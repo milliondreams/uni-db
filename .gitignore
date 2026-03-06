@@ -18,9 +18,9 @@ Thumbs.db
 
 # Storage and Data
 /storage/
-demos/demo01/data/
-demos/demo01/storage/
-demos/demo01/schema.json
+/demos/demo01/data/
+/demos/demo01/storage/
+/demos/demo01/schema.json
 **/tmp/
 
 # ML/Embedding caches
@@ -48,21 +48,21 @@ coverage/
 
 # Python
 __pycache__/
-crates/uni-tck/scripts/__pycache__/
+/crates/uni-tck/scripts/__pycache__/
 *.py[cod]
 *$py.class
 *.so
 .mypy_cache/
 .ruff_cache/
-bindings/*/test_db_*/
+/bindings/*/test_db_*/
 test_db_*/
 *.proptest-regressions
-bindings/*/.venv/
-bindings/*/dist/
+/bindings/*/.venv/
+/bindings/*/dist/
 
 # Generated docs
-bindings/uni-db/docs/
-bindings/uni-pydantic/docs/
+/bindings/uni-db/docs/
+/bindings/uni-pydantic/docs/
 
 # Local binaries
 bin/
@@ -73,12 +73,12 @@ GEMINI.md
 .claude/
 .gemini/
 .serena/
-conductor/
+/conductor/
 
 # Git worktrees
 .worktrees/
 
-demo/
+/demo/
 
 dist/
 

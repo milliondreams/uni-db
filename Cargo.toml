@@ -29,7 +29,7 @@ default-members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.6"
+version = "0.1.17"
 edition = "2024"
 authors = ["Dragonscale Industries Inc. <dev@dragonscale.ai>"]
 license = "Apache-2.0"
@@ -40,15 +40,15 @@ keywords = ["graph", "database", "cypher", "vector", "embedded"]
 categories = ["database", "data-structures"]
 
 [workspace.dependencies]
-uni-common = { path = "crates/uni-common", version = "0.1.6" }
-uni-store = { path = "crates/uni-store", version = "0.1.6" }
-uni-algo = { path = "crates/uni-algo", version = "0.1.6" }
-uni-query = { path = "crates/uni-query", version = "0.1.6" }
-uni-cli = { path = "crates/uni-cli", version = "0.1.6" }
-uni-db = { path = "crates/uni", version = "0.1.6" }
-uni-crdt = { path = "crates/uni-crdt", version = "0.1.6" }
-uni-cypher = { path = "crates/uni-cypher", version = "0.1.6" }
-uni-locy = { path = "crates/uni-locy", version = "0.1.6" }
+uni-common = { path = "crates/uni-common", version = "0.1.17" }
+uni-store = { path = "crates/uni-store", version = "0.1.17" }
+uni-algo = { path = "crates/uni-algo", version = "0.1.17" }
+uni-query = { path = "crates/uni-query", version = "0.1.17" }
+uni-cli = { path = "crates/uni-cli", version = "0.1.17" }
+uni-db = { path = "crates/uni", version = "0.1.17" }
+uni-crdt = { path = "crates/uni-crdt", version = "0.1.17" }
+uni-cypher = { path = "crates/uni-cypher", version = "0.1.17" }
+uni-locy = { path = "crates/uni-locy", version = "0.1.17" }
 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

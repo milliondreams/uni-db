@@ -35,7 +35,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+          sudo apt-get install -y mold protobuf-compiler
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
@@ -110,6 +110,10 @@ jobs:
         working-directory: bindings/uni-db
         run: uv run maturin develop
 
+      - name: Check Python formatting (uni-db)
+        working-directory: bindings/uni-db
+        run: uv run ruff format --check .
+
       - name: Lint Python code (uni-db)
         working-directory: bindings/uni-db
         run: uv run ruff check .
@@ -121,6 +125,10 @@ jobs:
       - name: Install Python dependencies (uni-pydantic)
         working-directory: bindings/uni-pydantic
         run: uv sync --group dev
+
+      - name: Check Python formatting (uni-pydantic)
+        working-directory: bindings/uni-pydantic
+        run: uv run ruff format --check .
 
       - name: Lint Python code (uni-pydantic)
         working-directory: bindings/uni-pydantic

@@ -1,0 +1,24 @@
+{
+  "edge_types": {
+    "FRIEND": { "id": 1, "src_labels": [], "dst_labels": [] },
+    "IN": { "id": 2, "src_labels": [], "dst_labels": [] },
+    "KNOWN_BY": { "id": 3, "src_labels": [], "dst_labels": [] },
+    "KNOWS": { "id": 4, "src_labels": [], "dst_labels": [] },
+    "SAME_AS": { "id": 5, "src_labels": [], "dst_labels": [] }
+  },
+  "indexes": [],
+  "labels": {
+    "City": { "id": 1 },
+    "Country": { "id": 2 },
+    "Person": { "id": 3 }
+  },
+  "properties": {
+    "City": {
+      "name": { "type": "String", "nullable": true }
+    },
+    "Person": {
+      "name": { "type": "String", "nullable": true }
+    }
+  },
+  "schema_version": 1
+}

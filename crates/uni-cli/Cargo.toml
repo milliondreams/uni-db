@@ -1,0 +1,42 @@
+[package]
+name = "uni-cli"
+description = "Command-line interface for Uni graph database"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "uni"
+path = "src/main.rs"
+
+[dependencies]
+uni-db = { workspace = true }
+uni-common = { workspace = true }
+uni-store = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+rustyline = { workspace = true }
+colored = { workspace = true }
+prettytable-rs = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde_json = { workspace = true }
+
+[features]
+default = ["provider-gemini", "provider-openai"]
+provider-candle = ["uni-db/provider-candle"]
+provider-fastembed = ["uni-db/provider-fastembed"]
+provider-openai = ["uni-db/provider-openai"]
+provider-gemini = ["uni-db/provider-gemini"]
+provider-vertexai = ["uni-db/provider-vertexai"]
+provider-mistral = ["uni-db/provider-mistral"]
+provider-anthropic = ["uni-db/provider-anthropic"]
+provider-voyageai = ["uni-db/provider-voyageai"]
+provider-cohere = ["uni-db/provider-cohere"]
+provider-azure-openai = ["uni-db/provider-azure-openai"]
+provider-mistralrs = ["uni-db/provider-mistralrs"]
+gpu-cuda = ["uni-db/gpu-cuda"]

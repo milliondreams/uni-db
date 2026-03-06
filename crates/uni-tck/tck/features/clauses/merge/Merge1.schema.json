@@ -1,0 +1,91 @@
+{
+  "edge_types": {},
+  "indexes": [],
+  "labels": {
+    "A": {
+      "id": 1
+    },
+    "B": {
+      "id": 2
+    },
+    "City": {
+      "id": 3
+    },
+    "L": {
+      "id": 4
+    },
+    "N": {
+      "id": 5
+    },
+    "Person": {
+      "id": 6
+    },
+    "TheLabel": {
+      "id": 7
+    },
+    "X": {
+      "id": 8
+    }
+  },
+  "properties": {
+    "A": {
+      "num": {
+        "nullable": true,
+        "type": "Int64"
+      }
+    },
+    "B": {
+      "num": {
+        "nullable": true,
+        "type": "Int64"
+      }
+    },
+    "City": {
+      "name": {
+        "nullable": true,
+        "type": "CypherValue"
+      }
+    },
+    "L": {
+      "num": {
+        "nullable": true,
+        "type": "Int64"
+      }
+    },
+    "N": {
+      "var": {
+        "nullable": true,
+        "type": "CypherValue"
+      },
+      "x": {
+        "nullable": true,
+        "type": "CypherValue"
+      },
+      "y": {
+        "nullable": true,
+        "type": "CypherValue"
+      }
+    },
+    "Person": {
+      "bornIn": {
+        "nullable": true,
+        "type": "String"
+      },
+      "name": {
+        "nullable": true,
+        "type": "String"
+      }
+    },
+    "TheLabel": {
+      "id": {
+        "nullable": true,
+        "type": "Int64"
+      },
+      "num": {
+        "nullable": true,
+        "type": "Int64"
+      }
+    }
+  },
+  "schema_version": 1
+}

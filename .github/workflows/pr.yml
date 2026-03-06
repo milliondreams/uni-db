@@ -1,0 +1,131 @@
+# Pull Request Workflow
+#
+# Runs essential tests and checks for pull requests.
+# Focused on fast feedback - only runs Rust and Python tests.
+
+name: PR Checks
+
+on:
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+permissions:
+  contents: read
+
+jobs:
+  # Format and lint checks
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify generated Locy notebooks
+        run: python3 website/scripts/generate_locy_notebooks.py --check
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci"
+          cache-on-failure: true
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy
+        run: cargo clippy --workspace --exclude uni-tck --all-targets -- -D warnings
+
+  # Rust tests
+  rust-tests:
+    name: Rust Tests
+    runs-on: ubuntu-xlarge
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mold protobuf-compiler
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci"
+          cache-on-failure: true
+
+      - name: Run tests
+        run: cargo nextest run --workspace --exclude uni-tck
+
+  # Python bindings tests
+  python-tests:
+    name: Python Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mold protobuf-compiler
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci"
+          cache-on-failure: true
+
+      - name: Install Python dependencies (uni-db)
+        working-directory: bindings/uni-db
+        run: uv sync --group dev
+
+      - name: Build Python bindings (uni-db)
+        working-directory: bindings/uni-db
+        run: uv run maturin develop
+
+      - name: Lint Python code (uni-db)
+        working-directory: bindings/uni-db
+        run: uv run ruff check .
+
+      - name: Run Python tests (uni-db)
+        working-directory: bindings/uni-db
+        run: uv run pytest tests/ -v -n auto
+
+      - name: Install Python dependencies (uni-pydantic)
+        working-directory: bindings/uni-pydantic
+        run: uv sync --group dev
+
+      - name: Lint Python code (uni-pydantic)
+        working-directory: bindings/uni-pydantic
+        run: uv run ruff check .
+
+      - name: Run Python tests (uni-pydantic)
+        working-directory: bindings/uni-pydantic
+        run: uv run pytest tests/ -v -n auto

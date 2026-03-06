@@ -1,0 +1,19 @@
+[package]
+name = "uni-cypher"
+description = "OpenCypher query parser and AST for Uni graph database"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+pest = "2.7"
+pest_derive = "2.7"
+serde = { workspace = true }
+thiserror = { workspace = true }
+uni-common = { workspace = true }

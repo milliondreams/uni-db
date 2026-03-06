@@ -1,0 +1,34 @@
+{
+  "edge_types": {
+    "E": { "id": 1, "src_labels": [], "dst_labels": [] },
+    "EDGE": { "id": 2, "src_labels": [], "dst_labels": [] },
+    "PAID": { "id": 3, "src_labels": [], "dst_labels": [] }
+  },
+  "indexes": [],
+  "labels": {
+    "Invoice": { "id": 1 },
+    "Node": { "id": 2 },
+    "Person": { "id": 3 }
+  },
+  "properties": {
+    "E": {
+      "weight": { "type": "Float64", "nullable": true }
+    },
+    "EDGE": {
+      "cost": { "type": "Int64", "nullable": true },
+      "label": { "type": "String", "nullable": true },
+      "score": { "type": "Int64", "nullable": true },
+      "weight": { "type": "Float64", "nullable": true }
+    },
+    "Node": {
+      "name": { "type": "String", "nullable": true }
+    },
+    "PAID": {
+      "amount": { "type": "Int64", "nullable": true }
+    },
+    "Person": {
+      "name": { "type": "String", "nullable": true }
+    }
+  },
+  "schema_version": 1
+}

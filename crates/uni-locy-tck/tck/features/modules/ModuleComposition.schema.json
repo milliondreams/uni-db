@@ -1,0 +1,9 @@
+{
+  "edge_types": {
+    "OWNS": { "id": 1, "src_labels": [], "dst_labels": [] }
+  },
+  "indexes": [],
+  "labels": {},
+  "properties": {},
+  "schema_version": 1
+}

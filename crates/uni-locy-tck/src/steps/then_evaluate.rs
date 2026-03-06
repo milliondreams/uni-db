@@ -1,0 +1,612 @@
+use crate::LocyWorld;
+use cucumber::then;
+use std::collections::HashMap;
+use uni_common::Value;
+use uni_locy::result::CommandResult;
+
+/// Extract a value from a Row (HashMap<String, Value>), supporting dotted
+/// property access such as `a.name` → row["a"] → Node.properties["name"].
+fn extract_field_value<'a>(row: &'a HashMap<String, Value>, field_path: &str) -> Option<&'a Value> {
+    if let Some((col, prop)) = field_path.split_once('.') {
+        match row.get(col)? {
+            Value::Node(node) => node.properties.get(prop),
+            Value::Edge(edge) => edge.properties.get(prop),
+            Value::Map(map) => map.get(prop),
+            _ => None,
+        }
+    } else {
+        row.get(field_path)
+    }
+}
+
+/// Parse a Gherkin value literal into a Value.
+fn parse_gherkin_value(s: &str) -> Value {
+    let t = s.trim();
+    if (t.starts_with('\'') && t.ends_with('\'')) || (t.starts_with('"') && t.ends_with('"')) {
+        Value::String(t[1..t.len() - 1].to_string())
+    } else if let Ok(i) = t.parse::<i64>() {
+        Value::Int(i)
+    } else if let Ok(f) = t.parse::<f64>() {
+        Value::Float(f)
+    } else if t == "true" {
+        Value::Bool(true)
+    } else if t == "false" {
+        Value::Bool(false)
+    } else if t == "null" {
+        Value::Null
+    } else {
+        Value::String(t.to_string())
+    }
+}
+
+/// Flexible value comparison (int/float cross-compare, etc.)
+fn values_match(actual: &Value, expected: &Value) -> bool {
+    match (actual, expected) {
+        (Value::Int(a), Value::Float(b)) => (*a as f64 - b).abs() < 1e-9,
+        (Value::Float(a), Value::Int(b)) => (a - *b as f64).abs() < 1e-9,
+        _ => actual == expected,
+    }
+}
+
+#[then("evaluation should succeed")]
+async fn evaluation_should_succeed(world: &mut LocyWorld) {
+    let locy_result = world
+        .locy_result()
+        .expect("No evaluation result found - did you forget to evaluate a program?");
+
+    match locy_result {
+        Ok(_) => {}
+        Err(err) => {
+            panic!("Expected successful evaluation, but got error: {}", err);
+        }
+    }
+}
+
+#[then("evaluation should fail")]
+async fn evaluation_should_fail(world: &mut LocyWorld) {
+    let locy_result = world
+        .locy_result()
+        .expect("No evaluation result found - did you forget to evaluate a program?");
+
+    if locy_result.is_ok() {
+        panic!("Expected evaluation failure, but evaluation succeeded");
+    }
+}
+
+#[then(regex = r#"^the evaluation error should mention ['"](.+)['"]$"#)]
+async fn evaluation_error_should_mention(world: &mut LocyWorld, expected_text: String) {
+    let locy_result = world
+        .locy_result()
+        .expect("No evaluation result found - did you forget to evaluate a program?");
+
+    match locy_result {
+        Ok(_) => {
+            panic!(
+                "Expected evaluation error mentioning '{}', but evaluation succeeded",
+                expected_text
+            );
+        }
+        Err(err) => {
+            let error_message = err.to_string();
+            if !error_message.contains(&expected_text) {
+                panic!(
+                    "Expected error message to contain '{}', but got: {}",
+                    expected_text, error_message
+                );
+            }
+        }
+    }
+}
+
+#[then(regex = r#"^the derived relation ['"](.+)['"] should have (\d+) facts$"#)]
+async fn derived_relation_should_have_n_facts(
+    world: &mut LocyWorld,
+    relation_name: String,
+    expected_count: usize,
+) {
+    let locy_result = world
+        .locy_result()
+        .expect("No evaluation result found - did you forget to evaluate a program?");
+
+    match locy_result {
+        Ok(result) => {
+            let facts = result.derived.get(&relation_name);
+            let actual = facts.map(|f| f.len()).unwrap_or(0);
+            assert_eq!(
+                actual, expected_count,
+                "Expected derived relation '{}' to have {} facts, but got {}. Available relations: {:?}",
+                relation_name,
+                expected_count,
+                actual,
+                result.derived.keys().collect::<Vec<_>>()
+            );
+        }
+        Err(err) => {
+            panic!(
+                "Expected successful evaluation with derived relation '{}', but got error: {}",
+                relation_name, err
+            );
+        }
+    }
+}
+
+#[then(regex = r#"^the derived relation ['"](.+)['"] should contain at least (\d+) facts$"#)]
+async fn derived_relation_should_contain_at_least_n_facts(
+    world: &mut LocyWorld,
+    relation_name: String,
+    min_count: usize,
+) {
+    let locy_result = world
+        .locy_result()
+        .expect("No evaluation result found - did you forget to evaluate a program?");
+
+    match locy_result {
+        Ok(result) => {
+            let facts = result.derived.get(&relation_name);
+            let actual = facts.map(|f| f.len()).unwrap_or(0);
+            assert!(
+                actual >= min_count,
+                "Expected derived relation '{}' to have at least {} facts, but got {}",
+                relation_name,
+                min_count,
+                actual
+            );
+        }
+        Err(err) => {
+            panic!(
+                "Expected successful evaluation with derived relation '{}', but got error: {}",
+                relation_name, err
+            );
+        }
+    }
+}
+
+// ── Value-Level Assertions ────────────────────────────────────────────────
+
+#[then(
+    regex = r#"^the derived relation ['"](.+)['"] should contain a fact where (.+) = (.+) and (.+) = (.+)$"#
+)]
+async fn derived_relation_should_contain_fact_where_and(
+    world: &mut LocyWorld,
+    relation: String,
+    f1: String,
+    v1: String,
+    f2: String,
+    v2: String,
+) {
+    let locy_result = world.locy_result().expect("No evaluation result found");
+
+    let result = locy_result.as_ref().expect("Evaluation failed");
+    let facts = result
+        .derived
+        .get(&relation)
+        .unwrap_or_else(|| panic!("No derived relation '{}'", relation));
+
+    let expected1 = parse_gherkin_value(&v1);
+    let expected2 = parse_gherkin_value(&v2);
+
+    let found = facts.iter().any(|row| {
+        let m1 = extract_field_value(row, f1.trim())
+            .map(|v| values_match(v, &expected1))
+            .unwrap_or(false);
+        let m2 = extract_field_value(row, f2.trim())
+            .map(|v| values_match(v, &expected2))
+            .unwrap_or(false);
+        m1 && m2
+    });
+
+    assert!(
+        found,
+        "Expected derived relation '{}' to contain a fact where {} = {} and {} = {}, but no match found in {} facts",
+        relation, f1, v1, f2, v2, facts.len()
+    );
+}
+
+#[then(
+    regex = r#"^the derived relation ['"](.+)['"] should contain a fact where ([^ ]+) = ('[^']*'|"[^"]*"|-?\d+(?:\.\d+)?|true|false|null)$"#
+)]
+async fn derived_relation_should_contain_fact_where(
+    world: &mut LocyWorld,
+    relation: String,
+    field: String,
+    value_str: String,
+) {
+    let locy_result = world.locy_result().expect("No evaluation result found");
+
+    let result = locy_result.as_ref().expect("Evaluation failed");
+    let facts = result
+        .derived
+        .get(&relation)
+        .unwrap_or_else(|| panic!("No derived relation '{}'", relation));
+
+    let expected = parse_gherkin_value(&value_str);
+
+    let found = facts.iter().any(|row| {
+        extract_field_value(row, field.trim())
+            .map(|v| values_match(v, &expected))
+            .unwrap_or(false)
+    });
+
+    assert!(
+        found,
+        "Expected derived relation '{}' to contain a fact where {} = {}, but no match found in {} facts",
+        relation, field, value_str, facts.len()
+    );
+}
+
+#[then(
+    regex = r#"^the derived relation ['"](.+)['"] should not contain a fact where (.+) = (.+) and (.+) = (.+)$"#
+)]
+async fn derived_relation_should_not_contain_fact_where_and(
+    world: &mut LocyWorld,
+    relation: String,
+    f1: String,
+    v1: String,
+    f2: String,
+    v2: String,
+) {
+    let locy_result = world.locy_result().expect("No evaluation result found");
+
+    let result = locy_result.as_ref().expect("Evaluation failed");
+    let facts = result
+        .derived
+        .get(&relation)
+        .map(|f| f.as_slice())
+        .unwrap_or(&[]);
+
+    let expected1 = parse_gherkin_value(&v1);
+    let expected2 = parse_gherkin_value(&v2);
+
+    let found = facts.iter().any(|row| {
+        let m1 = extract_field_value(row, f1.trim())
+            .map(|v| values_match(v, &expected1))
+            .unwrap_or(false);
+        let m2 = extract_field_value(row, f2.trim())
+            .map(|v| values_match(v, &expected2))
+            .unwrap_or(false);
+        m1 && m2
+    });
+
+    assert!(
+        !found,
+        "Expected derived relation '{}' NOT to contain a fact where {} = {} and {} = {}, but match was found",
+        relation, f1, v1, f2, v2
+    );
+}
+
+#[then(
+    regex = r#"^the derived relation ['"](.+)['"] should not contain a fact where ([^ ]+) = ('[^']*'|"[^"]*"|-?\d+(?:\.\d+)?|true|false|null)$"#
+)]
+async fn derived_relation_should_not_contain_fact_where(
+    world: &mut LocyWorld,
+    relation: String,
+    field: String,
+    value_str: String,
+) {
+    let locy_result = world.locy_result().expect("No evaluation result found");
+
+    let result = locy_result.as_ref().expect("Evaluation failed");
+    let facts = result
+        .derived
+        .get(&relation)
+        .map(|f| f.as_slice())
+        .unwrap_or(&[]);
+
+    let expected = parse_gherkin_value(&value_str);
+
+    let found = facts.iter().any(|row| {
+        extract_field_value(row, field.trim())
+            .map(|v| values_match(v, &expected))
+            .unwrap_or(false)
+    });
+
+    assert!(
+        !found,
+        "Expected derived relation '{}' NOT to contain a fact where {} = {}, but match was found",
+        relation, field, value_str
+    );
+}
+
+// ── Stats Assertions ──────────────────────────────────────────────────────
+
+#[then(regex = r#"^the evaluation stats should show (\d+) total iterations$"#)]
+async fn stats_total_iterations(world: &mut LocyWorld, expected: usize) {
+    let locy_result = world.locy_result().expect("No evaluation result found");
+
+    let result = locy_result.as_ref().expect("Evaluation failed");
+    assert_eq!(
+        result.stats.total_iterations, expected,
+        "Expected {} total iterations, got {}",
+        expected, result.stats.total_iterations
+    );
+}
+
+#[then(regex = r#"^the evaluation stats should show (\d+) queries executed$"#)]
+async fn stats_queries_executed(world: &mut LocyWorld, expected: usize) {
+    let locy_result = world.locy_result().expect("No evaluation result found");
+
+    let result = locy_result.as_ref().expect("Evaluation failed");
+    assert_eq!(
+        result.stats.queries_executed, expected,
+        "Expected {} queries executed, got {}",
+        expected, result.stats.queries_executed
+    );
+}
+
+#[then(regex = r#"^the evaluation stats should show (\d+) mutations executed$"#)]
+async fn stats_mutations_executed(world: &mut LocyWorld, expected: usize) {
+    let locy_result = world.locy_result().expect("No evaluation result found");
+
+    let result = locy_result.as_ref().expect("Evaluation failed");
+    assert_eq!(
+        result.stats.mutations_executed, expected,
+        "Expected {} mutations executed, got {}",
+        expected, result.stats.mutations_executed
+    );
+}
+
+// ── Command Result Assertions ─────────────────────────────────────────────
+
+#[then(regex = r#"^the command result (\d+) should be a Query with (\d+) rows$"#)]
+async fn command_result_query_rows(world: &mut LocyWorld, idx: usize, expected: usize) {
+    let locy_result = world.locy_result().expect("No evaluation result found");
+
+    let result = locy_result.as_ref().expect("Evaluation failed");
+    let cmd = result
+        .command_results
+        .get(idx)
+        .unwrap_or_else(|| panic!("No command result at index {}", idx));
+
+    match cmd {
+        CommandResult::Query(rows) => {
+            assert_eq!(
+                rows.len(),
+                expected,
+                "Expected Query command result {} to have {} rows, got {}",
+                idx,
+                expected,
+                rows.len()
+            );
+        }
+        other => panic!(
+            "Expected command result {} to be a Query, got {:?}",
+            idx, other
+        ),
+    }
+}
+
+#[then(regex = r#"^the command result (\d+) should be a Query containing row where (.+) = (.+)$"#)]
+async fn command_result_query_containing_row(
+    world: &mut LocyWorld,
+    idx: usize,
+    field: String,
+    value_str: String,
+) {
+    let locy_result = world.locy_result().expect("No evaluation result found");
+
+    let result = locy_result.as_ref().expect("Evaluation failed");
+    let cmd = result
+        .command_results
+        .get(idx)
+        .unwrap_or_else(|| panic!("No command result at index {}", idx));
+
+    match cmd {
+        CommandResult::Query(rows) => {
+            let expected = parse_gherkin_value(&value_str);
+            let found = rows.iter().any(|row| {
+                extract_field_value(row, field.trim())
+                    .map(|v| values_match(v, &expected))
+                    .unwrap_or(false)
+            });
+            assert!(
+                found,
+                "Expected Query result {} to contain row where {} = {}, but not found in {} rows",
+                idx,
+                field,
+                value_str,
+                rows.len()
+            );
+        }
+        other => panic!(
+            "Expected command result {} to be a Query, got {:?}",
+            idx, other
+        ),
+    }
+}
+
+#[then(regex = r#"^the command result (\d+) should be an Assume with (\d+) rows$"#)]
+async fn command_result_assume_rows(world: &mut LocyWorld, idx: usize, expected: usize) {
+    let locy_result = world.locy_result().expect("No evaluation result found");
+
+    let result = locy_result.as_ref().expect("Evaluation failed");
+    let cmd = result
+        .command_results
+        .get(idx)
+        .unwrap_or_else(|| panic!("No command result at index {}", idx));
+
+    match cmd {
+        CommandResult::Assume(rows) => {
+            assert_eq!(
+                rows.len(),
+                expected,
+                "Expected Assume command result {} to have {} rows, got {}",
+                idx,
+                expected,
+                rows.len()
+            );
+        }
+        other => panic!(
+            "Expected command result {} to be an Assume, got {:?}",
+            idx, other
+        ),
+    }
+}
+
+#[then(regex = r#"^the command result (\d+) should be an Explain with rule ['"](.+)['"]$"#)]
+async fn command_result_explain_rule(world: &mut LocyWorld, idx: usize, rule_name: String) {
+    let locy_result = world.locy_result().expect("No evaluation result found");
+
+    let result = locy_result.as_ref().expect("Evaluation failed");
+    let cmd = result
+        .command_results
+        .get(idx)
+        .unwrap_or_else(|| panic!("No command result at index {}", idx));
+
+    match cmd {
+        CommandResult::Explain(node) => {
+            assert_eq!(
+                node.rule, rule_name,
+                "Expected Explain root rule '{}', got '{}'",
+                rule_name, node.rule
+            );
+        }
+        other => panic!(
+            "Expected command result {} to be an Explain, got {:?}",
+            idx, other
+        ),
+    }
+}
+
+#[then(regex = r#"^the command result (\d+) should be an Explain with (\d+) children$"#)]
+async fn command_result_explain_children(world: &mut LocyWorld, idx: usize, expected: usize) {
+    let locy_result = world.locy_result().expect("No evaluation result found");
+
+    let result = locy_result.as_ref().expect("Evaluation failed");
+    let cmd = result
+        .command_results
+        .get(idx)
+        .unwrap_or_else(|| panic!("No command result at index {}", idx));
+
+    match cmd {
+        CommandResult::Explain(node) => {
+            assert_eq!(
+                node.children.len(),
+                expected,
+                "Expected Explain with {} children, got {}",
+                expected,
+                node.children.len()
+            );
+        }
+        other => panic!(
+            "Expected command result {} to be an Explain, got {:?}",
+            idx, other
+        ),
+    }
+}
+
+#[then(
+    regex = r#"^the command result (\d+) should be an Abduce with at least (\d+) modifications$"#
+)]
+async fn command_result_abduce_modifications(world: &mut LocyWorld, idx: usize, min: usize) {
+    let locy_result = world.locy_result().expect("No evaluation result found");
+
+    let result = locy_result.as_ref().expect("Evaluation failed");
+    let cmd = result
+        .command_results
+        .get(idx)
+        .unwrap_or_else(|| panic!("No command result at index {}", idx));
+
+    match cmd {
+        CommandResult::Abduce(abduce_result) => {
+            assert!(
+                abduce_result.modifications.len() >= min,
+                "Expected Abduce with at least {} modifications, got {}",
+                min,
+                abduce_result.modifications.len()
+            );
+        }
+        other => panic!(
+            "Expected command result {} to be an Abduce, got {:?}",
+            idx, other
+        ),
+    }
+}
+
+#[then(regex = r#"^the command result (\d+) should be a Derive affecting (\d+) elements$"#)]
+async fn command_result_derive_affecting(world: &mut LocyWorld, idx: usize, expected: usize) {
+    let locy_result = world.locy_result().expect("No evaluation result found");
+
+    let result = locy_result.as_ref().expect("Evaluation failed");
+    let cmd = result
+        .command_results
+        .get(idx)
+        .unwrap_or_else(|| panic!("No command result at index {}", idx));
+
+    match cmd {
+        CommandResult::Derive { affected } => {
+            assert_eq!(
+                *affected, expected,
+                "Expected Derive affecting {} elements, got {}",
+                expected, affected
+            );
+        }
+        other => panic!(
+            "Expected command result {} to be a Derive, got {:?}",
+            idx, other
+        ),
+    }
+}
+
+// ── Graph State Assertions ────────────────────────────────────────────────
+
+#[then(regex = r#"^the graph should contain (\d+) nodes with label ['"](.+)['"]$"#)]
+async fn graph_should_contain_n_nodes_with_label(
+    world: &mut LocyWorld,
+    expected: usize,
+    label: String,
+) {
+    let query = format!("MATCH (n:{}) RETURN count(n) AS cnt", label);
+    let result = world.db().query(&query).await.expect("graph query failed");
+    let cnt: i64 = result.rows[0].get("cnt").expect("missing cnt column");
+    assert_eq!(
+        cnt as usize, expected,
+        "Expected {} nodes with label '{}', got {}",
+        expected, label, cnt
+    );
+}
+
+#[then(
+    regex = r#"^the graph should contain an edge from ['"](.+)['"] to ['"](.+)['"] with type ['"](.+)['"]$"#
+)]
+async fn graph_should_contain_edge(
+    world: &mut LocyWorld,
+    from: String,
+    to: String,
+    edge_type: String,
+) {
+    let query = format!(
+        "MATCH (a {{name: '{}'}})-[r:{}]->(b {{name: '{}'}}) RETURN count(r) AS cnt",
+        from, edge_type, to
+    );
+    let result = world.db().query(&query).await.expect("graph query failed");
+    let cnt: i64 = result.rows[0].get("cnt").expect("missing cnt column");
+    assert!(
+        cnt > 0,
+        "Expected edge from '{}' to '{}' with type '{}', but none found",
+        from,
+        to,
+        edge_type
+    );
+}
+
+#[then(
+    regex = r#"^the graph should not contain an edge from ['"](.+)['"] to ['"](.+)['"] with type ['"](.+)['"]$"#
+)]
+async fn graph_should_not_contain_edge(
+    world: &mut LocyWorld,
+    from: String,
+    to: String,
+    edge_type: String,
+) {
+    let query = format!(
+        "MATCH (a {{name: '{}'}})-[r:{}]->(b {{name: '{}'}}) RETURN count(r) AS cnt",
+        from, edge_type, to
+    );
+    let result = world.db().query(&query).await.expect("graph query failed");
+    let cnt: i64 = result.rows[0].get("cnt").expect("missing cnt column");
+    assert_eq!(
+        cnt, 0,
+        "Expected no edge from '{}' to '{}' with type '{}', but found {}",
+        from, to, edge_type, cnt
+    );
+}

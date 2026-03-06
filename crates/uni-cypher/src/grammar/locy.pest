@@ -1,0 +1,410 @@
+// ═══════════════════════════════════════════════════════════════════════════
+// LOCY EXTENSIONS TO CYPHER PEST GRAMMAR
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// This file extends cypher.pest from the uni-cypher crate. Pest concatenates
+// both grammars when multiple #[grammar] attributes are stacked:
+//
+//   #[derive(Parser)]
+//   #[grammar = "../uni-cypher/src/cypher.pest"]
+//   #[grammar = "src/locy.pest"]
+//   struct LocyParser;
+//
+// All rules from cypher.pest are available here by name. This file defines
+// only the Locy-specific extensions.
+//
+// ═══════════════════════════════════════════════════════════════════════════
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// LOCY KEYWORDS
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Fully reserved — cannot be used as identifiers without backtick-quoting
+RULE     = @{ ^"rule" ~ !ident_char }
+ALONG    = @{ ^"along" ~ !ident_char }
+PREV     = @{ ^"prev" ~ !ident_char }
+FOLD     = @{ ^"fold" ~ !ident_char }
+BEST     = @{ ^"best" ~ !ident_char }
+DERIVE   = @{ ^"derive" ~ !ident_char }
+ASSUME   = @{ ^"assume" ~ !ident_char }
+ABDUCE   = @{ ^"abduce" ~ !ident_char }
+QUERY_KW = @{ ^"query" ~ !ident_char }
+
+// Contextual — already openCypher keywords, given additional meaning
+// MODULE, USE, PRIORITY, NEW, EXPORT are not defined in cypher.pest,
+// so we define them here. Others (CREATE, MATCH, WHERE, YIELD, MERGE,
+// KEY, BY, TO, IS, NOT, THEN, EXPLAIN, AS, RETURN) are in cypher.pest.
+MODULE   = @{ ^"module" ~ !ident_char }
+USE      = @{ ^"use" ~ !ident_char }
+PRIORITY = @{ ^"priority" ~ !ident_char }
+NEW      = @{ ^"new" ~ !ident_char }
+EXPORT   = @{ ^"export" ~ !ident_char }
+
+// Locy reserved words — added to the reserved keyword set so that
+// the Locy parser rejects them as bare identifiers.
+locy_keyword_reserved = {
+    RULE | ALONG | PREV | FOLD | BEST | DERIVE | ASSUME | ABDUCE | QUERY_KW
+}
+
+// Locy identifier: like cypher identifier, but also rejects Locy reserved words
+locy_identifier = @{
+    !keyword_reserved ~ !locy_keyword_reserved
+    ~ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")*
+    | "`" ~ (!"`" ~ ANY)* ~ "`"
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TOP-LEVEL: LOCY PROGRAM
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Entry point for the Locy parser. Replaces cypher.pest `query` as SOI/EOI.
+locy_query = { SOI ~ module_declaration? ~ use_declaration* ~ locy_union_query ~ EOI }
+
+locy_union_query = {
+    locy_single_query ~ (union_operator ~ locy_single_query)*
+}
+
+locy_single_query = {
+    explain_query                               // Cypher EXPLAIN (unchanged)
+    | locy_statement_block
+    | schema_command                             // Cypher schema commands (unchanged)
+    | transaction_command                        // Cypher transaction commands (unchanged)
+}
+
+locy_statement_block = { locy_clause+ }
+
+// A Locy clause is either a Locy extension or a standard Cypher clause.
+// Locy-specific forms are tried first; Cypher clause is the fallback.
+locy_clause = {
+    rule_definition
+    | goal_query
+    | derive_command
+    | assume_block
+    | abduce_query
+    | explain_rule_query
+    | clause                                    // Fallback to cypher clause
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MODULE SYSTEM
+// ═══════════════════════════════════════════════════════════════════════════
+
+module_declaration = { MODULE ~ locy_qualified_name }
+
+use_declaration = { USE ~ locy_qualified_name ~ use_import_list? }
+
+use_import_list = { "{" ~ locy_identifier ~ ("," ~ locy_identifier)* ~ "}" }
+
+// Dotted name for modules and cross-module rule references
+locy_qualified_name = { locy_identifier ~ ("." ~ locy_identifier)* }
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// RULE DEFINITION  (CREATE RULE ... AS ...)
+// ═══════════════════════════════════════════════════════════════════════════
+
+rule_definition = {
+    CREATE ~ RULE ~ rule_name ~ priority_clause? ~ AS
+    ~ rule_match_clause
+    ~ rule_where_clause?
+    ~ along_clause?
+    ~ fold_clause?
+    ~ best_by_clause?
+    ~ rule_terminal_clause
+}
+
+// Rule name: simple identifier or qualified (dotted) name
+rule_name = { locy_qualified_name }
+
+priority_clause = { PRIORITY ~ integer }
+
+// ── Rule MATCH ──────────────────────────────────────────────────────────
+
+rule_match_clause = { MATCH ~ pattern }
+
+// ── Rule WHERE (extended with IS references) ────────────────────────────
+//
+// The rule WHERE clause accepts comma-separated conditions, where each
+// condition may be an IS rule reference, an IS NOT reference, or a
+// standard Cypher expression. Commas act as AND.
+//
+// Disambiguation with Cypher IS forms (IS NULL, IS NOT NULL, IS :Label):
+//   - is_rule_reference requires IS followed by a rule_name (identifier).
+//     Since NULL is a reserved keyword it cannot be a rule_name, so
+//     "x IS NULL" falls through to expression. Same for IS :Label (colon).
+//   - is_not_rule_reference requires IS NOT followed by a rule_name.
+//     "x IS NOT NULL" falls through because NULL is not a rule_name.
+
+rule_where_clause = { WHERE ~ rule_condition ~ ("," ~ rule_condition)* }
+
+rule_condition = {
+    is_not_rule_reference
+    | is_rule_reference
+    | expression
+}
+
+// ── IS rule reference (positive) ────────────────────────────────────────
+//
+// Forms:
+//   x IS reachable
+//   x IS reachable TO y
+//   (x, y, cost) IS control
+
+is_rule_reference = {
+    "(" ~ locy_identifier ~ ("," ~ locy_identifier)* ~ ")" ~ IS ~ rule_name
+    | locy_identifier ~ IS ~ rule_name ~ TO ~ locy_identifier
+    | locy_identifier ~ IS ~ rule_name
+}
+
+// ── IS NOT rule reference (negative / stratified) ───────────────────────
+//
+// Both postfix NOT (IS NOT rule) and prefix NOT (NOT x IS rule) are
+// supported for all forms: unary, binary (TO), and tuple.
+
+is_not_rule_reference = {
+    // Postfix NOT forms: x IS NOT rule, x IS NOT rule TO y, (x,y) IS NOT rule
+    "(" ~ locy_identifier ~ ("," ~ locy_identifier)* ~ ")" ~ IS ~ NOT ~ rule_name
+    | locy_identifier ~ IS ~ NOT ~ rule_name ~ TO ~ locy_identifier
+    | locy_identifier ~ IS ~ NOT ~ rule_name
+    // Prefix NOT forms: NOT x IS rule, NOT x IS rule TO y, NOT (x,y) IS rule
+    | NOT ~ "(" ~ locy_identifier ~ ("," ~ locy_identifier)* ~ ")" ~ IS ~ rule_name
+    | NOT ~ locy_identifier ~ IS ~ rule_name ~ TO ~ locy_identifier
+    | NOT ~ locy_identifier ~ IS ~ rule_name
+}
+
+// ── Rule terminal: YIELD or DERIVE ──────────────────────────────────────
+
+rule_terminal_clause = {
+    locy_yield_clause
+    | derive_clause
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// YIELD CLAUSE (Locy-specific, distinct from Cypher YIELD)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Locy YIELD defines the output schema of a rule. It supports KEY markers
+// for grouping keys and expression-based projections with optional aliases.
+// Cypher's YIELD (for CALL procedures) is unchanged.
+
+locy_yield_clause = { YIELD ~ locy_yield_item ~ ("," ~ locy_yield_item)* }
+
+locy_yield_item = {
+    key_projection
+    | expression ~ (AS ~ alias_identifier)?
+}
+
+key_projection = { KEY ~ locy_identifier }
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PATH-CARRIED VALUES  (ALONG / prev)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// ALONG declares variables whose values are computed hop-by-hop during
+// recursive traversal.
+//
+// `prev.varname` references the value from the previous hop. At the pest
+// level, `prev.cost` parses as an identifier followed by property access
+// (since `expression` handles `primary ~ postfix*`). The Locy compiler
+// recognizes PREV as a special reference in ALONG context.
+//
+// If a user has a variable literally named `prev`, it must be backtick-
+// quoted in Locy mode since PREV is a fully reserved keyword.
+
+along_clause = { ALONG ~ along_declaration ~ ("," ~ along_declaration)* }
+
+along_declaration = { locy_identifier ~ eq ~ along_expression }
+
+// Along expressions may contain prev references. We define prev_reference
+// as an explicit rule so the AST builder can identify it directly, and
+// thread it into the expression hierarchy via locy_primary_expression.
+along_expression = { locy_or_expression }
+
+// Locy expression chain: mirrors Cypher's chain but with locy_primary
+// at the leaf level to include prev_reference.
+locy_or_expression  = { locy_xor_expression ~ (OR ~ locy_xor_expression)* }
+locy_xor_expression = { locy_and_expression ~ (XOR ~ locy_and_expression)* }
+locy_and_expression = { locy_not_expression ~ (AND ~ locy_not_expression)* }
+locy_not_expression = { NOT* ~ locy_comparison_expression }
+locy_comparison_expression = { locy_additive_expression ~ comparison_tail* }
+locy_additive_expression = { locy_multiplicative_expression ~ ((plus | minus) ~ locy_multiplicative_expression)* }
+locy_multiplicative_expression = { locy_power_expression ~ ((star | slash | percent) ~ locy_power_expression)* }
+locy_power_expression = { locy_unary_expression ~ (caret ~ locy_unary_expression)* }
+locy_unary_expression = { minus? ~ locy_postfix_expression }
+locy_postfix_expression = { locy_primary_expression ~ postfix_suffix* }
+
+// Locy primary: adds prev_reference before falling back to Cypher primary
+locy_primary_expression = {
+    prev_reference
+    | primary_expression
+}
+
+prev_reference = { PREV ~ "." ~ identifier_or_keyword }
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// AGGREGATION  (FOLD)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// FOLD declares aggregate computations over rule results.
+// The aggregate function (SUM, MSUM, MAX, MMAX, etc.) is parsed as a
+// function invocation within the expression. Semantic analysis validates
+// that monotonic aggregates (MSUM, MMAX, MMIN, MCOUNT) are used only
+// within recursive strata.
+
+fold_clause = { FOLD ~ fold_declaration ~ ("," ~ fold_declaration)* }
+
+fold_declaration = { locy_identifier ~ eq ~ fold_expression }
+
+fold_expression = { expression }
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// OPTIMIZED SELECTION  (BEST BY)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// BEST BY retains the optimal derivation(s) per key group, preserving
+// the full witness row. Ordering follows Cypher's ASC/DESC conventions.
+
+best_by_clause = { BEST ~ BY ~ best_by_item ~ ("," ~ best_by_item)* }
+
+best_by_item = { expression ~ (ASC | DESC)? }
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GRAPH DERIVATION  (DERIVE in rule heads)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// DERIVE clauses create graph structure (nodes and edges) as rule output.
+// DERIVE MERGE triggers entity resolution between two nodes.
+
+derive_clause = {
+    DERIVE ~ MERGE ~ locy_identifier ~ "," ~ locy_identifier
+    | DERIVE ~ derive_pattern ~ ("," ~ derive_pattern)*
+}
+
+derive_pattern = {
+    derive_forward_pattern
+    | derive_backward_pattern
+}
+
+// (a)-[:TYPE {props}]->(b)
+derive_forward_pattern = {
+    "(" ~ derive_node_spec ~ ")"
+    ~ "-" ~ "[" ~ derive_edge_spec ~ "]" ~ "->"
+    ~ "(" ~ derive_node_spec ~ ")"
+}
+
+// (a)<-[:TYPE {props}]-(b)
+derive_backward_pattern = {
+    "(" ~ derive_node_spec ~ ")"
+    ~ "<-" ~ "[" ~ derive_edge_spec ~ "]" ~ "-"
+    ~ "(" ~ derive_node_spec ~ ")"
+}
+
+derive_node_spec = {
+    NEW? ~ locy_identifier ~ node_labels? ~ properties?
+}
+
+derive_edge_spec = {
+    ":" ~ identifier_or_keyword ~ properties?
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GOAL-DIRECTED EVALUATION  (QUERY)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// QUERY evaluates a rule using SLG-resolution (top-down with tabling)
+// instead of bottom-up fixpoint.
+
+goal_query = {
+    QUERY_KW ~ rule_name
+    ~ WHERE ~ expression
+    ~ goal_return_clause?
+}
+
+goal_return_clause = {
+    RETURN ~ DISTINCT? ~ return_items ~ order_clause? ~ skip_clause? ~ limit_clause?
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TOP-LEVEL DERIVE COMMAND
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Triggers bottom-up materialization of a named rule.
+
+derive_command = { DERIVE ~ rule_name ~ where_clause? }
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HYPOTHETICAL REASONING  (ASSUME ... THEN)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// ASSUME creates a hypothetical context: mutations in the block are applied
+// inside a transaction savepoint, the THEN body executes, then the
+// savepoint is rolled back. Mutations never persist.
+
+assume_block = {
+    ASSUME ~ "{" ~ assume_mutation* ~ "}"
+    ~ THEN ~ assume_body
+}
+
+assume_mutation = {
+    match_clause
+    | create_clause
+    | merge_clause
+    | set_clause
+    | remove_clause
+    | delete_clause
+}
+
+assume_body = {
+    "{" ~ locy_clause+ ~ "}"
+    | locy_clause
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ABDUCTIVE REASONING  (ABDUCE)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// ABDUCE asks: "what graph modifications would make this rule hold
+// (or stop holding)?"
+
+abduce_query = {
+    ABDUCE ~ NOT? ~ rule_name
+    ~ WHERE ~ expression
+    ~ abduce_return_clause?
+}
+
+abduce_return_clause = {
+    RETURN ~ DISTINCT? ~ return_items ~ order_clause? ~ skip_clause? ~ limit_clause?
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PROOF TRACES  (EXPLAIN RULE)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// EXPLAIN RULE returns the derivation tree showing which rule clauses
+// and base facts produced a given result.
+//
+// Note: Cypher's EXPLAIN (query plan) is `EXPLAIN <statement>`, defined
+// in cypher.pest as `explain_query`. Locy's `EXPLAIN RULE` is
+// unambiguous because of the intervening RULE keyword.
+
+explain_rule_query = {
+    EXPLAIN ~ RULE ~ rule_name
+    ~ WHERE ~ expression
+    ~ explain_rule_return_clause?
+}
+
+explain_rule_return_clause = {
+    RETURN ~ DISTINCT? ~ return_items ~ order_clause? ~ skip_clause? ~ limit_clause?
+}

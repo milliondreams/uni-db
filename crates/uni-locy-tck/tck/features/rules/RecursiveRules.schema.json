@@ -1,0 +1,28 @@
+{
+  "edge_types": {
+    "E": {
+      "dst_labels": [],
+      "id": 1,
+      "src_labels": []
+    },
+    "EDGE": {
+      "dst_labels": [],
+      "id": 2,
+      "src_labels": []
+    },
+    "FAST": {
+      "dst_labels": [],
+      "id": 3,
+      "src_labels": []
+    },
+    "SLOW": {
+      "dst_labels": [],
+      "id": 4,
+      "src_labels": []
+    }
+  },
+  "indexes": [],
+  "labels": {},
+  "properties": {},
+  "schema_version": 1
+}

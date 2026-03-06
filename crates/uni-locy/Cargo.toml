@@ -1,0 +1,21 @@
+[package]
+name = "uni-locy"
+description = "Locy compiler: validates and stratifies Locy programs"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+uni-cypher = { workspace = true }
+uni-common = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+uni-cypher = { workspace = true }
+tokio = { workspace = true }

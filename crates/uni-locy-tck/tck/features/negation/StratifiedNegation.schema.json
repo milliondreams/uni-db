@@ -1,0 +1,14 @@
+{
+  "edge_types": {},
+  "indexes": [],
+  "labels": {
+    "Node": { "id": 1 }
+  },
+  "properties": {
+    "Node": {
+      "name": { "type": "String", "nullable": true },
+      "risk": { "type": "Float64", "nullable": true }
+    }
+  },
+  "schema_version": 1
+}

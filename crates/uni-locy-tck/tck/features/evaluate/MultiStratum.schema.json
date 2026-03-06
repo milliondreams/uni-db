@@ -1,0 +1,19 @@
+{
+  "edge_types": {
+    "EDGE": { "id": 1, "src_labels": [], "dst_labels": [] }
+  },
+  "indexes": [],
+  "labels": {
+    "Node": { "id": 1 }
+  },
+  "properties": {
+    "EDGE": {
+      "weight": { "type": "Float64", "nullable": true }
+    },
+    "Node": {
+      "name": { "type": "String", "nullable": true },
+      "risk": { "type": "Float64", "nullable": true }
+    }
+  },
+  "schema_version": 1
+}

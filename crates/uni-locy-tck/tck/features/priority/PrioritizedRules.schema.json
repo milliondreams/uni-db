@@ -1,0 +1,17 @@
+{
+  "edge_types": {
+    "FAST": { "id": 1, "src_labels": [], "dst_labels": [] },
+    "SLOW": { "id": 2, "src_labels": [], "dst_labels": [] }
+  },
+  "indexes": [],
+  "labels": {
+    "Node": { "id": 1 }
+  },
+  "properties": {
+    "Node": {
+      "name": { "type": "String", "nullable": true },
+      "risk": { "type": "Float64", "nullable": true }
+    }
+  },
+  "schema_version": 1
+}

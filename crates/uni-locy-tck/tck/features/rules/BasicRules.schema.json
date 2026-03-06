@@ -1,0 +1,29 @@
+{
+  "edge_types": {
+    "E": {
+      "dst_labels": [],
+      "id": 1,
+      "src_labels": []
+    },
+    "KNOWS": {
+      "dst_labels": [],
+      "id": 2,
+      "src_labels": []
+    }
+  },
+  "indexes": [],
+  "labels": {
+    "Person": {
+      "id": 1
+    }
+  },
+  "properties": {
+    "Person": {
+      "age": {
+        "nullable": true,
+        "type": "Int64"
+      }
+    }
+  },
+  "schema_version": 1
+}

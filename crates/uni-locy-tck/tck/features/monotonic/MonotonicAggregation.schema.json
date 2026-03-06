@@ -1,0 +1,26 @@
+{
+  "edge_types": {
+    "EDGE": { "id": 1, "src_labels": [], "dst_labels": [] },
+    "OWNS": { "id": 2, "src_labels": [], "dst_labels": [] }
+  },
+  "indexes": [],
+  "labels": {
+    "Co": { "id": 1 },
+    "Node": { "id": 2 }
+  },
+  "properties": {
+    "Co": {
+      "name": { "type": "String", "nullable": true }
+    },
+    "EDGE": {
+      "val": { "type": "Int64", "nullable": true }
+    },
+    "Node": {
+      "name": { "type": "String", "nullable": true }
+    },
+    "OWNS": {
+      "stake": { "type": "Float64", "nullable": true }
+    }
+  },
+  "schema_version": 1
+}

@@ -1,0 +1,13 @@
+asset_id,asset_name,owner_team,site,env,business_criticality,internet_exposed
+OT-ENG-01,Engineering Historian,Manufacturing-OT,fab-a,prod,5,1
+OT-MES-01,MES Core,Manufacturing-IT,fab-a,prod,5,0
+OT-PLC-07,Line PLC 07,Manufacturing-OT,fab-a,prod,4,0
+IT-IAM-01,Identity Gateway,Platform-Security,corp,prod,5,1
+IT-VPN-01,Remote Access VPN,Platform-Security,corp,prod,4,1
+IT-EDR-01,Endpoint Security Manager,SecOps,corp,prod,4,0
+IT-ERP-01,ERP Connector,Business-Apps,corp,prod,4,0
+OT-ENG-DR,Engineering DR Node,Manufacturing-OT,fab-b,dr,3,0
+IT-BUILD-01,Build Orchestrator,DevInfra,corp,prod,3,1
+IT-REPO-01,Artifact Registry,DevInfra,corp,prod,3,0
+OT-QA-01,QA Release Workstation,Quality,fab-a,prod,3,0
+IT-SIEM-01,Security Data Lake,SecOps,corp,prod,5,0

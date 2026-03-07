@@ -1,0 +1,5 @@
+asset_id,reason
+IT-IAM-01,internet_exposed + kev + very_high_epss
+IT-VPN-01,dual_kev_findings_on_edge_asset
+OT-ENG-01,critical_ot_asset_with_log4j
+OT-MES-01,mes_core_with_activemq_rce

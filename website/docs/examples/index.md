@@ -25,6 +25,9 @@ We provide examples in **Python**, **Python with Pydantic OGM**, and **Rust** to
 | **Infrastructure Blast Radius** | Recursive impact propagation across service call graph | [Python](python/locy_infrastructure_blast_radius.ipynb) | [Rust](rust/locy_infrastructure_blast_radius.ipynb) |
 | **Supply Chain Provenance** | Multi-hop upstream supplier traceability | [Python](python/locy_supply_chain_provenance.ipynb) | [Rust](rust/locy_supply_chain_provenance.ipynb) |
 | **Fraud Risk Propagation** | Recursive risk spread and clean-account derivation | [Python](python/locy_fraud_risk_propagation.ipynb) | [Rust](rust/locy_fraud_risk_propagation.ipynb) |
+| **Semiconductor Yield Excursion Triage** | Real-data manufacturing triage using DERIVE, ASSUME, ABDUCE, and EXPLAIN | [Python](python/locy_semiconductor_yield_excursion.ipynb) | - |
+| **Pharma Batch Genealogy (Flagship #2)** | Batch-risk propagation and risk-first intervention optimization | [Python](python/locy_pharma_batch_genealogy.ipynb) | - |
+| **Cyber Exposure Twin (Flagship #3)** | Hybrid search + columnar analytics + Locy remediation decisioning | [Python](python/locy_cyber_exposure_twin.ipynb) | - |
 
 ## Choosing an API
 

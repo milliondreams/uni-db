@@ -1,0 +1,27 @@
+{
+  "generated_at": "2026-03-07T00:46:06.653590+00:00",
+  "source": {
+    "name": "Pharma batch process/lab dataset collection",
+    "collection_url": "https://figshare.com/collections/_/5645578",
+    "paper_doi": "https://doi.org/10.1038/s41597-022-01203-x",
+    "files": {
+      "process_csv": "https://ndownloader.figshare.com/files/30874192",
+      "laboratory_csv": "https://ndownloader.figshare.com/files/30966250"
+    },
+    "license": "CC BY 4.0"
+  },
+  "shape": {
+    "batches": 180,
+    "deviation_batches": 68,
+    "material_lots": 90,
+    "usage_edges": 720,
+    "campaign_edges": 215,
+    "action_plans": 204,
+    "notebook_cases": 30
+  },
+  "parameters": {
+    "product_code": "17",
+    "max_batches": 180,
+    "top_cases": 30
+  }
+}

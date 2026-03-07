@@ -62,6 +62,30 @@ uv run python website/scripts/generate_locy_notebooks.py
 
 # Verify notebooks are in sync (used in PR checks)
 uv run python website/scripts/generate_locy_notebooks.py --check
+
+# Generate the flagship semiconductor Locy notebook
+uv run python website/scripts/generate_semiconductor_flagship_notebook.py
+
+# Execute + validate flagship notebook outputs
+uv run --with ./bindings/uni-db python website/scripts/verify_semiconductor_flagship_notebook.py
+
+# Prepare pharma flagship dataset bundle
+uv run python website/scripts/prepare_pharma_batch_genealogy_data.py
+
+# Generate flagship #2 pharma Locy notebook
+uv run python website/scripts/generate_pharma_flagship_notebook.py
+
+# Execute + validate flagship #2 notebook outputs
+uv run --with ./bindings/uni-db python website/scripts/verify_pharma_flagship_notebook.py
+
+# Prepare cyber flagship #3 dataset bundle
+uv run python website/scripts/prepare_cyber_exposure_twin_data.py
+
+# Generate flagship #3 cyber Locy notebook
+uv run python website/scripts/generate_cyber_flagship_notebook.py
+
+# Execute + validate flagship #3 notebook outputs
+uv run --with ./bindings/uni-db python website/scripts/verify_cyber_flagship_notebook.py
 ```
 
 ## Deployment

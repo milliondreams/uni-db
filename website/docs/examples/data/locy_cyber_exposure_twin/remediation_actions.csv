@@ -1,0 +1,17 @@
+action_id,cve_id,action_type,cost_index,downtime_hours,risk_reduction
+CVE-2024-3400::hotfix,CVE-2024-3400,hotfix_patch,8,2,0.8
+CVE-2024-3400::virtual,CVE-2024-3400,virtual_patch,3,0.5,0.52
+CVE-2023-3519::hotfix,CVE-2023-3519,hotfix_patch,9,2.5,0.84
+CVE-2023-3519::acl,CVE-2023-3519,acl_lockdown,2.8,0.3,0.46
+CVE-2023-4966::hotfix,CVE-2023-4966,hotfix_patch,8.5,2.5,0.8
+CVE-2023-4966::token,CVE-2023-4966,session_key_rotate,3.1,0.8,0.44
+CVE-2021-44228::patch,CVE-2021-44228,library_upgrade,5.5,1,0.76
+CVE-2021-44228::waf,CVE-2021-44228,waf_rule,2.2,0.1,0.38
+CVE-2022-1388::patch,CVE-2022-1388,firmware_patch,7.2,1.8,0.71
+CVE-2022-1388::isolate,CVE-2022-1388,network_isolation,3.4,0.6,0.49
+CVE-2023-22515::patch,CVE-2023-22515,hotfix_patch,5.9,1.2,0.67
+CVE-2023-22515::hardening,CVE-2023-22515,config_hardening,1.9,0.2,0.32
+CVE-2024-21762::patch,CVE-2024-21762,hotfix_patch,7.6,1.6,0.74
+CVE-2024-21762::geo,CVE-2024-21762,geo_fencing,2.6,0,0.35
+CVE-2023-46604::patch,CVE-2023-46604,broker_patch,6.2,1.4,0.69
+CVE-2023-46604::egress,CVE-2023-46604,egress_restrict,2.3,0,0.33

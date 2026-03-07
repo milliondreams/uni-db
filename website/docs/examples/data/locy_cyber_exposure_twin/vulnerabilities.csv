@@ -1,0 +1,9 @@
+cve_id,cwe,vendor,product_family,base_severity,attack_surface
+CVE-2024-3400,CWE-77,Palo Alto,Firewall,10,network
+CVE-2023-3519,CWE-94,Citrix,Gateway,9.8,network
+CVE-2023-4966,CWE-287,Citrix,NetScaler,9.4,network
+CVE-2021-44228,CWE-502,Apache,Log4j,10,app
+CVE-2022-1388,CWE-918,F5,BIG-IP,9.8,network
+CVE-2023-22515,CWE-285,Atlassian,Confluence,9.8,app
+CVE-2024-21762,CWE-89,Fortinet,FortiOS,9.6,network
+CVE-2023-46604,CWE-94,Apache,ActiveMQ,10,app

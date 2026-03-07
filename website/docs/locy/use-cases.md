@@ -40,6 +40,37 @@ Notebook:
 - Python: [Fraud Risk Propagation](../examples/python/locy_fraud_risk_propagation.ipynb)
 - Rust: [Fraud Risk Propagation](../examples/rust/locy_fraud_risk_propagation.ipynb)
 
+## 6. Semiconductor Yield Excursion Triage (Planned)
+
+Model excursion-driven failure triage in semiconductor manufacturing using real SECOM-derived data and full advanced Locy flow.
+
+Notebook:
+- Python: [Semiconductor Yield Excursion Triage](../examples/python/locy_semiconductor_yield_excursion.ipynb)
+
+Plan + Data:
+- Detailed notebook blueprint: [Semiconductor Yield Excursion Notebook Plan](semiconductor-yield-excursion-notebook-plan.md)
+- Data bundle: [SECOM-derived notebook data](../examples/data/locy_semiconductor_yield_excursion/README.md)
+
+## 7. Pharma Batch Genealogy Decisioning (Flagship #2)
+
+Use recursive path reasoning and action selection to model batch-risk propagation and choose interventions by risk-first optimization.
+
+Notebook:
+- Python: [Pharma Batch Genealogy](../examples/python/locy_pharma_batch_genealogy.ipynb)
+
+Data bundle:
+- [Pharma notebook data](../examples/data/locy_pharma_batch_genealogy/README.md)
+
+## 8. Cyber Exposure-to-Remediation Decision Twin (Flagship #3)
+
+Integrate hybrid evidence retrieval, columnar risk analytics, and Locy remediation reasoning in one flow for high-impact cyber prioritization.
+
+Notebook:
+- Python: [Cyber Exposure-to-Remediation Twin](../examples/python/locy_cyber_exposure_twin.ipynb)
+
+Data bundle:
+- [Cyber flagship notebook data](../examples/data/locy_cyber_exposure_twin/README.md)
+
 ## Pattern Template
 
 For each use case, model:

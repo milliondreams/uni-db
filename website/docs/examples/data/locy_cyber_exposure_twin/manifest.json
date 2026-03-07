@@ -1,0 +1,23 @@
+{
+  "generated_at": "2026-03-07T01:41:10.359678+00:00",
+  "snapshot_date": "2026-02-20",
+  "source": {
+    "description": "Curated deterministic snapshot inspired by KEV, EPSS, NVD, and ATT&CK references for docs/CI reproducibility.",
+    "urls": {
+      "cisa_kev": "https://www.cisa.gov/known-exploited-vulnerabilities-catalog",
+      "nvd": "https://nvd.nist.gov/",
+      "epss": "https://www.first.org/epss/",
+      "mitre_attack": "https://attack.mitre.org/"
+    },
+    "license_note": "Derived educational sample for documentation demos."
+  },
+  "shape": {
+    "assets": 12,
+    "vulnerabilities": 8,
+    "findings": 12,
+    "dependencies": 11,
+    "remediation_actions": 16,
+    "knowledge_docs": 8,
+    "notebook_cases": 4
+  }
+}

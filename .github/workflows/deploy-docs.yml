@@ -68,6 +68,15 @@ jobs:
         run: |
           pip install ./bindings/uni-pydantic
 
+      - name: Execute flagship Locy notebook (semiconductor)
+        run: python website/scripts/verify_semiconductor_flagship_notebook.py
+
+      - name: Execute flagship Locy notebook (pharma batch genealogy)
+        run: python website/scripts/verify_pharma_flagship_notebook.py
+
+      - name: Execute flagship Locy notebook (cyber exposure twin)
+        run: python website/scripts/verify_cyber_flagship_notebook.py
+
       # Clean up release artifacts to free disk space (keep wheels)
       - name: Clean up build artifacts
         run: |

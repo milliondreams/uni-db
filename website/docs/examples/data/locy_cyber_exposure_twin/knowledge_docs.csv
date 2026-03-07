@@ -1,0 +1,9 @@
+doc_id,doc_type,title,content,cve_id,embedding
+DOC-001,kev,CISA KEV alert for PAN-OS auth bypass,CVE-2024-3400 active exploitation observed in perimeter gateways. Prioritize internet exposed identity and VPN assets.,CVE-2024-3400,"[0.95,0.12,0.05,0.88]"
+DOC-002,advisory,Citrix ADC emergency mitigation,CVE-2023-3519 and CVE-2023-4966 enable remote execution or session theft. Apply hotfix and revoke active sessions.,CVE-2023-3519,"[0.91,0.18,0.07,0.82]"
+DOC-003,runbook,Virtual patch for edge gateways,Deploy virtual patch rules for internet-facing gateways before full maintenance window.,CVE-2024-21762,"[0.86,0.2,0.09,0.73]"
+DOC-004,runbook,Log4Shell isolation in OT middleware,CVE-2021-44228 in middleware connected to MES should be isolated and patched with urgency.,CVE-2021-44228,"[0.7,0.9,0.15,0.46]"
+DOC-005,advisory,F5 iControl REST exploitation notes,CVE-2022-1388 is used for pre-auth command execution. Restrict management interfaces and patch quickly.,CVE-2022-1388,"[0.77,0.52,0.11,0.66]"
+DOC-006,advisory,Confluence auth bypass containment,CVE-2023-22515 requires rapid patching and hardening. Restrict external access while patching.,CVE-2023-22515,"[0.55,0.49,0.42,0.57]"
+DOC-007,advisory,ActiveMQ deserialization exploit response,CVE-2023-46604 exploited in broker systems. Restrict egress and patch broker services.,CVE-2023-46604,"[0.64,0.84,0.21,0.62]"
+DOC-008,policy,Patch prioritization policy for KEV assets,KEV-listed findings on critical assets must be remediated within one patch cycle.,,"[0.88,0.1,0.52,0.79]"

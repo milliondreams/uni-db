@@ -25,7 +25,11 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Verify generated Locy notebooks
-        run: python3 website/scripts/generate_locy_notebooks.py --check
+        run: |
+          python3 website/scripts/generate_locy_notebooks.py --check
+          python3 website/scripts/generate_semiconductor_flagship_notebook.py --check
+          python3 website/scripts/generate_pharma_flagship_notebook.py --check
+          python3 website/scripts/generate_cyber_flagship_notebook.py --check
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -109,6 +113,15 @@ jobs:
       - name: Build Python bindings (uni-db)
         working-directory: bindings/uni-db
         run: uv run maturin develop
+
+      - name: Execute flagship Locy notebook (semiconductor)
+        run: uv run --project bindings/uni-db python website/scripts/verify_semiconductor_flagship_notebook.py
+
+      - name: Execute flagship Locy notebook (pharma batch genealogy)
+        run: uv run --project bindings/uni-db python website/scripts/verify_pharma_flagship_notebook.py
+
+      - name: Execute flagship Locy notebook (cyber exposure twin)
+        run: uv run --project bindings/uni-db python website/scripts/verify_cyber_flagship_notebook.py
 
       - name: Check Python formatting (uni-db)
         working-directory: bindings/uni-db

@@ -89,6 +89,9 @@ nav:
           - "Locy: Infrastructure Blast Radius": examples/python/locy_infrastructure_blast_radius.ipynb
           - "Locy: Supply Chain Provenance": examples/python/locy_supply_chain_provenance.ipynb
           - "Locy: Fraud Risk Propagation": examples/python/locy_fraud_risk_propagation.ipynb
+          - "Locy: Semiconductor Yield Excursion (Flagship)": examples/python/locy_semiconductor_yield_excursion.ipynb
+          - "Locy: Pharma Batch Genealogy (Flagship #2)": examples/python/locy_pharma_batch_genealogy.ipynb
+          - "Locy: Cyber Exposure-to-Remediation Twin (Flagship #3)": examples/python/locy_cyber_exposure_twin.ipynb
       - Pydantic OGM:
           - Supply Chain: examples/pydantic/supply_chain.ipynb
           - Recommendation: examples/pydantic/recommendation.ipynb

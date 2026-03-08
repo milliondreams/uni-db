@@ -18,7 +18,7 @@ use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
 use uni_common::Value;
-use uni_common::core::schema::Schema as UniSchema;
+use uni_common::core::schema::{DistanceMetric, Schema as UniSchema};
 use uni_cypher::ast::{BinaryOp, CypherLiteral, Expr};
 use uni_store::storage::manager::StorageManager;
 
@@ -1293,6 +1293,20 @@ pub(crate) fn extract_scalar_key(
             }
         })
         .collect()
+}
+
+/// Convert a raw distance value into a normalised similarity score.
+///
+/// The conversion depends on the distance metric:
+/// - **Cosine**: `(2 - d) / 2` (LanceDB cosine distance ranges 0..2)
+/// - **Dot**: pass-through (already a similarity measure)
+/// - **L2** and others: `1 / (1 + d)`
+pub fn calculate_score(distance: f32, metric: &DistanceMetric) -> f32 {
+    match metric {
+        DistanceMetric::Cosine => (2.0 - distance) / 2.0,
+        DistanceMetric::Dot => distance,
+        _ => 1.0 / (1.0 + distance),
+    }
 }
 
 #[cfg(test)]

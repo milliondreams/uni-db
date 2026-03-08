@@ -15,8 +15,9 @@
 
 use crate::query::df_graph::GraphExecutionContext;
 use crate::query::df_graph::common::{
-    compute_plan_properties, evaluate_simple_expr, labels_data_type,
+    calculate_score, compute_plan_properties, evaluate_simple_expr, labels_data_type,
 };
+use uni_common::core::schema::DistanceMetric;
 use crate::query::df_graph::scan::resolve_property_type;
 use arrow_array::builder::{
     BooleanBuilder, Float32Builder, Float64Builder, Int64Builder, StringBuilder, UInt64Builder,
@@ -1309,7 +1310,7 @@ async fn execute_vector_query(
     let metric = uni_schema
         .vector_index_for_property(&label, &property)
         .map(|config| config.metric.clone())
-        .unwrap_or(uni_common::core::schema::DistanceMetric::L2);
+        .unwrap_or(DistanceMetric::L2);
 
     build_search_result_batch(
         &results,
@@ -1369,7 +1370,7 @@ async fn execute_fts_query(
     build_search_result_batch(
         &results,
         &label,
-        &uni_common::core::schema::DistanceMetric::L2,
+        &DistanceMetric::L2,
         yield_items,
         target_properties,
         graph_ctx,
@@ -1531,7 +1532,7 @@ async fn execute_hybrid_search(
                 .vector_index_for_property(&label, vp)
                 .map(|config| config.metric.clone())
         })
-        .unwrap_or(uni_common::core::schema::DistanceMetric::L2);
+        .unwrap_or(DistanceMetric::L2);
 
     let score_ctx = HybridScoreContext {
         vec_score_map: &vec_score_map,
@@ -1631,7 +1632,7 @@ struct HybridScoreContext<'a> {
     vec_score_map: &'a HashMap<Vid, f32>,
     fts_score_map: &'a HashMap<Vid, f32>,
     fts_max: f32,
-    metric: &'a uni_common::core::schema::DistanceMetric,
+    metric: &'a DistanceMetric,
 }
 
 /// Build a RecordBatch for hybrid search results with fused, vector, and FTS scores.
@@ -1762,7 +1763,7 @@ async fn build_hybrid_search_batch(
 async fn build_search_result_batch(
     results: &[(Vid, f32)],
     label: &str,
-    metric: &uni_common::core::schema::DistanceMetric,
+    metric: &DistanceMetric,
     yield_items: &[(String, Option<String>)],
     target_properties: &HashMap<String, Vec<String>>,
     graph_ctx: &GraphExecutionContext,
@@ -1929,17 +1930,3 @@ fn extract_vector(val: &Value) -> DFResult<Vec<f32>> {
     }
 }
 
-/// Calculate normalized score from distance based on distance metric.
-fn calculate_score(distance: f32, metric: &uni_common::core::schema::DistanceMetric) -> f32 {
-    match metric {
-        uni_common::core::schema::DistanceMetric::Cosine => {
-            // Cosine distance → similarity: (2 - d) / 2
-            (2.0 - distance) / 2.0
-        }
-        uni_common::core::schema::DistanceMetric::Dot => distance,
-        _ => {
-            // L2 and others: 1 / (1 + d)
-            1.0 / (1.0 + distance)
-        }
-    }
-}

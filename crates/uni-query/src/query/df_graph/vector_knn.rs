@@ -15,7 +15,7 @@
 
 use crate::query::df_graph::GraphExecutionContext;
 use crate::query::df_graph::common::{
-    compute_plan_properties, evaluate_simple_expr, labels_data_type,
+    calculate_score, compute_plan_properties, evaluate_simple_expr, labels_data_type,
 };
 use crate::query::df_graph::scan::resolve_property_type;
 use arrow_array::builder::{Float32Builder, StringBuilder, UInt64Builder};
@@ -34,6 +34,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use uni_common::Value;
 use uni_common::core::id::Vid;
+use uni_common::core::schema::DistanceMetric;
 use uni_cypher::ast::Expr;
 
 /// Vector KNN search execution plan.
@@ -455,13 +456,21 @@ async fn execute_vector_search(
         .await
         .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
 
+    // Look up the distance metric for this vector property so we can
+    // convert raw distances into normalised similarity scores correctly.
+    let metric = storage
+        .schema_manager()
+        .schema()
+        .vector_index_for_property(label_name, property)
+        .map(|cfg| cfg.metric.clone())
+        .unwrap_or(DistanceMetric::L2);
+
     // Filter by threshold and build result
     let mut vids = Vec::new();
     let mut scores = Vec::new();
 
     for (vid, distance) in results {
-        // Convert distance to similarity (assuming Cosine/Dot product)
-        let similarity = 1.0 - distance;
+        let similarity = calculate_score(distance, &metric);
 
         if let Some(thresh) = threshold
             && similarity < thresh

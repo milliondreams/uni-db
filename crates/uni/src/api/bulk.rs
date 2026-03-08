@@ -1007,7 +1007,18 @@ impl<'a> BulkWriter<'a> {
             let labels_to_rebuild: Vec<String> = self.touched_labels.iter().cloned().collect();
 
             if self.config.async_indexes && !labels_to_rebuild.is_empty() {
-                // Async mode: schedule rebuilds in background
+                // Async mode: mark affected indexes as Stale before scheduling
+                let schema = self.db.schema.schema();
+                for label in &labels_to_rebuild {
+                    for idx in &schema.indexes {
+                        if idx.label() == label.as_str() {
+                            let _ = self.db.schema.update_index_metadata(idx.name(), |m| {
+                                m.status = uni_common::core::schema::IndexStatus::Stale;
+                            });
+                        }
+                    }
+                }
+
                 let rebuild_manager = IndexRebuildManager::new(
                     self.db.storage.clone(),
                     self.db.schema.clone(),
@@ -1024,9 +1035,6 @@ impl<'a> BulkWriter<'a> {
                 self.stats.index_task_ids = task_ids;
                 self.stats.indexes_pending = true;
 
-                // Start background worker if not already running
-                // Note: The Uni instance should manage the IndexRebuildManager lifecycle
-                // For now, we start a new worker for each bulk commit
                 let manager = Arc::new(rebuild_manager);
                 let handle = manager.start_background_worker(self.db.shutdown_handle.subscribe());
                 self.db.shutdown_handle.track_task(handle);
@@ -1050,6 +1058,34 @@ impl<'a> BulkWriter<'a> {
                         .await
                         .map_err(UniError::Internal)?;
                     self.stats.indexes_rebuilt += 1;
+
+                    // Update index metadata after successful sync rebuild
+                    let now = chrono::Utc::now();
+                    let row_count = self
+                        .db
+                        .storage
+                        .lancedb_store()
+                        .open_vertex_table(label)
+                        .await
+                        .ok()
+                        .map(|t| async move { t.count_rows(None).await.ok().map(|c| c as u64) });
+                    let row_count = match row_count {
+                        Some(fut) => fut.await,
+                        None => None,
+                    };
+
+                    let schema = self.db.schema.schema();
+                    for idx in &schema.indexes {
+                        if idx.label() == label.as_str() {
+                            let _ = self.db.schema.update_index_metadata(idx.name(), |m| {
+                                m.status = uni_common::core::schema::IndexStatus::Online;
+                                m.last_built_at = Some(now);
+                                if let Some(count) = row_count {
+                                    m.row_count_at_build = Some(count);
+                                }
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -1144,6 +1180,13 @@ impl<'a> BulkWriter<'a> {
             .storage
             .snapshot_manager()
             .set_latest_snapshot(&manifest.snapshot_id)
+            .await
+            .map_err(UniError::Internal)?;
+
+        // Save schema with updated index metadata
+        self.db
+            .schema
+            .save()
             .await
             .map_err(UniError::Internal)?;
 

@@ -29,6 +29,7 @@ fn create_fts_test_schema() -> Schema {
                 column: "_doc".to_string(),
                 paths: vec![],
                 with_positions: true,
+                metadata: Default::default(),
             },
         ));
 

@@ -7163,6 +7163,7 @@ impl QueryPlanner {
                     metric: DistanceMetric::Cosine,
                     index_type,
                     embedding_config,
+                    metadata: Default::default(),
                 };
                 Ok(LogicalPlan::CreateVectorIndex {
                     config,
@@ -7176,6 +7177,7 @@ impl QueryPlanner {
                     properties: cfg.properties,
                     tokenizer: TokenizerConfig::Standard,
                     with_positions: true,
+                    metadata: Default::default(),
                 },
                 if_not_exists: cfg.if_not_exists,
             }),
@@ -7194,6 +7196,7 @@ impl QueryPlanner {
                         properties,
                         index_type: ScalarIndexType::BTree,
                         where_clause: cfg.where_clause.map(|e| e.to_string_repr()),
+                        metadata: Default::default(),
                     },
                     if_not_exists: cfg.if_not_exists,
                 })
@@ -7211,6 +7214,7 @@ impl QueryPlanner {
                         column: cfg.column,
                         paths: Vec::new(),
                         with_positions,
+                        metadata: Default::default(),
                     },
                     if_not_exists: cfg.if_not_exists,
                 })

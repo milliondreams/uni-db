@@ -714,6 +714,22 @@ impl Uni {
         Ok(manager.is_index_building(label))
     }
 
+    /// List all indexes defined on a specific label.
+    pub fn list_indexes(&self, label: &str) -> Vec<uni_common::core::schema::IndexDefinition> {
+        let schema = self.schema.schema();
+        schema
+            .indexes
+            .iter()
+            .filter(|i| i.label() == label)
+            .cloned()
+            .collect()
+    }
+
+    /// List all indexes in the database.
+    pub fn list_all_indexes(&self) -> Vec<uni_common::core::schema::IndexDefinition> {
+        self.schema.schema().indexes.clone()
+    }
+
     /// Shutdown the database gracefully, flushing pending data and stopping background tasks.
     ///
     /// This method flushes any pending data and waits for all background tasks to complete
@@ -1301,6 +1317,30 @@ impl UniBuilder {
                 .map_err(UniError::Internal)?;
             if replayed > 0 {
                 info!("WAL recovery: replayed {} mutations", replayed);
+            }
+        }
+
+        // Wire up IndexRebuildManager for post-flush automatic rebuild scheduling
+        if self.config.index_rebuild.auto_rebuild_enabled {
+            let rebuild_manager = Arc::new(
+                uni_store::storage::IndexRebuildManager::new(
+                    storage.clone(),
+                    schema_manager.clone(),
+                    self.config.index_rebuild.clone(),
+                )
+                .await
+                .map_err(UniError::Internal)?,
+            );
+
+            let handle =
+                rebuild_manager
+                    .clone()
+                    .start_background_worker(shutdown_handle.subscribe());
+            shutdown_handle.track_task(handle);
+
+            {
+                let mut writer_guard = writer.write().await;
+                writer_guard.set_index_rebuild_manager(rebuild_manager);
             }
         }
 

@@ -5,7 +5,9 @@ use std::collections::{HashMap, HashSet};
 use uni_cypher::ast::{BinaryOp, CypherLiteral, Expr, UnaryOp};
 
 use uni_common::core::id::UniId;
-use uni_common::core::schema::{IndexDefinition, PropertyMeta, Schema};
+use uni_common::core::schema::{
+    IndexDefinition, IndexStatus, PropertyMeta, ScalarIndexType, Schema,
+};
 
 /// Categorized pushdown strategy for predicates with index awareness.
 ///
@@ -157,10 +159,11 @@ impl<'a> IndexAwareAnalyzer<'a> {
             let label_name = self.schema.label_name_by_id(label_id)?;
 
             for idx in &self.schema.indexes {
-                if let uni_common::core::schema::IndexDefinition::Scalar(cfg) = idx
+                if let IndexDefinition::Scalar(cfg) = idx
                     && cfg.label == *label_name
                     && cfg.properties.contains(prop)
-                    && cfg.index_type == uni_common::core::schema::ScalarIndexType::BTree
+                    && cfg.index_type == ScalarIndexType::BTree
+                    && cfg.metadata.status == IndexStatus::Online
                 {
                     // Calculate the upper bound by incrementing the last character
                     // For "John" -> "Joho"
@@ -202,6 +205,7 @@ impl<'a> IndexAwareAnalyzer<'a> {
                 if let IndexDefinition::JsonFullText(cfg) = idx
                     && cfg.label == *label_name
                     && cfg.column == *prop
+                    && cfg.metadata.status == IndexStatus::Online
                 {
                     return Some((prop.clone(), term.clone(), None));
                 }

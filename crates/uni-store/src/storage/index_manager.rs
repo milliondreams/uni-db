@@ -390,25 +390,15 @@ impl IndexManager {
     pub async fn drop_index(&self, name: &str) -> Result<()> {
         info!("Dropping index '{}'", name);
 
-        let idx_def = self
+        // Verify the index exists before removing
+        let _idx_def = self
             .schema_manager
             .get_index(name)
             .ok_or_else(|| anyhow!("Index '{}' not found in schema", name))?;
 
-        let label = idx_def.label();
-
-        if let Some(label_meta) = self.schema_manager.schema().labels.get(label) {
-            let ds_wrapper = VertexDataset::new(&self.base_uri, label, label_meta.id);
-            if let Ok(_lance_ds) = ds_wrapper.open_raw().await {
-                // Attempt physical drop
-                // if let Err(e) = lance_ds.drop_index(name).await {
-                //     warn!("Failed to drop physical index (might not exist): {}", e);
-                // }
-                warn!(
-                    "Physical index drop not supported by current Lance version, removing from schema only."
-                );
-            }
-        }
+        // Physical index drop is not supported by the current Lance version,
+        // so we only remove the definition from the schema.
+        warn!("Physical index drop not yet supported, removing from schema only.");
 
         self.schema_manager.remove_index(name)?;
         self.schema_manager.save().await?;
@@ -420,39 +410,22 @@ impl IndexManager {
         info!("Rebuilding all indexes for label '{}'", label);
         let schema = self.schema_manager.schema();
 
-        // Clone definitions to avoid holding lock while async awaiting
-        let indexes = schema.indexes.clone();
+        // Clone and filter to avoid holding lock while async awaiting
+        let indexes: Vec<_> = schema
+            .indexes
+            .iter()
+            .filter(|idx| idx.label() == label)
+            .cloned()
+            .collect();
 
         for index in indexes {
             match index {
-                IndexDefinition::Vector(cfg) => {
-                    if cfg.label == label {
-                        self.create_vector_index(cfg).await?;
-                    }
-                }
-                IndexDefinition::Scalar(cfg) => {
-                    if cfg.label == label {
-                        self.create_scalar_index(cfg).await?;
-                    }
-                }
-                IndexDefinition::FullText(cfg) => {
-                    if cfg.label == label {
-                        self.create_fts_index(cfg).await?;
-                    }
-                }
-                IndexDefinition::Inverted(cfg) => {
-                    if cfg.label == label {
-                        self.create_inverted_index(cfg).await?;
-                    }
-                }
-                IndexDefinition::JsonFullText(cfg) => {
-                    if cfg.label == label {
-                        self.create_json_fts_index(cfg).await?;
-                    }
-                }
-                _ => {
-                    log::warn!("Unknown index type encountered during rebuild, skipping");
-                }
+                IndexDefinition::Vector(cfg) => self.create_vector_index(cfg).await?,
+                IndexDefinition::Scalar(cfg) => self.create_scalar_index(cfg).await?,
+                IndexDefinition::FullText(cfg) => self.create_fts_index(cfg).await?,
+                IndexDefinition::Inverted(cfg) => self.create_inverted_index(cfg).await?,
+                IndexDefinition::JsonFullText(cfg) => self.create_json_fts_index(cfg).await?,
+                _ => warn!("Unknown index type encountered during rebuild, skipping"),
             }
         }
         Ok(())
@@ -496,6 +469,7 @@ impl IndexManager {
                 properties: properties.to_vec(),
                 index_type: uni_common::core::schema::ScalarIndexType::BTree,
                 where_clause: None,
+                metadata: Default::default(),
             };
 
             self.schema_manager

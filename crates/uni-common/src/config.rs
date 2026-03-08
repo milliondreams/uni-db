@@ -50,6 +50,15 @@ pub struct IndexRebuildConfig {
 
     /// How often to check for pending index rebuild tasks (default: 5s).
     pub worker_check_interval: Duration,
+
+    /// Row growth ratio to trigger rebuild (default: 0.5 = 50%). Set 0.0 to disable.
+    pub growth_trigger_ratio: f64,
+
+    /// Max index age before rebuild. `None` disables the time-based trigger.
+    pub max_index_age: Option<Duration>,
+
+    /// Enable post-flush automatic rebuild scheduling (default: false).
+    pub auto_rebuild_enabled: bool,
 }
 
 impl Default for IndexRebuildConfig {
@@ -58,6 +67,9 @@ impl Default for IndexRebuildConfig {
             max_retries: 3,
             retry_delay: Duration::from_secs(60),
             worker_check_interval: Duration::from_secs(5),
+            growth_trigger_ratio: 0.5,
+            max_index_age: None,
+            auto_rebuild_enabled: false,
         }
     }
 }

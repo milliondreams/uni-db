@@ -231,6 +231,7 @@ impl<'a> LabelBuilder<'a> {
                 index_type: cfg.algorithm.into_internal(),
                 metric: cfg.metric.into_internal(),
                 embedding_config: cfg.embedding.map(|e| e.into_internal()),
+                metadata: Default::default(),
             }),
             IndexType::FullText => IndexDefinition::FullText(FullTextIndexConfig {
                 name: format!("fts_{}_{}", self.name, property),
@@ -238,6 +239,7 @@ impl<'a> LabelBuilder<'a> {
                 properties: vec![property.to_string()],
                 tokenizer: TokenizerConfig::Standard,
                 with_positions: true,
+                metadata: Default::default(),
             }),
             IndexType::Scalar(stype) => IndexDefinition::Scalar(ScalarIndexConfig {
                 name: format!("idx_{}_{}", self.name, property),
@@ -245,6 +247,7 @@ impl<'a> LabelBuilder<'a> {
                 properties: vec![property.to_string()],
                 index_type: stype.into_internal(),
                 where_clause: None,
+                metadata: Default::default(),
             }),
             IndexType::Inverted(config) => IndexDefinition::Inverted(config),
         };

@@ -388,6 +388,7 @@ impl Schema {
             if let IndexDefinition::Vector(config) = idx
                 && config.label == label
                 && config.property == property
+                && config.metadata.status == IndexStatus::Online
             {
                 return Some(config);
             }
@@ -474,6 +475,34 @@ impl Schema {
     }
 }
 
+/// Lifecycle status of an index.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum IndexStatus {
+    /// Index is up-to-date and available for queries.
+    #[default]
+    Online,
+    /// Index is currently being rebuilt.
+    Building,
+    /// Index is outdated and scheduled for rebuild.
+    Stale,
+    /// Index rebuild failed after exhausting retries.
+    Failed,
+}
+
+/// Metadata tracking the lifecycle state of an index.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct IndexMetadata {
+    /// Current lifecycle status.
+    #[serde(default)]
+    pub status: IndexStatus,
+    /// When the index was last successfully built.
+    #[serde(default)]
+    pub last_built_at: Option<DateTime<Utc>>,
+    /// Row count of the dataset when the index was last built.
+    #[serde(default)]
+    pub row_count_at_build: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 #[non_exhaustive]
@@ -507,6 +536,28 @@ impl IndexDefinition {
             IndexDefinition::JsonFullText(c) => &c.label,
         }
     }
+
+    /// Returns a reference to the index lifecycle metadata.
+    pub fn metadata(&self) -> &IndexMetadata {
+        match self {
+            IndexDefinition::Vector(c) => &c.metadata,
+            IndexDefinition::FullText(c) => &c.metadata,
+            IndexDefinition::Scalar(c) => &c.metadata,
+            IndexDefinition::Inverted(c) => &c.metadata,
+            IndexDefinition::JsonFullText(c) => &c.metadata,
+        }
+    }
+
+    /// Returns a mutable reference to the index lifecycle metadata.
+    pub fn metadata_mut(&mut self) -> &mut IndexMetadata {
+        match self {
+            IndexDefinition::Vector(c) => &mut c.metadata,
+            IndexDefinition::FullText(c) => &mut c.metadata,
+            IndexDefinition::Scalar(c) => &mut c.metadata,
+            IndexDefinition::Inverted(c) => &mut c.metadata,
+            IndexDefinition::JsonFullText(c) => &mut c.metadata,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -518,6 +569,8 @@ pub struct InvertedIndexConfig {
     pub normalize: bool,
     #[serde(default = "default_max_terms_per_doc")]
     pub max_terms_per_doc: usize,
+    #[serde(default)]
+    pub metadata: IndexMetadata,
 }
 
 fn default_normalize() -> bool {
@@ -536,6 +589,8 @@ pub struct VectorIndexConfig {
     pub index_type: VectorIndexType,
     pub metric: DistanceMetric,
     pub embedding_config: Option<EmbeddingConfig>,
+    #[serde(default)]
+    pub metadata: IndexMetadata,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -608,6 +663,8 @@ pub struct FullTextIndexConfig {
     pub properties: Vec<String>,
     pub tokenizer: TokenizerConfig,
     pub with_positions: bool,
+    #[serde(default)]
+    pub metadata: IndexMetadata,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -628,6 +685,8 @@ pub struct JsonFtsIndexConfig {
     pub paths: Vec<String>,
     #[serde(default)]
     pub with_positions: bool,
+    #[serde(default)]
+    pub metadata: IndexMetadata,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -637,6 +696,8 @@ pub struct ScalarIndexConfig {
     pub properties: Vec<String>,
     pub index_type: ScalarIndexType,
     pub where_clause: Option<String>,
+    #[serde(default)]
+    pub metadata: IndexMetadata,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -961,6 +1022,26 @@ impl SchemaManager {
         schema.indexes.iter().find(|i| i.name() == name).cloned()
     }
 
+    /// Updates the lifecycle metadata for an index by name.
+    ///
+    /// The closure receives a mutable reference to the index's `IndexMetadata`,
+    /// allowing callers to update status, timestamps, etc.
+    pub fn update_index_metadata(
+        &self,
+        index_name: &str,
+        f: impl FnOnce(&mut IndexMetadata),
+    ) -> Result<()> {
+        let mut guard = acquire_write(&self.schema, "schema")?;
+        let schema = Arc::make_mut(&mut *guard);
+        let idx = schema
+            .indexes
+            .iter_mut()
+            .find(|i| i.name() == index_name)
+            .ok_or_else(|| anyhow!("Index '{}' not found", index_name))?;
+        f(idx.metadata_mut());
+        Ok(())
+    }
+
     pub fn remove_index(&self, name: &str) -> Result<()> {
         let mut guard = acquire_write(&self.schema, "schema")?;
         let schema = Arc::make_mut(&mut *guard);
@@ -1183,5 +1264,126 @@ mod tests {
         assert_eq!(col1, col2);
         assert_eq!(col2, col3);
         assert!(col1.starts_with("_gen_LOWER_email_"));
+    }
+
+    #[test]
+    fn test_index_metadata_serde_backward_compat() {
+        // Simulate old JSON without metadata field
+        let json = r#"{
+            "type": "Scalar",
+            "name": "idx_person_name",
+            "label": "Person",
+            "properties": ["name"],
+            "index_type": "BTree",
+            "where_clause": null
+        }"#;
+        let def: IndexDefinition = serde_json::from_str(json).unwrap();
+        let meta = def.metadata();
+        assert_eq!(meta.status, IndexStatus::Online);
+        assert!(meta.last_built_at.is_none());
+        assert!(meta.row_count_at_build.is_none());
+    }
+
+    #[test]
+    fn test_index_metadata_serde_roundtrip() {
+        let now = Utc::now();
+        let def = IndexDefinition::Scalar(ScalarIndexConfig {
+            name: "idx_test".to_string(),
+            label: "Test".to_string(),
+            properties: vec!["prop".to_string()],
+            index_type: ScalarIndexType::BTree,
+            where_clause: None,
+            metadata: IndexMetadata {
+                status: IndexStatus::Building,
+                last_built_at: Some(now),
+                row_count_at_build: Some(42),
+            },
+        });
+
+        let json = serde_json::to_string(&def).unwrap();
+        let parsed: IndexDefinition = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.metadata().status, IndexStatus::Building);
+        assert_eq!(parsed.metadata().row_count_at_build, Some(42));
+        assert!(parsed.metadata().last_built_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_update_index_metadata() -> Result<()> {
+        let dir = tempdir()?;
+        let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path())?);
+        let path = ObjectStorePath::from("schema.json");
+        let manager = SchemaManager::load_from_store(store, &path).await?;
+
+        manager.add_label("Person")?;
+        let idx = IndexDefinition::Scalar(ScalarIndexConfig {
+            name: "idx_test".to_string(),
+            label: "Person".to_string(),
+            properties: vec!["name".to_string()],
+            index_type: ScalarIndexType::BTree,
+            where_clause: None,
+            metadata: Default::default(),
+        });
+        manager.add_index(idx)?;
+
+        // Verify initial status is Online
+        let initial = manager.get_index("idx_test").unwrap();
+        assert_eq!(initial.metadata().status, IndexStatus::Online);
+
+        // Update to Building
+        manager.update_index_metadata("idx_test", |m| {
+            m.status = IndexStatus::Building;
+            m.row_count_at_build = Some(100);
+        })?;
+
+        let updated = manager.get_index("idx_test").unwrap();
+        assert_eq!(updated.metadata().status, IndexStatus::Building);
+        assert_eq!(updated.metadata().row_count_at_build, Some(100));
+
+        // Non-existent index should error
+        assert!(manager.update_index_metadata("nope", |_| {}).is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_vector_index_for_property_skips_non_online() {
+        let mut schema = Schema::default();
+        schema.labels.insert(
+            "Document".to_string(),
+            LabelMeta {
+                id: 1,
+                created_at: chrono::Utc::now(),
+                state: SchemaElementState::Active,
+            },
+        );
+
+        // Add a vector index with Stale status
+        schema
+            .indexes
+            .push(IndexDefinition::Vector(VectorIndexConfig {
+                name: "vec_doc_embedding".to_string(),
+                label: "Document".to_string(),
+                property: "embedding".to_string(),
+                index_type: VectorIndexType::Flat,
+                metric: DistanceMetric::Cosine,
+                embedding_config: None,
+                metadata: IndexMetadata {
+                    status: IndexStatus::Stale,
+                    ..Default::default()
+                },
+            }));
+
+        // Stale index should NOT be returned
+        assert!(schema
+            .vector_index_for_property("Document", "embedding")
+            .is_none());
+
+        // Set to Online — should now be returned
+        if let IndexDefinition::Vector(cfg) = &mut schema.indexes[0] {
+            cfg.metadata.status = IndexStatus::Online;
+        }
+        let result = schema.vector_index_for_property("Document", "embedding");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().metric, DistanceMetric::Cosine);
     }
 }

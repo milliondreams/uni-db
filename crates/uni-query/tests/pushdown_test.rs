@@ -278,7 +278,9 @@ fn test_index_aware_combined_predicates() {
 // BTree STARTS WITH Pushdown Tests
 // =====================================================================
 
-use uni_common::core::schema::{IndexDefinition, ScalarIndexConfig, ScalarIndexType};
+use uni_common::core::schema::{
+    IndexDefinition, IndexStatus, ScalarIndexConfig, ScalarIndexType,
+};
 
 fn create_test_schema_with_btree_index(label: &str, label_id: u16, index_property: &str) -> Schema {
     let mut schema = Schema::default();
@@ -298,6 +300,7 @@ fn create_test_schema_with_btree_index(label: &str, label_id: u16, index_propert
             properties: vec![index_property.to_string()],
             index_type: ScalarIndexType::BTree,
             where_clause: None,
+            metadata: Default::default(),
         }));
     schema
 }
@@ -379,15 +382,7 @@ fn test_btree_starts_with_empty_prefix() {
 
 #[test]
 fn test_btree_starts_with_hash_index_not_used() {
-    let mut schema = Schema::default();
-    schema.labels.insert(
-        "Person".to_string(),
-        LabelMeta {
-            id: 1,
-            created_at: chrono::Utc::now(),
-            state: SchemaElementState::Active,
-        },
-    );
+    let mut schema = create_test_schema_with_label("Person", 1);
     // Add a Hash index instead of BTree
     schema
         .indexes
@@ -397,6 +392,7 @@ fn test_btree_starts_with_hash_index_not_used() {
             properties: vec!["name".to_string()],
             index_type: ScalarIndexType::Hash, // Not BTree
             where_clause: None,
+            metadata: Default::default(),
         }));
 
     // Create predicate: n.name STARTS WITH 'John'
@@ -507,15 +503,7 @@ fn test_btree_starts_with_unicode() {
 
 #[test]
 fn test_btree_starts_with_multiple_indexed_properties() {
-    let mut schema = Schema::default();
-    schema.labels.insert(
-        "Person".to_string(),
-        LabelMeta {
-            id: 1,
-            created_at: chrono::Utc::now(),
-            state: SchemaElementState::Active,
-        },
-    );
+    let mut schema = create_test_schema_with_label("Person", 1);
     // Index covers multiple properties
     schema
         .indexes
@@ -525,6 +513,7 @@ fn test_btree_starts_with_multiple_indexed_properties() {
             properties: vec!["name".to_string(), "email".to_string()],
             index_type: ScalarIndexType::BTree,
             where_clause: None,
+            metadata: Default::default(),
         }));
 
     // Test name (indexed)
@@ -554,4 +543,41 @@ fn test_btree_starts_with_multiple_indexed_properties() {
 
     let strategy2 = analyzer.analyze(&expr2, "n", 1);
     assert_eq!(strategy2.btree_prefix_scans.len(), 1);
+}
+
+#[test]
+fn test_btree_prefix_scan_skips_non_online_index() {
+    // Start with a normal BTree-indexed schema, then set the index to Building
+    let mut schema = create_test_schema_with_btree_index("Person", 1, "name");
+    if let IndexDefinition::Scalar(cfg) = &mut schema.indexes[0] {
+        cfg.metadata.status = IndexStatus::Building;
+    }
+
+    // Create predicate: n.name STARTS WITH 'John'
+    let expr = Expr::BinaryOp {
+        left: Box::new(Expr::Property(
+            Box::new(Expr::Variable("n".to_string())),
+            "name".to_string(),
+        )),
+        op: BinaryOp::StartsWith,
+        right: Box::new(Expr::Literal(CypherLiteral::String("John".to_string()))),
+    };
+
+    let analyzer = IndexAwareAnalyzer::new(&schema);
+    let strategy = analyzer.analyze(&expr, "n", 1);
+
+    // Building index should NOT be used for BTree prefix scan
+    assert!(strategy.btree_prefix_scans.is_empty());
+    // Should fall through to lance_predicates
+    assert_eq!(strategy.lance_predicates.len(), 1);
+
+    // Now set to Online — should be used
+    if let IndexDefinition::Scalar(cfg) = &mut schema.indexes[0] {
+        cfg.metadata.status = IndexStatus::Online;
+    }
+    let analyzer = IndexAwareAnalyzer::new(&schema);
+    let strategy = analyzer.analyze(&expr, "n", 1);
+    assert_eq!(strategy.btree_prefix_scans.len(), 1);
+    assert_eq!(strategy.btree_prefix_scans[0].0, "name");
+    assert!(strategy.lance_predicates.is_empty());
 }

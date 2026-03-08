@@ -58,6 +58,8 @@ pub struct Writer {
     last_flush_time: std::time::Instant,
     /// Background compaction task handle (prevents concurrent compaction races)
     compaction_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
+    /// Optional index rebuild manager for post-flush automatic rebuild scheduling
+    index_rebuild_manager: Option<Arc<crate::storage::index_rebuild::IndexRebuildManager>>,
 }
 
 impl Writer {
@@ -115,7 +117,16 @@ impl Writer {
             adjacency_manager,
             last_flush_time: std::time::Instant::now(),
             compaction_handle: Arc::new(RwLock::new(None)),
+            index_rebuild_manager: None,
         })
+    }
+
+    /// Set the index rebuild manager for post-flush automatic rebuild scheduling.
+    pub fn set_index_rebuild_manager(
+        &mut self,
+        manager: Arc<crate::storage::index_rebuild::IndexRebuildManager>,
+    ) {
+        self.index_rebuild_manager = Some(manager);
     }
 
     /// Replay WAL mutations into the current L0 buffer.
@@ -2483,7 +2494,50 @@ impl Writer {
             }
         }
 
+        // Post-flush: check if any indexes need rebuilding based on thresholds
+        if let Some(ref rebuild_mgr) = self.index_rebuild_manager
+            && self.config.index_rebuild.auto_rebuild_enabled
+        {
+            self.schedule_index_rebuilds_if_needed(&manifest, rebuild_mgr.clone());
+        }
+
         Ok(snapshot_id)
+    }
+
+    /// Check rebuild thresholds and schedule background index rebuilds for
+    /// labels that exceed growth or age limits. Marks affected indexes as
+    /// `Stale` and spawns an async task to schedule the rebuild.
+    fn schedule_index_rebuilds_if_needed(
+        &self,
+        manifest: &SnapshotManifest,
+        rebuild_mgr: Arc<crate::storage::index_rebuild::IndexRebuildManager>,
+    ) {
+        let checker = crate::storage::index_rebuild::RebuildTriggerChecker::new(
+            self.config.index_rebuild.clone(),
+        );
+        let schema = self.schema_manager.schema();
+        let labels = checker.labels_needing_rebuild(manifest, &schema.indexes);
+
+        if labels.is_empty() {
+            return;
+        }
+
+        // Mark affected indexes as Stale
+        for label in &labels {
+            for idx in &schema.indexes {
+                if idx.label() == label {
+                    let _ = self.schema_manager.update_index_metadata(idx.name(), |m| {
+                        m.status = uni_common::core::schema::IndexStatus::Stale;
+                    });
+                }
+            }
+        }
+
+        tokio::spawn(async move {
+            if let Err(e) = rebuild_mgr.schedule(labels).await {
+                tracing::warn!("Failed to schedule index rebuild: {e}");
+            }
+        });
     }
 
     /// Set the property manager for cache invalidation.

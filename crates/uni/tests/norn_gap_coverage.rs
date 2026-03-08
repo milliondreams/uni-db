@@ -119,6 +119,7 @@ async fn test_inverted_index_edge_cases() -> Result<()> {
         property: "tags".to_string(),
         normalize: true,
         max_terms_per_doc: 100,
+        metadata: Default::default(),
     };
 
     db.schema()

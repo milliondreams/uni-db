@@ -14,11 +14,12 @@ use object_store::ObjectStore;
 use object_store::path::Path as ObjectPath;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::{error, info, warn};
 use uni_common::config::IndexRebuildConfig;
-use uni_common::core::schema::SchemaManager;
+use uni_common::core::schema::{IndexDefinition, IndexStatus, SchemaManager};
+use uni_common::core::snapshot::SnapshotManifest;
 use uuid::Uuid;
 
 /// Persisted state for index rebuild tasks.
@@ -36,6 +37,70 @@ impl Default for IndexRebuildState {
             tasks: Vec::new(),
             last_updated: Utc::now(),
         }
+    }
+}
+
+/// Checks whether indexes need rebuilding based on growth and time thresholds.
+pub struct RebuildTriggerChecker {
+    config: IndexRebuildConfig,
+}
+
+impl RebuildTriggerChecker {
+    pub fn new(config: IndexRebuildConfig) -> Self {
+        Self { config }
+    }
+
+    /// Returns the list of labels whose indexes need rebuilding based on
+    /// configured growth and time thresholds.
+    ///
+    /// Skips indexes with `Building` or `Failed` status.
+    pub fn labels_needing_rebuild(
+        &self,
+        manifest: &SnapshotManifest,
+        indexes: &[IndexDefinition],
+    ) -> Vec<String> {
+        let mut labels: HashSet<String> = HashSet::new();
+        let now = Utc::now();
+
+        for idx in indexes {
+            let meta = idx.metadata();
+
+            // Skip indexes that are already being rebuilt or have permanently failed
+            if meta.status == IndexStatus::Building || meta.status == IndexStatus::Failed {
+                continue;
+            }
+
+            let label = idx.label();
+
+            // Growth trigger: current count exceeds row_count_at_build * (1 + ratio)
+            if self.config.growth_trigger_ratio > 0.0
+                && let Some(built_count) = meta.row_count_at_build
+            {
+                let current_count = manifest
+                    .vertices
+                    .get(label)
+                    .map(|ls| ls.count)
+                    .unwrap_or(0);
+                let threshold =
+                    (built_count as f64 * (1.0 + self.config.growth_trigger_ratio)) as u64;
+                if current_count > threshold {
+                    labels.insert(label.to_string());
+                    continue;
+                }
+            }
+
+            // Time trigger: index age exceeds max_index_age
+            if let Some(max_age) = self.config.max_index_age
+                && let Some(built_at) = meta.last_built_at
+            {
+                let age = now.signed_duration_since(built_at);
+                if age.to_std().unwrap_or_default() > max_age {
+                    labels.insert(label.to_string());
+                }
+            }
+        }
+
+        labels.into_iter().collect()
     }
 }
 
@@ -289,91 +354,171 @@ impl IndexRebuildManager {
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
-
-                // Find a pending task
-                let task_to_process = {
-                    let mut tasks = self.tasks.write();
-                    let pending = tasks
-                        .values_mut()
-                        .find(|t| t.status == IndexRebuildStatus::Pending);
-
-                    if let Some(task) = pending {
-                        task.status = IndexRebuildStatus::InProgress;
-                        task.started_at = Some(Utc::now());
-                        Some((task.id.clone(), task.label.clone()))
-                    } else {
-                        None
-                    }
-                };
-
-                if let Some((task_id, label)) = task_to_process {
-                    // Save state before processing
-                    if let Err(e) = self.save_state().await {
-                        error!("Failed to save state before processing: {}", e);
-                    }
-
-                    info!("Starting index rebuild for label '{}'", label);
-
-                    // Execute the index rebuild
-                    let result = self.execute_rebuild(&label).await;
-
-                    // Update task status
-                    {
-                        let mut tasks = self.tasks.write();
-                        if let Some(task) = tasks.get_mut(&task_id) {
-                            match result {
-                                Ok(()) => {
-                                    task.status = IndexRebuildStatus::Completed;
-                                    task.completed_at = Some(Utc::now());
-                                    task.error = None;
-                                    info!("Index rebuild completed for label '{}'", label);
-                                }
-                                Err(e) => {
-                                    task.status = IndexRebuildStatus::Failed;
-                                    task.completed_at = Some(Utc::now());
-                                    task.error = Some(e.to_string());
-                                    task.retry_count += 1;
-                                    error!("Index rebuild failed for label '{}': {}", label, e);
-
-                                    // Auto-retry if within limits
-                                    if task.retry_count < self.config.max_retries {
-                                        info!(
-                                            "Will retry index rebuild for '{}' after delay (attempt {}/{})",
-                                            label, task.retry_count, self.config.max_retries
-                                        );
-                                        // Schedule retry by setting status back to pending after delay
-                                        let manager = self.clone();
-                                        let task_id_clone = task_id.clone();
-                                        let delay = self.config.retry_delay;
-                                        tokio::spawn(async move {
-                                            tokio::time::sleep(delay).await;
-                                            let mut tasks = manager.tasks.write();
-                                            if let Some(task) = tasks.get_mut(&task_id_clone)
-                                                && task.status == IndexRebuildStatus::Failed
-                                            {
-                                                task.status = IndexRebuildStatus::Pending;
-                                            }
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // Save state after processing
-                    if let Err(e) = self.save_state().await {
-                        error!("Failed to save state after processing: {}", e);
-                    }
-                }
+                        self.process_next_pending_task().await;
                     }
                     _ = shutdown_rx.recv() => {
-                        tracing::info!("Index rebuild worker shutting down");
+                        info!("Index rebuild worker shutting down");
                         let _ = self.save_state().await;
                         break;
                     }
                 }
             }
         })
+    }
+
+    /// Claim and process the next pending index rebuild task, if any.
+    ///
+    /// Marks the task as in-progress, executes the rebuild, updates task
+    /// status and index metadata, and persists state.
+    async fn process_next_pending_task(self: &Arc<Self>) {
+        // Find and claim a pending task
+        let task_to_process = {
+            let mut tasks = self.tasks.write();
+            let pending = tasks
+                .values_mut()
+                .find(|t| t.status == IndexRebuildStatus::Pending);
+
+            if let Some(task) = pending {
+                task.status = IndexRebuildStatus::InProgress;
+                task.started_at = Some(Utc::now());
+                Some((task.id.clone(), task.label.clone()))
+            } else {
+                None
+            }
+        };
+
+        let Some((task_id, label)) = task_to_process else {
+            return;
+        };
+
+        // Save state before processing
+        if let Err(e) = self.save_state().await {
+            error!("Failed to save state before processing: {}", e);
+        }
+
+        info!("Starting index rebuild for label '{}'", label);
+        self.set_index_status_for_label(&label, IndexStatus::Building);
+
+        // Execute the index rebuild
+        let result = self.execute_rebuild(&label).await;
+
+        match result {
+            Ok(()) => self.handle_rebuild_success(&task_id, &label).await,
+            Err(e) => self.handle_rebuild_failure(&task_id, &label, e),
+        }
+
+        // Save state and schema after processing
+        if let Err(e) = self.save_state().await {
+            error!("Failed to save state after processing: {}", e);
+        }
+        if let Err(e) = self.schema_manager.save().await {
+            error!("Failed to save schema after index rebuild: {}", e);
+        }
+    }
+
+    /// Handle a successful index rebuild: mark task completed and update index metadata.
+    async fn handle_rebuild_success(&self, task_id: &str, label: &str) {
+        let now = Utc::now();
+        let row_count = self.get_label_row_count(label).await;
+
+        {
+            let mut tasks = self.tasks.write();
+            if let Some(task) = tasks.get_mut(task_id) {
+                task.status = IndexRebuildStatus::Completed;
+                task.completed_at = Some(now);
+                task.error = None;
+            }
+        }
+        info!("Index rebuild completed for label '{}'", label);
+
+        self.update_index_metadata_for_label(label, IndexStatus::Online, Some(now), row_count);
+    }
+
+    /// Handle a failed index rebuild: mark task failed and schedule retry if within limits.
+    fn handle_rebuild_failure(self: &Arc<Self>, task_id: &str, label: &str, err: anyhow::Error) {
+        let (retry_count, exhausted) = {
+            let mut tasks = self.tasks.write();
+            if let Some(task) = tasks.get_mut(task_id) {
+                task.status = IndexRebuildStatus::Failed;
+                task.completed_at = Some(Utc::now());
+                task.error = Some(err.to_string());
+                task.retry_count += 1;
+                (task.retry_count, task.retry_count >= self.config.max_retries)
+            } else {
+                (0, true)
+            }
+        };
+        error!("Index rebuild failed for label '{}': {}", label, err);
+
+        if exhausted {
+            self.set_index_status_for_label(label, IndexStatus::Failed);
+        } else {
+            self.set_index_status_for_label(label, IndexStatus::Stale);
+            info!(
+                "Will retry index rebuild for '{}' after delay (attempt {}/{})",
+                label, retry_count, self.config.max_retries
+            );
+            let manager = self.clone();
+            let task_id_owned = task_id.to_string();
+            let delay = self.config.retry_delay;
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                let mut tasks = manager.tasks.write();
+                if let Some(task) = tasks.get_mut(&task_id_owned)
+                    && task.status == IndexRebuildStatus::Failed
+                {
+                    task.status = IndexRebuildStatus::Pending;
+                }
+            });
+        }
+    }
+
+    /// Set the lifecycle status for all indexes on a given label.
+    fn set_index_status_for_label(&self, label: &str, status: IndexStatus) {
+        let schema = self.schema_manager.schema();
+        for idx in &schema.indexes {
+            if idx.label() == label {
+                let _ = self.schema_manager.update_index_metadata(idx.name(), |m| {
+                    m.status = status.clone();
+                });
+            }
+        }
+    }
+
+    /// Update index metadata (status, build time, row count) for all indexes on a label.
+    fn update_index_metadata_for_label(
+        &self,
+        label: &str,
+        status: IndexStatus,
+        last_built_at: Option<chrono::DateTime<Utc>>,
+        row_count: Option<u64>,
+    ) {
+        let schema = self.schema_manager.schema();
+        for idx in &schema.indexes {
+            if idx.label() == label {
+                let _ = self.schema_manager.update_index_metadata(idx.name(), |m| {
+                    m.status = status.clone();
+                    if let Some(ts) = last_built_at {
+                        m.last_built_at = Some(ts);
+                    }
+                    if let Some(count) = row_count {
+                        m.row_count_at_build = Some(count);
+                    }
+                });
+            }
+        }
+    }
+
+    /// Get the current row count for a label from the latest snapshot.
+    async fn get_label_row_count(&self, label: &str) -> Option<u64> {
+        let manifest = self
+            .storage
+            .snapshot_manager()
+            .load_latest_snapshot()
+            .await
+            .ok()
+            .flatten()?;
+        manifest.vertices.get(label).map(|ls| ls.count)
     }
 
     /// Execute the actual index rebuild for a label.
@@ -390,6 +535,7 @@ impl IndexRebuildManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uni_common::core::schema::IndexMetadata;
 
     #[test]
     fn test_index_rebuild_status_serialize() {
@@ -419,5 +565,140 @@ mod tests {
         assert_eq!(parsed.id, task.id);
         assert_eq!(parsed.label, task.label);
         assert_eq!(parsed.status, task.status);
+    }
+
+    fn make_test_manifest(label: &str, count: u64) -> SnapshotManifest {
+        use uni_common::core::snapshot::LabelSnapshot;
+
+        let mut manifest = SnapshotManifest::new("test".into(), 1);
+        manifest.vertices.insert(
+            label.to_string(),
+            LabelSnapshot {
+                version: 1,
+                count,
+                lance_version: 0,
+            },
+        );
+        manifest
+    }
+
+    fn make_scalar_index(label: &str, status: IndexStatus, meta: IndexMetadata) -> IndexDefinition {
+        use uni_common::core::schema::{ScalarIndexConfig, ScalarIndexType};
+        IndexDefinition::Scalar(ScalarIndexConfig {
+            name: format!("idx_{}", label),
+            label: label.to_string(),
+            properties: vec!["prop".to_string()],
+            index_type: ScalarIndexType::BTree,
+            where_clause: None,
+            metadata: IndexMetadata {
+                status,
+                ..meta
+            },
+        })
+    }
+
+    #[test]
+    fn test_trigger_growth_fires() {
+        let config = IndexRebuildConfig {
+            growth_trigger_ratio: 0.5,
+            ..Default::default()
+        };
+        let checker = RebuildTriggerChecker::new(config);
+
+        // Built at 100 rows, now 151 (> 100 * 1.5 = 150)
+        let manifest = make_test_manifest("Person", 151);
+        let indexes = vec![make_scalar_index(
+            "Person",
+            IndexStatus::Online,
+            IndexMetadata {
+                row_count_at_build: Some(100),
+                ..Default::default()
+            },
+        )];
+
+        let labels = checker.labels_needing_rebuild(&manifest, &indexes);
+        assert_eq!(labels.len(), 1);
+        assert_eq!(labels[0], "Person");
+    }
+
+    #[test]
+    fn test_trigger_growth_below_threshold() {
+        let config = IndexRebuildConfig {
+            growth_trigger_ratio: 0.5,
+            ..Default::default()
+        };
+        let checker = RebuildTriggerChecker::new(config);
+
+        // Built at 100 rows, now 120 (< 100 * 1.5 = 150)
+        let manifest = make_test_manifest("Person", 120);
+        let indexes = vec![make_scalar_index(
+            "Person",
+            IndexStatus::Online,
+            IndexMetadata {
+                row_count_at_build: Some(100),
+                ..Default::default()
+            },
+        )];
+
+        let labels = checker.labels_needing_rebuild(&manifest, &indexes);
+        assert!(labels.is_empty());
+    }
+
+    #[test]
+    fn test_trigger_time_based() {
+        let config = IndexRebuildConfig {
+            growth_trigger_ratio: 0.0, // disable growth trigger
+            max_index_age: Some(std::time::Duration::from_secs(3600)), // 1 hour
+            ..Default::default()
+        };
+        let checker = RebuildTriggerChecker::new(config);
+
+        // Built 2 hours ago
+        let two_hours_ago = Utc::now() - chrono::Duration::hours(2);
+        let manifest = make_test_manifest("Person", 100);
+        let indexes = vec![make_scalar_index(
+            "Person",
+            IndexStatus::Online,
+            IndexMetadata {
+                last_built_at: Some(two_hours_ago),
+                row_count_at_build: Some(100),
+                ..Default::default()
+            },
+        )];
+
+        let labels = checker.labels_needing_rebuild(&manifest, &indexes);
+        assert_eq!(labels.len(), 1);
+    }
+
+    #[test]
+    fn test_trigger_skips_building_and_failed() {
+        let config = IndexRebuildConfig {
+            growth_trigger_ratio: 0.5,
+            ..Default::default()
+        };
+        let checker = RebuildTriggerChecker::new(config);
+
+        // Would trigger (151 > 150), but status is Building
+        let manifest = make_test_manifest("Person", 151);
+        let building = vec![make_scalar_index(
+            "Person",
+            IndexStatus::Building,
+            IndexMetadata {
+                row_count_at_build: Some(100),
+                ..Default::default()
+            },
+        )];
+        assert!(checker.labels_needing_rebuild(&manifest, &building).is_empty());
+
+        // Same with Failed status
+        let failed = vec![make_scalar_index(
+            "Person",
+            IndexStatus::Failed,
+            IndexMetadata {
+                row_count_at_build: Some(100),
+                ..Default::default()
+            },
+        )];
+        assert!(checker.labels_needing_rebuild(&manifest, &failed).is_empty());
     }
 }

@@ -257,6 +257,7 @@ pub async fn create_scalar_index_core(
         properties: vec![property.to_string()],
         index_type: it,
         where_clause: None,
+        metadata: Default::default(),
     };
     let def = IndexDefinition::Scalar(idx_config);
     sm.add_index(def).map_err(|e| e.to_string())?;
@@ -290,6 +291,7 @@ pub async fn create_vector_index_core(
         },
         metric: metric_type,
         embedding_config: None,
+        metadata: Default::default(),
     };
 
     let def = IndexDefinition::Vector(idx_config);
@@ -452,6 +454,7 @@ pub fn create_index_definition(
             properties: vec![property.to_string()],
             index_type: ScalarIndexType::BTree,
             where_clause: None,
+            metadata: Default::default(),
         })),
         "hash" => Ok(IndexDefinition::Scalar(ScalarIndexConfig {
             name: format!("idx_{}_{}", label, property),
@@ -459,6 +462,7 @@ pub fn create_index_definition(
             properties: vec![property.to_string()],
             index_type: ScalarIndexType::Hash,
             where_clause: None,
+            metadata: Default::default(),
         })),
         "vector" => Ok(IndexDefinition::Vector(VectorIndexConfig {
             name: format!("idx_{}_{}_vec", label, property),
@@ -471,6 +475,7 @@ pub fn create_index_definition(
             },
             metric: DistanceMetric::Cosine,
             embedding_config: None,
+            metadata: Default::default(),
         })),
         _ => Err(format!("Unknown index type: {}", index_type)),
     }

@@ -282,6 +282,7 @@ async fn create_index_internal(
                 }, // Default params
                 metric,
                 embedding_config,
+                metadata: Default::default(),
             })
         }
         "SCALAR" | "BTREE" => IndexDefinition::Scalar(ScalarIndexConfig {
@@ -290,6 +291,7 @@ async fn create_index_internal(
             properties: vec![prop_name.clone()],
             index_type: ScalarIndexType::BTree,
             where_clause: None,
+            metadata: Default::default(),
         }),
         "INVERTED" => IndexDefinition::Inverted(uni_common::core::schema::InvertedIndexConfig {
             name: index_name,
@@ -297,6 +299,7 @@ async fn create_index_internal(
             property: prop_name.clone(),
             normalize: true,
             max_terms_per_doc: 10_000,
+            metadata: Default::default(),
         }),
         _ => {
             return Err(UniError::InvalidArgument {

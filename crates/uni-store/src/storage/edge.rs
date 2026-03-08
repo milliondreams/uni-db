@@ -15,7 +15,7 @@ pub struct EdgeDataset {
 
 impl EdgeDataset {
     pub fn new(base_uri: &str, edge_type: &str, _src_label: &str, _dst_label: &str) -> Self {
-        let uri = format!("{}/edges/{}", base_uri, edge_type);
+        let uri = format!("{}/edges_{}", base_uri, edge_type);
         Self {
             uri,
             edge_type: edge_type.to_string(),

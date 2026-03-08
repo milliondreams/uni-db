@@ -13,6 +13,7 @@ use lancedb::Table;
 use lancedb::index::Index as LanceDbIndex;
 use lancedb::index::scalar::BTreeIndexBuilder;
 use sha3::{Digest, Sha3_256};
+use std::collections::HashMap;
 use std::sync::Arc;
 use uni_common::Properties;
 use uni_common::core::id::{UniId, Vid};
@@ -26,7 +27,7 @@ pub struct VertexDataset {
 
 impl VertexDataset {
     pub fn new(base_uri: &str, label: &str, label_id: u16) -> Self {
-        let uri = format!("{}/vertices/{}", base_uri, label);
+        let uri = format!("{}/vertices_{}", base_uri, label);
         Self {
             uri,
             label: label.to_string(),
@@ -108,8 +109,8 @@ impl VertexDataset {
         deleted: &[bool],
         versions: &[u64],
         schema: &Schema,
-        created_at: Option<&std::collections::HashMap<uni_common::core::id::Vid, i64>>,
-        updated_at: Option<&std::collections::HashMap<uni_common::core::id::Vid, i64>>,
+        created_at: Option<&HashMap<Vid, i64>>,
+        updated_at: Option<&HashMap<Vid, i64>>,
     ) -> Result<RecordBatch> {
         let arrow_schema = self.get_arrow_schema(schema)?;
         let mut columns: Vec<ArrayRef> = Vec::with_capacity(arrow_schema.fields().len());

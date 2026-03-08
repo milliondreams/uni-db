@@ -7,7 +7,7 @@ Get up and running with Uni in minutes.
 <div class="feature-card">
 
 ### [Installation](installation.md)
-Build Uni from source, install prerequisites, and verify your setup.
+Install the Rust crate, Python package, or build the CLI from source.
 
 </div>
 
@@ -27,25 +27,19 @@ Complete documentation for all Uni command-line tools.
 
 </div>
 
-## Prerequisites
-
-Before installing Uni, ensure you have:
-
-- **Rust 1.75+** — Install via [rustup](https://rustup.rs/)
-- **8GB+ RAM** — Recommended for development
-- **Git** — For cloning the repository
-
 ## Quick Install
 
-```bash
-# Clone and build
-git clone https://github.com/rustic-ai/uni.git
-cd uni
-cargo build --release
+=== "Rust"
 
-# Verify installation
-./target/release/uni --version
-```
+    ```bash
+    cargo add uni-db
+    ```
+
+=== "Python"
+
+    ```bash
+    pip install uni-db
+    ```
 
 ## Next Steps
 

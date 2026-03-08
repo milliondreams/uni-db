@@ -1,6 +1,6 @@
 # Quick Start
 
-Get Uni running with real data in under 5 minutes. This guide walks you through building the project, importing a sample dataset, and executing your first graph queries.
+Get Uni running with real data in under 5 minutes. This guide walks you through importing a sample dataset and executing your first graph queries.
 
 ## Prerequisites
 
@@ -11,24 +11,7 @@ Before starting, ensure you have:
 
 ---
 
-## Step 1: Build the Project
-
-If you haven't already built Uni, compile it in release mode for optimal performance:
-
-```bash
-cd uni
-cargo build --release
-```
-
-The binary will be available at `target/release/uni`. For convenience, you can add it to your PATH:
-
-```bash
-export PATH="$PWD/target/release:$PATH"
-```
-
----
-
-## Step 2: Explore the Demo Dataset
+## Step 1: Explore the Demo Dataset
 
 Uni includes a sample dataset based on academic papers and citations, perfect for learning graph queries.
 
@@ -57,7 +40,7 @@ The `src_vid` paper cites the `dst_vid` paper. In graph terms: `(vid=1)-[:CITES]
 
 ---
 
-## Step 3: Import Data
+## Step 2: Import Data
 
 Use the `import` command to ingest the sample dataset. This creates the demo schema (Paper/CITES), loads data, and persists it to storage.
 
@@ -96,7 +79,7 @@ FOR (p:Paper) ON p.embedding
 OPTIONS { type: 'hnsw' }
 ```
 
-## Step 4: Use the Interactive REPL
+## Step 3: Use the Interactive REPL
 
 The easiest way to explore Uni is via the interactive shell (REPL). It supports syntax highlighting, command history, and formatted table output.
 
@@ -140,7 +123,7 @@ exit
 
 ---
 
-## Step 5: Run One-off Queries
+## Step 4: Run One-off Queries
 
 You can also run queries directly from your terminal using the `query` command:
 
@@ -150,7 +133,7 @@ uni query "MATCH (p:Paper) RETURN COUNT(p)" --path ./my-first-graph
 
 ---
 
-## Step 6: Create New Data
+## Step 5: Create New Data
 
 Add new papers and citations with `CREATE`:
 

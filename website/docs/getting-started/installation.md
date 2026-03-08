@@ -1,140 +1,109 @@
 # Installation
 
-This guide covers all methods for installing Uni, from building from source to using pre-built binaries.
+This guide covers all methods for installing Uni.
 
 ## System Requirements
-
-### Minimum Requirements
 
 | Component | Requirement |
 |-----------|-------------|
 | **OS** | Linux (x86_64, aarch64), macOS (x86_64, Apple Silicon) |
 | **Memory** | 4 GB RAM minimum, 16 GB recommended for large graphs |
 | **Disk** | SSD recommended for optimal performance |
-| **Rust** | 1.75+ (if building from source) |
-
-### Build Dependencies
-
-Building Uni requires several system dependencies:
-
-| Dependency | Purpose | Installation |
-|------------|---------|--------------|
-| **Rust toolchain** | Compilation | [rustup.rs](https://rustup.rs/) |
-| **Clang/LLVM** | Lance native dependencies | System package manager |
-| **Protocol Buffers** | Lance serialization | System package manager |
-| **pkg-config** | Build configuration | System package manager |
-| **OpenSSL** | TLS for object store access | System package manager |
 
 ---
 
-## Installation Methods
+## Rust Library
 
-### Method 1: Build from Source (Recommended)
-
-Building from source provides the latest features and allows customization.
-
-#### Step 1: Install Rust
+Add `uni-db` to your project from [crates.io](https://crates.io/crates/uni-db):
 
 ```bash
-# Install rustup (Rust toolchain manager)
+cargo add uni-db
+```
+
+Or add it to your `Cargo.toml` directly:
+
+```toml
+[dependencies]
+uni-db = "*"
+```
+
+---
+
+## Python Package
+
+Install from [PyPI](https://pypi.org/project/uni-db/):
+
+```bash
+pip install uni-db
+```
+
+For the Pydantic OGM layer:
+
+```bash
+pip install uni-pydantic
+```
+
+---
+
+## CLI (Build from Source)
+
+The CLI is not published as a standalone binary. Build it from source:
+
+### Step 1: Install Rust and System Dependencies
+
+```bash
+# Install Rust
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
-# Reload your shell configuration
 source $HOME/.cargo/env
-
-# Verify installation
-rustc --version
-cargo --version
 ```
 
-#### Step 2: Install System Dependencies
+**System dependencies** (needed for Lance native code):
 
-**Ubuntu / Debian:**
-```bash
-sudo apt update
-sudo apt install -y \
-    build-essential \
-    pkg-config \
-    libssl-dev \
-    protobuf-compiler \
-    clang \
-    llvm
-```
+=== "Ubuntu / Debian"
 
-**Fedora / RHEL:**
-```bash
-sudo dnf install -y \
-    gcc \
-    gcc-c++ \
-    pkg-config \
-    openssl-devel \
-    protobuf-compiler \
-    clang \
-    llvm
-```
+    ```bash
+    sudo apt update
+    sudo apt install -y build-essential pkg-config libssl-dev protobuf-compiler clang llvm
+    ```
 
-**macOS:**
-```bash
-# Install Homebrew if not present
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+=== "Fedora / RHEL"
 
-# Install dependencies
-brew install protobuf llvm pkg-config openssl@3
+    ```bash
+    sudo dnf install -y gcc gcc-c++ pkg-config openssl-devel protobuf-compiler clang llvm
+    ```
 
-# Add LLVM to PATH (for Apple Silicon)
-echo 'export PATH="/opt/homebrew/opt/llvm/bin:$PATH"' >> ~/.zshrc
-source ~/.zshrc
-```
+=== "macOS"
 
-**Arch Linux:**
-```bash
-sudo pacman -S base-devel pkg-config openssl protobuf clang llvm
-```
+    ```bash
+    brew install protobuf llvm pkg-config openssl@3
+    # Apple Silicon: add LLVM to PATH
+    echo 'export PATH="/opt/homebrew/opt/llvm/bin:$PATH"' >> ~/.zshrc
+    source ~/.zshrc
+    ```
 
-#### Step 3: Clone and Build
+=== "Arch Linux"
+
+    ```bash
+    sudo pacman -S base-devel pkg-config openssl protobuf clang llvm
+    ```
+
+### Step 2: Clone and Build
 
 ```bash
-# Clone the repository
-git clone https://github.com/rustic-ai/uni.git
+git clone https://github.com/rustic-ai/uni-db.git
 cd uni
-
-# Build in release mode (optimized)
 cargo build --release
-
-# The binary is now at target/release/uni
-ls -la target/release/uni
 ```
 
-#### Step 4: Install to PATH (Optional)
+### Step 3: Install to PATH (Optional)
 
 ```bash
 # Option A: Copy to /usr/local/bin
 sudo cp target/release/uni /usr/local/bin/
 
-# Option B: Add cargo bin to PATH
-echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> ~/.bashrc
-cargo install --path .
+# Option B: Use cargo install
+cargo install --path crates/uni-cli
 ```
-
----
-
-### Method 2: Using Cargo Install
-
-If you only need the CLI and don't require source modifications:
-
-```bash
-# Install directly from the repository
-cargo install --git https://github.com/rustic-ai/uni.git
-
-# Or from crates.io (when published)
-cargo install uni
-```
-
----
-
-### Method 3: Docker (Planned)
-
-Container images and a supported Docker workflow are not published yet. If you need containerization today, build Uni from source inside your own base image and run it via the CLI.
 
 ---
 
@@ -286,7 +255,7 @@ For contributing to Uni, set up the full development environment:
 
 ```bash
 # Clone with submodules
-git clone --recursive https://github.com/rustic-ai/uni.git
+git clone --recursive https://github.com/rustic-ai/uni-db.git
 cd uni
 
 # Install development tools

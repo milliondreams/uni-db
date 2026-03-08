@@ -42,7 +42,8 @@ struct IndexConfig {
     property: Option<String>,
     #[serde(rename = "type")]
     index_type: String,
-    // Vector specific
+    // Vector specific (accepted in JSON but not consumed at runtime)
+    #[expect(dead_code)]
     dimensions: Option<usize>,
     metric: Option<String>,
     embedding: Option<EmbeddingOptions>,
@@ -250,7 +251,6 @@ async fn create_index_internal(
 
     let def = match config.index_type.to_uppercase().as_str() {
         "VECTOR" => {
-            let _dimensions = config.dimensions;
             let metric = match config.metric.as_deref().unwrap_or("cosine") {
                 "cosine" => DistanceMetric::Cosine,
                 "l2" | "euclidean" => DistanceMetric::L2,

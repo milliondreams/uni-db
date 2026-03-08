@@ -13,11 +13,6 @@
 //! YIELD node, score
 //! ```
 
-use crate::query::df_graph::GraphExecutionContext;
-use crate::query::df_graph::common::{
-    calculate_score, compute_plan_properties, evaluate_simple_expr, labels_data_type,
-};
-use crate::query::df_graph::scan::resolve_property_type;
 use arrow_array::builder::{Float32Builder, StringBuilder, UInt64Builder};
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -34,8 +29,14 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use uni_common::Value;
 use uni_common::core::id::Vid;
-use uni_common::core::schema::DistanceMetric;
+use uni_common::core::schema::{DistanceMetric, PropertyMeta};
 use uni_cypher::ast::Expr;
+
+use crate::query::df_graph::GraphExecutionContext;
+use crate::query::df_graph::common::{
+    calculate_score, compute_plan_properties, evaluate_simple_expr, labels_data_type,
+};
+use crate::query::df_graph::scan::resolve_property_type;
 
 /// Vector KNN search execution plan.
 ///
@@ -159,9 +160,7 @@ impl GraphVectorKnnExec {
     fn build_schema(
         variable: &str,
         target_properties: &[String],
-        label_props: Option<
-            &std::collections::HashMap<String, uni_common::core::schema::PropertyMeta>,
-        >,
+        label_props: Option<&HashMap<String, PropertyMeta>>,
     ) -> SchemaRef {
         let mut fields = vec![
             Field::new(format!("{}._vid", variable), DataType::UInt64, false),

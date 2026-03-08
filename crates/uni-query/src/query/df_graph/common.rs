@@ -1268,26 +1268,15 @@ pub(crate) fn extract_scalar_key(
                         .unwrap();
                     ScalarKey::Utf8(arr.value(row_idx).to_string())
                 }
-                arrow_schema::DataType::Struct(_) => {
-                    // Serialize struct to string via arrow display for hashing
-                    let formatter = arrow::util::display::ArrayFormatter::try_new(
-                        col.as_ref(),
-                        &arrow::util::display::FormatOptions::default(),
-                    );
-                    match formatter {
-                        Ok(f) => ScalarKey::Utf8(f.value(row_idx).to_string()),
-                        Err(_) => ScalarKey::Utf8(format!("struct@{row_idx}")),
-                    }
-                }
                 _ => {
-                    // Fallback: use arrow display formatter
+                    // Fallback (including Struct): use arrow display formatter
                     let formatter = arrow::util::display::ArrayFormatter::try_new(
                         col.as_ref(),
                         &arrow::util::display::FormatOptions::default(),
                     );
                     match formatter {
                         Ok(f) => ScalarKey::Utf8(f.value(row_idx).to_string()),
-                        Err(_) => ScalarKey::Utf8(format!("unknown@{row_idx}")),
+                        Err(_) => ScalarKey::Utf8(format!("opaque@{row_idx}")),
                     }
                 }
             }

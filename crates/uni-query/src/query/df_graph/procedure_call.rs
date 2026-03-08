@@ -13,12 +13,6 @@
 //! RETURN n.name, label
 //! ```
 
-use crate::query::df_graph::GraphExecutionContext;
-use crate::query::df_graph::common::{
-    calculate_score, compute_plan_properties, evaluate_simple_expr, labels_data_type,
-};
-use uni_common::core::schema::DistanceMetric;
-use crate::query::df_graph::scan::resolve_property_type;
 use arrow_array::builder::{
     BooleanBuilder, Float32Builder, Float64Builder, Int64Builder, StringBuilder, UInt64Builder,
 };
@@ -37,7 +31,14 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use uni_common::Value;
 use uni_common::core::id::Vid;
+use uni_common::core::schema::DistanceMetric;
 use uni_cypher::ast::Expr;
+
+use crate::query::df_graph::GraphExecutionContext;
+use crate::query::df_graph::common::{
+    calculate_score, compute_plan_properties, evaluate_simple_expr, labels_data_type,
+};
+use crate::query::df_graph::scan::resolve_property_type;
 
 /// Maps a user-provided yield name to a canonical name.
 ///

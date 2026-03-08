@@ -2,12 +2,14 @@
 // Copyright 2024-2026 Dragonscale Team
 
 use crate::compaction::{CompactionStats, CompactionStatus, CompactionTask};
+use crate::storage::compaction::Compactor;
+use crate::storage::direction::Direction;
 use crate::lancedb::LanceDbStore;
 use crate::runtime::WorkingGraph;
 use crate::runtime::context::QueryContext;
 use crate::runtime::l0::L0Buffer;
 use crate::storage::adjacency::AdjacencyDataset;
-use crate::storage::delta::{DeltaDataset, Op};
+use crate::storage::delta::{DeltaDataset, ENTRY_SIZE_ESTIMATE, Op};
 use crate::storage::edge::EdgeDataset;
 use crate::storage::index::UidIndex;
 use crate::storage::inverted_index::InvertedIndex;
@@ -15,15 +17,16 @@ use crate::storage::main_edge::MainEdgeDataset;
 use crate::storage::main_vertex::MainVertexDataset;
 use crate::storage::vertex::VertexDataset;
 use anyhow::{Result, anyhow};
-use arrow_array::{Array, Float32Array, UInt64Array};
+use arrow_array::{Array, Float32Array, TimestampNanosecondArray, UInt64Array};
 use dashmap::DashMap;
 use futures::TryStreamExt;
-use lancedb::query::{ExecutableQuery, QueryBase};
+use lancedb::query::{ExecutableQuery, QueryBase, Select};
 use object_store::ObjectStore;
 use object_store::local::LocalFileSystem;
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::warn;
 use uni_common::config::UniConfig;
 use uni_common::core::id::{Eid, UniId, Vid};
@@ -434,7 +437,7 @@ impl StorageManager {
 
                         if let Some(task) = self.pick_compaction_task() {
                             log::info!("Triggering background compaction: {:?}", task);
-                            if let Err(e) = self.execute_compaction(task).await {
+                            if let Err(e) = Self::execute_compaction(Arc::clone(&self), task).await {
                                 log::error!("Compaction failed: {}", e);
                             }
                         }
@@ -452,20 +455,62 @@ impl StorageManager {
     async fn update_compaction_status(&self) -> Result<()> {
         let schema = self.schema_manager.schema();
         let mut total_tables = 0;
+        let mut total_rows: usize = 0;
+        let mut oldest_ts: Option<i64> = None;
 
-        // Count edge delta tables
         for name in schema.edge_types.keys() {
             for dir in ["fwd", "bwd"] {
                 let table_name = LanceDbStore::delta_table_name(name, dir);
-                if self.lancedb_store.table_exists(&table_name).await? {
-                    total_tables += 1;
+                let Ok(table) = self.lancedb_store.open_table(&table_name).await else {
+                    continue;
+                };
+                let row_count = table.count_rows(None).await.unwrap_or(0);
+                if row_count == 0 {
+                    continue;
+                }
+                total_tables += 1;
+                total_rows += row_count;
+
+                // Query oldest _created_at for age tracking
+                let Ok(stream) = table
+                    .query()
+                    .select(Select::Columns(vec!["_created_at".to_string()]))
+                    .execute()
+                    .await
+                else {
+                    continue;
+                };
+                let Ok(batches) = stream.try_collect::<Vec<_>>().await else {
+                    continue;
+                };
+                for batch in batches {
+                    let Some(col) = batch
+                        .column_by_name("_created_at")
+                        .and_then(|c| c.as_any().downcast_ref::<TimestampNanosecondArray>())
+                    else {
+                        continue;
+                    };
+                    for i in 0..col.len() {
+                        if !col.is_null(i) {
+                            let ts = col.value(i);
+                            oldest_ts = Some(oldest_ts.map_or(ts, |prev| prev.min(ts)));
+                        }
+                    }
                 }
             }
         }
 
+        let oldest_l1_age = oldest_ts
+            .and_then(|ts| {
+                let created = UNIX_EPOCH + Duration::from_nanos(ts as u64);
+                SystemTime::now().duration_since(created).ok()
+            })
+            .unwrap_or(Duration::ZERO);
+
         let mut status = acquire_mutex(&self.compaction_status, "compaction_status")?;
         status.l1_runs = total_tables;
-        status.l1_size_bytes = 0; // LanceDB doesn't expose size easily
+        status.l1_size_bytes = (total_rows * ENTRY_SIZE_ESTIMATE) as u64;
+        status.oldest_l1_age = oldest_l1_age;
         Ok(())
     }
 
@@ -478,27 +523,82 @@ impl StorageManager {
         if status.l1_size_bytes >= self.config.compaction.max_l1_size_bytes {
             return Some(CompactionTask::BySize);
         }
-        // TODO: Age check
+        if status.oldest_l1_age >= self.config.compaction.max_l1_age
+            && status.oldest_l1_age > Duration::ZERO
+        {
+            return Some(CompactionTask::ByAge);
+        }
 
         None
     }
 
-    async fn execute_compaction(&self, _task: CompactionTask) -> Result<CompactionStats> {
+    /// Open a table by name and run `optimize(All)`, returning `true` on success.
+    async fn optimize_table(store: &LanceDbStore, table_name: &str) -> bool {
+        let Ok(table) = store.open_table(table_name).await else {
+            return false;
+        };
+        if let Err(e) = table.optimize(lancedb::table::OptimizeAction::All).await {
+            log::warn!("Failed to optimize table {}: {}", table_name, e);
+            return false;
+        }
+        true
+    }
+
+    async fn execute_compaction(
+        this: Arc<Self>,
+        _task: CompactionTask,
+    ) -> Result<CompactionStats> {
         let start = std::time::Instant::now();
-        // Use guard for automatic flag management
-        let _guard = CompactionGuard::new(self.compaction_status.clone())
+        let _guard = CompactionGuard::new(this.compaction_status.clone())
             .ok_or_else(|| anyhow!("Compaction already in progress"))?;
 
-        let schema = self.schema_manager.schema();
+        let schema = this.schema_manager.schema();
         let mut files_compacted = 0;
 
-        // Optimize all edge delta tables
+        // ── Tier 2: Semantic compaction ──
+        // Dedup vertices, merge CRDTs, consolidate L1→L2 deltas, clean tombstones
+        let compactor = Compactor::new(Arc::clone(&this));
+        let compaction_results = compactor.compact_all().await.unwrap_or_else(|e| {
+            log::error!(
+                "Semantic compaction failed (continuing with Lance optimize): {}",
+                e
+            );
+            Vec::new()
+        });
+
+        // Re-warm adjacency CSR after semantic compaction
+        let am = this.adjacency_manager();
+        for info in &compaction_results {
+            let direction = match info.direction.as_str() {
+                "fwd" => Direction::Outgoing,
+                "bwd" => Direction::Incoming,
+                _ => continue,
+            };
+            if let Some(etid) =
+                schema.edge_type_id_unified_case_insensitive(&info.edge_type)
+                && let Err(e) = am.warm(&this, etid, direction, None).await
+            {
+                log::warn!(
+                    "Failed to re-warm adjacency for {}/{}: {}",
+                    info.edge_type,
+                    info.direction,
+                    e
+                );
+            }
+        }
+
+        // ── Tier 3: Lance optimize ──
+        let store = &this.lancedb_store;
+
+        // Optimize edge delta and adjacency tables
         for name in schema.edge_types.keys() {
             for dir in ["fwd", "bwd"] {
-                let table_name = LanceDbStore::delta_table_name(name, dir);
-                if self.lancedb_store.table_exists(&table_name).await? {
-                    let table = self.lancedb_store.open_table(&table_name).await?;
-                    table.optimize(lancedb::table::OptimizeAction::All).await?;
+                let delta = LanceDbStore::delta_table_name(name, dir);
+                if Self::optimize_table(store, &delta).await {
+                    files_compacted += 1;
+                }
+                let adj = LanceDbStore::adjacency_table_name(name, dir);
+                if Self::optimize_table(store, &adj).await {
                     files_compacted += 1;
                 }
             }
@@ -507,16 +607,24 @@ impl StorageManager {
         // Optimize vertex tables
         for label in schema.labels.keys() {
             let table_name = LanceDbStore::vertex_table_name(label);
-            if self.lancedb_store.table_exists(&table_name).await? {
-                let table = self.lancedb_store.open_table(&table_name).await?;
-                table.optimize(lancedb::table::OptimizeAction::All).await?;
+            if Self::optimize_table(store, &table_name).await {
                 files_compacted += 1;
-                self.invalidate_table_cache(label);
+                this.invalidate_table_cache(label);
+            }
+        }
+
+        // Optimize main vertex and edge tables
+        for table_name in [
+            LanceDbStore::main_vertex_table_name(),
+            LanceDbStore::main_edge_table_name(),
+        ] {
+            if Self::optimize_table(store, table_name).await {
+                files_compacted += 1;
             }
         }
 
         {
-            let mut status = acquire_mutex(&self.compaction_status, "compaction_status")?;
+            let mut status = acquire_mutex(&this.compaction_status, "compaction_status")?;
             status.total_compactions += 1;
         }
 

@@ -3,12 +3,14 @@
 
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectStorePath;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::tempdir;
 use uni_common::config::UniConfig;
 use uni_common::core::schema::SchemaManager;
 use uni_store::Writer;
+use uni_store::lancedb::LanceDbStore;
 use uni_store::storage::manager::StorageManager;
 
 #[tokio::test]
@@ -102,4 +104,271 @@ async fn test_manual_compaction_trigger() {
 
     let stats = result.unwrap();
     assert_eq!(stats.files_compacted, 0); // Empty DB
+}
+
+/// Helper: create schema with Person label and KNOWS edge type.
+async fn setup_schema_and_storage(
+    db_path_str: &str,
+    config: UniConfig,
+) -> (Arc<StorageManager>, Arc<SchemaManager>, u32) {
+    let store = Arc::new(LocalFileSystem::new_with_prefix(db_path_str).unwrap());
+    let schema_path = ObjectStorePath::from("schema.json");
+    let schema_manager = Arc::new(
+        SchemaManager::load_from_store(store, &schema_path)
+            .await
+            .unwrap(),
+    );
+    let _label_id = schema_manager.add_label("Person").unwrap();
+    let edge_type_id = schema_manager
+        .add_edge_type(
+            "KNOWS",
+            vec!["Person".to_string()],
+            vec!["Person".to_string()],
+        )
+        .unwrap();
+    schema_manager.save().await.unwrap();
+
+    let storage = Arc::new(
+        StorageManager::new_with_config(db_path_str, schema_manager.clone(), config.clone())
+            .await
+            .unwrap(),
+    );
+    (storage, schema_manager, edge_type_id)
+}
+
+/// Helper: insert two Person vertices and a KNOWS edge, then flush.
+async fn write_and_flush(
+    storage: &Arc<StorageManager>,
+    schema_manager: &Arc<SchemaManager>,
+    edge_type_id: u32,
+    config: UniConfig,
+) {
+    let mut writer =
+        Writer::new_with_config(storage.clone(), schema_manager.clone(), 0, config, None, None)
+            .await
+            .unwrap();
+
+    let v1 = writer.next_vid().await.unwrap();
+    let v2 = writer.next_vid().await.unwrap();
+    writer
+        .insert_vertex_with_labels(v1, HashMap::new(), &["Person".to_string()])
+        .await
+        .unwrap();
+    writer
+        .insert_vertex_with_labels(v2, HashMap::new(), &["Person".to_string()])
+        .await
+        .unwrap();
+
+    let eid = writer.next_eid(edge_type_id).await.unwrap();
+    writer
+        .insert_edge(v1, v2, edge_type_id, eid, HashMap::new(), None)
+        .await
+        .unwrap();
+
+    writer.flush_to_l1(None).await.unwrap();
+}
+
+/// Helper: run background compaction for a given duration, then shut it down
+/// and return the final compaction status.
+async fn run_compaction_cycle(
+    storage: &Arc<StorageManager>,
+    run_duration: Duration,
+) -> uni_store::compaction::CompactionStatus {
+    let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+    let handle = storage.clone().start_background_compaction(shutdown_rx);
+
+    tokio::time::sleep(run_duration).await;
+
+    let _ = shutdown_tx.send(());
+    handle.await.unwrap();
+
+    storage.compaction_status().unwrap()
+}
+
+/// Verify that background compaction runs Tier 2 semantic compaction
+/// (L1 deltas cleared, total_compactions >= 1).
+#[tokio::test]
+async fn test_background_compaction_runs_semantic() {
+    let dir = tempdir().unwrap();
+    let db_path_str = dir.path().to_str().unwrap();
+
+    let mut config = UniConfig::default();
+    config.compaction.enabled = true;
+    config.compaction.max_l1_runs = 1; // Low threshold to trigger immediately
+    config.compaction.check_interval = Duration::from_millis(200);
+
+    let (storage, schema_manager, edge_type_id) =
+        setup_schema_and_storage(db_path_str, config.clone()).await;
+
+    write_and_flush(&storage, &schema_manager, edge_type_id, config).await;
+
+    // Verify L1 has data before background compaction
+    let fwd_table_name = LanceDbStore::delta_table_name("KNOWS", "fwd");
+    let table = storage
+        .lancedb_store()
+        .open_table(&fwd_table_name)
+        .await
+        .unwrap();
+    let pre_count = table.count_rows(None).await.unwrap();
+    assert!(pre_count > 0, "Delta table should have rows before compaction");
+
+    let status = run_compaction_cycle(&storage, Duration::from_secs(2)).await;
+
+    assert!(
+        status.total_compactions >= 1,
+        "Background compaction should have run at least once, got {}",
+        status.total_compactions
+    );
+    assert_eq!(
+        status.l1_runs, 0,
+        "l1_runs should be 0 after semantic compaction cleared deltas"
+    );
+}
+
+/// Verify that the BySize trigger fires when max_l1_size_bytes is exceeded.
+#[tokio::test]
+async fn test_compaction_by_size_trigger() {
+    let dir = tempdir().unwrap();
+    let db_path_str = dir.path().to_str().unwrap();
+
+    let mut config = UniConfig::default();
+    config.compaction.enabled = true;
+    config.compaction.max_l1_runs = 100; // High -- won't trigger by run count
+    config.compaction.max_l1_size_bytes = 1; // Very low -- triggers on any data
+    config.compaction.check_interval = Duration::from_millis(200);
+
+    let (storage, schema_manager, edge_type_id) =
+        setup_schema_and_storage(db_path_str, config.clone()).await;
+
+    write_and_flush(&storage, &schema_manager, edge_type_id, config).await;
+
+    let status = run_compaction_cycle(&storage, Duration::from_secs(2)).await;
+
+    assert!(
+        status.total_compactions >= 1,
+        "BySize trigger should have fired, total_compactions={}",
+        status.total_compactions
+    );
+}
+
+/// Verify that the ByAge trigger fires when max_l1_age is exceeded.
+#[tokio::test]
+async fn test_compaction_by_age_trigger() {
+    let dir = tempdir().unwrap();
+    let db_path_str = dir.path().to_str().unwrap();
+
+    let mut config = UniConfig::default();
+    config.compaction.enabled = true;
+    config.compaction.max_l1_runs = 100; // High -- won't trigger by run count
+    config.compaction.max_l1_size_bytes = u64::MAX; // High -- won't trigger by size
+    config.compaction.max_l1_age = Duration::from_millis(100); // Low -- triggers on any aged data
+    config.compaction.check_interval = Duration::from_millis(200);
+
+    let (storage, schema_manager, edge_type_id) =
+        setup_schema_and_storage(db_path_str, config.clone()).await;
+
+    write_and_flush(&storage, &schema_manager, edge_type_id, config).await;
+
+    // Wait for data to age past the threshold
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let status = run_compaction_cycle(&storage, Duration::from_secs(2)).await;
+
+    assert!(
+        status.total_compactions >= 1,
+        "ByAge trigger should have fired, total_compactions={}",
+        status.total_compactions
+    );
+}
+
+/// Verify that l1_runs only counts non-empty delta tables.
+/// After semantic compaction clears deltas, l1_runs should be 0
+/// even though the tables still exist.
+#[tokio::test]
+async fn test_l1_runs_counts_non_empty_only() {
+    let dir = tempdir().unwrap();
+    let db_path_str = dir.path().to_str().unwrap();
+
+    let mut config = UniConfig::default();
+    config.compaction.enabled = true;
+    config.compaction.max_l1_runs = 1;
+    config.compaction.check_interval = Duration::from_millis(200);
+
+    let (storage, schema_manager, edge_type_id) =
+        setup_schema_and_storage(db_path_str, config.clone()).await;
+
+    write_and_flush(&storage, &schema_manager, edge_type_id, config).await;
+
+    let status = run_compaction_cycle(&storage, Duration::from_secs(2)).await;
+
+    // If the delta table still exists after compaction, it should be empty
+    let fwd_table_name = LanceDbStore::delta_table_name("KNOWS", "fwd");
+    if let Ok(table) = storage.lancedb_store().open_table(&fwd_table_name).await {
+        let count = table.count_rows(None).await.unwrap();
+        assert_eq!(
+            count, 0,
+            "Delta table should be empty after semantic compaction"
+        );
+    }
+
+    assert_eq!(
+        status.l1_runs, 0,
+        "l1_runs should be 0 -- empty tables should not be counted"
+    );
+}
+
+/// Verify l1_size_bytes is computed from row counts, not hardcoded to 0.
+#[tokio::test]
+async fn test_compaction_status_tracks_data_size() {
+    let dir = tempdir().unwrap();
+    let db_path_str = dir.path().to_str().unwrap();
+
+    let mut config = UniConfig::default();
+    config.compaction.enabled = true;
+    config.compaction.max_l1_runs = 100; // High -- prevent triggering compaction
+    config.compaction.max_l1_size_bytes = u64::MAX;
+    config.compaction.check_interval = Duration::from_millis(200);
+
+    let (storage, schema_manager, edge_type_id) =
+        setup_schema_and_storage(db_path_str, config.clone()).await;
+
+    write_and_flush(&storage, &schema_manager, edge_type_id, config).await;
+
+    // Run just long enough for a status update cycle (no compaction will trigger)
+    let status = run_compaction_cycle(&storage, Duration::from_millis(500)).await;
+
+    assert!(
+        status.l1_size_bytes > 0,
+        "l1_size_bytes should be non-zero after writing data, got {}",
+        status.l1_size_bytes
+    );
+    assert!(
+        status.l1_runs > 0,
+        "l1_runs should be non-zero before compaction"
+    );
+}
+
+/// Verify that background compaction handles an empty DB gracefully
+/// (no crash, no panic, 0 total_compactions).
+#[tokio::test]
+async fn test_background_compaction_handles_empty_db() {
+    let dir = tempdir().unwrap();
+    let db_path_str = dir.path().to_str().unwrap();
+
+    let mut config = UniConfig::default();
+    config.compaction.enabled = true;
+    config.compaction.max_l1_runs = 1;
+    config.compaction.check_interval = Duration::from_millis(200);
+
+    let (storage, _schema_manager, _edge_type_id) =
+        setup_schema_and_storage(db_path_str, config).await;
+
+    let status = run_compaction_cycle(&storage, Duration::from_secs(1)).await;
+
+    assert_eq!(
+        status.total_compactions, 0,
+        "Empty DB should not trigger compaction"
+    );
+    assert_eq!(status.l1_runs, 0);
+    assert_eq!(status.l1_size_bytes, 0);
 }

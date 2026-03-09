@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "uni-docs"
-version = "0.1.17"
+version = "0.1.18"
 description = "Documentation site for Uni - The Embedded Multi-Model Graph Database"
 authors = ["Dragonscale Industries Inc. <dev@dragonscale.ai>"]
 readme = "README.md"

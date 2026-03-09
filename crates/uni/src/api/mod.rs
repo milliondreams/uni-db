@@ -1332,10 +1332,9 @@ impl UniBuilder {
                 .map_err(UniError::Internal)?,
             );
 
-            let handle =
-                rebuild_manager
-                    .clone()
-                    .start_background_worker(shutdown_handle.subscribe());
+            let handle = rebuild_manager
+                .clone()
+                .start_background_worker(shutdown_handle.subscribe());
             shutdown_handle.track_task(handle);
 
             {

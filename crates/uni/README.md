@@ -108,9 +108,9 @@ let db = Uni::open("./local_meta")
 
 ## Documentation
 
-- [Full Documentation](https://rustic-ai.github.io/uni)
-- [Rust API Reference](https://docs.rs/uni)
-- [GitHub Repository](https://github.com/rustic-ai/uni)
+- [Full Documentation](https://rustic-ai.github.io/uni-db)
+- [Rust API Reference](https://docs.rs/uni-db)
+- [GitHub Repository](https://github.com/rustic-ai/uni-db)
 
 ## License
 

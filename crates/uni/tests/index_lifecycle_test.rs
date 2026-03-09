@@ -7,9 +7,7 @@ use anyhow::Result;
 use std::collections::HashMap;
 use uni_db::Uni;
 use uni_db::UniConfig;
-use uni_db::core::schema::{
-    IndexDefinition, IndexStatus, ScalarIndexConfig, ScalarIndexType,
-};
+use uni_db::core::schema::{IndexDefinition, IndexStatus, ScalarIndexConfig, ScalarIndexType};
 use uni_db::unival;
 
 #[tokio::test]
@@ -18,8 +16,12 @@ async fn test_list_indexes_with_metadata() -> Result<()> {
 
     // Add a label and index
     db.schema_manager().add_label("Person")?;
-    db.schema_manager()
-        .add_property("Person", "name", uni_db::core::schema::DataType::String, false)?;
+    db.schema_manager().add_property(
+        "Person",
+        "name",
+        uni_db::core::schema::DataType::String,
+        false,
+    )?;
 
     let idx = IndexDefinition::Scalar(ScalarIndexConfig {
         name: "idx_person_name".to_string(),
@@ -92,8 +94,12 @@ async fn test_bulk_sync_sets_metadata() -> Result<()> {
 
     // Setup schema with a scalar index
     db.schema_manager().add_label("Item")?;
-    db.schema_manager()
-        .add_property("Item", "name", uni_db::core::schema::DataType::String, false)?;
+    db.schema_manager().add_property(
+        "Item",
+        "name",
+        uni_db::core::schema::DataType::String,
+        false,
+    )?;
     db.schema_manager().save().await?;
 
     let idx = IndexDefinition::Scalar(ScalarIndexConfig {

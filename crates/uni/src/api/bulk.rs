@@ -1184,11 +1184,7 @@ impl<'a> BulkWriter<'a> {
             .map_err(UniError::Internal)?;
 
         // Save schema with updated index metadata
-        self.db
-            .schema
-            .save()
-            .await
-            .map_err(UniError::Internal)?;
+        self.db.schema.save().await.map_err(UniError::Internal)?;
 
         // Warm adjacency CSRs for all edge types written during bulk import
         // so that subsequent traversal queries can find the edges.

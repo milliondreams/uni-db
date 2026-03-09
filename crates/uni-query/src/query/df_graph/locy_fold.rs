@@ -186,24 +186,16 @@ impl ExecutionPlan for FoldExec {
                 return Ok(RecordBatch::new_empty(output_schema));
             }
 
-            // Group by key columns → row indices
+            // Group by key columns → row indices, preserving insertion order
             let mut groups: HashMap<Vec<ScalarKey>, Vec<usize>> = HashMap::new();
+            let mut ordered_keys: Vec<Vec<ScalarKey>> = Vec::new();
             for row_idx in 0..batch.num_rows() {
                 let key = extract_scalar_key(&batch, &key_indices, row_idx);
-                groups.entry(key).or_default().push(row_idx);
-            }
-
-            // Preserve insertion order by collecting keys in order of first appearance
-            let mut ordered_keys: Vec<Vec<ScalarKey>> = Vec::new();
-            {
-                let mut seen: std::collections::HashSet<Vec<ScalarKey>> =
-                    std::collections::HashSet::new();
-                for row_idx in 0..batch.num_rows() {
-                    let key = extract_scalar_key(&batch, &key_indices, row_idx);
-                    if seen.insert(key.clone()) {
-                        ordered_keys.push(key);
-                    }
+                let entry = groups.entry(key.clone());
+                if matches!(entry, std::collections::hash_map::Entry::Vacant(_)) {
+                    ordered_keys.push(key);
                 }
+                entry.or_default().push(row_idx);
             }
 
             let num_groups = ordered_keys.len();
@@ -267,12 +259,7 @@ fn compute_fold_aggregate(
         FoldAggKind::Sum => {
             let mut builder = Float64Builder::with_capacity(num_groups);
             for key in ordered_keys {
-                let indices = &groups[key];
-                let sum = sum_f64(col, indices);
-                match sum {
-                    Some(v) => builder.append_value(v),
-                    None => builder.append_null(),
-                }
+                builder.append_option(sum_f64(col, &groups[key]));
             }
             Ok(Arc::new(builder.finish()))
         }
@@ -291,28 +278,24 @@ fn compute_fold_aggregate(
             let mut builder = Float64Builder::with_capacity(num_groups);
             for key in ordered_keys {
                 let indices = &groups[key];
-                let sum = sum_f64(col, indices);
                 let count = indices.iter().filter(|&&i| !col.is_null(i)).count();
-                match (sum, count) {
-                    (Some(s), c) if c > 0 => builder.append_value(s / c as f64),
-                    _ => builder.append_null(),
-                }
+                let avg = sum_f64(col, indices)
+                    .filter(|_| count > 0)
+                    .map(|s| s / count as f64);
+                builder.append_option(avg);
             }
             Ok(Arc::new(builder.finish()))
         }
         FoldAggKind::Collect => {
             let mut builder = LargeBinaryBuilder::with_capacity(num_groups, num_groups * 32);
             for key in ordered_keys {
-                let indices = &groups[key];
-                let mut values = Vec::new();
-                for &i in indices {
-                    if !col.is_null(i) {
-                        let val = scalar_to_value(col, i);
-                        values.push(val);
-                    }
-                }
-                let list = uni_common::Value::List(values);
-                let encoded = uni_common::cypher_value_codec::encode(&list);
+                let values: Vec<uni_common::Value> = groups[key]
+                    .iter()
+                    .filter(|&&i| !col.is_null(i))
+                    .map(|&i| scalar_to_value(col, i))
+                    .collect();
+                let encoded =
+                    uni_common::cypher_value_codec::encode(&uni_common::Value::List(values));
                 builder.append_value(&encoded);
             }
             Ok(Arc::new(builder.finish()))
@@ -349,23 +332,18 @@ fn compute_minmax(
             let arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
             let mut builder = Int64Builder::with_capacity(num_groups);
             for key in ordered_keys {
-                let indices = &groups[key];
                 let mut result: Option<i64> = None;
-                for &i in indices {
-                    if arr.is_null(i) {
-                        continue;
+                for &i in &groups[key] {
+                    if !arr.is_null(i) {
+                        let v = arr.value(i);
+                        result = Some(match result {
+                            None => v,
+                            Some(cur) if is_min => cur.min(v),
+                            Some(cur) => cur.max(v),
+                        });
                     }
-                    let v = arr.value(i);
-                    result = Some(match result {
-                        None => v,
-                        Some(cur) if is_min => cur.min(v),
-                        Some(cur) => cur.max(v),
-                    });
                 }
-                match result {
-                    Some(v) => builder.append_value(v),
-                    None => builder.append_null(),
-                }
+                builder.append_option(result);
             }
             Ok(Arc::new(builder.finish()))
         }
@@ -373,29 +351,27 @@ fn compute_minmax(
             let arr = col.as_any().downcast_ref::<Float64Array>().unwrap();
             let mut builder = Float64Builder::with_capacity(num_groups);
             for key in ordered_keys {
-                let indices = &groups[key];
                 let mut result: Option<f64> = None;
-                for &i in indices {
-                    if arr.is_null(i) {
-                        continue;
+                for &i in &groups[key] {
+                    if !arr.is_null(i) {
+                        let v = arr.value(i);
+                        result = Some(match result {
+                            None => v,
+                            Some(cur) if is_min => cur.min(v),
+                            Some(cur) => cur.max(v),
+                        });
                     }
-                    let v = arr.value(i);
-                    result = Some(match result {
-                        None => v,
-                        Some(cur) if is_min => cur.min(v),
-                        Some(cur) => cur.max(v),
-                    });
                 }
-                match result {
-                    Some(v) => builder.append_value(v),
-                    None => builder.append_null(),
-                }
+                builder.append_option(result);
             }
             Ok(Arc::new(builder.finish()))
         }
-        _ => {
-            // Fallback: treat as string comparison
-            let mut builder = arrow_array::builder::StringBuilder::new();
+        dt => {
+            // Fallback: treat as string comparison.
+            // Use LargeStringBuilder for LargeUtf8 input to match the output schema
+            // (build_output_schema preserves the input type for MAX/MIN).
+            let use_large = matches!(dt, DataType::LargeUtf8);
+            let mut values: Vec<Option<String>> = Vec::with_capacity(num_groups);
             for key in ordered_keys {
                 let indices = &groups[key];
                 let mut result: Option<String> = None;
@@ -405,25 +381,41 @@ fn compute_minmax(
                     }
                     let v = format!("{:?}", scalar_to_value(col, i));
                     result = Some(match result {
-                        None => v.clone(),
-                        Some(cur) => {
-                            if is_min {
-                                if v < cur { v } else { cur }
-                            } else if v > cur {
-                                v
-                            } else {
-                                cur
-                            }
-                        }
+                        None => v,
+                        Some(cur) if is_min && v < cur => v,
+                        Some(cur) if !is_min && v > cur => v,
+                        Some(cur) => cur,
                     });
                 }
-                match result {
-                    Some(v) => builder.append_value(&v),
-                    None => builder.append_null(),
-                }
+                values.push(result);
             }
-            Ok(Arc::new(builder.finish()))
+            Ok(build_optional_string_array(&values, use_large))
         }
+    }
+}
+
+fn build_optional_string_array(
+    values: &[Option<String>],
+    use_large: bool,
+) -> arrow_array::ArrayRef {
+    if use_large {
+        let mut builder = arrow_array::builder::LargeStringBuilder::new();
+        for v in values {
+            match v {
+                Some(s) => builder.append_value(s),
+                None => builder.append_null(),
+            }
+        }
+        Arc::new(builder.finish())
+    } else {
+        let mut builder = arrow_array::builder::StringBuilder::new();
+        for v in values {
+            match v {
+                Some(s) => builder.append_value(s),
+                None => builder.append_null(),
+            }
+        }
+        Arc::new(builder.finish())
     }
 }
 
@@ -444,6 +436,13 @@ fn scalar_to_value(col: &dyn Array, row_idx: usize) -> uni_common::Value {
             let arr = col
                 .as_any()
                 .downcast_ref::<arrow_array::StringArray>()
+                .unwrap();
+            uni_common::Value::String(arr.value(row_idx).to_string())
+        }
+        DataType::LargeUtf8 => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<arrow_array::LargeStringArray>()
                 .unwrap();
             uni_common::Value::String(arr.value(row_idx).to_string())
         }

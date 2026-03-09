@@ -10,7 +10,9 @@ use crate::query::df_graph::pattern_comprehension::{
 };
 use crate::query::df_graph::quantifier::{QuantifierExecExpr, QuantifierType};
 use crate::query::df_graph::reduce::ReduceExecExpr;
+use crate::query::df_graph::similar_to_expr::SimilarToExecExpr;
 use crate::query::planner::QueryPlanner;
+use crate::query::similar_to::SimilarToError;
 use anyhow::{Result, anyhow};
 use arrow_array::builder::BooleanBuilder;
 use arrow_schema::{DataType, Field, Schema};
@@ -427,6 +429,9 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
                 distinct,
                 ..
             } => {
+                if name.eq_ignore_ascii_case("similar_to") {
+                    return self.compile_similar_to(args, input_schema);
+                }
                 if args.iter().any(Self::contains_custom_expr) {
                     self.compile_function_with_custom_args(name, args, *distinct, input_schema)
                 } else {
@@ -685,6 +690,56 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
         )))
     }
 
+    /// Compile a `similar_to(sources, queries [, options])` call into a `SimilarToExecExpr`.
+    fn compile_similar_to(
+        &self,
+        args: &[Expr],
+        input_schema: &Schema,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        if args.len() < 2 || args.len() > 3 {
+            return Err(SimilarToError::InvalidArity { count: args.len() }.into());
+        }
+
+        let graph_ctx = self
+            .graph_ctx
+            .clone()
+            .ok_or(SimilarToError::NoGraphContext)?;
+
+        // Extract variable name and property names from the source expression.
+        let source_variable = extract_source_variable(&args[0]);
+        let source_property_names = extract_property_names(&args[0]);
+
+        // Normalize sources and queries: if args[0] is a List, split into
+        // individual source/query pairs for multi-source scoring.
+        let (source_exprs, query_exprs) = normalize_similar_to_args(&args[0], &args[1]);
+
+        // Compile each source and query expression
+        let source_children: Vec<Arc<dyn PhysicalExpr>> = source_exprs
+            .iter()
+            .map(|e| self.compile(e, input_schema))
+            .collect::<Result<Vec<_>>>()?;
+        let query_children: Vec<Arc<dyn PhysicalExpr>> = query_exprs
+            .iter()
+            .map(|e| self.compile(e, input_schema))
+            .collect::<Result<Vec<_>>>()?;
+
+        // Compile options if present
+        let options_child = if args.len() == 3 {
+            Some(self.compile(&args[2], input_schema)?)
+        } else {
+            None
+        };
+
+        Ok(Arc::new(SimilarToExecExpr::new(
+            source_children,
+            query_children,
+            options_child,
+            graph_ctx,
+            source_variable,
+            source_property_names,
+        )))
+    }
+
     /// Check if map_expr or where_clause contains a pattern comprehension that references the variable.
     fn needs_vid_extraction_for_variable(
         variable: &str,
@@ -751,7 +806,10 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
                 Self::contains_custom_expr(left) || Self::contains_custom_expr(right)
             }
             Expr::UnaryOp { expr, .. } => Self::contains_custom_expr(expr),
-            Expr::FunctionCall { args, .. } => args.iter().any(Self::contains_custom_expr),
+            Expr::FunctionCall { name, args, .. } => {
+                name.eq_ignore_ascii_case("similar_to")
+                    || args.iter().any(Self::contains_custom_expr)
+            }
             Expr::Case {
                 when_then,
                 else_expr,
@@ -810,7 +868,12 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
         expr: &Expr,
         input_schema: &Schema,
     ) -> Result<Arc<dyn PhysicalExpr>> {
-        let df_expr = cypher_expr_to_df(expr, self.translation_ctx)?;
+        // Pre-resolve Property(Variable(v), p) → Variable("v.p") when the flat
+        // column "v.p" exists in the input schema.  This prevents DataFusion's
+        // standard path from compiling it as ArrayIndex(column(v), "p"), which
+        // fails when the column stores a VID integer rather than a Map/Struct.
+        let resolved = Self::resolve_flat_column_properties(expr, input_schema);
+        let df_expr = cypher_expr_to_df(&resolved, self.translation_ctx)?;
         let resolved_expr = self.resolve_udfs(df_expr)?;
 
         let df_schema = datafusion::common::DFSchema::try_from(input_schema.clone())?;
@@ -825,6 +888,60 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
         planner
             .create_physical_expr(&coerced_expr, &df_schema, self.state)
             .map_err(|e| anyhow!("DataFusion planning failed: {}", e))
+    }
+
+    /// Recursively resolve `Property(Variable(v), p)` → `Variable("v.p")` when
+    /// the flat column `"v.p"` exists in `schema`.  This ensures that property
+    /// access on graph-scan variables is compiled as a direct column reference
+    /// rather than an ArrayIndex UDF call, which would fail when the variable
+    /// column holds a VID integer instead of a Map/Node struct.
+    fn resolve_flat_column_properties(expr: &Expr, schema: &Schema) -> Expr {
+        match expr {
+            Expr::Property(base, prop) => {
+                if let Expr::Variable(var) = base.as_ref() {
+                    let flat_col = format!("{}.{}", var, prop);
+                    if schema.index_of(&flat_col).is_ok() {
+                        return Expr::Variable(flat_col);
+                    }
+                }
+                // Recurse into the base expression
+                Expr::Property(
+                    Box::new(Self::resolve_flat_column_properties(base, schema)),
+                    prop.clone(),
+                )
+            }
+            Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
+                left: Box::new(Self::resolve_flat_column_properties(left, schema)),
+                op: *op,
+                right: Box::new(Self::resolve_flat_column_properties(right, schema)),
+            },
+            Expr::FunctionCall {
+                name,
+                args,
+                distinct,
+                window_spec,
+            } => Expr::FunctionCall {
+                name: name.clone(),
+                args: args
+                    .iter()
+                    .map(|a| Self::resolve_flat_column_properties(a, schema))
+                    .collect(),
+                distinct: *distinct,
+                window_spec: window_spec.clone(),
+            },
+            Expr::UnaryOp { op, expr: inner } => Expr::UnaryOp {
+                op: *op,
+                expr: Box::new(Self::resolve_flat_column_properties(inner, schema)),
+            },
+            Expr::List(items) => Expr::List(
+                items
+                    .iter()
+                    .map(|i| Self::resolve_flat_column_properties(i, schema))
+                    .collect(),
+            ),
+            // For all other expression types, return as-is (literals, variables, etc.)
+            other => other.clone(),
+        }
     }
 
     /// Resolve UDFs in DataFusion expression using the session state registry.
@@ -1126,24 +1243,18 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
                 )
             })?;
 
-        // 3. Build operand type list from compiled args
+        // 3. Build operand type list and dummy columns from compiled args
+        let placeholders: &[&str] = &["__arg0__", "__arg1__", "__arg2__", "__argN__"];
         let operand_types: Vec<(&str, DataType)> = compiled_args
             .iter()
             .enumerate()
             .map(|(i, arg)| {
                 let dt = arg.data_type(input_schema).unwrap_or(DataType::LargeBinary);
-                // Use a unique placeholder name per argument
-                let placeholder: &str = match i {
-                    0 => "__arg0__",
-                    1 => "__arg1__",
-                    2 => "__arg2__",
-                    _ => "__argN__",
-                };
+                let placeholder = placeholders[i.min(3)];
                 (placeholder, dt)
             })
             .collect();
 
-        // 4. Build dummy column references for the UDF logical expression
         let dummy_cols: Vec<datafusion::logical_expr::Expr> = operand_types
             .iter()
             .map(|(name, _)| {
@@ -1161,13 +1272,10 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
             },
         );
 
-        // 5. Plan and rebind
+        // 4. Plan and rebind
         self.plan_udf_physical_expr(
             &udf_expr,
-            &operand_types
-                .iter()
-                .map(|(n, dt)| (*n, dt.clone()))
-                .collect::<Vec<_>>(),
+            &operand_types,
             compiled_args,
             &format!("function {}", name),
         )
@@ -1233,41 +1341,22 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
             .map(|e| self.compile(e, input_schema))
             .transpose()?;
 
-        // Fix B: Wrap CypherValue WHEN conditions with _cv_to_bool
-        // Apply wrapping defensively - if we can't determine type or if it's LargeBinary
+        // Wrap CypherValue WHEN conditions with _cv_to_bool for proper boolean evaluation
         for (w_phy, _) in &mut when_then_phy {
-            let should_wrap = match w_phy.data_type(input_schema) {
-                Ok(dt) => dt == DataType::LargeBinary,
-                Err(_) => {
-                    // If we can't determine the type, check if it's likely CypherValue by looking
-                    // for common patterns (column references, function calls that might return CypherValue)
-                    // For now, be conservative and don't wrap if we can't determine type
-                    false
-                }
-            };
-            if should_wrap {
+            if matches!(w_phy.data_type(input_schema), Ok(DataType::LargeBinary)) {
                 *w_phy = self.wrap_with_cv_to_bool(w_phy.clone())?;
             }
         }
 
-        // Fix A: Unify branch types when mixing LargeList and LargeBinary
-        // Collect all branch data types
-        let mut branch_types: Vec<DataType> = Vec::new();
-        for (_, t_phy) in &when_then_phy {
-            if let Ok(dt) = t_phy.data_type(input_schema) {
-                branch_types.push(dt);
-            }
-        }
-        if let Some(ref e_phy) = else_phy
-            && let Ok(dt) = e_phy.data_type(input_schema)
-        {
-            branch_types.push(dt);
-        }
-
-        // Check if we have a mix of LargeBinary and LargeList/List types
-        let has_large_binary = branch_types
+        // Unify branch types when mixing LargeList and LargeBinary
+        let branch_types: Vec<DataType> = when_then_phy
             .iter()
-            .any(|dt| matches!(dt, DataType::LargeBinary));
+            .map(|(_, t)| t.data_type(input_schema))
+            .chain(else_phy.iter().map(|e| e.data_type(input_schema)))
+            .filter_map(Result::ok)
+            .collect();
+
+        let has_large_binary = branch_types.contains(&DataType::LargeBinary);
         let has_list = branch_types
             .iter()
             .any(|dt| matches!(dt, DataType::List(_) | DataType::LargeList(_)));
@@ -1356,8 +1445,8 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
         // UDFs which decode CypherValue to Value for comparison.
         let mut left = left;
         let mut right = right;
-        let left_type = left.data_type(input_schema).ok();
-        let right_type = right.data_type(input_schema).ok();
+        let mut left_type = left.data_type(input_schema).ok();
+        let mut right_type = right.data_type(input_schema).ok();
 
         // Type unification: if one side is LargeList and the other is LargeBinary,
         // convert LargeList to LargeBinary for consistent handling
@@ -1369,18 +1458,15 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
             right_type.as_ref(),
             Some(DataType::List(_) | DataType::LargeList(_))
         );
-        let left_is_binary = matches!(left_type.as_ref(), Some(DataType::LargeBinary));
-        let right_is_binary = matches!(right_type.as_ref(), Some(DataType::LargeBinary));
 
-        if left_is_list && right_is_binary {
+        if left_is_list && is_cypher_value_type(right_type.as_ref()) {
             left = Arc::new(LargeListToCypherValueExpr::new(left));
-        } else if right_is_list && left_is_binary {
+            left_type = Some(DataType::LargeBinary);
+        } else if right_is_list && is_cypher_value_type(left_type.as_ref()) {
             right = Arc::new(LargeListToCypherValueExpr::new(right));
+            right_type = Some(DataType::LargeBinary);
         }
 
-        // Recalculate types after unification
-        let left_type = left.data_type(input_schema).ok();
-        let right_type = right.data_type(input_schema).ok();
         let has_cv =
             is_cypher_value_type(left_type.as_ref()) || is_cypher_value_type(right_type.as_ref());
 
@@ -1615,6 +1701,65 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
             UnaryOp::Neg => datafusion::physical_expr::expressions::negative(expr, input_schema),
         }
         .map_err(|e| anyhow!("Failed to create unary expression: {}", e))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// similar_to() AST helpers
+// ---------------------------------------------------------------------------
+
+/// Extract the base variable name from a source expression.
+///
+/// For `d.embedding` → `"d"`, for `[d.embedding, d.content]` → `"d"`.
+fn extract_source_variable(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Property(inner, _) => extract_source_variable(inner),
+        Expr::Variable(name) => Some(name.clone()),
+        Expr::List(items) => items.first().and_then(extract_source_variable),
+        _ => None,
+    }
+}
+
+/// Extract property names from source expressions.
+///
+/// For `d.embedding` → `["embedding"]`, for `[d.embedding, d.content]` → `["embedding", "content"]`.
+fn extract_property_names(expr: &Expr) -> Vec<Option<String>> {
+    match expr {
+        Expr::Property(_, prop) => vec![Some(prop.clone())],
+        Expr::List(items) => items
+            .iter()
+            .map(|item| {
+                if let Expr::Property(_, prop) = item {
+                    Some(prop.clone())
+                } else {
+                    None
+                }
+            })
+            .collect(),
+        _ => vec![None],
+    }
+}
+
+/// Normalize similar_to arguments for multi-source scoring.
+///
+/// If source arg is a `List`, returns the individual items as separate source/query pairs.
+/// Otherwise returns the args as-is (single pair).
+fn normalize_similar_to_args<'e>(
+    sources: &'e Expr,
+    queries: &'e Expr,
+) -> (Vec<&'e Expr>, Vec<&'e Expr>) {
+    match (sources, queries) {
+        // Multi-source: [d.embedding, d.content] paired with [query_vec, query_text]
+        (Expr::List(src_items), Expr::List(qry_items)) if src_items.len() == qry_items.len() => {
+            (src_items.iter().collect(), qry_items.iter().collect())
+        }
+        // Multi-source with broadcast query: [d.embedding, d.content] paired with single query
+        (Expr::List(src_items), _) if src_items.len() > 1 => {
+            let queries_broadcast: Vec<&Expr> = vec![queries; src_items.len()];
+            (src_items.iter().collect(), queries_broadcast)
+        }
+        // Single source
+        _ => (vec![sources], vec![queries]),
     }
 }
 

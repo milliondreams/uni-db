@@ -121,6 +121,34 @@ fn infer_expr_type(expr: &Expr, node_vars: &HashSet<String>) -> DataType {
         Expr::Literal(CypherLiteral::Float(_)) => DataType::Float64,
         Expr::Literal(CypherLiteral::String(_)) => DataType::LargeUtf8,
         Expr::Property(_, _) => DataType::Float64,
+        // Function calls: infer return type from function name.
+        Expr::FunctionCall { name, args, .. } => {
+            match name.to_uppercase().as_str() {
+                // Numeric functions → Float64
+                "SIMILAR_TO" | "ABS" | "SQRT" | "LOG" | "LOG10" | "EXP" | "CEIL" | "FLOOR"
+                | "ROUND" | "SIGN" | "RAND" | "TOFLOAT" | "TODOUBLE" | "COS" | "SIN" | "TAN"
+                | "ACOS" | "ASIN" | "ATAN" | "ATAN2" | "DEGREES" | "RADIANS" | "PI" | "E"
+                | "DISTANCE" => DataType::Float64,
+                // Integer-returning functions
+                "TOINTEGER" | "LENGTH" | "SIZE" | "ID" => DataType::Int64,
+                // String-returning functions
+                "TOSTRING" | "TOLOWER" | "TOUPPER" | "TRIM" | "LTRIM" | "RTRIM" | "REPLACE"
+                | "SUBSTRING" | "LEFT" | "RIGHT" | "REVERSE" | "TYPE" => DataType::LargeUtf8,
+                // Boolean-returning functions
+                "EXISTS" | "STARTSWITH" | "ENDSWITH" | "CONTAINS" => DataType::Boolean,
+                // Aggregates that return Float64
+                "SUM" | "AVG" | "MAX" | "MIN" => DataType::Float64,
+                "COUNT" => DataType::Int64,
+                // Unknown function: try to infer from first argument
+                _ => {
+                    if let Some(first_arg) = args.first() {
+                        infer_expr_type(first_arg, node_vars)
+                    } else {
+                        DataType::LargeUtf8
+                    }
+                }
+            }
+        }
         _ => DataType::LargeUtf8,
     }
 }
@@ -285,10 +313,10 @@ impl<'a> LocyPlanBuilder<'a> {
             )?);
         }
 
-        // Collect fold/best_by from first clause (all clauses share same schema)
-        let fold_bindings = rule
-            .clauses
-            .first()
+        // All clauses share the same schema; derive metadata from first clause
+        let first_clause = rule.clauses.first();
+
+        let fold_bindings = first_clause
             .map(|c| {
                 c.fold
                     .iter()
@@ -296,9 +324,7 @@ impl<'a> LocyPlanBuilder<'a> {
                     .collect()
             })
             .unwrap_or_default();
-        let best_by_criteria = rule
-            .clauses
-            .first()
+        let best_by_criteria = first_clause
             .and_then(|c| c.best_by.as_ref())
             .map(|bb| {
                 bb.items
@@ -308,15 +334,10 @@ impl<'a> LocyPlanBuilder<'a> {
             })
             .unwrap_or_default();
 
-        // Infer yield column types from first clause expressions
-        let fold_output_names: HashSet<&str> = rule
-            .clauses
-            .first()
+        let fold_output_names: HashSet<&str> = first_clause
             .map(|c| c.fold.iter().map(|fb| fb.name.as_str()).collect())
             .unwrap_or_default();
-        let along_names: HashSet<&str> = rule
-            .clauses
-            .first()
+        let along_names: HashSet<&str> = first_clause
             .map(|c| c.along.iter().map(|a| a.name.as_str()).collect())
             .unwrap_or_default();
 
@@ -324,16 +345,11 @@ impl<'a> LocyPlanBuilder<'a> {
             .yield_schema
             .iter()
             .map(|yc| {
-                let data_type = if let Some(first_clause) = rule.clauses.first() {
-                    infer_yield_type(
-                        &yc.name,
-                        first_clause,
-                        &node_vars,
-                        &fold_output_names,
-                        &along_names,
-                    )
-                } else {
-                    DataType::LargeUtf8
+                let data_type = match first_clause {
+                    Some(fc) => {
+                        infer_yield_type(&yc.name, fc, &node_vars, &fold_output_names, &along_names)
+                    }
+                    None => DataType::LargeUtf8,
                 };
                 LocyYieldColumn {
                     name: yc.name.clone(),
@@ -513,12 +529,12 @@ impl<'a> LocyPlanBuilder<'a> {
                             non_key_cols.first().map(|c| c.name.clone())
                         };
 
-                        if let Some(col_name) = target_col_name
-                            && *target_var != col_name
-                        {
-                            // Target variable name differs from derived scan
-                            // column name. Add a node scan so `target_var` becomes
-                            // a proper node with `._vid`, `._labels`, `._all_props`.
+                        if let Some(col_name) = target_col_name {
+                            // Always add a node scan so `target_var` becomes a
+                            // proper node with `._vid`, `._labels`, and property
+                            // columns.  Without this, the derived scan only
+                            // provides the VID and property access (e.g.
+                            // `b.embedding`) would fail at runtime.
                             let target_node_scan = LogicalPlan::ScanAll {
                                 variable: target_var.clone(),
                                 filter: None,
@@ -539,8 +555,6 @@ impl<'a> LocyPlanBuilder<'a> {
                                 predicate: target_binding,
                                 optional_variables: HashSet::new(),
                             };
-                            // If target_var == col_name: derived scan column already
-                            // has the correct name; no additional join needed.
                         }
                     }
                 }
@@ -630,36 +644,28 @@ impl<'a> LocyPlanBuilder<'a> {
             _ => HashMap::new(),
         };
 
+        let along_names_set: HashSet<&str> = clause.along.iter().map(|a| a.name.as_str()).collect();
+
         let mut projections = Vec::new();
         let mut target_types = Vec::new();
         for yc in yield_cols {
             let expr = if let Some(locy_expr) = along_map.get(yc.name.as_str()) {
-                // ALONG binding — rewrite prev-references
                 rewrite_locy_expr(locy_expr)?
             } else if let Some(fold_input) = fold_input_map.get(yc.name.as_str()) {
-                // FOLD output — project the aggregate's input expression instead
                 (*fold_input).clone()
             } else if fold_output_names.contains(yc.name.as_str()) {
-                // FOLD output without extractable input — skip (shouldn't happen)
                 continue;
             } else if let Some(orig_expr) = yield_expr_map.get(&yc.name) {
-                // Use original expression from YIELD item (handles literals,
-                // property access, etc.)
                 (*orig_expr).clone()
             } else {
                 Expr::Variable(yc.name.clone())
             };
             projections.push((expr, Some(yc.name.clone())));
-
-            // Infer target type for this column
-            let along_names_set: HashSet<&str> =
-                clause.along.iter().map(|a| a.name.as_str()).collect();
-            let fold_out: HashSet<&str> = clause.fold.iter().map(|fb| fb.name.as_str()).collect();
             target_types.push(infer_yield_type(
                 &yc.name,
                 clause,
                 node_vars,
-                &fold_out,
+                &fold_output_names,
                 &along_names_set,
             ));
         }
@@ -962,14 +968,11 @@ pub(crate) fn locy_op_to_cypher_op(op: &LocyBinaryOp) -> BinaryOp {
 /// `locy_program.rs`.
 fn yield_schema_to_arrow_from_rule(target_rule: &CompiledRule) -> SchemaRef {
     let target_node_vars = collect_node_vars(&target_rule.clauses);
-    let fold_names: HashSet<&str> = target_rule
-        .clauses
-        .first()
+    let first_clause = target_rule.clauses.first();
+    let fold_names: HashSet<&str> = first_clause
         .map(|c| c.fold.iter().map(|fb| fb.name.as_str()).collect())
         .unwrap_or_default();
-    let along_names: HashSet<&str> = target_rule
-        .clauses
-        .first()
+    let along_names: HashSet<&str> = first_clause
         .map(|c| c.along.iter().map(|a| a.name.as_str()).collect())
         .unwrap_or_default();
 
@@ -977,16 +980,11 @@ fn yield_schema_to_arrow_from_rule(target_rule: &CompiledRule) -> SchemaRef {
         .yield_schema
         .iter()
         .map(|yc| {
-            let dt = if let Some(first_clause) = target_rule.clauses.first() {
-                infer_yield_type(
-                    &yc.name,
-                    first_clause,
-                    &target_node_vars,
-                    &fold_names,
-                    &along_names,
-                )
-            } else {
-                DataType::LargeUtf8
+            let dt = match first_clause {
+                Some(fc) => {
+                    infer_yield_type(&yc.name, fc, &target_node_vars, &fold_names, &along_names)
+                }
+                None => DataType::LargeUtf8,
             };
             Field::new(&yc.name, dt, true)
         })

@@ -11,11 +11,58 @@
 //! (top-K index scan). It works in WHERE, RETURN, WITH, ORDER BY, and
 //! Locy rule bodies.
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use uni_common::Value;
 use uni_common::core::schema::{DistanceMetric, Schema};
 
 use crate::query::fusion;
+
+/// Named error types for `similar_to()` validation failures.
+#[derive(Debug, thiserror::Error)]
+pub enum SimilarToError {
+    #[error("similar_to: property '{label}.{property}' has no vector or full-text index")]
+    NoIndex { label: String, property: String },
+
+    #[error(
+        "similar_to: source {source_index} is FTS-indexed but query is a vector (FTS cannot score against vectors)"
+    )]
+    TypeMismatch { source_index: usize },
+
+    #[error(
+        "similar_to: source {source_index} is a vector property but query is a string, and the index has no embedding config for auto-embedding"
+    )]
+    NoEmbeddingConfig { source_index: usize },
+
+    #[error("similar_to: weights length ({weights_len}) != sources length ({sources_len})")]
+    WeightsLengthMismatch {
+        weights_len: usize,
+        sources_len: usize,
+    },
+
+    #[error("similar_to: weights must sum to 1.0 (got {sum})")]
+    WeightsNotNormalized { sum: f32 },
+
+    #[error("similar_to: unknown method '{method}', expected 'rrf' or 'weighted'")]
+    InvalidMethod { method: String },
+
+    #[error("similar_to: {message}")]
+    InvalidOption { message: String },
+
+    #[error("similar_to: vector dimensions mismatch: {a} vs {b}")]
+    DimensionMismatch { a: usize, b: usize },
+
+    #[error("similar_to: expected vector or list of numbers, got {actual}")]
+    InvalidVectorValue { actual: String },
+
+    #[error("similar_to: weighted fusion requires 'weights' option")]
+    WeightsRequired,
+
+    #[error("similar_to takes 2 or 3 arguments (sources, queries [, options]), got {count}")]
+    InvalidArity { count: usize },
+
+    #[error("similar_to requires GraphExecutionContext")]
+    NoGraphContext,
+}
 
 /// Fusion method for multi-source scoring.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -53,11 +100,15 @@ impl Default for SimilarToOptions {
 }
 
 /// Parse options from a `Value::Map`.
-pub fn parse_options(value: &Value) -> Result<SimilarToOptions> {
+pub fn parse_options(value: &Value) -> Result<SimilarToOptions, SimilarToError> {
     let map = match value {
         Value::Map(m) => m,
         Value::Null => return Ok(SimilarToOptions::default()),
-        _ => return Err(anyhow!("similar_to options must be a map, got {:?}", value)),
+        _ => {
+            return Err(SimilarToError::InvalidOption {
+                message: format!("options must be a map, got {:?}", value),
+            });
+        }
     };
 
     let mut opts = SimilarToOptions::default();
@@ -67,15 +118,14 @@ pub fn parse_options(value: &Value) -> Result<SimilarToOptions> {
             Some("rrf") => opts.method = FusionMethod::Rrf,
             Some("weighted") => opts.method = FusionMethod::Weighted,
             Some(other) => {
-                return Err(anyhow!(
-                    "similar_to: unknown method '{}', expected 'rrf' or 'weighted'",
-                    other
-                ));
+                return Err(SimilarToError::InvalidMethod {
+                    method: other.to_string(),
+                });
             }
             None => {
-                return Err(anyhow!(
-                    "similar_to: 'method' must be a string ('rrf' or 'weighted')"
-                ));
+                return Err(SimilarToError::InvalidOption {
+                    message: "'method' must be a string ('rrf' or 'weighted')".to_string(),
+                });
             }
         }
     }
@@ -83,32 +133,40 @@ pub fn parse_options(value: &Value) -> Result<SimilarToOptions> {
     if let Some(weights_val) = map.get("weights") {
         match weights_val {
             Value::List(list) => {
-                let weights: Result<Vec<f32>> = list
+                let weights: Result<Vec<f32>, SimilarToError> = list
                     .iter()
                     .map(|v| {
                         v.as_f64()
                             .map(|f| f as f32)
-                            .ok_or_else(|| anyhow!("similar_to: weight must be a number"))
+                            .ok_or_else(|| SimilarToError::InvalidOption {
+                                message: "weight must be a number".to_string(),
+                            })
                     })
                     .collect();
                 opts.weights = Some(weights?);
             }
-            _ => return Err(anyhow!("similar_to: 'weights' must be a list of numbers")),
+            _ => {
+                return Err(SimilarToError::InvalidOption {
+                    message: "'weights' must be a list of numbers".to_string(),
+                });
+            }
         }
     }
 
     if let Some(k_val) = map.get("k") {
         opts.k = k_val
             .as_i64()
-            .ok_or_else(|| anyhow!("similar_to: 'k' must be an integer"))?
-            as usize;
+            .ok_or_else(|| SimilarToError::InvalidOption {
+                message: "'k' must be an integer".to_string(),
+            })? as usize;
     }
 
     if let Some(fts_k_val) = map.get("fts_k") {
         opts.fts_k = fts_k_val
             .as_f64()
-            .ok_or_else(|| anyhow!("similar_to: 'fts_k' must be a number"))?
-            as f32;
+            .ok_or_else(|| SimilarToError::InvalidOption {
+                message: "'fts_k' must be a number".to_string(),
+            })? as f32;
     }
 
     Ok(opts)
@@ -127,7 +185,11 @@ pub enum SourceType {
 }
 
 /// Resolve the source type for a property given the schema.
-pub fn resolve_source_type(schema: &Schema, label: &str, property: &str) -> Result<SourceType> {
+pub fn resolve_source_type(
+    schema: &Schema,
+    label: &str,
+    property: &str,
+) -> Result<SourceType, SimilarToError> {
     // Check vector index first
     if let Some(vec_config) = schema.vector_index_for_property(label, property) {
         return Ok(SourceType::Vector {
@@ -144,21 +206,19 @@ pub fn resolve_source_type(schema: &Schema, label: &str, property: &str) -> Resu
         return Ok(SourceType::Fts);
     }
 
-    Err(anyhow!(
-        "similar_to: property '{}.{}' has no vector or full-text index",
-        label,
-        property
-    ))
+    Err(SimilarToError::NoIndex {
+        label: label.to_string(),
+        property: property.to_string(),
+    })
 }
 
 /// Compute cosine similarity between two vectors, returning a score in [0, 1].
-pub fn cosine_similarity(a: &[f32], b: &[f32]) -> Result<f32> {
+pub fn cosine_similarity(a: &[f32], b: &[f32]) -> Result<f32, SimilarToError> {
     if a.len() != b.len() {
-        return Err(anyhow!(
-            "Vector dimensions mismatch: {} vs {}",
-            a.len(),
-            b.len()
-        ));
+        return Err(SimilarToError::DimensionMismatch {
+            a: a.len(),
+            b: b.len(),
+        });
     }
 
     let mut dot = 0.0f64;
@@ -204,7 +264,7 @@ pub fn eval_similar_to_pure(v1: &Value, v2: &Value) -> Result<Value> {
 }
 
 /// Convert a Value to a Vec<f32> for vector operations.
-pub fn value_to_f32_vec(v: &Value) -> Result<Vec<f32>> {
+pub fn value_to_f32_vec(v: &Value) -> Result<Vec<f32>, SimilarToError> {
     match v {
         Value::Vector(vec) => Ok(vec.clone()),
         Value::List(list) => list
@@ -212,26 +272,29 @@ pub fn value_to_f32_vec(v: &Value) -> Result<Vec<f32>> {
             .map(|v| {
                 v.as_f64()
                     .map(|f| f as f32)
-                    .ok_or_else(|| anyhow!("Vector element must be a number"))
+                    .ok_or_else(|| SimilarToError::InvalidOption {
+                        message: "vector element must be a number".to_string(),
+                    })
             })
             .collect(),
-        _ => Err(anyhow!("Expected vector or list of numbers, got {:?}", v)),
+        _ => Err(SimilarToError::InvalidVectorValue {
+            actual: format!("{:?}", v),
+        }),
     }
 }
 
 /// Validate options against the number of sources.
-pub fn validate_options(opts: &SimilarToOptions, num_sources: usize) -> Result<()> {
+pub fn validate_options(opts: &SimilarToOptions, num_sources: usize) -> Result<(), SimilarToError> {
     if let Some(ref weights) = opts.weights {
         if weights.len() != num_sources {
-            return Err(anyhow!(
-                "similar_to: weights length ({}) != sources length ({})",
-                weights.len(),
-                num_sources
-            ));
+            return Err(SimilarToError::WeightsLengthMismatch {
+                weights_len: weights.len(),
+                sources_len: num_sources,
+            });
         }
         let sum: f32 = weights.iter().sum();
         if (sum - 1.0).abs() > 0.01 {
-            return Err(anyhow!("similar_to: weights must sum to 1.0 (got {})", sum));
+            return Err(SimilarToError::WeightsNotNormalized { sum });
         }
     }
     Ok(())
@@ -246,27 +309,19 @@ pub fn validate_pair(
     query_is_vector: bool,
     query_is_string: bool,
     source_index: usize,
-) -> Result<()> {
+) -> Result<(), SimilarToError> {
     match source_type {
-        SourceType::Fts if query_is_vector => Err(anyhow!(
-            "similar_to: source {} is FTS-indexed but query is a vector \
-                 (FTS cannot score against vectors)",
-            source_index
-        )),
+        SourceType::Fts if query_is_vector => Err(SimilarToError::TypeMismatch { source_index }),
         SourceType::Vector {
             has_embedding_config: false,
             ..
-        } if query_is_string => Err(anyhow!(
-            "similar_to: source {} is a vector property but query is a string, \
-                 and the index has no embedding config for auto-embedding",
-            source_index
-        )),
+        } if query_is_string => Err(SimilarToError::NoEmbeddingConfig { source_index }),
         _ => Ok(()),
     }
 }
 
 /// Fuse multiple per-source scores into a single score.
-pub fn fuse_scores(scores: &[f32], opts: &SimilarToOptions) -> Result<f32> {
+pub fn fuse_scores(scores: &[f32], opts: &SimilarToOptions) -> Result<f32, SimilarToError> {
     if scores.len() == 1 {
         return Ok(scores[0]);
     }
@@ -276,7 +331,7 @@ pub fn fuse_scores(scores: &[f32], opts: &SimilarToOptions) -> Result<f32> {
             let weights = opts
                 .weights
                 .as_ref()
-                .ok_or_else(|| anyhow!("similar_to: weighted fusion requires 'weights' option"))?;
+                .ok_or(SimilarToError::WeightsRequired)?;
             Ok(fusion::fuse_weighted_multi(scores, weights))
         }
         FusionMethod::Rrf => {

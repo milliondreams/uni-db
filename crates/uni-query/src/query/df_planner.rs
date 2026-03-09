@@ -3396,7 +3396,13 @@ impl HybridPhysicalPlanner {
         // Translate sort expressions to DataFusion's SortExpr (a.k.a. Sort struct)
         // SortItem has `ascending: bool`, so use it directly
         // Default nulls_first to false for ASC, true for DESC
+        use crate::query::df_graph::expr_compiler::CypherPhysicalExprCompiler;
+
         let mut df_sort_exprs = Vec::new();
+        let mut custom_physical_overrides: Vec<(
+            usize,
+            Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+        )> = Vec::new();
         for item in order_by {
             let mut sort_expr = item.expr.clone();
 
@@ -3412,15 +3418,45 @@ impl HybridPhysicalPlanner {
                 }
             }
 
+            let asc = item.ascending;
+            let nulls_first = !asc; // Standard SQL behavior: nulls last for ASC, first for DESC
+
+            // Custom expressions (similar_to, comprehensions, etc.) cannot be
+            // translated via cypher_expr_to_df. Compile with the custom compiler
+            // and save as an override for the physical sort expression.
+            if CypherPhysicalExprCompiler::contains_custom_expr(&sort_expr) {
+                let sort_state = session.state();
+                let compiler = CypherPhysicalExprCompiler::new(&sort_state, Some(&ctx))
+                    .with_subquery_ctx(
+                        self.graph_ctx.clone(),
+                        self.schema.clone(),
+                        self.session_ctx.clone(),
+                        self.storage.clone(),
+                        self.params.clone(),
+                    );
+                let inner_physical = compiler.compile(&sort_expr, &schema)?;
+
+                // Use a dummy column reference for the logical sort expression
+                // (we'll replace the physical expression below).
+                let first_col = schema
+                    .fields()
+                    .first()
+                    .map(|f| f.name().clone())
+                    .unwrap_or_else(|| "_dummy_".to_string());
+                let dummy_expr = DfExpr::Column(datafusion::common::Column::from_name(&first_col));
+                let sort_key_udf = crate::query::df_udfs::create_cypher_sort_key_udf();
+                let sort_key_expr = sort_key_udf.call(vec![dummy_expr]);
+                custom_physical_overrides.push((df_sort_exprs.len(), inner_physical));
+                df_sort_exprs.push(DfSortExpr::new(sort_key_expr, asc, nulls_first));
+                continue;
+            }
+
             let df_expr = cypher_expr_to_df(&sort_expr, Some(&ctx))?;
             let df_expr = Self::resolve_udfs(&df_expr, &session.state())?;
             let df_expr = crate::query::df_expr::apply_type_coercion(&df_expr, &df_schema)?;
             // Resolve UDFs again: apply_type_coercion may create new dummy UDF
             // placeholders (e.g. _cv_to_bool, _cypher_add) that need resolution.
             let df_expr = Self::resolve_udfs(&df_expr, &session.state())?;
-
-            let asc = item.ascending;
-            let nulls_first = !asc; // Standard SQL behavior: nulls last for ASC, first for DESC
 
             // Single order-preserving sort key: _cypher_sort_key(expr) -> LargeBinary
             // The UDF handles all Cypher ordering semantics (cross-type ranks,
@@ -3431,11 +3467,41 @@ impl HybridPhysicalPlanner {
             df_sort_exprs.push(DfSortExpr::new(sort_key_expr, asc, nulls_first));
         }
 
-        let physical_sort_exprs = create_physical_sort_exprs(
+        let mut physical_sort_exprs = create_physical_sort_exprs(
             &df_sort_exprs,
             &df_schema,
             session.state().execution_props(),
         )?;
+
+        // Replace the inner expression for custom sort expressions.
+        // The _cypher_sort_key UDF wrapper is already in place; we just need
+        // to swap the dummy column reference with the actual custom physical expr.
+        for (idx, custom_inner) in custom_physical_overrides {
+            if idx < physical_sort_exprs.len() {
+                let phys = &physical_sort_exprs[idx];
+                // The physical sort expression wraps _cypher_sort_key(dummy_col).
+                // We need to replace the inner arg with our custom expression.
+                // ScalarFunctionExpr wraps the UDF; rebuild it with the correct child.
+                let sort_key_udf = Arc::new(crate::query::df_udfs::create_cypher_sort_key_udf());
+                let config_options = Arc::new(datafusion::config::ConfigOptions::default());
+                let udf_name = sort_key_udf.name().to_string();
+                let new_sort_key = datafusion::physical_expr::ScalarFunctionExpr::new(
+                    &udf_name,
+                    sort_key_udf,
+                    vec![custom_inner],
+                    Arc::new(arrow_schema::Field::new(
+                        "_cypher_sort_key",
+                        DataType::LargeBinary,
+                        true,
+                    )),
+                    config_options,
+                );
+                physical_sort_exprs[idx] = datafusion::physical_expr::PhysicalSortExpr {
+                    expr: Arc::new(new_sort_key),
+                    options: phys.options,
+                };
+            }
+        }
 
         // Convert Vec<PhysicalSortExpr> to LexOrdering
         // LexOrdering::new returns None for empty vector, so handle that case

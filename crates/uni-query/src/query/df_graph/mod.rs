@@ -76,6 +76,7 @@ pub mod recursive_cte;
 pub mod reduce;
 pub mod scan;
 pub mod shortest_path;
+pub(crate) mod similar_to_expr;
 pub mod traverse;
 pub mod unwind;
 pub mod vector_knn;

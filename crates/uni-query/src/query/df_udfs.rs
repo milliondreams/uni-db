@@ -6806,7 +6806,7 @@ struct SimilarToUdf {
 impl SimilarToUdf {
     fn new() -> Self {
         Self {
-            signature: Signature::new(TypeSignature::Any(0), Volatility::Immutable),
+            signature: Signature::new(TypeSignature::VariadicAny, Volatility::Immutable),
         }
     }
 }
@@ -6848,7 +6848,7 @@ struct VectorSimilarityUdf {
 impl VectorSimilarityUdf {
     fn new() -> Self {
         Self {
-            signature: Signature::new(TypeSignature::Any(0), Volatility::Immutable),
+            signature: Signature::new(TypeSignature::Any(2), Volatility::Immutable),
         }
     }
 }

@@ -1262,6 +1262,11 @@ fn value_to_scalar(value: &Value) -> Result<ScalarValue> {
                 ))),
             }
         }
+        Value::Vector(v) => {
+            // Encode as CypherValue LargeBinary so arrow_to_value_at decodes it correctly
+            let cv_bytes = uni_common::cypher_value_codec::encode(&Value::Vector(v.clone()));
+            Ok(ScalarValue::LargeBinary(Some(cv_bytes)))
+        }
         Value::Bytes(b) => Ok(ScalarValue::LargeBinary(Some(b.clone()))),
         // For complex graph types, fall back to JSON encoding
         other => {

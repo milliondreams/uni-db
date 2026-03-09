@@ -278,9 +278,7 @@ fn test_index_aware_combined_predicates() {
 // BTree STARTS WITH Pushdown Tests
 // =====================================================================
 
-use uni_common::core::schema::{
-    IndexDefinition, IndexStatus, ScalarIndexConfig, ScalarIndexType,
-};
+use uni_common::core::schema::{IndexDefinition, IndexStatus, ScalarIndexConfig, ScalarIndexType};
 
 fn create_test_schema_with_btree_index(label: &str, label_id: u16, index_property: &str) -> Schema {
     let mut schema = Schema::default();

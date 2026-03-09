@@ -76,11 +76,7 @@ impl RebuildTriggerChecker {
             if self.config.growth_trigger_ratio > 0.0
                 && let Some(built_count) = meta.row_count_at_build
             {
-                let current_count = manifest
-                    .vertices
-                    .get(label)
-                    .map(|ls| ls.count)
-                    .unwrap_or(0);
+                let current_count = manifest.vertices.get(label).map(|ls| ls.count).unwrap_or(0);
                 let threshold =
                     (built_count as f64 * (1.0 + self.config.growth_trigger_ratio)) as u64;
                 if current_count > threshold {
@@ -443,7 +439,10 @@ impl IndexRebuildManager {
                 task.completed_at = Some(Utc::now());
                 task.error = Some(err.to_string());
                 task.retry_count += 1;
-                (task.retry_count, task.retry_count >= self.config.max_retries)
+                (
+                    task.retry_count,
+                    task.retry_count >= self.config.max_retries,
+                )
             } else {
                 (0, true)
             }
@@ -590,10 +589,7 @@ mod tests {
             properties: vec!["prop".to_string()],
             index_type: ScalarIndexType::BTree,
             where_clause: None,
-            metadata: IndexMetadata {
-                status,
-                ..meta
-            },
+            metadata: IndexMetadata { status, ..meta },
         })
     }
 
@@ -688,7 +684,11 @@ mod tests {
                 ..Default::default()
             },
         )];
-        assert!(checker.labels_needing_rebuild(&manifest, &building).is_empty());
+        assert!(
+            checker
+                .labels_needing_rebuild(&manifest, &building)
+                .is_empty()
+        );
 
         // Same with Failed status
         let failed = vec![make_scalar_index(
@@ -699,6 +699,10 @@ mod tests {
                 ..Default::default()
             },
         )];
-        assert!(checker.labels_needing_rebuild(&manifest, &failed).is_empty());
+        assert!(
+            checker
+                .labels_needing_rebuild(&manifest, &failed)
+                .is_empty()
+        );
     }
 }

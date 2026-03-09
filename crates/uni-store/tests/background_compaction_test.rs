@@ -143,10 +143,16 @@ async fn write_and_flush(
     edge_type_id: u32,
     config: UniConfig,
 ) {
-    let mut writer =
-        Writer::new_with_config(storage.clone(), schema_manager.clone(), 0, config, None, None)
-            .await
-            .unwrap();
+    let mut writer = Writer::new_with_config(
+        storage.clone(),
+        schema_manager.clone(),
+        0,
+        config,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
 
     let v1 = writer.next_vid().await.unwrap();
     let v2 = writer.next_vid().await.unwrap();
@@ -210,7 +216,10 @@ async fn test_background_compaction_runs_semantic() {
         .await
         .unwrap();
     let pre_count = table.count_rows(None).await.unwrap();
-    assert!(pre_count > 0, "Delta table should have rows before compaction");
+    assert!(
+        pre_count > 0,
+        "Delta table should have rows before compaction"
+    );
 
     let status = run_compaction_cycle(&storage, Duration::from_secs(2)).await;
 

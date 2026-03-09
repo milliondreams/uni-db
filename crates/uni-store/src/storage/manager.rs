@@ -2,14 +2,14 @@
 // Copyright 2024-2026 Dragonscale Team
 
 use crate::compaction::{CompactionStats, CompactionStatus, CompactionTask};
-use crate::storage::compaction::Compactor;
-use crate::storage::direction::Direction;
 use crate::lancedb::LanceDbStore;
 use crate::runtime::WorkingGraph;
 use crate::runtime::context::QueryContext;
 use crate::runtime::l0::L0Buffer;
 use crate::storage::adjacency::AdjacencyDataset;
+use crate::storage::compaction::Compactor;
 use crate::storage::delta::{DeltaDataset, ENTRY_SIZE_ESTIMATE, Op};
+use crate::storage::direction::Direction;
 use crate::storage::edge::EdgeDataset;
 use crate::storage::index::UidIndex;
 use crate::storage::inverted_index::InvertedIndex;
@@ -544,10 +544,7 @@ impl StorageManager {
         true
     }
 
-    async fn execute_compaction(
-        this: Arc<Self>,
-        _task: CompactionTask,
-    ) -> Result<CompactionStats> {
+    async fn execute_compaction(this: Arc<Self>, _task: CompactionTask) -> Result<CompactionStats> {
         let start = std::time::Instant::now();
         let _guard = CompactionGuard::new(this.compaction_status.clone())
             .ok_or_else(|| anyhow!("Compaction already in progress"))?;
@@ -574,8 +571,7 @@ impl StorageManager {
                 "bwd" => Direction::Incoming,
                 _ => continue,
             };
-            if let Some(etid) =
-                schema.edge_type_id_unified_case_insensitive(&info.edge_type)
+            if let Some(etid) = schema.edge_type_id_unified_case_insensitive(&info.edge_type)
                 && let Err(e) = am.warm(&this, etid, direction, None).await
             {
                 log::warn!(

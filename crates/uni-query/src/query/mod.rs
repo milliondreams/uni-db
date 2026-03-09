@@ -10,11 +10,13 @@ pub mod df_udfs;
 pub mod executor;
 pub mod expr_eval;
 pub mod function_props;
+pub mod fusion;
 pub mod locy_planner;
 pub mod planner;
 pub mod planner_locy_types;
 pub mod pushdown;
 pub mod rewrite;
+pub mod similar_to;
 pub mod spatial;
 
 /// Supported window function names (uppercase).

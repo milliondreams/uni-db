@@ -1555,77 +1555,19 @@ async fn execute_hybrid_search(
 }
 
 /// Reciprocal Rank Fusion (RRF) for combining search results.
-/// RRF score = sum(1 / (k + rank)) for each result list.
+/// Delegates to the shared `fusion` module.
 fn fuse_rrf(vec_results: &[(Vid, f32)], fts_results: &[(Vid, f32)], k: usize) -> Vec<(Vid, f32)> {
-    let mut scores: HashMap<Vid, f32> = HashMap::new();
-
-    for (rank, (vid, _)) in vec_results.iter().enumerate() {
-        let rrf_score = 1.0 / (k as f32 + rank as f32 + 1.0);
-        *scores.entry(*vid).or_default() += rrf_score;
-    }
-
-    for (rank, (vid, _)) in fts_results.iter().enumerate() {
-        let rrf_score = 1.0 / (k as f32 + rank as f32 + 1.0);
-        *scores.entry(*vid).or_default() += rrf_score;
-    }
-
-    let mut results: Vec<_> = scores.into_iter().collect();
-    results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    results
+    crate::query::fusion::fuse_rrf(vec_results, fts_results, k)
 }
 
 /// Weighted fusion: alpha * vec_score + (1 - alpha) * fts_score.
-/// Both score sets are normalized to [0, 1] range.
+/// Delegates to the shared `fusion` module.
 fn fuse_weighted(
     vec_results: &[(Vid, f32)],
     fts_results: &[(Vid, f32)],
     alpha: f32,
 ) -> Vec<(Vid, f32)> {
-    // Normalize vector scores (distance -> similarity)
-    let vec_max = vec_results.iter().map(|(_, s)| *s).fold(f32::MIN, f32::max);
-    let vec_min = vec_results.iter().map(|(_, s)| *s).fold(f32::MAX, f32::min);
-    let vec_range = if vec_max > vec_min {
-        vec_max - vec_min
-    } else {
-        1.0
-    };
-
-    let fts_max = fts_results.iter().map(|(_, s)| *s).fold(0.0f32, f32::max);
-
-    let vec_scores: HashMap<Vid, f32> = vec_results
-        .iter()
-        .map(|(vid, dist)| {
-            let norm = 1.0 - (dist - vec_min) / vec_range;
-            (*vid, norm)
-        })
-        .collect();
-
-    let fts_scores: HashMap<Vid, f32> = fts_results
-        .iter()
-        .map(|(vid, score)| {
-            let norm = if fts_max > 0.0 { score / fts_max } else { 0.0 };
-            (*vid, norm)
-        })
-        .collect();
-
-    let all_vids: std::collections::HashSet<Vid> = vec_scores
-        .keys()
-        .chain(fts_scores.keys())
-        .cloned()
-        .collect();
-
-    let mut results: Vec<(Vid, f32)> = all_vids
-        .into_iter()
-        .map(|vid| {
-            let vec_score = *vec_scores.get(&vid).unwrap_or(&0.0);
-            let fts_score = *fts_scores.get(&vid).unwrap_or(&0.0);
-            let fused = alpha * vec_score + (1.0 - alpha) * fts_score;
-            (vid, fused)
-        })
-        .collect();
-
-    results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    results
+    crate::query::fusion::fuse_weighted(vec_results, fts_results, alpha)
 }
 
 /// Precomputed score context for hybrid search batch building.
@@ -1930,4 +1872,3 @@ fn extract_vector(val: &Value) -> DFResult<Vec<f32>> {
         )),
     }
 }
-

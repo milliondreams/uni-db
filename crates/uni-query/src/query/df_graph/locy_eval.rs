@@ -454,6 +454,21 @@ fn eval_function(name: &str, args: &[Value]) -> Result<Value, LocyError> {
             }
             Ok(Value::Null)
         }
+        "SIMILAR_TO" | "VECTOR_SIMILARITY" => {
+            if args.len() < 2 {
+                return Err(LocyError::EvaluationError {
+                    message: format!("{} requires at least 2 arguments", name),
+                });
+            }
+            // In Locy context, handle pure vector-vector case directly.
+            // Storage-dependent cases (auto-embed, FTS) are not available
+            // in the Locy in-memory evaluator.
+            crate::query::similar_to::eval_similar_to_pure(&args[0], &args[1]).map_err(|e| {
+                LocyError::EvaluationError {
+                    message: e.to_string(),
+                }
+            })
+        }
         _ => Err(LocyError::EvaluationError {
             message: format!("unknown function: {}", name),
         }),

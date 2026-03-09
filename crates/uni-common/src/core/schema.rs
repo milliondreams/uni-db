@@ -396,6 +396,27 @@ impl Schema {
         })
     }
 
+    /// Returns the full-text index configuration for a given label and property.
+    ///
+    /// A full-text index covers one or more properties. This returns the config
+    /// if the specified property is among the indexed properties.
+    pub fn fulltext_index_for_property(
+        &self,
+        label: &str,
+        property: &str,
+    ) -> Option<&FullTextIndexConfig> {
+        self.indexes.iter().find_map(|idx| {
+            if let IndexDefinition::FullText(config) = idx
+                && config.label == label
+                && config.properties.iter().any(|p| p == property)
+                && config.metadata.status == IndexStatus::Online
+            {
+                return Some(config);
+            }
+            None
+        })
+    }
+
     /// Get label metadata with case-insensitive lookup.
     ///
     /// This allows queries to match labels regardless of case, providing
@@ -1374,9 +1395,11 @@ mod tests {
             }));
 
         // Stale index should NOT be returned
-        assert!(schema
-            .vector_index_for_property("Document", "embedding")
-            .is_none());
+        assert!(
+            schema
+                .vector_index_for_property("Document", "embedding")
+                .is_none()
+        );
 
         // Set to Online — should now be returned
         if let IndexDefinition::Vector(cfg) = &mut schema.indexes[0] {

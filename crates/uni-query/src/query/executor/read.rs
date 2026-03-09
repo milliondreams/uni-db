@@ -2012,6 +2012,13 @@ impl Executor {
                         return eval_vector_similarity(&v1, &v2);
                     }
 
+                    // Special case: similar_to — unified similarity scoring
+                    if name.eq_ignore_ascii_case("similar_to") {
+                        return this
+                            .eval_similar_to_in_read(args, row, prop_manager, params, ctx)
+                            .await;
+                    }
+
                     // Special case: uni.validAt handles node fetching
                     if name.eq_ignore_ascii_case("uni.temporal.validAt")
                         || name.eq_ignore_ascii_case("uni.validAt")
@@ -5343,5 +5350,251 @@ impl Executor {
         }
 
         Ok(())
+    }
+
+    /// Evaluate a `similar_to(...)` call within the read executor.
+    ///
+    /// Handles vector-vector, vector-string (auto-embed), FTS, and
+    /// multi-source fusion. Has full access to storage and xervo runtime
+    /// for auto-embedding and FTS scoring.
+    async fn eval_similar_to_in_read(
+        &self,
+        args: &[Expr],
+        row: &HashMap<String, Value>,
+        prop_manager: &PropertyManager,
+        params: &HashMap<String, Value>,
+        ctx: Option<&QueryContext>,
+    ) -> Result<Value> {
+        use crate::query::similar_to::{
+            SimilarToOptions, fuse_scores, parse_options, validate_options,
+        };
+
+        if args.is_empty() || args.len() > 3 {
+            return Err(anyhow!(
+                "similar_to takes 2 or 3 arguments (sources, queries [, options]), got {}",
+                args.len()
+            ));
+        }
+
+        // Evaluate all arguments
+        let sources_val = self
+            .evaluate_expr(&args[0], row, prop_manager, params, ctx)
+            .await?;
+        let queries_val = self
+            .evaluate_expr(&args[1], row, prop_manager, params, ctx)
+            .await?;
+        let opts = if args.len() == 3 {
+            let opts_val = self
+                .evaluate_expr(&args[2], row, prop_manager, params, ctx)
+                .await?;
+            parse_options(&opts_val)?
+        } else {
+            SimilarToOptions::default()
+        };
+
+        // Normalize sources to list
+        let sources = match &sources_val {
+            Value::List(list) => list.clone(),
+            _ => vec![sources_val.clone()],
+        };
+
+        // Normalize queries to list, broadcasting if scalar
+        let queries = match &queries_val {
+            Value::List(list) => {
+                if list.len() != sources.len() {
+                    return Err(anyhow!(
+                        "similar_to: queries list length ({}) != sources list length ({})",
+                        list.len(),
+                        sources.len()
+                    ));
+                }
+                list.clone()
+            }
+            _ => vec![queries_val.clone(); sources.len()],
+        };
+
+        validate_options(&opts, sources.len())?;
+
+        // Score each (source, query) pair
+        let mut scores = Vec::with_capacity(sources.len());
+        for (i, (source, query)) in sources.iter().zip(queries.iter()).enumerate() {
+            let score = self
+                .score_single_pair(source, query, &opts, row, prop_manager, ctx)
+                .await
+                .map_err(|e| anyhow!("similar_to: source {}: {}", i, e))?;
+            scores.push(score);
+        }
+
+        // Fuse scores
+        let result = fuse_scores(&scores, &opts)?;
+        Ok(Value::Float(result as f64))
+    }
+
+    /// Score a single (source_value, query_value) pair.
+    ///
+    /// Dispatches to cosine similarity, auto-embed+cosine, or BM25
+    /// depending on the types of source and query values.
+    async fn score_single_pair(
+        &self,
+        source: &Value,
+        query: &Value,
+        opts: &crate::query::similar_to::SimilarToOptions,
+        row: &HashMap<String, Value>,
+        _prop_manager: &PropertyManager,
+        ctx: Option<&QueryContext>,
+    ) -> Result<f32> {
+        use crate::query::similar_to::{cosine_similarity, value_to_f32_vec};
+
+        match (source, query) {
+            // Vector + Vector: direct cosine similarity
+            (Value::Vector(_) | Value::List(_), Value::Vector(_) | Value::List(_)) => {
+                let v1 = value_to_f32_vec(source)?;
+                let v2 = value_to_f32_vec(query)?;
+                cosine_similarity(&v1, &v2)
+            }
+            // Vector + String: auto-embed the string, then cosine
+            (Value::Vector(_) | Value::List(_), Value::String(query_text)) => {
+                let v1 = value_to_f32_vec(source)?;
+                let v2 = self.auto_embed_for_similar_to(query_text, row).await?;
+                cosine_similarity(&v1, &v2)
+            }
+            // String + String: FTS BM25 scoring
+            (Value::String(source_text), Value::String(query_text)) => {
+                self.score_fts_pair(source_text, query_text, opts, row, ctx)
+                    .await
+            }
+            // String + Vector: invalid combination
+            (Value::String(_), Value::Vector(_) | Value::List(_)) => Err(anyhow!(
+                "similar_to: FTS source cannot be scored against a vector query"
+            )),
+            _ => Err(anyhow!(
+                "similar_to: unsupported source/query type combination"
+            )),
+        }
+    }
+
+    /// Auto-embed a query string using the xervo runtime.
+    ///
+    /// Attempts to find an appropriate embedding model from the schema.
+    /// In point-computation context, we look at the row to find label context.
+    async fn auto_embed_for_similar_to(
+        &self,
+        query_text: &str,
+        _row: &HashMap<String, Value>,
+    ) -> Result<Vec<f32>> {
+        let runtime = self.xervo_runtime.as_ref().ok_or_else(|| {
+            anyhow!(
+                "similar_to: cannot auto-embed text — Uni-Xervo runtime not configured. \
+                 Provide a pre-computed vector instead."
+            )
+        })?;
+
+        // Find the first vector index with an embedding config
+        let schema = self.storage.schema_manager().schema();
+        let embedding_alias = schema
+            .indexes
+            .iter()
+            .find_map(|idx| {
+                if let uni_common::core::schema::IndexDefinition::Vector(config) = idx {
+                    config.embedding_config.as_ref().map(|ec| ec.alias.clone())
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| {
+                anyhow!(
+                    "similar_to: no vector index with embedding config found. \
+                     Cannot auto-embed text query."
+                )
+            })?;
+
+        let embedder = runtime
+            .embedding(&embedding_alias)
+            .await
+            .map_err(|e| anyhow!("similar_to: failed to get embedder: {}", e))?;
+        let embeddings = embedder
+            .embed(vec![query_text])
+            .await
+            .map_err(|e| anyhow!("similar_to: embedding failed: {}", e))?;
+        embeddings
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("similar_to: embedding service returned no results"))
+    }
+
+    /// Score a string source against a string query using FTS/BM25.
+    ///
+    /// In point-computation context, we look up the node's VID in FTS
+    /// search results to get its BM25 score.
+    async fn score_fts_pair(
+        &self,
+        _source_text: &str,
+        query_text: &str,
+        opts: &crate::query::similar_to::SimilarToOptions,
+        row: &HashMap<String, Value>,
+        ctx: Option<&QueryContext>,
+    ) -> Result<f32> {
+        use crate::query::similar_to::normalize_bm25;
+
+        // Try to extract VID and label from the row context
+        let vid = row.values().find_map(|v| {
+            if let Value::Map(map) = v {
+                map.get("_vid").and_then(|v| v.as_u64()).map(Vid::from)
+            } else {
+                None
+            }
+        });
+
+        let label = row.values().find_map(|v| {
+            if let Value::Map(map) = v {
+                map.get("_label")
+                    .or_else(|| map.get("_labels"))
+                    .and_then(|v| match v {
+                        Value::String(s) => Some(s.clone()),
+                        Value::List(list) => {
+                            list.first().and_then(|v| v.as_str()).map(String::from)
+                        }
+                        _ => None,
+                    })
+            } else {
+                None
+            }
+        });
+
+        if let (Some(vid), Some(label)) = (vid, label) {
+            // Use a large K to get all results, then look up this VID's score
+            let fts_property = self.find_fts_property(&label);
+            let fts_results = self
+                .storage
+                .fts_search(&label, &fts_property, query_text, 1000, None, ctx)
+                .await;
+
+            if let Ok(results) = fts_results
+                && let Some((_, score)) = results.iter().find(|(v, _)| *v == vid)
+            {
+                return Ok(normalize_bm25(*score, opts.fts_k));
+            }
+
+            // Not found in FTS results = 0 relevance
+            return Ok(0.0);
+        }
+
+        // Fallback: no VID context, return 0
+        Ok(0.0)
+    }
+
+    /// Find the FTS-indexed property for a given label.
+    fn find_fts_property(&self, label: &str) -> String {
+        let schema = self.storage.schema_manager().schema();
+        for idx in &schema.indexes {
+            if let uni_common::core::schema::IndexDefinition::FullText(config) = idx
+                && config.label == label
+                && let Some(prop) = config.properties.first()
+            {
+                return prop.clone();
+            }
+        }
+        // Default fallback
+        "content".to_string()
     }
 }

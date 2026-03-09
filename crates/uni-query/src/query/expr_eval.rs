@@ -1764,6 +1764,22 @@ pub fn eval_scalar_function(name: &str, args: &[Value]) -> Result<Value> {
         | "UNI_BITWISE_SHIFTLEFT"
         | "UNI_BITWISE_SHIFTRIGHT" => eval_bitwise_function(&name_upper, args),
 
+        // Similarity functions — pure vector-vector case only (no storage access).
+        // Storage-dependent cases (auto-embed, FTS) are handled in read.rs.
+        "SIMILAR_TO" => {
+            if args.len() < 2 {
+                return Err(anyhow!("similar_to requires at least 2 arguments"));
+            }
+            crate::query::similar_to::eval_similar_to_pure(&args[0], &args[1])
+        }
+
+        "VECTOR_SIMILARITY" => {
+            if args.len() != 2 {
+                return Err(anyhow!("vector_similarity takes 2 arguments"));
+            }
+            eval_vector_similarity(&args[0], &args[1])
+        }
+
         _ => Err(anyhow!("Function {} not implemented or is aggregate", name)),
     }
 }
@@ -2015,6 +2031,7 @@ pub fn is_scalar_function(name: &str) -> bool {
             | "RANGE"
             | "UNI.VALIDAT"
             | "VALIDAT"
+            | "SIMILAR_TO"
             | "VECTOR_SIMILARITY"
             | "VECTOR_DISTANCE"
             | "DATE"

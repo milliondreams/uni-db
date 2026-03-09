@@ -2111,6 +2111,14 @@ fn translate_function_call(
         _ => {}
     }
 
+    // Similarity functions → registered UDFs
+    match name_upper.as_str() {
+        "SIMILAR_TO" | "VECTOR_SIMILARITY" => {
+            return Ok(dummy_udf_expr(&name_upper.to_lowercase(), df_args));
+        }
+        _ => {}
+    }
+
     // Unknown function - try as a UDF
     Ok(dummy_udf_expr(name, df_args))
 }

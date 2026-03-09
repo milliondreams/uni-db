@@ -211,6 +211,10 @@ pub fn register_cypher_udfs(ctx: &SessionContext) -> DFResult<()> {
     // CypherValue-to-Float64 conversion UDF (for SUM/AVG on LargeBinary columns)
     ctx.register_udf(create_cypher_to_float64_udf());
 
+    // Similarity scoring UDF
+    ctx.register_udf(create_similar_to_udf());
+    ctx.register_udf(create_vector_similarity_udf());
+
     // Cypher-aware aggregate UDAFs
     ctx.register_udaf(create_cypher_min_udaf());
     ctx.register_udaf(create_cypher_max_udaf());
@@ -6760,6 +6764,117 @@ pub(crate) fn create_cypher_percentile_disc_udaf() -> AggregateUDF {
 
 pub(crate) fn create_cypher_percentile_cont_udaf() -> AggregateUDF {
     AggregateUDF::from(CypherPercentileContUdaf::new())
+}
+
+// ============================================================================
+// similar_to / vector_similarity -> Float64
+// ============================================================================
+
+/// Shared invocation logic for similarity UDFs.
+///
+/// Both `similar_to` and `vector_similarity` compute pure vector-vector
+/// cosine similarity in the DataFusion path. Storage-dependent cases
+/// (auto-embed, FTS) are handled in the ReadQuery executor path.
+fn invoke_similarity_udf(
+    func_name: &str,
+    min_args: usize,
+    args: ScalarFunctionArgs,
+) -> DFResult<ColumnarValue> {
+    let output_type = DataType::Float64;
+    invoke_cypher_udf(args, &output_type, |val_args| {
+        if val_args.len() < min_args {
+            return Err(datafusion::error::DataFusionError::Execution(format!(
+                "{} requires at least {} arguments",
+                func_name, min_args
+            )));
+        }
+        crate::query::similar_to::eval_similar_to_pure(&val_args[0], &val_args[1])
+            .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))
+    })
+}
+
+/// Create the `similar_to` UDF for unified similarity scoring.
+pub fn create_similar_to_udf() -> ScalarUDF {
+    ScalarUDF::new_from_impl(SimilarToUdf::new())
+}
+
+#[derive(Debug)]
+struct SimilarToUdf {
+    signature: Signature,
+}
+
+impl SimilarToUdf {
+    fn new() -> Self {
+        Self {
+            signature: Signature::new(TypeSignature::Any(0), Volatility::Immutable),
+        }
+    }
+}
+
+impl_udf_eq_hash!(SimilarToUdf);
+
+impl ScalarUDFImpl for SimilarToUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        "similar_to"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Float64)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        invoke_similarity_udf("similar_to", 2, args)
+    }
+}
+
+/// Create the `vector_similarity` UDF (alias for similar_to with two vector args).
+pub fn create_vector_similarity_udf() -> ScalarUDF {
+    ScalarUDF::new_from_impl(VectorSimilarityUdf::new())
+}
+
+#[derive(Debug)]
+struct VectorSimilarityUdf {
+    signature: Signature,
+}
+
+impl VectorSimilarityUdf {
+    fn new() -> Self {
+        Self {
+            signature: Signature::new(TypeSignature::Any(0), Volatility::Immutable),
+        }
+    }
+}
+
+impl_udf_eq_hash!(VectorSimilarityUdf);
+
+impl ScalarUDFImpl for VectorSimilarityUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        "vector_similarity"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Float64)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        invoke_similarity_udf("vector_similarity", 2, args)
+    }
 }
 
 #[cfg(test)]

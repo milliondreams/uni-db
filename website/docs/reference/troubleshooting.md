@@ -584,9 +584,9 @@ heaptrack_gui heaptrack.uni.*.gz
 
 ### Resources
 
-- **Documentation**: [https://uni.dev/docs](https://uni.dev/docs)
-- **GitHub Issues**: [https://github.com/rustic-ai/uni/issues](https://github.com/rustic-ai/uni/issues)
-- **Discussions**: [https://github.com/rustic-ai/uni/discussions](https://github.com/rustic-ai/uni/discussions)
+- **Documentation**: [https://rustic-ai.github.io/uni-db/](https://rustic-ai.github.io/uni-db/)
+- **GitHub Issues**: [https://github.com/rustic-ai/uni-db/issues](https://github.com/rustic-ai/uni-db/issues)
+- **Discussions**: [https://github.com/rustic-ai/uni-db/discussions](https://github.com/rustic-ai/uni-db/discussions)
 
 ### Reporting Bugs
 

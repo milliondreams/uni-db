@@ -71,6 +71,28 @@ Notebook:
 Data bundle:
 - [Cyber flagship notebook data](../examples/data/locy_cyber_exposure_twin/README.md)
 
+## 9. Knowledge-Augmented Incident Triage
+
+Route support incidents to the best resolver by combining service-dependency graph traversal with semantic matching against runbooks and expertise profiles. Pure vector search finds similar runbooks but doesn't know which team owns them or which service is affected. Pure graph queries traverse service→team→runbook paths but can't score semantic relevance. Locy + `similar_to` does both: walk the dependency graph and score each candidate by how well their expertise matches the incident.
+
+```cypher
+-- Find the best-matching runbook reachable through the affected service's dependency graph
+CREATE RULE best_resolver AS
+MATCH (incident:Incident)-[:AFFECTS]->(svc:Service)-[:DEPENDS_ON*]->(dep:Service)
+      <-[:OWNS]-(team:Team)-[:HAS_RUNBOOK]->(rb:Runbook)
+WHERE similar_to(rb.embedding, incident.description) > 0.5
+ALONG match_score = similar_to(rb.embedding, incident.description)
+BEST BY match_score DESC
+YIELD KEY incident, KEY team, KEY rb, match_score
+
+QUERY best_resolver WHERE incident.id = $incident_id
+RETURN team.name, rb.title, match_score
+```
+
+This pattern applies wherever routing decisions need both structural constraints (org hierarchy, dependency chains, escalation paths) and semantic relevance (matching descriptions, expertise, or domain knowledge).
+
+See [Vector Search guide](../guides/vector-search.md#similar_to-expression-function) for `similar_to` details.
+
 ## Pattern Template
 
 For each use case, model:

@@ -494,6 +494,68 @@ db.rebuild_indexes("Paper", false).await?;
 
 ---
 
+## Index Lifecycle Management
+
+Uni tracks the lifecycle of each index via an `IndexStatus` state machine. This ensures queries only use up-to-date indexes, while stale or rebuilding indexes transparently fall back to full scans.
+
+### Index States
+
+| Status | Description | Used by Query Planner? |
+|--------|-------------|------------------------|
+| **Online** | Index is up-to-date and queryable | Yes |
+| **Building** | Rebuild is in progress | No (falls back to scan) |
+| **Stale** | Outdated, scheduled for rebuild | No (falls back to scan) |
+| **Failed** | Rebuild failed after retries exhausted | No (falls back to scan) |
+
+**Status gating:** The query planner only uses `Online` indexes. When an index is in any other state, queries transparently fall back to a full scan — no errors, no user intervention required.
+
+### State Transitions
+
+```
+Online ──(data changes exceed trigger)──► Stale
+Stale  ──(rebuild starts)──────────────► Building
+Building ──(success)───────────────────► Online
+Building ──(failure, retries left)─────► Stale (retry after delay)
+Building ──(failure, retries exhausted)► Failed
+```
+
+### Automatic Rebuild Triggers
+
+When `auto_rebuild_enabled: true`, the background worker checks indexes after each flush and marks them `Stale` when either trigger fires:
+
+| Trigger | Condition | Default |
+|---------|-----------|---------|
+| **Growth** | `current_rows > row_count_at_build × (1 + growth_trigger_ratio)` | 50% growth (`0.5`) |
+| **Age** | `time_since_last_build > max_index_age` | Disabled (`None`) |
+
+Set `growth_trigger_ratio: 0.0` to disable the growth trigger. Set `max_index_age: Some(Duration::from_secs(3600))` to enable time-based rebuilds.
+
+### Configuration
+
+Index lifecycle is configured via `IndexRebuildConfig`:
+
+```rust
+use std::time::Duration;
+use uni_db::UniConfig;
+
+let mut config = UniConfig::default();
+config.index_rebuild.auto_rebuild_enabled = true;   // Enable automatic rebuilds (default: false)
+config.index_rebuild.growth_trigger_ratio = 0.5;    // Rebuild after 50% row growth (default: 0.5)
+config.index_rebuild.max_index_age = None;          // Time-based trigger (default: None/disabled)
+config.index_rebuild.max_retries = 3;               // Retry failed rebuilds (default: 3)
+config.index_rebuild.retry_delay = Duration::from_secs(60); // Delay between retries (default: 60s)
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `auto_rebuild_enabled` | `bool` | `false` | Enable automatic index rebuilds |
+| `growth_trigger_ratio` | `f64` | `0.5` | Row growth ratio to trigger rebuild (0.0 disables) |
+| `max_index_age` | `Option<Duration>` | `None` | Max time since last build before triggering rebuild |
+| `max_retries` | `u32` | `3` | Maximum rebuild attempts before marking `Failed` |
+| `retry_delay` | `Duration` | `60s` | Delay between retry attempts |
+
+---
+
 ## Index Storage
 
 Indexes are stored within the Lance dataset structure:

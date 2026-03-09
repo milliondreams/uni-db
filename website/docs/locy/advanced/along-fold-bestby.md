@@ -38,9 +38,44 @@ BEST BY cost ASC
 YIELD KEY a, KEY b, cost
 ```
 
+## Using `similar_to` in ALONG and BEST BY
+
+The `similar_to()` expression function works in ALONG accumulators and BEST BY selectors, enabling semantic similarity scoring along recursive paths.
+
+### Semantic Relevance Along Paths
+
+```cypher
+CREATE RULE semantic_path AS
+MATCH (a:Document)-[:LINKS_TO]->(b:Document)
+ALONG relevance = prev.relevance * similar_to(b.embedding, $query)
+YIELD KEY a, KEY b, relevance
+```
+
+### Best Semantically Similar Path
+
+```cypher
+CREATE RULE best_match AS
+MATCH (a:Topic)-[:RELATED]->(b:Topic)
+ALONG score = prev.score + similar_to(b.embedding, $query)
+BEST BY score DESC
+YIELD KEY a, KEY b, score
+```
+
+### Hybrid Scoring in Rules
+
+```cypher
+CREATE RULE hybrid_relevant AS
+MATCH (q:Query)-[:SEARCHES]->(d:Document)
+WHERE similar_to([d.embedding, d.content], q.text,
+  {method: 'weighted', weights: [0.7, 0.3]}) > 0.5
+YIELD KEY q, KEY d
+```
+
+See the [Vector Search guide](../guides/vector-search.md#similar_to-expression-function) for full `similar_to` documentation.
+
 ## Practical Guidance
 
-- Use `ALONG` for accumulators (distance, risk, confidence).
+- Use `ALONG` for accumulators (distance, risk, confidence, similarity).
 - Use `FOLD` when you need grouped summaries.
 - Use `BEST BY` when you need one witness path, not all candidates.
 

@@ -242,6 +242,35 @@ flowchart TB
     C1 --> C2 --> C3 --> C4 --> C5
 ```
 
+### Compaction Tiers
+
+Uni uses a three-tier compaction strategy, each operating at a different level of the storage stack:
+
+#### Tier 1: CSR Overlay Compaction
+
+Automatic in-memory merge of frozen L0 CSR segment overlays into the main CSR after flush. Triggers when `frozen_segments >= 4`. Runs inline during the flush path — no background scheduling needed.
+
+#### Tier 2: Semantic Compaction
+
+Background process that consolidates L1 delta runs into L2. Operations include:
+
+- Vertex deduplication (newest VID wins)
+- CRDT merge for conflict-free property resolution
+- L1 → L2 delta consolidation
+- Tombstone cleanup (remove soft-deleted records)
+
+Triggered by any of the three compaction thresholds (ByRunCount, BySize, ByAge). Executed via `Compactor::compact_all()`.
+
+#### Tier 3: Lance Storage Optimize
+
+Background process that runs immediately after Tier 2 in the same compaction cycle. Operations include:
+
+- Fragment consolidation (merge small fragments)
+- Index rebuild on optimized data
+- Space reclamation
+
+Optimizes all table types: delta datasets, vertex datasets, adjacency datasets, and main tables.
+
 ---
 
 ## Lance Integration

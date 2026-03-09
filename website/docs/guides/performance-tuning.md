@@ -273,16 +273,52 @@ let config = UniConfig {
 
 ### Compaction
 
-Trigger compaction after bulk operations:
+Compaction is fully automatic. A background loop runs every `check_interval` (default 30s) and triggers compaction when any threshold is exceeded:
+
+| Trigger | Condition | Default |
+|---------|-----------|---------|
+| **ByRunCount** | L1 delta tables with data ≥ threshold | `max_l1_runs = 4` |
+| **BySize** | Aggregate L1 size ≥ threshold | `max_l1_size_bytes = 256 MB` |
+| **ByAge** | Oldest L1 run age ≥ threshold | `max_l1_age = 1 hour` |
+
+**What runs during compaction:**
+
+1. **Semantic compaction** (Tier 2) — vertex dedup, CRDT merge, L1→L2 delta consolidation, tombstone cleanup
+2. **Lance optimize** (Tier 3) — fragment consolidation, index rebuild, space reclaim across all table types
+
+#### Configuration
+
+```rust
+use std::time::Duration;
+use uni_db::UniConfig;
+
+let mut config = UniConfig::default();
+config.compaction.enabled = true;                          // Enable background compaction (default: true)
+config.compaction.max_l1_runs = 4;                         // Trigger after 4 L1 runs (default: 4)
+config.compaction.max_l1_size_bytes = 256 * 1024 * 1024;   // Trigger at 256 MB (default: 256 MB)
+config.compaction.max_l1_age = Duration::from_secs(3600);  // Trigger after 1 hour (default: 1 hour)
+config.compaction.check_interval = Duration::from_secs(30);// Check every 30s (default: 30s)
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `enabled` | `true` | Enable background compaction |
+| `max_l1_runs` | `4` | Max L1 delta run count before triggering |
+| `max_l1_size_bytes` | `256 MB` | Max aggregate L1 size before triggering |
+| `max_l1_age` | `1 hour` | Max age of oldest L1 run before triggering |
+| `check_interval` | `30s` | How often the background loop checks |
+
+#### Manual Compaction (Optional)
+
+For on-demand compaction after bulk loads, you can trigger it manually:
 
 ```bash
 # Manual compaction (via Cypher)
 uni query "CALL uni.admin.compact() YIELD files_compacted, duration_ms RETURN *" --path ./storage
 ```
 
-For label/edge-specific compaction, use the Rust API:
-
 ```rust
+// Label/edge-specific compaction via Rust API
 db.compact_label("Paper").await?;
 db.compact_edge_type("CITES").await?;
 ```

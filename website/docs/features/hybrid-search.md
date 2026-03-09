@@ -167,6 +167,27 @@ YIELD node, score, vector_score, fts_score
 RETURN node.title, score, vector_score, fts_score
 ```
 
+## Expression Form: `similar_to`
+
+For scoring already-bound nodes (rather than top-K retrieval), use the `similar_to()` expression function. It works in `WHERE`, `RETURN`, `ORDER BY`, and Locy rule bodies:
+
+```cypher
+-- Hybrid scoring as an expression
+MATCH (d:Document)
+RETURN d.title,
+  similar_to([d.embedding, d.content], 'machine learning') AS relevance
+ORDER BY relevance DESC
+LIMIT 20
+
+-- With weighted fusion
+MATCH (d:Document)
+WHERE similar_to([d.embedding, d.content], 'deep learning',
+  {method: 'weighted', weights: [0.7, 0.3]}) > 0.5
+RETURN d.title
+```
+
+`similar_to` uses the same fusion algorithms (RRF, weighted) as `uni.search`, but operates on one node at a time. See the [Vector Search guide](../guides/vector-search.md#similar_to-expression-function) for full documentation.
+
 ## Use Cases
 
 - **RAG applications**: Combine semantic retrieval with keyword boosting.

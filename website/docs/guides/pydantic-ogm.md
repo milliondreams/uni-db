@@ -351,7 +351,7 @@ session.commit()
 similar_docs = session.cypher(
     """
     MATCH (d:Document)
-    WHERE vector_similarity(d.embedding, $query_vec) > 0.8
+    WHERE similar_to(d.embedding, $query_vec) > 0.8
     RETURN d.title as title
     """,
     params={"query_vec": query_embedding}

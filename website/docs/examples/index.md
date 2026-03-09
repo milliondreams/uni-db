@@ -95,6 +95,6 @@ The Pydantic OGM notebooks additionally show:
 
 The notebook source files are also available in the repository:
 
-- Python: [`bindings/uni-db/examples/`](https://github.com/rustic-ai/uni/tree/main/bindings/uni-db/examples)
-- Pydantic OGM: [`bindings/uni-pydantic/examples/`](https://github.com/rustic-ai/uni/tree/main/bindings/uni-pydantic/examples)
-- Rust: [`examples/rust/`](https://github.com/rustic-ai/uni/tree/main/examples/rust)
+- Python: [`bindings/uni-db/examples/`](https://github.com/rustic-ai/uni-db/tree/main/bindings/uni-db/examples)
+- Pydantic OGM: [`bindings/uni-pydantic/examples/`](https://github.com/rustic-ai/uni-db/tree/main/bindings/uni-pydantic/examples)
+- Rust: [`examples/rust/`](https://github.com/rustic-ai/uni-db/tree/main/examples/rust)

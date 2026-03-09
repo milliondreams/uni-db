@@ -5,8 +5,9 @@ Uni provides native vector search over embedding properties with ANN indexes (HN
 ## What It Provides
 
 - Vector properties stored alongside graph data.
-- ANN indexes with cosine, L2, or dot distance.
+- ANN indexes with cosine, L2, or dot distance — scores are automatically converted to [0, 1] similarity regardless of metric.
 - `CALL uni.vector.query(...)` for KNN retrieval.
+- `similar_to()` expression function for point-scoring bound nodes in `WHERE`, `RETURN`, and Locy rules.
 - **Auto-embedding**: Pass text directly and let Uni embed it using the index's configured embedding model.
 
 ## Example
@@ -85,14 +86,30 @@ YIELD node, score
 RETURN node.title, score
 ```
 
+## Expression-Based Scoring: `similar_to`
+
+For scoring already-bound nodes rather than top-K retrieval, use `similar_to()`:
+
+```cypher
+MATCH (a:Paper)-[:CITES]->(b:Paper)
+WHERE similar_to(b.embedding, 'attention mechanisms') > 0.7
+RETURN b.title, similar_to(b.embedding, 'attention mechanisms') AS score
+```
+
+`similar_to` supports vector similarity, FTS scoring, and multi-source hybrid fusion. It works in `WHERE`, `RETURN`, `ORDER BY`, and Locy rule bodies. See the [Vector Search guide](../guides/vector-search.md#similar_to-expression-function) for full details.
+
 ## Use Cases
 
 - Semantic search for documents or products.
 - RAG retrieval over knowledge graphs.
 - Similarity search over embeddings generated in-app.
+- Scoring graph-traversed nodes with `similar_to()` in `WHERE` and Locy rules.
 
 ## When To Use
 
 Choose vector search when you need semantic similarity rather than exact matching. Pair it with graph traversal for contextual results.
+
+- Use `CALL uni.vector.query(...)` to **find** top-K candidates from a full label.
+- Use `similar_to()` to **score** nodes already bound by `MATCH`.
 
 See also: [Full-Text Search](full-text-json-search.md) | [Hybrid Search](hybrid-search.md)

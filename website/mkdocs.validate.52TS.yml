@@ -1,8 +1,8 @@
 site_name: Uni Documentation
 site_description: The Embedded Multi-Model Graph Database - Graph, Vector, Document, and Columnar workloads unified
-site_url: https://rustic-ai.github.io/uni
-repo_url: https://github.com/rustic-ai/uni
-repo_name: rustic-ai/uni
+site_url: https://rustic-ai.github.io/uni-db/
+repo_url: https://github.com/rustic-ai/uni-db
+repo_name: rustic-ai/uni-db
 
 copyright: Copyright &copy; 2024-2026 Dragonscale Industries Inc. - Part of The Rustic Initiative
 
@@ -125,7 +125,6 @@ nav:
       - Pydantic OGM: reference/pydantic-ogm.md
       - Configuration: reference/configuration.md
       - Troubleshooting: reference/troubleshooting.md
-      - Limitations: reference/limitations.md
       - Glossary: reference/glossary.md
   - API Docs:
       - Rust API (Generated): api/rust/index.md

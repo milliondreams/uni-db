@@ -193,7 +193,7 @@ ORDER BY distance
 LIMIT 10
 ```
 
-The threshold parameter (6th argument) filters results to only those with `distance <= 0.3`.
+The threshold parameter (6th argument) filters results to only those with a similarity score ≥ 0.3 (higher = more similar).
 
 ### Hybrid Search: Pre-Filtering
 
@@ -241,7 +241,7 @@ CALL uni.vector.query(
   $query_vector,
   100,
   'category = ''electronics'' AND price < 1000',  // Pre-filter
-  0.5  // Distance threshold
+  0.5  // Similarity threshold
 )
 YIELD node, distance, score
 RETURN node.name, node.price, distance, score
@@ -283,7 +283,7 @@ WITH seed, seed.embedding AS seed_embedding
 
 // Find papers cited by seed that are similar to seed
 MATCH (seed)-[:CITES]->(cited:Paper)
-WHERE vector_similarity(seed_embedding, cited.embedding) > 0.8
+WHERE similar_to(seed_embedding, cited.embedding) > 0.8
 RETURN cited.title, cited.year
 ```
 
@@ -294,7 +294,7 @@ Find papers in citation chain with semantic similarity:
 ```cypher
 MATCH (start:Paper {title: 'Attention Is All You Need'})
 MATCH (start)-[:CITES]->(hop1:Paper)-[:CITES]->(hop2:Paper)
-WHERE vector_similarity(start.embedding, hop2.embedding) > 0.7
+WHERE similar_to(start.embedding, hop2.embedding) > 0.7
 RETURN DISTINCT hop2.title, hop2.year
 ORDER BY hop2.year DESC
 LIMIT 20
@@ -315,6 +315,107 @@ RETURN paper.title, paper.year, distance
 ORDER BY distance
 LIMIT 10
 ```
+
+---
+
+## `similar_to` Expression Function
+
+`similar_to()` is a unified similarity scoring function that works as an expression — in `WHERE`, `RETURN`, `WITH`, `ORDER BY`, and Locy rule bodies. Unlike `CALL` procedures, it scores one already-bound node against a query (point computation, not top-K scan).
+
+```
+similar_to(sources, queries [, options]) → FLOAT [0, 1]
+```
+
+### Single Vector Source
+
+Score a bound node's embedding against a pre-computed vector or text query:
+
+```cypher
+// Pre-computed vector query
+MATCH (p:Paper)-[:CITES]->(cited:Paper)
+WHERE similar_to(cited.embedding, $query_vector) > 0.8
+RETURN cited.title, similar_to(cited.embedding, $query_vector) AS score
+
+// Auto-embed text query (uses the index's embedding model)
+MATCH (p:Paper)
+WHERE similar_to(p.embedding, 'attention mechanisms in transformers') > 0.6
+RETURN p.title
+```
+
+### Single FTS Source
+
+Score a string property with a full-text index using BM25:
+
+```cypher
+MATCH (d:Document)
+RETURN d.title, similar_to(d.content, 'graph database optimization') AS relevance
+ORDER BY relevance DESC
+```
+
+BM25 scores are normalized to `[0, 1]` using a saturation function: `score / (score + fts_k)` where `fts_k` defaults to `1.0`.
+
+### Multi-Source Hybrid
+
+Combine vector and FTS scoring in a single expression:
+
+```cypher
+// Broadcast: same query applied to both sources
+MATCH (d:Document)
+RETURN d.title,
+  similar_to([d.embedding, d.content], 'machine learning') AS relevance
+ORDER BY relevance DESC
+
+// Per-source queries: different query per source
+MATCH (p:Product)
+RETURN p.name, similar_to(
+  [p.image_embedding, p.desc_embedding, p.description],
+  [$photo_vec, 'red sneakers', 'affordable running shoes']
+) AS relevance
+```
+
+### Options
+
+The optional third argument controls fusion behavior:
+
+| Key | Values | Description |
+|-----|--------|-------------|
+| `method` | `'rrf'` (default), `'weighted'` | Fusion algorithm for multi-source |
+| `weights` | List of floats | Per-source weights for weighted fusion (must sum to 1.0) |
+| `k` | Integer (default: 60) | RRF constant |
+| `fts_k` | Float (default: 1.0) | BM25 saturation constant |
+
+```cypher
+// Weighted fusion: favor vector similarity 70/30
+MATCH (d:Document)
+RETURN d.title, similar_to([d.embedding, d.content], 'query',
+  {method: 'weighted', weights: [0.7, 0.3]}) AS score
+ORDER BY score DESC
+```
+
+### Procedures vs `similar_to`
+
+| | `CALL uni.search(...)` | `similar_to()` |
+|---|---|---|
+| **Operation** | Scan index, return top-K | Score one bound node |
+| **Use in WHERE** | No | Yes |
+| **Use in Locy rules** | No | Yes |
+| **Best for** | "Find top 10 from millions" | "Score this matched node" |
+
+Both are needed. Use `CALL` procedures to find candidates from a full label, then `similar_to` to score or filter nodes already bound by `MATCH`.
+
+### Execution Paths and Locy
+
+`similar_to()` runs through different execution engines depending on context:
+
+| Context | Engine | Vector | Auto-Embed | FTS | Multi-Source |
+|---------|--------|--------|------------|-----|-------------|
+| Cypher `MATCH ... WHERE/RETURN` | DataFusion | :white_check_mark: | :white_check_mark: | :white_check_mark: | :white_check_mark: |
+| Locy rule `WHERE / YIELD / ALONG / FOLD` | DataFusion | :white_check_mark: | :white_check_mark: | :white_check_mark: | :white_check_mark: |
+| Locy command `DERIVE / ABDUCE / ASSUME WHERE` | In-memory | :white_check_mark: | :x: | :x: | :x: |
+
+In Cypher queries and Locy **rule bodies**, `similar_to()` runs inside DataFusion with full access to storage, schema, and embedding models. All scoring modes work.
+
+In Locy **command** WHERE clauses (`DERIVE ... WHERE`, `ABDUCE ... WHERE`), `similar_to()` falls back to a pure vector cosine computation — no auto-embedding or FTS. This is because commands execute after strata converge on already-materialized row data. In practice this is rarely limiting: rule WHERE clauses (which have full capability) handle the semantic filtering, while command WHERE clauses typically apply simple scalar filters on already-derived columns.
 
 ---
 
@@ -450,6 +551,18 @@ distance = -similarity (negated for ranking)
 
 - Range: -∞ to +∞
 - Use when: Embeddings have meaningful magnitudes
+
+### Score Conversion
+
+`uni.vector.query`, `uni.search`, and `similar_to()` all return normalized **similarity scores** (higher = more similar), not raw distances. The conversion is metric-aware:
+
+| Metric | Raw Distance Range | Conversion Formula | Score Range |
+|---|---|---|---|
+| Cosine | [0, 2] | `(2 - d) / 2` | [0, 1] |
+| L2 | [0, ∞) | `1 / (1 + d)` | (0, 1] |
+| Dot | (-∞, +∞) | Pass-through | Unbounded |
+
+This means you can compare scores across queries without worrying about which distance metric the index uses.
 
 ---
 

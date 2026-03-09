@@ -466,6 +466,34 @@ Uni provides a comprehensive set of scalar functions for data transformation.
 | `toString(x)` | Convert to string | `RETURN toString(42)` → `'42'` |
 | `toBoolean(x)` | Convert to boolean | `RETURN toBoolean('true')` → `true` |
 
+### Similarity Functions
+
+| Function | Description | Example |
+|----------|-------------|---------|
+| `similar_to(sources, queries [, options])` | Unified similarity scoring (vector cosine, BM25, or hybrid fusion). Returns `FLOAT [0,1]`. | `RETURN similar_to(n.embedding, $vec)` |
+| `vector_similarity(v1, v2)` | Cosine similarity between two vectors. Alias for `similar_to` with a single vector source. | `WHERE vector_similarity(a.embed, b.embed) > 0.8` |
+| `vector_distance(v1, v2 [, metric])` | Distance between two vectors. | `RETURN vector_distance(a.embed, b.embed, 'cosine')` |
+
+`similar_to` is an expression function — it works in `WHERE`, `RETURN`, `WITH`, `ORDER BY`, and Locy rule bodies. Unlike `CALL uni.search(...)`, it scores one already-bound node (point computation), not a top-K scan.
+
+```cypher
+-- Single vector source with auto-embedding
+MATCH (d:Document) WHERE similar_to(d.embedding, 'search query') > 0.6
+RETURN d.title, similar_to(d.embedding, 'search query') AS score
+
+-- Multi-source hybrid (vector + FTS)
+MATCH (d:Document)
+RETURN d.title, similar_to([d.embedding, d.content], 'query') AS relevance
+ORDER BY relevance DESC
+
+-- Weighted fusion
+MATCH (d:Document)
+RETURN d.title, similar_to([d.embedding, d.content], 'query',
+  {method: 'weighted', weights: [0.7, 0.3]}) AS score
+```
+
+See the [Vector Search guide](vector-search.md#similar_to-expression-function) for full details.
+
 ### Null Handling Functions
 
 | Function | Description | Example |

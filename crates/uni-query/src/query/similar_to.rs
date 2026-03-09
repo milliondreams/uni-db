@@ -263,7 +263,7 @@ pub fn eval_similar_to_pure(v1: &Value, v2: &Value) -> Result<Value> {
     Ok(Value::Float(sim as f64))
 }
 
-/// Convert a Value to a Vec<f32> for vector operations.
+/// Convert a Value to a `Vec<f32>` for vector operations.
 pub fn value_to_f32_vec(v: &Value) -> Result<Vec<f32>, SimilarToError> {
     match v {
         Value::Vector(vec) => Ok(vec.clone()),

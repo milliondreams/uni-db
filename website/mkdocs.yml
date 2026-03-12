@@ -1,5 +1,5 @@
 site_name: Uni Documentation
-site_description: The Embedded Multi-Model Graph Database - Graph, Vector, Document, and Columnar workloads unified
+site_description: Reasoning and memory infrastructure for intelligent systems — structured memory, formal reasoning, what-if simulation, and explainable decisions in one embedded engine
 site_url: https://rustic-ai.github.io/uni-db/
 repo_url: https://github.com/rustic-ai/uni-db
 repo_name: rustic-ai/uni-db
@@ -8,6 +8,7 @@ copyright: Copyright &copy; 2024-2026 Dragonscale Industries Inc. - Part of The 
 
 nav:
   - Home: index.md
+  - Why Uni: why-uni.md
   - Getting Started:
       - Overview: getting-started/index.md
       - Installation: getting-started/installation.md

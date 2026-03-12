@@ -126,7 +126,7 @@ uni --help
 
 Expected output:
 ```
-Uni - The Embedded Multi-Model Graph Database
+Uni - Reasoning and Memory Infrastructure for Intelligent Systems
 
 Usage: uni <COMMAND>
 

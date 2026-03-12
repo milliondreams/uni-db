@@ -48,3 +48,28 @@
 .md-nav__link--active {
     color: #FF6928;
 }
+
+/* Quick-links pill bar */
+.quick-links {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin: 1rem 0;
+}
+
+.quick-links .quick-link {
+    display: inline-block;
+    padding: 0.4rem 1rem;
+    border: 1px solid #FF6928;
+    border-radius: 2rem;
+    font-size: 0.8rem;
+    font-weight: 600;
+    text-decoration: none;
+    color: #FF6928;
+    transition: background-color 0.2s, color 0.2s;
+}
+
+.quick-links .quick-link:hover {
+    background-color: #FF6928;
+    color: #fff;
+}

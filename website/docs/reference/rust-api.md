@@ -1851,24 +1851,69 @@ let results = db.query(
 ).await?;
 ```
 
-### Embedding Generation
+### Uni-Xervo Runtime (Embedding & Generation)
 
-Embeddings are auto-generated on CREATE when configured in schema. No direct embedding API:
+Access the Uni-Xervo runtime via `db.xervo()`. This requires a Uni-Xervo catalog configured at database open time (see [Vector Search Guide](../guides/vector-search.md)).
 
 ```rust
-// Schema with embedding config (embeddings auto-generated on insert)
+use uni_db::xervo::{Message, GenerationOptions, GenerationResult};
+
+let xervo = db.xervo()?;
+```
+
+**Embedding:**
+
+```rust
+// Embed text directly using a configured model alias
+let vectors: Vec<Vec<f32>> = xervo.embed("embed/default", &["query text"]).await?;
+```
+
+Embeddings are also auto-generated on `CREATE` when a vector index has an `embedding` configuration. No explicit call needed in that case:
+
+```rust
 db.schema()
     .label("Paper")
         .property("title", DataType::String)
         .property("abstract", DataType::String)
-        .vector("embedding", 384)  // Dimensions match model
+        .vector("embedding", 384)
     .apply()
     .await?;
 
 // Embedding generated automatically from configured source properties
 db.execute("CREATE (p:Paper {title: 'ML Paper', abstract: 'Deep learning...'})").await?;
+```
 
-// Query embeddings via vector search
+**Text Generation:**
+
+```rust
+// Structured messages with explicit roles
+let result: GenerationResult = xervo.generate("llm/default", &[
+    Message::system("You are a helpful assistant."),
+    Message::user("Summarize the following paper abstract."),
+], GenerationOptions::default()).await?;
+println!("{}", result.text);
+
+// Convenience: plain strings (each treated as a user message)
+let result = xervo.generate_text(
+    "llm/default",
+    &["Explain graph databases.".to_string()],
+    GenerationOptions::default(),
+).await?;
+```
+
+**Key types** (re-exported from `uni_db::xervo`):
+
+| Type | Description |
+|------|-------------|
+| `Message` | Structured message with role and content blocks. Constructors: `Message::user()`, `Message::system()`, `Message::assistant()` |
+| `MessageRole` | Enum: `System`, `User`, `Assistant` |
+| `ContentBlock` | Enum: `Text(String)`, `Image(ImageInput)` |
+| `GenerationOptions` | Options: `max_tokens`, `temperature`, `top_p`, `width`, `height` |
+| `GenerationResult` | Result: `text`, `usage`, `images: Vec<GeneratedImage>`, `audio: Option<AudioOutput>` |
+
+**Vector search with embeddings:**
+
+```rust
 let results = db.query_with(
     "CALL uni.vector.query('Paper', 'embedding', $query_vec, 10)
      YIELD node, distance

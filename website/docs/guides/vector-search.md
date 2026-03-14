@@ -115,7 +115,33 @@ Your import data should include embedding vectors:
 
 Auto-embedding requires a Uni-Xervo catalog with an alias that matches the vector index configuration. Define that alias when you open the database (_e.g._, via `Uni::temporary().xervo_catalog(vec![ModelAliasSpec { alias: "embed/default", task: ModelTask::Embed, ... }])` in Rust or the equivalent JSON catalog in Cypher). Every vector index that sets `embedding.alias` must point to one of these catalog entries; when Uni writes nodes, the writer calls the alias, batches text inputs, and stores the returned embeddings in the indexed property.
 
-Also keep in mind that `Uni::xervo()` exposes the underlying runtime so you can pre-warm models, generate ad-hoc embeddings, or manage generation tasks from other parts of your application.
+### Using the Uni-Xervo Runtime Directly
+
+`Uni::xervo()` exposes the underlying runtime so you can generate ad-hoc embeddings, run text generation, or pre-warm models from your application:
+
+```rust
+let xervo = db.xervo()?;
+
+// Embed text directly
+let vectors = xervo.embed("embed/default", &["some query text"]).await?;
+
+// Text generation with structured messages (uni-xervo 0.2.0+)
+use uni_db::xervo::{Message, GenerationOptions};
+let result = xervo.generate("llm/default", &[
+    Message::system("You are a helpful assistant."),
+    Message::user("Summarize this document."),
+], GenerationOptions::default()).await?;
+println!("{}", result.text);
+
+// Convenience: generate from plain strings (each treated as a user message)
+let result = xervo.generate_text(
+    "llm/default",
+    &["Summarize this document.".to_string()],
+    GenerationOptions::default(),
+).await?;
+```
+
+The `generate` method accepts structured `Message` objects with explicit roles (`System`, `User`, `Assistant`) and supports multimodal content blocks (text and images). The `generate_text` convenience method wraps plain strings as user messages for simpler use cases.
 
 ## Querying Vectors
 
@@ -440,15 +466,21 @@ OPTIONS {
 
 **Supported Providers:**
 
-| Provider | Feature flag(s) | Description |
-|----------|-----------------|-------------|
-| `MistralRS` | `provider-mistralrs` | Runs locally using the small, CPU-friendly `mistral-embed` loader. Ideal when you want embedding inference without any external API keys—this is the default for the workspace and what most local deployments should use. |
-| `Gemini` | `provider-gemini` | Remote Google Gemini API (requires network access and credentials). |
-| `OpenAI` | `provider-openai` | Remote OpenAI embedding APIs (configure via `OPENAI_API_KEY` or similar). |
-| `Candle` | `provider-candle` | Native HuggingFace Candle models (optional, pulls in `tokenizers` + `candle` crates). |
-| `FastEmbed` | `provider-fastembed` | ONNX runtime provider for legacy models (optional). |
+| Provider | Feature flag | Type | Description |
+|----------|-------------|------|-------------|
+| `MistralRS` | `provider-mistralrs` | Local | CPU-friendly local inference via MistralRS loader. Default for the workspace; ideal for offline deployments without API keys. |
+| `Candle` | `provider-candle` | Local | Native HuggingFace Candle models (optional, pulls in `tokenizers` + `candle` crates). |
+| `FastEmbed` | `provider-fastembed` | Local | ONNX runtime provider for legacy models (optional). |
+| `OpenAI` | `provider-openai` | Remote | OpenAI embedding and generation APIs (configure via `OPENAI_API_KEY`). |
+| `Gemini` | `provider-gemini` | Remote | Google Gemini API (requires network access and credentials). |
+| `Anthropic` | `provider-anthropic` | Remote | Anthropic Claude API for generation tasks. |
+| `Vertex AI` | `provider-vertexai` | Remote | Google Cloud Vertex AI API. |
+| `Mistral` | `provider-mistral` | Remote | Mistral AI hosted API. |
+| `Cohere` | `provider-cohere` | Remote | Cohere embedding and generation APIs. |
+| `Voyage AI` | `provider-voyageai` | Remote | Voyage AI embedding API. |
+| `Azure OpenAI` | `provider-azure-openai` | Remote | Azure-hosted OpenAI API. |
 
-Keep the feature list tight—only enable the providers your deployment actually needs. The workspace defaults already list `provider-mistralrs`, `provider-gemini`, and `provider-openai`, so Candle/FastEmbed remain opt-in unless explicitly activated.
+Keep the feature list tight—only enable the providers your deployment actually needs. The workspace defaults already list `provider-mistralrs`, `provider-gemini`, and `provider-openai`, so the remaining providers are opt-in unless explicitly activated.
 
 **Embedding Model Recommendation:**
 For local CPU auto-embedding, point your catalog alias at a lightweight embedding model such as `nomic-embed-text-v1.5`. It is already supported by `provider-mistralrs` via the MistralRS loader, runs well on an 8‑core laptop, and provides high-quality vectors for RAG tasks. That keeps dependencies small, avoids downloading large transformer checkpoints, and means your users can embed text entirely offline while still benefiting from Uni-Xervo’s batching.

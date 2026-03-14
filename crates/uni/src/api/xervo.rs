@@ -6,7 +6,10 @@ use std::sync::Arc;
 use crate::api::Uni;
 use uni_common::{Result, UniError};
 use uni_xervo::runtime::ModelRuntime;
-use uni_xervo::traits::{GenerationOptions, GenerationResult};
+pub use uni_xervo::traits::{
+    AudioOutput, ContentBlock, GeneratedImage, GenerationOptions, GenerationResult, ImageInput,
+    Message, MessageRole,
+};
 
 fn into_uni_error<E: std::fmt::Display>(err: E) -> UniError {
     UniError::Internal(anyhow::anyhow!(err.to_string()))
@@ -33,11 +36,11 @@ impl UniXervo {
         embedder.embed(texts.to_vec()).await.map_err(into_uni_error)
     }
 
-    /// Generate text using a configured model alias.
+    /// Generate using a configured model alias with structured messages.
     pub async fn generate(
         &self,
         alias: &str,
-        messages: &[String],
+        messages: &[Message],
         options: GenerationOptions,
     ) -> Result<GenerationResult> {
         let generator = self
@@ -49,6 +52,20 @@ impl UniXervo {
             .generate(messages, options)
             .await
             .map_err(into_uni_error)
+    }
+
+    /// Generate text using plain string messages (convenience wrapper).
+    ///
+    /// Each string is treated as a user message. For multi-role conversations
+    /// or multimodal inputs, use [`generate`](Self::generate) with [`Message`] directly.
+    pub async fn generate_text(
+        &self,
+        alias: &str,
+        messages: &[String],
+        options: GenerationOptions,
+    ) -> Result<GenerationResult> {
+        let structured: Vec<Message> = messages.iter().map(|s| Message::user(s)).collect();
+        self.generate(alias, &structured, options).await
     }
 
     /// Access the underlying Uni-Xervo runtime.

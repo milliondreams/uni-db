@@ -61,10 +61,10 @@ impl UniXervo {
     pub async fn generate_text(
         &self,
         alias: &str,
-        messages: &[String],
+        messages: &[&str],
         options: GenerationOptions,
     ) -> Result<GenerationResult> {
-        let structured: Vec<Message> = messages.iter().map(|s| Message::user(s)).collect();
+        let structured: Vec<Message> = messages.iter().map(|s| Message::user(*s)).collect();
         self.generate(alias, &structured, options).await
     }
 

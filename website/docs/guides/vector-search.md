@@ -50,9 +50,18 @@ Add a `Vector` type property to your schema:
         "dimensions": 768
       }
     },
+    "Document": {
+      "title": { "type": "String", "nullable": false },
+      "content": { "type": "String", "nullable": true },
+      "embedding": {
+        "type": "Vector",
+        "dimensions": 384
+      }
+    },
     "Product": {
       "name": { "type": "String", "nullable": false },
-      "description_embedding": {
+      "description": { "type": "String", "nullable": true },
+      "desc_embedding": {
         "type": "Vector",
         "dimensions": 384
       },
@@ -136,7 +145,7 @@ println!("{}", result.text);
 // Convenience: generate from plain strings (each treated as a user message)
 let result = xervo.generate_text(
     "llm/default",
-    &["Summarize this document.".to_string()],
+    &["Summarize this document."],
     GenerationOptions::default(),
 ).await?;
 ```
@@ -449,7 +458,7 @@ In Locy **command** WHERE clauses (`DERIVE ... WHERE`, `ABDUCE ... WHERE`), `sim
 
 ### Auto-Embedding via Index Options
 
-Uni can auto-generate embeddings on insert when you configure an embedding provider in the index options:
+Uni can auto-generate embeddings on insert when you configure an embedding alias in the index options:
 
 ```cypher
 CREATE VECTOR INDEX doc_embed_idx
@@ -457,12 +466,13 @@ FOR (d:Document) ON d.embedding
 OPTIONS {
   type: "hnsw",
   embedding: {
-    provider: "Candle",
-    model: "all-MiniLM-L6-v2",
+    alias: "embed/default",
     source: ["content"]
   }
 }
 ```
+
+The `alias` field references a model alias from your Uni-Xervo catalog configuration.
 
 **Supported Providers:**
 
@@ -480,7 +490,7 @@ OPTIONS {
 | `Voyage AI` | `provider-voyageai` | Remote | Voyage AI embedding API. |
 | `Azure OpenAI` | `provider-azure-openai` | Remote | Azure-hosted OpenAI API. |
 
-Keep the feature list tight—only enable the providers your deployment actually needs. The workspace defaults already list `provider-mistralrs`, `provider-gemini`, and `provider-openai`, so the remaining providers are opt-in unless explicitly activated.
+Keep the feature list tight—only enable the providers your deployment actually needs. The workspace defaults include `provider-gemini` and `provider-openai`; all other providers (including `provider-mistralrs`) are opt-in.
 
 **Embedding Model Recommendation:**
 For local CPU auto-embedding, point your catalog alias at a lightweight embedding model such as `nomic-embed-text-v1.5`. It is already supported by `provider-mistralrs` via the MistralRS loader, runs well on an 8‑core laptop, and provides high-quality vectors for RAG tasks. That keeps dependencies small, avoids downloading large transformer checkpoints, and means your users can embed text entirely offline while still benefiting from Uni-Xervo’s batching.

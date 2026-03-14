@@ -1896,7 +1896,7 @@ println!("{}", result.text);
 // Convenience: plain strings (each treated as a user message)
 let result = xervo.generate_text(
     "llm/default",
-    &["Explain graph databases.".to_string()],
+    &["Explain graph databases."],
     GenerationOptions::default(),
 ).await?;
 ```

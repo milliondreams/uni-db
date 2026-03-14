@@ -121,7 +121,7 @@ Beyond auto-embedding, the `Uni::xervo()` facade gives direct access to embeddin
 
     // Or plain strings (convenience)
     let result = xervo.generate_text("llm/default",
-        &["Summarize this.".to_string()],
+        &["Summarize this."],
         GenerationOptions::default(),
     ).await?;
     ```

@@ -74,9 +74,9 @@ CREATE VECTOR INDEX doc_embed FOR (d:Document) ON (d.embedding)
 OPTIONS {
     metric: 'cosine',
     embedding: {
-        provider: 'Candle',
-        model: 'all-MiniLM-L6-v2',
-        source: ['content']
+        alias: 'embed/default',
+        source: ['title'],
+        batch_size: 32
     }
 }
 
@@ -98,12 +98,43 @@ RETURN b.title, similar_to(b.embedding, 'attention mechanisms') AS score
 
 `similar_to` supports vector similarity, FTS scoring, and multi-source hybrid fusion. It works in `WHERE`, `RETURN`, `ORDER BY`, and Locy rule bodies. See the [Vector Search guide](../guides/vector-search.md#similar_to-expression-function) for full details.
 
+## Uni-Xervo Runtime
+
+Beyond auto-embedding, the `Uni::xervo()` facade gives direct access to embedding and generation models:
+
+=== "Embedding"
+    ```rust
+    let xervo = db.xervo()?;
+    let vectors = xervo.embed("embed/default", &["query text"]).await?;
+    ```
+
+=== "Text Generation"
+    ```rust
+    use uni_db::xervo::{Message, GenerationOptions};
+    let xervo = db.xervo()?;
+
+    // Structured messages with roles
+    let result = xervo.generate("llm/default", &[
+        Message::system("You are a helpful assistant."),
+        Message::user("Summarize this document."),
+    ], GenerationOptions::default()).await?;
+
+    // Or plain strings (convenience)
+    let result = xervo.generate_text("llm/default",
+        &["Summarize this."],
+        GenerationOptions::default(),
+    ).await?;
+    ```
+
+Uni-Xervo supports local providers (MistralRS, Candle, FastEmbed) and remote providers (OpenAI, Gemini, Anthropic, Cohere, Vertex AI, Mistral, Voyage AI, Azure OpenAI). See the [Vector Search Guide](../guides/vector-search.md) for the full provider table and configuration details.
+
 ## Use Cases
 
 - Semantic search for documents or products.
 - RAG retrieval over knowledge graphs.
 - Similarity search over embeddings generated in-app.
 - Scoring graph-traversed nodes with `similar_to()` in `WHERE` and Locy rules.
+- LLM generation with context from graph queries.
 
 ## When To Use
 

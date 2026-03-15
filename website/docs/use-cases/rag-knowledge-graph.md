@@ -94,16 +94,38 @@ let db = Uni::open("./rag_data")
 
 ### 3. Data Ingestion
 
-Embed your documents (using OpenAI/Cohere/FastEmbed) and extract entities (using LLM or NER) before inserting.
+With Uni-Xervo auto-embedding, you don't need to pre-compute embeddings externally. Configure an embedding alias in your vector index and Uni generates embeddings automatically on insert:
+
+```cypher
+-- Create index with auto-embedding
+CREATE VECTOR INDEX chunk_embed FOR (c:Chunk) ON (c.embedding)
+OPTIONS {
+    metric: 'cosine',
+    embedding: {
+        alias: 'embed/default',
+        source: ['text'],
+        batch_size: 64
+    }
+}
+
+-- Insert text — embedding generated automatically
+CREATE (c:Chunk {id: 'c1', text: 'Function verify() checks signatures.'})
+```
+
+Alternatively, you can pre-compute embeddings externally or via the Uni-Xervo runtime directly:
+
+```rust
+let xervo = db.xervo()?;
+let embeddings = xervo.embed("embed/default", &["Function verify() checks signatures."]).await?;
+```
+
+For bulk import, use JSONL with either pre-computed embeddings or rely on the auto-embed pipeline:
 
 ```bash
-# Example JSONL structure for import
-# chunks.jsonl
-# {"id": "c1", "text": "Function verify() checks signatures.", "embedding": [...]} 
-# entities.jsonl
-# {"id": "e1", "name": "verify", "type": "function"}
-# relations.jsonl
-# {"src": "c1", "dst": "e1", "type": "MENTIONS"}
+# With pre-computed embeddings
+# chunks.jsonl: {"id": "c1", "text": "Function verify() checks signatures.", "embedding": [...]}
+# Without embeddings (auto-generated if index has embedding config)
+# chunks.jsonl: {"id": "c1", "text": "Function verify() checks signatures."}
 
 uni import support-bot \
   --papers chunks.jsonl \
@@ -138,6 +160,39 @@ RETURN DISTINCT
     distance
 ORDER BY distance ASC
 LIMIT 10
+```
+
+### 5. Generation with Retrieved Context
+
+With Uni-Xervo's generation API, you can close the RAG loop entirely within Uni — retrieve context via graph+vector queries, then pass it to an LLM:
+
+```rust
+use uni_db::xervo::{Message, GenerationOptions};
+
+// 1. Retrieve context (from the GraphRAG query above)
+let context_rows = db.query_with(
+    "CALL uni.vector.query('Chunk', 'embedding', $q, 5) YIELD node, distance
+     MATCH (node)-[:MENTIONS]->(topic:Entity)
+     RETURN node.text AS chunk, topic.name AS entity, distance"
+)
+    .param("q", "how does verify() work?")
+    .fetch_all()
+    .await?;
+
+// 2. Build context string from results
+let context: String = context_rows.iter()
+    .map(|r| r.get::<String>("chunk").unwrap())
+    .collect::<Vec<_>>()
+    .join("\n\n");
+
+// 3. Generate answer using Uni-Xervo
+let xervo = db.xervo()?;
+let result = xervo.generate("llm/default", &[
+    Message::system("Answer using only the provided context."),
+    Message::user(&format!("Context:\n{context}\n\nQuestion: how does verify() work?")),
+], GenerationOptions::default()).await?;
+
+println!("{}", result.text);
 ```
 
 ### Key Advantages

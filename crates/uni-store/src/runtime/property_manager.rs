@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::{debug, instrument};
+use tracing::{debug, instrument, warn};
 use uni_common::Properties;
 use uni_common::Value;
 use uni_common::core::id::{Eid, Vid};
@@ -390,7 +390,21 @@ impl PropertyManager {
             let lancedb_store = self.storage.lancedb_store();
             let table = match ds.open_lancedb(lancedb_store).await {
                 Ok(t) => t,
-                Err(_) => continue,
+                Err(e) => {
+                    let err_msg = e.to_string();
+                    if err_msg.contains("was not found")
+                        || err_msg.contains("does not exist")
+                        || err_msg.contains("not found")
+                    {
+                        continue; // Table doesn't exist yet — skip this label
+                    }
+                    warn!(
+                        label = %label_name,
+                        error = %e,
+                        "failed to open LanceDB table for label, skipping"
+                    );
+                    continue;
+                }
             };
 
             // Construct filter: _vid IN (...)
@@ -419,17 +433,40 @@ impl PropertyManager {
 
             let stream = match query.execute().await {
                 Ok(s) => s,
-                Err(_) => continue,
+                Err(e) => {
+                    warn!(
+                        label = %label_name,
+                        error = %e,
+                        "failed to execute query on label table, skipping"
+                    );
+                    continue;
+                }
             };
 
-            let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap_or_default();
+            let batches: Vec<RecordBatch> = match stream.try_collect().await {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!(
+                        label = %label_name,
+                        error = %e,
+                        "failed to collect query results for label, skipping"
+                    );
+                    continue;
+                }
+            };
             for batch in batches {
-                let vid_col = match batch.column_by_name("_vid") {
-                    Some(col) => col.as_any().downcast_ref::<UInt64Array>().unwrap(),
+                let vid_col = match batch
+                    .column_by_name("_vid")
+                    .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
+                {
+                    Some(c) => c,
                     None => continue,
                 };
-                let del_col = match batch.column_by_name("_deleted") {
-                    Some(col) => col.as_any().downcast_ref::<BooleanArray>().unwrap(),
+                let del_col = match batch
+                    .column_by_name("_deleted")
+                    .and_then(|col| col.as_any().downcast_ref::<BooleanArray>())
+                {
+                    Some(c) => c,
                     None => continue,
                 };
 
@@ -591,7 +628,21 @@ impl PropertyManager {
             let lancedb_store = self.storage.lancedb_store();
             let table = match delta_ds.open_lancedb(lancedb_store).await {
                 Ok(t) => t,
-                Err(_) => continue,
+                Err(e) => {
+                    let err_msg = e.to_string();
+                    if err_msg.contains("was not found")
+                        || err_msg.contains("does not exist")
+                        || err_msg.contains("not found")
+                    {
+                        continue; // Table doesn't exist yet — skip this edge type
+                    }
+                    warn!(
+                        edge_type = %type_name,
+                        error = %e,
+                        "failed to open LanceDB delta table for edge type, skipping"
+                    );
+                    continue;
+                }
             };
 
             let eid_list = eids
@@ -619,20 +670,40 @@ impl PropertyManager {
 
             let stream = match query.execute().await {
                 Ok(s) => s,
-                Err(_) => continue,
+                Err(e) => {
+                    warn!(
+                        edge_type = %type_name,
+                        error = %e,
+                        "failed to execute query on edge delta table, skipping"
+                    );
+                    continue;
+                }
             };
 
-            let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap_or_default();
+            let batches: Vec<RecordBatch> = match stream.try_collect().await {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!(
+                        edge_type = %type_name,
+                        error = %e,
+                        "failed to collect query results for edge type, skipping"
+                    );
+                    continue;
+                }
+            };
             for batch in batches {
-                let eid_col = match batch.column_by_name("eid") {
-                    Some(col) => col.as_any().downcast_ref::<UInt64Array>().unwrap(),
+                let eid_col = match batch
+                    .column_by_name("eid")
+                    .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
+                {
+                    Some(c) => c,
                     None => continue,
                 };
-                let op_col = match batch.column_by_name("op") {
-                    Some(col) => col
-                        .as_any()
-                        .downcast_ref::<arrow_array::UInt8Array>()
-                        .unwrap(),
+                let op_col = match batch
+                    .column_by_name("op")
+                    .and_then(|col| col.as_any().downcast_ref::<arrow_array::UInt8Array>())
+                {
+                    Some(c) => c,
                     None => continue,
                 };
 
@@ -977,9 +1048,20 @@ impl PropertyManager {
 
         let table = match self.storage.get_cached_table(label).await {
             Ok(t) => t,
-            Err(_) => {
-                // Table doesn't exist — vertices only have L0 props (already in result).
-                return Ok(result);
+            Err(e) => {
+                let err_msg = e.to_string();
+                if err_msg.contains("was not found")
+                    || err_msg.contains("does not exist")
+                    || err_msg.contains("not found")
+                {
+                    // Table doesn't exist — vertices only have L0 props (already in result).
+                    return Ok(result);
+                }
+                // Propagate unexpected errors (I/O, corruption, etc.)
+                return Err(e.context(format!(
+                    "failed to open cached table for label '{}'",
+                    label
+                )));
             }
         };
 
@@ -1006,16 +1088,28 @@ impl PropertyManager {
 
         let filter_expr = self.storage.apply_version_filter(base_filter);
 
-        let batches: Vec<RecordBatch> = match table
+        let batches: Vec<RecordBatch> = table
             .query()
             .only_if(&filter_expr)
             .select(Select::Columns(columns.clone()))
             .execute()
             .await
-        {
-            Ok(stream) => stream.try_collect().await.unwrap_or_default(),
-            Err(_) => Vec::new(),
-        };
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to execute query on label '{}' table: {}",
+                    label,
+                    e
+                )
+            })?
+            .try_collect()
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to collect query results for label '{}': {}",
+                    label,
+                    e
+                )
+            })?;
 
         let prop_name_refs: Vec<&str> = prop_names.iter().map(|s| s.as_str()).collect();
 

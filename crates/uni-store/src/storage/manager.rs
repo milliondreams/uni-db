@@ -425,7 +425,13 @@ impl StorageManager {
         }
 
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(self.config.compaction.check_interval);
+            // Use interval_at to delay the first tick. tokio::time::interval fires
+            // immediately on the first tick, which can race with queries that run
+            // right after database open. Delaying by the check_interval gives
+            // initial queries time to complete before compaction modifies tables
+            // (optimize(All) can GC index files that concurrent queries depend on).
+            let start = tokio::time::Instant::now() + self.config.compaction.check_interval;
+            let mut interval = tokio::time::interval_at(start, self.config.compaction.check_interval);
 
             loop {
                 tokio::select! {

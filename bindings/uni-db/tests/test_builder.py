@@ -4,6 +4,7 @@
 """Tests for DatabaseBuilder API."""
 
 import os
+import shutil
 import tempfile
 
 import pytest
@@ -27,7 +28,8 @@ class TestDatabaseBuilderOpenModes:
 
     def test_create_fails_if_exists(self):
         """Test that create() fails if database exists."""
-        with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = tempfile.mkdtemp()
+        try:
             path = os.path.join(tmpdir, "testdb")
             # Create first
             db1 = uni_db.DatabaseBuilder.create(path).build()
@@ -38,6 +40,8 @@ class TestDatabaseBuilderOpenModes:
             # Create again should fail
             with pytest.raises(OSError):
                 uni_db.DatabaseBuilder.create(path).build()
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
     def test_open_existing_database(self):
         """Test opening an existing database."""

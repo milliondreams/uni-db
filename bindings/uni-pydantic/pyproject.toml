@@ -7,7 +7,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "uni-pydantic"
-version = "0.1.18"
+version = "0.2.0"
 description = "Pydantic-based OGM (Object-Graph Mapping) for Uni Graph Database"
 authors = [
     { name = "Dragonscale Industries Inc.", email = "dev@dragonscale.ai" }

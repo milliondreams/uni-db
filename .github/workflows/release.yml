@@ -224,7 +224,7 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.12'
 
       - name: Build wheels
         uses: PyO3/maturin-action@v1
@@ -268,7 +268,7 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.12'
 
       - name: Install protobuf
         run: brew install protobuf
@@ -295,7 +295,7 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.12'
 
       - name: Install protobuf
         run: choco install protoc
@@ -392,17 +392,17 @@ jobs:
     if: always() && inputs.dry_run != true && (needs.publish-testpypi.result == 'success' || needs.publish-pypi.result == 'success')
     env:
       REGISTRY: ${{ needs.publish-testpypi.result == 'success' && 'testpypi' || 'pypi' }}
-      UV_PYTHON: "3.11"
+      UV_PYTHON: "3.12"
     steps:
       - uses: actions/checkout@v4
 
       - name: Setup uv
         uses: astral-sh/setup-uv@v6
         with:
-          python-version: '3.11'
+          python-version: '3.12'
 
       - name: Create virtualenv
-        run: uv venv --python 3.11
+        run: uv venv --python 3.12
 
       - name: Install published uni-db (with retry)
         env:

@@ -1,6 +1,7 @@
 import os
 import shutil
 import sys
+import tempfile
 import unittest
 
 # Ensure we can import the module from the current directory
@@ -11,16 +12,13 @@ import uni_db
 
 class TestAdvanced(unittest.TestCase):
     def setUp(self):
-        self.test_dir = "./test_db_adv"
-        if os.path.exists(self.test_dir):
-            shutil.rmtree(self.test_dir)
+        self.test_dir = tempfile.mkdtemp(prefix="test_db_adv_")
         self.db = uni_db.Database(self.test_dir)
         self.db.create_label("Entity")
 
     def tearDown(self):
         del self.db
-        if os.path.exists(self.test_dir):
-            shutil.rmtree(self.test_dir)
+        shutil.rmtree(self.test_dir, ignore_errors=True)
 
     def test_transaction_commit(self):
         tx = self.db.begin()

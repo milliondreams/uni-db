@@ -75,7 +75,7 @@ OPTIONS {
     metric: 'cosine',
     embedding: {
         alias: 'embed/default',
-        source: ['content'],
+        source: ['title'],
         batch_size: 32
     }
 }

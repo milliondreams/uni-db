@@ -478,7 +478,7 @@ The `alias` field references a model alias from your Uni-Xervo catalog configura
 
 | Provider | Feature flag | Type | Description |
 |----------|-------------|------|-------------|
-| `MistralRS` | `provider-mistralrs` | Local | CPU-friendly local inference via MistralRS loader. Default for the workspace; ideal for offline deployments without API keys. |
+| `MistralRS` | `provider-mistralrs` | Local | CPU-friendly local inference via MistralRS loader. Opt-in; ideal for offline deployments without API keys. |
 | `Candle` | `provider-candle` | Local | Native HuggingFace Candle models (optional, pulls in `tokenizers` + `candle` crates). |
 | `FastEmbed` | `provider-fastembed` | Local | ONNX runtime provider for legacy models (optional). |
 | `OpenAI` | `provider-openai` | Remote | OpenAI embedding and generation APIs (configure via `OPENAI_API_KEY`). |

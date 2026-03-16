@@ -93,6 +93,14 @@ This pattern applies wherever routing decisions need both structural constraints
 
 See [Vector Search guide](../guides/vector-search.md#similar_to-expression-function) for `similar_to` details.
 
+## 10. Probabilistic Risk Scoring
+
+Combine independent quality signals with MNOR (noisy-OR failure aggregation) and MPROD (joint reliability) for vendor evaluation in supply chains.
+
+Notebook:
+- Python: [Probabilistic Risk Scoring](../examples/python/locy_probabilistic_risk_scoring.ipynb)
+- Rust: [Probabilistic Risk Scoring](../examples/rust/locy_probabilistic_risk_scoring.ipynb)
+
 ## Pattern Template
 
 For each use case, model:

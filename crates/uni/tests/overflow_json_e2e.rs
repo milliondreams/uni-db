@@ -106,43 +106,100 @@ async fn test_mixed_schema_and_overflow_properties() -> Result<()> {
 
 /// Test 2: Property Updates with SET Operations
 ///
-/// Verifies that SET operations can add and update overflow properties,
-/// and that changes persist through flush cycles.
+/// Verifies that SET operations add overflow properties visible via
+/// `properties()` and individual property access WITHOUT requiring flush.
 #[tokio::test]
 async fn test_set_overflow_properties() -> Result<()> {
     let temp_dir = tempdir()?;
     let path = temp_dir.path();
     let db = Uni::open(path.to_str().unwrap()).build().await?;
 
-    // Create schemaless label
     db.schema().label("User").apply().await?;
 
-    println!("✓ Created User label (schemaless)");
-
-    // Create initial vertex with minimal properties
+    // Create vertex, flush to Lance storage
     db.execute("CREATE (:User {name: 'Alice'})").await?;
-    println!("✓ Created user with name only");
-
-    // Flush
     db.flush().await?;
-    println!("✓ Flushed to storage");
 
-    // TODO: SET operations not yet implemented
-    // Once SET is implemented, uncomment and test:
+    // SET a new overflow property — writes to L0, no flush
+    db.execute("MATCH (u:User) SET u.extra = 42").await?;
 
-    // db.execute("MATCH (u:User) SET u.verified = true, u.email = 'alice@example.com'").await?;
-    // println!("✓ Updated user with SET operation");
+    // properties(n) must include the L0-buffered property
+    let results = db
+        .query("MATCH (u:User) RETURN properties(u) AS props")
+        .await?;
+    assert_eq!(results.len(), 1);
+    let row = &results.rows()[0];
+    let props_val = row.value("props").expect("props column should exist");
+    let props_json: serde_json::Value = props_val.clone().into();
+    let props_str = format!("{props_json:?}");
+    assert!(
+        props_str.contains("extra"),
+        "properties(u) should include L0-buffered 'extra', got: {props_str}"
+    );
 
-    // db.flush().await?;
-    // println!("✓ Flushed after SET");
+    // Individual property access must also work
+    let results = db.query("MATCH (u:User) RETURN u.extra AS extra").await?;
+    assert_eq!(results.len(), 1);
+    let row = &results.rows()[0];
+    let extra = row.get::<i64>("extra")?;
+    assert_eq!(extra, 42, "u.extra should be 42 from L0 buffer");
 
-    // let results = db.query("MATCH (u:User) RETURN u.name, u.verified, u.email").await?;
-    // assert_eq!(results.len(), 1);
-    // let row = &results.rows()[0];
-    // assert_eq!(row.get::<String>("u.name")?, "Alice");
-    // assert_eq!(row.get::<String>("u.email")?, "alice@example.com");
+    Ok(())
+}
 
-    println!("⚠ SET operations test skipped - SET not yet implemented");
+/// Test: Read-your-writes semantics without any flush.
+///
+/// After CREATE and SET (both unflushed), properties() must include
+/// all properties from the L0 buffer.
+#[tokio::test]
+async fn test_set_properties_read_your_writes_no_flush() -> Result<()> {
+    let temp_dir = tempdir()?;
+    let path = temp_dir.path();
+    let db = Uni::open(path.to_str().unwrap()).build().await?;
+
+    db.schema().label("Person").apply().await?;
+
+    // Create vertex — no flush
+    db.execute("CREATE (:Person {name: 'Alice', age: 30})")
+        .await?;
+    db.flush().await?;
+
+    // SET another property — no flush
+    db.execute("MATCH (p:Person) SET p.pagerank = 0.5").await?;
+
+    // properties(p) must include name, age, AND pagerank
+    let results = db
+        .query("MATCH (p:Person) RETURN properties(p) AS props")
+        .await?;
+    assert_eq!(results.len(), 1);
+    let row = &results.rows()[0];
+    let props_val = row.value("props").expect("props column should exist");
+    let props_json: serde_json::Value = props_val.clone().into();
+    let props_map = props_json
+        .as_object()
+        .expect("properties() should return a map");
+    assert!(
+        props_map.contains_key("name"),
+        "properties(p) should contain 'name', got: {props_map:?}"
+    );
+    assert!(
+        props_map.contains_key("age"),
+        "properties(p) should contain 'age', got: {props_map:?}"
+    );
+    assert!(
+        props_map.contains_key("pagerank"),
+        "properties(p) should contain 'pagerank', got: {props_map:?}"
+    );
+
+    // Individual property access
+    let results = db.query("MATCH (p:Person) RETURN p.pagerank AS pr").await?;
+    assert_eq!(results.len(), 1);
+    let row = &results.rows()[0];
+    let pr = row.get::<f64>("pr")?;
+    assert!(
+        (pr - 0.5).abs() < f64::EPSILON,
+        "p.pagerank should be 0.5, got: {pr}"
+    );
 
     Ok(())
 }

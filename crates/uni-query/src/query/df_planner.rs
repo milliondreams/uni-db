@@ -1574,6 +1574,19 @@ impl HybridPhysicalPlanner {
             }
         }
 
+        // If we need the full object (structural access), ensure _all_props and
+        // overflow_json are projected BEFORE creating the scan.
+        let var_props = all_properties.get(variable);
+        let need_full = var_props.is_some_and(|p| p.contains("*"));
+        if need_full {
+            if !properties.contains(&"_all_props".to_string()) {
+                properties.push("_all_props".to_string());
+            }
+            if !properties.contains(&"overflow_json".to_string()) {
+                properties.push("overflow_json".to_string());
+            }
+        }
+
         let mut scan_plan: Arc<dyn ExecutionPlan> = Arc::new(GraphScanExec::new_vertex_scan(
             self.graph_ctx.clone(),
             label_name.to_string(),
@@ -1588,14 +1601,12 @@ impl HybridPhysicalPlanner {
         // comparing `_vid` (UInt64) against Int64 literals in type coercion.
         scan_plan = self.apply_scan_filter(scan_plan, variable, filter, Some(label_name))?;
 
-        // If we need the full object (structural access), add a Struct projection
-        let var_props = all_properties.get(variable);
-        if var_props.is_some_and(|p| p.contains("*")) {
-            // Filter overflow_json from the structural projection — it's an internal
-            // column, not a user-visible property for the struct.
+        if need_full {
+            // Filter "*" (wildcard marker) and overflow_json from the structural
+            // projection. Keep _all_props so properties()/keys() UDFs can use it.
             let struct_props: Vec<String> = properties
                 .iter()
-                .filter(|p| *p != "overflow_json")
+                .filter(|p| *p != "overflow_json" && *p != "*")
                 .cloned()
                 .collect();
             scan_plan = self.add_structural_projection(scan_plan, variable, &struct_props)?;

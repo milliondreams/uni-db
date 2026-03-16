@@ -25,7 +25,7 @@ use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use uni_common::Value;
-use uni_common::core::schema::Schema as UniSchema;
+use uni_common::core::schema::{DistanceMetric, IndexDefinition, Schema as UniSchema};
 use uni_cypher::ast::{
     BinaryOp, Clause, CypherLiteral, Expr, MatchClause, Query, ReturnClause, ReturnItem, SortItem,
     Statement, UnaryOp, UnwindClause, WithClause,
@@ -730,6 +730,18 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
             None
         };
 
+        // Resolve per-source distance metrics from schema at compile time.
+        let source_metrics: Vec<Option<DistanceMetric>> = source_property_names
+            .iter()
+            .map(|prop_name| {
+                prop_name.as_ref().and_then(|prop| {
+                    self.uni_schema
+                        .as_ref()
+                        .and_then(|schema| resolve_metric_for_property(schema, prop))
+                })
+            })
+            .collect();
+
         Ok(Arc::new(SimilarToExecExpr::new(
             source_children,
             query_children,
@@ -737,6 +749,7 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
             graph_ctx,
             source_variable,
             source_property_names,
+            source_metrics,
         )))
     }
 
@@ -2471,4 +2484,18 @@ fn rewrite_expr_correlated(expr: &Expr, outer_vars: &HashSet<String>) -> Expr {
             .clone()
             .map_children(&mut |child| rewrite_expr_correlated(&child, outer_vars)),
     }
+}
+
+/// Look up the `DistanceMetric` for a vector-indexed property across all labels.
+///
+/// Returns `None` if no vector index exists for the property.
+fn resolve_metric_for_property(schema: &UniSchema, property: &str) -> Option<DistanceMetric> {
+    for idx in &schema.indexes {
+        if let IndexDefinition::Vector(config) = idx
+            && config.property == property
+        {
+            return Some(config.metric.clone());
+        }
+    }
+    None
 }

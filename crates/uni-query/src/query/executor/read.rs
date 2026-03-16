@@ -456,7 +456,17 @@ impl Executor {
         }
 
         let execution_plan = planner.plan(&plan)?;
-        Self::collect_batches(&session_ctx, execution_plan).await
+        let result = Self::collect_batches(&session_ctx, execution_plan).await;
+
+        // Harvest warnings from the graph execution context after query completion.
+        let graph_warnings = planner.graph_ctx().take_warnings();
+        if !graph_warnings.is_empty()
+            && let Ok(mut w) = self.warnings.lock()
+        {
+            w.extend(graph_warnings);
+        }
+
+        result
     }
 
     /// Execute a MERGE read sub-plan through the DataFusion engine.

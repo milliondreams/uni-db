@@ -12,7 +12,9 @@ pub use query::executor::procedure::{
 };
 pub use query::executor::{Executor, ResultNormalizer};
 pub use query::planner::{CostEstimates, ExplainOutput, IndexUsage, LogicalPlan, QueryPlanner};
-pub use types::{Edge, ExecuteResult, FromValue, Node, Path, QueryCursor, QueryResult, Row, Value};
+pub use types::{
+    Edge, ExecuteResult, FromValue, Node, Path, QueryCursor, QueryResult, QueryWarning, Row, Value,
+};
 pub use uni_cypher::ast::{Query as CypherQuery, TimeTravelSpec};
 
 /// Validate that a query AST is read-only (no CREATE, SET, DELETE, MERGE, REMOVE).

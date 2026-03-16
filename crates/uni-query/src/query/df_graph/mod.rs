@@ -83,7 +83,7 @@ pub mod vector_knn;
 
 use crate::query::executor::procedure::ProcedureRegistry;
 use parking_lot::RwLock;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use uni_algo::algo::AlgorithmRegistry;
 use uni_common::core::id::{Eid, Vid};
@@ -94,6 +94,8 @@ use uni_store::storage::adjacency_manager::AdjacencyManager;
 use uni_store::storage::direction::Direction;
 use uni_store::storage::manager::StorageManager;
 use uni_xervo::runtime::ModelRuntime;
+
+use crate::types::QueryWarning;
 
 pub use apply::GraphApplyExec;
 pub use ext_id_lookup::GraphExtIdLookupExec;
@@ -163,6 +165,9 @@ pub struct GraphExecutionContext {
     procedure_registry: Option<Arc<ProcedureRegistry>>,
     /// Uni-Xervo runtime used by vector auto-embedding paths.
     xervo_runtime: Option<Arc<ModelRuntime>>,
+
+    /// Runtime warnings collected during query execution.
+    warnings: Arc<Mutex<Vec<QueryWarning>>>,
 }
 
 impl std::fmt::Debug for GraphExecutionContext {
@@ -259,6 +264,7 @@ impl GraphExecutionContext {
             algo_registry: None,
             procedure_registry: None,
             xervo_runtime: None,
+            warnings: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -282,6 +288,7 @@ impl GraphExecutionContext {
             algo_registry: None,
             procedure_registry: None,
             xervo_runtime: None,
+            warnings: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -299,6 +306,7 @@ impl GraphExecutionContext {
             algo_registry: None,
             procedure_registry: None,
             xervo_runtime: None,
+            warnings: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -338,6 +346,21 @@ impl GraphExecutionContext {
 
     pub fn xervo_runtime(&self) -> Option<&Arc<ModelRuntime>> {
         self.xervo_runtime.as_ref()
+    }
+
+    /// Record a runtime warning.
+    pub fn push_warning(&self, warning: QueryWarning) {
+        if let Ok(mut w) = self.warnings.lock() {
+            w.push(warning);
+        }
+    }
+
+    /// Take all collected warnings, leaving the collector empty.
+    pub fn take_warnings(&self) -> Vec<QueryWarning> {
+        self.warnings
+            .lock()
+            .map(|mut w| std::mem::take(&mut *w))
+            .unwrap_or_default()
     }
 
     /// Check if the query has timed out.

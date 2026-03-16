@@ -15,6 +15,7 @@ use anyhow::Result;
 use uni_common::Value;
 use uni_common::core::schema::{DistanceMetric, Schema};
 
+use crate::query::df_graph::common::calculate_score;
 use crate::query::fusion;
 
 /// Named error types for `similar_to()` validation failures.
@@ -241,6 +242,39 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> Result<f32, SimilarToError> {
     // Cosine similarity in [-1, 1], map to [0, 1]
     let sim = (dot / (mag1 * mag2)) as f32;
     Ok(sim.clamp(-1.0, 1.0))
+}
+
+/// Score two vectors using the specified distance metric, returning a similarity
+/// score where higher means more similar.
+///
+/// - **Cosine**: raw cosine similarity in \[-1, 1\] (delegates to [`cosine_similarity`]).
+/// - **L2**: `1 / (1 + d²)` where d² is squared Euclidean distance; range (0, 1\].
+/// - **Dot**: raw dot product (for normalised vectors equals cosine similarity).
+pub fn score_vectors(a: &[f32], b: &[f32], metric: &DistanceMetric) -> Result<f32, SimilarToError> {
+    if a.len() != b.len() {
+        return Err(SimilarToError::DimensionMismatch {
+            a: a.len(),
+            b: b.len(),
+        });
+    }
+    match metric {
+        DistanceMetric::Cosine => cosine_similarity(a, b),
+        DistanceMetric::L2 => {
+            let distance = metric.compute_distance(a, b);
+            Ok(calculate_score(distance, metric))
+        }
+        DistanceMetric::Dot => {
+            // compute_distance returns -dot (LanceDB convention: lower = more similar).
+            // Negate to recover the actual dot product as a similarity score.
+            let distance = metric.compute_distance(a, b);
+            Ok(-distance)
+        }
+        // DistanceMetric is #[non_exhaustive]; fall back to L2-style normalisation.
+        _ => {
+            let distance = metric.compute_distance(a, b);
+            Ok(calculate_score(distance, metric))
+        }
+    }
 }
 
 /// Normalize a BM25 score to [0, 1] using a saturation function.
@@ -552,5 +586,65 @@ mod tests {
         let score = fuse_scores(&[0.8, 0.6], &opts).unwrap();
         // RRF in point context falls back to equal weights: (0.8 + 0.6) / 2 = 0.7
         assert!((score - 0.7).abs() < 1e-6);
+    }
+
+    // -----------------------------------------------------------------------
+    // score_vectors() tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_score_vectors_cosine_identical() {
+        let v = vec![1.0, 0.0, 0.0];
+        let score = score_vectors(&v, &v, &DistanceMetric::Cosine).unwrap();
+        assert!((score - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_score_vectors_cosine_matches_raw() {
+        // score_vectors with Cosine delegates to cosine_similarity
+        let a = vec![1.0, 0.0, 0.0];
+        let b = vec![0.8, 0.6, 0.0];
+        let raw = cosine_similarity(&a, &b).unwrap();
+        let scored = score_vectors(&a, &b, &DistanceMetric::Cosine).unwrap();
+        assert!((raw - scored).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_score_vectors_l2() {
+        // [1,0,0] vs [0,1,0]: L2 squared distance = 2, score = 1/(1+2) ≈ 0.333
+        let a = vec![1.0, 0.0, 0.0];
+        let b = vec![0.0, 1.0, 0.0];
+        let score = score_vectors(&a, &b, &DistanceMetric::L2).unwrap();
+        assert!((score - 1.0 / 3.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_score_vectors_l2_identical() {
+        let v = vec![1.0, 0.0, 0.0];
+        let score = score_vectors(&v, &v, &DistanceMetric::L2).unwrap();
+        assert!((score - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_score_vectors_dot() {
+        // [1,0,0] dot [0.8,0.6,0] = 0.8
+        let a = vec![1.0, 0.0, 0.0];
+        let b = vec![0.8, 0.6, 0.0];
+        let score = score_vectors(&a, &b, &DistanceMetric::Dot).unwrap();
+        assert!((score - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_score_vectors_dot_identical() {
+        let v = vec![1.0, 0.0, 0.0];
+        let score = score_vectors(&v, &v, &DistanceMetric::Dot).unwrap();
+        assert!((score - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_score_vectors_dimension_mismatch() {
+        let a = vec![1.0, 0.0];
+        let b = vec![1.0, 0.0, 0.0];
+        assert!(score_vectors(&a, &b, &DistanceMetric::Cosine).is_err());
     }
 }

@@ -431,7 +431,8 @@ impl StorageManager {
             // initial queries time to complete before compaction modifies tables
             // (optimize(All) can GC index files that concurrent queries depend on).
             let start = tokio::time::Instant::now() + self.config.compaction.check_interval;
-            let mut interval = tokio::time::interval_at(start, self.config.compaction.check_interval);
+            let mut interval =
+                tokio::time::interval_at(start, self.config.compaction.check_interval);
 
             loop {
                 tokio::select! {

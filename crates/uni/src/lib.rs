@@ -22,8 +22,8 @@ pub use uni_common::{
     CrdtType, DataType, Eid, Result, Schema, UniConfig, UniError, UniId, Vid, unival,
 };
 pub use uni_query::{
-    Edge, ExecuteResult, ExplainOutput, FromValue, Node, Path, ProfileOutput, QueryResult, Row,
-    Value,
+    Edge, ExecuteResult, ExplainOutput, FromValue, Node, Path, ProfileOutput, QueryResult,
+    QueryWarning, Row, Value,
 };
 
 #[cfg(feature = "storage-internals")]

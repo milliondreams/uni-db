@@ -17,6 +17,7 @@ use uni_xervo::runtime::ModelRuntime;
 
 use crate::query::datetime::{classify_temporal, eval_datetime_function};
 use crate::query::expr_eval::eval_binary_op;
+use crate::types::QueryWarning;
 
 use super::procedure::ProcedureRegistry;
 
@@ -223,6 +224,8 @@ pub struct Executor {
     pub(crate) procedure_registry: Option<Arc<ProcedureRegistry>>,
     /// Uni-Xervo runtime used by vector auto-embedding paths.
     pub(crate) xervo_runtime: Option<Arc<ModelRuntime>>,
+    /// Warnings collected during the last execution.
+    pub(crate) warnings: Arc<std::sync::Mutex<Vec<QueryWarning>>>,
 }
 
 impl Executor {
@@ -238,6 +241,7 @@ impl Executor {
             gen_expr_cache: Arc::new(RwLock::new(HashMap::new())),
             procedure_registry: None,
             xervo_runtime: None,
+            warnings: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -275,6 +279,14 @@ impl Executor {
 
     pub fn set_writer(&mut self, writer: Arc<RwLock<Writer>>) {
         self.writer = Some(writer);
+    }
+
+    /// Take all collected warnings from the last execution, leaving the collector empty.
+    pub fn take_warnings(&self) -> Vec<QueryWarning> {
+        self.warnings
+            .lock()
+            .map(|mut w| std::mem::take(&mut *w))
+            .unwrap_or_default()
     }
 
     pub fn set_use_transaction(&mut self, use_transaction: bool) {

@@ -1058,10 +1058,7 @@ impl PropertyManager {
                     return Ok(result);
                 }
                 // Propagate unexpected errors (I/O, corruption, etc.)
-                return Err(e.context(format!(
-                    "failed to open cached table for label '{}'",
-                    label
-                )));
+                return Err(e.context(format!("failed to open cached table for label '{}'", label)));
             }
         };
 
@@ -1095,11 +1092,7 @@ impl PropertyManager {
             .execute()
             .await
             .map_err(|e| {
-                anyhow::anyhow!(
-                    "failed to execute query on label '{}' table: {}",
-                    label,
-                    e
-                )
+                anyhow::anyhow!("failed to execute query on label '{}' table: {}", label, e)
             })?
             .try_collect()
             .await

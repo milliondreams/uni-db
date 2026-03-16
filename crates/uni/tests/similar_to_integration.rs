@@ -1186,3 +1186,297 @@ mod auto_embed_tests {
         Ok(())
     }
 }
+
+// ── Phase 11: Distance Metric Tests ──────────────────────────────────────────
+
+mod metric_tests {
+    use super::*;
+
+    /// Create a DB with a vector index using the specified metric.
+    async fn setup_metric_db(metric: VectorMetric) -> Result<Uni> {
+        let db = Uni::in_memory().build().await?;
+
+        db.schema()
+            .label("Item")
+            .property("name", DataType::String)
+            .vector("vec", 3)
+            .index(
+                "vec",
+                IndexType::Vector(VectorIndexCfg {
+                    algorithm: VectorAlgo::Flat,
+                    metric,
+                    embedding: None,
+                }),
+            )
+            .done()
+            .apply()
+            .await?;
+
+        // Unit-length vectors for predictable scores
+        db.execute("CREATE (:Item {name: 'A', vec: [1.0, 0.0, 0.0]})")
+            .await?;
+        db.execute("CREATE (:Item {name: 'B', vec: [0.0, 1.0, 0.0]})")
+            .await?;
+        db.execute("CREATE (:Item {name: 'C', vec: [0.8, 0.6, 0.0]})")
+            .await?;
+        db.flush().await?;
+        Ok(db)
+    }
+
+    // ── L2 ──
+
+    #[tokio::test]
+    async fn test_similar_to_l2_metric() -> Result<()> {
+        let db = setup_metric_db(VectorMetric::L2).await?;
+
+        let result = db
+            .query(
+                "MATCH (i:Item) \
+                 RETURN i.name AS name, similar_to(i.vec, [1.0, 0.0, 0.0]) AS score \
+                 ORDER BY score DESC",
+            )
+            .await?;
+
+        assert_eq!(result.len(), 3);
+
+        let names: Vec<String> = result
+            .rows
+            .iter()
+            .map(|r| r.get::<String>("name").unwrap())
+            .collect();
+        let scores: Vec<f64> = result
+            .rows
+            .iter()
+            .map(|r| r.get::<f64>("score").unwrap())
+            .collect();
+
+        // A: identical → distance=0, score=1/(1+0)=1.0
+        assert_eq!(names[0], "A");
+        assert!((scores[0] - 1.0).abs() < 1e-5, "A score: {}", scores[0]);
+
+        // C: [0.8,0.6,0] → d²=(0.2²+0.6²)=0.04+0.36=0.4, score=1/(1+0.4)≈0.714
+        assert_eq!(names[1], "C");
+        assert!(
+            (scores[1] - 1.0 / 1.4).abs() < 1e-4,
+            "C score: {} (expected ~0.714)",
+            scores[1]
+        );
+
+        // B: [0,1,0] → d²=(1²+1²)=2, score=1/(1+2)≈0.333
+        assert_eq!(names[2], "B");
+        assert!(
+            (scores[2] - 1.0 / 3.0).abs() < 1e-4,
+            "B score: {} (expected ~0.333)",
+            scores[2]
+        );
+
+        Ok(())
+    }
+
+    // ── Dot ──
+
+    #[tokio::test]
+    async fn test_similar_to_dot_metric() -> Result<()> {
+        let db = setup_metric_db(VectorMetric::Dot).await?;
+
+        let result = db
+            .query(
+                "MATCH (i:Item) \
+                 RETURN i.name AS name, similar_to(i.vec, [1.0, 0.0, 0.0]) AS score \
+                 ORDER BY score DESC",
+            )
+            .await?;
+
+        assert_eq!(result.len(), 3);
+
+        let names: Vec<String> = result
+            .rows
+            .iter()
+            .map(|r| r.get::<String>("name").unwrap())
+            .collect();
+        let scores: Vec<f64> = result
+            .rows
+            .iter()
+            .map(|r| r.get::<f64>("score").unwrap())
+            .collect();
+
+        // A: [1,0,0]·[1,0,0] = 1.0
+        assert_eq!(names[0], "A");
+        assert!((scores[0] - 1.0).abs() < 1e-5, "A score: {}", scores[0]);
+
+        // C: [0.8,0.6,0]·[1,0,0] = 0.8
+        assert_eq!(names[1], "C");
+        assert!((scores[1] - 0.8).abs() < 1e-5, "C score: {}", scores[1]);
+
+        // B: [0,1,0]·[1,0,0] = 0.0
+        assert_eq!(names[2], "B");
+        assert!(scores[2].abs() < 1e-5, "B score: {}", scores[2]);
+
+        Ok(())
+    }
+
+    // ── Cosine unchanged ──
+
+    #[tokio::test]
+    async fn test_similar_to_cosine_unchanged() -> Result<()> {
+        let db = setup_metric_db(VectorMetric::Cosine).await?;
+
+        let result = db
+            .query(
+                "MATCH (i:Item) \
+                 RETURN i.name AS name, similar_to(i.vec, [1.0, 0.0, 0.0]) AS score \
+                 ORDER BY score DESC",
+            )
+            .await?;
+
+        assert_eq!(result.len(), 3);
+
+        let scores: Vec<f64> = result
+            .rows
+            .iter()
+            .map(|r| r.get::<f64>("score").unwrap())
+            .collect();
+
+        // Cosine similarity for unit vectors equals dot product
+        assert!((scores[0] - 1.0).abs() < 1e-5, "A: {}", scores[0]);
+        assert!((scores[1] - 0.8).abs() < 1e-5, "C: {}", scores[1]);
+        assert!(scores[2].abs() < 1e-5, "B: {}", scores[2]);
+
+        Ok(())
+    }
+
+    // ── Multi-source with mixed metrics ──
+
+    #[tokio::test]
+    async fn test_similar_to_multi_source_mixed_metrics() -> Result<()> {
+        let db = Uni::in_memory().build().await?;
+
+        db.schema()
+            .label("Item")
+            .property("name", DataType::String)
+            .vector("vec_cos", 3)
+            .vector("vec_l2", 3)
+            .index(
+                "vec_cos",
+                IndexType::Vector(VectorIndexCfg {
+                    algorithm: VectorAlgo::Flat,
+                    metric: VectorMetric::Cosine,
+                    embedding: None,
+                }),
+            )
+            .index(
+                "vec_l2",
+                IndexType::Vector(VectorIndexCfg {
+                    algorithm: VectorAlgo::Flat,
+                    metric: VectorMetric::L2,
+                    embedding: None,
+                }),
+            )
+            .done()
+            .apply()
+            .await?;
+
+        db.execute("CREATE (:Item {name: 'A', vec_cos: [1.0, 0.0, 0.0], vec_l2: [1.0, 0.0, 0.0]})")
+            .await?;
+        db.execute("CREATE (:Item {name: 'B', vec_cos: [0.0, 1.0, 0.0], vec_l2: [0.0, 1.0, 0.0]})")
+            .await?;
+        db.flush().await?;
+
+        let result = db
+            .query(
+                "MATCH (i:Item) \
+                 RETURN i.name AS name, \
+                        similar_to([i.vec_cos, i.vec_l2], [[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]], \
+                                   {method: 'weighted', weights: [0.5, 0.5]}) AS score \
+                 ORDER BY score DESC",
+            )
+            .await?;
+
+        assert_eq!(result.len(), 2);
+
+        let names: Vec<String> = result
+            .rows
+            .iter()
+            .map(|r| r.get::<String>("name").unwrap())
+            .collect();
+        let scores: Vec<f64> = result
+            .rows
+            .iter()
+            .map(|r| r.get::<f64>("score").unwrap())
+            .collect();
+
+        // A: cosine=1.0, L2=1.0 → weighted=1.0
+        assert_eq!(names[0], "A");
+        assert!((scores[0] - 1.0).abs() < 1e-4, "A: {}", scores[0]);
+
+        // B: cosine=0.0, L2=1/(1+2)≈0.333 → weighted≈0.167
+        assert_eq!(names[1], "B");
+        let expected_b = 0.5 * 0.0 + 0.5 * (1.0 / 3.0);
+        assert!(
+            (scores[1] - expected_b).abs() < 1e-3,
+            "B: {} (expected ~{})",
+            scores[1],
+            expected_b
+        );
+
+        Ok(())
+    }
+
+    // ── RRF warning ──
+
+    #[tokio::test]
+    async fn test_similar_to_rrf_emits_warning() -> Result<()> {
+        let db = Uni::in_memory().build().await?;
+
+        db.schema()
+            .label("Doc")
+            .property("title", DataType::String)
+            .property("content", DataType::String)
+            .vector("embedding", 3)
+            .index(
+                "embedding",
+                IndexType::Vector(VectorIndexCfg {
+                    algorithm: VectorAlgo::Flat,
+                    metric: VectorMetric::Cosine,
+                    embedding: None,
+                }),
+            )
+            .index("content", IndexType::FullText)
+            .done()
+            .apply()
+            .await?;
+
+        db.execute(
+            "CREATE (:Doc {title: 'Alpha', content: 'rust programming', embedding: [1.0, 0.0, 0.0]})",
+        )
+        .await?;
+        db.flush().await?;
+
+        // Multi-source similar_to with default RRF fusion
+        let result = db
+            .query(
+                "MATCH (d:Doc) \
+                 RETURN d.title AS title, \
+                        similar_to([d.embedding, d.content], [[1.0, 0.0, 0.0], 'rust']) AS score",
+            )
+            .await?;
+
+        assert_eq!(result.len(), 1);
+        assert!(
+            result.has_warnings(),
+            "Expected RrfPointContext warning but got none"
+        );
+
+        let has_rrf_warning = result
+            .warnings()
+            .iter()
+            .any(|w| matches!(w, uni_db::QueryWarning::RrfPointContext));
+        assert!(
+            has_rrf_warning,
+            "Expected RrfPointContext warning, got: {:?}",
+            result.warnings()
+        );
+
+        Ok(())
+    }
+}

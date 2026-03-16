@@ -500,6 +500,199 @@ async fn test_comprehensive_null_handling() -> Result<()> {
     Ok(())
 }
 
+/// Test: SET overflow property on multiple nodes persists after flush.
+///
+/// Reproduction for the bug where non-schema (overflow) properties are
+/// silently lost for some vertices after flush(). The issue is that
+/// MATCH/SET on individual nodes writes back all properties to L0, but
+/// after flush some nodes lose their overflow property values.
+///
+/// Steps:
+///   1. CREATE a schema label with typed properties (pagerank is NOT in schema)
+///   2. CREATE 8 nodes with schema properties
+///   3. SET pagerank on each node individually via MATCH/SET
+///   4. Verify pre-flush: all 8 nodes have pagerank (L0 read)
+///   5. flush()
+///   6. Verify post-flush: all 8 nodes retain pagerank (storage read)
+#[tokio::test]
+async fn test_set_overflow_property_persistence_after_flush() -> Result<()> {
+    let temp_dir = tempdir()?;
+    let path = temp_dir.path();
+    let db = Uni::open(path.to_str().unwrap()).build().await?;
+
+    // Create File label with 'name' in schema — pagerank is NOT in schema (overflow)
+    db.schema()
+        .label("File")
+        .property("name", uni_db::DataType::String)
+        .apply()
+        .await?;
+
+    // Create 8 File nodes and flush to Lance first
+    let count = 8;
+    let names: Vec<String> = (0..count).map(|i| format!("file_{i:03}.txt")).collect();
+    for name in &names {
+        db.execute(&format!("CREATE (:File {{name: '{name}'}})"))
+            .await?;
+    }
+
+    // First flush: nodes now in Lance storage (no overflow properties yet)
+    db.flush().await?;
+
+    // SET pagerank on each node individually (each is a separate MATCH/SET)
+    // This creates L0 entries that overlay the Lance data
+    for (i, name) in names.iter().enumerate() {
+        let rank = (i + 1) as f64 * 0.1;
+        db.execute(&format!(
+            "MATCH (f:File {{name: '{name}'}}) SET f.pagerank = {rank}"
+        ))
+        .await?;
+    }
+
+    // Pre-flush: verify all 8 nodes have pagerank via L0
+    let results = db
+        .query("MATCH (f:File) RETURN f.name, f.pagerank ORDER BY f.name")
+        .await?;
+    assert_eq!(
+        results.len(),
+        count,
+        "Pre-flush: should have {count} File nodes"
+    );
+    for row in results.rows() {
+        let name = row.get::<String>("f.name")?;
+        let pr = row
+            .value("f.pagerank")
+            .expect("pre-flush: pagerank column should exist");
+        assert_ne!(
+            pr,
+            &uni_db::Value::Null,
+            "Pre-flush: pagerank should not be null for {name}"
+        );
+    }
+
+    // Flush to storage
+    db.flush().await?;
+
+    // Post-flush: verify ALL nodes retain pagerank
+    let results = db
+        .query("MATCH (f:File) RETURN f.name, f.pagerank ORDER BY f.name")
+        .await?;
+    assert_eq!(
+        results.len(),
+        count,
+        "Post-flush: should have {count} File nodes"
+    );
+    let mut non_null_count = 0;
+    let mut null_names = Vec::new();
+    for row in results.rows() {
+        let name = row.get::<String>("f.name")?;
+        let pr = row
+            .value("f.pagerank")
+            .expect("post-flush: pagerank column should exist");
+        if pr != &uni_db::Value::Null {
+            non_null_count += 1;
+        } else {
+            null_names.push(name);
+        }
+    }
+    assert_eq!(
+        non_null_count, count,
+        "Post-flush: all {count} nodes should retain pagerank, but only {non_null_count}/{count} did. Nulls: {null_names:?}"
+    );
+
+    // Also verify via properties() function
+    let results = db
+        .query("MATCH (f:File) RETURN f.name, properties(f) AS props ORDER BY f.name")
+        .await?;
+    assert_eq!(results.len(), count);
+    for row in results.rows() {
+        let name = row.get::<String>("f.name")?;
+        let props_val = row.value("props").expect("props column should exist");
+        let props_json: serde_json::Value = props_val.clone().into();
+        let props_map = props_json.as_object().unwrap_or_else(|| {
+            panic!("properties() for {name} should be a map, got {props_json:?}")
+        });
+        assert!(
+            props_map.contains_key("pagerank"),
+            "Post-flush: properties({name}) should contain 'pagerank', got: {props_map:?}"
+        );
+    }
+
+    Ok(())
+}
+
+/// Test: SET overflow on all nodes in single MATCH, then flush.
+///
+/// Variant of the above test where SET is done with a single MATCH
+/// that hits all nodes at once, rather than individual MATCH/SET per node.
+#[tokio::test]
+async fn test_set_overflow_all_at_once_persistence_after_flush() -> Result<()> {
+    let temp_dir = tempdir()?;
+    let path = temp_dir.path();
+    let db = Uni::open(path.to_str().unwrap()).build().await?;
+
+    db.schema()
+        .label("Doc")
+        .property("title", uni_db::DataType::String)
+        .apply()
+        .await?;
+
+    let count = 10;
+    for i in 0..count {
+        db.execute(&format!("CREATE (:Doc {{title: 'doc_{i}'}})"))
+            .await?;
+    }
+    db.flush().await?;
+
+    // SET overflow property on ALL nodes at once (single MATCH)
+    db.execute("MATCH (d:Doc) SET d.score = 42.0").await?;
+
+    // Pre-flush check
+    let results = db.query("MATCH (d:Doc) RETURN d.score").await?;
+    assert_eq!(results.len(), count);
+    for row in results.rows() {
+        assert_ne!(
+            row.value("d.score").unwrap(),
+            &uni_db::Value::Null,
+            "Pre-flush: score should not be null"
+        );
+    }
+
+    db.flush().await?;
+
+    // Post-flush check
+    let results = db
+        .query("MATCH (d:Doc) RETURN d.title, d.score ORDER BY d.title")
+        .await?;
+    assert_eq!(results.len(), count);
+    let mut non_null = 0;
+    for row in results.rows() {
+        if row.value("d.score").unwrap() != &uni_db::Value::Null {
+            non_null += 1;
+        }
+    }
+    assert_eq!(
+        non_null, count,
+        "Post-flush: all {count} nodes should retain score, but only {non_null}/{count} did"
+    );
+
+    // Also check properties() includes overflow
+    let results = db
+        .query("MATCH (d:Doc) RETURN properties(d) AS props")
+        .await?;
+    assert_eq!(results.len(), count);
+    for row in results.rows() {
+        let props_val = row.value("props").expect("props column");
+        let props_json: serde_json::Value = props_val.clone().into();
+        let map = props_json.as_object().expect("should be map");
+        assert!(
+            map.contains_key("score"),
+            "properties() should contain 'score', got: {map:?}"
+        );
+    }
+
+    Ok(())
+}
+
 /// Test 7: Bulk Operations with Overflow Properties
 ///
 /// Performance test with larger dataset to ensure overflow_json

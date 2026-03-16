@@ -82,4 +82,5 @@ pub struct CompilerWarning {
 #[derive(Debug, Clone, PartialEq)]
 pub enum WarningCode {
     MsumNonNegativity,
+    ProbabilityDomainViolation,
 }

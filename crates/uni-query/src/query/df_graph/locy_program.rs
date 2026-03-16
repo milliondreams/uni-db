@@ -792,6 +792,8 @@ fn parse_fold_aggregate(expr: &Expr) -> DFResult<(FoldAggKind, String)> {
                 "COUNT" | "MCOUNT" => FoldAggKind::Count,
                 "AVG" => FoldAggKind::Avg,
                 "COLLECT" => FoldAggKind::Collect,
+                "MNOR" => FoldAggKind::Nor,
+                "MPROD" => FoldAggKind::Prod,
                 _ => {
                     return Err(datafusion::error::DataFusionError::Plan(format!(
                         "Unknown FOLD aggregate function: {}",

@@ -373,6 +373,68 @@ mod tests {
         }
     }
 
+    // ── MNOR probability domain warning ────────────────────────────────
+
+    #[test]
+    fn mnor_probability_domain_warning() {
+        let prog = parse_locy(
+            "CREATE RULE r AS MATCH (a)-[:E]->(b) YIELD a, b, 0 AS prob \
+             CREATE RULE r AS MATCH (a)-[:E]->(mid) WHERE mid IS r TO b \
+             FOLD prob = MNOR(a.weight) YIELD a, b, prob",
+        )
+        .unwrap();
+
+        let compiled = compile(&prog).unwrap();
+        assert!(
+            compiled
+                .warnings
+                .iter()
+                .any(|w| w.code == WarningCode::ProbabilityDomainViolation)
+        );
+    }
+
+    // ── MNOR + BEST BY → BestByWithMonotonicFold error ───────────────
+
+    #[test]
+    fn mnor_best_by_rejected() {
+        let prog = parse_locy(
+            "CREATE RULE r AS MATCH (a)-[:E]->(b) YIELD a, b, 0 AS prob \
+             CREATE RULE r AS MATCH (a)-[:E]->(mid) WHERE mid IS r TO b \
+             FOLD prob = MNOR(a.weight) BEST BY prob ASC YIELD a, b, prob",
+        )
+        .unwrap();
+
+        let result = compile(&prog);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            LocyCompileError::BestByWithMonotonicFold { rule, fold } => {
+                assert_eq!(rule, "r");
+                assert_eq!(fold.to_uppercase(), "MNOR");
+            }
+            e => panic!("expected BestByWithMonotonicFold, got {e:?}"),
+        }
+    }
+
+    // ── MPROD probability domain warning ─────────────────────────────
+
+    #[test]
+    fn mprod_probability_domain_warning() {
+        let prog = parse_locy(
+            "CREATE RULE r AS MATCH (a)-[:E]->(b) YIELD a, b, 1 AS prob \
+             CREATE RULE r AS MATCH (a)-[:E]->(mid) WHERE mid IS r TO b \
+             FOLD prob = MPROD(a.weight) YIELD a, b, prob",
+        )
+        .unwrap();
+
+        let compiled = compile(&prog).unwrap();
+        assert!(
+            compiled
+                .warnings
+                .iter()
+                .any(|w| w.code == WarningCode::ProbabilityDomainViolation)
+        );
+    }
+
     // ── Step 9: Undefined rule reference → UNDEFINED_RULE error ─────────
 
     #[test]

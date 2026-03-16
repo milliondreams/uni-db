@@ -95,3 +95,105 @@ Feature: Monotonic Aggregation (MSUM, MMAX, MMIN, MCOUNT)
       """
     Then evaluation should succeed
     And the derived relation 'trough' should have 1 facts
+
+  # ── MNOR / MPROD ────────────────────────────────────────────────────
+
+  Scenario: MNOR syntax parses
+    When parsing the following Locy program:
+      """
+      CREATE RULE prob AS
+        MATCH (a)-[r:CAUSES]->(b)
+        FOLD p = MNOR(r.probability)
+        YIELD KEY a, KEY b, p
+      """
+    Then the program should parse successfully
+
+  Scenario: MPROD syntax parses
+    When parsing the following Locy program:
+      """
+      CREATE RULE joint AS
+        MATCH (a)-[r:REQUIRES]->(b)
+        FOLD p = MPROD(r.probability)
+        YIELD KEY a, KEY b, p
+      """
+    Then the program should parse successfully
+
+  Scenario: MNOR in non-recursive rule compiles
+    When compiling the following Locy program:
+      """
+      CREATE RULE prob AS
+        MATCH (a)-[r:CAUSES]->(b)
+        FOLD p = MNOR(r.probability)
+        YIELD KEY a, p
+      """
+    Then the program should compile successfully
+
+  Scenario: MPROD in non-recursive rule compiles
+    When compiling the following Locy program:
+      """
+      CREATE RULE joint AS
+        MATCH (a)-[r:REQUIRES]->(b)
+        FOLD p = MPROD(r.probability)
+        YIELD KEY a, p
+      """
+    Then the program should compile successfully
+
+  Scenario: MNOR rejected with BEST BY
+    When compiling the following Locy program:
+      """
+      CREATE RULE r AS
+        MATCH (a)-[:E]->(b)
+        YIELD KEY a, KEY b, 0 AS p
+      CREATE RULE r AS
+        MATCH (a)-[:E]->(mid)
+        WHERE mid IS r TO b
+        FOLD p = MNOR(a.weight) BEST BY p ASC
+        YIELD KEY a, KEY b, p
+      """
+    Then the program should fail to compile
+
+  Scenario: MPROD rejected with BEST BY
+    When compiling the following Locy program:
+      """
+      CREATE RULE r AS
+        MATCH (a)-[:E]->(b)
+        YIELD KEY a, KEY b, 1 AS p
+      CREATE RULE r AS
+        MATCH (a)-[:E]->(mid)
+        WHERE mid IS r TO b
+        FOLD p = MPROD(a.weight) BEST BY p ASC
+        YIELD KEY a, KEY b, p
+      """
+    Then the program should fail to compile
+
+  Scenario: MNOR converges with correct noisy-OR
+    Given having executed:
+      """
+      CREATE (a:Node {name: 'A'})-[:CAUSE {prob: 0.3}]->(b:Node {name: 'B'}),
+             (a)-[:CAUSE {prob: 0.5}]->(b)
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE risk AS
+        MATCH (a:Node)-[e:CAUSE]->(b:Node)
+        FOLD p = MNOR(e.prob)
+        YIELD KEY a, KEY b, p
+      """
+    Then evaluation should succeed
+    And the derived relation 'risk' should have 1 facts
+
+  Scenario: MPROD converges with correct product
+    Given having executed:
+      """
+      CREATE (a:Node {name: 'A'})-[:REQ {prob: 0.6}]->(b:Node {name: 'B'}),
+             (a)-[:REQ {prob: 0.8}]->(b)
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE joint AS
+        MATCH (a:Node)-[e:REQ]->(b:Node)
+        FOLD p = MPROD(e.prob)
+        YIELD KEY a, KEY b, p
+      """
+    Then evaluation should succeed
+    And the derived relation 'joint' should have 1 facts

@@ -160,10 +160,14 @@ impl MonotonicAggState {
                             self.accumulators
                                 .entry(map_key)
                                 .or_insert(match binding.kind {
-                                    FoldAggKind::Sum | FoldAggKind::Count | FoldAggKind::Avg => 0.0,
+                                    FoldAggKind::Sum
+                                    | FoldAggKind::Count
+                                    | FoldAggKind::Avg
+                                    | FoldAggKind::Nor => 0.0,
                                     FoldAggKind::Max => f64::NEG_INFINITY,
                                     FoldAggKind::Min => f64::INFINITY,
                                     FoldAggKind::Collect => 0.0,
+                                    FoldAggKind::Prod => 1.0,
                                 });
                         let old = *entry;
                         match binding.kind {
@@ -177,6 +181,14 @@ impl MonotonicAggState {
                                 if val < *entry {
                                     *entry = val;
                                 }
+                            }
+                            FoldAggKind::Nor => {
+                                let p = val.clamp(0.0, 1.0);
+                                *entry = 1.0 - (1.0 - *entry) * (1.0 - p);
+                            }
+                            FoldAggKind::Prod => {
+                                let p = val.clamp(0.0, 1.0);
+                                *entry *= p;
                             }
                             _ => {}
                         }

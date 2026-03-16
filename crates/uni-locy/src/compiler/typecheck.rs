@@ -47,6 +47,7 @@ pub fn check(
             if is_recursive {
                 check_non_monotonic_in_recursion(rule_name, def)?;
                 check_msum_warning(rule_name, def, &mut warnings);
+                check_probability_domain_warning(rule_name, def, &mut warnings);
             }
 
             check_best_by_monotonic_fold(rule_name, def)?;
@@ -301,6 +302,37 @@ fn check_msum_warning(rule_name: &str, def: &RuleDefinition, warnings: &mut Vec<
     }
 }
 
+// ─── MNOR/MPROD probability domain warning ───────────────────────────────────
+
+fn check_probability_domain_warning(
+    rule_name: &str,
+    def: &RuleDefinition,
+    warnings: &mut Vec<CompilerWarning>,
+) {
+    for fold in &def.fold {
+        if let Some(func_name) = extract_function_name(&fold.aggregate)
+            && matches!(func_name.to_uppercase().as_str(), "MNOR" | "MPROD")
+            && let Expr::FunctionCall { args, .. } = &fold.aggregate
+        {
+            let is_literal = args
+                .first()
+                .is_some_and(|arg| matches!(arg, Expr::Literal(_)));
+            if !is_literal {
+                warnings.push(CompilerWarning {
+                    code: WarningCode::ProbabilityDomainViolation,
+                    message: format!(
+                        "{} argument in fold '{}' may be outside [0,1]; \
+                         ensure values are valid probabilities for convergence",
+                        func_name.to_uppercase(),
+                        fold.name
+                    ),
+                    rule_name: rule_name.to_string(),
+                });
+            }
+        }
+    }
+}
+
 // ─── BEST BY + monotonic fold ────────────────────────────────────────────────
 
 fn check_best_by_monotonic_fold(
@@ -313,7 +345,10 @@ fn check_best_by_monotonic_fold(
     for fold in &def.fold {
         if let Some(func_name) = extract_function_name(&fold.aggregate) {
             let upper = func_name.to_uppercase();
-            if matches!(upper.as_str(), "MSUM" | "MMAX" | "MMIN" | "MCOUNT") {
+            if matches!(
+                upper.as_str(),
+                "MSUM" | "MMAX" | "MMIN" | "MCOUNT" | "MNOR" | "MPROD"
+            ) {
                 return Err(LocyCompileError::BestByWithMonotonicFold {
                     rule: rule_name.to_string(),
                     fold: func_name,

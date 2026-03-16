@@ -4578,6 +4578,8 @@ fn resolve_fold_bindings(
                         "MIN" | "MMIN" => super::df_graph::locy_fold::FoldAggKind::Min,
                         "AVG" => super::df_graph::locy_fold::FoldAggKind::Avg,
                         "COLLECT" => super::df_graph::locy_fold::FoldAggKind::Collect,
+                        "MNOR" => super::df_graph::locy_fold::FoldAggKind::Nor,
+                        "MPROD" => super::df_graph::locy_fold::FoldAggKind::Prod,
                         other => {
                             return Err(anyhow::anyhow!(
                                 "Unsupported FOLD aggregate function: {}",

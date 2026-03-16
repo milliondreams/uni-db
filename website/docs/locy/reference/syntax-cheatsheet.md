@@ -7,7 +7,7 @@ CREATE RULE name [PRIORITY n] AS
 MATCH ...
 [WHERE ...]
 [ALONG x = expr]
-[FOLD agg = SUM(expr)]
+[FOLD agg = SUM|MAX|MIN|COUNT|AVG|MNOR|MPROD(expr)]
 [BEST BY expr ASC|DESC]
 YIELD KEY a, ...
 ```

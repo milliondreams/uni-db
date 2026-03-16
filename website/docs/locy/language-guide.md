@@ -47,6 +47,25 @@ YIELD KEY a, KEY b, PROB similar_to(b.embedding, a.embedding)
 
 `similar_to()` supports metric-aware vector scoring (Cosine, L2, Dot Product), FTS scoring, and multi-source hybrid fusion. See the [Vector Search guide](../guides/vector-search.md#similar_to-expression-function) for full documentation.
 
+### Probabilistic Aggregation with MNOR and MPROD
+
+```cypher
+-- Noisy-OR: probability that at least one cause fires
+CREATE RULE failure_risk AS
+MATCH (c:Component)-[:HAS_SIGNAL]->(s:QualitySignal)
+FOLD risk = MNOR(1.0 - s.pass_rate)
+YIELD KEY c, risk
+
+-- Product: joint probability that all conditions hold
+CREATE RULE vendor_reliability AS
+MATCH (v:Vendor)-[:SUPPLIES]->(c:Component)
+WHERE c IS failure_risk
+FOLD reliability = MPROD(1.0 - failure_risk.risk)
+YIELD KEY v, reliability
+```
+
+See [Probabilistic Logic](advanced/probabilistic-logic.md) for full documentation of MNOR and MPROD.
+
 !!! note "Rule vs command expressions"
     In rule bodies (`WHERE`, `YIELD`, `ALONG`, `FOLD`), `similar_to()` runs inside DataFusion with full capability — metric-aware vector scoring, auto-embedding, FTS, and multi-source fusion. In command WHERE clauses (`DERIVE ... WHERE`, `ABDUCE ... WHERE`), only basic vector similarity (cosine) is available because commands execute on materialized rows after strata converge without schema context.
 

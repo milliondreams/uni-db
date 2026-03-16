@@ -26,6 +26,19 @@ YIELD KEY a, total
 
 For recursion, monotonic variants are used where required.
 
+### Monotonic Probabilistic Folds
+
+For probability domains, use `MNOR` (noisy-OR) and `MPROD` (product) instead of `MSUM`/`MMAX`:
+
+```cypher
+CREATE RULE failure_risk AS
+MATCH (c:Component)-[:HAS_SIGNAL]->(s:QualitySignal)
+FOLD risk = MNOR(1.0 - s.pass_rate)
+YIELD KEY c, risk
+```
+
+See [Probabilistic Logic](probabilistic-logic.md) for full documentation.
+
 ## BEST BY (Witness Selection)
 
 `BEST BY` picks the best candidate row by ordering expression.

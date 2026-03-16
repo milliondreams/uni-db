@@ -220,6 +220,12 @@ impl MonotonicAggState {
         }
         true
     }
+
+    /// Test-only accessor for accumulator values.
+    #[cfg(test)]
+    pub(crate) fn get_accumulator(&self, key: &(Vec<ScalarKey>, String)) -> Option<f64> {
+        self.accumulators.get(key).copied()
+    }
 }
 
 /// Extract f64 value from an Arrow column at a given row index.
@@ -1918,5 +1924,173 @@ mod tests {
         assert_eq!(batches.len(), 2);
         assert_eq!(batches[0].num_rows(), 1);
         assert_eq!(batches[1].num_rows(), 1);
+    }
+
+    // ── MonotonicAggState MNOR/MPROD tests ──────────────────────────────
+
+    fn make_f64_batch(names: &[&str], values: &[f64]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("value", DataType::Float64, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(
+                    names.iter().map(|s| Some(*s)).collect::<Vec<_>>(),
+                )),
+                Arc::new(Float64Array::from(values.to_vec())),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn make_nor_binding() -> Vec<MonotonicFoldBinding> {
+        use crate::query::df_graph::locy_fold::FoldAggKind;
+        vec![MonotonicFoldBinding {
+            fold_name: "prob".into(),
+            kind: FoldAggKind::Nor,
+            input_col_index: 1,
+        }]
+    }
+
+    fn make_prod_binding() -> Vec<MonotonicFoldBinding> {
+        use crate::query::df_graph::locy_fold::FoldAggKind;
+        vec![MonotonicFoldBinding {
+            fold_name: "prob".into(),
+            kind: FoldAggKind::Prod,
+            input_col_index: 1,
+        }]
+    }
+
+    fn acc_key(name: &str) -> (Vec<ScalarKey>, String) {
+        (vec![ScalarKey::Utf8(name.to_string())], "prob".to_string())
+    }
+
+    #[test]
+    fn test_monotonic_nor_first_update() {
+        let mut agg = MonotonicAggState::new(make_nor_binding());
+        let batch = make_f64_batch(&["a"], &[0.3]);
+        let changed = agg.update(&[0], &[batch]);
+        assert!(changed);
+        let val = agg.get_accumulator(&acc_key("a")).unwrap();
+        assert!((val - 0.3).abs() < 1e-10, "expected 0.3, got {}", val);
+    }
+
+    #[test]
+    fn test_monotonic_nor_two_updates() {
+        // Incremental NOR: acc = 1-(1-0.3)(1-0.5) = 0.65
+        let mut agg = MonotonicAggState::new(make_nor_binding());
+        let batch1 = make_f64_batch(&["a"], &[0.3]);
+        agg.update(&[0], &[batch1]);
+        let batch2 = make_f64_batch(&["a"], &[0.5]);
+        agg.update(&[0], &[batch2]);
+        let val = agg.get_accumulator(&acc_key("a")).unwrap();
+        assert!((val - 0.65).abs() < 1e-10, "expected 0.65, got {}", val);
+    }
+
+    #[test]
+    fn test_monotonic_prod_first_update() {
+        let mut agg = MonotonicAggState::new(make_prod_binding());
+        let batch = make_f64_batch(&["a"], &[0.6]);
+        let changed = agg.update(&[0], &[batch]);
+        assert!(changed);
+        let val = agg.get_accumulator(&acc_key("a")).unwrap();
+        assert!((val - 0.6).abs() < 1e-10, "expected 0.6, got {}", val);
+    }
+
+    #[test]
+    fn test_monotonic_prod_two_updates() {
+        // Incremental PROD: acc = 0.6 * 0.8 = 0.48
+        let mut agg = MonotonicAggState::new(make_prod_binding());
+        let batch1 = make_f64_batch(&["a"], &[0.6]);
+        agg.update(&[0], &[batch1]);
+        let batch2 = make_f64_batch(&["a"], &[0.8]);
+        agg.update(&[0], &[batch2]);
+        let val = agg.get_accumulator(&acc_key("a")).unwrap();
+        assert!((val - 0.48).abs() < 1e-10, "expected 0.48, got {}", val);
+    }
+
+    #[test]
+    fn test_monotonic_nor_stability() {
+        let mut agg = MonotonicAggState::new(make_nor_binding());
+        let batch = make_f64_batch(&["a"], &[0.3]);
+        agg.update(&[0], &[batch]);
+        agg.snapshot();
+        let changed = agg.update(&[0], &[]);
+        assert!(!changed);
+        assert!(agg.is_stable());
+    }
+
+    #[test]
+    fn test_monotonic_prod_stability() {
+        let mut agg = MonotonicAggState::new(make_prod_binding());
+        let batch = make_f64_batch(&["a"], &[0.6]);
+        agg.update(&[0], &[batch]);
+        agg.snapshot();
+        let changed = agg.update(&[0], &[]);
+        assert!(!changed);
+        assert!(agg.is_stable());
+    }
+
+    #[test]
+    fn test_monotonic_nor_multi_group() {
+        // (a,0.3),(b,0.5) then (a,0.5),(b,0.2) → a=0.65, b=0.6
+        let mut agg = MonotonicAggState::new(make_nor_binding());
+        let batch1 = make_f64_batch(&["a", "b"], &[0.3, 0.5]);
+        agg.update(&[0], &[batch1]);
+        let batch2 = make_f64_batch(&["a", "b"], &[0.5, 0.2]);
+        agg.update(&[0], &[batch2]);
+
+        let val_a = agg.get_accumulator(&acc_key("a")).unwrap();
+        let val_b = agg.get_accumulator(&acc_key("b")).unwrap();
+        assert!(
+            (val_a - 0.65).abs() < 1e-10,
+            "expected a=0.65, got {}",
+            val_a
+        );
+        assert!((val_b - 0.6).abs() < 1e-10, "expected b=0.6, got {}", val_b);
+    }
+
+    #[test]
+    fn test_monotonic_prod_zero_absorbing() {
+        // Zero absorbs: once 0.0, all further updates stay 0.0
+        let mut agg = MonotonicAggState::new(make_prod_binding());
+        let batch1 = make_f64_batch(&["a"], &[0.5]);
+        agg.update(&[0], &[batch1]);
+        let batch2 = make_f64_batch(&["a"], &[0.0]);
+        agg.update(&[0], &[batch2]);
+
+        let val = agg.get_accumulator(&acc_key("a")).unwrap();
+        assert!((val - 0.0).abs() < 1e-10, "expected 0.0, got {}", val);
+
+        // Further updates don't change the absorbing zero
+        agg.snapshot();
+        let batch3 = make_f64_batch(&["a"], &[0.5]);
+        let changed = agg.update(&[0], &[batch3]);
+        assert!(!changed);
+        assert!(agg.is_stable());
+    }
+
+    #[test]
+    fn test_monotonic_nor_clamping() {
+        // 1.5 clamped to 1.0: acc = 1-(1-0)(1-1) = 1.0
+        let mut agg = MonotonicAggState::new(make_nor_binding());
+        let batch = make_f64_batch(&["a"], &[1.5]);
+        agg.update(&[0], &[batch]);
+        let val = agg.get_accumulator(&acc_key("a")).unwrap();
+        assert!((val - 1.0).abs() < 1e-10, "expected 1.0, got {}", val);
+    }
+
+    #[test]
+    fn test_monotonic_nor_absorbing() {
+        // p=1.0 absorbs: 0.3 then 1.0 → 1.0
+        let mut agg = MonotonicAggState::new(make_nor_binding());
+        let batch1 = make_f64_batch(&["a"], &[0.3]);
+        agg.update(&[0], &[batch1]);
+        let batch2 = make_f64_batch(&["a"], &[1.0]);
+        agg.update(&[0], &[batch2]);
+        let val = agg.get_accumulator(&acc_key("a")).unwrap();
+        assert!((val - 1.0).abs() < 1e-10, "expected 1.0, got {}", val);
     }
 }

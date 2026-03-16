@@ -42,6 +42,7 @@ fn parse_gherkin_value(s: &str) -> Value {
 /// Flexible value comparison (int/float cross-compare, etc.)
 fn values_match(actual: &Value, expected: &Value) -> bool {
     match (actual, expected) {
+        (Value::Float(a), Value::Float(b)) => (a - b).abs() < 1e-9,
         (Value::Int(a), Value::Float(b)) => (*a as f64 - b).abs() < 1e-9,
         (Value::Float(a), Value::Int(b)) => (a - *b as f64).abs() < 1e-9,
         _ => actual == expected,

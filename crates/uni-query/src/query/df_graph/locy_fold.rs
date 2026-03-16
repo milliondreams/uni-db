@@ -1154,4 +1154,606 @@ mod tests {
             expected
         );
     }
+
+    // ── MNOR/MPROD mathematical correctness tests ───────────────────────
+
+    fn make_nullable_test_batch(names: Vec<&str>, values: Vec<Option<f64>>) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("value", DataType::Float64, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(
+                    names.into_iter().map(Some).collect::<Vec<_>>(),
+                )),
+                Arc::new(Float64Array::from(values)),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_nor_single_element() {
+        // MNOR({0.7}) = 0.7 (n=1 identity)
+        let batch = make_test_batch(vec!["a"], vec![0.7]);
+        let input = make_memory_exec(batch);
+        let result = execute_fold(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "prob".to_string(),
+                kind: FoldAggKind::Nor,
+                input_col_index: 1,
+            }],
+        )
+        .await;
+        let vals = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!((vals.value(0) - 0.7).abs() < 1e-10);
+    }
+
+    #[tokio::test]
+    async fn test_prod_single_element() {
+        // MPROD({0.7}) = 0.7 (n=1 identity)
+        let batch = make_test_batch(vec!["a"], vec![0.7]);
+        let input = make_memory_exec(batch);
+        let result = execute_fold(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "prob".to_string(),
+                kind: FoldAggKind::Prod,
+                input_col_index: 1,
+            }],
+        )
+        .await;
+        let vals = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!((vals.value(0) - 0.7).abs() < 1e-10);
+    }
+
+    #[tokio::test]
+    async fn test_nor_three_elements() {
+        // MNOR({0.3, 0.4, 0.5}) = 1 - (0.7)(0.6)(0.5) = 0.79
+        let batch = make_test_batch(vec!["a", "a", "a"], vec![0.3, 0.4, 0.5]);
+        let input = make_memory_exec(batch);
+        let result = execute_fold(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "prob".to_string(),
+                kind: FoldAggKind::Nor,
+                input_col_index: 1,
+            }],
+        )
+        .await;
+        let vals = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!((vals.value(0) - 0.79).abs() < 1e-10);
+    }
+
+    #[tokio::test]
+    async fn test_nor_four_elements_spec_example() {
+        // Spec §4.5: MNOR({0.72, 0.54, 0.56, 0.42}) = 1 - (0.28)(0.46)(0.44)(0.58) = 0.96713024
+        let batch = make_test_batch(vec!["a", "a", "a", "a"], vec![0.72, 0.54, 0.56, 0.42]);
+        let input = make_memory_exec(batch);
+        let result = execute_fold(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "prob".to_string(),
+                kind: FoldAggKind::Nor,
+                input_col_index: 1,
+            }],
+        )
+        .await;
+        let vals = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!(
+            (vals.value(0) - 0.96713024).abs() < 1e-10,
+            "expected 0.96713024, got {}",
+            vals.value(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prod_three_elements() {
+        // MPROD({0.5, 0.5, 0.5}) = 0.125
+        let batch = make_test_batch(vec!["a", "a", "a"], vec![0.5, 0.5, 0.5]);
+        let input = make_memory_exec(batch);
+        let result = execute_fold(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "prob".to_string(),
+                kind: FoldAggKind::Prod,
+                input_col_index: 1,
+            }],
+        )
+        .await;
+        let vals = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!((vals.value(0) - 0.125).abs() < 1e-10);
+    }
+
+    #[tokio::test]
+    async fn test_nor_absorbing_element() {
+        // p=1.0 absorbs: MNOR({0.3, 1.0}) = 1.0
+        let batch = make_test_batch(vec!["a", "a"], vec![0.3, 1.0]);
+        let input = make_memory_exec(batch);
+        let result = execute_fold(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "prob".to_string(),
+                kind: FoldAggKind::Nor,
+                input_col_index: 1,
+            }],
+        )
+        .await;
+        let vals = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!((vals.value(0) - 1.0).abs() < 1e-10);
+    }
+
+    #[tokio::test]
+    async fn test_prod_clamping() {
+        // Out-of-range 2.0 clamped to 1.0: MPROD({2.0, 0.5}) = 1.0 * 0.5 = 0.5
+        let batch = make_test_batch(vec!["a", "a"], vec![2.0, 0.5]);
+        let input = make_memory_exec(batch);
+        let result = execute_fold(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "prob".to_string(),
+                kind: FoldAggKind::Prod,
+                input_col_index: 1,
+            }],
+        )
+        .await;
+        let vals = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!((vals.value(0) - 0.5).abs() < 1e-10);
+    }
+
+    #[tokio::test]
+    async fn test_prod_multiple_groups() {
+        // a: MPROD({0.6, 0.8}) = 0.48, b: MPROD({0.5, 0.5}) = 0.25
+        let batch = make_test_batch(vec!["a", "a", "b", "b"], vec![0.6, 0.8, 0.5, 0.5]);
+        let input = make_memory_exec(batch);
+        let result = execute_fold(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "prob".to_string(),
+                kind: FoldAggKind::Prod,
+                input_col_index: 1,
+            }],
+        )
+        .await;
+
+        assert_eq!(result.num_rows(), 2);
+        let names = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let vals = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        for i in 0..2 {
+            match names.value(i) {
+                "a" => assert!((vals.value(i) - 0.48).abs() < 1e-10),
+                "b" => assert!((vals.value(i) - 0.25).abs() < 1e-10),
+                _ => panic!("unexpected group name"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_nor_commutativity() {
+        // Order independence: MNOR({0.2, 0.5, 0.8}) = MNOR({0.8, 0.5, 0.2}) = 0.92
+        let fwd = make_test_batch(vec!["a", "a", "a"], vec![0.2, 0.5, 0.8]);
+        let rev = make_test_batch(vec!["a", "a", "a"], vec![0.8, 0.5, 0.2]);
+        let binding = vec![FoldBinding {
+            output_name: "prob".to_string(),
+            kind: FoldAggKind::Nor,
+            input_col_index: 1,
+        }];
+        let r1 = execute_fold(make_memory_exec(fwd), vec![0], binding.clone()).await;
+        let r2 = execute_fold(make_memory_exec(rev), vec![0], binding).await;
+        let v1 = r1
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+            .value(0);
+        let v2 = r2
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+            .value(0);
+        assert!((v1 - 0.92).abs() < 1e-10);
+        assert!((v2 - 0.92).abs() < 1e-10);
+        assert!((v1 - v2).abs() < 1e-15, "commutativity violated");
+    }
+
+    #[tokio::test]
+    async fn test_prod_commutativity() {
+        // Order independence: MPROD({0.5, 0.25}) = MPROD({0.25, 0.5}) = 0.125
+        let fwd = make_test_batch(vec!["a", "a"], vec![0.5, 0.25]);
+        let rev = make_test_batch(vec!["a", "a"], vec![0.25, 0.5]);
+        let binding = vec![FoldBinding {
+            output_name: "prob".to_string(),
+            kind: FoldAggKind::Prod,
+            input_col_index: 1,
+        }];
+        let r1 = execute_fold(make_memory_exec(fwd), vec![0], binding.clone()).await;
+        let r2 = execute_fold(make_memory_exec(rev), vec![0], binding).await;
+        let v1 = r1
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+            .value(0);
+        let v2 = r2
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+            .value(0);
+        assert!((v1 - 0.125).abs() < 1e-10);
+        assert!((v2 - 0.125).abs() < 1e-10);
+        assert!((v1 - v2).abs() < 1e-15, "commutativity violated");
+    }
+
+    #[tokio::test]
+    async fn test_nor_boundary_near_zero() {
+        // Precision near 0: MNOR({0.001, 0.002}) = 1 - (0.999)(0.998) = 0.002998
+        let batch = make_test_batch(vec!["a", "a"], vec![0.001, 0.002]);
+        let input = make_memory_exec(batch);
+        let result = execute_fold(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "prob".to_string(),
+                kind: FoldAggKind::Nor,
+                input_col_index: 1,
+            }],
+        )
+        .await;
+        let vals = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let expected = 1.0 - 0.999 * 0.998;
+        assert!(
+            (vals.value(0) - expected).abs() < 1e-10,
+            "expected {}, got {}",
+            expected,
+            vals.value(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_nor_boundary_near_one() {
+        // Precision near 1: MNOR({0.999, 0.998}) = 1 - (0.001)(0.002) = 0.999998
+        let batch = make_test_batch(vec!["a", "a"], vec![0.999, 0.998]);
+        let input = make_memory_exec(batch);
+        let result = execute_fold(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "prob".to_string(),
+                kind: FoldAggKind::Nor,
+                input_col_index: 1,
+            }],
+        )
+        .await;
+        let vals = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let expected = 1.0 - 0.001 * 0.002;
+        assert!(
+            (vals.value(0) - expected).abs() < 1e-10,
+            "expected {}, got {}",
+            expected,
+            vals.value(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prod_boundary_near_zero() {
+        // Precision near 0: MPROD({0.001, 0.002}) = 2e-6
+        let batch = make_test_batch(vec!["a", "a"], vec![0.001, 0.002]);
+        let input = make_memory_exec(batch);
+        let result = execute_fold(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "prob".to_string(),
+                kind: FoldAggKind::Prod,
+                input_col_index: 1,
+            }],
+        )
+        .await;
+        let vals = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!(
+            (vals.value(0) - 2e-6).abs() < 1e-15,
+            "expected 2e-6, got {}",
+            vals.value(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_nor_empty_input() {
+        // Empty input → 0 rows output
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("value", DataType::Float64, true),
+        ]));
+        let batch = RecordBatch::new_empty(schema);
+        let input = make_memory_exec(batch);
+        let result = execute_fold(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "prob".to_string(),
+                kind: FoldAggKind::Nor,
+                input_col_index: 1,
+            }],
+        )
+        .await;
+        assert_eq!(result.num_rows(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_nor_nan_handling() {
+        // NaN propagates through noisy-OR
+        let batch = make_test_batch(vec!["a", "a"], vec![0.3, f64::NAN]);
+        let input = make_memory_exec(batch);
+        let result = execute_fold(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "prob".to_string(),
+                kind: FoldAggKind::Nor,
+                input_col_index: 1,
+            }],
+        )
+        .await;
+        let vals = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!(vals.value(0).is_nan(), "NaN should propagate through MNOR");
+    }
+
+    #[tokio::test]
+    async fn test_prod_nan_handling() {
+        // NaN propagates through product
+        let batch = make_test_batch(vec!["a", "a"], vec![0.5, f64::NAN]);
+        let input = make_memory_exec(batch);
+        let result = execute_fold(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "prob".to_string(),
+                kind: FoldAggKind::Prod,
+                input_col_index: 1,
+            }],
+        )
+        .await;
+        let vals = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!(vals.value(0).is_nan(), "NaN should propagate through MPROD");
+    }
+
+    #[tokio::test]
+    async fn test_prod_infinity_handling() {
+        // +∞ clamped to 1.0: MPROD({0.5, ∞}) = 0.5 * 1.0 = 0.5
+        let batch = make_test_batch(vec!["a", "a"], vec![0.5, f64::INFINITY]);
+        let input = make_memory_exec(batch);
+        let result = execute_fold(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "prob".to_string(),
+                kind: FoldAggKind::Prod,
+                input_col_index: 1,
+            }],
+        )
+        .await;
+        let vals = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!((vals.value(0) - 0.5).abs() < 1e-10);
+    }
+
+    #[tokio::test]
+    async fn test_nor_infinity_handling() {
+        // +∞ clamped to 1.0, which absorbs: MNOR({0.3, ∞}) = 1.0
+        let batch = make_test_batch(vec!["a", "a"], vec![0.3, f64::INFINITY]);
+        let input = make_memory_exec(batch);
+        let result = execute_fold(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "prob".to_string(),
+                kind: FoldAggKind::Nor,
+                input_col_index: 1,
+            }],
+        )
+        .await;
+        let vals = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!((vals.value(0) - 1.0).abs() < 1e-10);
+    }
+
+    #[tokio::test]
+    async fn test_nor_all_null_values() {
+        // All-null input → null output
+        let batch = make_nullable_test_batch(vec!["a", "a"], vec![None, None]);
+        let input = make_memory_exec(batch);
+        let result = execute_fold(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "prob".to_string(),
+                kind: FoldAggKind::Nor,
+                input_col_index: 1,
+            }],
+        )
+        .await;
+        assert_eq!(result.num_rows(), 1);
+        let vals = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!(vals.is_null(0), "all-null MNOR should produce null");
+    }
+
+    #[tokio::test]
+    async fn test_prod_all_null_values() {
+        // All-null input → null output
+        let batch = make_nullable_test_batch(vec!["a", "a"], vec![None, None]);
+        let input = make_memory_exec(batch);
+        let result = execute_fold(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "prob".to_string(),
+                kind: FoldAggKind::Prod,
+                input_col_index: 1,
+            }],
+        )
+        .await;
+        assert_eq!(result.num_rows(), 1);
+        let vals = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!(vals.is_null(0), "all-null MPROD should produce null");
+    }
+
+    #[tokio::test]
+    async fn test_nor_mixed_null_values() {
+        // Nulls skipped: MNOR({0.3, null, 0.5}) = 1 - (0.7)(0.5) = 0.65
+        let batch = make_nullable_test_batch(vec!["a", "a", "a"], vec![Some(0.3), None, Some(0.5)]);
+        let input = make_memory_exec(batch);
+        let result = execute_fold(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "prob".to_string(),
+                kind: FoldAggKind::Nor,
+                input_col_index: 1,
+            }],
+        )
+        .await;
+        let vals = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!((vals.value(0) - 0.65).abs() < 1e-10);
+    }
+
+    #[tokio::test]
+    async fn test_prod_mixed_null_values() {
+        // Nulls skipped: MPROD({0.6, null, 0.8}) = 0.6 * 0.8 = 0.48
+        let batch = make_nullable_test_batch(vec!["a", "a", "a"], vec![Some(0.6), None, Some(0.8)]);
+        let input = make_memory_exec(batch);
+        let result = execute_fold(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "prob".to_string(),
+                kind: FoldAggKind::Prod,
+                input_col_index: 1,
+            }],
+        )
+        .await;
+        let vals = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!((vals.value(0) - 0.48).abs() < 1e-10);
+    }
+
+    #[tokio::test]
+    async fn test_nor_many_small_values() {
+        // Large accumulation: 20 × 0.1 → 1 - 0.9^20 ≈ 0.8784
+        let names: Vec<&str> = vec!["a"; 20];
+        let values: Vec<f64> = vec![0.1; 20];
+        let batch = make_test_batch(names, values);
+        let input = make_memory_exec(batch);
+        let result = execute_fold(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "prob".to_string(),
+                kind: FoldAggKind::Nor,
+                input_col_index: 1,
+            }],
+        )
+        .await;
+        let vals = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let expected = 1.0 - 0.9_f64.powi(20);
+        assert!(
+            (vals.value(0) - expected).abs() < 1e-10,
+            "expected {}, got {}",
+            expected,
+            vals.value(0)
+        );
+    }
 }

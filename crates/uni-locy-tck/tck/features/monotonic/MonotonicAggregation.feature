@@ -197,3 +197,168 @@ Feature: Monotonic Aggregation (MSUM, MMAX, MMIN, MCOUNT)
       """
     Then evaluation should succeed
     And the derived relation 'joint' should have 1 facts
+
+  # ── MNOR / MPROD Value Assertions ─────────────────────────────────────
+
+  Scenario: MNOR produces correct noisy-OR value
+    Given having executed:
+      """
+      CREATE (a:Node {name: 'A'})-[:CAUSE {prob: 0.3}]->(b:Node {name: 'B'}),
+             (a)-[:CAUSE {prob: 0.5}]->(b)
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE risk AS
+        MATCH (a:Node)-[e:CAUSE]->(b:Node)
+        FOLD p = MNOR(e.prob)
+        YIELD KEY a, KEY b, p
+      """
+    Then evaluation should succeed
+    And the derived relation 'risk' should contain a fact where p = 0.65
+
+  Scenario: MPROD produces correct product value
+    Given having executed:
+      """
+      CREATE (a:Node {name: 'A'})-[:REQ {prob: 0.6}]->(b:Node {name: 'B'}),
+             (a)-[:REQ {prob: 0.8}]->(b)
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE joint AS
+        MATCH (a:Node)-[e:REQ]->(b:Node)
+        FOLD p = MPROD(e.prob)
+        YIELD KEY a, KEY b, p
+      """
+    Then evaluation should succeed
+    And the derived relation 'joint' should contain a fact where p = 0.48
+
+  Scenario: MNOR four causes matches spec example
+    Given having executed:
+      """
+      CREATE (a:Node {name: 'A'})-[:CAUSE {prob: 0.72}]->(b:Node {name: 'B'}),
+             (a)-[:CAUSE {prob: 0.54}]->(b),
+             (a)-[:CAUSE {prob: 0.56}]->(b),
+             (a)-[:CAUSE {prob: 0.42}]->(b)
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE risk AS
+        MATCH (a:Node)-[e:CAUSE]->(b:Node)
+        FOLD p = MNOR(e.prob)
+        YIELD KEY a, KEY b, p
+      """
+    Then evaluation should succeed
+    And the derived relation 'risk' should contain a fact where p = 0.96713024
+
+  Scenario: MNOR single cause unchanged
+    Given having executed:
+      """
+      CREATE (a:Node {name: 'A'})-[:CAUSE {prob: 0.7}]->(b:Node {name: 'B'})
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE risk AS
+        MATCH (a:Node)-[e:CAUSE]->(b:Node)
+        FOLD p = MNOR(e.prob)
+        YIELD KEY a, KEY b, p
+      """
+    Then evaluation should succeed
+    And the derived relation 'risk' should contain a fact where p = 0.7
+
+  Scenario: MPROD single requirement unchanged
+    Given having executed:
+      """
+      CREATE (a:Node {name: 'A'})-[:REQ {prob: 0.7}]->(b:Node {name: 'B'})
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE joint AS
+        MATCH (a:Node)-[e:REQ]->(b:Node)
+        FOLD p = MPROD(e.prob)
+        YIELD KEY a, KEY b, p
+      """
+    Then evaluation should succeed
+    And the derived relation 'joint' should contain a fact where p = 0.7
+
+  Scenario: MNOR with certainty yields one
+    Given having executed:
+      """
+      CREATE (a:Node {name: 'A'})-[:CAUSE {prob: 0.3}]->(b:Node {name: 'B'}),
+             (a)-[:CAUSE {prob: 1.0}]->(b)
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE risk AS
+        MATCH (a:Node)-[e:CAUSE]->(b:Node)
+        FOLD p = MNOR(e.prob)
+        YIELD KEY a, KEY b, p
+      """
+    Then evaluation should succeed
+    And the derived relation 'risk' should contain a fact where p = 1.0
+
+  Scenario: MPROD with zero yields zero
+    Given having executed:
+      """
+      CREATE (a:Node {name: 'A'})-[:REQ {prob: 0.5}]->(b:Node {name: 'B'}),
+             (a)-[:REQ {prob: 0.0}]->(b)
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE joint AS
+        MATCH (a:Node)-[e:REQ]->(b:Node)
+        FOLD p = MPROD(e.prob)
+        YIELD KEY a, KEY b, p
+      """
+    Then evaluation should succeed
+    And the derived relation 'joint' should contain a fact where p = 0.0
+
+  Scenario: MNOR with zeros yields zero
+    Given having executed:
+      """
+      CREATE (a:Node {name: 'A'})-[:CAUSE {prob: 0.0}]->(b:Node {name: 'B'}),
+             (a)-[:CAUSE {prob: 0.0}]->(b)
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE risk AS
+        MATCH (a:Node)-[e:CAUSE]->(b:Node)
+        FOLD p = MNOR(e.prob)
+        YIELD KEY a, KEY b, p
+      """
+    Then evaluation should succeed
+    And the derived relation 'risk' should contain a fact where p = 0.0
+
+  Scenario: MPROD with ones yields one
+    Given having executed:
+      """
+      CREATE (a:Node {name: 'A'})-[:REQ {prob: 1.0}]->(b:Node {name: 'B'}),
+             (a)-[:REQ {prob: 1.0}]->(b)
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE joint AS
+        MATCH (a:Node)-[e:REQ]->(b:Node)
+        FOLD p = MPROD(e.prob)
+        YIELD KEY a, KEY b, p
+      """
+    Then evaluation should succeed
+    And the derived relation 'joint' should contain a fact where p = 1.0
+
+  Scenario: MPROD groups independently
+    Given having executed:
+      """
+      CREATE (a:Node {name: 'A'})-[:REQ {prob: 0.5}]->(b:Node {name: 'B'}),
+             (a)-[:REQ {prob: 0.5}]->(b),
+             (c:Node {name: 'C'})-[:REQ {prob: 0.8}]->(b)
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE joint AS
+        MATCH (x:Node)-[e:REQ]->(y:Node)
+        FOLD p = MPROD(e.prob)
+        YIELD KEY x, KEY y, p
+      """
+    Then evaluation should succeed
+    And the derived relation 'joint' should have 2 facts
+    And the derived relation 'joint' should contain a fact where p = 0.25
+    And the derived relation 'joint' should contain a fact where p = 0.8

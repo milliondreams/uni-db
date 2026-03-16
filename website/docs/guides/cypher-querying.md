@@ -470,7 +470,7 @@ Uni provides a comprehensive set of scalar functions for data transformation.
 
 | Function | Description | Example |
 |----------|-------------|---------|
-| `similar_to(sources, queries [, options])` | Unified similarity scoring (vector cosine, BM25, or hybrid fusion). Returns `FLOAT [0,1]`. | `RETURN similar_to(n.embedding, $vec)` |
+| `similar_to(sources, queries [, options])` | Unified similarity scoring (vector similarity, BM25, or hybrid fusion). Metric-aware: uses the index's configured distance metric (Cosine, L2, or Dot). | `RETURN similar_to(n.embedding, $vec)` |
 | `vector_similarity(v1, v2)` | Cosine similarity between two vectors. Alias for `similar_to` with a single vector source. | `WHERE vector_similarity(a.embed, b.embed) > 0.8` |
 | `vector_distance(v1, v2 [, metric])` | Distance between two vectors. | `RETURN vector_distance(a.embed, b.embed, 'cosine')` |
 

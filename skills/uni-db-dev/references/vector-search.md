@@ -182,6 +182,71 @@ ORDER BY score DESC
 
 ---
 
+## similar_to() Expression Function
+
+Inline similarity scoring for already-bound nodes. Unlike `CALL` procedures that scan indexes for top-K results, `similar_to()` scores **one bound node** per row.
+
+### Syntax
+
+```cypher
+similar_to(sources, queries [, options]) → FLOAT [0, 1]
+```
+
+### Scoring Modes (auto-detected)
+
+| Source Property | Query Argument | Mode |
+|---|---|---|
+| Vector column | Vector literal/param | Vector-to-vector cosine |
+| Vector column | String literal | Auto-embed → cosine |
+| Text column (FTS-indexed) | String literal | BM25 full-text scoring |
+
+### Examples
+
+```cypher
+-- Vector-to-vector
+MATCH (d:Doc) RETURN d.title, similar_to(d.embedding, $vec) AS score
+
+-- Auto-embed
+MATCH (d:Doc) RETURN d.title, similar_to(d.embedding, 'graph databases') AS score
+
+-- FTS scoring
+MATCH (d:Doc) RETURN d.title, similar_to(d.content, 'distributed systems') AS score
+
+-- In WHERE clause
+MATCH (d:Doc) WHERE similar_to(d.embedding, $vec) > 0.8 RETURN d.title
+
+-- Multi-source fusion (RRF)
+MATCH (d:Doc)
+RETURN d.title, similar_to([d.embedding, d.content], [$vec, 'search term']) AS score
+
+-- Weighted fusion
+MATCH (d:Doc)
+RETURN d.title, similar_to(
+  [d.embedding, d.content], [$vec, 'query'],
+  {method: 'weighted', weights: [0.7, 0.3]}
+) AS score
+```
+
+### Options Map
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `method` | `"rrf"` | Fusion method: `"rrf"` or `"weighted"` |
+| `weights` | equal | Per-source weights (for `"weighted"` method) |
+| `k` | 60 | RRF ranking parameter |
+| `fts_k` | 1000 | Max FTS candidates |
+
+### Comparison with Procedures
+
+| | `CALL uni.search(...)` | `similar_to()` |
+|---|---|---|
+| Operation | Scan index, return top-K | Score one bound node |
+| Use in WHERE | No | Yes |
+| Use in Locy rules | No | Yes |
+| Best for | "Find top 10 from millions" | "Score this matched node" |
+
+---
+
 ## Schema Procedures
 
 ### List Labels

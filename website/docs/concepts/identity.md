@@ -128,7 +128,7 @@ assert_eq!(eid.local_offset(), 21);
 
 ## UniId
 
-The UniId is a content-addressed identifier for distributed systems and provenance tracking.
+The UniId is a content-addressed identifier for distributed systems and provenance tracking. It serves as a **lookup index**, not a uniqueness constraint — multiple vertices with identical content can coexist with different VIDs.
 
 ### Characteristics
 
@@ -186,8 +186,8 @@ println!("{}", uid.to_multibase());  // bafkrei...
 
 ### Use Cases
 
-1. **Content Deduplication**: Same content always produces same UID
-2. **Distributed Sync**: UIDs are globally unique without coordination
+1. **Content Lookup**: Find vertices by content hash (multiple vertices may share a UID)
+2. **Distributed Sync**: Deterministic IDs enable coordination-free references
 3. **Audit Trail**: Track data provenance across systems
 4. **CRDT Integration**: UIDs enable conflict-free replication across distributed nodes
 

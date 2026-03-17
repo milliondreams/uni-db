@@ -1458,8 +1458,8 @@ impl Writer {
             let properties_result = properties_batch.clone();
             {
                 let mut l0_guard = tx_l0.write();
-                for (vid, props) in vids.iter().zip(properties_batch) {
-                    l0_guard.insert_vertex_with_labels(*vid, props, &labels);
+                for (vid, props) in vids.iter().zip(properties_batch.iter()) {
+                    l0_guard.insert_vertex_with_labels(*vid, props.clone(), &labels);
                 }
             }
 
@@ -2312,25 +2312,6 @@ impl Writer {
             if !uid_mappings.is_empty()
                 && let Ok(uid_index) = self.storage.uid_index(label_name)
             {
-                // Issue #107: Check for UID collisions and FAIL instead of warning.
-                // SHA3-256 collisions are astronomically unlikely (~2^256), but if one
-                // occurs, we must reject the flush to prevent silent data corruption.
-                // Changed from tracing::warn!() to anyhow::bail!().
-                for (uid, vid) in &uid_mappings {
-                    if let Ok(Some(existing_vid)) = uid_index.get_vid(uid).await
-                        && existing_vid != *vid
-                    {
-                        anyhow::bail!(
-                            "UID collision detected: UID {:?} maps to both VID {} and VID {}. \
-                            This indicates either a hash collision (astronomically unlikely with SHA3-256) \
-                            or data corruption. Cannot proceed with flush.",
-                            uid,
-                            existing_vid.as_u64(),
-                            vid.as_u64()
-                        );
-                    }
-                }
-
                 uid_index.write_mapping(&uid_mappings).await?;
             }
         }

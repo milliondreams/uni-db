@@ -322,7 +322,7 @@ These principles, drawn from the original design documents, guide every architec
 2. **Simplicity Over Generality**: Explicit constraints, fewer options. A custom `SimpleGraph` instead of a generic graph library.
 3. **LSM-Style Writes**: Optimized for write-heavy workloads. Memory buffer → sorted runs → compacted base. Same proven pattern as LevelDB/RocksDB, adapted for graph data.
 4. **Columnar Everything**: Arrow arrays for properties, DataFusion for query execution. Get analytical performance without a separate OLAP system.
-5. **Content Addressing**: UniId (SHA3-256) provides stable references across systems, enables deduplication, and decouples identity from storage location.
+5. **Content Addressing**: UniId (SHA3-256) provides stable references across systems and decouples identity from storage location. UID is a lookup index, not a uniqueness constraint — multiple vertices may share a UID.
 6. **Single-Writer Simplicity**: One writer at a time eliminates write-write conflicts. Multi-reader with snapshot isolation provides consistent reads without locking.
 
 ---
@@ -414,9 +414,11 @@ A SHA3-256 hash that provides **stable, content-addressed identity** for vertice
 | **Computation** | `SHA3-256(label ‖ ext_id ‖ sorted_properties)` |
 
 UniId enables:
-- **Deduplication**: Same data always produces the same ID
+- **Content lookup**: Find vertices by content hash (multiple vertices may share a UID)
 - **Cross-system references**: IDs are stable regardless of which Uni instance created them
 - **Content verification**: Detect data corruption or tampering
+
+> **Note:** UID is a lookup index, not a uniqueness constraint. `CREATE (:Label), (:Label)` freely creates two vertices with different VIDs even if they produce the same UID.
 
 The UID Index provides O(log N) lookup from UniId → VID via a BTree index on the hex-encoded UID column.
 
@@ -2747,7 +2749,34 @@ CREATE RULE total_exposure AS
     YIELD KEY a, VALUE total, path_count
 ```
 
-Supported aggregators: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `COLLECT`, `MSUM`
+Supported aggregators: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `COLLECT`, `MSUM`, `MMAX`, `MMIN`, `MCOUNT`, `MNOR`, `MPROD`
+
+### Probabilistic Aggregation (MNOR / MPROD)
+
+Two monotonic aggregators for combining probabilities in recursive rules:
+
+| Aggregator | Formula | Identity | Semantics |
+|---|---|---|---|
+| `MNOR` | `1 − ∏(1 − pᵢ)` | 0.0 | "Any one cause can produce the effect" (Noisy-OR) |
+| `MPROD` | `∏ pᵢ` | 1.0 | "All conditions must hold simultaneously" |
+
+Both are monotonic (safe in recursive strata), clamp inputs to [0, 1], skip nulls, and are commutative.
+
+```cypher
+-- Risk combination: any signal can flag the account
+CREATE RULE risk_combined AS
+    MATCH (a:Component)-[s:SIGNAL]->(b:Flag)
+    FOLD risk = MNOR(s.probability)
+    YIELD KEY a, VALUE risk
+
+-- Joint reliability: all parts must work
+CREATE RULE joint_reliability AS
+    MATCH (asm:Part)-[r:REQUIRES]->(sub:Part)
+    FOLD availability = MPROD(sub.reliability)
+    YIELD KEY asm, VALUE availability
+```
+
+MPROD uses log-space computation when the product drops below 1e-15 to prevent underflow. MNOR and MPROD are incompatible with `BEST BY` (compiler error).
 
 ### BEST BY (Ranked Selection)
 

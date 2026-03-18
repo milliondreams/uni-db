@@ -209,11 +209,13 @@ mod tests {
             vec![
                 YieldColumn {
                     name: "a".into(),
-                    is_key: false
+                    is_key: false,
+                    is_prob: false,
                 },
                 YieldColumn {
                     name: "b".into(),
-                    is_key: false
+                    is_key: false,
+                    is_prob: false,
                 },
             ]
         );
@@ -378,9 +380,9 @@ mod tests {
     #[test]
     fn mnor_probability_domain_warning() {
         let prog = parse_locy(
-            "CREATE RULE r AS MATCH (a)-[:E]->(b) YIELD a, b, 0 AS prob \
+            "CREATE RULE r AS MATCH (a)-[:E]->(b) YIELD a, b, 0 AS score \
              CREATE RULE r AS MATCH (a)-[:E]->(mid) WHERE mid IS r TO b \
-             FOLD prob = MNOR(a.weight) YIELD a, b, prob",
+             FOLD score = MNOR(a.weight) YIELD a, b, score",
         )
         .unwrap();
 
@@ -398,9 +400,9 @@ mod tests {
     #[test]
     fn mnor_best_by_rejected() {
         let prog = parse_locy(
-            "CREATE RULE r AS MATCH (a)-[:E]->(b) YIELD a, b, 0 AS prob \
+            "CREATE RULE r AS MATCH (a)-[:E]->(b) YIELD a, b, 0 AS score \
              CREATE RULE r AS MATCH (a)-[:E]->(mid) WHERE mid IS r TO b \
-             FOLD prob = MNOR(a.weight) BEST BY prob ASC YIELD a, b, prob",
+             FOLD score = MNOR(a.weight) BEST BY score ASC YIELD a, b, score",
         )
         .unwrap();
 
@@ -420,9 +422,9 @@ mod tests {
     #[test]
     fn mprod_probability_domain_warning() {
         let prog = parse_locy(
-            "CREATE RULE r AS MATCH (a)-[:E]->(b) YIELD a, b, 1 AS prob \
+            "CREATE RULE r AS MATCH (a)-[:E]->(b) YIELD a, b, 1 AS score \
              CREATE RULE r AS MATCH (a)-[:E]->(mid) WHERE mid IS r TO b \
-             FOLD prob = MPROD(a.weight) YIELD a, b, prob",
+             FOLD score = MPROD(a.weight) YIELD a, b, score",
         )
         .unwrap();
 
@@ -491,15 +493,18 @@ mod tests {
             vec![
                 YieldColumn {
                     name: "a".into(),
-                    is_key: true
+                    is_key: true,
+                    is_prob: false,
                 },
                 YieldColumn {
                     name: "b".into(),
-                    is_key: true
+                    is_key: true,
+                    is_prob: false,
                 },
                 YieldColumn {
                     name: "total_cost".into(),
-                    is_key: false
+                    is_key: false,
+                    is_prob: false,
                 },
             ]
         );

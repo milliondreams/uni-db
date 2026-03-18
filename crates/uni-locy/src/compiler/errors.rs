@@ -50,4 +50,7 @@ pub enum LocyCompileError {
         field: String,
         available: String,
     },
+
+    #[error("rule '{rule}' has {count} PROB columns; at most 1 is allowed")]
+    MultipleProbColumns { rule: String, count: usize },
 }

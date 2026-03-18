@@ -860,9 +860,14 @@ fn build_locy_yield_item(pair: Pair<LocyRule>) -> Result<LocyYieldItem, ParseErr
             .unwrap();
         return Ok(LocyYieldItem {
             is_key: true,
+            is_prob: false,
             expr: ast::Expr::Variable(normalize_locy_identifier(ident.as_str())),
             alias: None,
         });
+    }
+
+    if first.as_rule() == LocyRule::prob_projection {
+        return build_prob_projection(first.clone());
     }
 
     // expression ~ (AS ~ alias_identifier)?
@@ -874,6 +879,41 @@ fn build_locy_yield_item(pair: Pair<LocyRule>) -> Result<LocyYieldItem, ParseErr
 
     Ok(LocyYieldItem {
         is_key: false,
+        is_prob: false,
+        expr,
+        alias,
+    })
+}
+
+/// Parse a `prob_projection` node into a `LocyYieldItem` with `is_prob = true`.
+///
+/// Grammar forms:
+///   `expression AS alias_identifier PROB` → explicit alias
+///   `expression AS PROB`                  → alias derived from expression
+///   `expression PROB`                     → alias derived from expression
+fn build_prob_projection(pair: Pair<LocyRule>) -> Result<LocyYieldItem, ParseError> {
+    let children: Vec<_> = pair.into_inner().collect();
+
+    // First child is always the expression
+    let expr_pair = &children[0];
+    let expr = reparse_as_cypher_expression(expr_pair.as_str())?;
+
+    // Look for an explicit alias_identifier (present only in form 1)
+    let alias = children
+        .iter()
+        .find(|p| p.as_rule() == LocyRule::alias_identifier)
+        .map(|p| normalize_locy_identifier(p.as_str()));
+
+    // For forms without explicit alias, derive from expression
+    let alias = alias.or_else(|| match &expr {
+        ast::Expr::Variable(name) => Some(name.clone()),
+        ast::Expr::Property(_, key) => Some(key.clone()),
+        _ => None,
+    });
+
+    Ok(LocyYieldItem {
+        is_key: false,
+        is_prob: true,
         expr,
         alias,
     })

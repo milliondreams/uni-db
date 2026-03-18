@@ -26,7 +26,28 @@ pub fn check(
 
         check_mixed_priority(rule_name, definitions)?;
 
-        let yield_schema = infer_yield_schema(rule_name, definitions)?;
+        let mut yield_schema = infer_yield_schema(rule_name, definitions)?;
+
+        // Implicit PROB: if a fold uses MNOR/MPROD, mark the matching yield column as PROB
+        for def in definitions.iter() {
+            for fold in &def.fold {
+                if let Some(func_name) = extract_function_name(&fold.aggregate)
+                    && matches!(func_name.to_uppercase().as_str(), "MNOR" | "MPROD")
+                    && let Some(col) = yield_schema.iter_mut().find(|c| c.name == fold.name)
+                {
+                    col.is_prob = true;
+                }
+            }
+        }
+
+        // Validate: at most 1 PROB column per rule
+        let prob_count = yield_schema.iter().filter(|c| c.is_prob).count();
+        if prob_count > 1 {
+            return Err(LocyCompileError::MultipleProbColumns {
+                rule: rule_name.clone(),
+                count: prob_count,
+            });
+        }
 
         let scc_rules = &strat.sccs[scc_idx];
 
@@ -188,6 +209,18 @@ fn infer_yield_schema(
                         ),
                     });
                 }
+                // Check is_prob consistency across clauses
+                for (i, (e, c)) in existing.iter().zip(columns.iter()).enumerate() {
+                    if e.is_prob != c.is_prob {
+                        return Err(LocyCompileError::YieldSchemaMismatch {
+                            rule: rule_name.to_string(),
+                            detail: format!(
+                                "column {} '{}' has inconsistent PROB annotation across clauses",
+                                i, e.name
+                            ),
+                        });
+                    }
+                }
             } else {
                 schema = Some(columns);
             }
@@ -205,6 +238,7 @@ fn yield_columns_from_items(items: &[LocyYieldItem]) -> Vec<YieldColumn> {
             YieldColumn {
                 name,
                 is_key: item.is_key,
+                is_prob: item.is_prob,
             }
         })
         .collect()

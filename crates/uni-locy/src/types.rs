@@ -69,6 +69,7 @@ pub struct CompiledClause {
 pub struct YieldColumn {
     pub name: String,
     pub is_key: bool,
+    pub is_prob: bool,
 }
 
 /// A non-fatal compiler diagnostic.

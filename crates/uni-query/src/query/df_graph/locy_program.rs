@@ -112,6 +112,7 @@ pub struct LocyProgramExec {
     timeout: Duration,
     max_derived_bytes: usize,
     deterministic_best_by: bool,
+    strict_probability_domain: bool,
     /// Shared slot for extracting the DerivedStore after execution completes.
     derived_store_slot: Arc<StdRwLock<Option<DerivedStore>>>,
     /// Optional provenance tracker injected after construction (via `set_derivation_tracker`).
@@ -151,6 +152,7 @@ impl LocyProgramExec {
         timeout: Duration,
         max_derived_bytes: usize,
         deterministic_best_by: bool,
+        strict_probability_domain: bool,
     ) -> Self {
         let properties = compute_plan_properties(Arc::clone(&output_schema));
         Self {
@@ -169,6 +171,7 @@ impl LocyProgramExec {
             timeout,
             max_derived_bytes,
             deterministic_best_by,
+            strict_probability_domain,
             derived_store_slot: Arc::new(StdRwLock::new(None)),
             derivation_tracker: Arc::new(StdRwLock::new(None)),
             iteration_counts_slot: Arc::new(StdRwLock::new(HashMap::new())),
@@ -276,6 +279,7 @@ impl ExecutionPlan for LocyProgramExec {
         let timeout = self.timeout;
         let max_derived_bytes = self.max_derived_bytes;
         let deterministic_best_by = self.deterministic_best_by;
+        let strict_probability_domain = self.strict_probability_domain;
         let derived_store_slot = Arc::clone(&self.derived_store_slot);
         let iteration_counts_slot = Arc::clone(&self.iteration_counts_slot);
         let peak_memory_slot = Arc::clone(&self.peak_memory_slot);
@@ -295,6 +299,7 @@ impl ExecutionPlan for LocyProgramExec {
                 timeout,
                 max_derived_bytes,
                 deterministic_best_by,
+                strict_probability_domain,
                 derived_store_slot,
                 iteration_counts_slot,
                 peak_memory_slot,
@@ -392,6 +397,7 @@ async fn run_program(
     timeout: Duration,
     max_derived_bytes: usize,
     deterministic_best_by: bool,
+    strict_probability_domain: bool,
     derived_store_slot: Arc<StdRwLock<Option<DerivedStore>>>,
     iteration_counts_slot: Arc<StdRwLock<HashMap<String, usize>>>,
     peak_memory_slot: Arc<StdRwLock<usize>>,
@@ -432,6 +438,7 @@ async fn run_program(
                 max_derived_bytes,
                 derivation_tracker.clone(),
                 Arc::clone(&iteration_counts_slot),
+                strict_probability_domain,
             );
 
             let task_ctx = session_ctx.read().task_ctx();
@@ -487,7 +494,7 @@ async fn run_program(
                 )
                 .await?;
 
-                // Apply anti-joins for negated IS-refs (IS NOT semantics).
+                // Apply negated IS-ref semantics: probabilistic complement or anti-join.
                 // For non-recursive rules, the negated rule is always in a lower stratum,
                 // so its facts are already in the registry from write_cross_stratum_facts.
                 for clause in &fp_rule.clauses {
@@ -498,20 +505,65 @@ async fn run_program(
                         {
                             let neg_facts = entry.data.read().clone();
                             if !neg_facts.is_empty() {
-                                for (left_col, right_col) in &binding.anti_join_cols {
-                                    facts = super::locy_fixpoint::apply_anti_join(
-                                        facts, &neg_facts, left_col, right_col,
-                                    )?;
+                                if binding.target_has_prob && fp_rule.prob_column_name.is_some() {
+                                    // Probabilistic complement: add 1-p column instead of filtering.
+                                    // Only when both target has PROB and current rule has PROB;
+                                    // otherwise fall back to Boolean anti-join.
+                                    if let Some(prob_col) = &binding.target_prob_col {
+                                        for (left_col, right_col) in &binding.anti_join_cols {
+                                            let complement_col =
+                                                format!("__prob_complement_{}", binding.rule_name);
+                                            facts = super::locy_fixpoint::apply_prob_complement(
+                                                facts,
+                                                &neg_facts,
+                                                left_col,
+                                                right_col,
+                                                prob_col,
+                                                &complement_col,
+                                            )?;
+                                        }
+                                    }
+                                } else {
+                                    // Boolean exclusion: anti-join (existing behavior)
+                                    for (left_col, right_col) in &binding.anti_join_cols {
+                                        facts = super::locy_fixpoint::apply_anti_join(
+                                            facts, &neg_facts, left_col, right_col,
+                                        )?;
+                                    }
                                 }
                             }
                         }
                     }
                 }
 
+                // Multiply complement columns into the PROB column (if any) and clean up
+                let complement_cols: Vec<String> = if !facts.is_empty() {
+                    facts[0]
+                        .schema()
+                        .fields()
+                        .iter()
+                        .filter(|f| f.name().starts_with("__prob_complement_"))
+                        .map(|f| f.name().clone())
+                        .collect()
+                } else {
+                    vec![]
+                };
+                if !complement_cols.is_empty() {
+                    facts = super::locy_fixpoint::multiply_prob_factors(
+                        facts,
+                        fp_rule.prob_column_name.as_deref(),
+                        &complement_cols,
+                    )?;
+                }
+
                 // Apply post-fixpoint operators (PRIORITY, FOLD, BEST BY)
-                let facts =
-                    super::locy_fixpoint::apply_post_fixpoint_chain(facts, fp_rule, &task_ctx)
-                        .await?;
+                let facts = super::locy_fixpoint::apply_post_fixpoint_chain(
+                    facts,
+                    fp_rule,
+                    &task_ctx,
+                    strict_probability_domain,
+                )
+                .await?;
 
                 // Write facts into registry handles for later strata
                 write_facts_to_registry(&registry, &rule.name, &facts);
@@ -670,6 +722,12 @@ fn convert_to_fixpoint_plans(
                 yield_schema
             };
 
+            let prob_column_name = rule
+                .yield_schema
+                .iter()
+                .find(|yc| yc.is_prob)
+                .map(|yc| yc.name.clone());
+
             Ok(FixpointRulePlan {
                 name: rule.name.clone(),
                 clauses,
@@ -682,6 +740,7 @@ fn convert_to_fixpoint_plans(
                 best_by_criteria,
                 has_priority,
                 deterministic: deterministic_best_by,
+                prob_column_name,
             })
         })
         .collect()
@@ -743,6 +802,8 @@ fn convert_is_refs(
                 is_self_ref: entry.is_self_ref,
                 negated: is_ref.negated,
                 anti_join_cols,
+                target_has_prob: is_ref.target_has_prob,
+                target_prob_col: is_ref.target_prob_col.clone(),
             })
         })
         .collect()
@@ -1033,16 +1094,19 @@ mod tests {
             LocyYieldColumn {
                 name: "a".to_string(),
                 is_key: true,
+                is_prob: false,
                 data_type: DataType::UInt64,
             },
             LocyYieldColumn {
                 name: "b".to_string(),
                 is_key: false,
+                is_prob: false,
                 data_type: DataType::LargeUtf8,
             },
             LocyYieldColumn {
                 name: "c".to_string(),
                 is_key: true,
+                is_prob: false,
                 data_type: DataType::Float64,
             },
         ];
@@ -1067,16 +1131,19 @@ mod tests {
             LocyYieldColumn {
                 name: "a".to_string(),
                 is_key: true,
+                is_prob: false,
                 data_type: DataType::LargeBinary,
             },
             LocyYieldColumn {
                 name: "b".to_string(),
                 is_key: false,
+                is_prob: false,
                 data_type: DataType::LargeBinary,
             },
             LocyYieldColumn {
                 name: "c".to_string(),
                 is_key: true,
+                is_prob: false,
                 data_type: DataType::LargeBinary,
             },
         ];

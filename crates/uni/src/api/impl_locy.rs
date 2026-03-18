@@ -76,6 +76,7 @@ impl<'a> LocyEngine<'a> {
                 config.timeout,
                 config.max_derived_bytes,
                 config.deterministic_best_by,
+                config.strict_probability_domain,
             )
             .map_err(|e| UniError::Query {
                 message: format!("LocyPlanBuildError: {e}"),
@@ -231,6 +232,7 @@ impl<'a> LocyEngine<'a> {
                 config.timeout,
                 config.max_derived_bytes,
                 config.deterministic_best_by,
+                config.strict_probability_domain,
             )
             .map_err(|e| UniError::Query {
                 message: format!("LocyPlanBuildError: {e}"),

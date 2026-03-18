@@ -687,6 +687,10 @@ pub struct IsRefBinding {
     /// `right_derived_col` is the corresponding KEY column in the negated rule's facts (e.g., `"n"`).
     /// Empty for non-negated IS-refs.
     pub anti_join_cols: Vec<(String, String)>,
+    /// Whether the target rule has a PROB column.
+    pub target_has_prob: bool,
+    /// Name of the PROB column in the target rule, if any.
+    pub target_prob_col: Option<String>,
 }
 
 /// A single clause (body) within a fixpoint rule.
@@ -727,6 +731,8 @@ pub struct FixpointRulePlan {
     /// tie-breaking. When false, tied rows are selected non-deterministically
     /// (faster but not repeatable across runs).
     pub deterministic: bool,
+    /// Name of the PROB column in this rule's yield schema, if any.
+    pub prob_column_name: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -752,6 +758,7 @@ async fn run_fixpoint_loop(
     max_derived_bytes: usize,
     derivation_tracker: Option<Arc<DerivationTracker>>,
     iteration_counts: Arc<StdRwLock<HashMap<String, usize>>>,
+    strict_probability_domain: bool,
 ) -> DFResult<Vec<RecordBatch>> {
     let start = Instant::now();
     let task_ctx = session_ctx.read().task_ctx();
@@ -812,7 +819,7 @@ async fn run_fixpoint_loop(
                     &schema_info,
                 )
                 .await?;
-                // Apply anti-joins for negated IS-refs (IS NOT semantics).
+                // Apply negated IS-ref semantics: probabilistic complement or anti-join.
                 for binding in &clause.is_ref_bindings {
                     if binding.negated
                         && !binding.anti_join_cols.is_empty()
@@ -820,13 +827,54 @@ async fn run_fixpoint_loop(
                     {
                         let neg_facts = entry.data.read().clone();
                         if !neg_facts.is_empty() {
-                            for (left_col, right_col) in &binding.anti_join_cols {
-                                batches =
-                                    apply_anti_join(batches, &neg_facts, left_col, right_col)?;
+                            if binding.target_has_prob && rule.prob_column_name.is_some() {
+                                // Probabilistic complement: add 1-p column instead of filtering.
+                                // Only when both target has PROB and current rule has PROB;
+                                // otherwise fall back to Boolean anti-join.
+                                if let Some(prob_col) = &binding.target_prob_col {
+                                    for (left_col, right_col) in &binding.anti_join_cols {
+                                        let complement_col =
+                                            format!("__prob_complement_{}", binding.rule_name);
+                                        batches = apply_prob_complement(
+                                            batches,
+                                            &neg_facts,
+                                            left_col,
+                                            right_col,
+                                            prob_col,
+                                            &complement_col,
+                                        )?;
+                                    }
+                                }
+                            } else {
+                                // Boolean exclusion: anti-join (existing behavior)
+                                for (left_col, right_col) in &binding.anti_join_cols {
+                                    batches =
+                                        apply_anti_join(batches, &neg_facts, left_col, right_col)?;
+                                }
                             }
                         }
                     }
                 }
+                // Multiply complement columns into the PROB column (if any) and clean up
+                let complement_cols: Vec<String> = if !batches.is_empty() {
+                    batches[0]
+                        .schema()
+                        .fields()
+                        .iter()
+                        .filter(|f| f.name().starts_with("__prob_complement_"))
+                        .map(|f| f.name().clone())
+                        .collect()
+                } else {
+                    vec![]
+                };
+                if !complement_cols.is_empty() {
+                    batches = multiply_prob_factors(
+                        batches,
+                        rule.prob_column_name.as_deref(),
+                        &complement_cols,
+                    )?;
+                }
+
                 clause_candidates.push(batches.clone());
                 all_candidates.extend(batches);
             }
@@ -896,7 +944,8 @@ async fn run_fixpoint_loop(
             continue;
         }
 
-        let processed = apply_post_fixpoint_chain(facts, rule, &task_ctx).await?;
+        let processed =
+            apply_post_fixpoint_chain(facts, rule, &task_ctx, strict_probability_domain).await?;
         all_output.extend(processed);
     }
 
@@ -1051,6 +1100,232 @@ pub fn apply_anti_join(
             result.push(filtered);
         }
     }
+    Ok(result)
+}
+
+/// Probabilistic complement for negated IS-refs targeting PROB rules.
+///
+/// Instead of filtering out matching VIDs (anti-join), this adds a complement column
+/// `__prob_complement_{rule_name}` with value `1 - p` for each matching VID, and `1.0`
+/// for VIDs not present in the negated rule's facts.
+///
+/// This implements the probabilistic complement semantics: `IS NOT risk` on a PROB rule
+/// yields the probability that the entity is NOT risky.
+pub fn apply_prob_complement(
+    batches: Vec<RecordBatch>,
+    neg_facts: &[RecordBatch],
+    left_col: &str,
+    right_col: &str,
+    prob_col: &str,
+    complement_col_name: &str,
+) -> datafusion::error::Result<Vec<RecordBatch>> {
+    use arrow_array::{Array as _, Float64Array, UInt64Array};
+
+    // Build VID → probability lookup from negative facts
+    let mut prob_map: std::collections::HashMap<u64, f64> = std::collections::HashMap::new();
+    for batch in neg_facts {
+        let Ok(vid_idx) = batch.schema().index_of(right_col) else {
+            continue;
+        };
+        let Ok(prob_idx) = batch.schema().index_of(prob_col) else {
+            continue;
+        };
+        let Some(vids) = batch.column(vid_idx).as_any().downcast_ref::<UInt64Array>() else {
+            continue;
+        };
+        let prob_arr = batch.column(prob_idx);
+        let probs = prob_arr.as_any().downcast_ref::<Float64Array>();
+        for i in 0..vids.len() {
+            if !vids.is_null(i) {
+                let p = probs
+                    .and_then(|arr| {
+                        if arr.is_null(i) {
+                            None
+                        } else {
+                            Some(arr.value(i))
+                        }
+                    })
+                    .unwrap_or(0.0);
+                // If multiple facts for same VID, use noisy-OR combination:
+                // combined = 1 - (1 - existing) * (1 - new)
+                prob_map
+                    .entry(vids.value(i))
+                    .and_modify(|existing| {
+                        *existing = 1.0 - (1.0 - *existing) * (1.0 - p);
+                    })
+                    .or_insert(p);
+            }
+        }
+    }
+
+    // Add complement column to each batch
+    let mut result = Vec::new();
+    for batch in batches {
+        let Ok(idx) = batch.schema().index_of(left_col) else {
+            result.push(batch);
+            continue;
+        };
+        let Some(vids) = batch.column(idx).as_any().downcast_ref::<UInt64Array>() else {
+            result.push(batch);
+            continue;
+        };
+
+        // Compute complement values: 1 - p for matched VIDs, 1.0 for absent
+        let complements: Vec<f64> = (0..vids.len())
+            .map(|i| {
+                if vids.is_null(i) {
+                    1.0
+                } else {
+                    let p = prob_map.get(&vids.value(i)).copied().unwrap_or(0.0);
+                    1.0 - p
+                }
+            })
+            .collect();
+
+        let complement_arr = Float64Array::from(complements);
+
+        // Add the complement column to the batch
+        let mut columns: Vec<arrow_array::ArrayRef> = batch.columns().to_vec();
+        columns.push(std::sync::Arc::new(complement_arr));
+
+        let mut fields: Vec<std::sync::Arc<arrow_schema::Field>> =
+            batch.schema().fields().iter().cloned().collect();
+        fields.push(std::sync::Arc::new(arrow_schema::Field::new(
+            complement_col_name,
+            arrow_schema::DataType::Float64,
+            true,
+        )));
+
+        let new_schema = std::sync::Arc::new(arrow_schema::Schema::new(fields));
+        let new_batch = RecordBatch::try_new(new_schema, columns)
+            .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+        result.push(new_batch);
+    }
+    Ok(result)
+}
+
+/// Multiply `__prob_complement_*` columns into the rule's PROB column and clean up.
+///
+/// After IS NOT probabilistic complement semantics have added `__prob_complement_*`
+/// columns to clause results, this function:
+/// 1. Computes the product of all complement factor columns
+/// 2. Multiplies the product into the existing PROB column (if any)
+/// 3. Removes the internal `__prob_complement_*` columns from the output
+///
+/// If the rule has no PROB column, complement columns are simply removed
+/// (the complement information is discarded and IS NOT acts as a keep-all).
+pub fn multiply_prob_factors(
+    batches: Vec<RecordBatch>,
+    prob_col: Option<&str>,
+    complement_cols: &[String],
+) -> datafusion::error::Result<Vec<RecordBatch>> {
+    use arrow_array::{Array as _, Float64Array};
+
+    let mut result = Vec::with_capacity(batches.len());
+
+    for batch in batches {
+        if batch.num_rows() == 0 {
+            // Remove complement columns from empty batches
+            let keep: Vec<usize> = batch
+                .schema()
+                .fields()
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| !complement_cols.contains(f.name()))
+                .map(|(i, _)| i)
+                .collect();
+            let fields: Vec<_> = keep
+                .iter()
+                .map(|&i| batch.schema().field(i).clone())
+                .collect();
+            let cols: Vec<_> = keep.iter().map(|&i| batch.column(i).clone()).collect();
+            let schema = std::sync::Arc::new(arrow_schema::Schema::new(fields));
+            result.push(
+                RecordBatch::try_new(schema, cols).map_err(|e| {
+                    datafusion::error::DataFusionError::ArrowError(Box::new(e), None)
+                })?,
+            );
+            continue;
+        }
+
+        let num_rows = batch.num_rows();
+
+        // 1. Compute product of all complement factors
+        let mut combined = vec![1.0f64; num_rows];
+        for col_name in complement_cols {
+            if let Ok(idx) = batch.schema().index_of(col_name) {
+                let arr = batch
+                    .column(idx)
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .ok_or_else(|| {
+                        datafusion::error::DataFusionError::Internal(format!(
+                            "Expected Float64 for complement column {col_name}"
+                        ))
+                    })?;
+                for (i, val) in combined.iter_mut().enumerate().take(num_rows) {
+                    if !arr.is_null(i) {
+                        *val *= arr.value(i);
+                    }
+                }
+            }
+        }
+
+        // 2. If there's a PROB column, multiply combined into it
+        let final_prob: Vec<f64> = if let Some(prob_name) = prob_col {
+            if let Ok(idx) = batch.schema().index_of(prob_name) {
+                let arr = batch
+                    .column(idx)
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .ok_or_else(|| {
+                        datafusion::error::DataFusionError::Internal(format!(
+                            "Expected Float64 for PROB column {prob_name}"
+                        ))
+                    })?;
+                (0..num_rows)
+                    .map(|i| {
+                        if arr.is_null(i) {
+                            combined[i]
+                        } else {
+                            arr.value(i) * combined[i]
+                        }
+                    })
+                    .collect()
+            } else {
+                combined
+            }
+        } else {
+            combined
+        };
+
+        let new_prob_array: arrow_array::ArrayRef =
+            std::sync::Arc::new(Float64Array::from(final_prob));
+
+        // 3. Build output: replace PROB column, remove complement columns
+        let mut fields = Vec::new();
+        let mut columns = Vec::new();
+
+        for (idx, field) in batch.schema().fields().iter().enumerate() {
+            if complement_cols.contains(field.name()) {
+                continue;
+            }
+            if prob_col.is_some_and(|p| field.name() == p) {
+                fields.push(field.clone());
+                columns.push(new_prob_array.clone());
+            } else {
+                fields.push(field.clone());
+                columns.push(batch.column(idx).clone());
+            }
+        }
+
+        let schema = std::sync::Arc::new(arrow_schema::Schema::new(fields));
+        result.push(
+            RecordBatch::try_new(schema, columns)
+                .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?,
+        );
+    }
+
     Ok(result)
 }
 
@@ -1261,6 +1536,7 @@ pub(crate) async fn apply_post_fixpoint_chain(
     facts: Vec<RecordBatch>,
     rule: &FixpointRulePlan,
     task_ctx: &Arc<TaskContext>,
+    strict_probability_domain: bool,
 ) -> DFResult<Vec<RecordBatch>> {
     if !rule.has_fold && !rule.has_best_by && !rule.has_priority {
         return Ok(facts);
@@ -1295,6 +1571,7 @@ pub(crate) async fn apply_post_fixpoint_chain(
             current,
             rule.key_column_indices.clone(),
             rule.fold_bindings.clone(),
+            strict_probability_domain,
         ))
     } else {
         current
@@ -1341,6 +1618,7 @@ pub struct FixpointExec {
     derivation_tracker: Option<Arc<DerivationTracker>>,
     /// Shared slot written with per-rule iteration counts after convergence.
     iteration_counts: Arc<StdRwLock<HashMap<String, usize>>>,
+    strict_probability_domain: bool,
 }
 
 impl fmt::Debug for FixpointExec {
@@ -1372,6 +1650,7 @@ impl FixpointExec {
         max_derived_bytes: usize,
         derivation_tracker: Option<Arc<DerivationTracker>>,
         iteration_counts: Arc<StdRwLock<HashMap<String, usize>>>,
+        strict_probability_domain: bool,
     ) -> Self {
         let properties = compute_plan_properties(Arc::clone(&output_schema));
         Self {
@@ -1390,6 +1669,7 @@ impl FixpointExec {
             max_derived_bytes,
             derivation_tracker,
             iteration_counts,
+            strict_probability_domain,
         }
     }
 
@@ -1484,6 +1764,7 @@ impl ExecutionPlan for FixpointExec {
                     best_by_criteria: r.best_by_criteria.clone(),
                     has_priority: r.has_priority,
                     deterministic: r.deterministic,
+                    prob_column_name: r.prob_column_name.clone(),
                 }
             })
             .collect();
@@ -1500,6 +1781,7 @@ impl ExecutionPlan for FixpointExec {
         let max_derived_bytes = self.max_derived_bytes;
         let derivation_tracker = self.derivation_tracker.clone();
         let iteration_counts = Arc::clone(&self.iteration_counts);
+        let strict_probability_domain = self.strict_probability_domain;
 
         let fut = async move {
             run_fixpoint_loop(
@@ -1516,6 +1798,7 @@ impl ExecutionPlan for FixpointExec {
                 max_derived_bytes,
                 derivation_tracker,
                 iteration_counts,
+                strict_probability_domain,
             )
             .await
         };

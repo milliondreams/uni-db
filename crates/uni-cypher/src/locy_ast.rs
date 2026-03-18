@@ -177,10 +177,11 @@ pub struct YieldClause {
     pub items: Vec<LocyYieldItem>,
 }
 
-/// A single YIELD item, possibly marked as KEY.
+/// A single YIELD item, possibly marked as KEY or PROB.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LocyYieldItem {
     pub is_key: bool,
+    pub is_prob: bool,
     pub expr: Expr,
     pub alias: Option<String>,
 }

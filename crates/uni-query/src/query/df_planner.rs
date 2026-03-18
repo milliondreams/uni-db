@@ -1121,6 +1121,7 @@ impl HybridPhysicalPlanner {
                 input,
                 key_columns,
                 fold_bindings,
+                strict_probability_domain,
             } => {
                 let child = self.plan_internal(input, all_properties)?;
                 let key_indices = resolve_column_indices(&child.schema(), key_columns)?;
@@ -1129,6 +1130,7 @@ impl HybridPhysicalPlanner {
                     child,
                     key_indices,
                     bindings,
+                    *strict_probability_domain,
                 )))
             }
 
@@ -1157,6 +1159,7 @@ impl HybridPhysicalPlanner {
                 timeout,
                 max_derived_bytes,
                 deterministic_best_by,
+                strict_probability_domain,
             } => {
                 let output_schema = super::df_graph::locy_program::stats_schema();
 
@@ -1175,6 +1178,7 @@ impl HybridPhysicalPlanner {
                         *timeout,
                         *max_derived_bytes,
                         *deterministic_best_by,
+                        *strict_probability_domain,
                     ),
                 ))
             }

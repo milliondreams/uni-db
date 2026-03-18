@@ -21,6 +21,9 @@ pub struct LocyConfig {
     /// deterministic tie-breaking. Set to false for non-deterministic (faster)
     /// selection.
     pub deterministic_best_by: bool,
+    /// When true, MNOR/MPROD reject values outside [0,1] with an error instead
+    /// of clamping. When false (default), values are clamped silently.
+    pub strict_probability_domain: bool,
 }
 
 impl Default for LocyConfig {
@@ -34,6 +37,7 @@ impl Default for LocyConfig {
             max_abduce_results: 10,
             max_derived_bytes: 256 * 1024 * 1024,
             deterministic_best_by: true,
+            strict_probability_domain: false,
         }
     }
 }

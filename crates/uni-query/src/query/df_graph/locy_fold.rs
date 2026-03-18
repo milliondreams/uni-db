@@ -52,6 +52,7 @@ pub struct FoldExec {
     input: Arc<dyn ExecutionPlan>,
     key_indices: Vec<usize>,
     fold_bindings: Vec<FoldBinding>,
+    strict_probability_domain: bool,
     schema: SchemaRef,
     properties: PlanProperties,
     metrics: ExecutionPlanMetricsSet,
@@ -68,6 +69,7 @@ impl FoldExec {
         input: Arc<dyn ExecutionPlan>,
         key_indices: Vec<usize>,
         fold_bindings: Vec<FoldBinding>,
+        strict_probability_domain: bool,
     ) -> Self {
         let input_schema = input.schema();
         let schema = Self::build_output_schema(&input_schema, &key_indices, &fold_bindings);
@@ -77,6 +79,7 @@ impl FoldExec {
             input,
             key_indices,
             fold_bindings,
+            strict_probability_domain,
             schema,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -161,6 +164,7 @@ impl ExecutionPlan for FoldExec {
             Arc::clone(&children[0]),
             self.key_indices.clone(),
             self.fold_bindings.clone(),
+            self.strict_probability_domain,
         )))
     }
 
@@ -173,6 +177,7 @@ impl ExecutionPlan for FoldExec {
         let metrics = BaselineMetrics::new(&self.metrics, partition);
         let key_indices = self.key_indices.clone();
         let fold_bindings = self.fold_bindings.clone();
+        let strict = self.strict_probability_domain;
         let output_schema = Arc::clone(&self.schema);
         let input_schema = self.input.schema();
 
@@ -228,6 +233,7 @@ impl ExecutionPlan for FoldExec {
                     &ordered_keys,
                     &groups,
                     num_groups,
+                    strict,
                 )?;
                 output_columns.push(agg_col);
             }
@@ -258,6 +264,7 @@ fn compute_fold_aggregate(
     ordered_keys: &[Vec<ScalarKey>],
     groups: &HashMap<Vec<ScalarKey>, Vec<usize>>,
     num_groups: usize,
+    strict: bool,
 ) -> DFResult<arrow_array::ArrayRef> {
     match kind {
         FoldAggKind::Sum => {
@@ -307,14 +314,15 @@ fn compute_fold_aggregate(
         FoldAggKind::Nor => {
             let mut builder = Float64Builder::with_capacity(num_groups);
             for key in ordered_keys {
-                builder.append_option(noisy_or_f64(col, &groups[key]));
+                let indices = &groups[key];
+                builder.append_option(noisy_or_f64(col, indices, strict)?);
             }
             Ok(Arc::new(builder.finish()))
         }
         FoldAggKind::Prod => {
             let mut builder = Float64Builder::with_capacity(num_groups);
             for key in ordered_keys {
-                builder.append_option(product_f64(col, &groups[key]));
+                builder.append_option(product_f64(col, &groups[key], strict)?);
             }
             Ok(Arc::new(builder.finish()))
         }
@@ -338,8 +346,8 @@ fn sum_f64(col: &dyn Array, indices: &[usize]) -> Option<f64> {
     if has_value { Some(sum) } else { None }
 }
 
-/// Noisy-OR: P = 1 − ∏(1 − pᵢ). Inputs clamped to [0, 1].
-fn noisy_or_f64(col: &dyn Array, indices: &[usize]) -> Option<f64> {
+/// Noisy-OR: P = 1 − ∏(1 − pᵢ). Inputs clamped to [0, 1] unless strict.
+fn noisy_or_f64(col: &dyn Array, indices: &[usize], strict: bool) -> DFResult<Option<f64>> {
     let mut complement_product = 1.0;
     let mut has_value = false;
     for &i in indices {
@@ -347,25 +355,31 @@ fn noisy_or_f64(col: &dyn Array, indices: &[usize]) -> Option<f64> {
             continue;
         }
         has_value = true;
-        let p = if let Some(arr) = col.as_any().downcast_ref::<Float64Array>() {
-            arr.value(i).clamp(0.0, 1.0)
+        let raw = if let Some(arr) = col.as_any().downcast_ref::<Float64Array>() {
+            arr.value(i)
         } else if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
-            (arr.value(i) as f64).clamp(0.0, 1.0)
+            arr.value(i) as f64
         } else {
             continue;
         };
+        if strict && !(0.0..=1.0).contains(&raw) {
+            return Err(datafusion::error::DataFusionError::Execution(format!(
+                "strict_probability_domain: MNOR input {raw} is outside [0, 1]"
+            )));
+        }
+        let p = raw.clamp(0.0, 1.0);
         complement_product *= 1.0 - p;
     }
     if has_value {
-        Some(1.0 - complement_product)
+        Ok(Some(1.0 - complement_product))
     } else {
-        None
+        Ok(None)
     }
 }
 
-/// Product: P = ∏ pᵢ. Inputs clamped to [0, 1].
+/// Product: P = ∏ pᵢ. Inputs clamped to [0, 1] unless strict.
 /// Switches to log-space when the running product drops below 1e-15 to prevent underflow.
-fn product_f64(col: &dyn Array, indices: &[usize]) -> Option<f64> {
+fn product_f64(col: &dyn Array, indices: &[usize], strict: bool) -> DFResult<Option<f64>> {
     let mut product = 1.0;
     let mut log_sum = 0.0;
     let mut use_log = false;
@@ -375,15 +389,21 @@ fn product_f64(col: &dyn Array, indices: &[usize]) -> Option<f64> {
             continue;
         }
         has_value = true;
-        let p = if let Some(arr) = col.as_any().downcast_ref::<Float64Array>() {
-            arr.value(i).clamp(0.0, 1.0)
+        let raw = if let Some(arr) = col.as_any().downcast_ref::<Float64Array>() {
+            arr.value(i)
         } else if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
-            (arr.value(i) as f64).clamp(0.0, 1.0)
+            arr.value(i) as f64
         } else {
             continue;
         };
+        if strict && !(0.0..=1.0).contains(&raw) {
+            return Err(datafusion::error::DataFusionError::Execution(format!(
+                "strict_probability_domain: MPROD input {raw} is outside [0, 1]"
+            )));
+        }
+        let p = raw.clamp(0.0, 1.0);
         if p == 0.0 {
-            return Some(0.0);
+            return Ok(Some(0.0));
         }
         if use_log {
             log_sum += p.ln();
@@ -397,12 +417,12 @@ fn product_f64(col: &dyn Array, indices: &[usize]) -> Option<f64> {
         }
     }
     if !has_value {
-        return None;
+        return Ok(None);
     }
     if use_log {
-        Some(log_sum.exp())
+        Ok(Some(log_sum.exp()))
     } else {
-        Some(product)
+        Ok(Some(product))
     }
 }
 
@@ -681,7 +701,7 @@ mod tests {
         key_indices: Vec<usize>,
         fold_bindings: Vec<FoldBinding>,
     ) -> RecordBatch {
-        let exec = FoldExec::new(input, key_indices, fold_bindings);
+        let exec = FoldExec::new(input, key_indices, fold_bindings, false);
         let ctx = SessionContext::new();
         let task_ctx = ctx.task_ctx();
         let stream = exec.execute(0, task_ctx).unwrap();

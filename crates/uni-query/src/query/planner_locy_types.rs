@@ -70,6 +70,10 @@ pub struct LocyIsRef {
     pub target: Option<Expr>,
     /// Whether this is a negated IS-reference (`NOT IS`).
     pub negated: bool,
+    /// Whether the target rule has a PROB column.
+    pub target_has_prob: bool,
+    /// Name of the PROB column in the target rule, if any.
+    pub target_prob_col: Option<String>,
 }
 
 /// A column in a rule's yield schema.
@@ -79,6 +83,8 @@ pub struct LocyYieldColumn {
     pub name: String,
     /// Whether this column is a KEY column.
     pub is_key: bool,
+    /// Whether this column is a PROB column (probability annotation).
+    pub is_prob: bool,
     /// Arrow data type for this column (inferred from yield expressions).
     pub data_type: DataType,
 }

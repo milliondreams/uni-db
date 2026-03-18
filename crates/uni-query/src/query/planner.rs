@@ -2040,12 +2040,14 @@ pub enum LogicalPlan {
         timeout: std::time::Duration,
         max_derived_bytes: usize,
         deterministic_best_by: bool,
+        strict_probability_domain: bool,
     },
     /// FOLD operator: lattice-join non-key columns per KEY group.
     LocyFold {
         input: Box<LogicalPlan>,
         key_columns: Vec<String>,
         fold_bindings: Vec<(String, Expr)>,
+        strict_probability_domain: bool,
     },
     /// BEST BY operator: select best row per KEY group by ordered criteria.
     LocyBestBy {

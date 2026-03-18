@@ -443,6 +443,47 @@ async fn command_result_assume_rows(world: &mut LocyWorld, idx: usize, expected:
     }
 }
 
+#[then(
+    regex = r#"^the command result (\d+) should be an Assume containing row where (.+) = (.+)$"#
+)]
+async fn command_result_assume_containing_row(
+    world: &mut LocyWorld,
+    idx: usize,
+    field: String,
+    value_str: String,
+) {
+    let locy_result = world.locy_result().expect("No evaluation result found");
+
+    let result = locy_result.as_ref().expect("Evaluation failed");
+    let cmd = result
+        .command_results
+        .get(idx)
+        .unwrap_or_else(|| panic!("No command result at index {}", idx));
+
+    match cmd {
+        CommandResult::Assume(rows) => {
+            let expected = parse_gherkin_value(&value_str);
+            let found = rows.iter().any(|row| {
+                extract_field_value(row, field.trim())
+                    .map(|v| values_match(v, &expected))
+                    .unwrap_or(false)
+            });
+            assert!(
+                found,
+                "Expected Assume result {} to contain row where {} = {}, but not found in {} rows",
+                idx,
+                field,
+                value_str,
+                rows.len()
+            );
+        }
+        other => panic!(
+            "Expected command result {} to be an Assume, got {:?}",
+            idx, other
+        ),
+    }
+}
+
 #[then(regex = r#"^the command result (\d+) should be an Explain with rule ['"](.+)['"]$"#)]
 async fn command_result_explain_rule(world: &mut LocyWorld, idx: usize, rule_name: String) {
     let locy_result = world.locy_result().expect("No evaluation result found");

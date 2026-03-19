@@ -2041,6 +2041,7 @@ pub enum LogicalPlan {
         max_derived_bytes: usize,
         deterministic_best_by: bool,
         strict_probability_domain: bool,
+        probability_epsilon: f64,
     },
     /// FOLD operator: lattice-join non-key columns per KEY group.
     LocyFold {
@@ -2048,6 +2049,7 @@ pub enum LogicalPlan {
         key_columns: Vec<String>,
         fold_bindings: Vec<(String, Expr)>,
         strict_probability_domain: bool,
+        probability_epsilon: f64,
     },
     /// BEST BY operator: select best row per KEY group by ordered criteria.
     LocyBestBy {

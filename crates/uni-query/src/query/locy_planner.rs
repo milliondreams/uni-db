@@ -204,6 +204,7 @@ impl<'a> LocyPlanBuilder<'a> {
     }
 
     /// Build a full `LogicalPlan::LocyProgram` with embedded `DerivedScanRegistry`.
+    #[expect(clippy::too_many_arguments, reason = "mirrors LocyConfig fields")]
     pub fn build_program_plan(
         &self,
         compiled: &CompiledProgram,
@@ -212,6 +213,7 @@ impl<'a> LocyPlanBuilder<'a> {
         max_derived_bytes: usize,
         deterministic_best_by: bool,
         strict_probability_domain: bool,
+        probability_epsilon: f64,
     ) -> Result<LogicalPlan> {
         let mut strata = Vec::with_capacity(compiled.strata.len());
 
@@ -223,6 +225,7 @@ impl<'a> LocyPlanBuilder<'a> {
                 &compiled.rule_catalog,
                 &rule_names,
                 strict_probability_domain,
+                probability_epsilon,
             )?;
             strata.push(locy_stratum);
         }
@@ -237,6 +240,7 @@ impl<'a> LocyPlanBuilder<'a> {
             max_derived_bytes,
             deterministic_best_by,
             strict_probability_domain,
+            probability_epsilon,
         };
 
         Ok(plan)
@@ -278,6 +282,7 @@ impl<'a> LocyPlanBuilder<'a> {
         rule_catalog: &HashMap<String, CompiledRule>,
         stratum_rule_names: &HashSet<String>,
         strict_probability_domain: bool,
+        probability_epsilon: f64,
     ) -> Result<LocyStratum> {
         let mut rules = Vec::with_capacity(stratum.rules.len());
         for rule in &stratum.rules {
@@ -287,6 +292,7 @@ impl<'a> LocyPlanBuilder<'a> {
                 stratum_rule_names,
                 rule_catalog,
                 strict_probability_domain,
+                probability_epsilon,
             )?);
         }
 
@@ -307,6 +313,7 @@ impl<'a> LocyPlanBuilder<'a> {
         stratum_rule_names: &HashSet<String>,
         rule_catalog: &HashMap<String, CompiledRule>,
         strict_probability_domain: bool,
+        probability_epsilon: f64,
     ) -> Result<LocyRulePlan> {
         // Collect node variable names from match patterns for VID-based joins
         let node_vars = collect_node_vars(&rule.clauses);
@@ -321,6 +328,7 @@ impl<'a> LocyPlanBuilder<'a> {
                 rule_catalog,
                 &node_vars,
                 strict_probability_domain,
+                probability_epsilon,
             )?);
         }
 
@@ -393,6 +401,7 @@ impl<'a> LocyPlanBuilder<'a> {
         rule_catalog: &HashMap<String, CompiledRule>,
         node_vars: &HashSet<String>,
         strict_probability_domain: bool,
+        probability_epsilon: f64,
     ) -> Result<LocyClausePlan> {
         // Collect node variables from THIS clause's MATCH pattern only.
         // Used for IS-ref predicates: only variables in the current MATCH
@@ -731,6 +740,7 @@ impl<'a> LocyPlanBuilder<'a> {
                 key_columns,
                 fold_bindings,
                 strict_probability_domain,
+                probability_epsilon,
             };
         }
 
@@ -1418,7 +1428,7 @@ mod tests {
         };
         let names: HashSet<String> = ["base".to_string()].into();
         let result = builder
-            .build_stratum(&stratum, &catalog, &names, false)
+            .build_stratum(&stratum, &catalog, &names, false, 1e-15)
             .unwrap();
 
         assert_eq!(result.id, 0);
@@ -1448,7 +1458,7 @@ mod tests {
         };
         let names: HashSet<String> = ["reach".to_string()].into();
         let result = builder
-            .build_stratum(&stratum, &catalog, &names, false)
+            .build_stratum(&stratum, &catalog, &names, false, 1e-15)
             .unwrap();
 
         assert!(result.is_recursive);
@@ -1476,7 +1486,7 @@ mod tests {
         };
         let names: HashSet<String> = ["derived".to_string()].into();
         let result = builder
-            .build_stratum(&stratum, &catalog, &names, false)
+            .build_stratum(&stratum, &catalog, &names, false, 1e-15)
             .unwrap();
 
         assert_eq!(result.depends_on, vec![0, 1]);
@@ -1510,7 +1520,7 @@ mod tests {
         };
         let names: HashSet<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
         let result = builder
-            .build_stratum(&stratum, &catalog, &names, false)
+            .build_stratum(&stratum, &catalog, &names, false, 1e-15)
             .unwrap();
 
         assert_eq!(result.rules.len(), 3);
@@ -1538,7 +1548,7 @@ mod tests {
         let names: HashSet<String> = ["reachable".to_string()].into();
 
         let result = builder
-            .build_rule(&rule, false, &names, &catalog, false)
+            .build_rule(&rule, false, &names, &catalog, false, 1e-15)
             .unwrap();
         assert_eq!(result.name, "reachable");
         assert_eq!(result.yield_schema.len(), 2);
@@ -1563,7 +1573,7 @@ mod tests {
         let names: HashSet<String> = ["prio".to_string()].into();
 
         let result = builder
-            .build_rule(&rule, false, &names, &catalog, false)
+            .build_rule(&rule, false, &names, &catalog, false, 1e-15)
             .unwrap();
         assert_eq!(result.priority, Some(5));
     }
@@ -1582,7 +1592,7 @@ mod tests {
         let names: HashSet<String> = ["noprio".to_string()].into();
 
         let result = builder
-            .build_rule(&rule, false, &names, &catalog, false)
+            .build_rule(&rule, false, &names, &catalog, false, 1e-15)
             .unwrap();
         assert_eq!(result.priority, None);
     }
@@ -1605,7 +1615,7 @@ mod tests {
         let names: HashSet<String> = ["multi".to_string()].into();
 
         let result = builder
-            .build_rule(&rule, false, &names, &catalog, false)
+            .build_rule(&rule, false, &names, &catalog, false, 1e-15)
             .unwrap();
         assert_eq!(result.clauses.len(), 3);
     }
@@ -1628,7 +1638,7 @@ mod tests {
         let names: HashSet<String> = ["keyed".to_string()].into();
 
         let result = builder
-            .build_rule(&rule, false, &names, &catalog, false)
+            .build_rule(&rule, false, &names, &catalog, false, 1e-15)
             .unwrap();
         assert!(result.yield_schema[0].is_key);
         assert!(!result.yield_schema[1].is_key);
@@ -1658,6 +1668,7 @@ mod tests {
                 &catalog,
                 &HashSet::new(),
                 false,
+                1e-15,
             )
             .unwrap();
 
@@ -1697,6 +1708,7 @@ mod tests {
                 &catalog,
                 &HashSet::new(),
                 false,
+                1e-15,
             )
             .unwrap();
 
@@ -1747,6 +1759,7 @@ mod tests {
                 &catalog,
                 &HashSet::new(),
                 false,
+                1e-15,
             )
             .unwrap();
 
@@ -1807,6 +1820,7 @@ mod tests {
                 &catalog,
                 &HashSet::new(),
                 false,
+                1e-15,
             )
             .unwrap();
 
@@ -1855,6 +1869,7 @@ mod tests {
                 &catalog,
                 &HashSet::new(),
                 false,
+                1e-15,
             )
             .unwrap();
 
@@ -1925,6 +1940,7 @@ mod tests {
                 &catalog,
                 &HashSet::new(),
                 false,
+                1e-15,
             )
             .unwrap();
 
@@ -1982,6 +1998,7 @@ mod tests {
                 &catalog,
                 &HashSet::new(),
                 false,
+                1e-15,
             )
             .unwrap();
 
@@ -2032,6 +2049,7 @@ mod tests {
                 &catalog,
                 &HashSet::new(),
                 false,
+                1e-15,
             )
             .unwrap();
 
@@ -2083,6 +2101,7 @@ mod tests {
                 &catalog,
                 &HashSet::new(),
                 false,
+                1e-15,
             )
             .unwrap();
 
@@ -2123,6 +2142,7 @@ mod tests {
                 &catalog,
                 &HashSet::new(),
                 false,
+                1e-15,
             )
             .unwrap();
 
@@ -2159,6 +2179,7 @@ mod tests {
                 &catalog,
                 &HashSet::new(),
                 false,
+                1e-15,
             )
             .unwrap();
 
@@ -2232,6 +2253,7 @@ mod tests {
                 &catalog,
                 &HashSet::new(),
                 false,
+                1e-15,
             )
             .unwrap();
 
@@ -2280,6 +2302,7 @@ mod tests {
                 256 * 1024 * 1024,
                 true,
                 false,
+                1e-15,
             )
             .unwrap();
 
@@ -2337,6 +2360,7 @@ mod tests {
                 256 * 1024 * 1024,
                 true,
                 false,
+                1e-15,
             )
             .unwrap();
         let registry = if let LogicalPlan::LocyProgram {
@@ -2412,6 +2436,7 @@ mod tests {
                 256 * 1024 * 1024,
                 true,
                 false,
+                1e-15,
             )
             .unwrap();
 
@@ -2483,6 +2508,7 @@ mod tests {
                 256 * 1024 * 1024,
                 true,
                 false,
+                1e-15,
             )
             .unwrap();
         let registry = if let LogicalPlan::LocyProgram {
@@ -2562,6 +2588,7 @@ mod tests {
                 256 * 1024 * 1024,
                 true,
                 false,
+                1e-15,
             )
             .unwrap();
         let registry = if let LogicalPlan::LocyProgram {
@@ -2658,6 +2685,7 @@ mod tests {
                 256 * 1024 * 1024,
                 true,
                 false,
+                1e-15,
             )
             .unwrap();
         let registry = if let LogicalPlan::LocyProgram {
@@ -2718,6 +2746,7 @@ mod tests {
                 256 * 1024 * 1024,
                 true,
                 false,
+                1e-15,
             )
             .unwrap();
         let registry = if let LogicalPlan::LocyProgram {
@@ -2836,6 +2865,7 @@ mod tests {
                 256 * 1024 * 1024,
                 true,
                 false,
+                1e-15,
             )
             .unwrap();
         let registry = if let LogicalPlan::LocyProgram {
@@ -2902,6 +2932,7 @@ mod tests {
             &catalog,
             &HashSet::new(),
             false,
+            1e-15,
         );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -2945,6 +2976,7 @@ mod tests {
             &catalog,
             &HashSet::new(),
             false,
+            1e-15,
         );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -2991,6 +3023,7 @@ mod tests {
             &catalog,
             &HashSet::new(),
             false,
+            1e-15,
         );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -3032,6 +3065,7 @@ mod tests {
             &catalog,
             &HashSet::new(),
             false,
+            1e-15,
         );
         assert!(result.is_ok());
     }

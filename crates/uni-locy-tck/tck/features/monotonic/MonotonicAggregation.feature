@@ -362,3 +362,100 @@ Feature: Monotonic Aggregation (MSUM, MMAX, MMIN, MCOUNT)
     And the derived relation 'joint' should have 2 facts
     And the derived relation 'joint' should contain a fact where p = 0.25
     And the derived relation 'joint' should contain a fact where p = 0.8
+
+  # ── Spec-level assertions ─────────────────────────────────────────────
+
+  Scenario: MNOR spec example (0.7, 0.5) yields 0.85
+    Given having executed:
+      """
+      CREATE (a:Node {name: 'A'})-[:CAUSE {prob: 0.7}]->(b:Node {name: 'B'}),
+             (a)-[:CAUSE {prob: 0.5}]->(b)
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE risk AS
+        MATCH (a:Node)-[e:CAUSE]->(b:Node)
+        FOLD p = MNOR(e.prob)
+        YIELD KEY a, KEY b, p
+      """
+    Then evaluation should succeed
+    And the derived relation 'risk' should contain a fact where p = 0.85
+
+  Scenario: MNOR zero does not affect result
+    Given having executed:
+      """
+      CREATE (a:Node {name: 'A'})-[:CAUSE {prob: 0.0}]->(b:Node {name: 'B'}),
+             (a)-[:CAUSE {prob: 0.5}]->(b)
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE risk AS
+        MATCH (a:Node)-[e:CAUSE]->(b:Node)
+        FOLD p = MNOR(e.prob)
+        YIELD KEY a, KEY b, p
+      """
+    Then evaluation should succeed
+    And the derived relation 'risk' should contain a fact where p = 0.5
+
+  Scenario: MNOR all-ones yields one
+    Given having executed:
+      """
+      CREATE (a:Node {name: 'A'})-[:CAUSE {prob: 1.0}]->(b:Node {name: 'B'}),
+             (a)-[:CAUSE {prob: 1.0}]->(b)
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE risk AS
+        MATCH (a:Node)-[e:CAUSE]->(b:Node)
+        FOLD p = MNOR(e.prob)
+        YIELD KEY a, KEY b, p
+      """
+    Then evaluation should succeed
+    And the derived relation 'risk' should contain a fact where p = 1.0
+
+  Scenario: MPROD three-value (0.9, 0.8, 0.7) yields 0.504
+    Given having executed:
+      """
+      CREATE (a:Node {name: 'A'})-[:REQ {prob: 0.9}]->(b:Node {name: 'B'}),
+             (a)-[:REQ {prob: 0.8}]->(b),
+             (a)-[:REQ {prob: 0.7}]->(b)
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE joint AS
+        MATCH (a:Node)-[e:REQ]->(b:Node)
+        FOLD p = MPROD(e.prob)
+        YIELD KEY a, KEY b, p
+      """
+    Then evaluation should succeed
+    And the derived relation 'joint' should contain a fact where p = 0.504
+
+  Scenario: strict rejects MPROD input greater than one
+    Given having executed:
+      """
+      CREATE (a:Node {name: 'A'})-[:REQ {prob: 1.5}]->(b:Node {name: 'B'})
+      """
+    When evaluating the following Locy program with strict_probability_domain:
+      """
+      CREATE RULE joint AS
+        MATCH (a:Node)-[e:REQ]->(b:Node)
+        FOLD p = MPROD(e.prob)
+        YIELD KEY a, KEY b, p
+      """
+    Then evaluation should fail
+    And the evaluation error should mention 'strict_probability_domain'
+
+  Scenario: strict rejects negative MNOR input
+    Given having executed:
+      """
+      CREATE (a:Node {name: 'A'})-[:CAUSE {prob: -0.5}]->(b:Node {name: 'B'})
+      """
+    When evaluating the following Locy program with strict_probability_domain:
+      """
+      CREATE RULE risk AS
+        MATCH (a:Node)-[e:CAUSE]->(b:Node)
+        FOLD p = MNOR(e.prob)
+        YIELD KEY a, KEY b, p
+      """
+    Then evaluation should fail
+    And the evaluation error should mention 'strict_probability_domain'

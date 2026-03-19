@@ -143,8 +143,17 @@ impl MonotonicAggState {
         }
     }
 
-    /// Update accumulators with new delta batches. Returns true if any value changed.
-    pub fn update(&mut self, key_indices: &[usize], delta_batches: &[RecordBatch]) -> bool {
+    /// Update accumulators with new delta batches.
+    ///
+    /// Returns `true` if any accumulator value changed. When `strict` is
+    /// `true`, Nor/Prod inputs outside `[0, 1]` produce an error instead
+    /// of being clamped.
+    pub fn update(
+        &mut self,
+        key_indices: &[usize],
+        delta_batches: &[RecordBatch],
+        strict: bool,
+    ) -> DFResult<bool> {
         use crate::query::df_graph::locy_fold::FoldAggKind;
 
         let mut changed = false;
@@ -183,10 +192,36 @@ impl MonotonicAggState {
                                 }
                             }
                             FoldAggKind::Nor => {
+                                if strict && !(0.0..=1.0).contains(&val) {
+                                    return Err(datafusion::error::DataFusionError::Execution(
+                                        format!(
+                                            "strict_probability_domain: MNOR input {val} is outside [0, 1]"
+                                        ),
+                                    ));
+                                }
+                                if !strict && !(0.0..=1.0).contains(&val) {
+                                    tracing::warn!(
+                                        "MNOR input {val} outside [0,1], clamped to {}",
+                                        val.clamp(0.0, 1.0)
+                                    );
+                                }
                                 let p = val.clamp(0.0, 1.0);
                                 *entry = 1.0 - (1.0 - *entry) * (1.0 - p);
                             }
                             FoldAggKind::Prod => {
+                                if strict && !(0.0..=1.0).contains(&val) {
+                                    return Err(datafusion::error::DataFusionError::Execution(
+                                        format!(
+                                            "strict_probability_domain: MPROD input {val} is outside [0, 1]"
+                                        ),
+                                    ));
+                                }
+                                if !strict && !(0.0..=1.0).contains(&val) {
+                                    tracing::warn!(
+                                        "MPROD input {val} outside [0,1], clamped to {}",
+                                        val.clamp(0.0, 1.0)
+                                    );
+                                }
                                 let p = val.clamp(0.0, 1.0);
                                 *entry *= p;
                             }
@@ -199,7 +234,7 @@ impl MonotonicAggState {
                 }
             }
         }
-        changed
+        Ok(changed)
     }
 
     /// Take a snapshot of current accumulators for stability comparison.
@@ -359,6 +394,8 @@ pub struct FixpointState {
     monotonic_agg: Option<MonotonicAggState>,
     /// Arrow RowConverter-based dedup state; `None` triggers legacy fallback.
     row_dedup: Option<RowDedupState>,
+    /// Whether strict probability domain checks are enabled.
+    strict_probability_domain: bool,
 }
 
 impl FixpointState {
@@ -369,6 +406,7 @@ impl FixpointState {
         key_column_indices: Vec<usize>,
         max_derived_bytes: usize,
         monotonic_agg: Option<MonotonicAggState>,
+        strict_probability_domain: bool,
     ) -> Self {
         let num_cols = schema.fields().len();
         let row_dedup = RowDedupState::try_new(&schema);
@@ -383,6 +421,7 @@ impl FixpointState {
             max_derived_bytes,
             monotonic_agg,
             row_dedup,
+            strict_probability_domain,
         }
     }
 
@@ -430,7 +469,11 @@ impl FixpointState {
         // Update monotonic aggs
         if let Some(ref mut agg) = self.monotonic_agg {
             agg.snapshot();
-            agg.update(&self.key_column_indices, &delta);
+            agg.update(
+                &self.key_column_indices,
+                &delta,
+                self.strict_probability_domain,
+            )?;
         }
 
         // Append delta to facts
@@ -759,6 +802,7 @@ async fn run_fixpoint_loop(
     derivation_tracker: Option<Arc<DerivationTracker>>,
     iteration_counts: Arc<StdRwLock<HashMap<String, usize>>>,
     strict_probability_domain: bool,
+    probability_epsilon: f64,
 ) -> DFResult<Vec<RecordBatch>> {
     let start = Instant::now();
     let task_ctx = session_ctx.read().task_ctx();
@@ -787,6 +831,7 @@ async fn run_fixpoint_loop(
                 rule.key_column_indices.clone(),
                 max_derived_bytes,
                 monotonic_agg,
+                strict_probability_domain,
             )
         })
         .collect();
@@ -829,28 +874,31 @@ async fn run_fixpoint_loop(
                         if !neg_facts.is_empty() {
                             if binding.target_has_prob && rule.prob_column_name.is_some() {
                                 // Probabilistic complement: add 1-p column instead of filtering.
-                                // Only when both target has PROB and current rule has PROB;
-                                // otherwise fall back to Boolean anti-join.
+                                let complement_col =
+                                    format!("__prob_complement_{}", binding.rule_name);
                                 if let Some(prob_col) = &binding.target_prob_col {
-                                    for (left_col, right_col) in &binding.anti_join_cols {
-                                        let complement_col =
-                                            format!("__prob_complement_{}", binding.rule_name);
-                                        batches = apply_prob_complement(
-                                            batches,
-                                            &neg_facts,
-                                            left_col,
-                                            right_col,
-                                            prob_col,
-                                            &complement_col,
-                                        )?;
-                                    }
+                                    batches = apply_prob_complement_composite(
+                                        batches,
+                                        &neg_facts,
+                                        &binding.anti_join_cols,
+                                        prob_col,
+                                        &complement_col,
+                                    )?;
+                                } else {
+                                    // target_has_prob but no prob_col: fall back to anti-join.
+                                    batches = apply_anti_join_composite(
+                                        batches,
+                                        &neg_facts,
+                                        &binding.anti_join_cols,
+                                    )?;
                                 }
                             } else {
                                 // Boolean exclusion: anti-join (existing behavior)
-                                for (left_col, right_col) in &binding.anti_join_cols {
-                                    batches =
-                                        apply_anti_join(batches, &neg_facts, left_col, right_col)?;
-                                }
+                                batches = apply_anti_join_composite(
+                                    batches,
+                                    &neg_facts,
+                                    &binding.anti_join_cols,
+                                )?;
                             }
                         }
                     }
@@ -944,8 +992,14 @@ async fn run_fixpoint_loop(
             continue;
         }
 
-        let processed =
-            apply_post_fixpoint_chain(facts, rule, &task_ctx, strict_probability_domain).await?;
+        let processed = apply_post_fixpoint_chain(
+            facts,
+            rule,
+            &task_ctx,
+            strict_probability_domain,
+            probability_epsilon,
+        )
+        .await?;
         all_output.extend(processed);
     }
 
@@ -1200,6 +1254,235 @@ pub fn apply_prob_complement(
         let new_batch = RecordBatch::try_new(new_schema, columns)
             .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
         result.push(new_batch);
+    }
+    Ok(result)
+}
+
+/// Probabilistic complement for composite (multi-column) join keys.
+///
+/// Builds a composite key from all `join_cols` right-side columns in
+/// `neg_facts`, maps each composite key to a probability via noisy-OR
+/// combination, then adds a single `complement_col_name` column with
+/// `1 - p` for matched keys and `1.0` for absent keys.
+pub fn apply_prob_complement_composite(
+    batches: Vec<RecordBatch>,
+    neg_facts: &[RecordBatch],
+    join_cols: &[(String, String)],
+    prob_col: &str,
+    complement_col_name: &str,
+) -> datafusion::error::Result<Vec<RecordBatch>> {
+    use arrow_array::{Array as _, Float64Array, UInt64Array};
+
+    // Build composite-key → probability lookup from negative facts.
+    let mut prob_map: HashMap<Vec<u64>, f64> = HashMap::new();
+    for batch in neg_facts {
+        let right_indices: Vec<usize> = join_cols
+            .iter()
+            .filter_map(|(_, rc)| batch.schema().index_of(rc).ok())
+            .collect();
+        if right_indices.len() != join_cols.len() {
+            continue;
+        }
+        let Ok(prob_idx) = batch.schema().index_of(prob_col) else {
+            continue;
+        };
+        let prob_arr = batch.column(prob_idx);
+        let probs = prob_arr.as_any().downcast_ref::<Float64Array>();
+        for row in 0..batch.num_rows() {
+            let mut key = Vec::with_capacity(right_indices.len());
+            let mut valid = true;
+            for &ci in &right_indices {
+                let col = batch.column(ci);
+                if let Some(vids) = col.as_any().downcast_ref::<UInt64Array>() {
+                    if vids.is_null(row) {
+                        valid = false;
+                        break;
+                    }
+                    key.push(vids.value(row));
+                } else {
+                    valid = false;
+                    break;
+                }
+            }
+            if !valid {
+                continue;
+            }
+            let p = probs
+                .and_then(|arr| {
+                    if arr.is_null(row) {
+                        None
+                    } else {
+                        Some(arr.value(row))
+                    }
+                })
+                .unwrap_or(0.0);
+            // Noisy-OR combination for duplicate composite keys.
+            prob_map
+                .entry(key)
+                .and_modify(|existing| {
+                    *existing = 1.0 - (1.0 - *existing) * (1.0 - p);
+                })
+                .or_insert(p);
+        }
+    }
+
+    // Add complement column to each batch.
+    let mut result = Vec::new();
+    for batch in batches {
+        let left_indices: Vec<usize> = join_cols
+            .iter()
+            .filter_map(|(lc, _)| batch.schema().index_of(lc).ok())
+            .collect();
+        if left_indices.len() != join_cols.len() {
+            result.push(batch);
+            continue;
+        }
+        let all_u64 = left_indices.iter().all(|&ci| {
+            batch
+                .column(ci)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .is_some()
+        });
+        if !all_u64 {
+            result.push(batch);
+            continue;
+        }
+
+        let complements: Vec<f64> = (0..batch.num_rows())
+            .map(|row| {
+                let mut key = Vec::with_capacity(left_indices.len());
+                for &ci in &left_indices {
+                    let vids = batch
+                        .column(ci)
+                        .as_any()
+                        .downcast_ref::<UInt64Array>()
+                        .unwrap();
+                    if vids.is_null(row) {
+                        return 1.0;
+                    }
+                    key.push(vids.value(row));
+                }
+                let p = prob_map.get(&key).copied().unwrap_or(0.0);
+                1.0 - p
+            })
+            .collect();
+
+        let complement_arr = Float64Array::from(complements);
+        let mut columns: Vec<arrow_array::ArrayRef> = batch.columns().to_vec();
+        columns.push(Arc::new(complement_arr));
+
+        let mut fields: Vec<Arc<arrow_schema::Field>> =
+            batch.schema().fields().iter().cloned().collect();
+        fields.push(Arc::new(arrow_schema::Field::new(
+            complement_col_name,
+            arrow_schema::DataType::Float64,
+            true,
+        )));
+
+        let new_schema = Arc::new(arrow_schema::Schema::new(fields));
+        let new_batch = RecordBatch::try_new(new_schema, columns)
+            .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+        result.push(new_batch);
+    }
+    Ok(result)
+}
+
+/// Boolean anti-join for composite (multi-column) join keys.
+///
+/// Builds a `HashSet<Vec<u64>>` from `neg_facts` using all right-side
+/// columns in `join_cols`, then filters `batches` to keep only rows
+/// whose composite left-side key is NOT in the set.
+pub fn apply_anti_join_composite(
+    batches: Vec<RecordBatch>,
+    neg_facts: &[RecordBatch],
+    join_cols: &[(String, String)],
+) -> datafusion::error::Result<Vec<RecordBatch>> {
+    use arrow::compute::filter_record_batch;
+    use arrow_array::{Array as _, BooleanArray, UInt64Array};
+
+    // Collect composite keys from the negated rule's derived facts.
+    let mut banned: HashSet<Vec<u64>> = HashSet::new();
+    for batch in neg_facts {
+        let right_indices: Vec<usize> = join_cols
+            .iter()
+            .filter_map(|(_, rc)| batch.schema().index_of(rc).ok())
+            .collect();
+        if right_indices.len() != join_cols.len() {
+            continue;
+        }
+        for row in 0..batch.num_rows() {
+            let mut key = Vec::with_capacity(right_indices.len());
+            let mut valid = true;
+            for &ci in &right_indices {
+                let col = batch.column(ci);
+                if let Some(vids) = col.as_any().downcast_ref::<UInt64Array>() {
+                    if vids.is_null(row) {
+                        valid = false;
+                        break;
+                    }
+                    key.push(vids.value(row));
+                } else {
+                    valid = false;
+                    break;
+                }
+            }
+            if valid {
+                banned.insert(key);
+            }
+        }
+    }
+
+    if banned.is_empty() {
+        return Ok(batches);
+    }
+
+    // Filter body batches: keep rows where composite left key NOT IN banned.
+    let mut result = Vec::new();
+    for batch in batches {
+        let left_indices: Vec<usize> = join_cols
+            .iter()
+            .filter_map(|(lc, _)| batch.schema().index_of(lc).ok())
+            .collect();
+        if left_indices.len() != join_cols.len() {
+            result.push(batch);
+            continue;
+        }
+        let all_u64 = left_indices.iter().all(|&ci| {
+            batch
+                .column(ci)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .is_some()
+        });
+        if !all_u64 {
+            result.push(batch);
+            continue;
+        }
+
+        let keep: Vec<bool> = (0..batch.num_rows())
+            .map(|row| {
+                let mut key = Vec::with_capacity(left_indices.len());
+                for &ci in &left_indices {
+                    let vids = batch
+                        .column(ci)
+                        .as_any()
+                        .downcast_ref::<UInt64Array>()
+                        .unwrap();
+                    if vids.is_null(row) {
+                        return true; // null keys are never banned
+                    }
+                    key.push(vids.value(row));
+                }
+                !banned.contains(&key)
+            })
+            .collect();
+        let keep_arr = BooleanArray::from(keep);
+        let filtered = filter_record_batch(&batch, &keep_arr)
+            .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+        if filtered.num_rows() > 0 {
+            result.push(filtered);
+        }
     }
     Ok(result)
 }
@@ -1537,6 +1820,7 @@ pub(crate) async fn apply_post_fixpoint_chain(
     rule: &FixpointRulePlan,
     task_ctx: &Arc<TaskContext>,
     strict_probability_domain: bool,
+    probability_epsilon: f64,
 ) -> DFResult<Vec<RecordBatch>> {
     if !rule.has_fold && !rule.has_best_by && !rule.has_priority {
         return Ok(facts);
@@ -1572,6 +1856,7 @@ pub(crate) async fn apply_post_fixpoint_chain(
             rule.key_column_indices.clone(),
             rule.fold_bindings.clone(),
             strict_probability_domain,
+            probability_epsilon,
         ))
     } else {
         current
@@ -1619,6 +1904,7 @@ pub struct FixpointExec {
     /// Shared slot written with per-rule iteration counts after convergence.
     iteration_counts: Arc<StdRwLock<HashMap<String, usize>>>,
     strict_probability_domain: bool,
+    probability_epsilon: f64,
 }
 
 impl fmt::Debug for FixpointExec {
@@ -1651,6 +1937,7 @@ impl FixpointExec {
         derivation_tracker: Option<Arc<DerivationTracker>>,
         iteration_counts: Arc<StdRwLock<HashMap<String, usize>>>,
         strict_probability_domain: bool,
+        probability_epsilon: f64,
     ) -> Self {
         let properties = compute_plan_properties(Arc::clone(&output_schema));
         Self {
@@ -1670,6 +1957,7 @@ impl FixpointExec {
             derivation_tracker,
             iteration_counts,
             strict_probability_domain,
+            probability_epsilon,
         }
     }
 
@@ -1782,6 +2070,7 @@ impl ExecutionPlan for FixpointExec {
         let derivation_tracker = self.derivation_tracker.clone();
         let iteration_counts = Arc::clone(&self.iteration_counts);
         let strict_probability_domain = self.strict_probability_domain;
+        let probability_epsilon = self.probability_epsilon;
 
         let fut = async move {
             run_fixpoint_loop(
@@ -1799,6 +2088,7 @@ impl ExecutionPlan for FixpointExec {
                 derivation_tracker,
                 iteration_counts,
                 strict_probability_domain,
+                probability_epsilon,
             )
             .await
         };
@@ -1913,7 +2203,7 @@ mod tests {
     #[tokio::test]
     async fn test_fixpoint_state_empty_facts_adds_all() {
         let schema = test_schema();
-        let mut state = FixpointState::new("test".into(), schema, vec![0], 1_000_000, None);
+        let mut state = FixpointState::new("test".into(), schema, vec![0], 1_000_000, None, false);
 
         let batch = make_batch(&["a", "b", "c"], &[1, 2, 3]);
         let changed = state.merge_delta(vec![batch], None).await.unwrap();
@@ -1928,7 +2218,7 @@ mod tests {
     #[tokio::test]
     async fn test_fixpoint_state_exact_duplicates_excluded() {
         let schema = test_schema();
-        let mut state = FixpointState::new("test".into(), schema, vec![0], 1_000_000, None);
+        let mut state = FixpointState::new("test".into(), schema, vec![0], 1_000_000, None, false);
 
         let batch1 = make_batch(&["a", "b"], &[1, 2]);
         state.merge_delta(vec![batch1], None).await.unwrap();
@@ -1945,7 +2235,7 @@ mod tests {
     #[tokio::test]
     async fn test_fixpoint_state_partial_overlap() {
         let schema = test_schema();
-        let mut state = FixpointState::new("test".into(), schema, vec![0], 1_000_000, None);
+        let mut state = FixpointState::new("test".into(), schema, vec![0], 1_000_000, None, false);
 
         let batch1 = make_batch(&["a", "b"], &[1, 2]);
         state.merge_delta(vec![batch1], None).await.unwrap();
@@ -1967,7 +2257,7 @@ mod tests {
     #[tokio::test]
     async fn test_fixpoint_state_convergence() {
         let schema = test_schema();
-        let mut state = FixpointState::new("test".into(), schema, vec![0], 1_000_000, None);
+        let mut state = FixpointState::new("test".into(), schema, vec![0], 1_000_000, None, false);
 
         let batch = make_batch(&["a"], &[1]);
         state.merge_delta(vec![batch], None).await.unwrap();
@@ -2156,13 +2446,13 @@ mod tests {
         // First update
         let batch = make_batch(&["a"], &[10]);
         agg.snapshot();
-        let changed = agg.update(&[0], &[batch]);
+        let changed = agg.update(&[0], &[batch], false).unwrap();
         assert!(changed);
         assert!(!agg.is_stable()); // changed since snapshot
 
         // Snapshot and check stability with no new data
         agg.snapshot();
-        let changed = agg.update(&[0], &[]);
+        let changed = agg.update(&[0], &[], false).unwrap();
         assert!(!changed);
         assert!(agg.is_stable());
     }
@@ -2173,7 +2463,7 @@ mod tests {
     async fn test_memory_limit_exceeded() {
         let schema = test_schema();
         // Set a tiny limit
-        let mut state = FixpointState::new("test".into(), schema, vec![0], 1, None);
+        let mut state = FixpointState::new("test".into(), schema, vec![0], 1, None, false);
 
         let batch = make_batch(&["a", "b", "c"], &[1, 2, 3]);
         let result = state.merge_delta(vec![batch], None).await;
@@ -2254,7 +2544,7 @@ mod tests {
     fn test_monotonic_nor_first_update() {
         let mut agg = MonotonicAggState::new(make_nor_binding());
         let batch = make_f64_batch(&["a"], &[0.3]);
-        let changed = agg.update(&[0], &[batch]);
+        let changed = agg.update(&[0], &[batch], false).unwrap();
         assert!(changed);
         let val = agg.get_accumulator(&acc_key("a")).unwrap();
         assert!((val - 0.3).abs() < 1e-10, "expected 0.3, got {}", val);
@@ -2265,9 +2555,9 @@ mod tests {
         // Incremental NOR: acc = 1-(1-0.3)(1-0.5) = 0.65
         let mut agg = MonotonicAggState::new(make_nor_binding());
         let batch1 = make_f64_batch(&["a"], &[0.3]);
-        agg.update(&[0], &[batch1]);
+        agg.update(&[0], &[batch1], false).unwrap();
         let batch2 = make_f64_batch(&["a"], &[0.5]);
-        agg.update(&[0], &[batch2]);
+        agg.update(&[0], &[batch2], false).unwrap();
         let val = agg.get_accumulator(&acc_key("a")).unwrap();
         assert!((val - 0.65).abs() < 1e-10, "expected 0.65, got {}", val);
     }
@@ -2276,7 +2566,7 @@ mod tests {
     fn test_monotonic_prod_first_update() {
         let mut agg = MonotonicAggState::new(make_prod_binding());
         let batch = make_f64_batch(&["a"], &[0.6]);
-        let changed = agg.update(&[0], &[batch]);
+        let changed = agg.update(&[0], &[batch], false).unwrap();
         assert!(changed);
         let val = agg.get_accumulator(&acc_key("a")).unwrap();
         assert!((val - 0.6).abs() < 1e-10, "expected 0.6, got {}", val);
@@ -2287,9 +2577,9 @@ mod tests {
         // Incremental PROD: acc = 0.6 * 0.8 = 0.48
         let mut agg = MonotonicAggState::new(make_prod_binding());
         let batch1 = make_f64_batch(&["a"], &[0.6]);
-        agg.update(&[0], &[batch1]);
+        agg.update(&[0], &[batch1], false).unwrap();
         let batch2 = make_f64_batch(&["a"], &[0.8]);
-        agg.update(&[0], &[batch2]);
+        agg.update(&[0], &[batch2], false).unwrap();
         let val = agg.get_accumulator(&acc_key("a")).unwrap();
         assert!((val - 0.48).abs() < 1e-10, "expected 0.48, got {}", val);
     }
@@ -2298,9 +2588,9 @@ mod tests {
     fn test_monotonic_nor_stability() {
         let mut agg = MonotonicAggState::new(make_nor_binding());
         let batch = make_f64_batch(&["a"], &[0.3]);
-        agg.update(&[0], &[batch]);
+        agg.update(&[0], &[batch], false).unwrap();
         agg.snapshot();
-        let changed = agg.update(&[0], &[]);
+        let changed = agg.update(&[0], &[], false).unwrap();
         assert!(!changed);
         assert!(agg.is_stable());
     }
@@ -2309,9 +2599,9 @@ mod tests {
     fn test_monotonic_prod_stability() {
         let mut agg = MonotonicAggState::new(make_prod_binding());
         let batch = make_f64_batch(&["a"], &[0.6]);
-        agg.update(&[0], &[batch]);
+        agg.update(&[0], &[batch], false).unwrap();
         agg.snapshot();
-        let changed = agg.update(&[0], &[]);
+        let changed = agg.update(&[0], &[], false).unwrap();
         assert!(!changed);
         assert!(agg.is_stable());
     }
@@ -2321,9 +2611,9 @@ mod tests {
         // (a,0.3),(b,0.5) then (a,0.5),(b,0.2) → a=0.65, b=0.6
         let mut agg = MonotonicAggState::new(make_nor_binding());
         let batch1 = make_f64_batch(&["a", "b"], &[0.3, 0.5]);
-        agg.update(&[0], &[batch1]);
+        agg.update(&[0], &[batch1], false).unwrap();
         let batch2 = make_f64_batch(&["a", "b"], &[0.5, 0.2]);
-        agg.update(&[0], &[batch2]);
+        agg.update(&[0], &[batch2], false).unwrap();
 
         let val_a = agg.get_accumulator(&acc_key("a")).unwrap();
         let val_b = agg.get_accumulator(&acc_key("b")).unwrap();
@@ -2340,9 +2630,9 @@ mod tests {
         // Zero absorbs: once 0.0, all further updates stay 0.0
         let mut agg = MonotonicAggState::new(make_prod_binding());
         let batch1 = make_f64_batch(&["a"], &[0.5]);
-        agg.update(&[0], &[batch1]);
+        agg.update(&[0], &[batch1], false).unwrap();
         let batch2 = make_f64_batch(&["a"], &[0.0]);
-        agg.update(&[0], &[batch2]);
+        agg.update(&[0], &[batch2], false).unwrap();
 
         let val = agg.get_accumulator(&acc_key("a")).unwrap();
         assert!((val - 0.0).abs() < 1e-10, "expected 0.0, got {}", val);
@@ -2350,7 +2640,7 @@ mod tests {
         // Further updates don't change the absorbing zero
         agg.snapshot();
         let batch3 = make_f64_batch(&["a"], &[0.5]);
-        let changed = agg.update(&[0], &[batch3]);
+        let changed = agg.update(&[0], &[batch3], false).unwrap();
         assert!(!changed);
         assert!(agg.is_stable());
     }
@@ -2360,7 +2650,7 @@ mod tests {
         // 1.5 clamped to 1.0: acc = 1-(1-0)(1-1) = 1.0
         let mut agg = MonotonicAggState::new(make_nor_binding());
         let batch = make_f64_batch(&["a"], &[1.5]);
-        agg.update(&[0], &[batch]);
+        agg.update(&[0], &[batch], false).unwrap();
         let val = agg.get_accumulator(&acc_key("a")).unwrap();
         assert!((val - 1.0).abs() < 1e-10, "expected 1.0, got {}", val);
     }
@@ -2370,9 +2660,9 @@ mod tests {
         // p=1.0 absorbs: 0.3 then 1.0 → 1.0
         let mut agg = MonotonicAggState::new(make_nor_binding());
         let batch1 = make_f64_batch(&["a"], &[0.3]);
-        agg.update(&[0], &[batch1]);
+        agg.update(&[0], &[batch1], false).unwrap();
         let batch2 = make_f64_batch(&["a"], &[1.0]);
-        agg.update(&[0], &[batch2]);
+        agg.update(&[0], &[batch2], false).unwrap();
         let val = agg.get_accumulator(&acc_key("a")).unwrap();
         assert!((val - 1.0).abs() < 1e-10, "expected 1.0, got {}", val);
     }

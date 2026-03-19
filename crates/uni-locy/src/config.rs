@@ -24,6 +24,12 @@ pub struct LocyConfig {
     /// When true, MNOR/MPROD reject values outside [0,1] with an error instead
     /// of clamping. When false (default), values are clamped silently.
     pub strict_probability_domain: bool,
+    /// Underflow threshold for MPROD log-space switch (spec §5.3).
+    ///
+    /// When the running product drops below this value, `product_f64`
+    /// switches to log-space accumulation to prevent floating-point
+    /// underflow.
+    pub probability_epsilon: f64,
 }
 
 impl Default for LocyConfig {
@@ -38,6 +44,7 @@ impl Default for LocyConfig {
             max_derived_bytes: 256 * 1024 * 1024,
             deterministic_best_by: true,
             strict_probability_domain: false,
+            probability_epsilon: 1e-15,
         }
     }
 }

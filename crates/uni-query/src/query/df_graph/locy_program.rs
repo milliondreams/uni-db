@@ -113,6 +113,7 @@ pub struct LocyProgramExec {
     max_derived_bytes: usize,
     deterministic_best_by: bool,
     strict_probability_domain: bool,
+    probability_epsilon: f64,
     /// Shared slot for extracting the DerivedStore after execution completes.
     derived_store_slot: Arc<StdRwLock<Option<DerivedStore>>>,
     /// Optional provenance tracker injected after construction (via `set_derivation_tracker`).
@@ -153,6 +154,7 @@ impl LocyProgramExec {
         max_derived_bytes: usize,
         deterministic_best_by: bool,
         strict_probability_domain: bool,
+        probability_epsilon: f64,
     ) -> Self {
         let properties = compute_plan_properties(Arc::clone(&output_schema));
         Self {
@@ -172,6 +174,7 @@ impl LocyProgramExec {
             max_derived_bytes,
             deterministic_best_by,
             strict_probability_domain,
+            probability_epsilon,
             derived_store_slot: Arc::new(StdRwLock::new(None)),
             derivation_tracker: Arc::new(StdRwLock::new(None)),
             iteration_counts_slot: Arc::new(StdRwLock::new(HashMap::new())),
@@ -280,6 +283,7 @@ impl ExecutionPlan for LocyProgramExec {
         let max_derived_bytes = self.max_derived_bytes;
         let deterministic_best_by = self.deterministic_best_by;
         let strict_probability_domain = self.strict_probability_domain;
+        let probability_epsilon = self.probability_epsilon;
         let derived_store_slot = Arc::clone(&self.derived_store_slot);
         let iteration_counts_slot = Arc::clone(&self.iteration_counts_slot);
         let peak_memory_slot = Arc::clone(&self.peak_memory_slot);
@@ -300,6 +304,7 @@ impl ExecutionPlan for LocyProgramExec {
                 max_derived_bytes,
                 deterministic_best_by,
                 strict_probability_domain,
+                probability_epsilon,
                 derived_store_slot,
                 iteration_counts_slot,
                 peak_memory_slot,
@@ -398,6 +403,7 @@ async fn run_program(
     max_derived_bytes: usize,
     deterministic_best_by: bool,
     strict_probability_domain: bool,
+    probability_epsilon: f64,
     derived_store_slot: Arc<StdRwLock<Option<DerivedStore>>>,
     iteration_counts_slot: Arc<StdRwLock<HashMap<String, usize>>>,
     peak_memory_slot: Arc<StdRwLock<usize>>,
@@ -439,6 +445,7 @@ async fn run_program(
                 derivation_tracker.clone(),
                 Arc::clone(&iteration_counts_slot),
                 strict_probability_domain,
+                probability_epsilon,
             );
 
             let task_ctx = session_ctx.read().task_ctx();
@@ -484,21 +491,22 @@ async fn run_program(
             let task_ctx = session_ctx.read().task_ctx();
 
             for (rule, fp_rule) in stratum.rules.iter().zip(fixpoint_rules.iter()) {
-                let mut facts = evaluate_non_recursive_rule(
-                    rule,
-                    &params,
-                    &graph_ctx,
-                    &session_ctx,
-                    &storage,
-                    &schema_info,
-                )
-                .await?;
+                // Process each clause independently (per-clause IS NOT).
+                let mut all_clause_facts: Vec<RecordBatch> = Vec::new();
+                for (clause, fp_clause) in rule.clauses.iter().zip(fp_rule.clauses.iter()) {
+                    let mut batches = execute_subplan(
+                        &clause.body,
+                        &params,
+                        &HashMap::new(),
+                        &graph_ctx,
+                        &session_ctx,
+                        &storage,
+                        &schema_info,
+                    )
+                    .await?;
 
-                // Apply negated IS-ref semantics: probabilistic complement or anti-join.
-                // For non-recursive rules, the negated rule is always in a lower stratum,
-                // so its facts are already in the registry from write_cross_stratum_facts.
-                for clause in &fp_rule.clauses {
-                    for binding in &clause.is_ref_bindings {
+                    // Apply negated IS-ref semantics per-clause.
+                    for binding in &fp_clause.is_ref_bindings {
                         if binding.negated
                             && !binding.anti_join_cols.is_empty()
                             && let Some(entry) = registry.get(binding.derived_scan_index)
@@ -506,62 +514,66 @@ async fn run_program(
                             let neg_facts = entry.data.read().clone();
                             if !neg_facts.is_empty() {
                                 if binding.target_has_prob && fp_rule.prob_column_name.is_some() {
-                                    // Probabilistic complement: add 1-p column instead of filtering.
-                                    // Only when both target has PROB and current rule has PROB;
-                                    // otherwise fall back to Boolean anti-join.
+                                    let complement_col =
+                                        format!("__prob_complement_{}", binding.rule_name);
                                     if let Some(prob_col) = &binding.target_prob_col {
-                                        for (left_col, right_col) in &binding.anti_join_cols {
-                                            let complement_col =
-                                                format!("__prob_complement_{}", binding.rule_name);
-                                            facts = super::locy_fixpoint::apply_prob_complement(
-                                                facts,
+                                        batches =
+                                            super::locy_fixpoint::apply_prob_complement_composite(
+                                                batches,
                                                 &neg_facts,
-                                                left_col,
-                                                right_col,
+                                                &binding.anti_join_cols,
                                                 prob_col,
                                                 &complement_col,
                                             )?;
-                                        }
-                                    }
-                                } else {
-                                    // Boolean exclusion: anti-join (existing behavior)
-                                    for (left_col, right_col) in &binding.anti_join_cols {
-                                        facts = super::locy_fixpoint::apply_anti_join(
-                                            facts, &neg_facts, left_col, right_col,
+                                    } else {
+                                        // target_has_prob but no prob_col: fall back to anti-join.
+                                        batches = super::locy_fixpoint::apply_anti_join_composite(
+                                            batches,
+                                            &neg_facts,
+                                            &binding.anti_join_cols,
                                         )?;
                                     }
+                                } else {
+                                    batches = super::locy_fixpoint::apply_anti_join_composite(
+                                        batches,
+                                        &neg_facts,
+                                        &binding.anti_join_cols,
+                                    )?;
                                 }
                             }
                         }
                     }
+
+                    // Multiply complement columns into PROB per-clause.
+                    let complement_cols: Vec<String> = if !batches.is_empty() {
+                        batches[0]
+                            .schema()
+                            .fields()
+                            .iter()
+                            .filter(|f| f.name().starts_with("__prob_complement_"))
+                            .map(|f| f.name().clone())
+                            .collect()
+                    } else {
+                        vec![]
+                    };
+                    if !complement_cols.is_empty() {
+                        batches = super::locy_fixpoint::multiply_prob_factors(
+                            batches,
+                            fp_rule.prob_column_name.as_deref(),
+                            &complement_cols,
+                        )?;
+                    }
+
+                    all_clause_facts.extend(batches);
                 }
 
-                // Multiply complement columns into the PROB column (if any) and clean up
-                let complement_cols: Vec<String> = if !facts.is_empty() {
-                    facts[0]
-                        .schema()
-                        .fields()
-                        .iter()
-                        .filter(|f| f.name().starts_with("__prob_complement_"))
-                        .map(|f| f.name().clone())
-                        .collect()
-                } else {
-                    vec![]
-                };
-                if !complement_cols.is_empty() {
-                    facts = super::locy_fixpoint::multiply_prob_factors(
-                        facts,
-                        fp_rule.prob_column_name.as_deref(),
-                        &complement_cols,
-                    )?;
-                }
-
-                // Apply post-fixpoint operators (PRIORITY, FOLD, BEST BY)
+                // Apply post-fixpoint operators (PRIORITY, FOLD, BEST BY) on union.
                 let facts = super::locy_fixpoint::apply_post_fixpoint_chain(
-                    facts,
+                    all_clause_facts,
                     fp_rule,
                     &task_ctx,
                     strict_probability_domain,
+                    probability_epsilon,
                 )
                 .await?;
 
@@ -592,37 +604,6 @@ async fn run_program(
     let stats = vec![build_stats_batch(&derived_store, &strata, output_schema)];
     *derived_store_slot.write().unwrap() = Some(derived_store);
     Ok(stats)
-}
-
-// ---------------------------------------------------------------------------
-// Non-recursive stratum evaluation
-// ---------------------------------------------------------------------------
-
-async fn evaluate_non_recursive_rule(
-    rule: &LocyRulePlan,
-    params: &HashMap<String, Value>,
-    graph_ctx: &Arc<GraphExecutionContext>,
-    session_ctx: &Arc<RwLock<datafusion::prelude::SessionContext>>,
-    storage: &Arc<StorageManager>,
-    schema_info: &Arc<UniSchema>,
-) -> DFResult<Vec<RecordBatch>> {
-    let mut all_batches = Vec::new();
-
-    for clause in &rule.clauses {
-        let batches = execute_subplan(
-            &clause.body,
-            params,
-            &HashMap::new(),
-            graph_ctx,
-            session_ctx,
-            storage,
-            schema_info,
-        )
-        .await?;
-        all_batches.extend(batches);
-    }
-
-    Ok(all_batches)
 }
 
 // ---------------------------------------------------------------------------

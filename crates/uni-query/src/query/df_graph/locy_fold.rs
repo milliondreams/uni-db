@@ -53,6 +53,7 @@ pub struct FoldExec {
     key_indices: Vec<usize>,
     fold_bindings: Vec<FoldBinding>,
     strict_probability_domain: bool,
+    probability_epsilon: f64,
     schema: SchemaRef,
     properties: PlanProperties,
     metrics: ExecutionPlanMetricsSet,
@@ -70,6 +71,7 @@ impl FoldExec {
         key_indices: Vec<usize>,
         fold_bindings: Vec<FoldBinding>,
         strict_probability_domain: bool,
+        probability_epsilon: f64,
     ) -> Self {
         let input_schema = input.schema();
         let schema = Self::build_output_schema(&input_schema, &key_indices, &fold_bindings);
@@ -80,6 +82,7 @@ impl FoldExec {
             key_indices,
             fold_bindings,
             strict_probability_domain,
+            probability_epsilon,
             schema,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -165,6 +168,7 @@ impl ExecutionPlan for FoldExec {
             self.key_indices.clone(),
             self.fold_bindings.clone(),
             self.strict_probability_domain,
+            self.probability_epsilon,
         )))
     }
 
@@ -178,6 +182,7 @@ impl ExecutionPlan for FoldExec {
         let key_indices = self.key_indices.clone();
         let fold_bindings = self.fold_bindings.clone();
         let strict = self.strict_probability_domain;
+        let epsilon = self.probability_epsilon;
         let output_schema = Arc::clone(&self.schema);
         let input_schema = self.input.schema();
 
@@ -234,6 +239,7 @@ impl ExecutionPlan for FoldExec {
                     &groups,
                     num_groups,
                     strict,
+                    epsilon,
                 )?;
                 output_columns.push(agg_col);
             }
@@ -265,6 +271,7 @@ fn compute_fold_aggregate(
     groups: &HashMap<Vec<ScalarKey>, Vec<usize>>,
     num_groups: usize,
     strict: bool,
+    probability_epsilon: f64,
 ) -> DFResult<arrow_array::ArrayRef> {
     match kind {
         FoldAggKind::Sum => {
@@ -322,7 +329,7 @@ fn compute_fold_aggregate(
         FoldAggKind::Prod => {
             let mut builder = Float64Builder::with_capacity(num_groups);
             for key in ordered_keys {
-                builder.append_option(product_f64(col, &groups[key], strict)?);
+                builder.append_option(product_f64(col, &groups[key], strict, probability_epsilon)?);
             }
             Ok(Arc::new(builder.finish()))
         }
@@ -367,6 +374,12 @@ fn noisy_or_f64(col: &dyn Array, indices: &[usize], strict: bool) -> DFResult<Op
                 "strict_probability_domain: MNOR input {raw} is outside [0, 1]"
             )));
         }
+        if !strict && !(0.0..=1.0).contains(&raw) {
+            tracing::warn!(
+                "MNOR input {raw} outside [0,1], clamped to {}",
+                raw.clamp(0.0, 1.0)
+            );
+        }
         let p = raw.clamp(0.0, 1.0);
         complement_product *= 1.0 - p;
     }
@@ -378,8 +391,15 @@ fn noisy_or_f64(col: &dyn Array, indices: &[usize], strict: bool) -> DFResult<Op
 }
 
 /// Product: P = ∏ pᵢ. Inputs clamped to [0, 1] unless strict.
-/// Switches to log-space when the running product drops below 1e-15 to prevent underflow.
-fn product_f64(col: &dyn Array, indices: &[usize], strict: bool) -> DFResult<Option<f64>> {
+///
+/// Switches to log-space when the running product drops below
+/// `probability_epsilon` to prevent floating-point underflow.
+fn product_f64(
+    col: &dyn Array,
+    indices: &[usize],
+    strict: bool,
+    probability_epsilon: f64,
+) -> DFResult<Option<f64>> {
     let mut product = 1.0;
     let mut log_sum = 0.0;
     let mut use_log = false;
@@ -401,6 +421,12 @@ fn product_f64(col: &dyn Array, indices: &[usize], strict: bool) -> DFResult<Opt
                 "strict_probability_domain: MPROD input {raw} is outside [0, 1]"
             )));
         }
+        if !strict && !(0.0..=1.0).contains(&raw) {
+            tracing::warn!(
+                "MPROD input {raw} outside [0,1], clamped to {}",
+                raw.clamp(0.0, 1.0)
+            );
+        }
         let p = raw.clamp(0.0, 1.0);
         if p == 0.0 {
             return Ok(Some(0.0));
@@ -409,7 +435,7 @@ fn product_f64(col: &dyn Array, indices: &[usize], strict: bool) -> DFResult<Opt
             log_sum += p.ln();
         } else {
             product *= p;
-            if product < 1e-15 {
+            if product < probability_epsilon {
                 // Switch to log-space to prevent underflow
                 log_sum = product.ln();
                 use_log = true;
@@ -701,7 +727,7 @@ mod tests {
         key_indices: Vec<usize>,
         fold_bindings: Vec<FoldBinding>,
     ) -> RecordBatch {
-        let exec = FoldExec::new(input, key_indices, fold_bindings, false);
+        let exec = FoldExec::new(input, key_indices, fold_bindings, false, 1e-15);
         let ctx = SessionContext::new();
         let task_ctx = ctx.task_ctx();
         let stream = exec.execute(0, task_ctx).unwrap();

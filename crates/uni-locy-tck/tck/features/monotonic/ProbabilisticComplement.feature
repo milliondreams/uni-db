@@ -221,3 +221,26 @@ Feature: Probabilistic Complement (PROB + IS NOT)
       """
     Then evaluation should succeed
     And the derived relation 'risk' should have 1 facts
+
+  Scenario: IS NOT complement after non-recursive PROB rule
+    Given having executed:
+      """
+      CREATE (:Node {name: 'Alice'})-[:HAS_RISK]->(:Risk {score: 0.8}),
+             (:Node {name: 'Bob'})-[:HAS_RISK]->(:Risk {score: 0.4}),
+             (:Node {name: 'Charlie'})
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE risky AS
+        MATCH (n:Node)-[:HAS_RISK]->(r:Risk)
+        YIELD KEY n, r.score AS risk_score PROB
+      CREATE RULE safe AS
+        MATCH (n:Node)
+        WHERE n IS NOT risky
+        YIELD KEY n, 1.0 AS safety PROB
+      """
+    Then evaluation should succeed
+    And the derived relation 'safe' should have 3 facts
+    And the derived relation 'safe' should contain a fact where n.name = 'Alice' and safety = 0.2
+    And the derived relation 'safe' should contain a fact where n.name = 'Bob' and safety = 0.6
+    And the derived relation 'safe' should contain a fact where n.name = 'Charlie' and safety = 1.0

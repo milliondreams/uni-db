@@ -15,7 +15,9 @@ use uni_locy::types::CompiledClause;
 use uni_locy::{LocyError, Row};
 
 use super::locy_ast_builder::expr_references_var;
-use super::locy_eval::{eval_expr, eval_locy_expr, record_batches_to_locy_rows, values_equal};
+use super::locy_eval::{
+    eval_expr, eval_locy_expr, record_batches_to_locy_rows, values_equal_for_join,
+};
 use super::locy_traits::DerivedFactSource;
 
 /// A tuple of key column values used for indexing derived facts.
@@ -81,7 +83,7 @@ fn is_ref_matches(
         }
         let base_val = base_row.get(subject).cloned().unwrap_or(Value::Null);
         let fact_val = derived_fact.get(&schema[i]).cloned().unwrap_or(Value::Null);
-        if !values_equal(&base_val, &fact_val) {
+        if !values_equal_for_join(&base_val, &fact_val) {
             return false;
         }
     }

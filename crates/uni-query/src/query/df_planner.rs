@@ -2905,12 +2905,21 @@ impl HybridPhysicalPlanner {
             );
             let physical_expr = compiler.compile(expr, &schema)?;
 
-            // CAST if the compiled expression's output type doesn't match target
+            // CAST if the compiled expression's output type doesn't match target.
+            // Skip coercion when actual is a string type but target is numeric
+            // (or vice versa) — this means `infer_expr_type` guessed wrong
+            // (e.g. defaulting Property to Float64 for a string column).
             let physical_expr = if let Some(target_dt) = target_type {
                 let actual_dt = physical_expr
                     .data_type(schema.as_ref())
                     .unwrap_or(DataType::LargeUtf8);
-                if actual_dt != *target_dt {
+                let is_string = |dt: &DataType| matches!(dt, DataType::Utf8 | DataType::LargeUtf8);
+                let is_numeric = |dt: &DataType| {
+                    matches!(dt, DataType::Int64 | DataType::Float64 | DataType::UInt64)
+                };
+                let cross_domain = (is_string(&actual_dt) && is_numeric(target_dt))
+                    || (is_numeric(&actual_dt) && is_string(target_dt));
+                if actual_dt != *target_dt && !cross_domain {
                     coerce_physical_expr(physical_expr, &actual_dt, target_dt, schema.as_ref())
                 } else {
                     physical_expr

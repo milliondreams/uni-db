@@ -1,0 +1,94 @@
+{
+  "edge_types": {
+    "ALARM": { "id": 1, "src_labels": [], "dst_labels": [] },
+    "CAUSE": { "id": 2, "src_labels": [], "dst_labels": [] },
+    "DEP": { "id": 3, "src_labels": [], "dst_labels": [] },
+    "HAS_ASM": { "id": 4, "src_labels": [], "dst_labels": [] },
+    "INFECTS": { "id": 5, "src_labels": [], "dst_labels": [] },
+    "REQ": { "id": 6, "src_labels": [], "dst_labels": [] },
+    "REQUIRES": { "id": 7, "src_labels": [], "dst_labels": [] },
+    "ROUTE": { "id": 8, "src_labels": [], "dst_labels": [] },
+    "SENSOR": { "id": 9, "src_labels": [], "dst_labels": [] },
+    "SUPPLIED_BY": { "id": 10, "src_labels": [], "dst_labels": [] },
+    "USES": { "id": 11, "src_labels": [], "dst_labels": [] }
+  },
+  "indexes": [],
+  "labels": {
+    "Assembly": { "id": 1 },
+    "Comp": { "id": 2 },
+    "Host": { "id": 3 },
+    "Node": { "id": 4 },
+    "Part": { "id": 5 },
+    "Plant": { "id": 6 },
+    "Route": { "id": 7 },
+    "Supplier": { "id": 8 },
+    "System": { "id": 9 },
+    "Zone": { "id": 10 }
+  },
+  "properties": {
+    "ALARM": {
+      "prob": { "type": "Float64", "nullable": true }
+    },
+    "Assembly": {
+      "name": { "type": "String", "nullable": true }
+    },
+    "CAUSE": {
+      "strength": { "type": "Float64", "nullable": true }
+    },
+    "Comp": {
+      "name": { "type": "String", "nullable": true }
+    },
+    "DEP": {
+      "avail": { "type": "Float64", "nullable": true }
+    },
+    "HAS_ASM": {
+      "rel": { "type": "Float64", "nullable": true }
+    },
+    "Host": {
+      "name": { "type": "String", "nullable": true }
+    },
+    "INFECTS": {
+      "prob": { "type": "Float64", "nullable": true }
+    },
+    "Node": {
+      "name": { "type": "String", "nullable": true }
+    },
+    "Part": {
+      "name": { "type": "String", "nullable": true }
+    },
+    "Plant": {
+      "name": { "type": "String", "nullable": true }
+    },
+    "REQ": {
+      "avail": { "type": "Float64", "nullable": true }
+    },
+    "REQUIRES": {},
+    "ROUTE": {
+      "reliability": { "type": "Float64", "nullable": true }
+    },
+    "Route": {
+      "name": { "type": "String", "nullable": true }
+    },
+    "SENSOR": {
+      "prob": { "type": "Float64", "nullable": true }
+    },
+    "SUPPLIED_BY": {
+      "rel": { "type": "Float64", "nullable": true },
+      "transport": { "type": "Float64", "nullable": true }
+    },
+    "Supplier": {
+      "base_rel": { "type": "Float64", "nullable": true },
+      "name": { "type": "String", "nullable": true }
+    },
+    "System": {
+      "name": { "type": "String", "nullable": true }
+    },
+    "USES": {
+      "rel": { "type": "Float64", "nullable": true }
+    },
+    "Zone": {
+      "name": { "type": "String", "nullable": true }
+    }
+  },
+  "schema_version": 1
+}

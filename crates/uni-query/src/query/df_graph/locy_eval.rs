@@ -484,6 +484,21 @@ pub fn values_equal(a: &Value, b: &Value) -> bool {
     }
 }
 
+/// Compare two values for join equality in IS-ref matching.
+///
+/// For graph entities (`Value::Node`, `Value::Edge`), compares by identity
+/// (VID/EID) rather than full structural equality. This is necessary because
+/// the same node may have different property sets across different query
+/// executions (e.g., schema mode adds `overflow_json: Null` in some paths
+/// but not others). For non-graph values, falls back to `values_equal`.
+pub fn values_equal_for_join(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Node(na), Value::Node(nb)) => na.vid == nb.vid,
+        (Value::Edge(ea), Value::Edge(eb)) => ea.eid == eb.eid,
+        _ => values_equal(a, b),
+    }
+}
+
 /// Compare two values returning an Ordering.
 pub fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
     if value_less_than(a, b) {

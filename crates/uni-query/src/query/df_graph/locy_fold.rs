@@ -22,6 +22,15 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+/// Direction of monotonicity for a fold aggregate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MonotonicDirection {
+    /// Value can only stay the same or increase across iterations.
+    NonDecreasing,
+    /// Value can only stay the same or decrease across iterations.
+    NonIncreasing,
+}
+
 /// Aggregate function kind for FOLD bindings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FoldAggKind {
@@ -33,6 +42,38 @@ pub enum FoldAggKind {
     Collect,
     Nor,  // Noisy-OR: 1 − ∏(1 − pᵢ)
     Prod, // Product:  ∏ pᵢ
+}
+
+impl FoldAggKind {
+    /// Returns `true` if this aggregate is monotonic (safe for fixpoint iteration).
+    pub fn is_monotonic(&self) -> bool {
+        matches!(
+            self,
+            Self::Sum | Self::Max | Self::Min | Self::Count | Self::Nor | Self::Prod
+        )
+    }
+
+    /// Returns the monotonicity direction, or `None` for non-monotonic aggregates.
+    pub fn monotonicity_direction(&self) -> Option<MonotonicDirection> {
+        match self {
+            Self::Sum | Self::Max | Self::Count | Self::Nor => {
+                Some(MonotonicDirection::NonDecreasing)
+            }
+            Self::Min | Self::Prod => Some(MonotonicDirection::NonIncreasing),
+            Self::Avg | Self::Collect => None,
+        }
+    }
+
+    /// Returns the identity element for this aggregate, or `None` for non-monotonic aggregates.
+    pub fn identity(&self) -> Option<f64> {
+        match self {
+            Self::Sum | Self::Count | Self::Nor => Some(0.0),
+            Self::Max => Some(f64::NEG_INFINITY),
+            Self::Min => Some(f64::INFINITY),
+            Self::Prod => Some(1.0),
+            Self::Avg | Self::Collect => None,
+        }
+    }
 }
 
 /// A single FOLD binding: aggregate an input column into an output column.
@@ -1795,6 +1836,211 @@ mod tests {
             .downcast_ref::<Float64Array>()
             .unwrap();
         let expected = 1.0 - 0.9_f64.powi(20);
+        assert!(
+            (vals.value(0) - expected).abs() < 1e-10,
+            "expected {}, got {}",
+            expected,
+            vals.value(0)
+        );
+    }
+
+    // ── FoldAggKind classification tests (Phase 1) ────────────────────────
+
+    #[test]
+    fn test_is_monotonic() {
+        assert!(FoldAggKind::Sum.is_monotonic());
+        assert!(FoldAggKind::Max.is_monotonic());
+        assert!(FoldAggKind::Min.is_monotonic());
+        assert!(FoldAggKind::Count.is_monotonic());
+        assert!(FoldAggKind::Nor.is_monotonic());
+        assert!(FoldAggKind::Prod.is_monotonic());
+        assert!(!FoldAggKind::Avg.is_monotonic());
+        assert!(!FoldAggKind::Collect.is_monotonic());
+    }
+
+    #[test]
+    fn test_monotonicity_direction() {
+        use super::MonotonicDirection;
+        assert_eq!(
+            FoldAggKind::Sum.monotonicity_direction(),
+            Some(MonotonicDirection::NonDecreasing)
+        );
+        assert_eq!(
+            FoldAggKind::Max.monotonicity_direction(),
+            Some(MonotonicDirection::NonDecreasing)
+        );
+        assert_eq!(
+            FoldAggKind::Count.monotonicity_direction(),
+            Some(MonotonicDirection::NonDecreasing)
+        );
+        assert_eq!(
+            FoldAggKind::Nor.monotonicity_direction(),
+            Some(MonotonicDirection::NonDecreasing)
+        );
+        assert_eq!(
+            FoldAggKind::Min.monotonicity_direction(),
+            Some(MonotonicDirection::NonIncreasing)
+        );
+        assert_eq!(
+            FoldAggKind::Prod.monotonicity_direction(),
+            Some(MonotonicDirection::NonIncreasing)
+        );
+        assert_eq!(FoldAggKind::Avg.monotonicity_direction(), None);
+        assert_eq!(FoldAggKind::Collect.monotonicity_direction(), None);
+    }
+
+    #[test]
+    fn test_identity_values() {
+        assert_eq!(FoldAggKind::Sum.identity(), Some(0.0));
+        assert_eq!(FoldAggKind::Count.identity(), Some(0.0));
+        assert_eq!(FoldAggKind::Nor.identity(), Some(0.0));
+        assert_eq!(FoldAggKind::Max.identity(), Some(f64::NEG_INFINITY));
+        assert_eq!(FoldAggKind::Min.identity(), Some(f64::INFINITY));
+        assert_eq!(FoldAggKind::Prod.identity(), Some(1.0));
+        assert_eq!(FoldAggKind::Avg.identity(), None);
+        assert_eq!(FoldAggKind::Collect.identity(), None);
+    }
+
+    // ── Strict mode tests (Phase 5) ──────────────────────────────────────
+
+    async fn execute_fold_strict(
+        input: Arc<dyn ExecutionPlan>,
+        key_indices: Vec<usize>,
+        fold_bindings: Vec<FoldBinding>,
+        strict: bool,
+    ) -> DFResult<RecordBatch> {
+        let exec = FoldExec::new(input, key_indices, fold_bindings, strict, 1e-15);
+        let ctx = SessionContext::new();
+        let task_ctx = ctx.task_ctx();
+        let stream = exec.execute(0, task_ctx).unwrap();
+        let batches: Vec<RecordBatch> = datafusion::physical_plan::common::collect(stream).await?;
+        if batches.is_empty() {
+            Ok(RecordBatch::new_empty(exec.schema()))
+        } else {
+            arrow::compute::concat_batches(&exec.schema(), &batches)
+                .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_nor_strict_rejects_above_one() {
+        let batch = make_test_batch(vec!["a"], vec![1.5]);
+        let input = make_memory_exec(batch);
+        let result = execute_fold_strict(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "p".into(),
+                kind: FoldAggKind::Nor,
+                input_col_index: 1,
+            }],
+            true,
+        )
+        .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("strict_probability_domain"),
+            "Expected strict error, got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_nor_strict_rejects_negative() {
+        let batch = make_test_batch(vec!["a"], vec![-0.1]);
+        let input = make_memory_exec(batch);
+        let result = execute_fold_strict(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "p".into(),
+                kind: FoldAggKind::Nor,
+                input_col_index: 1,
+            }],
+            true,
+        )
+        .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("strict_probability_domain"),
+            "Expected strict error, got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prod_strict_rejects_above_one() {
+        let batch = make_test_batch(vec!["a"], vec![2.0]);
+        let input = make_memory_exec(batch);
+        let result = execute_fold_strict(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "p".into(),
+                kind: FoldAggKind::Prod,
+                input_col_index: 1,
+            }],
+            true,
+        )
+        .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("strict_probability_domain"),
+            "Expected strict error, got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prod_strict_rejects_negative() {
+        let batch = make_test_batch(vec!["a"], vec![-0.5]);
+        let input = make_memory_exec(batch);
+        let result = execute_fold_strict(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "p".into(),
+                kind: FoldAggKind::Prod,
+                input_col_index: 1,
+            }],
+            true,
+        )
+        .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("strict_probability_domain"),
+            "Expected strict error, got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_nor_strict_accepts_valid() {
+        let batch = make_test_batch(vec!["a", "a"], vec![0.3, 0.5]);
+        let input = make_memory_exec(batch);
+        let result = execute_fold_strict(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "p".into(),
+                kind: FoldAggKind::Nor,
+                input_col_index: 1,
+            }],
+            true,
+        )
+        .await;
+        assert!(result.is_ok(), "Expected Ok, got: {:?}", result.err());
+        let batch = result.unwrap();
+        let vals = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let expected = 0.65; // 1 - (1-0.3)(1-0.5)
         assert!(
             (vals.value(0) - expected).abs() < 1e-10,
             "expected {}, got {}",

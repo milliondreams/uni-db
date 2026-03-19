@@ -3,6 +3,8 @@ use std::time::Duration;
 
 use uni_common::Value;
 
+use crate::types::{RuntimeWarning, RuntimeWarningCode};
+
 /// A single row of bindings from a query result.
 pub type Row = HashMap<String, Value>;
 
@@ -19,6 +21,8 @@ pub struct LocyResult {
     pub stats: LocyStats,
     /// Results from Phase 4 commands.
     pub command_results: Vec<CommandResult>,
+    /// Runtime warnings collected during evaluation.
+    pub warnings: Vec<RuntimeWarning>,
 }
 
 /// Result of executing a single Phase 4 command.
@@ -121,6 +125,16 @@ impl LocyResult {
     /// Get the total number of fixpoint iterations.
     pub fn iterations(&self) -> usize {
         self.stats.total_iterations
+    }
+
+    /// Get runtime warnings collected during evaluation.
+    pub fn warnings(&self) -> &[RuntimeWarning] {
+        &self.warnings
+    }
+
+    /// Check whether a specific warning code was emitted.
+    pub fn has_warning(&self, code: &RuntimeWarningCode) -> bool {
+        self.warnings.iter().any(|w| w.code == *code)
     }
 }
 

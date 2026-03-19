@@ -652,3 +652,55 @@ async fn graph_should_not_contain_edge(
         from, to, edge_type, cnt
     );
 }
+
+// ── Warning Assertions ──────────────────────────────────────────────────
+
+#[then(
+    regex = r#"^the result should contain a SharedProbabilisticDependency warning for rule ['"](.+)['"]$"#
+)]
+async fn result_should_contain_shared_dep_warning(world: &mut LocyWorld, rule_name: String) {
+    let locy_result = world
+        .locy_result()
+        .expect("no evaluation result")
+        .as_ref()
+        .expect("evaluation failed");
+
+    let found = locy_result.warnings().iter().any(|w| {
+        w.code == uni_locy::RuntimeWarningCode::SharedProbabilisticDependency
+            && w.rule_name == rule_name
+    });
+    assert!(
+        found,
+        "Expected SharedProbabilisticDependency warning for rule '{}', but warnings were: {:?}",
+        rule_name,
+        locy_result
+            .warnings()
+            .iter()
+            .map(|w| format!("{:?} ({})", w.code, w.rule_name))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[then("the result should not contain a SharedProbabilisticDependency warning")]
+async fn result_should_not_contain_shared_dep_warning(world: &mut LocyWorld) {
+    let locy_result = world
+        .locy_result()
+        .expect("no evaluation result")
+        .as_ref()
+        .expect("evaluation failed");
+
+    let found = locy_result
+        .warnings()
+        .iter()
+        .any(|w| w.code == uni_locy::RuntimeWarningCode::SharedProbabilisticDependency);
+    assert!(
+        !found,
+        "Expected no SharedProbabilisticDependency warning, but found: {:?}",
+        locy_result
+            .warnings()
+            .iter()
+            .filter(|w| w.code == uni_locy::RuntimeWarningCode::SharedProbabilisticDependency)
+            .map(|w| format!("rule={}", w.rule_name))
+            .collect::<Vec<_>>()
+    );
+}

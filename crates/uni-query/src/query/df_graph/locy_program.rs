@@ -40,6 +40,7 @@ use std::time::{Duration, Instant};
 use uni_common::Value;
 use uni_common::core::schema::Schema as UniSchema;
 use uni_cypher::ast::Expr;
+use uni_locy::RuntimeWarning;
 use uni_store::storage::manager::StorageManager;
 
 // ---------------------------------------------------------------------------
@@ -122,6 +123,8 @@ pub struct LocyProgramExec {
     iteration_counts_slot: Arc<StdRwLock<HashMap<String, usize>>>,
     /// Shared slot written with peak memory bytes after fixpoint completes.
     peak_memory_slot: Arc<StdRwLock<usize>>,
+    /// Shared slot for runtime warnings collected during evaluation.
+    warnings_slot: Arc<StdRwLock<Vec<RuntimeWarning>>>,
 }
 
 impl fmt::Debug for LocyProgramExec {
@@ -179,6 +182,7 @@ impl LocyProgramExec {
             derivation_tracker: Arc::new(StdRwLock::new(None)),
             iteration_counts_slot: Arc::new(StdRwLock::new(HashMap::new())),
             peak_memory_slot: Arc::new(StdRwLock::new(0)),
+            warnings_slot: Arc::new(StdRwLock::new(Vec::new())),
         }
     }
 
@@ -214,6 +218,14 @@ impl LocyProgramExec {
     /// across all strata. Read it with `slot.read().unwrap()`.
     pub fn peak_memory_slot(&self) -> Arc<StdRwLock<usize>> {
         Arc::clone(&self.peak_memory_slot)
+    }
+
+    /// Returns the shared runtime warnings slot.
+    ///
+    /// After execution, the slot contains warnings collected during fixpoint
+    /// iteration (e.g. shared probabilistic dependencies).
+    pub fn warnings_slot(&self) -> Arc<StdRwLock<Vec<RuntimeWarning>>> {
+        Arc::clone(&self.warnings_slot)
     }
 }
 
@@ -288,6 +300,7 @@ impl ExecutionPlan for LocyProgramExec {
         let iteration_counts_slot = Arc::clone(&self.iteration_counts_slot);
         let peak_memory_slot = Arc::clone(&self.peak_memory_slot);
         let derivation_tracker = self.derivation_tracker.read().ok().and_then(|g| g.clone());
+        let warnings_slot = Arc::clone(&self.warnings_slot);
 
         let fut = async move {
             run_program(
@@ -309,6 +322,7 @@ impl ExecutionPlan for LocyProgramExec {
                 iteration_counts_slot,
                 peak_memory_slot,
                 derivation_tracker,
+                warnings_slot,
             )
             .await
         };
@@ -408,6 +422,7 @@ async fn run_program(
     iteration_counts_slot: Arc<StdRwLock<HashMap<String, usize>>>,
     peak_memory_slot: Arc<StdRwLock<usize>>,
     derivation_tracker: Option<Arc<DerivationTracker>>,
+    warnings_slot: Arc<StdRwLock<Vec<RuntimeWarning>>>,
 ) -> DFResult<Vec<RecordBatch>> {
     let start = Instant::now();
     let mut derived_store = DerivedStore::new();
@@ -446,6 +461,7 @@ async fn run_program(
                 Arc::clone(&iteration_counts_slot),
                 strict_probability_domain,
                 probability_epsilon,
+                Arc::clone(&warnings_slot),
             );
 
             let task_ctx = session_ctx.read().task_ctx();
@@ -492,8 +508,10 @@ async fn run_program(
 
             for (rule, fp_rule) in stratum.rules.iter().zip(fixpoint_rules.iter()) {
                 // Process each clause independently (per-clause IS NOT).
-                let mut all_clause_facts: Vec<RecordBatch> = Vec::new();
-                for (clause, fp_clause) in rule.clauses.iter().zip(fp_rule.clauses.iter()) {
+                let mut tagged_clause_facts: Vec<(usize, Vec<RecordBatch>)> = Vec::new();
+                for (clause_idx, (clause, fp_clause)) in
+                    rule.clauses.iter().zip(fp_rule.clauses.iter()).enumerate()
+                {
                     let mut batches = execute_subplan(
                         &clause.body,
                         &params,
@@ -564,8 +582,25 @@ async fn run_program(
                         )?;
                     }
 
-                    all_clause_facts.extend(batches);
+                    tagged_clause_facts.push((clause_idx, batches));
                 }
+
+                // Record provenance and detect shared proofs for non-recursive rules.
+                if let Some(ref tracker) = derivation_tracker {
+                    super::locy_fixpoint::record_and_detect_shared_proofs_nonrecursive(
+                        fp_rule,
+                        &tagged_clause_facts,
+                        tracker,
+                        &warnings_slot,
+                        &registry,
+                    );
+                }
+
+                // Flatten tagged facts for post-fixpoint chain.
+                let all_clause_facts: Vec<RecordBatch> = tagged_clause_facts
+                    .into_iter()
+                    .flat_map(|(_, batches)| batches)
+                    .collect();
 
                 // Apply post-fixpoint operators (PRIORITY, FOLD, BEST BY) on union.
                 let facts = super::locy_fixpoint::apply_post_fixpoint_chain(
@@ -639,13 +674,16 @@ fn write_facts_to_registry(registry: &DerivedScanRegistry, rule_name: &str, fact
             *guard = if facts.is_empty() || facts.iter().all(|b| b.num_rows() == 0) {
                 vec![RecordBatch::new_empty(Arc::clone(&entry.schema))]
             } else {
-                // Re-wrap batches with the entry's schema to ensure column names and
-                // types match exactly. The column data is preserved; only the schema
-                // metadata (field names) is replaced.
+                // Try to re-wrap batches with the entry's schema for column name
+                // alignment. If the types don't match (e.g. inferred Float64 vs
+                // actual Utf8 from schema mode), fall back to the batch's own
+                // schema to avoid silent data loss.
                 facts
                     .iter()
-                    .filter_map(|b| {
-                        RecordBatch::try_new(Arc::clone(&entry.schema), b.columns().to_vec()).ok()
+                    .filter(|b| b.num_rows() > 0)
+                    .map(|b| {
+                        RecordBatch::try_new(Arc::clone(&entry.schema), b.columns().to_vec())
+                            .unwrap_or_else(|_| b.clone())
                     })
                     .collect()
             };
@@ -684,6 +722,7 @@ fn convert_to_fixpoint_plans(
                         body_logical: clause.body.clone(),
                         is_ref_bindings,
                         priority: clause.priority,
+                        along_bindings: clause.along_bindings.clone(),
                     })
                 })
                 .collect::<DFResult<Vec<_>>>()?;
@@ -777,6 +816,28 @@ fn convert_is_refs(
                 Vec::new()
             };
 
+            // Provenance join cols: for ALL IS-refs (not just negated), compute
+            // (body_col, derived_col) pairs so shared-proof detection can trace
+            // which source facts contributed to each derived row.
+            let provenance_join_cols: Vec<(String, String)> = is_ref
+                .subjects
+                .iter()
+                .enumerate()
+                .filter_map(|(i, s)| {
+                    if let uni_cypher::ast::Expr::Variable(var) = s {
+                        let right_col = entry
+                            .schema
+                            .fields()
+                            .get(i)
+                            .map(|f| f.name().clone())
+                            .unwrap_or_else(|| var.clone());
+                        Some((var.clone(), right_col))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
             Ok(IsRefBinding {
                 derived_scan_index: entry.scan_index,
                 rule_name: is_ref.rule_name.clone(),
@@ -785,6 +846,7 @@ fn convert_is_refs(
                 anti_join_cols,
                 target_has_prob: is_ref.target_has_prob,
                 target_prob_col: is_ref.target_prob_col.clone(),
+                provenance_join_cols,
             })
         })
         .collect()

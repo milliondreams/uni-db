@@ -233,3 +233,39 @@ Feature: Probabilistic Stress Corpus
     Then evaluation should succeed
     And the derived relation 'risk' should contain a fact where a.name = 'A' and p = 0.58
     And the derived relation 'risk' should contain a fact where a.name = 'A' and p = 0.6
+
+  Scenario: ALONG expression feeds MNOR feeds MPROD
+    Given having executed:
+      """
+      CREATE (asm:Assembly {name: 'Engine'}),
+             (p1:Part {name: 'Turbine'}),
+             (p2:Part {name: 'Compressor'}),
+             (asm)-[:REQUIRES]->(p1),
+             (asm)-[:REQUIRES]->(p2),
+             (p1)-[:SUPPLIED_BY {transport: 0.95}]->(s1:Supplier {name: 'S1', base_rel: 0.9}),
+             (p1)-[:SUPPLIED_BY {transport: 0.90}]->(s2:Supplier {name: 'S2', base_rel: 0.8}),
+             (p2)-[:SUPPLIED_BY {transport: 0.85}]->(s3:Supplier {name: 'S3', base_rel: 0.7})
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE chain_rel AS
+        MATCH (pt:Part)-[e:SUPPLIED_BY]->(s:Supplier)
+        ALONG rel = e.transport * s.base_rel
+        YIELD KEY pt, KEY s, rel
+
+      CREATE RULE part_avail AS
+        MATCH (pt:Part)
+        WHERE (pt, s) IS chain_rel
+        FOLD avail = MNOR(rel)
+        YIELD KEY pt, avail
+
+      CREATE RULE asm_avail AS
+        MATCH (asm:Assembly)-[:REQUIRES]->(pt:Part)
+        WHERE pt IS part_avail
+        FOLD joint = MPROD(avail)
+        YIELD KEY asm, joint
+      """
+    Then evaluation should succeed
+    And the derived relation 'chain_rel' should have 3 facts
+    And the derived relation 'part_avail' should have 2 facts
+    And the derived relation 'asm_avail' should have 1 facts

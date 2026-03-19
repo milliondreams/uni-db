@@ -85,3 +85,22 @@ pub enum WarningCode {
     MsumNonNegativity,
     ProbabilityDomainViolation,
 }
+
+/// Classification of runtime warnings emitted during evaluation.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RuntimeWarningCode {
+    /// Two or more proof paths aggregated by MNOR/MPROD share an
+    /// intermediate fact, violating the independence assumption.
+    SharedProbabilisticDependency,
+}
+
+/// A non-fatal runtime diagnostic collected during evaluation.
+#[derive(Debug, Clone)]
+pub struct RuntimeWarning {
+    /// Warning classification.
+    pub code: RuntimeWarningCode,
+    /// Human-readable explanation.
+    pub message: String,
+    /// Rule that triggered the warning, when applicable.
+    pub rule_name: String,
+}

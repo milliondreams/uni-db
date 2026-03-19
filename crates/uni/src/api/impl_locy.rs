@@ -15,7 +15,7 @@ use uni_cypher::locy_ast::RuleOutput;
 use uni_locy::types::CompiledCommand;
 use uni_locy::{
     CommandResult, CompiledProgram, LocyCompileError, LocyConfig, LocyError, LocyResult, LocyStats,
-    Row, SavepointId, compile,
+    Row, RuntimeWarning, SavepointId, compile,
 };
 use uni_query::QueryPlanner;
 use uni_query::query::df_graph::locy_ast_builder::build_match_return_query;
@@ -101,12 +101,26 @@ impl<'a> LocyEngine<'a> {
         // 3. Physical plan
         let exec_plan = planner.plan(&logical).map_err(map_native_df_error)?;
 
-        // 4. Create tracker for EXPLAIN commands
+        // 4. Create tracker for EXPLAIN commands or shared-proof detection
         let has_explain = compiled
             .commands
             .iter()
             .any(|c| matches!(c, CompiledCommand::ExplainRule(_)));
-        let tracker: Option<Arc<uni_query::query::df_graph::DerivationTracker>> = if has_explain {
+        let has_prob_fold = compiled.strata.iter().any(|s| {
+            s.rules.iter().any(|r| {
+                r.clauses.iter().any(|c| {
+                    c.fold.iter().any(|f| {
+                        if let uni_cypher::ast::Expr::FunctionCall { name, .. } = &f.aggregate {
+                            matches!(name.to_uppercase().as_str(), "MNOR" | "MPROD")
+                        } else {
+                            false
+                        }
+                    })
+                })
+            })
+        });
+        let needs_tracker = has_explain || has_prob_fold;
+        let tracker: Option<Arc<uni_query::query::df_graph::DerivationTracker>> = if needs_tracker {
             Some(Arc::new(
                 uni_query::query::df_graph::DerivationTracker::new(),
             ))
@@ -114,7 +128,7 @@ impl<'a> LocyEngine<'a> {
             None
         };
 
-        let (derived_store_slot, iteration_counts_slot, peak_memory_slot) =
+        let (derived_store_slot, iteration_counts_slot, peak_memory_slot, warnings_slot) =
             if let Some(program_exec) = exec_plan
                 .as_any()
                 .downcast_ref::<uni_query::query::df_graph::LocyProgramExec>(
@@ -126,12 +140,14 @@ impl<'a> LocyEngine<'a> {
                     program_exec.derived_store_slot(),
                     program_exec.iteration_counts_slot(),
                     program_exec.peak_memory_slot(),
+                    program_exec.warnings_slot(),
                 )
             } else {
                 (
                     Arc::new(std::sync::RwLock::new(None)),
                     Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
                     Arc::new(std::sync::RwLock::new(0usize)),
+                    Arc::new(std::sync::RwLock::new(Vec::new())),
                 )
             };
 
@@ -204,12 +220,14 @@ impl<'a> LocyEngine<'a> {
         .await;
 
         // 10. Build final LocyResult
+        let warnings = warnings_slot.read().map(|w| w.clone()).unwrap_or_default();
         Ok(build_locy_result(
             enriched_derived,
             command_results,
             &compiled,
             evaluation_time,
             locy_stats,
+            warnings,
         ))
     }
 
@@ -764,6 +782,7 @@ fn build_locy_result(
     compiled: &CompiledProgram,
     evaluation_time: Duration,
     mut orchestrator_stats: LocyStats,
+    warnings: Vec<RuntimeWarning>,
 ) -> LocyResult {
     let total_facts: usize = derived.values().map(|v| v.len()).sum();
     orchestrator_stats.strata_evaluated = compiled.strata.len();
@@ -774,6 +793,7 @@ fn build_locy_result(
         derived,
         stats: orchestrator_stats,
         command_results,
+        warnings,
     }
 }
 

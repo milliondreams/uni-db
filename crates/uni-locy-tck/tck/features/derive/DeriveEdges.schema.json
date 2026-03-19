@@ -16,6 +16,9 @@
     "City": {
       "name": { "type": "String", "nullable": true }
     },
+    "Country": {
+      "name": { "type": "String", "nullable": true }
+    },
     "Person": {
       "name": { "type": "String", "nullable": true }
     }

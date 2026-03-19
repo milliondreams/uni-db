@@ -292,19 +292,26 @@ fn collect_prev_refs(expr: &LocyExpr) -> Vec<String> {
 
 // ─── Non-monotonic in recursion ──────────────────────────────────────────────
 
+/// Returns `true` if the fold function name is a monotonic variant (MSUM, MMAX, etc.).
+fn is_monotonic_fold_name(name: &str) -> bool {
+    matches!(
+        name.to_uppercase().as_str(),
+        "MSUM" | "MMAX" | "MMIN" | "MCOUNT" | "MNOR" | "MPROD"
+    )
+}
+
 fn check_non_monotonic_in_recursion(
     rule_name: &str,
     def: &RuleDefinition,
 ) -> Result<(), LocyCompileError> {
     for fold in &def.fold {
-        if let Some(func_name) = extract_function_name(&fold.aggregate) {
-            let upper = func_name.to_uppercase();
-            if matches!(upper.as_str(), "SUM" | "COUNT" | "AVG" | "MIN" | "MAX") {
-                return Err(LocyCompileError::NonMonotonicInRecursion {
-                    rule: rule_name.to_string(),
-                    aggregate: func_name,
-                });
-            }
+        if let Some(func_name) = extract_function_name(&fold.aggregate)
+            && !is_monotonic_fold_name(&func_name)
+        {
+            return Err(LocyCompileError::NonMonotonicInRecursion {
+                rule: rule_name.to_string(),
+                aggregate: func_name,
+            });
         }
     }
     Ok(())
@@ -377,17 +384,13 @@ fn check_best_by_monotonic_fold(
         return Ok(());
     }
     for fold in &def.fold {
-        if let Some(func_name) = extract_function_name(&fold.aggregate) {
-            let upper = func_name.to_uppercase();
-            if matches!(
-                upper.as_str(),
-                "MSUM" | "MMAX" | "MMIN" | "MCOUNT" | "MNOR" | "MPROD"
-            ) {
-                return Err(LocyCompileError::BestByWithMonotonicFold {
-                    rule: rule_name.to_string(),
-                    fold: func_name,
-                });
-            }
+        if let Some(func_name) = extract_function_name(&fold.aggregate)
+            && is_monotonic_fold_name(&func_name)
+        {
+            return Err(LocyCompileError::BestByWithMonotonicFold {
+                rule: rule_name.to_string(),
+                fold: func_name,
+            });
         }
     }
     Ok(())

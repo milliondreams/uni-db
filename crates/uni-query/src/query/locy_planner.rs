@@ -335,7 +335,13 @@ impl<'a> LocyPlanBuilder<'a> {
         // All clauses share the same schema; derive metadata from first clause
         let first_clause = rule.clauses.first();
 
-        let fold_bindings = first_clause
+        // Collect fold bindings from the first clause that has them.
+        // A rule may have a base clause (no FOLD) plus recursive clauses (with FOLD);
+        // we need the FOLD metadata from whichever clause provides it.
+        let fold_bindings: Vec<(String, Expr)> = rule
+            .clauses
+            .iter()
+            .find(|c| !c.fold.is_empty())
             .map(|c| {
                 c.fold
                     .iter()

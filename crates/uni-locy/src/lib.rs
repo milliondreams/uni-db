@@ -14,4 +14,4 @@ pub use result::{
     AbductionResult, CommandResult, DerivationNode, LocyResult, LocyStats, Modification, Row,
     SavepointId, ValidatedModification,
 };
-pub use types::{CompiledCommand, CompiledProgram};
+pub use types::{CompiledCommand, CompiledProgram, RuntimeWarning, RuntimeWarningCode};

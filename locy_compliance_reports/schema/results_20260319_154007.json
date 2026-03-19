@@ -1,7 +1,7 @@
 [
   {
     "name": "AbductiveReasoning",
-    "uri": "/home/rohit/work/dragonscale/uni-locy/crates/uni-locy-tck/tck/features/abduce/AbductiveReasoning.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/abduce/AbductiveReasoning.feature",
     "elements": [
       {
         "type": "scenario",
@@ -63,7 +63,7 @@
   },
   {
     "name": "PathCarriedValues",
-    "uri": "/home/rohit/work/dragonscale/uni-locy/crates/uni-locy-tck/tck/features/along/PathCarriedValues.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/along/PathCarriedValues.feature",
     "elements": [
       {
         "type": "scenario",
@@ -181,7 +181,7 @@
   },
   {
     "name": "Hypothetical",
-    "uri": "/home/rohit/work/dragonscale/uni-locy/crates/uni-locy-tck/tck/features/assume/Hypothetical.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/assume/Hypothetical.feature",
     "elements": [
       {
         "type": "scenario",
@@ -271,7 +271,7 @@
   },
   {
     "name": "OptimizedSelection",
-    "uri": "/home/rohit/work/dragonscale/uni-locy/crates/uni-locy-tck/tck/features/bestby/OptimizedSelection.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/bestby/OptimizedSelection.feature",
     "elements": [
       {
         "type": "scenario",
@@ -361,7 +361,7 @@
   },
   {
     "name": "Stratification",
-    "uri": "/home/rohit/work/dragonscale/uni-locy/crates/uni-locy-tck/tck/features/compile/Stratification.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/compile/Stratification.feature",
     "elements": [
       {
         "type": "scenario",
@@ -451,7 +451,7 @@
   },
   {
     "name": "DeriveEdges",
-    "uri": "/home/rohit/work/dragonscale/uni-locy/crates/uni-locy-tck/tck/features/derive/DeriveEdges.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/derive/DeriveEdges.feature",
     "elements": [
       {
         "type": "scenario",
@@ -583,7 +583,7 @@
   },
   {
     "name": "ErrorConditions",
-    "uri": "/home/rohit/work/dragonscale/uni-locy/crates/uni-locy-tck/tck/features/evaluate/ErrorConditions.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/evaluate/ErrorConditions.feature",
     "elements": [
       {
         "type": "scenario",
@@ -659,7 +659,7 @@
   },
   {
     "name": "MultiStratum",
-    "uri": "/home/rohit/work/dragonscale/uni-locy/crates/uni-locy-tck/tck/features/evaluate/MultiStratum.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/evaluate/MultiStratum.feature",
     "elements": [
       {
         "type": "scenario",
@@ -707,7 +707,7 @@
   },
   {
     "name": "NonRecursive",
-    "uri": "/home/rohit/work/dragonscale/uni-locy/crates/uni-locy-tck/tck/features/evaluate/NonRecursive.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/evaluate/NonRecursive.feature",
     "elements": [
       {
         "type": "scenario",
@@ -769,7 +769,7 @@
   },
   {
     "name": "TransitiveClosure",
-    "uri": "/home/rohit/work/dragonscale/uni-locy/crates/uni-locy-tck/tck/features/evaluate/TransitiveClosure.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/evaluate/TransitiveClosure.feature",
     "elements": [
       {
         "type": "scenario",
@@ -803,7 +803,7 @@
   },
   {
     "name": "ProofTraces",
-    "uri": "/home/rohit/work/dragonscale/uni-locy/crates/uni-locy-tck/tck/features/explain/ProofTraces.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/explain/ProofTraces.feature",
     "elements": [
       {
         "type": "scenario",
@@ -851,7 +851,7 @@
   },
   {
     "name": "Aggregation",
-    "uri": "/home/rohit/work/dragonscale/uni-locy/crates/uni-locy-tck/tck/features/fold/Aggregation.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/fold/Aggregation.feature",
     "elements": [
       {
         "type": "scenario",
@@ -955,7 +955,7 @@
   },
   {
     "name": "ReservedKeywords",
-    "uri": "/home/rohit/work/dragonscale/uni-locy/crates/uni-locy-tck/tck/features/lexical/ReservedKeywords.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/lexical/ReservedKeywords.feature",
     "elements": [
       {
         "type": "scenario",
@@ -1171,7 +1171,7 @@
   },
   {
     "name": "ModuleComposition",
-    "uri": "/home/rohit/work/dragonscale/uni-locy/crates/uni-locy-tck/tck/features/modules/ModuleComposition.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/modules/ModuleComposition.feature",
     "elements": [
       {
         "type": "scenario",
@@ -1289,7 +1289,7 @@
   },
   {
     "name": "MonotonicAggregation",
-    "uri": "/home/rohit/work/dragonscale/uni-locy/crates/uni-locy-tck/tck/features/monotonic/MonotonicAggregation.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/monotonic/MonotonicAggregation.feature",
     "elements": [
       {
         "type": "scenario",
@@ -1374,12 +1374,744 @@
             }
           }
         ]
+      },
+      {
+        "type": "scenario",
+        "name": "MNOR syntax parses",
+        "line": 101,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "MNOR syntax parses",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "MPROD syntax parses",
+        "line": 111,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "MPROD syntax parses",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "MNOR in non-recursive rule compiles",
+        "line": 121,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "MNOR in non-recursive rule compiles",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "MPROD in non-recursive rule compiles",
+        "line": 131,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "MPROD in non-recursive rule compiles",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "MNOR rejected with BEST BY",
+        "line": 141,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "MNOR rejected with BEST BY",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "MPROD rejected with BEST BY",
+        "line": 155,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "MPROD rejected with BEST BY",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "MNOR converges with correct noisy-OR",
+        "line": 169,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "MNOR converges with correct noisy-OR",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "MPROD converges with correct product",
+        "line": 185,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "MPROD converges with correct product",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "MNOR produces correct noisy-OR value",
+        "line": 203,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "MNOR produces correct noisy-OR value",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "MPROD produces correct product value",
+        "line": 219,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "MPROD produces correct product value",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "MNOR four causes matches spec example",
+        "line": 235,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "MNOR four causes matches spec example",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "MNOR single cause unchanged",
+        "line": 253,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "MNOR single cause unchanged",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "MPROD single requirement unchanged",
+        "line": 268,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "MPROD single requirement unchanged",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "MNOR with certainty yields one",
+        "line": 283,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "MNOR with certainty yields one",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "MPROD with zero yields zero",
+        "line": 299,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "MPROD with zero yields zero",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "MNOR with zeros yields zero",
+        "line": 315,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "MNOR with zeros yields zero",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "MPROD with ones yields one",
+        "line": 331,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "MPROD with ones yields one",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "MPROD groups independently",
+        "line": 347,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "MPROD groups independently",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "MNOR spec example (0.7, 0.5) yields 0.85",
+        "line": 368,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "MNOR spec example (0.7, 0.5) yields 0.85",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "MNOR zero does not affect result",
+        "line": 384,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "MNOR zero does not affect result",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "MNOR all-ones yields one",
+        "line": 400,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "MNOR all-ones yields one",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "MPROD three-value (0.9, 0.8, 0.7) yields 0.504",
+        "line": 416,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "MPROD three-value (0.9, 0.8, 0.7) yields 0.504",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "strict rejects MPROD input greater than one",
+        "line": 433,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "strict rejects MPROD input greater than one",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "strict rejects negative MNOR input",
+        "line": 448,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "strict rejects negative MNOR input",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "ProbabilisticComplement",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/monotonic/ProbabilisticComplement.feature",
+    "elements": [
+      {
+        "type": "scenario",
+        "name": "PROB annotation parses",
+        "line": 11,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "PROB annotation parses",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "PROB with explicit alias syntax variants",
+        "line": 20,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "PROB with explicit alias syntax variants",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "Multiple PROB columns should fail to compile",
+        "line": 37,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "Multiple PROB columns should fail to compile",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "MNOR output is implicitly PROB",
+        "line": 47,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "MNOR output is implicitly PROB",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "IS NOT with PROB rule yields complement (1-p)",
+        "line": 59,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "IS NOT with PROB rule yields complement (1-p)",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "Absent key yields probability 1.0",
+        "line": 83,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "Absent key yields probability 1.0",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "IS NOT without PROB retains Boolean exclusion",
+        "line": 104,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "IS NOT without PROB retains Boolean exclusion",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "Cross-predicate IS + IS NOT combines risk * (1-trust)",
+        "line": 123,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "Cross-predicate IS + IS NOT combines risk * (1-trust)",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "Double complement (NOT NOT) recovers original probability",
+        "line": 149,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "Double complement (NOT NOT) recovers original probability",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "PROB column across strata via IS reference",
+        "line": 173,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "PROB column across strata via IS reference",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "strict_probability_domain rejects out-of-range MNOR input",
+        "line": 194,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "strict_probability_domain rejects out-of-range MNOR input",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "MNOR with values outside range clamps in non-strict mode",
+        "line": 209,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "MNOR with values outside range clamps in non-strict mode",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "IS NOT complement after non-recursive PROB rule",
+        "line": 225,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "IS NOT complement after non-recursive PROB rule",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "ProbabilisticStress",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/monotonic/ProbabilisticStress.feature",
+    "elements": [
+      {
+        "type": "scenario",
+        "name": "MNOR clamps inputs exceeding 1.0",
+        "line": 14,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "MNOR clamps inputs exceeding 1.0",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "MPROD clamps inputs exceeding 1.0",
+        "line": 33,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "MPROD clamps inputs exceeding 1.0",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "BEST BY ASC selects weakest link",
+        "line": 52,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "BEST BY ASC selects weakest link",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "Overloaded rule clauses combine via MNOR",
+        "line": 72,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "Overloaded rule clauses combine via MNOR",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "MPROD with 20 near-one factors",
+        "line": 97,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "MPROD with 20 near-one factors",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "Three-layer nested aggregation",
+        "line": 134,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "Three-layer nested aggregation",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "MNOR with no matching edges yields zero facts",
+        "line": 174,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "MNOR with no matching edges yields zero facts",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "ASSUME DELETE removes edges visible to Cypher",
+        "line": 191,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "ASSUME DELETE removes edges visible to Cypher",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "Recursive MNOR combines transitive paths over diamond",
+        "line": 212,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "Recursive MNOR combines transitive paths over diamond",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "ALONG expression feeds MNOR feeds MPROD",
+        "line": 237,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "ALONG expression feeds MNOR feeds MPROD",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "SharedProofDetection",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/monotonic/SharedProofDetection.feature",
+    "elements": [
+      {
+        "type": "scenario",
+        "name": "Diamond graph triggers SharedProbabilisticDependency warning",
+        "line": 17,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "Diamond graph triggers SharedProbabilisticDependency warning",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "Independent parallel paths produce no warning",
+        "line": 46,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "Independent parallel paths produce no warning",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "Non-probabilistic FOLD produces no warning",
+        "line": 67,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "Non-probabilistic FOLD produces no warning",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "Non-recursive cross-stratum shared proofs trigger warning",
+        "line": 93,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "Non-recursive cross-stratum shared proofs trigger warning",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
       }
     ]
   },
   {
     "name": "StratifiedNegation",
-    "uri": "/home/rohit/work/dragonscale/uni-locy/crates/uni-locy-tck/tck/features/negation/StratifiedNegation.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/negation/StratifiedNegation.feature",
     "elements": [
       {
         "type": "scenario",
@@ -1455,7 +2187,7 @@
   },
   {
     "name": "PrioritizedRules",
-    "uri": "/home/rohit/work/dragonscale/uni-locy/crates/uni-locy-tck/tck/features/priority/PrioritizedRules.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/priority/PrioritizedRules.feature",
     "elements": [
       {
         "type": "scenario",
@@ -1531,7 +2263,7 @@
   },
   {
     "name": "GoalDirected",
-    "uri": "/home/rohit/work/dragonscale/uni-locy/crates/uni-locy-tck/tck/features/query/GoalDirected.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/query/GoalDirected.feature",
     "elements": [
       {
         "type": "scenario",
@@ -1621,7 +2353,7 @@
   },
   {
     "name": "BasicRules",
-    "uri": "/home/rohit/work/dragonscale/uni-locy/crates/uni-locy-tck/tck/features/rules/BasicRules.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/rules/BasicRules.feature",
     "elements": [
       {
         "type": "scenario",
@@ -1711,7 +2443,7 @@
   },
   {
     "name": "RecursiveRules",
-    "uri": "/home/rohit/work/dragonscale/uni-locy/crates/uni-locy-tck/tck/features/rules/RecursiveRules.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/rules/RecursiveRules.feature",
     "elements": [
       {
         "type": "scenario",

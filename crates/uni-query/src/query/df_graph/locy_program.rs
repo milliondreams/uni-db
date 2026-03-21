@@ -115,8 +115,12 @@ pub struct LocyProgramExec {
     deterministic_best_by: bool,
     strict_probability_domain: bool,
     probability_epsilon: f64,
+    exact_probability: bool,
+    max_bdd_variables: usize,
     /// Shared slot for extracting the DerivedStore after execution completes.
     derived_store_slot: Arc<StdRwLock<Option<DerivedStore>>>,
+    /// Shared slot for groups where BDD fell back to independence mode.
+    approximate_slot: Arc<StdRwLock<HashMap<String, Vec<String>>>>,
     /// Optional provenance tracker injected after construction (via `set_derivation_tracker`).
     derivation_tracker: Arc<StdRwLock<Option<Arc<DerivationTracker>>>>,
     /// Shared slot written with per-rule iteration counts after fixpoint convergence.
@@ -158,6 +162,8 @@ impl LocyProgramExec {
         deterministic_best_by: bool,
         strict_probability_domain: bool,
         probability_epsilon: f64,
+        exact_probability: bool,
+        max_bdd_variables: usize,
     ) -> Self {
         let properties = compute_plan_properties(Arc::clone(&output_schema));
         Self {
@@ -178,7 +184,10 @@ impl LocyProgramExec {
             deterministic_best_by,
             strict_probability_domain,
             probability_epsilon,
+            exact_probability,
+            max_bdd_variables,
             derived_store_slot: Arc::new(StdRwLock::new(None)),
+            approximate_slot: Arc::new(StdRwLock::new(HashMap::new())),
             derivation_tracker: Arc::new(StdRwLock::new(None)),
             iteration_counts_slot: Arc::new(StdRwLock::new(HashMap::new())),
             peak_memory_slot: Arc::new(StdRwLock::new(0)),
@@ -226,6 +235,14 @@ impl LocyProgramExec {
     /// iteration (e.g. shared probabilistic dependencies).
     pub fn warnings_slot(&self) -> Arc<StdRwLock<Vec<RuntimeWarning>>> {
         Arc::clone(&self.warnings_slot)
+    }
+
+    /// Returns the shared approximate groups slot.
+    ///
+    /// After execution, the slot contains rule→key group descriptions for
+    /// groups where BDD computation fell back to independence mode.
+    pub fn approximate_slot(&self) -> Arc<StdRwLock<HashMap<String, Vec<String>>>> {
+        Arc::clone(&self.approximate_slot)
     }
 }
 
@@ -296,7 +313,10 @@ impl ExecutionPlan for LocyProgramExec {
         let deterministic_best_by = self.deterministic_best_by;
         let strict_probability_domain = self.strict_probability_domain;
         let probability_epsilon = self.probability_epsilon;
+        let exact_probability = self.exact_probability;
+        let max_bdd_variables = self.max_bdd_variables;
         let derived_store_slot = Arc::clone(&self.derived_store_slot);
+        let approximate_slot = Arc::clone(&self.approximate_slot);
         let iteration_counts_slot = Arc::clone(&self.iteration_counts_slot);
         let peak_memory_slot = Arc::clone(&self.peak_memory_slot);
         let derivation_tracker = self.derivation_tracker.read().ok().and_then(|g| g.clone());
@@ -318,7 +338,10 @@ impl ExecutionPlan for LocyProgramExec {
                 deterministic_best_by,
                 strict_probability_domain,
                 probability_epsilon,
+                exact_probability,
+                max_bdd_variables,
                 derived_store_slot,
+                approximate_slot,
                 iteration_counts_slot,
                 peak_memory_slot,
                 derivation_tracker,
@@ -418,7 +441,10 @@ async fn run_program(
     deterministic_best_by: bool,
     strict_probability_domain: bool,
     probability_epsilon: f64,
+    exact_probability: bool,
+    max_bdd_variables: usize,
     derived_store_slot: Arc<StdRwLock<Option<DerivedStore>>>,
+    approximate_slot: Arc<StdRwLock<HashMap<String, Vec<String>>>>,
     iteration_counts_slot: Arc<StdRwLock<HashMap<String, usize>>>,
     peak_memory_slot: Arc<StdRwLock<usize>>,
     derivation_tracker: Option<Arc<DerivationTracker>>,
@@ -461,7 +487,10 @@ async fn run_program(
                 Arc::clone(&iteration_counts_slot),
                 strict_probability_domain,
                 probability_epsilon,
+                exact_probability,
+                max_bdd_variables,
                 Arc::clone(&warnings_slot),
+                Arc::clone(&approximate_slot),
             );
 
             let task_ctx = session_ctx.read().task_ctx();
@@ -586,21 +615,39 @@ async fn run_program(
                 }
 
                 // Record provenance and detect shared proofs for non-recursive rules.
-                if let Some(ref tracker) = derivation_tracker {
+                let shared_info = if let Some(ref tracker) = derivation_tracker {
                     super::locy_fixpoint::record_and_detect_shared_proofs_nonrecursive(
                         fp_rule,
                         &tagged_clause_facts,
                         tracker,
                         &warnings_slot,
                         &registry,
-                    );
-                }
+                    )
+                } else {
+                    None
+                };
 
                 // Flatten tagged facts for post-fixpoint chain.
-                let all_clause_facts: Vec<RecordBatch> = tagged_clause_facts
+                let mut all_clause_facts: Vec<RecordBatch> = tagged_clause_facts
                     .into_iter()
                     .flat_map(|(_, batches)| batches)
                     .collect();
+
+                // Apply BDD for shared groups if exact_probability is enabled.
+                if exact_probability
+                    && let Some(ref info) = shared_info
+                    && let Some(ref tracker) = derivation_tracker
+                {
+                    all_clause_facts = super::locy_fixpoint::apply_bdd_for_shared_groups(
+                        all_clause_facts,
+                        fp_rule,
+                        info,
+                        tracker,
+                        max_bdd_variables,
+                        &warnings_slot,
+                        &approximate_slot,
+                    )?;
+                }
 
                 // Apply post-fixpoint operators (PRIORITY, FOLD, BEST BY) on union.
                 let facts = super::locy_fixpoint::apply_post_fixpoint_chain(

@@ -30,6 +30,14 @@ pub struct LocyConfig {
     /// switches to log-space accumulation to prevent floating-point
     /// underflow.
     pub probability_epsilon: f64,
+    /// When true, groups flagged with shared probabilistic dependencies use
+    /// exact BDD-based probability computation instead of the independence
+    /// assumption (MNOR/MPROD). Defaults to false (independence mode).
+    pub exact_probability: bool,
+    /// Maximum number of BDD variables (unique base facts) allowed per
+    /// aggregation group. If a group exceeds this limit, it falls back to
+    /// the independence-mode result and emits a `BddLimitExceeded` warning.
+    pub max_bdd_variables: usize,
 }
 
 impl Default for LocyConfig {
@@ -45,6 +53,8 @@ impl Default for LocyConfig {
             deterministic_best_by: true,
             strict_probability_domain: false,
             probability_epsilon: 1e-15,
+            exact_probability: false,
+            max_bdd_variables: 1000,
         }
     }
 }

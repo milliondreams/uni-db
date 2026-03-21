@@ -106,6 +106,7 @@ type VisitedSet = HashSet<(String, KeyTuple)>;
 /// Tries Mode A (provenance-based, uses DerivationTracker) first when a tracker is
 /// provided and has entries for the rule.  Falls through to Mode B (re-execution)
 /// when Mode A cannot produce a result.
+#[allow(clippy::too_many_arguments)]
 pub async fn explain_rule(
     query: &ExplainRule,
     program: &CompiledProgram,
@@ -114,15 +115,27 @@ pub async fn explain_rule(
     derived_store: &mut RowStore,
     stats: &mut LocyStats,
     tracker: Option<&DerivationTracker>,
+    approximate_groups: Option<&HashMap<String, Vec<String>>>,
 ) -> Result<DerivationNode, LocyError> {
     // Mode A: provenance-based (no re-execution required).
     // Falls through to Mode B when tracker is absent or has no matching entries.
-    if let Some(Ok(node)) = tracker.map(|t| explain_rule_mode_a(query, program, t, derived_store)) {
+    if let Some(Ok(node)) =
+        tracker.map(|t| explain_rule_mode_a(query, program, t, derived_store, approximate_groups))
+    {
         return Ok(node);
     }
 
     // Mode B: re-execution fallback
-    explain_rule_mode_b(query, program, fact_source, config, derived_store, stats).await
+    explain_rule_mode_b(
+        query,
+        program,
+        fact_source,
+        config,
+        derived_store,
+        stats,
+        approximate_groups,
+    )
+    .await
 }
 
 /// Mode A: build derivation tree using recorded provenance from the fixpoint loop.
@@ -133,6 +146,7 @@ fn explain_rule_mode_a(
     program: &CompiledProgram,
     tracker: &DerivationTracker,
     derived_store: &RowStore,
+    approximate_groups: Option<&HashMap<String, Vec<String>>>,
 ) -> Result<DerivationNode, LocyError> {
     let rule_name = query.rule_name.to_string();
     let rule = program
@@ -173,6 +187,10 @@ fn explain_rule_mode_a(
         .unwrap_or_default();
     let _ = orch_facts; // available for future use
 
+    let is_approximate = approximate_groups
+        .map(|ag| ag.contains_key(&rule_name))
+        .unwrap_or(false);
+
     let mut root = DerivationNode {
         rule: rule_name.clone(),
         clause_index: 0,
@@ -181,6 +199,7 @@ fn explain_rule_mode_a(
         along_values: HashMap::new(),
         children: Vec::new(),
         graph_fact: None,
+        approximate: is_approximate,
     };
 
     for (_, entry) in matching_entries {
@@ -189,6 +208,16 @@ fn explain_rule_mode_a(
             .clauses
             .get(entry.clause_index)
             .and_then(|c| c.priority);
+        let base_fact = format!(
+            "[iter={}] {}",
+            entry.iteration,
+            format_graph_fact(&entry.fact_row)
+        );
+        let graph_fact = if is_approximate {
+            format!("[APPROXIMATE] {}", base_fact)
+        } else {
+            base_fact
+        };
         let node = DerivationNode {
             rule: rule_name.clone(),
             clause_index: entry.clause_index,
@@ -197,11 +226,8 @@ fn explain_rule_mode_a(
             along_values,
             // Mode A: children not tracked (inputs list is reserved for future recursion)
             children: vec![],
-            graph_fact: Some(format!(
-                "[iter={}] {}",
-                entry.iteration,
-                format_graph_fact(&entry.fact_row)
-            )),
+            graph_fact: Some(graph_fact),
+            approximate: is_approximate,
         };
         root.children.push(node);
     }
@@ -218,6 +244,7 @@ async fn explain_rule_mode_b(
     config: &LocyConfig,
     derived_store: &mut RowStore,
     stats: &mut LocyStats,
+    approximate_groups: Option<&HashMap<String, Vec<String>>>,
 ) -> Result<DerivationNode, LocyError> {
     let rule_name = query.rule_name.to_string();
     let rule = program
@@ -267,6 +294,10 @@ async fn explain_rule_mode_b(
         })
         .collect();
 
+    let is_approximate = approximate_groups
+        .map(|ag| ag.contains_key(&rule_name))
+        .unwrap_or(false);
+
     // Build derivation tree root
     let mut root = DerivationNode {
         rule: rule_name.clone(),
@@ -276,12 +307,13 @@ async fn explain_rule_mode_b(
         along_values: HashMap::new(),
         children: Vec::new(),
         graph_fact: None,
+        approximate: is_approximate,
     };
 
     // For each matching fact, recursively build a derivation node
     for fact in &filtered {
         let mut visited = VisitedSet::new();
-        let node = build_derivation_node(
+        let mut node = build_derivation_node(
             &rule_name,
             fact,
             &key_columns,
@@ -293,6 +325,12 @@ async fn explain_rule_mode_b(
             config.max_explain_depth,
         )
         .await?;
+        if is_approximate {
+            node.approximate = true;
+            if let Some(ref gf) = node.graph_fact {
+                node.graph_fact = Some(format!("[APPROXIMATE] {}", gf));
+            }
+        }
         root.children.push(node);
     }
 
@@ -337,6 +375,7 @@ fn build_derivation_node<'a>(
                 along_values: extract_along_values(fact, rule),
                 children: Vec::new(),
                 graph_fact: Some("(cycle)".to_string()),
+                approximate: false,
             });
         }
 
@@ -471,6 +510,7 @@ fn build_derivation_node<'a>(
                     along_values,
                     children,
                     graph_fact: Some(format_graph_fact(evidence_row)),
+                    approximate: false,
                 });
             }
         }
@@ -485,6 +525,7 @@ fn build_derivation_node<'a>(
             along_values: extract_along_values(fact, rule),
             children: Vec::new(),
             graph_fact: Some(format_graph_fact(fact)),
+            approximate: false,
         })
     })
 }

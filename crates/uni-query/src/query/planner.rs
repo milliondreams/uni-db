@@ -2042,6 +2042,8 @@ pub enum LogicalPlan {
         deterministic_best_by: bool,
         strict_probability_domain: bool,
         probability_epsilon: f64,
+        exact_probability: bool,
+        max_bdd_variables: usize,
     },
     /// FOLD operator: lattice-join non-key columns per KEY group.
     LocyFold {

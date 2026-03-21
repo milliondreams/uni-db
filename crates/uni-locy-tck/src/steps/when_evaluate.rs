@@ -68,3 +68,59 @@ async fn when_evaluating_with_strict_probability(
         .await;
     world.set_locy_result(result);
 }
+
+#[when("evaluating the following Locy program with exact_probability:")]
+async fn when_evaluating_with_exact_probability(
+    world: &mut LocyWorld,
+    step: &cucumber::gherkin::Step,
+) {
+    let program = step
+        .docstring()
+        .expect("Expected a docstring with the Locy program to evaluate");
+
+    world
+        .init_db()
+        .await
+        .expect("Failed to initialize database");
+
+    let config = uni_locy::LocyConfig {
+        exact_probability: true,
+        ..Default::default()
+    };
+    let result = world
+        .db()
+        .locy()
+        .evaluate_with_config(program, &config)
+        .await;
+    world.set_locy_result(result);
+}
+
+#[when(
+    regex = r#"^evaluating the following Locy program with exact_probability and max_bdd_variables (\d+):$"#
+)]
+async fn when_evaluating_with_exact_probability_and_bdd_limit(
+    world: &mut LocyWorld,
+    max_bdd: usize,
+    step: &cucumber::gherkin::Step,
+) {
+    let program = step
+        .docstring()
+        .expect("Expected a docstring with the Locy program to evaluate");
+
+    world
+        .init_db()
+        .await
+        .expect("Failed to initialize database");
+
+    let config = uni_locy::LocyConfig {
+        exact_probability: true,
+        max_bdd_variables: max_bdd,
+        ..Default::default()
+    };
+    let result = world
+        .db()
+        .locy()
+        .evaluate_with_config(program, &config)
+        .await;
+    world.set_locy_result(result);
+}

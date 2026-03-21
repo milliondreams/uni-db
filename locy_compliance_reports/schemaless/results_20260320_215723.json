@@ -338,8 +338,7 @@
             "keyword": "Scenario ",
             "name": "BEST BY preserves full winning row",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/bestby/OptimizedSelection.feature:84:5\n      Matched: crates/uni-locy-tck/src/steps/then_evaluate.rs:52:1\n      Step panicked. Captured output: Expected successful evaluation, but got error: Query error: LocyRuntimeError: Arrow error: Invalid argument error: column types must match schema types, expected Float64 but found Utf8 at column index 3\n[Summary]\n1 feature\n1 scenario (1 failed)\n4 steps (3 passed, 1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1280,6 +1279,180 @@
           {
             "keyword": "Scenario ",
             "name": "Glob import backward compatibility",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "ExactProbability",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/monotonic/ExactProbability.feature",
+    "elements": [
+      {
+        "type": "scenario",
+        "name": "Shared-proof diamond with exact_probability produces correct result",
+        "line": 15,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "Shared-proof diamond with exact_probability produces correct result",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "BDD limit exceeded emits BddLimitExceeded warning",
+        "line": 43,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "BDD limit exceeded emits BddLimitExceeded warning",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "Default mode emits only SharedProbabilisticDependency warning",
+        "line": 71,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "Default mode emits only SharedProbabilisticDependency warning",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "Independent groups produce no warnings with exact_probability",
+        "line": 99,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "Independent groups produce no warnings with exact_probability",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "MPROD with shared base facts uses BDD",
+        "line": 121,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "MPROD with shared base facts uses BDD",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "BDD mode produces numeric probability for MNOR diamond",
+        "line": 151,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "BDD mode produces numeric probability for MNOR diamond",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "Default mode produces numeric probability for MNOR diamond",
+        "line": 181,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "Default mode produces numeric probability for MNOR diamond",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "Independent groups with exact_probability produce correct probability",
+        "line": 210,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "Independent groups with exact_probability produce correct probability",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "BDD limit exceeded retains independence value",
+        "line": 233,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "BDD limit exceeded retains independence value",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "MPROD diamond with exact_probability produces correct probability",
+        "line": 263,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "MPROD diamond with exact_probability produces correct probability",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "Multi-key disjoint groups do not emit CrossGroupCorrelationNotExact",
+        "line": 293,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "Multi-key disjoint groups do not emit CrossGroupCorrelationNotExact",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "Shared hub emits CrossGroupCorrelationNotExact warning",
+        "line": 323,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "Shared hub emits CrossGroupCorrelationNotExact warning",
             "result": {
               "status": "passed"
             }

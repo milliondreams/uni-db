@@ -23,6 +23,9 @@ pub struct LocyResult {
     pub command_results: Vec<CommandResult>,
     /// Runtime warnings collected during evaluation.
     pub warnings: Vec<RuntimeWarning>,
+    /// Groups where BDD computation fell back to independence mode.
+    /// Maps rule name → list of human-readable key group descriptions.
+    pub approximate_groups: HashMap<String, Vec<String>>,
 }
 
 /// Result of executing a single Phase 4 command.
@@ -46,6 +49,9 @@ pub struct DerivationNode {
     pub along_values: HashMap<String, Value>,
     pub children: Vec<DerivationNode>,
     pub graph_fact: Option<String>,
+    /// True when this node's probability was computed via BDD fallback
+    /// (independence mode) because the group exceeded `max_bdd_variables`.
+    pub approximate: bool,
 }
 
 /// Result of an ABDUCE query.

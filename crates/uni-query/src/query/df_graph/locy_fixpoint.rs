@@ -826,7 +826,10 @@ async fn run_fixpoint_loop(
     iteration_counts: Arc<StdRwLock<HashMap<String, usize>>>,
     strict_probability_domain: bool,
     probability_epsilon: f64,
+    exact_probability: bool,
+    max_bdd_variables: usize,
     warnings_slot: Arc<StdRwLock<Vec<RuntimeWarning>>>,
+    approximate_slot: Arc<StdRwLock<HashMap<String, Vec<String>>>>,
 ) -> DFResult<Vec<RecordBatch>> {
     let start = Instant::now();
     let task_ctx = session_ctx.read().task_ctx();
@@ -1012,14 +1015,32 @@ async fn run_fixpoint_loop(
 
     for (rule_idx, state) in states.into_iter().enumerate() {
         let rule = &rules[rule_idx];
-        let facts = state.into_facts();
+        let mut facts = state.into_facts();
         if facts.is_empty() {
             continue;
         }
 
         // Detect shared proofs before FOLD collapses groups.
-        if let Some(ref tracker) = derivation_tracker {
-            detect_shared_proofs(rule, &facts, tracker, &warnings_slot);
+        let shared_info = if let Some(ref tracker) = derivation_tracker {
+            detect_shared_proofs(rule, &facts, tracker, &warnings_slot)
+        } else {
+            None
+        };
+
+        // Apply BDD for shared groups if exact_probability is enabled.
+        if exact_probability
+            && let Some(ref info) = shared_info
+            && let Some(ref tracker) = derivation_tracker
+        {
+            facts = apply_bdd_for_shared_groups(
+                facts,
+                rule,
+                info,
+                tracker,
+                max_bdd_variables,
+                &warnings_slot,
+                &approximate_slot,
+            )?;
         }
 
         let processed = apply_post_fixpoint_chain(
@@ -1203,13 +1224,27 @@ fn collect_is_ref_inputs(
 ///    Recursive derivation through shared relations is a strong signal that
 ///    proof paths may share intermediate nodes.
 ///
+/// Per-row data collected during shared-proof detection.
+#[allow(dead_code)]
+pub(crate) struct SharedGroupRow {
+    pub fact_hash: Vec<u8>,
+    pub base_facts: HashSet<Vec<u8>>,
+}
+
+/// Information about groups with shared proofs, returned by `detect_shared_proofs`.
+pub(crate) struct SharedProofInfo {
+    /// KEY group → rows with their base fact sets.
+    pub shared_groups: HashMap<Vec<ScalarKey>, Vec<SharedGroupRow>>,
+}
+
 /// Emits at most one `SharedProbabilisticDependency` warning per rule.
+/// Returns `Some(SharedProofInfo)` if any group has shared proofs.
 fn detect_shared_proofs(
     rule: &FixpointRulePlan,
     pre_fold_facts: &[RecordBatch],
     tracker: &Arc<DerivationTracker>,
     warnings_slot: &Arc<StdRwLock<Vec<RuntimeWarning>>>,
-) {
+) -> Option<SharedProofInfo> {
     use crate::query::df_graph::locy_fold::FoldAggKind;
     use uni_locy::{RuntimeWarning, RuntimeWarningCode};
 
@@ -1219,7 +1254,7 @@ fn detect_shared_proofs(
         .iter()
         .any(|fb| matches!(fb.kind, FoldAggKind::Nor | FoldAggKind::Prod));
     if !has_prob_fold {
-        return;
+        return None;
     }
 
     // Group facts by KEY columns.
@@ -1236,8 +1271,11 @@ fn detect_shared_proofs(
         }
     }
 
+    let mut shared_groups: HashMap<Vec<ScalarKey>, Vec<SharedGroupRow>> = HashMap::new();
+    let mut any_shared = false;
+
     // Check each group with ≥2 rows.
-    for fact_hashes in groups.values() {
+    for (key, fact_hashes) in &groups {
         if fact_hashes.len() < 2 {
             continue;
         }
@@ -1280,26 +1318,86 @@ fn detect_shared_proofs(
         };
 
         if shared_found {
-            if let Ok(mut warnings) = warnings_slot.write() {
-                let already_warned = warnings.iter().any(|w| {
-                    w.code == RuntimeWarningCode::SharedProbabilisticDependency
-                        && w.rule_name == rule.name
-                });
-                if !already_warned {
-                    warnings.push(RuntimeWarning {
-                        code: RuntimeWarningCode::SharedProbabilisticDependency,
-                        message: format!(
-                            "Rule '{}' aggregates with MNOR/MPROD but some proof paths \
-                             share intermediate facts, violating the independence assumption. \
-                             Results may overestimate probability.",
-                            rule.name
-                        ),
-                        rule_name: rule.name.clone(),
-                    });
+            any_shared = true;
+            // Collect the group rows with their base facts for BDD use.
+            let rows: Vec<SharedGroupRow> = fact_hashes
+                .iter()
+                .zip(per_row_bases.into_iter())
+                .map(|(fh, bases)| SharedGroupRow {
+                    fact_hash: fh.clone(),
+                    base_facts: bases,
+                })
+                .collect();
+            shared_groups.insert(key.clone(), rows);
+        }
+    }
+
+    // Phase 5: Cross-group correlation warning.
+    // Check if any IS-ref input fact appears in multiple KEY groups.
+    // This is independent of within-group sharing: even rules whose KEY groups
+    // each have only one post-fold row can exhibit cross-group correlation when
+    // different groups consume the same IS-ref base fact.
+    {
+        let mut input_to_groups: HashMap<Vec<u8>, HashSet<Vec<ScalarKey>>> = HashMap::new();
+        for (key, fact_hashes) in &groups {
+            for fh in fact_hashes {
+                if let Some(entry) = tracker.lookup(fh) {
+                    for input in &entry.inputs {
+                        input_to_groups
+                            .entry(input.fact_hash.clone())
+                            .or_default()
+                            .insert(key.clone());
+                    }
                 }
             }
-            return; // One warning per rule is enough.
         }
+        let has_cross_group = input_to_groups.values().any(|g| g.len() > 1);
+        if has_cross_group && let Ok(mut warnings) = warnings_slot.write() {
+            let already_warned = warnings.iter().any(|w| {
+                w.code == RuntimeWarningCode::CrossGroupCorrelationNotExact
+                    && w.rule_name == rule.name
+            });
+            if !already_warned {
+                warnings.push(RuntimeWarning {
+                    code: RuntimeWarningCode::CrossGroupCorrelationNotExact,
+                    message: format!(
+                        "Rule '{}': IS-ref base facts are shared across different KEY \
+                         groups. BDD corrects per-group probabilities but cannot account \
+                         for cross-group correlations.",
+                        rule.name
+                    ),
+                    rule_name: rule.name.clone(),
+                    variable_count: None,
+                    key_group: None,
+                });
+            }
+        }
+    }
+
+    if any_shared {
+        if let Ok(mut warnings) = warnings_slot.write() {
+            let already_warned = warnings.iter().any(|w| {
+                w.code == RuntimeWarningCode::SharedProbabilisticDependency
+                    && w.rule_name == rule.name
+            });
+            if !already_warned {
+                warnings.push(RuntimeWarning {
+                    code: RuntimeWarningCode::SharedProbabilisticDependency,
+                    message: format!(
+                        "Rule '{}' aggregates with MNOR/MPROD but some proof paths \
+                         share intermediate facts, violating the independence assumption. \
+                         Results may overestimate probability.",
+                        rule.name
+                    ),
+                    rule_name: rule.name.clone(),
+                    variable_count: None,
+                    key_group: None,
+                });
+            }
+        }
+        Some(SharedProofInfo { shared_groups })
+    } else {
+        None
     }
 }
 
@@ -1316,7 +1414,7 @@ pub(crate) fn record_and_detect_shared_proofs_nonrecursive(
     tracker: &Arc<DerivationTracker>,
     warnings_slot: &Arc<StdRwLock<Vec<RuntimeWarning>>>,
     registry: &Arc<DerivedScanRegistry>,
-) {
+) -> Option<SharedProofInfo> {
     let all_indices: Vec<usize> = (0..rule.yield_schema.fields().len()).collect();
 
     // Record provenance for each clause's facts.
@@ -1359,7 +1457,208 @@ pub(crate) fn record_and_detect_shared_proofs_nonrecursive(
         .iter()
         .flat_map(|(_, batches)| batches.iter().cloned())
         .collect();
-    detect_shared_proofs(rule, &all_facts, tracker, warnings_slot);
+    detect_shared_proofs(rule, &all_facts, tracker, warnings_slot)
+}
+
+/// Replace multiple rows in shared-proof groups with a single row whose PROB
+/// column carries the BDD-computed exact probability.
+///
+/// For groups that exceed `max_bdd_variables`, rows are left unchanged and a
+/// `BddLimitExceeded` warning is emitted.
+pub(crate) fn apply_bdd_for_shared_groups(
+    pre_fold_facts: Vec<RecordBatch>,
+    rule: &FixpointRulePlan,
+    shared_info: &SharedProofInfo,
+    tracker: &Arc<DerivationTracker>,
+    max_bdd_variables: usize,
+    warnings_slot: &Arc<StdRwLock<Vec<RuntimeWarning>>>,
+    approximate_slot: &Arc<StdRwLock<HashMap<String, Vec<String>>>>,
+) -> DFResult<Vec<RecordBatch>> {
+    use crate::query::df_graph::locy_bdd::compute_bdd_probability;
+    use crate::query::df_graph::locy_fold::FoldAggKind;
+    use uni_locy::{RuntimeWarning, RuntimeWarningCode};
+
+    // Find the MNOR/MPROD fold binding to know which column to overwrite.
+    let prob_fold = rule
+        .fold_bindings
+        .iter()
+        .find(|fb| matches!(fb.kind, FoldAggKind::Nor | FoldAggKind::Prod));
+    let prob_fold = match prob_fold {
+        Some(f) => f,
+        None => return Ok(pre_fold_facts),
+    };
+    let is_nor = matches!(prob_fold.kind, FoldAggKind::Nor);
+    let prob_col_idx = prob_fold.input_col_index;
+    let prob_col_name = rule.yield_schema.field(prob_col_idx).name().clone();
+
+    let key_indices = &rule.key_column_indices;
+    let all_indices: Vec<usize> = (0..rule.yield_schema.fields().len()).collect();
+
+    // Build a set of shared group keys for quick lookup.
+    let shared_keys: HashSet<Vec<ScalarKey>> = shared_info.shared_groups.keys().cloned().collect();
+
+    // Phase 1: Collect all rows for each shared KEY group across all batches.
+    // Store (batch_index, row_index) pairs for each group.
+    struct GroupAccum {
+        base_facts: Vec<HashSet<Vec<u8>>>,
+        base_probs: HashMap<Vec<u8>, f64>,
+        /// First occurrence: (batch_index, row_index) — used as representative.
+        representative: (usize, usize),
+        row_locations: Vec<(usize, usize)>,
+    }
+
+    let mut group_accums: HashMap<Vec<ScalarKey>, GroupAccum> = HashMap::new();
+    let mut non_shared_rows: Vec<(usize, usize)> = Vec::new(); // (batch_idx, row_idx)
+
+    for (batch_idx, batch) in pre_fold_facts.iter().enumerate() {
+        for row_idx in 0..batch.num_rows() {
+            let key = extract_scalar_key(batch, key_indices, row_idx);
+            if shared_keys.contains(&key) {
+                let fact_hash =
+                    format!("{:?}", extract_scalar_key(batch, &all_indices, row_idx)).into_bytes();
+                let bases = collect_base_facts_recursive(&fact_hash, tracker, &mut HashSet::new());
+
+                let accum = group_accums.entry(key).or_insert_with(|| GroupAccum {
+                    base_facts: Vec::new(),
+                    base_probs: HashMap::new(),
+                    representative: (batch_idx, row_idx),
+                    row_locations: Vec::new(),
+                });
+
+                // Look up probabilities for base facts.
+                for bf in &bases {
+                    if !accum.base_probs.contains_key(bf)
+                        && let Some(entry) = tracker.lookup(bf)
+                        && let Some(val) = entry.fact_row.get(&prob_col_name)
+                        && let Some(p) = value_to_f64(val)
+                    {
+                        accum.base_probs.insert(bf.clone(), p);
+                    }
+                }
+
+                accum.base_facts.push(bases);
+                accum.row_locations.push((batch_idx, row_idx));
+            } else {
+                non_shared_rows.push((batch_idx, row_idx));
+            }
+        }
+    }
+
+    // Phase 2: Compute BDD for each shared group (across all batches).
+    // Track which (batch_idx, row_idx) pairs to keep vs drop.
+    let mut keep_rows: HashSet<(usize, usize)> = HashSet::new();
+    // Map of (batch_idx, row_idx) → overridden PROB value (for BDD-succeeded groups).
+    let mut overrides: HashMap<(usize, usize), f64> = HashMap::new();
+
+    // All non-shared rows are kept.
+    for &loc in &non_shared_rows {
+        keep_rows.insert(loc);
+    }
+
+    for (key, accum) in &group_accums {
+        let bdd_result = compute_bdd_probability(
+            &accum.base_facts,
+            &accum.base_probs,
+            is_nor,
+            max_bdd_variables,
+        );
+
+        if bdd_result.fell_back {
+            // Emit BddLimitExceeded warning (one per key group).
+            if let Ok(mut warnings) = warnings_slot.write() {
+                let key_desc = format!("{:?}", key);
+                let already_warned = warnings.iter().any(|w| {
+                    w.code == RuntimeWarningCode::BddLimitExceeded
+                        && w.rule_name == rule.name
+                        && w.key_group.as_deref() == Some(&key_desc)
+                });
+                if !already_warned {
+                    warnings.push(RuntimeWarning {
+                        code: RuntimeWarningCode::BddLimitExceeded,
+                        message: format!(
+                            "Rule '{}': BDD variable limit exceeded ({} > {}). \
+                             Falling back to independence-mode result.",
+                            rule.name, bdd_result.variable_count, max_bdd_variables
+                        ),
+                        rule_name: rule.name.clone(),
+                        variable_count: Some(bdd_result.variable_count),
+                        key_group: Some(key_desc),
+                    });
+                }
+            }
+            if let Ok(mut approx) = approximate_slot.write() {
+                let key_desc = format!("{:?}", key);
+                approx.entry(rule.name.clone()).or_default().push(key_desc);
+            }
+            // Keep all rows unchanged.
+            for &loc in &accum.row_locations {
+                keep_rows.insert(loc);
+            }
+        } else {
+            // BDD succeeded: keep one representative row with overridden PROB.
+            keep_rows.insert(accum.representative);
+            overrides.insert(accum.representative, bdd_result.probability);
+        }
+    }
+
+    // Phase 3: Build output batches by filtering kept rows per batch.
+    let mut result_batches = Vec::new();
+    for (batch_idx, batch) in pre_fold_facts.iter().enumerate() {
+        let kept_indices: Vec<usize> = (0..batch.num_rows())
+            .filter(|&row_idx| keep_rows.contains(&(batch_idx, row_idx)))
+            .collect();
+
+        if kept_indices.is_empty() {
+            continue;
+        }
+
+        let indices = arrow::array::UInt32Array::from(
+            kept_indices.iter().map(|&i| i as u32).collect::<Vec<_>>(),
+        );
+        let mut columns: Vec<arrow::array::ArrayRef> = batch
+            .columns()
+            .iter()
+            .map(|col| arrow::compute::take(col, &indices, None))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+
+        // Check if any kept rows have PROB overrides.
+        let override_map: Vec<Option<f64>> = kept_indices
+            .iter()
+            .map(|&row_idx| overrides.get(&(batch_idx, row_idx)).copied())
+            .collect();
+
+        if override_map.iter().any(|o| o.is_some()) {
+            // Rebuild the PROB column with overrides.
+            let existing_prob = columns[prob_col_idx]
+                .as_any()
+                .downcast_ref::<arrow::array::Float64Array>();
+            let new_values: Vec<f64> = override_map
+                .iter()
+                .enumerate()
+                .map(|(i, ov)| match ov {
+                    Some(p) => *p,
+                    None => existing_prob.map(|arr| arr.value(i)).unwrap_or(0.0),
+                })
+                .collect();
+            columns[prob_col_idx] = Arc::new(arrow::array::Float64Array::from(new_values));
+        }
+
+        let result_batch = RecordBatch::try_new(batch.schema(), columns)
+            .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+        result_batches.push(result_batch);
+    }
+
+    Ok(result_batches)
+}
+
+/// Extract an f64 from a `Value`, supporting Float and Int.
+fn value_to_f64(val: &uni_common::Value) -> Option<f64> {
+    match val {
+        uni_common::Value::Float(f) => Some(*f),
+        uni_common::Value::Int(i) => Some(*i as f64),
+        _ => None,
+    }
 }
 
 /// Recursively collect base fact hashes from a derivation entry.
@@ -2253,8 +2552,12 @@ pub struct FixpointExec {
     iteration_counts: Arc<StdRwLock<HashMap<String, usize>>>,
     strict_probability_domain: bool,
     probability_epsilon: f64,
+    exact_probability: bool,
+    max_bdd_variables: usize,
     /// Shared slot for runtime warnings collected during fixpoint iteration.
     warnings_slot: Arc<StdRwLock<Vec<RuntimeWarning>>>,
+    /// Shared slot for groups where BDD fell back to independence mode.
+    approximate_slot: Arc<StdRwLock<HashMap<String, Vec<String>>>>,
 }
 
 impl fmt::Debug for FixpointExec {
@@ -2288,7 +2591,10 @@ impl FixpointExec {
         iteration_counts: Arc<StdRwLock<HashMap<String, usize>>>,
         strict_probability_domain: bool,
         probability_epsilon: f64,
+        exact_probability: bool,
+        max_bdd_variables: usize,
         warnings_slot: Arc<StdRwLock<Vec<RuntimeWarning>>>,
+        approximate_slot: Arc<StdRwLock<HashMap<String, Vec<String>>>>,
     ) -> Self {
         let properties = compute_plan_properties(Arc::clone(&output_schema));
         Self {
@@ -2309,7 +2615,10 @@ impl FixpointExec {
             iteration_counts,
             strict_probability_domain,
             probability_epsilon,
+            exact_probability,
+            max_bdd_variables,
             warnings_slot,
+            approximate_slot,
         }
     }
 
@@ -2424,7 +2733,10 @@ impl ExecutionPlan for FixpointExec {
         let iteration_counts = Arc::clone(&self.iteration_counts);
         let strict_probability_domain = self.strict_probability_domain;
         let probability_epsilon = self.probability_epsilon;
+        let exact_probability = self.exact_probability;
+        let max_bdd_variables = self.max_bdd_variables;
         let warnings_slot = Arc::clone(&self.warnings_slot);
+        let approximate_slot = Arc::clone(&self.approximate_slot);
 
         let fut = async move {
             run_fixpoint_loop(
@@ -2443,7 +2755,10 @@ impl ExecutionPlan for FixpointExec {
                 iteration_counts,
                 strict_probability_domain,
                 probability_epsilon,
+                exact_probability,
+                max_bdd_variables,
                 warnings_slot,
+                approximate_slot,
             )
             .await
         };

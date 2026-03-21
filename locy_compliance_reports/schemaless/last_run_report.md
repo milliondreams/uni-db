@@ -1,17 +1,19 @@
 # TCK Compliance Report
 
-**Generated:** 2026-03-19 15:39:55
-**Results:** `results_20260319_153955.json`
-**Compared to:** `results_20260319_153251.json`
+**Generated:** 2026-03-20 23:35:56
+**Results:** `results_20260320_233556.json`
+**Compared to:** `results_20260320_215723.json`
 
 ## Summary
 
 | Metric | Current | Previous | Delta |
 |--------|---------|----------|-------|
-| Scenarios | 168 | 168 |  |
-| Passed | 168 | 168 |  |
+| Scenarios | 183 | 180 | +3 |
+| Passed | 183 | 180 | +3 |
 | Failed | 0 | 0 |  |
 | Pass Rate | 100.0% | 100.0% | ➡️ +0.0pp |
+
+**🆕 New:** 3 scenarios added
 
 ## Feature Breakdown
 
@@ -22,6 +24,7 @@
 | ✅ BasicRules | 6 | 6 | 0 | 100% |  |
 | ✅ DeriveEdges | 9 | 9 | 0 | 100% |  |
 | ✅ ErrorConditions | 5 | 5 | 0 | 100% |  |
+| ✅ ExactProbability | 15 | 15 | 0 | 100% |  |
 | ✅ GoalDirected | 6 | 6 | 0 | 100% |  |
 | ✅ Hypothetical | 6 | 6 | 0 | 100% |  |
 | ✅ ModuleComposition | 8 | 8 | 0 | 100% |  |

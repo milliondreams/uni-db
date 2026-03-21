@@ -1163,6 +1163,8 @@ impl HybridPhysicalPlanner {
                 deterministic_best_by,
                 strict_probability_domain,
                 probability_epsilon,
+                exact_probability,
+                max_bdd_variables,
             } => {
                 let output_schema = super::df_graph::locy_program::stats_schema();
 
@@ -1183,6 +1185,8 @@ impl HybridPhysicalPlanner {
                         *deterministic_best_by,
                         *strict_probability_domain,
                         *probability_epsilon,
+                        *exact_probability,
+                        *max_bdd_variables,
                     ),
                 ))
             }

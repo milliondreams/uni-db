@@ -74,6 +74,7 @@ pub async fn evaluate_abduce(
         derived_store,
         stats,
         tracker,
+        None,
     )
     .await?;
 

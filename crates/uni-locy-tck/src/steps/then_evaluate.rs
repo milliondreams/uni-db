@@ -704,3 +704,201 @@ async fn result_should_not_contain_shared_dep_warning(world: &mut LocyWorld) {
             .collect::<Vec<_>>()
     );
 }
+
+#[then(regex = r#"^the result should contain a BddLimitExceeded warning for rule ['"](.+)['"]$"#)]
+async fn result_should_contain_bdd_limit_warning(world: &mut LocyWorld, rule_name: String) {
+    let locy_result = world
+        .locy_result()
+        .expect("no evaluation result")
+        .as_ref()
+        .expect("evaluation failed");
+
+    let found = locy_result.warnings().iter().any(|w| {
+        w.code == uni_locy::RuntimeWarningCode::BddLimitExceeded && w.rule_name == rule_name
+    });
+    assert!(
+        found,
+        "Expected BddLimitExceeded warning for rule '{}', but warnings were: {:?}",
+        rule_name,
+        locy_result
+            .warnings()
+            .iter()
+            .map(|w| format!("{:?} ({})", w.code, w.rule_name))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[then("the result should not contain a BddLimitExceeded warning")]
+async fn result_should_not_contain_bdd_limit_warning(world: &mut LocyWorld) {
+    let locy_result = world
+        .locy_result()
+        .expect("no evaluation result")
+        .as_ref()
+        .expect("evaluation failed");
+
+    let found = locy_result
+        .warnings()
+        .iter()
+        .any(|w| w.code == uni_locy::RuntimeWarningCode::BddLimitExceeded);
+    assert!(
+        !found,
+        "Expected no BddLimitExceeded warning, but found: {:?}",
+        locy_result
+            .warnings()
+            .iter()
+            .filter(|w| w.code == uni_locy::RuntimeWarningCode::BddLimitExceeded)
+            .map(|w| format!("rule={}", w.rule_name))
+            .collect::<Vec<_>>()
+    );
+}
+
+// ── CrossGroupCorrelationNotExact Assertions ────────────────────────────
+
+#[then(
+    regex = r#"^the result should contain a CrossGroupCorrelationNotExact warning for rule ['"](.+)['"]$"#
+)]
+async fn result_should_contain_cross_group_warning(world: &mut LocyWorld, rule_name: String) {
+    let locy_result = world
+        .locy_result()
+        .expect("no evaluation result")
+        .as_ref()
+        .expect("evaluation failed");
+
+    let found = locy_result.warnings().iter().any(|w| {
+        w.code == uni_locy::RuntimeWarningCode::CrossGroupCorrelationNotExact
+            && w.rule_name == rule_name
+    });
+    assert!(
+        found,
+        "Expected CrossGroupCorrelationNotExact warning for rule '{}', but warnings were: {:?}",
+        rule_name,
+        locy_result
+            .warnings()
+            .iter()
+            .map(|w| format!("{:?} ({})", w.code, w.rule_name))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[then("the result should not contain a CrossGroupCorrelationNotExact warning")]
+async fn result_should_not_contain_cross_group_warning(world: &mut LocyWorld) {
+    let locy_result = world
+        .locy_result()
+        .expect("no evaluation result")
+        .as_ref()
+        .expect("evaluation failed");
+
+    let found = locy_result
+        .warnings()
+        .iter()
+        .any(|w| w.code == uni_locy::RuntimeWarningCode::CrossGroupCorrelationNotExact);
+    assert!(
+        !found,
+        "Expected no CrossGroupCorrelationNotExact warning, but found: {:?}",
+        locy_result
+            .warnings()
+            .iter()
+            .filter(|w| w.code == uni_locy::RuntimeWarningCode::CrossGroupCorrelationNotExact)
+            .map(|w| format!("rule={}", w.rule_name))
+            .collect::<Vec<_>>()
+    );
+}
+
+// ── BddLimitExceeded Metadata Assertions ────────────────────────────────
+
+#[then(
+    regex = r#"^the BddLimitExceeded warning for rule ['"](.+)['"] should have variable_count >= (\d+)$"#
+)]
+async fn bdd_warning_should_have_variable_count(
+    world: &mut LocyWorld,
+    rule_name: String,
+    min_count: usize,
+) {
+    let locy_result = world
+        .locy_result()
+        .expect("no evaluation result")
+        .as_ref()
+        .expect("evaluation failed");
+
+    let warning = locy_result.warnings().iter().find(|w| {
+        w.code == uni_locy::RuntimeWarningCode::BddLimitExceeded && w.rule_name == rule_name
+    });
+    let warning = warning.unwrap_or_else(|| {
+        panic!(
+            "Expected BddLimitExceeded warning for rule '{}', but none found",
+            rule_name
+        )
+    });
+    let vc = warning.variable_count.unwrap_or_else(|| {
+        panic!(
+            "BddLimitExceeded warning for rule '{}' has no variable_count",
+            rule_name
+        )
+    });
+    assert!(
+        vc >= min_count,
+        "Expected variable_count >= {} for rule '{}', but got {}",
+        min_count,
+        rule_name,
+        vc
+    );
+}
+
+#[then(regex = r#"^the BddLimitExceeded warning for rule ['"](.+)['"] should have a key_group$"#)]
+async fn bdd_warning_should_have_key_group(world: &mut LocyWorld, rule_name: String) {
+    let locy_result = world
+        .locy_result()
+        .expect("no evaluation result")
+        .as_ref()
+        .expect("evaluation failed");
+
+    let warning = locy_result.warnings().iter().find(|w| {
+        w.code == uni_locy::RuntimeWarningCode::BddLimitExceeded && w.rule_name == rule_name
+    });
+    let warning = warning.unwrap_or_else(|| {
+        panic!(
+            "Expected BddLimitExceeded warning for rule '{}', but none found",
+            rule_name
+        )
+    });
+    assert!(
+        warning.key_group.is_some(),
+        "BddLimitExceeded warning for rule '{}' has no key_group field",
+        rule_name
+    );
+}
+
+// ── Approximate Fact Assertions ──────────────────────────────────────────
+
+#[then(regex = r#"^the derived relation ['"](.+)['"] should not contain any approximate facts$"#)]
+async fn derived_relation_should_not_contain_approximate_facts(
+    world: &mut LocyWorld,
+    relation: String,
+) {
+    let locy_result = world
+        .locy_result()
+        .expect("No evaluation result found")
+        .as_ref()
+        .expect("Evaluation failed");
+
+    let facts = locy_result
+        .derived
+        .get(&relation)
+        .unwrap_or_else(|| panic!("No derived relation '{}'", relation));
+
+    let approximate_count = facts
+        .iter()
+        .filter(|row| {
+            row.get("_approximate")
+                .map(|v| matches!(v, Value::Bool(true)))
+                .unwrap_or(false)
+        })
+        .count();
+
+    assert!(
+        approximate_count == 0,
+        "Expected no approximate facts in '{}', but found {} approximate fact(s)",
+        relation,
+        approximate_count
+    );
+}

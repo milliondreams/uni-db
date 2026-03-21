@@ -135,6 +135,7 @@ fn dispatch_body_command<'a>(
                     derived_store,
                     stats,
                     None::<&DerivationTracker>,
+                    None,
                 )
                 .await?;
                 Ok(CommandResult::Explain(node))

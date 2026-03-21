@@ -214,6 +214,8 @@ impl<'a> LocyPlanBuilder<'a> {
         deterministic_best_by: bool,
         strict_probability_domain: bool,
         probability_epsilon: f64,
+        exact_probability: bool,
+        max_bdd_variables: usize,
     ) -> Result<LogicalPlan> {
         let mut strata = Vec::with_capacity(compiled.strata.len());
 
@@ -241,6 +243,8 @@ impl<'a> LocyPlanBuilder<'a> {
             deterministic_best_by,
             strict_probability_domain,
             probability_epsilon,
+            exact_probability,
+            max_bdd_variables,
         };
 
         Ok(plan)
@@ -2309,6 +2313,8 @@ mod tests {
                 true,
                 false,
                 1e-15,
+                false,
+                1000,
             )
             .unwrap();
 
@@ -2367,6 +2373,8 @@ mod tests {
                 true,
                 false,
                 1e-15,
+                false,
+                1000,
             )
             .unwrap();
         let registry = if let LogicalPlan::LocyProgram {
@@ -2443,6 +2451,8 @@ mod tests {
                 true,
                 false,
                 1e-15,
+                false,
+                1000,
             )
             .unwrap();
 
@@ -2515,6 +2525,8 @@ mod tests {
                 true,
                 false,
                 1e-15,
+                false,
+                1000,
             )
             .unwrap();
         let registry = if let LogicalPlan::LocyProgram {
@@ -2595,6 +2607,8 @@ mod tests {
                 true,
                 false,
                 1e-15,
+                false,
+                1000,
             )
             .unwrap();
         let registry = if let LogicalPlan::LocyProgram {
@@ -2692,6 +2706,8 @@ mod tests {
                 true,
                 false,
                 1e-15,
+                false,
+                1000,
             )
             .unwrap();
         let registry = if let LogicalPlan::LocyProgram {
@@ -2753,6 +2769,8 @@ mod tests {
                 true,
                 false,
                 1e-15,
+                false,
+                1000,
             )
             .unwrap();
         let registry = if let LogicalPlan::LocyProgram {
@@ -2872,6 +2890,8 @@ mod tests {
                 true,
                 false,
                 1e-15,
+                false,
+                1000,
             )
             .unwrap();
         let registry = if let LogicalPlan::LocyProgram {

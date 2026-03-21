@@ -78,6 +78,8 @@ impl<'a> LocyEngine<'a> {
                 config.deterministic_best_by,
                 config.strict_probability_domain,
                 config.probability_epsilon,
+                config.exact_probability,
+                config.max_bdd_variables,
             )
             .map_err(|e| UniError::Query {
                 message: format!("LocyPlanBuildError: {e}"),
@@ -128,28 +130,35 @@ impl<'a> LocyEngine<'a> {
             None
         };
 
-        let (derived_store_slot, iteration_counts_slot, peak_memory_slot, warnings_slot) =
-            if let Some(program_exec) = exec_plan
-                .as_any()
-                .downcast_ref::<uni_query::query::df_graph::LocyProgramExec>(
-            ) {
-                if let Some(ref t) = tracker {
-                    program_exec.set_derivation_tracker(Arc::clone(t));
-                }
-                (
-                    program_exec.derived_store_slot(),
-                    program_exec.iteration_counts_slot(),
-                    program_exec.peak_memory_slot(),
-                    program_exec.warnings_slot(),
-                )
-            } else {
-                (
-                    Arc::new(std::sync::RwLock::new(None)),
-                    Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
-                    Arc::new(std::sync::RwLock::new(0usize)),
-                    Arc::new(std::sync::RwLock::new(Vec::new())),
-                )
-            };
+        let (
+            derived_store_slot,
+            iteration_counts_slot,
+            peak_memory_slot,
+            warnings_slot,
+            approximate_slot,
+        ) = if let Some(program_exec) = exec_plan
+            .as_any()
+            .downcast_ref::<uni_query::query::df_graph::LocyProgramExec>(
+        ) {
+            if let Some(ref t) = tracker {
+                program_exec.set_derivation_tracker(Arc::clone(t));
+            }
+            (
+                program_exec.derived_store_slot(),
+                program_exec.iteration_counts_slot(),
+                program_exec.peak_memory_slot(),
+                program_exec.warnings_slot(),
+                program_exec.approximate_slot(),
+            )
+        } else {
+            (
+                Arc::new(std::sync::RwLock::new(None)),
+                Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+                Arc::new(std::sync::RwLock::new(0usize)),
+                Arc::new(std::sync::RwLock::new(Vec::new())),
+                Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            )
+        };
 
         // 5. Execute strata
         let _stats_batches = uni_query::Executor::collect_batches(&session_ctx, exec_plan)
@@ -182,6 +191,10 @@ impl<'a> LocyEngine<'a> {
             peak_memory_bytes: peak_memory_slot.read().map(|v| *v).unwrap_or(0),
             ..LocyStats::default()
         };
+        let approx_for_explain = approximate_slot
+            .read()
+            .map(|a| a.clone())
+            .unwrap_or_default();
         let mut command_results = Vec::new();
         for cmd in &compiled.commands {
             let result = dispatch_native_command(
@@ -193,6 +206,7 @@ impl<'a> LocyEngine<'a> {
                 &mut locy_stats,
                 tracker.clone(),
                 start,
+                &approx_for_explain,
             )
             .await
             .map_err(map_runtime_error)?;
@@ -202,7 +216,7 @@ impl<'a> LocyEngine<'a> {
         let evaluation_time = start.elapsed();
 
         // 9. Build derived map, enrich VID columns with full nodes
-        let base_derived: HashMap<String, Vec<Row>> = native_store
+        let mut base_derived: HashMap<String, Vec<Row>> = native_store
             .rule_names()
             .filter_map(|name| {
                 native_store
@@ -210,6 +224,22 @@ impl<'a> LocyEngine<'a> {
                     .map(|batches| (name.to_string(), record_batches_to_locy_rows(batches)))
             })
             .collect();
+
+        // Stamp _approximate on facts in rules that had BDD fallback groups.
+        let approximate_groups = approximate_slot
+            .read()
+            .map(|a| a.clone())
+            .unwrap_or_default();
+        for (rule_name, groups) in &approximate_groups {
+            if !groups.is_empty()
+                && let Some(rows) = base_derived.get_mut(rule_name)
+            {
+                for row in rows.iter_mut() {
+                    row.insert("_approximate".to_string(), Value::Bool(true));
+                }
+            }
+        }
+
         let enriched_derived = enrich_vids_with_nodes(
             self.db,
             &native_store,
@@ -228,6 +258,7 @@ impl<'a> LocyEngine<'a> {
             evaluation_time,
             locy_stats,
             warnings,
+            approximate_groups,
         ))
     }
 
@@ -253,6 +284,8 @@ impl<'a> LocyEngine<'a> {
                 config.deterministic_best_by,
                 config.strict_probability_domain,
                 config.probability_epsilon,
+                config.exact_probability,
+                config.max_bdd_variables,
             )
             .map_err(|e| UniError::Query {
                 message: format!("LocyPlanBuildError: {e}"),
@@ -611,6 +644,7 @@ fn dispatch_native_command<'a>(
     stats: &'a mut LocyStats,
     tracker: Option<Arc<DerivationTracker>>,
     start: Instant,
+    approximate_groups: &'a HashMap<String, Vec<String>>,
 ) -> std::pin::Pin<
     Box<dyn std::future::Future<Output = std::result::Result<CommandResult, LocyError>> + 'a>,
 > {
@@ -632,6 +666,7 @@ fn dispatch_native_command<'a>(
                     orch_store,
                     stats,
                     tracker.as_deref(),
+                    Some(approximate_groups),
                 )
                 .await?;
                 Ok(CommandResult::Explain(node))
@@ -783,6 +818,7 @@ fn build_locy_result(
     evaluation_time: Duration,
     mut orchestrator_stats: LocyStats,
     warnings: Vec<RuntimeWarning>,
+    approximate_groups: HashMap<String, Vec<String>>,
 ) -> LocyResult {
     let total_facts: usize = derived.values().map(|v| v.len()).sum();
     orchestrator_stats.strata_evaluated = compiled.strata.len();
@@ -794,6 +830,7 @@ fn build_locy_result(
         stats: orchestrator_stats,
         command_results,
         warnings,
+        approximate_groups,
     }
 }
 

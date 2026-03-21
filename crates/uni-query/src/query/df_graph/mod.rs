@@ -46,6 +46,7 @@ pub mod ext_id_lookup;
 pub mod locy_abduce;
 pub mod locy_assume;
 pub mod locy_ast_builder;
+pub(crate) mod locy_bdd;
 pub mod locy_best_by;
 pub mod locy_delta;
 pub mod locy_derive;

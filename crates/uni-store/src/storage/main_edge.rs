@@ -17,14 +17,14 @@
 
 use crate::lancedb::LanceDbStore;
 use crate::storage::arrow_convert::build_timestamp_column_from_eid_map;
+use crate::storage::index_utils::ensure_btree_index;
 use anyhow::{Result, anyhow};
 use arrow_array::builder::{LargeBinaryBuilder, StringBuilder};
 use arrow_array::{Array, ArrayRef, BooleanArray, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema, TimeUnit};
 use futures::TryStreamExt;
+use futures::future;
 use lancedb::Table;
-use lancedb::index::Index as LanceDbIndex;
-use lancedb::index::scalar::BTreeIndexBuilder;
 use lancedb::query::{ExecutableQuery, QueryBase, Select};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -36,6 +36,7 @@ use uni_common::core::id::{Eid, Vid};
 /// This table contains all edges regardless of type, providing:
 /// - Fast ID-based lookups without knowing the edge type
 /// - Unified traversal queries
+#[derive(Debug)]
 pub struct MainEdgeDataset {
     _base_uri: String,
 }
@@ -171,71 +172,12 @@ impl MainEdgeDataset {
             .await
             .map_err(|e| anyhow!("Failed to list indices: {}", e))?;
 
-        // Ensure _eid index (primary key)
-        if !indices
-            .iter()
-            .any(|idx| idx.columns.contains(&"_eid".to_string()))
-        {
-            log::info!("Creating _eid BTree index for main edges table");
-            if let Err(e) = table
-                .create_index(&["_eid"], LanceDbIndex::BTree(BTreeIndexBuilder::default()))
-                .execute()
-                .await
-            {
-                log::warn!("Failed to create _eid index for main edges: {}", e);
-            }
-        }
-
-        // Ensure src_vid index for outgoing traversal
-        if !indices
-            .iter()
-            .any(|idx| idx.columns.contains(&"src_vid".to_string()))
-        {
-            log::info!("Creating src_vid BTree index for main edges table");
-            if let Err(e) = table
-                .create_index(
-                    &["src_vid"],
-                    LanceDbIndex::BTree(BTreeIndexBuilder::default()),
-                )
-                .execute()
-                .await
-            {
-                log::warn!("Failed to create src_vid index for main edges: {}", e);
-            }
-        }
-
-        // Ensure dst_vid index for incoming traversal
-        if !indices
-            .iter()
-            .any(|idx| idx.columns.contains(&"dst_vid".to_string()))
-        {
-            log::info!("Creating dst_vid BTree index for main edges table");
-            if let Err(e) = table
-                .create_index(
-                    &["dst_vid"],
-                    LanceDbIndex::BTree(BTreeIndexBuilder::default()),
-                )
-                .execute()
-                .await
-            {
-                log::warn!("Failed to create dst_vid index for main edges: {}", e);
-            }
-        }
-
-        // Ensure type index for edge type filtering
-        if !indices
-            .iter()
-            .any(|idx| idx.columns.contains(&"type".to_string()))
-        {
-            log::info!("Creating type BTree index for main edges table");
-            if let Err(e) = table
-                .create_index(&["type"], LanceDbIndex::BTree(BTreeIndexBuilder::default()))
-                .execute()
-                .await
-            {
-                log::warn!("Failed to create type index for main edges: {}", e);
-            }
-        }
+        future::join_all(
+            ["_eid", "src_vid", "dst_vid", "type"]
+                .iter()
+                .map(|col| ensure_btree_index(table, &indices, col, "main edges")),
+        )
+        .await;
 
         Ok(())
     }

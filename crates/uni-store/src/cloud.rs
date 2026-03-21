@@ -85,12 +85,8 @@ pub fn build_cloud_store(config: &CloudStorageConfig) -> Result<Arc<dyn ObjectSt
                 builder = builder.with_token(token);
             }
 
-            if *virtual_hosted_style {
-                builder = builder.with_virtual_hosted_style_request(true);
-            } else {
-                // Path-style is required for LocalStack and MinIO
-                builder = builder.with_virtual_hosted_style_request(false);
-            }
+            // Path-style (false) is required for LocalStack and MinIO
+            builder = builder.with_virtual_hosted_style_request(*virtual_hosted_style);
 
             // Allow HTTP for local development (LocalStack, MinIO)
             if endpoint.as_ref().is_some_and(|e| e.starts_with("http://")) {

@@ -13,6 +13,7 @@ pub mod edge;
 pub mod index;
 pub mod index_manager;
 pub mod index_rebuild;
+pub(super) mod index_utils;
 pub mod inverted_index;
 pub mod json_index;
 pub mod main_edge;

@@ -401,7 +401,10 @@ impl<'a> LocyPlanBuilder<'a> {
 
     // -- Clause ---------------------------------------------------------
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "clause builder requires full planner context"
+    )]
     fn build_clause(
         &self,
         clause: &CompiledClause,

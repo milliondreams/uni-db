@@ -25,7 +25,7 @@
 
 use crate::query::datetime::parse_datetime_utc;
 use crate::query::df_graph::GraphExecutionContext;
-use crate::query::df_graph::common::{compute_plan_properties, labels_data_type};
+use crate::query::df_graph::common::{arrow_err, compute_plan_properties, labels_data_type};
 use arrow_array::builder::{
     BinaryBuilder, BooleanBuilder, Date32Builder, FixedSizeListBuilder, Float32Builder,
     Float64Builder, Int32Builder, Int64Builder, ListBuilder, StringBuilder,
@@ -567,7 +567,7 @@ fn merge_lance_and_l0(
     match (lance_deduped, has_l0) {
         (Some(lance), true) => {
             let combined = arrow::compute::concat_batches(internal_schema, &[lance, l0_batch])
-                .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+                .map_err(arrow_err)?;
             Ok(Some(mvcc_dedup_batch_by(&combined, id_column)?))
         }
         (Some(lance), false) => Ok(Some(lance)),
@@ -841,8 +841,7 @@ fn mvcc_dedup_batch_by(batch: &RecordBatch, id_column: &str) -> DFResult<RecordB
             }),
         },
     ];
-    let indices = arrow::compute::lexsort_to_indices(&sort_columns, None)
-        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+    let indices = arrow::compute::lexsort_to_indices(&sort_columns, None).map_err(arrow_err)?;
 
     // Reorder all columns by sorted indices
     let sorted_columns: Vec<ArrayRef> = batch
@@ -850,9 +849,8 @@ fn mvcc_dedup_batch_by(batch: &RecordBatch, id_column: &str) -> DFResult<RecordB
         .iter()
         .map(|col| arrow::compute::take(col.as_ref(), &indices, None))
         .collect::<Result<_, _>>()
-        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
-    let sorted = RecordBatch::try_new(batch.schema(), sorted_columns)
-        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+        .map_err(arrow_err)?;
+    let sorted = RecordBatch::try_new(batch.schema(), sorted_columns).map_err(arrow_err)?;
 
     // Build dedup mask: keep first occurrence of each id
     let sorted_id = sorted
@@ -873,8 +871,7 @@ fn mvcc_dedup_batch_by(batch: &RecordBatch, id_column: &str) -> DFResult<RecordB
     }
 
     let mask = arrow_array::BooleanArray::from(keep);
-    arrow::compute::filter_record_batch(&sorted, &mask)
-        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+    arrow::compute::filter_record_batch(&sorted, &mask).map_err(arrow_err)
 }
 
 /// Filter out edge rows where `op != 0` (non-INSERT) after MVCC dedup.
@@ -891,8 +888,7 @@ fn filter_deleted_edge_ops(batch: &RecordBatch) -> DFResult<RecordBatch> {
     };
     let keep: Vec<bool> = (0..op_col.len()).map(|i| op_col.value(i) == 0).collect();
     let mask = arrow_array::BooleanArray::from(keep);
-    arrow::compute::filter_record_batch(batch, &mask)
-        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+    arrow::compute::filter_record_batch(batch, &mask).map_err(arrow_err)
 }
 
 /// Filter out rows where `_deleted = true` after MVCC dedup.
@@ -911,8 +907,7 @@ fn filter_deleted_rows(batch: &RecordBatch) -> DFResult<RecordBatch> {
         .map(|i| !deleted_col.value(i))
         .collect();
     let mask = arrow_array::BooleanArray::from(keep);
-    arrow::compute::filter_record_batch(batch, &mask)
-        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+    arrow::compute::filter_record_batch(batch, &mask).map_err(arrow_err)
 }
 
 /// Filter out rows whose `_vid` appears in L0 tombstones.
@@ -949,8 +944,7 @@ fn filter_l0_tombstones(
         .map(|i| !tombstones.contains(&vid_col.value(i)))
         .collect();
     let mask = arrow_array::BooleanArray::from(keep);
-    arrow::compute::filter_record_batch(batch, &mask)
-        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+    arrow::compute::filter_record_batch(batch, &mask).map_err(arrow_err)
 }
 
 /// Filter out rows whose `eid` appears in L0 edge tombstones.
@@ -987,8 +981,7 @@ fn filter_l0_edge_tombstones(
         .map(|i| !tombstones.contains(&eid_col.value(i)))
         .collect();
     let mask = arrow_array::BooleanArray::from(keep);
-    arrow::compute::filter_record_batch(batch, &mask)
-        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+    arrow::compute::filter_record_batch(batch, &mask).map_err(arrow_err)
 }
 
 /// Build a RecordBatch from L0 buffer data for a given label, matching the
@@ -1106,8 +1099,7 @@ fn build_l0_vertex_batch(
         }
     }
 
-    RecordBatch::try_new(lance_schema.clone(), columns)
-        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+    RecordBatch::try_new(lance_schema.clone(), columns).map_err(arrow_err)
 }
 
 /// Build a single Arrow column from L0 property values.
@@ -1261,8 +1253,7 @@ fn build_l0_edge_batch(
         }
     }
 
-    RecordBatch::try_new(internal_schema.clone(), columns)
-        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+    RecordBatch::try_new(internal_schema.clone(), columns).map_err(arrow_err)
 }
 
 /// Build a single Arrow column from L0 edge property values.
@@ -1455,8 +1446,7 @@ fn map_to_output_schema(
         }
     }
 
-    RecordBatch::try_new(output_schema.clone(), columns)
-        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+    RecordBatch::try_new(output_schema.clone(), columns).map_err(arrow_err)
 }
 
 /// Map an internal DeltaDataset-schema edge batch to the DataFusion output schema.
@@ -1562,8 +1552,7 @@ fn map_edge_to_output_schema(
         }
     }
 
-    RecordBatch::try_new(output_schema.clone(), columns)
-        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+    RecordBatch::try_new(output_schema.clone(), columns).map_err(arrow_err)
 }
 
 /// Columnar-first vertex scan: single Lance query with MVCC dedup and L0 overlay.
@@ -2179,8 +2168,7 @@ fn build_l0_schemaless_vertex_batch(
         }
     }
 
-    RecordBatch::try_new(internal_schema.clone(), columns)
-        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+    RecordBatch::try_new(internal_schema.clone(), columns).map_err(arrow_err)
 }
 
 /// Map an internal-schema schemaless batch to the DataFusion output schema.
@@ -2301,8 +2289,7 @@ fn map_to_schemaless_output_schema(
         }
     }
 
-    RecordBatch::try_new(output_schema.clone(), columns)
-        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+    RecordBatch::try_new(output_schema.clone(), columns).map_err(arrow_err)
 }
 
 /// Get the property value for a VID, returning None if not found.

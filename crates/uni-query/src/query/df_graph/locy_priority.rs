@@ -7,7 +7,9 @@
 //! only those from the highest-priority clause are kept. The `__priority` column
 //! is consumed and removed from the output schema.
 
-use crate::query::df_graph::common::{ScalarKey, compute_plan_properties, extract_scalar_key};
+use crate::query::df_graph::common::{
+    ScalarKey, arrow_err, compute_plan_properties, extract_scalar_key,
+};
 use arrow::compute::filter as arrow_filter;
 use arrow_array::{BooleanArray, Int64Array, RecordBatch};
 use arrow_schema::{Field, Schema, SchemaRef};
@@ -140,8 +142,8 @@ impl ExecutionPlan for PriorityExec {
                 return Ok(RecordBatch::new_empty(output_schema));
             }
 
-            let batch = arrow::compute::concat_batches(&input_schema, &batches)
-                .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+            let batch =
+                arrow::compute::concat_batches(&input_schema, &batches).map_err(arrow_err)?;
 
             if batch.num_rows() == 0 {
                 return Ok(RecordBatch::new_empty(output_schema));
@@ -194,8 +196,7 @@ impl ExecutionPlan for PriorityExec {
                 output_columns.push(filtered);
             }
 
-            RecordBatch::try_new(output_schema, output_columns)
-                .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+            RecordBatch::try_new(output_schema, output_columns).map_err(arrow_err)
         };
 
         Ok(Box::pin(PriorityStream {

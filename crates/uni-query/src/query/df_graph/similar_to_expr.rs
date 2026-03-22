@@ -255,7 +255,6 @@ impl PhysicalExpr for SimilarToExecExpr {
         Ok(true)
     }
 
-    #[allow(clippy::manual_try_fold)]
     fn evaluate(
         &self,
         batch: &arrow_array::RecordBatch,

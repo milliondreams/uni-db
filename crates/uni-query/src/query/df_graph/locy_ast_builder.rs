@@ -284,7 +284,7 @@ fn value_to_string(v: &Value) -> String {
         Value::Int(i) => i.to_string(),
         Value::Float(f) => f.to_string(),
         Value::String(s) => s.clone(),
-        _ => format!("{:?}", v),
+        _ => format!("{v:?}"),
     }
 }
 
@@ -295,7 +295,7 @@ pub(crate) fn value_to_expr(v: &Value) -> Expr {
         Value::Int(i) => Expr::Literal(CypherLiteral::Integer(*i)),
         Value::Float(f) => Expr::Literal(CypherLiteral::Float(*f)),
         Value::String(s) => Expr::Literal(CypherLiteral::String(s.clone())),
-        _ => Expr::Literal(CypherLiteral::String(format!("{:?}", v))),
+        _ => Expr::Literal(CypherLiteral::String(format!("{v:?}"))),
     }
 }
 

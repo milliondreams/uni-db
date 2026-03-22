@@ -153,8 +153,8 @@ impl RuleStats {
 
     fn record_failure(&mut self, error: RewriteError) {
         self.attempts += 1;
-        let error_key = format!("{:?}", error);
-        *self.failures.entry(error_key).or_insert(0) += 1;
+        let error_key = format!("{error:?}");
+        *self.failures.entry(error_key).or_default() += 1;
     }
 }
 

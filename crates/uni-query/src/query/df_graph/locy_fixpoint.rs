@@ -8,7 +8,8 @@
 
 use crate::query::df_graph::GraphExecutionContext;
 use crate::query::df_graph::common::{
-    ScalarKey, collect_all_partitions, compute_plan_properties, execute_subplan, extract_scalar_key,
+    ScalarKey, arrow_err, collect_all_partitions, compute_plan_properties, execute_subplan,
+    extract_scalar_key,
 };
 use crate::query::df_graph::locy_best_by::{BestByExec, SortCriterion};
 use crate::query::df_graph::locy_errors::LocyRuntimeError;
@@ -327,10 +328,7 @@ impl RowDedupState {
 
             // Vectorized encoding of all rows in this batch.
             let arrays: Vec<_> = batch.columns().to_vec();
-            let rows = self
-                .converter
-                .convert_columns(&arrays)
-                .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+            let rows = self.converter.convert_columns(&arrays).map_err(arrow_err)?;
 
             // One pass: check+insert into persistent seen set.
             let mut keep = Vec::with_capacity(batch.num_rows());
@@ -809,7 +807,7 @@ pub struct FixpointRulePlan {
 ///
 /// Evaluates all rules in a stratum repeatedly, feeding deltas back through
 /// derived scan handles until convergence or limits are reached.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "Fixpoint loop needs all context")]
 async fn run_fixpoint_loop(
     rules: Vec<FixpointRulePlan>,
     max_iterations: usize,
@@ -1225,7 +1223,10 @@ fn collect_is_ref_inputs(
 ///    proof paths may share intermediate nodes.
 ///
 /// Per-row data collected during shared-proof detection.
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "Fields accessed via SharedProofInfo in detect_shared_proofs"
+)]
 pub(crate) struct SharedGroupRow {
     pub fact_hash: Vec<u8>,
     pub base_facts: HashSet<Vec<u8>>,
@@ -1235,6 +1236,11 @@ pub(crate) struct SharedGroupRow {
 pub(crate) struct SharedProofInfo {
     /// KEY group → rows with their base fact sets.
     pub shared_groups: HashMap<Vec<ScalarKey>, Vec<SharedGroupRow>>,
+}
+
+/// Build a byte key that uniquely identifies a row across all columns.
+fn fact_hash_key(batch: &RecordBatch, all_indices: &[usize], row_idx: usize) -> Vec<u8> {
+    format!("{:?}", extract_scalar_key(batch, all_indices, row_idx)).into_bytes()
 }
 
 /// Emits at most one `SharedProbabilisticDependency` warning per rule.
@@ -1265,8 +1271,7 @@ fn detect_shared_proofs(
     for batch in pre_fold_facts {
         for row_idx in 0..batch.num_rows() {
             let key = extract_scalar_key(batch, key_indices, row_idx);
-            let fact_hash =
-                format!("{:?}", extract_scalar_key(batch, &all_indices, row_idx)).into_bytes();
+            let fact_hash = fact_hash_key(batch, &all_indices, row_idx);
             groups.entry(key).or_default().push(fact_hash);
         }
     }
@@ -1421,8 +1426,7 @@ pub(crate) fn record_and_detect_shared_proofs_nonrecursive(
     for (clause_index, batches) in tagged_clause_facts {
         for batch in batches {
             for row_idx in 0..batch.num_rows() {
-                let row_hash =
-                    format!("{:?}", extract_scalar_key(batch, &all_indices, row_idx)).into_bytes();
+                let row_hash = fact_hash_key(batch, &all_indices, row_idx);
                 let fact_row = batch_row_to_value_map(batch, row_idx);
 
                 let inputs = collect_is_ref_inputs(rule, *clause_index, batch, row_idx, registry);
@@ -1514,8 +1518,7 @@ pub(crate) fn apply_bdd_for_shared_groups(
         for row_idx in 0..batch.num_rows() {
             let key = extract_scalar_key(batch, key_indices, row_idx);
             if shared_keys.contains(&key) {
-                let fact_hash =
-                    format!("{:?}", extract_scalar_key(batch, &all_indices, row_idx)).into_bytes();
+                let fact_hash = fact_hash_key(batch, &all_indices, row_idx);
                 let bases = collect_base_facts_recursive(&fact_hash, tracker, &mut HashSet::new());
 
                 let accum = group_accums.entry(key).or_insert_with(|| GroupAccum {
@@ -1566,7 +1569,7 @@ pub(crate) fn apply_bdd_for_shared_groups(
         if bdd_result.fell_back {
             // Emit BddLimitExceeded warning (one per key group).
             if let Ok(mut warnings) = warnings_slot.write() {
-                let key_desc = format!("{:?}", key);
+                let key_desc = format!("{key:?}");
                 let already_warned = warnings.iter().any(|w| {
                     w.code == RuntimeWarningCode::BddLimitExceeded
                         && w.rule_name == rule.name
@@ -1587,7 +1590,7 @@ pub(crate) fn apply_bdd_for_shared_groups(
                 }
             }
             if let Ok(mut approx) = approximate_slot.write() {
-                let key_desc = format!("{:?}", key);
+                let key_desc = format!("{key:?}");
                 approx.entry(rule.name.clone()).or_default().push(key_desc);
             }
             // Keep all rows unchanged.
@@ -1620,7 +1623,7 @@ pub(crate) fn apply_bdd_for_shared_groups(
             .iter()
             .map(|col| arrow::compute::take(col, &indices, None))
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+            .map_err(arrow_err)?;
 
         // Check if any kept rows have PROB overrides.
         let override_map: Vec<Option<f64>> = kept_indices
@@ -1644,8 +1647,7 @@ pub(crate) fn apply_bdd_for_shared_groups(
             columns[prob_col_idx] = Arc::new(arrow::array::Float64Array::from(new_values));
         }
 
-        let result_batch = RecordBatch::try_new(batch.schema(), columns)
-            .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+        let result_batch = RecordBatch::try_new(batch.schema(), columns).map_err(arrow_err)?;
         result_batches.push(result_batch);
     }
 
@@ -1788,8 +1790,7 @@ pub fn apply_anti_join(
             .map(|i| vids.is_null(i) || !banned.contains(&vids.value(i)))
             .collect();
         let keep_arr = BooleanArray::from(keep);
-        let filtered = filter_record_batch(&batch, &keep_arr)
-            .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+        let filtered = filter_record_batch(&batch, &keep_arr).map_err(arrow_err)?;
         if filtered.num_rows() > 0 {
             result.push(filtered);
         }
@@ -1891,8 +1892,7 @@ pub fn apply_prob_complement(
         )));
 
         let new_schema = std::sync::Arc::new(arrow_schema::Schema::new(fields));
-        let new_batch = RecordBatch::try_new(new_schema, columns)
-            .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+        let new_batch = RecordBatch::try_new(new_schema, columns).map_err(arrow_err)?;
         result.push(new_batch);
     }
     Ok(result)
@@ -2021,8 +2021,7 @@ pub fn apply_prob_complement_composite(
         )));
 
         let new_schema = Arc::new(arrow_schema::Schema::new(fields));
-        let new_batch = RecordBatch::try_new(new_schema, columns)
-            .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+        let new_batch = RecordBatch::try_new(new_schema, columns).map_err(arrow_err)?;
         result.push(new_batch);
     }
     Ok(result)
@@ -2118,8 +2117,7 @@ pub fn apply_anti_join_composite(
             })
             .collect();
         let keep_arr = BooleanArray::from(keep);
-        let filtered = filter_record_batch(&batch, &keep_arr)
-            .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+        let filtered = filter_record_batch(&batch, &keep_arr).map_err(arrow_err)?;
         if filtered.num_rows() > 0 {
             result.push(filtered);
         }
@@ -2243,10 +2241,7 @@ pub fn multiply_prob_factors(
         }
 
         let schema = std::sync::Arc::new(arrow_schema::Schema::new(fields));
-        result.push(
-            RecordBatch::try_new(schema, columns)
-                .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?,
-        );
+        result.push(RecordBatch::try_new(schema, columns).map_err(arrow_err)?);
     }
 
     Ok(result)
@@ -2574,7 +2569,10 @@ impl fmt::Debug for FixpointExec {
 
 impl FixpointExec {
     /// Create a new `FixpointExec`.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "FixpointExec configuration needs all context"
+    )]
     pub fn new(
         rules: Vec<FixpointRulePlan>,
         max_iterations: usize,

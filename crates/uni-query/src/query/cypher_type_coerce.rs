@@ -620,23 +620,25 @@ fn build_in_as_or_chain(
         return Ok(lit(ScalarValue::Boolean(Some(negated))));
     }
 
-    let mut or_chain = None;
-
-    for item in list {
-        let item_type = item
-            .get_type(schema)
-            .map_err(|e| anyhow!("Failed to get item type in OR chain: {}", e))?;
-
-        let eq_expr =
-            build_cypher_comparison(expr.clone(), expr_type, item, &item_type, Operator::Eq);
-
-        or_chain = Some(match or_chain {
-            None => eq_expr,
-            Some(chain) => binary_expr(chain, Operator::Or, eq_expr),
-        });
-    }
-
-    let result = or_chain.unwrap(); // Safe because list is non-empty
+    let result = list
+        .into_iter()
+        .map(|item| {
+            let item_type = item
+                .get_type(schema)
+                .map_err(|e| anyhow!("Failed to get item type in OR chain: {}", e))?;
+            Ok(build_cypher_comparison(
+                expr.clone(),
+                expr_type,
+                item,
+                &item_type,
+                Operator::Eq,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        // Safe: list is non-empty (checked above)
+        .reduce(|chain, eq_expr| binary_expr(chain, Operator::Or, eq_expr))
+        .unwrap();
 
     if negated { Ok(not(result)) } else { Ok(result) }
 }

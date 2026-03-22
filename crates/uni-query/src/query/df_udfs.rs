@@ -2804,85 +2804,20 @@ fn sort_key_map_rank(map: &std::collections::HashMap<String, Value>) -> u8 {
     }
 }
 
-/// Try to interpret a map as a temporal value (mirrors `map_as_temporal` from core.rs:468).
+/// Try to interpret a map as a temporal value.
+///
+/// Delegates to the shared implementation in `expr_eval`.
 fn sort_key_map_as_temporal(
     map: &std::collections::HashMap<String, Value>,
 ) -> Option<uni_common::TemporalValue> {
-    if map.len() != 1 {
-        return None;
-    }
-
-    let as_i32 = |v: &Value| v.as_i64().and_then(|n| i32::try_from(n).ok());
-    let as_i64 = |v: &Value| v.as_i64();
-
-    if let Some(Value::Map(inner)) = map.get("Date") {
-        let days = inner.get("days_since_epoch").and_then(as_i32)?;
-        return Some(uni_common::TemporalValue::Date {
-            days_since_epoch: days,
-        });
-    }
-    if let Some(Value::Map(inner)) = map.get("LocalTime") {
-        let nanos = inner.get("nanos_since_midnight").and_then(as_i64)?;
-        return Some(uni_common::TemporalValue::LocalTime {
-            nanos_since_midnight: nanos,
-        });
-    }
-    if let Some(Value::Map(inner)) = map.get("Time") {
-        let nanos = inner.get("nanos_since_midnight").and_then(as_i64)?;
-        let offset = inner.get("offset_seconds").and_then(as_i32)?;
-        return Some(uni_common::TemporalValue::Time {
-            nanos_since_midnight: nanos,
-            offset_seconds: offset,
-        });
-    }
-    if let Some(Value::Map(inner)) = map.get("LocalDateTime") {
-        let nanos = inner.get("nanos_since_epoch").and_then(as_i64)?;
-        return Some(uni_common::TemporalValue::LocalDateTime {
-            nanos_since_epoch: nanos,
-        });
-    }
-    if let Some(Value::Map(inner)) = map.get("DateTime") {
-        let nanos = inner.get("nanos_since_epoch").and_then(as_i64)?;
-        let offset = inner.get("offset_seconds").and_then(as_i32)?;
-        let timezone_name = match inner.get("timezone_name") {
-            Some(Value::String(s)) => Some(s.clone()),
-            _ => None,
-        };
-        return Some(uni_common::TemporalValue::DateTime {
-            nanos_since_epoch: nanos,
-            offset_seconds: offset,
-            timezone_name,
-        });
-    }
-    if let Some(Value::Map(inner)) = map.get("Duration") {
-        let months = inner.get("months").and_then(as_i64)?;
-        let days = inner.get("days").and_then(as_i64)?;
-        let nanos = inner.get("nanos").and_then(as_i64)?;
-        return Some(uni_common::TemporalValue::Duration {
-            months,
-            days,
-            nanos,
-        });
-    }
-    None
+    super::expr_eval::temporal_from_map_wrapper(map)
 }
 
-/// Try to parse a string as a temporal value (mirrors `string_as_temporal` from core.rs:453).
+/// Try to parse a string as a temporal value.
+///
+/// Delegates to the shared implementation in `expr_eval`.
 fn sort_key_string_as_temporal(s: &str) -> Option<uni_common::TemporalValue> {
-    use crate::query::datetime::{classify_temporal, eval_datetime_function};
-
-    let fn_name = match classify_temporal(s)? {
-        uni_common::TemporalType::Date => "DATE",
-        uni_common::TemporalType::LocalTime => "LOCALTIME",
-        uni_common::TemporalType::Time => "TIME",
-        uni_common::TemporalType::LocalDateTime => "LOCALDATETIME",
-        uni_common::TemporalType::DateTime => "DATETIME",
-        uni_common::TemporalType::Duration => "DURATION",
-    };
-    match eval_datetime_function(fn_name, &[Value::String(s.to_string())]).ok()? {
-        Value::Temporal(tv) => Some(tv),
-        _ => None,
-    }
+    super::expr_eval::temporal_from_value(&Value::String(s.to_string()))
 }
 
 /// Encode a wide (out-of-range) temporal sort key directly from a formatted string.

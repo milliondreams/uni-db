@@ -31,7 +31,7 @@
 //!    - If ALL rows fail the filter, emit one row with source columns preserved
 //!      and optional columns set to NULL
 
-use crate::query::df_graph::common::compute_plan_properties;
+use crate::query::df_graph::common::{arrow_err, compute_plan_properties};
 use arrow_array::{Array, ArrayRef, BooleanArray, RecordBatch, new_null_array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::Result as DFResult;
@@ -432,8 +432,7 @@ impl OptionalFilterStream {
 
         self.metrics.record_output(total_rows);
 
-        RecordBatch::try_new(Arc::clone(&self.schema), columns)
-            .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+        RecordBatch::try_new(Arc::clone(&self.schema), columns).map_err(arrow_err)
     }
 
     /// Compute a grouping key from source column values for a row.
@@ -491,8 +490,7 @@ fn extract_u64_value(col: &dyn Array, row_idx: usize) -> Option<u64> {
 fn take_indices(array: &ArrayRef, indices: &[usize]) -> DFResult<ArrayRef> {
     let idx_array =
         arrow_array::UInt64Array::from(indices.iter().map(|&i| i as u64).collect::<Vec<_>>());
-    arrow::compute::take(array.as_ref(), &idx_array, None)
-        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+    arrow::compute::take(array.as_ref(), &idx_array, None).map_err(arrow_err)
 }
 
 impl Stream for OptionalFilterStream {

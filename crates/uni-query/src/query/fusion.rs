@@ -19,14 +19,11 @@ pub fn fuse_rrf(
 ) -> Vec<(Vid, f32)> {
     let mut scores: HashMap<Vid, f32> = HashMap::new();
 
-    for (rank, (vid, _)) in vec_results.iter().enumerate() {
-        let rrf_score = 1.0 / (k as f32 + rank as f32 + 1.0);
-        *scores.entry(*vid).or_default() += rrf_score;
-    }
-
-    for (rank, (vid, _)) in fts_results.iter().enumerate() {
-        let rrf_score = 1.0 / (k as f32 + rank as f32 + 1.0);
-        *scores.entry(*vid).or_default() += rrf_score;
+    for ranked_list in [vec_results, fts_results] {
+        for (rank, (vid, _)) in ranked_list.iter().enumerate() {
+            let rrf_score = 1.0 / (k as f32 + rank as f32 + 1.0);
+            *scores.entry(*vid).or_default() += rrf_score;
+        }
     }
 
     let mut results: Vec<_> = scores.into_iter().collect();

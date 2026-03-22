@@ -804,7 +804,11 @@ fn temporal_partial_cmp(left: &TemporalValue, right: &TemporalValue) -> Option<O
     }
 }
 
-fn temporal_from_value(v: &Value) -> Option<TemporalValue> {
+/// Extract a `TemporalValue` from any `Value` variant that can represent one.
+///
+/// Handles `Value::Temporal`, `Value::Map` (JSON-serialized temporal wrappers),
+/// and `Value::String` (JSON wrapper strings like `{"Date":{"days_since_epoch":0}}`).
+pub(crate) fn temporal_from_value(v: &Value) -> Option<TemporalValue> {
     match v {
         Value::Temporal(tv) => Some(tv.clone()),
         Value::Map(map) => temporal_from_map_wrapper(map),
@@ -813,7 +817,12 @@ fn temporal_from_value(v: &Value) -> Option<TemporalValue> {
     }
 }
 
-fn temporal_from_map_wrapper(
+/// Try to interpret a map as a temporal value.
+///
+/// Recognizes single-entry maps with a temporal type key (`Date`, `Time`, etc.)
+/// whose value is a map of the appropriate fields. Returns `None` if the map
+/// does not match any temporal pattern.
+pub(crate) fn temporal_from_map_wrapper(
     map: &std::collections::HashMap<String, Value>,
 ) -> Option<TemporalValue> {
     if map.len() != 1 {

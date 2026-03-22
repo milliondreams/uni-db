@@ -29,7 +29,6 @@ use super::locy_explain::{DerivationTracker, explain_rule};
 use super::locy_traits::LocyExecutionContext;
 
 /// Evaluate an ABDUCE query using a three-phase pipeline.
-#[allow(clippy::too_many_arguments)]
 pub async fn evaluate_abduce(
     query: &AbduceQuery,
     program: &CompiledProgram,
@@ -276,7 +275,10 @@ fn extract_addition_candidates(rule: &CompiledRule) -> Vec<Modification> {
 }
 
 /// Phase 3: Validate a single modification via ASSUME (savepoint lifecycle).
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "validation requires full program and execution context"
+)]
 async fn validate_modification(
     modification: &Modification,
     negated: bool,

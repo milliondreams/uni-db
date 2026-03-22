@@ -6,7 +6,9 @@
 //! `FoldExec` applies fold (lattice-join) semantics: for each group of rows sharing
 //! the same KEY columns, it reduces non-key columns via their declared fold functions.
 
-use crate::query::df_graph::common::{ScalarKey, compute_plan_properties, extract_scalar_key};
+use crate::query::df_graph::common::{
+    ScalarKey, arrow_err, compute_plan_properties, extract_scalar_key,
+};
 use arrow_array::builder::{Float64Builder, Int64Builder, LargeBinaryBuilder};
 use arrow_array::{Array, Float64Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -234,8 +236,8 @@ impl ExecutionPlan for FoldExec {
                 return Ok(RecordBatch::new_empty(output_schema));
             }
 
-            let batch = arrow::compute::concat_batches(&input_schema, &batches)
-                .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+            let batch =
+                arrow::compute::concat_batches(&input_schema, &batches).map_err(arrow_err)?;
 
             if batch.num_rows() == 0 {
                 return Ok(RecordBatch::new_empty(output_schema));
@@ -285,8 +287,7 @@ impl ExecutionPlan for FoldExec {
                 output_columns.push(agg_col);
             }
 
-            RecordBatch::try_new(output_schema, output_columns)
-                .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+            RecordBatch::try_new(output_schema, output_columns).map_err(arrow_err)
         };
 
         Ok(Box::pin(FoldStream {
@@ -1917,8 +1918,7 @@ mod tests {
         if batches.is_empty() {
             Ok(RecordBatch::new_empty(exec.schema()))
         } else {
-            arrow::compute::concat_batches(&exec.schema(), &batches)
-                .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+            arrow::compute::concat_batches(&exec.schema(), &batches).map_err(arrow_err)
         }
     }
 

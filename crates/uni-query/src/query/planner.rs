@@ -536,7 +536,7 @@ fn validate_boolean_expression(expr: &Expr) -> Result<()> {
     if let Expr::BinaryOp { left, op, right } = expr
         && matches!(op, BinaryOp::And | BinaryOp::Or | BinaryOp::Xor)
     {
-        let op_name = format!("{:?}", op).to_uppercase();
+        let op_name = format!("{op:?}").to_uppercase();
         for operand in [left.as_ref(), right.as_ref()] {
             if is_non_boolean_literal(operand) {
                 return Err(anyhow!(

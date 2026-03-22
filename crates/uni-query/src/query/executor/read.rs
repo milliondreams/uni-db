@@ -2545,7 +2545,7 @@ impl Executor {
                             let key: Vec<u8> = non_optional_vars
                                 .iter()
                                 .map(|var| {
-                                    row.get(var).map(|v| format!("{:?}", v)).unwrap_or_default()
+                                    row.get(var).map(|v| format!("{v:?}")).unwrap_or_default()
                                 })
                                 .collect::<Vec<_>>()
                                 .join("|")
@@ -3629,7 +3629,7 @@ impl Executor {
         pub(crate) fn row_key(row: &HashMap<String, Value>) -> String {
             let mut pairs: Vec<_> = row.iter().collect();
             pairs.sort_by(|a, b| a.0.cmp(b.0));
-            format!("{:?}", pairs)
+            format!("{pairs:?}")
         }
 
         // 1. Execute Anchor
@@ -4831,7 +4831,7 @@ impl Executor {
             let mut seen = HashSet::new();
             left_rows.retain(|row| {
                 let sorted_row: std::collections::BTreeMap<_, _> = row.iter().collect();
-                let key = format!("{:?}", sorted_row);
+                let key = format!("{sorted_row:?}");
                 seen.insert(key)
             });
         }
@@ -5177,7 +5177,7 @@ impl Executor {
             Value::Int(i) => i.to_string(),
             Value::Float(f) => f.to_string(),
             Value::Bool(b) => b.to_string(),
-            _ => format!("{}", val),
+            _ => format!("{val}"),
         }
     }
 

@@ -18,7 +18,7 @@
 //! 3. Output all accumulated rows as a single-column list
 
 use crate::query::df_graph::GraphExecutionContext;
-use crate::query::df_graph::common::{compute_plan_properties, execute_subplan};
+use crate::query::df_graph::common::{arrow_err, compute_plan_properties, execute_subplan};
 use crate::query::df_graph::unwind::arrow_to_json_value;
 use crate::query::planner::LogicalPlan;
 use arrow_array::RecordBatch;
@@ -248,7 +248,7 @@ fn batches_to_values(batches: &[RecordBatch]) -> Vec<Value> {
 
 /// Create a stable string key for a Value, used for cycle detection.
 fn value_key(val: &Value) -> String {
-    format!("{:?}", val)
+    format!("{val:?}")
 }
 
 /// Extract the VID from a CTE result value.
@@ -366,8 +366,7 @@ async fn run_cte_loop(
     list_builder.append(true);
     let array = Arc::new(list_builder.finish());
 
-    RecordBatch::try_new(output_schema.clone(), vec![array])
-        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+    RecordBatch::try_new(output_schema.clone(), vec![array]).map_err(arrow_err)
 }
 
 // ---------------------------------------------------------------------------

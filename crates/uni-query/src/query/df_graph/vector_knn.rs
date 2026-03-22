@@ -34,7 +34,7 @@ use uni_cypher::ast::Expr;
 
 use crate::query::df_graph::GraphExecutionContext;
 use crate::query::df_graph::common::{
-    calculate_score, compute_plan_properties, evaluate_simple_expr, labels_data_type,
+    arrow_err, calculate_score, compute_plan_properties, evaluate_simple_expr, labels_data_type,
 };
 use crate::query::df_graph::scan::resolve_property_type;
 
@@ -565,8 +565,7 @@ async fn build_result_batch(
         }
     }
 
-    RecordBatch::try_new(schema.clone(), columns)
-        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+    RecordBatch::try_new(schema.clone(), columns).map_err(arrow_err)
 }
 
 #[cfg(test)]

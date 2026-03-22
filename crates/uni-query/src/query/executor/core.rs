@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
 use uni_algo::algo::AlgorithmRegistry;
-use uni_common::{TemporalType, TemporalValue, Value};
+use uni_common::{TemporalValue, Value};
 use uni_cypher::ast::{BinaryOp, Expr};
 use uni_store::QueryContext;
 use uni_store::runtime::l0_manager::L0Manager;
@@ -15,7 +15,6 @@ use uni_store::runtime::writer::Writer;
 use uni_store::storage::manager::StorageManager;
 use uni_xervo::runtime::ModelRuntime;
 
-use crate::query::datetime::{classify_temporal, eval_datetime_function};
 use crate::query::expr_eval::eval_binary_op;
 use crate::types::QueryWarning;
 
@@ -460,87 +459,11 @@ impl Executor {
     }
 
     fn extract_temporal_value(value: &Value) -> Option<TemporalValue> {
-        match value {
-            Value::Temporal(t) => Some(t.clone()),
-            Value::Map(map) => Self::map_as_temporal(map),
-            Value::String(s) => Self::string_as_temporal(s),
-            _ => None,
-        }
-    }
-
-    fn string_as_temporal(s: &str) -> Option<TemporalValue> {
-        let fn_name = match classify_temporal(s)? {
-            TemporalType::Date => "DATE",
-            TemporalType::LocalTime => "LOCALTIME",
-            TemporalType::Time => "TIME",
-            TemporalType::LocalDateTime => "LOCALDATETIME",
-            TemporalType::DateTime => "DATETIME",
-            TemporalType::Duration => "DURATION",
-        };
-        match eval_datetime_function(fn_name, &[Value::String(s.to_string())]).ok()? {
-            Value::Temporal(tv) => Some(tv),
-            _ => None,
-        }
+        crate::query::expr_eval::temporal_from_value(value)
     }
 
     fn map_as_temporal(map: &HashMap<String, Value>) -> Option<TemporalValue> {
-        if map.len() != 1 {
-            return None;
-        }
-
-        let as_i32 = |v: &Value| v.as_i64().and_then(|n| i32::try_from(n).ok());
-        let as_i64 = |v: &Value| v.as_i64();
-
-        if let Some(Value::Map(inner)) = map.get("Date") {
-            let days = inner.get("days_since_epoch").and_then(as_i32)?;
-            return Some(TemporalValue::Date {
-                days_since_epoch: days,
-            });
-        }
-        if let Some(Value::Map(inner)) = map.get("LocalTime") {
-            let nanos = inner.get("nanos_since_midnight").and_then(as_i64)?;
-            return Some(TemporalValue::LocalTime {
-                nanos_since_midnight: nanos,
-            });
-        }
-        if let Some(Value::Map(inner)) = map.get("Time") {
-            let nanos = inner.get("nanos_since_midnight").and_then(as_i64)?;
-            let offset = inner.get("offset_seconds").and_then(as_i32)?;
-            return Some(TemporalValue::Time {
-                nanos_since_midnight: nanos,
-                offset_seconds: offset,
-            });
-        }
-        if let Some(Value::Map(inner)) = map.get("LocalDateTime") {
-            let nanos = inner.get("nanos_since_epoch").and_then(as_i64)?;
-            return Some(TemporalValue::LocalDateTime {
-                nanos_since_epoch: nanos,
-            });
-        }
-        if let Some(Value::Map(inner)) = map.get("DateTime") {
-            let nanos = inner.get("nanos_since_epoch").and_then(as_i64)?;
-            let offset = inner.get("offset_seconds").and_then(as_i32)?;
-            let timezone_name = match inner.get("timezone_name") {
-                Some(Value::String(s)) => Some(s.clone()),
-                _ => None,
-            };
-            return Some(TemporalValue::DateTime {
-                nanos_since_epoch: nanos,
-                offset_seconds: offset,
-                timezone_name,
-            });
-        }
-        if let Some(Value::Map(inner)) = map.get("Duration") {
-            let months = inner.get("months").and_then(as_i64)?;
-            let days = inner.get("days").and_then(as_i64)?;
-            let nanos = inner.get("nanos").and_then(as_i64)?;
-            return Some(TemporalValue::Duration {
-                months,
-                days,
-                nanos,
-            });
-        }
-        None
+        crate::query::expr_eval::temporal_from_map_wrapper(map)
     }
 
     fn compare_lists(left: &[Value], right: &[Value]) -> std::cmp::Ordering {

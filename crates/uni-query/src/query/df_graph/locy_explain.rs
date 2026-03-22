@@ -106,7 +106,10 @@ type VisitedSet = HashSet<(String, KeyTuple)>;
 /// Tries Mode A (provenance-based, uses DerivationTracker) first when a tracker is
 /// provided and has entries for the rule.  Falls through to Mode B (re-execution)
 /// when Mode A cannot produce a result.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "explain requires full program context and tracker state"
+)]
 pub async fn explain_rule(
     query: &ExplainRule,
     program: &CompiledProgram,
@@ -341,7 +344,10 @@ async fn explain_rule_mode_b(
 ///
 /// Finds which clause produced this fact, extracts ALONG values,
 /// and recurses into IS reference dependencies.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "recursive derivation node builder requires full fact context"
+)]
 fn build_derivation_node<'a>(
     rule_name: &'a str,
     fact: &'a Row,
@@ -572,6 +578,6 @@ fn format_value(v: &Value) -> String {
         }
         Value::Node(n) => format!("Node({})", n.vid.as_u64()),
         Value::Edge(e) => format!("Edge({})", e.eid.as_u64()),
-        _ => format!("{:?}", v),
+        _ => format!("{v:?}"),
     }
 }

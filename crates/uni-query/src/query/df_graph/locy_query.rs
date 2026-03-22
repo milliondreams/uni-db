@@ -96,7 +96,7 @@ fn apply_return_clause(
                     ReturnItem::All => return Ok(row.clone()),
                     ReturnItem::Expr { expr, alias, .. } => {
                         let value = eval_expr(expr, &row)?;
-                        let name = alias.clone().unwrap_or_else(|| format!("{:?}", expr));
+                        let name = alias.clone().unwrap_or_else(|| format!("{expr:?}"));
                         new_row.insert(name, value);
                     }
                 }
@@ -109,7 +109,7 @@ fn apply_return_clause(
     if rc.distinct {
         let mut seen = std::collections::HashSet::new();
         projected.retain(|row| {
-            let key = format!("{:?}", row);
+            let key = format!("{row:?}");
             seen.insert(key)
         });
     }

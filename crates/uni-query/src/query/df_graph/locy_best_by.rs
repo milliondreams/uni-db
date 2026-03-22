@@ -6,7 +6,9 @@
 //! `BestByExec` selects the "best" row per group of KEY columns, using ordered
 //! criteria (ASC/DESC) to rank rows and keeping only the top-ranked row per group.
 
-use crate::query::df_graph::common::{ScalarKey, compute_plan_properties, extract_scalar_key};
+use crate::query::df_graph::common::{
+    ScalarKey, arrow_err, compute_plan_properties, extract_scalar_key,
+};
 use arrow::compute::take;
 use arrow_array::{RecordBatch, UInt32Array};
 use arrow_schema::SchemaRef;
@@ -142,8 +144,8 @@ impl ExecutionPlan for BestByExec {
                 return Ok(RecordBatch::new_empty(schema));
             }
 
-            let batch = arrow::compute::concat_batches(&input_schema, &batches)
-                .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+            let batch =
+                arrow::compute::concat_batches(&input_schema, &batches).map_err(arrow_err)?;
 
             if batch.num_rows() == 0 {
                 return Ok(RecordBatch::new_empty(schema));
@@ -197,8 +199,8 @@ impl ExecutionPlan for BestByExec {
             }
 
             // Sort to get indices
-            let sorted_indices = arrow::compute::lexsort_to_indices(&sort_columns, None)
-                .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+            let sorted_indices =
+                arrow::compute::lexsort_to_indices(&sort_columns, None).map_err(arrow_err)?;
 
             // Reorder batch by sorted indices
             let sorted_columns: Vec<_> = batch
@@ -206,8 +208,8 @@ impl ExecutionPlan for BestByExec {
                 .iter()
                 .map(|col| take(col.as_ref(), &sorted_indices, None))
                 .collect::<Result<Vec<_>, _>>()?;
-            let sorted_batch = RecordBatch::try_new(Arc::clone(&schema), sorted_columns)
-                .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+            let sorted_batch =
+                RecordBatch::try_new(Arc::clone(&schema), sorted_columns).map_err(arrow_err)?;
 
             // Dedup: keep first row per key group (linear scan)
             let mut keep_indices: Vec<u32> = Vec::new();
@@ -232,8 +234,7 @@ impl ExecutionPlan for BestByExec {
                 .map(|col| take(col.as_ref(), &keep_array, None))
                 .collect::<Result<Vec<_>, _>>()?;
 
-            RecordBatch::try_new(schema, output_columns)
-                .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+            RecordBatch::try_new(schema, output_columns).map_err(arrow_err)
         };
 
         Ok(Box::pin(BestByStream {

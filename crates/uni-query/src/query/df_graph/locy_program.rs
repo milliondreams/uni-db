@@ -145,7 +145,10 @@ impl fmt::Debug for LocyProgramExec {
 }
 
 impl LocyProgramExec {
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "execution plan node requires full graph and session context"
+    )]
     pub fn new(
         strata: Vec<LocyStratum>,
         commands: Vec<LocyCommand>,
@@ -425,7 +428,10 @@ impl RecordBatchStream for ProgramStream {
 // run_program — core evaluation algorithm
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "program evaluation requires full graph and session context"
+)]
 async fn run_program(
     strata: Vec<LocyStratum>,
     registry: Arc<DerivedScanRegistry>,

@@ -625,7 +625,10 @@ mod tests {
     use super::*;
 
     #[test]
-    #[expect(clippy::assertions_on_constants, reason = "Validating configuration constants intentionally")]
+    #[expect(
+        clippy::assertions_on_constants,
+        reason = "Validating configuration constants intentionally"
+    )]
     fn test_constants_are_reasonable() {
         // Verify DEFAULT_MAX_COMPACTION_ROWS is set to 5 million
         assert_eq!(DEFAULT_MAX_COMPACTION_ROWS, 5_000_000);

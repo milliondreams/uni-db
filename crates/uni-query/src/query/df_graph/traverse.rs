@@ -32,9 +32,9 @@
 use crate::query::df_graph::GraphExecutionContext;
 use crate::query::df_graph::bitmap::{EidFilter, VidFilter};
 use crate::query::df_graph::common::{
-    append_edge_to_struct, append_node_to_struct, build_edge_list_field, build_path_struct_field,
-    column_as_vid_array, compute_plan_properties, labels_data_type, new_edge_list_builder,
-    new_node_list_builder,
+    append_edge_to_struct, append_node_to_struct, arrow_err, build_edge_list_field,
+    build_path_struct_field, column_as_vid_array, compute_plan_properties, labels_data_type,
+    new_edge_list_builder, new_node_list_builder,
 };
 use crate::query::df_graph::nfa::{NfaStateId, PathNfa, PathSelector, VlpOutputMode};
 use crate::query::df_graph::pred_dag::PredecessorDag;
@@ -1001,8 +1001,7 @@ async fn build_traverse_output_batch(
         columns.push(Arc::new(UInt64Array::from(eid_u64s)));
     }
 
-    let expanded_batch = RecordBatch::try_new(schema.clone(), columns)
-        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+    let expanded_batch = RecordBatch::try_new(schema.clone(), columns).map_err(arrow_err)?;
 
     // Append null rows for unmatched optional sources
     if optional {
@@ -1023,7 +1022,7 @@ async fn build_traverse_output_batch(
                 &optional_pattern_vars,
             )?;
             let combined = arrow::compute::concat_batches(&schema, [&expanded_batch, &null_batch])
-                .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+                .map_err(arrow_err)?;
             return Ok(combined);
         }
     }
@@ -1052,8 +1051,7 @@ fn build_optional_null_batch_for_rows(
     for field in schema.fields().iter().skip(input.num_columns()) {
         columns.push(arrow_array::new_null_array(field.data_type(), num_rows));
     }
-    RecordBatch::try_new(schema.clone(), columns)
-        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+    RecordBatch::try_new(schema.clone(), columns).map_err(arrow_err)
 }
 
 fn is_optional_column_for_vars(col_name: &str, optional_vars: &HashSet<String>) -> bool {
@@ -1170,8 +1168,7 @@ fn build_optional_null_batch_for_rows_with_optional_vars(
         }
     }
 
-    RecordBatch::try_new(schema.clone(), columns)
-        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+    RecordBatch::try_new(schema.clone(), columns).map_err(arrow_err)
 }
 
 impl Stream for GraphTraverseStream {
@@ -1401,8 +1398,7 @@ fn build_traverse_output_batch_sync(
         columns.push(Arc::new(UInt64Array::from(edge_ids)));
     }
 
-    let expanded_batch = RecordBatch::try_new(schema.clone(), columns)
-        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+    let expanded_batch = RecordBatch::try_new(schema.clone(), columns).map_err(arrow_err)?;
 
     if optional {
         let matched_indices: HashSet<usize> =
@@ -2139,8 +2135,8 @@ impl GraphTraverseMainStream {
             }
         }
 
-        let matched_batch = RecordBatch::try_new(self.schema.clone(), columns)
-            .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+        let matched_batch =
+            RecordBatch::try_new(self.schema.clone(), columns).map_err(arrow_err)?;
 
         // Handle OPTIONAL: append unmatched rows with NULLs
         if self.optional {
@@ -2164,8 +2160,7 @@ impl GraphTraverseMainStream {
 
             // Concatenate matched and unmatched batches
             use arrow::compute::concat_batches;
-            concat_batches(&self.schema, &[matched_batch, unmatched_batch])
-                .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+            concat_batches(&self.schema, &[matched_batch, unmatched_batch]).map_err(arrow_err)
         } else {
             Ok(matched_batch)
         }
@@ -2739,7 +2734,10 @@ impl GraphVariableLengthTraverseExec {
 }
 
 /// Data needed by the stream (without ExecutionPlan overhead).
-#[allow(dead_code)] // Some fields accessed via NFA; kept for with_new_children reconstruction
+#[expect(
+    dead_code,
+    reason = "Fields accessed via NFA; kept for with_new_children reconstruction"
+)]
 struct GraphVariableLengthTraverseExecData {
     source_column: String,
     edge_type_ids: Vec<u32>,
@@ -2753,7 +2751,7 @@ struct GraphVariableLengthTraverseExecData {
     target_label_name: Option<String>,
     is_optional: bool,
     bound_target_column: Option<String>,
-    #[allow(dead_code)] // Used in Phase 3 warming
+    #[expect(dead_code, reason = "Used in Phase 3 warming")]
     edge_lance_filter: Option<String>,
     /// Simple property equality conditions for per-edge L0 checking during BFS.
     edge_property_conditions: Vec<(String, UniValue)>,
@@ -2872,7 +2870,6 @@ impl GraphVariableLengthTraverseExecData {
     ///
     /// Returns BFS results in the same format as the old bfs() for compatibility
     /// with build_output_batch.
-    #[allow(clippy::too_many_arguments)]
     fn bfs_with_dag(
         &self,
         source: Vid,
@@ -2956,7 +2953,6 @@ impl GraphVariableLengthTraverseExecData {
     ///
     /// More efficient when no path/step variable is bound — skips full path enumeration.
     /// Uses lightweight trail verification via has_trail_valid_path().
-    #[allow(clippy::too_many_arguments)]
     fn bfs_endpoints_only(
         &self,
         source: Vid,
@@ -3488,7 +3484,7 @@ impl GraphVariableLengthTraverseStream {
                 vec![nodes_array, rels_array],
                 Some(arrow::buffer::NullBuffer::from(path_validity)),
             )
-            .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+            .map_err(arrow_err)?;
 
             if let Some(idx) = existing_path_col_idx {
                 columns[idx] = Arc::new(path_struct);
@@ -3499,8 +3495,7 @@ impl GraphVariableLengthTraverseStream {
 
         self.metrics.record_output(num_rows);
 
-        RecordBatch::try_new(self.schema.clone(), columns)
-            .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+        RecordBatch::try_new(self.schema.clone(), columns).map_err(arrow_err)
     }
 }
 
@@ -3667,8 +3662,7 @@ async fn hydrate_vlp_target_properties(
         }
     }
 
-    RecordBatch::try_new(schema, new_columns)
-        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+    RecordBatch::try_new(schema, new_columns).map_err(arrow_err)
 }
 
 // ============================================================================
@@ -3999,7 +3993,7 @@ enum VarLengthMainStreamState {
 }
 
 /// Stream for variable-length traversal on schemaless edges.
-#[allow(dead_code)] // VLP fields used in Phase 3
+#[expect(dead_code, reason = "VLP fields used in Phase 3")]
 struct GraphVariableLengthTraverseMainStream {
     input: SendableRecordBatchStream,
     source_column: String,
@@ -4382,7 +4376,7 @@ impl GraphVariableLengthTraverseMainStream {
                 vec![nodes_array, rels_array],
                 Some(arrow::buffer::NullBuffer::from(path_validity)),
             )
-            .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+            .map_err(arrow_err)?;
 
             if let Some(idx) = existing_path_col_idx {
                 columns[idx] = Arc::new(path_struct);
@@ -4403,8 +4397,7 @@ impl GraphVariableLengthTraverseMainStream {
             }
         }
 
-        RecordBatch::try_new(self.schema.clone(), columns)
-            .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+        RecordBatch::try_new(self.schema.clone(), columns).map_err(arrow_err)
     }
 }
 

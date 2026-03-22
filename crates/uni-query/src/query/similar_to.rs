@@ -91,7 +91,7 @@ pub struct SimilarToOptions {
 
 impl Default for SimilarToOptions {
     fn default() -> Self {
-        SimilarToOptions {
+        Self {
             method: FusionMethod::Rrf,
             weights: None,
             k: 60,
@@ -257,23 +257,14 @@ pub fn score_vectors(a: &[f32], b: &[f32], metric: &DistanceMetric) -> Result<f3
             b: b.len(),
         });
     }
+    let distance = metric.compute_distance(a, b);
     match metric {
         DistanceMetric::Cosine => cosine_similarity(a, b),
-        DistanceMetric::L2 => {
-            let distance = metric.compute_distance(a, b);
-            Ok(calculate_score(distance, metric))
-        }
-        DistanceMetric::Dot => {
-            // compute_distance returns -dot (LanceDB convention: lower = more similar).
-            // Negate to recover the actual dot product as a similarity score.
-            let distance = metric.compute_distance(a, b);
-            Ok(-distance)
-        }
-        // DistanceMetric is #[non_exhaustive]; fall back to L2-style normalisation.
-        _ => {
-            let distance = metric.compute_distance(a, b);
-            Ok(calculate_score(distance, metric))
-        }
+        // compute_distance returns -dot (LanceDB convention: lower = more similar).
+        // Negate to recover the actual dot product as a similarity score.
+        DistanceMetric::Dot => Ok(-distance),
+        // L2 and all other metrics (#[non_exhaustive]): normalise via calculate_score.
+        _ => Ok(calculate_score(distance, metric)),
     }
 }
 
@@ -312,7 +303,7 @@ pub fn value_to_f32_vec(v: &Value) -> Result<Vec<f32>, SimilarToError> {
             })
             .collect(),
         _ => Err(SimilarToError::InvalidVectorValue {
-            actual: format!("{:?}", v),
+            actual: format!("{v:?}"),
         }),
     }
 }

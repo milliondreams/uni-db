@@ -55,12 +55,15 @@ impl VariableType {
     }
 }
 
-/// Information about a variable in scope.
+/// Information about a variable in scope during planning.
 #[derive(Debug, Clone)]
 pub struct VariableInfo {
+    /// Variable name as written in the query.
     pub name: String,
+    /// Semantic type of the variable.
     pub var_type: VariableType,
     /// True if this is a variable-length path (VLP) step variable.
+    ///
     /// VLP step variables are typed as Edge but semantically hold edge lists.
     pub is_vlp: bool,
 }
@@ -1682,21 +1685,33 @@ fn validate_expression(expr: &Expr, vars_in_scope: &[VariableInfo]) -> Result<()
 }
 
 /// One step (hop) in a Quantified Path Pattern sub-pattern.
+///
 /// Used by `LogicalPlan::Traverse` when `qpp_steps` is `Some`.
 #[derive(Debug, Clone)]
 pub struct QppStepInfo {
+    /// Edge type IDs that this step can traverse.
     pub edge_type_ids: Vec<u32>,
+    /// Traversal direction for this step.
     pub direction: Direction,
+    /// Optional label constraint on the target node.
     pub target_label: Option<String>,
 }
 
+/// Logical query plan produced by [`QueryPlanner`].
+///
+/// Each variant represents one step in the Cypher execution pipeline.
+/// Plans are tree-structured — leaf nodes produce rows, intermediate nodes
+/// transform or join them, and the root node defines the final output.
 #[derive(Debug, Clone)]
 pub enum LogicalPlan {
+    /// UNION / UNION ALL of two sub-plans.
     Union {
         left: Box<LogicalPlan>,
         right: Box<LogicalPlan>,
+        /// When `true`, duplicate rows are preserved (UNION ALL semantics).
         all: bool,
     },
+    /// Scan vertices of a single labeled dataset.
     Scan {
         label_id: u16,
         labels: Vec<String>,
@@ -1729,7 +1744,9 @@ pub enum LogicalPlan {
         filter: Option<Expr>,
         optional: bool,
     },
-    Empty, // Produces 1 empty row
+    /// Produces exactly one empty row (used to bootstrap pipelines with no source).
+    Empty,
+    /// UNWIND: expand a list expression into one row per element.
     Unwind {
         input: Box<LogicalPlan>,
         expr: Expr,
@@ -2239,6 +2256,12 @@ fn extract_float_literal(expr: &Expr) -> Option<f32> {
     }
 }
 
+/// Translates a parsed Cypher AST into a [`LogicalPlan`].
+///
+/// `QueryPlanner` applies semantic validation (variable scoping, label
+/// resolution, type checking) and produces a plan tree that the executor
+/// can run against storage.
+#[derive(Debug)]
 pub struct QueryPlanner {
     schema: Arc<Schema>,
     /// Cache of parsed generation expressions, keyed by (label_name, gen_col_name).
@@ -2260,6 +2283,10 @@ struct TraverseParams<'a> {
 }
 
 impl QueryPlanner {
+    /// Create a new planner for the given schema.
+    ///
+    /// Pre-parses all generation expressions defined in the schema so that
+    /// repeated plan calls avoid redundant parsing.
     pub fn new(schema: Arc<Schema>) -> Self {
         // Pre-parse all generation expressions for caching
         let mut gen_expr_cache = HashMap::new();
@@ -2286,10 +2313,15 @@ impl QueryPlanner {
         self
     }
 
+    /// Plan a Cypher query with no pre-bound variables.
     pub fn plan(&self, query: Query) -> Result<LogicalPlan> {
         self.plan_with_scope(query, Vec::new())
     }
 
+    /// Plan a Cypher query with a set of externally pre-bound variable names.
+    ///
+    /// `vars` lists variable names already in scope before this query executes
+    /// (e.g., from an enclosing Locy rule body).
     pub fn plan_with_scope(&self, query: Query, vars: Vec<String>) -> Result<LogicalPlan> {
         // Apply query rewrites before planning
         let rewritten_query = crate::query::rewrite::rewrite_query(query)?;
@@ -2762,7 +2794,7 @@ impl QueryPlanner {
                         if expr.is_aggregate() && !is_compound_aggregate(&expr) && !has_window_exprs
                         {
                             // Bare aggregate — replace with column reference
-                            let col_name = Self::get_aggregate_column_name(&expr);
+                            let col_name = aggregate_column_name(&expr);
                             (Expr::Variable(col_name), alias)
                         } else if !has_window_exprs
                             && (is_compound_aggregate(&expr)
@@ -6827,12 +6859,6 @@ impl QueryPlanner {
             other => other,
         }
     }
-
-    /// Get the column name for an aggregate expression.
-    /// This must match the logic in executor's build_aggregate_result.
-    fn get_aggregate_column_name(expr: &Expr) -> String {
-        aggregate_column_name(expr)
-    }
 }
 
 /// Get the expected column name for an aggregate expression.
@@ -6845,46 +6871,65 @@ pub fn aggregate_column_name(expr: &Expr) -> String {
     expr.to_string_repr()
 }
 
+/// Output produced by `EXPLAIN` — a human-readable plan with index and cost info.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ExplainOutput {
+    /// Debug-formatted logical plan tree.
     pub plan_text: String,
+    /// Index availability report for each scan in the plan.
     pub index_usage: Vec<IndexUsage>,
+    /// Rough row and cost estimates for the full plan.
     pub cost_estimates: CostEstimates,
+    /// Planner warnings (e.g., missing index, forced full scan).
     pub warnings: Vec<String>,
+    /// Suggested indexes that would improve this query.
     pub suggestions: Vec<IndexSuggestion>,
 }
 
 /// Suggestion for creating an index to improve query performance.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct IndexSuggestion {
+    /// Label or edge type that would benefit from the index.
     pub label_or_type: String,
+    /// Property to index.
     pub property: String,
+    /// Recommended index type (e.g., `"SCALAR"`, `"VECTOR"`).
     pub index_type: String,
+    /// Human-readable explanation of the performance benefit.
     pub reason: String,
+    /// Ready-to-execute Cypher statement to create the index.
     pub create_statement: String,
 }
 
+/// Index availability report for a single scan operator.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct IndexUsage {
     pub label_or_type: String,
     pub property: String,
     pub index_type: String,
+    /// Whether the index was actually used for this scan.
     pub used: bool,
+    /// Human-readable explanation of why the index was or was not used.
     pub reason: Option<String>,
 }
 
+/// Rough cost and row count estimates for a complete logical plan.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CostEstimates {
+    /// Estimated number of rows the plan will produce.
     pub estimated_rows: f64,
+    /// Abstract cost units (lower is cheaper).
     pub estimated_cost: f64,
 }
 
 impl QueryPlanner {
+    /// Plan a query and produce an EXPLAIN report (plan text, index usage, costs).
     pub fn explain_plan(&self, ast: Query) -> Result<ExplainOutput> {
         let plan = self.plan(ast)?;
         self.explain_logical_plan(&plan)
     }
 
+    /// Produce an EXPLAIN report for an already-planned logical plan.
     pub fn explain_logical_plan(&self, plan: &LogicalPlan) -> Result<ExplainOutput> {
         let index_usage = self.analyze_index_usage(plan)?;
         let cost_estimates = self.estimate_costs(plan)?;

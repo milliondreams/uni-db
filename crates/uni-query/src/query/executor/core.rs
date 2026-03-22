@@ -20,6 +20,7 @@ use crate::types::QueryWarning;
 
 use super::procedure::ProcedureRegistry;
 
+/// Mutable accumulator for Cypher aggregate functions (COUNT, SUM, AVG, ...).
 #[derive(Debug)]
 pub(crate) enum Accumulator {
     Count(i64),
@@ -207,6 +208,17 @@ impl Accumulator {
 /// Cache key for parsed generation expressions: (label_name, property_name)
 pub(crate) type GenExprCacheKey = (String, String);
 
+/// Query executor: runs logical plans against a Uni storage backend.
+///
+/// `Executor` bridges the logical query plan produced by [`crate::query::planner::QueryPlanner`]
+/// with the underlying `StorageManager`. It handles both read-only sessions and
+/// write-enabled sessions (via `Writer` and `L0Manager`).
+///
+/// # Cloning
+///
+/// `Executor` is cheaply cloneable — all expensive state is held behind `Arc`s.
+/// Clone it freely to share across tasks.
+// M-PUBLIC-DEBUG: Manual impl because Writer/ModelRuntime do not implement Debug.
 #[derive(Clone)]
 pub struct Executor {
     pub(crate) storage: Arc<StorageManager>,
@@ -227,7 +239,19 @@ pub struct Executor {
     pub(crate) warnings: Arc<std::sync::Mutex<Vec<QueryWarning>>>,
 }
 
+impl std::fmt::Debug for Executor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Executor")
+            .field("use_transaction", &self.use_transaction)
+            .field("has_writer", &self.writer.is_some())
+            .field("has_l0_manager", &self.l0_manager.is_some())
+            .field("has_xervo_runtime", &self.xervo_runtime.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
 impl Executor {
+    /// Create a read-only executor backed by the given storage manager.
     pub fn new(storage: Arc<StorageManager>) -> Self {
         Self {
             storage,
@@ -244,17 +268,19 @@ impl Executor {
         }
     }
 
+    /// Create a write-enabled executor with an attached `Writer`.
     pub fn new_with_writer(storage: Arc<StorageManager>, writer: Arc<RwLock<Writer>>) -> Self {
         let mut executor = Self::new(storage);
         executor.writer = Some(writer);
         executor
     }
 
-    /// Sets the external procedure registry for user-defined procedures.
+    /// Attach an external procedure registry for user-defined procedures.
     pub fn set_procedure_registry(&mut self, registry: Arc<ProcedureRegistry>) {
         self.procedure_registry = Some(registry);
     }
 
+    /// Attach or detach the Uni-Xervo model runtime for vector auto-embedding.
     pub fn set_xervo_runtime(&mut self, runtime: Option<Arc<ModelRuntime>>) {
         self.xervo_runtime = runtime;
     }
@@ -265,6 +291,7 @@ impl Executor {
         self.file_sandbox = sandbox;
     }
 
+    /// Apply a runtime configuration to this executor.
     pub fn set_config(&mut self, config: uni_common::config::UniConfig) {
         self.config = config;
     }
@@ -276,6 +303,7 @@ impl Executor {
             .map_err(|e| anyhow!("Path validation failed: {}", e))
     }
 
+    /// Attach a `Writer` after construction, enabling write operations.
     pub fn set_writer(&mut self, writer: Arc<RwLock<Writer>>) {
         self.writer = Some(writer);
     }
@@ -288,10 +316,12 @@ impl Executor {
             .unwrap_or_default()
     }
 
+    /// Configure whether query execution should operate within a transaction context.
     pub fn set_use_transaction(&mut self, use_transaction: bool) {
         self.use_transaction = use_transaction;
     }
 
+    /// Build a `QueryContext` from the current writer or standalone L0 manager.
     pub(crate) async fn get_context(&self) -> Option<QueryContext> {
         if let Some(writer_lock) = &self.writer {
             let writer = writer_lock.read().await;
@@ -312,6 +342,7 @@ impl Executor {
         }
     }
 
+    /// Total ordering for Cypher ORDER BY, including cross-type comparisons.
     pub(crate) fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
         use std::cmp::Ordering;
 
@@ -607,21 +638,36 @@ impl Executor {
     }
 }
 
+/// Combined output of a `PROFILE` query execution.
+///
+/// Contains both the logical plan explanation and per-operator runtime
+/// statistics collected during execution.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ProfileOutput {
+    /// Logical plan explanation with index usage and cost estimates.
     pub explain: crate::query::planner::ExplainOutput,
+    /// Per-operator timing and memory statistics.
     pub runtime_stats: Vec<OperatorStats>,
+    /// Wall-clock time for the entire execution in milliseconds.
     pub total_time_ms: u64,
+    /// Peak memory used during execution in bytes.
     pub peak_memory_bytes: usize,
 }
 
+/// Runtime statistics for a single logical plan operator.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OperatorStats {
+    /// Human-readable operator name (e.g., `"GraphScan"`, `"Filter"`).
     pub operator: String,
+    /// Number of rows produced by this operator.
     pub actual_rows: usize,
+    /// Wall-clock time spent in this operator in milliseconds.
     pub time_ms: f64,
+    /// Memory allocated by this operator in bytes.
     pub memory_bytes: usize,
+    /// Number of index cache hits (if applicable).
     pub index_hits: Option<usize>,
+    /// Number of index cache misses (if applicable).
     pub index_misses: Option<usize>,
 }
 

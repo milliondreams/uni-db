@@ -14,6 +14,12 @@ use anyhow::{Result, anyhow};
 use std::collections::HashMap;
 use uni_common::core::id::{Eid, Vid};
 
+/// Converts raw executor output into clean user-facing value types.
+///
+/// Ensures that `Value::Map` rows carrying internal fields (`_vid`, `_eid`,
+/// `_labels`, etc.) are converted to their proper `Value::Node`, `Value::Edge`,
+/// or `Value::Path` variants before results are returned to callers.
+#[derive(Debug)]
 pub struct ResultNormalizer;
 
 impl ResultNormalizer {

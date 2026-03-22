@@ -1,19 +1,17 @@
 # TCK Compliance Report
 
-**Generated:** 2026-03-20 23:36:09
-**Results:** `results_20260320_233609.json`
-**Compared to:** `results_20260320_215736.json`
+**Generated:** 2026-03-21 20:08:29
+**Results:** `results_20260321_200829.json`
+**Compared to:** `results_20260320_233609.json`
 
 ## Summary
 
 | Metric | Current | Previous | Delta |
 |--------|---------|----------|-------|
-| Scenarios | 183 | 180 | +3 |
-| Passed | 183 | 180 | +3 |
+| Scenarios | 183 | 183 |  |
+| Passed | 183 | 183 |  |
 | Failed | 0 | 0 |  |
 | Pass Rate | 100.0% | 100.0% | ➡️ +0.0pp |
-
-**🆕 New:** 3 scenarios added
 
 ## Feature Breakdown
 

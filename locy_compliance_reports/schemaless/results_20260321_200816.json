@@ -1458,6 +1458,48 @@
             }
           }
         ]
+      },
+      {
+        "type": "scenario",
+        "name": "BddLimitExceeded warning carries variable_count and key_group metadata",
+        "line": 355,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "BddLimitExceeded warning carries variable_count and key_group metadata",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "BDD fallback marks derived facts as approximate",
+        "line": 385,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "BDD fallback marks derived facts as approximate",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "Non-fallback exact_probability facts are not marked approximate",
+        "line": 414,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "Non-fallback exact_probability facts are not marked approximate",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
       }
     ]
   },

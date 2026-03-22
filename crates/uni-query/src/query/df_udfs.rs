@@ -7434,4 +7434,60 @@ mod tests {
             );
         }
     }
+
+    // Regression tests: human-readable temporal strings must parse via sort_key_string_as_temporal.
+    // These broke when the simplification commit removed the classify_temporal fallback.
+
+    #[test]
+    fn test_sort_key_string_as_temporal_time_with_offset() {
+        let tv = sort_key_string_as_temporal("12:35:15+05:00")
+            .expect("should parse Time with positive offset");
+        match tv {
+            uni_common::TemporalValue::Time {
+                nanos_since_midnight,
+                offset_seconds,
+            } => {
+                assert_eq!(offset_seconds, 5 * 3600, "offset should be +05:00 = 18000s");
+                // 12h 35m 15s in nanos
+                let expected_nanos = (12 * 3600 + 35 * 60 + 15) * 1_000_000_000i64;
+                assert_eq!(nanos_since_midnight, expected_nanos);
+            }
+            other => panic!("expected TemporalValue::Time, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_sort_key_string_as_temporal_time_negative_offset() {
+        let tv = sort_key_string_as_temporal("10:35:00-08:00")
+            .expect("should parse Time with negative offset");
+        match tv {
+            uni_common::TemporalValue::Time {
+                nanos_since_midnight,
+                offset_seconds,
+            } => {
+                assert_eq!(
+                    offset_seconds,
+                    -8 * 3600,
+                    "offset should be -08:00 = -28800s"
+                );
+                let expected_nanos = (10 * 3600 + 35 * 60) * 1_000_000_000i64;
+                assert_eq!(nanos_since_midnight, expected_nanos);
+            }
+            other => panic!("expected TemporalValue::Time, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_sort_key_string_as_temporal_date() {
+        use super::super::expr_eval::temporal_from_value;
+        let tv = temporal_from_value(&Value::String("2024-01-15".into()))
+            .expect("should parse Date string");
+        match tv {
+            uni_common::TemporalValue::Date { days_since_epoch } => {
+                // 2024-01-15: verify it is a positive epoch offset (post-1970)
+                assert!(days_since_epoch > 0, "2024-01-15 should be after epoch");
+            }
+            other => panic!("expected TemporalValue::Date, got {other:?}"),
+        }
+    }
 }

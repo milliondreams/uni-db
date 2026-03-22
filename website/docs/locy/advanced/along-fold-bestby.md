@@ -24,11 +24,36 @@ FOLD total = SUM(b.value)
 YIELD KEY a, total
 ```
 
-For recursion, monotonic variants are used where required.
+### Standard Aggregators
+
+Standard aggregators work in **non-recursive** strata only. They can decrease between iterations, which violates fixpoint requirements:
+
+| Operator | Description | Example |
+|----------|-------------|---------|
+| `COUNT(*)` | Row count | `FOLD n = COUNT(*)` |
+| `COUNT(expr)` | Non-null count | `FOLD n = COUNT(b.value)` |
+| `SUM(expr)` | Sum | `FOLD total = SUM(b.amount)` |
+| `AVG(expr)` | Average | `FOLD avg = AVG(b.score)` |
+| `MIN(expr)` | Minimum | `FOLD low = MIN(b.price)` |
+| `MAX(expr)` | Maximum | `FOLD high = MAX(b.price)` |
+| `COLLECT(expr)` | Collect into list | `FOLD paths = COLLECT(b.name)` |
+
+### Monotonic Aggregators (Safe in Recursion)
+
+Monotonic variants guarantee the aggregate never decreases between iterations, enabling safe use inside recursive strata:
+
+| Operator | Formula | Identity | Use When |
+|----------|---------|----------|----------|
+| `MSUM(expr)` | Running sum | `0` | Non-negative additive accumulation |
+| `MMAX(expr)` | Running maximum | `−∞` | Worst-case / dominant value |
+| `MMIN(expr)` | Running minimum | `+∞` | Best-case / bottleneck |
+| `MCOUNT(expr)` | Running count | `0` | Monotonically growing count |
+| `MNOR(expr)` | `1 − ∏(1 − pᵢ)` | `0.0` | Independent OR-causes (probabilities) |
+| `MPROD(expr)` | `∏ pᵢ` | `1.0` | Independent AND-conditions (probabilities) |
 
 ### Monotonic Probabilistic Folds
 
-For probability domains, use `MNOR` (noisy-OR) and `MPROD` (product) instead of `MSUM`/`MMAX`:
+For probability domains, use `MNOR` (noisy-OR) and `MPROD` (product):
 
 ```cypher
 CREATE RULE failure_risk AS
@@ -38,6 +63,19 @@ YIELD KEY c, risk
 ```
 
 See [Probabilistic Logic](probabilistic-logic.md) for full documentation.
+
+### Multiple FOLD Clauses
+
+A rule can have multiple `FOLD` clauses to compute several aggregates simultaneously:
+
+```cypher
+CREATE RULE exposure AS
+MATCH (a:Account)-[t:TRANSFER*]->(b:Account)
+WHERE b IS suspicious
+FOLD total = MSUM(t.amount)
+FOLD path_count = MCOUNT(*)
+YIELD KEY a, total, path_count
+```
 
 ## BEST BY (Witness Selection)
 
@@ -84,7 +122,7 @@ WHERE similar_to([d.embedding, d.content], q.text,
 YIELD KEY q, KEY d
 ```
 
-See the [Vector Search guide](../guides/vector-search.md#similar_to-expression-function) for full `similar_to` documentation.
+See the [Vector Search guide](../../guides/vector-search.md#similar_to-expression-function) for full `similar_to` documentation.
 
 ## Practical Guidance
 

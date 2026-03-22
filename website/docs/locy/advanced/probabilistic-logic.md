@@ -1,4 +1,4 @@
-# Probabilistic Logic (MNOR / MPROD)
+# Probabilistic Logic (MNOR / MPROD / PROB)
 
 ## The Problem
 
@@ -97,6 +97,54 @@ YIELD KEY v, reliability
 **BEST BY rejection.** Monotonic folds (including MNOR and MPROD) are incompatible with `BEST BY` witness selection. The compiler rejects this combination with a `BestByWithMonotonicFold` error.
 
 **Input clamping.** At runtime, values outside [0, 1] are clamped before computation. This prevents NaN or negative results from bad data, but you should fix the upstream source rather than relying on clamping.
+
+## PROB Columns and Probabilistic Negation
+
+`PROB` marks one output column in a rule as the probability channel for that relation:
+
+```cypher
+CREATE RULE supplier_risk AS
+MATCH (s:Supplier)-[:HAS_SIGNAL]->(sig:Signal)
+FOLD risk = MNOR(sig.risk)
+YIELD KEY s, risk AS PROB
+```
+
+Accepted forms:
+
+- `expr AS PROB`
+- `expr AS alias PROB`
+- `expr PROB`
+
+If `IS NOT` targets a rule with a `PROB` column, Locy uses probabilistic complement (`1 - p`) instead of Boolean anti-join:
+
+```cypher
+CREATE RULE usable_supplier AS
+MATCH (s:Supplier)
+WHERE s IS NOT supplier_risk
+YIELD KEY s, 1.0 AS confidence PROB
+```
+
+If the referenced rule has no `PROB` column, `IS NOT` keeps standard Boolean semantics.
+
+## Shared-Proof Detection and Exact Mode
+
+MNOR and MPROD assume independent derivations. When multiple proof paths in the same aggregate group share the same underlying evidence, the runtime emits `SharedProbabilisticDependency`.
+
+Set `exact_probability = true` in `LocyConfig` to enable BDD-backed exact probability computation for those groups. Two important fallbacks remain:
+
+- `BddLimitExceeded`: the group exceeded `max_bdd_variables`, so Locy falls back to the independence result for that key group.
+- `CrossGroupCorrelationNotExact`: shared evidence spans multiple aggregate groups; each group is exact internally, but cross-group correlation is still approximate.
+
+Rows from approximate groups are marked with `_approximate = true`, and Rust `LocyResult` values also expose `approximate_groups`.
+
+## Relevant Config Knobs
+
+| Field | Default | Effect |
+|-------|---------|--------|
+| `strict_probability_domain` | `false` | Reject out-of-range values instead of clamping |
+| `probability_epsilon` | `1e-15` | MPROD threshold for switching to log-space accumulation |
+| `exact_probability` | `false` | Enable BDD-based exact evaluation for shared-proof groups |
+| `max_bdd_variables` | `1000` | Cap per-group BDD complexity before fallback |
 
 ## Combining with similar_to
 

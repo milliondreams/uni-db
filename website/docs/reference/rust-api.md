@@ -1899,6 +1899,8 @@ let result = xervo.generate_text(
     &["Explain graph databases."],
     GenerationOptions::default(),
 ).await?;
+
+let runtime = xervo.raw_runtime();
 ```
 
 **Key types** (re-exported from `uni_db::xervo`):

@@ -217,13 +217,82 @@ out = db.locy_evaluate(program)
 out = await adb.locy_evaluate(program)
 ```
 
-Returned object includes:
+With optional config (including probabilistic reasoning options):
 
-- `derived`
-- `stats`
-- `command_results`
+```python
+out = db.locy_evaluate(program, {
+    "max_iterations": 500,
+    "timeout": 60.0,
+    "strict_probability_domain": True,
+    "exact_probability": True,
+    "max_bdd_variables": 1000,
+})
+```
+
+Returned dict includes:
+
+- `derived` — facts derived by each rule
+- `stats` — timing and iteration counts
+- `command_results` — output from `QUERY`, `ABDUCE`, `EXPLAIN RULE`
+- `warnings` — runtime warnings (e.g., `SharedProbabilisticDependency`)
+- `approximate_groups` — groups that fell back to approximate probability mode
 
 See [Locy Overview](../locy/index.md) and [Locy Python API Integration](../locy/api/python.md).
+
+### Xervo (Embedding & Generation)
+
+Access the configured model runtime via `db.xervo()`. Requires a Xervo catalog configured at database open time:
+
+```python
+from uni_db import DatabaseBuilder, Message
+
+db = DatabaseBuilder.open("./graph") \
+    .xervo_catalog_from_file("./models.json") \
+    .build()
+
+xervo = db.xervo()
+
+# Embed text → list[list[float]]
+vectors = xervo.embed("embed/default", ["graph databases", "vector search"])
+
+# Generate with Message objects
+result = xervo.generate(
+    "llm/default",
+    [
+        Message.system("You are a concise technical assistant."),
+        Message.user("What is snapshot isolation?"),
+    ],
+    max_tokens=256,
+    temperature=0.7,
+)
+print(result.text)    # Generated string
+print(result.usage)   # TokenUsage | None
+
+# Convenience wrapper — single prompt string
+result = xervo.generate_text("llm/default", "Explain hybrid search in one sentence.")
+```
+
+Async Xervo:
+
+```python
+db = await AsyncDatabaseBuilder.open("./graph") \
+    .xervo_catalog_from_file("./models.json") \
+    .build()
+xervo = db.xervo()
+vectors = await xervo.embed("embed/default", ["hello"])
+result = await xervo.generate_text("llm/default", "Hello!")
+```
+
+**Message constructors:**
+
+```python
+Message.user("content")        # role = "user"
+Message.assistant("content")   # role = "assistant"
+Message.system("content")      # role = "system"
+Message(role, content)         # explicit
+```
+
+`generate()` also accepts plain dicts with `"role"` and `"content"` keys instead of `Message` objects.
 
 ## Data Types
 
@@ -265,9 +334,32 @@ print(f"Total time: {profile['total_time_ms']}ms")
 print(f"Peak memory: {profile['peak_memory_bytes']} bytes")
 ```
 
-## Snapshots (Planned)
+## Snapshots
 
-Snapshot management is available in the Rust API, but is not yet exposed in the Python bindings.
+Snapshot management is available directly on the `Database` object:
+
+```python
+# Create a named snapshot
+snapshot_id = db.create_snapshot("baseline-import")
+
+# List all snapshots
+snapshots = db.list_snapshots()
+for snap in snapshots:
+    print(snap.snapshot_id, snap.name, snap.created_at)
+
+# Restore to a previous snapshot
+db.restore_snapshot(snapshot_id)
+```
+
+Async:
+
+```python
+snapshot_id = await adb.create_snapshot("pre-migration")
+snapshots = await adb.list_snapshots()
+await adb.restore_snapshot(snapshot_id)
+```
+
+`list_snapshots()` returns a list of `SnapshotInfo` objects with fields: `snapshot_id`, `name`, `created_at`, `version_hwm`.
 
 ## Error Handling
 

@@ -27,18 +27,26 @@ Common fields:
 - `max_abduce_results`
 - `max_derived_bytes`
 - `deterministic_best_by`
+- `strict_probability_domain`
+- `probability_epsilon`
+- `exact_probability`
+- `max_bdd_variables`
 
 ## Result Shape (`LocyResult`)
 
 - `derived: HashMap<String, Vec<Row>>`
 - `stats: LocyStats`
 - `command_results: Vec<CommandResult>`
+- `warnings: Vec<RuntimeWarning>`
+- `approximate_groups: HashMap<String, Vec<String>>`
 
 Helpers:
 
 - `result.rows()`
 - `result.columns()`
 - `result.stats()`
+- `result.warnings()`
+- `result.has_warning(...)`
 
 ## Full API References
 

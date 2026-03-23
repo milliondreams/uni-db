@@ -349,17 +349,15 @@ impl LanceDbStore {
         Ok(())
     }
 
-    /// Replace a table's contents atomically using a staging table.
+    /// Replace a table's contents atomically using Lance's overwrite mode.
     ///
-    /// This method provides crash-safe table replacement:
-    /// 1. Clean up any leftover `{name}_staging` from previous crash
-    /// 2. Write new data to `{name}_staging` (durable write-ahead)
-    /// 3. Drop old `{name}` (if exists)
-    /// 4. Create `{name}` from the same data
-    /// 5. Drop `{name}_staging` (cleanup)
+    /// When the table already exists, this uses `add().mode(Overwrite)` to create
+    /// a new dataset version without dropping the table. This is critical for
+    /// concurrency safety: the old data files remain on disk (referenced by older
+    /// versions) until `Prune` runs, so concurrent readers can finish without
+    /// hitting "file not found" errors.
     ///
-    /// Crash safety: If crash occurs between drop and create, staging has the data
-    /// and `recover_staging()` can restore it on startup.
+    /// When the table does not exist, it creates a new table normally.
     ///
     /// # Arguments
     /// * `name` - The table name to replace
@@ -375,39 +373,44 @@ impl LanceDbStore {
         batches: Vec<RecordBatch>,
         schema: Arc<ArrowSchema>,
     ) -> Result<Table> {
+        // Clean up any leftover staging table from pre-overwrite-mode code
         let staging_name = format!("{}_staging", name);
-
-        // Step 1: Clean up any leftover staging table from previous crash
         if self.table_exists(&staging_name).await? {
             self.drop_table(&staging_name).await?;
         }
 
-        // Step 2: Write new data to staging (durable write-ahead)
-        if batches.is_empty() {
-            self.create_empty_table(&staging_name, schema.clone())
-                .await?;
-        } else {
-            self.create_table(&staging_name, batches.clone()).await?;
-        }
-
-        // Step 3: Drop old table if exists
         if self.table_exists(name).await? {
-            self.drop_table(name).await?;
-        }
-
-        // Step 4: Create main table from the same data
-        let table = if batches.is_empty() {
-            self.create_empty_table(name, schema).await?
+            // Table exists: use overwrite mode to create a new version.
+            // Old data files stay on disk until Lance Prune removes them,
+            // so concurrent readers are safe.
+            let table = self.open_table(name).await?;
+            if batches.is_empty() {
+                // Delete all rows to produce an empty table version
+                table
+                    .delete("true")
+                    .await
+                    .map_err(|e| anyhow!("Failed to clear table '{}': {}", name, e))?;
+            } else {
+                use lancedb::table::AddDataMode;
+                let batch_schema = batches[0].schema();
+                let batch_iter =
+                    RecordBatchIterator::new(batches.into_iter().map(Ok), batch_schema);
+                table
+                    .add(batch_iter)
+                    .mode(AddDataMode::Overwrite)
+                    .execute()
+                    .await
+                    .map_err(|e| anyhow!("Failed to overwrite table '{}': {}", name, e))?;
+            }
+            Ok(table)
         } else {
-            self.create_table(name, batches).await?
-        };
-
-        // Step 5: Drop staging table (cleanup)
-        if self.table_exists(&staging_name).await? {
-            self.drop_table(&staging_name).await?;
+            // Table doesn't exist: create it
+            if batches.is_empty() {
+                self.create_empty_table(name, schema).await
+            } else {
+                self.create_table(name, batches).await
+            }
         }
-
-        Ok(table)
     }
 
     /// Recover a table from its staging table if needed.
@@ -654,7 +657,7 @@ mod tests {
         // Verify new data replaced old data
         assert_eq!(table.count_rows(None).await.unwrap(), 2);
 
-        // Verify staging table was cleaned up
+        // Verify no staging table was created (overwrite mode doesn't use staging)
         assert!(!store.table_exists("test_staging").await.unwrap());
     }
 
@@ -670,7 +673,7 @@ mod tests {
             Field::new("name", DataType::Utf8, true),
         ]));
 
-        // Create table with empty data
+        // Create table with empty data (table doesn't exist yet)
         let table = store
             .replace_table_atomic("test", vec![], schema.clone())
             .await
@@ -679,8 +682,44 @@ mod tests {
         // Verify table exists and is empty
         assert_eq!(table.count_rows(None).await.unwrap(), 0);
 
-        // Verify staging table was cleaned up
+        // Verify no staging table was created
         assert!(!store.table_exists("test_staging").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_replace_table_atomic_overwrite_existing_with_empty() {
+        use arrow_array::UInt64Array;
+
+        let temp_dir = TempDir::new().unwrap();
+        let uri = temp_dir.path().to_str().unwrap();
+
+        let store = LanceDbStore::connect(uri).await.unwrap();
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::UInt64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+
+        // Create initial table with data
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![1, 2, 3])),
+                Arc::new(Int64Array::from(vec![100, 200, 300])),
+            ],
+        )
+        .unwrap();
+
+        store.create_table("test", vec![batch]).await.unwrap();
+
+        // Replace existing table with empty data (clears all rows)
+        let table = store
+            .replace_table_atomic("test", vec![], schema.clone())
+            .await
+            .unwrap();
+
+        // Verify table is now empty
+        assert_eq!(table.count_rows(None).await.unwrap(), 0);
     }
 
     #[tokio::test]

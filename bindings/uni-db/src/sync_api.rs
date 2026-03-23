@@ -562,4 +562,173 @@ impl Database {
         };
         convert::locy_result_to_py(py, result)
     }
+
+    /// Get a Xervo facade for embedding and generation operations.
+    fn xervo(&self) -> PyResult<Xervo> {
+        Ok(Xervo {
+            inner: self.inner.clone(),
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Snapshot management
+    // -----------------------------------------------------------------------
+
+    /// Create a point-in-time snapshot. Returns the snapshot ID.
+    #[pyo3(signature = (name=None))]
+    fn create_snapshot(&self, name: Option<String>) -> PyResult<String> {
+        pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(core::create_snapshot_core(&self.inner, name))
+            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+    }
+
+    /// List all available snapshots.
+    fn list_snapshots(&self, py: Python) -> PyResult<Vec<crate::types::SnapshotInfo>> {
+        let manifests = pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(core::list_snapshots_core(&self.inner))
+            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
+        manifests
+            .into_iter()
+            .map(|m| convert::snapshot_manifest_to_py(py, m))
+            .collect()
+    }
+
+    /// Restore the database to a specific snapshot.
+    fn restore_snapshot(&self, snapshot_id: &str) -> PyResult<()> {
+        pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(core::restore_snapshot_core(&self.inner, snapshot_id))
+            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+    }
+
+    // -----------------------------------------------------------------------
+    // Index administration
+    // -----------------------------------------------------------------------
+
+    /// Get status of background index rebuild tasks.
+    fn index_rebuild_status(
+        &self,
+        py: Python,
+    ) -> PyResult<Vec<crate::types::IndexRebuildTaskInfo>> {
+        let tasks = pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(core::index_rebuild_status_core(&self.inner))
+            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
+        tasks
+            .into_iter()
+            .map(|t| convert::index_rebuild_task_to_py(py, t))
+            .collect()
+    }
+
+    /// Retry failed index rebuild tasks. Returns task IDs scheduled for retry.
+    fn retry_index_rebuilds(&self) -> PyResult<Vec<String>> {
+        pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(core::retry_index_rebuilds_core(&self.inner))
+            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+    }
+
+    /// Force rebuild indexes for a label. If async_=True, returns a task ID.
+    #[pyo3(signature = (label, async_=false))]
+    fn rebuild_indexes(&self, label: &str, async_: bool) -> PyResult<Option<String>> {
+        pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(core::rebuild_indexes_core(&self.inner, label, async_))
+            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+    }
+
+    /// Check if an index is currently being rebuilt for a label.
+    fn is_index_building(&self, label: &str) -> PyResult<bool> {
+        pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(core::is_index_building_core(&self.inner, label))
+            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+    }
+
+    /// List all indexes defined on a specific label.
+    fn list_indexes(
+        &self,
+        py: Python,
+        label: &str,
+    ) -> PyResult<Vec<crate::types::IndexDefinitionInfo>> {
+        core::list_indexes_core(&self.inner, label)
+            .into_iter()
+            .map(|i| convert::index_definition_to_py(py, i))
+            .collect()
+    }
+
+    /// List all indexes in the database.
+    fn list_all_indexes(&self, py: Python) -> PyResult<Vec<crate::types::IndexDefinitionInfo>> {
+        core::list_all_indexes_core(&self.inner)
+            .into_iter()
+            .map(|i| convert::index_definition_to_py(py, i))
+            .collect()
+    }
+}
+
+// ============================================================================
+// Xervo (synchronous)
+// ============================================================================
+
+/// Synchronous facade for Uni-Xervo embedding and generation.
+#[pyclass]
+pub struct Xervo {
+    inner: Arc<Uni>,
+}
+
+#[pymethods]
+impl Xervo {
+    /// Embed texts using a configured model alias. Returns a list of float vectors.
+    fn embed(&self, alias: &str, texts: Vec<String>) -> PyResult<Vec<Vec<f32>>> {
+        pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(core::xervo_embed_core(&self.inner, alias, texts))
+            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+    }
+
+    /// Generate text using structured messages. Returns a GenerationResult.
+    ///
+    /// Each message may be a `Message` instance or a dict with `"role"` and `"content"` keys.
+    #[pyo3(signature = (alias, messages, max_tokens=None, temperature=None, top_p=None))]
+    fn generate(
+        &self,
+        py: Python,
+        alias: &str,
+        messages: Vec<Py<PyAny>>,
+        max_tokens: Option<usize>,
+        temperature: Option<f32>,
+        top_p: Option<f32>,
+    ) -> PyResult<crate::types::PyGenerationResult> {
+        let msg_pairs = convert::extract_messages(py, messages)?;
+        let result = pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(core::xervo_generate_core(
+                &self.inner,
+                alias,
+                msg_pairs,
+                max_tokens,
+                temperature,
+                top_p,
+            ))
+            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
+        convert::generation_result_to_py(py, result)
+    }
+
+    /// Generate text from a single user prompt. Convenience wrapper around `generate()`.
+    #[pyo3(signature = (alias, prompt, max_tokens=None, temperature=None, top_p=None))]
+    fn generate_text(
+        &self,
+        py: Python,
+        alias: &str,
+        prompt: String,
+        max_tokens: Option<usize>,
+        temperature: Option<f32>,
+        top_p: Option<f32>,
+    ) -> PyResult<crate::types::PyGenerationResult> {
+        let msg_pairs = vec![("user".to_string(), prompt)];
+        let result = pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(core::xervo_generate_core(
+                &self.inner,
+                alias,
+                msg_pairs,
+                max_tokens,
+                temperature,
+                top_p,
+            ))
+            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
+        convert::generation_result_to_py(py, result)
+    }
 }

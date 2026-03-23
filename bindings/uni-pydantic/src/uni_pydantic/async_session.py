@@ -174,6 +174,19 @@ class AsyncUniSession:
         self._pending_new.clear()
         self._pending_delete.clear()
 
+    @property
+    def db(self) -> "uni_db.AsyncDatabase":
+        """Access the underlying uni_db.AsyncDatabase for low-level operations."""
+        return self._db
+
+    async def locy(self, program: str, config: dict | None = None) -> dict:
+        """
+        Evaluate a Locy program and return derived facts, stats, and warnings.
+
+        Delegates directly to the underlying ``uni_db.AsyncDatabase.locy_evaluate()``.
+        """
+        return await self._db.locy_evaluate(program, config)
+
     def register(self, *models: type[UniNode] | type[UniEdge]) -> None:
         """Register model classes with the session (sync)."""
         self._schema_gen.register(*models)

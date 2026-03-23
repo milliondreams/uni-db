@@ -202,6 +202,19 @@ class UniSession:
         self._pending_new.clear()
         self._pending_delete.clear()
 
+    @property
+    def db(self) -> "uni_db.Database":
+        """Access the underlying uni_db.Database for low-level operations."""
+        return self._db
+
+    def locy(self, program: str, config: dict | None = None) -> dict:
+        """
+        Evaluate a Locy program and return derived facts, stats, and warnings.
+
+        Delegates directly to the underlying ``uni_db.Database.locy_evaluate()``.
+        """
+        return self._db.locy_evaluate(program, config)
+
     def register(self, *models: type[UniNode] | type[UniEdge]) -> None:
         """
         Register model classes with the session.

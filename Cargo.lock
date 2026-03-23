@@ -11091,6 +11091,7 @@ dependencies = [
  "uni-common",
  "uni-db",
  "uni-locy",
+ "uni-store",
 ]
 
 [[package]]

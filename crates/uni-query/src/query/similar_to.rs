@@ -281,11 +281,67 @@ pub fn normalize_bm25(score: f32, fts_k: f32) -> f32 {
 /// Compute pure vector-vs-vector similarity (no storage access needed).
 ///
 /// Both values must be `Value::List` of numbers or `Value::Vector`.
+///
+/// Uses f64 arithmetic throughout when both inputs are `Value::List`, preserving
+/// full precision for property-based vectors (e.g. in TCK and unit tests). For
+/// `Value::Vector` (pre-indexed f32 data) it falls back to the f32 path.
 pub fn eval_similar_to_pure(v1: &Value, v2: &Value) -> Result<Value> {
+    // Fast path: at least one input is a List — use f64 to avoid f32 precision loss.
+    let has_list = matches!(v1, Value::List(_)) || matches!(v2, Value::List(_));
+    let f64_vecs = has_list
+        .then(|| value_to_f64_vec(v1).ok().zip(value_to_f64_vec(v2).ok()))
+        .flatten();
+    if let Some((vec1, vec2)) = f64_vecs {
+        let sim = cosine_similarity_f64(&vec1, &vec2)?;
+        return Ok(Value::Float(sim));
+    }
+    // Fallback: f32 path for Value::Vector (indexed data already in f32).
     let vec1 = value_to_f32_vec(v1)?;
     let vec2 = value_to_f32_vec(v2)?;
     let sim = cosine_similarity(&vec1, &vec2)?;
     Ok(Value::Float(sim as f64))
+}
+
+/// Compute cosine similarity between two f64 vectors, returning a score in [-1, 1].
+fn cosine_similarity_f64(a: &[f64], b: &[f64]) -> Result<f64, SimilarToError> {
+    if a.len() != b.len() {
+        return Err(SimilarToError::DimensionMismatch {
+            a: a.len(),
+            b: b.len(),
+        });
+    }
+    let mut dot = 0.0f64;
+    let mut mag1 = 0.0f64;
+    let mut mag2 = 0.0f64;
+    for (x, y) in a.iter().zip(b.iter()) {
+        dot += x * y;
+        mag1 += x * x;
+        mag2 += y * y;
+    }
+    let mag1 = mag1.sqrt();
+    let mag2 = mag2.sqrt();
+    if mag1 == 0.0 || mag2 == 0.0 {
+        return Ok(0.0);
+    }
+    Ok((dot / (mag1 * mag2)).clamp(-1.0, 1.0))
+}
+
+/// Convert a Value to a `Vec<f64>` for high-precision vector operations.
+fn value_to_f64_vec(v: &Value) -> Result<Vec<f64>, SimilarToError> {
+    match v {
+        Value::Vector(vec) => Ok(vec.iter().map(|&x| x as f64).collect()),
+        Value::List(list) => list
+            .iter()
+            .map(|v| {
+                v.as_f64().ok_or_else(|| SimilarToError::InvalidOption {
+                    message: "vector element must be a number".to_string(),
+                })
+            })
+            .collect(),
+        _ => Err(SimilarToError::InvalidVectorValue {
+            actual: format!("{v:?}"),
+        }),
+    }
 }
 
 /// Convert a Value to a `Vec<f32>` for vector operations.

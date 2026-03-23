@@ -539,6 +539,18 @@ pub fn extract_locy_config(
     if let Some(v) = config.get("deterministic_best_by") {
         locy_config.deterministic_best_by = v.extract::<bool>(py)?;
     }
+    if let Some(v) = config.get("strict_probability_domain") {
+        locy_config.strict_probability_domain = v.extract::<bool>(py)?;
+    }
+    if let Some(v) = config.get("probability_epsilon") {
+        locy_config.probability_epsilon = v.extract::<f64>(py)?;
+    }
+    if let Some(v) = config.get("exact_probability") {
+        locy_config.exact_probability = v.extract::<bool>(py)?;
+    }
+    if let Some(v) = config.get("max_bdd_variables") {
+        locy_config.max_bdd_variables = v.extract::<usize>(py)?;
+    }
     Ok(locy_config)
 }
 
@@ -573,5 +585,341 @@ pub fn locy_result_to_py(py: Python, result: uni_locy::LocyResult) -> PyResult<P
     }
     dict.set_item("command_results", cmd_list)?;
 
+    // warnings: Vec<RuntimeWarning> -> list of dicts
+    let warn_list = PyList::empty(py);
+    for w in result.warnings {
+        let wd = PyDict::new(py);
+        let code_str = match w.code {
+            uni_locy::RuntimeWarningCode::SharedProbabilisticDependency => {
+                "shared_probabilistic_dependency"
+            }
+            uni_locy::RuntimeWarningCode::BddLimitExceeded => "bdd_limit_exceeded",
+            uni_locy::RuntimeWarningCode::CrossGroupCorrelationNotExact => {
+                "cross_group_correlation_not_exact"
+            }
+        };
+        wd.set_item("code", code_str)?;
+        wd.set_item("message", &w.message)?;
+        wd.set_item("rule_name", &w.rule_name)?;
+        match w.variable_count {
+            Some(n) => wd.set_item("variable_count", n)?,
+            None => wd.set_item("variable_count", py.None())?,
+        }
+        match w.key_group {
+            Some(ref g) => wd.set_item("key_group", g)?,
+            None => wd.set_item("key_group", py.None())?,
+        }
+        warn_list.append(wd)?;
+    }
+    dict.set_item("warnings", warn_list)?;
+
+    // approximate_groups: HashMap<String, Vec<String>> -> Python dict of lists
+    let approx_dict = PyDict::new(py);
+    for (rule_name, groups) in result.approximate_groups {
+        let group_list = PyList::new(py, groups.iter().map(|s| s.as_str()))?;
+        approx_dict.set_item(&rule_name, group_list)?;
+    }
+    dict.set_item("approximate_groups", approx_dict)?;
+
     Ok(dict.into())
+}
+
+/// Extract a CloudStorageConfig from a Python dict.
+///
+/// The dict must have a `"provider"` key: `"s3"`, `"gcs"`, or `"azure"`.
+pub fn extract_cloud_config(
+    py: Python,
+    config: &HashMap<String, Py<PyAny>>,
+) -> PyResult<uni_common::CloudStorageConfig> {
+    let provider = config
+        .get("provider")
+        .ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "cloud_config must contain a 'provider' key",
+            )
+        })?
+        .extract::<String>(py)?;
+
+    match provider.to_lowercase().as_str() {
+        "s3" => {
+            let bucket = config
+                .get("bucket")
+                .ok_or_else(|| {
+                    PyErr::new::<pyo3::exceptions::PyValueError, _>("S3 config requires 'bucket'")
+                })?
+                .extract::<String>(py)?;
+            let region = config
+                .get("region")
+                .map(|v| v.extract::<String>(py))
+                .transpose()?;
+            let endpoint = config
+                .get("endpoint")
+                .map(|v| v.extract::<String>(py))
+                .transpose()?;
+            let access_key_id = config
+                .get("access_key_id")
+                .map(|v| v.extract::<String>(py))
+                .transpose()?;
+            let secret_access_key = config
+                .get("secret_access_key")
+                .map(|v| v.extract::<String>(py))
+                .transpose()?;
+            let session_token = config
+                .get("session_token")
+                .map(|v| v.extract::<String>(py))
+                .transpose()?;
+            let virtual_hosted_style = config
+                .get("virtual_hosted_style")
+                .map(|v| v.extract::<bool>(py))
+                .transpose()?
+                .unwrap_or(false);
+            Ok(uni_common::CloudStorageConfig::S3 {
+                bucket,
+                region,
+                endpoint,
+                access_key_id,
+                secret_access_key,
+                session_token,
+                virtual_hosted_style,
+            })
+        }
+        "gcs" => {
+            let bucket = config
+                .get("bucket")
+                .ok_or_else(|| {
+                    PyErr::new::<pyo3::exceptions::PyValueError, _>("GCS config requires 'bucket'")
+                })?
+                .extract::<String>(py)?;
+            let service_account_path = config
+                .get("service_account_path")
+                .map(|v| v.extract::<String>(py))
+                .transpose()?;
+            let service_account_key = config
+                .get("service_account_key")
+                .map(|v| v.extract::<String>(py))
+                .transpose()?;
+            Ok(uni_common::CloudStorageConfig::Gcs {
+                bucket,
+                service_account_path,
+                service_account_key,
+            })
+        }
+        "azure" => {
+            let container = config
+                .get("container")
+                .ok_or_else(|| {
+                    PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                        "Azure config requires 'container'",
+                    )
+                })?
+                .extract::<String>(py)?;
+            let account = config
+                .get("account")
+                .ok_or_else(|| {
+                    PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                        "Azure config requires 'account'",
+                    )
+                })?
+                .extract::<String>(py)?;
+            let access_key = config
+                .get("access_key")
+                .map(|v| v.extract::<String>(py))
+                .transpose()?;
+            let sas_token = config
+                .get("sas_token")
+                .map(|v| v.extract::<String>(py))
+                .transpose()?;
+            Ok(uni_common::CloudStorageConfig::Azure {
+                container,
+                account,
+                access_key,
+                sas_token,
+            })
+        }
+        other => Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "Unknown cloud provider '{}'. Expected 's3', 'gcs', or 'azure'.",
+            other
+        ))),
+    }
+}
+
+/// Extract a UniConfig from a Python dict.
+///
+/// Supports: `query_timeout` (float, seconds), `max_query_memory` (int, bytes),
+/// `parallelism` (int), `cache_size` (int, bytes).
+pub fn extract_uni_config(
+    py: Python,
+    config: &HashMap<String, Py<PyAny>>,
+) -> PyResult<uni_common::UniConfig> {
+    let mut uni_config = uni_common::UniConfig::default();
+    if let Some(v) = config.get("query_timeout") {
+        uni_config.query_timeout = std::time::Duration::from_secs_f64(v.extract::<f64>(py)?);
+    }
+    if let Some(v) = config.get("max_query_memory") {
+        uni_config.max_query_memory = v.extract::<usize>(py)?;
+    }
+    if let Some(v) = config.get("parallelism") {
+        uni_config.parallelism = v.extract::<usize>(py)?;
+    }
+    if let Some(v) = config.get("cache_size") {
+        uni_config.cache_size = v.extract::<usize>(py)?;
+    }
+    if let Some(v) = config.get("max_transaction_memory") {
+        uni_config.max_transaction_memory = v.extract::<usize>(py)?;
+    }
+    Ok(uni_config)
+}
+
+/// Convert a SnapshotManifest to a Python SnapshotInfo object.
+pub fn snapshot_manifest_to_py(
+    _py: Python,
+    manifest: uni_common::core::snapshot::SnapshotManifest,
+) -> PyResult<crate::types::SnapshotInfo> {
+    Ok(crate::types::SnapshotInfo {
+        snapshot_id: manifest.snapshot_id,
+        name: manifest.name,
+        created_at: manifest.created_at.to_rfc3339(),
+        version_hwm: manifest.version_high_water_mark,
+    })
+}
+
+/// Convert an IndexRebuildTask to a Python IndexRebuildTaskInfo object.
+pub fn index_rebuild_task_to_py(
+    _py: Python,
+    task: uni_store::storage::IndexRebuildTask,
+) -> PyResult<crate::types::IndexRebuildTaskInfo> {
+    let status = format!("{:?}", task.status).to_lowercase();
+    Ok(crate::types::IndexRebuildTaskInfo {
+        id: task.id,
+        label: task.label,
+        status,
+        created_at: task.created_at.to_rfc3339(),
+        started_at: task.started_at.map(|t| t.to_rfc3339()),
+        completed_at: task.completed_at.map(|t| t.to_rfc3339()),
+        error: task.error,
+        retry_count: task.retry_count,
+    })
+}
+
+/// Convert an IndexDefinition to a Python IndexDefinitionInfo object.
+pub fn index_definition_to_py(
+    _py: Python,
+    idx: uni_common::core::schema::IndexDefinition,
+) -> PyResult<crate::types::IndexDefinitionInfo> {
+    match idx {
+        uni_common::core::schema::IndexDefinition::Scalar(cfg) => {
+            Ok(crate::types::IndexDefinitionInfo {
+                name: cfg.name,
+                index_type: format!("{:?}", cfg.index_type).to_lowercase(),
+                label: cfg.label,
+                properties: cfg.properties,
+                state: format!("{:?}", cfg.metadata.status).to_lowercase(),
+            })
+        }
+        uni_common::core::schema::IndexDefinition::Vector(cfg) => {
+            Ok(crate::types::IndexDefinitionInfo {
+                name: cfg.name,
+                index_type: "vector".to_string(),
+                label: cfg.label,
+                properties: vec![cfg.property],
+                state: format!("{:?}", cfg.metadata.status).to_lowercase(),
+            })
+        }
+        uni_common::core::schema::IndexDefinition::FullText(cfg) => {
+            Ok(crate::types::IndexDefinitionInfo {
+                name: cfg.name,
+                index_type: "fulltext".to_string(),
+                label: cfg.label,
+                properties: cfg.properties,
+                state: format!("{:?}", cfg.metadata.status).to_lowercase(),
+            })
+        }
+        uni_common::core::schema::IndexDefinition::Inverted(cfg) => {
+            Ok(crate::types::IndexDefinitionInfo {
+                name: cfg.name,
+                index_type: "inverted".to_string(),
+                label: cfg.label,
+                properties: vec![cfg.property],
+                state: format!("{:?}", cfg.metadata.status).to_lowercase(),
+            })
+        }
+        uni_common::core::schema::IndexDefinition::JsonFullText(cfg) => {
+            Ok(crate::types::IndexDefinitionInfo {
+                name: cfg.name,
+                index_type: "json_fulltext".to_string(),
+                label: cfg.label,
+                properties: vec![cfg.column],
+                state: format!("{:?}", cfg.metadata.status).to_lowercase(),
+            })
+        }
+        _ => Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "Unknown index definition type",
+        )),
+    }
+}
+
+/// Extract a list of (role, content) pairs from Python objects.
+///
+/// Each element may be a `Message` instance or a dict with `"role"` and `"content"` keys.
+pub fn extract_messages(py: Python, messages: Vec<Py<PyAny>>) -> PyResult<Vec<(String, String)>> {
+    messages
+        .into_iter()
+        .enumerate()
+        .map(|(i, obj)| {
+            let bound = obj.bind(py);
+            // Try as PyMessage instance first
+            if let Ok(msg) = bound.extract::<crate::types::PyMessage>() {
+                return Ok((msg.role, msg.content));
+            }
+            // Try as dict
+            if let Ok(dict) = bound.cast::<pyo3::types::PyDict>() {
+                let role: String = dict
+                    .get_item("role")?
+                    .ok_or_else(|| {
+                        pyo3::exceptions::PyTypeError::new_err(format!(
+                            "messages[{}]: dict missing 'role' key",
+                            i
+                        ))
+                    })?
+                    .extract()?;
+                let content: String = dict
+                    .get_item("content")?
+                    .ok_or_else(|| {
+                        pyo3::exceptions::PyTypeError::new_err(format!(
+                            "messages[{}]: dict missing 'content' key",
+                            i
+                        ))
+                    })?
+                    .extract()?;
+                return Ok((role, content));
+            }
+            Err(pyo3::exceptions::PyTypeError::new_err(format!(
+                "messages[{}]: expected Message or dict, got {}",
+                i,
+                bound.get_type().name()?
+            )))
+        })
+        .collect()
+}
+
+/// Convert a GenerationResult to Python types.
+pub fn generation_result_to_py(
+    py: Python,
+    result: ::uni_db::api::xervo::GenerationResult,
+) -> PyResult<crate::types::PyGenerationResult> {
+    let usage = result
+        .usage
+        .map(|u| {
+            let tu = crate::types::PyTokenUsage {
+                prompt_tokens: u.prompt_tokens,
+                completion_tokens: u.completion_tokens,
+                total_tokens: u.total_tokens,
+            };
+            Py::new(py, tu)
+        })
+        .transpose()?;
+    Ok(crate::types::PyGenerationResult {
+        text: result.text,
+        usage,
+    })
 }

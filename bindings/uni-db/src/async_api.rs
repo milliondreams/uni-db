@@ -64,6 +64,11 @@ impl AsyncDatabase {
             hybrid_remote: None,
             cache_size: None,
             parallelism: None,
+            schema_file: None,
+            xervo_catalog_json: None,
+            xervo_catalog_file: None,
+            cloud_config: None,
+            uni_config: None,
         }
     }
 
@@ -577,6 +582,220 @@ impl AsyncDatabase {
             Python::attach(|py| convert::locy_result_to_py(py, result))
         })
     }
+
+    /// Get an AsyncXervo facade for embedding and generation operations.
+    fn xervo(&self) -> PyResult<AsyncXervo> {
+        Ok(AsyncXervo {
+            inner: self.inner.clone(),
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Snapshot management
+    // -----------------------------------------------------------------------
+
+    /// Create a point-in-time snapshot. Returns the snapshot ID.
+    #[pyo3(signature = (name=None))]
+    fn create_snapshot<'py>(
+        &self,
+        py: Python<'py>,
+        name: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let db = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            core::create_snapshot_core(&db, name)
+                .await
+                .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+        })
+    }
+
+    /// List all available snapshots.
+    fn list_snapshots<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let db = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let manifests = core::list_snapshots_core(&db)
+                .await
+                .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
+            Python::attach(|py| {
+                manifests
+                    .into_iter()
+                    .map(|m| convert::snapshot_manifest_to_py(py, m))
+                    .collect::<PyResult<Vec<_>>>()
+            })
+        })
+    }
+
+    /// Restore the database to a specific snapshot.
+    fn restore_snapshot<'py>(
+        &self,
+        py: Python<'py>,
+        snapshot_id: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let db = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            core::restore_snapshot_core(&db, &snapshot_id)
+                .await
+                .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Index administration
+    // -----------------------------------------------------------------------
+
+    /// Get status of background index rebuild tasks.
+    fn index_rebuild_status<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let db = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let tasks = core::index_rebuild_status_core(&db)
+                .await
+                .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
+            Python::attach(|py| {
+                tasks
+                    .into_iter()
+                    .map(|t| convert::index_rebuild_task_to_py(py, t))
+                    .collect::<PyResult<Vec<_>>>()
+            })
+        })
+    }
+
+    /// Retry failed index rebuild tasks.
+    fn retry_index_rebuilds<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let db = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            core::retry_index_rebuilds_core(&db)
+                .await
+                .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+        })
+    }
+
+    /// Force rebuild indexes for a label. If async_=True, returns a task ID.
+    #[pyo3(signature = (label, async_=false))]
+    fn rebuild_indexes<'py>(
+        &self,
+        py: Python<'py>,
+        label: String,
+        async_: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let db = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            core::rebuild_indexes_core(&db, &label, async_)
+                .await
+                .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+        })
+    }
+
+    /// Check if an index is currently being rebuilt for a label.
+    fn is_index_building<'py>(
+        &self,
+        py: Python<'py>,
+        label: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let db = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            core::is_index_building_core(&db, &label)
+                .await
+                .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+        })
+    }
+
+    /// List all indexes defined on a specific label.
+    fn list_indexes<'py>(
+        &self,
+        py: Python<'py>,
+        label: String,
+    ) -> PyResult<Vec<crate::types::IndexDefinitionInfo>> {
+        core::list_indexes_core(&self.inner, &label)
+            .into_iter()
+            .map(|i| convert::index_definition_to_py(py, i))
+            .collect()
+    }
+
+    /// List all indexes in the database.
+    fn list_all_indexes<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Vec<crate::types::IndexDefinitionInfo>> {
+        core::list_all_indexes_core(&self.inner)
+            .into_iter()
+            .map(|i| convert::index_definition_to_py(py, i))
+            .collect()
+    }
+}
+
+// ============================================================================
+// AsyncXervo
+// ============================================================================
+
+/// Async facade for Uni-Xervo embedding and generation.
+#[pyclass]
+pub struct AsyncXervo {
+    inner: Arc<Uni>,
+}
+
+#[pymethods]
+impl AsyncXervo {
+    /// Embed texts using a configured model alias (async).
+    fn embed<'py>(
+        &self,
+        py: Python<'py>,
+        alias: String,
+        texts: Vec<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let db = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            core::xervo_embed_core(&db, &alias, texts)
+                .await
+                .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+        })
+    }
+
+    /// Generate text using structured messages (async).
+    ///
+    /// Each message may be a `Message` instance or a dict with `"role"` and `"content"` keys.
+    #[pyo3(signature = (alias, messages, max_tokens=None, temperature=None, top_p=None))]
+    fn generate<'py>(
+        &self,
+        py: Python<'py>,
+        alias: String,
+        messages: Vec<Py<PyAny>>,
+        max_tokens: Option<usize>,
+        temperature: Option<f32>,
+        top_p: Option<f32>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let db = self.inner.clone();
+        // Extract messages while the GIL is held, before entering the async block.
+        let msg_pairs = crate::convert::extract_messages(py, messages)?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let result =
+                core::xervo_generate_core(&db, &alias, msg_pairs, max_tokens, temperature, top_p)
+                    .await
+                    .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
+            Python::attach(|py| crate::convert::generation_result_to_py(py, result))
+        })
+    }
+
+    /// Generate text from a single user prompt (async). Convenience wrapper around `generate()`.
+    #[pyo3(signature = (alias, prompt, max_tokens=None, temperature=None, top_p=None))]
+    fn generate_text<'py>(
+        &self,
+        py: Python<'py>,
+        alias: String,
+        prompt: String,
+        max_tokens: Option<usize>,
+        temperature: Option<f32>,
+        top_p: Option<f32>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let db = self.inner.clone();
+        let msg_pairs = vec![("user".to_string(), prompt)];
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let result =
+                core::xervo_generate_core(&db, &alias, msg_pairs, max_tokens, temperature, top_p)
+                    .await
+                    .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
+            Python::attach(|py| crate::convert::generation_result_to_py(py, result))
+        })
+    }
 }
 
 // ============================================================================
@@ -593,6 +812,11 @@ pub struct AsyncDatabaseBuilder {
     hybrid_remote: Option<String>,
     cache_size: Option<usize>,
     parallelism: Option<usize>,
+    schema_file: Option<String>,
+    xervo_catalog_json: Option<String>,
+    xervo_catalog_file: Option<String>,
+    cloud_config: Option<uni_common::CloudStorageConfig>,
+    uni_config: Option<uni_common::UniConfig>,
 }
 
 #[pymethods]
@@ -607,6 +831,11 @@ impl AsyncDatabaseBuilder {
             hybrid_remote: None,
             cache_size: None,
             parallelism: None,
+            schema_file: None,
+            xervo_catalog_json: None,
+            xervo_catalog_file: None,
+            cloud_config: None,
+            uni_config: None,
         }
     }
 
@@ -620,6 +849,11 @@ impl AsyncDatabaseBuilder {
             hybrid_remote: None,
             cache_size: None,
             parallelism: None,
+            schema_file: None,
+            xervo_catalog_json: None,
+            xervo_catalog_file: None,
+            cloud_config: None,
+            uni_config: None,
         }
     }
 
@@ -633,6 +867,11 @@ impl AsyncDatabaseBuilder {
             hybrid_remote: None,
             cache_size: None,
             parallelism: None,
+            schema_file: None,
+            xervo_catalog_json: None,
+            xervo_catalog_file: None,
+            cloud_config: None,
+            uni_config: None,
         }
     }
 
@@ -646,6 +885,11 @@ impl AsyncDatabaseBuilder {
             hybrid_remote: None,
             cache_size: None,
             parallelism: None,
+            schema_file: None,
+            xervo_catalog_json: None,
+            xervo_catalog_file: None,
+            cloud_config: None,
+            uni_config: None,
         }
     }
 
@@ -678,6 +922,46 @@ impl AsyncDatabaseBuilder {
         slf
     }
 
+    /// Load schema from a JSON file on initialization.
+    fn schema_file(mut slf: PyRefMut<'_, Self>, path: String) -> PyRefMut<'_, Self> {
+        slf.schema_file = Some(path);
+        slf
+    }
+
+    /// Configure the Xervo model catalog from a JSON string.
+    fn xervo_catalog_from_str(mut slf: PyRefMut<'_, Self>, json: String) -> PyRefMut<'_, Self> {
+        slf.xervo_catalog_json = Some(json);
+        slf.xervo_catalog_file = None;
+        slf
+    }
+
+    /// Configure the Xervo model catalog from a JSON file path.
+    fn xervo_catalog_from_file(mut slf: PyRefMut<'_, Self>, path: String) -> PyRefMut<'_, Self> {
+        slf.xervo_catalog_file = Some(path);
+        slf.xervo_catalog_json = None;
+        slf
+    }
+
+    /// Configure cloud storage credentials (dict with 'provider' key: 's3', 'gcs', or 'azure').
+    fn cloud_config(
+        mut slf: PyRefMut<'_, Self>,
+        config: std::collections::HashMap<String, Py<PyAny>>,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        let py = slf.py();
+        slf.cloud_config = Some(crate::convert::extract_cloud_config(py, &config)?);
+        Ok(slf)
+    }
+
+    /// Configure database options (query_timeout, max_query_memory, etc.).
+    fn config(
+        mut slf: PyRefMut<'_, Self>,
+        config: std::collections::HashMap<String, Py<PyAny>>,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        let py = slf.py();
+        slf.uni_config = Some(crate::convert::extract_uni_config(py, &config)?);
+        Ok(slf)
+    }
+
     /// Build and return the AsyncDatabase instance (returns awaitable).
     fn build<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let uri = self.uri.clone();
@@ -686,6 +970,11 @@ impl AsyncDatabaseBuilder {
         let hybrid_remote = self.hybrid_remote.clone();
         let cache_size = self.cache_size;
         let parallelism = self.parallelism;
+        let schema_file = self.schema_file.clone();
+        let xervo_catalog_json = self.xervo_catalog_json.clone();
+        let xervo_catalog_file = self.xervo_catalog_file.clone();
+        let cloud_config = self.cloud_config.clone();
+        let uni_config = self.uni_config.clone();
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let uni = core::build_database_core(
@@ -695,6 +984,11 @@ impl AsyncDatabaseBuilder {
                 hybrid_remote.as_deref(),
                 cache_size,
                 parallelism,
+                schema_file.as_deref(),
+                xervo_catalog_json.as_deref(),
+                xervo_catalog_file.as_deref(),
+                cloud_config,
+                uni_config,
             )
             .await
             .map_err(PyErr::new::<pyo3::exceptions::PyIOError, _>)?;

@@ -189,3 +189,168 @@ impl LocyStats {
         )
     }
 }
+
+// ============================================================================
+// Xervo types
+// ============================================================================
+
+/// A message in a conversation (role + text content).
+#[pyclass(get_all, name = "Message")]
+#[derive(Debug, Clone)]
+pub struct PyMessage {
+    /// Role: "user", "assistant", or "system".
+    pub role: String,
+    /// Text content of the message.
+    pub content: String,
+}
+
+#[pymethods]
+impl PyMessage {
+    #[new]
+    fn new(role: String, content: String) -> Self {
+        Self { role, content }
+    }
+
+    /// Create a user message.
+    #[staticmethod]
+    fn user(text: String) -> Self {
+        Self {
+            role: "user".to_string(),
+            content: text,
+        }
+    }
+
+    /// Create an assistant message.
+    #[staticmethod]
+    fn assistant(text: String) -> Self {
+        Self {
+            role: "assistant".to_string(),
+            content: text,
+        }
+    }
+
+    /// Create a system message.
+    #[staticmethod]
+    fn system(text: String) -> Self {
+        Self {
+            role: "system".to_string(),
+            content: text,
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!("Message(role='{}', content='{}')", self.role, self.content)
+    }
+}
+
+/// Token usage statistics from a generation call.
+#[pyclass(get_all, name = "TokenUsage")]
+#[derive(Debug, Clone)]
+pub struct PyTokenUsage {
+    pub prompt_tokens: usize,
+    pub completion_tokens: usize,
+    pub total_tokens: usize,
+}
+
+#[pymethods]
+impl PyTokenUsage {
+    fn __repr__(&self) -> String {
+        format!(
+            "TokenUsage(prompt={}, completion={}, total={})",
+            self.prompt_tokens, self.completion_tokens, self.total_tokens
+        )
+    }
+}
+
+/// Result of a Xervo generation call.
+#[pyclass(get_all, name = "GenerationResult")]
+#[derive(Debug)]
+pub struct PyGenerationResult {
+    /// The generated text.
+    pub text: String,
+    /// Token usage statistics, if available.
+    pub usage: Option<Py<PyTokenUsage>>,
+}
+
+#[pymethods]
+impl PyGenerationResult {
+    fn __repr__(&self) -> String {
+        format!(
+            "GenerationResult(text='{}...')",
+            &self.text.chars().take(40).collect::<String>()
+        )
+    }
+}
+
+// ============================================================================
+// Snapshot + Index types
+// ============================================================================
+
+/// Information about a database snapshot.
+#[pyclass(get_all)]
+#[derive(Debug, Clone)]
+pub struct SnapshotInfo {
+    /// Unique snapshot identifier.
+    pub snapshot_id: String,
+    /// Optional human-readable name.
+    pub name: Option<String>,
+    /// ISO 8601 creation timestamp.
+    pub created_at: String,
+    /// Version high-water mark at snapshot time.
+    pub version_hwm: u64,
+}
+
+#[pymethods]
+impl SnapshotInfo {
+    fn __repr__(&self) -> String {
+        format!(
+            "SnapshotInfo(id='{}', name={:?}, created_at='{}')",
+            self.snapshot_id, self.name, self.created_at
+        )
+    }
+}
+
+/// Status of a background index rebuild task.
+#[pyclass(get_all)]
+#[derive(Debug, Clone)]
+pub struct IndexRebuildTaskInfo {
+    pub id: String,
+    pub label: String,
+    pub status: String,
+    pub created_at: String,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub error: Option<String>,
+    pub retry_count: u32,
+}
+
+#[pymethods]
+impl IndexRebuildTaskInfo {
+    fn __repr__(&self) -> String {
+        format!(
+            "IndexRebuildTaskInfo(id='{}', label='{}', status='{}')",
+            self.id, self.label, self.status
+        )
+    }
+}
+
+/// Definition of an index in the schema.
+#[pyclass(get_all)]
+#[derive(Debug, Clone)]
+pub struct IndexDefinitionInfo {
+    pub name: String,
+    pub index_type: String,
+    pub label: String,
+    pub properties: Vec<String>,
+    pub state: String,
+}
+
+#[pymethods]
+impl IndexDefinitionInfo {
+    fn __repr__(&self) -> String {
+        format!(
+            "IndexDefinitionInfo(name='{}', type='{}', label='{}')",
+            self.name, self.index_type, self.label
+        )
+    }
+}

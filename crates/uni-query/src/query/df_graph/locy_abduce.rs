@@ -79,7 +79,7 @@ pub async fn evaluate_abduce(
 
     // Phase 2: Generate candidate modifications from tree
     let mut candidates: Vec<Modification> = if query.negated {
-        extract_removal_candidates(&derivation_tree, rule, &matching)
+        extract_removal_candidates(&derivation_tree, rule, &matching, program)
     } else {
         extract_addition_candidates(rule)
     };
@@ -128,21 +128,32 @@ fn extract_removal_candidates(
     tree: &uni_locy::DerivationNode,
     rule: &CompiledRule,
     _matching: &[Row],
+    program: &CompiledProgram,
 ) -> Vec<Modification> {
     let mut candidates = Vec::new();
-    collect_leaf_candidates(tree, rule, &mut candidates);
+    collect_leaf_candidates(tree, rule, program, &mut candidates);
     candidates
 }
 
 /// Recursively collect candidates from derivation tree leaves.
+///
+/// Each leaf node carries a `rule` field naming the rule that produced it —
+/// this may differ from the top-level `rule` parameter when IS-ref children
+/// come from a different rule (e.g. a `scored_signal` leaf inside a
+/// `threat_level` derivation).  We always look up the effective rule from
+/// `program` so that `clause.match_pattern` corresponds to the correct rule.
 fn collect_leaf_candidates(
     node: &uni_locy::DerivationNode,
     rule: &CompiledRule,
+    program: &CompiledProgram,
     candidates: &mut Vec<Modification>,
 ) {
     if node.children.is_empty() && node.graph_fact.is_some() {
-        if node.clause_index < rule.clauses.len() {
-            let clause = &rule.clauses[node.clause_index];
+        // Use the node's own rule when available; fall back to the caller's rule.
+        let effective_rule: &CompiledRule = program.rule_catalog.get(&node.rule).unwrap_or(rule);
+
+        if node.clause_index < effective_rule.clauses.len() {
+            let clause = &effective_rule.clauses[node.clause_index];
             for element in &clause.match_pattern.paths {
                 extract_edge_candidates(element, &node.bindings, candidates);
             }
@@ -173,7 +184,7 @@ fn collect_leaf_candidates(
     }
 
     for child in &node.children {
-        collect_leaf_candidates(child, rule, candidates);
+        collect_leaf_candidates(child, rule, program, candidates);
     }
 }
 

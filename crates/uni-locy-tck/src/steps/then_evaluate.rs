@@ -40,11 +40,15 @@ fn parse_gherkin_value(s: &str) -> Value {
 }
 
 /// Flexible value comparison (int/float cross-compare, etc.)
+///
+/// Tolerance is 1e-6 rather than 1e-9 to accommodate f32-precision values that
+/// come from the similar_to() computation path (cosine is computed in f32 and
+/// widened to f64, introducing ~2e-8 rounding error for unit vectors).
 fn values_match(actual: &Value, expected: &Value) -> bool {
     match (actual, expected) {
-        (Value::Float(a), Value::Float(b)) => (a - b).abs() < 1e-9,
-        (Value::Int(a), Value::Float(b)) => (*a as f64 - b).abs() < 1e-9,
-        (Value::Float(a), Value::Int(b)) => (a - *b as f64).abs() < 1e-9,
+        (Value::Float(a), Value::Float(b)) => (a - b).abs() < 1e-6,
+        (Value::Int(a), Value::Float(b)) => (*a as f64 - b).abs() < 1e-6,
+        (Value::Float(a), Value::Int(b)) => (a - *b as f64).abs() < 1e-6,
         _ => actual == expected,
     }
 }
@@ -165,7 +169,52 @@ async fn derived_relation_should_contain_at_least_n_facts(
 // ── Value-Level Assertions ────────────────────────────────────────────────
 
 #[then(
-    regex = r#"^the derived relation ['"](.+)['"] should contain a fact where (.+) = (.+) and (.+) = (.+)$"#
+    regex = r#"^the derived relation ['"](.+)['"] should contain a fact where ([^ =]+) = ('[^']*'|"[^"]*"|-?\d+(?:\.\d+)?|true|false|null) and ([^ =]+) = ('[^']*'|"[^"]*"|-?\d+(?:\.\d+)?|true|false|null) and ([^ =]+) = ('[^']*'|"[^"]*"|-?\d+(?:\.\d+)?|true|false|null)$"#
+)]
+#[allow(clippy::too_many_arguments)]
+async fn derived_relation_should_contain_fact_where_and_and(
+    world: &mut LocyWorld,
+    relation: String,
+    f1: String,
+    v1: String,
+    f2: String,
+    v2: String,
+    f3: String,
+    v3: String,
+) {
+    let locy_result = world.locy_result().expect("No evaluation result found");
+    let result = locy_result.as_ref().expect("Evaluation failed");
+    let facts = result
+        .derived
+        .get(&relation)
+        .unwrap_or_else(|| panic!("No derived relation '{}'", relation));
+
+    let expected1 = parse_gherkin_value(&v1);
+    let expected2 = parse_gherkin_value(&v2);
+    let expected3 = parse_gherkin_value(&v3);
+
+    let found = facts.iter().any(|row| {
+        let m1 = extract_field_value(row, f1.trim())
+            .map(|v| values_match(v, &expected1))
+            .unwrap_or(false);
+        let m2 = extract_field_value(row, f2.trim())
+            .map(|v| values_match(v, &expected2))
+            .unwrap_or(false);
+        let m3 = extract_field_value(row, f3.trim())
+            .map(|v| values_match(v, &expected3))
+            .unwrap_or(false);
+        m1 && m2 && m3
+    });
+
+    assert!(
+        found,
+        "Expected derived relation '{}' to contain a fact where {} = {} and {} = {} and {} = {}, but no match found in {} facts",
+        relation, f1, v1, f2, v2, f3, v3, facts.len()
+    );
+}
+
+#[then(
+    regex = r#"^the derived relation ['"](.+)['"] should contain a fact where ([^ =]+) = ('[^']*'|"[^"]*"|-?\d+(?:\.\d+)?|true|false|null) and ([^ =]+) = ('[^']*'|"[^"]*"|-?\d+(?:\.\d+)?|true|false|null)$"#
 )]
 async fn derived_relation_should_contain_fact_where_and(
     world: &mut LocyWorld,

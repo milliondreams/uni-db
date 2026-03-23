@@ -419,12 +419,44 @@ impl DerivedFactSource for NativeExecutionAdapter<'_> {
                     message: e.to_string(),
                 })?;
 
+        // When a savepoint transaction is active (e.g., inside ASSUME/ABDUCE mutations),
+        // the stored graph_ctx was built before the savepoint mutations and its L0Context
+        // does not include the transaction-local L0 buffer. Rebuild a temporary context
+        // that includes transaction_l0 so pattern queries see the hypothetical state.
+        let transaction_ctx: Option<Arc<uni_query::query::df_graph::GraphExecutionContext>> =
+            if let Some(writer_arc) = &self.db.writer {
+                if let Ok(writer) = writer_arc.try_read() {
+                    if writer.transaction_l0.is_some() {
+                        let l0_ctx = uni_query::query::df_graph::L0Context {
+                            current_l0: Some(writer.l0_manager.get_current()),
+                            transaction_l0: writer.transaction_l0.clone(),
+                            pending_flush_l0s: writer.l0_manager.get_pending_flush(),
+                        };
+                        Some(Arc::new(
+                            uni_query::query::df_graph::GraphExecutionContext::with_l0_context(
+                                self.db.storage.clone(),
+                                l0_ctx,
+                                self.graph_ctx.property_manager().clone(),
+                            ),
+                        ))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+        let effective_ctx = transaction_ctx.as_ref().unwrap_or(&self.graph_ctx);
+
         // Use the fixpoint planner's execution contexts directly via execute_subplan.
         uni_query::query::df_graph::common::execute_subplan(
             &logical_plan,
             &HashMap::new(),
             &HashMap::new(),
-            &self.graph_ctx,
+            effective_ctx,
             &self.session_ctx,
             &self.db.storage,
             &self.db.schema.schema(),

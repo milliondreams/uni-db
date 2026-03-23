@@ -21,20 +21,19 @@ use super::locy_delta::{
     KeyTuple, RowStore, extract_cypher_conditions, extract_key, resolve_clause_with_is_refs,
 };
 
-use super::locy_eval::{eval_expr, record_batches_to_locy_rows};
+use super::locy_eval::{eval_expr, record_batches_to_locy_rows, values_equal_for_join};
 use super::locy_slg::SLGResolver;
 use super::locy_traits::DerivedFactSource;
 
-/// Input dependency recorded for a derived fact: the source IS-ref rule and
-/// the hash of the source fact.
-#[derive(Clone)]
+/// Input dependency for a derived fact: IS-ref rule and source fact hash.
+#[derive(Clone, Debug)]
 pub struct DerivationInput {
     pub is_ref_rule: String,
     pub fact_hash: Vec<u8>,
 }
 
-/// Provenance record for a single derived fact, recorded during fixpoint iteration.
-#[derive(Clone)]
+/// Provenance record for a derived fact from fixpoint iteration.
+#[derive(Clone, Debug)]
 pub struct DerivationEntry {
     /// Name of the rule that derived this fact.
     pub rule_name: String,
@@ -50,11 +49,12 @@ pub struct DerivationEntry {
     pub fact_row: Row,
 }
 
-/// Tracks provenance of derived facts recorded during fixpoint iteration.
+/// Tracks provenance of derived facts from fixpoint iteration.
 ///
 /// Enables Mode A (provenance-based) EXPLAIN without re-execution.
-/// First-derivation-wins semantics: once a fact hash is recorded, subsequent
-/// iterations do not overwrite it.
+/// First-derivation-wins: once a fact hash is recorded, later iterations
+/// do not overwrite it.
+#[derive(Debug)]
 pub struct DerivationTracker {
     entries: RwLock<HashMap<Vec<u8>, DerivationEntry>>,
 }
@@ -148,7 +148,7 @@ fn explain_rule_mode_a(
     query: &ExplainRule,
     program: &CompiledProgram,
     tracker: &DerivationTracker,
-    derived_store: &RowStore,
+    _derived_store: &RowStore,
     approximate_groups: Option<&HashMap<String, Vec<String>>>,
 ) -> Result<DerivationNode, LocyError> {
     let rule_name = query.rule_name.to_string();
@@ -181,14 +181,6 @@ fn explain_rule_mode_a(
             message: format!("no tracker entries match WHERE clause for rule '{rule_name}'"),
         });
     }
-
-    // Also check orchestrator store for any additional facts not in tracker
-    // (e.g., facts derived outside the native fixpoint path)
-    let orch_facts = derived_store
-        .get(&rule_name)
-        .map(|r| r.rows.clone())
-        .unwrap_or_default();
-    let _ = orch_facts; // available for future use
 
     let is_approximate = approximate_groups
         .map(|ag| ag.contains_key(&rule_name))
@@ -385,8 +377,10 @@ fn build_derivation_node<'a>(
             });
         }
 
-        // All yield columns (key + non-key) for exact row matching
-        let yield_columns: Vec<String> = rule.yield_schema.iter().map(|c| c.name.clone()).collect();
+        // Match on KEY columns only.  Clause-level resolution returns only
+        // base graph bindings (vertex/edge identifiers); non-KEY yield columns
+        // (FOLD-aggregated, similar_to, etc.) are absent from those rows.
+        // KEY columns uniquely identify a derived fact, so this is sufficient.
 
         // Try each clause to find the one that produced this fact
         for (clause_idx, clause) in rule.clauses.iter().enumerate() {
@@ -409,10 +403,16 @@ fn build_derivation_node<'a>(
                 record_batches_to_locy_rows(&raw_batches)
             };
 
-            // Match on ALL yield columns (not just key columns) to find exact row
-            let matching_row = resolved
-                .iter()
-                .find(|row| yield_columns.iter().all(|k| row.get(k) == fact.get(k)));
+            // Use values_equal_for_join for VID/EID-based comparison: sidecar
+            // schema mode can add `overflow_json: Null` to nodes in some query
+            // paths, making structural equality unreliable.
+            let matching_row = resolved.iter().find(|row| {
+                key_columns.iter().all(|k| match (row.get(k), fact.get(k)) {
+                    (Some(v1), Some(v2)) => values_equal_for_join(v1, v2),
+                    (None, None) => true,
+                    _ => false,
+                })
+            });
 
             if let Some(evidence_row) = matching_row {
                 let along_values = extract_along_values(fact, rule);
@@ -443,40 +443,24 @@ fn build_derivation_node<'a>(
                                 .filter(|ref_fact| {
                                     let subjects_match =
                                         is_ref.subjects.iter().enumerate().all(|(i, subject)| {
-                                            if i < ref_key_columns.len() {
-                                                let subject_val = evidence_row
-                                                    .get(subject)
-                                                    .or_else(|| fact.get(subject));
-                                                match subject_val {
-                                                    Some(val) => {
-                                                        ref_fact.get(&ref_key_columns[i])
-                                                            == Some(val)
-                                                    }
-                                                    None => true,
-                                                }
-                                            } else {
-                                                true
-                                            }
+                                            binding_matches_key(
+                                                evidence_row,
+                                                fact,
+                                                subject,
+                                                ref_fact,
+                                                ref_key_columns.get(i),
+                                            )
                                         });
-                                    let target_matches = if let Some(target) = &is_ref.target {
-                                        let target_idx = is_ref.subjects.len();
-                                        if target_idx < ref_key_columns.len() {
-                                            let target_val = evidence_row
-                                                .get(target)
-                                                .or_else(|| fact.get(target));
-                                            match target_val {
-                                                Some(val) => {
-                                                    ref_fact.get(&ref_key_columns[target_idx])
-                                                        == Some(val)
-                                                }
-                                                None => true,
-                                            }
-                                        } else {
-                                            true
-                                        }
-                                    } else {
-                                        true
-                                    };
+                                    let target_matches =
+                                        is_ref.target.as_ref().is_none_or(|target| {
+                                            binding_matches_key(
+                                                evidence_row,
+                                                fact,
+                                                target,
+                                                ref_fact,
+                                                ref_key_columns.get(is_ref.subjects.len()),
+                                            )
+                                        });
                                     subjects_match && target_matches
                                 })
                                 .collect();
@@ -534,6 +518,29 @@ fn build_derivation_node<'a>(
             approximate: false,
         })
     })
+}
+
+/// Check if a binding variable matches a ref-fact key column via VID-based join.
+///
+/// Looks up `var_name` in `primary` (falling back to `fallback`), then compares
+/// it against `ref_key_col` in `ref_fact` using `values_equal_for_join`.
+/// Returns `true` when the key column is out of range or the binding is absent.
+fn binding_matches_key(
+    primary: &Row,
+    fallback: &Row,
+    var_name: &str,
+    ref_fact: &Row,
+    ref_key_col: Option<&String>,
+) -> bool {
+    let Some(key_col) = ref_key_col else {
+        return true;
+    };
+    let Some(val) = primary.get(var_name).or_else(|| fallback.get(var_name)) else {
+        return true;
+    };
+    ref_fact
+        .get(key_col)
+        .is_some_and(|rv| values_equal_for_join(rv, val))
 }
 
 fn extract_along_values(fact: &Row, rule: &CompiledRule) -> HashMap<String, Value> {

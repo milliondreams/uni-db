@@ -110,6 +110,33 @@ fn dispatch_body_command<'a>(
     Box::pin(async move {
         match cmd {
             CompiledCommand::GoalQuery(gq) => {
+                // For FOLD rules (MNOR/MPROD), the SLG resolver does not apply
+                // post-fixpoint aggregation and would return raw pre-FOLD match rows.
+                // Use the pre-computed `derived_store` (which ran the full native fixpoint
+                // including FOLD aggregation) when the rule is available there.
+                // The KEY columns in derived_store rows are VIDs (not full Node objects),
+                // so WHERE filters on properties are skipped; only RETURN projection is applied.
+                let rule_name_str = gq.rule_name.to_string();
+                let is_fold_rule = program
+                    .rule_catalog
+                    .get(&rule_name_str)
+                    .map(|r| r.clauses.iter().any(|c| !c.fold.is_empty()))
+                    .unwrap_or(false);
+
+                let fold_relation = if is_fold_rule {
+                    derived_store.get(&rule_name_str)
+                } else {
+                    None
+                };
+                if let Some(relation) = fold_relation {
+                    let rows = relation.rows.clone();
+                    let projected = super::locy_query::apply_return_clause(rows, &gq.return_clause)
+                        .map_err(|e| LocyError::QueryResolutionError {
+                            message: format!("ASSUME FOLD query projection: {e}"),
+                        })?;
+                    return Ok(CommandResult::Query(projected));
+                }
+
                 let rows = super::locy_query::evaluate_query(
                     gq,
                     program,

@@ -1,0 +1,24 @@
+{
+  "edge_types": {
+    "CITES": { "id": 1, "src_labels": [], "dst_labels": [] },
+    "LINK": { "id": 2, "src_labels": [], "dst_labels": [] }
+  },
+  "indexes": [],
+  "labels": {
+    "Doc": { "id": 1 },
+    "Node": { "id": 2 }
+  },
+  "properties": {
+    "Doc": {
+      "name": { "type": "String", "nullable": true },
+      "embedding": { "type": "CypherValue", "nullable": true }
+    },
+    "Node": {
+      "name": { "type": "String", "nullable": true }
+    },
+    "LINK": {
+      "rel": { "type": "Float64", "nullable": true }
+    }
+  },
+  "schema_version": 1
+}

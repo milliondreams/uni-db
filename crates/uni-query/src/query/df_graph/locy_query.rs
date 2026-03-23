@@ -77,7 +77,7 @@ pub async fn evaluate_query(
 }
 
 /// Apply a RETURN clause (projection, ordering, skip, limit) to results.
-fn apply_return_clause(
+pub(super) fn apply_return_clause(
     rows: Vec<Row>,
     return_clause: &Option<uni_cypher::ast::ReturnClause>,
 ) -> Result<Vec<Row>, LocyError> {
@@ -96,7 +96,7 @@ fn apply_return_clause(
                     ReturnItem::All => return Ok(row.clone()),
                     ReturnItem::Expr { expr, alias, .. } => {
                         let value = eval_expr(expr, &row)?;
-                        let name = alias.clone().unwrap_or_else(|| format!("{expr:?}"));
+                        let name = alias.clone().unwrap_or_else(|| return_item_name(expr));
                         new_row.insert(name, value);
                     }
                 }
@@ -149,4 +149,17 @@ fn apply_return_clause(
     }
 
     Ok(projected)
+}
+
+/// Derive a column name from a RETURN expression when no alias is given.
+///
+/// Follows OpenCypher convention: `RETURN p` yields `"p"`,
+/// `RETURN a.name` yields `"a.name"`.  Falls back to `Debug` for
+/// complex expressions.
+fn return_item_name(expr: &Expr) -> String {
+    match expr {
+        Expr::Variable(v) => v.clone(),
+        Expr::Property(base, prop) => format!("{}.{}", return_item_name(base), prop),
+        _ => format!("{expr:?}"),
+    }
 }

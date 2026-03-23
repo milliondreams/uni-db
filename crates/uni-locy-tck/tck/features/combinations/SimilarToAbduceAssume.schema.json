@@ -1,0 +1,32 @@
+{
+  "edge_types": {
+    "CANDIDATE": { "id": 1, "src_labels": [], "dst_labels": [] },
+    "ALERT": { "id": 2, "src_labels": [], "dst_labels": [] }
+  },
+  "indexes": [],
+  "labels": {
+    "Doc": { "id": 1 },
+    "Query": { "id": 2 },
+    "Signal": { "id": 3 },
+    "Asset": { "id": 4 }
+  },
+  "properties": {
+    "Doc": {
+      "name": { "type": "String", "nullable": true },
+      "embedding": { "type": "CypherValue", "nullable": true }
+    },
+    "Query": {
+      "name": { "type": "String", "nullable": true },
+      "vec": { "type": "CypherValue", "nullable": true }
+    },
+    "Signal": {
+      "name": { "type": "String", "nullable": true },
+      "vec": { "type": "CypherValue", "nullable": true }
+    },
+    "Asset": {
+      "name": { "type": "String", "nullable": true },
+      "ref_vec": { "type": "CypherValue", "nullable": true }
+    }
+  },
+  "schema_version": 1
+}

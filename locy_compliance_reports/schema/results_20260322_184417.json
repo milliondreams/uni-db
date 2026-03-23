@@ -360,6 +360,552 @@
     ]
   },
   {
+    "name": "AssumeAbduce",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/combinations/AssumeAbduce.feature",
+    "elements": [
+      {
+        "type": "scenario",
+        "name": "ASSUME then ABDUCE on same rule parses",
+        "line": 13,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "ASSUME then ABDUCE on same rule parses",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "ASSUME extends reachability then ABDUCE breaks it",
+        "line": 25,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "ASSUME extends reachability then ABDUCE breaks it",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "ASSUME with PROB rules then ABDUCE on same PROB rules",
+        "line": 45,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "ASSUME with PROB rules then ABDUCE on same PROB rules",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "ExplainCombinations",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/combinations/ExplainCombinations.feature",
+    "elements": [
+      {
+        "type": "scenario",
+        "name": "EXPLAIN on MNOR rule parses",
+        "line": 13,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "EXPLAIN on MNOR rule parses",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "EXPLAIN on IS NOT complement rule parses",
+        "line": 24,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "EXPLAIN on IS NOT complement rule parses",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "EXPLAIN on similar_to rule parses",
+        "line": 38,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "EXPLAIN on similar_to rule parses",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "EXPLAIN on MNOR rule returns derivation tree",
+        "line": 50,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "EXPLAIN on MNOR rule returns derivation tree",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "EXPLAIN on IS NOT complement rule returns derivation tree",
+        "line": 69,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "EXPLAIN on IS NOT complement rule returns derivation tree",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "EXPLAIN on similar_to-derived rule returns derivation tree",
+        "line": 91,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "EXPLAIN on similar_to-derived rule returns derivation tree",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "PathCombinations",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/combinations/PathCombinations.feature",
+    "elements": [
+      {
+        "type": "scenario",
+        "name": "similar_to in ALONG accumulator parses",
+        "line": 12,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "similar_to in ALONG accumulator parses",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "ALONG with edge weight then MNOR fold parses",
+        "line": 27,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "ALONG with edge weight then MNOR fold parses",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "similar_to carried along citation path",
+        "line": 49,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "similar_to carried along citation path",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "ALONG edge reliability aggregated by MNOR across multiple paths",
+        "line": 71,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "ALONG edge reliability aggregated by MNOR across multiple paths",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "ABDUCE NOT on ALONG-derived path rule finds edge removal",
+        "line": 97,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "ABDUCE NOT on ALONG-derived path rule finds edge removal",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "ProbAbduceAssume",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/combinations/ProbAbduceAssume.feature",
+    "elements": [
+      {
+        "type": "scenario",
+        "name": "ABDUCE NOT on MNOR rule parses",
+        "line": 13,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "ABDUCE NOT on MNOR rule parses",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "ASSUME with MNOR rule re-evaluation parses",
+        "line": 24,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "ASSUME with MNOR rule re-evaluation parses",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "ABDUCE NOT on MNOR rule finds edge removal candidate",
+        "line": 38,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "ABDUCE NOT on MNOR rule finds edge removal candidate",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "ABDUCE NOT on multi-edge MNOR rule finds edge removal",
+        "line": 56,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "ABDUCE NOT on multi-edge MNOR rule finds edge removal",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "ASSUME DELETE removes one cause, reduces MNOR probability",
+        "line": 75,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "ASSUME DELETE removes one cause, reduces MNOR probability",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "ASSUME and ABDUCE both operate on same MNOR rule",
+        "line": 96,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "ASSUME and ABDUCE both operate on same MNOR rule",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "SimilarToAbduceAssume",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/combinations/SimilarToAbduceAssume.feature",
+    "elements": [
+      {
+        "type": "scenario",
+        "name": "ABDUCE NOT on similar_to rule parses",
+        "line": 13,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "ABDUCE NOT on similar_to rule parses",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "ASSUME with similar_to MNOR rule parses",
+        "line": 23,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "ASSUME with similar_to MNOR rule parses",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "ABDUCE NOT on similar_to-derived rule finds edge removal",
+        "line": 41,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "ABDUCE NOT on similar_to-derived rule finds edge removal",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "ASSUME DELETE removes signal and reduces similar_to MNOR",
+        "line": 58,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "ASSUME DELETE removes signal and reduces similar_to MNOR",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "ASSUME CREATE adds signal and ABDUCE operates on same similar_to MNOR rule",
+        "line": 83,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "ASSUME CREATE adds signal and ABDUCE operates on same similar_to MNOR rule",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "SimilarToProbability",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/combinations/SimilarToProbability.feature",
+    "elements": [
+      {
+        "type": "scenario",
+        "name": "similar_to score in YIELD with MNOR fold parses",
+        "line": 12,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "similar_to score in YIELD with MNOR fold parses",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "similar_to with MPROD fold parses",
+        "line": 26,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "similar_to with MPROD fold parses",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "similar_to score used as YIELD column",
+        "line": 42,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "similar_to score used as YIELD column",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "similar_to fed into MNOR via two-rule pattern",
+        "line": 59,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "similar_to fed into MNOR via two-rule pattern",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "similar_to fed into MPROD via two-rule pattern",
+        "line": 82,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "similar_to fed into MPROD via two-rule pattern",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "similar_to score as PROB with IS NOT complement",
+        "line": 105,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "similar_to score as PROB with IS NOT complement",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "TripleCombinations",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/combinations/TripleCombinations.feature",
+    "elements": [
+      {
+        "type": "scenario",
+        "name": "similar_to + MNOR + IS NOT parses",
+        "line": 13,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "similar_to + MNOR + IS NOT parses",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "similar_to + PROB + ASSUME parses",
+        "line": 31,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "similar_to + PROB + ASSUME parses",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "similar_to scores aggregated by MNOR then IS NOT complement",
+        "line": 49,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "similar_to scores aggregated by MNOR then IS NOT complement",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "similar_to MNOR threat level reduced under ASSUME DELETE",
+        "line": 80,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "similar_to MNOR threat level reduced under ASSUME DELETE",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "similar_to MNOR aggregation then ABDUCE finds signal removal",
+        "line": 105,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "similar_to MNOR aggregation then ABDUCE finds signal removal",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  {
     "name": "Stratification",
     "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/compile/Stratification.feature",
     "elements": [

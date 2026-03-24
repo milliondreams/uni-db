@@ -576,6 +576,20 @@ impl AsyncDatabase {
         }
     }
 
+    /// Register Locy rules for reuse across multiple evaluate calls.
+    fn locy_compile(&self, program: &str) -> PyResult<()> {
+        self.inner
+            .locy()
+            .register(program)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+    }
+
+    /// Clear all registered Locy rules from the session.
+    fn locy_clear(&self) -> PyResult<()> {
+        self.inner.locy().clear_registry();
+        Ok(())
+    }
+
     /// Evaluate a Locy program and return derived facts, stats, and command results.
     #[pyo3(signature = (program, config=None))]
     fn locy_evaluate<'py>(

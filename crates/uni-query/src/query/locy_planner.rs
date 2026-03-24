@@ -106,6 +106,14 @@ fn infer_yield_type(
                 _ => String::new(),
             });
             if item_name == name {
+                // If the expression is a bare Variable referencing an ALONG name,
+                // infer as Float64 (ALONG bindings are numeric). Without this,
+                // `ew AS link_weight` would infer Variable("ew") as LargeUtf8.
+                if let Expr::Variable(v) = &item.expr
+                    && along_names.contains(v.as_str())
+                {
+                    return DataType::Float64;
+                }
                 return infer_expr_type(&item.expr, node_vars);
             }
         }
@@ -120,7 +128,40 @@ fn infer_expr_type(expr: &Expr, node_vars: &HashSet<String>) -> DataType {
         Expr::Literal(CypherLiteral::Integer(_)) => DataType::Int64,
         Expr::Literal(CypherLiteral::Float(_)) => DataType::Float64,
         Expr::Literal(CypherLiteral::String(_)) => DataType::LargeUtf8,
+        Expr::Literal(CypherLiteral::Bool(_)) => DataType::Boolean,
+        Expr::Literal(CypherLiteral::Null) => DataType::LargeUtf8,
         Expr::Property(_, _) => DataType::Float64,
+        // Binary operations: infer from operator and operand types.
+        Expr::BinaryOp { left, op, right } => {
+            use uni_cypher::ast::BinaryOp::*;
+            match op {
+                // Comparison and logical operators always return Boolean.
+                Eq | NotEq | Lt | LtEq | Gt | GtEq | And | Or | Xor | Regex | Contains
+                | StartsWith | EndsWith => DataType::Boolean,
+                // Arithmetic operators: infer from operands.
+                Add | Sub | Mul | Div | Mod | Pow | ApproxEq => {
+                    let lt = infer_expr_type(left, node_vars);
+                    let rt = infer_expr_type(right, node_vars);
+                    // If either operand is Float64, result is Float64.
+                    if lt == DataType::Float64 || rt == DataType::Float64 {
+                        DataType::Float64
+                    } else if lt == DataType::Int64 && rt == DataType::Int64 {
+                        DataType::Int64
+                    } else {
+                        DataType::Float64
+                    }
+                }
+            }
+        }
+        // Unary operations: infer from inner expression.
+        Expr::UnaryOp { op, expr: inner } => {
+            use uni_cypher::ast::UnaryOp;
+            match op {
+                UnaryOp::Not => DataType::Boolean,
+                UnaryOp::Neg => infer_expr_type(inner, node_vars),
+            }
+        }
+        Expr::IsNull(_) | Expr::IsNotNull(_) => DataType::Boolean,
         // Function calls: infer return type from function name.
         Expr::FunctionCall { name, args, .. } => {
             match name.to_uppercase().as_str() {
@@ -411,12 +452,12 @@ impl<'a> LocyPlanBuilder<'a> {
         &self,
         clause: &CompiledClause,
         yield_cols: &[YieldColumn],
-        is_recursive: bool,
+        _is_recursive: bool,
         stratum_rule_names: &HashSet<String>,
         rule_catalog: &HashMap<String, CompiledRule>,
         node_vars: &HashSet<String>,
-        strict_probability_domain: bool,
-        probability_epsilon: f64,
+        _strict_probability_domain: bool,
+        _probability_epsilon: f64,
     ) -> Result<LocyClausePlan> {
         // Collect node variables from THIS clause's MATCH pattern only.
         // Used for IS-ref predicates: only variables in the current MATCH
@@ -697,6 +738,16 @@ impl<'a> LocyPlanBuilder<'a> {
 
         let along_names_set: HashSet<&str> = clause.along.iter().map(|a| a.name.as_str()).collect();
 
+        // Pre-compute rewritten ALONG expressions for variable substitution.
+        // When a YIELD expression references an ALONG name (e.g., `ew * 2.0 AS score`
+        // where `ALONG ew = e.weight`), the Variable("ew") must be replaced with the
+        // underlying expression Property("e", "weight") because "ew" is not a column
+        // in the input plan schema.
+        let rewritten_along: HashMap<&str, Expr> = along_map
+            .iter()
+            .filter_map(|(&name, locy_expr)| rewrite_locy_expr(locy_expr).ok().map(|e| (name, e)))
+            .collect();
+
         let mut projections = Vec::new();
         let mut target_types = Vec::new();
         for yc in yield_cols {
@@ -707,9 +758,11 @@ impl<'a> LocyPlanBuilder<'a> {
             } else if fold_output_names.contains(yc.name.as_str()) {
                 continue;
             } else if let Some(orig_expr) = yield_expr_map.get(&yc.name) {
-                (*orig_expr).clone()
+                let e = (*orig_expr).clone();
+                substitute_along_vars(e, &rewritten_along)
             } else {
-                Expr::Variable(yc.name.clone())
+                let e = Expr::Variable(yc.name.clone());
+                substitute_along_vars(e, &rewritten_along)
             };
             projections.push((expr, Some(yc.name.clone())));
             target_types.push(infer_yield_type(
@@ -736,28 +789,11 @@ impl<'a> LocyPlanBuilder<'a> {
             target_types,
         };
 
-        // Step 7: Non-recursive FOLD wrapping
-        if !clause.fold.is_empty() && !is_recursive {
-            let key_columns: Vec<String> = yield_cols
-                .iter()
-                .filter(|yc| yc.is_key)
-                .map(|yc| yc.name.clone())
-                .collect();
-
-            let fold_bindings: Vec<(String, Expr)> = clause
-                .fold
-                .iter()
-                .map(|fb| (fb.name.clone(), fb.aggregate.clone()))
-                .collect();
-
-            plan = LogicalPlan::LocyFold {
-                input: Box::new(plan),
-                key_columns,
-                fold_bindings,
-                strict_probability_domain,
-                probability_epsilon,
-            };
-        }
+        // Step 7: Non-recursive FOLD — handled by apply_post_fixpoint_chain.
+        //
+        // Fold is always applied post-fixpoint (both recursive and non-recursive).
+        // Wrapping the body with LocyFold here would double-apply the aggregate,
+        // producing wrong results for COUNT/AVG where f(f(x)) ≠ f(x).
 
         // Step 8: BEST BY wrapping
         if let Some(best_by) = &clause.best_by {
@@ -996,6 +1032,45 @@ pub(crate) fn rewrite_locy_expr(expr: &LocyExpr) -> Result<Expr> {
             op: *op,
             expr: Box::new(rewrite_locy_expr(inner)?),
         }),
+    }
+}
+
+/// Recursively substitute `Variable(name)` nodes matching ALONG binding names
+/// with their rewritten expressions. This allows YIELD expressions like
+/// `ew * 2.0 AS score` to reference ALONG bindings (`ALONG ew = e.weight`)
+/// by inlining the underlying expression (`e.weight * 2.0`).
+fn substitute_along_vars(expr: Expr, along: &HashMap<&str, Expr>) -> Expr {
+    if along.is_empty() {
+        return expr;
+    }
+    match expr {
+        Expr::Variable(ref name) if along.contains_key(name.as_str()) => {
+            along[name.as_str()].clone()
+        }
+        Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
+            left: Box::new(substitute_along_vars(*left, along)),
+            op,
+            right: Box::new(substitute_along_vars(*right, along)),
+        },
+        Expr::UnaryOp { op, expr: inner } => Expr::UnaryOp {
+            op,
+            expr: Box::new(substitute_along_vars(*inner, along)),
+        },
+        Expr::FunctionCall {
+            name,
+            args,
+            distinct,
+            window_spec,
+        } => Expr::FunctionCall {
+            name,
+            args: args
+                .into_iter()
+                .map(|a| substitute_along_vars(a, along))
+                .collect(),
+            distinct,
+            window_spec,
+        },
+        other => other,
     }
 }
 
@@ -2068,17 +2143,9 @@ mod tests {
             )
             .unwrap();
 
-        assert!(plan_is_fold(&result.body));
-        if let LogicalPlan::LocyFold {
-            key_columns,
-            fold_bindings,
-            ..
-        } = &result.body
-        {
-            assert_eq!(key_columns, &["n".to_string()]);
-            assert_eq!(fold_bindings.len(), 1);
-            assert_eq!(fold_bindings[0].0, "total");
-        }
+        // Fold is deferred to apply_post_fixpoint_chain (not in body)
+        assert!(!plan_is_fold(&result.body));
+        assert!(plan_is_project(&result.body));
     }
 
     #[test]
@@ -2272,13 +2339,11 @@ mod tests {
             )
             .unwrap();
 
-        // Layered: BestBy { Fold { Project { Filter { CrossJoin { .. } } } } }
+        // Layered: BestBy { Project { Filter { CrossJoin { .. } } } }
+        // (Fold is deferred to apply_post_fixpoint_chain)
         assert!(plan_is_best_by(&result.body));
         if let LogicalPlan::LocyBestBy { input, .. } = &result.body {
-            assert!(plan_is_fold(input));
-            if let LogicalPlan::LocyFold { input, .. } = input.as_ref() {
-                assert!(plan_is_project(input));
-            }
+            assert!(plan_is_project(input));
         }
         assert_eq!(result.is_refs.len(), 1);
         assert_eq!(result.along_bindings, vec!["cost".to_string()]);

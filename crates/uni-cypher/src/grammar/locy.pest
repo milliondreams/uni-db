@@ -334,7 +334,7 @@ derive_edge_spec = {
 
 goal_query = {
     QUERY_KW ~ rule_name
-    ~ WHERE ~ expression
+    ~ (WHERE ~ expression)?
     ~ goal_return_clause?
 }
 
@@ -389,7 +389,7 @@ assume_body = {
 
 abduce_query = {
     ABDUCE ~ NOT? ~ rule_name
-    ~ WHERE ~ expression
+    ~ (WHERE ~ expression)?
     ~ abduce_return_clause?
 }
 
@@ -411,7 +411,7 @@ abduce_return_clause = {
 
 explain_rule_query = {
     EXPLAIN ~ RULE ~ rule_name
-    ~ WHERE ~ expression
+    ~ (WHERE ~ expression)?
     ~ explain_rule_return_clause?
 }
 

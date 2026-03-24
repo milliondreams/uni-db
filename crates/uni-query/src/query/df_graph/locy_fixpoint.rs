@@ -312,6 +312,26 @@ impl RowDedupState {
         }
     }
 
+    /// Populate the seen set from existing fact batches.
+    ///
+    /// Used after BEST BY in-loop pruning replaces the fact set, so that delta
+    /// computation in subsequent iterations correctly recognizes surviving facts.
+    fn ingest_existing(&mut self, facts: &[RecordBatch], _schema: &SchemaRef) {
+        self.seen.clear();
+        for batch in facts {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let arrays: Vec<_> = batch.columns().to_vec();
+            if let Ok(rows) = self.converter.convert_columns(&arrays) {
+                for row_idx in 0..batch.num_rows() {
+                    let row_bytes: Box<[u8]> = rows.row(row_idx).data().into();
+                    self.seen.insert(row_bytes);
+                }
+            }
+        }
+    }
+
     /// Filter `candidates` to only rows not yet seen, updating the persistent set.
     ///
     /// Both cross-iteration dedup (rows already accepted in prior iterations) and
@@ -603,6 +623,178 @@ impl FixpointState {
     /// Consume self and return facts.
     pub fn into_facts(self) -> Vec<RecordBatch> {
         self.facts
+    }
+
+    /// Merge candidates using BEST BY semantics.
+    ///
+    /// Combines existing facts with new candidates, keeping only the best row
+    /// per KEY group according to `sort_criteria`. Returns `true` if the
+    /// best-per-KEY fact set actually changed (a genuinely better value was
+    /// found or a new KEY appeared).
+    ///
+    /// This replaces `merge_delta` for rules with BEST BY, enabling convergence
+    /// on cyclic graphs where dominated ALONG values would otherwise produce an
+    /// unbounded stream of "new" full-row facts.
+    pub fn merge_best_by(
+        &mut self,
+        candidates: Vec<RecordBatch>,
+        sort_criteria: &[SortCriterion],
+    ) -> DFResult<bool> {
+        if candidates.is_empty() || candidates.iter().all(|b| b.num_rows() == 0) {
+            self.delta.clear();
+            return Ok(false);
+        }
+
+        // Reconcile schema from the first non-empty candidate batch.
+        if let Some(first) = candidates.iter().find(|b| b.num_rows() > 0) {
+            self.reconcile_schema(&first.schema());
+        }
+
+        // Round floats for stable dedup.
+        let candidates = round_float_columns(&candidates);
+
+        // Snapshot existing best-per-KEY facts for change detection.
+        let old_best: HashMap<Vec<ScalarKey>, Vec<ScalarKey>> =
+            self.build_key_criteria_map(sort_criteria);
+
+        // Concat existing facts + new candidates.
+        let mut all_batches = self.facts.clone();
+        all_batches.extend(candidates);
+        let all_batches: Vec<_> = all_batches
+            .into_iter()
+            .filter(|b| b.num_rows() > 0)
+            .collect();
+        if all_batches.is_empty() {
+            self.delta.clear();
+            return Ok(false);
+        }
+
+        let combined = arrow::compute::concat_batches(&self.schema, &all_batches)
+            .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+
+        if combined.num_rows() == 0 {
+            self.delta.clear();
+            return Ok(false);
+        }
+
+        // Sort by KEY ASC then criteria, so the best row per KEY group comes
+        // first.
+        let mut sort_columns = Vec::new();
+        for &ki in &self.key_column_indices {
+            sort_columns.push(arrow::compute::SortColumn {
+                values: Arc::clone(combined.column(ki)),
+                options: Some(arrow::compute::SortOptions {
+                    descending: false,
+                    nulls_first: false,
+                }),
+            });
+        }
+        for criterion in sort_criteria {
+            sort_columns.push(arrow::compute::SortColumn {
+                values: Arc::clone(combined.column(criterion.col_index)),
+                options: Some(arrow::compute::SortOptions {
+                    descending: !criterion.ascending,
+                    nulls_first: criterion.nulls_first,
+                }),
+            });
+        }
+
+        let sorted_indices =
+            arrow::compute::lexsort_to_indices(&sort_columns, None).map_err(arrow_err)?;
+        let sorted_columns: Vec<_> = combined
+            .columns()
+            .iter()
+            .map(|col| arrow::compute::take(col.as_ref(), &sorted_indices, None))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+        let sorted = RecordBatch::try_new(Arc::clone(&self.schema), sorted_columns)
+            .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+
+        // Dedup: keep first (best) row per KEY group.
+        let mut keep_indices: Vec<u32> = Vec::new();
+        let mut prev_key: Option<Vec<ScalarKey>> = None;
+        for row_idx in 0..sorted.num_rows() {
+            let key = extract_scalar_key(&sorted, &self.key_column_indices, row_idx);
+            let is_new_group = match &prev_key {
+                None => true,
+                Some(prev) => *prev != key,
+            };
+            if is_new_group {
+                keep_indices.push(row_idx as u32);
+                prev_key = Some(key);
+            }
+        }
+
+        let keep_array = arrow_array::UInt32Array::from(keep_indices);
+        let output_columns: Vec<_> = sorted
+            .columns()
+            .iter()
+            .map(|col| arrow::compute::take(col.as_ref(), &keep_array, None))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+        let pruned = RecordBatch::try_new(Arc::clone(&self.schema), output_columns)
+            .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+
+        // Detect whether the best-per-KEY set actually changed.
+        let new_best: HashMap<Vec<ScalarKey>, Vec<ScalarKey>> = {
+            let mut map = HashMap::new();
+            for row_idx in 0..pruned.num_rows() {
+                let key = extract_scalar_key(&pruned, &self.key_column_indices, row_idx);
+                let criteria: Vec<ScalarKey> = sort_criteria
+                    .iter()
+                    .flat_map(|c| extract_scalar_key(&pruned, &[c.col_index], row_idx))
+                    .collect();
+                map.insert(key, criteria);
+            }
+            map
+        };
+        let changed = old_best != new_best;
+
+        tracing::debug!(
+            rule = %self.rule_name,
+            old_keys = old_best.len(),
+            new_keys = new_best.len(),
+            changed = changed,
+            "BEST BY merge"
+        );
+
+        // Replace facts with the pruned set.
+        self.facts_bytes = batch_byte_size(&pruned);
+        self.facts = vec![pruned];
+        if changed {
+            // Delta is conceptually the new/improved facts, but since we
+            // replaced the entire set, just mark delta non-empty.
+            self.delta = self.facts.clone();
+        } else {
+            self.delta.clear();
+        }
+
+        // Rebuild row dedup from pruned facts for consistency.
+        self.row_dedup = RowDedupState::try_new(&self.schema);
+        if let Some(ref mut rd) = self.row_dedup {
+            rd.ingest_existing(&self.facts, &self.schema);
+        }
+
+        Ok(changed)
+    }
+
+    /// Build a map from KEY column values to sort criteria values.
+    fn build_key_criteria_map(
+        &self,
+        sort_criteria: &[SortCriterion],
+    ) -> HashMap<Vec<ScalarKey>, Vec<ScalarKey>> {
+        let mut map = HashMap::new();
+        for batch in &self.facts {
+            for row_idx in 0..batch.num_rows() {
+                let key = extract_scalar_key(batch, &self.key_column_indices, row_idx);
+                let criteria: Vec<ScalarKey> = sort_criteria
+                    .iter()
+                    .flat_map(|c| extract_scalar_key(batch, &[c.col_index], row_idx))
+                    .collect();
+                map.insert(key, criteria);
+            }
+        }
+        map
     }
 }
 
@@ -955,10 +1147,16 @@ async fn run_fixpoint_loop(
                 all_candidates.extend(batches);
             }
 
-            // Merge delta
-            let changed = states[rule_idx]
-                .merge_delta(all_candidates, Some(Arc::clone(&task_ctx)))
-                .await?;
+            // Merge candidates into facts.
+            // For BEST BY rules, use a specialized merge that keeps only the
+            // best row per KEY group, enabling convergence on cyclic graphs.
+            let changed = if rule.has_best_by && !rule.best_by_criteria.is_empty() {
+                states[rule_idx].merge_best_by(all_candidates, &rule.best_by_criteria)?
+            } else {
+                states[rule_idx]
+                    .merge_delta(all_candidates, Some(Arc::clone(&task_ctx)))
+                    .await?
+            };
             if changed {
                 any_changed = true;
                 // Record provenance for newly derived facts when tracker is present.

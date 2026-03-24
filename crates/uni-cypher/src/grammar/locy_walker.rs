@@ -1069,7 +1069,7 @@ fn build_goal_query(pair: Pair<LocyRule>) -> Result<GoalQuery, ParseError> {
 
     Ok(GoalQuery {
         rule_name: rule_name.unwrap(),
-        where_expr: where_expr.unwrap(),
+        where_expr,
         return_clause,
     })
 }
@@ -1198,7 +1198,7 @@ fn build_abduce_query(pair: Pair<LocyRule>) -> Result<AbduceQuery, ParseError> {
     Ok(AbduceQuery {
         negated,
         rule_name: rule_name.unwrap(),
-        where_expr: where_expr.unwrap(),
+        where_expr,
         return_clause,
     })
 }
@@ -1231,7 +1231,7 @@ fn build_explain_rule_query(pair: Pair<LocyRule>) -> Result<ExplainRule, ParseEr
 
     Ok(ExplainRule {
         rule_name: rule_name.unwrap(),
-        where_expr: where_expr.unwrap(),
+        where_expr,
         return_clause,
     })
 }

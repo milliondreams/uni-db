@@ -927,6 +927,17 @@ fn convert_fold_bindings(
         .iter()
         .map(|(name, expr)| {
             let (kind, _input_col_name) = parse_fold_aggregate(expr)?;
+
+            // CountAll has no input column — LocyProject skips the output column
+            // entirely, so there is nothing to look up.
+            if kind == FoldAggKind::CountAll {
+                return Ok(FoldBinding {
+                    output_name: name.clone(),
+                    kind,
+                    input_col_index: 0, // unused for CountAll
+                });
+            }
+
             // The LocyProject projects the aggregate input expression AS the fold
             // output name, so the input column index matches the yield schema position.
             let input_col_index = yield_schema
@@ -951,7 +962,15 @@ fn convert_fold_bindings(
 fn parse_fold_aggregate(expr: &Expr) -> DFResult<(FoldAggKind, String)> {
     match expr {
         Expr::FunctionCall { name, args, .. } => {
-            let kind = match name.to_uppercase().as_str() {
+            let upper = name.to_uppercase();
+            let is_count = matches!(upper.as_str(), "COUNT" | "MCOUNT");
+
+            // COUNT/MCOUNT with zero args → CountAll (like SQL COUNT(*))
+            if is_count && args.is_empty() {
+                return Ok((FoldAggKind::CountAll, String::new()));
+            }
+
+            let kind = match upper.as_str() {
                 "SUM" | "MSUM" => FoldAggKind::Sum,
                 "MAX" | "MMAX" => FoldAggKind::Max,
                 "MIN" | "MMIN" => FoldAggKind::Min,
@@ -970,10 +989,10 @@ fn parse_fold_aggregate(expr: &Expr) -> DFResult<(FoldAggKind, String)> {
             let col_name = match args.first() {
                 Some(Expr::Variable(v)) => v.clone(),
                 Some(Expr::Property(_, prop)) => prop.clone(),
-                _ => {
+                Some(other) => other.to_string_repr(),
+                None => {
                     return Err(datafusion::error::DataFusionError::Plan(
-                        "FOLD aggregate argument must be a variable or property reference"
-                            .to_string(),
+                        "FOLD aggregate function requires at least one argument".to_string(),
                     ));
                 }
             };

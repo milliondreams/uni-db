@@ -4605,7 +4605,19 @@ fn resolve_fold_bindings(
             // Parse aggregate expression: FunctionCall { name, args }
             match expr {
                 Expr::FunctionCall { name, args, .. } => {
-                    let kind = match name.to_uppercase().as_str() {
+                    let upper = name.to_uppercase();
+                    let is_count = matches!(upper.as_str(), "COUNT" | "MCOUNT");
+
+                    // COUNT/MCOUNT with zero args → CountAll
+                    if is_count && args.is_empty() {
+                        return Ok(super::df_graph::locy_fold::FoldBinding {
+                            output_name: output_name.clone(),
+                            kind: super::df_graph::locy_fold::FoldAggKind::CountAll,
+                            input_col_index: 0, // unused for CountAll
+                        });
+                    }
+
+                    let kind = match upper.as_str() {
                         "SUM" | "MSUM" => super::df_graph::locy_fold::FoldAggKind::Sum,
                         "COUNT" | "MCOUNT" => super::df_graph::locy_fold::FoldAggKind::Count,
                         "MAX" | "MMAX" => super::df_graph::locy_fold::FoldAggKind::Max,

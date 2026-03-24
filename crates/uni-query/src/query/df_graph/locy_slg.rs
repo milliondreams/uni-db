@@ -15,15 +15,15 @@ use std::time::Instant;
 
 use uni_common::Value;
 use uni_cypher::ast::{BinaryOp, Expr};
-use uni_cypher::locy_ast::RuleCondition;
-use uni_locy::types::CompiledRule;
+use uni_cypher::locy_ast::{LocyBinaryOp, LocyExpr, RuleCondition, RuleOutput};
+use uni_locy::types::{CompiledClause, CompiledRule};
 use uni_locy::{CompiledProgram, LocyConfig, LocyError, LocyStats, Row};
 
 use super::locy_ast_builder::value_to_expr;
 use super::locy_delta::{
     RowRelation, RowStore, extract_cypher_conditions, extract_key, resolve_clause_with_is_refs,
 };
-use super::locy_eval::{literal_to_value, record_batches_to_locy_rows};
+use super::locy_eval::{eval_expr, literal_to_value, record_batches_to_locy_rows};
 use super::locy_traits::DerivedFactSource;
 
 /// Status of a tabling cache entry.
@@ -210,8 +210,11 @@ impl<'a> SLGResolver<'a> {
                         .await?;
                 self.stats.queries_executed += 1;
 
+                // Apply YIELD projections to compute non-key columns.
+                let projected = apply_yield_projections(rows, clause);
+
                 // Filter by goal bindings.
-                let filtered: Vec<Row> = rows
+                let filtered: Vec<Row> = projected
                     .into_iter()
                     .filter(|row| matches_goal(row, goal_bindings))
                     .collect();
@@ -227,7 +230,11 @@ impl<'a> SLGResolver<'a> {
                     .execute_pattern(&clause.match_pattern, &all_conditions)
                     .await?;
                 self.stats.queries_executed += 1;
-                all_answers.extend(record_batches_to_locy_rows(&raw_batches));
+                let raw_rows = record_batches_to_locy_rows(&raw_batches);
+
+                // Apply YIELD projections to compute non-key columns.
+                let projected = apply_yield_projections(raw_rows, clause);
+                all_answers.extend(projected);
             }
         }
 
@@ -287,6 +294,126 @@ impl<'a> SLGResolver<'a> {
         }
 
         Ok(answers)
+    }
+}
+
+/// Convert a LocyExpr to a standard Cypher Expr for in-memory evaluation.
+/// Returns None for PrevRef (only meaningful in recursive fixpoint).
+fn locy_expr_to_cypher(locy: &LocyExpr) -> Option<Expr> {
+    match locy {
+        LocyExpr::Cypher(e) => Some(e.clone()),
+        LocyExpr::PrevRef(_) => None,
+        LocyExpr::BinaryOp { left, op, right } => {
+            let l = locy_expr_to_cypher(left)?;
+            let r = locy_expr_to_cypher(right)?;
+            let cypher_op = match op {
+                LocyBinaryOp::Add => BinaryOp::Add,
+                LocyBinaryOp::Sub => BinaryOp::Sub,
+                LocyBinaryOp::Mul => BinaryOp::Mul,
+                LocyBinaryOp::Div => BinaryOp::Div,
+                LocyBinaryOp::Mod => BinaryOp::Mod,
+                LocyBinaryOp::Pow => BinaryOp::Pow,
+                LocyBinaryOp::And => BinaryOp::And,
+                LocyBinaryOp::Or => BinaryOp::Or,
+                LocyBinaryOp::Xor => BinaryOp::Xor,
+            };
+            Some(Expr::BinaryOp {
+                left: Box::new(l),
+                op: cypher_op,
+                right: Box::new(r),
+            })
+        }
+        LocyExpr::UnaryOp(op, inner) => {
+            let e = locy_expr_to_cypher(inner)?;
+            Some(Expr::UnaryOp {
+                op: *op,
+                expr: Box::new(e),
+            })
+        }
+    }
+}
+
+/// Apply YIELD projections to raw rows from pattern execution.
+///
+/// The SLG resolver executes raw `MATCH ... RETURN *` queries, which return full
+/// graph entities (nodes, edges) but do NOT include non-key YIELD columns like
+/// property accesses (`n.val AS v`), computed expressions (`1.0 - n.val AS sev`),
+/// or literal constants (`0.5 AS lit`).  This function evaluates each clause's
+/// YIELD items against the raw rows to produce the projected columns.
+fn apply_yield_projections(raw_rows: Vec<Row>, clause: &CompiledClause) -> Vec<Row> {
+    let yield_items = match &clause.output {
+        RuleOutput::Yield(yc) => &yc.items,
+        _ => return raw_rows,
+    };
+
+    // If yield has no non-key items with expressions, skip projection
+    let has_non_key_exprs = yield_items.iter().any(|item| !item.is_key);
+    if !has_non_key_exprs {
+        return raw_rows;
+    }
+
+    raw_rows
+        .into_iter()
+        .map(|raw_row| {
+            let mut projected = Row::new();
+            for item in yield_items {
+                let name = item
+                    .alias
+                    .clone()
+                    .unwrap_or_else(|| expr_name_for_yield(&item.expr));
+
+                if item.is_key {
+                    // KEY columns: copy from raw row (node/edge variables)
+                    if let Some(val) = raw_row.get(&name) {
+                        projected.insert(name, val.clone());
+                    } else if let Expr::Variable(var_name) = &item.expr
+                        && let Some(val) = raw_row.get(var_name)
+                    {
+                        // KEY variable might be the graph entity itself
+                        projected.insert(name, val.clone());
+                    }
+                } else {
+                    // Non-key columns: evaluate the YIELD expression against the raw row
+                    match eval_expr(&item.expr, &raw_row) {
+                        Ok(val) => {
+                            projected.insert(name, val);
+                        }
+                        Err(_) => {
+                            projected.insert(name, Value::Null);
+                        }
+                    }
+                }
+            }
+
+            // Also carry through ALONG bindings from the raw row.
+            // ALONG expressions use LocyExpr; extract the inner Cypher Expr
+            // (PrevRef only applies in recursive fixpoint, not SLG resolution).
+            for along in &clause.along {
+                if !projected.contains_key(&along.name)
+                    && let Some(cypher_expr) = locy_expr_to_cypher(&along.expr)
+                {
+                    match eval_expr(&cypher_expr, &raw_row) {
+                        Ok(val) => {
+                            projected.insert(along.name.clone(), val);
+                        }
+                        Err(_) => {
+                            projected.insert(along.name.clone(), Value::Null);
+                        }
+                    }
+                }
+            }
+
+            projected
+        })
+        .collect()
+}
+
+/// Derive a column name from a YIELD expression (mirrors typecheck.rs `expr_name`).
+fn expr_name_for_yield(expr: &Expr) -> String {
+    match expr {
+        Expr::Variable(name) => name.clone(),
+        Expr::Property(_, prop) => prop.clone(),
+        _ => "?".to_string(),
     }
 }
 

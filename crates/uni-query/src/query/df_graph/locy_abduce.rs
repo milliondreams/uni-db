@@ -50,14 +50,18 @@ pub async fn evaluate_abduce(
     let facts = ctx.lookup_derived(&rule_name)?;
 
     // Filter by WHERE expression
-    let matching: Vec<Row> = facts
-        .into_iter()
-        .filter(|row| {
-            eval_expr(&query.where_expr, row)
-                .map(|v| v.as_bool().unwrap_or(false))
-                .unwrap_or(false)
-        })
-        .collect();
+    let matching: Vec<Row> = if let Some(where_expr) = &query.where_expr {
+        facts
+            .into_iter()
+            .filter(|row| {
+                eval_expr(where_expr, row)
+                    .map(|v| v.as_bool().unwrap_or(false))
+                    .unwrap_or(false)
+            })
+            .collect()
+    } else {
+        facts
+    };
 
     // Phase 1: Build derivation tree
     let explain_query = uni_cypher::locy_ast::ExplainRule {
@@ -93,7 +97,7 @@ pub async fn evaluate_abduce(
             &candidate,
             query.negated,
             &rule_name,
-            &query.where_expr,
+            query.where_expr.as_ref(),
             program,
             ctx,
             config,
@@ -294,7 +298,7 @@ async fn validate_modification(
     modification: &Modification,
     negated: bool,
     rule_name: &str,
-    where_expr: &Expr,
+    where_expr: Option<&Expr>,
     program: &CompiledProgram,
     ctx: &dyn LocyExecutionContext,
     config: &LocyConfig,
@@ -323,14 +327,18 @@ async fn validate_modification(
         .map(|r| r.rows.clone())
         .unwrap_or_default();
 
-    let matching: Vec<Row> = facts
-        .into_iter()
-        .filter(|row| {
-            eval_expr(where_expr, row)
-                .map(|v| v.as_bool().unwrap_or(false))
-                .unwrap_or(false)
-        })
-        .collect();
+    let matching: Vec<Row> = if let Some(where_expr) = where_expr {
+        facts
+            .into_iter()
+            .filter(|row| {
+                eval_expr(where_expr, row)
+                    .map(|v| v.as_bool().unwrap_or(false))
+                    .unwrap_or(false)
+            })
+            .collect()
+    } else {
+        facts
+    };
 
     // Rollback
     ctx.rollback_savepoint(savepoint_id)

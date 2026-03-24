@@ -247,14 +247,18 @@ fn explain_rule_mode_a(
     }
 
     // Filter tracker entries by WHERE expression
-    let matching_entries: Vec<_> = tracker_entries
-        .into_iter()
-        .filter(|(_, entry)| {
-            eval_expr(&query.where_expr, &entry.fact_row)
-                .map(|v| v.as_bool().unwrap_or(false))
-                .unwrap_or(false)
-        })
-        .collect();
+    let matching_entries: Vec<_> = if let Some(where_expr) = &query.where_expr {
+        tracker_entries
+            .into_iter()
+            .filter(|(_, entry)| {
+                eval_expr(where_expr, &entry.fact_row)
+                    .map(|v| v.as_bool().unwrap_or(false))
+                    .unwrap_or(false)
+            })
+            .collect()
+    } else {
+        tracker_entries
+    };
 
     if matching_entries.is_empty() {
         return Err(LocyError::EvaluationError {
@@ -362,14 +366,18 @@ async fn explain_rule_mode_b(
         .unwrap_or_default();
 
     // Filter facts by WHERE expression
-    let filtered: Vec<Row> = facts
-        .into_iter()
-        .filter(|row| {
-            eval_expr(&query.where_expr, row)
-                .map(|v| v.as_bool().unwrap_or(false))
-                .unwrap_or(false)
-        })
-        .collect();
+    let filtered: Vec<Row> = if let Some(where_expr) = &query.where_expr {
+        facts
+            .into_iter()
+            .filter(|row| {
+                eval_expr(where_expr, row)
+                    .map(|v| v.as_bool().unwrap_or(false))
+                    .unwrap_or(false)
+            })
+            .collect()
+    } else {
+        facts
+    };
 
     let is_approximate = approximate_groups
         .map(|ag| ag.contains_key(&rule_name))

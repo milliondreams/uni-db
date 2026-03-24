@@ -48,7 +48,10 @@ pub async fn evaluate_query(
         .collect();
 
     // Extract goal bindings from WHERE for goal-directed resolution
-    let goal_bindings = extract_goal_bindings(&query.where_expr, &key_columns);
+    let goal_bindings = match &query.where_expr {
+        Some(expr) => extract_goal_bindings(expr, &key_columns),
+        None => std::collections::HashMap::new(),
+    };
 
     // Use a fresh store rather than the pre-computed orch_store.
     // The native fixpoint stores node columns as VIDs (UInt64), not full node objects,
@@ -63,14 +66,18 @@ pub async fn evaluate_query(
     stats.mutations_executed += resolver.stats.mutations_executed;
 
     // Apply WHERE filter (SLG may return superset if goal bindings are partial)
-    let filtered: Vec<Row> = results
-        .into_iter()
-        .filter(|row| {
-            eval_expr(&query.where_expr, row)
-                .map(|v| v.as_bool().unwrap_or(false))
-                .unwrap_or(false)
-        })
-        .collect();
+    let filtered: Vec<Row> = if let Some(where_expr) = &query.where_expr {
+        results
+            .into_iter()
+            .filter(|row| {
+                eval_expr(where_expr, row)
+                    .map(|v| v.as_bool().unwrap_or(false))
+                    .unwrap_or(false)
+            })
+            .collect()
+    } else {
+        results
+    };
 
     // Apply RETURN clause if present
     apply_return_clause(filtered, &query.return_clause)

@@ -20,6 +20,19 @@ pub fn compile(program: &LocyProgram) -> Result<CompiledProgram, LocyCompileErro
     compile_with_modules(program, &HashMap::new())
 }
 
+/// Compile with pre-registered external rule names.
+///
+/// Rules in `external_rules` are treated as valid targets for IS-ref and
+/// QUERY references, even though they are not defined in this program.
+/// Used by `LocyEngine::evaluate()` when a session-level rule registry
+/// contains previously compiled rules.
+pub fn compile_with_external_rules(
+    program: &LocyProgram,
+    external_rules: &[String],
+) -> Result<CompiledProgram, LocyCompileError> {
+    compile_with_context(program, &HashMap::new(), external_rules)
+}
+
 /// Compile a Locy program with module resolution context.
 ///
 /// `available_modules` maps module names to their exported rule names,
@@ -29,12 +42,23 @@ pub fn compile_with_modules(
     program: &LocyProgram,
     available_modules: &HashMap<String, Vec<String>>,
 ) -> Result<CompiledProgram, LocyCompileError> {
+    compile_with_context(program, available_modules, &[])
+}
+
+/// Compile a Locy program with module resolution and external rule context.
+fn compile_with_context(
+    program: &LocyProgram,
+    available_modules: &HashMap<String, Vec<String>>,
+    external_rules: &[String],
+) -> Result<CompiledProgram, LocyCompileError> {
     let module_ctx = modules::resolve_modules(program, available_modules)?;
     let rule_groups = group_rules_with_context(program, &module_ctx);
-    let rule_names: Vec<String> = rule_groups.keys().cloned().collect();
+    let mut rule_names: Vec<String> = rule_groups.keys().cloned().collect();
+    // Include external (registered) rules in the valid-name set.
+    rule_names.extend(external_rules.iter().cloned());
 
     if rule_groups.is_empty() {
-        let commands = extract_commands(program, &[], &module_ctx)?;
+        let commands = extract_commands(program, &rule_names, &module_ctx)?;
         return Ok(CompiledProgram {
             strata: Vec::new(),
             rule_catalog: HashMap::new(),
@@ -43,7 +67,11 @@ pub fn compile_with_modules(
         });
     }
 
-    let dep_graph = dependency::build_dependency_graph(&rule_groups, &module_ctx)?;
+    let dep_graph = dependency::build_dependency_graph_with_external(
+        &rule_groups,
+        &module_ctx,
+        external_rules,
+    )?;
     let strat = stratify::stratify(&dep_graph)?;
     warded::check_wardedness(&rule_groups)?;
     let (compiled_rules, warnings) = typecheck::check(&rule_groups, &strat)?;

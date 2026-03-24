@@ -16,12 +16,23 @@ pub struct DependencyGraph {
 }
 
 /// Extract IS references from all rule definitions and build a dependency graph.
-/// Returns `UndefinedRule` if any IS reference targets a rule not in `rule_groups`.
+/// Returns `UndefinedRule` if any IS reference targets a rule not in `rule_groups`
+/// or `external_rules`.
 pub fn build_dependency_graph(
     rule_groups: &HashMap<String, Vec<&RuleDefinition>>,
     module_ctx: &ModuleContext,
 ) -> Result<DependencyGraph, LocyCompileError> {
-    let all_rules: HashSet<String> = rule_groups.keys().cloned().collect();
+    build_dependency_graph_with_external(rule_groups, module_ctx, &[])
+}
+
+/// Build a dependency graph that also recognizes external (registered) rule names.
+pub fn build_dependency_graph_with_external(
+    rule_groups: &HashMap<String, Vec<&RuleDefinition>>,
+    module_ctx: &ModuleContext,
+    external_rules: &[String],
+) -> Result<DependencyGraph, LocyCompileError> {
+    let mut all_rules: HashSet<String> = rule_groups.keys().cloned().collect();
+    all_rules.extend(external_rules.iter().cloned());
     let mut positive_edges: HashMap<String, HashSet<String>> = HashMap::new();
     let mut negative_edges: HashMap<String, HashSet<String>> = HashMap::new();
 

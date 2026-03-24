@@ -26,9 +26,7 @@ class TestSyncQueryCursor:
     def test_cursor_fetch_one(self, social_db_populated):
         """Iterate with fetch_one() until None."""
         db = social_db_populated
-        cursor = db.query_cursor(
-            "MATCH (p:Person) RETURN p.name AS name ORDER BY name"
-        )
+        cursor = db.query_cursor("MATCH (p:Person) RETURN p.name AS name ORDER BY name")
         names = []
         while True:
             row = cursor.fetch_one()
@@ -41,9 +39,7 @@ class TestSyncQueryCursor:
     def test_cursor_fetch_many(self, social_db_populated):
         """fetch_many(2) returns at most 2 rows per call."""
         db = social_db_populated
-        cursor = db.query_cursor(
-            "MATCH (p:Person) RETURN p.name AS name ORDER BY name"
-        )
+        cursor = db.query_cursor("MATCH (p:Person) RETURN p.name AS name ORDER BY name")
         batch1 = cursor.fetch_many(2)
         assert len(batch1) <= 2
         assert len(batch1) > 0
@@ -54,9 +50,7 @@ class TestSyncQueryCursor:
     def test_cursor_iterator(self, social_db_populated):
         """for row in cursor: iterates all rows."""
         db = social_db_populated
-        cursor = db.query_cursor(
-            "MATCH (p:Person) RETURN p.name AS name ORDER BY name"
-        )
+        cursor = db.query_cursor("MATCH (p:Person) RETURN p.name AS name ORDER BY name")
         names = [row["name"] for row in cursor]
         assert names == ["Alice", "Bob", "Charlie", "Diana", "Eve"]
 
@@ -72,9 +66,7 @@ class TestSyncQueryCursor:
     def test_cursor_close(self, social_db_populated):
         """close() makes subsequent calls return empty/None."""
         db = social_db_populated
-        cursor = db.query_cursor(
-            "MATCH (p:Person) RETURN p.name AS name ORDER BY name"
-        )
+        cursor = db.query_cursor("MATCH (p:Person) RETURN p.name AS name ORDER BY name")
         cursor.close()
         assert cursor.fetch_one() is None
         assert cursor.fetch_all() == []

@@ -5,6 +5,7 @@ pub mod result;
 pub mod types;
 
 pub use compiler::compile;
+pub use compiler::compile_with_external_rules;
 pub use compiler::compile_with_modules;
 pub use compiler::errors::LocyCompileError;
 pub use compiler::modules::ModuleContext;

@@ -1,0 +1,37 @@
+{
+  "edge_types": {
+    "LINK": {
+      "dst_labels": [],
+      "src_labels": [],
+      "id": 1
+    }
+  },
+  "indexes": [],
+  "labels": {
+    "Sensor": {
+      "id": 1
+    },
+    "Node": {
+      "id": 2
+    },
+    "Device": {
+      "id": 3
+    }
+  },
+  "properties": {
+    "Sensor": {
+      "name": { "nullable": true, "type": "String" },
+      "val": { "nullable": true, "type": "Float64" }
+    },
+    "Node": {
+      "name": { "nullable": true, "type": "String" }
+    },
+    "Device": {
+      "name": { "nullable": true, "type": "String" }
+    },
+    "LINK": {
+      "weight": { "nullable": true, "type": "Float64" }
+    }
+  },
+  "schema_version": 1
+}

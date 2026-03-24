@@ -26,6 +26,19 @@ use uni_query::query::df_graph::{DerivedFactSource, LocyExecutionContext};
 
 use crate::api::Uni;
 
+/// Session-level registry for pre-compiled Locy rules.
+///
+/// Rules registered here are automatically merged into subsequent `evaluate()`
+/// calls, eliminating the need to redeclare rules across multiple evaluations
+/// (e.g., baseline, EXPLAIN, ASSUME, ABDUCE in notebooks).
+#[derive(Debug, Default, Clone)]
+pub struct LocyRuleRegistry {
+    /// Compiled rules indexed by rule name.
+    pub rules: HashMap<String, uni_locy::types::CompiledRule>,
+    /// Strata from registered programs, for execution ordering.
+    pub strata: Vec<uni_locy::types::Stratum>,
+}
+
 /// Engine for evaluating Locy programs against a real database.
 pub struct LocyEngine<'a> {
     db: &'a Uni,
@@ -40,9 +53,51 @@ impl Uni {
 
 impl<'a> LocyEngine<'a> {
     /// Parse and compile a Locy program without executing it.
+    ///
+    /// If the session's rule registry contains pre-compiled rules, their names
+    /// are passed to the compiler so that IS-ref and QUERY references to
+    /// registered rules are accepted during validation.
     pub fn compile_only(&self, program: &str) -> Result<CompiledProgram> {
         let ast = uni_cypher::parse_locy(program).map_err(map_parse_error)?;
-        compile(&ast).map_err(map_compile_error)
+        let registry = self.db.locy_rule_registry.read().unwrap();
+        if registry.rules.is_empty() {
+            drop(registry);
+            compile(&ast).map_err(map_compile_error)
+        } else {
+            let external_names: Vec<String> = registry.rules.keys().cloned().collect();
+            drop(registry);
+            uni_locy::compile_with_external_rules(&ast, &external_names).map_err(map_compile_error)
+        }
+    }
+
+    /// Compile and register a Locy program's rules for reuse.
+    ///
+    /// Rules registered here persist within the database session and are
+    /// automatically merged into subsequent `evaluate()` calls, so notebooks
+    /// can define rules once and run QUERY, EXPLAIN, ASSUME, ABDUCE without
+    /// redeclaring the full rule set each time.
+    pub fn register(&self, program: &str) -> Result<()> {
+        let compiled = self.compile_only(program)?;
+        let mut registry = self.db.locy_rule_registry.write().unwrap();
+        for (name, rule) in compiled.rule_catalog {
+            registry.rules.insert(name, rule);
+        }
+        // Merge strata, assigning new IDs to avoid collisions.
+        let base_id = registry.strata.len();
+        for mut stratum in compiled.strata {
+            let old_id = stratum.id;
+            stratum.id = base_id + old_id;
+            stratum.depends_on = stratum.depends_on.iter().map(|d| base_id + d).collect();
+            registry.strata.push(stratum);
+        }
+        Ok(())
+    }
+
+    /// Clear all registered Locy rules from the session.
+    pub fn clear_registry(&self) {
+        let mut registry = self.db.locy_rule_registry.write().unwrap();
+        registry.rules.clear();
+        registry.strata.clear();
     }
 
     /// Parse, compile, and evaluate a Locy program with default config.
@@ -57,12 +112,36 @@ impl<'a> LocyEngine<'a> {
     }
 
     /// Parse, compile, and evaluate a Locy program with custom config.
+    ///
+    /// If rules were previously registered via `register()`, they are
+    /// automatically merged into the compiled program before execution.
     pub async fn evaluate_with_config(
         &self,
         program: &str,
         config: &LocyConfig,
     ) -> Result<LocyResult> {
-        let compiled = self.compile_only(program)?;
+        let mut compiled = self.compile_only(program)?;
+
+        // Merge registered rules into the compiled program.
+        {
+            let registry = self.db.locy_rule_registry.read().unwrap();
+            if !registry.rules.is_empty() {
+                for (name, rule) in &registry.rules {
+                    compiled
+                        .rule_catalog
+                        .entry(name.clone())
+                        .or_insert_with(|| rule.clone());
+                }
+                let base_id = registry.strata.len();
+                for stratum in &mut compiled.strata {
+                    stratum.id += base_id;
+                    stratum.depends_on = stratum.depends_on.iter().map(|d| d + base_id).collect();
+                }
+                let mut merged_strata = registry.strata.clone();
+                merged_strata.append(&mut compiled.strata);
+                compiled.strata = merged_strata;
+            }
+        }
         let start = Instant::now();
 
         // 1. Build logical plan

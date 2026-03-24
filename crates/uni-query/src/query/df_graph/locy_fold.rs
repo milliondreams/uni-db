@@ -40,6 +40,8 @@ pub enum FoldAggKind {
     Max,
     Min,
     Count,
+    /// Count all rows in a group (like SQL `COUNT(*)`), ignoring nulls.
+    CountAll,
     Avg,
     Collect,
     Nor,  // Noisy-OR: 1 − ∏(1 − pᵢ)
@@ -51,14 +53,20 @@ impl FoldAggKind {
     pub fn is_monotonic(&self) -> bool {
         matches!(
             self,
-            Self::Sum | Self::Max | Self::Min | Self::Count | Self::Nor | Self::Prod
+            Self::Sum
+                | Self::Max
+                | Self::Min
+                | Self::Count
+                | Self::CountAll
+                | Self::Nor
+                | Self::Prod
         )
     }
 
     /// Returns the monotonicity direction, or `None` for non-monotonic aggregates.
     pub fn monotonicity_direction(&self) -> Option<MonotonicDirection> {
         match self {
-            Self::Sum | Self::Max | Self::Count | Self::Nor => {
+            Self::Sum | Self::Max | Self::Count | Self::CountAll | Self::Nor => {
                 Some(MonotonicDirection::NonDecreasing)
             }
             Self::Min | Self::Prod => Some(MonotonicDirection::NonIncreasing),
@@ -69,7 +77,7 @@ impl FoldAggKind {
     /// Returns the identity element for this aggregate, or `None` for non-monotonic aggregates.
     pub fn identity(&self) -> Option<f64> {
         match self {
-            Self::Sum | Self::Count | Self::Nor => Some(0.0),
+            Self::Sum | Self::Count | Self::CountAll | Self::Nor => Some(0.0),
             Self::Max => Some(f64::NEG_INFINITY),
             Self::Min => Some(f64::INFINITY),
             Self::Prod => Some(1.0),
@@ -146,13 +154,15 @@ impl FoldExec {
 
         // Fold output columns
         for binding in fold_bindings {
-            let input_type = input_schema.field(binding.input_col_index).data_type();
             let output_type = match binding.kind {
                 FoldAggKind::Sum | FoldAggKind::Avg | FoldAggKind::Nor | FoldAggKind::Prod => {
                     DataType::Float64
                 }
-                FoldAggKind::Count => DataType::Int64,
-                FoldAggKind::Max | FoldAggKind::Min => input_type.clone(),
+                FoldAggKind::Count | FoldAggKind::CountAll => DataType::Int64,
+                FoldAggKind::Max | FoldAggKind::Min => input_schema
+                    .field(binding.input_col_index)
+                    .data_type()
+                    .clone(),
                 FoldAggKind::Collect => DataType::LargeBinary,
             };
             fields.push(Arc::new(Field::new(
@@ -274,7 +284,12 @@ impl ExecutionPlan for FoldExec {
 
             // Fold binding columns: compute aggregates per group
             for binding in &fold_bindings {
-                let col = batch.column(binding.input_col_index);
+                let col: Arc<dyn Array> = if binding.kind == FoldAggKind::CountAll {
+                    // CountAll doesn't need an input column — use a dummy
+                    Arc::new(arrow_array::Int64Array::from(vec![0i64; batch.num_rows()]))
+                } else {
+                    Arc::clone(batch.column(binding.input_col_index))
+                };
                 let agg_col = compute_fold_aggregate(
                     col.as_ref(),
                     &binding.kind,
@@ -329,6 +344,14 @@ fn compute_fold_aggregate(
                 let indices = &groups[key];
                 let count = indices.iter().filter(|&&i| !col.is_null(i)).count();
                 builder.append_value(count as i64);
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        FoldAggKind::CountAll => {
+            let mut builder = Int64Builder::with_capacity(num_groups);
+            for key in ordered_keys {
+                let indices = &groups[key];
+                builder.append_value(indices.len() as i64);
             }
             Ok(Arc::new(builder.finish()))
         }
@@ -2047,5 +2070,31 @@ mod tests {
             expected,
             vals.value(0)
         );
+    }
+
+    #[tokio::test]
+    async fn test_count_all_groups_by_key() {
+        // Two groups: "a" (2 rows), "b" (1 row)
+        let batch = make_test_batch(vec!["a", "a", "b"], vec![10.0, 20.0, 30.0]);
+        let input = make_memory_exec(batch);
+        let result = execute_fold(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "cnt".to_string(),
+                kind: FoldAggKind::CountAll,
+                input_col_index: 0, // unused for CountAll
+            }],
+        )
+        .await;
+
+        assert_eq!(result.num_rows(), 2, "Should have 2 groups");
+        let counts = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(counts.value(0), 2, "Group 'a' should have count 2");
+        assert_eq!(counts.value(1), 1, "Group 'b' should have count 1");
     }
 }

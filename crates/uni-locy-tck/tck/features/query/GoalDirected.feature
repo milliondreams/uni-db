@@ -26,7 +26,35 @@ Feature: QUERY Goal-Directed
       """
     Then the program should parse successfully
 
+  Scenario: QUERY without WHERE clause
+    When parsing the following Locy program:
+      """
+      QUERY reachable
+      """
+    Then the program should parse successfully
+
+  Scenario: QUERY without WHERE but with RETURN
+    When parsing the following Locy program:
+      """
+      QUERY reachable RETURN a, b
+      """
+    Then the program should parse successfully
+
   # ── Evaluate-level scenarios ──────────────────────────────────────────
+
+  Scenario: QUERY without WHERE returns all facts
+    Given having executed:
+      """
+      CREATE (a:Node {name: 'A'})-[:EDGE]->(b:Node {name: 'B'}),
+             (b)-[:EDGE]->(c:Node {name: 'C'})
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE reachable AS MATCH (a:Node)-[:EDGE]->(b:Node) YIELD KEY a, KEY b
+      QUERY reachable
+      """
+    Then evaluation should succeed
+    And the command result 0 should be a Query with 2 rows
 
   Scenario: QUERY filters to matching goal bindings
     Given having executed:

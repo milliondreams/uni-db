@@ -112,6 +112,31 @@ Feature: Locy Reserved Keywords
       """
     Then the program should parse successfully
 
+  # ── Comment syntax ──────────────────────────────────────────────────
+
+  Scenario: Block comments should be supported
+    When parsing the following Locy program:
+      """
+      /* This is a block comment */
+      CREATE RULE test AS MATCH (n:Node) YIELD KEY n
+      """
+    Then the program should parse successfully
+
+  Scenario: Line comments should be supported
+    When parsing the following Locy program:
+      """
+      // This is a line comment
+      CREATE RULE test AS MATCH (n:Node) YIELD KEY n
+      """
+    Then the program should parse successfully
+
+  Scenario: Inline block comment should be supported
+    When parsing the following Locy program:
+      """
+      CREATE RULE test AS MATCH (n:Node /* inline */) YIELD KEY n
+      """
+    Then the program should parse successfully
+
   Scenario: Valid DERIVE clause with real syntax should parse
     When parsing the following Locy program:
       """

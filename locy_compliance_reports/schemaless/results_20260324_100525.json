@@ -165,8 +165,22 @@
       },
       {
         "type": "scenario",
-        "name": "ALONG combined with FOLD SUM",
+        "name": "Recursive ALONG with BEST BY converges on cyclic graph",
         "line": 102,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "Recursive ALONG with BEST BY converges on cyclic graph",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "ALONG combined with FOLD SUM",
+        "line": 124,
         "steps": [
           {
             "keyword": "Scenario ",
@@ -1128,6 +1142,54 @@
     ]
   },
   {
+    "name": "AlongWithIsRef",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/evaluate/AlongWithIsRef.feature",
+    "elements": [
+      {
+        "type": "scenario",
+        "name": "ALONG binding directly as YIELD column with IS-ref",
+        "line": 11,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "ALONG binding directly as YIELD column with IS-ref",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "ALONG binding used in compound YIELD expression with IS-ref",
+        "line": 38,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "ALONG binding used in compound YIELD expression with IS-ref",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "ALONG binding with alias in YIELD with IS-ref",
+        "line": 64,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "ALONG binding with alias in YIELD with IS-ref",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  {
     "name": "ErrorConditions",
     "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/evaluate/ErrorConditions.feature",
     "elements": [
@@ -1348,6 +1410,82 @@
     ]
   },
   {
+    "name": "YieldValueColumns",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/evaluate/YieldValueColumns.feature",
+    "elements": [
+      {
+        "type": "scenario",
+        "name": "Non-key property access in YIELD via derived relation",
+        "line": 14,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "Non-key property access in YIELD via derived relation",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "Non-key property access in QUERY RETURN",
+        "line": 28,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "Non-key property access in QUERY RETURN",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "Literal constant in YIELD",
+        "line": 45,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "Literal constant in YIELD",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "Computed expression in YIELD",
+        "line": 61,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "Computed expression in YIELD",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "Edge property access in YIELD",
+        "line": 77,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "Edge property access in YIELD",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  {
     "name": "ProofTraces",
     "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/explain/ProofTraces.feature",
     "elements": [
@@ -1491,6 +1629,64 @@
           {
             "keyword": "Scenario ",
             "name": "BEST BY preserves full row including ALONG values",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "MCOUNT zero-argument counts all facts in group",
+        "line": 103,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "MCOUNT zero-argument counts all facts in group",
+            "result": {
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/fold/Aggregation.feature:118:5\n      Matched: crates/uni-locy-tck/src/steps/then_evaluate.rs:106:1\n      Step panicked. Captured output: assertion `left == right` failed: Expected derived relation 'friend_count' to have 2 facts, but got 3. Available relations: [\"friend_count\"]\n        left: 3\n       right: 2\n[Summary]\n1 feature\n1 scenario (1 failed)\n5 steps (4 passed, 1 failed)\n"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "COUNT zero-argument counts all facts",
+        "line": 120,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "COUNT zero-argument counts all facts",
+            "result": {
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/fold/Aggregation.feature:125:5\n      Matched: crates/uni-locy-tck/src/steps/when_evaluate.rs:4:1\n      Step panicked. Captured output: index out of bounds: the len is 0 but the index is 0\n[Summary]\n1 feature\n1 scenario (1 failed)\n3 steps (2 passed, 1 failed)\n"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "FOLD SUM with computed expression argument",
+        "line": 135,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "FOLD SUM with computed expression argument",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "FOLD SUM with arithmetic expression on edge properties",
+        "line": 152,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "FOLD SUM with arithmetic expression on edge properties",
             "result": {
               "status": "passed"
             }
@@ -1701,8 +1897,50 @@
       },
       {
         "type": "scenario",
+        "name": "Block comments should be supported",
+        "line": 117,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "Block comments should be supported",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "Line comments should be supported",
+        "line": 125,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "Line comments should be supported",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "Inline block comment should be supported",
+        "line": 133,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "Inline block comment should be supported",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
         "name": "Valid DERIVE clause with real syntax should parse",
-        "line": 115,
+        "line": 140,
         "steps": [
           {
             "keyword": "Scenario ",
@@ -2884,8 +3122,7 @@
             "keyword": "Scenario ",
             "name": "Default unlimited retains all proofs \u2014 backward compatible",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/monotonic/TopKProofs.feature:22:5\n      Matched: crates/uni-locy-tck/src/steps/then_evaluate.rs:56:1\n      Step panicked. Captured output: Expected successful evaluation, but got error: Query error: LocyRuntimeError: Execution error: Sub-plan error: DataFusion planning failed: Schema error: No field named \"PROB\". Valid fields are \"x._vid\", \"x._labels\", \"x._all_props\", \"y._vid\", \"y._labels\", \"e._eid\", \"e._type\", \"e.p\", \"y._vid\", \"y._all_props\", y.\n[Summary]\n1 feature\n1 scenario (1 failed)\n4 steps (3 passed, 1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -2893,14 +3130,13 @@
       {
         "type": "scenario",
         "name": "top_k=1 retains only highest-probability proof",
-        "line": 25,
+        "line": 26,
         "steps": [
           {
             "keyword": "Scenario ",
             "name": "top_k=1 retains only highest-probability proof",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/monotonic/TopKProofs.feature:38:5\n      Matched: crates/uni-locy-tck/src/steps/then_evaluate.rs:56:1\n      Step panicked. Captured output: Expected successful evaluation, but got error: Query error: LocyRuntimeError: Execution error: Sub-plan error: DataFusion planning failed: Schema error: No field named \"PROB\". Valid fields are \"x._vid\", \"x._labels\", \"x._all_props\", \"y._vid\", \"y._labels\", \"e._eid\", \"e._type\", \"e.p\", \"y._vid\", \"y._all_props\", y.\n[Summary]\n1 feature\n1 scenario (1 failed)\n4 steps (3 passed, 1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -2908,14 +3144,13 @@
       {
         "type": "scenario",
         "name": "top_k=5 handles diamond graph identically to unlimited",
-        "line": 41,
+        "line": 43,
         "steps": [
           {
             "keyword": "Scenario ",
             "name": "top_k=5 handles diamond graph identically to unlimited",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/monotonic/TopKProofs.feature:53:5\n      Matched: crates/uni-locy-tck/src/steps/then_evaluate.rs:56:1\n      Step panicked. Captured output: Expected successful evaluation, but got error: Query error: LocyRuntimeError: Execution error: Sub-plan error: DataFusion planning failed: Schema error: No field named \"PROB\". Valid fields are \"x._vid\", \"x._labels\", \"x._all_props\", \"y._vid\", \"y._labels\", \"e._eid\", \"e._type\", \"e.p\", \"y._vid\", \"y._all_props\", y.\n[Summary]\n1 feature\n1 scenario (1 failed)\n4 steps (3 passed, 1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -2923,14 +3158,13 @@
       {
         "type": "scenario",
         "name": "EXPLAIN output includes proof_probability when top_k active",
-        "line": 57,
+        "line": 60,
         "steps": [
           {
             "keyword": "Scenario ",
             "name": "EXPLAIN output includes proof_probability when top_k active",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/monotonic/TopKProofs.feature:69:5\n      Matched: crates/uni-locy-tck/src/steps/then_evaluate.rs:56:1\n      Step panicked. Captured output: Expected successful evaluation, but got error: Query error: LocyRuntimeError: Execution error: Sub-plan error: DataFusion planning failed: Schema error: No field named \"PROB\". Valid fields are \"x._vid\", \"x._labels\", \"x._all_props\", \"y._vid\", \"y._labels\", \"e._eid\", \"e._type\", \"e.p\", \"y._vid\", \"y._all_props\", y.\n[Summary]\n1 feature\n1 scenario (1 failed)\n4 steps (3 passed, 1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -3137,8 +3371,50 @@
       },
       {
         "type": "scenario",
+        "name": "QUERY without WHERE clause",
+        "line": 29,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "QUERY without WHERE clause",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "QUERY without WHERE but with RETURN",
+        "line": 36,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "QUERY without WHERE but with RETURN",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "QUERY without WHERE returns all facts",
+        "line": 45,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "QUERY without WHERE returns all facts",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
         "name": "QUERY filters to matching goal bindings",
-        "line": 31,
+        "line": 59,
         "steps": [
           {
             "keyword": "Scenario ",
@@ -3152,7 +3428,7 @@
       {
         "type": "scenario",
         "name": "QUERY returns empty when no match",
-        "line": 45,
+        "line": 73,
         "steps": [
           {
             "keyword": "Scenario ",
@@ -3166,7 +3442,7 @@
       {
         "type": "scenario",
         "name": "QUERY terminates on cyclic graph",
-        "line": 58,
+        "line": 86,
         "steps": [
           {
             "keyword": "Scenario ",

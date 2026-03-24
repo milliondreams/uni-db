@@ -1,26 +1,24 @@
 # TCK Compliance Report
 
-**Generated:** 2026-03-24 11:30:21
-**Results:** `results_20260324_113021.json`
-**Compared to:** `results_20260324_100525.json`
+**Generated:** 2026-03-24 15:40:39
+**Results:** `results_20260324_154038.json`
+**Compared to:** `results_20260324_153532.json`
 
 ## Summary
 
 | Metric | Current | Previous | Delta |
 |--------|---------|----------|-------|
 | Scenarios | 242 | 242 |  |
-| Passed | 242 | 240 | +2 |
-| Failed | 0 | 2 | -2 |
-| Pass Rate | 100.0% | 99.2% | 📈 +0.8pp |
-
-**🟢 Fixed:** 2 scenarios now passing
+| Passed | 242 | 242 |  |
+| Failed | 0 | 0 |  |
+| Pass Rate | 100.0% | 100.0% | ➡️ +0.0pp |
 
 ## Feature Breakdown
 
 | Feature | Scenarios | Passed | Failed | Rate | Delta |
 |---------|-----------|--------|--------|------|-------|
 | ✅ AbductiveReasoning | 4 | 4 | 0 | 100% |  |
-| ✅ Aggregation | 11 | 11 | 0 | 100% | +18pp |
+| ✅ Aggregation | 11 | 11 | 0 | 100% |  |
 | ✅ AlongWithIsRef | 3 | 3 | 0 | 100% |  |
 | ✅ AssumeAbduce | 3 | 3 | 0 | 100% |  |
 | ✅ BasicRules | 6 | 6 | 0 | 100% |  |
@@ -53,13 +51,6 @@
 | ✅ TransitiveClosure | 2 | 2 | 0 | 100% |  |
 | ✅ TripleCombinations | 5 | 5 | 0 | 100% |  |
 | ✅ YieldValueColumns | 5 | 5 | 0 | 100% |  |
-
-## 🟢 Newly Passing
-
-Scenarios that were failing but are now passing:
-
-- **Aggregation** — COUNT zero-argument counts all facts (line 120)
-- **Aggregation** — MCOUNT zero-argument counts all facts in group (line 103)
 
 ## Failed Scenarios
 

@@ -1154,7 +1154,8 @@
             "keyword": "Scenario ",
             "name": "ALONG binding directly as YIELD column with IS-ref",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/evaluate/AlongWithIsRef.feature:7:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:5:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/evaluate/AlongWithIsRef.feature': '/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/evaluate/AlongWithIsRef.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -1168,7 +1169,8 @@
             "keyword": "Scenario ",
             "name": "ALONG binding used in compound YIELD expression with IS-ref",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/evaluate/AlongWithIsRef.feature:7:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:5:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/evaluate/AlongWithIsRef.feature': '/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/evaluate/AlongWithIsRef.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -1182,7 +1184,8 @@
             "keyword": "Scenario ",
             "name": "ALONG binding with alias in YIELD with IS-ref",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/evaluate/AlongWithIsRef.feature:7:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:5:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/evaluate/AlongWithIsRef.feature': '/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/evaluate/AlongWithIsRef.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -1644,8 +1647,7 @@
             "keyword": "Scenario ",
             "name": "MCOUNT zero-argument counts all facts in group",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/fold/Aggregation.feature:118:5\n      Matched: crates/uni-locy-tck/src/steps/then_evaluate.rs:106:1\n      Step panicked. Captured output: assertion `left == right` failed: Expected derived relation 'friend_count' to have 2 facts, but got 3. Available relations: [\"friend_count\"]\n        left: 3\n       right: 2\n[Summary]\n1 feature\n1 scenario (1 failed)\n5 steps (4 passed, 1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1659,8 +1661,7 @@
             "keyword": "Scenario ",
             "name": "COUNT zero-argument counts all facts",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/fold/Aggregation.feature:125:5\n      Matched: crates/uni-locy-tck/src/steps/when_evaluate.rs:4:1\n      Step panicked. Captured output: index out of bounds: the len is 0 but the index is 0\n[Summary]\n1 feature\n1 scenario (1 failed)\n3 steps (2 passed, 1 failed)\n"
+              "status": "passed"
             }
           }
         ]

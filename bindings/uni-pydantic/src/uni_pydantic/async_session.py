@@ -175,7 +175,7 @@ class AsyncUniSession:
         self._pending_delete.clear()
 
     @property
-    def db(self) -> "uni_db.AsyncDatabase":
+    def db(self) -> uni_db.AsyncDatabase:
         """Access the underlying uni_db.AsyncDatabase for low-level operations."""
         return self._db
 

@@ -9,7 +9,7 @@ use crate::types::BulkStats;
 use ::uni_db::Uni;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use uni_common::core::schema::{DataType, IndexDefinition};
 
@@ -242,6 +242,30 @@ impl QueryBuilder {
     fn max_memory(mut slf: PyRefMut<'_, Self>, bytes: usize) -> PyRefMut<'_, Self> {
         slf.max_memory = Some(bytes);
         slf
+    }
+
+    /// Open a streaming cursor for this query.
+    fn cursor(&self, py: Python) -> PyResult<crate::sync_api::QueryCursor> {
+        let mut rust_params = HashMap::new();
+        for (k, v) in &self.params {
+            let val = convert::py_object_to_value(py, v)?;
+            rust_params.insert(k.clone(), val);
+        }
+        let cursor = pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(core::query_cursor_core(
+                &self.inner,
+                &self.cypher,
+                rust_params,
+                self.timeout_secs,
+                self.max_memory,
+            ))
+            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
+        let columns = cursor.columns().to_vec();
+        Ok(crate::sync_api::QueryCursor {
+            cursor: std::sync::Mutex::new(Some(cursor)),
+            buffer: std::sync::Mutex::new(VecDeque::new()),
+            columns,
+        })
     }
 
     /// Execute the query and fetch all results.

@@ -11,7 +11,7 @@ use ::uni_db::Uni;
 use pyo3::IntoPyObjectExt;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 // ============================================================================
@@ -528,6 +528,29 @@ impl AsyncDatabase {
             core::bulk_insert_edges_core(&inner, &edge_type, rust_edges)
                 .await
                 .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+        })
+    }
+
+    /// Open a streaming cursor for a query.
+    #[pyo3(signature = (cypher, params=None))]
+    fn query_cursor<'py>(
+        &self,
+        py: Python<'py>,
+        cypher: String,
+        params: Option<HashMap<String, Py<PyAny>>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let rust_params = convert::prepare_params(py, params)?;
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let cursor = core::query_cursor_core(&inner, &cypher, rust_params, None, None)
+                .await
+                .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
+            let columns = cursor.columns().to_vec();
+            Ok(AsyncQueryCursor {
+                cursor: Arc::new(tokio::sync::Mutex::new(Some(cursor))),
+                buffer: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
+                columns,
+            })
         })
     }
 
@@ -1423,6 +1446,32 @@ impl AsyncQueryBuilder {
         slf
     }
 
+    /// Open a streaming cursor for this query (returns awaitable).
+    fn cursor<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let mut rust_params = HashMap::new();
+        for (k, v) in &self.params {
+            let val = convert::py_object_to_value(py, v)?;
+            rust_params.insert(k.clone(), val);
+        }
+
+        let inner = self.inner.clone();
+        let cypher = self.cypher.clone();
+        let timeout_secs = self.timeout_secs;
+        let max_memory = self.max_memory;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let cursor =
+                core::query_cursor_core(&inner, &cypher, rust_params, timeout_secs, max_memory)
+                    .await
+                    .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
+            let columns = cursor.columns().to_vec();
+            Ok(AsyncQueryCursor {
+                cursor: Arc::new(tokio::sync::Mutex::new(Some(cursor))),
+                buffer: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
+                columns,
+            })
+        })
+    }
+
     /// Execute the query and fetch all results (returns awaitable).
     fn run<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let mut rust_params = HashMap::new();
@@ -1441,6 +1490,191 @@ impl AsyncQueryBuilder {
                     .await
                     .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
             Python::attach(|py| convert::rows_to_py(py, rows.rows))
+        })
+    }
+}
+
+// ============================================================================
+// AsyncQueryCursor
+// ============================================================================
+
+/// Async cursor-based result streaming for large query result sets.
+///
+/// Implements Python's async iterator (`__aiter__`/`__anext__`) and async context
+/// manager (`__aenter__`/`__aexit__`).
+#[pyclass]
+pub struct AsyncQueryCursor {
+    cursor: Arc<tokio::sync::Mutex<Option<core::QueryCursor>>>,
+    buffer: Arc<tokio::sync::Mutex<VecDeque<core::Row>>>,
+    #[pyo3(get)]
+    columns: Vec<String>,
+}
+
+impl AsyncQueryCursor {
+    /// Pull the next single row, refilling from the batch stream as needed.
+    async fn next_row_async(&self) -> Result<Option<core::Row>, String> {
+        {
+            let mut buf = self.buffer.lock().await;
+            if let Some(row) = buf.pop_front() {
+                return Ok(Some(row));
+            }
+        }
+        // Buffer empty – fetch next batch from cursor.
+        let mut guard = self.cursor.lock().await;
+        let cursor = match guard.as_mut() {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+        match cursor.next_batch().await {
+            Some(Ok(rows)) => {
+                let mut buf = self.buffer.lock().await;
+                let mut iter = rows.into_iter();
+                let first = iter.next();
+                buf.extend(iter);
+                Ok(first)
+            }
+            Some(Err(e)) => Err(e.to_string()),
+            None => Ok(None),
+        }
+    }
+}
+
+#[pymethods]
+impl AsyncQueryCursor {
+    /// Fetch a single row, or `None` if exhausted.
+    fn fetch_one<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let cursor = self.cursor.clone();
+        let buffer = self.buffer.clone();
+        let self_clone = AsyncQueryCursor {
+            cursor,
+            buffer,
+            columns: self.columns.clone(),
+        };
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            match self_clone.next_row_async().await {
+                Ok(Some(row)) => Python::attach(|py| {
+                    let dict = PyDict::new(py);
+                    for (col, val) in row.as_map() {
+                        dict.set_item(col, convert::value_to_py(py, val)?)?;
+                    }
+                    Ok(Some(dict.into_py_any(py)?))
+                }),
+                Ok(None) => Ok(None),
+                Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e)),
+            }
+        })
+    }
+
+    /// Fetch up to `n` rows.
+    #[pyo3(signature = (n))]
+    fn fetch_many<'py>(&self, py: Python<'py>, n: usize) -> PyResult<Bound<'py, PyAny>> {
+        let cursor = self.cursor.clone();
+        let buffer = self.buffer.clone();
+        let self_clone = AsyncQueryCursor {
+            cursor,
+            buffer,
+            columns: self.columns.clone(),
+        };
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let mut rows = Vec::with_capacity(n);
+            for _ in 0..n {
+                match self_clone.next_row_async().await {
+                    Ok(Some(row)) => rows.push(row),
+                    Ok(None) => break,
+                    Err(e) => {
+                        return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))
+                    }
+                }
+            }
+            Python::attach(|py| convert::rows_to_py(py, rows))
+        })
+    }
+
+    /// Fetch all remaining rows.
+    fn fetch_all<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let cursor_arc = self.cursor.clone();
+        let buffer_arc = self.buffer.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            // Drain buffer first
+            let mut rows: Vec<core::Row> = {
+                let mut buf = buffer_arc.lock().await;
+                buf.drain(..).collect()
+            };
+            // Take and consume the cursor
+            let cursor_opt = {
+                let mut guard = cursor_arc.lock().await;
+                guard.take()
+            };
+            if let Some(cursor) = cursor_opt {
+                let remaining = cursor.collect_remaining().await.map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
+                })?;
+                rows.extend(remaining);
+            }
+            Python::attach(|py| convert::rows_to_py(py, rows))
+        })
+    }
+
+    /// Close the cursor, releasing resources.
+    fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let cursor_arc = self.cursor.clone();
+        let buffer_arc = self.buffer.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let _ = cursor_arc.lock().await.take();
+            buffer_arc.lock().await.clear();
+            Ok(())
+        })
+    }
+
+    fn __aiter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let cursor = self.cursor.clone();
+        let buffer = self.buffer.clone();
+        let self_clone = AsyncQueryCursor {
+            cursor,
+            buffer,
+            columns: self.columns.clone(),
+        };
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            match self_clone.next_row_async().await {
+                Ok(Some(row)) => Python::attach(|py| {
+                    let dict = PyDict::new(py);
+                    for (col, val) in row.as_map() {
+                        dict.set_item(col, convert::value_to_py(py, val)?)?;
+                    }
+                    dict.into_py_any(py)
+                }),
+                Ok(None) => Err(pyo3::exceptions::PyStopAsyncIteration::new_err(
+                    "end of cursor",
+                )),
+                Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e)),
+            }
+        })
+    }
+
+    fn __aenter__<'py>(slf: PyRef<'py, Self>) -> PyResult<Bound<'py, PyAny>> {
+        let py = slf.py();
+        let obj: Py<PyAny> = slf.into_py_any(py)?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok(obj) })
+    }
+
+    #[pyo3(signature = (_exc_type=None, _exc_val=None, _exc_tb=None))]
+    fn __aexit__<'py>(
+        &self,
+        py: Python<'py>,
+        _exc_type: Option<Py<PyAny>>,
+        _exc_val: Option<Py<PyAny>>,
+        _exc_tb: Option<Py<PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let cursor_arc = self.cursor.clone();
+        let buffer_arc = self.buffer.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let _ = cursor_arc.lock().await.take();
+            buffer_arc.lock().await.clear();
+            Ok(false) // don't suppress exceptions
         })
     }
 }

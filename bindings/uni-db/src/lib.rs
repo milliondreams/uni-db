@@ -36,6 +36,7 @@ fn _uni_db(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Sync query
     m.add_class::<builders::QueryBuilder>()?;
+    m.add_class::<sync_api::QueryCursor>()?;
 
     // Schema
     m.add_class::<builders::SchemaBuilder>()?;
@@ -60,6 +61,7 @@ fn _uni_db(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<async_api::AsyncBulkWriter>()?;
     m.add_class::<async_api::AsyncBulkWriterBuilder>()?;
     m.add_class::<async_api::AsyncQueryBuilder>()?;
+    m.add_class::<async_api::AsyncQueryCursor>()?;
     m.add_class::<async_api::AsyncSchemaBuilder>()?;
     m.add_class::<async_api::AsyncLabelBuilder>()?;
     m.add_class::<async_api::AsyncEdgeTypeBuilder>()?;

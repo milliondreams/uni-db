@@ -203,7 +203,7 @@ class UniSession:
         self._pending_delete.clear()
 
     @property
-    def db(self) -> "uni_db.Database":
+    def db(self) -> uni_db.Database:
         """Access the underlying uni_db.Database for low-level operations."""
         return self._db
 

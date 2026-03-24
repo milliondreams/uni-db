@@ -18,6 +18,7 @@ use uni_common::core::schema::{
 // Re-export types used by the sync and async API modules.
 pub use ::uni_db::api::schema::LabelInfo as UniLabelInfo;
 pub use ::uni_db::{ExplainOutput, ProfileOutput, QueryResult, Row};
+pub use ::uni_db::query_crate::QueryCursor;
 
 // ============================================================================
 // Query Core
@@ -55,6 +56,27 @@ pub async fn query_builder_core(
         builder = builder.max_memory(m);
     }
     builder.fetch_all().await.map_err(|e| e.to_string())
+}
+
+/// Open a streaming cursor for a query with parameters, timeout, and memory limit.
+pub async fn query_cursor_core(
+    db: &Uni,
+    cypher: &str,
+    params: HashMap<String, Value>,
+    timeout_secs: Option<f64>,
+    max_memory: Option<usize>,
+) -> Result<QueryCursor, String> {
+    let mut builder = db.query_with(cypher);
+    for (k, v) in params {
+        builder = builder.param(&k, v);
+    }
+    if let Some(t) = timeout_secs {
+        builder = builder.timeout(Duration::from_secs_f64(t));
+    }
+    if let Some(m) = max_memory {
+        builder = builder.max_memory(m);
+    }
+    builder.query_cursor().await.map_err(|e| e.to_string())
 }
 
 /// Execute a mutation query, returning affected row count.

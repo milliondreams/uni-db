@@ -43,8 +43,7 @@ impl QueryCursor {
             Some(c) => c,
             None => return Ok(None), // closed
         };
-        let batch = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(cursor.next_batch());
+        let batch = pyo3_async_runtimes::tokio::get_runtime().block_on(cursor.next_batch());
         match batch {
             Some(Ok(rows)) => {
                 let mut iter = rows.into_iter();
@@ -110,9 +109,7 @@ impl QueryCursor {
         if let Some(cursor) = cursor_opt {
             let remaining = pyo3_async_runtimes::tokio::get_runtime()
                 .block_on(cursor.collect_remaining())
-                .map_err(|e| {
-                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
-                })?;
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
             rows.extend(remaining);
         }
 
@@ -270,7 +267,11 @@ impl Database {
         let rust_params = convert::prepare_params(py, params)?;
         let cursor = pyo3_async_runtimes::tokio::get_runtime()
             .block_on(core::query_cursor_core(
-                &self.inner, cypher, rust_params, None, None,
+                &self.inner,
+                cypher,
+                rust_params,
+                None,
+                None,
             ))
             .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
         let columns = cursor.columns().to_vec();

@@ -17,8 +17,8 @@ use uni_common::core::schema::{
 
 // Re-export types used by the sync and async API modules.
 pub use ::uni_db::api::schema::LabelInfo as UniLabelInfo;
-pub use ::uni_db::{ExplainOutput, ProfileOutput, QueryResult, Row};
 pub use ::uni_db::query_crate::QueryCursor;
+pub use ::uni_db::{ExplainOutput, ProfileOutput, QueryResult, Row};
 
 // ============================================================================
 // Query Core

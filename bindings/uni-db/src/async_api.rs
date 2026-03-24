@@ -1581,9 +1581,7 @@ impl AsyncQueryCursor {
                 match self_clone.next_row_async().await {
                     Ok(Some(row)) => rows.push(row),
                     Ok(None) => break,
-                    Err(e) => {
-                        return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))
-                    }
+                    Err(e) => return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e)),
                 }
             }
             Python::attach(|py| convert::rows_to_py(py, rows))

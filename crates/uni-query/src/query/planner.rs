@@ -2061,6 +2061,7 @@ pub enum LogicalPlan {
         probability_epsilon: f64,
         exact_probability: bool,
         max_bdd_variables: usize,
+        top_k_proofs: usize,
     },
     /// FOLD operator: lattice-join non-key columns per KEY group.
     LocyFold {

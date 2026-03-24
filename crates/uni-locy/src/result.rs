@@ -52,6 +52,9 @@ pub struct DerivationNode {
     /// True when this node's probability was computed via BDD fallback
     /// (independence mode) because the group exceeded `max_bdd_variables`.
     pub approximate: bool,
+    /// Probability of this specific proof path, populated when top-k proof
+    /// filtering is active (Scallop, Huang et al. 2021).
+    pub proof_probability: Option<f64>,
 }
 
 /// Result of an ABDUCE query.

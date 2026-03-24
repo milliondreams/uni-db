@@ -2872,6 +2872,68 @@
     ]
   },
   {
+    "name": "TopKProofs",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/monotonic/TopKProofs.feature",
+    "elements": [
+      {
+        "type": "scenario",
+        "name": "Default unlimited retains all proofs \u2014 backward compatible",
+        "line": 9,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "Default unlimited retains all proofs \u2014 backward compatible",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "top_k=1 retains only highest-probability proof",
+        "line": 26,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "top_k=1 retains only highest-probability proof",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "top_k=5 handles diamond graph identically to unlimited",
+        "line": 43,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "top_k=5 handles diamond graph identically to unlimited",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "EXPLAIN output includes proof_probability when top_k active",
+        "line": 60,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "EXPLAIN output includes proof_probability when top_k active",
+            "result": {
+              "status": "passed"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  {
     "name": "StratifiedNegation",
     "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/negation/StratifiedNegation.feature",
     "elements": [

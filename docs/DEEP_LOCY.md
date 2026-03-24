@@ -110,12 +110,12 @@ pub enum WarningCode {
 }
 ```
 
-**DerivationEntry** (`crates/uni-query/src/query/df_graph/locy_explain.rs`):
+**ProvenanceAnnotation** (`crates/uni-query/src/query/df_graph/locy_explain.rs`):
 ```rust
-pub struct DerivationEntry {
+pub struct ProvenanceAnnotation {
     pub rule_name: String,
     pub clause_index: usize,
-    pub inputs: Vec<DerivationInput>,        // currently always vec![]
+    pub support: Vec<ProofTerm>,        // currently always vec![]
     pub along_values: HashMap<String, Value>,
     pub iteration: usize,
     pub fact_row: Row,
@@ -134,7 +134,7 @@ Where `MonotonicAggState::is_stable()` compares current accumulators against a s
 
 ### 1.5 ALONG Status: Partial Implementation
 
-ALONG is parsed into the AST (`AlongBinding` with `LocyExpr` supporting `PrevRef`), compiled, and tracked for EXPLAIN output. However, value accumulation across recursive hops during fixpoint iteration is not fully threaded through — the `along_values` field in `DerivationEntry` is initialized to `HashMap::new()` in the provenance recorder. This means ALONG values appear in derivation trees but may not be correctly propagated through multi-hop recursive evaluation.
+ALONG is parsed into the AST (`AlongBinding` with `LocyExpr` supporting `PrevRef`), compiled, and tracked for EXPLAIN output. However, value accumulation across recursive hops during fixpoint iteration is not fully threaded through — the `along_values` field in `ProvenanceAnnotation` is initialized to `HashMap::new()` in the provenance recorder. This means ALONG values appear in derivation trees but may not be correctly propagated through multi-hop recursive evaluation.
 
 ---
 
@@ -387,7 +387,7 @@ Overestimation: +10 percentage points
 
 ### 7.2 Existing Infrastructure
 
-The `DerivationTracker` already records provenance per derived fact (rule name, clause index, iteration, fact row). The `inputs` field exists in `DerivationEntry` but is always `vec![]` — it was designed for base-fact tracking but never populated.
+The `ProvenanceStore` already records provenance per derived fact (rule name, clause index, iteration, fact row). The `support` field exists in `ProvenanceAnnotation` but is always `vec![]` — it was designed for base-fact tracking but never populated.
 
 ### 7.3 Phased Delivery
 
@@ -396,7 +396,7 @@ The `DerivationTracker` already records provenance per derived fact (rule name, 
 - Ships with R1/R2 implementation. No new infrastructure needed.
 
 **Phase B: Shared-Proof Detection (warning)**
-- Populate `DerivationEntry.inputs` during fixpoint evaluation.
+- Populate `ProvenanceAnnotation.support` during fixpoint evaluation.
 - Track which base probabilistic facts contribute to each derivation.
 - If derivations in the same MNOR/MPROD group share a base fact: emit `WarningCode::SharedProbabilisticDependency`.
 
@@ -575,7 +575,7 @@ This lets an auditor see: which parts of the derivation are symbolic vs. neural,
 
 ### 10.4 Existing Infrastructure
 
-The `DerivationTracker` and `DerivationEntry` in `locy_explain.rs` provide the skeleton. The `explain_rule()` function already builds derivation trees with cycle detection and depth limiting. What's missing is `NeuralProvenance` nodes in the tree and confidence/calibration metadata.
+The `ProvenanceStore` and `ProvenanceAnnotation` in `locy_explain.rs` provide the skeleton. The `explain_rule()` function already builds derivation trees with cycle detection and depth limiting. What's missing is `NeuralProvenance` nodes in the tree and confidence/calibration metadata.
 
 ---
 
@@ -992,7 +992,7 @@ similar_to() [~90% done]
 2. **PROB annotation** — Extend `YieldColumn` with `is_prob: bool`, parse the keyword, validate one-per-rule.
 3. **similar_to() L2/Dot metrics** — Wire existing `calculate_score()` into the expression evaluator.
 4. **New WarningCode variants** — Add the probability warning codes to the existing enum.
-5. **Populate `DerivationEntry.inputs`** — The field exists but is always empty; populate it during fixpoint for Phase B.
+5. **Populate `ProvenanceAnnotation.support`** — The field exists but is always empty; populate it during fixpoint for Phase B.
 
 ---
 

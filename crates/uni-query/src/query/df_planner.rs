@@ -1165,6 +1165,7 @@ impl HybridPhysicalPlanner {
                 probability_epsilon,
                 exact_probability,
                 max_bdd_variables,
+                top_k_proofs,
             } => {
                 let output_schema = super::df_graph::locy_program::stats_schema();
 
@@ -1187,6 +1188,7 @@ impl HybridPhysicalPlanner {
                         *probability_epsilon,
                         *exact_probability,
                         *max_bdd_variables,
+                        *top_k_proofs,
                     ),
                 ))
             }

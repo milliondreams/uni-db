@@ -13,7 +13,7 @@ use crate::query::df_graph::common::{
     collect_all_partitions, compute_plan_properties, execute_subplan,
 };
 use crate::query::df_graph::locy_best_by::SortCriterion;
-use crate::query::df_graph::locy_explain::DerivationTracker;
+use crate::query::df_graph::locy_explain::ProvenanceStore;
 use crate::query::df_graph::locy_fixpoint::{
     DerivedScanRegistry, FixpointClausePlan, FixpointExec, FixpointRulePlan, IsRefBinding,
 };
@@ -122,13 +122,15 @@ pub struct LocyProgramExec {
     /// Shared slot for groups where BDD fell back to independence mode.
     approximate_slot: Arc<StdRwLock<HashMap<String, Vec<String>>>>,
     /// Optional provenance tracker injected after construction (via `set_derivation_tracker`).
-    derivation_tracker: Arc<StdRwLock<Option<Arc<DerivationTracker>>>>,
+    derivation_tracker: Arc<StdRwLock<Option<Arc<ProvenanceStore>>>>,
     /// Shared slot written with per-rule iteration counts after fixpoint convergence.
     iteration_counts_slot: Arc<StdRwLock<HashMap<String, usize>>>,
     /// Shared slot written with peak memory bytes after fixpoint completes.
     peak_memory_slot: Arc<StdRwLock<usize>>,
     /// Shared slot for runtime warnings collected during evaluation.
     warnings_slot: Arc<StdRwLock<Vec<RuntimeWarning>>>,
+    /// Top-k proof filtering: 0 = unlimited (default), >0 = retain at most k proofs per fact.
+    top_k_proofs: usize,
 }
 
 impl fmt::Debug for LocyProgramExec {
@@ -167,6 +169,7 @@ impl LocyProgramExec {
         probability_epsilon: f64,
         exact_probability: bool,
         max_bdd_variables: usize,
+        top_k_proofs: usize,
     ) -> Self {
         let properties = compute_plan_properties(Arc::clone(&output_schema));
         Self {
@@ -195,6 +198,7 @@ impl LocyProgramExec {
             iteration_counts_slot: Arc::new(StdRwLock::new(HashMap::new())),
             peak_memory_slot: Arc::new(StdRwLock::new(0)),
             warnings_slot: Arc::new(StdRwLock::new(Vec::new())),
+            top_k_proofs,
         }
     }
 
@@ -206,11 +210,11 @@ impl LocyProgramExec {
         Arc::clone(&self.derived_store_slot)
     }
 
-    /// Inject a `DerivationTracker` to record provenance during fixpoint iteration.
+    /// Inject a `ProvenanceStore` to record provenance during fixpoint iteration.
     ///
     /// Must be called before `execute()` is invoked (i.e., before DataFusion runs
     /// the physical plan). Uses interior mutability so it works through `&self`.
-    pub fn set_derivation_tracker(&self, tracker: Arc<DerivationTracker>) {
+    pub fn set_derivation_tracker(&self, tracker: Arc<ProvenanceStore>) {
         if let Ok(mut guard) = self.derivation_tracker.write() {
             *guard = Some(tracker);
         }
@@ -324,6 +328,7 @@ impl ExecutionPlan for LocyProgramExec {
         let peak_memory_slot = Arc::clone(&self.peak_memory_slot);
         let derivation_tracker = self.derivation_tracker.read().ok().and_then(|g| g.clone());
         let warnings_slot = Arc::clone(&self.warnings_slot);
+        let top_k_proofs = self.top_k_proofs;
 
         let fut = async move {
             run_program(
@@ -349,6 +354,7 @@ impl ExecutionPlan for LocyProgramExec {
                 peak_memory_slot,
                 derivation_tracker,
                 warnings_slot,
+                top_k_proofs,
             )
             .await
         };
@@ -453,8 +459,9 @@ async fn run_program(
     approximate_slot: Arc<StdRwLock<HashMap<String, Vec<String>>>>,
     iteration_counts_slot: Arc<StdRwLock<HashMap<String, usize>>>,
     peak_memory_slot: Arc<StdRwLock<usize>>,
-    derivation_tracker: Option<Arc<DerivationTracker>>,
+    derivation_tracker: Option<Arc<ProvenanceStore>>,
     warnings_slot: Arc<StdRwLock<Vec<RuntimeWarning>>>,
+    top_k_proofs: usize,
 ) -> DFResult<Vec<RecordBatch>> {
     let start = Instant::now();
     let mut derived_store = DerivedStore::new();
@@ -497,6 +504,7 @@ async fn run_program(
                 max_bdd_variables,
                 Arc::clone(&warnings_slot),
                 Arc::clone(&approximate_slot),
+                top_k_proofs,
             );
 
             let task_ctx = session_ctx.read().task_ctx();
@@ -622,12 +630,13 @@ async fn run_program(
 
                 // Record provenance and detect shared proofs for non-recursive rules.
                 let shared_info = if let Some(ref tracker) = derivation_tracker {
-                    super::locy_fixpoint::record_and_detect_shared_proofs_nonrecursive(
+                    super::locy_fixpoint::record_and_detect_lineage_nonrecursive(
                         fp_rule,
                         &tagged_clause_facts,
                         tracker,
                         &warnings_slot,
                         &registry,
+                        top_k_proofs,
                     )
                 } else {
                     None
@@ -644,7 +653,7 @@ async fn run_program(
                     && let Some(ref info) = shared_info
                     && let Some(ref tracker) = derivation_tracker
                 {
-                    all_clause_facts = super::locy_fixpoint::apply_bdd_for_shared_groups(
+                    all_clause_facts = super::locy_fixpoint::apply_exact_wmc(
                         all_clause_facts,
                         fp_rule,
                         info,

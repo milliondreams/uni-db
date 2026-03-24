@@ -21,7 +21,7 @@ use uni_query::QueryPlanner;
 use uni_query::query::df_graph::locy_ast_builder::build_match_return_query;
 use uni_query::query::df_graph::locy_delta::{RowRelation, RowStore, extract_cypher_conditions};
 use uni_query::query::df_graph::locy_eval::record_batches_to_locy_rows;
-use uni_query::query::df_graph::locy_explain::DerivationTracker;
+use uni_query::query::df_graph::locy_explain::ProvenanceStore;
 use uni_query::query::df_graph::{DerivedFactSource, LocyExecutionContext};
 
 use crate::api::Uni;
@@ -80,6 +80,7 @@ impl<'a> LocyEngine<'a> {
                 config.probability_epsilon,
                 config.exact_probability,
                 config.max_bdd_variables,
+                config.top_k_proofs,
             )
             .map_err(|e| UniError::Query {
                 message: format!("LocyPlanBuildError: {e}"),
@@ -122,10 +123,8 @@ impl<'a> LocyEngine<'a> {
             })
         });
         let needs_tracker = has_explain || has_prob_fold;
-        let tracker: Option<Arc<uni_query::query::df_graph::DerivationTracker>> = if needs_tracker {
-            Some(Arc::new(
-                uni_query::query::df_graph::DerivationTracker::new(),
-            ))
+        let tracker: Option<Arc<uni_query::query::df_graph::ProvenanceStore>> = if needs_tracker {
+            Some(Arc::new(uni_query::query::df_graph::ProvenanceStore::new()))
         } else {
             None
         };
@@ -286,6 +285,7 @@ impl<'a> LocyEngine<'a> {
                 config.probability_epsilon,
                 config.exact_probability,
                 config.max_bdd_variables,
+                config.top_k_proofs,
             )
             .map_err(|e| UniError::Query {
                 message: format!("LocyPlanBuildError: {e}"),
@@ -674,7 +674,7 @@ fn dispatch_native_command<'a>(
     config: &'a LocyConfig,
     orch_store: &'a mut RowStore,
     stats: &'a mut LocyStats,
-    tracker: Option<Arc<DerivationTracker>>,
+    tracker: Option<Arc<ProvenanceStore>>,
     start: Instant,
     approximate_groups: &'a HashMap<String, Vec<String>>,
 ) -> std::pin::Pin<

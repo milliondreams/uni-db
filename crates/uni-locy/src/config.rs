@@ -38,6 +38,14 @@ pub struct LocyConfig {
     /// aggregation group. If a group exceeds this limit, it falls back to
     /// the independence-mode result and emits a `BddLimitExceeded` warning.
     pub max_bdd_variables: usize,
+    /// Top-k proof filtering (Scallop, Huang et al. 2021): retain at most k
+    /// proofs per derived fact, ranked by proof probability. When 0 (default),
+    /// all proofs are retained (unlimited mode).
+    pub top_k_proofs: usize,
+    /// Override `top_k_proofs` during training. When `Some(k)`, training
+    /// evaluation uses this value instead of `top_k_proofs`. When `None`,
+    /// `top_k_proofs` is used for both training and inference.
+    pub top_k_proofs_training: Option<usize>,
 }
 
 impl Default for LocyConfig {
@@ -55,6 +63,8 @@ impl Default for LocyConfig {
             probability_epsilon: 1e-15,
             exact_probability: false,
             max_bdd_variables: 1000,
+            top_k_proofs: 0,
+            top_k_proofs_training: None,
         }
     }
 }

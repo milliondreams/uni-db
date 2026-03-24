@@ -412,6 +412,7 @@ fn derivation_node_to_py(py: Python, node: uni_locy::DerivationNode) -> PyResult
     }
     dict.set_item("children", children)?;
     dict.set_item("graph_fact", node.graph_fact)?;
+    dict.set_item("proof_probability", node.proof_probability)?;
     Ok(dict.into())
 }
 
@@ -550,6 +551,12 @@ pub fn extract_locy_config(
     }
     if let Some(v) = config.get("max_bdd_variables") {
         locy_config.max_bdd_variables = v.extract::<usize>(py)?;
+    }
+    if let Some(v) = config.get("top_k_proofs") {
+        locy_config.top_k_proofs = v.extract::<usize>(py)?;
+    }
+    if let Some(v) = config.get("top_k_proofs_training") {
+        locy_config.top_k_proofs_training = Some(v.extract::<usize>(py)?);
     }
     Ok(locy_config)
 }

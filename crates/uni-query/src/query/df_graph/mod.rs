@@ -116,7 +116,7 @@ pub use unwind::GraphUnwindExec;
 pub use vector_knn::GraphVectorKnnExec;
 
 pub use locy_best_by::BestByExec;
-pub use locy_explain::{DerivationEntry, DerivationInput, DerivationTracker};
+pub use locy_explain::{ProofTerm, ProvenanceAnnotation, ProvenanceStore};
 pub use locy_fixpoint::{
     DerivedScanEntry, DerivedScanExec, DerivedScanRegistry, FixpointClausePlan, FixpointExec,
     FixpointRulePlan, FixpointState, IsRefBinding, MonotonicFoldBinding,

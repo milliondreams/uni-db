@@ -2872,6 +2872,72 @@
     ]
   },
   {
+    "name": "TopKProofs",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/monotonic/TopKProofs.feature",
+    "elements": [
+      {
+        "type": "scenario",
+        "name": "Default unlimited retains all proofs \u2014 backward compatible",
+        "line": 9,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "Default unlimited retains all proofs \u2014 backward compatible",
+            "result": {
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/monotonic/TopKProofs.feature:22:5\n      Matched: crates/uni-locy-tck/src/steps/then_evaluate.rs:56:1\n      Step panicked. Captured output: Expected successful evaluation, but got error: Query error: LocyRuntimeError: Execution error: Sub-plan error: DataFusion planning failed: Schema error: No field named \"PROB\". Valid fields are \"x._vid\", \"x._labels\", \"y._vid\", \"y._labels\", \"y.name\", \"e._eid\", \"e._type\", \"e.p\", y.\n[Summary]\n1 feature\n1 scenario (1 failed)\n4 steps (3 passed, 1 failed)\n"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "top_k=1 retains only highest-probability proof",
+        "line": 25,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "top_k=1 retains only highest-probability proof",
+            "result": {
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/monotonic/TopKProofs.feature:38:5\n      Matched: crates/uni-locy-tck/src/steps/then_evaluate.rs:56:1\n      Step panicked. Captured output: Expected successful evaluation, but got error: Query error: LocyRuntimeError: Execution error: Sub-plan error: DataFusion planning failed: Schema error: No field named \"PROB\". Valid fields are \"x._vid\", \"x._labels\", \"y._vid\", \"y._labels\", \"y.name\", \"e._eid\", \"e._type\", \"e.p\", y.\n[Summary]\n1 feature\n1 scenario (1 failed)\n4 steps (3 passed, 1 failed)\n"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "top_k=5 handles diamond graph identically to unlimited",
+        "line": 41,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "top_k=5 handles diamond graph identically to unlimited",
+            "result": {
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/monotonic/TopKProofs.feature:53:5\n      Matched: crates/uni-locy-tck/src/steps/then_evaluate.rs:56:1\n      Step panicked. Captured output: Expected successful evaluation, but got error: Query error: LocyRuntimeError: Execution error: Sub-plan error: DataFusion planning failed: Schema error: No field named \"PROB\". Valid fields are \"x._vid\", \"x._labels\", \"y._vid\", \"y._labels\", \"y.name\", \"e._eid\", \"e._type\", \"e.p\", y.\n[Summary]\n1 feature\n1 scenario (1 failed)\n4 steps (3 passed, 1 failed)\n"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "EXPLAIN output includes proof_probability when top_k active",
+        "line": 57,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "EXPLAIN output includes proof_probability when top_k active",
+            "result": {
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/monotonic/TopKProofs.feature:69:5\n      Matched: crates/uni-locy-tck/src/steps/then_evaluate.rs:56:1\n      Step panicked. Captured output: Expected successful evaluation, but got error: Query error: LocyRuntimeError: Execution error: Sub-plan error: DataFusion planning failed: Schema error: No field named \"PROB\". Valid fields are \"x._vid\", \"x._labels\", \"y._vid\", \"y._labels\", \"y.name\", \"e._eid\", \"e._type\", \"e.p\", y.\n[Summary]\n1 feature\n1 scenario (1 failed)\n4 steps (3 passed, 1 failed)\n"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  {
     "name": "StratifiedNegation",
     "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/negation/StratifiedNegation.feature",
     "elements": [

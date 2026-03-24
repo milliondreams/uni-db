@@ -1,17 +1,21 @@
 # TCK Compliance Report
 
-**Generated:** 2026-03-22 18:44:02
-**Results:** `results_20260322_184402.json`
-**Compared to:** `results_20260322_175628.json`
+**Generated:** 2026-03-23 17:01:06
+**Results:** `results_20260323_170106.json`
+**Compared to:** `results_20260323_165625.json`
 
 ## Summary
 
 | Metric | Current | Previous | Delta |
 |--------|---------|----------|-------|
-| Scenarios | 219 | 219 |  |
-| Passed | 219 | 219 |  |
-| Failed | 0 | 0 |  |
-| Pass Rate | 100.0% | 100.0% | ➡️ +0.0pp |
+| Scenarios | 223 | 223 |  |
+| Passed | 223 | 219 | +4 |
+| Failed | 0 | 4 | -4 |
+| Pass Rate | 100.0% | 98.2% | 📈 +1.8pp |
+
+**🟢 Fixed:** 1 scenarios now passing
+
+**🆕 New:** 3 scenarios added
 
 ## Feature Breakdown
 
@@ -46,8 +50,15 @@
 | ✅ SimilarToProbability | 6 | 6 | 0 | 100% |  |
 | ✅ Stratification | 6 | 6 | 0 | 100% |  |
 | ✅ StratifiedNegation | 5 | 5 | 0 | 100% |  |
+| ✅ TopKProofs | 4 | 4 | 0 | 100% | +100pp |
 | ✅ TransitiveClosure | 2 | 2 | 0 | 100% |  |
 | ✅ TripleCombinations | 5 | 5 | 0 | 100% |  |
+
+## 🟢 Newly Passing
+
+Scenarios that were failing but are now passing:
+
+- **TopKProofs** — Default unlimited retains all proofs — backward compatible (line 9)
 
 ## Failed Scenarios
 

@@ -16,7 +16,7 @@ use uni_locy::{CompiledProgram, LocyConfig, LocyError, LocyStats, Row};
 
 use super::locy_delta::RowStore;
 
-use super::locy_explain::DerivationTracker;
+use super::locy_explain::ProvenanceStore;
 use super::locy_traits::LocyExecutionContext;
 
 /// Evaluate an ASSUME block: begin savepoint, apply mutations, re-evaluate rules,
@@ -161,7 +161,7 @@ fn dispatch_body_command<'a>(
                     config,
                     derived_store,
                     stats,
-                    None::<&DerivationTracker>,
+                    None::<&ProvenanceStore>,
                     None,
                 )
                 .await?;

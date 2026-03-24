@@ -25,7 +25,7 @@ use super::locy_delta::RowStore;
 
 use super::locy_ast_builder::value_to_expr;
 use super::locy_eval::eval_expr;
-use super::locy_explain::{DerivationTracker, explain_rule};
+use super::locy_explain::{ProvenanceStore, explain_rule};
 use super::locy_traits::LocyExecutionContext;
 
 /// Evaluate an ABDUCE query using a three-phase pipeline.
@@ -36,7 +36,7 @@ pub async fn evaluate_abduce(
     config: &LocyConfig,
     derived_store: &mut RowStore,
     stats: &mut LocyStats,
-    tracker: Option<&DerivationTracker>,
+    tracker: Option<&ProvenanceStore>,
 ) -> Result<AbductionResult, LocyError> {
     let rule_name = query.rule_name.to_string();
     let rule = program

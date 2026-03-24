@@ -216,6 +216,7 @@ impl<'a> LocyPlanBuilder<'a> {
         probability_epsilon: f64,
         exact_probability: bool,
         max_bdd_variables: usize,
+        top_k_proofs: usize,
     ) -> Result<LogicalPlan> {
         let mut strata = Vec::with_capacity(compiled.strata.len());
 
@@ -245,6 +246,7 @@ impl<'a> LocyPlanBuilder<'a> {
             probability_epsilon,
             exact_probability,
             max_bdd_variables,
+            top_k_proofs,
         };
 
         Ok(plan)
@@ -2318,6 +2320,7 @@ mod tests {
                 1e-15,
                 false,
                 1000,
+                0,
             )
             .unwrap();
 
@@ -2378,6 +2381,7 @@ mod tests {
                 1e-15,
                 false,
                 1000,
+                0,
             )
             .unwrap();
         let registry = if let LogicalPlan::LocyProgram {
@@ -2456,6 +2460,7 @@ mod tests {
                 1e-15,
                 false,
                 1000,
+                0,
             )
             .unwrap();
 
@@ -2530,6 +2535,7 @@ mod tests {
                 1e-15,
                 false,
                 1000,
+                0,
             )
             .unwrap();
         let registry = if let LogicalPlan::LocyProgram {
@@ -2612,6 +2618,7 @@ mod tests {
                 1e-15,
                 false,
                 1000,
+                0,
             )
             .unwrap();
         let registry = if let LogicalPlan::LocyProgram {
@@ -2711,6 +2718,7 @@ mod tests {
                 1e-15,
                 false,
                 1000,
+                0,
             )
             .unwrap();
         let registry = if let LogicalPlan::LocyProgram {
@@ -2774,6 +2782,7 @@ mod tests {
                 1e-15,
                 false,
                 1000,
+                0,
             )
             .unwrap();
         let registry = if let LogicalPlan::LocyProgram {
@@ -2895,6 +2904,7 @@ mod tests {
                 1e-15,
                 false,
                 1000,
+                0,
             )
             .unwrap();
         let registry = if let LogicalPlan::LocyProgram {

@@ -13,7 +13,9 @@ use crate::query::df_graph::common::{
 };
 use crate::query::df_graph::locy_best_by::{BestByExec, SortCriterion};
 use crate::query::df_graph::locy_errors::LocyRuntimeError;
-use crate::query::df_graph::locy_explain::{DerivationEntry, DerivationInput, DerivationTracker};
+use crate::query::df_graph::locy_explain::{
+    ProofTerm, ProvenanceAnnotation, ProvenanceStore, compute_proof_probability,
+};
 use crate::query::df_graph::locy_fold::{FoldBinding, FoldExec};
 use crate::query::df_graph::locy_priority::PriorityExec;
 use crate::query::planner::LogicalPlan;
@@ -820,7 +822,7 @@ async fn run_fixpoint_loop(
     registry: Arc<DerivedScanRegistry>,
     output_schema: SchemaRef,
     max_derived_bytes: usize,
-    derivation_tracker: Option<Arc<DerivationTracker>>,
+    derivation_tracker: Option<Arc<ProvenanceStore>>,
     iteration_counts: Arc<StdRwLock<HashMap<String, usize>>>,
     strict_probability_domain: bool,
     probability_epsilon: f64,
@@ -828,6 +830,7 @@ async fn run_fixpoint_loop(
     max_bdd_variables: usize,
     warnings_slot: Arc<StdRwLock<Vec<RuntimeWarning>>>,
     approximate_slot: Arc<StdRwLock<HashMap<String, Vec<String>>>>,
+    top_k_proofs: usize,
 ) -> DFResult<Vec<RecordBatch>> {
     let start = Instant::now();
     let task_ctx = session_ctx.read().task_ctx();
@@ -967,6 +970,7 @@ async fn run_fixpoint_loop(
                         &clause_candidates,
                         iteration,
                         &registry,
+                        top_k_proofs,
                     );
                 }
             }
@@ -1020,7 +1024,7 @@ async fn run_fixpoint_loop(
 
         // Detect shared proofs before FOLD collapses groups.
         let shared_info = if let Some(ref tracker) = derivation_tracker {
-            detect_shared_proofs(rule, &facts, tracker, &warnings_slot)
+            detect_shared_lineage(rule, &facts, tracker, &warnings_slot)
         } else {
             None
         };
@@ -1030,7 +1034,7 @@ async fn run_fixpoint_loop(
             && let Some(ref info) = shared_info
             && let Some(ref tracker) = derivation_tracker
         {
-            facts = apply_bdd_for_shared_groups(
+            facts = apply_exact_wmc(
                 facts,
                 rule,
                 info,
@@ -1069,14 +1073,22 @@ async fn run_fixpoint_loop(
 /// Called after `merge_delta` returns `true`. Attributes each new fact to the
 /// clause most likely to have produced it, using first-derivation-wins semantics.
 fn record_provenance(
-    tracker: &Arc<DerivationTracker>,
+    tracker: &Arc<ProvenanceStore>,
     rule: &FixpointRulePlan,
     state: &FixpointState,
     clause_candidates: &[Vec<RecordBatch>],
     iteration: usize,
     registry: &Arc<DerivedScanRegistry>,
+    top_k_proofs: usize,
 ) {
     let all_indices: Vec<usize> = (0..rule.yield_schema.fields().len()).collect();
+
+    // Pre-compute base fact probabilities for top-k mode.
+    let base_probs = if top_k_proofs > 0 {
+        tracker.base_fact_probs()
+    } else {
+        HashMap::new()
+    };
 
     for delta_batch in state.all_delta() {
         for row_idx in 0..delta_batch.num_rows() {
@@ -1089,12 +1101,18 @@ fn record_provenance(
             let clause_index =
                 find_clause_for_row(delta_batch, row_idx, &all_indices, clause_candidates);
 
-            let inputs = collect_is_ref_inputs(rule, clause_index, delta_batch, row_idx, registry);
+            let support = collect_is_ref_inputs(rule, clause_index, delta_batch, row_idx, registry);
 
-            let entry = DerivationEntry {
+            let proof_probability = if top_k_proofs > 0 {
+                compute_proof_probability(&support, &base_probs)
+            } else {
+                None
+            };
+
+            let entry = ProvenanceAnnotation {
                 rule_name: rule.name.clone(),
                 clause_index,
-                inputs,
+                support,
                 along_values: {
                     let along_names: Vec<String> = rule
                         .clauses
@@ -1108,8 +1126,13 @@ fn record_provenance(
                 },
                 iteration,
                 fact_row,
+                proof_probability,
             };
-            tracker.record(row_hash, entry);
+            if top_k_proofs > 0 {
+                tracker.record_top_k(row_hash, entry, top_k_proofs);
+            } else {
+                tracker.record(row_hash, entry);
+            }
         }
     }
 }
@@ -1118,14 +1141,14 @@ fn record_provenance(
 ///
 /// For each non-negated IS-ref binding in the clause, extracts body-side key
 /// values from the delta row and finds matching source rows in the registry.
-/// Returns a `DerivationInput` for each match (with the source fact hash).
+/// Returns a `ProofTerm` for each match (with the source fact hash).
 fn collect_is_ref_inputs(
     rule: &FixpointRulePlan,
     clause_index: usize,
     delta_batch: &RecordBatch,
     row_idx: usize,
     registry: &Arc<DerivedScanRegistry>,
-) -> Vec<DerivationInput> {
+) -> Vec<ProofTerm> {
     let clause = match rule.clauses.get(clause_index) {
         Some(c) => c,
         None => return vec![],
@@ -1193,9 +1216,9 @@ fn collect_is_ref_inputs(
                         extract_scalar_key(src_batch, &all_src_indices, src_row)
                     )
                     .into_bytes();
-                    inputs.push(DerivationInput {
-                        is_ref_rule: binding.rule_name.clone(),
-                        fact_hash,
+                    inputs.push(ProofTerm {
+                        source_rule: binding.rule_name.clone(),
+                        base_fact_id: fact_hash,
                     });
                 }
             }
@@ -1206,34 +1229,34 @@ fn collect_is_ref_inputs(
 }
 
 // ---------------------------------------------------------------------------
-// Shared-proof detection
+// Shared-lineage detection
 // ---------------------------------------------------------------------------
 
 /// Detect KEY groups in a rule's pre-fold facts where recursive derivation
 /// may violate the independence assumption of MNOR/MPROD.
 ///
 /// Uses a two-tier strategy:
-/// 1. **Precise**: If the `DerivationTracker` has populated `inputs` for facts
-///    in the group, we recursively collect base-level fact hashes and check for
-///    pairwise overlap. A shared base fact proves a dependency.
-/// 2. **Structural fallback**: When input tracking is unavailable (e.g., the
+/// 1. **Precise**: If the `ProvenanceStore` has populated `support` for facts
+///    in the group, we recursively compute lineage (Cui & Widom 2000) and
+///    check for pairwise overlap. A shared base fact proves a dependency.
+/// 2. **Structural fallback**: When lineage tracking is unavailable (e.g., the
 ///    IS-ref subject variables were projected away), we check whether any fact
 ///    in a multi-row group was derived by a clause that has IS-ref bindings.
 ///    Recursive derivation through shared relations is a strong signal that
 ///    proof paths may share intermediate nodes.
 ///
-/// Per-row data collected during shared-proof detection.
+/// Per-row data collected during shared-lineage detection.
 #[expect(
     dead_code,
-    reason = "Fields accessed via SharedProofInfo in detect_shared_proofs"
+    reason = "Fields accessed via SharedLineageInfo in detect_shared_lineage"
 )]
 pub(crate) struct SharedGroupRow {
     pub fact_hash: Vec<u8>,
-    pub base_facts: HashSet<Vec<u8>>,
+    pub lineage: HashSet<Vec<u8>>,
 }
 
-/// Information about groups with shared proofs, returned by `detect_shared_proofs`.
-pub(crate) struct SharedProofInfo {
+/// Information about groups with shared proofs, returned by `detect_shared_lineage`.
+pub(crate) struct SharedLineageInfo {
     /// KEY group → rows with their base fact sets.
     pub shared_groups: HashMap<Vec<ScalarKey>, Vec<SharedGroupRow>>,
 }
@@ -1244,13 +1267,13 @@ fn fact_hash_key(batch: &RecordBatch, all_indices: &[usize], row_idx: usize) -> 
 }
 
 /// Emits at most one `SharedProbabilisticDependency` warning per rule.
-/// Returns `Some(SharedProofInfo)` if any group has shared proofs.
-fn detect_shared_proofs(
+/// Returns `Some(SharedLineageInfo)` if any group has shared proofs.
+fn detect_shared_lineage(
     rule: &FixpointRulePlan,
     pre_fold_facts: &[RecordBatch],
-    tracker: &Arc<DerivationTracker>,
+    tracker: &Arc<ProvenanceStore>,
     warnings_slot: &Arc<StdRwLock<Vec<RuntimeWarning>>>,
-) -> Option<SharedProofInfo> {
+) -> Option<SharedLineageInfo> {
     use crate::query::df_graph::locy_fold::FoldAggKind;
     use uni_locy::{RuntimeWarning, RuntimeWarningCode};
 
@@ -1289,9 +1312,9 @@ fn detect_shared_proofs(
         let mut has_inputs = false;
         let mut per_row_bases: Vec<HashSet<Vec<u8>>> = Vec::new();
         for fh in fact_hashes {
-            let bases = collect_base_facts_recursive(fh, tracker, &mut HashSet::new());
+            let bases = compute_lineage(fh, tracker, &mut HashSet::new());
             if let Some(entry) = tracker.lookup(fh)
-                && !entry.inputs.is_empty()
+                && !entry.support.is_empty()
             {
                 has_inputs = true;
             }
@@ -1330,7 +1353,7 @@ fn detect_shared_proofs(
                 .zip(per_row_bases.into_iter())
                 .map(|(fh, bases)| SharedGroupRow {
                     fact_hash: fh.clone(),
-                    base_facts: bases,
+                    lineage: bases,
                 })
                 .collect();
             shared_groups.insert(key.clone(), rows);
@@ -1347,9 +1370,9 @@ fn detect_shared_proofs(
         for (key, fact_hashes) in &groups {
             for fh in fact_hashes {
                 if let Some(entry) = tracker.lookup(fh) {
-                    for input in &entry.inputs {
+                    for input in &entry.support {
                         input_to_groups
-                            .entry(input.fact_hash.clone())
+                            .entry(input.base_fact_id.clone())
                             .or_default()
                             .insert(key.clone());
                     }
@@ -1400,7 +1423,7 @@ fn detect_shared_proofs(
                 });
             }
         }
-        Some(SharedProofInfo { shared_groups })
+        Some(SharedLineageInfo { shared_groups })
     } else {
         None
     }
@@ -1409,18 +1432,26 @@ fn detect_shared_proofs(
 /// Record provenance and detect shared proofs for non-recursive strata.
 ///
 /// Non-recursive rules are evaluated in a single pass (no fixpoint loop), so
-/// the regular `record_provenance` + `detect_shared_proofs` path is never hit.
-/// This function bridges that gap by recording a `DerivationEntry` for every
+/// the regular `record_provenance` + `detect_shared_lineage` path is never hit.
+/// This function bridges that gap by recording a `ProvenanceAnnotation` for every
 /// fact produced by each clause and then running the same two-tier detection
 /// logic used by the recursive path.
-pub(crate) fn record_and_detect_shared_proofs_nonrecursive(
+pub(crate) fn record_and_detect_lineage_nonrecursive(
     rule: &FixpointRulePlan,
     tagged_clause_facts: &[(usize, Vec<RecordBatch>)],
-    tracker: &Arc<DerivationTracker>,
+    tracker: &Arc<ProvenanceStore>,
     warnings_slot: &Arc<StdRwLock<Vec<RuntimeWarning>>>,
     registry: &Arc<DerivedScanRegistry>,
-) -> Option<SharedProofInfo> {
+    top_k_proofs: usize,
+) -> Option<SharedLineageInfo> {
     let all_indices: Vec<usize> = (0..rule.yield_schema.fields().len()).collect();
+
+    // Pre-compute base fact probabilities for top-k mode.
+    let base_probs = if top_k_proofs > 0 {
+        tracker.base_fact_probs()
+    } else {
+        HashMap::new()
+    };
 
     // Record provenance for each clause's facts.
     for (clause_index, batches) in tagged_clause_facts {
@@ -1429,12 +1460,18 @@ pub(crate) fn record_and_detect_shared_proofs_nonrecursive(
                 let row_hash = fact_hash_key(batch, &all_indices, row_idx);
                 let fact_row = batch_row_to_value_map(batch, row_idx);
 
-                let inputs = collect_is_ref_inputs(rule, *clause_index, batch, row_idx, registry);
+                let support = collect_is_ref_inputs(rule, *clause_index, batch, row_idx, registry);
 
-                let entry = DerivationEntry {
+                let proof_probability = if top_k_proofs > 0 {
+                    compute_proof_probability(&support, &base_probs)
+                } else {
+                    None
+                };
+
+                let entry = ProvenanceAnnotation {
                     rule_name: rule.name.clone(),
                     clause_index: *clause_index,
-                    inputs,
+                    support,
                     along_values: {
                         let along_names: Vec<String> = rule
                             .clauses
@@ -1450,8 +1487,13 @@ pub(crate) fn record_and_detect_shared_proofs_nonrecursive(
                     },
                     iteration: 0,
                     fact_row,
+                    proof_probability,
                 };
-                tracker.record(row_hash, entry);
+                if top_k_proofs > 0 {
+                    tracker.record_top_k(row_hash, entry, top_k_proofs);
+                } else {
+                    tracker.record(row_hash, entry);
+                }
             }
         }
     }
@@ -1461,24 +1503,26 @@ pub(crate) fn record_and_detect_shared_proofs_nonrecursive(
         .iter()
         .flat_map(|(_, batches)| batches.iter().cloned())
         .collect();
-    detect_shared_proofs(rule, &all_facts, tracker, warnings_slot)
+    detect_shared_lineage(rule, &all_facts, tracker, warnings_slot)
 }
 
-/// Replace multiple rows in shared-proof groups with a single row whose PROB
-/// column carries the BDD-computed exact probability.
+/// Apply exact weighted model counting (WMC) for shared-lineage groups.
 ///
-/// For groups that exceed `max_bdd_variables`, rows are left unchanged and a
-/// `BddLimitExceeded` warning is emitted.
-pub(crate) fn apply_bdd_for_shared_groups(
+/// Replaces multiple rows in groups with shared lineage with a single
+/// representative row whose PROB column carries the BDD-computed exact
+/// probability (Sang et al. 2005). For groups that exceed
+/// `max_bdd_variables`, rows are left unchanged and a `BddLimitExceeded`
+/// warning is emitted.
+pub(crate) fn apply_exact_wmc(
     pre_fold_facts: Vec<RecordBatch>,
     rule: &FixpointRulePlan,
-    shared_info: &SharedProofInfo,
-    tracker: &Arc<DerivationTracker>,
+    shared_info: &SharedLineageInfo,
+    tracker: &Arc<ProvenanceStore>,
     max_bdd_variables: usize,
     warnings_slot: &Arc<StdRwLock<Vec<RuntimeWarning>>>,
     approximate_slot: &Arc<StdRwLock<HashMap<String, Vec<String>>>>,
 ) -> DFResult<Vec<RecordBatch>> {
-    use crate::query::df_graph::locy_bdd::compute_bdd_probability;
+    use crate::query::df_graph::locy_bdd::{SemiringOp, weighted_model_count};
     use crate::query::df_graph::locy_fold::FoldAggKind;
     use uni_locy::{RuntimeWarning, RuntimeWarningCode};
 
@@ -1491,7 +1535,11 @@ pub(crate) fn apply_bdd_for_shared_groups(
         Some(f) => f,
         None => return Ok(pre_fold_facts),
     };
-    let is_nor = matches!(prob_fold.kind, FoldAggKind::Nor);
+    let semiring_op = if matches!(prob_fold.kind, FoldAggKind::Nor) {
+        SemiringOp::Disjunction
+    } else {
+        SemiringOp::Conjunction
+    };
     let prob_col_idx = prob_fold.input_col_index;
     let prob_col_name = rule.yield_schema.field(prob_col_idx).name().clone();
 
@@ -1519,7 +1567,7 @@ pub(crate) fn apply_bdd_for_shared_groups(
             let key = extract_scalar_key(batch, key_indices, row_idx);
             if shared_keys.contains(&key) {
                 let fact_hash = fact_hash_key(batch, &all_indices, row_idx);
-                let bases = collect_base_facts_recursive(&fact_hash, tracker, &mut HashSet::new());
+                let bases = compute_lineage(&fact_hash, tracker, &mut HashSet::new());
 
                 let accum = group_accums.entry(key).or_insert_with(|| GroupAccum {
                     base_facts: Vec::new(),
@@ -1559,14 +1607,14 @@ pub(crate) fn apply_bdd_for_shared_groups(
     }
 
     for (key, accum) in &group_accums {
-        let bdd_result = compute_bdd_probability(
+        let bdd_result = weighted_model_count(
             &accum.base_facts,
             &accum.base_probs,
-            is_nor,
+            semiring_op,
             max_bdd_variables,
         );
 
-        if bdd_result.fell_back {
+        if bdd_result.approximated {
             // Emit BddLimitExceeded warning (one per key group).
             if let Ok(mut warnings) = warnings_slot.write() {
                 let key_desc = format!("{key:?}");
@@ -1663,13 +1711,15 @@ fn value_to_f64(val: &uni_common::Value) -> Option<f64> {
     }
 }
 
-/// Recursively collect base fact hashes from a derivation entry.
+/// Compute the lineage of a derived fact (Cui & Widom 2000).
 ///
-/// A base fact is one with no IS-ref inputs (a graph-level fact). Intermediate
-/// facts are expanded transitively through the tracker.
-fn collect_base_facts_recursive(
+/// Recursively traverses the provenance store to collect the set of base-level
+/// fact hashes that contribute to this derivation. A base fact is one with no
+/// IS-ref support (a graph-level fact). Intermediate facts are expanded
+/// transitively through the store.
+fn compute_lineage(
     fact_hash: &[u8],
-    tracker: &Arc<DerivationTracker>,
+    tracker: &Arc<ProvenanceStore>,
     visited: &mut HashSet<Vec<u8>>,
 ) -> HashSet<Vec<u8>> {
     if !visited.insert(fact_hash.to_vec()) {
@@ -1677,10 +1727,10 @@ fn collect_base_facts_recursive(
     }
 
     match tracker.lookup(fact_hash) {
-        Some(entry) if !entry.inputs.is_empty() => {
+        Some(entry) if !entry.support.is_empty() => {
             let mut bases = HashSet::new();
-            for input in &entry.inputs {
-                let child_bases = collect_base_facts_recursive(&input.fact_hash, tracker, visited);
+            for input in &entry.support {
+                let child_bases = compute_lineage(&input.base_fact_id, tracker, visited);
                 bases.extend(child_bases);
             }
             bases
@@ -2542,7 +2592,7 @@ pub struct FixpointExec {
     metrics: ExecutionPlanMetricsSet,
     max_derived_bytes: usize,
     /// Optional provenance tracker populated during fixpoint iteration.
-    derivation_tracker: Option<Arc<DerivationTracker>>,
+    derivation_tracker: Option<Arc<ProvenanceStore>>,
     /// Shared slot written with per-rule iteration counts after convergence.
     iteration_counts: Arc<StdRwLock<HashMap<String, usize>>>,
     strict_probability_domain: bool,
@@ -2553,6 +2603,8 @@ pub struct FixpointExec {
     warnings_slot: Arc<StdRwLock<Vec<RuntimeWarning>>>,
     /// Shared slot for groups where BDD fell back to independence mode.
     approximate_slot: Arc<StdRwLock<HashMap<String, Vec<String>>>>,
+    /// When > 0, retain at most this many proofs per fact (top-k provenance).
+    top_k_proofs: usize,
 }
 
 impl fmt::Debug for FixpointExec {
@@ -2585,7 +2637,7 @@ impl FixpointExec {
         derived_scan_registry: Arc<DerivedScanRegistry>,
         output_schema: SchemaRef,
         max_derived_bytes: usize,
-        derivation_tracker: Option<Arc<DerivationTracker>>,
+        derivation_tracker: Option<Arc<ProvenanceStore>>,
         iteration_counts: Arc<StdRwLock<HashMap<String, usize>>>,
         strict_probability_domain: bool,
         probability_epsilon: f64,
@@ -2593,6 +2645,7 @@ impl FixpointExec {
         max_bdd_variables: usize,
         warnings_slot: Arc<StdRwLock<Vec<RuntimeWarning>>>,
         approximate_slot: Arc<StdRwLock<HashMap<String, Vec<String>>>>,
+        top_k_proofs: usize,
     ) -> Self {
         let properties = compute_plan_properties(Arc::clone(&output_schema));
         Self {
@@ -2617,6 +2670,7 @@ impl FixpointExec {
             max_bdd_variables,
             warnings_slot,
             approximate_slot,
+            top_k_proofs,
         }
     }
 
@@ -2735,6 +2789,7 @@ impl ExecutionPlan for FixpointExec {
         let max_bdd_variables = self.max_bdd_variables;
         let warnings_slot = Arc::clone(&self.warnings_slot);
         let approximate_slot = Arc::clone(&self.approximate_slot);
+        let top_k_proofs = self.top_k_proofs;
 
         let fut = async move {
             run_fixpoint_loop(
@@ -2757,6 +2812,7 @@ impl ExecutionPlan for FixpointExec {
                 max_bdd_variables,
                 warnings_slot,
                 approximate_slot,
+                top_k_proofs,
             )
             .await
         };

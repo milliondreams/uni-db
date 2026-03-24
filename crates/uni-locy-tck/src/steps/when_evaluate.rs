@@ -124,3 +124,33 @@ async fn when_evaluating_with_exact_probability_and_bdd_limit(
         .await;
     world.set_locy_result(result);
 }
+
+#[when(
+    regex = r#"^evaluating the following Locy program with exact_probability and top_k_proofs (\d+):$"#
+)]
+async fn when_evaluating_with_exact_probability_and_top_k(
+    world: &mut LocyWorld,
+    top_k: usize,
+    step: &cucumber::gherkin::Step,
+) {
+    let program = step
+        .docstring()
+        .expect("Expected a docstring with the Locy program to evaluate");
+
+    world
+        .init_db()
+        .await
+        .expect("Failed to initialize database");
+
+    let config = uni_locy::LocyConfig {
+        exact_probability: true,
+        top_k_proofs: top_k,
+        ..Default::default()
+    };
+    let result = world
+        .db()
+        .locy()
+        .evaluate_with_config(program, &config)
+        .await;
+    world.set_locy_result(result);
+}

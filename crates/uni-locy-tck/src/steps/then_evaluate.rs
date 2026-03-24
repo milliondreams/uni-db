@@ -951,3 +951,80 @@ async fn derived_relation_should_not_contain_approximate_facts(
         approximate_count
     );
 }
+
+#[then(
+    regex = r#"^the command result (\d+) should be an Explain where child (\d+) has proof_probability approximately (.+)$"#
+)]
+async fn command_result_explain_child_proof_probability(
+    world: &mut LocyWorld,
+    idx: usize,
+    child_idx: usize,
+    expected_str: String,
+) {
+    let locy_result = world.locy_result().expect("No evaluation result found");
+
+    let result = locy_result.as_ref().expect("Evaluation failed");
+    let cmd = result
+        .command_results
+        .get(idx)
+        .unwrap_or_else(|| panic!("No command result at index {}", idx));
+
+    match cmd {
+        CommandResult::Explain(node) => {
+            let child = node
+                .children
+                .get(child_idx)
+                .unwrap_or_else(|| panic!("No child at index {}", child_idx));
+            let expected: f64 = expected_str.parse().expect("Invalid float");
+            let actual = child.proof_probability.unwrap_or_else(|| {
+                panic!(
+                    "Child {} has no proof_probability (expected ~{})",
+                    child_idx, expected
+                )
+            });
+            assert!(
+                (actual - expected).abs() < 1e-6,
+                "Child {} proof_probability: expected ~{}, got {}",
+                child_idx,
+                expected,
+                actual
+            );
+        }
+        other => panic!(
+            "Expected command result {} to be an Explain, got {:?}",
+            idx, other
+        ),
+    }
+}
+
+#[then(
+    regex = r#"^the command result (\d+) should be an Explain where all children have proof_probability$"#
+)]
+async fn command_result_explain_all_children_have_proof_probability(
+    world: &mut LocyWorld,
+    idx: usize,
+) {
+    let locy_result = world.locy_result().expect("No evaluation result found");
+
+    let result = locy_result.as_ref().expect("Evaluation failed");
+    let cmd = result
+        .command_results
+        .get(idx)
+        .unwrap_or_else(|| panic!("No command result at index {}", idx));
+
+    match cmd {
+        CommandResult::Explain(node) => {
+            for (i, child) in node.children.iter().enumerate() {
+                assert!(
+                    child.proof_probability.is_some(),
+                    "Child {} is missing proof_probability",
+                    i
+                );
+            }
+        }
+        other => panic!(
+            "Expected command result {} to be an Explain, got {:?}",
+            idx, other
+        ),
+    }
+}

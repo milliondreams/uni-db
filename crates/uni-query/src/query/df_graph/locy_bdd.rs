@@ -1,51 +1,62 @@
-//! BDD-based exact probability computation for shared-proof groups.
+//! Weighted model counting (WMC) via BDDs for shared-lineage groups.
 //!
 //! When MNOR/MPROD groups have shared base facts (violating the
 //! independence assumption), this module computes the correct joint
-//! probability using Binary Decision Diagrams (BDDs).
+//! probability via weighted model counting on Binary Decision Diagrams
+//! (Sang et al. 2005; Darwiche 2011 for SDD generalization).
 
 use std::collections::{HashMap, HashSet};
 
 use biodivine_lib_bdd::{Bdd, BddPointer, BddVariable, BddVariableSet};
 
-/// Result of BDD-based probability computation for a single group.
+/// Semiring operation for probability aggregation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SemiringOp {
+    /// MNOR: P(any row) = 1 − ∏(1 − pᵢ)
+    Disjunction,
+    /// MPROD: P(all rows) = ∏ pᵢ
+    Conjunction,
+}
+
+/// Result of weighted model counting for a single aggregation group.
 #[derive(Debug)]
-pub struct BddGroupResult {
+pub struct WmcResult {
     /// The exact (or fallback) probability value.
     pub probability: f64,
     /// True if the computation fell back to independence mode because
     /// the number of unique base facts exceeded `max_bdd_variables`.
-    pub fell_back: bool,
+    pub approximated: bool,
     /// Number of unique base fact variables in this group.
     pub variable_count: usize,
 }
 
-/// Compute exact probability for an aggregation group using BDDs.
+/// Compute exact probability for an aggregation group via weighted model counting (WMC).
 ///
 /// Each derivation row contributes a set of base facts (identified by
 /// opaque byte-string hashes). The function builds a BDD representing
 /// the Boolean combination of those facts and evaluates the probability
 /// via Shannon expansion.
 ///
-/// - `is_nor = true` → MNOR semantics: P(any row derives) = P(row₁ ∨ row₂ ∨ …)
-/// - `is_nor = false` → MPROD semantics: P(all rows derive) = P(row₁ ∧ row₂ ∧ …)
-pub fn compute_bdd_probability(
-    derivation_base_facts: &[HashSet<Vec<u8>>],
-    base_fact_probabilities: &HashMap<Vec<u8>, f64>,
-    is_nor: bool,
+/// - `SemiringOp::Disjunction` → MNOR semantics: P(any row derives) = P(row₁ ∨ row₂ ∨ …)
+/// - `SemiringOp::Conjunction` → MPROD semantics: P(all rows derive) = P(row₁ ∧ row₂ ∧ …)
+pub fn weighted_model_count(
+    group_lineage: &[HashSet<Vec<u8>>],
+    base_fact_weights: &HashMap<Vec<u8>, f64>,
+    semiring_op: SemiringOp,
     max_bdd_variables: usize,
-) -> BddGroupResult {
-    if derivation_base_facts.is_empty() {
-        return BddGroupResult {
-            probability: if is_nor { 0.0 } else { 1.0 },
-            fell_back: false,
+) -> WmcResult {
+    let is_disjunction = semiring_op == SemiringOp::Disjunction;
+    if group_lineage.is_empty() {
+        return WmcResult {
+            probability: if is_disjunction { 0.0 } else { 1.0 },
+            approximated: false,
             variable_count: 0,
         };
     }
 
     // Collect all unique base facts across all derivation rows.
     let mut all_facts: Vec<Vec<u8>> =
-        HashSet::<&Vec<u8>>::from_iter(derivation_base_facts.iter().flat_map(|s| s.iter()))
+        HashSet::<&Vec<u8>>::from_iter(group_lineage.iter().flat_map(|s| s.iter()))
             .into_iter()
             .cloned()
             .collect();
@@ -56,9 +67,9 @@ pub fn compute_bdd_probability(
 
     // Check BDD variable limit.
     if variable_count > max_bdd_variables || variable_count > u16::MAX as usize {
-        return BddGroupResult {
+        return WmcResult {
             probability: 0.0, // caller should use independence-mode result
-            fell_back: true,
+            approximated: true,
             variable_count,
         };
     }
@@ -75,13 +86,13 @@ pub fn compute_bdd_probability(
     //   term_i = base_fact_a ∧ base_fact_b ∧ …
     let mut combined: Option<Bdd> = None;
 
-    for row_facts in derivation_base_facts {
+    for row_facts in group_lineage {
         if row_facts.is_empty() {
             // A row with no base facts is unconditionally true.
             let term = vars.mk_true();
             combined = Some(match combined {
                 Some(acc) => {
-                    if is_nor {
+                    if is_disjunction {
                         acc.or(&term)
                     } else {
                         acc.and(&term)
@@ -104,7 +115,7 @@ pub fn compute_bdd_probability(
         // Combine with previous rows: OR for MNOR, AND for MPROD.
         combined = Some(match combined {
             Some(acc) => {
-                if is_nor {
+                if is_disjunction {
                     acc.or(&term)
                 } else {
                     acc.and(&term)
@@ -117,9 +128,9 @@ pub fn compute_bdd_probability(
     let bdd = match combined {
         Some(b) => b,
         None => {
-            return BddGroupResult {
-                probability: if is_nor { 0.0 } else { 1.0 },
-                fell_back: false,
+            return WmcResult {
+                probability: if is_disjunction { 0.0 } else { 1.0 },
+                approximated: false,
                 variable_count,
             };
         }
@@ -130,16 +141,16 @@ pub fn compute_bdd_probability(
         .iter()
         .enumerate()
         .map(|(i, fact)| {
-            let p = base_fact_probabilities.get(fact).copied().unwrap_or(0.5);
+            let p = base_fact_weights.get(fact).copied().unwrap_or(0.5);
             (bdd_vars[i], p)
         })
         .collect();
 
     let probability = eval_bdd_probability(&bdd, &prob_map);
 
-    BddGroupResult {
+    WmcResult {
         probability,
-        fell_back: false,
+        approximated: false,
         variable_count,
     }
 }
@@ -201,8 +212,8 @@ mod tests {
         let rows = vec![HashSet::from([a.clone()]), HashSet::from([b.clone()])];
         let probs = HashMap::from([(a, 0.3), (b, 0.5)]);
 
-        let result = compute_bdd_probability(&rows, &probs, true, 1000);
-        assert!(!result.fell_back);
+        let result = weighted_model_count(&rows, &probs, SemiringOp::Disjunction, 1000);
+        assert!(!result.approximated);
         assert_eq!(result.variable_count, 2);
 
         let expected = noisy_or_independent(&[0.3, 0.5]);
@@ -233,8 +244,8 @@ mod tests {
         ];
         let probs = HashMap::from([(a, 0.3), (b, 0.5), (c, 0.7)]);
 
-        let result = compute_bdd_probability(&rows, &probs, true, 1000);
-        assert!(!result.fell_back);
+        let result = weighted_model_count(&rows, &probs, SemiringOp::Disjunction, 1000);
+        assert!(!result.approximated);
         assert_eq!(result.variable_count, 3);
 
         // Exact: P(C) * P(A ∨ B) = 0.7 * (1 - (1-0.3)(1-0.5)) = 0.7 * 0.65 = 0.455
@@ -273,8 +284,8 @@ mod tests {
         ];
         let probs = HashMap::from([(a, 0.3), (b, 0.5), (c, 0.7)]);
 
-        let result = compute_bdd_probability(&rows, &probs, false, 1000);
-        assert!(!result.fell_back);
+        let result = weighted_model_count(&rows, &probs, SemiringOp::Conjunction, 1000);
+        assert!(!result.approximated);
         assert_eq!(result.variable_count, 3);
 
         let expected = 0.3 * 0.5 * 0.7;
@@ -295,8 +306,8 @@ mod tests {
         let probs = HashMap::from([(a, 0.3), (b, 0.5)]);
 
         // Set limit to 1 — there are 2 unique facts, so it should fall back.
-        let result = compute_bdd_probability(&rows, &probs, true, 1);
-        assert!(result.fell_back);
+        let result = weighted_model_count(&rows, &probs, SemiringOp::Disjunction, 1);
+        assert!(result.approximated);
         assert_eq!(result.variable_count, 2);
     }
 
@@ -304,12 +315,12 @@ mod tests {
     fn empty_group_returns_identity() {
         let probs = HashMap::new();
 
-        let nor_result = compute_bdd_probability(&[], &probs, true, 1000);
-        assert!(!nor_result.fell_back);
+        let nor_result = weighted_model_count(&[], &probs, SemiringOp::Disjunction, 1000);
+        assert!(!nor_result.approximated);
         assert!((nor_result.probability - 0.0).abs() < 1e-10);
 
-        let prod_result = compute_bdd_probability(&[], &probs, false, 1000);
-        assert!(!prod_result.fell_back);
+        let prod_result = weighted_model_count(&[], &probs, SemiringOp::Conjunction, 1000);
+        assert!(!prod_result.approximated);
         assert!((prod_result.probability - 1.0).abs() < 1e-10);
     }
 
@@ -324,10 +335,10 @@ mod tests {
 
         // For MNOR or MPROD with a single row, the result is the same:
         // P(A ∧ B) = 0.15
-        let result = compute_bdd_probability(&rows, &probs, true, 1000);
+        let result = weighted_model_count(&rows, &probs, SemiringOp::Disjunction, 1000);
         assert!((result.probability - 0.15).abs() < 1e-10);
 
-        let result = compute_bdd_probability(&rows, &probs, false, 1000);
+        let result = weighted_model_count(&rows, &probs, SemiringOp::Conjunction, 1000);
         assert!((result.probability - 0.15).abs() < 1e-10);
     }
 
@@ -344,8 +355,8 @@ mod tests {
         let rows = vec![HashSet::from([a.clone()]), HashSet::from([b.clone()])];
         let probs = HashMap::from([(a, 0.3), (b, 0.5)]);
 
-        let result = compute_bdd_probability(&rows, &probs, false, 1000);
-        assert!(!result.fell_back);
+        let result = weighted_model_count(&rows, &probs, SemiringOp::Conjunction, 1000);
+        assert!(!result.approximated);
         assert_eq!(result.variable_count, 2);
 
         let expected = 0.3 * 0.5;
@@ -371,10 +382,10 @@ mod tests {
         ];
         let probs = HashMap::from([(a, 0.3), (b, 0.5), (c, 0.7)]);
 
-        let result = compute_bdd_probability(&rows, &probs, true, 2);
+        let result = weighted_model_count(&rows, &probs, SemiringOp::Disjunction, 2);
         assert!(
-            result.fell_back,
-            "Expected fell_back=true when limit exceeded"
+            result.approximated,
+            "Expected approximated=true when limit exceeded"
         );
         assert_eq!(result.variable_count, 3);
         assert!(
@@ -406,8 +417,8 @@ mod tests {
         ];
         let probs = HashMap::from([(a, 0.3), (b, 0.5), (c, 0.4), (d, 0.8)]);
 
-        let result = compute_bdd_probability(&rows, &probs, true, 1000);
-        assert!(!result.fell_back);
+        let result = weighted_model_count(&rows, &probs, SemiringOp::Disjunction, 1000);
+        assert!(!result.approximated);
         assert_eq!(result.variable_count, 4);
 
         let expected = 0.8 * (1.0 - (1.0 - 0.3) * (1.0 - 0.5) * (1.0 - 0.4));
@@ -455,8 +466,8 @@ mod tests {
         ];
         let probs = HashMap::from([(a, 0.3), (b, 0.5), (c, 0.7), (e, 0.6)]);
 
-        let result = compute_bdd_probability(&rows, &probs, true, 1000);
-        assert!(!result.fell_back);
+        let result = weighted_model_count(&rows, &probs, SemiringOp::Disjunction, 1000);
+        assert!(!result.approximated);
         assert_eq!(result.variable_count, 4);
 
         let p_c_times_a_or_b = 0.7 * (1.0 - (1.0 - 0.3) * (1.0 - 0.5));
@@ -479,8 +490,8 @@ mod tests {
         let rows = vec![HashSet::from([unknown.clone()])];
         let probs = HashMap::new(); // empty — unknown_fact has no entry
 
-        let result = compute_bdd_probability(&rows, &probs, true, 1000);
-        assert!(!result.fell_back);
+        let result = weighted_model_count(&rows, &probs, SemiringOp::Disjunction, 1000);
+        assert!(!result.approximated);
         assert_eq!(result.variable_count, 1);
         assert!(
             (result.probability - 0.5).abs() < 1e-10,

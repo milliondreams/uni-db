@@ -42,10 +42,12 @@ YIELD KEY q, KEY d, similar_to(d.embedding, q.text) AS score
 -- Use as PROB value for probabilistic derivation
 CREATE RULE related AS
 MATCH (a:Paper)-[:CITES]->(b:Paper)
-YIELD KEY a, KEY b, PROB similar_to(b.embedding, a.embedding)
+YIELD KEY a, KEY b, similar_to(b.embedding, a.embedding) AS PROB
 ```
 
 `similar_to()` supports metric-aware vector scoring (Cosine, L2, Dot Product), FTS scoring, and multi-source hybrid fusion. See the [Vector Search guide](../guides/vector-search.md#similar_to-expression-function) for full documentation.
+
+`PROB` can be written as `expr AS PROB`, `expr AS alias PROB`, or `expr PROB`. At most one output column per rule can be marked this way.
 
 ### Probabilistic Aggregation with MNOR and MPROD
 
@@ -74,6 +76,26 @@ See [Probabilistic Logic](advanced/probabilistic-logic.md) for full documentatio
 ```cypher
 QUERY reachable WHERE a.name = 'Alice' RETURN b
 ```
+
+## DERIVE in Rules (Graph Mutation)
+
+Rules can use `DERIVE` instead of `YIELD` to directly write graph mutations:
+
+```cypher
+-- Infer a new edge from rule output
+CREATE RULE infer_risk AS
+MATCH (a:Account)-[:TRANSFER]->(b:Account)
+WHERE a IS flagged
+DERIVE (b)-[:RISK_FROM]->(a)
+
+-- Add a label to derived nodes
+CREATE RULE flag_accounts AS
+MATCH (a:Account)
+WHERE a.fraud_score > 0.8
+DERIVE (a:FlaggedAccount)
+```
+
+`DERIVE` rules run in Phase 2 (command dispatch) on converged derived facts. Use `YIELD` when you want to produce queryable derived facts; use `DERIVE` when you want to write mutations back to the graph.
 
 ## Derivation Commands
 

@@ -984,6 +984,11 @@ let results = db.query("
 - `build_overflow_json_column()` serializes non-schema props
 - Both typed columns and overflow_json written to Lance
 
+**Read-your-writes guarantee:**
+- `properties(node)` and direct property reads consult the L0 overlay before storage.
+- Unflushed `SET` mutations on overflow properties are visible immediately.
+- Those overflow properties persist across flush cycles and remain queryable after they reach Lance storage.
+
 **Compaction:**
 - Overflow properties preserved through L1 → L2 compaction
 - Main vertices table includes all properties in `props_json`

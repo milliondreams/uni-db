@@ -122,6 +122,7 @@ nav:
       - Query Rewriting: internals/query-rewriting.md
       - Mutation Spec: internals/mutation_spec.md
       - API Gap Plan: internals/api-gap-plan.md
+      - Python API Priorities: internals/python-api-priorities.md
       - Benchmarks: internals/benchmarks.md
   - Reference:
       - Overview: reference/index.md

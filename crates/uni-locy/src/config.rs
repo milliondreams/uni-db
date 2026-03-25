@@ -24,7 +24,7 @@ pub struct LocyConfig {
     /// deterministic tie-breaking. Set to false for non-deterministic (faster)
     /// selection.
     pub deterministic_best_by: bool,
-    /// When true, MNOR/MPROD reject values outside [0,1] with an error instead
+    /// When true, MNOR/MPROD reject values outside \[0,1\] with an error instead
     /// of clamping. When false (default), values are clamped silently.
     pub strict_probability_domain: bool,
     /// Underflow threshold for MPROD log-space switch (spec §5.3).

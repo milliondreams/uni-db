@@ -456,8 +456,14 @@ fn eval_function(name: &str, args: &[Value]) -> Result<Value, LocyError> {
                 }
             })
         }
-        _ => Err(LocyError::EvaluationError {
-            message: format!("unknown function: {name}"),
+        // Delegate to the full Cypher scalar function evaluator so that every
+        // function available in Cypher (temporal, math, string, spatial, …) is
+        // automatically available in Locy. Both sides use uni_common::Value, so
+        // no type conversion is needed.
+        _ => crate::query::expr_eval::eval_scalar_function(name, args).map_err(|e| {
+            LocyError::EvaluationError {
+                message: e.to_string(),
+            }
         }),
     }
 }

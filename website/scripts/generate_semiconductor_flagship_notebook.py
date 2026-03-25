@@ -12,7 +12,9 @@ from pathlib import Path
 from typing import Any
 
 
-NOTEBOOK_PATH = Path("website/docs/examples/python/locy_semiconductor_yield_excursion.ipynb")
+NOTEBOOK_PATH = Path(
+    "website/docs/examples/python/locy_semiconductor_yield_excursion.ipynb"
+)
 
 
 def _cell_id(notebook_key: str, index: int, cell_type: str) -> str:
@@ -168,7 +170,7 @@ def _build_notebook() -> dict[str, Any]:
                 "        'Run from website/ (or repo root) or set LOCY_DATA_DIR to the dataset path.'",
                 "    )",
                 "DB_DIR = tempfile.mkdtemp(prefix='uni_locy_semiconductor_')",
-                "db = uni_db.Database(DB_DIR)",
+                "db = uni_db.Database.open(DB_DIR)",
                 "",
                 "print('DATA_DIR:', DATA_DIR)",
                 "print('DB_DIR:', DB_DIR)",
@@ -328,7 +330,7 @@ def _build_notebook() -> dict[str, Any]:
                 "    )",
                 "    db.execute(",
                 "        f\"MATCH (t:Tool {{tool_id: '{_esc(tool_id)}'}}), (m:Module {{name: '{_esc(module)}'}}) \"",
-                "        \"CREATE (t)-[:PART_OF]->(m)\"",
+                '        "CREATE (t)-[:PART_OF]->(m)"',
                 "    )",
                 "",
                 "for row in feature_rows:",
@@ -340,7 +342,7 @@ def _build_notebook() -> dict[str, Any]:
                 "    )",
                 "    db.execute(",
                 "        f\"MATCH (f:Feature {{feature_id: '{_esc(row['feature_id'])}'}}), (t:Tool {{tool_id: '{_esc(row['tool_id'])}'}}) \"",
-                "        \"CREATE (f)-[:MEASURED_ON]->(t)\"",
+                '        "CREATE (f)-[:MEASURED_ON]->(t)"',
                 "    )",
                 "",
                 "for row in focus_lots:",
@@ -353,25 +355,25 @@ def _build_notebook() -> dict[str, Any]:
                 "for row in focus_excursions:",
                 "    db.execute(",
                 "        f\"MATCH (l:Lot {{lot_id: '{_esc(row['lot_id'])}'}}), (f:Feature {{feature_id: '{_esc(row['feature_id'])}'}}) \"",
-                "        \"CREATE (l)-[:OBSERVED_EXCURSION]->(f)\"",
+                '        "CREATE (l)-[:OBSERVED_EXCURSION]->(f)"',
                 "    )",
                 "",
-                "counts = db.query(\"\"\"",
+                'counts = db.query("""',
                 "MATCH (l:Lot)",
                 "WITH count(l) AS lots",
                 "MATCH (f:Feature)",
                 "WITH lots, count(f) AS features",
                 "MATCH ()-[e:OBSERVED_EXCURSION]->()",
                 "RETURN lots, features, count(e) AS excursion_edges",
-                "\"\"\")",
+                '""")',
                 "print('Graph counts:')",
                 "pprint(counts[0])",
                 "",
-                "outcome_counts = db.query(\"\"\"",
+                'outcome_counts = db.query("""',
                 "MATCH (l:Lot)",
                 "RETURN l.yield_outcome AS outcome, count(*) AS lots",
                 "ORDER BY lots DESC",
-                "\"\"\")",
+                '""")',
                 "print('\\nLot outcomes:')",
                 "pprint(outcome_counts)",
             ],
@@ -428,9 +430,9 @@ def _build_notebook() -> dict[str, Any]:
                 "LIMIT 10",
                 "'''",
                 "",
-                "baseline_out = db.locy_evaluate(",
+                "baseline_out = db.locy().evaluate(",
                 "    program_baseline,",
-                "    {",
+                "    config={",
                 "        'max_iterations': 300,",
                 "        'timeout': 60.0,",
                 "        'max_abduce_candidates': 40,",
@@ -438,13 +440,13 @@ def _build_notebook() -> dict[str, Any]:
                 "    },",
                 ")",
                 "",
-                "stats = baseline_out['stats']",
+                "stats = baseline_out.stats",
                 "print('Iterations:', stats.total_iterations)",
                 "print('Strata:', stats.strata_evaluated)",
                 "print('Queries executed:', stats.queries_executed)",
                 "",
                 "hot_tool_rows = []",
-                "for i, cmd in enumerate(baseline_out['command_results'], start=1):",
+                "for i, cmd in enumerate(baseline_out.command_results, start=1):",
                 "    print(f\"\\nCommand #{i}:\", cmd.get('type'))",
                 "    if cmd.get('type') in ('query', 'cypher'):",
                 "        rows = cmd.get('rows', [])",
@@ -503,8 +505,8 @@ def _build_notebook() -> dict[str, Any]:
                 "EXPLAIN RULE fail_tool_excursion WHERE l.lot_id = '{focus_lot}' RETURN t",
                 "'''",
                 "",
-                "explain_out = db.locy_evaluate(program_explain)",
-                "explain_cmd = next(cmd for cmd in explain_out['command_results'] if cmd.get('type') == 'explain')",
+                "explain_out = db.locy().evaluate(program_explain)",
+                "explain_cmd = next(cmd for cmd in explain_out.command_results if cmd.get('type') == 'explain')",
                 "tree = explain_cmd['tree']",
                 "",
                 "def _print_tree(node, depth=0, max_depth=4):",
@@ -512,7 +514,7 @@ def _build_notebook() -> dict[str, Any]:
                 "    rule = node.get('rule')",
                 "    clause = node.get('clause_index')",
                 "    bindings = node.get('bindings', {})",
-                "    print(f\"{indent}- rule={rule}, clause={clause}, bindings={bindings}\")",
+                '    print(f"{indent}- rule={rule}, clause={clause}, bindings={bindings}")',
                 "    if depth >= max_depth:",
                 "        return",
                 "    for child in node.get('children', []):",
@@ -557,8 +559,8 @@ def _build_notebook() -> dict[str, Any]:
                 "}}",
                 "'''",
                 "",
-                "assume_out = db.locy_evaluate(program_assume)",
-                "assume_cmd = next(cmd for cmd in assume_out['command_results'] if cmd.get('type') == 'assume')",
+                "assume_out = db.locy().evaluate(program_assume)",
+                "assume_cmd = next(cmd for cmd in assume_out.command_results if cmd.get('type') == 'assume')",
                 "contained_rows = assume_cmd.get('rows', [])",
                 "contained_lot_ids = sorted({row['lot_id'] for row in contained_rows})",
                 "",
@@ -574,7 +576,7 @@ def _build_notebook() -> dict[str, Any]:
                 "print('\\nContained sample:')",
                 "pprint(contained_rows[:10])",
                 "",
-                "rollback_check = db.query(\"MATCH (:Lot)-[r:CONTAINED_BY]->(:Tool) RETURN count(r) AS c\")",
+                'rollback_check = db.query("MATCH (:Lot)-[r:CONTAINED_BY]->(:Tool) RETURN count(r) AS c")',
                 "print('\\nRollback check (should be 0):', rollback_check[0]['c'])",
             ],
         )
@@ -612,17 +614,17 @@ def _build_notebook() -> dict[str, Any]:
                 "ABDUCE NOT needs_quarantine WHERE l.lot_id = '{abduce_target_lot}' RETURN l",
                 "'''",
                 "",
-                "abduce_out = db.locy_evaluate(",
+                "abduce_out = db.locy().evaluate(",
                 "    program_abduce,",
-                "    {'max_abduce_candidates': 120, 'max_abduce_results': 12, 'timeout': 60.0},",
+                "    config={'max_abduce_candidates': 120, 'max_abduce_results': 12, 'timeout': 60.0},",
                 ")",
-                "abduce_cmd = next(cmd for cmd in abduce_out['command_results'] if cmd.get('type') == 'abduce')",
+                "abduce_cmd = next(cmd for cmd in abduce_out.command_results if cmd.get('type') == 'abduce')",
                 "mods = abduce_cmd.get('modifications', [])",
                 "",
                 "print('ABDUCE target lot:', abduce_target_lot)",
                 "print('Abduced modifications:', len(mods))",
                 "for i, item in enumerate(mods[:8], start=1):",
-                "    print(f\"\\nCandidate #{i}\")",
+                '    print(f"\\nCandidate #{i}")',
                 "    pprint(item)",
             ],
         )
@@ -723,7 +725,9 @@ def _check(path: Path, expected: str) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--check", action="store_true", help="Check drift without writing.")
+    parser.add_argument(
+        "--check", action="store_true", help="Check drift without writing."
+    )
     args = parser.parse_args(argv)
 
     notebook = _build_notebook()

@@ -53,13 +53,13 @@ QUERY friends WHERE a.name = 'Alice' RETURN b.name AS to_name
 async def test_basic_rule_evaluation(async_social_db_populated):
     """Async: a simple rule derives facts from graph edges."""
     db = async_social_db_populated
-    result = await db.locy_evaluate(FRIENDS_PROGRAM)
+    result = await db.locy().evaluate(FRIENDS_PROGRAM)
 
-    assert "derived" in result
-    assert "stats" in result
-    assert "command_results" in result
+    assert hasattr(result, "derived")
+    assert hasattr(result, "stats")
+    assert hasattr(result, "command_results")
 
-    friends_rows = result["derived"].get("friends", [])
+    friends_rows = result.derived.get("friends", [])
     assert len(friends_rows) == 4, f"Expected 4 friend pairs, got {len(friends_rows)}"
 
     for row in friends_rows:
@@ -70,9 +70,9 @@ async def test_basic_rule_evaluation(async_social_db_populated):
 async def test_stats_returned(async_social_db_populated):
     """Async: result includes a LocyStats object with expected fields."""
     db = async_social_db_populated
-    result = await db.locy_evaluate(FRIENDS_PROGRAM)
+    result = await db.locy().evaluate(FRIENDS_PROGRAM)
 
-    stats = result["stats"]
+    stats = result.stats
     assert isinstance(stats, uni_db.LocyStats)
     assert stats.strata_evaluated >= 1
     # Non-recursive strata may complete in 0 fixpoint iterations
@@ -86,9 +86,9 @@ async def test_stats_returned(async_social_db_populated):
 async def test_query_command(async_social_db_populated):
     """Async: QUERY command result appears in command_results."""
     db = async_social_db_populated
-    result = await db.locy_evaluate(QUERY_PROGRAM)
+    result = await db.locy().evaluate(QUERY_PROGRAM)
 
-    cmd_results = result["command_results"]
+    cmd_results = result.command_results
     assert len(cmd_results) >= 1
 
     query_result = cmd_results[0]
@@ -103,49 +103,49 @@ async def test_query_command(async_social_db_populated):
 async def test_recursive_rule(async_social_db_populated):
     """Async: recursive rule computes transitive closure."""
     db = async_social_db_populated
-    result = await db.locy_evaluate(REACHABLE_PROGRAM)
+    result = await db.locy().evaluate(REACHABLE_PROGRAM)
 
-    reachable_rows = result["derived"].get("reachable", [])
+    reachable_rows = result.derived.get("reachable", [])
     assert len(reachable_rows) >= 3
 
 
 async def test_multi_rule_program(async_social_db_populated):
     """Async: multiple rules can be defined in one program."""
     db = async_social_db_populated
-    result = await db.locy_evaluate(MULTI_RULE_PROGRAM)
+    result = await db.locy().evaluate(MULTI_RULE_PROGRAM)
 
-    assert "friends" in result["derived"]
-    assert "popular" in result["derived"]
-    assert len(result["derived"]["popular"]) >= 1
+    assert "friends" in result.derived
+    assert "popular" in result.derived
+    assert len(result.derived["popular"]) >= 1
 
 
 async def test_config_override(async_social_db_populated):
     """Async: custom config is respected (max_iterations)."""
     db = async_social_db_populated
-    result = await db.locy_evaluate(FRIENDS_PROGRAM, config={"max_iterations": 1})
-    assert len(result["derived"].get("friends", [])) == 4
+    result = await db.locy().evaluate(FRIENDS_PROGRAM, config={"max_iterations": 1})
+    assert len(result.derived.get("friends", [])) == 4
 
 
 async def test_empty_program_raises(async_social_db_populated):
     """Async: empty program raises RuntimeError (Locy requires at least one statement)."""
     db = async_social_db_populated
     with pytest.raises(RuntimeError):
-        await db.locy_evaluate("")
+        await db.locy().evaluate("")
 
 
 async def test_error_on_invalid_program(async_social_db_populated):
     """Async: invalid Locy program text raises RuntimeError."""
     db = async_social_db_populated
     with pytest.raises(RuntimeError):
-        await db.locy_evaluate("THIS IS COMPLETELY INVALID LOCY SYNTAX !!!!")
+        await db.locy().evaluate("THIS IS COMPLETELY INVALID LOCY SYNTAX !!!!")
 
 
 async def test_derived_facts_structure(async_social_db_populated):
     """Async: derived fact rows are Python dicts with string keys."""
     db = async_social_db_populated
-    result = await db.locy_evaluate(FRIENDS_PROGRAM)
+    result = await db.locy().evaluate(FRIENDS_PROGRAM)
 
-    for row in result["derived"].get("friends", []):
+    for row in result.derived.get("friends", []):
         assert isinstance(row, dict)
         for key in row:
             assert isinstance(key, str)
@@ -158,8 +158,8 @@ async def test_param_binding_query_where(async_social_db_populated):
 CREATE RULE persons AS MATCH (p:Person) YIELD KEY p, p.name AS nm
 QUERY persons WHERE nm = $target RETURN nm
 """
-    result = await db.locy_evaluate(program, params={"target": "Alice"})
-    rows = result["command_results"][0]["rows"]
+    result = await db.locy().evaluate(program, params={"target": "Alice"})
+    rows = result.command_results[0]["rows"]
     assert len(rows) == 1
     assert rows[0]["nm"] == "Alice"
 
@@ -171,8 +171,8 @@ async def test_param_binding_integer(async_social_db_populated):
 CREATE RULE adults AS MATCH (p:Person) YIELD KEY p, p.age AS age, p.name AS nm
 QUERY adults WHERE age > $min_age RETURN nm
 """
-    result = await db.locy_evaluate(program, params={"min_age": 30})
-    rows = result["command_results"][0]["rows"]
+    result = await db.locy().evaluate(program, params={"min_age": 30})
+    rows = result.command_results[0]["rows"]
     names = {r["nm"] for r in rows}
     assert "Charlie" in names  # age 35
     assert "Bob" not in names  # age 25

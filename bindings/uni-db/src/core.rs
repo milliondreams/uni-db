@@ -433,6 +433,29 @@ pub async fn restore_snapshot_core(db: &Uni, snapshot_id: &str) -> Result<(), St
 }
 
 // ============================================================================
+// Compaction Core
+// ============================================================================
+
+/// Compact a label's storage files.
+pub async fn compact_label_core(db: &Uni, label: &str) -> Result<(), String> {
+    db.compact_label(label).await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Compact an edge type's storage files.
+pub async fn compact_edge_type_core(db: &Uni, edge_type: &str) -> Result<(), String> {
+    db.compact_edge_type(edge_type)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Wait for any ongoing compaction to complete.
+pub async fn wait_for_compaction_core(db: &Uni) -> Result<(), String> {
+    db.wait_for_compaction().await.map_err(|e| e.to_string())
+}
+
+// ============================================================================
 // Index Admin Core
 // ============================================================================
 
@@ -492,6 +515,38 @@ pub async fn locy_evaluate_with_config_core(
     program: &str,
     config: ::uni_db::locy::LocyConfig,
 ) -> Result<::uni_db::locy::LocyResult, String> {
+    db.locy()
+        .evaluate_with_config(program, &config)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Compile a Locy program without executing it.
+pub fn locy_compile_only_core(
+    db: &Uni,
+    program: &str,
+) -> Result<::uni_locy::CompiledProgram, String> {
+    db.locy().compile_only(program).map_err(|e| e.to_string())
+}
+
+/// Evaluate a Locy program with specific params, timeout, and max_iterations.
+pub async fn locy_evaluate_builder_core(
+    db: &Uni,
+    program: &str,
+    params: HashMap<String, Value>,
+    timeout_secs: Option<f64>,
+    max_iterations: Option<usize>,
+) -> Result<::uni_db::locy::LocyResult, String> {
+    let mut config = ::uni_db::locy::LocyConfig {
+        params,
+        ..Default::default()
+    };
+    if let Some(t) = timeout_secs {
+        config.timeout = Duration::from_secs_f64(t);
+    }
+    if let Some(n) = max_iterations {
+        config.max_iterations = n;
+    }
     db.locy()
         .evaluate_with_config(program, &config)
         .await

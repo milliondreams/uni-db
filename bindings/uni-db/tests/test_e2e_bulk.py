@@ -196,14 +196,16 @@ def test_operations_after_abort_raise_error(social_db):
 
 
 def test_convenience_bulk_insert_vertices(social_db):
-    """Test the convenience bulk_insert_vertices method."""
+    """Test the convenience bulk_insert_vertices method via bulk_writer."""
     people_data = [
         {"name": "Alice", "age": 30, "email": "alice@example.com"},
         {"name": "Bob", "age": 25, "email": "bob@example.com"},
         {"name": "Charlie", "age": 35},
     ]
 
-    vids = social_db.bulk_insert_vertices("Person", people_data)
+    bw = social_db.bulk_writer().build()
+    vids = bw.insert_vertices("Person", people_data)
+    bw.commit()
 
     assert isinstance(vids, list)
     assert len(vids) == 3
@@ -218,21 +220,22 @@ def test_convenience_bulk_insert_vertices(social_db):
 
 
 def test_convenience_bulk_insert_edges(social_db):
-    """Test the convenience bulk_insert_edges method."""
-    # First insert vertices
+    """Test the convenience bulk_insert_edges method via bulk_writer."""
+    # First insert vertices, then edges, in one writer
     people_data = [
         {"name": "Alice", "age": 30},
         {"name": "Bob", "age": 25},
     ]
-    vids = social_db.bulk_insert_vertices("Person", people_data)
+    bw = social_db.bulk_writer().build()
+    vids = bw.insert_vertices("Person", people_data)
 
-    # Then insert edges using convenience method
+    # Then insert edges
     edges_data = [
         (vids[0], vids[1], {"since": 2020}),
     ]
 
-    result = social_db.bulk_insert_edges("KNOWS", edges_data)
-    assert result is None  # bulk_insert_edges returns None
+    bw.insert_edges("KNOWS", edges_data)
+    bw.commit()
 
     # Verify edge was inserted
     social_db.flush()

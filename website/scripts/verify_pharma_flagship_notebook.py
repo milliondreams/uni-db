@@ -11,12 +11,16 @@ import os
 from pathlib import Path
 
 
-DEFAULT_NOTEBOOK = Path("website/docs/examples/python/locy_pharma_batch_genealogy.ipynb")
+DEFAULT_NOTEBOOK = Path(
+    "website/docs/examples/python/locy_pharma_batch_genealogy.ipynb"
+)
 
 
 def _require(name: str, env: dict[str, object]) -> object:
     if name not in env:
-        raise AssertionError(f"Expected variable '{name}' to be defined by notebook execution.")
+        raise AssertionError(
+            f"Expected variable '{name}' to be defined by notebook execution."
+        )
     return env[name]
 
 
@@ -25,7 +29,9 @@ def _as_int(name: str, value: object) -> int:
         raise AssertionError(f"Expected '{name}' to be int-like, got bool.")
     if isinstance(value, int):
         return value
-    raise AssertionError(f"Expected '{name}' to be int-like, got {type(value).__name__}.")
+    raise AssertionError(
+        f"Expected '{name}' to be int-like, got {type(value).__name__}."
+    )
 
 
 def _as_list(name: str, value: object) -> list[object]:
@@ -77,8 +83,12 @@ def validate_results(env: dict[str, object]) -> dict[str, int]:
     total_deviating_batches = _as_int(
         "total_deviating_batches", _require("total_deviating_batches", env)
     )
-    contained_deviations = _as_int("contained_deviations", _require("contained_deviations", env))
-    residual_deviations = _as_int("residual_deviations", _require("residual_deviations", env))
+    contained_deviations = _as_int(
+        "contained_deviations", _require("contained_deviations", env)
+    )
+    residual_deviations = _as_int(
+        "residual_deviations", _require("residual_deviations", env)
+    )
 
     if not propagation_rows:
         raise AssertionError("Expected non-empty propagation rows.")
@@ -97,7 +107,9 @@ def validate_results(env: dict[str, object]) -> dict[str, int]:
 
     tree = _require("tree", env)
     if not isinstance(tree, dict) or not tree.get("rule"):
-        raise AssertionError("Expected EXPLAIN RULE to produce a derivation tree with a rule name.")
+        raise AssertionError(
+            "Expected EXPLAIN RULE to produce a derivation tree with a rule name."
+        )
     children = tree.get("children")
     if not isinstance(children, list) or not children:
         raise AssertionError("Expected EXPLAIN RULE tree to include child derivations.")
@@ -136,13 +148,17 @@ def main() -> int:
 
     os.environ.setdefault(
         "LOCY_DATA_DIR",
-        str((notebook_path.parent.parent / "data/locy_pharma_batch_genealogy").resolve()),
+        str(
+            (notebook_path.parent.parent / "data/locy_pharma_batch_genealogy").resolve()
+        ),
     )
 
     env, nb = execute_notebook(notebook_path, write_outputs=args.write_outputs)
     summary = validate_results(env)
     if args.write_outputs:
-        notebook_path.write_text(json.dumps(nb, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        notebook_path.write_text(
+            json.dumps(nb, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
         print(f"Wrote executed outputs to: {notebook_path}")
     print("Pharma flagship notebook validation passed.")
     print(

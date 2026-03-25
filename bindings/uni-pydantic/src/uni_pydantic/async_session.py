@@ -183,9 +183,9 @@ class AsyncUniSession:
         """
         Evaluate a Locy program and return derived facts, stats, and warnings.
 
-        Delegates directly to the underlying ``uni_db.AsyncDatabase.locy_evaluate()``.
+        Delegates directly to the underlying ``uni_db.AsyncDatabase.locy().evaluate()``.
         """
-        return await self._db.locy_evaluate(program, config)
+        return await self._db.locy().evaluate(program, config=config)
 
     def register(self, *models: type[UniNode] | type[UniEdge]) -> None:
         """Register model classes with the session (sync)."""
@@ -391,7 +391,7 @@ class AsyncUniSession:
         return cast(int, results[0]["count"]) if results else 0
 
     async def bulk_add(self, entities: Sequence[UniNode]) -> list[int]:
-        """Bulk-add entities using bulk_insert_vertices."""
+        """Bulk-add entities using bulk_writer."""
         if not entities:
             return []
 
@@ -408,7 +408,9 @@ class AsyncUniSession:
                 for entity in group:
                     run_hooks(entity, _BEFORE_CREATE)
                 prop_dicts = [e.to_properties() for e in group]
-                vids = await self._db.bulk_insert_vertices(label, prop_dicts)
+                async with self._db.bulk_writer().build() as bw:
+                    vids = await bw.insert_vertices(label, prop_dicts)
+                    await bw.commit()
                 for entity, vid in zip(group, vids):
                     entity._attach_session(self, vid)
                     self._identity_map[(label, vid)] = entity

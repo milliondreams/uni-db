@@ -16,7 +16,9 @@ DEFAULT_NOTEBOOK = Path("website/docs/examples/python/locy_cyber_exposure_twin.i
 
 def _require(name: str, env: dict[str, object]) -> object:
     if name not in env:
-        raise AssertionError(f"Expected variable '{name}' to be defined by notebook execution.")
+        raise AssertionError(
+            f"Expected variable '{name}' to be defined by notebook execution."
+        )
     return env[name]
 
 
@@ -25,7 +27,9 @@ def _as_int(name: str, value: object) -> int:
         raise AssertionError(f"Expected '{name}' to be int-like, got bool.")
     if isinstance(value, int):
         return value
-    raise AssertionError(f"Expected '{name}' to be int-like, got {type(value).__name__}.")
+    raise AssertionError(
+        f"Expected '{name}' to be int-like, got {type(value).__name__}."
+    )
 
 
 def _as_list(name: str, value: object) -> list[object]:

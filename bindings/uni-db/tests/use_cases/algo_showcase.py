@@ -14,7 +14,7 @@ class TestAlgoShowcase(unittest.TestCase):
         self.test_dir = "./test_db_algo"
         if os.path.exists(self.test_dir):
             shutil.rmtree(self.test_dir)
-        self.db = uni_db.Database(self.test_dir)
+        self.db = uni_db.Database.open(self.test_dir)
         self.setup_data()
 
     def tearDown(self):

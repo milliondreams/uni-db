@@ -385,7 +385,7 @@ async def test_query_with_builder_param_and_run(async_social_db_populated):
             "MATCH (p:Person {name: $name}) RETURN p.name AS name, p.age AS age"
         )
         .param("name", "Bob")
-        .run()
+        .fetch_all()
     )
 
     assert len(results) == 1
@@ -399,7 +399,7 @@ async def test_query_with_builder_timeout(async_social_db):
     results = (
         await async_social_db.query_with("MATCH (p:Person) RETURN count(p) AS count")
         .timeout(10.0)
-        .run()
+        .fetch_all()
     )
 
     assert len(results) == 1

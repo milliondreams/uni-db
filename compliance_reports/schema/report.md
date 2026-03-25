@@ -1,19 +1,17 @@
 # TCK Compliance Report
 
-**Generated:** 2026-03-25 00:41:37
-**Results:** `results_20260325_004137.json`
-**Compared to:** `results_20260325_001540.json`
+**Generated:** 2026-03-25 10:23:25
+**Results:** `results_20260325_102325.json`
+**Compared to:** `results_20260325_004137.json`
 
 ## Summary
 
 | Metric | Current | Previous | Delta |
 |--------|---------|----------|-------|
 | Scenarios | 3897 | 3897 |  |
-| Passed | 3896 | 3895 | +1 |
-| Failed | 0 | 1 | -1 |
-| Pass Rate | 100.0% | 99.9% | 📈 +0.0pp |
-
-**🟢 Fixed:** 1 scenarios now passing
+| Passed | 3896 | 3896 |  |
+| Failed | 0 | 0 |  |
+| Pass Rate | 100.0% | 100.0% | ➡️ +0.0pp |
 
 ## Feature Breakdown
 
@@ -144,7 +142,7 @@
 | ✅ Return1 | 2 | 2 | 0 | 100% |  |
 | ✅ Return2 | 18 | 18 | 0 | 100% |  |
 | ✅ Return3 | 3 | 3 | 0 | 100% |  |
-| ✅ Return4 | 11 | 11 | 0 | 100% | +9pp |
+| ✅ Return4 | 11 | 11 | 0 | 100% |  |
 | ✅ Return5 | 5 | 5 | 0 | 100% |  |
 | ✅ Return6 | 21 | 21 | 0 | 100% |  |
 | ✅ Return7 | 2 | 2 | 0 | 100% |  |
@@ -211,12 +209,6 @@
 | ✅ WithWhere5 | 4 | 4 | 0 | 100% |  |
 | ✅ WithWhere6 | 1 | 1 | 0 | 100% |  |
 | ✅ WithWhere7 | 3 | 3 | 0 | 100% |  |
-
-## 🟢 Newly Passing
-
-Scenarios that were failing but are now passing:
-
-- **Return4** — [9] Handle subexpression in aggregation also occurring as standalone expression with nested aggregation in a literal map (line 163)
 
 ## Failed Scenarios
 

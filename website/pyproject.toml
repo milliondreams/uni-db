@@ -19,3 +19,8 @@ uni-db = { path = "../bindings/uni-db", develop = true }
 [build-system]
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
+
+[dependency-groups]
+dev = [
+    "uni-pydantic @ file:///home/rohit/work/dragonscale/uni-lance-upgrade/bindings/uni-pydantic"
+]

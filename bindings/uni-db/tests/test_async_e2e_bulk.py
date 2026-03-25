@@ -152,7 +152,9 @@ async def test_convenience_bulk_insert_vertices(async_social_db):
 
     vertices = [{"name": "Kate", "age": 28}, {"name": "Liam", "age": 32}]
 
-    vids = await async_social_db.bulk_insert_vertices("Person", vertices)
+    bw = async_social_db.bulk_writer().build()
+    vids = await bw.insert_vertices("Person", vertices)
+    await bw.commit()
 
     assert len(vids) == 2
     assert all(isinstance(vid, int) for vid in vids)
@@ -169,7 +171,8 @@ async def test_convenience_bulk_insert_vertices(async_social_db):
 async def test_convenience_bulk_insert_edges(async_social_db):
     """Test convenience method bulk_insert_edges."""
 
-    vids = await async_social_db.bulk_insert_vertices(
+    bw = async_social_db.bulk_writer().build()
+    vids = await bw.insert_vertices(
         "Person",
         [
             {"name": "Mia", "age": 26, "email": "mia@example.com"},
@@ -178,7 +181,8 @@ async def test_convenience_bulk_insert_edges(async_social_db):
     )
 
     edges = [(vids[0], vids[1], {"since": 2023})]
-    await async_social_db.bulk_insert_edges("KNOWS", edges)
+    await bw.insert_edges("KNOWS", edges)
+    await bw.commit()
 
     result = await async_social_db.query("""
         MATCH (p1:Person {name: 'Mia'})-[k:KNOWS]->(p2:Person {name: 'Noah'})

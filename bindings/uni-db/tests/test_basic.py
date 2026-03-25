@@ -14,7 +14,7 @@ import uni_db
 class TestUni(unittest.TestCase):
     def setUp(self):
         self.test_dir = tempfile.mkdtemp(prefix="test_db_python_")
-        self.db = uni_db.Database(self.test_dir)
+        self.db = uni_db.Database.open(self.test_dir)
 
     def tearDown(self):
         # We can't easily close the DB in the current bindings,

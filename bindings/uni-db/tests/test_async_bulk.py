@@ -136,13 +136,15 @@ async def test_async_bulk_writer_builder_config(bulk_db):
 @pytest.mark.asyncio
 async def test_async_bulk_insert_vertices_convenience(bulk_db):
     """Test bulk_insert_vertices convenience method on AsyncDatabase."""
-    vids = await bulk_db.bulk_insert_vertices(
+    bw = bulk_db.bulk_writer().build()
+    vids = await bw.insert_vertices(
         "Person",
         [
             {"name": "Alice", "age": 30},
             {"name": "Bob", "age": 25},
         ],
     )
+    await bw.commit()
     assert len(vids) == 2
     results = await bulk_db.query(
         "MATCH (n:Person) RETURN n.name AS name ORDER BY n.name"
@@ -153,19 +155,21 @@ async def test_async_bulk_insert_vertices_convenience(bulk_db):
 @pytest.mark.asyncio
 async def test_async_bulk_insert_edges_convenience(bulk_db):
     """Test bulk_insert_edges convenience method on AsyncDatabase."""
-    person_vids = await bulk_db.bulk_insert_vertices(
+    bw = bulk_db.bulk_writer().build()
+    person_vids = await bw.insert_vertices(
         "Person",
         [{"name": "Alice", "age": 30}, {"name": "Bob", "age": 25}],
     )
-    company_vids = await bulk_db.bulk_insert_vertices("Company", [{"name": "TechCorp"}])
+    company_vids = await bw.insert_vertices("Company", [{"name": "TechCorp"}])
 
-    await bulk_db.bulk_insert_edges(
+    await bw.insert_edges(
         "WORKS_AT",
         [
             (person_vids[0], company_vids[0], {}),
             (person_vids[1], company_vids[0], {}),
         ],
     )
+    await bw.commit()
 
     results = await bulk_db.query(
         "MATCH (p:Person)-[:WORKS_AT]->(c:Company) "

@@ -53,14 +53,14 @@ QUERY friends WHERE a.name = 'Alice' RETURN b.name AS to_name
 def test_basic_rule_evaluation(social_db_populated):
     """A simple rule derives facts from graph edges."""
     db = social_db_populated
-    result = db.locy_evaluate(FRIENDS_PROGRAM)
+    result = db.locy().evaluate(FRIENDS_PROGRAM)
 
-    assert "derived" in result
-    assert "stats" in result
-    assert "command_results" in result
+    assert hasattr(result, "derived")
+    assert hasattr(result, "stats")
+    assert hasattr(result, "command_results")
 
     # friends rule captures 4 KNOWS edges
-    friends_rows = result["derived"].get("friends", [])
+    friends_rows = result.derived.get("friends", [])
     assert len(friends_rows) == 4, f"Expected 4 friend pairs, got {len(friends_rows)}"
 
     # Each row has keys 'a' and 'b'
@@ -72,9 +72,9 @@ def test_basic_rule_evaluation(social_db_populated):
 def test_stats_returned(social_db_populated):
     """Result includes a LocyStats object with expected fields."""
     db = social_db_populated
-    result = db.locy_evaluate(FRIENDS_PROGRAM)
+    result = db.locy().evaluate(FRIENDS_PROGRAM)
 
-    stats = result["stats"]
+    stats = result.stats
     assert isinstance(stats, uni_db.LocyStats)
     assert stats.strata_evaluated >= 1
     # Non-recursive strata may complete in 0 fixpoint iterations
@@ -88,9 +88,9 @@ def test_stats_returned(social_db_populated):
 def test_query_command(social_db_populated):
     """QUERY command result appears in command_results."""
     db = social_db_populated
-    result = db.locy_evaluate(QUERY_PROGRAM)
+    result = db.locy().evaluate(QUERY_PROGRAM)
 
-    cmd_results = result["command_results"]
+    cmd_results = result.command_results
     assert len(cmd_results) >= 1
 
     query_result = cmd_results[0]
@@ -105,9 +105,9 @@ def test_query_command(social_db_populated):
 def test_recursive_rule(social_db_populated):
     """Recursive rule computes transitive closure."""
     db = social_db_populated
-    result = db.locy_evaluate(REACHABLE_PROGRAM)
+    result = db.locy().evaluate(REACHABLE_PROGRAM)
 
-    reachable_rows = result["derived"].get("reachable", [])
+    reachable_rows = result.derived.get("reachable", [])
     # Alice→Bob, Bob→Charlie, Alice→Charlie (base), plus transitive pairs
     assert len(reachable_rows) >= 3
 
@@ -115,13 +115,13 @@ def test_recursive_rule(social_db_populated):
 def test_multi_rule_program(social_db_populated):
     """Multiple rules can be defined in one program."""
     db = social_db_populated
-    result = db.locy_evaluate(MULTI_RULE_PROGRAM)
+    result = db.locy().evaluate(MULTI_RULE_PROGRAM)
 
-    assert "friends" in result["derived"]
-    assert "popular" in result["derived"]
+    assert "friends" in result.derived
+    assert "popular" in result.derived
 
     # All 5 people in the social DB have outgoing KNOWS edges (except Eve)
-    popular_rows = result["derived"]["popular"]
+    popular_rows = result.derived["popular"]
     assert len(popular_rows) >= 1
 
 
@@ -129,30 +129,30 @@ def test_config_override(social_db_populated):
     """Custom config is respected (max_iterations)."""
     db = social_db_populated
     # Non-recursive program should succeed even with max_iterations=1
-    result = db.locy_evaluate(FRIENDS_PROGRAM, config={"max_iterations": 1})
-    assert len(result["derived"].get("friends", [])) == 4
+    result = db.locy().evaluate(FRIENDS_PROGRAM, config={"max_iterations": 1})
+    assert len(result.derived.get("friends", [])) == 4
 
 
 def test_empty_program_raises(social_db_populated):
     """Empty/blank program raises RuntimeError (Locy requires at least one statement)."""
     db = social_db_populated
     with pytest.raises(RuntimeError):
-        db.locy_evaluate("")
+        db.locy().evaluate("")
 
 
 def test_error_on_invalid_program(social_db_populated):
     """Invalid Locy program text raises RuntimeError."""
     db = social_db_populated
     with pytest.raises(RuntimeError):
-        db.locy_evaluate("THIS IS COMPLETELY INVALID LOCY SYNTAX !!!!")
+        db.locy().evaluate("THIS IS COMPLETELY INVALID LOCY SYNTAX !!!!")
 
 
 def test_derived_facts_structure(social_db_populated):
     """Derived fact rows are Python dicts with string keys."""
     db = social_db_populated
-    result = db.locy_evaluate(FRIENDS_PROGRAM)
+    result = db.locy().evaluate(FRIENDS_PROGRAM)
 
-    for row in result["derived"].get("friends", []):
+    for row in result.derived.get("friends", []):
         assert isinstance(row, dict)
         for key in row:
             assert isinstance(key, str)
@@ -165,8 +165,8 @@ def test_param_binding_query_where(social_db_populated):
 CREATE RULE persons AS MATCH (p:Person) YIELD KEY p, p.name AS nm
 QUERY persons WHERE nm = $target RETURN nm
 """
-    result = db.locy_evaluate(program, params={"target": "Alice"})
-    rows = result["command_results"][0]["rows"]
+    result = db.locy().evaluate(program, params={"target": "Alice"})
+    rows = result.command_results[0]["rows"]
     assert len(rows) == 1
     assert rows[0]["nm"] == "Alice"
 
@@ -181,8 +181,8 @@ CREATE RULE named AS
   YIELD KEY p, p.name AS nm
 QUERY named RETURN nm
 """
-    result = db.locy_evaluate(program, params={"target": "Bob"})
-    rows = result["command_results"][0]["rows"]
+    result = db.locy().evaluate(program, params={"target": "Bob"})
+    rows = result.command_results[0]["rows"]
     assert len(rows) == 1
     assert rows[0]["nm"] == "Bob"
 
@@ -194,8 +194,8 @@ def test_param_binding_integer(social_db_populated):
 CREATE RULE adults AS MATCH (p:Person) YIELD KEY p, p.age AS age, p.name AS nm
 QUERY adults WHERE age > $min_age RETURN nm
 """
-    result = db.locy_evaluate(program, params={"min_age": 30})
-    rows = result["command_results"][0]["rows"]
+    result = db.locy().evaluate(program, params={"min_age": 30})
+    rows = result.command_results[0]["rows"]
     names = {r["nm"] for r in rows}
     assert "Charlie" in names  # age 35
     assert "Bob" not in names  # age 25
@@ -208,9 +208,9 @@ def test_param_binding_with_config(social_db_populated):
 CREATE RULE persons AS MATCH (p:Person) YIELD KEY p, p.name AS nm
 QUERY persons WHERE nm = $target RETURN nm
 """
-    result = db.locy_evaluate(
+    result = db.locy().evaluate(
         program, params={"target": "Alice"}, config={"max_iterations": 10}
     )
-    rows = result["command_results"][0]["rows"]
+    rows = result.command_results[0]["rows"]
     assert len(rows) == 1
     assert rows[0]["nm"] == "Alice"

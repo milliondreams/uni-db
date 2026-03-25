@@ -190,6 +190,94 @@ impl LocyStats {
     }
 }
 
+/// Result of a Locy program evaluation, mirroring the Rust `LocyResult`.
+#[pyclass(get_all, name = "LocyResult")]
+#[derive(Debug)]
+pub struct PyLocyResult {
+    /// Derived relations as a dict of relation-name → list[dict].
+    pub derived: Py<PyAny>,
+    /// Evaluation statistics (`LocyStats`).
+    pub stats: Py<PyAny>,
+    /// Command results (goal queries, explanations, etc.).
+    pub command_results: Py<PyAny>,
+    /// Runtime warnings emitted during evaluation.
+    pub warnings: Py<PyAny>,
+    /// Groups flagged as approximate (shared-proof detection).
+    pub approximate_groups: Py<PyAny>,
+}
+
+#[pymethods]
+impl PyLocyResult {
+    fn __repr__(&self, py: Python<'_>) -> String {
+        let n_warnings = self.warnings.bind(py).len().unwrap_or(0);
+        format!(
+            "LocyResult(stats={}, warnings={})",
+            self.stats
+                .bind(py)
+                .repr()
+                .map_or_else(|_| "?".to_string(), |r| r.to_string(),),
+            n_warnings,
+        )
+    }
+
+    /// Check whether any warning with the given code string was emitted.
+    fn has_warning(&self, py: Python<'_>, code: &str) -> PyResult<bool> {
+        let list = self.warnings.bind(py);
+        let len = list.len()?;
+        for i in 0..len {
+            let item = list.get_item(i)?;
+            // Each warning is expected to have a `.code` attribute (string).
+            if let Ok(c) = item.getattr("code")
+                && let Ok(s) = c.extract::<String>()
+                && s == code
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Return the list of runtime warnings.
+    fn warnings_list(&self, py: Python<'_>) -> Py<PyAny> {
+        self.warnings.clone_ref(py)
+    }
+}
+
+/// A compiled Locy program ready for evaluation.
+#[pyclass(name = "CompiledProgram")]
+pub struct PyCompiledProgram {
+    pub(crate) inner: uni_locy::CompiledProgram,
+}
+
+#[pymethods]
+impl PyCompiledProgram {
+    fn __repr__(&self) -> String {
+        format!(
+            "CompiledProgram(strata={}, rules={})",
+            self.inner.strata.len(),
+            self.inner.rule_catalog.len(),
+        )
+    }
+
+    /// Number of strata in the compiled program.
+    #[getter]
+    fn num_strata(&self) -> usize {
+        self.inner.strata.len()
+    }
+
+    /// Number of compiled rules.
+    #[getter]
+    fn num_rules(&self) -> usize {
+        self.inner.rule_catalog.len()
+    }
+
+    /// Names of all compiled rules.
+    #[getter]
+    fn rule_names(&self) -> Vec<String> {
+        self.inner.rule_catalog.keys().cloned().collect()
+    }
+}
+
 // ============================================================================
 // Xervo types
 // ============================================================================

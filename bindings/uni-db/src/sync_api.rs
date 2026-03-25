@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Dragonscale Team
 
-//! Synchronous Python API — `Database` and `Transaction`.
+//! Synchronous Python API — `Database`, `Transaction`, and `LocyEngine`.
 
 use crate::builders::{BulkWriterBuilder, QueryBuilder, SchemaBuilder, SessionBuilder};
 use crate::convert;
@@ -160,7 +160,7 @@ pub struct Transaction {
 
 #[pymethods]
 impl Transaction {
-    /// Execute a query within this transaction.
+    /// Execute a read query within this transaction.
     #[pyo3(signature = (cypher, params=None))]
     fn query(
         &self,
@@ -180,6 +180,51 @@ impl Transaction {
             .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
 
         convert::rows_to_py(py, rows.rows)
+    }
+
+    /// Execute a mutation query within this transaction.
+    #[pyo3(signature = (cypher, params=None))]
+    fn execute(
+        &self,
+        py: Python,
+        cypher: &str,
+        params: Option<HashMap<String, Py<PyAny>>>,
+    ) -> PyResult<usize> {
+        if self.completed {
+            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                "Transaction already completed",
+            ));
+        }
+        let rust_params = convert::prepare_params(py, params)?;
+        if rust_params.is_empty() {
+            pyo3_async_runtimes::tokio::get_runtime()
+                .block_on(core::execute_core(&self.inner, cypher))
+                .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+        } else {
+            pyo3_async_runtimes::tokio::get_runtime()
+                .block_on(core::execute_with_params_core(
+                    &self.inner,
+                    cypher,
+                    rust_params,
+                ))
+                .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+        }
+    }
+
+    /// Create a query builder for this transaction.
+    fn query_with(&self, cypher: &str) -> PyResult<QueryBuilder> {
+        if self.completed {
+            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                "Transaction already completed",
+            ));
+        }
+        Ok(QueryBuilder {
+            inner: self.inner.clone(),
+            cypher: cypher.to_string(),
+            params: HashMap::new(),
+            timeout_secs: None,
+            max_memory: None,
+        })
     }
 
     /// Commit the transaction.
@@ -209,6 +254,27 @@ impl Transaction {
         self.completed = true;
         Ok(())
     }
+
+    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    /// Context manager exit — rolls back on error.
+    #[pyo3(signature = (_exc_type=None, _exc_val=None, _exc_tb=None))]
+    fn __exit__(
+        &mut self,
+        _exc_type: Option<Py<PyAny>>,
+        _exc_val: Option<Py<PyAny>>,
+        _exc_tb: Option<Py<PyAny>>,
+    ) -> PyResult<bool> {
+        if !self.completed {
+            self.completed = true;
+            // Rollback if exception, already handled externally otherwise
+            let _ = pyo3_async_runtimes::tokio::get_runtime()
+                .block_on(core::rollback_transaction_core(&self.inner));
+        }
+        Ok(false) // don't suppress exceptions
+    }
 }
 
 // ============================================================================
@@ -223,16 +289,88 @@ pub struct Database {
 
 #[pymethods]
 impl Database {
-    /// Create or open a database at the given path.
-    #[new]
-    fn new(path: &str) -> PyResult<Self> {
+    // ========================================================================
+    // Static Factory Methods
+    // ========================================================================
+
+    /// Open or create a database at the given path.
+    #[staticmethod]
+    fn open(path: &str) -> PyResult<Self> {
         let uni = pyo3_async_runtimes::tokio::get_runtime()
             .block_on(async { Uni::open(path).build().await })
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
-
         Ok(Database {
             inner: Arc::new(uni),
         })
+    }
+
+    /// Create a temporary in-memory database.
+    #[staticmethod]
+    fn temporary() -> PyResult<Self> {
+        let uni = pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(async { Uni::temporary().build().await })
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
+        Ok(Database {
+            inner: Arc::new(uni),
+        })
+    }
+
+    /// Create an in-memory database (alias for temporary).
+    #[staticmethod]
+    fn in_memory() -> PyResult<Self> {
+        Self::temporary()
+    }
+
+    /// Create a new database. Fails if it already exists.
+    #[staticmethod]
+    fn create(path: &str) -> PyResult<Self> {
+        let uni = pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(async { Uni::create(path).build().await })
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
+        Ok(Database {
+            inner: Arc::new(uni),
+        })
+    }
+
+    /// Open an existing database. Fails if it does not exist.
+    #[staticmethod]
+    fn open_existing(path: &str) -> PyResult<Self> {
+        let uni = pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(async { Uni::open_existing(path).build().await })
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
+        Ok(Database {
+            inner: Arc::new(uni),
+        })
+    }
+
+    /// Return a DatabaseBuilder for advanced configuration.
+    #[staticmethod]
+    fn builder() -> crate::builders::DatabaseBuilder {
+        crate::builders::DatabaseBuilder::temporary()
+    }
+
+    // ========================================================================
+    // Context Manager
+    // ========================================================================
+
+    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    #[pyo3(signature = (_exc_type=None, _exc_val=None, _exc_tb=None))]
+    fn __exit__(
+        &self,
+        _exc_type: Option<Py<PyAny>>,
+        _exc_val: Option<Py<PyAny>>,
+        _exc_tb: Option<Py<PyAny>>,
+    ) -> PyResult<bool> {
+        // Flush on exit to ensure data durability.
+        let _ = pyo3_async_runtimes::tokio::get_runtime().block_on(core::flush_core(&self.inner));
+        Ok(false)
+    }
+
+    fn __repr__(&self) -> String {
+        "Database(open)".to_string()
     }
 
     // ========================================================================
@@ -240,20 +378,32 @@ impl Database {
     // ========================================================================
 
     /// Execute a Cypher query and return results.
-    #[pyo3(signature = (cypher, params=None))]
+    #[pyo3(signature = (cypher, params=None, timeout=None))]
     fn query(
         &self,
         py: Python,
         cypher: &str,
         params: Option<HashMap<String, Py<PyAny>>>,
+        timeout: Option<f64>,
     ) -> PyResult<Vec<Py<PyAny>>> {
         let rust_params = convert::prepare_params(py, params)?;
-
-        let rows = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(core::query_core(&self.inner, cypher, rust_params))
-            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
-
-        convert::rows_to_py(py, rows.rows)
+        if timeout.is_some() {
+            let rows = pyo3_async_runtimes::tokio::get_runtime()
+                .block_on(core::query_builder_core(
+                    &self.inner,
+                    cypher,
+                    rust_params,
+                    timeout,
+                    None,
+                ))
+                .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
+            convert::rows_to_py(py, rows.rows)
+        } else {
+            let rows = pyo3_async_runtimes::tokio::get_runtime()
+                .block_on(core::query_core(&self.inner, cypher, rust_params))
+                .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
+            convert::rows_to_py(py, rows.rows)
+        }
     }
 
     /// Open a streaming cursor for a query.
@@ -293,16 +443,34 @@ impl Database {
         }
     }
 
+    /// Create a query builder for mutation queries (alias for query_with).
+    fn execute_with(&self, cypher: &str) -> QueryBuilder {
+        self.query_with(cypher)
+    }
+
     /// Execute a mutation query, returning affected row count.
-    #[pyo3(signature = (cypher, params=None))]
+    #[pyo3(signature = (cypher, params=None, timeout=None))]
     fn execute(
         &self,
         py: Python,
         cypher: &str,
         params: Option<HashMap<String, Py<PyAny>>>,
+        timeout: Option<f64>,
     ) -> PyResult<usize> {
         let rust_params = convert::prepare_params(py, params)?;
-        if rust_params.is_empty() {
+        if timeout.is_some() {
+            // Use builder core for timeout support
+            let rows = pyo3_async_runtimes::tokio::get_runtime()
+                .block_on(core::query_builder_core(
+                    &self.inner,
+                    cypher,
+                    rust_params,
+                    timeout,
+                    None,
+                ))
+                .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
+            Ok(rows.rows.len())
+        } else if rust_params.is_empty() {
             pyo3_async_runtimes::tokio::get_runtime()
                 .block_on(core::execute_core(&self.inner, cypher))
                 .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
@@ -408,6 +576,43 @@ impl Database {
             inner: self.inner.clone(),
             completed: false,
         })
+    }
+
+    /// Execute a closure within a transaction (auto-commit on success, auto-rollback on error).
+    fn transaction(&self, py: Python, func: Py<PyAny>) -> PyResult<Py<PyAny>> {
+        pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(core::begin_transaction_core(&self.inner))
+            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
+
+        let tx = Transaction {
+            inner: self.inner.clone(),
+            completed: false,
+        };
+        let tx_obj = Py::new(py, tx)?;
+
+        match func.call1(py, (tx_obj.clone_ref(py),)) {
+            Ok(result) => {
+                // Auto-commit on success
+                let mut tx_ref = tx_obj.borrow_mut(py);
+                if !tx_ref.completed {
+                    tx_ref.completed = true;
+                    pyo3_async_runtimes::tokio::get_runtime()
+                        .block_on(core::commit_transaction_core(&self.inner))
+                        .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
+                }
+                Ok(result)
+            }
+            Err(e) => {
+                // Auto-rollback on error
+                let mut tx_ref = tx_obj.borrow_mut(py);
+                if !tx_ref.completed {
+                    tx_ref.completed = true;
+                    let _ = pyo3_async_runtimes::tokio::get_runtime()
+                        .block_on(core::rollback_transaction_core(&self.inner));
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Flush all uncommitted changes to persistent storage.
@@ -642,110 +847,15 @@ impl Database {
         }
     }
 
-    /// Bulk insert vertices (legacy API, prefer bulk_writer()).
-    fn bulk_insert_vertices(
-        &self,
-        py: Python,
-        label: &str,
-        properties_list: Vec<HashMap<String, Py<PyAny>>>,
-    ) -> PyResult<Vec<u64>> {
-        let mut rust_props = Vec::new();
-        for p in properties_list {
-            let mut map = HashMap::new();
-            for (k, v) in p {
-                let val = convert::py_object_to_value(py, &v)?;
-                map.insert(k, serde_json::Value::from(val));
-            }
-            rust_props.push(map);
+    // ========================================================================
+    // Locy
+    // ========================================================================
+
+    /// Get the Locy evaluation engine.
+    fn locy(&self) -> LocyEngine {
+        LocyEngine {
+            inner: self.inner.clone(),
         }
-
-        let vids = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(core::bulk_insert_vertices_core(
-                &self.inner,
-                label,
-                rust_props,
-            ))
-            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
-
-        Ok(vids.into_iter().map(|v| v.as_u64()).collect())
-    }
-
-    /// Bulk insert edges (legacy API, prefer bulk_writer()).
-    fn bulk_insert_edges(
-        &self,
-        py: Python,
-        edge_type: &str,
-        edges: Vec<(u64, u64, HashMap<String, Py<PyAny>>)>,
-    ) -> PyResult<()> {
-        let mut rust_edges = Vec::new();
-        for (src, dst, p) in edges {
-            let mut map = HashMap::new();
-            for (k, v) in p {
-                let val = convert::py_object_to_value(py, &v)?;
-                map.insert(k, serde_json::Value::from(val));
-            }
-            rust_edges.push((::uni_db::Vid::from(src), ::uni_db::Vid::from(dst), map));
-        }
-
-        pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(core::bulk_insert_edges_core(
-                &self.inner,
-                edge_type,
-                rust_edges,
-            ))
-            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
-
-        Ok(())
-    }
-
-    /// Register Locy rules for reuse across multiple evaluate calls.
-    ///
-    /// Rules defined here persist within the session and are automatically
-    /// merged into subsequent ``locy_evaluate()`` calls, eliminating the
-    /// need to redeclare the full rule set each time.
-    fn locy_compile(&self, program: &str) -> PyResult<()> {
-        self.inner
-            .locy()
-            .register(program)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
-    }
-
-    /// Clear all registered Locy rules from the session.
-    fn locy_clear(&self) -> PyResult<()> {
-        self.inner.locy().clear_registry();
-        Ok(())
-    }
-
-    /// Evaluate a Locy program and return derived facts, stats, and command results.
-    #[pyo3(signature = (program, params=None, config=None))]
-    fn locy_evaluate(
-        &self,
-        py: Python,
-        program: &str,
-        params: Option<HashMap<String, Py<PyAny>>>,
-        config: Option<HashMap<String, Py<PyAny>>>,
-    ) -> PyResult<Py<PyAny>> {
-        let result = if config.is_some() || params.is_some() {
-            let mut locy_config = config
-                .map(|cfg| convert::extract_locy_config(py, cfg))
-                .transpose()?
-                .unwrap_or_default();
-            if let Some(p) = params {
-                locy_config.params = convert::prepare_params(py, Some(p))?;
-            }
-            pyo3_async_runtimes::tokio::get_runtime()
-                .block_on(core::locy_evaluate_with_config_core(
-                    &self.inner,
-                    program,
-                    locy_config,
-                ))
-                .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?
-        } else {
-            pyo3_async_runtimes::tokio::get_runtime()
-                .block_on(core::locy_evaluate_core(&self.inner, program))
-                .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?
-        };
-        convert::locy_result_to_py(py, result)
     }
 
     /// Get a Xervo facade for embedding and generation operations.
@@ -786,6 +896,31 @@ impl Database {
     }
 
     // -----------------------------------------------------------------------
+    // Compaction
+    // -----------------------------------------------------------------------
+
+    /// Compact a label's storage files.
+    fn compact_label(&self, label: &str) -> PyResult<()> {
+        pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(core::compact_label_core(&self.inner, label))
+            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+    }
+
+    /// Compact an edge type's storage files.
+    fn compact_edge_type(&self, edge_type: &str) -> PyResult<()> {
+        pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(core::compact_edge_type_core(&self.inner, edge_type))
+            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+    }
+
+    /// Wait for any ongoing compaction to complete.
+    fn wait_for_compaction(&self) -> PyResult<()> {
+        pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(core::wait_for_compaction_core(&self.inner))
+            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+    }
+
+    // -----------------------------------------------------------------------
     // Index administration
     // -----------------------------------------------------------------------
 
@@ -810,11 +945,11 @@ impl Database {
             .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
     }
 
-    /// Force rebuild indexes for a label. If async_=True, returns a task ID.
-    #[pyo3(signature = (label, async_=false))]
-    fn rebuild_indexes(&self, label: &str, async_: bool) -> PyResult<Option<String>> {
+    /// Force rebuild indexes for a label. If background=true, returns a task ID.
+    #[pyo3(signature = (label, background=false))]
+    fn rebuild_indexes(&self, label: &str, background: bool) -> PyResult<Option<String>> {
         pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(core::rebuild_indexes_core(&self.inner, label, async_))
+            .block_on(core::rebuild_indexes_core(&self.inner, label, background))
             .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
     }
 
@@ -843,6 +978,112 @@ impl Database {
             .into_iter()
             .map(|i| convert::index_definition_to_py(py, i))
             .collect()
+    }
+}
+
+// ============================================================================
+// LocyEngine (synchronous)
+// ============================================================================
+
+/// Synchronous Locy evaluation engine.
+#[pyclass]
+pub struct LocyEngine {
+    pub(crate) inner: Arc<Uni>,
+}
+
+#[pymethods]
+impl LocyEngine {
+    /// Evaluate a Locy program with optional params and config.
+    #[pyo3(signature = (program, params=None, config=None))]
+    fn evaluate(
+        &self,
+        py: Python,
+        program: &str,
+        params: Option<HashMap<String, Py<PyAny>>>,
+        config: Option<HashMap<String, Py<PyAny>>>,
+    ) -> PyResult<crate::types::PyLocyResult> {
+        let result = if config.is_some() || params.is_some() {
+            let mut locy_config = config
+                .map(|cfg| convert::extract_locy_config(py, cfg))
+                .transpose()?
+                .unwrap_or_default();
+            if let Some(p) = params {
+                locy_config.params = convert::prepare_params(py, Some(p))?;
+            }
+            pyo3_async_runtimes::tokio::get_runtime()
+                .block_on(core::locy_evaluate_with_config_core(
+                    &self.inner,
+                    program,
+                    locy_config,
+                ))
+                .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?
+        } else {
+            pyo3_async_runtimes::tokio::get_runtime()
+                .block_on(core::locy_evaluate_core(&self.inner, program))
+                .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?
+        };
+        convert::locy_result_to_py_class(py, result)
+    }
+
+    /// Create a builder for complex Locy evaluation configuration.
+    fn evaluate_with(&self, program: &str) -> crate::builders::LocyBuilder {
+        crate::builders::LocyBuilder {
+            inner: self.inner.clone(),
+            program: program.to_string(),
+            params: HashMap::new(),
+            timeout_secs: None,
+            max_iterations: None,
+            config: None,
+        }
+    }
+
+    /// Register Locy rules for reuse across multiple evaluate calls.
+    fn register(&self, program: &str) -> PyResult<()> {
+        self.inner
+            .locy()
+            .register(program)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+    }
+
+    /// Clear all registered Locy rules.
+    fn clear_registry(&self) -> PyResult<()> {
+        self.inner.locy().clear_registry();
+        Ok(())
+    }
+
+    /// Compile a Locy program without executing it.
+    fn compile_only(&self, program: &str) -> PyResult<crate::types::PyCompiledProgram> {
+        let compiled = core::locy_compile_only_core(&self.inner, program)
+            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
+        Ok(crate::types::PyCompiledProgram { inner: compiled })
+    }
+
+    /// Explain a Locy program's evaluation plan.
+    #[pyo3(signature = (program, params=None))]
+    fn explain(
+        &self,
+        py: Python,
+        program: &str,
+        params: Option<HashMap<String, Py<PyAny>>>,
+    ) -> PyResult<crate::types::PyLocyResult> {
+        let result = if let Some(p) = params {
+            let config = ::uni_db::locy::LocyConfig {
+                params: convert::prepare_params(py, Some(p))?,
+                ..Default::default()
+            };
+            pyo3_async_runtimes::tokio::get_runtime()
+                .block_on(core::locy_evaluate_with_config_core(
+                    &self.inner,
+                    program,
+                    config,
+                ))
+                .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?
+        } else {
+            pyo3_async_runtimes::tokio::get_runtime()
+                .block_on(core::locy_evaluate_core(&self.inner, program))
+                .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?
+        };
+        convert::locy_result_to_py_class(py, result)
     }
 }
 

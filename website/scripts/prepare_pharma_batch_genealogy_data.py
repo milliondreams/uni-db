@@ -92,7 +92,9 @@ def _format_float(value: object) -> str:
     return str(value)
 
 
-def _write_csv(path: Path, fieldnames: list[str], rows: list[dict[str, object]]) -> None:
+def _write_csv(
+    path: Path, fieldnames: list[str], rows: list[dict[str, object]]
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -224,14 +226,18 @@ def main() -> int:
 
     joined.sort(key=lambda row: int(row["batch_num"]))
     if not joined:
-        raise ValueError(f"No joined rows found for product code '{args.product_code}'.")
+        raise ValueError(
+            f"No joined rows found for product code '{args.product_code}'."
+        )
     joined = joined[: args.max_batches]
 
     scores = sorted(float(row["deviation_score"]) for row in joined)
     cutoff_idx = int(max(0, min(len(scores) - 1, round(len(scores) * 0.82))))
     soft_cutoff = scores[cutoff_idx]
     for row in joined:
-        is_dev = bool(row["hard_deviation"]) or float(row["deviation_score"]) >= soft_cutoff
+        is_dev = (
+            bool(row["hard_deviation"]) or float(row["deviation_score"]) >= soft_cutoff
+        )
         row["quality_state"] = "DEVIATION" if is_dev else "IN_SPEC"
         row["process_risk"] = min(0.98, 0.10 + float(row["deviation_score"]) / 8.0)
 
@@ -293,7 +299,9 @@ def main() -> int:
                 material_seen[material_lot_id] = material
             else:
                 material["batches_seen"] = int(material["batches_seen"]) + 1
-                material["intrinsic_risk"] = max(float(material["intrinsic_risk"]), intrinsic)
+                material["intrinsic_risk"] = max(
+                    float(material["intrinsic_risk"]), intrinsic
+                )
 
             usage_rows.append(
                 {
@@ -303,7 +311,9 @@ def main() -> int:
                 }
             )
 
-    material_rows.extend(sorted(material_seen.values(), key=lambda x: str(x["material_lot_id"])))
+    material_rows.extend(
+        sorted(material_seen.values(), key=lambda x: str(x["material_lot_id"]))
+    )
 
     campaign_edges: list[dict[str, object]] = []
     for i in range(len(joined) - 1):
@@ -311,7 +321,9 @@ def main() -> int:
         dst = joined[i + 1]
         startup = float(src["startup_waste"] or 0.0)
         startup_factor = min(1.0, max(0.0, (startup - 1500.0) / 5000.0))
-        carry = min(0.95, 0.20 + 0.55 * float(src["process_risk"]) + 0.25 * startup_factor)
+        carry = min(
+            0.95, 0.20 + 0.55 * float(src["process_risk"]) + 0.25 * startup_factor
+        )
         campaign_edges.append(
             {
                 "src_batch_id": src["batch_id"],
@@ -391,7 +403,13 @@ def main() -> int:
     )
     _write_csv(
         output_dir / "pharma_material_lots.csv",
-        ["material_lot_id", "material_type", "source_lot", "intrinsic_risk", "batches_seen"],
+        [
+            "material_lot_id",
+            "material_type",
+            "source_lot",
+            "intrinsic_risk",
+            "batches_seen",
+        ],
         material_rows,
     )
     _write_csv(
@@ -437,7 +455,9 @@ def main() -> int:
         },
         "shape": {
             "batches": len(batch_rows),
-            "deviation_batches": sum(1 for row in batch_rows if row["quality_state"] == "DEVIATION"),
+            "deviation_batches": sum(
+                1 for row in batch_rows if row["quality_state"] == "DEVIATION"
+            ),
             "material_lots": len(material_rows),
             "usage_edges": len(usage_rows),
             "campaign_edges": len(campaign_edges),
@@ -450,14 +470,22 @@ def main() -> int:
             "top_cases": args.top_cases,
         },
     }
-    (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    (output_dir / "manifest.json").write_text(
+        json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+    )
 
     print(f"wrote {output_dir / 'pharma_batches.csv'} ({len(batch_rows)} rows)")
-    print(f"wrote {output_dir / 'pharma_material_lots.csv'} ({len(material_rows)} rows)")
+    print(
+        f"wrote {output_dir / 'pharma_material_lots.csv'} ({len(material_rows)} rows)"
+    )
     print(f"wrote {output_dir / 'pharma_usage_edges.csv'} ({len(usage_rows)} rows)")
-    print(f"wrote {output_dir / 'pharma_campaign_edges.csv'} ({len(campaign_edges)} rows)")
+    print(
+        f"wrote {output_dir / 'pharma_campaign_edges.csv'} ({len(campaign_edges)} rows)"
+    )
     print(f"wrote {output_dir / 'pharma_action_plans.csv'} ({len(action_rows)} rows)")
-    print(f"wrote {output_dir / 'pharma_notebook_cases.csv'} ({len(notebook_cases_rows)} rows)")
+    print(
+        f"wrote {output_dir / 'pharma_notebook_cases.csv'} ({len(notebook_cases_rows)} rows)"
+    )
     print(f"wrote {output_dir / 'manifest.json'}")
     return 0
 

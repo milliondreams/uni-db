@@ -11428,8 +11428,7 @@
             "keyword": "Scenario ",
             "name": "[9] Handle subexpression in aggregation also occurring as standalone expression with nested aggregation in a literal map",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/clauses/return/Return4.feature:176:5\n      Matched: crates/uni-tck/src/steps/then.rs:20:1\n      Step panicked. Captured output: Result mismatch (any order): No match found for actual row 0. Actual values: [(\"foo\", Some(String(\"42\"))), (\"bar\", Some(Int(42))), (\"baz\", Some(Map({\"name\": Int(1)})))]. Expected: [{\"foo\": Int(42), \"bar\": Int(42), \"baz\": Map({\"name\": Int(1)})}]\n[Summary]\n1 feature\n1 scenario (1 failed)\n4 steps (3 passed, 1 failed)\n"
+              "status": "passed"
             }
           }
         ]

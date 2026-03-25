@@ -19,7 +19,7 @@ class TestUseCases(unittest.TestCase):
 
     def get_db(self, name):
         path = os.path.join(self.test_dir_base, name)
-        return uni_db.Database(path)
+        return uni_db.Database.open(path)
 
     def tearDown(self):
         self._rmtree_with_retries(self.test_dir_base)
@@ -63,16 +63,18 @@ class TestUseCases(unittest.TestCase):
         p2_props = {"sku": "MB-X1", "cost": 50.0}
         p3_props = {"sku": "SCR-OLED", "cost": 30.0}
 
-        vids = db.bulk_insert_vertices("Part", [p1_props, p2_props, p3_props])
+        bw = db.bulk_writer().build()
+        vids = bw.insert_vertices("Part", [p1_props, p2_props, p3_props])
         p1, p2, p3 = vids
 
         prod_props = {"name": "Smartphone X", "price": 500.0}
-        phone_vids = db.bulk_insert_vertices("Product", [prod_props])
+        phone_vids = bw.insert_vertices("Product", [prod_props])
         phone = phone_vids[0]
 
-        db.bulk_insert_edges(
+        bw.insert_edges(
             "ASSEMBLED_FROM", [(phone, p2, {}), (phone, p3, {}), (p2, p1, {})]
         )
+        bw.commit()
 
         db.flush()
 
@@ -121,7 +123,8 @@ class TestUseCases(unittest.TestCase):
         p1_vec = [1.0, 0.0, 0.0, 0.0]
         p2_vec = [0.9, 0.1, 0.0, 0.0]
 
-        vids = db.bulk_insert_vertices(
+        bw = db.bulk_writer().build()
+        vids = bw.insert_vertices(
             "Product",
             [
                 {"name": "Running Shoes", "price": 100.0, "embedding": p1_vec},
@@ -130,10 +133,11 @@ class TestUseCases(unittest.TestCase):
         )
         p1, p2 = vids
 
-        u_vids = db.bulk_insert_vertices("User", [{}, {}, {}])
+        u_vids = bw.insert_vertices("User", [{}, {}, {}])
         u1, u2, u3 = u_vids
 
-        db.bulk_insert_edges("PURCHASED", [(u1, p1, {}), (u2, p1, {}), (u3, p1, {})])
+        bw.insert_edges("PURCHASED", [(u1, p1, {}), (u2, p1, {}), (u3, p1, {})])
+        bw.commit()
 
         db.flush()
 
@@ -162,7 +166,8 @@ class TestUseCases(unittest.TestCase):
         c1_vec = [1.0, 0.0, 0.0, 0.0]
         c2_vec = [0.9, 0.1, 0.0, 0.0]
 
-        c_vids = db.bulk_insert_vertices(
+        bw = db.bulk_writer().build()
+        c_vids = bw.insert_vertices(
             "Chunk",
             [
                 {"text": "Function verify() checks signatures.", "embedding": c1_vec},
@@ -171,12 +176,11 @@ class TestUseCases(unittest.TestCase):
         )
         c1, c2 = c_vids
 
-        e_vids = db.bulk_insert_vertices(
-            "Entity", [{"name": "verify", "type": "function"}]
-        )
+        e_vids = bw.insert_vertices("Entity", [{"name": "verify", "type": "function"}])
         e1 = e_vids[0]
 
-        db.bulk_insert_edges("MENTIONS", [(c1, e1, {}), (c2, e1, {})])
+        bw.insert_edges("MENTIONS", [(c1, e1, {}), (c2, e1, {})])
+        bw.commit()
         db.flush()
 
         # 3. Hybrid RAG Query
@@ -202,7 +206,8 @@ class TestUseCases(unittest.TestCase):
         db.add_property("User", "risk_score", "float32", True)
 
         # 2. Ingestion
-        u_vids = db.bulk_insert_vertices(
+        bw = db.bulk_writer().build()
+        u_vids = bw.insert_vertices(
             "User",
             [
                 {"risk_score": 0.1},  # A
@@ -213,10 +218,10 @@ class TestUseCases(unittest.TestCase):
         )
         ua, ub, uc, ud = u_vids
 
-        d_vids = db.bulk_insert_vertices("Device", [{}])
+        d_vids = bw.insert_vertices("Device", [{}])
         d1 = d_vids[0]
 
-        db.bulk_insert_edges(
+        bw.insert_edges(
             "SENT_MONEY",
             [
                 (ua, ub, {"amount": 5000.0}),
@@ -225,7 +230,8 @@ class TestUseCases(unittest.TestCase):
             ],
         )
 
-        db.bulk_insert_edges("USED_DEVICE", [(ua, d1, {}), (ud, d1, {})])
+        bw.insert_edges("USED_DEVICE", [(ua, d1, {}), (ud, d1, {})])
+        bw.commit()
         db.flush()
 
         # 3. Cycle Detection
@@ -257,14 +263,16 @@ class TestUseCases(unittest.TestCase):
         db.add_property("Region", "name", "string", False)
         db.add_property("Order", "amount", "float64", False)
 
-        vids_region = db.bulk_insert_vertices("Region", [{"name": "North"}])
+        bw = db.bulk_writer().build()
+        vids_region = bw.insert_vertices("Region", [{"name": "North"}])
         north = vids_region[0]
 
         orders = [{"amount": 10.0 * (i + 1)} for i in range(100)]
-        vids_orders = db.bulk_insert_vertices("Order", orders)
+        vids_orders = bw.insert_vertices("Order", orders)
 
         edges = [(v, north, {}) for v in vids_orders]
-        db.bulk_insert_edges("SHIPPED_TO", edges)
+        bw.insert_edges("SHIPPED_TO", edges)
+        bw.commit()
         db.flush()
 
         # Query: Sum of amounts for orders shipped to "North"
@@ -285,7 +293,8 @@ class TestUseCases(unittest.TestCase):
         db.add_property("Paper", "topic", "string", False)
         db.add_property("Paper", "title", "string", False)
 
-        vids = db.bulk_insert_vertices(
+        bw = db.bulk_writer().build()
+        vids = bw.insert_vertices(
             "Paper",
             [
                 {"topic": "AI", "title": "Paper 1"},
@@ -295,7 +304,8 @@ class TestUseCases(unittest.TestCase):
         )
         p1, p2, p3 = vids
 
-        db.bulk_insert_edges("CITES", [(p1, p3, {})])
+        bw.insert_edges("CITES", [(p1, p3, {})])
+        bw.commit()
         db.flush()
 
         # Find AI papers that cite other AI papers
@@ -321,10 +331,11 @@ class TestUseCases(unittest.TestCase):
         db.create_vector_index("Product", "embedding", "l2")
 
         # Alice viewed a Laptop
-        vids_u = db.bulk_insert_vertices("User", [{"name": "Alice"}])
+        bw = db.bulk_writer().build()
+        vids_u = bw.insert_vertices("User", [{"name": "Alice"}])
         alice = vids_u[0]
 
-        vids_p = db.bulk_insert_vertices(
+        vids_p = bw.insert_vertices(
             "Product",
             [
                 {"name": "Laptop", "embedding": [1.0, 0.0]},
@@ -334,7 +345,8 @@ class TestUseCases(unittest.TestCase):
         )
         laptop, mouse, shampoo = vids_p
 
-        db.bulk_insert_edges("VIEWED", [(alice, laptop, {})])
+        bw.insert_edges("VIEWED", [(alice, laptop, {})])
+        bw.commit()
         db.flush()
 
         # 1. Find Alice's viewed products and their embeddings

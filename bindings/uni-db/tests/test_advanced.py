@@ -13,7 +13,7 @@ import uni_db
 class TestAdvanced(unittest.TestCase):
     def setUp(self):
         self.test_dir = tempfile.mkdtemp(prefix="test_db_adv_")
-        self.db = uni_db.Database(self.test_dir)
+        self.db = uni_db.Database.open(self.test_dir)
         self.db.create_label("Entity")
 
     def tearDown(self):

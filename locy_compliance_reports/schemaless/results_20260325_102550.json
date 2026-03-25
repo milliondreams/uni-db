@@ -1202,8 +1202,7 @@
             "keyword": "Scenario ",
             "name": "sqrt() in QUERY WHERE filters correctly",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/evaluate/CypherFunctions.feature:16:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/evaluate/CypherFunctions.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/evaluate/CypherFunctions.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1217,8 +1216,7 @@
             "keyword": "Scenario ",
             "name": "exp() in QUERY WHERE filters correctly",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/evaluate/CypherFunctions.feature:16:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/evaluate/CypherFunctions.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/evaluate/CypherFunctions.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1232,8 +1230,7 @@
             "keyword": "Scenario ",
             "name": "log() in QUERY WHERE filters correctly",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/evaluate/CypherFunctions.feature:16:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/evaluate/CypherFunctions.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/evaluate/CypherFunctions.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1247,8 +1244,7 @@
             "keyword": "Scenario ",
             "name": "exp(0) = 1.0 in QUERY RETURN",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/evaluate/CypherFunctions.feature:16:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/evaluate/CypherFunctions.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/evaluate/CypherFunctions.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1262,8 +1258,7 @@
             "keyword": "Scenario ",
             "name": "sqrt(4) = 2.0 in QUERY RETURN",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/evaluate/CypherFunctions.feature:16:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/evaluate/CypherFunctions.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/evaluate/CypherFunctions.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1277,8 +1272,7 @@
             "keyword": "Scenario ",
             "name": "toUpper() in QUERY RETURN",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/evaluate/CypherFunctions.feature:16:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/evaluate/CypherFunctions.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/evaluate/CypherFunctions.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1292,8 +1286,7 @@
             "keyword": "Scenario ",
             "name": "toLower() in QUERY WHERE",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/evaluate/CypherFunctions.feature:16:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/evaluate/CypherFunctions.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/evaluate/CypherFunctions.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1307,8 +1300,7 @@
             "keyword": "Scenario ",
             "name": "datetime() in QUERY RETURN does not error",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/evaluate/CypherFunctions.feature:16:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/evaluate/CypherFunctions.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/evaluate/CypherFunctions.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1322,8 +1314,7 @@
             "keyword": "Scenario ",
             "name": "exp() decay pattern in QUERY WHERE models relevance decay",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/evaluate/CypherFunctions.feature:16:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/evaluate/CypherFunctions.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/evaluate/CypherFunctions.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1529,8 +1520,7 @@
             "keyword": "Scenario ",
             "name": "$param in QUERY WHERE filters to matching agent",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/evaluate/ParameterBinding.feature:9:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/evaluate/ParameterBinding.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/evaluate/ParameterBinding.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1544,8 +1534,7 @@
             "keyword": "Scenario ",
             "name": "$param in QUERY WHERE excludes non-matching rows",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/evaluate/ParameterBinding.feature:9:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/evaluate/ParameterBinding.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/evaluate/ParameterBinding.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1559,8 +1548,7 @@
             "keyword": "Scenario ",
             "name": "$param in rule MATCH WHERE scopes derived relation",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/evaluate/ParameterBinding.feature:9:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/evaluate/ParameterBinding.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/evaluate/ParameterBinding.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1574,8 +1562,7 @@
             "keyword": "Scenario ",
             "name": "Integer $param used in WHERE comparison",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/evaluate/ParameterBinding.feature:9:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/evaluate/ParameterBinding.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/evaluate/ParameterBinding.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1589,8 +1576,7 @@
             "keyword": "Scenario ",
             "name": "Multiple $params filter on two dimensions",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/evaluate/ParameterBinding.feature:9:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/evaluate/ParameterBinding.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/evaluate/ParameterBinding.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]

@@ -153,9 +153,9 @@ class TestBackwardCompatibility:
     """Tests for backward compatibility with Database() constructor."""
 
     def test_database_constructor(self):
-        """Test that Database(path) constructor still works."""
+        """Test that Database.open(path) static factory works."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            db = uni_db.Database(tmpdir)
+            db = uni_db.Database.open(tmpdir)
             assert db is not None
             db.create_label("Legacy")
             db.execute("CREATE (n:Legacy)")

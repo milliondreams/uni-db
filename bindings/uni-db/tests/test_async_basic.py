@@ -133,7 +133,7 @@ async def test_async_query_with_builder():
     results = await (
         db.query_with("MATCH (n:Item) WHERE n.value = $val RETURN n.name AS name")
         .param("val", 42)
-        .run()
+        .fetch_all()
     )
     assert len(results) == 1
     assert results[0]["name"] == "Widget"
@@ -147,5 +147,7 @@ async def test_async_query_with_timeout():
     await db.add_property("Node", "x", "int", False)
     await db.execute("CREATE (n:Node {x: 1})")
 
-    results = await db.query_with("MATCH (n:Node) RETURN n.x AS x").timeout(30.0).run()
+    results = (
+        await db.query_with("MATCH (n:Node) RETURN n.x AS x").timeout(30.0).fetch_all()
+    )
     assert len(results) == 1

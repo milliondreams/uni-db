@@ -8,7 +8,6 @@ use crate::core::{self, OpenMode};
 use crate::types::BulkStats;
 use ::uni_db::Uni;
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use uni_common::core::schema::{DataType, IndexDefinition};
@@ -92,7 +91,7 @@ impl DatabaseBuilder {
 
     /// Create a temporary database that is deleted when dropped.
     #[staticmethod]
-    fn temporary() -> Self {
+    pub fn temporary() -> Self {
         Self {
             uri: String::new(),
             mode: OpenMode::Temporary,
@@ -224,12 +223,12 @@ impl QueryBuilder {
     }
 
     /// Bind multiple parameters from a dictionary.
-    fn params(&mut self, params: Bound<'_, PyDict>) {
-        for (k, v) in params {
-            if let Ok(key) = k.extract::<String>() {
-                self.params.insert(key, v.into());
-            }
-        }
+    fn params(
+        mut slf: PyRefMut<'_, Self>,
+        params: HashMap<String, Py<PyAny>>,
+    ) -> PyRefMut<'_, Self> {
+        slf.params.extend(params);
+        slf
     }
 
     /// Set maximum execution time in seconds.
@@ -266,6 +265,24 @@ impl QueryBuilder {
             buffer: std::sync::Mutex::new(VecDeque::new()),
             columns,
         })
+    }
+
+    /// Execute a mutation query and return affected row count.
+    fn execute(&self, py: Python) -> PyResult<usize> {
+        let mut rust_params = HashMap::new();
+        for (k, v) in &self.params {
+            let val = convert::py_object_to_value(py, v)?;
+            rust_params.insert(k.clone(), val);
+        }
+
+        let result = pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(core::execute_with_params_core(
+                &self.inner,
+                &self.cypher,
+                rust_params,
+            ))
+            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
+        Ok(result)
     }
 
     /// Execute the query and fetch all results.
@@ -529,10 +546,15 @@ pub struct SessionBuilder {
 #[pymethods]
 impl SessionBuilder {
     /// Set a session variable.
-    fn set(&mut self, py: Python, key: String, value: Py<PyAny>) -> PyResult<()> {
+    fn set<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        key: String,
+        value: Py<PyAny>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let py = slf.py();
         let json_val = convert::py_object_to_json(py, &value)?;
-        self.variables.insert(key, json_val);
-        Ok(())
+        slf.variables.insert(key, json_val);
+        Ok(slf)
     }
 
     /// Build the session.
@@ -598,6 +620,17 @@ impl Session {
             .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
 
         convert::rows_to_py(py, rows.rows)
+    }
+
+    /// Create a query builder with session variables available.
+    fn query_with(&self, cypher: &str) -> QueryBuilder {
+        QueryBuilder {
+            inner: self.inner.clone(),
+            cypher: cypher.to_string(),
+            params: HashMap::new(),
+            timeout_secs: None,
+            max_memory: None,
+        }
     }
 
     /// Execute a mutation query, returning affected row count.
@@ -781,5 +814,118 @@ impl BulkWriter {
         }
         self.aborted = true;
         Ok(())
+    }
+
+    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    /// Auto-abort on exception if not committed.
+    #[pyo3(signature = (_exc_type=None, _exc_val=None, _exc_tb=None))]
+    fn __exit__(
+        &mut self,
+        _exc_type: Option<Py<PyAny>>,
+        _exc_val: Option<Py<PyAny>>,
+        _exc_tb: Option<Py<PyAny>>,
+    ) -> PyResult<bool> {
+        if !self.committed && !self.aborted {
+            self.aborted = true;
+        }
+        Ok(false)
+    }
+}
+
+// ============================================================================
+// LocyBuilder (sync)
+// ============================================================================
+
+/// Builder for constructing and executing Locy evaluations.
+#[pyclass]
+pub struct LocyBuilder {
+    pub(crate) inner: Arc<Uni>,
+    pub(crate) program: String,
+    pub(crate) params: HashMap<String, Py<PyAny>>,
+    pub(crate) timeout_secs: Option<f64>,
+    pub(crate) max_iterations: Option<usize>,
+    pub(crate) config: Option<HashMap<String, Py<PyAny>>>,
+}
+
+#[pymethods]
+impl LocyBuilder {
+    /// Bind a single parameter.
+    fn param(mut slf: PyRefMut<'_, Self>, name: String, value: Py<PyAny>) -> PyRefMut<'_, Self> {
+        slf.params.insert(name, value);
+        slf
+    }
+
+    /// Bind multiple parameters from a dictionary.
+    fn params(
+        mut slf: PyRefMut<'_, Self>,
+        params: HashMap<String, Py<PyAny>>,
+    ) -> PyRefMut<'_, Self> {
+        slf.params.extend(params);
+        slf
+    }
+
+    /// Set maximum execution time in seconds.
+    fn timeout(mut slf: PyRefMut<'_, Self>, seconds: f64) -> PyRefMut<'_, Self> {
+        slf.timeout_secs = Some(seconds);
+        slf
+    }
+
+    /// Set maximum fixpoint iterations.
+    fn max_iterations(mut slf: PyRefMut<'_, Self>, n: usize) -> PyRefMut<'_, Self> {
+        slf.max_iterations = Some(n);
+        slf
+    }
+
+    /// Set full Locy config dict.
+    fn config(
+        mut slf: PyRefMut<'_, Self>,
+        config: HashMap<String, Py<PyAny>>,
+    ) -> PyRefMut<'_, Self> {
+        slf.config = Some(config);
+        slf
+    }
+
+    /// Execute the Locy evaluation.
+    fn run(&self, py: Python) -> PyResult<crate::types::PyLocyResult> {
+        // Extract params while we have the GIL
+        let mut rust_params = HashMap::new();
+        for (k, v) in &self.params {
+            let val = convert::py_object_to_value(py, v)?;
+            rust_params.insert(k.clone(), val);
+        }
+
+        // Build config from the config dict if provided, otherwise default
+        let mut locy_config = if let Some(ref cfg) = self.config {
+            // Re-extract: convert HashMap<String, Py<PyAny>> to owned HashMap for extract_locy_config
+            let cfg_owned: HashMap<String, Py<PyAny>> = cfg
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone_ref(py)))
+                .collect();
+            convert::extract_locy_config(py, cfg_owned)?
+        } else {
+            ::uni_db::locy::LocyConfig::default()
+        };
+
+        // Merge explicit params
+        locy_config.params.extend(rust_params);
+
+        if let Some(t) = self.timeout_secs {
+            locy_config.timeout = std::time::Duration::from_secs_f64(t);
+        }
+        if let Some(n) = self.max_iterations {
+            locy_config.max_iterations = n;
+        }
+
+        let result = pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(core::locy_evaluate_with_config_core(
+                &self.inner,
+                &self.program,
+                locy_config,
+            ))
+            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
+        convert::locy_result_to_py_class(py, result)
     }
 }

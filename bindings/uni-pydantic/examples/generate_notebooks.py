@@ -87,7 +87,7 @@ def db_setup(name):
         f'db_path = os.path.join(tempfile.gettempdir(), "{name}_pydantic_db")',
         "if os.path.exists(db_path):",
         "    shutil.rmtree(db_path)",
-        "db = uni_db.Database(db_path)",
+        "db = uni_db.Database.open(db_path)",
         "",
         "# Create session and register models",
         "session = UniSession(db)",

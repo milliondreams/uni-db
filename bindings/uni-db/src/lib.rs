@@ -74,6 +74,14 @@ fn _uni_db(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<types::BulkStats>()?;
     m.add_class::<types::BulkProgress>()?;
     m.add_class::<types::LocyStats>()?;
+    m.add_class::<types::PyLocyResult>()?;
+    m.add_class::<types::PyCompiledProgram>()?;
+
+    // Locy engine
+    m.add_class::<sync_api::LocyEngine>()?;
+    m.add_class::<builders::LocyBuilder>()?;
+    m.add_class::<async_api::AsyncLocyEngine>()?;
+    m.add_class::<async_api::AsyncLocyBuilder>()?;
 
     // Xervo types
     m.add_class::<types::PyMessage>()?;

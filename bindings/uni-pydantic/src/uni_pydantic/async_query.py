@@ -45,7 +45,7 @@ class AsyncQueryBuilder(_QueryBuilderBase[NodeT]):
                 builder = builder.timeout(self._timeout)
             if self._max_memory is not None:
                 builder = builder.max_memory(self._max_memory)
-            return await builder.run()
+            return await builder.fetch_all()
         return await self._session._db.query(cypher, params)
 
     async def all(self) -> list[NodeT]:

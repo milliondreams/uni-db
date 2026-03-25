@@ -211,9 +211,9 @@ class UniSession:
         """
         Evaluate a Locy program and return derived facts, stats, and warnings.
 
-        Delegates directly to the underlying ``uni_db.Database.locy_evaluate()``.
+        Delegates directly to the underlying ``uni_db.Database.locy().evaluate()``.
         """
-        return self._db.locy_evaluate(program, config)
+        return self._db.locy().evaluate(program, config=config)
 
     def register(self, *models: type[UniNode] | type[UniEdge]) -> None:
         """
@@ -594,9 +594,9 @@ class UniSession:
 
     def bulk_add(self, entities: Sequence[UniNode]) -> list[int]:
         """
-        Bulk-add entities using bulk_insert_vertices for performance.
+        Bulk-add entities using bulk_writer for performance.
 
-        Groups entities by label and uses db.bulk_insert_vertices().
+        Groups entities by label and uses db.bulk_writer().
         Returns VIDs and attaches sessions.
 
         Args:
@@ -630,7 +630,9 @@ class UniSession:
                 prop_dicts = [e.to_properties() for e in group]
 
                 # Bulk insert
-                vids = self._db.bulk_insert_vertices(label, prop_dicts)
+                with self._db.bulk_writer().build() as bw:
+                    vids = bw.insert_vertices(label, prop_dicts)
+                    bw.commit()
 
                 # Attach sessions and record VIDs
                 for entity, vid in zip(group, vids):

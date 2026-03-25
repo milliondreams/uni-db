@@ -635,6 +635,74 @@ pub fn locy_result_to_py(py: Python, result: uni_locy::LocyResult) -> PyResult<P
     Ok(dict.into())
 }
 
+/// Convert a LocyResult to a Python LocyResult class instance.
+pub fn locy_result_to_py_class(
+    py: Python,
+    result: uni_locy::LocyResult,
+) -> PyResult<crate::types::PyLocyResult> {
+    // Reuse the existing dict-based conversion for the inner fields
+    let derived_dict = pyo3::types::PyDict::new(py);
+    for (rule_name, rows) in result.derived {
+        derived_dict.set_item(&rule_name, locy_rows_to_py(py, rows)?)?;
+    }
+
+    let stats = crate::types::LocyStats {
+        strata_evaluated: result.stats.strata_evaluated,
+        total_iterations: result.stats.total_iterations,
+        derived_nodes: result.stats.derived_nodes,
+        derived_edges: result.stats.derived_edges,
+        evaluation_time_secs: result.stats.evaluation_time.as_secs_f64(),
+        queries_executed: result.stats.queries_executed,
+        mutations_executed: result.stats.mutations_executed,
+        peak_memory_bytes: result.stats.peak_memory_bytes,
+    };
+
+    let cmd_list = pyo3::types::PyList::empty(py);
+    for cmd in result.command_results {
+        cmd_list.append(command_result_to_py(py, cmd)?)?;
+    }
+
+    let warn_list = pyo3::types::PyList::empty(py);
+    for w in result.warnings {
+        let wd = pyo3::types::PyDict::new(py);
+        let code_str = match w.code {
+            uni_locy::RuntimeWarningCode::SharedProbabilisticDependency => {
+                "shared_probabilistic_dependency"
+            }
+            uni_locy::RuntimeWarningCode::BddLimitExceeded => "bdd_limit_exceeded",
+            uni_locy::RuntimeWarningCode::CrossGroupCorrelationNotExact => {
+                "cross_group_correlation_not_exact"
+            }
+        };
+        wd.set_item("code", code_str)?;
+        wd.set_item("message", &w.message)?;
+        wd.set_item("rule_name", &w.rule_name)?;
+        match w.variable_count {
+            Some(n) => wd.set_item("variable_count", n)?,
+            None => wd.set_item("variable_count", py.None())?,
+        }
+        match w.key_group {
+            Some(ref g) => wd.set_item("key_group", g)?,
+            None => wd.set_item("key_group", py.None())?,
+        }
+        warn_list.append(wd)?;
+    }
+
+    let approx_dict = pyo3::types::PyDict::new(py);
+    for (rule_name, groups) in result.approximate_groups {
+        let group_list = pyo3::types::PyList::new(py, groups.iter().map(|s| s.as_str()))?;
+        approx_dict.set_item(&rule_name, group_list)?;
+    }
+
+    Ok(crate::types::PyLocyResult {
+        derived: derived_dict.into(),
+        stats: stats.into_py_any(py)?,
+        command_results: cmd_list.into(),
+        warnings: warn_list.into(),
+        approximate_groups: approx_dict.into(),
+    })
+}
+
 /// Extract a CloudStorageConfig from a Python dict.
 ///
 /// The dict must have a `"provider"` key: `"s3"`, `"gcs"`, or `"azure"`.

@@ -813,7 +813,9 @@ async fn test_bulk_insert_vertices_overflow_properties() -> Result<()> {
         .await?;
     assert_eq!(results.len(), 1, "should find item_2 before flush");
     let row = &results.rows()[0];
-    let city = row.value("i.city").expect("city should be accessible from L0");
+    let city = row
+        .value("i.city")
+        .expect("city should be accessible from L0");
     assert_eq!(city, &uni_db::Value::String("city_2".into()));
 
     // ── Post-flush: overflow_json should persist and be queryable ────────

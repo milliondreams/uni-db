@@ -72,6 +72,31 @@ ORDER BY score DESC
 - `score` - Normalized BM25 score (0-1)
 - `node` - Full node with properties
 
+## How It Works
+
+### Auto-Build on Index Creation
+
+When you run `CREATE FULLTEXT INDEX`, Uni automatically builds the FTS index over existing data. There is no need to call `rebuild_indexes()` manually — the index is ready to query immediately after creation.
+
+```cypher
+-- This both creates AND builds the index in one step
+CREATE FULLTEXT INDEX article_content FOR (a:Article) ON (a.content)
+```
+
+### Immediate Write Visibility (L0 Buffer)
+
+FTS queries see unflushed writes from the in-memory L0 buffer. This means data is searchable immediately after a write, without waiting for a flush to persistent storage. The query engine merges L0 buffer results with on-disk index results transparently.
+
+```cypher
+-- Write and search in the same session — no flush needed
+CREATE (a:Article {title: 'New Article', content: 'graph database optimization'})
+
+-- This will find the article even before flush
+CALL uni.fts.query('Article', 'content', 'optimization', 10)
+YIELD node, score
+RETURN node.title, score
+```
+
 ## Use Cases
 
 - Search across documents, notes, or product descriptions.

@@ -251,7 +251,7 @@ supply_chain_nb = create_notebook(
             [
                 'query_bom = """',
                 "    MATCH (defective:Part {sku: 'RES-10K'})",
-                "    MATCH (product:Product)-[:ASSEMBLED_FROM*1..5]->(defective)",
+                "    MATCH (product:Product)-[:ASSEMBLED_FROM*]->(defective)",
                 "    RETURN product.name AS name, product.price AS price",
                 "    ORDER BY product.price DESC",
                 '"""',
@@ -260,6 +260,14 @@ supply_chain_nb = create_notebook(
                 "for r in results:",
                 "    print(f\"  {r['name']} (${r['price']})\")",
                 "assert len(results) == 2, f'Expected 2 affected products, got {len(results)}'",
+            ]
+        ),
+        md_cell(
+            [
+                "> **Bounded vs Unbounded Paths**: `[*]` performs unbounded traversal",
+                "> (defaults to 100 hops max), ideal for BOM explosion where you want *every*",
+                "> affected product regardless of depth. Use `[*1..5]` to cap traversal",
+                "> at a known depth, as shown in the queries below.",
             ]
         ),
         md_cell(

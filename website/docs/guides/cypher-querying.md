@@ -885,6 +885,158 @@ RETURN m
 
 ---
 
+## SET / REMOVE Clause
+
+Update properties and labels on existing nodes and relationships.
+
+### Setting Properties
+
+```cypher
+// Set a single property
+MATCH (n:Person {name: 'Alice'})
+SET n.age = 31
+
+// Set multiple properties at once
+MATCH (n:Person {name: 'Alice'})
+SET n.age = 25, n.email = 'alice@example.com'
+
+// Set a property on a relationship
+MATCH (a:Person)-[r:KNOWS]->(b:Person)
+WHERE a.name = 'Alice' AND b.name = 'Bob'
+SET r.since = 2020
+```
+
+### Setting Properties with Parameters
+
+```cypher
+MATCH (p:Person {name: $name})
+SET p.age = $new_age
+```
+
+### Replace and Merge Property Maps
+
+```cypher
+// Replace ALL properties on a node (keeps internal fields like _vid)
+MATCH (n:Person {name: 'Alice'})
+SET n = {name: 'Alice', age: 30, city: 'Boston'}
+
+// Merge properties — existing keys are overwritten, others are preserved
+MATCH (n:Person {name: 'Alice'})
+SET n += {city: 'New York', verified: true}
+```
+
+### Adding Labels
+
+```cypher
+// Add a label to an existing node
+MATCH (p:Person {name: 'Alice'})
+SET p:Employee
+```
+
+### Removing Properties
+
+Use `REMOVE` to delete a property from a node or relationship, setting it to `null`.
+
+```cypher
+// Remove a property from a node
+MATCH (u:User {name: 'Alice'})
+REMOVE u.age
+RETURN u.age  // returns null
+
+// Remove a property from a relationship
+MATCH (:User {name: 'Alice'})-[r:FOLLOWS]->(:User {name: 'Bob'})
+REMOVE r.since
+RETURN r.since  // returns null
+```
+
+### Removing Labels
+
+```cypher
+// Remove a label from a node
+MATCH (p:Person)
+REMOVE p:Employee
+```
+
+---
+
+## MERGE Clause
+
+`MERGE` is the upsert operation — it matches an existing pattern or creates it if it doesn't exist. Combine with `ON CREATE SET` and `ON MATCH SET` to control which properties are set in each case.
+
+### Basic MERGE (Nodes)
+
+```cypher
+// Create node if it doesn't exist, otherwise match it
+MERGE (n:Person {name: 'Alice'})
+
+// MERGE with property defaults
+MERGE (n:Person {name: 'Alice'})
+ON CREATE SET n.created_at = datetime()
+ON MATCH SET n.last_seen = datetime()
+```
+
+### MERGE with ON CREATE / ON MATCH
+
+```cypher
+// Different actions depending on create vs match
+MERGE (p:Person {name: 'Alice'})
+ON CREATE SET p.created = 1
+ON MATCH SET p.matched = 1
+RETURN p.created, p.matched
+```
+
+When the node doesn't exist, `ON CREATE SET` runs. When it already exists, `ON MATCH SET` runs.
+
+### MERGE Relationships
+
+```cypher
+// Merge a relationship between existing nodes
+MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'})
+MERGE (a)-[r:KNOWS]->(b)
+RETURN r
+```
+
+If the `KNOWS` relationship already exists between Alice and Bob, it is matched. Otherwise, it is created.
+
+---
+
+## OPTIONAL MATCH
+
+`OPTIONAL MATCH` works like `MATCH` but uses left-outer-join semantics — if no match is found, bound variables from the pattern become `null` instead of eliminating the row.
+
+### Basic Usage
+
+```cypher
+// Find all people and their friends (if any)
+MATCH (p:Person)
+OPTIONAL MATCH (p)-[:KNOWS]->(friend:Person)
+RETURN p.name, friend.name
+```
+
+People with no friends still appear in the results — `friend.name` is `null` for them.
+
+### Filtering Unmatched Rows
+
+```cypher
+// Find people who DON'T know anyone
+MATCH (n:Person)
+OPTIONAL MATCH (n)-[r:KNOWS]->()
+WITH n, r
+WHERE r IS NULL
+RETURN n.name
+```
+
+### With Variable-Length Paths
+
+```cypher
+// Optional traversal with variable-length paths
+MATCH (a:Person {name: 'Alice'})
+OPTIONAL MATCH (a)-[*1..3]->(b:Person)
+RETURN a.name, b.name
+```
+
+---
+
 ## DELETE Clause
 
 Remove nodes and relationships from the graph.

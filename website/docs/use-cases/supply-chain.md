@@ -79,21 +79,25 @@ Find all products affected by the defective part.
 MATCH (defective:Part {sku: 'RES-10K'})
 
 // Traverse UP the assembly tree (incoming ASSEMBLED_FROM edges)
-// Variable length path: *1..20 levels deep
-MATCH (product:Product)-[:ASSEMBLED_FROM*1..20]->(defective)
+// Unbounded traversal: [*] follows all paths (defaults to max 100 hops)
+MATCH (product:Product)-[:ASSEMBLED_FROM*]->(defective)
 
 // Return unique affected products and their price
-RETURN DISTINCT 
-    product.name, 
+RETURN DISTINCT
+    product.name,
     product.price
 ORDER BY product.price DESC
 ```
+
+!!! tip "Bounded vs Unbounded Paths"
+    Use `[*]` for unbounded traversal (defaults to 100 hops max) or `[*1..20]` to set an explicit bound. For most BOM trees, unbounded traversal is safe since assembly hierarchies are rarely deeper than ~20 levels.
 
 ### 4. Query: Cost Rollup
 
 Calculate the total cost of a product by summing the cost of all its constituent parts.
 
 ```cypher
+// Unbounded path traversal — follows all ASSEMBLED_FROM edges (max 100 hops)
 MATCH (p:Product {name: 'Smartphone X'})
 MATCH (p)-[:ASSEMBLED_FROM*]->(part:Part)
 RETURN p.name, SUM(part.cost) AS total_bom_cost

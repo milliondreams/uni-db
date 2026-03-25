@@ -1,15 +1,15 @@
 # TCK Compliance Report
 
-**Generated:** 2026-03-24 19:48:05
-**Results:** `results_20260324_194805.json`
-**Compared to:** `results_20260324_113021.json`
+**Generated:** 2026-03-25 01:05:20
+**Results:** `results_20260325_010520.json`
+**Compared to:** `results_20260325_010146.json`
 
 ## Summary
 
 | Metric | Current | Previous | Delta |
 |--------|---------|----------|-------|
-| Scenarios | 242 | 242 |  |
-| Passed | 242 | 242 |  |
+| Scenarios | 256 | 256 |  |
+| Passed | 256 | 256 |  |
 | Failed | 0 | 0 |  |
 | Pass Rate | 100.0% | 100.0% | ➡️ +0.0pp |
 
@@ -22,6 +22,7 @@
 | ✅ AlongWithIsRef | 3 | 3 | 0 | 100% |  |
 | ✅ AssumeAbduce | 3 | 3 | 0 | 100% |  |
 | ✅ BasicRules | 6 | 6 | 0 | 100% |  |
+| ✅ CypherFunctions | 9 | 9 | 0 | 100% |  |
 | ✅ DeriveEdges | 9 | 9 | 0 | 100% |  |
 | ✅ ErrorConditions | 5 | 5 | 0 | 100% |  |
 | ✅ ExactProbability | 15 | 15 | 0 | 100% |  |
@@ -33,6 +34,7 @@
 | ✅ MultiStratum | 3 | 3 | 0 | 100% |  |
 | ✅ NonRecursive | 4 | 4 | 0 | 100% |  |
 | ✅ OptimizedSelection | 6 | 6 | 0 | 100% |  |
+| ✅ ParameterBinding | 5 | 5 | 0 | 100% |  |
 | ✅ PathCarriedValues | 9 | 9 | 0 | 100% |  |
 | ✅ PathCombinations | 5 | 5 | 0 | 100% |  |
 | ✅ PrioritizedRules | 5 | 5 | 0 | 100% |  |

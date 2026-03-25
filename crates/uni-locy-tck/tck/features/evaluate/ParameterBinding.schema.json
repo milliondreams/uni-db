@@ -1,0 +1,56 @@
+{
+  "edge_types": {},
+  "indexes": [],
+  "labels": {
+    "Episode": {
+      "id": 1
+    },
+    "Score": {
+      "id": 2
+    },
+    "Event": {
+      "id": 3
+    }
+  },
+  "properties": {
+    "Episode": {
+      "agent_id": {
+        "nullable": true,
+        "type": "String"
+      },
+      "action": {
+        "nullable": true,
+        "type": "String"
+      },
+      "label": {
+        "nullable": true,
+        "type": "String"
+      }
+    },
+    "Score": {
+      "name": {
+        "nullable": true,
+        "type": "String"
+      },
+      "val": {
+        "nullable": true,
+        "type": "Int64"
+      }
+    },
+    "Event": {
+      "agent_id": {
+        "nullable": true,
+        "type": "String"
+      },
+      "kind": {
+        "nullable": true,
+        "type": "String"
+      },
+      "score": {
+        "nullable": true,
+        "type": "Float64"
+      }
+    }
+  },
+  "schema_version": 1
+}

@@ -558,6 +558,10 @@ pub fn extract_locy_config(
     if let Some(v) = config.get("top_k_proofs_training") {
         locy_config.top_k_proofs_training = Some(v.extract::<usize>(py)?);
     }
+    if let Some(v) = config.get("params") {
+        let params_map = v.extract::<HashMap<String, Py<PyAny>>>(py)?;
+        locy_config.params = prepare_params(py, Some(params_map))?;
+    }
     Ok(locy_config)
 }
 

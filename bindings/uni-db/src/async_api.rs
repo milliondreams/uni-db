@@ -591,17 +591,23 @@ impl AsyncDatabase {
     }
 
     /// Evaluate a Locy program and return derived facts, stats, and command results.
-    #[pyo3(signature = (program, config=None))]
+    #[pyo3(signature = (program, params=None, config=None))]
     fn locy_evaluate<'py>(
         &self,
         py: Python<'py>,
         program: String,
+        params: Option<HashMap<String, Py<PyAny>>>,
         config: Option<HashMap<String, Py<PyAny>>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let db = self.inner.clone();
-        let locy_config = config
+        let mut locy_config = config
             .map(|cfg| convert::extract_locy_config(py, cfg))
             .transpose()?;
+        if let Some(p) = params {
+            let rust_params = convert::prepare_params(py, Some(p))?;
+            locy_config.get_or_insert_with(Default::default).params = rust_params;
+        }
+        let locy_config = locy_config;
         // The locy future is !Send due to QueryPlanner's Cell<usize>.
         // Use spawn_blocking + block_on to run it from a blocking thread.
         pyo3_async_runtimes::tokio::future_into_py(py, async move {

@@ -717,15 +717,22 @@ impl Database {
     }
 
     /// Evaluate a Locy program and return derived facts, stats, and command results.
-    #[pyo3(signature = (program, config=None))]
+    #[pyo3(signature = (program, params=None, config=None))]
     fn locy_evaluate(
         &self,
         py: Python,
         program: &str,
+        params: Option<HashMap<String, Py<PyAny>>>,
         config: Option<HashMap<String, Py<PyAny>>>,
     ) -> PyResult<Py<PyAny>> {
-        let result = if let Some(cfg) = config {
-            let locy_config = convert::extract_locy_config(py, cfg)?;
+        let result = if config.is_some() || params.is_some() {
+            let mut locy_config = config
+                .map(|cfg| convert::extract_locy_config(py, cfg))
+                .transpose()?
+                .unwrap_or_default();
+            if let Some(p) = params {
+                locy_config.params = convert::prepare_params(py, Some(p))?;
+            }
             pyo3_async_runtimes::tokio::get_runtime()
                 .block_on(core::locy_evaluate_with_config_core(
                     &self.inner,

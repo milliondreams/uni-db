@@ -152,13 +152,13 @@ async def test_derived_facts_structure(async_social_db_populated):
 
 
 async def test_param_binding_query_where(async_social_db_populated):
-    """Async: $param in QUERY WHERE resolves from config['params']."""
+    """Async: $param in QUERY WHERE resolves from top-level params kwarg."""
     db = async_social_db_populated
     program = """
 CREATE RULE persons AS MATCH (p:Person) YIELD KEY p, p.name AS nm
 QUERY persons WHERE nm = $target RETURN nm
 """
-    result = await db.locy_evaluate(program, config={"params": {"target": "Alice"}})
+    result = await db.locy_evaluate(program, params={"target": "Alice"})
     rows = result["command_results"][0]["rows"]
     assert len(rows) == 1
     assert rows[0]["nm"] == "Alice"
@@ -171,7 +171,7 @@ async def test_param_binding_integer(async_social_db_populated):
 CREATE RULE adults AS MATCH (p:Person) YIELD KEY p, p.age AS age, p.name AS nm
 QUERY adults WHERE age > $min_age RETURN nm
 """
-    result = await db.locy_evaluate(program, config={"params": {"min_age": 30}})
+    result = await db.locy_evaluate(program, params={"min_age": 30})
     rows = result["command_results"][0]["rows"]
     names = {r["nm"] for r in rows}
     assert "Charlie" in names  # age 35

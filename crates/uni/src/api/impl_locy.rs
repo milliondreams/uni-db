@@ -176,7 +176,7 @@ impl<'a> LocyEngine<'a> {
         df_executor.set_procedure_registry(self.db.procedure_registry.clone());
 
         let (session_ctx, planner, _prop_mgr) = df_executor
-            .create_datafusion_planner(&self.db.properties, &HashMap::new())
+            .create_datafusion_planner(&self.db.properties, &config.params)
             .await
             .map_err(map_native_df_error)?;
 
@@ -260,6 +260,7 @@ impl<'a> LocyEngine<'a> {
             &compiled,
             planner.graph_ctx().clone(),
             planner.session_ctx().clone(),
+            config.params.clone(),
         );
         let mut locy_stats = LocyStats {
             total_iterations: iteration_counts_slot
@@ -415,6 +416,9 @@ struct NativeExecutionAdapter<'a> {
     /// Execution contexts from the fixpoint planner for columnar query execution.
     graph_ctx: Arc<uni_query::query::df_graph::GraphExecutionContext>,
     session_ctx: Arc<parking_lot::RwLock<datafusion::prelude::SessionContext>>,
+    /// Query parameters threaded from LocyConfig; passed to execute_subplan so
+    /// that $param references in rule MATCH WHERE clauses are resolved.
+    params: HashMap<String, Value>,
 }
 
 impl<'a> NativeExecutionAdapter<'a> {
@@ -424,6 +428,7 @@ impl<'a> NativeExecutionAdapter<'a> {
         compiled: &'a CompiledProgram,
         graph_ctx: Arc<uni_query::query::df_graph::GraphExecutionContext>,
         session_ctx: Arc<parking_lot::RwLock<datafusion::prelude::SessionContext>>,
+        params: HashMap<String, Value>,
     ) -> Self {
         Self {
             db,
@@ -431,6 +436,7 @@ impl<'a> NativeExecutionAdapter<'a> {
             compiled,
             graph_ctx,
             session_ctx,
+            params,
         }
     }
 
@@ -448,7 +454,7 @@ impl<'a> NativeExecutionAdapter<'a> {
                 })?;
         uni_query::query::df_graph::common::execute_subplan(
             &logical_plan,
-            &HashMap::new(),
+            &self.params,
             &HashMap::new(),
             &self.graph_ctx,
             &self.session_ctx,
@@ -533,7 +539,7 @@ impl DerivedFactSource for NativeExecutionAdapter<'_> {
         // Use the fixpoint planner's execution contexts directly via execute_subplan.
         uni_query::query::df_graph::common::execute_subplan(
             &logical_plan,
-            &HashMap::new(),
+            &self.params,
             &HashMap::new(),
             effective_ctx,
             &self.session_ctx,

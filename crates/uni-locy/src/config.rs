@@ -1,4 +1,7 @@
+use std::collections::HashMap;
 use std::time::Duration;
+
+use uni_common::Value;
 
 /// Configuration for the Locy orchestrator.
 #[derive(Debug, Clone)]
@@ -46,6 +49,11 @@ pub struct LocyConfig {
     /// evaluation uses this value instead of `top_k_proofs`. When `None`,
     /// `top_k_proofs` is used for both training and inference.
     pub top_k_proofs_training: Option<usize>,
+    /// Parameters bound to `$name` references inside rules and QUERY/RETURN
+    /// expressions.  Equivalent to the parameter map passed to `db.query()`.
+    /// Keys are parameter names **without** the leading `$` (e.g., `"agent_id"`
+    /// binds `$agent_id`).
+    pub params: HashMap<String, Value>,
 }
 
 impl Default for LocyConfig {
@@ -65,6 +73,7 @@ impl Default for LocyConfig {
             max_bdd_variables: 1000,
             top_k_proofs: 0,
             top_k_proofs_training: None,
+            params: HashMap::new(),
         }
     }
 }

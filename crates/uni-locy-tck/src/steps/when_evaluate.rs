@@ -1,5 +1,6 @@
 use crate::LocyWorld;
 use cucumber::when;
+use uni_locy::LocyConfig;
 
 #[when("evaluating the following Locy program:")]
 async fn when_evaluating_locy_program(world: &mut LocyWorld, step: &cucumber::gherkin::Step) {
@@ -145,6 +146,29 @@ async fn when_evaluating_with_exact_probability_and_top_k(
     let config = uni_locy::LocyConfig {
         exact_probability: true,
         top_k_proofs: top_k,
+        ..Default::default()
+    };
+    let result = world
+        .db()
+        .locy()
+        .evaluate_with_config(program, &config)
+        .await;
+    world.set_locy_result(result);
+}
+
+#[when("evaluating the following Locy program with params:")]
+async fn when_evaluating_with_params(world: &mut LocyWorld, step: &cucumber::gherkin::Step) {
+    let program = step
+        .docstring()
+        .expect("Expected a docstring with the Locy program to evaluate");
+
+    world
+        .init_db()
+        .await
+        .expect("Failed to initialize database");
+
+    let config = LocyConfig {
+        params: world.params().clone(),
         ..Default::default()
     };
     let result = world

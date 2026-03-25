@@ -130,10 +130,14 @@ fn dispatch_body_command<'a>(
                 };
                 if let Some(relation) = fold_relation {
                     let rows = relation.rows.clone();
-                    let projected = super::locy_query::apply_return_clause(rows, &gq.return_clause)
-                        .map_err(|e| LocyError::QueryResolutionError {
-                            message: format!("ASSUME FOLD query projection: {e}"),
-                        })?;
+                    let projected = super::locy_query::apply_return_clause(
+                        rows,
+                        &gq.return_clause,
+                        &config.params,
+                    )
+                    .map_err(|e| LocyError::QueryResolutionError {
+                        message: format!("ASSUME FOLD query projection: {e}"),
+                    })?;
                     return Ok(CommandResult::Query(projected));
                 }
 

@@ -775,3 +775,83 @@ async fn test_bulk_overflow_properties() -> Result<()> {
 
     Ok(())
 }
+
+/// Test 8: `bulk_insert_vertices` with undeclared properties.
+///
+/// Verifies that properties not declared in the schema are preserved
+/// via the `overflow_json` column when inserted through the
+/// `bulk_insert_vertices` API (not just Cypher CREATE).
+#[tokio::test]
+async fn test_bulk_insert_vertices_overflow_properties() -> Result<()> {
+    let temp_dir = tempdir()?;
+    let path = temp_dir.path();
+    let db = Uni::open(path.to_str().unwrap()).build().await?;
+
+    // Schema declares only "name" — "city" and "score" are undeclared.
+    db.schema()
+        .label("Item")
+        .property("name", uni_db::DataType::String)
+        .apply()
+        .await?;
+
+    // Build properties with a mix of declared and undeclared fields.
+    let mut props_list = Vec::new();
+    for i in 0..5 {
+        let mut p = std::collections::HashMap::new();
+        p.insert("name".to_string(), uni_db::unival!(format!("item_{i}")));
+        p.insert("city".to_string(), uni_db::unival!(format!("city_{i}")));
+        p.insert("score".to_string(), uni_db::unival!(i as i64 * 10));
+        props_list.push(p);
+    }
+
+    let vids = db.bulk_insert_vertices("Item", props_list).await?;
+    assert_eq!(vids.len(), 5);
+
+    // ── Pre-flush: L0 buffer should already expose overflow properties ──
+    let results = db
+        .query("MATCH (i:Item) WHERE i.name = 'item_2' RETURN i.city, i.score")
+        .await?;
+    assert_eq!(results.len(), 1, "should find item_2 before flush");
+    let row = &results.rows()[0];
+    let city = row.value("i.city").expect("city should be accessible from L0");
+    assert_eq!(city, &uni_db::Value::String("city_2".into()));
+
+    // ── Post-flush: overflow_json should persist and be queryable ────────
+    db.flush().await?;
+
+    let results = db
+        .query("MATCH (i:Item) RETURN i.name, i.city, i.score ORDER BY i.name")
+        .await?;
+    assert_eq!(results.len(), 5, "all 5 items should survive flush");
+
+    for (idx, row) in results.rows().iter().enumerate() {
+        let name = row.value("i.name").expect("name (schema col) should exist");
+        assert_eq!(name, &uni_db::Value::String(format!("item_{idx}")));
+
+        let city = row.value("i.city").expect("city (overflow) should exist");
+        assert_eq!(city, &uni_db::Value::String(format!("city_{idx}")));
+    }
+
+    // ── WHERE on overflow property should also work ─────────────────────
+    let results = db
+        .query("MATCH (i:Item) WHERE i.city = 'city_3' RETURN i.name")
+        .await?;
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results.rows()[0].value("i.name").unwrap(),
+        &uni_db::Value::String("item_3".into()),
+    );
+
+    // ── properties() should include both schema and overflow fields ─────
+    let results = db
+        .query("MATCH (i:Item) WHERE i.name = 'item_0' RETURN properties(i) AS props")
+        .await?;
+    assert_eq!(results.len(), 1);
+    let props_str = format!("{:?}", results.rows()[0].value("props"));
+    assert!(
+        props_str.contains("city_0"),
+        "properties(i) should include overflow 'city', got: {props_str}",
+    );
+
+    Ok(())
+}

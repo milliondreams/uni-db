@@ -258,3 +258,69 @@ async fn test_end_to_end_smoke() -> Result<()> {
     assert!(result.stats.total_iterations > 0);
     Ok(())
 }
+
+// ── LocyBuilder (evaluate_with) ────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_evaluate_with_param_builder() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.execute("CREATE (:Episode {agent_id: 'a1', label: 'alpha'})")
+        .await?;
+    db.execute("CREATE (:Episode {agent_id: 'a2', label: 'beta'})")
+        .await?;
+
+    let result = db
+        .locy()
+        .evaluate_with(
+            "CREATE RULE ep AS MATCH (e:Episode) WHERE e.agent_id = $aid \
+             YIELD KEY e, e.label AS lbl \
+             QUERY ep RETURN lbl",
+        )
+        .param("aid", "a1")
+        .run()
+        .await?;
+
+    let rows = match &result.command_results[0] {
+        uni_db::locy::CommandResult::Query(rows) => rows,
+        other => panic!("expected Query, got {other:?}"),
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].get("lbl"),
+        Some(&uni_db::Value::String("alpha".to_string()))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_evaluate_with_multiple_params() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.execute("CREATE (:Score {name: 'low',  val: 10})")
+        .await?;
+    db.execute("CREATE (:Score {name: 'mid',  val: 50})")
+        .await?;
+    db.execute("CREATE (:Score {name: 'high', val: 90})")
+        .await?;
+
+    let result = db
+        .locy()
+        .evaluate_with(
+            "CREATE RULE sc AS MATCH (s:Score) YIELD KEY s, s.val AS v, s.name AS nm \
+             QUERY sc WHERE v > $lo AND v < $hi RETURN nm",
+        )
+        .param("lo", uni_db::Value::Int(20))
+        .param("hi", uni_db::Value::Int(80))
+        .run()
+        .await?;
+
+    let rows = match &result.command_results[0] {
+        uni_db::locy::CommandResult::Query(rows) => rows,
+        other => panic!("expected Query, got {other:?}"),
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].get("nm"),
+        Some(&uni_db::Value::String("mid".to_string()))
+    );
+    Ok(())
+}

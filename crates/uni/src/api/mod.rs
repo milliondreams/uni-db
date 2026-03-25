@@ -9,6 +9,7 @@ pub mod builder;
 pub mod bulk;
 pub mod impl_locy;
 pub mod impl_query;
+pub mod locy_builder;
 pub mod query_builder;
 pub mod schema;
 pub mod session;

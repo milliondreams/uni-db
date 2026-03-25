@@ -106,6 +106,27 @@ impl<'a> LocyEngine<'a> {
             .await
     }
 
+    /// Start building a Locy evaluation with fluent parameter binding.
+    ///
+    /// Mirrors `db.query_with(cypher).param(…).fetch_all()` for Cypher.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use uni_db::Uni;
+    /// # async fn example(db: &Uni) -> uni_db::Result<()> {
+    /// let result = db.locy()
+    ///     .evaluate_with("CREATE RULE ep AS MATCH (e:Episode) WHERE e.agent_id = $aid YIELD KEY e")
+    ///     .param("aid", "agent-123")
+    ///     .run()
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn evaluate_with(&self, program: &str) -> crate::api::locy_builder::LocyBuilder<'_> {
+        crate::api::locy_builder::LocyBuilder::new(self.db, program)
+    }
+
     /// Convenience wrapper for EXPLAIN RULE commands.
     pub async fn explain(&self, program: &str) -> Result<LocyResult> {
         self.evaluate(program).await

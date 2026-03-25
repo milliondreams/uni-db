@@ -223,7 +223,7 @@ println!("Data ingested and flushed");"""
         code_cell(
             """let query = r#"
     MATCH (defective:Part {sku: 'RES-10K'})
-    MATCH (product:Product)-[:ASSEMBLED_FROM*1..5]->(defective)
+    MATCH (product:Product)-[:ASSEMBLED_FROM*]->(defective)
     RETURN product.name AS name, product.price AS price
     ORDER BY product.price DESC
 "#;
@@ -234,6 +234,14 @@ for row in &results.rows {
     println!("  {:?}", row);
 }
 assert!(results.rows.len() == 2, "Expected 2 affected products, got {}", results.rows.len());"""
+        ),
+        md_cell(
+            [
+                "> **Bounded vs Unbounded Paths**: `[*]` performs unbounded traversal",
+                "> (defaults to 100 hops max), ideal for BOM explosion where you want *every*",
+                "> affected product regardless of depth. Use `[*1..5]` to cap traversal",
+                "> at a known depth, as shown in the queries below.",
+            ]
         ),
         md_cell(
             [

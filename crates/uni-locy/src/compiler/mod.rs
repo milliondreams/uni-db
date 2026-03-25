@@ -20,6 +20,19 @@ pub fn compile(program: &LocyProgram) -> Result<CompiledProgram, LocyCompileErro
     compile_with_modules(program, &HashMap::new())
 }
 
+/// Compile with pre-registered external rule names.
+///
+/// Rules in `external_rules` are treated as valid targets for IS-ref and
+/// QUERY references, even though they are not defined in this program.
+/// Used by `LocyEngine::evaluate()` when a session-level rule registry
+/// contains previously compiled rules.
+pub fn compile_with_external_rules(
+    program: &LocyProgram,
+    external_rules: &[String],
+) -> Result<CompiledProgram, LocyCompileError> {
+    compile_with_context(program, &HashMap::new(), external_rules)
+}
+
 /// Compile a Locy program with module resolution context.
 ///
 /// `available_modules` maps module names to their exported rule names,
@@ -29,12 +42,23 @@ pub fn compile_with_modules(
     program: &LocyProgram,
     available_modules: &HashMap<String, Vec<String>>,
 ) -> Result<CompiledProgram, LocyCompileError> {
+    compile_with_context(program, available_modules, &[])
+}
+
+/// Compile a Locy program with module resolution and external rule context.
+fn compile_with_context(
+    program: &LocyProgram,
+    available_modules: &HashMap<String, Vec<String>>,
+    external_rules: &[String],
+) -> Result<CompiledProgram, LocyCompileError> {
     let module_ctx = modules::resolve_modules(program, available_modules)?;
     let rule_groups = group_rules_with_context(program, &module_ctx);
-    let rule_names: Vec<String> = rule_groups.keys().cloned().collect();
+    let mut rule_names: Vec<String> = rule_groups.keys().cloned().collect();
+    // Include external (registered) rules in the valid-name set.
+    rule_names.extend(external_rules.iter().cloned());
 
     if rule_groups.is_empty() {
-        let commands = extract_commands(program, &[], &module_ctx)?;
+        let commands = extract_commands(program, &rule_names, &module_ctx)?;
         return Ok(CompiledProgram {
             strata: Vec::new(),
             rule_catalog: HashMap::new(),
@@ -43,7 +67,11 @@ pub fn compile_with_modules(
         });
     }
 
-    let dep_graph = dependency::build_dependency_graph(&rule_groups, &module_ctx)?;
+    let dep_graph = dependency::build_dependency_graph_with_external(
+        &rule_groups,
+        &module_ctx,
+        external_rules,
+    )?;
     let strat = stratify::stratify(&dep_graph)?;
     warded::check_wardedness(&rule_groups)?;
     let (compiled_rules, warnings) = typecheck::check(&rule_groups, &strat)?;
@@ -209,11 +237,13 @@ mod tests {
             vec![
                 YieldColumn {
                     name: "a".into(),
-                    is_key: false
+                    is_key: false,
+                    is_prob: false,
                 },
                 YieldColumn {
                     name: "b".into(),
-                    is_key: false
+                    is_key: false,
+                    is_prob: false,
                 },
             ]
         );
@@ -373,6 +403,68 @@ mod tests {
         }
     }
 
+    // ── MNOR probability domain warning ────────────────────────────────
+
+    #[test]
+    fn mnor_probability_domain_warning() {
+        let prog = parse_locy(
+            "CREATE RULE r AS MATCH (a)-[:E]->(b) YIELD a, b, 0 AS score \
+             CREATE RULE r AS MATCH (a)-[:E]->(mid) WHERE mid IS r TO b \
+             FOLD score = MNOR(a.weight) YIELD a, b, score",
+        )
+        .unwrap();
+
+        let compiled = compile(&prog).unwrap();
+        assert!(
+            compiled
+                .warnings
+                .iter()
+                .any(|w| w.code == WarningCode::ProbabilityDomainViolation)
+        );
+    }
+
+    // ── MNOR + BEST BY → BestByWithMonotonicFold error ───────────────
+
+    #[test]
+    fn mnor_best_by_rejected() {
+        let prog = parse_locy(
+            "CREATE RULE r AS MATCH (a)-[:E]->(b) YIELD a, b, 0 AS score \
+             CREATE RULE r AS MATCH (a)-[:E]->(mid) WHERE mid IS r TO b \
+             FOLD score = MNOR(a.weight) BEST BY score ASC YIELD a, b, score",
+        )
+        .unwrap();
+
+        let result = compile(&prog);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            LocyCompileError::BestByWithMonotonicFold { rule, fold } => {
+                assert_eq!(rule, "r");
+                assert_eq!(fold.to_uppercase(), "MNOR");
+            }
+            e => panic!("expected BestByWithMonotonicFold, got {e:?}"),
+        }
+    }
+
+    // ── MPROD probability domain warning ─────────────────────────────
+
+    #[test]
+    fn mprod_probability_domain_warning() {
+        let prog = parse_locy(
+            "CREATE RULE r AS MATCH (a)-[:E]->(b) YIELD a, b, 1 AS score \
+             CREATE RULE r AS MATCH (a)-[:E]->(mid) WHERE mid IS r TO b \
+             FOLD score = MPROD(a.weight) YIELD a, b, score",
+        )
+        .unwrap();
+
+        let compiled = compile(&prog).unwrap();
+        assert!(
+            compiled
+                .warnings
+                .iter()
+                .any(|w| w.code == WarningCode::ProbabilityDomainViolation)
+        );
+    }
+
     // ── Step 9: Undefined rule reference → UNDEFINED_RULE error ─────────
 
     #[test]
@@ -429,15 +521,18 @@ mod tests {
             vec![
                 YieldColumn {
                     name: "a".into(),
-                    is_key: true
+                    is_key: true,
+                    is_prob: false,
                 },
                 YieldColumn {
                     name: "b".into(),
-                    is_key: true
+                    is_key: true,
+                    is_prob: false,
                 },
                 YieldColumn {
                     name: "total_cost".into(),
-                    is_key: false
+                    is_key: false,
+                    is_prob: false,
                 },
             ]
         );

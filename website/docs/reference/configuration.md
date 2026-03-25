@@ -78,6 +78,15 @@ pub struct UniConfig {
     /// Default maximum memory per query (default: 1GB)
     pub max_query_memory: usize,
 
+    /// Maximum transaction buffer memory in bytes (default: 1GB)
+    pub max_transaction_memory: usize,
+
+    /// Maximum rows allowed for in-memory compaction (default: 5M)
+    pub max_compaction_rows: usize,
+
+    /// Enable in-memory VID→labels index for O(1) lookups (default: true)
+    pub enable_vid_labels_index: bool,
+
     /// Object store resilience configuration
     pub object_store: ObjectStoreConfig,
 
@@ -100,6 +109,9 @@ pub struct UniConfig {
 | `wal_enabled` | bool | true | Enable write-ahead logging |
 | `query_timeout` | duration | 30s | Default query execution timeout |
 | `max_query_memory` | bytes | 1 GB | Maximum memory per query |
+| `max_transaction_memory` | bytes | 1 GB | Maximum memory per transaction |
+| `max_compaction_rows` | rows | 5,000,000 | OOM guard for in-memory compaction |
+| `enable_vid_labels_index` | bool | true | Enable O(1) VID→labels lookups |
 
 ### CompactionConfig
 
@@ -180,6 +192,15 @@ pub struct IndexRebuildConfig {
 
     /// Check interval for pending tasks (default: 5s)
     pub worker_check_interval: Duration,
+
+    /// Row growth ratio to trigger rebuild (default: 0.5)
+    pub growth_trigger_ratio: f64,
+
+    /// Max index age before rebuild (default: None/disabled)
+    pub max_index_age: Option<Duration>,
+
+    /// Enable post-flush automatic rebuild scheduling (default: false)
+    pub auto_rebuild_enabled: bool,
 }
 ```
 

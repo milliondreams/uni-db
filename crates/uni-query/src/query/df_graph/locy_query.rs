@@ -6,8 +6,10 @@
 //! Ported from `uni-locy/src/orchestrator/query.rs`. Uses `DerivedFactSource`
 //! instead of `CypherExecutor`.
 
+use std::collections::HashMap;
 use std::time::Instant;
 
+use uni_common::Value;
 use uni_cypher::ast::{CypherLiteral, Expr, ReturnItem};
 use uni_cypher::locy_ast::GoalQuery;
 use uni_locy::{CompiledProgram, LocyConfig, LocyError, LocyStats, Row};
@@ -48,7 +50,10 @@ pub async fn evaluate_query(
         .collect();
 
     // Extract goal bindings from WHERE for goal-directed resolution
-    let goal_bindings = extract_goal_bindings(&query.where_expr, &key_columns);
+    let goal_bindings = match &query.where_expr {
+        Some(expr) => extract_goal_bindings(expr, &key_columns),
+        None => std::collections::HashMap::new(),
+    };
 
     // Use a fresh store rather than the pre-computed orch_store.
     // The native fixpoint stores node columns as VIDs (UInt64), not full node objects,
@@ -62,41 +67,50 @@ pub async fn evaluate_query(
     stats.queries_executed += resolver.stats.queries_executed;
     stats.mutations_executed += resolver.stats.mutations_executed;
 
-    // Apply WHERE filter (SLG may return superset if goal bindings are partial)
-    let filtered: Vec<Row> = results
-        .into_iter()
-        .filter(|row| {
-            eval_expr(&query.where_expr, row)
-                .map(|v| v.as_bool().unwrap_or(false))
-                .unwrap_or(false)
-        })
-        .collect();
+    // Apply WHERE filter (SLG may return superset if goal bindings are partial).
+    // Params are injected into each row so $name references resolve correctly.
+    let filtered: Vec<Row> = if let Some(where_expr) = &query.where_expr {
+        results
+            .into_iter()
+            .filter(|row| {
+                let merged = merge_params(row, &config.params);
+                eval_expr(where_expr, &merged)
+                    .map(|v| v.as_bool().unwrap_or(false))
+                    .unwrap_or(false)
+            })
+            .collect()
+    } else {
+        results
+    };
 
     // Apply RETURN clause if present
-    apply_return_clause(filtered, &query.return_clause)
+    apply_return_clause(filtered, &query.return_clause, &config.params)
 }
 
 /// Apply a RETURN clause (projection, ordering, skip, limit) to results.
-fn apply_return_clause(
+pub(super) fn apply_return_clause(
     rows: Vec<Row>,
     return_clause: &Option<uni_cypher::ast::ReturnClause>,
+    params: &HashMap<String, Value>,
 ) -> Result<Vec<Row>, LocyError> {
     let rc = match return_clause {
         Some(rc) => rc,
         None => return Ok(rows),
     };
 
-    // Project columns
+    // Project columns. Params are merged into each row so $name references
+    // in RETURN expressions (e.g. RETURN $agent_id AS id) resolve correctly.
     let mut projected: Vec<Row> = rows
         .into_iter()
         .map(|row| {
+            let merged = merge_params(&row, params);
             let mut new_row = Row::new();
             for item in &rc.items {
                 match item {
                     ReturnItem::All => return Ok(row.clone()),
                     ReturnItem::Expr { expr, alias, .. } => {
-                        let value = eval_expr(expr, &row)?;
-                        let name = alias.clone().unwrap_or_else(|| format!("{:?}", expr));
+                        let value = eval_expr(expr, &merged)?;
+                        let name = alias.clone().unwrap_or_else(|| return_item_name(expr));
                         new_row.insert(name, value);
                     }
                 }
@@ -109,7 +123,7 @@ fn apply_return_clause(
     if rc.distinct {
         let mut seen = std::collections::HashSet::new();
         projected.retain(|row| {
-            let key = format!("{:?}", row);
+            let key = format!("{row:?}");
             seen.insert(key)
         });
     }
@@ -149,4 +163,27 @@ fn apply_return_clause(
     }
 
     Ok(projected)
+}
+
+/// Merge query parameters into a row so that `Expr::Parameter(name)` can
+/// resolve `$name` references during in-memory expression evaluation.
+///
+/// Row values take precedence — parameters only fill in keys that are absent.
+fn merge_params(row: &Row, params: &HashMap<String, Value>) -> Row {
+    let mut merged: Row = params.clone();
+    merged.extend(row.iter().map(|(k, v)| (k.clone(), v.clone())));
+    merged
+}
+
+/// Derive a column name from a RETURN expression when no alias is given.
+///
+/// Follows OpenCypher convention: `RETURN p` yields `"p"`,
+/// `RETURN a.name` yields `"a.name"`.  Falls back to `Debug` for
+/// complex expressions.
+fn return_item_name(expr: &Expr) -> String {
+    match expr {
+        Expr::Variable(v) => v.clone(),
+        Expr::Property(base, prop) => format!("{}.{}", return_item_name(base), prop),
+        _ => format!("{expr:?}"),
+    }
 }

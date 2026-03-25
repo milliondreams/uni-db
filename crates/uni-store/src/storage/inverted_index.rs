@@ -44,6 +44,10 @@ fn merge_postings_segments(segments: Vec<HashMap<String, Vec<u64>>>) -> HashMap<
     merged
 }
 
+/// Term-to-VID inverted index for efficient set-membership queries.
+///
+/// Supports both full rebuilds from a vertex dataset and incremental updates
+/// for optimal performance during small mutations.
 pub struct InvertedIndex {
     dataset: Option<Dataset>,
     base_uri: String,
@@ -52,7 +56,19 @@ pub struct InvertedIndex {
     config: InvertedIndexConfig,
 }
 
+impl std::fmt::Debug for InvertedIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InvertedIndex")
+            .field("base_uri", &self.base_uri)
+            .field("label", &self.label)
+            .field("property", &self.property)
+            .field("initialized", &self.dataset.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
 impl InvertedIndex {
+    /// Open or initialize an inverted index at `base_uri` for the given config.
     pub async fn new(base_uri: &str, config: InvertedIndexConfig) -> Result<Self> {
         let path = format!(
             "{}/indexes/{}/{}_inverted",
@@ -70,13 +86,10 @@ impl InvertedIndex {
         })
     }
 
-    pub async fn create_if_missing(&mut self) -> Result<()> {
-        if self.dataset.is_some() {
-            return Ok(());
-        }
-        Ok(())
-    }
-
+    /// Rebuild the index from scratch by scanning `vertex_dataset`.
+    ///
+    /// Calls `progress` every 10 000 vertices with the running document count.
+    /// Uses segmented accumulation to stay within the 256 MB memory limit.
     pub async fn build_from_dataset(
         &mut self,
         vertex_dataset: &VertexDataset,
@@ -196,6 +209,7 @@ impl InvertedIndex {
         Ok(())
     }
 
+    /// Overwrite the on-disk postings with the provided map.
     async fn write_postings(&mut self, postings: HashMap<String, Vec<u64>>) -> Result<()> {
         let mut terms = Vec::with_capacity(postings.len());
         let mut vid_lists = Vec::with_capacity(postings.len());
@@ -243,6 +257,7 @@ impl InvertedIndex {
         Ok(())
     }
 
+    /// Return all VIDs whose term list intersects `terms` (OR semantics).
     pub async fn query_any(&self, terms: &[String]) -> Result<Vec<Vid>> {
         let Some(ds) = &self.dataset else {
             debug!("Inverted index not initialized, returning empty result");

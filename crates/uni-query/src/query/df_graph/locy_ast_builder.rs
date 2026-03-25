@@ -76,30 +76,34 @@ fn build_create_from_derive_pattern(
 
     if source_is_existing || target_is_existing {
         let mut match_paths = Vec::new();
+        let mut vid_filters: Vec<Expr> = Vec::new();
         if source_is_existing {
+            let (node_pat, vid_filter) = match_node_from_binding(&source.variable, bindings);
             match_paths.push(PathPattern {
                 variable: None,
-                elements: vec![PatternElement::Node(match_node_from_binding(
-                    &source.variable,
-                    bindings,
-                ))],
+                elements: vec![PatternElement::Node(node_pat)],
                 shortest_path_mode: None,
             });
+            if let Some(f) = vid_filter {
+                vid_filters.push(f);
+            }
         }
         if target_is_existing {
+            let (node_pat, vid_filter) = match_node_from_binding(&target.variable, bindings);
             match_paths.push(PathPattern {
                 variable: None,
-                elements: vec![PatternElement::Node(match_node_from_binding(
-                    &target.variable,
-                    bindings,
-                ))],
+                elements: vec![PatternElement::Node(node_pat)],
                 shortest_path_mode: None,
             });
+            if let Some(f) = vid_filter {
+                vid_filters.push(f);
+            }
         }
+        let where_clause = combine_where_conditions(&vid_filters);
         clauses.push(Clause::Match(MatchClause {
             optional: false,
             pattern: Pattern { paths: match_paths },
-            where_clause: None,
+            where_clause,
         }));
     }
 
@@ -151,31 +155,48 @@ fn build_create_from_derive_pattern(
     Ok(Query::Single(Statement { clauses }))
 }
 
-fn match_node_from_binding(var_name: &str, bindings: &Row) -> NodePattern {
+/// Build a MATCH node pattern that rebinds an existing graph node by VID.
+///
+/// Uses `WHERE id(var) = <vid>` on the enclosing MATCH clause rather than
+/// property matching.  Property-based matching breaks in schema mode because
+/// internal columns (e.g. `overflow_json`) may appear as `Null`-valued
+/// properties.  Since `x = null` is always *unknown* in three-valued logic,
+/// the MATCH returns zero rows and the subsequent CREATE does nothing.
+///
+/// Returns `(NodePattern, Option<Expr>)` — the node pattern and an optional
+/// VID-equality predicate for the MATCH WHERE clause.
+fn match_node_from_binding(var_name: &str, bindings: &Row) -> (NodePattern, Option<Expr>) {
     if let Some(Value::Node(node)) = bindings.get(var_name) {
-        let properties = if node.properties.is_empty() {
-            None
-        } else {
-            Some(Expr::Map(
-                node.properties
-                    .iter()
-                    .map(|(k, v)| (k.clone(), value_to_expr(v)))
-                    .collect(),
-            ))
+        let vid_i64 = node.vid.as_u64() as i64;
+        let vid_filter = Expr::BinaryOp {
+            left: Box::new(Expr::FunctionCall {
+                name: "id".to_string(),
+                args: vec![Expr::Variable(var_name.to_string())],
+                distinct: false,
+                window_spec: None,
+            }),
+            op: BinaryOp::Eq,
+            right: Box::new(Expr::Literal(CypherLiteral::Integer(vid_i64))),
         };
-        NodePattern {
-            variable: Some(var_name.to_string()),
-            labels: node.labels.clone(),
-            properties,
-            where_clause: None,
-        }
+        (
+            NodePattern {
+                variable: Some(var_name.to_string()),
+                labels: node.labels.clone(),
+                properties: None,
+                where_clause: None,
+            },
+            Some(vid_filter),
+        )
     } else {
-        NodePattern {
-            variable: Some(var_name.to_string()),
-            labels: vec![],
-            properties: None,
-            where_clause: None,
-        }
+        (
+            NodePattern {
+                variable: Some(var_name.to_string()),
+                labels: vec![],
+                properties: None,
+                where_clause: None,
+            },
+            None,
+        )
     }
 }
 
@@ -263,7 +284,7 @@ fn value_to_string(v: &Value) -> String {
         Value::Int(i) => i.to_string(),
         Value::Float(f) => f.to_string(),
         Value::String(s) => s.clone(),
-        _ => format!("{:?}", v),
+        _ => format!("{v:?}"),
     }
 }
 
@@ -274,7 +295,7 @@ pub(crate) fn value_to_expr(v: &Value) -> Expr {
         Value::Int(i) => Expr::Literal(CypherLiteral::Integer(*i)),
         Value::Float(f) => Expr::Literal(CypherLiteral::Float(*f)),
         Value::String(s) => Expr::Literal(CypherLiteral::String(s.clone())),
-        _ => Expr::Literal(CypherLiteral::String(format!("{:?}", v))),
+        _ => Expr::Literal(CypherLiteral::String(format!("{v:?}"))),
     }
 }
 

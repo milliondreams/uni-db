@@ -425,7 +425,14 @@ impl StorageManager {
         }
 
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(self.config.compaction.check_interval);
+            // Use interval_at to delay the first tick. tokio::time::interval fires
+            // immediately on the first tick, which can race with queries that run
+            // right after database open. Delaying by the check_interval gives
+            // initial queries time to complete before compaction modifies tables
+            // (optimize(All) can GC index files that concurrent queries depend on).
+            let start = tokio::time::Instant::now() + self.config.compaction.check_interval;
+            let mut interval =
+                tokio::time::interval_at(start, self.config.compaction.check_interval);
 
             loop {
                 tokio::select! {
@@ -1089,44 +1096,51 @@ impl StorageManager {
         use lance_index::scalar::inverted::query::MatchQuery;
 
         // Try to open the cached table; if the label has no data yet the Lance
-        // table won't exist. In that case return empty results.
-        let table = match self.get_cached_table(label).await {
-            Ok(t) => t,
-            Err(_) => return Ok(Vec::new()),
+        // table won't exist. Fall through to L0 merge with empty results.
+        let table = self.get_cached_table(label).await.ok();
+
+        let mut results = if let Some(table) = table {
+            // Build the FTS query with specific column
+            let match_query =
+                MatchQuery::new(query.to_string()).with_column(Some(property.to_string()));
+            let fts_query = FullTextSearchQuery {
+                query: match_query.into(),
+                limit: Some(k as i64),
+                wand_factor: None,
+            };
+
+            let mut query_builder = table.query().full_text_search(fts_query).limit(k);
+
+            query_builder = query_builder.only_if(Self::build_active_filter(filter));
+
+            // Apply version filtering if snapshot is pinned
+            if ctx.is_some()
+                && let Some(hwm) = self.version_high_water_mark()
+            {
+                query_builder = query_builder.only_if(format!("_version <= {}", hwm));
+            }
+
+            let batches = query_builder
+                .execute()
+                .await
+                .map_err(|e| anyhow!("FTS search execution failed: {}", e))?
+                .try_collect::<Vec<_>>()
+                .await
+                .map_err(|e| anyhow!("Failed to collect FTS search results: {}", e))?;
+
+            let mut lance_results = extract_vid_score_pairs(&batches, "_vid", "_score")?;
+            // Results should already be sorted by score from Lance, but ensure descending order
+            lance_results
+                .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            lance_results
+        } else {
+            Vec::new()
         };
 
-        // Build the FTS query with specific column
-        let match_query =
-            MatchQuery::new(query.to_string()).with_column(Some(property.to_string()));
-        let fts_query = FullTextSearchQuery {
-            query: match_query.into(),
-            limit: Some(k as i64),
-            wand_factor: None,
-        };
-
-        let mut query_builder = table.query().full_text_search(fts_query).limit(k);
-
-        query_builder = query_builder.only_if(Self::build_active_filter(filter));
-
-        // Apply version filtering if snapshot is pinned
-        if ctx.is_some()
-            && let Some(hwm) = self.version_high_water_mark()
-        {
-            query_builder = query_builder.only_if(format!("_version <= {}", hwm));
+        // Merge L0 buffer vertices for visibility of unflushed data.
+        if let Some(qctx) = ctx {
+            merge_l0_into_fts_results(&mut results, qctx, label, property, query, k);
         }
-
-        let batches = query_builder
-            .execute()
-            .await
-            .map_err(|e| anyhow!("FTS search execution failed: {}", e))?
-            .try_collect::<Vec<_>>()
-            .await
-            .map_err(|e| anyhow!("Failed to collect FTS search results: {}", e))?;
-
-        let mut results = extract_vid_score_pairs(&batches, "_vid", "_score")?;
-
-        // Results should already be sorted by score from Lance, but ensure descending order
-        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         Ok(results)
     }
@@ -1492,5 +1506,110 @@ fn merge_l0_into_vector_results(
 
     // Re-sort by distance ascending.
     results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    results.truncate(k);
+}
+
+/// Computes a simple token-overlap relevance score between a query and text.
+///
+/// Returns the fraction of query tokens found in the text (case-insensitive),
+/// producing a score in [0.0, 1.0]. Sufficient for the small L0 buffer.
+fn compute_text_relevance(query: &str, text: &str) -> f32 {
+    let query_tokens: HashSet<String> =
+        query.split_whitespace().map(|t| t.to_lowercase()).collect();
+    if query_tokens.is_empty() {
+        return 0.0;
+    }
+    let text_tokens: HashSet<String> = text.split_whitespace().map(|t| t.to_lowercase()).collect();
+    let hits = query_tokens
+        .iter()
+        .filter(|t| text_tokens.contains(t.as_str()))
+        .count();
+    hits as f32 / query_tokens.len() as f32
+}
+
+/// Extracts a string slice from a property value.
+fn extract_text_from_props<'a>(
+    props: &'a uni_common::Properties,
+    property: &str,
+) -> Option<&'a str> {
+    props.get(property)?.as_str()
+}
+
+/// Merges L0 buffer vertices into LanceDB full-text search results.
+///
+/// Follows the same pattern as [`merge_l0_into_vector_results`]: visits L0
+/// buffers in precedence order, collects tombstoned VIDs and text-match
+/// candidates, then merges them so that:
+/// - Tombstoned VIDs are removed (unless re-created in a later L0).
+/// - VIDs present in both L0 and LanceDB use the L0 score.
+/// - New L0-only VIDs are appended.
+/// - Results are re-sorted by score **descending** and truncated to `k`.
+fn merge_l0_into_fts_results(
+    results: &mut Vec<(Vid, f32)>,
+    ctx: &QueryContext,
+    label: &str,
+    property: &str,
+    query: &str,
+    k: usize,
+) {
+    // Collect all L0 buffers in precedence order (earliest first, last writer wins).
+    let mut buffers: Vec<Arc<parking_lot::RwLock<L0Buffer>>> =
+        ctx.pending_flush_l0s.iter().map(Arc::clone).collect();
+    buffers.push(Arc::clone(&ctx.l0));
+    if let Some(ref txn) = ctx.transaction_l0 {
+        buffers.push(Arc::clone(txn));
+    }
+
+    // Maps VID → relevance score for L0 candidates (last writer wins).
+    let mut l0_candidates: HashMap<Vid, f32> = HashMap::new();
+    // Tombstoned VIDs across all L0 buffers.
+    let mut tombstoned: HashSet<Vid> = HashSet::new();
+
+    for buf_arc in &buffers {
+        let buf = buf_arc.read();
+
+        // Accumulate tombstones.
+        for &vid in &buf.vertex_tombstones {
+            tombstoned.insert(vid);
+        }
+
+        // Scan vertices with the target label.
+        for (&vid, labels) in &buf.vertex_labels {
+            if !labels.iter().any(|l| l == label) {
+                continue;
+            }
+            if let Some(props) = buf.vertex_properties.get(&vid)
+                && let Some(text) = extract_text_from_props(props, property)
+            {
+                let score = compute_text_relevance(query, text);
+                if score > 0.0 {
+                    // Last writer wins: later buffer overwrites earlier.
+                    l0_candidates.insert(vid, score);
+                }
+                // If re-created in a later L0, remove from tombstones.
+                tombstoned.remove(&vid);
+            }
+        }
+    }
+
+    // If no L0 activity affects this search, skip merge.
+    if l0_candidates.is_empty() && tombstoned.is_empty() {
+        return;
+    }
+
+    // Remove tombstoned VIDs from LanceDB results.
+    results.retain(|(vid, _)| !tombstoned.contains(vid));
+
+    // Overwrite or append L0 candidates.
+    for (vid, score) in &l0_candidates {
+        if let Some(existing) = results.iter_mut().find(|(v, _)| v == vid) {
+            existing.1 = *score;
+        } else {
+            results.push((*vid, *score));
+        }
+    }
+
+    // Re-sort by score descending (higher relevance first).
+    results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     results.truncate(k);
 }

@@ -83,7 +83,7 @@ jobs:
   # Python bindings tests
   python-tests:
     name: Python Tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-xlarge
     steps:
       - uses: actions/checkout@v4
 

@@ -17,6 +17,7 @@
 
 use crate::lancedb::LanceDbStore;
 use crate::storage::arrow_convert::build_timestamp_column_from_vid_map;
+use crate::storage::index_utils::ensure_btree_index;
 use anyhow::{Result, anyhow};
 use arrow_array::builder::{
     FixedSizeBinaryBuilder, LargeBinaryBuilder, ListBuilder, StringBuilder,
@@ -24,9 +25,10 @@ use arrow_array::builder::{
 use arrow_array::{Array, ArrayRef, BooleanArray, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema, TimeUnit};
 use futures::TryStreamExt;
+use futures::future;
 use lancedb::Table;
 use lancedb::index::Index as LanceDbIndex;
-use lancedb::index::scalar::{BTreeIndexBuilder, LabelListIndexBuilder};
+use lancedb::index::scalar::LabelListIndexBuilder;
 use lancedb::query::{ExecutableQuery, QueryBase};
 use sha3::{Digest, Sha3_256};
 use std::collections::HashMap;
@@ -40,6 +42,7 @@ use uni_common::core::id::{UniId, Vid};
 /// - Fast ID-based lookups without knowing the label
 /// - Global ext_id uniqueness enforcement
 /// - Multi-label storage with labels as a list column
+#[derive(Debug)]
 pub struct MainVertexDataset {
     _base_uri: String,
 }
@@ -234,58 +237,18 @@ impl MainVertexDataset {
             .await
             .map_err(|e| anyhow!("Failed to list indices: {}", e))?;
 
-        // Ensure _vid index (primary key)
-        if !indices
-            .iter()
-            .any(|idx| idx.columns.contains(&"_vid".to_string()))
-        {
-            log::info!("Creating _vid BTree index for main vertices table");
-            if let Err(e) = table
-                .create_index(&["_vid"], LanceDbIndex::BTree(BTreeIndexBuilder::default()))
-                .execute()
-                .await
-            {
-                log::warn!("Failed to create _vid index for main vertices: {}", e);
-            }
-        }
+        // BTree indexes for primary key and lookup columns
+        future::join_all(
+            ["_vid", "ext_id", "_uid"]
+                .iter()
+                .map(|col| ensure_btree_index(table, &indices, col, "main vertices")),
+        )
+        .await;
 
-        // Ensure ext_id index (unique lookup)
+        // LabelList index for array_contains() queries on labels
         if !indices
             .iter()
-            .any(|idx| idx.columns.contains(&"ext_id".to_string()))
-        {
-            log::info!("Creating ext_id BTree index for main vertices table");
-            if let Err(e) = table
-                .create_index(
-                    &["ext_id"],
-                    LanceDbIndex::BTree(BTreeIndexBuilder::default()),
-                )
-                .execute()
-                .await
-            {
-                log::warn!("Failed to create ext_id index for main vertices: {}", e);
-            }
-        }
-
-        // Ensure _uid index
-        if !indices
-            .iter()
-            .any(|idx| idx.columns.contains(&"_uid".to_string()))
-        {
-            log::info!("Creating _uid BTree index for main vertices table");
-            if let Err(e) = table
-                .create_index(&["_uid"], LanceDbIndex::BTree(BTreeIndexBuilder::default()))
-                .execute()
-                .await
-            {
-                log::warn!("Failed to create _uid index for main vertices: {}", e);
-            }
-        }
-
-        // Ensure labels LABEL_LIST index (for array_contains() queries)
-        if !indices
-            .iter()
-            .any(|idx| idx.columns.contains(&"labels".to_string()))
+            .any(|idx| idx.columns.iter().any(|c| c == "labels"))
         {
             log::info!("Creating labels LABEL_LIST index for main vertices table");
             if let Err(e) = table

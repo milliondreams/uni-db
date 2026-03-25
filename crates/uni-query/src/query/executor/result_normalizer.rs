@@ -14,6 +14,12 @@ use anyhow::{Result, anyhow};
 use std::collections::HashMap;
 use uni_common::core::id::{Eid, Vid};
 
+/// Converts raw executor output into clean user-facing value types.
+///
+/// Ensures that `Value::Map` rows carrying internal fields (`_vid`, `_eid`,
+/// `_labels`, etc.) are converted to their proper `Value::Node`, `Value::Edge`,
+/// or `Value::Path` variants before results are returned to callers.
+#[derive(Debug)]
 pub struct ResultNormalizer;
 
 impl ResultNormalizer {
@@ -230,12 +236,9 @@ impl ResultNormalizer {
         let labels = if let Some(Value::List(label_list)) = map.get("_labels") {
             label_list
                 .iter()
-                .filter_map(|v| {
-                    if let Value::String(s) = v {
-                        Some(s.clone())
-                    } else {
-                        None
-                    }
+                .filter_map(|v| match v {
+                    Value::String(s) => Some(s.clone()),
+                    _ => None,
                 })
                 .collect()
         } else if let Some(Value::String(s)) = map.get("_labels") {
@@ -347,12 +350,9 @@ impl ResultNormalizer {
     fn extract_path_nodes(value: Value) -> Result<Vec<Node>> {
         Self::extract_path_elements(
             value,
-            |v| {
-                if let Value::Node(n) = v {
-                    Some(n)
-                } else {
-                    None
-                }
+            |v| match v {
+                Value::Node(n) => Some(n),
+                _ => None,
             },
             Self::map_to_node,
             "nodes",
@@ -363,12 +363,9 @@ impl ResultNormalizer {
     fn extract_path_edges(value: Value) -> Result<Vec<Edge>> {
         Self::extract_path_elements(
             value,
-            |v| {
-                if let Value::Edge(e) = v {
-                    Some(e)
-                } else {
-                    None
-                }
+            |v| match v {
+                Value::Edge(e) => Some(e),
+                _ => None,
             },
             Self::map_to_edge,
             "edges",

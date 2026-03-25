@@ -14,7 +14,7 @@ Locy native execution uses a two-phase architecture: DataFusion-backed strata ev
 
 Expression functions in rule `WHERE` and `YIELD` clauses have full `GraphExecutionContext` access:
 
-- `similar_to()` supports vector cosine, auto-embedding, FTS/BM25, and multi-source fusion.
+- `similar_to()` supports metric-aware vector scoring (Cosine, L2, Dot), auto-embedding, FTS/BM25, and multi-source fusion.
 - `EXISTS` subqueries run as correlated DataFusion subplans.
 - All DataFusion optimizations apply (pushdown, projection pruning, parallel execution).
 
@@ -30,7 +30,7 @@ After strata converge, `dispatch_native_command()` processes each command:
 | `ASSUME` | Savepoint → mutate → re-evaluate → dispatch body | Yes (re-evaluates strata) |
 | `EXPLAIN RULE` | Build derivation tree | No (traces fact provenance) |
 
-Command WHERE filters use `eval_expr()`, a lightweight row-level evaluator. This evaluator supports basic operations (arithmetic, comparison, boolean logic) and pure-computation functions (`similar_to()` for vector cosine only). It does not have access to `GraphExecutionContext`, so auto-embedding, FTS, and multi-source fusion are not available in command WHERE clauses.
+Command WHERE filters use `eval_expr()`, a lightweight row-level evaluator. This evaluator supports basic operations (arithmetic, comparison, boolean logic) and pure-computation functions (`similar_to()` for vector similarity only — defaults to cosine). It does not have access to `GraphExecutionContext`, so auto-embedding, FTS, metric resolution, and multi-source fusion are not available in command WHERE clauses.
 
 ## Semantics Hooks
 

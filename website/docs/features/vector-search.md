@@ -96,7 +96,7 @@ WHERE similar_to(b.embedding, 'attention mechanisms') > 0.7
 RETURN b.title, similar_to(b.embedding, 'attention mechanisms') AS score
 ```
 
-`similar_to` supports vector similarity, FTS scoring, and multi-source hybrid fusion. It works in `WHERE`, `RETURN`, `ORDER BY`, and Locy rule bodies. See the [Vector Search guide](../guides/vector-search.md#similar_to-expression-function) for full details.
+`similar_to` supports metric-aware vector scoring (Cosine, L2, Dot Product), FTS scoring, and multi-source hybrid fusion. It automatically uses the distance metric configured on the vector index. It works in `WHERE`, `RETURN`, `ORDER BY`, and Locy rule bodies. See the [Vector Search guide](../guides/vector-search.md#similar_to-expression-function) for full details.
 
 ## Uni-Xervo Runtime
 

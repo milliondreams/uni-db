@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Dragonscale Team
 
+//! Query execution engine.
+//!
+//! Translates logical plans into concrete read/write operations against
+//! Uni storage, including DataFusion-based columnar execution, procedure
+//! dispatch, and result normalization.
+
 pub mod core;
 pub mod ddl_procedures;
 pub mod path_builder;

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Dragonscale Team
 
+//! LSM-style delta dataset for accumulating edge mutations before compaction.
+
 use crate::lancedb::LanceDbStore;
 use crate::storage::arrow_convert::build_timestamp_column;
 use crate::storage::property_builder::PropertyColumnBuilder;
@@ -56,12 +58,16 @@ pub fn check_oom_guard(
     Ok(())
 }
 
-#[derive(Clone, Debug, PartialEq)]
+/// Operation type stored in the delta (L1) log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Op {
+    /// Edge was inserted.
     Insert = 0,
+    /// Edge was soft-deleted.
     Delete = 1,
 }
 
+/// A single entry in the L1 (sorted run) delta dataset.
 #[derive(Clone, Debug)]
 pub struct L1Entry {
     pub src_vid: Vid,
@@ -76,6 +82,11 @@ pub struct L1Entry {
     pub updated_at: Option<i64>,
 }
 
+/// LSM-style delta dataset for a single edge type and direction.
+///
+/// Stores L1 sorted runs that accumulate edge mutations before compaction
+/// merges them into the base CSR.
+#[derive(Debug)]
 pub struct DeltaDataset {
     uri: String,
     edge_type: String,
@@ -83,6 +94,7 @@ pub struct DeltaDataset {
 }
 
 impl DeltaDataset {
+    /// Create a new `DeltaDataset` rooted at `base_uri` for the given edge type and direction.
     pub fn new(base_uri: &str, edge_type: &str, direction: &str) -> Self {
         let uri = format!("{}/deltas/{}_{}", base_uri, edge_type, direction);
         Self {
@@ -92,10 +104,12 @@ impl DeltaDataset {
         }
     }
 
+    /// Open the delta dataset at its latest version.
     pub async fn open(&self) -> Result<Arc<Dataset>> {
         self.open_at(None).await
     }
 
+    /// Open the delta dataset, optionally pinned to a specific Lance version.
     pub async fn open_at(&self, version: Option<u64>) -> Result<Arc<Dataset>> {
         let mut ds = Dataset::open(&self.uri).await?;
         if let Some(v) = version {
@@ -104,6 +118,7 @@ impl DeltaDataset {
         Ok(Arc::new(ds))
     }
 
+    /// Build the Arrow schema for this delta table using the given graph schema.
     pub fn get_arrow_schema(&self, schema: &Schema) -> Result<Arc<ArrowSchema>> {
         let mut fields = vec![
             Field::new("src_vid", arrow_schema::DataType::UInt64, false),
@@ -143,6 +158,7 @@ impl DeltaDataset {
         Ok(Arc::new(ArrowSchema::new(fields)))
     }
 
+    /// Serialize `entries` into an Arrow `RecordBatch` using the given graph schema.
     pub fn build_record_batch(&self, entries: &[L1Entry], schema: &Schema) -> Result<RecordBatch> {
         let arrow_schema = self.get_arrow_schema(schema)?;
 
@@ -156,7 +172,7 @@ impl DeltaDataset {
             src_vids.push(entry.src_vid.as_u64());
             dst_vids.push(entry.dst_vid.as_u64());
             eids.push(entry.eid.as_u64());
-            ops.push(entry.op.clone() as u8);
+            ops.push(entry.op as u8);
             versions.push(entry.version);
         }
 
@@ -201,6 +217,7 @@ impl DeltaDataset {
         )
     }
 
+    /// Scan and return all L1 entries, sorted by direction key and version.
     pub async fn scan_all(&self, schema: &Schema) -> Result<Vec<L1Entry>> {
         self.scan_all_with_limit(schema, DEFAULT_MAX_COMPACTION_ROWS)
             .await
@@ -608,7 +625,10 @@ mod tests {
     use super::*;
 
     #[test]
-    #[allow(clippy::assertions_on_constants)] // Validating configuration constants
+    #[expect(
+        clippy::assertions_on_constants,
+        reason = "Validating configuration constants intentionally"
+    )]
     fn test_constants_are_reasonable() {
         // Verify DEFAULT_MAX_COMPACTION_ROWS is set to 5 million
         assert_eq!(DEFAULT_MAX_COMPACTION_ROWS, 5_000_000);

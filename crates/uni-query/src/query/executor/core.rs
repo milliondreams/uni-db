@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
 use uni_algo::algo::AlgorithmRegistry;
-use uni_common::{TemporalType, TemporalValue, Value};
+use uni_common::{TemporalValue, Value};
 use uni_cypher::ast::{BinaryOp, Expr};
 use uni_store::QueryContext;
 use uni_store::runtime::l0_manager::L0Manager;
@@ -15,11 +15,12 @@ use uni_store::runtime::writer::Writer;
 use uni_store::storage::manager::StorageManager;
 use uni_xervo::runtime::ModelRuntime;
 
-use crate::query::datetime::{classify_temporal, eval_datetime_function};
 use crate::query::expr_eval::eval_binary_op;
+use crate::types::QueryWarning;
 
 use super::procedure::ProcedureRegistry;
 
+/// Mutable accumulator for Cypher aggregate functions (COUNT, SUM, AVG, ...).
 #[derive(Debug)]
 pub(crate) enum Accumulator {
     Count(i64),
@@ -207,6 +208,17 @@ impl Accumulator {
 /// Cache key for parsed generation expressions: (label_name, property_name)
 pub(crate) type GenExprCacheKey = (String, String);
 
+/// Query executor: runs logical plans against a Uni storage backend.
+///
+/// `Executor` bridges the logical query plan produced by [`crate::query::planner::QueryPlanner`]
+/// with the underlying `StorageManager`. It handles both read-only sessions and
+/// write-enabled sessions (via `Writer` and `L0Manager`).
+///
+/// # Cloning
+///
+/// `Executor` is cheaply cloneable — all expensive state is held behind `Arc`s.
+/// Clone it freely to share across tasks.
+// M-PUBLIC-DEBUG: Manual impl because Writer/ModelRuntime do not implement Debug.
 #[derive(Clone)]
 pub struct Executor {
     pub(crate) storage: Arc<StorageManager>,
@@ -223,9 +235,23 @@ pub struct Executor {
     pub(crate) procedure_registry: Option<Arc<ProcedureRegistry>>,
     /// Uni-Xervo runtime used by vector auto-embedding paths.
     pub(crate) xervo_runtime: Option<Arc<ModelRuntime>>,
+    /// Warnings collected during the last execution.
+    pub(crate) warnings: Arc<std::sync::Mutex<Vec<QueryWarning>>>,
+}
+
+impl std::fmt::Debug for Executor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Executor")
+            .field("use_transaction", &self.use_transaction)
+            .field("has_writer", &self.writer.is_some())
+            .field("has_l0_manager", &self.l0_manager.is_some())
+            .field("has_xervo_runtime", &self.xervo_runtime.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Executor {
+    /// Create a read-only executor backed by the given storage manager.
     pub fn new(storage: Arc<StorageManager>) -> Self {
         Self {
             storage,
@@ -238,20 +264,23 @@ impl Executor {
             gen_expr_cache: Arc::new(RwLock::new(HashMap::new())),
             procedure_registry: None,
             xervo_runtime: None,
+            warnings: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
+    /// Create a write-enabled executor with an attached `Writer`.
     pub fn new_with_writer(storage: Arc<StorageManager>, writer: Arc<RwLock<Writer>>) -> Self {
         let mut executor = Self::new(storage);
         executor.writer = Some(writer);
         executor
     }
 
-    /// Sets the external procedure registry for user-defined procedures.
+    /// Attach an external procedure registry for user-defined procedures.
     pub fn set_procedure_registry(&mut self, registry: Arc<ProcedureRegistry>) {
         self.procedure_registry = Some(registry);
     }
 
+    /// Attach or detach the Uni-Xervo model runtime for vector auto-embedding.
     pub fn set_xervo_runtime(&mut self, runtime: Option<Arc<ModelRuntime>>) {
         self.xervo_runtime = runtime;
     }
@@ -262,6 +291,7 @@ impl Executor {
         self.file_sandbox = sandbox;
     }
 
+    /// Apply a runtime configuration to this executor.
     pub fn set_config(&mut self, config: uni_common::config::UniConfig) {
         self.config = config;
     }
@@ -273,14 +303,25 @@ impl Executor {
             .map_err(|e| anyhow!("Path validation failed: {}", e))
     }
 
+    /// Attach a `Writer` after construction, enabling write operations.
     pub fn set_writer(&mut self, writer: Arc<RwLock<Writer>>) {
         self.writer = Some(writer);
     }
 
+    /// Take all collected warnings from the last execution, leaving the collector empty.
+    pub fn take_warnings(&self) -> Vec<QueryWarning> {
+        self.warnings
+            .lock()
+            .map(|mut w| std::mem::take(&mut *w))
+            .unwrap_or_default()
+    }
+
+    /// Configure whether query execution should operate within a transaction context.
     pub fn set_use_transaction(&mut self, use_transaction: bool) {
         self.use_transaction = use_transaction;
     }
 
+    /// Build a `QueryContext` from the current writer or standalone L0 manager.
     pub(crate) async fn get_context(&self) -> Option<QueryContext> {
         if let Some(writer_lock) = &self.writer {
             let writer = writer_lock.read().await;
@@ -301,6 +342,7 @@ impl Executor {
         }
     }
 
+    /// Total ordering for Cypher ORDER BY, including cross-type comparisons.
     pub(crate) fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
         use std::cmp::Ordering;
 
@@ -448,87 +490,11 @@ impl Executor {
     }
 
     fn extract_temporal_value(value: &Value) -> Option<TemporalValue> {
-        match value {
-            Value::Temporal(t) => Some(t.clone()),
-            Value::Map(map) => Self::map_as_temporal(map),
-            Value::String(s) => Self::string_as_temporal(s),
-            _ => None,
-        }
-    }
-
-    fn string_as_temporal(s: &str) -> Option<TemporalValue> {
-        let fn_name = match classify_temporal(s)? {
-            TemporalType::Date => "DATE",
-            TemporalType::LocalTime => "LOCALTIME",
-            TemporalType::Time => "TIME",
-            TemporalType::LocalDateTime => "LOCALDATETIME",
-            TemporalType::DateTime => "DATETIME",
-            TemporalType::Duration => "DURATION",
-        };
-        match eval_datetime_function(fn_name, &[Value::String(s.to_string())]).ok()? {
-            Value::Temporal(tv) => Some(tv),
-            _ => None,
-        }
+        crate::query::expr_eval::temporal_from_value(value)
     }
 
     fn map_as_temporal(map: &HashMap<String, Value>) -> Option<TemporalValue> {
-        if map.len() != 1 {
-            return None;
-        }
-
-        let as_i32 = |v: &Value| v.as_i64().and_then(|n| i32::try_from(n).ok());
-        let as_i64 = |v: &Value| v.as_i64();
-
-        if let Some(Value::Map(inner)) = map.get("Date") {
-            let days = inner.get("days_since_epoch").and_then(as_i32)?;
-            return Some(TemporalValue::Date {
-                days_since_epoch: days,
-            });
-        }
-        if let Some(Value::Map(inner)) = map.get("LocalTime") {
-            let nanos = inner.get("nanos_since_midnight").and_then(as_i64)?;
-            return Some(TemporalValue::LocalTime {
-                nanos_since_midnight: nanos,
-            });
-        }
-        if let Some(Value::Map(inner)) = map.get("Time") {
-            let nanos = inner.get("nanos_since_midnight").and_then(as_i64)?;
-            let offset = inner.get("offset_seconds").and_then(as_i32)?;
-            return Some(TemporalValue::Time {
-                nanos_since_midnight: nanos,
-                offset_seconds: offset,
-            });
-        }
-        if let Some(Value::Map(inner)) = map.get("LocalDateTime") {
-            let nanos = inner.get("nanos_since_epoch").and_then(as_i64)?;
-            return Some(TemporalValue::LocalDateTime {
-                nanos_since_epoch: nanos,
-            });
-        }
-        if let Some(Value::Map(inner)) = map.get("DateTime") {
-            let nanos = inner.get("nanos_since_epoch").and_then(as_i64)?;
-            let offset = inner.get("offset_seconds").and_then(as_i32)?;
-            let timezone_name = match inner.get("timezone_name") {
-                Some(Value::String(s)) => Some(s.clone()),
-                _ => None,
-            };
-            return Some(TemporalValue::DateTime {
-                nanos_since_epoch: nanos,
-                offset_seconds: offset,
-                timezone_name,
-            });
-        }
-        if let Some(Value::Map(inner)) = map.get("Duration") {
-            let months = inner.get("months").and_then(as_i64)?;
-            let days = inner.get("days").and_then(as_i64)?;
-            let nanos = inner.get("nanos").and_then(as_i64)?;
-            return Some(TemporalValue::Duration {
-                months,
-                days,
-                nanos,
-            });
-        }
-        None
+        crate::query::expr_eval::temporal_from_map_wrapper(map)
     }
 
     fn compare_lists(left: &[Value], right: &[Value]) -> std::cmp::Ordering {
@@ -672,21 +638,36 @@ impl Executor {
     }
 }
 
+/// Combined output of a `PROFILE` query execution.
+///
+/// Contains both the logical plan explanation and per-operator runtime
+/// statistics collected during execution.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ProfileOutput {
+    /// Logical plan explanation with index usage and cost estimates.
     pub explain: crate::query::planner::ExplainOutput,
+    /// Per-operator timing and memory statistics.
     pub runtime_stats: Vec<OperatorStats>,
+    /// Wall-clock time for the entire execution in milliseconds.
     pub total_time_ms: u64,
+    /// Peak memory used during execution in bytes.
     pub peak_memory_bytes: usize,
 }
 
+/// Runtime statistics for a single logical plan operator.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OperatorStats {
+    /// Human-readable operator name (e.g., `"GraphScan"`, `"Filter"`).
     pub operator: String,
+    /// Number of rows produced by this operator.
     pub actual_rows: usize,
+    /// Wall-clock time spent in this operator in milliseconds.
     pub time_ms: f64,
+    /// Memory allocated by this operator in bytes.
     pub memory_bytes: usize,
+    /// Number of index cache hits (if applicable).
     pub index_hits: Option<usize>,
+    /// Number of index cache misses (if applicable).
     pub index_misses: Option<usize>,
 }
 

@@ -28,6 +28,15 @@ use super::unwind::arrow_to_json_value;
 use crate::query::df_planner::HybridPhysicalPlanner;
 use crate::query::planner::LogicalPlan;
 
+/// Convert an `ArrowError` into a `DataFusionError`.
+///
+/// Wraps the Arrow-level error into DataFusion's `ArrowError` variant. Use this
+/// with `.map_err(arrow_err)` when calling raw Arrow compute kernels from
+/// DataFusion execution plans.
+pub fn arrow_err(e: arrow::error::ArrowError) -> datafusion::error::DataFusionError {
+    datafusion::error::DataFusionError::ArrowError(Box::new(e), None)
+}
+
 /// Compute standard plan properties for graph operators.
 ///
 /// All graph operators use the same plan properties:
@@ -892,37 +901,22 @@ pub async fn execute_subplan(
     storage: &Arc<StorageManager>,
     schema_info: &Arc<UniSchema>,
 ) -> DFResult<Vec<RecordBatch>> {
-    let planner_construction_start = std::time::Instant::now();
-    let l0_context = graph_ctx.l0_context().clone();
-    let prop_manager = graph_ctx.property_manager().clone();
-
     let planner = HybridPhysicalPlanner::with_l0_context(
         session_ctx.clone(),
         storage.clone(),
-        l0_context,
-        prop_manager,
+        graph_ctx.l0_context().clone(),
+        graph_ctx.property_manager().clone(),
         schema_info.clone(),
         params.clone(),
         outer_values.clone(),
     );
-    let planner_construction_elapsed = planner_construction_start.elapsed();
-    tracing::debug!(
-        "execute_subplan: planner construction took {:?}",
-        planner_construction_elapsed
-    );
 
-    let planning_start = std::time::Instant::now();
     let execution_plan = planner.plan(plan).map_err(|e| {
-        datafusion::error::DataFusionError::Execution(format!("Sub-plan error: {}", e))
+        datafusion::error::DataFusionError::Execution(format!("Sub-plan error: {e}"))
     })?;
-    let planning_elapsed = planning_start.elapsed();
-    tracing::debug!("execute_subplan: planning took {:?}", planning_elapsed);
 
-    let execution_start = std::time::Instant::now();
     let task_ctx = session_ctx.read().task_ctx();
     let all_batches = collect_all_partitions(&execution_plan, task_ctx).await?;
-    let execution_elapsed = execution_start.elapsed();
-    tracing::debug!("execute_subplan: execution took {:?}", execution_elapsed);
 
     Ok(all_batches)
 }
@@ -932,13 +926,13 @@ pub async fn execute_subplan(
 /// Used to build parameters for correlated subqueries (Apply, EXISTS).
 pub fn extract_row_params(batch: &RecordBatch, row_idx: usize) -> HashMap<String, Value> {
     let schema = batch.schema();
-    let mut row = HashMap::new();
-    for col_idx in 0..batch.num_columns() {
-        let col_name = schema.field(col_idx).name().clone();
-        let val = arrow_to_json_value(batch.column(col_idx).as_ref(), row_idx);
-        row.insert(col_name, val);
-    }
-    row
+    (0..batch.num_columns())
+        .map(|col_idx| {
+            let col_name = schema.field(col_idx).name().clone();
+            let val = arrow_to_json_value(batch.column(col_idx).as_ref(), row_idx);
+            (col_name, val)
+        })
+        .collect()
 }
 
 /// Infer the output schema of a ProcedureCall logical plan node.

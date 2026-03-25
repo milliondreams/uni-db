@@ -15,6 +15,7 @@ use anyhow::Result;
 use uni_common::Value;
 use uni_common::core::schema::{DistanceMetric, Schema};
 
+use crate::query::df_graph::common::calculate_score;
 use crate::query::fusion;
 
 /// Named error types for `similar_to()` validation failures.
@@ -90,7 +91,7 @@ pub struct SimilarToOptions {
 
 impl Default for SimilarToOptions {
     fn default() -> Self {
-        SimilarToOptions {
+        Self {
             method: FusionMethod::Rrf,
             weights: None,
             k: 60,
@@ -243,6 +244,30 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> Result<f32, SimilarToError> {
     Ok(sim.clamp(-1.0, 1.0))
 }
 
+/// Score two vectors using the specified distance metric, returning a similarity
+/// score where higher means more similar.
+///
+/// - **Cosine**: raw cosine similarity in \[-1, 1\] (delegates to [`cosine_similarity`]).
+/// - **L2**: `1 / (1 + d²)` where d² is squared Euclidean distance; range (0, 1\].
+/// - **Dot**: raw dot product (for normalised vectors equals cosine similarity).
+pub fn score_vectors(a: &[f32], b: &[f32], metric: &DistanceMetric) -> Result<f32, SimilarToError> {
+    if a.len() != b.len() {
+        return Err(SimilarToError::DimensionMismatch {
+            a: a.len(),
+            b: b.len(),
+        });
+    }
+    let distance = metric.compute_distance(a, b);
+    match metric {
+        DistanceMetric::Cosine => cosine_similarity(a, b),
+        // compute_distance returns -dot (LanceDB convention: lower = more similar).
+        // Negate to recover the actual dot product as a similarity score.
+        DistanceMetric::Dot => Ok(-distance),
+        // L2 and all other metrics (#[non_exhaustive]): normalise via calculate_score.
+        _ => Ok(calculate_score(distance, metric)),
+    }
+}
+
 /// Normalize a BM25 score to [0, 1] using a saturation function.
 ///
 /// `normalized = score / (score + fts_k)` where `fts_k` defaults to 1.0.
@@ -256,11 +281,67 @@ pub fn normalize_bm25(score: f32, fts_k: f32) -> f32 {
 /// Compute pure vector-vs-vector similarity (no storage access needed).
 ///
 /// Both values must be `Value::List` of numbers or `Value::Vector`.
+///
+/// Uses f64 arithmetic throughout when both inputs are `Value::List`, preserving
+/// full precision for property-based vectors (e.g. in TCK and unit tests). For
+/// `Value::Vector` (pre-indexed f32 data) it falls back to the f32 path.
 pub fn eval_similar_to_pure(v1: &Value, v2: &Value) -> Result<Value> {
+    // Fast path: at least one input is a List — use f64 to avoid f32 precision loss.
+    let has_list = matches!(v1, Value::List(_)) || matches!(v2, Value::List(_));
+    let f64_vecs = has_list
+        .then(|| value_to_f64_vec(v1).ok().zip(value_to_f64_vec(v2).ok()))
+        .flatten();
+    if let Some((vec1, vec2)) = f64_vecs {
+        let sim = cosine_similarity_f64(&vec1, &vec2)?;
+        return Ok(Value::Float(sim));
+    }
+    // Fallback: f32 path for Value::Vector (indexed data already in f32).
     let vec1 = value_to_f32_vec(v1)?;
     let vec2 = value_to_f32_vec(v2)?;
     let sim = cosine_similarity(&vec1, &vec2)?;
     Ok(Value::Float(sim as f64))
+}
+
+/// Compute cosine similarity between two f64 vectors, returning a score in [-1, 1].
+fn cosine_similarity_f64(a: &[f64], b: &[f64]) -> Result<f64, SimilarToError> {
+    if a.len() != b.len() {
+        return Err(SimilarToError::DimensionMismatch {
+            a: a.len(),
+            b: b.len(),
+        });
+    }
+    let mut dot = 0.0f64;
+    let mut mag1 = 0.0f64;
+    let mut mag2 = 0.0f64;
+    for (x, y) in a.iter().zip(b.iter()) {
+        dot += x * y;
+        mag1 += x * x;
+        mag2 += y * y;
+    }
+    let mag1 = mag1.sqrt();
+    let mag2 = mag2.sqrt();
+    if mag1 == 0.0 || mag2 == 0.0 {
+        return Ok(0.0);
+    }
+    Ok((dot / (mag1 * mag2)).clamp(-1.0, 1.0))
+}
+
+/// Convert a Value to a `Vec<f64>` for high-precision vector operations.
+fn value_to_f64_vec(v: &Value) -> Result<Vec<f64>, SimilarToError> {
+    match v {
+        Value::Vector(vec) => Ok(vec.iter().map(|&x| x as f64).collect()),
+        Value::List(list) => list
+            .iter()
+            .map(|v| {
+                v.as_f64().ok_or_else(|| SimilarToError::InvalidOption {
+                    message: "vector element must be a number".to_string(),
+                })
+            })
+            .collect(),
+        _ => Err(SimilarToError::InvalidVectorValue {
+            actual: format!("{v:?}"),
+        }),
+    }
 }
 
 /// Convert a Value to a `Vec<f32>` for vector operations.
@@ -278,7 +359,7 @@ pub fn value_to_f32_vec(v: &Value) -> Result<Vec<f32>, SimilarToError> {
             })
             .collect(),
         _ => Err(SimilarToError::InvalidVectorValue {
-            actual: format!("{:?}", v),
+            actual: format!("{v:?}"),
         }),
     }
 }
@@ -552,5 +633,65 @@ mod tests {
         let score = fuse_scores(&[0.8, 0.6], &opts).unwrap();
         // RRF in point context falls back to equal weights: (0.8 + 0.6) / 2 = 0.7
         assert!((score - 0.7).abs() < 1e-6);
+    }
+
+    // -----------------------------------------------------------------------
+    // score_vectors() tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_score_vectors_cosine_identical() {
+        let v = vec![1.0, 0.0, 0.0];
+        let score = score_vectors(&v, &v, &DistanceMetric::Cosine).unwrap();
+        assert!((score - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_score_vectors_cosine_matches_raw() {
+        // score_vectors with Cosine delegates to cosine_similarity
+        let a = vec![1.0, 0.0, 0.0];
+        let b = vec![0.8, 0.6, 0.0];
+        let raw = cosine_similarity(&a, &b).unwrap();
+        let scored = score_vectors(&a, &b, &DistanceMetric::Cosine).unwrap();
+        assert!((raw - scored).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_score_vectors_l2() {
+        // [1,0,0] vs [0,1,0]: L2 squared distance = 2, score = 1/(1+2) ≈ 0.333
+        let a = vec![1.0, 0.0, 0.0];
+        let b = vec![0.0, 1.0, 0.0];
+        let score = score_vectors(&a, &b, &DistanceMetric::L2).unwrap();
+        assert!((score - 1.0 / 3.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_score_vectors_l2_identical() {
+        let v = vec![1.0, 0.0, 0.0];
+        let score = score_vectors(&v, &v, &DistanceMetric::L2).unwrap();
+        assert!((score - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_score_vectors_dot() {
+        // [1,0,0] dot [0.8,0.6,0] = 0.8
+        let a = vec![1.0, 0.0, 0.0];
+        let b = vec![0.8, 0.6, 0.0];
+        let score = score_vectors(&a, &b, &DistanceMetric::Dot).unwrap();
+        assert!((score - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_score_vectors_dot_identical() {
+        let v = vec![1.0, 0.0, 0.0];
+        let score = score_vectors(&v, &v, &DistanceMetric::Dot).unwrap();
+        assert!((score - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_score_vectors_dimension_mismatch() {
+        let a = vec![1.0, 0.0];
+        let b = vec![1.0, 0.0, 0.0];
+        assert!(score_vectors(&a, &b, &DistanceMetric::Cosine).is_err());
     }
 }

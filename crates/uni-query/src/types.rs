@@ -116,6 +116,9 @@ pub enum QueryWarning {
         /// The property being filtered.
         property: String,
     },
+    /// RRF fusion was requested in point-computation context where no global
+    /// ranking is available, so it degenerated to equal-weight fusion.
+    RrfPointContext,
     /// Generic warning message.
     Other(String),
 }
@@ -139,6 +142,13 @@ impl std::fmt::Display for QueryWarning {
                     f,
                     "No index available for filter on {}.{}, using full scan",
                     label, property
+                )
+            }
+            QueryWarning::RrfPointContext => {
+                write!(
+                    f,
+                    "RRF fusion degenerated to equal-weight fusion in point-computation context \
+                     (no global ranking available). Consider using method: 'weighted' with explicit weights."
                 )
             }
             QueryWarning::Other(msg) => write!(f, "{}", msg),

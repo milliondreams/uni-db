@@ -804,16 +804,46 @@ fn temporal_partial_cmp(left: &TemporalValue, right: &TemporalValue) -> Option<O
     }
 }
 
-fn temporal_from_value(v: &Value) -> Option<TemporalValue> {
+/// Extract a `TemporalValue` from any `Value` variant that can represent one.
+///
+/// Handles `Value::Temporal`, `Value::Map` (JSON-serialized temporal wrappers),
+/// and `Value::String` — first tries JSON wrapper format
+/// (`{"Date":{"days_since_epoch":0}}`), then falls back to human-readable
+/// ISO 8601 strings like `"2024-01-15"` or `"12:35:15+05:00"`.
+pub(crate) fn temporal_from_value(v: &Value) -> Option<TemporalValue> {
     match v {
         Value::Temporal(tv) => Some(tv.clone()),
         Value::Map(map) => temporal_from_map_wrapper(map),
-        Value::String(s) => temporal_from_json_wrapper_str(s),
+        Value::String(s) => {
+            temporal_from_json_wrapper_str(s).or_else(|| temporal_from_human_readable_str(s))
+        }
         _ => None,
     }
 }
 
-fn temporal_from_map_wrapper(
+/// Parse a human-readable ISO 8601 temporal string (e.g. `"12:35:15+05:00"`,
+/// `"2024-01-15"`) into a `TemporalValue` by classifying and evaluating it.
+pub(crate) fn temporal_from_human_readable_str(s: &str) -> Option<TemporalValue> {
+    let fn_name = match classify_temporal(s)? {
+        TemporalType::Date => "DATE",
+        TemporalType::LocalTime => "LOCALTIME",
+        TemporalType::Time => "TIME",
+        TemporalType::LocalDateTime => "LOCALDATETIME",
+        TemporalType::DateTime => "DATETIME",
+        TemporalType::Duration => "DURATION",
+    };
+    match eval_datetime_function(fn_name, &[Value::String(s.to_string())]).ok()? {
+        Value::Temporal(tv) => Some(tv),
+        _ => None,
+    }
+}
+
+/// Try to interpret a map as a temporal value.
+///
+/// Recognizes single-entry maps with a temporal type key (`Date`, `Time`, etc.)
+/// whose value is a map of the appropriate fields. Returns `None` if the map
+/// does not match any temporal pattern.
+pub(crate) fn temporal_from_map_wrapper(
     map: &std::collections::HashMap<String, Value>,
 ) -> Option<TemporalValue> {
     if map.len() != 1 {

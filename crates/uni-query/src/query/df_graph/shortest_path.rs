@@ -17,7 +17,8 @@
 
 use crate::query::df_graph::GraphExecutionContext;
 use crate::query::df_graph::common::{
-    column_as_vid_array, compute_plan_properties, edge_struct_fields, new_node_list_builder,
+    arrow_err, column_as_vid_array, compute_plan_properties, edge_struct_fields,
+    new_node_list_builder,
 };
 use arrow::compute::take;
 use arrow_array::builder::{ListBuilder, StructBuilder, UInt64Builder};
@@ -494,8 +495,8 @@ impl GraphShortestPathStream {
                     })
                 })
                 .collect::<DFResult<Vec<_>>>()?;
-            let expanded_batch = RecordBatch::try_new(batch.schema(), expanded_columns)
-                .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+            let expanded_batch =
+                RecordBatch::try_new(batch.schema(), expanded_columns).map_err(arrow_err)?;
 
             self.build_output_batch(&expanded_batch, &all_paths)
         } else {
@@ -607,8 +608,7 @@ impl GraphShortestPathStream {
 
         self.metrics.record_output(num_rows);
 
-        RecordBatch::try_new(Arc::clone(&self.schema), columns)
-            .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+        RecordBatch::try_new(Arc::clone(&self.schema), columns).map_err(arrow_err)
     }
 
     /// Find an edge connecting src to dst.

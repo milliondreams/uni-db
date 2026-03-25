@@ -8,7 +8,7 @@ use uni_common::{Result, UniError};
 use uni_xervo::runtime::ModelRuntime;
 pub use uni_xervo::traits::{
     AudioOutput, ContentBlock, GeneratedImage, GenerationOptions, GenerationResult, ImageInput,
-    Message, MessageRole,
+    Message, MessageRole, TokenUsage,
 };
 
 fn into_uni_error<E: std::fmt::Display>(err: E) -> UniError {

@@ -368,7 +368,8 @@ for row in result["command_results"][0]["rows"]:
 - **Recursion**: Rules can reference themselves (positive recursion) or other rules
 - **Stratified negation**: `IS NOT` only for rules in earlier strata
 - **ALONG**: Carry state through recursive paths (e.g., cumulative cost)
-- **FOLD**: Aggregate over derived facts (SUM, MAX, COUNT)
+- **FOLD**: Aggregate over derived facts (SUM, MAX, COUNT, MNOR, MPROD)
+- **similar_to()**: Inline similarity scoring expression (vector, FTS, or multi-source fusion)
 - **BEST BY**: Keep optimal derivations per key group
 - **ASSUME...THEN**: Hypothetical what-if analysis (mutations rolled back)
 - **ABDUCE**: Find minimal graph changes to satisfy/prevent conditions

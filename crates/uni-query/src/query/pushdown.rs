@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Dragonscale Team
 
+//! Predicate pushdown and index-aware query routing.
+//!
+//! Routes WHERE predicates to the most selective execution path:
+//! UID index lookup → BTree prefix scan → JSON FTS → Lance columnar filter → residual.
+//! Includes SQL injection prevention for LIKE patterns (CWE-89) and UID validation (CWE-345).
+
 use std::collections::{HashMap, HashSet};
 use uni_cypher::ast::{BinaryOp, CypherLiteral, Expr, UnaryOp};
 
@@ -45,11 +51,14 @@ pub struct PushdownStrategy {
 /// 3. JSON FTS lookup (BM25 full-text search)
 /// 4. Lance scan filter (columnar scan with filter)
 /// 5. Residual (post-scan evaluation)
+// M-PUBLIC-DEBUG: Schema implements Debug, so the derived impl is sound.
+#[derive(Debug)]
 pub struct IndexAwareAnalyzer<'a> {
     schema: &'a Schema,
 }
 
 impl<'a> IndexAwareAnalyzer<'a> {
+    /// Create an analyzer bound to the given schema for index-aware predicate routing.
     pub fn new(schema: &'a Schema) -> Self {
         Self { schema }
     }
@@ -231,6 +240,8 @@ impl<'a> IndexAwareAnalyzer<'a> {
     }
 }
 
+/// Split result of predicate analysis: pushable vs residual.
+#[derive(Debug)]
 pub struct PredicateAnalysis {
     /// Predicates that can be pushed to storage
     pub pushable: Vec<Expr>,
@@ -240,15 +251,17 @@ pub struct PredicateAnalysis {
     pub required_properties: Vec<String>,
 }
 
-#[derive(Default)]
+/// Classifies predicates as pushable to Lance or residual (post-scan).
+#[derive(Debug, Default)]
 pub struct PredicateAnalyzer;
 
 impl PredicateAnalyzer {
+    /// Create a new analyzer for classifying predicates.
     pub fn new() -> Self {
         Self
     }
 
-    /// Analyze a predicate and determine pushdown strategy
+    /// Split a predicate into pushable (Lance) and residual (post-scan) parts.
     pub fn analyze(&self, predicate: &Expr, scan_variable: &str) -> PredicateAnalysis {
         let mut pushable = Vec::new();
         let mut residual = Vec::new();
@@ -299,7 +312,7 @@ impl PredicateAnalyzer {
         }
     }
 
-    /// Check if a predicate can be pushed to Lance
+    /// Returns `true` if a predicate can be pushed down to Lance storage.
     pub fn is_pushable(&self, expr: &Expr, variable: &str) -> bool {
         match expr {
             Expr::In {
@@ -543,6 +556,8 @@ fn flatten_ands(expr: &Expr) -> Vec<&Expr> {
     }
 }
 
+/// Converts pushable predicates to Lance SQL filter strings.
+#[derive(Debug)]
 pub struct LanceFilterGenerator;
 
 impl LanceFilterGenerator {

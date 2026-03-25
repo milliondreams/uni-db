@@ -99,6 +99,28 @@ Feature: ALONG Path-Carried Values
     Then evaluation should succeed
     And the derived relation 'path' should contain a fact where a.name = 'A' and b.name = 'C'
 
+  Scenario: Recursive ALONG with BEST BY converges on cyclic graph
+    Given having executed:
+      """
+      CREATE (a:Node {name: 'A'})-[:EDGE {weight: 1.0}]->(b:Node {name: 'B'})-[:EDGE {weight: 2.0}]->(c:Node {name: 'C'})-[:EDGE {weight: 3.0}]->(a)
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE shortest AS
+        MATCH (a:Node)-[e:EDGE]->(b:Node)
+        ALONG cost = e.weight
+        BEST BY cost ASC
+        YIELD KEY a, KEY b, cost
+      CREATE RULE shortest AS
+        MATCH (a:Node)-[e:EDGE]->(mid:Node)
+        WHERE mid IS shortest TO b
+        ALONG cost = prev.cost + e.weight
+        BEST BY cost ASC
+        YIELD KEY a, KEY b, cost
+      """
+    Then evaluation should succeed
+    And the derived relation 'shortest' should have 9 facts
+
   Scenario: ALONG combined with FOLD SUM
     Given having executed:
       """

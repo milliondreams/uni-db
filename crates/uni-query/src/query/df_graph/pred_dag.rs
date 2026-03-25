@@ -59,7 +59,6 @@ impl PredecessorDag {
     /// Records that to reach `(dst, dst_state)` at `depth`, one can come from
     /// `(src, src_state)` via edge `eid`. In shortest-only mode, predecessors
     /// at depths greater than the first-visit depth are skipped.
-    #[allow(clippy::too_many_arguments)]
     pub fn add_predecessor(
         &mut self,
         dst: Vid,
@@ -102,7 +101,10 @@ impl PredecessorDag {
     /// Iterates over depths in `[min_depth, max_depth]`, performing backward DFS
     /// through predecessor chains. Applies mode-specific filtering (Trail/Acyclic/Simple).
     /// The callback can return `ControlFlow::Break(())` to stop enumeration early.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "path enumeration requires full traversal context"
+    )]
     pub fn enumerate_paths<F>(
         &self,
         source: Vid,
@@ -190,7 +192,10 @@ impl PredecessorDag {
     }
 
     /// Internal backward DFS through predecessor chains.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "recursive DFS carries full path state"
+    )]
     fn dfs_backward<F>(
         &self,
         source: Vid,

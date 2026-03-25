@@ -9,6 +9,7 @@ pub mod builder;
 pub mod bulk;
 pub mod impl_locy;
 pub mod impl_query;
+pub mod locy_builder;
 pub mod query_builder;
 pub mod schema;
 pub mod session;
@@ -86,6 +87,11 @@ pub struct Uni {
     pub(crate) config: UniConfig,
     pub(crate) procedure_registry: Arc<uni_query::ProcedureRegistry>,
     pub(crate) shutdown_handle: Arc<ShutdownHandle>,
+    /// Session-level registry of pre-compiled Locy rules.
+    ///
+    /// Populated by `locy().compile()` and merged into subsequent `evaluate()`
+    /// calls so that rules defined once persist across multiple evaluations.
+    pub(crate) locy_rule_registry: Arc<std::sync::RwLock<impl_locy::LocyRuleRegistry>>,
 }
 
 impl Uni {
@@ -165,6 +171,9 @@ impl Uni {
             config: self.config.clone(),
             procedure_registry: self.procedure_registry.clone(),
             shutdown_handle,
+            locy_rule_registry: Arc::new(std::sync::RwLock::new(
+                impl_locy::LocyRuleRegistry::default(),
+            )),
         })
     }
 
@@ -1380,6 +1389,9 @@ impl UniBuilder {
             config: self.config,
             procedure_registry: Arc::new(uni_query::ProcedureRegistry::new()),
             shutdown_handle,
+            locy_rule_registry: Arc::new(std::sync::RwLock::new(
+                impl_locy::LocyRuleRegistry::default(),
+            )),
         })
     }
 

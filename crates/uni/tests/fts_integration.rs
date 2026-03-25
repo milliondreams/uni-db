@@ -125,3 +125,148 @@ async fn test_fts_query() -> Result<()> {
 
     Ok(())
 }
+
+/// CREATE FULLTEXT INDEX on existing (flushed) data should auto-build the
+/// physical tantivy index — no manual `rebuild_indexes()` required.
+#[tokio::test]
+async fn test_fts_auto_build_on_create_index() -> Result<()> {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let dir = tempdir()?;
+    let path = dir.path();
+
+    let schema_manager =
+        uni_db::core::schema::SchemaManager::load(&path.join("schema.json")).await?;
+    schema_manager.add_label("Doc")?;
+    schema_manager.add_property("Doc", "title", DataType::String, false)?;
+    schema_manager.add_property("Doc", "content", DataType::String, false)?;
+    schema_manager.save().await?;
+
+    let db = uni_db::Uni::open(path.to_str().unwrap()).build().await?;
+
+    // Insert and flush so data lives in Lance
+    db.execute(r#"CREATE (:Doc { title: "Rust Guide", content: "Memory safety without garbage collection." })"#).await?;
+    db.execute(r#"CREATE (:Doc { title: "Go Manual", content: "Concurrency with goroutines and channels." })"#).await?;
+    db.flush().await?;
+
+    // Create FTS index — should auto-build physical index (no rebuild_indexes needed)
+    db.execute("CREATE FULLTEXT INDEX doc_content_fts FOR (d:Doc) ON EACH [d.content]")
+        .await?;
+
+    // Query via FTS procedure — should find results without manual rebuild
+    let results = db
+        .query(
+            "CALL uni.fts.query('Doc', 'content', 'memory safety', 10) \
+             YIELD node \
+             RETURN node.title AS title",
+        )
+        .await?;
+    assert_eq!(
+        results.len(),
+        1,
+        "FTS should find 'Rust Guide' without manual rebuild_indexes; got {} results",
+        results.len()
+    );
+    let title: String = results.rows()[0].get("title")?;
+    assert_eq!(title, "Rust Guide");
+
+    Ok(())
+}
+
+/// FTS queries must see unflushed L0 writes and respect L0 tombstones.
+#[tokio::test]
+async fn test_fts_query_sees_l0_writes() -> Result<()> {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let dir = tempdir()?;
+    let path = dir.path();
+
+    // 1. Schema setup
+    let schema_manager =
+        uni_db::core::schema::SchemaManager::load(&path.join("schema.json")).await?;
+    schema_manager.add_label("Article")?;
+    schema_manager.add_property("Article", "title", DataType::String, false)?;
+    schema_manager.add_property("Article", "body", DataType::String, false)?;
+    schema_manager.save().await?;
+
+    let db = uni_db::Uni::open(path.to_str().unwrap()).build().await?;
+
+    // 2. Insert initial articles and flush to Lance
+    db.execute(r#"CREATE (:Article { title: "Alpha", body: "The quick brown fox jumps over the lazy dog." })"#).await?;
+    db.execute(r#"CREATE (:Article { title: "Beta", body: "Machine learning transforms modern data pipelines." })"#).await?;
+    db.flush().await?;
+
+    // 3. Create FTS index and rebuild so tantivy picks up the flushed data
+    db.execute("CREATE FULLTEXT INDEX article_body_fts FOR (a:Article) ON EACH [a.body]")
+        .await?;
+    db.rebuild_indexes("Article", false).await?;
+
+    // Sanity: flushed data is findable via FTS
+    let flushed = db
+        .query(
+            "CALL uni.fts.query('Article', 'body', 'machine learning', 10) \
+             YIELD node \
+             RETURN node.title AS title",
+        )
+        .await?;
+    assert_eq!(flushed.len(), 1, "Flushed article should be found via FTS");
+    let title: String = flushed.rows()[0].get("title")?;
+    assert_eq!(title, "Beta");
+
+    // 4. Insert a NEW article — do NOT flush (stays in L0)
+    db.execute(r#"CREATE (:Article { title: "Gamma", body: "Quantum computing breakthroughs in machine learning." })"#).await?;
+
+    // 5. FTS query must find the L0-only article
+    let l0_results = db
+        .query(
+            "CALL uni.fts.query('Article', 'body', 'quantum computing', 10) \
+             YIELD node \
+             RETURN node.title AS title",
+        )
+        .await?;
+    assert!(
+        !l0_results.is_empty(),
+        "L0-only article 'Gamma' should appear in FTS results, got 0 results",
+    );
+    let titles: Vec<String> = l0_results
+        .rows()
+        .iter()
+        .map(|r| r.get("title").unwrap())
+        .collect();
+    assert!(
+        titles.contains(&"Gamma".to_string()),
+        "L0-only article 'Gamma' not found; got {:?}",
+        titles
+    );
+
+    // 6. Delete a flushed article via Cypher (tombstone in L0, not flushed)
+    db.execute("MATCH (a:Article) WHERE a.title = 'Beta' DELETE a")
+        .await?;
+
+    // 7. FTS query for the deleted article's keywords should exclude it
+    let after_delete = db
+        .query(
+            "CALL uni.fts.query('Article', 'body', 'machine learning', 10) \
+             YIELD node \
+             RETURN node.title AS title",
+        )
+        .await?;
+    let titles_after: Vec<String> = after_delete
+        .rows()
+        .iter()
+        .map(|r| r.get("title").unwrap())
+        .collect();
+    assert!(
+        !titles_after.contains(&"Beta".to_string()),
+        "Deleted article 'Beta' should not appear in FTS results; got {:?}",
+        titles_after
+    );
+    // The L0 article 'Gamma' should still appear (it also mentions "machine learning")
+    assert!(
+        titles_after.contains(&"Gamma".to_string()),
+        "L0 article 'Gamma' should still appear after deleting Beta; got {:?}",
+        titles_after
+    );
+
+    Ok(())
+}

@@ -40,6 +40,7 @@ USE      = @{ ^"use" ~ !ident_char }
 PRIORITY = @{ ^"priority" ~ !ident_char }
 NEW      = @{ ^"new" ~ !ident_char }
 EXPORT   = @{ ^"export" ~ !ident_char }
+PROB     = @{ ^"prob" ~ !ident_char }
 
 // Locy reserved words — added to the reserved keyword set so that
 // the Locy parser rejects them as bare identifiers.
@@ -194,7 +195,16 @@ locy_yield_clause = { YIELD ~ locy_yield_item ~ ("," ~ locy_yield_item)* }
 
 locy_yield_item = {
     key_projection
+    | prob_projection
     | expression ~ (AS ~ alias_identifier)?
+}
+
+// PROB annotation on yield items: marks column as containing probability values.
+// Forms: `expr AS alias PROB`, `expr AS PROB`, `expr PROB`
+prob_projection = {
+    expression ~ AS ~ alias_identifier ~ PROB
+    | expression ~ AS ~ PROB
+    | expression ~ PROB
 }
 
 key_projection = { KEY ~ locy_identifier }
@@ -324,7 +334,7 @@ derive_edge_spec = {
 
 goal_query = {
     QUERY_KW ~ rule_name
-    ~ WHERE ~ expression
+    ~ (WHERE ~ expression)?
     ~ goal_return_clause?
 }
 
@@ -379,7 +389,7 @@ assume_body = {
 
 abduce_query = {
     ABDUCE ~ NOT? ~ rule_name
-    ~ WHERE ~ expression
+    ~ (WHERE ~ expression)?
     ~ abduce_return_clause?
 }
 
@@ -401,7 +411,7 @@ abduce_return_clause = {
 
 explain_rule_query = {
     EXPLAIN ~ RULE ~ rule_name
-    ~ WHERE ~ expression
+    ~ (WHERE ~ expression)?
     ~ explain_rule_return_clause?
 }
 

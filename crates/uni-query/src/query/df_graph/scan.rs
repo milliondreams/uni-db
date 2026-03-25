@@ -25,7 +25,7 @@
 
 use crate::query::datetime::parse_datetime_utc;
 use crate::query::df_graph::GraphExecutionContext;
-use crate::query::df_graph::common::{compute_plan_properties, labels_data_type};
+use crate::query::df_graph::common::{arrow_err, compute_plan_properties, labels_data_type};
 use arrow_array::builder::{
     BinaryBuilder, BooleanBuilder, Date32Builder, FixedSizeListBuilder, Float32Builder,
     Float64Builder, Int32Builder, Int64Builder, ListBuilder, StringBuilder,
@@ -567,7 +567,7 @@ fn merge_lance_and_l0(
     match (lance_deduped, has_l0) {
         (Some(lance), true) => {
             let combined = arrow::compute::concat_batches(internal_schema, &[lance, l0_batch])
-                .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+                .map_err(arrow_err)?;
             Ok(Some(mvcc_dedup_batch_by(&combined, id_column)?))
         }
         (Some(lance), false) => Ok(Some(lance)),
@@ -675,6 +675,132 @@ fn append_value_as_cypher_binary(
     }
 }
 
+/// Build the `_all_props` column by overlaying L0 buffer properties onto
+/// the batch's `props_json` column.
+///
+/// For each row, decodes the stored CypherValue blob, merges in any L0 buffer
+/// properties (in visibility order: pending → current → transaction), and
+/// re-encodes the result. This ensures `properties()` and `keys()` reflect
+/// uncommitted L0 mutations.
+fn build_all_props_column_with_l0_overlay(
+    num_rows: usize,
+    vid_arr: &UInt64Array,
+    props_arr: Option<&arrow_array::LargeBinaryArray>,
+    l0_ctx: &crate::query::df_graph::L0Context,
+) -> ArrayRef {
+    let mut builder = arrow_array::builder::LargeBinaryBuilder::new();
+    for i in 0..num_rows {
+        let vid = Vid::from(vid_arr.value(i));
+
+        // 1. Decode props_json blob from storage
+        let mut merged_props = serde_json::Map::new();
+        if let Some(arr) = props_arr
+            && !arr.is_null(i)
+            && let Ok(uni_common::Value::Map(map)) =
+                uni_common::cypher_value_codec::decode(arr.value(i))
+        {
+            for (k, v) in map {
+                let json_val: serde_json::Value = v.into();
+                merged_props.insert(k, json_val);
+            }
+        }
+
+        // 2. Overlay L0 properties (visibility order: pending → current → transaction)
+        for l0 in l0_ctx.iter_l0_buffers() {
+            let guard = l0.read();
+            if let Some(l0_props) = guard.vertex_properties.get(&vid) {
+                for (k, v) in l0_props {
+                    let json_val: serde_json::Value = v.clone().into();
+                    merged_props.insert(k.clone(), json_val);
+                }
+            }
+        }
+
+        // 3. Encode merged result
+        if merged_props.is_empty() {
+            builder.append_null();
+        } else {
+            let json_obj = serde_json::Value::Object(merged_props);
+            match encode_cypher_value(&json_obj) {
+                Ok(bytes) => builder.append_value(bytes),
+                Err(_) => builder.append_null(),
+            }
+        }
+    }
+    Arc::new(builder.finish())
+}
+
+/// Build `_all_props` for a schema-based scan by merging:
+/// 1. Schema-defined columns from the batch
+/// 2. Overflow_json properties
+/// 3. L0 buffer properties
+fn build_all_props_column_for_schema_scan(
+    batch: &RecordBatch,
+    vid_arr: &UInt64Array,
+    overflow_arr: Option<&arrow_array::LargeBinaryArray>,
+    projected_properties: &[String],
+    l0_ctx: &crate::query::df_graph::L0Context,
+) -> ArrayRef {
+    // Collect schema-defined property column names (non-internal, non-overflow, non-_all_props)
+    let schema_props: Vec<&str> = projected_properties
+        .iter()
+        .filter(|p| *p != "overflow_json" && *p != "_all_props" && !p.starts_with('_'))
+        .map(String::as_str)
+        .collect();
+
+    let num_rows = batch.num_rows();
+    let mut builder = arrow_array::builder::LargeBinaryBuilder::new();
+    for i in 0..num_rows {
+        let vid = Vid::from(vid_arr.value(i));
+        let mut merged_props = serde_json::Map::new();
+
+        // 1. Schema-defined columns
+        for &prop in &schema_props {
+            if let Some(col) = batch.column_by_name(prop) {
+                let val = uni_store::storage::arrow_convert::arrow_to_value(col.as_ref(), i, None);
+                if !val.is_null() {
+                    let json_val: serde_json::Value = val.into();
+                    merged_props.insert(prop.to_string(), json_val);
+                }
+            }
+        }
+
+        // 2. Overflow_json properties
+        if let Some(arr) = overflow_arr
+            && !arr.is_null(i)
+            && let Ok(uni_common::Value::Map(map)) =
+                uni_common::cypher_value_codec::decode(arr.value(i))
+        {
+            for (k, v) in map {
+                let json_val: serde_json::Value = v.into();
+                merged_props.insert(k, json_val);
+            }
+        }
+
+        // 3. L0 buffer overlay (pending → current → transaction)
+        for l0 in l0_ctx.iter_l0_buffers() {
+            let guard = l0.read();
+            if let Some(l0_props) = guard.vertex_properties.get(&vid) {
+                for (k, v) in l0_props {
+                    let json_val: serde_json::Value = v.clone().into();
+                    merged_props.insert(k.clone(), json_val);
+                }
+            }
+        }
+
+        if merged_props.is_empty() {
+            builder.append_null();
+        } else {
+            let json_obj = serde_json::Value::Object(merged_props);
+            match encode_cypher_value(&json_obj) {
+                Ok(bytes) => builder.append_value(bytes),
+                Err(_) => builder.append_null(),
+            }
+        }
+    }
+    Arc::new(builder.finish())
+}
+
 /// MVCC deduplication: keep only the highest-version row for each unique value
 /// in the given `id_column`.
 ///
@@ -715,8 +841,7 @@ fn mvcc_dedup_batch_by(batch: &RecordBatch, id_column: &str) -> DFResult<RecordB
             }),
         },
     ];
-    let indices = arrow::compute::lexsort_to_indices(&sort_columns, None)
-        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+    let indices = arrow::compute::lexsort_to_indices(&sort_columns, None).map_err(arrow_err)?;
 
     // Reorder all columns by sorted indices
     let sorted_columns: Vec<ArrayRef> = batch
@@ -724,9 +849,8 @@ fn mvcc_dedup_batch_by(batch: &RecordBatch, id_column: &str) -> DFResult<RecordB
         .iter()
         .map(|col| arrow::compute::take(col.as_ref(), &indices, None))
         .collect::<Result<_, _>>()
-        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
-    let sorted = RecordBatch::try_new(batch.schema(), sorted_columns)
-        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+        .map_err(arrow_err)?;
+    let sorted = RecordBatch::try_new(batch.schema(), sorted_columns).map_err(arrow_err)?;
 
     // Build dedup mask: keep first occurrence of each id
     let sorted_id = sorted
@@ -747,8 +871,7 @@ fn mvcc_dedup_batch_by(batch: &RecordBatch, id_column: &str) -> DFResult<RecordB
     }
 
     let mask = arrow_array::BooleanArray::from(keep);
-    arrow::compute::filter_record_batch(&sorted, &mask)
-        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+    arrow::compute::filter_record_batch(&sorted, &mask).map_err(arrow_err)
 }
 
 /// Filter out edge rows where `op != 0` (non-INSERT) after MVCC dedup.
@@ -765,8 +888,7 @@ fn filter_deleted_edge_ops(batch: &RecordBatch) -> DFResult<RecordBatch> {
     };
     let keep: Vec<bool> = (0..op_col.len()).map(|i| op_col.value(i) == 0).collect();
     let mask = arrow_array::BooleanArray::from(keep);
-    arrow::compute::filter_record_batch(batch, &mask)
-        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+    arrow::compute::filter_record_batch(batch, &mask).map_err(arrow_err)
 }
 
 /// Filter out rows where `_deleted = true` after MVCC dedup.
@@ -785,8 +907,7 @@ fn filter_deleted_rows(batch: &RecordBatch) -> DFResult<RecordBatch> {
         .map(|i| !deleted_col.value(i))
         .collect();
     let mask = arrow_array::BooleanArray::from(keep);
-    arrow::compute::filter_record_batch(batch, &mask)
-        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+    arrow::compute::filter_record_batch(batch, &mask).map_err(arrow_err)
 }
 
 /// Filter out rows whose `_vid` appears in L0 tombstones.
@@ -823,8 +944,7 @@ fn filter_l0_tombstones(
         .map(|i| !tombstones.contains(&vid_col.value(i)))
         .collect();
     let mask = arrow_array::BooleanArray::from(keep);
-    arrow::compute::filter_record_batch(batch, &mask)
-        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+    arrow::compute::filter_record_batch(batch, &mask).map_err(arrow_err)
 }
 
 /// Filter out rows whose `eid` appears in L0 edge tombstones.
@@ -861,8 +981,7 @@ fn filter_l0_edge_tombstones(
         .map(|i| !tombstones.contains(&eid_col.value(i)))
         .collect();
     let mask = arrow_array::BooleanArray::from(keep);
-    arrow::compute::filter_record_batch(batch, &mask)
-        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+    arrow::compute::filter_record_batch(batch, &mask).map_err(arrow_err)
 }
 
 /// Build a RecordBatch from L0 buffer data for a given label, matching the
@@ -980,8 +1099,7 @@ fn build_l0_vertex_batch(
         }
     }
 
-    RecordBatch::try_new(lance_schema.clone(), columns)
-        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+    RecordBatch::try_new(lance_schema.clone(), columns).map_err(arrow_err)
 }
 
 /// Build a single Arrow column from L0 property values.
@@ -1135,8 +1253,7 @@ fn build_l0_edge_batch(
         }
     }
 
-    RecordBatch::try_new(internal_schema.clone(), columns)
-        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+    RecordBatch::try_new(internal_schema.clone(), columns).map_err(arrow_err)
 }
 
 /// Build a single Arrow column from L0 edge property values.
@@ -1275,6 +1392,41 @@ fn map_to_output_schema(
                     ));
                 }
             }
+        } else if prop == "_all_props" {
+            // Build _all_props from overflow_json + L0 overlay.
+            // Fast path: if no L0 buffer has vertex property mutations AND
+            // there are no schema columns to merge, pass through overflow_json.
+            let any_l0_has_vertex_props = l0_ctx.iter_l0_buffers().any(|l0| {
+                let guard = l0.read();
+                !guard.vertex_properties.is_empty()
+            });
+            // Check if this label has schema-defined columns (besides system columns)
+            let has_schema_cols = projected_properties
+                .iter()
+                .any(|p| p != "overflow_json" && p != "_all_props" && !p.starts_with('_'));
+
+            if !any_l0_has_vertex_props && !has_schema_cols {
+                // No L0 mutations, no schema cols to merge: overflow_json IS _all_props
+                match batch.column_by_name("overflow_json") {
+                    Some(col) => columns.push(col.clone()),
+                    None => {
+                        columns.push(arrow_array::new_null_array(
+                            &DataType::LargeBinary,
+                            batch.num_rows(),
+                        ));
+                    }
+                }
+            } else {
+                // Need to merge: schema columns + overflow_json + L0 overlay
+                let col = build_all_props_column_for_schema_scan(
+                    batch,
+                    vid_arr,
+                    overflow_arr,
+                    projected_properties,
+                    l0_ctx,
+                );
+                columns.push(col);
+            }
         } else {
             match batch.column_by_name(prop) {
                 Some(col) => columns.push(col.clone()),
@@ -1294,8 +1446,7 @@ fn map_to_output_schema(
         }
     }
 
-    RecordBatch::try_new(output_schema.clone(), columns)
-        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+    RecordBatch::try_new(output_schema.clone(), columns).map_err(arrow_err)
 }
 
 /// Map an internal DeltaDataset-schema edge batch to the DataFusion output schema.
@@ -1401,8 +1552,7 @@ fn map_edge_to_output_schema(
         }
     }
 
-    RecordBatch::try_new(output_schema.clone(), columns)
-        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+    RecordBatch::try_new(output_schema.clone(), columns).map_err(arrow_err)
 }
 
 /// Columnar-first vertex scan: single Lance query with MVCC dedup and L0 overlay.
@@ -2018,8 +2168,7 @@ fn build_l0_schemaless_vertex_batch(
         }
     }
 
-    RecordBatch::try_new(internal_schema.clone(), columns)
-        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+    RecordBatch::try_new(internal_schema.clone(), columns).map_err(arrow_err)
 }
 
 /// Map an internal-schema schemaless batch to the DataFusion output schema.
@@ -2107,15 +2256,30 @@ fn map_to_schemaless_output_schema(
 
     for prop in projected_properties {
         if prop == "_all_props" {
-            // Optimization: _all_props IS props_json — passthrough directly
-            match props_col {
-                Some(col) => columns.push(col.clone()),
-                None => {
-                    columns.push(arrow_array::new_null_array(
-                        &DataType::LargeBinary,
-                        batch.num_rows(),
-                    ));
+            // Fast path: if no L0 buffer has vertex property mutations,
+            // the raw props_json passthrough is correct.
+            let any_l0_has_vertex_props = l0_ctx.iter_l0_buffers().any(|l0| {
+                let guard = l0.read();
+                !guard.vertex_properties.is_empty()
+            });
+            if !any_l0_has_vertex_props {
+                match props_col {
+                    Some(col) => columns.push(col.clone()),
+                    None => {
+                        columns.push(arrow_array::new_null_array(
+                            &DataType::LargeBinary,
+                            batch.num_rows(),
+                        ));
+                    }
                 }
+            } else {
+                let col = build_all_props_column_with_l0_overlay(
+                    batch.num_rows(),
+                    vid_arr,
+                    props_arr,
+                    l0_ctx,
+                );
+                columns.push(col);
             }
         } else {
             // Extract individual property from CypherValue blob with L0 overlay
@@ -2125,8 +2289,7 @@ fn map_to_schemaless_output_schema(
         }
     }
 
-    RecordBatch::try_new(output_schema.clone(), columns)
-        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+    RecordBatch::try_new(output_schema.clone(), columns).map_err(arrow_err)
 }
 
 /// Get the property value for a VID, returning None if not found.

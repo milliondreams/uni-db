@@ -1,0 +1,28 @@
+{
+  "edge_types": {
+    "CAUSE": { "id": 1, "src_labels": [], "dst_labels": [] },
+    "HAS": { "id": 2, "src_labels": [], "dst_labels": [] }
+  },
+  "indexes": [],
+  "labels": {
+    "Node": { "id": 1 },
+    "Rating": { "id": 2 },
+    "Doc": { "id": 3 }
+  },
+  "properties": {
+    "Node": {
+      "name": { "type": "String", "nullable": true }
+    },
+    "Doc": {
+      "name": { "type": "String", "nullable": true },
+      "embedding": { "type": "CypherValue", "nullable": true }
+    },
+    "CAUSE": {
+      "prob": { "type": "Float64", "nullable": true }
+    },
+    "HAS": {
+      "score": { "type": "Float64", "nullable": true }
+    }
+  },
+  "schema_version": 1
+}

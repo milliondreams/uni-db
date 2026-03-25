@@ -25,11 +25,10 @@ use super::locy_delta::RowStore;
 
 use super::locy_ast_builder::value_to_expr;
 use super::locy_eval::eval_expr;
-use super::locy_explain::{DerivationTracker, explain_rule};
+use super::locy_explain::{ProvenanceStore, explain_rule};
 use super::locy_traits::LocyExecutionContext;
 
 /// Evaluate an ABDUCE query using a three-phase pipeline.
-#[allow(clippy::too_many_arguments)]
 pub async fn evaluate_abduce(
     query: &AbduceQuery,
     program: &CompiledProgram,
@@ -37,7 +36,7 @@ pub async fn evaluate_abduce(
     config: &LocyConfig,
     derived_store: &mut RowStore,
     stats: &mut LocyStats,
-    tracker: Option<&DerivationTracker>,
+    tracker: Option<&ProvenanceStore>,
 ) -> Result<AbductionResult, LocyError> {
     let rule_name = query.rule_name.to_string();
     let rule = program
@@ -51,14 +50,18 @@ pub async fn evaluate_abduce(
     let facts = ctx.lookup_derived(&rule_name)?;
 
     // Filter by WHERE expression
-    let matching: Vec<Row> = facts
-        .into_iter()
-        .filter(|row| {
-            eval_expr(&query.where_expr, row)
-                .map(|v| v.as_bool().unwrap_or(false))
-                .unwrap_or(false)
-        })
-        .collect();
+    let matching: Vec<Row> = if let Some(where_expr) = &query.where_expr {
+        facts
+            .into_iter()
+            .filter(|row| {
+                eval_expr(where_expr, row)
+                    .map(|v| v.as_bool().unwrap_or(false))
+                    .unwrap_or(false)
+            })
+            .collect()
+    } else {
+        facts
+    };
 
     // Phase 1: Build derivation tree
     let explain_query = uni_cypher::locy_ast::ExplainRule {
@@ -74,12 +77,13 @@ pub async fn evaluate_abduce(
         derived_store,
         stats,
         tracker,
+        None,
     )
     .await?;
 
     // Phase 2: Generate candidate modifications from tree
     let mut candidates: Vec<Modification> = if query.negated {
-        extract_removal_candidates(&derivation_tree, rule, &matching)
+        extract_removal_candidates(&derivation_tree, rule, &matching, program)
     } else {
         extract_addition_candidates(rule)
     };
@@ -93,7 +97,7 @@ pub async fn evaluate_abduce(
             &candidate,
             query.negated,
             &rule_name,
-            &query.where_expr,
+            query.where_expr.as_ref(),
             program,
             ctx,
             config,
@@ -128,21 +132,32 @@ fn extract_removal_candidates(
     tree: &uni_locy::DerivationNode,
     rule: &CompiledRule,
     _matching: &[Row],
+    program: &CompiledProgram,
 ) -> Vec<Modification> {
     let mut candidates = Vec::new();
-    collect_leaf_candidates(tree, rule, &mut candidates);
+    collect_leaf_candidates(tree, rule, program, &mut candidates);
     candidates
 }
 
 /// Recursively collect candidates from derivation tree leaves.
+///
+/// Each leaf node carries a `rule` field naming the rule that produced it —
+/// this may differ from the top-level `rule` parameter when IS-ref children
+/// come from a different rule (e.g. a `scored_signal` leaf inside a
+/// `threat_level` derivation).  We always look up the effective rule from
+/// `program` so that `clause.match_pattern` corresponds to the correct rule.
 fn collect_leaf_candidates(
     node: &uni_locy::DerivationNode,
     rule: &CompiledRule,
+    program: &CompiledProgram,
     candidates: &mut Vec<Modification>,
 ) {
     if node.children.is_empty() && node.graph_fact.is_some() {
-        if node.clause_index < rule.clauses.len() {
-            let clause = &rule.clauses[node.clause_index];
+        // Use the node's own rule when available; fall back to the caller's rule.
+        let effective_rule: &CompiledRule = program.rule_catalog.get(&node.rule).unwrap_or(rule);
+
+        if node.clause_index < effective_rule.clauses.len() {
+            let clause = &effective_rule.clauses[node.clause_index];
             for element in &clause.match_pattern.paths {
                 extract_edge_candidates(element, &node.bindings, candidates);
             }
@@ -173,7 +188,7 @@ fn collect_leaf_candidates(
     }
 
     for child in &node.children {
-        collect_leaf_candidates(child, rule, candidates);
+        collect_leaf_candidates(child, rule, program, candidates);
     }
 }
 
@@ -275,12 +290,15 @@ fn extract_addition_candidates(rule: &CompiledRule) -> Vec<Modification> {
 }
 
 /// Phase 3: Validate a single modification via ASSUME (savepoint lifecycle).
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "validation requires full program and execution context"
+)]
 async fn validate_modification(
     modification: &Modification,
     negated: bool,
     rule_name: &str,
-    where_expr: &Expr,
+    where_expr: Option<&Expr>,
     program: &CompiledProgram,
     ctx: &dyn LocyExecutionContext,
     config: &LocyConfig,
@@ -309,14 +327,18 @@ async fn validate_modification(
         .map(|r| r.rows.clone())
         .unwrap_or_default();
 
-    let matching: Vec<Row> = facts
-        .into_iter()
-        .filter(|row| {
-            eval_expr(where_expr, row)
-                .map(|v| v.as_bool().unwrap_or(false))
-                .unwrap_or(false)
-        })
-        .collect();
+    let matching: Vec<Row> = if let Some(where_expr) = where_expr {
+        facts
+            .into_iter()
+            .filter(|row| {
+                eval_expr(where_expr, row)
+                    .map(|v| v.as_bool().unwrap_or(false))
+                    .unwrap_or(false)
+            })
+            .collect()
+    } else {
+        facts
+    };
 
     // Rollback
     ctx.rollback_savepoint(savepoint_id)

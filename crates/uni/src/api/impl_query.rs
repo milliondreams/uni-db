@@ -476,7 +476,7 @@ impl Uni {
         Ok(QueryResult {
             columns,
             rows,
-            warnings: Vec::new(),
+            warnings: executor.take_warnings(),
         })
     }
 

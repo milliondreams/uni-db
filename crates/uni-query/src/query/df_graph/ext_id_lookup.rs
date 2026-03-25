@@ -15,7 +15,7 @@
 //! - `{variable}.{property}` - materialized properties
 
 use crate::query::df_graph::GraphExecutionContext;
-use crate::query::df_graph::common::compute_plan_properties;
+use crate::query::df_graph::common::{arrow_err, compute_plan_properties};
 use arrow_array::builder::StringBuilder;
 use arrow_array::{ArrayRef, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -411,8 +411,7 @@ fn build_null_row(
         }
     }
 
-    RecordBatch::try_new(schema.clone(), columns)
-        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+    RecordBatch::try_new(schema.clone(), columns).map_err(arrow_err)
 }
 
 /// Build a result row with the found vertex data.
@@ -455,8 +454,7 @@ fn build_result_row(
         columns.push(Arc::new(builder.finish()));
     }
 
-    RecordBatch::try_new(schema.clone(), columns)
-        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+    RecordBatch::try_new(schema.clone(), columns).map_err(arrow_err)
 }
 
 #[cfg(test)]

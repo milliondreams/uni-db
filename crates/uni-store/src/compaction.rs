@@ -3,13 +3,18 @@
 
 use std::time::{Duration, SystemTime};
 
+/// Trigger strategy for a compaction run.
 #[derive(Debug, Clone, Copy)]
 pub enum CompactionTask {
+    /// Compact when the number of L1 runs exceeds a threshold.
     ByRunCount,
+    /// Compact when the total L1 size exceeds a byte threshold.
     BySize,
+    /// Compact when the oldest L1 run exceeds an age threshold.
     ByAge,
 }
 
+/// Statistics produced by a single compaction run.
 #[derive(Debug, Clone, Default)]
 pub struct CompactionStats {
     pub files_compacted: usize,
@@ -19,7 +24,8 @@ pub struct CompactionStats {
     pub crdt_merges: usize,
 }
 
-#[derive(Debug, Clone)]
+/// Snapshot of the current compaction state for observability.
+#[derive(Debug, Clone, Default)]
 pub struct CompactionStatus {
     pub l1_runs: usize,
     pub l1_size_bytes: u64,
@@ -29,19 +35,4 @@ pub struct CompactionStatus {
     pub last_compaction: Option<SystemTime>,
     pub total_compactions: u64,
     pub total_bytes_compacted: u64,
-}
-
-impl Default for CompactionStatus {
-    fn default() -> Self {
-        Self {
-            l1_runs: 0,
-            l1_size_bytes: 0,
-            oldest_l1_age: Duration::from_secs(0),
-            compaction_in_progress: false,
-            compaction_pending: 0,
-            last_compaction: None,
-            total_compactions: 0,
-            total_bytes_compacted: 0,
-        }
-    }
 }

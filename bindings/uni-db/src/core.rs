@@ -17,6 +17,7 @@ use uni_common::core::schema::{
 
 // Re-export types used by the sync and async API modules.
 pub use ::uni_db::api::schema::LabelInfo as UniLabelInfo;
+pub use ::uni_db::query_crate::QueryCursor;
 pub use ::uni_db::{ExplainOutput, ProfileOutput, QueryResult, Row};
 
 // ============================================================================
@@ -55,6 +56,27 @@ pub async fn query_builder_core(
         builder = builder.max_memory(m);
     }
     builder.fetch_all().await.map_err(|e| e.to_string())
+}
+
+/// Open a streaming cursor for a query with parameters, timeout, and memory limit.
+pub async fn query_cursor_core(
+    db: &Uni,
+    cypher: &str,
+    params: HashMap<String, Value>,
+    timeout_secs: Option<f64>,
+    max_memory: Option<usize>,
+) -> Result<QueryCursor, String> {
+    let mut builder = db.query_with(cypher);
+    for (k, v) in params {
+        builder = builder.param(&k, v);
+    }
+    if let Some(t) = timeout_secs {
+        builder = builder.timeout(Duration::from_secs_f64(t));
+    }
+    if let Some(m) = max_memory {
+        builder = builder.max_memory(m);
+    }
+    builder.query_cursor().await.map_err(|e| e.to_string())
 }
 
 /// Execute a mutation query, returning affected row count.
@@ -335,6 +357,124 @@ pub async fn bulk_insert_edges_core(
 }
 
 // ============================================================================
+// Xervo Core
+// ============================================================================
+
+/// Embed texts using a configured Xervo model alias.
+pub async fn xervo_embed_core(
+    db: &Uni,
+    alias: &str,
+    texts: Vec<String>,
+) -> Result<Vec<Vec<f32>>, String> {
+    let xervo = db.xervo().map_err(|e| e.to_string())?;
+    let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+    xervo
+        .embed(alias, &text_refs)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Generate text using structured messages via a configured Xervo model alias.
+pub async fn xervo_generate_core(
+    db: &Uni,
+    alias: &str,
+    messages: Vec<(String, String)>,
+    max_tokens: Option<usize>,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+) -> Result<::uni_db::api::xervo::GenerationResult, String> {
+    use ::uni_db::api::xervo::{GenerationOptions, Message};
+    let xervo = db.xervo().map_err(|e| e.to_string())?;
+    let rust_messages: Vec<Message> = messages
+        .into_iter()
+        .map(|(role, content)| match role.as_str() {
+            "user" => Message::user(content),
+            "assistant" => Message::assistant(content),
+            "system" => Message::system(content),
+            _ => Message::user(content),
+        })
+        .collect();
+    let opts = GenerationOptions {
+        max_tokens,
+        temperature,
+        top_p,
+        width: None,
+        height: None,
+    };
+    xervo
+        .generate(alias, &rust_messages, opts)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+// ============================================================================
+// Snapshot Core
+// ============================================================================
+
+/// Create a point-in-time snapshot of the database.
+pub async fn create_snapshot_core(db: &Uni, name: Option<String>) -> Result<String, String> {
+    db.create_snapshot(name.as_deref())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// List all available snapshots.
+pub async fn list_snapshots_core(
+    db: &Uni,
+) -> Result<Vec<uni_common::core::snapshot::SnapshotManifest>, String> {
+    db.list_snapshots().await.map_err(|e| e.to_string())
+}
+
+/// Restore the database to a specific snapshot.
+pub async fn restore_snapshot_core(db: &Uni, snapshot_id: &str) -> Result<(), String> {
+    db.restore_snapshot(snapshot_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+// ============================================================================
+// Index Admin Core
+// ============================================================================
+
+/// Get status of background index rebuild tasks.
+pub async fn index_rebuild_status_core(
+    db: &Uni,
+) -> Result<Vec<uni_store::storage::IndexRebuildTask>, String> {
+    db.index_rebuild_status().await.map_err(|e| e.to_string())
+}
+
+/// Retry failed index rebuild tasks.
+pub async fn retry_index_rebuilds_core(db: &Uni) -> Result<Vec<String>, String> {
+    db.retry_index_rebuilds().await.map_err(|e| e.to_string())
+}
+
+/// Force rebuild indexes for a label (async_ = true runs in background).
+pub async fn rebuild_indexes_core(
+    db: &Uni,
+    label: &str,
+    async_: bool,
+) -> Result<Option<String>, String> {
+    db.rebuild_indexes(label, async_)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Check if an index is currently being rebuilt for a label.
+pub async fn is_index_building_core(db: &Uni, label: &str) -> Result<bool, String> {
+    db.is_index_building(label).await.map_err(|e| e.to_string())
+}
+
+/// List all indexes defined on a specific label.
+pub fn list_indexes_core(db: &Uni, label: &str) -> Vec<uni_common::core::schema::IndexDefinition> {
+    db.list_indexes(label)
+}
+
+/// List all indexes in the database.
+pub fn list_all_indexes_core(db: &Uni) -> Vec<uni_common::core::schema::IndexDefinition> {
+    db.list_all_indexes()
+}
+
+// ============================================================================
 // Locy Core
 // ============================================================================
 
@@ -372,6 +512,7 @@ pub enum OpenMode {
 }
 
 /// Build and open a Uni database.
+#[allow(clippy::too_many_arguments)]
 pub async fn build_database_core(
     uri: &str,
     mode: OpenMode,
@@ -379,6 +520,11 @@ pub async fn build_database_core(
     hybrid_remote: Option<&str>,
     cache_size: Option<usize>,
     parallelism: Option<usize>,
+    schema_file: Option<&str>,
+    xervo_catalog_json: Option<&str>,
+    xervo_catalog_file: Option<&str>,
+    cloud_config: Option<uni_common::CloudStorageConfig>,
+    uni_config: Option<uni_common::UniConfig>,
 ) -> Result<Uni, String> {
     let mut builder = match mode {
         OpenMode::Open => Uni::open(uri),
@@ -397,6 +543,28 @@ pub async fn build_database_core(
 
     if let Some(n) = parallelism {
         builder = builder.parallelism(n);
+    }
+
+    if let Some(path) = schema_file {
+        builder = builder.schema_file(path);
+    }
+
+    if let Some(json) = xervo_catalog_json {
+        builder = builder
+            .xervo_catalog_from_str(json)
+            .map_err(|e| e.to_string())?;
+    } else if let Some(path) = xervo_catalog_file {
+        builder = builder
+            .xervo_catalog_from_file(path)
+            .map_err(|e| e.to_string())?;
+    }
+
+    if let Some(cc) = cloud_config {
+        builder = builder.cloud_config(cc);
+    }
+
+    if let Some(cfg) = uni_config {
+        builder = builder.config(cfg);
     }
 
     builder.build().await.map_err(|e| e.to_string())

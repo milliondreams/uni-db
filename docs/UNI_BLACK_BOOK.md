@@ -238,6 +238,7 @@ graph TB
 | `object_store` | S3/GCS/Azure/local filesystem abstraction |
 | `pyo3` | Python bindings (FFI) |
 | `candle-core` / `candle-transformers` | Native Rust ML inference for auto-embedding |
+| `uni-xervo` | Embedding + generation runtime used by auto-embedding and host-side multimodal model calls |
 | `sha3` | SHA3-256 hashing for UniId content addressing |
 | `serde` / `rmp-serde` | MessagePack serialization for CRDTs and CypherValues |
 
@@ -322,7 +323,7 @@ These principles, drawn from the original design documents, guide every architec
 2. **Simplicity Over Generality**: Explicit constraints, fewer options. A custom `SimpleGraph` instead of a generic graph library.
 3. **LSM-Style Writes**: Optimized for write-heavy workloads. Memory buffer → sorted runs → compacted base. Same proven pattern as LevelDB/RocksDB, adapted for graph data.
 4. **Columnar Everything**: Arrow arrays for properties, DataFusion for query execution. Get analytical performance without a separate OLAP system.
-5. **Content Addressing**: UniId (SHA3-256) provides stable references across systems, enables deduplication, and decouples identity from storage location.
+5. **Content Addressing**: UniId (SHA3-256) provides stable references across systems and decouples identity from storage location. UID is a lookup index, not a uniqueness constraint — multiple vertices may share a UID.
 6. **Single-Writer Simplicity**: One writer at a time eliminates write-write conflicts. Multi-reader with snapshot isolation provides consistent reads without locking.
 
 ---
@@ -414,9 +415,11 @@ A SHA3-256 hash that provides **stable, content-addressed identity** for vertice
 | **Computation** | `SHA3-256(label ‖ ext_id ‖ sorted_properties)` |
 
 UniId enables:
-- **Deduplication**: Same data always produces the same ID
+- **Content lookup**: Find vertices by content hash (multiple vertices may share a UID)
 - **Cross-system references**: IDs are stable regardless of which Uni instance created them
 - **Content verification**: Detect data corruption or tampering
+
+> **Note:** UID is a lookup index, not a uniqueness constraint. `CREATE (:Label), (:Label)` freely creates two vertices with different VIDs even if they produce the same UID.
 
 The UID Index provides O(log N) lookup from UniId → VID via a BTree index on the hex-encoded UID column.
 
@@ -1059,6 +1062,8 @@ The main table enables cross-label queries without scanning every per-label tabl
 ### Overflow Properties (Schemaless)
 
 Properties not defined in the schema are stored in the `overflow_json` column as JSONB binary. Queries against overflow properties are automatically rewritten to use Lance JSONB functions (`json_get_string`, `json_get_int`, etc.).
+
+Read-your-writes semantics apply to schemaless properties too: direct property access and `properties(node)` consult the L0 overlay before storage, so `SET n.extra = 42` is visible immediately without an explicit flush. The same overflow properties are preserved through flush and later compaction cycles.
 
 ```cypher
 // This property is in overflow_json if not in schema
@@ -2301,6 +2306,46 @@ YIELD node, score
 RETURN node.title, score
 ```
 
+## Host-Side Model Runtime (Uni-Xervo)
+
+Applications can access configured embedding and generation aliases directly through the host API:
+
+```rust
+use uni_xervo::Message;
+
+let xervo = db.xervo()?;
+
+let vectors = xervo
+    .embed("embed/default", &["graph databases for beginners"])
+    .await?;
+
+let answer = xervo
+    .generate(
+        "llm/default",
+        &[
+            Message::system("You summarize technical material."),
+            Message::user("Explain what snapshot isolation means in Uni."),
+        ],
+    )
+    .await?;
+
+// Convenience wrapper — wraps prompt as a single user message
+let quick = xervo
+    .generate_text(
+        "llm/default",
+        "List three use cases for hybrid search.",
+    )
+    .await?;
+```
+
+- `embed(alias, texts)` returns `Vec<Vec<f32>>`
+- `generate(alias, messages)` accepts `&[Message]` with roles `system`, `user`, `assistant`
+- `generate_text(alias, prompt)` is the convenience wrapper that wraps the prompt as a user message
+- `raw_runtime()` exposes the underlying `ModelRuntime` for advanced orchestration
+- Optional keyword args `max_tokens`, `temperature`, `top_p` control generation on both methods
+
+This is the same runtime used by vector-index auto-embedding on writes and by text-query auto-embedding in `uni.vector.query(...)` / `similar_to(...)`.
+
 ## Admin Procedures
 
 ### Compaction
@@ -2696,7 +2741,7 @@ CREATE RULE ruleName [PRIORITY n] AS
     [ALONG name = expr]
     [FOLD name = aggregate]
     [BEST BY expr [ASC|DESC], ...]
-    [YIELD [KEY] expr [AS alias], ...
+    [YIELD [KEY] expr [AS alias] [PROB], ...
     | DERIVE pattern, ... ]
 ```
 
@@ -2727,7 +2772,7 @@ CREATE RULE shortest_risk AS
     MATCH (a:Account)-[t:TRANSFER]->(b:Account)
     WHERE a IS flagged
     ALONG cumulative_risk = prev.risk + t.amount * 0.01
-    YIELD KEY b, VALUE cumulative_risk
+    YIELD KEY b, cumulative_risk
 ```
 
 - `prev.fieldName` — access the accumulator from the previous hop
@@ -2744,10 +2789,78 @@ CREATE RULE total_exposure AS
     WHERE b IS suspicious
     FOLD total = SUM(t.amount)
     FOLD path_count = COUNT(*)
-    YIELD KEY a, VALUE total, path_count
+    YIELD KEY a, total, path_count
 ```
 
-Supported aggregators: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `COLLECT`, `MSUM`
+Supported aggregators: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `COLLECT`, `MSUM`, `MMAX`, `MMIN`, `MCOUNT`, `MNOR`, `MPROD`
+
+### Probabilistic Aggregation (MNOR / MPROD)
+
+Two monotonic aggregators for combining probabilities in recursive rules:
+
+| Aggregator | Formula | Identity | Semantics |
+|---|---|---|---|
+| `MNOR` | `1 − ∏(1 − pᵢ)` | 0.0 | "Any one cause can produce the effect" (Noisy-OR) |
+| `MPROD` | `∏ pᵢ` | 1.0 | "All conditions must hold simultaneously" |
+
+Both are monotonic (safe in recursive strata), clamp inputs to [0, 1], skip nulls, and are commutative.
+
+```cypher
+-- Risk combination: any signal can flag the account
+CREATE RULE risk_combined AS
+    MATCH (a:Component)-[s:SIGNAL]->(b:Flag)
+    FOLD risk = MNOR(s.probability)
+    YIELD KEY a, risk
+
+-- Joint reliability: all parts must work
+CREATE RULE joint_reliability AS
+    MATCH (asm:Part)-[r:REQUIRES]->(sub:Part)
+    FOLD availability = MPROD(sub.reliability)
+    YIELD KEY asm, availability
+```
+
+MPROD uses log-space computation when the product drops below 1e-15 to prevent underflow. MNOR and MPROD are incompatible with `BEST BY` (compiler error).
+
+### PROB Columns and Probabilistic `IS NOT`
+
+Locy can mark one output column per rule as the rule's probability channel:
+
+```cypher
+CREATE RULE supplier_risk AS
+    MATCH (s:Supplier)-[:HAS_SIGNAL]->(sig:Signal)
+    FOLD risk = MNOR(sig.risk)
+    YIELD KEY s, risk AS PROB
+```
+
+Supported forms:
+
+- `expr AS PROB` — infer the output name from the expression
+- `expr AS alias PROB` — explicit alias
+- `expr PROB` — shorthand for simple expressions
+
+When `IS NOT` targets a rule with a `PROB` column, negation becomes probabilistic complement instead of Boolean anti-join:
+
+```cypher
+CREATE RULE usable_supplier AS
+    MATCH (s:Supplier)
+    WHERE s IS NOT supplier_risk
+    YIELD KEY s, 1.0 AS confidence PROB
+```
+
+- If the referenced rule has a `PROB` column, `IS NOT` contributes `1 - p`
+- If multiple probabilistic `IS` / `IS NOT` references appear in one clause, their probability terms multiply into the caller's `PROB` column
+- If the referenced rule has no `PROB` column, `IS NOT` keeps normal Boolean semantics
+
+### Shared-Proof Detection and Exact Probability Mode
+
+MNOR and MPROD assume independent derivations. When multiple proof paths share the same underlying evidence, the runtime detects that overlap and emits `SharedProbabilisticDependency`.
+
+With `LocyConfig::exact_probability = true`, Uni builds a per-group Boolean formula and uses a BDD-backed evaluator to compute exact probabilities for shared-proof MNOR/MPROD groups. Two fallbacks remain important:
+
+- `BddLimitExceeded` — the group exceeded `max_bdd_variables`, so Uni falls back to the independence result for that key group
+- `CrossGroupCorrelationNotExact` — shared evidence crosses separate aggregate groups; each group is exact internally, but cross-group correlation is still approximate
+
+Derived rows from approximate groups are annotated with `_approximate = true`, and `LocyResult.approximate_groups` records the affected rule/key groups.
 
 ### BEST BY (Ranked Selection)
 
@@ -2758,7 +2871,7 @@ CREATE RULE best_route AS
     MATCH (a:City)-[r:ROAD]->(b:City)
     ALONG distance = prev.distance + r.length
     BEST BY distance ASC
-    YIELD KEY b, VALUE distance
+    YIELD KEY b, distance
 ```
 
 Enables `LIMIT 1` optimization — the engine can prune suboptimal paths early during semi-naive evaluation.
@@ -2771,12 +2884,12 @@ Control result grouping:
 CREATE RULE risk_summary AS
     MATCH (a:Account)-[:TRANSFER]->(b:Account)
     WHERE b IS flagged
-    YIELD KEY a        -- Group by source account
-    YIELD VALUE count(*) AS exposure_count
-    YIELD VALUE sum(t.amount) AS total_exposure
+    YIELD KEY a,       -- Group by source account
+          count(*) AS exposure_count,
+          sum(t.amount) AS total_exposure
 ```
 
-`KEY` marks grouping dimensions (implicit GROUP BY). `VALUE` marks computed properties.
+`KEY` marks grouping dimensions (implicit GROUP BY). Unmarked outputs are regular value columns. `PROB` marks the clause's probability column when probabilistic semantics are required.
 
 ### PRIORITY (Execution Ordering)
 
@@ -2973,20 +3086,35 @@ CREATE RULE compliance_check AS
     MATCH (system:System)-[:HOSTS]->(service:Service)
     WHERE system IS reach TO service
     AND service IS NOT threat_model
-    YIELD KEY system, VALUE 'compliant' AS status
+    YIELD KEY system, 'compliant' AS status
 ```
 
 ## Configuration
 
 ```rust
 LocyConfig {
-    max_iterations: usize,     // Max fixpoint iterations (default: 100)
-    timeout: Duration,         // Total evaluation timeout
-    max_slg_depth: usize,      // Max SLG resolution depth
-    max_derived_facts: usize,  // Prevent unbounded derivation
-    enable_explain: bool,      // Enable EXPLAIN tracing (perf cost)
+    max_iterations: usize,          // Max fixpoint iterations per recursive stratum
+    timeout: Duration,              // Overall evaluation timeout
+    max_explain_depth: usize,       // Max derivation tree depth
+    max_slg_depth: usize,           // Max SLG resolution depth
+    max_abduce_candidates: usize,   // Candidate modifications to explore
+    max_abduce_results: usize,      // Validated ABDUCE results to return
+    max_derived_bytes: usize,       // Memory bound per derived relation
+    deterministic_best_by: bool,    // Stable tie-breaking for BEST BY
+    strict_probability_domain: bool, // Error instead of clamp for values outside [0,1]
+    probability_epsilon: f64,       // MPROD log-space threshold (default: 1e-15)
+    exact_probability: bool,        // Enable BDD-based exact evaluation for shared proofs
+    max_bdd_variables: usize,       // Per-group BDD variable cap before fallback
 }
 ```
+
+### Runtime Diagnostics
+
+`LocyResult` carries probability-specific runtime diagnostics:
+
+- `warnings: Vec<RuntimeWarning>` — includes `SharedProbabilisticDependency`, `BddLimitExceeded`, and `CrossGroupCorrelationNotExact`
+- `approximate_groups: HashMap<String, Vec<String>>` — human-readable rule/key groups that fell back to approximate mode
+- `warnings()` / `has_warning()` — convenience helpers for runtime inspection
 
 ## Real-World Examples
 
@@ -3005,7 +3133,7 @@ CREATE RULE risk_chain [PRIORITY 10] AS
     WHERE a IS flagged
     ALONG risk = prev.risk + t.amount * 0.01
     BEST BY risk DESC
-    YIELD KEY b, VALUE risk AS propagated_risk
+    YIELD KEY b, risk AS propagated_risk
 
 QUERY risk_chain
 WHERE propagated_risk > 100
@@ -3020,7 +3148,7 @@ MODULE rbac.resolver
 
 CREATE RULE effective_permission [PRIORITY 100] AS
     MATCH (u:User)-[:HAS_ROLE]->(r:Role)-[:GRANTS]->(p:Permission)
-    YIELD KEY u, KEY p, VALUE r.priority AS grant_priority
+    YIELD KEY u, KEY p, r.priority AS grant_priority
 
 CREATE RULE inherited_permission AS
     MATCH (r:Role)-[:INHERITS]->(parent:Role)-[:GRANTS]->(p:Permission)
@@ -3041,7 +3169,7 @@ MODULE supply.chain
 CREATE RULE provenance AS
     MATCH (part:Part)-[:MADE_FROM]->(material:Material)
     ALONG chain = COLLECT(part.name)
-    YIELD KEY material, VALUE chain AS supply_path
+    YIELD KEY material, chain AS supply_path
 
 CREATE RULE risk_assessment AS
     MATCH (supplier:Supplier)-[:SUPPLIES]->(part:Part)
@@ -3482,6 +3610,22 @@ db = DatabaseBuilder.in_memory().build()
 db = DatabaseBuilder.open("./local-wal") \
     .hybrid("./local-wal", "s3://my-bucket/graph") \
     .build()
+
+# Fluent config — both methods return self for chaining
+db = DatabaseBuilder.temporary() \
+    .config({"query_timeout": 30.0, "parallelism": 8}) \
+    .cache_size(4 * 1024**3) \
+    .build()
+
+# Cloud credentials (all fields optional; uses env vars if omitted)
+db = DatabaseBuilder.open("s3://my-bucket/graph") \
+    .cloud_config({
+        "provider": "s3",
+        "bucket": "my-bucket",
+        "region": "us-east-1",
+        # access_key_id / secret_access_key / session_token optional
+    }) \
+    .build()
 ```
 
 ### Querying
@@ -3656,6 +3800,94 @@ CREATE RULE flagged AS
 
 result = db.locy_evaluate(program)
 print(result["stats"])  # LocyStats
+```
+
+### Xervo (Embedding & Generation)
+
+`db.xervo()` returns a `Xervo` proxy that routes calls to the model catalog configured on the builder via `.xervo_catalog_from_str()` or `.xervo_catalog_from_file()`.
+
+```python
+from uni_db import Message
+
+xervo = db.xervo()
+
+# Embed text
+vectors = xervo.embed("embed/default", ["graph databases", "neural search"])
+# → list[list[float]], one vector per input string
+
+# Generate with Message objects
+result = xervo.generate(
+    "llm/default",
+    [
+        Message.system("You are a concise technical assistant."),
+        Message.user("What is snapshot isolation?"),
+    ],
+    max_tokens=256,
+    temperature=0.7,
+)
+print(result.text)          # Generated string
+print(result.usage)         # TokenUsage | None
+
+# Generate with plain dicts (equivalent to Message objects)
+result = xervo.generate(
+    "llm/default",
+    [
+        {"role": "system", "content": "You are helpful."},
+        {"role": "user", "content": "Summarise Locy in one sentence."},
+    ],
+)
+
+# Convenience wrapper — single prompt string
+result = xervo.generate_text(
+    "llm/default",
+    "List three graph database use cases.",
+    max_tokens=128,
+)
+```
+
+#### Message
+
+```python
+# Constructors
+msg = Message("user", "hello")        # positional role + content
+msg = Message.user("hello")           # role = "user"
+msg = Message.assistant("response")   # role = "assistant"
+msg = Message.system("Be helpful.")   # role = "system"
+
+msg.role     # str: "user" | "assistant" | "system"
+msg.content  # str
+repr(msg)    # Message(role='user', content='hello')
+```
+
+`generate()` accepts a mixed list of `Message` objects and/or dicts — dicts must have `"role"` and `"content"` keys. A `TypeError` is raised at call time if an element is neither, or if a dict is missing a required key.
+
+#### TokenUsage
+
+```python
+result.usage.prompt_tokens      # int
+result.usage.completion_tokens  # int
+result.usage.total_tokens       # int
+```
+
+`result.usage` is `None` when the provider does not report token counts.
+
+#### GenerationResult
+
+```python
+result.text   # str — the generated output
+result.usage  # TokenUsage | None
+```
+
+#### Async Xervo
+
+`AsyncDatabase.xervo()` returns an `AsyncXervo` proxy with identical methods returning coroutines:
+
+```python
+async def main():
+    db = await AsyncDatabase.temporary()
+    xervo = db.xervo()
+    result = await xervo.generate_text("llm/default", "Hello!")
+    vectors = await xervo.embed("embed/default", ["hello"])
 ```
 
 ### Async API
@@ -4001,6 +4233,7 @@ graph TB
 | `query_timeout` | `Duration` | 30s | Per-query timeout |
 | `max_query_memory` | `usize` | 1 GB | Per-query memory limit |
 | `max_transaction_memory` | `usize` | 1 GB | Transaction buffer limit |
+| `max_compaction_rows` | `usize` | 5,000,000 | OOM guard for in-memory compaction |
 | `enable_vid_labels_index` | `bool` | `true` | O(1) VID→labels lookups |
 
 ### Flush Settings
@@ -4122,6 +4355,9 @@ Prevents CWE-22 (path traversal) attacks in server mode.
 | `max_retries` | `u32` | 3 | Rebuild retry count |
 | `retry_delay` | `Duration` | 60s | Delay between retries |
 | `worker_check_interval` | `Duration` | 5s | Background worker check frequency |
+| `growth_trigger_ratio` | `f64` | 0.5 | Rebuild when row count grows by this ratio (`0.0` disables) |
+| `max_index_age` | `Option<Duration>` | `None` | Optional time-based rebuild trigger |
+| `auto_rebuild_enabled` | `bool` | `false` | Enable post-flush automatic rebuild scheduling |
 
 ### Stack Size
 
@@ -4389,4 +4625,3 @@ Quick reference of all anti-patterns from every chapter:
 
 *The Uni Black Book — Version 1.0*
 *Generated from Uni DB codebase analysis*
-

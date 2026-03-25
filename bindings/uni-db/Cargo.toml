@@ -18,5 +18,6 @@ pyo3-async-runtimes = { version = "0.27", features = ["tokio-runtime"] }
 uni-db = { workspace = true }
 uni-locy = { workspace = true }
 uni-common = { workspace = true }
+uni-store = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }

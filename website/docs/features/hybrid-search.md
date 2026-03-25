@@ -186,7 +186,12 @@ WHERE similar_to([d.embedding, d.content], 'deep learning',
 RETURN d.title
 ```
 
-`similar_to` uses the same fusion algorithms (RRF, weighted) as `uni.search`, but operates on one node at a time. See the [Vector Search guide](../guides/vector-search.md#similar_to-expression-function) for full documentation.
+`similar_to` uses the same fusion algorithms (RRF, weighted) as `uni.search`, but operates on one node at a time. Vector scoring is metric-aware — it automatically uses the index's configured distance metric (Cosine, L2, or Dot Product).
+
+!!! note "RRF in point-computation context"
+    Because `similar_to()` scores one node at a time (no ranked list), RRF fusion degenerates to equal-weight averaging. A `RrfPointContext` warning is emitted in this case. Use `method: 'weighted'` for explicit control over source weights.
+
+See the [Vector Search guide](../guides/vector-search.md#similar_to-expression-function) for full documentation.
 
 ## Use Cases
 

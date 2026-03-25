@@ -1121,6 +1121,8 @@ impl HybridPhysicalPlanner {
                 input,
                 key_columns,
                 fold_bindings,
+                strict_probability_domain,
+                probability_epsilon,
             } => {
                 let child = self.plan_internal(input, all_properties)?;
                 let key_indices = resolve_column_indices(&child.schema(), key_columns)?;
@@ -1129,6 +1131,8 @@ impl HybridPhysicalPlanner {
                     child,
                     key_indices,
                     bindings,
+                    *strict_probability_domain,
+                    *probability_epsilon,
                 )))
             }
 
@@ -1157,6 +1161,11 @@ impl HybridPhysicalPlanner {
                 timeout,
                 max_derived_bytes,
                 deterministic_best_by,
+                strict_probability_domain,
+                probability_epsilon,
+                exact_probability,
+                max_bdd_variables,
+                top_k_proofs,
             } => {
                 let output_schema = super::df_graph::locy_program::stats_schema();
 
@@ -1175,6 +1184,11 @@ impl HybridPhysicalPlanner {
                         *timeout,
                         *max_derived_bytes,
                         *deterministic_best_by,
+                        *strict_probability_domain,
+                        *probability_epsilon,
+                        *exact_probability,
+                        *max_bdd_variables,
+                        *top_k_proofs,
                     ),
                 ))
             }
@@ -1574,6 +1588,19 @@ impl HybridPhysicalPlanner {
             }
         }
 
+        // If we need the full object (structural access), ensure _all_props and
+        // overflow_json are projected BEFORE creating the scan.
+        let var_props = all_properties.get(variable);
+        let need_full = var_props.is_some_and(|p| p.contains("*"));
+        if need_full {
+            if !properties.contains(&"_all_props".to_string()) {
+                properties.push("_all_props".to_string());
+            }
+            if !properties.contains(&"overflow_json".to_string()) {
+                properties.push("overflow_json".to_string());
+            }
+        }
+
         let mut scan_plan: Arc<dyn ExecutionPlan> = Arc::new(GraphScanExec::new_vertex_scan(
             self.graph_ctx.clone(),
             label_name.to_string(),
@@ -1588,14 +1615,12 @@ impl HybridPhysicalPlanner {
         // comparing `_vid` (UInt64) against Int64 literals in type coercion.
         scan_plan = self.apply_scan_filter(scan_plan, variable, filter, Some(label_name))?;
 
-        // If we need the full object (structural access), add a Struct projection
-        let var_props = all_properties.get(variable);
-        if var_props.is_some_and(|p| p.contains("*")) {
-            // Filter overflow_json from the structural projection — it's an internal
-            // column, not a user-visible property for the struct.
+        if need_full {
+            // Filter "*" (wildcard marker) and overflow_json from the structural
+            // projection. Keep _all_props so properties()/keys() UDFs can use it.
             let struct_props: Vec<String> = properties
                 .iter()
-                .filter(|p| *p != "overflow_json")
+                .filter(|p| *p != "overflow_json" && *p != "*")
                 .cloned()
                 .collect();
             scan_plan = self.add_structural_projection(scan_plan, variable, &struct_props)?;
@@ -2886,12 +2911,21 @@ impl HybridPhysicalPlanner {
             );
             let physical_expr = compiler.compile(expr, &schema)?;
 
-            // CAST if the compiled expression's output type doesn't match target
+            // CAST if the compiled expression's output type doesn't match target.
+            // Skip coercion when actual is a string type but target is numeric
+            // (or vice versa) — this means `infer_expr_type` guessed wrong
+            // (e.g. defaulting Property to Float64 for a string column).
             let physical_expr = if let Some(target_dt) = target_type {
                 let actual_dt = physical_expr
                     .data_type(schema.as_ref())
                     .unwrap_or(DataType::LargeUtf8);
-                if actual_dt != *target_dt {
+                let is_string = |dt: &DataType| matches!(dt, DataType::Utf8 | DataType::LargeUtf8);
+                let is_numeric = |dt: &DataType| {
+                    matches!(dt, DataType::Int64 | DataType::Float64 | DataType::UInt64)
+                };
+                let cross_domain = (is_string(&actual_dt) && is_numeric(target_dt))
+                    || (is_numeric(&actual_dt) && is_string(target_dt));
+                if actual_dt != *target_dt && !cross_domain {
                     coerce_physical_expr(physical_expr, &actual_dt, target_dt, schema.as_ref())
                 } else {
                     physical_expr
@@ -4571,13 +4605,27 @@ fn resolve_fold_bindings(
             // Parse aggregate expression: FunctionCall { name, args }
             match expr {
                 Expr::FunctionCall { name, args, .. } => {
-                    let kind = match name.to_uppercase().as_str() {
+                    let upper = name.to_uppercase();
+                    let is_count = matches!(upper.as_str(), "COUNT" | "MCOUNT");
+
+                    // COUNT/MCOUNT with zero args → CountAll
+                    if is_count && args.is_empty() {
+                        return Ok(super::df_graph::locy_fold::FoldBinding {
+                            output_name: output_name.clone(),
+                            kind: super::df_graph::locy_fold::FoldAggKind::CountAll,
+                            input_col_index: 0, // unused for CountAll
+                        });
+                    }
+
+                    let kind = match upper.as_str() {
                         "SUM" | "MSUM" => super::df_graph::locy_fold::FoldAggKind::Sum,
                         "COUNT" | "MCOUNT" => super::df_graph::locy_fold::FoldAggKind::Count,
                         "MAX" | "MMAX" => super::df_graph::locy_fold::FoldAggKind::Max,
                         "MIN" | "MMIN" => super::df_graph::locy_fold::FoldAggKind::Min,
                         "AVG" => super::df_graph::locy_fold::FoldAggKind::Avg,
                         "COLLECT" => super::df_graph::locy_fold::FoldAggKind::Collect,
+                        "MNOR" => super::df_graph::locy_fold::FoldAggKind::Nor,
+                        "MPROD" => super::df_graph::locy_fold::FoldAggKind::Prod,
                         other => {
                             return Err(anyhow::anyhow!(
                                 "Unsupported FOLD aggregate function: {}",

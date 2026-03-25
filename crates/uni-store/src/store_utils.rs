@@ -21,57 +21,67 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default number of retries for transient object store failures.
 pub const DEFAULT_RETRIES: usize = 3;
 
-/// Gets an object from the store with a timeout and retries.
-pub async fn get_with_timeout(
-    store: &Arc<dyn ObjectStore>,
-    path: &Path,
-    timeout: Duration,
-) -> Result<GetResult> {
+/// Retries an async operation with exponential backoff and timeout.
+///
+/// Executes `op` up to `DEFAULT_RETRIES + 1` times, sleeping with linear
+/// backoff (100ms * attempt) between retries. Each attempt is wrapped in
+/// a timeout. On timeout, the provided `timeout_msg` is used as the error.
+///
+/// # Errors
+///
+/// Returns the last error if all attempts fail or time out.
+async fn retry_with_timeout<T, F, Fut>(timeout: Duration, timeout_msg: &str, op: F) -> Result<T>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<T, object_store::Error>>,
+{
     let mut last_err = anyhow!("Unknown error");
     for i in 0..=DEFAULT_RETRIES {
         if i > 0 {
             tokio::time::sleep(Duration::from_millis(100 * i as u64)).await;
         }
-        match tokio::time::timeout(timeout, store.get(path)).await {
+        match tokio::time::timeout(timeout, op()).await {
             Ok(Ok(res)) => return Ok(res),
             Ok(Err(e)) => last_err = anyhow!(e),
-            Err(_) => {
-                last_err = anyhow!(
-                    "Object store get timed out after {:?} for path: {}",
-                    timeout,
-                    path
-                )
-            }
+            Err(_) => last_err = anyhow!("{}", timeout_msg),
         }
     }
     Err(last_err)
 }
 
+/// Gets an object from the store with a timeout and retries.
+///
+/// # Errors
+///
+/// Returns an error if all retry attempts fail or time out.
+pub async fn get_with_timeout(
+    store: &Arc<dyn ObjectStore>,
+    path: &Path,
+    timeout: Duration,
+) -> Result<GetResult> {
+    let msg = format!(
+        "Object store get timed out after {:?} for path: {}",
+        timeout, path
+    );
+    retry_with_timeout(timeout, &msg, || store.get(path)).await
+}
+
 /// Puts an object to the store with a timeout and retries.
+///
+/// # Errors
+///
+/// Returns an error if all retry attempts fail or time out.
 pub async fn put_with_timeout(
     store: &Arc<dyn ObjectStore>,
     path: &Path,
     bytes: Bytes,
     timeout: Duration,
 ) -> Result<PutResult> {
-    let mut last_err = anyhow!("Unknown error");
-    for i in 0..=DEFAULT_RETRIES {
-        if i > 0 {
-            tokio::time::sleep(Duration::from_millis(100 * i as u64)).await;
-        }
-        match tokio::time::timeout(timeout, store.put(path, bytes.clone().into())).await {
-            Ok(Ok(res)) => return Ok(res),
-            Ok(Err(e)) => last_err = anyhow!(e),
-            Err(_) => {
-                last_err = anyhow!(
-                    "Object store put timed out after {:?} for path: {}",
-                    timeout,
-                    path
-                )
-            }
-        }
-    }
-    Err(last_err)
+    let msg = format!(
+        "Object store put timed out after {:?} for path: {}",
+        timeout, path
+    );
+    retry_with_timeout(timeout, &msg, || store.put(path, bytes.clone().into())).await
 }
 
 /// Puts an object to the store with options and a timeout.

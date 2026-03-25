@@ -1,0 +1,431 @@
+Feature: Exact BDD-based Probability Computation
+  When exact_probability is enabled, shared-proof groups use BDD-based
+  computation instead of the independence assumption. This produces correct
+  results for MNOR/MPROD when proof paths share base facts.
+
+  Background:
+    Given an empty graph
+
+  # ── BDD corrects shared-proof diamond ──────────────────────────────────
+  # Two paths in a recursive reach rule (Source→Mid→Target and Source→Target).
+  # MNOR folds over e.p values: Rule 1 contributes 0.7 (direct), Rule 2
+  # contributes 0.3 (first-hop edge). Independence MNOR: 1-(1-0.7)(1-0.3)=0.79.
+  # With exact_probability, a SharedProbabilisticDependency warning is emitted.
+
+  Scenario: Shared-proof diamond with exact_probability produces correct result
+    Given having executed:
+      """
+      CREATE (s:Node {name: 'Source'}),
+             (m:Node {name: 'Mid'}),
+             (t:Node {name: 'Target'}),
+             (s)-[:LINK {p: 0.3}]->(m),
+             (m)-[:LINK {p: 0.5}]->(t),
+             (s)-[:LINK {p: 0.7}]->(t)
+      """
+    When evaluating the following Locy program with exact_probability:
+      """
+      CREATE RULE reach AS
+        MATCH (a:Node)-[e:LINK]->(b:Node)
+        FOLD prob = MNOR(e.p)
+        YIELD KEY a, KEY b, prob
+      CREATE RULE reach AS
+        MATCH (a:Node)-[e:LINK]->(mid:Node) WHERE mid IS reach TO b
+        FOLD prob = MNOR(e.p)
+        YIELD KEY a, KEY b, prob
+      """
+    Then evaluation should succeed
+    And the result should contain a SharedProbabilisticDependency warning for rule 'reach'
+    And the result should not contain a BddLimitExceeded warning
+
+  # ── BDD limit exceeded ─────────────────────────────────────────────────
+  # Set max_bdd_variables to 1 so the group exceeds the limit and falls back.
+
+  Scenario: BDD limit exceeded emits BddLimitExceeded warning
+    Given having executed:
+      """
+      CREATE (s:Node {name: 'Source'}),
+             (m:Node {name: 'Mid'}),
+             (t:Node {name: 'Target'}),
+             (s)-[:LINK {p: 0.3}]->(m),
+             (m)-[:LINK {p: 0.5}]->(t),
+             (s)-[:LINK {p: 0.7}]->(t)
+      """
+    When evaluating the following Locy program with exact_probability and max_bdd_variables 1:
+      """
+      CREATE RULE reach AS
+        MATCH (a:Node)-[e:LINK]->(b:Node)
+        FOLD prob = MNOR(e.p)
+        YIELD KEY a, KEY b, prob
+      CREATE RULE reach AS
+        MATCH (a:Node)-[e:LINK]->(mid:Node) WHERE mid IS reach TO b
+        FOLD prob = MNOR(e.p)
+        YIELD KEY a, KEY b, prob
+      """
+    Then evaluation should succeed
+    And the result should contain a BddLimitExceeded warning for rule 'reach'
+    And the result should contain a SharedProbabilisticDependency warning for rule 'reach'
+
+  # ── Default mode (exact_probability=false) ─────────────────────────────
+  # Only the SharedProbabilisticDependency warning, no BDD.
+
+  Scenario: Default mode emits only SharedProbabilisticDependency warning
+    Given having executed:
+      """
+      CREATE (s:Node {name: 'Source'}),
+             (m:Node {name: 'Mid'}),
+             (t:Node {name: 'Target'}),
+             (s)-[:LINK {p: 0.3}]->(m),
+             (m)-[:LINK {p: 0.5}]->(t),
+             (s)-[:LINK {p: 0.7}]->(t)
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE reach AS
+        MATCH (a:Node)-[e:LINK]->(b:Node)
+        FOLD prob = MNOR(e.p)
+        YIELD KEY a, KEY b, prob
+      CREATE RULE reach AS
+        MATCH (a:Node)-[e:LINK]->(mid:Node) WHERE mid IS reach TO b
+        FOLD prob = MNOR(e.p)
+        YIELD KEY a, KEY b, prob
+      """
+    Then evaluation should succeed
+    And the result should contain a SharedProbabilisticDependency warning for rule 'reach'
+    And the result should not contain a BddLimitExceeded warning
+
+  # ── Independent groups unaffected ──────────────────────────────────────
+  # No shared base facts → no warnings at all.
+
+  Scenario: Independent groups produce no warnings with exact_probability
+    Given having executed:
+      """
+      CREATE (a:Node {name: 'A'}),
+             (b:Node {name: 'B'}),
+             (a)-[:LINK {p: 0.4}]->(b),
+             (a)-[:LINK {p: 0.6}]->(b)
+      """
+    When evaluating the following Locy program with exact_probability:
+      """
+      CREATE RULE risk AS
+        MATCH (a:Node)-[e:LINK]->(b:Node)
+        FOLD prob = MNOR(e.p)
+        YIELD KEY a, KEY b, prob
+      """
+    Then evaluation should succeed
+    And the result should not contain a SharedProbabilisticDependency warning
+    And the result should not contain a BddLimitExceeded warning
+
+  # ── MPROD with shared base facts ───────────────────────────────────────
+  # Verify exact AND computation works for MPROD.
+
+  Scenario: MPROD with shared base facts uses BDD
+    Given having executed:
+      """
+      CREATE (s:Node {name: 'Source'}),
+             (m:Node {name: 'Mid'}),
+             (t:Node {name: 'Target'}),
+             (s)-[:LINK {p: 0.3}]->(m),
+             (m)-[:LINK {p: 0.5}]->(t),
+             (s)-[:LINK {p: 0.7}]->(t)
+      """
+    When evaluating the following Locy program with exact_probability:
+      """
+      CREATE RULE reach AS
+        MATCH (a:Node)-[e:LINK]->(b:Node)
+        FOLD prob = MPROD(e.p)
+        YIELD KEY a, KEY b, prob
+      CREATE RULE reach AS
+        MATCH (a:Node)-[e:LINK]->(mid:Node) WHERE mid IS reach TO b
+        FOLD prob = MPROD(e.p)
+        YIELD KEY a, KEY b, prob
+      """
+    Then evaluation should succeed
+    And the result should contain a SharedProbabilisticDependency warning for rule 'reach'
+    And the result should not contain a BddLimitExceeded warning
+
+  # ── Numeric probability assertions: exact_probability mode ─────────────
+  # Scenario 2A: BDD mode asserts actual prob = 0.79 for (Source, Target).
+  # MNOR folds: Rule 1 contributes 0.7, Rule 2 contributes 0.3.
+  # MNOR(0.7, 0.3) = 1 - (1-0.7)(1-0.3) = 0.79.
+
+  Scenario: BDD mode produces numeric probability for MNOR diamond
+    Given having executed:
+      """
+      CREATE (s:Node {name: 'Source'}),
+             (m:Node {name: 'Mid'}),
+             (t:Node {name: 'Target'}),
+             (s)-[:LINK {p: 0.3}]->(m),
+             (m)-[:LINK {p: 0.5}]->(t),
+             (s)-[:LINK {p: 0.7}]->(t)
+      """
+    When evaluating the following Locy program with exact_probability:
+      """
+      CREATE RULE reach AS
+        MATCH (a:Node)-[e:LINK]->(b:Node)
+        FOLD prob = MNOR(e.p)
+        YIELD KEY a, KEY b, prob
+      CREATE RULE reach AS
+        MATCH (a:Node)-[e:LINK]->(mid:Node) WHERE mid IS reach TO b
+        FOLD prob = MNOR(e.p)
+        YIELD KEY a, KEY b, prob
+      """
+    Then evaluation should succeed
+    And the derived relation 'reach' should contain a fact where a.name = 'Source' and prob = 0.79
+    And the result should contain a SharedProbabilisticDependency warning for rule 'reach'
+    And the result should not contain a BddLimitExceeded warning
+
+  # ── Scenario 2B: Default mode (independence assumption) ────────────────
+  # Same graph, same program, default mode — independence assumption.
+  # MNOR(0.7, 0.3) = 0.79 (same value; confirms both paths compute correctly).
+
+  Scenario: Default mode produces numeric probability for MNOR diamond
+    Given having executed:
+      """
+      CREATE (s:Node {name: 'Source'}),
+             (m:Node {name: 'Mid'}),
+             (t:Node {name: 'Target'}),
+             (s)-[:LINK {p: 0.3}]->(m),
+             (m)-[:LINK {p: 0.5}]->(t),
+             (s)-[:LINK {p: 0.7}]->(t)
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE reach AS
+        MATCH (a:Node)-[e:LINK]->(b:Node)
+        FOLD prob = MNOR(e.p)
+        YIELD KEY a, KEY b, prob
+      CREATE RULE reach AS
+        MATCH (a:Node)-[e:LINK]->(mid:Node) WHERE mid IS reach TO b
+        FOLD prob = MNOR(e.p)
+        YIELD KEY a, KEY b, prob
+      """
+    Then evaluation should succeed
+    And the derived relation 'reach' should contain a fact where a.name = 'Source' and prob = 0.79
+
+  # ── Scenario 2C: Independent groups with exact_probability ─────────────
+  # Two parallel edges A→B with p=0.4 and p=0.6.
+  # MNOR(0.4, 0.6) = 1 - (1-0.4)(1-0.6) = 1 - 0.24 = 0.76.
+  # No IS-refs → no shared proofs → no warnings.
+
+  Scenario: Independent groups with exact_probability produce correct probability
+    Given having executed:
+      """
+      CREATE (a:Node {name: 'A'}),
+             (b:Node {name: 'B'}),
+             (a)-[:LINK {p: 0.4}]->(b),
+             (a)-[:LINK {p: 0.6}]->(b)
+      """
+    When evaluating the following Locy program with exact_probability:
+      """
+      CREATE RULE risk AS
+        MATCH (a:Node)-[e:LINK]->(b:Node)
+        FOLD prob = MNOR(e.p)
+        YIELD KEY a, KEY b, prob
+      """
+    Then evaluation should succeed
+    And the derived relation 'risk' should contain a fact where a.name = 'A' and prob = 0.76
+    And the result should not contain a SharedProbabilisticDependency warning
+    And the result should not contain a BddLimitExceeded warning
+
+  # ── Scenario 2D: BDD limit exceeded falls back to independence value ────
+  # max_bdd_variables=1 forces fallback. Result stays at independence value 0.79.
+
+  Scenario: BDD limit exceeded retains independence value
+    Given having executed:
+      """
+      CREATE (s:Node {name: 'Source'}),
+             (m:Node {name: 'Mid'}),
+             (t:Node {name: 'Target'}),
+             (s)-[:LINK {p: 0.3}]->(m),
+             (m)-[:LINK {p: 0.5}]->(t),
+             (s)-[:LINK {p: 0.7}]->(t)
+      """
+    When evaluating the following Locy program with exact_probability and max_bdd_variables 1:
+      """
+      CREATE RULE reach AS
+        MATCH (a:Node)-[e:LINK]->(b:Node)
+        FOLD prob = MNOR(e.p)
+        YIELD KEY a, KEY b, prob
+      CREATE RULE reach AS
+        MATCH (a:Node)-[e:LINK]->(mid:Node) WHERE mid IS reach TO b
+        FOLD prob = MNOR(e.p)
+        YIELD KEY a, KEY b, prob
+      """
+    Then evaluation should succeed
+    And the derived relation 'reach' should contain a fact where a.name = 'Source' and prob = 0.79
+    And the result should contain a BddLimitExceeded warning for rule 'reach'
+    And the result should contain a SharedProbabilisticDependency warning for rule 'reach'
+
+  # ── Scenario 2E: MPROD diamond with exact_probability ──────────────────
+  # MPROD folds: Rule 1 contributes 0.7, Rule 2 contributes 0.3.
+  # MPROD(0.7, 0.3) = 0.7 * 0.3 = 0.21.
+
+  Scenario: MPROD diamond with exact_probability produces correct probability
+    Given having executed:
+      """
+      CREATE (s:Node {name: 'Source'}),
+             (m:Node {name: 'Mid'}),
+             (t:Node {name: 'Target'}),
+             (s)-[:LINK {p: 0.3}]->(m),
+             (m)-[:LINK {p: 0.5}]->(t),
+             (s)-[:LINK {p: 0.7}]->(t)
+      """
+    When evaluating the following Locy program with exact_probability:
+      """
+      CREATE RULE reach AS
+        MATCH (a:Node)-[e:LINK]->(b:Node)
+        FOLD prob = MPROD(e.p)
+        YIELD KEY a, KEY b, prob
+      CREATE RULE reach AS
+        MATCH (a:Node)-[e:LINK]->(mid:Node) WHERE mid IS reach TO b
+        FOLD prob = MPROD(e.p)
+        YIELD KEY a, KEY b, prob
+      """
+    Then evaluation should succeed
+    And the derived relation 'reach' should contain a fact where a.name = 'Source' and prob = 0.21
+    And the result should contain a SharedProbabilisticDependency warning for rule 'reach'
+    And the result should not contain a BddLimitExceeded warning
+
+  # ── Scenario 2F: Multi-key disjoint groups ─────────────────────────────
+  # Non-recursive rule: two independent KEY groups (A,B) and (C,B).
+  # No shared proofs → no CrossGroupCorrelationNotExact warning.
+
+  Scenario: Multi-key disjoint groups do not emit CrossGroupCorrelationNotExact
+    Given having executed:
+      """
+      CREATE (a:Node {name: 'A'}),
+             (b:Node {name: 'B'}),
+             (c:Node {name: 'C'}),
+             (a)-[:LINK {p: 0.4}]->(b),
+             (a)-[:LINK {p: 0.6}]->(b),
+             (c)-[:LINK {p: 0.3}]->(b),
+             (c)-[:LINK {p: 0.5}]->(b)
+      """
+    When evaluating the following Locy program with exact_probability:
+      """
+      CREATE RULE risk AS
+        MATCH (x:Node)-[e:LINK]->(y:Node)
+        FOLD prob = MNOR(e.p)
+        YIELD KEY x, KEY y, prob
+      """
+    Then evaluation should succeed
+    And the derived relation 'risk' should contain a fact where x.name = 'A' and prob = 0.76
+    And the derived relation 'risk' should contain a fact where x.name = 'C' and prob = 0.65
+    And the result should not contain a CrossGroupCorrelationNotExact warning
+
+  # ── Scenario 2G: Shared hub triggers CrossGroupCorrelationNotExact ──────
+  # Hub H → two target groups (H,X1) and (H,X2) via parallel LINK edges.
+  # Rule hub_score yields KEY h (the hub); rule derived uses WHERE h IS hub_score.
+  # IS-ref subject 'h' is a YIELD KEY so it appears in the pre-fold yield schema,
+  # enabling Tier-1 base-fact tracking. Both groups consume the same hub_score(H)
+  # base fact, triggering CrossGroupCorrelationNotExact.
+
+  Scenario: Shared hub emits CrossGroupCorrelationNotExact warning
+    Given having executed:
+      """
+      CREATE (h:HubNode {name: 'Hub'}),
+             (b:BaseNode {name: 'Base'}),
+             (x1:TargetNode {name: 'X1'}),
+             (x2:TargetNode {name: 'X2'}),
+             (h)-[:BASE {p: 0.8}]->(b),
+             (h)-[:LINK {p: 0.3}]->(x1),
+             (h)-[:LINK {p: 0.5}]->(x1),
+             (h)-[:LINK {p: 0.4}]->(x2),
+             (h)-[:LINK {p: 0.6}]->(x2)
+      """
+    When evaluating the following Locy program with exact_probability:
+      """
+      CREATE RULE hub_score AS
+        MATCH (h:HubNode)-[e:BASE]->(b:BaseNode)
+        FOLD prob = MNOR(e.p)
+        YIELD KEY h, prob
+      CREATE RULE derived AS
+        MATCH (h:HubNode)-[e:LINK]->(x:TargetNode) WHERE h IS hub_score
+        FOLD prob = MNOR(e.p)
+        YIELD KEY h, KEY x, prob
+      """
+    Then evaluation should succeed
+    And the result should contain a CrossGroupCorrelationNotExact warning for rule 'derived'
+
+  # ── Scenario 5A: BddLimitExceeded warning has structured metadata ────────
+  # Same diamond graph + max_bdd_variables=1. The shared group requires >= 2
+  # variables, so BDD falls back. The warning should carry variable_count and
+  # key_group as typed fields (not just in the message string).
+
+  Scenario: BddLimitExceeded warning carries variable_count and key_group metadata
+    Given having executed:
+      """
+      CREATE (s:Node {name: 'Source'}),
+             (m:Node {name: 'Mid'}),
+             (t:Node {name: 'Target'}),
+             (s)-[:LINK {p: 0.3}]->(m),
+             (m)-[:LINK {p: 0.5}]->(t),
+             (s)-[:LINK {p: 0.7}]->(t)
+      """
+    When evaluating the following Locy program with exact_probability and max_bdd_variables 1:
+      """
+      CREATE RULE reach AS
+        MATCH (a:Node)-[e:LINK]->(b:Node)
+        FOLD prob = MNOR(e.p)
+        YIELD KEY a, KEY b, prob
+      CREATE RULE reach AS
+        MATCH (a:Node)-[e:LINK]->(mid:Node) WHERE mid IS reach TO b
+        FOLD prob = MNOR(e.p)
+        YIELD KEY a, KEY b, prob
+      """
+    Then evaluation should succeed
+    And the result should contain a BddLimitExceeded warning for rule 'reach'
+    And the BddLimitExceeded warning for rule 'reach' should have variable_count >= 2
+    And the BddLimitExceeded warning for rule 'reach' should have a key_group
+
+  # ── Scenario 5B: BDD fallback stamps _approximate on derived facts ────────
+  # Same diamond graph + max_bdd_variables=1. When a group falls back to
+  # independence mode, all facts in the rule are stamped with _approximate=true.
+
+  Scenario: BDD fallback marks derived facts as approximate
+    Given having executed:
+      """
+      CREATE (s:Node {name: 'Source'}),
+             (m:Node {name: 'Mid'}),
+             (t:Node {name: 'Target'}),
+             (s)-[:LINK {p: 0.3}]->(m),
+             (m)-[:LINK {p: 0.5}]->(t),
+             (s)-[:LINK {p: 0.7}]->(t)
+      """
+    When evaluating the following Locy program with exact_probability and max_bdd_variables 1:
+      """
+      CREATE RULE reach AS
+        MATCH (a:Node)-[e:LINK]->(b:Node)
+        FOLD prob = MNOR(e.p)
+        YIELD KEY a, KEY b, prob
+      CREATE RULE reach AS
+        MATCH (a:Node)-[e:LINK]->(mid:Node) WHERE mid IS reach TO b
+        FOLD prob = MNOR(e.p)
+        YIELD KEY a, KEY b, prob
+      """
+    Then evaluation should succeed
+    And the result should contain a BddLimitExceeded warning for rule 'reach'
+    And the derived relation 'reach' should contain a fact where a.name = 'Source' and _approximate = true
+
+  # ── Scenario 5C: Non-fallback facts have no _approximate flag ────────────
+  # Independent groups (no shared proofs) — BDD succeeds or is not needed.
+  # No fact should be stamped with _approximate=true.
+
+  Scenario: Non-fallback exact_probability facts are not marked approximate
+    Given having executed:
+      """
+      CREATE (a:Node {name: 'A'}),
+             (b:Node {name: 'B'}),
+             (a)-[:LINK {p: 0.4}]->(b),
+             (a)-[:LINK {p: 0.6}]->(b)
+      """
+    When evaluating the following Locy program with exact_probability:
+      """
+      CREATE RULE risk AS
+        MATCH (a:Node)-[e:LINK]->(b:Node)
+        FOLD prob = MNOR(e.p)
+        YIELD KEY a, KEY b, prob
+      """
+    Then evaluation should succeed
+    And the result should not contain a BddLimitExceeded warning
+    And the derived relation 'risk' should not contain any approximate facts

@@ -6,7 +6,7 @@
 //! Ported from `uni-locy/src/orchestrator/explain.rs`. Uses `DerivedFactSource`
 //! instead of `CypherExecutor`. Uses `RowStore` for row-based fact storage.
 //!
-//! Implements Mode A (provenance-based, uses DerivationTracker recorded during fixpoint)
+//! Implements Mode A (provenance-based, uses ProvenanceStore recorded during fixpoint)
 //! with fallback to Mode B (re-execution) when tracker has no entries for the rule.
 
 use std::collections::{HashMap, HashSet};
@@ -21,78 +21,158 @@ use super::locy_delta::{
     KeyTuple, RowStore, extract_cypher_conditions, extract_key, resolve_clause_with_is_refs,
 };
 
-use super::locy_eval::{eval_expr, record_batches_to_locy_rows};
+use super::locy_eval::{eval_expr, record_batches_to_locy_rows, values_equal_for_join};
 use super::locy_slg::SLGResolver;
 use super::locy_traits::DerivedFactSource;
 
-/// Input dependency recorded for a derived fact: the source IS-ref rule and
-/// the hash of the source fact.
-#[derive(Clone)]
-pub struct DerivationInput {
-    pub is_ref_rule: String,
-    pub fact_hash: Vec<u8>,
+/// A single term in a derivation proof: identifies one IS-ref dependency.
+///
+/// Each `ProofTerm` records a dependency edge in the proof DAG — the source
+/// rule that was referenced and the opaque hash of the specific base fact
+/// consumed (Cui & Widom 2000, lineage).
+#[derive(Clone, Debug)]
+pub struct ProofTerm {
+    /// Name of the IS-ref rule that produced this dependency.
+    pub source_rule: String,
+    /// Opaque hash identifying the base fact consumed from `source_rule`.
+    pub base_fact_id: Vec<u8>,
 }
 
-/// Provenance record for a single derived fact, recorded during fixpoint iteration.
-#[derive(Clone)]
-pub struct DerivationEntry {
+/// Provenance annotation for a derived fact (Green et al. 2007, Definition 3.1).
+///
+/// Captures a single derivation witness: the rule and clause that produced the
+/// fact, plus the `support` set of proof terms that contributed to it.
+#[derive(Clone, Debug)]
+pub struct ProvenanceAnnotation {
     /// Name of the rule that derived this fact.
     pub rule_name: String,
     /// Index of the clause within the rule that produced this fact.
     pub clause_index: usize,
-    /// Hashes of IS-ref input facts (populated when IS-ref tracking is available).
-    pub inputs: Vec<DerivationInput>,
+    /// Proof terms: IS-ref input facts (populated when IS-ref tracking is available).
+    pub support: Vec<ProofTerm>,
     /// ALONG column values captured at derivation time.
     pub along_values: HashMap<String, Value>,
     /// Fixpoint iteration number when the fact was first derived.
     pub iteration: usize,
     /// Full fact row stored for Mode A filtering/display.
     pub fact_row: Row,
+    /// Probability of this specific proof path (populated by top-k filtering).
+    pub proof_probability: Option<f64>,
 }
 
-/// Tracks provenance of derived facts recorded during fixpoint iteration.
+/// Provenance store for derived facts (Green et al. 2007, §3).
 ///
-/// Enables Mode A (provenance-based) EXPLAIN without re-execution.
-/// First-derivation-wins semantics: once a fact hash is recorded, subsequent
-/// iterations do not overwrite it.
-pub struct DerivationTracker {
-    entries: RwLock<HashMap<Vec<u8>, DerivationEntry>>,
+/// Stores provenance annotations keyed by opaque fact hashes. Enables
+/// Mode A (provenance-based) EXPLAIN without re-execution.
+/// First-derivation-wins: once a fact hash is recorded, later iterations
+/// do not overwrite it.
+#[derive(Debug)]
+pub struct ProvenanceStore {
+    entries: RwLock<HashMap<Vec<u8>, Vec<ProvenanceAnnotation>>>,
 }
 
-impl DerivationTracker {
+impl ProvenanceStore {
     pub fn new() -> Self {
         Self {
             entries: RwLock::new(HashMap::new()),
         }
     }
 
-    /// Record a derivation entry. First-derivation-wins: if the hash is already
-    /// present, the existing entry is kept.
-    pub fn record(&self, fact_hash: Vec<u8>, entry: DerivationEntry) {
+    /// Record a provenance annotation. First-derivation-wins: if the hash is already
+    /// present, the existing annotation is kept (unlimited mode).
+    pub fn record(&self, fact_hash: Vec<u8>, entry: ProvenanceAnnotation) {
         if let Ok(mut guard) = self.entries.write() {
-            guard.entry(fact_hash).or_insert(entry);
+            guard.entry(fact_hash).or_insert_with(|| vec![entry]);
         }
     }
 
-    /// Look up the derivation entry for a fact hash.
-    pub fn lookup(&self, fact_hash: &[u8]) -> Option<DerivationEntry> {
-        self.entries.read().ok()?.get(fact_hash).cloned()
+    /// Record a provenance annotation with top-k filtering.
+    ///
+    /// Retains at most `k` annotations per fact, ordered by `proof_probability`
+    /// (highest first). Annotations without a proof probability are treated as
+    /// having probability 0.0 for ordering purposes.
+    pub fn record_top_k(&self, fact_hash: Vec<u8>, entry: ProvenanceAnnotation, k: usize) {
+        if let Ok(mut guard) = self.entries.write() {
+            let vec = guard.entry(fact_hash).or_default();
+            vec.push(entry);
+            // Sort descending by proof_probability.
+            vec.sort_by(|a, b| {
+                b.proof_probability
+                    .unwrap_or(0.0)
+                    .partial_cmp(&a.proof_probability.unwrap_or(0.0))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            vec.truncate(k);
+        }
     }
 
-    /// Get all entries for a specific rule name.
-    pub fn entries_for_rule(&self, rule_name: &str) -> Vec<(Vec<u8>, DerivationEntry)> {
+    /// Look up the first (highest-priority) provenance annotation for a fact hash.
+    pub fn lookup(&self, fact_hash: &[u8]) -> Option<ProvenanceAnnotation> {
+        self.entries.read().ok()?.get(fact_hash)?.first().cloned()
+    }
+
+    /// Look up all provenance annotations for a fact hash.
+    pub fn lookup_all(&self, fact_hash: &[u8]) -> Option<Vec<ProvenanceAnnotation>> {
+        let guard = self.entries.read().ok()?;
+        guard.get(fact_hash).cloned()
+    }
+
+    /// Collect base fact probabilities from stored annotations.
+    ///
+    /// Scans all annotations for base facts (those with empty support, i.e. leaf
+    /// nodes in the proof tree) and extracts the PROB column value from their
+    /// `fact_row`. Used by top-k proof filtering to compute `proof_probability`.
+    pub fn base_fact_probs(&self) -> HashMap<Vec<u8>, f64> {
+        let mut probs = HashMap::new();
+        if let Ok(guard) = self.entries.read() {
+            for (fact_hash, annotations) in guard.iter() {
+                if let Some(ann) = annotations.first()
+                    && ann.support.is_empty()
+                    && let Some(uni_common::Value::Float(p)) = ann.fact_row.get("PROB")
+                {
+                    probs.insert(fact_hash.clone(), *p);
+                }
+            }
+        }
+        probs
+    }
+
+    /// Get all entries for a specific rule name (returns first annotation per fact).
+    pub fn entries_for_rule(&self, rule_name: &str) -> Vec<(Vec<u8>, ProvenanceAnnotation)> {
         match self.entries.read() {
             Ok(guard) => guard
                 .iter()
-                .filter(|(_, e)| e.rule_name == rule_name)
-                .map(|(k, v)| (k.clone(), v.clone()))
+                .filter_map(|(k, annotations)| {
+                    annotations
+                        .first()
+                        .filter(|e| e.rule_name == rule_name)
+                        .map(|e| (k.clone(), e.clone()))
+                })
                 .collect(),
             Err(_) => vec![],
         }
     }
 }
 
-impl Default for DerivationTracker {
+/// Compute the probability of a single proof path from its support terms.
+///
+/// Returns `None` if any base fact's probability is unknown.
+pub fn compute_proof_probability(
+    support: &[ProofTerm],
+    base_probs: &HashMap<Vec<u8>, f64>,
+) -> Option<f64> {
+    if support.is_empty() {
+        return None;
+    }
+    let mut product = 1.0;
+    for term in support {
+        let p = base_probs.get(&term.base_fact_id)?;
+        product *= p;
+    }
+    Some(product)
+}
+
+impl Default for ProvenanceStore {
     fn default() -> Self {
         Self::new()
     }
@@ -103,9 +183,13 @@ type VisitedSet = HashSet<(String, KeyTuple)>;
 
 /// Build a derivation tree for a rule, showing how each fact was derived.
 ///
-/// Tries Mode A (provenance-based, uses DerivationTracker) first when a tracker is
+/// Tries Mode A (provenance-based, uses ProvenanceStore) first when a store is
 /// provided and has entries for the rule.  Falls through to Mode B (re-execution)
 /// when Mode A cannot produce a result.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "explain requires full program context and tracker state"
+)]
 pub async fn explain_rule(
     query: &ExplainRule,
     program: &CompiledProgram,
@@ -113,16 +197,28 @@ pub async fn explain_rule(
     config: &LocyConfig,
     derived_store: &mut RowStore,
     stats: &mut LocyStats,
-    tracker: Option<&DerivationTracker>,
+    tracker: Option<&ProvenanceStore>,
+    approximate_groups: Option<&HashMap<String, Vec<String>>>,
 ) -> Result<DerivationNode, LocyError> {
     // Mode A: provenance-based (no re-execution required).
     // Falls through to Mode B when tracker is absent or has no matching entries.
-    if let Some(Ok(node)) = tracker.map(|t| explain_rule_mode_a(query, program, t, derived_store)) {
+    if let Some(Ok(node)) =
+        tracker.map(|t| explain_rule_mode_a(query, program, t, derived_store, approximate_groups))
+    {
         return Ok(node);
     }
 
     // Mode B: re-execution fallback
-    explain_rule_mode_b(query, program, fact_source, config, derived_store, stats).await
+    explain_rule_mode_b(
+        query,
+        program,
+        fact_source,
+        config,
+        derived_store,
+        stats,
+        approximate_groups,
+    )
+    .await
 }
 
 /// Mode A: build derivation tree using recorded provenance from the fixpoint loop.
@@ -131,8 +227,9 @@ pub async fn explain_rule(
 fn explain_rule_mode_a(
     query: &ExplainRule,
     program: &CompiledProgram,
-    tracker: &DerivationTracker,
-    derived_store: &RowStore,
+    tracker: &ProvenanceStore,
+    _derived_store: &RowStore,
+    approximate_groups: Option<&HashMap<String, Vec<String>>>,
 ) -> Result<DerivationNode, LocyError> {
     let rule_name = query.rule_name.to_string();
     let rule = program
@@ -150,14 +247,18 @@ fn explain_rule_mode_a(
     }
 
     // Filter tracker entries by WHERE expression
-    let matching_entries: Vec<_> = tracker_entries
-        .into_iter()
-        .filter(|(_, entry)| {
-            eval_expr(&query.where_expr, &entry.fact_row)
-                .map(|v| v.as_bool().unwrap_or(false))
-                .unwrap_or(false)
-        })
-        .collect();
+    let matching_entries: Vec<_> = if let Some(where_expr) = &query.where_expr {
+        tracker_entries
+            .into_iter()
+            .filter(|(_, entry)| {
+                eval_expr(where_expr, &entry.fact_row)
+                    .map(|v| v.as_bool().unwrap_or(false))
+                    .unwrap_or(false)
+            })
+            .collect()
+    } else {
+        tracker_entries
+    };
 
     if matching_entries.is_empty() {
         return Err(LocyError::EvaluationError {
@@ -165,13 +266,9 @@ fn explain_rule_mode_a(
         });
     }
 
-    // Also check orchestrator store for any additional facts not in tracker
-    // (e.g., facts derived outside the native fixpoint path)
-    let orch_facts = derived_store
-        .get(&rule_name)
-        .map(|r| r.rows.clone())
-        .unwrap_or_default();
-    let _ = orch_facts; // available for future use
+    let is_approximate = approximate_groups
+        .map(|ag| ag.contains_key(&rule_name))
+        .unwrap_or(false);
 
     let mut root = DerivationNode {
         rule: rule_name.clone(),
@@ -181,6 +278,8 @@ fn explain_rule_mode_a(
         along_values: HashMap::new(),
         children: Vec::new(),
         graph_fact: None,
+        approximate: is_approximate,
+        proof_probability: None,
     };
 
     for (_, entry) in matching_entries {
@@ -189,6 +288,16 @@ fn explain_rule_mode_a(
             .clauses
             .get(entry.clause_index)
             .and_then(|c| c.priority);
+        let base_fact = format!(
+            "[iter={}] {}",
+            entry.iteration,
+            format_graph_fact(&entry.fact_row)
+        );
+        let graph_fact = if is_approximate {
+            format!("[APPROXIMATE] {}", base_fact)
+        } else {
+            base_fact
+        };
         let node = DerivationNode {
             rule: rule_name.clone(),
             clause_index: entry.clause_index,
@@ -197,11 +306,9 @@ fn explain_rule_mode_a(
             along_values,
             // Mode A: children not tracked (inputs list is reserved for future recursion)
             children: vec![],
-            graph_fact: Some(format!(
-                "[iter={}] {}",
-                entry.iteration,
-                format_graph_fact(&entry.fact_row)
-            )),
+            graph_fact: Some(graph_fact),
+            approximate: is_approximate,
+            proof_probability: entry.proof_probability,
         };
         root.children.push(node);
     }
@@ -218,6 +325,7 @@ async fn explain_rule_mode_b(
     config: &LocyConfig,
     derived_store: &mut RowStore,
     stats: &mut LocyStats,
+    approximate_groups: Option<&HashMap<String, Vec<String>>>,
 ) -> Result<DerivationNode, LocyError> {
     let rule_name = query.rule_name.to_string();
     let rule = program
@@ -258,14 +366,22 @@ async fn explain_rule_mode_b(
         .unwrap_or_default();
 
     // Filter facts by WHERE expression
-    let filtered: Vec<Row> = facts
-        .into_iter()
-        .filter(|row| {
-            eval_expr(&query.where_expr, row)
-                .map(|v| v.as_bool().unwrap_or(false))
-                .unwrap_or(false)
-        })
-        .collect();
+    let filtered: Vec<Row> = if let Some(where_expr) = &query.where_expr {
+        facts
+            .into_iter()
+            .filter(|row| {
+                eval_expr(where_expr, row)
+                    .map(|v| v.as_bool().unwrap_or(false))
+                    .unwrap_or(false)
+            })
+            .collect()
+    } else {
+        facts
+    };
+
+    let is_approximate = approximate_groups
+        .map(|ag| ag.contains_key(&rule_name))
+        .unwrap_or(false);
 
     // Build derivation tree root
     let mut root = DerivationNode {
@@ -276,12 +392,14 @@ async fn explain_rule_mode_b(
         along_values: HashMap::new(),
         children: Vec::new(),
         graph_fact: None,
+        approximate: is_approximate,
+        proof_probability: None,
     };
 
     // For each matching fact, recursively build a derivation node
     for fact in &filtered {
         let mut visited = VisitedSet::new();
-        let node = build_derivation_node(
+        let mut node = build_derivation_node(
             &rule_name,
             fact,
             &key_columns,
@@ -293,6 +411,12 @@ async fn explain_rule_mode_b(
             config.max_explain_depth,
         )
         .await?;
+        if is_approximate {
+            node.approximate = true;
+            if let Some(ref gf) = node.graph_fact {
+                node.graph_fact = Some(format!("[APPROXIMATE] {}", gf));
+            }
+        }
         root.children.push(node);
     }
 
@@ -303,7 +427,10 @@ async fn explain_rule_mode_b(
 ///
 /// Finds which clause produced this fact, extracts ALONG values,
 /// and recurses into IS reference dependencies.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "recursive derivation node builder requires full fact context"
+)]
 fn build_derivation_node<'a>(
     rule_name: &'a str,
     fact: &'a Row,
@@ -337,11 +464,15 @@ fn build_derivation_node<'a>(
                 along_values: extract_along_values(fact, rule),
                 children: Vec::new(),
                 graph_fact: Some("(cycle)".to_string()),
+                approximate: false,
+                proof_probability: None,
             });
         }
 
-        // All yield columns (key + non-key) for exact row matching
-        let yield_columns: Vec<String> = rule.yield_schema.iter().map(|c| c.name.clone()).collect();
+        // Match on KEY columns only.  Clause-level resolution returns only
+        // base graph bindings (vertex/edge identifiers); non-KEY yield columns
+        // (FOLD-aggregated, similar_to, etc.) are absent from those rows.
+        // KEY columns uniquely identify a derived fact, so this is sufficient.
 
         // Try each clause to find the one that produced this fact
         for (clause_idx, clause) in rule.clauses.iter().enumerate() {
@@ -364,10 +495,16 @@ fn build_derivation_node<'a>(
                 record_batches_to_locy_rows(&raw_batches)
             };
 
-            // Match on ALL yield columns (not just key columns) to find exact row
-            let matching_row = resolved
-                .iter()
-                .find(|row| yield_columns.iter().all(|k| row.get(k) == fact.get(k)));
+            // Use values_equal_for_join for VID/EID-based comparison: sidecar
+            // schema mode can add `overflow_json: Null` to nodes in some query
+            // paths, making structural equality unreliable.
+            let matching_row = resolved.iter().find(|row| {
+                key_columns.iter().all(|k| match (row.get(k), fact.get(k)) {
+                    (Some(v1), Some(v2)) => values_equal_for_join(v1, v2),
+                    (None, None) => true,
+                    _ => false,
+                })
+            });
 
             if let Some(evidence_row) = matching_row {
                 let along_values = extract_along_values(fact, rule);
@@ -398,40 +535,24 @@ fn build_derivation_node<'a>(
                                 .filter(|ref_fact| {
                                     let subjects_match =
                                         is_ref.subjects.iter().enumerate().all(|(i, subject)| {
-                                            if i < ref_key_columns.len() {
-                                                let subject_val = evidence_row
-                                                    .get(subject)
-                                                    .or_else(|| fact.get(subject));
-                                                match subject_val {
-                                                    Some(val) => {
-                                                        ref_fact.get(&ref_key_columns[i])
-                                                            == Some(val)
-                                                    }
-                                                    None => true,
-                                                }
-                                            } else {
-                                                true
-                                            }
+                                            binding_matches_key(
+                                                evidence_row,
+                                                fact,
+                                                subject,
+                                                ref_fact,
+                                                ref_key_columns.get(i),
+                                            )
                                         });
-                                    let target_matches = if let Some(target) = &is_ref.target {
-                                        let target_idx = is_ref.subjects.len();
-                                        if target_idx < ref_key_columns.len() {
-                                            let target_val = evidence_row
-                                                .get(target)
-                                                .or_else(|| fact.get(target));
-                                            match target_val {
-                                                Some(val) => {
-                                                    ref_fact.get(&ref_key_columns[target_idx])
-                                                        == Some(val)
-                                                }
-                                                None => true,
-                                            }
-                                        } else {
-                                            true
-                                        }
-                                    } else {
-                                        true
-                                    };
+                                    let target_matches =
+                                        is_ref.target.as_ref().is_none_or(|target| {
+                                            binding_matches_key(
+                                                evidence_row,
+                                                fact,
+                                                target,
+                                                ref_fact,
+                                                ref_key_columns.get(is_ref.subjects.len()),
+                                            )
+                                        });
                                     subjects_match && target_matches
                                 })
                                 .collect();
@@ -471,6 +592,8 @@ fn build_derivation_node<'a>(
                     along_values,
                     children,
                     graph_fact: Some(format_graph_fact(evidence_row)),
+                    approximate: false,
+                    proof_probability: None,
                 });
             }
         }
@@ -485,8 +608,33 @@ fn build_derivation_node<'a>(
             along_values: extract_along_values(fact, rule),
             children: Vec::new(),
             graph_fact: Some(format_graph_fact(fact)),
+            approximate: false,
+            proof_probability: None,
         })
     })
+}
+
+/// Check if a binding variable matches a ref-fact key column via VID-based join.
+///
+/// Looks up `var_name` in `primary` (falling back to `fallback`), then compares
+/// it against `ref_key_col` in `ref_fact` using `values_equal_for_join`.
+/// Returns `true` when the key column is out of range or the binding is absent.
+fn binding_matches_key(
+    primary: &Row,
+    fallback: &Row,
+    var_name: &str,
+    ref_fact: &Row,
+    ref_key_col: Option<&String>,
+) -> bool {
+    let Some(key_col) = ref_key_col else {
+        return true;
+    };
+    let Some(val) = primary.get(var_name).or_else(|| fallback.get(var_name)) else {
+        return true;
+    };
+    ref_fact
+        .get(key_col)
+        .is_some_and(|rv| values_equal_for_join(rv, val))
 }
 
 fn extract_along_values(fact: &Row, rule: &CompiledRule) -> HashMap<String, Value> {
@@ -531,6 +679,114 @@ fn format_value(v: &Value) -> String {
         }
         Value::Node(n) => format!("Node({})", n.vid.as_u64()),
         Value::Edge(e) => format!("Edge({})", e.eid.as_u64()),
-        _ => format!("{:?}", v),
+        _ => format!("{v:?}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_annotation(rule: &str, prob: Option<f64>) -> ProvenanceAnnotation {
+        ProvenanceAnnotation {
+            rule_name: rule.to_string(),
+            clause_index: 0,
+            support: vec![],
+            along_values: HashMap::new(),
+            iteration: 0,
+            fact_row: HashMap::new(),
+            proof_probability: prob,
+        }
+    }
+
+    #[test]
+    fn record_first_derivation_wins() {
+        let store = ProvenanceStore::new();
+        let hash = b"fact1".to_vec();
+        store.record(hash.clone(), make_annotation("rule_a", None));
+        store.record(hash.clone(), make_annotation("rule_b", None));
+        let entry = store.lookup(&hash).unwrap();
+        assert_eq!(entry.rule_name, "rule_a");
+    }
+
+    #[test]
+    fn lookup_returns_first_annotation() {
+        let store = ProvenanceStore::new();
+        let hash = b"fact1".to_vec();
+        store.record(hash.clone(), make_annotation("rule_a", None));
+        assert_eq!(store.lookup(&hash).unwrap().rule_name, "rule_a");
+        assert!(store.lookup(b"nonexistent").is_none());
+    }
+
+    #[test]
+    fn lookup_all_returns_all_annotations() {
+        let store = ProvenanceStore::new();
+        let hash = b"fact1".to_vec();
+        // record() is first-wins, so only one entry per hash via record()
+        store.record(hash.clone(), make_annotation("rule_a", None));
+        let all = store.lookup_all(&hash).unwrap();
+        assert_eq!(all.len(), 1);
+    }
+
+    #[test]
+    fn record_top_k_retains_highest() {
+        let store = ProvenanceStore::new();
+        let hash = b"fact1".to_vec();
+        store.record_top_k(hash.clone(), make_annotation("low", Some(0.1)), 2);
+        store.record_top_k(hash.clone(), make_annotation("high", Some(0.9)), 2);
+        store.record_top_k(hash.clone(), make_annotation("mid", Some(0.5)), 2);
+        store.record_top_k(hash.clone(), make_annotation("highest", Some(0.95)), 2);
+        store.record_top_k(hash.clone(), make_annotation("lowest", Some(0.01)), 2);
+
+        let all = store.lookup_all(&hash).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].rule_name, "highest");
+        assert_eq!(all[1].rule_name, "high");
+    }
+
+    #[test]
+    fn compute_proof_probability_basic() {
+        let support = vec![
+            ProofTerm {
+                source_rule: "r1".to_string(),
+                base_fact_id: b"f1".to_vec(),
+            },
+            ProofTerm {
+                source_rule: "r2".to_string(),
+                base_fact_id: b"f2".to_vec(),
+            },
+        ];
+        let base_probs = HashMap::from([(b"f1".to_vec(), 0.3), (b"f2".to_vec(), 0.5)]);
+        let prob = compute_proof_probability(&support, &base_probs);
+        assert!((prob.unwrap() - 0.15).abs() < 1e-10);
+    }
+
+    #[test]
+    fn compute_proof_probability_empty_support() {
+        let prob = compute_proof_probability(&[], &HashMap::new());
+        assert!(prob.is_none());
+    }
+
+    #[test]
+    fn compute_proof_probability_missing_fact() {
+        let support = vec![ProofTerm {
+            source_rule: "r1".to_string(),
+            base_fact_id: b"unknown".to_vec(),
+        }];
+        let prob = compute_proof_probability(&support, &HashMap::new());
+        assert!(prob.is_none());
+    }
+
+    #[test]
+    fn entries_for_rule_filters_correctly() {
+        let store = ProvenanceStore::new();
+        store.record(b"f1".to_vec(), make_annotation("rule_a", None));
+        store.record(b"f2".to_vec(), make_annotation("rule_b", None));
+        store.record(b"f3".to_vec(), make_annotation("rule_a", None));
+
+        let entries = store.entries_for_rule("rule_a");
+        assert_eq!(entries.len(), 2);
+        let entries_b = store.entries_for_rule("rule_b");
+        assert_eq!(entries_b.len(), 1);
     }
 }

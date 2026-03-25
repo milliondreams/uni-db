@@ -59,6 +59,7 @@ nav:
           - ALONG / FOLD / BEST BY: locy/advanced/along-fold-bestby.md
           - DERIVE / ASSUME / ABDUCE: locy/advanced/derive-assume-abduce.md
           - Modules / PRIORITY / QUERY: locy/advanced/modules-priority-query.md
+          - Probabilistic Logic: locy/advanced/probabilistic-logic.md
       - API Integration:
           - Rust API: locy/api/rust.md
           - Python API: locy/api/python.md
@@ -94,6 +95,7 @@ nav:
           - "Locy: Semiconductor Yield Excursion (Flagship)": examples/python/locy_semiconductor_yield_excursion.ipynb
           - "Locy: Pharma Batch Genealogy (Flagship #2)": examples/python/locy_pharma_batch_genealogy.ipynb
           - "Locy: Cyber Exposure-to-Remediation Twin (Flagship #3)": examples/python/locy_cyber_exposure_twin.ipynb
+          - "Locy: Probabilistic Risk Scoring": examples/python/locy_probabilistic_risk_scoring.ipynb
       - Pydantic OGM:
           - Supply Chain: examples/pydantic/supply_chain.ipynb
           - Recommendation: examples/pydantic/recommendation.ipynb
@@ -111,6 +113,7 @@ nav:
           - "Locy: Infrastructure Blast Radius": examples/rust/locy_infrastructure_blast_radius.ipynb
           - "Locy: Supply Chain Provenance": examples/rust/locy_supply_chain_provenance.ipynb
           - "Locy: Fraud Risk Propagation": examples/rust/locy_fraud_risk_propagation.ipynb
+          - "Locy: Probabilistic Risk Scoring": examples/rust/locy_probabilistic_risk_scoring.ipynb
   - Internals:
       - Overview: internals/index.md
       - Vectorized Execution: internals/vectorized-execution.md
@@ -119,6 +122,7 @@ nav:
       - Query Rewriting: internals/query-rewriting.md
       - Mutation Spec: internals/mutation_spec.md
       - API Gap Plan: internals/api-gap-plan.md
+      - Python API Priorities: internals/python-api-priorities.md
       - Benchmarks: internals/benchmarks.md
   - Reference:
       - Overview: reference/index.md

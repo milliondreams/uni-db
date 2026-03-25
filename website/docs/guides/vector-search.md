@@ -357,6 +357,8 @@ LIMIT 10
 
 `similar_to()` is a unified similarity scoring function that works as an expression — in `WHERE`, `RETURN`, `WITH`, `ORDER BY`, and Locy rule bodies. Unlike `CALL` procedures, it scores one already-bound node against a query (point computation, not top-K scan).
 
+Scoring is **metric-aware**: `similar_to()` automatically uses the distance metric configured on the vector index (Cosine, L2, or Dot Product). You don't need to specify the metric — it's resolved from the schema at compile time. If no index is found, it defaults to cosine similarity.
+
 ```
 similar_to(sources, queries [, options]) → FLOAT [0, 1]
 ```
@@ -419,6 +421,9 @@ The optional third argument controls fusion behavior:
 | `k` | Integer (default: 60) | RRF constant |
 | `fts_k` | Float (default: 1.0) | BM25 saturation constant |
 
+!!! warning "RRF in point-computation context"
+    `similar_to()` operates on one node at a time (point computation), not over a ranked list. RRF fusion requires rank positions, which are unavailable in this context. When `method: 'rrf'` is used with multiple sources, `similar_to()` falls back to **equal-weight fusion** and emits a `RrfPointContext` warning in the query result. For explicit control, use `method: 'weighted'` with custom weights instead.
+
 ```cypher
 // Weighted fusion: favor vector similarity 70/30
 MATCH (d:Document)
@@ -448,9 +453,9 @@ Both are needed. Use `CALL` procedures to find candidates from a full label, the
 | Locy rule `WHERE / YIELD / ALONG / FOLD` | DataFusion | :white_check_mark: | :white_check_mark: | :white_check_mark: | :white_check_mark: |
 | Locy command `DERIVE / ABDUCE / ASSUME WHERE` | In-memory | :white_check_mark: | :x: | :x: | :x: |
 
-In Cypher queries and Locy **rule bodies**, `similar_to()` runs inside DataFusion with full access to storage, schema, and embedding models. All scoring modes work.
+In Cypher queries and Locy **rule bodies**, `similar_to()` runs inside DataFusion with full access to storage, schema, and embedding models. All scoring modes work, and the distance metric is automatically resolved from the vector index (Cosine, L2, or Dot Product).
 
-In Locy **command** WHERE clauses (`DERIVE ... WHERE`, `ABDUCE ... WHERE`), `similar_to()` falls back to a pure vector cosine computation — no auto-embedding or FTS. This is because commands execute after strata converge on already-materialized row data. In practice this is rarely limiting: rule WHERE clauses (which have full capability) handle the semantic filtering, while command WHERE clauses typically apply simple scalar filters on already-derived columns.
+In Locy **command** WHERE clauses (`DERIVE ... WHERE`, `ABDUCE ... WHERE`), `similar_to()` falls back to a pure vector cosine computation — no auto-embedding, FTS, metric resolution, or multi-source fusion. This is because commands execute after strata converge on already-materialized row data. In practice this is rarely limiting: rule WHERE clauses (which have full capability) handle the semantic filtering, while command WHERE clauses typically apply simple scalar filters on already-derived columns.
 
 ---
 
@@ -596,15 +601,17 @@ distance = -similarity (negated for ranking)
 
 ### Score Conversion
 
-`uni.vector.query`, `uni.search`, and `similar_to()` all return normalized **similarity scores** (higher = more similar), not raw distances. The conversion is metric-aware:
+`uni.vector.query`, `uni.search`, and `similar_to()` all return **similarity scores** (higher = more similar), not raw distances. The conversion is metric-aware:
 
-| Metric | Raw Distance Range | Conversion Formula | Score Range |
+| Metric | Raw Distance Range | `similar_to()` Score | `uni.vector.query` / `uni.search` Score |
 |---|---|---|---|
-| Cosine | [0, 2] | `(2 - d) / 2` | [0, 1] |
-| L2 | [0, ∞) | `1 / (1 + d)` | (0, 1] |
-| Dot | (-∞, +∞) | Pass-through | Unbounded |
+| Cosine | [0, 2] | Cosine similarity `[-1, 1]` | `(2 - d) / 2` → `[0, 1]` |
+| L2 | [0, ∞) | `1 / (1 + d)` → `(0, 1]` | `1 / (1 + d)` → `(0, 1]` |
+| Dot | (-∞, +∞) | Dot product (actual `A · B`) | Pass-through (negated convention) |
 
-This means you can compare scores across queries without worrying about which distance metric the index uses.
+`similar_to()` resolves the metric from the vector index at compile time. For Cosine, it returns raw cosine similarity; for L2, it normalizes to `(0, 1]`; for Dot Product, it returns the actual dot product value. If no vector index is found for a property, it defaults to cosine similarity.
+
+For Cosine and L2, you can compare scores across queries without worrying about which metric the index uses. Dot product scores are unbounded and should only be compared within the same metric.
 
 ---
 

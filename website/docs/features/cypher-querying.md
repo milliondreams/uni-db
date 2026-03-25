@@ -4,8 +4,10 @@ Uni uses OpenCypher as its primary query language, with extensions for vector se
 
 ## What It Provides
 
-- Pattern matching for nodes and relationships.
-- Aggregations, ordering, and filtering.
+- Pattern matching for nodes and relationships, including `OPTIONAL MATCH` for left-outer-join semantics.
+- Aggregations, ordering, filtering, and window functions (`OVER` clause).
+- `MERGE` for upsert operations with `ON CREATE SET` / `ON MATCH SET`.
+- `SET` / `REMOVE` for updating properties and labels on existing nodes and relationships.
 - Procedure calls for algorithms, snapshots, and indexes.
 
 ## Example

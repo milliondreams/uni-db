@@ -11,7 +11,7 @@ use ::uni_db::Uni;
 use pyo3::IntoPyObjectExt;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 // ============================================================================
@@ -64,6 +64,11 @@ impl AsyncDatabase {
             hybrid_remote: None,
             cache_size: None,
             parallelism: None,
+            schema_file: None,
+            xervo_catalog_json: None,
+            xervo_catalog_file: None,
+            cloud_config: None,
+            uni_config: None,
         }
     }
 
@@ -526,6 +531,29 @@ impl AsyncDatabase {
         })
     }
 
+    /// Open a streaming cursor for a query.
+    #[pyo3(signature = (cypher, params=None))]
+    fn query_cursor<'py>(
+        &self,
+        py: Python<'py>,
+        cypher: String,
+        params: Option<HashMap<String, Py<PyAny>>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let rust_params = convert::prepare_params(py, params)?;
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let cursor = core::query_cursor_core(&inner, &cypher, rust_params, None, None)
+                .await
+                .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
+            let columns = cursor.columns().to_vec();
+            Ok(AsyncQueryCursor {
+                cursor: Arc::new(tokio::sync::Mutex::new(Some(cursor))),
+                buffer: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
+                columns,
+            })
+        })
+    }
+
     /// Create a query builder for parameterized queries.
     fn query_with(&self, cypher: String) -> AsyncQueryBuilder {
         AsyncQueryBuilder {
@@ -548,18 +576,38 @@ impl AsyncDatabase {
         }
     }
 
+    /// Register Locy rules for reuse across multiple evaluate calls.
+    fn locy_compile(&self, program: &str) -> PyResult<()> {
+        self.inner
+            .locy()
+            .register(program)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+    }
+
+    /// Clear all registered Locy rules from the session.
+    fn locy_clear(&self) -> PyResult<()> {
+        self.inner.locy().clear_registry();
+        Ok(())
+    }
+
     /// Evaluate a Locy program and return derived facts, stats, and command results.
-    #[pyo3(signature = (program, config=None))]
+    #[pyo3(signature = (program, params=None, config=None))]
     fn locy_evaluate<'py>(
         &self,
         py: Python<'py>,
         program: String,
+        params: Option<HashMap<String, Py<PyAny>>>,
         config: Option<HashMap<String, Py<PyAny>>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let db = self.inner.clone();
-        let locy_config = config
+        let mut locy_config = config
             .map(|cfg| convert::extract_locy_config(py, cfg))
             .transpose()?;
+        if let Some(p) = params {
+            let rust_params = convert::prepare_params(py, Some(p))?;
+            locy_config.get_or_insert_with(Default::default).params = rust_params;
+        }
+        let locy_config = locy_config;
         // The locy future is !Send due to QueryPlanner's Cell<usize>.
         // Use spawn_blocking + block_on to run it from a blocking thread.
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -575,6 +623,220 @@ impl AsyncDatabase {
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
             .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
             Python::attach(|py| convert::locy_result_to_py(py, result))
+        })
+    }
+
+    /// Get an AsyncXervo facade for embedding and generation operations.
+    fn xervo(&self) -> PyResult<AsyncXervo> {
+        Ok(AsyncXervo {
+            inner: self.inner.clone(),
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Snapshot management
+    // -----------------------------------------------------------------------
+
+    /// Create a point-in-time snapshot. Returns the snapshot ID.
+    #[pyo3(signature = (name=None))]
+    fn create_snapshot<'py>(
+        &self,
+        py: Python<'py>,
+        name: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let db = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            core::create_snapshot_core(&db, name)
+                .await
+                .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+        })
+    }
+
+    /// List all available snapshots.
+    fn list_snapshots<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let db = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let manifests = core::list_snapshots_core(&db)
+                .await
+                .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
+            Python::attach(|py| {
+                manifests
+                    .into_iter()
+                    .map(|m| convert::snapshot_manifest_to_py(py, m))
+                    .collect::<PyResult<Vec<_>>>()
+            })
+        })
+    }
+
+    /// Restore the database to a specific snapshot.
+    fn restore_snapshot<'py>(
+        &self,
+        py: Python<'py>,
+        snapshot_id: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let db = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            core::restore_snapshot_core(&db, &snapshot_id)
+                .await
+                .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Index administration
+    // -----------------------------------------------------------------------
+
+    /// Get status of background index rebuild tasks.
+    fn index_rebuild_status<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let db = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let tasks = core::index_rebuild_status_core(&db)
+                .await
+                .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
+            Python::attach(|py| {
+                tasks
+                    .into_iter()
+                    .map(|t| convert::index_rebuild_task_to_py(py, t))
+                    .collect::<PyResult<Vec<_>>>()
+            })
+        })
+    }
+
+    /// Retry failed index rebuild tasks.
+    fn retry_index_rebuilds<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let db = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            core::retry_index_rebuilds_core(&db)
+                .await
+                .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+        })
+    }
+
+    /// Force rebuild indexes for a label. If async_=True, returns a task ID.
+    #[pyo3(signature = (label, async_=false))]
+    fn rebuild_indexes<'py>(
+        &self,
+        py: Python<'py>,
+        label: String,
+        async_: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let db = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            core::rebuild_indexes_core(&db, &label, async_)
+                .await
+                .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+        })
+    }
+
+    /// Check if an index is currently being rebuilt for a label.
+    fn is_index_building<'py>(
+        &self,
+        py: Python<'py>,
+        label: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let db = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            core::is_index_building_core(&db, &label)
+                .await
+                .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+        })
+    }
+
+    /// List all indexes defined on a specific label.
+    fn list_indexes<'py>(
+        &self,
+        py: Python<'py>,
+        label: String,
+    ) -> PyResult<Vec<crate::types::IndexDefinitionInfo>> {
+        core::list_indexes_core(&self.inner, &label)
+            .into_iter()
+            .map(|i| convert::index_definition_to_py(py, i))
+            .collect()
+    }
+
+    /// List all indexes in the database.
+    fn list_all_indexes<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Vec<crate::types::IndexDefinitionInfo>> {
+        core::list_all_indexes_core(&self.inner)
+            .into_iter()
+            .map(|i| convert::index_definition_to_py(py, i))
+            .collect()
+    }
+}
+
+// ============================================================================
+// AsyncXervo
+// ============================================================================
+
+/// Async facade for Uni-Xervo embedding and generation.
+#[pyclass]
+pub struct AsyncXervo {
+    inner: Arc<Uni>,
+}
+
+#[pymethods]
+impl AsyncXervo {
+    /// Embed texts using a configured model alias (async).
+    fn embed<'py>(
+        &self,
+        py: Python<'py>,
+        alias: String,
+        texts: Vec<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let db = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            core::xervo_embed_core(&db, &alias, texts)
+                .await
+                .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+        })
+    }
+
+    /// Generate text using structured messages (async).
+    ///
+    /// Each message may be a `Message` instance or a dict with `"role"` and `"content"` keys.
+    #[pyo3(signature = (alias, messages, max_tokens=None, temperature=None, top_p=None))]
+    fn generate<'py>(
+        &self,
+        py: Python<'py>,
+        alias: String,
+        messages: Vec<Py<PyAny>>,
+        max_tokens: Option<usize>,
+        temperature: Option<f32>,
+        top_p: Option<f32>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let db = self.inner.clone();
+        // Extract messages while the GIL is held, before entering the async block.
+        let msg_pairs = crate::convert::extract_messages(py, messages)?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let result =
+                core::xervo_generate_core(&db, &alias, msg_pairs, max_tokens, temperature, top_p)
+                    .await
+                    .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
+            Python::attach(|py| crate::convert::generation_result_to_py(py, result))
+        })
+    }
+
+    /// Generate text from a single user prompt (async). Convenience wrapper around `generate()`.
+    #[pyo3(signature = (alias, prompt, max_tokens=None, temperature=None, top_p=None))]
+    fn generate_text<'py>(
+        &self,
+        py: Python<'py>,
+        alias: String,
+        prompt: String,
+        max_tokens: Option<usize>,
+        temperature: Option<f32>,
+        top_p: Option<f32>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let db = self.inner.clone();
+        let msg_pairs = vec![("user".to_string(), prompt)];
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let result =
+                core::xervo_generate_core(&db, &alias, msg_pairs, max_tokens, temperature, top_p)
+                    .await
+                    .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
+            Python::attach(|py| crate::convert::generation_result_to_py(py, result))
         })
     }
 }
@@ -593,6 +855,11 @@ pub struct AsyncDatabaseBuilder {
     hybrid_remote: Option<String>,
     cache_size: Option<usize>,
     parallelism: Option<usize>,
+    schema_file: Option<String>,
+    xervo_catalog_json: Option<String>,
+    xervo_catalog_file: Option<String>,
+    cloud_config: Option<uni_common::CloudStorageConfig>,
+    uni_config: Option<uni_common::UniConfig>,
 }
 
 #[pymethods]
@@ -607,6 +874,11 @@ impl AsyncDatabaseBuilder {
             hybrid_remote: None,
             cache_size: None,
             parallelism: None,
+            schema_file: None,
+            xervo_catalog_json: None,
+            xervo_catalog_file: None,
+            cloud_config: None,
+            uni_config: None,
         }
     }
 
@@ -620,6 +892,11 @@ impl AsyncDatabaseBuilder {
             hybrid_remote: None,
             cache_size: None,
             parallelism: None,
+            schema_file: None,
+            xervo_catalog_json: None,
+            xervo_catalog_file: None,
+            cloud_config: None,
+            uni_config: None,
         }
     }
 
@@ -633,6 +910,11 @@ impl AsyncDatabaseBuilder {
             hybrid_remote: None,
             cache_size: None,
             parallelism: None,
+            schema_file: None,
+            xervo_catalog_json: None,
+            xervo_catalog_file: None,
+            cloud_config: None,
+            uni_config: None,
         }
     }
 
@@ -646,6 +928,11 @@ impl AsyncDatabaseBuilder {
             hybrid_remote: None,
             cache_size: None,
             parallelism: None,
+            schema_file: None,
+            xervo_catalog_json: None,
+            xervo_catalog_file: None,
+            cloud_config: None,
+            uni_config: None,
         }
     }
 
@@ -678,6 +965,46 @@ impl AsyncDatabaseBuilder {
         slf
     }
 
+    /// Load schema from a JSON file on initialization.
+    fn schema_file(mut slf: PyRefMut<'_, Self>, path: String) -> PyRefMut<'_, Self> {
+        slf.schema_file = Some(path);
+        slf
+    }
+
+    /// Configure the Xervo model catalog from a JSON string.
+    fn xervo_catalog_from_str(mut slf: PyRefMut<'_, Self>, json: String) -> PyRefMut<'_, Self> {
+        slf.xervo_catalog_json = Some(json);
+        slf.xervo_catalog_file = None;
+        slf
+    }
+
+    /// Configure the Xervo model catalog from a JSON file path.
+    fn xervo_catalog_from_file(mut slf: PyRefMut<'_, Self>, path: String) -> PyRefMut<'_, Self> {
+        slf.xervo_catalog_file = Some(path);
+        slf.xervo_catalog_json = None;
+        slf
+    }
+
+    /// Configure cloud storage credentials (dict with 'provider' key: 's3', 'gcs', or 'azure').
+    fn cloud_config(
+        mut slf: PyRefMut<'_, Self>,
+        config: std::collections::HashMap<String, Py<PyAny>>,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        let py = slf.py();
+        slf.cloud_config = Some(crate::convert::extract_cloud_config(py, &config)?);
+        Ok(slf)
+    }
+
+    /// Configure database options (query_timeout, max_query_memory, etc.).
+    fn config(
+        mut slf: PyRefMut<'_, Self>,
+        config: std::collections::HashMap<String, Py<PyAny>>,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        let py = slf.py();
+        slf.uni_config = Some(crate::convert::extract_uni_config(py, &config)?);
+        Ok(slf)
+    }
+
     /// Build and return the AsyncDatabase instance (returns awaitable).
     fn build<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let uri = self.uri.clone();
@@ -686,6 +1013,11 @@ impl AsyncDatabaseBuilder {
         let hybrid_remote = self.hybrid_remote.clone();
         let cache_size = self.cache_size;
         let parallelism = self.parallelism;
+        let schema_file = self.schema_file.clone();
+        let xervo_catalog_json = self.xervo_catalog_json.clone();
+        let xervo_catalog_file = self.xervo_catalog_file.clone();
+        let cloud_config = self.cloud_config.clone();
+        let uni_config = self.uni_config.clone();
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let uni = core::build_database_core(
@@ -695,6 +1027,11 @@ impl AsyncDatabaseBuilder {
                 hybrid_remote.as_deref(),
                 cache_size,
                 parallelism,
+                schema_file.as_deref(),
+                xervo_catalog_json.as_deref(),
+                xervo_catalog_file.as_deref(),
+                cloud_config,
+                uni_config,
             )
             .await
             .map_err(PyErr::new::<pyo3::exceptions::PyIOError, _>)?;
@@ -1129,6 +1466,32 @@ impl AsyncQueryBuilder {
         slf
     }
 
+    /// Open a streaming cursor for this query (returns awaitable).
+    fn cursor<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let mut rust_params = HashMap::new();
+        for (k, v) in &self.params {
+            let val = convert::py_object_to_value(py, v)?;
+            rust_params.insert(k.clone(), val);
+        }
+
+        let inner = self.inner.clone();
+        let cypher = self.cypher.clone();
+        let timeout_secs = self.timeout_secs;
+        let max_memory = self.max_memory;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let cursor =
+                core::query_cursor_core(&inner, &cypher, rust_params, timeout_secs, max_memory)
+                    .await
+                    .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
+            let columns = cursor.columns().to_vec();
+            Ok(AsyncQueryCursor {
+                cursor: Arc::new(tokio::sync::Mutex::new(Some(cursor))),
+                buffer: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
+                columns,
+            })
+        })
+    }
+
     /// Execute the query and fetch all results (returns awaitable).
     fn run<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let mut rust_params = HashMap::new();
@@ -1147,6 +1510,189 @@ impl AsyncQueryBuilder {
                     .await
                     .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
             Python::attach(|py| convert::rows_to_py(py, rows.rows))
+        })
+    }
+}
+
+// ============================================================================
+// AsyncQueryCursor
+// ============================================================================
+
+/// Async cursor-based result streaming for large query result sets.
+///
+/// Implements Python's async iterator (`__aiter__`/`__anext__`) and async context
+/// manager (`__aenter__`/`__aexit__`).
+#[pyclass]
+pub struct AsyncQueryCursor {
+    cursor: Arc<tokio::sync::Mutex<Option<core::QueryCursor>>>,
+    buffer: Arc<tokio::sync::Mutex<VecDeque<core::Row>>>,
+    #[pyo3(get)]
+    columns: Vec<String>,
+}
+
+impl AsyncQueryCursor {
+    /// Pull the next single row, refilling from the batch stream as needed.
+    async fn next_row_async(&self) -> Result<Option<core::Row>, String> {
+        {
+            let mut buf = self.buffer.lock().await;
+            if let Some(row) = buf.pop_front() {
+                return Ok(Some(row));
+            }
+        }
+        // Buffer empty – fetch next batch from cursor.
+        let mut guard = self.cursor.lock().await;
+        let cursor = match guard.as_mut() {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+        match cursor.next_batch().await {
+            Some(Ok(rows)) => {
+                let mut buf = self.buffer.lock().await;
+                let mut iter = rows.into_iter();
+                let first = iter.next();
+                buf.extend(iter);
+                Ok(first)
+            }
+            Some(Err(e)) => Err(e.to_string()),
+            None => Ok(None),
+        }
+    }
+}
+
+#[pymethods]
+impl AsyncQueryCursor {
+    /// Fetch a single row, or `None` if exhausted.
+    fn fetch_one<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let cursor = self.cursor.clone();
+        let buffer = self.buffer.clone();
+        let self_clone = AsyncQueryCursor {
+            cursor,
+            buffer,
+            columns: self.columns.clone(),
+        };
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            match self_clone.next_row_async().await {
+                Ok(Some(row)) => Python::attach(|py| {
+                    let dict = PyDict::new(py);
+                    for (col, val) in row.as_map() {
+                        dict.set_item(col, convert::value_to_py(py, val)?)?;
+                    }
+                    Ok(Some(dict.into_py_any(py)?))
+                }),
+                Ok(None) => Ok(None),
+                Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e)),
+            }
+        })
+    }
+
+    /// Fetch up to `n` rows.
+    #[pyo3(signature = (n))]
+    fn fetch_many<'py>(&self, py: Python<'py>, n: usize) -> PyResult<Bound<'py, PyAny>> {
+        let cursor = self.cursor.clone();
+        let buffer = self.buffer.clone();
+        let self_clone = AsyncQueryCursor {
+            cursor,
+            buffer,
+            columns: self.columns.clone(),
+        };
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let mut rows = Vec::with_capacity(n);
+            for _ in 0..n {
+                match self_clone.next_row_async().await {
+                    Ok(Some(row)) => rows.push(row),
+                    Ok(None) => break,
+                    Err(e) => return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e)),
+                }
+            }
+            Python::attach(|py| convert::rows_to_py(py, rows))
+        })
+    }
+
+    /// Fetch all remaining rows.
+    fn fetch_all<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let cursor_arc = self.cursor.clone();
+        let buffer_arc = self.buffer.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            // Drain buffer first
+            let mut rows: Vec<core::Row> = {
+                let mut buf = buffer_arc.lock().await;
+                buf.drain(..).collect()
+            };
+            // Take and consume the cursor
+            let cursor_opt = {
+                let mut guard = cursor_arc.lock().await;
+                guard.take()
+            };
+            if let Some(cursor) = cursor_opt {
+                let remaining = cursor.collect_remaining().await.map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
+                })?;
+                rows.extend(remaining);
+            }
+            Python::attach(|py| convert::rows_to_py(py, rows))
+        })
+    }
+
+    /// Close the cursor, releasing resources.
+    fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let cursor_arc = self.cursor.clone();
+        let buffer_arc = self.buffer.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let _ = cursor_arc.lock().await.take();
+            buffer_arc.lock().await.clear();
+            Ok(())
+        })
+    }
+
+    fn __aiter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let cursor = self.cursor.clone();
+        let buffer = self.buffer.clone();
+        let self_clone = AsyncQueryCursor {
+            cursor,
+            buffer,
+            columns: self.columns.clone(),
+        };
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            match self_clone.next_row_async().await {
+                Ok(Some(row)) => Python::attach(|py| {
+                    let dict = PyDict::new(py);
+                    for (col, val) in row.as_map() {
+                        dict.set_item(col, convert::value_to_py(py, val)?)?;
+                    }
+                    dict.into_py_any(py)
+                }),
+                Ok(None) => Err(pyo3::exceptions::PyStopAsyncIteration::new_err(
+                    "end of cursor",
+                )),
+                Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e)),
+            }
+        })
+    }
+
+    fn __aenter__<'py>(slf: PyRef<'py, Self>) -> PyResult<Bound<'py, PyAny>> {
+        let py = slf.py();
+        let obj: Py<PyAny> = slf.into_py_any(py)?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok(obj) })
+    }
+
+    #[pyo3(signature = (_exc_type=None, _exc_val=None, _exc_tb=None))]
+    fn __aexit__<'py>(
+        &self,
+        py: Python<'py>,
+        _exc_type: Option<Py<PyAny>>,
+        _exc_val: Option<Py<PyAny>>,
+        _exc_tb: Option<Py<PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let cursor_arc = self.cursor.clone();
+        let buffer_arc = self.buffer.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let _ = cursor_arc.lock().await.take();
+            buffer_arc.lock().await.clear();
+            Ok(false) // don't suppress exceptions
         })
     }
 }

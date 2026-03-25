@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Dragonscale Team
 
+//! Index lifecycle management: creation, rebuild, and incremental updates for all index types.
+
 use crate::storage::inverted_index::InvertedIndex;
 use crate::storage::vertex::VertexDataset;
 use anyhow::{Result, anyhow};
@@ -68,13 +70,23 @@ pub struct IndexRebuildTask {
     pub retry_count: u32,
 }
 
+/// Manages physical and logical indexes across all vertex datasets.
 pub struct IndexManager {
     base_uri: String,
     schema_manager: Arc<SchemaManager>,
     lancedb_store: Arc<crate::lancedb::LanceDbStore>,
 }
 
+impl std::fmt::Debug for IndexManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IndexManager")
+            .field("base_uri", &self.base_uri)
+            .finish_non_exhaustive()
+    }
+}
+
 impl IndexManager {
+    /// Create a new `IndexManager` bound to `base_uri` and the given schema and LanceDB store.
     pub fn new(
         base_uri: &str,
         schema_manager: Arc<SchemaManager>,
@@ -87,6 +99,7 @@ impl IndexManager {
         }
     }
 
+    /// Build and persist an inverted index for set-membership queries.
     #[instrument(skip(self), level = "info")]
     pub async fn create_inverted_index(&self, config: InvertedIndexConfig) -> Result<()> {
         let label = &config.label;
@@ -103,7 +116,6 @@ impl IndexManager {
             .ok_or_else(|| anyhow!("Label '{}' not found", label))?;
 
         let mut index = InvertedIndex::new(&self.base_uri, config.clone()).await?;
-        index.create_if_missing().await?;
 
         let ds = VertexDataset::new(&self.base_uri, label, label_meta.id);
 
@@ -126,6 +138,7 @@ impl IndexManager {
         Ok(())
     }
 
+    /// Build and persist a vector (ANN) index on an embedding column.
     #[instrument(skip(self), level = "info")]
     pub async fn create_vector_index(&self, config: VectorIndexConfig) -> Result<()> {
         let label = &config.label;
@@ -223,6 +236,7 @@ impl IndexManager {
         Ok(())
     }
 
+    /// Build and persist a scalar (BTree) index for exact-match and range queries.
     #[instrument(skip(self), level = "info")]
     pub async fn create_scalar_index(&self, config: ScalarIndexConfig) -> Result<()> {
         let label = &config.label;
@@ -275,6 +289,7 @@ impl IndexManager {
         Ok(())
     }
 
+    /// Build and persist a full-text search (Lance inverted) index.
     #[instrument(skip(self), level = "info")]
     pub async fn create_fts_index(&self, config: FullTextIndexConfig) -> Result<()> {
         let label = &config.label;
@@ -386,6 +401,7 @@ impl IndexManager {
         Ok(())
     }
 
+    /// Remove an index definition from the schema (physical drop is not yet supported).
     #[instrument(skip(self), level = "info")]
     pub async fn drop_index(&self, name: &str) -> Result<()> {
         info!("Dropping index '{}'", name);
@@ -405,6 +421,7 @@ impl IndexManager {
         Ok(())
     }
 
+    /// Rebuild all indexes registered for `label` from scratch.
     #[instrument(skip(self), level = "info")]
     pub async fn rebuild_indexes_for_label(&self, label: &str) -> Result<()> {
         info!("Rebuilding all indexes for label '{}'", label);

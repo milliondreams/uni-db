@@ -36,7 +36,7 @@ use uni_cypher::ast::Expr;
 
 use crate::query::df_graph::GraphExecutionContext;
 use crate::query::df_graph::common::{
-    calculate_score, compute_plan_properties, evaluate_simple_expr, labels_data_type,
+    arrow_err, calculate_score, compute_plan_properties, evaluate_simple_expr, labels_data_type,
 };
 use crate::query::df_graph::scan::resolve_property_type;
 
@@ -900,8 +900,7 @@ fn build_typed_column<'a>(
 fn create_empty_batch(schema: SchemaRef) -> DFResult<RecordBatch> {
     if schema.fields().is_empty() {
         let options = arrow_array::RecordBatchOptions::new().with_row_count(Some(0));
-        RecordBatch::try_new_with_options(schema, vec![], &options)
-            .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+        RecordBatch::try_new_with_options(schema, vec![], &options).map_err(arrow_err)
     } else {
         Ok(RecordBatch::new_empty(schema))
     }
@@ -926,8 +925,7 @@ fn build_scalar_batch(
         columns.push(build_typed_column(values, num_rows, field.data_type()));
     }
 
-    let batch = RecordBatch::try_new(schema.clone(), columns)
-        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+    let batch = RecordBatch::try_new(schema.clone(), columns).map_err(arrow_err)?;
     Ok(Some(batch))
 }
 
@@ -1016,8 +1014,7 @@ async fn execute_registered_procedure(
         columns.push(build_typed_column(values, num_rows, field.data_type()));
     }
 
-    let batch = RecordBatch::try_new(schema.clone(), columns)
-        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+    let batch = RecordBatch::try_new(schema.clone(), columns).map_err(arrow_err)?;
     Ok(Some(batch))
 }
 
@@ -1157,8 +1154,7 @@ fn build_algo_batch(
         columns.push(build_typed_column(values, num_rows, field.data_type()));
     }
 
-    let batch = RecordBatch::try_new(schema.clone(), columns)
-        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+    let batch = RecordBatch::try_new(schema.clone(), columns).map_err(arrow_err)?;
     Ok(Some(batch))
 }
 
@@ -1692,8 +1688,7 @@ async fn build_hybrid_search_batch(
         }
     }
 
-    let batch = RecordBatch::try_new(schema.clone(), columns)
-        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+    let batch = RecordBatch::try_new(schema.clone(), columns).map_err(arrow_err)?;
     Ok(Some(batch))
 }
 
@@ -1792,8 +1787,7 @@ async fn build_search_result_batch(
         }
     }
 
-    let batch = RecordBatch::try_new(schema.clone(), columns)
-        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+    let batch = RecordBatch::try_new(schema.clone(), columns).map_err(arrow_err)?;
     Ok(Some(batch))
 }
 

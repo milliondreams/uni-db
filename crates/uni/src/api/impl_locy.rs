@@ -15,16 +15,29 @@ use uni_cypher::locy_ast::RuleOutput;
 use uni_locy::types::CompiledCommand;
 use uni_locy::{
     CommandResult, CompiledProgram, LocyCompileError, LocyConfig, LocyError, LocyResult, LocyStats,
-    Row, SavepointId, compile,
+    Row, RuntimeWarning, SavepointId, compile,
 };
 use uni_query::QueryPlanner;
 use uni_query::query::df_graph::locy_ast_builder::build_match_return_query;
 use uni_query::query::df_graph::locy_delta::{RowRelation, RowStore, extract_cypher_conditions};
 use uni_query::query::df_graph::locy_eval::record_batches_to_locy_rows;
-use uni_query::query::df_graph::locy_explain::DerivationTracker;
+use uni_query::query::df_graph::locy_explain::ProvenanceStore;
 use uni_query::query::df_graph::{DerivedFactSource, LocyExecutionContext};
 
 use crate::api::Uni;
+
+/// Session-level registry for pre-compiled Locy rules.
+///
+/// Rules registered here are automatically merged into subsequent `evaluate()`
+/// calls, eliminating the need to redeclare rules across multiple evaluations
+/// (e.g., baseline, EXPLAIN, ASSUME, ABDUCE in notebooks).
+#[derive(Debug, Default, Clone)]
+pub struct LocyRuleRegistry {
+    /// Compiled rules indexed by rule name.
+    pub rules: HashMap<String, uni_locy::types::CompiledRule>,
+    /// Strata from registered programs, for execution ordering.
+    pub strata: Vec<uni_locy::types::Stratum>,
+}
 
 /// Engine for evaluating Locy programs against a real database.
 pub struct LocyEngine<'a> {
@@ -40,9 +53,51 @@ impl Uni {
 
 impl<'a> LocyEngine<'a> {
     /// Parse and compile a Locy program without executing it.
+    ///
+    /// If the session's rule registry contains pre-compiled rules, their names
+    /// are passed to the compiler so that IS-ref and QUERY references to
+    /// registered rules are accepted during validation.
     pub fn compile_only(&self, program: &str) -> Result<CompiledProgram> {
         let ast = uni_cypher::parse_locy(program).map_err(map_parse_error)?;
-        compile(&ast).map_err(map_compile_error)
+        let registry = self.db.locy_rule_registry.read().unwrap();
+        if registry.rules.is_empty() {
+            drop(registry);
+            compile(&ast).map_err(map_compile_error)
+        } else {
+            let external_names: Vec<String> = registry.rules.keys().cloned().collect();
+            drop(registry);
+            uni_locy::compile_with_external_rules(&ast, &external_names).map_err(map_compile_error)
+        }
+    }
+
+    /// Compile and register a Locy program's rules for reuse.
+    ///
+    /// Rules registered here persist within the database session and are
+    /// automatically merged into subsequent `evaluate()` calls, so notebooks
+    /// can define rules once and run QUERY, EXPLAIN, ASSUME, ABDUCE without
+    /// redeclaring the full rule set each time.
+    pub fn register(&self, program: &str) -> Result<()> {
+        let compiled = self.compile_only(program)?;
+        let mut registry = self.db.locy_rule_registry.write().unwrap();
+        for (name, rule) in compiled.rule_catalog {
+            registry.rules.insert(name, rule);
+        }
+        // Merge strata, assigning new IDs to avoid collisions.
+        let base_id = registry.strata.len();
+        for mut stratum in compiled.strata {
+            let old_id = stratum.id;
+            stratum.id = base_id + old_id;
+            stratum.depends_on = stratum.depends_on.iter().map(|d| base_id + d).collect();
+            registry.strata.push(stratum);
+        }
+        Ok(())
+    }
+
+    /// Clear all registered Locy rules from the session.
+    pub fn clear_registry(&self) {
+        let mut registry = self.db.locy_rule_registry.write().unwrap();
+        registry.rules.clear();
+        registry.strata.clear();
     }
 
     /// Parse, compile, and evaluate a Locy program with default config.
@@ -51,18 +106,63 @@ impl<'a> LocyEngine<'a> {
             .await
     }
 
+    /// Start building a Locy evaluation with fluent parameter binding.
+    ///
+    /// Mirrors `db.query_with(cypher).param(…).fetch_all()` for Cypher.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use uni_db::Uni;
+    /// # async fn example(db: &Uni) -> uni_db::Result<()> {
+    /// let result = db.locy()
+    ///     .evaluate_with("CREATE RULE ep AS MATCH (e:Episode) WHERE e.agent_id = $aid YIELD KEY e")
+    ///     .param("aid", "agent-123")
+    ///     .run()
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn evaluate_with(&self, program: &str) -> crate::api::locy_builder::LocyBuilder<'_> {
+        crate::api::locy_builder::LocyBuilder::new(self.db, program)
+    }
+
     /// Convenience wrapper for EXPLAIN RULE commands.
     pub async fn explain(&self, program: &str) -> Result<LocyResult> {
         self.evaluate(program).await
     }
 
     /// Parse, compile, and evaluate a Locy program with custom config.
+    ///
+    /// If rules were previously registered via `register()`, they are
+    /// automatically merged into the compiled program before execution.
     pub async fn evaluate_with_config(
         &self,
         program: &str,
         config: &LocyConfig,
     ) -> Result<LocyResult> {
-        let compiled = self.compile_only(program)?;
+        let mut compiled = self.compile_only(program)?;
+
+        // Merge registered rules into the compiled program.
+        {
+            let registry = self.db.locy_rule_registry.read().unwrap();
+            if !registry.rules.is_empty() {
+                for (name, rule) in &registry.rules {
+                    compiled
+                        .rule_catalog
+                        .entry(name.clone())
+                        .or_insert_with(|| rule.clone());
+                }
+                let base_id = registry.strata.len();
+                for stratum in &mut compiled.strata {
+                    stratum.id += base_id;
+                    stratum.depends_on = stratum.depends_on.iter().map(|d| d + base_id).collect();
+                }
+                let mut merged_strata = registry.strata.clone();
+                merged_strata.append(&mut compiled.strata);
+                compiled.strata = merged_strata;
+            }
+        }
         let start = Instant::now();
 
         // 1. Build logical plan
@@ -76,6 +176,11 @@ impl<'a> LocyEngine<'a> {
                 config.timeout,
                 config.max_derived_bytes,
                 config.deterministic_best_by,
+                config.strict_probability_domain,
+                config.probability_epsilon,
+                config.exact_probability,
+                config.max_bdd_variables,
+                config.top_k_proofs,
             )
             .map_err(|e| UniError::Query {
                 message: format!("LocyPlanBuildError: {e}"),
@@ -92,46 +197,67 @@ impl<'a> LocyEngine<'a> {
         df_executor.set_procedure_registry(self.db.procedure_registry.clone());
 
         let (session_ctx, planner, _prop_mgr) = df_executor
-            .create_datafusion_planner(&self.db.properties, &HashMap::new())
+            .create_datafusion_planner(&self.db.properties, &config.params)
             .await
             .map_err(map_native_df_error)?;
 
         // 3. Physical plan
         let exec_plan = planner.plan(&logical).map_err(map_native_df_error)?;
 
-        // 4. Create tracker for EXPLAIN commands
+        // 4. Create tracker for EXPLAIN commands or shared-proof detection
         let has_explain = compiled
             .commands
             .iter()
             .any(|c| matches!(c, CompiledCommand::ExplainRule(_)));
-        let tracker: Option<Arc<uni_query::query::df_graph::DerivationTracker>> = if has_explain {
-            Some(Arc::new(
-                uni_query::query::df_graph::DerivationTracker::new(),
-            ))
+        let has_prob_fold = compiled.strata.iter().any(|s| {
+            s.rules.iter().any(|r| {
+                r.clauses.iter().any(|c| {
+                    c.fold.iter().any(|f| {
+                        if let uni_cypher::ast::Expr::FunctionCall { name, .. } = &f.aggregate {
+                            matches!(name.to_uppercase().as_str(), "MNOR" | "MPROD")
+                        } else {
+                            false
+                        }
+                    })
+                })
+            })
+        });
+        let needs_tracker = has_explain || has_prob_fold;
+        let tracker: Option<Arc<uni_query::query::df_graph::ProvenanceStore>> = if needs_tracker {
+            Some(Arc::new(uni_query::query::df_graph::ProvenanceStore::new()))
         } else {
             None
         };
 
-        let (derived_store_slot, iteration_counts_slot, peak_memory_slot) =
-            if let Some(program_exec) = exec_plan
-                .as_any()
-                .downcast_ref::<uni_query::query::df_graph::LocyProgramExec>(
-            ) {
-                if let Some(ref t) = tracker {
-                    program_exec.set_derivation_tracker(Arc::clone(t));
-                }
-                (
-                    program_exec.derived_store_slot(),
-                    program_exec.iteration_counts_slot(),
-                    program_exec.peak_memory_slot(),
-                )
-            } else {
-                (
-                    Arc::new(std::sync::RwLock::new(None)),
-                    Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
-                    Arc::new(std::sync::RwLock::new(0usize)),
-                )
-            };
+        let (
+            derived_store_slot,
+            iteration_counts_slot,
+            peak_memory_slot,
+            warnings_slot,
+            approximate_slot,
+        ) = if let Some(program_exec) = exec_plan
+            .as_any()
+            .downcast_ref::<uni_query::query::df_graph::LocyProgramExec>(
+        ) {
+            if let Some(ref t) = tracker {
+                program_exec.set_derivation_tracker(Arc::clone(t));
+            }
+            (
+                program_exec.derived_store_slot(),
+                program_exec.iteration_counts_slot(),
+                program_exec.peak_memory_slot(),
+                program_exec.warnings_slot(),
+                program_exec.approximate_slot(),
+            )
+        } else {
+            (
+                Arc::new(std::sync::RwLock::new(None)),
+                Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+                Arc::new(std::sync::RwLock::new(0usize)),
+                Arc::new(std::sync::RwLock::new(Vec::new())),
+                Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            )
+        };
 
         // 5. Execute strata
         let _stats_batches = uni_query::Executor::collect_batches(&session_ctx, exec_plan)
@@ -155,6 +281,7 @@ impl<'a> LocyEngine<'a> {
             &compiled,
             planner.graph_ctx().clone(),
             planner.session_ctx().clone(),
+            config.params.clone(),
         );
         let mut locy_stats = LocyStats {
             total_iterations: iteration_counts_slot
@@ -164,6 +291,10 @@ impl<'a> LocyEngine<'a> {
             peak_memory_bytes: peak_memory_slot.read().map(|v| *v).unwrap_or(0),
             ..LocyStats::default()
         };
+        let approx_for_explain = approximate_slot
+            .read()
+            .map(|a| a.clone())
+            .unwrap_or_default();
         let mut command_results = Vec::new();
         for cmd in &compiled.commands {
             let result = dispatch_native_command(
@@ -175,6 +306,7 @@ impl<'a> LocyEngine<'a> {
                 &mut locy_stats,
                 tracker.clone(),
                 start,
+                &approx_for_explain,
             )
             .await
             .map_err(map_runtime_error)?;
@@ -184,7 +316,7 @@ impl<'a> LocyEngine<'a> {
         let evaluation_time = start.elapsed();
 
         // 9. Build derived map, enrich VID columns with full nodes
-        let base_derived: HashMap<String, Vec<Row>> = native_store
+        let mut base_derived: HashMap<String, Vec<Row>> = native_store
             .rule_names()
             .filter_map(|name| {
                 native_store
@@ -192,6 +324,22 @@ impl<'a> LocyEngine<'a> {
                     .map(|batches| (name.to_string(), record_batches_to_locy_rows(batches)))
             })
             .collect();
+
+        // Stamp _approximate on facts in rules that had BDD fallback groups.
+        let approximate_groups = approximate_slot
+            .read()
+            .map(|a| a.clone())
+            .unwrap_or_default();
+        for (rule_name, groups) in &approximate_groups {
+            if !groups.is_empty()
+                && let Some(rows) = base_derived.get_mut(rule_name)
+            {
+                for row in rows.iter_mut() {
+                    row.insert("_approximate".to_string(), Value::Bool(true));
+                }
+            }
+        }
+
         let enriched_derived = enrich_vids_with_nodes(
             self.db,
             &native_store,
@@ -202,12 +350,15 @@ impl<'a> LocyEngine<'a> {
         .await;
 
         // 10. Build final LocyResult
+        let warnings = warnings_slot.read().map(|w| w.clone()).unwrap_or_default();
         Ok(build_locy_result(
             enriched_derived,
             command_results,
             &compiled,
             evaluation_time,
             locy_stats,
+            warnings,
+            approximate_groups,
         ))
     }
 
@@ -231,6 +382,11 @@ impl<'a> LocyEngine<'a> {
                 config.timeout,
                 config.max_derived_bytes,
                 config.deterministic_best_by,
+                config.strict_probability_domain,
+                config.probability_epsilon,
+                config.exact_probability,
+                config.max_bdd_variables,
+                config.top_k_proofs,
             )
             .map_err(|e| UniError::Query {
                 message: format!("LocyPlanBuildError: {e}"),
@@ -281,6 +437,9 @@ struct NativeExecutionAdapter<'a> {
     /// Execution contexts from the fixpoint planner for columnar query execution.
     graph_ctx: Arc<uni_query::query::df_graph::GraphExecutionContext>,
     session_ctx: Arc<parking_lot::RwLock<datafusion::prelude::SessionContext>>,
+    /// Query parameters threaded from LocyConfig; passed to execute_subplan so
+    /// that $param references in rule MATCH WHERE clauses are resolved.
+    params: HashMap<String, Value>,
 }
 
 impl<'a> NativeExecutionAdapter<'a> {
@@ -290,6 +449,7 @@ impl<'a> NativeExecutionAdapter<'a> {
         compiled: &'a CompiledProgram,
         graph_ctx: Arc<uni_query::query::df_graph::GraphExecutionContext>,
         session_ctx: Arc<parking_lot::RwLock<datafusion::prelude::SessionContext>>,
+        params: HashMap<String, Value>,
     ) -> Self {
         Self {
             db,
@@ -297,6 +457,7 @@ impl<'a> NativeExecutionAdapter<'a> {
             compiled,
             graph_ctx,
             session_ctx,
+            params,
         }
     }
 
@@ -314,7 +475,7 @@ impl<'a> NativeExecutionAdapter<'a> {
                 })?;
         uni_query::query::df_graph::common::execute_subplan(
             &logical_plan,
-            &HashMap::new(),
+            &self.params,
             &HashMap::new(),
             &self.graph_ctx,
             &self.session_ctx,
@@ -364,12 +525,44 @@ impl DerivedFactSource for NativeExecutionAdapter<'_> {
                     message: e.to_string(),
                 })?;
 
+        // When a savepoint transaction is active (e.g., inside ASSUME/ABDUCE mutations),
+        // the stored graph_ctx was built before the savepoint mutations and its L0Context
+        // does not include the transaction-local L0 buffer. Rebuild a temporary context
+        // that includes transaction_l0 so pattern queries see the hypothetical state.
+        let transaction_ctx: Option<Arc<uni_query::query::df_graph::GraphExecutionContext>> =
+            if let Some(writer_arc) = &self.db.writer {
+                if let Ok(writer) = writer_arc.try_read() {
+                    if writer.transaction_l0.is_some() {
+                        let l0_ctx = uni_query::query::df_graph::L0Context {
+                            current_l0: Some(writer.l0_manager.get_current()),
+                            transaction_l0: writer.transaction_l0.clone(),
+                            pending_flush_l0s: writer.l0_manager.get_pending_flush(),
+                        };
+                        Some(Arc::new(
+                            uni_query::query::df_graph::GraphExecutionContext::with_l0_context(
+                                self.db.storage.clone(),
+                                l0_ctx,
+                                self.graph_ctx.property_manager().clone(),
+                            ),
+                        ))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+        let effective_ctx = transaction_ctx.as_ref().unwrap_or(&self.graph_ctx);
+
         // Use the fixpoint planner's execution contexts directly via execute_subplan.
         uni_query::query::df_graph::common::execute_subplan(
             &logical_plan,
+            &self.params,
             &HashMap::new(),
-            &HashMap::new(),
-            &self.graph_ctx,
+            effective_ctx,
             &self.session_ctx,
             &self.db.storage,
             &self.db.schema.schema(),
@@ -587,8 +780,9 @@ fn dispatch_native_command<'a>(
     config: &'a LocyConfig,
     orch_store: &'a mut RowStore,
     stats: &'a mut LocyStats,
-    tracker: Option<Arc<DerivationTracker>>,
+    tracker: Option<Arc<ProvenanceStore>>,
     start: Instant,
+    approximate_groups: &'a HashMap<String, Vec<String>>,
 ) -> std::pin::Pin<
     Box<dyn std::future::Future<Output = std::result::Result<CommandResult, LocyError>> + 'a>,
 > {
@@ -610,6 +804,7 @@ fn dispatch_native_command<'a>(
                     orch_store,
                     stats,
                     tracker.as_deref(),
+                    Some(approximate_groups),
                 )
                 .await?;
                 Ok(CommandResult::Explain(node))
@@ -760,6 +955,8 @@ fn build_locy_result(
     compiled: &CompiledProgram,
     evaluation_time: Duration,
     mut orchestrator_stats: LocyStats,
+    warnings: Vec<RuntimeWarning>,
+    approximate_groups: HashMap<String, Vec<String>>,
 ) -> LocyResult {
     let total_facts: usize = derived.values().map(|v| v.len()).sum();
     orchestrator_stats.strata_evaluated = compiled.strata.len();
@@ -770,6 +967,8 @@ fn build_locy_result(
         derived,
         stats: orchestrator_stats,
         command_results,
+        warnings,
+        approximate_groups,
     }
 }
 

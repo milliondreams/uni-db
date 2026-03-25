@@ -8,11 +8,14 @@
 
 use crate::query::df_graph::GraphExecutionContext;
 use crate::query::df_graph::common::{
-    ScalarKey, collect_all_partitions, compute_plan_properties, execute_subplan, extract_scalar_key,
+    ScalarKey, arrow_err, collect_all_partitions, compute_plan_properties, execute_subplan,
+    extract_scalar_key,
 };
 use crate::query::df_graph::locy_best_by::{BestByExec, SortCriterion};
 use crate::query::df_graph::locy_errors::LocyRuntimeError;
-use crate::query::df_graph::locy_explain::{DerivationEntry, DerivationTracker};
+use crate::query::df_graph::locy_explain::{
+    ProofTerm, ProvenanceAnnotation, ProvenanceStore, compute_proof_probability,
+};
 use crate::query::df_graph::locy_fold::{FoldBinding, FoldExec};
 use crate::query::df_graph::locy_priority::PriorityExec;
 use crate::query::planner::LogicalPlan;
@@ -37,6 +40,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use uni_common::Value;
 use uni_common::core::schema::Schema as UniSchema;
+use uni_locy::RuntimeWarning;
 use uni_store::storage::manager::StorageManager;
 
 // ---------------------------------------------------------------------------
@@ -143,8 +147,17 @@ impl MonotonicAggState {
         }
     }
 
-    /// Update accumulators with new delta batches. Returns true if any value changed.
-    pub fn update(&mut self, key_indices: &[usize], delta_batches: &[RecordBatch]) -> bool {
+    /// Update accumulators with new delta batches.
+    ///
+    /// Returns `true` if any accumulator value changed. When `strict` is
+    /// `true`, Nor/Prod inputs outside `[0, 1]` produce an error instead
+    /// of being clamped.
+    pub fn update(
+        &mut self,
+        key_indices: &[usize],
+        delta_batches: &[RecordBatch],
+        strict: bool,
+    ) -> DFResult<bool> {
         use crate::query::df_graph::locy_fold::FoldAggKind;
 
         let mut changed = false;
@@ -156,15 +169,10 @@ impl MonotonicAggState {
                     let val = extract_f64(col.as_ref(), row_idx);
                     if let Some(val) = val {
                         let map_key = (group_key.clone(), binding.fold_name.clone());
-                        let entry =
-                            self.accumulators
-                                .entry(map_key)
-                                .or_insert(match binding.kind {
-                                    FoldAggKind::Sum | FoldAggKind::Count | FoldAggKind::Avg => 0.0,
-                                    FoldAggKind::Max => f64::NEG_INFINITY,
-                                    FoldAggKind::Min => f64::INFINITY,
-                                    FoldAggKind::Collect => 0.0,
-                                });
+                        let entry = self
+                            .accumulators
+                            .entry(map_key)
+                            .or_insert(binding.kind.identity().unwrap_or(0.0));
                         let old = *entry;
                         match binding.kind {
                             FoldAggKind::Sum | FoldAggKind::Count => *entry += val,
@@ -178,6 +186,40 @@ impl MonotonicAggState {
                                     *entry = val;
                                 }
                             }
+                            FoldAggKind::Nor => {
+                                if strict && !(0.0..=1.0).contains(&val) {
+                                    return Err(datafusion::error::DataFusionError::Execution(
+                                        format!(
+                                            "strict_probability_domain: MNOR input {val} is outside [0, 1]"
+                                        ),
+                                    ));
+                                }
+                                if !strict && !(0.0..=1.0).contains(&val) {
+                                    tracing::warn!(
+                                        "MNOR input {val} outside [0,1], clamped to {}",
+                                        val.clamp(0.0, 1.0)
+                                    );
+                                }
+                                let p = val.clamp(0.0, 1.0);
+                                *entry = 1.0 - (1.0 - *entry) * (1.0 - p);
+                            }
+                            FoldAggKind::Prod => {
+                                if strict && !(0.0..=1.0).contains(&val) {
+                                    return Err(datafusion::error::DataFusionError::Execution(
+                                        format!(
+                                            "strict_probability_domain: MPROD input {val} is outside [0, 1]"
+                                        ),
+                                    ));
+                                }
+                                if !strict && !(0.0..=1.0).contains(&val) {
+                                    tracing::warn!(
+                                        "MPROD input {val} outside [0,1], clamped to {}",
+                                        val.clamp(0.0, 1.0)
+                                    );
+                                }
+                                let p = val.clamp(0.0, 1.0);
+                                *entry *= p;
+                            }
                             _ => {}
                         }
                         if (*entry - old).abs() > f64::EPSILON {
@@ -187,7 +229,7 @@ impl MonotonicAggState {
                 }
             }
         }
-        changed
+        Ok(changed)
     }
 
     /// Take a snapshot of current accumulators for stability comparison.
@@ -207,6 +249,12 @@ impl MonotonicAggState {
             }
         }
         true
+    }
+
+    /// Test-only accessor for accumulator values.
+    #[cfg(test)]
+    pub(crate) fn get_accumulator(&self, key: &(Vec<ScalarKey>, String)) -> Option<f64> {
+        self.accumulators.get(key).copied()
     }
 }
 
@@ -264,6 +312,26 @@ impl RowDedupState {
         }
     }
 
+    /// Populate the seen set from existing fact batches.
+    ///
+    /// Used after BEST BY in-loop pruning replaces the fact set, so that delta
+    /// computation in subsequent iterations correctly recognizes surviving facts.
+    fn ingest_existing(&mut self, facts: &[RecordBatch], _schema: &SchemaRef) {
+        self.seen.clear();
+        for batch in facts {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let arrays: Vec<_> = batch.columns().to_vec();
+            if let Ok(rows) = self.converter.convert_columns(&arrays) {
+                for row_idx in 0..batch.num_rows() {
+                    let row_bytes: Box<[u8]> = rows.row(row_idx).data().into();
+                    self.seen.insert(row_bytes);
+                }
+            }
+        }
+    }
+
     /// Filter `candidates` to only rows not yet seen, updating the persistent set.
     ///
     /// Both cross-iteration dedup (rows already accepted in prior iterations) and
@@ -282,10 +350,7 @@ impl RowDedupState {
 
             // Vectorized encoding of all rows in this batch.
             let arrays: Vec<_> = batch.columns().to_vec();
-            let rows = self
-                .converter
-                .convert_columns(&arrays)
-                .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+            let rows = self.converter.convert_columns(&arrays).map_err(arrow_err)?;
 
             // One pass: check+insert into persistent seen set.
             let mut keep = Vec::with_capacity(batch.num_rows());
@@ -341,6 +406,8 @@ pub struct FixpointState {
     monotonic_agg: Option<MonotonicAggState>,
     /// Arrow RowConverter-based dedup state; `None` triggers legacy fallback.
     row_dedup: Option<RowDedupState>,
+    /// Whether strict probability domain checks are enabled.
+    strict_probability_domain: bool,
 }
 
 impl FixpointState {
@@ -351,6 +418,7 @@ impl FixpointState {
         key_column_indices: Vec<usize>,
         max_derived_bytes: usize,
         monotonic_agg: Option<MonotonicAggState>,
+        strict_probability_domain: bool,
     ) -> Self {
         let num_cols = schema.fields().len();
         let row_dedup = RowDedupState::try_new(&schema);
@@ -365,6 +433,24 @@ impl FixpointState {
             max_derived_bytes,
             monotonic_agg,
             row_dedup,
+            strict_probability_domain,
+        }
+    }
+
+    /// Reconcile the pre-computed schema with the actual physical plan output.
+    ///
+    /// `infer_expr_type` may guess wrong (e.g. `Property → Float64` for a
+    /// string column).  When the first real batch arrives with a different
+    /// schema, update ours so that `RowDedupState` / `RecordBatch::try_new`
+    /// use the correct types.
+    fn reconcile_schema(&mut self, actual_schema: &SchemaRef) {
+        if self.schema.fields() != actual_schema.fields() {
+            tracing::debug!(
+                rule = %self.rule_name,
+                "Reconciling fixpoint schema from physical plan output",
+            );
+            self.schema = Arc::clone(actual_schema);
+            self.row_dedup = RowDedupState::try_new(&self.schema);
         }
     }
 
@@ -379,6 +465,13 @@ impl FixpointState {
         if candidates.is_empty() || candidates.iter().all(|b| b.num_rows() == 0) {
             self.delta.clear();
             return Ok(false);
+        }
+
+        // Reconcile schema from the first non-empty candidate batch.
+        // The physical plan's output types are authoritative over the
+        // planner's inferred types.
+        if let Some(first) = candidates.iter().find(|b| b.num_rows() > 0) {
+            self.reconcile_schema(&first.schema());
         }
 
         // Round floats for stable dedup
@@ -412,7 +505,11 @@ impl FixpointState {
         // Update monotonic aggs
         if let Some(ref mut agg) = self.monotonic_agg {
             agg.snapshot();
-            agg.update(&self.key_column_indices, &delta);
+            agg.update(
+                &self.key_column_indices,
+                &delta,
+                self.strict_probability_domain,
+            )?;
         }
 
         // Append delta to facts
@@ -526,6 +623,178 @@ impl FixpointState {
     /// Consume self and return facts.
     pub fn into_facts(self) -> Vec<RecordBatch> {
         self.facts
+    }
+
+    /// Merge candidates using BEST BY semantics.
+    ///
+    /// Combines existing facts with new candidates, keeping only the best row
+    /// per KEY group according to `sort_criteria`. Returns `true` if the
+    /// best-per-KEY fact set actually changed (a genuinely better value was
+    /// found or a new KEY appeared).
+    ///
+    /// This replaces `merge_delta` for rules with BEST BY, enabling convergence
+    /// on cyclic graphs where dominated ALONG values would otherwise produce an
+    /// unbounded stream of "new" full-row facts.
+    pub fn merge_best_by(
+        &mut self,
+        candidates: Vec<RecordBatch>,
+        sort_criteria: &[SortCriterion],
+    ) -> DFResult<bool> {
+        if candidates.is_empty() || candidates.iter().all(|b| b.num_rows() == 0) {
+            self.delta.clear();
+            return Ok(false);
+        }
+
+        // Reconcile schema from the first non-empty candidate batch.
+        if let Some(first) = candidates.iter().find(|b| b.num_rows() > 0) {
+            self.reconcile_schema(&first.schema());
+        }
+
+        // Round floats for stable dedup.
+        let candidates = round_float_columns(&candidates);
+
+        // Snapshot existing best-per-KEY facts for change detection.
+        let old_best: HashMap<Vec<ScalarKey>, Vec<ScalarKey>> =
+            self.build_key_criteria_map(sort_criteria);
+
+        // Concat existing facts + new candidates.
+        let mut all_batches = self.facts.clone();
+        all_batches.extend(candidates);
+        let all_batches: Vec<_> = all_batches
+            .into_iter()
+            .filter(|b| b.num_rows() > 0)
+            .collect();
+        if all_batches.is_empty() {
+            self.delta.clear();
+            return Ok(false);
+        }
+
+        let combined = arrow::compute::concat_batches(&self.schema, &all_batches)
+            .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+
+        if combined.num_rows() == 0 {
+            self.delta.clear();
+            return Ok(false);
+        }
+
+        // Sort by KEY ASC then criteria, so the best row per KEY group comes
+        // first.
+        let mut sort_columns = Vec::new();
+        for &ki in &self.key_column_indices {
+            sort_columns.push(arrow::compute::SortColumn {
+                values: Arc::clone(combined.column(ki)),
+                options: Some(arrow::compute::SortOptions {
+                    descending: false,
+                    nulls_first: false,
+                }),
+            });
+        }
+        for criterion in sort_criteria {
+            sort_columns.push(arrow::compute::SortColumn {
+                values: Arc::clone(combined.column(criterion.col_index)),
+                options: Some(arrow::compute::SortOptions {
+                    descending: !criterion.ascending,
+                    nulls_first: criterion.nulls_first,
+                }),
+            });
+        }
+
+        let sorted_indices =
+            arrow::compute::lexsort_to_indices(&sort_columns, None).map_err(arrow_err)?;
+        let sorted_columns: Vec<_> = combined
+            .columns()
+            .iter()
+            .map(|col| arrow::compute::take(col.as_ref(), &sorted_indices, None))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+        let sorted = RecordBatch::try_new(Arc::clone(&self.schema), sorted_columns)
+            .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+
+        // Dedup: keep first (best) row per KEY group.
+        let mut keep_indices: Vec<u32> = Vec::new();
+        let mut prev_key: Option<Vec<ScalarKey>> = None;
+        for row_idx in 0..sorted.num_rows() {
+            let key = extract_scalar_key(&sorted, &self.key_column_indices, row_idx);
+            let is_new_group = match &prev_key {
+                None => true,
+                Some(prev) => *prev != key,
+            };
+            if is_new_group {
+                keep_indices.push(row_idx as u32);
+                prev_key = Some(key);
+            }
+        }
+
+        let keep_array = arrow_array::UInt32Array::from(keep_indices);
+        let output_columns: Vec<_> = sorted
+            .columns()
+            .iter()
+            .map(|col| arrow::compute::take(col.as_ref(), &keep_array, None))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+        let pruned = RecordBatch::try_new(Arc::clone(&self.schema), output_columns)
+            .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+
+        // Detect whether the best-per-KEY set actually changed.
+        let new_best: HashMap<Vec<ScalarKey>, Vec<ScalarKey>> = {
+            let mut map = HashMap::new();
+            for row_idx in 0..pruned.num_rows() {
+                let key = extract_scalar_key(&pruned, &self.key_column_indices, row_idx);
+                let criteria: Vec<ScalarKey> = sort_criteria
+                    .iter()
+                    .flat_map(|c| extract_scalar_key(&pruned, &[c.col_index], row_idx))
+                    .collect();
+                map.insert(key, criteria);
+            }
+            map
+        };
+        let changed = old_best != new_best;
+
+        tracing::debug!(
+            rule = %self.rule_name,
+            old_keys = old_best.len(),
+            new_keys = new_best.len(),
+            changed = changed,
+            "BEST BY merge"
+        );
+
+        // Replace facts with the pruned set.
+        self.facts_bytes = batch_byte_size(&pruned);
+        self.facts = vec![pruned];
+        if changed {
+            // Delta is conceptually the new/improved facts, but since we
+            // replaced the entire set, just mark delta non-empty.
+            self.delta = self.facts.clone();
+        } else {
+            self.delta.clear();
+        }
+
+        // Rebuild row dedup from pruned facts for consistency.
+        self.row_dedup = RowDedupState::try_new(&self.schema);
+        if let Some(ref mut rd) = self.row_dedup {
+            rd.ingest_existing(&self.facts, &self.schema);
+        }
+
+        Ok(changed)
+    }
+
+    /// Build a map from KEY column values to sort criteria values.
+    fn build_key_criteria_map(
+        &self,
+        sort_criteria: &[SortCriterion],
+    ) -> HashMap<Vec<ScalarKey>, Vec<ScalarKey>> {
+        let mut map = HashMap::new();
+        for batch in &self.facts {
+            for row_idx in 0..batch.num_rows() {
+                let key = extract_scalar_key(batch, &self.key_column_indices, row_idx);
+                let criteria: Vec<ScalarKey> = sort_criteria
+                    .iter()
+                    .flat_map(|c| extract_scalar_key(batch, &[c.col_index], row_idx))
+                    .collect();
+                map.insert(key, criteria);
+            }
+        }
+        map
     }
 }
 
@@ -669,6 +938,15 @@ pub struct IsRefBinding {
     /// `right_derived_col` is the corresponding KEY column in the negated rule's facts (e.g., `"n"`).
     /// Empty for non-negated IS-refs.
     pub anti_join_cols: Vec<(String, String)>,
+    /// Whether the target rule has a PROB column.
+    pub target_has_prob: bool,
+    /// Name of the PROB column in the target rule, if any.
+    pub target_prob_col: Option<String>,
+    /// `(body_col, derived_col)` pairs for provenance tracking.
+    ///
+    /// Used by shared-proof detection to find which source facts a derived row
+    /// consumed. Populated for all IS-refs (not just negated ones).
+    pub provenance_join_cols: Vec<(String, String)>,
 }
 
 /// A single clause (body) within a fixpoint rule.
@@ -680,6 +958,8 @@ pub struct FixpointClausePlan {
     pub is_ref_bindings: Vec<IsRefBinding>,
     /// Priority value for this clause (if PRIORITY semantics apply).
     pub priority: Option<i64>,
+    /// ALONG binding variable names propagated from the planner.
+    pub along_bindings: Vec<String>,
 }
 
 /// Physical plan for a single rule in a fixpoint stratum.
@@ -709,6 +989,8 @@ pub struct FixpointRulePlan {
     /// tie-breaking. When false, tied rows are selected non-deterministically
     /// (faster but not repeatable across runs).
     pub deterministic: bool,
+    /// Name of the PROB column in this rule's yield schema, if any.
+    pub prob_column_name: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -719,7 +1001,7 @@ pub struct FixpointRulePlan {
 ///
 /// Evaluates all rules in a stratum repeatedly, feeding deltas back through
 /// derived scan handles until convergence or limits are reached.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "Fixpoint loop needs all context")]
 async fn run_fixpoint_loop(
     rules: Vec<FixpointRulePlan>,
     max_iterations: usize,
@@ -732,8 +1014,15 @@ async fn run_fixpoint_loop(
     registry: Arc<DerivedScanRegistry>,
     output_schema: SchemaRef,
     max_derived_bytes: usize,
-    derivation_tracker: Option<Arc<DerivationTracker>>,
+    derivation_tracker: Option<Arc<ProvenanceStore>>,
     iteration_counts: Arc<StdRwLock<HashMap<String, usize>>>,
+    strict_probability_domain: bool,
+    probability_epsilon: f64,
+    exact_probability: bool,
+    max_bdd_variables: usize,
+    warnings_slot: Arc<StdRwLock<Vec<RuntimeWarning>>>,
+    approximate_slot: Arc<StdRwLock<HashMap<String, Vec<String>>>>,
+    top_k_proofs: usize,
 ) -> DFResult<Vec<RecordBatch>> {
     let start = Instant::now();
     let task_ctx = session_ctx.read().task_ctx();
@@ -762,6 +1051,7 @@ async fn run_fixpoint_loop(
                 rule.key_column_indices.clone(),
                 max_derived_bytes,
                 monotonic_agg,
+                strict_probability_domain,
             )
         })
         .collect();
@@ -794,7 +1084,7 @@ async fn run_fixpoint_loop(
                     &schema_info,
                 )
                 .await?;
-                // Apply anti-joins for negated IS-refs (IS NOT semantics).
+                // Apply negated IS-ref semantics: probabilistic complement or anti-join.
                 for binding in &clause.is_ref_bindings {
                     if binding.negated
                         && !binding.anti_join_cols.is_empty()
@@ -802,21 +1092,71 @@ async fn run_fixpoint_loop(
                     {
                         let neg_facts = entry.data.read().clone();
                         if !neg_facts.is_empty() {
-                            for (left_col, right_col) in &binding.anti_join_cols {
-                                batches =
-                                    apply_anti_join(batches, &neg_facts, left_col, right_col)?;
+                            if binding.target_has_prob && rule.prob_column_name.is_some() {
+                                // Probabilistic complement: add 1-p column instead of filtering.
+                                let complement_col =
+                                    format!("__prob_complement_{}", binding.rule_name);
+                                if let Some(prob_col) = &binding.target_prob_col {
+                                    batches = apply_prob_complement_composite(
+                                        batches,
+                                        &neg_facts,
+                                        &binding.anti_join_cols,
+                                        prob_col,
+                                        &complement_col,
+                                    )?;
+                                } else {
+                                    // target_has_prob but no prob_col: fall back to anti-join.
+                                    batches = apply_anti_join_composite(
+                                        batches,
+                                        &neg_facts,
+                                        &binding.anti_join_cols,
+                                    )?;
+                                }
+                            } else {
+                                // Boolean exclusion: anti-join (existing behavior)
+                                batches = apply_anti_join_composite(
+                                    batches,
+                                    &neg_facts,
+                                    &binding.anti_join_cols,
+                                )?;
                             }
                         }
                     }
                 }
+                // Multiply complement columns into the PROB column (if any) and clean up
+                let complement_cols: Vec<String> = if !batches.is_empty() {
+                    batches[0]
+                        .schema()
+                        .fields()
+                        .iter()
+                        .filter(|f| f.name().starts_with("__prob_complement_"))
+                        .map(|f| f.name().clone())
+                        .collect()
+                } else {
+                    vec![]
+                };
+                if !complement_cols.is_empty() {
+                    batches = multiply_prob_factors(
+                        batches,
+                        rule.prob_column_name.as_deref(),
+                        &complement_cols,
+                    )?;
+                }
+
                 clause_candidates.push(batches.clone());
                 all_candidates.extend(batches);
             }
 
-            // Merge delta
-            let changed = states[rule_idx]
-                .merge_delta(all_candidates, Some(Arc::clone(&task_ctx)))
-                .await?;
+            // Merge candidates into facts.
+            // For BEST BY rules, use a specialized merge that keeps only the
+            // best row per KEY group, enabling convergence on cyclic graphs.
+            let changed = if rule.has_best_by && !rule.best_by_criteria.is_empty() {
+                states[rule_idx].merge_best_by(all_candidates, &rule.best_by_criteria)?
+            } else {
+                states[rule_idx]
+                    .merge_delta(all_candidates, Some(Arc::clone(&task_ctx)))
+                    .await?
+            };
             if changed {
                 any_changed = true;
                 // Record provenance for newly derived facts when tracker is present.
@@ -827,6 +1167,8 @@ async fn run_fixpoint_loop(
                         &states[rule_idx],
                         &clause_candidates,
                         iteration,
+                        &registry,
+                        top_k_proofs,
                     );
                 }
             }
@@ -873,12 +1215,42 @@ async fn run_fixpoint_loop(
 
     for (rule_idx, state) in states.into_iter().enumerate() {
         let rule = &rules[rule_idx];
-        let facts = state.into_facts();
+        let mut facts = state.into_facts();
         if facts.is_empty() {
             continue;
         }
 
-        let processed = apply_post_fixpoint_chain(facts, rule, &task_ctx).await?;
+        // Detect shared proofs before FOLD collapses groups.
+        let shared_info = if let Some(ref tracker) = derivation_tracker {
+            detect_shared_lineage(rule, &facts, tracker, &warnings_slot)
+        } else {
+            None
+        };
+
+        // Apply BDD for shared groups if exact_probability is enabled.
+        if exact_probability
+            && let Some(ref info) = shared_info
+            && let Some(ref tracker) = derivation_tracker
+        {
+            facts = apply_exact_wmc(
+                facts,
+                rule,
+                info,
+                tracker,
+                max_bdd_variables,
+                &warnings_slot,
+                &approximate_slot,
+            )?;
+        }
+
+        let processed = apply_post_fixpoint_chain(
+            facts,
+            rule,
+            &task_ctx,
+            strict_probability_domain,
+            probability_epsilon,
+        )
+        .await?;
         all_output.extend(processed);
     }
 
@@ -899,13 +1271,22 @@ async fn run_fixpoint_loop(
 /// Called after `merge_delta` returns `true`. Attributes each new fact to the
 /// clause most likely to have produced it, using first-derivation-wins semantics.
 fn record_provenance(
-    tracker: &Arc<DerivationTracker>,
+    tracker: &Arc<ProvenanceStore>,
     rule: &FixpointRulePlan,
     state: &FixpointState,
     clause_candidates: &[Vec<RecordBatch>],
     iteration: usize,
+    registry: &Arc<DerivedScanRegistry>,
+    top_k_proofs: usize,
 ) {
     let all_indices: Vec<usize> = (0..rule.yield_schema.fields().len()).collect();
+
+    // Pre-compute base fact probabilities for top-k mode.
+    let base_probs = if top_k_proofs > 0 {
+        tracker.base_fact_probs()
+    } else {
+        HashMap::new()
+    };
 
     for delta_batch in state.all_delta() {
         for row_idx in 0..delta_batch.num_rows() {
@@ -918,15 +1299,645 @@ fn record_provenance(
             let clause_index =
                 find_clause_for_row(delta_batch, row_idx, &all_indices, clause_candidates);
 
-            let entry = DerivationEntry {
+            let support = collect_is_ref_inputs(rule, clause_index, delta_batch, row_idx, registry);
+
+            let proof_probability = if top_k_proofs > 0 {
+                compute_proof_probability(&support, &base_probs)
+            } else {
+                None
+            };
+
+            let entry = ProvenanceAnnotation {
                 rule_name: rule.name.clone(),
                 clause_index,
-                inputs: vec![],
-                along_values: std::collections::HashMap::new(),
+                support,
+                along_values: {
+                    let along_names: Vec<String> = rule
+                        .clauses
+                        .get(clause_index)
+                        .map(|c| c.along_bindings.clone())
+                        .unwrap_or_default();
+                    along_names
+                        .iter()
+                        .filter_map(|name| fact_row.get(name).map(|v| (name.clone(), v.clone())))
+                        .collect()
+                },
                 iteration,
                 fact_row,
+                proof_probability,
             };
-            tracker.record(row_hash, entry);
+            if top_k_proofs > 0 {
+                tracker.record_top_k(row_hash, entry, top_k_proofs);
+            } else {
+                tracker.record(row_hash, entry);
+            }
+        }
+    }
+}
+
+/// Collect IS-ref input facts for a derived row using provenance join columns.
+///
+/// For each non-negated IS-ref binding in the clause, extracts body-side key
+/// values from the delta row and finds matching source rows in the registry.
+/// Returns a `ProofTerm` for each match (with the source fact hash).
+fn collect_is_ref_inputs(
+    rule: &FixpointRulePlan,
+    clause_index: usize,
+    delta_batch: &RecordBatch,
+    row_idx: usize,
+    registry: &Arc<DerivedScanRegistry>,
+) -> Vec<ProofTerm> {
+    let clause = match rule.clauses.get(clause_index) {
+        Some(c) => c,
+        None => return vec![],
+    };
+
+    let mut inputs = Vec::new();
+    let delta_schema = delta_batch.schema();
+
+    for binding in &clause.is_ref_bindings {
+        if binding.negated {
+            continue;
+        }
+        if binding.provenance_join_cols.is_empty() {
+            continue;
+        }
+
+        // Extract body-side values from the delta row for each provenance join col.
+        let body_values: Vec<(String, ScalarKey)> = binding
+            .provenance_join_cols
+            .iter()
+            .filter_map(|(body_col, _derived_col)| {
+                let col_idx = delta_schema
+                    .fields()
+                    .iter()
+                    .position(|f| f.name() == body_col)?;
+                let key = extract_scalar_key(delta_batch, &[col_idx], row_idx);
+                Some((body_col.clone(), key.into_iter().next()?))
+            })
+            .collect();
+
+        if body_values.len() != binding.provenance_join_cols.len() {
+            continue;
+        }
+
+        // Read current data from the registry entry for this IS-ref's rule.
+        let entry = match registry.get(binding.derived_scan_index) {
+            Some(e) => e,
+            None => continue,
+        };
+        let source_batches = entry.data.read();
+        let source_schema = &entry.schema;
+
+        // Find matching source rows and hash them.
+        for src_batch in source_batches.iter() {
+            let all_src_indices: Vec<usize> = (0..src_batch.num_columns()).collect();
+            for src_row in 0..src_batch.num_rows() {
+                let matches = binding.provenance_join_cols.iter().enumerate().all(
+                    |(i, (_body_col, derived_col))| {
+                        let src_col_idx = source_schema
+                            .fields()
+                            .iter()
+                            .position(|f| f.name() == derived_col);
+                        match src_col_idx {
+                            Some(idx) => {
+                                let src_key = extract_scalar_key(src_batch, &[idx], src_row);
+                                src_key.first() == Some(&body_values[i].1)
+                            }
+                            None => false,
+                        }
+                    },
+                );
+                if matches {
+                    let fact_hash = format!(
+                        "{:?}",
+                        extract_scalar_key(src_batch, &all_src_indices, src_row)
+                    )
+                    .into_bytes();
+                    inputs.push(ProofTerm {
+                        source_rule: binding.rule_name.clone(),
+                        base_fact_id: fact_hash,
+                    });
+                }
+            }
+        }
+    }
+
+    inputs
+}
+
+// ---------------------------------------------------------------------------
+// Shared-lineage detection
+// ---------------------------------------------------------------------------
+
+/// Detect KEY groups in a rule's pre-fold facts where recursive derivation
+/// may violate the independence assumption of MNOR/MPROD.
+///
+/// Uses a two-tier strategy:
+/// 1. **Precise**: If the `ProvenanceStore` has populated `support` for facts
+///    in the group, we recursively compute lineage (Cui & Widom 2000) and
+///    check for pairwise overlap. A shared base fact proves a dependency.
+/// 2. **Structural fallback**: When lineage tracking is unavailable (e.g., the
+///    IS-ref subject variables were projected away), we check whether any fact
+///    in a multi-row group was derived by a clause that has IS-ref bindings.
+///    Recursive derivation through shared relations is a strong signal that
+///    proof paths may share intermediate nodes.
+///
+/// Per-row data collected during shared-lineage detection.
+#[expect(
+    dead_code,
+    reason = "Fields accessed via SharedLineageInfo in detect_shared_lineage"
+)]
+pub(crate) struct SharedGroupRow {
+    pub fact_hash: Vec<u8>,
+    pub lineage: HashSet<Vec<u8>>,
+}
+
+/// Information about groups with shared proofs, returned by `detect_shared_lineage`.
+pub(crate) struct SharedLineageInfo {
+    /// KEY group → rows with their base fact sets.
+    pub shared_groups: HashMap<Vec<ScalarKey>, Vec<SharedGroupRow>>,
+}
+
+/// Build a byte key that uniquely identifies a row across all columns.
+fn fact_hash_key(batch: &RecordBatch, all_indices: &[usize], row_idx: usize) -> Vec<u8> {
+    format!("{:?}", extract_scalar_key(batch, all_indices, row_idx)).into_bytes()
+}
+
+/// Emits at most one `SharedProbabilisticDependency` warning per rule.
+/// Returns `Some(SharedLineageInfo)` if any group has shared proofs.
+fn detect_shared_lineage(
+    rule: &FixpointRulePlan,
+    pre_fold_facts: &[RecordBatch],
+    tracker: &Arc<ProvenanceStore>,
+    warnings_slot: &Arc<StdRwLock<Vec<RuntimeWarning>>>,
+) -> Option<SharedLineageInfo> {
+    use crate::query::df_graph::locy_fold::FoldAggKind;
+    use uni_locy::{RuntimeWarning, RuntimeWarningCode};
+
+    // Only check rules with MNOR/MPROD fold bindings.
+    let has_prob_fold = rule
+        .fold_bindings
+        .iter()
+        .any(|fb| matches!(fb.kind, FoldAggKind::Nor | FoldAggKind::Prod));
+    if !has_prob_fold {
+        return None;
+    }
+
+    // Group facts by KEY columns.
+    let key_indices = &rule.key_column_indices;
+    let all_indices: Vec<usize> = (0..rule.yield_schema.fields().len()).collect();
+
+    let mut groups: HashMap<Vec<ScalarKey>, Vec<Vec<u8>>> = HashMap::new();
+    for batch in pre_fold_facts {
+        for row_idx in 0..batch.num_rows() {
+            let key = extract_scalar_key(batch, key_indices, row_idx);
+            let fact_hash = fact_hash_key(batch, &all_indices, row_idx);
+            groups.entry(key).or_default().push(fact_hash);
+        }
+    }
+
+    let mut shared_groups: HashMap<Vec<ScalarKey>, Vec<SharedGroupRow>> = HashMap::new();
+    let mut any_shared = false;
+
+    // Check each group with ≥2 rows.
+    for (key, fact_hashes) in &groups {
+        if fact_hashes.len() < 2 {
+            continue;
+        }
+
+        // Tier 1: precise base-fact overlap detection via tracker inputs.
+        let mut has_inputs = false;
+        let mut per_row_bases: Vec<HashSet<Vec<u8>>> = Vec::new();
+        for fh in fact_hashes {
+            let bases = compute_lineage(fh, tracker, &mut HashSet::new());
+            if let Some(entry) = tracker.lookup(fh)
+                && !entry.support.is_empty()
+            {
+                has_inputs = true;
+            }
+            per_row_bases.push(bases);
+        }
+
+        let shared_found = if has_inputs {
+            // At least some facts have tracked inputs — do precise comparison.
+            let mut found = false;
+            'outer: for i in 0..per_row_bases.len() {
+                for j in (i + 1)..per_row_bases.len() {
+                    if !per_row_bases[i].is_disjoint(&per_row_bases[j]) {
+                        found = true;
+                        break 'outer;
+                    }
+                }
+            }
+            found
+        } else {
+            // Tier 2: structural fallback — check if any fact in the group was
+            // derived by a clause with IS-ref bindings (recursive derivation).
+            fact_hashes.iter().any(|fh| {
+                tracker.lookup(fh).is_some_and(|entry| {
+                    rule.clauses
+                        .get(entry.clause_index)
+                        .is_some_and(|clause| clause.is_ref_bindings.iter().any(|b| !b.negated))
+                })
+            })
+        };
+
+        if shared_found {
+            any_shared = true;
+            // Collect the group rows with their base facts for BDD use.
+            let rows: Vec<SharedGroupRow> = fact_hashes
+                .iter()
+                .zip(per_row_bases.into_iter())
+                .map(|(fh, bases)| SharedGroupRow {
+                    fact_hash: fh.clone(),
+                    lineage: bases,
+                })
+                .collect();
+            shared_groups.insert(key.clone(), rows);
+        }
+    }
+
+    // Phase 5: Cross-group correlation warning.
+    // Check if any IS-ref input fact appears in multiple KEY groups.
+    // This is independent of within-group sharing: even rules whose KEY groups
+    // each have only one post-fold row can exhibit cross-group correlation when
+    // different groups consume the same IS-ref base fact.
+    {
+        let mut input_to_groups: HashMap<Vec<u8>, HashSet<Vec<ScalarKey>>> = HashMap::new();
+        for (key, fact_hashes) in &groups {
+            for fh in fact_hashes {
+                if let Some(entry) = tracker.lookup(fh) {
+                    for input in &entry.support {
+                        input_to_groups
+                            .entry(input.base_fact_id.clone())
+                            .or_default()
+                            .insert(key.clone());
+                    }
+                }
+            }
+        }
+        let has_cross_group = input_to_groups.values().any(|g| g.len() > 1);
+        if has_cross_group && let Ok(mut warnings) = warnings_slot.write() {
+            let already_warned = warnings.iter().any(|w| {
+                w.code == RuntimeWarningCode::CrossGroupCorrelationNotExact
+                    && w.rule_name == rule.name
+            });
+            if !already_warned {
+                warnings.push(RuntimeWarning {
+                    code: RuntimeWarningCode::CrossGroupCorrelationNotExact,
+                    message: format!(
+                        "Rule '{}': IS-ref base facts are shared across different KEY \
+                         groups. BDD corrects per-group probabilities but cannot account \
+                         for cross-group correlations.",
+                        rule.name
+                    ),
+                    rule_name: rule.name.clone(),
+                    variable_count: None,
+                    key_group: None,
+                });
+            }
+        }
+    }
+
+    if any_shared {
+        if let Ok(mut warnings) = warnings_slot.write() {
+            let already_warned = warnings.iter().any(|w| {
+                w.code == RuntimeWarningCode::SharedProbabilisticDependency
+                    && w.rule_name == rule.name
+            });
+            if !already_warned {
+                warnings.push(RuntimeWarning {
+                    code: RuntimeWarningCode::SharedProbabilisticDependency,
+                    message: format!(
+                        "Rule '{}' aggregates with MNOR/MPROD but some proof paths \
+                         share intermediate facts, violating the independence assumption. \
+                         Results may overestimate probability.",
+                        rule.name
+                    ),
+                    rule_name: rule.name.clone(),
+                    variable_count: None,
+                    key_group: None,
+                });
+            }
+        }
+        Some(SharedLineageInfo { shared_groups })
+    } else {
+        None
+    }
+}
+
+/// Record provenance and detect shared proofs for non-recursive strata.
+///
+/// Non-recursive rules are evaluated in a single pass (no fixpoint loop), so
+/// the regular `record_provenance` + `detect_shared_lineage` path is never hit.
+/// This function bridges that gap by recording a `ProvenanceAnnotation` for every
+/// fact produced by each clause and then running the same two-tier detection
+/// logic used by the recursive path.
+pub(crate) fn record_and_detect_lineage_nonrecursive(
+    rule: &FixpointRulePlan,
+    tagged_clause_facts: &[(usize, Vec<RecordBatch>)],
+    tracker: &Arc<ProvenanceStore>,
+    warnings_slot: &Arc<StdRwLock<Vec<RuntimeWarning>>>,
+    registry: &Arc<DerivedScanRegistry>,
+    top_k_proofs: usize,
+) -> Option<SharedLineageInfo> {
+    let all_indices: Vec<usize> = (0..rule.yield_schema.fields().len()).collect();
+
+    // Pre-compute base fact probabilities for top-k mode.
+    let base_probs = if top_k_proofs > 0 {
+        tracker.base_fact_probs()
+    } else {
+        HashMap::new()
+    };
+
+    // Record provenance for each clause's facts.
+    for (clause_index, batches) in tagged_clause_facts {
+        for batch in batches {
+            for row_idx in 0..batch.num_rows() {
+                let row_hash = fact_hash_key(batch, &all_indices, row_idx);
+                let fact_row = batch_row_to_value_map(batch, row_idx);
+
+                let support = collect_is_ref_inputs(rule, *clause_index, batch, row_idx, registry);
+
+                let proof_probability = if top_k_proofs > 0 {
+                    compute_proof_probability(&support, &base_probs)
+                } else {
+                    None
+                };
+
+                let entry = ProvenanceAnnotation {
+                    rule_name: rule.name.clone(),
+                    clause_index: *clause_index,
+                    support,
+                    along_values: {
+                        let along_names: Vec<String> = rule
+                            .clauses
+                            .get(*clause_index)
+                            .map(|c| c.along_bindings.clone())
+                            .unwrap_or_default();
+                        along_names
+                            .iter()
+                            .filter_map(|name| {
+                                fact_row.get(name).map(|v| (name.clone(), v.clone()))
+                            })
+                            .collect()
+                    },
+                    iteration: 0,
+                    fact_row,
+                    proof_probability,
+                };
+                if top_k_proofs > 0 {
+                    tracker.record_top_k(row_hash, entry, top_k_proofs);
+                } else {
+                    tracker.record(row_hash, entry);
+                }
+            }
+        }
+    }
+
+    // Flatten all clause facts and run detection.
+    let all_facts: Vec<RecordBatch> = tagged_clause_facts
+        .iter()
+        .flat_map(|(_, batches)| batches.iter().cloned())
+        .collect();
+    detect_shared_lineage(rule, &all_facts, tracker, warnings_slot)
+}
+
+/// Apply exact weighted model counting (WMC) for shared-lineage groups.
+///
+/// Replaces multiple rows in groups with shared lineage with a single
+/// representative row whose PROB column carries the BDD-computed exact
+/// probability (Sang et al. 2005). For groups that exceed
+/// `max_bdd_variables`, rows are left unchanged and a `BddLimitExceeded`
+/// warning is emitted.
+pub(crate) fn apply_exact_wmc(
+    pre_fold_facts: Vec<RecordBatch>,
+    rule: &FixpointRulePlan,
+    shared_info: &SharedLineageInfo,
+    tracker: &Arc<ProvenanceStore>,
+    max_bdd_variables: usize,
+    warnings_slot: &Arc<StdRwLock<Vec<RuntimeWarning>>>,
+    approximate_slot: &Arc<StdRwLock<HashMap<String, Vec<String>>>>,
+) -> DFResult<Vec<RecordBatch>> {
+    use crate::query::df_graph::locy_bdd::{SemiringOp, weighted_model_count};
+    use crate::query::df_graph::locy_fold::FoldAggKind;
+    use uni_locy::{RuntimeWarning, RuntimeWarningCode};
+
+    // Find the MNOR/MPROD fold binding to know which column to overwrite.
+    let prob_fold = rule
+        .fold_bindings
+        .iter()
+        .find(|fb| matches!(fb.kind, FoldAggKind::Nor | FoldAggKind::Prod));
+    let prob_fold = match prob_fold {
+        Some(f) => f,
+        None => return Ok(pre_fold_facts),
+    };
+    let semiring_op = if matches!(prob_fold.kind, FoldAggKind::Nor) {
+        SemiringOp::Disjunction
+    } else {
+        SemiringOp::Conjunction
+    };
+    let prob_col_idx = prob_fold.input_col_index;
+    let prob_col_name = rule.yield_schema.field(prob_col_idx).name().clone();
+
+    let key_indices = &rule.key_column_indices;
+    let all_indices: Vec<usize> = (0..rule.yield_schema.fields().len()).collect();
+
+    // Build a set of shared group keys for quick lookup.
+    let shared_keys: HashSet<Vec<ScalarKey>> = shared_info.shared_groups.keys().cloned().collect();
+
+    // Phase 1: Collect all rows for each shared KEY group across all batches.
+    // Store (batch_index, row_index) pairs for each group.
+    struct GroupAccum {
+        base_facts: Vec<HashSet<Vec<u8>>>,
+        base_probs: HashMap<Vec<u8>, f64>,
+        /// First occurrence: (batch_index, row_index) — used as representative.
+        representative: (usize, usize),
+        row_locations: Vec<(usize, usize)>,
+    }
+
+    let mut group_accums: HashMap<Vec<ScalarKey>, GroupAccum> = HashMap::new();
+    let mut non_shared_rows: Vec<(usize, usize)> = Vec::new(); // (batch_idx, row_idx)
+
+    for (batch_idx, batch) in pre_fold_facts.iter().enumerate() {
+        for row_idx in 0..batch.num_rows() {
+            let key = extract_scalar_key(batch, key_indices, row_idx);
+            if shared_keys.contains(&key) {
+                let fact_hash = fact_hash_key(batch, &all_indices, row_idx);
+                let bases = compute_lineage(&fact_hash, tracker, &mut HashSet::new());
+
+                let accum = group_accums.entry(key).or_insert_with(|| GroupAccum {
+                    base_facts: Vec::new(),
+                    base_probs: HashMap::new(),
+                    representative: (batch_idx, row_idx),
+                    row_locations: Vec::new(),
+                });
+
+                // Look up probabilities for base facts.
+                for bf in &bases {
+                    if !accum.base_probs.contains_key(bf)
+                        && let Some(entry) = tracker.lookup(bf)
+                        && let Some(val) = entry.fact_row.get(&prob_col_name)
+                        && let Some(p) = value_to_f64(val)
+                    {
+                        accum.base_probs.insert(bf.clone(), p);
+                    }
+                }
+
+                accum.base_facts.push(bases);
+                accum.row_locations.push((batch_idx, row_idx));
+            } else {
+                non_shared_rows.push((batch_idx, row_idx));
+            }
+        }
+    }
+
+    // Phase 2: Compute BDD for each shared group (across all batches).
+    // Track which (batch_idx, row_idx) pairs to keep vs drop.
+    let mut keep_rows: HashSet<(usize, usize)> = HashSet::new();
+    // Map of (batch_idx, row_idx) → overridden PROB value (for BDD-succeeded groups).
+    let mut overrides: HashMap<(usize, usize), f64> = HashMap::new();
+
+    // All non-shared rows are kept.
+    for &loc in &non_shared_rows {
+        keep_rows.insert(loc);
+    }
+
+    for (key, accum) in &group_accums {
+        let bdd_result = weighted_model_count(
+            &accum.base_facts,
+            &accum.base_probs,
+            semiring_op,
+            max_bdd_variables,
+        );
+
+        if bdd_result.approximated {
+            // Emit BddLimitExceeded warning (one per key group).
+            if let Ok(mut warnings) = warnings_slot.write() {
+                let key_desc = format!("{key:?}");
+                let already_warned = warnings.iter().any(|w| {
+                    w.code == RuntimeWarningCode::BddLimitExceeded
+                        && w.rule_name == rule.name
+                        && w.key_group.as_deref() == Some(&key_desc)
+                });
+                if !already_warned {
+                    warnings.push(RuntimeWarning {
+                        code: RuntimeWarningCode::BddLimitExceeded,
+                        message: format!(
+                            "Rule '{}': BDD variable limit exceeded ({} > {}). \
+                             Falling back to independence-mode result.",
+                            rule.name, bdd_result.variable_count, max_bdd_variables
+                        ),
+                        rule_name: rule.name.clone(),
+                        variable_count: Some(bdd_result.variable_count),
+                        key_group: Some(key_desc),
+                    });
+                }
+            }
+            if let Ok(mut approx) = approximate_slot.write() {
+                let key_desc = format!("{key:?}");
+                approx.entry(rule.name.clone()).or_default().push(key_desc);
+            }
+            // Keep all rows unchanged.
+            for &loc in &accum.row_locations {
+                keep_rows.insert(loc);
+            }
+        } else {
+            // BDD succeeded: keep one representative row with overridden PROB.
+            keep_rows.insert(accum.representative);
+            overrides.insert(accum.representative, bdd_result.probability);
+        }
+    }
+
+    // Phase 3: Build output batches by filtering kept rows per batch.
+    let mut result_batches = Vec::new();
+    for (batch_idx, batch) in pre_fold_facts.iter().enumerate() {
+        let kept_indices: Vec<usize> = (0..batch.num_rows())
+            .filter(|&row_idx| keep_rows.contains(&(batch_idx, row_idx)))
+            .collect();
+
+        if kept_indices.is_empty() {
+            continue;
+        }
+
+        let indices = arrow::array::UInt32Array::from(
+            kept_indices.iter().map(|&i| i as u32).collect::<Vec<_>>(),
+        );
+        let mut columns: Vec<arrow::array::ArrayRef> = batch
+            .columns()
+            .iter()
+            .map(|col| arrow::compute::take(col, &indices, None))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(arrow_err)?;
+
+        // Check if any kept rows have PROB overrides.
+        let override_map: Vec<Option<f64>> = kept_indices
+            .iter()
+            .map(|&row_idx| overrides.get(&(batch_idx, row_idx)).copied())
+            .collect();
+
+        if override_map.iter().any(|o| o.is_some()) {
+            // Rebuild the PROB column with overrides.
+            let existing_prob = columns[prob_col_idx]
+                .as_any()
+                .downcast_ref::<arrow::array::Float64Array>();
+            let new_values: Vec<f64> = override_map
+                .iter()
+                .enumerate()
+                .map(|(i, ov)| match ov {
+                    Some(p) => *p,
+                    None => existing_prob.map(|arr| arr.value(i)).unwrap_or(0.0),
+                })
+                .collect();
+            columns[prob_col_idx] = Arc::new(arrow::array::Float64Array::from(new_values));
+        }
+
+        let result_batch = RecordBatch::try_new(batch.schema(), columns).map_err(arrow_err)?;
+        result_batches.push(result_batch);
+    }
+
+    Ok(result_batches)
+}
+
+/// Extract an f64 from a `Value`, supporting Float and Int.
+fn value_to_f64(val: &uni_common::Value) -> Option<f64> {
+    match val {
+        uni_common::Value::Float(f) => Some(*f),
+        uni_common::Value::Int(i) => Some(*i as f64),
+        _ => None,
+    }
+}
+
+/// Compute the lineage of a derived fact (Cui & Widom 2000).
+///
+/// Recursively traverses the provenance store to collect the set of base-level
+/// fact hashes that contribute to this derivation. A base fact is one with no
+/// IS-ref support (a graph-level fact). Intermediate facts are expanded
+/// transitively through the store.
+fn compute_lineage(
+    fact_hash: &[u8],
+    tracker: &Arc<ProvenanceStore>,
+    visited: &mut HashSet<Vec<u8>>,
+) -> HashSet<Vec<u8>> {
+    if !visited.insert(fact_hash.to_vec()) {
+        return HashSet::new(); // Cycle guard.
+    }
+
+    match tracker.lookup(fact_hash) {
+        Some(entry) if !entry.support.is_empty() => {
+            let mut bases = HashSet::new();
+            for input in &entry.support {
+                let child_bases = compute_lineage(&input.base_fact_id, tracker, visited);
+                bases.extend(child_bases);
+            }
+            bases
+        }
+        _ => {
+            // Base fact (no tracker entry or no inputs).
+            let mut set = HashSet::new();
+            set.insert(fact_hash.to_vec());
+            set
         }
     }
 }
@@ -1027,12 +2038,460 @@ pub fn apply_anti_join(
             .map(|i| vids.is_null(i) || !banned.contains(&vids.value(i)))
             .collect();
         let keep_arr = BooleanArray::from(keep);
-        let filtered = filter_record_batch(&batch, &keep_arr)
-            .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+        let filtered = filter_record_batch(&batch, &keep_arr).map_err(arrow_err)?;
         if filtered.num_rows() > 0 {
             result.push(filtered);
         }
     }
+    Ok(result)
+}
+
+/// Probabilistic complement for negated IS-refs targeting PROB rules.
+///
+/// Instead of filtering out matching VIDs (anti-join), this adds a complement column
+/// `__prob_complement_{rule_name}` with value `1 - p` for each matching VID, and `1.0`
+/// for VIDs not present in the negated rule's facts.
+///
+/// This implements the probabilistic complement semantics: `IS NOT risk` on a PROB rule
+/// yields the probability that the entity is NOT risky.
+pub fn apply_prob_complement(
+    batches: Vec<RecordBatch>,
+    neg_facts: &[RecordBatch],
+    left_col: &str,
+    right_col: &str,
+    prob_col: &str,
+    complement_col_name: &str,
+) -> datafusion::error::Result<Vec<RecordBatch>> {
+    use arrow_array::{Array as _, Float64Array, UInt64Array};
+
+    // Build VID → probability lookup from negative facts
+    let mut prob_map: std::collections::HashMap<u64, f64> = std::collections::HashMap::new();
+    for batch in neg_facts {
+        let Ok(vid_idx) = batch.schema().index_of(right_col) else {
+            continue;
+        };
+        let Ok(prob_idx) = batch.schema().index_of(prob_col) else {
+            continue;
+        };
+        let Some(vids) = batch.column(vid_idx).as_any().downcast_ref::<UInt64Array>() else {
+            continue;
+        };
+        let prob_arr = batch.column(prob_idx);
+        let probs = prob_arr.as_any().downcast_ref::<Float64Array>();
+        for i in 0..vids.len() {
+            if !vids.is_null(i) {
+                let p = probs
+                    .and_then(|arr| {
+                        if arr.is_null(i) {
+                            None
+                        } else {
+                            Some(arr.value(i))
+                        }
+                    })
+                    .unwrap_or(0.0);
+                // If multiple facts for same VID, use noisy-OR combination:
+                // combined = 1 - (1 - existing) * (1 - new)
+                prob_map
+                    .entry(vids.value(i))
+                    .and_modify(|existing| {
+                        *existing = 1.0 - (1.0 - *existing) * (1.0 - p);
+                    })
+                    .or_insert(p);
+            }
+        }
+    }
+
+    // Add complement column to each batch
+    let mut result = Vec::new();
+    for batch in batches {
+        let Ok(idx) = batch.schema().index_of(left_col) else {
+            result.push(batch);
+            continue;
+        };
+        let Some(vids) = batch.column(idx).as_any().downcast_ref::<UInt64Array>() else {
+            result.push(batch);
+            continue;
+        };
+
+        // Compute complement values: 1 - p for matched VIDs, 1.0 for absent
+        let complements: Vec<f64> = (0..vids.len())
+            .map(|i| {
+                if vids.is_null(i) {
+                    1.0
+                } else {
+                    let p = prob_map.get(&vids.value(i)).copied().unwrap_or(0.0);
+                    1.0 - p
+                }
+            })
+            .collect();
+
+        let complement_arr = Float64Array::from(complements);
+
+        // Add the complement column to the batch
+        let mut columns: Vec<arrow_array::ArrayRef> = batch.columns().to_vec();
+        columns.push(std::sync::Arc::new(complement_arr));
+
+        let mut fields: Vec<std::sync::Arc<arrow_schema::Field>> =
+            batch.schema().fields().iter().cloned().collect();
+        fields.push(std::sync::Arc::new(arrow_schema::Field::new(
+            complement_col_name,
+            arrow_schema::DataType::Float64,
+            true,
+        )));
+
+        let new_schema = std::sync::Arc::new(arrow_schema::Schema::new(fields));
+        let new_batch = RecordBatch::try_new(new_schema, columns).map_err(arrow_err)?;
+        result.push(new_batch);
+    }
+    Ok(result)
+}
+
+/// Probabilistic complement for composite (multi-column) join keys.
+///
+/// Builds a composite key from all `join_cols` right-side columns in
+/// `neg_facts`, maps each composite key to a probability via noisy-OR
+/// combination, then adds a single `complement_col_name` column with
+/// `1 - p` for matched keys and `1.0` for absent keys.
+pub fn apply_prob_complement_composite(
+    batches: Vec<RecordBatch>,
+    neg_facts: &[RecordBatch],
+    join_cols: &[(String, String)],
+    prob_col: &str,
+    complement_col_name: &str,
+) -> datafusion::error::Result<Vec<RecordBatch>> {
+    use arrow_array::{Array as _, Float64Array, UInt64Array};
+
+    // Build composite-key → probability lookup from negative facts.
+    let mut prob_map: HashMap<Vec<u64>, f64> = HashMap::new();
+    for batch in neg_facts {
+        let right_indices: Vec<usize> = join_cols
+            .iter()
+            .filter_map(|(_, rc)| batch.schema().index_of(rc).ok())
+            .collect();
+        if right_indices.len() != join_cols.len() {
+            continue;
+        }
+        let Ok(prob_idx) = batch.schema().index_of(prob_col) else {
+            continue;
+        };
+        let prob_arr = batch.column(prob_idx);
+        let probs = prob_arr.as_any().downcast_ref::<Float64Array>();
+        for row in 0..batch.num_rows() {
+            let mut key = Vec::with_capacity(right_indices.len());
+            let mut valid = true;
+            for &ci in &right_indices {
+                let col = batch.column(ci);
+                if let Some(vids) = col.as_any().downcast_ref::<UInt64Array>() {
+                    if vids.is_null(row) {
+                        valid = false;
+                        break;
+                    }
+                    key.push(vids.value(row));
+                } else {
+                    valid = false;
+                    break;
+                }
+            }
+            if !valid {
+                continue;
+            }
+            let p = probs
+                .and_then(|arr| {
+                    if arr.is_null(row) {
+                        None
+                    } else {
+                        Some(arr.value(row))
+                    }
+                })
+                .unwrap_or(0.0);
+            // Noisy-OR combination for duplicate composite keys.
+            prob_map
+                .entry(key)
+                .and_modify(|existing| {
+                    *existing = 1.0 - (1.0 - *existing) * (1.0 - p);
+                })
+                .or_insert(p);
+        }
+    }
+
+    // Add complement column to each batch.
+    let mut result = Vec::new();
+    for batch in batches {
+        let left_indices: Vec<usize> = join_cols
+            .iter()
+            .filter_map(|(lc, _)| batch.schema().index_of(lc).ok())
+            .collect();
+        if left_indices.len() != join_cols.len() {
+            result.push(batch);
+            continue;
+        }
+        let all_u64 = left_indices.iter().all(|&ci| {
+            batch
+                .column(ci)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .is_some()
+        });
+        if !all_u64 {
+            result.push(batch);
+            continue;
+        }
+
+        let complements: Vec<f64> = (0..batch.num_rows())
+            .map(|row| {
+                let mut key = Vec::with_capacity(left_indices.len());
+                for &ci in &left_indices {
+                    let vids = batch
+                        .column(ci)
+                        .as_any()
+                        .downcast_ref::<UInt64Array>()
+                        .unwrap();
+                    if vids.is_null(row) {
+                        return 1.0;
+                    }
+                    key.push(vids.value(row));
+                }
+                let p = prob_map.get(&key).copied().unwrap_or(0.0);
+                1.0 - p
+            })
+            .collect();
+
+        let complement_arr = Float64Array::from(complements);
+        let mut columns: Vec<arrow_array::ArrayRef> = batch.columns().to_vec();
+        columns.push(Arc::new(complement_arr));
+
+        let mut fields: Vec<Arc<arrow_schema::Field>> =
+            batch.schema().fields().iter().cloned().collect();
+        fields.push(Arc::new(arrow_schema::Field::new(
+            complement_col_name,
+            arrow_schema::DataType::Float64,
+            true,
+        )));
+
+        let new_schema = Arc::new(arrow_schema::Schema::new(fields));
+        let new_batch = RecordBatch::try_new(new_schema, columns).map_err(arrow_err)?;
+        result.push(new_batch);
+    }
+    Ok(result)
+}
+
+/// Boolean anti-join for composite (multi-column) join keys.
+///
+/// Builds a `HashSet<Vec<u64>>` from `neg_facts` using all right-side
+/// columns in `join_cols`, then filters `batches` to keep only rows
+/// whose composite left-side key is NOT in the set.
+pub fn apply_anti_join_composite(
+    batches: Vec<RecordBatch>,
+    neg_facts: &[RecordBatch],
+    join_cols: &[(String, String)],
+) -> datafusion::error::Result<Vec<RecordBatch>> {
+    use arrow::compute::filter_record_batch;
+    use arrow_array::{Array as _, BooleanArray, UInt64Array};
+
+    // Collect composite keys from the negated rule's derived facts.
+    let mut banned: HashSet<Vec<u64>> = HashSet::new();
+    for batch in neg_facts {
+        let right_indices: Vec<usize> = join_cols
+            .iter()
+            .filter_map(|(_, rc)| batch.schema().index_of(rc).ok())
+            .collect();
+        if right_indices.len() != join_cols.len() {
+            continue;
+        }
+        for row in 0..batch.num_rows() {
+            let mut key = Vec::with_capacity(right_indices.len());
+            let mut valid = true;
+            for &ci in &right_indices {
+                let col = batch.column(ci);
+                if let Some(vids) = col.as_any().downcast_ref::<UInt64Array>() {
+                    if vids.is_null(row) {
+                        valid = false;
+                        break;
+                    }
+                    key.push(vids.value(row));
+                } else {
+                    valid = false;
+                    break;
+                }
+            }
+            if valid {
+                banned.insert(key);
+            }
+        }
+    }
+
+    if banned.is_empty() {
+        return Ok(batches);
+    }
+
+    // Filter body batches: keep rows where composite left key NOT IN banned.
+    let mut result = Vec::new();
+    for batch in batches {
+        let left_indices: Vec<usize> = join_cols
+            .iter()
+            .filter_map(|(lc, _)| batch.schema().index_of(lc).ok())
+            .collect();
+        if left_indices.len() != join_cols.len() {
+            result.push(batch);
+            continue;
+        }
+        let all_u64 = left_indices.iter().all(|&ci| {
+            batch
+                .column(ci)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .is_some()
+        });
+        if !all_u64 {
+            result.push(batch);
+            continue;
+        }
+
+        let keep: Vec<bool> = (0..batch.num_rows())
+            .map(|row| {
+                let mut key = Vec::with_capacity(left_indices.len());
+                for &ci in &left_indices {
+                    let vids = batch
+                        .column(ci)
+                        .as_any()
+                        .downcast_ref::<UInt64Array>()
+                        .unwrap();
+                    if vids.is_null(row) {
+                        return true; // null keys are never banned
+                    }
+                    key.push(vids.value(row));
+                }
+                !banned.contains(&key)
+            })
+            .collect();
+        let keep_arr = BooleanArray::from(keep);
+        let filtered = filter_record_batch(&batch, &keep_arr).map_err(arrow_err)?;
+        if filtered.num_rows() > 0 {
+            result.push(filtered);
+        }
+    }
+    Ok(result)
+}
+
+/// Multiply `__prob_complement_*` columns into the rule's PROB column and clean up.
+///
+/// After IS NOT probabilistic complement semantics have added `__prob_complement_*`
+/// columns to clause results, this function:
+/// 1. Computes the product of all complement factor columns
+/// 2. Multiplies the product into the existing PROB column (if any)
+/// 3. Removes the internal `__prob_complement_*` columns from the output
+///
+/// If the rule has no PROB column, complement columns are simply removed
+/// (the complement information is discarded and IS NOT acts as a keep-all).
+pub fn multiply_prob_factors(
+    batches: Vec<RecordBatch>,
+    prob_col: Option<&str>,
+    complement_cols: &[String],
+) -> datafusion::error::Result<Vec<RecordBatch>> {
+    use arrow_array::{Array as _, Float64Array};
+
+    let mut result = Vec::with_capacity(batches.len());
+
+    for batch in batches {
+        if batch.num_rows() == 0 {
+            // Remove complement columns from empty batches
+            let keep: Vec<usize> = batch
+                .schema()
+                .fields()
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| !complement_cols.contains(f.name()))
+                .map(|(i, _)| i)
+                .collect();
+            let fields: Vec<_> = keep
+                .iter()
+                .map(|&i| batch.schema().field(i).clone())
+                .collect();
+            let cols: Vec<_> = keep.iter().map(|&i| batch.column(i).clone()).collect();
+            let schema = std::sync::Arc::new(arrow_schema::Schema::new(fields));
+            result.push(
+                RecordBatch::try_new(schema, cols).map_err(|e| {
+                    datafusion::error::DataFusionError::ArrowError(Box::new(e), None)
+                })?,
+            );
+            continue;
+        }
+
+        let num_rows = batch.num_rows();
+
+        // 1. Compute product of all complement factors
+        let mut combined = vec![1.0f64; num_rows];
+        for col_name in complement_cols {
+            if let Ok(idx) = batch.schema().index_of(col_name) {
+                let arr = batch
+                    .column(idx)
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .ok_or_else(|| {
+                        datafusion::error::DataFusionError::Internal(format!(
+                            "Expected Float64 for complement column {col_name}"
+                        ))
+                    })?;
+                for (i, val) in combined.iter_mut().enumerate().take(num_rows) {
+                    if !arr.is_null(i) {
+                        *val *= arr.value(i);
+                    }
+                }
+            }
+        }
+
+        // 2. If there's a PROB column, multiply combined into it
+        let final_prob: Vec<f64> = if let Some(prob_name) = prob_col {
+            if let Ok(idx) = batch.schema().index_of(prob_name) {
+                let arr = batch
+                    .column(idx)
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .ok_or_else(|| {
+                        datafusion::error::DataFusionError::Internal(format!(
+                            "Expected Float64 for PROB column {prob_name}"
+                        ))
+                    })?;
+                (0..num_rows)
+                    .map(|i| {
+                        if arr.is_null(i) {
+                            combined[i]
+                        } else {
+                            arr.value(i) * combined[i]
+                        }
+                    })
+                    .collect()
+            } else {
+                combined
+            }
+        } else {
+            combined
+        };
+
+        let new_prob_array: arrow_array::ArrayRef =
+            std::sync::Arc::new(Float64Array::from(final_prob));
+
+        // 3. Build output: replace PROB column, remove complement columns
+        let mut fields = Vec::new();
+        let mut columns = Vec::new();
+
+        for (idx, field) in batch.schema().fields().iter().enumerate() {
+            if complement_cols.contains(field.name()) {
+                continue;
+            }
+            if prob_col.is_some_and(|p| field.name() == p) {
+                fields.push(field.clone());
+                columns.push(new_prob_array.clone());
+            } else {
+                fields.push(field.clone());
+                columns.push(batch.column(idx).clone());
+            }
+        }
+
+        let schema = std::sync::Arc::new(arrow_schema::Schema::new(fields));
+        result.push(RecordBatch::try_new(schema, columns).map_err(arrow_err)?);
+    }
+
     Ok(result)
 }
 
@@ -1243,13 +2702,22 @@ pub(crate) async fn apply_post_fixpoint_chain(
     facts: Vec<RecordBatch>,
     rule: &FixpointRulePlan,
     task_ctx: &Arc<TaskContext>,
+    strict_probability_domain: bool,
+    probability_epsilon: f64,
 ) -> DFResult<Vec<RecordBatch>> {
     if !rule.has_fold && !rule.has_best_by && !rule.has_priority {
         return Ok(facts);
     }
 
-    // Wrap facts in InMemoryExec
-    let schema = Arc::clone(&rule.yield_schema);
+    // Wrap facts in InMemoryExec.
+    // Prefer the actual batch schema (from physical execution) over the
+    // pre-computed yield_schema, which may have wrong inferred types
+    // (e.g. Float64 for a string property).
+    let schema = facts
+        .iter()
+        .find(|b| b.num_rows() > 0)
+        .map(|b| b.schema())
+        .unwrap_or_else(|| Arc::clone(&rule.yield_schema));
     let input: Arc<dyn ExecutionPlan> = Arc::new(InMemoryExec::new(facts, schema));
 
     // Apply PRIORITY first — keeps only rows with max __priority per KEY group,
@@ -1277,6 +2745,8 @@ pub(crate) async fn apply_post_fixpoint_chain(
             current,
             rule.key_column_indices.clone(),
             rule.fold_bindings.clone(),
+            strict_probability_domain,
+            probability_epsilon,
         ))
     } else {
         current
@@ -1320,9 +2790,19 @@ pub struct FixpointExec {
     metrics: ExecutionPlanMetricsSet,
     max_derived_bytes: usize,
     /// Optional provenance tracker populated during fixpoint iteration.
-    derivation_tracker: Option<Arc<DerivationTracker>>,
+    derivation_tracker: Option<Arc<ProvenanceStore>>,
     /// Shared slot written with per-rule iteration counts after convergence.
     iteration_counts: Arc<StdRwLock<HashMap<String, usize>>>,
+    strict_probability_domain: bool,
+    probability_epsilon: f64,
+    exact_probability: bool,
+    max_bdd_variables: usize,
+    /// Shared slot for runtime warnings collected during fixpoint iteration.
+    warnings_slot: Arc<StdRwLock<Vec<RuntimeWarning>>>,
+    /// Shared slot for groups where BDD fell back to independence mode.
+    approximate_slot: Arc<StdRwLock<HashMap<String, Vec<String>>>>,
+    /// When > 0, retain at most this many proofs per fact (top-k provenance).
+    top_k_proofs: usize,
 }
 
 impl fmt::Debug for FixpointExec {
@@ -1339,7 +2819,10 @@ impl fmt::Debug for FixpointExec {
 
 impl FixpointExec {
     /// Create a new `FixpointExec`.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "FixpointExec configuration needs all context"
+    )]
     pub fn new(
         rules: Vec<FixpointRulePlan>,
         max_iterations: usize,
@@ -1352,8 +2835,15 @@ impl FixpointExec {
         derived_scan_registry: Arc<DerivedScanRegistry>,
         output_schema: SchemaRef,
         max_derived_bytes: usize,
-        derivation_tracker: Option<Arc<DerivationTracker>>,
+        derivation_tracker: Option<Arc<ProvenanceStore>>,
         iteration_counts: Arc<StdRwLock<HashMap<String, usize>>>,
+        strict_probability_domain: bool,
+        probability_epsilon: f64,
+        exact_probability: bool,
+        max_bdd_variables: usize,
+        warnings_slot: Arc<StdRwLock<Vec<RuntimeWarning>>>,
+        approximate_slot: Arc<StdRwLock<HashMap<String, Vec<String>>>>,
+        top_k_proofs: usize,
     ) -> Self {
         let properties = compute_plan_properties(Arc::clone(&output_schema));
         Self {
@@ -1372,6 +2862,13 @@ impl FixpointExec {
             max_derived_bytes,
             derivation_tracker,
             iteration_counts,
+            strict_probability_domain,
+            probability_epsilon,
+            exact_probability,
+            max_bdd_variables,
+            warnings_slot,
+            approximate_slot,
+            top_k_proofs,
         }
     }
 
@@ -1455,6 +2952,7 @@ impl ExecutionPlan for FixpointExec {
                             body_logical: c.body_logical.clone(),
                             is_ref_bindings: c.is_ref_bindings.clone(),
                             priority: c.priority,
+                            along_bindings: c.along_bindings.clone(),
                         })
                         .collect(),
                     yield_schema: Arc::clone(&r.yield_schema),
@@ -1466,6 +2964,7 @@ impl ExecutionPlan for FixpointExec {
                     best_by_criteria: r.best_by_criteria.clone(),
                     has_priority: r.has_priority,
                     deterministic: r.deterministic,
+                    prob_column_name: r.prob_column_name.clone(),
                 }
             })
             .collect();
@@ -1482,6 +2981,13 @@ impl ExecutionPlan for FixpointExec {
         let max_derived_bytes = self.max_derived_bytes;
         let derivation_tracker = self.derivation_tracker.clone();
         let iteration_counts = Arc::clone(&self.iteration_counts);
+        let strict_probability_domain = self.strict_probability_domain;
+        let probability_epsilon = self.probability_epsilon;
+        let exact_probability = self.exact_probability;
+        let max_bdd_variables = self.max_bdd_variables;
+        let warnings_slot = Arc::clone(&self.warnings_slot);
+        let approximate_slot = Arc::clone(&self.approximate_slot);
+        let top_k_proofs = self.top_k_proofs;
 
         let fut = async move {
             run_fixpoint_loop(
@@ -1498,6 +3004,13 @@ impl ExecutionPlan for FixpointExec {
                 max_derived_bytes,
                 derivation_tracker,
                 iteration_counts,
+                strict_probability_domain,
+                probability_epsilon,
+                exact_probability,
+                max_bdd_variables,
+                warnings_slot,
+                approximate_slot,
+                top_k_proofs,
             )
             .await
         };
@@ -1612,7 +3125,7 @@ mod tests {
     #[tokio::test]
     async fn test_fixpoint_state_empty_facts_adds_all() {
         let schema = test_schema();
-        let mut state = FixpointState::new("test".into(), schema, vec![0], 1_000_000, None);
+        let mut state = FixpointState::new("test".into(), schema, vec![0], 1_000_000, None, false);
 
         let batch = make_batch(&["a", "b", "c"], &[1, 2, 3]);
         let changed = state.merge_delta(vec![batch], None).await.unwrap();
@@ -1627,7 +3140,7 @@ mod tests {
     #[tokio::test]
     async fn test_fixpoint_state_exact_duplicates_excluded() {
         let schema = test_schema();
-        let mut state = FixpointState::new("test".into(), schema, vec![0], 1_000_000, None);
+        let mut state = FixpointState::new("test".into(), schema, vec![0], 1_000_000, None, false);
 
         let batch1 = make_batch(&["a", "b"], &[1, 2]);
         state.merge_delta(vec![batch1], None).await.unwrap();
@@ -1644,7 +3157,7 @@ mod tests {
     #[tokio::test]
     async fn test_fixpoint_state_partial_overlap() {
         let schema = test_schema();
-        let mut state = FixpointState::new("test".into(), schema, vec![0], 1_000_000, None);
+        let mut state = FixpointState::new("test".into(), schema, vec![0], 1_000_000, None, false);
 
         let batch1 = make_batch(&["a", "b"], &[1, 2]);
         state.merge_delta(vec![batch1], None).await.unwrap();
@@ -1666,7 +3179,7 @@ mod tests {
     #[tokio::test]
     async fn test_fixpoint_state_convergence() {
         let schema = test_schema();
-        let mut state = FixpointState::new("test".into(), schema, vec![0], 1_000_000, None);
+        let mut state = FixpointState::new("test".into(), schema, vec![0], 1_000_000, None, false);
 
         let batch = make_batch(&["a"], &[1]);
         state.merge_delta(vec![batch], None).await.unwrap();
@@ -1855,13 +3368,13 @@ mod tests {
         // First update
         let batch = make_batch(&["a"], &[10]);
         agg.snapshot();
-        let changed = agg.update(&[0], &[batch]);
+        let changed = agg.update(&[0], &[batch], false).unwrap();
         assert!(changed);
         assert!(!agg.is_stable()); // changed since snapshot
 
         // Snapshot and check stability with no new data
         agg.snapshot();
-        let changed = agg.update(&[0], &[]);
+        let changed = agg.update(&[0], &[], false).unwrap();
         assert!(!changed);
         assert!(agg.is_stable());
     }
@@ -1872,7 +3385,7 @@ mod tests {
     async fn test_memory_limit_exceeded() {
         let schema = test_schema();
         // Set a tiny limit
-        let mut state = FixpointState::new("test".into(), schema, vec![0], 1, None);
+        let mut state = FixpointState::new("test".into(), schema, vec![0], 1, None, false);
 
         let batch = make_batch(&["a", "b", "c"], &[1, 2, 3]);
         let result = state.merge_delta(vec![batch], None).await;
@@ -1906,5 +3419,463 @@ mod tests {
         assert_eq!(batches.len(), 2);
         assert_eq!(batches[0].num_rows(), 1);
         assert_eq!(batches[1].num_rows(), 1);
+    }
+
+    // ── MonotonicAggState MNOR/MPROD tests ──────────────────────────────
+
+    fn make_f64_batch(names: &[&str], values: &[f64]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("value", DataType::Float64, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(
+                    names.iter().map(|s| Some(*s)).collect::<Vec<_>>(),
+                )),
+                Arc::new(Float64Array::from(values.to_vec())),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn make_nor_binding() -> Vec<MonotonicFoldBinding> {
+        use crate::query::df_graph::locy_fold::FoldAggKind;
+        vec![MonotonicFoldBinding {
+            fold_name: "prob".into(),
+            kind: FoldAggKind::Nor,
+            input_col_index: 1,
+        }]
+    }
+
+    fn make_prod_binding() -> Vec<MonotonicFoldBinding> {
+        use crate::query::df_graph::locy_fold::FoldAggKind;
+        vec![MonotonicFoldBinding {
+            fold_name: "prob".into(),
+            kind: FoldAggKind::Prod,
+            input_col_index: 1,
+        }]
+    }
+
+    fn acc_key(name: &str) -> (Vec<ScalarKey>, String) {
+        (vec![ScalarKey::Utf8(name.to_string())], "prob".to_string())
+    }
+
+    #[test]
+    fn test_monotonic_nor_first_update() {
+        let mut agg = MonotonicAggState::new(make_nor_binding());
+        let batch = make_f64_batch(&["a"], &[0.3]);
+        let changed = agg.update(&[0], &[batch], false).unwrap();
+        assert!(changed);
+        let val = agg.get_accumulator(&acc_key("a")).unwrap();
+        assert!((val - 0.3).abs() < 1e-10, "expected 0.3, got {}", val);
+    }
+
+    #[test]
+    fn test_monotonic_nor_two_updates() {
+        // Incremental NOR: acc = 1-(1-0.3)(1-0.5) = 0.65
+        let mut agg = MonotonicAggState::new(make_nor_binding());
+        let batch1 = make_f64_batch(&["a"], &[0.3]);
+        agg.update(&[0], &[batch1], false).unwrap();
+        let batch2 = make_f64_batch(&["a"], &[0.5]);
+        agg.update(&[0], &[batch2], false).unwrap();
+        let val = agg.get_accumulator(&acc_key("a")).unwrap();
+        assert!((val - 0.65).abs() < 1e-10, "expected 0.65, got {}", val);
+    }
+
+    #[test]
+    fn test_monotonic_prod_first_update() {
+        let mut agg = MonotonicAggState::new(make_prod_binding());
+        let batch = make_f64_batch(&["a"], &[0.6]);
+        let changed = agg.update(&[0], &[batch], false).unwrap();
+        assert!(changed);
+        let val = agg.get_accumulator(&acc_key("a")).unwrap();
+        assert!((val - 0.6).abs() < 1e-10, "expected 0.6, got {}", val);
+    }
+
+    #[test]
+    fn test_monotonic_prod_two_updates() {
+        // Incremental PROD: acc = 0.6 * 0.8 = 0.48
+        let mut agg = MonotonicAggState::new(make_prod_binding());
+        let batch1 = make_f64_batch(&["a"], &[0.6]);
+        agg.update(&[0], &[batch1], false).unwrap();
+        let batch2 = make_f64_batch(&["a"], &[0.8]);
+        agg.update(&[0], &[batch2], false).unwrap();
+        let val = agg.get_accumulator(&acc_key("a")).unwrap();
+        assert!((val - 0.48).abs() < 1e-10, "expected 0.48, got {}", val);
+    }
+
+    #[test]
+    fn test_monotonic_nor_stability() {
+        let mut agg = MonotonicAggState::new(make_nor_binding());
+        let batch = make_f64_batch(&["a"], &[0.3]);
+        agg.update(&[0], &[batch], false).unwrap();
+        agg.snapshot();
+        let changed = agg.update(&[0], &[], false).unwrap();
+        assert!(!changed);
+        assert!(agg.is_stable());
+    }
+
+    #[test]
+    fn test_monotonic_prod_stability() {
+        let mut agg = MonotonicAggState::new(make_prod_binding());
+        let batch = make_f64_batch(&["a"], &[0.6]);
+        agg.update(&[0], &[batch], false).unwrap();
+        agg.snapshot();
+        let changed = agg.update(&[0], &[], false).unwrap();
+        assert!(!changed);
+        assert!(agg.is_stable());
+    }
+
+    #[test]
+    fn test_monotonic_nor_multi_group() {
+        // (a,0.3),(b,0.5) then (a,0.5),(b,0.2) → a=0.65, b=0.6
+        let mut agg = MonotonicAggState::new(make_nor_binding());
+        let batch1 = make_f64_batch(&["a", "b"], &[0.3, 0.5]);
+        agg.update(&[0], &[batch1], false).unwrap();
+        let batch2 = make_f64_batch(&["a", "b"], &[0.5, 0.2]);
+        agg.update(&[0], &[batch2], false).unwrap();
+
+        let val_a = agg.get_accumulator(&acc_key("a")).unwrap();
+        let val_b = agg.get_accumulator(&acc_key("b")).unwrap();
+        assert!(
+            (val_a - 0.65).abs() < 1e-10,
+            "expected a=0.65, got {}",
+            val_a
+        );
+        assert!((val_b - 0.6).abs() < 1e-10, "expected b=0.6, got {}", val_b);
+    }
+
+    #[test]
+    fn test_monotonic_prod_zero_absorbing() {
+        // Zero absorbs: once 0.0, all further updates stay 0.0
+        let mut agg = MonotonicAggState::new(make_prod_binding());
+        let batch1 = make_f64_batch(&["a"], &[0.5]);
+        agg.update(&[0], &[batch1], false).unwrap();
+        let batch2 = make_f64_batch(&["a"], &[0.0]);
+        agg.update(&[0], &[batch2], false).unwrap();
+
+        let val = agg.get_accumulator(&acc_key("a")).unwrap();
+        assert!((val - 0.0).abs() < 1e-10, "expected 0.0, got {}", val);
+
+        // Further updates don't change the absorbing zero
+        agg.snapshot();
+        let batch3 = make_f64_batch(&["a"], &[0.5]);
+        let changed = agg.update(&[0], &[batch3], false).unwrap();
+        assert!(!changed);
+        assert!(agg.is_stable());
+    }
+
+    #[test]
+    fn test_monotonic_nor_clamping() {
+        // 1.5 clamped to 1.0: acc = 1-(1-0)(1-1) = 1.0
+        let mut agg = MonotonicAggState::new(make_nor_binding());
+        let batch = make_f64_batch(&["a"], &[1.5]);
+        agg.update(&[0], &[batch], false).unwrap();
+        let val = agg.get_accumulator(&acc_key("a")).unwrap();
+        assert!((val - 1.0).abs() < 1e-10, "expected 1.0, got {}", val);
+    }
+
+    #[test]
+    fn test_monotonic_nor_absorbing() {
+        // p=1.0 absorbs: 0.3 then 1.0 → 1.0
+        let mut agg = MonotonicAggState::new(make_nor_binding());
+        let batch1 = make_f64_batch(&["a"], &[0.3]);
+        agg.update(&[0], &[batch1], false).unwrap();
+        let batch2 = make_f64_batch(&["a"], &[1.0]);
+        agg.update(&[0], &[batch2], false).unwrap();
+        let val = agg.get_accumulator(&acc_key("a")).unwrap();
+        assert!((val - 1.0).abs() < 1e-10, "expected 1.0, got {}", val);
+    }
+
+    // ── MonotonicAggState strict mode tests (Phase 5) ─────────────────────
+
+    #[test]
+    fn test_monotonic_agg_strict_nor_rejects() {
+        let mut agg = MonotonicAggState::new(make_nor_binding());
+        let batch = make_f64_batch(&["a"], &[1.5]);
+        let result = agg.update(&[0], &[batch], true);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("strict_probability_domain"),
+            "Expected strict error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_monotonic_agg_strict_prod_rejects() {
+        let mut agg = MonotonicAggState::new(make_prod_binding());
+        let batch = make_f64_batch(&["a"], &[2.0]);
+        let result = agg.update(&[0], &[batch], true);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("strict_probability_domain"),
+            "Expected strict error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_monotonic_agg_strict_accepts_valid() {
+        let mut agg = MonotonicAggState::new(make_nor_binding());
+        let batch = make_f64_batch(&["a"], &[0.5]);
+        let result = agg.update(&[0], &[batch], true);
+        assert!(result.is_ok());
+        let val = agg.get_accumulator(&acc_key("a")).unwrap();
+        assert!((val - 0.5).abs() < 1e-10, "expected 0.5, got {}", val);
+    }
+
+    // ── Complement function unit tests (Phase 4) ──────────────────────────
+
+    fn make_vid_prob_batch(vids: &[u64], probs: &[f64]) -> RecordBatch {
+        use arrow_array::UInt64Array;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("vid", DataType::UInt64, true),
+            Field::new("prob", DataType::Float64, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(UInt64Array::from(vids.to_vec())),
+                Arc::new(Float64Array::from(probs.to_vec())),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_prob_complement_basic() {
+        // neg has VID=1 with prob=0.7 → complement=0.3; VID=2 absent → complement=1.0
+        let body = make_vid_prob_batch(&[1, 2], &[0.9, 0.8]);
+        let neg = make_vid_prob_batch(&[1], &[0.7]);
+        let join_cols = vec![("vid".to_string(), "vid".to_string())];
+        let result = apply_prob_complement_composite(
+            vec![body],
+            &[neg],
+            &join_cols,
+            "prob",
+            "__complement_0",
+        )
+        .unwrap();
+        assert_eq!(result.len(), 1);
+        let batch = &result[0];
+        let complement = batch
+            .column_by_name("__complement_0")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        // VID=1: complement = 1 - 0.7 = 0.3
+        assert!(
+            (complement.value(0) - 0.3).abs() < 1e-10,
+            "expected 0.3, got {}",
+            complement.value(0)
+        );
+        // VID=2: absent from neg → complement = 1.0
+        assert!(
+            (complement.value(1) - 1.0).abs() < 1e-10,
+            "expected 1.0, got {}",
+            complement.value(1)
+        );
+    }
+
+    #[test]
+    fn test_prob_complement_noisy_or_duplicates() {
+        // neg has VID=1 twice with prob=0.3 and prob=0.5
+        // Combined via noisy-OR: 1-(1-0.3)(1-0.5) = 0.65
+        // Complement = 1 - 0.65 = 0.35
+        let body = make_vid_prob_batch(&[1], &[0.9]);
+        let neg = make_vid_prob_batch(&[1, 1], &[0.3, 0.5]);
+        let join_cols = vec![("vid".to_string(), "vid".to_string())];
+        let result = apply_prob_complement_composite(
+            vec![body],
+            &[neg],
+            &join_cols,
+            "prob",
+            "__complement_0",
+        )
+        .unwrap();
+        let batch = &result[0];
+        let complement = batch
+            .column_by_name("__complement_0")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!(
+            (complement.value(0) - 0.35).abs() < 1e-10,
+            "expected 0.35, got {}",
+            complement.value(0)
+        );
+    }
+
+    #[test]
+    fn test_prob_complement_empty_neg() {
+        // Empty neg_facts → body passes through with complement=1.0
+        let body = make_vid_prob_batch(&[1, 2], &[0.5, 0.6]);
+        let join_cols = vec![("vid".to_string(), "vid".to_string())];
+        let result =
+            apply_prob_complement_composite(vec![body], &[], &join_cols, "prob", "__complement_0")
+                .unwrap();
+        let batch = &result[0];
+        let complement = batch
+            .column_by_name("__complement_0")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        for i in 0..2 {
+            assert!(
+                (complement.value(i) - 1.0).abs() < 1e-10,
+                "row {}: expected 1.0, got {}",
+                i,
+                complement.value(i)
+            );
+        }
+    }
+
+    #[test]
+    fn test_anti_join_basic() {
+        // body [1,2,3], neg [2] → result [1,3]
+        use arrow_array::UInt64Array;
+        let body = make_vid_prob_batch(&[1, 2, 3], &[0.5, 0.6, 0.7]);
+        let neg = make_vid_prob_batch(&[2], &[0.0]);
+        let join_cols = vec![("vid".to_string(), "vid".to_string())];
+        let result = apply_anti_join_composite(vec![body], &[neg], &join_cols).unwrap();
+        assert_eq!(result.len(), 1);
+        let batch = &result[0];
+        assert_eq!(batch.num_rows(), 2);
+        let vids = batch
+            .column_by_name("vid")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert_eq!(vids.value(0), 1);
+        assert_eq!(vids.value(1), 3);
+    }
+
+    #[test]
+    fn test_anti_join_empty_neg() {
+        // Empty neg → all rows kept
+        let body = make_vid_prob_batch(&[1, 2, 3], &[0.5, 0.6, 0.7]);
+        let join_cols = vec![("vid".to_string(), "vid".to_string())];
+        let result = apply_anti_join_composite(vec![body], &[], &join_cols).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].num_rows(), 3);
+    }
+
+    #[test]
+    fn test_anti_join_all_excluded() {
+        // neg covers all body rows → empty result
+        let body = make_vid_prob_batch(&[1, 2], &[0.5, 0.6]);
+        let neg = make_vid_prob_batch(&[1, 2], &[0.0, 0.0]);
+        let join_cols = vec![("vid".to_string(), "vid".to_string())];
+        let result = apply_anti_join_composite(vec![body], &[neg], &join_cols).unwrap();
+        let total: usize = result.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn test_multiply_prob_single_complement() {
+        // prob=0.8, complement=0.5 → output prob=0.4; complement col removed
+        let body = make_vid_prob_batch(&[1], &[0.8]);
+        // Add a complement column
+        let complement_arr = Float64Array::from(vec![0.5]);
+        let mut cols: Vec<arrow_array::ArrayRef> = body.columns().to_vec();
+        cols.push(Arc::new(complement_arr));
+        let mut fields: Vec<Arc<Field>> = body.schema().fields().iter().cloned().collect();
+        fields.push(Arc::new(Field::new(
+            "__complement_0",
+            DataType::Float64,
+            true,
+        )));
+        let schema = Arc::new(Schema::new(fields));
+        let batch = RecordBatch::try_new(schema, cols).unwrap();
+
+        let result =
+            multiply_prob_factors(vec![batch], Some("prob"), &["__complement_0".to_string()])
+                .unwrap();
+        assert_eq!(result.len(), 1);
+        let out = &result[0];
+        // Complement column should be removed
+        assert!(out.column_by_name("__complement_0").is_none());
+        let prob = out
+            .column_by_name("prob")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!(
+            (prob.value(0) - 0.4).abs() < 1e-10,
+            "expected 0.4, got {}",
+            prob.value(0)
+        );
+    }
+
+    #[test]
+    fn test_multiply_prob_multiple_complements() {
+        // prob=0.8, c1=0.5, c2=0.6 → 0.8×0.5×0.6=0.24
+        let body = make_vid_prob_batch(&[1], &[0.8]);
+        let c1 = Float64Array::from(vec![0.5]);
+        let c2 = Float64Array::from(vec![0.6]);
+        let mut cols: Vec<arrow_array::ArrayRef> = body.columns().to_vec();
+        cols.push(Arc::new(c1));
+        cols.push(Arc::new(c2));
+        let mut fields: Vec<Arc<Field>> = body.schema().fields().iter().cloned().collect();
+        fields.push(Arc::new(Field::new("__c1", DataType::Float64, true)));
+        fields.push(Arc::new(Field::new("__c2", DataType::Float64, true)));
+        let schema = Arc::new(Schema::new(fields));
+        let batch = RecordBatch::try_new(schema, cols).unwrap();
+
+        let result = multiply_prob_factors(
+            vec![batch],
+            Some("prob"),
+            &["__c1".to_string(), "__c2".to_string()],
+        )
+        .unwrap();
+        let out = &result[0];
+        assert!(out.column_by_name("__c1").is_none());
+        assert!(out.column_by_name("__c2").is_none());
+        let prob = out
+            .column_by_name("prob")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!(
+            (prob.value(0) - 0.24).abs() < 1e-10,
+            "expected 0.24, got {}",
+            prob.value(0)
+        );
+    }
+
+    #[test]
+    fn test_multiply_prob_no_prob_column() {
+        // No prob column → combined complements become the output
+        use arrow_array::UInt64Array;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("vid", DataType::UInt64, true),
+            Field::new("__c1", DataType::Float64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(UInt64Array::from(vec![1u64])),
+                Arc::new(Float64Array::from(vec![0.7])),
+            ],
+        )
+        .unwrap();
+
+        let result = multiply_prob_factors(vec![batch], None, &["__c1".to_string()]).unwrap();
+        let out = &result[0];
+        // __c1 should be removed since it's a complement column
+        assert!(out.column_by_name("__c1").is_none());
+        // Only vid column remains
+        assert_eq!(out.num_columns(), 1);
     }
 }

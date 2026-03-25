@@ -1,6 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Dragonscale Team
 
+//! Query execution layer for the Uni graph database.
+//!
+//! This crate provides OpenCypher query parsing, logical planning, and
+//! execution against Uni's object-store-backed property graph.
+//!
+//! # Modules
+//!
+//! - [`query`] — planner, executor, DataFusion integration, pushdown logic
+//! - [`types`] — public value types (`Value`, `Node`, `Edge`, `Path`, etc.)
+//!
+//! # Quick Start
+//!
+//! ```rust,ignore
+//! let executor = Executor::new(storage);
+//! let planner = QueryPlanner::new(schema);
+//! let plan = planner.plan(cypher_ast)?;
+//! let result = executor.execute_plan(plan, &params).await?;
+//! ```
+
 #![recursion_limit = "256"]
 
 pub mod query;
@@ -12,13 +31,21 @@ pub use query::executor::procedure::{
 };
 pub use query::executor::{Executor, ResultNormalizer};
 pub use query::planner::{CostEstimates, ExplainOutput, IndexUsage, LogicalPlan, QueryPlanner};
-pub use types::{Edge, ExecuteResult, FromValue, Node, Path, QueryCursor, QueryResult, Row, Value};
+pub use types::{
+    Edge, ExecuteResult, FromValue, Node, Path, QueryCursor, QueryResult, QueryWarning, Row, Value,
+};
 pub use uni_cypher::ast::{Query as CypherQuery, TimeTravelSpec};
 
-/// Validate that a query AST is read-only (no CREATE, SET, DELETE, MERGE, REMOVE).
+/// Validate that a query AST contains only read clauses.
 ///
-/// Returns `Ok(())` if the query contains only read clauses, or an error
-/// message describing the violation.
+/// Rejects any query that contains CREATE, MERGE, DELETE, SET, REMOVE,
+/// schema commands, or transaction commands.
+///
+/// # Errors
+///
+/// Returns `Err(message)` describing the first write clause found. Used to
+/// enforce read-only access for time-travel queries (`VERSION AS OF` /
+/// `TIMESTAMP AS OF`).
 pub fn validate_read_only(query: &CypherQuery) -> Result<(), String> {
     use uni_cypher::ast::{Clause, Query, Statement};
 

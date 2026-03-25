@@ -181,8 +181,27 @@ YIELD KEY a, total
 | `MMAX` | `MAX` |
 | `MMIN` | `MIN` |
 | `MCOUNT` | `COUNT` |
+| `MNOR` | — |
+| `MPROD` | — |
 
 Use monotonic variants (`MSUM`, `MMAX`, etc.) when the rule is part of a recursive stratum.
+
+### Probabilistic Aggregation (MNOR / MPROD)
+
+| Aggregator | Formula | Semantics |
+|---|---|---|
+| `MNOR` | `1 − ∏(1 − pᵢ)` | Noisy-OR: any cause can trigger the effect |
+| `MPROD` | `∏ pᵢ` | Product: all conditions must hold |
+
+Both clamp inputs to [0, 1], skip nulls, and are incompatible with `BEST BY`.
+
+```cypher
+-- Combine independent risk signals
+CREATE RULE combined_risk AS
+MATCH (a:Account)-[s:SIGNAL]->(f:Flag)
+FOLD risk = MNOR(s.probability)
+YIELD KEY a, risk
+```
 
 ---
 

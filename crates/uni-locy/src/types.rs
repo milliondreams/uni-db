@@ -69,6 +69,7 @@ pub struct CompiledClause {
 pub struct YieldColumn {
     pub name: String,
     pub is_key: bool,
+    pub is_prob: bool,
 }
 
 /// A non-fatal compiler diagnostic.
@@ -82,4 +83,35 @@ pub struct CompilerWarning {
 #[derive(Debug, Clone, PartialEq)]
 pub enum WarningCode {
     MsumNonNegativity,
+    ProbabilityDomainViolation,
+}
+
+/// Classification of runtime warnings emitted during evaluation.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RuntimeWarningCode {
+    /// Two or more proof paths aggregated by MNOR/MPROD share an
+    /// intermediate fact, violating the independence assumption.
+    SharedProbabilisticDependency,
+    /// A shared-proof group exceeded `max_bdd_variables`, so the BDD
+    /// computation fell back to the independence-mode result.
+    BddLimitExceeded,
+    /// Base facts are shared across different KEY groups within the same
+    /// rule. The BDD corrects per-group probabilities but cannot account
+    /// for cross-group correlations.
+    CrossGroupCorrelationNotExact,
+}
+
+/// A non-fatal runtime diagnostic collected during evaluation.
+#[derive(Debug, Clone)]
+pub struct RuntimeWarning {
+    /// Warning classification.
+    pub code: RuntimeWarningCode,
+    /// Human-readable explanation.
+    pub message: String,
+    /// Rule that triggered the warning, when applicable.
+    pub rule_name: String,
+    /// BDD variable count for the affected group (BddLimitExceeded only).
+    pub variable_count: Option<usize>,
+    /// Human-readable KEY group description (BddLimitExceeded only).
+    pub key_group: Option<String>,
 }

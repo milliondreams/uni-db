@@ -22,14 +22,9 @@ pub fn eval_locy_expr(
     prev_values: Option<&Row>,
 ) -> Result<Value, LocyError> {
     match expr {
-        LocyExpr::PrevRef(field) => {
-            if let Some(prev) = prev_values {
-                Ok(prev.get(field).cloned().unwrap_or(Value::Null))
-            } else {
-                // Base case: no previous values, return Null
-                Ok(Value::Null)
-            }
-        }
+        LocyExpr::PrevRef(field) => Ok(prev_values
+            .and_then(|prev| prev.get(field).cloned())
+            .unwrap_or(Value::Null)),
         LocyExpr::Cypher(cypher_expr) => eval_expr(cypher_expr, bindings),
         LocyExpr::BinaryOp { left, op, right } => {
             let l = eval_locy_expr(left, bindings, prev_values)?;
@@ -38,23 +33,7 @@ pub fn eval_locy_expr(
         }
         LocyExpr::UnaryOp(op, inner) => {
             let v = eval_locy_expr(inner, bindings, prev_values)?;
-            match op {
-                UnaryOp::Not => match v {
-                    Value::Bool(b) => Ok(Value::Bool(!b)),
-                    Value::Null => Ok(Value::Null),
-                    _ => Err(LocyError::TypeError {
-                        message: format!("NOT requires boolean, got {:?}", v),
-                    }),
-                },
-                UnaryOp::Neg => match v {
-                    Value::Int(i) => Ok(Value::Int(-i)),
-                    Value::Float(f) => Ok(Value::Float(-f)),
-                    Value::Null => Ok(Value::Null),
-                    _ => Err(LocyError::TypeError {
-                        message: format!("negation requires numeric, got {:?}", v),
-                    }),
-                },
-            }
+            eval_unary_op(op, &v)
         }
     }
 }
@@ -75,23 +54,7 @@ pub fn eval_expr(expr: &Expr, bindings: &Row) -> Result<Value, LocyError> {
         }
         Expr::UnaryOp { op, expr } => {
             let v = eval_expr(expr, bindings)?;
-            match op {
-                UnaryOp::Not => match v {
-                    Value::Bool(b) => Ok(Value::Bool(!b)),
-                    Value::Null => Ok(Value::Null),
-                    _ => Err(LocyError::TypeError {
-                        message: format!("NOT requires boolean, got {:?}", v),
-                    }),
-                },
-                UnaryOp::Neg => match v {
-                    Value::Int(i) => Ok(Value::Int(-i)),
-                    Value::Float(f) => Ok(Value::Float(-f)),
-                    Value::Null => Ok(Value::Null),
-                    _ => Err(LocyError::TypeError {
-                        message: format!("negation requires numeric, got {:?}", v),
-                    }),
-                },
-            }
+            eval_unary_op(op, &v)
         }
         Expr::FunctionCall { name, args, .. } => {
             let evaluated_args: Result<Vec<Value>, _> =
@@ -120,7 +83,7 @@ pub fn eval_expr(expr: &Expr, bindings: &Row) -> Result<Value, LocyError> {
             Ok(Value::Map(map))
         }
         _ => Err(LocyError::EvaluationError {
-            message: format!("unsupported expression in in-memory evaluation: {:?}", expr),
+            message: format!("unsupported expression in in-memory evaluation: {expr:?}"),
         }),
     }
 }
@@ -248,7 +211,7 @@ pub fn eval_aggregate_over_group(
             Ok(Value::List(vals))
         }
         _ => Err(LocyError::EvaluationError {
-            message: format!("unknown aggregate function: {}", func_name),
+            message: format!("unknown aggregate function: {func_name}"),
         }),
     }
 }
@@ -273,6 +236,30 @@ fn get_property(value: &Value, property: &str) -> Value {
     }
 }
 
+/// Evaluate a unary operator on a value.
+///
+/// Shared by both `eval_locy_expr` and `eval_expr` to avoid duplicating
+/// NOT/negation logic.
+fn eval_unary_op(op: &UnaryOp, v: &Value) -> Result<Value, LocyError> {
+    match op {
+        UnaryOp::Not => match v {
+            Value::Bool(b) => Ok(Value::Bool(!b)),
+            Value::Null => Ok(Value::Null),
+            _ => Err(LocyError::TypeError {
+                message: format!("NOT requires boolean, got {v:?}"),
+            }),
+        },
+        UnaryOp::Neg => match v {
+            Value::Int(i) => Ok(Value::Int(-i)),
+            Value::Float(f) => Ok(Value::Float(-f)),
+            Value::Null => Ok(Value::Null),
+            _ => Err(LocyError::TypeError {
+                message: format!("negation requires numeric, got {v:?}"),
+            }),
+        },
+    }
+}
+
 fn eval_locy_binary_op(left: &Value, op: &LocyBinaryOp, right: &Value) -> Result<Value, LocyError> {
     if left.is_null() || right.is_null() {
         return Ok(Value::Null);
@@ -293,10 +280,10 @@ fn eval_locy_binary_op(left: &Value, op: &LocyBinaryOp, right: &Value) -> Result
         LocyBinaryOp::Mod => numeric_op(left, right, |a, b| a % b, |a, b| a % b),
         LocyBinaryOp::Pow => {
             let l = left.as_f64().ok_or_else(|| LocyError::TypeError {
-                message: format!("pow requires numeric, got {:?}", left),
+                message: format!("pow requires numeric, got {left:?}"),
             })?;
             let r = right.as_f64().ok_or_else(|| LocyError::TypeError {
-                message: format!("pow requires numeric, got {:?}", right),
+                message: format!("pow requires numeric, got {right:?}"),
             })?;
             Ok(Value::Float(l.powf(r)))
         }
@@ -369,7 +356,7 @@ fn eval_binary_op(left: &Value, op: &BinaryOp, right: &Value) -> Result<Value, L
             _ => Ok(Value::Null),
         },
         _ => Err(LocyError::EvaluationError {
-            message: format!("unsupported binary op in in-memory evaluation: {:?}", op),
+            message: format!("unsupported binary op in in-memory evaluation: {op:?}"),
         }),
     }
 }
@@ -384,10 +371,10 @@ fn numeric_op(
         (Value::Int(a), Value::Int(b)) => Ok(Value::Int(int_op(*a, *b))),
         _ => {
             let a = left.as_f64().ok_or_else(|| LocyError::TypeError {
-                message: format!("numeric op requires number, got {:?}", left),
+                message: format!("numeric op requires number, got {left:?}"),
             })?;
             let b = right.as_f64().ok_or_else(|| LocyError::TypeError {
-                message: format!("numeric op requires number, got {:?}", right),
+                message: format!("numeric op requires number, got {right:?}"),
             })?;
             Ok(Value::Float(float_op(a, b)))
         }
@@ -406,7 +393,7 @@ fn eval_function(name: &str, args: &[Value]) -> Result<Value, LocyError> {
                     s.parse::<i64>()
                         .map(Value::Int)
                         .map_err(|_| LocyError::TypeError {
-                            message: format!("cannot convert '{}' to integer", s),
+                            message: format!("cannot convert '{s}' to integer"),
                         })
                 }
                 _ => Ok(Value::Null),
@@ -421,7 +408,7 @@ fn eval_function(name: &str, args: &[Value]) -> Result<Value, LocyError> {
                     s.parse::<f64>()
                         .map(Value::Float)
                         .map_err(|_| LocyError::TypeError {
-                            message: format!("cannot convert '{}' to float", s),
+                            message: format!("cannot convert '{s}' to float"),
                         })
                 }
                 _ => Ok(Value::Null),
@@ -435,7 +422,7 @@ fn eval_function(name: &str, args: &[Value]) -> Result<Value, LocyError> {
                 Value::Float(f) => Ok(Value::String(f.to_string())),
                 Value::Bool(b) => Ok(Value::String(b.to_string())),
                 Value::Null => Ok(Value::Null),
-                _ => Ok(Value::String(format!("{:?}", v))),
+                _ => Ok(Value::String(format!("{v:?}"))),
             }
         }
         "ABS" => {
@@ -457,7 +444,7 @@ fn eval_function(name: &str, args: &[Value]) -> Result<Value, LocyError> {
         "SIMILAR_TO" | "VECTOR_SIMILARITY" => {
             if args.len() < 2 {
                 return Err(LocyError::EvaluationError {
-                    message: format!("{} requires at least 2 arguments", name),
+                    message: format!("{name} requires at least 2 arguments"),
                 });
             }
             // In Locy context, handle pure vector-vector case directly.
@@ -469,8 +456,14 @@ fn eval_function(name: &str, args: &[Value]) -> Result<Value, LocyError> {
                 }
             })
         }
-        _ => Err(LocyError::EvaluationError {
-            message: format!("unknown function: {}", name),
+        // Delegate to the full Cypher scalar function evaluator so that every
+        // function available in Cypher (temporal, math, string, spatial, …) is
+        // automatically available in Locy. Both sides use uni_common::Value, so
+        // no type conversion is needed.
+        _ => crate::query::expr_eval::eval_scalar_function(name, args).map_err(|e| {
+            LocyError::EvaluationError {
+                message: e.to_string(),
+            }
         }),
     }
 }
@@ -481,6 +474,21 @@ pub fn values_equal(a: &Value, b: &Value) -> bool {
         (Value::Int(x), Value::Float(y)) => (*x as f64) == *y,
         (Value::Float(x), Value::Int(y)) => *x == (*y as f64),
         _ => a == b,
+    }
+}
+
+/// Compare two values for join equality in IS-ref matching.
+///
+/// For graph entities (`Value::Node`, `Value::Edge`), compares by identity
+/// (VID/EID) rather than full structural equality. This is necessary because
+/// the same node may have different property sets across different query
+/// executions (e.g., schema mode adds `overflow_json: Null` in some paths
+/// but not others). For non-graph values, falls back to `values_equal`.
+pub fn values_equal_for_join(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Node(na), Value::Node(nb)) => na.vid == nb.vid,
+        (Value::Edge(ea), Value::Edge(eb)) => ea.eid == eb.eid,
+        _ => values_equal(a, b),
     }
 }
 
@@ -515,19 +523,11 @@ pub fn value_compare(a: &Value, b: &Value, null_last: bool) -> std::cmp::Orderin
     } else {
         Ordering::Less
     };
-    match (matches!(a, Value::Null), matches!(b, Value::Null)) {
+    match (a.is_null(), b.is_null()) {
         (true, true) => Ordering::Equal,
         (true, false) => null_order,
         (false, true) => null_order.reverse(),
-        (false, false) => {
-            if value_less_than(a, b) {
-                Ordering::Less
-            } else if value_less_than(b, a) {
-                Ordering::Greater
-            } else {
-                Ordering::Equal
-            }
-        }
+        (false, false) => value_cmp(a, b),
     }
 }
 
@@ -662,12 +662,9 @@ fn map_to_graph_entity(map: HashMap<String, Value>) -> Value {
         let labels = match map.get("_labels") {
             Some(Value::List(list)) => list
                 .iter()
-                .filter_map(|v| {
-                    if let Value::String(s) = v {
-                        Some(s.clone())
-                    } else {
-                        None
-                    }
+                .filter_map(|v| match v {
+                    Value::String(s) => Some(s.clone()),
+                    _ => None,
                 })
                 .collect(),
             _ => Vec::new(),

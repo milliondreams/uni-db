@@ -3,6 +3,8 @@ use std::time::Duration;
 
 use uni_common::Value;
 
+use crate::types::{RuntimeWarning, RuntimeWarningCode};
+
 /// A single row of bindings from a query result.
 pub type Row = HashMap<String, Value>;
 
@@ -19,6 +21,11 @@ pub struct LocyResult {
     pub stats: LocyStats,
     /// Results from Phase 4 commands.
     pub command_results: Vec<CommandResult>,
+    /// Runtime warnings collected during evaluation.
+    pub warnings: Vec<RuntimeWarning>,
+    /// Groups where BDD computation fell back to independence mode.
+    /// Maps rule name → list of human-readable key group descriptions.
+    pub approximate_groups: HashMap<String, Vec<String>>,
 }
 
 /// Result of executing a single Phase 4 command.
@@ -42,6 +49,12 @@ pub struct DerivationNode {
     pub along_values: HashMap<String, Value>,
     pub children: Vec<DerivationNode>,
     pub graph_fact: Option<String>,
+    /// True when this node's probability was computed via BDD fallback
+    /// (independence mode) because the group exceeded `max_bdd_variables`.
+    pub approximate: bool,
+    /// Probability of this specific proof path, populated when top-k proof
+    /// filtering is active (Scallop, Huang et al. 2021).
+    pub proof_probability: Option<f64>,
 }
 
 /// Result of an ABDUCE query.
@@ -121,6 +134,16 @@ impl LocyResult {
     /// Get the total number of fixpoint iterations.
     pub fn iterations(&self) -> usize {
         self.stats.total_iterations
+    }
+
+    /// Get runtime warnings collected during evaluation.
+    pub fn warnings(&self) -> &[RuntimeWarning] {
+        &self.warnings
+    }
+
+    /// Check whether a specific warning code was emitted.
+    pub fn has_warning(&self, code: &RuntimeWarningCode) -> bool {
+        self.warnings.iter().any(|w| w.code == *code)
     }
 }
 

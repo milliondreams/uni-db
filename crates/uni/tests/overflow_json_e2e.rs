@@ -106,43 +106,100 @@ async fn test_mixed_schema_and_overflow_properties() -> Result<()> {
 
 /// Test 2: Property Updates with SET Operations
 ///
-/// Verifies that SET operations can add and update overflow properties,
-/// and that changes persist through flush cycles.
+/// Verifies that SET operations add overflow properties visible via
+/// `properties()` and individual property access WITHOUT requiring flush.
 #[tokio::test]
 async fn test_set_overflow_properties() -> Result<()> {
     let temp_dir = tempdir()?;
     let path = temp_dir.path();
     let db = Uni::open(path.to_str().unwrap()).build().await?;
 
-    // Create schemaless label
     db.schema().label("User").apply().await?;
 
-    println!("✓ Created User label (schemaless)");
-
-    // Create initial vertex with minimal properties
+    // Create vertex, flush to Lance storage
     db.execute("CREATE (:User {name: 'Alice'})").await?;
-    println!("✓ Created user with name only");
-
-    // Flush
     db.flush().await?;
-    println!("✓ Flushed to storage");
 
-    // TODO: SET operations not yet implemented
-    // Once SET is implemented, uncomment and test:
+    // SET a new overflow property — writes to L0, no flush
+    db.execute("MATCH (u:User) SET u.extra = 42").await?;
 
-    // db.execute("MATCH (u:User) SET u.verified = true, u.email = 'alice@example.com'").await?;
-    // println!("✓ Updated user with SET operation");
+    // properties(n) must include the L0-buffered property
+    let results = db
+        .query("MATCH (u:User) RETURN properties(u) AS props")
+        .await?;
+    assert_eq!(results.len(), 1);
+    let row = &results.rows()[0];
+    let props_val = row.value("props").expect("props column should exist");
+    let props_json: serde_json::Value = props_val.clone().into();
+    let props_str = format!("{props_json:?}");
+    assert!(
+        props_str.contains("extra"),
+        "properties(u) should include L0-buffered 'extra', got: {props_str}"
+    );
 
-    // db.flush().await?;
-    // println!("✓ Flushed after SET");
+    // Individual property access must also work
+    let results = db.query("MATCH (u:User) RETURN u.extra AS extra").await?;
+    assert_eq!(results.len(), 1);
+    let row = &results.rows()[0];
+    let extra = row.get::<i64>("extra")?;
+    assert_eq!(extra, 42, "u.extra should be 42 from L0 buffer");
 
-    // let results = db.query("MATCH (u:User) RETURN u.name, u.verified, u.email").await?;
-    // assert_eq!(results.len(), 1);
-    // let row = &results.rows()[0];
-    // assert_eq!(row.get::<String>("u.name")?, "Alice");
-    // assert_eq!(row.get::<String>("u.email")?, "alice@example.com");
+    Ok(())
+}
 
-    println!("⚠ SET operations test skipped - SET not yet implemented");
+/// Test: Read-your-writes semantics without any flush.
+///
+/// After CREATE and SET (both unflushed), properties() must include
+/// all properties from the L0 buffer.
+#[tokio::test]
+async fn test_set_properties_read_your_writes_no_flush() -> Result<()> {
+    let temp_dir = tempdir()?;
+    let path = temp_dir.path();
+    let db = Uni::open(path.to_str().unwrap()).build().await?;
+
+    db.schema().label("Person").apply().await?;
+
+    // Create vertex — no flush
+    db.execute("CREATE (:Person {name: 'Alice', age: 30})")
+        .await?;
+    db.flush().await?;
+
+    // SET another property — no flush
+    db.execute("MATCH (p:Person) SET p.pagerank = 0.5").await?;
+
+    // properties(p) must include name, age, AND pagerank
+    let results = db
+        .query("MATCH (p:Person) RETURN properties(p) AS props")
+        .await?;
+    assert_eq!(results.len(), 1);
+    let row = &results.rows()[0];
+    let props_val = row.value("props").expect("props column should exist");
+    let props_json: serde_json::Value = props_val.clone().into();
+    let props_map = props_json
+        .as_object()
+        .expect("properties() should return a map");
+    assert!(
+        props_map.contains_key("name"),
+        "properties(p) should contain 'name', got: {props_map:?}"
+    );
+    assert!(
+        props_map.contains_key("age"),
+        "properties(p) should contain 'age', got: {props_map:?}"
+    );
+    assert!(
+        props_map.contains_key("pagerank"),
+        "properties(p) should contain 'pagerank', got: {props_map:?}"
+    );
+
+    // Individual property access
+    let results = db.query("MATCH (p:Person) RETURN p.pagerank AS pr").await?;
+    assert_eq!(results.len(), 1);
+    let row = &results.rows()[0];
+    let pr = row.get::<f64>("pr")?;
+    assert!(
+        (pr - 0.5).abs() < f64::EPSILON,
+        "p.pagerank should be 0.5, got: {pr}"
+    );
 
     Ok(())
 }
@@ -443,6 +500,199 @@ async fn test_comprehensive_null_handling() -> Result<()> {
     Ok(())
 }
 
+/// Test: SET overflow property on multiple nodes persists after flush.
+///
+/// Reproduction for the bug where non-schema (overflow) properties are
+/// silently lost for some vertices after flush(). The issue is that
+/// MATCH/SET on individual nodes writes back all properties to L0, but
+/// after flush some nodes lose their overflow property values.
+///
+/// Steps:
+///   1. CREATE a schema label with typed properties (pagerank is NOT in schema)
+///   2. CREATE 8 nodes with schema properties
+///   3. SET pagerank on each node individually via MATCH/SET
+///   4. Verify pre-flush: all 8 nodes have pagerank (L0 read)
+///   5. flush()
+///   6. Verify post-flush: all 8 nodes retain pagerank (storage read)
+#[tokio::test]
+async fn test_set_overflow_property_persistence_after_flush() -> Result<()> {
+    let temp_dir = tempdir()?;
+    let path = temp_dir.path();
+    let db = Uni::open(path.to_str().unwrap()).build().await?;
+
+    // Create File label with 'name' in schema — pagerank is NOT in schema (overflow)
+    db.schema()
+        .label("File")
+        .property("name", uni_db::DataType::String)
+        .apply()
+        .await?;
+
+    // Create 8 File nodes and flush to Lance first
+    let count = 8;
+    let names: Vec<String> = (0..count).map(|i| format!("file_{i:03}.txt")).collect();
+    for name in &names {
+        db.execute(&format!("CREATE (:File {{name: '{name}'}})"))
+            .await?;
+    }
+
+    // First flush: nodes now in Lance storage (no overflow properties yet)
+    db.flush().await?;
+
+    // SET pagerank on each node individually (each is a separate MATCH/SET)
+    // This creates L0 entries that overlay the Lance data
+    for (i, name) in names.iter().enumerate() {
+        let rank = (i + 1) as f64 * 0.1;
+        db.execute(&format!(
+            "MATCH (f:File {{name: '{name}'}}) SET f.pagerank = {rank}"
+        ))
+        .await?;
+    }
+
+    // Pre-flush: verify all 8 nodes have pagerank via L0
+    let results = db
+        .query("MATCH (f:File) RETURN f.name, f.pagerank ORDER BY f.name")
+        .await?;
+    assert_eq!(
+        results.len(),
+        count,
+        "Pre-flush: should have {count} File nodes"
+    );
+    for row in results.rows() {
+        let name = row.get::<String>("f.name")?;
+        let pr = row
+            .value("f.pagerank")
+            .expect("pre-flush: pagerank column should exist");
+        assert_ne!(
+            pr,
+            &uni_db::Value::Null,
+            "Pre-flush: pagerank should not be null for {name}"
+        );
+    }
+
+    // Flush to storage
+    db.flush().await?;
+
+    // Post-flush: verify ALL nodes retain pagerank
+    let results = db
+        .query("MATCH (f:File) RETURN f.name, f.pagerank ORDER BY f.name")
+        .await?;
+    assert_eq!(
+        results.len(),
+        count,
+        "Post-flush: should have {count} File nodes"
+    );
+    let mut non_null_count = 0;
+    let mut null_names = Vec::new();
+    for row in results.rows() {
+        let name = row.get::<String>("f.name")?;
+        let pr = row
+            .value("f.pagerank")
+            .expect("post-flush: pagerank column should exist");
+        if pr != &uni_db::Value::Null {
+            non_null_count += 1;
+        } else {
+            null_names.push(name);
+        }
+    }
+    assert_eq!(
+        non_null_count, count,
+        "Post-flush: all {count} nodes should retain pagerank, but only {non_null_count}/{count} did. Nulls: {null_names:?}"
+    );
+
+    // Also verify via properties() function
+    let results = db
+        .query("MATCH (f:File) RETURN f.name, properties(f) AS props ORDER BY f.name")
+        .await?;
+    assert_eq!(results.len(), count);
+    for row in results.rows() {
+        let name = row.get::<String>("f.name")?;
+        let props_val = row.value("props").expect("props column should exist");
+        let props_json: serde_json::Value = props_val.clone().into();
+        let props_map = props_json.as_object().unwrap_or_else(|| {
+            panic!("properties() for {name} should be a map, got {props_json:?}")
+        });
+        assert!(
+            props_map.contains_key("pagerank"),
+            "Post-flush: properties({name}) should contain 'pagerank', got: {props_map:?}"
+        );
+    }
+
+    Ok(())
+}
+
+/// Test: SET overflow on all nodes in single MATCH, then flush.
+///
+/// Variant of the above test where SET is done with a single MATCH
+/// that hits all nodes at once, rather than individual MATCH/SET per node.
+#[tokio::test]
+async fn test_set_overflow_all_at_once_persistence_after_flush() -> Result<()> {
+    let temp_dir = tempdir()?;
+    let path = temp_dir.path();
+    let db = Uni::open(path.to_str().unwrap()).build().await?;
+
+    db.schema()
+        .label("Doc")
+        .property("title", uni_db::DataType::String)
+        .apply()
+        .await?;
+
+    let count = 10;
+    for i in 0..count {
+        db.execute(&format!("CREATE (:Doc {{title: 'doc_{i}'}})"))
+            .await?;
+    }
+    db.flush().await?;
+
+    // SET overflow property on ALL nodes at once (single MATCH)
+    db.execute("MATCH (d:Doc) SET d.score = 42.0").await?;
+
+    // Pre-flush check
+    let results = db.query("MATCH (d:Doc) RETURN d.score").await?;
+    assert_eq!(results.len(), count);
+    for row in results.rows() {
+        assert_ne!(
+            row.value("d.score").unwrap(),
+            &uni_db::Value::Null,
+            "Pre-flush: score should not be null"
+        );
+    }
+
+    db.flush().await?;
+
+    // Post-flush check
+    let results = db
+        .query("MATCH (d:Doc) RETURN d.title, d.score ORDER BY d.title")
+        .await?;
+    assert_eq!(results.len(), count);
+    let mut non_null = 0;
+    for row in results.rows() {
+        if row.value("d.score").unwrap() != &uni_db::Value::Null {
+            non_null += 1;
+        }
+    }
+    assert_eq!(
+        non_null, count,
+        "Post-flush: all {count} nodes should retain score, but only {non_null}/{count} did"
+    );
+
+    // Also check properties() includes overflow
+    let results = db
+        .query("MATCH (d:Doc) RETURN properties(d) AS props")
+        .await?;
+    assert_eq!(results.len(), count);
+    for row in results.rows() {
+        let props_val = row.value("props").expect("props column");
+        let props_json: serde_json::Value = props_val.clone().into();
+        let map = props_json.as_object().expect("should be map");
+        assert!(
+            map.contains_key("score"),
+            "properties() should contain 'score', got: {map:?}"
+        );
+    }
+
+    Ok(())
+}
+
 /// Test 7: Bulk Operations with Overflow Properties
 ///
 /// Performance test with larger dataset to ensure overflow_json
@@ -522,6 +772,88 @@ async fn test_bulk_overflow_properties() -> Result<()> {
     }
 
     println!("✓ Individual property lookup works in bulk dataset");
+
+    Ok(())
+}
+
+/// Test 8: `bulk_insert_vertices` with undeclared properties.
+///
+/// Verifies that properties not declared in the schema are preserved
+/// via the `overflow_json` column when inserted through the
+/// `bulk_insert_vertices` API (not just Cypher CREATE).
+#[tokio::test]
+async fn test_bulk_insert_vertices_overflow_properties() -> Result<()> {
+    let temp_dir = tempdir()?;
+    let path = temp_dir.path();
+    let db = Uni::open(path.to_str().unwrap()).build().await?;
+
+    // Schema declares only "name" — "city" and "score" are undeclared.
+    db.schema()
+        .label("Item")
+        .property("name", uni_db::DataType::String)
+        .apply()
+        .await?;
+
+    // Build properties with a mix of declared and undeclared fields.
+    let mut props_list = Vec::new();
+    for i in 0..5 {
+        let mut p = std::collections::HashMap::new();
+        p.insert("name".to_string(), uni_db::unival!(format!("item_{i}")));
+        p.insert("city".to_string(), uni_db::unival!(format!("city_{i}")));
+        p.insert("score".to_string(), uni_db::unival!(i as i64 * 10));
+        props_list.push(p);
+    }
+
+    let vids = db.bulk_insert_vertices("Item", props_list).await?;
+    assert_eq!(vids.len(), 5);
+
+    // ── Pre-flush: L0 buffer should already expose overflow properties ──
+    let results = db
+        .query("MATCH (i:Item) WHERE i.name = 'item_2' RETURN i.city, i.score")
+        .await?;
+    assert_eq!(results.len(), 1, "should find item_2 before flush");
+    let row = &results.rows()[0];
+    let city = row
+        .value("i.city")
+        .expect("city should be accessible from L0");
+    assert_eq!(city, &uni_db::Value::String("city_2".into()));
+
+    // ── Post-flush: overflow_json should persist and be queryable ────────
+    db.flush().await?;
+
+    let results = db
+        .query("MATCH (i:Item) RETURN i.name, i.city, i.score ORDER BY i.name")
+        .await?;
+    assert_eq!(results.len(), 5, "all 5 items should survive flush");
+
+    for (idx, row) in results.rows().iter().enumerate() {
+        let name = row.value("i.name").expect("name (schema col) should exist");
+        assert_eq!(name, &uni_db::Value::String(format!("item_{idx}")));
+
+        let city = row.value("i.city").expect("city (overflow) should exist");
+        assert_eq!(city, &uni_db::Value::String(format!("city_{idx}")));
+    }
+
+    // ── WHERE on overflow property should also work ─────────────────────
+    let results = db
+        .query("MATCH (i:Item) WHERE i.city = 'city_3' RETURN i.name")
+        .await?;
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results.rows()[0].value("i.name").unwrap(),
+        &uni_db::Value::String("item_3".into()),
+    );
+
+    // ── properties() should include both schema and overflow fields ─────
+    let results = db
+        .query("MATCH (i:Item) WHERE i.name = 'item_0' RETURN properties(i) AS props")
+        .await?;
+    assert_eq!(results.len(), 1);
+    let props_str = format!("{:?}", results.rows()[0].value("props"));
+    assert!(
+        props_str.contains("city_0"),
+        "properties(i) should include overflow 'city', got: {props_str}",
+    );
 
     Ok(())
 }

@@ -494,7 +494,7 @@ impl Executor {
                                 Value::Int(i) => i.to_string(),
                                 Value::Float(f) => f.to_string(),
                                 Value::String(s) => s,
-                                _ => format!("{}", value),
+                                _ => format!("{value}"),
                             };
                             row.push(csv_value);
                         }

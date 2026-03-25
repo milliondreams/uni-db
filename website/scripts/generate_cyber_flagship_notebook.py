@@ -447,6 +447,18 @@ def _build_notebook() -> dict[str, Any]:
         )
     )
     cells.append(
+        _md_cell(
+            key,
+            len(cells),
+            [
+                "> **FTS Auto-Build and L0 Visibility**: `CREATE FULLTEXT INDEX` automatically",
+                "> builds the index — no `rebuild_indexes()` call needed. Uni also searches the",
+                "> L0 in-memory write buffer, so documents ingested in the previous step are",
+                "> immediately visible to FTS queries without requiring a flush to disk.",
+            ],
+        )
+    )
+    cells.append(
         _code_cell(
             key,
             len(cells),

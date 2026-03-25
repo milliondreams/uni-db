@@ -6,7 +6,9 @@
 //! `FoldExec` applies fold (lattice-join) semantics: for each group of rows sharing
 //! the same KEY columns, it reduces non-key columns via their declared fold functions.
 
-use crate::query::df_graph::common::{ScalarKey, compute_plan_properties, extract_scalar_key};
+use crate::query::df_graph::common::{
+    ScalarKey, arrow_err, compute_plan_properties, extract_scalar_key,
+};
 use arrow_array::builder::{Float64Builder, Int64Builder, LargeBinaryBuilder};
 use arrow_array::{Array, Float64Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -22,6 +24,15 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+/// Direction of monotonicity for a fold aggregate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MonotonicDirection {
+    /// Value can only stay the same or increase across iterations.
+    NonDecreasing,
+    /// Value can only stay the same or decrease across iterations.
+    NonIncreasing,
+}
+
 /// Aggregate function kind for FOLD bindings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FoldAggKind {
@@ -29,8 +40,50 @@ pub enum FoldAggKind {
     Max,
     Min,
     Count,
+    /// Count all rows in a group (like SQL `COUNT(*)`), ignoring nulls.
+    CountAll,
     Avg,
     Collect,
+    Nor,  // Noisy-OR: 1 − ∏(1 − pᵢ)
+    Prod, // Product:  ∏ pᵢ
+}
+
+impl FoldAggKind {
+    /// Returns `true` if this aggregate is monotonic (safe for fixpoint iteration).
+    pub fn is_monotonic(&self) -> bool {
+        matches!(
+            self,
+            Self::Sum
+                | Self::Max
+                | Self::Min
+                | Self::Count
+                | Self::CountAll
+                | Self::Nor
+                | Self::Prod
+        )
+    }
+
+    /// Returns the monotonicity direction, or `None` for non-monotonic aggregates.
+    pub fn monotonicity_direction(&self) -> Option<MonotonicDirection> {
+        match self {
+            Self::Sum | Self::Max | Self::Count | Self::CountAll | Self::Nor => {
+                Some(MonotonicDirection::NonDecreasing)
+            }
+            Self::Min | Self::Prod => Some(MonotonicDirection::NonIncreasing),
+            Self::Avg | Self::Collect => None,
+        }
+    }
+
+    /// Returns the identity element for this aggregate, or `None` for non-monotonic aggregates.
+    pub fn identity(&self) -> Option<f64> {
+        match self {
+            Self::Sum | Self::Count | Self::CountAll | Self::Nor => Some(0.0),
+            Self::Max => Some(f64::NEG_INFINITY),
+            Self::Min => Some(f64::INFINITY),
+            Self::Prod => Some(1.0),
+            Self::Avg | Self::Collect => None,
+        }
+    }
 }
 
 /// A single FOLD binding: aggregate an input column into an output column.
@@ -50,6 +103,8 @@ pub struct FoldExec {
     input: Arc<dyn ExecutionPlan>,
     key_indices: Vec<usize>,
     fold_bindings: Vec<FoldBinding>,
+    strict_probability_domain: bool,
+    probability_epsilon: f64,
     schema: SchemaRef,
     properties: PlanProperties,
     metrics: ExecutionPlanMetricsSet,
@@ -66,6 +121,8 @@ impl FoldExec {
         input: Arc<dyn ExecutionPlan>,
         key_indices: Vec<usize>,
         fold_bindings: Vec<FoldBinding>,
+        strict_probability_domain: bool,
+        probability_epsilon: f64,
     ) -> Self {
         let input_schema = input.schema();
         let schema = Self::build_output_schema(&input_schema, &key_indices, &fold_bindings);
@@ -75,6 +132,8 @@ impl FoldExec {
             input,
             key_indices,
             fold_bindings,
+            strict_probability_domain,
+            probability_epsilon,
             schema,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -95,11 +154,15 @@ impl FoldExec {
 
         // Fold output columns
         for binding in fold_bindings {
-            let input_type = input_schema.field(binding.input_col_index).data_type();
             let output_type = match binding.kind {
-                FoldAggKind::Sum | FoldAggKind::Avg => DataType::Float64,
-                FoldAggKind::Count => DataType::Int64,
-                FoldAggKind::Max | FoldAggKind::Min => input_type.clone(),
+                FoldAggKind::Sum | FoldAggKind::Avg | FoldAggKind::Nor | FoldAggKind::Prod => {
+                    DataType::Float64
+                }
+                FoldAggKind::Count | FoldAggKind::CountAll => DataType::Int64,
+                FoldAggKind::Max | FoldAggKind::Min => input_schema
+                    .field(binding.input_col_index)
+                    .data_type()
+                    .clone(),
                 FoldAggKind::Collect => DataType::LargeBinary,
             };
             fields.push(Arc::new(Field::new(
@@ -157,6 +220,8 @@ impl ExecutionPlan for FoldExec {
             Arc::clone(&children[0]),
             self.key_indices.clone(),
             self.fold_bindings.clone(),
+            self.strict_probability_domain,
+            self.probability_epsilon,
         )))
     }
 
@@ -169,6 +234,8 @@ impl ExecutionPlan for FoldExec {
         let metrics = BaselineMetrics::new(&self.metrics, partition);
         let key_indices = self.key_indices.clone();
         let fold_bindings = self.fold_bindings.clone();
+        let strict = self.strict_probability_domain;
+        let epsilon = self.probability_epsilon;
         let output_schema = Arc::clone(&self.schema);
         let input_schema = self.input.schema();
 
@@ -179,8 +246,8 @@ impl ExecutionPlan for FoldExec {
                 return Ok(RecordBatch::new_empty(output_schema));
             }
 
-            let batch = arrow::compute::concat_batches(&input_schema, &batches)
-                .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+            let batch =
+                arrow::compute::concat_batches(&input_schema, &batches).map_err(arrow_err)?;
 
             if batch.num_rows() == 0 {
                 return Ok(RecordBatch::new_empty(output_schema));
@@ -217,19 +284,25 @@ impl ExecutionPlan for FoldExec {
 
             // Fold binding columns: compute aggregates per group
             for binding in &fold_bindings {
-                let col = batch.column(binding.input_col_index);
+                let col: Arc<dyn Array> = if binding.kind == FoldAggKind::CountAll {
+                    // CountAll doesn't need an input column — use a dummy
+                    Arc::new(arrow_array::Int64Array::from(vec![0i64; batch.num_rows()]))
+                } else {
+                    Arc::clone(batch.column(binding.input_col_index))
+                };
                 let agg_col = compute_fold_aggregate(
                     col.as_ref(),
                     &binding.kind,
                     &ordered_keys,
                     &groups,
                     num_groups,
+                    strict,
+                    epsilon,
                 )?;
                 output_columns.push(agg_col);
             }
 
-            RecordBatch::try_new(output_schema, output_columns)
-                .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+            RecordBatch::try_new(output_schema, output_columns).map_err(arrow_err)
         };
 
         Ok(Box::pin(FoldStream {
@@ -254,6 +327,8 @@ fn compute_fold_aggregate(
     ordered_keys: &[Vec<ScalarKey>],
     groups: &HashMap<Vec<ScalarKey>, Vec<usize>>,
     num_groups: usize,
+    strict: bool,
+    probability_epsilon: f64,
 ) -> DFResult<arrow_array::ArrayRef> {
     match kind {
         FoldAggKind::Sum => {
@@ -269,6 +344,14 @@ fn compute_fold_aggregate(
                 let indices = &groups[key];
                 let count = indices.iter().filter(|&&i| !col.is_null(i)).count();
                 builder.append_value(count as i64);
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        FoldAggKind::CountAll => {
+            let mut builder = Int64Builder::with_capacity(num_groups);
+            for key in ordered_keys {
+                let indices = &groups[key];
+                builder.append_value(indices.len() as i64);
             }
             Ok(Arc::new(builder.finish()))
         }
@@ -300,6 +383,21 @@ fn compute_fold_aggregate(
             }
             Ok(Arc::new(builder.finish()))
         }
+        FoldAggKind::Nor => {
+            let mut builder = Float64Builder::with_capacity(num_groups);
+            for key in ordered_keys {
+                let indices = &groups[key];
+                builder.append_option(noisy_or_f64(col, indices, strict)?);
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        FoldAggKind::Prod => {
+            let mut builder = Float64Builder::with_capacity(num_groups);
+            for key in ordered_keys {
+                builder.append_option(product_f64(col, &groups[key], strict, probability_epsilon)?);
+            }
+            Ok(Arc::new(builder.finish()))
+        }
     }
 }
 
@@ -318,6 +416,105 @@ fn sum_f64(col: &dyn Array, indices: &[usize]) -> Option<f64> {
         }
     }
     if has_value { Some(sum) } else { None }
+}
+
+/// Noisy-OR: P = 1 − ∏(1 − pᵢ). Inputs clamped to [0, 1] unless strict.
+fn noisy_or_f64(col: &dyn Array, indices: &[usize], strict: bool) -> DFResult<Option<f64>> {
+    let mut complement_product = 1.0;
+    let mut has_value = false;
+    for &i in indices {
+        if col.is_null(i) {
+            continue;
+        }
+        has_value = true;
+        let raw = if let Some(arr) = col.as_any().downcast_ref::<Float64Array>() {
+            arr.value(i)
+        } else if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
+            arr.value(i) as f64
+        } else {
+            continue;
+        };
+        if strict && !(0.0..=1.0).contains(&raw) {
+            return Err(datafusion::error::DataFusionError::Execution(format!(
+                "strict_probability_domain: MNOR input {raw} is outside [0, 1]"
+            )));
+        }
+        if !strict && !(0.0..=1.0).contains(&raw) {
+            tracing::warn!(
+                "MNOR input {raw} outside [0,1], clamped to {}",
+                raw.clamp(0.0, 1.0)
+            );
+        }
+        let p = raw.clamp(0.0, 1.0);
+        complement_product *= 1.0 - p;
+    }
+    if has_value {
+        Ok(Some(1.0 - complement_product))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Product: P = ∏ pᵢ. Inputs clamped to [0, 1] unless strict.
+///
+/// Switches to log-space when the running product drops below
+/// `probability_epsilon` to prevent floating-point underflow.
+fn product_f64(
+    col: &dyn Array,
+    indices: &[usize],
+    strict: bool,
+    probability_epsilon: f64,
+) -> DFResult<Option<f64>> {
+    let mut product = 1.0;
+    let mut log_sum = 0.0;
+    let mut use_log = false;
+    let mut has_value = false;
+    for &i in indices {
+        if col.is_null(i) {
+            continue;
+        }
+        has_value = true;
+        let raw = if let Some(arr) = col.as_any().downcast_ref::<Float64Array>() {
+            arr.value(i)
+        } else if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
+            arr.value(i) as f64
+        } else {
+            continue;
+        };
+        if strict && !(0.0..=1.0).contains(&raw) {
+            return Err(datafusion::error::DataFusionError::Execution(format!(
+                "strict_probability_domain: MPROD input {raw} is outside [0, 1]"
+            )));
+        }
+        if !strict && !(0.0..=1.0).contains(&raw) {
+            tracing::warn!(
+                "MPROD input {raw} outside [0,1], clamped to {}",
+                raw.clamp(0.0, 1.0)
+            );
+        }
+        let p = raw.clamp(0.0, 1.0);
+        if p == 0.0 {
+            return Ok(Some(0.0));
+        }
+        if use_log {
+            log_sum += p.ln();
+        } else {
+            product *= p;
+            if product < probability_epsilon {
+                // Switch to log-space to prevent underflow
+                log_sum = product.ln();
+                use_log = true;
+            }
+        }
+    }
+    if !has_value {
+        return Ok(None);
+    }
+    if use_log {
+        Ok(Some(log_sum.exp()))
+    } else {
+        Ok(Some(product))
+    }
 }
 
 fn compute_minmax(
@@ -595,7 +792,7 @@ mod tests {
         key_indices: Vec<usize>,
         fold_bindings: Vec<FoldBinding>,
     ) -> RecordBatch {
-        let exec = FoldExec::new(input, key_indices, fold_bindings);
+        let exec = FoldExec::new(input, key_indices, fold_bindings, false, 1e-15);
         let ctx = SessionContext::new();
         let task_ctx = ctx.task_ctx();
         let stream = exec.execute(0, task_ctx).unwrap();
@@ -845,5 +1042,1059 @@ mod tests {
             .downcast_ref::<Float64Array>()
             .unwrap();
         assert_eq!(maxes.value(0), 3.0);
+    }
+
+    // ── MNOR tests ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_nor_single_group() {
+        // MNOR({0.3, 0.5}) = 1 - (1-0.3)*(1-0.5) = 1 - 0.7*0.5 = 1 - 0.35 = 0.65
+        let batch = make_test_batch(vec!["a", "a"], vec![0.3, 0.5]);
+        let input = make_memory_exec(batch);
+        let result = execute_fold(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "prob".to_string(),
+                kind: FoldAggKind::Nor,
+                input_col_index: 1,
+            }],
+        )
+        .await;
+
+        assert_eq!(result.num_rows(), 1);
+        let vals = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!((vals.value(0) - 0.65).abs() < 1e-10);
+    }
+
+    #[tokio::test]
+    async fn test_nor_identity() {
+        // MNOR({0.0, 0.0}) = 1 - (1-0)*(1-0) = 1 - 1 = 0.0
+        let batch = make_test_batch(vec!["a", "a"], vec![0.0, 0.0]);
+        let input = make_memory_exec(batch);
+        let result = execute_fold(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "prob".to_string(),
+                kind: FoldAggKind::Nor,
+                input_col_index: 1,
+            }],
+        )
+        .await;
+
+        let vals = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!((vals.value(0) - 0.0).abs() < 1e-10);
+    }
+
+    #[tokio::test]
+    async fn test_nor_clamping() {
+        // Out-of-range values should be clamped to [0, 1]
+        let batch = make_test_batch(vec!["a", "a"], vec![-0.5, 1.5]);
+        let input = make_memory_exec(batch);
+        let result = execute_fold(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "prob".to_string(),
+                kind: FoldAggKind::Nor,
+                input_col_index: 1,
+            }],
+        )
+        .await;
+
+        let vals = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        // Clamped to (0.0, 1.0): MNOR = 1 - (1-0)*(1-1) = 1 - 1*0 = 1.0
+        assert!((vals.value(0) - 1.0).abs() < 1e-10);
+    }
+
+    #[tokio::test]
+    async fn test_nor_multiple_groups() {
+        let batch = make_test_batch(vec!["a", "a", "b", "b"], vec![0.3, 0.5, 0.1, 0.2]);
+        let input = make_memory_exec(batch);
+        let result = execute_fold(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "prob".to_string(),
+                kind: FoldAggKind::Nor,
+                input_col_index: 1,
+            }],
+        )
+        .await;
+
+        assert_eq!(result.num_rows(), 2);
+        let names = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let vals = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+
+        for i in 0..2 {
+            match names.value(i) {
+                // MNOR({0.3, 0.5}) = 0.65
+                "a" => assert!((vals.value(i) - 0.65).abs() < 1e-10),
+                // MNOR({0.1, 0.2}) = 1 - 0.9*0.8 = 1 - 0.72 = 0.28
+                "b" => assert!((vals.value(i) - 0.28).abs() < 1e-10),
+                _ => panic!("unexpected name"),
+            }
+        }
+    }
+
+    // ── MPROD tests ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_prod_single_group() {
+        // MPROD({0.6, 0.8}) = 0.48
+        let batch = make_test_batch(vec!["a", "a"], vec![0.6, 0.8]);
+        let input = make_memory_exec(batch);
+        let result = execute_fold(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "prob".to_string(),
+                kind: FoldAggKind::Prod,
+                input_col_index: 1,
+            }],
+        )
+        .await;
+
+        assert_eq!(result.num_rows(), 1);
+        let vals = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!((vals.value(0) - 0.48).abs() < 1e-10);
+    }
+
+    #[tokio::test]
+    async fn test_prod_identity() {
+        // MPROD({1.0, 1.0}) = 1.0
+        let batch = make_test_batch(vec!["a", "a"], vec![1.0, 1.0]);
+        let input = make_memory_exec(batch);
+        let result = execute_fold(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "prob".to_string(),
+                kind: FoldAggKind::Prod,
+                input_col_index: 1,
+            }],
+        )
+        .await;
+
+        let vals = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!((vals.value(0) - 1.0).abs() < 1e-10);
+    }
+
+    #[tokio::test]
+    async fn test_prod_zero_absorbing() {
+        // MPROD with 0.0 = 0.0 (zero is absorbing element)
+        let batch = make_test_batch(vec!["a", "a", "a"], vec![0.5, 0.0, 0.8]);
+        let input = make_memory_exec(batch);
+        let result = execute_fold(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "prob".to_string(),
+                kind: FoldAggKind::Prod,
+                input_col_index: 1,
+            }],
+        )
+        .await;
+
+        let vals = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!((vals.value(0) - 0.0).abs() < 1e-10);
+    }
+
+    #[tokio::test]
+    async fn test_prod_underflow_protection() {
+        // 50 × 0.5 ≈ 8.88e-16, should not be exactly 0 thanks to log-space
+        let names: Vec<&str> = vec!["a"; 50];
+        let values: Vec<f64> = vec![0.5; 50];
+        let batch = make_test_batch(names, values);
+        let input = make_memory_exec(batch);
+        let result = execute_fold(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "prob".to_string(),
+                kind: FoldAggKind::Prod,
+                input_col_index: 1,
+            }],
+        )
+        .await;
+
+        let vals = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let expected = 0.5_f64.powi(50); // ≈ 8.88e-16
+        assert!(vals.value(0) > 0.0, "should not underflow to zero");
+        assert!(
+            (vals.value(0) - expected).abs() / expected < 1e-6,
+            "result {} should be close to expected {}",
+            vals.value(0),
+            expected
+        );
+    }
+
+    // ── MNOR/MPROD mathematical correctness tests ───────────────────────
+
+    fn make_nullable_test_batch(names: Vec<&str>, values: Vec<Option<f64>>) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("value", DataType::Float64, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(
+                    names.into_iter().map(Some).collect::<Vec<_>>(),
+                )),
+                Arc::new(Float64Array::from(values)),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_nor_single_element() {
+        // MNOR({0.7}) = 0.7 (n=1 identity)
+        let batch = make_test_batch(vec!["a"], vec![0.7]);
+        let input = make_memory_exec(batch);
+        let result = execute_fold(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "prob".to_string(),
+                kind: FoldAggKind::Nor,
+                input_col_index: 1,
+            }],
+        )
+        .await;
+        let vals = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!((vals.value(0) - 0.7).abs() < 1e-10);
+    }
+
+    #[tokio::test]
+    async fn test_prod_single_element() {
+        // MPROD({0.7}) = 0.7 (n=1 identity)
+        let batch = make_test_batch(vec!["a"], vec![0.7]);
+        let input = make_memory_exec(batch);
+        let result = execute_fold(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "prob".to_string(),
+                kind: FoldAggKind::Prod,
+                input_col_index: 1,
+            }],
+        )
+        .await;
+        let vals = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!((vals.value(0) - 0.7).abs() < 1e-10);
+    }
+
+    #[tokio::test]
+    async fn test_nor_three_elements() {
+        // MNOR({0.3, 0.4, 0.5}) = 1 - (0.7)(0.6)(0.5) = 0.79
+        let batch = make_test_batch(vec!["a", "a", "a"], vec![0.3, 0.4, 0.5]);
+        let input = make_memory_exec(batch);
+        let result = execute_fold(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "prob".to_string(),
+                kind: FoldAggKind::Nor,
+                input_col_index: 1,
+            }],
+        )
+        .await;
+        let vals = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!((vals.value(0) - 0.79).abs() < 1e-10);
+    }
+
+    #[tokio::test]
+    async fn test_nor_four_elements_spec_example() {
+        // Spec §4.5: MNOR({0.72, 0.54, 0.56, 0.42}) = 1 - (0.28)(0.46)(0.44)(0.58) = 0.96713024
+        let batch = make_test_batch(vec!["a", "a", "a", "a"], vec![0.72, 0.54, 0.56, 0.42]);
+        let input = make_memory_exec(batch);
+        let result = execute_fold(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "prob".to_string(),
+                kind: FoldAggKind::Nor,
+                input_col_index: 1,
+            }],
+        )
+        .await;
+        let vals = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!(
+            (vals.value(0) - 0.96713024).abs() < 1e-10,
+            "expected 0.96713024, got {}",
+            vals.value(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prod_three_elements() {
+        // MPROD({0.5, 0.5, 0.5}) = 0.125
+        let batch = make_test_batch(vec!["a", "a", "a"], vec![0.5, 0.5, 0.5]);
+        let input = make_memory_exec(batch);
+        let result = execute_fold(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "prob".to_string(),
+                kind: FoldAggKind::Prod,
+                input_col_index: 1,
+            }],
+        )
+        .await;
+        let vals = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!((vals.value(0) - 0.125).abs() < 1e-10);
+    }
+
+    #[tokio::test]
+    async fn test_nor_absorbing_element() {
+        // p=1.0 absorbs: MNOR({0.3, 1.0}) = 1.0
+        let batch = make_test_batch(vec!["a", "a"], vec![0.3, 1.0]);
+        let input = make_memory_exec(batch);
+        let result = execute_fold(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "prob".to_string(),
+                kind: FoldAggKind::Nor,
+                input_col_index: 1,
+            }],
+        )
+        .await;
+        let vals = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!((vals.value(0) - 1.0).abs() < 1e-10);
+    }
+
+    #[tokio::test]
+    async fn test_prod_clamping() {
+        // Out-of-range 2.0 clamped to 1.0: MPROD({2.0, 0.5}) = 1.0 * 0.5 = 0.5
+        let batch = make_test_batch(vec!["a", "a"], vec![2.0, 0.5]);
+        let input = make_memory_exec(batch);
+        let result = execute_fold(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "prob".to_string(),
+                kind: FoldAggKind::Prod,
+                input_col_index: 1,
+            }],
+        )
+        .await;
+        let vals = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!((vals.value(0) - 0.5).abs() < 1e-10);
+    }
+
+    #[tokio::test]
+    async fn test_prod_multiple_groups() {
+        // a: MPROD({0.6, 0.8}) = 0.48, b: MPROD({0.5, 0.5}) = 0.25
+        let batch = make_test_batch(vec!["a", "a", "b", "b"], vec![0.6, 0.8, 0.5, 0.5]);
+        let input = make_memory_exec(batch);
+        let result = execute_fold(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "prob".to_string(),
+                kind: FoldAggKind::Prod,
+                input_col_index: 1,
+            }],
+        )
+        .await;
+
+        assert_eq!(result.num_rows(), 2);
+        let names = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let vals = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        for i in 0..2 {
+            match names.value(i) {
+                "a" => assert!((vals.value(i) - 0.48).abs() < 1e-10),
+                "b" => assert!((vals.value(i) - 0.25).abs() < 1e-10),
+                _ => panic!("unexpected group name"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_nor_commutativity() {
+        // Order independence: MNOR({0.2, 0.5, 0.8}) = MNOR({0.8, 0.5, 0.2}) = 0.92
+        let fwd = make_test_batch(vec!["a", "a", "a"], vec![0.2, 0.5, 0.8]);
+        let rev = make_test_batch(vec!["a", "a", "a"], vec![0.8, 0.5, 0.2]);
+        let binding = vec![FoldBinding {
+            output_name: "prob".to_string(),
+            kind: FoldAggKind::Nor,
+            input_col_index: 1,
+        }];
+        let r1 = execute_fold(make_memory_exec(fwd), vec![0], binding.clone()).await;
+        let r2 = execute_fold(make_memory_exec(rev), vec![0], binding).await;
+        let v1 = r1
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+            .value(0);
+        let v2 = r2
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+            .value(0);
+        assert!((v1 - 0.92).abs() < 1e-10);
+        assert!((v2 - 0.92).abs() < 1e-10);
+        assert!((v1 - v2).abs() < 1e-15, "commutativity violated");
+    }
+
+    #[tokio::test]
+    async fn test_prod_commutativity() {
+        // Order independence: MPROD({0.5, 0.25}) = MPROD({0.25, 0.5}) = 0.125
+        let fwd = make_test_batch(vec!["a", "a"], vec![0.5, 0.25]);
+        let rev = make_test_batch(vec!["a", "a"], vec![0.25, 0.5]);
+        let binding = vec![FoldBinding {
+            output_name: "prob".to_string(),
+            kind: FoldAggKind::Prod,
+            input_col_index: 1,
+        }];
+        let r1 = execute_fold(make_memory_exec(fwd), vec![0], binding.clone()).await;
+        let r2 = execute_fold(make_memory_exec(rev), vec![0], binding).await;
+        let v1 = r1
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+            .value(0);
+        let v2 = r2
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+            .value(0);
+        assert!((v1 - 0.125).abs() < 1e-10);
+        assert!((v2 - 0.125).abs() < 1e-10);
+        assert!((v1 - v2).abs() < 1e-15, "commutativity violated");
+    }
+
+    #[tokio::test]
+    async fn test_nor_boundary_near_zero() {
+        // Precision near 0: MNOR({0.001, 0.002}) = 1 - (0.999)(0.998) = 0.002998
+        let batch = make_test_batch(vec!["a", "a"], vec![0.001, 0.002]);
+        let input = make_memory_exec(batch);
+        let result = execute_fold(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "prob".to_string(),
+                kind: FoldAggKind::Nor,
+                input_col_index: 1,
+            }],
+        )
+        .await;
+        let vals = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let expected = 1.0 - 0.999 * 0.998;
+        assert!(
+            (vals.value(0) - expected).abs() < 1e-10,
+            "expected {}, got {}",
+            expected,
+            vals.value(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_nor_boundary_near_one() {
+        // Precision near 1: MNOR({0.999, 0.998}) = 1 - (0.001)(0.002) = 0.999998
+        let batch = make_test_batch(vec!["a", "a"], vec![0.999, 0.998]);
+        let input = make_memory_exec(batch);
+        let result = execute_fold(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "prob".to_string(),
+                kind: FoldAggKind::Nor,
+                input_col_index: 1,
+            }],
+        )
+        .await;
+        let vals = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let expected = 1.0 - 0.001 * 0.002;
+        assert!(
+            (vals.value(0) - expected).abs() < 1e-10,
+            "expected {}, got {}",
+            expected,
+            vals.value(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prod_boundary_near_zero() {
+        // Precision near 0: MPROD({0.001, 0.002}) = 2e-6
+        let batch = make_test_batch(vec!["a", "a"], vec![0.001, 0.002]);
+        let input = make_memory_exec(batch);
+        let result = execute_fold(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "prob".to_string(),
+                kind: FoldAggKind::Prod,
+                input_col_index: 1,
+            }],
+        )
+        .await;
+        let vals = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!(
+            (vals.value(0) - 2e-6).abs() < 1e-15,
+            "expected 2e-6, got {}",
+            vals.value(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_nor_empty_input() {
+        // Empty input → 0 rows output
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("value", DataType::Float64, true),
+        ]));
+        let batch = RecordBatch::new_empty(schema);
+        let input = make_memory_exec(batch);
+        let result = execute_fold(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "prob".to_string(),
+                kind: FoldAggKind::Nor,
+                input_col_index: 1,
+            }],
+        )
+        .await;
+        assert_eq!(result.num_rows(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_nor_nan_handling() {
+        // NaN propagates through noisy-OR
+        let batch = make_test_batch(vec!["a", "a"], vec![0.3, f64::NAN]);
+        let input = make_memory_exec(batch);
+        let result = execute_fold(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "prob".to_string(),
+                kind: FoldAggKind::Nor,
+                input_col_index: 1,
+            }],
+        )
+        .await;
+        let vals = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!(vals.value(0).is_nan(), "NaN should propagate through MNOR");
+    }
+
+    #[tokio::test]
+    async fn test_prod_nan_handling() {
+        // NaN propagates through product
+        let batch = make_test_batch(vec!["a", "a"], vec![0.5, f64::NAN]);
+        let input = make_memory_exec(batch);
+        let result = execute_fold(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "prob".to_string(),
+                kind: FoldAggKind::Prod,
+                input_col_index: 1,
+            }],
+        )
+        .await;
+        let vals = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!(vals.value(0).is_nan(), "NaN should propagate through MPROD");
+    }
+
+    #[tokio::test]
+    async fn test_prod_infinity_handling() {
+        // +∞ clamped to 1.0: MPROD({0.5, ∞}) = 0.5 * 1.0 = 0.5
+        let batch = make_test_batch(vec!["a", "a"], vec![0.5, f64::INFINITY]);
+        let input = make_memory_exec(batch);
+        let result = execute_fold(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "prob".to_string(),
+                kind: FoldAggKind::Prod,
+                input_col_index: 1,
+            }],
+        )
+        .await;
+        let vals = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!((vals.value(0) - 0.5).abs() < 1e-10);
+    }
+
+    #[tokio::test]
+    async fn test_nor_infinity_handling() {
+        // +∞ clamped to 1.0, which absorbs: MNOR({0.3, ∞}) = 1.0
+        let batch = make_test_batch(vec!["a", "a"], vec![0.3, f64::INFINITY]);
+        let input = make_memory_exec(batch);
+        let result = execute_fold(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "prob".to_string(),
+                kind: FoldAggKind::Nor,
+                input_col_index: 1,
+            }],
+        )
+        .await;
+        let vals = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!((vals.value(0) - 1.0).abs() < 1e-10);
+    }
+
+    #[tokio::test]
+    async fn test_nor_all_null_values() {
+        // All-null input → null output
+        let batch = make_nullable_test_batch(vec!["a", "a"], vec![None, None]);
+        let input = make_memory_exec(batch);
+        let result = execute_fold(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "prob".to_string(),
+                kind: FoldAggKind::Nor,
+                input_col_index: 1,
+            }],
+        )
+        .await;
+        assert_eq!(result.num_rows(), 1);
+        let vals = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!(vals.is_null(0), "all-null MNOR should produce null");
+    }
+
+    #[tokio::test]
+    async fn test_prod_all_null_values() {
+        // All-null input → null output
+        let batch = make_nullable_test_batch(vec!["a", "a"], vec![None, None]);
+        let input = make_memory_exec(batch);
+        let result = execute_fold(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "prob".to_string(),
+                kind: FoldAggKind::Prod,
+                input_col_index: 1,
+            }],
+        )
+        .await;
+        assert_eq!(result.num_rows(), 1);
+        let vals = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!(vals.is_null(0), "all-null MPROD should produce null");
+    }
+
+    #[tokio::test]
+    async fn test_nor_mixed_null_values() {
+        // Nulls skipped: MNOR({0.3, null, 0.5}) = 1 - (0.7)(0.5) = 0.65
+        let batch = make_nullable_test_batch(vec!["a", "a", "a"], vec![Some(0.3), None, Some(0.5)]);
+        let input = make_memory_exec(batch);
+        let result = execute_fold(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "prob".to_string(),
+                kind: FoldAggKind::Nor,
+                input_col_index: 1,
+            }],
+        )
+        .await;
+        let vals = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!((vals.value(0) - 0.65).abs() < 1e-10);
+    }
+
+    #[tokio::test]
+    async fn test_prod_mixed_null_values() {
+        // Nulls skipped: MPROD({0.6, null, 0.8}) = 0.6 * 0.8 = 0.48
+        let batch = make_nullable_test_batch(vec!["a", "a", "a"], vec![Some(0.6), None, Some(0.8)]);
+        let input = make_memory_exec(batch);
+        let result = execute_fold(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "prob".to_string(),
+                kind: FoldAggKind::Prod,
+                input_col_index: 1,
+            }],
+        )
+        .await;
+        let vals = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!((vals.value(0) - 0.48).abs() < 1e-10);
+    }
+
+    #[tokio::test]
+    async fn test_nor_many_small_values() {
+        // Large accumulation: 20 × 0.1 → 1 - 0.9^20 ≈ 0.8784
+        let names: Vec<&str> = vec!["a"; 20];
+        let values: Vec<f64> = vec![0.1; 20];
+        let batch = make_test_batch(names, values);
+        let input = make_memory_exec(batch);
+        let result = execute_fold(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "prob".to_string(),
+                kind: FoldAggKind::Nor,
+                input_col_index: 1,
+            }],
+        )
+        .await;
+        let vals = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let expected = 1.0 - 0.9_f64.powi(20);
+        assert!(
+            (vals.value(0) - expected).abs() < 1e-10,
+            "expected {}, got {}",
+            expected,
+            vals.value(0)
+        );
+    }
+
+    // ── FoldAggKind classification tests (Phase 1) ────────────────────────
+
+    #[test]
+    fn test_is_monotonic() {
+        assert!(FoldAggKind::Sum.is_monotonic());
+        assert!(FoldAggKind::Max.is_monotonic());
+        assert!(FoldAggKind::Min.is_monotonic());
+        assert!(FoldAggKind::Count.is_monotonic());
+        assert!(FoldAggKind::Nor.is_monotonic());
+        assert!(FoldAggKind::Prod.is_monotonic());
+        assert!(!FoldAggKind::Avg.is_monotonic());
+        assert!(!FoldAggKind::Collect.is_monotonic());
+    }
+
+    #[test]
+    fn test_monotonicity_direction() {
+        use super::MonotonicDirection;
+        assert_eq!(
+            FoldAggKind::Sum.monotonicity_direction(),
+            Some(MonotonicDirection::NonDecreasing)
+        );
+        assert_eq!(
+            FoldAggKind::Max.monotonicity_direction(),
+            Some(MonotonicDirection::NonDecreasing)
+        );
+        assert_eq!(
+            FoldAggKind::Count.monotonicity_direction(),
+            Some(MonotonicDirection::NonDecreasing)
+        );
+        assert_eq!(
+            FoldAggKind::Nor.monotonicity_direction(),
+            Some(MonotonicDirection::NonDecreasing)
+        );
+        assert_eq!(
+            FoldAggKind::Min.monotonicity_direction(),
+            Some(MonotonicDirection::NonIncreasing)
+        );
+        assert_eq!(
+            FoldAggKind::Prod.monotonicity_direction(),
+            Some(MonotonicDirection::NonIncreasing)
+        );
+        assert_eq!(FoldAggKind::Avg.monotonicity_direction(), None);
+        assert_eq!(FoldAggKind::Collect.monotonicity_direction(), None);
+    }
+
+    #[test]
+    fn test_identity_values() {
+        assert_eq!(FoldAggKind::Sum.identity(), Some(0.0));
+        assert_eq!(FoldAggKind::Count.identity(), Some(0.0));
+        assert_eq!(FoldAggKind::Nor.identity(), Some(0.0));
+        assert_eq!(FoldAggKind::Max.identity(), Some(f64::NEG_INFINITY));
+        assert_eq!(FoldAggKind::Min.identity(), Some(f64::INFINITY));
+        assert_eq!(FoldAggKind::Prod.identity(), Some(1.0));
+        assert_eq!(FoldAggKind::Avg.identity(), None);
+        assert_eq!(FoldAggKind::Collect.identity(), None);
+    }
+
+    // ── Strict mode tests (Phase 5) ──────────────────────────────────────
+
+    async fn execute_fold_strict(
+        input: Arc<dyn ExecutionPlan>,
+        key_indices: Vec<usize>,
+        fold_bindings: Vec<FoldBinding>,
+        strict: bool,
+    ) -> DFResult<RecordBatch> {
+        let exec = FoldExec::new(input, key_indices, fold_bindings, strict, 1e-15);
+        let ctx = SessionContext::new();
+        let task_ctx = ctx.task_ctx();
+        let stream = exec.execute(0, task_ctx).unwrap();
+        let batches: Vec<RecordBatch> = datafusion::physical_plan::common::collect(stream).await?;
+        if batches.is_empty() {
+            Ok(RecordBatch::new_empty(exec.schema()))
+        } else {
+            arrow::compute::concat_batches(&exec.schema(), &batches).map_err(arrow_err)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_nor_strict_rejects_above_one() {
+        let batch = make_test_batch(vec!["a"], vec![1.5]);
+        let input = make_memory_exec(batch);
+        let result = execute_fold_strict(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "p".into(),
+                kind: FoldAggKind::Nor,
+                input_col_index: 1,
+            }],
+            true,
+        )
+        .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("strict_probability_domain"),
+            "Expected strict error, got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_nor_strict_rejects_negative() {
+        let batch = make_test_batch(vec!["a"], vec![-0.1]);
+        let input = make_memory_exec(batch);
+        let result = execute_fold_strict(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "p".into(),
+                kind: FoldAggKind::Nor,
+                input_col_index: 1,
+            }],
+            true,
+        )
+        .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("strict_probability_domain"),
+            "Expected strict error, got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prod_strict_rejects_above_one() {
+        let batch = make_test_batch(vec!["a"], vec![2.0]);
+        let input = make_memory_exec(batch);
+        let result = execute_fold_strict(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "p".into(),
+                kind: FoldAggKind::Prod,
+                input_col_index: 1,
+            }],
+            true,
+        )
+        .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("strict_probability_domain"),
+            "Expected strict error, got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prod_strict_rejects_negative() {
+        let batch = make_test_batch(vec!["a"], vec![-0.5]);
+        let input = make_memory_exec(batch);
+        let result = execute_fold_strict(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "p".into(),
+                kind: FoldAggKind::Prod,
+                input_col_index: 1,
+            }],
+            true,
+        )
+        .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("strict_probability_domain"),
+            "Expected strict error, got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_nor_strict_accepts_valid() {
+        let batch = make_test_batch(vec!["a", "a"], vec![0.3, 0.5]);
+        let input = make_memory_exec(batch);
+        let result = execute_fold_strict(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "p".into(),
+                kind: FoldAggKind::Nor,
+                input_col_index: 1,
+            }],
+            true,
+        )
+        .await;
+        assert!(result.is_ok(), "Expected Ok, got: {:?}", result.err());
+        let batch = result.unwrap();
+        let vals = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let expected = 0.65; // 1 - (1-0.3)(1-0.5)
+        assert!(
+            (vals.value(0) - expected).abs() < 1e-10,
+            "expected {}, got {}",
+            expected,
+            vals.value(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_count_all_groups_by_key() {
+        // Two groups: "a" (2 rows), "b" (1 row)
+        let batch = make_test_batch(vec!["a", "a", "b"], vec![10.0, 20.0, 30.0]);
+        let input = make_memory_exec(batch);
+        let result = execute_fold(
+            input,
+            vec![0],
+            vec![FoldBinding {
+                output_name: "cnt".to_string(),
+                kind: FoldAggKind::CountAll,
+                input_col_index: 0, // unused for CountAll
+            }],
+        )
+        .await;
+
+        assert_eq!(result.num_rows(), 2, "Should have 2 groups");
+        let counts = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(counts.value(0), 2, "Group 'a' should have count 2");
+        assert_eq!(counts.value(1), 1, "Group 'b' should have count 1");
     }
 }

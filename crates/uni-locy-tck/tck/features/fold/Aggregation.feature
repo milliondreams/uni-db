@@ -99,3 +99,68 @@ Feature: FOLD Aggregation
       """
     Then evaluation should succeed
     And the derived relation 'shortest' should contain a fact where a.name = 'A' and b.name = 'C'
+
+  Scenario: MCOUNT zero-argument counts all facts in group
+    Given having executed:
+      """
+      CREATE (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'}),
+             (a)-[:KNOWS]->(:Person {name: 'Carol'}),
+             (b)-[:KNOWS]->(:Person {name: 'Dave'})
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE friend_count AS
+        MATCH (a:Person)-[:KNOWS]->(b:Person)
+        FOLD cnt = MCOUNT()
+        YIELD KEY a, cnt
+      """
+    Then evaluation should succeed
+    And the derived relation 'friend_count' should have 2 facts
+
+  Scenario: COUNT zero-argument counts all facts
+    Given having executed:
+      """
+      CREATE (:Person {name: 'Alice'}), (:Person {name: 'Bob'}), (:Person {name: 'Carol'})
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE headcount AS
+        MATCH (n:Person)
+        FOLD cnt = COUNT()
+        YIELD cnt
+      """
+    Then evaluation should succeed
+    And the derived relation 'headcount' should have 1 facts
+
+  Scenario: FOLD SUM with computed expression argument
+    Given having executed:
+      """
+      CREATE (a:Person {name: 'Alice'})-[:PAID {amount: 100}]->(:Invoice),
+             (a)-[:PAID {amount: 200}]->(:Invoice),
+             (b:Person {name: 'Bob'})-[:PAID {amount: 50}]->(:Invoice)
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE double_spending AS
+        MATCH (p:Person)-[r:PAID]->(i:Invoice)
+        FOLD total = SUM(r.amount * 2)
+        YIELD KEY p, total
+      """
+    Then evaluation should succeed
+    And the derived relation 'double_spending' should have 2 facts
+
+  Scenario: FOLD SUM with arithmetic expression on edge properties
+    Given having executed:
+      """
+      CREATE (a:Node {name: 'A'})-[:EDGE {weight: 5.0, cost: 2}]->(b:Node {name: 'B'}),
+             (a)-[:EDGE {weight: 3.0, cost: 4}]->(c:Node {name: 'C'})
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE weighted_costs AS
+        MATCH (a:Node)-[e:EDGE]->(b:Node)
+        FOLD total = SUM(e.weight + 1.0)
+        YIELD KEY a, total
+      """
+    Then evaluation should succeed
+    And the derived relation 'weighted_costs' should have 1 facts

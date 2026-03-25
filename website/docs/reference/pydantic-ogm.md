@@ -90,7 +90,7 @@ class Person(UniNode):
 | Property | Type | Description |
 |----------|------|-------------|
 | `vid` | `int \| None` | Vertex ID assigned by database |
-| `uid` | `str \| None` | Content-addressed unique identifier |
+| `uid` | `str \| None` | Content-addressed identifier (lookup index, not a uniqueness constraint) |
 | `is_persisted` | `bool` | Whether saved to database |
 | `is_dirty` | `bool` | Whether has unsaved changes |
 

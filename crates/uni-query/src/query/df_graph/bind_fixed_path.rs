@@ -10,7 +10,7 @@
 //! where the traversals are single-hop and the path variable needs to be materialized.
 
 use super::GraphExecutionContext;
-use super::common::{compute_plan_properties, extract_column_value};
+use super::common::{arrow_err, compute_plan_properties, extract_column_value};
 use arrow_array::builder::{
     LargeBinaryBuilder, ListBuilder, StringBuilder, StructBuilder, UInt64Builder,
 };
@@ -337,8 +337,7 @@ impl BindFixedPathStream {
         let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
         columns.push(Arc::new(path_array));
 
-        RecordBatch::try_new(self.schema.clone(), columns)
-            .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+        RecordBatch::try_new(self.schema.clone(), columns).map_err(arrow_err)
     }
 }
 

@@ -30,11 +30,13 @@ fn _uni_db(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Sync main classes
     m.add_class::<sync_api::Database>()?;
+    m.add_class::<sync_api::Xervo>()?;
     m.add_class::<builders::DatabaseBuilder>()?;
     m.add_class::<sync_api::Transaction>()?;
 
     // Sync query
     m.add_class::<builders::QueryBuilder>()?;
+    m.add_class::<sync_api::QueryCursor>()?;
 
     // Schema
     m.add_class::<builders::SchemaBuilder>()?;
@@ -51,6 +53,7 @@ fn _uni_db(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Async classes
     m.add_class::<async_api::AsyncDatabase>()?;
+    m.add_class::<async_api::AsyncXervo>()?;
     m.add_class::<async_api::AsyncDatabaseBuilder>()?;
     m.add_class::<async_api::AsyncTransaction>()?;
     m.add_class::<async_api::AsyncSession>()?;
@@ -58,6 +61,7 @@ fn _uni_db(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<async_api::AsyncBulkWriter>()?;
     m.add_class::<async_api::AsyncBulkWriterBuilder>()?;
     m.add_class::<async_api::AsyncQueryBuilder>()?;
+    m.add_class::<async_api::AsyncQueryCursor>()?;
     m.add_class::<async_api::AsyncSchemaBuilder>()?;
     m.add_class::<async_api::AsyncLabelBuilder>()?;
     m.add_class::<async_api::AsyncEdgeTypeBuilder>()?;
@@ -70,6 +74,16 @@ fn _uni_db(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<types::BulkStats>()?;
     m.add_class::<types::BulkProgress>()?;
     m.add_class::<types::LocyStats>()?;
+
+    // Xervo types
+    m.add_class::<types::PyMessage>()?;
+    m.add_class::<types::PyTokenUsage>()?;
+    m.add_class::<types::PyGenerationResult>()?;
+
+    // Snapshot & index types
+    m.add_class::<types::SnapshotInfo>()?;
+    m.add_class::<types::IndexRebuildTaskInfo>()?;
+    m.add_class::<types::IndexDefinitionInfo>()?;
 
     Ok(())
 }

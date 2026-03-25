@@ -10,8 +10,142 @@ use crate::types::*;
 use ::uni_db::Uni;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+
+// ============================================================================
+// QueryCursor (synchronous)
+// ============================================================================
+
+/// Cursor-based result streaming for large query result sets.
+///
+/// Implements Python's iterator protocol (`__iter__`/`__next__`) and context
+/// manager protocol (`__enter__`/`__exit__`).  Rows are yielded one at a time
+/// from the underlying batch stream.
+#[pyclass]
+pub struct QueryCursor {
+    pub(crate) cursor: std::sync::Mutex<Option<core::QueryCursor>>,
+    pub(crate) buffer: std::sync::Mutex<VecDeque<core::Row>>,
+    #[pyo3(get)]
+    pub(crate) columns: Vec<String>,
+}
+
+impl QueryCursor {
+    /// Pull the next single row, refilling from the batch stream as needed.
+    fn next_row(&self) -> PyResult<Option<core::Row>> {
+        let mut buf = self.buffer.lock().unwrap();
+        if let Some(row) = buf.pop_front() {
+            return Ok(Some(row));
+        }
+        // Buffer empty – fetch next batch from cursor.
+        let mut guard = self.cursor.lock().unwrap();
+        let cursor = match guard.as_mut() {
+            Some(c) => c,
+            None => return Ok(None), // closed
+        };
+        let batch = pyo3_async_runtimes::tokio::get_runtime().block_on(cursor.next_batch());
+        match batch {
+            Some(Ok(rows)) => {
+                let mut iter = rows.into_iter();
+                let first = iter.next();
+                buf.extend(iter);
+                Ok(first)
+            }
+            Some(Err(e)) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                e.to_string(),
+            )),
+            None => Ok(None),
+        }
+    }
+}
+
+#[pymethods]
+impl QueryCursor {
+    /// Fetch a single row, or `None` if exhausted.
+    fn fetch_one(&self, py: Python) -> PyResult<Option<Py<PyAny>>> {
+        match self.next_row()? {
+            Some(row) => {
+                let dict = PyDict::new(py);
+                for (col, val) in row.as_map() {
+                    dict.set_item(col, convert::value_to_py(py, val)?)?;
+                }
+                Ok(Some(dict.into()))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Fetch up to `n` rows.
+    #[pyo3(signature = (n))]
+    fn fetch_many(&self, py: Python, n: usize) -> PyResult<Vec<Py<PyAny>>> {
+        let mut result = Vec::with_capacity(n);
+        for _ in 0..n {
+            match self.next_row()? {
+                Some(row) => {
+                    let dict = PyDict::new(py);
+                    for (col, val) in row.as_map() {
+                        dict.set_item(col, convert::value_to_py(py, val)?)?;
+                    }
+                    result.push(dict.into());
+                }
+                None => break,
+            }
+        }
+        Ok(result)
+    }
+
+    /// Fetch all remaining rows.
+    fn fetch_all(&self, py: Python) -> PyResult<Vec<Py<PyAny>>> {
+        // Drain buffer first, then collect remaining from cursor.
+        let mut rows: Vec<core::Row> = {
+            let mut buf = self.buffer.lock().unwrap();
+            buf.drain(..).collect()
+        };
+
+        let cursor_opt = {
+            let mut guard = self.cursor.lock().unwrap();
+            guard.take()
+        };
+        if let Some(cursor) = cursor_opt {
+            let remaining = pyo3_async_runtimes::tokio::get_runtime()
+                .block_on(cursor.collect_remaining())
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            rows.extend(remaining);
+        }
+
+        convert::rows_to_py(py, rows)
+    }
+
+    /// Close the cursor, releasing resources.
+    fn close(&self) -> PyResult<()> {
+        let _ = self.cursor.lock().unwrap().take();
+        self.buffer.lock().unwrap().clear();
+        Ok(())
+    }
+
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&self, py: Python) -> PyResult<Option<Py<PyAny>>> {
+        self.fetch_one(py)
+    }
+
+    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    #[pyo3(signature = (_exc_type=None, _exc_val=None, _exc_tb=None))]
+    fn __exit__(
+        &self,
+        _exc_type: Option<Py<PyAny>>,
+        _exc_val: Option<Py<PyAny>>,
+        _exc_tb: Option<Py<PyAny>>,
+    ) -> PyResult<bool> {
+        self.close()?;
+        Ok(false) // don't suppress exceptions
+    }
+}
 
 // ============================================================================
 // Transaction
@@ -120,6 +254,32 @@ impl Database {
             .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
 
         convert::rows_to_py(py, rows.rows)
+    }
+
+    /// Open a streaming cursor for a query.
+    #[pyo3(signature = (cypher, params=None))]
+    fn query_cursor(
+        &self,
+        py: Python,
+        cypher: &str,
+        params: Option<HashMap<String, Py<PyAny>>>,
+    ) -> PyResult<QueryCursor> {
+        let rust_params = convert::prepare_params(py, params)?;
+        let cursor = pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(core::query_cursor_core(
+                &self.inner,
+                cypher,
+                rust_params,
+                None,
+                None,
+            ))
+            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
+        let columns = cursor.columns().to_vec();
+        Ok(QueryCursor {
+            cursor: std::sync::Mutex::new(Some(cursor)),
+            buffer: std::sync::Mutex::new(VecDeque::new()),
+            columns,
+        })
     }
 
     /// Create a query builder for parameterized queries.
@@ -538,16 +698,41 @@ impl Database {
         Ok(())
     }
 
+    /// Register Locy rules for reuse across multiple evaluate calls.
+    ///
+    /// Rules defined here persist within the session and are automatically
+    /// merged into subsequent ``locy_evaluate()`` calls, eliminating the
+    /// need to redeclare the full rule set each time.
+    fn locy_compile(&self, program: &str) -> PyResult<()> {
+        self.inner
+            .locy()
+            .register(program)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+    }
+
+    /// Clear all registered Locy rules from the session.
+    fn locy_clear(&self) -> PyResult<()> {
+        self.inner.locy().clear_registry();
+        Ok(())
+    }
+
     /// Evaluate a Locy program and return derived facts, stats, and command results.
-    #[pyo3(signature = (program, config=None))]
+    #[pyo3(signature = (program, params=None, config=None))]
     fn locy_evaluate(
         &self,
         py: Python,
         program: &str,
+        params: Option<HashMap<String, Py<PyAny>>>,
         config: Option<HashMap<String, Py<PyAny>>>,
     ) -> PyResult<Py<PyAny>> {
-        let result = if let Some(cfg) = config {
-            let locy_config = convert::extract_locy_config(py, cfg)?;
+        let result = if config.is_some() || params.is_some() {
+            let mut locy_config = config
+                .map(|cfg| convert::extract_locy_config(py, cfg))
+                .transpose()?
+                .unwrap_or_default();
+            if let Some(p) = params {
+                locy_config.params = convert::prepare_params(py, Some(p))?;
+            }
             pyo3_async_runtimes::tokio::get_runtime()
                 .block_on(core::locy_evaluate_with_config_core(
                     &self.inner,
@@ -561,5 +746,174 @@ impl Database {
                 .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?
         };
         convert::locy_result_to_py(py, result)
+    }
+
+    /// Get a Xervo facade for embedding and generation operations.
+    fn xervo(&self) -> PyResult<Xervo> {
+        Ok(Xervo {
+            inner: self.inner.clone(),
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Snapshot management
+    // -----------------------------------------------------------------------
+
+    /// Create a point-in-time snapshot. Returns the snapshot ID.
+    #[pyo3(signature = (name=None))]
+    fn create_snapshot(&self, name: Option<String>) -> PyResult<String> {
+        pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(core::create_snapshot_core(&self.inner, name))
+            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+    }
+
+    /// List all available snapshots.
+    fn list_snapshots(&self, py: Python) -> PyResult<Vec<crate::types::SnapshotInfo>> {
+        let manifests = pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(core::list_snapshots_core(&self.inner))
+            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
+        manifests
+            .into_iter()
+            .map(|m| convert::snapshot_manifest_to_py(py, m))
+            .collect()
+    }
+
+    /// Restore the database to a specific snapshot.
+    fn restore_snapshot(&self, snapshot_id: &str) -> PyResult<()> {
+        pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(core::restore_snapshot_core(&self.inner, snapshot_id))
+            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+    }
+
+    // -----------------------------------------------------------------------
+    // Index administration
+    // -----------------------------------------------------------------------
+
+    /// Get status of background index rebuild tasks.
+    fn index_rebuild_status(
+        &self,
+        py: Python,
+    ) -> PyResult<Vec<crate::types::IndexRebuildTaskInfo>> {
+        let tasks = pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(core::index_rebuild_status_core(&self.inner))
+            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
+        tasks
+            .into_iter()
+            .map(|t| convert::index_rebuild_task_to_py(py, t))
+            .collect()
+    }
+
+    /// Retry failed index rebuild tasks. Returns task IDs scheduled for retry.
+    fn retry_index_rebuilds(&self) -> PyResult<Vec<String>> {
+        pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(core::retry_index_rebuilds_core(&self.inner))
+            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+    }
+
+    /// Force rebuild indexes for a label. If async_=True, returns a task ID.
+    #[pyo3(signature = (label, async_=false))]
+    fn rebuild_indexes(&self, label: &str, async_: bool) -> PyResult<Option<String>> {
+        pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(core::rebuild_indexes_core(&self.inner, label, async_))
+            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+    }
+
+    /// Check if an index is currently being rebuilt for a label.
+    fn is_index_building(&self, label: &str) -> PyResult<bool> {
+        pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(core::is_index_building_core(&self.inner, label))
+            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+    }
+
+    /// List all indexes defined on a specific label.
+    fn list_indexes(
+        &self,
+        py: Python,
+        label: &str,
+    ) -> PyResult<Vec<crate::types::IndexDefinitionInfo>> {
+        core::list_indexes_core(&self.inner, label)
+            .into_iter()
+            .map(|i| convert::index_definition_to_py(py, i))
+            .collect()
+    }
+
+    /// List all indexes in the database.
+    fn list_all_indexes(&self, py: Python) -> PyResult<Vec<crate::types::IndexDefinitionInfo>> {
+        core::list_all_indexes_core(&self.inner)
+            .into_iter()
+            .map(|i| convert::index_definition_to_py(py, i))
+            .collect()
+    }
+}
+
+// ============================================================================
+// Xervo (synchronous)
+// ============================================================================
+
+/// Synchronous facade for Uni-Xervo embedding and generation.
+#[pyclass]
+pub struct Xervo {
+    inner: Arc<Uni>,
+}
+
+#[pymethods]
+impl Xervo {
+    /// Embed texts using a configured model alias. Returns a list of float vectors.
+    fn embed(&self, alias: &str, texts: Vec<String>) -> PyResult<Vec<Vec<f32>>> {
+        pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(core::xervo_embed_core(&self.inner, alias, texts))
+            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+    }
+
+    /// Generate text using structured messages. Returns a GenerationResult.
+    ///
+    /// Each message may be a `Message` instance or a dict with `"role"` and `"content"` keys.
+    #[pyo3(signature = (alias, messages, max_tokens=None, temperature=None, top_p=None))]
+    fn generate(
+        &self,
+        py: Python,
+        alias: &str,
+        messages: Vec<Py<PyAny>>,
+        max_tokens: Option<usize>,
+        temperature: Option<f32>,
+        top_p: Option<f32>,
+    ) -> PyResult<crate::types::PyGenerationResult> {
+        let msg_pairs = convert::extract_messages(py, messages)?;
+        let result = pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(core::xervo_generate_core(
+                &self.inner,
+                alias,
+                msg_pairs,
+                max_tokens,
+                temperature,
+                top_p,
+            ))
+            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
+        convert::generation_result_to_py(py, result)
+    }
+
+    /// Generate text from a single user prompt. Convenience wrapper around `generate()`.
+    #[pyo3(signature = (alias, prompt, max_tokens=None, temperature=None, top_p=None))]
+    fn generate_text(
+        &self,
+        py: Python,
+        alias: &str,
+        prompt: String,
+        max_tokens: Option<usize>,
+        temperature: Option<f32>,
+        top_p: Option<f32>,
+    ) -> PyResult<crate::types::PyGenerationResult> {
+        let msg_pairs = vec![("user".to_string(), prompt)];
+        let result = pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(core::xervo_generate_core(
+                &self.inner,
+                alias,
+                msg_pairs,
+                max_tokens,
+                temperature,
+                top_p,
+            ))
+            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
+        convert::generation_result_to_py(py, result)
     }
 }

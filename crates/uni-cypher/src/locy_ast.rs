@@ -177,10 +177,11 @@ pub struct YieldClause {
     pub items: Vec<LocyYieldItem>,
 }
 
-/// A single YIELD item, possibly marked as KEY.
+/// A single YIELD item, possibly marked as KEY or PROB.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LocyYieldItem {
     pub is_key: bool,
+    pub is_prob: bool,
     pub expr: Expr,
     pub alias: Option<String>,
 }
@@ -222,11 +223,11 @@ pub struct DeriveEdgeSpec {
 // GOAL-DIRECTED QUERY
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// `QUERY ruleName WHERE expr [RETURN ...]`
+/// `QUERY ruleName [WHERE expr] [RETURN ...]`
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GoalQuery {
     pub rule_name: QualifiedName,
-    pub where_expr: Expr,
+    pub where_expr: Option<Expr>,
     pub return_clause: Option<ReturnClause>,
 }
 
@@ -256,12 +257,12 @@ pub struct AssumeBlock {
 // ABDUCE QUERY
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// `ABDUCE [NOT] ruleName WHERE expr [RETURN ...]`
+/// `ABDUCE [NOT] ruleName [WHERE expr] [RETURN ...]`
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AbduceQuery {
     pub negated: bool,
     pub rule_name: QualifiedName,
-    pub where_expr: Expr,
+    pub where_expr: Option<Expr>,
     pub return_clause: Option<ReturnClause>,
 }
 
@@ -269,10 +270,10 @@ pub struct AbduceQuery {
 // EXPLAIN RULE
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// `EXPLAIN RULE ruleName WHERE expr [RETURN ...]`
+/// `EXPLAIN RULE ruleName [WHERE expr] [RETURN ...]`
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExplainRule {
     pub rule_name: QualifiedName,
-    pub where_expr: Expr,
+    pub where_expr: Option<Expr>,
     pub return_clause: Option<ReturnClause>,
 }

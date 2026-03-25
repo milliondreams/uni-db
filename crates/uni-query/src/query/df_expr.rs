@@ -557,17 +557,15 @@ pub fn cypher_expr_to_df(expr: &Expr, context: Option<&TranslationContext>) -> R
                     // Node: check _labels array contains all specified labels
                     let labels_col =
                         DfExpr::Column(Column::from_name(format!("{}.{}", var, COL_LABELS)));
-                    let mut checks: Option<DfExpr> = None;
-                    for label in labels {
-                        let check = datafusion::functions_nested::expr_fn::array_has(
-                            labels_col.clone(),
-                            lit(label.clone()),
-                        );
-                        checks = Some(match checks {
-                            Some(prev) => prev.and(check),
-                            None => check,
-                        });
-                    }
+                    let checks = labels
+                        .iter()
+                        .map(|label| {
+                            datafusion::functions_nested::expr_fn::array_has(
+                                labels_col.clone(),
+                                lit(label.clone()),
+                            )
+                        })
+                        .reduce(|acc, check| acc.and(check));
                     // Wrap in CASE WHEN _labels IS NULL THEN NULL ELSE ... END
                     Ok(DfExpr::Case(datafusion::logical_expr::Case {
                         expr: None,

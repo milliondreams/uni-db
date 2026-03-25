@@ -14,6 +14,16 @@
 - `max_explain_depth`: derivation tree depth bound.
 - `max_slg_depth`: goal-directed recursion bound.
 - `max_abduce_candidates` / `max_abduce_results`: abduction search bounds.
+- `strict_probability_domain`: reject probability inputs outside `[0, 1]` instead of clamping.
+- `probability_epsilon`: MPROD threshold for switching to log-space accumulation.
+- `exact_probability`: enable BDD-based exact evaluation for shared-proof aggregate groups.
+- `max_bdd_variables`: cap per-group BDD complexity before fallback.
+
+## Runtime Warning Codes
+
+- `SharedProbabilisticDependency`: multiple proof paths inside one MNOR/MPROD group reuse shared evidence.
+- `BddLimitExceeded`: exact mode was enabled, but the group exceeded `max_bdd_variables` and fell back to independence mode.
+- `CrossGroupCorrelationNotExact`: shared evidence spans multiple aggregate groups; each group is exact internally, but correlation across groups is still approximate.
 
 ## Recommended Profiles
 

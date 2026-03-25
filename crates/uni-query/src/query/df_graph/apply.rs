@@ -20,7 +20,7 @@
 
 use crate::query::df_graph::GraphExecutionContext;
 use crate::query::df_graph::common::{
-    collect_all_partitions, compute_plan_properties, execute_subplan, extract_row_params,
+    arrow_err, collect_all_partitions, compute_plan_properties, execute_subplan, extract_row_params,
 };
 use crate::query::planner::LogicalPlan;
 use arrow_array::builder::{
@@ -442,7 +442,7 @@ fn rows_to_batch(rows: &[HashMap<String, Value>], schema: &SchemaRef) -> DFResul
                                 match item {
                                     Value::String(s) => builder.values().append_value(s),
                                     Value::Null => builder.values().append_null(),
-                                    other => builder.values().append_value(format!("{}", other)),
+                                    other => builder.values().append_value(format!("{other}")),
                                 }
                             }
                             builder.append(true);
@@ -460,7 +460,7 @@ fn rows_to_batch(rows: &[HashMap<String, Value>], schema: &SchemaRef) -> DFResul
                     match row.get(col_name) {
                         Some(Value::Null) | None => builder.append_null(),
                         Some(Value::String(s)) => builder.append_value(s),
-                        Some(other) => builder.append_value(format!("{}", other)),
+                        Some(other) => builder.append_value(format!("{other}")),
                     }
                 }
                 Arc::new(builder.finish()) as ArrayRef
@@ -469,8 +469,7 @@ fn rows_to_batch(rows: &[HashMap<String, Value>], schema: &SchemaRef) -> DFResul
         columns.push(col);
     }
 
-    RecordBatch::try_new(schema.clone(), columns)
-        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+    RecordBatch::try_new(schema.clone(), columns).map_err(arrow_err)
 }
 
 /// Slice a single row from a RecordBatch, preserving Arrow types.
@@ -505,7 +504,7 @@ fn hash_row_params(params: &HashMap<String, Value>) -> u64 {
     entries.sort_unstable_by_key(|(k, _)| *k);
     for (key, val) in entries {
         key.hash(&mut hasher);
-        format!("{:?}", val).hash(&mut hasher);
+        format!("{val:?}").hash(&mut hasher);
     }
     hasher.finish()
 }
@@ -833,7 +832,7 @@ fn value_to_single_row_array(val: &Value, data_type: &DataType) -> DFResult<Arra
             match val {
                 Value::Null => b.append_null(),
                 Value::String(s) => b.append_value(s),
-                other => b.append_value(format!("{}", other)),
+                other => b.append_value(format!("{other}")),
             }
             Arc::new(b.finish()) as ArrayRef
         }
@@ -884,13 +883,11 @@ fn concat_column_arrays(
     let mut final_columns: Vec<ArrayRef> = Vec::with_capacity(column_arrays.len());
     for arrays in column_arrays {
         let refs: Vec<&dyn arrow_array::Array> = arrays.iter().map(|a| a.as_ref()).collect();
-        let concatenated = arrow::compute::concat(&refs)
-            .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+        let concatenated = arrow::compute::concat(&refs).map_err(arrow_err)?;
         final_columns.push(concatenated);
     }
 
-    RecordBatch::try_new(output_schema.clone(), final_columns)
-        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+    RecordBatch::try_new(output_schema.clone(), final_columns).map_err(arrow_err)
 }
 
 // ---------------------------------------------------------------------------

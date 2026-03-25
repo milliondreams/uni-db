@@ -9,7 +9,7 @@ use crate::types::BulkStats;
 use ::uni_db::Uni;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use uni_common::core::schema::{DataType, IndexDefinition};
 
@@ -27,6 +27,11 @@ pub struct DatabaseBuilder {
     pub(crate) hybrid_remote: Option<String>,
     pub(crate) cache_size: Option<usize>,
     pub(crate) parallelism: Option<usize>,
+    pub(crate) schema_file: Option<String>,
+    pub(crate) xervo_catalog_json: Option<String>,
+    pub(crate) xervo_catalog_file: Option<String>,
+    pub(crate) cloud_config: Option<uni_common::CloudStorageConfig>,
+    pub(crate) uni_config: Option<uni_common::UniConfig>,
 }
 
 #[pymethods]
@@ -41,6 +46,11 @@ impl DatabaseBuilder {
             hybrid_remote: None,
             cache_size: None,
             parallelism: None,
+            schema_file: None,
+            xervo_catalog_json: None,
+            xervo_catalog_file: None,
+            cloud_config: None,
+            uni_config: None,
         }
     }
 
@@ -54,6 +64,11 @@ impl DatabaseBuilder {
             hybrid_remote: None,
             cache_size: None,
             parallelism: None,
+            schema_file: None,
+            xervo_catalog_json: None,
+            xervo_catalog_file: None,
+            cloud_config: None,
+            uni_config: None,
         }
     }
 
@@ -67,6 +82,11 @@ impl DatabaseBuilder {
             hybrid_remote: None,
             cache_size: None,
             parallelism: None,
+            schema_file: None,
+            xervo_catalog_json: None,
+            xervo_catalog_file: None,
+            cloud_config: None,
+            uni_config: None,
         }
     }
 
@@ -80,6 +100,11 @@ impl DatabaseBuilder {
             hybrid_remote: None,
             cache_size: None,
             parallelism: None,
+            schema_file: None,
+            xervo_catalog_json: None,
+            xervo_catalog_file: None,
+            cloud_config: None,
+            uni_config: None,
         }
     }
 
@@ -112,6 +137,46 @@ impl DatabaseBuilder {
         slf
     }
 
+    /// Load schema from a JSON file on initialization.
+    fn schema_file(mut slf: PyRefMut<'_, Self>, path: String) -> PyRefMut<'_, Self> {
+        slf.schema_file = Some(path);
+        slf
+    }
+
+    /// Configure the Xervo model catalog from a JSON string.
+    fn xervo_catalog_from_str(mut slf: PyRefMut<'_, Self>, json: String) -> PyRefMut<'_, Self> {
+        slf.xervo_catalog_json = Some(json);
+        slf.xervo_catalog_file = None;
+        slf
+    }
+
+    /// Configure the Xervo model catalog from a JSON file path.
+    fn xervo_catalog_from_file(mut slf: PyRefMut<'_, Self>, path: String) -> PyRefMut<'_, Self> {
+        slf.xervo_catalog_file = Some(path);
+        slf.xervo_catalog_json = None;
+        slf
+    }
+
+    /// Configure cloud storage credentials (dict with 'provider' key: 's3', 'gcs', or 'azure').
+    fn cloud_config(
+        mut slf: PyRefMut<'_, Self>,
+        config: HashMap<String, Py<PyAny>>,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        let py = slf.py();
+        slf.cloud_config = Some(convert::extract_cloud_config(py, &config)?);
+        Ok(slf)
+    }
+
+    /// Configure database options (query_timeout, max_query_memory, etc.).
+    fn config(
+        mut slf: PyRefMut<'_, Self>,
+        config: HashMap<String, Py<PyAny>>,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        let py = slf.py();
+        slf.uni_config = Some(convert::extract_uni_config(py, &config)?);
+        Ok(slf)
+    }
+
     /// Build and return the Database instance.
     fn build(&self) -> PyResult<crate::sync_api::Database> {
         let uni = pyo3_async_runtimes::tokio::get_runtime()
@@ -122,6 +187,11 @@ impl DatabaseBuilder {
                 self.hybrid_remote.as_deref(),
                 self.cache_size,
                 self.parallelism,
+                self.schema_file.as_deref(),
+                self.xervo_catalog_json.as_deref(),
+                self.xervo_catalog_file.as_deref(),
+                self.cloud_config.clone(),
+                self.uni_config.clone(),
             ))
             .map_err(PyErr::new::<pyo3::exceptions::PyIOError, _>)?;
 
@@ -172,6 +242,30 @@ impl QueryBuilder {
     fn max_memory(mut slf: PyRefMut<'_, Self>, bytes: usize) -> PyRefMut<'_, Self> {
         slf.max_memory = Some(bytes);
         slf
+    }
+
+    /// Open a streaming cursor for this query.
+    fn cursor(&self, py: Python) -> PyResult<crate::sync_api::QueryCursor> {
+        let mut rust_params = HashMap::new();
+        for (k, v) in &self.params {
+            let val = convert::py_object_to_value(py, v)?;
+            rust_params.insert(k.clone(), val);
+        }
+        let cursor = pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(core::query_cursor_core(
+                &self.inner,
+                &self.cypher,
+                rust_params,
+                self.timeout_secs,
+                self.max_memory,
+            ))
+            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
+        let columns = cursor.columns().to_vec();
+        Ok(crate::sync_api::QueryCursor {
+            cursor: std::sync::Mutex::new(Some(cursor)),
+            buffer: std::sync::Mutex::new(VecDeque::new()),
+            columns,
+        })
     }
 
     /// Execute the query and fetch all results.

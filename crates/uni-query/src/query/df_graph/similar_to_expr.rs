@@ -9,9 +9,10 @@
 
 use crate::query::df_graph::GraphExecutionContext;
 use crate::query::similar_to::{
-    SimilarToOptions, cosine_similarity, fuse_scores, normalize_bm25, parse_options,
+    FusionMethod, SimilarToOptions, fuse_scores, normalize_bm25, parse_options, score_vectors,
     validate_options, value_to_f32_vec,
 };
+use crate::types::QueryWarning;
 use arrow_array::builder::Float64Builder;
 use arrow_array::{Array, UInt64Array};
 use arrow_schema::{DataType, Schema};
@@ -20,6 +21,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use uni_common::Value;
 use uni_common::core::id::Vid;
+use uni_common::core::schema::DistanceMetric;
 
 /// Physical expression that evaluates `similar_to(sources, queries [, options])`.
 ///
@@ -41,6 +43,8 @@ pub(crate) struct SimilarToExecExpr {
     source_variable: Option<String>,
     /// Property names per source (e.g., ["embedding", "content"] for multi-source).
     source_property_names: Vec<Option<String>>,
+    /// Per-source distance metrics resolved at compile time. `None` for FTS sources.
+    source_metrics: Vec<Option<DistanceMetric>>,
 }
 
 impl SimilarToExecExpr {
@@ -51,6 +55,7 @@ impl SimilarToExecExpr {
         graph_ctx: Arc<GraphExecutionContext>,
         source_variable: Option<String>,
         source_property_names: Vec<Option<String>>,
+        source_metrics: Vec<Option<DistanceMetric>>,
     ) -> Self {
         Self {
             source_children,
@@ -59,6 +64,7 @@ impl SimilarToExecExpr {
             graph_ctx,
             source_variable,
             source_property_names,
+            source_metrics,
         }
     }
 }
@@ -228,10 +234,10 @@ struct PrecomputedResources {
 
 /// Scoring mode for a single (source, query) pair.
 enum ScoringMode {
-    /// Both are vectors → cosine similarity per-row.
-    Cosine,
-    /// Source is a vector, query is a string → auto-embed once, then cosine per-row.
-    AutoEmbed,
+    /// Both are vectors → metric-aware similarity per-row.
+    Vector(DistanceMetric),
+    /// Source is a vector, query is a string → auto-embed once, then metric-aware per-row.
+    AutoEmbed(DistanceMetric),
     /// Both are strings → FTS search once, VID lookup per-row.
     Fts,
 }
@@ -249,7 +255,6 @@ impl PhysicalExpr for SimilarToExecExpr {
         Ok(true)
     }
 
-    #[allow(clippy::manual_try_fold)]
     fn evaluate(
         &self,
         batch: &arrow_array::RecordBatch,
@@ -303,7 +308,10 @@ impl PhysicalExpr for SimilarToExecExpr {
         let scoring_modes: Vec<ScoringMode> = first_row_source_vals
             .iter()
             .zip(first_row_query_vals.iter())
-            .map(|(s, q)| determine_scoring_mode(s, q))
+            .enumerate()
+            .map(|(i, (s, q))| {
+                determine_scoring_mode(s, q, self.source_metrics.get(i).and_then(|m| m.as_ref()))
+            })
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| {
                 datafusion::error::DataFusionError::Execution(format!("similar_to: {}", e))
@@ -366,7 +374,7 @@ impl PhysicalExpr for SimilarToExecExpr {
 
                 for (i, mode) in scoring_modes.iter().enumerate() {
                     match mode {
-                        ScoringMode::AutoEmbed => {
+                        ScoringMode::AutoEmbed(_) => {
                             let query_text = query_strings[i].as_deref().unwrap_or("");
                             let vec = rt.block_on(auto_embed_query(
                                 &graph_ctx,
@@ -388,7 +396,7 @@ impl PhysicalExpr for SimilarToExecExpr {
                             ))?;
                             fts_results[i] = Some(results);
                         }
-                        ScoringMode::Cosine => {} // No pre-computation needed
+                        ScoringMode::Vector(_) => {} // No pre-computation needed
                     }
                 }
 
@@ -413,24 +421,24 @@ impl PhysicalExpr for SimilarToExecExpr {
 
             for (src_idx, mode) in scoring_modes.iter().enumerate() {
                 let score = match mode {
-                    ScoringMode::Cosine => {
+                    ScoringMode::Vector(metric) => {
                         let sv = columnar_value_to_value(&source_cvs[src_idx], batch, row_idx);
                         let qv = columnar_value_to_value(&query_cvs[src_idx], batch, row_idx);
-                        score_cosine(&sv, &qv).map_err(|e| {
+                        score_vectors_from_values(&sv, &qv, metric).map_err(|e| {
                             datafusion::error::DataFusionError::Execution(format!(
-                                "similar_to cosine: {}",
+                                "similar_to vector: {}",
                                 e
                             ))
                         })?
                     }
-                    ScoringMode::AutoEmbed => {
+                    ScoringMode::AutoEmbed(metric) => {
                         let sv = columnar_value_to_value(&source_cvs[src_idx], batch, row_idx);
                         let embed_vec = precomputed.embed_vectors[src_idx]
                             .as_ref()
                             .expect("auto-embed should have been precomputed");
-                        score_cosine_with_precomputed(&sv, embed_vec).map_err(|e| {
+                        score_vectors_precomputed(&sv, embed_vec, metric).map_err(|e| {
                             datafusion::error::DataFusionError::Execution(format!(
-                                "similar_to auto-embed cosine: {}",
+                                "similar_to auto-embed: {}",
                                 e
                             ))
                         })?
@@ -459,6 +467,11 @@ impl PhysicalExpr for SimilarToExecExpr {
                 datafusion::error::DataFusionError::Execution(format!("similar_to fusion: {}", e))
             })?;
             builder.append_value(fused as f64);
+        }
+
+        // Emit warning once per evaluate() if RRF was used in point context
+        if opts.method == FusionMethod::Rrf && num_sources > 1 {
+            self.graph_ctx.push_warning(QueryWarning::RrfPointContext);
         }
 
         Ok(ColumnarValue::Array(Arc::new(builder.finish())))
@@ -501,6 +514,7 @@ impl PhysicalExpr for SimilarToExecExpr {
             self.graph_ctx.clone(),
             self.source_variable.clone(),
             self.source_property_names.clone(),
+            self.source_metrics.clone(),
         )))
     }
 
@@ -513,12 +527,17 @@ impl PhysicalExpr for SimilarToExecExpr {
 // Scoring helpers
 // ---------------------------------------------------------------------------
 
-fn determine_scoring_mode(source: &Value, query: &Value) -> Result<ScoringMode, String> {
+fn determine_scoring_mode(
+    source: &Value,
+    query: &Value,
+    metric: Option<&DistanceMetric>,
+) -> Result<ScoringMode, String> {
+    let m = metric.cloned().unwrap_or(DistanceMetric::Cosine);
     match (source, query) {
         (Value::Vector(_) | Value::List(_), Value::Vector(_) | Value::List(_)) => {
-            Ok(ScoringMode::Cosine)
+            Ok(ScoringMode::Vector(m))
         }
-        (Value::Vector(_) | Value::List(_), Value::String(_)) => Ok(ScoringMode::AutoEmbed),
+        (Value::Vector(_) | Value::List(_), Value::String(_)) => Ok(ScoringMode::AutoEmbed(m)),
         (Value::String(_), Value::String(_)) => Ok(ScoringMode::Fts),
         (Value::String(_), Value::Vector(_) | Value::List(_)) => {
             Err("FTS source cannot be scored against a vector query".to_string())
@@ -531,15 +550,23 @@ fn determine_scoring_mode(source: &Value, query: &Value) -> Result<ScoringMode, 
     }
 }
 
-fn score_cosine(source: &Value, query: &Value) -> Result<f32, String> {
+fn score_vectors_from_values(
+    source: &Value,
+    query: &Value,
+    metric: &DistanceMetric,
+) -> Result<f32, String> {
     let v1 = value_to_f32_vec(source).map_err(|e| e.to_string())?;
     let v2 = value_to_f32_vec(query).map_err(|e| e.to_string())?;
-    cosine_similarity(&v1, &v2).map_err(|e| e.to_string())
+    score_vectors(&v1, &v2, metric).map_err(|e| e.to_string())
 }
 
-fn score_cosine_with_precomputed(source: &Value, query_vec: &[f32]) -> Result<f32, String> {
+fn score_vectors_precomputed(
+    source: &Value,
+    query_vec: &[f32],
+    metric: &DistanceMetric,
+) -> Result<f32, String> {
     let v1 = value_to_f32_vec(source).map_err(|e| e.to_string())?;
-    cosine_similarity(&v1, query_vec).map_err(|e| e.to_string())
+    score_vectors(&v1, query_vec, metric).map_err(|e| e.to_string())
 }
 
 // ---------------------------------------------------------------------------

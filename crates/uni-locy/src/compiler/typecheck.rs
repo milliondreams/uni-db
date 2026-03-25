@@ -26,7 +26,28 @@ pub fn check(
 
         check_mixed_priority(rule_name, definitions)?;
 
-        let yield_schema = infer_yield_schema(rule_name, definitions)?;
+        let mut yield_schema = infer_yield_schema(rule_name, definitions)?;
+
+        // Implicit PROB: if a fold uses MNOR/MPROD, mark the matching yield column as PROB
+        for def in definitions.iter() {
+            for fold in &def.fold {
+                if let Some(func_name) = extract_function_name(&fold.aggregate)
+                    && matches!(func_name.to_uppercase().as_str(), "MNOR" | "MPROD")
+                    && let Some(col) = yield_schema.iter_mut().find(|c| c.name == fold.name)
+                {
+                    col.is_prob = true;
+                }
+            }
+        }
+
+        // Validate: at most 1 PROB column per rule
+        let prob_count = yield_schema.iter().filter(|c| c.is_prob).count();
+        if prob_count > 1 {
+            return Err(LocyCompileError::MultipleProbColumns {
+                rule: rule_name.clone(),
+                count: prob_count,
+            });
+        }
 
         let scc_rules = &strat.sccs[scc_idx];
 
@@ -47,6 +68,7 @@ pub fn check(
             if is_recursive {
                 check_non_monotonic_in_recursion(rule_name, def)?;
                 check_msum_warning(rule_name, def, &mut warnings);
+                check_probability_domain_warning(rule_name, def, &mut warnings);
             }
 
             check_best_by_monotonic_fold(rule_name, def)?;
@@ -187,6 +209,18 @@ fn infer_yield_schema(
                         ),
                     });
                 }
+                // Check is_prob consistency across clauses
+                for (i, (e, c)) in existing.iter().zip(columns.iter()).enumerate() {
+                    if e.is_prob != c.is_prob {
+                        return Err(LocyCompileError::YieldSchemaMismatch {
+                            rule: rule_name.to_string(),
+                            detail: format!(
+                                "column {} '{}' has inconsistent PROB annotation across clauses",
+                                i, e.name
+                            ),
+                        });
+                    }
+                }
             } else {
                 schema = Some(columns);
             }
@@ -204,6 +238,7 @@ fn yield_columns_from_items(items: &[LocyYieldItem]) -> Vec<YieldColumn> {
             YieldColumn {
                 name,
                 is_key: item.is_key,
+                is_prob: item.is_prob,
             }
         })
         .collect()
@@ -257,19 +292,26 @@ fn collect_prev_refs(expr: &LocyExpr) -> Vec<String> {
 
 // ─── Non-monotonic in recursion ──────────────────────────────────────────────
 
+/// Returns `true` if the fold function name is a monotonic variant (MSUM, MMAX, etc.).
+fn is_monotonic_fold_name(name: &str) -> bool {
+    matches!(
+        name.to_uppercase().as_str(),
+        "MSUM" | "MMAX" | "MMIN" | "MCOUNT" | "MNOR" | "MPROD"
+    )
+}
+
 fn check_non_monotonic_in_recursion(
     rule_name: &str,
     def: &RuleDefinition,
 ) -> Result<(), LocyCompileError> {
     for fold in &def.fold {
-        if let Some(func_name) = extract_function_name(&fold.aggregate) {
-            let upper = func_name.to_uppercase();
-            if matches!(upper.as_str(), "SUM" | "COUNT" | "AVG" | "MIN" | "MAX") {
-                return Err(LocyCompileError::NonMonotonicInRecursion {
-                    rule: rule_name.to_string(),
-                    aggregate: func_name,
-                });
-            }
+        if let Some(func_name) = extract_function_name(&fold.aggregate)
+            && !is_monotonic_fold_name(&func_name)
+        {
+            return Err(LocyCompileError::NonMonotonicInRecursion {
+                rule: rule_name.to_string(),
+                aggregate: func_name,
+            });
         }
     }
     Ok(())
@@ -301,6 +343,37 @@ fn check_msum_warning(rule_name: &str, def: &RuleDefinition, warnings: &mut Vec<
     }
 }
 
+// ─── MNOR/MPROD probability domain warning ───────────────────────────────────
+
+fn check_probability_domain_warning(
+    rule_name: &str,
+    def: &RuleDefinition,
+    warnings: &mut Vec<CompilerWarning>,
+) {
+    for fold in &def.fold {
+        if let Some(func_name) = extract_function_name(&fold.aggregate)
+            && matches!(func_name.to_uppercase().as_str(), "MNOR" | "MPROD")
+            && let Expr::FunctionCall { args, .. } = &fold.aggregate
+        {
+            let is_literal = args
+                .first()
+                .is_some_and(|arg| matches!(arg, Expr::Literal(_)));
+            if !is_literal {
+                warnings.push(CompilerWarning {
+                    code: WarningCode::ProbabilityDomainViolation,
+                    message: format!(
+                        "{} argument in fold '{}' may be outside [0,1]; \
+                         ensure values are valid probabilities for convergence",
+                        func_name.to_uppercase(),
+                        fold.name
+                    ),
+                    rule_name: rule_name.to_string(),
+                });
+            }
+        }
+    }
+}
+
 // ─── BEST BY + monotonic fold ────────────────────────────────────────────────
 
 fn check_best_by_monotonic_fold(
@@ -311,14 +384,13 @@ fn check_best_by_monotonic_fold(
         return Ok(());
     }
     for fold in &def.fold {
-        if let Some(func_name) = extract_function_name(&fold.aggregate) {
-            let upper = func_name.to_uppercase();
-            if matches!(upper.as_str(), "MSUM" | "MMAX" | "MMIN" | "MCOUNT") {
-                return Err(LocyCompileError::BestByWithMonotonicFold {
-                    rule: rule_name.to_string(),
-                    fold: func_name,
-                });
-            }
+        if let Some(func_name) = extract_function_name(&fold.aggregate)
+            && is_monotonic_fold_name(&func_name)
+        {
+            return Err(LocyCompileError::BestByWithMonotonicFold {
+                rule: rule_name.to_string(),
+                fold: func_name,
+            });
         }
     }
     Ok(())

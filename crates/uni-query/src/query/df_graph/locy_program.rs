@@ -13,7 +13,7 @@ use crate::query::df_graph::common::{
     collect_all_partitions, compute_plan_properties, execute_subplan,
 };
 use crate::query::df_graph::locy_best_by::SortCriterion;
-use crate::query::df_graph::locy_explain::DerivationTracker;
+use crate::query::df_graph::locy_explain::ProvenanceStore;
 use crate::query::df_graph::locy_fixpoint::{
     DerivedScanRegistry, FixpointClausePlan, FixpointExec, FixpointRulePlan, IsRefBinding,
 };
@@ -40,6 +40,7 @@ use std::time::{Duration, Instant};
 use uni_common::Value;
 use uni_common::core::schema::Schema as UniSchema;
 use uni_cypher::ast::Expr;
+use uni_locy::RuntimeWarning;
 use uni_store::storage::manager::StorageManager;
 
 // ---------------------------------------------------------------------------
@@ -112,14 +113,24 @@ pub struct LocyProgramExec {
     timeout: Duration,
     max_derived_bytes: usize,
     deterministic_best_by: bool,
+    strict_probability_domain: bool,
+    probability_epsilon: f64,
+    exact_probability: bool,
+    max_bdd_variables: usize,
     /// Shared slot for extracting the DerivedStore after execution completes.
     derived_store_slot: Arc<StdRwLock<Option<DerivedStore>>>,
+    /// Shared slot for groups where BDD fell back to independence mode.
+    approximate_slot: Arc<StdRwLock<HashMap<String, Vec<String>>>>,
     /// Optional provenance tracker injected after construction (via `set_derivation_tracker`).
-    derivation_tracker: Arc<StdRwLock<Option<Arc<DerivationTracker>>>>,
+    derivation_tracker: Arc<StdRwLock<Option<Arc<ProvenanceStore>>>>,
     /// Shared slot written with per-rule iteration counts after fixpoint convergence.
     iteration_counts_slot: Arc<StdRwLock<HashMap<String, usize>>>,
     /// Shared slot written with peak memory bytes after fixpoint completes.
     peak_memory_slot: Arc<StdRwLock<usize>>,
+    /// Shared slot for runtime warnings collected during evaluation.
+    warnings_slot: Arc<StdRwLock<Vec<RuntimeWarning>>>,
+    /// Top-k proof filtering: 0 = unlimited (default), >0 = retain at most k proofs per fact.
+    top_k_proofs: usize,
 }
 
 impl fmt::Debug for LocyProgramExec {
@@ -136,7 +147,10 @@ impl fmt::Debug for LocyProgramExec {
 }
 
 impl LocyProgramExec {
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "execution plan node requires full graph and session context"
+    )]
     pub fn new(
         strata: Vec<LocyStratum>,
         commands: Vec<LocyCommand>,
@@ -151,6 +165,11 @@ impl LocyProgramExec {
         timeout: Duration,
         max_derived_bytes: usize,
         deterministic_best_by: bool,
+        strict_probability_domain: bool,
+        probability_epsilon: f64,
+        exact_probability: bool,
+        max_bdd_variables: usize,
+        top_k_proofs: usize,
     ) -> Self {
         let properties = compute_plan_properties(Arc::clone(&output_schema));
         Self {
@@ -169,10 +188,17 @@ impl LocyProgramExec {
             timeout,
             max_derived_bytes,
             deterministic_best_by,
+            strict_probability_domain,
+            probability_epsilon,
+            exact_probability,
+            max_bdd_variables,
             derived_store_slot: Arc::new(StdRwLock::new(None)),
+            approximate_slot: Arc::new(StdRwLock::new(HashMap::new())),
             derivation_tracker: Arc::new(StdRwLock::new(None)),
             iteration_counts_slot: Arc::new(StdRwLock::new(HashMap::new())),
             peak_memory_slot: Arc::new(StdRwLock::new(0)),
+            warnings_slot: Arc::new(StdRwLock::new(Vec::new())),
+            top_k_proofs,
         }
     }
 
@@ -184,11 +210,11 @@ impl LocyProgramExec {
         Arc::clone(&self.derived_store_slot)
     }
 
-    /// Inject a `DerivationTracker` to record provenance during fixpoint iteration.
+    /// Inject a `ProvenanceStore` to record provenance during fixpoint iteration.
     ///
     /// Must be called before `execute()` is invoked (i.e., before DataFusion runs
     /// the physical plan). Uses interior mutability so it works through `&self`.
-    pub fn set_derivation_tracker(&self, tracker: Arc<DerivationTracker>) {
+    pub fn set_derivation_tracker(&self, tracker: Arc<ProvenanceStore>) {
         if let Ok(mut guard) = self.derivation_tracker.write() {
             *guard = Some(tracker);
         }
@@ -208,6 +234,22 @@ impl LocyProgramExec {
     /// across all strata. Read it with `slot.read().unwrap()`.
     pub fn peak_memory_slot(&self) -> Arc<StdRwLock<usize>> {
         Arc::clone(&self.peak_memory_slot)
+    }
+
+    /// Returns the shared runtime warnings slot.
+    ///
+    /// After execution, the slot contains warnings collected during fixpoint
+    /// iteration (e.g. shared probabilistic dependencies).
+    pub fn warnings_slot(&self) -> Arc<StdRwLock<Vec<RuntimeWarning>>> {
+        Arc::clone(&self.warnings_slot)
+    }
+
+    /// Returns the shared approximate groups slot.
+    ///
+    /// After execution, the slot contains rule→key group descriptions for
+    /// groups where BDD computation fell back to independence mode.
+    pub fn approximate_slot(&self) -> Arc<StdRwLock<HashMap<String, Vec<String>>>> {
+        Arc::clone(&self.approximate_slot)
     }
 }
 
@@ -276,10 +318,17 @@ impl ExecutionPlan for LocyProgramExec {
         let timeout = self.timeout;
         let max_derived_bytes = self.max_derived_bytes;
         let deterministic_best_by = self.deterministic_best_by;
+        let strict_probability_domain = self.strict_probability_domain;
+        let probability_epsilon = self.probability_epsilon;
+        let exact_probability = self.exact_probability;
+        let max_bdd_variables = self.max_bdd_variables;
         let derived_store_slot = Arc::clone(&self.derived_store_slot);
+        let approximate_slot = Arc::clone(&self.approximate_slot);
         let iteration_counts_slot = Arc::clone(&self.iteration_counts_slot);
         let peak_memory_slot = Arc::clone(&self.peak_memory_slot);
         let derivation_tracker = self.derivation_tracker.read().ok().and_then(|g| g.clone());
+        let warnings_slot = Arc::clone(&self.warnings_slot);
+        let top_k_proofs = self.top_k_proofs;
 
         let fut = async move {
             run_program(
@@ -295,10 +344,17 @@ impl ExecutionPlan for LocyProgramExec {
                 timeout,
                 max_derived_bytes,
                 deterministic_best_by,
+                strict_probability_domain,
+                probability_epsilon,
+                exact_probability,
+                max_bdd_variables,
                 derived_store_slot,
+                approximate_slot,
                 iteration_counts_slot,
                 peak_memory_slot,
                 derivation_tracker,
+                warnings_slot,
+                top_k_proofs,
             )
             .await
         };
@@ -378,7 +434,10 @@ impl RecordBatchStream for ProgramStream {
 // run_program — core evaluation algorithm
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "program evaluation requires full graph and session context"
+)]
 async fn run_program(
     strata: Vec<LocyStratum>,
     registry: Arc<DerivedScanRegistry>,
@@ -392,10 +451,17 @@ async fn run_program(
     timeout: Duration,
     max_derived_bytes: usize,
     deterministic_best_by: bool,
+    strict_probability_domain: bool,
+    probability_epsilon: f64,
+    exact_probability: bool,
+    max_bdd_variables: usize,
     derived_store_slot: Arc<StdRwLock<Option<DerivedStore>>>,
+    approximate_slot: Arc<StdRwLock<HashMap<String, Vec<String>>>>,
     iteration_counts_slot: Arc<StdRwLock<HashMap<String, usize>>>,
     peak_memory_slot: Arc<StdRwLock<usize>>,
-    derivation_tracker: Option<Arc<DerivationTracker>>,
+    derivation_tracker: Option<Arc<ProvenanceStore>>,
+    warnings_slot: Arc<StdRwLock<Vec<RuntimeWarning>>>,
+    top_k_proofs: usize,
 ) -> DFResult<Vec<RecordBatch>> {
     let start = Instant::now();
     let mut derived_store = DerivedStore::new();
@@ -432,6 +498,13 @@ async fn run_program(
                 max_derived_bytes,
                 derivation_tracker.clone(),
                 Arc::clone(&iteration_counts_slot),
+                strict_probability_domain,
+                probability_epsilon,
+                exact_probability,
+                max_bdd_variables,
+                Arc::clone(&warnings_slot),
+                Arc::clone(&approximate_slot),
+                top_k_proofs,
             );
 
             let task_ctx = session_ctx.read().task_ctx();
@@ -477,41 +550,129 @@ async fn run_program(
             let task_ctx = session_ctx.read().task_ctx();
 
             for (rule, fp_rule) in stratum.rules.iter().zip(fixpoint_rules.iter()) {
-                let mut facts = evaluate_non_recursive_rule(
-                    rule,
-                    &params,
-                    &graph_ctx,
-                    &session_ctx,
-                    &storage,
-                    &schema_info,
-                )
-                .await?;
+                // Process each clause independently (per-clause IS NOT).
+                let mut tagged_clause_facts: Vec<(usize, Vec<RecordBatch>)> = Vec::new();
+                for (clause_idx, (clause, fp_clause)) in
+                    rule.clauses.iter().zip(fp_rule.clauses.iter()).enumerate()
+                {
+                    let mut batches = execute_subplan(
+                        &clause.body,
+                        &params,
+                        &HashMap::new(),
+                        &graph_ctx,
+                        &session_ctx,
+                        &storage,
+                        &schema_info,
+                    )
+                    .await?;
 
-                // Apply anti-joins for negated IS-refs (IS NOT semantics).
-                // For non-recursive rules, the negated rule is always in a lower stratum,
-                // so its facts are already in the registry from write_cross_stratum_facts.
-                for clause in &fp_rule.clauses {
-                    for binding in &clause.is_ref_bindings {
+                    // Apply negated IS-ref semantics per-clause.
+                    for binding in &fp_clause.is_ref_bindings {
                         if binding.negated
                             && !binding.anti_join_cols.is_empty()
                             && let Some(entry) = registry.get(binding.derived_scan_index)
                         {
                             let neg_facts = entry.data.read().clone();
                             if !neg_facts.is_empty() {
-                                for (left_col, right_col) in &binding.anti_join_cols {
-                                    facts = super::locy_fixpoint::apply_anti_join(
-                                        facts, &neg_facts, left_col, right_col,
+                                if binding.target_has_prob && fp_rule.prob_column_name.is_some() {
+                                    let complement_col =
+                                        format!("__prob_complement_{}", binding.rule_name);
+                                    if let Some(prob_col) = &binding.target_prob_col {
+                                        batches =
+                                            super::locy_fixpoint::apply_prob_complement_composite(
+                                                batches,
+                                                &neg_facts,
+                                                &binding.anti_join_cols,
+                                                prob_col,
+                                                &complement_col,
+                                            )?;
+                                    } else {
+                                        // target_has_prob but no prob_col: fall back to anti-join.
+                                        batches = super::locy_fixpoint::apply_anti_join_composite(
+                                            batches,
+                                            &neg_facts,
+                                            &binding.anti_join_cols,
+                                        )?;
+                                    }
+                                } else {
+                                    batches = super::locy_fixpoint::apply_anti_join_composite(
+                                        batches,
+                                        &neg_facts,
+                                        &binding.anti_join_cols,
                                     )?;
                                 }
                             }
                         }
                     }
+
+                    // Multiply complement columns into PROB per-clause.
+                    let complement_cols: Vec<String> = if !batches.is_empty() {
+                        batches[0]
+                            .schema()
+                            .fields()
+                            .iter()
+                            .filter(|f| f.name().starts_with("__prob_complement_"))
+                            .map(|f| f.name().clone())
+                            .collect()
+                    } else {
+                        vec![]
+                    };
+                    if !complement_cols.is_empty() {
+                        batches = super::locy_fixpoint::multiply_prob_factors(
+                            batches,
+                            fp_rule.prob_column_name.as_deref(),
+                            &complement_cols,
+                        )?;
+                    }
+
+                    tagged_clause_facts.push((clause_idx, batches));
                 }
 
-                // Apply post-fixpoint operators (PRIORITY, FOLD, BEST BY)
-                let facts =
-                    super::locy_fixpoint::apply_post_fixpoint_chain(facts, fp_rule, &task_ctx)
-                        .await?;
+                // Record provenance and detect shared proofs for non-recursive rules.
+                let shared_info = if let Some(ref tracker) = derivation_tracker {
+                    super::locy_fixpoint::record_and_detect_lineage_nonrecursive(
+                        fp_rule,
+                        &tagged_clause_facts,
+                        tracker,
+                        &warnings_slot,
+                        &registry,
+                        top_k_proofs,
+                    )
+                } else {
+                    None
+                };
+
+                // Flatten tagged facts for post-fixpoint chain.
+                let mut all_clause_facts: Vec<RecordBatch> = tagged_clause_facts
+                    .into_iter()
+                    .flat_map(|(_, batches)| batches)
+                    .collect();
+
+                // Apply BDD for shared groups if exact_probability is enabled.
+                if exact_probability
+                    && let Some(ref info) = shared_info
+                    && let Some(ref tracker) = derivation_tracker
+                {
+                    all_clause_facts = super::locy_fixpoint::apply_exact_wmc(
+                        all_clause_facts,
+                        fp_rule,
+                        info,
+                        tracker,
+                        max_bdd_variables,
+                        &warnings_slot,
+                        &approximate_slot,
+                    )?;
+                }
+
+                // Apply post-fixpoint operators (PRIORITY, FOLD, BEST BY) on union.
+                let facts = super::locy_fixpoint::apply_post_fixpoint_chain(
+                    all_clause_facts,
+                    fp_rule,
+                    &task_ctx,
+                    strict_probability_domain,
+                    probability_epsilon,
+                )
+                .await?;
 
                 // Write facts into registry handles for later strata
                 write_facts_to_registry(&registry, &rule.name, &facts);
@@ -540,37 +701,6 @@ async fn run_program(
     let stats = vec![build_stats_batch(&derived_store, &strata, output_schema)];
     *derived_store_slot.write().unwrap() = Some(derived_store);
     Ok(stats)
-}
-
-// ---------------------------------------------------------------------------
-// Non-recursive stratum evaluation
-// ---------------------------------------------------------------------------
-
-async fn evaluate_non_recursive_rule(
-    rule: &LocyRulePlan,
-    params: &HashMap<String, Value>,
-    graph_ctx: &Arc<GraphExecutionContext>,
-    session_ctx: &Arc<RwLock<datafusion::prelude::SessionContext>>,
-    storage: &Arc<StorageManager>,
-    schema_info: &Arc<UniSchema>,
-) -> DFResult<Vec<RecordBatch>> {
-    let mut all_batches = Vec::new();
-
-    for clause in &rule.clauses {
-        let batches = execute_subplan(
-            &clause.body,
-            params,
-            &HashMap::new(),
-            graph_ctx,
-            session_ctx,
-            storage,
-            schema_info,
-        )
-        .await?;
-        all_batches.extend(batches);
-    }
-
-    Ok(all_batches)
 }
 
 // ---------------------------------------------------------------------------
@@ -606,13 +736,16 @@ fn write_facts_to_registry(registry: &DerivedScanRegistry, rule_name: &str, fact
             *guard = if facts.is_empty() || facts.iter().all(|b| b.num_rows() == 0) {
                 vec![RecordBatch::new_empty(Arc::clone(&entry.schema))]
             } else {
-                // Re-wrap batches with the entry's schema to ensure column names and
-                // types match exactly. The column data is preserved; only the schema
-                // metadata (field names) is replaced.
+                // Try to re-wrap batches with the entry's schema for column name
+                // alignment. If the types don't match (e.g. inferred Float64 vs
+                // actual Utf8 from schema mode), fall back to the batch's own
+                // schema to avoid silent data loss.
                 facts
                     .iter()
-                    .filter_map(|b| {
-                        RecordBatch::try_new(Arc::clone(&entry.schema), b.columns().to_vec()).ok()
+                    .filter(|b| b.num_rows() > 0)
+                    .map(|b| {
+                        RecordBatch::try_new(Arc::clone(&entry.schema), b.columns().to_vec())
+                            .unwrap_or_else(|_| b.clone())
                     })
                     .collect()
             };
@@ -651,6 +784,7 @@ fn convert_to_fixpoint_plans(
                         body_logical: clause.body.clone(),
                         is_ref_bindings,
                         priority: clause.priority,
+                        along_bindings: clause.along_bindings.clone(),
                     })
                 })
                 .collect::<DFResult<Vec<_>>>()?;
@@ -670,6 +804,12 @@ fn convert_to_fixpoint_plans(
                 yield_schema
             };
 
+            let prob_column_name = rule
+                .yield_schema
+                .iter()
+                .find(|yc| yc.is_prob)
+                .map(|yc| yc.name.clone());
+
             Ok(FixpointRulePlan {
                 name: rule.name.clone(),
                 clauses,
@@ -682,6 +822,7 @@ fn convert_to_fixpoint_plans(
                 best_by_criteria,
                 has_priority,
                 deterministic: deterministic_best_by,
+                prob_column_name,
             })
         })
         .collect()
@@ -737,12 +878,37 @@ fn convert_is_refs(
                 Vec::new()
             };
 
+            // Provenance join cols: for ALL IS-refs (not just negated), compute
+            // (body_col, derived_col) pairs so shared-proof detection can trace
+            // which source facts contributed to each derived row.
+            let provenance_join_cols: Vec<(String, String)> = is_ref
+                .subjects
+                .iter()
+                .enumerate()
+                .filter_map(|(i, s)| {
+                    if let uni_cypher::ast::Expr::Variable(var) = s {
+                        let right_col = entry
+                            .schema
+                            .fields()
+                            .get(i)
+                            .map(|f| f.name().clone())
+                            .unwrap_or_else(|| var.clone());
+                        Some((var.clone(), right_col))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
             Ok(IsRefBinding {
                 derived_scan_index: entry.scan_index,
                 rule_name: is_ref.rule_name.clone(),
                 is_self_ref: entry.is_self_ref,
                 negated: is_ref.negated,
                 anti_join_cols,
+                target_has_prob: is_ref.target_has_prob,
+                target_prob_col: is_ref.target_prob_col.clone(),
+                provenance_join_cols,
             })
         })
         .collect()
@@ -761,6 +927,17 @@ fn convert_fold_bindings(
         .iter()
         .map(|(name, expr)| {
             let (kind, _input_col_name) = parse_fold_aggregate(expr)?;
+
+            // CountAll has no input column — LocyProject skips the output column
+            // entirely, so there is nothing to look up.
+            if kind == FoldAggKind::CountAll {
+                return Ok(FoldBinding {
+                    output_name: name.clone(),
+                    kind,
+                    input_col_index: 0, // unused for CountAll
+                });
+            }
+
             // The LocyProject projects the aggregate input expression AS the fold
             // output name, so the input column index matches the yield schema position.
             let input_col_index = yield_schema
@@ -785,13 +962,23 @@ fn convert_fold_bindings(
 fn parse_fold_aggregate(expr: &Expr) -> DFResult<(FoldAggKind, String)> {
     match expr {
         Expr::FunctionCall { name, args, .. } => {
-            let kind = match name.to_uppercase().as_str() {
+            let upper = name.to_uppercase();
+            let is_count = matches!(upper.as_str(), "COUNT" | "MCOUNT");
+
+            // COUNT/MCOUNT with zero args → CountAll (like SQL COUNT(*))
+            if is_count && args.is_empty() {
+                return Ok((FoldAggKind::CountAll, String::new()));
+            }
+
+            let kind = match upper.as_str() {
                 "SUM" | "MSUM" => FoldAggKind::Sum,
                 "MAX" | "MMAX" => FoldAggKind::Max,
                 "MIN" | "MMIN" => FoldAggKind::Min,
                 "COUNT" | "MCOUNT" => FoldAggKind::Count,
                 "AVG" => FoldAggKind::Avg,
                 "COLLECT" => FoldAggKind::Collect,
+                "MNOR" => FoldAggKind::Nor,
+                "MPROD" => FoldAggKind::Prod,
                 _ => {
                     return Err(datafusion::error::DataFusionError::Plan(format!(
                         "Unknown FOLD aggregate function: {}",
@@ -802,10 +989,10 @@ fn parse_fold_aggregate(expr: &Expr) -> DFResult<(FoldAggKind, String)> {
             let col_name = match args.first() {
                 Some(Expr::Variable(v)) => v.clone(),
                 Some(Expr::Property(_, prop)) => prop.clone(),
-                _ => {
+                Some(other) => other.to_string_repr(),
+                None => {
                     return Err(datafusion::error::DataFusionError::Plan(
-                        "FOLD aggregate argument must be a variable or property reference"
-                            .to_string(),
+                        "FOLD aggregate function requires at least one argument".to_string(),
                     ));
                 }
             };
@@ -1031,16 +1218,19 @@ mod tests {
             LocyYieldColumn {
                 name: "a".to_string(),
                 is_key: true,
+                is_prob: false,
                 data_type: DataType::UInt64,
             },
             LocyYieldColumn {
                 name: "b".to_string(),
                 is_key: false,
+                is_prob: false,
                 data_type: DataType::LargeUtf8,
             },
             LocyYieldColumn {
                 name: "c".to_string(),
                 is_key: true,
+                is_prob: false,
                 data_type: DataType::Float64,
             },
         ];
@@ -1065,16 +1255,19 @@ mod tests {
             LocyYieldColumn {
                 name: "a".to_string(),
                 is_key: true,
+                is_prob: false,
                 data_type: DataType::LargeBinary,
             },
             LocyYieldColumn {
                 name: "b".to_string(),
                 is_key: false,
+                is_prob: false,
                 data_type: DataType::LargeBinary,
             },
             LocyYieldColumn {
                 name: "c".to_string(),
                 is_key: true,
+                is_prob: false,
                 data_type: DataType::LargeBinary,
             },
         ];

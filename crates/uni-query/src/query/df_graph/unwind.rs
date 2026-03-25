@@ -23,7 +23,7 @@
 //!           {"list": [1,2,3], "item": 3}]
 //! ```
 
-use crate::query::df_graph::common::compute_plan_properties;
+use crate::query::df_graph::common::{arrow_err, compute_plan_properties};
 use arrow::compute::take;
 use arrow_array::builder::{
     BooleanBuilder, Float64Builder, Int64Builder, LargeBinaryBuilder, StringBuilder,
@@ -627,8 +627,7 @@ impl GraphUnwindStream {
 
         self.metrics.record_output(num_rows);
 
-        RecordBatch::try_new(Arc::clone(&self.schema), columns)
-            .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+        RecordBatch::try_new(Arc::clone(&self.schema), columns).map_err(arrow_err)
     }
 }
 

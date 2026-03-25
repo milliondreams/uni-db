@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Dragonscale Team
 
+//! Cypher query planning and execution engine.
+//!
+//! Contains the logical planner, executor, DataFusion integration,
+//! predicate pushdown, rewrite rules, and supporting utilities.
+
 pub mod cypher_type_coerce;
 pub mod datetime;
 pub mod df_expr;

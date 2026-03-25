@@ -126,6 +126,53 @@ async fn test_fts_query() -> Result<()> {
     Ok(())
 }
 
+/// CREATE FULLTEXT INDEX on existing (flushed) data should auto-build the
+/// physical tantivy index — no manual `rebuild_indexes()` required.
+#[tokio::test]
+async fn test_fts_auto_build_on_create_index() -> Result<()> {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let dir = tempdir()?;
+    let path = dir.path();
+
+    let schema_manager =
+        uni_db::core::schema::SchemaManager::load(&path.join("schema.json")).await?;
+    schema_manager.add_label("Doc")?;
+    schema_manager.add_property("Doc", "title", DataType::String, false)?;
+    schema_manager.add_property("Doc", "content", DataType::String, false)?;
+    schema_manager.save().await?;
+
+    let db = uni_db::Uni::open(path.to_str().unwrap()).build().await?;
+
+    // Insert and flush so data lives in Lance
+    db.execute(r#"CREATE (:Doc { title: "Rust Guide", content: "Memory safety without garbage collection." })"#).await?;
+    db.execute(r#"CREATE (:Doc { title: "Go Manual", content: "Concurrency with goroutines and channels." })"#).await?;
+    db.flush().await?;
+
+    // Create FTS index — should auto-build physical index (no rebuild_indexes needed)
+    db.execute("CREATE FULLTEXT INDEX doc_content_fts FOR (d:Doc) ON EACH [d.content]")
+        .await?;
+
+    // Query via FTS procedure — should find results without manual rebuild
+    let results = db
+        .query(
+            "CALL uni.fts.query('Doc', 'content', 'memory safety', 10) \
+             YIELD node \
+             RETURN node.title AS title",
+        )
+        .await?;
+    assert_eq!(
+        results.len(),
+        1,
+        "FTS should find 'Rust Guide' without manual rebuild_indexes; got {} results",
+        results.len()
+    );
+    let title: String = results.rows()[0].get("title")?;
+    assert_eq!(title, "Rust Guide");
+
+    Ok(())
+}
+
 /// FTS queries must see unflushed L0 writes and respect L0 tombstones.
 #[tokio::test]
 async fn test_fts_query_sees_l0_writes() -> Result<()> {

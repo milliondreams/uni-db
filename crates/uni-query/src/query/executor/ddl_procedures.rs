@@ -341,6 +341,12 @@ async fn create_index_internal(
             IndexDefinition::Inverted(cfg) => {
                 idx_mgr.create_inverted_index(cfg).await?;
             }
+            IndexDefinition::FullText(cfg) => {
+                idx_mgr.create_fts_index(cfg).await?;
+            }
+            IndexDefinition::JsonFullText(cfg) => {
+                idx_mgr.create_json_fts_index(cfg).await?;
+            }
             _ => {}
         }
     }

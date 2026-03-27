@@ -15,7 +15,7 @@ use std::sync::RwLock;
 use uni_common::Value;
 use uni_cypher::locy_ast::{ExplainRule, RuleCondition};
 use uni_locy::types::CompiledRule;
-use uni_locy::{CompiledProgram, DerivationNode, LocyConfig, LocyError, LocyStats, Row};
+use uni_locy::{CompiledProgram, DerivationNode, FactRow, LocyConfig, LocyError, LocyStats};
 
 use super::locy_delta::{
     KeyTuple, RowStore, extract_cypher_conditions, extract_key, resolve_clause_with_is_refs,
@@ -55,7 +55,7 @@ pub struct ProvenanceAnnotation {
     /// Fixpoint iteration number when the fact was first derived.
     pub iteration: usize,
     /// Full fact row stored for Mode A filtering/display.
-    pub fact_row: Row,
+    pub fact_row: FactRow,
     /// Probability of this specific proof path (populated by top-k filtering).
     pub proof_probability: Option<f64>,
 }
@@ -366,7 +366,7 @@ async fn explain_rule_mode_b(
         .unwrap_or_default();
 
     // Filter facts by WHERE expression
-    let filtered: Vec<Row> = if let Some(where_expr) = &query.where_expr {
+    let filtered: Vec<FactRow> = if let Some(where_expr) = &query.where_expr {
         facts
             .into_iter()
             .filter(|row| {
@@ -433,7 +433,7 @@ async fn explain_rule_mode_b(
 )]
 fn build_derivation_node<'a>(
     rule_name: &'a str,
-    fact: &'a Row,
+    fact: &'a FactRow,
     key_columns: &'a [String],
     program: &'a CompiledProgram,
     fact_source: &'a dyn DerivedFactSource,
@@ -525,12 +525,12 @@ fn build_derivation_node<'a>(
                                 .map(|c| c.name.clone())
                                 .collect();
 
-                            let ref_facts: Vec<Row> = derived_store
+                            let ref_facts: Vec<FactRow> = derived_store
                                 .get(&ref_rule_name)
                                 .map(|r| r.rows.clone())
                                 .unwrap_or_default();
 
-                            let matching_ref_facts: Vec<Row> = ref_facts
+                            let matching_ref_facts: Vec<FactRow> = ref_facts
                                 .into_iter()
                                 .filter(|ref_fact| {
                                     let subjects_match =
@@ -620,10 +620,10 @@ fn build_derivation_node<'a>(
 /// it against `ref_key_col` in `ref_fact` using `values_equal_for_join`.
 /// Returns `true` when the key column is out of range or the binding is absent.
 fn binding_matches_key(
-    primary: &Row,
-    fallback: &Row,
+    primary: &FactRow,
+    fallback: &FactRow,
     var_name: &str,
-    ref_fact: &Row,
+    ref_fact: &FactRow,
     ref_key_col: Option<&String>,
 ) -> bool {
     let Some(key_col) = ref_key_col else {
@@ -637,7 +637,7 @@ fn binding_matches_key(
         .is_some_and(|rv| values_equal_for_join(rv, val))
 }
 
-fn extract_along_values(fact: &Row, rule: &CompiledRule) -> HashMap<String, Value> {
+fn extract_along_values(fact: &FactRow, rule: &CompiledRule) -> HashMap<String, Value> {
     let mut along_values = HashMap::new();
     for clause in &rule.clauses {
         for along in &clause.along {
@@ -649,7 +649,7 @@ fn extract_along_values(fact: &Row, rule: &CompiledRule) -> HashMap<String, Valu
     along_values
 }
 
-pub(crate) fn format_graph_fact(row: &Row) -> String {
+pub(crate) fn format_graph_fact(row: &FactRow) -> String {
     let mut entries: Vec<String> = row
         .iter()
         .map(|(k, v)| format!("{}: {}", k, format_value(v)))

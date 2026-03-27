@@ -371,6 +371,9 @@ impl Executor {
 
         let session = SessionContext::new();
         crate::query::df_udfs::register_cypher_udfs(&session)?;
+        if let Some(ref registry) = self.custom_function_registry {
+            crate::query::df_udfs::register_custom_udfs(&session, registry)?;
+        }
         let session_ctx = Arc::new(SyncRwLock::new(session));
 
         let mut planner = HybridPhysicalPlanner::with_l0_context(
@@ -447,6 +450,7 @@ impl Executor {
                 prop_manager: prop_manager_arc,
                 params: params.clone(),
                 query_ctx,
+                tx_l0_override: self.transaction_l0_override.clone(),
             });
             planner = planner.with_mutation_context(mutation_ctx);
             tracing::debug!(
@@ -2143,7 +2147,11 @@ impl Executor {
 
                         evaluated_args.push(val);
                     }
-                    eval_scalar_function(name, &evaluated_args)
+                    eval_scalar_function(
+                        name,
+                        &evaluated_args,
+                        self.custom_function_registry.as_deref(),
+                    )
                 }
                 Expr::Reduce {
                     accumulator,

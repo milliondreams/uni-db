@@ -27,18 +27,14 @@ class TestExplainProfile:
             db.query("CREATE (p:Person {name: 'Alice', age: 30})")
             db.query("CREATE (p:Person {name: 'Bob', age: 25})")
             db.query("CREATE (p:Person {name: 'Charlie', age: 35})")
-            db.query(
-                """
+            db.query("""
                 MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'})
                 CREATE (a)-[:KNOWS]->(b)
-            """
-            )
-            db.query(
-                """
+            """)
+            db.query("""
                 MATCH (b:Person {name: 'Bob'}), (c:Person {name: 'Charlie'})
                 CREATE (b)-[:KNOWS]->(c)
-            """
-            )
+            """)
             db.flush()
             yield db
 
@@ -200,13 +196,11 @@ class TestAggregations:
 
     def test_group_by_aggregation(self, db):
         """Test aggregation with GROUP BY."""
-        results = db.query(
-            """
+        results = db.query("""
             MATCH (p:Product)
             RETURN p.category AS category, sum(p.quantity) AS total_qty
             ORDER BY category
-        """
-        )
+        """)
         assert len(results) == 2
         # Check that both categories are present with correct totals
         categories = {r["category"]: r["total_qty"] for r in results}
@@ -277,24 +271,18 @@ class TestPatternMatching:
             db.query("CREATE (p:Person {name: 'Charlie'})")
             db.query("CREATE (p:Person {name: 'David'})")
 
-            db.query(
-                """
+            db.query("""
                 MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'})
                 CREATE (a)-[:KNOWS]->(b)
-            """
-            )
-            db.query(
-                """
+            """)
+            db.query("""
                 MATCH (b:Person {name: 'Bob'}), (c:Person {name: 'Charlie'})
                 CREATE (b)-[:KNOWS]->(c)
-            """
-            )
-            db.query(
-                """
+            """)
+            db.query("""
                 MATCH (a:Person {name: 'Alice'}), (c:Person {name: 'Charlie'})
                 CREATE (a)-[:WORKS_WITH]->(c)
-            """
-            )
+            """)
             db.flush()
             yield db
 

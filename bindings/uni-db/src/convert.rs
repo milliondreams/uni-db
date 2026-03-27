@@ -566,7 +566,8 @@ pub fn extract_locy_config(
 }
 
 /// Convert a LocyResult to a Python dict.
-pub fn locy_result_to_py(py: Python, result: uni_locy::LocyResult) -> PyResult<Py<PyAny>> {
+pub fn locy_result_to_py(py: Python, result: uni_db::locy::LocyResult) -> PyResult<Py<PyAny>> {
+    let result = result.into_inner();
     let dict = PyDict::new(py);
 
     // derived: HashMap<String, Vec<Row>> -> Python dict of lists of dicts
@@ -638,8 +639,9 @@ pub fn locy_result_to_py(py: Python, result: uni_locy::LocyResult) -> PyResult<P
 /// Convert a LocyResult to a Python LocyResult class instance.
 pub fn locy_result_to_py_class(
     py: Python,
-    result: uni_locy::LocyResult,
+    result: uni_db::locy::LocyResult,
 ) -> PyResult<crate::types::PyLocyResult> {
+    let result = result.into_inner();
     // Reuse the existing dict-based conversion for the inner fields
     let derived_dict = pyo3::types::PyDict::new(py);
     for (rule_name, rows) in result.derived {

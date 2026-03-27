@@ -11,22 +11,72 @@ use futures::Stream;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 use uni_common::{Result, UniError};
 
 // Re-export core value types from uni-common.
 #[doc(inline)]
 pub use uni_common::value::{Edge, FromValue, Node, Path, Value};
 
+/// Timing metrics collected during query execution.
+///
+/// All durations default to zero until the execution pipeline populates them.
+#[derive(Debug, Clone, Default)]
+pub struct QueryMetrics {
+    /// Time spent parsing the query string into an AST.
+    pub parse_time: Duration,
+    /// Time spent planning (logical plan generation).
+    pub plan_time: Duration,
+    /// Time spent executing the plan.
+    pub exec_time: Duration,
+    /// Wall-clock time from query submission to result.
+    pub total_time: Duration,
+    /// Number of rows returned to the caller.
+    pub rows_returned: usize,
+    /// Number of rows scanned during execution (0 until executor instrumentation).
+    pub rows_scanned: usize,
+    /// Number of bytes read from storage (0 until storage instrumentation).
+    pub bytes_read: usize,
+    /// Whether the plan was served from cache.
+    pub plan_cache_hit: bool,
+    /// Number of L0 reads during execution (0 until storage instrumentation).
+    pub l0_reads: usize,
+    /// Number of storage reads during execution (0 until storage instrumentation).
+    pub storage_reads: usize,
+    /// Number of cache hits during execution (0 until storage instrumentation).
+    pub cache_hits: usize,
+}
+
 /// Single result row from a query.
 #[derive(Debug, Clone)]
 pub struct Row {
     /// Column names shared across all rows in a result set.
-    pub columns: Arc<Vec<String>>,
+    pub(crate) columns: Arc<Vec<String>>,
     /// Column values for this row.
-    pub values: Vec<Value>,
+    pub(crate) values: Vec<Value>,
 }
 
 impl Row {
+    /// Create a new row from columns and values.
+    pub fn new(columns: Arc<Vec<String>>, values: Vec<Value>) -> Self {
+        Self { columns, values }
+    }
+
+    /// Returns the column names for this row.
+    pub fn columns(&self) -> &[String] {
+        &self.columns
+    }
+
+    /// Returns the column values for this row.
+    pub fn values(&self) -> &[Value] {
+        &self.values
+    }
+
+    /// Consumes the row, returning the column values.
+    pub fn into_values(self) -> Vec<Value> {
+        self.values
+    }
+
     /// Gets a typed value by column name.
     ///
     /// # Errors
@@ -160,14 +210,32 @@ impl std::fmt::Display for QueryWarning {
 #[derive(Debug)]
 pub struct QueryResult {
     /// Column names shared across all rows.
-    pub columns: Arc<Vec<String>>,
+    pub(crate) columns: Arc<Vec<String>>,
     /// Result rows.
-    pub rows: Vec<Row>,
+    pub(crate) rows: Vec<Row>,
     /// Warnings emitted during query execution.
-    pub warnings: Vec<QueryWarning>,
+    pub(crate) warnings: Vec<QueryWarning>,
+    /// Execution timing metrics.
+    pub(crate) metrics: QueryMetrics,
 }
 
 impl QueryResult {
+    /// Create a new query result.
+    #[doc(hidden)]
+    pub fn new(
+        columns: Arc<Vec<String>>,
+        rows: Vec<Row>,
+        warnings: Vec<QueryWarning>,
+        metrics: QueryMetrics,
+    ) -> Self {
+        Self {
+            columns,
+            rows,
+            warnings,
+            metrics,
+        }
+    }
+
     /// Returns the column names.
     pub fn columns(&self) -> &[String] {
         &self.columns
@@ -207,6 +275,25 @@ impl QueryResult {
     pub fn has_warnings(&self) -> bool {
         !self.warnings.is_empty()
     }
+
+    /// Returns execution timing metrics.
+    pub fn metrics(&self) -> &QueryMetrics {
+        &self.metrics
+    }
+
+    /// Update the parse timing and total time on the metrics.
+    ///
+    /// Used when the parse phase happens outside `execute_ast_internal` (e.g.,
+    /// in `execute_internal_with_config` which parses first, then delegates).
+    #[doc(hidden)]
+    pub fn update_parse_timing(
+        &mut self,
+        parse_time: std::time::Duration,
+        total_time: std::time::Duration,
+    ) {
+        self.metrics.parse_time = parse_time;
+        self.metrics.total_time = total_time;
+    }
 }
 
 impl IntoIterator for QueryResult {
@@ -222,18 +309,129 @@ impl IntoIterator for QueryResult {
 #[derive(Debug)]
 pub struct ExecuteResult {
     /// Number of entities affected.
-    pub affected_rows: usize,
+    pub(crate) affected_rows: usize,
+    /// Number of nodes created.
+    pub(crate) nodes_created: usize,
+    /// Number of nodes deleted.
+    pub(crate) nodes_deleted: usize,
+    /// Number of relationships created.
+    pub(crate) relationships_created: usize,
+    /// Number of relationships deleted.
+    pub(crate) relationships_deleted: usize,
+    /// Number of properties set.
+    pub(crate) properties_set: usize,
+    /// Number of labels added.
+    pub(crate) labels_added: usize,
+    /// Number of labels removed.
+    pub(crate) labels_removed: usize,
+    /// Execution timing metrics.
+    pub(crate) metrics: QueryMetrics,
+}
+
+impl ExecuteResult {
+    /// Create a new execute result with only an affected row count.
+    ///
+    /// All per-type counters default to zero. Use [`with_details`](Self::with_details)
+    /// to populate detailed mutation statistics.
+    #[doc(hidden)]
+    pub fn new(affected_rows: usize) -> Self {
+        Self {
+            affected_rows,
+            nodes_created: 0,
+            nodes_deleted: 0,
+            relationships_created: 0,
+            relationships_deleted: 0,
+            properties_set: 0,
+            labels_added: 0,
+            labels_removed: 0,
+            metrics: QueryMetrics::default(),
+        }
+    }
+
+    /// Create an execute result with detailed per-type mutation counters and metrics.
+    #[doc(hidden)]
+    pub fn with_details(
+        affected_rows: usize,
+        stats: &uni_store::runtime::l0::MutationStats,
+        metrics: QueryMetrics,
+    ) -> Self {
+        Self {
+            affected_rows,
+            nodes_created: stats.nodes_created,
+            nodes_deleted: stats.nodes_deleted,
+            relationships_created: stats.relationships_created,
+            relationships_deleted: stats.relationships_deleted,
+            properties_set: stats.properties_set,
+            labels_added: stats.labels_added,
+            labels_removed: stats.labels_removed,
+            metrics,
+        }
+    }
+
+    /// Returns the number of affected entities.
+    pub fn affected_rows(&self) -> usize {
+        self.affected_rows
+    }
+
+    /// Returns the number of nodes created.
+    pub fn nodes_created(&self) -> usize {
+        self.nodes_created
+    }
+
+    /// Returns the number of nodes deleted.
+    pub fn nodes_deleted(&self) -> usize {
+        self.nodes_deleted
+    }
+
+    /// Returns the number of relationships created.
+    pub fn relationships_created(&self) -> usize {
+        self.relationships_created
+    }
+
+    /// Returns the number of relationships deleted.
+    pub fn relationships_deleted(&self) -> usize {
+        self.relationships_deleted
+    }
+
+    /// Returns the number of properties set.
+    pub fn properties_set(&self) -> usize {
+        self.properties_set
+    }
+
+    /// Returns the number of labels added.
+    pub fn labels_added(&self) -> usize {
+        self.labels_added
+    }
+
+    /// Returns the number of labels removed.
+    pub fn labels_removed(&self) -> usize {
+        self.labels_removed
+    }
+
+    /// Returns execution timing metrics.
+    pub fn metrics(&self) -> &QueryMetrics {
+        &self.metrics
+    }
 }
 
 /// Cursor-based result streaming for large result sets.
 pub struct QueryCursor {
     /// Column names shared across all rows.
-    pub columns: Arc<Vec<String>>,
+    pub(crate) columns: Arc<Vec<String>>,
     /// Async stream of row batches.
-    pub stream: Pin<Box<dyn Stream<Item = Result<Vec<Row>>> + Send>>,
+    pub(crate) stream: Pin<Box<dyn Stream<Item = Result<Vec<Row>>> + Send>>,
 }
 
 impl QueryCursor {
+    /// Create a new query cursor.
+    #[doc(hidden)]
+    pub fn new(
+        columns: Arc<Vec<String>>,
+        stream: Pin<Box<dyn Stream<Item = Result<Vec<Row>>> + Send>>,
+    ) -> Self {
+        Self { columns, stream }
+    }
+
     /// Returns the column names.
     pub fn columns(&self) -> &[String] {
         &self.columns

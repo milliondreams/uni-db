@@ -123,7 +123,7 @@ impl<'a> SchemaBuilder<'a> {
     }
 
     pub async fn apply(self) -> Result<()> {
-        let manager = &self.db.schema;
+        let manager = &self.db.inner.schema;
         let mut indexes_to_build = Vec::new();
 
         for change in self.pending {
@@ -490,15 +490,16 @@ impl Uni {
 
         // We need a way to update the schema in SchemaManager.
         // I'll add a `replace_schema` or similar to SchemaManager.
-        self.schema.replace_schema(schema);
+        self.inner.schema.replace_schema(schema);
         Ok(())
     }
 
     pub async fn save_schema(&self, path: impl AsRef<Path>) -> Result<()> {
-        let content =
-            serde_json::to_string_pretty(&self.schema.schema()).map_err(|e| UniError::Schema {
+        let content = serde_json::to_string_pretty(&self.inner.schema.schema()).map_err(|e| {
+            UniError::Schema {
                 message: e.to_string(),
-            })?;
+            }
+        })?;
         tokio::fs::write(path, content)
             .await
             .map_err(UniError::Io)?;

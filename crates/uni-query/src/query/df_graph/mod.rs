@@ -169,6 +169,9 @@ pub struct GraphExecutionContext {
 
     /// Runtime warnings collected during query execution.
     warnings: Arc<Mutex<Vec<QueryWarning>>>,
+
+    /// Cooperative cancellation token, threaded from `QueryContext`.
+    cancellation_token: Option<tokio_util::sync::CancellationToken>,
 }
 
 impl std::fmt::Debug for GraphExecutionContext {
@@ -266,6 +269,7 @@ impl GraphExecutionContext {
             procedure_registry: None,
             xervo_runtime: None,
             warnings: Arc::new(Mutex::new(Vec::new())),
+            cancellation_token: None,
         }
     }
 
@@ -290,6 +294,7 @@ impl GraphExecutionContext {
             procedure_registry: None,
             xervo_runtime: None,
             warnings: Arc::new(Mutex::new(Vec::new())),
+            cancellation_token: None,
         }
     }
 
@@ -308,6 +313,7 @@ impl GraphExecutionContext {
             procedure_registry: None,
             xervo_runtime: None,
             warnings: Arc::new(Mutex::new(Vec::new())),
+            cancellation_token: query_ctx.cancellation_token.clone(),
         }
     }
 
@@ -370,6 +376,11 @@ impl GraphExecutionContext {
     ///
     /// Returns an error if the deadline has passed.
     pub fn check_timeout(&self) -> anyhow::Result<()> {
+        if let Some(ref token) = self.cancellation_token
+            && token.is_cancelled()
+        {
+            return Err(anyhow::anyhow!("Query cancelled"));
+        }
         if let Some(deadline) = self.deadline
             && Instant::now() > deadline
         {

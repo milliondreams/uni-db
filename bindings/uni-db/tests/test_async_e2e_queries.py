@@ -108,13 +108,11 @@ async def test_min_max_aggregation(async_social_db_populated):
 async def test_group_by_with_aggregation(async_social_db_populated):
     """Test GROUP BY with aggregation."""
 
-    results = await async_social_db_populated.query(
-        """
+    results = await async_social_db_populated.query("""
         MATCH (p:Person)-[:WORKS_AT]->(c:Company)
         RETURN c.name AS company, count(p) AS employee_count
         ORDER BY c.name
-        """
-    )
+        """)
 
     assert len(results) == 2
     assert results[0]["company"] == "StartupInc"
@@ -179,13 +177,11 @@ async def test_skip_and_limit(async_social_db_populated):
 async def test_optional_match(async_social_db_populated):
     """Test OPTIONAL MATCH for nodes that may not have relationships."""
 
-    results = await async_social_db_populated.query(
-        """
+    results = await async_social_db_populated.query("""
         MATCH (p:Person {name: 'Eve'})
         OPTIONAL MATCH (p)-[:WORKS_AT]->(c:Company)
         RETURN p.name AS name, c.name AS company
-        """
-    )
+        """)
 
     assert len(results) == 1
     assert results[0]["name"] == "Eve"
@@ -196,13 +192,11 @@ async def test_optional_match(async_social_db_populated):
 async def test_union_queries(async_social_db_populated):
     """Test UNION of multiple queries."""
 
-    results = await async_social_db_populated.query(
-        """
+    results = await async_social_db_populated.query("""
         MATCH (p:Person {name: 'Alice'}) RETURN p.name AS name
         UNION
         MATCH (p:Person {name: 'Bob'}) RETURN p.name AS name
-        """
-    )
+        """)
 
     assert len(results) == 2
     names = sorted([r["name"] for r in results])
@@ -213,15 +207,13 @@ async def test_union_queries(async_social_db_populated):
 async def test_with_clause(async_social_db_populated):
     """Test WITH clause for query composition."""
 
-    results = await async_social_db_populated.query(
-        """
+    results = await async_social_db_populated.query("""
         MATCH (p:Person)
         WITH p
         WHERE p.age > 30
         RETURN p.name AS name
         ORDER BY p.name
-        """
-    )
+        """)
 
     assert len(results) == 2
     names = [r["name"] for r in results]
@@ -232,13 +224,11 @@ async def test_with_clause(async_social_db_populated):
 async def test_variable_length_paths(async_social_db_populated):
     """Test variable-length path patterns."""
 
-    results = await async_social_db_populated.query(
-        """
+    results = await async_social_db_populated.query("""
         MATCH (alice:Person {name: 'Alice'})-[:KNOWS*1..2]->(friend:Person)
         RETURN DISTINCT friend.name AS name
         ORDER BY friend.name
-        """
-    )
+        """)
 
     # Alice knows Bob directly and Charlie both directly and via Bob (1-2 hops)
     assert len(results) >= 2
@@ -252,14 +242,12 @@ async def test_where_with_logical_operators(async_social_db_populated):
     """Test WHERE clause with AND, OR, NOT operators."""
 
     # Test AND
-    results = await async_social_db_populated.query(
-        """
+    results = await async_social_db_populated.query("""
         MATCH (p:Person)
         WHERE p.age > 25 AND p.age < 32
         RETURN p.name AS name
         ORDER BY name
-        """
-    )
+        """)
 
     names = [r["name"] for r in results]
     assert "Alice" in names  # 30
@@ -268,28 +256,24 @@ async def test_where_with_logical_operators(async_social_db_populated):
     assert "Eve" not in names  # 32
 
     # Test OR
-    results = await async_social_db_populated.query(
-        """
+    results = await async_social_db_populated.query("""
         MATCH (p:Person)
         WHERE p.name = 'Alice' OR p.name = 'Bob'
         RETURN p.name AS name
         ORDER BY name
-        """
-    )
+        """)
 
     assert len(results) == 2
     names = [r["name"] for r in results]
     assert names == ["Alice", "Bob"]
 
     # Test NOT
-    results = await async_social_db_populated.query(
-        """
+    results = await async_social_db_populated.query("""
         MATCH (p:Person)
         WHERE NOT p.age > 30
         RETURN p.name AS name
         ORDER BY name
-        """
-    )
+        """)
 
     names = [r["name"] for r in results]
     assert "Bob" in names  # 25
@@ -339,13 +323,11 @@ async def test_where_with_comparisons(async_social_db_populated):
 async def test_distinct(async_social_db_populated):
     """Test DISTINCT keyword to remove duplicates."""
 
-    results = await async_social_db_populated.query(
-        """
+    results = await async_social_db_populated.query("""
         MATCH (p:Person)-[:KNOWS]->(friend:Person)
         RETURN DISTINCT friend.name AS name
         ORDER BY friend.name
-        """
-    )
+        """)
 
     # Bob is known by Alice, Charlie is known by both Alice and Bob
     names = [r["name"] for r in results]
@@ -359,12 +341,10 @@ async def test_distinct(async_social_db_populated):
 async def test_return_aliases(async_social_db_populated):
     """Test RETURN clause with aliases."""
 
-    results = await async_social_db_populated.query(
-        """
+    results = await async_social_db_populated.query("""
         MATCH (p:Person {name: 'Alice'})
         RETURN p.name AS person_name, p.age AS person_age, p.email AS contact_email
-        """
-    )
+        """)
 
     assert len(results) == 1
     result = results[0]

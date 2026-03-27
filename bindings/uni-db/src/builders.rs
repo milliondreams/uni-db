@@ -31,6 +31,7 @@ pub struct DatabaseBuilder {
     pub(crate) xervo_catalog_file: Option<String>,
     pub(crate) cloud_config: Option<uni_common::CloudStorageConfig>,
     pub(crate) uni_config: Option<uni_common::UniConfig>,
+    pub(crate) read_only: bool,
 }
 
 #[pymethods]
@@ -50,6 +51,7 @@ impl DatabaseBuilder {
             xervo_catalog_file: None,
             cloud_config: None,
             uni_config: None,
+            read_only: false,
         }
     }
 
@@ -68,6 +70,7 @@ impl DatabaseBuilder {
             xervo_catalog_file: None,
             cloud_config: None,
             uni_config: None,
+            read_only: false,
         }
     }
 
@@ -86,6 +89,7 @@ impl DatabaseBuilder {
             xervo_catalog_file: None,
             cloud_config: None,
             uni_config: None,
+            read_only: false,
         }
     }
 
@@ -104,6 +108,7 @@ impl DatabaseBuilder {
             xervo_catalog_file: None,
             cloud_config: None,
             uni_config: None,
+            read_only: false,
         }
     }
 
@@ -176,6 +181,12 @@ impl DatabaseBuilder {
         Ok(slf)
     }
 
+    /// Open the database in read-only mode (no writes allowed).
+    fn read_only(mut slf: PyRefMut<'_, Self>) -> PyRefMut<'_, Self> {
+        slf.read_only = true;
+        slf
+    }
+
     /// Build and return the Database instance.
     fn build(&self) -> PyResult<crate::sync_api::Database> {
         let uni = pyo3_async_runtimes::tokio::get_runtime()
@@ -191,6 +202,7 @@ impl DatabaseBuilder {
                 self.xervo_catalog_file.as_deref(),
                 self.cloud_config.clone(),
                 self.uni_config.clone(),
+                self.read_only,
             ))
             .map_err(PyErr::new::<pyo3::exceptions::PyIOError, _>)?;
 
@@ -303,7 +315,7 @@ impl QueryBuilder {
             ))
             .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
 
-        convert::rows_to_py(py, rows.rows)
+        convert::rows_to_py(py, rows.into_rows())
     }
 }
 
@@ -559,53 +571,52 @@ impl SessionBuilder {
 
     /// Build the session.
     fn build(&self) -> PyResult<Session> {
+        let mut rust_session = self.inner.session();
+        for (k, v) in &self.variables {
+            let val = ::uni_db::Value::from(v.clone());
+            rust_session.set(k.clone(), val);
+        }
         Ok(Session {
-            inner: self.inner.clone(),
-            variables: self.variables.clone(),
+            inner: rust_session,
         })
     }
 }
 
 /// A query session with scoped variables.
+///
+/// Sessions are the primary scope for reads and the factory for transactions.
+/// Create via `db.session()` or `db.session_builder().set(...).build()`.
 #[pyclass]
-#[derive(Clone)]
 pub struct Session {
-    pub(crate) inner: Arc<Uni>,
-    pub(crate) variables: HashMap<String, serde_json::Value>,
-}
-
-impl Session {
-    /// Build session params: creates a nested Value::Map under key "session".
-    fn build_session_params(
-        &self,
-        py: Python,
-        params: Option<HashMap<String, Py<PyAny>>>,
-    ) -> PyResult<HashMap<String, ::uni_db::Value>> {
-        let mut rust_params = HashMap::new();
-
-        // Build session variable map
-        let mut session_map = HashMap::new();
-        for (k, v) in &self.variables {
-            let val = ::uni_db::Value::from(v.clone());
-            session_map.insert(k.clone(), val);
-        }
-        rust_params.insert("session".to_string(), ::uni_db::Value::Map(session_map));
-
-        // Add query params (may override if same key)
-        if let Some(p) = params {
-            for (k, v) in p {
-                let val = convert::py_object_to_value(py, &v)?;
-                rust_params.insert(k, val);
-            }
-        }
-
-        Ok(rust_params)
-    }
+    pub(crate) inner: ::uni_db::Session,
 }
 
 #[pymethods]
 impl Session {
-    /// Execute a query with session variables available.
+    /// Set a session-scoped parameter.
+    fn set<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        key: String,
+        value: Py<PyAny>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let py = slf.py();
+        let val = convert::py_object_to_value(py, &value)?;
+        slf.inner.set(key, val);
+        Ok(slf)
+    }
+
+    /// Get a session-scoped parameter.
+    fn get(&self, py: Python, key: &str) -> PyResult<Option<Py<PyAny>>> {
+        match self.inner.get(key) {
+            Some(v) => {
+                let py_val = convert::value_to_py(py, v)?;
+                Ok(Some(py_val))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Execute a read query within this session.
     #[pyo3(signature = (cypher, params=None))]
     fn query(
         &self,
@@ -613,44 +624,407 @@ impl Session {
         cypher: &str,
         params: Option<HashMap<String, Py<PyAny>>>,
     ) -> PyResult<Vec<Py<PyAny>>> {
-        let rust_params = self.build_session_params(py, params)?;
-
-        let rows = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(core::query_core(&self.inner, cypher, rust_params))
-            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
-
-        convert::rows_to_py(py, rows.rows)
-    }
-
-    /// Create a query builder with session variables available.
-    fn query_with(&self, cypher: &str) -> QueryBuilder {
-        QueryBuilder {
-            inner: self.inner.clone(),
-            cypher: cypher.to_string(),
-            params: HashMap::new(),
-            timeout_secs: None,
-            max_memory: None,
-        }
+        let result = if let Some(p) = params {
+            let mut builder = self.inner.query_with(cypher);
+            for (k, v) in p {
+                let val = convert::py_object_to_value(py, &v)?;
+                builder = builder.param(k, val);
+            }
+            pyo3_async_runtimes::tokio::get_runtime()
+                .block_on(builder.fetch_all())
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+        } else {
+            pyo3_async_runtimes::tokio::get_runtime()
+                .block_on(self.inner.query(cypher))
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+        };
+        convert::rows_to_py(py, result.into_rows())
     }
 
     /// Execute a mutation query, returning affected row count.
-    fn execute(&self, py: Python, cypher: &str) -> PyResult<usize> {
-        let rust_params = self.build_session_params(py, None)?;
-
-        pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(core::execute_with_params_core(
-                &self.inner,
-                cypher,
-                rust_params,
-            ))
-            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+    #[pyo3(signature = (cypher, params=None))]
+    fn execute(
+        &self,
+        py: Python,
+        cypher: &str,
+        params: Option<HashMap<String, Py<PyAny>>>,
+    ) -> PyResult<usize> {
+        let affected = if let Some(p) = params {
+            let mut builder = self.inner.query_with(cypher);
+            for (k, v) in p {
+                let val = convert::py_object_to_value(py, &v)?;
+                builder = builder.param(k, val);
+            }
+            pyo3_async_runtimes::tokio::get_runtime()
+                .block_on(builder.execute_mutation())
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+                .affected_rows()
+        } else {
+            pyo3_async_runtimes::tokio::get_runtime()
+                .block_on(self.inner.execute(cypher))
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+                .affected_rows()
+        };
+        Ok(affected)
     }
 
-    /// Get a session variable value.
-    fn get(&self, py: Python, key: &str) -> PyResult<Option<Py<PyAny>>> {
-        match self.variables.get(key) {
-            Some(v) => Ok(Some(convert::json_value_to_py(py, v)?)),
-            None => Ok(None),
+    /// Create a new transaction for multi-statement writes.
+    fn tx(&self) -> PyResult<super::sync_api::Transaction> {
+        let tx = pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(self.inner.tx())
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        Ok(super::sync_api::Transaction { inner: Some(tx) })
+    }
+
+    /// Get the session ID.
+    fn id(&self) -> &str {
+        self.inner.id()
+    }
+
+    /// Add a session hook (Python object with optional before_query/after_query/before_commit/after_commit methods).
+    fn add_hook(&mut self, hook: Py<PyAny>) {
+        self.inner.add_hook(PySessionHook { py_obj: hook });
+    }
+
+    /// Create a streaming appender for the given label.
+    fn appender(&self, label: &str) -> PyResult<StreamingAppender> {
+        let builder = self.inner.appender(label);
+        let appender = builder
+            .build()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        Ok(StreamingAppender {
+            inner: std::sync::Mutex::new(Some(appender)),
+        })
+    }
+
+    /// Get session capabilities.
+    fn capabilities(&self) -> crate::types::PySessionCapabilities {
+        let caps = self.inner.capabilities();
+        crate::types::PySessionCapabilities {
+            can_write: caps.can_write,
+            can_pin: caps.can_pin,
+            isolation: caps.isolation.to_string(),
+            has_notifications: caps.has_notifications,
+        }
+    }
+
+    /// Evaluate a Locy program within this session.
+    #[pyo3(signature = (program, params=None))]
+    fn locy(
+        &self,
+        py: Python,
+        program: &str,
+        params: Option<HashMap<String, Py<PyAny>>>,
+    ) -> PyResult<crate::types::PyLocyResult> {
+        let result = if let Some(p) = params {
+            let mut builder = self.inner.locy_with(program);
+            for (k, v) in p {
+                let val = convert::py_object_to_value(py, &v)?;
+                builder = builder.param(&k, val);
+            }
+            pyo3_async_runtimes::tokio::get_runtime()
+                .block_on(builder.run())
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+        } else {
+            pyo3_async_runtimes::tokio::get_runtime()
+                .block_on(self.inner.locy(program))
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+        };
+        convert::locy_result_to_py_class(py, result)
+    }
+
+    /// Register Locy rules for reuse across evaluations in this session.
+    fn register_rules(&self, program: &str) -> PyResult<()> {
+        self.inner
+            .register_rules(program)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+    }
+
+    /// Prepare a Cypher query for repeated execution.
+    fn prepare(&self, cypher: &str) -> PyResult<crate::types::PyPreparedQuery> {
+        let prepared = pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(self.inner.prepare(cypher))
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        Ok(crate::types::PyPreparedQuery {
+            inner: std::sync::Mutex::new(prepared),
+        })
+    }
+}
+
+// ============================================================================
+// Python hook bridge
+// ============================================================================
+
+/// Bridge from Python hook objects to Rust SessionHook trait.
+struct PySessionHook {
+    py_obj: Py<PyAny>,
+}
+
+// Safety: The Py<PyAny> handle is GIL-independent (reference-counted).
+// All access to the Python object goes through `Python::attach`.
+unsafe impl Send for PySessionHook {}
+unsafe impl Sync for PySessionHook {}
+
+impl ::uni_db::SessionHook for PySessionHook {
+    fn before_query(&self, ctx: &::uni_db::HookContext) -> uni_common::Result<()> {
+        Python::attach(|py| {
+            if let Ok(method) = self.py_obj.getattr(py, "before_query") {
+                let py_ctx = pyo3::types::PyDict::new(py);
+                py_ctx.set_item("session_id", &ctx.session_id).ok();
+                py_ctx.set_item("query_text", &ctx.query_text).ok();
+                py_ctx
+                    .set_item("query_type", format!("{:?}", ctx.query_type))
+                    .ok();
+                if let Err(e) = method.call1(py, (py_ctx,)) {
+                    return Err(uni_common::UniError::HookRejected {
+                        message: e.to_string(),
+                    });
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn after_query(&self, ctx: &::uni_db::HookContext, _metrics: &::uni_db::QueryMetrics) {
+        Python::attach(|py| {
+            if let Ok(method) = self.py_obj.getattr(py, "after_query") {
+                let py_ctx = pyo3::types::PyDict::new(py);
+                py_ctx.set_item("session_id", &ctx.session_id).ok();
+                py_ctx.set_item("query_text", &ctx.query_text).ok();
+                let _ = method.call1(py, (py_ctx,));
+            }
+        });
+    }
+
+    fn before_commit(&self, ctx: &::uni_db::CommitHookContext) -> uni_common::Result<()> {
+        Python::attach(|py| {
+            if let Ok(method) = self.py_obj.getattr(py, "before_commit") {
+                let py_ctx = pyo3::types::PyDict::new(py);
+                py_ctx.set_item("session_id", &ctx.session_id).ok();
+                py_ctx.set_item("tx_id", &ctx.tx_id).ok();
+                py_ctx.set_item("mutation_count", ctx.mutation_count).ok();
+                if let Err(e) = method.call1(py, (py_ctx,)) {
+                    return Err(uni_common::UniError::HookRejected {
+                        message: e.to_string(),
+                    });
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn after_commit(&self, ctx: &::uni_db::CommitHookContext, _result: &::uni_db::CommitResult) {
+        Python::attach(|py| {
+            if let Ok(method) = self.py_obj.getattr(py, "after_commit") {
+                let py_ctx = pyo3::types::PyDict::new(py);
+                py_ctx.set_item("session_id", &ctx.session_id).ok();
+                py_ctx.set_item("tx_id", &ctx.tx_id).ok();
+                py_ctx.set_item("mutation_count", ctx.mutation_count).ok();
+                let _ = method.call1(py, (py_ctx,));
+            }
+        });
+    }
+}
+
+// ============================================================================
+// StreamingAppender
+// ============================================================================
+
+/// A streaming appender for single-label data loading.
+///
+/// Rows are buffered and flushed in batches. Use as a context manager:
+/// ```python
+/// with session.appender("Person") as app:
+///     app.append({"name": "Alice", "age": 30})
+///     stats = app.finish()
+/// ```
+#[pyclass]
+pub struct StreamingAppender {
+    inner: std::sync::Mutex<Option<::uni_db::StreamingAppender>>,
+}
+
+#[pymethods]
+impl StreamingAppender {
+    /// Append a single row of properties.
+    fn append(&self, py: Python, properties: HashMap<String, Py<PyAny>>) -> PyResult<()> {
+        let mut guard = self.inner.lock().unwrap();
+        let appender = guard.as_mut().ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Appender already finished")
+        })?;
+        let mut rust_props = HashMap::new();
+        for (k, v) in properties {
+            rust_props.insert(k, convert::py_object_to_value(py, &v)?);
+        }
+        pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(appender.append(rust_props))
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+    }
+
+    /// Flush remaining rows and commit.
+    fn finish(&self) -> PyResult<BulkStats> {
+        let mut guard = self.inner.lock().unwrap();
+        let appender = guard.as_mut().ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Appender already finished")
+        })?;
+        let stats = pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(appender.finish())
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        Ok(BulkStats {
+            vertices_inserted: stats.vertices_inserted,
+            edges_inserted: stats.edges_inserted,
+            indexes_rebuilt: stats.indexes_rebuilt,
+            duration_secs: stats.duration.as_secs_f64(),
+            index_build_duration_secs: stats.index_build_duration.as_secs_f64(),
+            indexes_pending: stats.indexes_pending,
+        })
+    }
+
+    /// Abort without committing.
+    fn abort(&self) -> PyResult<()> {
+        let mut guard = self.inner.lock().unwrap();
+        if let Some(appender) = guard.as_mut() {
+            appender.abort();
+        }
+        Ok(())
+    }
+
+    /// Number of rows currently buffered.
+    fn buffered_count(&self) -> PyResult<usize> {
+        let guard = self.inner.lock().unwrap();
+        guard.as_ref().map(|a| a.buffered_count()).ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Appender already finished")
+        })
+    }
+
+    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    #[pyo3(signature = (_exc_type=None, _exc_val=None, _exc_tb=None))]
+    fn __exit__(
+        &self,
+        _exc_type: Option<Py<PyAny>>,
+        _exc_val: Option<Py<PyAny>>,
+        _exc_tb: Option<Py<PyAny>>,
+    ) -> PyResult<bool> {
+        let guard = self.inner.lock().unwrap();
+        if guard.is_some() {
+            drop(guard);
+            self.abort()?;
+        }
+        Ok(false)
+    }
+}
+
+// ============================================================================
+// SessionTemplateBuilder
+// ============================================================================
+
+/// Builder for creating pre-configured session templates.
+#[pyclass]
+pub struct SessionTemplateBuilder {
+    pub(crate) inner: Option<::uni_db::SessionTemplateBuilder>,
+}
+
+#[pymethods]
+impl SessionTemplateBuilder {
+    /// Bind a parameter that all sessions created from this template will inherit.
+    fn param<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        key: String,
+        value: Py<PyAny>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let py = slf.py();
+        let val = convert::py_object_to_value(py, &value)?;
+        let builder = slf.inner.take().ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Builder already consumed")
+        })?;
+        slf.inner = Some(builder.param(key, val));
+        Ok(slf)
+    }
+
+    /// Pre-compile Locy rules.
+    fn rules<'py>(mut slf: PyRefMut<'py, Self>, program: &str) -> PyResult<PyRefMut<'py, Self>> {
+        let builder = slf.inner.take().ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Builder already consumed")
+        })?;
+        slf.inner = Some(
+            builder
+                .rules(program)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?,
+        );
+        Ok(slf)
+    }
+
+    /// Attach a hook.
+    fn hook<'py>(mut slf: PyRefMut<'py, Self>, hook: Py<PyAny>) -> PyResult<PyRefMut<'py, Self>> {
+        let builder = slf.inner.take().ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Builder already consumed")
+        })?;
+        slf.inner = Some(builder.hook(PySessionHook { py_obj: hook }));
+        Ok(slf)
+    }
+
+    /// Set default query timeout in seconds.
+    fn query_timeout<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        seconds: f64,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let builder = slf.inner.take().ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Builder already consumed")
+        })?;
+        slf.inner = Some(builder.query_timeout(std::time::Duration::from_secs_f64(seconds)));
+        Ok(slf)
+    }
+
+    /// Set default transaction timeout in seconds.
+    fn transaction_timeout<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        seconds: f64,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let builder = slf.inner.take().ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Builder already consumed")
+        })?;
+        slf.inner = Some(builder.transaction_timeout(std::time::Duration::from_secs_f64(seconds)));
+        Ok(slf)
+    }
+
+    /// Build the session template.
+    fn build(&mut self) -> PyResult<SessionTemplate> {
+        let builder = self.inner.take().ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Builder already consumed")
+        })?;
+        let template = builder
+            .build()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        Ok(SessionTemplate {
+            inner: std::sync::Arc::new(template),
+        })
+    }
+}
+
+// ============================================================================
+// SessionTemplate
+// ============================================================================
+
+/// A pre-configured session factory.
+///
+/// Create sessions cheaply from pre-compiled templates:
+/// ```python
+/// template = db.session_template().param("tenant", 42).rules("...").build()
+/// session = template.create()
+/// ```
+#[pyclass]
+pub struct SessionTemplate {
+    inner: std::sync::Arc<::uni_db::SessionTemplate>,
+}
+
+#[pymethods]
+impl SessionTemplate {
+    /// Create a new session from this template (cheap, no I/O).
+    fn create(&self) -> Session {
+        Session {
+            inner: self.inner.create(),
         }
     }
 }

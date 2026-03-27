@@ -37,8 +37,13 @@ async fn having_executed(world: &mut UniWorld, step: &cucumber::gherkin::Step) {
         .expect("Failed to initialize database");
 
     if let Some(query) = step.docstring() {
-        world.db().execute(query).await.unwrap_or_else(|e| {
-            panic!("Setup query failed: {}", e);
-        });
+        world
+            .db()
+            .session()
+            .execute(query)
+            .await
+            .unwrap_or_else(|e| {
+                panic!("Setup query failed: {}", e);
+            });
     }
 }

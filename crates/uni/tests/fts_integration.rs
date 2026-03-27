@@ -145,16 +145,18 @@ async fn test_fts_auto_build_on_create_index() -> Result<()> {
     let db = uni_db::Uni::open(path.to_str().unwrap()).build().await?;
 
     // Insert and flush so data lives in Lance
-    db.execute(r#"CREATE (:Doc { title: "Rust Guide", content: "Memory safety without garbage collection." })"#).await?;
-    db.execute(r#"CREATE (:Doc { title: "Go Manual", content: "Concurrency with goroutines and channels." })"#).await?;
+    db.session().execute(r#"CREATE (:Doc { title: "Rust Guide", content: "Memory safety without garbage collection." })"#).await?;
+    db.session().execute(r#"CREATE (:Doc { title: "Go Manual", content: "Concurrency with goroutines and channels." })"#).await?;
     db.flush().await?;
 
     // Create FTS index — should auto-build physical index (no rebuild_indexes needed)
-    db.execute("CREATE FULLTEXT INDEX doc_content_fts FOR (d:Doc) ON EACH [d.content]")
+    db.session()
+        .execute("CREATE FULLTEXT INDEX doc_content_fts FOR (d:Doc) ON EACH [d.content]")
         .await?;
 
     // Query via FTS procedure — should find results without manual rebuild
     let results = db
+        .session()
         .query(
             "CALL uni.fts.query('Doc', 'content', 'memory safety', 10) \
              YIELD node \
@@ -192,17 +194,19 @@ async fn test_fts_query_sees_l0_writes() -> Result<()> {
     let db = uni_db::Uni::open(path.to_str().unwrap()).build().await?;
 
     // 2. Insert initial articles and flush to Lance
-    db.execute(r#"CREATE (:Article { title: "Alpha", body: "The quick brown fox jumps over the lazy dog." })"#).await?;
-    db.execute(r#"CREATE (:Article { title: "Beta", body: "Machine learning transforms modern data pipelines." })"#).await?;
+    db.session().execute(r#"CREATE (:Article { title: "Alpha", body: "The quick brown fox jumps over the lazy dog." })"#).await?;
+    db.session().execute(r#"CREATE (:Article { title: "Beta", body: "Machine learning transforms modern data pipelines." })"#).await?;
     db.flush().await?;
 
     // 3. Create FTS index and rebuild so tantivy picks up the flushed data
-    db.execute("CREATE FULLTEXT INDEX article_body_fts FOR (a:Article) ON EACH [a.body]")
+    db.session()
+        .execute("CREATE FULLTEXT INDEX article_body_fts FOR (a:Article) ON EACH [a.body]")
         .await?;
     db.rebuild_indexes("Article", false).await?;
 
     // Sanity: flushed data is findable via FTS
     let flushed = db
+        .session()
         .query(
             "CALL uni.fts.query('Article', 'body', 'machine learning', 10) \
              YIELD node \
@@ -214,10 +218,11 @@ async fn test_fts_query_sees_l0_writes() -> Result<()> {
     assert_eq!(title, "Beta");
 
     // 4. Insert a NEW article — do NOT flush (stays in L0)
-    db.execute(r#"CREATE (:Article { title: "Gamma", body: "Quantum computing breakthroughs in machine learning." })"#).await?;
+    db.session().execute(r#"CREATE (:Article { title: "Gamma", body: "Quantum computing breakthroughs in machine learning." })"#).await?;
 
     // 5. FTS query must find the L0-only article
     let l0_results = db
+        .session()
         .query(
             "CALL uni.fts.query('Article', 'body', 'quantum computing', 10) \
              YIELD node \
@@ -240,11 +245,13 @@ async fn test_fts_query_sees_l0_writes() -> Result<()> {
     );
 
     // 6. Delete a flushed article via Cypher (tombstone in L0, not flushed)
-    db.execute("MATCH (a:Article) WHERE a.title = 'Beta' DELETE a")
+    db.session()
+        .execute("MATCH (a:Article) WHERE a.title = 'Beta' DELETE a")
         .await?;
 
     // 7. FTS query for the deleted article's keywords should exclude it
     let after_delete = db
+        .session()
         .query(
             "CALL uni.fts.query('Article', 'body', 'machine learning', 10) \
              YIELD node \

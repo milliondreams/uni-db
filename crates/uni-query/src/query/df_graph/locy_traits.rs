@@ -15,7 +15,7 @@ use arrow_array::RecordBatch;
 use async_trait::async_trait;
 use uni_common::Value;
 use uni_cypher::ast::{Expr, Pattern, Query};
-use uni_locy::{CompiledProgram, LocyConfig, LocyError, Row, SavepointId};
+use uni_locy::{CompiledProgram, FactRow, LocyConfig, LocyError, SavepointId};
 
 use super::locy_delta::RowStore;
 
@@ -26,7 +26,7 @@ use super::locy_delta::RowStore;
 #[async_trait(?Send)]
 pub trait DerivedFactSource: Send + Sync {
     /// Look up all facts for a rule. Returns Row-based results.
-    fn lookup_derived(&self, rule_name: &str) -> Result<Vec<Row>, LocyError>;
+    fn lookup_derived(&self, rule_name: &str) -> Result<Vec<FactRow>, LocyError>;
 
     /// Look up all facts for a rule as raw RecordBatches (zero-copy from native store).
     ///
@@ -41,7 +41,7 @@ pub trait DerivedFactSource: Send + Sync {
     /// Execute a graph MATCH query with optional WHERE conditions.
     ///
     /// Returns raw `RecordBatch`es so the native path stays columnar.
-    /// Callers that need `Vec<Row>` must convert via `record_batches_to_locy_rows`.
+    /// Callers that need `Vec<FactRow>` must convert via `record_batches_to_locy_rows`.
     ///
     /// Used by SLG clause resolution, EXPLAIN re-execution, and delta resolution.
     /// AST construction happens inside the adapter via `build_match_return_query`.
@@ -63,14 +63,14 @@ pub trait LocyExecutionContext: DerivedFactSource {
     /// for the orchestrator path which already returns full `Value::Node` objects).
     /// Override in native adapters to replace UInt64 VID values with full nodes so
     /// that commands like DERIVE can access node properties.
-    async fn lookup_derived_enriched(&self, rule_name: &str) -> Result<Vec<Row>, LocyError> {
+    async fn lookup_derived_enriched(&self, rule_name: &str) -> Result<Vec<FactRow>, LocyError> {
         self.lookup_derived(rule_name)
     }
 
     /// Execute a pre-compiled Cypher read query (e.g. from a `CompiledCommand::Cypher`).
     ///
     /// Used by ASSUME/ABDUCE body dispatch where a Query AST is already available.
-    async fn execute_cypher_read(&self, ast: Query) -> Result<Vec<Row>, LocyError>;
+    async fn execute_cypher_read(&self, ast: Query) -> Result<Vec<FactRow>, LocyError>;
 
     /// Execute a mutation (CREATE/MERGE/DELETE), returning affected row count.
     async fn execute_mutation(

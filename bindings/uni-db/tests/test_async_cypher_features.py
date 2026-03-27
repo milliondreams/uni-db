@@ -20,18 +20,14 @@ async def db_with_data():
     await db.query("CREATE (p:Person {name: 'Alice', age: 30})")
     await db.query("CREATE (p:Person {name: 'Bob', age: 25})")
     await db.query("CREATE (p:Person {name: 'Charlie', age: 35})")
-    await db.query(
-        """
+    await db.query("""
         MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'})
         CREATE (a)-[:KNOWS]->(b)
-    """
-    )
-    await db.query(
-        """
+    """)
+    await db.query("""
         MATCH (b:Person {name: 'Bob'}), (c:Person {name: 'Charlie'})
         CREATE (b)-[:KNOWS]->(c)
-    """
-    )
+    """)
     await db.flush()
     return db
 
@@ -205,13 +201,11 @@ class TestAsyncAggregations:
     @pytest.mark.asyncio
     async def test_group_by_aggregation(self, db):
         """Test aggregation with GROUP BY."""
-        results = await db.query(
-            """
+        results = await db.query("""
             MATCH (p:Product)
             RETURN p.category AS category, sum(p.quantity) AS total_qty
             ORDER BY category
-        """
-        )
+        """)
         assert len(results) == 2
         categories = {r["category"]: r["total_qty"] for r in results}
         assert categories["Books"] == 18
@@ -282,24 +276,18 @@ class TestAsyncPatternMatching:
         await db.query("CREATE (p:Person {name: 'Charlie'})")
         await db.query("CREATE (p:Person {name: 'David'})")
 
-        await db.query(
-            """
+        await db.query("""
             MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'})
             CREATE (a)-[:KNOWS]->(b)
-        """
-        )
-        await db.query(
-            """
+        """)
+        await db.query("""
             MATCH (b:Person {name: 'Bob'}), (c:Person {name: 'Charlie'})
             CREATE (b)-[:KNOWS]->(c)
-        """
-        )
-        await db.query(
-            """
+        """)
+        await db.query("""
             MATCH (a:Person {name: 'Alice'}), (c:Person {name: 'Charlie'})
             CREATE (a)-[:WORKS_WITH]->(c)
-        """
-        )
+        """)
         await db.flush()
         return db
 

@@ -13,7 +13,7 @@ fn v(j: serde_json::Value) -> Value {
 #[test]
 fn test_point_geographic() {
     let arg = v(json!({"latitude": 12.9716, "longitude": 77.5946}));
-    let res = eval_scalar_function("POINT", &[arg]).unwrap();
+    let res = eval_scalar_function("POINT", &[arg], None).unwrap();
 
     assert_eq!(res.get("crs"), Some(&Value::String("WGS84".to_string())));
     assert_eq!(res.get("latitude"), Some(&Value::Float(12.9716)));
@@ -23,7 +23,7 @@ fn test_point_geographic() {
 #[test]
 fn test_point_cartesian() {
     let arg = v(json!({"x": 10.0, "y": 20.0}));
-    let res = eval_scalar_function("POINT", &[arg]).unwrap();
+    let res = eval_scalar_function("POINT", &[arg], None).unwrap();
 
     assert_eq!(
         res.get("crs"),
@@ -38,7 +38,7 @@ fn test_distance_cartesian() {
     let p1 = v(json!({"crs": "Cartesian", "x": 0.0, "y": 0.0}));
     let p2 = v(json!({"crs": "Cartesian", "x": 3.0, "y": 4.0}));
 
-    let res = eval_scalar_function("DISTANCE", &[p1, p2]).unwrap();
+    let res = eval_scalar_function("DISTANCE", &[p1, p2], None).unwrap();
     assert_eq!(res.as_f64().unwrap(), 5.0);
 }
 
@@ -48,7 +48,7 @@ fn test_distance_geographic() {
     let p1 = v(json!({"crs": "WGS84", "latitude": 12.9716, "longitude": 77.5946}));
     let p2 = v(json!({"crs": "WGS84", "latitude": 19.0760, "longitude": 72.8777}));
 
-    let res = eval_scalar_function("DISTANCE", &[p1, p2]).unwrap();
+    let res = eval_scalar_function("DISTANCE", &[p1, p2], None).unwrap();
     let distance_km = res.as_f64().unwrap() / 1000.0;
 
     assert!(distance_km > 800.0 && distance_km < 900.0);
@@ -64,14 +64,19 @@ fn test_within_bbox_cartesian() {
     let res = eval_scalar_function(
         "POINT.WITHINBBOX",
         &[point.clone(), lower_left.clone(), upper_right.clone()],
+        None,
     )
     .unwrap();
     assert!(res.as_bool().unwrap());
 
     // Point outside bbox
     let outside = v(json!({"crs": "Cartesian", "x": 15.0, "y": 5.0}));
-    let res =
-        eval_scalar_function("POINT.WITHINBBOX", &[outside, lower_left, upper_right]).unwrap();
+    let res = eval_scalar_function(
+        "POINT.WITHINBBOX",
+        &[outside, lower_left, upper_right],
+        None,
+    )
+    .unwrap();
     assert!(!res.as_bool().unwrap());
 }
 
@@ -83,11 +88,12 @@ fn test_within_bbox_geographic() {
     let ll = v(json!({"crs": "WGS84", "latitude": 32.0, "longitude": -125.0}));
     let ur = v(json!({"crs": "WGS84", "latitude": 42.0, "longitude": -114.0}));
 
-    let res = eval_scalar_function("POINT.WITHINBBOX", &[sf, ll.clone(), ur.clone()]).unwrap();
+    let res =
+        eval_scalar_function("POINT.WITHINBBOX", &[sf, ll.clone(), ur.clone()], None).unwrap();
     assert!(res.as_bool().unwrap());
 
     // Point in New York (outside California bbox)
     let ny = v(json!({"crs": "WGS84", "latitude": 40.7128, "longitude": -74.0060}));
-    let res = eval_scalar_function("POINT.WITHINBBOX", &[ny, ll, ur]).unwrap();
+    let res = eval_scalar_function("POINT.WITHINBBOX", &[ny, ll, ur], None).unwrap();
     assert!(!res.as_bool().unwrap());
 }

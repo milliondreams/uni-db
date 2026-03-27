@@ -3,17 +3,25 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
+pub mod appender;
 pub mod builder;
 pub mod bulk;
+pub mod hooks;
 pub mod impl_locy;
 pub mod impl_query;
 pub mod locy_builder;
+pub mod locy_result;
+pub mod multi_agent;
+pub mod notifications;
+pub mod prepared;
 pub mod query_builder;
 pub mod schema;
 pub mod session;
 pub mod sync;
+pub mod template;
 pub mod transaction;
 pub mod xervo;
 
@@ -38,47 +46,16 @@ use uni_store::runtime::writer::Writer;
 
 use crate::shutdown::ShutdownHandle;
 
-/// Main entry point for Uni embedded database.
+use std::collections::HashMap;
+
+/// Shared inner state of a Uni database instance.
 ///
-/// Handles storage, schema, and query execution. It coordinates the various
-/// subsystems including the storage engine, query executor, and graph algorithms.
-///
-/// # Examples
-///
-/// ## Local Usage
-/// ```no_run
-/// use uni_db::Uni;
-///
-/// #[tokio::main]
-/// async fn main() -> Result<(), uni_db::UniError> {
-///     let db = Uni::open("./my_db")
-///         .build()
-///         .await?;
-///
-///     // Run a query
-///     let results = db.query("MATCH (n) RETURN count(n)").await?;
-///     println!("Count: {:?}", results);
-///     Ok(())
-/// }
-/// ```
-///
-/// ## Hybrid Storage (S3 + Local)
-/// Store bulk data and catalog metadata in S3 (or GCS/Azure) while keeping WAL/ID allocation local.
-///
-/// ```no_run
-/// use uni_db::Uni;
-///
-/// #[tokio::main]
-/// async fn main() -> Result<(), uni_db::UniError> {
-///     // Requires `object_store` features enabled (aws, gcp, azure)
-///     let db = Uni::open("./local_meta")
-///         .hybrid("./local_meta", "s3://my-bucket/graph-data")
-///         .build()
-///         .await?;
-///     Ok(())
-/// }
-/// ```
-pub struct Uni {
+/// Wrapped in `Arc` by [`Uni`] so that [`Session`](session::Session) and
+/// [`Transaction`](transaction::Transaction) can hold cheap, owned references
+/// without lifetime parameters.
+/// Shared inner state of a Uni database instance. Not intended for direct use.
+#[doc(hidden)]
+pub struct UniInner {
     pub(crate) storage: Arc<StorageManager>,
     pub(crate) schema: Arc<SchemaManager>,
     pub(crate) properties: Arc<PropertyManager>,
@@ -87,11 +64,129 @@ pub struct Uni {
     pub(crate) config: UniConfig,
     pub(crate) procedure_registry: Arc<uni_query::ProcedureRegistry>,
     pub(crate) shutdown_handle: Arc<ShutdownHandle>,
-    /// Session-level registry of pre-compiled Locy rules.
+    /// Global registry of pre-compiled Locy rules.
     ///
-    /// Populated by `locy().compile()` and merged into subsequent `evaluate()`
-    /// calls so that rules defined once persist across multiple evaluations.
+    /// Cloned into every new Session. Use `db.register_rules()` to add rules
+    /// globally, or `session.register_rules()` for session-scoped rules.
     pub(crate) locy_rule_registry: Arc<std::sync::RwLock<impl_locy::LocyRuleRegistry>>,
+    /// Timestamp when this database instance was built.
+    pub(crate) start_time: Instant,
+    /// Broadcast channel for commit notifications.
+    pub(crate) commit_tx: tokio::sync::broadcast::Sender<Arc<notifications::CommitNotification>>,
+    /// Write lease configuration for multi-agent access.
+    pub(crate) write_lease: Option<multi_agent::WriteLease>,
+    /// Number of currently active sessions.
+    pub(crate) active_session_count: AtomicUsize,
+    /// Total queries executed across all sessions.
+    pub(crate) total_queries: AtomicU64,
+    /// Total transactions committed across all sessions.
+    pub(crate) total_commits: AtomicU64,
+    /// Database-level registry of custom scalar functions.
+    pub(crate) custom_functions: Arc<std::sync::RwLock<uni_query::CustomFunctionRegistry>>,
+}
+
+/// Snapshot of database-level metrics.
+#[derive(Debug, Clone)]
+pub struct DatabaseMetrics {
+    /// Current L0 mutation count (cumulative since last flush).
+    pub l0_mutation_count: usize,
+    /// Estimated L0 buffer size in bytes.
+    pub l0_estimated_size_bytes: usize,
+    /// Schema version number.
+    pub schema_version: u32,
+    /// Time since the database instance was created.
+    pub uptime: Duration,
+    /// Number of currently active sessions.
+    pub active_sessions: usize,
+    /// Number of L1 compaction runs completed (0 until storage instrumentation).
+    pub l1_run_count: usize,
+    /// Write throttle pressure (0.0–1.0, 0 until instrumentation).
+    pub write_throttle_pressure: f64,
+    /// Current compaction status, if any.
+    pub compaction_status: Option<String>,
+    /// WAL size in bytes (0 until instrumentation).
+    pub wal_size_bytes: usize,
+    /// WAL log sequence number (0 until instrumentation).
+    pub wal_lsn: u64,
+    /// Total queries executed across all sessions.
+    pub total_queries: u64,
+    /// Total transactions committed across all sessions.
+    pub total_commits: u64,
+}
+
+/// Main entry point for Uni embedded database.
+///
+/// `Uni` is the lifecycle and admin handle. All data access goes through
+/// [`Session`](session::Session) (reads) and [`Transaction`](transaction::Transaction) (writes).
+///
+/// # Examples
+///
+/// ```no_run
+/// use uni_db::Uni;
+///
+/// #[tokio::main]
+/// async fn main() -> Result<(), uni_db::UniError> {
+///     let db = Uni::open("./my_db").build().await?;
+///
+///     // All data access goes through sessions
+///     let session = db.session();
+///     let results = session.query("MATCH (n) RETURN count(n)").await?;
+///     println!("Count: {:?}", results);
+///     Ok(())
+/// }
+/// ```
+pub struct Uni {
+    pub(crate) inner: Arc<UniInner>,
+}
+
+// No Deref<Target = UniInner> — Uni is an opaque handle.
+// All field access goes through `self.inner.field` explicitly.
+
+impl UniInner {
+    /// Open a point-in-time view of the database at the given snapshot.
+    ///
+    /// Returns a new `UniInner` that is pinned to the specified snapshot state.
+    /// The returned instance is read-only.
+    pub(crate) async fn at_snapshot(&self, snapshot_id: &str) -> Result<UniInner> {
+        let manifest = self
+            .storage
+            .snapshot_manager()
+            .load_snapshot(snapshot_id)
+            .await
+            .map_err(UniError::Internal)?;
+
+        let pinned_storage = Arc::new(self.storage.pinned(manifest));
+
+        let prop_manager = Arc::new(PropertyManager::new(
+            pinned_storage.clone(),
+            self.schema.clone(),
+            self.properties.cache_size(),
+        ));
+
+        let shutdown_handle = Arc::new(ShutdownHandle::new(Duration::from_secs(30)));
+
+        let (commit_tx, _) = tokio::sync::broadcast::channel(256);
+        Ok(UniInner {
+            storage: pinned_storage,
+            schema: self.schema.clone(),
+            properties: prop_manager,
+            writer: None,
+            xervo_runtime: self.xervo_runtime.clone(),
+            config: self.config.clone(),
+            procedure_registry: self.procedure_registry.clone(),
+            shutdown_handle,
+            locy_rule_registry: Arc::new(std::sync::RwLock::new(
+                impl_locy::LocyRuleRegistry::default(),
+            )),
+            start_time: Instant::now(),
+            commit_tx,
+            write_lease: None,
+            active_session_count: AtomicUsize::new(0),
+            total_queries: AtomicU64::new(0),
+            total_commits: AtomicU64::new(0),
+            custom_functions: self.custom_functions.clone(),
+        })
+    }
 }
 
 impl Uni {
@@ -138,84 +233,115 @@ impl Uni {
         Self::temporary()
     }
 
-    /// Open a point-in-time view of the database at the given snapshot.
+    // ── Session Factory (primary entry point for data access) ────────
+
+    /// Create a new Session for data access.
     ///
-    /// This returns a new `Uni` instance that is pinned to the specified snapshot state.
-    /// The returned instance is read-only. Used internally by Cypher `VERSION AS OF` / `TIMESTAMP AS OF`.
-    pub(crate) async fn at_snapshot(&self, snapshot_id: &str) -> Result<Uni> {
-        let manifest = self
-            .storage
-            .snapshot_manager()
-            .load_snapshot(snapshot_id)
-            .await
-            .map_err(UniError::Internal)?;
-
-        let pinned_storage = Arc::new(self.storage.pinned(manifest));
-
-        let prop_manager = Arc::new(PropertyManager::new(
-            pinned_storage.clone(),
-            self.schema.clone(),
-            self.properties.cache_size(),
-        ));
-
-        // Create a shutdown handle for this read-only snapshot view
-        // (no background tasks, but needed for consistency)
-        let shutdown_handle = Arc::new(ShutdownHandle::new(Duration::from_secs(30)));
-
-        Ok(Uni {
-            storage: pinned_storage,
-            schema: self.schema.clone(),
-            properties: prop_manager,
-            writer: None,
-            xervo_runtime: self.xervo_runtime.clone(),
-            config: self.config.clone(),
-            procedure_registry: self.procedure_registry.clone(),
-            shutdown_handle,
-            locy_rule_registry: Arc::new(std::sync::RwLock::new(
-                impl_locy::LocyRuleRegistry::default(),
-            )),
-        })
+    /// Sessions are cheap, synchronous, and infallible. All reads go through
+    /// sessions, and sessions are the factory for transactions (writes).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use uni_db::Uni;
+    /// # async fn example(db: &Uni) -> uni_db::Result<()> {
+    /// let session = db.session();
+    /// let rows = session.query("MATCH (n) RETURN n LIMIT 10").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn session(&self) -> session::Session {
+        session::Session::new(self.inner.clone())
     }
 
-    /// Get configuration
+    /// Create a session template builder for pre-configured session factories.
+    ///
+    /// Templates pre-compile Locy rules, bind parameters, and attach hooks
+    /// once, then cheaply stamp out sessions per-request.
+    pub fn session_template(&self) -> template::SessionTemplateBuilder {
+        template::SessionTemplateBuilder::new(self.inner.clone())
+    }
+
+    // ── Database Metrics ──────────────────────────────────────────────
+
+    /// Snapshot the database-level metrics.
+    pub async fn metrics(&self) -> DatabaseMetrics {
+        let l0_mutation_count = self.inner.get_mutation_count().await;
+        let l0_estimated_size_bytes = match self.inner.writer.as_ref() {
+            Some(w) => {
+                let writer = w.read().await;
+                writer.l0_manager.get_current().read().estimated_size
+            }
+            None => 0,
+        };
+        let schema_version = self.inner.schema.schema().schema_version;
+        DatabaseMetrics {
+            l0_mutation_count,
+            l0_estimated_size_bytes,
+            schema_version,
+            uptime: self.inner.start_time.elapsed(),
+            active_sessions: self.inner.active_session_count.load(Ordering::Relaxed),
+            l1_run_count: 0,
+            write_throttle_pressure: 0.0,
+            compaction_status: None,
+            wal_size_bytes: 0,
+            wal_lsn: 0,
+            total_queries: self.inner.total_queries.load(Ordering::Relaxed),
+            total_commits: self.inner.total_commits.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Returns the write lease configuration, if any.
+    /// Write lease enforcement is Phase 2.
+    pub fn write_lease(&self) -> Option<&multi_agent::WriteLease> {
+        self.inner.write_lease.as_ref()
+    }
+
+    // ── Global Locy Rule Management ───────────────────────────────────
+
+    /// Register Locy rules globally. These are cloned into every new Session.
+    pub fn register_rules(&self, program: &str) -> Result<()> {
+        impl_locy::register_rules_on_registry(&self.inner.locy_rule_registry, program)
+    }
+
+    /// Clear all globally registered Locy rules.
+    pub fn clear_rules(&self) {
+        let mut registry = self.inner.locy_rule_registry.write().unwrap();
+        registry.rules.clear();
+        registry.strata.clear();
+    }
+
+    // ── Configuration & Introspection ─────────────────────────────────
+
+    /// Get configuration.
     pub fn config(&self) -> &UniConfig {
-        &self.config
+        &self.inner.config
     }
 
     /// Returns the procedure registry for registering test procedures.
     pub fn procedure_registry(&self) -> &Arc<uni_query::ProcedureRegistry> {
-        &self.procedure_registry
+        &self.inner.procedure_registry
     }
 
-    /// Get current schema (read-only snapshot)
+    /// Get current schema (read-only snapshot).
     pub fn get_schema(&self) -> Arc<uni_common::core::schema::Schema> {
-        self.schema.schema()
+        self.inner.schema.schema()
     }
 
-    /// Create a bulk writer for efficient data loading.
-    pub fn bulk_writer(&self) -> bulk::BulkWriterBuilder<'_> {
-        bulk::BulkWriterBuilder::new(self)
-    }
-
-    /// Create a session builder for scoped query context.
-    pub fn session(&self) -> session::SessionBuilder<'_> {
-        session::SessionBuilder::new(self)
-    }
-
-    /// Get schema manager
+    /// Get schema manager.
     #[doc(hidden)]
     pub fn schema_manager(&self) -> Arc<SchemaManager> {
-        self.schema.clone()
+        self.inner.schema.clone()
     }
 
     #[doc(hidden)]
     pub fn writer(&self) -> Option<Arc<RwLock<Writer>>> {
-        self.writer.clone()
+        self.inner.writer.clone()
     }
 
     #[doc(hidden)]
     pub fn storage(&self) -> Arc<StorageManager> {
-        self.storage.clone()
+        self.inner.storage.clone()
     }
 
     /// Flush all uncommitted changes to persistent storage (L1).
@@ -223,7 +349,7 @@ impl Uni {
     /// This forces a write of the current in-memory buffer (L0) to columnar files.
     /// It also creates a new snapshot.
     pub async fn flush(&self) -> Result<()> {
-        if let Some(writer_lock) = &self.writer {
+        if let Some(writer_lock) = &self.inner.writer {
             let mut writer = writer_lock.write().await;
             writer
                 .flush_to_l1(None)
@@ -242,7 +368,7 @@ impl Uni {
     /// This flushes current changes and records the state.
     /// Returns the snapshot ID.
     pub async fn create_snapshot(&self, name: Option<&str>) -> Result<String> {
-        if let Some(writer_lock) = &self.writer {
+        if let Some(writer_lock) = &self.inner.writer {
             let mut writer = writer_lock.write().await;
             writer
                 .flush_to_l1(name.map(|s| s.to_string()))
@@ -265,7 +391,8 @@ impl Uni {
 
         let snapshot_id = self.create_snapshot(Some(name)).await?;
 
-        self.storage
+        self.inner
+            .storage
             .snapshot_manager()
             .save_named_snapshot(name, &snapshot_id)
             .await
@@ -276,7 +403,7 @@ impl Uni {
 
     /// List all available snapshots.
     pub async fn list_snapshots(&self) -> Result<Vec<SnapshotManifest>> {
-        let sm = self.storage.snapshot_manager();
+        let sm = self.inner.storage.snapshot_manager();
         let ids = sm.list_snapshots().await.map_err(UniError::Internal)?;
         let mut manifests = Vec::new();
         for id in ids {
@@ -292,7 +419,8 @@ impl Uni {
     /// **Note**: This currently requires a restart or re-opening of Uni to fully take effect
     /// as it only updates the latest pointer.
     pub async fn restore_snapshot(&self, snapshot_id: &str) -> Result<()> {
-        self.storage
+        self.inner
+            .storage
             .snapshot_manager()
             .set_latest_snapshot(snapshot_id)
             .await
@@ -301,22 +429,34 @@ impl Uni {
 
     /// Check if a label exists in the schema.
     pub async fn label_exists(&self, name: &str) -> Result<bool> {
-        Ok(self.schema.schema().labels.get(name).is_some_and(|l| {
-            matches!(
-                l.state,
-                uni_common::core::schema::SchemaElementState::Active
-            )
-        }))
+        Ok(self
+            .inner
+            .schema
+            .schema()
+            .labels
+            .get(name)
+            .is_some_and(|l| {
+                matches!(
+                    l.state,
+                    uni_common::core::schema::SchemaElementState::Active
+                )
+            }))
     }
 
     /// Check if an edge type exists in the schema.
     pub async fn edge_type_exists(&self, name: &str) -> Result<bool> {
-        Ok(self.schema.schema().edge_types.get(name).is_some_and(|e| {
-            matches!(
-                e.state,
-                uni_common::core::schema::SchemaElementState::Active
-            )
-        }))
+        Ok(self
+            .inner
+            .schema
+            .schema()
+            .edge_types
+            .get(name)
+            .is_some_and(|e| {
+                matches!(
+                    e.state,
+                    uni_common::core::schema::SchemaElementState::Active
+                )
+            }))
     }
 
     /// Get all label names.
@@ -328,7 +468,7 @@ impl Uni {
         let mut all_labels = std::collections::HashSet::new();
 
         // Schema labels (covers schema-defined labels that may not have data yet)
-        for (name, label) in self.schema.schema().labels.iter() {
+        for (name, label) in self.inner.schema.schema().labels.iter() {
             if matches!(
                 label.state,
                 uni_common::core::schema::SchemaElementState::Active
@@ -339,8 +479,8 @@ impl Uni {
 
         // Data labels (covers schemaless labels that aren't in the schema)
         let query = "MATCH (n) RETURN DISTINCT labels(n) AS labels";
-        let result = self.query(query).await?;
-        for row in &result.rows {
+        let result = self.inner.execute_internal(query, HashMap::new()).await?;
+        for row in result.rows() {
             if let Ok(labels_list) = row.get::<Vec<String>>("labels") {
                 for label in labels_list {
                     all_labels.insert(label);
@@ -354,6 +494,7 @@ impl Uni {
     /// Get all edge type names.
     pub async fn list_edge_types(&self) -> Result<Vec<String>> {
         Ok(self
+            .inner
             .schema
             .schema()
             .edge_types
@@ -373,9 +514,9 @@ impl Uni {
         &self,
         name: &str,
     ) -> Result<Option<crate::api::schema::LabelInfo>> {
-        let schema = self.schema.schema();
+        let schema = self.inner.schema.schema();
         if schema.labels.contains_key(name) {
-            let count = if let Ok(ds) = self.storage.vertex_dataset(name) {
+            let count = if let Ok(ds) = self.inner.storage.vertex_dataset(name) {
                 if let Ok(raw) = ds.open_raw().await {
                     raw.count_rows(None)
                         .await
@@ -484,7 +625,8 @@ impl Uni {
         &self,
         label: &str,
     ) -> Result<uni_store::compaction::CompactionStats> {
-        self.storage
+        self.inner
+            .storage
             .compact_label(label)
             .await
             .map_err(UniError::Internal)
@@ -495,7 +637,8 @@ impl Uni {
         &self,
         edge_type: &str,
     ) -> Result<uni_store::compaction::CompactionStats> {
-        self.storage
+        self.inner
+            .storage
             .compact_edge_type(edge_type)
             .await
             .map_err(UniError::Internal)
@@ -505,105 +648,11 @@ impl Uni {
     ///
     /// Useful for tests or ensuring consistent performance before benchmarks.
     pub async fn wait_for_compaction(&self) -> Result<()> {
-        self.storage
+        self.inner
+            .storage
             .wait_for_compaction()
             .await
             .map_err(UniError::Internal)
-    }
-
-    /// Bulk insert vertices for a given label.
-    ///
-    /// This is a low-level API intended for bulk loading and benchmarking.
-    /// Each properties map should contain all property values as JSON.
-    ///
-    /// Returns the allocated VIDs in the same order as the input.
-    pub async fn bulk_insert_vertices(
-        &self,
-        label: &str,
-        properties_list: Vec<uni_common::Properties>,
-    ) -> Result<Vec<uni_common::core::id::Vid>> {
-        let schema = self.schema.schema();
-        // Validate label exists in schema
-        schema
-            .labels
-            .get(label)
-            .ok_or_else(|| UniError::LabelNotFound {
-                label: label.to_string(),
-            })?;
-        if let Some(writer_lock) = &self.writer {
-            let mut writer = writer_lock.write().await;
-
-            if properties_list.is_empty() {
-                return Ok(Vec::new());
-            }
-
-            // NEW: Batch allocate VIDs (single call)
-            let vids = writer
-                .allocate_vids(properties_list.len())
-                .await
-                .map_err(UniError::Internal)?;
-
-            // NEW: Use optimized batch insert
-            let _props = writer
-                .insert_vertices_batch(vids.clone(), properties_list, vec![label.to_string()])
-                .await
-                .map_err(UniError::Internal)?;
-
-            Ok(vids)
-        } else {
-            Err(UniError::ReadOnly {
-                operation: "bulk_insert_vertices".to_string(),
-            })
-        }
-    }
-
-    /// Bulk insert edges for a given edge type using pre-allocated VIDs.
-    ///
-    /// This is a low-level API intended for bulk loading and benchmarking.
-    /// Each tuple is (src_vid, dst_vid, properties).
-    pub async fn bulk_insert_edges(
-        &self,
-        edge_type: &str,
-        edges: Vec<(
-            uni_common::core::id::Vid,
-            uni_common::core::id::Vid,
-            uni_common::Properties,
-        )>,
-    ) -> Result<()> {
-        let schema = self.schema.schema();
-        let edge_meta =
-            schema
-                .edge_types
-                .get(edge_type)
-                .ok_or_else(|| UniError::EdgeTypeNotFound {
-                    edge_type: edge_type.to_string(),
-                })?;
-        let type_id = edge_meta.id;
-
-        if let Some(writer_lock) = &self.writer {
-            let mut writer = writer_lock.write().await;
-
-            for (src_vid, dst_vid, props) in edges {
-                let eid = writer.next_eid(type_id).await.map_err(UniError::Internal)?;
-                writer
-                    .insert_edge(
-                        src_vid,
-                        dst_vid,
-                        type_id,
-                        eid,
-                        props,
-                        Some(edge_type.to_string()),
-                    )
-                    .await
-                    .map_err(UniError::Internal)?;
-            }
-
-            Ok(())
-        } else {
-            Err(UniError::ReadOnly {
-                operation: "bulk_insert_edges".to_string(),
-            })
-        }
     }
 
     /// Get the status of background index rebuild tasks.
@@ -622,9 +671,9 @@ impl Uni {
     /// ```
     pub async fn index_rebuild_status(&self) -> Result<Vec<uni_store::storage::IndexRebuildTask>> {
         let manager = uni_store::storage::IndexRebuildManager::new(
-            self.storage.clone(),
-            self.schema.clone(),
-            self.config.index_rebuild.clone(),
+            self.inner.storage.clone(),
+            self.inner.schema.clone(),
+            self.inner.config.index_rebuild.clone(),
         )
         .await
         .map_err(UniError::Internal)?;
@@ -643,9 +692,9 @@ impl Uni {
     /// A vector of task IDs that were scheduled for retry.
     pub async fn retry_index_rebuilds(&self) -> Result<Vec<String>> {
         let manager = uni_store::storage::IndexRebuildManager::new(
-            self.storage.clone(),
-            self.schema.clone(),
-            self.config.index_rebuild.clone(),
+            self.inner.storage.clone(),
+            self.inner.schema.clone(),
+            self.inner.config.index_rebuild.clone(),
         )
         .await
         .map_err(UniError::Internal)?;
@@ -655,8 +704,8 @@ impl Uni {
         // Start background worker to process the retried tasks
         if !retried.is_empty() {
             let manager = std::sync::Arc::new(manager);
-            let handle = manager.start_background_worker(self.shutdown_handle.subscribe());
-            self.shutdown_handle.track_task(handle);
+            let handle = manager.start_background_worker(self.inner.shutdown_handle.subscribe());
+            self.inner.shutdown_handle.track_task(handle);
         }
 
         Ok(retried)
@@ -676,9 +725,9 @@ impl Uni {
     pub async fn rebuild_indexes(&self, label: &str, async_: bool) -> Result<Option<String>> {
         if async_ {
             let manager = uni_store::storage::IndexRebuildManager::new(
-                self.storage.clone(),
-                self.schema.clone(),
-                self.config.index_rebuild.clone(),
+                self.inner.storage.clone(),
+                self.inner.schema.clone(),
+                self.inner.config.index_rebuild.clone(),
             )
             .await
             .map_err(UniError::Internal)?;
@@ -689,15 +738,15 @@ impl Uni {
                 .map_err(UniError::Internal)?;
 
             let manager = std::sync::Arc::new(manager);
-            let handle = manager.start_background_worker(self.shutdown_handle.subscribe());
-            self.shutdown_handle.track_task(handle);
+            let handle = manager.start_background_worker(self.inner.shutdown_handle.subscribe());
+            self.inner.shutdown_handle.track_task(handle);
 
             Ok(task_ids.into_iter().next())
         } else {
             let idx_mgr = uni_store::storage::IndexManager::new(
-                self.storage.base_path(),
-                self.schema.clone(),
-                self.storage.lancedb_store_arc(),
+                self.inner.storage.base_path(),
+                self.inner.schema.clone(),
+                self.inner.storage.lancedb_store_arc(),
             );
             idx_mgr
                 .rebuild_indexes_for_label(label)
@@ -713,9 +762,9 @@ impl Uni {
     /// for the specified label.
     pub async fn is_index_building(&self, label: &str) -> Result<bool> {
         let manager = uni_store::storage::IndexRebuildManager::new(
-            self.storage.clone(),
-            self.schema.clone(),
-            self.config.index_rebuild.clone(),
+            self.inner.storage.clone(),
+            self.inner.schema.clone(),
+            self.inner.config.index_rebuild.clone(),
         )
         .await
         .map_err(UniError::Internal)?;
@@ -725,7 +774,7 @@ impl Uni {
 
     /// List all indexes defined on a specific label.
     pub fn list_indexes(&self, label: &str) -> Vec<uni_common::core::schema::IndexDefinition> {
-        let schema = self.schema.schema();
+        let schema = self.inner.schema.schema();
         schema
             .indexes
             .iter()
@@ -736,7 +785,7 @@ impl Uni {
 
     /// List all indexes in the database.
     pub fn list_all_indexes(&self) -> Vec<uni_common::core::schema::IndexDefinition> {
-        self.schema.schema().indexes.clone()
+        self.inner.schema.schema().indexes.clone()
     }
 
     /// Shutdown the database gracefully, flushing pending data and stopping background tasks.
@@ -745,14 +794,15 @@ impl Uni {
     /// (with a timeout). After calling this method, the database instance should not be used.
     pub async fn shutdown(self) -> Result<()> {
         // Flush pending data
-        if let Some(ref writer) = self.writer {
+        if let Some(ref writer) = self.inner.writer {
             let mut w = writer.write().await;
             if let Err(e) = w.flush_to_l1(None).await {
                 tracing::error!("Error flushing during shutdown: {}", e);
             }
         }
 
-        self.shutdown_handle
+        self.inner
+            .shutdown_handle
             .shutdown_async()
             .await
             .map_err(UniError::Internal)
@@ -761,7 +811,7 @@ impl Uni {
 
 impl Drop for Uni {
     fn drop(&mut self) {
-        self.shutdown_handle.shutdown_blocking();
+        self.inner.shutdown_handle.shutdown_blocking();
         tracing::debug!("Uni dropped, shutdown signal sent");
     }
 }
@@ -777,6 +827,8 @@ pub struct UniBuilder {
     cloud_config: Option<CloudStorageConfig>,
     create_if_missing: bool,
     fail_if_exists: bool,
+    read_only: bool,
+    write_lease: Option<multi_agent::WriteLease>,
 }
 
 impl UniBuilder {
@@ -791,6 +843,8 @@ impl UniBuilder {
             cloud_config: None,
             create_if_missing: true,
             fail_if_exists: false,
+            read_only: false,
+            write_lease: None,
         }
     }
 
@@ -869,6 +923,25 @@ impl UniBuilder {
     /// ```
     pub fn cloud_config(mut self, config: CloudStorageConfig) -> Self {
         self.cloud_config = Some(config);
+        self
+    }
+
+    /// Open the database in read-only mode.
+    ///
+    /// In read-only mode, no writer is created. All write operations
+    /// (`tx()`, `execute()`, `bulk_writer()`, `appender()`) will return
+    /// `ReadOnly` errors. Reads work normally.
+    pub fn read_only(mut self) -> Self {
+        self.read_only = true;
+        self
+    }
+
+    /// Set the write lease strategy for multi-agent access.
+    ///
+    /// This configures how write access is coordinated when multiple
+    /// processes share the same database.
+    pub fn write_lease(mut self, lease: multi_agent::WriteLease) -> Self {
+        self.write_lease = Some(lease);
         self
     }
 
@@ -1380,18 +1453,32 @@ impl UniBuilder {
             shutdown_handle.track_task(handle);
         }
 
+        let (commit_tx, _) = tokio::sync::broadcast::channel(256);
+        let writer_field = if self.read_only { None } else { Some(writer) };
+
         Ok(Uni {
-            storage,
-            schema: schema_manager,
-            properties: prop_manager,
-            writer: Some(writer),
-            xervo_runtime,
-            config: self.config,
-            procedure_registry: Arc::new(uni_query::ProcedureRegistry::new()),
-            shutdown_handle,
-            locy_rule_registry: Arc::new(std::sync::RwLock::new(
-                impl_locy::LocyRuleRegistry::default(),
-            )),
+            inner: Arc::new(UniInner {
+                storage,
+                schema: schema_manager,
+                properties: prop_manager,
+                writer: writer_field,
+                xervo_runtime,
+                config: self.config,
+                procedure_registry: Arc::new(uni_query::ProcedureRegistry::new()),
+                shutdown_handle,
+                locy_rule_registry: Arc::new(std::sync::RwLock::new(
+                    impl_locy::LocyRuleRegistry::default(),
+                )),
+                start_time: Instant::now(),
+                commit_tx,
+                write_lease: self.write_lease,
+                active_session_count: AtomicUsize::new(0),
+                total_queries: AtomicU64::new(0),
+                total_commits: AtomicU64::new(0),
+                custom_functions: Arc::new(std::sync::RwLock::new(
+                    uni_query::CustomFunctionRegistry::new(),
+                )),
+            }),
         })
     }
 

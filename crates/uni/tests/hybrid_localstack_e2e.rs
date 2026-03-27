@@ -40,15 +40,20 @@ async fn test_hybrid_localstack_from_zero_e2e() -> Result<()> {
         .apply()
         .await?;
 
-    db.execute("CREATE (:Person {name: 'Alice'})").await?;
-    db.execute("CREATE (:Person {name: 'Bob'})").await?;
-    db.execute(
-        "
+    db.session()
+        .execute("CREATE (:Person {name: 'Alice'})")
+        .await?;
+    db.session()
+        .execute("CREATE (:Person {name: 'Bob'})")
+        .await?;
+    db.session()
+        .execute(
+            "
         MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'})
         CREATE (a)-[:KNOWS {since: 2024}]->(b)
     ",
-    )
-    .await?;
+        )
+        .await?;
     db.flush().await?;
     drop(db);
 
@@ -59,10 +64,14 @@ async fn test_hybrid_localstack_from_zero_e2e() -> Result<()> {
         .build()
         .await?;
 
-    let res = db.query("MATCH (p:Person) RETURN count(p) AS c").await?;
+    let res = db
+        .session()
+        .query("MATCH (p:Person) RETURN count(p) AS c")
+        .await?;
     assert_eq!(res.rows()[0].get::<i64>("c")?, 2);
 
     let rel = db
+        .session()
         .query("MATCH (a:Person)-[k:KNOWS]->(b:Person) RETURN a.name, b.name, k.since")
         .await?;
     assert_eq!(rel.len(), 1);
@@ -71,7 +80,9 @@ async fn test_hybrid_localstack_from_zero_e2e() -> Result<()> {
     assert_eq!(rel.rows()[0].get::<i64>("k.since")?, 2024);
 
     // Mutate after reopen, flush, and verify again after another reopen.
-    db.execute("CREATE (:Person {name: 'Carol'})").await?;
+    db.session()
+        .execute("CREATE (:Person {name: 'Carol'})")
+        .await?;
     db.flush().await?;
     drop(db);
 
@@ -81,7 +92,10 @@ async fn test_hybrid_localstack_from_zero_e2e() -> Result<()> {
         .build()
         .await?;
 
-    let res = db.query("MATCH (p:Person) RETURN count(p) AS c").await?;
+    let res = db
+        .session()
+        .query("MATCH (p:Person) RETURN count(p) AS c")
+        .await?;
     assert_eq!(res.rows()[0].get::<i64>("c")?, 3);
     drop(db);
 

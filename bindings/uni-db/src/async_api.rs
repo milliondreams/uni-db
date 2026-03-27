@@ -107,6 +107,7 @@ impl AsyncDatabase {
             xervo_catalog_file: None,
             cloud_config: None,
             uni_config: None,
+            read_only: false,
         }
     }
 
@@ -158,14 +159,14 @@ impl AsyncDatabase {
                 let rows = core::query_builder_core(&inner, &cypher, rust_params, timeout, None)
                     .await
                     .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
-                Python::attach(|py| convert::rows_to_py(py, rows.rows))
+                Python::attach(|py| convert::rows_to_py(py, rows.into_rows()))
             })
         } else {
             pyo3_async_runtimes::tokio::future_into_py(py, async move {
                 let rows = core::query_core(&inner, &cypher, rust_params)
                     .await
                     .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
-                Python::attach(|py| convert::rows_to_py(py, rows.rows))
+                Python::attach(|py| convert::rows_to_py(py, rows.into_rows()))
             })
         }
     }
@@ -186,7 +187,7 @@ impl AsyncDatabase {
                 let rows = core::query_builder_core(&inner, &cypher, rust_params, timeout, None)
                     .await
                     .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
-                Ok(rows.rows.len())
+                Ok(rows.len())
             })
         } else if rust_params.is_empty() {
             pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -266,7 +267,7 @@ impl AsyncDatabase {
                 .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
 
             Python::attach(|py| {
-                let rows = convert::rows_to_py(py, results.rows)?;
+                let rows = convert::rows_to_py(py, results.into_rows())?;
 
                 let profile_dict = PyDict::new(py);
                 profile_dict.set_item("total_time_ms", profile.total_time_ms)?;
@@ -314,12 +315,13 @@ impl AsyncDatabase {
     fn begin<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            core::begin_transaction_core(&inner)
+            let session = inner.session();
+            let tx = session
+                .tx()
                 .await
-                .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
             Ok(AsyncTransaction {
-                inner,
-                completed: false,
+                inner: Arc::new(tokio::sync::Mutex::new(Some(tx))),
             })
         })
     }
@@ -546,8 +548,15 @@ impl AsyncDatabase {
     // Session Methods
     // ========================================================================
 
-    /// Create an async session builder.
-    fn session(&self) -> AsyncSessionBuilder {
+    /// Create a new async session wrapping a real Rust Session.
+    fn session(&self) -> AsyncSession {
+        AsyncSession {
+            inner: Arc::new(tokio::sync::Mutex::new(self.inner.session())),
+        }
+    }
+
+    /// Create an async session builder for setting variables before building.
+    fn session_builder(&self) -> AsyncSessionBuilder {
         AsyncSessionBuilder {
             inner: self.inner.clone(),
             variables: HashMap::new(),
@@ -640,32 +649,42 @@ impl AsyncDatabase {
     fn transaction<'py>(&self, py: Python<'py>, func: Py<PyAny>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            // Begin transaction
-            core::begin_transaction_core(&inner)
+            // Create session and begin transaction
+            let session = inner.session();
+            let tx = session
+                .tx()
                 .await
-                .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
-            let tx = AsyncTransaction {
-                inner: inner.clone(),
-                completed: false,
+            let tx_mutex = Arc::new(tokio::sync::Mutex::new(Some(tx)));
+            let async_tx = AsyncTransaction {
+                inner: tx_mutex.clone(),
             };
 
             // Call the async function and convert coroutine to a Rust future
             let fut = Python::attach(|py| -> PyResult<_> {
-                let tx_obj = Py::new(py, tx)?;
+                let tx_obj = Py::new(py, async_tx)?;
                 let coro = func.call1(py, (tx_obj,))?;
                 pyo3_async_runtimes::tokio::into_future(coro.bind(py).clone())
             })?;
 
             match fut.await {
                 Ok(val) => {
-                    core::commit_transaction_core(&inner)
-                        .await
-                        .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
+                    // Auto-commit on success if transaction is still active
+                    let mut guard = tx_mutex.lock().await;
+                    if let Some(tx) = guard.take() {
+                        tx.commit().await.map_err(|e| {
+                            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
+                        })?;
+                    }
                     Ok(val)
                 }
                 Err(e) => {
-                    let _ = core::rollback_transaction_core(&inner).await;
+                    // Auto-rollback on error if transaction is still active
+                    let mut guard = tx_mutex.lock().await;
+                    if let Some(tx) = guard.take() {
+                        tx.rollback();
+                    }
                     Err(e)
                 }
             }
@@ -906,14 +925,13 @@ impl AsyncLocyEngine {
     /// Register Locy rules for reuse across multiple evaluate calls.
     fn register(&self, program: &str) -> PyResult<()> {
         self.inner
-            .locy()
-            .register(program)
+            .register_rules(program)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
     }
 
     /// Clear all registered Locy rules.
     fn clear_registry(&self) -> PyResult<()> {
-        self.inner.locy().clear_registry();
+        self.inner.clear_rules();
         Ok(())
     }
 
@@ -1151,6 +1169,7 @@ pub struct AsyncDatabaseBuilder {
     xervo_catalog_file: Option<String>,
     cloud_config: Option<uni_common::CloudStorageConfig>,
     uni_config: Option<uni_common::UniConfig>,
+    read_only: bool,
 }
 
 #[pymethods]
@@ -1170,6 +1189,7 @@ impl AsyncDatabaseBuilder {
             xervo_catalog_file: None,
             cloud_config: None,
             uni_config: None,
+            read_only: false,
         }
     }
 
@@ -1188,6 +1208,7 @@ impl AsyncDatabaseBuilder {
             xervo_catalog_file: None,
             cloud_config: None,
             uni_config: None,
+            read_only: false,
         }
     }
 
@@ -1206,6 +1227,7 @@ impl AsyncDatabaseBuilder {
             xervo_catalog_file: None,
             cloud_config: None,
             uni_config: None,
+            read_only: false,
         }
     }
 
@@ -1224,6 +1246,7 @@ impl AsyncDatabaseBuilder {
             xervo_catalog_file: None,
             cloud_config: None,
             uni_config: None,
+            read_only: false,
         }
     }
 
@@ -1296,6 +1319,12 @@ impl AsyncDatabaseBuilder {
         Ok(slf)
     }
 
+    /// Open the database in read-only mode (no writes allowed).
+    fn read_only(mut slf: PyRefMut<'_, Self>) -> PyRefMut<'_, Self> {
+        slf.read_only = true;
+        slf
+    }
+
     /// Build and return the AsyncDatabase instance (returns awaitable).
     fn build<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let uri = self.uri.clone();
@@ -1309,6 +1338,7 @@ impl AsyncDatabaseBuilder {
         let xervo_catalog_file = self.xervo_catalog_file.clone();
         let cloud_config = self.cloud_config.clone();
         let uni_config = self.uni_config.clone();
+        let read_only = self.read_only;
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let uni = core::build_database_core(
@@ -1323,6 +1353,7 @@ impl AsyncDatabaseBuilder {
                 xervo_catalog_file.as_deref(),
                 cloud_config,
                 uni_config,
+                read_only,
             )
             .await
             .map_err(PyErr::new::<pyo3::exceptions::PyIOError, _>)?;
@@ -1339,10 +1370,12 @@ impl AsyncDatabaseBuilder {
 // ============================================================================
 
 /// An async database transaction.
+///
+/// Wraps a Rust `Transaction` which provides ACID guarantees.
+/// Use as an async context manager for automatic rollback on error.
 #[pyclass]
 pub struct AsyncTransaction {
-    inner: Arc<Uni>,
-    completed: bool,
+    pub(crate) inner: Arc<tokio::sync::Mutex<Option<::uni_db::Transaction>>>,
 }
 
 #[pymethods]
@@ -1355,18 +1388,37 @@ impl AsyncTransaction {
         cypher: String,
         params: Option<HashMap<String, Py<PyAny>>>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        if self.completed {
-            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                "Transaction already completed",
-            ));
-        }
-        let rust_params = convert::prepare_params(py, params)?;
+        let rust_params = if let Some(p) = params {
+            let mut map = HashMap::new();
+            for (k, v) in p {
+                let val = convert::py_object_to_value(py, &v)?;
+                map.insert(k, val);
+            }
+            Some(map)
+        } else {
+            None
+        };
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let rows = core::query_core(&inner, &cypher, rust_params)
-                .await
-                .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
-            Python::attach(|py| convert::rows_to_py(py, rows.rows))
+            let guard = inner.lock().await;
+            let tx = guard.as_ref().ok_or_else(|| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Transaction already completed")
+            })?;
+            let result = if let Some(params) = rust_params {
+                let mut builder = tx.query_with(&cypher);
+                for (k, v) in params {
+                    builder = builder.param(&k, v);
+                }
+                builder
+                    .fetch_all()
+                    .await
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+            } else {
+                tx.query(&cypher)
+                    .await
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+            };
+            Python::attach(|py| convert::rows_to_py(py, result.into_rows()))
         })
     }
 
@@ -1378,73 +1430,95 @@ impl AsyncTransaction {
         cypher: String,
         params: Option<HashMap<String, Py<PyAny>>>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        if self.completed {
-            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                "Transaction already completed",
-            ));
-        }
-        let rust_params = convert::prepare_params(py, params)?;
-        let inner = self.inner.clone();
-        if rust_params.is_empty() {
-            pyo3_async_runtimes::tokio::future_into_py(py, async move {
-                core::execute_core(&inner, &cypher)
-                    .await
-                    .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
-            })
+        let rust_params = if let Some(p) = params {
+            let mut map = HashMap::new();
+            for (k, v) in p {
+                let val = convert::py_object_to_value(py, &v)?;
+                map.insert(k, val);
+            }
+            Some(map)
         } else {
-            pyo3_async_runtimes::tokio::future_into_py(py, async move {
-                core::execute_with_params_core(&inner, &cypher, rust_params)
+            None
+        };
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let guard = inner.lock().await;
+            let tx = guard.as_ref().ok_or_else(|| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Transaction already completed")
+            })?;
+            let result = if let Some(params) = rust_params {
+                let mut builder = tx.query_with(&cypher);
+                for (k, v) in params {
+                    builder = builder.param(&k, v);
+                }
+                builder
+                    .execute()
                     .await
-                    .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
-            })
-        }
-    }
-
-    /// Create an async query builder for this transaction.
-    fn query_with(&self, cypher: String) -> PyResult<AsyncQueryBuilder> {
-        if self.completed {
-            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                "Transaction already completed",
-            ));
-        }
-        Ok(AsyncQueryBuilder {
-            inner: self.inner.clone(),
-            cypher,
-            params: HashMap::new(),
-            timeout_secs: None,
-            max_memory: None,
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+            } else {
+                tx.execute(&cypher)
+                    .await
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+            };
+            Ok(result.affected_rows())
         })
     }
 
-    /// Commit the transaction.
-    fn commit<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        if self.completed {
-            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                "Transaction already completed",
-            ));
-        }
-        self.completed = true;
+    /// Commit the transaction, returning a CommitResult.
+    fn commit<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            core::commit_transaction_core(&inner)
+            let mut guard = inner.lock().await;
+            let tx = guard.take().ok_or_else(|| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Transaction already completed")
+            })?;
+            let result = tx
+                .commit()
                 .await
-                .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Python::attach(|py| {
+                Ok(crate::types::PyCommitResult::from(result)
+                    .into_pyobject(py)?
+                    .into_any()
+                    .unbind())
+            })
         })
     }
 
     /// Rollback the transaction.
-    fn rollback<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        if self.completed {
-            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                "Transaction already completed",
-            ));
-        }
-        self.completed = true;
+    fn rollback<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            core::rollback_transaction_core(&inner)
-                .await
-                .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+            let mut guard = inner.lock().await;
+            let tx = guard.take().ok_or_else(|| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Transaction already completed")
+            })?;
+            tx.rollback();
+            Ok(())
+        })
+    }
+
+    /// Get the transaction ID.
+    fn id<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let guard = inner.lock().await;
+            let tx = guard.as_ref().ok_or_else(|| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Transaction already completed")
+            })?;
+            Ok(tx.id().to_string())
+        })
+    }
+
+    /// Check if the transaction has uncommitted changes.
+    fn is_dirty<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let guard = inner.lock().await;
+            let tx = guard.as_ref().ok_or_else(|| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Transaction already completed")
+            })?;
+            Ok(tx.is_dirty())
         })
     }
 
@@ -1454,32 +1528,22 @@ impl AsyncTransaction {
         pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok(obj) })
     }
 
-    /// Async context manager exit — commits on success, rolls back on error.
+    /// Async context manager exit — rolls back if still active.
+    #[pyo3(signature = (_exc_type=None, _exc_val=None, _exc_tb=None))]
     fn __aexit__<'py>(
-        &mut self,
+        &self,
         py: Python<'py>,
-        exc_type: Py<PyAny>,
-        _exc_val: Py<PyAny>,
-        _exc_tb: Py<PyAny>,
+        _exc_type: Option<Py<PyAny>>,
+        _exc_val: Option<Py<PyAny>>,
+        _exc_tb: Option<Py<PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        if self.completed {
-            // Already committed or rolled back
-            return pyo3_async_runtimes::tokio::future_into_py(py, async move {
-                Ok(false) // Don't suppress exceptions
-            });
-        }
-        self.completed = true;
         let inner = self.inner.clone();
-        let has_exception = !exc_type.is_none(py);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            if has_exception {
-                core::rollback_transaction_core(&inner)
-                    .await
-                    .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
-            } else {
-                core::commit_transaction_core(&inner)
-                    .await
-                    .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
+            let mut guard = inner.lock().await;
+            if let Some(tx) = guard.take() {
+                // Transaction still active — roll it back.
+                // The Rust Drop impl will also auto-rollback, but explicit is clearer.
+                tx.rollback();
             }
             Ok(false) // Don't suppress exceptions
         })
@@ -1512,54 +1576,64 @@ impl AsyncSessionBuilder {
         Ok(slf)
     }
 
-    /// Build the session.
+    /// Build the session, returning an AsyncSession wrapping a real Rust Session.
     fn build(&self) -> PyResult<AsyncSession> {
+        let mut rust_session = self.inner.session();
+        for (k, v) in &self.variables {
+            let val = ::uni_db::Value::from(v.clone());
+            rust_session.set(k.clone(), val);
+        }
         Ok(AsyncSession {
-            inner: self.inner.clone(),
-            variables: self.variables.clone(),
+            inner: Arc::new(tokio::sync::Mutex::new(rust_session)),
         })
     }
 }
 
 /// An async query session with scoped variables.
+///
+/// Sessions are the primary scope for reads and the factory for transactions.
+/// Create via `db.session()` or `AsyncSessionBuilder`.
 #[pyclass]
-#[derive(Clone)]
 pub struct AsyncSession {
-    inner: Arc<Uni>,
-    variables: HashMap<String, serde_json::Value>,
-}
-
-impl AsyncSession {
-    /// Build session params: creates a nested Value::Map under key "session".
-    fn build_session_params(
-        &self,
-        py: Python,
-        params: Option<HashMap<String, Py<PyAny>>>,
-    ) -> PyResult<HashMap<String, ::uni_db::Value>> {
-        let mut rust_params = HashMap::new();
-
-        // Build session variable map
-        let mut session_map = HashMap::new();
-        for (k, v) in &self.variables {
-            let val = ::uni_db::Value::from(v.clone());
-            session_map.insert(k.clone(), val);
-        }
-        rust_params.insert("session".to_string(), ::uni_db::Value::Map(session_map));
-
-        // Add query params (may override if same key)
-        if let Some(p) = params {
-            for (k, v) in p {
-                let val = convert::py_object_to_value(py, &v)?;
-                rust_params.insert(k, val);
-            }
-        }
-
-        Ok(rust_params)
-    }
+    pub(crate) inner: Arc<tokio::sync::Mutex<::uni_db::Session>>,
 }
 
 #[pymethods]
 impl AsyncSession {
+    /// Set a session-scoped parameter.
+    fn set<'py>(
+        &self,
+        py: Python<'py>,
+        key: String,
+        value: Py<PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let val = convert::py_object_to_value(py, &value)?;
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let mut guard = inner.lock().await;
+            guard.set(key, val);
+            Ok(())
+        })
+    }
+
+    /// Get a session-scoped parameter.
+    fn get<'py>(&self, py: Python<'py>, key: String) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let guard = inner.lock().await;
+            match guard.get(&key) {
+                Some(v) => {
+                    let cloned = v.clone();
+                    Python::attach(|py| {
+                        let py_val = convert::value_to_py(py, &cloned)?;
+                        Ok(Some(py_val))
+                    })
+                }
+                None => Ok(None),
+            }
+        })
+    }
+
     /// Execute a query with session variables.
     #[pyo3(signature = (cypher, params=None))]
     fn query<'py>(
@@ -1568,44 +1642,184 @@ impl AsyncSession {
         cypher: String,
         params: Option<HashMap<String, Py<PyAny>>>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let rust_params = self.build_session_params(py, params)?;
+        let rust_params = if let Some(p) = params {
+            let mut map = HashMap::new();
+            for (k, v) in p {
+                let val = convert::py_object_to_value(py, &v)?;
+                map.insert(k, val);
+            }
+            Some(map)
+        } else {
+            None
+        };
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let rows = core::query_core(&inner, &cypher, rust_params)
-                .await
-                .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
-            Python::attach(|py| convert::rows_to_py(py, rows.rows))
+            let guard = inner.lock().await;
+            let result =
+                if let Some(params) = rust_params {
+                    let mut builder = guard.query_with(&cypher);
+                    for (k, v) in params {
+                        builder = builder.param(k, v);
+                    }
+                    builder.fetch_all().await.map_err(|e| {
+                        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
+                    })?
+                } else {
+                    guard.query(&cypher).await.map_err(|e| {
+                        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
+                    })?
+                };
+            Python::attach(|py| convert::rows_to_py(py, result.into_rows()))
         })
     }
 
-    /// Execute a mutation query.
-    fn execute<'py>(&self, py: Python<'py>, cypher: String) -> PyResult<Bound<'py, PyAny>> {
-        let rust_params = self.build_session_params(py, None)?;
+    /// Execute a mutation query, returning affected row count.
+    #[pyo3(signature = (cypher, params=None))]
+    fn execute<'py>(
+        &self,
+        py: Python<'py>,
+        cypher: String,
+        params: Option<HashMap<String, Py<PyAny>>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let rust_params = if let Some(p) = params {
+            let mut map = HashMap::new();
+            for (k, v) in p {
+                let val = convert::py_object_to_value(py, &v)?;
+                map.insert(k, val);
+            }
+            Some(map)
+        } else {
+            None
+        };
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            core::execute_with_params_core(&inner, &cypher, rust_params)
-                .await
-                .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+            let guard = inner.lock().await;
+            let affected = if let Some(params) = rust_params {
+                let mut builder = guard.query_with(&cypher);
+                for (k, v) in params {
+                    builder = builder.param(k, v);
+                }
+                builder
+                    .execute_mutation()
+                    .await
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+                    .affected_rows()
+            } else {
+                guard
+                    .execute(&cypher)
+                    .await
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+                    .affected_rows()
+            };
+            Ok(affected)
         })
     }
 
-    /// Create an async query builder with session variables available.
-    fn query_with(&self, cypher: String) -> AsyncQueryBuilder {
-        AsyncQueryBuilder {
-            inner: self.inner.clone(),
-            cypher,
-            params: HashMap::new(),
-            timeout_secs: None,
-            max_memory: None,
-        }
+    /// Create a new async transaction for multi-statement writes.
+    fn tx<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let guard = inner.lock().await;
+            let tx = guard
+                .tx()
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(AsyncTransaction {
+                inner: Arc::new(tokio::sync::Mutex::new(Some(tx))),
+            })
+        })
     }
 
-    /// Get a session variable value.
-    fn get(&self, py: Python, key: &str) -> PyResult<Option<Py<PyAny>>> {
-        match self.variables.get(key) {
-            Some(v) => Ok(Some(convert::json_value_to_py(py, v)?)),
-            None => Ok(None),
-        }
+    /// Get the session ID.
+    fn id<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let guard = inner.lock().await;
+            Ok(guard.id().to_string())
+        })
+    }
+
+    /// Get session capabilities.
+    fn capabilities<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let guard = inner.lock().await;
+            let caps = guard.capabilities();
+            Ok(crate::types::PySessionCapabilities {
+                can_write: caps.can_write,
+                can_pin: caps.can_pin,
+                isolation: caps.isolation.to_string(),
+                has_notifications: caps.has_notifications,
+            })
+        })
+    }
+
+    /// Evaluate a Locy program within this session (returns awaitable).
+    #[pyo3(signature = (program, params=None))]
+    fn locy<'py>(
+        &self,
+        py: Python<'py>,
+        program: String,
+        params: Option<HashMap<String, Py<PyAny>>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let rust_params = if let Some(p) = params {
+            let mut map = HashMap::new();
+            for (k, v) in p {
+                let val = convert::py_object_to_value(py, &v)?;
+                map.insert(k, val);
+            }
+            Some(map)
+        } else {
+            None
+        };
+        let inner = self.inner.clone();
+        // Locy future is !Send — use spawn_blocking
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let result = tokio::task::spawn_blocking(move || {
+                tokio::runtime::Handle::current().block_on(async move {
+                    let guard = inner.lock().await;
+                    if let Some(params) = rust_params {
+                        let mut builder = guard.locy_with(&program);
+                        for (k, v) in params {
+                            builder = builder.param(&k, v);
+                        }
+                        builder.run().await
+                    } else {
+                        guard.locy(&program).await
+                    }
+                })
+            })
+            .await
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Python::attach(|py| convert::locy_result_to_py_class(py, result))
+        })
+    }
+
+    /// Register Locy rules for reuse across evaluations in this session.
+    fn register_rules<'py>(&self, py: Python<'py>, program: String) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let guard = inner.lock().await;
+            guard
+                .register_rules(&program)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+        })
+    }
+
+    /// Prepare a Cypher query for repeated execution (returns awaitable).
+    fn prepare<'py>(&self, py: Python<'py>, cypher: String) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let guard = inner.lock().await;
+            let prepared = guard
+                .prepare(&cypher)
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(crate::types::PyPreparedQuery {
+                inner: std::sync::Mutex::new(prepared),
+            })
+        })
     }
 }
 
@@ -1899,7 +2113,7 @@ impl AsyncQueryBuilder {
                 core::query_builder_core(&inner, &cypher, rust_params, timeout_secs, max_memory)
                     .await
                     .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
-            Python::attach(|py| convert::rows_to_py(py, rows.rows))
+            Python::attach(|py| convert::rows_to_py(py, rows.into_rows()))
         })
     }
 }

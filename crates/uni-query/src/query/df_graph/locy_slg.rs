@@ -17,7 +17,7 @@ use uni_common::Value;
 use uni_cypher::ast::{BinaryOp, Expr};
 use uni_cypher::locy_ast::{LocyBinaryOp, LocyExpr, RuleCondition, RuleOutput};
 use uni_locy::types::{CompiledClause, CompiledRule};
-use uni_locy::{CompiledProgram, LocyConfig, LocyError, LocyStats, Row};
+use uni_locy::{CompiledProgram, FactRow, LocyConfig, LocyError, LocyStats};
 
 use super::locy_ast_builder::value_to_expr;
 use super::locy_delta::{
@@ -36,7 +36,7 @@ enum GoalStatus {
 /// A cache entry for a resolved goal.
 #[derive(Debug, Clone)]
 struct TableEntry {
-    answers: Vec<Row>,
+    answers: Vec<FactRow>,
     status: GoalStatus,
 }
 
@@ -85,7 +85,7 @@ impl<'a> SLGResolver<'a> {
         &'s mut self,
         rule_name: &'s str,
         goal_bindings: &'s HashMap<String, Value>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<Row>, LocyError>> + 's>>
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<FactRow>, LocyError>> + 's>>
     {
         Box::pin(async move {
             let elapsed = self.start.elapsed();
@@ -128,7 +128,7 @@ impl<'a> SLGResolver<'a> {
             if let Some(relation) = self.derived_store.get(rule_name) {
                 let all_facts = relation.rows.clone();
                 if !all_facts.is_empty() {
-                    let filtered: Vec<Row> = all_facts
+                    let filtered: Vec<FactRow> = all_facts
                         .into_iter()
                         .filter(|row| matches_goal(row, goal_bindings))
                         .collect();
@@ -185,7 +185,7 @@ impl<'a> SLGResolver<'a> {
         &mut self,
         rule: &CompiledRule,
         goal_bindings: &HashMap<String, Value>,
-    ) -> Result<Vec<Row>, LocyError> {
+    ) -> Result<Vec<FactRow>, LocyError> {
         let mut all_answers = Vec::new();
 
         for clause in &rule.clauses {
@@ -214,7 +214,7 @@ impl<'a> SLGResolver<'a> {
                 let projected = apply_yield_projections(rows, clause);
 
                 // Filter by goal bindings.
-                let filtered: Vec<Row> = projected
+                let filtered: Vec<FactRow> = projected
                     .into_iter()
                     .filter(|row| matches_goal(row, goal_bindings))
                     .collect();
@@ -246,8 +246,8 @@ impl<'a> SLGResolver<'a> {
         &mut self,
         rule: &CompiledRule,
         goal_bindings: &HashMap<String, Value>,
-        initial_answers: Vec<Row>,
-    ) -> Result<Vec<Row>, LocyError> {
+        initial_answers: Vec<FactRow>,
+    ) -> Result<Vec<FactRow>, LocyError> {
         let key_columns: Vec<String> = rule
             .yield_schema
             .iter()
@@ -340,7 +340,7 @@ fn locy_expr_to_cypher(locy: &LocyExpr) -> Option<Expr> {
 /// property accesses (`n.val AS v`), computed expressions (`1.0 - n.val AS sev`),
 /// or literal constants (`0.5 AS lit`).  This function evaluates each clause's
 /// YIELD items against the raw rows to produce the projected columns.
-fn apply_yield_projections(raw_rows: Vec<Row>, clause: &CompiledClause) -> Vec<Row> {
+fn apply_yield_projections(raw_rows: Vec<FactRow>, clause: &CompiledClause) -> Vec<FactRow> {
     let yield_items = match &clause.output {
         RuleOutput::Yield(yc) => &yc.items,
         _ => return raw_rows,
@@ -355,7 +355,7 @@ fn apply_yield_projections(raw_rows: Vec<Row>, clause: &CompiledClause) -> Vec<R
     raw_rows
         .into_iter()
         .map(|raw_row| {
-            let mut projected = Row::new();
+            let mut projected = FactRow::new();
             for item in yield_items {
                 let name = item
                     .alias
@@ -422,7 +422,7 @@ fn store_derived_facts(
     derived_store: &mut RowStore,
     rule_name: &str,
     rule: &CompiledRule,
-    facts: &[Row],
+    facts: &[FactRow],
 ) {
     let columns: Vec<String> = rule.yield_schema.iter().map(|c| c.name.clone()).collect();
 
@@ -450,7 +450,7 @@ fn make_cache_key(rule_name: &str, goal_bindings: &HashMap<String, Value>) -> Ca
 }
 
 /// Check if a row matches goal bindings.
-fn matches_goal(row: &Row, goal_bindings: &HashMap<String, Value>) -> bool {
+fn matches_goal(row: &FactRow, goal_bindings: &HashMap<String, Value>) -> bool {
     goal_bindings
         .iter()
         .all(|(k, v)| row.get(k).map(|rv| rv == v).unwrap_or(false))

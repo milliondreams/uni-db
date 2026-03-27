@@ -37,6 +37,41 @@ pub fn serialize_constraint_key(label: &str, key_values: &[(String, Value)]) -> 
     buf
 }
 
+/// Per-type mutation counters accumulated by the L0 buffer.
+///
+/// Used to provide detailed mutation statistics (e.g., `nodes_created`,
+/// `relationships_deleted`) on `ExecuteResult`. Callers snapshot before/after
+/// execution and call [`diff()`](MutationStats::diff) to get the delta.
+#[derive(Debug, Clone, Default)]
+pub struct MutationStats {
+    pub nodes_created: usize,
+    pub nodes_deleted: usize,
+    pub relationships_created: usize,
+    pub relationships_deleted: usize,
+    pub properties_set: usize,
+    pub labels_added: usize,
+    pub labels_removed: usize,
+}
+
+impl MutationStats {
+    /// Compute the field-wise difference `self - before`.
+    pub fn diff(&self, before: &Self) -> Self {
+        Self {
+            nodes_created: self.nodes_created.saturating_sub(before.nodes_created),
+            nodes_deleted: self.nodes_deleted.saturating_sub(before.nodes_deleted),
+            relationships_created: self
+                .relationships_created
+                .saturating_sub(before.relationships_created),
+            relationships_deleted: self
+                .relationships_deleted
+                .saturating_sub(before.relationships_deleted),
+            properties_set: self.properties_set.saturating_sub(before.properties_set),
+            labels_added: self.labels_added.saturating_sub(before.labels_added),
+            labels_removed: self.labels_removed.saturating_sub(before.labels_removed),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct TombstoneEntry {
     pub eid: Eid,
@@ -71,6 +106,8 @@ pub struct L0Buffer {
     pub current_version: u64,
     /// Mutation count for flush decisions
     pub mutation_count: usize,
+    /// Per-type mutation counters for detailed statistics.
+    pub mutation_stats: MutationStats,
     /// Write-ahead log for durability
     pub wal: Option<Arc<WriteAheadLog>>,
     /// WAL LSN at the time this L0 was rotated for flush.
@@ -202,6 +239,7 @@ impl L0Buffer {
             edge_types: HashMap::new(),
             current_version: start_version,
             mutation_count: 0,
+            mutation_stats: MutationStats::default(),
             wal,
             wal_lsn_at_flush: 0,
             vertex_created_at: HashMap::new(),
@@ -254,6 +292,13 @@ impl L0Buffer {
 
         self.graph.add_vertex(vid);
         self.mutation_count += 1;
+        self.mutation_stats.nodes_created += 1;
+        if !properties.is_empty() {
+            self.mutation_stats.properties_set += properties.len();
+        }
+        if !labels.is_empty() {
+            self.mutation_stats.labels_added += labels.len();
+        }
 
         let props_size = Self::estimate_properties_size(&properties);
         self.estimated_size += 8 + props_size + 16 + labels_size + 32;
@@ -274,6 +319,7 @@ impl L0Buffer {
             labels.remove(pos);
             self.current_version += 1;
             self.mutation_count += 1;
+            self.mutation_stats.labels_removed += 1;
             // Note: WAL logging for label mutations not yet implemented
             // Currently consistent with add_vertex_labels behavior
             return true;
@@ -337,6 +383,7 @@ impl L0Buffer {
                 self.edge_properties.remove(&eid);
                 self.graph.remove_edge(eid);
                 self.mutation_count += 1;
+                self.mutation_stats.relationships_deleted += 1;
             }
         }
 
@@ -345,6 +392,7 @@ impl L0Buffer {
         self.vertex_versions.insert(vid, version);
         self.graph.remove_vertex(vid);
         self.mutation_count += 1;
+        self.mutation_stats.nodes_deleted += 1;
 
         // Remove constraint index entries for this vertex
         self.constraint_index.retain(|_, v| *v != vid);
@@ -445,6 +493,7 @@ impl L0Buffer {
 
         // Store metadata with CRDT merge logic
         let props_size = Self::estimate_properties_size(&properties);
+        let props_count = properties.len();
         if !properties.is_empty() {
             let entry = self.edge_properties.entry(eid).or_default();
             Self::merge_crdt_properties(entry, properties);
@@ -455,6 +504,10 @@ impl L0Buffer {
             .insert(eid, (src_vid, dst_vid, edge_type));
         self.tombstones.remove(&eid);
         self.mutation_count += 1;
+        self.mutation_stats.relationships_created += 1;
+        if props_count > 0 {
+            self.mutation_stats.properties_set += props_count;
+        }
 
         // 24 edge + props + 16 version + 28 endpoints + 32 timestamps
         self.estimated_size += 24 + props_size + 16 + 28 + 32;
@@ -508,6 +561,7 @@ impl L0Buffer {
         self.edge_versions.insert(eid, version);
         self.graph.remove_edge(eid);
         self.mutation_count += 1;
+        self.mutation_stats.relationships_deleted += 1;
 
         // 64 bytes tombstone + 16 bytes version
         self.estimated_size += 80;

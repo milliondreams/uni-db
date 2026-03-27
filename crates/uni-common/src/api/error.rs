@@ -108,6 +108,37 @@ pub enum UniError {
 
     #[error("Argument '{arg}' is invalid: {message}")]
     InvalidArgument { arg: String, message: String },
+
+    /// Write context (transaction, bulk writer, or appender) is already active on session.
+    #[error("A write context is already active on session '{session_id}'")]
+    WriteContextAlreadyActive {
+        session_id: String,
+        hint: &'static str,
+    },
+
+    /// Transaction commit timed out waiting for the global writer lock.
+    #[error("Transaction '{tx_id}' commit timed out")]
+    CommitTimeout { tx_id: String, hint: &'static str },
+
+    /// Transaction exceeded its deadline.
+    #[error("Transaction '{tx_id}' expired")]
+    TransactionExpired { tx_id: String, hint: &'static str },
+
+    /// Operation was cancelled via a cancellation token.
+    #[error("Operation cancelled")]
+    Cancelled,
+
+    /// Derived facts are stale relative to the current database version.
+    #[error("Derived facts are stale: version gap is {version_gap}")]
+    StaleDerivedFacts { version_gap: u64 },
+
+    /// A Locy rule conflict was detected during transaction commit rule promotion.
+    #[error("Rule conflict: rule '{rule_name}' conflicts during promotion")]
+    RuleConflict { rule_name: String },
+
+    /// A session hook rejected the operation.
+    #[error("Hook rejected: {message}")]
+    HookRejected { message: String },
 }
 
 pub type Result<T> = std::result::Result<T, UniError>;

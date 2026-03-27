@@ -1,14 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Dragonscale Team
 
-use crate::api::Uni;
-use crate::api::query_builder::QueryBuilder;
 use futures::StreamExt;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 use uni_common::{Result, UniConfig, UniError};
 use uni_query::{
-    ExecuteResult, ExplainOutput, LogicalPlan, ProfileOutput, QueryCursor, QueryResult,
+    ExplainOutput, LogicalPlan, ProfileOutput, QueryCursor, QueryMetrics, QueryResult,
     ResultNormalizer, Row, Value as ApiValue,
 };
 
@@ -65,7 +64,7 @@ fn normalize_error_message(raw: &str, cypher: &str) -> String {
 }
 
 /// Convert a parse error into `UniError::Parse`.
-fn into_parse_error(e: impl std::fmt::Display) -> UniError {
+pub(crate) fn into_parse_error(e: impl std::fmt::Display) -> UniError {
     UniError::Parse {
         message: e.to_string(),
         position: None,
@@ -76,9 +75,10 @@ fn into_parse_error(e: impl std::fmt::Display) -> UniError {
 }
 
 /// Convert a planner/compile-time error into the appropriate `UniError` type.
+///
 /// Errors starting with "SyntaxError:" are treated as parse/syntax errors.
 /// All other errors are query/semantic errors (CompileTime).
-fn into_query_error(e: impl std::fmt::Display, cypher: &str) -> UniError {
+pub(crate) fn into_query_error(e: impl std::fmt::Display, cypher: &str) -> UniError {
     let msg = normalize_error_message(&e.to_string(), cypher);
     // Errors containing "SyntaxError:" prefix should be treated as syntax errors
     // This covers validation errors like VariableTypeConflict, UndefinedVariable, etc.
@@ -104,7 +104,9 @@ fn into_query_error(e: impl std::fmt::Display, cypher: &str) -> UniError {
 /// All other executor errors remain `UniError::Query`.
 fn into_execution_error(e: impl std::fmt::Display, cypher: &str) -> UniError {
     let msg = normalize_error_message(&e.to_string(), cypher);
-    if msg.contains("TypeError:") {
+    if msg.contains("Query cancelled") {
+        UniError::Cancelled
+    } else if msg.contains("TypeError:") {
         UniError::Type {
             expected: msg,
             actual: String::new(),
@@ -145,7 +147,7 @@ fn extract_projection_order(plan: &LogicalPlan) -> Option<Vec<String>> {
     }
 }
 
-impl Uni {
+impl crate::api::UniInner {
     /// Get the current L0Buffer mutation count (cumulative mutations since last flush).
     /// Used to compute affected_rows for mutation queries that return no result rows.
     pub(crate) async fn get_mutation_count(&self) -> usize {
@@ -158,8 +160,25 @@ impl Uni {
         }
     }
 
+    /// Get the current L0Buffer mutation stats snapshot.
+    /// Used together with `get_mutation_count` to compute per-type affected counters.
+    pub(crate) async fn get_mutation_stats(&self) -> uni_store::runtime::l0::MutationStats {
+        match self.writer.as_ref() {
+            Some(w) => {
+                let writer = w.read().await;
+                writer
+                    .l0_manager
+                    .get_current()
+                    .read()
+                    .mutation_stats
+                    .clone()
+            }
+            None => uni_store::runtime::l0::MutationStats::default(),
+        }
+    }
+
     /// Explain a Cypher query plan without executing it.
-    pub async fn explain(&self, cypher: &str) -> Result<ExplainOutput> {
+    pub(crate) async fn explain_internal(&self, cypher: &str) -> Result<ExplainOutput> {
         let ast = uni_cypher::parse(cypher).map_err(into_parse_error)?;
 
         let planner = uni_query::QueryPlanner::new(self.schema.schema().clone());
@@ -169,7 +188,10 @@ impl Uni {
     }
 
     /// Profile a Cypher query execution.
-    pub async fn profile(&self, cypher: &str) -> Result<(QueryResult, ProfileOutput)> {
+    pub(crate) async fn profile_internal(
+        &self,
+        cypher: &str,
+    ) -> Result<(QueryResult, ProfileOutput)> {
         let ast = uni_cypher::parse(cypher).map_err(into_parse_error)?;
 
         let planner = uni_query::QueryPlanner::new(self.schema.schema().clone());
@@ -179,6 +201,11 @@ impl Uni {
         executor.set_config(self.config.clone());
         executor.set_xervo_runtime(self.xervo_runtime.clone());
         executor.set_procedure_registry(self.procedure_registry.clone());
+        if let Ok(reg) = self.custom_functions.read()
+            && !reg.is_empty()
+        {
+            executor.set_custom_functions(Arc::new(reg.clone()));
+        }
         if let Some(w) = &self.writer {
             executor.set_writer(w.clone());
         }
@@ -215,72 +242,14 @@ impl Uni {
                         ResultNormalizer::normalize_value(value).unwrap_or(ApiValue::Null);
                     values.push(normalized);
                 }
-                Row {
-                    columns: columns.clone(),
-                    values,
-                }
+                Row::new(columns.clone(), values)
             })
             .collect();
 
         Ok((
-            QueryResult {
-                columns,
-                rows,
-                warnings: Vec::new(),
-            },
+            QueryResult::new(columns, rows, Vec::new(), Default::default()),
             profile_output,
         ))
-    }
-
-    /// Execute a Cypher query
-    pub async fn query(&self, cypher: &str) -> Result<QueryResult> {
-        self.execute_internal(cypher, HashMap::new()).await
-    }
-
-    /// Execute query returning a cursor for streaming results
-    pub async fn query_cursor(&self, cypher: &str) -> Result<QueryCursor> {
-        self.execute_cursor_internal(cypher, HashMap::new()).await
-    }
-
-    /// Execute a query with parameters using a builder
-    pub fn query_with(&self, cypher: &str) -> QueryBuilder<'_> {
-        QueryBuilder::new(self, cypher)
-    }
-
-    /// Execute a mutation with parameters using a builder.
-    ///
-    /// Alias for [`query_with`](Self::query_with) that clarifies intent for
-    /// mutation queries. Use `.param()` to bind parameters, then `.execute()`
-    /// to run the mutation.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use uni_db::Uni;
-    /// # async fn example(db: &Uni) -> uni_db::Result<()> {
-    /// db.execute_with("CREATE (p:Person {name: $name, age: $age})")
-    ///     .param("name", "Alice")
-    ///     .param("age", 30)
-    ///     .execute()
-    ///     .await?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn execute_with(&self, cypher: &str) -> QueryBuilder<'_> {
-        self.query_with(cypher)
-    }
-
-    /// Execute a modification query (CREATE, SET, DELETE, etc.)
-    /// Returns the number of affected rows/elements
-    pub async fn execute(&self, cypher: &str) -> Result<ExecuteResult> {
-        let before = self.get_mutation_count().await;
-        let result = self.execute_internal(cypher, HashMap::new()).await?;
-        let affected_rows = if result.is_empty() {
-            self.get_mutation_count().await.saturating_sub(before)
-        } else {
-            result.len()
-        };
-        Ok(ExecuteResult { affected_rows })
     }
 
     pub(crate) async fn execute_cursor_internal(
@@ -308,6 +277,11 @@ impl Uni {
         executor.set_config(config.clone());
         executor.set_xervo_runtime(self.xervo_runtime.clone());
         executor.set_procedure_registry(self.procedure_registry.clone());
+        if let Ok(reg) = self.custom_functions.read()
+            && !reg.is_empty()
+        {
+            executor.set_custom_functions(Arc::new(reg.clone()));
+        }
         if let Some(w) = &self.writer {
             executor.set_writer(w.clone());
         }
@@ -357,10 +331,7 @@ impl Uni {
                         let value = map.get(col).cloned().unwrap_or(ApiValue::Null);
                         values.push(value);
                     }
-                    Row {
-                        columns: columns.clone(),
-                        values,
-                    }
+                    Row::new(columns.clone(), values)
                 })
                 .collect();
 
@@ -374,10 +345,7 @@ impl Uni {
             Arc::new(vec![])
         };
 
-        Ok(QueryCursor {
-            columns,
-            stream: Box::pin(row_stream),
-        })
+        Ok(QueryCursor::new(columns, Box::pin(row_stream)))
     }
 
     pub(crate) async fn execute_internal(
@@ -389,14 +357,116 @@ impl Uni {
             .await
     }
 
+    /// Execute a Cypher query with a private transaction L0 buffer.
+    /// The tx_l0 is installed on the executor so both reads and mutations
+    /// are routed through the caller's private L0 (commit-time serialization).
+    pub(crate) async fn execute_internal_with_tx_l0(
+        &self,
+        cypher: &str,
+        params: HashMap<String, ApiValue>,
+        tx_l0: std::sync::Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>,
+    ) -> Result<QueryResult> {
+        let total_start = Instant::now();
+
+        let parse_start = Instant::now();
+        let ast = uni_cypher::parse(cypher).map_err(into_parse_error)?;
+        let parse_time = parse_start.elapsed();
+
+        let (ast, tt_spec) = match ast {
+            uni_cypher::ast::Query::TimeTravel { query, spec } => (*query, Some(spec)),
+            other => (other, None),
+        };
+
+        if tt_spec.is_some() {
+            return Err(UniError::Query {
+                message: "Time-travel queries are not supported within transactions".to_string(),
+                query: Some(cypher.to_string()),
+            });
+        }
+
+        let plan_start = Instant::now();
+        let planner =
+            uni_query::QueryPlanner::new(self.schema.schema().clone()).with_params(params.clone());
+        let logical_plan = planner.plan(ast).map_err(|e| into_query_error(e, cypher))?;
+        let plan_time = plan_start.elapsed();
+
+        let mut executor = uni_query::Executor::new(self.storage.clone());
+        executor.set_config(self.config.clone());
+        executor.set_xervo_runtime(self.xervo_runtime.clone());
+        executor.set_procedure_registry(self.procedure_registry.clone());
+        if let Ok(reg) = self.custom_functions.read()
+            && !reg.is_empty()
+        {
+            executor.set_custom_functions(Arc::new(reg.clone()));
+        }
+        if let Some(w) = &self.writer {
+            executor.set_writer(w.clone());
+        }
+        executor.set_transaction_l0(tx_l0);
+
+        let projection_order = extract_projection_order(&logical_plan);
+
+        let exec_start = Instant::now();
+        let results = executor
+            .execute(logical_plan, &self.properties, &params)
+            .await
+            .map_err(|e| into_execution_error(e, cypher))?;
+        let exec_time = exec_start.elapsed();
+
+        let columns = if results.is_empty() {
+            Arc::new(vec![])
+        } else if let Some(order) = projection_order {
+            Arc::new(order)
+        } else {
+            let mut cols: Vec<String> = results[0].keys().cloned().collect();
+            cols.sort();
+            Arc::new(cols)
+        };
+
+        let rows: Vec<Row> = results
+            .into_iter()
+            .map(|map| {
+                let mut values = Vec::with_capacity(columns.len());
+                for col in columns.iter() {
+                    let value = map.get(col).cloned().unwrap_or(ApiValue::Null);
+                    let normalized =
+                        ResultNormalizer::normalize_value(value).unwrap_or(ApiValue::Null);
+                    values.push(normalized);
+                }
+                Row::new(columns.clone(), values)
+            })
+            .collect();
+
+        let metrics = QueryMetrics {
+            parse_time,
+            plan_time,
+            exec_time,
+            total_time: total_start.elapsed(),
+            rows_returned: rows.len(),
+            ..Default::default()
+        };
+
+        Ok(QueryResult::new(
+            columns,
+            rows,
+            executor.take_warnings(),
+            metrics,
+        ))
+    }
+
     pub(crate) async fn execute_internal_with_config(
         &self,
         cypher: &str,
         params: HashMap<String, ApiValue>,
         config: UniConfig,
     ) -> Result<QueryResult> {
+        let total_start = Instant::now();
+
         // Single parse: extract time-travel clause if present
+        let parse_start = Instant::now();
         let ast = uni_cypher::parse(cypher).map_err(into_parse_error)?;
+        let parse_time = parse_start.elapsed();
+
         let (ast, tt_spec) = match ast {
             uni_cypher::ast::Query::TimeTravel { query, spec } => (*query, Some(spec)),
             other => (other, None),
@@ -412,38 +482,91 @@ impl Uni {
                 .await;
         }
 
-        self.execute_ast_internal(ast, cypher, params, config).await
+        let mut result = self
+            .execute_ast_internal(ast, cypher, params, config)
+            .await?;
+        result.update_parse_timing(parse_time, total_start.elapsed());
+        Ok(result)
     }
 
-    /// Execute a pre-parsed Cypher AST through the planner and executor.
-    ///
-    /// The `cypher` parameter is the original query string, used only for
-    /// error messages.
-    pub(crate) async fn execute_ast_internal(
+    /// Like `execute_internal_with_config` but also accepts a cancellation token.
+    pub(crate) async fn execute_internal_with_config_and_token(
+        &self,
+        cypher: &str,
+        params: HashMap<String, ApiValue>,
+        config: UniConfig,
+        cancellation_token: Option<tokio_util::sync::CancellationToken>,
+    ) -> Result<QueryResult> {
+        let total_start = Instant::now();
+
+        let parse_start = Instant::now();
+        let ast = uni_cypher::parse(cypher).map_err(into_parse_error)?;
+        let parse_time = parse_start.elapsed();
+
+        let (ast, tt_spec) = match ast {
+            uni_cypher::ast::Query::TimeTravel { query, spec } => (*query, Some(spec)),
+            other => (other, None),
+        };
+
+        if let Some(spec) = tt_spec {
+            uni_query::validate_read_only(&ast).map_err(|msg| into_query_error(msg, cypher))?;
+            let snapshot_id = self.resolve_time_travel(&spec).await?;
+            let pinned = self.at_snapshot(&snapshot_id).await?;
+            return pinned
+                .execute_ast_internal(ast, cypher, params, config)
+                .await;
+        }
+
+        let planner =
+            uni_query::QueryPlanner::new(self.schema.schema().clone()).with_params(params.clone());
+        let logical_plan = planner.plan(ast).map_err(|e| into_query_error(e, cypher))?;
+
+        let mut result = self
+            .execute_plan_internal(logical_plan, cypher, params, config, cancellation_token)
+            .await?;
+        result.update_parse_timing(parse_time, total_start.elapsed());
+        Ok(result)
+    }
+
+    /// Execute a pre-parsed Cypher AST with a private transaction L0 override.
+    pub(crate) async fn execute_ast_internal_with_tx_l0(
         &self,
         ast: uni_query::CypherQuery,
         cypher: &str,
         params: HashMap<String, ApiValue>,
         config: UniConfig,
+        tx_l0: std::sync::Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>,
     ) -> Result<QueryResult> {
+        let total_start = Instant::now();
+
+        let plan_start = Instant::now();
         let planner =
             uni_query::QueryPlanner::new(self.schema.schema().clone()).with_params(params.clone());
         let logical_plan = planner.plan(ast).map_err(|e| into_query_error(e, cypher))?;
+        let plan_time = plan_start.elapsed();
 
         let mut executor = uni_query::Executor::new(self.storage.clone());
         executor.set_config(config.clone());
         executor.set_xervo_runtime(self.xervo_runtime.clone());
         executor.set_procedure_registry(self.procedure_registry.clone());
+        if let Ok(reg) = self.custom_functions.read()
+            && !reg.is_empty()
+        {
+            executor.set_custom_functions(Arc::new(reg.clone()));
+        }
         if let Some(w) = &self.writer {
             executor.set_writer(w.clone());
         }
+        executor.set_transaction_l0(tx_l0);
 
         let projection_order = extract_projection_order(&logical_plan);
 
+        let exec_start = Instant::now();
         let results = executor
             .execute(logical_plan, &self.properties, &params)
             .await
             .map_err(|e| into_execution_error(e, cypher))?;
+        let exec_time = exec_start.elapsed();
 
         let columns = if results.is_empty() {
             Arc::new(vec![])
@@ -461,23 +584,111 @@ impl Uni {
                 let mut values = Vec::with_capacity(columns.len());
                 for col in columns.iter() {
                     let value = map.get(col).cloned().unwrap_or(ApiValue::Null);
-                    // Normalize to ensure proper Node/Edge/Path types
                     let normalized =
                         ResultNormalizer::normalize_value(value).unwrap_or(ApiValue::Null);
                     values.push(normalized);
                 }
-                Row {
-                    columns: columns.clone(),
-                    values,
-                }
+                Row::new(columns.clone(), values)
             })
-            .collect();
+            .collect::<Vec<Row>>();
 
-        Ok(QueryResult {
+        let metrics = QueryMetrics {
+            parse_time: std::time::Duration::ZERO,
+            plan_time,
+            exec_time,
+            total_time: total_start.elapsed(),
+            rows_returned: rows.len(),
+            ..Default::default()
+        };
+
+        Ok(QueryResult::new(
             columns,
             rows,
-            warnings: executor.take_warnings(),
-        })
+            executor.take_warnings(),
+            metrics,
+        ))
+    }
+
+    /// Execute a pre-parsed Cypher AST through the planner and executor.
+    ///
+    /// The `cypher` parameter is the original query string, used only for
+    /// error messages.
+    pub(crate) async fn execute_ast_internal(
+        &self,
+        ast: uni_query::CypherQuery,
+        cypher: &str,
+        params: HashMap<String, ApiValue>,
+        config: UniConfig,
+    ) -> Result<QueryResult> {
+        let total_start = Instant::now();
+
+        let plan_start = Instant::now();
+        let planner =
+            uni_query::QueryPlanner::new(self.schema.schema().clone()).with_params(params.clone());
+        let logical_plan = planner.plan(ast).map_err(|e| into_query_error(e, cypher))?;
+        let plan_time = plan_start.elapsed();
+
+        let mut executor = uni_query::Executor::new(self.storage.clone());
+        executor.set_config(config.clone());
+        executor.set_xervo_runtime(self.xervo_runtime.clone());
+        executor.set_procedure_registry(self.procedure_registry.clone());
+        if let Ok(reg) = self.custom_functions.read()
+            && !reg.is_empty()
+        {
+            executor.set_custom_functions(Arc::new(reg.clone()));
+        }
+        if let Some(w) = &self.writer {
+            executor.set_writer(w.clone());
+        }
+
+        let projection_order = extract_projection_order(&logical_plan);
+
+        let exec_start = Instant::now();
+        let results = executor
+            .execute(logical_plan, &self.properties, &params)
+            .await
+            .map_err(|e| into_execution_error(e, cypher))?;
+        let exec_time = exec_start.elapsed();
+
+        let columns = if results.is_empty() {
+            Arc::new(vec![])
+        } else if let Some(order) = projection_order {
+            Arc::new(order)
+        } else {
+            let mut cols: Vec<String> = results[0].keys().cloned().collect();
+            cols.sort();
+            Arc::new(cols)
+        };
+
+        let rows = results
+            .into_iter()
+            .map(|map| {
+                let mut values = Vec::with_capacity(columns.len());
+                for col in columns.iter() {
+                    let value = map.get(col).cloned().unwrap_or(ApiValue::Null);
+                    let normalized =
+                        ResultNormalizer::normalize_value(value).unwrap_or(ApiValue::Null);
+                    values.push(normalized);
+                }
+                Row::new(columns.clone(), values)
+            })
+            .collect::<Vec<Row>>();
+
+        let metrics = QueryMetrics {
+            parse_time: std::time::Duration::ZERO,
+            plan_time,
+            exec_time,
+            total_time: total_start.elapsed(),
+            rows_returned: rows.len(),
+            ..Default::default()
+        };
+
+        Ok(QueryResult::new(
+            columns,
+            rows,
+            executor.take_warnings(),
+            metrics,
+        ))
     }
 
     /// Resolve a time-travel spec to a snapshot ID.
@@ -490,18 +701,107 @@ impl Uni {
                         into_parse_error(format!("Invalid timestamp '{}': {}", ts_str, e))
                     })?
                     .with_timezone(&chrono::Utc);
-                let manifest = self
-                    .storage
-                    .snapshot_manager()
-                    .find_snapshot_at_time(ts)
-                    .await
-                    .map_err(UniError::Internal)?
-                    .ok_or_else(|| UniError::Query {
-                        message: format!("No snapshot found at or before {}", ts_str),
-                        query: None,
-                    })?;
-                Ok(manifest.snapshot_id)
+                self.resolve_time_travel_timestamp(ts).await
             }
         }
+    }
+
+    /// Resolve a `chrono::DateTime<Utc>` to the snapshot ID of the closest
+    /// snapshot at or before that timestamp.
+    pub(crate) async fn resolve_time_travel_timestamp(
+        &self,
+        ts: chrono::DateTime<chrono::Utc>,
+    ) -> Result<String> {
+        let manifest = self
+            .storage
+            .snapshot_manager()
+            .find_snapshot_at_time(ts)
+            .await
+            .map_err(UniError::Internal)?
+            .ok_or_else(|| UniError::Query {
+                message: format!("No snapshot found at or before {}", ts),
+                query: None,
+            })?;
+        Ok(manifest.snapshot_id)
+    }
+
+    /// Execute a pre-built logical plan, skipping parse and plan phases.
+    ///
+    /// Used by the plan cache and prepared statements to re-execute
+    /// previously planned queries.
+    pub(crate) async fn execute_plan_internal(
+        &self,
+        plan: uni_query::LogicalPlan,
+        cypher: &str,
+        params: HashMap<String, ApiValue>,
+        config: UniConfig,
+        cancellation_token: Option<tokio_util::sync::CancellationToken>,
+    ) -> Result<QueryResult> {
+        let total_start = Instant::now();
+
+        let mut executor = uni_query::Executor::new(self.storage.clone());
+        executor.set_config(config.clone());
+        executor.set_xervo_runtime(self.xervo_runtime.clone());
+        executor.set_procedure_registry(self.procedure_registry.clone());
+        if let Ok(reg) = self.custom_functions.read()
+            && !reg.is_empty()
+        {
+            executor.set_custom_functions(Arc::new(reg.clone()));
+        }
+        if let Some(w) = &self.writer {
+            executor.set_writer(w.clone());
+        }
+        if let Some(token) = cancellation_token {
+            executor.set_cancellation_token(token);
+        }
+
+        let projection_order = extract_projection_order(&plan);
+
+        let exec_start = Instant::now();
+        let results = executor
+            .execute(plan, &self.properties, &params)
+            .await
+            .map_err(|e| into_execution_error(e, cypher))?;
+        let exec_time = exec_start.elapsed();
+
+        let columns = if results.is_empty() {
+            Arc::new(vec![])
+        } else if let Some(order) = projection_order {
+            Arc::new(order)
+        } else {
+            let mut cols: Vec<String> = results[0].keys().cloned().collect();
+            cols.sort();
+            Arc::new(cols)
+        };
+
+        let rows: Vec<Row> = results
+            .into_iter()
+            .map(|map| {
+                let mut values = Vec::with_capacity(columns.len());
+                for col in columns.iter() {
+                    let value = map.get(col).cloned().unwrap_or(ApiValue::Null);
+                    let normalized =
+                        ResultNormalizer::normalize_value(value).unwrap_or(ApiValue::Null);
+                    values.push(normalized);
+                }
+                Row::new(columns.clone(), values)
+            })
+            .collect();
+
+        let metrics = QueryMetrics {
+            parse_time: std::time::Duration::ZERO,
+            plan_time: std::time::Duration::ZERO,
+            exec_time,
+            total_time: total_start.elapsed(),
+            rows_returned: rows.len(),
+            ..Default::default()
+        };
+
+        Ok(QueryResult::new(
+            columns,
+            rows,
+            executor.take_warnings(),
+            metrics,
+        ))
     }
 }

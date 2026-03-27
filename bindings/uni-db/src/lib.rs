@@ -93,5 +93,16 @@ fn _uni_db(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<types::IndexRebuildTaskInfo>()?;
     m.add_class::<types::IndexDefinitionInfo>()?;
 
+    // Session/Transaction result types
+    m.add_class::<types::PyCommitResult>()?;
+    m.add_class::<types::PyCommitNotification>()?;
+    m.add_class::<types::PySessionCapabilities>()?;
+    m.add_class::<types::PyPreparedQuery>()?;
+
+    // Session templates & streaming appender
+    m.add_class::<builders::SessionTemplateBuilder>()?;
+    m.add_class::<builders::SessionTemplate>()?;
+    m.add_class::<builders::StreamingAppender>()?;
+
     Ok(())
 }

@@ -647,8 +647,13 @@ async fn graph_should_contain_n_nodes_with_label(
     label: String,
 ) {
     let query = format!("MATCH (n:{}) RETURN count(n) AS cnt", label);
-    let result = world.db().query(&query).await.expect("graph query failed");
-    let cnt: i64 = result.rows[0].get("cnt").expect("missing cnt column");
+    let result = world
+        .db()
+        .session()
+        .query(&query)
+        .await
+        .expect("graph query failed");
+    let cnt: i64 = result.rows()[0].get("cnt").expect("missing cnt column");
     assert_eq!(
         cnt as usize, expected,
         "Expected {} nodes with label '{}', got {}",
@@ -669,8 +674,13 @@ async fn graph_should_contain_edge(
         "MATCH (a {{name: '{}'}})-[r:{}]->(b {{name: '{}'}}) RETURN count(r) AS cnt",
         from, edge_type, to
     );
-    let result = world.db().query(&query).await.expect("graph query failed");
-    let cnt: i64 = result.rows[0].get("cnt").expect("missing cnt column");
+    let result = world
+        .db()
+        .session()
+        .query(&query)
+        .await
+        .expect("graph query failed");
+    let cnt: i64 = result.rows()[0].get("cnt").expect("missing cnt column");
     assert!(
         cnt > 0,
         "Expected edge from '{}' to '{}' with type '{}', but none found",
@@ -693,8 +703,13 @@ async fn graph_should_not_contain_edge(
         "MATCH (a {{name: '{}'}})-[r:{}]->(b {{name: '{}'}}) RETURN count(r) AS cnt",
         from, edge_type, to
     );
-    let result = world.db().query(&query).await.expect("graph query failed");
-    let cnt: i64 = result.rows[0].get("cnt").expect("missing cnt column");
+    let result = world
+        .db()
+        .session()
+        .query(&query)
+        .await
+        .expect("graph query failed");
+    let cnt: i64 = result.rows()[0].get("cnt").expect("missing cnt column");
     assert_eq!(
         cnt, 0,
         "Expected no edge from '{}' to '{}' with type '{}', but found {}",

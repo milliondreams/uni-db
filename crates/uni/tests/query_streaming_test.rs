@@ -17,12 +17,14 @@ async fn test_query_cursor_streaming() -> Result<()> {
 
     // Insert 100 persons
     for i in 0..100 {
-        db.execute(&format!("CREATE (:Person {{name: 'Person {}'}})", i))
+        db.session()
+            .execute(&format!("CREATE (:Person {{name: 'Person {}'}})", i))
             .await?;
     }
 
     // Query with cursor
     let mut cursor = db
+        .session()
         .query_cursor("MATCH (p:Person) RETURN p.name ORDER BY p.name")
         .await?;
 
@@ -54,11 +56,15 @@ async fn test_query_cursor_streaming() -> Result<()> {
         .await?;
 
     for i in 0..100 {
-        db2.execute(&format!("CREATE (:Person {{name: 'Person {}'}})", i))
+        db2.session()
+            .execute(&format!("CREATE (:Person {{name: 'Person {}'}})", i))
             .await?;
     }
 
-    let mut cursor2 = db2.query_cursor("MATCH (p:Person) RETURN p.name").await?;
+    let mut cursor2 = db2
+        .session()
+        .query_cursor("MATCH (p:Person) RETURN p.name")
+        .await?;
     let first_batch = cursor2.next_batch().await.unwrap()?;
     assert_eq!(first_batch.len(), 10);
 

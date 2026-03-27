@@ -15,25 +15,32 @@ async fn test_profile_basic() -> anyhow::Result<()> {
         .await?;
 
     // Create schema
-    db.query("CREATE LABEL Person (name STRING, age INT)")
+    db.session()
+        .query("CREATE LABEL Person (name STRING, age INT)")
         .await?;
-    db.query("CREATE LABEL City (name STRING)").await?;
-    db.query("CREATE EDGE TYPE LIVES_IN () FROM Person TO City")
+    db.session()
+        .query("CREATE LABEL City (name STRING)")
+        .await?;
+    db.session()
+        .query("CREATE EDGE TYPE LIVES_IN () FROM Person TO City")
         .await?;
 
     // Insert data
-    db.query("CREATE (p:Person {name: 'Alice', age: 30})")
+    db.session()
+        .query("CREATE (p:Person {name: 'Alice', age: 30})")
         .await?;
-    db.query("CREATE (c:City {name: 'London'})").await?;
-    db.query("MATCH (p:Person), (c:City) WHERE p.name = 'Alice' AND c.name = 'London' CREATE (p)-[:LIVES_IN]->(c)").await?;
+    db.session()
+        .query("CREATE (c:City {name: 'London'})")
+        .await?;
+    db.session().query("MATCH (p:Person), (c:City) WHERE p.name = 'Alice' AND c.name = 'London' CREATE (p)-[:LIVES_IN]->(c)").await?;
 
     // Profile query
     let _query = "PROFILE MATCH (p:Person)-[:LIVES_IN]->(c:City) RETURN p.name, c.name";
 
     // Note: Uni::profile takes the query string. The parser handles "PROFILE" prefix if present?
     // Actually Uni::profile just profiles whatever query is passed.
-    // The "PROFILE" keyword is handled by parser/repl to call `db.profile()`.
-    // But `db.profile()` takes a query string. Does it strip "PROFILE"?
+    // The "PROFILE" keyword is handled by parser/repl to call `db.session().profile()`.
+    // But `db.session().profile()` takes a query string. Does it strip "PROFILE"?
     // Let's check Parser. Parser handles "PROFILE" by returning Query::Profile?
     // Wait, parser supports EXPLAIN. Does it support PROFILE?
 
@@ -49,16 +56,16 @@ async fn test_profile_basic() -> anyhow::Result<()> {
     // Let's check `uni-cli/src/repl.rs`.
     // L149: if query_upper.starts_with("PROFILE") {
     //    let query = query[7..].trim();
-    //    match db.profile(query).await { ... }
+    //    match db.session().profile(query).await { ... }
 
-    // So the CLI strips "PROFILE". The `db.profile()` method expects the query WITHOUT "PROFILE".
+    // So the CLI strips "PROFILE". The `db.session().profile()` method expects the query WITHOUT "PROFILE".
 
     let clean_query = "MATCH (p:Person)-[:LIVES_IN]->(c:City) RETURN p.name, c.name";
-    let (result, profile) = db.profile(clean_query).await?;
+    let (result, profile) = db.session().profile(clean_query).await?;
 
     println!("Profile Stats: {:#?}", profile.runtime_stats);
 
-    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.len(), 1);
 
     // Check stats
     // We expect: Scan(Person), Traverse, Scan(City) (or filtered scan), Project

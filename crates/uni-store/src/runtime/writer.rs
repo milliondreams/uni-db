@@ -183,10 +183,16 @@ impl Writer {
         if self.transaction_l0.is_some() {
             return Err(anyhow!("Transaction already active"));
         }
+        self.transaction_l0 = Some(self.create_transaction_l0());
+        Ok(())
+    }
+
+    /// Create a new empty L0 buffer for transaction-scoped mutations.
+    /// This only reads the current version — no exclusive lock required on Writer.
+    pub fn create_transaction_l0(&self) -> Arc<RwLock<L0Buffer>> {
         let current_version = self.l0_manager.get_current().read().current_version;
         // Transaction mutations are logged to WAL at COMMIT time, not during the transaction.
-        self.transaction_l0 = Some(Arc::new(RwLock::new(L0Buffer::new(current_version, None))));
-        Ok(())
+        Arc::new(RwLock::new(L0Buffer::new(current_version, None)))
     }
 
     /// Returns the active L0 buffer: the transaction L0 if a transaction is open,
@@ -212,17 +218,22 @@ impl Writer {
         }
     }
 
+    /// Commit the writer-owned transaction L0 (legacy path).
+    /// Delegates to `commit_transaction_l0()` with the internal transaction L0.
     pub async fn commit_transaction(&mut self) -> Result<()> {
-        // 1. Borrow transaction L0 - keep available for rollback if commit fails
         let tx_l0_arc = self
             .transaction_l0
-            .as_ref()
-            .ok_or_else(|| anyhow!("No active transaction"))?
-            .clone();
+            .take()
+            .ok_or_else(|| anyhow!("No active transaction"))?;
+        self.commit_transaction_l0(tx_l0_arc).await
+    }
 
-        // 2. Write transaction mutations to WAL BEFORE merging into main L0
+    /// Commit an externally-owned transaction L0 buffer.
+    /// Writes mutations to WAL, flushes, merges into main L0, and replays
+    /// edges into the AdjacencyManager.
+    pub async fn commit_transaction_l0(&mut self, tx_l0_arc: Arc<RwLock<L0Buffer>>) -> Result<()> {
+        // 1. Write transaction mutations to WAL BEFORE merging into main L0
         // This ensures durability before visibility.
-        // Note: WAL is optional - if present, we get durability; if absent, we skip this step.
         {
             let tx_l0 = tx_l0_arc.read();
             let main_l0_arc = self.l0_manager.get_current();
@@ -230,7 +241,6 @@ impl Writer {
 
             // If WAL exists, write mutations to it for durability
             if let Some(wal) = main_l0.wal.as_ref() {
-                // Append all transaction mutations to WAL
                 // Order: vertices first, then edges (to ensure src/dst exist on replay)
 
                 // Vertex insertions
@@ -254,7 +264,6 @@ impl Writer {
                 // Edge insertions and deletions
                 for (eid, (src_vid, dst_vid, edge_type)) in &tx_l0.edge_endpoints {
                     if tx_l0.tombstones.contains_key(eid) {
-                        // Edge deletion
                         let version = tx_l0.edge_versions.get(eid).copied().unwrap_or(0);
                         wal.append(&crate::runtime::wal::Mutation::DeleteEdge {
                             eid: *eid,
@@ -264,7 +273,6 @@ impl Writer {
                             version,
                         })?;
                     } else {
-                        // Edge insertion
                         let properties =
                             tx_l0.edge_properties.get(eid).cloned().unwrap_or_default();
                         let version = tx_l0.edge_versions.get(eid).copied().unwrap_or(0);
@@ -283,20 +291,17 @@ impl Writer {
             }
         }
 
-        // 3. Flush WAL to durable storage - THIS IS THE COMMIT POINT
-        // If this fails, transaction remains active and can be retried or rolled back.
+        // 2. Flush WAL to durable storage - THIS IS THE COMMIT POINT
         self.flush_wal().await?;
 
-        // 4. Now that mutations are durable, merge into main L0 and make visible
+        // 3. Merge into main L0 and make visible
         {
             let tx_l0 = tx_l0_arc.read();
             let main_l0_arc = self.l0_manager.get_current();
             let mut main_l0 = main_l0_arc.write();
             main_l0.merge(&tx_l0)?;
 
-            // Replay transaction edges into the AdjacencyManager overlay so they
-            // become visible to queries that read from the AM (post-migration path).
-            // Use per-edge versions from tx_l0.edge_versions, falling back to current version.
+            // Replay transaction edges into the AdjacencyManager overlay
             for (eid, (src, dst, etype)) in &tx_l0.edge_endpoints {
                 let edge_version = tx_l0
                     .edge_versions
@@ -315,10 +320,7 @@ impl Writer {
 
         self.update_metrics();
 
-        // 5. Clear transaction (all critical steps succeeded)
-        self.transaction_l0 = None;
-
-        // 6. check_flush is best-effort compaction, not critical
+        // 4. Best-effort compaction
         if let Err(e) = self.check_flush().await {
             tracing::warn!("Post-commit flush check failed (non-critical): {}", e);
         }
@@ -349,6 +351,17 @@ impl Writer {
         if self.transaction_l0.take().is_some() {
             tracing::warn!("Force-rolled back leaked transaction");
         }
+    }
+
+    /// Temporarily install a transaction L0 on the writer, returning the previous value.
+    /// Used by the executor to route mutations to a private (externally-owned) L0 buffer
+    /// while the writer lock is held.  Callers MUST restore the previous value before
+    /// releasing the writer lock.
+    pub fn install_transaction_l0(
+        &mut self,
+        tx_l0: Option<Arc<RwLock<L0Buffer>>>,
+    ) -> Option<Arc<RwLock<L0Buffer>>> {
+        std::mem::replace(&mut self.transaction_l0, tx_l0)
     }
 
     /// Validates vertex constraints for the given properties.

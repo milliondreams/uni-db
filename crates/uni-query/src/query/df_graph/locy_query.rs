@@ -12,7 +12,7 @@ use std::time::Instant;
 use uni_common::Value;
 use uni_cypher::ast::{CypherLiteral, Expr, ReturnItem};
 use uni_cypher::locy_ast::GoalQuery;
-use uni_locy::{CompiledProgram, LocyConfig, LocyError, LocyStats, Row};
+use uni_locy::{CompiledProgram, FactRow, LocyConfig, LocyError, LocyStats};
 
 use super::locy_delta::RowStore;
 
@@ -32,7 +32,7 @@ pub async fn evaluate_query(
     _derived_store: &mut RowStore,
     stats: &mut LocyStats,
     start: Instant,
-) -> Result<Vec<Row>, LocyError> {
+) -> Result<Vec<FactRow>, LocyError> {
     let rule_name = query.rule_name.to_string();
     let rule =
         program
@@ -69,7 +69,7 @@ pub async fn evaluate_query(
 
     // Apply WHERE filter (SLG may return superset if goal bindings are partial).
     // Params are injected into each row so $name references resolve correctly.
-    let filtered: Vec<Row> = if let Some(where_expr) = &query.where_expr {
+    let filtered: Vec<FactRow> = if let Some(where_expr) = &query.where_expr {
         results
             .into_iter()
             .filter(|row| {
@@ -89,10 +89,10 @@ pub async fn evaluate_query(
 
 /// Apply a RETURN clause (projection, ordering, skip, limit) to results.
 pub(super) fn apply_return_clause(
-    rows: Vec<Row>,
+    rows: Vec<FactRow>,
     return_clause: &Option<uni_cypher::ast::ReturnClause>,
     params: &HashMap<String, Value>,
-) -> Result<Vec<Row>, LocyError> {
+) -> Result<Vec<FactRow>, LocyError> {
     let rc = match return_clause {
         Some(rc) => rc,
         None => return Ok(rows),
@@ -100,11 +100,11 @@ pub(super) fn apply_return_clause(
 
     // Project columns. Params are merged into each row so $name references
     // in RETURN expressions (e.g. RETURN $agent_id AS id) resolve correctly.
-    let mut projected: Vec<Row> = rows
+    let mut projected: Vec<FactRow> = rows
         .into_iter()
         .map(|row| {
             let merged = merge_params(&row, params);
-            let mut new_row = Row::new();
+            let mut new_row = FactRow::new();
             for item in &rc.items {
                 match item {
                     ReturnItem::All => return Ok(row.clone()),
@@ -169,8 +169,8 @@ pub(super) fn apply_return_clause(
 /// resolve `$name` references during in-memory expression evaluation.
 ///
 /// Row values take precedence — parameters only fill in keys that are absent.
-fn merge_params(row: &Row, params: &HashMap<String, Value>) -> Row {
-    let mut merged: Row = params.clone();
+fn merge_params(row: &FactRow, params: &HashMap<String, Value>) -> FactRow {
+    let mut merged: FactRow = params.clone();
     merged.extend(row.iter().map(|(k, v)| (k.clone(), v.clone())));
     merged
 }

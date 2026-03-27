@@ -38,6 +38,7 @@ uni-locy = { workspace = true }
 async-trait = { workspace = true }
 parking_lot = { workspace = true }
 datafusion = { workspace = true }
+tokio-util = { workspace = true }
 
 [dev-dependencies]
 criterion = "0.5"

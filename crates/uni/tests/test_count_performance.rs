@@ -55,14 +55,18 @@ async fn test_count_scaling() {
             p.insert("name".to_string(), Value::String(format!("Person_{}", i)));
             props.push(p);
         }
-        db.bulk_insert_vertices("Person", props).await.unwrap();
+        db.session()
+            .bulk_insert_vertices("Person", props)
+            .await
+            .unwrap();
         eprintln!("  Create: {:?}", create_start.elapsed());
 
         // Test COUNT query
         let count_start = Instant::now();
         match tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            db.query("MATCH (n:Person) RETURN count(n) as cnt"),
+            db.session()
+                .query("MATCH (n:Person) RETURN count(n) as cnt"),
         )
         .await
         {
@@ -70,7 +74,7 @@ async fn test_count_scaling() {
                 eprintln!(
                     "  COUNT: {:?} - result: {:?}",
                     count_start.elapsed(),
-                    result.rows.first()
+                    result.rows().first()
                 );
             }
             Ok(Err(e)) => {
@@ -84,17 +88,21 @@ async fn test_count_scaling() {
         // Test simple scan with LIMIT
         let scan_start = Instant::now();
         let scan_result = db
+            .session()
             .query("MATCH (n:Person) RETURN n.name LIMIT 3")
             .await
             .unwrap();
         eprintln!(
             "  Scan LIMIT 3: {:?} - {} rows",
             scan_start.elapsed(),
-            scan_result.rows.len()
+            scan_result.len()
         );
 
         // Clear for next test
-        db.query("MATCH (n:Person) DETACH DELETE n").await.unwrap();
+        db.session()
+            .query("MATCH (n:Person) DETACH DELETE n")
+            .await
+            .unwrap();
         eprintln!();
     }
 }
@@ -125,20 +133,24 @@ async fn test_count_vs_scan_all() {
         p.insert("name".to_string(), Value::String(format!("Person_{}", i)));
         props.push(p);
     }
-    db.bulk_insert_vertices("Person", props).await.unwrap();
+    db.session()
+        .bulk_insert_vertices("Person", props)
+        .await
+        .unwrap();
     eprintln!("Created {} vertices\n", num_vertices);
 
     // Test COUNT
     let count_start = Instant::now();
     match tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        db.query("MATCH (n:Person) RETURN count(n) as cnt"),
+        db.session()
+            .query("MATCH (n:Person) RETURN count(n) as cnt"),
     )
     .await
     {
         Ok(Ok(result)) => {
             eprintln!("COUNT time: {:?}", count_start.elapsed());
-            eprintln!("COUNT result: {:?}", result.rows.first());
+            eprintln!("COUNT result: {:?}", result.rows().first());
         }
         Ok(Err(e)) => {
             eprintln!("COUNT ERROR: {}", e);
@@ -152,13 +164,13 @@ async fn test_count_vs_scan_all() {
     let scan_start = Instant::now();
     match tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        db.query("MATCH (n:Person) RETURN n.name"),
+        db.session().query("MATCH (n:Person) RETURN n.name"),
     )
     .await
     {
         Ok(Ok(result)) => {
             eprintln!("\nFull scan time: {:?}", scan_start.elapsed());
-            eprintln!("Full scan rows: {}", result.rows.len());
+            eprintln!("Full scan rows: {}", result.len());
         }
         Ok(Err(e)) => {
             eprintln!("\nFull scan ERROR: {}", e);
@@ -172,13 +184,13 @@ async fn test_count_vs_scan_all() {
     let scan_no_prop_start = Instant::now();
     match tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        db.query("MATCH (n:Person) RETURN n"),
+        db.session().query("MATCH (n:Person) RETURN n"),
     )
     .await
     {
         Ok(Ok(result)) => {
             eprintln!("\nScan (RETURN n) time: {:?}", scan_no_prop_start.elapsed());
-            eprintln!("Scan (RETURN n) rows: {}", result.rows.len());
+            eprintln!("Scan (RETURN n) rows: {}", result.len());
         }
         Ok(Err(e)) => {
             eprintln!("\nScan (RETURN n) ERROR: {}", e);

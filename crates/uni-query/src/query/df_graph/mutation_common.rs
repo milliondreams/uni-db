@@ -57,6 +57,11 @@ pub struct MutationContext {
 
     /// Query context for L0 buffer visibility.
     pub query_ctx: Option<uni_store::QueryContext>,
+
+    /// When set, mutations are routed to this private L0 buffer instead of
+    /// the writer's internal `transaction_l0` slot. Installed on the writer
+    /// temporarily while the writer lock is held during mutation execution.
+    pub tx_l0_override: Option<Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
 }
 
 impl std::fmt::Debug for MutationContext {
@@ -508,6 +513,7 @@ async fn execute_mutation_inner(
                 pm,
                 params,
                 ctx,
+                mutation_ctx.tx_l0_override.as_ref(),
             )
             .await
             .map_err(|e| {
@@ -535,8 +541,18 @@ async fn execute_mutation_inner(
     }
 
     let mut writer = mutation_ctx.writer.write().await;
-    apply_mutations(&mutation_ctx, &mutation_kind, &mut rows, &mut writer).await?;
+    // Install private tx L0 on writer so active_l0() and constraint checks use it
+    let saved_tx_l0 = mutation_ctx
+        .tx_l0_override
+        .as_ref()
+        .map(|tx_l0| writer.install_transaction_l0(Some(tx_l0.clone())));
+    let result = apply_mutations(&mutation_ctx, &mutation_kind, &mut rows, &mut writer).await;
+    // Always restore before releasing writer lock, even on error
+    if let Some(saved) = saved_tx_l0 {
+        writer.install_transaction_l0(saved);
+    }
     drop(writer);
+    result?;
 
     tracing::debug!(
         mutation = mutation_label,

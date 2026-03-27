@@ -16,12 +16,13 @@ fn test_sync_api() -> Result<()> {
         .property("age", DataType::Int32)
         .apply()?;
 
-    // 3. Execute
-    db.execute("CREATE (:User {name: 'Alice', age: 30})")?;
-    db.execute("CREATE (:User {name: 'Bob', age: 25})")?;
+    // 3. Execute via session
+    let session = db.session();
+    session.execute("CREATE (:User {name: 'Alice', age: 30})")?;
+    session.execute("CREATE (:User {name: 'Bob', age: 25})")?;
 
     // 4. Query
-    let result = db.query("MATCH (u:User) RETURN u.name, u.age ORDER BY u.age")?;
+    let result = session.query("MATCH (u:User) RETURN u.name, u.age ORDER BY u.age")?;
     assert_eq!(result.len(), 2);
 
     let row0 = &result.rows()[0];
@@ -29,11 +30,11 @@ fn test_sync_api() -> Result<()> {
     assert_eq!(row0.get::<i32>("u.age")?, 25);
 
     // 5. Transaction
-    let tx = db.begin()?;
+    let tx = session.tx()?;
     tx.execute("CREATE (:User {name: 'Charlie', age: 40})")?;
     tx.commit()?;
 
-    let result = db.query("MATCH (u:User) WHERE u.name = 'Charlie' RETURN u.age")?;
+    let result = session.query("MATCH (u:User) WHERE u.name = 'Charlie' RETURN u.age")?;
     assert_eq!(result.len(), 1);
     assert_eq!(result.rows()[0].get::<i32>("u.age")?, 40);
 

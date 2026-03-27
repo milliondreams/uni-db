@@ -249,16 +249,21 @@ async fn test_ecommerce_recommendation() -> anyhow::Result<()> {
     let db = Uni::open(path.to_str().unwrap()).build().await?;
 
     // 2. Create data using high-level API
-    db.execute("CREATE (alice:User {name: 'Alice'})").await?;
-    db.execute("CREATE (laptop:Product {name: 'Laptop', embedding: [1.0, 0.0]})")
+    db.session()
+        .execute("CREATE (alice:User {name: 'Alice'})")
         .await?;
-    db.execute("CREATE (mouse:Product {name: 'Mouse', embedding: [0.9, 0.1]})")
+    db.session()
+        .execute("CREATE (laptop:Product {name: 'Laptop', embedding: [1.0, 0.0]})")
         .await?;
-    db.execute("CREATE (shampoo:Product {name: 'Shampoo', embedding: [0.0, 1.0]})")
+    db.session()
+        .execute("CREATE (mouse:Product {name: 'Mouse', embedding: [0.9, 0.1]})")
+        .await?;
+    db.session()
+        .execute("CREATE (shampoo:Product {name: 'Shampoo', embedding: [0.0, 1.0]})")
         .await?;
 
     // Create the VIEWED edge: Alice -> Laptop
-    db.execute(
+    db.session().execute(
         "MATCH (u:User {name: 'Alice'}), (p:Product {name: 'Laptop'}) CREATE (u)-[:VIEWED]->(p)",
     )
     .await?;
@@ -269,6 +274,7 @@ async fn test_ecommerce_recommendation() -> anyhow::Result<()> {
     // 3. Execution Logic
     // Step A: Find products Alice viewed
     let result = db
+        .session()
         .query("MATCH (u:User)-[:VIEWED]->(p:Product) RETURN p.embedding, p.name")
         .await?;
     assert_eq!(result.len(), 1);
@@ -280,7 +286,7 @@ async fn test_ecommerce_recommendation() -> anyhow::Result<()> {
     // Step B: Vector Search using that embedding
     // Find top 2 (should be Laptop itself and Mouse)
     let similar = db
-        .query("CALL uni.vector.query('Product', 'embedding', [1.0, 0.0], 2) YIELD node RETURN node.name AS name")
+        .session().query("CALL uni.vector.query('Product', 'embedding', [1.0, 0.0], 2) YIELD node RETURN node.name AS name")
         .await?;
 
     // Verify we got Laptop and Mouse (both have similar embeddings to [1.0, 0.0])

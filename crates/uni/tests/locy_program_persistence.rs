@@ -19,21 +19,21 @@ async fn test_locy_register_persists_rules() -> anyhow::Result<()> {
         .apply()
         .await?;
 
-    db.execute(
+    db.session().execute(
         "CREATE (a:Node {name: 'A', val: 1})-[:EDGE]->(b:Node {name: 'B', val: 2})-[:EDGE]->(c:Node {name: 'C', val: 3})",
     )
     .await?;
     db.flush().await?;
 
-    // Step 1: Register rules (no execution).
-    db.locy().register(
+    // Step 1: Register rules globally (no execution).
+    db.register_rules(
         "CREATE RULE reach AS
            MATCH (a:Node)-[:EDGE]->(b:Node)
            YIELD KEY a, KEY b",
     )?;
 
     // Step 2: Evaluate a QUERY that references the registered rule.
-    let result = db.locy().evaluate("QUERY reach WHERE a.name = 'A'").await?;
+    let result = db.session().locy("QUERY reach WHERE a.name = 'A'").await?;
 
     // The QUERY should find A→B and A→C (via the registered rule).
     assert!(
@@ -62,23 +62,24 @@ async fn test_locy_clear_removes_registered_rules() -> anyhow::Result<()> {
         .apply()
         .await?;
 
-    db.execute("CREATE (:Node {name: 'A'})-[:EDGE]->(:Node {name: 'B'})")
+    db.session()
+        .execute("CREATE (:Node {name: 'A'})-[:EDGE]->(:Node {name: 'B'})")
         .await?;
     db.flush().await?;
 
-    // Register a rule.
-    db.locy().register(
+    // Register a rule globally.
+    db.register_rules(
         "CREATE RULE reach AS
            MATCH (a:Node)-[:EDGE]->(b:Node)
            YIELD KEY a, KEY b",
     )?;
 
-    // Clear the registry.
-    db.locy().clear_registry();
+    // Clear the global registry.
+    db.clear_rules();
 
     // Evaluating a QUERY that references the cleared rule should fail or
     // return empty results (rule is no longer available).
-    let result = db.locy().evaluate("QUERY reach WHERE a.name = 'A'").await;
+    let result = db.session().locy("QUERY reach WHERE a.name = 'A'").await;
     // The query should fail because 'reach' is not defined.
     assert!(result.is_err(), "Should fail when querying a cleared rule");
 

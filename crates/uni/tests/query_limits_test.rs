@@ -14,11 +14,12 @@ async fn test_query_timeout() -> Result<()> {
 
     // Create some data
     for _ in 0..100 {
-        db.execute("CREATE (:Node)").await?;
+        db.session().execute("CREATE (:Node)").await?;
     }
 
     // This query should be very fast, but let's set an extremely short timeout
     let res = db
+        .session()
         .query_with("MATCH (n:Node) RETURN n")
         .timeout(Duration::from_nanos(1))
         .fetch_all()
@@ -40,11 +41,12 @@ async fn test_query_memory_limit() -> Result<()> {
 
     // Create some data
     for _ in 0..100 {
-        db.execute("CREATE (:Node)").await?;
+        db.session().execute("CREATE (:Node)").await?;
     }
 
     // Set an extremely small memory limit
     let res = db
+        .session()
         .query_with("MATCH (n:Node) RETURN n")
         .max_memory(100) // 100 bytes
         .fetch_all()

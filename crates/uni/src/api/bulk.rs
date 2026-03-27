@@ -26,11 +26,12 @@
 //! let status = db.index_rebuild_status().await?;
 //! ```
 
-use crate::api::Uni;
+use crate::api::UniInner;
 use anyhow::{Result, anyhow};
 use chrono::Utc;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use uni_common::Value;
 use uni_common::core::id::{Eid, Vid};
@@ -43,19 +44,25 @@ use uni_store::storage::{IndexManager, IndexRebuildManager};
 use uuid::Uuid;
 
 /// Builder for configuring a bulk writer.
-pub struct BulkWriterBuilder<'a> {
-    db: &'a Uni,
+pub struct BulkWriterBuilder {
+    db: Arc<UniInner>,
     config: BulkConfig,
     progress_callback: Option<Box<dyn Fn(BulkProgress) + Send>>,
+    /// Session write guard — released when the BulkWriter is committed/aborted/dropped.
+    session_write_guard: Option<Arc<AtomicBool>>,
 }
 
-impl<'a> BulkWriterBuilder<'a> {
-    /// Create a new bulk writer builder with default configuration.
-    pub fn new(db: &'a Uni) -> Self {
+impl BulkWriterBuilder {
+    /// Create a new bulk writer builder bound to a session write guard.
+    ///
+    /// The guard is released when the resulting `BulkWriter` is committed,
+    /// aborted, or dropped.
+    pub(crate) fn new_with_guard(db: Arc<UniInner>, guard: Arc<AtomicBool>) -> Self {
         Self {
             db,
             config: BulkConfig::default(),
             progress_callback: None,
+            session_write_guard: Some(guard),
         }
     }
 
@@ -126,8 +133,12 @@ impl<'a> BulkWriterBuilder<'a> {
     /// # Errors
     ///
     /// Returns an error if the database is not writable.
-    pub fn build(self) -> Result<BulkWriter<'a>> {
+    pub fn build(self) -> Result<BulkWriter> {
         if self.db.writer.is_none() {
+            // Release session guard on failure so the session isn't stuck.
+            if let Some(guard) = &self.session_write_guard {
+                guard.store(false, Ordering::SeqCst);
+            }
             return Err(anyhow!("BulkWriter requires a writable database instance"));
         }
 
@@ -144,6 +155,7 @@ impl<'a> BulkWriterBuilder<'a> {
             initial_table_versions: HashMap::new(),
             buffer_size_bytes: 0,
             committed: false,
+            session_write_guard: self.session_write_guard,
         })
     }
 }
@@ -244,8 +256,8 @@ impl EdgeData {
 ///
 /// Use `abort()` to discard uncommitted changes and roll back storage to its
 /// pre-bulk-load state.
-pub struct BulkWriter<'a> {
-    db: &'a Uni,
+pub struct BulkWriter {
+    db: Arc<UniInner>,
     config: BulkConfig,
     progress_callback: Option<Box<dyn Fn(BulkProgress) + Send>>,
     stats: BulkStats,
@@ -262,9 +274,11 @@ pub struct BulkWriter<'a> {
     // Current buffer size in bytes (approximate)
     buffer_size_bytes: usize,
     committed: bool,
+    /// Session write guard — released when committed/aborted/dropped.
+    session_write_guard: Option<Arc<AtomicBool>>,
 }
 
-impl<'a> BulkWriter<'a> {
+impl BulkWriter {
     /// Returns the current timestamp in microseconds since Unix epoch.
     fn get_current_timestamp_micros(&self) -> i64 {
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -1199,8 +1213,12 @@ impl<'a> BulkWriter<'a> {
         }
 
         self.committed = true;
+        // Release session write guard on successful commit
+        if let Some(guard) = &self.session_write_guard {
+            guard.store(false, Ordering::SeqCst);
+        }
         self.stats.duration = self.start_time.elapsed();
-        Ok(self.stats)
+        Ok(self.stats.clone())
     }
 
     /// Abort bulk loading and roll back all changes.
@@ -1261,6 +1279,9 @@ impl<'a> BulkWriter<'a> {
         // 3. Clear table cache to ensure next read picks up rolled-back state
         self.db.storage.clear_table_cache();
 
+        // Release session write guard on abort
+        self.release_guard();
+
         if rollback_errors.is_empty() {
             log::info!(
                 "Bulk load aborted successfully. Rolled back {} tables, dropped {} tables.",
@@ -1286,6 +1307,22 @@ impl<'a> BulkWriter<'a> {
                 current_label: label,
                 elapsed: self.start_time.elapsed(),
             });
+        }
+    }
+
+    /// Release the session write guard if this bulk writer holds one.
+    fn release_guard(&self) {
+        if let Some(guard) = &self.session_write_guard {
+            guard.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
+impl Drop for BulkWriter {
+    fn drop(&mut self) {
+        if !self.committed {
+            // Release session write guard on drop (abort case or forgotten writer)
+            self.release_guard();
         }
     }
 }

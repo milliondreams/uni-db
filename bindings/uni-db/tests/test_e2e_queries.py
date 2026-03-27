@@ -93,13 +93,11 @@ class TestAggregations:
 
     def test_group_by_aggregation(self, social_db_populated):
         """Test aggregation with GROUP BY."""
-        results = social_db_populated.query(
-            """
+        results = social_db_populated.query("""
             MATCH (p:Person)-[:WORKS_AT]->(c:Company)
             RETURN c.name AS company, count(p) AS employee_count
             ORDER BY company
-        """
-        )
+        """)
         assert len(results) == 2
         companies = {r["company"]: r["employee_count"] for r in results}
         assert companies["TechCorp"] == 2
@@ -157,28 +155,24 @@ class TestAdvancedCypher:
 
     def test_optional_match(self, social_db_populated):
         """Test OPTIONAL MATCH for nullable relationships."""
-        results = social_db_populated.query(
-            """
+        results = social_db_populated.query("""
             MATCH (p:Person {name: 'Diana'})
             OPTIONAL MATCH (p)-[:WORKS_AT]->(c:Company)
             RETURN p.name AS name, c.name AS company
-        """
-        )
+        """)
         assert len(results) == 1
         assert results[0]["name"] == "Diana"
         assert results[0]["company"] is None
 
     def test_union_queries(self, social_db_populated):
         """Test UNION to combine multiple query results."""
-        results = social_db_populated.query(
-            """
+        results = social_db_populated.query("""
             MATCH (p:Person {name: 'Alice'})
             RETURN p.name AS name
             UNION
             MATCH (p:Person {name: 'Bob'})
             RETURN p.name AS name
-        """
-        )
+        """)
         assert len(results) == 2
         names = [r["name"] for r in results]
         assert "Alice" in names
@@ -186,15 +180,13 @@ class TestAdvancedCypher:
 
     def test_with_clause(self, social_db_populated):
         """Test WITH clause for multi-stage queries."""
-        results = social_db_populated.query(
-            """
+        results = social_db_populated.query("""
             MATCH (p:Person)
             WITH p.age AS age, count(p) AS cnt
             WHERE age > 28
             RETURN age, cnt
             ORDER BY age
-        """
-        )
+        """)
         assert len(results) == 3
         # Ages: 30 (Alice), 32 (Eve), 35 (Charlie)
         assert results[0]["age"] == 30
@@ -204,13 +196,11 @@ class TestAdvancedCypher:
 
     def test_variable_length_path_1_to_2(self, social_db_populated):
         """Test variable-length path pattern *1..2."""
-        results = social_db_populated.query(
-            """
+        results = social_db_populated.query("""
             MATCH (a:Person {name: 'Alice'})-[:KNOWS*1..2]->(b:Person)
             RETURN DISTINCT b.name AS name
             ORDER BY name
-        """
-        )
+        """)
         # Alice knows Bob (1 hop) and Charlie (1 hop)
         # Bob knows Charlie (2 hops from Alice)
         # So we should get Bob and Charlie
@@ -220,13 +210,11 @@ class TestAdvancedCypher:
 
     def test_variable_length_path_1_to_3(self, social_db_populated):
         """Test variable-length path pattern *1..3."""
-        results = social_db_populated.query(
-            """
+        results = social_db_populated.query("""
             MATCH (a:Person {name: 'Alice'})-[:KNOWS*1..3]->(b:Person)
             RETURN DISTINCT b.name AS name
             ORDER BY name
-        """
-        )
+        """)
         # Alice -> Bob (1), Alice -> Charlie (1)
         # Alice -> Bob -> Charlie (2)
         names = [r["name"] for r in results]
@@ -239,14 +227,12 @@ class TestWhereClause:
 
     def test_where_and(self, social_db_populated):
         """Test WHERE with AND."""
-        results = social_db_populated.query(
-            """
+        results = social_db_populated.query("""
             MATCH (p:Person)
             WHERE p.age > 25 AND p.age < 35
             RETURN p.name AS name
             ORDER BY name
-        """
-        )
+        """)
         # Ages: 28 (Diana), 30 (Alice), 32 (Eve)
         assert len(results) == 3
         names = [r["name"] for r in results]
@@ -256,28 +242,24 @@ class TestWhereClause:
 
     def test_where_or(self, social_db_populated):
         """Test WHERE with OR."""
-        results = social_db_populated.query(
-            """
+        results = social_db_populated.query("""
             MATCH (p:Person)
             WHERE p.name = 'Alice' OR p.name = 'Bob'
             RETURN p.name AS name
             ORDER BY name
-        """
-        )
+        """)
         assert len(results) == 2
         assert results[0]["name"] == "Alice"
         assert results[1]["name"] == "Bob"
 
     def test_where_not(self, social_db_populated):
         """Test WHERE with NOT."""
-        results = social_db_populated.query(
-            """
+        results = social_db_populated.query("""
             MATCH (p:Person)
             WHERE NOT p.age >= 30
             RETURN p.name AS name
             ORDER BY name
-        """
-        )
+        """)
         # Ages < 30: Bob (25), Diana (28)
         assert len(results) == 2
         names = [r["name"] for r in results]
@@ -332,13 +314,11 @@ class TestDistinctAndAliases:
 
     def test_distinct(self, social_db_populated):
         """Test DISTINCT to remove duplicates."""
-        results = social_db_populated.query(
-            """
+        results = social_db_populated.query("""
             MATCH (p:Person)-[:WORKS_AT]->(c:Company)
             RETURN DISTINCT c.name AS company
             ORDER BY company
-        """
-        )
+        """)
         companies = [r["company"] for r in results]
         assert len(companies) >= 2
         assert "StartupInc" in companies
@@ -346,14 +326,12 @@ class TestDistinctAndAliases:
 
     def test_return_aliases(self, social_db_populated):
         """Test RETURN with various aliases."""
-        results = social_db_populated.query(
-            """
+        results = social_db_populated.query("""
             MATCH (p:Person)
             RETURN p.name AS person_name, p.age AS years_old, p.email AS contact_email
             ORDER BY person_name
             LIMIT 1
-        """
-        )
+        """)
         assert len(results) == 1
         assert "person_name" in results[0]
         assert "years_old" in results[0]
@@ -506,14 +484,12 @@ class TestEdgeCases:
     def test_nullable_property_filter(self, social_db_populated):
         """Test filtering on nullable properties."""
         # Charlie and Eve don't have email
-        results = social_db_populated.query(
-            """
+        results = social_db_populated.query("""
             MATCH (p:Person)
             WHERE p.email IS NULL
             RETURN p.name AS name
             ORDER BY name
-        """
-        )
+        """)
         assert len(results) == 2
         names = [r["name"] for r in results]
         assert "Charlie" in names
@@ -522,14 +498,12 @@ class TestEdgeCases:
     def test_nullable_property_not_null(self, social_db_populated):
         """Test filtering for non-null nullable properties."""
         # Alice, Bob, Diana have email
-        results = social_db_populated.query(
-            """
+        results = social_db_populated.query("""
             MATCH (p:Person)
             WHERE p.email IS NOT NULL
             RETURN p.name AS name
             ORDER BY name
-        """
-        )
+        """)
         assert len(results) == 3
         names = [r["name"] for r in results]
         assert "Alice" in names
@@ -538,14 +512,12 @@ class TestEdgeCases:
 
     def test_relationship_property_filter(self, social_db_populated):
         """Test filtering on relationship properties."""
-        results = social_db_populated.query(
-            """
+        results = social_db_populated.query("""
             MATCH (a:Person)-[k:KNOWS]->(b:Person)
             WHERE k.since IS NOT NULL AND k.since >= 2018
             RETURN a.name AS src, b.name AS dst, k.since AS year
             ORDER BY k.since
-        """
-        )
+        """)
         assert len(results) == 2
         # Bob->Charlie (2018), Alice->Charlie (2020)
         assert results[0]["year"] == 2018
@@ -553,13 +525,11 @@ class TestEdgeCases:
 
     def test_complex_path_pattern(self, social_db_populated):
         """Test complex path pattern matching."""
-        results = social_db_populated.query(
-            """
+        results = social_db_populated.query("""
             MATCH (a:Person)-[:KNOWS]->(b:Person)-[:WORKS_AT]->(c:Company)
             RETURN a.name AS person, b.name AS friend, c.name AS company
             ORDER BY person, friend
-        """
-        )
+        """)
         # Alice->Bob->TechCorp, Alice->Charlie->StartupInc
         # Bob->Charlie->StartupInc
         assert len(results) >= 2

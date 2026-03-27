@@ -228,6 +228,84 @@ pub fn register_cypher_udfs(ctx: &SessionContext) -> DFResult<()> {
     Ok(())
 }
 
+/// Register user-defined custom scalar functions from a [`CustomFunctionRegistry`]
+/// as DataFusion UDFs on the given session context.
+pub fn register_custom_udfs(
+    ctx: &SessionContext,
+    registry: &super::executor::custom_functions::CustomFunctionRegistry,
+) -> DFResult<()> {
+    for (name, func) in registry.iter() {
+        // Register with both lowercase and uppercase so that resolve_udfs
+        // finds the UDF regardless of the case the user writes in Cypher.
+        let lower = name.to_lowercase();
+        ctx.register_udf(ScalarUDF::new_from_impl(CustomScalarUdf::new(
+            lower,
+            func.clone(),
+        )));
+        // name is already UPPERCASE from the registry
+        ctx.register_udf(ScalarUDF::new_from_impl(CustomScalarUdf::new(
+            name.to_string(),
+            func.clone(),
+        )));
+    }
+    Ok(())
+}
+
+/// Adapter that wraps a [`CustomScalarFn`] as a DataFusion `ScalarUDFImpl`.
+///
+/// Uses `LargeBinary` (CypherValue encoding) as the return type, matching
+/// the convention used by other Cypher UDFs in this module.
+struct CustomScalarUdf {
+    name: String,
+    func: super::executor::custom_functions::CustomScalarFn,
+    signature: Signature,
+}
+
+impl CustomScalarUdf {
+    fn new(name: String, func: super::executor::custom_functions::CustomScalarFn) -> Self {
+        Self {
+            signature: Signature::new(TypeSignature::VariadicAny, Volatility::Volatile),
+            name,
+            func,
+        }
+    }
+}
+
+impl std::fmt::Debug for CustomScalarUdf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CustomScalarUdf")
+            .field("name", &self.name)
+            .finish()
+    }
+}
+
+impl_udf_eq_hash!(CustomScalarUdf);
+
+impl ScalarUDFImpl for CustomScalarUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::LargeBinary)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let func = &self.func;
+        invoke_cypher_udf(args, &DataType::LargeBinary, |vals| {
+            func(vals).map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))
+        })
+    }
+}
+
 // ============================================================================
 // id(node) -> UInt64
 // ============================================================================

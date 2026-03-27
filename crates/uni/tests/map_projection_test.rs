@@ -17,21 +17,24 @@ async fn test_map_projection_property_selection() -> Result<()> {
     let db = Uni::temporary().build().await?;
 
     // Create schema
-    db.execute("CREATE LABEL Person (name STRING, age INT32, city STRING)")
+    db.session()
+        .execute("CREATE LABEL Person (name STRING, age INT32, city STRING)")
         .await?;
 
     // Create a person node with properties
-    db.execute("CREATE (:Person {name: 'Alice', age: 30, city: 'NYC'})")
+    db.session()
+        .execute("CREATE (:Person {name: 'Alice', age: 30, city: 'NYC'})")
         .await?;
     db.flush().await?;
 
     // Test property selection
     let results = db
+        .session()
         .query("MATCH (p:Person) RETURN p{.name, .age} AS data")
         .await?;
 
     assert_eq!(results.len(), 1);
-    let data = get_map(results.rows[0].value("data").unwrap());
+    let data = get_map(results.rows()[0].value("data").unwrap());
     assert_eq!(data.get("name"), Some(&Value::String("Alice".to_string())));
     assert_eq!(data.get("age"), Some(&Value::Int(30)));
     // city should not be included
@@ -45,17 +48,22 @@ async fn test_map_projection_property_selection() -> Result<()> {
 async fn test_map_projection_wildcard() -> Result<()> {
     let db = Uni::temporary().build().await?;
 
-    db.execute("CREATE LABEL Person (name STRING, age INT32, city STRING)")
+    db.session()
+        .execute("CREATE LABEL Person (name STRING, age INT32, city STRING)")
         .await?;
-    db.execute("CREATE (:Person {name: 'Bob', age: 25, city: 'LA'})")
+    db.session()
+        .execute("CREATE (:Person {name: 'Bob', age: 25, city: 'LA'})")
         .await?;
     db.flush().await?;
 
     // Test wildcard selection
-    let results = db.query("MATCH (p:Person) RETURN p{.*} AS data").await?;
+    let results = db
+        .session()
+        .query("MATCH (p:Person) RETURN p{.*} AS data")
+        .await?;
 
     assert_eq!(results.len(), 1);
-    let data = get_map(results.rows[0].value("data").unwrap());
+    let data = get_map(results.rows()[0].value("data").unwrap());
     assert_eq!(data.get("name"), Some(&Value::String("Bob".to_string())));
     assert_eq!(data.get("age"), Some(&Value::Int(25)));
     assert_eq!(data.get("city"), Some(&Value::String("LA".to_string())));
@@ -68,19 +76,22 @@ async fn test_map_projection_wildcard() -> Result<()> {
 async fn test_map_projection_computed_properties() -> Result<()> {
     let db = Uni::temporary().build().await?;
 
-    db.execute("CREATE LABEL Person (name STRING, age INT32)")
+    db.session()
+        .execute("CREATE LABEL Person (name STRING, age INT32)")
         .await?;
-    db.execute("CREATE (:Person {name: 'Charlie', age: 35})")
+    db.session()
+        .execute("CREATE (:Person {name: 'Charlie', age: 35})")
         .await?;
     db.flush().await?;
 
     // Test computed properties
     let results = db
+        .session()
         .query("MATCH (p:Person) RETURN p{.name, doubled: p.age * 2} AS data")
         .await?;
 
     assert_eq!(results.len(), 1);
-    let data = get_map(results.rows[0].value("data").unwrap());
+    let data = get_map(results.rows()[0].value("data").unwrap());
     assert_eq!(
         data.get("name"),
         Some(&Value::String("Charlie".to_string()))
@@ -97,19 +108,22 @@ async fn test_map_projection_computed_properties() -> Result<()> {
 async fn test_map_projection_mixed() -> Result<()> {
     let db = Uni::temporary().build().await?;
 
-    db.execute("CREATE LABEL Person (name STRING, age INT32, city STRING)")
+    db.session()
+        .execute("CREATE LABEL Person (name STRING, age INT32, city STRING)")
         .await?;
-    db.execute("CREATE (:Person {name: 'Diana', age: 28, city: 'SF'})")
+    db.session()
+        .execute("CREATE (:Person {name: 'Diana', age: 28, city: 'SF'})")
         .await?;
     db.flush().await?;
 
     // Test mixed selection
     let results = db
+        .session()
         .query("MATCH (p:Person) RETURN p{.*, yearsToRetirement: 65 - p.age} AS data")
         .await?;
 
     assert_eq!(results.len(), 1);
-    let data = get_map(results.rows[0].value("data").unwrap());
+    let data = get_map(results.rows()[0].value("data").unwrap());
     assert_eq!(data.get("name"), Some(&Value::String("Diana".to_string())));
     assert_eq!(data.get("age"), Some(&Value::Int(28)));
     assert_eq!(data.get("city"), Some(&Value::String("SF".to_string())));
@@ -123,21 +137,25 @@ async fn test_map_projection_mixed() -> Result<()> {
 async fn test_map_projection_with_where() -> Result<()> {
     let db = Uni::temporary().build().await?;
 
-    db.execute("CREATE LABEL Person (name STRING, age INT32, city STRING)")
+    db.session()
+        .execute("CREATE LABEL Person (name STRING, age INT32, city STRING)")
         .await?;
-    db.execute("CREATE (:Person {name: 'Eve', age: 40, city: 'Boston'})")
+    db.session()
+        .execute("CREATE (:Person {name: 'Eve', age: 40, city: 'Boston'})")
         .await?;
-    db.execute("CREATE (:Person {name: 'Frank', age: 20, city: 'Seattle'})")
+    db.session()
+        .execute("CREATE (:Person {name: 'Frank', age: 20, city: 'Seattle'})")
         .await?;
     db.flush().await?;
 
     // Test map projection with WHERE clause
     let results = db
+        .session()
         .query("MATCH (p:Person) WHERE p.age > 30 RETURN p{.name, .city} AS data")
         .await?;
 
     assert_eq!(results.len(), 1);
-    let data = get_map(results.rows[0].value("data").unwrap());
+    let data = get_map(results.rows()[0].value("data").unwrap());
     assert_eq!(data.get("name"), Some(&Value::String("Eve".to_string())));
     assert_eq!(data.get("city"), Some(&Value::String("Boston".to_string())));
 
@@ -149,24 +167,29 @@ async fn test_map_projection_with_where() -> Result<()> {
 async fn test_map_projection_with_order_limit() -> Result<()> {
     let db = Uni::temporary().build().await?;
 
-    db.execute("CREATE LABEL Person (name STRING, age INT32)")
+    db.session()
+        .execute("CREATE LABEL Person (name STRING, age INT32)")
         .await?;
-    db.execute("CREATE (:Person {name: 'Grace', age: 45})")
+    db.session()
+        .execute("CREATE (:Person {name: 'Grace', age: 45})")
         .await?;
-    db.execute("CREATE (:Person {name: 'Henry', age: 50})")
+    db.session()
+        .execute("CREATE (:Person {name: 'Henry', age: 50})")
         .await?;
-    db.execute("CREATE (:Person {name: 'Ivy', age: 42})")
+    db.session()
+        .execute("CREATE (:Person {name: 'Ivy', age: 42})")
         .await?;
     db.flush().await?;
 
     // Test with ORDER BY and LIMIT
     let results = db
+        .session()
         .query("MATCH (p:Person) RETURN p{.name, .age} AS data ORDER BY p.age DESC LIMIT 2")
         .await?;
 
     assert_eq!(results.len(), 2);
-    let data0 = get_map(results.rows[0].value("data").unwrap());
-    let data1 = get_map(results.rows[1].value("data").unwrap());
+    let data0 = get_map(results.rows()[0].value("data").unwrap());
+    let data1 = get_map(results.rows()[1].value("data").unwrap());
     assert_eq!(data0.get("name"), Some(&Value::String("Henry".to_string())));
     assert_eq!(data0.get("age"), Some(&Value::Int(50)));
     assert_eq!(data1.get("name"), Some(&Value::String("Grace".to_string())));
@@ -180,25 +203,30 @@ async fn test_map_projection_with_order_limit() -> Result<()> {
 async fn test_map_projection_multiple_nodes() -> Result<()> {
     let db = Uni::temporary().build().await?;
 
-    db.execute("CREATE LABEL Person (name STRING, age INT32)")
+    db.session()
+        .execute("CREATE LABEL Person (name STRING, age INT32)")
         .await?;
-    db.execute("CREATE (:Person {name: 'Kate', age: 29})")
+    db.session()
+        .execute("CREATE (:Person {name: 'Kate', age: 29})")
         .await?;
-    db.execute("CREATE (:Person {name: 'Leo', age: 31})")
+    db.session()
+        .execute("CREATE (:Person {name: 'Leo', age: 31})")
         .await?;
-    db.execute("CREATE (:Person {name: 'Mia', age: 27})")
+    db.session()
+        .execute("CREATE (:Person {name: 'Mia', age: 27})")
         .await?;
     db.flush().await?;
 
     // Test with multiple nodes
     let results = db
+        .session()
         .query("MATCH (p:Person) RETURN p{.name} AS data ORDER BY p.name")
         .await?;
 
     assert_eq!(results.len(), 3);
-    let data0 = get_map(results.rows[0].value("data").unwrap());
-    let data1 = get_map(results.rows[1].value("data").unwrap());
-    let data2 = get_map(results.rows[2].value("data").unwrap());
+    let data0 = get_map(results.rows()[0].value("data").unwrap());
+    let data1 = get_map(results.rows()[1].value("data").unwrap());
+    let data2 = get_map(results.rows()[2].value("data").unwrap());
     assert_eq!(data0.get("name"), Some(&Value::String("Kate".to_string())));
     assert_eq!(data1.get("name"), Some(&Value::String("Leo".to_string())));
     assert_eq!(data2.get("name"), Some(&Value::String("Mia".to_string())));
@@ -211,19 +239,22 @@ async fn test_map_projection_multiple_nodes() -> Result<()> {
 async fn test_map_projection_string_concat() -> Result<()> {
     let db = Uni::temporary().build().await?;
 
-    db.execute("CREATE LABEL Person (firstName STRING, lastName STRING)")
+    db.session()
+        .execute("CREATE LABEL Person (firstName STRING, lastName STRING)")
         .await?;
-    db.execute("CREATE (:Person {firstName: 'Nora', lastName: 'Smith'})")
+    db.session()
+        .execute("CREATE (:Person {firstName: 'Nora', lastName: 'Smith'})")
         .await?;
     db.flush().await?;
 
     // Test string concatenation in computed property
     let results = db
+        .session()
         .query("MATCH (p:Person) RETURN p{fullName: p.firstName + ' ' + p.lastName} AS data")
         .await?;
 
     assert_eq!(results.len(), 1);
-    let data = get_map(results.rows[0].value("data").unwrap());
+    let data = get_map(results.rows()[0].value("data").unwrap());
     assert_eq!(
         data.get("fullName"),
         Some(&Value::String("Nora Smith".to_string()))
@@ -237,16 +268,23 @@ async fn test_map_projection_string_concat() -> Result<()> {
 async fn test_map_projection_with_edges() -> Result<()> {
     let db = Uni::temporary().build().await?;
 
-    db.execute("CREATE LABEL Person (name STRING)").await?;
-    db.execute("CREATE EDGE TYPE FRIEND_OF () FROM Person TO Person")
+    db.session()
+        .execute("CREATE LABEL Person (name STRING)")
+        .await?;
+    db.session()
+        .execute("CREATE EDGE TYPE FRIEND_OF () FROM Person TO Person")
         .await?;
 
     // Create nodes first
-    db.execute("CREATE (a:Person {name: 'Oscar'})").await?;
-    db.execute("CREATE (b:Person {name: 'Paula'})").await?;
+    db.session()
+        .execute("CREATE (a:Person {name: 'Oscar'})")
+        .await?;
+    db.session()
+        .execute("CREATE (b:Person {name: 'Paula'})")
+        .await?;
 
     // Create edge
-    db.execute(
+    db.session().execute(
         "MATCH (a:Person {name: 'Oscar'}), (b:Person {name: 'Paula'}) CREATE (a)-[:FRIEND_OF]->(b)",
     )
     .await?;
@@ -254,12 +292,13 @@ async fn test_map_projection_with_edges() -> Result<()> {
 
     // Test basic map projection syntax on relationship (even if properties are empty)
     let results = db
+        .session()
         .query("MATCH (a:Person)-[r:FRIEND_OF]->(b:Person) RETURN r{.*} AS relData")
         .await?;
 
     assert_eq!(results.len(), 1);
     // Just verify the query executes without error
-    let _rel_data = results.rows[0].value("relData").unwrap();
+    let _rel_data = results.rows()[0].value("relData").unwrap();
 
     Ok(())
 }
@@ -269,26 +308,29 @@ async fn test_map_projection_with_edges() -> Result<()> {
 async fn test_map_projection_multiple() -> Result<()> {
     let db = Uni::temporary().build().await?;
 
-    db.execute("CREATE LABEL Person (name STRING, age INT32, city STRING)")
+    db.session()
+        .execute("CREATE LABEL Person (name STRING, age INT32, city STRING)")
         .await?;
 
     // Create two nodes
-    db.execute("CREATE (a:Person {name: 'Quinn', age: 36, city: 'Portland'})")
+    db.session()
+        .execute("CREATE (a:Person {name: 'Quinn', age: 36, city: 'Portland'})")
         .await?;
-    db.execute("CREATE (b:Person {name: 'Rose', age: 38, city: 'Seattle'})")
+    db.session()
+        .execute("CREATE (b:Person {name: 'Rose', age: 38, city: 'Seattle'})")
         .await?;
     db.flush().await?;
 
     // Test multiple map projections in the same RETURN clause
     let results = db
-        .query(
+        .session().query(
             "MATCH (a:Person), (b:Person) WHERE a.name = 'Quinn' AND b.name = 'Rose' RETURN a{.name, .city} AS person1, b{.name, .age} AS person2",
         )
         .await?;
 
     assert_eq!(results.len(), 1);
-    let person1 = get_map(results.rows[0].value("person1").unwrap());
-    let person2 = get_map(results.rows[0].value("person2").unwrap());
+    let person1 = get_map(results.rows()[0].value("person1").unwrap());
+    let person2 = get_map(results.rows()[0].value("person2").unwrap());
     assert_eq!(
         person1.get("name"),
         Some(&Value::String("Quinn".to_string()))

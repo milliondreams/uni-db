@@ -9,21 +9,36 @@
 pub mod api;
 mod shutdown;
 
+pub use api::appender::{AppenderBuilder, StreamingAppender};
 pub use api::builder::PropertiesBuilder;
-pub use api::impl_locy::LocyEngine;
+pub use api::hooks::{CommitHookContext, HookContext, QueryType, SessionHook};
+pub use api::multi_agent::{LeaseGuard, WriteLease, WriteLeaseProvider};
+pub use api::notifications::{CommitNotification, CommitStream, WatchBuilder};
+pub use api::prepared::{PreparedLocy, PreparedQuery};
 pub use api::schema::{IndexType, ScalarType, VectorAlgo, VectorIndexCfg, VectorMetric};
-pub use api::sync::UniSync;
-pub use api::transaction::Transaction;
+pub use api::session::{
+    AutoCommitBuilder, AutoCommitResult, Session, SessionCapabilities, SessionMetrics,
+    TransactionBuilder, WriteLeaseSummary,
+};
+pub use api::sync::{
+    ApplyBuilderSync, AutoCommitBuilderSync, ExecuteBuilderSync, SessionLocyBuilderSync,
+    SessionQueryBuilderSync, SessionSync, TransactionBuilderSync, TransactionLocyBuilderSync,
+    TransactionQueryBuilderSync, TransactionSync, UniSync,
+};
+pub use api::template::{SessionTemplate, SessionTemplateBuilder};
+pub use api::transaction::{
+    ApplyBuilder, ApplyResult, CommitResult, ExecuteBuilder, IsolationLevel, Transaction,
+};
 pub use api::xervo::UniXervo;
-pub use api::{Uni, UniBuilder};
+pub use api::{DatabaseMetrics, Uni, UniBuilder};
 
 // Re-exports from internal crates
 pub use uni_common::{
     CrdtType, DataType, Eid, Result, Schema, UniConfig, UniError, UniId, Vid, unival,
 };
 pub use uni_query::{
-    Edge, ExecuteResult, ExplainOutput, FromValue, Node, Path, ProfileOutput, QueryResult,
-    QueryWarning, Row, Value,
+    Edge, ExecuteResult, ExplainOutput, FromValue, Node, Path, ProfileOutput, QueryMetrics,
+    QueryResult, QueryWarning, Row, Value,
 };
 
 #[cfg(feature = "storage-internals")]
@@ -72,9 +87,12 @@ pub mod xervo {
 
 pub mod locy {
     pub use crate::api::impl_locy::LocyEngine;
+    pub use crate::api::locy_result::LocyResult;
     pub use uni_cypher::locy_ast::LocyProgram;
     pub use uni_cypher::{ParseError, parse_locy};
+    pub use uni_locy::LocyResult as RawLocyResult;
     pub use uni_locy::{
-        CommandResult, CompiledProgram, LocyCompileError, LocyConfig, LocyError, LocyResult,
+        CommandResult, CompiledProgram, DerivedEdge, DerivedFactSet, LocyCompileError, LocyConfig,
+        LocyError,
     };
 }

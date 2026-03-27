@@ -25,11 +25,11 @@ async fn test_granular_compaction_public_api() -> anyhow::Result<()> {
 
     // 2. Write Data (Fragments)
     // Fragment 1
-    db.execute("CREATE (:Node {name: 'A'})").await?;
+    db.session().execute("CREATE (:Node {name: 'A'})").await?;
     db.flush().await?;
 
     // Fragment 2
-    db.execute("CREATE (:Node {name: 'B'})").await?;
+    db.session().execute("CREATE (:Node {name: 'B'})").await?;
     db.flush().await?;
 
     // 4. Compact Label (Granular)
@@ -42,12 +42,14 @@ async fn test_granular_compaction_public_api() -> anyhow::Result<()> {
 
     // 5. Test Edge Compaction
     // Fragment 1
-    db.execute("MATCH (a:Node {name: 'A'}), (b:Node {name: 'B'}) CREATE (a)-[:REL]->(b)")
+    db.session()
+        .execute("MATCH (a:Node {name: 'A'}), (b:Node {name: 'B'}) CREATE (a)-[:REL]->(b)")
         .await?;
     db.flush().await?;
 
     // Fragment 2
-    db.execute("MATCH (a:Node {name: 'A'}), (b:Node {name: 'B'}) CREATE (b)-[:REL]->(a)")
+    db.session()
+        .execute("MATCH (a:Node {name: 'A'}), (b:Node {name: 'B'}) CREATE (b)-[:REL]->(a)")
         .await?;
     db.flush().await?;
 

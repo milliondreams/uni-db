@@ -79,7 +79,7 @@ async fn test_supply_chain_use_case() -> anyhow::Result<()> {
     ]);
 
     let parts = vec![p1_props, p2_props, p3_props];
-    let part_vids = db.bulk_insert_vertices("Part", parts).await?;
+    let part_vids = db.session().bulk_insert_vertices("Part", parts).await?;
     let p1 = part_vids[0]; // Defective
     let p2 = part_vids[1];
     let p3 = part_vids[2];
@@ -89,7 +89,10 @@ async fn test_supply_chain_use_case() -> anyhow::Result<()> {
         ("name".to_string(), unival!("Smartphone X")),
         ("price".to_string(), unival!(500.0)),
     ]);
-    let prod_vids = db.bulk_insert_vertices("Product", vec![prod_props]).await?;
+    let prod_vids = db
+        .session()
+        .bulk_insert_vertices("Product", vec![prod_props])
+        .await?;
     let phone = prod_vids[0];
 
     // Edges:
@@ -102,7 +105,9 @@ async fn test_supply_chain_use_case() -> anyhow::Result<()> {
         (phone, p3, HashMap::new()),
         (p2, p1, HashMap::new()),
     ];
-    db.bulk_insert_edges("ASSEMBLED_FROM", assembly).await?;
+    db.session()
+        .bulk_insert_edges("ASSEMBLED_FROM", assembly)
+        .await?;
 
     db.flush().await?; // Flush to ensure scalar index is built? (if used)
 
@@ -118,15 +123,15 @@ async fn test_supply_chain_use_case() -> anyhow::Result<()> {
         RETURN DISTINCT product.name, product.price
     ";
 
-    let result = db.query_with(query_impact).fetch_all().await?;
+    let result = db.session().query_with(query_impact).fetch_all().await?;
 
     // We expect at least Smartphone X.
     // Due to potential lack of Label filtering in Traverse, we might get other nodes (Parts) with Null props.
-    // assert!(result.rows.len() >= 1, "Should find Smartphone X");
+    // assert!(result.len() >= 1, "Should find Smartphone X");
 
     // Check if Smartphone X is in results
-    let found = result.rows.iter().any(|row| {
-        if let Some(val) = row.values.first()
+    let found = result.rows().iter().any(|row| {
+        if let Some(val) = row.values().first()
             && let Ok(name) = String::try_from(val)
         {
             return name == "Smartphone X";

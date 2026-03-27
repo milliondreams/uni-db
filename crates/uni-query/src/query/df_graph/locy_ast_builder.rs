@@ -14,7 +14,7 @@ use uni_cypher::ast::{
     ReturnItem, Statement,
 };
 use uni_cypher::locy_ast::{DeriveClause, DeriveNodeSpec, DerivePattern};
-use uni_locy::{LocyError, Row};
+use uni_locy::{FactRow, LocyError};
 
 /// Build a `MATCH pattern RETURN *` query from a compiled clause's match pattern.
 pub fn build_match_return_query(pattern: &Pattern, where_conditions: &[Expr]) -> Query {
@@ -40,7 +40,10 @@ pub fn build_match_return_query(pattern: &Pattern, where_conditions: &[Expr]) ->
 }
 
 /// Build a CREATE query for a DERIVE clause's patterns.
-pub fn build_derive_create(derive: &DeriveClause, bindings: &Row) -> Result<Vec<Query>, LocyError> {
+pub fn build_derive_create(
+    derive: &DeriveClause,
+    bindings: &FactRow,
+) -> Result<Vec<Query>, LocyError> {
     match derive {
         DeriveClause::Patterns(patterns) => {
             let mut queries = Vec::new();
@@ -60,7 +63,7 @@ pub fn build_derive_create(derive: &DeriveClause, bindings: &Row) -> Result<Vec<
 /// Build a MATCH+CREATE query from a single derive pattern.
 fn build_create_from_derive_pattern(
     pattern: &DerivePattern,
-    bindings: &Row,
+    bindings: &FactRow,
 ) -> Result<Query, LocyError> {
     let source = &pattern.source;
     let edge = &pattern.edge;
@@ -165,7 +168,7 @@ fn build_create_from_derive_pattern(
 ///
 /// Returns `(NodePattern, Option<Expr>)` — the node pattern and an optional
 /// VID-equality predicate for the MATCH WHERE clause.
-fn match_node_from_binding(var_name: &str, bindings: &Row) -> (NodePattern, Option<Expr>) {
+fn match_node_from_binding(var_name: &str, bindings: &FactRow) -> (NodePattern, Option<Expr>) {
     if let Some(Value::Node(node)) = bindings.get(var_name) {
         let vid_i64 = node.vid.as_u64() as i64;
         let vid_filter = Expr::BinaryOp {
@@ -201,7 +204,7 @@ fn match_node_from_binding(var_name: &str, bindings: &Row) -> (NodePattern, Opti
 }
 
 /// Build a MERGE query for DERIVE MERGE a, b.
-pub fn build_merge_query(a: &str, b: &str, _bindings: &Row) -> Result<Query, LocyError> {
+pub fn build_merge_query(a: &str, b: &str, _bindings: &FactRow) -> Result<Query, LocyError> {
     let source = PatternElement::Node(NodePattern {
         variable: Some(a.to_string()),
         labels: vec![],
@@ -240,7 +243,7 @@ pub fn build_merge_query(a: &str, b: &str, _bindings: &Row) -> Result<Query, Loc
     }))
 }
 
-fn node_spec_to_pattern(spec: &DeriveNodeSpec, bindings: &Row) -> NodePattern {
+fn node_spec_to_pattern(spec: &DeriveNodeSpec, bindings: &FactRow) -> NodePattern {
     let variable = Some(spec.variable.clone());
     let labels = spec.labels.clone();
 
@@ -267,7 +270,7 @@ fn node_spec_to_pattern(spec: &DeriveNodeSpec, bindings: &Row) -> NodePattern {
 }
 
 /// Generate a deterministic Skolem ID for a NEW node based on its variable name and bindings.
-pub fn generate_skolem_id(var_name: &str, bindings: &Row) -> String {
+pub fn generate_skolem_id(var_name: &str, bindings: &FactRow) -> String {
     use std::collections::BTreeMap;
     let sorted: BTreeMap<&String, &Value> = bindings.iter().collect();
     let mut parts = vec![var_name.to_string()];

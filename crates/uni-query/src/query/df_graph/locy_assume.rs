@@ -12,7 +12,7 @@ use std::time::Instant;
 use uni_cypher::ast::Query;
 use uni_locy::result::CommandResult;
 use uni_locy::types::{CompiledAssume, CompiledCommand};
-use uni_locy::{CompiledProgram, LocyConfig, LocyError, LocyStats, Row};
+use uni_locy::{CompiledProgram, FactRow, LocyConfig, LocyError, LocyStats};
 
 use super::locy_delta::RowStore;
 
@@ -27,7 +27,7 @@ pub async fn evaluate_assume(
     ctx: &dyn LocyExecutionContext,
     config: &LocyConfig,
     stats: &mut LocyStats,
-) -> Result<Vec<Row>, LocyError> {
+) -> Result<Vec<FactRow>, LocyError> {
     // 1. Begin savepoint
     let savepoint_id = ctx
         .begin_savepoint()

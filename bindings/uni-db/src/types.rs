@@ -442,3 +442,189 @@ impl IndexDefinitionInfo {
         )
     }
 }
+
+// ============================================================================
+// Commit notification
+// ============================================================================
+
+/// A commit notification describing the effects of a committed transaction.
+#[pyclass(get_all, name = "CommitNotification")]
+#[derive(Debug, Clone)]
+pub struct PyCommitNotification {
+    /// Database version after commit.
+    pub version: u64,
+    /// Number of mutations in the committed transaction.
+    pub mutation_count: usize,
+    /// Vertex labels affected by the commit.
+    pub labels_affected: Vec<String>,
+    /// Edge types affected by the commit.
+    pub edge_types_affected: Vec<String>,
+    /// Number of Locy rules promoted.
+    pub rules_promoted: usize,
+    /// ISO 8601 timestamp of the commit.
+    pub timestamp: String,
+    /// Transaction ID.
+    pub tx_id: String,
+    /// Session ID that committed the transaction.
+    pub session_id: String,
+    /// Database version when the transaction started.
+    pub causal_version: u64,
+}
+
+#[pymethods]
+impl PyCommitNotification {
+    fn __repr__(&self) -> String {
+        format!(
+            "CommitNotification(version={}, mutations={}, labels={:?})",
+            self.version, self.mutation_count, self.labels_affected
+        )
+    }
+}
+
+impl From<::uni_db::CommitNotification> for PyCommitNotification {
+    fn from(n: ::uni_db::CommitNotification) -> Self {
+        Self {
+            version: n.version,
+            mutation_count: n.mutation_count,
+            labels_affected: n.labels_affected,
+            edge_types_affected: n.edge_types_affected,
+            rules_promoted: n.rules_promoted,
+            timestamp: n.timestamp.to_rfc3339(),
+            tx_id: n.tx_id,
+            session_id: n.session_id,
+            causal_version: n.causal_version,
+        }
+    }
+}
+
+/// Session capabilities snapshot.
+#[pyclass(get_all, name = "SessionCapabilities")]
+#[derive(Debug, Clone)]
+pub struct PySessionCapabilities {
+    /// Whether the session can create transactions and execute writes.
+    pub can_write: bool,
+    /// Whether the session supports version pinning.
+    pub can_pin: bool,
+    /// The isolation level used for transactions.
+    pub isolation: String,
+    /// Whether commit notifications are available.
+    pub has_notifications: bool,
+}
+
+#[pymethods]
+impl PySessionCapabilities {
+    fn __repr__(&self) -> String {
+        format!(
+            "SessionCapabilities(can_write={}, has_notifications={})",
+            self.can_write, self.has_notifications
+        )
+    }
+}
+
+// ============================================================================
+// Transaction commit result
+// ============================================================================
+
+/// Result of committing a transaction.
+#[pyclass(name = "CommitResult")]
+pub struct PyCommitResult {
+    /// Number of mutations committed.
+    #[pyo3(get)]
+    pub mutations_committed: usize,
+    /// Number of rules promoted to the parent session.
+    #[pyo3(get)]
+    pub rules_promoted: usize,
+    /// Database version after commit.
+    #[pyo3(get)]
+    pub version: u64,
+    /// Database version when the transaction was created.
+    #[pyo3(get)]
+    pub started_at_version: u64,
+    /// Duration of the commit operation in seconds.
+    #[pyo3(get)]
+    pub duration_secs: f64,
+}
+
+impl From<::uni_db::CommitResult> for PyCommitResult {
+    fn from(r: ::uni_db::CommitResult) -> Self {
+        Self {
+            mutations_committed: r.mutations_committed,
+            rules_promoted: r.rules_promoted,
+            version: r.version,
+            started_at_version: r.started_at_version,
+            duration_secs: r.duration.as_secs_f64(),
+        }
+    }
+}
+
+#[pymethods]
+impl PyCommitResult {
+    fn __repr__(&self) -> String {
+        format!(
+            "CommitResult(mutations={}, version={}, duration={:.3}s)",
+            self.mutations_committed, self.version, self.duration_secs
+        )
+    }
+}
+
+// ============================================================================
+// PreparedQuery
+// ============================================================================
+
+/// A prepared Cypher query that can be executed multiple times with different parameters.
+#[pyclass]
+pub struct PyPreparedQuery {
+    pub inner: std::sync::Mutex<::uni_db::PreparedQuery>,
+}
+
+#[pymethods]
+impl PyPreparedQuery {
+    /// Execute the prepared query with optional parameter bindings.
+    #[pyo3(signature = (params=None))]
+    fn execute(
+        &self,
+        py: pyo3::Python,
+        params: Option<std::collections::HashMap<String, pyo3::Py<pyo3::PyAny>>>,
+    ) -> pyo3::PyResult<Vec<pyo3::Py<pyo3::PyAny>>> {
+        let rust_params: Vec<(String, ::uni_db::Value)> = if let Some(p) = params {
+            p.into_iter()
+                .map(|(k, v)| {
+                    let val = crate::convert::py_object_to_value(py, &v)?;
+                    Ok((k, val))
+                })
+                .collect::<pyo3::PyResult<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
+        let param_refs: Vec<(&str, ::uni_db::Value)> = rust_params
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.clone()))
+            .collect();
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        let result = pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(guard.execute(&param_refs))
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        crate::convert::rows_to_py(py, result.into_rows())
+    }
+
+    /// Get the original query text.
+    fn query_text(&self) -> pyo3::PyResult<String> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        Ok(guard.query_text().to_string())
+    }
+
+    fn __repr__(&self) -> String {
+        let text = self
+            .inner
+            .lock()
+            .map(|g| g.query_text().to_string())
+            .unwrap_or_else(|_| "<locked>".to_string());
+        format!("PreparedQuery({:?})", text)
+    }
+}

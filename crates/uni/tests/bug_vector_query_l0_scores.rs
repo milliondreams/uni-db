@@ -33,11 +33,14 @@ async fn test_vector_query_scores_without_hnsw_index() -> anyhow::Result<()> {
     let db = Uni::open(path.to_str().unwrap()).build().await?;
 
     // 2. Insert data with known embeddings: A and B identical, C orthogonal
-    db.execute("CREATE (:Item {name: 'A', embedding: [1.0, 0.0, 0.0]})")
+    db.session()
+        .execute("CREATE (:Item {name: 'A', embedding: [1.0, 0.0, 0.0]})")
         .await?;
-    db.execute("CREATE (:Item {name: 'B', embedding: [1.0, 0.0, 0.0]})")
+    db.session()
+        .execute("CREATE (:Item {name: 'B', embedding: [1.0, 0.0, 0.0]})")
         .await?;
-    db.execute("CREATE (:Item {name: 'C', embedding: [0.0, 0.0, 1.0]})")
+    db.session()
+        .execute("CREATE (:Item {name: 'C', embedding: [0.0, 0.0, 1.0]})")
         .await?;
 
     // 3. Flush but DO NOT rebuild indexes — force brute-force path
@@ -45,6 +48,7 @@ async fn test_vector_query_scores_without_hnsw_index() -> anyhow::Result<()> {
 
     // 4. Query for items similar to [1.0, 0.0, 0.0]
     let res = db
+        .session()
         .query(
             "CALL uni.vector.query('Item', 'embedding', [1.0, 0.0, 0.0], 10)
              YIELD node, score
@@ -124,15 +128,18 @@ async fn test_vector_query_score_consistency_with_and_without_index() -> anyhow:
 
     let db = Uni::open(path.to_str().unwrap()).build().await?;
 
-    db.execute("CREATE (:Item {name: 'X', embedding: [1.0, 0.0, 0.0]})")
+    db.session()
+        .execute("CREATE (:Item {name: 'X', embedding: [1.0, 0.0, 0.0]})")
         .await?;
-    db.execute("CREATE (:Item {name: 'Y', embedding: [0.7, 0.7, 0.0]})")
+    db.session()
+        .execute("CREATE (:Item {name: 'Y', embedding: [0.7, 0.7, 0.0]})")
         .await?;
 
     db.flush().await?;
 
     // 2. Query WITHOUT index
     let res_no_index = db
+        .session()
         .query(
             "CALL uni.vector.query('Item', 'embedding', [1.0, 0.0, 0.0], 10)
              YIELD node, score
@@ -145,6 +152,7 @@ async fn test_vector_query_score_consistency_with_and_without_index() -> anyhow:
     db.rebuild_indexes("Item", false).await?;
 
     let res_with_index = db
+        .session()
         .query(
             "CALL uni.vector.query('Item', 'embedding', [1.0, 0.0, 0.0], 10)
              YIELD node, score

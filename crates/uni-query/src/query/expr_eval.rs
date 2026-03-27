@@ -1680,7 +1680,11 @@ fn eval_range_function(args: &[Value]) -> Result<Value> {
 ///
 /// This handles functions like COALESCE, NULLIF, SIZE, KEYS, HEAD, TAIL, etc.
 /// Functions that require argument evaluation (like COALESCE) take pre-evaluated args.
-pub fn eval_scalar_function(name: &str, args: &[Value]) -> Result<Value> {
+pub fn eval_scalar_function(
+    name: &str,
+    args: &[Value],
+    custom_fns: Option<&super::executor::custom_functions::CustomFunctionRegistry>,
+) -> Result<Value> {
     let name_upper = name.to_uppercase();
 
     match name_upper.as_str() {
@@ -1810,7 +1814,13 @@ pub fn eval_scalar_function(name: &str, args: &[Value]) -> Result<Value> {
             eval_vector_similarity(&args[0], &args[1])
         }
 
-        _ => Err(anyhow!("Function {} not implemented or is aggregate", name)),
+        _ => {
+            // Fall back to custom function registry before reporting an error.
+            if let Some(func) = custom_fns.and_then(|r| r.get(name)) {
+                return func(args).map_err(|e| anyhow!("{}", e));
+            }
+            Err(anyhow!("Function {} not implemented or is aggregate", name))
+        }
     }
 }
 
@@ -2191,7 +2201,7 @@ mod tests {
     #[test]
     fn test_scalar_function_size() {
         assert_eq!(
-            eval_scalar_function("SIZE", &[Value::List(vec![i(1), i(2), i(3)])]).unwrap(),
+            eval_scalar_function("SIZE", &[Value::List(vec![i(1), i(2), i(3)])], None).unwrap(),
             Value::Int(3)
         );
     }
@@ -2199,7 +2209,7 @@ mod tests {
     #[test]
     fn test_scalar_function_head() {
         assert_eq!(
-            eval_scalar_function("HEAD", &[Value::List(vec![i(1), i(2), i(3)])]).unwrap(),
+            eval_scalar_function("HEAD", &[Value::List(vec![i(1), i(2), i(3)])], None).unwrap(),
             Value::Int(1)
         );
     }
@@ -2207,7 +2217,12 @@ mod tests {
     #[test]
     fn test_scalar_function_coalesce() {
         assert_eq!(
-            eval_scalar_function("COALESCE", &[Value::Null, Value::Int(1), Value::Int(2)]).unwrap(),
+            eval_scalar_function(
+                "COALESCE",
+                &[Value::Null, Value::Int(1), Value::Int(2)],
+                None
+            )
+            .unwrap(),
             Value::Int(1)
         );
     }

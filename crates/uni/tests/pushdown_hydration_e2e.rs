@@ -37,25 +37,31 @@ async fn setup_works_at_graph() -> Result<Uni> {
         .await?;
 
     // Create vertices
-    db.execute("CREATE (:Person {name: 'Alice', age: 30})")
+    db.session()
+        .execute("CREATE (:Person {name: 'Alice', age: 30})")
         .await?;
-    db.execute("CREATE (:Person {name: 'Bob', age: 25})")
+    db.session()
+        .execute("CREATE (:Person {name: 'Bob', age: 25})")
         .await?;
-    db.execute("CREATE (:Company {name: 'Acme Corp'})").await?;
-    db.execute("CREATE (:Company {name: 'TechCo'})").await?;
+    db.session()
+        .execute("CREATE (:Company {name: 'Acme Corp'})")
+        .await?;
+    db.session()
+        .execute("CREATE (:Company {name: 'TechCo'})")
+        .await?;
 
     // Create WORKS_AT edges with temporal properties
-    db.execute(
+    db.session().execute(
         "MATCH (p:Person {name: 'Alice'}), (c:Company {name: 'Acme Corp'}) \
          CREATE (p)-[:WORKS_AT {role: 'Engineer', valid_from: datetime('2020-01-01T00:00:00Z'), valid_to: datetime('2022-12-31T00:00:00Z')}]->(c)"
     ).await?;
 
-    db.execute(
+    db.session().execute(
         "MATCH (p:Person {name: 'Bob'}), (c:Company {name: 'TechCo'}) \
          CREATE (p)-[:WORKS_AT {role: 'Manager', valid_from: datetime('2021-06-01T00:00:00Z'), valid_to: datetime('2024-12-31T00:00:00Z')}]->(c)"
     ).await?;
 
-    db.execute(
+    db.session().execute(
         "MATCH (p:Person {name: 'Alice'}), (c:Company {name: 'TechCo'}) \
          CREATE (p)-[:WORKS_AT {role: 'Senior Engineer', valid_from: datetime('2023-01-01T00:00:00Z'), valid_to: datetime('2025-12-31T00:00:00Z')}]->(c)"
     ).await?;
@@ -82,35 +88,47 @@ async fn setup_knows_graph() -> Result<Uni> {
         .await?;
 
     // Create vertices
-    db.execute("CREATE (:Person {name: 'Alice'})").await?;
-    db.execute("CREATE (:Person {name: 'Bob'})").await?;
-    db.execute("CREATE (:Person {name: 'Carol'})").await?;
-    db.execute("CREATE (:Person {name: 'Dave'})").await?;
+    db.session()
+        .execute("CREATE (:Person {name: 'Alice'})")
+        .await?;
+    db.session()
+        .execute("CREATE (:Person {name: 'Bob'})")
+        .await?;
+    db.session()
+        .execute("CREATE (:Person {name: 'Carol'})")
+        .await?;
+    db.session()
+        .execute("CREATE (:Person {name: 'Dave'})")
+        .await?;
 
     // Create KNOWS edges with properties
-    db.execute(
-        "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) \
+    db.session()
+        .execute(
+            "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) \
          CREATE (a)-[:KNOWS {since: '2020-01-01', weight: 10}]->(b)",
-    )
-    .await?;
+        )
+        .await?;
 
-    db.execute(
-        "MATCH (b:Person {name: 'Bob'}), (c:Person {name: 'Carol'}) \
+    db.session()
+        .execute(
+            "MATCH (b:Person {name: 'Bob'}), (c:Person {name: 'Carol'}) \
          CREATE (b)-[:KNOWS {since: '2021-03-15', weight: 3}]->(c)",
-    )
-    .await?;
+        )
+        .await?;
 
-    db.execute(
-        "MATCH (c:Person {name: 'Carol'}), (d:Person {name: 'Dave'}) \
+    db.session()
+        .execute(
+            "MATCH (c:Person {name: 'Carol'}), (d:Person {name: 'Dave'}) \
          CREATE (c)-[:KNOWS {since: '2019-07-20', weight: 8}]->(d)",
-    )
-    .await?;
+        )
+        .await?;
 
-    db.execute(
-        "MATCH (a:Person {name: 'Alice'}), (c:Person {name: 'Carol'}) \
+    db.session()
+        .execute(
+            "MATCH (a:Person {name: 'Alice'}), (c:Person {name: 'Carol'}) \
          CREATE (a)-[:KNOWS {since: '2022-11-01', weight: 5}]->(c)",
-    )
-    .await?;
+        )
+        .await?;
 
     Ok(db)
 }
@@ -126,20 +144,20 @@ async fn test_temporal_function_pushdown() -> Result<()> {
         RETURN p.name AS person, e.role AS role, c.name AS company \
         ORDER BY person";
 
-    let result = db.query(query).await?;
+    let result = db.session().query(query).await?;
 
     // Should return Alice (Engineer at Acme) and Bob (Manager at TechCo)
     assert_eq!(result.len(), 2, "Expected 2 rows matching temporal query");
 
     // Verify Alice's row
-    assert_eq!(result.rows[0].get::<String>("person")?, "Alice");
-    assert_eq!(result.rows[0].get::<String>("role")?, "Engineer");
-    assert_eq!(result.rows[0].get::<String>("company")?, "Acme Corp");
+    assert_eq!(result.rows()[0].get::<String>("person")?, "Alice");
+    assert_eq!(result.rows()[0].get::<String>("role")?, "Engineer");
+    assert_eq!(result.rows()[0].get::<String>("company")?, "Acme Corp");
 
     // Verify Bob's row
-    assert_eq!(result.rows[1].get::<String>("person")?, "Bob");
-    assert_eq!(result.rows[1].get::<String>("role")?, "Manager");
-    assert_eq!(result.rows[1].get::<String>("company")?, "TechCo");
+    assert_eq!(result.rows()[1].get::<String>("person")?, "Bob");
+    assert_eq!(result.rows()[1].get::<String>("role")?, "Manager");
+    assert_eq!(result.rows()[1].get::<String>("company")?, "TechCo");
 
     Ok(())
 }
@@ -153,13 +171,13 @@ async fn test_edge_scan_properties() -> Result<()> {
         MATCH (:Person)-[e:KNOWS]->(:Person) \
         RETURN e.since AS since, e.weight AS weight";
 
-    let result = db.query(query).await?;
+    let result = db.session().query(query).await?;
 
     assert_eq!(result.len(), 4, "Expected 4 KNOWS edges");
 
     // Verify edge properties are materialized
     let mut dates: Vec<String> = result
-        .rows
+        .rows()
         .iter()
         .map(|r| r.get::<String>("since"))
         .collect::<Result<Vec<_>, _>>()?;
@@ -175,7 +193,7 @@ async fn test_edge_scan_properties() -> Result<()> {
 
     // Verify weights
     let weights: Vec<i64> = result
-        .rows
+        .rows()
         .iter()
         .map(|r| r.get::<i64>("weight"))
         .collect::<Result<Vec<_>, _>>()?;
@@ -200,13 +218,13 @@ async fn test_traverse_edge_properties() -> Result<()> {
         RETURN b.name AS friend, r.weight AS strength \
         ORDER BY friend";
 
-    let result = db.query(query).await?;
+    let result = db.session().query(query).await?;
 
     // Alice -> Bob (weight=10) should match, Alice -> Carol (weight=5) should not
     assert_eq!(result.len(), 1, "Expected 1 friend with weight > 5");
 
-    assert_eq!(result.rows[0].get::<String>("friend")?, "Bob");
-    assert_eq!(result.rows[0].get::<i64>("strength")?, 10);
+    assert_eq!(result.rows()[0].get::<String>("friend")?, "Bob");
+    assert_eq!(result.rows()[0].get::<i64>("strength")?, 10);
 
     Ok(())
 }
@@ -223,10 +241,10 @@ async fn test_traverse_edge_properties() -> Result<()> {
 //         WITH p, 'name' AS prop \
 //         RETURN p[prop] AS result";
 //
-//     let result = db.query(query).await?;
+//     let result = db.session().query(query).await?;
 //
 //     assert_eq!(result.len(), 1);
-//     let result_val = result.rows[0].get::<String>("result")?;
+//     let result_val = result.rows()[0].get::<String>("result")?;
 //     assert_eq!(result_val, "Alice", "Dynamic property access should work via fallback");
 //
 //     Ok(())
@@ -242,10 +260,10 @@ async fn test_keys_function_requires_all_properties() -> Result<()> {
         WHERE size(keys(e)) > 0 \
         RETURN count(e) AS edge_count";
 
-    let result = db.query(query).await?;
+    let result = db.session().query(query).await?;
 
     assert_eq!(result.len(), 1);
-    let count = result.rows[0].get::<i64>("edge_count")?;
+    let count = result.rows()[0].get::<i64>("edge_count")?;
     assert_eq!(count, 4, "All 4 edges should have keys");
 
     Ok(())
@@ -261,12 +279,12 @@ async fn test_multiple_edge_properties() -> Result<()> {
         RETURN e.role AS role, e.valid_from AS start, e.valid_to AS end \
         ORDER BY start";
 
-    let result = db.query(query).await?;
+    let result = db.session().query(query).await?;
 
     assert_eq!(result.len(), 3, "Expected 3 WORKS_AT edges");
 
     // Verify all properties are accessible
-    for row in &result.rows {
+    for row in result.rows() {
         assert!(row.get::<String>("role").is_ok(), "role should be loaded");
         // Timestamps should be loaded
         assert!(row.value("start").is_some(), "valid_from should be loaded");
@@ -297,32 +315,38 @@ async fn test_coalesce_with_edge_properties() -> Result<()> {
         .await?;
 
     // Create edges with optional properties
-    db.execute("CREATE (:Person {name: 'Alice'})").await?;
-    db.execute("CREATE (:Person {name: 'Bob'})").await?;
+    db.session()
+        .execute("CREATE (:Person {name: 'Alice'})")
+        .await?;
+    db.session()
+        .execute("CREATE (:Person {name: 'Bob'})")
+        .await?;
 
-    db.execute(
-        "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) \
+    db.session()
+        .execute(
+            "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) \
          CREATE (a)-[:FRIEND {nickname: 'Ally'}]->(b)",
-    )
-    .await?;
+        )
+        .await?;
 
-    db.execute(
-        "MATCH (b:Person {name: 'Bob'}), (a:Person {name: 'Alice'}) \
+    db.session()
+        .execute(
+            "MATCH (b:Person {name: 'Bob'}), (a:Person {name: 'Alice'}) \
          CREATE (b)-[:FRIEND]->(a)",
-    )
-    .await?;
+        )
+        .await?;
 
     // coalesce should trigger property pushdown for accessed properties
     let query = "\
         MATCH (:Person)-[f:FRIEND]->(:Person) \
         RETURN coalesce(f.nickname, 'unknown') AS display_name";
 
-    let result = db.query(query).await?;
+    let result = db.session().query(query).await?;
 
     assert_eq!(result.len(), 2);
 
     let names: Vec<String> = result
-        .rows
+        .rows()
         .iter()
         .map(|r| r.get::<String>("display_name"))
         .collect::<Result<Vec<_>, _>>()?;

@@ -30,7 +30,8 @@ pub async fn query_core(
     cypher: &str,
     params: HashMap<String, Value>,
 ) -> Result<QueryResult, String> {
-    let mut builder = db.query_with(cypher);
+    let session = db.session();
+    let mut builder = session.query_with(cypher);
     for (k, v) in params {
         builder = builder.param(&k, v);
     }
@@ -45,7 +46,8 @@ pub async fn query_builder_core(
     timeout_secs: Option<f64>,
     max_memory: Option<usize>,
 ) -> Result<QueryResult, String> {
-    let mut builder = db.query_with(cypher);
+    let session = db.session();
+    let mut builder = session.query_with(cypher);
     for (k, v) in params {
         builder = builder.param(&k, v);
     }
@@ -66,7 +68,8 @@ pub async fn query_cursor_core(
     timeout_secs: Option<f64>,
     max_memory: Option<usize>,
 ) -> Result<QueryCursor, String> {
-    let mut builder = db.query_with(cypher);
+    let session = db.session();
+    let mut builder = session.query_with(cypher);
     for (k, v) in params {
         builder = builder.param(&k, v);
     }
@@ -76,13 +79,17 @@ pub async fn query_cursor_core(
     if let Some(m) = max_memory {
         builder = builder.max_memory(m);
     }
-    builder.query_cursor().await.map_err(|e| e.to_string())
+    builder.cursor().await.map_err(|e| e.to_string())
 }
 
 /// Execute a mutation query, returning affected row count.
 pub async fn execute_core(db: &Uni, cypher: &str) -> Result<usize, String> {
-    let result = db.execute(cypher).await.map_err(|e| e.to_string())?;
-    Ok(result.affected_rows)
+    let result = db
+        .session()
+        .execute(cypher)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(result.affected_rows())
 }
 
 /// Execute a mutation query with parameters, returning affected row count.
@@ -91,22 +98,28 @@ pub async fn execute_with_params_core(
     cypher: &str,
     params: HashMap<String, Value>,
 ) -> Result<usize, String> {
-    let mut builder = db.query_with(cypher);
+    let session = db.session();
+    let mut builder = session.query_with(cypher);
     for (k, v) in params {
         builder = builder.param(&k, v);
     }
-    let result = builder.execute().await.map_err(|e| e.to_string())?;
-    Ok(result.affected_rows)
+    let result = builder
+        .execute_mutation()
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(result.affected_rows())
 }
 
 /// Explain a query plan without executing.
 pub async fn explain_core(db: &Uni, cypher: &str) -> Result<ExplainOutput, String> {
-    db.explain(cypher).await.map_err(|e| e.to_string())
+    let session = db.session();
+    session.explain(cypher).await.map_err(|e| e.to_string())
 }
 
 /// Profile query execution with operator-level statistics.
 pub async fn profile_core(db: &Uni, cypher: &str) -> Result<(QueryResult, ProfileOutput), String> {
-    db.profile(cypher).await.map_err(|e| e.to_string())
+    let session = db.session();
+    session.profile(cypher).await.map_err(|e| e.to_string())
 }
 
 /// Flush all uncommitted changes to persistent storage.
@@ -336,7 +349,8 @@ pub async fn bulk_insert_vertices_core(
         .into_iter()
         .map(|m| m.into_iter().map(|(k, v)| (k, v.into())).collect())
         .collect();
-    db.bulk_insert_vertices(label, uni_props)
+    db.session()
+        .bulk_insert_vertices(label, uni_props)
         .await
         .map_err(|e| e.to_string())
 }
@@ -351,7 +365,8 @@ pub async fn bulk_insert_edges_core(
         .into_iter()
         .map(|(s, d, m)| (s, d, m.into_iter().map(|(k, v)| (k, v.into())).collect()))
         .collect();
-    db.bulk_insert_edges(edge_type, uni_edges)
+    db.session()
+        .bulk_insert_edges(edge_type, uni_edges)
         .await
         .map_err(|e| e.to_string())
 }
@@ -506,7 +521,7 @@ pub async fn locy_evaluate_core(
     db: &Uni,
     program: &str,
 ) -> Result<::uni_db::locy::LocyResult, String> {
-    db.locy().evaluate(program).await.map_err(|e| e.to_string())
+    db.session().locy(program).await.map_err(|e| e.to_string())
 }
 
 /// Evaluate a Locy program with custom configuration.
@@ -515,8 +530,10 @@ pub async fn locy_evaluate_with_config_core(
     program: &str,
     config: ::uni_db::locy::LocyConfig,
 ) -> Result<::uni_db::locy::LocyResult, String> {
-    db.locy()
-        .evaluate_with_config(program, &config)
+    db.session()
+        .locy_with(program)
+        .with_config(config)
+        .run()
         .await
         .map_err(|e| e.to_string())
 }
@@ -526,7 +543,9 @@ pub fn locy_compile_only_core(
     db: &Uni,
     program: &str,
 ) -> Result<::uni_locy::CompiledProgram, String> {
-    db.locy().compile_only(program).map_err(|e| e.to_string())
+    db.session()
+        .compile_locy(program)
+        .map_err(|e| e.to_string())
 }
 
 /// Evaluate a Locy program with specific params, timeout, and max_iterations.
@@ -547,8 +566,10 @@ pub async fn locy_evaluate_builder_core(
     if let Some(n) = max_iterations {
         config.max_iterations = n;
     }
-    db.locy()
-        .evaluate_with_config(program, &config)
+    db.session()
+        .locy_with(program)
+        .with_config(config)
+        .run()
         .await
         .map_err(|e| e.to_string())
 }
@@ -580,6 +601,7 @@ pub async fn build_database_core(
     xervo_catalog_file: Option<&str>,
     cloud_config: Option<uni_common::CloudStorageConfig>,
     uni_config: Option<uni_common::UniConfig>,
+    read_only: bool,
 ) -> Result<Uni, String> {
     let mut builder = match mode {
         OpenMode::Open => Uni::open(uri),
@@ -620,6 +642,10 @@ pub async fn build_database_core(
 
     if let Some(cfg) = uni_config {
         builder = builder.config(cfg);
+    }
+
+    if read_only {
+        builder = builder.read_only();
     }
 
     builder.build().await.map_err(|e| e.to_string())

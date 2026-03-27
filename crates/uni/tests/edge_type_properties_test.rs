@@ -11,11 +11,16 @@ async fn test_create_edge_type_with_properties() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
     // Create labels first
-    db.execute("CREATE LABEL Person (name STRING)").await?;
-    db.execute("CREATE LABEL Company (name STRING)").await?;
+    db.session()
+        .execute("CREATE LABEL Person (name STRING)")
+        .await?;
+    db.session()
+        .execute("CREATE LABEL Company (name STRING)")
+        .await?;
 
     // Test 1: CREATE EDGE TYPE with single property
-    db.execute("CREATE EDGE TYPE WORKS_AT (since INT) FROM Person TO Company")
+    db.session()
+        .execute("CREATE EDGE TYPE WORKS_AT (since INT) FROM Person TO Company")
         .await?;
 
     let schema = db.get_schema();
@@ -28,11 +33,12 @@ async fn test_create_edge_type_with_properties() -> Result<()> {
     );
 
     // Test 2: CREATE EDGE TYPE with multiple properties
-    db.execute(
-        "CREATE EDGE TYPE KNOWS (since INT, strength FLOAT, verified BOOLEAN)
+    db.session()
+        .execute(
+            "CREATE EDGE TYPE KNOWS (since INT, strength FLOAT, verified BOOLEAN)
          FROM Person TO Person",
-    )
-    .await?;
+        )
+        .await?;
 
     let schema = db.get_schema();
     assert!(schema.edge_types.contains_key("KNOWS"));
@@ -42,7 +48,8 @@ async fn test_create_edge_type_with_properties() -> Result<()> {
     assert!(knows_props.contains_key("verified"));
 
     // Test 3: CREATE EDGE TYPE without properties (empty parentheses)
-    db.execute("CREATE EDGE TYPE FOLLOWS () FROM Person TO Person")
+    db.session()
+        .execute("CREATE EDGE TYPE FOLLOWS () FROM Person TO Person")
         .await?;
 
     let schema = db.get_schema();
@@ -52,7 +59,8 @@ async fn test_create_edge_type_with_properties() -> Result<()> {
     assert!(follows_props.is_none() || follows_props.unwrap().is_empty());
 
     // Test 4: CREATE EDGE TYPE without parentheses at all
-    db.execute("CREATE EDGE TYPE LIKES FROM Person TO Company")
+    db.session()
+        .execute("CREATE EDGE TYPE LIKES FROM Person TO Company")
         .await?;
 
     let schema = db.get_schema();
@@ -67,14 +75,17 @@ async fn test_create_edge_type_with_properties() -> Result<()> {
 async fn test_create_edge_type_with_property_constraints() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
-    db.execute("CREATE LABEL User (name STRING)").await?;
+    db.session()
+        .execute("CREATE LABEL User (name STRING)")
+        .await?;
 
     // Test nullable and non-nullable properties
-    db.execute(
-        "CREATE EDGE TYPE RATED (score INT NOT NULL, comment STRING)
+    db.session()
+        .execute(
+            "CREATE EDGE TYPE RATED (score INT NOT NULL, comment STRING)
          FROM User TO User",
-    )
-    .await?;
+        )
+        .await?;
 
     let schema = db.get_schema();
     let rated_props = schema.properties.get("RATED").unwrap();

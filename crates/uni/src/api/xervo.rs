@@ -77,7 +77,7 @@ impl UniXervo {
 impl Uni {
     /// Access Uni-Xervo runtime facade configured for this database.
     pub fn xervo(&self) -> Result<UniXervo> {
-        let runtime = self.xervo_runtime.clone().ok_or_else(|| {
+        let runtime = self.inner.xervo_runtime.clone().ok_or_else(|| {
             UniError::Internal(anyhow::anyhow!("Uni-Xervo runtime is not configured"))
         })?;
         Ok(UniXervo::new(runtime))

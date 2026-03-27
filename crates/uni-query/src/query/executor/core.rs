@@ -237,6 +237,16 @@ pub struct Executor {
     pub(crate) xervo_runtime: Option<Arc<ModelRuntime>>,
     /// Warnings collected during the last execution.
     pub(crate) warnings: Arc<std::sync::Mutex<Vec<QueryWarning>>>,
+    /// When set, overrides `writer.transaction_l0` for query context and mutations.
+    /// Used by Transaction to route reads and writes through a private L0 buffer
+    /// without requiring the writer lock at transaction-creation time.
+    pub(crate) transaction_l0_override:
+        Option<Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
+    /// Cooperative cancellation token. Passed to `QueryContext` and
+    /// `GraphExecutionContext` so in-flight operators can detect cancellation.
+    pub(crate) custom_function_registry:
+        Option<Arc<super::custom_functions::CustomFunctionRegistry>>,
+    pub(crate) cancellation_token: Option<tokio_util::sync::CancellationToken>,
 }
 
 impl std::fmt::Debug for Executor {
@@ -265,6 +275,9 @@ impl Executor {
             procedure_registry: None,
             xervo_runtime: None,
             warnings: Arc::new(std::sync::Mutex::new(Vec::new())),
+            transaction_l0_override: None,
+            custom_function_registry: None,
+            cancellation_token: None,
         }
     }
 
@@ -321,22 +334,57 @@ impl Executor {
         self.use_transaction = use_transaction;
     }
 
+    /// Set a private transaction L0 buffer that overrides `writer.transaction_l0`
+    /// for both read visibility (QueryContext) and mutation routing.
+    pub fn set_transaction_l0(
+        &mut self,
+        l0: Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>,
+    ) {
+        self.transaction_l0_override = Some(l0);
+    }
+
+    /// Attach a custom scalar function registry for user-defined functions.
+    pub fn set_custom_functions(
+        &mut self,
+        registry: Arc<super::custom_functions::CustomFunctionRegistry>,
+    ) {
+        self.custom_function_registry = Some(registry);
+    }
+
+    /// Set a cooperative cancellation token for in-flight query cancellation.
+    pub fn set_cancellation_token(&mut self, token: tokio_util::sync::CancellationToken) {
+        self.cancellation_token = Some(token);
+    }
+
     /// Build a `QueryContext` from the current writer or standalone L0 manager.
+    /// When `transaction_l0_override` is set, it takes precedence over the writer's
+    /// internal `transaction_l0` — this is how private-per-transaction L0 buffers
+    /// become visible to reads without requiring the writer lock at tx creation.
     pub(crate) async fn get_context(&self) -> Option<QueryContext> {
         if let Some(writer_lock) = &self.writer {
             let writer = writer_lock.read().await;
-            // Include pending_flush L0s so data being flushed remains visible
+            // Prefer the override (private tx L0) over the writer's slot
+            let tx_l0 = self
+                .transaction_l0_override
+                .clone()
+                .or_else(|| writer.transaction_l0.clone());
             let mut ctx = QueryContext::new_with_pending(
                 writer.l0_manager.get_current(),
-                writer.transaction_l0.clone(),
+                tx_l0,
                 writer.l0_manager.get_pending_flush(),
             );
             ctx.set_deadline(Instant::now() + self.config.query_timeout);
+            if let Some(ref token) = self.cancellation_token {
+                ctx.set_cancellation_token(token.clone());
+            }
             Some(ctx)
         } else {
             self.l0_manager.as_ref().map(|m| {
                 let mut ctx = QueryContext::new(m.get_current());
                 ctx.set_deadline(Instant::now() + self.config.query_timeout);
+                if let Some(ref token) = self.cancellation_token {
+                    ctx.set_cancellation_token(token.clone());
+                }
                 ctx
             })
         }

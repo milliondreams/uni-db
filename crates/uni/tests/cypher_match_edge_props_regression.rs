@@ -11,19 +11,21 @@ async fn test_schemaless_edge_property_filter() -> Result<()> {
     // No schema setup — fully schemaless mode
     let db = Uni::in_memory().build().await?;
 
-    db.execute(
-        r#"
+    db.session()
+        .execute(
+            r#"
         CREATE (a {name: 'root'})
         CREATE (x {name: 'monkey_friend'})
         CREATE (y {name: 'woot_friend'})
         CREATE (a)-[:KNOWS {name: 'monkey'}]->(x)
         CREATE (a)-[:KNOWS {name: 'woot'}]->(y)
     "#,
-    )
-    .await?;
+        )
+        .await?;
 
     // Edge property filter: only edges with name='monkey'
     let result = db
+        .session()
         .query("MATCH (n {name: 'root'})-[r:KNOWS {name: 'monkey'}]->(a) RETURN a.name")
         .await?;
     assert_eq!(
@@ -40,17 +42,19 @@ async fn test_schemaless_edge_property_filter() -> Result<()> {
 async fn test_schemaless_edge_property_no_match() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
-    db.execute(
-        r#"
+    db.session()
+        .execute(
+            r#"
         CREATE (a {name: 'root'})
         CREATE (x {name: 'other'})
         CREATE (a)-[:KNOWS {name: 'monkey'}]->(x)
     "#,
-    )
-    .await?;
+        )
+        .await?;
 
     // No edge has name='nope'
     let result = db
+        .session()
         .query("MATCH (n {name: 'root'})-[r:KNOWS {name: 'nope'}]->(a) RETURN a.name")
         .await?;
     assert_eq!(result.rows().len(), 0, "No edges match name='nope'");

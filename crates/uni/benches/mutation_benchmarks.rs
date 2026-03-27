@@ -18,8 +18,9 @@ async fn make_db() -> Uni {
 
 /// Seed `count` schemaless nodes with an `idx` property.
 async fn seed_nodes(db: &Uni, count: usize) {
+    let s = db.session();
     for i in 0..count {
-        db.execute(&format!("CREATE (n:BenchNode {{idx: {i}}})"))
+        s.execute(&format!("CREATE (n:BenchNode {{idx: {i}}})"))
             .await
             .unwrap();
     }
@@ -35,8 +36,9 @@ fn bench_create_100_nodes(c: &mut Criterion) {
             || rt.block_on(make_db()),
             |db| {
                 rt.block_on(async {
+                    let s = db.session();
                     for i in 0..100 {
-                        db.execute(&format!("CREATE (n:BenchNode {{idx: {i}}})"))
+                        s.execute(&format!("CREATE (n:BenchNode {{idx: {i}}})"))
                             .await
                             .unwrap();
                     }
@@ -62,7 +64,8 @@ fn bench_set_100_properties(c: &mut Criterion) {
             },
             |db| {
                 rt.block_on(async {
-                    db.execute("MATCH (n:BenchNode) SET n.updated = true")
+                    db.session()
+                        .execute("MATCH (n:BenchNode) SET n.updated = true")
                         .await
                         .unwrap();
                 })
@@ -87,7 +90,8 @@ fn bench_delete_100_nodes(c: &mut Criterion) {
             },
             |db| {
                 rt.block_on(async {
-                    db.execute("MATCH (n:BenchNode) DETACH DELETE n")
+                    db.session()
+                        .execute("MATCH (n:BenchNode) DETACH DELETE n")
                         .await
                         .unwrap();
                 })
@@ -108,12 +112,13 @@ fn bench_create_then_match(c: &mut Criterion) {
             || rt.block_on(make_db()),
             |db| {
                 rt.block_on(async {
+                    let s = db.session();
                     for i in 0..50 {
-                        db.execute(&format!("CREATE (n:BenchNode {{idx: {i}}})"))
+                        s.execute(&format!("CREATE (n:BenchNode {{idx: {i}}})"))
                             .await
                             .unwrap();
                     }
-                    let result = db
+                    let result = s
                         .query("MATCH (n:BenchNode) RETURN count(n) AS cnt")
                         .await
                         .unwrap();
@@ -136,15 +141,16 @@ fn bench_merge_50_nodes(c: &mut Criterion) {
             || rt.block_on(make_db()),
             |db| {
                 rt.block_on(async {
+                    let s = db.session();
                     // First pass: all creates
                     for i in 0..50 {
-                        db.execute(&format!("MERGE (n:BenchNode {{idx: {i}}})"))
+                        s.execute(&format!("MERGE (n:BenchNode {{idx: {i}}})"))
                             .await
                             .unwrap();
                     }
                     // Second pass: all matches
                     for i in 0..50 {
-                        db.execute(&format!("MERGE (n:BenchNode {{idx: {i}}})"))
+                        s.execute(&format!("MERGE (n:BenchNode {{idx: {i}}})"))
                             .await
                             .unwrap();
                     }

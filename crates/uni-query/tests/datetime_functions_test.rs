@@ -17,14 +17,14 @@ fn make_map(entries: Vec<(&str, Value)>) -> Value {
 
 #[test]
 fn test_date_function() {
-    let res = eval_scalar_function("DATE", &[unival!("2023-01-15")]).unwrap();
+    let res = eval_scalar_function("DATE", &[unival!("2023-01-15")], None).unwrap();
     assert_eq!(res.to_string(), "2023-01-15");
 
-    let res = eval_scalar_function("DATE", &[unival!("2023-01-15 10:30:00")]).unwrap();
+    let res = eval_scalar_function("DATE", &[unival!("2023-01-15 10:30:00")], None).unwrap();
     assert_eq!(res.to_string(), "2023-01-15");
 
     // Current date (no args)
-    let res = eval_scalar_function("DATE", &[]).unwrap();
+    let res = eval_scalar_function("DATE", &[], None).unwrap();
     assert!(res.to_string().len() == 10);
 }
 
@@ -32,15 +32,15 @@ fn test_date_function() {
 fn test_time_function() {
     // Cypher time() always includes timezone (defaults to Z when unspecified).
     // TemporalValue::Time Display omits :SS when seconds and nanos are zero.
-    let res = eval_scalar_function("TIME", &[unival!("10:30:00")]).unwrap();
+    let res = eval_scalar_function("TIME", &[unival!("10:30:00")], None).unwrap();
     assert_eq!(res.to_string(), "10:30Z");
 
     // Time with non-zero seconds includes seconds and timezone.
-    let res = eval_scalar_function("TIME", &[unival!("10:30:45")]).unwrap();
+    let res = eval_scalar_function("TIME", &[unival!("10:30:45")], None).unwrap();
     assert_eq!(res.to_string(), "10:30:45Z");
 
     // Time with explicit timezone preserves it.
-    let res = eval_scalar_function("TIME", &[unival!("10:30:45+01:00")]).unwrap();
+    let res = eval_scalar_function("TIME", &[unival!("10:30:45+01:00")], None).unwrap();
     assert_eq!(res.to_string(), "10:30:45+01:00");
 }
 
@@ -48,11 +48,12 @@ fn test_time_function() {
 fn test_datetime_function() {
     // Standard Cypher datetime uses T separator (not space).
     // TemporalValue::DateTime Display omits :SS when seconds and nanos are zero.
-    let res = eval_scalar_function("DATETIME", &[unival!("2023-01-15T10:30:00Z")]).unwrap();
+    let res = eval_scalar_function("DATETIME", &[unival!("2023-01-15T10:30:00Z")], None).unwrap();
     assert_eq!(res.to_string(), "2023-01-15T10:30Z");
 
     // Datetime with explicit timezone.
-    let res = eval_scalar_function("DATETIME", &[unival!("2023-01-15T10:30:00+05:00")]).unwrap();
+    let res =
+        eval_scalar_function("DATETIME", &[unival!("2023-01-15T10:30:00+05:00")], None).unwrap();
     assert_eq!(res.to_string(), "2023-01-15T10:30+05:00");
 }
 
@@ -61,42 +62,42 @@ fn test_extract_functions() {
     let dt = unival!("2023-01-15 10:30:45");
 
     assert_eq!(
-        eval_scalar_function("YEAR", std::slice::from_ref(&dt))
+        eval_scalar_function("YEAR", std::slice::from_ref(&dt), None)
             .unwrap()
             .as_i64()
             .unwrap(),
         2023
     );
     assert_eq!(
-        eval_scalar_function("MONTH", std::slice::from_ref(&dt))
+        eval_scalar_function("MONTH", std::slice::from_ref(&dt), None)
             .unwrap()
             .as_i64()
             .unwrap(),
         1
     );
     assert_eq!(
-        eval_scalar_function("DAY", std::slice::from_ref(&dt))
+        eval_scalar_function("DAY", std::slice::from_ref(&dt), None)
             .unwrap()
             .as_i64()
             .unwrap(),
         15
     );
     assert_eq!(
-        eval_scalar_function("HOUR", std::slice::from_ref(&dt))
+        eval_scalar_function("HOUR", std::slice::from_ref(&dt), None)
             .unwrap()
             .as_i64()
             .unwrap(),
         10
     );
     assert_eq!(
-        eval_scalar_function("MINUTE", std::slice::from_ref(&dt))
+        eval_scalar_function("MINUTE", std::slice::from_ref(&dt), None)
             .unwrap()
             .as_i64()
             .unwrap(),
         30
     );
     assert_eq!(
-        eval_scalar_function("SECOND", std::slice::from_ref(&dt))
+        eval_scalar_function("SECOND", std::slice::from_ref(&dt), None)
             .unwrap()
             .as_i64()
             .unwrap(),
@@ -107,7 +108,7 @@ fn test_extract_functions() {
 #[test]
 fn test_localdatetime_function() {
     // localdatetime() returns current local time as TemporalValue::LocalDateTime
-    let res = eval_scalar_function("LOCALDATETIME", &[]).unwrap();
+    let res = eval_scalar_function("LOCALDATETIME", &[], None).unwrap();
     let s = res.to_string();
     // Should contain T separator in display
     assert!(s.contains("T"), "Expected format with T separator");
@@ -115,14 +116,15 @@ fn test_localdatetime_function() {
 
     // Should work with string argument too
     // TemporalValue::LocalDateTime Display omits :SS when seconds and nanos are zero
-    let res = eval_scalar_function("LOCALDATETIME", &[unival!("2023-01-15T10:30:00")]).unwrap();
+    let res =
+        eval_scalar_function("LOCALDATETIME", &[unival!("2023-01-15T10:30:00")], None).unwrap();
     assert_eq!(res.to_string(), "2023-01-15T10:30");
 }
 
 #[test]
 fn test_localtime_function() {
     // localtime() returns current local time as TemporalValue::LocalTime
-    let res = eval_scalar_function("LOCALTIME", &[]).unwrap();
+    let res = eval_scalar_function("LOCALTIME", &[], None).unwrap();
     let s = res.to_string();
     // Should be in format HH:MM or HH:MM:SS
     assert!(s.contains(":"), "Expected time format with colons");
@@ -130,7 +132,7 @@ fn test_localtime_function() {
 
     // Should work with string argument too
     // TemporalValue::LocalTime Display omits :SS when seconds and nanos are zero
-    let res = eval_scalar_function("LOCALTIME", &[unival!("10:30:00")]).unwrap();
+    let res = eval_scalar_function("LOCALTIME", &[unival!("10:30:00")], None).unwrap();
     assert_eq!(res.to_string(), "10:30");
 }
 
@@ -156,7 +158,7 @@ fn test_date_all_string_formats() {
     ];
 
     for (input, expected) in &cases {
-        let res = eval_scalar_function("DATE", &[unival!(*input)])
+        let res = eval_scalar_function("DATE", &[unival!(*input)], None)
             .unwrap_or_else(|e| panic!("DATE({:?}) failed: {}", input, e));
         assert_eq!(
             res.to_string(),
@@ -183,7 +185,7 @@ fn test_localtime_all_string_formats() {
     ];
 
     for (input, expected) in &cases {
-        let res = eval_scalar_function("LOCALTIME", &[unival!(*input)])
+        let res = eval_scalar_function("LOCALTIME", &[unival!(*input)], None)
             .unwrap_or_else(|e| panic!("LOCALTIME({:?}) failed: {}", input, e));
         assert_eq!(
             res.to_string(),
@@ -211,7 +213,7 @@ fn test_time_all_string_formats() {
     ];
 
     for (input, expected) in &cases {
-        let res = eval_scalar_function("TIME", &[unival!(*input)])
+        let res = eval_scalar_function("TIME", &[unival!(*input)], None)
             .unwrap_or_else(|e| panic!("TIME({:?}) failed: {}", input, e));
         assert_eq!(
             res.to_string(),
@@ -238,7 +240,7 @@ fn test_localdatetime_all_string_formats() {
     ];
 
     for (input, expected) in &cases {
-        let res = eval_scalar_function("LOCALDATETIME", &[unival!(*input)])
+        let res = eval_scalar_function("LOCALDATETIME", &[unival!(*input)], None)
             .unwrap_or_else(|e| panic!("LOCALDATETIME({:?}) failed: {}", input, e));
         assert_eq!(
             res.to_string(),
@@ -269,7 +271,7 @@ fn test_datetime_all_string_formats() {
     ];
 
     for (input, expected) in &cases {
-        let res = eval_scalar_function("DATETIME", &[unival!(*input)])
+        let res = eval_scalar_function("DATETIME", &[unival!(*input)], None)
             .unwrap_or_else(|e| panic!("DATETIME({:?}) failed: {}", input, e));
         assert_eq!(
             res.to_string(),
@@ -309,7 +311,7 @@ fn test_datetime_named_timezone_formats() {
     ];
 
     for (input, expected) in &cases {
-        let res = eval_scalar_function("DATETIME", &[unival!(*input)])
+        let res = eval_scalar_function("DATETIME", &[unival!(*input)], None)
             .unwrap_or_else(|e| panic!("DATETIME({:?}) failed: {}", input, e));
         assert_eq!(
             res.to_string(),
@@ -336,7 +338,7 @@ fn test_duration_all_string_formats() {
     ];
 
     for (input, expected) in &cases {
-        let res = eval_scalar_function("DURATION", &[unival!(*input)])
+        let res = eval_scalar_function("DURATION", &[unival!(*input)], None)
             .unwrap_or_else(|e| panic!("DURATION({:?}) failed: {}", input, e));
         assert_eq!(
             res.to_string(),
@@ -360,15 +362,20 @@ fn test_duration_all_string_formats() {
 #[test]
 fn test_project_date_from_date() {
     // Source: date({year: 1984, month: 11, day: 11})
-    let source =
-        eval_scalar_function("DATE", &[unival!({"year": 1984, "month": 11, "day": 11})]).unwrap();
+    let source = eval_scalar_function(
+        "DATE",
+        &[unival!({"year": 1984, "month": 11, "day": 11})],
+        None,
+    )
+    .unwrap();
 
     // date(other) → identity
-    let res = eval_scalar_function("DATE", std::slice::from_ref(&source)).unwrap();
+    let res = eval_scalar_function("DATE", std::slice::from_ref(&source), None).unwrap();
     assert_eq!(res.to_string(), "1984-11-11");
 
     // date({date: other}) → copy
-    let res = eval_scalar_function("DATE", &[make_map(vec![("date", source.clone())])]).unwrap();
+    let res =
+        eval_scalar_function("DATE", &[make_map(vec![("date", source.clone())])], None).unwrap();
     assert_eq!(res.to_string(), "1984-11-11");
 
     // date({date: other, year: 28})
@@ -378,6 +385,7 @@ fn test_project_date_from_date() {
             ("date", source.clone()),
             ("year", Value::from(28)),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "0028-11-11");
@@ -389,6 +397,7 @@ fn test_project_date_from_date() {
             ("date", source.clone()),
             ("day", Value::from(28)),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "1984-11-28");
@@ -401,6 +410,7 @@ fn test_project_date_from_date() {
             ("date", source.clone()),
             ("week", Value::from(1)),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "1984-01-08");
@@ -412,6 +422,7 @@ fn test_project_date_from_date() {
             ("date", source.clone()),
             ("ordinalDay", Value::from(28)),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "1984-01-28");
@@ -424,6 +435,7 @@ fn test_project_date_from_date() {
             ("date", source.clone()),
             ("quarter", Value::from(3)),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "1984-08-11");
@@ -435,15 +447,17 @@ fn test_project_date_from_localdatetime() {
     let source = eval_scalar_function(
         "LOCALDATETIME",
         &[unival!({"year": 1984, "month": 11, "day": 11, "hour": 12, "minute": 31, "second": 14, "nanosecond": 645876123})],
+    None,
     )
     .unwrap();
 
     // date(other) → extract date
-    let res = eval_scalar_function("DATE", std::slice::from_ref(&source)).unwrap();
+    let res = eval_scalar_function("DATE", std::slice::from_ref(&source), None).unwrap();
     assert_eq!(res.to_string(), "1984-11-11");
 
     // date({date: other})
-    let res = eval_scalar_function("DATE", &[make_map(vec![("date", source.clone())])]).unwrap();
+    let res =
+        eval_scalar_function("DATE", &[make_map(vec![("date", source.clone())])], None).unwrap();
     assert_eq!(res.to_string(), "1984-11-11");
 
     // date({date: other, year: 28})
@@ -453,6 +467,7 @@ fn test_project_date_from_localdatetime() {
             ("date", source.clone()),
             ("year", Value::from(28)),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "0028-11-11");
@@ -464,6 +479,7 @@ fn test_project_date_from_localdatetime() {
             ("date", source.clone()),
             ("day", Value::from(28)),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "1984-11-28");
@@ -475,6 +491,7 @@ fn test_project_date_from_localdatetime() {
             ("date", source.clone()),
             ("week", Value::from(1)),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "1984-01-08");
@@ -486,6 +503,7 @@ fn test_project_date_from_localdatetime() {
             ("date", source.clone()),
             ("ordinalDay", Value::from(28)),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "1984-01-28");
@@ -497,6 +515,7 @@ fn test_project_date_from_localdatetime() {
             ("date", source.clone()),
             ("quarter", Value::from(3)),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "1984-08-11");
@@ -508,15 +527,17 @@ fn test_project_date_from_datetime() {
     let source = eval_scalar_function(
         "DATETIME",
         &[unival!({"year": 1984, "month": 11, "day": 11, "hour": 12, "timezone": "+01:00"})],
+        None,
     )
     .unwrap();
 
     // date(other)
-    let res = eval_scalar_function("DATE", std::slice::from_ref(&source)).unwrap();
+    let res = eval_scalar_function("DATE", std::slice::from_ref(&source), None).unwrap();
     assert_eq!(res.to_string(), "1984-11-11");
 
     // date({date: other})
-    let res = eval_scalar_function("DATE", &[make_map(vec![("date", source.clone())])]).unwrap();
+    let res =
+        eval_scalar_function("DATE", &[make_map(vec![("date", source.clone())])], None).unwrap();
     assert_eq!(res.to_string(), "1984-11-11");
 
     // date({date: other, year: 28})
@@ -526,6 +547,7 @@ fn test_project_date_from_datetime() {
             ("date", source.clone()),
             ("year", Value::from(28)),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "0028-11-11");
@@ -537,6 +559,7 @@ fn test_project_date_from_datetime() {
             ("date", source.clone()),
             ("day", Value::from(28)),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "1984-11-28");
@@ -548,6 +571,7 @@ fn test_project_date_from_datetime() {
             ("date", source.clone()),
             ("week", Value::from(1)),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "1984-01-08");
@@ -559,6 +583,7 @@ fn test_project_date_from_datetime() {
             ("date", source.clone()),
             ("ordinalDay", Value::from(28)),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "1984-01-28");
@@ -570,6 +595,7 @@ fn test_project_date_from_datetime() {
             ("date", source.clone()),
             ("quarter", Value::from(3)),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "1984-08-11");
@@ -585,16 +611,21 @@ fn test_project_localtime_from_localtime() {
     let source = eval_scalar_function(
         "LOCALTIME",
         &[unival!({"hour": 12, "minute": 31, "second": 14, "nanosecond": 645876123})],
+        None,
     )
     .unwrap();
 
     // localtime(other) → identity
-    let res = eval_scalar_function("LOCALTIME", std::slice::from_ref(&source)).unwrap();
+    let res = eval_scalar_function("LOCALTIME", std::slice::from_ref(&source), None).unwrap();
     assert_eq!(res.to_string(), "12:31:14.645876123");
 
     // localtime({time: other})
-    let res =
-        eval_scalar_function("LOCALTIME", &[make_map(vec![("time", source.clone())])]).unwrap();
+    let res = eval_scalar_function(
+        "LOCALTIME",
+        &[make_map(vec![("time", source.clone())])],
+        None,
+    )
+    .unwrap();
     assert_eq!(res.to_string(), "12:31:14.645876123");
 
     // localtime({time: other, second: 42})
@@ -604,6 +635,7 @@ fn test_project_localtime_from_localtime() {
             ("time", source.clone()),
             ("second", Value::from(42)),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "12:31:42.645876123");
@@ -615,16 +647,21 @@ fn test_project_localtime_from_time() {
     let source = eval_scalar_function(
         "TIME",
         &[unival!({"hour": 12, "minute": 31, "second": 14, "microsecond": 645876, "timezone": "+01:00"})],
+    None,
     )
     .unwrap();
 
     // localtime(other) → strips timezone
-    let res = eval_scalar_function("LOCALTIME", std::slice::from_ref(&source)).unwrap();
+    let res = eval_scalar_function("LOCALTIME", std::slice::from_ref(&source), None).unwrap();
     assert_eq!(res.to_string(), "12:31:14.645876");
 
     // localtime({time: other})
-    let res =
-        eval_scalar_function("LOCALTIME", &[make_map(vec![("time", source.clone())])]).unwrap();
+    let res = eval_scalar_function(
+        "LOCALTIME",
+        &[make_map(vec![("time", source.clone())])],
+        None,
+    )
+    .unwrap();
     assert_eq!(res.to_string(), "12:31:14.645876");
 
     // localtime({time: other, second: 42})
@@ -634,6 +671,7 @@ fn test_project_localtime_from_time() {
             ("time", source.clone()),
             ("second", Value::from(42)),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "12:31:42.645876");
@@ -645,16 +683,21 @@ fn test_project_localtime_from_localdatetime() {
     let source = eval_scalar_function(
         "LOCALDATETIME",
         &[unival!({"year": 1984, "week": 10, "dayOfWeek": 3, "hour": 12, "minute": 31, "second": 14, "millisecond": 645})],
+    None,
     )
     .unwrap();
 
     // localtime(other) → extract time
-    let res = eval_scalar_function("LOCALTIME", std::slice::from_ref(&source)).unwrap();
+    let res = eval_scalar_function("LOCALTIME", std::slice::from_ref(&source), None).unwrap();
     assert_eq!(res.to_string(), "12:31:14.645");
 
     // localtime({time: other})
-    let res =
-        eval_scalar_function("LOCALTIME", &[make_map(vec![("time", source.clone())])]).unwrap();
+    let res = eval_scalar_function(
+        "LOCALTIME",
+        &[make_map(vec![("time", source.clone())])],
+        None,
+    )
+    .unwrap();
     assert_eq!(res.to_string(), "12:31:14.645");
 
     // localtime({time: other, second: 42})
@@ -664,6 +707,7 @@ fn test_project_localtime_from_localdatetime() {
             ("time", source.clone()),
             ("second", Value::from(42)),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "12:31:42.645");
@@ -675,16 +719,21 @@ fn test_project_localtime_from_datetime() {
     let source = eval_scalar_function(
         "DATETIME",
         &[unival!({"year": 1984, "month": 10, "day": 11, "hour": 12, "timezone": "+01:00"})],
+        None,
     )
     .unwrap();
 
     // localtime(other) → extract time, strip tz
-    let res = eval_scalar_function("LOCALTIME", std::slice::from_ref(&source)).unwrap();
+    let res = eval_scalar_function("LOCALTIME", std::slice::from_ref(&source), None).unwrap();
     assert_eq!(res.to_string(), "12:00");
 
     // localtime({time: other})
-    let res =
-        eval_scalar_function("LOCALTIME", &[make_map(vec![("time", source.clone())])]).unwrap();
+    let res = eval_scalar_function(
+        "LOCALTIME",
+        &[make_map(vec![("time", source.clone())])],
+        None,
+    )
+    .unwrap();
     assert_eq!(res.to_string(), "12:00");
 
     // localtime({time: other, second: 42})
@@ -694,6 +743,7 @@ fn test_project_localtime_from_datetime() {
             ("time", source.clone()),
             ("second", Value::from(42)),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "12:00:42");
@@ -709,15 +759,17 @@ fn test_project_time_from_localtime() {
     let source = eval_scalar_function(
         "LOCALTIME",
         &[unival!({"hour": 12, "minute": 31, "second": 14, "nanosecond": 645876123})],
+        None,
     )
     .unwrap();
 
     // time(other) → defaults to Z (localtime has no tz)
-    let res = eval_scalar_function("TIME", std::slice::from_ref(&source)).unwrap();
+    let res = eval_scalar_function("TIME", std::slice::from_ref(&source), None).unwrap();
     assert_eq!(res.to_string(), "12:31:14.645876123Z");
 
     // time({time: other})
-    let res = eval_scalar_function("TIME", &[make_map(vec![("time", source.clone())])]).unwrap();
+    let res =
+        eval_scalar_function("TIME", &[make_map(vec![("time", source.clone())])], None).unwrap();
     assert_eq!(res.to_string(), "12:31:14.645876123Z");
 
     // time({time: other, timezone: '+05:00'}) → assign timezone (no conversion, source has no tz)
@@ -727,6 +779,7 @@ fn test_project_time_from_localtime() {
             ("time", source.clone()),
             ("timezone", Value::from("+05:00")),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "12:31:14.645876123+05:00");
@@ -738,6 +791,7 @@ fn test_project_time_from_localtime() {
             ("time", source.clone()),
             ("second", Value::from(42)),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "12:31:42.645876123Z");
@@ -750,6 +804,7 @@ fn test_project_time_from_localtime() {
             ("second", Value::from(42)),
             ("timezone", Value::from("+05:00")),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "12:31:42.645876123+05:00");
@@ -761,15 +816,17 @@ fn test_project_time_from_time() {
     let source = eval_scalar_function(
         "TIME",
         &[unival!({"hour": 12, "minute": 31, "second": 14, "microsecond": 645876, "timezone": "+01:00"})],
+    None,
     )
     .unwrap();
 
     // time(other) → identity
-    let res = eval_scalar_function("TIME", std::slice::from_ref(&source)).unwrap();
+    let res = eval_scalar_function("TIME", std::slice::from_ref(&source), None).unwrap();
     assert_eq!(res.to_string(), "12:31:14.645876+01:00");
 
     // time({time: other})
-    let res = eval_scalar_function("TIME", &[make_map(vec![("time", source.clone())])]).unwrap();
+    let res =
+        eval_scalar_function("TIME", &[make_map(vec![("time", source.clone())])], None).unwrap();
     assert_eq!(res.to_string(), "12:31:14.645876+01:00");
 
     // time({time: other, timezone: '+05:00'}) → TIMEZONE CONVERSION: 12:31+01:00 → 16:31+05:00
@@ -779,6 +836,7 @@ fn test_project_time_from_time() {
             ("time", source.clone()),
             ("timezone", Value::from("+05:00")),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "16:31:14.645876+05:00");
@@ -790,6 +848,7 @@ fn test_project_time_from_time() {
             ("time", source.clone()),
             ("second", Value::from(42)),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "12:31:42.645876+01:00");
@@ -802,6 +861,7 @@ fn test_project_time_from_time() {
             ("second", Value::from(42)),
             ("timezone", Value::from("+05:00")),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "16:31:42.645876+05:00");
@@ -813,15 +873,17 @@ fn test_project_time_from_localdatetime() {
     let source = eval_scalar_function(
         "LOCALDATETIME",
         &[unival!({"year": 1984, "week": 10, "dayOfWeek": 3, "hour": 12, "minute": 31, "second": 14, "millisecond": 645})],
+    None,
     )
     .unwrap();
 
     // time(other) → defaults to Z
-    let res = eval_scalar_function("TIME", std::slice::from_ref(&source)).unwrap();
+    let res = eval_scalar_function("TIME", std::slice::from_ref(&source), None).unwrap();
     assert_eq!(res.to_string(), "12:31:14.645Z");
 
     // time({time: other})
-    let res = eval_scalar_function("TIME", &[make_map(vec![("time", source.clone())])]).unwrap();
+    let res =
+        eval_scalar_function("TIME", &[make_map(vec![("time", source.clone())])], None).unwrap();
     assert_eq!(res.to_string(), "12:31:14.645Z");
 
     // time({time: other, timezone: '+05:00'}) → assign (no conversion, source has no tz)
@@ -831,6 +893,7 @@ fn test_project_time_from_localdatetime() {
             ("time", source.clone()),
             ("timezone", Value::from("+05:00")),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "12:31:14.645+05:00");
@@ -842,6 +905,7 @@ fn test_project_time_from_localdatetime() {
             ("time", source.clone()),
             ("second", Value::from(42)),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "12:31:42.645Z");
@@ -854,6 +918,7 @@ fn test_project_time_from_localdatetime() {
             ("second", Value::from(42)),
             ("timezone", Value::from("+05:00")),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "12:31:42.645+05:00");
@@ -866,15 +931,17 @@ fn test_project_time_from_datetime() {
     let source = eval_scalar_function(
         "DATETIME",
         &[unival!({"year": 1984, "month": 10, "day": 11, "hour": 12, "timezone": "Europe/Stockholm"})],
+    None,
     )
     .unwrap();
 
     // time(other) → extract time with offset from named tz
-    let res = eval_scalar_function("TIME", std::slice::from_ref(&source)).unwrap();
+    let res = eval_scalar_function("TIME", std::slice::from_ref(&source), None).unwrap();
     assert_eq!(res.to_string(), "12:00+01:00");
 
     // time({time: other})
-    let res = eval_scalar_function("TIME", &[make_map(vec![("time", source.clone())])]).unwrap();
+    let res =
+        eval_scalar_function("TIME", &[make_map(vec![("time", source.clone())])], None).unwrap();
     assert_eq!(res.to_string(), "12:00+01:00");
 
     // time({time: other, timezone: '+05:00'}) → conversion: 12:00+01:00 → 16:00+05:00
@@ -884,6 +951,7 @@ fn test_project_time_from_datetime() {
             ("time", source.clone()),
             ("timezone", Value::from("+05:00")),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "16:00+05:00");
@@ -895,6 +963,7 @@ fn test_project_time_from_datetime() {
             ("time", source.clone()),
             ("second", Value::from(42)),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "12:00:42+01:00");
@@ -907,6 +976,7 @@ fn test_project_time_from_datetime() {
             ("second", Value::from(42)),
             ("timezone", Value::from("+05:00")),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "16:00:42+05:00");
@@ -919,8 +989,12 @@ fn test_project_time_from_datetime() {
 #[test]
 fn test_project_localdatetime_from_date() {
     // Source: date({year: 1984, month: 10, day: 11})
-    let date_source =
-        eval_scalar_function("DATE", &[unival!({"year": 1984, "month": 10, "day": 11})]).unwrap();
+    let date_source = eval_scalar_function(
+        "DATE",
+        &[unival!({"year": 1984, "month": 10, "day": 11})],
+        None,
+    )
+    .unwrap();
 
     // localdatetime({date: other, hour: 10, minute: 10, second: 10})
     let res = eval_scalar_function(
@@ -931,6 +1005,7 @@ fn test_project_localdatetime_from_date() {
             ("minute", Value::from(10)),
             ("second", Value::from(10)),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "1984-10-11T10:10:10");
@@ -945,6 +1020,7 @@ fn test_project_localdatetime_from_date() {
             ("minute", Value::from(10)),
             ("second", Value::from(10)),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "1984-10-28T10:10:10");
@@ -953,6 +1029,7 @@ fn test_project_localdatetime_from_date() {
     let ldt_source = eval_scalar_function(
         "LOCALDATETIME",
         &[unival!({"year": 1984, "week": 10, "dayOfWeek": 3, "hour": 12, "minute": 31, "second": 14, "millisecond": 645})],
+    None,
     )
     .unwrap();
 
@@ -964,6 +1041,7 @@ fn test_project_localdatetime_from_date() {
             ("minute", Value::from(10)),
             ("second", Value::from(10)),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "1984-03-07T10:10:10");
@@ -977,6 +1055,7 @@ fn test_project_localdatetime_from_date() {
             ("minute", Value::from(10)),
             ("second", Value::from(10)),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "1984-03-28T10:10:10");
@@ -985,6 +1064,7 @@ fn test_project_localdatetime_from_date() {
     let dt_source = eval_scalar_function(
         "DATETIME",
         &[unival!({"year": 1984, "month": 10, "day": 11, "hour": 12, "timezone": "+01:00"})],
+        None,
     )
     .unwrap();
 
@@ -996,6 +1076,7 @@ fn test_project_localdatetime_from_date() {
             ("minute", Value::from(10)),
             ("second", Value::from(10)),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "1984-10-11T10:10:10");
@@ -1009,6 +1090,7 @@ fn test_project_localdatetime_from_date() {
             ("minute", Value::from(10)),
             ("second", Value::from(10)),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "1984-10-28T10:10:10");
@@ -1024,6 +1106,7 @@ fn test_project_localdatetime_from_time() {
     let lt_source = eval_scalar_function(
         "LOCALTIME",
         &[unival!({"hour": 12, "minute": 31, "second": 14, "nanosecond": 645876123})],
+        None,
     )
     .unwrap();
 
@@ -1035,6 +1118,7 @@ fn test_project_localdatetime_from_time() {
             ("day", Value::from(11)),
             ("time", lt_source.clone()),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "1984-10-11T12:31:14.645876123");
@@ -1048,6 +1132,7 @@ fn test_project_localdatetime_from_time() {
             ("time", lt_source.clone()),
             ("second", Value::from(42)),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "1984-10-11T12:31:42.645876123");
@@ -1056,6 +1141,7 @@ fn test_project_localdatetime_from_time() {
     let t_source = eval_scalar_function(
         "TIME",
         &[unival!({"hour": 12, "minute": 31, "second": 14, "microsecond": 645876, "timezone": "+01:00"})],
+    None,
     )
     .unwrap();
 
@@ -1067,6 +1153,7 @@ fn test_project_localdatetime_from_time() {
             ("day", Value::from(11)),
             ("time", t_source.clone()),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "1984-10-11T12:31:14.645876");
@@ -1080,6 +1167,7 @@ fn test_project_localdatetime_from_time() {
             ("time", t_source.clone()),
             ("second", Value::from(42)),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "1984-10-11T12:31:42.645876");
@@ -1088,6 +1176,7 @@ fn test_project_localdatetime_from_time() {
     let ldt_source = eval_scalar_function(
         "LOCALDATETIME",
         &[unival!({"year": 1984, "week": 10, "dayOfWeek": 3, "hour": 12, "minute": 31, "second": 14, "millisecond": 645})],
+    None,
     )
     .unwrap();
 
@@ -1099,6 +1188,7 @@ fn test_project_localdatetime_from_time() {
             ("day", Value::from(11)),
             ("time", ldt_source.clone()),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "1984-10-11T12:31:14.645");
@@ -1112,6 +1202,7 @@ fn test_project_localdatetime_from_time() {
             ("time", ldt_source.clone()),
             ("second", Value::from(42)),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "1984-10-11T12:31:42.645");
@@ -1120,6 +1211,7 @@ fn test_project_localdatetime_from_time() {
     let dt_source = eval_scalar_function(
         "DATETIME",
         &[unival!({"year": 1984, "month": 10, "day": 11, "hour": 12, "timezone": "+01:00"})],
+        None,
     )
     .unwrap();
 
@@ -1131,6 +1223,7 @@ fn test_project_localdatetime_from_time() {
             ("day", Value::from(11)),
             ("time", dt_source.clone()),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "1984-10-11T12:00");
@@ -1144,6 +1237,7 @@ fn test_project_localdatetime_from_time() {
             ("time", dt_source.clone()),
             ("second", Value::from(42)),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "1984-10-11T12:00:42");
@@ -1157,16 +1251,22 @@ fn test_project_localdatetime_from_time() {
 #[allow(clippy::type_complexity)]
 fn test_project_localdatetime_date_and_time() {
     // Date sources
-    let date1 =
-        eval_scalar_function("DATE", &[unival!({"year": 1984, "month": 10, "day": 11})]).unwrap();
+    let date1 = eval_scalar_function(
+        "DATE",
+        &[unival!({"year": 1984, "month": 10, "day": 11})],
+        None,
+    )
+    .unwrap();
     let date_ldt = eval_scalar_function(
         "LOCALDATETIME",
         &[unival!({"year": 1984, "week": 10, "dayOfWeek": 3, "hour": 12, "minute": 31, "second": 14, "millisecond": 645})],
+    None,
     )
     .unwrap();
     let date_dt = eval_scalar_function(
         "DATETIME",
         &[unival!({"year": 1984, "month": 10, "day": 11, "hour": 12, "timezone": "+01:00"})],
+        None,
     )
     .unwrap();
 
@@ -1174,21 +1274,25 @@ fn test_project_localdatetime_date_and_time() {
     let time_lt = eval_scalar_function(
         "LOCALTIME",
         &[unival!({"hour": 12, "minute": 31, "second": 14, "nanosecond": 645876123})],
+        None,
     )
     .unwrap();
     let time_t = eval_scalar_function(
         "TIME",
         &[unival!({"hour": 12, "minute": 31, "second": 14, "microsecond": 645876, "timezone": "+01:00"})],
+    None,
     )
     .unwrap();
     let time_ldt = eval_scalar_function(
         "LOCALDATETIME",
         &[unival!({"year": 1984, "week": 10, "dayOfWeek": 3, "hour": 12, "minute": 31, "second": 14, "millisecond": 645})],
+    None,
     )
     .unwrap();
     let time_dt = eval_scalar_function(
         "DATETIME",
         &[unival!({"year": 1984, "month": 10, "day": 11, "hour": 12, "timezone": "+01:00"})],
+        None,
     )
     .unwrap();
 
@@ -1231,7 +1335,7 @@ fn test_project_localdatetime_date_and_time() {
             entries.push(("day", Value::from(*day)));
             entries.push(("second", Value::from(*sec)));
         }
-        let res = eval_scalar_function("LOCALDATETIME", &[make_map(entries)])
+        let res = eval_scalar_function("LOCALDATETIME", &[make_map(entries)], None)
             .unwrap_or_else(|e| panic!("localdatetime(date1+{}) failed: {}", label, e));
         assert_eq!(res.to_string(), *expected, "date1+{}", label);
     }
@@ -1275,7 +1379,7 @@ fn test_project_localdatetime_date_and_time() {
             entries.push(("day", Value::from(*day)));
             entries.push(("second", Value::from(*sec)));
         }
-        let res = eval_scalar_function("LOCALDATETIME", &[make_map(entries)])
+        let res = eval_scalar_function("LOCALDATETIME", &[make_map(entries)], None)
             .unwrap_or_else(|e| panic!("localdatetime(ldt+{}) failed: {}", label, e));
         assert_eq!(res.to_string(), *expected, "ldt+{}", label);
     }
@@ -1319,7 +1423,7 @@ fn test_project_localdatetime_date_and_time() {
             entries.push(("day", Value::from(*day)));
             entries.push(("second", Value::from(*sec)));
         }
-        let res = eval_scalar_function("LOCALDATETIME", &[make_map(entries)])
+        let res = eval_scalar_function("LOCALDATETIME", &[make_map(entries)], None)
             .unwrap_or_else(|e| panic!("localdatetime(dt+{}) failed: {}", label, e));
         assert_eq!(res.to_string(), *expected, "dt+{}", label);
     }
@@ -1335,17 +1439,20 @@ fn test_project_localdatetime_from_datetime() {
     let ldt_source = eval_scalar_function(
         "LOCALDATETIME",
         &[unival!({"year": 1984, "week": 10, "dayOfWeek": 3, "hour": 12, "minute": 31, "second": 14, "millisecond": 645})],
+    None,
     )
     .unwrap();
 
     // localdatetime(other) → identity
-    let res = eval_scalar_function("LOCALDATETIME", std::slice::from_ref(&ldt_source)).unwrap();
+    let res =
+        eval_scalar_function("LOCALDATETIME", std::slice::from_ref(&ldt_source), None).unwrap();
     assert_eq!(res.to_string(), "1984-03-07T12:31:14.645");
 
     // localdatetime({datetime: other})
     let res = eval_scalar_function(
         "LOCALDATETIME",
         &[make_map(vec![("datetime", ldt_source.clone())])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "1984-03-07T12:31:14.645");
@@ -1358,6 +1465,7 @@ fn test_project_localdatetime_from_datetime() {
             ("day", Value::from(28)),
             ("second", Value::from(42)),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "1984-03-28T12:31:42.645");
@@ -1366,17 +1474,20 @@ fn test_project_localdatetime_from_datetime() {
     let dt_source = eval_scalar_function(
         "DATETIME",
         &[unival!({"year": 1984, "month": 10, "day": 11, "hour": 12, "timezone": "+01:00"})],
+        None,
     )
     .unwrap();
 
     // localdatetime(other) → strips tz
-    let res = eval_scalar_function("LOCALDATETIME", std::slice::from_ref(&dt_source)).unwrap();
+    let res =
+        eval_scalar_function("LOCALDATETIME", std::slice::from_ref(&dt_source), None).unwrap();
     assert_eq!(res.to_string(), "1984-10-11T12:00");
 
     // localdatetime({datetime: other})
     let res = eval_scalar_function(
         "LOCALDATETIME",
         &[make_map(vec![("datetime", dt_source.clone())])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "1984-10-11T12:00");
@@ -1389,6 +1500,7 @@ fn test_project_localdatetime_from_datetime() {
             ("day", Value::from(28)),
             ("second", Value::from(42)),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "1984-10-28T12:00:42");
@@ -1400,8 +1512,12 @@ fn test_project_localdatetime_from_datetime() {
 
 #[test]
 fn test_project_datetime_from_date() {
-    let date_source =
-        eval_scalar_function("DATE", &[unival!({"year": 1984, "month": 10, "day": 11})]).unwrap();
+    let date_source = eval_scalar_function(
+        "DATE",
+        &[unival!({"year": 1984, "month": 10, "day": 11})],
+        None,
+    )
+    .unwrap();
 
     // datetime({date: other, hour: 10, minute: 10, second: 10}) → defaults to Z
     let res = eval_scalar_function(
@@ -1412,6 +1528,7 @@ fn test_project_datetime_from_date() {
             ("minute", Value::from(10)),
             ("second", Value::from(10)),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "1984-10-11T10:10:10Z");
@@ -1426,6 +1543,7 @@ fn test_project_datetime_from_date() {
             ("second", Value::from(10)),
             ("timezone", Value::from("+05:00")),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "1984-10-11T10:10:10+05:00");
@@ -1440,6 +1558,7 @@ fn test_project_datetime_from_date() {
             ("minute", Value::from(10)),
             ("second", Value::from(10)),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "1984-10-28T10:10:10Z");
@@ -1455,6 +1574,7 @@ fn test_project_datetime_from_date() {
             ("second", Value::from(10)),
             ("timezone", Value::from("Pacific/Honolulu")),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(
@@ -1466,6 +1586,7 @@ fn test_project_datetime_from_date() {
     let ldt_source = eval_scalar_function(
         "LOCALDATETIME",
         &[unival!({"year": 1984, "week": 10, "dayOfWeek": 3, "hour": 12, "minute": 31, "second": 14, "millisecond": 645})],
+    None,
     )
     .unwrap();
 
@@ -1477,6 +1598,7 @@ fn test_project_datetime_from_date() {
             ("minute", Value::from(10)),
             ("second", Value::from(10)),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "1984-03-07T10:10:10Z");
@@ -1490,6 +1612,7 @@ fn test_project_datetime_from_date() {
             ("second", Value::from(10)),
             ("timezone", Value::from("+05:00")),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "1984-03-07T10:10:10+05:00");
@@ -1503,6 +1626,7 @@ fn test_project_datetime_from_date() {
             ("minute", Value::from(10)),
             ("second", Value::from(10)),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "1984-03-28T10:10:10Z");
@@ -1517,6 +1641,7 @@ fn test_project_datetime_from_date() {
             ("second", Value::from(10)),
             ("timezone", Value::from("Pacific/Honolulu")),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(
@@ -1528,6 +1653,7 @@ fn test_project_datetime_from_date() {
     let dt_source = eval_scalar_function(
         "DATETIME",
         &[unival!({"year": 1984, "month": 10, "day": 11, "hour": 12, "timezone": "+01:00"})],
+        None,
     )
     .unwrap();
 
@@ -1539,6 +1665,7 @@ fn test_project_datetime_from_date() {
             ("minute", Value::from(10)),
             ("second", Value::from(10)),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "1984-10-11T10:10:10Z");
@@ -1552,6 +1679,7 @@ fn test_project_datetime_from_date() {
             ("second", Value::from(10)),
             ("timezone", Value::from("+05:00")),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "1984-10-11T10:10:10+05:00");
@@ -1565,6 +1693,7 @@ fn test_project_datetime_from_date() {
             ("minute", Value::from(10)),
             ("second", Value::from(10)),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "1984-10-28T10:10:10Z");
@@ -1579,6 +1708,7 @@ fn test_project_datetime_from_date() {
             ("second", Value::from(10)),
             ("timezone", Value::from("Pacific/Honolulu")),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(
@@ -1597,6 +1727,7 @@ fn test_project_datetime_from_time() {
     let lt_source = eval_scalar_function(
         "LOCALTIME",
         &[unival!({"hour": 12, "minute": 31, "second": 14, "nanosecond": 645876123})],
+        None,
     )
     .unwrap();
 
@@ -1608,6 +1739,7 @@ fn test_project_datetime_from_time() {
             ("day", Value::from(11)),
             ("time", lt_source.clone()),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "1984-10-11T12:31:14.645876123Z");
@@ -1621,6 +1753,7 @@ fn test_project_datetime_from_time() {
             ("time", lt_source.clone()),
             ("timezone", Value::from("+05:00")),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "1984-10-11T12:31:14.645876123+05:00");
@@ -1634,6 +1767,7 @@ fn test_project_datetime_from_time() {
             ("time", lt_source.clone()),
             ("second", Value::from(42)),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "1984-10-11T12:31:42.645876123Z");
@@ -1648,6 +1782,7 @@ fn test_project_datetime_from_time() {
             ("second", Value::from(42)),
             ("timezone", Value::from("Pacific/Honolulu")),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(
@@ -1659,6 +1794,7 @@ fn test_project_datetime_from_time() {
     let t_source = eval_scalar_function(
         "TIME",
         &[unival!({"hour": 12, "minute": 31, "second": 14, "microsecond": 645876, "timezone": "+01:00"})],
+    None,
     )
     .unwrap();
 
@@ -1671,6 +1807,7 @@ fn test_project_datetime_from_time() {
             ("day", Value::from(11)),
             ("time", t_source.clone()),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "1984-10-11T12:31:14.645876+01:00");
@@ -1685,6 +1822,7 @@ fn test_project_datetime_from_time() {
             ("time", t_source.clone()),
             ("timezone", Value::from("+05:00")),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "1984-10-11T16:31:14.645876+05:00");
@@ -1699,6 +1837,7 @@ fn test_project_datetime_from_time() {
             ("time", t_source.clone()),
             ("second", Value::from(42)),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "1984-10-11T12:31:42.645876+01:00");
@@ -1714,6 +1853,7 @@ fn test_project_datetime_from_time() {
             ("second", Value::from(42)),
             ("timezone", Value::from("Pacific/Honolulu")),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(
@@ -1725,6 +1865,7 @@ fn test_project_datetime_from_time() {
     let ldt_source = eval_scalar_function(
         "LOCALDATETIME",
         &[unival!({"year": 1984, "week": 10, "dayOfWeek": 3, "hour": 12, "minute": 31, "second": 14, "millisecond": 645})],
+    None,
     )
     .unwrap();
 
@@ -1736,6 +1877,7 @@ fn test_project_datetime_from_time() {
             ("day", Value::from(11)),
             ("time", ldt_source.clone()),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "1984-10-11T12:31:14.645Z");
@@ -1749,6 +1891,7 @@ fn test_project_datetime_from_time() {
             ("time", ldt_source.clone()),
             ("timezone", Value::from("+05:00")),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "1984-10-11T12:31:14.645+05:00");
@@ -1762,6 +1905,7 @@ fn test_project_datetime_from_time() {
             ("time", ldt_source.clone()),
             ("second", Value::from(42)),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "1984-10-11T12:31:42.645Z");
@@ -1776,6 +1920,7 @@ fn test_project_datetime_from_time() {
             ("second", Value::from(42)),
             ("timezone", Value::from("Pacific/Honolulu")),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(
@@ -1787,6 +1932,7 @@ fn test_project_datetime_from_time() {
     let dt_source = eval_scalar_function(
         "DATETIME",
         &[unival!({"year": 1984, "month": 10, "day": 11, "hour": 12, "timezone": "Europe/Stockholm"})],
+    None,
     )
     .unwrap();
 
@@ -1799,6 +1945,7 @@ fn test_project_datetime_from_time() {
             ("day", Value::from(11)),
             ("time", dt_source.clone()),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "1984-10-11T12:00+01:00[Europe/Stockholm]");
@@ -1813,6 +1960,7 @@ fn test_project_datetime_from_time() {
             ("time", dt_source.clone()),
             ("timezone", Value::from("+05:00")),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "1984-10-11T16:00+05:00");
@@ -1827,6 +1975,7 @@ fn test_project_datetime_from_time() {
             ("time", dt_source.clone()),
             ("second", Value::from(42)),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(
@@ -1845,6 +1994,7 @@ fn test_project_datetime_from_time() {
             ("second", Value::from(42)),
             ("timezone", Value::from("Pacific/Honolulu")),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(
@@ -1860,16 +2010,22 @@ fn test_project_datetime_from_time() {
 #[test]
 fn test_project_datetime_date_and_time() {
     // Date sources
-    let date1 =
-        eval_scalar_function("DATE", &[unival!({"year": 1984, "month": 10, "day": 11})]).unwrap();
+    let date1 = eval_scalar_function(
+        "DATE",
+        &[unival!({"year": 1984, "month": 10, "day": 11})],
+        None,
+    )
+    .unwrap();
     let date_ldt = eval_scalar_function(
         "LOCALDATETIME",
         &[unival!({"year": 1984, "week": 10, "dayOfWeek": 3, "hour": 12, "minute": 31, "second": 14, "millisecond": 645})],
+    None,
     )
     .unwrap();
     let date_dt = eval_scalar_function(
         "DATETIME",
         &[unival!({"year": 1984, "month": 10, "day": 11, "hour": 12, "timezone": "+01:00"})],
+        None,
     )
     .unwrap();
 
@@ -1877,21 +2033,25 @@ fn test_project_datetime_date_and_time() {
     let time_lt = eval_scalar_function(
         "LOCALTIME",
         &[unival!({"hour": 12, "minute": 31, "second": 14, "nanosecond": 645876123})],
+        None,
     )
     .unwrap();
     let time_t = eval_scalar_function(
         "TIME",
         &[unival!({"hour": 12, "minute": 31, "second": 14, "microsecond": 645876, "timezone": "+01:00"})],
+    None,
     )
     .unwrap();
     let time_ldt = eval_scalar_function(
         "LOCALDATETIME",
         &[unival!({"year": 1984, "week": 10, "dayOfWeek": 3, "hour": 12, "minute": 31, "second": 14, "millisecond": 645})],
+    None,
     )
     .unwrap();
     let time_dt = eval_scalar_function(
         "DATETIME",
         &[unival!({"year": 1984, "month": 10, "day": 11, "hour": 12, "timezone": "Europe/Stockholm"})],
+    None,
     )
     .unwrap();
 
@@ -2311,7 +2471,7 @@ fn test_project_datetime_date_and_time() {
         if let Some(tz) = case.tz {
             entries.push(("timezone", Value::from(tz)));
         }
-        let res = eval_scalar_function("DATETIME", &[make_map(entries)])
+        let res = eval_scalar_function("DATETIME", &[make_map(entries)], None)
             .unwrap_or_else(|e| panic!("datetime({}) failed: {}", case.label, e));
         assert_eq!(res.to_string(), case.expected, "case: {}", case.label);
     }
@@ -2327,17 +2487,19 @@ fn test_project_datetime_from_datetime() {
     let ldt_source = eval_scalar_function(
         "LOCALDATETIME",
         &[unival!({"year": 1984, "week": 10, "dayOfWeek": 3, "hour": 12, "minute": 31, "second": 14, "millisecond": 645})],
+    None,
     )
     .unwrap();
 
     // datetime(other) → add Z timezone
-    let res = eval_scalar_function("DATETIME", std::slice::from_ref(&ldt_source)).unwrap();
+    let res = eval_scalar_function("DATETIME", std::slice::from_ref(&ldt_source), None).unwrap();
     assert_eq!(res.to_string(), "1984-03-07T12:31:14.645Z");
 
     // datetime({datetime: other})
     let res = eval_scalar_function(
         "DATETIME",
         &[make_map(vec![("datetime", ldt_source.clone())])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "1984-03-07T12:31:14.645Z");
@@ -2349,6 +2511,7 @@ fn test_project_datetime_from_datetime() {
             ("datetime", ldt_source.clone()),
             ("timezone", Value::from("+05:00")),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "1984-03-07T12:31:14.645+05:00");
@@ -2361,6 +2524,7 @@ fn test_project_datetime_from_datetime() {
             ("day", Value::from(28)),
             ("second", Value::from(42)),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "1984-03-28T12:31:42.645Z");
@@ -2374,6 +2538,7 @@ fn test_project_datetime_from_datetime() {
             ("second", Value::from(42)),
             ("timezone", Value::from("Pacific/Honolulu")),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(
@@ -2385,17 +2550,19 @@ fn test_project_datetime_from_datetime() {
     let dt_source = eval_scalar_function(
         "DATETIME",
         &[unival!({"year": 1984, "month": 10, "day": 11, "hour": 12, "timezone": "Europe/Stockholm"})],
+    None,
     )
     .unwrap();
 
     // datetime(other) → identity
-    let res = eval_scalar_function("DATETIME", std::slice::from_ref(&dt_source)).unwrap();
+    let res = eval_scalar_function("DATETIME", std::slice::from_ref(&dt_source), None).unwrap();
     assert_eq!(res.to_string(), "1984-10-11T12:00+01:00[Europe/Stockholm]");
 
     // datetime({datetime: other})
     let res = eval_scalar_function(
         "DATETIME",
         &[make_map(vec![("datetime", dt_source.clone())])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "1984-10-11T12:00+01:00[Europe/Stockholm]");
@@ -2407,6 +2574,7 @@ fn test_project_datetime_from_datetime() {
             ("datetime", dt_source.clone()),
             ("timezone", Value::from("+05:00")),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(res.to_string(), "1984-10-11T16:00+05:00");
@@ -2419,6 +2587,7 @@ fn test_project_datetime_from_datetime() {
             ("day", Value::from(28)),
             ("second", Value::from(42)),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(
@@ -2436,6 +2605,7 @@ fn test_project_datetime_from_datetime() {
             ("second", Value::from(42)),
             ("timezone", Value::from("Pacific/Honolulu")),
         ])],
+        None,
     )
     .unwrap();
     assert_eq!(

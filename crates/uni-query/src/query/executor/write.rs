@@ -1239,6 +1239,7 @@ impl Executor {
         prop_manager: &PropertyManager,
         params: &HashMap<String, Value>,
         ctx: Option<&QueryContext>,
+        tx_l0_override: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
     ) -> Result<Vec<HashMap<String, Value>>> {
         let writer_lock = self
             .writer
@@ -1302,6 +1303,9 @@ impl Executor {
             if let Some((vid, _pattern_props)) = optimized_vid {
                 // Optimized Path: Node found via index
                 let mut writer = writer_lock.write().await;
+                let saved_l0 =
+                    tx_l0_override.map(|l0| writer.install_transaction_l0(Some(l0.clone())));
+
                 let mut match_row = row.clone();
                 if let PatternElement::Node(n) = &pattern.paths[0].elements[0]
                     && let Some(var) = &n.variable
@@ -1309,7 +1313,7 @@ impl Executor {
                     match_row.insert(var.clone(), Value::Int(vid.as_u64() as i64));
                 }
 
-                if let Some(set) = on_match {
+                let result = if let Some(set) = on_match {
                     self.execute_set_items_locked(
                         &set.items,
                         &mut match_row,
@@ -1318,8 +1322,17 @@ impl Executor {
                         params,
                         ctx,
                     )
-                    .await?;
+                    .await
+                } else {
+                    Ok(())
+                };
+
+                if let Some(saved) = saved_l0 {
+                    writer.install_transaction_l0(saved);
                 }
+                drop(writer);
+                result?;
+
                 Self::bind_path_variables(&path_pattern, &mut match_row, &temp_vars);
                 results.push(match_row);
             } else {
@@ -1328,35 +1341,30 @@ impl Executor {
                     .execute_merge_match(pattern, &row, prop_manager, params, ctx)
                     .await?;
                 let mut writer = writer_lock.write().await;
-                if !matches.is_empty() {
-                    for mut m in matches {
-                        if let Some(set) = on_match {
-                            self.execute_set_items_locked(
-                                &set.items,
-                                &mut m,
-                                &mut writer,
-                                prop_manager,
-                                params,
-                                ctx,
-                            )
-                            .await?;
+                let saved_l0 =
+                    tx_l0_override.map(|l0| writer.install_transaction_l0(Some(l0.clone())));
+
+                let result: Result<Vec<HashMap<String, Value>>> = async {
+                    let mut batch = Vec::new();
+                    if !matches.is_empty() {
+                        for mut m in matches {
+                            if let Some(set) = on_match {
+                                self.execute_set_items_locked(
+                                    &set.items,
+                                    &mut m,
+                                    &mut writer,
+                                    prop_manager,
+                                    params,
+                                    ctx,
+                                )
+                                .await?;
+                            }
+                            Self::bind_path_variables(&path_pattern, &mut m, &temp_vars);
+                            batch.push(m);
                         }
-                        Self::bind_path_variables(&path_pattern, &mut m, &temp_vars);
-                        results.push(m);
-                    }
-                } else {
-                    self.execute_create_pattern(
-                        &path_pattern,
-                        &mut row,
-                        &mut writer,
-                        prop_manager,
-                        params,
-                        ctx,
-                    )
-                    .await?;
-                    if let Some(set) = on_create {
-                        self.execute_set_items_locked(
-                            &set.items,
+                    } else {
+                        self.execute_create_pattern(
+                            &path_pattern,
                             &mut row,
                             &mut writer,
                             prop_manager,
@@ -1364,10 +1372,29 @@ impl Executor {
                             ctx,
                         )
                         .await?;
+                        if let Some(set) = on_create {
+                            self.execute_set_items_locked(
+                                &set.items,
+                                &mut row,
+                                &mut writer,
+                                prop_manager,
+                                params,
+                                ctx,
+                            )
+                            .await?;
+                        }
+                        Self::bind_path_variables(&path_pattern, &mut row, &temp_vars);
+                        batch.push(row);
                     }
-                    Self::bind_path_variables(&path_pattern, &mut row, &temp_vars);
-                    results.push(row);
+                    Ok(batch)
                 }
+                .await;
+
+                if let Some(saved) = saved_l0 {
+                    writer.install_transaction_l0(saved);
+                }
+                drop(writer);
+                results.extend(result?);
             }
         }
         Ok(results)

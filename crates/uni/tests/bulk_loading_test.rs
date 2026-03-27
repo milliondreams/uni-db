@@ -72,7 +72,7 @@ async fn setup_db() -> Result<(Uni, tempfile::TempDir)> {
 async fn test_bulk_insert_vertices() -> Result<()> {
     let (db, _temp) = setup_db().await?;
 
-    let mut bulk = db.bulk_writer().batch_size(100).build()?;
+    let mut bulk = db.session().bulk_writer()?.batch_size(100).build()?;
 
     // Insert 250 vertices (will trigger multiple flushes with batch_size=100)
     let mut props = Vec::new();
@@ -90,8 +90,11 @@ async fn test_bulk_insert_vertices() -> Result<()> {
     assert_eq!(stats.vertices_inserted, 250);
 
     // Verify data was persisted
-    let result = db.query("MATCH (p:Person) RETURN count(p) AS c").await?;
-    assert_eq!(result.rows[0].get::<i64>("c")?, 250);
+    let result = db
+        .session()
+        .query("MATCH (p:Person) RETURN count(p) AS c")
+        .await?;
+    assert_eq!(result.rows()[0].get::<i64>("c")?, 250);
 
     Ok(())
 }
@@ -101,7 +104,7 @@ async fn test_bulk_insert_edges() -> Result<()> {
     let (db, _temp) = setup_db().await?;
 
     // First create some vertices
-    let mut bulk = db.bulk_writer().batch_size(100).build()?;
+    let mut bulk = db.session().bulk_writer()?.batch_size(100).build()?;
 
     let mut person_props = Vec::new();
     for i in 0..100 {
@@ -155,7 +158,7 @@ async fn test_bulk_insert_edges() -> Result<()> {
 async fn test_bulk_abort_clears_buffers() -> Result<()> {
     let (db, _temp) = setup_db().await?;
 
-    let mut bulk = db.bulk_writer().batch_size(1000).build()?; // Large batch to avoid flush
+    let mut bulk = db.session().bulk_writer()?.batch_size(1000).build()?; // Large batch to avoid flush
 
     // Insert vertices (won't be flushed due to large batch size)
     let mut props = Vec::new();
@@ -171,12 +174,15 @@ async fn test_bulk_abort_clears_buffers() -> Result<()> {
 
     // Verify no data was persisted (buffers were cleared before flush)
     // When no dataset exists yet, MATCH returns no rows
-    let result = db.query("MATCH (p:Person) RETURN count(p) AS c").await?;
-    if result.rows.is_empty() {
+    let result = db
+        .session()
+        .query("MATCH (p:Person) RETURN count(p) AS c")
+        .await?;
+    if result.is_empty() {
         // No dataset exists - abort worked correctly
     } else {
         // Dataset exists but should have 0 rows
-        assert_eq!(result.rows[0].get::<i64>("c")?, 0);
+        assert_eq!(result.rows()[0].get::<i64>("c")?, 0);
     }
 
     Ok(())
@@ -193,7 +199,8 @@ async fn test_bulk_progress_callback() -> Result<()> {
     let progress_count_clone = progress_count.clone();
 
     let mut bulk = db
-        .bulk_writer()
+        .session()
+        .bulk_writer()?
         .batch_size(50)
         .on_progress(move |_progress| {
             progress_count_clone.fetch_add(1, Ordering::SeqCst);
@@ -220,7 +227,7 @@ async fn test_bulk_progress_callback() -> Result<()> {
 async fn test_bulk_edge_with_properties() -> Result<()> {
     let (db, _temp) = setup_db().await?;
 
-    let mut bulk = db.bulk_writer().build()?;
+    let mut bulk = db.session().bulk_writer()?.build()?;
 
     // Create two persons
     let p1_props = vec![{
@@ -252,9 +259,10 @@ async fn test_bulk_edge_with_properties() -> Result<()> {
     // Verify edge exists with property
     // Note: Edge property queries may require specific query patterns
     let result = db
+        .session()
         .query("MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN a.name, b.name")
         .await?;
-    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.len(), 1);
 
     Ok(())
 }
@@ -266,7 +274,8 @@ async fn test_bulk_async_indexes_returns_immediately() -> Result<()> {
     let (db, _temp) = setup_db().await?;
 
     let mut bulk = db
-        .bulk_writer()
+        .session()
+        .bulk_writer()?
         .async_indexes(true)
         .batch_size(100)
         .build()?;
@@ -287,8 +296,11 @@ async fn test_bulk_async_indexes_returns_immediately() -> Result<()> {
     assert!(stats.indexes_pending);
 
     // Data should be queryable immediately (via full scan)
-    let result = db.query("MATCH (p:Person) RETURN count(p) AS c").await?;
-    assert_eq!(result.rows[0].get::<i64>("c")?, 100);
+    let result = db
+        .session()
+        .query("MATCH (p:Person) RETURN count(p) AS c")
+        .await?;
+    assert_eq!(result.rows()[0].get::<i64>("c")?, 100);
 
     // Check initial status - should have pending or in-progress tasks
     let status = db.index_rebuild_status().await?;
@@ -313,7 +325,8 @@ async fn test_bulk_sync_indexes_blocks() -> Result<()> {
     let (db, _temp) = setup_db().await?;
 
     let mut bulk = db
-        .bulk_writer()
+        .session()
+        .bulk_writer()?
         .async_indexes(false) // Default behavior
         .batch_size(100)
         .build()?;
@@ -334,8 +347,11 @@ async fn test_bulk_sync_indexes_blocks() -> Result<()> {
     assert!(stats.index_task_ids.is_empty());
 
     // Data should be queryable
-    let result = db.query("MATCH (p:Person) RETURN count(p) AS c").await?;
-    assert_eq!(result.rows[0].get::<i64>("c")?, 50);
+    let result = db
+        .session()
+        .query("MATCH (p:Person) RETURN count(p) AS c")
+        .await?;
+    assert_eq!(result.rows()[0].get::<i64>("c")?, 50);
 
     Ok(())
 }
@@ -424,7 +440,11 @@ async fn setup_db_with_constraints() -> Result<(Uni, tempfile::TempDir)> {
 async fn test_bulk_not_null_constraint() -> Result<()> {
     let (db, _temp) = setup_db_with_constraints().await?;
 
-    let mut bulk = db.bulk_writer().validate_constraints(true).build()?;
+    let mut bulk = db
+        .session()
+        .bulk_writer()?
+        .validate_constraints(true)
+        .build()?;
 
     // Try to insert without required "name" field - should fail
     let props = vec![{
@@ -450,7 +470,11 @@ async fn test_bulk_not_null_constraint() -> Result<()> {
 async fn test_bulk_not_null_constraint_with_explicit_null() -> Result<()> {
     let (db, _temp) = setup_db_with_constraints().await?;
 
-    let mut bulk = db.bulk_writer().validate_constraints(true).build()?;
+    let mut bulk = db
+        .session()
+        .bulk_writer()?
+        .validate_constraints(true)
+        .build()?;
 
     // Try to insert with explicit null for required field
     let props = vec![{
@@ -470,7 +494,11 @@ async fn test_bulk_not_null_constraint_with_explicit_null() -> Result<()> {
 async fn test_bulk_unique_constraint_in_batch() -> Result<()> {
     let (db, _temp) = setup_db_with_constraints().await?;
 
-    let mut bulk = db.bulk_writer().validate_constraints(true).build()?;
+    let mut bulk = db
+        .session()
+        .bulk_writer()?
+        .validate_constraints(true)
+        .build()?;
 
     // Insert batch with duplicate emails - should fail
     let props = vec![
@@ -504,7 +532,11 @@ async fn test_bulk_unique_constraint_in_batch() -> Result<()> {
 async fn test_bulk_unique_constraint_across_batches() -> Result<()> {
     let (db, _temp) = setup_db_with_constraints().await?;
 
-    let mut bulk = db.bulk_writer().validate_constraints(true).build()?;
+    let mut bulk = db
+        .session()
+        .bulk_writer()?
+        .validate_constraints(true)
+        .build()?;
 
     // First batch succeeds
     let props1 = vec![{
@@ -536,7 +568,7 @@ async fn test_bulk_unique_constraint_across_batches() -> Result<()> {
 async fn test_bulk_abort_after_flush_rollback() -> Result<()> {
     let (db, _temp) = setup_db().await?;
 
-    let mut bulk = db.bulk_writer().batch_size(10).build()?; // Small batch to force flush
+    let mut bulk = db.session().bulk_writer()?.batch_size(10).build()?; // Small batch to force flush
 
     // Insert enough data to trigger a flush (batch_size=10)
     let mut props = Vec::new();
@@ -553,13 +585,16 @@ async fn test_bulk_abort_after_flush_rollback() -> Result<()> {
     bulk.abort().await?;
 
     // Verify no data remains
-    let result = db.query("MATCH (p:Person) RETURN count(p) AS c").await?;
-    if result.rows.is_empty() {
+    let result = db
+        .session()
+        .query("MATCH (p:Person) RETURN count(p) AS c")
+        .await?;
+    if result.is_empty() {
         // Dataset was dropped - abort worked correctly
     } else {
         // Dataset exists but should have 0 rows (rollback worked)
         assert_eq!(
-            result.rows[0].get::<i64>("c")?,
+            result.rows()[0].get::<i64>("c")?,
             0,
             "Abort should rollback all flushed data"
         );
@@ -575,7 +610,8 @@ async fn test_bulk_buffer_limit_checkpoint() -> Result<()> {
     // Set a very small buffer limit (10KB) and large batch size
     // This forces checkpoint based on buffer size, not batch count
     let mut bulk = db
-        .bulk_writer()
+        .session()
+        .bulk_writer()?
         .batch_size(100_000) // Won't flush based on count
         .max_buffer_size_bytes(10 * 1024) // 10KB limit
         .build()?;
@@ -599,8 +635,11 @@ async fn test_bulk_buffer_limit_checkpoint() -> Result<()> {
     assert_eq!(stats.vertices_inserted, 100);
 
     // Verify all data was persisted
-    let result = db.query("MATCH (p:Person) RETURN count(p) AS c").await?;
-    assert_eq!(result.rows[0].get::<i64>("c")?, 100);
+    let result = db
+        .session()
+        .query("MATCH (p:Person) RETURN count(p) AS c")
+        .await?;
+    assert_eq!(result.rows()[0].get::<i64>("c")?, 100);
 
     Ok(())
 }
@@ -611,7 +650,11 @@ async fn test_bulk_constraint_validation_disabled() -> Result<()> {
 
     // With validation disabled, UNIQUE constraint violations should not fail at insert time
     // Note: Arrow/LanceDB still enforces schema-level nullability, so we can't skip NOT NULL
-    let mut bulk = db.bulk_writer().validate_constraints(false).build()?;
+    let mut bulk = db
+        .session()
+        .bulk_writer()?
+        .validate_constraints(false)
+        .build()?;
 
     // Insert duplicate emails - should succeed when UNIQUE validation disabled
     let props = vec![
@@ -640,8 +683,11 @@ async fn test_bulk_constraint_validation_disabled() -> Result<()> {
     bulk.commit().await?;
 
     // Both rows should exist (constraint was bypassed)
-    let result = db.query("MATCH (p:Person) RETURN count(p) AS c").await?;
-    assert_eq!(result.rows[0].get::<i64>("c")?, 2);
+    let result = db
+        .session()
+        .query("MATCH (p:Person) RETURN count(p) AS c")
+        .await?;
+    assert_eq!(result.rows()[0].get::<i64>("c")?, 2);
 
     Ok(())
 }

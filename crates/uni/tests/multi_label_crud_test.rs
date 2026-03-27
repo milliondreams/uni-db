@@ -1626,6 +1626,7 @@ mod cypher_tests {
 
         // Try to create a vertex with multi-label syntax
         let result = db
+            .session()
             .execute("CREATE (:Person:Employee {name: 'Alice'})")
             .await;
 
@@ -1635,14 +1636,17 @@ mod cypher_tests {
                 // Parser supports it! Verify the vertex was created
                 db.flush().await?;
 
-                let query_result = db.query("MATCH (p:Person) RETURN p.name").await?;
+                let query_result = db.session().query("MATCH (p:Person) RETURN p.name").await?;
 
                 assert_eq!(query_result.len(), 1);
                 let name: String = query_result.rows()[0].get("p.name")?;
                 assert_eq!(name, "Alice");
 
                 // Also verify it matches as Employee
-                let query_result2 = db.query("MATCH (e:Employee) RETURN e.name").await?;
+                let query_result2 = db
+                    .session()
+                    .query("MATCH (e:Employee) RETURN e.name")
+                    .await?;
 
                 assert_eq!(query_result2.len(), 1);
                 let name2: String = query_result2.rows()[0].get("e.name")?;
@@ -1674,12 +1678,19 @@ mod cypher_tests {
             .await?;
 
         // Create test data using single-label syntax
-        db.execute("CREATE (:Person {name: 'Alice'})").await?;
-        db.execute("CREATE (:Person {name: 'Bob'})").await?;
+        db.session()
+            .execute("CREATE (:Person {name: 'Alice'})")
+            .await?;
+        db.session()
+            .execute("CREATE (:Person {name: 'Bob'})")
+            .await?;
         db.flush().await?;
 
         // Try to match with multi-label pattern
-        let result = db.query("MATCH (p:Person:Employee) RETURN p.name").await;
+        let result = db
+            .session()
+            .query("MATCH (p:Person:Employee) RETURN p.name")
+            .await;
 
         match result {
             Ok(res) => {
@@ -1709,11 +1720,13 @@ mod cypher_tests {
             .await?;
 
         // Create a Person vertex
-        db.execute("CREATE (:Person {name: 'Alice'})").await?;
+        db.session()
+            .execute("CREATE (:Person {name: 'Alice'})")
+            .await?;
         db.flush().await?;
 
         // Try to add Manager label using SET
-        let result = db.execute("MATCH (p:Person) SET p:Manager").await;
+        let result = db.session().execute("MATCH (p:Person) SET p:Manager").await;
 
         match result {
             Ok(_) => {
@@ -1721,7 +1734,10 @@ mod cypher_tests {
                 db.flush().await?;
 
                 // Verify the vertex now has Manager label
-                let query_result = db.query("MATCH (m:Manager) RETURN m.name").await?;
+                let query_result = db
+                    .session()
+                    .query("MATCH (m:Manager) RETURN m.name")
+                    .await?;
 
                 if !query_result.is_empty() {
                     let name: String = query_result.rows()[0].get("m.name")?;
@@ -1753,11 +1769,16 @@ mod cypher_tests {
             .await?;
 
         // Create a Person vertex
-        db.execute("CREATE (:Person {name: 'Alice'})").await?;
+        db.session()
+            .execute("CREATE (:Person {name: 'Alice'})")
+            .await?;
         db.flush().await?;
 
         // Try to remove Employee label using REMOVE
-        let result = db.execute("MATCH (p:Person) REMOVE p:Employee").await;
+        let result = db
+            .session()
+            .execute("MATCH (p:Person) REMOVE p:Employee")
+            .await;
 
         match result {
             Ok(_) => {
@@ -1785,11 +1806,14 @@ mod cypher_tests {
             .await?;
 
         // Create a Person vertex
-        db.execute("CREATE (:Person {name: 'Alice'})").await?;
+        db.session()
+            .execute("CREATE (:Person {name: 'Alice'})")
+            .await?;
         db.flush().await?;
 
         // Try to use labels() function
         let result = db
+            .session()
             .query("MATCH (p:Person) RETURN labels(p) as vertex_labels")
             .await;
 

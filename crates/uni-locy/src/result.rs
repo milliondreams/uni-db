@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use uni_common::Value;
+use uni_common::{Properties, Value};
 
 use crate::types::{RuntimeWarning, RuntimeWarningCode};
 
-/// A single row of bindings from a query result.
-pub type Row = HashMap<String, Value>;
+/// A single row of bindings from a Locy evaluation result.
+pub type FactRow = HashMap<String, Value>;
 
 /// Opaque savepoint identifier for transactional rollback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -16,7 +16,7 @@ pub struct SavepointId(pub u64);
 #[derive(Debug, Clone)]
 pub struct LocyResult {
     /// Derived facts per rule name.
-    pub derived: HashMap<String, Vec<Row>>,
+    pub derived: HashMap<String, Vec<FactRow>>,
     /// Execution statistics.
     pub stats: LocyStats,
     /// Results from Phase 4 commands.
@@ -26,17 +26,20 @@ pub struct LocyResult {
     /// Groups where BDD computation fell back to independence mode.
     /// Maps rule name → list of human-readable key group descriptions.
     pub approximate_groups: HashMap<String, Vec<String>>,
+    /// When present, contains the derived facts from a session-level DERIVE
+    /// that have not yet been applied. Use `tx.apply(derived)` to materialize.
+    pub derived_fact_set: Option<DerivedFactSet>,
 }
 
 /// Result of executing a single Phase 4 command.
 #[derive(Debug, Clone)]
 pub enum CommandResult {
-    Query(Vec<Row>),
-    Assume(Vec<Row>),
+    Query(Vec<FactRow>),
+    Assume(Vec<FactRow>),
     Explain(DerivationNode),
     Abduce(AbductionResult),
     Derive { affected: usize },
-    Cypher(Vec<Row>),
+    Cypher(Vec<FactRow>),
 }
 
 /// A node in a derivation tree, produced by EXPLAIN RULE.
@@ -95,6 +98,47 @@ pub enum Modification {
     },
 }
 
+/// A derived edge to be materialized.
+#[derive(Debug, Clone)]
+pub struct DerivedEdge {
+    pub edge_type: String,
+    pub source_label: String,
+    pub source_properties: Properties,
+    pub target_label: String,
+    pub target_properties: Properties,
+    pub edge_properties: Properties,
+}
+
+/// Pure-data representation of facts derived by a session-level DERIVE.
+///
+/// Apply to a transaction via `tx.apply(derived)` or `tx.apply_with(derived)`.
+#[derive(Debug, Clone)]
+pub struct DerivedFactSet {
+    /// New vertices grouped by label.
+    pub vertices: HashMap<String, Vec<Properties>>,
+    /// Derived edges connecting source/target vertices.
+    pub edges: Vec<DerivedEdge>,
+    /// Evaluation statistics from the DERIVE run.
+    pub stats: LocyStats,
+    /// Database version at evaluation time (for staleness detection).
+    pub evaluated_at_version: u64,
+    /// Internal: Cypher ASTs for faithful replay during `tx.apply()`.
+    #[doc(hidden)]
+    pub mutation_queries: Vec<uni_cypher::ast::Query>,
+}
+
+impl DerivedFactSet {
+    /// Total number of derived facts (vertices + edges).
+    pub fn fact_count(&self) -> usize {
+        self.vertices.values().map(|v| v.len()).sum::<usize>() + self.edges.len()
+    }
+
+    /// True when no facts were derived.
+    pub fn is_empty(&self) -> bool {
+        self.vertices.is_empty() && self.edges.is_empty()
+    }
+}
+
 /// Statistics collected during Locy program evaluation.
 #[derive(Debug, Clone, Default)]
 pub struct LocyStats {
@@ -111,12 +155,12 @@ pub struct LocyStats {
 
 impl LocyResult {
     /// Get derived facts for a specific rule.
-    pub fn derived_facts(&self, rule: &str) -> Option<&Vec<Row>> {
+    pub fn derived_facts(&self, rule: &str) -> Option<&Vec<FactRow>> {
         self.derived.get(rule)
     }
 
     /// Get rows from the first Query command result.
-    pub fn rows(&self) -> Option<&Vec<Row>> {
+    pub fn rows(&self) -> Option<&Vec<FactRow>> {
         self.command_results.iter().find_map(|cr| cr.as_query())
     }
 
@@ -157,7 +201,7 @@ impl CommandResult {
     }
 
     /// If this is a Query result, return the rows.
-    pub fn as_query(&self) -> Option<&Vec<Row>> {
+    pub fn as_query(&self) -> Option<&Vec<FactRow>> {
         match self {
             CommandResult::Query(rows) => Some(rows),
             _ => None,

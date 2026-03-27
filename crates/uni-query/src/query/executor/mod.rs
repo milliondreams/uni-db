@@ -8,6 +8,7 @@
 //! dispatch, and result normalization.
 
 pub mod core;
+pub mod custom_functions;
 pub mod ddl_procedures;
 pub mod path_builder;
 pub mod procedure;
@@ -16,5 +17,6 @@ pub mod result_normalizer;
 pub mod write;
 
 pub use self::core::Executor;
+pub use custom_functions::{CustomFunctionRegistry, CustomScalarFn};
 pub use path_builder::PathBuilder;
 pub use result_normalizer::ResultNormalizer;

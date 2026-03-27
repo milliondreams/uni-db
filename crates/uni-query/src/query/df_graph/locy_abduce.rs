@@ -19,7 +19,7 @@ use uni_cypher::ast::{
 use uni_cypher::locy_ast::AbduceQuery;
 use uni_locy::result::{AbductionResult, Modification, ValidatedModification};
 use uni_locy::types::CompiledRule;
-use uni_locy::{CompiledProgram, LocyConfig, LocyError, LocyStats, Row};
+use uni_locy::{CompiledProgram, FactRow, LocyConfig, LocyError, LocyStats};
 
 use super::locy_delta::RowStore;
 
@@ -50,7 +50,7 @@ pub async fn evaluate_abduce(
     let facts = ctx.lookup_derived(&rule_name)?;
 
     // Filter by WHERE expression
-    let matching: Vec<Row> = if let Some(where_expr) = &query.where_expr {
+    let matching: Vec<FactRow> = if let Some(where_expr) = &query.where_expr {
         facts
             .into_iter()
             .filter(|row| {
@@ -131,7 +131,7 @@ pub async fn evaluate_abduce(
 fn extract_removal_candidates(
     tree: &uni_locy::DerivationNode,
     rule: &CompiledRule,
-    _matching: &[Row],
+    _matching: &[FactRow],
     program: &CompiledProgram,
 ) -> Vec<Modification> {
     let mut candidates = Vec::new();
@@ -193,7 +193,11 @@ fn collect_leaf_candidates(
 }
 
 /// Extract edge removal candidates from a path pattern.
-fn extract_edge_candidates(path: &PathPattern, bindings: &Row, candidates: &mut Vec<Modification>) {
+fn extract_edge_candidates(
+    path: &PathPattern,
+    bindings: &FactRow,
+    candidates: &mut Vec<Modification>,
+) {
     let mut source_var = String::new();
     for element in &path.elements {
         match element {
@@ -327,7 +331,7 @@ async fn validate_modification(
         .map(|r| r.rows.clone())
         .unwrap_or_default();
 
-    let matching: Vec<Row> = if let Some(where_expr) = where_expr {
+    let matching: Vec<FactRow> = if let Some(where_expr) = where_expr {
         facts
             .into_iter()
             .filter(|row| {

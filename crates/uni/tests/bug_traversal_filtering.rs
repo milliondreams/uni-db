@@ -20,20 +20,26 @@ async fn test_traversal_label_filtering_bug() -> Result<()> {
 
     // 2. Insert Data
     // Create a Person 'Human' and a Robot 'Beep'
-    db.execute("CREATE (p:Person {name: 'Human'})").await?;
-    db.execute("CREATE (r:Robot {model: 'Beep'})").await?;
+    db.session()
+        .execute("CREATE (p:Person {name: 'Human'})")
+        .await?;
+    db.session()
+        .execute("CREATE (r:Robot {model: 'Beep'})")
+        .await?;
 
     // Connect them: Person -> OWNS -> Robot
-    db.execute(
-        "MATCH (p:Person {name: 'Human'}), (r:Robot {model: 'Beep'}) CREATE (p)-[:OWNS]->(r)",
-    )
-    .await?;
+    db.session()
+        .execute(
+            "MATCH (p:Person {name: 'Human'}), (r:Robot {model: 'Beep'}) CREATE (p)-[:OWNS]->(r)",
+        )
+        .await?;
 
     // 3. Test Cases
 
     // Case A: MATCH (p:Person)-[:OWNS]->(x:Person)
     // Expectation: 0 rows, because the neighbor is a Robot, not a Person.
     let results_wrong_label = db
+        .session()
         .query("MATCH (p:Person)-[:OWNS]->(x:Person) RETURN x")
         .await?;
 
@@ -63,6 +69,7 @@ async fn test_traversal_label_filtering_bug() -> Result<()> {
     // Case B: MATCH (p:Person)-[:OWNS]->(x:Robot)
     // Expectation: 1 row.
     let results_correct_label = db
+        .session()
         .query("MATCH (p:Person)-[:OWNS]->(x:Robot) RETURN x")
         .await?;
     assert_eq!(
@@ -75,6 +82,7 @@ async fn test_traversal_label_filtering_bug() -> Result<()> {
     // MATCH (p:Person)-[:OWNS*1..2]->(x:Person)
     // Expectation: 0 rows, because neighbor is Robot.
     let results_var_len = db
+        .session()
         .query("MATCH (p:Person)-[:OWNS*1..2]->(x:Person) RETURN x")
         .await?;
     assert_eq!(
@@ -85,6 +93,7 @@ async fn test_traversal_label_filtering_bug() -> Result<()> {
 
     // Case D: Variable Length Traversal (Correct Label)
     let results_var_len_correct = db
+        .session()
         .query("MATCH (p:Person)-[:OWNS*1..2]->(x:Robot) RETURN x")
         .await?;
     assert_eq!(

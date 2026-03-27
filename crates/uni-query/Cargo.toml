@@ -45,6 +45,7 @@ datafusion = { workspace = true }
 bitvec = "1"
 fxhash = { workspace = true }
 biodivine-lib-bdd = { workspace = true }
+tokio-util = { workspace = true }
 
 [features]
 default = []

@@ -156,7 +156,7 @@ async fn test_transaction_commit_atomic() -> anyhow::Result<()> {
         .await?;
 
     // Start transaction and create multiple nodes
-    let tx = db.begin().await?;
+    let tx = db.session().tx().await?;
     tx.execute("CREATE (:Person {name: 'Alice', age: 30})")
         .await?;
     tx.execute("CREATE (:Person {name: 'Bob', age: 25})")
@@ -169,6 +169,7 @@ async fn test_transaction_commit_atomic() -> anyhow::Result<()> {
 
     // Verify all nodes are visible after commit (atomicity)
     let result = db
+        .session()
         .query("MATCH (n:Person) RETURN n.name, n.age ORDER BY n.name")
         .await?;
     assert_eq!(
@@ -178,7 +179,7 @@ async fn test_transaction_commit_atomic() -> anyhow::Result<()> {
     );
 
     let names: Vec<String> = result
-        .rows
+        .rows()
         .iter()
         .map(|r| r.get("n.name").unwrap())
         .collect();
@@ -205,13 +206,13 @@ async fn test_transaction_drop_auto_rollback() -> anyhow::Result<()> {
 
     // Create and drop a transaction without commit
     {
-        let tx = db.begin().await?;
+        let tx = db.session().tx().await?;
         tx.execute("CREATE (:Person {name: 'Alice'})").await?;
         // tx is dropped here without commit
     }
 
     // Verify the node was NOT persisted (auto-rollback)
-    let result = db.query("MATCH (n:Person) RETURN n.name").await?;
+    let result = db.session().query("MATCH (n:Person) RETURN n.name").await?;
     assert_eq!(
         result.len(),
         0,
@@ -219,13 +220,13 @@ async fn test_transaction_drop_auto_rollback() -> anyhow::Result<()> {
     );
 
     // Verify we can start a new transaction (writer is not locked)
-    let tx2 = db.begin().await?;
+    let tx2 = db.session().tx().await?;
     tx2.execute("CREATE (:Person {name: 'Bob'})").await?;
     tx2.commit().await?;
 
-    let result = db.query("MATCH (n:Person) RETURN n.name").await?;
+    let result = db.session().query("MATCH (n:Person) RETURN n.name").await?;
     assert_eq!(result.len(), 1, "New transaction after drop should work");
-    let name: String = result.rows[0].get("n.name")?;
+    let name: String = result.rows()[0].get("n.name")?;
     assert_eq!(name, "Bob");
 
     Ok(())
@@ -247,14 +248,17 @@ async fn test_transaction_drop_then_new_transaction() -> anyhow::Result<()> {
 
     // Create and drop 3 transactions in sequence
     for i in 1..=3 {
-        let tx = db.begin().await?;
+        let tx = db.session().tx().await?;
         tx.execute(&format!("CREATE (:Counter {{value: {}}})", i))
             .await?;
         // Drop without commit
     }
 
     // Verify no counters exist (all auto-rolled back)
-    let result = db.query("MATCH (c:Counter) RETURN c.value").await?;
+    let result = db
+        .session()
+        .query("MATCH (c:Counter) RETURN c.value")
+        .await?;
     assert_eq!(
         result.len(),
         0,
@@ -262,14 +266,194 @@ async fn test_transaction_drop_then_new_transaction() -> anyhow::Result<()> {
     );
 
     // Verify we can still create a new successful transaction
-    let tx = db.begin().await?;
+    let tx = db.session().tx().await?;
     tx.execute("CREATE (:Counter {value: 999})").await?;
     tx.commit().await?;
 
-    let result = db.query("MATCH (c:Counter) RETURN c.value").await?;
+    let result = db
+        .session()
+        .query("MATCH (c:Counter) RETURN c.value")
+        .await?;
     assert_eq!(result.len(), 1);
-    let value: i64 = result.rows[0].get("c.value")?;
+    let value: i64 = result.rows()[0].get("c.value")?;
     assert_eq!(value, 999);
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5: Commit-Time Serialization Tests (Private L0 per Transaction)
+// ---------------------------------------------------------------------------
+
+/// Two sessions create transactions concurrently — both succeed.
+/// (Was impossible before: begin-time locking blocked the second tx.)
+#[tokio::test]
+async fn test_concurrent_transaction_creation() -> anyhow::Result<()> {
+    use uni_db::Uni;
+
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("Node")
+        .property("id", DataType::Int)
+        .apply()
+        .await?;
+
+    let s1 = db.session();
+    let s2 = db.session();
+
+    // Both sessions can start transactions concurrently
+    let tx1 = s1.tx().await?;
+    let tx2 = s2.tx().await?;
+
+    // Both can execute mutations
+    tx1.execute("CREATE (:Node {id: 1})").await?;
+    tx2.execute("CREATE (:Node {id: 2})").await?;
+
+    // Commit sequentially — both succeed
+    let r1 = tx1.commit().await?;
+    let r2 = tx2.commit().await?;
+
+    assert!(r1.mutations_committed > 0, "tx1 committed mutations");
+    assert!(r2.mutations_committed > 0, "tx2 committed mutations");
+
+    // Both nodes visible
+    let result = db
+        .session()
+        .query("MATCH (n:Node) RETURN n.id ORDER BY n.id")
+        .await?;
+    assert_eq!(result.len(), 2);
+    let ids: Vec<i64> = result
+        .rows()
+        .iter()
+        .map(|r| r.get("n.id").unwrap())
+        .collect();
+    assert_eq!(ids, vec![1, 2]);
+
+    Ok(())
+}
+
+/// Transaction reads its own uncommitted writes (read-your-writes).
+#[tokio::test]
+async fn test_transaction_read_your_writes() -> anyhow::Result<()> {
+    use uni_db::Uni;
+
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("Item")
+        .property("name", DataType::String)
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Item {name: 'Alpha'})").await?;
+
+    // Transaction should see its own write
+    let result = tx.query("MATCH (i:Item) RETURN i.name").await?;
+    assert_eq!(result.len(), 1);
+    let name: String = result.rows()[0].get("i.name")?;
+    assert_eq!(name, "Alpha");
+
+    // Add another item and read both
+    tx.execute("CREATE (:Item {name: 'Beta'})").await?;
+    let result = tx
+        .query("MATCH (i:Item) RETURN i.name ORDER BY i.name")
+        .await?;
+    assert_eq!(result.len(), 2);
+
+    tx.rollback();
+    Ok(())
+}
+
+/// Transaction A's writes are invisible to Session B.
+#[tokio::test]
+async fn test_transaction_isolation() -> anyhow::Result<()> {
+    use uni_db::Uni;
+
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("Secret")
+        .property("val", DataType::Int)
+        .apply()
+        .await?;
+
+    // Create a baseline node visible to all
+    db.session().execute("CREATE (:Secret {val: 0})").await?;
+
+    let s1 = db.session();
+    let s2 = db.session();
+
+    let tx = s1.tx().await?;
+    tx.execute("CREATE (:Secret {val: 42})").await?;
+
+    // Transaction sees both nodes (baseline + uncommitted)
+    let tx_result = tx
+        .query("MATCH (s:Secret) RETURN s.val ORDER BY s.val")
+        .await?;
+    assert_eq!(tx_result.len(), 2, "tx sees baseline + own write");
+
+    // Session B should only see the baseline node
+    let s2_result = s2.query("MATCH (s:Secret) RETURN s.val").await?;
+    assert_eq!(
+        s2_result.len(),
+        1,
+        "session B should not see tx's uncommitted writes"
+    );
+    let val: i64 = s2_result.rows()[0].get("s.val")?;
+    assert_eq!(val, 0, "session B sees only the committed baseline node");
+
+    tx.commit().await?;
+
+    // After commit, Session B sees both
+    let s2_result = s2
+        .query("MATCH (s:Secret) RETURN s.val ORDER BY s.val")
+        .await?;
+    assert_eq!(
+        s2_result.len(),
+        2,
+        "after commit, session B sees both nodes"
+    );
+
+    Ok(())
+}
+
+/// Two transactions commit sequentially — both succeed, version increments.
+#[tokio::test]
+async fn test_sequential_transaction_commits() -> anyhow::Result<()> {
+    use uni_db::Uni;
+
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("Seq")
+        .property("n", DataType::Int)
+        .apply()
+        .await?;
+
+    let s1 = db.session();
+    let s2 = db.session();
+
+    let tx1 = s1.tx().await?;
+    let tx2 = s2.tx().await?;
+
+    tx1.execute("CREATE (:Seq {n: 1})").await?;
+    tx2.execute("CREATE (:Seq {n: 2})").await?;
+
+    let r1 = tx1.commit().await?;
+    let r2 = tx2.commit().await?;
+
+    // Version should increment: tx2's version > tx1's version
+    assert!(
+        r2.version > r1.version,
+        "second commit should have higher version: {} > {}",
+        r2.version,
+        r1.version
+    );
+
+    // Both nodes exist
+    let result = db
+        .session()
+        .query("MATCH (s:Seq) RETURN s.n ORDER BY s.n")
+        .await?;
+    assert_eq!(result.len(), 2);
 
     Ok(())
 }

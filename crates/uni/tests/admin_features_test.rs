@@ -9,22 +9,26 @@ async fn test_admin_features() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
     // SHOW DATABASE
-    let result = db.query("SHOW DATABASE").await?;
+    let result = db.session().query("SHOW DATABASE").await?;
     assert_eq!(result.len(), 1);
     assert_eq!(result.rows()[0].get::<String>("name")?, "uni");
 
     // SHOW CONFIG
-    let result = db.query("SHOW CONFIG").await?;
+    let result = db.session().query("SHOW CONFIG").await?;
     // Should be empty for now
     assert_eq!(result.len(), 0);
 
     // Insert Data and Checkpoint for Statistics
-    db.execute("CREATE LABEL User (name STRING)").await?;
-    db.execute("CREATE (:User {name: 'Alice'})").await?;
-    db.execute("CHECKPOINT").await?;
+    db.session()
+        .execute("CREATE LABEL User (name STRING)")
+        .await?;
+    db.session()
+        .execute("CREATE (:User {name: 'Alice'})")
+        .await?;
+    db.session().execute("CHECKPOINT").await?;
 
     // SHOW STATISTICS
-    let result = db.query("SHOW STATISTICS").await?;
+    let result = db.session().query("SHOW STATISTICS").await?;
     assert!(!result.is_empty());
     let user_stat = result
         .rows()
@@ -40,7 +44,7 @@ async fn test_admin_features() -> Result<()> {
     assert_eq!(user_stat.get::<i64>("count")?, 1);
 
     // VACUUM
-    db.execute("VACUUM").await?;
+    db.session().execute("VACUUM").await?;
     // Implicitly verifies no error
 
     Ok(())

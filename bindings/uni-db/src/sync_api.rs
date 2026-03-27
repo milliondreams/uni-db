@@ -152,10 +152,20 @@ impl QueryCursor {
 // ============================================================================
 
 /// A database transaction for atomic operations.
+///
+/// Wraps a Rust `Transaction` which provides ACID guarantees.
+/// Use as a context manager for automatic rollback on error.
 #[pyclass]
 pub struct Transaction {
-    pub(crate) inner: Arc<Uni>,
-    pub(crate) completed: bool,
+    pub(crate) inner: Option<::uni_db::Transaction>,
+}
+
+impl Transaction {
+    fn check_active(&self) -> PyResult<&::uni_db::Transaction> {
+        self.inner.as_ref().ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Transaction already completed")
+        })
+    }
 }
 
 #[pymethods]
@@ -168,18 +178,22 @@ impl Transaction {
         cypher: &str,
         params: Option<HashMap<String, Py<PyAny>>>,
     ) -> PyResult<Vec<Py<PyAny>>> {
-        if self.completed {
-            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                "Transaction already completed",
-            ));
-        }
-        let rust_params = convert::prepare_params(py, params)?;
-
-        let rows = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(core::query_core(&self.inner, cypher, rust_params))
-            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
-
-        convert::rows_to_py(py, rows.rows)
+        let tx = self.check_active()?;
+        let result = if let Some(p) = params {
+            let mut builder = tx.query_with(cypher);
+            for (k, v) in p {
+                let val = convert::py_object_to_value(py, &v)?;
+                builder = builder.param(&k, val);
+            }
+            pyo3_async_runtimes::tokio::get_runtime()
+                .block_on(builder.fetch_all())
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+        } else {
+            pyo3_async_runtimes::tokio::get_runtime()
+                .block_on(tx.query(cypher))
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+        };
+        convert::rows_to_py(py, result.into_rows())
     }
 
     /// Execute a mutation query within this transaction.
@@ -190,76 +204,59 @@ impl Transaction {
         cypher: &str,
         params: Option<HashMap<String, Py<PyAny>>>,
     ) -> PyResult<usize> {
-        if self.completed {
-            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                "Transaction already completed",
-            ));
-        }
-        let rust_params = convert::prepare_params(py, params)?;
-        if rust_params.is_empty() {
+        let tx = self.check_active()?;
+        let result = if let Some(p) = params {
+            let mut builder = tx.query_with(cypher);
+            for (k, v) in p {
+                let val = convert::py_object_to_value(py, &v)?;
+                builder = builder.param(&k, val);
+            }
             pyo3_async_runtimes::tokio::get_runtime()
-                .block_on(core::execute_core(&self.inner, cypher))
-                .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+                .block_on(builder.execute())
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
         } else {
             pyo3_async_runtimes::tokio::get_runtime()
-                .block_on(core::execute_with_params_core(
-                    &self.inner,
-                    cypher,
-                    rust_params,
-                ))
-                .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
-        }
+                .block_on(tx.execute(cypher))
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+        };
+        Ok(result.affected_rows())
     }
 
-    /// Create a query builder for this transaction.
-    fn query_with(&self, cypher: &str) -> PyResult<QueryBuilder> {
-        if self.completed {
-            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                "Transaction already completed",
-            ));
-        }
-        Ok(QueryBuilder {
-            inner: self.inner.clone(),
-            cypher: cypher.to_string(),
-            params: HashMap::new(),
-            timeout_secs: None,
-            max_memory: None,
-        })
-    }
-
-    /// Commit the transaction.
-    fn commit(&mut self) -> PyResult<()> {
-        if self.completed {
-            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                "Transaction already completed",
-            ));
-        }
-        pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(core::commit_transaction_core(&self.inner))
-            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
-        self.completed = true;
-        Ok(())
+    /// Commit the transaction, returning a CommitResult.
+    fn commit(&mut self) -> PyResult<PyCommitResult> {
+        let tx = self.inner.take().ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Transaction already completed")
+        })?;
+        let result = pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(tx.commit())
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        Ok(PyCommitResult::from(result))
     }
 
     /// Rollback the transaction.
     fn rollback(&mut self) -> PyResult<()> {
-        if self.completed {
-            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                "Transaction already completed",
-            ));
-        }
-        pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(core::rollback_transaction_core(&self.inner))
-            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
-        self.completed = true;
+        let tx = self.inner.take().ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Transaction already completed")
+        })?;
+        tx.rollback();
         Ok(())
+    }
+
+    /// Get the transaction ID.
+    fn id(&self) -> PyResult<String> {
+        Ok(self.check_active()?.id().to_string())
+    }
+
+    /// Check if the transaction has uncommitted changes.
+    fn is_dirty(&self) -> PyResult<bool> {
+        Ok(self.check_active()?.is_dirty())
     }
 
     fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
         slf
     }
 
-    /// Context manager exit — rolls back on error.
+    /// Context manager exit — rolls back if not committed.
     #[pyo3(signature = (_exc_type=None, _exc_val=None, _exc_tb=None))]
     fn __exit__(
         &mut self,
@@ -267,11 +264,10 @@ impl Transaction {
         _exc_val: Option<Py<PyAny>>,
         _exc_tb: Option<Py<PyAny>>,
     ) -> PyResult<bool> {
-        if !self.completed {
-            self.completed = true;
-            // Rollback if exception, already handled externally otherwise
-            let _ = pyo3_async_runtimes::tokio::get_runtime()
-                .block_on(core::rollback_transaction_core(&self.inner));
+        // If the transaction is still active, roll it back.
+        // The Rust Drop impl will also auto-rollback, but explicit is clearer.
+        if let Some(tx) = self.inner.take() {
+            tx.rollback();
         }
         Ok(false) // don't suppress exceptions
     }
@@ -397,12 +393,12 @@ impl Database {
                     None,
                 ))
                 .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
-            convert::rows_to_py(py, rows.rows)
+            convert::rows_to_py(py, rows.into_rows())
         } else {
             let rows = pyo3_async_runtimes::tokio::get_runtime()
                 .block_on(core::query_core(&self.inner, cypher, rust_params))
                 .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
-            convert::rows_to_py(py, rows.rows)
+            convert::rows_to_py(py, rows.into_rows())
         }
     }
 
@@ -469,7 +465,7 @@ impl Database {
                     None,
                 ))
                 .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
-            Ok(rows.rows.len())
+            Ok(rows.len())
         } else if rust_params.is_empty() {
             pyo3_async_runtimes::tokio::get_runtime()
                 .block_on(core::execute_core(&self.inner, cypher))
@@ -535,7 +531,7 @@ impl Database {
             .block_on(core::profile_core(&self.inner, cypher))
             .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
 
-        let rows = convert::rows_to_py(py, results.rows)?;
+        let rows = convert::rows_to_py(py, results.into_rows())?;
 
         let profile_dict = PyDict::new(py);
         profile_dict.set_item("total_time_ms", profile.total_time_ms)?;
@@ -567,48 +563,44 @@ impl Database {
     // ========================================================================
 
     /// Begin a new transaction.
+    ///
+    /// **Deprecated**: Use `db.session().tx()` instead for proper session scoping.
     fn begin(&self) -> PyResult<Transaction> {
-        pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(core::begin_transaction_core(&self.inner))
-            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
-
-        Ok(Transaction {
-            inner: self.inner.clone(),
-            completed: false,
-        })
+        let session = self.inner.session();
+        let tx = pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(session.tx())
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        Ok(Transaction { inner: Some(tx) })
     }
 
     /// Execute a closure within a transaction (auto-commit on success, auto-rollback on error).
     fn transaction(&self, py: Python, func: Py<PyAny>) -> PyResult<Py<PyAny>> {
-        pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(core::begin_transaction_core(&self.inner))
-            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
-
-        let tx = Transaction {
-            inner: self.inner.clone(),
-            completed: false,
-        };
+        let session = self.inner.session();
+        let tx = pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(session.tx())
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        let tx = Transaction { inner: Some(tx) };
         let tx_obj = Py::new(py, tx)?;
 
         match func.call1(py, (tx_obj.clone_ref(py),)) {
             Ok(result) => {
                 // Auto-commit on success
                 let mut tx_ref = tx_obj.borrow_mut(py);
-                if !tx_ref.completed {
-                    tx_ref.completed = true;
+                if tx_ref.inner.is_some() {
+                    let tx_inner = tx_ref.inner.take().unwrap();
                     pyo3_async_runtimes::tokio::get_runtime()
-                        .block_on(core::commit_transaction_core(&self.inner))
-                        .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
+                        .block_on(tx_inner.commit())
+                        .map_err(|e| {
+                            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
+                        })?;
                 }
                 Ok(result)
             }
             Err(e) => {
                 // Auto-rollback on error
                 let mut tx_ref = tx_obj.borrow_mut(py);
-                if !tx_ref.completed {
-                    tx_ref.completed = true;
-                    let _ = pyo3_async_runtimes::tokio::get_runtime()
-                        .block_on(core::rollback_transaction_core(&self.inner));
+                if let Some(tx_inner) = tx_ref.inner.take() {
+                    tx_inner.rollback();
                 }
                 Err(e)
             }
@@ -824,11 +816,27 @@ impl Database {
     // Session Methods
     // ========================================================================
 
-    /// Create a session builder.
-    fn session(&self) -> SessionBuilder {
+    /// Create a new session.
+    ///
+    /// Sessions are the primary scope for reads and the factory for transactions.
+    fn session(&self) -> crate::builders::Session {
+        crate::builders::Session {
+            inner: self.inner.session(),
+        }
+    }
+
+    /// Create a session builder for setting variables before building.
+    fn session_builder(&self) -> SessionBuilder {
         SessionBuilder {
             inner: self.inner.clone(),
             variables: HashMap::new(),
+        }
+    }
+
+    /// Create a session template builder for pre-configured session factories.
+    fn session_template(&self) -> crate::builders::SessionTemplateBuilder {
+        crate::builders::SessionTemplateBuilder {
+            inner: Some(self.inner.session_template()),
         }
     }
 
@@ -1040,14 +1048,13 @@ impl LocyEngine {
     /// Register Locy rules for reuse across multiple evaluate calls.
     fn register(&self, program: &str) -> PyResult<()> {
         self.inner
-            .locy()
-            .register(program)
+            .register_rules(program)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
     }
 
     /// Clear all registered Locy rules.
     fn clear_registry(&self) -> PyResult<()> {
-        self.inner.locy().clear_registry();
+        self.inner.clear_rules();
         Ok(())
     }
 

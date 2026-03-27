@@ -260,18 +260,18 @@ impl UniWorld {
         let mut snapshot = HashMap::new();
 
         // Node properties
-        if let Ok(result) = self.db().query("MATCH (n) RETURN n").await {
-            for row in &result.rows {
-                if let Some(node_val) = row.values.first() {
+        if let Ok(result) = self.db().session().query("MATCH (n) RETURN n").await {
+            for row in result.rows() {
+                if let Some(node_val) = row.values().first() {
                     self.add_entity_to_snapshot(&mut snapshot, "n", node_val);
                 }
             }
         }
 
         // Relationship properties
-        if let Ok(result) = self.db().query("MATCH ()-[r]->() RETURN r").await {
-            for row in &result.rows {
-                if let Some(rel_val) = row.values.first() {
+        if let Ok(result) = self.db().session().query("MATCH ()-[r]->() RETURN r").await {
+            for row in result.rows() {
+                if let Some(rel_val) = row.values().first() {
                     self.add_entity_to_snapshot(&mut snapshot, "r", rel_val);
                 }
             }
@@ -321,9 +321,14 @@ impl UniWorld {
     /// Collect all node IDs (VIDs) currently in the graph.
     async fn collect_node_ids(&self) -> HashSet<u64> {
         let mut ids = HashSet::new();
-        if let Ok(result) = self.db().query("MATCH (n) RETURN id(n) AS id").await {
-            for row in &result.rows {
-                if let Some(Value::Int(id)) = row.values.first() {
+        if let Ok(result) = self
+            .db()
+            .session()
+            .query("MATCH (n) RETURN id(n) AS id")
+            .await
+        {
+            for row in result.rows() {
+                if let Some(Value::Int(id)) = row.values().first() {
                     ids.insert(*id as u64);
                 }
             }
@@ -334,9 +339,14 @@ impl UniWorld {
     /// Collect all edge IDs (EIDs) currently in the graph.
     async fn collect_edge_ids(&self) -> HashSet<u64> {
         let mut ids = HashSet::new();
-        if let Ok(result) = self.db().query("MATCH ()-[r]->() RETURN id(r) AS id").await {
-            for row in &result.rows {
-                if let Some(Value::Int(id)) = row.values.first() {
+        if let Ok(result) = self
+            .db()
+            .session()
+            .query("MATCH ()-[r]->() RETURN id(r) AS id")
+            .await
+        {
+            for row in result.rows() {
+                if let Some(Value::Int(id)) = row.values().first() {
                     ids.insert(*id as u64);
                 }
             }
@@ -353,9 +363,9 @@ impl UniWorld {
     /// before/after diff is always zero in schema-aware mode.
     async fn get_labels(&self) -> anyhow::Result<HashSet<String>> {
         let query = "MATCH (n) RETURN DISTINCT labels(n) AS labels";
-        let result = self.db().query(query).await?;
+        let result = self.db().session().query(query).await?;
         let mut all_labels = HashSet::new();
-        for row in &result.rows {
+        for row in result.rows() {
             if let Ok(labels_list) = row.get::<Vec<String>>("labels") {
                 for label in labels_list {
                     all_labels.insert(label);

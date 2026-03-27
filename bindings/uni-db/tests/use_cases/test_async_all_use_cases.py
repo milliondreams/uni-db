@@ -57,24 +57,20 @@ async def test_supply_chain(db):
     await db.query("MATCH (a:Part)-[:ASSEMBLED_FROM]->(b:Part) RETURN a.sku")
 
     # BOM Explosion
-    results = await db.query(
-        """
+    results = await db.query("""
         MATCH (defective:Part {sku: 'RES-10K'})
         MATCH (product:Product)-[:ASSEMBLED_FROM*1..5]->(defective)
         RETURN product.name as name, product.price as price
-    """
-    )
+    """)
     names = [r.get("name") for r in results]
     assert "Smartphone X" in names
 
     # Cost Rollup
-    results_cost = await db.query(
-        """
+    results_cost = await db.query("""
         MATCH (p:Product {name: 'Smartphone X'})
         MATCH (p)-[:ASSEMBLED_FROM*1..5]->(part:Part)
         RETURN SUM(part.cost) AS total_bom_cost
-    """
-    )
+    """)
     assert len(results_cost) == 1
     assert abs(results_cost[0]["total_bom_cost"] - 80.05) < 0.01
 
@@ -208,22 +204,18 @@ async def test_fraud_detection(db):
     await db.flush()
 
     # Cycle detection
-    results = await db.query(
-        """
+    results = await db.query("""
         MATCH (a:User)-[:SENT_MONEY]->(b:User)-[:SENT_MONEY]->(c:User)-[:SENT_MONEY]->(a)
         RETURN count(*) as count
-    """
-    )
+    """)
     assert results[0]["count"] == 3
 
     # Shared device with fraudster
-    results = await db.query(
-        """
+    results = await db.query("""
         MATCH (u:User)-[:USED_DEVICE]->(d:Device)<-[:USED_DEVICE]-(fraudster:User)
         WHERE fraudster.risk_score > 0.8 AND u._vid <> fraudster._vid
         RETURN u._vid as uid
-    """
-    )
+    """)
     assert len(results) == 1
     assert results[0]["uid"] == ua
 
@@ -248,12 +240,10 @@ async def test_regional_sales_analytics(db):
     await writer.commit()
     await db.flush()
 
-    results = await db.query(
-        """
+    results = await db.query("""
         MATCH (r:Region {name: 'North'})<-[:SHIPPED_TO]-(o:Order)
         RETURN SUM(o.amount) as total
-    """
-    )
+    """)
     assert abs(results[0]["total"] - 50500.0) < 0.01
 
 
@@ -280,12 +270,10 @@ async def test_document_knowledge_graph(db):
     await writer.commit()
     await db.flush()
 
-    results = await db.query(
-        """
+    results = await db.query("""
         MATCH (a:Paper {topic: 'AI'})-[:CITES]->(b:Paper {topic: 'AI'})
         RETURN a.title as src, b.title as dst
-    """
-    )
+    """)
     assert len(results) == 1
     assert results[0]["src"] == "Paper 1"
     assert results[0]["dst"] == "Paper 3"

@@ -169,7 +169,7 @@ pub(super) fn apply_return_clause(
 /// resolve `$name` references during in-memory expression evaluation.
 ///
 /// Row values take precedence — parameters only fill in keys that are absent.
-fn merge_params(row: &FactRow, params: &HashMap<String, Value>) -> FactRow {
+pub(super) fn merge_params(row: &FactRow, params: &HashMap<String, Value>) -> FactRow {
     let mut merged: FactRow = params.clone();
     merged.extend(row.iter().map(|(k, v)| (k.clone(), v.clone())));
     merged

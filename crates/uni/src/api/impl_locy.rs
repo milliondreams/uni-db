@@ -371,6 +371,7 @@ impl<'a> LocyEngine<'a> {
             peak_memory_slot,
             warnings_slot,
             approximate_slot,
+            command_results_slot,
         ) = if let Some(program_exec) = exec_plan
             .as_any()
             .downcast_ref::<uni_query::query::df_graph::LocyProgramExec>(
@@ -384,6 +385,7 @@ impl<'a> LocyEngine<'a> {
                 program_exec.peak_memory_slot(),
                 program_exec.warnings_slot(),
                 program_exec.approximate_slot(),
+                program_exec.command_results_slot(),
             )
         } else {
             (
@@ -392,6 +394,7 @@ impl<'a> LocyEngine<'a> {
                 Arc::new(std::sync::RwLock::new(0usize)),
                 Arc::new(std::sync::RwLock::new(Vec::new())),
                 Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+                Arc::new(std::sync::RwLock::new(Vec::new())),
             )
         };
 
@@ -432,9 +435,21 @@ impl<'a> LocyEngine<'a> {
             .read()
             .map(|a| a.clone())
             .unwrap_or_default();
+        // Collect inline results (QUERY, Cypher) already executed by run_program()
+        let inline_map: HashMap<usize, CommandResult> = command_results_slot
+            .write()
+            .unwrap()
+            .drain(..)
+            .collect();
+
         let mut command_results = Vec::new();
         let mut collected_derives: Vec<CollectedDeriveOutput> = Vec::new();
-        for cmd in &compiled.commands {
+        for (cmd_idx, cmd) in compiled.commands.iter().enumerate() {
+            if let Some(result) = inline_map.get(&cmd_idx) {
+                // Already executed inline by run_program
+                command_results.push(result.clone());
+                continue;
+            }
             let result = dispatch_native_command(
                 cmd,
                 &compiled,

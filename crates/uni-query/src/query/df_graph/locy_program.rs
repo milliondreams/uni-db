@@ -40,7 +40,8 @@ use std::time::{Duration, Instant};
 use uni_common::Value;
 use uni_common::core::schema::Schema as UniSchema;
 use uni_cypher::ast::Expr;
-use uni_locy::RuntimeWarning;
+use uni_cypher::locy_ast::GoalQuery;
+use uni_locy::{CommandResult, FactRow, RuntimeWarning};
 use uni_store::storage::manager::StorageManager;
 
 // ---------------------------------------------------------------------------
@@ -129,6 +130,8 @@ pub struct LocyProgramExec {
     peak_memory_slot: Arc<StdRwLock<usize>>,
     /// Shared slot for runtime warnings collected during evaluation.
     warnings_slot: Arc<StdRwLock<Vec<RuntimeWarning>>>,
+    /// Shared slot for inline command results (QUERY, Cypher) executed inside `run_program()`.
+    command_results_slot: Arc<StdRwLock<Vec<(usize, CommandResult)>>>,
     /// Top-k proof filtering: 0 = unlimited (default), >0 = retain at most k proofs per fact.
     top_k_proofs: usize,
 }
@@ -198,6 +201,7 @@ impl LocyProgramExec {
             iteration_counts_slot: Arc::new(StdRwLock::new(HashMap::new())),
             peak_memory_slot: Arc::new(StdRwLock::new(0)),
             warnings_slot: Arc::new(StdRwLock::new(Vec::new())),
+            command_results_slot: Arc::new(StdRwLock::new(Vec::new())),
             top_k_proofs,
         }
     }
@@ -250,6 +254,14 @@ impl LocyProgramExec {
     /// groups where BDD computation fell back to independence mode.
     pub fn approximate_slot(&self) -> Arc<StdRwLock<HashMap<String, Vec<String>>>> {
         Arc::clone(&self.approximate_slot)
+    }
+
+    /// Returns the shared command results slot.
+    ///
+    /// After execution, the slot contains `(command_index, CommandResult)` pairs
+    /// for commands that were executed inline by `run_program()` (QUERY, Cypher).
+    pub fn command_results_slot(&self) -> Arc<StdRwLock<Vec<(usize, CommandResult)>>> {
+        Arc::clone(&self.command_results_slot)
     }
 }
 
@@ -328,11 +340,14 @@ impl ExecutionPlan for LocyProgramExec {
         let peak_memory_slot = Arc::clone(&self.peak_memory_slot);
         let derivation_tracker = self.derivation_tracker.read().ok().and_then(|g| g.clone());
         let warnings_slot = Arc::clone(&self.warnings_slot);
+        let commands = self.commands.clone();
+        let command_results_slot = Arc::clone(&self.command_results_slot);
         let top_k_proofs = self.top_k_proofs;
 
         let fut = async move {
             run_program(
                 strata,
+                commands,
                 registry,
                 graph_ctx,
                 session_ctx,
@@ -354,6 +369,7 @@ impl ExecutionPlan for LocyProgramExec {
                 peak_memory_slot,
                 derivation_tracker,
                 warnings_slot,
+                command_results_slot,
                 top_k_proofs,
             )
             .await
@@ -431,6 +447,184 @@ impl RecordBatchStream for ProgramStream {
 }
 
 // ---------------------------------------------------------------------------
+// Inline command execution helpers
+// ---------------------------------------------------------------------------
+
+/// Execute QUERY by scanning converged DerivedStore directly (no SLG).
+///
+/// Strata have already converged all facts, so we can scan the DerivedStore
+/// without re-derivation. WHERE filtering and RETURN projection are applied
+/// in-memory.
+///
+/// NOTE: Currently unused because the DerivedStore uses inferred Arrow types
+/// (Float64 for all property-derived columns), so string property values are
+/// not preserved. Once `infer_expr_type` is improved to use actual schema types,
+/// this function can be re-enabled for QUERYs whose WHERE/RETURN only reference
+/// reliably-typed columns.
+#[allow(dead_code)]
+fn execute_query_inline(
+    query: &GoalQuery,
+    derived_store: &DerivedStore,
+    params: &HashMap<String, Value>,
+) -> DFResult<Vec<FactRow>> {
+    let rule_name = query.rule_name.to_string();
+    let batches = derived_store.get(&rule_name).cloned().unwrap_or_default();
+    let rows = super::locy_eval::record_batches_to_locy_rows(&batches);
+
+    // Apply WHERE filter
+    let filtered = if let Some(ref where_expr) = query.where_expr {
+        rows.into_iter()
+            .filter(|row| {
+                let merged = super::locy_query::merge_params(row, params);
+                super::locy_eval::eval_expr(where_expr, &merged)
+                    .map(|v| v.as_bool().unwrap_or(false))
+                    .unwrap_or(false)
+            })
+            .collect()
+    } else {
+        rows
+    };
+
+    // Apply RETURN (project, distinct, order, skip, limit)
+    super::locy_query::apply_return_clause(filtered, &query.return_clause, params)
+        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))
+}
+
+/// Execute Cypher passthrough via execute_subplan.
+async fn execute_cypher_inline(
+    query: &uni_cypher::ast::Query,
+    schema_info: &Arc<UniSchema>,
+    params: &HashMap<String, Value>,
+    graph_ctx: &Arc<GraphExecutionContext>,
+    session_ctx: &Arc<RwLock<datafusion::prelude::SessionContext>>,
+    storage: &Arc<StorageManager>,
+) -> DFResult<Vec<FactRow>> {
+    let planner = crate::query::planner::QueryPlanner::new(Arc::clone(schema_info));
+    let logical_plan = planner.plan(query.clone()).map_err(|e| {
+        datafusion::error::DataFusionError::Execution(format!("Cypher plan error: {e}"))
+    })?;
+    let batches = execute_subplan(
+        &logical_plan,
+        params,
+        &HashMap::new(),
+        graph_ctx,
+        session_ctx,
+        storage,
+        schema_info,
+    )
+    .await?;
+    Ok(super::locy_eval::record_batches_to_locy_rows(&batches))
+}
+
+/// Returns true if the WHERE or RETURN expressions contain property access
+/// (e.g. `a.name`) that requires full node objects not available in DerivedStore.
+#[allow(dead_code)]
+fn needs_node_enrichment(query: &GoalQuery) -> bool {
+    let has_property_in_where = query
+        .where_expr
+        .as_ref()
+        .is_some_and(expr_has_property_access);
+    let has_property_in_return = query
+        .return_clause
+        .as_ref()
+        .is_some_and(|rc| {
+            rc.items.iter().any(|item| match item {
+                uni_cypher::ast::ReturnItem::Expr { expr, .. } => {
+                    expr_has_property_access(expr)
+                }
+                uni_cypher::ast::ReturnItem::All => false,
+            })
+        });
+    has_property_in_where || has_property_in_return
+}
+
+/// Recursively check whether an expression contains property access (`a.name`).
+#[allow(dead_code)]
+fn expr_has_property_access(expr: &Expr) -> bool {
+    match expr {
+        Expr::Property(..) => true,
+        Expr::BinaryOp { left, right, .. } => {
+            expr_has_property_access(left) || expr_has_property_access(right)
+        }
+        Expr::UnaryOp { expr, .. } => expr_has_property_access(expr),
+        Expr::FunctionCall { args, .. } => args.iter().any(expr_has_property_access),
+        Expr::List(items) => items.iter().any(expr_has_property_access),
+        Expr::Map(entries) => entries.iter().any(|(_, e)| expr_has_property_access(e)),
+        Expr::Case {
+            expr: case_expr,
+            when_then,
+            else_expr,
+        } => {
+            case_expr
+                .as_ref()
+                .is_some_and(|e| expr_has_property_access(e))
+                || when_then
+                    .iter()
+                    .any(|(w, t)| expr_has_property_access(w) || expr_has_property_access(t))
+                || else_expr
+                    .as_ref()
+                    .is_some_and(|e| expr_has_property_access(e))
+        }
+        Expr::IsNull(e) | Expr::IsNotNull(e) | Expr::IsUnique(e) => expr_has_property_access(e),
+        Expr::In { expr, list } => {
+            expr_has_property_access(expr) || expr_has_property_access(list)
+        }
+        Expr::ArrayIndex { array, index } => {
+            expr_has_property_access(array) || expr_has_property_access(index)
+        }
+        Expr::ArraySlice { array, start, end } => {
+            expr_has_property_access(array)
+                || start
+                    .as_ref()
+                    .is_some_and(|e| expr_has_property_access(e))
+                || end
+                    .as_ref()
+                    .is_some_and(|e| expr_has_property_access(e))
+        }
+        Expr::Quantifier {
+            list, predicate, ..
+        } => expr_has_property_access(list) || expr_has_property_access(predicate),
+        Expr::Reduce {
+            init, list, expr, ..
+        } => {
+            expr_has_property_access(init)
+                || expr_has_property_access(list)
+                || expr_has_property_access(expr)
+        }
+        Expr::ListComprehension {
+            list,
+            where_clause,
+            map_expr,
+            ..
+        } => {
+            expr_has_property_access(list)
+                || where_clause
+                    .as_ref()
+                    .is_some_and(|e| expr_has_property_access(e))
+                || expr_has_property_access(map_expr)
+        }
+        Expr::PatternComprehension {
+            where_clause,
+            map_expr,
+            ..
+        } => {
+            where_clause
+                .as_ref()
+                .is_some_and(|e| expr_has_property_access(e))
+                || expr_has_property_access(map_expr)
+        }
+        Expr::ValidAt {
+            entity, timestamp, ..
+        } => expr_has_property_access(entity) || expr_has_property_access(timestamp),
+        Expr::MapProjection { base, .. } => expr_has_property_access(base),
+        Expr::LabelCheck { expr, .. } => expr_has_property_access(expr),
+        // Leaf nodes (Literal, Parameter, Variable, Wildcard) and subqueries
+        // (Exists, CountSubquery, CollectSubquery) — no property access.
+        _ => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // run_program — core evaluation algorithm
 // ---------------------------------------------------------------------------
 
@@ -440,6 +634,7 @@ impl RecordBatchStream for ProgramStream {
 )]
 async fn run_program(
     strata: Vec<LocyStratum>,
+    commands: Vec<LocyCommand>,
     registry: Arc<DerivedScanRegistry>,
     graph_ctx: Arc<GraphExecutionContext>,
     session_ctx: Arc<RwLock<datafusion::prelude::SessionContext>>,
@@ -461,6 +656,7 @@ async fn run_program(
     peak_memory_slot: Arc<StdRwLock<usize>>,
     derivation_tracker: Option<Arc<ProvenanceStore>>,
     warnings_slot: Arc<StdRwLock<Vec<RuntimeWarning>>>,
+    command_results_slot: Arc<StdRwLock<Vec<(usize, CommandResult)>>>,
     top_k_proofs: usize,
 ) -> DFResult<Vec<RecordBatch>> {
     let start = Instant::now();
@@ -700,9 +896,29 @@ async fn run_program(
         .sum();
     *peak_memory_slot.write().unwrap() = peak_bytes;
 
-    // Commands are dispatched by the caller (e.g., evaluate_native) via the
-    // orchestrator after DataFusion strata evaluation, so run_program only handles
-    // strata evaluation and stores converged facts.
+    // Execute inline Cypher commands via execute_subplan.
+    // QUERY is deferred to the orchestrator: the DerivedStore uses inferred types
+    // (e.g. Float64 for property-derived columns) which don't preserve the actual
+    // property values. The orchestrator's SLG path re-derives with correct types.
+    // DERIVE/ASSUME/EXPLAIN/ABDUCE are also deferred (need savepoints, tree output, etc.).
+    let mut inline_results: Vec<(usize, CommandResult)> = Vec::new();
+    for (cmd_idx, cmd) in commands.iter().enumerate() {
+        if let LocyCommand::Cypher { query } = cmd {
+            let result = execute_cypher_inline(
+                query,
+                &schema_info,
+                &params,
+                &graph_ctx,
+                &session_ctx,
+                &storage,
+            )
+            .await?;
+            inline_results.push((cmd_idx, CommandResult::Cypher(result)));
+        }
+        // QUERY, DERIVE, ASSUME, EXPLAIN, ABDUCE: deferred to orchestrator
+    }
+    *command_results_slot.write().unwrap() = inline_results;
+
     let stats = vec![build_stats_batch(&derived_store, &strata, output_schema)];
     *derived_store_slot.write().unwrap() = Some(derived_store);
     Ok(stats)

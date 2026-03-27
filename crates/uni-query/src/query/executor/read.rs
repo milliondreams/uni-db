@@ -473,6 +473,64 @@ impl Executor {
         result
     }
 
+    /// Like [`execute_datafusion()`] but also returns the physical execution plan.
+    ///
+    /// The returned `Arc<dyn ExecutionPlan>` can be walked to extract per-operator
+    /// metrics (e.g., `output_rows`, `elapsed_compute`) that DataFusion's
+    /// `BaselineMetrics` recorded during execution.
+    pub async fn execute_datafusion_with_plan(
+        &self,
+        plan: LogicalPlan,
+        prop_manager: &PropertyManager,
+        params: &HashMap<String, Value>,
+    ) -> Result<(Vec<RecordBatch>, Arc<dyn datafusion::physical_plan::ExecutionPlan>)> {
+        let (session_ctx, mut planner, prop_manager_arc) =
+            self.create_datafusion_planner(prop_manager, params).await?;
+
+        // Build MutationContext when the plan contains write operations
+        if Self::contains_write_operations(&plan) {
+            let writer = self
+                .writer
+                .as_ref()
+                .ok_or_else(|| anyhow!("Write operations require a Writer"))?
+                .clone();
+            let query_ctx = self.get_context().await;
+
+            debug_assert!(
+                query_ctx.is_some(),
+                "BUG: query_ctx is None for write operation"
+            );
+
+            let mutation_ctx = Arc::new(crate::query::df_graph::MutationContext {
+                executor: self.clone(),
+                writer,
+                prop_manager: prop_manager_arc,
+                params: params.clone(),
+                query_ctx,
+                tx_l0_override: self.transaction_l0_override.clone(),
+            });
+            planner = planner.with_mutation_context(mutation_ctx);
+            tracing::debug!(
+                plan_type = Self::get_plan_type(&plan),
+                "Mutation routed to DataFusion engine"
+            );
+        }
+
+        let execution_plan = planner.plan(&plan)?;
+        let plan_clone = Arc::clone(&execution_plan);
+        let result = Self::collect_batches(&session_ctx, execution_plan).await;
+
+        // Harvest warnings from the graph execution context after query completion.
+        let graph_warnings = planner.graph_ctx().take_warnings();
+        if !graph_warnings.is_empty()
+            && let Ok(mut w) = self.warnings.lock()
+        {
+            w.extend(graph_warnings);
+        }
+
+        result.map(|batches| (batches, plan_clone))
+    }
+
     /// Execute a MERGE read sub-plan through the DataFusion engine.
     ///
     /// Plans and executes the MERGE pattern match using flat columnar output
@@ -540,7 +598,7 @@ impl Executor {
     /// - `cv_encoded=true`: Parse the string value as JSON to restore original type
     ///
     /// Also normalizes path structures to user-facing format (converts _vid to _id).
-    fn record_batches_to_rows(
+    pub(crate) fn record_batches_to_rows(
         &self,
         batches: Vec<RecordBatch>,
     ) -> Result<Vec<HashMap<String, Value>>> {
@@ -940,7 +998,7 @@ impl Executor {
     /// DataFusion planner. Recurses through wrapper nodes (`Project`, `Sort`,
     /// `Limit`, etc.) to detect DDL/admin operations nested inside read
     /// wrappers (e.g. `CALL procedure(...) YIELD x RETURN x`).
-    fn is_ddl_or_admin(plan: &LogicalPlan) -> bool {
+    pub(crate) fn is_ddl_or_admin(plan: &LogicalPlan) -> bool {
         match plan {
             // DDL / schema operations
             LogicalPlan::CreateLabel(_)

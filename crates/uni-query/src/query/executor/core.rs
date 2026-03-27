@@ -719,11 +719,54 @@ pub struct OperatorStats {
     pub index_misses: Option<usize>,
 }
 
+/// Walk a DataFusion physical plan tree (post-order DFS) and collect
+/// per-operator metrics recorded by `BaselineMetrics` during execution.
+///
+/// Children are visited before parents so the resulting `Vec` flows from
+/// data-producers (leaf scans) up to consumers (projections, filters).
+fn collect_plan_metrics(
+    plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+) -> Vec<OperatorStats> {
+    let mut stats = Vec::new();
+    collect_plan_metrics_inner(plan, &mut stats);
+    stats
+}
+
+fn collect_plan_metrics_inner(
+    plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+    out: &mut Vec<OperatorStats>,
+) {
+    // Recurse into children first (post-order)
+    for child in plan.children() {
+        collect_plan_metrics_inner(child, out);
+    }
+
+    let operator = plan.name().to_string();
+
+    let (actual_rows, time_ms) = match plan.metrics() {
+        Some(metrics) => {
+            let rows = metrics.output_rows().unwrap_or(0);
+            // elapsed_compute() returns nanoseconds
+            let nanos = metrics.elapsed_compute().unwrap_or(0);
+            let ms = nanos as f64 / 1_000_000.0;
+            (rows, ms)
+        }
+        None => (0, 0.0),
+    };
+
+    out.push(OperatorStats {
+        operator,
+        actual_rows,
+        time_ms,
+        memory_bytes: 0,
+        index_hits: None,
+        index_misses: None,
+    });
+}
+
 impl Executor {
-    /// Profiles query execution and returns results with timing statistics.
-    ///
-    /// Uses the DataFusion-based executor for query execution. Granular operator
-    /// profiling will be added in a future release.
+    /// Profiles query execution and returns results with per-operator timing
+    /// statistics extracted from the DataFusion physical plan tree.
     pub async fn profile(
         &self,
         plan: crate::query::planner::LogicalPlan,
@@ -736,21 +779,34 @@ impl Executor {
 
         let start = Instant::now();
 
-        // Execute using the standard execute path (DataFusion-based)
         let prop_manager = self.create_prop_manager();
-        let results = self.execute(plan.clone(), &prop_manager, params).await?;
+
+        // DDL/admin queries don't flow through DataFusion — fall back to
+        // single aggregate stat.
+        let (results, stats) = if Self::is_ddl_or_admin(&plan) {
+            let results = self
+                .execute_subplan(plan, &prop_manager, params, None)
+                .await?;
+            let elapsed = start.elapsed();
+            let stats = vec![OperatorStats {
+                operator: "DDL/Admin Execution".to_string(),
+                actual_rows: results.len(),
+                time_ms: elapsed.as_secs_f64() * 1000.0,
+                memory_bytes: 0,
+                index_hits: None,
+                index_misses: None,
+            }];
+            (results, stats)
+        } else {
+            let (batches, execution_plan) = self
+                .execute_datafusion_with_plan(plan, &prop_manager, params)
+                .await?;
+            let results = self.record_batches_to_rows(batches)?;
+            let stats = collect_plan_metrics(&execution_plan);
+            (results, stats)
+        };
 
         let total_time = start.elapsed();
-
-        // Return aggregate stats (granular operator profiling to be added later)
-        let stats = vec![OperatorStats {
-            operator: "DataFusion Execution".to_string(),
-            actual_rows: results.len(),
-            time_ms: total_time.as_secs_f64() * 1000.0,
-            memory_bytes: 0,
-            index_hits: None,
-            index_misses: None,
-        }];
 
         Ok((
             results,

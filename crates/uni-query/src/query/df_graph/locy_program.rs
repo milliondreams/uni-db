@@ -514,8 +514,13 @@ async fn run_program(
             // FixpointExec concatenates all rules' output; store per-rule.
             // For now, store all output under each rule name (since FixpointExec
             // handles per-rule state internally, the output is already correct).
-            // TODO: parse output back into per-rule facts when needed for
-            // cross-stratum consumption of individual rules from recursive strata.
+            // NOTE(deferred): Per-rule fact demultiplexing is not yet implemented.
+            // FixpointExec concatenates all rules' output into a single batch stream.
+            // Proper demux requires FixpointExec to tag output batches with rule identity
+            // (e.g. an extra column or side-channel), which is a non-trivial change to
+            // run_fixpoint_loop. The current schema-field-count heuristic (filter below)
+            // works because recursive stratum rules share compatible schemas.
+            // Revisit when cross-stratum consumption of individual recursive rules is needed.
             for rule in &stratum.rules {
                 // Write converged facts into registry handles for cross-stratum consumers
                 let rule_entries = registry.entries_for_rule(&rule.name);

@@ -416,10 +416,10 @@ pub fn fuse_scores(scores: &[f32], opts: &SimilarToOptions) -> Result<f32, Simil
             Ok(fusion::fuse_weighted_multi(scores, weights))
         }
         FusionMethod::Rrf => {
-            // In point-computation context, RRF degenerates.
-            // Fall back to equal-weight fusion.
-            let (score, _used_fallback) = fusion::fuse_rrf_point(scores);
-            // TODO: emit WarningCode::RrfInPointContext when used_fallback is true
+            // In point-computation context, RRF degenerates to equal-weight fusion.
+            // The caller (similar_to_expr.rs) already emits QueryWarning::RrfPointContext
+            // unconditionally when method == Rrf && num_sources > 1.
+            let (score, _) = fusion::fuse_rrf_point(scores);
             Ok(score)
         }
     }

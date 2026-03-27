@@ -283,13 +283,13 @@ pub fn cypher_expr_to_df(expr: &Expr, context: Option<&TranslationContext>) -> R
         Expr::PatternComprehension { .. } => Err(anyhow!(
             "Pattern comprehensions require fallback executor (graph traversal)"
         )),
-        // TODO: Resolve wildcard to concrete expressions per DataFusion guidance
-        // See: https://github.com/apache/datafusion/issues/7765
-        #[expect(deprecated)]
-        Expr::Wildcard => Ok(DfExpr::Wildcard {
-            qualifier: None,
-            options: Default::default(),
-        }),
+        // count(*) is the only Cypher path that produces Expr::Wildcard here;
+        // RETURN * expansion is handled at the planner level.  Map to literal 1
+        // so count(*) → count(1), avoiding the deprecated DfExpr::Wildcard.
+        Expr::Wildcard => Ok(DfExpr::Literal(
+            datafusion::common::ScalarValue::Int32(Some(1)),
+            None,
+        )),
 
         Expr::Variable(name) => {
             // Priority 1: Known structural variable (Node/Edge/Path)

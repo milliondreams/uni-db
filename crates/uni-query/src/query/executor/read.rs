@@ -483,7 +483,10 @@ impl Executor {
         plan: LogicalPlan,
         prop_manager: &PropertyManager,
         params: &HashMap<String, Value>,
-    ) -> Result<(Vec<RecordBatch>, Arc<dyn datafusion::physical_plan::ExecutionPlan>)> {
+    ) -> Result<(
+        Vec<RecordBatch>,
+        Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+    )> {
         let (session_ctx, mut planner, prop_manager_arc) =
             self.create_datafusion_planner(prop_manager, params).await?;
 
@@ -3709,8 +3712,7 @@ impl Executor {
 
         // 2. Loop
         // Safety: Max iterations to prevent infinite loop
-        // TODO: expose this via UniConfig for user control
-        let max_iterations = 1000;
+        let max_iterations = self.config.max_recursive_cte_iterations;
         for _iteration in 0..max_iterations {
             // CWE-400: Check timeout at each iteration to prevent resource exhaustion
             if let Some(ctx) = ctx {

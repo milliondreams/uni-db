@@ -104,9 +104,9 @@ pub struct DatabaseMetrics {
     pub write_throttle_pressure: f64,
     /// Current compaction status, if any.
     pub compaction_status: Option<String>,
-    /// WAL size in bytes (0 until instrumentation).
+    /// WAL size in bytes (0 until storage instrumentation).
     pub wal_size_bytes: usize,
-    /// WAL log sequence number (0 until instrumentation).
+    /// Highest WAL log sequence number that has been flushed (0 when no WAL is configured).
     pub wal_lsn: u64,
     /// Total queries executed across all sessions.
     pub total_queries: u64,
@@ -267,12 +267,20 @@ impl Uni {
     /// Snapshot the database-level metrics.
     pub async fn metrics(&self) -> DatabaseMetrics {
         let l0_mutation_count = self.inner.get_mutation_count().await;
-        let l0_estimated_size_bytes = match self.inner.writer.as_ref() {
+        let (l0_estimated_size_bytes, wal_lsn) = match self.inner.writer.as_ref() {
             Some(w) => {
                 let writer = w.read().await;
-                writer.l0_manager.get_current().read().estimated_size
+                let l0 = writer.l0_manager.get_current();
+                let l0_guard = l0.read();
+                let size = l0_guard.estimated_size;
+                let lsn = l0_guard
+                    .wal
+                    .as_ref()
+                    .and_then(|wal| wal.flushed_lsn().ok())
+                    .unwrap_or(0);
+                (size, lsn)
             }
-            None => 0,
+            None => (0, 0),
         };
         let schema_version = self.inner.schema.schema().schema_version;
         DatabaseMetrics {
@@ -285,7 +293,7 @@ impl Uni {
             write_throttle_pressure: 0.0,
             compaction_status: None,
             wal_size_bytes: 0,
-            wal_lsn: 0,
+            wal_lsn,
             total_queries: self.inner.total_queries.load(Ordering::Relaxed),
             total_commits: self.inner.total_commits.load(Ordering::Relaxed),
         }

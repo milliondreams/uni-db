@@ -1901,10 +1901,13 @@ impl Executor {
                     .unwrap_or_default();
 
                 // Only write back if at least one property actually exists
-                let any_exist = prop_names
+                let removed_count = prop_names
                     .iter()
-                    .any(|p| props.get(p).is_some_and(|v| !v.is_null()));
+                    .filter(|p| props.get(*p).is_some_and(|v| !v.is_null()))
+                    .count();
+                let any_exist = removed_count > 0;
                 if any_exist {
+                    writer.track_properties_removed(removed_count);
                     for prop_name in prop_names {
                         props.insert(prop_name.clone(), Value::Null);
                     }
@@ -1941,10 +1944,13 @@ impl Executor {
                         .await?
                         .unwrap_or_default();
 
-                    let any_exist = prop_names
+                    let removed_count = prop_names
                         .iter()
-                        .any(|p| props.get(p).is_some_and(|v| !v.is_null()));
+                        .filter(|p| props.get(*p).is_some_and(|v| !v.is_null()))
+                        .count();
+                    let any_exist = removed_count > 0;
                     if any_exist {
+                        writer.track_properties_removed(removed_count);
                         for prop_name in prop_names {
                             props.insert(prop_name.to_string(), Value::Null);
                         }
@@ -2000,10 +2006,12 @@ impl Executor {
                     .await?
                     .unwrap_or_default();
 
-                let any_exist = prop_names
+                let removed_count = prop_names
                     .iter()
-                    .any(|p| props.get(p).is_some_and(|v| !v.is_null()));
-                if any_exist {
+                    .filter(|p| props.get(*p).is_some_and(|v| !v.is_null()))
+                    .count();
+                if removed_count > 0 {
+                    writer.track_properties_removed(removed_count);
                     for prop_name in prop_names {
                         props.insert(prop_name.to_string(), Value::Null);
                     }

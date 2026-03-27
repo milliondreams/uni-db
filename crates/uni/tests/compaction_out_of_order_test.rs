@@ -7,11 +7,13 @@
 use arrow_array::{
     LargeBinaryArray, RecordBatch, TimestampNanosecondArray, UInt8Array, UInt64Array,
 };
+use std::collections::HashMap;
 use std::sync::Arc;
 use tempfile::tempdir;
 use uni_db::core::id::{Eid, Vid};
 use uni_db::core::schema::SchemaManager;
 use uni_db::storage::compaction::Compactor;
+use uni_db::storage::main_edge::MainEdgeDataset;
 use uni_db::storage::manager::StorageManager;
 
 #[tokio::test]
@@ -82,6 +84,19 @@ async fn test_out_of_order_delta_operations() -> anyhow::Result<()> {
     )?;
 
     delta_ds.write_run_lancedb(lancedb_store, batch2).await?;
+
+    // 2b. Populate main_edges so the dual-write invariant holds
+    let main_edges = vec![(
+        eid1,
+        vid_a,
+        vid_b,
+        "knows".to_string(),
+        HashMap::new(),
+        false,
+        1u64,
+    )];
+    let main_batch = MainEdgeDataset::build_record_batch(&main_edges, None, None)?;
+    MainEdgeDataset::write_batch_lancedb(lancedb_store, main_batch).await?;
 
     // 3. Run Compaction
     let _ = compactor
@@ -161,6 +176,30 @@ async fn test_multiple_out_of_order_operations() -> anyhow::Result<()> {
         delta_ds.write_run_lancedb(lancedb_store, batch).await?;
     }
 
+    // Populate main_edges so the dual-write invariant holds
+    let main_edges = vec![
+        (
+            eid1,
+            vid_a,
+            vid_b,
+            "knows".to_string(),
+            HashMap::new(),
+            false,
+            1u64,
+        ),
+        (
+            eid2,
+            vid_a,
+            vid_c,
+            "knows".to_string(),
+            HashMap::new(),
+            false,
+            2u64,
+        ),
+    ];
+    let main_batch = MainEdgeDataset::build_record_batch(&main_edges, None, None)?;
+    MainEdgeDataset::write_batch_lancedb(lancedb_store, main_batch).await?;
+
     // Run Compaction
     let _ = compactor
         .compact_adjacency("knows", "Person", "fwd")
@@ -232,6 +271,19 @@ async fn test_insert_delete_insert_sequence() -> anyhow::Result<()> {
 
         delta_ds.write_run_lancedb(lancedb_store, batch).await?;
     }
+
+    // Populate main_edges so the dual-write invariant holds
+    let main_edges = vec![(
+        eid1,
+        vid_a,
+        vid_b,
+        "knows".to_string(),
+        HashMap::new(),
+        false,
+        1u64,
+    )];
+    let main_batch = MainEdgeDataset::build_record_batch(&main_edges, None, None)?;
+    MainEdgeDataset::write_batch_lancedb(lancedb_store, main_batch).await?;
 
     // Run Compaction
     let _ = compactor

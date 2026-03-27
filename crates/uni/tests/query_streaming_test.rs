@@ -5,7 +5,6 @@ use anyhow::Result;
 use uni_db::{DataType, Uni};
 
 #[tokio::test]
-#[ignore = "Query streaming/cursor functionality not yet implemented"]
 async fn test_query_cursor_streaming() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 

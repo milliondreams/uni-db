@@ -77,7 +77,7 @@ pub struct AutoCommitResult {
     pub relationships_created: usize,
     pub relationships_deleted: usize,
     pub properties_set: usize,
-    /// Stub — `MutationStats` does not yet track property removals.
+    /// Number of properties removed by `REMOVE` clauses.
     pub properties_removed: usize,
     pub labels_added: usize,
     pub labels_removed: usize,
@@ -401,7 +401,7 @@ impl Session {
             relationships_created: diff.relationships_created,
             relationships_deleted: diff.relationships_deleted,
             properties_set: diff.properties_set,
-            properties_removed: 0,
+            properties_removed: diff.properties_removed,
             labels_added: diff.labels_added,
             labels_removed: diff.labels_removed,
             version,
@@ -434,7 +434,17 @@ impl Session {
     /// Profile a Cypher query execution.
     #[instrument(skip(self), fields(session_id = %self.id))]
     pub async fn profile(&self, cypher: &str) -> Result<(QueryResult, ProfileOutput)> {
-        self.db.profile_internal(cypher).await
+        let params = self.merge_params(HashMap::new());
+        self.db.profile_internal(cypher, params).await
+    }
+
+    /// Profile a Cypher query with a builder for parameters.
+    pub fn profile_with(&self, cypher: &str) -> ProfileBuilder<'_> {
+        ProfileBuilder {
+            session: self,
+            cypher: cypher.to_string(),
+            params: HashMap::new(),
+        }
     }
 
     // ── Locy Evaluation ───────────────────────────────────────────────
@@ -1236,12 +1246,41 @@ impl<'a> AutoCommitBuilder<'a> {
             relationships_created: diff.relationships_created,
             relationships_deleted: diff.relationships_deleted,
             properties_set: diff.properties_set,
-            properties_removed: 0, // MutationStats doesn't track removals yet
+            properties_removed: diff.properties_removed, // MutationStats doesn't track removals yet
             labels_added: diff.labels_added,
             labels_removed: diff.labels_removed,
             version,
             metrics: result.metrics().clone(),
         })
+    }
+}
+
+/// Builder for profiling a Cypher query with parameters.
+pub struct ProfileBuilder<'a> {
+    session: &'a Session,
+    cypher: String,
+    params: HashMap<String, Value>,
+}
+
+impl<'a> ProfileBuilder<'a> {
+    /// Bind a parameter to the profiled query.
+    pub fn param<K: Into<String>, V: Into<Value>>(mut self, key: K, value: V) -> Self {
+        self.params.insert(key.into(), value.into());
+        self
+    }
+
+    /// Bind multiple parameters from an iterator.
+    pub fn params<'p>(mut self, params: impl IntoIterator<Item = (&'p str, Value)>) -> Self {
+        for (k, v) in params {
+            self.params.insert(k.to_string(), v);
+        }
+        self
+    }
+
+    /// Execute the profiled query and return results with profiling output.
+    pub async fn run(self) -> Result<(QueryResult, ProfileOutput)> {
+        let params = self.session.merge_params(self.params);
+        self.session.db.profile_internal(&self.cypher, params).await
     }
 }
 

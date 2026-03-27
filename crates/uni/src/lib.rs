@@ -17,13 +17,13 @@ pub use api::notifications::{CommitNotification, CommitStream, WatchBuilder};
 pub use api::prepared::{PreparedLocy, PreparedQuery};
 pub use api::schema::{IndexType, ScalarType, VectorAlgo, VectorIndexCfg, VectorMetric};
 pub use api::session::{
-    AutoCommitBuilder, AutoCommitResult, Session, SessionCapabilities, SessionMetrics,
-    TransactionBuilder, WriteLeaseSummary,
+    AutoCommitBuilder, AutoCommitResult, ProfileBuilder, Session, SessionCapabilities,
+    SessionMetrics, TransactionBuilder, WriteLeaseSummary,
 };
 pub use api::sync::{
-    ApplyBuilderSync, AutoCommitBuilderSync, ExecuteBuilderSync, SessionLocyBuilderSync,
-    SessionQueryBuilderSync, SessionSync, TransactionBuilderSync, TransactionLocyBuilderSync,
-    TransactionQueryBuilderSync, TransactionSync, UniSync,
+    ApplyBuilderSync, AutoCommitBuilderSync, ExecuteBuilderSync, ProfileBuilderSync,
+    SessionLocyBuilderSync, SessionQueryBuilderSync, SessionSync, TransactionBuilderSync,
+    TransactionLocyBuilderSync, TransactionQueryBuilderSync, TransactionSync, UniSync,
 };
 pub use api::template::{SessionTemplate, SessionTemplateBuilder};
 pub use api::transaction::{

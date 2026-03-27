@@ -57,7 +57,7 @@ pub struct CommitResult {
     pub version: u64,
     /// Database version when the transaction was created.
     pub started_at_version: u64,
-    /// WAL log sequence number of the commit (stub — WAL instrumentation pending).
+    /// WAL log sequence number of the commit (0 when no WAL is configured).
     pub wal_lsn: u64,
     /// Duration of the commit operation (lock + WAL + merge).
     pub duration: Duration,
@@ -445,7 +445,7 @@ impl Transaction {
             tx_id: self.id.clone(),
             hint: "Another commit is in progress and taking longer than expected. Your transaction is still active \u{2014} you can retry commit().",
         })?;
-        writer.commit_transaction_l0(self.tx_l0.clone()).await?;
+        let wal_lsn = writer.commit_transaction_l0(self.tx_l0.clone()).await?;
         let version = writer.l0_manager.get_current().read().current_version;
         drop(writer);
 
@@ -504,7 +504,7 @@ impl Transaction {
             rules_promoted,
             version,
             started_at_version: self.started_at_version,
-            wal_lsn: 0, // WAL instrumentation pending
+            wal_lsn,
             duration,
             rule_promotion_errors,
         };

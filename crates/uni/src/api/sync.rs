@@ -4,7 +4,8 @@
 use crate::api::Uni;
 use crate::api::locy_builder::{SessionLocyBuilder, TransactionLocyBuilder};
 use crate::api::session::{
-    AutoCommitBuilder, AutoCommitResult, Session, SessionQueryBuilder, TransactionBuilder,
+    AutoCommitBuilder, AutoCommitResult, ProfileBuilder, Session, SessionQueryBuilder,
+    TransactionBuilder,
 };
 use crate::api::transaction::{
     ApplyBuilder, ApplyResult, CommitResult, Transaction, TransactionQueryBuilder,
@@ -151,6 +152,14 @@ impl<'a> SessionSync<'a> {
     /// Profile a Cypher query execution.
     pub fn profile(&self, cypher: &str) -> Result<(QueryResult, ProfileOutput)> {
         self.rt.block_on(self.session.profile(cypher))
+    }
+
+    /// Profile a Cypher query with a builder for parameters.
+    pub fn profile_with(&self, cypher: &str) -> ProfileBuilderSync<'_, 'a> {
+        ProfileBuilderSync {
+            inner: self.session.profile_with(cypher),
+            rt: self.rt,
+        }
     }
 
     // ── Locy Evaluation ───────────────────────────────────────────────
@@ -385,6 +394,33 @@ impl<'s, 'a> AutoCommitBuilderSync<'s, 'a> {
 
     /// Execute the mutation and return the result with database version.
     pub fn run(self) -> Result<AutoCommitResult> {
+        self.rt.block_on(self.inner.run())
+    }
+}
+
+// ── ProfileBuilderSync ──────────────────────────────────────────────────
+
+/// Blocking wrapper around [`ProfileBuilder`].
+pub struct ProfileBuilderSync<'s, 'a> {
+    inner: ProfileBuilder<'s>,
+    rt: &'a tokio::runtime::Runtime,
+}
+
+impl<'s, 'a> ProfileBuilderSync<'s, 'a> {
+    /// Bind a parameter to the profiled query.
+    pub fn param<K: Into<String>, V: Into<Value>>(mut self, key: K, value: V) -> Self {
+        self.inner = self.inner.param(key, value);
+        self
+    }
+
+    /// Bind multiple parameters from an iterator.
+    pub fn params<'p>(mut self, params: impl IntoIterator<Item = (&'p str, Value)>) -> Self {
+        self.inner = self.inner.params(params);
+        self
+    }
+
+    /// Execute the profiled query and return results with profiling output.
+    pub fn run(self) -> Result<(QueryResult, ProfileOutput)> {
         self.rt.block_on(self.inner.run())
     }
 }

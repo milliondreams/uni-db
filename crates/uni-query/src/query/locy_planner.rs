@@ -7,7 +7,9 @@
 //! and assembles [`LocyStratum`] / [`LocyRulePlan`] / [`LocyClausePlan`] trees with
 //! `LocyDerivedScan` nodes for IS-reference data injection.
 //!
-//! **Scope:** Strata (rules + clauses) only. Command plan building deferred to Phase 4.
+//! **Scope:** Strata (rules + clauses) only. Commands (`DERIVE`, `QUERY`, `ASSUME`,
+//! `ABDUCE`, `EXPLAIN`) are dispatched by the orchestrator after strata evaluation;
+//! dedicated command plan building is a future enhancement.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};

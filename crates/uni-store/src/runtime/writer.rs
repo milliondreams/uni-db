@@ -225,13 +225,16 @@ impl Writer {
             .transaction_l0
             .take()
             .ok_or_else(|| anyhow!("No active transaction"))?;
-        self.commit_transaction_l0(tx_l0_arc).await
+        self.commit_transaction_l0(tx_l0_arc).await?;
+        Ok(())
     }
 
     /// Commit an externally-owned transaction L0 buffer.
+    ///
     /// Writes mutations to WAL, flushes, merges into main L0, and replays
-    /// edges into the AdjacencyManager.
-    pub async fn commit_transaction_l0(&mut self, tx_l0_arc: Arc<RwLock<L0Buffer>>) -> Result<()> {
+    /// edges into the AdjacencyManager. Returns the WAL LSN of the commit
+    /// (0 when no WAL is configured).
+    pub async fn commit_transaction_l0(&mut self, tx_l0_arc: Arc<RwLock<L0Buffer>>) -> Result<u64> {
         // 1. Write transaction mutations to WAL BEFORE merging into main L0
         // This ensures durability before visibility.
         {
@@ -292,7 +295,7 @@ impl Writer {
         }
 
         // 2. Flush WAL to durable storage - THIS IS THE COMMIT POINT
-        self.flush_wal().await?;
+        let wal_lsn = self.flush_wal().await?;
 
         // 3. Merge into main L0 and make visible
         {
@@ -325,18 +328,41 @@ impl Writer {
             tracing::warn!("Post-commit flush check failed (non-critical): {}", e);
         }
 
-        Ok(())
+        Ok(wal_lsn)
     }
 
     /// Flush the WAL buffer to durable storage.
-    pub async fn flush_wal(&self) -> Result<()> {
+    ///
+    /// Returns the LSN of the flushed segment, or `0` when no WAL is configured.
+    pub async fn flush_wal(&self) -> Result<u64> {
         let l0 = self.l0_manager.get_current();
         let wal = l0.read().wal.clone();
 
         if let Some(wal) = wal {
-            wal.flush().await?;
+            let lsn = wal.flush().await?;
+            Ok(lsn)
+        } else {
+            Ok(0)
         }
-        Ok(())
+    }
+
+    /// Record property removals in the active L0 mutation stats.
+    ///
+    /// Routes to the transaction L0 if a transaction is active, otherwise
+    /// to the main L0 — matching the routing of other write operations.
+    pub fn track_properties_removed(&self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        if let Some(tx_l0) = &self.transaction_l0 {
+            tx_l0.write().mutation_stats.properties_removed += count;
+        } else {
+            self.l0_manager
+                .get_current()
+                .write()
+                .mutation_stats
+                .properties_removed += count;
+        }
     }
 
     pub fn rollback_transaction(&mut self) -> Result<()> {

@@ -106,6 +106,16 @@ fn into_execution_error(e: impl std::fmt::Display, cypher: &str) -> UniError {
     let msg = normalize_error_message(&e.to_string(), cypher);
     if msg.contains("Query cancelled") {
         UniError::Cancelled
+    } else if msg.contains("Query timed out") {
+        UniError::Query {
+            message: "Query timed out".to_string(),
+            query: Some(cypher.to_string()),
+        }
+    } else if msg.contains("Query exceeded memory limit") {
+        UniError::Query {
+            message: msg,
+            query: Some(cypher.to_string()),
+        }
     } else if msg.contains("TypeError:") {
         UniError::Type {
             expected: msg,
@@ -191,6 +201,7 @@ impl crate::api::UniInner {
     pub(crate) async fn profile_internal(
         &self,
         cypher: &str,
+        params: HashMap<String, ApiValue>,
     ) -> Result<(QueryResult, ProfileOutput)> {
         let ast = uni_cypher::parse(cypher).map_err(into_parse_error)?;
 
@@ -209,8 +220,6 @@ impl crate::api::UniInner {
         if let Some(w) = &self.writer {
             executor.set_writer(w.clone());
         }
-
-        let params: HashMap<String, uni_common::Value> = HashMap::new(); // TODO: Support params in profile
 
         // Extract projection order
         let projection_order = extract_projection_order(&logical_plan);
@@ -289,54 +298,68 @@ impl crate::api::UniInner {
         let projection_order = extract_projection_order(&logical_plan);
         let projection_order_for_rows = projection_order.clone();
         let cypher_for_error = cypher.to_string();
+        let batch_size = config.batch_size;
 
         let stream = executor.execute_stream(logical_plan, self.properties.clone(), params);
 
-        let row_stream = stream.map(move |batch_res| {
-            let results = batch_res.map_err(|e| {
-                let msg = normalize_error_message(&e.to_string(), &cypher_for_error);
-                if msg.contains("TypeError:") {
-                    UniError::Type {
-                        expected: msg,
-                        actual: String::new(),
+        // Convert raw hash-map batches to Row batches, chunked by batch_size.
+        let row_stream = stream
+            .map(move |batch_res| {
+                let results = batch_res.map_err(|e| {
+                    let msg = normalize_error_message(&e.to_string(), &cypher_for_error);
+                    if msg.contains("TypeError:") {
+                        UniError::Type {
+                            expected: msg,
+                            actual: String::new(),
+                        }
+                    } else if msg.starts_with("ConstraintVerificationFailed:") {
+                        UniError::Constraint { message: msg }
+                    } else {
+                        UniError::Query {
+                            message: msg,
+                            query: Some(cypher_for_error.clone()),
+                        }
                     }
-                } else if msg.starts_with("ConstraintVerificationFailed:") {
-                    UniError::Constraint { message: msg }
-                } else {
-                    UniError::Query {
-                        message: msg,
-                        query: Some(cypher_for_error.clone()),
-                    }
+                })?;
+
+                if results.is_empty() {
+                    return Ok(vec![]);
                 }
-            })?;
 
-            if results.is_empty() {
-                return Ok(vec![]);
-            }
+                // Determine columns for this batch
+                let columns = if let Some(order) = &projection_order_for_rows {
+                    Arc::new(order.clone())
+                } else {
+                    let mut cols: Vec<String> = results[0].keys().cloned().collect();
+                    cols.sort();
+                    Arc::new(cols)
+                };
 
-            // Determine columns for this batch (should be stable for the whole query)
-            let columns = if let Some(order) = &projection_order_for_rows {
-                Arc::new(order.clone())
-            } else {
-                let mut cols: Vec<String> = results[0].keys().cloned().collect();
-                cols.sort();
-                Arc::new(cols)
-            };
+                let rows = results
+                    .into_iter()
+                    .map(|map| {
+                        let mut values = Vec::with_capacity(columns.len());
+                        for col in columns.iter() {
+                            let value = map.get(col).cloned().unwrap_or(ApiValue::Null);
+                            values.push(value);
+                        }
+                        Row::new(columns.clone(), values)
+                    })
+                    .collect::<Vec<Row>>();
 
-            let rows = results
-                .into_iter()
-                .map(|map| {
-                    let mut values = Vec::with_capacity(columns.len());
-                    for col in columns.iter() {
-                        let value = map.get(col).cloned().unwrap_or(ApiValue::Null);
-                        values.push(value);
+                Ok(rows)
+            })
+            // Re-chunk into batch_size-sized pieces
+            .flat_map(
+                move |batch_res: std::result::Result<Vec<Row>, UniError>| match batch_res {
+                    Ok(rows) if batch_size > 0 => {
+                        let chunks: Vec<_> =
+                            rows.chunks(batch_size).map(|c| Ok(c.to_vec())).collect();
+                        futures::stream::iter(chunks).boxed()
                     }
-                    Row::new(columns.clone(), values)
-                })
-                .collect();
-
-            Ok(rows)
-        });
+                    other => futures::stream::iter(vec![other]).boxed(),
+                },
+            );
 
         // We need columns ahead of time for QueryCursor if possible.
         let columns = if let Some(order) = projection_order {
@@ -621,6 +644,7 @@ impl crate::api::UniInner {
         config: UniConfig,
     ) -> Result<QueryResult> {
         let total_start = Instant::now();
+        let deadline = total_start + config.query_timeout;
 
         let plan_start = Instant::now();
         let planner =
@@ -644,11 +668,49 @@ impl crate::api::UniInner {
         let projection_order = extract_projection_order(&logical_plan);
 
         let exec_start = Instant::now();
-        let results = executor
-            .execute(logical_plan, &self.properties, &params)
-            .await
-            .map_err(|e| into_execution_error(e, cypher))?;
+        let timeout_duration = config.query_timeout;
+        let results = tokio::time::timeout(
+            timeout_duration,
+            executor.execute(logical_plan, &self.properties, &params),
+        )
+        .await
+        .map_err(|_| UniError::Query {
+            message: "Query timed out".to_string(),
+            query: Some(cypher.to_string()),
+        })?
+        .map_err(|e| into_execution_error(e, cypher))?;
         let exec_time = exec_start.elapsed();
+
+        // Instant-based deadline check for sub-millisecond timeouts that
+        // tokio::time::timeout cannot catch due to timer wheel resolution.
+        if Instant::now() > deadline {
+            return Err(UniError::Query {
+                message: "Query timed out".to_string(),
+                query: Some(cypher.to_string()),
+            });
+        }
+
+        // Enforce per-query memory limit on the result set.
+        let max_mem = config.max_query_memory;
+        if max_mem > 0 {
+            let estimated_bytes: usize = results
+                .iter()
+                .map(|row| {
+                    row.values()
+                        .map(|v| std::mem::size_of_val(v) + 64)
+                        .sum::<usize>()
+                })
+                .sum();
+            if estimated_bytes > max_mem {
+                return Err(UniError::Query {
+                    message: format!(
+                        "Query exceeded memory limit ({} bytes > {} byte limit)",
+                        estimated_bytes, max_mem
+                    ),
+                    query: Some(cypher.to_string()),
+                });
+            }
+        }
 
         let columns = if results.is_empty() {
             Arc::new(vec![])
@@ -758,11 +820,47 @@ impl crate::api::UniInner {
         let projection_order = extract_projection_order(&plan);
 
         let exec_start = Instant::now();
-        let results = executor
-            .execute(plan, &self.properties, &params)
-            .await
-            .map_err(|e| into_execution_error(e, cypher))?;
+        let deadline = exec_start + config.query_timeout;
+        let timeout_duration = config.query_timeout;
+        let results = tokio::time::timeout(
+            timeout_duration,
+            executor.execute(plan, &self.properties, &params),
+        )
+        .await
+        .map_err(|_| UniError::Query {
+            message: "Query timed out".to_string(),
+            query: Some(cypher.to_string()),
+        })?
+        .map_err(|e| into_execution_error(e, cypher))?;
         let exec_time = exec_start.elapsed();
+
+        if Instant::now() > deadline {
+            return Err(UniError::Query {
+                message: "Query timed out".to_string(),
+                query: Some(cypher.to_string()),
+            });
+        }
+
+        let max_mem = config.max_query_memory;
+        if max_mem > 0 {
+            let estimated_bytes: usize = results
+                .iter()
+                .map(|row| {
+                    row.values()
+                        .map(|v| std::mem::size_of_val(v) + 64)
+                        .sum::<usize>()
+                })
+                .sum();
+            if estimated_bytes > max_mem {
+                return Err(UniError::Query {
+                    message: format!(
+                        "Query exceeded memory limit ({} bytes > {} byte limit)",
+                        estimated_bytes, max_mem
+                    ),
+                    query: Some(cypher.to_string()),
+                });
+            }
+        }
 
         let columns = if results.is_empty() {
             Arc::new(vec![])

@@ -49,6 +49,7 @@ pub struct MutationStats {
     pub relationships_created: usize,
     pub relationships_deleted: usize,
     pub properties_set: usize,
+    pub properties_removed: usize,
     pub labels_added: usize,
     pub labels_removed: usize,
 }
@@ -66,6 +67,9 @@ impl MutationStats {
                 .relationships_deleted
                 .saturating_sub(before.relationships_deleted),
             properties_set: self.properties_set.saturating_sub(before.properties_set),
+            properties_removed: self
+                .properties_removed
+                .saturating_sub(before.properties_removed),
             labels_added: self.labels_added.saturating_sub(before.labels_added),
             labels_removed: self.labels_removed.saturating_sub(before.labels_removed),
         }

@@ -6,7 +6,7 @@ use crate::runtime::l0::L0Buffer;
 use crate::runtime::l0_visibility;
 use crate::storage::main_vertex::MainVertexDataset;
 use crate::storage::manager::StorageManager;
-use crate::storage::value_codec::{self, CrdtDecodeMode};
+use crate::storage::value_codec::CrdtDecodeMode;
 use anyhow::{Result, anyhow};
 use arrow_array::{Array, BooleanArray, RecordBatch, UInt64Array};
 use futures::TryStreamExt;
@@ -1767,17 +1767,12 @@ impl PropertyManager {
 
     /// Decode an Arrow column value with strict CRDT error handling.
     pub fn value_from_column(col: &dyn Array, data_type: &DataType, row: usize) -> Result<Value> {
-        // Temporal types must go through arrow_convert to preserve Value::Temporal
-        // variants. The value_codec path converts them to strings, which breaks
-        // round-trip writes (e.g. SET re-writes all properties and
-        // values_to_datetime_struct_array only matches Value::Temporal).
-        match data_type {
-            DataType::DateTime | DataType::Timestamp | DataType::Date | DataType::Time => Ok(
-                crate::storage::arrow_convert::arrow_to_value(col, row, Some(data_type)),
-            ),
-            _ => value_codec::value_from_column(col, data_type, row, CrdtDecodeMode::Strict)
-                .map(Value::from),
-        }
+        crate::storage::value_codec::decode_column_value(
+            col,
+            data_type,
+            row,
+            CrdtDecodeMode::Strict,
+        )
     }
 
     pub(crate) fn merge_crdt_values(&self, a: &Value, b: &Value) -> Result<Value> {

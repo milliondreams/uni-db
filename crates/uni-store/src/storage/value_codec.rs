@@ -359,6 +359,25 @@ fn value_from_column_inner(
     }
 }
 
+/// Decode an Arrow column value to a [`uni_common::Value`], preserving
+/// `Value::Temporal` variants for round-trip fidelity.
+///
+/// For DateTime/Timestamp/Date/Time, delegates to [`super::arrow_convert::arrow_to_value`].
+/// For all other types, decodes via [`value_from_column`] and converts.
+pub fn decode_column_value(
+    col: &dyn Array,
+    data_type: &DataType,
+    row: usize,
+    crdt_mode: CrdtDecodeMode,
+) -> anyhow::Result<uni_common::Value> {
+    match data_type {
+        DataType::DateTime | DataType::Timestamp | DataType::Date | DataType::Time => Ok(
+            super::arrow_convert::arrow_to_value(col, row, Some(data_type)),
+        ),
+        _ => value_from_column(col, data_type, row, crdt_mode).map(uni_common::Value::from),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

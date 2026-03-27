@@ -6,7 +6,6 @@ use std::time::Duration;
 use uni_db::Uni;
 
 #[tokio::test]
-#[ignore = "Query timeout enforcement not yet implemented"]
 async fn test_query_timeout() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
@@ -33,7 +32,6 @@ async fn test_query_timeout() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "Query memory limit enforcement not yet implemented"]
 async fn test_query_memory_limit() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 

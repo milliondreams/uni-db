@@ -488,20 +488,42 @@ impl IndexManager {
         Ok(())
     }
 
-    /// Remove an index definition from the schema (physical drop is not yet supported).
+    /// Remove an index both physically from the Lance dataset and from the schema.
     #[instrument(skip(self), level = "info")]
     pub async fn drop_index(&self, name: &str) -> Result<()> {
         info!("Dropping index '{}'", name);
 
-        // Verify the index exists before removing
-        let _idx_def = self
+        let idx_def = self
             .schema_manager
             .get_index(name)
             .ok_or_else(|| anyhow!("Index '{}' not found in schema", name))?;
 
-        // Physical index drop is not supported by the current Lance version,
-        // so we only remove the definition from the schema.
-        warn!("Physical index drop not yet supported, removing from schema only.");
+        // Attempt physical index drop on the underlying Lance dataset.
+        let label = idx_def.label();
+        let schema = self.schema_manager.schema();
+        if let Some(label_meta) = schema.labels.get(label) {
+            let ds_wrapper = VertexDataset::new(&self.base_uri, label, label_meta.id);
+            match ds_wrapper.open_raw().await {
+                Ok(mut lance_ds) => {
+                    if let Err(e) = lance_ds.drop_index(name).await {
+                        // Log but don't fail — the index may never have been
+                        // physically built (e.g. empty dataset at creation time).
+                        warn!(
+                            "Physical index drop for '{}' returned error (non-fatal): {}",
+                            name, e
+                        );
+                    } else {
+                        info!("Physical index '{}' dropped from Lance dataset", name);
+                    }
+                }
+                Err(e) => {
+                    debug!(
+                        "Could not open dataset for label '{}' to drop physical index: {}",
+                        label, e
+                    );
+                }
+            }
+        }
 
         self.schema_manager.remove_index(name)?;
         self.schema_manager.save().await?;

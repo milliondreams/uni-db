@@ -213,12 +213,12 @@ impl Compactor {
                             // Property was explicitly removed (set to NULL)
                             null_props.push(name.clone());
                         } else {
-                            // TODO: Refactor value_from_column to be shared
-                            // For now, assuming we can get it.
-                            // We need to move `value_from_column` to uni-common or a shared util?
-                            // Or duplication.
-                            // Duplication for now to avoid large refactor.
-                            let val = crate::runtime::property_manager::PropertyManager::value_from_column(col.as_ref(), &meta.r#type, i)?;
+                            let val = crate::storage::value_codec::decode_column_value(
+                                col.as_ref(),
+                                &meta.r#type,
+                                i,
+                                crate::storage::value_codec::CrdtDecodeMode::Strict,
+                            )?;
                             row_props.insert(name.clone(), val);
                         }
                     }
@@ -538,21 +538,19 @@ impl Compactor {
                 deltas.len()
             );
 
-            // TODO: Re-enable this assertion once test fixtures properly create main_edges entries
-            // Debug assertion: Verify all edge EIDs in delta have entries in main_edges
-            // Currently disabled because some tests create delta entries directly without main_edges
-            /*
+            // Invariant: Every EID in Delta L1 must have a corresponding entry in
+            // main_edges, because Writer::flush_to_l1 performs a dual-write.
+            // Tests that create delta entries directly (for schema/overflow testing)
+            // must not call compact_adjacency without also populating main_edges.
             #[cfg(debug_assertions)]
             {
                 use crate::storage::main_edge::MainEdgeDataset;
                 let lancedb_store = self.storage.lancedb_store();
 
-                // Collect unique EIDs from deltas
                 let delta_eids: std::collections::HashSet<Eid> =
                     deltas.iter().map(|e| e.eid).collect();
 
                 for eid in delta_eids {
-                    // Check if EID exists in main_edges
                     let main_edge_exists = MainEdgeDataset::find_props_by_eid(lancedb_store, eid)
                         .await
                         .unwrap_or(None)
@@ -566,7 +564,6 @@ impl Compactor {
                     );
                 }
             }
-            */
 
             // Clear the Delta L1 table by replacing with empty batch
             let delta_ds = self.storage.delta_dataset(edge_type, direction)?;

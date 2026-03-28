@@ -128,37 +128,6 @@ pub async fn flush_core(db: &Uni) -> Result<(), String> {
 }
 
 // ============================================================================
-// Transaction Core
-// ============================================================================
-
-/// Begin a new transaction.
-pub async fn begin_transaction_core(db: &Uni) -> Result<(), String> {
-    let writer_lock = db.writer().ok_or_else(|| "Read only".to_string())?;
-    let mut writer = writer_lock.write().await;
-    writer.begin_transaction().map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-/// Commit a transaction.
-pub async fn commit_transaction_core(db: &Uni) -> Result<(), String> {
-    let writer_lock = db.writer().ok_or_else(|| "Read only".to_string())?;
-    let mut writer = writer_lock.write().await;
-    writer
-        .commit_transaction()
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-/// Rollback a transaction.
-pub async fn rollback_transaction_core(db: &Uni) -> Result<(), String> {
-    let writer_lock = db.writer().ok_or_else(|| "Read only".to_string())?;
-    let mut writer = writer_lock.write().await;
-    writer.rollback_transaction().map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-// ============================================================================
 // Schema Core
 // ============================================================================
 
@@ -545,32 +514,6 @@ pub fn locy_compile_only_core(
 ) -> Result<::uni_locy::CompiledProgram, String> {
     db.session()
         .compile_locy(program)
-        .map_err(|e| e.to_string())
-}
-
-/// Evaluate a Locy program with specific params, timeout, and max_iterations.
-pub async fn locy_evaluate_builder_core(
-    db: &Uni,
-    program: &str,
-    params: HashMap<String, Value>,
-    timeout_secs: Option<f64>,
-    max_iterations: Option<usize>,
-) -> Result<::uni_db::locy::LocyResult, String> {
-    let mut config = ::uni_db::locy::LocyConfig {
-        params,
-        ..Default::default()
-    };
-    if let Some(t) = timeout_secs {
-        config.timeout = Duration::from_secs_f64(t);
-    }
-    if let Some(n) = max_iterations {
-        config.max_iterations = n;
-    }
-    db.session()
-        .locy_with(program)
-        .with_config(config)
-        .run()
-        .await
         .map_err(|e| e.to_string())
 }
 

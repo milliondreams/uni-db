@@ -204,6 +204,8 @@ pub struct PyLocyResult {
     pub warnings: Py<PyAny>,
     /// Groups flagged as approximate (shared-proof detection).
     pub approximate_groups: Py<PyAny>,
+    /// Opaque derived fact set, pass to `tx.apply()` to materialize.
+    pub derived_fact_set: Py<PyAny>,
 }
 
 #[pymethods]
@@ -540,6 +542,9 @@ pub struct PyCommitResult {
     /// Database version when the transaction was created.
     #[pyo3(get)]
     pub started_at_version: u64,
+    /// WAL log sequence number.
+    #[pyo3(get)]
+    pub wal_lsn: u64,
     /// Duration of the commit operation in seconds.
     #[pyo3(get)]
     pub duration_secs: f64,
@@ -552,6 +557,7 @@ impl From<::uni_db::CommitResult> for PyCommitResult {
             rules_promoted: r.rules_promoted,
             version: r.version,
             started_at_version: r.started_at_version,
+            wal_lsn: r.wal_lsn,
             duration_secs: r.duration.as_secs_f64(),
         }
     }
@@ -559,6 +565,11 @@ impl From<::uni_db::CommitResult> for PyCommitResult {
 
 #[pymethods]
 impl PyCommitResult {
+    /// Number of versions between start and commit (0 means no concurrent commits).
+    fn version_gap(&self) -> u64 {
+        self.version.saturating_sub(self.started_at_version + 1)
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "CommitResult(mutations={}, version={}, duration={:.3}s)",
@@ -626,5 +637,413 @@ impl PyPreparedQuery {
             .map(|g| g.query_text().to_string())
             .unwrap_or_else(|_| "<locked>".to_string());
         format!("PreparedQuery({:?})", text)
+    }
+}
+
+// ============================================================================
+// AutoCommitResult
+// ============================================================================
+
+/// Result of an auto-committed session.execute() call.
+#[pyclass(get_all, name = "AutoCommitResult")]
+#[derive(Debug)]
+pub struct PyAutoCommitResult {
+    pub affected_rows: usize,
+    pub nodes_created: usize,
+    pub nodes_deleted: usize,
+    pub relationships_created: usize,
+    pub relationships_deleted: usize,
+    pub properties_set: usize,
+    pub properties_removed: usize,
+    pub labels_added: usize,
+    pub labels_removed: usize,
+    pub version: u64,
+    pub metrics: Py<pyo3::types::PyDict>,
+}
+
+#[pymethods]
+impl PyAutoCommitResult {
+    fn __repr__(&self) -> String {
+        format!(
+            "AutoCommitResult(affected={}, version={})",
+            self.affected_rows, self.version
+        )
+    }
+}
+
+// ============================================================================
+// ExecuteResult
+// ============================================================================
+
+/// Result of a transaction.execute() call.
+#[pyclass(get_all, name = "ExecuteResult")]
+#[derive(Debug)]
+pub struct PyExecuteResult {
+    pub affected_rows: usize,
+    pub nodes_created: usize,
+    pub nodes_deleted: usize,
+    pub relationships_created: usize,
+    pub relationships_deleted: usize,
+    pub properties_set: usize,
+    pub labels_added: usize,
+    pub labels_removed: usize,
+    pub metrics: Py<pyo3::types::PyDict>,
+}
+
+#[pymethods]
+impl PyExecuteResult {
+    fn __repr__(&self) -> String {
+        format!(
+            "ExecuteResult(affected={}, nodes_created={})",
+            self.affected_rows, self.nodes_created
+        )
+    }
+}
+
+// ============================================================================
+// ApplyResult
+// ============================================================================
+
+/// Result of applying a DerivedFactSet to a transaction.
+#[pyclass(get_all, name = "ApplyResult")]
+#[derive(Debug, Clone)]
+pub struct PyApplyResult {
+    pub facts_applied: usize,
+    pub version_gap: u64,
+}
+
+#[pymethods]
+impl PyApplyResult {
+    fn __repr__(&self) -> String {
+        format!(
+            "ApplyResult(facts={}, version_gap={})",
+            self.facts_applied, self.version_gap
+        )
+    }
+}
+
+// ============================================================================
+// DerivedFactSet
+// ============================================================================
+
+/// Opaque wrapper around a Locy-derived fact set.
+///
+/// Obtained from `LocyResult.derived_fact_set` and passed to `tx.apply()`.
+#[pyclass(name = "DerivedFactSet")]
+pub struct PyDerivedFactSet {
+    pub(crate) inner: Option<uni_locy::DerivedFactSet>,
+}
+
+#[pymethods]
+impl PyDerivedFactSet {
+    /// Database version at evaluation time.
+    #[getter]
+    fn evaluated_at_version(&self) -> PyResult<u64> {
+        self.inner
+            .as_ref()
+            .map(|d| d.evaluated_at_version)
+            .ok_or_else(|| {
+                pyo3::exceptions::PyRuntimeError::new_err("DerivedFactSet already consumed")
+            })
+    }
+
+    /// Number of derived vertices.
+    #[getter]
+    fn vertex_count(&self) -> PyResult<usize> {
+        self.inner
+            .as_ref()
+            .map(|d| d.vertices.values().map(|v| v.len()).sum())
+            .ok_or_else(|| {
+                pyo3::exceptions::PyRuntimeError::new_err("DerivedFactSet already consumed")
+            })
+    }
+
+    /// Number of derived edges.
+    #[getter]
+    fn edge_count(&self) -> PyResult<usize> {
+        self.inner
+            .as_ref()
+            .map(|d| d.edges.len())
+            .ok_or_else(|| {
+                pyo3::exceptions::PyRuntimeError::new_err("DerivedFactSet already consumed")
+            })
+    }
+
+    /// Total number of derived facts.
+    #[getter]
+    fn fact_count(&self) -> PyResult<usize> {
+        self.inner
+            .as_ref()
+            .map(|d| d.fact_count())
+            .ok_or_else(|| {
+                pyo3::exceptions::PyRuntimeError::new_err("DerivedFactSet already consumed")
+            })
+    }
+
+    fn __repr__(&self) -> String {
+        match &self.inner {
+            Some(d) => format!(
+                "DerivedFactSet(facts={}, version={})",
+                d.fact_count(),
+                d.evaluated_at_version
+            ),
+            None => "DerivedFactSet(<consumed>)".to_string(),
+        }
+    }
+}
+
+// ============================================================================
+// SessionMetrics
+// ============================================================================
+
+/// Metrics for a session's lifetime.
+#[pyclass(get_all, name = "SessionMetrics")]
+#[derive(Debug, Clone)]
+pub struct PySessionMetrics {
+    pub session_id: String,
+    pub queries_executed: u64,
+    pub locy_evaluations: u64,
+    pub total_query_time_secs: f64,
+    pub transactions_committed: u64,
+    pub transactions_rolled_back: u64,
+    pub total_rows_returned: u64,
+    pub total_rows_scanned: u64,
+    pub plan_cache_hits: u64,
+    pub plan_cache_misses: u64,
+    pub plan_cache_size: usize,
+}
+
+#[pymethods]
+impl PySessionMetrics {
+    fn __repr__(&self) -> String {
+        format!(
+            "SessionMetrics(session='{}', queries={}, txns={})",
+            self.session_id, self.queries_executed, self.transactions_committed
+        )
+    }
+}
+
+// ============================================================================
+// PreparedLocy
+// ============================================================================
+
+/// A prepared Locy program that can be executed multiple times.
+#[pyclass(name = "PreparedLocy")]
+pub struct PyPreparedLocy {
+    pub(crate) inner: std::sync::Mutex<::uni_db::PreparedLocy>,
+}
+
+#[pymethods]
+impl PyPreparedLocy {
+    /// Execute the prepared Locy program.
+    fn execute(&self, py: pyo3::Python) -> pyo3::PyResult<PyLocyResult> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        let result = pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(guard.execute())
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        crate::convert::locy_result_to_py_class(py, result)
+    }
+
+    /// Get the original program text.
+    fn program_text(&self) -> pyo3::PyResult<String> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        Ok(guard.program_text().to_string())
+    }
+
+    fn __repr__(&self) -> String {
+        let text = self
+            .inner
+            .lock()
+            .map(|g| {
+                let t = g.program_text();
+                if t.len() > 60 {
+                    format!("{}...", &t[..60])
+                } else {
+                    t.to_string()
+                }
+            })
+            .unwrap_or_else(|_| "<locked>".to_string());
+        format!("PreparedLocy({:?})", text)
+    }
+}
+
+// ============================================================================
+// DatabaseMetrics
+// ============================================================================
+
+/// Database-wide metrics snapshot.
+#[pyclass(get_all, name = "DatabaseMetrics")]
+#[derive(Debug, Clone)]
+pub struct PyDatabaseMetrics {
+    pub l0_mutation_count: usize,
+    pub l0_estimated_size_bytes: usize,
+    pub schema_version: u32,
+    pub uptime_secs: f64,
+    pub active_sessions: usize,
+    pub l1_run_count: usize,
+    pub write_throttle_pressure: f64,
+    pub compaction_status: Option<String>,
+    pub wal_size_bytes: usize,
+    pub wal_lsn: u64,
+    pub total_queries: u64,
+    pub total_commits: u64,
+}
+
+#[pymethods]
+impl PyDatabaseMetrics {
+    fn __repr__(&self) -> String {
+        format!(
+            "DatabaseMetrics(queries={}, commits={}, sessions={}, uptime={:.1}s)",
+            self.total_queries, self.total_commits, self.active_sessions, self.uptime_secs
+        )
+    }
+}
+
+// ============================================================================
+// CommitStream (sync iterator)
+// ============================================================================
+
+/// A synchronous iterator over commit notifications.
+///
+/// Use as a context manager or call `close()` when done.
+#[pyclass(name = "CommitStream")]
+pub struct PyCommitStream {
+    pub(crate) inner: std::sync::Mutex<Option<::uni_db::CommitStream>>,
+}
+
+#[pymethods]
+impl PyCommitStream {
+    fn __iter__(slf: pyo3::PyRef<'_, Self>) -> pyo3::PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&self) -> pyo3::PyResult<Option<PyCommitNotification>> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        let stream = match guard.as_mut() {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        let notification = pyo3_async_runtimes::tokio::get_runtime().block_on(stream.next());
+        match notification {
+            Some(n) => Ok(Some(PyCommitNotification::from(n))),
+            None => Ok(None),
+        }
+    }
+
+    /// Close the stream, releasing resources.
+    fn close(&self) -> pyo3::PyResult<()> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        guard.take();
+        Ok(())
+    }
+
+    fn __enter__(slf: pyo3::PyRef<'_, Self>) -> pyo3::PyRef<'_, Self> {
+        slf
+    }
+
+    #[pyo3(signature = (_exc_type=None, _exc_val=None, _exc_tb=None))]
+    fn __exit__(
+        &self,
+        _exc_type: Option<pyo3::Py<pyo3::PyAny>>,
+        _exc_val: Option<pyo3::Py<pyo3::PyAny>>,
+        _exc_tb: Option<pyo3::Py<pyo3::PyAny>>,
+    ) -> pyo3::PyResult<bool> {
+        self.close()?;
+        Ok(false)
+    }
+}
+
+// ============================================================================
+// WatchBuilder
+// ============================================================================
+
+/// Builder for configuring a commit watch stream.
+#[pyclass(name = "WatchBuilder")]
+pub struct PyWatchBuilder {
+    pub(crate) inner: Option<::uni_db::WatchBuilder>,
+}
+
+#[pymethods]
+impl PyWatchBuilder {
+    /// Filter notifications to only include commits affecting these labels.
+    fn labels<'py>(
+        mut slf: pyo3::PyRefMut<'py, Self>,
+        labels: Vec<String>,
+    ) -> pyo3::PyResult<pyo3::PyRefMut<'py, Self>> {
+        let builder = slf.inner.take().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("WatchBuilder already consumed")
+        })?;
+        let label_refs: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
+        slf.inner = Some(builder.labels(&label_refs));
+        Ok(slf)
+    }
+
+    /// Filter notifications to only include commits affecting these edge types.
+    fn edge_types<'py>(
+        mut slf: pyo3::PyRefMut<'py, Self>,
+        types: Vec<String>,
+    ) -> pyo3::PyResult<pyo3::PyRefMut<'py, Self>> {
+        let builder = slf.inner.take().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("WatchBuilder already consumed")
+        })?;
+        let type_refs: Vec<&str> = types.iter().map(|s| s.as_str()).collect();
+        slf.inner = Some(builder.edge_types(&type_refs));
+        Ok(slf)
+    }
+
+    /// Set a debounce interval in seconds.
+    fn debounce<'py>(
+        mut slf: pyo3::PyRefMut<'py, Self>,
+        seconds: f64,
+    ) -> pyo3::PyResult<pyo3::PyRefMut<'py, Self>> {
+        let builder = slf.inner.take().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("WatchBuilder already consumed")
+        })?;
+        slf.inner = Some(builder.debounce(std::time::Duration::from_secs_f64(seconds)));
+        Ok(slf)
+    }
+
+    /// Exclude notifications from a specific session.
+    fn exclude_session<'py>(
+        mut slf: pyo3::PyRefMut<'py, Self>,
+        session_id: &str,
+    ) -> pyo3::PyResult<pyo3::PyRefMut<'py, Self>> {
+        let builder = slf.inner.take().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("WatchBuilder already consumed")
+        })?;
+        slf.inner = Some(builder.exclude_session(session_id));
+        Ok(slf)
+    }
+
+    /// Build and return a synchronous CommitStream.
+    fn build(&mut self) -> pyo3::PyResult<PyCommitStream> {
+        let builder = self.inner.take().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("WatchBuilder already consumed")
+        })?;
+        Ok(PyCommitStream {
+            inner: std::sync::Mutex::new(Some(builder.build())),
+        })
+    }
+
+    /// Build and return an async CommitStream.
+    fn build_async(&mut self) -> pyo3::PyResult<crate::async_api::AsyncCommitStream> {
+        let builder = self.inner.take().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("WatchBuilder already consumed")
+        })?;
+        Ok(crate::async_api::AsyncCommitStream {
+            inner: std::sync::Arc::new(tokio::sync::Mutex::new(Some(builder.build()))),
+        })
     }
 }

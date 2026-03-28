@@ -34,7 +34,7 @@ fn _uni_db(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<builders::DatabaseBuilder>()?;
     m.add_class::<sync_api::Transaction>()?;
 
-    // Sync query
+    // Sync query (legacy Database-level builder, kept for backward compat)
     m.add_class::<builders::QueryBuilder>()?;
     m.add_class::<sync_api::QueryCursor>()?;
 
@@ -47,9 +47,25 @@ fn _uni_db(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<builders::SessionBuilder>()?;
     m.add_class::<builders::Session>()?;
 
+    // Session builders
+    m.add_class::<builders::SessionQueryBuilder>()?;
+    m.add_class::<builders::SessionAutoCommitBuilder>()?;
+    m.add_class::<builders::SessionLocyBuilder>()?;
+    m.add_class::<builders::SessionProfileBuilder>()?;
+    m.add_class::<builders::PyTransactionBuilder>()?;
+
+    // Transaction builders
+    m.add_class::<builders::PyTxQueryBuilder>()?;
+    m.add_class::<builders::PyTxExecuteBuilder>()?;
+    m.add_class::<builders::PyTxLocyBuilder>()?;
+    m.add_class::<builders::PyApplyBuilder>()?;
+
     // Bulk loading
     m.add_class::<builders::BulkWriterBuilder>()?;
     m.add_class::<builders::BulkWriter>()?;
+
+    // Locy builder (legacy, for Database-level LocyBuilder)
+    m.add_class::<builders::LocyBuilder>()?;
 
     // Async classes
     m.add_class::<async_api::AsyncDatabase>()?;
@@ -77,11 +93,12 @@ fn _uni_db(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<types::PyLocyResult>()?;
     m.add_class::<types::PyCompiledProgram>()?;
 
-    // Locy engine
-    m.add_class::<sync_api::LocyEngine>()?;
-    m.add_class::<builders::LocyBuilder>()?;
-    m.add_class::<async_api::AsyncLocyEngine>()?;
-    m.add_class::<async_api::AsyncLocyBuilder>()?;
+    // New result types
+    m.add_class::<types::PyAutoCommitResult>()?;
+    m.add_class::<types::PyExecuteResult>()?;
+    m.add_class::<types::PyApplyResult>()?;
+    m.add_class::<types::PyDerivedFactSet>()?;
+    m.add_class::<types::PySessionMetrics>()?;
 
     // Xervo types
     m.add_class::<types::PyMessage>()?;
@@ -98,6 +115,13 @@ fn _uni_db(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<types::PyCommitNotification>()?;
     m.add_class::<types::PySessionCapabilities>()?;
     m.add_class::<types::PyPreparedQuery>()?;
+    m.add_class::<types::PyPreparedLocy>()?;
+    m.add_class::<types::PyDatabaseMetrics>()?;
+    m.add_class::<types::PyCommitStream>()?;
+    m.add_class::<types::PyWatchBuilder>()?;
+
+    // Async commit stream
+    m.add_class::<async_api::AsyncCommitStream>()?;
 
     // Session templates & streaming appender
     m.add_class::<builders::SessionTemplateBuilder>()?;

@@ -636,6 +636,61 @@ pub fn locy_result_to_py(py: Python, result: uni_db::locy::LocyResult) -> PyResu
     Ok(dict.into())
 }
 
+/// Convert QueryMetrics to a Python dict.
+pub fn query_metrics_to_py(py: Python, m: &::uni_db::QueryMetrics) -> PyResult<Py<PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item("parse_time_ms", m.parse_time.as_secs_f64() * 1000.0)?;
+    dict.set_item("plan_time_ms", m.plan_time.as_secs_f64() * 1000.0)?;
+    dict.set_item("exec_time_ms", m.exec_time.as_secs_f64() * 1000.0)?;
+    dict.set_item("total_time_ms", m.total_time.as_secs_f64() * 1000.0)?;
+    dict.set_item("rows_returned", m.rows_returned)?;
+    dict.set_item("rows_scanned", m.rows_scanned)?;
+    dict.set_item("bytes_read", m.bytes_read)?;
+    dict.set_item("plan_cache_hit", m.plan_cache_hit)?;
+    dict.set_item("l0_reads", m.l0_reads)?;
+    dict.set_item("storage_reads", m.storage_reads)?;
+    dict.set_item("cache_hits", m.cache_hits)?;
+    Ok(dict.into())
+}
+
+/// Convert an AutoCommitResult to a Python AutoCommitResult.
+pub fn auto_commit_result_to_py(
+    py: Python,
+    r: ::uni_db::AutoCommitResult,
+) -> PyResult<crate::types::PyAutoCommitResult> {
+    Ok(crate::types::PyAutoCommitResult {
+        affected_rows: r.affected_rows(),
+        nodes_created: r.nodes_created,
+        nodes_deleted: r.nodes_deleted,
+        relationships_created: r.relationships_created,
+        relationships_deleted: r.relationships_deleted,
+        properties_set: r.properties_set,
+        properties_removed: r.properties_removed,
+        labels_added: r.labels_added,
+        labels_removed: r.labels_removed,
+        version: r.version,
+        metrics: query_metrics_to_py(py, &r.metrics)?,
+    })
+}
+
+/// Convert an ExecuteResult to a Python ExecuteResult.
+pub fn execute_result_to_py(
+    py: Python,
+    r: ::uni_db::query_crate::ExecuteResult,
+) -> PyResult<crate::types::PyExecuteResult> {
+    Ok(crate::types::PyExecuteResult {
+        affected_rows: r.affected_rows(),
+        nodes_created: r.nodes_created(),
+        nodes_deleted: r.nodes_deleted(),
+        relationships_created: r.relationships_created(),
+        relationships_deleted: r.relationships_deleted(),
+        properties_set: r.properties_set(),
+        labels_added: r.labels_added(),
+        labels_removed: r.labels_removed(),
+        metrics: query_metrics_to_py(py, r.metrics())?,
+    })
+}
+
 /// Convert a LocyResult to a Python LocyResult class instance.
 pub fn locy_result_to_py_class(
     py: Python,
@@ -696,13 +751,96 @@ pub fn locy_result_to_py_class(
         approx_dict.set_item(&rule_name, group_list)?;
     }
 
+    // Wrap the derived fact set in the opaque PyDerivedFactSet type
+    let derived_fact_set: Py<pyo3::PyAny> = match result.derived_fact_set {
+        Some(dfs) => {
+            let py_dfs = crate::types::PyDerivedFactSet { inner: Some(dfs) };
+            py_dfs.into_py_any(py)?
+        }
+        None => py.None(),
+    };
+
     Ok(crate::types::PyLocyResult {
         derived: derived_dict.into(),
         stats: stats.into_py_any(py)?,
         command_results: cmd_list.into(),
         warnings: warn_list.into(),
         approximate_groups: approx_dict.into(),
+        derived_fact_set,
     })
+}
+
+/// Convert ExplainOutput to a Python dict.
+pub fn explain_output_to_py(
+    py: Python,
+    output: ::uni_db::ExplainOutput,
+) -> PyResult<Py<pyo3::PyAny>> {
+    let dict = PyDict::new(py);
+    dict.set_item("plan_text", &output.plan_text)?;
+    dict.set_item("warnings", &output.warnings)?;
+
+    let cost_dict = PyDict::new(py);
+    cost_dict.set_item("estimated_rows", output.cost_estimates.estimated_rows)?;
+    cost_dict.set_item("estimated_cost", output.cost_estimates.estimated_cost)?;
+    dict.set_item("cost_estimates", cost_dict)?;
+
+    let index_usage = PyList::empty(py);
+    for usage in &output.index_usage {
+        let usage_dict = PyDict::new(py);
+        usage_dict.set_item("label_or_type", &usage.label_or_type)?;
+        usage_dict.set_item("property", &usage.property)?;
+        usage_dict.set_item("index_type", &usage.index_type)?;
+        usage_dict.set_item("used", usage.used)?;
+        if let Some(reason) = &usage.reason {
+            usage_dict.set_item("reason", reason)?;
+        }
+        index_usage.append(usage_dict)?;
+    }
+    dict.set_item("index_usage", index_usage)?;
+
+    let suggestions = PyList::empty(py);
+    for suggestion in &output.suggestions {
+        let sug_dict = PyDict::new(py);
+        sug_dict.set_item("label_or_type", &suggestion.label_or_type)?;
+        sug_dict.set_item("property", &suggestion.property)?;
+        sug_dict.set_item("index_type", &suggestion.index_type)?;
+        sug_dict.set_item("reason", &suggestion.reason)?;
+        sug_dict.set_item("create_statement", &suggestion.create_statement)?;
+        suggestions.append(sug_dict)?;
+    }
+    dict.set_item("suggestions", suggestions)?;
+
+    Ok(dict.into())
+}
+
+/// Convert ProfileOutput to a Python dict.
+pub fn profile_output_to_py(
+    py: Python,
+    profile: ::uni_db::ProfileOutput,
+) -> PyResult<Py<pyo3::PyAny>> {
+    let profile_dict = PyDict::new(py);
+    profile_dict.set_item("total_time_ms", profile.total_time_ms)?;
+    profile_dict.set_item("peak_memory_bytes", profile.peak_memory_bytes)?;
+    profile_dict.set_item("plan_text", &profile.explain.plan_text)?;
+
+    let ops = PyList::empty(py);
+    for op in &profile.runtime_stats {
+        let op_dict = PyDict::new(py);
+        op_dict.set_item("operator", &op.operator)?;
+        op_dict.set_item("actual_rows", op.actual_rows)?;
+        op_dict.set_item("time_ms", op.time_ms)?;
+        op_dict.set_item("memory_bytes", op.memory_bytes)?;
+        if let Some(hits) = op.index_hits {
+            op_dict.set_item("index_hits", hits)?;
+        }
+        if let Some(misses) = op.index_misses {
+            op_dict.set_item("index_misses", misses)?;
+        }
+        ops.append(op_dict)?;
+    }
+    profile_dict.set_item("operators", ops)?;
+
+    Ok(profile_dict.into())
 }
 
 /// Extract a CloudStorageConfig from a Python dict.
@@ -1003,4 +1141,47 @@ pub fn generation_result_to_py(
         text: result.text,
         usage,
     })
+}
+
+/// Convert a `DatabaseMetrics` to a Python `PyDatabaseMetrics`.
+pub fn database_metrics_to_py(
+    _py: Python,
+    m: ::uni_db::DatabaseMetrics,
+) -> PyResult<crate::types::PyDatabaseMetrics> {
+    Ok(crate::types::PyDatabaseMetrics {
+        l0_mutation_count: m.l0_mutation_count,
+        l0_estimated_size_bytes: m.l0_estimated_size_bytes,
+        schema_version: m.schema_version,
+        uptime_secs: m.uptime.as_secs_f64(),
+        active_sessions: m.active_sessions,
+        l1_run_count: m.l1_run_count,
+        write_throttle_pressure: m.write_throttle_pressure,
+        compaction_status: m.compaction_status,
+        wal_size_bytes: m.wal_size_bytes,
+        wal_lsn: m.wal_lsn,
+        total_queries: m.total_queries,
+        total_commits: m.total_commits,
+    })
+}
+
+/// Convert a `&UniConfig` to a Python dict.
+pub fn uni_config_to_py(py: Python, config: &uni_common::UniConfig) -> PyResult<Py<PyAny>> {
+    let dict = PyDict::new(py);
+    dict.set_item("cache_size", config.cache_size)?;
+    dict.set_item("parallelism", config.parallelism)?;
+    dict.set_item("query_timeout", config.query_timeout.as_secs_f64())?;
+    dict.set_item("max_query_memory", config.max_query_memory)?;
+    dict.set_item("max_transaction_memory", config.max_transaction_memory)?;
+    dict.set_item("batch_size", config.batch_size)?;
+    dict.set_item("auto_flush_threshold", config.auto_flush_threshold)?;
+    dict.set_item(
+        "auto_flush_interval",
+        config.auto_flush_interval.map(|d| d.as_secs_f64()),
+    )?;
+    dict.set_item("wal_enabled", config.wal_enabled)?;
+    dict.set_item(
+        "max_recursive_cte_iterations",
+        config.max_recursive_cte_iterations,
+    )?;
+    Ok(dict.into())
 }

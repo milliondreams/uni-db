@@ -436,11 +436,8 @@ impl<'a> LocyEngine<'a> {
             .map(|a| a.clone())
             .unwrap_or_default();
         // Collect inline results (QUERY, Cypher) already executed by run_program()
-        let inline_map: HashMap<usize, CommandResult> = command_results_slot
-            .write()
-            .unwrap()
-            .drain(..)
-            .collect();
+        let inline_map: HashMap<usize, CommandResult> =
+            command_results_slot.write().unwrap().drain(..).collect();
 
         let mut command_results = Vec::new();
         let mut collected_derives: Vec<CollectedDeriveOutput> = Vec::new();

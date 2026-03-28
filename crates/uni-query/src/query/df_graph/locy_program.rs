@@ -520,22 +520,17 @@ async fn execute_cypher_inline(
 /// (e.g. `a.name`) that requires full node objects not available in DerivedStore.
 #[allow(dead_code)]
 fn needs_node_enrichment(query: &GoalQuery) -> bool {
-    let has_property_in_where = query
+    let where_has_property = query
         .where_expr
         .as_ref()
         .is_some_and(expr_has_property_access);
-    let has_property_in_return = query
-        .return_clause
-        .as_ref()
-        .is_some_and(|rc| {
-            rc.items.iter().any(|item| match item {
-                uni_cypher::ast::ReturnItem::Expr { expr, .. } => {
-                    expr_has_property_access(expr)
-                }
-                uni_cypher::ast::ReturnItem::All => false,
-            })
-        });
-    has_property_in_where || has_property_in_return
+    let return_has_property = query.return_clause.as_ref().is_some_and(|rc| {
+        rc.items.iter().any(|item| match item {
+            uni_cypher::ast::ReturnItem::Expr { expr, .. } => expr_has_property_access(expr),
+            uni_cypher::ast::ReturnItem::All => false,
+        })
+    });
+    where_has_property || return_has_property
 }
 
 /// Recursively check whether an expression contains property access (`a.name`).
@@ -566,20 +561,14 @@ fn expr_has_property_access(expr: &Expr) -> bool {
                     .is_some_and(|e| expr_has_property_access(e))
         }
         Expr::IsNull(e) | Expr::IsNotNull(e) | Expr::IsUnique(e) => expr_has_property_access(e),
-        Expr::In { expr, list } => {
-            expr_has_property_access(expr) || expr_has_property_access(list)
-        }
+        Expr::In { expr, list } => expr_has_property_access(expr) || expr_has_property_access(list),
         Expr::ArrayIndex { array, index } => {
             expr_has_property_access(array) || expr_has_property_access(index)
         }
         Expr::ArraySlice { array, start, end } => {
             expr_has_property_access(array)
-                || start
-                    .as_ref()
-                    .is_some_and(|e| expr_has_property_access(e))
-                || end
-                    .as_ref()
-                    .is_some_and(|e| expr_has_property_access(e))
+                || start.as_ref().is_some_and(|e| expr_has_property_access(e))
+                || end.as_ref().is_some_and(|e| expr_has_property_access(e))
         }
         Expr::Quantifier {
             list, predicate, ..
@@ -904,7 +893,7 @@ async fn run_program(
     let mut inline_results: Vec<(usize, CommandResult)> = Vec::new();
     for (cmd_idx, cmd) in commands.iter().enumerate() {
         if let LocyCommand::Cypher { query } = cmd {
-            let result = execute_cypher_inline(
+            let rows = execute_cypher_inline(
                 query,
                 &schema_info,
                 &params,
@@ -913,9 +902,8 @@ async fn run_program(
                 &storage,
             )
             .await?;
-            inline_results.push((cmd_idx, CommandResult::Cypher(result)));
+            inline_results.push((cmd_idx, CommandResult::Cypher(rows)));
         }
-        // QUERY, DERIVE, ASSUME, EXPLAIN, ABDUCE: deferred to orchestrator
     }
     *command_results_slot.write().unwrap() = inline_results;
 

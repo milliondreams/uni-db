@@ -2,13 +2,12 @@
 // Copyright 2024-2026 Dragonscale Team
 
 use crate::api::Uni;
-use crate::api::locy_builder::{SessionLocyBuilder, TransactionLocyBuilder};
+use crate::api::locy_builder::{LocyBuilder, TxLocyBuilder};
 use crate::api::session::{
-    AutoCommitBuilder, AutoCommitResult, ProfileBuilder, Session, SessionQueryBuilder,
-    TransactionBuilder,
+    AutoCommitBuilder, AutoCommitResult, ProfileBuilder, QueryBuilder, Session, TransactionBuilder,
 };
 use crate::api::transaction::{
-    ApplyBuilder, ApplyResult, CommitResult, Transaction, TransactionQueryBuilder,
+    ApplyBuilder, ApplyResult, CommitResult, Transaction, TxQueryBuilder,
 };
 use std::sync::Arc;
 use uni_common::core::schema::{DataType, Schema};
@@ -115,8 +114,8 @@ impl<'a> SessionSync<'a> {
     }
 
     /// Execute a read-only Cypher query with a builder for parameters.
-    pub fn query_with<'s>(&'s self, cypher: &str) -> SessionQueryBuilderSync<'s, 'a> {
-        SessionQueryBuilderSync {
+    pub fn query_with<'s>(&'s self, cypher: &str) -> QueryBuilderSync<'s, 'a> {
+        QueryBuilderSync {
             inner: self.session.query_with(cypher),
             rt: self.rt,
         }
@@ -170,8 +169,8 @@ impl<'a> SessionSync<'a> {
     }
 
     /// Evaluate a Locy program with parameters using a builder.
-    pub fn locy_with<'s>(&'s self, program: &str) -> SessionLocyBuilderSync<'s, 'a> {
-        SessionLocyBuilderSync {
+    pub fn locy_with<'s>(&'s self, program: &str) -> LocyBuilderSync<'s, 'a> {
+        LocyBuilderSync {
             inner: self.session.locy_with(program),
             rt: self.rt,
         }
@@ -261,6 +260,11 @@ impl<'a> SessionSync<'a> {
         self.rt.block_on(self.session.pin_to_timestamp(ts))
     }
 
+    /// Unpin the session, returning to the live database state.
+    pub fn refresh(&mut self) -> Result<()> {
+        self.rt.block_on(self.session.refresh())
+    }
+
     // ── Planning & Introspection ──────────────────────────────────────
 
     /// Explain a Locy program.
@@ -316,15 +320,15 @@ impl<'a> SessionSync<'a> {
     }
 }
 
-// ── SessionQueryBuilderSync ──────────────────────────────────────────────
+// ── QueryBuilderSync ──────────────────────────────────────────────
 
-/// Blocking wrapper around [`SessionQueryBuilder`].
-pub struct SessionQueryBuilderSync<'s, 'a> {
-    inner: SessionQueryBuilder<'s>,
+/// Blocking wrapper around [`QueryBuilder`].
+pub struct QueryBuilderSync<'s, 'a> {
+    inner: QueryBuilder<'s>,
     rt: &'a tokio::runtime::Runtime,
 }
 
-impl<'s, 'a> SessionQueryBuilderSync<'s, 'a> {
+impl<'s, 'a> QueryBuilderSync<'s, 'a> {
     /// Bind a parameter to the query.
     pub fn param<K: Into<String>, V: Into<Value>>(mut self, key: K, value: V) -> Self {
         self.inner = self.inner.param(key, value);
@@ -425,15 +429,15 @@ impl<'s, 'a> ProfileBuilderSync<'s, 'a> {
     }
 }
 
-// ── SessionLocyBuilderSync ──────────────────────────────────────────────
+// ── LocyBuilderSync ──────────────────────────────────────────────
 
-/// Blocking wrapper around [`SessionLocyBuilder`].
-pub struct SessionLocyBuilderSync<'s, 'a> {
-    inner: SessionLocyBuilder<'s>,
+/// Blocking wrapper around [`LocyBuilder`].
+pub struct LocyBuilderSync<'s, 'a> {
+    inner: LocyBuilder<'s>,
     rt: &'a tokio::runtime::Runtime,
 }
 
-impl<'s, 'a> SessionLocyBuilderSync<'s, 'a> {
+impl<'s, 'a> LocyBuilderSync<'s, 'a> {
     /// Bind a single parameter.
     pub fn param(mut self, name: &str, value: impl Into<Value>) -> Self {
         self.inner = self.inner.param(name, value);
@@ -483,8 +487,8 @@ impl<'a> TransactionSync<'a> {
     }
 
     /// Execute a Cypher query with parameters using a builder.
-    pub fn query_with<'t>(&'t self, cypher: &str) -> TransactionQueryBuilderSync<'t, 'a> {
-        TransactionQueryBuilderSync {
+    pub fn query_with<'t>(&'t self, cypher: &str) -> TxQueryBuilderSync<'t, 'a> {
+        TxQueryBuilderSync {
             inner: self.tx.query_with(cypher),
             rt: self.rt,
         }
@@ -508,8 +512,8 @@ impl<'a> TransactionSync<'a> {
     }
 
     /// Evaluate a Locy program with parameters using a builder.
-    pub fn locy_with<'t>(&'t self, program: &str) -> TransactionLocyBuilderSync<'t, 'a> {
-        TransactionLocyBuilderSync {
+    pub fn locy_with<'t>(&'t self, program: &str) -> TxLocyBuilderSync<'t, 'a> {
+        TxLocyBuilderSync {
             inner: self.tx.locy_with(program),
             rt: self.rt,
         }
@@ -618,15 +622,15 @@ impl<'s, 'a> TransactionBuilderSync<'s, 'a> {
     }
 }
 
-// ── TransactionQueryBuilderSync ─────────────────────────────────────────
+// ── TxQueryBuilderSync ─────────────────────────────────────────
 
-/// Blocking wrapper around [`TransactionQueryBuilder`].
-pub struct TransactionQueryBuilderSync<'t, 'a> {
-    inner: TransactionQueryBuilder<'t>,
+/// Blocking wrapper around [`TxQueryBuilder`].
+pub struct TxQueryBuilderSync<'t, 'a> {
+    inner: TxQueryBuilder<'t>,
     rt: &'a tokio::runtime::Runtime,
 }
 
-impl<'t, 'a> TransactionQueryBuilderSync<'t, 'a> {
+impl<'t, 'a> TxQueryBuilderSync<'t, 'a> {
     /// Bind a parameter.
     pub fn param(mut self, name: &str, value: impl Into<Value>) -> Self {
         self.inner = self.inner.param(name, value);
@@ -676,15 +680,15 @@ impl<'t, 'a> ApplyBuilderSync<'t, 'a> {
     }
 }
 
-// ── TransactionLocyBuilderSync ──────────────────────────────────────────
+// ── TxLocyBuilderSync ──────────────────────────────────────────
 
-/// Blocking wrapper around [`TransactionLocyBuilder`].
-pub struct TransactionLocyBuilderSync<'t, 'a> {
-    inner: TransactionLocyBuilder<'t>,
+/// Blocking wrapper around [`TxLocyBuilder`].
+pub struct TxLocyBuilderSync<'t, 'a> {
+    inner: TxLocyBuilder<'t>,
     rt: &'a tokio::runtime::Runtime,
 }
 
-impl<'t, 'a> TransactionLocyBuilderSync<'t, 'a> {
+impl<'t, 'a> TxLocyBuilderSync<'t, 'a> {
     /// Bind a single parameter.
     pub fn param(mut self, name: &str, value: impl Into<Value>) -> Self {
         self.inner = self.inner.param(name, value);

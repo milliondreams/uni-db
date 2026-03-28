@@ -203,8 +203,8 @@ impl Transaction {
     }
 
     /// Execute a Cypher query with parameters.
-    pub fn query_with(&self, cypher: &str) -> TransactionQueryBuilder<'_> {
-        TransactionQueryBuilder {
+    pub fn query_with(&self, cypher: &str) -> TxQueryBuilder<'_> {
+        TxQueryBuilder {
             tx: self,
             cypher: cypher.to_string(),
             params: HashMap::new(),
@@ -341,8 +341,8 @@ impl Transaction {
     }
 
     /// Evaluate a Locy program with parameters using a builder.
-    pub fn locy_with(&self, program: &str) -> crate::api::locy_builder::TransactionLocyBuilder<'_> {
-        crate::api::locy_builder::TransactionLocyBuilder::new(self, program)
+    pub fn locy_with(&self, program: &str) -> crate::api::locy_builder::TxLocyBuilder<'_> {
+        crate::api::locy_builder::TxLocyBuilder::new(self, program)
     }
 
     // ── Prepared Statements ──────────────────────────────────────────
@@ -701,14 +701,14 @@ impl<'a> ExecuteBuilder<'a> {
 }
 
 /// Builder for parameterized queries within a transaction.
-pub struct TransactionQueryBuilder<'a> {
+pub struct TxQueryBuilder<'a> {
     tx: &'a Transaction,
     cypher: String,
     params: HashMap<String, Value>,
     cancellation_token: Option<CancellationToken>,
 }
 
-impl<'a> TransactionQueryBuilder<'a> {
+impl<'a> TxQueryBuilder<'a> {
     /// Bind a parameter to the mutation.
     pub fn param(mut self, name: &str, value: impl Into<Value>) -> Self {
         self.params.insert(name.to_string(), value.into());

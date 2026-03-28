@@ -21,9 +21,9 @@ pub use api::session::{
     SessionMetrics, TransactionBuilder, WriteLeaseSummary,
 };
 pub use api::sync::{
-    ApplyBuilderSync, AutoCommitBuilderSync, ExecuteBuilderSync, ProfileBuilderSync,
-    SessionLocyBuilderSync, SessionQueryBuilderSync, SessionSync, TransactionBuilderSync,
-    TransactionLocyBuilderSync, TransactionQueryBuilderSync, TransactionSync, UniSync,
+    ApplyBuilderSync, AutoCommitBuilderSync, ExecuteBuilderSync, LocyBuilderSync,
+    ProfileBuilderSync, QueryBuilderSync, SessionSync, TransactionBuilderSync, TransactionSync,
+    TxLocyBuilderSync, TxQueryBuilderSync, UniSync,
 };
 pub use api::template::{SessionTemplate, SessionTemplateBuilder};
 pub use api::transaction::{

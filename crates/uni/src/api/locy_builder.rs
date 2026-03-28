@@ -86,15 +86,15 @@ impl<'a> InnerLocyBuilder<'a> {
 /// Builder for constructing and evaluating Locy programs (Session-level).
 ///
 /// Uses the session's rule registry for compilation and evaluation.
-#[must_use = "SessionLocyBuilder does nothing until .run() is called"]
-pub struct SessionLocyBuilder<'a> {
+#[must_use = "LocyBuilder does nothing until .run() is called"]
+pub struct LocyBuilder<'a> {
     session: &'a Session,
     program: String,
     config: LocyConfig,
     cancellation_token: Option<CancellationToken>,
 }
 
-impl<'a> SessionLocyBuilder<'a> {
+impl<'a> LocyBuilder<'a> {
     pub(crate) fn new(session: &'a Session, program: &str) -> Self {
         Self {
             session,
@@ -165,15 +165,15 @@ impl<'a> SessionLocyBuilder<'a> {
 ///
 /// Uses the transaction's private L0 buffer so the Locy engine sees uncommitted
 /// writes. DERIVE commands auto-apply to the private L0.
-#[must_use = "TransactionLocyBuilder does nothing until .run() is called"]
-pub struct TransactionLocyBuilder<'a> {
+#[must_use = "TxLocyBuilder does nothing until .run() is called"]
+pub struct TxLocyBuilder<'a> {
     tx: &'a Transaction,
     program: String,
     config: LocyConfig,
     cancellation_token: Option<CancellationToken>,
 }
 
-impl<'a> TransactionLocyBuilder<'a> {
+impl<'a> TxLocyBuilder<'a> {
     pub(crate) fn new(tx: &'a Transaction, program: &str) -> Self {
         Self {
             tx,

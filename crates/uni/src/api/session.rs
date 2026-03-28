@@ -323,8 +323,8 @@ impl Session {
     }
 
     /// Execute a read-only Cypher query with a builder for parameters.
-    pub fn query_with(&self, cypher: &str) -> SessionQueryBuilder<'_> {
-        SessionQueryBuilder {
+    pub fn query_with(&self, cypher: &str) -> QueryBuilder<'_> {
+        QueryBuilder {
             session: self,
             cypher: cypher.to_string(),
             params: HashMap::new(),
@@ -467,8 +467,8 @@ impl Session {
     }
 
     /// Evaluate a Locy program with parameters using a builder.
-    pub fn locy_with(&self, program: &str) -> crate::api::locy_builder::SessionLocyBuilder<'_> {
-        crate::api::locy_builder::SessionLocyBuilder::new(self, program)
+    pub fn locy_with(&self, program: &str) -> crate::api::locy_builder::LocyBuilder<'_> {
+        crate::api::locy_builder::LocyBuilder::new(self, program)
     }
 
     // ── Rule Management ───────────────────────────────────────────────
@@ -684,11 +684,16 @@ impl Session {
         self.pin_to_version(&snapshot_id).await
     }
 
-    /// Unpin the session, returning to the live database state.
-    pub fn refresh(&mut self) {
+    /// Refresh: unpin the session, returning to the live database state.
+    ///
+    /// In single-process mode, this simply unpins the session.
+    /// In multi-agent mode (Phase 2), this picks up the latest
+    /// committed version from storage.
+    pub async fn refresh(&mut self) -> Result<()> {
         if let Some(original) = self.original_db.take() {
             self.db = original;
         }
+        Ok(())
     }
 
     /// Returns `true` if the session is pinned to a specific version.
@@ -1006,7 +1011,7 @@ impl Session {
 }
 
 /// Builder for parameterized queries within a session.
-pub struct SessionQueryBuilder<'a> {
+pub struct QueryBuilder<'a> {
     session: &'a Session,
     cypher: String,
     params: HashMap<String, Value>,
@@ -1015,7 +1020,7 @@ pub struct SessionQueryBuilder<'a> {
     cancellation_token: Option<CancellationToken>,
 }
 
-impl<'a> SessionQueryBuilder<'a> {
+impl<'a> QueryBuilder<'a> {
     /// Bind a parameter to the query.
     pub fn param<K: Into<String>, V: Into<Value>>(mut self, key: K, value: V) -> Self {
         self.params.insert(key.into(), value.into());

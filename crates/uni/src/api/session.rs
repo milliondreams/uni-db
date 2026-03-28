@@ -460,10 +460,20 @@ impl Session {
         result
     }
 
-    /// Explain a Locy program. Currently equivalent to `locy()`.
+    /// Explain a Locy program without executing it.
+    ///
+    /// Compiles the program and returns plan introspection data (strata,
+    /// rule names, recursion info, compiler warnings). No data is read or
+    /// written — this is a pure CPU operation.
     #[instrument(skip(self), fields(session_id = %self.id))]
-    pub async fn explain_locy(&self, program: &str) -> Result<LocyResult> {
-        self.locy(program).await
+    pub fn explain_locy(
+        &self,
+        program: &str,
+    ) -> Result<crate::api::locy_result::LocyExplainOutput> {
+        let compiled = self.compile_locy(program)?;
+        Ok(crate::api::locy_result::LocyExplainOutput::from_compiled(
+            &compiled,
+        ))
     }
 
     /// Evaluate a Locy program with parameters using a builder.
@@ -834,6 +844,11 @@ impl Session {
     /// The function is registered at the database level and is visible to
     /// all sessions sharing the same database instance.
     ///
+    /// **Note:** The spec declares `&mut self`, but the implementation uses `&self`
+    /// with interior mutability (`RwLock`-protected registry). This is intentional:
+    /// `Session` is shared via `Arc` in the Python bindings and concurrent access
+    /// patterns, so requiring `&mut self` would be impractical.
+    ///
     /// # Example
     ///
     /// ```ignore
@@ -1088,6 +1103,7 @@ impl<'a> QueryBuilder<'a> {
     }
 
     /// Alias for `fetch_all()`.
+    #[deprecated(since = "0.4.0", note = "Use `fetch_all()` instead")]
     pub async fn execute(self) -> Result<QueryResult> {
         self.fetch_all().await
     }
@@ -1099,6 +1115,10 @@ impl<'a> QueryBuilder<'a> {
     }
 
     /// Execute a mutation and return affected row count with detailed stats.
+    #[deprecated(
+        since = "0.4.0",
+        note = "Use `session.execute_with(cypher).run()` for auto-committed writes"
+    )]
     pub async fn execute_mutation(self) -> Result<ExecuteResult> {
         let db = &self.session.db;
         let before = db.get_mutation_count().await;
@@ -1208,15 +1228,21 @@ impl<'a> AutoCommitBuilder<'a> {
         };
         let diff = after_stats.diff(&before_stats);
 
-        // Read L0 version after mutation (same pattern as Transaction::commit)
+        // Read L0 version after mutation and update cached metrics
         let version = match self.session.db.writer.as_ref() {
             Some(w) => {
-                w.read()
-                    .await
-                    .l0_manager
-                    .get_current()
-                    .read()
-                    .current_version
+                let writer = w.read().await;
+                let l0 = writer.l0_manager.get_current();
+                let l0_guard = l0.read();
+                self.session
+                    .db
+                    .cached_l0_mutation_count
+                    .store(l0_guard.mutation_count, Ordering::Relaxed);
+                self.session
+                    .db
+                    .cached_l0_estimated_size
+                    .store(l0_guard.estimated_size, Ordering::Relaxed);
+                l0_guard.current_version
             }
             None => 0,
         };

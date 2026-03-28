@@ -83,6 +83,14 @@ pub struct UniInner {
     pub(crate) total_commits: AtomicU64,
     /// Database-level registry of custom scalar functions.
     pub(crate) custom_functions: Arc<std::sync::RwLock<uni_query::CustomFunctionRegistry>>,
+
+    // ── Cached metrics (updated on commit, read by sync `metrics()`) ─────
+    /// Cached L0 mutation count (updated after every commit).
+    pub(crate) cached_l0_mutation_count: AtomicUsize,
+    /// Cached L0 estimated size in bytes (updated after every commit).
+    pub(crate) cached_l0_estimated_size: AtomicUsize,
+    /// Cached WAL log sequence number (updated after every commit).
+    pub(crate) cached_wal_lsn: AtomicU64,
 }
 
 /// Snapshot of database-level metrics.
@@ -185,6 +193,9 @@ impl UniInner {
             total_queries: AtomicU64::new(0),
             total_commits: AtomicU64::new(0),
             custom_functions: self.custom_functions.clone(),
+            cached_l0_mutation_count: AtomicUsize::new(0),
+            cached_l0_estimated_size: AtomicUsize::new(0),
+            cached_wal_lsn: AtomicU64::new(0),
         })
     }
 }
@@ -265,27 +276,15 @@ impl Uni {
     // ── Database Metrics ──────────────────────────────────────────────
 
     /// Snapshot the database-level metrics.
-    pub async fn metrics(&self) -> DatabaseMetrics {
-        let l0_mutation_count = self.inner.get_mutation_count().await;
-        let (l0_estimated_size_bytes, wal_lsn) = match self.inner.writer.as_ref() {
-            Some(w) => {
-                let writer = w.read().await;
-                let l0 = writer.l0_manager.get_current();
-                let l0_guard = l0.read();
-                let size = l0_guard.estimated_size;
-                let lsn = l0_guard
-                    .wal
-                    .as_ref()
-                    .and_then(|wal| wal.flushed_lsn().ok())
-                    .unwrap_or(0);
-                (size, lsn)
-            }
-            None => (0, 0),
-        };
+    ///
+    /// This is a cheap, synchronous read of cached atomic values.
+    /// L0 metrics (`l0_mutation_count`, `l0_estimated_size_bytes`, `wal_lsn`)
+    /// reflect the state as of the last successful commit.
+    pub fn metrics(&self) -> DatabaseMetrics {
         let schema_version = self.inner.schema.schema().schema_version;
         DatabaseMetrics {
-            l0_mutation_count,
-            l0_estimated_size_bytes,
+            l0_mutation_count: self.inner.cached_l0_mutation_count.load(Ordering::Relaxed),
+            l0_estimated_size_bytes: self.inner.cached_l0_estimated_size.load(Ordering::Relaxed),
             schema_version,
             uptime: self.inner.start_time.elapsed(),
             active_sessions: self.inner.active_session_count.load(Ordering::Relaxed),
@@ -293,7 +292,7 @@ impl Uni {
             write_throttle_pressure: 0.0,
             compaction_status: None,
             wal_size_bytes: 0,
-            wal_lsn,
+            wal_lsn: self.inner.cached_wal_lsn.load(Ordering::Relaxed),
             total_queries: self.inner.total_queries.load(Ordering::Relaxed),
             total_commits: self.inner.total_commits.load(Ordering::Relaxed),
         }
@@ -1486,6 +1485,9 @@ impl UniBuilder {
                 custom_functions: Arc::new(std::sync::RwLock::new(
                     uni_query::CustomFunctionRegistry::new(),
                 )),
+                cached_l0_mutation_count: AtomicUsize::new(0),
+                cached_l0_estimated_size: AtomicUsize::new(0),
+                cached_wal_lsn: AtomicU64::new(0),
             }),
         })
     }

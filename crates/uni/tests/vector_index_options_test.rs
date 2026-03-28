@@ -301,7 +301,7 @@ async fn test_uni_xervo_facade_exposed_when_catalog_configured() -> Result<()> {
         .xervo_catalog(vec![mistral_embed_alias("embed/default")])
         .build()
         .await?;
-    db.xervo()?;
+    assert!(db.xervo().is_available());
     Ok(())
 }
 

@@ -446,6 +446,18 @@ impl Transaction {
             hint: "Another commit is in progress and taking longer than expected. Your transaction is still active \u{2014} you can retry commit().",
         })?;
         let wal_lsn = writer.commit_transaction_l0(self.tx_l0.clone()).await?;
+        // Update cached metrics atomics while we still hold the writer lock
+        {
+            let l0 = writer.l0_manager.get_current();
+            let l0_guard = l0.read();
+            self.db
+                .cached_l0_mutation_count
+                .store(l0_guard.mutation_count, Ordering::Relaxed);
+            self.db
+                .cached_l0_estimated_size
+                .store(l0_guard.estimated_size, Ordering::Relaxed);
+        }
+        self.db.cached_wal_lsn.store(wal_lsn, Ordering::Relaxed);
         let version = writer.l0_manager.get_current().read().current_version;
         drop(writer);
 

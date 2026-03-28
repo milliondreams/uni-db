@@ -15,7 +15,10 @@ pub use api::hooks::{CommitHookContext, HookContext, QueryType, SessionHook};
 pub use api::multi_agent::{LeaseGuard, WriteLease, WriteLeaseProvider};
 pub use api::notifications::{CommitNotification, CommitStream, WatchBuilder};
 pub use api::prepared::{PreparedLocy, PreparedQuery};
-pub use api::schema::{IndexType, ScalarType, VectorAlgo, VectorIndexCfg, VectorMetric};
+pub use api::schema::{
+    ConstraintInfo, EdgeTypeBuilder, IndexInfo, IndexType, LabelBuilder, LabelInfo, PropertyInfo,
+    ScalarType, SchemaBuilder, VectorAlgo, VectorIndexCfg, VectorMetric,
+};
 pub use api::session::{
     AutoCommitBuilder, AutoCommitResult, ProfileBuilder, Session, SessionCapabilities,
     SessionMetrics, TransactionBuilder, WriteLeaseSummary,
@@ -87,7 +90,7 @@ pub mod xervo {
 
 pub mod locy {
     pub use crate::api::impl_locy::LocyEngine;
-    pub use crate::api::locy_result::LocyResult;
+    pub use crate::api::locy_result::{LocyExplainOutput, LocyResult};
     pub use uni_cypher::locy_ast::LocyProgram;
     pub use uni_cypher::{ParseError, parse_locy};
     pub use uni_locy::LocyResult as RawLocyResult;

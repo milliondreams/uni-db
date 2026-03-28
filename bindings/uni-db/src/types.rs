@@ -761,23 +761,17 @@ impl PyDerivedFactSet {
     /// Number of derived edges.
     #[getter]
     fn edge_count(&self) -> PyResult<usize> {
-        self.inner
-            .as_ref()
-            .map(|d| d.edges.len())
-            .ok_or_else(|| {
-                pyo3::exceptions::PyRuntimeError::new_err("DerivedFactSet already consumed")
-            })
+        self.inner.as_ref().map(|d| d.edges.len()).ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("DerivedFactSet already consumed")
+        })
     }
 
     /// Total number of derived facts.
     #[getter]
     fn fact_count(&self) -> PyResult<usize> {
-        self.inner
-            .as_ref()
-            .map(|d| d.fact_count())
-            .ok_or_else(|| {
-                pyo3::exceptions::PyRuntimeError::new_err("DerivedFactSet already consumed")
-            })
+        self.inner.as_ref().map(|d| d.fact_count()).ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("DerivedFactSet already consumed")
+        })
     }
 
     fn __repr__(&self) -> String {

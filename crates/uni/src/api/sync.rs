@@ -267,9 +267,12 @@ impl<'a> SessionSync<'a> {
 
     // ── Planning & Introspection ──────────────────────────────────────
 
-    /// Explain a Locy program.
-    pub fn explain_locy(&self, program: &str) -> Result<LocyResult> {
-        self.rt.block_on(self.session.explain_locy(program))
+    /// Explain a Locy program without executing it.
+    pub fn explain_locy(
+        &self,
+        program: &str,
+    ) -> Result<crate::api::locy_result::LocyExplainOutput> {
+        self.session.explain_locy(program)
     }
 
     // ── Prepared Statements ──────────────────────────────────────────
@@ -364,7 +367,12 @@ impl<'s, 'a> QueryBuilderSync<'s, 'a> {
     }
 
     /// Execute a mutation and return affected row count with detailed stats.
+    #[deprecated(
+        since = "0.4.0",
+        note = "Use `session.execute_with(cypher).run()` for auto-committed writes"
+    )]
     pub fn execute_mutation(self) -> Result<ExecuteResult> {
+        #[allow(deprecated)]
         self.rt.block_on(self.inner.execute_mutation())
     }
 }

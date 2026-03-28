@@ -757,11 +757,12 @@ impl Session {
     }
 
     /// Explain a Locy program's evaluation plan.
-    fn explain_locy(&self, py: Python, program: &str) -> PyResult<crate::types::PyLocyResult> {
-        let result = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(self.inner.explain_locy(program))
+    fn explain_locy(&self, py: Python, program: &str) -> PyResult<Py<PyAny>> {
+        let result = self
+            .inner
+            .explain_locy(program)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-        convert::locy_result_to_py_class(py, result)
+        convert::locy_explain_to_py(py, result)
     }
 
     /// Profile a query with operator-level statistics.
@@ -824,9 +825,7 @@ impl Session {
             epoch_secs as i64,
             ((epoch_secs.fract()) * 1_000_000_000.0) as u32,
         )
-        .ok_or_else(|| {
-            PyErr::new::<pyo3::exceptions::PyValueError, _>("Invalid timestamp")
-        })?;
+        .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>("Invalid timestamp"))?;
         pyo3_async_runtimes::tokio::get_runtime()
             .block_on(self.inner.pin_to_timestamp(ts))
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))

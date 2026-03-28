@@ -770,6 +770,27 @@ pub fn locy_result_to_py_class(
     })
 }
 
+/// Convert a `LocyExplainOutput` to a Python dict.
+pub fn locy_explain_to_py(
+    py: Python,
+    output: uni_db::api::locy_result::LocyExplainOutput,
+) -> PyResult<Py<PyAny>> {
+    let dict = PyDict::new(py);
+    dict.set_item("plan_text", &output.plan_text)?;
+    dict.set_item("strata_count", output.strata_count)?;
+    dict.set_item(
+        "rule_names",
+        pyo3::types::PyList::new(py, output.rule_names.iter().map(|s| s.as_str()))?,
+    )?;
+    dict.set_item("has_recursive_strata", output.has_recursive_strata)?;
+    dict.set_item(
+        "warnings",
+        pyo3::types::PyList::new(py, output.warnings.iter().map(|s| s.as_str()))?,
+    )?;
+    dict.set_item("command_count", output.command_count)?;
+    dict.into_py_any(py)
+}
+
 /// Convert ExplainOutput to a Python dict.
 pub fn explain_output_to_py(
     py: Python,

@@ -99,14 +99,11 @@ pub async fn execute_with_params_core(
     params: HashMap<String, Value>,
 ) -> Result<usize, String> {
     let session = db.session();
-    let mut builder = session.query_with(cypher);
+    let mut builder = session.execute_with(cypher);
     for (k, v) in params {
         builder = builder.param(&k, v);
     }
-    let result = builder
-        .execute_mutation()
-        .await
-        .map_err(|e| e.to_string())?;
+    let result = builder.run().await.map_err(|e| e.to_string())?;
     Ok(result.affected_rows())
 }
 
@@ -350,7 +347,7 @@ pub async fn xervo_embed_core(
     alias: &str,
     texts: Vec<String>,
 ) -> Result<Vec<Vec<f32>>, String> {
-    let xervo = db.xervo().map_err(|e| e.to_string())?;
+    let xervo = db.xervo();
     let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
     xervo
         .embed(alias, &text_refs)
@@ -368,7 +365,7 @@ pub async fn xervo_generate_core(
     top_p: Option<f32>,
 ) -> Result<::uni_db::api::xervo::GenerationResult, String> {
     use ::uni_db::api::xervo::{GenerationOptions, Message};
-    let xervo = db.xervo().map_err(|e| e.to_string())?;
+    let xervo = db.xervo();
     let rust_messages: Vec<Message> = messages
         .into_iter()
         .map(|(role, content)| match role.as_str() {

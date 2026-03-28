@@ -24,7 +24,7 @@ use uni_query::{ExecuteResult, QueryCursor, QueryResult, Row, Value};
 /// # Ok(())
 /// # }
 /// ```
-#[must_use = "query builders do nothing until .fetch_all(), .execute(), or .query_cursor() is called"]
+#[must_use = "query builders do nothing until .fetch_all(), .fetch_one(), or .query_cursor() is called"]
 pub struct QueryBuilder<'a> {
     db: &'a Uni,
     cypher: String,
@@ -97,6 +97,10 @@ impl<'a> QueryBuilder<'a> {
     }
 
     /// Execute a mutation (CREATE, SET, DELETE, etc.) and return affected row count.
+    #[deprecated(
+        since = "0.4.0",
+        note = "Use `session.execute_with(cypher).run()` for auto-committed writes, or `fetch_all()` for queries"
+    )]
     pub async fn execute(self) -> Result<ExecuteResult> {
         let inner = &self.db.inner;
         let before = inner.get_mutation_count().await;

@@ -449,12 +449,9 @@ impl AsyncDatabase {
     }
 
     /// Get database-wide metrics.
-    fn metrics<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let db = self.inner.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let m = db.metrics().await;
-            Python::attach(|py| convert::database_metrics_to_py(py, m))
-        })
+    fn metrics(&self, py: Python) -> PyResult<crate::types::PyDatabaseMetrics> {
+        let m = self.inner.metrics();
+        convert::database_metrics_to_py(py, m)
     }
 
     /// Get the current database configuration as a dict.
@@ -1105,9 +1102,7 @@ impl AsyncTransaction {
             } else {
                 tx.apply(dfs).await
             }
-            .map_err(|e| {
-                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
-            })?;
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
             Ok(crate::types::PyApplyResult {
                 facts_applied: result.facts_applied,
                 version_gap: result.version_gap,
@@ -1419,21 +1414,20 @@ impl AsyncSession {
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let guard = inner.lock().await;
-            let result = if let Some(params) = rust_params {
-                let mut builder = guard.execute_with(&cypher);
-                for (k, v) in params {
-                    builder = builder.param(&k, v);
-                }
-                builder
-                    .run()
-                    .await
-                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
-            } else {
-                guard
-                    .execute(&cypher)
-                    .await
-                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
-            };
+            let result =
+                if let Some(params) = rust_params {
+                    let mut builder = guard.execute_with(&cypher);
+                    for (k, v) in params {
+                        builder = builder.param(&k, v);
+                    }
+                    builder.run().await.map_err(|e| {
+                        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
+                    })?
+                } else {
+                    guard.execute(&cypher).await.map_err(|e| {
+                        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
+                    })?
+                };
             Python::attach(|py| {
                 let py_result = convert::auto_commit_result_to_py(py, result)?;
                 Ok(py_result.into_pyobject(py)?.into_any().unbind())
@@ -1571,18 +1565,18 @@ impl AsyncSession {
     /// Explain a Locy program's evaluation plan.
     fn explain_locy<'py>(&self, py: Python<'py>, program: String) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
-        // Locy future is !Send — use spawn_blocking
+        // explain_locy is now sync (compile-only, no I/O) — use spawn_blocking
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let result = tokio::task::spawn_blocking(move || {
                 tokio::runtime::Handle::current().block_on(async move {
                     let guard = inner.lock().await;
-                    guard.explain_locy(&program).await
+                    guard.explain_locy(&program)
                 })
             })
             .await
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-            Python::attach(|py| convert::locy_result_to_py_class(py, result))
+            Python::attach(|py| convert::locy_explain_to_py(py, result))
         })
     }
 
@@ -1708,9 +1702,7 @@ impl AsyncSession {
                 epoch_secs as i64,
                 ((epoch_secs.fract()) * 1_000_000_000.0) as u32,
             )
-            .ok_or_else(|| {
-                PyErr::new::<pyo3::exceptions::PyValueError, _>("Invalid timestamp")
-            })?;
+            .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>("Invalid timestamp"))?;
             let mut guard = inner.lock().await;
             guard
                 .pin_to_timestamp(ts)
@@ -1752,21 +1744,20 @@ impl AsyncSession {
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let guard = inner.lock().await;
-            let cursor = if let Some(params) = rust_params {
-                let mut builder = guard.query_with(&cypher);
-                for (k, v) in params {
-                    builder = builder.param(k, v);
-                }
-                builder
-                    .cursor()
-                    .await
-                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
-            } else {
-                guard
-                    .query_cursor(&cypher)
-                    .await
-                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
-            };
+            let cursor =
+                if let Some(params) = rust_params {
+                    let mut builder = guard.query_with(&cypher);
+                    for (k, v) in params {
+                        builder = builder.param(k, v);
+                    }
+                    builder.cursor().await.map_err(|e| {
+                        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
+                    })?
+                } else {
+                    guard.query_cursor(&cypher).await.map_err(|e| {
+                        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
+                    })?
+                };
             let columns = cursor.columns().to_vec();
             Ok(AsyncQueryCursor {
                 cursor: Arc::new(tokio::sync::Mutex::new(Some(cursor))),
@@ -1815,9 +1806,9 @@ impl AsyncSession {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let guard = inner.lock().await;
             let builder = guard.appender(&label);
-            let appender = builder.build().map_err(|e| {
-                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
-            })?;
+            let appender = builder
+                .build()
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
             Ok(crate::builders::StreamingAppender {
                 inner: std::sync::Mutex::new(Some(appender)),
             })
@@ -1900,9 +1891,7 @@ impl AsyncCommitStream {
             };
             match stream.next().await {
                 Some(n) => Ok(crate::types::PyCommitNotification::from(n)),
-                None => {
-                    Err(PyErr::new::<pyo3::exceptions::PyStopAsyncIteration, _>(""))
-                }
+                None => Err(PyErr::new::<pyo3::exceptions::PyStopAsyncIteration, _>("")),
             }
         })
     }

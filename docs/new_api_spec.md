@@ -504,7 +504,11 @@ impl Session {
     // ── Custom Functions ──
 
     /// Register a custom scalar function usable in Cypher queries.
-    pub fn register_function<F>(&mut self, name: &str, func: F) -> Result<()>
+    ///
+    /// Uses `&self` (not `&mut self`) with interior mutability (`RwLock`-protected
+    /// registry) to support `Arc<Session>` sharing in Python bindings and
+    /// concurrent access patterns.
+    pub fn register_function<F>(&self, name: &str, func: F) -> Result<()>
     where
         F: Fn(&[Value]) -> Result<Value> + Send + Sync + 'static;
 

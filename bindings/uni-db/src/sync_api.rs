@@ -256,9 +256,7 @@ impl Transaction {
         })?;
         let result = pyo3_async_runtimes::tokio::get_runtime()
             .block_on(tx.apply(dfs))
-            .map_err(|e| {
-                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
-            })?;
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
         Ok(PyApplyResult {
             facts_applied: result.facts_applied,
             version_gap: result.version_gap,
@@ -339,7 +337,10 @@ impl Transaction {
     }
 
     /// Create an apply builder for this transaction.
-    fn apply_with(slf: Py<Self>, derived: &mut PyDerivedFactSet) -> PyResult<crate::builders::PyApplyBuilder> {
+    fn apply_with(
+        slf: Py<Self>,
+        derived: &mut PyDerivedFactSet,
+    ) -> PyResult<crate::builders::PyApplyBuilder> {
         let dfs = derived.inner.take().ok_or_else(|| {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("DerivedFactSet already consumed")
         })?;
@@ -892,8 +893,7 @@ impl Database {
 
     /// Get database-wide metrics.
     fn metrics(&self, py: Python) -> PyResult<crate::types::PyDatabaseMetrics> {
-        let m = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(self.inner.metrics());
+        let m = self.inner.metrics();
         convert::database_metrics_to_py(py, m)
     }
 

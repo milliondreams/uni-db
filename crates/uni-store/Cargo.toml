@@ -33,8 +33,8 @@ metrics = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 futures = "0.3"
 lance = { workspace = true }
-lance-index = { version = "1.0.1" }
-lance-linalg = { version = "1.0.1" }
+lance-index = { version = "3.0.1" }
+lance-linalg = { version = "3.0.1" }
 lancedb = { workspace = true }
 uni-xervo = { workspace = true }
 

@@ -6905,6 +6905,13 @@ mod tests {
 
     /// Helper to create ScalarFunctionArgs from multiple scalar values.
     fn make_multi_scalar_args(scalars: Vec<ScalarValue>) -> ScalarFunctionArgs {
+        make_multi_scalar_args_with_return(scalars, DataType::LargeBinary)
+    }
+
+    fn make_multi_scalar_args_with_return(
+        scalars: Vec<ScalarValue>,
+        return_type: DataType,
+    ) -> ScalarFunctionArgs {
         use datafusion::arrow::datatypes::Field;
         use datafusion::config::ConfigOptions;
 
@@ -6918,7 +6925,7 @@ mod tests {
             args,
             arg_fields,
             number_rows: 1,
-            return_field: Arc::new(Field::new("result", DataType::LargeBinary, true)),
+            return_field: Arc::new(Field::new("result", return_type, true)),
             config_options: Arc::new(ConfigOptions::default()),
         }
     }
@@ -7003,10 +7010,13 @@ mod tests {
         element: &serde_json::Value,
         list: &serde_json::Value,
     ) -> ScalarFunctionArgs {
-        make_multi_scalar_args(vec![
-            ScalarValue::LargeBinary(Some(json_to_cv_bytes(element))),
-            ScalarValue::LargeBinary(Some(json_to_cv_bytes(list))),
-        ])
+        make_multi_scalar_args_with_return(
+            vec![
+                ScalarValue::LargeBinary(Some(json_to_cv_bytes(element))),
+                ScalarValue::LargeBinary(Some(json_to_cv_bytes(list))),
+            ],
+            DataType::Boolean,
+        )
     }
 
     #[test]
@@ -7034,10 +7044,13 @@ mod tests {
     #[test]
     fn test_cypher_in_null_list() {
         let udf = create_cypher_in_udf();
-        let args = make_multi_scalar_args(vec![
-            ScalarValue::LargeBinary(Some(json_to_cv_bytes(&serde_json::json!(1)))),
-            ScalarValue::LargeBinary(Some(json_to_cv_bytes(&serde_json::json!(null)))),
-        ]);
+        let args = make_multi_scalar_args_with_return(
+            vec![
+                ScalarValue::LargeBinary(Some(json_to_cv_bytes(&serde_json::json!(1)))),
+                ScalarValue::LargeBinary(Some(json_to_cv_bytes(&serde_json::json!(null)))),
+            ],
+            DataType::Boolean,
+        );
         let result = udf.invoke_with_args(args).unwrap();
         match result {
             ColumnarValue::Scalar(ScalarValue::Boolean(None)) => {} // null
@@ -7048,10 +7061,13 @@ mod tests {
     #[test]
     fn test_cypher_in_null_element_nonempty() {
         let udf = create_cypher_in_udf();
-        let args = make_multi_scalar_args(vec![
-            ScalarValue::LargeBinary(Some(json_to_cv_bytes(&serde_json::json!(null)))),
-            ScalarValue::LargeBinary(Some(json_to_cv_bytes(&serde_json::json!([1, 2])))),
-        ]);
+        let args = make_multi_scalar_args_with_return(
+            vec![
+                ScalarValue::LargeBinary(Some(json_to_cv_bytes(&serde_json::json!(null)))),
+                ScalarValue::LargeBinary(Some(json_to_cv_bytes(&serde_json::json!([1, 2])))),
+            ],
+            DataType::Boolean,
+        );
         let result = udf.invoke_with_args(args).unwrap();
         match result {
             ColumnarValue::Scalar(ScalarValue::Boolean(None)) => {} // null
@@ -7062,10 +7078,13 @@ mod tests {
     #[test]
     fn test_cypher_in_null_element_empty() {
         let udf = create_cypher_in_udf();
-        let args = make_multi_scalar_args(vec![
-            ScalarValue::LargeBinary(Some(json_to_cv_bytes(&serde_json::json!(null)))),
-            ScalarValue::LargeBinary(Some(json_to_cv_bytes(&serde_json::json!([])))),
-        ]);
+        let args = make_multi_scalar_args_with_return(
+            vec![
+                ScalarValue::LargeBinary(Some(json_to_cv_bytes(&serde_json::json!(null)))),
+                ScalarValue::LargeBinary(Some(json_to_cv_bytes(&serde_json::json!([])))),
+            ],
+            DataType::Boolean,
+        );
         let result = udf.invoke_with_args(args).unwrap();
         match result {
             ColumnarValue::Scalar(ScalarValue::Boolean(Some(b))) => assert!(!b),

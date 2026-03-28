@@ -3580,7 +3580,7 @@ impl HybridPhysicalPlanner {
         let left_plan = self.plan_internal(left, all_properties)?;
         let right_plan = self.plan_internal(right, all_properties)?;
 
-        let union_plan = Arc::new(UnionExec::new(vec![left_plan, right_plan]));
+        let union_plan = UnionExec::try_new(vec![left_plan, right_plan])?;
 
         // UNION (without ALL) requires deduplication
         if !all {
@@ -3839,7 +3839,7 @@ impl HybridPhysicalPlanner {
                 &partition_by_physical,
                 &order_by_physical,
                 window_frame,
-                input_schema.as_ref(),
+                input_schema.clone(),
                 false, // ignore_nulls
                 *distinct,
                 None, // filter

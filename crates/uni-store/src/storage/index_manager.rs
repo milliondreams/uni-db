@@ -10,6 +10,7 @@ use arrow_array::UInt64Array;
 use chrono::{DateTime, Utc};
 use futures::TryStreamExt;
 use lance::index::vector::VectorIndexParams;
+use lance_index::progress::IndexBuildProgress;
 use lance_index::scalar::{InvertedIndexParams, ScalarIndexParams};
 use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_index::vector::ivf::IvfBuildParams;
@@ -21,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tracing::{info, instrument, warn};
+use tracing::{debug, info, instrument, warn};
 use uni_common::core::id::Vid;
 use uni_common::core::schema::{
     DistanceMetric, FullTextIndexConfig, IndexDefinition, InvertedIndexConfig, JsonFtsIndexConfig,
@@ -34,6 +35,56 @@ use uni_common::core::schema::{
 /// Allows only alphanumeric characters and underscores.
 fn is_valid_column_name(name: &str) -> bool {
     !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_')
+}
+
+/// Tracing-based progress reporter for Lance index builds.
+///
+/// Emits structured log events at each stage boundary, enabling
+/// observability into index build duration and progress.
+#[derive(Debug)]
+pub struct TracingIndexProgress {
+    index_name: String,
+}
+
+impl TracingIndexProgress {
+    pub fn arc(index_name: &str) -> Arc<dyn IndexBuildProgress> {
+        Arc::new(Self {
+            index_name: index_name.to_string(),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl IndexBuildProgress for TracingIndexProgress {
+    async fn stage_start(&self, stage: &str, total: Option<u64>, unit: &str) -> lance::Result<()> {
+        info!(
+            index = %self.index_name,
+            stage,
+            ?total,
+            unit,
+            "Index build stage started"
+        );
+        Ok(())
+    }
+
+    async fn stage_progress(&self, stage: &str, completed: u64) -> lance::Result<()> {
+        debug!(
+            index = %self.index_name,
+            stage,
+            completed,
+            "Index build progress"
+        );
+        Ok(())
+    }
+
+    async fn stage_complete(&self, stage: &str) -> lance::Result<()> {
+        info!(
+            index = %self.index_name,
+            stage,
+            "Index build stage complete"
+        );
+        Ok(())
+    }
 }
 
 /// Status of an index rebuild task.
@@ -205,20 +256,28 @@ impl IndexManager {
                 };
 
                 // Ignore errors during creation if dataset is empty or similar, but try
-                if let Err(e) = lance_ds
-                    .create_index(
-                        &[property],
-                        IndexType::Vector,
-                        Some(config.name.clone()),
-                        &params,
-                        true,
-                    )
+                let progress = TracingIndexProgress::arc(&config.name);
+                match lance_ds
+                    .create_index_builder(&[property], IndexType::Vector, &params)
+                    .name(config.name.clone())
+                    .replace(true)
+                    .progress(progress)
                     .await
                 {
-                    warn!(
-                        "Failed to create physical vector index (dataset might be empty): {}",
-                        e
-                    );
+                    Ok(metadata) => {
+                        info!(
+                            index_name = %metadata.name,
+                            index_uuid = %metadata.uuid,
+                            dataset_version = metadata.dataset_version,
+                            "Vector index created"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to create physical vector index (dataset might be empty): {}",
+                            e
+                        );
+                    }
                 }
             }
             Err(e) => {
@@ -258,20 +317,32 @@ impl IndexManager {
             Ok(mut lance_ds) => {
                 let columns: Vec<&str> = properties.iter().map(|s| s.as_str()).collect();
 
-                if let Err(e) = lance_ds
-                    .create_index(
+                let progress = TracingIndexProgress::arc(&config.name);
+                match lance_ds
+                    .create_index_builder(
                         &columns,
                         IndexType::Scalar,
-                        Some(config.name.clone()),
                         &ScalarIndexParams::default(),
-                        true,
                     )
+                    .name(config.name.clone())
+                    .replace(true)
+                    .progress(progress)
                     .await
                 {
-                    warn!(
-                        "Failed to create physical scalar index (dataset might be empty): {}",
-                        e
-                    );
+                    Ok(metadata) => {
+                        info!(
+                            index_name = %metadata.name,
+                            index_uuid = %metadata.uuid,
+                            dataset_version = metadata.dataset_version,
+                            "Scalar index created"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to create physical scalar index (dataset might be empty): {}",
+                            e
+                        );
+                    }
                 }
             }
             Err(e) => {
@@ -313,20 +384,28 @@ impl IndexManager {
                 let fts_params =
                     InvertedIndexParams::default().with_position(config.with_positions);
 
-                if let Err(e) = lance_ds
-                    .create_index(
-                        &columns,
-                        IndexType::Inverted,
-                        Some(config.name.clone()),
-                        &fts_params,
-                        true,
-                    )
+                let progress = TracingIndexProgress::arc(&config.name);
+                match lance_ds
+                    .create_index_builder(&columns, IndexType::Inverted, &fts_params)
+                    .name(config.name.clone())
+                    .replace(true)
+                    .progress(progress)
                     .await
                 {
-                    warn!(
-                        "Failed to create physical FTS index (dataset might be empty): {}",
-                        e
-                    );
+                    Ok(metadata) => {
+                        info!(
+                            index_name = %metadata.name,
+                            index_uuid = %metadata.uuid,
+                            dataset_version = metadata.dataset_version,
+                            "FTS index created"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to create physical FTS index (dataset might be empty): {}",
+                            e
+                        );
+                    }
                 }
             }
             Err(e) => {
@@ -370,20 +449,28 @@ impl IndexManager {
                 let fts_params =
                     InvertedIndexParams::default().with_position(config.with_positions);
 
-                if let Err(e) = lance_ds
-                    .create_index(
-                        &[column],
-                        IndexType::Inverted,
-                        Some(config.name.clone()),
-                        &fts_params,
-                        true,
-                    )
+                let progress = TracingIndexProgress::arc(&config.name);
+                match lance_ds
+                    .create_index_builder(&[column.as_str()], IndexType::Inverted, &fts_params)
+                    .name(config.name.clone())
+                    .replace(true)
+                    .progress(progress)
                     .await
                 {
-                    warn!(
-                        "Failed to create physical JSON FTS index (dataset might be empty): {}",
-                        e
-                    );
+                    Ok(metadata) => {
+                        info!(
+                            index_name = %metadata.name,
+                            index_uuid = %metadata.uuid,
+                            dataset_version = metadata.dataset_version,
+                            "JSON FTS index created"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to create physical JSON FTS index (dataset might be empty): {}",
+                            e
+                        );
+                    }
                 }
             }
             Err(e) => {
@@ -467,17 +554,25 @@ impl IndexManager {
             // Convert properties to slice of &str
             let columns: Vec<&str> = properties.iter().map(|s| s.as_str()).collect();
 
-            if let Err(e) = ds
-                .create_index(
-                    &columns,
-                    IndexType::Scalar,
-                    Some(index_name.clone()),
-                    &ScalarIndexParams::default(),
-                    true,
-                )
+            let progress = TracingIndexProgress::arc(&index_name);
+            match ds
+                .create_index_builder(&columns, IndexType::Scalar, &ScalarIndexParams::default())
+                .name(index_name.clone())
+                .replace(true)
+                .progress(progress)
                 .await
             {
-                warn!("Failed to create physical composite index: {}", e);
+                Ok(metadata) => {
+                    info!(
+                        index_name = %metadata.name,
+                        index_uuid = %metadata.uuid,
+                        dataset_version = metadata.dataset_version,
+                        "Composite index created"
+                    );
+                }
+                Err(e) => {
+                    warn!("Failed to create physical composite index: {}", e);
+                }
             }
 
             let config = ScalarIndexConfig {

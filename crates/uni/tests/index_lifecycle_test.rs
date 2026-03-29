@@ -116,7 +116,7 @@ async fn test_bulk_sync_sets_metadata() -> Result<()> {
     // Bulk load some data with sync index rebuild
     let mut bulk = db
         .session()
-        .bulk_writer()?
+        .bulk_writer()
         .defer_scalar_indexes(true)
         .async_indexes(false)
         .build()?;

@@ -93,6 +93,14 @@ fn _uni_db(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<types::PyLocyResult>()?;
     m.add_class::<types::PyCompiledProgram>()?;
 
+    // Query result types (Phase 1)
+    m.add_class::<types::PyQueryResult>()?;
+    m.add_class::<types::PyQueryMetrics>()?;
+    m.add_class::<types::PyQueryWarning>()?;
+    m.add_class::<types::PyExplainOutput>()?;
+    m.add_class::<types::PyProfileOutput>()?;
+    m.add_class::<types::PyLocyExplainOutput>()?;
+
     // New result types
     m.add_class::<types::PyAutoCommitResult>()?;
     m.add_class::<types::PyExecuteResult>()?;
@@ -110,7 +118,11 @@ fn _uni_db(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<types::IndexRebuildTaskInfo>()?;
     m.add_class::<types::IndexDefinitionInfo>()?;
 
+    // Compaction
+    m.add_class::<types::PyCompactionStats>()?;
+
     // Session/Transaction result types
+    m.add_class::<types::PyRulePromotionError>()?;
     m.add_class::<types::PyCommitResult>()?;
     m.add_class::<types::PyCommitNotification>()?;
     m.add_class::<types::PySessionCapabilities>()?;

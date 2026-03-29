@@ -93,6 +93,42 @@ pub struct UniInner {
     pub(crate) cached_wal_lsn: AtomicU64,
 }
 
+/// Write throttle pressure as a value in 0.0–1.0.
+///
+/// Indicates how much back-pressure the storage layer is exerting.
+/// 0.0 means no throttling; 1.0 means fully throttled.
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+pub struct ThrottlePressure(f64);
+
+impl ThrottlePressure {
+    /// Create a new throttle pressure value, clamped to 0.0–1.0.
+    pub fn new(value: f64) -> Self {
+        Self(value.clamp(0.0, 1.0))
+    }
+
+    /// The raw pressure value (0.0–1.0).
+    pub fn value(&self) -> f64 {
+        self.0
+    }
+
+    /// Returns `true` if any throttle pressure is active.
+    pub fn is_throttled(&self) -> bool {
+        self.0 > 0.0
+    }
+}
+
+impl std::fmt::Display for ThrottlePressure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:.1}%", self.0 * 100.0)
+    }
+}
+
+impl Default for ThrottlePressure {
+    fn default() -> Self {
+        Self(0.0)
+    }
+}
+
 /// Snapshot of database-level metrics.
 #[derive(Debug, Clone)]
 pub struct DatabaseMetrics {
@@ -101,7 +137,7 @@ pub struct DatabaseMetrics {
     /// Estimated L0 buffer size in bytes.
     pub l0_estimated_size_bytes: usize,
     /// Schema version number.
-    pub schema_version: u32,
+    pub schema_version: u64,
     /// Time since the database instance was created.
     pub uptime: Duration,
     /// Number of currently active sessions.
@@ -109,11 +145,11 @@ pub struct DatabaseMetrics {
     /// Number of L1 compaction runs completed (0 until storage instrumentation).
     pub l1_run_count: usize,
     /// Write throttle pressure (0.0–1.0, 0 until instrumentation).
-    pub write_throttle_pressure: f64,
-    /// Current compaction status, if any.
-    pub compaction_status: Option<String>,
+    pub write_throttle_pressure: ThrottlePressure,
+    /// Current compaction status.
+    pub compaction_status: uni_store::CompactionStatus,
     /// WAL size in bytes (0 until storage instrumentation).
-    pub wal_size_bytes: usize,
+    pub wal_size_bytes: u64,
     /// Highest WAL log sequence number that has been flushed (0 when no WAL is configured).
     pub wal_lsn: u64,
     /// Total queries executed across all sessions.
@@ -281,17 +317,18 @@ impl Uni {
     /// L0 metrics (`l0_mutation_count`, `l0_estimated_size_bytes`, `wal_lsn`)
     /// reflect the state as of the last successful commit.
     pub fn metrics(&self) -> DatabaseMetrics {
-        let schema_version = self.inner.schema.schema().schema_version;
+        let schema_version = self.inner.schema.schema().schema_version as u64;
+        let compaction_status = self.inner.storage.compaction_status().unwrap_or_default();
         DatabaseMetrics {
             l0_mutation_count: self.inner.cached_l0_mutation_count.load(Ordering::Relaxed),
             l0_estimated_size_bytes: self.inner.cached_l0_estimated_size.load(Ordering::Relaxed),
             schema_version,
             uptime: self.inner.start_time.elapsed(),
             active_sessions: self.inner.active_session_count.load(Ordering::Relaxed),
-            l1_run_count: 0,
-            write_throttle_pressure: 0.0,
-            compaction_status: None,
-            wal_size_bytes: 0,
+            l1_run_count: compaction_status.l1_runs,
+            write_throttle_pressure: ThrottlePressure::default(),
+            compaction_status,
+            wal_size_bytes: 0u64,
             wal_lsn: self.inner.cached_wal_lsn.load(Ordering::Relaxed),
             total_queries: self.inner.total_queries.load(Ordering::Relaxed),
             total_commits: self.inner.total_commits.load(Ordering::Relaxed),
@@ -326,6 +363,7 @@ impl Uni {
     }
 
     /// Returns the procedure registry for registering test procedures.
+    #[doc(hidden)]
     pub fn procedure_registry(&self) -> &Arc<uni_query::ProcedureRegistry> {
         &self.inner.procedure_registry
     }

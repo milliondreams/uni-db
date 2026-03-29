@@ -72,7 +72,7 @@ async fn setup_db() -> Result<(Uni, tempfile::TempDir)> {
 async fn test_bulk_insert_vertices() -> Result<()> {
     let (db, _temp) = setup_db().await?;
 
-    let mut bulk = db.session().bulk_writer()?.batch_size(100).build()?;
+    let mut bulk = db.session().bulk_writer().batch_size(100).build()?;
 
     // Insert 250 vertices (will trigger multiple flushes with batch_size=100)
     let mut props = Vec::new();
@@ -104,7 +104,7 @@ async fn test_bulk_insert_edges() -> Result<()> {
     let (db, _temp) = setup_db().await?;
 
     // First create some vertices
-    let mut bulk = db.session().bulk_writer()?.batch_size(100).build()?;
+    let mut bulk = db.session().bulk_writer().batch_size(100).build()?;
 
     let mut person_props = Vec::new();
     for i in 0..100 {
@@ -158,7 +158,7 @@ async fn test_bulk_insert_edges() -> Result<()> {
 async fn test_bulk_abort_clears_buffers() -> Result<()> {
     let (db, _temp) = setup_db().await?;
 
-    let mut bulk = db.session().bulk_writer()?.batch_size(1000).build()?; // Large batch to avoid flush
+    let mut bulk = db.session().bulk_writer().batch_size(1000).build()?; // Large batch to avoid flush
 
     // Insert vertices (won't be flushed due to large batch size)
     let mut props = Vec::new();
@@ -200,7 +200,7 @@ async fn test_bulk_progress_callback() -> Result<()> {
 
     let mut bulk = db
         .session()
-        .bulk_writer()?
+        .bulk_writer()
         .batch_size(50)
         .on_progress(move |_progress| {
             progress_count_clone.fetch_add(1, Ordering::SeqCst);
@@ -227,7 +227,7 @@ async fn test_bulk_progress_callback() -> Result<()> {
 async fn test_bulk_edge_with_properties() -> Result<()> {
     let (db, _temp) = setup_db().await?;
 
-    let mut bulk = db.session().bulk_writer()?.build()?;
+    let mut bulk = db.session().bulk_writer().build()?;
 
     // Create two persons
     let p1_props = vec![{
@@ -275,7 +275,7 @@ async fn test_bulk_async_indexes_returns_immediately() -> Result<()> {
 
     let mut bulk = db
         .session()
-        .bulk_writer()?
+        .bulk_writer()
         .async_indexes(true)
         .batch_size(100)
         .build()?;
@@ -326,7 +326,7 @@ async fn test_bulk_sync_indexes_blocks() -> Result<()> {
 
     let mut bulk = db
         .session()
-        .bulk_writer()?
+        .bulk_writer()
         .async_indexes(false) // Default behavior
         .batch_size(100)
         .build()?;
@@ -442,7 +442,7 @@ async fn test_bulk_not_null_constraint() -> Result<()> {
 
     let mut bulk = db
         .session()
-        .bulk_writer()?
+        .bulk_writer()
         .validate_constraints(true)
         .build()?;
 
@@ -472,7 +472,7 @@ async fn test_bulk_not_null_constraint_with_explicit_null() -> Result<()> {
 
     let mut bulk = db
         .session()
-        .bulk_writer()?
+        .bulk_writer()
         .validate_constraints(true)
         .build()?;
 
@@ -496,7 +496,7 @@ async fn test_bulk_unique_constraint_in_batch() -> Result<()> {
 
     let mut bulk = db
         .session()
-        .bulk_writer()?
+        .bulk_writer()
         .validate_constraints(true)
         .build()?;
 
@@ -534,7 +534,7 @@ async fn test_bulk_unique_constraint_across_batches() -> Result<()> {
 
     let mut bulk = db
         .session()
-        .bulk_writer()?
+        .bulk_writer()
         .validate_constraints(true)
         .build()?;
 
@@ -568,7 +568,7 @@ async fn test_bulk_unique_constraint_across_batches() -> Result<()> {
 async fn test_bulk_abort_after_flush_rollback() -> Result<()> {
     let (db, _temp) = setup_db().await?;
 
-    let mut bulk = db.session().bulk_writer()?.batch_size(10).build()?; // Small batch to force flush
+    let mut bulk = db.session().bulk_writer().batch_size(10).build()?; // Small batch to force flush
 
     // Insert enough data to trigger a flush (batch_size=10)
     let mut props = Vec::new();
@@ -611,7 +611,7 @@ async fn test_bulk_buffer_limit_checkpoint() -> Result<()> {
     // This forces checkpoint based on buffer size, not batch count
     let mut bulk = db
         .session()
-        .bulk_writer()?
+        .bulk_writer()
         .batch_size(100_000) // Won't flush based on count
         .max_buffer_size_bytes(10 * 1024) // 10KB limit
         .build()?;
@@ -652,7 +652,7 @@ async fn test_bulk_constraint_validation_disabled() -> Result<()> {
     // Note: Arrow/LanceDB still enforces schema-level nullability, so we can't skip NOT NULL
     let mut bulk = db
         .session()
-        .bulk_writer()?
+        .bulk_writer()
         .validate_constraints(false)
         .build()?;
 

@@ -32,8 +32,8 @@ impl<'a> InnerLocyBuilder<'a> {
     }
 
     /// Bind a single parameter.  The name should not include the `$` prefix.
-    pub fn param(mut self, name: &str, value: impl Into<Value>) -> Self {
-        self.config.params.insert(name.to_string(), value.into());
+    pub fn param(mut self, name: impl Into<String>, value: impl Into<Value>) -> Self {
+        self.config.params.insert(name.into(), value.into());
         self
     }
 
@@ -105,8 +105,8 @@ impl<'a> LocyBuilder<'a> {
     }
 
     /// Bind a single parameter.
-    pub fn param(mut self, name: &str, value: impl Into<Value>) -> Self {
-        self.config.params.insert(name.to_string(), value.into());
+    pub fn param(mut self, name: impl Into<String>, value: impl Into<Value>) -> Self {
+        self.config.params.insert(name.into(), value.into());
         self
     }
 
@@ -184,8 +184,8 @@ impl<'a> TxLocyBuilder<'a> {
     }
 
     /// Bind a single parameter.
-    pub fn param(mut self, name: &str, value: impl Into<Value>) -> Self {
-        self.config.params.insert(name.to_string(), value.into());
+    pub fn param(mut self, name: impl Into<String>, value: impl Into<Value>) -> Self {
+        self.config.params.insert(name.into(), value.into());
         self
     }
 

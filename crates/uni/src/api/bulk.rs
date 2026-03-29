@@ -43,6 +43,42 @@ use uni_store::storage::main_vertex::MainVertexDataset;
 use uni_store::storage::{IndexManager, IndexRebuildManager};
 use uuid::Uuid;
 
+/// Trait for types that can be converted to property maps for bulk insertion.
+///
+/// Enables `insert_vertices` to accept both `Vec<HashMap<String, Value>>`
+/// and `RecordBatch` (Arrow columnar data).
+pub trait IntoArrow {
+    /// Convert to a vector of property maps.
+    fn into_property_maps(self) -> Vec<HashMap<String, Value>>;
+}
+
+impl IntoArrow for Vec<HashMap<String, Value>> {
+    fn into_property_maps(self) -> Vec<HashMap<String, Value>> {
+        self
+    }
+}
+
+impl IntoArrow for arrow_array::RecordBatch {
+    fn into_property_maps(self) -> Vec<HashMap<String, Value>> {
+        let schema = self.schema();
+        let num_rows = self.num_rows();
+        let mut rows = Vec::with_capacity(num_rows);
+        for row_idx in 0..num_rows {
+            let mut props = HashMap::with_capacity(schema.fields().len());
+            for (col_idx, field) in schema.fields().iter().enumerate() {
+                let col = self.column(col_idx);
+                let value =
+                    uni_store::storage::arrow_convert::arrow_to_value(col.as_ref(), row_idx, None);
+                if !value.is_null() {
+                    props.insert(field.name().clone(), value);
+                }
+            }
+            rows.push(props);
+        }
+        rows
+    }
+}
+
 /// Builder for configuring a bulk writer.
 pub struct BulkWriterBuilder {
     db: Arc<UniInner>,
@@ -50,19 +86,48 @@ pub struct BulkWriterBuilder {
     progress_callback: Option<Box<dyn Fn(BulkProgress) + Send>>,
     /// Session write guard — released when the BulkWriter is committed/aborted/dropped.
     session_write_guard: Option<Arc<AtomicBool>>,
+    /// If true, the write guard was already acquired by the caller (e.g. AppenderBuilder).
+    guard_pre_acquired: bool,
+    /// If true, the session is pinned to a read-only snapshot.
+    is_pinned: bool,
+    /// Session ID for error messages.
+    session_id: String,
 }
 
 impl BulkWriterBuilder {
-    /// Create a new bulk writer builder bound to a session write guard.
+    /// Create a new bulk writer builder with a pre-acquired write guard.
     ///
-    /// The guard is released when the resulting `BulkWriter` is committed,
-    /// aborted, or dropped.
+    /// Used by `AppenderBuilder` which acquires the guard before creating the builder.
     pub(crate) fn new_with_guard(db: Arc<UniInner>, guard: Arc<AtomicBool>) -> Self {
         Self {
             db,
             config: BulkConfig::default(),
             progress_callback: None,
             session_write_guard: Some(guard),
+            guard_pre_acquired: true,
+            is_pinned: false,
+            session_id: String::new(),
+        }
+    }
+
+    /// Create a new bulk writer builder with deferred guard acquisition.
+    ///
+    /// The guard is acquired in [`build()`](Self::build) rather than at creation time,
+    /// so that `Session::bulk_writer()` is infallible.
+    pub(crate) fn new_deferred(
+        db: Arc<UniInner>,
+        guard: Arc<AtomicBool>,
+        session_id: String,
+        is_pinned: bool,
+    ) -> Self {
+        Self {
+            db,
+            config: BulkConfig::default(),
+            progress_callback: None,
+            session_write_guard: Some(guard),
+            guard_pre_acquired: false,
+            is_pinned,
+            session_id,
         }
     }
 
@@ -132,8 +197,32 @@ impl BulkWriterBuilder {
     ///
     /// # Errors
     ///
-    /// Returns an error if the database is not writable.
+    /// Returns an error if:
+    /// - The session is pinned to a read-only snapshot
+    /// - Another write context is already active on the session
+    /// - The database is not writable
     pub fn build(self) -> Result<BulkWriter> {
+        // Check pinned state (deferred from Session::bulk_writer)
+        if self.is_pinned {
+            return Err(UniError::ReadOnly {
+                operation: "bulk_writer".to_string(),
+            }
+            .into());
+        }
+
+        // Acquire write guard if not pre-acquired (deferred from Session::bulk_writer)
+        if !self.guard_pre_acquired
+            && let Some(guard) = &self.session_write_guard
+            && guard
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+        {
+            return Err(UniError::WriteContextAlreadyActive {
+                session_id: self.session_id.clone(),
+                hint: "Only one Transaction, BulkWriter, or Appender can be active per Session at a time. Commit or rollback the active one first, or create a separate Session for concurrent writes.",
+            }.into());
+        }
+
         if self.db.writer.is_none() {
             // Release session guard on failure so the session isn't stuck.
             if let Some(guard) = &self.session_write_guard {
@@ -224,6 +313,9 @@ pub struct BulkStats {
     pub indexes_pending: bool,
 }
 
+/// Alias for [`BulkStats`] (spec §8.1 compatibility).
+pub type BulkStatsAccumulator = BulkStats;
+
 /// Edge data for bulk insertion.
 ///
 /// Contains source/destination vertex IDs and properties.
@@ -279,6 +371,22 @@ pub struct BulkWriter {
 }
 
 impl BulkWriter {
+    /// Returns a snapshot of the current bulk load statistics.
+    /// Updated after each batch flush.
+    pub fn stats(&self) -> &BulkStats {
+        &self.stats
+    }
+
+    /// Returns the set of vertex labels that have been written to.
+    pub fn touched_labels(&self) -> Vec<String> {
+        self.touched_labels.iter().cloned().collect()
+    }
+
+    /// Returns the set of edge types that have been written to.
+    pub fn touched_edge_types(&self) -> Vec<String> {
+        self.touched_edge_types.iter().cloned().collect()
+    }
+
     /// Returns the current timestamp in microseconds since Unix epoch.
     fn get_current_timestamp_micros(&self) -> i64 {
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -303,8 +411,9 @@ impl BulkWriter {
     pub async fn insert_vertices(
         &mut self,
         label: &str,
-        vertices: Vec<HashMap<String, Value>>,
+        vertices: impl IntoArrow,
     ) -> Result<Vec<Vid>> {
+        let vertices = vertices.into_property_maps();
         let schema = self.db.schema.schema();
         // Validate label exists in schema
         schema

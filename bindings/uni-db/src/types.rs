@@ -4,6 +4,207 @@
 //! Python data classes for query results, schema info, and statistics.
 
 use pyo3::prelude::*;
+use pyo3::types::PyList;
+
+// ============================================================================
+// Query result types (Phase 1)
+// ============================================================================
+
+/// Query performance metrics returned with every query result.
+#[pyclass(get_all, name = "QueryMetrics")]
+#[derive(Debug, Clone)]
+pub struct PyQueryMetrics {
+    /// Time spent parsing the query in milliseconds.
+    pub parse_time_ms: f64,
+    /// Time spent planning the query in milliseconds.
+    pub plan_time_ms: f64,
+    /// Time spent executing the query in milliseconds.
+    pub exec_time_ms: f64,
+    /// Total query time in milliseconds.
+    pub total_time_ms: f64,
+    /// Number of rows in the result set.
+    pub rows_returned: usize,
+    /// Number of rows scanned during execution.
+    pub rows_scanned: usize,
+    /// Number of bytes read from storage.
+    pub bytes_read: usize,
+    /// Whether the query plan was served from cache.
+    pub plan_cache_hit: bool,
+    /// Number of L0 (in-memory) reads.
+    pub l0_reads: usize,
+    /// Number of persistent storage reads.
+    pub storage_reads: usize,
+    /// Number of cache hits during execution.
+    pub cache_hits: usize,
+}
+
+#[pymethods]
+impl PyQueryMetrics {
+    fn __repr__(&self) -> String {
+        format!(
+            "QueryMetrics(total={:.2}ms, rows_returned={}, rows_scanned={})",
+            self.total_time_ms, self.rows_returned, self.rows_scanned
+        )
+    }
+}
+
+/// A query warning emitted during execution (e.g., missing index).
+#[pyclass(get_all, name = "QueryWarning")]
+#[derive(Debug, Clone)]
+pub struct PyQueryWarning {
+    /// Warning code string (e.g., "index_unavailable", "no_index_for_filter").
+    pub code: String,
+    /// Human-readable warning message.
+    pub message: String,
+}
+
+#[pymethods]
+impl PyQueryWarning {
+    fn __repr__(&self) -> String {
+        format!(
+            "QueryWarning(code='{}', message='{}')",
+            self.code, self.message
+        )
+    }
+}
+
+/// Rich query result containing rows, metrics, warnings, and column names.
+///
+/// Implements the sequence protocol for backward compatibility:
+/// `for row in result`, `result[0]`, `len(result)` all work.
+#[pyclass(name = "QueryResult")]
+pub struct PyQueryResult {
+    pub(crate) rows: Vec<Py<PyAny>>,
+    #[pyo3(get)]
+    pub metrics: Py<PyQueryMetrics>,
+    #[pyo3(get)]
+    pub warnings: Vec<PyQueryWarning>,
+    #[pyo3(get)]
+    pub columns: Vec<String>,
+}
+
+#[pymethods]
+impl PyQueryResult {
+    /// Return the list of row dicts.
+    #[getter]
+    fn rows(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
+        let list = PyList::new(py, self.rows.iter().map(|r| r.bind(py)))?;
+        Ok(list.unbind())
+    }
+
+    fn __len__(&self) -> usize {
+        self.rows.len()
+    }
+
+    fn __getitem__(&self, py: Python<'_>, idx: isize) -> PyResult<Py<PyAny>> {
+        let len = self.rows.len() as isize;
+        let actual = if idx < 0 { len + idx } else { idx };
+        if actual < 0 || actual >= len {
+            return Err(pyo3::exceptions::PyIndexError::new_err(
+                "index out of range",
+            ));
+        }
+        Ok(self.rows[actual as usize].clone_ref(py))
+    }
+
+    fn __iter__(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let list = PyList::new(py, slf.rows.iter().map(|r| r.bind(py)))?;
+        list.call_method0("__iter__").map(|i| i.unbind())
+    }
+
+    fn __bool__(&self) -> bool {
+        !self.rows.is_empty()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "QueryResult(rows={}, columns={:?})",
+            self.rows.len(),
+            self.columns
+        )
+    }
+}
+
+/// Typed output from `session.explain()`.
+#[pyclass(get_all, name = "ExplainOutput")]
+#[derive(Debug)]
+pub struct PyExplainOutput {
+    /// Human-readable query plan text.
+    pub plan_text: String,
+    /// Warnings from the planner.
+    pub warnings: Vec<String>,
+    /// Cost estimates as a dict with `estimated_rows` and `estimated_cost`.
+    pub cost_estimates: Py<PyAny>,
+    /// List of index usage details.
+    pub index_usage: Py<PyAny>,
+    /// List of index suggestions from the planner.
+    pub suggestions: Py<PyAny>,
+}
+
+#[pymethods]
+impl PyExplainOutput {
+    fn __repr__(&self) -> String {
+        format!(
+            "ExplainOutput(warnings={}, plan_text='{}...')",
+            self.warnings.len(),
+            &self.plan_text.chars().take(60).collect::<String>()
+        )
+    }
+}
+
+/// Typed output from `session.profile()`.
+#[pyclass(get_all, name = "ProfileOutput")]
+#[derive(Debug)]
+pub struct PyProfileOutput {
+    /// Total execution time in milliseconds.
+    pub total_time_ms: u64,
+    /// Peak memory usage in bytes.
+    pub peak_memory_bytes: usize,
+    /// Human-readable query plan text.
+    pub plan_text: String,
+    /// Operator-level statistics (list of dicts).
+    pub operators: Py<PyAny>,
+}
+
+#[pymethods]
+impl PyProfileOutput {
+    fn __repr__(&self) -> String {
+        format!(
+            "ProfileOutput(total_time={}ms, peak_memory={}B)",
+            self.total_time_ms, self.peak_memory_bytes
+        )
+    }
+}
+
+/// Typed output from `session.explain_locy()`.
+#[pyclass(get_all, name = "LocyExplainOutput")]
+#[derive(Debug, Clone)]
+pub struct PyLocyExplainOutput {
+    /// Human-readable evaluation plan text.
+    pub plan_text: String,
+    /// Number of strata in the program.
+    pub strata_count: usize,
+    /// Names of all rules in the program.
+    pub rule_names: Vec<String>,
+    /// Whether any stratum is recursive.
+    pub has_recursive_strata: bool,
+    /// Warnings from the planner.
+    pub warnings: Vec<String>,
+    /// Number of Cypher commands in the program.
+    pub command_count: usize,
+}
+
+#[pymethods]
+impl PyLocyExplainOutput {
+    fn __repr__(&self) -> String {
+        format!(
+            "LocyExplainOutput(strata={}, rules={}, recursive={})",
+            self.strata_count,
+            self.rule_names.len(),
+            self.has_recursive_strata
+        )
+    }
+}
 
 /// Information about a vertex label in the schema.
 #[pyclass(get_all)]
@@ -511,6 +712,32 @@ pub struct PySessionCapabilities {
     pub isolation: String,
     /// Whether commit notifications are available.
     pub has_notifications: bool,
+    /// Write lease configuration, if any (e.g., "local", "dynamodb:table_name").
+    pub write_lease: Option<String>,
+}
+
+/// Statistics from a compaction operation.
+#[pyclass(get_all, name = "CompactionStats")]
+#[derive(Debug, Clone)]
+pub struct PyCompactionStats {
+    /// Number of files compacted.
+    pub files_compacted: usize,
+    /// Total bytes before compaction.
+    pub bytes_before: u64,
+    /// Total bytes after compaction.
+    pub bytes_after: u64,
+    /// Duration in seconds.
+    pub duration_secs: f64,
+}
+
+#[pymethods]
+impl PyCompactionStats {
+    fn __repr__(&self) -> String {
+        format!(
+            "CompactionStats(files={}, before={}B, after={}B, duration={:.2}s)",
+            self.files_compacted, self.bytes_before, self.bytes_after, self.duration_secs
+        )
+    }
 }
 
 #[pymethods]
@@ -526,6 +753,27 @@ impl PySessionCapabilities {
 // ============================================================================
 // Transaction commit result
 // ============================================================================
+
+/// A rule promotion error from a transaction commit.
+#[pyclass(get_all, name = "RulePromotionError")]
+#[derive(Debug, Clone)]
+pub struct PyRulePromotionError {
+    /// The rule text that failed.
+    pub rule_text: String,
+    /// The error message.
+    pub error: String,
+}
+
+#[pymethods]
+impl PyRulePromotionError {
+    fn __repr__(&self) -> String {
+        format!(
+            "RulePromotionError(rule='{}...', error='{}')",
+            &self.rule_text.chars().take(40).collect::<String>(),
+            self.error
+        )
+    }
+}
 
 /// Result of committing a transaction.
 #[pyclass(name = "CommitResult")]
@@ -548,6 +796,9 @@ pub struct PyCommitResult {
     /// Duration of the commit operation in seconds.
     #[pyo3(get)]
     pub duration_secs: f64,
+    /// Rule promotion errors (empty if all rules promoted successfully).
+    #[pyo3(get)]
+    pub rule_promotion_errors: Vec<PyRulePromotionError>,
 }
 
 impl From<::uni_db::CommitResult> for PyCommitResult {
@@ -559,6 +810,14 @@ impl From<::uni_db::CommitResult> for PyCommitResult {
             started_at_version: r.started_at_version,
             wal_lsn: r.wal_lsn,
             duration_secs: r.duration.as_secs_f64(),
+            rule_promotion_errors: r
+                .rule_promotion_errors
+                .into_iter()
+                .map(|e| PyRulePromotionError {
+                    rule_text: e.rule_text,
+                    error: e.error,
+                })
+                .collect(),
         }
     }
 }
@@ -591,12 +850,14 @@ pub struct PyPreparedQuery {
 #[pymethods]
 impl PyPreparedQuery {
     /// Execute the prepared query with optional parameter bindings.
+    ///
+    /// Returns a `QueryResult` with `.rows`, `.metrics`, `.warnings`, `.columns`.
     #[pyo3(signature = (params=None))]
     fn execute(
         &self,
         py: pyo3::Python,
         params: Option<std::collections::HashMap<String, pyo3::Py<pyo3::PyAny>>>,
-    ) -> pyo3::PyResult<Vec<pyo3::Py<pyo3::PyAny>>> {
+    ) -> pyo3::PyResult<PyQueryResult> {
         let rust_params: Vec<(String, ::uni_db::Value)> = if let Some(p) = params {
             p.into_iter()
                 .map(|(k, v)| {
@@ -611,14 +872,14 @@ impl PyPreparedQuery {
             .iter()
             .map(|(k, v)| (k.as_str(), v.clone()))
             .collect();
-        let mut guard = self
+        let guard = self
             .inner
             .lock()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
         let result = pyo3_async_runtimes::tokio::get_runtime()
             .block_on(guard.execute(&param_refs))
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-        crate::convert::rows_to_py(py, result.into_rows())
+        crate::convert::query_result_to_py_class(py, result)
     }
 
     /// Get the original query text.
@@ -795,6 +1056,8 @@ impl PyDerivedFactSet {
 #[derive(Debug, Clone)]
 pub struct PySessionMetrics {
     pub session_id: String,
+    /// Seconds since the session was created.
+    pub active_since_secs: f64,
     pub queries_executed: u64,
     pub locy_evaluations: u64,
     pub total_query_time_secs: f64,
@@ -836,7 +1099,7 @@ impl PyPreparedLocy {
             .lock()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
         let result = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(guard.execute())
+            .block_on(guard.execute(&[]))
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
         crate::convert::locy_result_to_py_class(py, result)
     }
@@ -877,13 +1140,13 @@ impl PyPreparedLocy {
 pub struct PyDatabaseMetrics {
     pub l0_mutation_count: usize,
     pub l0_estimated_size_bytes: usize,
-    pub schema_version: u32,
+    pub schema_version: u64,
     pub uptime_secs: f64,
     pub active_sessions: usize,
     pub l1_run_count: usize,
     pub write_throttle_pressure: f64,
-    pub compaction_status: Option<String>,
-    pub wal_size_bytes: usize,
+    pub compaction_in_progress: bool,
+    pub wal_size_bytes: u64,
     pub wal_lsn: u64,
     pub total_queries: u64,
     pub total_commits: u64,

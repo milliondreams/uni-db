@@ -171,13 +171,15 @@ impl Transaction {
 #[pymethods]
 impl Transaction {
     /// Execute a read query within this transaction.
+    ///
+    /// Returns a `QueryResult` with `.rows`, `.metrics`, `.warnings`, `.columns`.
     #[pyo3(signature = (cypher, params=None))]
     fn query(
         &self,
         py: Python,
         cypher: &str,
         params: Option<HashMap<String, Py<PyAny>>>,
-    ) -> PyResult<Vec<Py<PyAny>>> {
+    ) -> PyResult<crate::types::PyQueryResult> {
         let tx = self.check_active()?;
         let result = if let Some(p) = params {
             let mut builder = tx.query_with(cypher);
@@ -193,7 +195,7 @@ impl Transaction {
                 .block_on(tx.query(cypher))
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
         };
-        convert::rows_to_py(py, result.into_rows())
+        convert::query_result_to_py_class(py, result)
     }
 
     /// Execute a mutation query within this transaction.
@@ -380,6 +382,11 @@ impl Transaction {
     /// Check if the transaction has uncommitted changes.
     fn is_dirty(&self) -> PyResult<bool> {
         Ok(self.check_active()?.is_dirty())
+    }
+
+    /// Check if the transaction has been completed (committed or rolled back).
+    fn is_completed(&self) -> bool {
+        self.inner.is_none()
     }
 
     fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
@@ -742,8 +749,10 @@ impl Database {
             inner: self.inner.clone(),
             defer_vector_indexes: true,
             defer_scalar_indexes: true,
-            batch_size: 10_000,
+            batch_size: None,
             async_indexes: false,
+            validate_constraints: None,
+            max_buffer_size_bytes: None,
         }
     }
 
@@ -915,6 +924,11 @@ pub struct Xervo {
 
 #[pymethods]
 impl Xervo {
+    /// Check if Xervo (embedding/generation) is available for this database.
+    fn is_available(&self) -> bool {
+        self.inner.xervo().is_available()
+    }
+
     /// Embed texts using a configured model alias. Returns a list of float vectors.
     fn embed(&self, alias: &str, texts: Vec<String>) -> PyResult<Vec<Vec<f32>>> {
         pyo3_async_runtimes::tokio::get_runtime()

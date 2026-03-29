@@ -477,6 +477,120 @@ impl crate::api::UniInner {
         ))
     }
 
+    /// Execute a cursor query with a private transaction L0 buffer.
+    ///
+    /// Mirrors `execute_cursor_internal_with_config` but installs the
+    /// caller's private L0 so reads see uncommitted transaction writes.
+    pub(crate) async fn execute_cursor_internal_with_tx_l0(
+        &self,
+        cypher: &str,
+        params: HashMap<String, ApiValue>,
+        tx_l0: std::sync::Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>,
+    ) -> Result<QueryCursor> {
+        let ast = uni_cypher::parse(cypher).map_err(into_parse_error)?;
+
+        let (ast, tt_spec) = match ast {
+            uni_cypher::ast::Query::TimeTravel { query, spec } => (*query, Some(spec)),
+            other => (other, None),
+        };
+
+        if tt_spec.is_some() {
+            return Err(UniError::Query {
+                message: "Time-travel queries are not supported within transactions".to_string(),
+                query: Some(cypher.to_string()),
+            });
+        }
+
+        let planner =
+            uni_query::QueryPlanner::new(self.schema.schema().clone()).with_params(params.clone());
+        let logical_plan = planner.plan(ast).map_err(|e| into_query_error(e, cypher))?;
+
+        let mut executor = uni_query::Executor::new(self.storage.clone());
+        executor.set_config(self.config.clone());
+        executor.set_xervo_runtime(self.xervo_runtime.clone());
+        executor.set_procedure_registry(self.procedure_registry.clone());
+        if let Ok(reg) = self.custom_functions.read()
+            && !reg.is_empty()
+        {
+            executor.set_custom_functions(Arc::new(reg.clone()));
+        }
+        if let Some(w) = &self.writer {
+            executor.set_writer(w.clone());
+        }
+        executor.set_transaction_l0(tx_l0);
+
+        let projection_order = extract_projection_order(&logical_plan);
+        let projection_order_for_rows = projection_order.clone();
+        let cypher_for_error = cypher.to_string();
+        let batch_size = self.config.batch_size;
+
+        let stream = executor.execute_stream(logical_plan, self.properties.clone(), params);
+
+        let row_stream = stream
+            .map(move |batch_res| {
+                let results = batch_res.map_err(|e| {
+                    let msg = normalize_error_message(&e.to_string(), &cypher_for_error);
+                    if msg.contains("TypeError:") {
+                        UniError::Type {
+                            expected: msg,
+                            actual: String::new(),
+                        }
+                    } else if msg.starts_with("ConstraintVerificationFailed:") {
+                        UniError::Constraint { message: msg }
+                    } else {
+                        UniError::Query {
+                            message: msg,
+                            query: Some(cypher_for_error.clone()),
+                        }
+                    }
+                })?;
+
+                if results.is_empty() {
+                    return Ok(vec![]);
+                }
+
+                let columns = if let Some(order) = &projection_order_for_rows {
+                    Arc::new(order.clone())
+                } else {
+                    let mut cols: Vec<String> = results[0].keys().cloned().collect();
+                    cols.sort();
+                    Arc::new(cols)
+                };
+
+                let rows = results
+                    .into_iter()
+                    .map(|map| {
+                        let mut values = Vec::with_capacity(columns.len());
+                        for col in columns.iter() {
+                            let value = map.get(col).cloned().unwrap_or(ApiValue::Null);
+                            values.push(value);
+                        }
+                        Row::new(columns.clone(), values)
+                    })
+                    .collect::<Vec<Row>>();
+
+                Ok(rows)
+            })
+            .flat_map(
+                move |batch_res: std::result::Result<Vec<Row>, UniError>| match batch_res {
+                    Ok(rows) if batch_size > 0 => {
+                        let chunks: Vec<_> =
+                            rows.chunks(batch_size).map(|c| Ok(c.to_vec())).collect();
+                        futures::stream::iter(chunks).boxed()
+                    }
+                    other => futures::stream::iter(vec![other]).boxed(),
+                },
+            );
+
+        let columns = if let Some(order) = projection_order {
+            Arc::new(order)
+        } else {
+            Arc::new(vec![])
+        };
+
+        Ok(QueryCursor::new(columns, Box::pin(row_stream)))
+    }
+
     pub(crate) async fn execute_internal_with_config(
         &self,
         cypher: &str,

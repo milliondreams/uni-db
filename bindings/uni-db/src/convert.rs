@@ -864,6 +864,165 @@ pub fn profile_output_to_py(
     Ok(profile_dict.into())
 }
 
+// ============================================================================
+// Typed conversion functions (Phase 1) — return pyclass instances
+// ============================================================================
+
+/// Convert QueryMetrics to a typed PyQueryMetrics instance.
+pub fn query_metrics_to_py_class(
+    py: Python,
+    m: &::uni_db::QueryMetrics,
+) -> PyResult<Py<crate::types::PyQueryMetrics>> {
+    let metrics = crate::types::PyQueryMetrics {
+        parse_time_ms: m.parse_time.as_secs_f64() * 1000.0,
+        plan_time_ms: m.plan_time.as_secs_f64() * 1000.0,
+        exec_time_ms: m.exec_time.as_secs_f64() * 1000.0,
+        total_time_ms: m.total_time.as_secs_f64() * 1000.0,
+        rows_returned: m.rows_returned,
+        rows_scanned: m.rows_scanned,
+        bytes_read: m.bytes_read,
+        plan_cache_hit: m.plan_cache_hit,
+        l0_reads: m.l0_reads,
+        storage_reads: m.storage_reads,
+        cache_hits: m.cache_hits,
+    };
+    Py::new(py, metrics)
+}
+
+/// Convert a QueryWarning enum to a PyQueryWarning.
+pub fn query_warning_to_py(w: &::uni_db::QueryWarning) -> crate::types::PyQueryWarning {
+    match w {
+        ::uni_db::QueryWarning::IndexUnavailable {
+            label,
+            index_name,
+            reason,
+        } => crate::types::PyQueryWarning {
+            code: "index_unavailable".to_string(),
+            message: format!(
+                "Index '{}' on label '{}' unavailable: {}",
+                index_name, label, reason
+            ),
+        },
+        ::uni_db::QueryWarning::NoIndexForFilter { label, property } => {
+            crate::types::PyQueryWarning {
+                code: "no_index_for_filter".to_string(),
+                message: format!("No index on '{}.{}' — full scan required", label, property),
+            }
+        }
+        ::uni_db::QueryWarning::RrfPointContext => crate::types::PyQueryWarning {
+            code: "rrf_point_context".to_string(),
+            message: "RRF used in point-query context".to_string(),
+        },
+        ::uni_db::QueryWarning::Other(msg) => crate::types::PyQueryWarning {
+            code: "other".to_string(),
+            message: msg.clone(),
+        },
+    }
+}
+
+/// Convert a full QueryResult to a typed PyQueryResult.
+pub fn query_result_to_py_class(
+    py: Python,
+    result: ::uni_db::QueryResult,
+) -> PyResult<crate::types::PyQueryResult> {
+    let columns = result.columns().to_vec();
+    let warnings: Vec<crate::types::PyQueryWarning> =
+        result.warnings().iter().map(query_warning_to_py).collect();
+    let metrics = query_metrics_to_py_class(py, result.metrics())?;
+    let rows = rows_to_py(py, result.into_rows())?;
+    Ok(crate::types::PyQueryResult {
+        rows,
+        metrics,
+        warnings,
+        columns,
+    })
+}
+
+/// Convert ExplainOutput to a typed PyExplainOutput.
+pub fn explain_output_to_py_class(
+    py: Python,
+    output: ::uni_db::ExplainOutput,
+) -> PyResult<crate::types::PyExplainOutput> {
+    let cost_dict = PyDict::new(py);
+    cost_dict.set_item("estimated_rows", output.cost_estimates.estimated_rows)?;
+    cost_dict.set_item("estimated_cost", output.cost_estimates.estimated_cost)?;
+
+    let index_usage = PyList::empty(py);
+    for usage in &output.index_usage {
+        let d = PyDict::new(py);
+        d.set_item("label_or_type", &usage.label_or_type)?;
+        d.set_item("property", &usage.property)?;
+        d.set_item("index_type", &usage.index_type)?;
+        d.set_item("used", usage.used)?;
+        if let Some(reason) = &usage.reason {
+            d.set_item("reason", reason)?;
+        }
+        index_usage.append(d)?;
+    }
+
+    let suggestions = PyList::empty(py);
+    for s in &output.suggestions {
+        let d = PyDict::new(py);
+        d.set_item("label_or_type", &s.label_or_type)?;
+        d.set_item("property", &s.property)?;
+        d.set_item("index_type", &s.index_type)?;
+        d.set_item("reason", &s.reason)?;
+        d.set_item("create_statement", &s.create_statement)?;
+        suggestions.append(d)?;
+    }
+
+    Ok(crate::types::PyExplainOutput {
+        plan_text: output.plan_text,
+        warnings: output.warnings,
+        cost_estimates: cost_dict.into(),
+        index_usage: index_usage.into(),
+        suggestions: suggestions.into(),
+    })
+}
+
+/// Convert ProfileOutput to a typed PyProfileOutput.
+pub fn profile_output_to_py_class(
+    py: Python,
+    profile: ::uni_db::ProfileOutput,
+) -> PyResult<crate::types::PyProfileOutput> {
+    let ops = PyList::empty(py);
+    for op in &profile.runtime_stats {
+        let d = PyDict::new(py);
+        d.set_item("operator", &op.operator)?;
+        d.set_item("actual_rows", op.actual_rows)?;
+        d.set_item("time_ms", op.time_ms)?;
+        d.set_item("memory_bytes", op.memory_bytes)?;
+        if let Some(hits) = op.index_hits {
+            d.set_item("index_hits", hits)?;
+        }
+        if let Some(misses) = op.index_misses {
+            d.set_item("index_misses", misses)?;
+        }
+        ops.append(d)?;
+    }
+
+    Ok(crate::types::PyProfileOutput {
+        total_time_ms: profile.total_time_ms,
+        peak_memory_bytes: profile.peak_memory_bytes,
+        plan_text: profile.explain.plan_text,
+        operators: ops.into(),
+    })
+}
+
+/// Convert LocyExplainOutput to a typed PyLocyExplainOutput.
+pub fn locy_explain_to_py_class(
+    output: uni_db::api::locy_result::LocyExplainOutput,
+) -> crate::types::PyLocyExplainOutput {
+    crate::types::PyLocyExplainOutput {
+        plan_text: output.plan_text,
+        strata_count: output.strata_count,
+        rule_names: output.rule_names,
+        has_recursive_strata: output.has_recursive_strata,
+        warnings: output.warnings,
+        command_count: output.command_count,
+    }
+}
+
 /// Extract a CloudStorageConfig from a Python dict.
 ///
 /// The dict must have a `"provider"` key: `"s3"`, `"gcs"`, or `"azure"`.
@@ -1176,8 +1335,8 @@ pub fn database_metrics_to_py(
         uptime_secs: m.uptime.as_secs_f64(),
         active_sessions: m.active_sessions,
         l1_run_count: m.l1_run_count,
-        write_throttle_pressure: m.write_throttle_pressure,
-        compaction_status: m.compaction_status,
+        write_throttle_pressure: m.write_throttle_pressure.value(),
+        compaction_in_progress: m.compaction_status.compaction_in_progress,
         wal_size_bytes: m.wal_size_bytes,
         wal_lsn: m.wal_lsn,
         total_queries: m.total_queries,

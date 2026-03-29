@@ -297,15 +297,15 @@ impl QueryBuilder {
         Ok(result)
     }
 
-    /// Execute the query and fetch all results.
-    fn fetch_all(&self, py: Python) -> PyResult<Vec<Py<PyAny>>> {
+    /// Execute the query and fetch all results as a `QueryResult`.
+    fn fetch_all(&self, py: Python) -> PyResult<crate::types::PyQueryResult> {
         let mut rust_params = HashMap::new();
         for (k, v) in &self.params {
             let val = convert::py_object_to_value(py, v)?;
             rust_params.insert(k.clone(), val);
         }
 
-        let rows = pyo3_async_runtimes::tokio::get_runtime()
+        let result = pyo3_async_runtimes::tokio::get_runtime()
             .block_on(core::query_builder_core(
                 &self.inner,
                 &self.cypher,
@@ -315,7 +315,7 @@ impl QueryBuilder {
             ))
             .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
 
-        convert::rows_to_py(py, rows.into_rows())
+        convert::query_result_to_py_class(py, result)
     }
 }
 
@@ -385,6 +385,33 @@ impl SchemaBuilder {
     }
 }
 
+/// Parse an index config from either a string or dict Python object.
+pub(crate) fn parse_index_config(
+    py: Python<'_>,
+    label: &str,
+    property: &str,
+    index_type: &Py<PyAny>,
+) -> PyResult<IndexDefinition> {
+    let bound = index_type.bind(py);
+    if let Ok(type_str) = bound.extract::<String>() {
+        core::create_index_definition(label, property, &type_str)
+            .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)
+    } else if bound.is_instance_of::<pyo3::types::PyDict>() {
+        let dict: HashMap<String, Py<PyAny>> = bound.extract()?;
+        let mut config = std::collections::HashMap::new();
+        for (k, v) in &dict {
+            let val = crate::convert::py_object_to_json(py, v)?;
+            config.insert(k.clone(), val);
+        }
+        core::create_index_definition_from_config(label, property, &config)
+            .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)
+    } else {
+        Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
+            "index_type must be a string or dict",
+        ))
+    }
+}
+
 /// Builder for defining a label with its properties and indexes.
 #[pyclass]
 #[derive(Clone)]
@@ -433,14 +460,32 @@ impl LabelBuilder {
     }
 
     /// Add an index on a property.
-    fn index(
-        mut slf: PyRefMut<'_, Self>,
+    ///
+    /// `index_type` can be a string (e.g., `"btree"`, `"vector"`, `"fulltext"`, `"inverted"`)
+    /// or a dict with a `"type"` key and additional configuration:
+    ///
+    /// ```python
+    /// # Simple (string):
+    /// builder.index("name", "btree")
+    ///
+    /// # Rich (dict):
+    /// builder.index("embedding", {
+    ///     "type": "vector", "algorithm": "hnsw",
+    ///     "m": 32, "ef_construction": 400, "metric": "l2"
+    /// })
+    /// builder.index("content", {
+    ///     "type": "fulltext", "tokenizer": "ngram",
+    ///     "ngram_min": 2, "ngram_max": 4
+    /// })
+    /// ```
+    fn index<'py>(
+        mut slf: PyRefMut<'py, Self>,
         property: String,
-        index_type: String,
-    ) -> PyResult<PyRefMut<'_, Self>> {
+        index_type: Py<PyAny>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let py = slf.py();
         let label = slf.name.clone();
-        let idx = core::create_index_definition(&label, &property, &index_type)
-            .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?;
+        let idx = parse_index_config(py, &label, &property, &index_type)?;
         slf.indexes.push(idx);
         Ok(slf)
     }
@@ -617,13 +662,16 @@ impl Session {
     }
 
     /// Execute a read query within this session.
+    ///
+    /// Returns a `QueryResult` with `.rows`, `.metrics`, `.warnings`, `.columns`.
+    /// The result also implements the sequence protocol (`for row in result` works).
     #[pyo3(signature = (cypher, params=None))]
     fn query(
         &self,
         py: Python,
         cypher: &str,
         params: Option<HashMap<String, Py<PyAny>>>,
-    ) -> PyResult<Vec<Py<PyAny>>> {
+    ) -> PyResult<crate::types::PyQueryResult> {
         let result = if let Some(p) = params {
             let mut builder = self.inner.query_with(cypher);
             for (k, v) in p {
@@ -638,7 +686,7 @@ impl Session {
                 .block_on(self.inner.query(cypher))
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
         };
-        convert::rows_to_py(py, result.into_rows())
+        convert::query_result_to_py_class(py, result)
     }
 
     /// Execute a mutation query, returning an AutoCommitResult.
@@ -698,11 +746,13 @@ impl Session {
     /// Get session capabilities.
     fn capabilities(&self) -> crate::types::PySessionCapabilities {
         let caps = self.inner.capabilities();
+        let write_lease = caps.write_lease.map(|wl| format!("{:?}", wl));
         crate::types::PySessionCapabilities {
             can_write: caps.can_write,
             can_pin: caps.can_pin,
             isolation: caps.isolation.to_string(),
             has_notifications: caps.has_notifications,
+            write_lease,
         }
     }
 
@@ -749,30 +799,45 @@ impl Session {
     }
 
     /// Explain a query plan without executing.
-    fn explain(&self, py: Python, cypher: &str) -> PyResult<Py<PyAny>> {
+    ///
+    /// Returns a typed `ExplainOutput` with `.plan_text`, `.warnings`, `.cost_estimates`,
+    /// `.index_usage`, `.suggestions`.
+    fn explain(&self, py: Python, cypher: &str) -> PyResult<crate::types::PyExplainOutput> {
         let output = pyo3_async_runtimes::tokio::get_runtime()
             .block_on(self.inner.explain(cypher))
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-        convert::explain_output_to_py(py, output)
+        convert::explain_output_to_py_class(py, output)
     }
 
     /// Explain a Locy program's evaluation plan.
-    fn explain_locy(&self, py: Python, program: &str) -> PyResult<Py<PyAny>> {
+    ///
+    /// Returns a typed `LocyExplainOutput`.
+    fn explain_locy(
+        &self,
+        _py: Python,
+        program: &str,
+    ) -> PyResult<crate::types::PyLocyExplainOutput> {
         let result = self
             .inner
             .explain_locy(program)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-        convert::locy_explain_to_py(py, result)
+        Ok(convert::locy_explain_to_py_class(result))
     }
 
     /// Profile a query with operator-level statistics.
-    fn profile(&self, py: Python, cypher: &str) -> PyResult<(Vec<Py<PyAny>>, Py<PyAny>)> {
+    ///
+    /// Returns `(QueryResult, ProfileOutput)`.
+    fn profile(
+        &self,
+        py: Python,
+        cypher: &str,
+    ) -> PyResult<(crate::types::PyQueryResult, crate::types::PyProfileOutput)> {
         let (results, profile) = pyo3_async_runtimes::tokio::get_runtime()
             .block_on(self.inner.profile(cypher))
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-        let rows = convert::rows_to_py(py, results.into_rows())?;
-        let profile_dict = convert::profile_output_to_py(py, profile)?;
-        Ok((rows, profile_dict))
+        let query_result = convert::query_result_to_py_class(py, results)?;
+        let profile_output = convert::profile_output_to_py_class(py, profile)?;
+        Ok((query_result, profile_output))
     }
 
     /// Clear all registered Locy rules.
@@ -794,6 +859,7 @@ impl Session {
         let m = self.inner.metrics();
         crate::types::PySessionMetrics {
             session_id: m.session_id,
+            active_since_secs: m.active_since.elapsed().as_secs_f64(),
             queries_executed: m.queries_executed,
             locy_evaluations: m.locy_evaluations,
             total_query_time_secs: m.total_query_time.as_secs_f64(),
@@ -805,6 +871,57 @@ impl Session {
             plan_cache_misses: m.plan_cache_misses,
             plan_cache_size: m.plan_cache_size,
         }
+    }
+
+    /// Set multiple session-scoped parameters at once.
+    fn set_all(&mut self, py: Python, params: HashMap<String, Py<PyAny>>) -> PyResult<()> {
+        for (k, v) in params {
+            let val = convert::py_object_to_value(py, &v)?;
+            self.inner.set(k, val);
+        }
+        Ok(())
+    }
+
+    /// Insert vertices in bulk within this session (auto-committed).
+    fn bulk_insert_vertices(
+        &self,
+        py: Python,
+        label: &str,
+        vertices: Vec<HashMap<String, Py<PyAny>>>,
+    ) -> PyResult<Vec<u64>> {
+        let mut props_list = Vec::with_capacity(vertices.len());
+        for v in vertices {
+            let mut map = HashMap::new();
+            for (k, val) in v {
+                map.insert(k, convert::py_object_to_value(py, &val)?);
+            }
+            props_list.push(map);
+        }
+        let vids = pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(self.inner.bulk_insert_vertices(label, props_list))
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        Ok(vids.into_iter().map(|v| v.as_u64()).collect())
+    }
+
+    /// Insert edges in bulk within this session (auto-committed).
+    fn bulk_insert_edges(
+        &self,
+        py: Python,
+        edge_type: &str,
+        edges: Vec<(u64, u64, HashMap<String, Py<PyAny>>)>,
+    ) -> PyResult<()> {
+        let mut edge_data = Vec::with_capacity(edges.len());
+        for (src, dst, props) in edges {
+            let mut map = HashMap::new();
+            for (k, v) in props {
+                map.insert(k, convert::py_object_to_value(py, &v)?);
+            }
+            edge_data.push((::uni_db::Vid::from(src), ::uni_db::Vid::from(dst), map));
+        }
+        pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(self.inner.bulk_insert_edges(edge_type, edge_data))
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        Ok(())
     }
 
     /// Cancel in-progress operations on this session.
@@ -946,6 +1063,7 @@ impl Session {
         PyTransactionBuilder {
             session: slf,
             timeout_secs: None,
+            isolation_level: None,
         }
     }
 
@@ -1010,8 +1128,8 @@ impl SessionQueryBuilder {
         slf
     }
 
-    /// Fetch all results.
-    fn fetch_all(&self, py: Python) -> PyResult<Vec<Py<PyAny>>> {
+    /// Fetch all results as a `QueryResult`.
+    fn fetch_all(&self, py: Python) -> PyResult<crate::types::PyQueryResult> {
         let session = self.session.borrow(py);
         let mut builder = session.inner.query_with(&self.cypher);
         for (k, v) in &self.params {
@@ -1027,13 +1145,13 @@ impl SessionQueryBuilder {
         let result = pyo3_async_runtimes::tokio::get_runtime()
             .block_on(builder.fetch_all())
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-        convert::rows_to_py(py, result.into_rows())
+        convert::query_result_to_py_class(py, result)
     }
 
     /// Fetch a single row or None.
     fn fetch_one(&self, py: Python) -> PyResult<Option<Py<PyAny>>> {
-        let rows = self.fetch_all(py)?;
-        Ok(rows.into_iter().next())
+        let result = self.fetch_all(py)?;
+        Ok(result.rows.into_iter().next())
     }
 
     /// Open a streaming cursor.
@@ -1179,8 +1297,11 @@ impl SessionProfileBuilder {
         slf
     }
 
-    /// Execute the profile.
-    fn run(&self, py: Python) -> PyResult<(Vec<Py<PyAny>>, Py<PyAny>)> {
+    /// Execute the profile, returning `(QueryResult, ProfileOutput)`.
+    fn run(
+        &self,
+        py: Python,
+    ) -> PyResult<(crate::types::PyQueryResult, crate::types::PyProfileOutput)> {
         let session = self.session.borrow(py);
         let mut builder = session.inner.profile_with(&self.cypher);
         for (k, v) in &self.params {
@@ -1190,9 +1311,9 @@ impl SessionProfileBuilder {
         let (results, profile) = pyo3_async_runtimes::tokio::get_runtime()
             .block_on(builder.run())
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-        let rows = convert::rows_to_py(py, results.into_rows())?;
-        let profile_dict = convert::profile_output_to_py(py, profile)?;
-        Ok((rows, profile_dict))
+        let query_result = convert::query_result_to_py_class(py, results)?;
+        let profile_output = convert::profile_output_to_py_class(py, profile)?;
+        Ok((query_result, profile_output))
     }
 }
 
@@ -1201,6 +1322,7 @@ impl SessionProfileBuilder {
 pub struct PyTransactionBuilder {
     pub(crate) session: Py<Session>,
     pub(crate) timeout_secs: Option<f64>,
+    pub(crate) isolation_level: Option<String>,
 }
 
 #[pymethods]
@@ -1211,12 +1333,31 @@ impl PyTransactionBuilder {
         slf
     }
 
+    /// Set isolation level (currently only "serialized" is supported).
+    fn isolation(mut slf: PyRefMut<'_, Self>, level: String) -> PyRefMut<'_, Self> {
+        slf.isolation_level = Some(level);
+        slf
+    }
+
     /// Start the transaction.
     fn start(&self, py: Python) -> PyResult<super::sync_api::Transaction> {
         let session = self.session.borrow(py);
         let mut builder = session.inner.tx_with();
         if let Some(t) = self.timeout_secs {
             builder = builder.timeout(std::time::Duration::from_secs_f64(t));
+        }
+        if let Some(ref level) = self.isolation_level {
+            match level.to_lowercase().as_str() {
+                "serialized" => {
+                    builder = builder.isolation(::uni_db::IsolationLevel::Serialized);
+                }
+                _ => {
+                    return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                        "Unknown isolation level: {}",
+                        level
+                    )));
+                }
+            }
         }
         let tx = pyo3_async_runtimes::tokio::get_runtime()
             .block_on(builder.start())
@@ -1245,8 +1386,8 @@ impl PyTxQueryBuilder {
         slf
     }
 
-    /// Fetch all results.
-    fn fetch_all(&self, py: Python) -> PyResult<Vec<Py<PyAny>>> {
+    /// Fetch all results as a `QueryResult`.
+    fn fetch_all(&self, py: Python) -> PyResult<crate::types::PyQueryResult> {
         let tx_ref = self.tx.borrow(py);
         let tx = tx_ref.inner.as_ref().ok_or_else(|| {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Transaction already completed")
@@ -1259,13 +1400,13 @@ impl PyTxQueryBuilder {
         let result = pyo3_async_runtimes::tokio::get_runtime()
             .block_on(builder.fetch_all())
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-        convert::rows_to_py(py, result.into_rows())
+        convert::query_result_to_py_class(py, result)
     }
 
     /// Fetch a single row or None.
     fn fetch_one(&self, py: Python) -> PyResult<Option<Py<PyAny>>> {
-        let rows = self.fetch_all(py)?;
-        Ok(rows.into_iter().next())
+        let result = self.fetch_all(py)?;
+        Ok(result.rows.into_iter().next())
     }
 
     /// Execute as a mutation and return ExecuteResult.
@@ -1545,7 +1686,7 @@ impl StreamingAppender {
     /// Flush remaining rows and commit.
     fn finish(&self) -> PyResult<BulkStats> {
         let mut guard = self.inner.lock().unwrap();
-        let appender = guard.as_mut().ok_or_else(|| {
+        let appender = guard.take().ok_or_else(|| {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Appender already finished")
         })?;
         let stats = pyo3_async_runtimes::tokio::get_runtime()
@@ -1564,7 +1705,7 @@ impl StreamingAppender {
     /// Abort without committing.
     fn abort(&self) -> PyResult<()> {
         let mut guard = self.inner.lock().unwrap();
-        if let Some(appender) = guard.as_mut() {
+        if let Some(appender) = guard.take() {
             appender.abort();
         }
         Ok(())
@@ -1712,18 +1853,21 @@ impl SessionTemplate {
 }
 
 // ============================================================================
-// BulkWriterBuilder and BulkWriter
+// BulkWriterBuilder and BulkWriter (wrapping real Rust BulkWriter)
 // ============================================================================
 
 /// Builder for configuring bulk data loading.
+///
+/// Wraps the Rust `Session::bulk_writer()` → `BulkWriterBuilder` chain.
 #[pyclass]
-#[derive(Clone)]
 pub struct BulkWriterBuilder {
     pub(crate) inner: Arc<Uni>,
     pub(crate) defer_vector_indexes: bool,
     pub(crate) defer_scalar_indexes: bool,
-    pub(crate) batch_size: usize,
+    pub(crate) batch_size: Option<usize>,
     pub(crate) async_indexes: bool,
+    pub(crate) validate_constraints: Option<bool>,
+    pub(crate) max_buffer_size_bytes: Option<usize>,
 }
 
 #[pymethods]
@@ -1742,7 +1886,7 @@ impl BulkWriterBuilder {
 
     /// Set batch size for flushing to storage.
     fn batch_size(mut slf: PyRefMut<'_, Self>, size: usize) -> PyRefMut<'_, Self> {
-        slf.batch_size = size;
+        slf.batch_size = Some(size);
         slf
     }
 
@@ -1752,123 +1896,186 @@ impl BulkWriterBuilder {
         slf
     }
 
+    /// Set whether to validate constraints during bulk load.
+    fn validate_constraints(mut slf: PyRefMut<'_, Self>, validate: bool) -> PyRefMut<'_, Self> {
+        slf.validate_constraints = Some(validate);
+        slf
+    }
+
+    /// Set maximum buffer size before triggering a checkpoint flush.
+    fn max_buffer_size_bytes(mut slf: PyRefMut<'_, Self>, size: usize) -> PyRefMut<'_, Self> {
+        slf.max_buffer_size_bytes = Some(size);
+        slf
+    }
+
     /// Build the BulkWriter.
+    ///
+    /// Creates a Session internally and acquires a write context on it.
     fn build(&self) -> PyResult<BulkWriter> {
+        let session = self.inner.session();
+        let mut builder = session.bulk_writer();
+        builder = builder
+            .defer_vector_indexes(self.defer_vector_indexes)
+            .defer_scalar_indexes(self.defer_scalar_indexes)
+            .async_indexes(self.async_indexes);
+        if let Some(bs) = self.batch_size {
+            builder = builder.batch_size(bs);
+        }
+        if let Some(vc) = self.validate_constraints {
+            builder = builder.validate_constraints(vc);
+        }
+        if let Some(mbs) = self.max_buffer_size_bytes {
+            builder = builder.max_buffer_size_bytes(mbs);
+        }
+        let real_writer = builder
+            .build()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
         Ok(BulkWriter {
-            inner: self.inner.clone(),
-            stats: BulkStats::default(),
-            aborted: false,
-            committed: false,
+            inner: std::sync::Mutex::new(Some(real_writer)),
         })
     }
 }
 
 /// Bulk writer for high-throughput data ingestion.
+///
+/// Wraps the real Rust `BulkWriter` via `Mutex<Option<T>>` ownership pattern.
 #[pyclass]
 pub struct BulkWriter {
-    inner: Arc<Uni>,
-    stats: BulkStats,
-    aborted: bool,
-    committed: bool,
+    inner: std::sync::Mutex<Option<::uni_db::api::bulk::BulkWriter>>,
+}
+
+impl BulkWriter {
+    fn with_writer<F, R>(&self, op: &str, f: F) -> PyResult<R>
+    where
+        F: FnOnce(&mut ::uni_db::api::bulk::BulkWriter) -> PyResult<R>,
+    {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        let writer = guard.as_mut().ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                "BulkWriter already completed ({})",
+                op
+            ))
+        })?;
+        f(writer)
+    }
 }
 
 #[pymethods]
 impl BulkWriter {
     /// Insert vertices in bulk, returning allocated VIDs.
     fn insert_vertices(
-        &mut self,
+        &self,
         py: Python,
         label: &str,
         vertices: Vec<HashMap<String, Py<PyAny>>>,
     ) -> PyResult<Vec<u64>> {
-        if self.aborted || self.committed {
-            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                "BulkWriter already completed",
-            ));
-        }
-
-        let mut rust_props = Vec::new();
+        let mut rust_props: Vec<HashMap<String, ::uni_db::Value>> =
+            Vec::with_capacity(vertices.len());
         for v in vertices {
             let mut map = HashMap::new();
             for (k, val) in v {
-                let value = convert::py_object_to_value(py, &val)?;
-                map.insert(k, serde_json::Value::from(value));
+                map.insert(k, convert::py_object_to_value(py, &val)?);
             }
             rust_props.push(map);
         }
-
-        let vids = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(core::bulk_insert_vertices_core(
-                &self.inner,
-                label,
-                rust_props,
-            ))
-            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
-
-        self.stats.vertices_inserted += vids.len();
-        Ok(vids.into_iter().map(|v| v.as_u64()).collect())
+        self.with_writer("insert_vertices", |writer| {
+            let vids = pyo3_async_runtimes::tokio::get_runtime()
+                .block_on(writer.insert_vertices(label, rust_props))
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(vids.into_iter().map(|v| v.as_u64()).collect())
+        })
     }
 
     /// Insert edges in bulk.
     fn insert_edges(
-        &mut self,
+        &self,
         py: Python,
         edge_type: &str,
         edges: Vec<(u64, u64, HashMap<String, Py<PyAny>>)>,
     ) -> PyResult<()> {
-        if self.aborted || self.committed {
-            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                "BulkWriter already completed",
-            ));
-        }
-
-        let edge_count = edges.len();
-        let mut rust_edges = Vec::new();
+        let mut rust_edges = Vec::with_capacity(edges.len());
         for (src, dst, props) in edges {
             let mut map = HashMap::new();
             for (k, v) in props {
-                let val = convert::py_object_to_value(py, &v)?;
-                map.insert(k, serde_json::Value::from(val));
+                map.insert(k, convert::py_object_to_value(py, &v)?);
             }
-            rust_edges.push((::uni_db::Vid::from(src), ::uni_db::Vid::from(dst), map));
+            rust_edges.push(::uni_db::api::bulk::EdgeData::new(
+                ::uni_db::Vid::from(src),
+                ::uni_db::Vid::from(dst),
+                map,
+            ));
         }
+        self.with_writer("insert_edges", |writer| {
+            pyo3_async_runtimes::tokio::get_runtime()
+                .block_on(writer.insert_edges(edge_type, rust_edges))
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(())
+        })
+    }
 
-        pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(core::bulk_insert_edges_core(
-                &self.inner,
-                edge_type,
-                rust_edges,
-            ))
-            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
+    /// Get current bulk load statistics.
+    fn stats(&self) -> PyResult<BulkStats> {
+        self.with_writer("stats", |writer| {
+            let s = writer.stats();
+            Ok(BulkStats {
+                vertices_inserted: s.vertices_inserted,
+                edges_inserted: s.edges_inserted,
+                indexes_rebuilt: s.indexes_rebuilt,
+                duration_secs: s.duration.as_secs_f64(),
+                index_build_duration_secs: s.index_build_duration.as_secs_f64(),
+                indexes_pending: s.indexes_pending,
+            })
+        })
+    }
 
-        self.stats.edges_inserted += edge_count;
-        Ok(())
+    /// Get labels that have been written to.
+    fn touched_labels(&self) -> PyResult<Vec<String>> {
+        self.with_writer("touched_labels", |writer| Ok(writer.touched_labels()))
+    }
+
+    /// Get edge types that have been written to.
+    fn touched_edge_types(&self) -> PyResult<Vec<String>> {
+        self.with_writer("touched_edge_types", |writer| {
+            Ok(writer.touched_edge_types())
+        })
     }
 
     /// Commit all pending data and rebuild indexes.
-    fn commit(&mut self) -> PyResult<BulkStats> {
-        if self.aborted || self.committed {
-            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                "BulkWriter already completed",
-            ));
-        }
-
-        pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(core::flush_core(&self.inner))
-            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
-
-        self.committed = true;
-        Ok(self.stats.clone())
+    fn commit(&self) -> PyResult<BulkStats> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        let writer = guard.take().ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("BulkWriter already completed")
+        })?;
+        let stats = pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(writer.commit())
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        Ok(BulkStats {
+            vertices_inserted: stats.vertices_inserted,
+            edges_inserted: stats.edges_inserted,
+            indexes_rebuilt: stats.indexes_rebuilt,
+            duration_secs: stats.duration.as_secs_f64(),
+            index_build_duration_secs: stats.index_build_duration.as_secs_f64(),
+            indexes_pending: stats.indexes_pending,
+        })
     }
 
     /// Abort bulk loading and discard uncommitted changes.
-    fn abort(&mut self) -> PyResult<()> {
-        if self.committed {
-            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                "Cannot abort: already committed",
-            ));
+    fn abort(&self) -> PyResult<()> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        if let Some(writer) = guard.take() {
+            pyo3_async_runtimes::tokio::get_runtime()
+                .block_on(writer.abort())
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
         }
-        self.aborted = true;
         Ok(())
     }
 
@@ -1879,13 +2086,15 @@ impl BulkWriter {
     /// Auto-abort on exception if not committed.
     #[pyo3(signature = (_exc_type=None, _exc_val=None, _exc_tb=None))]
     fn __exit__(
-        &mut self,
+        &self,
         _exc_type: Option<Py<PyAny>>,
         _exc_val: Option<Py<PyAny>>,
         _exc_tb: Option<Py<PyAny>>,
     ) -> PyResult<bool> {
-        if !self.committed && !self.aborted {
-            self.aborted = true;
+        let guard = self.inner.lock().unwrap();
+        if guard.is_some() {
+            drop(guard);
+            self.abort()?;
         }
         Ok(false)
     }

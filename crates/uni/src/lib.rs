@@ -14,7 +14,7 @@ pub use api::builder::PropertiesBuilder;
 pub use api::hooks::{CommitHookContext, HookContext, QueryType, SessionHook};
 pub use api::multi_agent::{LeaseGuard, WriteLease, WriteLeaseProvider};
 pub use api::notifications::{CommitNotification, CommitStream, WatchBuilder};
-pub use api::prepared::{PreparedLocy, PreparedQuery};
+pub use api::prepared::{PreparedLocy, PreparedLocyBinder, PreparedQuery, PreparedQueryBinder};
 pub use api::schema::{
     ConstraintInfo, EdgeTypeBuilder, IndexInfo, IndexType, LabelBuilder, LabelInfo, PropertyInfo,
     ScalarType, SchemaBuilder, VectorAlgo, VectorIndexCfg, VectorMetric,
@@ -33,7 +33,7 @@ pub use api::transaction::{
     ApplyBuilder, ApplyResult, CommitResult, ExecuteBuilder, IsolationLevel, Transaction,
 };
 pub use api::xervo::UniXervo;
-pub use api::{DatabaseMetrics, Uni, UniBuilder};
+pub use api::{DatabaseMetrics, ThrottlePressure, Uni, UniBuilder};
 
 // Re-exports from internal crates
 pub use uni_common::{

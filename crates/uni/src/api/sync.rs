@@ -220,7 +220,7 @@ impl<'a> SessionSync<'a> {
     }
 
     /// Create a bulk writer for efficient data loading.
-    pub fn bulk_writer(&self) -> Result<crate::api::bulk::BulkWriterBuilder> {
+    pub fn bulk_writer(&self) -> crate::api::bulk::BulkWriterBuilder {
         self.session.bulk_writer()
     }
 
@@ -318,7 +318,7 @@ impl<'a> SessionSync<'a> {
     }
 
     /// Cancel all in-flight queries in this session.
-    pub fn cancel(&mut self) {
+    pub fn cancel(&self) {
         self.session.cancel()
     }
 }
@@ -364,16 +364,6 @@ impl<'s, 'a> QueryBuilderSync<'s, 'a> {
     /// Execute the query and return the first row, or `None` if empty.
     pub fn fetch_one(self) -> Result<Option<Row>> {
         self.rt.block_on(self.inner.fetch_one())
-    }
-
-    /// Execute a mutation and return affected row count with detailed stats.
-    #[deprecated(
-        since = "0.4.0",
-        note = "Use `session.execute_with(cypher).run()` for auto-committed writes"
-    )]
-    pub fn execute_mutation(self) -> Result<ExecuteResult> {
-        #[allow(deprecated)]
-        self.rt.block_on(self.inner.execute_mutation())
     }
 }
 

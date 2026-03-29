@@ -127,8 +127,8 @@ impl StreamingAppender {
     ///
     /// The row is buffered internally. When the buffer reaches `batch_size`,
     /// it is automatically flushed to the underlying bulk writer.
-    pub async fn append(&mut self, properties: HashMap<String, Value>) -> Result<()> {
-        self.buffer.push(properties);
+    pub async fn append(&mut self, properties: impl Into<HashMap<String, Value>>) -> Result<()> {
+        self.buffer.push(properties.into());
         if self.buffer.len() >= self.batch_size {
             self.flush_buffer().await?;
         }
@@ -163,9 +163,9 @@ impl StreamingAppender {
 
     /// Flush all buffered rows and commit the bulk writer.
     ///
-    /// Returns statistics about the loading operation. After calling this,
-    /// the appender is consumed and the write guard is released.
-    pub async fn finish(&mut self) -> Result<BulkStats> {
+    /// Consumes the appender. Returns statistics about the loading operation.
+    /// The write guard is released when this method returns (or on error via Drop).
+    pub async fn finish(mut self) -> Result<BulkStats> {
         self.flush_buffer().await?;
         let writer = self
             .writer
@@ -178,8 +178,9 @@ impl StreamingAppender {
 
     /// Abort the appender without committing.
     ///
-    /// Discards all buffered and previously flushed rows. Releases the write guard.
-    pub fn abort(&mut self) {
+    /// Consumes the appender. Discards all buffered and previously flushed rows.
+    /// Releases the write guard.
+    pub fn abort(mut self) {
         self.buffer.clear();
         self.writer.take(); // Drop the writer
         self.finished = true;

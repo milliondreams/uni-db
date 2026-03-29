@@ -23,7 +23,7 @@ use uni_common::{Result, UniError};
 use uni_locy::DerivedFactSet;
 
 use crate::api::locy_result::LocyResult;
-use uni_query::{ExecuteResult, QueryResult, Row, Value};
+use uni_query::{ExecuteResult, QueryCursor, QueryResult, Row, Value};
 
 /// Transaction isolation level.
 ///
@@ -209,6 +209,7 @@ impl Transaction {
             cypher: cypher.to_string(),
             params: HashMap::new(),
             cancellation_token: None,
+            timeout: None,
         }
     }
 
@@ -718,6 +719,7 @@ pub struct TxQueryBuilder<'a> {
     cypher: String,
     params: HashMap<String, Value>,
     cancellation_token: Option<CancellationToken>,
+    timeout: Option<Duration>,
 }
 
 impl<'a> TxQueryBuilder<'a> {
@@ -733,6 +735,12 @@ impl<'a> TxQueryBuilder<'a> {
         self
     }
 
+    /// Set maximum execution time for this query.
+    pub fn timeout(mut self, duration: Duration) -> Self {
+        self.timeout = Some(duration);
+        self
+    }
+
     /// Execute the mutation and return affected row count with detailed stats.
     pub async fn execute(self) -> Result<ExecuteResult> {
         self.tx.check_completed()?;
@@ -740,11 +748,20 @@ impl<'a> TxQueryBuilder<'a> {
             let l0 = self.tx.tx_l0.read();
             (l0.mutation_count, l0.mutation_stats.clone())
         };
-        let result = self
-            .tx
-            .db
-            .execute_internal_with_tx_l0(&self.cypher, self.params, self.tx.tx_l0.clone())
-            .await?;
+        let fut = self.tx.db.execute_internal_with_tx_l0(
+            &self.cypher,
+            self.params,
+            self.tx.tx_l0.clone(),
+        );
+        let result = if let Some(t) = self.timeout {
+            tokio::time::timeout(t, fut)
+                .await
+                .map_err(|_| UniError::Timeout {
+                    timeout_ms: t.as_millis() as u64,
+                })??
+        } else {
+            fut.await?
+        };
         let (after, after_stats) = {
             let l0 = self.tx.tx_l0.read();
             (l0.mutation_count, l0.mutation_stats.clone())
@@ -765,16 +782,35 @@ impl<'a> TxQueryBuilder<'a> {
     /// Execute as a query and return rows.
     pub async fn fetch_all(self) -> Result<QueryResult> {
         self.tx.check_completed()?;
-        self.tx
-            .db
-            .execute_internal_with_tx_l0(&self.cypher, self.params, self.tx.tx_l0.clone())
-            .await
+        let fut = self.tx.db.execute_internal_with_tx_l0(
+            &self.cypher,
+            self.params,
+            self.tx.tx_l0.clone(),
+        );
+        if let Some(t) = self.timeout {
+            tokio::time::timeout(t, fut)
+                .await
+                .map_err(|_| UniError::Timeout {
+                    timeout_ms: t.as_millis() as u64,
+                })?
+        } else {
+            fut.await
+        }
     }
 
     /// Execute the query and return the first row, or `None` if empty.
     pub async fn fetch_one(self) -> Result<Option<Row>> {
         let result = self.fetch_all().await?;
         Ok(result.into_rows().into_iter().next())
+    }
+
+    /// Execute the query and return a cursor for streaming results.
+    pub async fn cursor(self) -> Result<QueryCursor> {
+        self.tx.check_completed()?;
+        self.tx
+            .db
+            .execute_cursor_internal_with_tx_l0(&self.cypher, self.params, self.tx.tx_l0.clone())
+            .await
     }
 }
 

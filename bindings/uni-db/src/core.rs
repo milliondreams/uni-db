@@ -11,8 +11,9 @@ use ::uni_db::{Uni, Value, Vid};
 use std::collections::HashMap;
 use std::time::Duration;
 use uni_common::core::schema::{
-    DataType, DistanceMetric, IndexDefinition, ScalarIndexConfig, ScalarIndexType,
-    VectorIndexConfig, VectorIndexType,
+    DataType, DistanceMetric, EmbeddingConfig, FullTextIndexConfig, IndexDefinition,
+    InvertedIndexConfig, ScalarIndexConfig, ScalarIndexType, TokenizerConfig, VectorIndexConfig,
+    VectorIndexType,
 };
 
 // Re-export types used by the sync and async API modules.
@@ -666,6 +667,166 @@ pub fn create_index_definition(
             embedding_config: None,
             metadata: Default::default(),
         })),
+        "inverted" => Ok(IndexDefinition::Inverted(InvertedIndexConfig {
+            name: format!("idx_{}_{}_inv", label, property),
+            label: label.to_string(),
+            property: property.to_string(),
+            normalize: true,
+            max_terms_per_doc: 1024,
+            metadata: Default::default(),
+        })),
+        "fulltext" => Ok(IndexDefinition::FullText(FullTextIndexConfig {
+            name: format!("idx_{}_{}_ft", label, property),
+            label: label.to_string(),
+            properties: vec![property.to_string()],
+            tokenizer: TokenizerConfig::Standard,
+            with_positions: true,
+            metadata: Default::default(),
+        })),
         _ => Err(format!("Unknown index type: {}", index_type)),
+    }
+}
+
+/// Create an index definition from a rich configuration dict.
+///
+/// The config dict must have a `"type"` key. Supported types:
+/// - `"vector"`: optional `algorithm`, `metric`, `m`, `ef_construction`, `embedding`
+/// - `"fulltext"`: optional `tokenizer`, `ngram_min`, `ngram_max`
+/// - `"inverted"`: no extra options
+/// - `"btree"`, `"hash"`, `"scalar"`: no extra options
+pub fn create_index_definition_from_config(
+    label: &str,
+    property: &str,
+    config: &HashMap<String, serde_json::Value>,
+) -> Result<IndexDefinition, String> {
+    let idx_type = config
+        .get("type")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "Index config must contain a 'type' key".to_string())?;
+
+    match idx_type.to_lowercase().as_str() {
+        "btree" | "scalar" => create_index_definition(label, property, "btree"),
+        "hash" => create_index_definition(label, property, "hash"),
+        "inverted" => create_index_definition(label, property, "inverted"),
+
+        "vector" => {
+            let algorithm = config
+                .get("algorithm")
+                .and_then(|v| v.as_str())
+                .unwrap_or("hnsw");
+            let metric = match config
+                .get("metric")
+                .and_then(|v| v.as_str())
+                .unwrap_or("cosine")
+                .to_lowercase()
+                .as_str()
+            {
+                "l2" => DistanceMetric::L2,
+                "dot" => DistanceMetric::Dot,
+                _ => DistanceMetric::Cosine,
+            };
+
+            let index_type = match algorithm.to_lowercase().as_str() {
+                "ivf_pq" | "ivfpq" => VectorIndexType::IvfPq {
+                    num_partitions: config
+                        .get("partitions")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(256) as u32,
+                    num_sub_vectors: config
+                        .get("sub_vectors")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(16) as u32,
+                    bits_per_subvector: config
+                        .get("bits_per_subvector")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(8) as u8,
+                },
+                "flat" => VectorIndexType::Flat,
+                _ => VectorIndexType::Hnsw {
+                    m: config.get("m").and_then(|v| v.as_u64()).unwrap_or(16) as u32,
+                    ef_construction: config
+                        .get("ef_construction")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(200) as u32,
+                    ef_search: config
+                        .get("ef_search")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(50) as u32,
+                },
+            };
+
+            let embedding_config = config.get("embedding").and_then(|v| {
+                let obj = v.as_object()?;
+                Some(EmbeddingConfig {
+                    alias: obj.get("alias")?.as_str()?.to_string(),
+                    source_properties: obj
+                        .get("source_properties")?
+                        .as_array()?
+                        .iter()
+                        .filter_map(|s| s.as_str().map(|s| s.to_string()))
+                        .collect(),
+                    batch_size: obj
+                        .get("batch_size")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(100) as usize,
+                })
+            });
+
+            Ok(IndexDefinition::Vector(VectorIndexConfig {
+                name: format!("idx_{}_{}_vec", label, property),
+                label: label.to_string(),
+                property: property.to_string(),
+                index_type,
+                metric,
+                embedding_config,
+                metadata: Default::default(),
+            }))
+        }
+
+        "fulltext" => {
+            let tokenizer = match config
+                .get("tokenizer")
+                .and_then(|v| v.as_str())
+                .unwrap_or("standard")
+                .to_lowercase()
+                .as_str()
+            {
+                "whitespace" => TokenizerConfig::Whitespace,
+                "ngram" => {
+                    let min = config
+                        .get("ngram_min")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(2) as u8;
+                    let max = config
+                        .get("ngram_max")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(4) as u8;
+                    TokenizerConfig::Ngram { min, max }
+                }
+                "custom" => {
+                    let name = config
+                        .get("custom_name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("default")
+                        .to_string();
+                    TokenizerConfig::Custom { name }
+                }
+                _ => TokenizerConfig::Standard,
+            };
+
+            Ok(IndexDefinition::FullText(FullTextIndexConfig {
+                name: format!("idx_{}_{}_ft", label, property),
+                label: label.to_string(),
+                properties: vec![property.to_string()],
+                tokenizer,
+                with_positions: config
+                    .get("with_positions")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true),
+                metadata: Default::default(),
+            }))
+        }
+
+        _ => Err(format!("Unknown index type in config: {}", idx_type)),
     }
 }

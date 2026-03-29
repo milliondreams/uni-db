@@ -403,8 +403,10 @@ impl AsyncDatabase {
             inner: self.inner.clone(),
             defer_vector_indexes: true,
             defer_scalar_indexes: true,
-            batch_size: 10_000,
+            batch_size: None,
             async_indexes: false,
+            validate_constraints: None,
+            max_buffer_size_bytes: None,
         }
     }
 
@@ -642,6 +644,11 @@ pub struct AsyncXervo {
 
 #[pymethods]
 impl AsyncXervo {
+    /// Check if Xervo (embedding/generation) is available for this database.
+    fn is_available(&self) -> bool {
+        self.inner.xervo().is_available()
+    }
+
     /// Embed texts using a configured model alias (async).
     fn embed<'py>(
         &self,
@@ -936,6 +943,8 @@ pub struct AsyncTransaction {
 #[pymethods]
 impl AsyncTransaction {
     /// Execute a query within this transaction.
+    ///
+    /// Returns a `QueryResult` with `.rows`, `.metrics`, `.warnings`, `.columns`.
     #[pyo3(signature = (cypher, params=None))]
     fn query<'py>(
         &self,
@@ -973,7 +982,7 @@ impl AsyncTransaction {
                     .await
                     .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
             };
-            Python::attach(|py| convert::rows_to_py(py, result.into_rows()))
+            Python::attach(|py| convert::query_result_to_py_class(py, result))
         })
     }
 
@@ -1355,6 +1364,8 @@ impl AsyncSession {
     }
 
     /// Execute a query with session variables.
+    ///
+    /// Returns a `QueryResult` with `.rows`, `.metrics`, `.warnings`, `.columns`.
     #[pyo3(signature = (cypher, params=None))]
     fn query<'py>(
         &self,
@@ -1389,7 +1400,7 @@ impl AsyncSession {
                         PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
                     })?
                 };
-            Python::attach(|py| convert::rows_to_py(py, result.into_rows()))
+            Python::attach(|py| convert::query_result_to_py_class(py, result))
         })
     }
 
@@ -1472,11 +1483,13 @@ impl AsyncSession {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let guard = inner.lock().await;
             let caps = guard.capabilities();
+            let write_lease = caps.write_lease.map(|wl| format!("{:?}", wl));
             Ok(crate::types::PySessionCapabilities {
                 can_write: caps.can_write,
                 can_pin: caps.can_pin,
                 isolation: caps.isolation.to_string(),
                 has_notifications: caps.has_notifications,
+                write_lease,
             })
         })
     }
@@ -1550,6 +1563,8 @@ impl AsyncSession {
     }
 
     /// Explain a query plan without executing.
+    ///
+    /// Returns a typed `ExplainOutput`.
     fn explain<'py>(&self, py: Python<'py>, cypher: String) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -1558,11 +1573,13 @@ impl AsyncSession {
                 .explain(&cypher)
                 .await
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-            Python::attach(|py| convert::explain_output_to_py(py, output))
+            Python::attach(|py| convert::explain_output_to_py_class(py, output))
         })
     }
 
     /// Explain a Locy program's evaluation plan.
+    ///
+    /// Returns a typed `LocyExplainOutput`.
     fn explain_locy<'py>(&self, py: Python<'py>, program: String) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         // explain_locy is now sync (compile-only, no I/O) — use spawn_blocking
@@ -1576,11 +1593,13 @@ impl AsyncSession {
             .await
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-            Python::attach(|py| convert::locy_explain_to_py(py, result))
+            Ok(convert::locy_explain_to_py_class(result))
         })
     }
 
     /// Profile a query with operator-level statistics.
+    ///
+    /// Returns `(QueryResult, ProfileOutput)`.
     #[pyo3(signature = (cypher, params=None))]
     fn profile<'py>(
         &self,
@@ -1612,9 +1631,9 @@ impl AsyncSession {
             }
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
             Python::attach(|py| {
-                let rows = convert::rows_to_py(py, results.into_rows())?;
-                let profile_dict = convert::profile_output_to_py(py, profile)?;
-                let tuple = (rows, profile_dict);
+                let query_result = convert::query_result_to_py_class(py, results)?;
+                let profile_output = convert::profile_output_to_py_class(py, profile)?;
+                let tuple = (query_result, profile_output);
                 tuple.into_py_any(py)
             })
         })
@@ -1650,6 +1669,7 @@ impl AsyncSession {
             let m = guard.metrics();
             Ok(crate::types::PySessionMetrics {
                 session_id: m.session_id,
+                active_since_secs: m.active_since.elapsed().as_secs_f64(),
                 queries_executed: m.queries_executed,
                 locy_evaluations: m.locy_evaluations,
                 total_query_time_secs: m.total_query_time.as_secs_f64(),
@@ -1668,7 +1688,7 @@ impl AsyncSession {
     fn cancel<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let mut guard = inner.lock().await;
+            let guard = inner.lock().await;
             guard.cancel();
             Ok(())
         })
@@ -1856,7 +1876,7 @@ impl AsyncSession {
     ) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let mut guard = inner.lock().await;
+            let guard = inner.lock().await;
             guard.cancel();
             Ok(false) // Don't suppress exceptions
         })
@@ -1908,18 +1928,19 @@ impl AsyncCommitStream {
 }
 
 // ============================================================================
-// AsyncBulkWriter
+// AsyncBulkWriter (wrapping real Rust BulkWriter)
 // ============================================================================
 
 /// Builder for async bulk writer.
 #[pyclass]
-#[derive(Clone)]
 pub struct AsyncBulkWriterBuilder {
     inner: Arc<Uni>,
     defer_vector_indexes: bool,
     defer_scalar_indexes: bool,
-    batch_size: usize,
+    batch_size: Option<usize>,
     async_indexes: bool,
+    validate_constraints: Option<bool>,
+    max_buffer_size_bytes: Option<usize>,
 }
 
 #[pymethods]
@@ -1938,7 +1959,7 @@ impl AsyncBulkWriterBuilder {
 
     /// Set batch size for flushing to storage.
     fn batch_size(mut slf: PyRefMut<'_, Self>, size: usize) -> PyRefMut<'_, Self> {
-        slf.batch_size = size;
+        slf.batch_size = Some(size);
         slf
     }
 
@@ -1948,129 +1969,237 @@ impl AsyncBulkWriterBuilder {
         slf
     }
 
+    /// Set whether to validate constraints during bulk load.
+    fn validate_constraints(mut slf: PyRefMut<'_, Self>, validate: bool) -> PyRefMut<'_, Self> {
+        slf.validate_constraints = Some(validate);
+        slf
+    }
+
+    /// Set maximum buffer size before triggering a checkpoint flush.
+    fn max_buffer_size_bytes(mut slf: PyRefMut<'_, Self>, size: usize) -> PyRefMut<'_, Self> {
+        slf.max_buffer_size_bytes = Some(size);
+        slf
+    }
+
     /// Build the AsyncBulkWriter.
-    fn build(&self) -> PyResult<AsyncBulkWriter> {
-        Ok(AsyncBulkWriter {
-            inner: self.inner.clone(),
-            stats: Arc::new(std::sync::Mutex::new(BulkStats::default())),
-            aborted: false,
-            committed: false,
+    fn build<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let defer_vector = self.defer_vector_indexes;
+        let defer_scalar = self.defer_scalar_indexes;
+        let batch_size = self.batch_size;
+        let async_indexes = self.async_indexes;
+        let validate_constraints = self.validate_constraints;
+        let max_buffer_size_bytes = self.max_buffer_size_bytes;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let session = inner.session();
+            let mut builder = session
+                .bulk_writer()
+                .defer_vector_indexes(defer_vector)
+                .defer_scalar_indexes(defer_scalar)
+                .async_indexes(async_indexes);
+            if let Some(bs) = batch_size {
+                builder = builder.batch_size(bs);
+            }
+            if let Some(vc) = validate_constraints {
+                builder = builder.validate_constraints(vc);
+            }
+            if let Some(mbs) = max_buffer_size_bytes {
+                builder = builder.max_buffer_size_bytes(mbs);
+            }
+            let real_writer = builder
+                .build()
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(AsyncBulkWriter {
+                inner: Arc::new(std::sync::Mutex::new(Some(real_writer))),
+            })
         })
     }
 }
 
 /// Async bulk writer for high-throughput data ingestion.
+///
+/// Uses `std::sync::Mutex` + `spawn_blocking` because `BulkWriter`'s progress
+/// callback (`Box<dyn Fn + Send>`) is not `Sync`, so it can't be held across
+/// `.await` points in a `tokio::sync::Mutex`.
 #[pyclass]
 pub struct AsyncBulkWriter {
-    inner: Arc<Uni>,
-    stats: Arc<std::sync::Mutex<BulkStats>>,
-    aborted: bool,
-    committed: bool,
+    inner: Arc<std::sync::Mutex<Option<::uni_db::api::bulk::BulkWriter>>>,
 }
 
 #[pymethods]
 impl AsyncBulkWriter {
     /// Insert vertices in bulk.
     fn insert_vertices<'py>(
-        &mut self,
+        &self,
         py: Python<'py>,
         label: String,
         vertices: Vec<HashMap<String, Py<PyAny>>>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        if self.aborted || self.committed {
-            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                "BulkWriter already completed",
-            ));
-        }
-
-        let mut rust_props = Vec::new();
+        let mut rust_props: Vec<HashMap<String, ::uni_db::Value>> =
+            Vec::with_capacity(vertices.len());
         for v in vertices {
             let mut map = HashMap::new();
             for (k, val) in v {
-                let value = convert::py_object_to_value(py, &val)?;
-                map.insert(k, serde_json::Value::from(value));
+                map.insert(k, convert::py_object_to_value(py, &val)?);
             }
             rust_props.push(map);
         }
-
         let inner = self.inner.clone();
-        let stats = self.stats.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let vids = core::bulk_insert_vertices_core(&inner, &label, rust_props)
-                .await
-                .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
-            if let Ok(mut s) = stats.lock() {
-                s.vertices_inserted += vids.len();
-            }
+            // BulkWriter is !Sync (progress callback), use spawn_blocking
+            let vids = tokio::task::spawn_blocking(move || {
+                let mut guard = inner.lock().map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
+                })?;
+                let writer = guard.as_mut().ok_or_else(|| {
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                        "BulkWriter already completed",
+                    )
+                })?;
+                let rt = tokio::runtime::Handle::current();
+                rt.block_on(writer.insert_vertices(&label, rust_props))
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+            })
+            .await
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))??;
             Ok(vids.into_iter().map(|v| v.as_u64()).collect::<Vec<_>>())
         })
     }
 
     /// Insert edges in bulk.
     fn insert_edges<'py>(
-        &mut self,
+        &self,
         py: Python<'py>,
         edge_type: String,
         edges: Vec<(u64, u64, HashMap<String, Py<PyAny>>)>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        if self.aborted || self.committed {
-            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                "BulkWriter already completed",
-            ));
-        }
-
-        let edge_count = edges.len();
-        let mut rust_edges = Vec::new();
+        let mut rust_edges = Vec::with_capacity(edges.len());
         for (src, dst, props) in edges {
             let mut map = HashMap::new();
             for (k, v) in props {
-                let val = convert::py_object_to_value(py, &v)?;
-                map.insert(k, serde_json::Value::from(val));
+                map.insert(k, convert::py_object_to_value(py, &v)?);
             }
-            rust_edges.push((::uni_db::Vid::from(src), ::uni_db::Vid::from(dst), map));
+            rust_edges.push(::uni_db::api::bulk::EdgeData::new(
+                ::uni_db::Vid::from(src),
+                ::uni_db::Vid::from(dst),
+                map,
+            ));
         }
-
         let inner = self.inner.clone();
-        let stats = self.stats.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            core::bulk_insert_edges_core(&inner, &edge_type, rust_edges)
-                .await
-                .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
-            if let Ok(mut s) = stats.lock() {
-                s.edges_inserted += edge_count;
-            }
+            tokio::task::spawn_blocking(move || {
+                let mut guard = inner.lock().map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
+                })?;
+                let writer = guard.as_mut().ok_or_else(|| {
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                        "BulkWriter already completed",
+                    )
+                })?;
+                let rt = tokio::runtime::Handle::current();
+                rt.block_on(writer.insert_edges(&edge_type, rust_edges))
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+            })
+            .await
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))??;
             Ok(())
         })
     }
 
-    /// Commit all pending data.
-    fn commit<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        if self.aborted || self.committed {
-            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                "BulkWriter already completed",
-            ));
-        }
-        self.committed = true;
-        let stats = self.stats.clone();
-        let inner = self.inner.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            core::flush_core(&inner)
-                .await
-                .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
-            let final_stats = stats.lock().unwrap().clone();
-            Ok(final_stats)
+    /// Get current bulk load statistics.
+    fn stats(&self) -> PyResult<BulkStats> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        let writer = guard.as_ref().ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("BulkWriter already completed")
+        })?;
+        let s = writer.stats();
+        Ok(BulkStats {
+            vertices_inserted: s.vertices_inserted,
+            edges_inserted: s.edges_inserted,
+            indexes_rebuilt: s.indexes_rebuilt,
+            duration_secs: s.duration.as_secs_f64(),
+            index_build_duration_secs: s.index_build_duration.as_secs_f64(),
+            indexes_pending: s.indexes_pending,
         })
     }
 
-    /// Abort bulk loading.
-    fn abort(&mut self) -> PyResult<()> {
-        if self.committed {
-            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                "Cannot abort: already committed",
-            ));
-        }
-        self.aborted = true;
-        Ok(())
+    /// Get labels that have been written to.
+    fn touched_labels(&self) -> PyResult<Vec<String>> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        let writer = guard.as_ref().ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("BulkWriter already completed")
+        })?;
+        Ok(writer.touched_labels())
+    }
+
+    /// Get edge types that have been written to.
+    fn touched_edge_types(&self) -> PyResult<Vec<String>> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        let writer = guard.as_ref().ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("BulkWriter already completed")
+        })?;
+        Ok(writer.touched_edge_types())
+    }
+
+    /// Commit all pending data and rebuild indexes.
+    fn commit<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let stats = tokio::task::spawn_blocking(move || {
+                let mut guard = inner.lock().map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
+                })?;
+                let writer = guard.take().ok_or_else(|| {
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                        "BulkWriter already completed",
+                    )
+                })?;
+                let rt = tokio::runtime::Handle::current();
+                rt.block_on(writer.commit())
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+            })
+            .await
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))??;
+            Ok(BulkStats {
+                vertices_inserted: stats.vertices_inserted,
+                edges_inserted: stats.edges_inserted,
+                indexes_rebuilt: stats.indexes_rebuilt,
+                duration_secs: stats.duration.as_secs_f64(),
+                index_build_duration_secs: stats.index_build_duration.as_secs_f64(),
+                indexes_pending: stats.indexes_pending,
+            })
+        })
+    }
+
+    /// Abort bulk loading and discard uncommitted changes.
+    fn abort<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            tokio::task::spawn_blocking(move || {
+                let mut guard = inner.lock().map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
+                })?;
+                if let Some(writer) = guard.take() {
+                    let rt = tokio::runtime::Handle::current();
+                    rt.block_on(writer.abort()).map_err(|e| {
+                        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
+                    })?;
+                }
+                Ok::<_, PyErr>(())
+            })
+            .await
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))??;
+            Ok(())
+        })
     }
 
     fn __aenter__<'py>(slf: Bound<'py, Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
@@ -2081,16 +2210,25 @@ impl AsyncBulkWriter {
     /// Auto-abort on exception if not committed.
     #[pyo3(signature = (_exc_type=None, _exc_val=None, _exc_tb=None))]
     fn __aexit__<'py>(
-        &mut self,
+        &self,
         py: Python<'py>,
         _exc_type: Option<Py<PyAny>>,
         _exc_val: Option<Py<PyAny>>,
         _exc_tb: Option<Py<PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        if !self.committed && !self.aborted {
-            self.aborted = true;
-        }
-        pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok(false) })
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            tokio::task::spawn_blocking(move || {
+                let mut guard = inner.lock().unwrap();
+                if let Some(writer) = guard.take() {
+                    let rt = tokio::runtime::Handle::current();
+                    let _ = rt.block_on(writer.abort());
+                }
+            })
+            .await
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(false)
+        })
     }
 }
 
@@ -2180,7 +2318,7 @@ impl AsyncQueryBuilder {
         })
     }
 
-    /// Execute the query and fetch all results (returns awaitable).
+    /// Execute the query and fetch all results as a `QueryResult` (returns awaitable).
     fn fetch_all<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let mut rust_params = HashMap::new();
         for (k, v) in &self.params {
@@ -2193,11 +2331,11 @@ impl AsyncQueryBuilder {
         let timeout_secs = self.timeout_secs;
         let max_memory = self.max_memory;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let rows =
+            let result =
                 core::query_builder_core(&inner, &cypher, rust_params, timeout_secs, max_memory)
                     .await
                     .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
-            Python::attach(|py| convert::rows_to_py(py, rows.into_rows()))
+            Python::attach(|py| convert::query_result_to_py_class(py, result))
         })
     }
 }
@@ -2502,14 +2640,16 @@ impl AsyncLabelBuilder {
     }
 
     /// Add an index on a property.
-    fn index(
-        mut slf: PyRefMut<'_, Self>,
+    ///
+    /// `index_type` can be a string or a dict with rich config (see `LabelBuilder.index()`).
+    fn index<'py>(
+        mut slf: PyRefMut<'py, Self>,
         property: String,
-        index_type: String,
-    ) -> PyResult<PyRefMut<'_, Self>> {
+        index_type: Py<PyAny>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let py = slf.py();
         let label = slf.name.clone();
-        let idx = core::create_index_definition(&label, &property, &index_type)
-            .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?;
+        let idx = crate::builders::parse_index_config(py, &label, &property, &index_type)?;
         slf.indexes.push(idx);
         Ok(slf)
     }

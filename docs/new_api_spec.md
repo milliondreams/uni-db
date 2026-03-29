@@ -469,7 +469,8 @@ impl Session {
     pub async fn profile(&self, cypher: &str) -> Result<(QueryResult, ProfileOutput)>;
 
     /// Explain Locy rule evaluation strategy.
-    pub async fn explain_locy(&self, program: &str) -> Result<LocyExplainOutput>;
+    /// Note: synchronous — compile-only, no I/O.
+    pub fn explain_locy(&self, program: &str) -> Result<LocyExplainOutput>;
 
     /// Compile a Locy program without executing.
     pub fn compile_locy(&self, program: &str) -> Result<CompiledProgram>;
@@ -480,7 +481,8 @@ impl Session {
     pub async fn prepare(&self, cypher: &str) -> Result<PreparedQuery>;
 
     /// Prepare a Locy program. Compiles, stratifies, and caches.
-    pub async fn prepare_locy(&self, program: &str) -> Result<PreparedLocy>;
+    /// Note: synchronous — compile-only, no I/O.
+    pub fn prepare_locy(&self, program: &str) -> Result<PreparedLocy>;
 
     // ── Transaction & Writer Factories ──
 
@@ -629,8 +631,9 @@ pub struct SessionCapabilities {
     /// Current isolation level for new transactions.
     pub isolation: IsolationLevel,
 
-    /// Active write lease (None for local single-process mode).
-    pub write_lease: Option<WriteLease>,
+    /// Active write lease summary (None for local single-process mode).
+    /// Note: `WriteLeaseSummary` (not `WriteLease`) because the provider trait object is non-Clone.
+    pub write_lease: Option<WriteLeaseSummary>,
 
     /// Whether commit notifications are available.
     pub has_notifications: bool,
@@ -798,7 +801,8 @@ impl Transaction {
     // ── Prepared Statements ──
 
     pub async fn prepare(&self, cypher: &str) -> Result<PreparedQuery>;
-    pub async fn prepare_locy(&self, program: &str) -> Result<PreparedLocy>;
+    /// Note: synchronous — compile-only, no I/O.
+    pub fn prepare_locy(&self, program: &str) -> Result<PreparedLocy>;
 
     // ── Lifecycle ──
 
@@ -1150,14 +1154,16 @@ impl<'a> BulkWriterBuilder<'a> {
     pub fn batch_size(self, n: usize) -> Self;                // Default: 10,000
     pub fn max_buffer_size_bytes(self, n: usize) -> Self;     // Default: 1 GB
     pub fn defer_vector_indexes(self, defer: bool) -> Self;   // Default: true
-    pub async fn build(self) -> Result<BulkWriter>;
+    /// Note: synchronous — no I/O in build; guard acquisition only.
+    pub fn build(self) -> Result<BulkWriter>;
 }
 
 impl BulkWriter {
     pub async fn insert_vertices(&mut self, label: &str, data: impl IntoArrow) -> Result<()>;
     pub async fn insert_edges(&mut self, edge_type: &str, data: impl IntoArrow) -> Result<()>;
     pub async fn commit(self) -> Result<BulkStats>;
-    pub async fn abort(self);
+    /// Note: returns Result because abort performs real I/O (LanceDB version rollback).
+    pub async fn abort(self) -> Result<()>;
     pub fn stats(&self) -> &BulkStatsAccumulator;
 }
 ```
@@ -1185,7 +1191,8 @@ pub struct AppenderBuilder<'a> { /* ... */ }
 
 impl<'a> AppenderBuilder<'a> {
     pub fn batch_size(self, n: usize) -> Self;           // Auto-flush threshold
-    pub async fn build(self) -> Result<StreamingAppender>;
+    /// Note: synchronous — no I/O in build; guard acquisition only.
+    pub fn build(self) -> Result<StreamingAppender>;
 }
 
 pub struct StreamingAppender { /* wraps BulkWriter internally */ }

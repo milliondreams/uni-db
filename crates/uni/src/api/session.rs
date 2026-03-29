@@ -21,9 +21,7 @@ use crate::api::impl_locy::{self, LocyRuleRegistry};
 use crate::api::locy_result::LocyResult;
 use crate::api::transaction::{IsolationLevel, Transaction};
 use uni_common::{Result, UniError, Value};
-use uni_query::{
-    ExecuteResult, ExplainOutput, ProfileOutput, QueryCursor, QueryMetrics, QueryResult, Row,
-};
+use uni_query::{ExplainOutput, ProfileOutput, QueryCursor, QueryMetrics, QueryResult, Row};
 
 /// Atomic counters for plan cache hits/misses, shared between Session and its
 /// query execution helpers.
@@ -191,7 +189,8 @@ pub struct Session {
     /// Timestamp when this session was created.
     created_at: Instant,
     /// Cancellation token for cooperative query cancellation.
-    cancellation_token: CancellationToken,
+    /// Behind `Arc<RwLock<>>` so `cancel()` can take `&self`.
+    cancellation_token: Arc<std::sync::RwLock<CancellationToken>>,
     /// Transparent plan cache for parsed/planned queries.
     plan_cache: std::sync::Mutex<PlanCache>,
     /// Atomic plan cache hit/miss counters.
@@ -223,7 +222,7 @@ impl Session {
             active_write_guard: Arc::new(AtomicBool::new(false)),
             metrics_inner: Arc::new(SessionMetricsInner::new()),
             created_at: Instant::now(),
-            cancellation_token: CancellationToken::new(),
+            cancellation_token: Arc::new(std::sync::RwLock::new(CancellationToken::new())),
             plan_cache: std::sync::Mutex::new(PlanCache::new(1000)),
             plan_cache_metrics: Arc::new(PlanCacheMetrics {
                 hits: AtomicU64::new(0),
@@ -255,7 +254,7 @@ impl Session {
             active_write_guard: Arc::new(AtomicBool::new(false)),
             metrics_inner: Arc::new(SessionMetricsInner::new()),
             created_at: Instant::now(),
-            cancellation_token: CancellationToken::new(),
+            cancellation_token: Arc::new(std::sync::RwLock::new(CancellationToken::new())),
             plan_cache: std::sync::Mutex::new(PlanCache::new(1000)),
             plan_cache_metrics: Arc::new(PlanCacheMetrics {
                 hits: AtomicU64::new(0),
@@ -552,32 +551,18 @@ impl Session {
         }
     }
 
-    /// Create a bulk writer for efficient data loading.
+    /// Create a bulk writer builder for efficient data loading.
     ///
-    /// Only one write context (transaction or bulk writer) can be active
-    /// per session at a time.
+    /// The builder is infallible; guard acquisition and pinned-state checks
+    /// are deferred to [`BulkWriterBuilder::build()`](crate::api::bulk::BulkWriterBuilder::build).
     #[instrument(skip(self), fields(session_id = %self.id))]
-    pub fn bulk_writer(&self) -> Result<crate::api::bulk::BulkWriterBuilder> {
-        if self.is_pinned() {
-            return Err(UniError::ReadOnly {
-                operation: "bulk_writer".to_string(),
-            });
-        }
-        // Acquire write guard
-        if self
-            .active_write_guard
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return Err(UniError::WriteContextAlreadyActive {
-                session_id: self.id.to_string(),
-                hint: "Only one Transaction, BulkWriter, or Appender can be active per Session at a time. Commit or rollback the active one first, or create a separate Session for concurrent writes.",
-            });
-        }
-        Ok(crate::api::bulk::BulkWriterBuilder::new_with_guard(
+    pub fn bulk_writer(&self) -> crate::api::bulk::BulkWriterBuilder {
+        crate::api::bulk::BulkWriterBuilder::new_deferred(
             self.db.clone(),
             self.active_write_guard.clone(),
-        ))
+            self.id.clone(),
+            self.is_pinned(),
+        )
     }
 
     // ── Bulk Insert (admin convenience) ─────────────────────────────
@@ -724,16 +709,17 @@ impl Session {
     /// `check_timeout()`. After cancellation, a fresh token is created
     /// so the session remains usable.
     #[instrument(skip(self), fields(session_id = %self.id))]
-    pub fn cancel(&mut self) {
-        self.cancellation_token.cancel();
-        self.cancellation_token = CancellationToken::new();
+    pub fn cancel(&self) {
+        let mut token = self.cancellation_token.write().unwrap();
+        token.cancel();
+        *token = CancellationToken::new();
     }
 
     /// Get a clone of this session's cancellation token.
     ///
     /// Useful for external cancellation (e.g. from a timeout task).
     pub fn cancellation_token(&self) -> CancellationToken {
-        self.cancellation_token.clone()
+        self.cancellation_token.read().unwrap().clone()
     }
 
     // ── Prepared Statements ──────────────────────────────────────────
@@ -1102,40 +1088,10 @@ impl<'a> QueryBuilder<'a> {
         }
     }
 
-    /// Alias for `fetch_all()`.
-    #[deprecated(since = "0.4.0", note = "Use `fetch_all()` instead")]
-    pub async fn execute(self) -> Result<QueryResult> {
-        self.fetch_all().await
-    }
-
     /// Execute the query and return the first row, or `None` if empty.
     pub async fn fetch_one(self) -> Result<Option<Row>> {
         let result = self.fetch_all().await?;
         Ok(result.into_rows().into_iter().next())
-    }
-
-    /// Execute a mutation and return affected row count with detailed stats.
-    #[deprecated(
-        since = "0.4.0",
-        note = "Use `session.execute_with(cypher).run()` for auto-committed writes"
-    )]
-    pub async fn execute_mutation(self) -> Result<ExecuteResult> {
-        let db = &self.session.db;
-        let before = db.get_mutation_count().await;
-        let before_stats = db.get_mutation_stats().await;
-        let result = self.fetch_all().await?;
-        let after_stats = db.get_mutation_stats().await;
-        let affected_rows = if result.is_empty() {
-            db.get_mutation_count().await.saturating_sub(before)
-        } else {
-            result.len()
-        };
-        let diff = after_stats.diff(&before_stats);
-        Ok(ExecuteResult::with_details(
-            affected_rows,
-            &diff,
-            result.metrics().clone(),
-        ))
     }
 
     /// Execute the query and return a cursor for streaming results.

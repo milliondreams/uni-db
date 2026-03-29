@@ -419,17 +419,36 @@ pub async fn restore_snapshot_core(db: &Uni, snapshot_id: &str) -> Result<(), St
 // ============================================================================
 
 /// Compact a label's storage files.
-pub async fn compact_label_core(db: &Uni, label: &str) -> Result<(), String> {
-    db.compact_label(label).await.map_err(|e| e.to_string())?;
-    Ok(())
+pub async fn compact_label_core(
+    db: &Uni,
+    label: &str,
+) -> Result<crate::types::PyCompactionStats, String> {
+    let stats = db.compact_label(label).await.map_err(|e| e.to_string())?;
+    Ok(crate::types::PyCompactionStats {
+        files_compacted: stats.files_compacted,
+        bytes_before: stats.bytes_before,
+        bytes_after: stats.bytes_after,
+        duration_secs: stats.duration.as_secs_f64(),
+        crdt_merges: stats.crdt_merges,
+    })
 }
 
 /// Compact an edge type's storage files.
-pub async fn compact_edge_type_core(db: &Uni, edge_type: &str) -> Result<(), String> {
-    db.compact_edge_type(edge_type)
+pub async fn compact_edge_type_core(
+    db: &Uni,
+    edge_type: &str,
+) -> Result<crate::types::PyCompactionStats, String> {
+    let stats = db
+        .compact_edge_type(edge_type)
         .await
         .map_err(|e| e.to_string())?;
-    Ok(())
+    Ok(crate::types::PyCompactionStats {
+        files_compacted: stats.files_compacted,
+        bytes_before: stats.bytes_before,
+        bytes_after: stats.bytes_after,
+        duration_secs: stats.duration.as_secs_f64(),
+        crdt_merges: stats.crdt_merges,
+    })
 }
 
 /// Wait for any ongoing compaction to complete.
@@ -543,6 +562,7 @@ pub async fn build_database_core(
     cloud_config: Option<uni_common::CloudStorageConfig>,
     uni_config: Option<uni_common::UniConfig>,
     read_only: bool,
+    write_lease: Option<::uni_db::api::multi_agent::WriteLease>,
 ) -> Result<Uni, String> {
     let mut builder = match mode {
         OpenMode::Open => Uni::open(uri),
@@ -587,6 +607,10 @@ pub async fn build_database_core(
 
     if read_only {
         builder = builder.read_only();
+    }
+
+    if let Some(wl) = write_lease {
+        builder = builder.write_lease(wl);
     }
 
     builder.build().await.map_err(|e| e.to_string())

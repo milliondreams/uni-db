@@ -321,6 +321,8 @@ pub struct BulkStats {
     pub duration_secs: f64,
     /// Duration spent building indexes in seconds.
     pub index_build_duration_secs: f64,
+    /// Task IDs for async index rebuilds.
+    pub index_task_ids: Vec<String>,
     /// Whether indexes are still building in background.
     pub indexes_pending: bool,
 }
@@ -728,6 +730,8 @@ pub struct PyCompactionStats {
     pub bytes_after: u64,
     /// Duration in seconds.
     pub duration_secs: f64,
+    /// Number of CRDT merge operations performed.
+    pub crdt_merges: usize,
 }
 
 #[pymethods]
@@ -898,6 +902,14 @@ impl PyPreparedQuery {
             .map(|g| g.query_text().to_string())
             .unwrap_or_else(|_| "<locked>".to_string());
         format!("PreparedQuery({:?})", text)
+    }
+
+    /// Create a fluent binder for this prepared query.
+    fn bind(slf: Py<Self>) -> PyPreparedQueryBinder {
+        PyPreparedQueryBinder {
+            prepared: slf,
+            params: std::collections::HashMap::new(),
+        }
     }
 }
 
@@ -1092,14 +1104,33 @@ pub struct PyPreparedLocy {
 
 #[pymethods]
 impl PyPreparedLocy {
-    /// Execute the prepared Locy program.
-    fn execute(&self, py: pyo3::Python) -> pyo3::PyResult<PyLocyResult> {
+    /// Execute the prepared Locy program with optional parameter bindings.
+    #[pyo3(signature = (params=None))]
+    fn execute(
+        &self,
+        py: pyo3::Python,
+        params: Option<std::collections::HashMap<String, Py<PyAny>>>,
+    ) -> pyo3::PyResult<PyLocyResult> {
+        let rust_params: Vec<(String, ::uni_db::Value)> = if let Some(p) = params {
+            p.into_iter()
+                .map(|(k, v)| {
+                    let val = crate::convert::py_object_to_value(py, &v)?;
+                    Ok((k, val))
+                })
+                .collect::<pyo3::PyResult<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
+        let param_refs: Vec<(&str, ::uni_db::Value)> = rust_params
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.clone()))
+            .collect();
         let guard = self
             .inner
             .lock()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
         let result = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(guard.execute(&[]))
+            .block_on(guard.execute(&param_refs))
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
         crate::convert::locy_result_to_py_class(py, result)
     }
@@ -1127,6 +1158,186 @@ impl PyPreparedLocy {
             })
             .unwrap_or_else(|_| "<locked>".to_string());
         format!("PreparedLocy({:?})", text)
+    }
+
+    /// Create a fluent binder for this prepared Locy program.
+    fn bind(slf: Py<Self>) -> PyPreparedLocyBinder {
+        PyPreparedLocyBinder {
+            prepared: slf,
+            params: std::collections::HashMap::new(),
+        }
+    }
+}
+
+// ============================================================================
+// CancellationToken
+// ============================================================================
+
+/// A cooperative cancellation token for long-running operations.
+///
+/// Call `cancel()` to request cancellation; operations holding a reference
+/// to the same token will observe the cancellation and terminate early.
+#[pyclass(name = "CancellationToken")]
+#[derive(Clone)]
+pub struct PyCancellationToken {
+    pub(crate) inner: tokio_util::sync::CancellationToken,
+}
+
+#[pymethods]
+impl PyCancellationToken {
+    /// Request cancellation.
+    fn cancel(&self) {
+        self.inner.cancel();
+    }
+
+    /// Check whether cancellation has been requested.
+    fn is_cancelled(&self) -> bool {
+        self.inner.is_cancelled()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("CancellationToken(cancelled={})", self.inner.is_cancelled())
+    }
+}
+
+// ============================================================================
+// PreparedQueryBinder / PreparedLocyBinder
+// ============================================================================
+
+/// A fluent binder for executing a prepared Cypher query with named parameters.
+#[pyclass(name = "PreparedQueryBinder")]
+pub struct PyPreparedQueryBinder {
+    pub(crate) prepared: Py<PyPreparedQuery>,
+    pub(crate) params: std::collections::HashMap<String, Py<PyAny>>,
+}
+
+#[pymethods]
+impl PyPreparedQueryBinder {
+    /// Bind a named parameter.
+    fn param(
+        mut slf: pyo3::PyRefMut<'_, Self>,
+        name: String,
+        value: Py<PyAny>,
+    ) -> pyo3::PyRefMut<'_, Self> {
+        slf.params.insert(name, value);
+        slf
+    }
+
+    /// Execute with bound parameters.
+    fn execute(&self, py: pyo3::Python) -> pyo3::PyResult<PyQueryResult> {
+        let prepared = self.prepared.borrow(py);
+        let rust_params: Vec<(String, ::uni_db::Value)> = self
+            .params
+            .iter()
+            .map(|(k, v)| {
+                let val = crate::convert::py_object_to_value(py, v)?;
+                Ok((k.clone(), val))
+            })
+            .collect::<pyo3::PyResult<Vec<_>>>()?;
+        let param_refs: Vec<(&str, ::uni_db::Value)> = rust_params
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.clone()))
+            .collect();
+        let guard = prepared
+            .inner
+            .lock()
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        let result = pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(guard.execute(&param_refs))
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        crate::convert::query_result_to_py_class(py, result)
+    }
+}
+
+/// A fluent binder for executing a prepared Locy program with named parameters.
+#[pyclass(name = "PreparedLocyBinder")]
+pub struct PyPreparedLocyBinder {
+    pub(crate) prepared: Py<PyPreparedLocy>,
+    pub(crate) params: std::collections::HashMap<String, Py<PyAny>>,
+}
+
+#[pymethods]
+impl PyPreparedLocyBinder {
+    /// Bind a named parameter.
+    fn param(
+        mut slf: pyo3::PyRefMut<'_, Self>,
+        name: String,
+        value: Py<PyAny>,
+    ) -> pyo3::PyRefMut<'_, Self> {
+        slf.params.insert(name, value);
+        slf
+    }
+
+    /// Execute with bound parameters.
+    fn execute(&self, py: pyo3::Python) -> pyo3::PyResult<PyLocyResult> {
+        let prepared = self.prepared.borrow(py);
+        let rust_params: Vec<(String, ::uni_db::Value)> = self
+            .params
+            .iter()
+            .map(|(k, v)| {
+                let val = crate::convert::py_object_to_value(py, v)?;
+                Ok((k.clone(), val))
+            })
+            .collect::<pyo3::PyResult<Vec<_>>>()?;
+        let param_refs: Vec<(&str, ::uni_db::Value)> = rust_params
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.clone()))
+            .collect();
+        let guard = prepared
+            .inner
+            .lock()
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        let result = pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(guard.execute(&param_refs))
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        crate::convert::locy_result_to_py_class(py, result)
+    }
+}
+
+// ============================================================================
+// WriteLease
+// ============================================================================
+
+/// Write lease configuration for multi-agent coordination.
+#[pyclass(name = "WriteLease")]
+#[derive(Debug, Clone)]
+pub struct PyWriteLease {
+    pub(crate) variant: WriteLeaseVariant,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum WriteLeaseVariant {
+    Local,
+    DynamoDB { table: String },
+}
+
+#[pymethods]
+impl PyWriteLease {
+    /// Create a local (single-process) write lease.
+    #[staticmethod]
+    #[pyo3(name = "LOCAL")]
+    fn local() -> Self {
+        Self {
+            variant: WriteLeaseVariant::Local,
+        }
+    }
+
+    /// Create a DynamoDB-based distributed write lease.
+    #[staticmethod]
+    #[pyo3(name = "DYNAMODB")]
+    fn dynamodb(table: String) -> Self {
+        Self {
+            variant: WriteLeaseVariant::DynamoDB { table },
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        match &self.variant {
+            WriteLeaseVariant::Local => "WriteLease.LOCAL".to_string(),
+            WriteLeaseVariant::DynamoDB { table } => {
+                format!("WriteLease.DYNAMODB(table={:?})", table)
+            }
+        }
     }
 }
 

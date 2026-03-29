@@ -108,6 +108,7 @@ impl AsyncDatabase {
             cloud_config: None,
             uni_config: None,
             read_only: false,
+            write_lease: None,
         }
     }
 
@@ -128,9 +129,10 @@ impl AsyncDatabase {
         _exc_val: Option<Py<PyAny>>,
         _exc_tb: Option<Py<PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        // Shutdown on exit.
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let _ = core::flush_core(&inner).await;
+            let _ = inner.flush().await;
             Ok(false)
         })
     }
@@ -393,23 +395,6 @@ impl AsyncDatabase {
         }
     }
 
-    // ========================================================================
-    // Bulk Loading Methods
-    // ========================================================================
-
-    /// Create an async bulk writer builder.
-    fn bulk_writer(&self) -> AsyncBulkWriterBuilder {
-        AsyncBulkWriterBuilder {
-            inner: self.inner.clone(),
-            defer_vector_indexes: true,
-            defer_scalar_indexes: true,
-            batch_size: None,
-            async_indexes: false,
-            validate_constraints: None,
-            max_buffer_size_bytes: None,
-        }
-    }
-
     /// Create a schema builder.
     fn schema(&self) -> AsyncSchemaBuilder {
         AsyncSchemaBuilder {
@@ -459,6 +444,25 @@ impl AsyncDatabase {
     /// Get the current database configuration as a dict.
     fn config(&self, py: Python) -> PyResult<Py<pyo3::PyAny>> {
         convert::uni_config_to_py(py, self.inner.config())
+    }
+
+    /// Get the configured write lease, if any.
+    fn write_lease(&self) -> Option<crate::types::PyWriteLease> {
+        self.inner.write_lease().map(|wl| match wl {
+            ::uni_db::api::multi_agent::WriteLease::Local => crate::types::PyWriteLease {
+                variant: crate::types::WriteLeaseVariant::Local,
+            },
+            ::uni_db::api::multi_agent::WriteLease::DynamoDB { table } => {
+                crate::types::PyWriteLease {
+                    variant: crate::types::WriteLeaseVariant::DynamoDB {
+                        table: table.clone(),
+                    },
+                }
+            }
+            _ => crate::types::PyWriteLease {
+                variant: crate::types::WriteLeaseVariant::Local,
+            },
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -732,6 +736,7 @@ pub struct AsyncDatabaseBuilder {
     cloud_config: Option<uni_common::CloudStorageConfig>,
     uni_config: Option<uni_common::UniConfig>,
     read_only: bool,
+    write_lease: Option<crate::types::PyWriteLease>,
 }
 
 #[pymethods]
@@ -752,6 +757,7 @@ impl AsyncDatabaseBuilder {
             cloud_config: None,
             uni_config: None,
             read_only: false,
+            write_lease: None,
         }
     }
 
@@ -771,6 +777,7 @@ impl AsyncDatabaseBuilder {
             cloud_config: None,
             uni_config: None,
             read_only: false,
+            write_lease: None,
         }
     }
 
@@ -790,6 +797,7 @@ impl AsyncDatabaseBuilder {
             cloud_config: None,
             uni_config: None,
             read_only: false,
+            write_lease: None,
         }
     }
 
@@ -809,6 +817,7 @@ impl AsyncDatabaseBuilder {
             cloud_config: None,
             uni_config: None,
             read_only: false,
+            write_lease: None,
         }
     }
 
@@ -887,6 +896,15 @@ impl AsyncDatabaseBuilder {
         slf
     }
 
+    /// Configure write lease for multi-agent coordination.
+    fn write_lease(
+        mut slf: PyRefMut<'_, Self>,
+        lease: crate::types::PyWriteLease,
+    ) -> PyRefMut<'_, Self> {
+        slf.write_lease = Some(lease);
+        slf
+    }
+
     /// Build and return the AsyncDatabase instance (returns awaitable).
     fn build<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let uri = self.uri.clone();
@@ -901,6 +919,14 @@ impl AsyncDatabaseBuilder {
         let cloud_config = self.cloud_config.clone();
         let uni_config = self.uni_config.clone();
         let read_only = self.read_only;
+        let rust_write_lease = self.write_lease.as_ref().map(|wl| match &wl.variant {
+            crate::types::WriteLeaseVariant::Local => ::uni_db::api::multi_agent::WriteLease::Local,
+            crate::types::WriteLeaseVariant::DynamoDB { table } => {
+                ::uni_db::api::multi_agent::WriteLease::DynamoDB {
+                    table: table.clone(),
+                }
+            }
+        });
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let uni = core::build_database_core(
@@ -916,6 +942,7 @@ impl AsyncDatabaseBuilder {
                 cloud_config,
                 uni_config,
                 read_only,
+                rust_write_lease,
             )
             .await
             .map_err(PyErr::new::<pyo3::exceptions::PyIOError, _>)?;
@@ -1251,6 +1278,15 @@ impl AsyncTransaction {
         })
     }
 
+    /// Check if the transaction has been completed (committed or rolled back).
+    fn is_completed<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let guard = inner.lock().await;
+            Ok(guard.is_none())
+        })
+    }
+
     /// Async context manager support.
     fn __aenter__<'py>(slf: Bound<'py, Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let obj: Py<PyAny> = slf.into_any().unbind();
@@ -1341,6 +1377,27 @@ impl AsyncSession {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let mut guard = inner.lock().await;
             guard.set(key, val);
+            Ok(())
+        })
+    }
+
+    /// Set multiple session-scoped parameters at once.
+    fn set_all<'py>(
+        &self,
+        py: Python<'py>,
+        params: HashMap<String, Py<PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mut rust_params = HashMap::new();
+        for (k, v) in params {
+            let val = convert::py_object_to_value(py, &v)?;
+            rust_params.insert(k, val);
+        }
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let mut guard = inner.lock().await;
+            for (k, v) in rust_params {
+                guard.set(k, v);
+            }
             Ok(())
         })
     }
@@ -1466,6 +1523,29 @@ impl AsyncSession {
                 inner: Arc::new(tokio::sync::Mutex::new(Some(tx))),
             })
         })
+    }
+
+    /// Create a transaction builder for configuring transaction options.
+    fn tx_with(&self) -> AsyncTransactionBuilder {
+        AsyncTransactionBuilder {
+            session: self.inner.clone(),
+            timeout_secs: None,
+            isolation_level: None,
+        }
+    }
+
+    /// Create an async bulk writer builder for high-throughput data ingestion.
+    fn bulk_writer(&self) -> AsyncBulkWriterBuilder {
+        AsyncBulkWriterBuilder {
+            session: self.inner.clone(),
+            defer_vector_indexes: true,
+            defer_scalar_indexes: true,
+            batch_size: None,
+            async_indexes: false,
+            validate_constraints: None,
+            max_buffer_size_bytes: None,
+            on_progress: None,
+        }
     }
 
     /// Get the session ID.
@@ -1684,6 +1764,58 @@ impl AsyncSession {
         })
     }
 
+    /// Insert vertices in bulk within this session (auto-committed).
+    fn bulk_insert_vertices<'py>(
+        &self,
+        py: Python<'py>,
+        label: String,
+        vertices: Vec<HashMap<String, Py<PyAny>>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mut props_list = Vec::with_capacity(vertices.len());
+        for v in vertices {
+            let mut map = HashMap::new();
+            for (k, val) in v {
+                map.insert(k, convert::py_object_to_value(py, &val)?);
+            }
+            props_list.push(map);
+        }
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let guard = inner.lock().await;
+            let vids = guard
+                .bulk_insert_vertices(&label, props_list)
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(vids.into_iter().map(|v| v.as_u64()).collect::<Vec<u64>>())
+        })
+    }
+
+    /// Insert edges in bulk within this session (auto-committed).
+    fn bulk_insert_edges<'py>(
+        &self,
+        py: Python<'py>,
+        edge_type: String,
+        edges: Vec<(u64, u64, HashMap<String, Py<PyAny>>)>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mut edge_data = Vec::with_capacity(edges.len());
+        for (src, dst, props) in edges {
+            let mut map = HashMap::new();
+            for (k, v) in props {
+                map.insert(k, convert::py_object_to_value(py, &v)?);
+            }
+            edge_data.push((::uni_db::Vid::from(src), ::uni_db::Vid::from(dst), map));
+        }
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let guard = inner.lock().await;
+            guard
+                .bulk_insert_edges(&edge_type, edge_data)
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(())
+        })
+    }
+
     /// Cancel in-progress operations on this session.
     fn cancel<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
@@ -1810,6 +1942,60 @@ impl AsyncSession {
         })
     }
 
+    /// Register a user-defined function callable from Cypher/Locy.
+    fn register_function<'py>(
+        &self,
+        py: Python<'py>,
+        name: String,
+        func: Py<PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        struct PyUdfWrapper {
+            py_obj: Py<PyAny>,
+        }
+        unsafe impl Send for PyUdfWrapper {}
+        unsafe impl Sync for PyUdfWrapper {}
+
+        let wrapper = PyUdfWrapper {
+            py_obj: func.clone_ref(py),
+        };
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let guard = inner.lock().await;
+            guard
+                .register_function(&name, move |args: &[::uni_db::Value]| {
+                    Python::attach(|py| {
+                        let py_args: Vec<Py<PyAny>> = args
+                            .iter()
+                            .map(|v| crate::convert::value_to_py(py, v))
+                            .collect::<pyo3::PyResult<Vec<_>>>()
+                            .map_err(|e| {
+                                uni_common::UniError::Internal(anyhow::anyhow!(
+                                    "UDF arg conversion: {}",
+                                    e
+                                ))
+                            })?;
+                        let py_list = pyo3::types::PyList::new(py, &py_args).map_err(|e| {
+                            uni_common::UniError::Internal(anyhow::anyhow!(
+                                "UDF list creation: {}",
+                                e
+                            ))
+                        })?;
+                        let result = wrapper.py_obj.call1(py, (py_list,)).map_err(|e| {
+                            uni_common::UniError::Internal(anyhow::anyhow!("UDF call: {}", e))
+                        })?;
+                        crate::convert::py_object_to_value(py, &result).map_err(|e| {
+                            uni_common::UniError::Internal(anyhow::anyhow!(
+                                "UDF result conversion: {}",
+                                e
+                            ))
+                        })
+                    })
+                })
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(())
+        })
+    }
+
     /// Add a session hook (Python object with optional before_query/after_query/before_commit/after_commit methods).
     fn add_hook<'py>(&self, py: Python<'py>, hook: Py<PyAny>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
@@ -1826,6 +2012,23 @@ impl AsyncSession {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let guard = inner.lock().await;
             let builder = guard.appender(&label);
+            let appender = builder
+                .build()
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(crate::builders::StreamingAppender {
+                inner: std::sync::Mutex::new(Some(appender)),
+            })
+        })
+    }
+
+    /// Create a configurable appender builder for the given label.
+    fn appender_builder<'py>(&self, py: Python<'py>, label: String) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let guard = inner.lock().await;
+            let builder = guard.appender(&label);
+            // Return a StreamingAppender with default config; advanced config
+            // should use sync appender_builder for now.
             let appender = builder
                 .build()
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
@@ -1928,19 +2131,81 @@ impl AsyncCommitStream {
 }
 
 // ============================================================================
+// AsyncTransactionBuilder
+// ============================================================================
+
+/// Builder for configuring async transaction options.
+#[pyclass(name = "AsyncTransactionBuilder")]
+pub struct AsyncTransactionBuilder {
+    session: Arc<tokio::sync::Mutex<::uni_db::Session>>,
+    timeout_secs: Option<f64>,
+    isolation_level: Option<String>,
+}
+
+#[pymethods]
+impl AsyncTransactionBuilder {
+    /// Set transaction timeout in seconds.
+    fn timeout(mut slf: PyRefMut<'_, Self>, seconds: f64) -> PyRefMut<'_, Self> {
+        slf.timeout_secs = Some(seconds);
+        slf
+    }
+
+    /// Set isolation level (currently only "serialized" is supported).
+    fn isolation(mut slf: PyRefMut<'_, Self>, level: String) -> PyRefMut<'_, Self> {
+        slf.isolation_level = Some(level);
+        slf
+    }
+
+    /// Start the transaction.
+    fn start<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let session = self.session.clone();
+        let timeout_secs = self.timeout_secs;
+        let isolation_level = self.isolation_level.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let guard = session.lock().await;
+            let mut builder = guard.tx_with();
+            if let Some(t) = timeout_secs {
+                builder = builder.timeout(std::time::Duration::from_secs_f64(t));
+            }
+            if let Some(ref level) = isolation_level {
+                match level.to_lowercase().as_str() {
+                    "serialized" => {
+                        builder = builder.isolation(::uni_db::IsolationLevel::Serialized);
+                    }
+                    _ => {
+                        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                            "Unknown isolation level: {}",
+                            level
+                        )));
+                    }
+                }
+            }
+            let tx = builder
+                .start()
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(AsyncTransaction {
+                inner: Arc::new(tokio::sync::Mutex::new(Some(tx))),
+            })
+        })
+    }
+}
+
+// ============================================================================
 // AsyncBulkWriter (wrapping real Rust BulkWriter)
 // ============================================================================
 
 /// Builder for async bulk writer.
 #[pyclass]
 pub struct AsyncBulkWriterBuilder {
-    inner: Arc<Uni>,
+    session: Arc<tokio::sync::Mutex<::uni_db::Session>>,
     defer_vector_indexes: bool,
     defer_scalar_indexes: bool,
     batch_size: Option<usize>,
     async_indexes: bool,
     validate_constraints: Option<bool>,
     max_buffer_size_bytes: Option<usize>,
+    on_progress: Option<Py<PyAny>>,
 }
 
 #[pymethods]
@@ -1981,18 +2246,25 @@ impl AsyncBulkWriterBuilder {
         slf
     }
 
+    /// Set a progress callback invoked during bulk loading.
+    fn on_progress(mut slf: PyRefMut<'_, Self>, callback: Py<PyAny>) -> PyRefMut<'_, Self> {
+        slf.on_progress = Some(callback);
+        slf
+    }
+
     /// Build the AsyncBulkWriter.
     fn build<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
+        let session = self.session.clone();
         let defer_vector = self.defer_vector_indexes;
         let defer_scalar = self.defer_scalar_indexes;
         let batch_size = self.batch_size;
         let async_indexes = self.async_indexes;
         let validate_constraints = self.validate_constraints;
         let max_buffer_size_bytes = self.max_buffer_size_bytes;
+        let on_progress = self.on_progress.as_ref().map(|cb| cb.clone_ref(py));
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let session = inner.session();
-            let mut builder = session
+            let guard = session.lock().await;
+            let mut builder = guard
                 .bulk_writer()
                 .defer_vector_indexes(defer_vector)
                 .defer_scalar_indexes(defer_scalar)
@@ -2005,6 +2277,28 @@ impl AsyncBulkWriterBuilder {
             }
             if let Some(mbs) = max_buffer_size_bytes {
                 builder = builder.max_buffer_size_bytes(mbs);
+            }
+            if let Some(callback) = on_progress {
+                struct PyProgressWrapper {
+                    py_obj: Py<PyAny>,
+                }
+                unsafe impl Send for PyProgressWrapper {}
+
+                let wrapper = PyProgressWrapper { py_obj: callback };
+                builder =
+                    builder.on_progress(move |progress: ::uni_db::api::bulk::BulkProgress| {
+                        Python::attach(|py| {
+                            let py_progress = crate::types::BulkProgress {
+                                phase: format!("{:?}", progress.phase),
+                                rows_processed: progress.rows_processed,
+                                total_rows: progress.total_rows,
+                                current_label: progress.current_label.clone(),
+                            };
+                            if let Ok(bound) = Py::new(py, py_progress) {
+                                let _ = wrapper.py_obj.call1(py, (bound,));
+                            }
+                        });
+                    });
             }
             let real_writer = builder
                 .build()
@@ -2122,6 +2416,7 @@ impl AsyncBulkWriter {
             indexes_rebuilt: s.indexes_rebuilt,
             duration_secs: s.duration.as_secs_f64(),
             index_build_duration_secs: s.index_build_duration.as_secs_f64(),
+            index_task_ids: s.index_task_ids.clone(),
             indexes_pending: s.indexes_pending,
         })
     }
@@ -2175,6 +2470,7 @@ impl AsyncBulkWriter {
                 indexes_rebuilt: stats.indexes_rebuilt,
                 duration_secs: stats.duration.as_secs_f64(),
                 index_build_duration_secs: stats.index_build_duration.as_secs_f64(),
+                index_task_ids: stats.index_task_ids.clone(),
                 indexes_pending: stats.indexes_pending,
             })
         })

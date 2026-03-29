@@ -10800,11 +10800,15 @@ dependencies = [
 name = "uni-python"
 version = "0.3.0"
 dependencies = [
+ "anyhow",
+ "arrow-array",
+ "arrow-schema",
  "chrono",
  "pyo3",
  "pyo3-async-runtimes",
  "serde_json",
  "tokio",
+ "tokio-util",
  "uni-common",
  "uni-db",
  "uni-locy",

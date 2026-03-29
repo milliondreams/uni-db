@@ -32,6 +32,7 @@ pub struct DatabaseBuilder {
     pub(crate) cloud_config: Option<uni_common::CloudStorageConfig>,
     pub(crate) uni_config: Option<uni_common::UniConfig>,
     pub(crate) read_only: bool,
+    pub(crate) write_lease: Option<crate::types::PyWriteLease>,
 }
 
 #[pymethods]
@@ -52,6 +53,7 @@ impl DatabaseBuilder {
             cloud_config: None,
             uni_config: None,
             read_only: false,
+            write_lease: None,
         }
     }
 
@@ -71,6 +73,7 @@ impl DatabaseBuilder {
             cloud_config: None,
             uni_config: None,
             read_only: false,
+            write_lease: None,
         }
     }
 
@@ -90,6 +93,7 @@ impl DatabaseBuilder {
             cloud_config: None,
             uni_config: None,
             read_only: false,
+            write_lease: None,
         }
     }
 
@@ -109,6 +113,7 @@ impl DatabaseBuilder {
             cloud_config: None,
             uni_config: None,
             read_only: false,
+            write_lease: None,
         }
     }
 
@@ -187,8 +192,25 @@ impl DatabaseBuilder {
         slf
     }
 
+    /// Configure write lease for multi-agent coordination.
+    fn write_lease(
+        mut slf: PyRefMut<'_, Self>,
+        lease: crate::types::PyWriteLease,
+    ) -> PyRefMut<'_, Self> {
+        slf.write_lease = Some(lease);
+        slf
+    }
+
     /// Build and return the Database instance.
     fn build(&self) -> PyResult<crate::sync_api::Database> {
+        let rust_write_lease = self.write_lease.as_ref().map(|wl| match &wl.variant {
+            crate::types::WriteLeaseVariant::Local => ::uni_db::api::multi_agent::WriteLease::Local,
+            crate::types::WriteLeaseVariant::DynamoDB { table } => {
+                ::uni_db::api::multi_agent::WriteLease::DynamoDB {
+                    table: table.clone(),
+                }
+            }
+        });
         let uni = pyo3_async_runtimes::tokio::get_runtime()
             .block_on(core::build_database_core(
                 &self.uri,
@@ -203,119 +225,13 @@ impl DatabaseBuilder {
                 self.cloud_config.clone(),
                 self.uni_config.clone(),
                 self.read_only,
+                rust_write_lease,
             ))
             .map_err(PyErr::new::<pyo3::exceptions::PyIOError, _>)?;
 
         Ok(crate::sync_api::Database {
             inner: Arc::new(uni),
         })
-    }
-}
-
-// ============================================================================
-// QueryBuilder
-// ============================================================================
-
-/// Builder for constructing and executing parameterized queries.
-#[pyclass]
-pub struct QueryBuilder {
-    pub(crate) inner: Arc<Uni>,
-    pub(crate) cypher: String,
-    pub(crate) params: HashMap<String, Py<PyAny>>,
-    pub(crate) timeout_secs: Option<f64>,
-    pub(crate) max_memory: Option<usize>,
-}
-
-#[pymethods]
-impl QueryBuilder {
-    /// Bind a parameter to the query.
-    fn param(mut slf: PyRefMut<'_, Self>, name: String, value: Py<PyAny>) -> PyRefMut<'_, Self> {
-        slf.params.insert(name, value);
-        slf
-    }
-
-    /// Bind multiple parameters from a dictionary.
-    fn params(
-        mut slf: PyRefMut<'_, Self>,
-        params: HashMap<String, Py<PyAny>>,
-    ) -> PyRefMut<'_, Self> {
-        slf.params.extend(params);
-        slf
-    }
-
-    /// Set maximum execution time in seconds.
-    fn timeout(mut slf: PyRefMut<'_, Self>, seconds: f64) -> PyRefMut<'_, Self> {
-        slf.timeout_secs = Some(seconds);
-        slf
-    }
-
-    /// Set maximum memory for this query in bytes.
-    fn max_memory(mut slf: PyRefMut<'_, Self>, bytes: usize) -> PyRefMut<'_, Self> {
-        slf.max_memory = Some(bytes);
-        slf
-    }
-
-    /// Open a streaming cursor for this query.
-    fn cursor(&self, py: Python) -> PyResult<crate::sync_api::QueryCursor> {
-        let mut rust_params = HashMap::new();
-        for (k, v) in &self.params {
-            let val = convert::py_object_to_value(py, v)?;
-            rust_params.insert(k.clone(), val);
-        }
-        let cursor = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(core::query_cursor_core(
-                &self.inner,
-                &self.cypher,
-                rust_params,
-                self.timeout_secs,
-                self.max_memory,
-            ))
-            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
-        let columns = cursor.columns().to_vec();
-        Ok(crate::sync_api::QueryCursor {
-            cursor: std::sync::Mutex::new(Some(cursor)),
-            buffer: std::sync::Mutex::new(VecDeque::new()),
-            columns,
-        })
-    }
-
-    /// Execute a mutation query and return affected row count.
-    fn execute(&self, py: Python) -> PyResult<usize> {
-        let mut rust_params = HashMap::new();
-        for (k, v) in &self.params {
-            let val = convert::py_object_to_value(py, v)?;
-            rust_params.insert(k.clone(), val);
-        }
-
-        let result = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(core::execute_with_params_core(
-                &self.inner,
-                &self.cypher,
-                rust_params,
-            ))
-            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
-        Ok(result)
-    }
-
-    /// Execute the query and fetch all results as a `QueryResult`.
-    fn fetch_all(&self, py: Python) -> PyResult<crate::types::PyQueryResult> {
-        let mut rust_params = HashMap::new();
-        for (k, v) in &self.params {
-            let val = convert::py_object_to_value(py, v)?;
-            rust_params.insert(k.clone(), val);
-        }
-
-        let result = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(core::query_builder_core(
-                &self.inner,
-                &self.cypher,
-                rust_params,
-                self.timeout_secs,
-                self.max_memory,
-            ))
-            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
-
-        convert::query_result_to_py_class(py, result)
     }
 }
 
@@ -743,6 +659,31 @@ impl Session {
         })
     }
 
+    /// Create a configurable appender builder for the given label.
+    fn appender_builder(slf: Py<Self>, label: &str) -> PyAppenderBuilder {
+        PyAppenderBuilder {
+            session: slf,
+            label: label.to_string(),
+            batch_size: None,
+            defer_vector_indexes: None,
+            max_buffer_size_bytes: None,
+        }
+    }
+
+    /// Create a bulk writer builder for high-throughput data ingestion.
+    fn bulk_writer(slf: Py<Self>) -> BulkWriterBuilder {
+        BulkWriterBuilder {
+            session: slf,
+            defer_vector_indexes: true,
+            defer_scalar_indexes: true,
+            batch_size: None,
+            async_indexes: false,
+            validate_constraints: None,
+            max_buffer_size_bytes: None,
+            on_progress: None,
+        }
+    }
+
     /// Get session capabilities.
     fn capabilities(&self) -> crate::types::PySessionCapabilities {
         let caps = self.inner.capabilities();
@@ -924,6 +865,57 @@ impl Session {
         Ok(())
     }
 
+    /// Register a user-defined function callable from Cypher/Locy.
+    fn register_function(&self, py: Python, name: &str, func: Py<PyAny>) -> PyResult<()> {
+        // Wrap the Python callable in a Send+Sync struct.
+        struct PyUdfWrapper {
+            py_obj: Py<PyAny>,
+        }
+        // Safety: Py<PyAny> is reference-counted and GIL-independent.
+        // All access goes through Python::attach.
+        unsafe impl Send for PyUdfWrapper {}
+        unsafe impl Sync for PyUdfWrapper {}
+
+        let wrapper = PyUdfWrapper {
+            py_obj: func.clone_ref(py),
+        };
+        self.inner
+            .register_function(name, move |args: &[::uni_db::Value]| {
+                Python::attach(|py| {
+                    let py_args: Vec<Py<PyAny>> = args
+                        .iter()
+                        .map(|v| convert::value_to_py(py, v))
+                        .collect::<PyResult<Vec<_>>>()
+                        .map_err(|e| {
+                            uni_common::UniError::Internal(anyhow::anyhow!(
+                                "UDF arg conversion: {}",
+                                e
+                            ))
+                        })?;
+                    let py_list = pyo3::types::PyList::new(py, &py_args).map_err(|e| {
+                        uni_common::UniError::Internal(anyhow::anyhow!("UDF list creation: {}", e))
+                    })?;
+                    let result = wrapper.py_obj.call1(py, (py_list,)).map_err(|e| {
+                        uni_common::UniError::Internal(anyhow::anyhow!("UDF call: {}", e))
+                    })?;
+                    convert::py_object_to_value(py, &result).map_err(|e| {
+                        uni_common::UniError::Internal(anyhow::anyhow!(
+                            "UDF result conversion: {}",
+                            e
+                        ))
+                    })
+                })
+            })
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+    }
+
+    /// Get a cancellation token for this session.
+    fn cancellation_token(&self) -> crate::types::PyCancellationToken {
+        crate::types::PyCancellationToken {
+            inner: self.inner.cancellation_token(),
+        }
+    }
+
     /// Cancel in-progress operations on this session.
     fn cancel(&mut self) {
         self.inner.cancel();
@@ -963,6 +955,7 @@ impl Session {
             params: HashMap::new(),
             timeout_secs: None,
             max_memory: None,
+            cancellation_token: None,
         }
     }
 
@@ -984,6 +977,8 @@ impl Session {
             params: HashMap::new(),
             timeout_secs: None,
             max_iterations: None,
+            locy_config: None,
+            cancellation_token: None,
         }
     }
 
@@ -1097,6 +1092,7 @@ pub struct SessionQueryBuilder {
     pub(crate) params: HashMap<String, Py<PyAny>>,
     pub(crate) timeout_secs: Option<f64>,
     pub(crate) max_memory: Option<usize>,
+    pub(crate) cancellation_token: Option<crate::types::PyCancellationToken>,
 }
 
 #[pymethods]
@@ -1128,6 +1124,15 @@ impl SessionQueryBuilder {
         slf
     }
 
+    /// Attach a cancellation token to this query.
+    fn cancellation_token(
+        mut slf: PyRefMut<'_, Self>,
+        token: crate::types::PyCancellationToken,
+    ) -> PyRefMut<'_, Self> {
+        slf.cancellation_token = Some(token);
+        slf
+    }
+
     /// Fetch all results as a `QueryResult`.
     fn fetch_all(&self, py: Python) -> PyResult<crate::types::PyQueryResult> {
         let session = self.session.borrow(py);
@@ -1141,6 +1146,9 @@ impl SessionQueryBuilder {
         }
         if let Some(m) = self.max_memory {
             builder = builder.max_memory(m);
+        }
+        if let Some(ref ct) = self.cancellation_token {
+            builder = builder.cancellation_token(ct.inner.clone());
         }
         let result = pyo3_async_runtimes::tokio::get_runtime()
             .block_on(builder.fetch_all())
@@ -1167,6 +1175,9 @@ impl SessionQueryBuilder {
         }
         if let Some(m) = self.max_memory {
             builder = builder.max_memory(m);
+        }
+        if let Some(ref ct) = self.cancellation_token {
+            builder = builder.cancellation_token(ct.inner.clone());
         }
         let cursor = pyo3_async_runtimes::tokio::get_runtime()
             .block_on(builder.cursor())
@@ -1229,6 +1240,8 @@ pub struct SessionLocyBuilder {
     pub(crate) params: HashMap<String, Py<PyAny>>,
     pub(crate) timeout_secs: Option<f64>,
     pub(crate) max_iterations: Option<usize>,
+    pub(crate) locy_config: Option<HashMap<String, Py<PyAny>>>,
+    pub(crate) cancellation_token: Option<crate::types::PyCancellationToken>,
 }
 
 #[pymethods]
@@ -1260,6 +1273,24 @@ impl SessionLocyBuilder {
         slf
     }
 
+    /// Apply a full Locy configuration dict.
+    fn with_config(
+        mut slf: PyRefMut<'_, Self>,
+        config: HashMap<String, Py<PyAny>>,
+    ) -> PyRefMut<'_, Self> {
+        slf.locy_config = Some(config);
+        slf
+    }
+
+    /// Attach a cancellation token to this evaluation.
+    fn cancellation_token(
+        mut slf: PyRefMut<'_, Self>,
+        token: crate::types::PyCancellationToken,
+    ) -> PyRefMut<'_, Self> {
+        slf.cancellation_token = Some(token);
+        slf
+    }
+
     /// Execute the Locy evaluation.
     fn run(&self, py: Python) -> PyResult<crate::types::PyLocyResult> {
         let session = self.session.borrow(py);
@@ -1273,6 +1304,17 @@ impl SessionLocyBuilder {
         }
         if let Some(n) = self.max_iterations {
             builder = builder.max_iterations(n);
+        }
+        if let Some(ref config) = self.locy_config {
+            let cloned: HashMap<String, Py<PyAny>> = config
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone_ref(py)))
+                .collect();
+            let locy_config = convert::extract_locy_config(py, cloned)?;
+            builder = builder.with_config(locy_config);
+        }
+        if let Some(ref ct) = self.cancellation_token {
+            builder = builder.cancellation_token(ct.inner.clone());
         }
         let result = pyo3_async_runtimes::tokio::get_runtime()
             .block_on(builder.run())
@@ -1376,6 +1418,7 @@ pub struct PyTxQueryBuilder {
     pub(crate) tx: Py<super::sync_api::Transaction>,
     pub(crate) cypher: String,
     pub(crate) params: HashMap<String, Py<PyAny>>,
+    pub(crate) timeout_secs: Option<f64>,
 }
 
 #[pymethods]
@@ -1383,6 +1426,12 @@ impl PyTxQueryBuilder {
     /// Bind a parameter.
     fn param(mut slf: PyRefMut<'_, Self>, name: String, value: Py<PyAny>) -> PyRefMut<'_, Self> {
         slf.params.insert(name, value);
+        slf
+    }
+
+    /// Set query timeout in seconds.
+    fn timeout(mut slf: PyRefMut<'_, Self>, seconds: f64) -> PyRefMut<'_, Self> {
+        slf.timeout_secs = Some(seconds);
         slf
     }
 
@@ -1396,6 +1445,9 @@ impl PyTxQueryBuilder {
         for (k, v) in &self.params {
             let val = convert::py_object_to_value(py, v)?;
             builder = builder.param(k, val);
+        }
+        if let Some(t) = self.timeout_secs {
+            builder = builder.timeout(std::time::Duration::from_secs_f64(t));
         }
         let result = pyo3_async_runtimes::tokio::get_runtime()
             .block_on(builder.fetch_all())
@@ -1424,6 +1476,31 @@ impl PyTxQueryBuilder {
             .block_on(builder.run())
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
         convert::execute_result_to_py(py, result)
+    }
+
+    /// Open a streaming cursor.
+    fn cursor(&self, py: Python) -> PyResult<crate::sync_api::QueryCursor> {
+        let tx_ref = self.tx.borrow(py);
+        let tx = tx_ref.inner.as_ref().ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Transaction already completed")
+        })?;
+        let mut builder = tx.query_with(&self.cypher);
+        for (k, v) in &self.params {
+            let val = convert::py_object_to_value(py, v)?;
+            builder = builder.param(k, val);
+        }
+        if let Some(t) = self.timeout_secs {
+            builder = builder.timeout(std::time::Duration::from_secs_f64(t));
+        }
+        let cursor = pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(builder.cursor())
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        let columns = cursor.columns().to_vec();
+        Ok(crate::sync_api::QueryCursor {
+            cursor: std::sync::Mutex::new(Some(cursor)),
+            buffer: std::sync::Mutex::new(VecDeque::new()),
+            columns,
+        })
     }
 }
 
@@ -1479,6 +1556,8 @@ pub struct PyTxLocyBuilder {
     pub(crate) params: HashMap<String, Py<PyAny>>,
     pub(crate) timeout_secs: Option<f64>,
     pub(crate) max_iterations: Option<usize>,
+    pub(crate) locy_config: Option<HashMap<String, Py<PyAny>>>,
+    pub(crate) cancellation_token: Option<crate::types::PyCancellationToken>,
 }
 
 #[pymethods]
@@ -1501,6 +1580,24 @@ impl PyTxLocyBuilder {
         slf
     }
 
+    /// Apply a full Locy configuration dict.
+    fn with_config(
+        mut slf: PyRefMut<'_, Self>,
+        config: HashMap<String, Py<PyAny>>,
+    ) -> PyRefMut<'_, Self> {
+        slf.locy_config = Some(config);
+        slf
+    }
+
+    /// Attach a cancellation token to this evaluation.
+    fn cancellation_token(
+        mut slf: PyRefMut<'_, Self>,
+        token: crate::types::PyCancellationToken,
+    ) -> PyRefMut<'_, Self> {
+        slf.cancellation_token = Some(token);
+        slf
+    }
+
     /// Execute the Locy evaluation.
     fn run(&self, py: Python) -> PyResult<crate::types::PyLocyResult> {
         let tx_ref = self.tx.borrow(py);
@@ -1517,6 +1614,17 @@ impl PyTxLocyBuilder {
         }
         if let Some(n) = self.max_iterations {
             builder = builder.max_iterations(n);
+        }
+        if let Some(ref config) = self.locy_config {
+            let cloned: HashMap<String, Py<PyAny>> = config
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone_ref(py)))
+                .collect();
+            let locy_config = convert::extract_locy_config(py, cloned)?;
+            builder = builder.with_config(locy_config);
+        }
+        if let Some(ref ct) = self.cancellation_token {
+            builder = builder.cancellation_token(ct.inner.clone());
         }
         let result = pyo3_async_runtimes::tokio::get_runtime()
             .block_on(builder.run())
@@ -1598,6 +1706,14 @@ impl ::uni_db::SessionHook for PySessionHook {
                 py_ctx
                     .set_item("query_type", format!("{:?}", ctx.query_type))
                     .ok();
+                // Enrich: pass params dict
+                let params_dict = pyo3::types::PyDict::new(py);
+                for (k, v) in &ctx.params {
+                    if let Ok(py_v) = convert::value_to_py(py, v) {
+                        params_dict.set_item(k, py_v).ok();
+                    }
+                }
+                py_ctx.set_item("params", params_dict).ok();
                 if let Err(e) = method.call1(py, (py_ctx,)) {
                     return Err(uni_common::UniError::HookRejected {
                         message: e.to_string(),
@@ -1608,13 +1724,27 @@ impl ::uni_db::SessionHook for PySessionHook {
         })
     }
 
-    fn after_query(&self, ctx: &::uni_db::HookContext, _metrics: &::uni_db::QueryMetrics) {
+    fn after_query(&self, ctx: &::uni_db::HookContext, metrics: &::uni_db::QueryMetrics) {
         Python::attach(|py| {
             if let Ok(method) = self.py_obj.getattr(py, "after_query") {
                 let py_ctx = pyo3::types::PyDict::new(py);
                 py_ctx.set_item("session_id", &ctx.session_id).ok();
                 py_ctx.set_item("query_text", &ctx.query_text).ok();
-                let _ = method.call1(py, (py_ctx,));
+                // Enrich: pass metrics as second argument (with fallback to 1-arg)
+                if let Ok(py_metrics) = convert::query_metrics_to_py_class(py, metrics) {
+                    if method
+                        .call1(py, (py_ctx.as_any(), py_metrics.bind(py).as_any()))
+                        .is_err()
+                    {
+                        // Fallback: try 1-arg call for backward compat
+                        let py_ctx2 = pyo3::types::PyDict::new(py);
+                        py_ctx2.set_item("session_id", &ctx.session_id).ok();
+                        py_ctx2.set_item("query_text", &ctx.query_text).ok();
+                        let _ = method.call1(py, (py_ctx2,));
+                    }
+                } else {
+                    let _ = method.call1(py, (py_ctx,));
+                }
             }
         });
     }
@@ -1636,14 +1766,44 @@ impl ::uni_db::SessionHook for PySessionHook {
         })
     }
 
-    fn after_commit(&self, ctx: &::uni_db::CommitHookContext, _result: &::uni_db::CommitResult) {
+    fn after_commit(&self, ctx: &::uni_db::CommitHookContext, result: &::uni_db::CommitResult) {
         Python::attach(|py| {
             if let Ok(method) = self.py_obj.getattr(py, "after_commit") {
                 let py_ctx = pyo3::types::PyDict::new(py);
                 py_ctx.set_item("session_id", &ctx.session_id).ok();
                 py_ctx.set_item("tx_id", &ctx.tx_id).ok();
                 py_ctx.set_item("mutation_count", ctx.mutation_count).ok();
-                let _ = method.call1(py, (py_ctx,));
+                // Enrich: pass commit result as second argument (with fallback)
+                let py_result = crate::types::PyCommitResult {
+                    mutations_committed: result.mutations_committed,
+                    rules_promoted: result.rules_promoted,
+                    version: result.version,
+                    started_at_version: result.started_at_version,
+                    wal_lsn: result.wal_lsn,
+                    duration_secs: result.duration.as_secs_f64(),
+                    rule_promotion_errors: result
+                        .rule_promotion_errors
+                        .iter()
+                        .map(|e| crate::types::PyRulePromotionError {
+                            rule_text: e.rule_text.clone(),
+                            error: e.error.clone(),
+                        })
+                        .collect(),
+                };
+                if let Ok(bound) = Py::new(py, py_result) {
+                    if method
+                        .call1(py, (py_ctx.as_any(), bound.bind(py).as_any()))
+                        .is_err()
+                    {
+                        let py_ctx2 = pyo3::types::PyDict::new(py);
+                        py_ctx2.set_item("session_id", &ctx.session_id).ok();
+                        py_ctx2.set_item("tx_id", &ctx.tx_id).ok();
+                        py_ctx2.set_item("mutation_count", ctx.mutation_count).ok();
+                        let _ = method.call1(py, (py_ctx2,));
+                    }
+                } else {
+                    let _ = method.call1(py, (py_ctx,));
+                }
             }
         });
     }
@@ -1698,6 +1858,7 @@ impl StreamingAppender {
             indexes_rebuilt: stats.indexes_rebuilt,
             duration_secs: stats.duration.as_secs_f64(),
             index_build_duration_secs: stats.index_build_duration.as_secs_f64(),
+            index_task_ids: stats.index_task_ids.clone(),
             indexes_pending: stats.indexes_pending,
         })
     }
@@ -1709,6 +1870,63 @@ impl StreamingAppender {
             appender.abort();
         }
         Ok(())
+    }
+
+    /// Write an Arrow RecordBatch of rows.
+    ///
+    /// Accepts a PyArrow RecordBatch. Uses the Arrow PyCapsule C Data Interface
+    /// (`__arrow_c_array__`) for zero-copy transfer.
+    fn write_batch(&self, batch: &Bound<'_, PyAny>) -> PyResult<()> {
+        // Use Arrow PyCapsule interface (__arrow_c_array__) for zero-copy
+        let capsule_tuple = batch.call_method0("__arrow_c_array__").map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyTypeError, _>(format!(
+                "Expected a PyArrow RecordBatch with __arrow_c_array__ support: {}",
+                e
+            ))
+        })?;
+        let schema_capsule = capsule_tuple.get_item(0)?;
+        let array_capsule = capsule_tuple.get_item(1)?;
+
+        // Extract raw pointers from PyCapsules and convert via Arrow FFI
+        let (ffi_schema, ffi_array) = unsafe {
+            let schema_ptr =
+                pyo3::ffi::PyCapsule_GetPointer(schema_capsule.as_ptr(), c"arrow_schema".as_ptr())
+                    as *mut arrow_array::ffi::FFI_ArrowSchema;
+            let array_ptr =
+                pyo3::ffi::PyCapsule_GetPointer(array_capsule.as_ptr(), c"arrow_array".as_ptr())
+                    as *mut arrow_array::ffi::FFI_ArrowArray;
+            // Move out of the capsule pointers (Arrow C Data Interface: consumer owns the data)
+            (std::ptr::read(schema_ptr), std::ptr::read(array_ptr))
+        };
+
+        let array_data = unsafe {
+            arrow_array::ffi::from_ffi(ffi_array, &ffi_schema).map_err(
+                |e: arrow_schema::ArrowError| {
+                    PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string())
+                },
+            )?
+        };
+        let struct_array = arrow_array::StructArray::from(array_data);
+        let schema = arrow_schema::Schema::new(
+            struct_array
+                .fields()
+                .iter()
+                .map(|f| f.as_ref().clone())
+                .collect::<Vec<_>>(),
+        );
+        let record_batch = arrow_array::RecordBatch::try_new(
+            std::sync::Arc::new(schema),
+            struct_array.columns().to_vec(),
+        )
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
+
+        let mut guard = self.inner.lock().unwrap();
+        let appender = guard.as_mut().ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Appender already finished")
+        })?;
+        pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(appender.write_batch(&record_batch))
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
     }
 
     /// Number of rows currently buffered.
@@ -1853,6 +2071,62 @@ impl SessionTemplate {
 }
 
 // ============================================================================
+// AppenderBuilder
+// ============================================================================
+
+/// Builder for configuring a StreamingAppender with advanced options.
+#[pyclass(name = "AppenderBuilder")]
+pub struct PyAppenderBuilder {
+    pub(crate) session: Py<Session>,
+    pub(crate) label: String,
+    pub(crate) batch_size: Option<usize>,
+    pub(crate) defer_vector_indexes: Option<bool>,
+    pub(crate) max_buffer_size_bytes: Option<usize>,
+}
+
+#[pymethods]
+impl PyAppenderBuilder {
+    /// Set batch size for flushing to storage.
+    fn batch_size(mut slf: PyRefMut<'_, Self>, size: usize) -> PyRefMut<'_, Self> {
+        slf.batch_size = Some(size);
+        slf
+    }
+
+    /// Set whether to defer vector index building.
+    fn defer_vector_indexes(mut slf: PyRefMut<'_, Self>, defer: bool) -> PyRefMut<'_, Self> {
+        slf.defer_vector_indexes = Some(defer);
+        slf
+    }
+
+    /// Set maximum buffer size in bytes.
+    fn max_buffer_size_bytes(mut slf: PyRefMut<'_, Self>, size: usize) -> PyRefMut<'_, Self> {
+        slf.max_buffer_size_bytes = Some(size);
+        slf
+    }
+
+    /// Build and return the StreamingAppender.
+    fn build(&self, py: Python) -> PyResult<StreamingAppender> {
+        let session = self.session.borrow(py);
+        let mut builder = session.inner.appender(&self.label);
+        if let Some(bs) = self.batch_size {
+            builder = builder.batch_size(bs);
+        }
+        if let Some(dvi) = self.defer_vector_indexes {
+            builder = builder.defer_vector_indexes(dvi);
+        }
+        if let Some(mbs) = self.max_buffer_size_bytes {
+            builder = builder.max_buffer_size_bytes(mbs);
+        }
+        let appender = builder
+            .build()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        Ok(StreamingAppender {
+            inner: std::sync::Mutex::new(Some(appender)),
+        })
+    }
+}
+
+// ============================================================================
 // BulkWriterBuilder and BulkWriter (wrapping real Rust BulkWriter)
 // ============================================================================
 
@@ -1861,13 +2135,14 @@ impl SessionTemplate {
 /// Wraps the Rust `Session::bulk_writer()` → `BulkWriterBuilder` chain.
 #[pyclass]
 pub struct BulkWriterBuilder {
-    pub(crate) inner: Arc<Uni>,
+    pub(crate) session: Py<Session>,
     pub(crate) defer_vector_indexes: bool,
     pub(crate) defer_scalar_indexes: bool,
     pub(crate) batch_size: Option<usize>,
     pub(crate) async_indexes: bool,
     pub(crate) validate_constraints: Option<bool>,
     pub(crate) max_buffer_size_bytes: Option<usize>,
+    pub(crate) on_progress: Option<Py<PyAny>>,
 }
 
 #[pymethods]
@@ -1908,12 +2183,16 @@ impl BulkWriterBuilder {
         slf
     }
 
+    /// Set a progress callback invoked during bulk loading.
+    fn on_progress(mut slf: PyRefMut<'_, Self>, callback: Py<PyAny>) -> PyRefMut<'_, Self> {
+        slf.on_progress = Some(callback);
+        slf
+    }
+
     /// Build the BulkWriter.
-    ///
-    /// Creates a Session internally and acquires a write context on it.
-    fn build(&self) -> PyResult<BulkWriter> {
-        let session = self.inner.session();
-        let mut builder = session.bulk_writer();
+    fn build(&self, py: Python) -> PyResult<BulkWriter> {
+        let session_ref = self.session.borrow(py);
+        let mut builder = session_ref.inner.bulk_writer();
         builder = builder
             .defer_vector_indexes(self.defer_vector_indexes)
             .defer_scalar_indexes(self.defer_scalar_indexes)
@@ -1926,6 +2205,29 @@ impl BulkWriterBuilder {
         }
         if let Some(mbs) = self.max_buffer_size_bytes {
             builder = builder.max_buffer_size_bytes(mbs);
+        }
+        if let Some(ref callback) = self.on_progress {
+            struct PyProgressWrapper {
+                py_obj: Py<PyAny>,
+            }
+            unsafe impl Send for PyProgressWrapper {}
+
+            let wrapper = PyProgressWrapper {
+                py_obj: callback.clone_ref(py),
+            };
+            builder = builder.on_progress(move |progress: ::uni_db::api::bulk::BulkProgress| {
+                Python::attach(|py| {
+                    let py_progress = crate::types::BulkProgress {
+                        phase: format!("{:?}", progress.phase),
+                        rows_processed: progress.rows_processed,
+                        total_rows: progress.total_rows,
+                        current_label: progress.current_label.clone(),
+                    };
+                    if let Ok(bound) = Py::new(py, py_progress) {
+                        let _ = wrapper.py_obj.call1(py, (bound,));
+                    }
+                });
+            });
         }
         let real_writer = builder
             .build()
@@ -2026,6 +2328,7 @@ impl BulkWriter {
                 indexes_rebuilt: s.indexes_rebuilt,
                 duration_secs: s.duration.as_secs_f64(),
                 index_build_duration_secs: s.index_build_duration.as_secs_f64(),
+                index_task_ids: s.index_task_ids.clone(),
                 indexes_pending: s.indexes_pending,
             })
         })
@@ -2061,6 +2364,7 @@ impl BulkWriter {
             indexes_rebuilt: stats.indexes_rebuilt,
             duration_secs: stats.duration.as_secs_f64(),
             index_build_duration_secs: stats.index_build_duration.as_secs_f64(),
+            index_task_ids: stats.index_task_ids.clone(),
             indexes_pending: stats.indexes_pending,
         })
     }
@@ -2097,100 +2401,5 @@ impl BulkWriter {
             self.abort()?;
         }
         Ok(false)
-    }
-}
-
-// ============================================================================
-// LocyBuilder (sync)
-// ============================================================================
-
-/// Builder for constructing and executing Locy evaluations.
-#[pyclass]
-pub struct LocyBuilder {
-    pub(crate) inner: Arc<Uni>,
-    pub(crate) program: String,
-    pub(crate) params: HashMap<String, Py<PyAny>>,
-    pub(crate) timeout_secs: Option<f64>,
-    pub(crate) max_iterations: Option<usize>,
-    pub(crate) config: Option<HashMap<String, Py<PyAny>>>,
-}
-
-#[pymethods]
-impl LocyBuilder {
-    /// Bind a single parameter.
-    fn param(mut slf: PyRefMut<'_, Self>, name: String, value: Py<PyAny>) -> PyRefMut<'_, Self> {
-        slf.params.insert(name, value);
-        slf
-    }
-
-    /// Bind multiple parameters from a dictionary.
-    fn params(
-        mut slf: PyRefMut<'_, Self>,
-        params: HashMap<String, Py<PyAny>>,
-    ) -> PyRefMut<'_, Self> {
-        slf.params.extend(params);
-        slf
-    }
-
-    /// Set maximum execution time in seconds.
-    fn timeout(mut slf: PyRefMut<'_, Self>, seconds: f64) -> PyRefMut<'_, Self> {
-        slf.timeout_secs = Some(seconds);
-        slf
-    }
-
-    /// Set maximum fixpoint iterations.
-    fn max_iterations(mut slf: PyRefMut<'_, Self>, n: usize) -> PyRefMut<'_, Self> {
-        slf.max_iterations = Some(n);
-        slf
-    }
-
-    /// Set full Locy config dict.
-    fn config(
-        mut slf: PyRefMut<'_, Self>,
-        config: HashMap<String, Py<PyAny>>,
-    ) -> PyRefMut<'_, Self> {
-        slf.config = Some(config);
-        slf
-    }
-
-    /// Execute the Locy evaluation.
-    fn run(&self, py: Python) -> PyResult<crate::types::PyLocyResult> {
-        // Extract params while we have the GIL
-        let mut rust_params = HashMap::new();
-        for (k, v) in &self.params {
-            let val = convert::py_object_to_value(py, v)?;
-            rust_params.insert(k.clone(), val);
-        }
-
-        // Build config from the config dict if provided, otherwise default
-        let mut locy_config = if let Some(ref cfg) = self.config {
-            // Re-extract: convert HashMap<String, Py<PyAny>> to owned HashMap for extract_locy_config
-            let cfg_owned: HashMap<String, Py<PyAny>> = cfg
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone_ref(py)))
-                .collect();
-            convert::extract_locy_config(py, cfg_owned)?
-        } else {
-            ::uni_db::locy::LocyConfig::default()
-        };
-
-        // Merge explicit params
-        locy_config.params.extend(rust_params);
-
-        if let Some(t) = self.timeout_secs {
-            locy_config.timeout = std::time::Duration::from_secs_f64(t);
-        }
-        if let Some(n) = self.max_iterations {
-            locy_config.max_iterations = n;
-        }
-
-        let result = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(core::locy_evaluate_with_config_core(
-                &self.inner,
-                &self.program,
-                locy_config,
-            ))
-            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
-        convert::locy_result_to_py_class(py, result)
     }
 }

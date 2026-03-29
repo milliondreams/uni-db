@@ -3,7 +3,7 @@
 
 //! Synchronous Python API — `Database`, `Transaction`, and `LocyEngine`.
 
-use crate::builders::{BulkWriterBuilder, SchemaBuilder, SessionBuilder};
+use crate::builders::{SchemaBuilder, SessionBuilder};
 use crate::convert;
 use crate::core;
 use crate::types::*;
@@ -314,6 +314,7 @@ impl Transaction {
             tx: slf,
             cypher: cypher.to_string(),
             params: HashMap::new(),
+            timeout_secs: None,
         }
     }
 
@@ -335,6 +336,8 @@ impl Transaction {
             params: HashMap::new(),
             timeout_secs: None,
             max_iterations: None,
+            locy_config: None,
+            cancellation_token: None,
         }
     }
 
@@ -387,6 +390,14 @@ impl Transaction {
     /// Check if the transaction has been completed (committed or rolled back).
     fn is_completed(&self) -> bool {
         self.inner.is_none()
+    }
+
+    /// Get a cancellation token for this transaction.
+    fn cancellation_token(&self) -> PyResult<crate::types::PyCancellationToken> {
+        let tx = self.check_active()?;
+        Ok(crate::types::PyCancellationToken {
+            inner: tx.cancellation_token(),
+        })
     }
 
     fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
@@ -497,8 +508,8 @@ impl Database {
         _exc_val: Option<Py<PyAny>>,
         _exc_tb: Option<Py<PyAny>>,
     ) -> PyResult<bool> {
-        // Flush on exit to ensure data durability.
-        let _ = pyo3_async_runtimes::tokio::get_runtime().block_on(core::flush_core(&self.inner));
+        // Shutdown on exit.
+        let _ = self.shutdown();
         Ok(false)
     }
 
@@ -739,23 +750,6 @@ impl Database {
         }
     }
 
-    // ========================================================================
-    // Bulk Loading Methods
-    // ========================================================================
-
-    /// Create a bulk writer builder.
-    fn bulk_writer(&self) -> BulkWriterBuilder {
-        BulkWriterBuilder {
-            inner: self.inner.clone(),
-            defer_vector_indexes: true,
-            defer_scalar_indexes: true,
-            batch_size: None,
-            async_indexes: false,
-            validate_constraints: None,
-            max_buffer_size_bytes: None,
-        }
-    }
-
     /// Register Locy rules at the database level.
     fn register_rules(&self, program: &str) -> PyResult<()> {
         self.inner
@@ -810,14 +804,14 @@ impl Database {
     // -----------------------------------------------------------------------
 
     /// Compact a label's storage files.
-    fn compact_label(&self, label: &str) -> PyResult<()> {
+    fn compact_label(&self, label: &str) -> PyResult<crate::types::PyCompactionStats> {
         pyo3_async_runtimes::tokio::get_runtime()
             .block_on(core::compact_label_core(&self.inner, label))
             .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
     }
 
     /// Compact an edge type's storage files.
-    fn compact_edge_type(&self, edge_type: &str) -> PyResult<()> {
+    fn compact_edge_type(&self, edge_type: &str) -> PyResult<crate::types::PyCompactionStats> {
         pyo3_async_runtimes::tokio::get_runtime()
             .block_on(core::compact_edge_type_core(&self.inner, edge_type))
             .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
@@ -909,6 +903,25 @@ impl Database {
     /// Get the current database configuration as a dict.
     fn config(&self, py: Python) -> PyResult<Py<pyo3::PyAny>> {
         convert::uni_config_to_py(py, self.inner.config())
+    }
+
+    /// Get the configured write lease, if any.
+    fn write_lease(&self) -> Option<crate::types::PyWriteLease> {
+        self.inner.write_lease().map(|wl| match wl {
+            ::uni_db::api::multi_agent::WriteLease::Local => crate::types::PyWriteLease {
+                variant: crate::types::WriteLeaseVariant::Local,
+            },
+            ::uni_db::api::multi_agent::WriteLease::DynamoDB { table } => {
+                crate::types::PyWriteLease {
+                    variant: crate::types::WriteLeaseVariant::DynamoDB {
+                        table: table.clone(),
+                    },
+                }
+            }
+            _ => crate::types::PyWriteLease {
+                variant: crate::types::WriteLeaseVariant::Local,
+            },
+        })
     }
 }
 

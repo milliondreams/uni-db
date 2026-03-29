@@ -34,8 +34,6 @@ fn _uni_db(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<builders::DatabaseBuilder>()?;
     m.add_class::<sync_api::Transaction>()?;
 
-    // Sync query (legacy Database-level builder, kept for backward compat)
-    m.add_class::<builders::QueryBuilder>()?;
     m.add_class::<sync_api::QueryCursor>()?;
 
     // Schema
@@ -64,9 +62,6 @@ fn _uni_db(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<builders::BulkWriterBuilder>()?;
     m.add_class::<builders::BulkWriter>()?;
 
-    // Locy builder (legacy, for Database-level LocyBuilder)
-    m.add_class::<builders::LocyBuilder>()?;
-
     // Async classes
     m.add_class::<async_api::AsyncDatabase>()?;
     m.add_class::<async_api::AsyncXervo>()?;
@@ -76,6 +71,7 @@ fn _uni_db(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<async_api::AsyncSessionBuilder>()?;
     m.add_class::<async_api::AsyncBulkWriter>()?;
     m.add_class::<async_api::AsyncBulkWriterBuilder>()?;
+    m.add_class::<async_api::AsyncTransactionBuilder>()?;
     m.add_class::<async_api::AsyncQueryBuilder>()?;
     m.add_class::<async_api::AsyncQueryCursor>()?;
     m.add_class::<async_api::AsyncSchemaBuilder>()?;
@@ -139,6 +135,15 @@ fn _uni_db(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<builders::SessionTemplateBuilder>()?;
     m.add_class::<builders::SessionTemplate>()?;
     m.add_class::<builders::StreamingAppender>()?;
+
+    // Phase B: New Python types
+    m.add_class::<types::PyCancellationToken>()?;
+    m.add_class::<types::PyPreparedQueryBinder>()?;
+    m.add_class::<types::PyPreparedLocyBinder>()?;
+    m.add_class::<types::PyWriteLease>()?;
+
+    // Phase C: AppenderBuilder
+    m.add_class::<builders::PyAppenderBuilder>()?;
 
     Ok(())
 }

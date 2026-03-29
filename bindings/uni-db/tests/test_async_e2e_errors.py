@@ -53,7 +53,8 @@ async def test_operations_on_committed_bulk_writer_raise_error(async_empty_db):
     await async_empty_db.create_label("Person")
     await async_empty_db.add_property("Person", "name", "string", False)
 
-    writer = async_empty_db.bulk_writer().build()
+    session = async_empty_db.session()
+    writer = await session.bulk_writer().build()
     await writer.insert_vertices("Person", [{"name": "Alice"}])
     await writer.commit()
 
@@ -71,7 +72,8 @@ async def test_operations_on_aborted_bulk_writer_raise_error(async_empty_db):
     await async_empty_db.create_label("Person")
     await async_empty_db.add_property("Person", "name", "string", False)
 
-    writer = async_empty_db.bulk_writer().build()
+    session = async_empty_db.session()
+    writer = await session.bulk_writer().build()
     await writer.insert_vertices("Person", [{"name": "Alice"}])
     writer.abort()
 

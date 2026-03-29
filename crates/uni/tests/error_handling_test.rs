@@ -72,7 +72,7 @@ async fn test_transaction_expired_on_commit() -> anyhow::Result<()> {
 async fn test_session_cancel() -> anyhow::Result<()> {
     let db = Uni::in_memory().build().await?;
 
-    let mut session = db.session();
+    let session = db.session();
 
     // Cancel with no in-flight queries — must not panic
     session.cancel();
@@ -138,7 +138,7 @@ async fn test_write_guard_released_on_appender_abort() -> anyhow::Result<()> {
 
     // Create an appender and abort it
     {
-        let mut appender = session.appender("Row").build()?;
+        let appender = session.appender("Row").build()?;
         appender.abort();
     }
 

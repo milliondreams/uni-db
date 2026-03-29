@@ -53,8 +53,8 @@ def test_type_mismatch_string_into_int_field(social_db):
 
 def test_operations_on_committed_bulk_writer(social_db):
     """Operations on a committed bulk writer should raise RuntimeError."""
-    db = social_db
-    writer = db.bulk_writer().build()
+    session = social_db.session()
+    writer = session.bulk_writer().build()
 
     # Commit the writer
     writer.commit()
@@ -66,8 +66,8 @@ def test_operations_on_committed_bulk_writer(social_db):
 
 def test_operations_on_aborted_bulk_writer(social_db):
     """Operations on an aborted bulk writer should raise RuntimeError."""
-    db = social_db
-    writer = db.bulk_writer().build()
+    session = social_db.session()
+    writer = session.bulk_writer().build()
 
     # Abort the writer
     writer.abort()
@@ -137,8 +137,8 @@ def test_operations_after_transaction_rollback(social_db):
 
 def test_bulk_writer_double_commit(social_db):
     """Double commit on bulk writer should raise RuntimeError."""
-    db = social_db
-    writer = db.bulk_writer().build()
+    session = social_db.session()
+    writer = session.bulk_writer().build()
 
     # Insert some data
     writer.insert_vertices("Person", [{"name": "Alice", "age": 30}])
@@ -153,8 +153,8 @@ def test_bulk_writer_double_commit(social_db):
 
 def test_bulk_writer_double_abort(social_db):
     """Double abort on bulk writer is a no-op (does not raise)."""
-    db = social_db
-    writer = db.bulk_writer().build()
+    session = social_db.session()
+    writer = session.bulk_writer().build()
 
     # Insert some data
     writer.insert_vertices("Person", [{"name": "Alice", "age": 30}])
@@ -168,8 +168,8 @@ def test_bulk_writer_double_abort(social_db):
 
 def test_bulk_writer_commit_after_abort(social_db):
     """Committing after abort should raise RuntimeError."""
-    db = social_db
-    writer = db.bulk_writer().build()
+    session = social_db.session()
+    writer = session.bulk_writer().build()
 
     writer.abort()
 
@@ -179,8 +179,8 @@ def test_bulk_writer_commit_after_abort(social_db):
 
 def test_bulk_writer_abort_after_commit(social_db):
     """Aborting after commit should raise RuntimeError."""
-    db = social_db
-    writer = db.bulk_writer().build()
+    session = social_db.session()
+    writer = session.bulk_writer().build()
 
     writer.commit()
 
@@ -237,8 +237,8 @@ def test_missing_required_property(social_db):
 
 def test_bulk_writer_insert_after_commit(social_db):
     """Insert operations after bulk writer commit should raise RuntimeError."""
-    db = social_db
-    writer = db.bulk_writer().build()
+    session = social_db.session()
+    writer = session.bulk_writer().build()
 
     writer.insert_vertices("Person", [{"name": "Alice", "age": 30}])
     writer.commit()
@@ -250,8 +250,8 @@ def test_bulk_writer_insert_after_commit(social_db):
 
 def test_bulk_writer_insert_edges_after_abort(social_db):
     """Insert edge operations after bulk writer abort should raise RuntimeError."""
-    db = social_db
-    writer = db.bulk_writer().build()
+    session = social_db.session()
+    writer = session.bulk_writer().build()
 
     # Insert vertices first
     vids = writer.insert_vertices(

@@ -218,7 +218,7 @@ fn bench_ingest_vertices(c: &mut Criterion) {
                                 .param("name", Value::String(format!("Bench_{}", i)))
                                 .param("age", Value::Int(30))
                                 .param("embedding", embedding_value.clone())
-                                .execute()
+                                .fetch_all()
                                 .await
                                 .unwrap();
                         }

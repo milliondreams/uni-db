@@ -28,12 +28,14 @@ class TestBulkWriter:
 
     def test_bulk_writer_builder(self, db):
         """Test creating a bulk writer with builder."""
-        writer = db.bulk_writer().batch_size(1000).build()
+        session = db.session()
+        writer = session.bulk_writer().batch_size(1000).build()
         assert writer is not None
 
     def test_bulk_insert_vertices(self, db):
         """Test bulk inserting vertices."""
-        writer = db.bulk_writer().build()
+        session = db.session()
+        writer = session.bulk_writer().build()
 
         # Insert multiple vertices
         vids = writer.insert_vertices(
@@ -49,13 +51,16 @@ class TestBulkWriter:
         writer.commit()
 
         # Verify vertices were inserted
-        results = db.query("MATCH (n:Person) RETURN n.name AS name ORDER BY n.name")
+        results = session.query(
+            "MATCH (n:Person) RETURN n.name AS name ORDER BY n.name"
+        )
         assert len(results) == 3
         assert results[0]["name"] == "Alice"
 
     def test_bulk_insert_edges(self, db):
         """Test bulk inserting edges."""
-        writer = db.bulk_writer().build()
+        session = db.session()
+        writer = session.bulk_writer().build()
 
         # First insert vertices
         person_vids = writer.insert_vertices(
@@ -76,14 +81,15 @@ class TestBulkWriter:
         writer.commit()
 
         # Verify edges
-        results = db.query(
+        results = session.query(
             "MATCH (p:Person)-[:WORKS_AT]->(c:Company) RETURN p.name AS p_name, c.name AS c_name"
         )
         assert len(results) == 2
 
     def test_bulk_writer_abort(self, db):
         """Test aborting a bulk write operation prevents further operations."""
-        writer = db.bulk_writer().build()
+        session = db.session()
+        writer = session.bulk_writer().build()
 
         writer.insert_vertices(
             "Person",
@@ -98,8 +104,9 @@ class TestBulkWriter:
 
     def test_bulk_writer_deferred_indexes(self, db):
         """Test bulk writer with deferred index building."""
+        session = db.session()
         writer = (
-            db.bulk_writer()
+            session.bulk_writer()
             .defer_scalar_indexes(True)
             .defer_vector_indexes(True)
             .build()
@@ -123,7 +130,8 @@ class TestBulkStats:
             db = uni_db.DatabaseBuilder.open(tmpdir).build()
             db.create_label("Test")
 
-            writer = db.bulk_writer().build()
+            session = db.session()
+            writer = session.bulk_writer().build()
             writer.insert_vertices("Test", [{"value": 1}])
             stats = writer.commit()
 

@@ -74,7 +74,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .param("name", Value::String(format!("Bench_{}", i)))
             .param("age", Value::Int(30))
             .param("embedding", embedding_value.clone())
-            .execute()
+            .fetch_all()
             .await?;
     }
     let duration2 = start.elapsed();

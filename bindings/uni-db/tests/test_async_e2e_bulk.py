@@ -205,11 +205,16 @@ async def test_large_batch_insert(async_social_db):
 @pytest.mark.asyncio
 async def test_data_correctness_after_bulk_insert(async_empty_db):
     """Test that bulk inserted data maintains correctness."""
-    await async_empty_db.create_label("Member")
-    await async_empty_db.add_property("Member", "name", "string", False)
-    await async_empty_db.add_property("Member", "age", "int", True)
-    await async_empty_db.add_property("Member", "active", "bool", True)
-    await async_empty_db.add_property("Member", "score", "float", True)
+    await (
+        async_empty_db.schema()
+        .label("Member")
+        .property("name", "string")
+        .property_nullable("age", "int")
+        .property_nullable("active", "bool")
+        .property_nullable("score", "float")
+        .done()
+        .apply()
+    )
 
     vertices = [
         {"name": "Olivia", "age": 29, "active": True, "score": 95.5},

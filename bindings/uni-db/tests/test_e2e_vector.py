@@ -6,8 +6,9 @@
 
 def test_basic_vector_search_knn(ecommerce_db_populated):
     """Test basic K-NN vector search returns top k results."""
+    session = ecommerce_db_populated.session()
 
-    results = ecommerce_db_populated.query("""
+    results = session.query("""
         CALL uni.vector.query('Product', 'embedding', [1.0, 0.0, 0.0, 0.0], 3)
         YIELD vid, distance
         RETURN vid, distance
@@ -18,8 +19,9 @@ def test_basic_vector_search_knn(ecommerce_db_populated):
 
 def test_vector_search_ordered_by_distance(ecommerce_db_populated):
     """Test vector search results are ordered by increasing distance."""
+    session = ecommerce_db_populated.session()
 
-    results = ecommerce_db_populated.query("""
+    results = session.query("""
         CALL uni.vector.query('Product', 'embedding', [1.0, 0.0, 0.0, 0.0], 4)
         YIELD vid, distance
         RETURN vid, distance
@@ -34,8 +36,9 @@ def test_vector_search_ordered_by_distance(ecommerce_db_populated):
 
 def test_vector_search_vid_and_distance(ecommerce_db_populated):
     """Test vector search returns vid and distance with correct types."""
+    session = ecommerce_db_populated.session()
 
-    results = ecommerce_db_populated.query("""
+    results = session.query("""
         CALL uni.vector.query('Product', 'embedding', [1.0, 0.0, 0.0, 0.0], 1)
         YIELD vid, distance
         RETURN vid, distance
@@ -51,8 +54,9 @@ def test_vector_search_vid_and_distance(ecommerce_db_populated):
 
 def test_vector_search_with_k(ecommerce_db_populated):
     """Test vector search with different k values."""
+    session = ecommerce_db_populated.session()
 
-    results = ecommerce_db_populated.query("""
+    results = session.query("""
         CALL uni.vector.query('Product', 'embedding', [1.0, 0.0, 0.0, 0.0], 2)
         YIELD vid, distance
         RETURN vid, distance
@@ -63,8 +67,9 @@ def test_vector_search_with_k(ecommerce_db_populated):
 
 def test_vector_search_with_threshold(ecommerce_db_populated):
     """Test vector search with distance threshold filtering."""
+    session = ecommerce_db_populated.session()
 
-    results_tight = ecommerce_db_populated.query("""
+    results_tight = session.query("""
         CALL uni.vector.query('Product', 'embedding', [1.0, 0.0, 0.0, 0.0], 10, NULL, 0.5)
         YIELD vid, distance
         RETURN vid, distance
@@ -74,7 +79,7 @@ def test_vector_search_with_threshold(ecommerce_db_populated):
         "All matches should be within threshold"
     )
 
-    results_wide = ecommerce_db_populated.query("""
+    results_wide = session.query("""
         CALL uni.vector.query('Product', 'embedding', [1.0, 0.0, 0.0, 0.0], 10, NULL, 2.0)
         YIELD vid, distance
         RETURN vid, distance
@@ -87,8 +92,9 @@ def test_vector_search_with_threshold(ecommerce_db_populated):
 
 def test_vector_search_fetch_nodes(ecommerce_db_populated):
     """Test vector search with YIELD node to get full node properties."""
+    session = ecommerce_db_populated.session()
 
-    results = ecommerce_db_populated.query("""
+    results = session.query("""
         CALL uni.vector.query('Product', 'embedding', [1.0, 0.0, 0.0, 0.0], 3)
         YIELD node, distance
         RETURN node.name AS name, node.price AS price, distance
@@ -105,8 +111,9 @@ def test_vector_search_fetch_nodes(ecommerce_db_populated):
 
 def test_fetch_nodes_returns_properties_and_distance(ecommerce_db_populated):
     """Test fetch_nodes returns node properties and ordered distances."""
+    session = ecommerce_db_populated.session()
 
-    results = ecommerce_db_populated.query("""
+    results = session.query("""
         CALL uni.vector.query('Product', 'embedding', [1.0, 0.0, 0.0, 0.0], 2)
         YIELD node, distance
         RETURN node.name AS name, node.price AS price, distance
@@ -118,6 +125,7 @@ def test_fetch_nodes_returns_properties_and_distance(ecommerce_db_populated):
 
 def test_cosine_metric_index(empty_db):
     """Test creating and using a cosine metric vector index."""
+    session = empty_db.session()
 
     (
         empty_db.schema()
@@ -128,14 +136,16 @@ def test_cosine_metric_index(empty_db):
         .apply()
     )
 
-    empty_db.execute("CREATE (d:CosineDoc {title: 'Doc1', vec: [1.0, 0.0, 0.0]})")
-    empty_db.execute("CREATE (d:CosineDoc {title: 'Doc2', vec: [0.0, 1.0, 0.0]})")
-    empty_db.execute("CREATE (d:CosineDoc {title: 'Doc3', vec: [0.707, 0.707, 0.0]})")
+    session.execute("CREATE (d:CosineDoc {title: 'Doc1', vec: [1.0, 0.0, 0.0]})")
+    session.execute("CREATE (d:CosineDoc {title: 'Doc2', vec: [0.0, 1.0, 0.0]})")
+    session.execute("CREATE (d:CosineDoc {title: 'Doc3', vec: [0.707, 0.707, 0.0]})")
     empty_db.flush()
 
-    empty_db.create_vector_index("CosineDoc", "vec", "cosine")
+    empty_db.schema().label("CosineDoc").index(
+        "vec", {"type": "vector", "metric": "cosine"}
+    ).apply()
 
-    results = empty_db.query("""
+    results = session.query("""
         CALL uni.vector.query('CosineDoc', 'vec', [1.0, 0.0, 0.0], 3)
         YIELD node, distance
         RETURN node.title AS title, distance
@@ -149,8 +159,9 @@ def test_cosine_metric_index(empty_db):
 
 def test_vector_search_with_graph_traversal(ecommerce_db_populated):
     """Test combining vector search with graph traversal."""
+    session = ecommerce_db_populated.session()
 
-    results = ecommerce_db_populated.query("""
+    results = session.query("""
         CALL uni.vector.query('Product', 'embedding', [1.0, 0.0, 0.0, 0.0], 3)
         YIELD node, distance
         MATCH (node)-[:IN_CATEGORY]->(c:Category)
@@ -162,8 +173,9 @@ def test_vector_search_with_graph_traversal(ecommerce_db_populated):
 
 def test_vector_search_with_filter_expression(ecommerce_db_populated):
     """Test vector search with pre-filter expression."""
+    session = ecommerce_db_populated.session()
 
-    results_expensive = ecommerce_db_populated.query("""
+    results_expensive = session.query("""
         CALL uni.vector.query('Product', 'embedding', [1.0, 0.0, 0.0, 0.0], 10, 'price > 500')
         YIELD node, distance
         RETURN node.name AS name, node.price AS price, distance
@@ -172,7 +184,7 @@ def test_vector_search_with_filter_expression(ecommerce_db_populated):
     for row in results_expensive:
         assert row["price"] > 500, f"Product {row['name']} should have price > 500"
 
-    results_cheap = ecommerce_db_populated.query("""
+    results_cheap = session.query("""
         CALL uni.vector.query('Product', 'embedding', [1.0, 0.0, 0.0, 0.0], 10, 'price < 100')
         YIELD node, distance
         RETURN node.name AS name, node.price AS price, distance
@@ -190,6 +202,7 @@ def test_vector_search_with_filter_expression(ecommerce_db_populated):
 
 def test_vector_search_empty_results(empty_db):
     """Test vector search on label with no data returns empty results."""
+    session = empty_db.session()
 
     (
         empty_db.schema()
@@ -200,21 +213,24 @@ def test_vector_search_empty_results(empty_db):
         .apply()
     )
 
-    empty_db.create_vector_index("EmptyLabel", "vec", "l2")
+    empty_db.schema().label("EmptyLabel").index(
+        "vec", {"type": "vector", "metric": "l2"}
+    ).apply()
 
-    results = empty_db.query("""
+    results = session.query("""
         CALL uni.vector.query('EmptyLabel', 'vec', [1.0, 0.0, 0.0, 0.0], 5)
         YIELD vid, distance
         RETURN vid, distance
     """)
 
-    assert results == [], "Should return empty list for label with no data"
+    assert len(results) == 0, "Should return empty result for label with no data"
 
 
 def test_vector_search_k_larger_than_dataset(ecommerce_db_populated):
     """Test vector search with k larger than available nodes."""
+    session = ecommerce_db_populated.session()
 
-    results = ecommerce_db_populated.query("""
+    results = session.query("""
         CALL uni.vector.query('Product', 'embedding', [1.0, 0.0, 0.0, 0.0], 100)
         YIELD vid, distance
         RETURN vid, distance
@@ -226,8 +242,9 @@ def test_vector_search_k_larger_than_dataset(ecommerce_db_populated):
 
 def test_vector_search_threshold_excludes_distant_results(ecommerce_db_populated):
     """Test threshold properly excludes results beyond distance limit."""
+    session = ecommerce_db_populated.session()
 
-    results = ecommerce_db_populated.query("""
+    results = session.query("""
         CALL uni.vector.query('Product', 'embedding', [0.0, 0.0, 1.0, 0.0], 10, NULL, 0.1)
         YIELD node, distance
         RETURN node.name AS name, distance
@@ -240,14 +257,15 @@ def test_vector_search_threshold_excludes_distant_results(ecommerce_db_populated
 
 def test_vector_search_chained_constraints(ecommerce_db_populated):
     """Test vector search with both filter and threshold."""
+    session = ecommerce_db_populated.session()
 
-    results = ecommerce_db_populated.query("""
+    results = session.query("""
         CALL uni.vector.query('Product', 'embedding', [1.0, 0.0, 0.0, 0.0], 5, 'price > 0', 1.5)
         YIELD node, distance
         RETURN node.name AS name, node.price AS price, distance
     """)
 
-    assert isinstance(results, list)
+    assert isinstance(results, object)
     for row in results:
         assert row["distance"] <= 1.5, "Distance should be within threshold"
         assert row["price"] > 0, "Price should satisfy filter"
@@ -255,6 +273,7 @@ def test_vector_search_chained_constraints(ecommerce_db_populated):
 
 def test_vector_search_different_dimensions(empty_db):
     """Test vector search with different dimensionality vectors."""
+    session = empty_db.session()
 
     (
         empty_db.schema()
@@ -265,14 +284,16 @@ def test_vector_search_different_dimensions(empty_db):
         .apply()
     )
 
-    empty_db.execute("CREATE (d:Doc5D {name: 'A', vec5: [1.0, 0.0, 0.0, 0.0, 0.0]})")
-    empty_db.execute("CREATE (d:Doc5D {name: 'B', vec5: [0.0, 1.0, 0.0, 0.0, 0.0]})")
-    empty_db.execute("CREATE (d:Doc5D {name: 'C', vec5: [0.0, 0.0, 1.0, 0.0, 0.0]})")
+    session.execute("CREATE (d:Doc5D {name: 'A', vec5: [1.0, 0.0, 0.0, 0.0, 0.0]})")
+    session.execute("CREATE (d:Doc5D {name: 'B', vec5: [0.0, 1.0, 0.0, 0.0, 0.0]})")
+    session.execute("CREATE (d:Doc5D {name: 'C', vec5: [0.0, 0.0, 1.0, 0.0, 0.0]})")
     empty_db.flush()
 
-    empty_db.create_vector_index("Doc5D", "vec5", "l2")
+    empty_db.schema().label("Doc5D").index(
+        "vec5", {"type": "vector", "metric": "l2"}
+    ).apply()
 
-    results = empty_db.query("""
+    results = session.query("""
         CALL uni.vector.query('Doc5D', 'vec5', [1.0, 0.0, 0.0, 0.0, 0.0], 2)
         YIELD vid, distance
         RETURN vid, distance

@@ -9,14 +9,14 @@ import pytest
 @pytest.mark.asyncio
 async def test_session_with_single_variable(async_social_db):
     """Test creating a session with a single variable."""
-    await async_social_db.execute("CREATE (p:Person {name: 'Alice', age: 30})")
-    await async_social_db.execute("CREATE (p:Person {name: 'Bob', age: 25})")
+    setup = async_social_db.session()
+    await setup.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+    await setup.execute("CREATE (p:Person {name: 'Bob', age: 25})")
     await async_social_db.flush()
 
-    # Create session with single variable
-    builder = async_social_db.session()
-    builder.set("min_age", 25)
-    session = builder.build()
+    # Create session and set single variable
+    session = async_social_db.session()
+    await session.set("min_age", 25)
 
     result = await session.query(
         "MATCH (p:Person) WHERE p.age >= $session.min_age RETURN p.name as name ORDER BY name"
@@ -29,21 +29,19 @@ async def test_session_with_single_variable(async_social_db):
 @pytest.mark.asyncio
 async def test_session_with_multiple_variables(async_social_db):
     """Test creating a session with multiple variables."""
-    await async_social_db.execute(
+    setup = async_social_db.session()
+    await setup.execute(
         "CREATE (p:Person {name: 'Alice', age: 30, email: 'alice@nyc.com'})"
     )
-    await async_social_db.execute(
-        "CREATE (p:Person {name: 'Bob', age: 25, email: 'bob@la.com'})"
-    )
-    await async_social_db.execute(
+    await setup.execute("CREATE (p:Person {name: 'Bob', age: 25, email: 'bob@la.com'})")
+    await setup.execute(
         "CREATE (p:Person {name: 'Charlie', age: 35, email: 'charlie@nyc.com'})"
     )
     await async_social_db.flush()
 
-    builder = async_social_db.session()
-    builder.set("min_age", 28)
-    builder.set("max_age", 40)
-    session = builder.build()
+    session = async_social_db.session()
+    await session.set("min_age", 28)
+    await session.set("max_age", 40)
 
     result = await session.query(
         "MATCH (p:Person) WHERE p.age >= $session.min_age AND p.age <= $session.max_age RETURN p.name as name ORDER BY name"
@@ -56,30 +54,29 @@ async def test_session_with_multiple_variables(async_social_db):
 @pytest.mark.asyncio
 async def test_session_get_nonexistent_returns_none(async_social_db):
     """Test that getting a nonexistent variable returns None."""
-    builder = async_social_db.session()
-    builder.set("existing_key", "value")
-    session = builder.build()
+    session = async_social_db.session()
+    await session.set("existing_key", "value")
 
-    value = session.get("existing_key")
+    value = await session.get("existing_key")
     assert value == "value"
 
-    value = session.get("nonexistent_key")
+    value = await session.get("nonexistent_key")
     assert value is None
 
 
 @pytest.mark.asyncio
 async def test_session_query(async_social_db):
     """Test querying through a session."""
-    await async_social_db.execute("CREATE (p:Person {name: 'Alice', age: 30})")
-    await async_social_db.execute("CREATE (p:Person {name: 'Bob', age: 25})")
-    await async_social_db.execute(
+    setup = async_social_db.session()
+    await setup.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+    await setup.execute("CREATE (p:Person {name: 'Bob', age: 25})")
+    await setup.execute(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) CREATE (a)-[:KNOWS]->(b)"
     )
     await async_social_db.flush()
 
-    builder = async_social_db.session()
-    builder.set("person_name", "Alice")
-    session = builder.build()
+    session = async_social_db.session()
+    await session.set("person_name", "Alice")
 
     result = await session.query(
         "MATCH (p:Person {name: $session.person_name})-[:KNOWS]->(friend) RETURN friend.name as friend_name"
@@ -99,33 +96,32 @@ async def test_session_query(async_social_db):
 @pytest.mark.asyncio
 async def test_session_execute(async_social_db):
     """Test executing mutations through a session."""
-    builder = async_social_db.session()
-    builder.set("person_name", "SessionPerson")
-    builder.set("person_age", 40)
-    session = builder.build()
+    session = async_social_db.session()
+    await session.set("person_name", "SessionPerson")
+    await session.set("person_age", 40)
 
-    count = await session.execute(
+    result = await session.execute(
         "CREATE (p:Person {name: $session.person_name, age: $session.person_age})"
     )
-    assert count == 1
+    assert result.nodes_created >= 1
 
-    result = await async_social_db.query(
+    verify = async_social_db.session()
+    result = await verify.query(
         "MATCH (p:Person {name: 'SessionPerson'}) RETURN p.age as age"
     )
     assert len(result) == 1
     assert result[0]["age"] == 40
 
-    builder2 = async_social_db.session()
-    builder2.set("name_to_update", "SessionPerson")
-    builder2.set("new_age", 41)
-    session2 = builder2.build()
+    session2 = async_social_db.session()
+    await session2.set("name_to_update", "SessionPerson")
+    await session2.set("new_age", 41)
 
-    count = await session2.execute(
+    result = await session2.execute(
         "MATCH (p:Person {name: $session.name_to_update}) SET p.age = $session.new_age"
     )
-    assert count == 1
+    assert result.properties_set >= 1
 
-    result = await async_social_db.query(
+    result = await verify.query(
         "MATCH (p:Person {name: 'SessionPerson'}) RETURN p.age as age"
     )
     assert len(result) == 1
@@ -135,15 +131,15 @@ async def test_session_execute(async_social_db):
 @pytest.mark.asyncio
 async def test_session_variables_persist_across_queries(async_social_db):
     """Test that session variables persist across multiple queries."""
-    await async_social_db.execute("CREATE (p:Person {name: 'Alice', age: 30})")
-    await async_social_db.execute("CREATE (p:Person {name: 'Bob', age: 25})")
-    await async_social_db.execute("CREATE (p:Person {name: 'Charlie', age: 35})")
+    setup = async_social_db.session()
+    await setup.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+    await setup.execute("CREATE (p:Person {name: 'Bob', age: 25})")
+    await setup.execute("CREATE (p:Person {name: 'Charlie', age: 35})")
     await async_social_db.flush()
 
-    builder = async_social_db.session()
-    builder.set("min_age", 30)
-    builder.set("max_age", 40)
-    session = builder.build()
+    session = async_social_db.session()
+    await session.set("min_age", 30)
+    await session.set("max_age", 40)
 
     # First query using min_age
     result = await session.query(
@@ -167,16 +163,17 @@ async def test_session_variables_persist_across_queries(async_social_db):
     assert result[0]["name"] == "Alice"
     assert result[1]["name"] == "Charlie"
 
-    assert session.get("min_age") == 30
-    assert session.get("max_age") == 40
+    assert await session.get("min_age") == 30
+    assert await session.get("max_age") == 40
 
     # Execute mutation using session variables
-    count = await session.execute(
+    result = await session.execute(
         "MATCH (p:Person) WHERE p.age >= $session.min_age SET p.email = 'senior@example.com'"
     )
-    assert count == 2
+    assert result.properties_set >= 1
 
-    result = await async_social_db.query(
+    verify = async_social_db.session()
+    result = await verify.query(
         "MATCH (p:Person {email: 'senior@example.com'}) RETURN p.name as name ORDER BY name"
     )
     assert len(result) == 2

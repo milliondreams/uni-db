@@ -17,13 +17,20 @@ class TestBulkWriter:
     def db(self):
         """Create a database with schema for bulk loading."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            db = uni_db.DatabaseBuilder.open(tmpdir).build()
-            db.create_label("Person")
-            db.add_property("Person", "name", "string", False)
-            db.add_property("Person", "age", "int", False)
-            db.create_label("Company")
-            db.add_property("Company", "name", "string", False)
-            db.create_edge_type("WORKS_AT", ["Person"], ["Company"])
+            db = uni_db.UniBuilder.open(tmpdir).build()
+            (
+                db.schema()
+                .label("Person")
+                .property("name", "string")
+                .property("age", "int")
+                .done()
+                .label("Company")
+                .property("name", "string")
+                .done()
+                .edge_type("WORKS_AT", ["Person"], ["Company"])
+                .done()
+                .apply()
+            )
             yield db
 
     def test_bulk_writer_builder(self, db):
@@ -127,8 +134,8 @@ class TestBulkStats:
     def test_bulk_stats_attributes(self):
         """Test BulkStats has expected attributes."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            db = uni_db.DatabaseBuilder.open(tmpdir).build()
-            db.create_label("Test")
+            db = uni_db.UniBuilder.open(tmpdir).build()
+            db.schema().label("Test").apply()
 
             session = db.session()
             writer = session.bulk_writer().build()

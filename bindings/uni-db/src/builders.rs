@@ -16,8 +16,8 @@ use uni_common::core::schema::{DataType, IndexDefinition};
 // DatabaseBuilder
 // ============================================================================
 
-/// Builder for creating and configuring a Database instance.
-#[pyclass]
+/// Builder for creating and configuring a Uni instance.
+#[pyclass(name = "UniBuilder")]
 #[derive(Debug, Clone)]
 pub struct DatabaseBuilder {
     pub(crate) uri: String,
@@ -186,6 +186,22 @@ impl DatabaseBuilder {
         Ok(slf)
     }
 
+    /// Set I/O batch size (default 1024).
+    fn batch_size(mut slf: PyRefMut<'_, Self>, size: usize) -> PyRefMut<'_, Self> {
+        slf.uni_config
+            .get_or_insert_with(uni_common::UniConfig::default)
+            .batch_size = size;
+        slf
+    }
+
+    /// Enable or disable write-ahead log (default true).
+    fn wal_enabled(mut slf: PyRefMut<'_, Self>, enabled: bool) -> PyRefMut<'_, Self> {
+        slf.uni_config
+            .get_or_insert_with(uni_common::UniConfig::default)
+            .wal_enabled = enabled;
+        slf
+    }
+
     /// Open the database in read-only mode (no writes allowed).
     fn read_only(mut slf: PyRefMut<'_, Self>) -> PyRefMut<'_, Self> {
         slf.read_only = true;
@@ -227,7 +243,7 @@ impl DatabaseBuilder {
                 self.read_only,
                 rust_write_lease,
             ))
-            .map_err(PyErr::new::<pyo3::exceptions::PyIOError, _>)?;
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
 
         Ok(crate::sync_api::Database {
             inner: Arc::new(uni),
@@ -296,7 +312,7 @@ impl SchemaBuilder {
                 &self.pending_properties,
                 &self.pending_indexes,
             ))
-            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
         Ok(())
     }
 }
@@ -345,25 +361,35 @@ pub struct LabelBuilder {
 #[pymethods]
 impl LabelBuilder {
     /// Add a required property to this label.
-    fn property(
-        mut slf: PyRefMut<'_, Self>,
+    fn property<'py>(
+        mut slf: PyRefMut<'py, Self>,
         name: String,
-        data_type: String,
-    ) -> PyResult<PyRefMut<'_, Self>> {
-        let dt = core::parse_data_type(&data_type)
-            .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?;
+        data_type: &Bound<'py, PyAny>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let dt = if let Ok(py_dt) = data_type.extract::<crate::types::PyDataType>() {
+            py_dt.inner
+        } else {
+            let s: String = data_type.extract()?;
+            crate::core::parse_data_type(&s)
+                .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?
+        };
         slf.properties.push((name, dt, false));
         Ok(slf)
     }
 
     /// Add a nullable property to this label.
-    fn property_nullable(
-        mut slf: PyRefMut<'_, Self>,
+    fn property_nullable<'py>(
+        mut slf: PyRefMut<'py, Self>,
         name: String,
-        data_type: String,
-    ) -> PyResult<PyRefMut<'_, Self>> {
-        let dt = core::parse_data_type(&data_type)
-            .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?;
+        data_type: &Bound<'py, PyAny>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let dt = if let Ok(py_dt) = data_type.extract::<crate::types::PyDataType>() {
+            py_dt.inner
+        } else {
+            let s: String = data_type.extract()?;
+            crate::core::parse_data_type(&s)
+                .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?
+        };
         slf.properties.push((name, dt, true));
         Ok(slf)
     }
@@ -452,25 +478,35 @@ pub struct EdgeTypeBuilder {
 #[pymethods]
 impl EdgeTypeBuilder {
     /// Add a required property to this edge type.
-    fn property(
-        mut slf: PyRefMut<'_, Self>,
+    fn property<'py>(
+        mut slf: PyRefMut<'py, Self>,
         name: String,
-        data_type: String,
-    ) -> PyResult<PyRefMut<'_, Self>> {
-        let dt = core::parse_data_type(&data_type)
-            .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?;
+        data_type: &Bound<'py, PyAny>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let dt = if let Ok(py_dt) = data_type.extract::<crate::types::PyDataType>() {
+            py_dt.inner
+        } else {
+            let s: String = data_type.extract()?;
+            crate::core::parse_data_type(&s)
+                .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?
+        };
         slf.properties.push((name, dt, false));
         Ok(slf)
     }
 
     /// Add a nullable property to this edge type.
-    fn property_nullable(
-        mut slf: PyRefMut<'_, Self>,
+    fn property_nullable<'py>(
+        mut slf: PyRefMut<'py, Self>,
         name: String,
-        data_type: String,
-    ) -> PyResult<PyRefMut<'_, Self>> {
-        let dt = core::parse_data_type(&data_type)
-            .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?;
+        data_type: &Bound<'py, PyAny>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let dt = if let Ok(py_dt) = data_type.extract::<crate::types::PyDataType>() {
+            py_dt.inner
+        } else {
+            let s: String = data_type.extract()?;
+            crate::core::parse_data_type(&s)
+                .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?
+        };
         slf.properties.push((name, dt, true));
         Ok(slf)
     }
@@ -505,48 +541,13 @@ impl EdgeTypeBuilder {
 }
 
 // ============================================================================
-// SessionBuilder and Session
+// Session
 // ============================================================================
-
-/// Builder for creating query sessions with scoped variables.
-#[pyclass]
-#[derive(Clone)]
-pub struct SessionBuilder {
-    pub(crate) inner: Arc<Uni>,
-    pub(crate) variables: HashMap<String, serde_json::Value>,
-}
-
-#[pymethods]
-impl SessionBuilder {
-    /// Set a session variable.
-    fn set<'py>(
-        mut slf: PyRefMut<'py, Self>,
-        key: String,
-        value: Py<PyAny>,
-    ) -> PyResult<PyRefMut<'py, Self>> {
-        let py = slf.py();
-        let json_val = convert::py_object_to_json(py, &value)?;
-        slf.variables.insert(key, json_val);
-        Ok(slf)
-    }
-
-    /// Build the session.
-    fn build(&self) -> PyResult<Session> {
-        let mut rust_session = self.inner.session();
-        for (k, v) in &self.variables {
-            let val = ::uni_db::Value::from(v.clone());
-            rust_session.set(k.clone(), val);
-        }
-        Ok(Session {
-            inner: rust_session,
-        })
-    }
-}
 
 /// A query session with scoped variables.
 ///
 /// Sessions are the primary scope for reads and the factory for transactions.
-/// Create via `db.session()` or `db.session_builder().set(...).build()`.
+/// Create via `db.session()`.
 #[pyclass]
 pub struct Session {
     pub(crate) inner: ::uni_db::Session,
@@ -596,11 +597,11 @@ impl Session {
             }
             pyo3_async_runtimes::tokio::get_runtime()
                 .block_on(builder.fetch_all())
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+                .map_err(crate::exceptions::uni_error_to_pyerr)?
         } else {
             pyo3_async_runtimes::tokio::get_runtime()
                 .block_on(self.inner.query(cypher))
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+                .map_err(crate::exceptions::uni_error_to_pyerr)?
         };
         convert::query_result_to_py_class(py, result)
     }
@@ -621,11 +622,11 @@ impl Session {
             }
             pyo3_async_runtimes::tokio::get_runtime()
                 .block_on(builder.run())
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+                .map_err(crate::exceptions::uni_error_to_pyerr)?
         } else {
             pyo3_async_runtimes::tokio::get_runtime()
                 .block_on(self.inner.execute(cypher))
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+                .map_err(crate::exceptions::uni_error_to_pyerr)?
         };
         convert::auto_commit_result_to_py(py, result)
     }
@@ -634,7 +635,7 @@ impl Session {
     fn tx(&self) -> PyResult<super::sync_api::Transaction> {
         let tx = pyo3_async_runtimes::tokio::get_runtime()
             .block_on(self.inner.tx())
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
         Ok(super::sync_api::Transaction { inner: Some(tx) })
     }
 
@@ -653,7 +654,7 @@ impl Session {
         let builder = self.inner.appender(label);
         let appender = builder
             .build()
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
         Ok(StreamingAppender {
             inner: std::sync::Mutex::new(Some(appender)),
         })
@@ -713,11 +714,11 @@ impl Session {
             }
             pyo3_async_runtimes::tokio::get_runtime()
                 .block_on(builder.run())
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+                .map_err(crate::exceptions::uni_error_to_pyerr)?
         } else {
             pyo3_async_runtimes::tokio::get_runtime()
                 .block_on(self.inner.locy(program))
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+                .map_err(crate::exceptions::uni_error_to_pyerr)?
         };
         convert::locy_result_to_py_class(py, result)
     }
@@ -726,14 +727,14 @@ impl Session {
     fn register_rules(&self, program: &str) -> PyResult<()> {
         self.inner
             .register_rules(program)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+            .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
     /// Prepare a Cypher query for repeated execution.
     fn prepare(&self, cypher: &str) -> PyResult<crate::types::PyPreparedQuery> {
         let prepared = pyo3_async_runtimes::tokio::get_runtime()
             .block_on(self.inner.prepare(cypher))
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
         Ok(crate::types::PyPreparedQuery {
             inner: std::sync::Mutex::new(prepared),
         })
@@ -746,7 +747,7 @@ impl Session {
     fn explain(&self, py: Python, cypher: &str) -> PyResult<crate::types::PyExplainOutput> {
         let output = pyo3_async_runtimes::tokio::get_runtime()
             .block_on(self.inner.explain(cypher))
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
         convert::explain_output_to_py_class(py, output)
     }
 
@@ -761,7 +762,7 @@ impl Session {
         let result = self
             .inner
             .explain_locy(program)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
         Ok(convert::locy_explain_to_py_class(result))
     }
 
@@ -775,7 +776,7 @@ impl Session {
     ) -> PyResult<(crate::types::PyQueryResult, crate::types::PyProfileOutput)> {
         let (results, profile) = pyo3_async_runtimes::tokio::get_runtime()
             .block_on(self.inner.profile(cypher))
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
         let query_result = convert::query_result_to_py_class(py, results)?;
         let profile_output = convert::profile_output_to_py_class(py, profile)?;
         Ok((query_result, profile_output))
@@ -791,7 +792,7 @@ impl Session {
         let compiled = self
             .inner
             .compile_locy(program)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
         Ok(crate::types::PyCompiledProgram { inner: compiled })
     }
 
@@ -840,7 +841,7 @@ impl Session {
         }
         let vids = pyo3_async_runtimes::tokio::get_runtime()
             .block_on(self.inner.bulk_insert_vertices(label, props_list))
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
         Ok(vids.into_iter().map(|v| v.as_u64()).collect())
     }
 
@@ -861,7 +862,7 @@ impl Session {
         }
         pyo3_async_runtimes::tokio::get_runtime()
             .block_on(self.inner.bulk_insert_edges(edge_type, edge_data))
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
         Ok(())
     }
 
@@ -906,7 +907,7 @@ impl Session {
                     })
                 })
             })
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+            .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
     /// Get a cancellation token for this session.
@@ -925,7 +926,7 @@ impl Session {
     fn pin_to_version(&mut self, snapshot_id: &str) -> PyResult<()> {
         pyo3_async_runtimes::tokio::get_runtime()
             .block_on(self.inner.pin_to_version(snapshot_id))
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+            .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
     /// Pin this session to a specific timestamp (seconds since epoch).
@@ -937,14 +938,14 @@ impl Session {
         .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>("Invalid timestamp"))?;
         pyo3_async_runtimes::tokio::get_runtime()
             .block_on(self.inner.pin_to_timestamp(ts))
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+            .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
     /// Refresh session to latest database version (unpins if pinned).
     fn refresh(&mut self) -> PyResult<()> {
         pyo3_async_runtimes::tokio::get_runtime()
             .block_on(self.inner.refresh())
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+            .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
     /// Create a query builder for parameterized queries.
@@ -1007,11 +1008,11 @@ impl Session {
             }
             pyo3_async_runtimes::tokio::get_runtime()
                 .block_on(builder.cursor())
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+                .map_err(crate::exceptions::uni_error_to_pyerr)?
         } else {
             pyo3_async_runtimes::tokio::get_runtime()
                 .block_on(self.inner.query_cursor(cypher))
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+                .map_err(crate::exceptions::uni_error_to_pyerr)?
         };
         let columns = cursor.columns().to_vec();
         Ok(super::sync_api::QueryCursor {
@@ -1031,7 +1032,7 @@ impl Session {
         let prepared = self
             .inner
             .prepare_locy(program)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
         Ok(crate::types::PyPreparedLocy {
             inner: std::sync::Mutex::new(prepared),
         })
@@ -1152,7 +1153,7 @@ impl SessionQueryBuilder {
         }
         let result = pyo3_async_runtimes::tokio::get_runtime()
             .block_on(builder.fetch_all())
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
         convert::query_result_to_py_class(py, result)
     }
 
@@ -1181,7 +1182,7 @@ impl SessionQueryBuilder {
         }
         let cursor = pyo3_async_runtimes::tokio::get_runtime()
             .block_on(builder.cursor())
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
         let columns = cursor.columns().to_vec();
         Ok(crate::sync_api::QueryCursor {
             cursor: std::sync::Mutex::new(Some(cursor)),
@@ -1227,7 +1228,7 @@ impl SessionAutoCommitBuilder {
         }
         let result = pyo3_async_runtimes::tokio::get_runtime()
             .block_on(builder.run())
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
         convert::auto_commit_result_to_py(py, result)
     }
 }
@@ -1240,7 +1241,7 @@ pub struct SessionLocyBuilder {
     pub(crate) params: HashMap<String, Py<PyAny>>,
     pub(crate) timeout_secs: Option<f64>,
     pub(crate) max_iterations: Option<usize>,
-    pub(crate) locy_config: Option<HashMap<String, Py<PyAny>>>,
+    pub(crate) locy_config: Option<::uni_locy::LocyConfig>,
     pub(crate) cancellation_token: Option<crate::types::PyCancellationToken>,
 }
 
@@ -1273,13 +1274,19 @@ impl SessionLocyBuilder {
         slf
     }
 
-    /// Apply a full Locy configuration dict.
-    fn with_config(
-        mut slf: PyRefMut<'_, Self>,
-        config: HashMap<String, Py<PyAny>>,
-    ) -> PyRefMut<'_, Self> {
-        slf.locy_config = Some(config);
-        slf
+    /// Apply a full Locy configuration (LocyConfig object or dict).
+    fn with_config<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        config: &Bound<'py, PyAny>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let locy_config = if let Ok(cfg) = config.extract::<crate::types::PyLocyConfig>() {
+            cfg.inner
+        } else {
+            let dict: HashMap<String, Py<PyAny>> = config.extract()?;
+            crate::convert::extract_locy_config(config.py(), dict)?
+        };
+        slf.locy_config = Some(locy_config);
+        Ok(slf)
     }
 
     /// Attach a cancellation token to this evaluation.
@@ -1306,19 +1313,14 @@ impl SessionLocyBuilder {
             builder = builder.max_iterations(n);
         }
         if let Some(ref config) = self.locy_config {
-            let cloned: HashMap<String, Py<PyAny>> = config
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone_ref(py)))
-                .collect();
-            let locy_config = convert::extract_locy_config(py, cloned)?;
-            builder = builder.with_config(locy_config);
+            builder = builder.with_config(config.clone());
         }
         if let Some(ref ct) = self.cancellation_token {
             builder = builder.cancellation_token(ct.inner.clone());
         }
         let result = pyo3_async_runtimes::tokio::get_runtime()
             .block_on(builder.run())
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
         convert::locy_result_to_py_class(py, result)
     }
 }
@@ -1352,7 +1354,7 @@ impl SessionProfileBuilder {
         }
         let (results, profile) = pyo3_async_runtimes::tokio::get_runtime()
             .block_on(builder.run())
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
         let query_result = convert::query_result_to_py_class(py, results)?;
         let profile_output = convert::profile_output_to_py_class(py, profile)?;
         Ok((query_result, profile_output))
@@ -1403,7 +1405,7 @@ impl PyTransactionBuilder {
         }
         let tx = pyo3_async_runtimes::tokio::get_runtime()
             .block_on(builder.start())
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
         Ok(super::sync_api::Transaction { inner: Some(tx) })
     }
 }
@@ -1451,7 +1453,7 @@ impl PyTxQueryBuilder {
         }
         let result = pyo3_async_runtimes::tokio::get_runtime()
             .block_on(builder.fetch_all())
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
         convert::query_result_to_py_class(py, result)
     }
 
@@ -1474,7 +1476,7 @@ impl PyTxQueryBuilder {
         }
         let result = pyo3_async_runtimes::tokio::get_runtime()
             .block_on(builder.run())
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
         convert::execute_result_to_py(py, result)
     }
 
@@ -1494,7 +1496,7 @@ impl PyTxQueryBuilder {
         }
         let cursor = pyo3_async_runtimes::tokio::get_runtime()
             .block_on(builder.cursor())
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
         let columns = cursor.columns().to_vec();
         Ok(crate::sync_api::QueryCursor {
             cursor: std::sync::Mutex::new(Some(cursor)),
@@ -1543,7 +1545,7 @@ impl PyTxExecuteBuilder {
         }
         let result = pyo3_async_runtimes::tokio::get_runtime()
             .block_on(builder.run())
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
         convert::execute_result_to_py(py, result)
     }
 }
@@ -1556,7 +1558,7 @@ pub struct PyTxLocyBuilder {
     pub(crate) params: HashMap<String, Py<PyAny>>,
     pub(crate) timeout_secs: Option<f64>,
     pub(crate) max_iterations: Option<usize>,
-    pub(crate) locy_config: Option<HashMap<String, Py<PyAny>>>,
+    pub(crate) locy_config: Option<::uni_locy::LocyConfig>,
     pub(crate) cancellation_token: Option<crate::types::PyCancellationToken>,
 }
 
@@ -1580,13 +1582,19 @@ impl PyTxLocyBuilder {
         slf
     }
 
-    /// Apply a full Locy configuration dict.
-    fn with_config(
-        mut slf: PyRefMut<'_, Self>,
-        config: HashMap<String, Py<PyAny>>,
-    ) -> PyRefMut<'_, Self> {
-        slf.locy_config = Some(config);
-        slf
+    /// Apply a full Locy configuration (LocyConfig object or dict).
+    fn with_config<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        config: &Bound<'py, PyAny>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let locy_config = if let Ok(cfg) = config.extract::<crate::types::PyLocyConfig>() {
+            cfg.inner
+        } else {
+            let dict: HashMap<String, Py<PyAny>> = config.extract()?;
+            crate::convert::extract_locy_config(config.py(), dict)?
+        };
+        slf.locy_config = Some(locy_config);
+        Ok(slf)
     }
 
     /// Attach a cancellation token to this evaluation.
@@ -1616,19 +1624,14 @@ impl PyTxLocyBuilder {
             builder = builder.max_iterations(n);
         }
         if let Some(ref config) = self.locy_config {
-            let cloned: HashMap<String, Py<PyAny>> = config
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone_ref(py)))
-                .collect();
-            let locy_config = convert::extract_locy_config(py, cloned)?;
-            builder = builder.with_config(locy_config);
+            builder = builder.with_config(config.clone());
         }
         if let Some(ref ct) = self.cancellation_token {
             builder = builder.cancellation_token(ct.inner.clone());
         }
         let result = pyo3_async_runtimes::tokio::get_runtime()
             .block_on(builder.run())
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
         convert::locy_result_to_py_class(py, result)
     }
 }
@@ -1674,7 +1677,7 @@ impl PyApplyBuilder {
         }
         let result = pyo3_async_runtimes::tokio::get_runtime()
             .block_on(builder.run())
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
         Ok(crate::types::PyApplyResult {
             facts_applied: result.facts_applied,
             version_gap: result.version_gap,
@@ -1840,7 +1843,7 @@ impl StreamingAppender {
         }
         pyo3_async_runtimes::tokio::get_runtime()
             .block_on(appender.append(rust_props))
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+            .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
     /// Flush remaining rows and commit.
@@ -1851,7 +1854,7 @@ impl StreamingAppender {
         })?;
         let stats = pyo3_async_runtimes::tokio::get_runtime()
             .block_on(appender.finish())
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
         Ok(BulkStats {
             vertices_inserted: stats.vertices_inserted,
             edges_inserted: stats.edges_inserted,
@@ -1926,7 +1929,7 @@ impl StreamingAppender {
         })?;
         pyo3_async_runtimes::tokio::get_runtime()
             .block_on(appender.write_batch(&record_batch))
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+            .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
     /// Number of rows currently buffered.
@@ -1992,7 +1995,7 @@ impl SessionTemplateBuilder {
         slf.inner = Some(
             builder
                 .rules(program)
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?,
+                .map_err(crate::exceptions::uni_error_to_pyerr)?,
         );
         Ok(slf)
     }
@@ -2037,7 +2040,7 @@ impl SessionTemplateBuilder {
         })?;
         let template = builder
             .build()
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
         Ok(SessionTemplate {
             inner: std::sync::Arc::new(template),
         })
@@ -2119,7 +2122,7 @@ impl PyAppenderBuilder {
         }
         let appender = builder
             .build()
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
         Ok(StreamingAppender {
             inner: std::sync::Mutex::new(Some(appender)),
         })
@@ -2222,6 +2225,7 @@ impl BulkWriterBuilder {
                         rows_processed: progress.rows_processed,
                         total_rows: progress.total_rows,
                         current_label: progress.current_label.clone(),
+                        elapsed_secs: progress.elapsed.as_secs_f64(),
                     };
                     if let Ok(bound) = Py::new(py, py_progress) {
                         let _ = wrapper.py_obj.call1(py, (bound,));
@@ -2231,7 +2235,7 @@ impl BulkWriterBuilder {
         }
         let real_writer = builder
             .build()
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            .map_err(crate::exceptions::anyhow_to_pyerr)?;
         Ok(BulkWriter {
             inner: std::sync::Mutex::new(Some(real_writer)),
         })
@@ -2286,7 +2290,7 @@ impl BulkWriter {
         self.with_writer("insert_vertices", |writer| {
             let vids = pyo3_async_runtimes::tokio::get_runtime()
                 .block_on(writer.insert_vertices(label, rust_props))
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(crate::exceptions::anyhow_to_pyerr)?;
             Ok(vids.into_iter().map(|v| v.as_u64()).collect())
         })
     }
@@ -2313,7 +2317,7 @@ impl BulkWriter {
         self.with_writer("insert_edges", |writer| {
             pyo3_async_runtimes::tokio::get_runtime()
                 .block_on(writer.insert_edges(edge_type, rust_edges))
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(crate::exceptions::anyhow_to_pyerr)?;
             Ok(())
         })
     }
@@ -2357,7 +2361,7 @@ impl BulkWriter {
         })?;
         let stats = pyo3_async_runtimes::tokio::get_runtime()
             .block_on(writer.commit())
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            .map_err(crate::exceptions::anyhow_to_pyerr)?;
         Ok(BulkStats {
             vertices_inserted: stats.vertices_inserted,
             edges_inserted: stats.edges_inserted,
@@ -2378,7 +2382,7 @@ impl BulkWriter {
         if let Some(writer) = guard.take() {
             pyo3_async_runtimes::tokio::get_runtime()
                 .block_on(writer.abort())
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(crate::exceptions::anyhow_to_pyerr)?;
         }
         Ok(())
     }

@@ -13,6 +13,7 @@ pub mod async_api;
 pub mod builders;
 pub mod convert;
 pub mod core;
+pub mod exceptions;
 pub mod sync_api;
 pub mod types;
 
@@ -42,7 +43,6 @@ fn _uni_db(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<builders::EdgeTypeBuilder>()?;
 
     // Session
-    m.add_class::<builders::SessionBuilder>()?;
     m.add_class::<builders::Session>()?;
 
     // Session builders
@@ -68,7 +68,6 @@ fn _uni_db(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<async_api::AsyncDatabaseBuilder>()?;
     m.add_class::<async_api::AsyncTransaction>()?;
     m.add_class::<async_api::AsyncSession>()?;
-    m.add_class::<async_api::AsyncSessionBuilder>()?;
     m.add_class::<async_api::AsyncBulkWriter>()?;
     m.add_class::<async_api::AsyncBulkWriterBuilder>()?;
     m.add_class::<async_api::AsyncTransactionBuilder>()?;
@@ -85,6 +84,11 @@ fn _uni_db(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<types::ConstraintInfo>()?;
     m.add_class::<types::BulkStats>()?;
     m.add_class::<types::BulkProgress>()?;
+
+    // Graph element types
+    m.add_class::<types::PyNode>()?;
+    m.add_class::<types::PyEdge>()?;
+    m.add_class::<types::PyPath>()?;
     m.add_class::<types::LocyStats>()?;
     m.add_class::<types::PyLocyResult>()?;
     m.add_class::<types::PyCompiledProgram>()?;
@@ -131,6 +135,16 @@ fn _uni_db(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Async commit stream
     m.add_class::<async_api::AsyncCommitStream>()?;
 
+    // Async session/transaction builders
+    m.add_class::<async_api::AsyncSessionQueryBuilder>()?;
+    m.add_class::<async_api::AsyncAutoCommitBuilder>()?;
+    m.add_class::<async_api::AsyncSessionLocyBuilder>()?;
+    m.add_class::<async_api::AsyncSessionProfileBuilder>()?;
+    m.add_class::<async_api::AsyncTxQueryBuilder>()?;
+    m.add_class::<async_api::AsyncTxExecuteBuilder>()?;
+    m.add_class::<async_api::AsyncTxLocyBuilder>()?;
+    m.add_class::<async_api::AsyncApplyBuilder>()?;
+
     // Session templates & streaming appender
     m.add_class::<builders::SessionTemplateBuilder>()?;
     m.add_class::<builders::SessionTemplate>()?;
@@ -144,6 +158,39 @@ fn _uni_db(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Phase C: AppenderBuilder
     m.add_class::<builders::PyAppenderBuilder>()?;
+
+    // Type system enums
+    m.add_class::<types::PyDataType>()?;
+    m.add_class::<types::PyCrdtType>()?;
+
+    // ID types
+    m.add_class::<types::PyVid>()?;
+    m.add_class::<types::PyEid>()?;
+    m.add_class::<types::PyUniId>()?;
+
+    // Value and Row types
+    m.add_class::<types::PyValue>()?;
+    m.add_class::<types::PyRow>()?;
+
+    // LocyConfig and Schema
+    m.add_class::<types::PyLocyConfig>()?;
+    m.add_class::<types::PySchema>()?;
+
+    // CommandResult classes
+    m.add_class::<types::PyQueryCommandResult>()?;
+    m.add_class::<types::PyAssumeCommandResult>()?;
+    m.add_class::<types::PyExplainCommandResult>()?;
+    m.add_class::<types::PyAbduceCommandResult>()?;
+    m.add_class::<types::PyDeriveCommandResult>()?;
+    m.add_class::<types::PyCypherCommandResult>()?;
+
+    // Hook context types
+    m.add_class::<types::PyHookContext>()?;
+    m.add_class::<types::PyCommitHookContext>()?;
+    m.add_class::<types::PyQueryType>()?;
+
+    // Typed exception hierarchy
+    exceptions::register_exceptions(_py, m)?;
 
     Ok(())
 }

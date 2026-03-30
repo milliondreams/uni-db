@@ -11,24 +11,31 @@ import uni_db
 @pytest.fixture
 async def db():
     """Create a temporary async database for each test."""
-    return await uni_db.AsyncDatabase.temporary()
+    return await uni_db.AsyncUni.temporary()
 
 
 @pytest.mark.asyncio
 async def test_supply_chain(db):
-    await db.create_label("Part")
-    await db.create_label("Supplier")
-    await db.create_label("Product")
+    await (
+        db.schema()
+        .label("Part")
+        .property("sku", "string")
+        .property("cost", "float64")
+        .done()
+        .label("Supplier")
+        .done()
+        .label("Product")
+        .property("name", "string")
+        .property("price", "float64")
+        .done()
+        .edge_type("ASSEMBLED_FROM", ["Product", "Part"], ["Part"])
+        .done()
+        .edge_type("SUPPLIED_BY", ["Part"], ["Supplier"])
+        .done()
+        .apply()
+    )
 
-    await db.create_edge_type("ASSEMBLED_FROM", ["Product", "Part"], ["Part"])
-    await db.create_edge_type("SUPPLIED_BY", ["Part"], ["Supplier"])
-
-    await db.add_property("Part", "sku", "string", False)
-    await db.add_property("Part", "cost", "float64", False)
-    await db.add_property("Product", "name", "string", False)
-    await db.add_property("Product", "price", "float64", False)
-
-    await db.create_scalar_index("Part", "sku", "hash")
+    await db.schema().label("Part").index("sku", "hash").apply()
 
     p1_props = {
         "sku": "RES-10K",
@@ -38,7 +45,9 @@ async def test_supply_chain(db):
     p2_props = {"sku": "MB-X1", "cost": 50.0}
     p3_props = {"sku": "SCR-OLED", "cost": 30.0}
 
-    writer = db.bulk_writer().build()
+    session = db.session()
+
+    writer = await session.bulk_writer().build()
     vids = await writer.insert_vertices("Part", [p1_props, p2_props, p3_props])
     p1, p2, p3 = vids
 
@@ -54,10 +63,10 @@ async def test_supply_chain(db):
     await db.flush()
 
     # Warm-up query
-    await db.query("MATCH (a:Part)-[:ASSEMBLED_FROM]->(b:Part) RETURN a.sku")
+    await session.query("MATCH (a:Part)-[:ASSEMBLED_FROM]->(b:Part) RETURN a.sku")
 
     # BOM Explosion
-    results = await db.query("""
+    results = await session.query("""
         MATCH (defective:Part {sku: 'RES-10K'})
         MATCH (product:Product)-[:ASSEMBLED_FROM*1..5]->(defective)
         RETURN product.name as name, product.price as price
@@ -66,7 +75,7 @@ async def test_supply_chain(db):
     assert "Smartphone X" in names
 
     # Cost Rollup
-    results_cost = await db.query("""
+    results_cost = await session.query("""
         MATCH (p:Product {name: 'Smartphone X'})
         MATCH (p)-[:ASSEMBLED_FROM*1..5]->(part:Part)
         RETURN SUM(part.cost) AS total_bom_cost
@@ -77,23 +86,38 @@ async def test_supply_chain(db):
 
 @pytest.mark.asyncio
 async def test_recommendation(db):
-    await db.create_label("User")
-    await db.create_label("Product")
-    await db.create_label("Category")
+    await (
+        db.schema()
+        .label("User")
+        .done()
+        .label("Product")
+        .property("name", "string")
+        .property("price", "float64")
+        .done()
+        .label("Category")
+        .done()
+        .edge_type("VIEWED", ["User"], ["Product"])
+        .done()
+        .edge_type("PURCHASED", ["User"], ["Product"])
+        .done()
+        .edge_type("IN_CATEGORY", ["Product"], ["Category"])
+        .done()
+        .apply()
+    )
 
-    await db.create_edge_type("VIEWED", ["User"], ["Product"])
-    await db.create_edge_type("PURCHASED", ["User"], ["Product"])
-    await db.create_edge_type("IN_CATEGORY", ["Product"], ["Category"])
-
-    await db.add_property("Product", "name", "string", False)
-    await db.add_property("Product", "price", "float64", False)
-
-    await db.create_vector_index("Product", "embedding", "cosine")
+    await (
+        db.schema()
+        .label("Product")
+        .index("embedding", {"type": "vector", "metric": "cosine"})
+        .apply()
+    )
 
     p1_vec = [1.0, 0.0, 0.0, 0.0]
     p2_vec = [0.9, 0.1, 0.0, 0.0]
 
-    writer = db.bulk_writer().build()
+    session = db.session()
+
+    writer = await session.bulk_writer().build()
     vids = await writer.insert_vertices(
         "Product",
         [
@@ -112,7 +136,7 @@ async def test_recommendation(db):
     await db.flush()
 
     # Collaborative filter
-    results = await db.query(
+    results = await session.query(
         """
         MATCH (u1:User)-[:PURCHASED]->(p:Product)<-[:PURCHASED]-(other:User)
         WHERE u1._vid = $uid AND other._vid <> u1._vid
@@ -125,17 +149,31 @@ async def test_recommendation(db):
 
 @pytest.mark.asyncio
 async def test_rag(db):
-    await db.create_label("Chunk")
-    await db.create_label("Entity")
-    await db.create_edge_type("MENTIONS", ["Chunk"], ["Entity"])
+    await (
+        db.schema()
+        .label("Chunk")
+        .property("text", "string")
+        .done()
+        .label("Entity")
+        .done()
+        .edge_type("MENTIONS", ["Chunk"], ["Entity"])
+        .done()
+        .apply()
+    )
 
-    await db.add_property("Chunk", "text", "string", False)
-    await db.create_vector_index("Chunk", "embedding", "cosine")
+    await (
+        db.schema()
+        .label("Chunk")
+        .index("embedding", {"type": "vector", "metric": "cosine"})
+        .apply()
+    )
 
     c1_vec = [1.0, 0.0, 0.0, 0.0]
     c2_vec = [0.9, 0.1, 0.0, 0.0]
 
-    writer = db.bulk_writer().build()
+    session = db.session()
+
+    writer = await session.bulk_writer().build()
     c_vids = await writer.insert_vertices(
         "Chunk",
         [
@@ -155,7 +193,7 @@ async def test_rag(db):
     await db.flush()
 
     # Hybrid RAG query
-    results = await db.query(
+    results = await session.query(
         """
         MATCH (c:Chunk)-[:MENTIONS]->(e:Entity)<-[:MENTIONS]-(related:Chunk)
         WHERE c._vid = $cid AND related._vid <> c._vid
@@ -169,14 +207,24 @@ async def test_rag(db):
 
 @pytest.mark.asyncio
 async def test_fraud_detection(db):
-    await db.create_label("User")
-    await db.create_label("Device")
-    await db.create_edge_type("SENT_MONEY", ["User"], ["User"])
-    await db.create_edge_type("USED_DEVICE", ["User"], ["Device"])
-    await db.add_property("SENT_MONEY", "amount", "float64", False)
-    await db.add_property("User", "risk_score", "float32", True)
+    await (
+        db.schema()
+        .label("User")
+        .property_nullable("risk_score", "float32")
+        .done()
+        .label("Device")
+        .done()
+        .edge_type("SENT_MONEY", ["User"], ["User"])
+        .property("amount", "float64")
+        .done()
+        .edge_type("USED_DEVICE", ["User"], ["Device"])
+        .done()
+        .apply()
+    )
 
-    writer = db.bulk_writer().build()
+    session = db.session()
+
+    writer = await session.bulk_writer().build()
     u_vids = await writer.insert_vertices(
         "User",
         [
@@ -204,14 +252,14 @@ async def test_fraud_detection(db):
     await db.flush()
 
     # Cycle detection
-    results = await db.query("""
+    results = await session.query("""
         MATCH (a:User)-[:SENT_MONEY]->(b:User)-[:SENT_MONEY]->(c:User)-[:SENT_MONEY]->(a)
         RETURN count(*) as count
     """)
     assert results[0]["count"] == 3
 
     # Shared device with fraudster
-    results = await db.query("""
+    results = await session.query("""
         MATCH (u:User)-[:USED_DEVICE]->(d:Device)<-[:USED_DEVICE]-(fraudster:User)
         WHERE fraudster.risk_score > 0.8 AND u._vid <> fraudster._vid
         RETURN u._vid as uid
@@ -222,13 +270,22 @@ async def test_fraud_detection(db):
 
 @pytest.mark.asyncio
 async def test_regional_sales_analytics(db):
-    await db.create_label("Region")
-    await db.create_label("Order")
-    await db.create_edge_type("SHIPPED_TO", ["Order"], ["Region"])
-    await db.add_property("Region", "name", "string", False)
-    await db.add_property("Order", "amount", "float64", False)
+    await (
+        db.schema()
+        .label("Region")
+        .property("name", "string")
+        .done()
+        .label("Order")
+        .property("amount", "float64")
+        .done()
+        .edge_type("SHIPPED_TO", ["Order"], ["Region"])
+        .done()
+        .apply()
+    )
 
-    writer = db.bulk_writer().build()
+    session = db.session()
+
+    writer = await session.bulk_writer().build()
     vids_region = await writer.insert_vertices("Region", [{"name": "North"}])
     north = vids_region[0]
 
@@ -240,7 +297,7 @@ async def test_regional_sales_analytics(db):
     await writer.commit()
     await db.flush()
 
-    results = await db.query("""
+    results = await session.query("""
         MATCH (r:Region {name: 'North'})<-[:SHIPPED_TO]-(o:Order)
         RETURN SUM(o.amount) as total
     """)
@@ -249,13 +306,20 @@ async def test_regional_sales_analytics(db):
 
 @pytest.mark.asyncio
 async def test_document_knowledge_graph(db):
-    await db.create_label("Paper")
-    await db.create_edge_type("CITES", ["Paper"], ["Paper"])
+    await (
+        db.schema()
+        .label("Paper")
+        .property("topic", "string")
+        .property("title", "string")
+        .done()
+        .edge_type("CITES", ["Paper"], ["Paper"])
+        .done()
+        .apply()
+    )
 
-    await db.add_property("Paper", "topic", "string", False)
-    await db.add_property("Paper", "title", "string", False)
+    session = db.session()
 
-    writer = db.bulk_writer().build()
+    writer = await session.bulk_writer().build()
     vids = await writer.insert_vertices(
         "Paper",
         [
@@ -270,7 +334,7 @@ async def test_document_knowledge_graph(db):
     await writer.commit()
     await db.flush()
 
-    results = await db.query("""
+    results = await session.query("""
         MATCH (a:Paper {topic: 'AI'})-[:CITES]->(b:Paper {topic: 'AI'})
         RETURN a.title as src, b.title as dst
     """)
@@ -281,16 +345,24 @@ async def test_document_knowledge_graph(db):
 
 @pytest.mark.asyncio
 async def test_ecommerce_recommendation(db):
-    await db.create_label("User")
-    await db.create_label("Product")
-    await db.create_edge_type("VIEWED", ["User"], ["Product"])
+    await (
+        db.schema()
+        .label("User")
+        .property("name", "string")
+        .done()
+        .label("Product")
+        .property("name", "string")
+        .property("embedding", "vector:2")
+        .index("embedding", {"type": "vector", "metric": "l2"})
+        .done()
+        .edge_type("VIEWED", ["User"], ["Product"])
+        .done()
+        .apply()
+    )
 
-    await db.add_property("User", "name", "string", False)
-    await db.add_property("Product", "name", "string", False)
-    await db.add_property("Product", "embedding", "vector:2", False)
-    await db.create_vector_index("Product", "embedding", "l2")
+    session = db.session()
 
-    writer = db.bulk_writer().build()
+    writer = await session.bulk_writer().build()
     vids_u = await writer.insert_vertices("User", [{"name": "Alice"}])
     alice = vids_u[0]
 
@@ -309,7 +381,7 @@ async def test_ecommerce_recommendation(db):
     await db.flush()
 
     # Find Alice's viewed products
-    res = await db.query(
+    res = await session.query(
         "MATCH (u:User {name: 'Alice'})-[:VIEWED]->(p:Product) "
         "RETURN p.embedding as emb"
     )
@@ -317,7 +389,7 @@ async def test_ecommerce_recommendation(db):
     emb = res[0]["emb"]
 
     # Find similar products
-    res_sim = await db.query(
+    res_sim = await session.query(
         """
         MATCH (p:Product)
         WHERE vector_similarity(p.embedding, $emb) > 0.9
@@ -333,18 +405,26 @@ async def test_ecommerce_recommendation(db):
 
 @pytest.mark.asyncio
 async def test_identity_provenance(db):
-    await db.create_label("Node")
-    await db.add_property("Node", "name", "string", False)
-    await db.create_edge_type("DERIVED_FROM", ["Node"], ["Node"])
+    await (
+        db.schema()
+        .label("Node")
+        .property("name", "string")
+        .done()
+        .edge_type("DERIVED_FROM", ["Node"], ["Node"])
+        .done()
+        .apply()
+    )
 
-    await db.query("CREATE (a:Node {name: 'A'}), (b:Node {name: 'B'})")
-    await db.query(
+    session = db.session()
+
+    await session.execute("CREATE (a:Node {name: 'A'}), (b:Node {name: 'B'})")
+    await session.execute(
         "MATCH (a:Node {name: 'A'}), (b:Node {name: 'B'}) "
         "CREATE (b)-[:DERIVED_FROM]->(a)"
     )
     await db.flush()
 
-    res = await db.query(
+    res = await session.query(
         "MATCH (b:Node {name: 'B'})-[:DERIVED_FROM]->(a:Node) RETURN a.name as name"
     )
     assert len(res) == 1

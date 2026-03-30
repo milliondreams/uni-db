@@ -14,29 +14,30 @@ class TestAlgoShowcase(unittest.TestCase):
         self.test_dir = "./test_db_algo"
         if os.path.exists(self.test_dir):
             shutil.rmtree(self.test_dir)
-        self.db = uni_db.Database.open(self.test_dir)
+        self.db = uni_db.Uni.open(self.test_dir)
+        self.session = self.db.session()
         self.setup_data()
 
     def tearDown(self):
+        del self.session
         del self.db
         if os.path.exists(self.test_dir):
             shutil.rmtree(self.test_dir)
 
     def setup_data(self):
-        self.db.create_label("Page")
-        self.db.create_edge_type("LINKS")
+        self.db.schema().label("Page").done().edge_type("LINKS").done().apply()
 
         # Create a small graph for PageRank
         # A -> B, A -> C, B -> C, C -> A (cycle), D -> C (dangling source)
 
         nodes = ["A", "B", "C", "D"]
         for n in nodes:
-            self.db.query(f"CREATE (:Page {{name: '{n}'}})")
+            self.session.query(f"CREATE (:Page {{name: '{n}'}})")
 
         edges = [("A", "B"), ("A", "C"), ("B", "C"), ("C", "A"), ("D", "C")]
 
         for src, dst in edges:
-            self.db.query(
+            self.session.query(
                 "MATCH (a:Page {name: $src}), (b:Page {name: $dst}) CREATE (a)-[:LINKS]->(b)",
                 {"src": src, "dst": dst},
             )
@@ -45,7 +46,7 @@ class TestAlgoShowcase(unittest.TestCase):
         # CALL algo.pageRank('Page', 'LINKS') YIELD node, score
         # Assuming this syntax.
 
-        results = self.db.query(
+        results = self.session.query(
             "CALL algo.pageRank('Page', 'LINKS') YIELD node, score RETURN node.name as name, score ORDER BY score DESC"
         )
 
@@ -59,9 +60,9 @@ class TestAlgoShowcase(unittest.TestCase):
 
     def test_wcc(self):
         # Create disjoint component
-        self.db.query("CREATE (:Page {name: 'E'})-[:LINKS]->(:Page {name: 'F'})")
+        self.session.query("CREATE (:Page {name: 'E'})-[:LINKS]->(:Page {name: 'F'})")
 
-        results = self.db.query(
+        results = self.session.query(
             "CALL algo.wcc('Page', 'LINKS') YIELD node, componentId RETURN node.name as name, componentId ORDER BY componentId"
         )
 
@@ -78,7 +79,7 @@ class TestAlgoShowcase(unittest.TestCase):
 
     def test_shortest_path(self):
         # D -> C -> A -> B
-        results = self.db.query(
+        results = self.session.query(
             "MATCH p = shortestPath((s:Page {name: 'D'})-[:LINKS*]->(t:Page {name: 'B'})) RETURN length(p) as len, [n in nodes(p) | n.name] as path"
         )
 

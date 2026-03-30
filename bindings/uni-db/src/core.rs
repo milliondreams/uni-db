@@ -10,6 +10,7 @@
 use ::uni_db::{Uni, Value, Vid};
 use std::collections::HashMap;
 use std::time::Duration;
+use uni_common::UniError;
 use uni_common::core::schema::{
     DataType, DistanceMetric, EmbeddingConfig, FullTextIndexConfig, IndexDefinition,
     InvertedIndexConfig, ScalarIndexConfig, ScalarIndexType, TokenizerConfig, VectorIndexConfig,
@@ -30,13 +31,13 @@ pub async fn query_core(
     db: &Uni,
     cypher: &str,
     params: HashMap<String, Value>,
-) -> Result<QueryResult, String> {
+) -> Result<QueryResult, UniError> {
     let session = db.session();
     let mut builder = session.query_with(cypher);
     for (k, v) in params {
         builder = builder.param(&k, v);
     }
-    builder.fetch_all().await.map_err(|e| e.to_string())
+    builder.fetch_all().await
 }
 
 /// Execute a query with parameters, timeout, and memory limit.
@@ -46,7 +47,7 @@ pub async fn query_builder_core(
     params: HashMap<String, Value>,
     timeout_secs: Option<f64>,
     max_memory: Option<usize>,
-) -> Result<QueryResult, String> {
+) -> Result<QueryResult, UniError> {
     let session = db.session();
     let mut builder = session.query_with(cypher);
     for (k, v) in params {
@@ -58,7 +59,7 @@ pub async fn query_builder_core(
     if let Some(m) = max_memory {
         builder = builder.max_memory(m);
     }
-    builder.fetch_all().await.map_err(|e| e.to_string())
+    builder.fetch_all().await
 }
 
 /// Open a streaming cursor for a query with parameters, timeout, and memory limit.
@@ -68,7 +69,7 @@ pub async fn query_cursor_core(
     params: HashMap<String, Value>,
     timeout_secs: Option<f64>,
     max_memory: Option<usize>,
-) -> Result<QueryCursor, String> {
+) -> Result<QueryCursor, UniError> {
     let session = db.session();
     let mut builder = session.query_with(cypher);
     for (k, v) in params {
@@ -80,16 +81,12 @@ pub async fn query_cursor_core(
     if let Some(m) = max_memory {
         builder = builder.max_memory(m);
     }
-    builder.cursor().await.map_err(|e| e.to_string())
+    builder.cursor().await
 }
 
 /// Execute a mutation query, returning affected row count.
-pub async fn execute_core(db: &Uni, cypher: &str) -> Result<usize, String> {
-    let result = db
-        .session()
-        .execute(cypher)
-        .await
-        .map_err(|e| e.to_string())?;
+pub async fn execute_core(db: &Uni, cypher: &str) -> Result<usize, UniError> {
+    let result = db.session().execute(cypher).await?;
     Ok(result.affected_rows())
 }
 
@@ -98,209 +95,140 @@ pub async fn execute_with_params_core(
     db: &Uni,
     cypher: &str,
     params: HashMap<String, Value>,
-) -> Result<usize, String> {
+) -> Result<usize, UniError> {
     let session = db.session();
     let mut builder = session.execute_with(cypher);
     for (k, v) in params {
         builder = builder.param(&k, v);
     }
-    let result = builder.run().await.map_err(|e| e.to_string())?;
+    let result = builder.run().await?;
     Ok(result.affected_rows())
 }
 
 /// Explain a query plan without executing.
-pub async fn explain_core(db: &Uni, cypher: &str) -> Result<ExplainOutput, String> {
+pub async fn explain_core(db: &Uni, cypher: &str) -> Result<ExplainOutput, UniError> {
     let session = db.session();
-    session.explain(cypher).await.map_err(|e| e.to_string())
+    session.explain(cypher).await
 }
 
 /// Profile query execution with operator-level statistics.
-pub async fn profile_core(db: &Uni, cypher: &str) -> Result<(QueryResult, ProfileOutput), String> {
+pub async fn profile_core(
+    db: &Uni,
+    cypher: &str,
+) -> Result<(QueryResult, ProfileOutput), UniError> {
     let session = db.session();
-    session.profile(cypher).await.map_err(|e| e.to_string())
+    session.profile(cypher).await
 }
 
 /// Flush all uncommitted changes to persistent storage.
-pub async fn flush_core(db: &Uni) -> Result<(), String> {
-    db.flush().await.map_err(|e| e.to_string())
+pub async fn flush_core(db: &Uni) -> Result<(), UniError> {
+    db.flush().await
 }
 
 // ============================================================================
 // Schema Core
 // ============================================================================
 
-/// Create a label.
-pub async fn create_label_core(db: &Uni, name: &str) -> Result<u16, String> {
-    let sm = db.schema_manager();
-    let id = sm.add_label(name).map_err(|e| e.to_string())?;
-    sm.save().await.map_err(|e| e.to_string())?;
-    Ok(id)
-}
-
-/// Create an edge type.
-pub async fn create_edge_type_core(
-    db: &Uni,
-    name: &str,
-    from_labels: Vec<String>,
-    to_labels: Vec<String>,
-) -> Result<u32, String> {
-    let sm = db.schema_manager();
-    let id = sm
-        .add_edge_type(name, from_labels, to_labels)
-        .map_err(|e| e.to_string())?;
-    sm.save().await.map_err(|e| e.to_string())?;
-    Ok(id)
-}
-
-/// Add a property to a label or edge type.
-pub async fn add_property_core(
-    db: &Uni,
-    label_or_type: &str,
-    name: &str,
-    dt: DataType,
-    nullable: bool,
-) -> Result<(), String> {
-    let sm = db.schema_manager();
-    sm.add_property(label_or_type, name, dt, nullable)
-        .map_err(|e| e.to_string())?;
-    sm.save().await.map_err(|e| e.to_string())?;
-    Ok(())
-}
-
 /// Check if a label exists.
-pub async fn label_exists_core(db: &Uni, name: &str) -> Result<bool, String> {
-    db.label_exists(name).await.map_err(|e| e.to_string())
+pub async fn label_exists_core(db: &Uni, name: &str) -> Result<bool, UniError> {
+    db.label_exists(name).await
 }
 
 /// Check if an edge type exists.
-pub async fn edge_type_exists_core(db: &Uni, name: &str) -> Result<bool, String> {
-    db.edge_type_exists(name).await.map_err(|e| e.to_string())
+pub async fn edge_type_exists_core(db: &Uni, name: &str) -> Result<bool, UniError> {
+    db.edge_type_exists(name).await
 }
 
 /// List all label names.
-pub async fn list_labels_core(db: &Uni) -> Result<Vec<String>, String> {
-    db.list_labels().await.map_err(|e| e.to_string())
+pub async fn list_labels_core(db: &Uni) -> Result<Vec<String>, UniError> {
+    db.list_labels().await
 }
 
 /// List all edge type names.
-pub async fn list_edge_types_core(db: &Uni) -> Result<Vec<String>, String> {
-    db.list_edge_types().await.map_err(|e| e.to_string())
+pub async fn list_edge_types_core(db: &Uni) -> Result<Vec<String>, UniError> {
+    db.list_edge_types().await
 }
 
 /// Get detailed information about a label.
-pub async fn get_label_info_core(db: &Uni, name: &str) -> Result<Option<UniLabelInfo>, String> {
-    db.get_label_info(name).await.map_err(|e| e.to_string())
+pub async fn get_label_info_core(db: &Uni, name: &str) -> Result<Option<UniLabelInfo>, UniError> {
+    db.get_label_info(name).await
 }
 
 /// Load schema from a JSON file.
-pub async fn load_schema_core(db: &Uni, path: &str) -> Result<(), String> {
-    db.load_schema(path).await.map_err(|e| e.to_string())
+pub async fn load_schema_core(db: &Uni, path: &str) -> Result<(), UniError> {
+    db.load_schema(path).await
 }
 
 /// Save schema to a JSON file.
-pub async fn save_schema_core(db: &Uni, path: &str) -> Result<(), String> {
-    db.save_schema(path).await.map_err(|e| e.to_string())
+pub async fn save_schema_core(db: &Uni, path: &str) -> Result<(), UniError> {
+    db.save_schema(path).await
 }
 
 /// Apply pending schema changes.
+///
+/// This is additive/idempotent: labels and edge types that already exist are
+/// silently skipped so that the schema builder can be used to add properties
+/// or indexes to existing schema elements.
 pub async fn apply_schema_core(
     db: &Uni,
     pending_labels: &[String],
     pending_edge_types: &[(String, Vec<String>, Vec<String>)],
     pending_properties: &[(String, String, DataType, bool)],
     pending_indexes: &[IndexDefinition],
-) -> Result<(), String> {
+) -> Result<(), UniError> {
     let sm = db.schema_manager();
 
     for name in pending_labels {
-        sm.add_label(name).map_err(|e| e.to_string())?;
+        match sm.add_label(name) {
+            Ok(_) => {}
+            Err(e) if e.to_string().contains("already exists") => {}
+            Err(e) => {
+                return Err(UniError::Schema {
+                    message: e.to_string(),
+                });
+            }
+        }
     }
 
     for (name, from, to) in pending_edge_types {
-        sm.add_edge_type(name, from.clone(), to.clone())
-            .map_err(|e| e.to_string())?;
+        match sm.add_edge_type(name, from.clone(), to.clone()) {
+            Ok(_) => {}
+            Err(e) if e.to_string().contains("already exists") => {}
+            Err(e) => {
+                return Err(UniError::Schema {
+                    message: e.to_string(),
+                });
+            }
+        }
     }
 
     for (label_or_type, prop_name, data_type, nullable) in pending_properties {
-        sm.add_property(label_or_type, prop_name, data_type.clone(), *nullable)
-            .map_err(|e| e.to_string())?;
+        match sm.add_property(label_or_type, prop_name, data_type.clone(), *nullable) {
+            Ok(_) => {}
+            Err(e) if e.to_string().contains("already exists") => {}
+            Err(e) => {
+                return Err(UniError::Schema {
+                    message: e.to_string(),
+                });
+            }
+        }
     }
 
     for idx in pending_indexes {
-        sm.add_index(idx.clone()).map_err(|e| e.to_string())?;
+        sm.add_index(idx.clone()).map_err(|e| UniError::Schema {
+            message: e.to_string(),
+        })?;
     }
 
-    sm.save().await.map_err(|e| e.to_string())?;
+    sm.save().await.map_err(|e| UniError::Schema {
+        message: e.to_string(),
+    })?;
     Ok(())
 }
 
 // ============================================================================
 // Index Core
 // ============================================================================
-
-/// Create a scalar index.
-pub async fn create_scalar_index_core(
-    db: &Uni,
-    label: &str,
-    property: &str,
-    index_type: &str,
-) -> Result<(), String> {
-    let it = match index_type.to_lowercase().as_str() {
-        "btree" => ScalarIndexType::BTree,
-        "hash" => ScalarIndexType::Hash,
-        "bitmap" => ScalarIndexType::Bitmap,
-        _ => return Err(format!("Unknown index type: {}", index_type)),
-    };
-
-    let sm = db.schema_manager();
-    let idx_config = ScalarIndexConfig {
-        name: format!("idx_{}_{}", label, property),
-        label: label.to_string(),
-        properties: vec![property.to_string()],
-        index_type: it,
-        where_clause: None,
-        metadata: Default::default(),
-    };
-    let def = IndexDefinition::Scalar(idx_config);
-    sm.add_index(def).map_err(|e| e.to_string())?;
-    sm.save().await.map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-/// Create a vector index.
-pub async fn create_vector_index_core(
-    db: &Uni,
-    label: &str,
-    property: &str,
-    metric: &str,
-) -> Result<(), String> {
-    let metric_type = match metric.to_lowercase().as_str() {
-        "l2" => DistanceMetric::L2,
-        "cosine" => DistanceMetric::Cosine,
-        "dot" => DistanceMetric::Dot,
-        _ => return Err(format!("Unknown metric: {}", metric)),
-    };
-
-    let sm = db.schema_manager();
-    let idx_config = VectorIndexConfig {
-        name: format!("idx_{}_{}_vec", label, property),
-        label: label.to_string(),
-        property: property.to_string(),
-        index_type: VectorIndexType::Hnsw {
-            m: 16,
-            ef_construction: 200,
-            ef_search: 50,
-        },
-        metric: metric_type,
-        embedding_config: None,
-        metadata: Default::default(),
-    };
-
-    let def = IndexDefinition::Vector(idx_config);
-    sm.add_index(def).map_err(|e| e.to_string())?;
-    sm.save().await.map_err(|e| e.to_string())?;
-    Ok(())
-}
 
 // ============================================================================
 // Bulk Loading Core
@@ -311,15 +239,12 @@ pub async fn bulk_insert_vertices_core(
     db: &Uni,
     label: &str,
     rust_props: Vec<HashMap<String, serde_json::Value>>,
-) -> Result<Vec<Vid>, String> {
+) -> Result<Vec<Vid>, UniError> {
     let uni_props: Vec<uni_common::Properties> = rust_props
         .into_iter()
         .map(|m| m.into_iter().map(|(k, v)| (k, v.into())).collect())
         .collect();
-    db.session()
-        .bulk_insert_vertices(label, uni_props)
-        .await
-        .map_err(|e| e.to_string())
+    db.session().bulk_insert_vertices(label, uni_props).await
 }
 
 /// Bulk insert edges.
@@ -327,15 +252,12 @@ pub async fn bulk_insert_edges_core(
     db: &Uni,
     edge_type: &str,
     edges: Vec<(Vid, Vid, HashMap<String, serde_json::Value>)>,
-) -> Result<(), String> {
+) -> Result<(), UniError> {
     let uni_edges: Vec<(Vid, Vid, uni_common::Properties)> = edges
         .into_iter()
         .map(|(s, d, m)| (s, d, m.into_iter().map(|(k, v)| (k, v.into())).collect()))
         .collect();
-    db.session()
-        .bulk_insert_edges(edge_type, uni_edges)
-        .await
-        .map_err(|e| e.to_string())
+    db.session().bulk_insert_edges(edge_type, uni_edges).await
 }
 
 // ============================================================================
@@ -347,13 +269,10 @@ pub async fn xervo_embed_core(
     db: &Uni,
     alias: &str,
     texts: Vec<String>,
-) -> Result<Vec<Vec<f32>>, String> {
+) -> Result<Vec<Vec<f32>>, UniError> {
     let xervo = db.xervo();
     let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
-    xervo
-        .embed(alias, &text_refs)
-        .await
-        .map_err(|e| e.to_string())
+    xervo.embed(alias, &text_refs).await
 }
 
 /// Generate text using structured messages via a configured Xervo model alias.
@@ -364,7 +283,7 @@ pub async fn xervo_generate_core(
     max_tokens: Option<usize>,
     temperature: Option<f32>,
     top_p: Option<f32>,
-) -> Result<::uni_db::api::xervo::GenerationResult, String> {
+) -> Result<::uni_db::api::xervo::GenerationResult, UniError> {
     use ::uni_db::api::xervo::{GenerationOptions, Message};
     let xervo = db.xervo();
     let rust_messages: Vec<Message> = messages
@@ -383,10 +302,7 @@ pub async fn xervo_generate_core(
         width: None,
         height: None,
     };
-    xervo
-        .generate(alias, &rust_messages, opts)
-        .await
-        .map_err(|e| e.to_string())
+    xervo.generate(alias, &rust_messages, opts).await
 }
 
 // ============================================================================
@@ -394,24 +310,20 @@ pub async fn xervo_generate_core(
 // ============================================================================
 
 /// Create a point-in-time snapshot of the database.
-pub async fn create_snapshot_core(db: &Uni, name: Option<String>) -> Result<String, String> {
-    db.create_snapshot(name.as_deref())
-        .await
-        .map_err(|e| e.to_string())
+pub async fn create_snapshot_core(db: &Uni, name: Option<String>) -> Result<String, UniError> {
+    db.create_snapshot(name.as_deref()).await
 }
 
 /// List all available snapshots.
 pub async fn list_snapshots_core(
     db: &Uni,
-) -> Result<Vec<uni_common::core::snapshot::SnapshotManifest>, String> {
-    db.list_snapshots().await.map_err(|e| e.to_string())
+) -> Result<Vec<uni_common::core::snapshot::SnapshotManifest>, UniError> {
+    db.list_snapshots().await
 }
 
 /// Restore the database to a specific snapshot.
-pub async fn restore_snapshot_core(db: &Uni, snapshot_id: &str) -> Result<(), String> {
-    db.restore_snapshot(snapshot_id)
-        .await
-        .map_err(|e| e.to_string())
+pub async fn restore_snapshot_core(db: &Uni, snapshot_id: &str) -> Result<(), UniError> {
+    db.restore_snapshot(snapshot_id).await
 }
 
 // ============================================================================
@@ -422,8 +334,8 @@ pub async fn restore_snapshot_core(db: &Uni, snapshot_id: &str) -> Result<(), St
 pub async fn compact_label_core(
     db: &Uni,
     label: &str,
-) -> Result<crate::types::PyCompactionStats, String> {
-    let stats = db.compact_label(label).await.map_err(|e| e.to_string())?;
+) -> Result<crate::types::PyCompactionStats, UniError> {
+    let stats = db.compact_label(label).await?;
     Ok(crate::types::PyCompactionStats {
         files_compacted: stats.files_compacted,
         bytes_before: stats.bytes_before,
@@ -437,11 +349,8 @@ pub async fn compact_label_core(
 pub async fn compact_edge_type_core(
     db: &Uni,
     edge_type: &str,
-) -> Result<crate::types::PyCompactionStats, String> {
-    let stats = db
-        .compact_edge_type(edge_type)
-        .await
-        .map_err(|e| e.to_string())?;
+) -> Result<crate::types::PyCompactionStats, UniError> {
+    let stats = db.compact_edge_type(edge_type).await?;
     Ok(crate::types::PyCompactionStats {
         files_compacted: stats.files_compacted,
         bytes_before: stats.bytes_before,
@@ -452,8 +361,8 @@ pub async fn compact_edge_type_core(
 }
 
 /// Wait for any ongoing compaction to complete.
-pub async fn wait_for_compaction_core(db: &Uni) -> Result<(), String> {
-    db.wait_for_compaction().await.map_err(|e| e.to_string())
+pub async fn wait_for_compaction_core(db: &Uni) -> Result<(), UniError> {
+    db.wait_for_compaction().await
 }
 
 // ============================================================================
@@ -463,13 +372,13 @@ pub async fn wait_for_compaction_core(db: &Uni) -> Result<(), String> {
 /// Get status of background index rebuild tasks.
 pub async fn index_rebuild_status_core(
     db: &Uni,
-) -> Result<Vec<uni_store::storage::IndexRebuildTask>, String> {
-    db.index_rebuild_status().await.map_err(|e| e.to_string())
+) -> Result<Vec<uni_store::storage::IndexRebuildTask>, UniError> {
+    db.index_rebuild_status().await
 }
 
 /// Retry failed index rebuild tasks.
-pub async fn retry_index_rebuilds_core(db: &Uni) -> Result<Vec<String>, String> {
-    db.retry_index_rebuilds().await.map_err(|e| e.to_string())
+pub async fn retry_index_rebuilds_core(db: &Uni) -> Result<Vec<String>, UniError> {
+    db.retry_index_rebuilds().await
 }
 
 /// Force rebuild indexes for a label (async_ = true runs in background).
@@ -477,15 +386,13 @@ pub async fn rebuild_indexes_core(
     db: &Uni,
     label: &str,
     async_: bool,
-) -> Result<Option<String>, String> {
-    db.rebuild_indexes(label, async_)
-        .await
-        .map_err(|e| e.to_string())
+) -> Result<Option<String>, UniError> {
+    db.rebuild_indexes(label, async_).await
 }
 
 /// Check if an index is currently being rebuilt for a label.
-pub async fn is_index_building_core(db: &Uni, label: &str) -> Result<bool, String> {
-    db.is_index_building(label).await.map_err(|e| e.to_string())
+pub async fn is_index_building_core(db: &Uni, label: &str) -> Result<bool, UniError> {
+    db.is_index_building(label).await
 }
 
 /// List all indexes defined on a specific label.
@@ -506,8 +413,8 @@ pub fn list_all_indexes_core(db: &Uni) -> Vec<uni_common::core::schema::IndexDef
 pub async fn locy_evaluate_core(
     db: &Uni,
     program: &str,
-) -> Result<::uni_db::locy::LocyResult, String> {
-    db.session().locy(program).await.map_err(|e| e.to_string())
+) -> Result<::uni_db::locy::LocyResult, UniError> {
+    db.session().locy(program).await
 }
 
 /// Evaluate a Locy program with custom configuration.
@@ -515,23 +422,20 @@ pub async fn locy_evaluate_with_config_core(
     db: &Uni,
     program: &str,
     config: ::uni_db::locy::LocyConfig,
-) -> Result<::uni_db::locy::LocyResult, String> {
+) -> Result<::uni_db::locy::LocyResult, UniError> {
     db.session()
         .locy_with(program)
         .with_config(config)
         .run()
         .await
-        .map_err(|e| e.to_string())
 }
 
 /// Compile a Locy program without executing it.
 pub fn locy_compile_only_core(
     db: &Uni,
     program: &str,
-) -> Result<::uni_locy::CompiledProgram, String> {
-    db.session()
-        .compile_locy(program)
-        .map_err(|e| e.to_string())
+) -> Result<::uni_locy::CompiledProgram, UniError> {
+    db.session().compile_locy(program)
 }
 
 // ============================================================================
@@ -563,7 +467,7 @@ pub async fn build_database_core(
     uni_config: Option<uni_common::UniConfig>,
     read_only: bool,
     write_lease: Option<::uni_db::api::multi_agent::WriteLease>,
-) -> Result<Uni, String> {
+) -> Result<Uni, UniError> {
     let mut builder = match mode {
         OpenMode::Open => Uni::open(uri),
         OpenMode::OpenExisting => Uni::open_existing(uri),
@@ -588,13 +492,9 @@ pub async fn build_database_core(
     }
 
     if let Some(json) = xervo_catalog_json {
-        builder = builder
-            .xervo_catalog_from_str(json)
-            .map_err(|e| e.to_string())?;
+        builder = builder.xervo_catalog_from_str(json)?;
     } else if let Some(path) = xervo_catalog_file {
-        builder = builder
-            .xervo_catalog_from_file(path)
-            .map_err(|e| e.to_string())?;
+        builder = builder.xervo_catalog_from_file(path)?;
     }
 
     if let Some(cc) = cloud_config {
@@ -613,7 +513,7 @@ pub async fn build_database_core(
         builder = builder.write_lease(wl);
     }
 
-    builder.build().await.map_err(|e| e.to_string())
+    builder.build().await
 }
 
 // ============================================================================

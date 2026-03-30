@@ -11,13 +11,20 @@ import uni_db
 @pytest.fixture
 async def bulk_db():
     """Create an async database with schema for bulk loading."""
-    db = await uni_db.AsyncDatabase.temporary()
-    await db.create_label("Person")
-    await db.add_property("Person", "name", "string", False)
-    await db.add_property("Person", "age", "int", False)
-    await db.create_label("Company")
-    await db.add_property("Company", "name", "string", False)
-    await db.create_edge_type("WORKS_AT", ["Person"], ["Company"])
+    db = await uni_db.AsyncUni.temporary()
+    await (
+        db.schema()
+        .label("Person")
+        .property("name", "string")
+        .property("age", "int")
+        .done()
+        .label("Company")
+        .property("name", "string")
+        .done()
+        .edge_type("WORKS_AT", ["Person"], ["Company"])
+        .done()
+        .apply()
+    )
     return db
 
 

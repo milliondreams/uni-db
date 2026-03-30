@@ -3,7 +3,7 @@
 
 //! Synchronous Python API — `Database`, `Transaction`, and `LocyEngine`.
 
-use crate::builders::{SchemaBuilder, SessionBuilder};
+use crate::builders::SchemaBuilder;
 use crate::convert;
 use crate::core;
 use crate::types::*;
@@ -51,9 +51,7 @@ impl QueryCursor {
                 buf.extend(iter);
                 Ok(first)
             }
-            Some(Err(e)) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                e.to_string(),
-            )),
+            Some(Err(e)) => Err(crate::exceptions::uni_error_to_pyerr(e)),
             None => Ok(None),
         }
     }
@@ -109,7 +107,7 @@ impl QueryCursor {
         if let Some(cursor) = cursor_opt {
             let remaining = pyo3_async_runtimes::tokio::get_runtime()
                 .block_on(cursor.collect_remaining())
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(crate::exceptions::uni_error_to_pyerr)?;
             rows.extend(remaining);
         }
 
@@ -163,7 +161,9 @@ pub struct Transaction {
 impl Transaction {
     fn check_active(&self) -> PyResult<&::uni_db::Transaction> {
         self.inner.as_ref().ok_or_else(|| {
-            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Transaction already completed")
+            crate::exceptions::UniTransactionAlreadyCompletedError::new_err(
+                "Transaction already completed",
+            )
         })
     }
 }
@@ -189,11 +189,11 @@ impl Transaction {
             }
             pyo3_async_runtimes::tokio::get_runtime()
                 .block_on(builder.fetch_all())
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+                .map_err(crate::exceptions::uni_error_to_pyerr)?
         } else {
             pyo3_async_runtimes::tokio::get_runtime()
                 .block_on(tx.query(cypher))
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+                .map_err(crate::exceptions::uni_error_to_pyerr)?
         };
         convert::query_result_to_py_class(py, result)
     }
@@ -215,11 +215,11 @@ impl Transaction {
             }
             pyo3_async_runtimes::tokio::get_runtime()
                 .block_on(builder.run())
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+                .map_err(crate::exceptions::uni_error_to_pyerr)?
         } else {
             pyo3_async_runtimes::tokio::get_runtime()
                 .block_on(tx.execute(cypher))
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+                .map_err(crate::exceptions::uni_error_to_pyerr)?
         };
         convert::execute_result_to_py(py, result)
     }
@@ -241,11 +241,11 @@ impl Transaction {
             }
             pyo3_async_runtimes::tokio::get_runtime()
                 .block_on(builder.run())
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+                .map_err(crate::exceptions::uni_error_to_pyerr)?
         } else {
             pyo3_async_runtimes::tokio::get_runtime()
                 .block_on(tx.locy(program))
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+                .map_err(crate::exceptions::uni_error_to_pyerr)?
         };
         convert::locy_result_to_py_class(py, result)
     }
@@ -258,7 +258,7 @@ impl Transaction {
         })?;
         let result = pyo3_async_runtimes::tokio::get_runtime()
             .block_on(tx.apply(dfs))
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
         Ok(PyApplyResult {
             facts_applied: result.facts_applied,
             version_gap: result.version_gap,
@@ -269,7 +269,7 @@ impl Transaction {
     fn register_rules(&self, program: &str) -> PyResult<()> {
         let tx = self.check_active()?;
         tx.register_rules(program)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+            .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
     /// Clear all registered Locy rules in this transaction.
@@ -291,7 +291,7 @@ impl Transaction {
         let tx = self.check_active()?;
         let prepared = pyo3_async_runtimes::tokio::get_runtime()
             .block_on(tx.prepare(cypher))
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
         Ok(PyPreparedQuery {
             inner: std::sync::Mutex::new(prepared),
         })
@@ -302,7 +302,7 @@ impl Transaction {
         let tx = self.check_active()?;
         let prepared = tx
             .prepare_locy(program)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
         Ok(PyPreparedLocy {
             inner: std::sync::Mutex::new(prepared),
         })
@@ -360,18 +360,22 @@ impl Transaction {
     /// Commit the transaction, returning a CommitResult.
     fn commit(&mut self) -> PyResult<PyCommitResult> {
         let tx = self.inner.take().ok_or_else(|| {
-            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Transaction already completed")
+            crate::exceptions::UniTransactionAlreadyCompletedError::new_err(
+                "Transaction already completed",
+            )
         })?;
         let result = pyo3_async_runtimes::tokio::get_runtime()
             .block_on(tx.commit())
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
         Ok(PyCommitResult::from(result))
     }
 
     /// Rollback the transaction.
     fn rollback(&mut self) -> PyResult<()> {
         let tx = self.inner.take().ok_or_else(|| {
-            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Transaction already completed")
+            crate::exceptions::UniTransactionAlreadyCompletedError::new_err(
+                "Transaction already completed",
+            )
         })?;
         tx.rollback();
         Ok(())
@@ -380,6 +384,11 @@ impl Transaction {
     /// Get the transaction ID.
     fn id(&self) -> PyResult<String> {
         Ok(self.check_active()?.id().to_string())
+    }
+
+    /// Database version when this transaction was started.
+    fn started_at_version(&self) -> PyResult<u64> {
+        Ok(self.check_active()?.started_at_version())
     }
 
     /// Check if the transaction has uncommitted changes.
@@ -426,7 +435,7 @@ impl Transaction {
 // ============================================================================
 
 /// Main entry point for the Uni embedded graph database.
-#[pyclass]
+#[pyclass(name = "Uni")]
 pub struct Database {
     pub(crate) inner: Arc<Uni>,
 }
@@ -442,7 +451,7 @@ impl Database {
     fn open(path: &str) -> PyResult<Self> {
         let uni = pyo3_async_runtimes::tokio::get_runtime()
             .block_on(async { Uni::open(path).build().await })
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
         Ok(Database {
             inner: Arc::new(uni),
         })
@@ -453,7 +462,7 @@ impl Database {
     fn temporary() -> PyResult<Self> {
         let uni = pyo3_async_runtimes::tokio::get_runtime()
             .block_on(async { Uni::temporary().build().await })
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
         Ok(Database {
             inner: Arc::new(uni),
         })
@@ -470,7 +479,7 @@ impl Database {
     fn create(path: &str) -> PyResult<Self> {
         let uni = pyo3_async_runtimes::tokio::get_runtime()
             .block_on(async { Uni::create(path).build().await })
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
         Ok(Database {
             inner: Arc::new(uni),
         })
@@ -481,7 +490,7 @@ impl Database {
     fn open_existing(path: &str) -> PyResult<Self> {
         let uni = pyo3_async_runtimes::tokio::get_runtime()
             .block_on(async { Uni::open_existing(path).build().await })
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
         Ok(Database {
             inner: Arc::new(uni),
         })
@@ -514,14 +523,14 @@ impl Database {
     }
 
     fn __repr__(&self) -> String {
-        "Database(open)".to_string()
+        "Uni(open)".to_string()
     }
 
     /// Flush all uncommitted changes to persistent storage.
     fn flush(&self) -> PyResult<()> {
         pyo3_async_runtimes::tokio::get_runtime()
             .block_on(core::flush_core(&self.inner))
-            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
         Ok(())
     }
 
@@ -540,83 +549,39 @@ impl Database {
         }
     }
 
-    /// Create a label.
-    fn create_label(&self, name: &str) -> PyResult<u16> {
-        pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(core::create_label_core(&self.inner, name))
-            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
-    }
-
-    /// Create an edge type.
-    #[pyo3(signature = (name, from_labels=None, to_labels=None))]
-    fn create_edge_type(
-        &self,
-        name: &str,
-        from_labels: Option<Vec<String>>,
-        to_labels: Option<Vec<String>>,
-    ) -> PyResult<u32> {
-        let from = from_labels.unwrap_or_default();
-        let to = to_labels.unwrap_or_default();
-        pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(core::create_edge_type_core(&self.inner, name, from, to))
-            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
-    }
-
-    /// Add a property to a label or edge type.
-    fn add_property(
-        &self,
-        label_or_type: &str,
-        name: &str,
-        data_type: &str,
-        nullable: bool,
-    ) -> PyResult<()> {
-        let dt = core::parse_data_type(data_type)
-            .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?;
-        pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(core::add_property_core(
-                &self.inner,
-                label_or_type,
-                name,
-                dt,
-                nullable,
-            ))
-            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
-        Ok(())
-    }
-
     /// Check if a label exists.
     fn label_exists(&self, name: &str) -> PyResult<bool> {
         pyo3_async_runtimes::tokio::get_runtime()
             .block_on(core::label_exists_core(&self.inner, name))
-            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+            .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
     /// Check if an edge type exists.
     fn edge_type_exists(&self, name: &str) -> PyResult<bool> {
         pyo3_async_runtimes::tokio::get_runtime()
             .block_on(core::edge_type_exists_core(&self.inner, name))
-            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+            .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
     /// Get all label names.
     fn list_labels(&self) -> PyResult<Vec<String>> {
         pyo3_async_runtimes::tokio::get_runtime()
             .block_on(core::list_labels_core(&self.inner))
-            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+            .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
     /// Get all edge type names.
     fn list_edge_types(&self) -> PyResult<Vec<String>> {
         pyo3_async_runtimes::tokio::get_runtime()
             .block_on(core::list_edge_types_core(&self.inner))
-            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+            .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
     /// Get detailed information about a label.
     fn get_label_info(&self, name: &str) -> PyResult<Option<LabelInfo>> {
         let info = pyo3_async_runtimes::tokio::get_runtime()
             .block_on(core::get_label_info_core(&self.inner, name))
-            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
 
         Ok(info.map(|i| LabelInfo {
             name: i.name,
@@ -678,49 +643,30 @@ impl Database {
         Ok(dict.into())
     }
 
+    /// Get the schema as a typed `Schema` object.
+    fn get_schema_typed(&self) -> PySchema {
+        PySchema {
+            inner: self.inner.get_schema(),
+        }
+    }
+
     /// Load schema from a JSON file.
     fn load_schema(&self, path: &str) -> PyResult<()> {
         pyo3_async_runtimes::tokio::get_runtime()
             .block_on(core::load_schema_core(&self.inner, path))
-            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+            .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
     /// Save schema to a JSON file.
     fn save_schema(&self, path: &str) -> PyResult<()> {
         pyo3_async_runtimes::tokio::get_runtime()
             .block_on(core::save_schema_core(&self.inner, path))
-            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+            .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
     // ========================================================================
     // Index Methods
     // ========================================================================
-
-    /// Create a scalar index on a property.
-    fn create_scalar_index(&self, label: &str, property: &str, index_type: &str) -> PyResult<()> {
-        pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(core::create_scalar_index_core(
-                &self.inner,
-                label,
-                property,
-                index_type,
-            ))
-            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
-        Ok(())
-    }
-
-    /// Create a vector index on a property.
-    fn create_vector_index(&self, label: &str, property: &str, metric: &str) -> PyResult<()> {
-        pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(core::create_vector_index_core(
-                &self.inner,
-                label,
-                property,
-                metric,
-            ))
-            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
-        Ok(())
-    }
 
     // ========================================================================
     // Session Methods
@@ -735,14 +681,6 @@ impl Database {
         }
     }
 
-    /// Create a session builder for setting variables before building.
-    fn session_builder(&self) -> SessionBuilder {
-        SessionBuilder {
-            inner: self.inner.clone(),
-            variables: HashMap::new(),
-        }
-    }
-
     /// Create a session template builder for pre-configured session factories.
     fn session_template(&self) -> crate::builders::SessionTemplateBuilder {
         crate::builders::SessionTemplateBuilder {
@@ -754,7 +692,7 @@ impl Database {
     fn register_rules(&self, program: &str) -> PyResult<()> {
         self.inner
             .register_rules(program)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+            .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
     /// Clear all registered Locy rules at the database level.
@@ -778,14 +716,14 @@ impl Database {
     fn create_snapshot(&self, name: Option<String>) -> PyResult<String> {
         pyo3_async_runtimes::tokio::get_runtime()
             .block_on(core::create_snapshot_core(&self.inner, name))
-            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+            .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
     /// List all available snapshots.
     fn list_snapshots(&self, py: Python) -> PyResult<Vec<crate::types::SnapshotInfo>> {
         let manifests = pyo3_async_runtimes::tokio::get_runtime()
             .block_on(core::list_snapshots_core(&self.inner))
-            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
         manifests
             .into_iter()
             .map(|m| convert::snapshot_manifest_to_py(py, m))
@@ -796,7 +734,7 @@ impl Database {
     fn restore_snapshot(&self, snapshot_id: &str) -> PyResult<()> {
         pyo3_async_runtimes::tokio::get_runtime()
             .block_on(core::restore_snapshot_core(&self.inner, snapshot_id))
-            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+            .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
     // -----------------------------------------------------------------------
@@ -807,21 +745,21 @@ impl Database {
     fn compact_label(&self, label: &str) -> PyResult<crate::types::PyCompactionStats> {
         pyo3_async_runtimes::tokio::get_runtime()
             .block_on(core::compact_label_core(&self.inner, label))
-            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+            .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
     /// Compact an edge type's storage files.
     fn compact_edge_type(&self, edge_type: &str) -> PyResult<crate::types::PyCompactionStats> {
         pyo3_async_runtimes::tokio::get_runtime()
             .block_on(core::compact_edge_type_core(&self.inner, edge_type))
-            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+            .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
     /// Wait for any ongoing compaction to complete.
     fn wait_for_compaction(&self) -> PyResult<()> {
         pyo3_async_runtimes::tokio::get_runtime()
             .block_on(core::wait_for_compaction_core(&self.inner))
-            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+            .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
     // -----------------------------------------------------------------------
@@ -835,7 +773,7 @@ impl Database {
     ) -> PyResult<Vec<crate::types::IndexRebuildTaskInfo>> {
         let tasks = pyo3_async_runtimes::tokio::get_runtime()
             .block_on(core::index_rebuild_status_core(&self.inner))
-            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
         tasks
             .into_iter()
             .map(|t| convert::index_rebuild_task_to_py(py, t))
@@ -846,7 +784,7 @@ impl Database {
     fn retry_index_rebuilds(&self) -> PyResult<Vec<String>> {
         pyo3_async_runtimes::tokio::get_runtime()
             .block_on(core::retry_index_rebuilds_core(&self.inner))
-            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+            .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
     /// Force rebuild indexes for a label. If background=true, returns a task ID.
@@ -854,14 +792,14 @@ impl Database {
     fn rebuild_indexes(&self, label: &str, background: bool) -> PyResult<Option<String>> {
         pyo3_async_runtimes::tokio::get_runtime()
             .block_on(core::rebuild_indexes_core(&self.inner, label, background))
-            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+            .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
     /// Check if an index is currently being rebuilt for a label.
     fn is_index_building(&self, label: &str) -> PyResult<bool> {
         pyo3_async_runtimes::tokio::get_runtime()
             .block_on(core::is_index_building_core(&self.inner, label))
-            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+            .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
     /// List all indexes defined on a specific label.
@@ -891,7 +829,7 @@ impl Database {
     fn shutdown(&self) -> PyResult<()> {
         pyo3_async_runtimes::tokio::get_runtime()
             .block_on(self.inner.flush())
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+            .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
     /// Get database-wide metrics.
@@ -946,7 +884,7 @@ impl Xervo {
     fn embed(&self, alias: &str, texts: Vec<String>) -> PyResult<Vec<Vec<f32>>> {
         pyo3_async_runtimes::tokio::get_runtime()
             .block_on(core::xervo_embed_core(&self.inner, alias, texts))
-            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+            .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
     /// Generate text using structured messages. Returns a GenerationResult.
@@ -972,7 +910,7 @@ impl Xervo {
                 temperature,
                 top_p,
             ))
-            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
         convert::generation_result_to_py(py, result)
     }
 
@@ -997,7 +935,7 @@ impl Xervo {
                 temperature,
                 top_p,
             ))
-            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
         convert::generation_result_to_py(py, result)
     }
 }

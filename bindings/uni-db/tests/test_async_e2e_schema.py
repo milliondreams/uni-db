@@ -9,12 +9,10 @@ import uni_db
 
 
 @pytest.mark.asyncio
-async def test_create_labels_direct(async_empty_db):
-    """Test creating labels via direct methods."""
+async def test_create_labels_via_builder(async_empty_db):
+    """Test creating labels via schema builder."""
 
-    label_id = await async_empty_db.create_label("Person")
-    assert isinstance(label_id, int)
-    assert label_id >= 0
+    await async_empty_db.schema().label("Person").apply()
 
     assert await async_empty_db.label_exists("Person")
     labels = await async_empty_db.list_labels()
@@ -22,15 +20,19 @@ async def test_create_labels_direct(async_empty_db):
 
 
 @pytest.mark.asyncio
-async def test_create_edge_types_direct(async_empty_db):
-    """Test creating edge types via direct methods."""
+async def test_create_edge_types_via_builder(async_empty_db):
+    """Test creating edge types via schema builder."""
 
-    await async_empty_db.create_label("Person")
-    await async_empty_db.create_label("Company")
-
-    edge_id = await async_empty_db.create_edge_type("WORKS_AT", ["Person"], ["Company"])
-    assert isinstance(edge_id, int)
-    assert edge_id >= 0
+    await (
+        async_empty_db.schema()
+        .label("Person")
+        .done()
+        .label("Company")
+        .done()
+        .edge_type("WORKS_AT", ["Person"], ["Company"])
+        .done()
+        .apply()
+    )
 
     assert await async_empty_db.edge_type_exists("WORKS_AT")
     edge_types = await async_empty_db.list_edge_types()
@@ -39,14 +41,17 @@ async def test_create_edge_types_direct(async_empty_db):
 
 @pytest.mark.asyncio
 async def test_add_properties_basic_types(async_empty_db):
-    """Test adding properties with basic data types."""
+    """Test adding properties with basic data types via schema builder."""
 
-    await async_empty_db.create_label("User")
-
-    await async_empty_db.add_property("User", "name", "string", False)
-    await async_empty_db.add_property("User", "age", "int", False)
-    await async_empty_db.add_property("User", "score", "float", False)
-    await async_empty_db.add_property("User", "active", "bool", False)
+    await (
+        async_empty_db.schema()
+        .label("User")
+        .property("name", "string")
+        .property("age", "int")
+        .property("score", "float")
+        .property("active", "bool")
+        .apply()
+    )
 
     info = await async_empty_db.get_label_info("User")
     assert info.name == "User"
@@ -67,15 +72,15 @@ async def test_add_properties_basic_types(async_empty_db):
 
 @pytest.mark.asyncio
 async def test_nullable_properties(async_empty_db):
-    """Test nullable and non-nullable properties."""
+    """Test nullable and non-nullable properties via schema builder."""
 
-    await async_empty_db.create_label("Product")
-
-    # Non-nullable property
-    await async_empty_db.add_property("Product", "name", "string", False)
-
-    # Nullable property
-    await async_empty_db.add_property("Product", "description", "string", True)
+    await (
+        async_empty_db.schema()
+        .label("Product")
+        .property("name", "string")
+        .property_nullable("description", "string")
+        .apply()
+    )
 
     info = await async_empty_db.get_label_info("Product")
     props_by_name = {p.name: p for p in info.properties}
@@ -86,10 +91,9 @@ async def test_nullable_properties(async_empty_db):
 
 @pytest.mark.asyncio
 async def test_vector_properties(async_empty_db):
-    """Test vector properties."""
+    """Test vector properties via schema builder."""
 
-    await async_empty_db.create_label("Document")
-    await async_empty_db.add_property("Document", "embedding", "vector:128", False)
+    await async_empty_db.schema().label("Document").vector("embedding", 128).apply()
 
     info = await async_empty_db.get_label_info("Document")
     props_by_name = {p.name: p for p in info.properties}
@@ -103,11 +107,15 @@ async def test_vector_properties(async_empty_db):
 
 @pytest.mark.asyncio
 async def test_list_properties(async_empty_db):
-    """Test list properties."""
+    """Test list properties via schema builder."""
 
-    await async_empty_db.create_label("Article")
-    await async_empty_db.add_property("Article", "tags", "list:string", False)
-    await async_empty_db.add_property("Article", "scores", "list:int", False)
+    await (
+        async_empty_db.schema()
+        .label("Article")
+        .property("tags", "list:string")
+        .property("scores", "list:int")
+        .apply()
+    )
 
     info = await async_empty_db.get_label_info("Article")
     props_by_name = {p.name: p for p in info.properties}
@@ -263,14 +271,15 @@ async def test_schema_builder_edge_type_with_properties(async_empty_db):
     assert await async_empty_db.edge_type_exists("KNOWS")
 
     # Create an edge to verify properties work
-    await async_empty_db.execute("CREATE (a:Person {name: 'Alice'})")
-    await async_empty_db.execute("CREATE (b:Person {name: 'Bob'})")
-    await async_empty_db.execute(
+    session = async_empty_db.session()
+    await session.execute("CREATE (a:Person {name: 'Alice'})")
+    await session.execute("CREATE (b:Person {name: 'Bob'})")
+    await session.execute(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) "
         "CREATE (a)-[:KNOWS {since: 2020, weight: 0.8}]->(b)"
     )
 
-    result = await async_empty_db.query(
+    result = await session.query(
         "MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN r.since as since, r.weight as weight"
     )
     assert len(result) == 1
@@ -285,12 +294,19 @@ async def test_label_exists_and_edge_type_exists(async_empty_db):
     assert await async_empty_db.label_exists("NonExistent") is False
     assert await async_empty_db.edge_type_exists("NON_EXISTENT") is False
 
-    await async_empty_db.create_label("TestLabel")
+    await async_empty_db.schema().label("TestLabel").apply()
     assert await async_empty_db.label_exists("TestLabel") is True
 
-    await async_empty_db.create_label("Source")
-    await async_empty_db.create_label("Target")
-    await async_empty_db.create_edge_type("TEST_EDGE", ["Source"], ["Target"])
+    await (
+        async_empty_db.schema()
+        .label("Source")
+        .done()
+        .label("Target")
+        .done()
+        .edge_type("TEST_EDGE", ["Source"], ["Target"])
+        .done()
+        .apply()
+    )
     assert await async_empty_db.edge_type_exists("TEST_EDGE") is True
 
 
@@ -301,9 +317,16 @@ async def test_list_labels_and_edge_types(async_empty_db):
     labels = await async_empty_db.list_labels()
     edge_types = await async_empty_db.list_edge_types()
 
-    await async_empty_db.create_label("Person")
-    await async_empty_db.create_label("Company")
-    await async_empty_db.create_label("Product")
+    await (
+        async_empty_db.schema()
+        .label("Person")
+        .done()
+        .label("Company")
+        .done()
+        .label("Product")
+        .done()
+        .apply()
+    )
 
     labels = await async_empty_db.list_labels()
     assert isinstance(labels, list)
@@ -311,8 +334,14 @@ async def test_list_labels_and_edge_types(async_empty_db):
     assert "Company" in labels
     assert "Product" in labels
 
-    await async_empty_db.create_edge_type("WORKS_AT", ["Person"], ["Company"])
-    await async_empty_db.create_edge_type("PRODUCES", ["Company"], ["Product"])
+    await (
+        async_empty_db.schema()
+        .edge_type("WORKS_AT", ["Person"], ["Company"])
+        .done()
+        .edge_type("PRODUCES", ["Company"], ["Product"])
+        .done()
+        .apply()
+    )
 
     edge_types = await async_empty_db.list_edge_types()
     assert isinstance(edge_types, list)
@@ -335,10 +364,11 @@ async def test_get_label_info(async_empty_db):
         .apply()
     )
 
-    await async_empty_db.execute(
+    session = async_empty_db.session()
+    await session.execute(
         "CREATE (:Movie {title: 'The Matrix', year: 1999, rating: 8.7})"
     )
-    await async_empty_db.execute("CREATE (:Movie {title: 'Inception', year: 2010})")
+    await session.execute("CREATE (:Movie {title: 'Inception', year: 2010})")
     await async_empty_db.flush()
 
     info = await async_empty_db.get_label_info("Movie")
@@ -413,7 +443,7 @@ async def test_save_and_load_schema(async_empty_db, tmp_path):
     assert schema_path.exists()
     assert schema_path.stat().st_size > 0
 
-    db2 = await uni_db.AsyncDatabase.temporary()
+    db2 = await uni_db.AsyncUni.temporary()
     await db2.load_schema(str(schema_path))
 
     assert await db2.label_exists("Person")
@@ -451,7 +481,8 @@ async def test_data_types_e2e(async_empty_db):
         .apply()
     )
 
-    await async_empty_db.execute("""
+    session = async_empty_db.session()
+    await session.execute("""
         CREATE (:TestEntity {
             str_val: 'hello',
             int_val: 42,
@@ -463,7 +494,7 @@ async def test_data_types_e2e(async_empty_db):
         })
     """)
 
-    result = await async_empty_db.query("""
+    result = await session.query("""
         MATCH (e:TestEntity)
         RETURN e.str_val, e.int_val, e.float_val, e.bool_val,
                e.tags, e.scores, e.embedding
@@ -549,7 +580,8 @@ async def test_schema_builder_complex_workflow(async_empty_db):
     assert person_props["email"].is_indexed is True
 
     # Create some data to verify schema works
-    await async_empty_db.execute(
+    session = async_empty_db.session()
+    await session.execute(
         """
         CREATE (alice:Person {
             name: 'Alice',
@@ -583,7 +615,7 @@ async def test_schema_builder_complex_workflow(async_empty_db):
     )
 
     # Query to verify
-    result = await async_empty_db.query("""
+    result = await session.query("""
         MATCH (a:Person)-[:AUTHORED]->(p:Post)
         RETURN a.name, p.title
     """)

@@ -10,6 +10,42 @@ use pyo3::types::{PyBytes, PyDict, PyList};
 use std::collections::HashMap;
 use uni_common::value::TemporalValue;
 
+use crate::types::{PyEdge, PyNode, PyPath};
+
+/// Convert a Rust `Node` to a Python `Node` object.
+pub fn node_to_py(py: Python, n: &::uni_db::Node) -> PyResult<Py<PyNode>> {
+    let mut properties = HashMap::new();
+    for (k, v) in &n.properties {
+        properties.insert(k.clone(), value_to_py(py, v)?);
+    }
+    Py::new(
+        py,
+        PyNode {
+            id: n.vid.as_u64(),
+            labels: n.labels.clone(),
+            properties,
+        },
+    )
+}
+
+/// Convert a Rust `Edge` to a Python `Edge` object.
+pub fn edge_to_py(py: Python, e: &::uni_db::Edge) -> PyResult<Py<PyEdge>> {
+    let mut properties = HashMap::new();
+    for (k, v) in &e.properties {
+        properties.insert(k.clone(), value_to_py(py, v)?);
+    }
+    Py::new(
+        py,
+        PyEdge {
+            id: e.eid.as_u64(),
+            type_name: e.edge_type.clone(),
+            start_id: e.src.as_u64(),
+            end_id: e.dst.as_u64(),
+            properties,
+        },
+    )
+}
+
 /// Convert a Uni Value to a Python object.
 pub fn value_to_py(py: Python, value: &Value) -> PyResult<Py<PyAny>> {
     match value {
@@ -34,40 +70,20 @@ pub fn value_to_py(py: Python, value: &Value) -> PyResult<Py<PyAny>> {
             Ok(dict.into())
         }
         Value::Vector(v) => Ok(v.clone().into_py_any(py)?),
-        Value::Node(n) => {
-            let dict = PyDict::new(py);
-            dict.set_item("_id", n.vid.to_string())?;
-            dict.set_item("_labels", &n.labels)?;
-            for (k, v) in &n.properties {
-                dict.set_item(k, value_to_py(py, v)?)?;
-            }
-            Ok(dict.into())
-        }
-        Value::Edge(e) => {
-            let dict = PyDict::new(py);
-            dict.set_item("_id", e.eid.as_u64())?;
-            dict.set_item("_type", &e.edge_type)?;
-            dict.set_item("_src", e.src.to_string())?;
-            dict.set_item("_dst", e.dst.to_string())?;
-            for (k, v) in &e.properties {
-                dict.set_item(k, value_to_py(py, v)?)?;
-            }
-            Ok(dict.into())
-        }
+        Value::Node(n) => Ok(node_to_py(py, n)?.into_any()),
+        Value::Edge(e) => Ok(edge_to_py(py, e)?.into_any()),
         Value::Path(p) => {
-            let dict = PyDict::new(py);
-            let nodes = PyList::empty(py);
-            for n in p.nodes() {
-                nodes.append(value_to_py(py, &Value::Node(n.clone()))?)?;
-            }
-            dict.set_item("nodes", nodes)?;
-
-            let edges = PyList::empty(py);
-            for e in p.edges() {
-                edges.append(value_to_py(py, &Value::Edge(e.clone()))?)?;
-            }
-            dict.set_item("edges", edges)?;
-            Ok(dict.into())
+            let nodes: Vec<Py<PyNode>> = p
+                .nodes()
+                .iter()
+                .map(|n| node_to_py(py, n))
+                .collect::<PyResult<_>>()?;
+            let edges: Vec<Py<PyEdge>> = p
+                .edges()
+                .iter()
+                .map(|e| edge_to_py(py, e))
+                .collect::<PyResult<_>>()?;
+            Ok(Py::new(py, PyPath { nodes, edges })?.into_any())
         }
         Value::Temporal(tv) => {
             let datetime_module = py.import("datetime")?;
@@ -361,15 +377,18 @@ pub fn prepare_params(
     Ok(rust_params)
 }
 
-/// Convert query result rows to Python dicts.
+/// Convert query result rows to Python Row objects.
 pub fn rows_to_py(py: Python, rows: Vec<::uni_db::Row>) -> PyResult<Vec<Py<PyAny>>> {
     let mut result = Vec::new();
     for row in rows {
-        let dict = PyDict::new(py);
-        for (col_name, val) in row.as_map() {
-            dict.set_item(col_name, value_to_py(py, val)?)?;
+        let columns: Vec<String> = row.columns().to_vec();
+        let mut values = Vec::with_capacity(columns.len());
+        for col in &columns {
+            let val = row.value(col).unwrap_or(&::uni_db::Value::Null);
+            values.push(value_to_py(py, val)?);
         }
-        result.push(dict.into());
+        let py_row = crate::types::PyRow { columns, values };
+        result.push(Py::new(py, py_row)?.into_any());
     }
     Ok(result)
 }
@@ -472,22 +491,23 @@ fn modification_to_py(py: Python, m: uni_locy::Modification) -> PyResult<Py<PyAn
 
 /// Convert a Locy CommandResult to a Python dict.
 fn command_result_to_py(py: Python, cmd: uni_locy::CommandResult) -> PyResult<Py<PyAny>> {
-    let dict = PyDict::new(py);
+    use crate::types::*;
     match cmd {
         uni_locy::CommandResult::Query(rows) => {
-            dict.set_item("type", "query")?;
-            dict.set_item("rows", locy_rows_to_py(py, rows)?)?;
+            let rows_py = locy_rows_to_py(py, rows)?;
+            let list = PyList::new(py, &rows_py)?;
+            Ok(Py::new(py, PyQueryCommandResult { rows: list.into() })?.into_any())
         }
         uni_locy::CommandResult::Assume(rows) => {
-            dict.set_item("type", "assume")?;
-            dict.set_item("rows", locy_rows_to_py(py, rows)?)?;
+            let rows_py = locy_rows_to_py(py, rows)?;
+            let list = PyList::new(py, &rows_py)?;
+            Ok(Py::new(py, PyAssumeCommandResult { rows: list.into() })?.into_any())
         }
         uni_locy::CommandResult::Explain(node) => {
-            dict.set_item("type", "explain")?;
-            dict.set_item("tree", derivation_node_to_py(py, node)?)?;
+            let tree = derivation_node_to_py(py, node)?;
+            Ok(Py::new(py, PyExplainCommandResult { tree })?.into_any())
         }
         uni_locy::CommandResult::Abduce(result) => {
-            dict.set_item("type", "abduce")?;
             let mods = PyList::empty(py);
             for vm in result.modifications {
                 let mod_dict = PyDict::new(py);
@@ -496,18 +516,23 @@ fn command_result_to_py(py: Python, cmd: uni_locy::CommandResult) -> PyResult<Py
                 mod_dict.set_item("cost", vm.cost)?;
                 mods.append(mod_dict)?;
             }
-            dict.set_item("modifications", mods)?;
+            Ok(Py::new(
+                py,
+                PyAbduceCommandResult {
+                    modifications: mods.into(),
+                },
+            )?
+            .into_any())
         }
         uni_locy::CommandResult::Derive { affected } => {
-            dict.set_item("type", "derive")?;
-            dict.set_item("affected", affected)?;
+            Ok(Py::new(py, PyDeriveCommandResult { affected })?.into_any())
         }
         uni_locy::CommandResult::Cypher(rows) => {
-            dict.set_item("type", "cypher")?;
-            dict.set_item("rows", locy_rows_to_py(py, rows)?)?;
+            let rows_py = locy_rows_to_py(py, rows)?;
+            let list = PyList::new(py, &rows_py)?;
+            Ok(Py::new(py, PyCypherCommandResult { rows: list.into() })?.into_any())
         }
     }
-    Ok(dict.into())
 }
 
 /// Extract a LocyConfig from a Python config dict.
@@ -1145,7 +1170,8 @@ pub fn extract_cloud_config(
 /// Extract a UniConfig from a Python dict.
 ///
 /// Supports: `query_timeout` (float, seconds), `max_query_memory` (int, bytes),
-/// `parallelism` (int), `cache_size` (int, bytes).
+/// `parallelism` (int), `cache_size` (int, bytes), `max_transaction_memory` (int, bytes),
+/// `batch_size` (int), `wal_enabled` (bool).
 pub fn extract_uni_config(
     py: Python,
     config: &HashMap<String, Py<PyAny>>,
@@ -1165,6 +1191,12 @@ pub fn extract_uni_config(
     }
     if let Some(v) = config.get("max_transaction_memory") {
         uni_config.max_transaction_memory = v.extract::<usize>(py)?;
+    }
+    if let Some(v) = config.get("batch_size") {
+        uni_config.batch_size = v.extract::<usize>(py)?;
+    }
+    if let Some(v) = config.get("wal_enabled") {
+        uni_config.wal_enabled = v.extract::<bool>(py)?;
     }
     Ok(uni_config)
 }

@@ -209,7 +209,7 @@ class SchemaGenerator:
         self._schema = schema
         return schema
 
-    def apply_to_database(self, db: uni_db.Database) -> None:
+    def apply_to_database(self, db: uni_db.Uni) -> None:
         """Apply the generated schema to a database using SchemaBuilder.
 
         Uses db.schema() for atomic schema application with additive-only
@@ -258,26 +258,26 @@ class SchemaGenerator:
         if has_changes:
             builder.apply()
 
-        # Create vector indexes separately (SchemaBuilder may not handle them)
+        # Create vector and fulltext indexes via schema builder
         for label, label_schema in schema.labels.items():
             for prop in label_schema.properties.values():
                 if prop.index_type == "vector":
                     metric = prop.metric or "l2"
                     try:
-                        db.create_vector_index(label, prop.name, metric)
+                        db.schema().label(label).index(
+                            prop.name, {"type": "vector", "metric": metric}
+                        ).apply()
+                    except Exception:
+                        pass  # Index may already exist
+                elif prop.index_type == "fulltext":
+                    try:
+                        db.schema().label(label).index(
+                            prop.name, "fulltext"
+                        ).apply()
                     except Exception:
                         pass  # Index may already exist
 
-        # Create fulltext indexes separately
-        for label, label_schema in schema.labels.items():
-            for prop in label_schema.properties.values():
-                if prop.index_type == "fulltext":
-                    try:
-                        db.create_scalar_index(label, prop.name, "fulltext")
-                    except Exception:
-                        pass  # Index may already exist or not supported
-
-    async def async_apply_to_database(self, db: uni_db.AsyncDatabase) -> None:
+    async def async_apply_to_database(self, db: uni_db.AsyncUni) -> None:
         """Apply the generated schema to an async database.
 
         Async variant of apply_to_database using AsyncSchemaBuilder.
@@ -323,24 +323,24 @@ class SchemaGenerator:
         if has_changes:
             await builder.apply()
 
-        # Create vector indexes separately
+        # Create vector and fulltext indexes via schema builder
         for label, label_schema in schema.labels.items():
             for prop in label_schema.properties.values():
                 if prop.index_type == "vector":
                     metric = prop.metric or "l2"
                     try:
-                        await db.create_vector_index(label, prop.name, metric)
+                        await db.schema().label(label).index(
+                            prop.name, {"type": "vector", "metric": metric}
+                        ).apply()
                     except Exception:
-                        pass
-
-        # Create fulltext indexes separately
-        for label, label_schema in schema.labels.items():
-            for prop in label_schema.properties.values():
-                if prop.index_type == "fulltext":
+                        pass  # Index may already exist
+                elif prop.index_type == "fulltext":
                     try:
-                        await db.create_scalar_index(label, prop.name, "fulltext")
+                        await db.schema().label(label).index(
+                            prop.name, "fulltext"
+                        ).apply()
                     except Exception:
-                        pass
+                        pass  # Index may already exist
 
 
 def generate_schema(*models: type[UniNode] | type[UniEdge]) -> DatabaseSchema:

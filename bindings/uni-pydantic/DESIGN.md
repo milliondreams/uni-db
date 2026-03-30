@@ -20,7 +20,7 @@ uni_db bindings) and focuses on additive schema sync.
 ### Schema Generation
 
 - `SchemaGenerator` registers node/edge models, builds a `DatabaseSchema`, and
-  applies it to `uni_db.Database`.
+  applies it to `uni_db.Uni`.
 - Schema sync is additive-only: labels and properties are created if missing.
 - Index creation is supported for:
   - Scalar indexes (`btree`, `hash`) via `create_scalar_index`.
@@ -40,8 +40,8 @@ uni_db bindings) and focuses on additive schema sync.
   - `filter`, `order_by`, `limit`, `skip`, `distinct`.
   - `traverse` and `eager_load` (relationship traversal / prefetch).
   - `vector_search` using `CALL uni.vector.query`.
-- Queries are compiled to Cypher and executed via `uni_db.Database.query` or
-  `uni_db.Database.execute`.
+- Queries are compiled to Cypher and executed via `uni_db.Uni.query` or
+  `uni_db.Uni.execute`.
 
 ### Relationships
 

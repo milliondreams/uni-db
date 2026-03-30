@@ -79,7 +79,7 @@ class UniTransaction:
         self._rolled_back = False
 
     def __enter__(self) -> UniTransaction:
-        self._tx = self._session._db.begin()
+        self._tx = self._session._db_session.tx()
         return self
 
     def __exit__(
@@ -164,10 +164,10 @@ class UniSession:
     and provides CRUD operations and query building.
 
     Example:
-        >>> from uni_db import Database
+        >>> from uni_db import Uni
         >>> from uni_pydantic import UniSession
         >>>
-        >>> db = Database("./my_graph")
+        >>> db = Uni("./my_graph")
         >>> session = UniSession(db)
         >>> session.register(Person, Company)
         >>> session.sync_schema()
@@ -177,8 +177,9 @@ class UniSession:
         >>> session.commit()
     """
 
-    def __init__(self, db: uni_db.Database) -> None:
+    def __init__(self, db: uni_db.Uni) -> None:
         self._db = db
+        self._db_session = db.session()
         self._schema_gen = SchemaGenerator()
         self._identity_map: WeakValueDictionary[tuple[str, int], UniNode] = (
             WeakValueDictionary()
@@ -203,17 +204,19 @@ class UniSession:
         self._pending_delete.clear()
 
     @property
-    def db(self) -> uni_db.Database:
-        """Access the underlying uni_db.Database for low-level operations."""
+    def db(self) -> uni_db.Uni:
+        """Access the underlying uni_db.Uni for low-level operations."""
         return self._db
 
-    def locy(self, program: str, config: dict | None = None) -> dict:
+    def locy(
+        self, program: str, params: dict[str, Any] | None = None
+    ) -> uni_db.LocyResult:
         """
         Evaluate a Locy program and return derived facts, stats, and warnings.
 
-        Delegates directly to the underlying ``uni_db.Database.locy().evaluate()``.
+        Delegates to the underlying ``uni_db.Session.locy()``.
         """
-        return self._db.locy().evaluate(program, config=config)
+        return self._db_session.locy(program, params)
 
     def register(self, *models: type[UniNode] | type[UniEdge]) -> None:
         """
@@ -314,11 +317,11 @@ class UniSession:
         else:
             raise ValueError("Must provide vid, uid, or property filters")
 
-        results = self._db.query(cypher, params)
+        results = self._db_session.query(cypher, params)
         if not results:
             return None
 
-        node_data = _row_to_node_dict(results[0])
+        node_data = _row_to_node_dict(results[0].to_dict())
         if node_data is None:
             return None
         return self._result_to_model(node_data, model)
@@ -330,13 +333,13 @@ class UniSession:
 
         label = entity.__class__.__label__
         cypher = f"MATCH (n:{label}) WHERE id(n) = $vid RETURN {_NODE_RETURN}"
-        results = self._db.query(cypher, {"vid": entity._vid})
+        results = self._db_session.query(cypher, {"vid": entity._vid})
 
         if not results:
             raise SessionError(f"Entity with vid={entity._vid} no longer exists")
 
         # Update properties
-        props = _row_to_node_dict(results[0])
+        props = _row_to_node_dict(results[0].to_dict())
         if props is None:
             raise SessionError(f"Entity with vid={entity._vid} no longer exists")
         try:
@@ -405,7 +408,7 @@ class UniSession:
     def begin(self) -> UniTransaction:
         """Begin a new transaction."""
         tx = UniTransaction(self)
-        tx._tx = self._db.begin()
+        tx._tx = self._db_session.tx()
         return tx
 
     def cypher(
@@ -425,14 +428,15 @@ class UniSession:
         Returns:
             List of results (model instances if result_type provided).
         """
-        results = self._db.query(query, params)
+        results = self._db_session.query(query, params)
 
         if result_type is None:
-            return cast(list[dict[str, Any]], results)
+            return [r.to_dict() for r in results]
 
         # Map results to model instances
         mapped = []
-        for row in results:
+        for raw_row in results:
+            row = raw_row.to_dict()
             # Try to find node data in the row
             for key, value in row.items():
                 if isinstance(value, dict):
@@ -509,7 +513,9 @@ class UniSession:
             cypher = f"MATCH (a:{src_label}), (b:{dst_label}) WHERE a._vid = $src AND b._vid = $dst CREATE (a)-[r:{edge_type}]->(b)"
 
         params = {"src": src_vid, "dst": dst_vid, **props}
-        self._db.query(cypher, params)
+        with self._db_session.tx() as tx:
+            tx.execute(cypher, params)
+            tx.commit()
 
     def delete_edge(
         self,
@@ -526,7 +532,9 @@ class UniSession:
             f"WHERE a._vid = $src AND b._vid = $dst "
             f"DELETE r RETURN count(r) as count"
         )
-        results = self._db.query(cypher, {"src": src_vid, "dst": dst_vid})
+        with self._db_session.tx() as tx:
+            results = tx.query(cypher, {"src": src_vid, "dst": dst_vid})
+            tx.commit()
         return cast(int, results[0]["count"]) if results else 0
 
     def update_edge(
@@ -548,7 +556,9 @@ class UniSession:
             f"SET {', '.join(set_parts)} "
             f"RETURN count(r) as count"
         )
-        results = self._db.query(cypher, params)
+        with self._db_session.tx() as tx:
+            results = tx.query(cypher, params)
+            tx.commit()
         return cast(int, results[0]["count"]) if results else 0
 
     def get_edge(
@@ -567,11 +577,12 @@ class UniSession:
             f"WHERE a._vid = $src AND b._vid = $dst "
             f"RETURN properties(r) AS _props, id(r) AS _eid"
         )
-        results = self._db.query(cypher, {"src": src_vid, "dst": dst_vid})
+        results = self._db_session.query(cypher, {"src": src_vid, "dst": dst_vid})
+        rows = [r.to_dict() for r in results]
 
         if edge_model is None:
             edge_dicts: list[dict[str, Any]] = []
-            for row in results:
+            for row in rows:
                 props = row.get("_props", {})
                 if isinstance(props, dict):
                     edge_dict = dict(props)
@@ -580,7 +591,7 @@ class UniSession:
             return edge_dicts
 
         edges = []
-        for row in results:
+        for row in rows:
             r_data = row.get("_props", {})
             if isinstance(r_data, dict):
                 edge = edge_model.from_properties(
@@ -630,7 +641,7 @@ class UniSession:
                 prop_dicts = [e.to_properties() for e in group]
 
                 # Bulk insert
-                with self._db.bulk_writer().build() as bw:
+                with self._db_session.bulk_writer().build() as bw:
                     vids = bw.insert_vertices(label, prop_dicts)
                     bw.commit()
 
@@ -647,13 +658,15 @@ class UniSession:
 
         return all_vids
 
-    def explain(self, cypher: str) -> dict[str, Any]:
+    def explain(self, cypher: str) -> uni_db.ExplainOutput:
         """Get the query execution plan without running it."""
-        return self._db.explain(cypher)
+        return self._db_session.explain(cypher)
 
-    def profile(self, cypher: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    def profile(
+        self, cypher: str
+    ) -> tuple[uni_db.QueryResult, uni_db.ProfileOutput]:
         """Run the query with profiling and return results + stats."""
-        return self._db.profile(cypher)
+        return self._db_session.profile(cypher)
 
     def save_schema(self, path: str) -> None:
         """Save the database schema to a file."""
@@ -679,7 +692,9 @@ class UniSession:
         props_str = ", ".join(f"{k}: ${k}" for k in props)
         cypher = f"CREATE (n:{label} {{{props_str}}}) RETURN id(n) as vid"
 
-        results = self._db.query(cypher, props)
+        with self._db_session.tx() as tx:
+            results = tx.query(cypher, props)
+            tx.commit()
         if results:
             vid = results[0]["vid"]
             entity._attach_session(self, vid)
@@ -757,7 +772,9 @@ class UniSession:
         cypher = f"MATCH (n:{label}) WHERE id(n) = $vid SET {set_clause}"
         params = {"vid": entity._vid, **dirty_props}
 
-        self._db.query(cypher, params)
+        with self._db_session.tx() as tx:
+            tx.execute(cypher, params)
+            tx.commit()
 
         run_hooks(entity, _AFTER_UPDATE)
         entity._mark_clean()
@@ -771,7 +788,9 @@ class UniSession:
 
         # DETACH DELETE to also remove connected edges
         cypher = f"MATCH (n:{label}) WHERE id(n) = $vid DETACH DELETE n"
-        self._db.query(cypher, {"vid": vid})
+        with self._db_session.tx() as tx:
+            tx.execute(cypher, {"vid": vid})
+            tx.commit()
 
         # Remove from identity map
         if vid is not None and (label, vid) in self._identity_map:
@@ -856,10 +875,11 @@ class UniSession:
             f"MATCH (a:{label}){pattern}(b) WHERE id(a) = $vid "
             f"RETURN properties(b) AS _props, id(b) AS _vid, labels(b) AS _labels"
         )
-        results = self._db.query(cypher, {"vid": entity._vid})
+        results = self._db_session.query(cypher, {"vid": entity._vid})
 
         nodes = []
-        for row in results:
+        for raw_row in results:
+            row = raw_row.to_dict()
             node_data = _row_to_node_dict(row)
             if node_data is None:
                 continue
@@ -903,11 +923,12 @@ class UniSession:
                 f"MATCH (a:{label}){pattern}(b) WHERE id(a) IN $vids "
                 f"RETURN id(a) as src_vid, properties(b) AS _props, id(b) AS _vid, labels(b) AS _labels"
             )
-            results = self._db.query(cypher, {"vids": vids})
+            results = self._db_session.query(cypher, {"vids": vids})
 
             # Group results by source vid
             by_source: dict[int, list[Any]] = {}
-            for row in results:
+            for raw_row in results:
+                row = raw_row.to_dict()
                 src_vid = row["src_vid"]
                 node_data = _row_to_node_dict(row)
                 if node_data is None:

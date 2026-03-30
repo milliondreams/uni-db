@@ -38,15 +38,17 @@ class AsyncQueryBuilder(_QueryBuilderBase[NodeT]):
     ) -> list[dict[str, Any]]:
         """Execute a query, using query_with if timeout/max_memory is set."""
         if self._timeout is not None or self._max_memory is not None:
-            builder = self._session._db.query_with(cypher)
+            builder = self._session._db_session.query_with(cypher)
             if params:
                 builder = builder.params(params)
             if self._timeout is not None:
                 builder = builder.timeout(self._timeout)
             if self._max_memory is not None:
                 builder = builder.max_memory(self._max_memory)
-            return await builder.fetch_all()
-        return await self._session._db.query(cypher, params)
+            result = await builder.fetch_all()
+        else:
+            result = await self._session._db_session.query(cypher, params)
+        return [row.to_dict() for row in result]
 
     async def all(self) -> list[NodeT]:
         """Execute the query and return all results."""
@@ -95,11 +97,15 @@ class AsyncQueryBuilder(_QueryBuilderBase[NodeT]):
     async def delete(self) -> int:
         """Delete all matching records (DETACH DELETE)."""
         cypher, params = self._build_delete_cypher()
-        results = await self._session._db.query(cypher, params)
-        return cast(int, results[0]["count"]) if results else 0
+        async with await self._session._db_session.tx() as tx:
+            results = await tx.query(cypher, params)
+            await tx.commit()
+        return results[0].to_dict()["count"] if results else 0
 
     async def update(self, **kwargs: Any) -> int:
         """Update all matching records."""
         cypher, params = self._build_update_cypher(**kwargs)
-        results = await self._session._db.query(cypher, params)
-        return cast(int, results[0]["count"]) if results else 0
+        async with await self._session._db_session.tx() as tx:
+            results = await tx.query(cypher, params)
+            await tx.commit()
+        return results[0].to_dict()["count"] if results else 0

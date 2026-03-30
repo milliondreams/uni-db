@@ -21,7 +21,7 @@ def db(temp_db_path):
     try:
         import uni_db
 
-        return uni_db.DatabaseBuilder.open(temp_db_path).build()
+        return uni_db.UniBuilder.open(temp_db_path).build()
     except ImportError:
         pytest.skip("uni_db not available")
 
@@ -41,7 +41,7 @@ async def async_db():
     try:
         import uni_db
 
-        db = await uni_db.AsyncDatabase.temporary()
+        db = await uni_db.AsyncUni.temporary()
         yield db
     except ImportError:
         pytest.skip("uni_db not available")

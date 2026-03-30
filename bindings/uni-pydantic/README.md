@@ -54,7 +54,7 @@ class WorksAt(UniEdge):
 
 
 # Connect and sync schema
-db = uni_db.Database("./my_graph")
+db = uni_db.Uni("./my_graph")
 session = UniSession(db)
 session.register(Person, Company, WorksAt)
 session.sync_schema()

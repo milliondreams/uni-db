@@ -102,7 +102,6 @@ async fn test_error_handling() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "Uni is single-writer by design; test validates proper concurrent write rejection"]
 async fn test_concurrency() -> Result<()> {
     let db = Arc::new(Uni::in_memory().build().await?);
 

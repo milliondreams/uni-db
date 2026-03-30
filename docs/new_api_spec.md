@@ -215,6 +215,8 @@ Uni is a lifecycle and administration handle. It opens the database, manages sto
 impl Uni {
     // ── Lifecycle ──
     fn open(uri: impl Into<String>) -> UniBuilder;
+    fn open_existing(uri: impl Into<String>) -> UniBuilder;   // open only if exists
+    fn create(uri: impl Into<String>) -> UniBuilder;          // create only (error if exists)
     fn temporary() -> UniBuilder;
     fn in_memory() -> UniBuilder;
     async fn shutdown(self) -> Result<()>;
@@ -248,11 +250,12 @@ impl Uni {
 
     // ── Snapshots ──
     async fn create_snapshot(&self, name: Option<&str>) -> Result<String>;
+    async fn create_named_snapshot(&self, name: &str) -> Result<String>;  // persisted named snapshot
     async fn list_snapshots(&self) -> Result<Vec<SnapshotManifest>>;
     async fn restore_snapshot(&self, snapshot_id: &str) -> Result<()>;
 
     // ── Index Admin ──
-    async fn rebuild_indexes(&self, label: &str, background: bool) -> Result<Option<String>>;
+    async fn rebuild_indexes(&self, label: &str, async_: bool) -> Result<Option<String>>;
     async fn index_rebuild_status(&self) -> Result<Vec<IndexRebuildTask>>;
     async fn retry_index_rebuilds(&self) -> Result<Vec<String>>;
     async fn is_index_building(&self, label: &str) -> Result<bool>;
@@ -261,6 +264,9 @@ impl Uni {
 
     // ── Xervo (ML Runtime) ──
     fn xervo(&self) -> UniXervo<'_>;
+
+    // ── Multi-Agent Introspection ──
+    fn write_lease(&self) -> Option<&WriteLease>;
 
     // ── Database Metrics ──
     fn metrics(&self) -> DatabaseMetrics;
@@ -281,6 +287,17 @@ impl UniBuilder {
     fn cache_size(self, bytes: usize) -> Self;
     fn parallelism(self, n: usize) -> Self;
     fn cloud_config(self, config: CloudStorageConfig) -> Self;
+
+    // ── Schema ──
+    fn schema_file(self, path: impl AsRef<Path>) -> Self;
+
+    // ── Xervo (ML Runtime) ──
+    fn xervo_catalog(self, catalog: Vec<ModelAliasSpec>) -> Self;
+    fn xervo_catalog_from_str(self, json: &str) -> Result<Self>;
+    fn xervo_catalog_from_file(self, path: impl AsRef<Path>) -> Result<Self>;
+
+    // ── Hybrid Storage ──
+    fn hybrid(self, local_path: impl AsRef<Path>, remote_url: &str) -> Self;
 
     // ── Multi-agent modes (Phase 2) ──
     fn read_only(self) -> Self;
@@ -401,6 +418,9 @@ impl Session {
     /// Only meaningful for read-only instances in multi-agent mode.
     pub async fn refresh(&mut self) -> Result<()>;
 
+    /// Whether this session is currently pinned to a specific version.
+    pub fn is_pinned(&self) -> bool;
+
     // ── Cypher Reads ──
 
     /// Execute a read-only Cypher query.
@@ -468,6 +488,9 @@ impl Session {
     /// Execute and profile a Cypher query.
     pub async fn profile(&self, cypher: &str) -> Result<(QueryResult, ProfileOutput)>;
 
+    /// Fluent profile builder with parameter binding.
+    pub fn profile_with(&self, cypher: &str) -> ProfileBuilder<'_>;
+
     /// Explain Locy rule evaluation strategy.
     /// Note: synchronous — compile-only, no I/O.
     pub fn explain_locy(&self, program: &str) -> Result<LocyExplainOutput>;
@@ -503,6 +526,15 @@ impl Session {
     /// Errors if another write context is already active.
     pub fn appender(&self, label: &str) -> AppenderBuilder<'_>;
 
+    // ── Admin Bulk Insert (convenience — bypasses BulkWriter, no batching/deferred indexes) ──
+
+    /// Bulk insert vertices directly. For admin/benchmarking use.
+    /// For production bulk loading, prefer `bulk_writer()` or `appender()`.
+    pub async fn bulk_insert_vertices(&self, label: &str, properties_list: Vec<Properties>) -> Result<Vec<Vid>>;
+
+    /// Bulk insert edges directly. For admin/benchmarking use.
+    pub async fn bulk_insert_edges(&self, edge_type: &str, edges: Vec<(Vid, Vid, Properties)>) -> Result<()>;
+
     // ── Custom Functions ──
 
     /// Register a custom scalar function usable in Cypher queries.
@@ -535,7 +567,7 @@ impl Session {
     // ── Hooks ──
 
     /// Register a hook that fires on query/commit events.
-    pub fn add_hook(&mut self, hook: Box<dyn SessionHook>);
+    pub fn add_hook(&mut self, hook: impl SessionHook + 'static);
 
     // ── Cancellation ──
 
@@ -598,10 +630,16 @@ pub struct AutoCommitResult {
     pub relationships_created: usize,
     pub relationships_deleted: usize,
     pub properties_set: usize,
+    pub properties_removed: usize,
     pub labels_added: usize,
     pub labels_removed: usize,
     pub version: u64,             // Database version after commit
     pub metrics: QueryMetrics,
+}
+
+impl AutoCommitResult {
+    /// Total affected rows (nodes + relationships created/deleted + properties set/removed).
+    pub fn affected_rows(&self) -> usize;
 }
 ```
 
@@ -753,7 +791,7 @@ impl Transaction {
     // ── Cypher Reads (sees shared DB + uncommitted writes) ──
 
     pub async fn query(&self, cypher: &str) -> Result<QueryResult>;
-    pub fn query_with(&self, cypher: &str) -> QueryBuilder<'_>;
+    pub fn query_with(&self, cypher: &str) -> TxQueryBuilder<'_>;
 
     // ── Cypher Writes ──
 
@@ -777,7 +815,7 @@ impl Transaction {
     pub async fn locy(&self, program: &str) -> Result<LocyResult>;
 
     /// Fluent Locy builder.
-    pub fn locy_with(&self, program: &str) -> LocyBuilder<'_>;
+    pub fn locy_with(&self, program: &str) -> TxLocyBuilder<'_>;
 
     // ── Apply DerivedFactSet (from session-level DERIVE) ──
 
@@ -820,8 +858,14 @@ impl Transaction {
     /// Transaction identifier (UUID).
     pub fn id(&self) -> &str;
 
+    /// Database version when this transaction was created.
+    pub fn started_at_version(&self) -> u64;
+
     /// Cancel all active operations in this transaction.
     pub fn cancel(&self);
+
+    /// Get the transaction's cancellation token for manual use.
+    pub fn cancellation_token(&self) -> CancellationToken;
 }
 
 impl Drop for Transaction {
@@ -1154,6 +1198,10 @@ impl<'a> BulkWriterBuilder<'a> {
     pub fn batch_size(self, n: usize) -> Self;                // Default: 10,000
     pub fn max_buffer_size_bytes(self, n: usize) -> Self;     // Default: 1 GB
     pub fn defer_vector_indexes(self, defer: bool) -> Self;   // Default: true
+    pub fn defer_scalar_indexes(self, defer: bool) -> Self;   // Default: false
+    pub fn on_progress<F: Fn(BulkProgress) + Send + 'static>(self, f: F) -> Self;
+    pub fn async_indexes(self, async_: bool) -> Self;         // Rebuild indexes asynchronously
+    pub fn validate_constraints(self, validate: bool) -> Self; // Default: true
     /// Note: synchronous — no I/O in build; guard acquisition only.
     pub fn build(self) -> Result<BulkWriter>;
 }
@@ -1164,7 +1212,7 @@ impl BulkWriter {
     pub async fn commit(self) -> Result<BulkStats>;
     /// Note: returns Result because abort performs real I/O (LanceDB version rollback).
     pub async fn abort(self) -> Result<()>;
-    pub fn stats(&self) -> &BulkStatsAccumulator;
+    pub fn stats(&self) -> &BulkStats;
 }
 ```
 
@@ -1190,7 +1238,9 @@ impl Session {
 pub struct AppenderBuilder<'a> { /* ... */ }
 
 impl<'a> AppenderBuilder<'a> {
-    pub fn batch_size(self, n: usize) -> Self;           // Auto-flush threshold
+    pub fn batch_size(self, n: usize) -> Self;                // Auto-flush threshold
+    pub fn defer_vector_indexes(self, defer: bool) -> Self;   // Default: true
+    pub fn max_buffer_size_bytes(self, size: usize) -> Self;  // Memory limit
     /// Note: synchronous — no I/O in build; guard acquisition only.
     pub fn build(self) -> Result<StreamingAppender>;
 }
@@ -1208,7 +1258,8 @@ impl StreamingAppender {
     pub async fn finish(self) -> Result<BulkStats>;
 
     /// Abort without flushing remaining rows.
-    pub async fn abort(self);
+    /// Note: synchronous — only discards in-memory buffers, no I/O.
+    pub fn abort(self);
 }
 ```
 
@@ -1608,7 +1659,7 @@ impl Uni {
 impl SessionTemplateBuilder {
     pub fn param<K: Into<String>, V: Into<Value>>(self, key: K, value: V) -> Self;
     pub fn rules(self, program: &str) -> Result<Self, LocyCompileError>;
-    pub fn hook(self, hook: Box<dyn SessionHook>) -> Self;
+    pub fn hook(self, hook: impl SessionHook + 'static) -> Self;
     pub fn query_timeout(self, duration: Duration) -> Self;
     pub fn transaction_timeout(self, duration: Duration) -> Self;
     pub fn build(self) -> Result<SessionTemplate>;
@@ -2499,50 +2550,50 @@ let result = session.locy("?- path('a', X).").await?;
 
 ## Phase 1: Core API (This Release)
 
-- [ ] Session struct with params, rule registry, plan cache
-- [ ] Transaction struct with private L0, **commit-time locking**
-- [ ] `session.execute()` / `session.execute_with()` auto-commit convenience
-- [ ] Locy flattened: `session.locy()`, `tx.locy()`, `register_rules()`, `clear_rules()`
-- [ ] DERIVE on Session returning DerivedFactSet
-- [ ] ASSUME on Session with eval-scoped temporary buffer
-- [ ] `tx.apply()` and `tx.apply_with()` with staleness policy (`require_fresh`, `max_version_gap`)
-- [ ] `tx()` / `tx_with()` naming with `_with` pattern
-- [ ] `IsolationLevel` enum (`#[non_exhaustive]`, single variant `Serialized`)
-- [ ] `CommitResult::started_at_version` and `version_gap()` method
-- [ ] `CommitResult::rule_promotion_errors` for best-effort rule promotion
-- [ ] Commit failure matrix implemented per §19.2
-- [ ] Mutual exclusion (one write context per session) with scopeguard pattern
-- [ ] Concurrent transactions across sessions (no lock until commit)
-- [ ] Transparent plan cache with schema-version invalidation
-- [ ] Explicit `prepare()` / `PreparedQuery`
-- [ ] Query cancellation via CancellationToken
-- [ ] Transaction timeouts
-- [ ] Per-query metrics on every result
-- [ ] Session-level and database-level metrics
-- [ ] `SessionCapabilities` struct
-- [ ] Tracing spans on all public methods
-- [ ] Remove all legacy methods from Uni (clean break)
+- [x] Session struct with params, rule registry, plan cache
+- [x] Transaction struct with private L0, **commit-time locking**
+- [x] `session.execute()` / `session.execute_with()` auto-commit convenience
+- [x] Locy flattened: `session.locy()`, `tx.locy()`, `register_rules()`, `clear_rules()`
+- [x] DERIVE on Session returning DerivedFactSet
+- [x] ASSUME on Session with eval-scoped temporary buffer
+- [x] `tx.apply()` and `tx.apply_with()` with staleness policy (`require_fresh`, `max_version_gap`)
+- [x] `tx()` / `tx_with()` naming with `_with` pattern
+- [x] `IsolationLevel` enum (`#[non_exhaustive]`, single variant `Serialized`)
+- [x] `CommitResult::started_at_version` and `version_gap()` method
+- [x] `CommitResult::rule_promotion_errors` for best-effort rule promotion
+- [x] Commit failure matrix implemented per §19.2
+- [x] Mutual exclusion (one write context per session) with scopeguard pattern
+- [x] Concurrent transactions across sessions (no lock until commit)
+- [x] Transparent plan cache with schema-version invalidation
+- [x] Explicit `prepare()` / `PreparedQuery`
+- [x] Query cancellation via CancellationToken
+- [x] Transaction timeouts
+- [x] Per-query metrics on every result
+- [x] Session-level and database-level metrics
+- [x] `SessionCapabilities` struct
+- [x] Tracing spans on all public methods
+- [x] Remove all legacy methods from Uni (clean break)
 - [ ] "Changes from Prior Concurrency Model" section in release notes
-- [ ] Update entire test suite (~3000 call sites)
-- [ ] Update Python bindings (sync + async)
+- [x] Update entire test suite (~3000 call sites)
+- [x] Update Python bindings (sync + async)
 - [ ] Migration guide with behavioral diff table
-- [ ] `ExecuteBuilder` type (not `QueryBuilder`) for `tx.execute_with()`
-- [ ] Version pinning: `pin_to_version()`, `pin_to_timestamp()`
-- [ ] Hook failure semantics per §15.1
+- [x] `ExecuteBuilder` type (not `QueryBuilder`) for `tx.execute_with()`
+- [x] Version pinning: `pin_to_version()`, `pin_to_timestamp()`
+- [x] Hook failure semantics per §15.1
 
 ## Phase 2: Ecosystem (Next Release)
 
-- [ ] Commit notifications (`session.watch()`, `session.watch_with()`)
-- [ ] `WatchBuilder` with label filtering, debounce, session exclusion
-- [ ] `CommitNotification::session_id` and `causal_version` fields
-- [ ] Session hooks (before/after query/commit)
-- [ ] SessionTemplate for pre-configured sessions
-- [ ] Streaming Appender on Session
-- [ ] Multi-agent: `read_only()` mode
-- [ ] Multi-agent: `write_lease(WriteLease::DynamoDB)` and `WriteLeaseProvider` trait
-- [ ] `WriteLease` enum (`#[non_exhaustive]`)
-- [ ] `session.refresh()` for reader instances
-- [ ] Custom function registration (`session.register_function()`)
+- [x] Commit notifications (`session.watch()`, `session.watch_with()`)
+- [x] `WatchBuilder` with label filtering, debounce, session exclusion
+- [x] `CommitNotification::session_id` and `causal_version` fields
+- [x] Session hooks (before/after query/commit)
+- [x] SessionTemplate for pre-configured sessions
+- [x] Streaming Appender on Session
+- [x] Multi-agent: `read_only()` mode
+- [x] Multi-agent: `write_lease(WriteLease::DynamoDB)` and `WriteLeaseProvider` trait
+- [x] `WriteLease` enum (`#[non_exhaustive]`)
+- [x] `session.refresh()` for reader instances
+- [x] Custom function registration (`session.register_function()`)
 
 ## Phase 3: Advanced (Future)
 

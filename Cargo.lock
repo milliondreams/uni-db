@@ -10742,6 +10742,7 @@ dependencies = [
  "parking_lot",
  "parquet",
  "rand 0.8.5",
+ "scopeguard",
  "serde",
  "serde_json",
  "tempfile",

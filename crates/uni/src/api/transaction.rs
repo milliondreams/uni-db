@@ -144,9 +144,18 @@ impl Transaction {
             });
         }
 
+        // Panic safety: if anything between the compare_exchange above and the
+        // Transaction construction below panics, this scopeguard ensures the
+        // write guard is cleared so the Session isn't permanently locked.
+        // Once the Transaction is successfully constructed, we forget the guard —
+        // Transaction's Drop impl takes over cleanup responsibility.
+        let write_guard_cleanup = scopeguard::guard(session.active_write_guard().clone(), |g| {
+            g.store(false, Ordering::SeqCst);
+        });
+
         let db = session.db().clone();
         let writer_lock = db.writer.clone().ok_or_else(|| {
-            session.active_write_guard().store(false, Ordering::SeqCst);
+            // No need to manually clear — scopeguard handles it on early return
             UniError::ReadOnly {
                 operation: "start_transaction".to_string(),
             }
@@ -172,7 +181,7 @@ impl Transaction {
         // Child token from session — cancelled when session.cancel() fires
         let cancellation_token = session.cancellation_token().child_token();
 
-        Ok(Self {
+        let tx = Self {
             db,
             tx_l0,
             session_write_guard: session.active_write_guard().clone(),
@@ -187,7 +196,13 @@ impl Transaction {
             deadline,
             cancellation_token,
             hooks: session.hooks.clone(),
-        })
+        };
+
+        // Transaction constructed successfully — its Drop impl will clear the
+        // write guard, so we disarm the scopeguard.
+        std::mem::forget(write_guard_cleanup);
+
+        Ok(tx)
     }
 
     // ── Cypher Reads (sees shared DB + uncommitted writes) ────────────
@@ -592,6 +607,11 @@ impl Transaction {
     /// Get the transaction ID.
     pub fn id(&self) -> &str {
         &self.id
+    }
+
+    /// Database version when this transaction was started.
+    pub fn started_at_version(&self) -> u64 {
+        self.started_at_version
     }
 
     /// Cancel all in-flight queries in this transaction.

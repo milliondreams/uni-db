@@ -29,9 +29,11 @@ def test_data_persists_across_reopens(tmp_path):
 
     # Insert data
     session = db.session()
-    session.execute("CREATE (p:Person {name: 'Alice', age: 30})")
-    session.execute("CREATE (p:Person {name: 'Bob', age: 25})")
-    session.execute("CREATE (p:Person {name: 'Charlie', age: 35})")
+    tx = session.tx()
+    tx.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+    tx.execute("CREATE (p:Person {name: 'Bob', age: 25})")
+    tx.execute("CREATE (p:Person {name: 'Charlie', age: 35})")
+    tx.commit()
 
     # Flush to disk
     db.flush()
@@ -83,14 +85,14 @@ def test_schema_persists_across_reopens(tmp_path):
 
     # Insert some data using the schema
     session = db.session()
-    session.execute(
-        "CREATE (p:Person {name: 'Alice', age: 30, email: 'alice@example.com'})"
-    )
-    session.execute("CREATE (c:Company {name: 'TechCorp', founded: 2010})")
-    session.execute(
+    tx = session.tx()
+    tx.execute("CREATE (p:Person {name: 'Alice', age: 30, email: 'alice@example.com'})")
+    tx.execute("CREATE (c:Company {name: 'TechCorp', founded: 2010})")
+    tx.execute(
         "MATCH (p:Person {name: 'Alice'}), (c:Company {name: 'TechCorp'}) "
         "CREATE (p)-[:WORKS_AT {role: 'Engineer'}]->(c)"
     )
+    tx.commit()
 
     db.flush()
     del db
@@ -100,7 +102,9 @@ def test_schema_persists_across_reopens(tmp_path):
     session2 = db2.session()
 
     # Should be able to insert using the schema without redefining it
-    session2.execute("CREATE (p:Person {name: 'Bob', age: 25})")
+    tx2 = session2.tx()
+    tx2.execute("CREATE (p:Person {name: 'Bob', age: 25})")
+    tx2.commit()
 
     # Query to verify both old and new data
     person_results = session2.query(
@@ -142,9 +146,11 @@ def test_indexes_persist_across_reopens(tmp_path):
 
     # Insert data
     session = db.session()
-    session.execute("CREATE (i:Item {sku: 'SKU001', name: 'Widget', price: 19.99})")
-    session.execute("CREATE (i:Item {sku: 'SKU002', name: 'Gadget', price: 29.99})")
-    session.execute("CREATE (i:Item {sku: 'SKU003', name: 'Doohickey', price: 9.99})")
+    tx = session.tx()
+    tx.execute("CREATE (i:Item {sku: 'SKU001', name: 'Widget', price: 19.99})")
+    tx.execute("CREATE (i:Item {sku: 'SKU002', name: 'Gadget', price: 29.99})")
+    tx.execute("CREATE (i:Item {sku: 'SKU003', name: 'Doohickey', price: 9.99})")
+    tx.commit()
 
     db.flush()
     del db
@@ -188,15 +194,11 @@ def test_vector_indexes_persist_across_reopens(tmp_path):
 
     # Insert data with vectors
     session = db.session()
-    session.execute(
-        "CREATE (d:Document {title: 'Doc1', embedding: [1.0, 0.0, 0.0, 0.0]})"
-    )
-    session.execute(
-        "CREATE (d:Document {title: 'Doc2', embedding: [0.9, 0.1, 0.0, 0.0]})"
-    )
-    session.execute(
-        "CREATE (d:Document {title: 'Doc3', embedding: [0.0, 0.0, 1.0, 0.0]})"
-    )
+    tx = session.tx()
+    tx.execute("CREATE (d:Document {title: 'Doc1', embedding: [1.0, 0.0, 0.0, 0.0]})")
+    tx.execute("CREATE (d:Document {title: 'Doc2', embedding: [0.9, 0.1, 0.0, 0.0]})")
+    tx.execute("CREATE (d:Document {title: 'Doc3', embedding: [0.0, 0.0, 1.0, 0.0]})")
+    tx.commit()
 
     # Create vector index
     db.schema().label("Document").index(
@@ -231,21 +233,27 @@ def test_multiple_reopen_cycles(tmp_path):
     db = uni_db.UniBuilder.open(str(db_path)).build()
     (db.schema().label("Counter").property("value", "int").done().apply())
     session = db.session()
-    session.execute("CREATE (c:Counter {value: 1})")
+    tx = session.tx()
+    tx.execute("CREATE (c:Counter {value: 1})")
+    tx.commit()
     db.flush()
     del db
 
     # Second cycle: reopen and add more data
     db = uni_db.UniBuilder.open(str(db_path)).build()
     session = db.session()
-    session.execute("CREATE (c:Counter {value: 2})")
+    tx = session.tx()
+    tx.execute("CREATE (c:Counter {value: 2})")
+    tx.commit()
     db.flush()
     del db
 
     # Third cycle: reopen and add more data
     db = uni_db.UniBuilder.open(str(db_path)).build()
     session = db.session()
-    session.execute("CREATE (c:Counter {value: 3})")
+    tx = session.tx()
+    tx.execute("CREATE (c:Counter {value: 3})")
+    tx.commit()
     db.flush()
     del db
 
@@ -281,12 +289,14 @@ def test_relationships_persist_across_reopens(tmp_path):
     )
 
     session = db.session()
-    session.execute("CREATE (p:Person {name: 'Alice'})")
-    session.execute("CREATE (p:Person {name: 'Bob'})")
-    session.execute(
+    tx = session.tx()
+    tx.execute("CREATE (p:Person {name: 'Alice'})")
+    tx.execute("CREATE (p:Person {name: 'Bob'})")
+    tx.execute(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) "
         "CREATE (a)-[:KNOWS {since: 2020}]->(b)"
     )
+    tx.commit()
 
     db.flush()
     del db
@@ -334,17 +344,19 @@ def test_complex_graph_persists(tmp_path):
 
     # Create complex graph
     session = db.session()
-    session.execute("CREATE (u:User {name: 'Alice'})")
-    session.execute("CREATE (p:Product {name: 'Laptop', price: 999.99})")
-    session.execute("CREATE (c:Category {name: 'Electronics'})")
-    session.execute(
+    tx = session.tx()
+    tx.execute("CREATE (u:User {name: 'Alice'})")
+    tx.execute("CREATE (p:Product {name: 'Laptop', price: 999.99})")
+    tx.execute("CREATE (c:Category {name: 'Electronics'})")
+    tx.execute(
         "MATCH (u:User {name: 'Alice'}), (p:Product {name: 'Laptop'}) "
         "CREATE (u)-[:PURCHASED]->(p)"
     )
-    session.execute(
+    tx.execute(
         "MATCH (p:Product {name: 'Laptop'}), (c:Category {name: 'Electronics'}) "
         "CREATE (p)-[:IN_CATEGORY]->(c)"
     )
+    tx.commit()
 
     db.flush()
     del db
@@ -386,7 +398,9 @@ def test_empty_database_persists(tmp_path):
     assert len(results) == 0
 
     # Should be able to insert data using persisted schema
-    session2.execute("CREATE (n:Node {value: 42})")
+    tx2 = session2.tx()
+    tx2.execute("CREATE (n:Node {value: 42})")
+    tx2.commit()
     results2 = session2.query("MATCH (n:Node) RETURN n.value as value")
     assert len(results2) == 1
     assert results2[0]["value"] == 42

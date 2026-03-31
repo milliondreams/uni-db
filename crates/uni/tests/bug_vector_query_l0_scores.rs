@@ -33,15 +33,14 @@ async fn test_vector_query_scores_without_hnsw_index() -> anyhow::Result<()> {
     let db = Uni::open(path.to_str().unwrap()).build().await?;
 
     // 2. Insert data with known embeddings: A and B identical, C orthogonal
-    db.session()
-        .execute("CREATE (:Item {name: 'A', embedding: [1.0, 0.0, 0.0]})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Item {name: 'A', embedding: [1.0, 0.0, 0.0]})")
         .await?;
-    db.session()
-        .execute("CREATE (:Item {name: 'B', embedding: [1.0, 0.0, 0.0]})")
+    tx.execute("CREATE (:Item {name: 'B', embedding: [1.0, 0.0, 0.0]})")
         .await?;
-    db.session()
-        .execute("CREATE (:Item {name: 'C', embedding: [0.0, 0.0, 1.0]})")
+    tx.execute("CREATE (:Item {name: 'C', embedding: [0.0, 0.0, 1.0]})")
         .await?;
+    tx.commit().await?;
 
     // 3. Flush but DO NOT rebuild indexes — force brute-force path
     db.flush().await?;
@@ -128,12 +127,12 @@ async fn test_vector_query_score_consistency_with_and_without_index() -> anyhow:
 
     let db = Uni::open(path.to_str().unwrap()).build().await?;
 
-    db.session()
-        .execute("CREATE (:Item {name: 'X', embedding: [1.0, 0.0, 0.0]})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Item {name: 'X', embedding: [1.0, 0.0, 0.0]})")
         .await?;
-    db.session()
-        .execute("CREATE (:Item {name: 'Y', embedding: [0.7, 0.7, 0.0]})")
+    tx.execute("CREATE (:Item {name: 'Y', embedding: [0.7, 0.7, 0.0]})")
         .await?;
+    tx.commit().await?;
 
     db.flush().await?;
 

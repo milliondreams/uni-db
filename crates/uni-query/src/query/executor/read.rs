@@ -427,53 +427,14 @@ impl Executor {
         prop_manager: &PropertyManager,
         params: &HashMap<String, Value>,
     ) -> Result<Vec<RecordBatch>> {
-        let (session_ctx, mut planner, prop_manager_arc) =
-            self.create_datafusion_planner(prop_manager, params).await?;
-
-        // Build MutationContext when the plan contains write operations
-        if Self::contains_write_operations(&plan) {
-            let writer = self
-                .writer
-                .as_ref()
-                .ok_or_else(|| anyhow!("Write operations require a Writer"))?
-                .clone();
-            let query_ctx = self.get_context().await;
-
-            debug_assert!(
-                query_ctx.is_some(),
-                "BUG: query_ctx is None for write operation"
-            );
-
-            let mutation_ctx = Arc::new(crate::query::df_graph::MutationContext {
-                executor: self.clone(),
-                writer,
-                prop_manager: prop_manager_arc,
-                params: params.clone(),
-                query_ctx,
-                tx_l0_override: self.transaction_l0_override.clone(),
-            });
-            planner = planner.with_mutation_context(mutation_ctx);
-            tracing::debug!(
-                plan_type = Self::get_plan_type(&plan),
-                "Mutation routed to DataFusion engine"
-            );
-        }
-
-        let execution_plan = planner.plan(&plan)?;
-        let result = Self::collect_batches(&session_ctx, execution_plan).await;
-
-        // Harvest warnings from the graph execution context after query completion.
-        let graph_warnings = planner.graph_ctx().take_warnings();
-        if !graph_warnings.is_empty()
-            && let Ok(mut w) = self.warnings.lock()
-        {
-            w.extend(graph_warnings);
-        }
-
-        result
+        let (batches, _plan) = self
+            .execute_datafusion_with_plan(plan, prop_manager, params)
+            .await?;
+        Ok(batches)
     }
 
-    /// Like [`execute_datafusion()`] but also returns the physical execution plan.
+    /// Executes a query using the DataFusion-based engine, returning both
+    /// result batches and the physical execution plan.
     ///
     /// The returned `Arc<dyn ExecutionPlan>` can be walked to extract per-operator
     /// metrics (e.g., `output_rows`, `elapsed_compute`) that DataFusion's
@@ -1028,9 +989,6 @@ impl Executor {
             | LogicalPlan::ShowStatistics
             | LogicalPlan::Vacuum
             | LogicalPlan::Checkpoint
-            | LogicalPlan::Begin
-            | LogicalPlan::Commit
-            | LogicalPlan::Rollback
             | LogicalPlan::Copy { .. }
             | LogicalPlan::CopyTo { .. }
             | LogicalPlan::CopyFrom { .. }
@@ -2876,33 +2834,6 @@ impl Executor {
                 LogicalPlan::Delete { .. } => {
                     unreachable!("mutations are handled by DataFusion engine")
                 }
-                LogicalPlan::Begin => {
-                    if let Some(writer_lock) = &self.writer {
-                        let mut writer = writer_lock.write().await;
-                        writer.begin_transaction()?;
-                    } else {
-                        return Err(anyhow!("Transaction requires a Writer"));
-                    }
-                    Ok(vec![HashMap::new()])
-                }
-                LogicalPlan::Commit => {
-                    if let Some(writer_lock) = &self.writer {
-                        let mut writer = writer_lock.write().await;
-                        writer.commit_transaction().await?;
-                    } else {
-                        return Err(anyhow!("Transaction requires a Writer"));
-                    }
-                    Ok(vec![HashMap::new()])
-                }
-                LogicalPlan::Rollback => {
-                    if let Some(writer_lock) = &self.writer {
-                        let mut writer = writer_lock.write().await;
-                        writer.rollback_transaction()?;
-                    } else {
-                        return Err(anyhow!("Transaction requires a Writer"));
-                    }
-                    Ok(vec![HashMap::new()])
-                }
                 LogicalPlan::Copy {
                     target,
                     source,
@@ -2962,6 +2893,7 @@ impl Executor {
     ///
     /// Used by the DataFusion ForeachExec operator to delegate body clause
     /// execution back to the executor.
+    #[expect(clippy::too_many_arguments)]
     pub(crate) async fn execute_foreach_body_plan(
         &self,
         plan: LogicalPlan,
@@ -2970,14 +2902,23 @@ impl Executor {
         prop_manager: &PropertyManager,
         params: &HashMap<String, Value>,
         ctx: Option<&QueryContext>,
+        tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
     ) -> Result<()> {
         match plan {
             LogicalPlan::Set { items, .. } => {
-                self.execute_set_items_locked(&items, scope, writer, prop_manager, params, ctx)
-                    .await?;
+                self.execute_set_items_locked(
+                    &items,
+                    scope,
+                    writer,
+                    prop_manager,
+                    params,
+                    ctx,
+                    tx_l0,
+                )
+                .await?;
             }
             LogicalPlan::Remove { items, .. } => {
-                self.execute_remove_items_locked(&items, scope, writer, prop_manager, ctx)
+                self.execute_remove_items_locked(&items, scope, writer, prop_manager, ctx, tx_l0)
                     .await?;
             }
             LogicalPlan::Delete { items, detach, .. } => {
@@ -2985,18 +2926,34 @@ impl Executor {
                     let val = self
                         .evaluate_expr(expr, scope, prop_manager, params, ctx)
                         .await?;
-                    self.execute_delete_item_locked(&val, detach, writer)
+                    self.execute_delete_item_locked(&val, detach, writer, tx_l0)
                         .await?;
                 }
             }
             LogicalPlan::Create { pattern, .. } => {
-                self.execute_create_pattern(&pattern, scope, writer, prop_manager, params, ctx)
-                    .await?;
+                self.execute_create_pattern(
+                    &pattern,
+                    scope,
+                    writer,
+                    prop_manager,
+                    params,
+                    ctx,
+                    tx_l0,
+                )
+                .await?;
             }
             LogicalPlan::CreateBatch { patterns, .. } => {
                 for pattern in &patterns {
-                    self.execute_create_pattern(pattern, scope, writer, prop_manager, params, ctx)
-                        .await?;
+                    self.execute_create_pattern(
+                        pattern,
+                        scope,
+                        writer,
+                        prop_manager,
+                        params,
+                        ctx,
+                        tx_l0,
+                    )
+                    .await?;
                 }
             }
             LogicalPlan::Merge {
@@ -3005,8 +2962,16 @@ impl Executor {
                 on_create,
                 ..
             } => {
-                self.execute_create_pattern(&pattern, scope, writer, prop_manager, params, ctx)
-                    .await?;
+                self.execute_create_pattern(
+                    &pattern,
+                    scope,
+                    writer,
+                    prop_manager,
+                    params,
+                    ctx,
+                    tx_l0,
+                )
+                .await?;
                 if let Some(on_create_clause) = on_create {
                     self.execute_set_items_locked(
                         &on_create_clause.items,
@@ -3015,6 +2980,7 @@ impl Executor {
                         prop_manager,
                         params,
                         ctx,
+                        tx_l0,
                     )
                     .await?;
                 }
@@ -3044,6 +3010,7 @@ impl Executor {
                             prop_manager,
                             params,
                             ctx,
+                            tx_l0,
                         ))
                         .await?;
                     }
@@ -4196,7 +4163,7 @@ impl Executor {
 
                 let vid = writer.next_vid().await?;
                 writer
-                    .insert_vertex_with_labels(vid, props, &[target.to_string()])
+                    .insert_vertex_with_labels(vid, props, &[target.to_string()], None)
                     .await?;
                 count += 1;
             }
@@ -4246,7 +4213,15 @@ impl Executor {
 
                 let eid = writer.next_eid(type_id).await?;
                 writer
-                    .insert_edge(src, dst, type_id, eid, props, Some(target.to_string()))
+                    .insert_edge(
+                        src,
+                        dst,
+                        type_id,
+                        eid,
+                        props,
+                        Some(target.to_string()),
+                        None,
+                    )
                     .await?;
                 count += 1;
             }
@@ -4323,7 +4298,7 @@ impl Executor {
                     }
                     let vid = writer.next_vid().await?;
                     writer
-                        .insert_vertex_with_labels(vid, props, &[target.to_string()])
+                        .insert_vertex_with_labels(vid, props, &[target.to_string()], None)
                         .await?;
                     count += 1;
                 }
@@ -4380,7 +4355,15 @@ impl Executor {
 
                     let eid = writer.next_eid(type_id).await?;
                     writer
-                        .insert_edge(src, dst, type_id, eid, props, Some(target.to_string()))
+                        .insert_edge(
+                            src,
+                            dst,
+                            type_id,
+                            eid,
+                            props,
+                            Some(target.to_string()),
+                            None,
+                        )
                         .await?;
                     count += 1;
                 }
@@ -5304,7 +5287,12 @@ impl Executor {
         }
     }
 
-    pub(crate) async fn detach_delete_vertex(&self, vid: Vid, writer: &mut Writer) -> Result<()> {
+    pub(crate) async fn detach_delete_vertex(
+        &self,
+        vid: Vid,
+        writer: &mut Writer,
+        tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
+    ) -> Result<()> {
         let schema = self.storage.schema_manager().schema();
         let edge_type_ids: Vec<u32> = schema.all_edge_type_ids();
 
@@ -5322,7 +5310,7 @@ impl Executor {
 
         for edge in out_graph.edges() {
             writer
-                .delete_edge(edge.eid, edge.src_vid, edge.dst_vid, edge.edge_type)
+                .delete_edge(edge.eid, edge.src_vid, edge.dst_vid, edge.edge_type, tx_l0)
                 .await?;
         }
 
@@ -5340,7 +5328,7 @@ impl Executor {
 
         for edge in in_graph.edges() {
             writer
-                .delete_edge(edge.eid, edge.src_vid, edge.dst_vid, edge.edge_type)
+                .delete_edge(edge.eid, edge.src_vid, edge.dst_vid, edge.edge_type, tx_l0)
                 .await?;
         }
 
@@ -5353,6 +5341,7 @@ impl Executor {
         vids: &[Vid],
         labels_per_vid: Vec<Option<Vec<String>>>,
         writer: &mut Writer,
+        tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
     ) -> Result<()> {
         let schema = self.storage.schema_manager().schema();
         let edge_type_ids: Vec<u32> = schema.all_edge_type_ids();
@@ -5371,7 +5360,7 @@ impl Executor {
 
         for edge in out_graph.edges() {
             writer
-                .delete_edge(edge.eid, edge.src_vid, edge.dst_vid, edge.edge_type)
+                .delete_edge(edge.eid, edge.src_vid, edge.dst_vid, edge.edge_type, tx_l0)
                 .await?;
         }
 
@@ -5389,13 +5378,13 @@ impl Executor {
 
         for edge in in_graph.edges() {
             writer
-                .delete_edge(edge.eid, edge.src_vid, edge.dst_vid, edge.edge_type)
+                .delete_edge(edge.eid, edge.src_vid, edge.dst_vid, edge.edge_type, tx_l0)
                 .await?;
         }
 
         // Delete all vertices.
         for (vid, labels) in vids.iter().zip(labels_per_vid) {
-            writer.delete_vertex(*vid, labels).await?;
+            writer.delete_vertex(*vid, labels, tx_l0).await?;
         }
 
         Ok(())

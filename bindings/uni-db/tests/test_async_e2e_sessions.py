@@ -10,8 +10,10 @@ import pytest
 async def test_session_with_single_variable(async_social_db):
     """Test creating a session with a single variable."""
     setup = async_social_db.session()
-    await setup.execute("CREATE (p:Person {name: 'Alice', age: 30})")
-    await setup.execute("CREATE (p:Person {name: 'Bob', age: 25})")
+    tx = await setup.tx()
+    await tx.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+    await tx.execute("CREATE (p:Person {name: 'Bob', age: 25})")
+    await tx.commit()
     await async_social_db.flush()
 
     # Create session and set single variable
@@ -30,13 +32,15 @@ async def test_session_with_single_variable(async_social_db):
 async def test_session_with_multiple_variables(async_social_db):
     """Test creating a session with multiple variables."""
     setup = async_social_db.session()
-    await setup.execute(
+    tx = await setup.tx()
+    await tx.execute(
         "CREATE (p:Person {name: 'Alice', age: 30, email: 'alice@nyc.com'})"
     )
-    await setup.execute("CREATE (p:Person {name: 'Bob', age: 25, email: 'bob@la.com'})")
-    await setup.execute(
+    await tx.execute("CREATE (p:Person {name: 'Bob', age: 25, email: 'bob@la.com'})")
+    await tx.execute(
         "CREATE (p:Person {name: 'Charlie', age: 35, email: 'charlie@nyc.com'})"
     )
+    await tx.commit()
     await async_social_db.flush()
 
     session = async_social_db.session()
@@ -68,11 +72,13 @@ async def test_session_get_nonexistent_returns_none(async_social_db):
 async def test_session_query(async_social_db):
     """Test querying through a session."""
     setup = async_social_db.session()
-    await setup.execute("CREATE (p:Person {name: 'Alice', age: 30})")
-    await setup.execute("CREATE (p:Person {name: 'Bob', age: 25})")
-    await setup.execute(
+    tx = await setup.tx()
+    await tx.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+    await tx.execute("CREATE (p:Person {name: 'Bob', age: 25})")
+    await tx.execute(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) CREATE (a)-[:KNOWS]->(b)"
     )
+    await tx.commit()
     await async_social_db.flush()
 
     session = async_social_db.session()
@@ -100,10 +106,12 @@ async def test_session_execute(async_social_db):
     await session.set("person_name", "SessionPerson")
     await session.set("person_age", 40)
 
-    result = await session.execute(
+    tx = await session.tx()
+    result = await tx.execute(
         "CREATE (p:Person {name: $session.person_name, age: $session.person_age})"
     )
     assert result.nodes_created >= 1
+    await tx.commit()
 
     verify = async_social_db.session()
     result = await verify.query(
@@ -116,10 +124,12 @@ async def test_session_execute(async_social_db):
     await session2.set("name_to_update", "SessionPerson")
     await session2.set("new_age", 41)
 
-    result = await session2.execute(
+    tx2 = await session2.tx()
+    result = await tx2.execute(
         "MATCH (p:Person {name: $session.name_to_update}) SET p.age = $session.new_age"
     )
     assert result.properties_set >= 1
+    await tx2.commit()
 
     result = await verify.query(
         "MATCH (p:Person {name: 'SessionPerson'}) RETURN p.age as age"
@@ -132,9 +142,11 @@ async def test_session_execute(async_social_db):
 async def test_session_variables_persist_across_queries(async_social_db):
     """Test that session variables persist across multiple queries."""
     setup = async_social_db.session()
-    await setup.execute("CREATE (p:Person {name: 'Alice', age: 30})")
-    await setup.execute("CREATE (p:Person {name: 'Bob', age: 25})")
-    await setup.execute("CREATE (p:Person {name: 'Charlie', age: 35})")
+    tx = await setup.tx()
+    await tx.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+    await tx.execute("CREATE (p:Person {name: 'Bob', age: 25})")
+    await tx.execute("CREATE (p:Person {name: 'Charlie', age: 35})")
+    await tx.commit()
     await async_social_db.flush()
 
     session = async_social_db.session()
@@ -167,10 +179,12 @@ async def test_session_variables_persist_across_queries(async_social_db):
     assert await session.get("max_age") == 40
 
     # Execute mutation using session variables
-    result = await session.execute(
+    tx_mut = await session.tx()
+    result = await tx_mut.execute(
         "MATCH (p:Person) WHERE p.age >= $session.min_age SET p.email = 'senior@example.com'"
     )
     assert result.properties_set >= 1
+    await tx_mut.commit()
 
     verify = async_social_db.session()
     result = await verify.query(

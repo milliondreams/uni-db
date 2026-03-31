@@ -678,26 +678,6 @@ pub fn query_metrics_to_py(py: Python, m: &::uni_db::QueryMetrics) -> PyResult<P
     Ok(dict.into())
 }
 
-/// Convert an AutoCommitResult to a Python AutoCommitResult.
-pub fn auto_commit_result_to_py(
-    py: Python,
-    r: ::uni_db::AutoCommitResult,
-) -> PyResult<crate::types::PyAutoCommitResult> {
-    Ok(crate::types::PyAutoCommitResult {
-        affected_rows: r.affected_rows(),
-        nodes_created: r.nodes_created,
-        nodes_deleted: r.nodes_deleted,
-        relationships_created: r.relationships_created,
-        relationships_deleted: r.relationships_deleted,
-        properties_set: r.properties_set,
-        properties_removed: r.properties_removed,
-        labels_added: r.labels_added,
-        labels_removed: r.labels_removed,
-        version: r.version,
-        metrics: query_metrics_to_py(py, &r.metrics)?,
-    })
-}
-
 /// Convert an ExecuteResult to a Python ExecuteResult.
 pub fn execute_result_to_py(
     py: Python,

@@ -46,7 +46,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "CREATE (n:Person {{name: 'Bench_{}', age: 30, embedding: {}}})",
             i, embedding_str
         );
-        db1.session().execute(&cypher).await?;
+        let s = db1.session();
+        let tx = s.tx().await?;
+        tx.execute(&cypher).await?;
+        tx.commit().await?;
     }
     let duration1 = start.elapsed();
     let per_query1 = duration1.as_micros() as f64 / ITERATIONS as f64;

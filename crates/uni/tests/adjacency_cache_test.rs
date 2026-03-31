@@ -50,7 +50,7 @@ async fn test_adjacency_manager_lifecycle() -> anyhow::Result<()> {
     let eid01 = Eid::new(0);
 
     writer
-        .insert_edge(vid0, vid1, knows_type, eid01, HashMap::new(), None)
+        .insert_edge(vid0, vid1, knows_type, eid01, HashMap::new(), None, None)
         .await?;
 
     // 3. AM overlay should have the edge immediately (no flush needed)
@@ -71,7 +71,7 @@ async fn test_adjacency_manager_lifecycle() -> anyhow::Result<()> {
     let eid02 = Eid::new(1);
 
     writer
-        .insert_edge(vid0, vid2, knows_type, eid02, HashMap::new(), None)
+        .insert_edge(vid0, vid2, knows_type, eid02, HashMap::new(), None, None)
         .await?;
 
     // Should see both neighbors immediately

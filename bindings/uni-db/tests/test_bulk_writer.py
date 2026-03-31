@@ -36,13 +36,15 @@ class TestBulkWriter:
     def test_bulk_writer_builder(self, db):
         """Test creating a bulk writer with builder."""
         session = db.session()
-        writer = session.bulk_writer().batch_size(1000).build()
+        tx = session.tx()
+        writer = tx.bulk_writer().batch_size(1000).build()
         assert writer is not None
 
     def test_bulk_insert_vertices(self, db):
         """Test bulk inserting vertices."""
         session = db.session()
-        writer = session.bulk_writer().build()
+        tx = session.tx()
+        writer = tx.bulk_writer().build()
 
         # Insert multiple vertices
         vids = writer.insert_vertices(
@@ -56,6 +58,7 @@ class TestBulkWriter:
 
         assert len(vids) == 3
         writer.commit()
+        tx.commit()
 
         # Verify vertices were inserted
         results = session.query(
@@ -67,7 +70,8 @@ class TestBulkWriter:
     def test_bulk_insert_edges(self, db):
         """Test bulk inserting edges."""
         session = db.session()
-        writer = session.bulk_writer().build()
+        tx = session.tx()
+        writer = tx.bulk_writer().build()
 
         # First insert vertices
         person_vids = writer.insert_vertices(
@@ -86,6 +90,7 @@ class TestBulkWriter:
         )
 
         writer.commit()
+        tx.commit()
 
         # Verify edges
         results = session.query(
@@ -96,7 +101,8 @@ class TestBulkWriter:
     def test_bulk_writer_abort(self, db):
         """Test aborting a bulk write operation prevents further operations."""
         session = db.session()
-        writer = session.bulk_writer().build()
+        tx = session.tx()
+        writer = tx.bulk_writer().build()
 
         writer.insert_vertices(
             "Person",
@@ -104,6 +110,7 @@ class TestBulkWriter:
         )
 
         writer.abort()
+        tx.rollback()
 
         # After abort, further operations should fail
         with pytest.raises(RuntimeError):
@@ -112,8 +119,9 @@ class TestBulkWriter:
     def test_bulk_writer_deferred_indexes(self, db):
         """Test bulk writer with deferred index building."""
         session = db.session()
+        tx = session.tx()
         writer = (
-            session.bulk_writer()
+            tx.bulk_writer()
             .defer_scalar_indexes(True)
             .defer_vector_indexes(True)
             .build()
@@ -125,6 +133,7 @@ class TestBulkWriter:
         )
 
         stats = writer.commit()
+        tx.commit()
         assert stats.vertices_inserted == 100
 
 
@@ -138,9 +147,11 @@ class TestBulkStats:
             db.schema().label("Test").apply()
 
             session = db.session()
-            writer = session.bulk_writer().build()
+            tx = session.tx()
+            writer = tx.bulk_writer().build()
             writer.insert_vertices("Test", [{"value": 1}])
             stats = writer.commit()
+            tx.commit()
 
             assert hasattr(stats, "vertices_inserted")
             assert hasattr(stats, "edges_inserted")

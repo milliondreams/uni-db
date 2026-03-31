@@ -37,35 +37,37 @@ def social_db(tmp_path):
 
     # Add test data
     session = db.session()
-    session.execute("""
+    tx = session.tx()
+    tx.execute("""
         CREATE (:User {username: 'alice', email: 'alice@example.com', age: 30})
     """)
-    session.execute("""
+    tx.execute("""
         CREATE (:User {username: 'bob', email: 'bob@example.com', age: 25})
     """)
-    session.execute("""
+    tx.execute("""
         CREATE (:User {username: 'charlie', email: 'charlie@example.com', age: 35})
     """)
-    session.execute("""
+    tx.execute("""
         CREATE (:Post {title: 'Hello World', content: 'My first post!', likes: 5})
     """)
-    session.execute("""
+    tx.execute("""
         CREATE (:Post {title: 'Graph Databases', content: 'They are awesome!', likes: 10})
     """)
 
     # Create relationships
-    session.execute("""
+    tx.execute("""
         MATCH (a:User {username: 'alice'}), (b:User {username: 'bob'})
         CREATE (a)-[:FOLLOWS]->(b)
     """)
-    session.execute("""
+    tx.execute("""
         MATCH (a:User {username: 'alice'}), (p:Post {title: 'Hello World'})
         CREATE (a)-[:POSTED {timestamp: 1234567890}]->(p)
     """)
-    session.execute("""
+    tx.execute("""
         MATCH (b:User {username: 'bob'}), (p:Post {title: 'Hello World'})
         CREATE (b)-[:LIKES {timestamp: 1234567900}]->(p)
     """)
+    tx.commit()
 
     db.flush()
     yield db
@@ -172,13 +174,12 @@ def test_session_execute(social_db):
     session.set("new_email", "diana@example.com")
     session.set("new_age", 28)
 
-    # Execute create operation
-    result = session.execute("""
+    # Execute create operation using transaction (resolves $session.xxx params)
+    tx = session.tx()
+    tx.execute("""
         CREATE (:User {username: $session.new_username, email: $session.new_email, age: $session.new_age})
     """)
-
-    # execute returns AutoCommitResult
-    assert hasattr(result, "affected_rows") or hasattr(result, "nodes_created")
+    tx.commit()
 
     # Verify the user was created using a plain session
     verify_session = db.session()
@@ -253,13 +254,13 @@ def test_session_execute_update(social_db):
     session.set("target_user", "charlie")
     session.set("new_age", 36)
 
-    # Execute update
-    result = session.execute("""
+    # Execute update using transaction (resolves $session.xxx params)
+    tx = session.tx()
+    tx.execute("""
         MATCH (u:User {username: $session.target_user})
         SET u.age = $session.new_age
     """)
-
-    assert hasattr(result, "affected_rows") or hasattr(result, "nodes_created")
+    tx.commit()
 
     # Verify update using a plain session
     verify_session = db.session()
@@ -284,13 +285,13 @@ def test_session_execute_delete(social_db):
     session = db.session()
     session.set("post_title", "Graph Databases")
 
-    # Execute delete
-    result = session.execute("""
+    # Execute delete using transaction (resolves $session.xxx params)
+    tx = session.tx()
+    tx.execute("""
         MATCH (p:Post {title: $session.post_title})
         DELETE p
     """)
-
-    assert hasattr(result, "affected_rows") or hasattr(result, "nodes_deleted")
+    tx.commit()
 
     # Verify deletion
     results = verify_session.query(

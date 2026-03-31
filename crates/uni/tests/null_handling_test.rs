@@ -64,7 +64,7 @@ async fn test_null_handling_functions() -> anyhow::Result<()> {
         let mut props1 = HashMap::new();
         props1.insert("name".to_string(), unival!("Alice"));
         props1.insert("age".to_string(), unival!(30));
-        w.insert_vertex_with_labels(vid1, props1, &["Person".to_string()])
+        w.insert_vertex_with_labels(vid1, props1, &["Person".to_string()], None)
             .await?;
 
         // Person 2: Bob, no age, nickname 'Bobby'
@@ -72,14 +72,14 @@ async fn test_null_handling_functions() -> anyhow::Result<()> {
         let mut props2 = HashMap::new();
         props2.insert("name".to_string(), unival!("Bob"));
         props2.insert("nickname".to_string(), unival!("Bobby"));
-        w.insert_vertex_with_labels(vid2, props2, &["Person".to_string()])
+        w.insert_vertex_with_labels(vid2, props2, &["Person".to_string()], None)
             .await?;
 
         // Person 3: Charlie, no age, no nickname
         let vid3 = Vid::new(3);
         let mut props3 = HashMap::new();
         props3.insert("name".to_string(), unival!("Charlie"));
-        w.insert_vertex_with_labels(vid3, props3, &["Person".to_string()])
+        w.insert_vertex_with_labels(vid3, props3, &["Person".to_string()], None)
             .await?;
 
         w.flush_to_l1(None).await?;

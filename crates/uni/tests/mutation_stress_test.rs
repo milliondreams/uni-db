@@ -15,9 +15,10 @@ async fn test_stress_create_10k_nodes() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
     for i in 0..10_000 {
-        db.session()
-            .execute(&format!("CREATE (n:StressNode {{idx: {i}}})"))
+        let tx = db.session().tx().await?;
+        tx.execute(&format!("CREATE (n:StressNode {{idx: {i}}})"))
             .await?;
+        tx.commit().await?;
     }
 
     let result = db
@@ -38,15 +39,17 @@ async fn test_stress_set_10k_nodes() -> Result<()> {
 
     // Seed 10k nodes
     for i in 0..10_000 {
-        db.session()
-            .execute(&format!("CREATE (n:StressNode {{idx: {i}}})"))
+        let tx = db.session().tx().await?;
+        tx.execute(&format!("CREATE (n:StressNode {{idx: {i}}})"))
             .await?;
+        tx.commit().await?;
     }
 
     // Bulk SET via single MATCH
-    db.session()
-        .execute("MATCH (n:StressNode) SET n.updated = true")
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (n:StressNode) SET n.updated = true")
         .await?;
+    tx.commit().await?;
 
     // Verify all nodes were updated
     let result = db
@@ -67,9 +70,10 @@ async fn test_stress_delete_10k_nodes() -> Result<()> {
 
     // Seed 10k nodes
     for i in 0..10_000 {
-        db.session()
-            .execute(&format!("CREATE (n:StressNode {{idx: {i}}})"))
+        let tx = db.session().tx().await?;
+        tx.execute(&format!("CREATE (n:StressNode {{idx: {i}}})"))
             .await?;
+        tx.commit().await?;
     }
 
     // Verify seed
@@ -80,9 +84,9 @@ async fn test_stress_delete_10k_nodes() -> Result<()> {
     assert_eq!(result.rows()[0].get::<i64>("cnt")?, 10_000);
 
     // Bulk DETACH DELETE
-    db.session()
-        .execute("MATCH (n:StressNode) DETACH DELETE n")
-        .await?;
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (n:StressNode) DETACH DELETE n").await?;
+    tx.commit().await?;
 
     // Verify empty
     let result = db
@@ -101,9 +105,10 @@ async fn test_stress_mixed_mutations_10k() -> Result<()> {
 
     // CREATE 5k nodes
     for i in 0..5_000 {
-        db.session()
-            .execute(&format!("CREATE (n:StressNode {{idx: {i}}})"))
+        let tx = db.session().tx().await?;
+        tx.execute(&format!("CREATE (n:StressNode {{idx: {i}}})"))
             .await?;
+        tx.commit().await?;
     }
     let result = db
         .session()
@@ -112,14 +117,16 @@ async fn test_stress_mixed_mutations_10k() -> Result<()> {
     assert_eq!(result.rows()[0].get::<i64>("cnt")?, 5_000);
 
     // SET all
-    db.session()
-        .execute("MATCH (n:StressNode) SET n.phase = 'updated'")
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (n:StressNode) SET n.phase = 'updated'")
         .await?;
+    tx.commit().await?;
 
     // DELETE half (idx < 2500)
-    db.session()
-        .execute("MATCH (n:StressNode) WHERE n.idx < 2500 DETACH DELETE n")
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (n:StressNode) WHERE n.idx < 2500 DETACH DELETE n")
         .await?;
+    tx.commit().await?;
     let result = db
         .session()
         .query("MATCH (n:StressNode) RETURN count(n) AS cnt")
@@ -128,9 +135,10 @@ async fn test_stress_mixed_mutations_10k() -> Result<()> {
 
     // CREATE 5k more (idx 5000..9999)
     for i in 5_000..10_000 {
-        db.session()
-            .execute(&format!("CREATE (n:StressNode {{idx: {i}}})"))
+        let tx = db.session().tx().await?;
+        tx.execute(&format!("CREATE (n:StressNode {{idx: {i}}})"))
             .await?;
+        tx.commit().await?;
     }
 
     // Verify final count: 2500 (surviving) + 5000 (new) = 7500
@@ -150,9 +158,10 @@ async fn test_stress_merge_10k_ops() -> Result<()> {
 
     // 5k MERGE creates (all new)
     for i in 0..5_000 {
-        db.session()
-            .execute(&format!("MERGE (n:StressNode {{idx: {i}}})"))
+        let tx = db.session().tx().await?;
+        tx.execute(&format!("MERGE (n:StressNode {{idx: {i}}})"))
             .await?;
+        tx.commit().await?;
     }
     let result = db
         .session()
@@ -162,9 +171,10 @@ async fn test_stress_merge_10k_ops() -> Result<()> {
 
     // 10k MERGE: first 5k match existing, next 5k create new
     for i in 0..10_000 {
-        db.session()
-            .execute(&format!("MERGE (n:StressNode {{idx: {i}}})"))
+        let tx = db.session().tx().await?;
+        tx.execute(&format!("MERGE (n:StressNode {{idx: {i}}})"))
             .await?;
+        tx.commit().await?;
     }
 
     // Verify 10k total (5k original matched + 5k new created)
@@ -183,15 +193,17 @@ async fn test_stress_create_edges_5k() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
     // Create a chain of 5001 nodes with NEXT edges (5000 edges)
-    db.session()
-        .execute("CREATE (n:ChainNode {idx: 0})")
-        .await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (n:ChainNode {idx: 0})").await?;
+    tx.commit().await?;
     for i in 1..=5_000 {
-        db.session().execute(&format!(
+        let tx = db.session().tx().await?;
+        tx.execute(&format!(
             "MATCH (a:ChainNode {{idx: {prev}}}) CREATE (b:ChainNode {{idx: {i}}}), (a)-[:NEXT]->(b)",
             prev = i - 1,
         ))
         .await?;
+        tx.commit().await?;
     }
 
     // Verify node count

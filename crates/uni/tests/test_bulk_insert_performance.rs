@@ -61,10 +61,9 @@ async fn test_bulk_insert_performance() {
             props.push(p);
         }
 
-        db.session()
-            .bulk_insert_vertices("Person", props)
-            .await
-            .unwrap();
+        let tx = db.session().tx().await.unwrap();
+        tx.bulk_insert_vertices("Person", props).await.unwrap();
+        tx.commit().await.unwrap();
         let insert_elapsed = create_start.elapsed();
 
         let flush_start = Instant::now();
@@ -160,10 +159,9 @@ async fn test_bulk_insert_with_constraints() {
             props.push(p);
         }
 
-        db.session()
-            .bulk_insert_vertices("User", props)
-            .await
-            .unwrap();
+        let tx = db.session().tx().await.unwrap();
+        tx.bulk_insert_vertices("User", props).await.unwrap();
+        tx.commit().await.unwrap();
         let insert_elapsed = create_start.elapsed();
 
         let flush_start = Instant::now();

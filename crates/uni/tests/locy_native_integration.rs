@@ -45,9 +45,10 @@ fn timeout_config() -> LocyConfig {
 #[tokio::test]
 async fn test_native_transitive_closure() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session()
-        .execute("CREATE (:N {name: 'A'})-[:E]->(:N {name: 'B'})-[:E]->(:N {name: 'C'})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:N {name: 'A'})-[:E]->(:N {name: 'B'})-[:E]->(:N {name: 'C'})")
         .await?;
+    tx.commit().await?;
 
     let result = db
         .session()
@@ -81,15 +82,16 @@ async fn test_native_transitive_closure() -> Result<()> {
 #[tokio::test]
 async fn test_native_fold_sum() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session()
-        .execute(
-            "CREATE (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}), \
+    let tx = db.session().tx().await?;
+    tx.execute(
+        "CREATE (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}), \
          (i1:Invoice {id: 1}), (i2:Invoice {id: 2}), (i3:Invoice {id: 3}), \
          (a)-[:PAID {amount: 100}]->(i1), \
          (a)-[:PAID {amount: 200}]->(i2), \
          (b)-[:PAID {amount: 50}]->(i3)",
-        )
-        .await?;
+    )
+    .await?;
+    tx.commit().await?;
 
     let result = db
         .session()
@@ -121,15 +123,16 @@ async fn test_native_fold_sum() -> Result<()> {
 #[tokio::test]
 async fn test_native_best_by() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session()
-        .execute(
-            "CREATE (a:Node {name: 'A'}), \
+    let tx = db.session().tx().await?;
+    tx.execute(
+        "CREATE (a:Node {name: 'A'}), \
          (b:Node {name: 'B'}), (c:Node {name: 'C'}), (d:Node {name: 'D'}), \
          (a)-[:EDGE {cost: 5}]->(b), \
          (a)-[:EDGE {cost: 3}]->(c), \
          (a)-[:EDGE {cost: 7}]->(d)",
-        )
-        .await?;
+    )
+    .await?;
+    tx.commit().await?;
 
     let result = db
         .session()
@@ -163,12 +166,13 @@ async fn test_native_best_by() -> Result<()> {
 #[tokio::test]
 async fn test_native_priority() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session()
-        .execute(
-            "CREATE (:Item {name: 'A', risk: 0.8}), \
+    let tx = db.session().tx().await?;
+    tx.execute(
+        "CREATE (:Item {name: 'A', risk: 0.8}), \
          (:Item {name: 'B', risk: 0.2})",
-        )
-        .await?;
+    )
+    .await?;
+    tx.commit().await?;
 
     let result = db
         .session()
@@ -201,9 +205,10 @@ async fn test_native_priority() -> Result<()> {
 #[tokio::test]
 async fn test_native_multi_stratum() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session()
-        .execute("CREATE (:N {name: 'A'})-[:E]->(:N {name: 'B'})-[:E]->(:N {name: 'C'})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:N {name: 'A'})-[:E]->(:N {name: 'B'})-[:E]->(:N {name: 'C'})")
         .await?;
+    tx.commit().await?;
 
     let result = db
         .session()
@@ -242,14 +247,15 @@ async fn test_native_multi_stratum() -> Result<()> {
 #[tokio::test]
 async fn test_native_along() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session()
-        .execute(
-            "CREATE (a:Node {name: 'A'}), (b:Node {name: 'B'}), (c:Node {name: 'C'}), \
+    let tx = db.session().tx().await?;
+    tx.execute(
+        "CREATE (a:Node {name: 'A'}), (b:Node {name: 'B'}), (c:Node {name: 'C'}), \
          (a)-[:EDGE {weight: 5.0}]->(b), \
          (b)-[:EDGE {weight: 3.0}]->(c), \
          (a)-[:EDGE {weight: 20.0}]->(c)",
-        )
-        .await?;
+    )
+    .await?;
+    tx.commit().await?;
 
     let result = db
         .session()
@@ -304,9 +310,10 @@ async fn test_native_along() -> Result<()> {
 #[tokio::test]
 async fn test_native_error_max_iterations() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session()
-        .execute("CREATE (:N {name: 'A'})-[:E]->(:N {name: 'B'})-[:E]->(:N {name: 'C'})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:N {name: 'A'})-[:E]->(:N {name: 'B'})-[:E]->(:N {name: 'C'})")
         .await?;
+    tx.commit().await?;
 
     let err = db
         .session()
@@ -337,9 +344,10 @@ async fn test_native_error_max_iterations() -> Result<()> {
 #[tokio::test]
 async fn test_native_error_timeout() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session()
-        .execute("CREATE (:N {name: 'A'})-[:E]->(:N {name: 'B'})-[:E]->(:N {name: 'C'})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:N {name: 'A'})-[:E]->(:N {name: 'B'})-[:E]->(:N {name: 'C'})")
         .await?;
+    tx.commit().await?;
 
     let err = db
         .session()
@@ -372,8 +380,10 @@ async fn test_native_error_timeout() -> Result<()> {
 #[tokio::test]
 async fn test_native_goal_query_command() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session().execute("CREATE (:Person {name: 'Alice'})-[:KNOWS]->(:Person {name: 'Bob'})-[:KNOWS]->(:Person {name: 'Carol'})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Person {name: 'Alice'})-[:KNOWS]->(:Person {name: 'Bob'})-[:KNOWS]->(:Person {name: 'Carol'})")
         .await?;
+    tx.commit().await?;
 
     let result = db
         .session()
@@ -415,9 +425,10 @@ async fn test_native_goal_query_command() -> Result<()> {
 #[tokio::test]
 async fn test_native_cypher_command() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session()
-        .execute("CREATE (:Node {name: 'X'}), (:Node {name: 'Y'}), (:Node {name: 'Z'})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Node {name: 'X'}), (:Node {name: 'Y'}), (:Node {name: 'Z'})")
         .await?;
+    tx.commit().await?;
 
     let result = db
         .session()
@@ -452,9 +463,10 @@ async fn test_native_cypher_command() -> Result<()> {
 #[tokio::test]
 async fn test_native_explain_rule_command() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session()
-        .execute("CREATE (:Person {name: 'Alice'})-[:KNOWS]->(:Person {name: 'Bob'})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Person {name: 'Alice'})-[:KNOWS]->(:Person {name: 'Bob'})")
         .await?;
+    tx.commit().await?;
 
     let result = db
         .session()
@@ -491,11 +503,12 @@ async fn test_native_explain_rule_command() -> Result<()> {
 #[tokio::test]
 async fn test_native_multiple_commands() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session()
-        .execute(
-            "CREATE (:City {name: 'A'})-[:ROAD]->(:City {name: 'B'})-[:ROAD]->(:City {name: 'C'})",
-        )
-        .await?;
+    let tx = db.session().tx().await?;
+    tx.execute(
+        "CREATE (:City {name: 'A'})-[:ROAD]->(:City {name: 'B'})-[:ROAD]->(:City {name: 'C'})",
+    )
+    .await?;
+    tx.commit().await?;
 
     let result = db
         .session()

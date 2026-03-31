@@ -55,16 +55,40 @@ async fn test_shortest_path_match() -> anyhow::Result<()> {
         for (vid, name) in [(vid_a, "A"), (vid_b, "B"), (vid_c, "C"), (vid_d, "D")] {
             let mut props = HashMap::new();
             props.insert("name".to_string(), Value::String(name.to_string()));
-            w.insert_vertex_with_labels(vid, props, &["Node".to_string()])
+            w.insert_vertex_with_labels(vid, props, &["Node".to_string()], None)
                 .await?;
         }
 
-        w.insert_edge(vid_a, vid_b, link_edge, Eid::new(0), HashMap::new(), None)
-            .await?;
-        w.insert_edge(vid_b, vid_c, link_edge, Eid::new(1), HashMap::new(), None)
-            .await?;
-        w.insert_edge(vid_c, vid_d, link_edge, Eid::new(2), HashMap::new(), None)
-            .await?;
+        w.insert_edge(
+            vid_a,
+            vid_b,
+            link_edge,
+            Eid::new(0),
+            HashMap::new(),
+            None,
+            None,
+        )
+        .await?;
+        w.insert_edge(
+            vid_b,
+            vid_c,
+            link_edge,
+            Eid::new(1),
+            HashMap::new(),
+            None,
+            None,
+        )
+        .await?;
+        w.insert_edge(
+            vid_c,
+            vid_d,
+            link_edge,
+            Eid::new(2),
+            HashMap::new(),
+            None,
+            None,
+        )
+        .await?;
 
         // Add a long shortcut just to test shortestPath
         // A -> D (but let's say we want to find the one through LINK)
@@ -137,18 +161,50 @@ async fn test_all_shortest_paths_diamond() -> anyhow::Result<()> {
         for (vid, name) in [(vid_a, "A"), (vid_b, "B"), (vid_c, "C"), (vid_d, "D")] {
             let mut props = HashMap::new();
             props.insert("name".to_string(), Value::String(name.to_string()));
-            w.insert_vertex_with_labels(vid, props, &["Node".to_string()])
+            w.insert_vertex_with_labels(vid, props, &["Node".to_string()], None)
                 .await?;
         }
 
-        w.insert_edge(vid_a, vid_b, link_edge, Eid::new(0), HashMap::new(), None)
-            .await?;
-        w.insert_edge(vid_a, vid_c, link_edge, Eid::new(1), HashMap::new(), None)
-            .await?;
-        w.insert_edge(vid_b, vid_d, link_edge, Eid::new(2), HashMap::new(), None)
-            .await?;
-        w.insert_edge(vid_c, vid_d, link_edge, Eid::new(3), HashMap::new(), None)
-            .await?;
+        w.insert_edge(
+            vid_a,
+            vid_b,
+            link_edge,
+            Eid::new(0),
+            HashMap::new(),
+            None,
+            None,
+        )
+        .await?;
+        w.insert_edge(
+            vid_a,
+            vid_c,
+            link_edge,
+            Eid::new(1),
+            HashMap::new(),
+            None,
+            None,
+        )
+        .await?;
+        w.insert_edge(
+            vid_b,
+            vid_d,
+            link_edge,
+            Eid::new(2),
+            HashMap::new(),
+            None,
+            None,
+        )
+        .await?;
+        w.insert_edge(
+            vid_c,
+            vid_d,
+            link_edge,
+            Eid::new(3),
+            HashMap::new(),
+            None,
+            None,
+        )
+        .await?;
 
         w.flush_to_l1(None).await?;
     }
@@ -223,16 +279,40 @@ async fn test_all_shortest_paths_only_shortest() -> anyhow::Result<()> {
         for (vid, name) in [(vid_a, "A"), (vid_b, "B"), (vid_c, "C")] {
             let mut props = HashMap::new();
             props.insert("name".to_string(), Value::String(name.to_string()));
-            w.insert_vertex_with_labels(vid, props, &["Node".to_string()])
+            w.insert_vertex_with_labels(vid, props, &["Node".to_string()], None)
                 .await?;
         }
 
-        w.insert_edge(vid_a, vid_b, link_edge, Eid::new(0), HashMap::new(), None)
-            .await?;
-        w.insert_edge(vid_b, vid_c, link_edge, Eid::new(1), HashMap::new(), None)
-            .await?;
-        w.insert_edge(vid_a, vid_c, link_edge, Eid::new(2), HashMap::new(), None)
-            .await?;
+        w.insert_edge(
+            vid_a,
+            vid_b,
+            link_edge,
+            Eid::new(0),
+            HashMap::new(),
+            None,
+            None,
+        )
+        .await?;
+        w.insert_edge(
+            vid_b,
+            vid_c,
+            link_edge,
+            Eid::new(1),
+            HashMap::new(),
+            None,
+            None,
+        )
+        .await?;
+        w.insert_edge(
+            vid_a,
+            vid_c,
+            link_edge,
+            Eid::new(2),
+            HashMap::new(),
+            None,
+            None,
+        )
+        .await?;
 
         w.flush_to_l1(None).await?;
     }
@@ -294,7 +374,7 @@ async fn test_all_shortest_paths_no_path() -> anyhow::Result<()> {
         for (vid, name) in [(vid_a, "A"), (vid_b, "B")] {
             let mut props = HashMap::new();
             props.insert("name".to_string(), Value::String(name.to_string()));
-            w.insert_vertex_with_labels(vid, props, &["Node".to_string()])
+            w.insert_vertex_with_labels(vid, props, &["Node".to_string()], None)
                 .await?;
         }
         // No edges between A and B
@@ -356,7 +436,7 @@ async fn test_all_shortest_paths_same_node() -> anyhow::Result<()> {
         let mut w = writer.write().await;
         let mut props = HashMap::new();
         props.insert("name".to_string(), Value::String("A".to_string()));
-        w.insert_vertex_with_labels(vid_a, props, &["Node".to_string()])
+        w.insert_vertex_with_labels(vid_a, props, &["Node".to_string()], None)
             .await?;
         w.flush_to_l1(None).await?;
     }

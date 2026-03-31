@@ -1,17 +1,19 @@
 # TCK Compliance Report
 
-**Generated:** 2026-03-29 14:01:02
-**Results:** `results_20260329_140102.json`
-**Compared to:** `results_20260327_133613.json`
+**Generated:** 2026-03-30 21:29:44
+**Results:** `results_20260330_212944.json`
+**Compared to:** `results_20260330_210422.json`
 
 ## Summary
 
 | Metric | Current | Previous | Delta |
 |--------|---------|----------|-------|
-| Scenarios | 256 | 256 |  |
-| Passed | 256 | 256 |  |
-| Failed | 0 | 0 |  |
-| Pass Rate | 100.0% | 100.0% | ➡️ +0.0pp |
+| Scenarios | 263 | 263 |  |
+| Passed | 263 | 256 | +7 |
+| Failed | 0 | 7 | -7 |
+| Pass Rate | 100.0% | 97.3% | 📈 +2.7pp |
+
+**🟢 Fixed:** 7 scenarios now passing
 
 ## Feature Breakdown
 
@@ -24,6 +26,7 @@
 | ✅ BasicRules | 6 | 6 | 0 | 100% |  |
 | ✅ CypherFunctions | 9 | 9 | 0 | 100% |  |
 | ✅ DeriveEdges | 9 | 9 | 0 | 100% |  |
+| ✅ DeriveVisibility | 7 | 7 | 0 | 100% | +100pp |
 | ✅ ErrorConditions | 5 | 5 | 0 | 100% |  |
 | ✅ ExactProbability | 15 | 15 | 0 | 100% |  |
 | ✅ ExplainCombinations | 6 | 6 | 0 | 100% |  |
@@ -53,6 +56,18 @@
 | ✅ TransitiveClosure | 2 | 2 | 0 | 100% |  |
 | ✅ TripleCombinations | 5 | 5 | 0 | 100% |  |
 | ✅ YieldValueColumns | 5 | 5 | 0 | 100% |  |
+
+## 🟢 Newly Passing
+
+Scenarios that were failing but are now passing:
+
+- **DeriveVisibility** — DERIVE edges do not persist to graph without tx.apply (line 111)
+- **DeriveVisibility** — QUERY then DERIVE then trailing Cypher (line 91)
+- **DeriveVisibility** — Trailing Cypher after DERIVE sees derived edges (line 16)
+- **DeriveVisibility** — Trailing Cypher after empty DERIVE returns 0 correctly (line 124)
+- **DeriveVisibility** — Trailing Cypher count reflects derived edge count (line 31)
+- **DeriveVisibility** — Trailing Cypher joins derived edges with existing graph (line 51)
+- **DeriveVisibility** — Trailing Cypher sees edges from multiple DERIVE commands (line 72)
 
 ## Failed Scenarios
 

@@ -33,7 +33,9 @@ class TestAsyncSchemaCreation:
 
         assert await db.label_exists("Person")
         session = db.session()
-        await session.execute("CREATE (n:Person {name: 'Alice', age: 30})")
+        tx = await session.tx()
+        await tx.execute("CREATE (n:Person {name: 'Alice', age: 30})")
+        await tx.commit()
         await db.flush()
         results = await session.query("MATCH (n:Person) RETURN n.name, n.age")
         assert len(results) == 1
@@ -50,7 +52,9 @@ class TestAsyncSchemaCreation:
         )
 
         session = db.session()
-        await session.execute("CREATE (n:Person {name: 'Bob'})")
+        tx = await session.tx()
+        await tx.execute("CREATE (n:Person {name: 'Bob'})")
+        await tx.commit()
         await db.flush()
         results = await session.query("MATCH (n:Person) RETURN n.name, n.nickname")
         assert len(results) == 1
@@ -161,7 +165,9 @@ class TestAsyncDataTypes:
         """Test string data type."""
         await db.schema().label("Test").property("text", "string").apply()
         session = db.session()
-        await session.execute("CREATE (n:Test {text: 'hello world'})")
+        tx = await session.tx()
+        await tx.execute("CREATE (n:Test {text: 'hello world'})")
+        await tx.commit()
         await db.flush()
         results = await session.query("MATCH (n:Test) RETURN n.text")
         assert results[0]["n.text"] == "hello world"
@@ -171,7 +177,9 @@ class TestAsyncDataTypes:
         """Test integer data type."""
         await db.schema().label("Test").property("num", "int").apply()
         session = db.session()
-        await session.execute("CREATE (n:Test {num: 42})")
+        tx = await session.tx()
+        await tx.execute("CREATE (n:Test {num: 42})")
+        await tx.commit()
         await db.flush()
         results = await session.query("MATCH (n:Test) RETURN n.num")
         assert results[0]["n.num"] == 42
@@ -181,7 +189,9 @@ class TestAsyncDataTypes:
         """Test float data type."""
         await db.schema().label("Test").property("value", "float").apply()
         session = db.session()
-        await session.execute("CREATE (n:Test {value: 3.14})")
+        tx = await session.tx()
+        await tx.execute("CREATE (n:Test {value: 3.14})")
+        await tx.commit()
         await db.flush()
         results = await session.query("MATCH (n:Test) RETURN n.value")
         assert abs(results[0]["n.value"] - 3.14) < 0.001
@@ -191,7 +201,9 @@ class TestAsyncDataTypes:
         """Test boolean data type."""
         await db.schema().label("Test").property("active", "bool").apply()
         session = db.session()
-        await session.execute("CREATE (n:Test {active: true})")
+        tx = await session.tx()
+        await tx.execute("CREATE (n:Test {active: true})")
+        await tx.commit()
         await db.flush()
         results = await session.query("MATCH (n:Test) RETURN n.active")
         assert results[0]["n.active"] is True
@@ -219,7 +231,9 @@ class TestAsyncSchemaBuilder:
 
         assert await db.label_exists("Person")
         session = db.session()
-        await session.execute("CREATE (n:Person {name: 'Alice', age: 30})")
+        tx = await session.tx()
+        await tx.execute("CREATE (n:Person {name: 'Alice', age: 30})")
+        await tx.commit()
         await db.flush()
         results = await session.query("MATCH (n:Person) RETURN n.name, n.age")
         assert len(results) == 1
@@ -264,7 +278,9 @@ class TestAsyncSchemaBuilder:
 
         assert await db.label_exists("Contact")
         session = db.session()
-        await session.execute("CREATE (n:Contact {name: 'Bob'})")
+        tx = await session.tx()
+        await tx.execute("CREATE (n:Contact {name: 'Bob'})")
+        await tx.commit()
         await db.flush()
         results = await session.query("MATCH (n:Contact) RETURN n.name")
         assert len(results) == 1

@@ -16,17 +16,13 @@ async fn test_path_variable() -> Result<()> {
         .apply()
         .await?;
 
-    db.session()
-        .execute("CREATE (a:Person {name: 'Alice'})")
-        .await?;
-    db.session()
-        .execute("CREATE (b:Person {name: 'Bob'})")
-        .await?;
-    db.session()
-        .execute("CREATE (c:Person {name: 'Charlie'})")
-        .await?;
-    db.session().execute("MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) CREATE (a)-[:KNOWS {since: 2020}]->(b)").await?;
-    db.session().execute("MATCH (b:Person {name: 'Bob'}), (c:Person {name: 'Charlie'}) CREATE (b)-[:KNOWS {since: 2021}]->(c)").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (a:Person {name: 'Alice'})").await?;
+    tx.execute("CREATE (b:Person {name: 'Bob'})").await?;
+    tx.execute("CREATE (c:Person {name: 'Charlie'})").await?;
+    tx.execute("MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) CREATE (a)-[:KNOWS {since: 2020}]->(b)").await?;
+    tx.execute("MATCH (b:Person {name: 'Bob'}), (c:Person {name: 'Charlie'}) CREATE (b)-[:KNOWS {since: 2021}]->(c)").await?;
+    tx.commit().await?;
 
     // 1. Path variable in Variable Length Traversal
     // MATCH p = (a)-[:KNOWS*1..2]->(b) WHERE a.name = 'Alice' RETURN p
@@ -94,25 +90,19 @@ async fn test_multihop_chained_path_variable() -> Result<()> {
         .apply()
         .await?;
 
-    db.session()
-        .execute("CREATE (a:Person {name: 'Alice'})")
-        .await?;
-    db.session()
-        .execute("CREATE (b:Person {name: 'Bob'})")
-        .await?;
-    db.session()
-        .execute("CREATE (c:Person {name: 'Charlie'})")
-        .await?;
-    db.session()
-        .execute(
-            "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) CREATE (a)-[:KNOWS]->(b)",
-        )
-        .await?;
-    db.session()
-        .execute(
-            "MATCH (b:Person {name: 'Bob'}), (c:Person {name: 'Charlie'}) CREATE (b)-[:KNOWS]->(c)",
-        )
-        .await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (a:Person {name: 'Alice'})").await?;
+    tx.execute("CREATE (b:Person {name: 'Bob'})").await?;
+    tx.execute("CREATE (c:Person {name: 'Charlie'})").await?;
+    tx.execute(
+        "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) CREATE (a)-[:KNOWS]->(b)",
+    )
+    .await?;
+    tx.execute(
+        "MATCH (b:Person {name: 'Bob'}), (c:Person {name: 'Charlie'}) CREATE (b)-[:KNOWS]->(c)",
+    )
+    .await?;
+    tx.commit().await?;
 
     // Test chained multi-hop pattern with path variable
     // This pattern was previously blocked with "Named path variables not yet supported for multi-hop patterns"

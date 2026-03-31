@@ -75,6 +75,7 @@ impl<'a> InnerLocyBuilder<'a> {
         let engine = crate::api::impl_locy::LocyEngine {
             db: self.db,
             tx_l0_override: None,
+            locy_l0: None,
             collect_derive: true,
         };
         engine
@@ -233,6 +234,7 @@ impl<'a> TxLocyBuilder<'a> {
         let engine = crate::api::impl_locy::LocyEngine {
             db: &self.tx.db,
             tx_l0_override: Some(self.tx.tx_l0.clone()),
+            locy_l0: Some(self.tx.tx_l0.clone()),
             collect_derive: false,
         };
         engine

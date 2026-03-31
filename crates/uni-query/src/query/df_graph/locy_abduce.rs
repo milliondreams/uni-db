@@ -4,10 +4,10 @@
 //! Abductive reasoning (ABDUCE) via `LocyExecutionContext`.
 //!
 //! Ported from `uni-locy/src/orchestrator/abduce.rs`. Uses `LocyExecutionContext`
-//! for savepoints, mutations, and strata re-evaluation. Three-phase pipeline:
+//! for L0 fork/restore, mutations, and strata re-evaluation. Three-phase pipeline:
 //! Phase 1: Build derivation tree via EXPLAIN.
 //! Phase 2: Generate candidate modifications from tree leaves.
-//! Phase 3: Validate each candidate via ASSUME (savepoint + mutate + re-eval + rollback).
+//! Phase 3: Validate each candidate via ASSUME (fork L0 + mutate + re-eval + restore).
 
 use std::collections::HashMap;
 
@@ -293,7 +293,7 @@ fn extract_addition_candidates(rule: &CompiledRule) -> Vec<Modification> {
     candidates
 }
 
-/// Phase 3: Validate a single modification via ASSUME (savepoint lifecycle).
+/// Phase 3: Validate a single modification via ASSUME (fork L0 + mutate + re-eval + restore).
 #[expect(
     clippy::too_many_arguments,
     reason = "validation requires full program and execution context"
@@ -310,12 +310,11 @@ async fn validate_modification(
 ) -> Result<bool, LocyError> {
     let mutation_query = modification_to_cypher(modification);
 
-    // Begin savepoint
-    let savepoint_id = ctx
-        .begin_savepoint()
+    // Fork L0 for hypothetical reasoning
+    ctx.fork_l0()
         .await
         .map_err(|e| LocyError::SavepointFailed {
-            message: format!("ABDUCE savepoint begin failed: {}", e),
+            message: format!("ABDUCE fork L0 failed: {}", e),
         })?;
 
     // Execute the mutation
@@ -344,11 +343,11 @@ async fn validate_modification(
         facts
     };
 
-    // Rollback
-    ctx.rollback_savepoint(savepoint_id)
+    // Restore L0 (discard hypothetical mutations)
+    ctx.restore_l0()
         .await
         .map_err(|e| LocyError::SavepointFailed {
-            message: format!("ABDUCE savepoint rollback failed: {}", e),
+            message: format!("ABDUCE restore L0 failed: {}", e),
         })?;
 
     if negated {

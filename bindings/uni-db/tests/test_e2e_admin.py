@@ -22,7 +22,9 @@ def test_database_builder_temporary():
     (db.schema().label("Test").property("value", "int").done().apply())
 
     session = db.session()
-    session.execute("CREATE (t:Test {value: 42})")
+    tx = session.tx()
+    tx.execute("CREATE (t:Test {value: 42})")
+    tx.commit()
     results = session.query("MATCH (t:Test) RETURN t.value as value")
 
     assert len(results) == 1
@@ -37,7 +39,9 @@ def test_database_builder_in_memory():
     (db.schema().label("Test").property("value", "int").done().apply())
 
     session = db.session()
-    session.execute("CREATE (t:Test {value: 99})")
+    tx = session.tx()
+    tx.execute("CREATE (t:Test {value: 99})")
+    tx.commit()
     results = session.query("MATCH (t:Test) RETURN t.value as value")
 
     assert len(results) == 1
@@ -54,7 +58,9 @@ def test_database_builder_open_new_path(tmp_path):
     (db.schema().label("Node").property("value", "int").done().apply())
 
     session = db.session()
-    session.execute("CREATE (n:Node {value: 123})")
+    tx = session.tx()
+    tx.execute("CREATE (n:Node {value: 123})")
+    tx.commit()
     results = session.query("MATCH (n:Node) RETURN n.value as value")
 
     assert len(results) == 1
@@ -71,7 +77,9 @@ def test_database_builder_create_new_path(tmp_path):
     (db.schema().label("Item").property("name", "string").done().apply())
 
     session = db.session()
-    session.execute("CREATE (i:Item {name: 'TestItem'})")
+    tx = session.tx()
+    tx.execute("CREATE (i:Item {name: 'TestItem'})")
+    tx.commit()
     results = session.query("MATCH (i:Item) RETURN i.name as name")
 
     assert len(results) == 1
@@ -109,7 +117,9 @@ def test_database_builder_open_existing_succeeds(tmp_path):
     db = uni_db.UniBuilder.create(str(db_path)).build()
     (db.schema().label("Data").property("value", "int").done().apply())
     session = db.session()
-    session.execute("CREATE (d:Data {value: 456})")
+    tx = session.tx()
+    tx.execute("CREATE (d:Data {value: 456})")
+    tx.commit()
     db.flush()
     del session
     del db
@@ -133,7 +143,9 @@ def test_builder_with_cache_size():
     (db.schema().label("Cached").property("value", "int").done().apply())
 
     session = db.session()
-    session.execute("CREATE (c:Cached {value: 777})")
+    tx = session.tx()
+    tx.execute("CREATE (c:Cached {value: 777})")
+    tx.commit()
     results = session.query("MATCH (c:Cached) RETURN c.value as value")
 
     assert len(results) == 1
@@ -149,7 +161,9 @@ def test_builder_with_parallelism():
     (db.schema().label("Parallel").property("value", "int").done().apply())
 
     session = db.session()
-    session.execute("CREATE (p:Parallel {value: 888})")
+    tx = session.tx()
+    tx.execute("CREATE (p:Parallel {value: 888})")
+    tx.commit()
     results = session.query("MATCH (p:Parallel) RETURN p.value as value")
 
     assert len(results) == 1
@@ -169,7 +183,9 @@ def test_builder_with_multiple_configs():
     (db.schema().label("Multi").property("value", "int").done().apply())
 
     session = db.session()
-    session.execute("CREATE (m:Multi {value: 999})")
+    tx = session.tx()
+    tx.execute("CREATE (m:Multi {value: 999})")
+    tx.commit()
     results = session.query("MATCH (m:Multi) RETURN m.value as value")
 
     assert len(results) == 1
@@ -224,8 +240,10 @@ def test_profile_returns_results_and_stats():
     session = db.session()
 
     # Insert some data
-    session.execute("CREATE (p:Person {name: 'Alice', age: 30})")
-    session.execute("CREATE (p:Person {name: 'Bob', age: 25})")
+    tx = session.tx()
+    tx.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+    tx.execute("CREATE (p:Person {name: 'Bob', age: 25})")
+    tx.commit()
 
     # Profile a query
     results, profile = session.profile(
@@ -295,9 +313,11 @@ def test_profile_with_filters():
     session = db.session()
 
     # Insert data
-    session.execute("CREATE (p:Product {name: 'Widget', price: 19.99})")
-    session.execute("CREATE (p:Product {name: 'Gadget', price: 29.99})")
-    session.execute("CREATE (p:Product {name: 'Doohickey', price: 9.99})")
+    tx = session.tx()
+    tx.execute("CREATE (p:Product {name: 'Widget', price: 19.99})")
+    tx.execute("CREATE (p:Product {name: 'Gadget', price: 29.99})")
+    tx.execute("CREATE (p:Product {name: 'Doohickey', price: 9.99})")
+    tx.commit()
 
     # Profile with filter
     results, profile = session.profile(
@@ -349,7 +369,9 @@ def test_database_builder_chaining():
     (db.schema().label("Chain").property("value", "int").done().apply())
 
     session = db.session()
-    session.execute("CREATE (c:Chain {value: 111})")
+    tx = session.tx()
+    tx.execute("CREATE (c:Chain {value: 111})")
+    tx.commit()
     results = session.query("MATCH (c:Chain) RETURN c.value as value")
 
     assert len(results) == 1
@@ -364,7 +386,9 @@ def test_open_vs_create_vs_open_existing(tmp_path):
     db = uni_db.UniBuilder.open(str(db_path)).build()
     (db.schema().label("Test").property("value", "int").done().apply())
     session = db.session()
-    session.execute("CREATE (t:Test {value: 1})")
+    tx = session.tx()
+    tx.execute("CREATE (t:Test {value: 1})")
+    tx.commit()
     db.flush()
     del session
     del db

@@ -37,13 +37,16 @@ async fn having_executed(world: &mut UniWorld, step: &cucumber::gherkin::Step) {
         .expect("Failed to initialize database");
 
     if let Some(query) = step.docstring() {
-        world
-            .db()
-            .session()
-            .execute(query)
+        let session = world.db().session();
+        let tx = session
+            .tx()
             .await
-            .unwrap_or_else(|e| {
-                panic!("Setup query failed: {}", e);
-            });
+            .unwrap_or_else(|e| panic!("Failed to start transaction: {}", e));
+        tx.execute(query)
+            .await
+            .unwrap_or_else(|e| panic!("Setup query failed: {}", e));
+        tx.commit()
+            .await
+            .unwrap_or_else(|e| panic!("Failed to commit setup query: {}", e));
     }
 }

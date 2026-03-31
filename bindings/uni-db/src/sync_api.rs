@@ -409,6 +409,43 @@ impl Transaction {
         })
     }
 
+    /// Create a bulk writer builder for high-throughput data ingestion.
+    fn bulk_writer(slf: Py<Self>) -> TxBulkWriterBuilder {
+        TxBulkWriterBuilder {
+            tx: slf,
+            defer_vector_indexes: true,
+            defer_scalar_indexes: true,
+            batch_size: None,
+            async_indexes: false,
+            validate_constraints: None,
+            max_buffer_size_bytes: None,
+            on_progress: None,
+        }
+    }
+
+    /// Create a streaming appender for the given label.
+    fn appender(&self, label: &str) -> PyResult<crate::builders::StreamingAppender> {
+        let tx = self.check_active()?;
+        let builder = tx.appender(label);
+        let appender = builder
+            .build()
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
+        Ok(crate::builders::StreamingAppender {
+            inner: std::sync::Mutex::new(Some(appender)),
+        })
+    }
+
+    /// Create a configurable appender builder for the given label.
+    fn appender_builder(slf: Py<Self>, label: &str) -> TxAppenderBuilder {
+        TxAppenderBuilder {
+            tx: slf,
+            label: label.to_string(),
+            batch_size: None,
+            defer_vector_indexes: None,
+            max_buffer_size_bytes: None,
+        }
+    }
+
     fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
         slf
     }
@@ -427,6 +464,163 @@ impl Transaction {
             tx.rollback();
         }
         Ok(false) // don't suppress exceptions
+    }
+}
+
+// ============================================================================
+// Transaction Bulk Writer Builder
+// ============================================================================
+
+/// Builder for configuring bulk data loading within a transaction.
+#[pyclass(name = "TxBulkWriterBuilder")]
+pub struct TxBulkWriterBuilder {
+    tx: Py<Transaction>,
+    defer_vector_indexes: bool,
+    defer_scalar_indexes: bool,
+    batch_size: Option<usize>,
+    async_indexes: bool,
+    validate_constraints: Option<bool>,
+    max_buffer_size_bytes: Option<usize>,
+    on_progress: Option<Py<PyAny>>,
+}
+
+#[pymethods]
+impl TxBulkWriterBuilder {
+    fn defer_vector_indexes(mut slf: PyRefMut<'_, Self>, defer: bool) -> PyRefMut<'_, Self> {
+        slf.defer_vector_indexes = defer;
+        slf
+    }
+
+    fn defer_scalar_indexes(mut slf: PyRefMut<'_, Self>, defer: bool) -> PyRefMut<'_, Self> {
+        slf.defer_scalar_indexes = defer;
+        slf
+    }
+
+    fn batch_size(mut slf: PyRefMut<'_, Self>, size: usize) -> PyRefMut<'_, Self> {
+        slf.batch_size = Some(size);
+        slf
+    }
+
+    fn async_indexes(mut slf: PyRefMut<'_, Self>, async_: bool) -> PyRefMut<'_, Self> {
+        slf.async_indexes = async_;
+        slf
+    }
+
+    fn validate_constraints(mut slf: PyRefMut<'_, Self>, validate: bool) -> PyRefMut<'_, Self> {
+        slf.validate_constraints = Some(validate);
+        slf
+    }
+
+    fn max_buffer_size_bytes(mut slf: PyRefMut<'_, Self>, size: usize) -> PyRefMut<'_, Self> {
+        slf.max_buffer_size_bytes = Some(size);
+        slf
+    }
+
+    fn on_progress(mut slf: PyRefMut<'_, Self>, callback: Py<PyAny>) -> PyRefMut<'_, Self> {
+        slf.on_progress = Some(callback);
+        slf
+    }
+
+    fn build(&self, py: Python) -> PyResult<crate::builders::BulkWriter> {
+        let tx_ref = self.tx.borrow(py);
+        let tx = tx_ref.check_active()?;
+        let mut builder = tx.bulk_writer();
+        builder = builder
+            .defer_vector_indexes(self.defer_vector_indexes)
+            .defer_scalar_indexes(self.defer_scalar_indexes)
+            .async_indexes(self.async_indexes);
+        if let Some(bs) = self.batch_size {
+            builder = builder.batch_size(bs);
+        }
+        if let Some(vc) = self.validate_constraints {
+            builder = builder.validate_constraints(vc);
+        }
+        if let Some(mbs) = self.max_buffer_size_bytes {
+            builder = builder.max_buffer_size_bytes(mbs);
+        }
+        if let Some(ref callback) = self.on_progress {
+            struct PyProgressWrapper {
+                py_obj: Py<PyAny>,
+            }
+            unsafe impl Send for PyProgressWrapper {}
+
+            let wrapper = PyProgressWrapper {
+                py_obj: callback.clone_ref(py),
+            };
+            builder = builder.on_progress(move |progress: ::uni_db::api::bulk::BulkProgress| {
+                Python::attach(|py| {
+                    let py_progress = crate::types::BulkProgress {
+                        phase: format!("{:?}", progress.phase),
+                        rows_processed: progress.rows_processed,
+                        total_rows: progress.total_rows,
+                        current_label: progress.current_label.clone(),
+                        elapsed_secs: progress.elapsed.as_secs_f64(),
+                    };
+                    if let Ok(bound) = Py::new(py, py_progress) {
+                        let _ = wrapper.py_obj.call1(py, (bound,));
+                    }
+                });
+            });
+        }
+        let real_writer = builder
+            .build()
+            .map_err(crate::exceptions::anyhow_to_pyerr)?;
+        Ok(crate::builders::BulkWriter {
+            inner: std::sync::Mutex::new(Some(real_writer)),
+        })
+    }
+}
+
+// ============================================================================
+// Transaction Appender Builder
+// ============================================================================
+
+/// Builder for configuring a StreamingAppender within a transaction.
+#[pyclass(name = "TxAppenderBuilder")]
+pub struct TxAppenderBuilder {
+    tx: Py<Transaction>,
+    label: String,
+    batch_size: Option<usize>,
+    defer_vector_indexes: Option<bool>,
+    max_buffer_size_bytes: Option<usize>,
+}
+
+#[pymethods]
+impl TxAppenderBuilder {
+    fn batch_size(mut slf: PyRefMut<'_, Self>, size: usize) -> PyRefMut<'_, Self> {
+        slf.batch_size = Some(size);
+        slf
+    }
+
+    fn defer_vector_indexes(mut slf: PyRefMut<'_, Self>, defer: bool) -> PyRefMut<'_, Self> {
+        slf.defer_vector_indexes = Some(defer);
+        slf
+    }
+
+    fn max_buffer_size_bytes(mut slf: PyRefMut<'_, Self>, size: usize) -> PyRefMut<'_, Self> {
+        slf.max_buffer_size_bytes = Some(size);
+        slf
+    }
+
+    fn build(&self, py: Python) -> PyResult<crate::builders::StreamingAppender> {
+        let tx_ref = self.tx.borrow(py);
+        let tx = tx_ref.check_active()?;
+        let mut builder = tx.appender(&self.label);
+        if let Some(bs) = self.batch_size {
+            builder = builder.batch_size(bs);
+        }
+        if let Some(dvi) = self.defer_vector_indexes {
+            builder = builder.defer_vector_indexes(dvi);
+        }
+        if let Some(mbs) = self.max_buffer_size_bytes {
+            builder = builder.max_buffer_size_bytes(mbs);
+        }
+        let appender = builder
+            .build()
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
+        Ok(crate::builders::StreamingAppender {
+            inner: std::sync::Mutex::new(Some(appender)),
+        })
     }
 }
 

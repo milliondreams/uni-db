@@ -86,11 +86,9 @@ async fn test_100k_property_lookup() {
         let prep_time = prep_start.elapsed();
 
         let insert_start = Instant::now();
-        let vids = db
-            .session()
-            .bulk_insert_vertices("Person", props)
-            .await
-            .unwrap();
+        let tx = db.session().tx().await.unwrap();
+        let vids = tx.bulk_insert_vertices("Person", props).await.unwrap();
+        tx.commit().await.unwrap();
         let insert_time = insert_start.elapsed();
 
         all_vids.extend(vids);
@@ -140,10 +138,9 @@ async fn test_100k_property_lookup() {
         let edge_prep_time = edge_prep_start.elapsed();
 
         let edge_insert_start = Instant::now();
-        db.session()
-            .bulk_insert_edges("KNOWS", edges)
-            .await
-            .unwrap();
+        let tx = db.session().tx().await.unwrap();
+        tx.bulk_insert_edges("KNOWS", edges).await.unwrap();
+        tx.commit().await.unwrap();
         let edge_insert_time = edge_insert_start.elapsed();
 
         eprintln!(

@@ -271,9 +271,7 @@ class SchemaGenerator:
                         pass  # Index may already exist
                 elif prop.index_type == "fulltext":
                     try:
-                        db.schema().label(label).index(
-                            prop.name, "fulltext"
-                        ).apply()
+                        db.schema().label(label).index(prop.name, "fulltext").apply()
                     except Exception:
                         pass  # Index may already exist
 
@@ -329,16 +327,22 @@ class SchemaGenerator:
                 if prop.index_type == "vector":
                     metric = prop.metric or "l2"
                     try:
-                        await db.schema().label(label).index(
-                            prop.name, {"type": "vector", "metric": metric}
-                        ).apply()
+                        await (
+                            db.schema()
+                            .label(label)
+                            .index(prop.name, {"type": "vector", "metric": metric})
+                            .apply()
+                        )
                     except Exception:
                         pass  # Index may already exist
                 elif prop.index_type == "fulltext":
                     try:
-                        await db.schema().label(label).index(
-                            prop.name, "fulltext"
-                        ).apply()
+                        await (
+                            db.schema()
+                            .label(label)
+                            .index(prop.name, "fulltext")
+                            .apply()
+                        )
                     except Exception:
                         pass  # Index may already exist
 

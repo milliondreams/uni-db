@@ -1330,6 +1330,40 @@ impl AsyncTransaction {
         })
     }
 
+    /// Create a bulk writer builder for high-throughput data ingestion.
+    fn bulk_writer(&self) -> AsyncTxBulkWriterBuilder {
+        AsyncTxBulkWriterBuilder {
+            tx: self.inner.clone(),
+            defer_vector_indexes: true,
+            defer_scalar_indexes: true,
+            batch_size: None,
+            async_indexes: false,
+            validate_constraints: None,
+            max_buffer_size_bytes: None,
+            on_progress: None,
+        }
+    }
+
+    /// Create a streaming appender for the given label.
+    fn appender<'py>(&self, py: Python<'py>, label: String) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let guard = inner.lock().await;
+            let tx = guard.as_ref().ok_or_else(|| {
+                crate::exceptions::UniTransactionAlreadyCompletedError::new_err(
+                    "Transaction already completed",
+                )
+            })?;
+            let builder = tx.appender(&label);
+            let appender = builder
+                .build()
+                .map_err(crate::exceptions::uni_error_to_pyerr)?;
+            Ok(crate::builders::StreamingAppender {
+                inner: std::sync::Mutex::new(Some(appender)),
+            })
+        })
+    }
+
     /// Async context manager support.
     fn __aenter__<'py>(slf: Bound<'py, Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let obj: Py<PyAny> = slf.into_any().unbind();
@@ -1354,6 +1388,123 @@ impl AsyncTransaction {
                 tx.rollback();
             }
             Ok(false) // Don't suppress exceptions
+        })
+    }
+}
+
+// ============================================================================
+// AsyncTransaction Bulk Writer Builder
+// ============================================================================
+
+/// Builder for async bulk writer within a transaction.
+#[pyclass(name = "AsyncTxBulkWriterBuilder")]
+pub struct AsyncTxBulkWriterBuilder {
+    tx: Arc<tokio::sync::Mutex<Option<::uni_db::Transaction>>>,
+    defer_vector_indexes: bool,
+    defer_scalar_indexes: bool,
+    batch_size: Option<usize>,
+    async_indexes: bool,
+    validate_constraints: Option<bool>,
+    max_buffer_size_bytes: Option<usize>,
+    on_progress: Option<Py<PyAny>>,
+}
+
+#[pymethods]
+impl AsyncTxBulkWriterBuilder {
+    fn defer_vector_indexes(mut slf: PyRefMut<'_, Self>, defer: bool) -> PyRefMut<'_, Self> {
+        slf.defer_vector_indexes = defer;
+        slf
+    }
+
+    fn defer_scalar_indexes(mut slf: PyRefMut<'_, Self>, defer: bool) -> PyRefMut<'_, Self> {
+        slf.defer_scalar_indexes = defer;
+        slf
+    }
+
+    fn batch_size(mut slf: PyRefMut<'_, Self>, size: usize) -> PyRefMut<'_, Self> {
+        slf.batch_size = Some(size);
+        slf
+    }
+
+    fn async_indexes(mut slf: PyRefMut<'_, Self>, async_: bool) -> PyRefMut<'_, Self> {
+        slf.async_indexes = async_;
+        slf
+    }
+
+    fn validate_constraints(mut slf: PyRefMut<'_, Self>, validate: bool) -> PyRefMut<'_, Self> {
+        slf.validate_constraints = Some(validate);
+        slf
+    }
+
+    fn max_buffer_size_bytes(mut slf: PyRefMut<'_, Self>, size: usize) -> PyRefMut<'_, Self> {
+        slf.max_buffer_size_bytes = Some(size);
+        slf
+    }
+
+    fn on_progress(mut slf: PyRefMut<'_, Self>, callback: Py<PyAny>) -> PyRefMut<'_, Self> {
+        slf.on_progress = Some(callback);
+        slf
+    }
+
+    fn build<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let tx = self.tx.clone();
+        let defer_vector = self.defer_vector_indexes;
+        let defer_scalar = self.defer_scalar_indexes;
+        let batch_size = self.batch_size;
+        let async_indexes = self.async_indexes;
+        let validate_constraints = self.validate_constraints;
+        let max_buffer_size_bytes = self.max_buffer_size_bytes;
+        let on_progress = self.on_progress.as_ref().map(|cb| cb.clone_ref(py));
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let guard = tx.lock().await;
+            let tx_ref = guard.as_ref().ok_or_else(|| {
+                crate::exceptions::UniTransactionAlreadyCompletedError::new_err(
+                    "Transaction already completed",
+                )
+            })?;
+            let mut builder = tx_ref
+                .bulk_writer()
+                .defer_vector_indexes(defer_vector)
+                .defer_scalar_indexes(defer_scalar)
+                .async_indexes(async_indexes);
+            if let Some(bs) = batch_size {
+                builder = builder.batch_size(bs);
+            }
+            if let Some(vc) = validate_constraints {
+                builder = builder.validate_constraints(vc);
+            }
+            if let Some(mbs) = max_buffer_size_bytes {
+                builder = builder.max_buffer_size_bytes(mbs);
+            }
+            if let Some(callback) = on_progress {
+                struct PyProgressWrapper {
+                    py_obj: Py<PyAny>,
+                }
+                unsafe impl Send for PyProgressWrapper {}
+
+                let wrapper = PyProgressWrapper { py_obj: callback };
+                builder =
+                    builder.on_progress(move |progress: ::uni_db::api::bulk::BulkProgress| {
+                        Python::attach(|py| {
+                            let py_progress = crate::types::BulkProgress {
+                                phase: format!("{:?}", progress.phase),
+                                rows_processed: progress.rows_processed,
+                                total_rows: progress.total_rows,
+                                current_label: progress.current_label.clone(),
+                                elapsed_secs: progress.elapsed.as_secs_f64(),
+                            };
+                            if let Ok(bound) = Py::new(py, py_progress) {
+                                let _ = wrapper.py_obj.call1(py, (bound,));
+                            }
+                        });
+                    });
+            }
+            let real_writer = builder
+                .build()
+                .map_err(crate::exceptions::anyhow_to_pyerr)?;
+            Ok(AsyncBulkWriter {
+                inner: Arc::new(std::sync::Mutex::new(Some(real_writer))),
+            })
         })
     }
 }
@@ -1470,49 +1621,6 @@ impl AsyncSession {
         })
     }
 
-    /// Execute a mutation query, returning an AutoCommitResult.
-    #[pyo3(signature = (cypher, params=None))]
-    fn execute<'py>(
-        &self,
-        py: Python<'py>,
-        cypher: String,
-        params: Option<HashMap<String, Py<PyAny>>>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let rust_params = if let Some(p) = params {
-            let mut map = HashMap::new();
-            for (k, v) in p {
-                let val = convert::py_object_to_value(py, &v)?;
-                map.insert(k, val);
-            }
-            Some(map)
-        } else {
-            None
-        };
-        let inner = self.inner.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let guard = inner.lock().await;
-            let result = if let Some(params) = rust_params {
-                let mut builder = guard.execute_with(&cypher);
-                for (k, v) in params {
-                    builder = builder.param(&k, v);
-                }
-                builder
-                    .run()
-                    .await
-                    .map_err(crate::exceptions::uni_error_to_pyerr)?
-            } else {
-                guard
-                    .execute(&cypher)
-                    .await
-                    .map_err(crate::exceptions::uni_error_to_pyerr)?
-            };
-            Python::attach(|py| {
-                let py_result = convert::auto_commit_result_to_py(py, result)?;
-                Ok(py_result.into_pyobject(py)?.into_any().unbind())
-            })
-        })
-    }
-
     /// Create a new async transaction for multi-statement writes.
     #[pyo3(signature = (timeout=None))]
     fn tx<'py>(&self, py: Python<'py>, timeout: Option<f64>) -> PyResult<Bound<'py, PyAny>> {
@@ -1541,20 +1649,6 @@ impl AsyncSession {
             session: self.inner.clone(),
             timeout_secs: None,
             isolation_level: None,
-        }
-    }
-
-    /// Create an async bulk writer builder for high-throughput data ingestion.
-    fn bulk_writer(&self) -> AsyncBulkWriterBuilder {
-        AsyncBulkWriterBuilder {
-            session: self.inner.clone(),
-            defer_vector_indexes: true,
-            defer_scalar_indexes: true,
-            batch_size: None,
-            async_indexes: false,
-            validate_constraints: None,
-            max_buffer_size_bytes: None,
-            on_progress: None,
         }
     }
 
@@ -1774,58 +1868,6 @@ impl AsyncSession {
         })
     }
 
-    /// Insert vertices in bulk within this session (auto-committed).
-    fn bulk_insert_vertices<'py>(
-        &self,
-        py: Python<'py>,
-        label: String,
-        vertices: Vec<HashMap<String, Py<PyAny>>>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let mut props_list = Vec::with_capacity(vertices.len());
-        for v in vertices {
-            let mut map = HashMap::new();
-            for (k, val) in v {
-                map.insert(k, convert::py_object_to_value(py, &val)?);
-            }
-            props_list.push(map);
-        }
-        let inner = self.inner.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let guard = inner.lock().await;
-            let vids = guard
-                .bulk_insert_vertices(&label, props_list)
-                .await
-                .map_err(crate::exceptions::uni_error_to_pyerr)?;
-            Ok(vids.into_iter().map(|v| v.as_u64()).collect::<Vec<u64>>())
-        })
-    }
-
-    /// Insert edges in bulk within this session (auto-committed).
-    fn bulk_insert_edges<'py>(
-        &self,
-        py: Python<'py>,
-        edge_type: String,
-        edges: Vec<(u64, u64, HashMap<String, Py<PyAny>>)>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let mut edge_data = Vec::with_capacity(edges.len());
-        for (src, dst, props) in edges {
-            let mut map = HashMap::new();
-            for (k, v) in props {
-                map.insert(k, convert::py_object_to_value(py, &v)?);
-            }
-            edge_data.push((::uni_db::Vid::from(src), ::uni_db::Vid::from(dst), map));
-        }
-        let inner = self.inner.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let guard = inner.lock().await;
-            guard
-                .bulk_insert_edges(&edge_type, edge_data)
-                .await
-                .map_err(crate::exceptions::uni_error_to_pyerr)?;
-            Ok(())
-        })
-    }
-
     /// Cancel in-progress operations on this session.
     fn cancel<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
@@ -2017,38 +2059,6 @@ impl AsyncSession {
         })
     }
 
-    /// Create a streaming appender for the given label.
-    fn appender<'py>(&self, py: Python<'py>, label: String) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let guard = inner.lock().await;
-            let builder = guard.appender(&label);
-            let appender = builder
-                .build()
-                .map_err(crate::exceptions::uni_error_to_pyerr)?;
-            Ok(crate::builders::StreamingAppender {
-                inner: std::sync::Mutex::new(Some(appender)),
-            })
-        })
-    }
-
-    /// Create a configurable appender builder for the given label.
-    fn appender_builder<'py>(&self, py: Python<'py>, label: String) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let guard = inner.lock().await;
-            let builder = guard.appender(&label);
-            // Return a StreamingAppender with default config; advanced config
-            // should use sync appender_builder for now.
-            let appender = builder
-                .build()
-                .map_err(crate::exceptions::uni_error_to_pyerr)?;
-            Ok(crate::builders::StreamingAppender {
-                inner: std::sync::Mutex::new(Some(appender)),
-            })
-        })
-    }
-
     /// Watch for commit notifications (returns an async CommitStream).
     fn watch<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
@@ -2084,16 +2094,6 @@ impl AsyncSession {
             timeout_secs: None,
             max_memory: None,
             cancellation_token: None,
-        }
-    }
-
-    /// Create a mutation builder with parameter binding, timeout.
-    fn execute_with(&self, cypher: &str) -> AsyncAutoCommitBuilder {
-        AsyncAutoCommitBuilder {
-            inner: self.inner.clone(),
-            cypher: cypher.to_string(),
-            params: HashMap::new(),
-            timeout_secs: None,
         }
     }
 
@@ -2262,122 +2262,6 @@ impl AsyncTransactionBuilder {
 // ============================================================================
 // AsyncBulkWriter (wrapping real Rust BulkWriter)
 // ============================================================================
-
-/// Builder for async bulk writer.
-#[pyclass]
-pub struct AsyncBulkWriterBuilder {
-    session: Arc<tokio::sync::Mutex<::uni_db::Session>>,
-    defer_vector_indexes: bool,
-    defer_scalar_indexes: bool,
-    batch_size: Option<usize>,
-    async_indexes: bool,
-    validate_constraints: Option<bool>,
-    max_buffer_size_bytes: Option<usize>,
-    on_progress: Option<Py<PyAny>>,
-}
-
-#[pymethods]
-impl AsyncBulkWriterBuilder {
-    /// Defer vector index building until commit.
-    fn defer_vector_indexes(mut slf: PyRefMut<'_, Self>, defer: bool) -> PyRefMut<'_, Self> {
-        slf.defer_vector_indexes = defer;
-        slf
-    }
-
-    /// Defer scalar index building until commit.
-    fn defer_scalar_indexes(mut slf: PyRefMut<'_, Self>, defer: bool) -> PyRefMut<'_, Self> {
-        slf.defer_scalar_indexes = defer;
-        slf
-    }
-
-    /// Set batch size for flushing to storage.
-    fn batch_size(mut slf: PyRefMut<'_, Self>, size: usize) -> PyRefMut<'_, Self> {
-        slf.batch_size = Some(size);
-        slf
-    }
-
-    /// Build indexes asynchronously after commit.
-    fn async_indexes(mut slf: PyRefMut<'_, Self>, async_: bool) -> PyRefMut<'_, Self> {
-        slf.async_indexes = async_;
-        slf
-    }
-
-    /// Set whether to validate constraints during bulk load.
-    fn validate_constraints(mut slf: PyRefMut<'_, Self>, validate: bool) -> PyRefMut<'_, Self> {
-        slf.validate_constraints = Some(validate);
-        slf
-    }
-
-    /// Set maximum buffer size before triggering a checkpoint flush.
-    fn max_buffer_size_bytes(mut slf: PyRefMut<'_, Self>, size: usize) -> PyRefMut<'_, Self> {
-        slf.max_buffer_size_bytes = Some(size);
-        slf
-    }
-
-    /// Set a progress callback invoked during bulk loading.
-    fn on_progress(mut slf: PyRefMut<'_, Self>, callback: Py<PyAny>) -> PyRefMut<'_, Self> {
-        slf.on_progress = Some(callback);
-        slf
-    }
-
-    /// Build the AsyncBulkWriter.
-    fn build<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let session = self.session.clone();
-        let defer_vector = self.defer_vector_indexes;
-        let defer_scalar = self.defer_scalar_indexes;
-        let batch_size = self.batch_size;
-        let async_indexes = self.async_indexes;
-        let validate_constraints = self.validate_constraints;
-        let max_buffer_size_bytes = self.max_buffer_size_bytes;
-        let on_progress = self.on_progress.as_ref().map(|cb| cb.clone_ref(py));
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let guard = session.lock().await;
-            let mut builder = guard
-                .bulk_writer()
-                .defer_vector_indexes(defer_vector)
-                .defer_scalar_indexes(defer_scalar)
-                .async_indexes(async_indexes);
-            if let Some(bs) = batch_size {
-                builder = builder.batch_size(bs);
-            }
-            if let Some(vc) = validate_constraints {
-                builder = builder.validate_constraints(vc);
-            }
-            if let Some(mbs) = max_buffer_size_bytes {
-                builder = builder.max_buffer_size_bytes(mbs);
-            }
-            if let Some(callback) = on_progress {
-                struct PyProgressWrapper {
-                    py_obj: Py<PyAny>,
-                }
-                unsafe impl Send for PyProgressWrapper {}
-
-                let wrapper = PyProgressWrapper { py_obj: callback };
-                builder =
-                    builder.on_progress(move |progress: ::uni_db::api::bulk::BulkProgress| {
-                        Python::attach(|py| {
-                            let py_progress = crate::types::BulkProgress {
-                                phase: format!("{:?}", progress.phase),
-                                rows_processed: progress.rows_processed,
-                                total_rows: progress.total_rows,
-                                current_label: progress.current_label.clone(),
-                                elapsed_secs: progress.elapsed.as_secs_f64(),
-                            };
-                            if let Ok(bound) = Py::new(py, py_progress) {
-                                let _ = wrapper.py_obj.call1(py, (bound,));
-                            }
-                        });
-                    });
-            }
-            let real_writer = builder
-                .build()
-                .map_err(crate::exceptions::anyhow_to_pyerr)?;
-            Ok(AsyncBulkWriter {
-                inner: Arc::new(std::sync::Mutex::new(Some(real_writer))),
-            })
-        })
-    }
-}
 
 /// Async bulk writer for high-throughput data ingestion.
 ///
@@ -3050,69 +2934,6 @@ impl AsyncSessionQueryBuilder {
                 cursor: Arc::new(tokio::sync::Mutex::new(Some(cursor))),
                 buffer: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
                 columns,
-            })
-        })
-    }
-}
-
-/// Async builder for auto-commit mutations on a Session.
-#[pyclass(name = "AsyncAutoCommitBuilder")]
-pub struct AsyncAutoCommitBuilder {
-    inner: Arc<tokio::sync::Mutex<::uni_db::Session>>,
-    cypher: String,
-    params: HashMap<String, Py<PyAny>>,
-    timeout_secs: Option<f64>,
-}
-
-#[pymethods]
-impl AsyncAutoCommitBuilder {
-    /// Bind a parameter.
-    fn param(mut slf: PyRefMut<'_, Self>, name: String, value: Py<PyAny>) -> PyRefMut<'_, Self> {
-        slf.params.insert(name, value);
-        slf
-    }
-
-    /// Bind multiple parameters.
-    fn params(
-        mut slf: PyRefMut<'_, Self>,
-        params: HashMap<String, Py<PyAny>>,
-    ) -> PyRefMut<'_, Self> {
-        slf.params.extend(params);
-        slf
-    }
-
-    /// Set execution timeout in seconds.
-    fn timeout(mut slf: PyRefMut<'_, Self>, seconds: f64) -> PyRefMut<'_, Self> {
-        slf.timeout_secs = Some(seconds);
-        slf
-    }
-
-    /// Execute the mutation (returns awaitable AutoCommitResult).
-    fn run<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let mut rust_params = HashMap::new();
-        for (k, v) in &self.params {
-            let val = convert::py_object_to_value(py, v)?;
-            rust_params.insert(k.clone(), val);
-        }
-        let inner = self.inner.clone();
-        let cypher = self.cypher.clone();
-        let timeout_secs = self.timeout_secs;
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let guard = inner.lock().await;
-            let mut builder = guard.execute_with(&cypher);
-            for (k, v) in rust_params {
-                builder = builder.param(k, v);
-            }
-            if let Some(t) = timeout_secs {
-                builder = builder.timeout(std::time::Duration::from_secs_f64(t));
-            }
-            let result = builder
-                .run()
-                .await
-                .map_err(crate::exceptions::uni_error_to_pyerr)?;
-            Python::attach(|py| {
-                let py_result = convert::auto_commit_result_to_py(py, result)?;
-                Ok(py_result.into_pyobject(py)?.into_any().unbind())
             })
         })
     }

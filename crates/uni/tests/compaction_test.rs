@@ -41,13 +41,13 @@ async fn test_compaction_l1_to_l2() -> anyhow::Result<()> {
     // Insert A -> B
     let eid1 = writer.next_eid(1).await?;
     writer
-        .insert_edge(vid_a, vid_b, 1, eid1, HashMap::new(), None)
+        .insert_edge(vid_a, vid_b, 1, eid1, HashMap::new(), None, None)
         .await?;
 
     // Insert A -> C
     let eid2 = writer.next_eid(1).await?;
     writer
-        .insert_edge(vid_a, vid_c, 1, eid2, HashMap::new(), None)
+        .insert_edge(vid_a, vid_c, 1, eid2, HashMap::new(), None, None)
         .await?;
 
     // Flush to L1
@@ -84,12 +84,12 @@ async fn test_compaction_l1_to_l2() -> anyhow::Result<()> {
 
     // 6. Test Updates (Delete + Insert new)
     // Delete A -> B
-    writer.delete_edge(eid1, vid_a, vid_b, 1).await?;
+    writer.delete_edge(eid1, vid_a, vid_b, 1, None).await?;
 
     // Insert B -> C (different source, check multi-row)
     let eid3 = writer.next_eid(1).await?;
     writer
-        .insert_edge(vid_b, vid_c, 1, eid3, HashMap::new(), None)
+        .insert_edge(vid_b, vid_c, 1, eid3, HashMap::new(), None, None)
         .await?;
 
     writer.flush_to_l1(None).await?;
@@ -164,7 +164,7 @@ async fn test_compaction_vertices_crdt() -> anyhow::Result<()> {
         ("name".to_string(), Value::String("Version1".to_string())),
     ]);
     writer
-        .insert_vertex_with_labels(vid, props1, &["CounterNode".to_string()])
+        .insert_vertex_with_labels(vid, props1, &["CounterNode".to_string()], None)
         .await?;
     writer.flush_to_l1(None).await?;
 
@@ -180,7 +180,7 @@ async fn test_compaction_vertices_crdt() -> anyhow::Result<()> {
         ("name".to_string(), Value::String("Version2".to_string())),
     ]);
     writer
-        .insert_vertex_with_labels(vid, props2, &["CounterNode".to_string()])
+        .insert_vertex_with_labels(vid, props2, &["CounterNode".to_string()], None)
         .await?;
     writer.flush_to_l1(None).await?;
 

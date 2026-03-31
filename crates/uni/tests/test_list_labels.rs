@@ -16,7 +16,9 @@ async fn test_list_labels_lifecycle() -> anyhow::Result<()> {
     assert_eq!(labels.len(), 0);
 
     // Create a vertex with label X
-    db.session().execute("CREATE (:X)").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:X)").await?;
+    tx.commit().await?;
 
     // Debug: Check what the count query returns
     let count_result = db
@@ -43,7 +45,9 @@ async fn test_list_labels_lifecycle() -> anyhow::Result<()> {
     );
 
     // Delete all X vertices
-    db.session().execute("MATCH (n:X) DELETE n").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (n:X) DELETE n").await?;
+    tx.commit().await?;
     let labels = db.list_labels().await?;
     println!("After DELETE all X: {:?}", labels);
     assert!(

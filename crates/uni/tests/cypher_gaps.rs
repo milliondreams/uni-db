@@ -15,22 +15,15 @@ async fn test_relationship_disjunction() -> Result<()> {
         .apply()
         .await?;
 
-    db.session()
-        .execute("CREATE (a:Person {name: 'A'})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (a:Person {name: 'A'})").await?;
+    tx.execute("CREATE (b:Person {name: 'B'})").await?;
+    tx.execute("CREATE (c:Person {name: 'C'})").await?;
+    tx.execute("MATCH (a:Person {name: 'A'}), (b:Person {name: 'B'}) CREATE (a)-[:KNOWS]->(b)")
         .await?;
-    db.session()
-        .execute("CREATE (b:Person {name: 'B'})")
+    tx.execute("MATCH (a:Person {name: 'A'}), (c:Person {name: 'C'}) CREATE (a)-[:LIKES]->(c)")
         .await?;
-    db.session()
-        .execute("CREATE (c:Person {name: 'C'})")
-        .await?;
-
-    db.session()
-        .execute("MATCH (a:Person {name: 'A'}), (b:Person {name: 'B'}) CREATE (a)-[:KNOWS]->(b)")
-        .await?;
-    db.session()
-        .execute("MATCH (a:Person {name: 'A'}), (c:Person {name: 'C'}) CREATE (a)-[:LIKES]->(c)")
-        .await?;
+    tx.commit().await?;
 
     // Query with disjunction
     let result = db
@@ -60,28 +53,19 @@ async fn test_undirected_relationship_match() -> Result<()> {
         .apply()
         .await?;
 
-    db.session()
-        .execute("CREATE (a:Person {name: 'Alice'})")
-        .await?;
-    db.session()
-        .execute("CREATE (b:Person {name: 'Bob'})")
-        .await?;
-    db.session()
-        .execute("CREATE (c:Person {name: 'Charlie'})")
-        .await?;
-
-    // Alice -> Bob
-    db.session()
-        .execute(
-            "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) CREATE (a)-[:KNOWS]->(b)",
-        )
-        .await?;
-    // Bob -> Charlie
-    db.session()
-        .execute(
-            "MATCH (b:Person {name: 'Bob'}), (c:Person {name: 'Charlie'}) CREATE (b)-[:KNOWS]->(c)",
-        )
-        .await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (a:Person {name: 'Alice'})").await?;
+    tx.execute("CREATE (b:Person {name: 'Bob'})").await?;
+    tx.execute("CREATE (c:Person {name: 'Charlie'})").await?;
+    tx.execute(
+        "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) CREATE (a)-[:KNOWS]->(b)",
+    )
+    .await?;
+    tx.execute(
+        "MATCH (b:Person {name: 'Bob'}), (c:Person {name: 'Charlie'}) CREATE (b)-[:KNOWS]->(c)",
+    )
+    .await?;
+    tx.commit().await?;
 
     // Undirected match from Bob: should find both Alice (incoming) and Charlie (outgoing)
     let result = db
@@ -141,9 +125,9 @@ async fn test_yield_aliasing() -> Result<()> {
 async fn test_call_composition() -> Result<()> {
     let db = Uni::in_memory().build().await?;
     db.schema().label("Person").apply().await?;
-    db.session()
-        .execute("CREATE (:Person {name: 'Alice'})")
-        .await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Person {name: 'Alice'})").await?;
+    tx.commit().await?;
 
     // CALL ... YIELD ... MATCH ...
     // Note: MATCH (n) WHERE n:Person is not yet fully supported for label inference in Scan.

@@ -25,11 +25,15 @@ async fn test_granular_compaction_public_api() -> anyhow::Result<()> {
 
     // 2. Write Data (Fragments)
     // Fragment 1
-    db.session().execute("CREATE (:Node {name: 'A'})").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Node {name: 'A'})").await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // Fragment 2
-    db.session().execute("CREATE (:Node {name: 'B'})").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Node {name: 'B'})").await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // 4. Compact Label (Granular)
@@ -42,15 +46,17 @@ async fn test_granular_compaction_public_api() -> anyhow::Result<()> {
 
     // 5. Test Edge Compaction
     // Fragment 1
-    db.session()
-        .execute("MATCH (a:Node {name: 'A'}), (b:Node {name: 'B'}) CREATE (a)-[:REL]->(b)")
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (a:Node {name: 'A'}), (b:Node {name: 'B'}) CREATE (a)-[:REL]->(b)")
         .await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // Fragment 2
-    db.session()
-        .execute("MATCH (a:Node {name: 'A'}), (b:Node {name: 'B'}) CREATE (b)-[:REL]->(a)")
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (a:Node {name: 'A'}), (b:Node {name: 'B'}) CREATE (b)-[:REL]->(a)")
         .await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // Compact Edge Type

@@ -6,9 +6,10 @@ async fn test_basic_vlp_works() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
     // Create chain: A -> B -> C
-    db.session()
-        .execute("CREATE (a:A)-[:REL]->(b:B)-[:REL]->(c:C)")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (a:A)-[:REL]->(b:B)-[:REL]->(c:C)")
         .await?;
+    tx.commit().await?;
 
     // Test 1: Regular VLP (non-pattern-predicate)
     let results = db

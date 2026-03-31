@@ -3,9 +3,7 @@
 
 use crate::api::Uni;
 use crate::api::locy_builder::{LocyBuilder, TxLocyBuilder};
-use crate::api::session::{
-    AutoCommitBuilder, AutoCommitResult, ProfileBuilder, QueryBuilder, Session, TransactionBuilder,
-};
+use crate::api::session::{ProfileBuilder, QueryBuilder, Session, TransactionBuilder};
 use crate::api::transaction::{
     ApplyBuilder, ApplyResult, CommitResult, Transaction, TxQueryBuilder,
 };
@@ -126,21 +124,6 @@ impl<'a> SessionSync<'a> {
         self.rt.block_on(self.session.query_cursor(cypher))
     }
 
-    // ── Cypher Writes ─────────────────────────────────────────────────
-
-    /// Execute a Cypher mutation (CREATE, SET, DELETE, etc.).
-    pub fn execute(&self, cypher: &str) -> Result<AutoCommitResult> {
-        self.rt.block_on(self.session.execute(cypher))
-    }
-
-    /// Execute a Cypher mutation with a builder for parameters.
-    pub fn execute_with<'s>(&'s self, cypher: &str) -> AutoCommitBuilderSync<'s, 'a> {
-        AutoCommitBuilderSync {
-            inner: self.session.execute_with(cypher),
-            rt: self.rt,
-        }
-    }
-
     // ── Planning & Introspection ──────────────────────────────────────
 
     /// Explain a Cypher query plan without executing it.
@@ -217,16 +200,6 @@ impl<'a> SessionSync<'a> {
             inner: self.session.tx_with(),
             rt: self.rt,
         }
-    }
-
-    /// Create a bulk writer for efficient data loading.
-    pub fn bulk_writer(&self) -> crate::api::bulk::BulkWriterBuilder {
-        self.session.bulk_writer()
-    }
-
-    /// Create a streaming appender for row-by-row data loading.
-    pub fn appender(&self, label: &str) -> crate::api::appender::AppenderBuilder<'_> {
-        self.session.appender(label)
     }
 
     // ── Commit Notifications ─────────────────────────────────────────
@@ -364,39 +337,6 @@ impl<'s, 'a> QueryBuilderSync<'s, 'a> {
     /// Execute the query and return the first row, or `None` if empty.
     pub fn fetch_one(self) -> Result<Option<Row>> {
         self.rt.block_on(self.inner.fetch_one())
-    }
-}
-
-// ── AutoCommitBuilderSync ───────────────────────────────────────────────
-
-/// Blocking wrapper around [`AutoCommitBuilder`].
-pub struct AutoCommitBuilderSync<'s, 'a> {
-    inner: AutoCommitBuilder<'s>,
-    rt: &'a tokio::runtime::Runtime,
-}
-
-impl<'s, 'a> AutoCommitBuilderSync<'s, 'a> {
-    /// Bind a parameter to the mutation.
-    pub fn param<K: Into<String>, V: Into<Value>>(mut self, key: K, value: V) -> Self {
-        self.inner = self.inner.param(key, value);
-        self
-    }
-
-    /// Bind multiple parameters from an iterator.
-    pub fn params<'p>(mut self, params: impl IntoIterator<Item = (&'p str, Value)>) -> Self {
-        self.inner = self.inner.params(params);
-        self
-    }
-
-    /// Set maximum execution time for this mutation.
-    pub fn timeout(mut self, duration: std::time::Duration) -> Self {
-        self.inner = self.inner.timeout(duration);
-        self
-    }
-
-    /// Execute the mutation and return the result with database version.
-    pub fn run(self) -> Result<AutoCommitResult> {
-        self.rt.block_on(self.inner.run())
     }
 }
 
@@ -546,6 +486,40 @@ impl<'a> TransactionSync<'a> {
 
     pub fn rollback(self) {
         self.tx.rollback()
+    }
+
+    /// Create a bulk writer builder for efficient data loading.
+    pub fn bulk_writer(&self) -> crate::api::bulk::BulkWriterBuilder {
+        self.tx.bulk_writer()
+    }
+
+    /// Create a streaming appender for row-by-row data loading.
+    pub fn appender(&self, label: &str) -> crate::api::appender::AppenderBuilder {
+        self.tx.appender(label)
+    }
+
+    /// Bulk insert vertices within this transaction.
+    pub fn bulk_insert_vertices(
+        &self,
+        label: &str,
+        properties_list: Vec<uni_common::Properties>,
+    ) -> Result<Vec<uni_common::core::id::Vid>> {
+        self.rt
+            .block_on(self.tx.bulk_insert_vertices(label, properties_list))
+    }
+
+    /// Bulk insert edges within this transaction.
+    pub fn bulk_insert_edges(
+        &self,
+        edge_type: &str,
+        edges: Vec<(
+            uni_common::core::id::Vid,
+            uni_common::core::id::Vid,
+            uni_common::Properties,
+        )>,
+    ) -> Result<()> {
+        self.rt
+            .block_on(self.tx.bulk_insert_edges(edge_type, edges))
     }
 
     /// Check if the transaction has uncommitted changes.

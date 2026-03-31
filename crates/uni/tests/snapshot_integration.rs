@@ -46,17 +46,17 @@ async fn test_snapshot_creation_on_flush() -> anyhow::Result<()> {
     let mut p1 = HashMap::new();
     p1.insert("name".to_string(), serde_json::json!("Alice").into());
     writer
-        .insert_vertex_with_labels(vid_a, p1, &["Person".to_string()])
+        .insert_vertex_with_labels(vid_a, p1, &["Person".to_string()], None)
         .await?;
 
     let mut p2 = HashMap::new();
     p2.insert("name".to_string(), serde_json::json!("Bob").into());
     writer
-        .insert_vertex_with_labels(vid_b, p2, &["Person".to_string()])
+        .insert_vertex_with_labels(vid_b, p2, &["Person".to_string()], None)
         .await?;
 
     writer
-        .insert_edge(vid_a, vid_b, knows_type, eid, HashMap::new(), None)
+        .insert_edge(vid_a, vid_b, knows_type, eid, HashMap::new(), None, None)
         .await?;
 
     // 4. Flush
@@ -91,10 +91,10 @@ async fn test_snapshot_creation_on_flush() -> anyhow::Result<()> {
     let mut p3 = HashMap::new();
     p3.insert("name".to_string(), serde_json::json!("Charlie").into());
     writer
-        .insert_vertex_with_labels(vid_c, p3, &["Person".to_string()])
+        .insert_vertex_with_labels(vid_c, p3, &["Person".to_string()], None)
         .await?;
     writer
-        .insert_edge(vid_b, vid_c, knows_type, eid2, HashMap::new(), None)
+        .insert_edge(vid_b, vid_c, knows_type, eid2, HashMap::new(), None, None)
         .await?;
 
     // 7. Flush Again

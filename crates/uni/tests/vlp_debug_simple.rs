@@ -6,7 +6,9 @@ async fn test_vlp_simple() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
     // Create simple chain: A -> B
-    db.session().execute("CREATE (a:A)-[:REL]->(b:B)").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (a:A)-[:REL]->(b:B)").await?;
+    tx.commit().await?;
 
     // First verify we have 2 nodes
     let all_nodes = db.session().query("MATCH (n) RETURN n").await?;

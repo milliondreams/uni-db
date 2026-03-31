@@ -99,17 +99,19 @@ mod test_helpers {
     pub async fn setup_social_graph(db: &Uni) -> Result<()> {
         // Create persons and relationships using combined CREATE statements
         // Alice -> Bob -> Charlie, Alice -> Diana
-        db.session()
-            .execute(
-                "CREATE (alice:Person {name: 'Alice', age: 30})
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute(
+            "CREATE (alice:Person {name: 'Alice', age: 30})
              CREATE (bob:Person {name: 'Bob', age: 25})
              CREATE (charlie:Person {name: 'Charlie', age: 35})
              CREATE (diana:Person {name: 'Diana', age: 28})
              CREATE (alice)-[:KNOWS {since: 2020}]->(bob)
              CREATE (bob)-[:KNOWS {since: 2021}]->(charlie)
              CREATE (alice)-[:KNOWS {since: 2019}]->(diana)",
-            )
-            .await?;
+        )
+        .await?;
+        tx.commit().await?;
 
         db.flush().await?;
         Ok(())
@@ -130,18 +132,16 @@ mod data_type_tests {
         setup_all_types_schema(&db).await?;
 
         // Test various string values
-        db.session()
-            .execute("CREATE (:AllTypesNode {str_val: 'hello world'})")
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (:AllTypesNode {str_val: 'hello world'})")
             .await?;
-        db.session()
-            .execute("CREATE (:AllTypesNode {str_val: ''})")
-            .await?; // Empty string
-        db.session()
-            .execute("CREATE (:AllTypesNode {str_val: 'special chars: !@#$%^&*()'})")
+        tx.execute("CREATE (:AllTypesNode {str_val: ''})").await?; // Empty string
+        tx.execute("CREATE (:AllTypesNode {str_val: 'special chars: !@#$%^&*()'})")
             .await?;
-        db.session()
-            .execute("CREATE (:AllTypesNode {str_val: 'unicode: 你好世界 🎉'})")
+        tx.execute("CREATE (:AllTypesNode {str_val: 'unicode: 你好世界 🎉'})")
             .await?;
+        tx.commit().await?;
 
         db.flush().await?;
 
@@ -164,26 +164,19 @@ mod data_type_tests {
         setup_all_types_schema(&db).await?;
 
         // Test Int32 (note: negative literals not supported by parser)
-        db.session()
-            .execute("CREATE (:AllTypesNode {int32_val: 42})")
-            .await?;
-        db.session()
-            .execute("CREATE (:AllTypesNode {int32_val: 0})")
-            .await?;
-        db.session()
-            .execute("CREATE (:AllTypesNode {int32_val: 2147483647})")
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (:AllTypesNode {int32_val: 42})").await?;
+        tx.execute("CREATE (:AllTypesNode {int32_val: 0})").await?;
+        tx.execute("CREATE (:AllTypesNode {int32_val: 2147483647})")
             .await?; // Max Int32
-
         // Test Int64
-        db.session()
-            .execute("CREATE (:AllTypesNode {int64_val: 0})")
+        tx.execute("CREATE (:AllTypesNode {int64_val: 0})").await?;
+        tx.execute("CREATE (:AllTypesNode {int64_val: 100})")
             .await?;
-        db.session()
-            .execute("CREATE (:AllTypesNode {int64_val: 100})")
-            .await?;
-        db.session()
-            .execute("CREATE (:AllTypesNode {int64_val: 9223372036854775807})")
+        tx.execute("CREATE (:AllTypesNode {int64_val: 9223372036854775807})")
             .await?; // Max Int64
+        tx.commit().await?;
 
         db.flush().await?;
 
@@ -216,18 +209,17 @@ mod data_type_tests {
         setup_all_types_schema(&db).await?;
 
         // Test Float32 and Float64 (note: negative literals not supported by parser)
-        db.session()
-            .execute("CREATE (:AllTypesNode {float32_val: 3.5})")
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (:AllTypesNode {float32_val: 3.5})")
             .await?;
-        db.session()
-            .execute("CREATE (:AllTypesNode {float64_val: 2.718281828459045})")
+        tx.execute("CREATE (:AllTypesNode {float64_val: 2.718281828459045})")
             .await?;
-        db.session()
-            .execute("CREATE (:AllTypesNode {float64_val: 0.0})")
+        tx.execute("CREATE (:AllTypesNode {float64_val: 0.0})")
             .await?;
-        db.session()
-            .execute("CREATE (:AllTypesNode {float64_val: 1.5})")
+        tx.execute("CREATE (:AllTypesNode {float64_val: 1.5})")
             .await?;
+        tx.commit().await?;
 
         db.flush().await?;
 
@@ -247,12 +239,13 @@ mod data_type_tests {
         let db = create_test_db().await?;
         setup_all_types_schema(&db).await?;
 
-        db.session()
-            .execute("CREATE (:AllTypesNode {bool_val: true})")
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (:AllTypesNode {bool_val: true})")
             .await?;
-        db.session()
-            .execute("CREATE (:AllTypesNode {bool_val: false})")
+        tx.execute("CREATE (:AllTypesNode {bool_val: false})")
             .await?;
+        tx.commit().await?;
 
         db.flush().await?;
 
@@ -281,8 +274,11 @@ mod data_type_tests {
         setup_all_types_schema(&db).await?;
 
         // Use TemporalNode which has non-nullable date_val
-        db.session().execute("CREATE (:TemporalNode {date_val: date('2024-01-15'), datetime_val: datetime('2024-01-15T00:00:00Z')})").await?;
-        db.session().execute("CREATE (:TemporalNode {date_val: date('2023-12-31'), datetime_val: datetime('2023-12-31T00:00:00Z')})").await?;
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (:TemporalNode {date_val: date('2024-01-15'), datetime_val: datetime('2024-01-15T00:00:00Z')})").await?;
+        tx.execute("CREATE (:TemporalNode {date_val: date('2023-12-31'), datetime_val: datetime('2023-12-31T00:00:00Z')})").await?;
+        tx.commit().await?;
 
         db.flush().await?;
 
@@ -301,8 +297,11 @@ mod data_type_tests {
         setup_all_types_schema(&db).await?;
 
         // Use TemporalNode which has non-nullable datetime_val
-        db.session().execute("CREATE (:TemporalNode {date_val: date('2024-01-15'), datetime_val: datetime('2024-01-15T10:30:00Z')})").await?;
-        db.session().execute("CREATE (:TemporalNode {date_val: date('2024-06-01'), datetime_val: datetime('2024-06-01T23:59:59Z')})").await?;
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (:TemporalNode {date_val: date('2024-01-15'), datetime_val: datetime('2024-01-15T10:30:00Z')})").await?;
+        tx.execute("CREATE (:TemporalNode {date_val: date('2024-06-01'), datetime_val: datetime('2024-06-01T23:59:59Z')})").await?;
+        tx.commit().await?;
 
         db.flush().await?;
 
@@ -324,19 +323,22 @@ mod data_type_tests {
 
         // Create nodes with DateTimes representing the same UTC instant but different offsets
         // 2024-01-01T01:00+01:00 = 2024-01-01T00:00+00:00 (same UTC instant)
-        db.session().execute(
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute(
             "CREATE (:TemporalNode {date_val: date('2024-01-01'), datetime_val: datetime('2024-01-01T01:00+01:00')})",
         )
         .await?;
-        db.session().execute(
+        tx.execute(
             "CREATE (:TemporalNode {date_val: date('2024-01-01'), datetime_val: datetime('2024-01-01T00:00+00:00')})",
         )
         .await?;
         // Different UTC instant for comparison
-        db.session().execute(
+        tx.execute(
             "CREATE (:TemporalNode {date_val: date('2024-01-01'), datetime_val: datetime('2024-01-01T02:00+00:00')})",
         )
         .await?;
+        tx.commit().await?;
 
         db.flush().await?;
 
@@ -389,9 +391,11 @@ mod data_type_tests {
         setup_all_types_schema(&db).await?;
 
         // Note: JSON literals in Cypher are typically represented as maps
-        db.session()
-            .execute("CREATE (:AllTypesNode {json_val: '{\"key\": \"value\", \"number\": 42}'})")
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (:AllTypesNode {json_val: '{\"key\": \"value\", \"number\": 42}'})")
             .await?;
+        tx.commit().await?;
 
         db.flush().await?;
 
@@ -410,12 +414,13 @@ mod data_type_tests {
         setup_all_types_schema(&db).await?;
 
         // Create nodes with and without nullable property
-        db.session()
-            .execute("CREATE (:AllTypesNode {str_val: 'has nullable', nullable_str: 'present'})")
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (:AllTypesNode {str_val: 'has nullable', nullable_str: 'present'})")
             .await?;
-        db.session()
-            .execute("CREATE (:AllTypesNode {str_val: 'no nullable'})")
+        tx.execute("CREATE (:AllTypesNode {str_val: 'no nullable'})")
             .await?;
+        tx.commit().await?;
 
         db.flush().await?;
 
@@ -445,18 +450,21 @@ mod data_type_tests {
         let db = create_test_db().await?;
         setup_all_types_schema(&db).await?;
 
-        db.session().execute(
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute(
             "CREATE (:Document {title: 'Doc1', content: 'Test', embedding: [1.0, 0.0, 0.0, 0.0]})",
         )
         .await?;
-        db.session().execute(
+        tx.execute(
             "CREATE (:Document {title: 'Doc2', content: 'Test', embedding: [0.0, 1.0, 0.0, 0.0]})",
         )
         .await?;
-        db.session().execute(
+        tx.execute(
             "CREATE (:Document {title: 'Doc3', content: 'Test', embedding: [0.0, 0.0, 1.0, 0.0]})",
         )
         .await?;
+        tx.commit().await?;
 
         db.flush().await?;
 
@@ -480,15 +488,15 @@ mod data_type_tests {
             .await?;
 
         // Create nodes with time values
-        db.session()
-            .execute("CREATE (:TimeNode {time_val: time('10:30:45')})")
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (:TimeNode {time_val: time('10:30:45')})")
             .await?;
-        db.session()
-            .execute("CREATE (:TimeNode {time_val: time('23:59:59')})")
+        tx.execute("CREATE (:TimeNode {time_val: time('23:59:59')})")
             .await?;
-        db.session()
-            .execute("CREATE (:TimeNode {time_val: time('00:00:00')})")
+        tx.execute("CREATE (:TimeNode {time_val: time('00:00:00')})")
             .await?;
+        tx.commit().await?;
 
         db.flush().await?;
 
@@ -520,15 +528,15 @@ mod data_type_tests {
             .await?;
 
         // Create nodes with duration values (stored as microseconds)
-        db.session()
-            .execute("CREATE (:DurationNode {duration_val: duration('PT1H30M')})")
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (:DurationNode {duration_val: duration('PT1H30M')})")
             .await?; // 1h30m
-        db.session()
-            .execute("CREATE (:DurationNode {duration_val: duration('P1D')})")
+        tx.execute("CREATE (:DurationNode {duration_val: duration('P1D')})")
             .await?; // 1 day
-        db.session()
-            .execute("CREATE (:DurationNode {duration_val: duration('PT90S')})")
+        tx.execute("CREATE (:DurationNode {duration_val: duration('PT90S')})")
             .await?; // 90 seconds
+        tx.commit().await?;
 
         db.flush().await?;
 
@@ -560,12 +568,13 @@ mod data_type_tests {
             .await?;
 
         // Timestamp is functionally same as DateTime
-        db.session()
-            .execute("CREATE (:TimestampNode {ts_val: datetime('2024-06-15T14:30:00Z')})")
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (:TimestampNode {ts_val: datetime('2024-06-15T14:30:00Z')})")
             .await?;
-        db.session()
-            .execute("CREATE (:TimestampNode {ts_val: datetime('2024-01-01T00:00:00Z')})")
+        tx.execute("CREATE (:TimestampNode {ts_val: datetime('2024-01-01T00:00:00Z')})")
             .await?;
+        tx.commit().await?;
 
         db.flush().await?;
 
@@ -592,12 +601,13 @@ mod data_type_tests {
             .apply()
             .await?;
 
-        db.session()
-            .execute("CREATE (:ListNode {tags: ['rust', 'database', 'graph']})")
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (:ListNode {tags: ['rust', 'database', 'graph']})")
             .await?;
-        db.session()
-            .execute("CREATE (:ListNode {tags: ['python', 'ai']})")
+        tx.execute("CREATE (:ListNode {tags: ['python', 'ai']})")
             .await?;
+        tx.commit().await?;
 
         db.flush().await?;
 
@@ -627,12 +637,13 @@ mod data_type_tests {
             .apply()
             .await?;
 
-        db.session()
-            .execute("CREATE (:IntListNode {numbers: [1, 2, 3, 4, 5]})")
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (:IntListNode {numbers: [1, 2, 3, 4, 5]})")
             .await?;
-        db.session()
-            .execute("CREATE (:IntListNode {numbers: [10, 20]})")
+        tx.execute("CREATE (:IntListNode {numbers: [10, 20]})")
             .await?;
+        tx.commit().await?;
 
         db.flush().await?;
 
@@ -664,9 +675,11 @@ mod data_type_tests {
             .apply()
             .await?;
 
-        db.session()
-            .execute("CREATE (:MapNode {metadata: {key1: 'value1', key2: 'value2'}})")
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (:MapNode {metadata: {key1: 'value1', key2: 'value2'}})")
             .await?;
+        tx.commit().await?;
 
         db.flush().await?;
 
@@ -731,11 +744,13 @@ mod crdt_type_tests {
             .await?;
 
         // GCounter JSON format: {"t": "gc", "d": {"counts": {"actor": n}}}
-        db.session()
-            .execute(
-                r#"CREATE (:CounterNode {counter: '{"t": "gc", "d": {"counts": {"actor1": 5}}}'})"#,
-            )
-            .await?;
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute(
+            r#"CREATE (:CounterNode {counter: '{"t": "gc", "d": {"counts": {"actor1": 5}}}'})"#,
+        )
+        .await?;
+        tx.commit().await?;
 
         db.flush().await?;
 
@@ -762,11 +777,13 @@ mod crdt_type_tests {
             .await?;
 
         // GSet JSON format: {"t": "gs", "d": {"elements": [...]}}
-        db.session()
-            .execute(
-                r#"CREATE (:SetNode {items: '{"t": "gs", "d": {"elements": ["a", "b", "c"]}}'})"#,
-            )
-            .await?;
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute(
+            r#"CREATE (:SetNode {items: '{"t": "gs", "d": {"elements": ["a", "b", "c"]}}'})"#,
+        )
+        .await?;
+        tx.commit().await?;
 
         db.flush().await?;
 
@@ -793,7 +810,10 @@ mod crdt_type_tests {
             .await?;
 
         // ORSet JSON format: {"t": "os", "d": {"elements": {...}, "tombstones": [...]}}
-        db.session().execute(r#"CREATE (:ORSetNode {items: '{"t": "os", "d": {"elements": {}, "tombstones": []}}'})"#).await?;
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute(r#"CREATE (:ORSetNode {items: '{"t": "os", "d": {"elements": {}, "tombstones": []}}'})"#).await?;
+        tx.commit().await?;
 
         db.flush().await?;
 
@@ -820,7 +840,10 @@ mod crdt_type_tests {
             .await?;
 
         // LWWRegister JSON format: {"t": "lr", "d": {"value": v, "timestamp": n}}
-        db.session().execute(r#"CREATE (:RegisterNode {value: '{"t": "lr", "d": {"value": "hello", "timestamp": 1000}}'})"#).await?;
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute(r#"CREATE (:RegisterNode {value: '{"t": "lr", "d": {"value": "hello", "timestamp": 1000}}'})"#).await?;
+        tx.commit().await?;
 
         db.flush().await?;
 
@@ -847,9 +870,11 @@ mod crdt_type_tests {
             .await?;
 
         // LWWMap JSON format: {"t": "lm", "d": {"map": {...}}}
-        db.session()
-            .execute(r#"CREATE (:LWWMapNode {data: '{"t": "lm", "d": {"map": {}}}'})"#)
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute(r#"CREATE (:LWWMapNode {data: '{"t": "lm", "d": {"map": {}}}'})"#)
             .await?;
+        tx.commit().await?;
 
         db.flush().await?;
 
@@ -876,9 +901,11 @@ mod crdt_type_tests {
             .await?;
 
         // RGA JSON format: {"t": "rg", "d": {"nodes": {...}}}
-        db.session()
-            .execute(r#"CREATE (:RgaNode {sequence: '{"t": "rg", "d": {"nodes": {}}}'})"#)
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute(r#"CREATE (:RgaNode {sequence: '{"t": "rg", "d": {"nodes": {}}}'})"#)
             .await?;
+        tx.commit().await?;
 
         db.flush().await?;
 
@@ -905,10 +932,13 @@ mod crdt_type_tests {
             .await?;
 
         // VectorClock JSON format: {"t": "vc", "d": {"clocks": {...}}}
-        db.session().execute(
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute(
             r#"CREATE (:VCNode {clock: '{"t": "vc", "d": {"clocks": {"node1": 1, "node2": 2}}}'})"#,
         )
         .await?;
+        tx.commit().await?;
 
         db.flush().await?;
 
@@ -935,7 +965,10 @@ mod crdt_type_tests {
             .await?;
 
         // VCRegister JSON format: {"t": "vr", "d": {"value": v, "clock": {...}}}
-        db.session().execute(r#"CREATE (:VCRegNode {value: '{"t": "vr", "d": {"value": "test", "clock": {"clocks": {"node1": 1}}}}'})"#).await?;
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute(r#"CREATE (:VCRegNode {value: '{"t": "vr", "d": {"value": "test", "clock": {"clocks": {"node1": 1}}}}'})"#).await?;
+        tx.commit().await?;
 
         db.flush().await?;
 
@@ -967,12 +1000,13 @@ mod clause_tests {
         let db = create_test_db().await?;
         setup_all_types_schema(&db).await?;
 
-        db.session()
-            .execute("CREATE (:Person {name: 'Alice', age: 30})")
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (:Person {name: 'Alice', age: 30})")
             .await?;
-        db.session()
-            .execute("CREATE (:Person {name: 'Bob', age: 25})")
+        tx.execute("CREATE (:Person {name: 'Bob', age: 25})")
             .await?;
+        tx.commit().await?;
         db.flush().await?;
 
         let result = db.session().query("MATCH (n:Person) RETURN n.name").await?;
@@ -1002,14 +1036,16 @@ mod clause_tests {
         setup_all_types_schema(&db).await?;
 
         // Use combined CREATE pattern
-        db.session()
-            .execute(
-                "CREATE (lonely:Person {name: 'Lonely', age: 40})
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute(
+            "CREATE (lonely:Person {name: 'Lonely', age: 40})
              CREATE (alice:Person {name: 'Alice', age: 30})
              CREATE (bob:Person {name: 'Bob', age: 25})
              CREATE (alice)-[:KNOWS {since: 2020}]->(bob)",
-            )
-            .await?;
+        )
+        .await?;
+        tx.commit().await?;
         db.flush().await?;
 
         // OPTIONAL MATCH should return NULL for nodes without relationships
@@ -1119,15 +1155,15 @@ mod clause_tests {
         let db = create_test_db().await?;
         setup_all_types_schema(&db).await?;
 
-        db.session()
-            .execute("CREATE (:Person {name: 'Alice', age: 30})")
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (:Person {name: 'Alice', age: 30})")
             .await?;
-        db.session()
-            .execute("CREATE (:Person {name: 'Alice', age: 25})")
+        tx.execute("CREATE (:Person {name: 'Alice', age: 25})")
             .await?;
-        db.session()
-            .execute("CREATE (:Person {name: 'Bob', age: 30})")
+        tx.execute("CREATE (:Person {name: 'Bob', age: 30})")
             .await?;
+        tx.commit().await?;
         db.flush().await?;
 
         // Note: RETURN DISTINCT is not fully supported, use count(DISTINCT) or GROUP BY instead
@@ -1268,12 +1304,13 @@ mod clause_tests {
         let db = create_test_db().await?;
         setup_all_types_schema(&db).await?;
 
-        db.session()
-            .execute("CREATE (:Person {name: 'Alice', age: 30})")
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (:Person {name: 'Alice', age: 30})")
             .await?;
-        db.session()
-            .execute("CREATE (:Person {name: 'Bob', age: 25})")
+        tx.execute("CREATE (:Person {name: 'Bob', age: 25})")
             .await?;
+        tx.commit().await?;
         db.flush().await?;
 
         // UNION removes duplicates
@@ -1308,9 +1345,11 @@ mod clause_tests {
         let db = create_test_db().await?;
         setup_all_types_schema(&db).await?;
 
-        db.session()
-            .execute("CREATE (n:Person {name: 'NewPerson', age: 42})")
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (n:Person {name: 'NewPerson', age: 42})")
             .await?;
+        tx.commit().await?;
         db.flush().await?;
 
         let result = db
@@ -1330,13 +1369,15 @@ mod clause_tests {
         setup_all_types_schema(&db).await?;
 
         // Use combined CREATE pattern since MATCH+CREATE with variable references isn't supported
-        db.session()
-            .execute(
-                "CREATE (a:Person {name: 'A', age: 1})
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute(
+            "CREATE (a:Person {name: 'A', age: 1})
              CREATE (b:Person {name: 'B', age: 2})
              CREATE (a)-[:KNOWS {since: 2024}]->(b)",
-            )
-            .await?;
+        )
+        .await?;
+        tx.commit().await?;
         db.flush().await?;
 
         let result = db
@@ -1358,14 +1399,18 @@ mod clause_tests {
         let db = create_test_db().await?;
         setup_all_types_schema(&db).await?;
 
-        db.session()
-            .execute("CREATE (:Person {name: 'UpdateMe', age: 20})")
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (:Person {name: 'UpdateMe', age: 20})")
             .await?;
+        tx.commit().await?;
         db.flush().await?;
 
-        db.session()
-            .execute("MATCH (n:Person {name: 'UpdateMe'}) SET n.age = 21")
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("MATCH (n:Person {name: 'UpdateMe'}) SET n.age = 21")
             .await?;
+        tx.commit().await?;
         db.flush().await?;
 
         let result = db
@@ -1383,16 +1428,20 @@ mod clause_tests {
         let db = create_test_db().await?;
         setup_all_types_schema(&db).await?;
 
-        db.session()
-            .execute("CREATE (:Person {name: 'MultiUpdate', age: 20})")
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (:Person {name: 'MultiUpdate', age: 20})")
             .await?;
+        tx.commit().await?;
         db.flush().await?;
 
-        db.session()
-            .execute(
-                "MATCH (n:Person {name: 'MultiUpdate'}) SET n.age = 25, n.email = 'test@test.com'",
-            )
-            .await?;
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute(
+            "MATCH (n:Person {name: 'MultiUpdate'}) SET n.age = 25, n.email = 'test@test.com'",
+        )
+        .await?;
+        tx.commit().await?;
         db.flush().await?;
 
         let result = db
@@ -1414,14 +1463,18 @@ mod clause_tests {
         let db = create_test_db().await?;
         setup_all_types_schema(&db).await?;
 
-        db.session()
-            .execute("CREATE (:Person {name: 'HasEmail', age: 30, email: 'remove@me.com'})")
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (:Person {name: 'HasEmail', age: 30, email: 'remove@me.com'})")
             .await?;
+        tx.commit().await?;
         db.flush().await?;
 
-        db.session()
-            .execute("MATCH (n:Person {name: 'HasEmail'}) REMOVE n.email")
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("MATCH (n:Person {name: 'HasEmail'}) REMOVE n.email")
             .await?;
+        tx.commit().await?;
         db.flush().await?;
 
         let result = db
@@ -1441,9 +1494,11 @@ mod clause_tests {
         let db = create_test_db().await?;
         setup_all_types_schema(&db).await?;
 
-        db.session()
-            .execute("CREATE (:Person {name: 'ToDelete', age: 99})")
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (:Person {name: 'ToDelete', age: 99})")
             .await?;
+        tx.commit().await?;
         db.flush().await?;
 
         // Verify it exists
@@ -1454,9 +1509,11 @@ mod clause_tests {
         assert_eq!(result.len(), 1);
 
         // Delete it
-        db.session()
-            .execute("MATCH (n:Person {name: 'ToDelete'}) DELETE n")
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("MATCH (n:Person {name: 'ToDelete'}) DELETE n")
             .await?;
+        tx.commit().await?;
         db.flush().await?;
 
         // Verify it's gone
@@ -1475,19 +1532,22 @@ mod clause_tests {
         setup_all_types_schema(&db).await?;
 
         // Use combined CREATE pattern
-        db.session()
-            .execute(
-                "CREATE (p:Person {name: 'DetachMe', age: 50})
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute(
+            "CREATE (p:Person {name: 'DetachMe', age: 50})
              CREATE (friend:Person {name: 'Friend', age: 51})
              CREATE (p)-[:KNOWS {since: 2000}]->(friend)",
-            )
-            .await?;
+        )
+        .await?;
+        tx.commit().await?;
         db.flush().await?;
 
         // DETACH DELETE removes node and its relationships
-        db.session()
-            .execute("MATCH (n:Person {name: 'DetachMe'}) DETACH DELETE n")
+        let tx2 = session.tx().await?;
+        tx2.execute("MATCH (n:Person {name: 'DetachMe'}) DETACH DELETE n")
             .await?;
+        tx2.commit().await?;
         db.flush().await?;
 
         // Node should be gone
@@ -1515,9 +1575,11 @@ mod clause_tests {
         setup_all_types_schema(&db).await?;
 
         // MERGE should create when node doesn't exist
-        db.session()
-            .execute("MERGE (n:Person {name: 'MergeNew'}) ON CREATE SET n.age = 1")
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("MERGE (n:Person {name: 'MergeNew'}) ON CREATE SET n.age = 1")
             .await?;
+        tx.commit().await?;
         db.flush().await?;
 
         let result = db
@@ -1537,15 +1599,19 @@ mod clause_tests {
         setup_all_types_schema(&db).await?;
 
         // Create first
-        db.session()
-            .execute("CREATE (:Person {name: 'MergeExisting', age: 10})")
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (:Person {name: 'MergeExisting', age: 10})")
             .await?;
+        tx.commit().await?;
         db.flush().await?;
 
         // MERGE should match existing and run ON MATCH
-        db.session()
-            .execute("MERGE (n:Person {name: 'MergeExisting'}) ON MATCH SET n.age = 20")
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("MERGE (n:Person {name: 'MergeExisting'}) ON MATCH SET n.age = 20")
             .await?;
+        tx.commit().await?;
         db.flush().await?;
 
         let result = db
@@ -1660,15 +1726,15 @@ mod operator_tests {
         let db = create_test_db().await?;
         setup_all_types_schema(&db).await?;
 
-        db.session()
-            .execute("CREATE (:AllTypesNode {str_val: 'Hello World'})")
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (:AllTypesNode {str_val: 'Hello World'})")
             .await?;
-        db.session()
-            .execute("CREATE (:AllTypesNode {str_val: 'Goodbye World'})")
+        tx.execute("CREATE (:AllTypesNode {str_val: 'Goodbye World'})")
             .await?;
-        db.session()
-            .execute("CREATE (:AllTypesNode {str_val: 'Hello Universe'})")
+        tx.execute("CREATE (:AllTypesNode {str_val: 'Hello Universe'})")
             .await?;
+        tx.commit().await?;
         db.flush().await?;
 
         // CONTAINS
@@ -2135,9 +2201,11 @@ mod function_tests {
         let db = create_test_db().await?;
         setup_all_types_schema(&db).await?;
 
-        db.session()
-            .execute("CREATE (:AllTypesNode {str_val: 'test'})")
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (:AllTypesNode {str_val: 'test'})")
             .await?;
+        tx.commit().await?;
         db.flush().await?;
 
         // coalesce - returns first non-null value
@@ -2183,9 +2251,11 @@ mod function_tests {
         assert_eq!(with_email, 0); // No one has email set
 
         // count(DISTINCT expr)
-        db.session()
-            .execute("CREATE (:Person {name: 'Alice2', age: 30})")
+        let session2 = db.session();
+        let tx2 = session2.tx().await?;
+        tx2.execute("CREATE (:Person {name: 'Alice2', age: 30})")
             .await?; // Another person with age 30
+        tx2.commit().await?;
         db.flush().await?;
 
         let result = db
@@ -2265,21 +2335,14 @@ mod function_tests {
         setup_all_types_schema(&db).await?;
 
         // Create persons with duplicate ages
-        db.session()
-            .execute("CREATE (:Person {name: 'A1', age: 20})")
-            .await?;
-        db.session()
-            .execute("CREATE (:Person {name: 'A2', age: 20})")
-            .await?;
-        db.session()
-            .execute("CREATE (:Person {name: 'B1', age: 30})")
-            .await?;
-        db.session()
-            .execute("CREATE (:Person {name: 'B2', age: 30})")
-            .await?;
-        db.session()
-            .execute("CREATE (:Person {name: 'B3', age: 30})")
-            .await?;
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (:Person {name: 'A1', age: 20})").await?;
+        tx.execute("CREATE (:Person {name: 'A2', age: 20})").await?;
+        tx.execute("CREATE (:Person {name: 'B1', age: 30})").await?;
+        tx.execute("CREATE (:Person {name: 'B2', age: 30})").await?;
+        tx.execute("CREATE (:Person {name: 'B3', age: 30})").await?;
+        tx.commit().await?;
         db.flush().await?;
 
         let result = db
@@ -2362,9 +2425,10 @@ mod path_tests {
         // Create a graph with multiple paths using combined CREATE
         // A -> B -> C -> D (long path)
         // A -> E -> D (shorter path)
-        db.session()
-            .execute(
-                "CREATE (a:Person {name: 'A', age: 1})
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute(
+            "CREATE (a:Person {name: 'A', age: 1})
              CREATE (b:Person {name: 'B', age: 2})
              CREATE (c:Person {name: 'C', age: 3})
              CREATE (d:Person {name: 'D', age: 4})
@@ -2374,8 +2438,9 @@ mod path_tests {
              CREATE (c)-[:KNOWS {since: 3}]->(d)
              CREATE (a)-[:KNOWS {since: 4}]->(e)
              CREATE (e)-[:KNOWS {since: 5}]->(d)",
-            )
-            .await?;
+        )
+        .await?;
+        tx.commit().await?;
 
         db.flush().await?;
 
@@ -2440,9 +2505,10 @@ mod integration_tests {
             .await?;
 
         // 2. Create data using combined CREATE pattern
-        db.session()
-            .execute(
-                "CREATE (electronics:Category {name: 'Electronics'})
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute(
+            "CREATE (electronics:Category {name: 'Electronics'})
              CREATE (books:Category {name: 'Books'})
              CREATE (laptop:Product {name: 'Laptop', price: 999.99, stock: 50})
              CREATE (phone:Product {name: 'Phone', price: 699.99, stock: 100})
@@ -2450,8 +2516,9 @@ mod integration_tests {
              CREATE (laptop)-[:IN_CATEGORY]->(electronics)
              CREATE (phone)-[:IN_CATEGORY]->(electronics)
              CREATE (rustbook)-[:IN_CATEGORY]->(books)",
-            )
-            .await?;
+        )
+        .await?;
+        tx.commit().await?;
 
         // 3. CRITICAL: Flush to storage
         db.flush().await?;
@@ -2505,9 +2572,10 @@ mod integration_tests {
             .await?;
 
         // Initial balance
-        db.session()
-            .execute("CREATE (:Account {balance: 1000})")
-            .await?;
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (:Account {balance: 1000})").await?;
+        tx.commit().await?;
         db.flush().await?;
 
         // Transaction that commits
@@ -2552,12 +2620,14 @@ mod integration_tests {
         setup_all_types_schema(&db).await?;
 
         // Create data in multiple batches with flushes
+        let session = db.session();
+        let tx = session.tx().await?;
         for i in 0..5 {
-            db.session()
-                .execute(&format!("CREATE (:Counter {{val: {}}})", i))
+            tx.execute(&format!("CREATE (:Counter {{val: {}}})", i))
                 .await?;
             db.flush().await?;
         }
+        tx.commit().await?;
 
         // Verify all data is present
         let result = db

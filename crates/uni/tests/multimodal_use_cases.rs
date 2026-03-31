@@ -249,24 +249,21 @@ async fn test_ecommerce_recommendation() -> anyhow::Result<()> {
     let db = Uni::open(path.to_str().unwrap()).build().await?;
 
     // 2. Create data using high-level API
-    db.session()
-        .execute("CREATE (alice:User {name: 'Alice'})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (alice:User {name: 'Alice'})").await?;
+    tx.execute("CREATE (laptop:Product {name: 'Laptop', embedding: [1.0, 0.0]})")
         .await?;
-    db.session()
-        .execute("CREATE (laptop:Product {name: 'Laptop', embedding: [1.0, 0.0]})")
+    tx.execute("CREATE (mouse:Product {name: 'Mouse', embedding: [0.9, 0.1]})")
         .await?;
-    db.session()
-        .execute("CREATE (mouse:Product {name: 'Mouse', embedding: [0.9, 0.1]})")
-        .await?;
-    db.session()
-        .execute("CREATE (shampoo:Product {name: 'Shampoo', embedding: [0.0, 1.0]})")
+    tx.execute("CREATE (shampoo:Product {name: 'Shampoo', embedding: [0.0, 1.0]})")
         .await?;
 
     // Create the VIEWED edge: Alice -> Laptop
-    db.session().execute(
+    tx.execute(
         "MATCH (u:User {name: 'Alice'}), (p:Product {name: 'Laptop'}) CREATE (u)-[:VIEWED]->(p)",
     )
     .await?;
+    tx.commit().await?;
 
     // Flush to storage
     db.flush().await?;

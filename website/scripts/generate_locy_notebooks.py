@@ -110,12 +110,15 @@ def _python_setup_lines() -> list[str]:
         'DB_DIR = tempfile.mkdtemp(prefix="uni_locy_")',
         'print("DB_DIR:", DB_DIR)',
         "",
-        "db = uni_db.Database.open(DB_DIR)",
+        "db = uni_db.Uni.open(DB_DIR)",
+        "session = db.session()",
     ]
 
 
 def _python_seed_lines(statements: list[str]) -> list[str]:
-    lines = [f"db.execute({json.dumps(stmt)})" for stmt in statements]
+    lines = ["tx = session.tx()"]
+    lines.extend(f"tx.execute({json.dumps(stmt)})" for stmt in statements)
+    lines.append("tx.commit()")
     lines.append("print('Seeded graph data')")
     return lines
 
@@ -141,7 +144,10 @@ def _rust_setup_lines() -> list[str]:
 
 
 def _rust_seed_lines(statements: list[str]) -> list[str]:
-    lines = [f"db.execute({json.dumps(stmt)}).await?;" for stmt in statements]
+    lines = ["let session = db.session();"]
+    lines.append("let tx = session.tx().await?;")
+    lines.extend(f"tx.execute({json.dumps(stmt)}).await?;" for stmt in statements)
+    lines.append("tx.commit().await?;")
     lines.append('println!("Seeded graph data");')
     return lines
 
@@ -174,7 +180,7 @@ def _rust_program_lines(program_lines: list[str]) -> list[str]:
 
 def _python_eval_lines() -> list[str]:
     return [
-        "out = db.locy().evaluate(program)",
+        "out = session.locy(program)",
         "",
         'print("Derived relations:", list(out.derived.keys()))',
         "stats = out.stats",
@@ -194,8 +200,8 @@ def _python_results_lines() -> list[str]:
         "if out.command_results:",
         '    print("\\\\nCommand results:")',
         "for i, cmd in enumerate(out.command_results, start=1):",
-        '    print(f"\\\\nCommand #{i}:", cmd.get("type"))',
-        '    rows = cmd.get("rows")',
+        '    print(f"\\\\nCommand #{i}:", cmd.command_type)',
+        "    rows = getattr(cmd, 'rows', None)",
         "    if rows is not None:",
         "        pprint(rows)",
         "if not out.command_results:",
@@ -212,7 +218,8 @@ def _python_cleanup_lines() -> list[str]:
 
 def _rust_eval_lines() -> list[str]:
     return [
-        "let result = db.locy().evaluate(program).await?;",
+        "let session = db.session();",
+        "let result = session.locy(program).await?;",
         'println!("Derived relations: {:?}", result.derived.keys().collect::<Vec<_>>());',
         'println!("Iterations: {}", result.stats().total_iterations);',
         'println!("Queries executed: {}", result.stats().queries_executed);',

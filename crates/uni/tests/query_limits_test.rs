@@ -12,9 +12,11 @@ async fn test_query_timeout() -> Result<()> {
     db.schema().label("Node").apply().await?;
 
     // Create some data
+    let tx = db.session().tx().await?;
     for _ in 0..100 {
-        db.session().execute("CREATE (:Node)").await?;
+        tx.execute("CREATE (:Node)").await?;
     }
+    tx.commit().await?;
 
     // This query should be very fast, but let's set an extremely short timeout
     let res = db
@@ -38,9 +40,11 @@ async fn test_query_memory_limit() -> Result<()> {
     db.schema().label("Node").apply().await?;
 
     // Create some data
+    let tx = db.session().tx().await?;
     for _ in 0..100 {
-        db.session().execute("CREATE (:Node)").await?;
+        tx.execute("CREATE (:Node)").await?;
     }
+    tx.commit().await?;
 
     // Set an extremely small memory limit
     let res = db

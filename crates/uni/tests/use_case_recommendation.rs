@@ -67,16 +67,14 @@ async fn test_recommendation_use_case() -> anyhow::Result<()> {
             ("embedding".to_string(), Value::Vector(p2_vec.clone())),
         ]),
     ];
-    let product_vids = db
-        .session()
-        .bulk_insert_vertices("Product", products)
-        .await?;
+    let tx = db.session().tx().await?;
+    let product_vids = tx.bulk_insert_vertices("Product", products).await?;
     let p1 = product_vids[0];
     let _p2 = product_vids[1];
 
     // Users: U1, U2, U3
     let users = vec![HashMap::new(), HashMap::new(), HashMap::new()];
-    let user_vids = db.session().bulk_insert_vertices("User", users).await?;
+    let user_vids = tx.bulk_insert_vertices("User", users).await?;
     let u1 = user_vids[0];
     let u2 = user_vids[1];
     let u3 = user_vids[2];
@@ -87,9 +85,8 @@ async fn test_recommendation_use_case() -> anyhow::Result<()> {
         (u2, p1, HashMap::new()),
         (u3, p1, HashMap::new()),
     ];
-    db.session()
-        .bulk_insert_edges("PURCHASED", purchased)
-        .await?;
+    tx.bulk_insert_edges("PURCHASED", purchased).await?;
+    tx.commit().await?;
 
     db.flush().await?;
 

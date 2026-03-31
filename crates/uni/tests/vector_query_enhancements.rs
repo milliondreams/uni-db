@@ -34,19 +34,18 @@ async fn test_vector_search_with_filter() -> anyhow::Result<()> {
     // 2. Create database and insert products with varying prices
     let db = Uni::open(path.to_str().unwrap()).build().await?;
 
-    db.session()
-        .execute("CREATE (p1:Product {name: 'Cheap Laptop', embedding: [1.0, 0.0], price: 500.0})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (p1:Product {name: 'Cheap Laptop', embedding: [1.0, 0.0], price: 500.0})")
         .await?;
-    db.session()
-        .execute("CREATE (p2:Product {name: 'Mid Laptop', embedding: [0.9, 0.1], price: 1500.0})")
+    tx.execute("CREATE (p2:Product {name: 'Mid Laptop', embedding: [0.9, 0.1], price: 1500.0})")
         .await?;
-    db.session().execute(
+    tx.execute(
         "CREATE (p3:Product {name: 'Expensive Laptop', embedding: [0.95, 0.05], price: 3000.0})",
     )
     .await?;
-    db.session()
-        .execute("CREATE (p4:Product {name: 'Budget Mouse', embedding: [0.85, 0.15], price: 20.0})")
+    tx.execute("CREATE (p4:Product {name: 'Budget Mouse', embedding: [0.85, 0.15], price: 20.0})")
         .await?;
+    tx.commit().await?;
 
     db.flush().await?;
 
@@ -104,18 +103,16 @@ async fn test_vector_search_with_threshold() -> anyhow::Result<()> {
     // 2. Create items with known distances from query point [1.0, 0.0]
     let db = Uni::open(path.to_str().unwrap()).build().await?;
 
-    db.session()
-        .execute("CREATE (i1:Item {name: 'Very Close', embedding: [1.0, 0.0]})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (i1:Item {name: 'Very Close', embedding: [1.0, 0.0]})")
         .await?; // Distance: 0.0
-    db.session()
-        .execute("CREATE (i2:Item {name: 'Close', embedding: [0.9, 0.1]})")
+    tx.execute("CREATE (i2:Item {name: 'Close', embedding: [0.9, 0.1]})")
         .await?; // Distance: ~0.14
-    db.session()
-        .execute("CREATE (i3:Item {name: 'Medium', embedding: [0.7, 0.3]})")
+    tx.execute("CREATE (i3:Item {name: 'Medium', embedding: [0.7, 0.3]})")
         .await?; // Distance: ~0.42
-    db.session()
-        .execute("CREATE (i4:Item {name: 'Far', embedding: [0.0, 1.0]})")
+    tx.execute("CREATE (i4:Item {name: 'Far', embedding: [0.0, 1.0]})")
         .await?; // Distance: ~1.41
+    tx.commit().await?;
 
     db.flush().await?;
 
@@ -165,9 +162,10 @@ async fn test_vector_search_yield_order() -> anyhow::Result<()> {
 
     // 2. Create test data
     let db = Uni::open(path.to_str().unwrap()).build().await?;
-    db.session()
-        .execute("CREATE (d:Doc {text: 'Hello', embedding: [1.0, 0.0]})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (d:Doc {text: 'Hello', embedding: [1.0, 0.0]})")
         .await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // 3. Test different yield orders
@@ -221,12 +219,14 @@ async fn test_vector_search_conditional_loading() -> anyhow::Result<()> {
     // 2. Create articles
     let db = Uni::open(path.to_str().unwrap()).build().await?;
 
+    let tx = db.session().tx().await?;
     for i in 0..10 {
-        db.session().execute(&format!(
+        tx.execute(&format!(
             "CREATE (a:Article {{title: 'Article {}', content: 'Content {}', author: 'Author {}', embedding: [{}, 0.0]}})",
             i, i, i, 1.0 - (i as f32 * 0.05)
         )).await?;
     }
+    tx.commit().await?;
 
     db.flush().await?;
 
@@ -284,9 +284,10 @@ async fn test_vector_search_score_normalization() -> anyhow::Result<()> {
     schema_manager.save().await?;
 
     let db = Uni::open(path.to_str().unwrap()).build().await?;
-    db.session()
-        .execute("CREATE (d:CosineDoc {embedding: [1.0, 0.0]})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (d:CosineDoc {embedding: [1.0, 0.0]})")
         .await?;
+    tx.commit().await?;
     db.flush().await?;
 
     let result = db
@@ -335,22 +336,20 @@ async fn test_vector_search_combined_filter_and_threshold() -> anyhow::Result<()
     // 2. Create products in different categories
     let db = Uni::open(path.to_str().unwrap()).build().await?;
 
-    db.session()
-        .execute(
-            "CREATE (p:Product {name: 'Laptop A', category: 'Electronics', embedding: [1.0, 0.0]})",
-        )
+    let tx = db.session().tx().await?;
+    tx.execute(
+        "CREATE (p:Product {name: 'Laptop A', category: 'Electronics', embedding: [1.0, 0.0]})",
+    )
+    .await?;
+    tx.execute(
+        "CREATE (p:Product {name: 'Laptop B', category: 'Electronics', embedding: [0.9, 0.1]})",
+    )
+    .await?;
+    tx.execute("CREATE (p:Product {name: 'Book A', category: 'Books', embedding: [0.95, 0.05]})")
         .await?;
-    db.session()
-        .execute(
-            "CREATE (p:Product {name: 'Laptop B', category: 'Electronics', embedding: [0.9, 0.1]})",
-        )
+    tx.execute("CREATE (p:Product {name: 'Book B', category: 'Books', embedding: [0.0, 1.0]})")
         .await?;
-    db.session()
-        .execute("CREATE (p:Product {name: 'Book A', category: 'Books', embedding: [0.95, 0.05]})")
-        .await?;
-    db.session()
-        .execute("CREATE (p:Product {name: 'Book B', category: 'Books', embedding: [0.0, 1.0]})")
-        .await?;
+    tx.commit().await?;
 
     db.flush().await?;
 
@@ -399,9 +398,10 @@ async fn test_vector_search_null_filter_and_threshold() -> anyhow::Result<()> {
     schema_manager.save().await?;
 
     let db = Uni::open(path.to_str().unwrap()).build().await?;
-    db.session()
-        .execute("CREATE (i:Item {embedding: [1.0, 0.0]})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (i:Item {embedding: [1.0, 0.0]})")
         .await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // 2. Test with explicit NULL for filter and threshold
@@ -438,9 +438,10 @@ async fn test_vector_search_all_yield_types() -> anyhow::Result<()> {
     schema_manager.save().await?;
 
     let db = Uni::open(path.to_str().unwrap()).build().await?;
-    db.session()
-        .execute("CREATE (t:Test {value: 'test', embedding: [1.0, 0.0]})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (t:Test {value: 'test', embedding: [1.0, 0.0]})")
         .await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // 2. Test all yield types together

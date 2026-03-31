@@ -26,7 +26,9 @@ async def test_async_open_and_query(test_dir):
         .property("age", "int")
         .apply()
     )
-    await session.execute("CREATE (n:Person {name: 'Alice', age: 30})")
+    tx = await session.tx()
+    await tx.execute("CREATE (n:Person {name: 'Alice', age: 30})")
+    await tx.commit()
 
     results = await session.query(
         "MATCH (n:Person) RETURN n.name AS name, n.age AS age"
@@ -42,7 +44,9 @@ async def test_async_temporary():
     db = await uni_db.AsyncUni.temporary()
     session = db.session()
     await db.schema().label("Thing").property("value", "int").apply()
-    await session.execute("CREATE (n:Thing {value: 42})")
+    tx = await session.tx()
+    await tx.execute("CREATE (n:Thing {value: 42})")
+    await tx.commit()
 
     results = await session.query("MATCH (n:Thing) RETURN n.value AS value")
     assert len(results) == 1
@@ -61,7 +65,9 @@ async def test_async_query_with_params(test_dir):
         .property("age", "int")
         .apply()
     )
-    await session.execute("CREATE (n:Person {name: 'Bob', age: 25})")
+    tx = await session.tx()
+    await tx.execute("CREATE (n:Person {name: 'Bob', age: 25})")
+    await tx.commit()
 
     results = await session.query(
         "MATCH (n:Person {name: 'Bob'}) RETURN n.age AS age",
@@ -76,8 +82,10 @@ async def test_async_execute_returns_count(test_dir):
     db = await uni_db.AsyncUni.open(test_dir)
     session = db.session()
     await db.schema().label("Counter").apply()
-    result = await session.execute("CREATE (n:Counter {value: 1})")
-    assert isinstance(result, uni_db.AutoCommitResult)
+    tx = await session.tx()
+    result = await tx.execute("CREATE (n:Counter {value: 1})")
+    await tx.commit()
+    assert isinstance(result, uni_db.ExecuteResult)
     assert result.affected_rows >= 0
     assert result.nodes_created >= 1
 
@@ -88,7 +96,9 @@ async def test_async_flush(test_dir):
     db = await uni_db.AsyncUni.open(test_dir)
     session = db.session()
     await db.schema().label("Flushed").apply()
-    await session.execute("CREATE (n:Flushed {val: 1})")
+    tx = await session.tx()
+    await tx.execute("CREATE (n:Flushed {val: 1})")
+    await tx.commit()
     await db.flush()
 
     # After flush, data should be persisted
@@ -117,7 +127,9 @@ async def test_async_builder():
     db = await builder.build()
     session = db.session()
     await db.schema().label("Built").property("x", "int").apply()
-    await session.execute("CREATE (n:Built {x: 1})")
+    tx = await session.tx()
+    await tx.execute("CREATE (n:Built {x: 1})")
+    await tx.commit()
     results = await session.query("MATCH (n:Built) RETURN n.x AS x")
     assert len(results) == 1
     assert results[0]["x"] == 1
@@ -130,8 +142,10 @@ async def test_async_multiple_queries():
     session = db.session()
     await db.schema().label("Node").property("idx", "int").apply()
 
+    tx = await session.tx()
     for i in range(10):
-        await session.execute(f"CREATE (n:Node {{idx: {i}}})")
+        await tx.execute(f"CREATE (n:Node {{idx: {i}}})")
+    await tx.commit()
 
     results = await session.query("MATCH (n:Node) RETURN n.idx AS idx ORDER BY n.idx")
     assert len(results) == 10
@@ -151,7 +165,9 @@ async def test_async_query_with_builder():
         .property("value", "int")
         .apply()
     )
-    await session.execute("CREATE (n:Item {name: 'Widget', value: 42})")
+    tx = await session.tx()
+    await tx.execute("CREATE (n:Item {name: 'Widget', value: 42})")
+    await tx.commit()
     await db.flush()
 
     results = await (
@@ -169,7 +185,9 @@ async def test_async_query_with_timeout():
     db = await uni_db.AsyncUni.temporary()
     session = db.session()
     await db.schema().label("Node").property("x", "int").apply()
-    await session.execute("CREATE (n:Node {x: 1})")
+    tx = await session.tx()
+    await tx.execute("CREATE (n:Node {x: 1})")
+    await tx.commit()
 
     results = (
         await session.query_with("MATCH (n:Node) RETURN n.x AS x")

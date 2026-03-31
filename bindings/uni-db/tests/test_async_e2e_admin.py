@@ -16,7 +16,9 @@ async def test_async_database_builder_temporary():
     await db.schema().label("Person").property("name", "string").apply()
 
     session = db.session()
-    await session.execute("CREATE (:Person {name: 'Alice'})")
+    tx = await session.tx()
+    await tx.execute("CREATE (:Person {name: 'Alice'})")
+    await tx.commit()
 
     result = await session.query("MATCH (n:Person) RETURN n.name")
     assert len(result) == 1
@@ -38,7 +40,9 @@ async def test_async_database_builder_in_memory():
     )
 
     session = db.session()
-    await session.execute("CREATE (:Product {sku: 'SKU001', price: 9.99})")
+    tx = await session.tx()
+    await tx.execute("CREATE (:Product {sku: 'SKU001', price: 9.99})")
+    await tx.commit()
 
     result = await session.query("MATCH (p:Product) RETURN p.sku, p.price")
     assert len(result) == 1
@@ -56,7 +60,9 @@ async def test_async_database_builder_open_new_path(tmp_path):
     await db.schema().label("User").property("username", "string").apply()
 
     session = db.session()
-    await session.execute("CREATE (:User {username: 'testuser'})")
+    tx = await session.tx()
+    await tx.execute("CREATE (:User {username: 'testuser'})")
+    await tx.commit()
 
     result = await session.query("MATCH (u:User) RETURN u.username")
     assert len(result) == 1
@@ -73,7 +79,9 @@ async def test_async_database_builder_create_new_path(tmp_path):
     await db.schema().label("Item").property("id", "int").apply()
 
     session = db.session()
-    await session.execute("CREATE (:Item {id: 42})")
+    tx = await session.tx()
+    await tx.execute("CREATE (:Item {id: 42})")
+    await tx.commit()
 
     result = await session.query("MATCH (i:Item) RETURN i.id")
     assert len(result) == 1
@@ -111,7 +119,9 @@ async def test_async_database_builder_open_existing_succeeds(tmp_path):
     db1 = await uni_db.AsyncUniBuilder.create(str(db_path)).build()
     await db1.schema().label("Person").property("name", "string").apply()
     session1 = db1.session()
-    await session1.execute("CREATE (:Person {name: 'Alice'})")
+    tx = await session1.tx()
+    await tx.execute("CREATE (:Person {name: 'Alice'})")
+    await tx.commit()
     await db1.flush()
     del db1
 
@@ -129,16 +139,14 @@ async def test_async_database_builder_with_cache_size(tmp_path):
     db_path = tmp_path / "test_cache_size_db"
 
     cache_size = 10 * 1024 * 1024
-    db = (
-        await uni_db.AsyncUniBuilder.open(str(db_path))
-        .cache_size(cache_size)
-        .build()
-    )
+    db = await uni_db.AsyncUniBuilder.open(str(db_path)).cache_size(cache_size).build()
 
     await db.schema().label("Data").property("value", "int").apply()
 
     session = db.session()
-    await session.execute("CREATE (:Data {value: 123})")
+    tx = await session.tx()
+    await tx.execute("CREATE (:Data {value: 123})")
+    await tx.commit()
 
     result = await session.query("MATCH (d:Data) RETURN d.value")
     assert len(result) == 1
@@ -155,7 +163,9 @@ async def test_async_database_builder_with_parallelism(tmp_path):
     await db.schema().label("Task").property("name", "string").apply()
 
     session = db.session()
-    await session.execute("CREATE (:Task {name: 'task1'})")
+    tx = await session.tx()
+    await tx.execute("CREATE (:Task {name: 'task1'})")
+    await tx.commit()
 
     result = await session.query("MATCH (t:Task) RETURN t.name")
     assert len(result) == 1
@@ -184,7 +194,9 @@ async def test_async_database_builder_chained_options(tmp_path):
     )
 
     session = db.session()
-    await session.execute("CREATE (:Config {key: 'setting1', value: 'value1'})")
+    tx = await session.tx()
+    await tx.execute("CREATE (:Config {key: 'setting1', value: 'value1'})")
+    await tx.commit()
 
     result = await session.query("MATCH (c:Config) RETURN c.key, c.value")
     assert len(result) == 1
@@ -202,7 +214,9 @@ async def test_async_database_convenience_open(tmp_path):
     await db.schema().label("Note").property("content", "string").apply()
 
     session = db.session()
-    await session.execute("CREATE (:Note {content: 'test note'})")
+    tx = await session.tx()
+    await tx.execute("CREATE (:Note {content: 'test note'})")
+    await tx.commit()
 
     result = await session.query("MATCH (n:Note) RETURN n.content")
     assert len(result) == 1
@@ -217,7 +231,9 @@ async def test_async_database_convenience_temporary():
     await db.schema().label("TempData").property("id", "int").apply()
 
     session = db.session()
-    await session.execute("CREATE (:TempData {id: 999})")
+    tx = await session.tx()
+    await tx.execute("CREATE (:TempData {id: 999})")
+    await tx.commit()
 
     result = await session.query("MATCH (t:TempData) RETURN t.id")
     assert len(result) == 1
@@ -239,8 +255,10 @@ async def test_explain():
     )
 
     session = db.session()
-    await session.execute("CREATE (:Person {name: 'Alice', age: 30})")
-    await session.execute("CREATE (:Person {name: 'Bob', age: 25})")
+    tx = await session.tx()
+    await tx.execute("CREATE (:Person {name: 'Alice', age: 30})")
+    await tx.execute("CREATE (:Person {name: 'Bob', age: 25})")
+    await tx.commit()
 
     plan = await session.explain(
         "MATCH (n:Person) WHERE n.age > 20 RETURN n.name, n.age"
@@ -266,9 +284,11 @@ async def test_profile():
     )
 
     session = db.session()
-    await session.execute("CREATE (:Product {name: 'Widget A', price: 9.99})")
-    await session.execute("CREATE (:Product {name: 'Widget B', price: 19.99})")
-    await session.execute("CREATE (:Product {name: 'Widget C', price: 29.99})")
+    tx = await session.tx()
+    await tx.execute("CREATE (:Product {name: 'Widget A', price: 9.99})")
+    await tx.execute("CREATE (:Product {name: 'Widget B', price: 19.99})")
+    await tx.execute("CREATE (:Product {name: 'Widget C', price: 29.99})")
+    await tx.commit()
 
     results, stats = await session.profile(
         "MATCH (p:Product) WHERE p.price < 25.0 RETURN p.name, p.price"
@@ -299,15 +319,16 @@ async def test_explain_with_complex_query():
     )
 
     session = db.session()
-    await session.execute("CREATE (:User {username: 'alice'})")
-    await session.execute("CREATE (:User {username: 'bob'})")
-    await session.execute("CREATE (:Post {title: 'Post 1'})")
-    await session.execute("CREATE (:Post {title: 'Post 2'})")
-
-    await session.execute("""
+    tx = await session.tx()
+    await tx.execute("CREATE (:User {username: 'alice'})")
+    await tx.execute("CREATE (:User {username: 'bob'})")
+    await tx.execute("CREATE (:Post {title: 'Post 1'})")
+    await tx.execute("CREATE (:Post {title: 'Post 2'})")
+    await tx.execute("""
         MATCH (u:User {username: 'alice'}), (p:Post {title: 'Post 1'})
         CREATE (u)-[:AUTHORED]->(p)
     """)
+    await tx.commit()
 
     plan = await session.explain("""
         MATCH (u:User)-[:AUTHORED]->(p:Post)
@@ -327,8 +348,10 @@ async def test_profile_with_aggregation():
     await db.schema().label("Order").property("amount", "float").apply()
 
     session = db.session()
+    tx = await session.tx()
     for i in range(10):
-        await session.execute(f"CREATE (:Order {{amount: {(i + 1) * 10.0}}})")
+        await tx.execute(f"CREATE (:Order {{amount: {(i + 1) * 10.0}}})")
+    await tx.commit()
 
     results, stats = await session.profile("""
         MATCH (o:Order)

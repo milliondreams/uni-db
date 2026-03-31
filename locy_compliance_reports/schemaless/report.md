@@ -1,17 +1,19 @@
 # TCK Compliance Report
 
-**Generated:** 2026-03-29 14:00:45
-**Results:** `results_20260329_140045.json`
-**Compared to:** `results_20260327_133556.json`
+**Generated:** 2026-03-30 21:29:27
+**Results:** `results_20260330_212927.json`
+**Compared to:** `results_20260330_210405.json`
 
 ## Summary
 
 | Metric | Current | Previous | Delta |
 |--------|---------|----------|-------|
-| Scenarios | 256 | 256 |  |
-| Passed | 256 | 256 |  |
-| Failed | 0 | 0 |  |
-| Pass Rate | 100.0% | 100.0% | ➡️ +0.0pp |
+| Scenarios | 263 | 263 |  |
+| Passed | 263 | 262 | +1 |
+| Failed | 0 | 1 | -1 |
+| Pass Rate | 100.0% | 99.6% | 📈 +0.4pp |
+
+**🟢 Fixed:** 1 scenarios now passing
 
 ## Feature Breakdown
 
@@ -24,6 +26,7 @@
 | ✅ BasicRules | 6 | 6 | 0 | 100% |  |
 | ✅ CypherFunctions | 9 | 9 | 0 | 100% |  |
 | ✅ DeriveEdges | 9 | 9 | 0 | 100% |  |
+| ✅ DeriveVisibility | 7 | 7 | 0 | 100% | +14pp |
 | ✅ ErrorConditions | 5 | 5 | 0 | 100% |  |
 | ✅ ExactProbability | 15 | 15 | 0 | 100% |  |
 | ✅ ExplainCombinations | 6 | 6 | 0 | 100% |  |
@@ -53,6 +56,12 @@
 | ✅ TransitiveClosure | 2 | 2 | 0 | 100% |  |
 | ✅ TripleCombinations | 5 | 5 | 0 | 100% |  |
 | ✅ YieldValueColumns | 5 | 5 | 0 | 100% |  |
+
+## 🟢 Newly Passing
+
+Scenarios that were failing but are now passing:
+
+- **DeriveVisibility** — DERIVE edges do not persist to graph without tx.apply (line 111)
 
 ## Failed Scenarios
 

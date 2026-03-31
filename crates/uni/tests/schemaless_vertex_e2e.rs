@@ -52,9 +52,10 @@ async fn test_schemaless_vertex_basic_return() -> Result<()> {
     let (db, _dir) = open_temp_db().await?;
     // No schema registration — "Gadget" is completely unknown.
 
-    db.session()
-        .execute("CREATE (:Gadget {name: 'Wrench', weight: 3})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Gadget {name: 'Wrench', weight: 3})")
         .await?;
+    tx.commit().await?;
 
     // L0 read
     let rows = db
@@ -95,15 +96,14 @@ async fn test_schemaless_vertex_basic_return() -> Result<()> {
 async fn test_schemaless_vertex_where_clause() -> Result<()> {
     let (db, _dir) = open_temp_db().await?;
 
-    db.session()
-        .execute("CREATE (:Animal {species: 'Cat', legs: 4})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Animal {species: 'Cat', legs: 4})")
         .await?;
-    db.session()
-        .execute("CREATE (:Animal {species: 'Snake', legs: 0})")
+    tx.execute("CREATE (:Animal {species: 'Snake', legs: 0})")
         .await?;
-    db.session()
-        .execute("CREATE (:Animal {species: 'Dog', legs: 4})")
+    tx.execute("CREATE (:Animal {species: 'Dog', legs: 4})")
         .await?;
+    tx.commit().await?;
 
     db.flush().await?;
 
@@ -150,21 +150,24 @@ async fn test_schemaless_vertex_multiple_flushes() -> Result<()> {
     let (db, _dir) = open_temp_db().await?;
 
     // Batch 1
-    db.session()
-        .execute("CREATE (:Metric {source: 'cpu', value: 82})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Metric {source: 'cpu', value: 82})")
         .await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // Batch 2
-    db.session()
-        .execute("CREATE (:Metric {source: 'mem', value: 64})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Metric {source: 'mem', value: 64})")
         .await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // Batch 3
-    db.session()
-        .execute("CREATE (:Metric {source: 'disk', value: 45})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Metric {source: 'disk', value: 45})")
         .await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // All three should be present
@@ -210,17 +213,18 @@ async fn test_schemaless_vertex_multiple_flushes() -> Result<()> {
 async fn test_schemaless_vertex_mixed_types() -> Result<()> {
     let (db, _dir) = open_temp_db().await?;
 
-    db.session()
-        .execute(
-            r#"CREATE (:Config {
+    let tx = db.session().tx().await?;
+    tx.execute(
+        r#"CREATE (:Config {
             name: 'prod',
             replicas: 3,
             cpu_limit: 2.5,
             enabled: true,
             regions: ['us-east', 'eu-west']
         })"#,
-        )
-        .await?;
+    )
+    .await?;
+    tx.commit().await?;
 
     db.flush().await?;
 
@@ -288,15 +292,13 @@ async fn test_schemaless_vertex_null_handling() -> Result<()> {
     let (db, _dir) = open_temp_db().await?;
 
     // Explicit null, present property, and missing property across vertices
-    db.session()
-        .execute("CREATE (:Reading {sensor: 'temp', value: 22.5})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Reading {sensor: 'temp', value: 22.5})")
         .await?;
-    db.session()
-        .execute("CREATE (:Reading {sensor: 'humidity', value: null})")
+    tx.execute("CREATE (:Reading {sensor: 'humidity', value: null})")
         .await?;
-    db.session()
-        .execute("CREATE (:Reading {sensor: 'pressure'})")
-        .await?; // value omitted entirely
+    tx.execute("CREATE (:Reading {sensor: 'pressure'})").await?; // value omitted entirely
+    tx.commit().await?;
 
     db.flush().await?;
 
@@ -353,13 +355,14 @@ async fn test_schemaless_vertex_null_handling() -> Result<()> {
 async fn test_schemaless_vertex_bulk() -> Result<()> {
     let (db, _dir) = open_temp_db().await?;
 
+    let tx = db.session().tx().await?;
     for i in 0..500 {
-        db.session()
-            .execute(&format!(
-                "CREATE (:LogEntry {{seq: {i}, level: 'info', msg: 'event_{i}'}})"
-            ))
-            .await?;
+        tx.execute(&format!(
+            "CREATE (:LogEntry {{seq: {i}, level: 'info', msg: 'event_{i}'}})"
+        ))
+        .await?;
     }
+    tx.commit().await?;
 
     db.flush().await?;
 
@@ -408,27 +411,30 @@ async fn test_schemaless_vertex_count_across_flushes() -> Result<()> {
     let (db, _dir) = open_temp_db().await?;
 
     // Generation 1
+    let tx = db.session().tx().await?;
     for i in 0..10 {
-        db.session()
-            .execute(&format!("CREATE (:Tick {{id: {i}, gen: 1}})"))
+        tx.execute(&format!("CREATE (:Tick {{id: {i}, gen: 1}})"))
             .await?;
     }
+    tx.commit().await?;
     db.flush().await?;
 
     // Generation 2
+    let tx = db.session().tx().await?;
     for i in 10..25 {
-        db.session()
-            .execute(&format!("CREATE (:Tick {{id: {i}, gen: 2}})"))
+        tx.execute(&format!("CREATE (:Tick {{id: {i}, gen: 2}})"))
             .await?;
     }
+    tx.commit().await?;
     db.flush().await?;
 
     // Generation 3 (still in L0, not flushed)
+    let tx = db.session().tx().await?;
     for i in 25..30 {
-        db.session()
-            .execute(&format!("CREATE (:Tick {{id: {i}, gen: 3}})"))
+        tx.execute(&format!("CREATE (:Tick {{id: {i}, gen: 3}})"))
             .await?;
     }
+    tx.commit().await?;
 
     // Total across flushed + L0
     let rows = db
@@ -458,15 +464,14 @@ async fn test_schemaless_vertex_count_across_flushes() -> Result<()> {
 async fn test_schemaless_vertex_multiple_labels() -> Result<()> {
     let (db, _dir) = open_temp_db().await?;
 
-    db.session()
-        .execute("CREATE (:Planet {name: 'Mars', moons: 2})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Planet {name: 'Mars', moons: 2})")
         .await?;
-    db.session()
-        .execute("CREATE (:Planet {name: 'Jupiter', moons: 95})")
+    tx.execute("CREATE (:Planet {name: 'Jupiter', moons: 95})")
         .await?;
-    db.session()
-        .execute("CREATE (:Star {name: 'Sirius', spectral: 'A1V'})")
+    tx.execute("CREATE (:Star {name: 'Sirius', spectral: 'A1V'})")
         .await?;
+    tx.commit().await?;
 
     db.flush().await?;
 
@@ -501,9 +506,10 @@ async fn test_schemaless_vertex_multiple_labels() -> Result<()> {
 async fn test_schemaless_vertex_special_strings() -> Result<()> {
     let (db, _dir) = open_temp_db().await?;
 
-    db.session()
-        .execute(r#"CREATE (:Note {title: '', body: "line1\nline2", tag: 'it''s'})"#)
+    let tx = db.session().tx().await?;
+    tx.execute(r#"CREATE (:Note {title: '', body: "line1\nline2", tag: 'it''s'})"#)
         .await?;
+    tx.commit().await?;
 
     db.flush().await?;
 

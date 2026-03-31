@@ -55,10 +55,10 @@ async fn test_lancedb_flush_vertices() -> anyhow::Result<()> {
     props2.insert("age".to_string(), uni_common::Value::Int(25));
 
     writer
-        .insert_vertex_with_labels(vid1, props1, &["Person".to_string()])
+        .insert_vertex_with_labels(vid1, props1, &["Person".to_string()], None)
         .await?;
     writer
-        .insert_vertex_with_labels(vid2, props2, &["Person".to_string()])
+        .insert_vertex_with_labels(vid2, props2, &["Person".to_string()], None)
         .await?;
 
     // 4. Flush to L1 (this should use LanceDB)
@@ -110,13 +110,13 @@ async fn test_lancedb_flush_edges() -> anyhow::Result<()> {
 
     // Insert vertices first (with labels)
     writer
-        .insert_vertex_with_labels(vid1, HashMap::new(), &["Person".to_string()])
+        .insert_vertex_with_labels(vid1, HashMap::new(), &["Person".to_string()], None)
         .await?;
     writer
-        .insert_vertex_with_labels(vid2, HashMap::new(), &["Person".to_string()])
+        .insert_vertex_with_labels(vid2, HashMap::new(), &["Person".to_string()], None)
         .await?;
     writer
-        .insert_vertex_with_labels(vid3, HashMap::new(), &["Person".to_string()])
+        .insert_vertex_with_labels(vid3, HashMap::new(), &["Person".to_string()], None)
         .await?;
 
     // Insert edges: vid1 -> vid2, vid1 -> vid3
@@ -124,10 +124,10 @@ async fn test_lancedb_flush_edges() -> anyhow::Result<()> {
     let eid2 = writer.next_eid(1).await?;
 
     writer
-        .insert_edge(vid1, vid2, 1, eid1, HashMap::new(), None)
+        .insert_edge(vid1, vid2, 1, eid1, HashMap::new(), None, None)
         .await?;
     writer
-        .insert_edge(vid1, vid3, 1, eid2, HashMap::new(), None)
+        .insert_edge(vid1, vid3, 1, eid2, HashMap::new(), None, None)
         .await?;
 
     // 4. Flush to L1 (this should use LanceDB)

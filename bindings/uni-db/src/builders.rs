@@ -606,31 +606,6 @@ impl Session {
         convert::query_result_to_py_class(py, result)
     }
 
-    /// Execute a mutation query, returning an AutoCommitResult.
-    #[pyo3(signature = (cypher, params=None))]
-    fn execute(
-        &self,
-        py: Python,
-        cypher: &str,
-        params: Option<HashMap<String, Py<PyAny>>>,
-    ) -> PyResult<crate::types::PyAutoCommitResult> {
-        let result = if let Some(p) = params {
-            let mut builder = self.inner.execute_with(cypher);
-            for (k, v) in p {
-                let val = convert::py_object_to_value(py, &v)?;
-                builder = builder.param(&k, val);
-            }
-            pyo3_async_runtimes::tokio::get_runtime()
-                .block_on(builder.run())
-                .map_err(crate::exceptions::uni_error_to_pyerr)?
-        } else {
-            pyo3_async_runtimes::tokio::get_runtime()
-                .block_on(self.inner.execute(cypher))
-                .map_err(crate::exceptions::uni_error_to_pyerr)?
-        };
-        convert::auto_commit_result_to_py(py, result)
-    }
-
     /// Create a new transaction for multi-statement writes.
     fn tx(&self) -> PyResult<super::sync_api::Transaction> {
         let tx = pyo3_async_runtimes::tokio::get_runtime()
@@ -647,42 +622,6 @@ impl Session {
     /// Add a session hook (Python object with optional before_query/after_query/before_commit/after_commit methods).
     fn add_hook(&mut self, hook: Py<PyAny>) {
         self.inner.add_hook(PySessionHook { py_obj: hook });
-    }
-
-    /// Create a streaming appender for the given label.
-    fn appender(&self, label: &str) -> PyResult<StreamingAppender> {
-        let builder = self.inner.appender(label);
-        let appender = builder
-            .build()
-            .map_err(crate::exceptions::uni_error_to_pyerr)?;
-        Ok(StreamingAppender {
-            inner: std::sync::Mutex::new(Some(appender)),
-        })
-    }
-
-    /// Create a configurable appender builder for the given label.
-    fn appender_builder(slf: Py<Self>, label: &str) -> PyAppenderBuilder {
-        PyAppenderBuilder {
-            session: slf,
-            label: label.to_string(),
-            batch_size: None,
-            defer_vector_indexes: None,
-            max_buffer_size_bytes: None,
-        }
-    }
-
-    /// Create a bulk writer builder for high-throughput data ingestion.
-    fn bulk_writer(slf: Py<Self>) -> BulkWriterBuilder {
-        BulkWriterBuilder {
-            session: slf,
-            defer_vector_indexes: true,
-            defer_scalar_indexes: true,
-            batch_size: None,
-            async_indexes: false,
-            validate_constraints: None,
-            max_buffer_size_bytes: None,
-            on_progress: None,
-        }
     }
 
     /// Get session capabilities.
@@ -824,48 +763,6 @@ impl Session {
         Ok(())
     }
 
-    /// Insert vertices in bulk within this session (auto-committed).
-    fn bulk_insert_vertices(
-        &self,
-        py: Python,
-        label: &str,
-        vertices: Vec<HashMap<String, Py<PyAny>>>,
-    ) -> PyResult<Vec<u64>> {
-        let mut props_list = Vec::with_capacity(vertices.len());
-        for v in vertices {
-            let mut map = HashMap::new();
-            for (k, val) in v {
-                map.insert(k, convert::py_object_to_value(py, &val)?);
-            }
-            props_list.push(map);
-        }
-        let vids = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(self.inner.bulk_insert_vertices(label, props_list))
-            .map_err(crate::exceptions::uni_error_to_pyerr)?;
-        Ok(vids.into_iter().map(|v| v.as_u64()).collect())
-    }
-
-    /// Insert edges in bulk within this session (auto-committed).
-    fn bulk_insert_edges(
-        &self,
-        py: Python,
-        edge_type: &str,
-        edges: Vec<(u64, u64, HashMap<String, Py<PyAny>>)>,
-    ) -> PyResult<()> {
-        let mut edge_data = Vec::with_capacity(edges.len());
-        for (src, dst, props) in edges {
-            let mut map = HashMap::new();
-            for (k, v) in props {
-                map.insert(k, convert::py_object_to_value(py, &v)?);
-            }
-            edge_data.push((::uni_db::Vid::from(src), ::uni_db::Vid::from(dst), map));
-        }
-        pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(self.inner.bulk_insert_edges(edge_type, edge_data))
-            .map_err(crate::exceptions::uni_error_to_pyerr)?;
-        Ok(())
-    }
-
     /// Register a user-defined function callable from Cypher/Locy.
     fn register_function(&self, py: Python, name: &str, func: Py<PyAny>) -> PyResult<()> {
         // Wrap the Python callable in a Send+Sync struct.
@@ -957,16 +854,6 @@ impl Session {
             timeout_secs: None,
             max_memory: None,
             cancellation_token: None,
-        }
-    }
-
-    /// Create a builder for parameterized auto-commit mutations.
-    fn execute_with(slf: Py<Self>, cypher: &str) -> SessionAutoCommitBuilder {
-        SessionAutoCommitBuilder {
-            session: slf,
-            cypher: cypher.to_string(),
-            params: HashMap::new(),
-            timeout_secs: None,
         }
     }
 
@@ -1189,47 +1076,6 @@ impl SessionQueryBuilder {
             buffer: std::sync::Mutex::new(VecDeque::new()),
             columns,
         })
-    }
-}
-
-/// Builder for auto-commit mutations on a Session.
-#[pyclass(name = "AutoCommitBuilder")]
-pub struct SessionAutoCommitBuilder {
-    pub(crate) session: Py<Session>,
-    pub(crate) cypher: String,
-    pub(crate) params: HashMap<String, Py<PyAny>>,
-    pub(crate) timeout_secs: Option<f64>,
-}
-
-#[pymethods]
-impl SessionAutoCommitBuilder {
-    /// Bind a parameter.
-    fn param(mut slf: PyRefMut<'_, Self>, name: String, value: Py<PyAny>) -> PyRefMut<'_, Self> {
-        slf.params.insert(name, value);
-        slf
-    }
-
-    /// Set execution timeout in seconds.
-    fn timeout(mut slf: PyRefMut<'_, Self>, seconds: f64) -> PyRefMut<'_, Self> {
-        slf.timeout_secs = Some(seconds);
-        slf
-    }
-
-    /// Execute the mutation and return an AutoCommitResult.
-    fn run(&self, py: Python) -> PyResult<crate::types::PyAutoCommitResult> {
-        let session = self.session.borrow(py);
-        let mut builder = session.inner.execute_with(&self.cypher);
-        for (k, v) in &self.params {
-            let val = convert::py_object_to_value(py, v)?;
-            builder = builder.param(k, val);
-        }
-        if let Some(t) = self.timeout_secs {
-            builder = builder.timeout(std::time::Duration::from_secs_f64(t));
-        }
-        let result = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(builder.run())
-            .map_err(crate::exceptions::uni_error_to_pyerr)?;
-        convert::auto_commit_result_to_py(py, result)
     }
 }
 
@@ -2074,180 +1920,15 @@ impl SessionTemplate {
 }
 
 // ============================================================================
-// AppenderBuilder
+// BulkWriter (wrapping real Rust BulkWriter)
 // ============================================================================
-
-/// Builder for configuring a StreamingAppender with advanced options.
-#[pyclass(name = "AppenderBuilder")]
-pub struct PyAppenderBuilder {
-    pub(crate) session: Py<Session>,
-    pub(crate) label: String,
-    pub(crate) batch_size: Option<usize>,
-    pub(crate) defer_vector_indexes: Option<bool>,
-    pub(crate) max_buffer_size_bytes: Option<usize>,
-}
-
-#[pymethods]
-impl PyAppenderBuilder {
-    /// Set batch size for flushing to storage.
-    fn batch_size(mut slf: PyRefMut<'_, Self>, size: usize) -> PyRefMut<'_, Self> {
-        slf.batch_size = Some(size);
-        slf
-    }
-
-    /// Set whether to defer vector index building.
-    fn defer_vector_indexes(mut slf: PyRefMut<'_, Self>, defer: bool) -> PyRefMut<'_, Self> {
-        slf.defer_vector_indexes = Some(defer);
-        slf
-    }
-
-    /// Set maximum buffer size in bytes.
-    fn max_buffer_size_bytes(mut slf: PyRefMut<'_, Self>, size: usize) -> PyRefMut<'_, Self> {
-        slf.max_buffer_size_bytes = Some(size);
-        slf
-    }
-
-    /// Build and return the StreamingAppender.
-    fn build(&self, py: Python) -> PyResult<StreamingAppender> {
-        let session = self.session.borrow(py);
-        let mut builder = session.inner.appender(&self.label);
-        if let Some(bs) = self.batch_size {
-            builder = builder.batch_size(bs);
-        }
-        if let Some(dvi) = self.defer_vector_indexes {
-            builder = builder.defer_vector_indexes(dvi);
-        }
-        if let Some(mbs) = self.max_buffer_size_bytes {
-            builder = builder.max_buffer_size_bytes(mbs);
-        }
-        let appender = builder
-            .build()
-            .map_err(crate::exceptions::uni_error_to_pyerr)?;
-        Ok(StreamingAppender {
-            inner: std::sync::Mutex::new(Some(appender)),
-        })
-    }
-}
-
-// ============================================================================
-// BulkWriterBuilder and BulkWriter (wrapping real Rust BulkWriter)
-// ============================================================================
-
-/// Builder for configuring bulk data loading.
-///
-/// Wraps the Rust `Session::bulk_writer()` → `BulkWriterBuilder` chain.
-#[pyclass]
-pub struct BulkWriterBuilder {
-    pub(crate) session: Py<Session>,
-    pub(crate) defer_vector_indexes: bool,
-    pub(crate) defer_scalar_indexes: bool,
-    pub(crate) batch_size: Option<usize>,
-    pub(crate) async_indexes: bool,
-    pub(crate) validate_constraints: Option<bool>,
-    pub(crate) max_buffer_size_bytes: Option<usize>,
-    pub(crate) on_progress: Option<Py<PyAny>>,
-}
-
-#[pymethods]
-impl BulkWriterBuilder {
-    /// Defer vector index building until commit.
-    fn defer_vector_indexes(mut slf: PyRefMut<'_, Self>, defer: bool) -> PyRefMut<'_, Self> {
-        slf.defer_vector_indexes = defer;
-        slf
-    }
-
-    /// Defer scalar index building until commit.
-    fn defer_scalar_indexes(mut slf: PyRefMut<'_, Self>, defer: bool) -> PyRefMut<'_, Self> {
-        slf.defer_scalar_indexes = defer;
-        slf
-    }
-
-    /// Set batch size for flushing to storage.
-    fn batch_size(mut slf: PyRefMut<'_, Self>, size: usize) -> PyRefMut<'_, Self> {
-        slf.batch_size = Some(size);
-        slf
-    }
-
-    /// Build indexes asynchronously after commit.
-    fn async_indexes(mut slf: PyRefMut<'_, Self>, async_: bool) -> PyRefMut<'_, Self> {
-        slf.async_indexes = async_;
-        slf
-    }
-
-    /// Set whether to validate constraints during bulk load.
-    fn validate_constraints(mut slf: PyRefMut<'_, Self>, validate: bool) -> PyRefMut<'_, Self> {
-        slf.validate_constraints = Some(validate);
-        slf
-    }
-
-    /// Set maximum buffer size before triggering a checkpoint flush.
-    fn max_buffer_size_bytes(mut slf: PyRefMut<'_, Self>, size: usize) -> PyRefMut<'_, Self> {
-        slf.max_buffer_size_bytes = Some(size);
-        slf
-    }
-
-    /// Set a progress callback invoked during bulk loading.
-    fn on_progress(mut slf: PyRefMut<'_, Self>, callback: Py<PyAny>) -> PyRefMut<'_, Self> {
-        slf.on_progress = Some(callback);
-        slf
-    }
-
-    /// Build the BulkWriter.
-    fn build(&self, py: Python) -> PyResult<BulkWriter> {
-        let session_ref = self.session.borrow(py);
-        let mut builder = session_ref.inner.bulk_writer();
-        builder = builder
-            .defer_vector_indexes(self.defer_vector_indexes)
-            .defer_scalar_indexes(self.defer_scalar_indexes)
-            .async_indexes(self.async_indexes);
-        if let Some(bs) = self.batch_size {
-            builder = builder.batch_size(bs);
-        }
-        if let Some(vc) = self.validate_constraints {
-            builder = builder.validate_constraints(vc);
-        }
-        if let Some(mbs) = self.max_buffer_size_bytes {
-            builder = builder.max_buffer_size_bytes(mbs);
-        }
-        if let Some(ref callback) = self.on_progress {
-            struct PyProgressWrapper {
-                py_obj: Py<PyAny>,
-            }
-            unsafe impl Send for PyProgressWrapper {}
-
-            let wrapper = PyProgressWrapper {
-                py_obj: callback.clone_ref(py),
-            };
-            builder = builder.on_progress(move |progress: ::uni_db::api::bulk::BulkProgress| {
-                Python::attach(|py| {
-                    let py_progress = crate::types::BulkProgress {
-                        phase: format!("{:?}", progress.phase),
-                        rows_processed: progress.rows_processed,
-                        total_rows: progress.total_rows,
-                        current_label: progress.current_label.clone(),
-                        elapsed_secs: progress.elapsed.as_secs_f64(),
-                    };
-                    if let Ok(bound) = Py::new(py, py_progress) {
-                        let _ = wrapper.py_obj.call1(py, (bound,));
-                    }
-                });
-            });
-        }
-        let real_writer = builder
-            .build()
-            .map_err(crate::exceptions::anyhow_to_pyerr)?;
-        Ok(BulkWriter {
-            inner: std::sync::Mutex::new(Some(real_writer)),
-        })
-    }
-}
 
 /// Bulk writer for high-throughput data ingestion.
 ///
 /// Wraps the real Rust `BulkWriter` via `Mutex<Option<T>>` ownership pattern.
 #[pyclass]
 pub struct BulkWriter {
-    inner: std::sync::Mutex<Option<::uni_db::api::bulk::BulkWriter>>,
+    pub(crate) inner: std::sync::Mutex<Option<::uni_db::api::bulk::BulkWriter>>,
 }
 
 impl BulkWriter {

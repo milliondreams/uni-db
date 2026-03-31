@@ -9,9 +9,10 @@ async fn test_ddl_execution() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
     // 1. CREATE LABEL
-    db.session()
-        .execute("CREATE LABEL Person (name STRING NOT NULL, age INT UNIQUE)")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL Person (name STRING NOT NULL, age INT UNIQUE)")
         .await?;
+    tx.commit().await?;
 
     let schema = db.get_schema();
     assert!(schema.labels.contains_key("Person"));
@@ -29,9 +30,10 @@ async fn test_ddl_execution() -> Result<()> {
     );
 
     // 2. CREATE EDGE TYPE
-    db.session()
-        .execute("CREATE EDGE TYPE FOLLOWS (since STRING) FROM Person TO Person")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE EDGE TYPE FOLLOWS (since STRING) FROM Person TO Person")
         .await?;
+    tx.commit().await?;
 
     let schema = db.get_schema();
     assert!(schema.edge_types.contains_key("FOLLOWS"));
@@ -39,16 +41,18 @@ async fn test_ddl_execution() -> Result<()> {
     assert_eq!(follows_meta.src_labels, &["Person".to_string()]);
 
     // 3. ALTER LABEL
-    db.session()
-        .execute("ALTER LABEL Person ADD PROPERTY bio STRING")
+    let tx = db.session().tx().await?;
+    tx.execute("ALTER LABEL Person ADD PROPERTY bio STRING")
         .await?;
+    tx.commit().await?;
     let schema = db.get_schema();
     assert!(schema.properties.get("Person").unwrap().contains_key("bio"));
 
     // 4. CREATE CONSTRAINT
-    db.session()
-        .execute("CREATE CONSTRAINT name_unique ON (p:Person) ASSERT p.name IS UNIQUE")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE CONSTRAINT name_unique ON (p:Person) ASSERT p.name IS UNIQUE")
         .await?;
+    tx.commit().await?;
     let schema = db.get_schema();
     assert!(schema.constraints.iter().any(|c| c.name == "name_unique"));
 
@@ -58,7 +62,9 @@ async fn test_ddl_execution() -> Result<()> {
     assert_eq!(result.len(), 2);
 
     // 6. DROP LABEL
-    db.session().execute("DROP LABEL Person").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("DROP LABEL Person").await?;
+    tx.commit().await?;
     let schema = db.get_schema();
     assert!(schema.labels.contains_key("Person"));
     assert!(matches!(

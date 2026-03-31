@@ -16,15 +16,13 @@ fn get_map(value: &Value) -> &std::collections::HashMap<String, Value> {
 async fn test_map_projection_property_selection() -> Result<()> {
     let db = Uni::temporary().build().await?;
 
-    // Create schema
-    db.session()
-        .execute("CREATE LABEL Person (name STRING, age INT32, city STRING)")
+    // Create schema and data
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL Person (name STRING, age INT32, city STRING)")
         .await?;
-
-    // Create a person node with properties
-    db.session()
-        .execute("CREATE (:Person {name: 'Alice', age: 30, city: 'NYC'})")
+    tx.execute("CREATE (:Person {name: 'Alice', age: 30, city: 'NYC'})")
         .await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // Test property selection
@@ -48,12 +46,12 @@ async fn test_map_projection_property_selection() -> Result<()> {
 async fn test_map_projection_wildcard() -> Result<()> {
     let db = Uni::temporary().build().await?;
 
-    db.session()
-        .execute("CREATE LABEL Person (name STRING, age INT32, city STRING)")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL Person (name STRING, age INT32, city STRING)")
         .await?;
-    db.session()
-        .execute("CREATE (:Person {name: 'Bob', age: 25, city: 'LA'})")
+    tx.execute("CREATE (:Person {name: 'Bob', age: 25, city: 'LA'})")
         .await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // Test wildcard selection
@@ -76,12 +74,12 @@ async fn test_map_projection_wildcard() -> Result<()> {
 async fn test_map_projection_computed_properties() -> Result<()> {
     let db = Uni::temporary().build().await?;
 
-    db.session()
-        .execute("CREATE LABEL Person (name STRING, age INT32)")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL Person (name STRING, age INT32)")
         .await?;
-    db.session()
-        .execute("CREATE (:Person {name: 'Charlie', age: 35})")
+    tx.execute("CREATE (:Person {name: 'Charlie', age: 35})")
         .await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // Test computed properties
@@ -108,12 +106,12 @@ async fn test_map_projection_computed_properties() -> Result<()> {
 async fn test_map_projection_mixed() -> Result<()> {
     let db = Uni::temporary().build().await?;
 
-    db.session()
-        .execute("CREATE LABEL Person (name STRING, age INT32, city STRING)")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL Person (name STRING, age INT32, city STRING)")
         .await?;
-    db.session()
-        .execute("CREATE (:Person {name: 'Diana', age: 28, city: 'SF'})")
+    tx.execute("CREATE (:Person {name: 'Diana', age: 28, city: 'SF'})")
         .await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // Test mixed selection
@@ -137,15 +135,14 @@ async fn test_map_projection_mixed() -> Result<()> {
 async fn test_map_projection_with_where() -> Result<()> {
     let db = Uni::temporary().build().await?;
 
-    db.session()
-        .execute("CREATE LABEL Person (name STRING, age INT32, city STRING)")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL Person (name STRING, age INT32, city STRING)")
         .await?;
-    db.session()
-        .execute("CREATE (:Person {name: 'Eve', age: 40, city: 'Boston'})")
+    tx.execute("CREATE (:Person {name: 'Eve', age: 40, city: 'Boston'})")
         .await?;
-    db.session()
-        .execute("CREATE (:Person {name: 'Frank', age: 20, city: 'Seattle'})")
+    tx.execute("CREATE (:Person {name: 'Frank', age: 20, city: 'Seattle'})")
         .await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // Test map projection with WHERE clause
@@ -167,18 +164,16 @@ async fn test_map_projection_with_where() -> Result<()> {
 async fn test_map_projection_with_order_limit() -> Result<()> {
     let db = Uni::temporary().build().await?;
 
-    db.session()
-        .execute("CREATE LABEL Person (name STRING, age INT32)")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL Person (name STRING, age INT32)")
         .await?;
-    db.session()
-        .execute("CREATE (:Person {name: 'Grace', age: 45})")
+    tx.execute("CREATE (:Person {name: 'Grace', age: 45})")
         .await?;
-    db.session()
-        .execute("CREATE (:Person {name: 'Henry', age: 50})")
+    tx.execute("CREATE (:Person {name: 'Henry', age: 50})")
         .await?;
-    db.session()
-        .execute("CREATE (:Person {name: 'Ivy', age: 42})")
+    tx.execute("CREATE (:Person {name: 'Ivy', age: 42})")
         .await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // Test with ORDER BY and LIMIT
@@ -203,18 +198,16 @@ async fn test_map_projection_with_order_limit() -> Result<()> {
 async fn test_map_projection_multiple_nodes() -> Result<()> {
     let db = Uni::temporary().build().await?;
 
-    db.session()
-        .execute("CREATE LABEL Person (name STRING, age INT32)")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL Person (name STRING, age INT32)")
         .await?;
-    db.session()
-        .execute("CREATE (:Person {name: 'Kate', age: 29})")
+    tx.execute("CREATE (:Person {name: 'Kate', age: 29})")
         .await?;
-    db.session()
-        .execute("CREATE (:Person {name: 'Leo', age: 31})")
+    tx.execute("CREATE (:Person {name: 'Leo', age: 31})")
         .await?;
-    db.session()
-        .execute("CREATE (:Person {name: 'Mia', age: 27})")
+    tx.execute("CREATE (:Person {name: 'Mia', age: 27})")
         .await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // Test with multiple nodes
@@ -239,12 +232,12 @@ async fn test_map_projection_multiple_nodes() -> Result<()> {
 async fn test_map_projection_string_concat() -> Result<()> {
     let db = Uni::temporary().build().await?;
 
-    db.session()
-        .execute("CREATE LABEL Person (firstName STRING, lastName STRING)")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL Person (firstName STRING, lastName STRING)")
         .await?;
-    db.session()
-        .execute("CREATE (:Person {firstName: 'Nora', lastName: 'Smith'})")
+    tx.execute("CREATE (:Person {firstName: 'Nora', lastName: 'Smith'})")
         .await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // Test string concatenation in computed property
@@ -268,26 +261,17 @@ async fn test_map_projection_string_concat() -> Result<()> {
 async fn test_map_projection_with_edges() -> Result<()> {
     let db = Uni::temporary().build().await?;
 
-    db.session()
-        .execute("CREATE LABEL Person (name STRING)")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL Person (name STRING)").await?;
+    tx.execute("CREATE EDGE TYPE FRIEND_OF () FROM Person TO Person")
         .await?;
-    db.session()
-        .execute("CREATE EDGE TYPE FRIEND_OF () FROM Person TO Person")
-        .await?;
-
-    // Create nodes first
-    db.session()
-        .execute("CREATE (a:Person {name: 'Oscar'})")
-        .await?;
-    db.session()
-        .execute("CREATE (b:Person {name: 'Paula'})")
-        .await?;
-
-    // Create edge
-    db.session().execute(
+    tx.execute("CREATE (a:Person {name: 'Oscar'})").await?;
+    tx.execute("CREATE (b:Person {name: 'Paula'})").await?;
+    tx.execute(
         "MATCH (a:Person {name: 'Oscar'}), (b:Person {name: 'Paula'}) CREATE (a)-[:FRIEND_OF]->(b)",
     )
     .await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // Test basic map projection syntax on relationship (even if properties are empty)
@@ -308,17 +292,14 @@ async fn test_map_projection_with_edges() -> Result<()> {
 async fn test_map_projection_multiple() -> Result<()> {
     let db = Uni::temporary().build().await?;
 
-    db.session()
-        .execute("CREATE LABEL Person (name STRING, age INT32, city STRING)")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL Person (name STRING, age INT32, city STRING)")
         .await?;
-
-    // Create two nodes
-    db.session()
-        .execute("CREATE (a:Person {name: 'Quinn', age: 36, city: 'Portland'})")
+    tx.execute("CREATE (a:Person {name: 'Quinn', age: 36, city: 'Portland'})")
         .await?;
-    db.session()
-        .execute("CREATE (b:Person {name: 'Rose', age: 38, city: 'Seattle'})")
+    tx.execute("CREATE (b:Person {name: 'Rose', age: 38, city: 'Seattle'})")
         .await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // Test multiple map projections in the same RETURN clause

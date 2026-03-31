@@ -110,6 +110,22 @@ impl BulkWriterBuilder {
         }
     }
 
+    /// Create a bulk writer builder without a write guard.
+    ///
+    /// Used by `Transaction::bulk_writer()` — the Transaction already holds
+    /// the session write guard, so the BulkWriter must not release it.
+    pub(crate) fn new_unguarded(db: Arc<UniInner>) -> Self {
+        Self {
+            db,
+            config: BulkConfig::default(),
+            progress_callback: None,
+            session_write_guard: None,
+            guard_pre_acquired: true,
+            is_pinned: false,
+            session_id: String::new(),
+        }
+    }
+
     /// Create a new bulk writer builder with deferred guard acquisition.
     ///
     /// The guard is acquired in [`build()`](Self::build) rather than at creation time,
@@ -1322,10 +1338,7 @@ impl BulkWriter {
         }
 
         self.committed = true;
-        // Release session write guard on successful commit
-        if let Some(guard) = &self.session_write_guard {
-            guard.store(false, Ordering::SeqCst);
-        }
+        self.release_guard();
         self.stats.duration = self.start_time.elapsed();
         Ok(self.stats.clone())
     }

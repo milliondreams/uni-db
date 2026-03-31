@@ -147,6 +147,38 @@ impl std::fmt::Debug for L0Buffer {
     }
 }
 
+impl Clone for L0Buffer {
+    /// Clone the L0 buffer for fork/restore (ASSUME/ABDUCE).
+    ///
+    /// The cloned buffer does NOT share the WAL reference — forked L0s are
+    /// ephemeral and should not write to the WAL.
+    fn clone(&self) -> Self {
+        Self {
+            graph: self.graph.clone(),
+            tombstones: self.tombstones.clone(),
+            vertex_tombstones: self.vertex_tombstones.clone(),
+            edge_versions: self.edge_versions.clone(),
+            vertex_versions: self.vertex_versions.clone(),
+            edge_properties: self.edge_properties.clone(),
+            vertex_properties: self.vertex_properties.clone(),
+            edge_endpoints: self.edge_endpoints.clone(),
+            vertex_labels: self.vertex_labels.clone(),
+            edge_types: self.edge_types.clone(),
+            current_version: self.current_version,
+            mutation_count: self.mutation_count,
+            mutation_stats: self.mutation_stats.clone(),
+            wal: None, // Forked L0s don't share the WAL
+            wal_lsn_at_flush: self.wal_lsn_at_flush,
+            vertex_created_at: self.vertex_created_at.clone(),
+            vertex_updated_at: self.vertex_updated_at.clone(),
+            edge_created_at: self.edge_created_at.clone(),
+            edge_updated_at: self.edge_updated_at.clone(),
+            estimated_size: self.estimated_size,
+            constraint_index: self.constraint_index.clone(),
+        }
+    }
+}
+
 impl L0Buffer {
     /// Append labels to a vec, skipping duplicates.
     fn append_unique_labels(existing: &mut Vec<String>, labels: &[String]) {
@@ -297,12 +329,8 @@ impl L0Buffer {
         self.graph.add_vertex(vid);
         self.mutation_count += 1;
         self.mutation_stats.nodes_created += 1;
-        if !properties.is_empty() {
-            self.mutation_stats.properties_set += properties.len();
-        }
-        if !labels.is_empty() {
-            self.mutation_stats.labels_added += labels.len();
-        }
+        self.mutation_stats.properties_set += properties.len();
+        self.mutation_stats.labels_added += labels.len();
 
         let props_size = Self::estimate_properties_size(&properties);
         self.estimated_size += 8 + props_size + 16 + labels_size + 32;
@@ -509,9 +537,7 @@ impl L0Buffer {
         self.tombstones.remove(&eid);
         self.mutation_count += 1;
         self.mutation_stats.relationships_created += 1;
-        if props_count > 0 {
-            self.mutation_stats.properties_set += props_count;
-        }
+        self.mutation_stats.properties_set += props_count;
 
         // 24 edge + props + 16 version + 28 endpoints + 32 timestamps
         self.estimated_size += 24 + props_size + 16 + 28 + 32;
@@ -722,6 +748,20 @@ impl L0Buffer {
                 let props = other.edge_properties.get(eid).cloned().unwrap_or_default();
                 let etype_name = other.edge_types.get(eid).cloned();
                 self.insert_edge(*src, *dst, *etype, *eid, props, etype_name)?;
+            }
+        }
+
+        // Merge tombstones for edges that only exist in the target buffer (self),
+        // not in the source buffer's edge_endpoints.  Without this, transaction
+        // DELETEs of pre-existing edges are silently lost on commit.
+        for (eid, tombstone) in &other.tombstones {
+            if !other.edge_endpoints.contains_key(eid) {
+                self.delete_edge(
+                    *eid,
+                    tombstone.src_vid,
+                    tombstone.dst_vid,
+                    tombstone.edge_type,
+                )?;
             }
         }
 

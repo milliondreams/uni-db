@@ -32,7 +32,8 @@ async def bulk_db():
 async def test_async_bulk_writer_builder(bulk_db):
     """Test creating an async bulk writer with builder."""
     session = bulk_db.session()
-    writer = await session.bulk_writer().build()
+    tx = await session.tx()
+    writer = await tx.bulk_writer().build()
     assert writer is not None
 
 
@@ -40,7 +41,8 @@ async def test_async_bulk_writer_builder(bulk_db):
 async def test_async_bulk_insert_vertices(bulk_db):
     """Test async bulk inserting vertices."""
     session = bulk_db.session()
-    writer = await session.bulk_writer().build()
+    tx = await session.tx()
+    writer = await tx.bulk_writer().build()
 
     vids = await writer.insert_vertices(
         "Person",
@@ -53,6 +55,7 @@ async def test_async_bulk_insert_vertices(bulk_db):
 
     assert len(vids) == 3
     await writer.commit()
+    await tx.commit()
 
     results = await session.query(
         "MATCH (n:Person) RETURN n.name AS name ORDER BY n.name"
@@ -65,7 +68,8 @@ async def test_async_bulk_insert_vertices(bulk_db):
 async def test_async_bulk_insert_edges(bulk_db):
     """Test async bulk inserting edges."""
     session = bulk_db.session()
-    writer = await session.bulk_writer().build()
+    tx = await session.tx()
+    writer = await tx.bulk_writer().build()
 
     person_vids = await writer.insert_vertices(
         "Person",
@@ -82,6 +86,7 @@ async def test_async_bulk_insert_edges(bulk_db):
     )
 
     await writer.commit()
+    await tx.commit()
 
     results = await session.query(
         "MATCH (p:Person)-[:WORKS_AT]->(c:Company) "
@@ -94,7 +99,8 @@ async def test_async_bulk_insert_edges(bulk_db):
 async def test_async_bulk_writer_abort(bulk_db):
     """Test aborting an async bulk write operation."""
     session = bulk_db.session()
-    writer = await session.bulk_writer().build()
+    tx = await session.tx()
+    writer = await tx.bulk_writer().build()
 
     await writer.insert_vertices(
         "Person",
@@ -102,6 +108,7 @@ async def test_async_bulk_writer_abort(bulk_db):
     )
 
     writer.abort()
+    await tx.rollback()
 
     with pytest.raises(RuntimeError):
         await writer.insert_vertices("Person", [{"name": "AfterAbort", "age": 100}])
@@ -111,12 +118,14 @@ async def test_async_bulk_writer_abort(bulk_db):
 async def test_async_bulk_stats_attributes(bulk_db):
     """Test BulkStats attributes from async commit."""
     session = bulk_db.session()
-    writer = await session.bulk_writer().build()
+    tx = await session.tx()
+    writer = await tx.bulk_writer().build()
     await writer.insert_vertices(
         "Person",
         [{"name": f"Person{i}", "age": i} for i in range(10)],
     )
     stats = await writer.commit()
+    await tx.commit()
 
     assert hasattr(stats, "vertices_inserted")
     assert hasattr(stats, "edges_inserted")
@@ -128,8 +137,9 @@ async def test_async_bulk_stats_attributes(bulk_db):
 async def test_async_bulk_writer_builder_config(bulk_db):
     """Test async bulk writer builder with configuration options."""
     session = bulk_db.session()
+    tx = await session.tx()
     writer = await (
-        session.bulk_writer()
+        tx.bulk_writer()
         .defer_vector_indexes(True)
         .defer_scalar_indexes(True)
         .batch_size(5000)
@@ -144,13 +154,15 @@ async def test_async_bulk_writer_builder_config(bulk_db):
     )
     assert len(vids) == 1
     await writer.commit()
+    await tx.commit()
 
 
 @pytest.mark.asyncio
 async def test_async_bulk_insert_vertices_convenience(bulk_db):
     """Test bulk_insert_vertices convenience method via session."""
     session = bulk_db.session()
-    bw = await session.bulk_writer().build()
+    tx = await session.tx()
+    bw = await tx.bulk_writer().build()
     vids = await bw.insert_vertices(
         "Person",
         [
@@ -159,6 +171,7 @@ async def test_async_bulk_insert_vertices_convenience(bulk_db):
         ],
     )
     await bw.commit()
+    await tx.commit()
     assert len(vids) == 2
     results = await session.query(
         "MATCH (n:Person) RETURN n.name AS name ORDER BY n.name"
@@ -170,7 +183,8 @@ async def test_async_bulk_insert_vertices_convenience(bulk_db):
 async def test_async_bulk_insert_edges_convenience(bulk_db):
     """Test bulk_insert_edges convenience method via session."""
     session = bulk_db.session()
-    bw = await session.bulk_writer().build()
+    tx = await session.tx()
+    bw = await tx.bulk_writer().build()
     person_vids = await bw.insert_vertices(
         "Person",
         [{"name": "Alice", "age": 30}, {"name": "Bob", "age": 25}],
@@ -185,6 +199,7 @@ async def test_async_bulk_insert_edges_convenience(bulk_db):
         ],
     )
     await bw.commit()
+    await tx.commit()
 
     results = await session.query(
         "MATCH (p:Person)-[:WORKS_AT]->(c:Company) "

@@ -563,7 +563,9 @@ class TestSchemaOnEmptyDb:
         """Test creating data and querying on initially empty database."""
         session = social_db.session()
         # Create a single person
-        session.execute("CREATE (p:Person {name: 'TestUser', age: 99})")
+        tx = session.tx()
+        tx.execute("CREATE (p:Person {name: 'TestUser', age: 99})")
+        tx.commit()
         social_db.flush()
 
         # Query it back

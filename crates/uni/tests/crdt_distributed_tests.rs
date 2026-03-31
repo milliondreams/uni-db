@@ -70,6 +70,7 @@ mod multi_actor_convergence {
                         vid,
                         HashMap::from([("counter".to_string(), val.into())]),
                         &["CounterNode".to_string()],
+                        None,
                     )
                     .await?;
             }
@@ -137,6 +138,7 @@ mod multi_actor_convergence {
                     vid,
                     HashMap::from([("items".to_string(), val1.into())]),
                     &["SetNode".to_string()],
+                    None,
                 )
                 .await?;
             writer.flush_to_l1(None).await?;
@@ -156,6 +158,7 @@ mod multi_actor_convergence {
                     vid,
                     HashMap::from([("items".to_string(), val2.into())]),
                     &["SetNode".to_string()],
+                    None,
                 )
                 .await?;
             writer.flush_to_l1(None).await?;
@@ -173,6 +176,7 @@ mod multi_actor_convergence {
                     vid,
                     HashMap::from([("items".to_string(), val3.into())]),
                     &["SetNode".to_string()],
+                    None,
                 )
                 .await?;
             writer.flush_to_l1(None).await?;

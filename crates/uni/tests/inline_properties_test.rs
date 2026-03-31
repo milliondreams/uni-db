@@ -8,21 +8,17 @@ use uni_db::Uni;
 async fn test_inline_property_simple() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
-    // Create schema
-    db.session()
-        .execute("CREATE LABEL Person (name STRING, age INT)")
+    // Create schema and test data
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL Person (name STRING, age INT)")
         .await?;
-
-    // Create test data
-    db.session()
-        .execute("CREATE (:Person {name: 'Alice', age: 25})")
+    tx.execute("CREATE (:Person {name: 'Alice', age: 25})")
         .await?;
-    db.session()
-        .execute("CREATE (:Person {name: 'Bob', age: 30})")
+    tx.execute("CREATE (:Person {name: 'Bob', age: 30})")
         .await?;
-    db.session()
-        .execute("CREATE (:Person {name: 'Charlie', age: 35})")
+    tx.execute("CREATE (:Person {name: 'Charlie', age: 35})")
         .await?;
+    tx.commit().await?;
 
     // Test inline property matching
     let result = db
@@ -50,21 +46,17 @@ async fn test_inline_property_simple() -> Result<()> {
 async fn test_inline_property_multiple() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
-    // Create schema
-    db.session()
-        .execute("CREATE LABEL Product (name STRING, price INT, category STRING)")
+    // Create schema and test data
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL Product (name STRING, price INT, category STRING)")
         .await?;
-
-    // Create test data
-    db.session()
-        .execute("CREATE (:Product {name: 'Laptop', price: 1000, category: 'Electronics'})")
+    tx.execute("CREATE (:Product {name: 'Laptop', price: 1000, category: 'Electronics'})")
         .await?;
-    db.session()
-        .execute("CREATE (:Product {name: 'Mouse', price: 25, category: 'Electronics'})")
+    tx.execute("CREATE (:Product {name: 'Mouse', price: 25, category: 'Electronics'})")
         .await?;
-    db.session()
-        .execute("CREATE (:Product {name: 'Desk', price: 300, category: 'Furniture'})")
+    tx.execute("CREATE (:Product {name: 'Desk', price: 300, category: 'Furniture'})")
         .await?;
+    tx.commit().await?;
 
     // Test multiple inline properties
     let result = db

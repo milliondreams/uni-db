@@ -34,7 +34,9 @@ async def test_async_transaction_rollback():
     session = db.session()
 
     # Insert a baseline
-    await session.execute("CREATE (n:Person {name: 'Existing'})")
+    tx_setup = await session.tx()
+    await tx_setup.execute("CREATE (n:Person {name: 'Existing'})")
+    await tx_setup.commit()
 
     tx = await session.tx()
     await tx.query("CREATE (n:Person {name: 'WillBeRolledBack'})")
@@ -75,7 +77,9 @@ async def test_async_transaction_context_manager_rollback_on_error():
     await db.schema().label("Item").property("value", "int").apply()
 
     session = db.session()
-    await session.execute("CREATE (n:Item {value: 0})")
+    tx_setup = await session.tx()
+    await tx_setup.execute("CREATE (n:Item {value: 0})")
+    await tx_setup.commit()
 
     tx = await session.tx()
     with pytest.raises(ValueError):

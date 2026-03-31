@@ -9,17 +9,14 @@ async fn test_incoming_relationship_create() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
     // Create schema
-    db.session().execute("CREATE LABEL A (name STRING)").await?;
-    db.session().execute("CREATE LABEL B (name STRING)").await?;
-    db.session()
-        .execute("CREATE EDGE TYPE KNOWS (since INT) FROM B TO A")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL A (name STRING)").await?;
+    tx.execute("CREATE LABEL B (name STRING)").await?;
+    tx.execute("CREATE EDGE TYPE KNOWS (since INT) FROM B TO A")
         .await?;
-
-    // Create pattern with incoming relationship: (a)<-[:KNOWS]-(b)
-    // This should create edge from b -> a
-    db.session()
-        .execute("CREATE (a:A {name: 'Alice'})<-[:KNOWS {since: 2020}]-(b:B {name: 'Bob'})")
+    tx.execute("CREATE (a:A {name: 'Alice'})<-[:KNOWS {since: 2020}]-(b:B {name: 'Bob'})")
         .await?;
+    tx.commit().await?;
 
     // Query in outgoing direction: Bob -> Alice
     let result = db
@@ -39,15 +36,13 @@ async fn test_mixed_directions() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
     // Create labels only - use schemaless edge types
-    db.session().execute("CREATE LABEL A (id INT)").await?;
-    db.session().execute("CREATE LABEL B (id INT)").await?;
-    db.session().execute("CREATE LABEL C (id INT)").await?;
-
-    // Create pattern with mixed directions: (a)<-[:ADMIN]-(b)-[:ADMIN]->(c)
-    // Should create: b -> a and b -> c
-    db.session()
-        .execute("CREATE (a:A {id: 0})<-[:ADMIN]-(b:B {id: 1})-[:ADMIN]->(c:C {id: 2})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL A (id INT)").await?;
+    tx.execute("CREATE LABEL B (id INT)").await?;
+    tx.execute("CREATE LABEL C (id INT)").await?;
+    tx.execute("CREATE (a:A {id: 0})<-[:ADMIN]-(b:B {id: 1})-[:ADMIN]->(c:C {id: 2})")
         .await?;
+    tx.commit().await?;
 
     // Flush to ensure writes are visible
     db.flush().await?;
@@ -84,19 +79,15 @@ async fn test_incoming_with_properties() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
     // Create schema
-    db.session()
-        .execute("CREATE LABEL Person (name STRING)")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL Person (name STRING)").await?;
+    tx.execute("CREATE EDGE TYPE FOLLOWS (since INT) FROM Person TO Person")
         .await?;
-    db.session()
-        .execute("CREATE EDGE TYPE FOLLOWS (since INT) FROM Person TO Person")
-        .await?;
-
-    // Create incoming relationship with properties
-    db.session()
-        .execute(
-            "CREATE (:Person {name: 'Alice'})<-[:FOLLOWS {since: 2021}]-(:Person {name: 'Bob'})",
-        )
-        .await?;
+    tx.execute(
+        "CREATE (:Person {name: 'Alice'})<-[:FOLLOWS {since: 2021}]-(:Person {name: 'Bob'})",
+    )
+    .await?;
+    tx.commit().await?;
 
     // Query to verify edge direction and properties
     let result = db

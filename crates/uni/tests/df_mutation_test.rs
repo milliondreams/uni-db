@@ -23,9 +23,9 @@ async fn test_df_create_read_your_write() -> Result<()> {
         .await?;
 
     // Standalone CREATE — routes through DF MutationCreateExec (terminal mutation)
-    db.session()
-        .execute("CREATE (n:TestNode {name: 'Alice'})")
-        .await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (n:TestNode {name: 'Alice'})").await?;
+    tx.commit().await?;
 
     // Subsequent MATCH should see the created node via L0 buffer
     let result = db
@@ -50,9 +50,11 @@ async fn test_df_create_multiple_nodes() -> Result<()> {
         .await?;
 
     // Three separate CREATEs — each should go through DF MutationCreateExec
-    db.session().execute("CREATE (n:Item {id: 1})").await?;
-    db.session().execute("CREATE (n:Item {id: 2})").await?;
-    db.session().execute("CREATE (n:Item {id: 3})").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (n:Item {id: 1})").await?;
+    tx.execute("CREATE (n:Item {id: 2})").await?;
+    tx.execute("CREATE (n:Item {id: 3})").await?;
+    tx.commit().await?;
 
     // All three should be visible
     let result = db
@@ -80,14 +82,15 @@ async fn test_df_set_read_your_write() -> Result<()> {
         .await?;
 
     // Setup: Create a node (goes through fallback because multi-clause or DF for terminal)
-    db.session()
-        .execute("CREATE (n:Person {name: 'Alice'})")
-        .await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (n:Person {name: 'Alice'})").await?;
+    tx.commit().await?;
 
     // Terminal SET — routes through DF MutationSetExec
-    db.session()
-        .execute("MATCH (n:Person {name: 'Alice'}) SET n.name = 'Updated'")
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (n:Person {name: 'Alice'}) SET n.name = 'Updated'")
         .await?;
+    tx.commit().await?;
 
     // Subsequent MATCH should see the updated name
     let result = db.session().query("MATCH (n:Person) RETURN n.name").await?;
@@ -110,8 +113,10 @@ async fn test_df_delete_read_your_write() -> Result<()> {
         .await?;
 
     // Setup
-    db.session().execute("CREATE (n:Ephemeral {id: 1})").await?;
-    db.session().execute("CREATE (n:Ephemeral {id: 2})").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (n:Ephemeral {id: 1})").await?;
+    tx.execute("CREATE (n:Ephemeral {id: 2})").await?;
+    tx.commit().await?;
 
     // Verify both exist
     let result = db
@@ -121,9 +126,10 @@ async fn test_df_delete_read_your_write() -> Result<()> {
     assert_eq!(result.rows().len(), 2);
 
     // Terminal DETACH DELETE — routes through DF MutationDeleteExec
-    db.session()
-        .execute("MATCH (n:Ephemeral {id: 1}) DETACH DELETE n")
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (n:Ephemeral {id: 1}) DETACH DELETE n")
         .await?;
+    tx.commit().await?;
 
     // Only one should remain
     let result = db
@@ -150,9 +156,10 @@ async fn test_df_remove_read_your_write() -> Result<()> {
         .await?;
 
     // Setup
-    db.session()
-        .execute("CREATE (n:Tag {name: 'rust', color: 'orange'})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (n:Tag {name: 'rust', color: 'orange'})")
         .await?;
+    tx.commit().await?;
 
     // Verify the property exists
     let result = db.session().query("MATCH (n:Tag) RETURN n.color").await?;
@@ -160,7 +167,9 @@ async fn test_df_remove_read_your_write() -> Result<()> {
     assert_eq!(result.rows()[0].get::<String>("n.color")?, "orange");
 
     // Terminal REMOVE — routes through DF MutationRemoveExec
-    db.session().execute("MATCH (n:Tag) REMOVE n.color").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (n:Tag) REMOVE n.color").await?;
+    tx.commit().await?;
 
     // Property should be null/removed
     let result = db
@@ -186,13 +195,16 @@ async fn test_df_create_edge_read_your_write() -> Result<()> {
     db.schema().edge_type("LINK", &[], &[]).apply().await?;
 
     // Setup nodes
-    db.session().execute("CREATE (n:Node {id: 1})").await?;
-    db.session().execute("CREATE (n:Node {id: 2})").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (n:Node {id: 1})").await?;
+    tx.execute("CREATE (n:Node {id: 2})").await?;
+    tx.commit().await?;
 
     // Terminal edge CREATE — routes through DF MutationCreateExec
-    db.session()
-        .execute("MATCH (a:Node {id: 1}), (b:Node {id: 2}) CREATE (a)-[:LINK]->(b)")
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (a:Node {id: 1}), (b:Node {id: 2}) CREATE (a)-[:LINK]->(b)")
         .await?;
+    tx.commit().await?;
 
     // Verify edge exists by traversal
     let result = db

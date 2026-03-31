@@ -1218,9 +1218,6 @@ impl HybridPhysicalPlanner {
             | LogicalPlan::CreateConstraint(_)
             | LogicalPlan::DropConstraint(_)
             | LogicalPlan::ShowConstraints(_)
-            | LogicalPlan::Begin
-            | LogicalPlan::Commit
-            | LogicalPlan::Rollback
             | LogicalPlan::Explain { .. } => {
                 Err(anyhow!("DDL/Admin operations should be handled separately"))
             }
@@ -4866,10 +4863,7 @@ fn collect_variable_kinds(plan: &LogicalPlan, kinds: &mut HashMap<String, Variab
         | LogicalPlan::DropEdgeType(_)
         | LogicalPlan::CreateConstraint(_)
         | LogicalPlan::DropConstraint(_)
-        | LogicalPlan::ShowConstraints(_)
-        | LogicalPlan::Begin
-        | LogicalPlan::Commit
-        | LogicalPlan::Rollback => {}
+        | LogicalPlan::ShowConstraints(_) => {}
     }
 }
 

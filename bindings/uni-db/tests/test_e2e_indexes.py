@@ -32,15 +32,17 @@ def indexed_db(tmp_path):
 
     # Add some test data
     session = db.session()
-    session.execute("""
+    tx = session.tx()
+    tx.execute("""
         CREATE (:Item {sku: 'SKU001', name: 'Widget', embedding: [1.0, 0.0, 0.0, 0.0]})
     """)
-    session.execute("""
+    tx.execute("""
         CREATE (:Item {sku: 'SKU002', name: 'Gadget', embedding: [0.0, 1.0, 0.0, 0.0]})
     """)
-    session.execute("""
+    tx.execute("""
         CREATE (:Item {sku: 'SKU003', name: 'Doohickey', embedding: [0.0, 0.0, 1.0, 0.0]})
     """)
+    tx.commit()
     db.flush()
 
     yield db
@@ -75,9 +77,11 @@ def test_create_additional_scalar_index(indexed_db):
     session = db.session()
 
     # Add a new property to schema
-    session.execute(
+    tx = session.tx()
+    tx.execute(
         "CREATE (:Item {sku: 'SKU004', name: 'Thingamajig', embedding: [0.5, 0.5, 0.0, 0.0]})"
     )
+    tx.commit()
     db.flush()
 
     # Verify new item exists
@@ -104,9 +108,11 @@ def test_create_additional_vector_index(indexed_db):
         .done()
         .apply()
     )
-    session.execute("""
+    tx = session.tx()
+    tx.execute("""
         CREATE (:Document {title: 'Doc1', vector: [1.0, 0.0, 0.0, 0.0]})
     """)
+    tx.commit()
     db.flush()
 
     # Create vector index with cosine similarity
@@ -164,14 +170,16 @@ def test_index_on_edge_type_properties(indexed_db):
     session = db.session()
 
     # Create some edges with weights
-    session.execute("""
+    tx = session.tx()
+    tx.execute("""
         MATCH (i1:Item {sku: 'SKU001'}), (i2:Item {sku: 'SKU002'})
         CREATE (i1)-[:RELATED_TO {weight: 0.8}]->(i2)
     """)
-    session.execute("""
+    tx.execute("""
         MATCH (i1:Item {sku: 'SKU002'}), (i2:Item {sku: 'SKU003'})
         CREATE (i1)-[:RELATED_TO {weight: 0.6}]->(i2)
     """)
+    tx.commit()
     db.flush()
 
     # Query edges by weight

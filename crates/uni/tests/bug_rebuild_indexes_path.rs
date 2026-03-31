@@ -33,15 +33,14 @@ async fn test_rebuild_indexes_finds_correct_dataset() -> anyhow::Result<()> {
     // 2. Create database and insert vertices with embeddings
     let db = Uni::open(path.to_str().unwrap()).build().await?;
 
-    db.session()
-        .execute("CREATE (:Chunk {text: 'alpha', embedding: [1.0, 0.0, 0.0]})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Chunk {text: 'alpha', embedding: [1.0, 0.0, 0.0]})")
         .await?;
-    db.session()
-        .execute("CREATE (:Chunk {text: 'beta', embedding: [0.0, 1.0, 0.0]})")
+    tx.execute("CREATE (:Chunk {text: 'beta', embedding: [0.0, 1.0, 0.0]})")
         .await?;
-    db.session()
-        .execute("CREATE (:Chunk {text: 'gamma', embedding: [0.0, 0.0, 1.0]})")
+    tx.execute("CREATE (:Chunk {text: 'gamma', embedding: [0.0, 0.0, 1.0]})")
         .await?;
+    tx.commit().await?;
 
     db.flush().await?;
 

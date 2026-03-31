@@ -12,7 +12,9 @@ async def test_create_single_vertex_and_read(async_social_db):
 
     session = async_social_db.session()
 
-    await session.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+    tx = await session.tx()
+    await tx.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+    await tx.commit()
     await async_social_db.flush()
 
     result = await session.query(
@@ -30,9 +32,11 @@ async def test_create_vertex_with_all_properties(async_social_db):
 
     session = async_social_db.session()
 
-    await session.execute(
+    tx = await session.tx()
+    await tx.execute(
         "CREATE (p:Person {name: 'Bob', age: 25, email: 'bob@example.com'})"
     )
+    await tx.commit()
     await async_social_db.flush()
 
     result = await session.query(
@@ -51,7 +55,9 @@ async def test_create_vertex_with_nullable_property_omitted(async_social_db):
 
     session = async_social_db.session()
 
-    await session.execute("CREATE (p:Person {name: 'Charlie', age: 35})")
+    tx = await session.tx()
+    await tx.execute("CREATE (p:Person {name: 'Charlie', age: 35})")
+    await tx.commit()
     await async_social_db.flush()
 
     result = await session.query(
@@ -70,9 +76,11 @@ async def test_create_multiple_vertices(async_social_db):
 
     session = async_social_db.session()
 
-    await session.execute("CREATE (p1:Person {name: 'Diana', age: 28})")
-    await session.execute("CREATE (p2:Person {name: 'Eve', age: 32})")
-    await session.execute("CREATE (p3:Person {name: 'Frank', age: 40})")
+    tx = await session.tx()
+    await tx.execute("CREATE (p1:Person {name: 'Diana', age: 28})")
+    await tx.execute("CREATE (p2:Person {name: 'Eve', age: 32})")
+    await tx.execute("CREATE (p3:Person {name: 'Frank', age: 40})")
+    await tx.commit()
     await async_social_db.flush()
 
     result = await session.query(
@@ -91,13 +99,17 @@ async def test_create_edge_between_vertices(async_social_db):
 
     session = async_social_db.session()
 
-    await session.execute("CREATE (p:Person {name: 'Grace', age: 29})")
-    await session.execute("CREATE (p:Person {name: 'Henry', age: 31})")
+    tx = await session.tx()
+    await tx.execute("CREATE (p:Person {name: 'Grace', age: 29})")
+    await tx.execute("CREATE (p:Person {name: 'Henry', age: 31})")
+    await tx.commit()
     await async_social_db.flush()
 
-    await session.execute(
+    tx = await session.tx()
+    await tx.execute(
         "MATCH (a:Person {name: 'Grace'}), (b:Person {name: 'Henry'}) CREATE (a)-[:KNOWS]->(b)"
     )
+    await tx.commit()
     await async_social_db.flush()
 
     result = await session.query(
@@ -115,14 +127,18 @@ async def test_create_edge_with_properties(async_social_db):
 
     session = async_social_db.session()
 
-    await session.execute("CREATE (p:Person {name: 'Ivy', age: 27})")
-    await session.execute("CREATE (p:Person {name: 'Jack', age: 33})")
+    tx = await session.tx()
+    await tx.execute("CREATE (p:Person {name: 'Ivy', age: 27})")
+    await tx.execute("CREATE (p:Person {name: 'Jack', age: 33})")
+    await tx.commit()
     await async_social_db.flush()
 
-    await session.execute(
+    tx = await session.tx()
+    await tx.execute(
         "MATCH (a:Person {name: 'Ivy'}), (b:Person {name: 'Jack'}) "
         "CREATE (a)-[:KNOWS {since: 2020}]->(b)"
     )
+    await tx.commit()
     await async_social_db.flush()
 
     result = await session.query(
@@ -142,9 +158,11 @@ async def test_match_vertex_by_property(async_social_db):
 
     session = async_social_db.session()
 
-    await session.execute("CREATE (p:Person {name: 'Kelly', age: 26})")
-    await session.execute("CREATE (p:Person {name: 'Leo', age: 26})")
-    await session.execute("CREATE (p:Person {name: 'Mia', age: 30})")
+    tx = await session.tx()
+    await tx.execute("CREATE (p:Person {name: 'Kelly', age: 26})")
+    await tx.execute("CREATE (p:Person {name: 'Leo', age: 26})")
+    await tx.execute("CREATE (p:Person {name: 'Mia', age: 30})")
+    await tx.commit()
     await async_social_db.flush()
 
     result = await session.query(
@@ -162,9 +180,11 @@ async def test_match_with_where_clause(async_social_db):
 
     session = async_social_db.session()
 
-    await session.execute("CREATE (p:Person {name: 'Nina', age: 24})")
-    await session.execute("CREATE (p:Person {name: 'Oscar', age: 35})")
-    await session.execute("CREATE (p:Person {name: 'Paul', age: 42})")
+    tx = await session.tx()
+    await tx.execute("CREATE (p:Person {name: 'Nina', age: 24})")
+    await tx.execute("CREATE (p:Person {name: 'Oscar', age: 35})")
+    await tx.execute("CREATE (p:Person {name: 'Paul', age: 42})")
+    await tx.commit()
     await async_social_db.flush()
 
     result = await session.query(
@@ -182,10 +202,14 @@ async def test_set_property_on_vertex(async_social_db):
 
     session = async_social_db.session()
 
-    await session.execute("CREATE (p:Person {name: 'Quinn', age: 28})")
+    tx = await session.tx()
+    await tx.execute("CREATE (p:Person {name: 'Quinn', age: 28})")
+    await tx.commit()
     await async_social_db.flush()
 
-    await session.execute("MATCH (p:Person {name: 'Quinn'}) SET p.age = 29")
+    tx = await session.tx()
+    await tx.execute("MATCH (p:Person {name: 'Quinn'}) SET p.age = 29")
+    await tx.commit()
     await async_social_db.flush()
 
     result = await session.query("MATCH (p:Person {name: 'Quinn'}) RETURN p.age")
@@ -200,18 +224,22 @@ async def test_set_property_on_edge(async_social_db):
 
     session = async_social_db.session()
 
-    await session.execute("CREATE (p:Person {name: 'Rachel', age: 30})")
-    await session.execute("CREATE (p:Person {name: 'Sam', age: 32})")
-    await session.execute(
+    tx = await session.tx()
+    await tx.execute("CREATE (p:Person {name: 'Rachel', age: 30})")
+    await tx.execute("CREATE (p:Person {name: 'Sam', age: 32})")
+    await tx.execute(
         "MATCH (a:Person {name: 'Rachel'}), (b:Person {name: 'Sam'}) "
         "CREATE (a)-[:KNOWS {since: 2015}]->(b)"
     )
+    await tx.commit()
     await async_social_db.flush()
 
-    await session.execute(
+    tx = await session.tx()
+    await tx.execute(
         "MATCH (a:Person {name: 'Rachel'})-[k:KNOWS]->(b:Person {name: 'Sam'}) "
         "SET k.since = 2018"
     )
+    await tx.commit()
     await async_social_db.flush()
 
     result = await session.query(
@@ -229,13 +257,17 @@ async def test_delete_vertex(async_social_db):
 
     session = async_social_db.session()
 
-    await session.execute("CREATE (p:Person {name: 'Tina', age: 27})")
+    tx = await session.tx()
+    await tx.execute("CREATE (p:Person {name: 'Tina', age: 27})")
+    await tx.commit()
     await async_social_db.flush()
 
     result = await session.query("MATCH (p:Person {name: 'Tina'}) RETURN p.name")
     assert len(result) == 1
 
-    await session.execute("MATCH (p:Person {name: 'Tina'}) DELETE p")
+    tx = await session.tx()
+    await tx.execute("MATCH (p:Person {name: 'Tina'}) DELETE p")
+    await tx.commit()
     await async_social_db.flush()
 
     result = await session.query("MATCH (p:Person {name: 'Tina'}) RETURN p.name")
@@ -248,12 +280,14 @@ async def test_delete_edge(async_social_db):
 
     session = async_social_db.session()
 
-    await session.execute("CREATE (p:Person {name: 'Uma', age: 29})")
-    await session.execute("CREATE (p:Person {name: 'Victor', age: 31})")
-    await session.execute(
+    tx = await session.tx()
+    await tx.execute("CREATE (p:Person {name: 'Uma', age: 29})")
+    await tx.execute("CREATE (p:Person {name: 'Victor', age: 31})")
+    await tx.execute(
         "MATCH (a:Person {name: 'Uma'}), (b:Person {name: 'Victor'}) "
         "CREATE (a)-[:KNOWS]->(b)"
     )
+    await tx.commit()
     await async_social_db.flush()
 
     result = await session.query(
@@ -262,9 +296,11 @@ async def test_delete_edge(async_social_db):
     )
     assert len(result) == 1
 
-    await session.execute(
+    tx = await session.tx()
+    await tx.execute(
         "MATCH (a:Person {name: 'Uma'})-[k:KNOWS]->(b:Person {name: 'Victor'}) DELETE k"
     )
+    await tx.commit()
     await async_social_db.flush()
 
     result = await session.query(
@@ -285,20 +321,24 @@ async def test_delete_vertex_with_cascading_edge_removal(async_social_db):
 
     session = async_social_db.session()
 
-    await session.execute("CREATE (p:Person {name: 'Wendy', age: 28})")
-    await session.execute("CREATE (p:Person {name: 'Xavier', age: 30})")
-    await session.execute("CREATE (p:Person {name: 'Yara', age: 26})")
-    await session.execute(
+    tx = await session.tx()
+    await tx.execute("CREATE (p:Person {name: 'Wendy', age: 28})")
+    await tx.execute("CREATE (p:Person {name: 'Xavier', age: 30})")
+    await tx.execute("CREATE (p:Person {name: 'Yara', age: 26})")
+    await tx.execute(
         "MATCH (a:Person {name: 'Wendy'}), (b:Person {name: 'Xavier'}) "
         "CREATE (a)-[:KNOWS]->(b)"
     )
-    await session.execute(
+    await tx.execute(
         "MATCH (a:Person {name: 'Wendy'}), (b:Person {name: 'Yara'}) "
         "CREATE (a)-[:KNOWS]->(b)"
     )
+    await tx.commit()
     await async_social_db.flush()
 
-    await session.execute("MATCH (p:Person {name: 'Wendy'}) DETACH DELETE p")
+    tx = await session.tx()
+    await tx.execute("MATCH (p:Person {name: 'Wendy'}) DETACH DELETE p")
+    await tx.commit()
     await async_social_db.flush()
 
     result = await session.query("MATCH (p:Person {name: 'Wendy'}) RETURN p.name")
@@ -316,14 +356,18 @@ async def test_merge_vertex_upsert(async_social_db):
 
     session = async_social_db.session()
 
-    await session.execute("MERGE (p:Person {name: 'Zara', age: 25})")
+    tx = await session.tx()
+    await tx.execute("MERGE (p:Person {name: 'Zara', age: 25})")
+    await tx.commit()
     await async_social_db.flush()
 
     result = await session.query("MATCH (p:Person {name: 'Zara'}) RETURN p.age")
     assert len(result) == 1
     assert result[0]["p.age"] == 25
 
-    await session.execute("MERGE (p:Person {name: 'Zara', age: 25})")
+    tx = await session.tx()
+    await tx.execute("MERGE (p:Person {name: 'Zara', age: 25})")
+    await tx.commit()
     await async_social_db.flush()
 
     result = await session.query("MATCH (p:Person {name: 'Zara'}) RETURN p.age")
@@ -337,14 +381,18 @@ async def test_merge_edge(async_social_db):
 
     session = async_social_db.session()
 
-    await session.execute("CREATE (p:Person {name: 'Adam', age: 33})")
-    await session.execute("CREATE (p:Person {name: 'Beth', age: 29})")
+    tx = await session.tx()
+    await tx.execute("CREATE (p:Person {name: 'Adam', age: 33})")
+    await tx.execute("CREATE (p:Person {name: 'Beth', age: 29})")
+    await tx.commit()
     await async_social_db.flush()
 
-    await session.execute(
+    tx = await session.tx()
+    await tx.execute(
         "MATCH (a:Person {name: 'Adam'}), (b:Person {name: 'Beth'}) "
         "MERGE (a)-[k:KNOWS]->(b) ON CREATE SET k.since = 2021"
     )
+    await tx.commit()
     await async_social_db.flush()
 
     result = await session.query(
@@ -354,10 +402,12 @@ async def test_merge_edge(async_social_db):
     assert len(result) == 1
     assert result[0]["k.since"] == 2021
 
-    await session.execute(
+    tx = await session.tx()
+    await tx.execute(
         "MATCH (a:Person {name: 'Adam'}), (b:Person {name: 'Beth'}) "
         "MERGE (a)-[k:KNOWS]->(b) ON CREATE SET k.since = 2023"
     )
+    await tx.commit()
     await async_social_db.flush()
 
     result = await session.query(
@@ -374,14 +424,16 @@ async def test_match_and_return_multiple_properties(async_social_db):
 
     session = async_social_db.session()
 
-    await session.execute(
+    tx = await session.tx()
+    await tx.execute(
         "CREATE (p:Person {name: 'Carol', age: 34, email: 'carol@example.com'})"
     )
-    await session.execute("CREATE (c:Company {name: 'TechCorp', founded: 2010})")
-    await session.execute(
+    await tx.execute("CREATE (c:Company {name: 'TechCorp', founded: 2010})")
+    await tx.execute(
         "MATCH (p:Person {name: 'Carol'}), (c:Company {name: 'TechCorp'}) "
         "CREATE (p)-[:WORKS_AT {role: 'Engineer'}]->(c)"
     )
+    await tx.commit()
     await async_social_db.flush()
 
     result = await session.query(
@@ -404,10 +456,12 @@ async def test_create_with_parameterized_queries(async_social_db):
 
     session = async_social_db.session()
 
-    await session.execute(
+    tx = await session.tx()
+    await tx.execute(
         "CREATE (p:Person {name: $name, age: $age})",
         params={"name": "David", "age": 36},
     )
+    await tx.commit()
     await async_social_db.flush()
 
     result = await session.query(
@@ -418,14 +472,16 @@ async def test_create_with_parameterized_queries(async_social_db):
     assert result[0]["p.name"] == "David"
     assert result[0]["p.age"] == 36
 
-    await session.execute(
+    tx = await session.tx()
+    await tx.execute(
         "CREATE (p:Person {name: $name, age: $age})", params={"name": "Emma", "age": 28}
     )
-    await session.execute(
+    await tx.execute(
         "MATCH (a:Person {name: $name1}), (b:Person {name: $name2}) "
         "CREATE (a)-[:KNOWS {since: $since}]->(b)",
         params={"name1": "David", "name2": "Emma", "since": 2019},
     )
+    await tx.commit()
     await async_social_db.flush()
 
     result = await session.query(

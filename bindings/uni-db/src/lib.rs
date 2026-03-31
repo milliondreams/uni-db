@@ -47,7 +47,6 @@ fn _uni_db(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Session builders
     m.add_class::<builders::SessionQueryBuilder>()?;
-    m.add_class::<builders::SessionAutoCommitBuilder>()?;
     m.add_class::<builders::SessionLocyBuilder>()?;
     m.add_class::<builders::SessionProfileBuilder>()?;
     m.add_class::<builders::PyTransactionBuilder>()?;
@@ -59,7 +58,6 @@ fn _uni_db(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<builders::PyApplyBuilder>()?;
 
     // Bulk loading
-    m.add_class::<builders::BulkWriterBuilder>()?;
     m.add_class::<builders::BulkWriter>()?;
 
     // Async classes
@@ -69,7 +67,6 @@ fn _uni_db(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<async_api::AsyncTransaction>()?;
     m.add_class::<async_api::AsyncSession>()?;
     m.add_class::<async_api::AsyncBulkWriter>()?;
-    m.add_class::<async_api::AsyncBulkWriterBuilder>()?;
     m.add_class::<async_api::AsyncTransactionBuilder>()?;
     m.add_class::<async_api::AsyncQueryBuilder>()?;
     m.add_class::<async_api::AsyncQueryCursor>()?;
@@ -102,7 +99,6 @@ fn _uni_db(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<types::PyLocyExplainOutput>()?;
 
     // New result types
-    m.add_class::<types::PyAutoCommitResult>()?;
     m.add_class::<types::PyExecuteResult>()?;
     m.add_class::<types::PyApplyResult>()?;
     m.add_class::<types::PyDerivedFactSet>()?;
@@ -137,7 +133,6 @@ fn _uni_db(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Async session/transaction builders
     m.add_class::<async_api::AsyncSessionQueryBuilder>()?;
-    m.add_class::<async_api::AsyncAutoCommitBuilder>()?;
     m.add_class::<async_api::AsyncSessionLocyBuilder>()?;
     m.add_class::<async_api::AsyncSessionProfileBuilder>()?;
     m.add_class::<async_api::AsyncTxQueryBuilder>()?;
@@ -156,8 +151,10 @@ fn _uni_db(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<types::PyPreparedLocyBinder>()?;
     m.add_class::<types::PyWriteLease>()?;
 
-    // Phase C: AppenderBuilder
-    m.add_class::<builders::PyAppenderBuilder>()?;
+    // Transaction bulk writer/appender builders
+    m.add_class::<sync_api::TxBulkWriterBuilder>()?;
+    m.add_class::<sync_api::TxAppenderBuilder>()?;
+    m.add_class::<async_api::AsyncTxBulkWriterBuilder>()?;
 
     // Type system enums
     m.add_class::<types::PyDataType>()?;

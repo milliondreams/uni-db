@@ -52,21 +52,21 @@ async fn test_pagerank_procedure() -> anyhow::Result<()> {
 
     {
         let mut w = writer.write().await;
-        w.insert_vertex_with_labels(vid_a, HashMap::new(), &["Person".to_string()])
+        w.insert_vertex_with_labels(vid_a, HashMap::new(), &["Person".to_string()], None)
             .await?;
-        w.insert_vertex_with_labels(vid_b, HashMap::new(), &["Person".to_string()])
+        w.insert_vertex_with_labels(vid_b, HashMap::new(), &["Person".to_string()], None)
             .await?;
-        w.insert_vertex_with_labels(vid_c, HashMap::new(), &["Person".to_string()])
+        w.insert_vertex_with_labels(vid_c, HashMap::new(), &["Person".to_string()], None)
             .await?;
 
         let eid1 = w.next_eid(knows_edge).await?;
-        w.insert_edge(vid_a, vid_b, knows_edge, eid1, HashMap::new(), None)
+        w.insert_edge(vid_a, vid_b, knows_edge, eid1, HashMap::new(), None, None)
             .await?;
         let eid2 = w.next_eid(knows_edge).await?;
-        w.insert_edge(vid_b, vid_c, knows_edge, eid2, HashMap::new(), None)
+        w.insert_edge(vid_b, vid_c, knows_edge, eid2, HashMap::new(), None, None)
             .await?;
         let eid3 = w.next_eid(knows_edge).await?;
-        w.insert_edge(vid_c, vid_a, knows_edge, eid3, HashMap::new(), None)
+        w.insert_edge(vid_c, vid_a, knows_edge, eid3, HashMap::new(), None, None)
             .await?;
 
         w.flush_to_l1(None).await?;
@@ -130,15 +130,15 @@ async fn test_wcc_procedure() -> anyhow::Result<()> {
 
     {
         let mut w = writer.write().await;
-        w.insert_vertex_with_labels(vid_a, HashMap::new(), &["Node".to_string()])
+        w.insert_vertex_with_labels(vid_a, HashMap::new(), &["Node".to_string()], None)
             .await?;
-        w.insert_vertex_with_labels(vid_b, HashMap::new(), &["Node".to_string()])
+        w.insert_vertex_with_labels(vid_b, HashMap::new(), &["Node".to_string()], None)
             .await?;
-        w.insert_vertex_with_labels(vid_c, HashMap::new(), &["Node".to_string()])
+        w.insert_vertex_with_labels(vid_c, HashMap::new(), &["Node".to_string()], None)
             .await?;
 
         let eid = w.next_eid(link_edge).await?;
-        w.insert_edge(vid_a, vid_b, link_edge, eid, HashMap::new(), None)
+        w.insert_edge(vid_a, vid_b, link_edge, eid, HashMap::new(), None, None)
             .await?;
 
         w.flush_to_l1(None).await?;
@@ -212,18 +212,18 @@ async fn test_shortest_path_procedure() -> anyhow::Result<()> {
 
     {
         let mut w = writer.write().await;
-        w.insert_vertex_with_labels(vid_a, HashMap::new(), &["Node".to_string()])
+        w.insert_vertex_with_labels(vid_a, HashMap::new(), &["Node".to_string()], None)
             .await?;
-        w.insert_vertex_with_labels(vid_b, HashMap::new(), &["Node".to_string()])
+        w.insert_vertex_with_labels(vid_b, HashMap::new(), &["Node".to_string()], None)
             .await?;
-        w.insert_vertex_with_labels(vid_c, HashMap::new(), &["Node".to_string()])
+        w.insert_vertex_with_labels(vid_c, HashMap::new(), &["Node".to_string()], None)
             .await?;
 
         let eid1 = w.next_eid(link_edge).await?;
-        w.insert_edge(vid_a, vid_b, link_edge, eid1, HashMap::new(), None)
+        w.insert_edge(vid_a, vid_b, link_edge, eid1, HashMap::new(), None, None)
             .await?;
         let eid2 = w.next_eid(link_edge).await?;
-        w.insert_edge(vid_b, vid_c, link_edge, eid2, HashMap::new(), None)
+        w.insert_edge(vid_b, vid_c, link_edge, eid2, HashMap::new(), None, None)
             .await?;
 
         w.flush_to_l1(None).await?;
@@ -287,36 +287,92 @@ async fn test_louvain_procedure() -> anyhow::Result<()> {
     {
         let mut w = writer.write().await;
         for &vid in &vids {
-            w.insert_vertex_with_labels(vid, HashMap::new(), &["Node".to_string()])
+            w.insert_vertex_with_labels(vid, HashMap::new(), &["Node".to_string()], None)
                 .await?;
         }
 
         // Clique 1
         let eid1 = w.next_eid(link_edge).await?;
-        w.insert_edge(vids[0], vids[1], link_edge, eid1, HashMap::new(), None)
-            .await?;
+        w.insert_edge(
+            vids[0],
+            vids[1],
+            link_edge,
+            eid1,
+            HashMap::new(),
+            None,
+            None,
+        )
+        .await?;
         let eid2 = w.next_eid(link_edge).await?;
-        w.insert_edge(vids[1], vids[2], link_edge, eid2, HashMap::new(), None)
-            .await?;
+        w.insert_edge(
+            vids[1],
+            vids[2],
+            link_edge,
+            eid2,
+            HashMap::new(),
+            None,
+            None,
+        )
+        .await?;
         let eid3 = w.next_eid(link_edge).await?;
-        w.insert_edge(vids[2], vids[0], link_edge, eid3, HashMap::new(), None)
-            .await?;
+        w.insert_edge(
+            vids[2],
+            vids[0],
+            link_edge,
+            eid3,
+            HashMap::new(),
+            None,
+            None,
+        )
+        .await?;
 
         // Clique 2
         let eid4 = w.next_eid(link_edge).await?;
-        w.insert_edge(vids[3], vids[4], link_edge, eid4, HashMap::new(), None)
-            .await?;
+        w.insert_edge(
+            vids[3],
+            vids[4],
+            link_edge,
+            eid4,
+            HashMap::new(),
+            None,
+            None,
+        )
+        .await?;
         let eid5 = w.next_eid(link_edge).await?;
-        w.insert_edge(vids[4], vids[5], link_edge, eid5, HashMap::new(), None)
-            .await?;
+        w.insert_edge(
+            vids[4],
+            vids[5],
+            link_edge,
+            eid5,
+            HashMap::new(),
+            None,
+            None,
+        )
+        .await?;
         let eid6 = w.next_eid(link_edge).await?;
-        w.insert_edge(vids[5], vids[3], link_edge, eid6, HashMap::new(), None)
-            .await?;
+        w.insert_edge(
+            vids[5],
+            vids[3],
+            link_edge,
+            eid6,
+            HashMap::new(),
+            None,
+            None,
+        )
+        .await?;
 
         // Connection
         let eid7 = w.next_eid(link_edge).await?;
-        w.insert_edge(vids[2], vids[3], link_edge, eid7, HashMap::new(), None)
-            .await?;
+        w.insert_edge(
+            vids[2],
+            vids[3],
+            link_edge,
+            eid7,
+            HashMap::new(),
+            None,
+            None,
+        )
+        .await?;
 
         w.flush_to_l1(None).await?;
     }
@@ -392,24 +448,24 @@ async fn test_scc_procedure() -> anyhow::Result<()> {
     {
         let mut w = writer.write().await;
         for &vid in &[vid_a, vid_b, vid_c, vid_d] {
-            w.insert_vertex_with_labels(vid, HashMap::new(), &["Node".to_string()])
+            w.insert_vertex_with_labels(vid, HashMap::new(), &["Node".to_string()], None)
                 .await?;
         }
 
         // Cycle {A, B, C}
         let eid1 = w.next_eid(link_edge).await?;
-        w.insert_edge(vid_a, vid_b, link_edge, eid1, HashMap::new(), None)
+        w.insert_edge(vid_a, vid_b, link_edge, eid1, HashMap::new(), None, None)
             .await?;
         let eid2 = w.next_eid(link_edge).await?;
-        w.insert_edge(vid_b, vid_c, link_edge, eid2, HashMap::new(), None)
+        w.insert_edge(vid_b, vid_c, link_edge, eid2, HashMap::new(), None, None)
             .await?;
         let eid3 = w.next_eid(link_edge).await?;
-        w.insert_edge(vid_c, vid_a, link_edge, eid3, HashMap::new(), None)
+        w.insert_edge(vid_c, vid_a, link_edge, eid3, HashMap::new(), None, None)
             .await?;
 
         // D -> A (not in cycle)
         let eid4 = w.next_eid(link_edge).await?;
-        w.insert_edge(vid_d, vid_a, link_edge, eid4, HashMap::new(), None)
+        w.insert_edge(vid_d, vid_a, link_edge, eid4, HashMap::new(), None, None)
             .await?;
 
         w.flush_to_l1(None).await?;
@@ -492,36 +548,92 @@ async fn test_label_propagation_procedure() -> anyhow::Result<()> {
     {
         let mut w = writer.write().await;
         for &vid in &vids {
-            w.insert_vertex_with_labels(vid, HashMap::new(), &["Node".to_string()])
+            w.insert_vertex_with_labels(vid, HashMap::new(), &["Node".to_string()], None)
                 .await?;
         }
 
         // Clique 1 (Triangle)
         let eid1 = w.next_eid(link_edge).await?;
-        w.insert_edge(vids[0], vids[1], link_edge, eid1, HashMap::new(), None)
-            .await?;
+        w.insert_edge(
+            vids[0],
+            vids[1],
+            link_edge,
+            eid1,
+            HashMap::new(),
+            None,
+            None,
+        )
+        .await?;
         let eid2 = w.next_eid(link_edge).await?;
-        w.insert_edge(vids[1], vids[2], link_edge, eid2, HashMap::new(), None)
-            .await?;
+        w.insert_edge(
+            vids[1],
+            vids[2],
+            link_edge,
+            eid2,
+            HashMap::new(),
+            None,
+            None,
+        )
+        .await?;
         let eid3 = w.next_eid(link_edge).await?;
-        w.insert_edge(vids[2], vids[0], link_edge, eid3, HashMap::new(), None)
-            .await?;
+        w.insert_edge(
+            vids[2],
+            vids[0],
+            link_edge,
+            eid3,
+            HashMap::new(),
+            None,
+            None,
+        )
+        .await?;
 
         // Clique 2 (Triangle)
         let eid4 = w.next_eid(link_edge).await?;
-        w.insert_edge(vids[3], vids[4], link_edge, eid4, HashMap::new(), None)
-            .await?;
+        w.insert_edge(
+            vids[3],
+            vids[4],
+            link_edge,
+            eid4,
+            HashMap::new(),
+            None,
+            None,
+        )
+        .await?;
         let eid5 = w.next_eid(link_edge).await?;
-        w.insert_edge(vids[4], vids[5], link_edge, eid5, HashMap::new(), None)
-            .await?;
+        w.insert_edge(
+            vids[4],
+            vids[5],
+            link_edge,
+            eid5,
+            HashMap::new(),
+            None,
+            None,
+        )
+        .await?;
         let eid6 = w.next_eid(link_edge).await?;
-        w.insert_edge(vids[5], vids[3], link_edge, eid6, HashMap::new(), None)
-            .await?;
+        w.insert_edge(
+            vids[5],
+            vids[3],
+            link_edge,
+            eid6,
+            HashMap::new(),
+            None,
+            None,
+        )
+        .await?;
 
         // Connection
         let eid7 = w.next_eid(link_edge).await?;
-        w.insert_edge(vids[2], vids[3], link_edge, eid7, HashMap::new(), None)
-            .await?;
+        w.insert_edge(
+            vids[2],
+            vids[3],
+            link_edge,
+            eid7,
+            HashMap::new(),
+            None,
+            None,
+        )
+        .await?;
 
         w.flush_to_l1(None).await?;
     }
@@ -593,13 +705,13 @@ async fn test_betweenness_procedure() -> anyhow::Result<()> {
 
     {
         let mut w = writer.write().await;
-        w.insert_vertex_with_labels(center, HashMap::new(), &["Node".to_string()])
+        w.insert_vertex_with_labels(center, HashMap::new(), &["Node".to_string()], None)
             .await?;
         for &leaf in &leaves {
-            w.insert_vertex_with_labels(leaf, HashMap::new(), &["Node".to_string()])
+            w.insert_vertex_with_labels(leaf, HashMap::new(), &["Node".to_string()], None)
                 .await?;
             let eid = w.next_eid(link_edge).await?;
-            w.insert_edge(center, leaf, link_edge, eid, HashMap::new(), None)
+            w.insert_edge(center, leaf, link_edge, eid, HashMap::new(), None, None)
                 .await?;
         }
         w.flush_to_l1(None).await?;
@@ -662,18 +774,18 @@ async fn test_node_similarity_procedure() -> anyhow::Result<()> {
 
     {
         let mut w = writer.write().await;
-        w.insert_vertex_with_labels(v0, HashMap::new(), &["Node".to_string()])
+        w.insert_vertex_with_labels(v0, HashMap::new(), &["Node".to_string()], None)
             .await?;
-        w.insert_vertex_with_labels(v1, HashMap::new(), &["Node".to_string()])
+        w.insert_vertex_with_labels(v1, HashMap::new(), &["Node".to_string()], None)
             .await?;
-        w.insert_vertex_with_labels(v2, HashMap::new(), &["Node".to_string()])
+        w.insert_vertex_with_labels(v2, HashMap::new(), &["Node".to_string()], None)
             .await?;
 
         let eid1 = w.next_eid(link_edge).await?;
-        w.insert_edge(v0, v2, link_edge, eid1, HashMap::new(), None)
+        w.insert_edge(v0, v2, link_edge, eid1, HashMap::new(), None, None)
             .await?;
         let eid2 = w.next_eid(link_edge).await?;
-        w.insert_edge(v1, v2, link_edge, eid2, HashMap::new(), None)
+        w.insert_edge(v1, v2, link_edge, eid2, HashMap::new(), None, None)
             .await?;
 
         w.flush_to_l1(None).await?;
@@ -733,18 +845,18 @@ async fn test_closeness_procedure() -> anyhow::Result<()> {
 
     {
         let mut w = writer.write().await;
-        w.insert_vertex_with_labels(v0, HashMap::new(), &["Node".to_string()])
+        w.insert_vertex_with_labels(v0, HashMap::new(), &["Node".to_string()], None)
             .await?;
-        w.insert_vertex_with_labels(v1, HashMap::new(), &["Node".to_string()])
+        w.insert_vertex_with_labels(v1, HashMap::new(), &["Node".to_string()], None)
             .await?;
-        w.insert_vertex_with_labels(v2, HashMap::new(), &["Node".to_string()])
+        w.insert_vertex_with_labels(v2, HashMap::new(), &["Node".to_string()], None)
             .await?;
 
         let eid1 = w.next_eid(link_edge).await?;
-        w.insert_edge(v0, v1, link_edge, eid1, HashMap::new(), None)
+        w.insert_edge(v0, v1, link_edge, eid1, HashMap::new(), None, None)
             .await?;
         let eid2 = w.next_eid(link_edge).await?;
-        w.insert_edge(v1, v2, link_edge, eid2, HashMap::new(), None)
+        w.insert_edge(v1, v2, link_edge, eid2, HashMap::new(), None, None)
             .await?;
 
         w.flush_to_l1(None).await?;
@@ -811,21 +923,21 @@ async fn test_triangle_count_procedure() -> anyhow::Result<()> {
 
     {
         let mut w = writer.write().await;
-        w.insert_vertex_with_labels(v0, HashMap::new(), &["Node".to_string()])
+        w.insert_vertex_with_labels(v0, HashMap::new(), &["Node".to_string()], None)
             .await?;
-        w.insert_vertex_with_labels(v1, HashMap::new(), &["Node".to_string()])
+        w.insert_vertex_with_labels(v1, HashMap::new(), &["Node".to_string()], None)
             .await?;
-        w.insert_vertex_with_labels(v2, HashMap::new(), &["Node".to_string()])
+        w.insert_vertex_with_labels(v2, HashMap::new(), &["Node".to_string()], None)
             .await?;
 
         let eid1 = w.next_eid(link_edge).await?;
-        w.insert_edge(v0, v1, link_edge, eid1, HashMap::new(), None)
+        w.insert_edge(v0, v1, link_edge, eid1, HashMap::new(), None, None)
             .await?;
         let eid2 = w.next_eid(link_edge).await?;
-        w.insert_edge(v1, v2, link_edge, eid2, HashMap::new(), None)
+        w.insert_edge(v1, v2, link_edge, eid2, HashMap::new(), None, None)
             .await?;
         let eid3 = w.next_eid(link_edge).await?;
-        w.insert_edge(v2, v0, link_edge, eid3, HashMap::new(), None)
+        w.insert_edge(v2, v0, link_edge, eid3, HashMap::new(), None, None)
             .await?;
 
         w.flush_to_l1(None).await?;
@@ -886,21 +998,21 @@ async fn test_kcore_procedure() -> anyhow::Result<()> {
     {
         let mut w = writer.write().await;
         for &v in &[v0, v1, v2, v3] {
-            w.insert_vertex_with_labels(v, HashMap::new(), &["Node".to_string()])
+            w.insert_vertex_with_labels(v, HashMap::new(), &["Node".to_string()], None)
                 .await?;
         }
 
         let eid1 = w.next_eid(link_edge).await?;
-        w.insert_edge(v0, v1, link_edge, eid1, HashMap::new(), None)
+        w.insert_edge(v0, v1, link_edge, eid1, HashMap::new(), None, None)
             .await?;
         let eid2 = w.next_eid(link_edge).await?;
-        w.insert_edge(v1, v2, link_edge, eid2, HashMap::new(), None)
+        w.insert_edge(v1, v2, link_edge, eid2, HashMap::new(), None, None)
             .await?;
         let eid3 = w.next_eid(link_edge).await?;
-        w.insert_edge(v2, v0, link_edge, eid3, HashMap::new(), None)
+        w.insert_edge(v2, v0, link_edge, eid3, HashMap::new(), None, None)
             .await?;
         let eid4 = w.next_eid(link_edge).await?;
-        w.insert_edge(v3, v0, link_edge, eid4, HashMap::new(), None)
+        w.insert_edge(v3, v0, link_edge, eid4, HashMap::new(), None, None)
             .await?;
 
         w.flush_to_l1(None).await?;
@@ -967,14 +1079,14 @@ async fn test_random_walk_procedure() -> anyhow::Result<()> {
     {
         let mut w = writer.write().await;
         for &v in &[v0, v1, v2] {
-            w.insert_vertex_with_labels(v, HashMap::new(), &["Node".to_string()])
+            w.insert_vertex_with_labels(v, HashMap::new(), &["Node".to_string()], None)
                 .await?;
         }
         let eid1 = w.next_eid(link_edge).await?;
-        w.insert_edge(v0, v1, link_edge, eid1, HashMap::new(), None)
+        w.insert_edge(v0, v1, link_edge, eid1, HashMap::new(), None, None)
             .await?;
         let eid2 = w.next_eid(link_edge).await?;
-        w.insert_edge(v1, v2, link_edge, eid2, HashMap::new(), None)
+        w.insert_edge(v1, v2, link_edge, eid2, HashMap::new(), None, None)
             .await?;
         w.flush_to_l1(None).await?;
     }
@@ -1036,14 +1148,14 @@ async fn test_apsp_procedure() -> anyhow::Result<()> {
     {
         let mut w = writer.write().await;
         for &v in &[v0, v1, v2] {
-            w.insert_vertex_with_labels(v, HashMap::new(), &["Node".to_string()])
+            w.insert_vertex_with_labels(v, HashMap::new(), &["Node".to_string()], None)
                 .await?;
         }
         let eid1 = w.next_eid(link_edge).await?;
-        w.insert_edge(v0, v1, link_edge, eid1, HashMap::new(), None)
+        w.insert_edge(v0, v1, link_edge, eid1, HashMap::new(), None, None)
             .await?;
         let eid2 = w.next_eid(link_edge).await?;
-        w.insert_edge(v1, v2, link_edge, eid2, HashMap::new(), None)
+        w.insert_edge(v1, v2, link_edge, eid2, HashMap::new(), None, None)
             .await?;
         w.flush_to_l1(None).await?;
     }

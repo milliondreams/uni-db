@@ -16,15 +16,12 @@ async fn test_candle_embedding_basic() -> Result<()> {
     let db = Uni::temporary().build().await?;
 
     // 1. Create label with content property
-    db.session()
-        .execute("CREATE LABEL Document (content STRING)")
-        .await?;
-
     // 2. Create vector index with Candle auto-embedding
     // all-MiniLM-L6-v2 produces 384-dimensional embeddings
-    db.session()
-        .execute(
-            r#"
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL Document (content STRING)").await?;
+    tx.execute(
+        r#"
         CREATE VECTOR INDEX doc_embed_idx
         FOR (d:Document) ON (d.embedding)
         OPTIONS {
@@ -36,13 +33,12 @@ async fn test_candle_embedding_basic() -> Result<()> {
             }
         }
     "#,
-        )
-        .await?;
-
+    )
+    .await?;
     // 3. Insert a document - this triggers auto-embedding
-    db.session()
-        .execute(r#"CREATE (:Document {content: "Test content for embedding generation."})"#)
+    tx.execute(r#"CREATE (:Document {content: "Test content for embedding generation."})"#)
         .await?;
+    tx.commit().await?;
 
     // 4. Flush to persist the data
     db.flush().await?;
@@ -72,13 +68,11 @@ async fn test_candle_embedding_basic() -> Result<()> {
 async fn test_candle_multiple_embeddings() -> Result<()> {
     let db = Uni::temporary().build().await?;
 
-    db.session()
-        .execute("CREATE LABEL Article (title STRING, body STRING)")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL Article (title STRING, body STRING)")
         .await?;
-
-    db.session()
-        .execute(
-            r#"
+    tx.execute(
+        r#"
         CREATE VECTOR INDEX article_embed_idx
         FOR (a:Article) ON (a.embedding)
         OPTIONS {
@@ -90,16 +84,19 @@ async fn test_candle_multiple_embeddings() -> Result<()> {
             }
         }
     "#,
-        )
-        .await?;
+    )
+    .await?;
+    tx.commit().await?;
 
     // Insert multiple documents
     for i in 1..=5 {
-        db.session().execute(&format!(
+        let tx = db.session().tx().await?;
+        tx.execute(&format!(
             r#"CREATE (:Article {{title: "Article {}", body: "This is the body of article number {}."}})"#,
             i, i
         ))
         .await?;
+        tx.commit().await?;
     }
 
     db.flush().await?;
@@ -187,10 +184,12 @@ mod mistralrs_tests {
             .await?;
 
         // Insert without providing an embedding — auto-embedding fills it in.
-        db.session().execute(
+        let tx = db.session().tx().await?;
+        tx.execute(
             r#"CREATE (:Document {content: "MistralRS EmbeddingGemma produces dense vectors."})"#,
         )
         .await?;
+        tx.commit().await?;
 
         db.flush().await?;
 
@@ -239,10 +238,12 @@ mod mistralrs_tests {
 
         // Insert multiple articles — each triggers auto-embedding on write.
         for i in 1..=3_u32 {
-            db.session().execute(&format!(
+            let tx = db.session().tx().await?;
+            tx.execute(&format!(
                 r#"CREATE (:Article {{title: "Article {i}", body: "Body text for article number {i}."}})"#,
             ))
             .await?;
+            tx.commit().await?;
         }
 
         db.flush().await?;
@@ -284,15 +285,14 @@ mod fastembed_tests {
         let db = Uni::temporary().build().await?;
 
         // 1. Create label with content property
-        db.session()
-            .execute("CREATE LABEL Document (content STRING)")
-            .await?;
-
         // 2. Create vector index with fastembed auto-embedding
         // BGESmallENV15 produces 384-dimensional embeddings
-        db.session()
-            .execute(
-                r#"
+        // 3. Insert a document - this triggers auto-embedding
+        // Without the stack overflow fix, this would crash
+        let tx = db.session().tx().await?;
+        tx.execute("CREATE LABEL Document (content STRING)").await?;
+        tx.execute(
+            r#"
             CREATE VECTOR INDEX doc_embed_idx
             FOR (d:Document) ON (d.embedding)
             OPTIONS {
@@ -304,14 +304,11 @@ mod fastembed_tests {
                 }
             }
         "#,
-            )
+        )
+        .await?;
+        tx.execute(r#"CREATE (:Document {content: "Test content for embedding generation."})"#)
             .await?;
-
-        // 3. Insert a document - this triggers auto-embedding
-        // Without the stack overflow fix, this would crash
-        db.session()
-            .execute(r#"CREATE (:Document {content: "Test content for embedding generation."})"#)
-            .await?;
+        tx.commit().await?;
 
         // 4. Flush to persist the data
         db.flush().await?;
@@ -340,13 +337,11 @@ mod fastembed_tests {
     async fn test_fastembed_multiple_embeddings() -> Result<()> {
         let db = Uni::temporary().build().await?;
 
-        db.session()
-            .execute("CREATE LABEL Article (title STRING, body STRING)")
+        let tx = db.session().tx().await?;
+        tx.execute("CREATE LABEL Article (title STRING, body STRING)")
             .await?;
-
-        db.session()
-            .execute(
-                r#"
+        tx.execute(
+            r#"
             CREATE VECTOR INDEX article_embed_idx
             FOR (a:Article) ON (a.embedding)
             OPTIONS {
@@ -358,16 +353,19 @@ mod fastembed_tests {
                 }
             }
         "#,
-            )
-            .await?;
+        )
+        .await?;
+        tx.commit().await?;
 
         // Insert multiple documents
         for i in 1..=5 {
-            db.session().execute(&format!(
+            let tx = db.session().tx().await?;
+            tx.execute(&format!(
                 r#"CREATE (:Article {{title: "Article {}", body: "This is the body of article number {}."}})"#,
                 i, i
             ))
             .await?;
+            tx.commit().await?;
         }
 
         db.flush().await?;

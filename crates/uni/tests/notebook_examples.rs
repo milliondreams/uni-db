@@ -48,11 +48,8 @@ async fn test_supply_chain() -> anyhow::Result<()> {
         ]),
     ];
 
-    let part_vids = db
-        .session()
-        .bulk_insert_vertices("Part", part_props)
-        .await
-        .unwrap();
+    let tx = db.session().tx().await.unwrap();
+    let part_vids = tx.bulk_insert_vertices("Part", part_props).await.unwrap();
     let (p1, p2, p3) = (part_vids[0], part_vids[1], part_vids[2]);
 
     // Insert Product
@@ -61,25 +58,24 @@ async fn test_supply_chain() -> anyhow::Result<()> {
         ("price".to_string(), unival!(500.0)),
     ])];
 
-    let phone_vids = db
-        .session()
+    let phone_vids = tx
         .bulk_insert_vertices("Product", prod_props)
         .await
         .unwrap();
     let phone = phone_vids[0];
 
     // Create assembly relationships
-    db.session()
-        .bulk_insert_edges(
-            "ASSEMBLED_FROM",
-            vec![
-                (phone, p2, HashMap::new()), // phone <- MB-X1
-                (phone, p3, HashMap::new()), // phone <- SCR-OLED
-                (p2, p1, HashMap::new()),    // MB-X1 <- RES-10K
-            ],
-        )
-        .await
-        .unwrap();
+    tx.bulk_insert_edges(
+        "ASSEMBLED_FROM",
+        vec![
+            (phone, p2, HashMap::new()), // phone <- MB-X1
+            (phone, p3, HashMap::new()), // phone <- SCR-OLED
+            (p2, p1, HashMap::new()),    // MB-X1 <- RES-10K
+        ],
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
 
     db.flush().await.unwrap();
 
@@ -168,11 +164,8 @@ async fn test_recommendation() -> anyhow::Result<()> {
         ]),
     ];
 
-    let prod_vids = db
-        .session()
-        .bulk_insert_vertices("Product", products)
-        .await
-        .unwrap();
+    let tx = db.session().tx().await.unwrap();
+    let prod_vids = tx.bulk_insert_vertices("Product", products).await.unwrap();
     let (p1, p2, p3) = (prod_vids[0], prod_vids[1], prod_vids[2]);
 
     // Users
@@ -182,34 +175,29 @@ async fn test_recommendation() -> anyhow::Result<()> {
         HashMap::from([("name".to_string(), unival!("Charlie"))]),
     ];
 
-    let user_vids = db
-        .session()
-        .bulk_insert_vertices("User", users)
-        .await
-        .unwrap();
+    let user_vids = tx.bulk_insert_vertices("User", users).await.unwrap();
     let (u1, u2, u3) = (user_vids[0], user_vids[1], user_vids[2]);
 
     // Purchase history
-    db.session()
-        .bulk_insert_edges(
-            "PURCHASED",
-            vec![
-                (u1, p1, HashMap::new()),
-                (u2, p1, HashMap::new()),
-                (u3, p1, HashMap::new()),
-            ],
-        )
-        .await
-        .unwrap();
+    tx.bulk_insert_edges(
+        "PURCHASED",
+        vec![
+            (u1, p1, HashMap::new()),
+            (u2, p1, HashMap::new()),
+            (u3, p1, HashMap::new()),
+        ],
+    )
+    .await
+    .unwrap();
 
     // View history
-    db.session()
-        .bulk_insert_edges(
-            "VIEWED",
-            vec![(u1, p2, HashMap::new()), (u1, p3, HashMap::new())],
-        )
-        .await
-        .unwrap();
+    tx.bulk_insert_edges(
+        "VIEWED",
+        vec![(u1, p2, HashMap::new()), (u1, p3, HashMap::new())],
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
 
     db.flush().await.unwrap();
 
@@ -278,11 +266,8 @@ async fn test_rag() -> anyhow::Result<()> {
         ]),
     ];
 
-    let chunk_vids = db
-        .session()
-        .bulk_insert_vertices("Chunk", chunks)
-        .await
-        .unwrap();
+    let tx = db.session().tx().await.unwrap();
+    let chunk_vids = tx.bulk_insert_vertices("Chunk", chunks).await.unwrap();
     let (c1, c2) = (chunk_vids[0], chunk_vids[1]);
 
     // Entities
@@ -291,21 +276,17 @@ async fn test_rag() -> anyhow::Result<()> {
         ("type".to_string(), unival!("function")),
     ])];
 
-    let entity_vids = db
-        .session()
-        .bulk_insert_vertices("Entity", entities)
-        .await
-        .unwrap();
+    let entity_vids = tx.bulk_insert_vertices("Entity", entities).await.unwrap();
     let e1 = entity_vids[0];
 
     // Link chunks to entities
-    db.session()
-        .bulk_insert_edges(
-            "MENTIONS",
-            vec![(c1, e1, HashMap::new()), (c2, e1, HashMap::new())],
-        )
-        .await
-        .unwrap();
+    tx.bulk_insert_edges(
+        "MENTIONS",
+        vec![(c1, e1, HashMap::new()), (c2, e1, HashMap::new())],
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
 
     db.flush().await.unwrap();
 
@@ -356,55 +337,47 @@ async fn test_fraud_detection() -> anyhow::Result<()> {
         HashMap::from([("risk_score".to_string(), unival!(0.9))]), // D (Fraudster)
     ];
 
-    let user_vids = db
-        .session()
-        .bulk_insert_vertices("User", users)
-        .await
-        .unwrap();
+    let tx = db.session().tx().await.unwrap();
+    let user_vids = tx.bulk_insert_vertices("User", users).await.unwrap();
     let (ua, ub, uc, ud) = (user_vids[0], user_vids[1], user_vids[2], user_vids[3]);
 
     // Device
     let devices = vec![HashMap::new()];
-    let device_vids = db
-        .session()
-        .bulk_insert_vertices("Device", devices)
-        .await
-        .unwrap();
+    let device_vids = tx.bulk_insert_vertices("Device", devices).await.unwrap();
     let d1 = device_vids[0];
 
     // Money transfer cycle: A -> B -> C -> A
-    db.session()
-        .bulk_insert_edges(
-            "SENT_MONEY",
-            vec![
-                (
-                    ua,
-                    ub,
-                    HashMap::from([("amount".to_string(), unival!(5000.0))]),
-                ),
-                (
-                    ub,
-                    uc,
-                    HashMap::from([("amount".to_string(), unival!(5000.0))]),
-                ),
-                (
-                    uc,
-                    ua,
-                    HashMap::from([("amount".to_string(), unival!(5000.0))]),
-                ),
-            ],
-        )
-        .await
-        .unwrap();
+    tx.bulk_insert_edges(
+        "SENT_MONEY",
+        vec![
+            (
+                ua,
+                ub,
+                HashMap::from([("amount".to_string(), unival!(5000.0))]),
+            ),
+            (
+                ub,
+                uc,
+                HashMap::from([("amount".to_string(), unival!(5000.0))]),
+            ),
+            (
+                uc,
+                ua,
+                HashMap::from([("amount".to_string(), unival!(5000.0))]),
+            ),
+        ],
+    )
+    .await
+    .unwrap();
 
     // Shared device
-    db.session()
-        .bulk_insert_edges(
-            "USED_DEVICE",
-            vec![(ua, d1, HashMap::new()), (ud, d1, HashMap::new())],
-        )
-        .await
-        .unwrap();
+    tx.bulk_insert_edges(
+        "USED_DEVICE",
+        vec![(ua, d1, HashMap::new()), (ud, d1, HashMap::new())],
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
 
     db.flush().await.unwrap();
 
@@ -459,11 +432,8 @@ async fn test_sales_analytics() -> anyhow::Result<()> {
     let regions: Vec<uni_db::common::Properties> =
         vec![HashMap::from([("name".to_string(), unival!("North"))])];
 
-    let region_vids = db
-        .session()
-        .bulk_insert_vertices("Region", regions)
-        .await
-        .unwrap();
+    let tx = db.session().tx().await.unwrap();
+    let region_vids = tx.bulk_insert_vertices("Region", regions).await.unwrap();
     let north = region_vids[0];
 
     // Create 100 orders
@@ -471,11 +441,7 @@ async fn test_sales_analytics() -> anyhow::Result<()> {
         .map(|i| HashMap::from([("amount".to_string(), unival!(10.0 * (i + 1) as f64))]))
         .collect();
 
-    let order_vids = db
-        .session()
-        .bulk_insert_vertices("ORDER", orders)
-        .await
-        .unwrap();
+    let order_vids = tx.bulk_insert_vertices("ORDER", orders).await.unwrap();
 
     // Ship all orders to North region
     let edges: Vec<_> = order_vids
@@ -483,10 +449,8 @@ async fn test_sales_analytics() -> anyhow::Result<()> {
         .map(|vid| (*vid, north, HashMap::new()))
         .collect();
 
-    db.session()
-        .bulk_insert_edges("SHIPPED_TO", edges)
-        .await
-        .unwrap();
+    tx.bulk_insert_edges("SHIPPED_TO", edges).await.unwrap();
+    tx.commit().await.unwrap();
     db.flush().await.unwrap();
 
     // Analytical query

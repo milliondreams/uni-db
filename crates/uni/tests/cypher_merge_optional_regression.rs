@@ -24,15 +24,16 @@ async fn test_merge_optional_match_count() -> Result<()> {
     // TCK Match8 #2 reproduction:
     // Create 2 nodes (a1, a2) with edges:
     // a1-[:KNOWS]->a2 and a1-[:HATES]->a2
-    db.session()
-        .execute(
-            r#"
+    let tx = db.session().tx().await?;
+    tx.execute(
+        r#"
         CREATE (a:A {name: 'a1'}), (b:A {name: 'a2'})
         CREATE (a)-[:KNOWS]->(b)
         CREATE (a)-[:HATES]->(b)
     "#,
-        )
-        .await?;
+    )
+    .await?;
+    tx.commit().await?;
 
     // MATCH (a) finds 2 nodes
     // MERGE (b:B {name: 'b1'}) creates/merges 1 node → cross product = 2 rows
@@ -68,8 +69,10 @@ async fn test_optional_match_both_bound_no_edge() -> Result<()> {
         .await?;
 
     // Create disconnected nodes
-    db.session().execute("CREATE (:A {name: 'alice'})").await?;
-    db.session().execute("CREATE (:B {name: 'bob'})").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:A {name: 'alice'})").await?;
+    tx.execute("CREATE (:B {name: 'bob'})").await?;
+    tx.commit().await?;
 
     // Both a and b are bound from MATCH. OPTIONAL MATCH should preserve the row
     // with NULLs for the relationship.

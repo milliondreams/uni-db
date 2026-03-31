@@ -47,7 +47,9 @@ class TestAsyncUniBuilderOpenModes:
             db1 = await uni_db.AsyncUniBuilder.create(path).build()
             session1 = db1.session()
             await db1.schema().label("Person").property("name", "string").apply()
-            await session1.execute("CREATE (n:Person {name: 'Alice'})")
+            tx1 = await session1.tx()
+            await tx1.execute("CREATE (n:Person {name: 'Alice'})")
+            await tx1.commit()
             await db1.flush()
             del db1
 
@@ -74,7 +76,9 @@ class TestAsyncUniBuilderOpenModes:
             assert db is not None
             session = db.session()
             await db.schema().label("Test").apply()
-            await session.execute("CREATE (n:Test)")
+            tx = await session.tx()
+            await tx.execute("CREATE (n:Test)")
+            await tx.commit()
             await db.flush()
 
     @pytest.mark.asyncio
@@ -85,7 +89,9 @@ class TestAsyncUniBuilderOpenModes:
             db1 = await uni_db.AsyncUniBuilder.create(path).build()
             session1 = db1.session()
             await db1.schema().label("Person").property("name", "string").apply()
-            await session1.execute("CREATE (n:Person {name: 'Bob'})")
+            tx1 = await session1.tx()
+            await tx1.execute("CREATE (n:Person {name: 'Bob'})")
+            await tx1.commit()
             await db1.flush()
             del db1
 
@@ -102,7 +108,9 @@ class TestAsyncUniBuilderOpenModes:
         assert db is not None
         session = db.session()
         await db.schema().label("Temp").property("value", "int").apply()
-        await session.execute("CREATE (n:Temp {value: 42})")
+        tx = await session.tx()
+        await tx.execute("CREATE (n:Temp {value: 42})")
+        await tx.commit()
         await db.flush()
         results = await session.query("MATCH (n:Temp) RETURN n.value AS value")
         assert len(results) == 1
@@ -146,7 +154,9 @@ class TestAsyncUniBuilderConfiguration:
             assert db is not None
             session = db.session()
             await db.schema().label("Test").apply()
-            await session.execute("CREATE (n:Test)")
+            tx = await session.tx()
+            await tx.execute("CREATE (n:Test)")
+            await tx.commit()
             await db.flush()
             results = await session.query("MATCH (n:Test) RETURN n")
             assert len(results) == 1
@@ -162,7 +172,9 @@ class TestAsyncInMemory:
         assert db is not None
         session = db.session()
         await db.schema().label("Mem").property("x", "int").apply()
-        await session.execute("CREATE (n:Mem {x: 42})")
+        tx = await session.tx()
+        await tx.execute("CREATE (n:Mem {x: 42})")
+        await tx.commit()
         await db.flush()
         results = await session.query("MATCH (n:Mem) RETURN n.x AS x")
         assert len(results) == 1
@@ -180,7 +192,9 @@ class TestAsyncBackwardCompatibility:
             assert db is not None
             session = db.session()
             await db.schema().label("Legacy").apply()
-            await session.execute("CREATE (n:Legacy)")
+            tx = await session.tx()
+            await tx.execute("CREATE (n:Legacy)")
+            await tx.commit()
             await db.flush()
             results = await session.query("MATCH (n:Legacy) RETURN n")
             assert len(results) == 1

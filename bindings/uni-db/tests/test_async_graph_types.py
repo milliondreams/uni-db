@@ -16,7 +16,9 @@ class TestAsyncNode:
 
     async def test_node_from_query(self, async_social_db):
         session = async_social_db.session()
-        await session.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+        tx = await session.tx()
+        await tx.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+        await tx.commit()
         result = await session.query("MATCH (p:Person) RETURN p")
         assert len(result) == 1
         node = result[0]["p"]
@@ -24,7 +26,9 @@ class TestAsyncNode:
 
     async def test_node_attributes(self, async_social_db):
         session = async_social_db.session()
-        await session.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+        tx = await session.tx()
+        await tx.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+        await tx.commit()
         result = await session.query("MATCH (p:Person) RETURN p")
         node = result[0]["p"]
 
@@ -34,7 +38,9 @@ class TestAsyncNode:
 
     async def test_node_dict_access(self, async_social_db):
         session = async_social_db.session()
-        await session.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+        tx = await session.tx()
+        await tx.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+        await tx.commit()
         result = await session.query("MATCH (p:Person) RETURN p")
         node = result[0]["p"]
 
@@ -45,7 +51,9 @@ class TestAsyncNode:
 
     async def test_node_deprecated_keys(self, async_social_db):
         session = async_social_db.session()
-        await session.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+        tx = await session.tx()
+        await tx.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+        await tx.commit()
         result = await session.query("MATCH (p:Person) RETURN p")
         node = result[0]["p"]
 
@@ -63,12 +71,14 @@ class TestAsyncEdge:
 
     async def test_edge_from_query(self, async_social_db):
         session = async_social_db.session()
-        await session.execute("CREATE (a:Person {name: 'Alice', age: 30})")
-        await session.execute("CREATE (b:Person {name: 'Bob', age: 25})")
-        await session.execute(
+        tx = await session.tx()
+        await tx.execute("CREATE (a:Person {name: 'Alice', age: 30})")
+        await tx.execute("CREATE (b:Person {name: 'Bob', age: 25})")
+        await tx.execute(
             "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) "
             "CREATE (a)-[:KNOWS {since: 2020}]->(b)"
         )
+        await tx.commit()
         result = await session.query("MATCH ()-[r:KNOWS]->() RETURN r")
         assert len(result) == 1
         edge = result[0]["r"]
@@ -76,12 +86,14 @@ class TestAsyncEdge:
 
     async def test_edge_attributes(self, async_social_db):
         session = async_social_db.session()
-        await session.execute("CREATE (a:Person {name: 'Alice', age: 30})")
-        await session.execute("CREATE (b:Person {name: 'Bob', age: 25})")
-        await session.execute(
+        tx = await session.tx()
+        await tx.execute("CREATE (a:Person {name: 'Alice', age: 30})")
+        await tx.execute("CREATE (b:Person {name: 'Bob', age: 25})")
+        await tx.execute(
             "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) "
             "CREATE (a)-[:KNOWS {since: 2020}]->(b)"
         )
+        await tx.commit()
         result = await session.query("MATCH ()-[r:KNOWS]->() RETURN r")
         edge = result[0]["r"]
 
@@ -98,12 +110,14 @@ class TestAsyncPath:
 
     async def test_path_from_query(self, async_social_db):
         session = async_social_db.session()
-        await session.execute("CREATE (a:Person {name: 'Alice', age: 30})")
-        await session.execute("CREATE (b:Person {name: 'Bob', age: 25})")
-        await session.execute(
+        tx = await session.tx()
+        await tx.execute("CREATE (a:Person {name: 'Alice', age: 30})")
+        await tx.execute("CREATE (b:Person {name: 'Bob', age: 25})")
+        await tx.execute(
             "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) "
             "CREATE (a)-[:KNOWS]->(b)"
         )
+        await tx.commit()
         result = await session.query(
             "MATCH p=(a:Person {name: 'Alice'})-[:KNOWS]->(b:Person) RETURN p"
         )
@@ -115,12 +129,14 @@ class TestAsyncPath:
 
     async def test_path_interleaved_indexing(self, async_social_db):
         session = async_social_db.session()
-        await session.execute("CREATE (a:Person {name: 'Alice', age: 30})")
-        await session.execute("CREATE (b:Person {name: 'Bob', age: 25})")
-        await session.execute(
+        tx = await session.tx()
+        await tx.execute("CREATE (a:Person {name: 'Alice', age: 30})")
+        await tx.execute("CREATE (b:Person {name: 'Bob', age: 25})")
+        await tx.execute(
             "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) "
             "CREATE (a)-[:KNOWS]->(b)"
         )
+        await tx.commit()
         result = await session.query(
             "MATCH p=(a:Person {name: 'Alice'})-[:KNOWS]->(b:Person) RETURN p"
         )
@@ -136,12 +152,14 @@ class TestAsyncMixedReturn:
 
     async def test_mixed_return(self, async_social_db):
         session = async_social_db.session()
-        await session.execute("CREATE (a:Person {name: 'Alice', age: 30})")
-        await session.execute("CREATE (b:Person {name: 'Bob', age: 25})")
-        await session.execute(
+        tx = await session.tx()
+        await tx.execute("CREATE (a:Person {name: 'Alice', age: 30})")
+        await tx.execute("CREATE (b:Person {name: 'Bob', age: 25})")
+        await tx.execute(
             "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) "
             "CREATE (a)-[:KNOWS {since: 2020}]->(b)"
         )
+        await tx.commit()
         result = await session.query(
             "MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN a, r, b"
         )

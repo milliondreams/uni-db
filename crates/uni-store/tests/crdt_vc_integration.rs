@@ -53,7 +53,7 @@ async fn test_vector_clock_integration() -> anyhow::Result<()> {
     ]);
 
     writer
-        .insert_vertex_with_labels(vid, props1, &["Person".to_string()])
+        .insert_vertex_with_labels(vid, props1, &["Person".to_string()], None)
         .await?;
     writer.flush_to_l1(None).await?;
 
@@ -80,7 +80,7 @@ async fn test_vector_clock_integration() -> anyhow::Result<()> {
 
     // Insert into L0 (this will be merged with L1 on read)
     writer
-        .insert_vertex_with_labels(vid, props2, &["Person".to_string()])
+        .insert_vertex_with_labels(vid, props2, &["Person".to_string()], None)
         .await?;
 
     // 5. Verify Read (Should see UpdateB because {A:1, B:1} > {A:1})
@@ -118,7 +118,7 @@ async fn test_vector_clock_integration() -> anyhow::Result<()> {
     )]);
 
     writer
-        .insert_vertex_with_labels(vid, props3, &["Person".to_string()])
+        .insert_vertex_with_labels(vid, props3, &["Person".to_string()], None)
         .await?;
 
     // 7. Verify Read (Merge of UpdateB and UpdateC)

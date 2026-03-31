@@ -889,10 +889,22 @@ async fn run_program(
     // QUERY is deferred to the orchestrator: the DerivedStore uses inferred types
     // (e.g. Float64 for property-derived columns) which don't preserve the actual
     // property values. The orchestrator's SLG path re-derives with correct types.
-    // DERIVE/ASSUME/EXPLAIN/ABDUCE are also deferred (need savepoints, tree output, etc.).
+    // DERIVE/ASSUME/EXPLAIN/ABDUCE are also deferred (need L0 fork/restore, tree output, etc.).
+    //
+    // Cypher commands that appear AFTER a DERIVE command are also deferred:
+    // they need the ephemeral L0 overlay populated by DERIVE to see derived
+    // edges, which is only available in the orchestrator's dispatch loop.
+    let first_derive_idx = commands
+        .iter()
+        .position(|c| matches!(c, LocyCommand::Derive { .. }));
     let mut inline_results: Vec<(usize, CommandResult)> = Vec::new();
     for (cmd_idx, cmd) in commands.iter().enumerate() {
         if let LocyCommand::Cypher { query } = cmd {
+            // Defer Cypher commands that follow a DERIVE to the dispatch loop
+            // so they can read from the ephemeral L0 overlay.
+            if first_derive_idx.is_some_and(|di| cmd_idx > di) {
+                continue;
+            }
             let rows = execute_cypher_inline(
                 query,
                 &schema_info,

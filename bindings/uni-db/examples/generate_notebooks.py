@@ -70,7 +70,8 @@ def db_setup(name):
         f'db_path = os.path.join(tempfile.gettempdir(), "{name}_db")',
         "if os.path.exists(db_path):",
         "    shutil.rmtree(db_path)",
-        "db = uni_db.Database.open(db_path)",
+        "db = uni_db.Uni.open(db_path)",
+        "session = db.session()",
         'print(f"Opened database at {db_path}")',
     ]
 
@@ -131,7 +132,8 @@ supply_chain_nb = create_notebook(
         ),
         code_cell(
             [
-                "with db.bulk_writer().build() as bw:",
+                "tx = session.tx()",
+                "with tx.bulk_writer().build() as bw:",
                 "    # Parts: 7 components with different costs",
                 "    part_vids = bw.insert_vertices('Part', [",
                 "        {'name': 'Resistor 10K',   'sku': 'RES-10K',   'cost': 0.05},",
@@ -189,6 +191,7 @@ supply_chain_nb = create_notebook(
                 "    ])",
                 "",
                 "    bw.commit()",
+                "tx.commit()",
                 'print("Data ingested")',
             ]
         ),
@@ -207,7 +210,7 @@ supply_chain_nb = create_notebook(
                 "    RETURN product.name AS name, product.price AS price",
                 "    ORDER BY product.price DESC",
                 '"""',
-                "results = db.query(query_bom)",
+                "results = session.query(query_bom)",
                 "print('Products affected by defective RES-10K:')",
                 "for r in results:",
                 "    print(f\"  {r['name']} (${r['price']})\")",
@@ -235,7 +238,7 @@ supply_chain_nb = create_notebook(
                 "    RETURN part.name AS part_name, part.sku AS sku, part.cost AS cost",
                 "    ORDER BY cost DESC",
                 '"""',
-                "results = db.query(query_parts)",
+                "results = session.query(query_parts)",
                 "print('Smartphone X BOM:')",
                 "for r in results:",
                 "    print(f\"  {r['part_name']} ({r['sku']}): ${r['cost']}\")",
@@ -254,7 +257,7 @@ supply_chain_nb = create_notebook(
                 "    RETURN p.name AS product, SUM(part.cost) AS total_bom_cost",
                 "    ORDER BY total_bom_cost DESC",
                 '"""',
-                "results = db.query(query_rollup)",
+                "results = session.query(query_rollup)",
                 "print('BOM cost rollup per product:')",
                 "for r in results:",
                 "    print(f\"  {r['product']}: ${r['total_bom_cost']:.2f}\")",
@@ -274,7 +277,7 @@ supply_chain_nb = create_notebook(
                 "    RETURN s.name AS supplier, COUNT(DISTINCT p) AS products_at_risk",
                 "    ORDER BY products_at_risk DESC",
                 '"""',
-                "results = db.query(query_risk)",
+                "results = session.query(query_risk)",
                 "print('Supplier risk analysis:')",
                 "for r in results:",
                 "    print(f\"  {r['supplier']}: {r['products_at_risk']} product(s) at risk\")",
@@ -331,7 +334,8 @@ rec_nb = create_notebook(
         code_cell(
             [
                 "# 4D embeddings: [tech, fiction, history, science]",
-                "with db.bulk_writer().build() as bw:",
+                "tx = session.tx()",
+                "with tx.bulk_writer().build() as bw:",
                 "    book_vids = bw.insert_vertices('Book', [",
                 "        {'name': 'Clean Code',                        'genre': 'tech',    'embedding': [0.95, 0.05, 0.0,  0.0 ]},",
                 "        {'name': 'The Pragmatic Programmer',          'genre': 'tech',    'embedding': [0.90, 0.10, 0.0,  0.0 ]},",
@@ -364,10 +368,9 @@ rec_nb = create_notebook(
                 "    ])",
                 "",
                 "    bw.commit()",
+                "tx.commit()",
                 "",
-                "# Create vector index AFTER commit",
-                'db.create_vector_index("Book", "embedding", "l2")',
-                'print("Data ingested and vector index created")',
+                'print("Data ingested")',
             ]
         ),
         md_cell(
@@ -386,7 +389,7 @@ rec_nb = create_notebook(
                 "    RETURN rec.name AS recommendation, COUNT(DISTINCT other) AS buyers",
                 "    ORDER BY buyers DESC",
                 '"""',
-                "results = db.query(query_collab)",
+                "results = session.query(query_collab)",
                 "print('Collaborative recommendations for Alice:')",
                 "for r in results:",
                 "    print(f\"  {r['recommendation']} (bought by {r['buyers']} similar user(s))\")",
@@ -402,7 +405,7 @@ rec_nb = create_notebook(
             [
                 "tech_query = [0.95, 0.05, 0.0, 0.0]",
                 "",
-                'results = db.query("""',
+                'results = session.query("""',
                 "    CALL uni.vector.query('Book', 'embedding', $vec, 3)",
                 "    YIELD node, distance",
                 "    RETURN node.name AS title, node.genre AS genre, distance",
@@ -428,7 +431,7 @@ rec_nb = create_notebook(
             [
                 "fiction_query = [0.0, 0.95, 0.0, 0.05]",
                 "",
-                'results = db.query("""',
+                'results = session.query("""',
                 "    CALL uni.vector.query('Book', 'embedding', $vec, 3)",
                 "    YIELD node, distance",
                 "    MATCH (u:User)-[:PURCHASED]->(node)",
@@ -456,7 +459,7 @@ rec_nb = create_notebook(
                 "    RETURN b.name AS book, COUNT(DISTINCT u) AS buyers",
                 "    ORDER BY buyers DESC",
                 '"""',
-                "results = db.query(query_discovery)",
+                "results = session.query(query_discovery)",
                 "print('Popular books Alice has not read:')",
                 "for r in results:",
                 "    print(f\"  {r['book']}: {r['buyers']} buyer(s)\")",
@@ -516,7 +519,8 @@ rag_nb = create_notebook(
         code_cell(
             [
                 "# 4D embeddings: [auth, routing, database, testing]",
-                "with db.bulk_writer().build() as bw:",
+                "tx = session.tx()",
+                "with tx.bulk_writer().build() as bw:",
                 "    chunk_vids = bw.insert_vertices('Chunk', [",
                 "        {'chunk_id': 'c1', 'text': 'JWT tokens issued by /auth/login endpoint. Tokens expire after 1 hour.',",
                 "         'embedding': [1.0,  0.0,  0.0,  0.0 ]},",
@@ -564,10 +568,9 @@ rag_nb = create_notebook(
                 "    ])",
                 "",
                 "    bw.commit()",
+                "tx.commit()",
                 "",
-                "# Create vector index AFTER commit",
-                'db.create_vector_index("Chunk", "embedding", "l2")',
-                'print("Data ingested and vector index created")',
+                'print("Data ingested")',
             ]
         ),
         md_cell(
@@ -580,7 +583,7 @@ rag_nb = create_notebook(
             [
                 "auth_query = [1.0, 0.0, 0.0, 0.0]",
                 "",
-                'results = db.query("""',
+                'results = session.query("""',
                 "    CALL uni.vector.query('Chunk', 'embedding', $vec, 3)",
                 "    YIELD node, distance",
                 "    RETURN node.chunk_id AS chunk_id, node.text AS text, distance",
@@ -603,7 +606,7 @@ rag_nb = create_notebook(
         ),
         code_cell(
             [
-                'results = db.query("""',
+                'results = session.query("""',
                 "    CALL uni.vector.query('Chunk', 'embedding', $vec, 3)",
                 "    YIELD node, distance",
                 "    MATCH (node)-[:MENTIONS]->(e:Entity)",
@@ -625,7 +628,7 @@ rag_nb = create_notebook(
         ),
         code_cell(
             [
-                'results = db.query("""',
+                'results = session.query("""',
                 "    CALL uni.vector.query('Chunk', 'embedding', $vec, 3)",
                 "    YIELD node AS anchor, distance",
                 "    MATCH (anchor)-[:MENTIONS]->(e:Entity)<-[:MENTIONS]-(related:Chunk)",
@@ -649,7 +652,7 @@ rag_nb = create_notebook(
         ),
         code_cell(
             [
-                'results = db.query("""',
+                'results = session.query("""',
                 "    CALL uni.vector.query('Chunk', 'embedding', $vec, 3)",
                 "    YIELD node AS seed, distance",
                 "    MATCH (seed)-[:MENTIONS]->(e:Entity)<-[:MENTIONS]-(related:Chunk)",
@@ -720,7 +723,8 @@ fraud_nb = create_notebook(
         ),
         code_cell(
             [
-                "with db.bulk_writer().build() as bw:",
+                "tx = session.tx()",
+                "with tx.bulk_writer().build() as bw:",
                 "    # 5 users: 3 in a ring, 2 high-risk fraudsters",
                 "    u_vids = bw.insert_vertices('User', [",
                 "        {'name': 'Alice',  'email': 'alice@example.com',  'risk_score': 0.10},",
@@ -757,6 +761,7 @@ fraud_nb = create_notebook(
                 "    ])",
                 "",
                 "    bw.commit()",
+                "tx.commit()",
                 'print("Data ingested")',
             ]
         ),
@@ -776,7 +781,7 @@ fraud_nb = create_notebook(
                 "    RETURN a.name AS user_a, b.name AS user_b, c.name AS user_c,",
                 "           COUNT(*) AS rings",
                 '"""',
-                "results = db.query(query_ring)",
+                "results = session.query(query_ring)",
                 "print('Money laundering rings detected:')",
                 "for r in results:",
                 "    print(f\"  Ring: {r['user_a']} | {r['user_b']} | {r['user_c']} ({r['rings']} ring(s))\")",
@@ -798,7 +803,7 @@ fraud_nb = create_notebook(
                 "           r1.amount AS leg1, r2.amount AS leg2, r3.amount AS leg3,",
                 "           r1.amount + r2.amount + r3.amount AS total_cycled",
                 '"""',
-                "results = db.query(query_amounts)",
+                "results = session.query(query_amounts)",
                 "for r in results:",
                 "    print(f\"Ring: {r['user_a']} -> {r['user_b']} -> {r['user_c']} -> {r['user_a']}\")",
                 "    print(f\"  Leg amounts: ${r['leg1']:.0f}, ${r['leg2']:.0f}, ${r['leg3']:.0f}\")",
@@ -820,7 +825,7 @@ fraud_nb = create_notebook(
                 "    RETURN u.name AS user, d.device_id AS device, fraudster.name AS flagged_contact",
                 "    ORDER BY user",
                 '"""',
-                "results = db.query(query_shared)",
+                "results = session.query(query_shared)",
                 "print('Users sharing device with high-risk account:')",
                 "for r in results:",
                 "    print(f\"  {r['user']} shares {r['device']} with {r['flagged_contact']}\")",
@@ -850,7 +855,7 @@ fraud_nb = create_notebook(
                 "    WHERE a._vid < b._vid AND a._vid < c._vid",
                 "    RETURN c.name AS n",
                 '"""',
-                "ring_members = {r['n'] for r in db.query(ring_query)}",
+                "ring_members = {r['n'] for r in session.query(ring_query)}",
                 "",
                 "# Device-sharing users",
                 'device_query = """',
@@ -858,7 +863,7 @@ fraud_nb = create_notebook(
                 "    WHERE fraudster.risk_score > 0.8 AND u._vid <> fraudster._vid",
                 "    RETURN u.name AS n",
                 '"""',
-                "device_risk = {r['n'] for r in db.query(device_query)}",
+                "device_risk = {r['n'] for r in session.query(device_query)}",
                 "",
                 "combined = ring_members & device_risk",
                 "print(f'Ring members: {sorted(ring_members)}')",
@@ -919,7 +924,8 @@ sales_nb = create_notebook(
         ),
         code_cell(
             [
-                "with db.bulk_writer().build() as bw:",
+                "tx = session.tx()",
+                "with tx.bulk_writer().build() as bw:",
                 "    # Regions",
                 "    region_vids = bw.insert_vertices('Region', [",
                 "        {'name': 'North'},",
@@ -981,6 +987,7 @@ sales_nb = create_notebook(
                 "    bw.insert_edges('SHIPPED_TO',   shipped_edges)",
                 "    bw.insert_edges('IN_CATEGORY',  category_edges)",
                 "    bw.commit()",
+                "tx.commit()",
                 'print("Data ingested")',
             ]
         ),
@@ -997,7 +1004,7 @@ sales_nb = create_notebook(
                 "    RETURN r.name AS region, COUNT(o) AS order_count, SUM(o.amount) AS total_revenue",
                 "    ORDER BY total_revenue DESC",
                 '"""',
-                "results = db.query(query_region)",
+                "results = session.query(query_region)",
                 "print('Revenue by region:')",
                 "for r in results:",
                 "    print(f\"  {r['region']:10s}: {r['order_count']:3d} orders, ${r['total_revenue']:8.2f}\")",
@@ -1018,7 +1025,7 @@ sales_nb = create_notebook(
                 "           COUNT(o) AS orders, SUM(o.amount) AS revenue",
                 "    ORDER BY region, revenue DESC",
                 '"""',
-                "results = db.query(query_breakdown)",
+                "results = session.query(query_breakdown)",
                 "print('Region x Category breakdown:')",
                 "current_region = None",
                 "for r in results:",
@@ -1042,7 +1049,7 @@ sales_nb = create_notebook(
                 "    RETURN r.name AS region, o.amount AS amount",
                 "    ORDER BY region, amount DESC",
                 '"""',
-                "all_orders = db.query(query_top)",
+                "all_orders = session.query(query_top)",
                 "",
                 "# Group by region, take top 2",
                 "region_orders = defaultdict(list)",
@@ -1070,7 +1077,7 @@ sales_nb = create_notebook(
                 "    RETURN r.name AS region, c.name AS category, SUM(o.amount) AS revenue",
                 "    ORDER BY region, revenue DESC",
                 '"""',
-                "results = db.query(query_best_cat)",
+                "results = session.query(query_best_cat)",
                 "",
                 "# Take first (highest revenue) category per region",
                 "best = {}",

@@ -16,10 +16,12 @@ fn test_sync_api() -> Result<()> {
         .property("age", DataType::Int32)
         .apply()?;
 
-    // 3. Execute via session
+    // 3. Execute via transaction
     let session = db.session();
-    session.execute("CREATE (:User {name: 'Alice', age: 30})")?;
-    session.execute("CREATE (:User {name: 'Bob', age: 25})")?;
+    let tx = session.tx()?;
+    tx.execute("CREATE (:User {name: 'Alice', age: 30})")?;
+    tx.execute("CREATE (:User {name: 'Bob', age: 25})")?;
+    tx.commit()?;
 
     // 4. Query
     let result = session.query("MATCH (u:User) RETURN u.name, u.age ORDER BY u.age")?;

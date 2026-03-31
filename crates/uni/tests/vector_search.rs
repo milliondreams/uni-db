@@ -229,7 +229,7 @@ async fn test_l0_vertex_appears_in_vector_search() -> anyhow::Result<()> {
         serde_json::json!([0.0, 0.0]).into(),
     );
     writer
-        .insert_vertex_with_labels(vid2, props, &["Item".to_string()])
+        .insert_vertex_with_labels(vid2, props, &["Item".to_string()], None)
         .await?;
 
     // Build QueryContext from writer's L0.
@@ -274,7 +274,7 @@ async fn test_l0_tombstone_hides_flushed_vertex() -> anyhow::Result<()> {
 
     // Delete VID 1 via the writer (tombstone in L0).
     writer
-        .delete_vertex(Vid::new(1), Some(vec!["Item".to_string()]))
+        .delete_vertex(Vid::new(1), Some(vec!["Item".to_string()]), None)
         .await?;
 
     let l0_arc = writer.l0_manager.get_current();

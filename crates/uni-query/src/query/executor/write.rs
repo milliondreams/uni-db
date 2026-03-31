@@ -129,6 +129,7 @@ impl Executor {
         prop_manager: &PropertyManager,
         params: &HashMap<String, Value>,
         ctx: Option<&QueryContext>,
+        tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
     ) -> Result<()> {
         // Clone the target so we can hold &row references elsewhere.
         let target = row.get(variable).cloned();
@@ -154,7 +155,7 @@ impl Executor {
                     .await?;
                 }
                 let _ = writer
-                    .insert_vertex_with_labels(vid, enriched.clone(), &labels)
+                    .insert_vertex_with_labels(vid, enriched.clone(), &labels, tx_l0)
                     .await?;
                 // Update the in-memory row binding
                 if let Some(Value::Node(n)) = row.get_mut(variable) {
@@ -181,7 +182,7 @@ impl Executor {
                     .await?;
                 }
                 let _ = writer
-                    .insert_vertex_with_labels(vid, enriched.clone(), &labels)
+                    .insert_vertex_with_labels(vid, enriched.clone(), &labels, tx_l0)
                     .await?;
                 // Update the in-memory map-encoded node binding
                 if let Some(Value::Map(node_map)) = row.get_mut(variable) {
@@ -215,6 +216,7 @@ impl Executor {
                         eid,
                         write_props.clone(),
                         Some(edge.edge_type.clone()),
+                        tx_l0,
                     )
                     .await?;
                 // Update the in-memory row binding
@@ -253,6 +255,7 @@ impl Executor {
                         ei.eid,
                         write_props.clone(),
                         edge_type_name,
+                        tx_l0,
                     )
                     .await?;
                 // Update the in-memory map-encoded edge binding
@@ -705,6 +708,7 @@ impl Executor {
                             eid,
                             properties,
                             Some(label.to_string()),
+                            None,
                         )
                         .await?;
 
@@ -762,7 +766,7 @@ impl Executor {
                     let mut writer = writer_arc.write().await;
                     let vid = writer.next_vid().await?;
                     let _ = writer
-                        .insert_vertex_with_labels(vid, properties, &[label.to_string()])
+                        .insert_vertex_with_labels(vid, properties, &[label.to_string()], None)
                         .await?;
 
                     total_rows += 1;
@@ -1303,8 +1307,6 @@ impl Executor {
             if let Some((vid, _pattern_props)) = optimized_vid {
                 // Optimized Path: Node found via index
                 let mut writer = writer_lock.write().await;
-                let saved_l0 =
-                    tx_l0_override.map(|l0| writer.install_transaction_l0(Some(l0.clone())));
 
                 let mut match_row = row.clone();
                 if let PatternElement::Node(n) = &pattern.paths[0].elements[0]
@@ -1321,15 +1323,13 @@ impl Executor {
                         prop_manager,
                         params,
                         ctx,
+                        tx_l0_override,
                     )
                     .await
                 } else {
                     Ok(())
                 };
 
-                if let Some(saved) = saved_l0 {
-                    writer.install_transaction_l0(saved);
-                }
                 drop(writer);
                 result?;
 
@@ -1341,8 +1341,6 @@ impl Executor {
                     .execute_merge_match(pattern, &row, prop_manager, params, ctx)
                     .await?;
                 let mut writer = writer_lock.write().await;
-                let saved_l0 =
-                    tx_l0_override.map(|l0| writer.install_transaction_l0(Some(l0.clone())));
 
                 let result: Result<Vec<HashMap<String, Value>>> = async {
                     let mut batch = Vec::new();
@@ -1356,6 +1354,7 @@ impl Executor {
                                     prop_manager,
                                     params,
                                     ctx,
+                                    tx_l0_override,
                                 )
                                 .await?;
                             }
@@ -1370,6 +1369,7 @@ impl Executor {
                             prop_manager,
                             params,
                             ctx,
+                            tx_l0_override,
                         )
                         .await?;
                         if let Some(set) = on_create {
@@ -1380,6 +1380,7 @@ impl Executor {
                                 prop_manager,
                                 params,
                                 ctx,
+                                tx_l0_override,
                             )
                             .await?;
                         }
@@ -1390,9 +1391,6 @@ impl Executor {
                 }
                 .await;
 
-                if let Some(saved) = saved_l0 {
-                    writer.install_transaction_l0(saved);
-                }
                 drop(writer);
                 results.extend(result?);
             }
@@ -1401,6 +1399,7 @@ impl Executor {
     }
 
     /// Execute a CREATE pattern, inserting new vertices and edges into the graph.
+    #[expect(clippy::too_many_arguments)]
     pub(crate) async fn execute_create_pattern(
         &self,
         pattern: &Pattern,
@@ -1409,6 +1408,7 @@ impl Executor {
         prop_manager: &PropertyManager,
         params: &HashMap<String, Value>,
         ctx: Option<&QueryContext>,
+        tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
     ) -> Result<()> {
         for path in &pattern.paths {
             let mut prev_vid: Option<Vid> = None;
@@ -1467,7 +1467,7 @@ impl Executor {
 
                             // Insert vertex and get back final properties (includes auto-generated embeddings)
                             let final_props = writer
-                                .insert_vertex_with_labels(new_vid, props, &n.labels)
+                                .insert_vertex_with_labels(new_vid, props, &n.labels, tx_l0)
                                 .await?;
 
                             // Build node object with final properties (includes embeddings)
@@ -1527,6 +1527,7 @@ impl Executor {
                                         eid,
                                         rel_props,
                                         Some(type_name.clone()),
+                                        tx_l0,
                                     )
                                     .await?;
 
@@ -1636,6 +1637,7 @@ impl Executor {
         Ok(())
     }
 
+    #[expect(clippy::too_many_arguments)]
     pub(crate) async fn execute_set_items_locked(
         &self,
         items: &[SetItem],
@@ -1644,6 +1646,7 @@ impl Executor {
         prop_manager: &PropertyManager,
         params: &HashMap<String, Value>,
         ctx: Option<&QueryContext>,
+        tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
     ) -> Result<()> {
         for item in items {
             match item {
@@ -1679,7 +1682,7 @@ impl Executor {
                             }
 
                             let _ = writer
-                                .insert_vertex_with_labels(vid, props, &labels)
+                                .insert_vertex_with_labels(vid, props, &labels, tx_l0)
                                 .await?;
 
                             // Update the row object so subsequent RETURN sees the new value
@@ -1727,6 +1730,7 @@ impl Executor {
                                     ei.eid,
                                     props,
                                     Some(edge_type_name.clone()),
+                                    tx_l0,
                                 )
                                 .await?;
 
@@ -1768,6 +1772,7 @@ impl Executor {
                                     eid,
                                     props,
                                     Some(edge_type_name.clone()),
+                                    tx_l0,
                                 )
                                 .await?;
 
@@ -1841,6 +1846,7 @@ impl Executor {
                         prop_manager,
                         params,
                         ctx,
+                        tx_l0,
                     )
                     .await?;
                 }
@@ -1863,6 +1869,7 @@ impl Executor {
         writer: &mut Writer,
         prop_manager: &PropertyManager,
         ctx: Option<&QueryContext>,
+        tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
     ) -> Result<()> {
         // Collect property names to remove, grouped by variable.
         // Use Vec<(String, Vec<String>)> to preserve insertion order.
@@ -1907,7 +1914,7 @@ impl Executor {
                     .count();
                 let any_exist = removed_count > 0;
                 if any_exist {
-                    writer.track_properties_removed(removed_count);
+                    writer.track_properties_removed(removed_count, tx_l0);
                     for prop_name in prop_names {
                         props.insert(prop_name.clone(), Value::Null);
                     }
@@ -1921,7 +1928,7 @@ impl Executor {
                 if any_exist {
                     let labels = Self::extract_labels_from_node(node_val).unwrap_or_default();
                     let _ = writer
-                        .insert_vertex_with_labels(vid, props, &labels)
+                        .insert_vertex_with_labels(vid, props, &labels, tx_l0)
                         .await?;
                 }
 
@@ -1950,7 +1957,7 @@ impl Executor {
                         .count();
                     let any_exist = removed_count > 0;
                     if any_exist {
-                        writer.track_properties_removed(removed_count);
+                        writer.track_properties_removed(removed_count, tx_l0);
                         for prop_name in prop_names {
                             props.insert(prop_name.to_string(), Value::Null);
                         }
@@ -1981,6 +1988,7 @@ impl Executor {
                                 ei.eid,
                                 props,
                                 edge_type_name,
+                                tx_l0,
                             )
                             .await?;
                     }
@@ -2011,12 +2019,20 @@ impl Executor {
                     .filter(|p| props.get(*p).is_some_and(|v| !v.is_null()))
                     .count();
                 if removed_count > 0 {
-                    writer.track_properties_removed(removed_count);
+                    writer.track_properties_removed(removed_count, tx_l0);
                     for prop_name in prop_names {
                         props.insert(prop_name.to_string(), Value::Null);
                     }
                     writer
-                        .insert_edge(src, dst, etype, eid, props, Some(edge.edge_type.clone()))
+                        .insert_edge(
+                            src,
+                            dst,
+                            etype,
+                            eid,
+                            props,
+                            Some(edge.edge_type.clone()),
+                            tx_l0,
+                        )
                         .await?;
                 }
 
@@ -2081,13 +2097,14 @@ impl Executor {
         &self,
         edge: &crate::types::Edge,
         writer: &Writer,
+        tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
     ) -> Result<u32> {
         if !edge.edge_type.is_empty() {
             return self.resolve_edge_type_id(&Value::String(edge.edge_type.clone()));
         }
         // Edge type name is empty (e.g., from anonymous MATCH patterns).
         // Look up the edge type ID from the L0 buffer's edge endpoints.
-        if let Some(etype) = writer.get_edge_type_id_from_l0(edge.eid) {
+        if let Some(etype) = writer.get_edge_type_id_from_l0(edge.eid, tx_l0) {
             return Ok(etype);
         }
         Err(anyhow!(
@@ -2102,6 +2119,7 @@ impl Executor {
         val: &Value,
         detach: bool,
         writer: &mut Writer,
+        tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
     ) -> Result<()> {
         match val {
             Value::Null => {
@@ -2110,23 +2128,29 @@ impl Executor {
             Value::Path(path) => {
                 // Delete path edges first, then nodes
                 for edge in &path.edges {
-                    let etype = self.resolve_edge_type_id_for_edge(edge, writer)?;
+                    let etype = self.resolve_edge_type_id_for_edge(edge, writer, tx_l0)?;
                     writer
-                        .delete_edge(edge.eid, edge.src, edge.dst, etype)
+                        .delete_edge(edge.eid, edge.src, edge.dst, etype, tx_l0)
                         .await?;
                 }
                 for node in &path.nodes {
-                    self.execute_delete_vertex(node.vid, detach, Some(node.labels.clone()), writer)
-                        .await?;
+                    self.execute_delete_vertex(
+                        node.vid,
+                        detach,
+                        Some(node.labels.clone()),
+                        writer,
+                        tx_l0,
+                    )
+                    .await?;
                 }
             }
             _ => {
                 // Try Path reconstruction from Map first (Arrow loses Path type)
                 if let Ok(path) = Path::try_from(val) {
                     for edge in &path.edges {
-                        let etype = self.resolve_edge_type_id_for_edge(edge, writer)?;
+                        let etype = self.resolve_edge_type_id_for_edge(edge, writer, tx_l0)?;
                         writer
-                            .delete_edge(edge.eid, edge.src, edge.dst, etype)
+                            .delete_edge(edge.eid, edge.src, edge.dst, etype, tx_l0)
                             .await?;
                     }
                     for node in &path.nodes {
@@ -2135,19 +2159,21 @@ impl Executor {
                             detach,
                             Some(node.labels.clone()),
                             writer,
+                            tx_l0,
                         )
                         .await?;
                     }
                 } else if let Ok(vid) = Self::vid_from_value(val) {
                     let labels = Self::extract_labels_from_node(val);
-                    self.execute_delete_vertex(vid, detach, labels, writer)
+                    self.execute_delete_vertex(vid, detach, labels, writer, tx_l0)
                         .await?;
                 } else if let Value::Map(map) = val {
-                    self.execute_delete_edge_from_map(map, writer).await?;
+                    self.execute_delete_edge_from_map(map, writer, tx_l0)
+                        .await?;
                 } else if let Value::Edge(edge) = val {
-                    let etype = self.resolve_edge_type_id_for_edge(edge, writer)?;
+                    let etype = self.resolve_edge_type_id_for_edge(edge, writer, tx_l0)?;
                     writer
-                        .delete_edge(edge.eid, edge.src, edge.dst, etype)
+                        .delete_edge(edge.eid, edge.src, edge.dst, etype, tx_l0)
                         .await?;
                 }
             }
@@ -2162,13 +2188,14 @@ impl Executor {
         detach: bool,
         labels: Option<Vec<String>>,
         writer: &mut Writer,
+        tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
     ) -> Result<()> {
         if detach {
-            self.detach_delete_vertex(vid, writer).await?;
+            self.detach_delete_vertex(vid, writer, tx_l0).await?;
         } else {
             self.check_vertex_has_no_edges(vid, writer).await?;
         }
-        writer.delete_vertex(vid, labels).await?;
+        writer.delete_vertex(vid, labels, tx_l0).await?;
         Ok(())
     }
 
@@ -2215,12 +2242,13 @@ impl Executor {
         &self,
         map: &HashMap<String, Value>,
         writer: &mut Writer,
+        tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
     ) -> Result<()> {
         // Check for non-null _eid to skip OPTIONAL MATCH null edges
         if map.get("_eid").is_some_and(|v| !v.is_null()) {
             let ei = self.extract_edge_identity(map)?;
             writer
-                .delete_edge(ei.eid, ei.src, ei.dst, ei.edge_type_id)
+                .delete_edge(ei.eid, ei.src, ei.dst, ei.edge_type_id, tx_l0)
                 .await?;
         }
         Ok(())

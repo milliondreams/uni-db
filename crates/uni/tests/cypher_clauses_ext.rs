@@ -63,7 +63,7 @@ impl PersonTestHarness {
             let mut props = HashMap::new();
             props.insert("name".to_string(), unival!(*name));
             props.insert("age".to_string(), unival!(*age));
-            w.insert_vertex_with_labels(vid, props, &["Person".to_string()])
+            w.insert_vertex_with_labels(vid, props, &["Person".to_string()], None)
                 .await?;
         }
         w.flush_to_l1(None).await?;
@@ -200,7 +200,7 @@ async fn test_cypher_with() -> anyhow::Result<()> {
         let vid = w.next_vid().await?;
         let mut props = HashMap::new();
         props.insert("name".to_string(), unival!("Alice"));
-        w.insert_vertex_with_labels(vid, props, &["Person".to_string()])
+        w.insert_vertex_with_labels(vid, props, &["Person".to_string()], None)
             .await?;
         w.flush_to_l1(None).await?;
     }

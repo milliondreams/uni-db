@@ -50,7 +50,8 @@ async fn test_fraud_detection_use_case() -> anyhow::Result<()> {
         HashMap::from([("risk_score".to_string(), Value::Float(0.3))]), // User C
         HashMap::from([("risk_score".to_string(), Value::Float(0.9))]), // User D (Fraudster)
     ];
-    let user_vids = db.session().bulk_insert_vertices("User", users).await?;
+    let tx = db.session().tx().await?;
+    let user_vids = tx.bulk_insert_vertices("User", users).await?;
     let user_a = user_vids[0];
     let user_b = user_vids[1];
     let user_c = user_vids[2];
@@ -58,7 +59,7 @@ async fn test_fraud_detection_use_case() -> anyhow::Result<()> {
 
     // Insert Device: D1
     let devices = vec![HashMap::new()];
-    let device_vids = db.session().bulk_insert_vertices("Device", devices).await?;
+    let device_vids = tx.bulk_insert_vertices("Device", devices).await?;
     let device_d1 = device_vids[0];
 
     // Insert Edges: Payment Ring A -> B -> C -> A
@@ -92,18 +93,16 @@ async fn test_fraud_detection_use_case() -> anyhow::Result<()> {
             ]),
         ),
     ];
-    db.session()
-        .bulk_insert_edges("SENT_MONEY", edges_sent_money)
-        .await?;
+    tx.bulk_insert_edges("SENT_MONEY", edges_sent_money).await?;
 
     // Insert Edges: Shared Device A -> D1, B -> D1, D -> D1
     let edges_used_device = vec![
         (user_a, device_d1, HashMap::new()),
         (user_d, device_d1, HashMap::new()), // User A shares device with Fraudster D
     ];
-    db.session()
-        .bulk_insert_edges("USED_DEVICE", edges_used_device)
+    tx.bulk_insert_edges("USED_DEVICE", edges_used_device)
         .await?;
+    tx.commit().await?;
 
     // 3. Real-time Detection Query (Cycle Detection)
     // MATCH (a:User)-[t1:SENT_MONEY]->(b:User)-[t2:SENT_MONEY]->(c:User)-[t3:SENT_MONEY]->(a)

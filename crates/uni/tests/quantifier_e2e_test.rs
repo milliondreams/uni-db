@@ -34,12 +34,12 @@ async fn test_quantifier_all_e2e() -> Result<()> {
     let db = create_test_db().await?;
 
     // Create test data
-    db.session()
-        .execute("CREATE (p:Person {name: 'Alice', tags: [1, 2, 3], scores: [85, 90, 95]})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (p:Person {name: 'Alice', tags: [1, 2, 3], scores: [85, 90, 95]})")
         .await?;
-    db.session()
-        .execute("CREATE (p:Person {name: 'Bob', tags: [0, -1, 5], scores: [60, 70, 80]})")
+    tx.execute("CREATE (p:Person {name: 'Bob', tags: [0, -1, 5], scores: [60, 70, 80]})")
         .await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // Test ALL quantifier - should return Alice (all tags > 0)
@@ -59,12 +59,12 @@ async fn test_quantifier_all_e2e() -> Result<()> {
 async fn test_quantifier_any_e2e() -> Result<()> {
     let db = create_test_db().await?;
 
-    db.session()
-        .execute("CREATE (p:Person {name: 'Alice', values: [1, 2, 3]})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (p:Person {name: 'Alice', values: [1, 2, 3]})")
         .await?;
-    db.session()
-        .execute("CREATE (p:Person {name: 'Bob', values: [10, 20, 30]})")
+    tx.execute("CREATE (p:Person {name: 'Bob', values: [10, 20, 30]})")
         .await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // Test ANY quantifier - should return Bob (has values >= 20)
@@ -86,12 +86,12 @@ async fn test_quantifier_any_e2e() -> Result<()> {
 async fn test_quantifier_single_e2e() -> Result<()> {
     let db = create_test_db().await?;
 
-    db.session()
-        .execute("CREATE (p:Person {name: 'Charlie', items: [5]})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (p:Person {name: 'Charlie', items: [5]})")
         .await?;
-    db.session()
-        .execute("CREATE (p:Person {name: 'David', items: [5, 5, 5]})")
+    tx.execute("CREATE (p:Person {name: 'David', items: [5, 5, 5]})")
         .await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // Test SINGLE quantifier - should return Charlie (exactly one 5)
@@ -111,12 +111,12 @@ async fn test_quantifier_single_e2e() -> Result<()> {
 async fn test_quantifier_none_e2e() -> Result<()> {
     let db = create_test_db().await?;
 
-    db.session()
-        .execute("CREATE (p:Person {name: 'Eve', errors: [1, 2, 3]})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (p:Person {name: 'Eve', errors: [1, 2, 3]})")
         .await?;
-    db.session()
-        .execute("CREATE (p:Person {name: 'Frank', errors: [-1, -2]})")
+    tx.execute("CREATE (p:Person {name: 'Frank', errors: [-1, -2]})")
         .await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // Test NONE quantifier - should return Eve (no negative values)
@@ -136,9 +136,10 @@ async fn test_quantifier_none_e2e() -> Result<()> {
 async fn test_quantifier_in_return_e2e() -> Result<()> {
     let db = create_test_db().await?;
 
-    db.session()
-        .execute("CREATE (p:Person {name: 'Grace', numbers: [10, 20, 30]})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (p:Person {name: 'Grace', numbers: [10, 20, 30]})")
         .await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // Test quantifier in RETURN clause
@@ -174,9 +175,10 @@ async fn test_quantifier_with_literal_list_e2e() -> Result<()> {
 async fn test_quantifier_empty_list_e2e() -> Result<()> {
     let db = create_test_db().await?;
 
-    db.session()
-        .execute("CREATE (p:Person {name: 'Empty', items: []})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (p:Person {name: 'Empty', items: []})")
         .await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // ALL on empty list should be true (vacuous truth)
@@ -213,9 +215,10 @@ async fn test_quantifier_empty_list_e2e() -> Result<()> {
 async fn test_array_indexing_e2e() -> Result<()> {
     let db = create_test_db().await?;
 
-    db.session()
-        .execute("CREATE (p:Person {name: 'Helen', tags: ['a', 'b', 'c', 'd']})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (p:Person {name: 'Helen', tags: ['a', 'b', 'c', 'd']})")
         .await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // Test array indexing
@@ -237,9 +240,10 @@ async fn test_array_indexing_e2e() -> Result<()> {
 async fn test_array_slicing_e2e() -> Result<()> {
     let db = create_test_db().await?;
 
-    db.session()
-        .execute("CREATE (p:Person {name: 'Ivan', numbers: [10, 20, 30, 40, 50]})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (p:Person {name: 'Ivan', numbers: [10, 20, 30, 40, 50]})")
         .await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // Test array slicing
@@ -259,9 +263,10 @@ async fn test_array_slicing_e2e() -> Result<()> {
 async fn test_combined_quantifier_and_array_ops_e2e() -> Result<()> {
     let db = create_test_db().await?;
 
-    db.session()
-        .execute("CREATE (p:Person {name: 'Jane', data: [[1, 2], [3, 4], [5, 6]]})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (p:Person {name: 'Jane', data: [[1, 2], [3, 4], [5, 6]]})")
         .await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // Test quantifier with array operations

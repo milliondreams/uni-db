@@ -19,10 +19,12 @@ async fn test_locy_register_persists_rules() -> anyhow::Result<()> {
         .apply()
         .await?;
 
-    db.session().execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (a:Node {name: 'A', val: 1})-[:EDGE]->(b:Node {name: 'B', val: 2})-[:EDGE]->(c:Node {name: 'C', val: 3})",
     )
     .await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // Step 1: Register rules globally (no execution).
@@ -62,9 +64,10 @@ async fn test_locy_clear_removes_registered_rules() -> anyhow::Result<()> {
         .apply()
         .await?;
 
-    db.session()
-        .execute("CREATE (:Node {name: 'A'})-[:EDGE]->(:Node {name: 'B'})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Node {name: 'A'})-[:EDGE]->(:Node {name: 'B'})")
         .await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // Register a rule globally.

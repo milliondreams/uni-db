@@ -60,7 +60,8 @@ class TestUseCases(unittest.TestCase):
         p2_props = {"sku": "MB-X1", "cost": 50.0}
         p3_props = {"sku": "SCR-OLED", "cost": 30.0}
 
-        bw = session.bulk_writer().build()
+        tx = session.tx()
+        bw = tx.bulk_writer().build()
         vids = bw.insert_vertices("Part", [p1_props, p2_props, p3_props])
         p1, p2, p3 = vids
 
@@ -72,6 +73,7 @@ class TestUseCases(unittest.TestCase):
             "ASSEMBLED_FROM", [(phone, p2, {}), (phone, p3, {}), (p2, p1, {})]
         )
         bw.commit()
+        tx.commit()
 
         db.flush()
 
@@ -120,7 +122,8 @@ class TestUseCases(unittest.TestCase):
         p1_vec = [1.0, 0.0, 0.0, 0.0]
         p2_vec = [0.9, 0.1, 0.0, 0.0]
 
-        bw = session.bulk_writer().build()
+        tx = session.tx()
+        bw = tx.bulk_writer().build()
         vids = bw.insert_vertices(
             "Product",
             [
@@ -135,6 +138,7 @@ class TestUseCases(unittest.TestCase):
 
         bw.insert_edges("PURCHASED", [(u1, p1, {}), (u2, p1, {}), (u3, p1, {})])
         bw.commit()
+        tx.commit()
 
         db.flush()
 
@@ -165,7 +169,8 @@ class TestUseCases(unittest.TestCase):
         c1_vec = [1.0, 0.0, 0.0, 0.0]
         c2_vec = [0.9, 0.1, 0.0, 0.0]
 
-        bw = session.bulk_writer().build()
+        tx = session.tx()
+        bw = tx.bulk_writer().build()
         c_vids = bw.insert_vertices(
             "Chunk",
             [
@@ -180,6 +185,7 @@ class TestUseCases(unittest.TestCase):
 
         bw.insert_edges("MENTIONS", [(c1, e1, {}), (c2, e1, {})])
         bw.commit()
+        tx.commit()
         db.flush()
 
         # 3. Hybrid RAG Query
@@ -207,7 +213,8 @@ class TestUseCases(unittest.TestCase):
         ).done().apply()
 
         # 2. Ingestion
-        bw = session.bulk_writer().build()
+        tx = session.tx()
+        bw = tx.bulk_writer().build()
         u_vids = bw.insert_vertices(
             "User",
             [
@@ -233,6 +240,7 @@ class TestUseCases(unittest.TestCase):
 
         bw.insert_edges("USED_DEVICE", [(ua, d1, {}), (ud, d1, {})])
         bw.commit()
+        tx.commit()
         db.flush()
 
         # 3. Cycle Detection
@@ -265,7 +273,8 @@ class TestUseCases(unittest.TestCase):
             "SHIPPED_TO", ["Order"], ["Region"]
         ).done().apply()
 
-        bw = session.bulk_writer().build()
+        tx = session.tx()
+        bw = tx.bulk_writer().build()
         vids_region = bw.insert_vertices("Region", [{"name": "North"}])
         north = vids_region[0]
 
@@ -275,6 +284,7 @@ class TestUseCases(unittest.TestCase):
         edges = [(v, north, {}) for v in vids_orders]
         bw.insert_edges("SHIPPED_TO", edges)
         bw.commit()
+        tx.commit()
         db.flush()
 
         # Query: Sum of amounts for orders shipped to "North"
@@ -294,7 +304,8 @@ class TestUseCases(unittest.TestCase):
             "title", "string"
         ).done().edge_type("CITES", ["Paper"], ["Paper"]).done().apply()
 
-        bw = session.bulk_writer().build()
+        tx = session.tx()
+        bw = tx.bulk_writer().build()
         vids = bw.insert_vertices(
             "Paper",
             [
@@ -307,6 +318,7 @@ class TestUseCases(unittest.TestCase):
 
         bw.insert_edges("CITES", [(p1, p3, {})])
         bw.commit()
+        tx.commit()
         db.flush()
 
         # Find AI papers that cite other AI papers
@@ -330,7 +342,8 @@ class TestUseCases(unittest.TestCase):
         ).done().edge_type("VIEWED", ["User"], ["Product"]).done().apply()
 
         # Alice viewed a Laptop
-        bw = session.bulk_writer().build()
+        tx = session.tx()
+        bw = tx.bulk_writer().build()
         vids_u = bw.insert_vertices("User", [{"name": "Alice"}])
         alice = vids_u[0]
 
@@ -346,6 +359,7 @@ class TestUseCases(unittest.TestCase):
 
         bw.insert_edges("VIEWED", [(alice, laptop, {})])
         bw.commit()
+        tx.commit()
         db.flush()
 
         # 1. Find Alice's viewed products and their embeddings
@@ -378,10 +392,12 @@ class TestUseCases(unittest.TestCase):
         ).done().apply()
 
         # 1. Ingestion via CREATE
-        session.execute("CREATE (a:Node {name: 'A'}), (b:Node {name: 'B'})")
-        session.execute(
+        tx = session.tx()
+        tx.execute("CREATE (a:Node {name: 'A'}), (b:Node {name: 'B'})")
+        tx.execute(
             "MATCH (a:Node {name: 'A'}), (b:Node {name: 'B'}) CREATE (b)-[:DERIVED_FROM]->(a)"
         )
+        tx.commit()
         db.flush()
 
         # 2. Query and traverse

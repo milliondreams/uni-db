@@ -9,16 +9,14 @@ async fn test_session_variables() -> Result<()> {
     let db = Uni::temporary().build().await?;
 
     // Create Schema
-    db.session()
-        .execute("CREATE LABEL User (name STRING, tenant STRING)")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL User (name STRING, tenant STRING)")
         .await?;
-
-    db.session()
-        .execute("CREATE (n:User {name: 'Alice', tenant: 'A'})")
+    tx.execute("CREATE (n:User {name: 'Alice', tenant: 'A'})")
         .await?;
-    db.session()
-        .execute("CREATE (n:User {name: 'Bob', tenant: 'B'})")
+    tx.execute("CREATE (n:User {name: 'Bob', tenant: 'B'})")
         .await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // Create session with scoped parameter

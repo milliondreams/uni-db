@@ -133,9 +133,9 @@ async fn test_auto_embed_string_query_requires_xervo_runtime() -> Result<()> {
         .apply()
         .await?;
 
-    db.session()
-        .execute(
-            r#"
+    let tx = db.session().tx().await?;
+    tx.execute(
+        r#"
         CREATE VECTOR INDEX item_vec_idx
         FOR (i:Item) ON (i.embedding)
         OPTIONS {
@@ -146,8 +146,9 @@ async fn test_auto_embed_string_query_requires_xervo_runtime() -> Result<()> {
             }
         }
     "#,
-        )
-        .await?;
+    )
+    .await?;
+    tx.commit().await?;
 
     let result = db
         .session()
@@ -193,12 +194,12 @@ async fn test_vector_e2e_lifecycle_create_insert_flush_query_delete_query() -> R
         .apply()
         .await?;
 
-    db.session()
-        .execute("CREATE (d:Doc {id: 1, content: 'alpha', embedding: [0.0, 0.0]})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (d:Doc {id: 1, content: 'alpha', embedding: [0.0, 0.0]})")
         .await?;
-    db.session()
-        .execute("CREATE (d:Doc {id: 2, content: 'beta', embedding: [1.0, 1.0]})")
+    tx.execute("CREATE (d:Doc {id: 2, content: 'beta', embedding: [1.0, 1.0]})")
         .await?;
+    tx.commit().await?;
 
     db.flush().await?;
 
@@ -223,9 +224,9 @@ async fn test_vector_e2e_lifecycle_create_insert_flush_query_delete_query() -> R
         .await?;
     assert_eq!(nearest.rows()[0].get::<i64>("d.id")?, 1);
 
-    db.session()
-        .execute("MATCH (d:Doc {id: 1}) DETACH DELETE d")
-        .await?;
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (d:Doc {id: 1}) DETACH DELETE d").await?;
+    tx.commit().await?;
     db.flush().await?;
 
     let after = db
@@ -266,12 +267,12 @@ async fn test_vector_match_operator_with_embedding_alias_config() -> Result<()> 
         .apply()
         .await?;
 
-    db.session()
-        .execute("CREATE (i:Item {id: 1, embedding: [0.0, 0.0]})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (i:Item {id: 1, embedding: [0.0, 0.0]})")
         .await?;
-    db.session()
-        .execute("CREATE (i:Item {id: 2, embedding: [2.0, 2.0]})")
+    tx.execute("CREATE (i:Item {id: 2, embedding: [2.0, 2.0]})")
         .await?;
+    tx.commit().await?;
     db.flush().await?;
 
     let results = db

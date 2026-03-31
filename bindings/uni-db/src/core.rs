@@ -86,8 +86,12 @@ pub async fn query_cursor_core(
 
 /// Execute a mutation query, returning affected row count.
 pub async fn execute_core(db: &Uni, cypher: &str) -> Result<usize, UniError> {
-    let result = db.session().execute(cypher).await?;
-    Ok(result.affected_rows())
+    let session = db.session();
+    let tx = session.tx().await?;
+    let result = tx.execute(cypher).await?;
+    let affected = result.affected_rows();
+    tx.commit().await?;
+    Ok(affected)
 }
 
 /// Execute a mutation query with parameters, returning affected row count.
@@ -97,12 +101,15 @@ pub async fn execute_with_params_core(
     params: HashMap<String, Value>,
 ) -> Result<usize, UniError> {
     let session = db.session();
-    let mut builder = session.execute_with(cypher);
+    let tx = session.tx().await?;
+    let mut builder = tx.execute_with(cypher);
     for (k, v) in params {
         builder = builder.param(&k, v);
     }
     let result = builder.run().await?;
-    Ok(result.affected_rows())
+    let affected = result.affected_rows();
+    tx.commit().await?;
+    Ok(affected)
 }
 
 /// Explain a query plan without executing.
@@ -244,7 +251,11 @@ pub async fn bulk_insert_vertices_core(
         .into_iter()
         .map(|m| m.into_iter().map(|(k, v)| (k, v.into())).collect())
         .collect();
-    db.session().bulk_insert_vertices(label, uni_props).await
+    let session = db.session();
+    let tx = session.tx().await?;
+    let vids = tx.bulk_insert_vertices(label, uni_props).await?;
+    tx.commit().await?;
+    Ok(vids)
 }
 
 /// Bulk insert edges.
@@ -257,7 +268,11 @@ pub async fn bulk_insert_edges_core(
         .into_iter()
         .map(|(s, d, m)| (s, d, m.into_iter().map(|(k, v)| (k, v.into())).collect()))
         .collect();
-    db.session().bulk_insert_edges(edge_type, uni_edges).await
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.bulk_insert_edges(edge_type, uni_edges).await?;
+    tx.commit().await?;
+    Ok(())
 }
 
 // ============================================================================

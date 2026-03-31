@@ -157,17 +157,17 @@ async fn write_and_flush(
     let v1 = writer.next_vid().await.unwrap();
     let v2 = writer.next_vid().await.unwrap();
     writer
-        .insert_vertex_with_labels(v1, HashMap::new(), &["Person".to_string()])
+        .insert_vertex_with_labels(v1, HashMap::new(), &["Person".to_string()], None)
         .await
         .unwrap();
     writer
-        .insert_vertex_with_labels(v2, HashMap::new(), &["Person".to_string()])
+        .insert_vertex_with_labels(v2, HashMap::new(), &["Person".to_string()], None)
         .await
         .unwrap();
 
     let eid = writer.next_eid(edge_type_id).await.unwrap();
     writer
-        .insert_edge(v1, v2, edge_type_id, eid, HashMap::new(), None)
+        .insert_edge(v1, v2, edge_type_id, eid, HashMap::new(), None, None)
         .await
         .unwrap();
 

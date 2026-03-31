@@ -41,23 +41,23 @@ async fn test_transaction_edge_versions_preserved_in_adjacency() -> Result<()> {
     );
     let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 1).await?;
 
-    // Create vertices
+    // Create vertices (outside transaction)
     let vid_src = writer.next_vid().await?;
     let vid_dst_a = writer.next_vid().await?;
     let vid_dst_b = writer.next_vid().await?;
 
     writer
-        .insert_vertex_with_labels(vid_src, HashMap::new(), &["Person".to_string()])
+        .insert_vertex_with_labels(vid_src, HashMap::new(), &["Person".to_string()], None)
         .await?;
     writer
-        .insert_vertex_with_labels(vid_dst_a, HashMap::new(), &["Person".to_string()])
+        .insert_vertex_with_labels(vid_dst_a, HashMap::new(), &["Person".to_string()], None)
         .await?;
     writer
-        .insert_vertex_with_labels(vid_dst_b, HashMap::new(), &["Person".to_string()])
+        .insert_vertex_with_labels(vid_dst_b, HashMap::new(), &["Person".to_string()], None)
         .await?;
 
     // Begin transaction
-    writer.begin_transaction()?;
+    let tx_l0 = writer.create_transaction_l0();
 
     // Insert first edge (will get version from tx L0)
     let eid_a = writer.next_eid(edge_type_id).await?;
@@ -69,15 +69,12 @@ async fn test_transaction_edge_versions_preserved_in_adjacency() -> Result<()> {
             eid_a,
             HashMap::new(),
             None,
+            Some(&tx_l0),
         )
         .await?;
 
     // Capture version after first edge (simulate version advancement in transaction)
     let version_after_first = {
-        let tx_l0 = writer
-            .transaction_l0
-            .as_ref()
-            .expect("Transaction should be active");
         let tx_l0_guard = tx_l0.read();
         tx_l0_guard.current_version
     };
@@ -92,20 +89,17 @@ async fn test_transaction_edge_versions_preserved_in_adjacency() -> Result<()> {
             eid_b,
             HashMap::new(),
             None,
+            Some(&tx_l0),
         )
         .await?;
 
     let version_after_second = {
-        let tx_l0 = writer
-            .transaction_l0
-            .as_ref()
-            .expect("Transaction should be active");
         let tx_l0_guard = tx_l0.read();
         tx_l0_guard.current_version
     };
 
     // Commit transaction - this should preserve per-edge versions in adjacency manager
-    writer.commit_transaction().await?;
+    writer.commit_transaction_l0(tx_l0).await?;
 
     let am = storage.adjacency_manager();
 
@@ -178,27 +172,27 @@ async fn test_multiple_transactions_preserve_edge_versions() -> Result<()> {
     );
     let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 1).await?;
 
-    // Create vertices
+    // Create vertices (outside transaction)
     let vid_src = writer.next_vid().await?;
     let vid_dst_1 = writer.next_vid().await?;
     let vid_dst_2 = writer.next_vid().await?;
     let vid_dst_3 = writer.next_vid().await?;
 
     writer
-        .insert_vertex_with_labels(vid_src, HashMap::new(), &["Person".to_string()])
+        .insert_vertex_with_labels(vid_src, HashMap::new(), &["Person".to_string()], None)
         .await?;
     writer
-        .insert_vertex_with_labels(vid_dst_1, HashMap::new(), &["Person".to_string()])
+        .insert_vertex_with_labels(vid_dst_1, HashMap::new(), &["Person".to_string()], None)
         .await?;
     writer
-        .insert_vertex_with_labels(vid_dst_2, HashMap::new(), &["Person".to_string()])
+        .insert_vertex_with_labels(vid_dst_2, HashMap::new(), &["Person".to_string()], None)
         .await?;
     writer
-        .insert_vertex_with_labels(vid_dst_3, HashMap::new(), &["Person".to_string()])
+        .insert_vertex_with_labels(vid_dst_3, HashMap::new(), &["Person".to_string()], None)
         .await?;
 
     // Transaction 1: Insert edge to dst_1
-    writer.begin_transaction()?;
+    let tx_l0 = writer.create_transaction_l0();
     let eid_1 = writer.next_eid(edge_type_id).await?;
     writer
         .insert_edge(
@@ -208,9 +202,10 @@ async fn test_multiple_transactions_preserve_edge_versions() -> Result<()> {
             eid_1,
             HashMap::new(),
             None,
+            Some(&tx_l0),
         )
         .await?;
-    writer.commit_transaction().await?;
+    writer.commit_transaction_l0(tx_l0).await?;
 
     let version_after_tx1 = {
         let main_l0 = writer.l0_manager.get_current();
@@ -218,7 +213,7 @@ async fn test_multiple_transactions_preserve_edge_versions() -> Result<()> {
     };
 
     // Transaction 2: Insert edge to dst_2
-    writer.begin_transaction()?;
+    let tx_l0 = writer.create_transaction_l0();
     let eid_2 = writer.next_eid(edge_type_id).await?;
     writer
         .insert_edge(
@@ -228,9 +223,10 @@ async fn test_multiple_transactions_preserve_edge_versions() -> Result<()> {
             eid_2,
             HashMap::new(),
             None,
+            Some(&tx_l0),
         )
         .await?;
-    writer.commit_transaction().await?;
+    writer.commit_transaction_l0(tx_l0).await?;
 
     let version_after_tx2 = {
         let main_l0 = writer.l0_manager.get_current();
@@ -238,7 +234,7 @@ async fn test_multiple_transactions_preserve_edge_versions() -> Result<()> {
     };
 
     // Transaction 3: Insert edge to dst_3
-    writer.begin_transaction()?;
+    let tx_l0 = writer.create_transaction_l0();
     let eid_3 = writer.next_eid(edge_type_id).await?;
     writer
         .insert_edge(
@@ -248,9 +244,10 @@ async fn test_multiple_transactions_preserve_edge_versions() -> Result<()> {
             eid_3,
             HashMap::new(),
             None,
+            Some(&tx_l0),
         )
         .await?;
-    writer.commit_transaction().await?;
+    writer.commit_transaction_l0(tx_l0).await?;
 
     let am = storage.adjacency_manager();
 

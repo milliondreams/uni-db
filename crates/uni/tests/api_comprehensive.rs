@@ -21,22 +21,17 @@ async fn test_complex_cypher() -> Result<()> {
         .await?;
 
     // Data
-    db.session()
-        .execute("CREATE (p1:Product {name: 'Apple', price: 1.2})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (p1:Product {name: 'Apple', price: 1.2})")
         .await?;
-    db.session()
-        .execute("CREATE (p2:Product {name: 'Banana', price: 0.8})")
+    tx.execute("CREATE (p2:Product {name: 'Banana', price: 0.8})")
         .await?;
-    db.session()
-        .execute("CREATE (o1:Order {date: '2024-01-01'})")
-        .await?;
-    db.session()
-        .execute("CREATE (o2:Order {date: '2024-01-02'})")
-        .await?;
-
-    db.session().execute("MATCH (o:Order {date: '2024-01-01'}), (p:Product {name: 'Apple'}) CREATE (o)-[:CONTAINS {qty: 10}]->(p)").await?;
-    db.session().execute("MATCH (o:Order {date: '2024-01-01'}), (p:Product {name: 'Banana'}) CREATE (o)-[:CONTAINS {qty: 5}]->(p)").await?;
-    db.session().execute("MATCH (o:Order {date: '2024-01-02'}), (p:Product {name: 'Apple'}) CREATE (o)-[:CONTAINS {qty: 20}]->(p)").await?;
+    tx.execute("CREATE (o1:Order {date: '2024-01-01'})").await?;
+    tx.execute("CREATE (o2:Order {date: '2024-01-02'})").await?;
+    tx.execute("MATCH (o:Order {date: '2024-01-01'}), (p:Product {name: 'Apple'}) CREATE (o)-[:CONTAINS {qty: 10}]->(p)").await?;
+    tx.execute("MATCH (o:Order {date: '2024-01-01'}), (p:Product {name: 'Banana'}) CREATE (o)-[:CONTAINS {qty: 5}]->(p)").await?;
+    tx.execute("MATCH (o:Order {date: '2024-01-02'}), (p:Product {name: 'Apple'}) CREATE (o)-[:CONTAINS {qty: 20}]->(p)").await?;
+    tx.commit().await?;
 
     // Aggregation
     // Total quantity per product
@@ -89,7 +84,9 @@ async fn test_error_handling() -> Result<()> {
         .await?;
     // Uni currently doesn't enforce schema constraints on write strictly in L0
     // (L0 is schema-less/flexible), but read might fail or cast?
-    db.session().execute("CREATE (:User {age: 25})").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:User {age: 25})").await?;
+    tx.commit().await?;
     let res = db.session().query("MATCH (u:User) RETURN u.age").await?;
     let row = &res.rows()[0];
 
@@ -110,7 +107,9 @@ async fn test_concurrency() -> Result<()> {
         .property("val", DataType::Int32)
         .apply()
         .await?;
-    db.session().execute("CREATE (:Counter {val: 0})").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Counter {val: 0})").await?;
+    tx.commit().await?;
 
     let mut handles = Vec::new();
     for _ in 0..10 {

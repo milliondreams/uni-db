@@ -19,7 +19,9 @@ class TestNode:
 
     def test_node_from_query(self, social_db):
         session = social_db.session()
-        session.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+        tx = session.tx()
+        tx.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+        tx.commit()
         result = session.query("MATCH (p:Person) RETURN p")
         assert len(result) == 1
         node = result[0]["p"]
@@ -27,7 +29,9 @@ class TestNode:
 
     def test_node_attributes(self, social_db):
         session = social_db.session()
-        session.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+        tx = session.tx()
+        tx.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+        tx.commit()
         result = session.query("MATCH (p:Person) RETURN p")
         node = result[0]["p"]
 
@@ -38,7 +42,9 @@ class TestNode:
 
     def test_node_dict_access(self, social_db):
         session = social_db.session()
-        session.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+        tx = session.tx()
+        tx.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+        tx.commit()
         result = session.query("MATCH (p:Person) RETURN p")
         node = result[0]["p"]
 
@@ -66,7 +72,9 @@ class TestNode:
 
     def test_node_iteration(self, social_db):
         session = social_db.session()
-        session.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+        tx = session.tx()
+        tx.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+        tx.commit()
         result = session.query("MATCH (p:Person) RETURN p")
         node = result[0]["p"]
         keys = list(node)
@@ -74,7 +82,9 @@ class TestNode:
 
     def test_node_keyerror(self, social_db):
         session = social_db.session()
-        session.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+        tx = session.tx()
+        tx.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+        tx.commit()
         result = session.query("MATCH (p:Person) RETURN p")
         node = result[0]["p"]
         with pytest.raises(KeyError, match="nonexistent"):
@@ -82,7 +92,9 @@ class TestNode:
 
     def test_node_deprecated_keys(self, social_db):
         session = social_db.session()
-        session.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+        tx = session.tx()
+        tx.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+        tx.commit()
         result = session.query("MATCH (p:Person) RETURN p")
         node = result[0]["p"]
 
@@ -104,7 +116,9 @@ class TestNode:
 
     def test_node_equality_and_hash(self, social_db):
         session = social_db.session()
-        session.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+        tx = session.tx()
+        tx.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+        tx.commit()
         r1 = session.query("MATCH (p:Person) RETURN p")
         r2 = session.query("MATCH (p:Person) RETURN p")
         n1 = r1[0]["p"]
@@ -116,7 +130,9 @@ class TestNode:
 
     def test_node_repr(self, social_db):
         session = social_db.session()
-        session.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+        tx = session.tx()
+        tx.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+        tx.commit()
         result = session.query("MATCH (p:Person) RETURN p")
         node = result[0]["p"]
         r = repr(node)
@@ -125,7 +141,9 @@ class TestNode:
 
     def test_node_bool_always_true(self, social_db):
         session = social_db.session()
-        session.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+        tx = session.tx()
+        tx.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+        tx.commit()
         result = session.query("MATCH (p:Person) RETURN p")
         node = result[0]["p"]
         assert bool(node) is True
@@ -133,7 +151,9 @@ class TestNode:
     def test_node_id_is_vid(self, social_db):
         """Node IDs must be Vid type (convertible to int)."""
         session = social_db.session()
-        session.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+        tx = session.tx()
+        tx.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+        tx.commit()
         result = session.query("MATCH (p:Person) RETURN p")
         node = result[0]["p"]
         assert isinstance(node.id, uni_db.Vid)
@@ -150,12 +170,14 @@ class TestEdge:
 
     def test_edge_from_query(self, social_db):
         session = social_db.session()
-        session.execute("CREATE (a:Person {name: 'Alice', age: 30})")
-        session.execute("CREATE (b:Person {name: 'Bob', age: 25})")
-        session.execute(
+        tx = session.tx()
+        tx.execute("CREATE (a:Person {name: 'Alice', age: 30})")
+        tx.execute("CREATE (b:Person {name: 'Bob', age: 25})")
+        tx.execute(
             "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) "
             "CREATE (a)-[:KNOWS {since: 2020}]->(b)"
         )
+        tx.commit()
         result = session.query("MATCH ()-[r:KNOWS]->() RETURN r")
         assert len(result) == 1
         edge = result[0]["r"]
@@ -163,12 +185,14 @@ class TestEdge:
 
     def test_edge_attributes(self, social_db):
         session = social_db.session()
-        session.execute("CREATE (a:Person {name: 'Alice', age: 30})")
-        session.execute("CREATE (b:Person {name: 'Bob', age: 25})")
-        session.execute(
+        tx = session.tx()
+        tx.execute("CREATE (a:Person {name: 'Alice', age: 30})")
+        tx.execute("CREATE (b:Person {name: 'Bob', age: 25})")
+        tx.execute(
             "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) "
             "CREATE (a)-[:KNOWS {since: 2020}]->(b)"
         )
+        tx.commit()
         result = session.query("MATCH ()-[r:KNOWS]->() RETURN r")
         edge = result[0]["r"]
 
@@ -182,12 +206,14 @@ class TestEdge:
 
     def test_edge_dict_access(self, social_db):
         session = social_db.session()
-        session.execute("CREATE (a:Person {name: 'Alice', age: 30})")
-        session.execute("CREATE (b:Person {name: 'Bob', age: 25})")
-        session.execute(
+        tx = session.tx()
+        tx.execute("CREATE (a:Person {name: 'Alice', age: 30})")
+        tx.execute("CREATE (b:Person {name: 'Bob', age: 25})")
+        tx.execute(
             "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) "
             "CREATE (a)-[:KNOWS {since: 2020}]->(b)"
         )
+        tx.commit()
         result = session.query("MATCH ()-[r:KNOWS]->() RETURN r")
         edge = result[0]["r"]
 
@@ -201,12 +227,14 @@ class TestEdge:
 
     def test_edge_deprecated_keys(self, social_db):
         session = social_db.session()
-        session.execute("CREATE (a:Person {name: 'Alice', age: 30})")
-        session.execute("CREATE (b:Person {name: 'Bob', age: 25})")
-        session.execute(
+        tx = session.tx()
+        tx.execute("CREATE (a:Person {name: 'Alice', age: 30})")
+        tx.execute("CREATE (b:Person {name: 'Bob', age: 25})")
+        tx.execute(
             "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) "
             "CREATE (a)-[:KNOWS {since: 2020}]->(b)"
         )
+        tx.commit()
         result = session.query("MATCH ()-[r:KNOWS]->() RETURN r")
         edge = result[0]["r"]
 
@@ -224,12 +252,14 @@ class TestEdge:
 
     def test_edge_equality_and_hash(self, social_db):
         session = social_db.session()
-        session.execute("CREATE (a:Person {name: 'Alice', age: 30})")
-        session.execute("CREATE (b:Person {name: 'Bob', age: 25})")
-        session.execute(
+        tx = session.tx()
+        tx.execute("CREATE (a:Person {name: 'Alice', age: 30})")
+        tx.execute("CREATE (b:Person {name: 'Bob', age: 25})")
+        tx.execute(
             "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) "
             "CREATE (a)-[:KNOWS {since: 2020}]->(b)"
         )
+        tx.commit()
         r1 = session.query("MATCH ()-[r:KNOWS]->() RETURN r")
         r2 = session.query("MATCH ()-[r:KNOWS]->() RETURN r")
         e1 = r1[0]["r"]
@@ -239,12 +269,14 @@ class TestEdge:
 
     def test_edge_repr(self, social_db):
         session = social_db.session()
-        session.execute("CREATE (a:Person {name: 'Alice', age: 30})")
-        session.execute("CREATE (b:Person {name: 'Bob', age: 25})")
-        session.execute(
+        tx = session.tx()
+        tx.execute("CREATE (a:Person {name: 'Alice', age: 30})")
+        tx.execute("CREATE (b:Person {name: 'Bob', age: 25})")
+        tx.execute(
             "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) "
-            "CREATE (a)-[:KNOWS {since: 2020}]->(b)"
+            "CREATE (a)-[:KNOWS]->(b)"
         )
+        tx.commit()
         result = session.query("MATCH ()-[r:KNOWS]->() RETURN r")
         edge = result[0]["r"]
         r = repr(edge)
@@ -254,12 +286,14 @@ class TestEdge:
     def test_edge_id_is_eid(self, social_db):
         """Edge IDs must be Eid type (convertible to int)."""
         session = social_db.session()
-        session.execute("CREATE (a:Person {name: 'Alice', age: 30})")
-        session.execute("CREATE (b:Person {name: 'Bob', age: 25})")
-        session.execute(
+        tx = session.tx()
+        tx.execute("CREATE (a:Person {name: 'Alice', age: 30})")
+        tx.execute("CREATE (b:Person {name: 'Bob', age: 25})")
+        tx.execute(
             "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) "
             "CREATE (a)-[:KNOWS]->(b)"
         )
+        tx.commit()
         result = session.query("MATCH ()-[r:KNOWS]->() RETURN r")
         edge = result[0]["r"]
         assert isinstance(edge.id, uni_db.Eid)
@@ -276,12 +310,14 @@ class TestPath:
 
     def test_path_from_query(self, social_db):
         session = social_db.session()
-        session.execute("CREATE (a:Person {name: 'Alice', age: 30})")
-        session.execute("CREATE (b:Person {name: 'Bob', age: 25})")
-        session.execute(
+        tx = session.tx()
+        tx.execute("CREATE (a:Person {name: 'Alice', age: 30})")
+        tx.execute("CREATE (b:Person {name: 'Bob', age: 25})")
+        tx.execute(
             "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) "
             "CREATE (a)-[:KNOWS {since: 2020}]->(b)"
         )
+        tx.commit()
         result = session.query(
             "MATCH p=(a:Person {name: 'Alice'})-[:KNOWS]->(b:Person) RETURN p"
         )
@@ -291,12 +327,14 @@ class TestPath:
 
     def test_path_attributes(self, social_db):
         session = social_db.session()
-        session.execute("CREATE (a:Person {name: 'Alice', age: 30})")
-        session.execute("CREATE (b:Person {name: 'Bob', age: 25})")
-        session.execute(
+        tx = session.tx()
+        tx.execute("CREATE (a:Person {name: 'Alice', age: 30})")
+        tx.execute("CREATE (b:Person {name: 'Bob', age: 25})")
+        tx.execute(
             "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) "
             "CREATE (a)-[:KNOWS {since: 2020}]->(b)"
         )
+        tx.commit()
         result = session.query(
             "MATCH p=(a:Person {name: 'Alice'})-[:KNOWS]->(b:Person) RETURN p"
         )
@@ -313,12 +351,14 @@ class TestPath:
 
     def test_path_len(self, social_db):
         session = social_db.session()
-        session.execute("CREATE (a:Person {name: 'Alice', age: 30})")
-        session.execute("CREATE (b:Person {name: 'Bob', age: 25})")
-        session.execute(
+        tx = session.tx()
+        tx.execute("CREATE (a:Person {name: 'Alice', age: 30})")
+        tx.execute("CREATE (b:Person {name: 'Bob', age: 25})")
+        tx.execute(
             "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) "
             "CREATE (a)-[:KNOWS]->(b)"
         )
+        tx.commit()
         result = session.query(
             "MATCH p=(a:Person {name: 'Alice'})-[:KNOWS]->(b:Person) RETURN p"
         )
@@ -327,12 +367,14 @@ class TestPath:
 
     def test_path_interleaved_indexing(self, social_db):
         session = social_db.session()
-        session.execute("CREATE (a:Person {name: 'Alice', age: 30})")
-        session.execute("CREATE (b:Person {name: 'Bob', age: 25})")
-        session.execute(
+        tx = session.tx()
+        tx.execute("CREATE (a:Person {name: 'Alice', age: 30})")
+        tx.execute("CREATE (b:Person {name: 'Bob', age: 25})")
+        tx.execute(
             "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) "
             "CREATE (a)-[:KNOWS]->(b)"
         )
+        tx.commit()
         result = session.query(
             "MATCH p=(a:Person {name: 'Alice'})-[:KNOWS]->(b:Person) RETURN p"
         )
@@ -349,12 +391,14 @@ class TestPath:
 
     def test_path_iteration(self, social_db):
         session = social_db.session()
-        session.execute("CREATE (a:Person {name: 'Alice', age: 30})")
-        session.execute("CREATE (b:Person {name: 'Bob', age: 25})")
-        session.execute(
+        tx = session.tx()
+        tx.execute("CREATE (a:Person {name: 'Alice', age: 30})")
+        tx.execute("CREATE (b:Person {name: 'Bob', age: 25})")
+        tx.execute(
             "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) "
             "CREATE (a)-[:KNOWS]->(b)"
         )
+        tx.commit()
         result = session.query(
             "MATCH p=(a:Person {name: 'Alice'})-[:KNOWS]->(b:Person) RETURN p"
         )
@@ -367,12 +411,14 @@ class TestPath:
 
     def test_path_index_out_of_range(self, social_db):
         session = social_db.session()
-        session.execute("CREATE (a:Person {name: 'Alice', age: 30})")
-        session.execute("CREATE (b:Person {name: 'Bob', age: 25})")
-        session.execute(
+        tx = session.tx()
+        tx.execute("CREATE (a:Person {name: 'Alice', age: 30})")
+        tx.execute("CREATE (b:Person {name: 'Bob', age: 25})")
+        tx.execute(
             "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) "
             "CREATE (a)-[:KNOWS]->(b)"
         )
+        tx.commit()
         result = session.query(
             "MATCH p=(a:Person {name: 'Alice'})-[:KNOWS]->(b:Person) RETURN p"
         )
@@ -382,12 +428,14 @@ class TestPath:
 
     def test_path_repr(self, social_db):
         session = social_db.session()
-        session.execute("CREATE (a:Person {name: 'Alice', age: 30})")
-        session.execute("CREATE (b:Person {name: 'Bob', age: 25})")
-        session.execute(
+        tx = session.tx()
+        tx.execute("CREATE (a:Person {name: 'Alice', age: 30})")
+        tx.execute("CREATE (b:Person {name: 'Bob', age: 25})")
+        tx.execute(
             "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) "
             "CREATE (a)-[:KNOWS]->(b)"
         )
+        tx.commit()
         result = session.query(
             "MATCH p=(a:Person {name: 'Alice'})-[:KNOWS]->(b:Person) RETURN p"
         )
@@ -408,12 +456,14 @@ class TestMixedReturn:
 
     def test_mixed_return_types(self, social_db):
         session = social_db.session()
-        session.execute("CREATE (a:Person {name: 'Alice', age: 30})")
-        session.execute("CREATE (b:Person {name: 'Bob', age: 25})")
-        session.execute(
+        tx = session.tx()
+        tx.execute("CREATE (a:Person {name: 'Alice', age: 30})")
+        tx.execute("CREATE (b:Person {name: 'Bob', age: 25})")
+        tx.execute(
             "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) "
             "CREATE (a)-[:KNOWS {since: 2020}]->(b)"
         )
+        tx.commit()
         result = session.query("MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN a, r, b")
         assert len(result) == 1
         row = result[0]
@@ -427,7 +477,9 @@ class TestMixedReturn:
 
     def test_node_and_scalar_mixed(self, social_db):
         session = social_db.session()
-        session.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+        tx = session.tx()
+        tx.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+        tx.commit()
         result = session.query(
             "MATCH (p:Person) RETURN p, p.name AS name, p.age AS age"
         )

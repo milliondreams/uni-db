@@ -79,7 +79,8 @@ async fn test_supply_chain_use_case() -> anyhow::Result<()> {
     ]);
 
     let parts = vec![p1_props, p2_props, p3_props];
-    let part_vids = db.session().bulk_insert_vertices("Part", parts).await?;
+    let tx = db.session().tx().await?;
+    let part_vids = tx.bulk_insert_vertices("Part", parts).await?;
     let p1 = part_vids[0]; // Defective
     let p2 = part_vids[1];
     let p3 = part_vids[2];
@@ -89,10 +90,7 @@ async fn test_supply_chain_use_case() -> anyhow::Result<()> {
         ("name".to_string(), unival!("Smartphone X")),
         ("price".to_string(), unival!(500.0)),
     ]);
-    let prod_vids = db
-        .session()
-        .bulk_insert_vertices("Product", vec![prod_props])
-        .await?;
+    let prod_vids = tx.bulk_insert_vertices("Product", vec![prod_props]).await?;
     let phone = prod_vids[0];
 
     // Edges:
@@ -105,9 +103,8 @@ async fn test_supply_chain_use_case() -> anyhow::Result<()> {
         (phone, p3, HashMap::new()),
         (p2, p1, HashMap::new()),
     ];
-    db.session()
-        .bulk_insert_edges("ASSEMBLED_FROM", assembly)
-        .await?;
+    tx.bulk_insert_edges("ASSEMBLED_FROM", assembly).await?;
+    tx.commit().await?;
 
     db.flush().await?; // Flush to ensure scalar index is built? (if used)
 

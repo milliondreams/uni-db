@@ -12,8 +12,10 @@ async fn test_edge_properties_no_overflow_json() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
     // Create nodes and edge with properties
-    db.session().execute("CREATE (a:Person {name: 'Alice'})-[r:KNOWS {since: 2020, strength: 0.8}]->(b:Person {name: 'Bob'})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (a:Person {name: 'Alice'})-[r:KNOWS {since: 2020, strength: 0.8}]->(b:Person {name: 'Bob'})")
         .await?;
+    tx.commit().await?;
 
     // Query that returns edge with dotted properties
     let result = db
@@ -43,11 +45,12 @@ async fn test_edge_struct_no_overflow_json() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
     // Create nodes and edge
-    db.session()
-        .execute(
-            "CREATE (a:Person {name: 'Alice'})-[r:KNOWS {since: 2020}]->(b:Person {name: 'Bob'})",
-        )
-        .await?;
+    let tx = db.session().tx().await?;
+    tx.execute(
+        "CREATE (a:Person {name: 'Alice'})-[r:KNOWS {since: 2020}]->(b:Person {name: 'Bob'})",
+    )
+    .await?;
+    tx.commit().await?;
 
     // Query that returns full edge struct
     let result = db

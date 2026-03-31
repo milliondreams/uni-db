@@ -1404,37 +1404,6 @@ impl PyPreparedQuery {
 }
 
 // ============================================================================
-// AutoCommitResult
-// ============================================================================
-
-/// Result of an auto-committed session.execute() call.
-#[pyclass(get_all, name = "AutoCommitResult")]
-#[derive(Debug)]
-pub struct PyAutoCommitResult {
-    pub affected_rows: usize,
-    pub nodes_created: usize,
-    pub nodes_deleted: usize,
-    pub relationships_created: usize,
-    pub relationships_deleted: usize,
-    pub properties_set: usize,
-    pub properties_removed: usize,
-    pub labels_added: usize,
-    pub labels_removed: usize,
-    pub version: u64,
-    pub metrics: Py<pyo3::types::PyDict>,
-}
-
-#[pymethods]
-impl PyAutoCommitResult {
-    fn __repr__(&self) -> String {
-        format!(
-            "AutoCommitResult(affected={}, version={})",
-            self.affected_rows, self.version
-        )
-    }
-}
-
-// ============================================================================
 // ExecuteResult
 // ============================================================================
 

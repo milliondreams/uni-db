@@ -19,13 +19,11 @@ async fn test_admin_features() -> Result<()> {
     assert_eq!(result.len(), 0);
 
     // Insert Data and Checkpoint for Statistics
-    db.session()
-        .execute("CREATE LABEL User (name STRING)")
-        .await?;
-    db.session()
-        .execute("CREATE (:User {name: 'Alice'})")
-        .await?;
-    db.session().execute("CHECKPOINT").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL User (name STRING)").await?;
+    tx.execute("CREATE (:User {name: 'Alice'})").await?;
+    tx.commit().await?;
+    db.flush().await?;
 
     // SHOW STATISTICS
     let result = db.session().query("SHOW STATISTICS").await?;
@@ -44,7 +42,9 @@ async fn test_admin_features() -> Result<()> {
     assert_eq!(user_stat.get::<i64>("count")?, 1);
 
     // VACUUM
-    db.session().execute("VACUUM").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("VACUUM").await?;
+    tx.commit().await?;
     // Implicitly verifies no error
 
     Ok(())

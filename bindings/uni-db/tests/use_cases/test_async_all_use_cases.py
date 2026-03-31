@@ -47,7 +47,8 @@ async def test_supply_chain(db):
 
     session = db.session()
 
-    writer = await session.bulk_writer().build()
+    tx = await session.tx()
+    writer = await tx.bulk_writer().build()
     vids = await writer.insert_vertices("Part", [p1_props, p2_props, p3_props])
     p1, p2, p3 = vids
 
@@ -59,6 +60,7 @@ async def test_supply_chain(db):
         "ASSEMBLED_FROM", [(phone, p2, {}), (phone, p3, {}), (p2, p1, {})]
     )
     await writer.commit()
+    await tx.commit()
 
     await db.flush()
 
@@ -117,7 +119,8 @@ async def test_recommendation(db):
 
     session = db.session()
 
-    writer = await session.bulk_writer().build()
+    tx = await session.tx()
+    writer = await tx.bulk_writer().build()
     vids = await writer.insert_vertices(
         "Product",
         [
@@ -132,6 +135,7 @@ async def test_recommendation(db):
 
     await writer.insert_edges("PURCHASED", [(u1, p1, {}), (u2, p1, {}), (u3, p1, {})])
     await writer.commit()
+    await tx.commit()
 
     await db.flush()
 
@@ -173,7 +177,8 @@ async def test_rag(db):
 
     session = db.session()
 
-    writer = await session.bulk_writer().build()
+    tx = await session.tx()
+    writer = await tx.bulk_writer().build()
     c_vids = await writer.insert_vertices(
         "Chunk",
         [
@@ -190,6 +195,7 @@ async def test_rag(db):
 
     await writer.insert_edges("MENTIONS", [(c1, e1, {}), (c2, e1, {})])
     await writer.commit()
+    await tx.commit()
     await db.flush()
 
     # Hybrid RAG query
@@ -224,7 +230,8 @@ async def test_fraud_detection(db):
 
     session = db.session()
 
-    writer = await session.bulk_writer().build()
+    tx = await session.tx()
+    writer = await tx.bulk_writer().build()
     u_vids = await writer.insert_vertices(
         "User",
         [
@@ -249,6 +256,7 @@ async def test_fraud_detection(db):
     )
     await writer.insert_edges("USED_DEVICE", [(ua, d1, {}), (ud, d1, {})])
     await writer.commit()
+    await tx.commit()
     await db.flush()
 
     # Cycle detection
@@ -285,7 +293,8 @@ async def test_regional_sales_analytics(db):
 
     session = db.session()
 
-    writer = await session.bulk_writer().build()
+    tx = await session.tx()
+    writer = await tx.bulk_writer().build()
     vids_region = await writer.insert_vertices("Region", [{"name": "North"}])
     north = vids_region[0]
 
@@ -295,6 +304,7 @@ async def test_regional_sales_analytics(db):
     edges = [(v, north, {}) for v in vids_orders]
     await writer.insert_edges("SHIPPED_TO", edges)
     await writer.commit()
+    await tx.commit()
     await db.flush()
 
     results = await session.query("""
@@ -319,7 +329,8 @@ async def test_document_knowledge_graph(db):
 
     session = db.session()
 
-    writer = await session.bulk_writer().build()
+    tx = await session.tx()
+    writer = await tx.bulk_writer().build()
     vids = await writer.insert_vertices(
         "Paper",
         [
@@ -332,6 +343,7 @@ async def test_document_knowledge_graph(db):
 
     await writer.insert_edges("CITES", [(p1, p3, {})])
     await writer.commit()
+    await tx.commit()
     await db.flush()
 
     results = await session.query("""
@@ -362,7 +374,8 @@ async def test_ecommerce_recommendation(db):
 
     session = db.session()
 
-    writer = await session.bulk_writer().build()
+    tx = await session.tx()
+    writer = await tx.bulk_writer().build()
     vids_u = await writer.insert_vertices("User", [{"name": "Alice"}])
     alice = vids_u[0]
 
@@ -378,6 +391,7 @@ async def test_ecommerce_recommendation(db):
 
     await writer.insert_edges("VIEWED", [(alice, laptop, {})])
     await writer.commit()
+    await tx.commit()
     await db.flush()
 
     # Find Alice's viewed products
@@ -417,11 +431,13 @@ async def test_identity_provenance(db):
 
     session = db.session()
 
-    await session.execute("CREATE (a:Node {name: 'A'}), (b:Node {name: 'B'})")
-    await session.execute(
+    tx = await session.tx()
+    await tx.execute("CREATE (a:Node {name: 'A'}), (b:Node {name: 'B'})")
+    await tx.execute(
         "MATCH (a:Node {name: 'A'}), (b:Node {name: 'B'}) "
         "CREATE (b)-[:DERIVED_FROM]->(a)"
     )
+    await tx.commit()
     await db.flush()
 
     res = await session.query(

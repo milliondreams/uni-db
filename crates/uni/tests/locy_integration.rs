@@ -69,9 +69,10 @@ async fn test_compile_error_cyclic_negation() -> Result<()> {
 #[tokio::test]
 async fn test_evaluate_non_recursive() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session()
-        .execute("CREATE (:Person {name: 'Alice'})-[:KNOWS]->(:Person {name: 'Bob'})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Person {name: 'Alice'})-[:KNOWS]->(:Person {name: 'Bob'})")
         .await?;
+    tx.commit().await?;
 
     let result = db
         .session()
@@ -98,9 +99,10 @@ async fn test_evaluate_non_recursive() -> Result<()> {
 #[tokio::test]
 async fn test_evaluate_recursive_transitive_closure() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session()
-        .execute("CREATE (:N {name: 'A'})-[:E]->(:N {name: 'B'})-[:E]->(:N {name: 'C'})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:N {name: 'A'})-[:E]->(:N {name: 'B'})-[:E]->(:N {name: 'C'})")
         .await?;
+    tx.commit().await?;
 
     let result = db
         .session()
@@ -132,9 +134,10 @@ async fn test_evaluate_recursive_transitive_closure() -> Result<()> {
 async fn test_derive_creates_edges() -> Result<()> {
     let db = Uni::in_memory().build().await?;
     let session = db.session();
-    session
-        .execute("CREATE (:Person {name: 'Alice'})-[:KNOWS]->(:Person {name: 'Bob'})")
+    let tx = session.tx().await?;
+    tx.execute("CREATE (:Person {name: 'Alice'})-[:KNOWS]->(:Person {name: 'Bob'})")
         .await?;
+    tx.commit().await?;
 
     // Session-level DERIVE now collects facts (no auto-apply).
     // Use tx.apply(derived) to materialize.
@@ -173,9 +176,10 @@ async fn test_derive_creates_edges() -> Result<()> {
 #[tokio::test]
 async fn test_assume_rollback() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session()
-        .execute("CREATE (:Person {name: 'Alice'})-[:KNOWS]->(:Person {name: 'Bob'})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Person {name: 'Alice'})-[:KNOWS]->(:Person {name: 'Bob'})")
         .await?;
+    tx.commit().await?;
 
     // ASSUME creates a temporary node, THEN re-evaluates rule in mutated state
     let result = db
@@ -209,9 +213,10 @@ async fn test_assume_rollback() -> Result<()> {
 #[tokio::test]
 async fn test_runtime_error_max_iterations() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session()
-        .execute("CREATE (:N {name: 'A'})-[:E]->(:N {name: 'B'})-[:E]->(:N {name: 'C'})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:N {name: 'A'})-[:E]->(:N {name: 'B'})-[:E]->(:N {name: 'C'})")
         .await?;
+    tx.commit().await?;
 
     let config = uni_db::locy::LocyConfig {
         max_iterations: 1,
@@ -249,11 +254,13 @@ async fn test_end_to_end_smoke() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
     // Create a small social network
-    db.session().execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}), (c:Person {name: 'Carol'}), \
          (a)-[:KNOWS]->(b), (b)-[:KNOWS]->(c)",
     )
     .await?;
+    tx.commit().await?;
 
     // Compute transitive reachability
     let result = db
@@ -289,12 +296,12 @@ async fn test_end_to_end_smoke() -> Result<()> {
 #[tokio::test]
 async fn test_evaluate_with_param_builder() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session()
-        .execute("CREATE (:Episode {agent_id: 'a1', label: 'alpha'})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Episode {agent_id: 'a1', label: 'alpha'})")
         .await?;
-    db.session()
-        .execute("CREATE (:Episode {agent_id: 'a2', label: 'beta'})")
+    tx.execute("CREATE (:Episode {agent_id: 'a2', label: 'beta'})")
         .await?;
+    tx.commit().await?;
 
     let result = db
         .session()
@@ -322,15 +329,14 @@ async fn test_evaluate_with_param_builder() -> Result<()> {
 #[tokio::test]
 async fn test_evaluate_with_multiple_params() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session()
-        .execute("CREATE (:Score {name: 'low',  val: 10})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Score {name: 'low',  val: 10})")
         .await?;
-    db.session()
-        .execute("CREATE (:Score {name: 'mid',  val: 50})")
+    tx.execute("CREATE (:Score {name: 'mid',  val: 50})")
         .await?;
-    db.session()
-        .execute("CREATE (:Score {name: 'high', val: 90})")
+    tx.execute("CREATE (:Score {name: 'high', val: 90})")
         .await?;
+    tx.commit().await?;
 
     let result = db
         .session()
@@ -362,9 +368,10 @@ async fn test_evaluate_with_multiple_params() -> Result<()> {
 async fn test_session_derive_returns_derived_fact_set() -> Result<()> {
     let db = Uni::in_memory().build().await?;
     let session = db.session();
-    session
-        .execute("CREATE (:Person {name: 'Alice'})-[:KNOWS]->(:Person {name: 'Bob'})")
+    let tx = session.tx().await?;
+    tx.execute("CREATE (:Person {name: 'Alice'})-[:KNOWS]->(:Person {name: 'Bob'})")
         .await?;
+    tx.commit().await?;
 
     let result = session
         .locy(
@@ -402,9 +409,11 @@ async fn test_session_derive_returns_derived_fact_set() -> Result<()> {
 async fn test_tx_derive_auto_applies() -> Result<()> {
     let db = Uni::in_memory().build().await?;
     let session = db.session();
-    session
+    let setup_tx = session.tx().await?;
+    setup_tx
         .execute("CREATE (:Person {name: 'Alice'})-[:KNOWS]->(:Person {name: 'Bob'})")
         .await?;
+    setup_tx.commit().await?;
 
     let tx = session.tx().await?;
     let result = tx
@@ -438,9 +447,11 @@ async fn test_tx_derive_auto_applies() -> Result<()> {
 async fn test_tx_apply_writes_facts() -> Result<()> {
     let db = Uni::in_memory().build().await?;
     let session = db.session();
-    session
+    let setup_tx = session.tx().await?;
+    setup_tx
         .execute("CREATE (:Person {name: 'Alice'})-[:KNOWS]->(:Person {name: 'Bob'})")
         .await?;
+    setup_tx.commit().await?;
 
     // Session DERIVE: collect facts
     let result = session
@@ -472,9 +483,11 @@ async fn test_tx_apply_writes_facts() -> Result<()> {
 async fn test_tx_apply_with_require_fresh() -> Result<()> {
     let db = Uni::in_memory().build().await?;
     let session = db.session();
-    session
+    let setup_tx = session.tx().await?;
+    setup_tx
         .execute("CREATE (:Person {name: 'Alice'})-[:KNOWS]->(:Person {name: 'Bob'})")
         .await?;
+    setup_tx.commit().await?;
 
     // Derive facts at current version
     let result = session
@@ -488,7 +501,11 @@ async fn test_tx_apply_with_require_fresh() -> Result<()> {
     let derived = result.derived_fact_set.clone().unwrap();
 
     // Create a concurrent write to advance the version
-    session.execute("CREATE (:Person {name: 'Carol'})").await?;
+    let advance_tx = session.tx().await?;
+    advance_tx
+        .execute("CREATE (:Person {name: 'Carol'})")
+        .await?;
+    advance_tx.commit().await?;
 
     // Now apply with require_fresh — should fail because version advanced
     let tx = session.tx().await?;
@@ -509,9 +526,11 @@ async fn test_tx_apply_with_require_fresh() -> Result<()> {
 async fn test_tx_apply_with_max_version_gap() -> Result<()> {
     let db = Uni::in_memory().build().await?;
     let session = db.session();
-    session
+    let setup_tx = session.tx().await?;
+    setup_tx
         .execute("CREATE (:Person {name: 'Alice'})-[:KNOWS]->(:Person {name: 'Bob'})")
         .await?;
+    setup_tx.commit().await?;
 
     // Derive facts
     let result = session
@@ -525,7 +544,11 @@ async fn test_tx_apply_with_max_version_gap() -> Result<()> {
     let derived = result.derived_fact_set.clone().unwrap();
 
     // Advance version once
-    session.execute("CREATE (:Person {name: 'Carol'})").await?;
+    let advance_tx = session.tx().await?;
+    advance_tx
+        .execute("CREATE (:Person {name: 'Carol'})")
+        .await?;
+    advance_tx.commit().await?;
 
     // max_version_gap(0) should reject (gap = 1)
     let tx = session.tx().await?;
@@ -554,9 +577,11 @@ async fn test_tx_apply_with_max_version_gap() -> Result<()> {
 async fn test_derived_fact_set_inspection() -> Result<()> {
     let db = Uni::in_memory().build().await?;
     let session = db.session();
-    session
+    let setup_tx = session.tx().await?;
+    setup_tx
         .execute("CREATE (:Person {name: 'Alice'})-[:KNOWS]->(:Person {name: 'Bob'})")
         .await?;
+    setup_tx.commit().await?;
 
     let result = session
         .locy(

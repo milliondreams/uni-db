@@ -68,48 +68,50 @@ async def async_social_db_populated(async_social_db):
     """
     db = async_social_db
     session = db.session()
-    await session.execute(
+    tx = await session.tx()
+    await tx.execute(
         "CREATE (p:Person {name: 'Alice', age: 30, email: 'alice@example.com'})"
     )
-    await session.execute(
+    await tx.execute(
         "CREATE (p:Person {name: 'Bob', age: 25, email: 'bob@example.com'})"
     )
-    await session.execute("CREATE (p:Person {name: 'Charlie', age: 35})")
-    await session.execute(
+    await tx.execute("CREATE (p:Person {name: 'Charlie', age: 35})")
+    await tx.execute(
         "CREATE (p:Person {name: 'Diana', age: 28, email: 'diana@example.com'})"
     )
-    await session.execute("CREATE (p:Person {name: 'Eve', age: 32})")
-    await session.execute("CREATE (c:Company {name: 'TechCorp', founded: 2010})")
-    await session.execute("CREATE (c:Company {name: 'StartupInc', founded: 2020})")
+    await tx.execute("CREATE (p:Person {name: 'Eve', age: 32})")
+    await tx.execute("CREATE (c:Company {name: 'TechCorp', founded: 2010})")
+    await tx.execute("CREATE (c:Company {name: 'StartupInc', founded: 2020})")
 
-    await session.execute(
+    await tx.execute(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) "
         "CREATE (a)-[:KNOWS {since: 2015}]->(b)"
     )
-    await session.execute(
+    await tx.execute(
         "MATCH (b:Person {name: 'Bob'}), (c:Person {name: 'Charlie'}) "
         "CREATE (b)-[:KNOWS {since: 2018}]->(c)"
     )
-    await session.execute(
+    await tx.execute(
         "MATCH (a:Person {name: 'Alice'}), (c:Person {name: 'Charlie'}) "
         "CREATE (a)-[:KNOWS {since: 2020}]->(c)"
     )
-    await session.execute(
+    await tx.execute(
         "MATCH (d:Person {name: 'Diana'}), (e:Person {name: 'Eve'}) "
         "CREATE (d)-[:KNOWS]->(e)"
     )
-    await session.execute(
+    await tx.execute(
         "MATCH (a:Person {name: 'Alice'}), (t:Company {name: 'TechCorp'}) "
         "CREATE (a)-[:WORKS_AT {role: 'Engineer'}]->(t)"
     )
-    await session.execute(
+    await tx.execute(
         "MATCH (b:Person {name: 'Bob'}), (t:Company {name: 'TechCorp'}) "
         "CREATE (b)-[:WORKS_AT {role: 'Designer'}]->(t)"
     )
-    await session.execute(
+    await tx.execute(
         "MATCH (c:Person {name: 'Charlie'}), (s:Company {name: 'StartupInc'}) "
         "CREATE (c)-[:WORKS_AT {role: 'CTO'}]->(s)"
     )
+    await tx.commit()
     await db.flush()
     return db
 
@@ -156,49 +158,51 @@ async def async_ecommerce_db_populated(async_ecommerce_db):
     """Async e-commerce database pre-populated with data including embeddings."""
     db = async_ecommerce_db
     session = db.session()
-    await session.execute("CREATE (u:User {name: 'Alice'})")
-    await session.execute("CREATE (u:User {name: 'Bob'})")
-    await session.execute(
+    tx = await session.tx()
+    await tx.execute("CREATE (u:User {name: 'Alice'})")
+    await tx.execute("CREATE (u:User {name: 'Bob'})")
+    await tx.execute(
         "CREATE (p:Product {name: 'Laptop', price: 999.99, embedding: [1.0, 0.0, 0.0, 0.0]})"
     )
-    await session.execute(
+    await tx.execute(
         "CREATE (p:Product {name: 'Phone', price: 699.99, embedding: [0.9, 0.1, 0.0, 0.0]})"
     )
-    await session.execute(
+    await tx.execute(
         "CREATE (p:Product {name: 'Book', price: 19.99, embedding: [0.0, 0.0, 1.0, 0.0]})"
     )
-    await session.execute(
+    await tx.execute(
         "CREATE (p:Product {name: 'Headphones', price: 149.99, embedding: [0.8, 0.2, 0.0, 0.0]})"
     )
-    await session.execute("CREATE (c:Category {name: 'Electronics'})")
-    await session.execute("CREATE (c:Category {name: 'Books'})")
-    await session.execute("CREATE (o:Order {amount: 999.99})")
+    await tx.execute("CREATE (c:Category {name: 'Electronics'})")
+    await tx.execute("CREATE (c:Category {name: 'Books'})")
+    await tx.execute("CREATE (o:Order {amount: 999.99})")
 
     # Edges
-    await session.execute(
+    await tx.execute(
         "MATCH (u:User {name: 'Alice'}), (p:Product {name: 'Laptop'}) CREATE (u)-[:VIEWED]->(p)"
     )
-    await session.execute(
+    await tx.execute(
         "MATCH (u:User {name: 'Alice'}), (p:Product {name: 'Laptop'}) CREATE (u)-[:PURCHASED]->(p)"
     )
-    await session.execute(
+    await tx.execute(
         "MATCH (u:User {name: 'Bob'}), (p:Product {name: 'Book'}) CREATE (u)-[:VIEWED]->(p)"
     )
-    await session.execute(
+    await tx.execute(
         "MATCH (p:Product {name: 'Laptop'}), (c:Category {name: 'Electronics'}) "
         "CREATE (p)-[:IN_CATEGORY]->(c)"
     )
-    await session.execute(
+    await tx.execute(
         "MATCH (p:Product {name: 'Phone'}), (c:Category {name: 'Electronics'}) "
         "CREATE (p)-[:IN_CATEGORY]->(c)"
     )
-    await session.execute(
+    await tx.execute(
         "MATCH (p:Product {name: 'Book'}), (c:Category {name: 'Books'}) "
         "CREATE (p)-[:IN_CATEGORY]->(c)"
     )
-    await session.execute(
+    await tx.execute(
         "MATCH (u:User {name: 'Alice'}), (o:Order {amount: 999.99}) CREATE (u)-[:PLACED]->(o)"
     )
+    await tx.commit()
 
     await (
         db.schema()
@@ -322,48 +326,44 @@ def social_db_populated(social_db):
     """Sync social database pre-populated with test data."""
     db = social_db
     session = db.session()
-    session.execute(
-        "CREATE (p:Person {name: 'Alice', age: 30, email: 'alice@example.com'})"
-    )
-    session.execute(
-        "CREATE (p:Person {name: 'Bob', age: 25, email: 'bob@example.com'})"
-    )
-    session.execute("CREATE (p:Person {name: 'Charlie', age: 35})")
-    session.execute(
-        "CREATE (p:Person {name: 'Diana', age: 28, email: 'diana@example.com'})"
-    )
-    session.execute("CREATE (p:Person {name: 'Eve', age: 32})")
-    session.execute("CREATE (c:Company {name: 'TechCorp', founded: 2010})")
-    session.execute("CREATE (c:Company {name: 'StartupInc', founded: 2020})")
+    tx = session.tx()
+    tx.execute("CREATE (p:Person {name: 'Alice', age: 30, email: 'alice@example.com'})")
+    tx.execute("CREATE (p:Person {name: 'Bob', age: 25, email: 'bob@example.com'})")
+    tx.execute("CREATE (p:Person {name: 'Charlie', age: 35})")
+    tx.execute("CREATE (p:Person {name: 'Diana', age: 28, email: 'diana@example.com'})")
+    tx.execute("CREATE (p:Person {name: 'Eve', age: 32})")
+    tx.execute("CREATE (c:Company {name: 'TechCorp', founded: 2010})")
+    tx.execute("CREATE (c:Company {name: 'StartupInc', founded: 2020})")
 
-    session.execute(
+    tx.execute(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) "
         "CREATE (a)-[:KNOWS {since: 2015}]->(b)"
     )
-    session.execute(
+    tx.execute(
         "MATCH (b:Person {name: 'Bob'}), (c:Person {name: 'Charlie'}) "
         "CREATE (b)-[:KNOWS {since: 2018}]->(c)"
     )
-    session.execute(
+    tx.execute(
         "MATCH (a:Person {name: 'Alice'}), (c:Person {name: 'Charlie'}) "
         "CREATE (a)-[:KNOWS {since: 2020}]->(c)"
     )
-    session.execute(
+    tx.execute(
         "MATCH (d:Person {name: 'Diana'}), (e:Person {name: 'Eve'}) "
         "CREATE (d)-[:KNOWS]->(e)"
     )
-    session.execute(
+    tx.execute(
         "MATCH (a:Person {name: 'Alice'}), (t:Company {name: 'TechCorp'}) "
         "CREATE (a)-[:WORKS_AT {role: 'Engineer'}]->(t)"
     )
-    session.execute(
+    tx.execute(
         "MATCH (b:Person {name: 'Bob'}), (t:Company {name: 'TechCorp'}) "
         "CREATE (b)-[:WORKS_AT {role: 'Designer'}]->(t)"
     )
-    session.execute(
+    tx.execute(
         "MATCH (c:Person {name: 'Charlie'}), (s:Company {name: 'StartupInc'}) "
         "CREATE (c)-[:WORKS_AT {role: 'CTO'}]->(s)"
     )
+    tx.commit()
     db.flush()
     return db
 
@@ -406,48 +406,50 @@ def ecommerce_db_populated(ecommerce_db):
     """Sync e-commerce database pre-populated with data including embeddings."""
     db = ecommerce_db
     session = db.session()
-    session.execute("CREATE (u:User {name: 'Alice'})")
-    session.execute("CREATE (u:User {name: 'Bob'})")
-    session.execute(
+    tx = session.tx()
+    tx.execute("CREATE (u:User {name: 'Alice'})")
+    tx.execute("CREATE (u:User {name: 'Bob'})")
+    tx.execute(
         "CREATE (p:Product {name: 'Laptop', price: 999.99, embedding: [1.0, 0.0, 0.0, 0.0]})"
     )
-    session.execute(
+    tx.execute(
         "CREATE (p:Product {name: 'Phone', price: 699.99, embedding: [0.9, 0.1, 0.0, 0.0]})"
     )
-    session.execute(
+    tx.execute(
         "CREATE (p:Product {name: 'Book', price: 19.99, embedding: [0.0, 0.0, 1.0, 0.0]})"
     )
-    session.execute(
+    tx.execute(
         "CREATE (p:Product {name: 'Headphones', price: 149.99, embedding: [0.8, 0.2, 0.0, 0.0]})"
     )
-    session.execute("CREATE (c:Category {name: 'Electronics'})")
-    session.execute("CREATE (c:Category {name: 'Books'})")
-    session.execute("CREATE (o:Order {amount: 999.99})")
+    tx.execute("CREATE (c:Category {name: 'Electronics'})")
+    tx.execute("CREATE (c:Category {name: 'Books'})")
+    tx.execute("CREATE (o:Order {amount: 999.99})")
 
-    session.execute(
+    tx.execute(
         "MATCH (u:User {name: 'Alice'}), (p:Product {name: 'Laptop'}) CREATE (u)-[:VIEWED]->(p)"
     )
-    session.execute(
+    tx.execute(
         "MATCH (u:User {name: 'Alice'}), (p:Product {name: 'Laptop'}) CREATE (u)-[:PURCHASED]->(p)"
     )
-    session.execute(
+    tx.execute(
         "MATCH (u:User {name: 'Bob'}), (p:Product {name: 'Book'}) CREATE (u)-[:VIEWED]->(p)"
     )
-    session.execute(
+    tx.execute(
         "MATCH (p:Product {name: 'Laptop'}), (c:Category {name: 'Electronics'}) "
         "CREATE (p)-[:IN_CATEGORY]->(c)"
     )
-    session.execute(
+    tx.execute(
         "MATCH (p:Product {name: 'Phone'}), (c:Category {name: 'Electronics'}) "
         "CREATE (p)-[:IN_CATEGORY]->(c)"
     )
-    session.execute(
+    tx.execute(
         "MATCH (p:Product {name: 'Book'}), (c:Category {name: 'Books'}) "
         "CREATE (p)-[:IN_CATEGORY]->(c)"
     )
-    session.execute(
+    tx.execute(
         "MATCH (u:User {name: 'Alice'}), (o:Order {amount: 999.99}) CREATE (u)-[:PLACED]->(o)"
     )
+    tx.commit()
 
     db.schema().label("Product").index(
         "embedding", {"type": "vector", "metric": "l2"}

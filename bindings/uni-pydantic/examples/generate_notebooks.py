@@ -87,7 +87,7 @@ def db_setup(name):
         f'db_path = os.path.join(tempfile.gettempdir(), "{name}_pydantic_db")',
         "if os.path.exists(db_path):",
         "    shutil.rmtree(db_path)",
-        "db = uni_db.Database.open(db_path)",
+        "db = uni_db.Uni.open(db_path)",
         "",
         "# Create session and register models",
         "session = UniSession(db)",
@@ -448,9 +448,7 @@ rec_nb = create_notebook(
                 "                 alice, bob, carol, dave])",
                 "session.commit()",
                 "",
-                "# Create vector index AFTER commit",
-                'db.create_vector_index("Book", "embedding", "l2")',
-                'print("Data ingested and vector index created")',
+                'print("Data ingested")',
             ]
         ),
         code_cell(
@@ -690,9 +688,7 @@ rag_nb = create_notebook(
                 "                 jwt, auth_entity, routing_ent, db_entity, bcrypt_ent, pool_entity])",
                 "session.commit()",
                 "",
-                "# Create vector index AFTER commit",
-                'db.create_vector_index("Chunk", "embedding", "l2")',
-                'print("Data ingested and vector index created")',
+                'print("Data ingested")',
             ]
         ),
         code_cell(

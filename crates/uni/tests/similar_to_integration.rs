@@ -45,30 +45,28 @@ async fn setup_doc_db() -> Result<Uni> {
         .apply()
         .await?;
 
-    db.session()
-        .execute(
-            "CREATE (:Doc {title: 'Alpha', content: 'rust systems programming language', \
+    let tx = db.session().tx().await?;
+    tx.execute(
+        "CREATE (:Doc {title: 'Alpha', content: 'rust systems programming language', \
          embedding: [1.0, 0.0, 0.0]})",
-        )
-        .await?;
-    db.session()
-        .execute(
-            "CREATE (:Doc {title: 'Beta', content: 'python data science scripting', \
+    )
+    .await?;
+    tx.execute(
+        "CREATE (:Doc {title: 'Beta', content: 'python data science scripting', \
          embedding: [0.6, 0.8, 0.0]})",
-        )
-        .await?;
-    db.session()
-        .execute(
-            "CREATE (:Doc {title: 'Gamma', content: 'database storage engine systems', \
+    )
+    .await?;
+    tx.execute(
+        "CREATE (:Doc {title: 'Gamma', content: 'database storage engine systems', \
          embedding: [0.0, 0.0, 1.0]})",
-        )
-        .await?;
-    db.session()
-        .execute(
-            "CREATE (:Doc {title: 'Delta', content: 'rust memory safety programming', \
+    )
+    .await?;
+    tx.execute(
+        "CREATE (:Doc {title: 'Delta', content: 'rust memory safety programming', \
          embedding: [0.8, 0.6, 0.0]})",
-        )
-        .await?;
+    )
+    .await?;
+    tx.commit().await?;
 
     db.flush().await?;
 
@@ -301,9 +299,9 @@ async fn test_similar_to_string_no_fts_index() -> Result<()> {
         .apply()
         .await?;
 
-    db.session()
-        .execute("CREATE (:Doc {title: 'Hello'})")
-        .await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Doc {title: 'Hello'})").await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // title has no FTS index → should error
@@ -536,8 +534,10 @@ async fn test_similar_to_in_locy_along() -> Result<()> {
         .await?;
 
     // Chain: A → B → C
-    db.session()
-        .execute(
+    {
+        let s = db.session();
+        let tx = s.tx().await?;
+        tx.execute(
             "CREATE (a:Doc {title: 'A', embedding: [1.0, 0.0, 0.0]}), \
          (b:Doc {title: 'B', embedding: [0.8, 0.6, 0.0]}), \
          (c:Doc {title: 'C', embedding: [0.0, 0.0, 1.0]}), \
@@ -545,6 +545,8 @@ async fn test_similar_to_in_locy_along() -> Result<()> {
          (b)-[:LINKS]->(c)",
         )
         .await?;
+        tx.commit().await?;
+    }
     db.flush().await?;
 
     // ALONG accumulates similarity along the path
@@ -959,8 +961,10 @@ async fn test_similar_to_in_locy_fold() -> Result<()> {
 
     // Alpha [1,0,0], Beta [0.6,0.8,0], Gamma [0,0,1], Delta [0.8,0.6,0]
     // Edges: Alpha→Beta, Alpha→Delta, Beta→Gamma
-    db.session()
-        .execute(
+    {
+        let s = db.session();
+        let tx = s.tx().await?;
+        tx.execute(
             "CREATE (a:Doc {title: 'Alpha', embedding: [1.0, 0.0, 0.0]}), \
          (b:Doc {title: 'Beta', embedding: [0.6, 0.8, 0.0]}), \
          (g:Doc {title: 'Gamma', embedding: [0.0, 0.0, 1.0]}), \
@@ -968,6 +972,8 @@ async fn test_similar_to_in_locy_fold() -> Result<()> {
          (a)-[:LINKS]->(b), (a)-[:LINKS]->(d), (b)-[:LINKS]->(g)",
         )
         .await?;
+        tx.commit().await?;
+    }
     db.flush().await?;
 
     // Rule 1: compute per-edge similarity scores
@@ -1249,15 +1255,17 @@ mod metric_tests {
             .await?;
 
         // Unit-length vectors for predictable scores
-        db.session()
-            .execute("CREATE (:Item {name: 'A', vec: [1.0, 0.0, 0.0]})")
-            .await?;
-        db.session()
-            .execute("CREATE (:Item {name: 'B', vec: [0.0, 1.0, 0.0]})")
-            .await?;
-        db.session()
-            .execute("CREATE (:Item {name: 'C', vec: [0.8, 0.6, 0.0]})")
-            .await?;
+        {
+            let s = db.session();
+            let tx = s.tx().await?;
+            tx.execute("CREATE (:Item {name: 'A', vec: [1.0, 0.0, 0.0]})")
+                .await?;
+            tx.execute("CREATE (:Item {name: 'B', vec: [0.0, 1.0, 0.0]})")
+                .await?;
+            tx.execute("CREATE (:Item {name: 'C', vec: [0.8, 0.6, 0.0]})")
+                .await?;
+            tx.commit().await?;
+        }
         db.flush().await?;
         Ok(db)
     }
@@ -1418,16 +1426,19 @@ mod metric_tests {
             .apply()
             .await?;
 
-        db.session()
-            .execute(
+        {
+            let s = db.session();
+            let tx = s.tx().await?;
+            tx.execute(
                 "CREATE (:Item {name: 'A', vec_cos: [1.0, 0.0, 0.0], vec_l2: [1.0, 0.0, 0.0]})",
             )
             .await?;
-        db.session()
-            .execute(
+            tx.execute(
                 "CREATE (:Item {name: 'B', vec_cos: [0.0, 1.0, 0.0], vec_l2: [0.0, 1.0, 0.0]})",
             )
             .await?;
+            tx.commit().await?;
+        }
         db.flush().await?;
 
         let result = db
@@ -1495,10 +1506,12 @@ mod metric_tests {
             .apply()
             .await?;
 
-        db.session().execute(
+        let tx = db.session().tx().await?;
+        tx.execute(
             "CREATE (:Doc {title: 'Alpha', content: 'rust programming', embedding: [1.0, 0.0, 0.0]})",
         )
         .await?;
+        tx.commit().await?;
         db.flush().await?;
 
         // Multi-source similar_to with default RRF fusion

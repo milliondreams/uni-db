@@ -12,22 +12,53 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use uni_common::{Result, UniError, Value};
 
+use crate::api::UniInner;
 use crate::api::bulk::{BulkStats, BulkWriter, BulkWriterBuilder};
 use crate::api::session::Session;
 
 /// Builder for creating a [`StreamingAppender`].
-pub struct AppenderBuilder<'a> {
-    session: &'a Session,
+pub struct AppenderBuilder {
+    db: Arc<UniInner>,
+    write_guard: Arc<AtomicBool>,
+    session_id: String,
+    is_pinned: bool,
+    /// Whether the write guard was already acquired by the caller (Transaction).
+    guard_pre_acquired: bool,
     label: String,
     batch_size: usize,
     defer_vector_indexes: bool,
     max_buffer_size_bytes: Option<usize>,
 }
 
-impl<'a> AppenderBuilder<'a> {
-    pub(crate) fn new(session: &'a Session, label: &str) -> Self {
+impl AppenderBuilder {
+    /// Create a new appender builder from a Session.
+    pub(crate) fn new(session: &Session, label: &str) -> Self {
         Self {
-            session,
+            db: session.db().clone(),
+            write_guard: session.active_write_guard().clone(),
+            session_id: session.id().to_string(),
+            is_pinned: session.is_pinned(),
+            guard_pre_acquired: false,
+            label: label.to_string(),
+            batch_size: 5000,
+            defer_vector_indexes: true,
+            max_buffer_size_bytes: None,
+        }
+    }
+
+    /// Create an appender builder for use within a Transaction.
+    ///
+    /// The Transaction already holds the session write guard, so the appender
+    /// skips guard acquisition and does not release it on finish/drop.
+    pub(crate) fn new_from_tx(db: Arc<UniInner>, label: &str) -> Self {
+        // Dummy guard — never acquired/released. Transaction owns the real guard.
+        let dummy_guard = Arc::new(AtomicBool::new(true));
+        Self {
+            db,
+            write_guard: dummy_guard,
+            session_id: String::new(),
+            is_pinned: false,
+            guard_pre_acquired: true,
             label: label.to_string(),
             batch_size: 5000,
             defer_vector_indexes: true,
@@ -62,29 +93,40 @@ impl<'a> AppenderBuilder<'a> {
     /// Build the streaming appender.
     ///
     /// Acquires the session's write guard (mutual exclusion with transactions
-    /// and other bulk writers).
+    /// and other bulk writers) unless the guard was pre-acquired by a Transaction.
     pub fn build(self) -> Result<StreamingAppender> {
-        if self.session.is_pinned() {
+        if self.is_pinned {
             return Err(UniError::ReadOnly {
                 operation: "appender".to_string(),
             });
         }
-        // Acquire write guard
-        let guard = self.session.active_write_guard().clone();
-        if guard
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return Err(UniError::WriteContextAlreadyActive {
-                session_id: self.session.id().to_string(),
-                hint: "Only one Transaction, BulkWriter, or Appender can be active per Session at a time. Commit or rollback the active one first, or create a separate Session for concurrent writes.",
-            });
-        }
 
-        let mut bulk_builder =
-            BulkWriterBuilder::new_with_guard(self.session.db().clone(), guard.clone())
-                .batch_size(self.batch_size)
-                .defer_vector_indexes(self.defer_vector_indexes);
+        // Determine guard ownership and create the appropriate BulkWriterBuilder.
+        let (bulk_builder_base, session_write_guard) = if self.guard_pre_acquired {
+            // Transaction path: guard already held, use unguarded BulkWriter.
+            (BulkWriterBuilder::new_unguarded(self.db), None)
+        } else {
+            // Session path: acquire the guard.
+            let guard = self.write_guard.clone();
+            if guard
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
+                return Err(UniError::WriteContextAlreadyActive {
+                    session_id: self.session_id,
+                    hint: "Only one Transaction, BulkWriter, or Appender can be active per Session at a time. Commit or rollback the active one first, or create a separate Session for concurrent writes.",
+                });
+            }
+            (
+                BulkWriterBuilder::new_with_guard(self.db, guard.clone()),
+                Some(guard),
+            )
+        };
+
+        // Apply shared configuration.
+        let mut bulk_builder = bulk_builder_base
+            .batch_size(self.batch_size)
+            .defer_vector_indexes(self.defer_vector_indexes);
         if let Some(max_buf) = self.max_buffer_size_bytes {
             bulk_builder = bulk_builder.max_buffer_size_bytes(max_buf);
         }
@@ -95,7 +137,7 @@ impl<'a> AppenderBuilder<'a> {
             label: self.label,
             batch_size: self.batch_size,
             buffer: Vec::with_capacity(self.batch_size),
-            session_write_guard: guard,
+            session_write_guard,
             finished: false,
         })
     }
@@ -109,7 +151,8 @@ impl<'a> AppenderBuilder<'a> {
 ///
 /// # Write Guard
 ///
-/// The appender holds the session's write guard for its entire lifetime.
+/// The appender holds the session's write guard for its entire lifetime
+/// (unless created from a Transaction, where the Transaction manages the guard).
 /// Only one write context (transaction, bulk writer, or appender) can be
 /// active per session at a time. The guard is released on `finish()`,
 /// `abort()`, or `drop()`.
@@ -118,7 +161,7 @@ pub struct StreamingAppender {
     label: String,
     batch_size: usize,
     buffer: Vec<HashMap<String, Value>>,
-    session_write_guard: Arc<AtomicBool>,
+    session_write_guard: Option<Arc<AtomicBool>>,
     finished: bool,
 }
 
@@ -195,8 +238,7 @@ impl StreamingAppender {
         if self.buffer.is_empty() {
             return Ok(());
         }
-        let rows = std::mem::take(&mut self.buffer);
-        self.buffer = Vec::with_capacity(self.batch_size);
+        let rows = std::mem::replace(&mut self.buffer, Vec::with_capacity(self.batch_size));
         let writer = self
             .writer
             .as_mut()
@@ -213,7 +255,9 @@ impl Drop for StreamingAppender {
     fn drop(&mut self) {
         if !self.finished {
             // Release write guard — buffered data is lost
-            self.session_write_guard.store(false, Ordering::SeqCst);
+            if let Some(guard) = &self.session_write_guard {
+                guard.store(false, Ordering::SeqCst);
+            }
         }
     }
 }

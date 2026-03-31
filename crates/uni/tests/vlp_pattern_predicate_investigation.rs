@@ -14,7 +14,9 @@ async fn control_single_hop_pattern_predicate_schema() -> Result<()> {
     db.schema().label("A").apply().await?;
     db.schema().label("B").apply().await?;
     db.schema().edge_type("REL", &[], &[]).apply().await?;
-    db.session().execute("CREATE (a:A)-[:REL]->(b:B)").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (a:A)-[:REL]->(b:B)").await?;
+    tx.commit().await?;
 
     let rows = db
         .session()
@@ -36,9 +38,10 @@ async fn regression_vlp_pattern_predicate_schema_bound_target() -> Result<()> {
     db.schema().label("B").apply().await?;
     db.schema().label("C").apply().await?;
     db.schema().edge_type("REL", &[], &[]).apply().await?;
-    db.session()
-        .execute("CREATE (a:A)-[:REL]->(b:B)-[:REL]->(c:C)")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (a:A)-[:REL]->(b:B)-[:REL]->(c:C)")
         .await?;
+    tx.commit().await?;
 
     let rows = db
         .session()
@@ -52,9 +55,10 @@ async fn regression_vlp_pattern_predicate_schema_bound_target() -> Result<()> {
 async fn regression_vlp_pattern_predicate_schemaless_bound_target() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
-    db.session()
-        .execute("CREATE (a:A)-[:REL]->(b:B)-[:REL]->(c:C)")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (a:A)-[:REL]->(b:B)-[:REL]->(c:C)")
         .await?;
+    tx.commit().await?;
 
     let rows = db
         .session()
@@ -77,9 +81,10 @@ async fn regression_vlp_pattern_predicate_type_filter() -> Result<()> {
         .await?;
     db.schema().edge_type("REL1", &[], &[]).apply().await?;
     db.schema().edge_type("REL2", &[], &[]).apply().await?;
-    db.session()
-        .execute("CREATE (a:A)-[:REL1]->(b:B), (a)-[:REL2]->(c:C {dummy: 1})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (a:A)-[:REL1]->(b:B), (a)-[:REL2]->(c:C {dummy: 1})")
         .await?;
+    tx.commit().await?;
 
     let rows = db
         .session()

@@ -13,21 +13,40 @@ async fn apply_derived_and_store(
     world: &mut LocyWorld,
     result: Result<uni_db::locy::LocyResult, uni_common::UniError>,
 ) {
+    store_result(world, result, true).await;
+}
+
+/// Store the evaluation result without applying derived facts.
+/// Used by scenarios that test DERIVE isolation (e.g. "edges do not persist without tx.apply").
+async fn store_without_apply(
+    world: &mut LocyWorld,
+    result: Result<uni_db::locy::LocyResult, uni_common::UniError>,
+) {
+    store_result(world, result, false).await;
+}
+
+async fn store_result(
+    world: &mut LocyWorld,
+    result: Result<uni_db::locy::LocyResult, uni_common::UniError>,
+    apply_derived: bool,
+) {
     let result = match result {
         Ok(locy_result) => {
             let mut inner = locy_result.into_inner();
-            if let Some(derived) = inner.derived_fact_set.clone() {
-                let session = world.db().session();
-                let tx = session
-                    .tx()
-                    .await
-                    .expect("Failed to start transaction for DERIVE apply");
-                let apply_result = tx
-                    .apply(derived)
-                    .await
-                    .expect("Failed to apply derived facts");
-                tx.commit().await.expect("Failed to commit derived facts");
-                inner.stats.mutations_executed += apply_result.facts_applied;
+            if apply_derived {
+                if let Some(derived) = inner.derived_fact_set.clone() {
+                    let session = world.db().session();
+                    let tx = session
+                        .tx()
+                        .await
+                        .expect("Failed to start transaction for DERIVE apply");
+                    let apply_result = tx
+                        .apply(derived)
+                        .await
+                        .expect("Failed to apply derived facts");
+                    tx.commit().await.expect("Failed to commit derived facts");
+                    inner.stats.mutations_executed += apply_result.facts_applied;
+                }
             }
             Ok(inner)
         }
@@ -49,6 +68,24 @@ async fn when_evaluating_locy_program(world: &mut LocyWorld, step: &cucumber::gh
 
     let result = world.db().session().locy(program).await;
     apply_derived_and_store(world, result).await;
+}
+
+#[when("evaluating the following Locy program without applying derived facts:")]
+async fn when_evaluating_locy_program_without_apply(
+    world: &mut LocyWorld,
+    step: &cucumber::gherkin::Step,
+) {
+    let program = step
+        .docstring()
+        .expect("Expected a docstring with the Locy program to evaluate");
+
+    world
+        .init_db()
+        .await
+        .expect("Failed to initialize database");
+
+    let result = world.db().session().locy(program).await;
+    store_without_apply(world, result).await;
 }
 
 #[when(regex = r#"^evaluating the following Locy program with max_iterations (\d+):$"#)]

@@ -638,6 +638,130 @@ async fn command_result_derive_affecting(world: &mut LocyWorld, idx: usize, expe
     }
 }
 
+// ── Cypher Command Result Assertions ─────────────────────────────────────
+
+#[then(regex = r#"^the command result (\d+) should be a Cypher with at least (\d+) rows$"#)]
+async fn command_result_cypher_at_least_rows(world: &mut LocyWorld, idx: usize, min: usize) {
+    let locy_result = world.locy_result().expect("No evaluation result found");
+
+    let result = locy_result.as_ref().expect("Evaluation failed");
+    let cmd = result
+        .command_results
+        .get(idx)
+        .unwrap_or_else(|| panic!("No command result at index {}", idx));
+
+    match cmd {
+        CommandResult::Cypher(rows) => {
+            assert!(
+                rows.len() >= min,
+                "Expected Cypher command result {} to have at least {} rows, got {}",
+                idx,
+                min,
+                rows.len()
+            );
+        }
+        other => panic!(
+            "Expected command result {} to be a Cypher, got {:?}",
+            idx, other
+        ),
+    }
+}
+
+#[then(regex = r#"^the command result (\d+) should be a Cypher containing row where (.+) = (.+)$"#)]
+async fn command_result_cypher_containing_row(
+    world: &mut LocyWorld,
+    idx: usize,
+    field: String,
+    value_str: String,
+) {
+    let locy_result = world.locy_result().expect("No evaluation result found");
+
+    let result = locy_result.as_ref().expect("Evaluation failed");
+    let cmd = result
+        .command_results
+        .get(idx)
+        .unwrap_or_else(|| panic!("No command result at index {}", idx));
+
+    match cmd {
+        CommandResult::Cypher(rows) => {
+            let expected = parse_gherkin_value(&value_str);
+            let found = rows.iter().any(|row| {
+                extract_field_value(row, field.trim())
+                    .map(|v| values_match(v, &expected))
+                    .unwrap_or(false)
+            });
+            assert!(
+                found,
+                "Cypher command result {} has no row where {} = {} (out of {} rows)",
+                idx,
+                field,
+                value_str,
+                rows.len()
+            );
+        }
+        other => panic!(
+            "Expected command result {} to be a Cypher, got {:?}",
+            idx, other
+        ),
+    }
+}
+
+// ── "at least" Variants for Query and Derive ─────────────────────────────
+
+#[then(regex = r#"^the command result (\d+) should be a Query with at least (\d+) rows$"#)]
+async fn command_result_query_at_least_rows(world: &mut LocyWorld, idx: usize, min: usize) {
+    let locy_result = world.locy_result().expect("No evaluation result found");
+
+    let result = locy_result.as_ref().expect("Evaluation failed");
+    let cmd = result
+        .command_results
+        .get(idx)
+        .unwrap_or_else(|| panic!("No command result at index {}", idx));
+
+    match cmd {
+        CommandResult::Query(rows) => {
+            assert!(
+                rows.len() >= min,
+                "Expected Query command result {} to have at least {} rows, got {}",
+                idx,
+                min,
+                rows.len()
+            );
+        }
+        other => panic!(
+            "Expected command result {} to be a Query, got {:?}",
+            idx, other
+        ),
+    }
+}
+
+#[then(regex = r#"^the command result (\d+) should be a Derive with at least (\d+) affected$"#)]
+async fn command_result_derive_at_least_affected(world: &mut LocyWorld, idx: usize, min: usize) {
+    let locy_result = world.locy_result().expect("No evaluation result found");
+
+    let result = locy_result.as_ref().expect("Evaluation failed");
+    let cmd = result
+        .command_results
+        .get(idx)
+        .unwrap_or_else(|| panic!("No command result at index {}", idx));
+
+    match cmd {
+        CommandResult::Derive { affected } => {
+            assert!(
+                *affected >= min,
+                "Expected Derive command result {} to have at least {} affected, got {}",
+                idx,
+                min,
+                affected
+            );
+        }
+        other => panic!(
+            "Expected command result {} to be a Derive, got {:?}",
+            idx, other
+        ),
+    }
+}
+
 // ── Graph State Assertions ────────────────────────────────────────────────
 
 #[then(regex = r#"^the graph should contain (\d+) nodes with label ['"](.+)['"]$"#)]
@@ -714,6 +838,23 @@ async fn graph_should_not_contain_edge(
         cnt, 0,
         "Expected no edge from '{}' to '{}' with type '{}', but found {}",
         from, to, edge_type, cnt
+    );
+}
+
+#[then(regex = r#"^the graph should NOT contain an edge with type ['"](.+)['"]$"#)]
+async fn graph_should_not_contain_edge_type(world: &mut LocyWorld, edge_type: String) {
+    let query = format!("MATCH ()-[r:{}]->() RETURN count(r) AS cnt", edge_type);
+    let result = world
+        .db()
+        .session()
+        .query(&query)
+        .await
+        .expect("graph query failed");
+    let cnt: i64 = result.rows()[0].get("cnt").expect("missing cnt column");
+    assert_eq!(
+        cnt, 0,
+        "Expected no edges with type '{}', but found {}",
+        edge_type, cnt
     );
 }
 

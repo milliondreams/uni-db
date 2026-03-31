@@ -45,7 +45,7 @@ async fn test_wal_preservation_after_flush() -> anyhow::Result<()> {
     let vid_b = Vid::new(2);
     let eid = Eid::new(100);
     writer
-        .insert_edge(vid_a, vid_b, 1, eid, HashMap::new(), None)
+        .insert_edge(vid_a, vid_b, 1, eid, HashMap::new(), None, None)
         .await?;
 
     // 4. Flush WAL manually to persist buffer
@@ -71,7 +71,7 @@ async fn test_wal_preservation_after_flush() -> anyhow::Result<()> {
     // 7. Insert another edge
     let eid2 = Eid::new(101);
     writer
-        .insert_edge(vid_a, vid_b, 1, eid2, HashMap::new(), None)
+        .insert_edge(vid_a, vid_b, 1, eid2, HashMap::new(), None, None)
         .await?;
     wal.flush().await?;
 

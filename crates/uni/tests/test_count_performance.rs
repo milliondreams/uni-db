@@ -55,10 +55,9 @@ async fn test_count_scaling() {
             p.insert("name".to_string(), Value::String(format!("Person_{}", i)));
             props.push(p);
         }
-        db.session()
-            .bulk_insert_vertices("Person", props)
-            .await
-            .unwrap();
+        let tx = db.session().tx().await.unwrap();
+        tx.bulk_insert_vertices("Person", props).await.unwrap();
+        tx.commit().await.unwrap();
         eprintln!("  Create: {:?}", create_start.elapsed());
 
         // Test COUNT query
@@ -133,10 +132,9 @@ async fn test_count_vs_scan_all() {
         p.insert("name".to_string(), Value::String(format!("Person_{}", i)));
         props.push(p);
     }
-    db.session()
-        .bulk_insert_vertices("Person", props)
-        .await
-        .unwrap();
+    let tx = db.session().tx().await.unwrap();
+    tx.bulk_insert_vertices("Person", props).await.unwrap();
+    tx.commit().await.unwrap();
     eprintln!("Created {} vertices\n", num_vertices);
 
     // Test COUNT

@@ -54,13 +54,13 @@ async fn test_l0_auto_flush_threshold() -> anyhow::Result<()> {
     let mut p1 = HashMap::new();
     p1.insert("name".to_string(), serde_json::json!("v1").into());
     writer
-        .insert_vertex_with_labels(v1, p1, &["Person".to_string()])
+        .insert_vertex_with_labels(v1, p1, &["Person".to_string()], None)
         .await?;
     let v2 = writer.next_vid().await?;
     let mut p2 = HashMap::new();
     p2.insert("name".to_string(), serde_json::json!("v2").into());
     writer
-        .insert_vertex_with_labels(v2, p2, &["Person".to_string()])
+        .insert_vertex_with_labels(v2, p2, &["Person".to_string()], None)
         .await?;
 
     // Still no snapshot
@@ -77,7 +77,7 @@ async fn test_l0_auto_flush_threshold() -> anyhow::Result<()> {
     let mut p3 = HashMap::new();
     p3.insert("name".to_string(), serde_json::json!("v3").into());
     writer
-        .insert_vertex_with_labels(v3, p3, &["Person".to_string()])
+        .insert_vertex_with_labels(v3, p3, &["Person".to_string()], None)
         .await?;
 
     // Snapshot should be created automatically

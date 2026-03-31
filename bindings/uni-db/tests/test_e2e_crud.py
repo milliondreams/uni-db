@@ -27,8 +27,10 @@ class TestVertexCRUD:
     def test_create_single_vertex_and_read_back(self, social_db, social_session):
         """Test creating a single vertex and reading it back with MATCH."""
         # Create
-        result = social_session.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+        tx = social_session.tx()
+        result = tx.execute("CREATE (p:Person {name: 'Alice', age: 30})")
         assert result.nodes_created >= 1
+        tx.commit()
 
         # Read
         results = social_session.query(
@@ -41,10 +43,12 @@ class TestVertexCRUD:
     def test_create_vertex_with_all_properties(self, social_db, social_session):
         """Test creating a vertex with all defined properties including nullable ones."""
         # Create with all properties
-        result = social_session.execute(
+        tx = social_session.tx()
+        result = tx.execute(
             "CREATE (p:Person {name: 'Bob', age: 25, email: 'bob@example.com'})"
         )
         assert result.nodes_created >= 1
+        tx.commit()
 
         # Read back
         results = social_session.query(
@@ -60,8 +64,10 @@ class TestVertexCRUD:
     ):
         """Test creating a vertex with nullable property omitted."""
         # Create without email (nullable)
-        result = social_session.execute("CREATE (p:Person {name: 'Charlie', age: 35})")
+        tx = social_session.tx()
+        result = tx.execute("CREATE (p:Person {name: 'Charlie', age: 35})")
         assert result.nodes_created >= 1
+        tx.commit()
 
         # Read back - email should be null/None
         results = social_session.query(
@@ -75,9 +81,11 @@ class TestVertexCRUD:
     def test_create_multiple_vertices(self, social_db, social_session):
         """Test creating multiple vertices in sequence."""
         # Create multiple vertices
-        social_session.execute("CREATE (p:Person {name: 'Alice', age: 30})")
-        social_session.execute("CREATE (p:Person {name: 'Bob', age: 25})")
-        social_session.execute("CREATE (p:Person {name: 'Charlie', age: 35})")
+        tx = social_session.tx()
+        tx.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+        tx.execute("CREATE (p:Person {name: 'Bob', age: 25})")
+        tx.execute("CREATE (p:Person {name: 'Charlie', age: 35})")
+        tx.commit()
         social_db.flush()
 
         # Read all back
@@ -92,10 +100,12 @@ class TestVertexCRUD:
     def test_create_company_vertex(self, social_db, social_session):
         """Test creating a Company vertex with nullable founded property."""
         # Create with founded
-        social_session.execute("CREATE (c:Company {name: 'TechCorp', founded: 2010})")
+        tx = social_session.tx()
+        tx.execute("CREATE (c:Company {name: 'TechCorp', founded: 2010})")
 
         # Create without founded
-        social_session.execute("CREATE (c:Company {name: 'StartupInc'})")
+        tx.execute("CREATE (c:Company {name: 'StartupInc'})")
+        tx.commit()
         social_db.flush()
 
         # Read back
@@ -114,16 +124,18 @@ class TestEdgeCRUD:
 
     def test_create_edge_between_vertices(self, social_db, social_session):
         """Test creating an edge between two vertices."""
-        # Create vertices
-        social_session.execute("CREATE (p:Person {name: 'Alice', age: 30})")
-        social_session.execute("CREATE (p:Person {name: 'Bob', age: 25})")
+        # Create vertices and edge
+        tx = social_session.tx()
+        tx.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+        tx.execute("CREATE (p:Person {name: 'Bob', age: 25})")
 
         # Create edge
-        result = social_session.execute(
+        result = tx.execute(
             "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) "
             "CREATE (a)-[:KNOWS]->(b)"
         )
         assert result.relationships_created >= 1
+        tx.commit()
         social_db.flush()
 
         # Read back
@@ -137,16 +149,18 @@ class TestEdgeCRUD:
 
     def test_create_edge_with_properties(self, social_db, social_session):
         """Test creating an edge with properties."""
-        # Create vertices
-        social_session.execute("CREATE (p:Person {name: 'Alice', age: 30})")
-        social_session.execute("CREATE (p:Person {name: 'Bob', age: 25})")
+        # Create vertices and edge with properties
+        tx = social_session.tx()
+        tx.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+        tx.execute("CREATE (p:Person {name: 'Bob', age: 25})")
 
         # Create edge with properties
-        result = social_session.execute(
+        result = tx.execute(
             "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) "
             "CREATE (a)-[:KNOWS {since: 2015}]->(b)"
         )
         assert result.relationships_created >= 1
+        tx.commit()
         social_db.flush()
 
         # Read back edge property
@@ -159,16 +173,18 @@ class TestEdgeCRUD:
 
     def test_create_works_at_edge_with_role(self, social_db, social_session):
         """Test creating a WORKS_AT edge with role property."""
-        # Create vertices
-        social_session.execute("CREATE (p:Person {name: 'Alice', age: 30})")
-        social_session.execute("CREATE (c:Company {name: 'TechCorp', founded: 2010})")
+        # Create vertices and edge with role
+        tx = social_session.tx()
+        tx.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+        tx.execute("CREATE (c:Company {name: 'TechCorp', founded: 2010})")
 
         # Create edge with role
-        result = social_session.execute(
+        result = tx.execute(
             "MATCH (a:Person {name: 'Alice'}), (c:Company {name: 'TechCorp'}) "
             "CREATE (a)-[:WORKS_AT {role: 'Engineer'}]->(c)"
         )
         assert result.relationships_created >= 1
+        tx.commit()
         social_db.flush()
 
         # Read back
@@ -188,9 +204,11 @@ class TestQueryOperations:
     def test_match_vertex_by_property(self, social_db, social_session):
         """Test matching vertices by specific property values."""
         # Create test data
-        social_session.execute("CREATE (p:Person {name: 'Alice', age: 30})")
-        social_session.execute("CREATE (p:Person {name: 'Bob', age: 25})")
-        social_session.execute("CREATE (p:Person {name: 'Charlie', age: 30})")
+        tx = social_session.tx()
+        tx.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+        tx.execute("CREATE (p:Person {name: 'Bob', age: 25})")
+        tx.execute("CREATE (p:Person {name: 'Charlie', age: 30})")
+        tx.commit()
         social_db.flush()
 
         # Match by age
@@ -204,9 +222,11 @@ class TestQueryOperations:
     def test_match_with_where_clause(self, social_db, social_session):
         """Test MATCH with WHERE clause for filtering."""
         # Create test data
-        social_session.execute("CREATE (p:Person {name: 'Alice', age: 30})")
-        social_session.execute("CREATE (p:Person {name: 'Bob', age: 25})")
-        social_session.execute("CREATE (p:Person {name: 'Charlie', age: 35})")
+        tx = social_session.tx()
+        tx.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+        tx.execute("CREATE (p:Person {name: 'Bob', age: 25})")
+        tx.execute("CREATE (p:Person {name: 'Charlie', age: 35})")
+        tx.commit()
         social_db.flush()
 
         # Match with WHERE
@@ -220,9 +240,11 @@ class TestQueryOperations:
     def test_match_return_multiple_properties(self, social_db, social_session):
         """Test returning multiple properties from a match."""
         # Create test data
-        social_session.execute(
+        tx = social_session.tx()
+        tx.execute(
             "CREATE (p:Person {name: 'Alice', age: 30, email: 'alice@example.com'})"
         )
+        tx.commit()
         social_db.flush()
 
         # Return multiple properties
@@ -242,14 +264,16 @@ class TestUpdateOperations:
     def test_set_property_on_vertex(self, social_db, social_session):
         """Test updating a property on a vertex using SET."""
         # Create vertex
-        social_session.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+        tx = social_session.tx()
+        tx.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+        tx.commit()
         social_db.flush()
 
         # Update age
-        result = social_session.execute(
-            "MATCH (p:Person {name: 'Alice'}) SET p.age = 31"
-        )
+        tx = social_session.tx()
+        result = tx.execute("MATCH (p:Person {name: 'Alice'}) SET p.age = 31")
         assert result.properties_set >= 1
+        tx.commit()
         social_db.flush()
 
         # Verify update
@@ -262,14 +286,18 @@ class TestUpdateOperations:
     def test_set_nullable_property_on_vertex(self, social_db, social_session):
         """Test setting a nullable property that was initially null."""
         # Create vertex without email
-        social_session.execute("CREATE (p:Person {name: 'Bob', age: 25})")
+        tx = social_session.tx()
+        tx.execute("CREATE (p:Person {name: 'Bob', age: 25})")
+        tx.commit()
         social_db.flush()
 
         # Set email
-        result = social_session.execute(
+        tx = social_session.tx()
+        result = tx.execute(
             "MATCH (p:Person {name: 'Bob'}) SET p.email = 'bob@example.com'"
         )
         assert result.properties_set >= 1
+        tx.commit()
         social_db.flush()
 
         # Verify
@@ -282,20 +310,24 @@ class TestUpdateOperations:
     def test_set_property_on_edge(self, social_db, social_session):
         """Test updating a property on an edge using SET."""
         # Create vertices and edge
-        social_session.execute("CREATE (p:Person {name: 'Alice', age: 30})")
-        social_session.execute("CREATE (p:Person {name: 'Bob', age: 25})")
-        social_session.execute(
+        tx = social_session.tx()
+        tx.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+        tx.execute("CREATE (p:Person {name: 'Bob', age: 25})")
+        tx.execute(
             "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) "
             "CREATE (a)-[:KNOWS {since: 2015}]->(b)"
         )
+        tx.commit()
         social_db.flush()
 
         # Update edge property
-        result = social_session.execute(
+        tx = social_session.tx()
+        result = tx.execute(
             "MATCH (a:Person {name: 'Alice'})-[k:KNOWS]->(b:Person {name: 'Bob'}) "
             "SET k.since = 2016"
         )
         assert result.properties_set >= 1
+        tx.commit()
         social_db.flush()
 
         # Verify
@@ -313,12 +345,14 @@ class TestDeleteOperations:
     def test_delete_edge(self, social_db, social_session):
         """Test deleting an edge."""
         # Create vertices and edge
-        social_session.execute("CREATE (p:Person {name: 'Alice', age: 30})")
-        social_session.execute("CREATE (p:Person {name: 'Bob', age: 25})")
-        social_session.execute(
+        tx = social_session.tx()
+        tx.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+        tx.execute("CREATE (p:Person {name: 'Bob', age: 25})")
+        tx.execute(
             "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) "
             "CREATE (a)-[:KNOWS]->(b)"
         )
+        tx.commit()
         social_db.flush()
 
         # Verify edge exists
@@ -329,10 +363,12 @@ class TestDeleteOperations:
         assert len(results) == 1
 
         # Delete edge
-        result = social_session.execute(
+        tx = social_session.tx()
+        result = tx.execute(
             "MATCH (a:Person {name: 'Alice'})-[k:KNOWS]->(b:Person {name: 'Bob'}) DELETE k"
         )
         assert result.relationships_deleted >= 1
+        tx.commit()
         social_db.flush()
 
         # Verify edge deleted
@@ -345,7 +381,9 @@ class TestDeleteOperations:
     def test_delete_vertex(self, social_db, social_session):
         """Test deleting a vertex with no edges."""
         # Create vertex
-        social_session.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+        tx = social_session.tx()
+        tx.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+        tx.commit()
         social_db.flush()
 
         # Verify exists
@@ -355,8 +393,10 @@ class TestDeleteOperations:
         assert results[0]["count"] == 1
 
         # Delete vertex
-        result = social_session.execute("MATCH (p:Person {name: 'Alice'}) DELETE p")
+        tx = social_session.tx()
+        result = tx.execute("MATCH (p:Person {name: 'Alice'}) DELETE p")
         assert result.nodes_deleted >= 1
+        tx.commit()
         social_db.flush()
 
         # Verify deleted
@@ -368,17 +408,19 @@ class TestDeleteOperations:
     def test_delete_vertex_with_cascading_edge_removal(self, social_db, social_session):
         """Test deleting a vertex and its connected edges (DETACH DELETE)."""
         # Create vertices and edges
-        social_session.execute("CREATE (p:Person {name: 'Alice', age: 30})")
-        social_session.execute("CREATE (p:Person {name: 'Bob', age: 25})")
-        social_session.execute("CREATE (p:Person {name: 'Charlie', age: 35})")
-        social_session.execute(
+        tx = social_session.tx()
+        tx.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+        tx.execute("CREATE (p:Person {name: 'Bob', age: 25})")
+        tx.execute("CREATE (p:Person {name: 'Charlie', age: 35})")
+        tx.execute(
             "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) "
             "CREATE (a)-[:KNOWS]->(b)"
         )
-        social_session.execute(
+        tx.execute(
             "MATCH (b:Person {name: 'Bob'}), (c:Person {name: 'Charlie'}) "
             "CREATE (b)-[:KNOWS]->(c)"
         )
+        tx.commit()
         social_db.flush()
 
         # Verify Bob has edges
@@ -389,10 +431,10 @@ class TestDeleteOperations:
         assert results[0]["count"] >= 1
 
         # Delete Bob and cascade edges
-        result = social_session.execute(
-            "MATCH (p:Person {name: 'Bob'}) DETACH DELETE p"
-        )
+        tx = social_session.tx()
+        result = tx.execute("MATCH (p:Person {name: 'Bob'}) DETACH DELETE p")
         assert result.nodes_deleted >= 1  # At least the vertex
+        tx.commit()
         social_db.flush()
 
         # Verify Bob is deleted
@@ -412,8 +454,10 @@ class TestMergeOperations:
     def test_merge_vertex_creates_when_not_exists(self, social_db, social_session):
         """Test MERGE creates vertex when it doesn't exist."""
         # Merge (should create)
-        result = social_session.execute("MERGE (p:Person {name: 'Alice', age: 30})")
+        tx = social_session.tx()
+        result = tx.execute("MERGE (p:Person {name: 'Alice', age: 30})")
         assert result.nodes_created >= 1
+        tx.commit()
         social_db.flush()
 
         # Verify created
@@ -426,11 +470,15 @@ class TestMergeOperations:
     def test_merge_vertex_matches_when_exists(self, social_db, social_session):
         """Test MERGE matches existing vertex instead of creating duplicate."""
         # Create vertex
-        social_session.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+        tx = social_session.tx()
+        tx.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+        tx.commit()
         social_db.flush()
 
         # Merge same vertex (should match, not create)
-        social_session.execute("MERGE (p:Person {name: 'Alice', age: 30})")
+        tx = social_session.tx()
+        tx.execute("MERGE (p:Person {name: 'Alice', age: 30})")
+        tx.commit()
         social_db.flush()
 
         # Verify only one vertex exists
@@ -442,22 +490,28 @@ class TestMergeOperations:
     def test_merge_edge(self, social_db, social_session):
         """Test MERGE on edges."""
         # Create vertices
-        social_session.execute("CREATE (p:Person {name: 'Alice', age: 30})")
-        social_session.execute("CREATE (p:Person {name: 'Bob', age: 25})")
+        tx = social_session.tx()
+        tx.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+        tx.execute("CREATE (p:Person {name: 'Bob', age: 25})")
+        tx.commit()
         social_db.flush()
 
         # First merge - should create
-        social_session.execute(
+        tx = social_session.tx()
+        tx.execute(
             "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) "
             "MERGE (a)-[:KNOWS]->(b)"
         )
+        tx.commit()
         social_db.flush()
 
         # Second merge - should match existing
-        social_session.execute(
+        tx = social_session.tx()
+        tx.execute(
             "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) "
             "MERGE (a)-[:KNOWS]->(b)"
         )
+        tx.commit()
         social_db.flush()
 
         # Verify only one edge exists
@@ -475,10 +529,10 @@ class TestParameterizedQueries:
         """Test CREATE with string parameter."""
         # Create with parameter
         params = {"name": "Alice", "age": 30}
-        result = social_session.execute(
-            "CREATE (p:Person {name: $name, age: $age})", params
-        )
+        tx = social_session.tx()
+        result = tx.execute("CREATE (p:Person {name: $name, age: $age})", params)
         assert result.nodes_created >= 1
+        tx.commit()
         social_db.flush()
 
         # Verify
@@ -491,9 +545,11 @@ class TestParameterizedQueries:
     def test_query_with_parameters(self, social_db, social_session):
         """Test query with parameterized WHERE clause."""
         # Create test data
-        social_session.execute("CREATE (p:Person {name: 'Alice', age: 30})")
-        social_session.execute("CREATE (p:Person {name: 'Bob', age: 25})")
-        social_session.execute("CREATE (p:Person {name: 'Charlie', age: 35})")
+        tx = social_session.tx()
+        tx.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+        tx.execute("CREATE (p:Person {name: 'Bob', age: 25})")
+        tx.execute("CREATE (p:Person {name: 'Charlie', age: 35})")
+        tx.commit()
         social_db.flush()
 
         # Query with parameter
@@ -509,18 +565,22 @@ class TestParameterizedQueries:
     def test_create_edge_with_parameters(self, social_db, social_session):
         """Test creating edge with parameterized properties."""
         # Create vertices
-        social_session.execute("CREATE (p:Person {name: 'Alice', age: 30})")
-        social_session.execute("CREATE (p:Person {name: 'Bob', age: 25})")
+        tx = social_session.tx()
+        tx.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+        tx.execute("CREATE (p:Person {name: 'Bob', age: 25})")
+        tx.commit()
         social_db.flush()
 
         # Create edge with parameters
         params = {"name1": "Alice", "name2": "Bob", "since": 2015}
-        result = social_session.execute(
+        tx = social_session.tx()
+        result = tx.execute(
             "MATCH (a:Person {name: $name1}), (b:Person {name: $name2}) "
             "CREATE (a)-[:KNOWS {since: $since}]->(b)",
             params,
         )
         assert result.relationships_created >= 1
+        tx.commit()
         social_db.flush()
 
         # Verify
@@ -534,15 +594,19 @@ class TestParameterizedQueries:
     def test_update_with_parameters(self, social_db, social_session):
         """Test SET operation with parameters."""
         # Create vertex
-        social_session.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+        tx = social_session.tx()
+        tx.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+        tx.commit()
         social_db.flush()
 
         # Update with parameter
         params = {"name": "Alice", "new_age": 31}
-        result = social_session.execute(
+        tx = social_session.tx()
+        result = tx.execute(
             "MATCH (p:Person {name: $name}) SET p.age = $new_age", params
         )
         assert result.properties_set >= 1
+        tx.commit()
         social_db.flush()
 
         # Verify
@@ -555,15 +619,17 @@ class TestParameterizedQueries:
     def test_delete_with_parameters(self, social_db, social_session):
         """Test DELETE operation with parameters."""
         # Create vertex
-        social_session.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+        tx = social_session.tx()
+        tx.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+        tx.commit()
         social_db.flush()
 
         # Delete with parameter
         params = {"name": "Alice"}
-        result = social_session.execute(
-            "MATCH (p:Person {name: $name}) DELETE p", params
-        )
+        tx = social_session.tx()
+        result = tx.execute("MATCH (p:Person {name: $name}) DELETE p", params)
         assert result.nodes_deleted >= 1
+        tx.commit()
         social_db.flush()
 
         # Verify deleted

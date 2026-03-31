@@ -283,13 +283,17 @@ def test_schema_builder_edge_type_with_properties(empty_db):
 
     # Insert data to verify edge properties work
     session = db.session()
-    session.execute("CREATE (a:Person {name: 'Alice'})")
-    session.execute("CREATE (b:Person {name: 'Bob'})")
+    tx = session.tx()
+    tx.execute("CREATE (a:Person {name: 'Alice'})")
+    tx.execute("CREATE (b:Person {name: 'Bob'})")
+    tx.commit()
     db.flush()
-    session.execute(
+    tx2 = session.tx()
+    tx2.execute(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) "
         "CREATE (a)-[:KNOWS {since: 2020, strength: 0.9}]->(b)"
     )
+    tx2.commit()
     db.flush()
 
     results = session.query(
@@ -480,7 +484,9 @@ def test_data_type_string_e2e(empty_db):
     db.schema().label("Person").property("name", "string").apply()
 
     session = db.session()
-    session.execute("CREATE (p:Person {name: 'Alice'})")
+    tx = session.tx()
+    tx.execute("CREATE (p:Person {name: 'Alice'})")
+    tx.commit()
     db.flush()
 
     results = session.query("MATCH (p:Person) RETURN p.name AS name")
@@ -495,7 +501,9 @@ def test_data_type_int_e2e(empty_db):
     db.schema().label("Person").property("age", "int").apply()
 
     session = db.session()
-    session.execute("CREATE (p:Person {age: 30})")
+    tx = session.tx()
+    tx.execute("CREATE (p:Person {age: 30})")
+    tx.commit()
     db.flush()
 
     results = session.query("MATCH (p:Person) RETURN p.age AS age")
@@ -510,7 +518,9 @@ def test_data_type_float_e2e(empty_db):
     db.schema().label("Product").property("price", "float").apply()
 
     session = db.session()
-    session.execute("CREATE (p:Product {price: 99.99})")
+    tx = session.tx()
+    tx.execute("CREATE (p:Product {price: 99.99})")
+    tx.commit()
     db.flush()
 
     results = session.query("MATCH (p:Product) RETURN p.price AS price")
@@ -525,8 +535,10 @@ def test_data_type_bool_e2e(empty_db):
     db.schema().label("User").property("active", "bool").apply()
 
     session = db.session()
-    session.execute("CREATE (u:User {active: true})")
-    session.execute("CREATE (u:User {active: false})")
+    tx = session.tx()
+    tx.execute("CREATE (u:User {active: true})")
+    tx.execute("CREATE (u:User {active: false})")
+    tx.commit()
     db.flush()
 
     results = session.query(
@@ -551,9 +563,9 @@ def test_data_type_vector_e2e(empty_db):
     )
 
     session = db.session()
-    session.execute(
-        "CREATE (d:Document {title: 'Doc1', embedding: [1.0, 0.0, 0.0, 0.0]})"
-    )
+    tx = session.tx()
+    tx.execute("CREATE (d:Document {title: 'Doc1', embedding: [1.0, 0.0, 0.0, 0.0]})")
+    tx.commit()
     db.flush()
 
     results = session.query("MATCH (d:Document) RETURN d.embedding AS embedding")
@@ -570,7 +582,9 @@ def test_data_type_list_string_e2e(empty_db):
     db.schema().label("Article").property("tags", "list:string").apply()
 
     session = db.session()
-    session.execute("CREATE (a:Article {tags: ['python', 'database', 'graph']})")
+    tx = session.tx()
+    tx.execute("CREATE (a:Article {tags: ['python', 'database', 'graph']})")
+    tx.commit()
     db.flush()
 
     results = session.query("MATCH (a:Article) RETURN a.tags AS tags")
@@ -586,7 +600,9 @@ def test_data_type_list_int_e2e(empty_db):
     db.schema().label("Data").property("scores", "list:int").apply()
 
     session = db.session()
-    session.execute("CREATE (d:Data {scores: [10, 20, 30, 40]})")
+    tx = session.tx()
+    tx.execute("CREATE (d:Data {scores: [10, 20, 30, 40]})")
+    tx.commit()
     db.flush()
 
     results = session.query("MATCH (d:Data) RETURN d.scores AS scores")
@@ -609,10 +625,12 @@ def test_nullable_property_with_null_value_e2e(empty_db):
     )
 
     session = db.session()
+    tx = session.tx()
     # Create with null email
-    session.execute("CREATE (p:Person {name: 'Alice'})")
+    tx.execute("CREATE (p:Person {name: 'Alice'})")
     # Create with email
-    session.execute("CREATE (p:Person {name: 'Bob', email: 'bob@example.com'})")
+    tx.execute("CREATE (p:Person {name: 'Bob', email: 'bob@example.com'})")
+    tx.commit()
     db.flush()
 
     results = session.query(
@@ -647,14 +665,16 @@ def test_multiple_data_types_combined(empty_db):
     )
 
     session = db.session()
-    session.execute(
+    tx = session.tx()
+    tx.execute(
         "CREATE (p:Product {name: 'Laptop', price: 999.99, stock: 10, available: true, "
         "embedding: [1.0, 0.0, 0.0, 0.0]})"
     )
-    session.execute(
+    tx.execute(
         "CREATE (p:Product {name: 'Phone', price: 699.99, stock: 0, available: false, "
         "description: 'Out of stock', embedding: [0.0, 1.0, 0.0, 0.0]})"
     )
+    tx.commit()
     db.flush()
 
     results = session.query(

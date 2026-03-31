@@ -20,19 +20,16 @@ async fn test_traversal_label_filtering_bug() -> Result<()> {
 
     // 2. Insert Data
     // Create a Person 'Human' and a Robot 'Beep'
-    db.session()
-        .execute("CREATE (p:Person {name: 'Human'})")
-        .await?;
-    db.session()
-        .execute("CREATE (r:Robot {model: 'Beep'})")
-        .await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (p:Person {name: 'Human'})").await?;
+    tx.execute("CREATE (r:Robot {model: 'Beep'})").await?;
 
     // Connect them: Person -> OWNS -> Robot
-    db.session()
-        .execute(
-            "MATCH (p:Person {name: 'Human'}), (r:Robot {model: 'Beep'}) CREATE (p)-[:OWNS]->(r)",
-        )
-        .await?;
+    tx.execute(
+        "MATCH (p:Person {name: 'Human'}), (r:Robot {model: 'Beep'}) CREATE (p)-[:OWNS]->(r)",
+    )
+    .await?;
+    tx.commit().await?;
 
     // 3. Test Cases
 

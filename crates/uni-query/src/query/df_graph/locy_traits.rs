@@ -6,7 +6,7 @@
 //! `DerivedFactSource` provides read-only access to derived facts and the graph,
 //! replacing `CypherExecutor` for read operations in the native path.
 //!
-//! `LocyExecutionContext` extends it with write operations (mutations, savepoints,
+//! `LocyExecutionContext` extends it with write operations (mutations, L0 fork/restore,
 //! and strata re-evaluation) needed by ASSUME, DERIVE, and ABDUCE.
 
 use std::collections::HashMap;
@@ -15,17 +15,17 @@ use arrow_array::RecordBatch;
 use async_trait::async_trait;
 use uni_common::Value;
 use uni_cypher::ast::{Expr, Pattern, Query};
-use uni_locy::{CompiledProgram, FactRow, LocyConfig, LocyError, SavepointId};
+use uni_locy::{CompiledProgram, FactRow, LocyConfig, LocyError};
 
 use super::locy_delta::RowStore;
 
 /// Read-only access to derived facts and graph data.
 ///
 /// Replaces `CypherExecutor` for read operations in the native command dispatch path.
-/// `lookup_derived` converts RecordBatch-based native facts to Row-based format internally.
+/// `lookup_derived` converts RecordBatch-based native facts to `FactRow` format internally.
 #[async_trait(?Send)]
 pub trait DerivedFactSource: Send + Sync {
-    /// Look up all facts for a rule. Returns Row-based results.
+    /// Look up all facts for a rule. Returns `FactRow`-based results.
     fn lookup_derived(&self, rule_name: &str) -> Result<Vec<FactRow>, LocyError>;
 
     /// Look up all facts for a rule as raw RecordBatches (zero-copy from native store).
@@ -79,11 +79,17 @@ pub trait LocyExecutionContext: DerivedFactSource {
         params: HashMap<String, Value>,
     ) -> Result<usize, LocyError>;
 
-    /// Begin a savepoint for transactional rollback.
-    async fn begin_savepoint(&self) -> Result<SavepointId, LocyError>;
+    /// Fork the current Locy L0 buffer for hypothetical reasoning.
+    ///
+    /// Saves the current L0 state and replaces it with a clone.
+    /// Mutations after fork are isolated to the clone.
+    /// Call `restore_l0()` to undo all hypothetical changes.
+    async fn fork_l0(&self) -> Result<(), LocyError>;
 
-    /// Rollback to a previously created savepoint.
-    async fn rollback_savepoint(&self, id: SavepointId) -> Result<(), LocyError>;
+    /// Restore the Locy L0 buffer to its state before the last `fork_l0()`.
+    ///
+    /// Discards all mutations made since the fork.
+    async fn restore_l0(&self) -> Result<(), LocyError>;
 
     /// Re-evaluate all strata in the current (possibly mutated) state.
     ///

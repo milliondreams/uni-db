@@ -14,9 +14,11 @@ async def test_verify_preexisting_indexes(async_indexed_db):
 
     session = async_indexed_db.session()
 
-    await session.execute(
+    tx = await session.tx()
+    await tx.execute(
         "CREATE (i:Item {sku: 'TEST-001', name: 'TestItem', price: 9.99, active: true, embedding: [0.1, 0.2, 0.3, 0.4]})"
     )
+    await tx.commit()
     await async_indexed_db.flush()
 
     result = await session.query(
@@ -47,12 +49,12 @@ async def test_create_additional_scalar_index(async_indexed_db):
 
     session = async_indexed_db.session()
 
-    await session.execute(
-        "CREATE (p:Product {name: 'Widget', sku: 'WDG-001', price: 9.99})"
-    )
-    await session.execute(
+    tx = await session.tx()
+    await tx.execute("CREATE (p:Product {name: 'Widget', sku: 'WDG-001', price: 9.99})")
+    await tx.execute(
         "CREATE (p:Product {name: 'Gadget', sku: 'GDG-001', price: 19.99})"
     )
+    await tx.commit()
     await async_indexed_db.flush()
 
     await async_indexed_db.schema().label("Product").index("sku", "btree").apply()
@@ -86,12 +88,10 @@ async def test_create_vector_index(async_indexed_db):
 
     session = async_indexed_db.session()
 
-    await session.execute(
-        "CREATE (d:Document {title: 'Doc1', embedding: [0.1, 0.2, 0.3]})"
-    )
-    await session.execute(
-        "CREATE (d:Document {title: 'Doc2', embedding: [0.4, 0.5, 0.6]})"
-    )
+    tx = await session.tx()
+    await tx.execute("CREATE (d:Document {title: 'Doc1', embedding: [0.1, 0.2, 0.3]})")
+    await tx.execute("CREATE (d:Document {title: 'Doc2', embedding: [0.4, 0.5, 0.6]})")
+    await tx.commit()
     await async_indexed_db.flush()
 
     await (
@@ -110,7 +110,9 @@ async def test_create_vector_index(async_indexed_db):
         .apply()
     )
 
-    await session.execute("CREATE (i:Image {name: 'img1', features: [0.7, 0.8, 0.9]})")
+    tx2 = await session.tx()
+    await tx2.execute("CREATE (i:Image {name: 'img1', features: [0.7, 0.8, 0.9]})")
+    await tx2.commit()
     await async_indexed_db.flush()
 
     await (
@@ -130,15 +132,17 @@ async def test_indexed_queries_return_correct_results(async_indexed_db):
     session = async_indexed_db.session()
 
     # Add test data with known values using Item label (which has indexes)
-    await session.execute(
+    tx = await session.tx()
+    await tx.execute(
         "CREATE (i:Item {sku: 'IDX-001', name: 'IndexedAlice', price: 100.0, active: true, embedding: [0.1, 0.2, 0.3, 0.4]})"
     )
-    await session.execute(
+    await tx.execute(
         "CREATE (i:Item {sku: 'IDX-002', name: 'IndexedBob', price: 101.0, active: true, embedding: [0.5, 0.6, 0.7, 0.8]})"
     )
-    await session.execute(
+    await tx.execute(
         "CREATE (i:Item {sku: 'IDX-003', name: 'IndexedCharlie', price: 102.0, active: false, embedding: [0.9, 1.0, 1.1, 1.2]})"
     )
+    await tx.commit()
     await async_indexed_db.flush()
 
     # Query by name (should use hash index)

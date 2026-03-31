@@ -9,18 +9,16 @@ async fn test_where_property_equals() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
     // Create schema and data
-    db.session()
-        .execute("CREATE LABEL Person (name STRING, age INT)")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL Person (name STRING, age INT)")
         .await?;
-    db.session()
-        .execute("CREATE (:Person {name: 'Alice', age: 25})")
+    tx.execute("CREATE (:Person {name: 'Alice', age: 25})")
         .await?;
-    db.session()
-        .execute("CREATE (:Person {name: 'Bob', age: 30})")
+    tx.execute("CREATE (:Person {name: 'Bob', age: 30})")
         .await?;
-    db.session()
-        .execute("CREATE (:Person {name: 'Charlie', age: 35})")
+    tx.execute("CREATE (:Person {name: 'Charlie', age: 35})")
         .await?;
+    tx.commit().await?;
 
     println!("Created 3 Person nodes");
 
@@ -51,18 +49,16 @@ async fn test_where_property_comparison() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
     // Create schema and data
-    db.session()
-        .execute("CREATE LABEL Person (name STRING, age INT)")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL Person (name STRING, age INT)")
         .await?;
-    db.session()
-        .execute("CREATE (:Person {name: 'Alice', age: 25})")
+    tx.execute("CREATE (:Person {name: 'Alice', age: 25})")
         .await?;
-    db.session()
-        .execute("CREATE (:Person {name: 'Bob', age: 30})")
+    tx.execute("CREATE (:Person {name: 'Bob', age: 30})")
         .await?;
-    db.session()
-        .execute("CREATE (:Person {name: 'Charlie', age: 35})")
+    tx.execute("CREATE (:Person {name: 'Charlie', age: 35})")
         .await?;
+    tx.commit().await?;
 
     println!("Created 3 Person nodes");
 
@@ -87,22 +83,16 @@ async fn test_where_label_predicate() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
     // Create schema and data
-    db.session()
-        .execute("CREATE LABEL Person (name STRING)")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL Person (name STRING)").await?;
+    tx.execute("CREATE LABEL Company (name STRING)").await?;
+    tx.execute("CREATE EDGE TYPE WORKS_AT FROM Person TO Company")
         .await?;
-    db.session()
-        .execute("CREATE LABEL Company (name STRING)")
+    tx.execute("CREATE (:Person {name: 'Alice'})-[:WORKS_AT]->(:Company {name: 'Acme'})")
         .await?;
-    db.session()
-        .execute("CREATE EDGE TYPE WORKS_AT FROM Person TO Company")
+    tx.execute("CREATE (:Person {name: 'Bob'})-[:WORKS_AT]->(:Company {name: 'BigCo'})")
         .await?;
-
-    db.session()
-        .execute("CREATE (:Person {name: 'Alice'})-[:WORKS_AT]->(:Company {name: 'Acme'})")
-        .await?;
-    db.session()
-        .execute("CREATE (:Person {name: 'Bob'})-[:WORKS_AT]->(:Company {name: 'BigCo'})")
-        .await?;
+    tx.commit().await?;
 
     println!("Created graph with Person and Company nodes");
 
@@ -160,18 +150,15 @@ async fn test_where_equi_join() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
     // Create schema and data
-    db.session()
-        .execute("CREATE LABEL Person (id INT, name STRING)")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL Person (id INT, name STRING)")
         .await?;
-    db.session()
-        .execute("CREATE (:Person {id: 1, name: 'Alice'})")
+    tx.execute("CREATE (:Person {id: 1, name: 'Alice'})")
         .await?;
-    db.session()
-        .execute("CREATE (:Person {id: 2, name: 'Bob'})")
-        .await?;
-    db.session()
-        .execute("CREATE (:Person {id: 1, name: 'Alice2'})")
+    tx.execute("CREATE (:Person {id: 2, name: 'Bob'})").await?;
+    tx.execute("CREATE (:Person {id: 1, name: 'Alice2'})")
         .await?; // Same id as first Alice
+    tx.commit().await?;
 
     println!("Created 3 Person nodes");
 
@@ -194,15 +181,13 @@ async fn test_where_unlabeled() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
     // Create unlabeled nodes
-    db.session()
-        .execute("CREATE ({name: 'Alice', type: 'person'})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE ({name: 'Alice', type: 'person'})")
         .await?;
-    db.session()
-        .execute("CREATE ({name: 'Bob', type: 'person'})")
+    tx.execute("CREATE ({name: 'Bob', type: 'person'})").await?;
+    tx.execute("CREATE ({name: 'Acme', type: 'company'})")
         .await?;
-    db.session()
-        .execute("CREATE ({name: 'Acme', type: 'company'})")
-        .await?;
+    tx.commit().await?;
 
     println!("Created 3 unlabeled nodes");
 

@@ -6,17 +6,20 @@ import pytest
 def test_create_bulk_writer_with_builder(social_db):
     """Test creating a bulk writer using the builder pattern."""
     session = social_db.session()
-    writer = session.bulk_writer().build()
+    tx = session.tx()
+    writer = tx.bulk_writer().build()
     assert writer is not None
 
     # Abort to clean up
     writer.abort()
+    tx.rollback()
 
 
 def test_bulk_insert_vertices(social_db):
     """Test bulk inserting vertices and receiving vertex IDs."""
     session = social_db.session()
-    writer = session.bulk_writer().build()
+    tx = session.tx()
+    writer = tx.bulk_writer().build()
 
     people_data = [
         {"name": "Alice", "age": 30, "email": "alice@example.com"},
@@ -32,13 +35,15 @@ def test_bulk_insert_vertices(social_db):
     assert len(set(vids)) == 3  # All IDs should be unique
 
     stats = writer.commit()
+    tx.commit()
     assert stats.vertices_inserted == 3
 
 
 def test_bulk_insert_edges(social_db):
     """Test bulk inserting edges after inserting vertices."""
     session = social_db.session()
-    writer = session.bulk_writer().build()
+    tx = session.tx()
+    writer = tx.bulk_writer().build()
 
     # Insert vertices first
     people_data = [
@@ -59,6 +64,7 @@ def test_bulk_insert_edges(social_db):
     assert result is None  # insert_edges returns None
 
     stats = writer.commit()
+    tx.commit()
     assert stats.vertices_inserted == 3
     assert stats.edges_inserted == 3
 
@@ -66,56 +72,65 @@ def test_bulk_insert_edges(social_db):
 def test_bulk_writer_with_defer_vector_indexes(social_db):
     """Test bulk writer with defer_vector_indexes option."""
     session = social_db.session()
-    writer = session.bulk_writer().defer_vector_indexes(True).build()
+    tx = session.tx()
+    writer = tx.bulk_writer().defer_vector_indexes(True).build()
 
     people_data = [{"name": "Alice", "age": 30}]
     writer.insert_vertices("Person", people_data)
 
     stats = writer.commit()
+    tx.commit()
     assert stats.vertices_inserted == 1
 
 
 def test_bulk_writer_with_defer_scalar_indexes(social_db):
     """Test bulk writer with defer_scalar_indexes option."""
     session = social_db.session()
-    writer = session.bulk_writer().defer_scalar_indexes(True).build()
+    tx = session.tx()
+    writer = tx.bulk_writer().defer_scalar_indexes(True).build()
 
     people_data = [{"name": "Bob", "age": 25}]
     writer.insert_vertices("Person", people_data)
 
     stats = writer.commit()
+    tx.commit()
     assert stats.vertices_inserted == 1
 
 
 def test_bulk_writer_with_batch_size(social_db):
     """Test bulk writer with custom batch_size option."""
     session = social_db.session()
-    writer = session.bulk_writer().batch_size(100).build()
+    tx = session.tx()
+    writer = tx.bulk_writer().batch_size(100).build()
 
     people_data = [{"name": f"Person{i}", "age": 20 + i} for i in range(10)]
     writer.insert_vertices("Person", people_data)
 
     stats = writer.commit()
+    tx.commit()
     assert stats.vertices_inserted == 10
 
 
 def test_bulk_writer_with_async_indexes(social_db):
     """Test bulk writer with async_indexes option."""
     session = social_db.session()
-    writer = session.bulk_writer().async_indexes(True).build()
+    tx = session.tx()
+    writer = tx.bulk_writer().async_indexes(True).build()
 
     people_data = [{"name": "Charlie", "age": 35}]
     writer.insert_vertices("Person", people_data)
 
     stats = writer.commit()
+    tx.commit()
     assert stats.vertices_inserted == 1
 
 
 def test_bulk_writer_with_all_config_options(social_db):
     """Test bulk writer with all configuration options combined."""
     session = social_db.session()
+    tx = session.tx()
     writer = (
-        session.bulk_writer()
+        tx.bulk_writer()
         .defer_vector_indexes(True)
         .defer_scalar_indexes(False)
         .batch_size(50)
@@ -127,13 +142,15 @@ def test_bulk_writer_with_all_config_options(social_db):
     writer.insert_vertices("Person", people_data)
 
     stats = writer.commit()
+    tx.commit()
     assert stats.vertices_inserted == 5
 
 
 def test_bulk_stats_attributes(social_db):
     """Test that BulkStats has all expected attributes."""
     session = social_db.session()
-    writer = session.bulk_writer().build()
+    tx = session.tx()
+    writer = tx.bulk_writer().build()
 
     people_data = [{"name": "Alice", "age": 30}]
     vids = writer.insert_vertices("Person", people_data)
@@ -145,6 +162,7 @@ def test_bulk_stats_attributes(social_db):
     writer.insert_edges("WORKS_AT", edges_data)
 
     stats = writer.commit()
+    tx.commit()
 
     # Check all expected attributes
     assert hasattr(stats, "vertices_inserted")
@@ -171,13 +189,15 @@ def test_bulk_stats_attributes(social_db):
 def test_bulk_writer_abort(social_db):
     """Test aborting a bulk writer."""
     session = social_db.session()
-    writer = session.bulk_writer().build()
+    tx = session.tx()
+    writer = tx.bulk_writer().build()
 
     people_data = [{"name": "Alice", "age": 30}]
     writer.insert_vertices("Person", people_data)
 
     # Abort the writer
     writer.abort()
+    tx.rollback()
 
     # Verify data was not committed
     social_db.flush()
@@ -188,10 +208,12 @@ def test_bulk_writer_abort(social_db):
 def test_operations_after_abort_raise_error(social_db):
     """Test that operations after abort raise RuntimeError."""
     session = social_db.session()
-    writer = session.bulk_writer().build()
+    tx = session.tx()
+    writer = tx.bulk_writer().build()
 
     # Abort the writer
     writer.abort()
+    tx.rollback()
 
     # Attempting to insert vertices should raise RuntimeError (Python-side check)
     with pytest.raises(RuntimeError):
@@ -209,15 +231,17 @@ def test_operations_after_abort_raise_error(social_db):
 def test_convenience_bulk_insert_vertices(social_db):
     """Test the convenience bulk_insert_vertices method via bulk_writer."""
     session = social_db.session()
+    tx = session.tx()
     people_data = [
         {"name": "Alice", "age": 30, "email": "alice@example.com"},
         {"name": "Bob", "age": 25, "email": "bob@example.com"},
         {"name": "Charlie", "age": 35},
     ]
 
-    bw = session.bulk_writer().build()
+    bw = tx.bulk_writer().build()
     vids = bw.insert_vertices("Person", people_data)
     bw.commit()
+    tx.commit()
 
     assert isinstance(vids, list)
     assert len(vids) == 3
@@ -234,12 +258,13 @@ def test_convenience_bulk_insert_vertices(social_db):
 def test_convenience_bulk_insert_edges(social_db):
     """Test the convenience bulk_insert_edges method via bulk_writer."""
     session = social_db.session()
+    tx = session.tx()
     # First insert vertices, then edges, in one writer
     people_data = [
         {"name": "Alice", "age": 30},
         {"name": "Bob", "age": 25},
     ]
-    bw = session.bulk_writer().build()
+    bw = tx.bulk_writer().build()
     vids = bw.insert_vertices("Person", people_data)
 
     # Then insert edges
@@ -249,6 +274,7 @@ def test_convenience_bulk_insert_edges(social_db):
 
     bw.insert_edges("KNOWS", edges_data)
     bw.commit()
+    tx.commit()
 
     # Verify edge was inserted
     social_db.flush()
@@ -264,7 +290,8 @@ def test_convenience_bulk_insert_edges(social_db):
 def test_large_batch_insert(social_db):
     """Test inserting a large batch of vertices (1000+)."""
     session = social_db.session()
-    writer = session.bulk_writer().batch_size(200).build()
+    tx = session.tx()
+    writer = tx.bulk_writer().batch_size(200).build()
 
     # Generate 1500 vertices
     large_batch = [{"name": f"Person{i}", "age": 20 + (i % 50)} for i in range(1500)]
@@ -275,6 +302,7 @@ def test_large_batch_insert(social_db):
     assert len(set(vids)) == 1500  # All IDs should be unique
 
     stats = writer.commit()
+    tx.commit()
     assert stats.vertices_inserted == 1500
 
     # Verify data was inserted
@@ -286,7 +314,8 @@ def test_large_batch_insert(social_db):
 def test_verify_data_correctness_after_bulk_insert(social_db):
     """Test that data inserted via bulk operations is queryable and correct."""
     session = social_db.session()
-    writer = session.bulk_writer().build()
+    tx = session.tx()
+    writer = tx.bulk_writer().build()
 
     # Insert people
     people_data = [
@@ -318,6 +347,7 @@ def test_verify_data_correctness_after_bulk_insert(social_db):
     writer.insert_edges("WORKS_AT", works_at_edges)
 
     stats = writer.commit()
+    tx.commit()
     assert stats.vertices_inserted == 5
     assert stats.edges_inserted == 4
 
@@ -378,13 +408,15 @@ def test_verify_data_correctness_after_bulk_insert(social_db):
 def test_multiple_vertex_labels_in_single_writer(social_db):
     """Test inserting multiple different vertex labels with a single writer."""
     session = social_db.session()
-    writer = session.bulk_writer().build()
+    tx = session.tx()
+    writer = tx.bulk_writer().build()
 
     # Insert different types of vertices
     writer.insert_vertices("Person", [{"name": "Alice", "age": 30}])
     writer.insert_vertices("Company", [{"name": "TechCorp"}])
 
     stats = writer.commit()
+    tx.commit()
     assert stats.vertices_inserted == 2
 
     social_db.flush()
@@ -401,7 +433,8 @@ def test_multiple_vertex_labels_in_single_writer(social_db):
 def test_bulk_insert_with_empty_data(social_db):
     """Test bulk insert with empty data arrays."""
     session = social_db.session()
-    writer = session.bulk_writer().build()
+    tx = session.tx()
+    writer = tx.bulk_writer().build()
 
     # Insert empty vertex list
     vids = writer.insert_vertices("Person", [])
@@ -412,6 +445,7 @@ def test_bulk_insert_with_empty_data(social_db):
     assert result is None
 
     stats = writer.commit()
+    tx.commit()
     assert stats.vertices_inserted == 0
     assert stats.edges_inserted == 0
 
@@ -419,7 +453,8 @@ def test_bulk_insert_with_empty_data(social_db):
 def test_bulk_insert_edges_without_properties(social_db):
     """Test bulk inserting edges without any properties."""
     session = social_db.session()
-    writer = session.bulk_writer().build()
+    tx = session.tx()
+    writer = tx.bulk_writer().build()
 
     people_data = [{"name": "Alice", "age": 30}, {"name": "Bob", "age": 25}]
     vids = writer.insert_vertices("Person", people_data)
@@ -429,6 +464,7 @@ def test_bulk_insert_edges_without_properties(social_db):
     writer.insert_edges("KNOWS", edges_data)
 
     stats = writer.commit()
+    tx.commit()
     assert stats.edges_inserted == 1
 
     social_db.flush()

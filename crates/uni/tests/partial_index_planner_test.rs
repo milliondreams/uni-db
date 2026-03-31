@@ -15,20 +15,16 @@ async fn test_partial_index_exact_match() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
     // Setup
-    db.session()
-        .execute("CREATE LABEL User (email STRING, active BOOL)")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL User (email STRING, active BOOL)")
         .await?;
-    db.session()
-        .execute("CREATE INDEX idx_active FOR (u:User) ON (u.email) WHERE u.active = true")
+    tx.execute("CREATE INDEX idx_active FOR (u:User) ON (u.email) WHERE u.active = true")
         .await?;
-
-    // Insert data
-    db.session()
-        .execute("CREATE (:User {email: 'alice@example.com', active: true})")
+    tx.execute("CREATE (:User {email: 'alice@example.com', active: true})")
         .await?;
-    db.session()
-        .execute("CREATE (:User {email: 'bob@example.com', active: false})")
+    tx.execute("CREATE (:User {email: 'bob@example.com', active: false})")
         .await?;
+    tx.commit().await?;
 
     // Query with matching predicate - should use partial index
     let result = db
@@ -52,20 +48,16 @@ async fn test_partial_index_predicate_not_matching() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
     // Setup
-    db.session()
-        .execute("CREATE LABEL User (email STRING, active BOOL)")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL User (email STRING, active BOOL)")
         .await?;
-    db.session()
-        .execute("CREATE INDEX idx_active FOR (u:User) ON (u.email) WHERE u.active = true")
+    tx.execute("CREATE INDEX idx_active FOR (u:User) ON (u.email) WHERE u.active = true")
         .await?;
-
-    // Insert data
-    db.session()
-        .execute("CREATE (:User {email: 'alice@example.com', active: true})")
+    tx.execute("CREATE (:User {email: 'alice@example.com', active: true})")
         .await?;
-    db.session()
-        .execute("CREATE (:User {email: 'bob@example.com', active: false})")
+    tx.execute("CREATE (:User {email: 'bob@example.com', active: false})")
         .await?;
+    tx.commit().await?;
 
     // Query WITHOUT the matching predicate - should NOT use partial index
     // But should still return correct results via full scan
@@ -86,17 +78,14 @@ async fn test_partial_index_with_different_variable_name() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
     // Setup - index uses 'u', query will use 'person'
-    db.session()
-        .execute("CREATE LABEL User (email STRING, active BOOL)")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL User (email STRING, active BOOL)")
         .await?;
-    db.session()
-        .execute("CREATE INDEX idx_active FOR (u:User) ON (u.email) WHERE u.active = true")
+    tx.execute("CREATE INDEX idx_active FOR (u:User) ON (u.email) WHERE u.active = true")
         .await?;
-
-    // Insert data
-    db.session()
-        .execute("CREATE (:User {email: 'alice@example.com', active: true})")
+    tx.execute("CREATE (:User {email: 'alice@example.com', active: true})")
         .await?;
+    tx.commit().await?;
 
     // Query with DIFFERENT variable name but same predicate semantics
     let result = db
@@ -120,21 +109,18 @@ async fn test_partial_index_composite_with_partial() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
     // Setup: composite partial index
-    db.session()
-        .execute("CREATE LABEL Order (status STRING, customer_id STRING, total FLOAT)")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL Order (status STRING, customer_id STRING, total FLOAT)")
         .await?;
-    db.session().execute(
+    tx.execute(
         "CREATE INDEX idx_pending FOR (o:Order) ON (o.customer_id, o.total) WHERE o.status = 'pending'",
     )
     .await?;
-
-    // Insert data
-    db.session()
-        .execute("CREATE (:Order {status: 'pending', customer_id: 'C001', total: 100.0})")
+    tx.execute("CREATE (:Order {status: 'pending', customer_id: 'C001', total: 100.0})")
         .await?;
-    db.session()
-        .execute("CREATE (:Order {status: 'completed', customer_id: 'C001', total: 200.0})")
+    tx.execute("CREATE (:Order {status: 'completed', customer_id: 'C001', total: 200.0})")
         .await?;
+    tx.commit().await?;
 
     // Query matching partial index
     let result = db
@@ -154,21 +140,18 @@ async fn test_partial_index_multiple_conjuncts() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
     // Setup: partial index with multiple conditions
-    db.session()
-        .execute("CREATE LABEL Product (name STRING, in_stock BOOL, active BOOL)")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL Product (name STRING, in_stock BOOL, active BOOL)")
         .await?;
-    db.session().execute(
+    tx.execute(
         "CREATE INDEX idx_available FOR (p:Product) ON (p.name) WHERE p.in_stock = true AND p.active = true",
     )
     .await?;
-
-    // Insert data
-    db.session()
-        .execute("CREATE (:Product {name: 'Widget', in_stock: true, active: true})")
+    tx.execute("CREATE (:Product {name: 'Widget', in_stock: true, active: true})")
         .await?;
-    db.session()
-        .execute("CREATE (:Product {name: 'Gadget', in_stock: false, active: true})")
+    tx.execute("CREATE (:Product {name: 'Gadget', in_stock: false, active: true})")
         .await?;
+    tx.commit().await?;
 
     // Query matching all index conditions
     let result = db
@@ -189,20 +172,16 @@ async fn test_partial_index_with_additional_predicates() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
     // Setup
-    db.session()
-        .execute("CREATE LABEL User (email STRING, active BOOL, age INT)")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL User (email STRING, active BOOL, age INT)")
         .await?;
-    db.session()
-        .execute("CREATE INDEX idx_active FOR (u:User) ON (u.email) WHERE u.active = true")
+    tx.execute("CREATE INDEX idx_active FOR (u:User) ON (u.email) WHERE u.active = true")
         .await?;
-
-    // Insert data
-    db.session()
-        .execute("CREATE (:User {email: 'alice@example.com', active: true, age: 30})")
+    tx.execute("CREATE (:User {email: 'alice@example.com', active: true, age: 30})")
         .await?;
-    db.session()
-        .execute("CREATE (:User {email: 'bob@example.com', active: true, age: 25})")
+    tx.execute("CREATE (:User {email: 'bob@example.com', active: true, age: 25})")
         .await?;
+    tx.commit().await?;
 
     // Query with index predicate PLUS additional predicates
     let result = db
@@ -225,20 +204,16 @@ async fn test_partial_index_different_value_no_match() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
     // Setup: index is for active = true
-    db.session()
-        .execute("CREATE LABEL User (email STRING, active BOOL)")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL User (email STRING, active BOOL)")
         .await?;
-    db.session()
-        .execute("CREATE INDEX idx_active FOR (u:User) ON (u.email) WHERE u.active = true")
+    tx.execute("CREATE INDEX idx_active FOR (u:User) ON (u.email) WHERE u.active = true")
         .await?;
-
-    // Insert data
-    db.session()
-        .execute("CREATE (:User {email: 'alice@example.com', active: true})")
+    tx.execute("CREATE (:User {email: 'alice@example.com', active: true})")
         .await?;
-    db.session()
-        .execute("CREATE (:User {email: 'bob@example.com', active: false})")
+    tx.execute("CREATE (:User {email: 'bob@example.com', active: false})")
         .await?;
+    tx.commit().await?;
 
     // Query with active = false (different value than index)
     // Should NOT use partial index but should still work

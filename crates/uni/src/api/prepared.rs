@@ -205,32 +205,7 @@ impl PreparedLocy {
         rule_registry: Arc<std::sync::RwLock<LocyRuleRegistry>>,
         program: &str,
     ) -> Result<Self> {
-        let ast = uni_cypher::parse_locy(program).map_err(|e| UniError::Parse {
-            message: format!("LocyParseError: {e}"),
-            position: None,
-            line: None,
-            column: None,
-            context: None,
-        })?;
-
-        let registry = rule_registry.read().unwrap();
-        let compiled = if registry.rules.is_empty() {
-            drop(registry);
-            uni_locy::compile(&ast).map_err(|e| UniError::Query {
-                message: format!("LocyCompileError: {e}"),
-                query: None,
-            })?
-        } else {
-            let external_names: Vec<String> = registry.rules.keys().cloned().collect();
-            drop(registry);
-            uni_locy::compile_with_external_rules(&ast, &external_names).map_err(|e| {
-                UniError::Query {
-                    message: format!("LocyCompileError: {e}"),
-                    query: None,
-                }
-            })?
-        };
-
+        let compiled = compile_locy_with_registry(program, &rule_registry)?;
         let schema_version = db.schema.schema().schema_version;
 
         Ok(Self {
@@ -309,6 +284,7 @@ impl PreparedLocy {
         let engine = crate::api::impl_locy::LocyEngine {
             db: &self.db,
             tx_l0_override: None,
+            locy_l0: None,
             collect_derive: true,
         };
         engine
@@ -334,35 +310,43 @@ impl PreparedLocy {
             return Ok(());
         }
 
-        let ast = uni_cypher::parse_locy(&self.program_text).map_err(|e| UniError::Parse {
-            message: format!("LocyParseError: {e}"),
-            position: None,
-            line: None,
-            column: None,
-            context: None,
-        })?;
-
-        let registry = self.rule_registry.read().unwrap();
-        let compiled = if registry.rules.is_empty() {
-            drop(registry);
-            uni_locy::compile(&ast).map_err(|e| UniError::Query {
-                message: format!("LocyCompileError: {e}"),
-                query: None,
-            })?
-        } else {
-            let external_names: Vec<String> = registry.rules.keys().cloned().collect();
-            drop(registry);
-            uni_locy::compile_with_external_rules(&ast, &external_names).map_err(|e| {
-                UniError::Query {
-                    message: format!("LocyCompileError: {e}"),
-                    query: None,
-                }
-            })?
-        };
-
-        inner.compiled = compiled;
+        inner.compiled = compile_locy_with_registry(&self.program_text, &self.rule_registry)?;
         inner.schema_version = current_version;
         Ok(())
+    }
+}
+
+/// Parse and compile a Locy program using the given rule registry.
+///
+/// Shared between `PreparedLocy::new()` and `PreparedLocy::ensure_compiled_fresh()`.
+fn compile_locy_with_registry(
+    program: &str,
+    rule_registry: &std::sync::RwLock<LocyRuleRegistry>,
+) -> Result<uni_locy::CompiledProgram> {
+    let ast = uni_cypher::parse_locy(program).map_err(|e| UniError::Parse {
+        message: format!("LocyParseError: {e}"),
+        position: None,
+        line: None,
+        column: None,
+        context: None,
+    })?;
+
+    let registry = rule_registry.read().unwrap();
+    if registry.rules.is_empty() {
+        drop(registry);
+        uni_locy::compile(&ast).map_err(|e| UniError::Query {
+            message: format!("LocyCompileError: {e}"),
+            query: None,
+        })
+    } else {
+        let external_names: Vec<String> = registry.rules.keys().cloned().collect();
+        drop(registry);
+        uni_locy::compile_with_external_rules(&ast, &external_names).map_err(|e| {
+            UniError::Query {
+                message: format!("LocyCompileError: {e}"),
+                query: None,
+            }
+        })
     }
 }
 

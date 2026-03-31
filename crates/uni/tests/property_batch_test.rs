@@ -54,14 +54,14 @@ async fn test_property_batch_loading() -> anyhow::Result<()> {
     props0.insert("name".to_string(), unival!("Alice"));
     props0.insert("age".to_string(), unival!(30));
     writer
-        .insert_vertex_with_labels(vid0, props0, &["Person".to_string()])
+        .insert_vertex_with_labels(vid0, props0, &["Person".to_string()], None)
         .await?;
 
     let mut props1 = HashMap::new();
     props1.insert("name".to_string(), unival!("Bob"));
     props1.insert("age".to_string(), unival!(40));
     writer
-        .insert_vertex_with_labels(vid1, props1, &["Person".to_string()])
+        .insert_vertex_with_labels(vid1, props1, &["Person".to_string()], None)
         .await?;
 
     // Flush to storage
@@ -72,7 +72,7 @@ async fn test_property_batch_loading() -> anyhow::Result<()> {
     props2.insert("name".to_string(), unival!("Charlie"));
     props2.insert("age".to_string(), unival!(20));
     writer
-        .insert_vertex_with_labels(vid2, props2, &["Person".to_string()])
+        .insert_vertex_with_labels(vid2, props2, &["Person".to_string()], None)
         .await?;
 
     // Update vid0 in L0
@@ -80,7 +80,7 @@ async fn test_property_batch_loading() -> anyhow::Result<()> {
     props0_update.insert("age".to_string(), unival!(31)); // Birthday!
     props0_update.insert("name".to_string(), unival!("Alice")); // Must provide mandatory field
     writer
-        .insert_vertex_with_labels(vid0, props0_update, &["Person".to_string()])
+        .insert_vertex_with_labels(vid0, props0_update, &["Person".to_string()], None)
         .await?;
 
     let prop_manager = PropertyManager::new(storage.clone(), schema_manager.clone(), 100);

@@ -95,7 +95,7 @@ async fn test_overlay_neighbors_via_writer() -> anyhow::Result<()> {
 
     // Insert via Writer (dual-writes to L0 data + AM overlay)
     writer
-        .insert_edge(src, dst, type_id, eid, HashMap::new(), None)
+        .insert_edge(src, dst, type_id, eid, HashMap::new(), None, None)
         .await?;
 
     // Edge should be immediately visible in AM overlay

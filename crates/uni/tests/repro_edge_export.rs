@@ -58,12 +58,14 @@ async fn test_edge_export_failure() -> anyhow::Result<()> {
             uni_db::common::core::id::Vid::new(0),
             HashMap::new(),
             &["Person".to_string()],
+            None,
         )
         .await?;
         w.insert_vertex_with_labels(
             uni_db::common::core::id::Vid::new(1),
             HashMap::new(),
             &["Person".to_string()],
+            None,
         )
         .await?;
 
@@ -77,6 +79,7 @@ async fn test_edge_export_failure() -> anyhow::Result<()> {
             1,
             eid,
             props,
+            None,
             None,
         )
         .await?;

@@ -40,9 +40,10 @@ async fn test_collection_types_storage_and_query() -> anyhow::Result<()> {
         .await?;
 
     // 3. Insert Data via Cypher (Testing parser/planner/executor for collections)
-    db.session()
-        .execute("CREATE (n:Node {tags: ['alpha', 'beta', 'gamma'], counters: {a: 10, b: 20}})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (n:Node {tags: ['alpha', 'beta', 'gamma'], counters: {a: 10, b: 20}})")
         .await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // 4. Query Data

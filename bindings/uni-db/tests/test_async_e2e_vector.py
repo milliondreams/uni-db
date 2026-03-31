@@ -158,11 +158,11 @@ async def test_cosine_metric_index(async_empty_db):
 
     session = async_empty_db.session()
 
-    await session.execute("CREATE (d:CosineDoc {title: 'Doc1', vec: [1.0, 0.0, 0.0]})")
-    await session.execute("CREATE (d:CosineDoc {title: 'Doc2', vec: [0.0, 1.0, 0.0]})")
-    await session.execute(
-        "CREATE (d:CosineDoc {title: 'Doc3', vec: [0.707, 0.707, 0.0]})"
-    )
+    tx = await session.tx()
+    await tx.execute("CREATE (d:CosineDoc {title: 'Doc1', vec: [1.0, 0.0, 0.0]})")
+    await tx.execute("CREATE (d:CosineDoc {title: 'Doc2', vec: [0.0, 1.0, 0.0]})")
+    await tx.execute("CREATE (d:CosineDoc {title: 'Doc3', vec: [0.707, 0.707, 0.0]})")
+    await tx.commit()
     await async_empty_db.flush()
 
     await (
@@ -334,15 +334,11 @@ async def test_vector_search_different_dimensions(async_empty_db):
 
     session = async_empty_db.session()
 
-    await session.execute(
-        "CREATE (d:Doc5D {name: 'A', vec5: [1.0, 0.0, 0.0, 0.0, 0.0]})"
-    )
-    await session.execute(
-        "CREATE (d:Doc5D {name: 'B', vec5: [0.0, 1.0, 0.0, 0.0, 0.0]})"
-    )
-    await session.execute(
-        "CREATE (d:Doc5D {name: 'C', vec5: [0.0, 0.0, 1.0, 0.0, 0.0]})"
-    )
+    tx = await session.tx()
+    await tx.execute("CREATE (d:Doc5D {name: 'A', vec5: [1.0, 0.0, 0.0, 0.0, 0.0]})")
+    await tx.execute("CREATE (d:Doc5D {name: 'B', vec5: [0.0, 1.0, 0.0, 0.0, 0.0]})")
+    await tx.execute("CREATE (d:Doc5D {name: 'C', vec5: [0.0, 0.0, 1.0, 0.0, 0.0]})")
+    await tx.commit()
     await async_empty_db.flush()
 
     await (
@@ -377,8 +373,10 @@ async def test_create_vector_index_l2(async_empty_db):
 
     session = async_empty_db.session()
 
-    await session.execute("CREATE (:Item {name: 'Item1', vec: [1.0, 2.0, 3.0]})")
-    await session.execute("CREATE (:Item {name: 'Item2', vec: [2.0, 3.0, 4.0]})")
+    tx = await session.tx()
+    await tx.execute("CREATE (:Item {name: 'Item1', vec: [1.0, 2.0, 3.0]})")
+    await tx.execute("CREATE (:Item {name: 'Item2', vec: [2.0, 3.0, 4.0]})")
+    await tx.commit()
     await async_empty_db.flush()
 
     await (

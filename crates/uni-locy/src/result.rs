@@ -8,10 +8,6 @@ use crate::types::{RuntimeWarning, RuntimeWarningCode};
 /// A single row of bindings from a Locy evaluation result.
 pub type FactRow = HashMap<String, Value>;
 
-/// Opaque savepoint identifier for transactional rollback.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct SavepointId(pub u64);
-
 /// The result of evaluating a compiled Locy program.
 #[derive(Debug, Clone)]
 pub struct LocyResult {

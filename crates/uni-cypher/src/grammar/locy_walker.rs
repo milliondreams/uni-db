@@ -62,7 +62,7 @@ fn build_locy_union_query(pair: Pair<LocyRule>) -> Result<Vec<LocyStatement>, Pa
 fn build_locy_single_query(pair: Pair<LocyRule>) -> Result<Vec<LocyStatement>, ParseError> {
     let inner = pair.into_inner().next().unwrap();
     match inner.as_rule() {
-        LocyRule::explain_query | LocyRule::schema_command | LocyRule::transaction_command => {
+        LocyRule::explain_query | LocyRule::schema_command => {
             // Cypher passthrough — re-parse the text
             let cypher_query = reparse_as_cypher_query(inner.as_str())?;
             Ok(vec![LocyStatement::Cypher(cypher_query)])

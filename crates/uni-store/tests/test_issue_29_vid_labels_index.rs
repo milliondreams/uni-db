@@ -41,21 +41,21 @@ async fn test_vid_labels_index_basic_functionality() -> Result<()> {
     let mut props1 = HashMap::new();
     props1.insert("name".to_string(), "Alice".into());
     writer
-        .insert_vertex_with_labels(vid1, props1, &["Person".to_string()])
+        .insert_vertex_with_labels(vid1, props1, &["Person".to_string()], None)
         .await?;
 
     let vid2 = writer.next_vid().await?;
     let mut props2 = HashMap::new();
     props2.insert("name".to_string(), "Bob".into());
     writer
-        .insert_vertex_with_labels(vid2, props2, &["Person".to_string()])
+        .insert_vertex_with_labels(vid2, props2, &["Person".to_string()], None)
         .await?;
 
     let vid3 = writer.next_vid().await?;
     let mut props3 = HashMap::new();
     props3.insert("name".to_string(), "Charlie".into());
     writer
-        .insert_vertex_with_labels(vid3, props3, &["Person".to_string()])
+        .insert_vertex_with_labels(vid3, props3, &["Person".to_string()], None)
         .await?;
 
     // Flush to storage (this should update the index)
@@ -94,7 +94,7 @@ async fn test_vid_labels_index_delete_removes_from_index() -> Result<()> {
     let mut props = HashMap::new();
     props.insert("name".to_string(), "Alice".into());
     writer
-        .insert_vertex_with_labels(vid, props, &["Person".to_string()])
+        .insert_vertex_with_labels(vid, props, &["Person".to_string()], None)
         .await?;
     writer.flush_to_l1(None).await?;
 
@@ -102,7 +102,7 @@ async fn test_vid_labels_index_delete_removes_from_index() -> Result<()> {
     assert!(storage.get_labels_from_index(vid).is_some());
 
     // Delete the vertex
-    writer.delete_vertex(vid, None).await?;
+    writer.delete_vertex(vid, None, None).await?;
     writer.flush_to_l1(None).await?;
 
     // Verify it's removed from the index
@@ -139,7 +139,7 @@ async fn test_vid_labels_index_disabled_fallback() -> Result<()> {
     let mut props = HashMap::new();
     props.insert("name".to_string(), "Alice".into());
     writer
-        .insert_vertex_with_labels(vid, props, &["Person".to_string()])
+        .insert_vertex_with_labels(vid, props, &["Person".to_string()], None)
         .await?;
     writer.flush_to_l1(None).await?;
 
@@ -178,14 +178,14 @@ async fn test_vid_labels_index_rebuild_on_open() -> Result<()> {
         let mut props1 = HashMap::new();
         props1.insert("name".to_string(), "Alice".into());
         writer
-            .insert_vertex_with_labels(vid1, props1, &["Person".to_string()])
+            .insert_vertex_with_labels(vid1, props1, &["Person".to_string()], None)
             .await?;
 
         vid2 = writer.next_vid().await?;
         let mut props2 = HashMap::new();
         props2.insert("name".to_string(), "Bob".into());
         writer
-            .insert_vertex_with_labels(vid2, props2, &["Person".to_string()])
+            .insert_vertex_with_labels(vid2, props2, &["Person".to_string()], None)
             .await?;
 
         writer.flush_to_l1(None).await?;

@@ -16,19 +16,17 @@ async fn test_quantified_pattern_fixed() -> Result<()> {
         .await?;
 
     // Create chain: (1)->(2)->(3)->(4)->(5)
-    db.session().execute("CREATE (n1:Node {id: 1}), (n2:Node {id: 2}), (n3:Node {id: 3}), (n4:Node {id: 4}), (n5:Node {id: 5})").await?;
-    db.session()
-        .execute("MATCH (n1:Node {id: 1}), (n2:Node {id: 2}) CREATE (n1)-[:NEXT]->(n2)")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (n1:Node {id: 1}), (n2:Node {id: 2}), (n3:Node {id: 3}), (n4:Node {id: 4}), (n5:Node {id: 5})").await?;
+    tx.execute("MATCH (n1:Node {id: 1}), (n2:Node {id: 2}) CREATE (n1)-[:NEXT]->(n2)")
         .await?;
-    db.session()
-        .execute("MATCH (n2:Node {id: 2}), (n3:Node {id: 3}) CREATE (n2)-[:NEXT]->(n3)")
+    tx.execute("MATCH (n2:Node {id: 2}), (n3:Node {id: 3}) CREATE (n2)-[:NEXT]->(n3)")
         .await?;
-    db.session()
-        .execute("MATCH (n3:Node {id: 3}), (n4:Node {id: 4}) CREATE (n3)-[:NEXT]->(n4)")
+    tx.execute("MATCH (n3:Node {id: 3}), (n4:Node {id: 4}) CREATE (n3)-[:NEXT]->(n4)")
         .await?;
-    db.session()
-        .execute("MATCH (n4:Node {id: 4}), (n5:Node {id: 5}) CREATE (n4)-[:NEXT]->(n5)")
+    tx.execute("MATCH (n4:Node {id: 4}), (n5:Node {id: 5}) CREATE (n4)-[:NEXT]->(n5)")
         .await?;
+    tx.commit().await?;
 
     // 2 hops: (1)->(3), (2)->(4), (3)->(5)
     let query = "MATCH ((a:Node)-[:NEXT]->(b)){2} RETURN a.id as start, b.id as end ORDER BY a.id";
@@ -57,15 +55,14 @@ async fn test_quantified_pattern_variable() -> Result<()> {
         .await?;
 
     // (1)->(2)->(3)
-    db.session()
-        .execute("CREATE (n1:Node {id: 1}), (n2:Node {id: 2}), (n3:Node {id: 3})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (n1:Node {id: 1}), (n2:Node {id: 2}), (n3:Node {id: 3})")
         .await?;
-    db.session()
-        .execute("MATCH (n1:Node {id: 1}), (n2:Node {id: 2}) CREATE (n1)-[:NEXT]->(n2)")
+    tx.execute("MATCH (n1:Node {id: 1}), (n2:Node {id: 2}) CREATE (n1)-[:NEXT]->(n2)")
         .await?;
-    db.session()
-        .execute("MATCH (n2:Node {id: 2}), (n3:Node {id: 3}) CREATE (n2)-[:NEXT]->(n3)")
+    tx.execute("MATCH (n2:Node {id: 2}), (n3:Node {id: 3}) CREATE (n2)-[:NEXT]->(n3)")
         .await?;
+    tx.commit().await?;
 
     // 1 to 2 hops from 1
     let query = "MATCH ((a:Node {id: 1})-[:NEXT]->(b)){1,2} RETURN b.id as end ORDER BY b.id";

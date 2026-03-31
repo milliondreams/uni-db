@@ -15,11 +15,12 @@ async fn test_query_cursor_streaming() -> Result<()> {
         .await?;
 
     // Insert 100 persons
+    let tx = db.session().tx().await?;
     for i in 0..100 {
-        db.session()
-            .execute(&format!("CREATE (:Person {{name: 'Person {}'}})", i))
+        tx.execute(&format!("CREATE (:Person {{name: 'Person {}'}})", i))
             .await?;
     }
+    tx.commit().await?;
 
     // Query with cursor
     let mut cursor = db
@@ -54,11 +55,12 @@ async fn test_query_cursor_streaming() -> Result<()> {
         .apply()
         .await?;
 
+    let tx2 = db2.session().tx().await?;
     for i in 0..100 {
-        db2.session()
-            .execute(&format!("CREATE (:Person {{name: 'Person {}'}})", i))
+        tx2.execute(&format!("CREATE (:Person {{name: 'Person {}'}})", i))
             .await?;
     }
+    tx2.commit().await?;
 
     let mut cursor2 = db2
         .session()

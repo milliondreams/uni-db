@@ -37,9 +37,9 @@ async fn test_lost_latest_pointer_recovers_from_manifest() -> Result<()> {
     // Create database, insert data, and flush
     {
         let db = Uni::open(path).build().await?;
-        db.session()
-            .execute("CREATE (n:Person {name: 'Alice'})")
-            .await?;
+        let tx = db.session().tx().await?;
+        tx.execute("CREATE (n:Person {name: 'Alice'})").await?;
+        tx.commit().await?;
         db.flush().await?;
     }
 
@@ -82,9 +82,9 @@ async fn test_wal_without_manifest_fails_loudly() -> Result<()> {
     // Create database and insert data (writes to WAL)
     {
         let db = Uni::open(path).build().await?;
-        db.session()
-            .execute("CREATE (n:Person {name: 'Alice'})")
-            .await?;
+        let tx = db.session().tx().await?;
+        tx.execute("CREATE (n:Person {name: 'Alice'})").await?;
+        tx.commit().await?;
         // Don't flush - data only in WAL
     }
 

@@ -15,7 +15,7 @@ use uni_cypher::locy_ast::RuleOutput;
 use uni_locy::types::CompiledCommand;
 use uni_locy::{
     CommandResult, CompiledProgram, DerivedFactSet, FactRow, LocyCompileError, LocyConfig,
-    LocyError, LocyStats, RuntimeWarning, SavepointId, compile,
+    LocyError, LocyStats, RuntimeWarning, compile,
 };
 use uni_query::{QueryMetrics, QueryPlanner};
 
@@ -63,8 +63,7 @@ pub(crate) fn register_rules_on_registry(
     }
     let base_id = registry.strata.len();
     for mut stratum in compiled.strata {
-        let old_id = stratum.id;
-        stratum.id = base_id + old_id;
+        stratum.id += base_id;
         stratum.depends_on = stratum.depends_on.iter().map(|d| base_id + d).collect();
         registry.strata.push(stratum);
     }
@@ -119,9 +118,19 @@ pub(crate) async fn evaluate_with_db_and_config(
 
     // Create a LocyEngine directly from &UniInner.
     // Session-level: collect DERIVE output for deferred materialization.
+    // Always create an ephemeral locy_l0 for the evaluation scope — this provides:
+    // - DERIVE visibility: trailing Cypher sees DERIVE mutations
+    // - ASSUME/ABDUCE isolation: fork/restore from this buffer
+    let locy_l0 = if let Some(ref writer) = db.writer {
+        let w = writer.read().await;
+        Some(w.create_transaction_l0())
+    } else {
+        None // Read-only DB: degrade gracefully
+    };
     let engine = LocyEngine {
         db,
-        tx_l0_override: None,
+        tx_l0_override: locy_l0.clone(),
+        locy_l0,
         collect_derive: true,
     };
     engine.evaluate_compiled_with_config(compiled, config).await
@@ -133,6 +142,11 @@ pub struct LocyEngine<'a> {
     /// When set, the engine routes reads/writes through this private L0 buffer
     /// (commit-time serialization for transactions).
     pub(crate) tx_l0_override: Option<Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
+    /// Ephemeral L0 buffer for Locy evaluation scope.
+    /// Session path: ephemeral per-locy() buffer (DERIVE writes here, discarded on return).
+    /// Transaction path: same as tx_l0 (DERIVE auto-applies).
+    /// ASSUME/ABDUCE fork from here via fork_l0/restore_l0.
+    pub(crate) locy_l0: Option<Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
     /// When true, DERIVE commands collect ASTs + data instead of executing.
     /// Session-level evaluation sets this to true; transaction-level sets false.
     pub(crate) collect_derive: bool,
@@ -147,6 +161,7 @@ impl crate::api::Uni {
         LocyEngine {
             db: &self.inner,
             tx_l0_override: None,
+            locy_l0: None,
             collect_derive: true,
         }
     }
@@ -186,8 +201,7 @@ impl<'a> LocyEngine<'a> {
         // Merge strata, assigning new IDs to avoid collisions.
         let base_id = registry.strata.len();
         for mut stratum in compiled.strata {
-            let old_id = stratum.id;
-            stratum.id = base_id + old_id;
+            stratum.id += base_id;
             stratum.depends_on = stratum.depends_on.iter().map(|d| base_id + d).collect();
             registry.strata.push(stratum);
         }
@@ -423,6 +437,8 @@ impl<'a> LocyEngine<'a> {
             config.params.clone(),
             self.tx_l0_override.clone(),
         );
+        // Propagate locy_l0 to the adapter for DERIVE/ASSUME/ABDUCE scoping.
+        *native_ctx.locy_l0.lock().unwrap() = self.locy_l0.clone();
         let mut locy_stats = LocyStats {
             total_iterations: iteration_counts_slot
                 .read()
@@ -577,6 +593,11 @@ impl<'a> LocyEngine<'a> {
         if let Some(ref w) = self.db.writer {
             df_executor.set_writer(w.clone());
         }
+        // Pass the tx_l0_override so the fixpoint planner sees uncommitted mutations
+        // (ASSUME/ABDUCE hypothetical state, session DERIVE mutations, etc.)
+        if let Some(ref l0) = self.tx_l0_override {
+            df_executor.set_transaction_l0(l0.clone());
+        }
         df_executor.set_xervo_runtime(self.db.xervo_runtime.clone());
         df_executor.set_procedure_registry(self.db.procedure_registry.clone());
 
@@ -621,9 +642,12 @@ struct NativeExecutionAdapter<'a> {
     params: HashMap<String, Value>,
     /// Private transaction L0 override for commit-time serialization.
     tx_l0_override: Option<Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
-    /// Set to true during savepoint execution to bypass tx_l0_override.
-    /// Savepoints use writer.transaction_l0 directly for hypothetical mutations.
-    savepoint_active: std::sync::atomic::AtomicBool,
+    /// Locy-scoped L0 buffer. DERIVE mutations go here. ASSUME/ABDUCE fork from here.
+    /// Protected by std::sync::Mutex for interior mutability (fork/restore swap the Arc).
+    locy_l0: std::sync::Mutex<Option<Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>>,
+    /// Stack of saved L0 states for nested fork/restore (ASSUME inside ASSUME).
+    l0_save_stack:
+        std::sync::Mutex<Vec<Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>>,
 }
 
 impl<'a> NativeExecutionAdapter<'a> {
@@ -644,7 +668,8 @@ impl<'a> NativeExecutionAdapter<'a> {
             session_ctx,
             params,
             tx_l0_override,
-            savepoint_active: std::sync::atomic::AtomicBool::new(false),
+            locy_l0: std::sync::Mutex::new(None),
+            l0_save_stack: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -712,16 +737,15 @@ impl DerivedFactSource for NativeExecutionAdapter<'_> {
                     message: e.to_string(),
                 })?;
 
-        // When a transaction L0 override or savepoint transaction is active, the stored
-        // graph_ctx may not include the transaction-local L0 buffer. Rebuild a temporary
-        // context that includes it so pattern queries see the uncommitted state.
-        let tx_l0_for_ctx = self.tx_l0_override.clone().or_else(|| {
-            self.db.writer.as_ref().and_then(|w| {
-                w.try_read()
-                    .ok()
-                    .and_then(|writer| writer.transaction_l0.clone())
-            })
-        });
+        // When a locy_l0 or transaction L0 is active, the stored graph_ctx may not
+        // include the local L0 buffer. Rebuild a temporary context that includes it
+        // so pattern queries see the uncommitted/hypothetical state.
+        let tx_l0_for_ctx = self
+            .locy_l0
+            .lock()
+            .unwrap()
+            .clone()
+            .or_else(|| self.tx_l0_override.clone());
         let transaction_ctx: Option<Arc<uni_query::query::df_graph::GraphExecutionContext>> =
             if let Some(tx_l0) = tx_l0_for_ctx {
                 if let Some(writer_arc) = &self.db.writer {
@@ -874,15 +898,37 @@ impl LocyExecutionContext for NativeExecutionAdapter<'_> {
         &self,
         ast: Query,
     ) -> std::result::Result<Vec<FactRow>, LocyError> {
-        // Must use execute_ast_internal (fresh SessionContext) so that savepoint
-        // mutations applied during ASSUME/ABDUCE body dispatch are visible.
-        let result = self
-            .db
-            .execute_ast_internal(ast, "<locy>", HashMap::new(), self.db.config.clone())
-            .await
-            .map_err(|e| LocyError::ExecutorError {
-                message: e.to_string(),
-            })?;
+        // Route through locy_l0 so trailing Cypher sees DERIVE/ASSUME mutations.
+        // locy_l0 is the "active" L0 for this evaluation scope.
+        let active_l0 = self.locy_l0.lock().unwrap().clone();
+        let result = if let Some(ref l0) = active_l0 {
+            self.db
+                .execute_ast_internal_with_tx_l0(
+                    ast,
+                    "<locy>",
+                    HashMap::new(),
+                    self.db.config.clone(),
+                    l0.clone(),
+                )
+                .await
+        } else if let Some(ref tx_l0) = self.tx_l0_override {
+            self.db
+                .execute_ast_internal_with_tx_l0(
+                    ast,
+                    "<locy>",
+                    HashMap::new(),
+                    self.db.config.clone(),
+                    tx_l0.clone(),
+                )
+                .await
+        } else {
+            self.db
+                .execute_ast_internal(ast, "<locy>", HashMap::new(), self.db.config.clone())
+                .await
+        }
+        .map_err(|e| LocyError::ExecutorError {
+            message: e.to_string(),
+        })?;
         Ok(result
             .into_rows()
             .into_iter()
@@ -898,12 +944,26 @@ impl LocyExecutionContext for NativeExecutionAdapter<'_> {
         ast: Query,
         params: HashMap<String, Value>,
     ) -> std::result::Result<usize, LocyError> {
-        // When a savepoint is active, bypass tx_l0_override so mutations go to
-        // the writer's savepoint L0 (hypothetical buffer that can be rolled back).
-        let use_override = !self
-            .savepoint_active
-            .load(std::sync::atomic::Ordering::Relaxed);
-        if use_override && let Some(ref tx_l0) = self.tx_l0_override {
+        // Route through locy_l0 for all mutations within this evaluation scope.
+        let active_l0 = self.locy_l0.lock().unwrap().clone();
+        if let Some(ref l0) = active_l0 {
+            let before = l0.read().mutation_count;
+            self.db
+                .execute_ast_internal_with_tx_l0(
+                    ast,
+                    "<locy>",
+                    params,
+                    self.db.config.clone(),
+                    l0.clone(),
+                )
+                .await
+                .map_err(|e| LocyError::ExecutorError {
+                    message: e.to_string(),
+                })?;
+            let after = l0.read().mutation_count;
+            return Ok(after.saturating_sub(before));
+        }
+        if let Some(ref tx_l0) = self.tx_l0_override {
             let before = tx_l0.read().mutation_count;
             self.db
                 .execute_ast_internal_with_tx_l0(
@@ -920,7 +980,7 @@ impl LocyExecutionContext for NativeExecutionAdapter<'_> {
             let after = tx_l0.read().mutation_count;
             return Ok(after.saturating_sub(before));
         }
-        // Standard path: mutations go through writer.active_l0()
+        // Standard path: mutations go through writer's global L0
         let before = self.db.get_mutation_count().await;
         self.db
             .execute_ast_internal(ast, "<locy>", params, self.db.config.clone())
@@ -932,41 +992,30 @@ impl LocyExecutionContext for NativeExecutionAdapter<'_> {
         Ok(after.saturating_sub(before))
     }
 
-    async fn begin_savepoint(&self) -> std::result::Result<SavepointId, LocyError> {
-        let writer = self
-            .db
-            .writer
-            .as_ref()
-            .ok_or_else(|| LocyError::SavepointFailed {
-                message: "database is read-only".to_string(),
-            })?;
-        let mut w = writer.write().await;
-        w.begin_transaction()
-            .map_err(|e| LocyError::SavepointFailed {
-                message: e.to_string(),
-            })?;
-        // While savepoint is active, bypass tx_l0_override so mutations go to
-        // the writer's savepoint L0 rather than the outer transaction's L0.
-        self.savepoint_active
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        Ok(SavepointId(0))
+    async fn fork_l0(&self) -> std::result::Result<(), LocyError> {
+        let mut guard = self.locy_l0.lock().unwrap();
+        let current = guard.as_ref().ok_or_else(|| LocyError::SavepointFailed {
+            message: "no active Locy L0 to fork".into(),
+        })?;
+        // Clone the current L0 buffer (deep copy — forked WAL is None)
+        let cloned = Arc::new(parking_lot::RwLock::new(current.read().clone()));
+        // Save the original, replace with the clone for hypothetical mutations
+        let previous = guard.replace(cloned).unwrap();
+        self.l0_save_stack.lock().unwrap().push(previous);
+        Ok(())
     }
 
-    async fn rollback_savepoint(&self, _id: SavepointId) -> std::result::Result<(), LocyError> {
-        let writer = self
-            .db
-            .writer
-            .as_ref()
-            .ok_or_else(|| LocyError::SavepointFailed {
-                message: "database is read-only".to_string(),
-            })?;
-        let mut w = writer.write().await;
-        w.rollback_transaction()
-            .map_err(|e| LocyError::SavepointFailed {
-                message: e.to_string(),
-            })?;
-        self.savepoint_active
-            .store(false, std::sync::atomic::Ordering::Relaxed);
+    async fn restore_l0(&self) -> std::result::Result<(), LocyError> {
+        let saved =
+            self.l0_save_stack
+                .lock()
+                .unwrap()
+                .pop()
+                .ok_or_else(|| LocyError::SavepointFailed {
+                    message: "no saved L0 to restore".into(),
+                })?;
+        let mut guard = self.locy_l0.lock().unwrap();
+        *guard = Some(saved);
         Ok(())
     }
 
@@ -981,9 +1030,12 @@ impl LocyExecutionContext for NativeExecutionAdapter<'_> {
             warnings: vec![],
             commands: vec![],
         };
+        // Pass the current locy_l0 so re-evaluation sees hypothetical state.
+        let locy_l0 = self.locy_l0.lock().unwrap().clone();
         let engine = LocyEngine {
             db: self.db,
-            tx_l0_override: None,
+            tx_l0_override: locy_l0.clone(),
+            locy_l0,
             collect_derive: false,
         };
         let native_store = engine
@@ -1059,12 +1111,25 @@ fn dispatch_native_command<'a>(
             }
             CompiledCommand::DeriveCommand(dc) => {
                 if collect_derive {
-                    // Session path: collect ASTs + data for deferred materialization
+                    // Session path: collect ASTs + data for deferred materialization.
                     let output = uni_query::query::df_graph::locy_derive::collect_derive_facts(
                         dc, program, ctx,
                     )
                     .await?;
                     let affected = output.affected;
+
+                    // Replay mutations to the ephemeral L0 so that subsequent
+                    // trailing Cypher commands can read the derived edges.
+                    // Guard: skip when no L0 exists (read-only DB).
+                    // Replay mutations to the ephemeral L0 so that subsequent
+                    // trailing Cypher commands can read the derived edges.
+                    // Guard: skip when no L0 exists (read-only DB).
+                    if ctx.tx_l0_override.is_some() {
+                        for query in &output.queries {
+                            ctx.execute_mutation(query.clone(), HashMap::new()).await?;
+                        }
+                    }
+
                     collected_derives.push(output);
                     Ok(CommandResult::Derive { affected })
                 } else {

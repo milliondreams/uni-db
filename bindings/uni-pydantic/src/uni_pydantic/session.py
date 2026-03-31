@@ -640,10 +640,12 @@ class UniSession:
                 # Convert to property dicts
                 prop_dicts = [e.to_properties() for e in group]
 
-                # Bulk insert
-                with self._db_session.bulk_writer().build() as bw:
+                # Bulk insert via transaction
+                tx = self._db_session.tx()
+                with tx.bulk_writer().build() as bw:
                     vids = bw.insert_vertices(label, prop_dicts)
                     bw.commit()
+                tx.commit()
 
                 # Attach sessions and record VIDs
                 for entity, vid in zip(group, vids):
@@ -662,9 +664,7 @@ class UniSession:
         """Get the query execution plan without running it."""
         return self._db_session.explain(cypher)
 
-    def profile(
-        self, cypher: str
-    ) -> tuple[uni_db.QueryResult, uni_db.ProfileOutput]:
+    def profile(self, cypher: str) -> tuple[uni_db.QueryResult, uni_db.ProfileOutput]:
         """Run the query with profiling and return results + stats."""
         return self._db_session.profile(cypher)
 

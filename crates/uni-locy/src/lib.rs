@@ -13,6 +13,6 @@ pub use config::LocyConfig;
 pub use errors::LocyError;
 pub use result::{
     AbductionResult, CommandResult, DerivationNode, DerivedEdge, DerivedFactSet, FactRow,
-    LocyResult, LocyStats, Modification, SavepointId, ValidatedModification,
+    LocyResult, LocyStats, Modification, ValidatedModification,
 };
 pub use types::{CompiledCommand, CompiledProgram, RuntimeWarning, RuntimeWarningCode};

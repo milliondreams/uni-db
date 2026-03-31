@@ -9,14 +9,13 @@ async fn test_expression_index() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
     // 1. Create label
-    db.session()
-        .execute("CREATE LABEL User (email STRING)")
-        .await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL User (email STRING)").await?;
 
     // 2. Create Expression Index
-    db.session()
-        .execute("CREATE INDEX lower_email FOR (u:User) ON (lower(u.email))")
+    tx.execute("CREATE INDEX lower_email FOR (u:User) ON (lower(u.email))")
         .await?;
+    tx.commit().await?;
 
     // 3. Verify schema metadata
     let schema = db.get_schema();
@@ -50,9 +49,10 @@ async fn test_expression_index() -> Result<()> {
     assert_eq!(meta.generation_expression, Some(original_expr.to_string()));
 
     // 4. Insert Data (should compute generated column)
-    db.session()
-        .execute("CREATE (:User {email: 'Alice@Example.com'})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:User {email: 'Alice@Example.com'})")
         .await?;
+    tx.commit().await?;
 
     // 5. Verify data (querying generated column directly)
     // Use ALIAS because default column name includes variable prefix (e.g. "u._gen...")

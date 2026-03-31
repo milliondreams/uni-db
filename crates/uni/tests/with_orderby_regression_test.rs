@@ -391,9 +391,11 @@ async fn wo1_20_sort_datetimes_tz_desc() -> Result<()> {
 #[tokio::test]
 async fn wo1_23_sort_bool_property_asc() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session().execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (:A {bool: true}), (:B {bool: false}), (:C {bool: false}), (:D {bool: true}), (:E {bool: false})",
     ).await?;
+    tx.commit().await?;
     let r = db
         .session()
         .query("MATCH (a) WITH a, a.bool AS bool WITH a, bool ORDER BY bool LIMIT 3 RETURN bool")
@@ -410,9 +412,11 @@ async fn wo1_23_sort_bool_property_asc() -> Result<()> {
 #[tokio::test]
 async fn wo1_24_sort_bool_property_desc() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session().execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (:A {bool: true}), (:B {bool: false}), (:C {bool: false}), (:D {bool: true}), (:E {bool: false})",
     ).await?;
+    tx.commit().await?;
     let r = db
         .session()
         .query(
@@ -431,10 +435,12 @@ async fn wo1_24_sort_bool_property_desc() -> Result<()> {
 #[tokio::test]
 async fn wo1_25_sort_int_property_asc() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session().execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (:A {num: 9}), (:B {num: 5}), (:C {num: 30}), (:D {num: -11}), (:E {num: 7054})",
     )
     .await?;
+    tx.commit().await?;
     let r = db
         .session()
         .query("MATCH (a) WITH a, a.num AS num WITH a, num ORDER BY num LIMIT 3 RETURN num")
@@ -450,10 +456,12 @@ async fn wo1_25_sort_int_property_asc() -> Result<()> {
 #[tokio::test]
 async fn wo1_26_sort_int_property_desc() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session().execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (:A {num: 9}), (:B {num: 5}), (:C {num: 30}), (:D {num: -11}), (:E {num: 7054})",
     )
     .await?;
+    tx.commit().await?;
     let r = db
         .session()
         .query("MATCH (a) WITH a, a.num AS num WITH a, num ORDER BY num DESC LIMIT 3 RETURN num")
@@ -469,9 +477,11 @@ async fn wo1_26_sort_int_property_desc() -> Result<()> {
 #[tokio::test]
 async fn wo1_27_sort_float_property_asc() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session().execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (:A {num: 5.025648}), (:B {num: 30.94857}), (:C {num: 30.94856}), (:D {num: -11.2943}), (:E {num: 7054.008})",
     ).await?;
+    tx.commit().await?;
     let r = db
         .session()
         .query("MATCH (a) WITH a, a.num AS num WITH a, num ORDER BY num LIMIT 3 RETURN num")
@@ -494,9 +504,11 @@ async fn wo1_27_sort_float_property_asc() -> Result<()> {
 #[tokio::test]
 async fn wo1_28_sort_float_property_desc() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session().execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (:A {num: 5.025648}), (:B {num: 30.94857}), (:C {num: 30.94856}), (:D {num: -11.2943}), (:E {num: 7054.008})",
     ).await?;
+    tx.commit().await?;
     let r = db
         .session()
         .query("MATCH (a) WITH a, a.num AS num WITH a, num ORDER BY num DESC LIMIT 3 RETURN num")
@@ -514,9 +526,11 @@ async fn wo1_28_sort_float_property_desc() -> Result<()> {
 #[tokio::test]
 async fn wo1_29_sort_string_property_asc() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session().execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (:A {name: 'lorem'}), (:B {name: 'ipsum'}), (:C {name: 'dolor'}), (:D {name: 'sit'}), (:E {name: 'amet'})",
     ).await?;
+    tx.commit().await?;
     let r = db
         .session()
         .query("MATCH (a) WITH a, a.name AS name WITH a, name ORDER BY name LIMIT 3 RETURN name")
@@ -532,9 +546,11 @@ async fn wo1_29_sort_string_property_asc() -> Result<()> {
 #[tokio::test]
 async fn wo1_30_sort_string_property_desc() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session().execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (:A {name: 'lorem'}), (:B {name: 'ipsum'}), (:C {name: 'dolor'}), (:D {name: 'sit'}), (:E {name: 'amet'})",
     ).await?;
+    tx.commit().await?;
     let r = db
         .session()
         .query(
@@ -552,16 +568,17 @@ async fn wo1_30_sort_string_property_desc() -> Result<()> {
 #[tokio::test]
 async fn wo1_33_sort_date_property_asc() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session()
-        .execute(
-            "CREATE (:A {date: date({year: 1910, month: 5, day: 6})}),
+    let tx = db.session().tx().await?;
+    tx.execute(
+        "CREATE (:A {date: date({year: 1910, month: 5, day: 6})}),
                 (:B {date: date({year: 1980, month: 12, day: 24})}),
                 (:C {date: date({year: 1984, month: 10, day: 12})}),
                 (:D {date: date({year: 1985, month: 5, day: 6})}),
                 (:E {date: date({year: 1980, month: 10, day: 24})}),
                 (:F {date: date({year: 1984, month: 10, day: 11})})",
-        )
-        .await?;
+    )
+    .await?;
+    tx.commit().await?;
     let r = db
         .session()
         .query("MATCH (a) WITH a, a.date AS date WITH a, date ORDER BY date LIMIT 2 RETURN date")
@@ -576,16 +593,17 @@ async fn wo1_33_sort_date_property_asc() -> Result<()> {
 #[tokio::test]
 async fn wo1_34_sort_date_property_desc() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session()
-        .execute(
-            "CREATE (:A {date: date({year: 1910, month: 5, day: 6})}),
+    let tx = db.session().tx().await?;
+    tx.execute(
+        "CREATE (:A {date: date({year: 1910, month: 5, day: 6})}),
                 (:B {date: date({year: 1980, month: 12, day: 24})}),
                 (:C {date: date({year: 1984, month: 10, day: 12})}),
                 (:D {date: date({year: 1985, month: 5, day: 6})}),
                 (:E {date: date({year: 1980, month: 10, day: 24})}),
                 (:F {date: date({year: 1984, month: 10, day: 11})})",
-        )
-        .await?;
+    )
+    .await?;
+    tx.commit().await?;
     let r = db
         .session()
         .query(
@@ -602,15 +620,16 @@ async fn wo1_34_sort_date_property_desc() -> Result<()> {
 #[tokio::test]
 async fn wo1_35_sort_localtime_property_asc() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session()
-        .execute(
-            "CREATE (:A {time: localtime({hour: 10, minute: 35})}),
+    let tx = db.session().tx().await?;
+    tx.execute(
+        "CREATE (:A {time: localtime({hour: 10, minute: 35})}),
                 (:B {time: localtime({hour: 12, minute: 31, second: 14, nanosecond: 645876123})}),
                 (:C {time: localtime({hour: 12, minute: 31, second: 14, nanosecond: 645876124})}),
                 (:D {time: localtime({hour: 12, minute: 30, second: 14, nanosecond: 645876123})}),
                 (:E {time: localtime({hour: 12, minute: 31, second: 15})})",
-        )
-        .await?;
+    )
+    .await?;
+    tx.commit().await?;
     let r = db
         .session()
         .query("MATCH (a) WITH a, a.time AS time WITH a, time ORDER BY time LIMIT 3 RETURN time")
@@ -625,13 +644,15 @@ async fn wo1_35_sort_localtime_property_asc() -> Result<()> {
 #[tokio::test]
 async fn wo1_39_sort_localdatetime_property_asc() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session().execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (:A {datetime: localdatetime({year: 1984, month: 10, day: 11, hour: 12, minute: 30, second: 14, nanosecond: 12})}),
                 (:B {datetime: localdatetime({year: 1984, month: 10, day: 11, hour: 12, minute: 31, second: 14, nanosecond: 645876123})}),
                 (:C {datetime: localdatetime({year: 1, month: 1, day: 1, hour: 1, minute: 1, second: 1, nanosecond: 1})}),
                 (:D {datetime: localdatetime({year: 9999, month: 9, day: 9, hour: 9, minute: 59, second: 59, nanosecond: 999999999})}),
                 (:E {datetime: localdatetime({year: 1980, month: 12, day: 11, hour: 12, minute: 31, second: 14})})",
     ).await?;
+    tx.commit().await?;
     let r = db.session().query(
         "MATCH (a) WITH a, a.datetime AS datetime WITH a, datetime ORDER BY datetime LIMIT 3 RETURN datetime",
     ).await?;
@@ -661,13 +682,15 @@ async fn wo1_39_sort_localdatetime_property_asc() -> Result<()> {
 #[tokio::test]
 async fn wo1_40_sort_localdatetime_property_desc() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session().execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (:A {datetime: localdatetime({year: 1984, month: 10, day: 11, hour: 12, minute: 30, second: 14, nanosecond: 12})}),
                 (:B {datetime: localdatetime({year: 1984, month: 10, day: 11, hour: 12, minute: 31, second: 14, nanosecond: 645876123})}),
                 (:C {datetime: localdatetime({year: 1, month: 1, day: 1, hour: 1, minute: 1, second: 1, nanosecond: 1})}),
                 (:D {datetime: localdatetime({year: 9999, month: 9, day: 9, hour: 9, minute: 59, second: 59, nanosecond: 999999999})}),
                 (:E {datetime: localdatetime({year: 1980, month: 12, day: 11, hour: 12, minute: 31, second: 14})})",
     ).await?;
+    tx.commit().await?;
     let r = db.session().query(
         "MATCH (a) WITH a, a.datetime AS datetime WITH a, datetime ORDER BY datetime DESC LIMIT 3 RETURN datetime",
     ).await?;
@@ -687,13 +710,15 @@ async fn wo1_40_sort_localdatetime_property_desc() -> Result<()> {
 #[tokio::test]
 async fn wo1_41_sort_datetime_tz_property_asc() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session().execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (:A {datetime: datetime({year: 1984, month: 10, day: 11, hour: 12, minute: 30, second: 14, nanosecond: 12, timezone: '+00:15'})}),
                 (:B {datetime: datetime({year: 1984, month: 10, day: 11, hour: 12, minute: 31, second: 14, nanosecond: 645876123, timezone: '+00:17'})}),
                 (:C {datetime: datetime({year: 1, month: 1, day: 1, hour: 1, minute: 1, second: 1, nanosecond: 1, timezone: '-11:59'})}),
                 (:D {datetime: datetime({year: 9999, month: 9, day: 9, hour: 9, minute: 59, second: 59, nanosecond: 999999999, timezone: '+11:59'})}),
                 (:E {datetime: datetime({year: 1980, month: 12, day: 11, hour: 12, minute: 31, second: 14, timezone: '-11:59'})})",
     ).await?;
+    tx.commit().await?;
     let r = db.session().query(
         "MATCH (a) WITH a, a.datetime AS datetime WITH a, datetime ORDER BY datetime LIMIT 3 RETURN datetime",
     ).await?;
@@ -718,13 +743,15 @@ async fn wo1_41_sort_datetime_tz_property_asc() -> Result<()> {
 #[tokio::test]
 async fn wo1_42_sort_datetime_tz_property_desc() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session().execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (:A {datetime: datetime({year: 1984, month: 10, day: 11, hour: 12, minute: 30, second: 14, nanosecond: 12, timezone: '+00:15'})}),
                 (:B {datetime: datetime({year: 1984, month: 10, day: 11, hour: 12, minute: 31, second: 14, nanosecond: 645876123, timezone: '+00:17'})}),
                 (:C {datetime: datetime({year: 1, month: 1, day: 1, hour: 1, minute: 1, second: 1, nanosecond: 1, timezone: '-11:59'})}),
                 (:D {datetime: datetime({year: 9999, month: 9, day: 9, hour: 9, minute: 59, second: 59, nanosecond: 999999999, timezone: '+11:59'})}),
                 (:E {datetime: datetime({year: 1980, month: 12, day: 11, hour: 12, minute: 31, second: 14, timezone: '-11:59'})})",
     ).await?;
+    tx.commit().await?;
     let r = db.session().query(
         "MATCH (a) WITH a, a.datetime AS datetime WITH a, datetime ORDER BY datetime DESC LIMIT 3 RETURN datetime",
     ).await?;
@@ -981,9 +1008,11 @@ async fn wo1_45_sort_consistency_datetimes() -> Result<()> {
 #[tokio::test]
 async fn wo2_03_sort_int_expr_asc() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session().execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (:A {num: 9, num2: 5}), (:B {num: 5, num2: 4}), (:C {num: 30, num2: 3}), (:D {num: -11, num2: 2}), (:E {num: 7054, num2: 1})",
     ).await?;
+    tx.commit().await?;
     let r = db
         .session()
         .query(
@@ -1008,9 +1037,11 @@ async fn wo2_03_sort_int_expr_asc() -> Result<()> {
 #[tokio::test]
 async fn wo2_04_sort_int_expr_desc() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session().execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (:A {num: 9, num2: 5}), (:B {num: 5, num2: 4}), (:C {num: 30, num2: 3}), (:D {num: -11, num2: 2}), (:E {num: 7054, num2: 1})",
     ).await?;
+    tx.commit().await?;
     let r = db
         .session()
         .query(
@@ -1033,9 +1064,11 @@ async fn wo2_04_sort_int_expr_desc() -> Result<()> {
 #[tokio::test]
 async fn wo2_05_sort_float_expr_asc() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session().execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (:A {num: 5.025648, num2: 1.96357}), (:B {num: 30.94857, num2: 0.00002}), (:C {num: 30.94856, num2: 0.00002}), (:D {num: -11.2943, num2: -8.5007}), (:E {num: 7054.008, num2: 948.841})",
     ).await?;
+    tx.commit().await?;
     let r = db
         .session()
         .query(
@@ -1061,9 +1094,11 @@ async fn wo2_05_sort_float_expr_asc() -> Result<()> {
 #[tokio::test]
 async fn wo2_07_sort_string_expr_asc() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session().execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (:A {name: 'lorem', title: 'dr.'}), (:B {name: 'ipsum', title: 'dr.'}), (:C {name: 'dolor', title: 'prof.'}), (:D {name: 'sit', title: 'dr.'}), (:E {name: 'amet', title: 'prof.'})",
     ).await?;
+    tx.commit().await?;
     let r = db
         .session()
         .query(
@@ -1099,9 +1134,11 @@ async fn wo2_07_sort_string_expr_asc() -> Result<()> {
 #[tokio::test]
 async fn wo2_08_sort_string_expr_desc() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session().execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (:A {name: 'lorem', title: 'dr.'}), (:B {name: 'ipsum', title: 'dr.'}), (:C {name: 'dolor', title: 'prof.'}), (:D {name: 'sit', title: 'dr.'}), (:E {name: 'amet', title: 'prof.'})",
     ).await?;
+    tx.commit().await?;
     let r = db
         .session()
         .query(
@@ -1136,16 +1173,17 @@ async fn wo2_08_sort_string_expr_desc() -> Result<()> {
 #[tokio::test]
 async fn wo2_11_sort_date_expr_asc() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session()
-        .execute(
-            "CREATE (:A {date: date({year: 1910, month: 5, day: 6})}),
+    let tx = db.session().tx().await?;
+    tx.execute(
+        "CREATE (:A {date: date({year: 1910, month: 5, day: 6})}),
                 (:B {date: date({year: 1980, month: 12, day: 24})}),
                 (:C {date: date({year: 1984, month: 10, day: 12})}),
                 (:D {date: date({year: 1985, month: 5, day: 6})}),
                 (:E {date: date({year: 1980, month: 10, day: 24})}),
                 (:F {date: date({year: 1984, month: 10, day: 11})})",
-        )
-        .await?;
+    )
+    .await?;
+    tx.commit().await?;
     let r = db
         .session()
         .query(
@@ -1164,13 +1202,15 @@ async fn wo2_11_sort_date_expr_asc() -> Result<()> {
 #[tokio::test]
 async fn wo2_17_sort_localdatetime_expr_asc() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session().execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (:A {datetime: localdatetime({year: 1984, month: 10, day: 11, hour: 12, minute: 30, second: 14, nanosecond: 12})}),
                 (:B {datetime: localdatetime({year: 1984, month: 10, day: 11, hour: 12, minute: 31, second: 14, nanosecond: 645876123})}),
                 (:C {datetime: localdatetime({year: 1, month: 1, day: 1, hour: 1, minute: 1, second: 1, nanosecond: 1})}),
                 (:D {datetime: localdatetime({year: 9999, month: 9, day: 9, hour: 9, minute: 59, second: 59, nanosecond: 999999999})}),
                 (:E {datetime: localdatetime({year: 1980, month: 12, day: 11, hour: 12, minute: 31, second: 14})})",
     ).await?;
+    tx.commit().await?;
     let r = db
         .session()
         .query(
@@ -1200,13 +1240,15 @@ async fn wo2_17_sort_localdatetime_expr_asc() -> Result<()> {
 #[tokio::test]
 async fn wo2_18_sort_localdatetime_expr_desc() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session().execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (:A {datetime: localdatetime({year: 1984, month: 10, day: 11, hour: 12, minute: 30, second: 14, nanosecond: 12})}),
                 (:B {datetime: localdatetime({year: 1984, month: 10, day: 11, hour: 12, minute: 31, second: 14, nanosecond: 645876123})}),
                 (:C {datetime: localdatetime({year: 1, month: 1, day: 1, hour: 1, minute: 1, second: 1, nanosecond: 1})}),
                 (:D {datetime: localdatetime({year: 9999, month: 9, day: 9, hour: 9, minute: 59, second: 59, nanosecond: 999999999})}),
                 (:E {datetime: localdatetime({year: 1980, month: 12, day: 11, hour: 12, minute: 31, second: 14})})",
     ).await?;
+    tx.commit().await?;
     let r = db
         .session()
         .query(
@@ -1231,13 +1273,15 @@ async fn wo2_18_sort_localdatetime_expr_desc() -> Result<()> {
 #[tokio::test]
 async fn wo2_19_sort_datetime_tz_expr_asc() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session().execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (:A {datetime: datetime({year: 1984, month: 10, day: 11, hour: 12, minute: 30, second: 14, nanosecond: 12, timezone: '+00:15'})}),
                 (:B {datetime: datetime({year: 1984, month: 10, day: 11, hour: 12, minute: 31, second: 14, nanosecond: 645876123, timezone: '+00:17'})}),
                 (:C {datetime: datetime({year: 1, month: 1, day: 1, hour: 1, minute: 1, second: 1, nanosecond: 1, timezone: '-11:59'})}),
                 (:D {datetime: datetime({year: 9999, month: 9, day: 9, hour: 9, minute: 59, second: 59, nanosecond: 999999999, timezone: '+11:59'})}),
                 (:E {datetime: datetime({year: 1980, month: 12, day: 11, hour: 12, minute: 31, second: 14, timezone: '-11:59'})})",
     ).await?;
+    tx.commit().await?;
     let r = db
         .session()
         .query(
@@ -1262,9 +1306,10 @@ async fn wo2_19_sort_datetime_tz_expr_asc() -> Result<()> {
 #[tokio::test]
 async fn wo2_21_sort_partially_orderable_string_asc() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session()
-        .execute("CREATE ({name: 'A'}), ({name: 'A'}), ({name: 'B'}), ({name: 'C'}), ({name: 'C'})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE ({name: 'A'}), ({name: 'A'}), ({name: 'B'}), ({name: 'C'}), ({name: 'C'})")
         .await?;
+    tx.commit().await?;
     let r = db
         .session()
         .query("MATCH (a) WITH a.name AS name ORDER BY a.name + 'C' LIMIT 2 RETURN name")
@@ -1280,9 +1325,10 @@ async fn wo2_21_sort_partially_orderable_string_asc() -> Result<()> {
 #[tokio::test]
 async fn wo2_21_sort_partially_orderable_string_desc() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session()
-        .execute("CREATE ({name: 'A'}), ({name: 'A'}), ({name: 'B'}), ({name: 'C'}), ({name: 'C'})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE ({name: 'A'}), ({name: 'A'}), ({name: 'B'}), ({name: 'C'}), ({name: 'C'})")
         .await?;
+    tx.commit().await?;
     let r = db
         .session()
         .query("MATCH (a) WITH a.name AS name ORDER BY a.name + 'C' DESC LIMIT 2 RETURN name")
@@ -1298,9 +1344,10 @@ async fn wo2_21_sort_partially_orderable_string_desc() -> Result<()> {
 #[tokio::test]
 async fn wo2_22_sort_grouping_key_asc() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session()
-        .execute("CREATE ({name: 'A'}), ({name: 'A'}), ({name: 'B'}), ({name: 'C'}), ({name: 'C'})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE ({name: 'A'}), ({name: 'A'}), ({name: 'B'}), ({name: 'C'}), ({name: 'C'})")
         .await?;
+    tx.commit().await?;
     let r = db.session().query(
         "MATCH (a) WITH a.name AS name, count(*) AS cnt ORDER BY a.name LIMIT 1 RETURN name, cnt",
     ).await?;
@@ -1314,9 +1361,10 @@ async fn wo2_22_sort_grouping_key_asc() -> Result<()> {
 #[tokio::test]
 async fn wo2_23_sort_string_expr_grouping_asc() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session()
-        .execute("CREATE ({name: 'A'}), ({name: 'A'}), ({name: 'B'}), ({name: 'C'}), ({name: 'C'})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE ({name: 'A'}), ({name: 'A'}), ({name: 'B'}), ({name: 'C'}), ({name: 'C'})")
         .await?;
+    tx.commit().await?;
     let r = db.session().query(
         "MATCH (a) WITH a.name AS name, count(*) AS cnt ORDER BY a.name + 'C' LIMIT 1 RETURN name, cnt",
     ).await?;
@@ -1330,9 +1378,10 @@ async fn wo2_23_sort_string_expr_grouping_asc() -> Result<()> {
 #[tokio::test]
 async fn wo2_24_sort_with_distinct() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session()
-        .execute("CREATE ({name: 'A'}), ({name: 'A'}), ({name: 'B'}), ({name: 'C'}), ({name: 'C'})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE ({name: 'A'}), ({name: 'A'}), ({name: 'B'}), ({name: 'C'}), ({name: 'C'})")
         .await?;
+    tx.commit().await?;
     let r = db
         .session()
         .query("MATCH (a) WITH DISTINCT a.name AS name ORDER BY a.name LIMIT 1 RETURN *")
@@ -1350,9 +1399,11 @@ async fn wo2_24_sort_with_distinct() -> Result<()> {
 #[tokio::test]
 async fn wo3_01_sort_two_exprs_asc_asc() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session().execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (:A {num: 9, bool: true}), (:B {num: 5, bool: false}), (:C {num: -30, bool: false}), (:D {num: -41, bool: true}), (:E {num: 7054, bool: false})",
     ).await?;
+    tx.commit().await?;
     let r = db
         .session()
         .query(
@@ -1377,9 +1428,11 @@ async fn wo3_01_sort_two_exprs_asc_asc() -> Result<()> {
 #[tokio::test]
 async fn wo3_04_sort_two_exprs_desc_desc() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session().execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (:A {num: 9, bool: true}), (:B {num: 5, bool: false}), (:C {num: -30, bool: false}), (:D {num: -41, bool: true}), (:E {num: 7054, bool: false})",
     ).await?;
+    tx.commit().await?;
     let r = db
         .session()
         .query("MATCH (a) WITH a ORDER BY a.bool DESC, a.num DESC LIMIT 4 RETURN a.num AS num")
@@ -1399,9 +1452,11 @@ async fn wo3_04_sort_two_exprs_desc_desc() -> Result<()> {
 #[tokio::test]
 async fn wo3_05_default_sort_direction() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session().execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE ({num: 3, text: 'a'}), ({num: 3, text: 'b'}), ({num: 1, text: 'a'}), ({num: 1, text: 'b'}), ({num: 2, text: 'a'}), ({num: 2, text: 'b'}), ({num: 4, text: 'a'}), ({num: 4, text: 'b'})",
     ).await?;
+    tx.commit().await?;
     // ASC, (default=ASC for num), ASC for text => first row should be num=2, text='a'
     // num%2: 0 for 2,4; 1 for 1,3. ASC => 0 first. Within 0: num ASC => 2,4. text ASC => 'a'
     let r = db.session().query(
@@ -1441,9 +1496,11 @@ async fn wo3_07_order_direction_not_overwritten() -> Result<()> {
 #[tokio::test]
 async fn wo4_01_sort_projected_expr() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session().execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (:A {num: 1, num2: 4}), (:A {num: 5, num2: 2}), (:A {num: 9, num2: 0}), (:A {num: 3, num2: 3}), (:A {num: 7, num2: 1})",
     ).await?;
+    tx.commit().await?;
     let r = db
         .session()
         .query(
@@ -1470,9 +1527,11 @@ async fn wo4_01_sort_projected_expr() -> Result<()> {
 #[tokio::test]
 async fn wo4_02_sort_by_alias() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session().execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (:A {num: 1, num2: 4}), (:A {num: 5, num2: 2}), (:A {num: 9, num2: 0}), (:A {num: 3, num2: 3}), (:A {num: 7, num2: 1})",
     ).await?;
+    tx.commit().await?;
     let r = db
         .session()
         .query(
@@ -1497,9 +1556,11 @@ async fn wo4_02_sort_by_alias() -> Result<()> {
 #[tokio::test]
 async fn wo4_03_sort_two_projected_exprs() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session().execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (:A {num: 1, num2: 4}), (:A {num: 5, num2: 2}), (:A {num: 9, num2: 0}), (:A {num: 3, num2: 3}), (:A {num: 7, num2: 1})",
     ).await?;
+    tx.commit().await?;
     let r = db
         .session()
         .query(
@@ -1525,9 +1586,11 @@ async fn wo4_03_sort_two_projected_exprs() -> Result<()> {
 #[tokio::test]
 async fn wo4_06_sort_by_aliases() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session().execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (:A {num: 1, num2: 4}), (:A {num: 5, num2: 2}), (:A {num: 9, num2: 0}), (:A {num: 3, num2: 3}), (:A {num: 7, num2: 1})",
     ).await?;
+    tx.commit().await?;
     let r = db
         .session()
         .query(
@@ -1546,9 +1609,11 @@ async fn wo4_06_sort_by_aliases() -> Result<()> {
 #[tokio::test]
 async fn wo4_07_sort_alias_shadows_variable() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session().execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (:A {num: 1, num2: 4}), (:A {num: 5, num2: 2}), (:A {num: 9, num2: 0}), (:A {num: 3, num2: 3}), (:A {num: 7, num2: 1})",
     ).await?;
+    tx.commit().await?;
     let r = db
         .session()
         .query(
@@ -1574,9 +1639,11 @@ async fn wo4_07_sort_alias_shadows_variable() -> Result<()> {
 #[tokio::test]
 async fn wo4_08_sort_non_projected_var() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session().execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (:A {num: 1, num2: 4}), (:A {num: 5, num2: 2}), (:A {num: 9, num2: 0}), (:A {num: 3, num2: 3}), (:A {num: 7, num2: 1})",
     ).await?;
+    tx.commit().await?;
     let r = db
         .session()
         .query(
@@ -1611,9 +1678,11 @@ async fn wo4_08_sort_non_projected_var() -> Result<()> {
 #[tokio::test]
 async fn wo4_09_sort_alias_containing_shadowed_var() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session().execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (:A {num: 1, num2: 4}), (:A {num: 5, num2: 2}), (:A {num: 9, num2: 0}), (:A {num: 3, num2: 3}), (:A {num: 7, num2: 1})",
     ).await?;
+    tx.commit().await?;
     let r = db
         .session()
         .query(
@@ -1638,9 +1707,11 @@ async fn wo4_09_sort_alias_containing_shadowed_var() -> Result<()> {
 #[tokio::test]
 async fn wo4_11_sort_by_aggregate() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session().execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (:A {num: 1, num2: 4}), (:A {num: 5, num2: 2}), (:A {num: 9, num2: 0}), (:A {num: 3, num2: 3}), (:A {num: 7, num2: 1})",
     ).await?;
+    tx.commit().await?;
     let r = db
         .session()
         .query(
@@ -1665,9 +1736,11 @@ async fn wo4_11_sort_by_aggregate() -> Result<()> {
 #[tokio::test]
 async fn wo4_12_sort_by_aliased_aggregate() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session().execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (:A {num: 1, num2: 4}), (:A {num: 5, num2: 2}), (:A {num: 9, num2: 0}), (:A {num: 3, num2: 3}), (:A {num: 7, num2: 1})",
     ).await?;
+    tx.commit().await?;
     let r = db
         .session()
         .query(
@@ -1684,9 +1757,10 @@ async fn wo4_12_sort_by_aliased_aggregate() -> Result<()> {
 #[tokio::test]
 async fn wo4_15_sort_aggregate_with_subsequent_match() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session()
-        .execute("CREATE ()-[:T1 {id: 0}]->(:X), ()-[:T2 {id: 1}]->(:X), ()-[:T2 {id: 2}]->()")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE ()-[:T1 {id: 0}]->(:X), ()-[:T2 {id: 1}]->(:X), ()-[:T2 {id: 2}]->()")
         .await?;
+    tx.commit().await?;
     let r = db
         .session()
         .query(
@@ -1821,9 +1895,10 @@ async fn ro1_07_return_orderby_floats() -> Result<()> {
 #[tokio::test]
 async fn ro2_01_return_orderby_property_asc() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session()
-        .execute("CREATE ({num: 1}), ({num: 3}), ({num: -5})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE ({num: 1}), ({num: 3}), ({num: -5})")
         .await?;
+    tx.commit().await?;
     let r = db
         .session()
         .query("MATCH (n) RETURN n.num AS prop ORDER BY n.num")
@@ -1839,9 +1914,10 @@ async fn ro2_01_return_orderby_property_asc() -> Result<()> {
 #[tokio::test]
 async fn ro2_02_return_orderby_property_desc() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session()
-        .execute("CREATE ({num: 1}), ({num: 3}), ({num: -5})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE ({num: 1}), ({num: 3}), ({num: -5})")
         .await?;
+    tx.commit().await?;
     let r = db
         .session()
         .query("MATCH (n) RETURN n.num AS prop ORDER BY n.num DESC")
@@ -1857,9 +1933,11 @@ async fn ro2_02_return_orderby_property_desc() -> Result<()> {
 #[tokio::test]
 async fn ro2_03_sort_on_aggregate_function() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session().execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE ({division: 'A', age: 22}), ({division: 'B', age: 33}), ({division: 'B', age: 44}), ({division: 'C', age: 55})",
     ).await?;
+    tx.commit().await?;
     let r = db
         .session()
         .query("MATCH (n) RETURN n.division, max(n.age) ORDER BY max(n.age)")
@@ -1875,9 +1953,10 @@ async fn ro2_03_sort_on_aggregate_function() -> Result<()> {
 #[tokio::test]
 async fn ro2_04_sort_and_distinct() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session()
-        .execute("CREATE ({name: 'A'}), ({name: 'B'}), ({name: 'C'})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE ({name: 'A'}), ({name: 'B'}), ({name: 'C'})")
         .await?;
+    tx.commit().await?;
     let r = db
         .session()
         .query("MATCH (a) RETURN DISTINCT a ORDER BY a.name")
@@ -1890,7 +1969,9 @@ async fn ro2_04_sort_and_distinct() -> Result<()> {
 #[tokio::test]
 async fn ro2_07_ordering_with_aggregation() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session().execute("CREATE ({name: 'nisse'})").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE ({name: 'nisse'})").await?;
+    tx.commit().await?;
     let r = db
         .session()
         .query("MATCH (n) RETURN n.name, count(*) AS foo ORDER BY n.name")
@@ -1905,7 +1986,9 @@ async fn ro2_07_ordering_with_aggregation() -> Result<()> {
 #[tokio::test]
 async fn ro2_08_return_star_orderby() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session().execute("CREATE ({id: 1}), ({id: 10})").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE ({id: 1}), ({id: 10})").await?;
+    tx.commit().await?;
     let r = db
         .session()
         .query("MATCH (n) RETURN * ORDER BY n.id")
@@ -1918,7 +2001,9 @@ async fn ro2_08_return_star_orderby() -> Result<()> {
 #[tokio::test]
 async fn ro2_09_aliased_distinct_orderby() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session().execute("CREATE ({id: 1}), ({id: 10})").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE ({id: 1}), ({id: 10})").await?;
+    tx.commit().await?;
     let r = db
         .session()
         .query("MATCH (n) RETURN DISTINCT n.id AS id ORDER BY id DESC")
@@ -1933,7 +2018,9 @@ async fn ro2_09_aliased_distinct_orderby() -> Result<()> {
 #[tokio::test]
 async fn ro2_11_aggregates_ordered_by_arithmetics() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session().execute("CREATE (:A), (:X), (:X)").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:A), (:X), (:X)").await?;
+    tx.commit().await?;
     let r = db
         .session()
         .query("MATCH (a:A), (b:X) RETURN count(a) * 10 + count(b) * 5 AS x ORDER BY x")
@@ -1951,9 +2038,11 @@ async fn ro2_11_aggregates_ordered_by_arithmetics() -> Result<()> {
 #[tokio::test]
 async fn ro3_01_sort_aggregate_and_property() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session().execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE ({division: 'Sweden'}), ({division: 'Germany'}), ({division: 'England'}), ({division: 'Sweden'})",
     ).await?;
+    tx.commit().await?;
     let r = db
         .session()
         .query("MATCH (n) RETURN n.division, count(*) ORDER BY count(*) DESC, n.division ASC")
@@ -1991,9 +2080,11 @@ async fn ro4_01_orderby_column_from_return() -> Result<()> {
 #[tokio::test]
 async fn ro4_02_projections_with_orderby() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session().execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (:Crew {name: 'Neo', rank: 1}), (:Crew {name: 'Neo', rank: 2}), (:Crew {name: 'Neo', rank: 3}), (:Crew {name: 'Neo', rank: 4}), (:Crew {name: 'Neo', rank: 5})",
     ).await?;
+    tx.commit().await?;
     let r = db.session().query(
         "MATCH (c:Crew {name: 'Neo'}) WITH c, 0 AS relevance RETURN c.rank AS rank ORDER BY relevance, c.rank",
     ).await?;
@@ -2012,9 +2103,10 @@ async fn ro4_02_projections_with_orderby() -> Result<()> {
 #[tokio::test]
 async fn ro5_01_renamed_column_orderby() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session()
-        .execute("CREATE ({num: 1}), ({num: 3}), ({num: -5})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE ({num: 1}), ({num: 3}), ({num: -5})")
         .await?;
+    tx.commit().await?;
     let r = db
         .session()
         .query("MATCH (n) RETURN n.num AS n ORDER BY n + 2")

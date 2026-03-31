@@ -27,18 +27,20 @@ async def test_data_persists_after_reopen(tmp_path):
     )
 
     session = db.session()
-    await session.execute("CREATE (:Person {name: 'Alice', age: 30})")
-    await session.execute("CREATE (:Person {name: 'Bob', age: 25})")
-    await session.execute("CREATE (:Person {name: 'Carol', age: 35})")
+    tx = await session.tx()
+    await tx.execute("CREATE (:Person {name: 'Alice', age: 30})")
+    await tx.execute("CREATE (:Person {name: 'Bob', age: 25})")
+    await tx.execute("CREATE (:Person {name: 'Carol', age: 35})")
 
-    await session.execute("""
+    await tx.execute("""
         MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'})
         CREATE (a)-[:KNOWS]->(b)
     """)
-    await session.execute("""
+    await tx.execute("""
         MATCH (b:Person {name: 'Bob'}), (c:Person {name: 'Carol'})
         CREATE (b)-[:KNOWS]->(c)
     """)
+    await tx.commit()
 
     await db.flush()
 
@@ -132,12 +134,14 @@ async def test_schema_persists_across_reopens(tmp_path):
     assert "FOLLOWS" in edge_types
 
     session2 = db2.session()
-    await session2.execute(
+    tx2 = await session2.tx()
+    await tx2.execute(
         "CREATE (:User {username: 'testuser', email: 'test@example.com'})"
     )
-    await session2.execute(
+    await tx2.execute(
         "CREATE (:Post {title: 'Test Post', content: 'This is a test', published: true})"
     )
+    await tx2.commit()
 
     result = await session2.query("MATCH (u:User) RETURN u.username")
     assert len(result) == 1
@@ -167,15 +171,15 @@ async def test_indexes_persist_across_reopens(tmp_path):
     )
 
     session = db.session()
-    await session.execute(
-        "CREATE (:Product {sku: 'SKU001', name: 'Widget A', price: 9.99})"
-    )
-    await session.execute(
+    tx = await session.tx()
+    await tx.execute("CREATE (:Product {sku: 'SKU001', name: 'Widget A', price: 9.99})")
+    await tx.execute(
         "CREATE (:Product {sku: 'SKU002', name: 'Widget B', price: 19.99})"
     )
-    await session.execute(
+    await tx.execute(
         "CREATE (:Product {sku: 'SKU003', name: 'Widget C', price: 29.99})"
     )
+    await tx.commit()
 
     await db.flush()
 
@@ -198,9 +202,11 @@ async def test_indexes_persist_across_reopens(tmp_path):
     assert result[0]["p.name"] == "Widget B"
     assert result[0]["p.price"] == 19.99
 
-    await session2.execute(
+    tx2 = await session2.tx()
+    await tx2.execute(
         "CREATE (:Product {sku: 'SKU004', name: 'Widget D', price: 39.99})"
     )
+    await tx2.commit()
 
     result = await session2.query("""
         MATCH (p:Product {sku: 'SKU004'})
@@ -219,7 +225,9 @@ async def test_multiple_reopen_cycles(tmp_path):
     db1 = await uni_db.AsyncUni.open(str(db_path))
     await db1.schema().label("Counter").property("value", "int").apply()
     session1 = db1.session()
-    await session1.execute("CREATE (:Counter {value: 1})")
+    tx1 = await session1.tx()
+    await tx1.execute("CREATE (:Counter {value: 1})")
+    await tx1.commit()
     await db1.flush()
     del db1
 
@@ -228,7 +236,9 @@ async def test_multiple_reopen_cycles(tmp_path):
     session2 = db2.session()
     result = await session2.query("MATCH (c:Counter) RETURN c.value")
     assert result[0]["c.value"] == 1
-    await session2.execute("MATCH (c:Counter) SET c.value = 2")
+    tx2 = await session2.tx()
+    await tx2.execute("MATCH (c:Counter) SET c.value = 2")
+    await tx2.commit()
     await db2.flush()
     del db2
 
@@ -237,7 +247,9 @@ async def test_multiple_reopen_cycles(tmp_path):
     session3 = db3.session()
     result = await session3.query("MATCH (c:Counter) RETURN c.value")
     assert result[0]["c.value"] == 2
-    await session3.execute("MATCH (c:Counter) SET c.value = 3")
+    tx3 = await session3.tx()
+    await tx3.execute("MATCH (c:Counter) SET c.value = 3")
+    await tx3.commit()
     await db3.flush()
     del db3
 
@@ -265,8 +277,10 @@ async def test_large_dataset_persistence(tmp_path):
     )
 
     session = db.session()
+    tx = await session.tx()
     for i in range(1000):
-        await session.execute(f"CREATE (:Item {{id: {i}, data: 'item_{i}'}})")
+        await tx.execute(f"CREATE (:Item {{id: {i}, data: 'item_{i}'}})")
+    await tx.commit()
 
     await db.flush()
 

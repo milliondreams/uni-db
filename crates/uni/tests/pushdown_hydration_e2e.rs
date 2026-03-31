@@ -36,35 +36,31 @@ async fn setup_works_at_graph() -> Result<Uni> {
         .apply()
         .await?;
 
-    // Create vertices
-    db.session()
-        .execute("CREATE (:Person {name: 'Alice', age: 30})")
+    // Create vertices and edges
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Person {name: 'Alice', age: 30})")
         .await?;
-    db.session()
-        .execute("CREATE (:Person {name: 'Bob', age: 25})")
+    tx.execute("CREATE (:Person {name: 'Bob', age: 25})")
         .await?;
-    db.session()
-        .execute("CREATE (:Company {name: 'Acme Corp'})")
-        .await?;
-    db.session()
-        .execute("CREATE (:Company {name: 'TechCo'})")
-        .await?;
+    tx.execute("CREATE (:Company {name: 'Acme Corp'})").await?;
+    tx.execute("CREATE (:Company {name: 'TechCo'})").await?;
 
     // Create WORKS_AT edges with temporal properties
-    db.session().execute(
+    tx.execute(
         "MATCH (p:Person {name: 'Alice'}), (c:Company {name: 'Acme Corp'}) \
          CREATE (p)-[:WORKS_AT {role: 'Engineer', valid_from: datetime('2020-01-01T00:00:00Z'), valid_to: datetime('2022-12-31T00:00:00Z')}]->(c)"
     ).await?;
 
-    db.session().execute(
+    tx.execute(
         "MATCH (p:Person {name: 'Bob'}), (c:Company {name: 'TechCo'}) \
          CREATE (p)-[:WORKS_AT {role: 'Manager', valid_from: datetime('2021-06-01T00:00:00Z'), valid_to: datetime('2024-12-31T00:00:00Z')}]->(c)"
     ).await?;
 
-    db.session().execute(
+    tx.execute(
         "MATCH (p:Person {name: 'Alice'}), (c:Company {name: 'TechCo'}) \
          CREATE (p)-[:WORKS_AT {role: 'Senior Engineer', valid_from: datetime('2023-01-01T00:00:00Z'), valid_to: datetime('2025-12-31T00:00:00Z')}]->(c)"
     ).await?;
+    tx.commit().await?;
 
     Ok(db)
 }
@@ -87,48 +83,38 @@ async fn setup_knows_graph() -> Result<Uni> {
         .apply()
         .await?;
 
-    // Create vertices
-    db.session()
-        .execute("CREATE (:Person {name: 'Alice'})")
-        .await?;
-    db.session()
-        .execute("CREATE (:Person {name: 'Bob'})")
-        .await?;
-    db.session()
-        .execute("CREATE (:Person {name: 'Carol'})")
-        .await?;
-    db.session()
-        .execute("CREATE (:Person {name: 'Dave'})")
-        .await?;
+    // Create vertices and edges
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Person {name: 'Alice'})").await?;
+    tx.execute("CREATE (:Person {name: 'Bob'})").await?;
+    tx.execute("CREATE (:Person {name: 'Carol'})").await?;
+    tx.execute("CREATE (:Person {name: 'Dave'})").await?;
 
     // Create KNOWS edges with properties
-    db.session()
-        .execute(
-            "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) \
+    tx.execute(
+        "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) \
          CREATE (a)-[:KNOWS {since: '2020-01-01', weight: 10}]->(b)",
-        )
-        .await?;
+    )
+    .await?;
 
-    db.session()
-        .execute(
-            "MATCH (b:Person {name: 'Bob'}), (c:Person {name: 'Carol'}) \
+    tx.execute(
+        "MATCH (b:Person {name: 'Bob'}), (c:Person {name: 'Carol'}) \
          CREATE (b)-[:KNOWS {since: '2021-03-15', weight: 3}]->(c)",
-        )
-        .await?;
+    )
+    .await?;
 
-    db.session()
-        .execute(
-            "MATCH (c:Person {name: 'Carol'}), (d:Person {name: 'Dave'}) \
+    tx.execute(
+        "MATCH (c:Person {name: 'Carol'}), (d:Person {name: 'Dave'}) \
          CREATE (c)-[:KNOWS {since: '2019-07-20', weight: 8}]->(d)",
-        )
-        .await?;
+    )
+    .await?;
 
-    db.session()
-        .execute(
-            "MATCH (a:Person {name: 'Alice'}), (c:Person {name: 'Carol'}) \
+    tx.execute(
+        "MATCH (a:Person {name: 'Alice'}), (c:Person {name: 'Carol'}) \
          CREATE (a)-[:KNOWS {since: '2022-11-01', weight: 5}]->(c)",
-        )
-        .await?;
+    )
+    .await?;
+    tx.commit().await?;
 
     Ok(db)
 }
@@ -315,26 +301,20 @@ async fn test_coalesce_with_edge_properties() -> Result<()> {
         .await?;
 
     // Create edges with optional properties
-    db.session()
-        .execute("CREATE (:Person {name: 'Alice'})")
-        .await?;
-    db.session()
-        .execute("CREATE (:Person {name: 'Bob'})")
-        .await?;
-
-    db.session()
-        .execute(
-            "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) \
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Person {name: 'Alice'})").await?;
+    tx.execute("CREATE (:Person {name: 'Bob'})").await?;
+    tx.execute(
+        "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) \
          CREATE (a)-[:FRIEND {nickname: 'Ally'}]->(b)",
-        )
-        .await?;
-
-    db.session()
-        .execute(
-            "MATCH (b:Person {name: 'Bob'}), (a:Person {name: 'Alice'}) \
+    )
+    .await?;
+    tx.execute(
+        "MATCH (b:Person {name: 'Bob'}), (a:Person {name: 'Alice'}) \
          CREATE (b)-[:FRIEND]->(a)",
-        )
-        .await?;
+    )
+    .await?;
+    tx.commit().await?;
 
     // coalesce should trigger property pushdown for accessed properties
     let query = "\

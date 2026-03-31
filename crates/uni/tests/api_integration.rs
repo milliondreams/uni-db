@@ -76,20 +76,18 @@ async fn test_api_schema_and_property_query() -> Result<()> {
         .await?;
 
     // 2. Insert Data using Cypher
-    db.session()
-        .execute("CREATE (:Person {name: 'Tom Hanks', age: 68})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Person {name: 'Tom Hanks', age: 68})")
         .await?;
-    db.session()
-        .execute("CREATE (:Movie {title: 'Cast Away'})")
-        .await?;
-    db.session()
-        .execute(
-            "
+    tx.execute("CREATE (:Movie {title: 'Cast Away'})").await?;
+    tx.execute(
+        "
         MATCH (p:Person {name: 'Tom Hanks'}), (m:Movie {title: 'Cast Away'})
         CREATE (p)-[:ACTED_IN {role: 'Chuck Noland'}]->(m)
     ",
-        )
-        .await?;
+    )
+    .await?;
+    tx.commit().await?;
 
     // 3. Query properties
     let result = db
@@ -168,12 +166,13 @@ async fn test_parameterized_create_vertex() -> Result<()> {
         .apply()
         .await?;
 
-    db.session()
-        .execute_with("CREATE (p:Person {name: $name, age: $age})")
+    let tx = db.session().tx().await?;
+    tx.execute_with("CREATE (p:Person {name: $name, age: $age})")
         .param("name", "Alice")
         .param("age", 30)
         .run()
         .await?;
+    tx.commit().await?;
 
     let result = db
         .session()
@@ -197,14 +196,13 @@ async fn test_parameterized_create_edge() -> Result<()> {
         .apply()
         .await?;
 
-    db.session()
-        .execute("CREATE (p:Person {name: 'Alice'})")
-        .await?;
-    db.session()
-        .execute("CREATE (p:Person {name: 'Bob'})")
-        .await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (p:Person {name: 'Alice'})").await?;
+    tx.execute("CREATE (p:Person {name: 'Bob'})").await?;
+    tx.commit().await?;
 
-    db.session().execute_with(
+    let tx = db.session().tx().await?;
+    tx.execute_with(
         "MATCH (a:Person {name: $src}), (b:Person {name: $dst}) CREATE (a)-[:KNOWS {since: $since}]->(b)",
     )
     .param("src", "Alice")
@@ -212,6 +210,7 @@ async fn test_parameterized_create_edge() -> Result<()> {
     .param("since", 2024)
     .run()
     .await?;
+    tx.commit().await?;
 
     let result = db
         .session().query("MATCH (a:Person {name: 'Alice'})-[k:KNOWS]->(b:Person {name: 'Bob'}) RETURN k.since AS since")
@@ -233,16 +232,18 @@ async fn test_parameterized_set() -> Result<()> {
         .apply()
         .await?;
 
-    db.session()
-        .execute("CREATE (p:Person {name: 'Alice', age: 30})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (p:Person {name: 'Alice', age: 30})")
         .await?;
+    tx.commit().await?;
 
-    db.session()
-        .execute_with("MATCH (p:Person {name: $name}) SET p.age = $new_age")
+    let tx = db.session().tx().await?;
+    tx.execute_with("MATCH (p:Person {name: $name}) SET p.age = $new_age")
         .param("name", "Alice")
         .param("new_age", 31)
         .run()
         .await?;
+    tx.commit().await?;
 
     let result = db
         .session()
@@ -265,18 +266,19 @@ async fn test_parameterized_delete() -> Result<()> {
         .apply()
         .await?;
 
-    db.session()
-        .execute("CREATE (p:Person {name: 'Alice', age: 30})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (p:Person {name: 'Alice', age: 30})")
         .await?;
-    db.session()
-        .execute("CREATE (p:Person {name: 'Bob', age: 25})")
+    tx.execute("CREATE (p:Person {name: 'Bob', age: 25})")
         .await?;
+    tx.commit().await?;
 
-    db.session()
-        .execute_with("MATCH (p:Person {name: $name}) DELETE p")
+    let tx = db.session().tx().await?;
+    tx.execute_with("MATCH (p:Person {name: $name}) DELETE p")
         .param("name", "Alice")
         .run()
         .await?;
+    tx.commit().await?;
 
     let result = db
         .session()
@@ -298,16 +300,16 @@ async fn test_execute_with_returns_auto_commit_result() -> Result<()> {
         .apply()
         .await?;
 
-    let result = db
-        .session()
+    let tx = db.session().tx().await?;
+    let result = tx
         .execute_with("CREATE (i:Item {name: $name})")
         .param("name", "Widget")
         .run()
         .await?;
+    tx.commit().await?;
 
-    assert_eq!(result.nodes_created, 1);
-    assert!(result.version > 0);
-    assert_eq!(result.properties_set, 1);
+    assert_eq!(result.nodes_created(), 1);
+    assert_eq!(result.properties_set(), 1);
 
     Ok(())
 }

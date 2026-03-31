@@ -23,18 +23,12 @@ async def vector_db():
     )
 
     session = db.session()
-    await session.execute(
-        "CREATE (d:Document {title: 'Doc1', embedding: [1.0, 0.0, 0.0]})"
-    )
-    await session.execute(
-        "CREATE (d:Document {title: 'Doc2', embedding: [0.0, 1.0, 0.0]})"
-    )
-    await session.execute(
-        "CREATE (d:Document {title: 'Doc3', embedding: [0.0, 0.0, 1.0]})"
-    )
-    await session.execute(
-        "CREATE (d:Document {title: 'Doc4', embedding: [0.5, 0.5, 0.0]})"
-    )
+    tx = await session.tx()
+    await tx.execute("CREATE (d:Document {title: 'Doc1', embedding: [1.0, 0.0, 0.0]})")
+    await tx.execute("CREATE (d:Document {title: 'Doc2', embedding: [0.0, 1.0, 0.0]})")
+    await tx.execute("CREATE (d:Document {title: 'Doc3', embedding: [0.0, 0.0, 1.0]})")
+    await tx.execute("CREATE (d:Document {title: 'Doc4', embedding: [0.5, 0.5, 0.0]})")
+    await tx.commit()
     await db.flush()
     return db
 

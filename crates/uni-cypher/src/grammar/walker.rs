@@ -125,7 +125,6 @@ fn build_single_query(pair: Pair<Rule>) -> Result<Query, ParseError> {
         }
         Rule::statement => Ok(Query::Single(build_statement(inner)?)),
         Rule::schema_command => Ok(Query::Schema(Box::new(build_schema_command(inner)?))),
-        Rule::transaction_command => Ok(Query::Transaction(build_transaction_command(inner)?)),
         _ => unreachable!("Unexpected single_query rule: {:?}", inner.as_rule()),
     }
 }
@@ -2535,15 +2534,5 @@ pub(crate) fn build_string_literal(pair: Pair<Rule>) -> Result<String, ParseErro
         unescape_string(content, quote_char)
     } else {
         Err(ParseError::new("Expected string literal".to_string()))
-    }
-}
-
-fn build_transaction_command(pair: Pair<Rule>) -> Result<TransactionCommand, ParseError> {
-    let inner = pair.into_inner().next().unwrap();
-    match inner.as_rule() {
-        Rule::BEGIN => Ok(TransactionCommand::Begin),
-        Rule::COMMIT => Ok(TransactionCommand::Commit),
-        Rule::ROLLBACK => Ok(TransactionCommand::Rollback),
-        _ => unreachable!(),
     }
 }

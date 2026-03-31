@@ -28,7 +28,9 @@ class TestSchemaBuilder:
         assert db.label_exists("Person")
         # Verify we can insert data
         session = db.session()
-        session.execute("CREATE (n:Person {name: 'Alice', age: 30})")
+        tx = session.tx()
+        tx.execute("CREATE (n:Person {name: 'Alice', age: 30})")
+        tx.commit()
         db.flush()
         results = session.query("MATCH (n:Person) RETURN n.name, n.age")
         assert len(results) == 1
@@ -41,7 +43,9 @@ class TestSchemaBuilder:
 
         # Insert without nickname
         session = db.session()
-        session.execute("CREATE (n:Person {name: 'Bob'})")
+        tx = session.tx()
+        tx.execute("CREATE (n:Person {name: 'Bob'})")
+        tx.commit()
         db.flush()
         results = session.query("MATCH (n:Person) RETURN n.name, n.nickname")
         assert len(results) == 1
@@ -147,7 +151,9 @@ class TestDataTypes:
         """Test string data type."""
         db.schema().label("Test").property("text", "string").apply()
         session = db.session()
-        session.execute("CREATE (n:Test {text: 'hello world'})")
+        tx = session.tx()
+        tx.execute("CREATE (n:Test {text: 'hello world'})")
+        tx.commit()
         db.flush()
         results = session.query("MATCH (n:Test) RETURN n.text")
         assert results[0]["n.text"] == "hello world"
@@ -156,7 +162,9 @@ class TestDataTypes:
         """Test integer data type."""
         db.schema().label("Test").property("num", "int").apply()
         session = db.session()
-        session.execute("CREATE (n:Test {num: 42})")
+        tx = session.tx()
+        tx.execute("CREATE (n:Test {num: 42})")
+        tx.commit()
         db.flush()
         results = session.query("MATCH (n:Test) RETURN n.num")
         assert results[0]["n.num"] == 42
@@ -165,7 +173,9 @@ class TestDataTypes:
         """Test float data type."""
         db.schema().label("Test").property("value", "float").apply()
         session = db.session()
-        session.execute("CREATE (n:Test {value: 3.14})")
+        tx = session.tx()
+        tx.execute("CREATE (n:Test {value: 3.14})")
+        tx.commit()
         db.flush()
         results = session.query("MATCH (n:Test) RETURN n.value")
         assert abs(results[0]["n.value"] - 3.14) < 0.001
@@ -174,7 +184,9 @@ class TestDataTypes:
         """Test boolean data type."""
         db.schema().label("Test").property("active", "bool").apply()
         session = db.session()
-        session.execute("CREATE (n:Test {active: true})")
+        tx = session.tx()
+        tx.execute("CREATE (n:Test {active: true})")
+        tx.commit()
         db.flush()
         results = session.query("MATCH (n:Test) RETURN n.active")
         assert results[0]["n.active"] is True

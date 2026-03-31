@@ -20,12 +20,10 @@ use uni_db::Uni;
 async fn test_schema_labels_composite_match() -> Result<()> {
     let db = Uni::in_memory().build().await?;
     db.schema().label("Person").label("Animal").apply().await?;
-    db.session()
-        .execute("CREATE (:Person {name: 'Alice'})")
-        .await?;
-    db.session()
-        .execute("CREATE (:Animal {name: 'Rex'})")
-        .await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Person {name: 'Alice'})").await?;
+    tx.execute("CREATE (:Animal {name: 'Rex'})").await?;
+    tx.commit().await?;
 
     // CALL uni.schema.labels() YIELD label MATCH (n:Person) WHERE label = 'Person'
     let result = db
@@ -50,9 +48,9 @@ async fn test_schema_labels_composite_match() -> Result<()> {
 async fn test_schema_labels_composite_no_filter() -> Result<()> {
     let db = Uni::in_memory().build().await?;
     db.schema().label("Person").label("Animal").apply().await?;
-    db.session()
-        .execute("CREATE (:Person {name: 'Alice'})")
-        .await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Person {name: 'Alice'})").await?;
+    tx.commit().await?;
 
     // Cross join: every label x every Person node
     let result = db
@@ -81,9 +79,9 @@ async fn test_schema_labels_composite_no_filter() -> Result<()> {
 async fn test_schema_labels_yield_alias_composite() -> Result<()> {
     let db = Uni::in_memory().build().await?;
     db.schema().label("Person").apply().await?;
-    db.session()
-        .execute("CREATE (:Person {name: 'Bob'})")
-        .await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Person {name: 'Bob'})").await?;
+    tx.commit().await?;
 
     // Test YIELD aliasing in composite query
     let result = db
@@ -106,9 +104,9 @@ async fn test_schema_labels_yield_alias_composite() -> Result<()> {
 async fn test_schema_labels_composite_empty_result() -> Result<()> {
     let db = Uni::in_memory().build().await?;
     db.schema().label("Person").apply().await?;
-    db.session()
-        .execute("CREATE (:Person {name: 'Alice'})")
-        .await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Person {name: 'Alice'})").await?;
+    tx.commit().await?;
 
     // Filter on a label that doesn't exist: cross join produces rows
     // but WHERE filters them all out
@@ -130,9 +128,9 @@ async fn test_schema_labels_composite_empty_result() -> Result<()> {
 async fn test_schema_labels_multiple_yield_columns() -> Result<()> {
     let db = Uni::in_memory().build().await?;
     db.schema().label("Person").apply().await?;
-    db.session()
-        .execute("CREATE (:Person {name: 'Alice'})")
-        .await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Person {name: 'Alice'})").await?;
+    tx.commit().await?;
 
     // Yield multiple columns from schema procedure in a composite query
     let result = db
@@ -170,17 +168,14 @@ async fn test_schema_edge_types_composite() -> Result<()> {
         .edge_type("KNOWS", &["Person"], &["Person"])
         .apply()
         .await?;
-    db.session()
-        .execute("CREATE (a:Person {name: 'Alice'})")
-        .await?;
-    db.session()
-        .execute("CREATE (b:Person {name: 'Bob'})")
-        .await?;
-    db.session()
-        .execute(
-            "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) CREATE (a)-[:KNOWS]->(b)",
-        )
-        .await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (a:Person {name: 'Alice'})").await?;
+    tx.execute("CREATE (b:Person {name: 'Bob'})").await?;
+    tx.execute(
+        "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) CREATE (a)-[:KNOWS]->(b)",
+    )
+    .await?;
+    tx.commit().await?;
 
     // CALL schema.edgeTypes() YIELD type MATCH on that edge type
     let result = db
@@ -226,16 +221,16 @@ async fn test_vector_query_composite_with_match() -> Result<()> {
     schema_manager.save().await?;
 
     let db = Uni::open(path.to_str().unwrap()).build().await?;
-    db.session()
-        .execute("CREATE (d:Doc {title: 'ML Paper', embedding: [1.0, 0.0]})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (d:Doc {title: 'ML Paper', embedding: [1.0, 0.0]})")
         .await?;
-    db.session()
-        .execute("CREATE (t:Tag {name: 'machine-learning'})")
+    tx.execute("CREATE (t:Tag {name: 'machine-learning'})")
         .await?;
-    db.session().execute(
+    tx.execute(
         "MATCH (d:Doc {title: 'ML Paper'}), (t:Tag {name: 'machine-learning'}) CREATE (d)-[:TAGGED]->(t)",
     )
     .await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // Composite: vector search + graph traversal
@@ -277,16 +272,15 @@ async fn test_vector_query_composite_yield_alias() -> Result<()> {
     schema_manager.save().await?;
 
     let db = Uni::open(path.to_str().unwrap()).build().await?;
-    db.session()
-        .execute("CREATE (i:Item {name: 'Widget', embedding: [1.0, 0.0]})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (i:Item {name: 'Widget', embedding: [1.0, 0.0]})")
         .await?;
-    db.session()
-        .execute("CREATE (c:Category {name: 'Gadgets'})")
-        .await?;
-    db.session().execute(
+    tx.execute("CREATE (c:Category {name: 'Gadgets'})").await?;
+    tx.execute(
         "MATCH (i:Item {name: 'Widget'}), (c:Category {name: 'Gadgets'}) CREATE (i)-[:IN_CATEGORY]->(c)",
     )
     .await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // YIELD with alias: p instead of node, dist instead of distance
@@ -325,12 +319,12 @@ async fn test_vector_query_composite_multiple_yields() -> Result<()> {
     schema_manager.save().await?;
 
     let db = Uni::open(path.to_str().unwrap()).build().await?;
-    db.session()
-        .execute("CREATE (d:Doc {title: 'Close', embedding: [0.99, 0.01]})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (d:Doc {title: 'Close', embedding: [0.99, 0.01]})")
         .await?;
-    db.session()
-        .execute("CREATE (d:Doc {title: 'Far', embedding: [0.0, 1.0]})")
+    tx.execute("CREATE (d:Doc {title: 'Far', embedding: [0.0, 1.0]})")
         .await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // Yield both node and distance together, then filter in WHERE
@@ -375,9 +369,10 @@ async fn test_vector_query_composite_empty_results() -> Result<()> {
 
     let db = Uni::open(path.to_str().unwrap()).build().await?;
     // Insert a doc WITHOUT any TAGGED edges
-    db.session()
-        .execute("CREATE (d:Doc {title: 'Orphan', embedding: [1.0, 0.0]})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (d:Doc {title: 'Orphan', embedding: [1.0, 0.0]})")
         .await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // Vector search finds the doc, but MATCH for edges yields nothing
@@ -403,9 +398,9 @@ async fn test_vector_query_composite_empty_results() -> Result<()> {
 async fn test_unknown_procedure_in_composite_query() -> Result<()> {
     let db = Uni::in_memory().build().await?;
     db.schema().label("Person").apply().await?;
-    db.session()
-        .execute("CREATE (:Person {name: 'Alice'})")
-        .await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Person {name: 'Alice'})").await?;
+    tx.commit().await?;
 
     let result = db
         .session()
@@ -498,15 +493,11 @@ async fn test_standalone_call_with_alias_still_works() -> Result<()> {
 async fn test_schema_labels_composite_with_counts() -> Result<()> {
     let db = Uni::in_memory().build().await?;
     db.schema().label("Person").label("Company").apply().await?;
-    db.session()
-        .execute("CREATE (:Person {name: 'Alice'})")
-        .await?;
-    db.session()
-        .execute("CREATE (:Person {name: 'Bob'})")
-        .await?;
-    db.session()
-        .execute("CREATE (:Company {name: 'Acme'})")
-        .await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Person {name: 'Alice'})").await?;
+    tx.execute("CREATE (:Person {name: 'Bob'})").await?;
+    tx.execute("CREATE (:Company {name: 'Acme'})").await?;
+    tx.commit().await?;
 
     // Use multiple yield columns and filter
     let result = db
@@ -538,12 +529,10 @@ async fn test_schema_labels_composite_with_counts() -> Result<()> {
 async fn test_yield_scalar_survives_match() -> Result<()> {
     let db = Uni::in_memory().build().await?;
     db.schema().label("Person").apply().await?;
-    db.session()
-        .execute("CREATE (:Person {name: 'Alice'})")
-        .await?;
-    db.session()
-        .execute("CREATE (:Person {name: 'Bob'})")
-        .await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Person {name: 'Alice'})").await?;
+    tx.execute("CREATE (:Person {name: 'Bob'})").await?;
+    tx.commit().await?;
 
     // CALL followed by MATCH: label column should survive
     let result = db
@@ -579,15 +568,11 @@ async fn test_yield_scalar_survives_match() -> Result<()> {
 async fn test_yield_var_does_not_shadow_parameter() -> Result<()> {
     let db = Uni::in_memory().build().await?;
     db.schema().label("Person").label("Company").apply().await?;
-    db.session()
-        .execute("CREATE (:Person {name: 'Alice'})")
-        .await?;
-    db.session()
-        .execute("CREATE (:Person {name: 'Bob'})")
-        .await?;
-    db.session()
-        .execute("CREATE (:Company {name: 'Acme'})")
-        .await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Person {name: 'Alice'})").await?;
+    tx.execute("CREATE (:Person {name: 'Bob'})").await?;
+    tx.execute("CREATE (:Company {name: 'Acme'})").await?;
+    tx.commit().await?;
 
     // Use a parameter with the same name as a YIELD column
     let result = db
@@ -634,9 +619,9 @@ async fn test_vector_distance_survives_match_where() -> Result<()> {
         .await?;
 
     // Create documents with embeddings and tags
-    db.session()
-        .execute(
-            "CREATE (d1:Doc {title: 'Doc1', embedding: [1.0, 0.0, 0.0]}),
+    let tx = db.session().tx().await?;
+    tx.execute(
+        "CREATE (d1:Doc {title: 'Doc1', embedding: [1.0, 0.0, 0.0]}),
                 (d2:Doc {title: 'Doc2', embedding: [0.9, 0.1, 0.0]}),
                 (d3:Doc {title: 'Doc3', embedding: [0.5, 0.5, 0.0]}),
                 (t1:Tag {name: 'AI'}),
@@ -644,8 +629,9 @@ async fn test_vector_distance_survives_match_where() -> Result<()> {
                 (d1)-[:TAGGED]->(t1),
                 (d2)-[:TAGGED]->(t1),
                 (d3)-[:TAGGED]->(t2)",
-        )
-        .await?;
+    )
+    .await?;
+    tx.commit().await?;
 
     // Wait for vector index to be built
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -695,15 +681,11 @@ async fn test_yield_vid_vs_param_vid_no_conflict() -> Result<()> {
         .await?;
 
     // Create some data
-    db.session()
-        .execute("CREATE (:Person {name: 'Alice'})")
-        .await?;
-    db.session()
-        .execute("CREATE (:Person {name: 'Bob'})")
-        .await?;
-    db.session()
-        .execute("CREATE (:Company {name: 'Acme'})")
-        .await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Person {name: 'Alice'})").await?;
+    tx.execute("CREATE (:Person {name: 'Bob'})").await?;
+    tx.execute("CREATE (:Company {name: 'Acme'})").await?;
+    tx.commit().await?;
 
     // Use a parameter to filter, while YIELD also produces a column
     // The parameter should work correctly and not be shadowed by YIELD
@@ -755,12 +737,13 @@ async fn test_multiple_yield_scalars_survive_match() -> Result<()> {
         .apply()
         .await?;
 
-    db.session()
-        .execute(
-            "CREATE (d1:Doc {title: 'Doc1', embedding: [1.0, 0.0, 0.0]}),
+    let tx = db.session().tx().await?;
+    tx.execute(
+        "CREATE (d1:Doc {title: 'Doc1', embedding: [1.0, 0.0, 0.0]}),
                 (d2:Doc {title: 'Doc2', embedding: [0.9, 0.1, 0.0]})",
-        )
-        .await?;
+    )
+    .await?;
+    tx.commit().await?;
 
     // Wait for vector index
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -823,8 +806,10 @@ async fn test_vector_search_match_bound_target() -> Result<()> {
     let db = Uni::open(path.to_str().unwrap()).build().await?;
 
     // Create test data
-    db.session().execute("CREATE (a:Author {name: 'Alice'})-[:WROTE]->(d:Doc {title: 'Paper', embedding: [1.0, 0.0]})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (a:Author {name: 'Alice'})-[:WROTE]->(d:Doc {title: 'Paper', embedding: [1.0, 0.0]})")
         .await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // Vector search binds 'd', then MATCH traverses from bound 'd'

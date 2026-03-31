@@ -15,16 +15,16 @@ async fn test_snapshots_and_time_travel() -> Result<()> {
         .await?;
 
     // State 1: Alice
-    db.session()
-        .execute("CREATE (:Person {name: 'Alice'})")
-        .await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Person {name: 'Alice'})").await?;
+    tx.commit().await?;
     db.flush().await?;
     let snap1_id = db.create_snapshot(Some("alice-only")).await?;
 
     // State 2: Alice + Bob
-    db.session()
-        .execute("CREATE (:Person {name: 'Bob'})")
-        .await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Person {name: 'Bob'})").await?;
+    tx.commit().await?;
     db.flush().await?;
     let _snap2_id = db.create_snapshot(Some("alice-and-bob")).await?;
 
@@ -60,9 +60,10 @@ async fn test_snapshots_and_time_travel() -> Result<()> {
     assert!(found_alice);
 
     // Test Restore
-    db.session()
-        .execute(&format!("CALL uni.admin.snapshot.restore('{}')", snap1_id))
+    let tx = db.session().tx().await?;
+    tx.execute(&format!("CALL uni.admin.snapshot.restore('{}')", snap1_id))
         .await?;
+    tx.commit().await?;
 
     Ok(())
 }
@@ -79,18 +80,18 @@ async fn test_snapshot_edge_isolation() -> Result<()> {
         .await?;
 
     // State 1: Alice -> Bob
-    db.session()
-        .execute("CREATE (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'})")
         .await?;
+    tx.commit().await?;
     db.flush().await?;
     let snap1 = db.create_snapshot(Some("knows-bob")).await?;
 
     // State 2: Add Alice -> Charlie
-    db.session()
-        .execute(
-            "MATCH (a:Person {name: 'Alice'}) CREATE (a)-[:KNOWS]->(:Person {name: 'Charlie'})",
-        )
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (a:Person {name: 'Alice'}) CREATE (a)-[:KNOWS]->(:Person {name: 'Charlie'})")
         .await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // Current state should see 2 friends
@@ -125,16 +126,18 @@ async fn test_snapshot_property_isolation() -> Result<()> {
         .await?;
 
     // State 1: Alice age 30
-    db.session()
-        .execute("CREATE (:Person {name: 'Alice', age: 30})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Person {name: 'Alice', age: 30})")
         .await?;
+    tx.commit().await?;
     db.flush().await?;
     let snap1 = db.create_snapshot(Some("alice-30")).await?;
 
     // State 2: Update age to 31
-    db.session()
-        .execute("MATCH (n:Person {name: 'Alice'}) SET n.age = 31")
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (n:Person {name: 'Alice'}) SET n.age = 31")
         .await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // Current query should see age 31
@@ -167,16 +170,17 @@ async fn test_time_travel_rejects_writes() -> Result<()> {
         .apply()
         .await?;
 
-    db.session()
-        .execute("CREATE (:Person {name: 'Alice'})")
-        .await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Person {name: 'Alice'})").await?;
+    tx.commit().await?;
     db.flush().await?;
     let snap = db.create_snapshot(Some("snap1")).await?;
 
-    // CREATE with VERSION AS OF should fail
+    // CREATE with VERSION AS OF should fail — write clauses not allowed with time-travel.
+    // Use session.query() since auto-commit path validates time-travel restrictions.
     let result = db
         .session()
-        .execute(&format!(
+        .query(&format!(
             "CREATE (:Person {{name: 'Eve'}}) VERSION AS OF '{}'",
             snap
         ))
@@ -184,7 +188,7 @@ async fn test_time_travel_rejects_writes() -> Result<()> {
     assert!(result.is_err());
     let err_msg = result.unwrap_err().to_string();
     assert!(
-        err_msg.contains("Write clauses"),
+        err_msg.contains("Write clauses") || err_msg.contains("not allowed"),
         "Expected write clause error, got: {}",
         err_msg
     );
@@ -229,9 +233,9 @@ async fn test_timestamp_as_of_happy_path() -> Result<()> {
         .await?;
 
     // State 1: Alice
-    db.session()
-        .execute("CREATE (:Person {name: 'Alice'})")
-        .await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Person {name: 'Alice'})").await?;
+    tx.commit().await?;
     db.flush().await?;
     let _snap1 = db.create_snapshot(Some("snap1")).await?;
 
@@ -241,9 +245,9 @@ async fn test_timestamp_as_of_happy_path() -> Result<()> {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     // State 2: Alice + Bob
-    db.session()
-        .execute("CREATE (:Person {name: 'Bob'})")
-        .await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Person {name: 'Bob'})").await?;
+    tx.commit().await?;
     db.flush().await?;
     let _snap2 = db.create_snapshot(Some("snap2")).await?;
 

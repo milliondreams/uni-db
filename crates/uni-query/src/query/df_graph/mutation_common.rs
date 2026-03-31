@@ -59,8 +59,7 @@ pub struct MutationContext {
     pub query_ctx: Option<uni_store::QueryContext>,
 
     /// When set, mutations are routed to this private L0 buffer instead of
-    /// the writer's internal `transaction_l0` slot. Installed on the writer
-    /// temporarily while the writer lock is held during mutation execution.
+    /// the global L0. Passed explicitly to Writer methods during mutation execution.
     pub tx_l0_override: Option<Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
 }
 
@@ -541,16 +540,9 @@ async fn execute_mutation_inner(
     }
 
     let mut writer = mutation_ctx.writer.write().await;
-    // Install private tx L0 on writer so active_l0() and constraint checks use it
-    let saved_tx_l0 = mutation_ctx
-        .tx_l0_override
-        .as_ref()
-        .map(|tx_l0| writer.install_transaction_l0(Some(tx_l0.clone())));
-    let result = apply_mutations(&mutation_ctx, &mutation_kind, &mut rows, &mut writer).await;
-    // Always restore before releasing writer lock, even on error
-    if let Some(saved) = saved_tx_l0 {
-        writer.install_transaction_l0(saved);
-    }
+    let tx_l0 = mutation_ctx.tx_l0_override.as_ref();
+    let result =
+        apply_mutations(&mutation_ctx, &mutation_kind, &mut rows, &mut writer, tx_l0).await;
     drop(writer);
     result?;
 
@@ -651,6 +643,7 @@ async fn apply_mutations(
     mutation_kind: &MutationKind,
     rows: &mut [HashMap<String, Value>],
     writer: &mut Writer,
+    tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
 ) -> DFResult<()> {
     tracing::trace!(
         mutation = mutation_kind_label(mutation_kind),
@@ -670,7 +663,7 @@ async fn apply_mutations(
     match mutation_kind {
         MutationKind::Create { pattern } => {
             for row in rows.iter_mut() {
-                exec.execute_create_pattern(pattern, row, writer, pm, params, ctx)
+                exec.execute_create_pattern(pattern, row, writer, pm, params, ctx, tx_l0)
                     .await
                     .map_err(|e| df_err("CREATE failed", e))?;
             }
@@ -678,7 +671,7 @@ async fn apply_mutations(
         MutationKind::CreateBatch { patterns } => {
             for row in rows.iter_mut() {
                 for pattern in patterns {
-                    exec.execute_create_pattern(pattern, row, writer, pm, params, ctx)
+                    exec.execute_create_pattern(pattern, row, writer, pm, params, ctx, tx_l0)
                         .await
                         .map_err(|e| df_err("CREATE failed", e))?;
                 }
@@ -686,14 +679,14 @@ async fn apply_mutations(
         }
         MutationKind::Set { items } => {
             for row in rows.iter_mut() {
-                exec.execute_set_items_locked(items, row, writer, pm, params, ctx)
+                exec.execute_set_items_locked(items, row, writer, pm, params, ctx, tx_l0)
                     .await
                     .map_err(|e| df_err("SET failed", e))?;
             }
         }
         MutationKind::Remove { items } => {
             for row in rows.iter_mut() {
-                exec.execute_remove_items_locked(items, row, writer, pm, ctx)
+                exec.execute_remove_items_locked(items, row, writer, pm, ctx, tx_l0)
                     .await
                     .map_err(|e| df_err("REMOVE failed", e))?;
             }
@@ -713,7 +706,7 @@ async fn apply_mutations(
 
             // Delete edges before nodes so non-detach DELETE satisfies constraints.
             for val in &collector.edge_vals {
-                exec.execute_delete_item_locked(val, false, writer)
+                exec.execute_delete_item_locked(val, false, writer, tx_l0)
                     .await
                     .map_err(|e| df_err("DELETE edge failed", e))?;
             }
@@ -721,12 +714,12 @@ async fn apply_mutations(
             if *detach {
                 let (vids, labels): (Vec<Vid>, Vec<Option<Vec<String>>>) =
                     collector.node_entries.into_iter().unzip();
-                exec.batch_detach_delete_vertices(&vids, labels, writer)
+                exec.batch_detach_delete_vertices(&vids, labels, writer, tx_l0)
                     .await
                     .map_err(|e| df_err("DETACH DELETE failed", e))?;
             } else {
                 for (vid, labels) in &collector.node_entries {
-                    exec.execute_delete_vertex(*vid, false, labels.clone(), writer)
+                    exec.execute_delete_vertex(*vid, false, labels.clone(), writer, tx_l0)
                         .await
                         .map_err(|e| df_err("DELETE node failed", e))?;
                 }

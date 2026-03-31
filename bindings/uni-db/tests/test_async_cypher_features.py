@@ -24,17 +24,19 @@ async def db_with_data():
         .apply()
     )
 
-    await session.execute("CREATE (p:Person {name: 'Alice', age: 30})")
-    await session.execute("CREATE (p:Person {name: 'Bob', age: 25})")
-    await session.execute("CREATE (p:Person {name: 'Charlie', age: 35})")
-    await session.execute("""
+    tx = await session.tx()
+    await tx.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+    await tx.execute("CREATE (p:Person {name: 'Bob', age: 25})")
+    await tx.execute("CREATE (p:Person {name: 'Charlie', age: 35})")
+    await tx.execute("""
         MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'})
         CREATE (a)-[:KNOWS]->(b)
     """)
-    await session.execute("""
+    await tx.execute("""
         MATCH (b:Person {name: 'Bob'}), (c:Person {name: 'Charlie'})
         CREATE (b)-[:KNOWS]->(c)
     """)
+    await tx.commit()
     await db.flush()
     return db, session
 
@@ -122,8 +124,10 @@ class TestAsyncQueryWithParameters:
             .property("age", "int")
             .apply()
         )
-        await session.execute("CREATE (p:Person {name: 'Alice', age: 30})")
-        await session.execute("CREATE (p:Person {name: 'Bob', age: 25})")
+        tx = await session.tx()
+        await tx.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+        await tx.execute("CREATE (p:Person {name: 'Bob', age: 25})")
+        await tx.commit()
         await db.flush()
         return db, session
 
@@ -180,18 +184,20 @@ class TestAsyncAggregations:
             .apply()
         )
 
-        await session.execute(
+        tx = await session.tx()
+        await tx.execute(
             "CREATE (p:Product {category: 'Electronics', price: 100.0, quantity: 5})"
         )
-        await session.execute(
+        await tx.execute(
             "CREATE (p:Product {category: 'Electronics', price: 200.0, quantity: 3})"
         )
-        await session.execute(
+        await tx.execute(
             "CREATE (p:Product {category: 'Books', price: 20.0, quantity: 10})"
         )
-        await session.execute(
+        await tx.execute(
             "CREATE (p:Product {category: 'Books', price: 30.0, quantity: 8})"
         )
+        await tx.commit()
         await db.flush()
         return db, session
 
@@ -265,8 +271,10 @@ class TestAsyncOrderingAndLimits:
             .apply()
         )
 
+        tx = await session.tx()
         for i in range(10):
-            await session.execute(f"CREATE (n:Item {{num: {i}, name: 'Item{i}'}})")
+            await tx.execute(f"CREATE (n:Item {{num: {i}, name: 'Item{i}'}})")
+        await tx.commit()
         await db.flush()
         return db, session
 
@@ -325,23 +333,24 @@ class TestAsyncPatternMatching:
             .apply()
         )
 
-        await session.execute("CREATE (p:Person {name: 'Alice'})")
-        await session.execute("CREATE (p:Person {name: 'Bob'})")
-        await session.execute("CREATE (p:Person {name: 'Charlie'})")
-        await session.execute("CREATE (p:Person {name: 'David'})")
-
-        await session.execute("""
+        tx = await session.tx()
+        await tx.execute("CREATE (p:Person {name: 'Alice'})")
+        await tx.execute("CREATE (p:Person {name: 'Bob'})")
+        await tx.execute("CREATE (p:Person {name: 'Charlie'})")
+        await tx.execute("CREATE (p:Person {name: 'David'})")
+        await tx.execute("""
             MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'})
             CREATE (a)-[:KNOWS]->(b)
         """)
-        await session.execute("""
+        await tx.execute("""
             MATCH (b:Person {name: 'Bob'}), (c:Person {name: 'Charlie'})
             CREATE (b)-[:KNOWS]->(c)
         """)
-        await session.execute("""
+        await tx.execute("""
             MATCH (a:Person {name: 'Alice'}), (c:Person {name: 'Charlie'})
             CREATE (a)-[:WORKS_WITH]->(c)
         """)
+        await tx.commit()
         await db.flush()
         return db, session
 

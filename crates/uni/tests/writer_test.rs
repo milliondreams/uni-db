@@ -37,7 +37,7 @@ async fn test_writer_flush() -> anyhow::Result<()> {
     let vid_b = Vid::new(2);
     let eid = Eid::new(100);
     writer
-        .insert_edge(vid_a, vid_b, 1, eid, HashMap::new(), None)
+        .insert_edge(vid_a, vid_b, 1, eid, HashMap::new(), None, None)
         .await?;
 
     // 4. Flush to L1
@@ -81,7 +81,7 @@ async fn test_writer_vertex_flush() -> anyhow::Result<()> {
     let mut props = HashMap::new();
     props.insert("name".to_string(), unival!("Alice"));
     writer
-        .insert_vertex_with_labels(vid, props, &["Person".to_string()])
+        .insert_vertex_with_labels(vid, props, &["Person".to_string()], None)
         .await?;
 
     // 4. Flush to L1

@@ -13,9 +13,10 @@ async fn test_overflow_json_post_flush() -> Result<()> {
     db.schema().label("Person").apply().await?;
 
     // Create with overflow properties
-    db.session()
-        .execute("CREATE (:Person {name: 'Alice', city: 'NYC', age: 30})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Person {name: 'Alice', city: 'NYC', age: 30})")
         .await?;
+    tx.commit().await?;
 
     println!("✓ Created vertex with overflow properties");
 
@@ -77,9 +78,10 @@ async fn test_overflow_properties_returned() -> Result<()> {
 
     db.schema().label("Product").apply().await?;
 
-    db.session()
-        .execute("CREATE (:Product {name: 'Book A', category: 'books'})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Product {name: 'Book A', category: 'books'})")
         .await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // First verify we can return overflow properties at all
@@ -113,15 +115,14 @@ async fn test_where_clause_on_overflow_property() -> Result<()> {
     db.schema().label("Product").apply().await?;
 
     // Create test data
-    db.session()
-        .execute("CREATE (:Product {name: 'Book A', category: 'books', price: 10})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Product {name: 'Book A', category: 'books', price: 10})")
         .await?;
-    db.session()
-        .execute("CREATE (:Product {name: 'Book B', category: 'books', price: 20})")
+    tx.execute("CREATE (:Product {name: 'Book B', category: 'books', price: 20})")
         .await?;
-    db.session()
-        .execute("CREATE (:Product {name: 'Phone', category: 'electronics', price: 500})")
+    tx.execute("CREATE (:Product {name: 'Phone', category: 'electronics', price: 500})")
         .await?;
+    tx.commit().await?;
 
     println!("✓ Created 3 products with overflow properties");
 

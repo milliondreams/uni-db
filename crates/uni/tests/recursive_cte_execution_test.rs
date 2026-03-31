@@ -20,16 +20,16 @@ async fn setup_linear_chain() -> Result<Uni> {
         .apply()
         .await?;
 
-    db.session().execute("CREATE (n0:Item {id: 0})").await?;
-    db.session().execute("CREATE (n1:Item {id: 1})").await?;
-    db.session().execute("CREATE (n2:Item {id: 2})").await?;
-
-    db.session()
-        .execute("MATCH (a:Item {id: 0}), (b:Item {id: 1}) CREATE (a)-[:CHILD]->(b)")
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE (n0:Item {id: 0})").await?;
+    tx.execute("CREATE (n1:Item {id: 1})").await?;
+    tx.execute("CREATE (n2:Item {id: 2})").await?;
+    tx.execute("MATCH (a:Item {id: 0}), (b:Item {id: 1}) CREATE (a)-[:CHILD]->(b)")
         .await?;
-    db.session()
-        .execute("MATCH (a:Item {id: 1}), (b:Item {id: 2}) CREATE (a)-[:CHILD]->(b)")
+    tx.execute("MATCH (a:Item {id: 1}), (b:Item {id: 2}) CREATE (a)-[:CHILD]->(b)")
         .await?;
+    tx.commit().await?;
 
     Ok(db)
 }
@@ -89,25 +89,21 @@ async fn test_recursive_cte_branching_tree() -> Result<()> {
         .apply()
         .await?;
 
+    let session = db.session();
+    let tx = session.tx().await?;
     for i in 0..5 {
-        db.session()
-            .execute(&format!("CREATE (:Item {{id: {}}})", i))
-            .await?;
+        tx.execute(&format!("CREATE (:Item {{id: {}}})", i)).await?;
     }
-
     // 0 → 1, 0 → 2, 1 → 3, 1 → 4
-    db.session()
-        .execute("MATCH (a:Item {id: 0}), (b:Item {id: 1}) CREATE (a)-[:CHILD]->(b)")
+    tx.execute("MATCH (a:Item {id: 0}), (b:Item {id: 1}) CREATE (a)-[:CHILD]->(b)")
         .await?;
-    db.session()
-        .execute("MATCH (a:Item {id: 0}), (b:Item {id: 2}) CREATE (a)-[:CHILD]->(b)")
+    tx.execute("MATCH (a:Item {id: 0}), (b:Item {id: 2}) CREATE (a)-[:CHILD]->(b)")
         .await?;
-    db.session()
-        .execute("MATCH (a:Item {id: 1}), (b:Item {id: 3}) CREATE (a)-[:CHILD]->(b)")
+    tx.execute("MATCH (a:Item {id: 1}), (b:Item {id: 3}) CREATE (a)-[:CHILD]->(b)")
         .await?;
-    db.session()
-        .execute("MATCH (a:Item {id: 1}), (b:Item {id: 4}) CREATE (a)-[:CHILD]->(b)")
+    tx.execute("MATCH (a:Item {id: 1}), (b:Item {id: 4}) CREATE (a)-[:CHILD]->(b)")
         .await?;
+    tx.commit().await?;
 
     let result = db
         .session()
@@ -150,20 +146,20 @@ async fn test_recursive_cte_deep_chain() -> Result<()> {
         .await?;
 
     let depth = 7;
+    let session = db.session();
+    let tx = session.tx().await?;
     for i in 0..depth {
-        db.session()
-            .execute(&format!("CREATE (:Item {{id: {}}})", i))
-            .await?;
+        tx.execute(&format!("CREATE (:Item {{id: {}}})", i)).await?;
     }
     for i in 0..depth - 1 {
-        db.session()
-            .execute(&format!(
-                "MATCH (a:Item {{id: {}}}), (b:Item {{id: {}}}) CREATE (a)-[:CHILD]->(b)",
-                i,
-                i + 1
-            ))
-            .await?;
+        tx.execute(&format!(
+            "MATCH (a:Item {{id: {}}}), (b:Item {{id: {}}}) CREATE (a)-[:CHILD]->(b)",
+            i,
+            i + 1
+        ))
+        .await?;
     }
+    tx.commit().await?;
 
     let result = db
         .session()
@@ -214,25 +210,21 @@ async fn test_recursive_cte_diamond_deduplication() -> Result<()> {
         .apply()
         .await?;
 
+    let session = db.session();
+    let tx = session.tx().await?;
     for i in 0..4 {
-        db.session()
-            .execute(&format!("CREATE (:Item {{id: {}}})", i))
-            .await?;
+        tx.execute(&format!("CREATE (:Item {{id: {}}})", i)).await?;
     }
-
     // 0 → 1, 0 → 2, 1 → 3, 2 → 3
-    db.session()
-        .execute("MATCH (a:Item {id: 0}), (b:Item {id: 1}) CREATE (a)-[:CHILD]->(b)")
+    tx.execute("MATCH (a:Item {id: 0}), (b:Item {id: 1}) CREATE (a)-[:CHILD]->(b)")
         .await?;
-    db.session()
-        .execute("MATCH (a:Item {id: 0}), (b:Item {id: 2}) CREATE (a)-[:CHILD]->(b)")
+    tx.execute("MATCH (a:Item {id: 0}), (b:Item {id: 2}) CREATE (a)-[:CHILD]->(b)")
         .await?;
-    db.session()
-        .execute("MATCH (a:Item {id: 1}), (b:Item {id: 3}) CREATE (a)-[:CHILD]->(b)")
+    tx.execute("MATCH (a:Item {id: 1}), (b:Item {id: 3}) CREATE (a)-[:CHILD]->(b)")
         .await?;
-    db.session()
-        .execute("MATCH (a:Item {id: 2}), (b:Item {id: 3}) CREATE (a)-[:CHILD]->(b)")
+    tx.execute("MATCH (a:Item {id: 2}), (b:Item {id: 3}) CREATE (a)-[:CHILD]->(b)")
         .await?;
+    tx.commit().await?;
 
     let result = db
         .session()
@@ -275,22 +267,19 @@ async fn test_recursive_cte_cycle_terminates() -> Result<()> {
         .apply()
         .await?;
 
+    let session = db.session();
+    let tx = session.tx().await?;
     for i in 0..3 {
-        db.session()
-            .execute(&format!("CREATE (:Item {{id: {}}})", i))
-            .await?;
+        tx.execute(&format!("CREATE (:Item {{id: {}}})", i)).await?;
     }
-
     // 0 → 1 → 2 → 0 (cycle)
-    db.session()
-        .execute("MATCH (a:Item {id: 0}), (b:Item {id: 1}) CREATE (a)-[:CHILD]->(b)")
+    tx.execute("MATCH (a:Item {id: 0}), (b:Item {id: 1}) CREATE (a)-[:CHILD]->(b)")
         .await?;
-    db.session()
-        .execute("MATCH (a:Item {id: 1}), (b:Item {id: 2}) CREATE (a)-[:CHILD]->(b)")
+    tx.execute("MATCH (a:Item {id: 1}), (b:Item {id: 2}) CREATE (a)-[:CHILD]->(b)")
         .await?;
-    db.session()
-        .execute("MATCH (a:Item {id: 2}), (b:Item {id: 0}) CREATE (a)-[:CHILD]->(b)")
+    tx.execute("MATCH (a:Item {id: 2}), (b:Item {id: 0}) CREATE (a)-[:CHILD]->(b)")
         .await?;
+    tx.commit().await?;
 
     let result = db
         .session()
@@ -334,16 +323,16 @@ async fn test_recursive_cte_self_loop() -> Result<()> {
         .apply()
         .await?;
 
-    db.session().execute("CREATE (:Item {id: 0})").await?;
-    db.session().execute("CREATE (:Item {id: 1})").await?;
-
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE (:Item {id: 0})").await?;
+    tx.execute("CREATE (:Item {id: 1})").await?;
     // 0 → 0 (self-loop) and 0 → 1
-    db.session()
-        .execute("MATCH (a:Item {id: 0}), (b:Item {id: 0}) CREATE (a)-[:CHILD]->(b)")
+    tx.execute("MATCH (a:Item {id: 0}), (b:Item {id: 0}) CREATE (a)-[:CHILD]->(b)")
         .await?;
-    db.session()
-        .execute("MATCH (a:Item {id: 0}), (b:Item {id: 1}) CREATE (a)-[:CHILD]->(b)")
+    tx.execute("MATCH (a:Item {id: 0}), (b:Item {id: 1}) CREATE (a)-[:CHILD]->(b)")
         .await?;
+    tx.commit().await?;
 
     let result = db
         .session()
@@ -387,25 +376,18 @@ async fn test_recursive_cte_multiple_anchor_roots() -> Result<()> {
         .await?;
 
     // Two separate trees: 0 → 1 and 10 → 11
-    db.session()
-        .execute("CREATE (:Item {id: 0, is_root: true})")
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE (:Item {id: 0, is_root: true})").await?;
+    tx.execute("CREATE (:Item {id: 1, is_root: false})").await?;
+    tx.execute("CREATE (:Item {id: 10, is_root: true})").await?;
+    tx.execute("CREATE (:Item {id: 11, is_root: false})")
         .await?;
-    db.session()
-        .execute("CREATE (:Item {id: 1, is_root: false})")
+    tx.execute("MATCH (a:Item {id: 0}), (b:Item {id: 1}) CREATE (a)-[:CHILD]->(b)")
         .await?;
-    db.session()
-        .execute("CREATE (:Item {id: 10, is_root: true})")
+    tx.execute("MATCH (a:Item {id: 10}), (b:Item {id: 11}) CREATE (a)-[:CHILD]->(b)")
         .await?;
-    db.session()
-        .execute("CREATE (:Item {id: 11, is_root: false})")
-        .await?;
-
-    db.session()
-        .execute("MATCH (a:Item {id: 0}), (b:Item {id: 1}) CREATE (a)-[:CHILD]->(b)")
-        .await?;
-    db.session()
-        .execute("MATCH (a:Item {id: 10}), (b:Item {id: 11}) CREATE (a)-[:CHILD]->(b)")
-        .await?;
+    tx.commit().await?;
 
     // Anchor returns both roots via boolean flag
     let result = db
@@ -444,7 +426,10 @@ async fn test_recursive_cte_disconnected_graph() -> Result<()> {
     let db = setup_linear_chain().await?;
 
     // Add an isolated node
-    db.session().execute("CREATE (:Item {id: 99})").await?;
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE (:Item {id: 99})").await?;
+    tx.commit().await?;
 
     let result = db
         .session()
@@ -581,36 +566,27 @@ async fn test_recursive_cte_specific_edge_type() -> Result<()> {
         .apply()
         .await?;
 
-    db.session()
-        .execute("CREATE (:Person {name: 'Alice'})")
-        .await?;
-    db.session()
-        .execute("CREATE (:Person {name: 'Bob'})")
-        .await?;
-    db.session()
-        .execute("CREATE (:Person {name: 'Carol'})")
-        .await?;
-    db.session()
-        .execute("CREATE (:Person {name: 'Dave'})")
-        .await?;
-
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE (:Person {name: 'Alice'})").await?;
+    tx.execute("CREATE (:Person {name: 'Bob'})").await?;
+    tx.execute("CREATE (:Person {name: 'Carol'})").await?;
+    tx.execute("CREATE (:Person {name: 'Dave'})").await?;
     // MANAGES chain: Alice → Bob → Carol
-    db.session()
-        .execute(
-            "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) CREATE (a)-[:MANAGES]->(b)",
-        )
-        .await?;
-    db.session()
-        .execute(
-            "MATCH (a:Person {name: 'Bob'}), (b:Person {name: 'Carol'}) CREATE (a)-[:MANAGES]->(b)",
-        )
-        .await?;
-
+    tx.execute(
+        "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) CREATE (a)-[:MANAGES]->(b)",
+    )
+    .await?;
+    tx.execute(
+        "MATCH (a:Person {name: 'Bob'}), (b:Person {name: 'Carol'}) CREATE (a)-[:MANAGES]->(b)",
+    )
+    .await?;
     // MENTORS: Alice → Dave (different relationship)
-    db.session().execute(
+    tx.execute(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Dave'}) CREATE (a)-[:MENTORS]->(b)",
     )
     .await?;
+    tx.commit().await?;
 
     // CTE follows only MANAGES
     let result = db
@@ -655,20 +631,19 @@ async fn test_recursive_cte_string_properties() -> Result<()> {
         .apply()
         .await?;
 
-    db.session()
-        .execute("CREATE (:Category {name: 'Root', level: 0})")
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE (:Category {name: 'Root', level: 0})")
         .await?;
-    db.session()
-        .execute("CREATE (:Category {name: 'Electronics', level: 1})")
+    tx.execute("CREATE (:Category {name: 'Electronics', level: 1})")
         .await?;
-    db.session()
-        .execute("CREATE (:Category {name: 'Phones', level: 2})")
+    tx.execute("CREATE (:Category {name: 'Phones', level: 2})")
         .await?;
-
-    db.session().execute("MATCH (a:Category {name: 'Root'}), (b:Category {name: 'Electronics'}) CREATE (a)-[:SUBCATEGORY]->(b)")
+    tx.execute("MATCH (a:Category {name: 'Root'}), (b:Category {name: 'Electronics'}) CREATE (a)-[:SUBCATEGORY]->(b)")
         .await?;
-    db.session().execute("MATCH (a:Category {name: 'Electronics'}), (b:Category {name: 'Phones'}) CREATE (a)-[:SUBCATEGORY]->(b)")
+    tx.execute("MATCH (a:Category {name: 'Electronics'}), (b:Category {name: 'Phones'}) CREATE (a)-[:SUBCATEGORY]->(b)")
         .await?;
+    tx.commit().await?;
 
     let result = db
         .session()
@@ -718,22 +693,19 @@ async fn test_recursive_cte_float_properties() -> Result<()> {
         .apply()
         .await?;
 
-    db.session()
-        .execute("CREATE (:Station {name: 'A', distance: 0.0})")
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE (:Station {name: 'A', distance: 0.0})")
         .await?;
-    db.session()
-        .execute("CREATE (:Station {name: 'B', distance: 1.5})")
+    tx.execute("CREATE (:Station {name: 'B', distance: 1.5})")
         .await?;
-    db.session()
-        .execute("CREATE (:Station {name: 'C', distance: 3.7})")
+    tx.execute("CREATE (:Station {name: 'C', distance: 3.7})")
         .await?;
-
-    db.session()
-        .execute("MATCH (a:Station {name: 'A'}), (b:Station {name: 'B'}) CREATE (a)-[:NEXT]->(b)")
+    tx.execute("MATCH (a:Station {name: 'A'}), (b:Station {name: 'B'}) CREATE (a)-[:NEXT]->(b)")
         .await?;
-    db.session()
-        .execute("MATCH (a:Station {name: 'B'}), (b:Station {name: 'C'}) CREATE (a)-[:NEXT]->(b)")
+    tx.execute("MATCH (a:Station {name: 'B'}), (b:Station {name: 'C'}) CREATE (a)-[:NEXT]->(b)")
         .await?;
+    tx.commit().await?;
 
     let result = db
         .session()
@@ -882,8 +854,11 @@ async fn test_recursive_cte_no_recursive_edges() -> Result<()> {
         .await?;
 
     // Just isolated nodes, no edges
-    db.session().execute("CREATE (:Item {id: 0})").await?;
-    db.session().execute("CREATE (:Item {id: 1})").await?;
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE (:Item {id: 0})").await?;
+    tx.execute("CREATE (:Item {id: 1})").await?;
+    tx.commit().await?;
 
     let result = db
         .session()
@@ -960,33 +935,24 @@ async fn test_recursive_cte_multi_label_graph() -> Result<()> {
         .apply()
         .await?;
 
-    db.session()
-        .execute("CREATE (:Dept {name: 'Company'})")
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE (:Dept {name: 'Company'})").await?;
+    tx.execute("CREATE (:Dept {name: 'Engineering'})").await?;
+    tx.execute("CREATE (:Dept {name: 'Backend'})").await?;
+    tx.execute("CREATE (:Dept {name: 'Frontend'})").await?;
+    tx.execute("CREATE (:Dept {name: 'Sales'})").await?;
+    tx.execute("MATCH (a:Dept {name: 'Company'}), (b:Dept {name: 'Engineering'}) CREATE (a)-[:HAS_SUB]->(b)")
         .await?;
-    db.session()
-        .execute("CREATE (:Dept {name: 'Engineering'})")
+    tx.execute(
+        "MATCH (a:Dept {name: 'Company'}), (b:Dept {name: 'Sales'}) CREATE (a)-[:HAS_SUB]->(b)",
+    )
+    .await?;
+    tx.execute("MATCH (a:Dept {name: 'Engineering'}), (b:Dept {name: 'Backend'}) CREATE (a)-[:HAS_SUB]->(b)")
         .await?;
-    db.session()
-        .execute("CREATE (:Dept {name: 'Backend'})")
+    tx.execute("MATCH (a:Dept {name: 'Engineering'}), (b:Dept {name: 'Frontend'}) CREATE (a)-[:HAS_SUB]->(b)")
         .await?;
-    db.session()
-        .execute("CREATE (:Dept {name: 'Frontend'})")
-        .await?;
-    db.session()
-        .execute("CREATE (:Dept {name: 'Sales'})")
-        .await?;
-
-    db.session().execute("MATCH (a:Dept {name: 'Company'}), (b:Dept {name: 'Engineering'}) CREATE (a)-[:HAS_SUB]->(b)")
-        .await?;
-    db.session()
-        .execute(
-            "MATCH (a:Dept {name: 'Company'}), (b:Dept {name: 'Sales'}) CREATE (a)-[:HAS_SUB]->(b)",
-        )
-        .await?;
-    db.session().execute("MATCH (a:Dept {name: 'Engineering'}), (b:Dept {name: 'Backend'}) CREATE (a)-[:HAS_SUB]->(b)")
-        .await?;
-    db.session().execute("MATCH (a:Dept {name: 'Engineering'}), (b:Dept {name: 'Frontend'}) CREATE (a)-[:HAS_SUB]->(b)")
-        .await?;
+    tx.commit().await?;
 
     // Find all sub-departments under Engineering
     let result = db
@@ -1031,18 +997,18 @@ async fn test_recursive_cte_wide_fan_out() -> Result<()> {
         .await?;
 
     let fan_out = 20;
-    db.session().execute("CREATE (:Item {id: 0})").await?;
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE (:Item {id: 0})").await?;
     for i in 1..=fan_out {
-        db.session()
-            .execute(&format!("CREATE (:Item {{id: {}}})", i))
-            .await?;
-        db.session()
-            .execute(&format!(
-                "MATCH (a:Item {{id: 0}}), (b:Item {{id: {}}}) CREATE (a)-[:CHILD]->(b)",
-                i
-            ))
-            .await?;
+        tx.execute(&format!("CREATE (:Item {{id: {}}})", i)).await?;
+        tx.execute(&format!(
+            "MATCH (a:Item {{id: 0}}), (b:Item {{id: {}}}) CREATE (a)-[:CHILD]->(b)",
+            i
+        ))
+        .await?;
     }
+    tx.commit().await?;
 
     let result = db
         .session()

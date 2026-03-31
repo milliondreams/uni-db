@@ -40,7 +40,7 @@ pub use uni_cypher::ast::{Query as CypherQuery, TimeTravelSpec};
 /// Validate that a query AST contains only read clauses.
 ///
 /// Rejects any query that contains CREATE, MERGE, DELETE, SET, REMOVE,
-/// schema commands, or transaction commands.
+/// or schema commands.
 ///
 /// # Errors
 ///
@@ -79,11 +79,9 @@ pub fn validate_read_only(query: &CypherQuery) -> Result<(), String> {
             }
             Query::Explain(inner) => check_query(inner),
             Query::TimeTravel { query, .. } => check_query(query),
-            Query::Schema(_) | Query::Transaction(_) => {
-                Err("Schema and transaction commands are not allowed \
+            Query::Schema(_) => Err("Schema commands are not allowed \
                  with VERSION AS OF / TIMESTAMP AS OF"
-                    .to_string())
-            }
+                .to_string()),
         }
     }
 

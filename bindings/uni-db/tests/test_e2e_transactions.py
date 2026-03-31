@@ -39,7 +39,9 @@ def test_begin_and_rollback(social_db):
     session = social_db.session()
 
     # Insert initial data
-    session.execute("CREATE (p:Person {name: 'Bob', age: 25})")
+    tx = session.tx()
+    tx.execute("CREATE (p:Person {name: 'Bob', age: 25})")
+    tx.commit()
     social_db.flush()
 
     # Begin transaction
@@ -220,7 +222,9 @@ def test_rollback_after_partial_writes(social_db):
     session = social_db.session()
 
     # Insert initial data
-    session.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+    tx = session.tx()
+    tx.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+    tx.commit()
     social_db.flush()
 
     # Begin transaction

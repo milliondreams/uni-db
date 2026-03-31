@@ -77,7 +77,7 @@ async fn test_stress_concurrent_read_write() -> anyhow::Result<()> {
                         let vid_prev = Vid::new(prev);
                         let eid = Eid::new(i); // Simplistic EID
 
-                        w.insert_edge(vid_prev, vid, t_link, eid, HashMap::new(), None)
+                        w.insert_edge(vid_prev, vid, t_link, eid, HashMap::new(), None, None)
                             .await
                             .unwrap();
                     }

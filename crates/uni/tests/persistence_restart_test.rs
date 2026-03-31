@@ -47,7 +47,7 @@ async fn test_data_survives_restart() -> Result<()> {
             serde_json::json!("PersistenceCheck").into(),
         );
         writer
-            .insert_vertex_with_labels(vid, props, &["Person".to_string()])
+            .insert_vertex_with_labels(vid, props, &["Person".to_string()], None)
             .await?;
 
         // 3. Flush to Disk

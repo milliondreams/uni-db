@@ -20,13 +20,13 @@ pub use api::schema::{
     ScalarType, SchemaBuilder, VectorAlgo, VectorIndexCfg, VectorMetric,
 };
 pub use api::session::{
-    AutoCommitBuilder, AutoCommitResult, ProfileBuilder, Session, SessionCapabilities,
-    SessionMetrics, TransactionBuilder, WriteLeaseSummary,
+    ProfileBuilder, Session, SessionCapabilities, SessionMetrics, TransactionBuilder,
+    WriteLeaseSummary,
 };
 pub use api::sync::{
-    ApplyBuilderSync, AutoCommitBuilderSync, ExecuteBuilderSync, LocyBuilderSync,
-    ProfileBuilderSync, QueryBuilderSync, SessionSync, TransactionBuilderSync, TransactionSync,
-    TxLocyBuilderSync, TxQueryBuilderSync, UniSync,
+    ApplyBuilderSync, ExecuteBuilderSync, LocyBuilderSync, ProfileBuilderSync, QueryBuilderSync,
+    SessionSync, TransactionBuilderSync, TransactionSync, TxLocyBuilderSync, TxQueryBuilderSync,
+    UniSync,
 };
 pub use api::template::{SessionTemplate, SessionTemplateBuilder};
 pub use api::transaction::{

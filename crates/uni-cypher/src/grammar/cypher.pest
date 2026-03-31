@@ -90,9 +90,6 @@ RELATIONSHIP = @{ ^"relationship" ~ !ident_char }
 DROP_KW   = @{ ^"drop" ~ !ident_char }
 SHOW      = @{ ^"show" ~ !ident_char }
 ALTER     = @{ ^"alter" ~ !ident_char }
-BEGIN     = @{ ^"begin" ~ !ident_char }
-COMMIT    = @{ ^"commit" ~ !ident_char }
-ROLLBACK  = @{ ^"rollback" ~ !ident_char }
 TRANSACTION = @{ ^"transaction" ~ !ident_char }
 VACUUM    = @{ ^"vacuum" ~ !ident_char }
 CHECKPOINT = @{ ^"checkpoint" ~ !ident_char }
@@ -158,7 +155,7 @@ keyword_nonreserved = {
     LABEL | EDGE | INDEX | INDEXES | CONSTRAINT | CONSTRAINTS |
     PROPERTY | UNIQUE | ASSERT | KEY | TYPE | DEFAULT | ADD | RENAME |
     VECTOR | FULLTEXT | JSON | OPTIONS | FOR | NODE | RELATIONSHIP |
-    BEGIN | COMMIT | ROLLBACK | TRANSACTION | VACUUM | CHECKPOINT |
+    TRANSACTION | VACUUM | CHECKPOINT |
     DATABASE | CONFIG | STATISTICS | BACKUP | COPY |
     VERSION | TIMESTAMP_KW | OF
 }
@@ -496,7 +493,6 @@ single_query = {
     explain_query
     | statement
     | schema_command
-    | transaction_command
 }
 
 statement = { clause+ }
@@ -742,16 +738,6 @@ default_value = { DEFAULT ~ expression }
 if_not_exists = { IF ~ NOT ~ EXISTS }
 if_exists = { IF ~ EXISTS }
 identifier_list = { identifier_or_keyword ~ ("," ~ identifier_or_keyword)* }
-
-// ═══════════════════════════════════════════════════════════════════════════
-// TRANSACTION COMMANDS
-// ═══════════════════════════════════════════════════════════════════════════
-
-transaction_command = {
-    BEGIN ~ TRANSACTION?
-    | COMMIT
-    | ROLLBACK
-}
 
 // EXPLAIN wrapper
 explain_query = { EXPLAIN ~ (statement | schema_command) }

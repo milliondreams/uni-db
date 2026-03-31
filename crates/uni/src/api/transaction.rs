@@ -25,6 +25,12 @@ use uni_locy::DerivedFactSet;
 use crate::api::locy_result::LocyResult;
 use uni_query::{ExecuteResult, QueryCursor, QueryResult, Row, Value};
 
+/// Snapshot of L0 mutation state, used for before/after comparison in execute operations.
+struct L0Snapshot {
+    mutation_count: usize,
+    mutation_stats: uni_store::runtime::l0::MutationStats,
+}
+
 /// Transaction isolation level.
 ///
 /// Uses commit-time serialization: `tx()` allocates a private L0 buffer
@@ -235,26 +241,10 @@ impl Transaction {
     #[instrument(skip(self), fields(transaction_id = %self.id))]
     pub async fn execute(&self, cypher: &str) -> Result<ExecuteResult> {
         self.check_completed()?;
-        let (before, before_stats) = {
-            let l0 = self.tx_l0.read();
-            (l0.mutation_count, l0.mutation_stats.clone())
-        };
+        let before = self.snapshot_l0();
         let result = self.query(cypher).await?;
-        let (after, after_stats) = {
-            let l0 = self.tx_l0.read();
-            (l0.mutation_count, l0.mutation_stats.clone())
-        };
-        let affected_rows = if result.is_empty() {
-            after.saturating_sub(before)
-        } else {
-            result.len()
-        };
-        let diff = after_stats.diff(&before_stats);
-        Ok(ExecuteResult::with_details(
-            affected_rows,
-            &diff,
-            result.metrics().clone(),
-        ))
+        let after = self.snapshot_l0();
+        Ok(Self::compute_execute_result(&before, &after, &result))
     }
 
     /// Execute a mutation with parameters using a builder.
@@ -338,6 +328,121 @@ impl Transaction {
         })
     }
 
+    // ── Bulk Insert (admin convenience) ─────────────────────────────
+
+    /// Bulk insert vertices for a given label within this transaction.
+    ///
+    /// Mutations are written to the transaction's private L0 and become
+    /// visible on commit. Returns the allocated VIDs in input order.
+    #[instrument(skip(self, properties_list), fields(transaction_id = %self.id))]
+    pub async fn bulk_insert_vertices(
+        &self,
+        label: &str,
+        properties_list: Vec<uni_common::Properties>,
+    ) -> Result<Vec<uni_common::core::id::Vid>> {
+        self.check_completed()?;
+        let schema = self.db.schema.schema();
+        schema
+            .labels
+            .get(label)
+            .ok_or_else(|| UniError::LabelNotFound {
+                label: label.to_string(),
+            })?;
+        let writer_lock = self.db.writer.as_ref().ok_or_else(|| UniError::ReadOnly {
+            operation: "bulk_insert_vertices".to_string(),
+        })?;
+        let mut writer = writer_lock.write().await;
+        if properties_list.is_empty() {
+            return Ok(Vec::new());
+        }
+        let vids = writer
+            .allocate_vids(properties_list.len())
+            .await
+            .map_err(UniError::Internal)?;
+        // Route mutations through the transaction's private L0.
+        let result = writer
+            .insert_vertices_batch(
+                vids.clone(),
+                properties_list,
+                vec![label.to_string()],
+                Some(&self.tx_l0),
+            )
+            .await
+            .map_err(UniError::Internal);
+        result?;
+        Ok(vids)
+    }
+
+    /// Bulk insert edges for a given edge type within this transaction.
+    ///
+    /// Mutations are written to the transaction's private L0 and become
+    /// visible on commit.
+    #[instrument(skip(self, edges), fields(transaction_id = %self.id))]
+    pub async fn bulk_insert_edges(
+        &self,
+        edge_type: &str,
+        edges: Vec<(
+            uni_common::core::id::Vid,
+            uni_common::core::id::Vid,
+            uni_common::Properties,
+        )>,
+    ) -> Result<()> {
+        self.check_completed()?;
+        let schema = self.db.schema.schema();
+        let edge_meta =
+            schema
+                .edge_types
+                .get(edge_type)
+                .ok_or_else(|| UniError::EdgeTypeNotFound {
+                    edge_type: edge_type.to_string(),
+                })?;
+        let type_id = edge_meta.id;
+        let writer_lock = self.db.writer.as_ref().ok_or_else(|| UniError::ReadOnly {
+            operation: "bulk_insert_edges".to_string(),
+        })?;
+        let mut writer = writer_lock.write().await;
+        // Route mutations through the transaction's private L0.
+        let result: Result<()> = async {
+            for (src_vid, dst_vid, props) in edges {
+                let eid = writer.next_eid(type_id).await.map_err(UniError::Internal)?;
+                writer
+                    .insert_edge(
+                        src_vid,
+                        dst_vid,
+                        type_id,
+                        eid,
+                        props,
+                        Some(edge_type.to_string()),
+                        Some(&self.tx_l0),
+                    )
+                    .await
+                    .map_err(UniError::Internal)?;
+            }
+            Ok(())
+        }
+        .await;
+        result
+    }
+
+    // ── Bulk Writer / Appender ────────────────────────────────────────
+
+    /// Create a bulk writer builder for efficient data loading within this transaction.
+    ///
+    /// The bulk writer writes directly to storage (bypassing the L0 buffer).
+    /// The Transaction's write guard ensures mutual exclusion — the BulkWriter
+    /// does not manage the guard itself.
+    pub fn bulk_writer(&self) -> crate::api::bulk::BulkWriterBuilder {
+        crate::api::bulk::BulkWriterBuilder::new_unguarded(self.db.clone())
+    }
+
+    /// Create a streaming appender for row-by-row data loading within this transaction.
+    ///
+    /// The appender writes directly to storage (bypassing the L0 buffer).
+    /// The Transaction's write guard ensures mutual exclusion.
+    pub fn appender(&self, label: &str) -> crate::api::appender::AppenderBuilder {
+        crate::api::appender::AppenderBuilder::new_from_tx(self.db.clone(), label)
+    }
+
     // ── Locy Evaluation ───────────────────────────────────────────────
 
     /// Evaluate a Locy program within the transaction.
@@ -351,6 +456,7 @@ impl Transaction {
         let engine = impl_locy::LocyEngine {
             db: &self.db,
             tx_l0_override: Some(self.tx_l0.clone()),
+            locy_l0: Some(self.tx_l0.clone()),
             collect_derive: false,
         };
         engine.evaluate(program).await
@@ -625,6 +731,30 @@ impl Transaction {
         self.cancellation_token.clone()
     }
 
+    /// Snapshot the current L0 mutation count and stats for before/after comparison.
+    fn snapshot_l0(&self) -> L0Snapshot {
+        let l0 = self.tx_l0.read();
+        L0Snapshot {
+            mutation_count: l0.mutation_count,
+            mutation_stats: l0.mutation_stats.clone(),
+        }
+    }
+
+    /// Compute an `ExecuteResult` by comparing L0 snapshots before and after a query.
+    fn compute_execute_result(
+        before: &L0Snapshot,
+        after: &L0Snapshot,
+        result: &QueryResult,
+    ) -> ExecuteResult {
+        let affected_rows = if result.is_empty() {
+            after.mutation_count.saturating_sub(before.mutation_count)
+        } else {
+            result.len()
+        };
+        let diff = after.mutation_stats.diff(&before.mutation_stats);
+        ExecuteResult::with_details(affected_rows, &diff, result.metrics().clone())
+    }
+
     fn check_completed(&self) -> Result<()> {
         if self.completed {
             return Err(UniError::TransactionAlreadyCompleted);
@@ -692,44 +822,23 @@ impl<'a> ExecuteBuilder<'a> {
     /// Execute the mutation and return affected row count with detailed stats.
     pub async fn run(self) -> Result<ExecuteResult> {
         self.tx.check_completed()?;
-        let (before, before_stats) = {
-            let l0 = self.tx.tx_l0.read();
-            (l0.mutation_count, l0.mutation_stats.clone())
-        };
+        let before = self.tx.snapshot_l0();
+        let fut = self.tx.db.execute_internal_with_tx_l0(
+            &self.cypher,
+            self.params,
+            self.tx.tx_l0.clone(),
+        );
         let result = if let Some(t) = self.timeout {
-            tokio::time::timeout(
-                t,
-                self.tx.db.execute_internal_with_tx_l0(
-                    &self.cypher,
-                    self.params,
-                    self.tx.tx_l0.clone(),
-                ),
-            )
-            .await
-            .map_err(|_| UniError::Timeout {
-                timeout_ms: t.as_millis() as u64,
-            })??
+            tokio::time::timeout(t, fut)
+                .await
+                .map_err(|_| UniError::Timeout {
+                    timeout_ms: t.as_millis() as u64,
+                })??
         } else {
-            self.tx
-                .db
-                .execute_internal_with_tx_l0(&self.cypher, self.params, self.tx.tx_l0.clone())
-                .await?
+            fut.await?
         };
-        let (after, after_stats) = {
-            let l0 = self.tx.tx_l0.read();
-            (l0.mutation_count, l0.mutation_stats.clone())
-        };
-        let affected_rows = if result.is_empty() {
-            after.saturating_sub(before)
-        } else {
-            result.len()
-        };
-        let diff = after_stats.diff(&before_stats);
-        Ok(ExecuteResult::with_details(
-            affected_rows,
-            &diff,
-            result.metrics().clone(),
-        ))
+        let after = self.tx.snapshot_l0();
+        Ok(Transaction::compute_execute_result(&before, &after, &result))
     }
 }
 
@@ -764,10 +873,7 @@ impl<'a> TxQueryBuilder<'a> {
     /// Execute the mutation and return affected row count with detailed stats.
     pub async fn execute(self) -> Result<ExecuteResult> {
         self.tx.check_completed()?;
-        let (before, before_stats) = {
-            let l0 = self.tx.tx_l0.read();
-            (l0.mutation_count, l0.mutation_stats.clone())
-        };
+        let before = self.tx.snapshot_l0();
         let fut = self.tx.db.execute_internal_with_tx_l0(
             &self.cypher,
             self.params,
@@ -782,21 +888,8 @@ impl<'a> TxQueryBuilder<'a> {
         } else {
             fut.await?
         };
-        let (after, after_stats) = {
-            let l0 = self.tx.tx_l0.read();
-            (l0.mutation_count, l0.mutation_stats.clone())
-        };
-        let affected_rows = if result.is_empty() {
-            after.saturating_sub(before)
-        } else {
-            result.len()
-        };
-        let diff = after_stats.diff(&before_stats);
-        Ok(ExecuteResult::with_details(
-            affected_rows,
-            &diff,
-            result.metrics().clone(),
-        ))
+        let after = self.tx.snapshot_l0();
+        Ok(Transaction::compute_execute_result(&before, &after, &result))
     }
 
     /// Execute as a query and return rows.

@@ -272,12 +272,14 @@ async def test_schema_builder_edge_type_with_properties(async_empty_db):
 
     # Create an edge to verify properties work
     session = async_empty_db.session()
-    await session.execute("CREATE (a:Person {name: 'Alice'})")
-    await session.execute("CREATE (b:Person {name: 'Bob'})")
-    await session.execute(
+    tx = await session.tx()
+    await tx.execute("CREATE (a:Person {name: 'Alice'})")
+    await tx.execute("CREATE (b:Person {name: 'Bob'})")
+    await tx.execute(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) "
         "CREATE (a)-[:KNOWS {since: 2020, weight: 0.8}]->(b)"
     )
+    await tx.commit()
 
     result = await session.query(
         "MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN r.since as since, r.weight as weight"
@@ -365,10 +367,10 @@ async def test_get_label_info(async_empty_db):
     )
 
     session = async_empty_db.session()
-    await session.execute(
-        "CREATE (:Movie {title: 'The Matrix', year: 1999, rating: 8.7})"
-    )
-    await session.execute("CREATE (:Movie {title: 'Inception', year: 2010})")
+    tx = await session.tx()
+    await tx.execute("CREATE (:Movie {title: 'The Matrix', year: 1999, rating: 8.7})")
+    await tx.execute("CREATE (:Movie {title: 'Inception', year: 2010})")
+    await tx.commit()
     await async_empty_db.flush()
 
     info = await async_empty_db.get_label_info("Movie")
@@ -482,7 +484,8 @@ async def test_data_types_e2e(async_empty_db):
     )
 
     session = async_empty_db.session()
-    await session.execute("""
+    tx = await session.tx()
+    await tx.execute("""
         CREATE (:TestEntity {
             str_val: 'hello',
             int_val: 42,
@@ -493,6 +496,7 @@ async def test_data_types_e2e(async_empty_db):
             embedding: [0.1, 0.2, 0.3, 0.4]
         })
     """)
+    await tx.commit()
 
     result = await session.query("""
         MATCH (e:TestEntity)
@@ -581,7 +585,8 @@ async def test_schema_builder_complex_workflow(async_empty_db):
 
     # Create some data to verify schema works
     session = async_empty_db.session()
-    await session.execute(
+    tx = await session.tx()
+    await tx.execute(
         """
         CREATE (alice:Person {
             name: 'Alice',
@@ -613,6 +618,7 @@ async def test_schema_builder_complex_workflow(async_empty_db):
         CREATE (alice)-[:AUTHORED {timestamp: 1234567890}]->(post)
     """
     )
+    await tx.commit()
 
     # Query to verify
     result = await session.query("""

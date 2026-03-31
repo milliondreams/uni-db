@@ -20,12 +20,14 @@ async fn test_valid_at_function() -> Result<()> {
 
     // Create events with validity
     // e1: valid [2023-01-01, 2023-01-02)
-    db.session().execute("CREATE (e:Event {id: 1, valid_from: datetime('2023-01-01T00:00:00Z'), valid_to: datetime('2023-01-02T00:00:00Z')})").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (e:Event {id: 1, valid_from: datetime('2023-01-01T00:00:00Z'), valid_to: datetime('2023-01-02T00:00:00Z')})").await?;
     // e2: valid [2023-01-02, infinity)
-    db.session().execute(
+    tx.execute(
         "CREATE (e:Event {id: 2, valid_from: datetime('2023-01-02T00:00:00Z'), valid_to: null})",
     )
     .await?;
+    tx.commit().await?;
 
     // Test 1: Function call
     // Query at 2023-01-01T12:00:00Z. Should match e1.
@@ -87,12 +89,14 @@ async fn test_valid_at_macro() -> Result<()> {
         .await?;
 
     // e1: valid [2023-01-01, 2023-01-02)
-    db.session().execute("CREATE (e:Event {id: 1, valid_from: datetime('2023-01-01T00:00:00Z'), valid_to: datetime('2023-01-02T00:00:00Z')})").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (e:Event {id: 1, valid_from: datetime('2023-01-01T00:00:00Z'), valid_to: datetime('2023-01-02T00:00:00Z')})").await?;
     // e2: valid [2023-01-02, infinity)
-    db.session().execute(
+    tx.execute(
         "CREATE (e:Event {id: 2, valid_from: datetime('2023-01-02T00:00:00Z'), valid_to: null})",
     )
     .await?;
+    tx.commit().await?;
 
     // Test 2: Macro simple
     // MATCH (e:Event) WHERE e VALID_AT datetime(...)
@@ -138,7 +142,9 @@ async fn test_valid_at_macro_custom_props() -> Result<()> {
         .await?;
 
     // Test 3: Macro with custom props
-    db.session().execute("CREATE (t:Task {id: 3, start: datetime('2023-01-01T00:00:00Z'), end: datetime('2023-01-05T00:00:00Z')})").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (t:Task {id: 3, start: datetime('2023-01-01T00:00:00Z'), end: datetime('2023-01-05T00:00:00Z')})").await?;
+    tx.commit().await?;
 
     // MATCH (t:Task) WHERE t VALID_AT(datetime(...), 'start', 'end')
     let results = db
@@ -195,22 +201,17 @@ async fn test_valid_at_edge_temporal() -> Result<()> {
         .apply()
         .await?;
 
-    // Create nodes
-    db.session()
-        .execute("CREATE (p:Person {name: 'Alice'})")
-        .await?;
-    db.session()
-        .execute("CREATE (c:Company {name: 'Acme Corp'})")
-        .await?;
-    db.session()
-        .execute("CREATE (c:Company {name: 'Globex Inc'})")
+    // Create nodes and employment history
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (p:Person {name: 'Alice'})").await?;
+    tx.execute("CREATE (c:Company {name: 'Acme Corp'})").await?;
+    tx.execute("CREATE (c:Company {name: 'Globex Inc'})")
         .await?;
 
     // Create employment history with temporal validity
     // Job 1: 2020-01-01 to 2022-06-30 at Acme Corp
-    db.session()
-        .execute(
-            "
+    tx.execute(
+        "
         MATCH (p:Person {name: 'Alice'}), (c:Company {name: 'Acme Corp'})
         CREATE (p)-[:EMPLOYED_BY {
             valid_from: datetime('2020-01-01T00:00:00Z'),
@@ -218,13 +219,12 @@ async fn test_valid_at_edge_temporal() -> Result<()> {
             role: 'Engineer'
         }]->(c)
     ",
-        )
-        .await?;
+    )
+    .await?;
 
     // Job 2: 2022-07-01 to present at Globex Inc
-    db.session()
-        .execute(
-            "
+    tx.execute(
+        "
         MATCH (p:Person {name: 'Alice'}), (c:Company {name: 'Globex Inc'})
         CREATE (p)-[:EMPLOYED_BY {
             valid_from: datetime('2022-07-01T00:00:00Z'),
@@ -232,8 +232,9 @@ async fn test_valid_at_edge_temporal() -> Result<()> {
             role: 'Senior Engineer'
         }]->(c)
     ",
-        )
-        .await?;
+    )
+    .await?;
+    tx.commit().await?;
 
     // Flush to ensure edges are persisted
     db.flush().await?;
@@ -334,7 +335,9 @@ async fn test_valid_at_boundary_conditions() -> Result<()> {
         .await?;
 
     // Contract valid exactly from start to end
-    db.session().execute("CREATE (c:Contract {id: 1, valid_from: datetime('2023-01-01T00:00:00Z'), valid_to: datetime('2023-12-31T23:59:59Z')})").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (c:Contract {id: 1, valid_from: datetime('2023-01-01T00:00:00Z'), valid_to: datetime('2023-12-31T23:59:59Z')})").await?;
+    tx.commit().await?;
 
     // Test: Exactly at start time (should be valid)
     let results = db
@@ -412,9 +415,11 @@ async fn test_valid_at_open_ended() -> Result<()> {
         .await?;
 
     // Active subscription with no end date
-    db.session().execute("CREATE (s:Subscription {id: 1, valid_from: datetime('2020-01-01T00:00:00Z'), valid_to: null})").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (s:Subscription {id: 1, valid_from: datetime('2020-01-01T00:00:00Z'), valid_to: null})").await?;
     // Cancelled subscription
-    db.session().execute("CREATE (s:Subscription {id: 2, valid_from: datetime('2020-01-01T00:00:00Z'), valid_to: datetime('2022-01-01T00:00:00Z')})").await?;
+    tx.execute("CREATE (s:Subscription {id: 2, valid_from: datetime('2020-01-01T00:00:00Z'), valid_to: datetime('2022-01-01T00:00:00Z')})").await?;
+    tx.commit().await?;
 
     // Test: Far future date should only match open-ended subscription
     let results = db
@@ -528,9 +533,10 @@ async fn test_valid_at_no_suggestion_with_index() -> Result<()> {
         .await?;
 
     // Create a scalar index on valid_from
-    db.session()
-        .execute("CREATE INDEX idx_valid_from FOR (t:Task) ON (t.valid_from)")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE INDEX idx_valid_from FOR (t:Task) ON (t.valid_from)")
         .await?;
+    tx.commit().await?;
 
     // Parse and plan a query - index now exists
     let query = "MATCH (t:Task) WHERE t VALID_AT datetime('2023-01-01T00:00:00Z') RETURN t.id";
@@ -614,18 +620,12 @@ async fn test_valid_at_schemaless_edge_temporal() -> Result<()> {
         .apply()
         .await?;
 
-    // Create nodes
-    db.session()
-        .execute("CREATE (w:Worker {name: 'Bob'})")
-        .await?;
-    db.session()
-        .execute("CREATE (e:Employer {name: 'TechCo'})")
-        .await?;
-
-    // Create edge with temporal properties (schemaless — not declared in schema)
-    db.session()
-        .execute(
-            "
+    // Create nodes and edge with temporal properties (schemaless — not declared in schema)
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (w:Worker {name: 'Bob'})").await?;
+    tx.execute("CREATE (e:Employer {name: 'TechCo'})").await?;
+    tx.execute(
+        "
         MATCH (w:Worker {name: 'Bob'}), (e:Employer {name: 'TechCo'})
         CREATE (w)-[:WORKS_FOR {
             valid_from: datetime('2021-01-01T00:00:00Z'),
@@ -633,8 +633,9 @@ async fn test_valid_at_schemaless_edge_temporal() -> Result<()> {
             role: 'Developer'
         }]->(e)
     ",
-        )
-        .await?;
+    )
+    .await?;
+    tx.commit().await?;
 
     // Pre-flush: named property access should work (data in L0)
     let results = db

@@ -79,7 +79,9 @@ class TestUniBuilderOpenModes:
             assert db is not None
             db.schema().label("Test").apply()
             session = db.session()
-            session.execute("CREATE (n:Test)")
+            tx = session.tx()
+            tx.execute("CREATE (n:Test)")
+            tx.commit()
             db.flush()
 
     def test_open_reuses_existing(self):
@@ -150,7 +152,9 @@ class TestUniBuilderConfiguration:
             # Verify database works
             db.schema().label("Test").apply()
             session = db.session()
-            session.execute("CREATE (n:Test)")
+            tx = session.tx()
+            tx.execute("CREATE (n:Test)")
+            tx.commit()
             db.flush()
             results = session.query("MATCH (n:Test) RETURN n")
             assert len(results) == 1
@@ -166,7 +170,9 @@ class TestBackwardCompatibility:
             assert db is not None
             db.schema().label("Legacy").apply()
             session = db.session()
-            session.execute("CREATE (n:Legacy)")
+            tx = session.tx()
+            tx.execute("CREATE (n:Legacy)")
+            tx.commit()
             db.flush()
             results = session.query("MATCH (n:Legacy) RETURN n")
             assert len(results) == 1

@@ -22,8 +22,10 @@ class TestSession:
                 "age", "int"
             ).apply()
             session = db.session()
-            session.execute("CREATE (n:Person {name: 'Alice', age: 30})")
-            session.execute("CREATE (n:Person {name: 'Bob', age: 25})")
+            tx = session.tx()
+            tx.execute("CREATE (n:Person {name: 'Alice', age: 30})")
+            tx.execute("CREATE (n:Person {name: 'Bob', age: 25})")
+            tx.commit()
             db.flush()
             yield db
 
@@ -45,9 +47,11 @@ class TestSession:
     def test_session_execute(self, db):
         """Test executing a mutation through a session."""
         session = db.session()
-        result = session.execute("CREATE (n:Person {name: 'Charlie', age: 35})")
-        # execute returns AutoCommitResult
+        tx = session.tx()
+        result = tx.execute("CREATE (n:Person {name: 'Charlie', age: 35})")
+        # execute returns ExecuteResult
         assert hasattr(result, "affected_rows") or hasattr(result, "nodes_created")
+        tx.commit()
 
         # Verify the node was created
         results = session.query(

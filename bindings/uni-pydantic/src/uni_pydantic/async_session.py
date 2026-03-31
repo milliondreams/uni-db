@@ -180,9 +180,7 @@ class AsyncUniSession:
         """Access the underlying uni_db.AsyncUni for low-level operations."""
         return self._db
 
-    async def locy(
-        self, program: str, params: dict[str, Any] | None = None
-    ) -> Any:
+    async def locy(self, program: str, params: dict[str, Any] | None = None) -> Any:
         """
         Evaluate a Locy program and return derived facts, stats, and warnings.
 
@@ -416,9 +414,11 @@ class AsyncUniSession:
                 for entity in group:
                     run_hooks(entity, _BEFORE_CREATE)
                 prop_dicts = [e.to_properties() for e in group]
-                async with await self._db_session.bulk_writer().build() as bw:
+                tx = await self._db_session.tx()
+                async with await tx.bulk_writer().build() as bw:
                     vids = await bw.insert_vertices(label, prop_dicts)
                     await bw.commit()
+                await tx.commit()
                 for entity, vid in zip(group, vids):
                     entity._attach_session(self, vid)
                     self._identity_map[(label, vid)] = entity

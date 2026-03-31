@@ -122,8 +122,8 @@ async fn test_write_guard_released_on_tx_drop() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Create a streaming appender, abort it, then verify the write guard
-/// is released so a new transaction can be created on the same session.
+/// Create a streaming appender within a transaction, abort it, then verify
+/// the transaction can still operate and a subsequent transaction can be created.
 #[tokio::test]
 async fn test_write_guard_released_on_appender_abort() -> anyhow::Result<()> {
     let db = Uni::in_memory().build().await?;
@@ -136,20 +136,28 @@ async fn test_write_guard_released_on_appender_abort() -> anyhow::Result<()> {
 
     let session = db.session();
 
-    // Create an appender and abort it
+    // Create a tx, get an appender from it, abort the appender
+    let tx = session.tx().await?;
     {
-        let appender = session.appender("Row").build()?;
+        let appender = tx.appender("Row").build()?;
         appender.abort();
     }
-
-    // The write guard should be released — creating a tx must succeed
-    let tx = session.tx().await?;
+    // The tx should still be usable after appender abort
     tx.execute("CREATE (:Row {x: 42})").await?;
     tx.commit().await?;
 
-    let result = db.session().query("MATCH (r:Row) RETURN r.x AS x").await?;
-    assert_eq!(result.len(), 1);
+    // The write guard should be released — creating a new tx must succeed
+    let tx2 = session.tx().await?;
+    tx2.execute("CREATE (:Row {x: 99})").await?;
+    tx2.commit().await?;
+
+    let result = db
+        .session()
+        .query("MATCH (r:Row) RETURN r.x AS x ORDER BY r.x")
+        .await?;
+    assert_eq!(result.len(), 2);
     assert_eq!(result.rows()[0].get::<i64>("x")?, 42);
+    assert_eq!(result.rows()[1].get::<i64>("x")?, 99);
 
     Ok(())
 }
@@ -172,19 +180,8 @@ async fn test_read_only_rejects_writes() -> anyhow::Result<()> {
         "expected ReadOnly, got: {err:?}"
     );
 
-    // Auto-committed execute should also fail (the error surfaces as a Query
-    // error from the execution layer since there is no Writer, rather than
-    // ReadOnly which is only returned for pinned sessions).
-    let err = session
-        .execute("CREATE (:Anything {x: 1})")
-        .await
-        .expect_err("should fail on read-only database");
-
-    // Accept either ReadOnly or a Query error indicating no writer
-    assert!(
-        matches!(err, UniError::ReadOnly { .. } | UniError::Query { .. }),
-        "expected ReadOnly or Query error on execute, got: {err:?}"
-    );
+    // Session no longer has execute() — all writes go through Transaction,
+    // and tx() already fails with ReadOnly above.
 
     // Reads should still work
     let result = session.query("RETURN 42 AS val").await?;

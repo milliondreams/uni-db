@@ -153,7 +153,9 @@ async fn test_return_order_by_lists() -> Result<()> {
 async fn test_return_order_by_distinct_type_precedence() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
-    db.session().execute("CREATE (:N)-[:REL]->()").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:N)-[:REL]->()").await?;
+    tx.commit().await?;
     let mixed = db
         .session()
         .query(
@@ -203,10 +205,12 @@ async fn test_return_order_by_distinct_type_precedence() -> Result<()> {
 async fn test_return_order_by_aggregate_function_expression() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
-    db.session().execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE ({division: 'A', age: 22}), ({division: 'B', age: 33}), ({division: 'B', age: 44}), ({division: 'C', age: 55})",
     )
     .await?;
+    tx.commit().await?;
 
     let aggregate_sorted = db
         .session()
@@ -238,9 +242,10 @@ async fn test_return_order_by_aggregate_function_expression() -> Result<()> {
 #[tokio::test]
 async fn test_return_order_by_distinct_alias_and_columns_shape() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session()
-        .execute("CREATE ({id: 1}), ({id: 10}), ({id: 10})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE ({id: 1}), ({id: 10}), ({id: 10})")
         .await?;
+    tx.commit().await?;
 
     let alias_distinct = db
         .session()
@@ -273,12 +278,13 @@ async fn test_return_order_by_distinct_alias_and_columns_shape() -> Result<()> {
 #[tokio::test]
 async fn test_return_order_by_distinct_node_identity_deduplicates_same_binding() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.session()
-        .execute(
-            "CREATE (a:Start {id: 0}), (b:Target {id: 10}), (c:Target {id: 20}), \
+    let tx = db.session().tx().await?;
+    tx.execute(
+        "CREATE (a:Start {id: 0}), (b:Target {id: 10}), (c:Target {id: 20}), \
          (a)-[:R]->(b), (a)-[:R]->(b), (a)-[:R]->(c)",
-        )
-        .await?;
+    )
+    .await?;
+    tx.commit().await?;
 
     let distinct_nodes = db
         .session()
@@ -298,10 +304,12 @@ async fn test_return_order_by_distinct_node_identity_deduplicates_same_binding()
 async fn test_return_order_by_multi_expression_with_aggregate_and_property() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
-    db.session().execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE ({division: 'Sweden'}), ({division: 'Germany'}), ({division: 'England'}), ({division: 'Sweden'})",
     )
     .await?;
+    tx.commit().await?;
 
     let multi = db
         .session()
@@ -504,7 +512,9 @@ async fn test_with_order_by_local_times_desc() -> Result<()> {
 async fn test_with_order_by_distinct_type_precedence_with_limit() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
-    db.session().execute("CREATE (:N)-[:REL]->()").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:N)-[:REL]->()").await?;
+    tx.commit().await?;
     let with_mixed = db
         .session()
         .query(

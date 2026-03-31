@@ -114,8 +114,9 @@ async fn test_bulk_sync_sets_metadata() -> Result<()> {
     db.schema_manager().save().await?;
 
     // Bulk load some data with sync index rebuild
-    let mut bulk = db
-        .session()
+    let s = db.session();
+    let tx = s.tx().await?;
+    let mut bulk = tx
         .bulk_writer()
         .defer_scalar_indexes(true)
         .async_indexes(false)

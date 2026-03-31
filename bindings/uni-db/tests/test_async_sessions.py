@@ -20,8 +20,10 @@ async def db():
         .apply()
     )
     session = db.session()
-    await session.execute("CREATE (n:Person {name: 'Alice', age: 30})")
-    await session.execute("CREATE (n:Person {name: 'Bob', age: 25})")
+    tx = await session.tx()
+    await tx.execute("CREATE (n:Person {name: 'Alice', age: 30})")
+    await tx.execute("CREATE (n:Person {name: 'Bob', age: 25})")
+    await tx.commit()
     await db.flush()
     return db
 
@@ -48,8 +50,10 @@ async def test_async_session_query(db):
 async def test_async_session_execute(db):
     """Test executing a mutation through an async session."""
     session = db.session()
-    result = await session.execute("CREATE (n:Person {name: 'Charlie', age: 35})")
+    tx = await session.tx()
+    result = await tx.execute("CREATE (n:Person {name: 'Charlie', age: 35})")
     assert result.affected_rows >= 0
+    await tx.commit()
 
     results = await session.query(
         "MATCH (n:Person {name: 'Charlie'}) RETURN n.age AS age"

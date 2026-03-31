@@ -9,15 +9,14 @@ async fn test_return_property_access() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
     // Create schema and data
-    db.session()
-        .execute("CREATE LABEL Person (name STRING, age INT)")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL Person (name STRING, age INT)")
         .await?;
-    db.session()
-        .execute("CREATE (:Person {name: 'Alice', age: 25})")
+    tx.execute("CREATE (:Person {name: 'Alice', age: 25})")
         .await?;
-    db.session()
-        .execute("CREATE (:Person {name: 'Bob', age: 30})")
+    tx.execute("CREATE (:Person {name: 'Bob', age: 30})")
         .await?;
+    tx.commit().await?;
 
     // Test RETURN with property access
     let result = db
@@ -38,21 +37,15 @@ async fn test_return_property_access() -> Result<()> {
 async fn test_return_graph_introspection_functions() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
-    // Create schema
-    db.session()
-        .execute("CREATE LABEL Person (name STRING)")
+    // Create schema and data
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL Person (name STRING)").await?;
+    tx.execute("CREATE LABEL Company (name STRING)").await?;
+    tx.execute("CREATE EDGE TYPE WORKS_AT FROM Person TO Company")
         .await?;
-    db.session()
-        .execute("CREATE LABEL Company (name STRING)")
+    tx.execute("CREATE (:Person {name: 'Alice'})-[:WORKS_AT]->(:Company {name: 'Acme'})")
         .await?;
-    db.session()
-        .execute("CREATE EDGE TYPE WORKS_AT FROM Person TO Company")
-        .await?;
-
-    // Create data
-    db.session()
-        .execute("CREATE (:Person {name: 'Alice'})-[:WORKS_AT]->(:Company {name: 'Acme'})")
-        .await?;
+    tx.commit().await?;
 
     // Test labels() function
     let result = db
@@ -105,12 +98,12 @@ async fn test_return_full_node() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
     // Create schema and data
-    db.session()
-        .execute("CREATE LABEL Person (name STRING, age INT)")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL Person (name STRING, age INT)")
         .await?;
-    db.session()
-        .execute("CREATE (:Person {name: 'Alice', age: 25})")
+    tx.execute("CREATE (:Person {name: 'Alice', age: 25})")
         .await?;
+    tx.commit().await?;
 
     // Test returning full node
     let result = db.session().query("MATCH (n:Person) RETURN n").await?;

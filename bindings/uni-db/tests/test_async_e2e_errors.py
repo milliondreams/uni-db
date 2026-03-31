@@ -17,7 +17,9 @@ async def test_invalid_cypher_syntax_raises_exception(async_empty_db):
         await session.query("INVALID CYPHER SYNTAX !!!")
 
     with pytest.raises(Exception):
-        await session.execute("CREATE (n:Person {name: 'Alice' MISSING_BRACE")
+        tx = await session.tx()
+        await tx.execute("CREATE (n:Person {name: 'Alice' MISSING_BRACE")
+        await tx.commit()
 
 
 @pytest.mark.asyncio
@@ -48,9 +50,11 @@ async def test_type_mismatch_in_property(async_empty_db):
 
     session = async_empty_db.session()
     try:
-        await session.execute("""
+        tx = await session.tx()
+        await tx.execute("""
             CREATE (:Person {name: 'Alice', age: 'not_a_number'})
         """)
+        await tx.commit()
         pass  # No error means type was coerced
     except Exception:
         pass
@@ -63,9 +67,11 @@ async def test_operations_on_committed_bulk_writer_raise_error(async_empty_db):
     await async_empty_db.schema().label("Person").property("name", "string").apply()
 
     session = async_empty_db.session()
-    writer = await session.bulk_writer().build()
+    tx = await session.tx()
+    writer = await tx.bulk_writer().build()
     await writer.insert_vertices("Person", [{"name": "Alice"}])
     await writer.commit()
+    await tx.commit()
 
     with pytest.raises(RuntimeError):
         await writer.insert_vertices("Person", [{"name": "Bob"}])
@@ -81,9 +87,11 @@ async def test_operations_on_aborted_bulk_writer_raise_error(async_empty_db):
     await async_empty_db.schema().label("Person").property("name", "string").apply()
 
     session = async_empty_db.session()
-    writer = await session.bulk_writer().build()
+    tx = await session.tx()
+    writer = await tx.bulk_writer().build()
     await writer.insert_vertices("Person", [{"name": "Alice"}])
     writer.abort()
+    await tx.rollback()
 
     with pytest.raises(RuntimeError):
         await writer.insert_vertices("Person", [{"name": "Bob"}])

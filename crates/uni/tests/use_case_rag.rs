@@ -81,7 +81,8 @@ async fn test_rag_use_case() -> anyhow::Result<()> {
             ("embedding".to_string(), unival!(c3_vec)),
         ]),
     ];
-    let chunk_vids = db.session().bulk_insert_vertices("Chunk", chunks).await?;
+    let tx = db.session().tx().await?;
+    let chunk_vids = tx.bulk_insert_vertices("Chunk", chunks).await?;
     let c1 = chunk_vids[0];
     let c2 = chunk_vids[1];
     let _c3 = chunk_vids[2];
@@ -90,17 +91,13 @@ async fn test_rag_use_case() -> anyhow::Result<()> {
         ("name".to_string(), unival!("verify")),
         ("type".to_string(), unival!("function")),
     ])];
-    let entity_vids = db
-        .session()
-        .bulk_insert_vertices("Entity", entities)
-        .await?;
+    let entity_vids = tx.bulk_insert_vertices("Entity", entities).await?;
     let e1 = entity_vids[0];
 
     // Insert Edges
     let edges_mentions = vec![(c1, e1, HashMap::new()), (c2, e1, HashMap::new())];
-    db.session()
-        .bulk_insert_edges("MENTIONS", edges_mentions)
-        .await?;
+    tx.bulk_insert_edges("MENTIONS", edges_mentions).await?;
+    tx.commit().await?;
 
     // Flush to ensure data is in Lance (Vector query usually reads from L1/L2)
     // Note: Vector query might NOT read from L0?

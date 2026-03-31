@@ -70,7 +70,6 @@ locy_single_query = {
     explain_query                               // Cypher EXPLAIN (unchanged)
     | locy_statement_block
     | schema_command                             // Cypher schema commands (unchanged)
-    | transaction_command                        // Cypher transaction commands (unchanged)
 }
 
 locy_statement_block = { locy_clause+ }

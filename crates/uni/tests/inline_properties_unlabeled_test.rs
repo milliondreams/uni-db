@@ -9,15 +9,19 @@ async fn test_inline_property_unlabeled() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
     // Create unlabeled nodes (no schema needed)
-    db.session().execute("CREATE ({name: 'bar'})").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE ({name: 'bar'})").await?;
+    tx.commit().await?;
     println!("Created node 1");
 
     // Test immediately after first CREATE (should be in L0)
     let immediate = db.session().query("MATCH (n) RETURN n").await?;
     println!("Immediately after first CREATE: {} nodes", immediate.len());
 
-    db.session().execute("CREATE ({name: 'monkey'})").await?;
-    db.session().execute("CREATE ({firstname: 'bar'})").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE ({name: 'monkey'})").await?;
+    tx.execute("CREATE ({firstname: 'bar'})").await?;
+    tx.commit().await?;
 
     println!("Created 3 unlabeled nodes total");
 

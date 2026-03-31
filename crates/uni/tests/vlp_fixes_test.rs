@@ -34,9 +34,9 @@ async fn setup_multi_path_graph() -> Result<Uni> {
         .await?;
 
     // Create: a-[:R]->b1, a-[:R]->b2, a-[:R]->b3
-    db.session()
-        .execute(
-            r#"
+    let tx = db.session().tx().await?;
+    tx.execute(
+        r#"
         CREATE (a:A {num: 1})
         CREATE (b1:B {num: 10}), (b2:B {num: 20}), (b3:B {num: 30})
         CREATE (c1:C {name: "c1"}), (c2:C {name: "c2"}), (c3:C {name: "c3"})
@@ -47,8 +47,9 @@ async fn setup_multi_path_graph() -> Result<Uni> {
         CREATE (b2)-[:R {since: 2024}]->(c2)
         CREATE (b3)-[:R {since: 2025}]->(c3)
     "#,
-        )
-        .await?;
+    )
+    .await?;
+    tx.commit().await?;
 
     Ok(db)
 }
@@ -82,7 +83,9 @@ async fn test_optional_vlp_returns_all_matches() -> Result<()> {
 #[tokio::test]
 async fn test_optional_vlp_emits_row_when_no_match() -> Result<()> {
     let db = setup_multi_path_graph().await?;
-    db.session().execute("CREATE (:A {num: 999})").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:A {num: 999})").await?;
+    tx.commit().await?;
 
     // Should return 1 row (with null target), not 0 rows
     let result = db
@@ -135,15 +138,16 @@ async fn test_vlp_hydrates_unlabeled_target_properties() -> Result<()> {
     db.schema().edge_type("LINK", &[], &[]).apply().await?;
 
     // Create unlabeled nodes with properties
-    db.session()
-        .execute(
-            r#"
+    let tx = db.session().tx().await?;
+    tx.execute(
+        r#"
         CREATE (start:Start {id: 1})
         CREATE (n1 {name: "node1"}), (n2 {name: "node2"})
         CREATE (start)-[:LINK]->(n1)-[:LINK]->(n2)
     "#,
-        )
-        .await?;
+    )
+    .await?;
+    tx.commit().await?;
 
     // Query unlabeled targets via VLP - properties should be hydrated
     let result = db

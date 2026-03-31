@@ -1142,6 +1142,117 @@
     ]
   },
   {
+    "name": "DeriveVisibility",
+    "uri": "/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/derive/DeriveVisibility.feature",
+    "elements": [
+      {
+        "type": "scenario",
+        "name": "Trailing Cypher after DERIVE sees derived edges",
+        "line": 16,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "Trailing Cypher after DERIVE sees derived edges",
+            "result": {
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/derive/DeriveVisibility.feature:8:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/derive/DeriveVisibility.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/derive/DeriveVisibility.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "Trailing Cypher count reflects derived edge count",
+        "line": 31,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "Trailing Cypher count reflects derived edge count",
+            "result": {
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/derive/DeriveVisibility.feature:8:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/derive/DeriveVisibility.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/derive/DeriveVisibility.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "Trailing Cypher joins derived edges with existing graph",
+        "line": 51,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "Trailing Cypher joins derived edges with existing graph",
+            "result": {
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/derive/DeriveVisibility.feature:8:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/derive/DeriveVisibility.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/derive/DeriveVisibility.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "Trailing Cypher sees edges from multiple DERIVE commands",
+        "line": 72,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "Trailing Cypher sees edges from multiple DERIVE commands",
+            "result": {
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/derive/DeriveVisibility.feature:8:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/derive/DeriveVisibility.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/derive/DeriveVisibility.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "QUERY then DERIVE then trailing Cypher",
+        "line": 91,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "QUERY then DERIVE then trailing Cypher",
+            "result": {
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/derive/DeriveVisibility.feature:8:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/derive/DeriveVisibility.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/derive/DeriveVisibility.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "DERIVE edges do not persist to graph without tx.apply",
+        "line": 111,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "DERIVE edges do not persist to graph without tx.apply",
+            "result": {
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/derive/DeriveVisibility.feature:8:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/derive/DeriveVisibility.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/derive/DeriveVisibility.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+            }
+          }
+        ]
+      },
+      {
+        "type": "scenario",
+        "name": "Trailing Cypher after empty DERIVE returns 0 correctly",
+        "line": 124,
+        "steps": [
+          {
+            "keyword": "Scenario ",
+            "name": "Trailing Cypher after empty DERIVE returns 0 correctly",
+            "result": {
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/derive/DeriveVisibility.feature:8:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/derive/DeriveVisibility.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/derive/DeriveVisibility.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  {
     "name": "AlongWithIsRef",
     "uri": "/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/evaluate/AlongWithIsRef.feature",
     "elements": [

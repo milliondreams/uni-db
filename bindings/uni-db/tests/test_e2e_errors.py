@@ -40,7 +40,9 @@ def test_type_mismatch_in_property(social_db):
     # The engine performs lenient type coercion, so this may not raise
     # Just verify it doesn't crash the database
     try:
-        session.execute("CREATE (p:Person {name: 'Bob', age: 'not_an_int'})")
+        tx = session.tx()
+        tx.execute("CREATE (p:Person {name: 'Bob', age: 'not_an_int'})")
+        tx.commit()
     except Exception:
         pass  # Either behavior is acceptable
 
@@ -52,7 +54,9 @@ def test_type_mismatch_string_into_int_field(social_db):
     # age property is defined as int type
     # The engine performs lenient type coercion, so this may not raise
     try:
-        session.execute("CREATE (p:Person {name: 'Test', age: 'twenty-five'})")
+        tx = session.tx()
+        tx.execute("CREATE (p:Person {name: 'Test', age: 'twenty-five'})")
+        tx.commit()
     except Exception:
         pass  # Either behavior is acceptable
 
@@ -60,10 +64,12 @@ def test_type_mismatch_string_into_int_field(social_db):
 def test_operations_on_committed_bulk_writer(social_db):
     """Operations on a committed bulk writer should raise RuntimeError."""
     session = social_db.session()
-    writer = session.bulk_writer().build()
+    tx = session.tx()
+    writer = tx.bulk_writer().build()
 
     # Commit the writer
     writer.commit()
+    tx.commit()
 
     # Now try to insert - should raise RuntimeError (Python-side check)
     with pytest.raises(RuntimeError):
@@ -73,10 +79,12 @@ def test_operations_on_committed_bulk_writer(social_db):
 def test_operations_on_aborted_bulk_writer(social_db):
     """Operations on an aborted bulk writer should raise RuntimeError."""
     session = social_db.session()
-    writer = session.bulk_writer().build()
+    tx = session.tx()
+    writer = tx.bulk_writer().build()
 
     # Abort the writer
     writer.abort()
+    tx.rollback()
 
     # Now try to insert - should raise RuntimeError (Python-side check)
     with pytest.raises(RuntimeError):
@@ -148,13 +156,15 @@ def test_operations_after_transaction_rollback(social_db):
 def test_bulk_writer_double_commit(social_db):
     """Double commit on bulk writer should raise RuntimeError."""
     session = social_db.session()
-    writer = session.bulk_writer().build()
+    tx = session.tx()
+    writer = tx.bulk_writer().build()
 
     # Insert some data
     writer.insert_vertices("Person", [{"name": "Alice", "age": 30}])
 
     # First commit
     writer.commit()
+    tx.commit()
 
     # Second commit should raise RuntimeError (Python-side check)
     with pytest.raises(RuntimeError):
@@ -164,13 +174,15 @@ def test_bulk_writer_double_commit(social_db):
 def test_bulk_writer_double_abort(social_db):
     """Double abort on bulk writer is a no-op (does not raise)."""
     session = social_db.session()
-    writer = session.bulk_writer().build()
+    tx = session.tx()
+    writer = tx.bulk_writer().build()
 
     # Insert some data
     writer.insert_vertices("Person", [{"name": "Alice", "age": 30}])
 
     # First abort
     writer.abort()
+    tx.rollback()
 
     # Second abort is a no-op - the writer is already aborted
     writer.abort()
@@ -179,9 +191,11 @@ def test_bulk_writer_double_abort(social_db):
 def test_bulk_writer_commit_after_abort(social_db):
     """Committing after abort should raise RuntimeError."""
     session = social_db.session()
-    writer = session.bulk_writer().build()
+    tx = session.tx()
+    writer = tx.bulk_writer().build()
 
     writer.abort()
+    tx.rollback()
 
     with pytest.raises(RuntimeError):
         writer.commit()
@@ -191,9 +205,11 @@ def test_bulk_writer_commit_after_abort(social_db):
 def test_bulk_writer_abort_after_commit(social_db):
     """Aborting after commit should raise RuntimeError."""
     session = social_db.session()
-    writer = session.bulk_writer().build()
+    tx = session.tx()
+    writer = tx.bulk_writer().build()
 
     writer.commit()
+    tx.commit()
 
     with pytest.raises(RuntimeError):
         writer.abort()
@@ -235,7 +251,9 @@ def test_malformed_property_access(social_db):
     """Malformed property access in Cypher should raise an exception."""
     db = social_db
     session = db.session()
-    session.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+    tx = session.tx()
+    tx.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+    tx.commit()
 
     # Invalid property syntax
     with pytest.raises(Exception):
@@ -248,16 +266,20 @@ def test_missing_required_property(social_db):
     session = db.session()
     # name and age are required (not nullable) for Person
     with pytest.raises(Exception):
-        session.execute("CREATE (p:Person {name: 'Alice'})")  # missing age
+        tx = session.tx()
+        tx.execute("CREATE (p:Person {name: 'Alice'})")  # missing age
+        tx.commit()
 
 
 def test_bulk_writer_insert_after_commit(social_db):
     """Insert operations after bulk writer commit should raise RuntimeError."""
     session = social_db.session()
-    writer = session.bulk_writer().build()
+    tx = session.tx()
+    writer = tx.bulk_writer().build()
 
     writer.insert_vertices("Person", [{"name": "Alice", "age": 30}])
     writer.commit()
+    tx.commit()
 
     # Try to insert more vertices after commit - RuntimeError (Python-side check)
     with pytest.raises(RuntimeError):
@@ -267,7 +289,8 @@ def test_bulk_writer_insert_after_commit(social_db):
 def test_bulk_writer_insert_edges_after_abort(social_db):
     """Insert edge operations after bulk writer abort should raise RuntimeError."""
     session = social_db.session()
-    writer = session.bulk_writer().build()
+    tx = session.tx()
+    writer = tx.bulk_writer().build()
 
     # Insert vertices first
     vids = writer.insert_vertices(
@@ -275,6 +298,7 @@ def test_bulk_writer_insert_edges_after_abort(social_db):
     )
 
     writer.abort()
+    tx.rollback()
 
     # Try to insert edges after abort - RuntimeError (Python-side check)
     with pytest.raises(RuntimeError):

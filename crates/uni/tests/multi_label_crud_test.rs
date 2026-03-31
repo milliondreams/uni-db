@@ -109,7 +109,7 @@ mod test_helpers {
         expected_labels: &[&str],
     ) -> Result<()> {
         let labels = writer
-            .get_vertex_labels(vid)
+            .get_vertex_labels(vid, None)
             .await
             .ok_or_else(|| anyhow::anyhow!("Vid {:?} not found in any source", vid))?;
 
@@ -166,7 +166,12 @@ mod create_tests {
         props.insert("name".to_string(), unival!("Alice"));
 
         writer
-            .insert_vertex_with_labels(vid, props, &["Person".to_string(), "Employee".to_string()])
+            .insert_vertex_with_labels(
+                vid,
+                props,
+                &["Person".to_string(), "Employee".to_string()],
+                None,
+            )
             .await?;
 
         // Verify via L0Buffer before flush
@@ -209,6 +214,7 @@ mod create_tests {
                     "Employee".to_string(),
                     "Manager".to_string(),
                 ],
+                None,
             )
             .await?;
 
@@ -247,6 +253,7 @@ mod create_tests {
                 vid_a,
                 props_a.clone(),
                 &["Person".to_string(), "Employee".to_string()],
+                None,
             )
             .await?;
 
@@ -260,6 +267,7 @@ mod create_tests {
                 vid_b,
                 props_b,
                 &["Employee".to_string(), "Person".to_string()],
+                None,
             )
             .await?;
 
@@ -310,7 +318,9 @@ mod create_tests {
                 &["Person".to_string()]
             };
 
-            writer.insert_vertex_with_labels(vid, props, labels).await?;
+            writer
+                .insert_vertex_with_labels(vid, props, labels, None)
+                .await?;
         }
 
         writer.flush_to_l1(None).await?;
@@ -348,7 +358,7 @@ mod create_tests {
         let mut props1 = HashMap::new();
         props1.insert("name".to_string(), unival!("Alice"));
         writer
-            .insert_vertex_with_labels(vid1, props1, &["Person".to_string()])
+            .insert_vertex_with_labels(vid1, props1, &["Person".to_string()], None)
             .await?;
 
         // Test 2: Duplicate labels in input (should be deduplicated by VidLabelsIndex)
@@ -364,6 +374,7 @@ mod create_tests {
                     "Employee".to_string(),
                     "Employee".to_string(),
                 ],
+                None,
             )
             .await?;
 
@@ -425,6 +436,7 @@ mod l0_flush_tests {
                 vid1,
                 props1,
                 &["Person".to_string(), "Employee".to_string()],
+                None,
             )
             .await?;
 
@@ -432,14 +444,19 @@ mod l0_flush_tests {
         let mut props2 = HashMap::new();
         props2.insert("name".to_string(), unival!("Bob"));
         writer
-            .insert_vertex_with_labels(vid2, props2, &["Person".to_string(), "Manager".to_string()])
+            .insert_vertex_with_labels(
+                vid2,
+                props2,
+                &["Person".to_string(), "Manager".to_string()],
+                None,
+            )
             .await?;
 
         let vid3 = Vid::new(3);
         let mut props3 = HashMap::new();
         props3.insert("name".to_string(), unival!("Charlie"));
         writer
-            .insert_vertex_with_labels(vid3, props3, &["Company".to_string()])
+            .insert_vertex_with_labels(vid3, props3, &["Company".to_string()], None)
             .await?;
 
         // BEFORE flush: Verify all vertices exist in L0Buffer
@@ -528,6 +545,7 @@ mod l0_flush_tests {
                         "Employee".to_string(),
                         "Manager".to_string(),
                     ],
+                    None,
                 )
                 .await?;
 
@@ -597,6 +615,7 @@ mod read_tests {
                 vid_a,
                 props_a,
                 &["Person".to_string(), "Employee".to_string()],
+                None,
             )
             .await?;
 
@@ -604,7 +623,7 @@ mod read_tests {
         let mut props_b = HashMap::new();
         props_b.insert("name".to_string(), unival!("Bob"));
         writer
-            .insert_vertex_with_labels(vid_b, props_b, &["Person".to_string()])
+            .insert_vertex_with_labels(vid_b, props_b, &["Person".to_string()], None)
             .await?;
 
         let vid_c = Vid::new(3);
@@ -615,6 +634,7 @@ mod read_tests {
                 vid_c,
                 props_c,
                 &["Employee".to_string(), "Manager".to_string()],
+                None,
             )
             .await?;
 
@@ -659,6 +679,7 @@ mod read_tests {
                 vid_a,
                 props_a,
                 &["Person".to_string(), "Employee".to_string()],
+                None,
             )
             .await?;
 
@@ -670,6 +691,7 @@ mod read_tests {
                 vid_b,
                 props_b,
                 &["Person".to_string(), "Manager".to_string()],
+                None,
             )
             .await?;
 
@@ -685,6 +707,7 @@ mod read_tests {
                     "Employee".to_string(),
                     "Manager".to_string(),
                 ],
+                None,
             )
             .await?;
 
@@ -725,7 +748,7 @@ mod read_tests {
         let mut props = HashMap::new();
         props.insert("name".to_string(), unival!("Alice"));
         writer
-            .insert_vertex_with_labels(vid, props, &["Person".to_string()])
+            .insert_vertex_with_labels(vid, props, &["Person".to_string()], None)
             .await?;
 
         writer.flush_to_l1(None).await?;
@@ -758,13 +781,13 @@ mod read_tests {
         let mut props = HashMap::new();
         props.insert("name".to_string(), unival!("Alice"));
         writer
-            .insert_vertex_with_labels(vid, props, &["Person".to_string()])
+            .insert_vertex_with_labels(vid, props, &["Person".to_string()], None)
             .await?;
 
         writer.flush_to_l1(None).await?;
 
         // Verify the vertex doesn't have a non-existent label (persisted to L1)
-        let labels = writer.get_vertex_labels(vid).await.unwrap();
+        let labels = writer.get_vertex_labels(vid, None).await.unwrap();
         assert!(!labels.contains(&"NonExistent".to_string()));
         assert!(labels.contains(&"Person".to_string()));
 
@@ -793,13 +816,18 @@ mod read_tests {
         let mut props = HashMap::new();
         props.insert("name".to_string(), unival!("Alice"));
         writer
-            .insert_vertex_with_labels(vid, props, &["Person".to_string(), "Employee".to_string()])
+            .insert_vertex_with_labels(
+                vid,
+                props,
+                &["Person".to_string(), "Employee".to_string()],
+                None,
+            )
             .await?;
 
         writer.flush_to_l1(None).await?;
 
         // Test label membership (persisted to L1)
-        let labels = writer.get_vertex_labels(vid).await.unwrap();
+        let labels = writer.get_vertex_labels(vid, None).await.unwrap();
 
         // Test has_label equivalent
         assert!(labels.contains(&"Person".to_string()));
@@ -850,7 +878,7 @@ mod update_tests {
         let mut props = HashMap::new();
         props.insert("name".to_string(), unival!("Alice"));
         writer
-            .insert_vertex_with_labels(vid, props.clone(), &["Person".to_string()])
+            .insert_vertex_with_labels(vid, props.clone(), &["Person".to_string()], None)
             .await?;
 
         writer.flush_to_l1(None).await?;
@@ -860,7 +888,12 @@ mod update_tests {
 
         // Add Employee label by re-inserting with updated labels
         writer
-            .insert_vertex_with_labels(vid, props, &["Person".to_string(), "Employee".to_string()])
+            .insert_vertex_with_labels(
+                vid,
+                props,
+                &["Person".to_string(), "Employee".to_string()],
+                None,
+            )
             .await?;
 
         writer.flush_to_l1(None).await?;
@@ -897,6 +930,7 @@ mod update_tests {
                 vid,
                 props.clone(),
                 &["Person".to_string(), "Employee".to_string()],
+                None,
             )
             .await?;
 
@@ -907,7 +941,7 @@ mod update_tests {
 
         // Remove Employee label by re-inserting with only Person
         writer
-            .insert_vertex_with_labels(vid, props, &["Person".to_string()])
+            .insert_vertex_with_labels(vid, props, &["Person".to_string()], None)
             .await?;
 
         writer.flush_to_l1(None).await?;
@@ -941,7 +975,12 @@ mod update_tests {
         props1.insert("name".to_string(), unival!("Alice"));
         props1.insert("age".to_string(), unival!(30));
         writer
-            .insert_vertex_with_labels(vid, props1, &["Person".to_string(), "Employee".to_string()])
+            .insert_vertex_with_labels(
+                vid,
+                props1,
+                &["Person".to_string(), "Employee".to_string()],
+                None,
+            )
             .await?;
 
         writer.flush_to_l1(None).await?;
@@ -951,7 +990,12 @@ mod update_tests {
         props2.insert("name".to_string(), unival!("Alicia"));
         props2.insert("age".to_string(), unival!(31));
         writer
-            .insert_vertex_with_labels(vid, props2, &["Person".to_string(), "Employee".to_string()])
+            .insert_vertex_with_labels(
+                vid,
+                props2,
+                &["Person".to_string(), "Employee".to_string()],
+                None,
+            )
             .await?;
 
         writer.flush_to_l1(None).await?;
@@ -988,6 +1032,7 @@ mod update_tests {
                 vid,
                 props.clone(),
                 &["Person".to_string(), "Employee".to_string()],
+                None,
             )
             .await?;
 
@@ -995,13 +1040,18 @@ mod update_tests {
 
         // Try adding Employee again (duplicate)
         writer
-            .insert_vertex_with_labels(vid, props, &["Person".to_string(), "Employee".to_string()])
+            .insert_vertex_with_labels(
+                vid,
+                props,
+                &["Person".to_string(), "Employee".to_string()],
+                None,
+            )
             .await?;
 
         writer.flush_to_l1(None).await?;
 
         // Verify labels are correct (persisted to L1)
-        let labels = writer.get_vertex_labels(vid).await.unwrap();
+        let labels = writer.get_vertex_labels(vid, None).await.unwrap();
 
         // Verify both Person and Employee are present
         assert!(labels.contains(&"Person".to_string()));
@@ -1032,13 +1082,13 @@ mod update_tests {
         let mut props = HashMap::new();
         props.insert("name".to_string(), unival!("Alice"));
         writer
-            .insert_vertex_with_labels(vid, props, &["Person".to_string()])
+            .insert_vertex_with_labels(vid, props, &["Person".to_string()], None)
             .await?;
 
         writer.flush_to_l1(None).await?;
 
         // Verify the vertex doesn't have Employee label (persisted to L1)
-        let labels = writer.get_vertex_labels(vid).await.unwrap();
+        let labels = writer.get_vertex_labels(vid, None).await.unwrap();
 
         assert!(
             !labels.contains(&"Employee".to_string()),
@@ -1090,6 +1140,7 @@ mod delete_tests {
                     "Employee".to_string(),
                     "Manager".to_string(),
                 ],
+                None,
             )
             .await?;
 
@@ -1099,11 +1150,11 @@ mod delete_tests {
         verify_labels_persisted(&writer, vid, &["Person", "Employee", "Manager"]).await?;
 
         // Delete vertex
-        writer.delete_vertex(vid, None).await?;
+        writer.delete_vertex(vid, None, None).await?;
         writer.flush_to_l1(None).await?;
 
         // Verify deleted (should not be found in any source)
-        let labels = writer.get_vertex_labels(vid).await;
+        let labels = writer.get_vertex_labels(vid, None).await;
         assert!(labels.is_none(), "Deleted vertex should not be found");
 
         Ok(())
@@ -1131,20 +1182,30 @@ mod delete_tests {
         let mut props = HashMap::new();
         props.insert("name".to_string(), unival!("Alice"));
         writer
-            .insert_vertex_with_labels(vid, props, &["Person".to_string(), "Employee".to_string()])
+            .insert_vertex_with_labels(
+                vid,
+                props,
+                &["Person".to_string(), "Employee".to_string()],
+                None,
+            )
             .await?;
 
         writer.flush_to_l1(None).await?;
 
         // Delete
-        writer.delete_vertex(vid, None).await?;
+        writer.delete_vertex(vid, None, None).await?;
         writer.flush_to_l1(None).await?;
 
         // Recreate with different labels: Person:Manager
         let mut props2 = HashMap::new();
         props2.insert("name".to_string(), unival!("Alice"));
         writer
-            .insert_vertex_with_labels(vid, props2, &["Person".to_string(), "Manager".to_string()])
+            .insert_vertex_with_labels(
+                vid,
+                props2,
+                &["Person".to_string(), "Manager".to_string()],
+                None,
+            )
             .await?;
 
         writer.flush_to_l1(None).await?;
@@ -1153,7 +1214,7 @@ mod delete_tests {
         verify_labels_persisted(&writer, vid, &["Person", "Manager"]).await?;
 
         // Verify old Employee label not present
-        let labels = writer.get_vertex_labels(vid).await.unwrap();
+        let labels = writer.get_vertex_labels(vid, None).await.unwrap();
         assert!(!labels.contains(&"Employee".to_string()));
 
         Ok(())
@@ -1185,6 +1246,7 @@ mod delete_tests {
                 vid1,
                 props1,
                 &["Person".to_string(), "Employee".to_string()],
+                None,
             )
             .await?;
 
@@ -1192,17 +1254,22 @@ mod delete_tests {
         let mut props2 = HashMap::new();
         props2.insert("name".to_string(), unival!("Bob"));
         writer
-            .insert_vertex_with_labels(vid2, props2, &["Person".to_string(), "Manager".to_string()])
+            .insert_vertex_with_labels(
+                vid2,
+                props2,
+                &["Person".to_string(), "Manager".to_string()],
+                None,
+            )
             .await?;
 
         writer.flush_to_l1(None).await?;
 
         // Delete vid1
-        writer.delete_vertex(vid1, None).await?;
+        writer.delete_vertex(vid1, None, None).await?;
         writer.flush_to_l1(None).await?;
 
         // Verify vid1 is deleted (persisted to L1)
-        let labels1 = writer.get_vertex_labels(vid1).await;
+        let labels1 = writer.get_vertex_labels(vid1, None).await;
         assert!(labels1.is_none(), "Deleted vertex should not be found");
 
         // Verify vid2 still exists (persisted to L1)
@@ -1237,6 +1304,7 @@ mod delete_tests {
                 vid_person,
                 props_person,
                 &["Person".to_string(), "Employee".to_string()],
+                None,
             )
             .await?;
 
@@ -1244,18 +1312,18 @@ mod delete_tests {
         let mut props_company = HashMap::new();
         props_company.insert("name".to_string(), unival!("ACME Corp"));
         writer
-            .insert_vertex_with_labels(vid_company, props_company, &["Company".to_string()])
+            .insert_vertex_with_labels(vid_company, props_company, &["Company".to_string()], None)
             .await?;
 
         let eid = Eid::new(100);
         writer
-            .insert_edge(vid_person, vid_company, 1, eid, HashMap::new(), None)
+            .insert_edge(vid_person, vid_company, 1, eid, HashMap::new(), None, None)
             .await?;
 
         writer.flush_to_l1(None).await?;
 
         // Delete vertex (which will delete edges too)
-        writer.delete_vertex(vid_person, None).await?;
+        writer.delete_vertex(vid_person, None, None).await?;
         writer.flush_to_l1(None).await?;
 
         // Verify vertex is deleted or tombstoned
@@ -1317,7 +1385,7 @@ mod index_tests {
                 unival!(format!("Person{}", vid.as_u64())),
             );
             writer
-                .insert_vertex_with_labels(*vid, props, labels)
+                .insert_vertex_with_labels(*vid, props, labels, None)
                 .await?;
         }
 
@@ -1368,6 +1436,7 @@ mod index_tests {
                 vid1,
                 props1,
                 &["Person".to_string(), "Employee".to_string()],
+                None,
             )
             .await?;
 
@@ -1375,7 +1444,12 @@ mod index_tests {
         let mut props2 = HashMap::new();
         props2.insert("name".to_string(), unival!("Bob"));
         writer
-            .insert_vertex_with_labels(vid2, props2, &["Person".to_string(), "Manager".to_string()])
+            .insert_vertex_with_labels(
+                vid2,
+                props2,
+                &["Person".to_string(), "Manager".to_string()],
+                None,
+            )
             .await?;
 
         writer.flush_to_l1(None).await?;
@@ -1420,7 +1494,9 @@ mod index_tests {
                 ],
             };
 
-            writer.insert_vertex_with_labels(vid, props, labels).await?;
+            writer
+                .insert_vertex_with_labels(vid, props, labels, None)
+                .await?;
         }
 
         writer.flush_to_l1(None).await?;
@@ -1471,6 +1547,7 @@ mod uniid_tests {
                 vid_a,
                 props_a.clone(),
                 &["Person".to_string(), "Employee".to_string()],
+                None,
             )
             .await?;
 
@@ -1483,6 +1560,7 @@ mod uniid_tests {
                 vid_b,
                 props_b,
                 &["Employee".to_string(), "Person".to_string()],
+                None,
             )
             .await?;
 
@@ -1519,7 +1597,7 @@ mod uniid_tests {
         let mut props1 = HashMap::new();
         props1.insert("name".to_string(), unival!("Alice"));
         writer
-            .insert_vertex_with_labels(vid1, props1, &["Person".to_string()])
+            .insert_vertex_with_labels(vid1, props1, &["Person".to_string()], None)
             .await?;
 
         // Create vertex with ["Person", "Employee"]
@@ -1531,6 +1609,7 @@ mod uniid_tests {
                 vid2,
                 props2,
                 &["Person".to_string(), "Employee".to_string()],
+                None,
             )
             .await?;
 
@@ -1586,7 +1665,7 @@ mod uniid_tests {
             let mut props = HashMap::new();
             props.insert("name".to_string(), unival!("Alice"));
             writer
-                .insert_vertex_with_labels(*vid, props, labels)
+                .insert_vertex_with_labels(*vid, props, labels, None)
                 .await?;
         }
 
@@ -1625,8 +1704,8 @@ mod cypher_tests {
             .await?;
 
         // Try to create a vertex with multi-label syntax
-        let result = db
-            .session()
+        let tx = db.session().tx().await?;
+        let result = tx
             .execute("CREATE (:Person:Employee {name: 'Alice'})")
             .await;
 
@@ -1634,6 +1713,7 @@ mod cypher_tests {
         match result {
             Ok(_) => {
                 // Parser supports it! Verify the vertex was created
+                tx.commit().await?;
                 db.flush().await?;
 
                 let query_result = db.session().query("MATCH (p:Person) RETURN p.name").await?;
@@ -1678,12 +1758,10 @@ mod cypher_tests {
             .await?;
 
         // Create test data using single-label syntax
-        db.session()
-            .execute("CREATE (:Person {name: 'Alice'})")
-            .await?;
-        db.session()
-            .execute("CREATE (:Person {name: 'Bob'})")
-            .await?;
+        let tx = db.session().tx().await?;
+        tx.execute("CREATE (:Person {name: 'Alice'})").await?;
+        tx.execute("CREATE (:Person {name: 'Bob'})").await?;
+        tx.commit().await?;
         db.flush().await?;
 
         // Try to match with multi-label pattern
@@ -1720,17 +1798,19 @@ mod cypher_tests {
             .await?;
 
         // Create a Person vertex
-        db.session()
-            .execute("CREATE (:Person {name: 'Alice'})")
-            .await?;
+        let tx = db.session().tx().await?;
+        tx.execute("CREATE (:Person {name: 'Alice'})").await?;
+        tx.commit().await?;
         db.flush().await?;
 
         // Try to add Manager label using SET
-        let result = db.session().execute("MATCH (p:Person) SET p:Manager").await;
+        let tx = db.session().tx().await?;
+        let result = tx.execute("MATCH (p:Person) SET p:Manager").await;
 
         match result {
             Ok(_) => {
                 println!("SET label operation supported!");
+                tx.commit().await?;
                 db.flush().await?;
 
                 // Verify the vertex now has Manager label
@@ -1769,20 +1849,19 @@ mod cypher_tests {
             .await?;
 
         // Create a Person vertex
-        db.session()
-            .execute("CREATE (:Person {name: 'Alice'})")
-            .await?;
+        let tx = db.session().tx().await?;
+        tx.execute("CREATE (:Person {name: 'Alice'})").await?;
+        tx.commit().await?;
         db.flush().await?;
 
         // Try to remove Employee label using REMOVE
-        let result = db
-            .session()
-            .execute("MATCH (p:Person) REMOVE p:Employee")
-            .await;
+        let tx = db.session().tx().await?;
+        let result = tx.execute("MATCH (p:Person) REMOVE p:Employee").await;
 
         match result {
             Ok(_) => {
                 println!("REMOVE label operation supported!");
+                tx.commit().await?;
                 Ok(())
             }
             Err(e) => {
@@ -1806,9 +1885,9 @@ mod cypher_tests {
             .await?;
 
         // Create a Person vertex
-        db.session()
-            .execute("CREATE (:Person {name: 'Alice'})")
-            .await?;
+        let tx = db.session().tx().await?;
+        tx.execute("CREATE (:Person {name: 'Alice'})").await?;
+        tx.commit().await?;
         db.flush().await?;
 
         // Try to use labels() function

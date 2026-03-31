@@ -18,6 +18,7 @@ use uni_common::core::schema::{
 };
 
 // Re-export types used by the sync and async API modules.
+pub use ::uni_db::api::schema::EdgeTypeInfo as UniEdgeTypeInfo;
 pub use ::uni_db::api::schema::LabelInfo as UniLabelInfo;
 pub use ::uni_db::query_crate::QueryCursor;
 pub use ::uni_db::{ExplainOutput, ProfileOutput, QueryResult, Row};
@@ -161,6 +162,14 @@ pub async fn get_label_info_core(db: &Uni, name: &str) -> Result<Option<UniLabel
     db.get_label_info(name).await
 }
 
+/// Get detailed information about an edge type.
+pub async fn get_edge_type_info_core(
+    db: &Uni,
+    name: &str,
+) -> Result<Option<UniEdgeTypeInfo>, UniError> {
+    db.get_edge_type_info(name).await
+}
+
 /// Load schema from a JSON file.
 pub async fn load_schema_core(db: &Uni, path: &str) -> Result<(), UniError> {
     db.load_schema(path).await
@@ -183,54 +192,36 @@ pub async fn apply_schema_core(
     pending_properties: &[(String, String, DataType, bool)],
     pending_indexes: &[IndexDefinition],
 ) -> Result<(), UniError> {
-    let sm = db.schema_manager();
+    use ::uni_db::api::schema::SchemaChange;
+
+    let mut changes = Vec::new();
 
     for name in pending_labels {
-        match sm.add_label(name) {
-            Ok(_) => {}
-            Err(e) if e.to_string().contains("already exists") => {}
-            Err(e) => {
-                return Err(UniError::Schema {
-                    message: e.to_string(),
-                });
-            }
-        }
+        changes.push(SchemaChange::AddLabel { name: name.clone() });
     }
 
     for (name, from, to) in pending_edge_types {
-        match sm.add_edge_type(name, from.clone(), to.clone()) {
-            Ok(_) => {}
-            Err(e) if e.to_string().contains("already exists") => {}
-            Err(e) => {
-                return Err(UniError::Schema {
-                    message: e.to_string(),
-                });
-            }
-        }
+        changes.push(SchemaChange::AddEdgeType {
+            name: name.clone(),
+            from_labels: from.clone(),
+            to_labels: to.clone(),
+        });
     }
 
     for (label_or_type, prop_name, data_type, nullable) in pending_properties {
-        match sm.add_property(label_or_type, prop_name, data_type.clone(), *nullable) {
-            Ok(_) => {}
-            Err(e) if e.to_string().contains("already exists") => {}
-            Err(e) => {
-                return Err(UniError::Schema {
-                    message: e.to_string(),
-                });
-            }
-        }
+        changes.push(SchemaChange::AddProperty {
+            label_or_type: label_or_type.clone(),
+            name: prop_name.clone(),
+            data_type: data_type.clone(),
+            nullable: *nullable,
+        });
     }
 
     for idx in pending_indexes {
-        sm.add_index(idx.clone()).map_err(|e| UniError::Schema {
-            message: e.to_string(),
-        })?;
+        changes.push(SchemaChange::AddIndex(idx.clone()));
     }
 
-    sm.save().await.map_err(|e| UniError::Schema {
-        message: e.to_string(),
-    })?;
-    Ok(())
+    db.schema().with_changes(changes).apply().await
 }
 
 // ============================================================================
@@ -325,8 +316,8 @@ pub async fn xervo_generate_core(
 // ============================================================================
 
 /// Create a point-in-time snapshot of the database.
-pub async fn create_snapshot_core(db: &Uni, name: Option<String>) -> Result<String, UniError> {
-    db.create_snapshot(name.as_deref()).await
+pub async fn create_snapshot_core(db: &Uni, name: &str) -> Result<String, UniError> {
+    db.create_snapshot(name).await
 }
 
 /// List all available snapshots.
@@ -345,27 +336,12 @@ pub async fn restore_snapshot_core(db: &Uni, snapshot_id: &str) -> Result<(), Un
 // Compaction Core
 // ============================================================================
 
-/// Compact a label's storage files.
-pub async fn compact_label_core(
+/// Compact a label or edge type's storage files.
+pub async fn compact_core(
     db: &Uni,
-    label: &str,
+    name: &str,
 ) -> Result<crate::types::PyCompactionStats, UniError> {
-    let stats = db.compact_label(label).await?;
-    Ok(crate::types::PyCompactionStats {
-        files_compacted: stats.files_compacted,
-        bytes_before: stats.bytes_before,
-        bytes_after: stats.bytes_after,
-        duration_secs: stats.duration.as_secs_f64(),
-        crdt_merges: stats.crdt_merges,
-    })
-}
-
-/// Compact an edge type's storage files.
-pub async fn compact_edge_type_core(
-    db: &Uni,
-    edge_type: &str,
-) -> Result<crate::types::PyCompactionStats, UniError> {
-    let stats = db.compact_edge_type(edge_type).await?;
+    let stats = db.compaction().compact(name).await?;
     Ok(crate::types::PyCompactionStats {
         files_compacted: stats.files_compacted,
         bytes_before: stats.bytes_before,
@@ -377,7 +353,7 @@ pub async fn compact_edge_type_core(
 
 /// Wait for any ongoing compaction to complete.
 pub async fn wait_for_compaction_core(db: &Uni) -> Result<(), UniError> {
-    db.wait_for_compaction().await
+    db.compaction().wait().await
 }
 
 // ============================================================================
@@ -388,36 +364,31 @@ pub async fn wait_for_compaction_core(db: &Uni) -> Result<(), UniError> {
 pub async fn index_rebuild_status_core(
     db: &Uni,
 ) -> Result<Vec<uni_store::storage::IndexRebuildTask>, UniError> {
-    db.index_rebuild_status().await
+    db.indexes().rebuild_status().await
 }
 
 /// Retry failed index rebuild tasks.
 pub async fn retry_index_rebuilds_core(db: &Uni) -> Result<Vec<String>, UniError> {
-    db.retry_index_rebuilds().await
+    db.indexes().retry_failed().await
 }
 
-/// Force rebuild indexes for a label (async_ = true runs in background).
+/// Force rebuild indexes for a label (background = true runs in background).
 pub async fn rebuild_indexes_core(
     db: &Uni,
     label: &str,
-    async_: bool,
+    background: bool,
 ) -> Result<Option<String>, UniError> {
-    db.rebuild_indexes(label, async_).await
-}
-
-/// Check if an index is currently being rebuilt for a label.
-pub async fn is_index_building_core(db: &Uni, label: &str) -> Result<bool, UniError> {
-    db.is_index_building(label).await
+    db.indexes().rebuild(label, background).await
 }
 
 /// List all indexes defined on a specific label.
 pub fn list_indexes_core(db: &Uni, label: &str) -> Vec<uni_common::core::schema::IndexDefinition> {
-    db.list_indexes(label)
+    db.indexes().list(Some(label))
 }
 
 /// List all indexes in the database.
 pub fn list_all_indexes_core(db: &Uni) -> Vec<uni_common::core::schema::IndexDefinition> {
-    db.list_all_indexes()
+    db.indexes().list(None)
 }
 
 // ============================================================================
@@ -490,34 +461,42 @@ pub async fn build_database_core(
         OpenMode::Temporary => Uni::temporary(),
     };
 
-    if let (Some(local), Some(remote)) = (hybrid_local, hybrid_remote) {
-        builder = builder.hybrid(local, remote);
-    }
+    // Apply uni_config first so cache_size/parallelism overrides below take effect
+    let mut config = uni_config.unwrap_or_default();
 
     if let Some(size) = cache_size {
-        builder = builder.cache_size(size);
+        config.cache_size = size;
     }
 
     if let Some(n) = parallelism {
-        builder = builder.parallelism(n);
+        config.parallelism = n;
     }
+
+    builder = builder.config(config);
 
     if let Some(path) = schema_file {
         builder = builder.schema_file(path);
     }
 
     if let Some(json) = xervo_catalog_json {
-        builder = builder.xervo_catalog_from_str(json)?;
+        let catalog = ::uni_db::xervo_catalog_from_str(json)
+            .map_err(|e| UniError::Internal(anyhow::anyhow!(e.to_string())))?;
+        builder = builder.xervo_catalog(catalog);
     } else if let Some(path) = xervo_catalog_file {
-        builder = builder.xervo_catalog_from_file(path)?;
+        let catalog = ::uni_db::xervo_catalog_from_file(path)
+            .map_err(|e| UniError::Internal(anyhow::anyhow!(e.to_string())))?;
+        builder = builder.xervo_catalog(catalog);
     }
 
-    if let Some(cc) = cloud_config {
-        builder = builder.cloud_config(cc);
-    }
-
-    if let Some(cfg) = uni_config {
-        builder = builder.config(cfg);
+    if let (Some(_local), Some(remote)) = (hybrid_local, hybrid_remote) {
+        if let Some(cc) = cloud_config {
+            builder = builder.remote_storage(remote, cc);
+        } else {
+            // remote_storage requires config; create a minimal one from the URL scheme
+            return Err(UniError::Internal(anyhow::anyhow!(
+                "remote_storage requires a CloudStorageConfig"
+            )));
+        }
     }
 
     if read_only {

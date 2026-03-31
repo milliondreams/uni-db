@@ -130,6 +130,7 @@ impl BulkWriterBuilder {
     ///
     /// The guard is acquired in [`build()`](Self::build) rather than at creation time,
     /// so that `Session::bulk_writer()` is infallible.
+    #[allow(dead_code)] // Scaffolding for Session::bulk_writer()
     pub(crate) fn new_deferred(
         db: Arc<UniInner>,
         guard: Arc<AtomicBool>,

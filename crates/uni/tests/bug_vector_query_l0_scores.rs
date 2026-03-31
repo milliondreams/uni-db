@@ -148,7 +148,7 @@ async fn test_vector_query_score_consistency_with_and_without_index() -> anyhow:
         .await?;
 
     // 3. Build index and query again
-    db.rebuild_indexes("Item", false).await?;
+    db.indexes().rebuild("Item", false).await?;
 
     let res_with_index = db
         .session()

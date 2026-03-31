@@ -16,8 +16,6 @@ pub mod index;
 pub mod index_manager;
 pub mod index_rebuild;
 #[cfg(feature = "lance-backend")]
-pub(super) mod index_utils;
-#[cfg(feature = "lance-backend")]
 pub mod inverted_index;
 #[cfg(feature = "lance-backend")]
 pub mod json_index;

@@ -240,36 +240,55 @@ impl AsyncDatabase {
         })
     }
 
-    /// Get the full schema as a dictionary.
-    fn get_schema<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
-        // Schema is synchronous, no need for async wrapper
-        let schema = self.inner.get_schema();
-        let dict = PyDict::new(py);
+    /// Get detailed information about an edge type.
+    fn get_edge_type_info<'py>(
+        &self,
+        py: Python<'py>,
+        name: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let info = core::get_edge_type_info_core(&inner, &name)
+                .await
+                .map_err(crate::exceptions::uni_error_to_pyerr)?;
 
-        let labels = PyDict::new(py);
-        for (name, meta) in &schema.labels {
-            let label_dict = PyDict::new(py);
-            label_dict.set_item("id", meta.id)?;
-            labels.set_item(name, label_dict)?;
-        }
-        dict.set_item("labels", labels)?;
-
-        let edge_types = PyDict::new(py);
-        for (name, meta) in &schema.edge_types {
-            let et_dict = PyDict::new(py);
-            et_dict.set_item("id", meta.id)?;
-            edge_types.set_item(name, et_dict)?;
-        }
-        dict.set_item("edge_types", edge_types)?;
-
-        Ok(dict.into())
-    }
-
-    /// Get the schema as a typed `Schema` object.
-    fn get_schema_typed(&self) -> crate::types::PySchema {
-        crate::types::PySchema {
-            inner: self.inner.get_schema(),
-        }
+            Ok(info.map(|i| crate::types::EdgeTypeInfo {
+                name: i.name,
+                count: i.count,
+                source_labels: i.source_labels,
+                target_labels: i.target_labels,
+                properties: i
+                    .properties
+                    .into_iter()
+                    .map(|p| crate::types::PropertyInfo {
+                        name: p.name,
+                        data_type: p.data_type,
+                        nullable: p.nullable,
+                        is_indexed: p.is_indexed,
+                    })
+                    .collect(),
+                indexes: i
+                    .indexes
+                    .into_iter()
+                    .map(|idx| crate::types::IndexInfo {
+                        name: idx.name,
+                        index_type: idx.index_type,
+                        properties: idx.properties,
+                        status: idx.status,
+                    })
+                    .collect(),
+                constraints: i
+                    .constraints
+                    .into_iter()
+                    .map(|c| crate::types::ConstraintInfo {
+                        name: c.name,
+                        constraint_type: c.constraint_type,
+                        properties: c.properties,
+                        enabled: c.enabled,
+                    })
+                    .collect(),
+            }))
+        })
     }
 
     /// Load schema from a JSON file.
@@ -302,8 +321,11 @@ impl AsyncDatabase {
 
     /// Create a new async session wrapping a real Rust Session.
     fn session(&self) -> AsyncSession {
+        let session = self.inner.session();
+        let rule_reg = session.rules().clone_registry_arc();
         AsyncSession {
-            inner: Arc::new(tokio::sync::Mutex::new(self.inner.session())),
+            inner: Arc::new(tokio::sync::Mutex::new(session)),
+            rule_registry_arc: rule_reg,
         }
     }
 
@@ -332,16 +354,11 @@ impl AsyncDatabase {
         })
     }
 
-    /// Register Locy rules at the database level.
-    fn register_rules(&self, program: &str) -> PyResult<()> {
-        self.inner
-            .register_rules(program)
-            .map_err(crate::exceptions::uni_error_to_pyerr)
-    }
-
-    /// Clear all registered Locy rules at the database level.
-    fn clear_rules(&self) {
-        self.inner.clear_rules();
+    /// Access the rule registry for managing pre-compiled Locy rules.
+    fn rules(&self) -> crate::sync_api::PyRuleRegistry {
+        crate::sync_api::PyRuleRegistry {
+            registry: self.inner.rules().clone_registry_arc(),
+        }
     }
 
     /// Flush data and prepare for shutdown.
@@ -389,15 +406,10 @@ impl AsyncDatabase {
     // -----------------------------------------------------------------------
 
     /// Create a point-in-time snapshot. Returns the snapshot ID.
-    #[pyo3(signature = (name=None))]
-    fn create_snapshot<'py>(
-        &self,
-        py: Python<'py>,
-        name: Option<String>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    fn create_snapshot<'py>(&self, py: Python<'py>, name: String) -> PyResult<Bound<'py, PyAny>> {
         let db = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            core::create_snapshot_core(&db, name)
+            core::create_snapshot_core(&db, &name)
                 .await
                 .map_err(crate::exceptions::uni_error_to_pyerr)
         })
@@ -433,125 +445,18 @@ impl AsyncDatabase {
         })
     }
 
-    // -----------------------------------------------------------------------
-    // Index administration
-    // -----------------------------------------------------------------------
-
-    /// Get status of background index rebuild tasks.
-    fn index_rebuild_status<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let db = self.inner.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let tasks = core::index_rebuild_status_core(&db)
-                .await
-                .map_err(crate::exceptions::uni_error_to_pyerr)?;
-            Python::attach(|py| {
-                tasks
-                    .into_iter()
-                    .map(|t| convert::index_rebuild_task_to_py(py, t))
-                    .collect::<PyResult<Vec<_>>>()
-            })
-        })
+    /// Access compaction operations.
+    fn compaction(&self) -> AsyncCompaction {
+        AsyncCompaction {
+            inner: self.inner.clone(),
+        }
     }
 
-    /// Retry failed index rebuild tasks.
-    fn retry_index_rebuilds<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let db = self.inner.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            core::retry_index_rebuilds_core(&db)
-                .await
-                .map_err(crate::exceptions::uni_error_to_pyerr)
-        })
-    }
-
-    /// Force rebuild indexes for a label. If background=True, returns a task ID.
-    #[pyo3(signature = (label, background=false))]
-    fn rebuild_indexes<'py>(
-        &self,
-        py: Python<'py>,
-        label: String,
-        background: bool,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let db = self.inner.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            core::rebuild_indexes_core(&db, &label, background)
-                .await
-                .map_err(crate::exceptions::uni_error_to_pyerr)
-        })
-    }
-
-    // -----------------------------------------------------------------------
-    // Compaction
-    // -----------------------------------------------------------------------
-
-    /// Compact a label's storage files.
-    fn compact_label<'py>(&self, py: Python<'py>, label: String) -> PyResult<Bound<'py, PyAny>> {
-        let db = self.inner.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            core::compact_label_core(&db, &label)
-                .await
-                .map_err(crate::exceptions::uni_error_to_pyerr)
-        })
-    }
-
-    /// Compact an edge type's storage files.
-    fn compact_edge_type<'py>(
-        &self,
-        py: Python<'py>,
-        edge_type: String,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let db = self.inner.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            core::compact_edge_type_core(&db, &edge_type)
-                .await
-                .map_err(crate::exceptions::uni_error_to_pyerr)
-        })
-    }
-
-    /// Wait for any ongoing compaction to complete.
-    fn wait_for_compaction<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let db = self.inner.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            core::wait_for_compaction_core(&db)
-                .await
-                .map_err(crate::exceptions::uni_error_to_pyerr)
-        })
-    }
-
-    /// Check if an index is currently being rebuilt for a label.
-    fn is_index_building<'py>(
-        &self,
-        py: Python<'py>,
-        label: String,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let db = self.inner.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            core::is_index_building_core(&db, &label)
-                .await
-                .map_err(crate::exceptions::uni_error_to_pyerr)
-        })
-    }
-
-    /// List all indexes defined on a specific label.
-    fn list_indexes<'py>(
-        &self,
-        py: Python<'py>,
-        label: String,
-    ) -> PyResult<Vec<crate::types::IndexDefinitionInfo>> {
-        core::list_indexes_core(&self.inner, &label)
-            .into_iter()
-            .map(|i| convert::index_definition_to_py(py, i))
-            .collect()
-    }
-
-    /// List all indexes in the database.
-    fn list_all_indexes<'py>(
-        &self,
-        py: Python<'py>,
-    ) -> PyResult<Vec<crate::types::IndexDefinitionInfo>> {
-        core::list_all_indexes_core(&self.inner)
-            .into_iter()
-            .map(|i| convert::index_definition_to_py(py, i))
-            .collect()
+    /// Access index management operations.
+    fn indexes(&self) -> AsyncIndexes {
+        AsyncIndexes {
+            inner: self.inner.clone(),
+        }
     }
 }
 
@@ -631,6 +536,111 @@ impl AsyncXervo {
                     .await
                     .map_err(crate::exceptions::uni_error_to_pyerr)?;
             Python::attach(|py| crate::convert::generation_result_to_py(py, result))
+        })
+    }
+}
+
+// ============================================================================
+// AsyncCompaction
+// ============================================================================
+
+/// Async facade for compaction operations.
+#[pyclass(name = "AsyncCompaction")]
+pub struct AsyncCompaction {
+    inner: Arc<Uni>,
+}
+
+#[pymethods]
+impl AsyncCompaction {
+    /// Compact data for a label or edge type.
+    fn compact<'py>(&self, py: Python<'py>, name: String) -> PyResult<Bound<'py, PyAny>> {
+        let db = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            core::compact_core(&db, &name)
+                .await
+                .map_err(crate::exceptions::uni_error_to_pyerr)
+        })
+    }
+
+    /// Wait for all background compaction to complete.
+    fn wait<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let db = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            core::wait_for_compaction_core(&db)
+                .await
+                .map_err(crate::exceptions::uni_error_to_pyerr)
+        })
+    }
+}
+
+// ============================================================================
+// AsyncIndexes
+// ============================================================================
+
+/// Async facade for index management operations.
+#[pyclass(name = "AsyncIndexes")]
+pub struct AsyncIndexes {
+    inner: Arc<Uni>,
+}
+
+#[pymethods]
+impl AsyncIndexes {
+    /// List index definitions, optionally filtered by label.
+    #[pyo3(signature = (label=None))]
+    fn list(
+        &self,
+        py: Python,
+        label: Option<String>,
+    ) -> PyResult<Vec<crate::types::IndexDefinitionInfo>> {
+        let indexes = match label.as_deref() {
+            Some(l) => core::list_indexes_core(&self.inner, l),
+            None => core::list_all_indexes_core(&self.inner),
+        };
+        indexes
+            .into_iter()
+            .map(|i| convert::index_definition_to_py(py, i))
+            .collect()
+    }
+
+    /// Rebuild indexes for a label. If background=True, returns a task ID.
+    #[pyo3(signature = (label, background=false))]
+    fn rebuild<'py>(
+        &self,
+        py: Python<'py>,
+        label: String,
+        background: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let db = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            core::rebuild_indexes_core(&db, &label, background)
+                .await
+                .map_err(crate::exceptions::uni_error_to_pyerr)
+        })
+    }
+
+    /// Get status of all rebuild tasks.
+    fn rebuild_status<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let db = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let tasks = core::index_rebuild_status_core(&db)
+                .await
+                .map_err(crate::exceptions::uni_error_to_pyerr)?;
+            Python::attach(|py| {
+                tasks
+                    .into_iter()
+                    .map(|t| convert::index_rebuild_task_to_py(py, t))
+                    .collect::<PyResult<Vec<_>>>()
+            })
+        })
+    }
+
+    /// Retry failed rebuild tasks. Returns task IDs scheduled for retry.
+    fn retry_failed<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let db = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            core::retry_index_rebuilds_core(&db)
+                .await
+                .map_err(crate::exceptions::uni_error_to_pyerr)
         })
     }
 }
@@ -900,6 +910,7 @@ impl AsyncDatabaseBuilder {
 #[pyclass]
 pub struct AsyncTransaction {
     pub(crate) inner: Arc<tokio::sync::Mutex<Option<::uni_db::Transaction>>>,
+    pub(crate) rule_registry_arc: std::sync::Arc<std::sync::RwLock<::uni_db::LocyRuleRegistry>>,
 }
 
 #[pymethods]
@@ -1127,34 +1138,11 @@ impl AsyncTransaction {
         })
     }
 
-    /// Register Locy rules for reuse within this transaction.
-    fn register_rules<'py>(&self, py: Python<'py>, program: String) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let guard = inner.lock().await;
-            let tx = guard.as_ref().ok_or_else(|| {
-                crate::exceptions::UniTransactionAlreadyCompletedError::new_err(
-                    "Transaction already completed",
-                )
-            })?;
-            tx.register_rules(&program)
-                .map_err(crate::exceptions::uni_error_to_pyerr)
-        })
-    }
-
-    /// Clear all registered Locy rules in this transaction.
-    fn clear_rules<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let guard = inner.lock().await;
-            let tx = guard.as_ref().ok_or_else(|| {
-                crate::exceptions::UniTransactionAlreadyCompletedError::new_err(
-                    "Transaction already completed",
-                )
-            })?;
-            tx.clear_rules();
-            Ok(())
-        })
+    /// Access the transaction-scoped rule registry.
+    fn rules(&self) -> crate::sync_api::PyRuleRegistry {
+        crate::sync_api::PyRuleRegistry {
+            registry: self.rule_registry_arc.clone(),
+        }
     }
 
     /// Cancel in-progress operations on this transaction.
@@ -1520,6 +1508,7 @@ impl AsyncTxBulkWriterBuilder {
 #[pyclass]
 pub struct AsyncSession {
     pub(crate) inner: Arc<tokio::sync::Mutex<::uni_db::Session>>,
+    pub(crate) rule_registry_arc: std::sync::Arc<std::sync::RwLock<::uni_db::LocyRuleRegistry>>,
 }
 
 #[pymethods]
@@ -1637,8 +1626,10 @@ impl AsyncSession {
                 guard.tx().await
             }
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
+            let rule_reg = tx.rules().clone_registry_arc();
             Ok(AsyncTransaction {
                 inner: Arc::new(tokio::sync::Mutex::new(Some(tx))),
+                rule_registry_arc: rule_reg,
             })
         })
     }
@@ -1720,15 +1711,11 @@ impl AsyncSession {
         })
     }
 
-    /// Register Locy rules for reuse across evaluations in this session.
-    fn register_rules<'py>(&self, py: Python<'py>, program: String) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let guard = inner.lock().await;
-            guard
-                .register_rules(&program)
-                .map_err(crate::exceptions::uni_error_to_pyerr)
-        })
+    /// Access the session-scoped rule registry.
+    fn rules(&self) -> crate::sync_api::PyRuleRegistry {
+        crate::sync_api::PyRuleRegistry {
+            registry: self.rule_registry_arc.clone(),
+        }
     }
 
     /// Prepare a Cypher query for repeated execution (returns awaitable).
@@ -1820,16 +1807,6 @@ impl AsyncSession {
                 let tuple = (query_result, profile_output);
                 tuple.into_py_any(py)
             })
-        })
-    }
-
-    /// Clear all registered Locy rules.
-    fn clear_rules<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let guard = inner.lock().await;
-            guard.clear_rules();
-            Ok(())
         })
     }
 
@@ -2252,8 +2229,10 @@ impl AsyncTransactionBuilder {
                 .start()
                 .await
                 .map_err(crate::exceptions::uni_error_to_pyerr)?;
+            let rule_reg = tx.rules().clone_registry_arc();
             Ok(AsyncTransaction {
                 inner: Arc::new(tokio::sync::Mutex::new(Some(tx))),
+                rule_registry_arc: rule_reg,
             })
         })
     }
@@ -3517,6 +3496,37 @@ pub struct AsyncSchemaBuilder {
 
 #[pymethods]
 impl AsyncSchemaBuilder {
+    /// Get the current schema as a dictionary.
+    fn current(&self, py: Python) -> PyResult<pyo3::Py<pyo3::types::PyAny>> {
+        let schema = self.inner.schema().current();
+        let dict = pyo3::types::PyDict::new(py);
+
+        let labels = pyo3::types::PyDict::new(py);
+        for (name, meta) in &schema.labels {
+            let label_dict = pyo3::types::PyDict::new(py);
+            label_dict.set_item("id", meta.id)?;
+            labels.set_item(name, label_dict)?;
+        }
+        dict.set_item("labels", labels)?;
+
+        let edge_types = pyo3::types::PyDict::new(py);
+        for (name, meta) in &schema.edge_types {
+            let et_dict = pyo3::types::PyDict::new(py);
+            et_dict.set_item("id", meta.id)?;
+            edge_types.set_item(name, et_dict)?;
+        }
+        dict.set_item("edge_types", edge_types)?;
+
+        Ok(dict.into())
+    }
+
+    /// Get the current schema as a typed `Schema` object.
+    fn current_typed(&self) -> crate::types::PySchema {
+        crate::types::PySchema {
+            inner: self.inner.schema().current(),
+        }
+    }
+
     /// Start defining a new label.
     fn label(&self, name: &str) -> PyResult<AsyncLabelBuilder> {
         Ok(AsyncLabelBuilder {

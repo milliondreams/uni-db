@@ -492,19 +492,10 @@ impl Transaction {
 
     // ── Rule Management ───────────────────────────────────────────────
 
-    /// Register Locy rules scoped to this transaction.
+    /// Access the transaction-scoped rule registry.
     /// On commit, new rules are promoted to the session (best-effort).
-    #[instrument(skip(self), fields(transaction_id = %self.id))]
-    pub fn register_rules(&self, program: &str) -> Result<()> {
-        impl_locy::register_rules_on_registry(&self.rule_registry, program)
-    }
-
-    /// Clear all registered rules in this transaction scope.
-    #[instrument(skip(self), fields(transaction_id = %self.id))]
-    pub fn clear_rules(&self) {
-        let mut registry = self.rule_registry.write().unwrap();
-        registry.rules.clear();
-        registry.strata.clear();
+    pub fn rules(&self) -> super::rule_registry::RuleRegistry<'_> {
+        super::rule_registry::RuleRegistry::new(&self.rule_registry)
     }
 
     // ── Lifecycle ─────────────────────────────────────────────────────

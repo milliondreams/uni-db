@@ -14,7 +14,6 @@ use uni_common::{Result, UniError, Value};
 
 use crate::api::UniInner;
 use crate::api::bulk::{BulkStats, BulkWriter, BulkWriterBuilder};
-use crate::api::session::Session;
 
 /// Builder for creating a [`StreamingAppender`].
 pub struct AppenderBuilder {
@@ -31,21 +30,6 @@ pub struct AppenderBuilder {
 }
 
 impl AppenderBuilder {
-    /// Create a new appender builder from a Session.
-    pub(crate) fn new(session: &Session, label: &str) -> Self {
-        Self {
-            db: session.db().clone(),
-            write_guard: session.active_write_guard().clone(),
-            session_id: session.id().to_string(),
-            is_pinned: session.is_pinned(),
-            guard_pre_acquired: false,
-            label: label.to_string(),
-            batch_size: 5000,
-            defer_vector_indexes: true,
-            max_buffer_size_bytes: None,
-        }
-    }
-
     /// Create an appender builder for use within a Transaction.
     ///
     /// The Transaction already holds the session write guard, so the appender

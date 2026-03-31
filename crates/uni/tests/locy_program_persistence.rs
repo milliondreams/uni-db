@@ -28,7 +28,7 @@ async fn test_locy_register_persists_rules() -> anyhow::Result<()> {
     db.flush().await?;
 
     // Step 1: Register rules globally (no execution).
-    db.register_rules(
+    db.rules().register(
         "CREATE RULE reach AS
            MATCH (a:Node)-[:EDGE]->(b:Node)
            YIELD KEY a, KEY b",
@@ -71,14 +71,14 @@ async fn test_locy_clear_removes_registered_rules() -> anyhow::Result<()> {
     db.flush().await?;
 
     // Register a rule globally.
-    db.register_rules(
+    db.rules().register(
         "CREATE RULE reach AS
            MATCH (a:Node)-[:EDGE]->(b:Node)
            YIELD KEY a, KEY b",
     )?;
 
     // Clear the global registry.
-    db.clear_rules();
+    db.rules().clear();
 
     // Evaluating a QUERY that references the cleared rule should fail or
     // return empty results (rule is no longer available).

@@ -208,7 +208,7 @@ async fn test_fts_query_sees_l0_writes() -> Result<()> {
     tx.execute("CREATE FULLTEXT INDEX article_body_fts FOR (a:Article) ON EACH [a.body]")
         .await?;
     tx.commit().await?;
-    db.rebuild_indexes("Article", false).await?;
+    db.indexes().rebuild("Article", false).await?;
 
     // Sanity: flushed data is findable via FTS
     let flushed = db

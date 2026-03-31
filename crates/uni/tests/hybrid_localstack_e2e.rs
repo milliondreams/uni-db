@@ -27,8 +27,7 @@ async fn test_hybrid_localstack_from_zero_e2e() -> Result<()> {
 
     // Start from empty remote + empty local metadata directory.
     let db = Uni::open(local_meta.to_string_lossy().to_string())
-        .hybrid(&local_meta, &remote_url)
-        .cloud_config(cloud_cfg.clone())
+        .remote_storage(&remote_url, cloud_cfg.clone())
         .build()
         .await?;
 
@@ -56,8 +55,7 @@ async fn test_hybrid_localstack_from_zero_e2e() -> Result<()> {
 
     // Reopen and verify graph state survives in hybrid mode.
     let db = Uni::open(local_meta.to_string_lossy().to_string())
-        .hybrid(&local_meta, &remote_url)
-        .cloud_config(cloud_cfg.clone())
+        .remote_storage(&remote_url, cloud_cfg.clone())
         .build()
         .await?;
 
@@ -84,8 +82,7 @@ async fn test_hybrid_localstack_from_zero_e2e() -> Result<()> {
     drop(db);
 
     let db = Uni::open(local_meta.to_string_lossy().to_string())
-        .hybrid(&local_meta, &remote_url)
-        .cloud_config(cloud_cfg.clone())
+        .remote_storage(&remote_url, cloud_cfg.clone())
         .build()
         .await?;
 

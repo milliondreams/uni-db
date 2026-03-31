@@ -53,7 +53,7 @@ impl UniSync {
     }
 
     pub fn schema_meta(&self) -> Arc<Schema> {
-        self.inner().get_schema()
+        self.inner().schema().current()
     }
 
     pub fn schema(&self) -> SchemaBuilderSync<'_> {
@@ -161,14 +161,9 @@ impl<'a> SessionSync<'a> {
 
     // ── Rule Management ───────────────────────────────────────────────
 
-    /// Register Locy rules for this session.
-    pub fn register_rules(&self, program: &str) -> Result<()> {
-        self.session.register_rules(program)
-    }
-
-    /// Clear all registered Locy rules for this session.
-    pub fn clear_rules(&self) {
-        self.session.clear_rules()
+    /// Access the session-scoped rule registry.
+    pub fn rules(&self) -> crate::api::rule_registry::RuleRegistry<'_> {
+        self.session.rules()
     }
 
     /// Compile a Locy program without executing it.

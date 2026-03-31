@@ -18,7 +18,7 @@ async fn test_create_edge_type_with_properties() -> Result<()> {
         .await?;
     tx.commit().await?;
 
-    let schema = db.get_schema();
+    let schema = db.schema().current();
     assert!(schema.edge_types.contains_key("WORKS_AT"));
     let works_at_props = schema.properties.get("WORKS_AT").unwrap();
     assert!(works_at_props.contains_key("since"));
@@ -36,7 +36,7 @@ async fn test_create_edge_type_with_properties() -> Result<()> {
     .await?;
     tx.commit().await?;
 
-    let schema = db.get_schema();
+    let schema = db.schema().current();
     assert!(schema.edge_types.contains_key("KNOWS"));
     let knows_props = schema.properties.get("KNOWS").unwrap();
     assert!(knows_props.contains_key("since"));
@@ -49,7 +49,7 @@ async fn test_create_edge_type_with_properties() -> Result<()> {
         .await?;
     tx.commit().await?;
 
-    let schema = db.get_schema();
+    let schema = db.schema().current();
     assert!(schema.edge_types.contains_key("FOLLOWS"));
     // No properties should be defined for FOLLOWS
     let follows_props = schema.properties.get("FOLLOWS");
@@ -61,7 +61,7 @@ async fn test_create_edge_type_with_properties() -> Result<()> {
         .await?;
     tx.commit().await?;
 
-    let schema = db.get_schema();
+    let schema = db.schema().current();
     assert!(schema.edge_types.contains_key("LIKES"));
 
     println!("✅ All CREATE EDGE TYPE property definition tests passed!");
@@ -82,7 +82,7 @@ async fn test_create_edge_type_with_property_constraints() -> Result<()> {
     .await?;
     tx.commit().await?;
 
-    let schema = db.get_schema();
+    let schema = db.schema().current();
     let rated_props = schema.properties.get("RATED").unwrap();
 
     // score should be NOT NULL

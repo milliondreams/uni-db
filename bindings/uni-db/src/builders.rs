@@ -268,6 +268,37 @@ pub struct SchemaBuilder {
 
 #[pymethods]
 impl SchemaBuilder {
+    /// Get the current schema as a dictionary.
+    fn current(&self, py: Python) -> PyResult<pyo3::Py<pyo3::types::PyAny>> {
+        let schema = self.inner.schema().current();
+        let dict = pyo3::types::PyDict::new(py);
+
+        let labels = pyo3::types::PyDict::new(py);
+        for (name, meta) in &schema.labels {
+            let label_dict = pyo3::types::PyDict::new(py);
+            label_dict.set_item("id", meta.id)?;
+            labels.set_item(name, label_dict)?;
+        }
+        dict.set_item("labels", labels)?;
+
+        let edge_types = pyo3::types::PyDict::new(py);
+        for (name, meta) in &schema.edge_types {
+            let et_dict = pyo3::types::PyDict::new(py);
+            et_dict.set_item("id", meta.id)?;
+            edge_types.set_item(name, et_dict)?;
+        }
+        dict.set_item("edge_types", edge_types)?;
+
+        Ok(dict.into())
+    }
+
+    /// Get the current schema as a typed `Schema` object.
+    fn current_typed(&self) -> crate::types::PySchema {
+        crate::types::PySchema {
+            inner: self.inner.schema().current(),
+        }
+    }
+
     /// Start defining a new label.
     fn label(&self, name: &str) -> PyResult<LabelBuilder> {
         Ok(LabelBuilder {
@@ -662,11 +693,11 @@ impl Session {
         convert::locy_result_to_py_class(py, result)
     }
 
-    /// Register Locy rules for reuse across evaluations in this session.
-    fn register_rules(&self, program: &str) -> PyResult<()> {
-        self.inner
-            .register_rules(program)
-            .map_err(crate::exceptions::uni_error_to_pyerr)
+    /// Access the session-scoped rule registry.
+    fn rules(&self) -> crate::sync_api::PyRuleRegistry {
+        crate::sync_api::PyRuleRegistry {
+            registry: self.inner.rules().clone_registry_arc(),
+        }
     }
 
     /// Prepare a Cypher query for repeated execution.
@@ -719,11 +750,6 @@ impl Session {
         let query_result = convert::query_result_to_py_class(py, results)?;
         let profile_output = convert::profile_output_to_py_class(py, profile)?;
         Ok((query_result, profile_output))
-    }
-
-    /// Clear all registered Locy rules.
-    fn clear_rules(&self) {
-        self.inner.clear_rules();
     }
 
     /// Compile a Locy program without executing it.

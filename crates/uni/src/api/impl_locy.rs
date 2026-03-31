@@ -38,6 +38,8 @@ pub struct LocyRuleRegistry {
     pub rules: HashMap<String, uni_locy::types::CompiledRule>,
     /// Strata from registered programs, for execution ordering.
     pub strata: Vec<uni_locy::types::Stratum>,
+    /// Source program texts, stored for recompilation on rule removal.
+    pub sources: Vec<String>,
 }
 
 /// Compile and register rules into an existing rule registry.
@@ -67,6 +69,7 @@ pub(crate) fn register_rules_on_registry(
         stratum.depends_on = stratum.depends_on.iter().map(|d| base_id + d).collect();
         registry.strata.push(stratum);
     }
+    registry.sources.push(program.to_string());
     Ok(())
 }
 

@@ -14,7 +14,7 @@ async fn test_ddl_execution() -> Result<()> {
         .await?;
     tx.commit().await?;
 
-    let schema = db.get_schema();
+    let schema = db.schema().current();
     assert!(schema.labels.contains_key("Person"));
     let person_props = schema.properties.get("Person").unwrap();
     assert!(person_props.contains_key("name"));
@@ -35,7 +35,7 @@ async fn test_ddl_execution() -> Result<()> {
         .await?;
     tx.commit().await?;
 
-    let schema = db.get_schema();
+    let schema = db.schema().current();
     assert!(schema.edge_types.contains_key("FOLLOWS"));
     let follows_meta = schema.edge_types.get("FOLLOWS").unwrap();
     assert_eq!(follows_meta.src_labels, &["Person".to_string()]);
@@ -45,7 +45,7 @@ async fn test_ddl_execution() -> Result<()> {
     tx.execute("ALTER LABEL Person ADD PROPERTY bio STRING")
         .await?;
     tx.commit().await?;
-    let schema = db.get_schema();
+    let schema = db.schema().current();
     assert!(schema.properties.get("Person").unwrap().contains_key("bio"));
 
     // 4. CREATE CONSTRAINT
@@ -53,7 +53,7 @@ async fn test_ddl_execution() -> Result<()> {
     tx.execute("CREATE CONSTRAINT name_unique ON (p:Person) ASSERT p.name IS UNIQUE")
         .await?;
     tx.commit().await?;
-    let schema = db.get_schema();
+    let schema = db.schema().current();
     assert!(schema.constraints.iter().any(|c| c.name == "name_unique"));
 
     // 5. SHOW CONSTRAINTS
@@ -65,7 +65,7 @@ async fn test_ddl_execution() -> Result<()> {
     let tx = db.session().tx().await?;
     tx.execute("DROP LABEL Person").await?;
     tx.commit().await?;
-    let schema = db.get_schema();
+    let schema = db.schema().current();
     assert!(schema.labels.contains_key("Person"));
     assert!(matches!(
         schema.labels.get("Person").unwrap().state,

@@ -317,7 +317,7 @@ async fn test_bulk_async_indexes_returns_immediately() -> Result<()> {
     assert_eq!(result.rows()[0].get::<i64>("c")?, 100);
 
     // Check initial status - should have pending or in-progress tasks
-    let status = db.index_rebuild_status().await?;
+    let status = db.indexes().rebuild_status().await?;
     // Status may be empty if no indexes defined, or have tasks if indexes exist
     if !status.is_empty() {
         // Verify task structure is correct
@@ -377,16 +377,16 @@ async fn test_index_rebuild_status_tracking() -> Result<()> {
     let (db, _temp) = setup_db().await?;
 
     // Initially, there should be no tasks
-    let status = db.index_rebuild_status().await?;
+    let status = db.indexes().rebuild_status().await?;
     // After a fresh DB, status may be empty or have loaded state
     let _initial_count = status.len();
 
     // Use rebuild_indexes to trigger a task
-    let task_id = db.rebuild_indexes("Person", true).await?;
+    let task_id = db.indexes().rebuild("Person", true).await?;
 
     // If a task was created, verify we can track it
     if let Some(tid) = task_id {
-        let status = db.index_rebuild_status().await?;
+        let status = db.indexes().rebuild_status().await?;
         let found = status.iter().any(|t| t.id == tid);
         assert!(found, "Task {} should be in status list", tid);
     }
@@ -399,11 +399,18 @@ async fn test_is_index_building() -> Result<()> {
     let (db, _temp) = setup_db().await?;
 
     // Initially, no indexes should be building
-    let is_building = db.is_index_building("Person").await?;
+    let status = db.indexes().rebuild_status().await?;
+    let is_building = status.iter().any(|t| {
+        matches!(
+            t.status,
+            uni_store::storage::IndexRebuildStatus::Pending
+                | uni_store::storage::IndexRebuildStatus::InProgress
+        )
+    });
     assert!(!is_building);
 
     // Trigger an async rebuild
-    let _task_id = db.rebuild_indexes("Person", true).await?;
+    let _task_id = db.indexes().rebuild("Person", true).await?;
 
     // Note: The task may complete very quickly for an empty dataset
     // So we just verify the API works without asserting the value

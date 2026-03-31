@@ -17,7 +17,7 @@ async fn test_composite_index_creation() -> Result<()> {
     tx.commit().await?;
 
     // 3. Verify schema
-    let schema = db.get_schema();
+    let schema = db.schema().current();
     let index = schema
         .indexes
         .iter()
@@ -59,7 +59,7 @@ async fn test_composite_index_creation() -> Result<()> {
     tx.commit().await?;
 
     // Verify partial index metadata
-    let schema = db.get_schema();
+    let schema = db.schema().current();
     let partial_idx = schema
         .indexes
         .iter()

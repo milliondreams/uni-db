@@ -172,6 +172,7 @@ impl crate::api::UniInner {
 
     /// Get the current L0Buffer mutation stats snapshot.
     /// Used together with `get_mutation_count` to compute per-type affected counters.
+    #[allow(dead_code)] // Reserved for future per-type affected_rows reporting
     pub(crate) async fn get_mutation_stats(&self) -> uni_store::runtime::l0::MutationStats {
         match self.writer.as_ref() {
             Some(w) => {

@@ -265,18 +265,12 @@ impl Transaction {
         })
     }
 
-    /// Register Locy rules for reuse within this transaction.
-    fn register_rules(&self, program: &str) -> PyResult<()> {
+    /// Access the transaction-scoped rule registry.
+    fn rules(&self) -> PyResult<PyRuleRegistry> {
         let tx = self.check_active()?;
-        tx.register_rules(program)
-            .map_err(crate::exceptions::uni_error_to_pyerr)
-    }
-
-    /// Clear all registered Locy rules in this transaction.
-    fn clear_rules(&self) -> PyResult<()> {
-        let tx = self.check_active()?;
-        tx.clear_rules();
-        Ok(())
+        Ok(PyRuleRegistry {
+            registry: tx.rules().clone_registry_arc(),
+        })
     }
 
     /// Cancel in-progress operations.
@@ -813,35 +807,48 @@ impl Database {
         }))
     }
 
-    /// Get the full schema as a dictionary.
-    fn get_schema(&self, py: Python) -> PyResult<Py<PyAny>> {
-        let schema = self.inner.get_schema();
-        let dict = PyDict::new(py);
+    /// Get detailed information about an edge type.
+    fn get_edge_type_info(&self, name: &str) -> PyResult<Option<crate::types::EdgeTypeInfo>> {
+        let info = pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(core::get_edge_type_info_core(&self.inner, name))
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
 
-        let labels = PyDict::new(py);
-        for (name, meta) in &schema.labels {
-            let label_dict = PyDict::new(py);
-            label_dict.set_item("id", meta.id)?;
-            labels.set_item(name, label_dict)?;
-        }
-        dict.set_item("labels", labels)?;
-
-        let edge_types = PyDict::new(py);
-        for (name, meta) in &schema.edge_types {
-            let et_dict = PyDict::new(py);
-            et_dict.set_item("id", meta.id)?;
-            edge_types.set_item(name, et_dict)?;
-        }
-        dict.set_item("edge_types", edge_types)?;
-
-        Ok(dict.into())
-    }
-
-    /// Get the schema as a typed `Schema` object.
-    fn get_schema_typed(&self) -> PySchema {
-        PySchema {
-            inner: self.inner.get_schema(),
-        }
+        Ok(info.map(|i| crate::types::EdgeTypeInfo {
+            name: i.name,
+            count: i.count,
+            source_labels: i.source_labels,
+            target_labels: i.target_labels,
+            properties: i
+                .properties
+                .into_iter()
+                .map(|p| PropertyInfo {
+                    name: p.name,
+                    data_type: p.data_type,
+                    nullable: p.nullable,
+                    is_indexed: p.is_indexed,
+                })
+                .collect(),
+            indexes: i
+                .indexes
+                .into_iter()
+                .map(|idx| IndexInfo {
+                    name: idx.name,
+                    index_type: idx.index_type,
+                    properties: idx.properties,
+                    status: idx.status,
+                })
+                .collect(),
+            constraints: i
+                .constraints
+                .into_iter()
+                .map(|c| ConstraintInfo {
+                    name: c.name,
+                    constraint_type: c.constraint_type,
+                    properties: c.properties,
+                    enabled: c.enabled,
+                })
+                .collect(),
+        }))
     }
 
     /// Load schema from a JSON file.
@@ -882,16 +889,11 @@ impl Database {
         }
     }
 
-    /// Register Locy rules at the database level.
-    fn register_rules(&self, program: &str) -> PyResult<()> {
-        self.inner
-            .register_rules(program)
-            .map_err(crate::exceptions::uni_error_to_pyerr)
-    }
-
-    /// Clear all registered Locy rules at the database level.
-    fn clear_rules(&self) {
-        self.inner.clear_rules();
+    /// Access the rule registry for managing pre-compiled Locy rules.
+    fn rules(&self) -> PyRuleRegistry {
+        PyRuleRegistry {
+            registry: self.inner.rules().clone_registry_arc(),
+        }
     }
 
     /// Get a Xervo facade for embedding and generation operations.
@@ -906,8 +908,7 @@ impl Database {
     // -----------------------------------------------------------------------
 
     /// Create a point-in-time snapshot. Returns the snapshot ID.
-    #[pyo3(signature = (name=None))]
-    fn create_snapshot(&self, name: Option<String>) -> PyResult<String> {
+    fn create_snapshot(&self, name: &str) -> PyResult<String> {
         pyo3_async_runtimes::tokio::get_runtime()
             .block_on(core::create_snapshot_core(&self.inner, name))
             .map_err(crate::exceptions::uni_error_to_pyerr)
@@ -931,89 +932,18 @@ impl Database {
             .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
-    // -----------------------------------------------------------------------
-    // Compaction
-    // -----------------------------------------------------------------------
-
-    /// Compact a label's storage files.
-    fn compact_label(&self, label: &str) -> PyResult<crate::types::PyCompactionStats> {
-        pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(core::compact_label_core(&self.inner, label))
-            .map_err(crate::exceptions::uni_error_to_pyerr)
+    /// Access compaction operations.
+    fn compaction(&self) -> PyCompaction {
+        PyCompaction {
+            inner: self.inner.clone(),
+        }
     }
 
-    /// Compact an edge type's storage files.
-    fn compact_edge_type(&self, edge_type: &str) -> PyResult<crate::types::PyCompactionStats> {
-        pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(core::compact_edge_type_core(&self.inner, edge_type))
-            .map_err(crate::exceptions::uni_error_to_pyerr)
-    }
-
-    /// Wait for any ongoing compaction to complete.
-    fn wait_for_compaction(&self) -> PyResult<()> {
-        pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(core::wait_for_compaction_core(&self.inner))
-            .map_err(crate::exceptions::uni_error_to_pyerr)
-    }
-
-    // -----------------------------------------------------------------------
-    // Index administration
-    // -----------------------------------------------------------------------
-
-    /// Get status of background index rebuild tasks.
-    fn index_rebuild_status(
-        &self,
-        py: Python,
-    ) -> PyResult<Vec<crate::types::IndexRebuildTaskInfo>> {
-        let tasks = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(core::index_rebuild_status_core(&self.inner))
-            .map_err(crate::exceptions::uni_error_to_pyerr)?;
-        tasks
-            .into_iter()
-            .map(|t| convert::index_rebuild_task_to_py(py, t))
-            .collect()
-    }
-
-    /// Retry failed index rebuild tasks. Returns task IDs scheduled for retry.
-    fn retry_index_rebuilds(&self) -> PyResult<Vec<String>> {
-        pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(core::retry_index_rebuilds_core(&self.inner))
-            .map_err(crate::exceptions::uni_error_to_pyerr)
-    }
-
-    /// Force rebuild indexes for a label. If background=true, returns a task ID.
-    #[pyo3(signature = (label, background=false))]
-    fn rebuild_indexes(&self, label: &str, background: bool) -> PyResult<Option<String>> {
-        pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(core::rebuild_indexes_core(&self.inner, label, background))
-            .map_err(crate::exceptions::uni_error_to_pyerr)
-    }
-
-    /// Check if an index is currently being rebuilt for a label.
-    fn is_index_building(&self, label: &str) -> PyResult<bool> {
-        pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(core::is_index_building_core(&self.inner, label))
-            .map_err(crate::exceptions::uni_error_to_pyerr)
-    }
-
-    /// List all indexes defined on a specific label.
-    fn list_indexes(
-        &self,
-        py: Python,
-        label: &str,
-    ) -> PyResult<Vec<crate::types::IndexDefinitionInfo>> {
-        core::list_indexes_core(&self.inner, label)
-            .into_iter()
-            .map(|i| convert::index_definition_to_py(py, i))
-            .collect()
-    }
-
-    /// List all indexes in the database.
-    fn list_all_indexes(&self, py: Python) -> PyResult<Vec<crate::types::IndexDefinitionInfo>> {
-        core::list_all_indexes_core(&self.inner)
-            .into_iter()
-            .map(|i| convert::index_definition_to_py(py, i))
-            .collect()
+    /// Access index management operations.
+    fn indexes(&self) -> PyIndexes {
+        PyIndexes {
+            inner: self.inner.clone(),
+        }
     }
 
     /// Flush data and prepare for shutdown.
@@ -1131,5 +1061,151 @@ impl Xervo {
             ))
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
         convert::generation_result_to_py(py, result)
+    }
+}
+
+// ============================================================================
+// Rule Registry (synchronous)
+// ============================================================================
+
+/// Facade for managing pre-compiled Locy rules.
+///
+/// Obtained via `db.rules()`, `session.rules()`, or `tx.rules()`.
+#[pyclass(name = "RuleRegistry")]
+pub struct PyRuleRegistry {
+    pub(crate) registry: std::sync::Arc<std::sync::RwLock<uni_db::LocyRuleRegistry>>,
+}
+
+#[pymethods]
+impl PyRuleRegistry {
+    /// Register Locy rules from a program string.
+    fn register(&self, program: &str) -> PyResult<()> {
+        let facade = uni_db::RuleRegistry::new(&self.registry);
+        facade
+            .register(program)
+            .map_err(crate::exceptions::uni_error_to_pyerr)
+    }
+
+    /// Remove a rule by name. Returns True if found and removed.
+    fn remove(&self, name: &str) -> PyResult<bool> {
+        let facade = uni_db::RuleRegistry::new(&self.registry);
+        facade
+            .remove(name)
+            .map_err(crate::exceptions::uni_error_to_pyerr)
+    }
+
+    /// List names of all registered rules.
+    fn list(&self) -> Vec<String> {
+        let facade = uni_db::RuleRegistry::new(&self.registry);
+        facade.list()
+    }
+
+    /// Get metadata about a registered rule.
+    fn get(&self, name: &str) -> Option<crate::types::PyRuleInfo> {
+        let facade = uni_db::RuleRegistry::new(&self.registry);
+        facade.get(name).map(|info| crate::types::PyRuleInfo {
+            name: info.name,
+            clause_count: info.clause_count,
+            is_recursive: info.is_recursive,
+        })
+    }
+
+    /// Clear all registered rules.
+    fn clear(&self) {
+        let facade = uni_db::RuleRegistry::new(&self.registry);
+        facade.clear();
+    }
+
+    /// Get the number of registered rules.
+    fn count(&self) -> usize {
+        let facade = uni_db::RuleRegistry::new(&self.registry);
+        facade.count()
+    }
+}
+
+// ============================================================================
+// Compaction (synchronous)
+// ============================================================================
+
+/// Facade for compaction operations.
+///
+/// Obtained via `db.compaction()`.
+#[pyclass(name = "Compaction")]
+pub struct PyCompaction {
+    inner: Arc<Uni>,
+}
+
+#[pymethods]
+impl PyCompaction {
+    /// Compact data for a label or edge type.
+    fn compact(&self, name: &str) -> PyResult<crate::types::PyCompactionStats> {
+        pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(core::compact_core(&self.inner, name))
+            .map_err(crate::exceptions::uni_error_to_pyerr)
+    }
+
+    /// Wait for all background compaction to complete.
+    fn wait(&self) -> PyResult<()> {
+        pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(core::wait_for_compaction_core(&self.inner))
+            .map_err(crate::exceptions::uni_error_to_pyerr)
+    }
+}
+
+// ============================================================================
+// Indexes (synchronous)
+// ============================================================================
+
+/// Facade for index management operations.
+///
+/// Obtained via `db.indexes()`.
+#[pyclass(name = "Indexes")]
+pub struct PyIndexes {
+    inner: Arc<Uni>,
+}
+
+#[pymethods]
+impl PyIndexes {
+    /// List index definitions, optionally filtered by label.
+    #[pyo3(signature = (label=None))]
+    fn list(
+        &self,
+        py: Python,
+        label: Option<&str>,
+    ) -> PyResult<Vec<crate::types::IndexDefinitionInfo>> {
+        let indexes = match label {
+            Some(l) => core::list_indexes_core(&self.inner, l),
+            None => core::list_all_indexes_core(&self.inner),
+        };
+        indexes
+            .into_iter()
+            .map(|i| convert::index_definition_to_py(py, i))
+            .collect()
+    }
+
+    /// Rebuild indexes for a label. If background=true, returns a task ID.
+    #[pyo3(signature = (label, background=false))]
+    fn rebuild(&self, label: &str, background: bool) -> PyResult<Option<String>> {
+        pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(core::rebuild_indexes_core(&self.inner, label, background))
+            .map_err(crate::exceptions::uni_error_to_pyerr)
+    }
+
+    /// Get status of all rebuild tasks.
+    fn rebuild_status(&self, py: Python) -> PyResult<Vec<crate::types::IndexRebuildTaskInfo>> {
+        let tasks = pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(core::index_rebuild_status_core(&self.inner))
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
+        tasks
+            .into_iter()
+            .map(|t| convert::index_rebuild_task_to_py(py, t))
+            .collect()
+    }
+
+    /// Retry failed rebuild tasks. Returns task IDs scheduled for retry.
+    fn retry_failed(&self) -> PyResult<Vec<String>> {
+        pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(core::retry_index_rebuilds_core(&self.inner))
+            .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 }

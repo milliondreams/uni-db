@@ -32,6 +32,9 @@ fn _uni_db(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Sync main classes
     m.add_class::<sync_api::Database>()?;
     m.add_class::<sync_api::Xervo>()?;
+    m.add_class::<sync_api::PyRuleRegistry>()?;
+    m.add_class::<sync_api::PyCompaction>()?;
+    m.add_class::<sync_api::PyIndexes>()?;
     m.add_class::<builders::DatabaseBuilder>()?;
     m.add_class::<sync_api::Transaction>()?;
 
@@ -63,6 +66,8 @@ fn _uni_db(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Async classes
     m.add_class::<async_api::AsyncDatabase>()?;
     m.add_class::<async_api::AsyncXervo>()?;
+    m.add_class::<async_api::AsyncCompaction>()?;
+    m.add_class::<async_api::AsyncIndexes>()?;
     m.add_class::<async_api::AsyncDatabaseBuilder>()?;
     m.add_class::<async_api::AsyncTransaction>()?;
     m.add_class::<async_api::AsyncSession>()?;
@@ -113,6 +118,12 @@ fn _uni_db(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<types::SnapshotInfo>()?;
     m.add_class::<types::IndexRebuildTaskInfo>()?;
     m.add_class::<types::IndexDefinitionInfo>()?;
+
+    // Rules
+    m.add_class::<types::PyRuleInfo>()?;
+
+    // Edge type info
+    m.add_class::<types::EdgeTypeInfo>()?;
 
     // Compaction
     m.add_class::<types::PyCompactionStats>()?;

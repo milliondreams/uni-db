@@ -17,11 +17,11 @@ use uuid::Uuid;
 
 use crate::api::UniInner;
 use crate::api::hooks::{HookContext, QueryType, SessionHook};
-use crate::api::impl_locy::{self, LocyRuleRegistry};
+use crate::api::impl_locy::LocyRuleRegistry;
 use crate::api::locy_result::LocyResult;
 use crate::api::transaction::{IsolationLevel, Transaction};
 use uni_common::{Result, UniError, Value};
-use uni_query::{ExplainOutput, ProfileOutput, QueryCursor, QueryMetrics, QueryResult, Row};
+use uni_query::{ExplainOutput, ProfileOutput, QueryCursor, QueryResult, Row};
 
 /// Atomic counters for plan cache hits/misses, shared between Session and its
 /// query execution helpers.
@@ -368,19 +368,9 @@ impl Session {
 
     // ── Rule Management ───────────────────────────────────────────────
 
-    /// Register Locy rules for this session. Session-scoped rules are visible
-    /// to all evaluations and transactions within this session.
-    #[instrument(skip(self), fields(session_id = %self.id))]
-    pub fn register_rules(&self, program: &str) -> Result<()> {
-        impl_locy::register_rules_on_registry(&self.rule_registry, program)
-    }
-
-    /// Clear all registered Locy rules for this session.
-    #[instrument(skip(self), fields(session_id = %self.id))]
-    pub fn clear_rules(&self) {
-        let mut registry = self.rule_registry.write().unwrap();
-        registry.rules.clear();
-        registry.strata.clear();
+    /// Access the session-scoped rule registry.
+    pub fn rules(&self) -> super::rule_registry::RuleRegistry<'_> {
+        super::rule_registry::RuleRegistry::new(&self.rule_registry)
     }
 
     /// Compile a Locy program without executing it, using this session's rule registry.

@@ -748,6 +748,41 @@ impl ConstraintInfo {
     }
 }
 
+/// Information about an edge type in the schema.
+#[pyclass(get_all)]
+#[derive(Debug, Clone)]
+pub struct EdgeTypeInfo {
+    /// Edge type name.
+    pub name: String,
+    /// Approximate count of edges with this type.
+    pub count: usize,
+    /// Allowed source labels.
+    pub source_labels: Vec<String>,
+    /// Allowed target labels.
+    pub target_labels: Vec<String>,
+    /// Properties defined on this edge type.
+    pub properties: Vec<PropertyInfo>,
+    /// Indexes defined on this edge type.
+    pub indexes: Vec<IndexInfo>,
+    /// Constraints defined on this edge type.
+    pub constraints: Vec<ConstraintInfo>,
+}
+
+#[pymethods]
+impl EdgeTypeInfo {
+    fn __repr__(&self) -> String {
+        format!(
+            "EdgeTypeInfo(name='{}', count={}, source_labels={:?}, target_labels={:?}, properties={}, indexes={})",
+            self.name,
+            self.count,
+            self.source_labels,
+            self.target_labels,
+            self.properties.len(),
+            self.indexes.len()
+        )
+    }
+}
+
 /// Statistics from a bulk loading operation.
 #[pyclass(get_all)]
 #[derive(Debug, Clone, Default)]
@@ -1206,6 +1241,18 @@ pub struct PySessionCapabilities {
     pub has_notifications: bool,
     /// Write lease configuration, if any (e.g., "local", "dynamodb:table_name").
     pub write_lease: Option<String>,
+}
+
+/// Metadata about a registered Locy rule.
+#[pyclass(get_all, name = "RuleInfo")]
+#[derive(Debug, Clone)]
+pub struct PyRuleInfo {
+    /// Rule name.
+    pub name: String,
+    /// Number of clauses in the rule.
+    pub clause_count: usize,
+    /// Whether the rule is recursive.
+    pub is_recursive: bool,
 }
 
 /// Statistics from a compaction operation.

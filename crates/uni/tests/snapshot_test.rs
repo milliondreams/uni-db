@@ -19,14 +19,14 @@ async fn test_snapshots_and_time_travel() -> Result<()> {
     tx.execute("CREATE (:Person {name: 'Alice'})").await?;
     tx.commit().await?;
     db.flush().await?;
-    let snap1_id = db.create_snapshot(Some("alice-only")).await?;
+    let snap1_id = db.create_snapshot("alice-only").await?;
 
     // State 2: Alice + Bob
     let tx = db.session().tx().await?;
     tx.execute("CREATE (:Person {name: 'Bob'})").await?;
     tx.commit().await?;
     db.flush().await?;
-    let _snap2_id = db.create_snapshot(Some("alice-and-bob")).await?;
+    let _snap2_id = db.create_snapshot("alice-and-bob").await?;
 
     // Verify State 2
     let res2 = db
@@ -85,7 +85,7 @@ async fn test_snapshot_edge_isolation() -> Result<()> {
         .await?;
     tx.commit().await?;
     db.flush().await?;
-    let snap1 = db.create_snapshot(Some("knows-bob")).await?;
+    let snap1 = db.create_snapshot("knows-bob").await?;
 
     // State 2: Add Alice -> Charlie
     let tx = db.session().tx().await?;
@@ -131,7 +131,7 @@ async fn test_snapshot_property_isolation() -> Result<()> {
         .await?;
     tx.commit().await?;
     db.flush().await?;
-    let snap1 = db.create_snapshot(Some("alice-30")).await?;
+    let snap1 = db.create_snapshot("alice-30").await?;
 
     // State 2: Update age to 31
     let tx = db.session().tx().await?;
@@ -174,7 +174,7 @@ async fn test_time_travel_rejects_writes() -> Result<()> {
     tx.execute("CREATE (:Person {name: 'Alice'})").await?;
     tx.commit().await?;
     db.flush().await?;
-    let snap = db.create_snapshot(Some("snap1")).await?;
+    let snap = db.create_snapshot("snap1").await?;
 
     // CREATE with VERSION AS OF should fail — write clauses not allowed with time-travel.
     // Use session.query() since auto-commit path validates time-travel restrictions.
@@ -237,7 +237,7 @@ async fn test_timestamp_as_of_happy_path() -> Result<()> {
     tx.execute("CREATE (:Person {name: 'Alice'})").await?;
     tx.commit().await?;
     db.flush().await?;
-    let _snap1 = db.create_snapshot(Some("snap1")).await?;
+    let _snap1 = db.create_snapshot("snap1").await?;
 
     // Record a timestamp after snap1 but before snap2
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -249,7 +249,7 @@ async fn test_timestamp_as_of_happy_path() -> Result<()> {
     tx.execute("CREATE (:Person {name: 'Bob'})").await?;
     tx.commit().await?;
     db.flush().await?;
-    let _snap2 = db.create_snapshot(Some("snap2")).await?;
+    let _snap2 = db.create_snapshot("snap2").await?;
 
     // Current state sees both
     let current = db

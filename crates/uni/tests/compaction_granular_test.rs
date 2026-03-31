@@ -38,7 +38,7 @@ async fn test_granular_compaction_public_api() -> anyhow::Result<()> {
 
     // 4. Compact Label (Granular)
     // We expect compaction to run because we have 2 fragments (files).
-    let stats = db.compact_label("Node").await?;
+    let stats = db.compaction().compact("Node").await?;
     assert_eq!(
         stats.files_compacted, 1,
         "Expected 1 compaction operation on vertex label"
@@ -60,7 +60,7 @@ async fn test_granular_compaction_public_api() -> anyhow::Result<()> {
     db.flush().await?;
 
     // Compact Edge Type
-    let stats_edge = db.compact_edge_type("REL").await?;
+    let stats_edge = db.compaction().compact("REL").await?;
     assert!(
         stats_edge.files_compacted >= 1,
         "Expected at least 1 edge compaction"
@@ -68,7 +68,7 @@ async fn test_granular_compaction_public_api() -> anyhow::Result<()> {
 
     // 7. Test Wait For Compaction (Should return immediately)
     let start = std::time::Instant::now();
-    db.wait_for_compaction().await?;
+    db.compaction().wait().await?;
     assert!(start.elapsed() < std::time::Duration::from_millis(500));
 
     Ok(())

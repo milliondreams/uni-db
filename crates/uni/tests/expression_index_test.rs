@@ -18,7 +18,7 @@ async fn test_expression_index() -> Result<()> {
     tx.commit().await?;
 
     // 3. Verify schema metadata
-    let schema = db.get_schema();
+    let schema = db.schema().current();
     let _idx = schema
         .indexes
         .iter()

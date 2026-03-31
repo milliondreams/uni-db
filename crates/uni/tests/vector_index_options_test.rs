@@ -51,7 +51,7 @@ async fn test_vector_index_preserves_embedding_alias_config() -> Result<()> {
         .apply()
         .await?;
 
-    let schema = db.get_schema();
+    let schema = db.schema().current();
     let index = schema
         .indexes
         .iter()
@@ -100,7 +100,7 @@ async fn test_procedure_api_embedding_alias_config() -> Result<()> {
         )
         .await?;
 
-    let schema = db.get_schema();
+    let schema = db.schema().current();
     let index = schema
         .indexes
         .iter()

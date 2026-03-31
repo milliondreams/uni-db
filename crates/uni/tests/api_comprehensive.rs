@@ -160,8 +160,11 @@ async fn test_concurrency() -> Result<()> {
 #[tokio::test]
 async fn test_builder_config() -> Result<()> {
     let db = Uni::open("tmp/test_config")
-        .cache_size(1024 * 1024) // 1MB
-        .parallelism(2)
+        .config(uni_db::UniConfig {
+            cache_size: 1024 * 1024, // 1MB
+            parallelism: 2,
+            ..Default::default()
+        })
         .build()
         .await?;
 

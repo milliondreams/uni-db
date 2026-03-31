@@ -46,7 +46,7 @@ async fn test_rebuild_indexes_finds_correct_dataset() -> anyhow::Result<()> {
 
     // 3. rebuild_indexes should NOT error (previously it silently failed
     //    because VertexDataset.uri pointed to a non-existent path)
-    db.rebuild_indexes("Chunk", false).await?;
+    db.indexes().rebuild("Chunk", false).await?;
 
     // 4. Verify vector search still works after rebuild
     let result = db

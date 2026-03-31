@@ -9,15 +9,18 @@ use std::time::{Duration, Instant};
 pub mod appender;
 pub mod builder;
 pub mod bulk;
+pub mod compaction;
 pub mod hooks;
 pub mod impl_locy;
 pub mod impl_query;
+pub mod indexes;
 pub mod locy_builder;
 pub mod locy_result;
 pub mod multi_agent;
 pub mod notifications;
 pub mod prepared;
 pub mod query_builder;
+pub mod rule_registry;
 pub mod schema;
 pub mod session;
 pub mod sync;
@@ -343,16 +346,11 @@ impl Uni {
 
     // ── Global Locy Rule Management ───────────────────────────────────
 
-    /// Register Locy rules globally. These are cloned into every new Session.
-    pub fn register_rules(&self, program: &str) -> Result<()> {
-        impl_locy::register_rules_on_registry(&self.inner.locy_rule_registry, program)
-    }
-
-    /// Clear all globally registered Locy rules.
-    pub fn clear_rules(&self) {
-        let mut registry = self.inner.locy_rule_registry.write().unwrap();
-        registry.rules.clear();
-        registry.strata.clear();
+    /// Access the global rule registry for managing pre-compiled Locy rules.
+    ///
+    /// Rules registered here are cloned into every new Session.
+    pub fn rules(&self) -> rule_registry::RuleRegistry<'_> {
+        rule_registry::RuleRegistry::new(&self.inner.locy_rule_registry)
     }
 
     // ── Configuration & Introspection ─────────────────────────────────
@@ -366,11 +364,6 @@ impl Uni {
     #[doc(hidden)]
     pub fn procedure_registry(&self) -> &Arc<uni_query::ProcedureRegistry> {
         &self.inner.procedure_registry
-    }
-
-    /// Get current schema (read-only snapshot).
-    pub fn get_schema(&self) -> Arc<uni_common::core::schema::Schema> {
-        self.inner.schema.schema()
     }
 
     /// Get schema manager.
@@ -410,31 +403,27 @@ impl Uni {
 
     /// Create a named point-in-time snapshot of the database.
     ///
-    /// This flushes current changes and records the state.
+    /// Flushes current changes, records the state, and persists the snapshot
+    /// under the given name so it can be retrieved later.
     /// Returns the snapshot ID.
-    pub async fn create_snapshot(&self, name: Option<&str>) -> Result<String> {
-        if let Some(writer_lock) = &self.inner.writer {
-            let mut writer = writer_lock.write().await;
-            writer
-                .flush_to_l1(name.map(|s| s.to_string()))
-                .await
-                .map_err(UniError::Internal)
-        } else {
-            Err(UniError::ReadOnly {
-                operation: "create_snapshot".to_string(),
-            })
-        }
-    }
-
-    /// Create a persisted named snapshot that can be retrieved later.
-    pub async fn create_named_snapshot(&self, name: &str) -> Result<String> {
+    pub async fn create_snapshot(&self, name: &str) -> Result<String> {
         if name.is_empty() {
             return Err(UniError::Internal(anyhow::anyhow!(
                 "Snapshot name cannot be empty"
             )));
         }
 
-        let snapshot_id = self.create_snapshot(Some(name)).await?;
+        let snapshot_id = if let Some(writer_lock) = &self.inner.writer {
+            let mut writer = writer_lock.write().await;
+            writer
+                .flush_to_l1(Some(name.to_string()))
+                .await
+                .map_err(UniError::Internal)?
+        } else {
+            return Err(UniError::ReadOnly {
+                operation: "create_snapshot".to_string(),
+            });
+        };
 
         self.inner
             .storage
@@ -663,174 +652,126 @@ impl Uni {
         }
     }
 
-    /// Manually trigger compaction for a specific label.
-    ///
-    /// Compaction merges multiple L1 files into larger files to improve read performance.
-    pub async fn compact_label(
+    /// Get detailed information about an edge type.
+    pub async fn get_edge_type_info(
         &self,
-        label: &str,
-    ) -> Result<uni_store::compaction::CompactionStats> {
-        self.inner
-            .storage
-            .compact_label(label)
-            .await
-            .map_err(UniError::Internal)
-    }
-
-    /// Manually trigger compaction for a specific edge type.
-    pub async fn compact_edge_type(
-        &self,
-        edge_type: &str,
-    ) -> Result<uni_store::compaction::CompactionStats> {
-        self.inner
-            .storage
-            .compact_edge_type(edge_type)
-            .await
-            .map_err(UniError::Internal)
-    }
-
-    /// Wait for any ongoing compaction to complete.
-    ///
-    /// Useful for tests or ensuring consistent performance before benchmarks.
-    pub async fn wait_for_compaction(&self) -> Result<()> {
-        self.inner
-            .storage
-            .wait_for_compaction()
-            .await
-            .map_err(UniError::Internal)
-    }
-
-    /// Get the status of background index rebuild tasks.
-    ///
-    /// Returns all tracked index rebuild tasks, including pending, in-progress,
-    /// completed, and failed tasks. Use this to monitor progress of async
-    /// index rebuilds started via `BulkWriter::commit()` with `async_indexes(true)`.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let status = db.index_rebuild_status().await?;
-    /// for task in status {
-    ///     println!("Label: {}, Status: {:?}", task.label, task.status);
-    /// }
-    /// ```
-    pub async fn index_rebuild_status(&self) -> Result<Vec<uni_store::storage::IndexRebuildTask>> {
-        let manager = uni_store::storage::IndexRebuildManager::new(
-            self.inner.storage.clone(),
-            self.inner.schema.clone(),
-            self.inner.config.index_rebuild.clone(),
-        )
-        .await
-        .map_err(UniError::Internal)?;
-
-        Ok(manager.status())
-    }
-
-    /// Retry failed index rebuild tasks.
-    ///
-    /// Resets failed tasks back to pending state and returns the task IDs
-    /// that will be retried. Tasks that have exceeded their retry limit
-    /// will not be retried.
-    ///
-    /// # Returns
-    ///
-    /// A vector of task IDs that were scheduled for retry.
-    pub async fn retry_index_rebuilds(&self) -> Result<Vec<String>> {
-        let manager = uni_store::storage::IndexRebuildManager::new(
-            self.inner.storage.clone(),
-            self.inner.schema.clone(),
-            self.inner.config.index_rebuild.clone(),
-        )
-        .await
-        .map_err(UniError::Internal)?;
-
-        let retried = manager.retry_failed().await.map_err(UniError::Internal)?;
-
-        // Start background worker to process the retried tasks
-        if !retried.is_empty() {
-            let manager = std::sync::Arc::new(manager);
-            let handle = manager.start_background_worker(self.inner.shutdown_handle.subscribe());
-            self.inner.shutdown_handle.track_task(handle);
-        }
-
-        Ok(retried)
-    }
-
-    /// Force rebuild indexes for a specific label.
-    ///
-    /// # Arguments
-    ///
-    /// * `label` - The vertex label to rebuild indexes for.
-    /// * `async_` - If true, rebuild in background; if false, block until complete.
-    ///
-    /// # Returns
-    ///
-    /// When `async_` is true, returns the task ID for tracking progress.
-    /// When `async_` is false, returns None after indexes are rebuilt.
-    pub async fn rebuild_indexes(&self, label: &str, async_: bool) -> Result<Option<String>> {
-        if async_ {
-            let manager = uni_store::storage::IndexRebuildManager::new(
-                self.inner.storage.clone(),
-                self.inner.schema.clone(),
-                self.inner.config.index_rebuild.clone(),
-            )
-            .await
-            .map_err(UniError::Internal)?;
-
-            let task_ids = manager
-                .schedule(vec![label.to_string()])
-                .await
-                .map_err(UniError::Internal)?;
-
-            let manager = std::sync::Arc::new(manager);
-            let handle = manager.start_background_worker(self.inner.shutdown_handle.subscribe());
-            self.inner.shutdown_handle.track_task(handle);
-
-            Ok(task_ids.into_iter().next())
-        } else {
-            let idx_mgr = uni_store::storage::IndexManager::new(
-                self.inner.storage.base_path(),
-                self.inner.schema.clone(),
-                self.inner.storage.backend_arc(),
-            );
-            idx_mgr
-                .rebuild_indexes_for_label(label)
-                .await
-                .map_err(UniError::Internal)?;
-            Ok(None)
-        }
-    }
-
-    /// Check if an index is currently being rebuilt for a label.
-    ///
-    /// Returns true if there is a pending or in-progress index rebuild task
-    /// for the specified label.
-    pub async fn is_index_building(&self, label: &str) -> Result<bool> {
-        let manager = uni_store::storage::IndexRebuildManager::new(
-            self.inner.storage.clone(),
-            self.inner.schema.clone(),
-            self.inner.config.index_rebuild.clone(),
-        )
-        .await
-        .map_err(UniError::Internal)?;
-
-        Ok(manager.is_index_building(label))
-    }
-
-    /// List all indexes defined on a specific label.
-    pub fn list_indexes(&self, label: &str) -> Vec<uni_common::core::schema::IndexDefinition> {
+        name: &str,
+    ) -> Result<Option<crate::api::schema::EdgeTypeInfo>> {
         let schema = self.inner.schema.schema();
-        schema
-            .indexes
-            .iter()
-            .filter(|i| i.label() == label)
-            .cloned()
-            .collect()
+        let edge_meta = match schema.edge_types.get(name) {
+            Some(meta) => meta,
+            None => return Ok(None),
+        };
+
+        // Count edges via internal query
+        let count = {
+            let query = format!("MATCH ()-[r:{}]->() RETURN count(r) AS cnt", name);
+            match self.inner.execute_internal(&query, HashMap::new()).await {
+                Ok(result) => result
+                    .rows()
+                    .first()
+                    .and_then(|r| r.get::<i64>("cnt").ok())
+                    .unwrap_or(0) as usize,
+                Err(_) => 0,
+            }
+        };
+
+        let source_labels = edge_meta.src_labels.clone();
+        let target_labels = edge_meta.dst_labels.clone();
+
+        let mut properties = Vec::new();
+        if let Some(props) = schema.properties.get(name) {
+            for (prop_name, prop_meta) in props {
+                let is_indexed = schema.indexes.iter().any(|idx| match idx {
+                    uni_common::core::schema::IndexDefinition::Scalar(s) => {
+                        s.label == name && s.properties.contains(prop_name)
+                    }
+                    uni_common::core::schema::IndexDefinition::FullText(f) => {
+                        f.label == name && f.properties.contains(prop_name)
+                    }
+                    uni_common::core::schema::IndexDefinition::Inverted(inv) => {
+                        inv.label == name && inv.property == *prop_name
+                    }
+                    _ => false,
+                });
+
+                properties.push(crate::api::schema::PropertyInfo {
+                    name: prop_name.clone(),
+                    data_type: format!("{:?}", prop_meta.r#type),
+                    nullable: prop_meta.nullable,
+                    is_indexed,
+                });
+            }
+        }
+
+        let mut indexes = Vec::new();
+        for idx in schema.indexes.iter().filter(|i| i.label() == name) {
+            use uni_common::core::schema::IndexDefinition;
+            let (idx_type, idx_props) = match idx {
+                IndexDefinition::Scalar(s) => ("SCALAR", s.properties.clone()),
+                IndexDefinition::FullText(f) => ("FULLTEXT", f.properties.clone()),
+                IndexDefinition::Inverted(inv) => ("INVERTED", vec![inv.property.clone()]),
+                _ => continue,
+            };
+
+            indexes.push(crate::api::schema::IndexInfo {
+                name: idx.name().to_string(),
+                index_type: idx_type.to_string(),
+                properties: idx_props,
+                status: "ONLINE".to_string(),
+            });
+        }
+
+        let mut constraints = Vec::new();
+        for c in &schema.constraints {
+            if let uni_common::core::schema::ConstraintTarget::EdgeType(et) = &c.target
+                && et == name
+            {
+                let (ctype, cprops) = match &c.constraint_type {
+                    uni_common::core::schema::ConstraintType::Unique { properties } => {
+                        ("UNIQUE", properties.clone())
+                    }
+                    uni_common::core::schema::ConstraintType::Exists { property } => {
+                        ("EXISTS", vec![property.clone()])
+                    }
+                    uni_common::core::schema::ConstraintType::Check { expression } => {
+                        ("CHECK", vec![expression.clone()])
+                    }
+                    _ => ("UNKNOWN", vec![]),
+                };
+
+                constraints.push(crate::api::schema::ConstraintInfo {
+                    name: c.name.clone(),
+                    constraint_type: ctype.to_string(),
+                    properties: cprops,
+                    enabled: c.enabled,
+                });
+            }
+        }
+
+        Ok(Some(crate::api::schema::EdgeTypeInfo {
+            name: name.to_string(),
+            count,
+            source_labels,
+            target_labels,
+            properties,
+            indexes,
+            constraints,
+        }))
     }
 
-    /// List all indexes in the database.
-    pub fn list_all_indexes(&self) -> Vec<uni_common::core::schema::IndexDefinition> {
-        self.inner.schema.schema().indexes.clone()
+    // ── Compaction ──────────────────────────────────────────────────────
+
+    /// Access compaction operations.
+    pub fn compaction(&self) -> compaction::Compaction<'_> {
+        compaction::Compaction { inner: &self.inner }
+    }
+
+    // ── Indexes ──────────────────────────────────────────────────────────
+
+    /// Access index management operations.
+    pub fn indexes(&self) -> indexes::Indexes<'_> {
+        indexes::Indexes { inner: &self.inner }
     }
 
     /// Shutdown the database gracefully, flushing pending data and stopping background tasks.
@@ -905,45 +846,7 @@ impl UniBuilder {
         self
     }
 
-    /// Parse Uni-Xervo catalog from JSON string.
-    pub fn xervo_catalog_from_str(mut self, json: &str) -> Result<Self> {
-        let catalog = uni_xervo::api::catalog_from_str(json)
-            .map_err(|e| UniError::Internal(anyhow::anyhow!(e.to_string())))?;
-        self.xervo_catalog = Some(catalog);
-        Ok(self)
-    }
-
-    /// Parse Uni-Xervo catalog from a JSON file.
-    pub fn xervo_catalog_from_file(mut self, path: impl AsRef<Path>) -> Result<Self> {
-        let catalog = uni_xervo::api::catalog_from_file(path)
-            .map_err(|e| UniError::Internal(anyhow::anyhow!(e.to_string())))?;
-        self.xervo_catalog = Some(catalog);
-        Ok(self)
-    }
-
-    /// Configure hybrid storage with a local path for WAL/IDs and a remote URL for data.
-    ///
-    /// This allows fast local writes and metadata operations while storing bulk data
-    /// in object storage (e.g., S3, GCS, Azure Blob Storage).
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// let db = Uni::open("./local_meta")
-    ///     .hybrid("./local_meta", "s3://my-bucket/graph-data")
-    ///     .build()
-    ///     .await?;
-    /// ```
-    pub fn hybrid(mut self, local_path: impl AsRef<Path>, remote_url: &str) -> Self {
-        self.uri = local_path.as_ref().to_string_lossy().to_string();
-        self.hybrid_remote_url = Some(remote_url.to_string());
-        self
-    }
-
-    /// Configure cloud storage with explicit credentials.
-    ///
-    /// Use this method when you need fine-grained control over cloud storage
-    /// credentials instead of relying on environment variables.
+    /// Configure remote storage for data, keeping local path for WAL/IDs.
     ///
     /// # Examples
     ///
@@ -953,20 +856,20 @@ impl UniBuilder {
     /// let config = CloudStorageConfig::S3 {
     ///     bucket: "my-bucket".to_string(),
     ///     region: Some("us-east-1".to_string()),
-    ///     endpoint: Some("http://localhost:4566".to_string()), // LocalStack
-    ///     access_key_id: Some("test".to_string()),
-    ///     secret_access_key: Some("test".to_string()),
+    ///     endpoint: None,
+    ///     access_key_id: None,
+    ///     secret_access_key: None,
     ///     session_token: None,
     ///     virtual_hosted_style: false,
     /// };
     ///
     /// let db = Uni::open("./local_meta")
-    ///     .hybrid("./local_meta", "s3://my-bucket/data")
-    ///     .cloud_config(config)
+    ///     .remote_storage("s3://my-bucket/graph-data", config)
     ///     .build()
     ///     .await?;
     /// ```
-    pub fn cloud_config(mut self, config: CloudStorageConfig) -> Self {
+    pub fn remote_storage(mut self, remote_url: &str, config: CloudStorageConfig) -> Self {
+        self.hybrid_remote_url = Some(remote_url.to_string());
         self.cloud_config = Some(config);
         self
     }
@@ -993,18 +896,6 @@ impl UniBuilder {
     /// Configure database options using `UniConfig`.
     pub fn config(mut self, config: UniConfig) -> Self {
         self.config = config;
-        self
-    }
-
-    /// Set maximum adjacency cache size in bytes.
-    pub fn cache_size(mut self, bytes: usize) -> Self {
-        self.config.cache_size = bytes;
-        self
-    }
-
-    /// Set query parallelism (number of worker threads).
-    pub fn parallelism(mut self, n: usize) -> Self {
-        self.config.parallelism = n;
         self
     }
 

@@ -32,7 +32,6 @@ async fn test_property_lookup_uses_vid_filter() -> anyhow::Result<()> {
         .await?,
     );
 
-    let lancedb_store = storage.lancedb_store();
     let vertex_ds = storage.vertex_dataset("Person")?;
     let arrow_schema = vertex_ds.get_arrow_schema(&schema_manager.schema())?;
 
@@ -70,7 +69,7 @@ async fn test_property_lookup_uses_vid_filter() -> anyhow::Result<()> {
         ],
     )?;
     vertex_ds
-        .write_batch_lancedb(lancedb_store, batch, &schema_manager.schema())
+        .write_batch(storage.backend(), batch, &schema_manager.schema())
         .await?;
 
     let prop_mgr = PropertyManager::new(storage.clone(), schema_manager.clone(), 10);
@@ -139,7 +138,6 @@ async fn test_list_property_storage() -> anyhow::Result<()> {
         .await?,
     );
 
-    let lancedb_store = storage.lancedb_store();
     let vertex_ds = storage.vertex_dataset("Node")?;
     let arrow_schema = vertex_ds.get_arrow_schema(&schema_manager.schema())?;
 
@@ -176,7 +174,7 @@ async fn test_list_property_storage() -> anyhow::Result<()> {
         ],
     )?;
     vertex_ds
-        .write_batch_lancedb(lancedb_store, batch, &schema_manager.schema())
+        .write_batch(storage.backend(), batch, &schema_manager.schema())
         .await?;
 
     let prop_mgr = PropertyManager::new(storage, schema_manager, 10);

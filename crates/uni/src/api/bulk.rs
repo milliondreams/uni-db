@@ -788,10 +788,10 @@ impl BulkWriter {
             }
 
             // Record initial version for abort rollback (only once per table)
-            let table_name = uni_store::lancedb::LanceDbStore::vertex_table_name(label);
+            let table_name = uni_store::backend::table_names::vertex_table_name(label);
             if !self.initial_table_versions.contains_key(&table_name) {
-                let lancedb_store = self.db.storage.lancedb_store();
-                let version = lancedb_store
+                let backend = self.db.storage.backend();
+                let version = backend
                     .get_table_version(&table_name)
                     .await
                     .map_err(UniError::Internal)?;
@@ -800,10 +800,10 @@ impl BulkWriter {
 
             // Record main vertices table version for rollback
             let main_table_name =
-                uni_store::lancedb::LanceDbStore::main_vertex_table_name().to_string();
+                uni_store::backend::table_names::main_vertex_table_name().to_string();
             if !self.initial_table_versions.contains_key(&main_table_name) {
-                let lancedb_store = self.db.storage.lancedb_store();
-                let version = lancedb_store
+                let backend = self.db.storage.backend();
+                let version = backend
                     .get_table_version(&main_table_name)
                     .await
                     .map_err(UniError::Internal)?;
@@ -849,15 +849,14 @@ impl BulkWriter {
                 )
                 .map_err(UniError::Internal)?;
 
-            // Write to per-label LanceDB table
-            let lancedb_store = self.db.storage.lancedb_store();
-            let table = ds
-                .write_batch_lancedb(lancedb_store, batch, &schema)
+            // Write to per-label table via backend
+            let backend = self.db.storage.backend();
+            ds.write_batch(backend, batch, &schema)
                 .await
                 .map_err(UniError::Internal)?;
 
             // Create default scalar indexes (_vid, _uid) which are critical for basic function
-            ds.ensure_default_indexes_lancedb(&table)
+            ds.ensure_default_indexes(backend)
                 .await
                 .map_err(UniError::Internal)?;
 
@@ -876,11 +875,11 @@ impl BulkWriter {
                 )
                 .map_err(UniError::Internal)?;
 
-                let main_table = MainVertexDataset::write_batch_lancedb(lancedb_store, main_batch)
+                MainVertexDataset::write_batch(backend, main_batch)
                     .await
                     .map_err(UniError::Internal)?;
 
-                MainVertexDataset::ensure_default_indexes_lancedb(&main_table)
+                MainVertexDataset::ensure_default_indexes(backend)
                     .await
                     .map_err(UniError::Internal)?;
             }
@@ -996,22 +995,22 @@ impl BulkWriter {
             }
 
             let schema = self.db.schema.schema();
-            let lancedb_store = self.db.storage.lancedb_store();
+            let backend = self.db.storage.backend();
 
             // Record initial versions for abort rollback (FWD and BWD tables)
             let fwd_table_name =
-                uni_store::lancedb::LanceDbStore::delta_table_name(edge_type, "fwd");
+                uni_store::backend::table_names::delta_table_name(edge_type, "fwd");
             if !self.initial_table_versions.contains_key(&fwd_table_name) {
-                let version = lancedb_store
+                let version = backend
                     .get_table_version(&fwd_table_name)
                     .await
                     .map_err(UniError::Internal)?;
                 self.initial_table_versions.insert(fwd_table_name, version);
             }
             let bwd_table_name =
-                uni_store::lancedb::LanceDbStore::delta_table_name(edge_type, "bwd");
+                uni_store::backend::table_names::delta_table_name(edge_type, "bwd");
             if !self.initial_table_versions.contains_key(&bwd_table_name) {
-                let version = lancedb_store
+                let version = backend
                     .get_table_version(&bwd_table_name)
                     .await
                     .map_err(UniError::Internal)?;
@@ -1020,12 +1019,12 @@ impl BulkWriter {
 
             // Record main edges table version for rollback
             let main_edge_table_name =
-                uni_store::lancedb::LanceDbStore::main_edge_table_name().to_string();
+                uni_store::backend::table_names::main_edge_table_name().to_string();
             if !self
                 .initial_table_versions
                 .contains_key(&main_edge_table_name)
             {
-                let version = lancedb_store
+                let version = backend
                     .get_table_version(&main_edge_table_name)
                     .await
                     .map_err(UniError::Internal)?;
@@ -1044,12 +1043,13 @@ impl BulkWriter {
             let fwd_batch = fwd_ds
                 .build_record_batch(&fwd_entries, &schema)
                 .map_err(UniError::Internal)?;
-            let fwd_table = fwd_ds
-                .write_run_lancedb(lancedb_store, fwd_batch)
+            let backend = self.db.storage.backend();
+            fwd_ds
+                .write_run(backend, fwd_batch)
                 .await
                 .map_err(UniError::Internal)?;
             fwd_ds
-                .ensure_eid_index_lancedb(&fwd_table)
+                .ensure_eid_index(backend)
                 .await
                 .map_err(UniError::Internal)?;
 
@@ -1064,12 +1064,12 @@ impl BulkWriter {
             let bwd_batch = bwd_ds
                 .build_record_batch(&bwd_entries, &schema)
                 .map_err(UniError::Internal)?;
-            let bwd_table = bwd_ds
-                .write_run_lancedb(lancedb_store, bwd_batch)
+            bwd_ds
+                .write_run(backend, bwd_batch)
                 .await
                 .map_err(UniError::Internal)?;
             bwd_ds
-                .ensure_eid_index_lancedb(&bwd_table)
+                .ensure_eid_index(backend)
                 .await
                 .map_err(UniError::Internal)?;
 
@@ -1106,11 +1106,11 @@ impl BulkWriter {
                 )
                 .map_err(UniError::Internal)?;
 
-                let main_table = MainEdgeDataset::write_batch_lancedb(lancedb_store, main_batch)
+                MainEdgeDataset::write_batch(self.db.storage.backend(), main_batch)
                     .await
                     .map_err(UniError::Internal)?;
 
-                MainEdgeDataset::ensure_default_indexes_lancedb(&main_table)
+                MainEdgeDataset::ensure_default_indexes(self.db.storage.backend())
                     .await
                     .map_err(UniError::Internal)?;
             }
@@ -1190,7 +1190,7 @@ impl BulkWriter {
                     let idx_mgr = IndexManager::new(
                         self.db.storage.base_path(),
                         self.db.storage.schema_manager_arc(),
-                        self.db.storage.lancedb_store_arc(),
+                        self.db.storage.backend_arc(),
                     );
                     idx_mgr
                         .rebuild_indexes_for_label(label)
@@ -1200,18 +1200,15 @@ impl BulkWriter {
 
                     // Update index metadata after successful sync rebuild
                     let now = chrono::Utc::now();
+                    let vtable_name = uni_store::backend::table_names::vertex_table_name(label);
                     let row_count = self
                         .db
                         .storage
-                        .lancedb_store()
-                        .open_vertex_table(label)
+                        .backend()
+                        .count_rows(&vtable_name, None)
                         .await
                         .ok()
-                        .map(|t| async move { t.count_rows(None).await.ok().map(|c| c as u64) });
-                    let row_count = match row_count {
-                        Some(fut) => fut.await,
-                        None => None,
-                    };
+                        .map(|c| c as u64);
 
                     let schema = self.db.schema.schema();
                     for idx in &schema.indexes {
@@ -1260,16 +1257,13 @@ impl BulkWriter {
         manifest.created_at = Utc::now();
 
         // Update counts and versions for touched labels (vertices)
-        let lancedb_store = self.db.storage.lancedb_store();
+        let backend = self.db.storage.backend();
         for label in &self.touched_labels {
-            let table = lancedb_store
-                .open_vertex_table(label)
+            let vtable_name = uni_store::backend::table_names::vertex_table_name(label);
+            let count = backend
+                .count_rows(&vtable_name, None)
                 .await
                 .map_err(UniError::Internal)?;
-            let count = table
-                .count_rows(None)
-                .await
-                .map_err(|e| UniError::Internal(anyhow::anyhow!("Count rows failed: {}", e)))?;
 
             let current_snap =
                 manifest
@@ -1287,12 +1281,8 @@ impl BulkWriter {
 
         // Update counts and versions for touched edge types
         for edge_type in &self.touched_edge_types {
-            if let Ok(table) = lancedb_store.open_delta_table(edge_type, "fwd").await {
-                let count = table
-                    .count_rows(None)
-                    .await
-                    .map_err(|e| UniError::Internal(anyhow::anyhow!("Count rows failed: {}", e)))?;
-
+            let delta_name = uni_store::backend::table_names::delta_table_name(edge_type, "fwd");
+            if let Ok(count) = backend.count_rows(&delta_name, None).await {
                 let current_snap =
                     manifest
                         .edges
@@ -1364,7 +1354,7 @@ impl BulkWriter {
         self.buffer_size_bytes = 0;
 
         // 2. Roll back each modified table to its initial version
-        let lancedb_store = self.db.storage.lancedb_store();
+        let backend = self.db.storage.backend();
         let mut rollback_errors = Vec::new();
         let mut rolled_back_count = 0;
         let mut dropped_count = 0;
@@ -1373,7 +1363,7 @@ impl BulkWriter {
             match initial_version {
                 Some(version) => {
                     // Table existed before - rollback to initial version
-                    match lancedb_store.rollback_table(table_name, *version).await {
+                    match backend.rollback_table(table_name, *version).await {
                         Ok(()) => {
                             log::info!("Rolled back table '{}' to version {}", table_name, version);
                             rolled_back_count += 1;
@@ -1385,7 +1375,7 @@ impl BulkWriter {
                 }
                 None => {
                     // Table was created during bulk load - drop it
-                    match lancedb_store.drop_table(table_name).await {
+                    match backend.drop_table(table_name).await {
                         Ok(()) => {
                             log::info!("Dropped table '{}' (created during bulk load)", table_name);
                             dropped_count += 1;
@@ -1398,8 +1388,8 @@ impl BulkWriter {
             }
         }
 
-        // 3. Clear table cache to ensure next read picks up rolled-back state
-        self.db.storage.clear_table_cache();
+        // 3. Clear backend cache to ensure next read picks up rolled-back state
+        self.db.storage.backend().clear_cache();
 
         // Release session write guard on abort
         self.release_guard();

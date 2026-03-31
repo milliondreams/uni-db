@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tempfile::tempdir;
 use uni_common::config::UniConfig;
 use uni_common::core::schema::SchemaManager;
-use uni_store::lancedb::LanceDbStore;
+use uni_store::backend::table_names;
 use uni_store::runtime::writer::Writer;
 use uni_store::storage::manager::StorageManager;
 
@@ -67,14 +67,13 @@ async fn test_lancedb_flush_vertices() -> anyhow::Result<()> {
         .await?;
     assert!(!snapshot_id.is_empty());
 
-    // 5. Verify LanceDB table exists and has data
-    let lancedb_store = storage.lancedb_store();
-    let table_name = LanceDbStore::vertex_table_name("Person");
+    // 5. Verify table exists and has data
+    let backend = storage.backend();
+    let table_name = table_names::vertex_table_name("Person");
 
-    assert!(lancedb_store.table_exists(&table_name).await?);
+    assert!(backend.table_exists(&table_name).await?);
 
-    let table = lancedb_store.open_table(&table_name).await?;
-    let count = table.count_rows(None).await?;
+    let count = backend.count_rows(&table_name, None).await?;
     assert_eq!(count, 2, "Should have 2 vertices in the table");
 
     Ok(())
@@ -134,27 +133,25 @@ async fn test_lancedb_flush_edges() -> anyhow::Result<()> {
     let snapshot_id = writer.flush_to_l1(None).await?;
     assert!(!snapshot_id.is_empty());
 
-    // 5. Verify LanceDB delta tables exist
-    let lancedb_store = storage.lancedb_store();
+    // 5. Verify delta tables exist
+    let backend = storage.backend();
 
-    let fwd_table_name = LanceDbStore::delta_table_name("knows", "fwd");
-    let bwd_table_name = LanceDbStore::delta_table_name("knows", "bwd");
+    let fwd_table_name = table_names::delta_table_name("knows", "fwd");
+    let bwd_table_name = table_names::delta_table_name("knows", "bwd");
 
     assert!(
-        lancedb_store.table_exists(&fwd_table_name).await?,
+        backend.table_exists(&fwd_table_name).await?,
         "FWD delta table should exist"
     );
     assert!(
-        lancedb_store.table_exists(&bwd_table_name).await?,
+        backend.table_exists(&bwd_table_name).await?,
         "BWD delta table should exist"
     );
 
-    let fwd_table = lancedb_store.open_table(&fwd_table_name).await?;
-    let fwd_count = fwd_table.count_rows(None).await?;
+    let fwd_count = backend.count_rows(&fwd_table_name, None).await?;
     assert_eq!(fwd_count, 2, "Should have 2 edges in FWD delta table");
 
-    let bwd_table = lancedb_store.open_table(&bwd_table_name).await?;
-    let bwd_count = bwd_table.count_rows(None).await?;
+    let bwd_count = backend.count_rows(&bwd_table_name, None).await?;
     assert_eq!(bwd_count, 2, "Should have 2 edges in BWD delta table");
 
     Ok(())
@@ -163,20 +160,20 @@ async fn test_lancedb_flush_edges() -> anyhow::Result<()> {
 #[tokio::test]
 async fn test_lancedb_table_naming() {
     // Verify table naming conventions
-    assert_eq!(LanceDbStore::vertex_table_name("Person"), "vertices_Person");
-    assert_eq!(LanceDbStore::vertex_table_name("User"), "vertices_User");
+    assert_eq!(table_names::vertex_table_name("Person"), "vertices_Person");
+    assert_eq!(table_names::vertex_table_name("User"), "vertices_User");
 
     assert_eq!(
-        LanceDbStore::delta_table_name("knows", "fwd"),
+        table_names::delta_table_name("knows", "fwd"),
         "deltas_knows_fwd"
     );
     assert_eq!(
-        LanceDbStore::delta_table_name("LIKES", "bwd"),
+        table_names::delta_table_name("LIKES", "bwd"),
         "deltas_LIKES_bwd"
     );
 
     assert_eq!(
-        LanceDbStore::adjacency_table_name("knows", "fwd"),
+        table_names::adjacency_table_name("knows", "fwd"),
         "adjacency_knows_fwd"
     );
 }

@@ -45,7 +45,6 @@ async fn test_cypher_aggregation() -> anyhow::Result<()> {
     // 1: 30
     // 2: 20
     // 3: 40
-    let lancedb_store = storage.lancedb_store();
     let vertex_ds = storage.vertex_dataset("Person")?;
     // Columns: _vid, _uid, _deleted, _version, ext_id, _labels, _created_at, _updated_at, age, overflow_json
     let batch = RecordBatch::try_new(
@@ -83,7 +82,7 @@ async fn test_cypher_aggregation() -> anyhow::Result<()> {
         ],
     )?;
     vertex_ds
-        .write_batch_lancedb(lancedb_store, batch, &schema_manager.schema())
+        .write_batch(storage.backend(), batch, &schema_manager.schema())
         .await?;
 
     // Insert Orders
@@ -126,7 +125,7 @@ async fn test_cypher_aggregation() -> anyhow::Result<()> {
         ],
     )?;
     order_ds
-        .write_batch_lancedb(lancedb_store, batch, &schema_manager.schema())
+        .write_batch(storage.backend(), batch, &schema_manager.schema())
         .await?;
 
     let prop_mgr = PropertyManager::new(storage.clone(), schema_manager.clone(), 100);

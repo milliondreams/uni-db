@@ -52,7 +52,6 @@ async fn test_cypher_filtering() -> anyhow::Result<()> {
     // 0: Alice, 25, true
     // 1: Bob, 35, false
     // 2: Charlie, 40, true
-    let lancedb_store = storage.lancedb_store();
     let vertex_ds = storage.vertex_dataset("Person")?;
     let arrow_schema = vertex_ds.get_arrow_schema(&schema_manager.schema())?;
 
@@ -93,7 +92,7 @@ async fn test_cypher_filtering() -> anyhow::Result<()> {
         ],
     )?;
     vertex_ds
-        .write_batch_lancedb(lancedb_store, batch, &schema_manager.schema())
+        .write_batch(storage.backend(), batch, &schema_manager.schema())
         .await?;
 
     let prop_mgr = PropertyManager::new(storage.clone(), schema_manager.clone(), 100);

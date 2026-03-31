@@ -8,7 +8,8 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-default = []
+default = ["lance-backend"]
+lance-backend = ["dep:lance", "dep:lancedb", "dep:lance-index", "dep:lance-linalg"]
 
 [dependencies]
 uni-common = { workspace = true }
@@ -27,15 +28,15 @@ parking_lot = { workspace = true }
 bytes = { workspace = true }
 async-trait = { workspace = true }
 tempfile = { workspace = true }
-dashmap = "6.0"
 lru = "0.16"
 metrics = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 futures = "0.3"
-lance = { workspace = true }
-lance-index = { version = "3.0.1" }
-lance-linalg = { version = "3.0.1" }
-lancedb = { workspace = true }
+lance = { workspace = true, optional = true }
+lance-index = { version = "3.0.1", optional = true }
+lance-linalg = { version = "3.0.1", optional = true }
+lancedb = { workspace = true, optional = true }
+dashmap = "6.0"
 uni-xervo = { workspace = true }
 
 object_store = { workspace = true }

@@ -31,7 +31,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use uni_common::core::id::Vid;
-use uni_store::storage::main_vertex::MainVertexDataset;
 
 /// Execution plan for looking up a vertex by external ID.
 ///
@@ -323,13 +322,12 @@ async fn execute_lookup(
     schema: &SchemaRef,
 ) -> DFResult<Option<RecordBatch>> {
     let storage = graph_ctx.storage();
-    let lancedb = storage.lancedb_store();
 
     // Look up vertex by ext_id with snapshot isolation
-    let found_vid =
-        MainVertexDataset::find_by_ext_id(lancedb, ext_id, storage.version_high_water_mark())
-            .await
-            .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+    let found_vid = storage
+        .find_vertex_by_ext_id(ext_id)
+        .await
+        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
 
     let Some(vid) = found_vid else {
         // No match found
@@ -357,11 +355,11 @@ async fn execute_lookup(
     };
 
     // Get labels for the vertex
-    let labels =
-        MainVertexDataset::find_labels_by_vid(lancedb, vid, storage.version_high_water_mark())
-            .await
-            .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?
-            .unwrap_or_default();
+    let labels = storage
+        .find_vertex_labels_by_vid(vid)
+        .await
+        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?
+        .unwrap_or_default();
 
     let label_name = labels
         .first()

@@ -7,8 +7,6 @@
 //! and can be recovered after a complete "restart" (dropping all memory state).
 
 use anyhow::Result;
-use futures::TryStreamExt;
-use lancedb::query::{ExecutableQuery, QueryBase, Select};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tempfile::tempdir;
@@ -16,6 +14,8 @@ use uni_db::core::id::Vid;
 use uni_db::core::schema::{DataType, SchemaManager};
 use uni_db::runtime::writer::Writer;
 use uni_db::storage::manager::StorageManager;
+use uni_db::store::backend::table_names;
+use uni_db::store::backend::types::{ColumnProjection, ScanRequest};
 
 #[tokio::test]
 async fn test_data_survives_restart() -> Result<()> {
@@ -87,16 +87,19 @@ async fn test_data_survives_restart() -> Result<()> {
         // 2. Re-initialize Storage (Cold Start)
         let storage = Arc::new(StorageManager::new(storage_str, schema_manager.clone()).await?);
 
-        // 3. Verify Data via LanceDB API
-        let ds = storage.vertex_dataset("Person")?;
-        let lancedb_store = storage.lancedb_store();
-        let table = ds.open_lancedb(lancedb_store).await?;
-        let count = table.count_rows(None).await?;
+        // 3. Verify Data via backend API
+        let table_name = table_names::vertex_table_name("Person");
+        let count = storage.backend().count_rows(&table_name, None).await?;
         assert_eq!(count, 1, "Data should persist after restart");
 
-        // 4. Verify Data Content via LanceDB query
-        let query = table.query().select(Select::Columns(vec!["name".into()]));
-        let batches: Vec<arrow_array::RecordBatch> = query.execute().await?.try_collect().await?;
+        // 4. Verify Data Content via backend scan
+        let scan_req = ScanRequest {
+            table_name: table_name.clone(),
+            columns: ColumnProjection::Columns(vec!["name".to_string()]),
+            filter: uni_store::backend::types::FilterExpr::None,
+            limit: None,
+        };
+        let batches = storage.backend().scan(scan_req).await?;
         assert!(!batches.is_empty(), "Should have at least one batch");
         let batch = &batches[0];
         let name_col = batch

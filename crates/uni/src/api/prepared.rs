@@ -341,11 +341,9 @@ fn compile_locy_with_registry(
     } else {
         let external_names: Vec<String> = registry.rules.keys().cloned().collect();
         drop(registry);
-        uni_locy::compile_with_external_rules(&ast, &external_names).map_err(|e| {
-            UniError::Query {
-                message: format!("LocyCompileError: {e}"),
-                query: None,
-            }
+        uni_locy::compile_with_external_rules(&ast, &external_names).map_err(|e| UniError::Query {
+            message: format!("LocyCompileError: {e}"),
+            query: None,
         })
     }
 }

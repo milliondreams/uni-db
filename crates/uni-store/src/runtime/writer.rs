@@ -14,7 +14,6 @@ use crate::storage::main_vertex::MainVertexDataset;
 use crate::storage::manager::StorageManager;
 use anyhow::{Result, anyhow};
 use chrono::Utc;
-use futures::TryStreamExt;
 use metrics;
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
@@ -764,6 +763,7 @@ impl Writer {
                     }
                 }
 
+                #[cfg(feature = "lance-backend")]
                 if !or_filters.is_empty() {
                     let vid_list: Vec<String> =
                         vids.iter().map(|v| v.as_u64().to_string()).collect();
@@ -830,8 +830,8 @@ impl Writer {
 
         // Check main vertices table (if it exists)
         // Pass None for global uniqueness check (not snapshot-isolated)
-        let lancedb = self.storage.lancedb_store();
-        if let Ok(Some(found_vid)) = MainVertexDataset::find_by_ext_id(lancedb, ext_id, None).await
+        let backend = self.storage.backend();
+        if let Ok(Some(found_vid)) = MainVertexDataset::find_by_ext_id(backend, ext_id, None).await
             && found_vid != current_vid
         {
             return Err(anyhow!(
@@ -1103,6 +1103,7 @@ impl Writer {
             current_vid.as_u64()
         ));
 
+        #[cfg(feature = "lance-backend")]
         if let Ok(ds) = self.storage.vertex_dataset(label)
             && let Ok(lance_ds) = ds.open_raw().await
         {
@@ -1605,31 +1606,33 @@ impl Writer {
     /// Find vertex labels from storage by querying the main vertices table.
     /// Returns the labels from the latest non-deleted version of the vertex.
     async fn find_vertex_labels_in_storage(&self, vid: Vid) -> Result<Option<Vec<String>>> {
+        use crate::backend::types::ScanRequest;
         use arrow_array::Array;
         use arrow_array::cast::AsArray;
-        use lancedb::query::{ExecutableQuery, QueryBase, Select};
 
-        let lancedb_store = self.storage.lancedb_store();
+        let backend = self.storage.backend();
         let table_name = MainVertexDataset::table_name();
 
         // Check if table exists first; if not, vertex hasn't been flushed to storage yet
-        if !lancedb_store.table_exists(table_name).await? {
+        if !backend.table_exists(table_name).await? {
             return Ok(None);
         }
 
-        let table = lancedb_store.open_table(table_name).await?;
-
         // Query for this specific vid (don't filter by _deleted yet - we need to find the latest version first)
         let filter = format!("_vid = {}", vid.as_u64());
-        let query = table.query().only_if(filter).select(Select::Columns(vec![
-            "_vid".to_string(),
-            "labels".to_string(),
-            "_version".to_string(),
-            "_deleted".to_string(),
-        ]));
-
-        let stream = query.execute().await?;
-        let batches: Vec<arrow_array::RecordBatch> = stream.try_collect().await.unwrap_or_default();
+        let batches = backend
+            .scan(
+                ScanRequest::all(table_name)
+                    .with_filter(filter)
+                    .with_columns(vec![
+                        "_vid".to_string(),
+                        "labels".to_string(),
+                        "_version".to_string(),
+                        "_deleted".to_string(),
+                    ]),
+            )
+            .await
+            .unwrap_or_default();
 
         // Find the row with the highest version number
         let mut max_version: Option<u64> = None;
@@ -2187,8 +2190,6 @@ impl Writer {
         tracing::Span::current().record("snapshot_id", &snapshot_id);
 
         // 2. For each edge type, write FWD and BWD runs
-        let lancedb_store = self.storage.lancedb_store();
-
         for (&edge_type_id, entries) in entries_by_type.iter() {
             // Get edge type name from unified lookup (handles both schema'd and schemaless)
             let edge_type_name = self
@@ -2203,9 +2204,10 @@ impl Writer {
             let fwd_ds = self.storage.delta_dataset(&edge_type_name, "fwd")?;
             let fwd_batch = fwd_ds.build_record_batch(&fwd_entries, &schema)?;
 
-            // Write using LanceDB
-            let table = fwd_ds.write_run_lancedb(lancedb_store, fwd_batch).await?;
-            fwd_ds.ensure_eid_index_lancedb(&table).await?;
+            // Write using backend
+            let backend = self.storage.backend();
+            fwd_ds.write_run(backend, fwd_batch).await?;
+            fwd_ds.ensure_eid_index(backend).await?;
 
             // BWD Run (sorted by dst_vid)
             let mut bwd_entries = entries.clone();
@@ -2213,8 +2215,9 @@ impl Writer {
             let bwd_ds = self.storage.delta_dataset(&edge_type_name, "bwd")?;
             let bwd_batch = bwd_ds.build_record_batch(&bwd_entries, &schema)?;
 
-            let bwd_table = bwd_ds.write_run_lancedb(lancedb_store, bwd_batch).await?;
-            bwd_ds.ensure_eid_index_lancedb(&bwd_table).await?;
+            let backend = self.storage.backend();
+            bwd_ds.write_run(backend, bwd_batch).await?;
+            bwd_ds.ensure_eid_index(backend).await?;
 
             // Update Manifest
             let current_snap =
@@ -2296,11 +2299,10 @@ impl Writer {
                 Some(&vertex_updated_at),
             )?;
 
-            // Write using LanceDB
-            let table = ds
-                .write_batch_lancedb(lancedb_store, batch, &schema)
-                .await?;
-            ds.ensure_default_indexes_lancedb(&table).await?;
+            // Write using backend
+            let backend = self.storage.backend();
+            ds.write_batch(backend, batch, &schema).await?;
+            ds.ensure_default_indexes(backend).await?;
 
             // Update VidLabelsIndex (if enabled)
             for ((vid, labels, _props), &deleted) in v_data.iter().zip(d_data.iter()) {
@@ -2330,6 +2332,7 @@ impl Writer {
             self.storage.invalidate_table_cache(label_name);
 
             // Apply inverted index updates incrementally
+            #[cfg(feature = "lance-backend")]
             for idx in &schema.indexes {
                 if let IndexDefinition::Inverted(cfg) = idx
                     && cfg.label == label_name
@@ -2344,19 +2347,22 @@ impl Writer {
 
             // Update UID index with new vertex mappings
             // Collect (UniId, Vid) mappings from non-deleted vertices
-            let mut uid_mappings: Vec<(uni_common::core::id::UniId, Vid)> = Vec::new();
-            for (vid, _labels, props) in &v_data {
-                let ext_id = props.get("ext_id").and_then(|v| v.as_str());
-                let uid = crate::storage::vertex::VertexDataset::compute_vertex_uid(
-                    label_name, ext_id, props,
-                );
-                uid_mappings.push((uid, *vid));
-            }
-
-            if !uid_mappings.is_empty()
-                && let Ok(uid_index) = self.storage.uid_index(label_name)
+            #[cfg(feature = "lance-backend")]
             {
-                uid_index.write_mapping(&uid_mappings).await?;
+                let mut uid_mappings: Vec<(uni_common::core::id::UniId, Vid)> = Vec::new();
+                for (vid, _labels, props) in &v_data {
+                    let ext_id = props.get("ext_id").and_then(|v| v.as_str());
+                    let uid = crate::storage::vertex::VertexDataset::compute_vertex_uid(
+                        label_name, ext_id, props,
+                    );
+                    uid_mappings.push((uid, *vid));
+                }
+
+                if !uid_mappings.is_empty()
+                    && let Ok(uid_index) = self.storage.uid_index(label_name)
+                {
+                    uid_index.write_mapping(&uid_mappings).await?;
+                }
             }
         }
 
@@ -2415,9 +2421,8 @@ impl Writer {
                 Some(&edge_created_at_map),
                 Some(&edge_updated_at_map),
             )?;
-            let main_edge_table =
-                MainEdgeDataset::write_batch_lancedb(lancedb_store, main_edge_batch).await?;
-            MainEdgeDataset::ensure_default_indexes_lancedb(&main_edge_table).await?;
+            MainEdgeDataset::write_batch(self.storage.backend(), main_edge_batch).await?;
+            MainEdgeDataset::ensure_default_indexes(self.storage.backend()).await?;
         }
 
         // 3.2 Write to main vertices table
@@ -2449,9 +2454,8 @@ impl Writer {
                 Some(&vertex_created_at),
                 Some(&vertex_updated_at),
             )?;
-            let main_vertex_table =
-                MainVertexDataset::write_batch_lancedb(lancedb_store, main_vertex_batch).await?;
-            MainVertexDataset::ensure_default_indexes_lancedb(&main_vertex_table).await?;
+            MainVertexDataset::write_batch(self.storage.backend(), main_vertex_batch).await?;
+            MainVertexDataset::ensure_default_indexes(self.storage.backend()).await?;
         }
 
         // Save Snapshot

@@ -15,21 +15,16 @@
 //! - `_created_at`: Creation timestamp
 //! - `_updated_at`: Update timestamp
 
-use crate::lancedb::LanceDbStore;
+use crate::backend::StorageBackend;
+use crate::backend::table_names;
+use crate::backend::types::{ScalarIndexType, ScanRequest, WriteMode};
 use crate::storage::arrow_convert::build_timestamp_column_from_vid_map;
-use crate::storage::index_utils::ensure_btree_index;
 use anyhow::{Result, anyhow};
 use arrow_array::builder::{
     FixedSizeBinaryBuilder, LargeBinaryBuilder, ListBuilder, StringBuilder,
 };
 use arrow_array::{Array, ArrayRef, BooleanArray, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema, TimeUnit};
-use futures::TryStreamExt;
-use futures::future;
-use lancedb::Table;
-use lancedb::index::Index as LanceDbIndex;
-use lancedb::index::scalar::LabelListIndexBuilder;
-use lancedb::query::{ExecutableQuery, QueryBase};
 use sha3::{Digest, Sha3_256};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -84,17 +79,7 @@ impl MainVertexDataset {
 
     /// Get the table name for the main vertices table.
     pub fn table_name() -> &'static str {
-        "vertices"
-    }
-
-    /// Open the main vertices table.
-    ///
-    /// Returns the LanceDB table handle for querying vertices.
-    pub async fn open_table(store: &LanceDbStore) -> Result<Table> {
-        store
-            .open_table(Self::table_name())
-            .await
-            .map_err(|e| anyhow!("Failed to open main vertices table: {}", e))
+        table_names::main_vertex_table_name()
     }
 
     /// Compute the UniId (content-addressed hash) for a vertex.
@@ -218,50 +203,37 @@ impl MainVertexDataset {
     /// Write a batch to the main vertices table.
     ///
     /// Creates the table if it doesn't exist, otherwise appends to it.
-    pub async fn write_batch_lancedb(store: &LanceDbStore, batch: RecordBatch) -> Result<Table> {
-        let table_name = Self::table_name();
+    pub async fn write_batch(backend: &dyn StorageBackend, batch: RecordBatch) -> Result<()> {
+        let table_name = table_names::main_vertex_table_name();
 
-        if store.table_exists(table_name).await? {
-            let table = store.open_table(table_name).await?;
-            store.append_to_table(&table, vec![batch]).await?;
-            Ok(table)
+        if backend.table_exists(table_name).await? {
+            backend
+                .write(table_name, vec![batch], WriteMode::Append)
+                .await
         } else {
-            store.create_table(table_name, vec![batch]).await
+            backend.create_table(table_name, vec![batch]).await
         }
     }
 
     /// Ensure default indexes exist on the main vertices table.
-    pub async fn ensure_default_indexes_lancedb(table: &Table) -> Result<()> {
-        let indices = table
-            .list_indices()
-            .await
-            .map_err(|e| anyhow!("Failed to list indices: {}", e))?;
+    pub async fn ensure_default_indexes(backend: &dyn StorageBackend) -> Result<()> {
+        let table_name = table_names::main_vertex_table_name();
 
         // BTree indexes for primary key and lookup columns
-        future::join_all(
-            ["_vid", "ext_id", "_uid"]
-                .iter()
-                .map(|col| ensure_btree_index(table, &indices, col, "main vertices")),
-        )
-        .await;
+        let _ = backend
+            .create_scalar_index(table_name, "_vid", ScalarIndexType::BTree)
+            .await;
+        let _ = backend
+            .create_scalar_index(table_name, "ext_id", ScalarIndexType::BTree)
+            .await;
+        let _ = backend
+            .create_scalar_index(table_name, "_uid", ScalarIndexType::BTree)
+            .await;
 
         // LabelList index for array_contains() queries on labels
-        if !indices
-            .iter()
-            .any(|idx| idx.columns.iter().any(|c| c == "labels"))
-        {
-            log::info!("Creating labels LABEL_LIST index for main vertices table");
-            if let Err(e) = table
-                .create_index(
-                    &["labels"],
-                    LanceDbIndex::LabelList(LabelListIndexBuilder::default()),
-                )
-                .execute()
-                .await
-            {
-                log::warn!("Failed to create labels index for main vertices: {}", e);
-            }
-        }
+        let _ = backend
+            .create_scalar_index(table_name, "labels", ScalarIndexType::LabelList)
+            .await;
 
         Ok(())
     }
@@ -275,34 +247,31 @@ impl MainVertexDataset {
     ///   Pass `None` for writer uniqueness checks (global visibility).
     ///   Pass `Some(hwm)` for query-time snapshot isolation.
     pub async fn find_by_ext_id(
-        store: &LanceDbStore,
+        backend: &dyn StorageBackend,
         ext_id: &str,
         version: Option<u64>,
     ) -> Result<Option<Vid>> {
-        let table_name = Self::table_name();
+        let table_name = table_names::main_vertex_table_name();
 
-        if !store.table_exists(table_name).await? {
+        if !backend.table_exists(table_name).await? {
             return Ok(None);
         }
 
-        let table = store.open_table(table_name).await?;
-        let mut query = format!(
+        let mut filter = format!(
             "ext_id = '{}' AND _deleted = false",
             ext_id.replace('\'', "''")
         );
         if let Some(hwm) = version {
-            query.push_str(&format!(" AND _version <= {}", hwm));
+            filter.push_str(&format!(" AND _version <= {}", hwm));
         }
 
-        let batches = table
-            .query()
-            .only_if(query)
-            .select(lancedb::query::Select::Columns(vec!["_vid".to_string()]))
-            .execute()
-            .await
-            .map_err(|e| anyhow!("Query failed: {}", e))?;
-
-        let results: Vec<RecordBatch> = batches.try_collect().await?;
+        let results = backend
+            .scan(
+                ScanRequest::all(table_name)
+                    .with_filter(filter)
+                    .with_columns(vec!["_vid".to_string()]),
+            )
+            .await?;
 
         for batch in results {
             if batch.num_rows() > 0
@@ -321,11 +290,11 @@ impl MainVertexDataset {
     /// # Arguments
     /// * `version` - Optional version high water mark for snapshot isolation.
     pub async fn ext_id_exists(
-        store: &LanceDbStore,
+        backend: &dyn StorageBackend,
         ext_id: &str,
         version: Option<u64>,
     ) -> Result<bool> {
-        Ok(Self::find_by_ext_id(store, ext_id, version)
+        Ok(Self::find_by_ext_id(backend, ext_id, version)
             .await?
             .is_some())
     }
@@ -337,31 +306,28 @@ impl MainVertexDataset {
     /// # Arguments
     /// * `version` - Optional version high water mark for snapshot isolation.
     pub async fn find_labels_by_vid(
-        store: &LanceDbStore,
+        backend: &dyn StorageBackend,
         vid: Vid,
         version: Option<u64>,
     ) -> Result<Option<Vec<String>>> {
-        let table_name = Self::table_name();
+        let table_name = table_names::main_vertex_table_name();
 
-        if !store.table_exists(table_name).await? {
+        if !backend.table_exists(table_name).await? {
             return Ok(None);
         }
 
-        let table = store.open_table(table_name).await?;
-        let mut query = format!("_vid = {} AND _deleted = false", vid.as_u64());
+        let mut filter = format!("_vid = {} AND _deleted = false", vid.as_u64());
         if let Some(hwm) = version {
-            query.push_str(&format!(" AND _version <= {}", hwm));
+            filter.push_str(&format!(" AND _version <= {}", hwm));
         }
 
-        let batches = table
-            .query()
-            .only_if(query)
-            .select(lancedb::query::Select::Columns(vec!["labels".to_string()]))
-            .execute()
-            .await
-            .map_err(|e| anyhow!("Query failed: {}", e))?;
-
-        let results: Vec<RecordBatch> = batches.try_collect().await?;
+        let results = backend
+            .scan(
+                ScanRequest::all(table_name)
+                    .with_filter(filter)
+                    .with_columns(vec!["labels".to_string()]),
+            )
+            .await?;
 
         for batch in results {
             if batch.num_rows() > 0
@@ -398,28 +364,28 @@ impl MainVertexDataset {
     /// # Errors
     ///
     /// Returns an error if the table query fails.
-    pub async fn find_all_vids(store: &LanceDbStore, version: Option<u64>) -> Result<Vec<Vid>> {
-        let table_name = Self::table_name();
+    pub async fn find_all_vids(
+        backend: &dyn StorageBackend,
+        version: Option<u64>,
+    ) -> Result<Vec<Vid>> {
+        let table_name = table_names::main_vertex_table_name();
 
-        if !store.table_exists(table_name).await? {
+        if !backend.table_exists(table_name).await? {
             return Ok(Vec::new());
         }
 
-        let table = store.open_table(table_name).await?;
-        let mut query = "_deleted = false".to_string();
+        let mut filter = "_deleted = false".to_string();
         if let Some(hwm) = version {
-            query.push_str(&format!(" AND _version <= {}", hwm));
+            filter.push_str(&format!(" AND _version <= {}", hwm));
         }
 
-        let batches = table
-            .query()
-            .only_if(query)
-            .select(lancedb::query::Select::Columns(vec!["_vid".to_string()]))
-            .execute()
-            .await
-            .map_err(|e| anyhow!("Query failed: {}", e))?;
-
-        let results: Vec<RecordBatch> = batches.try_collect().await?;
+        let results = backend
+            .scan(
+                ScanRequest::all(table_name)
+                    .with_filter(filter)
+                    .with_columns(vec!["_vid".to_string()]),
+            )
+            .await?;
 
         let mut vids = Vec::new();
         for batch in results {
@@ -449,32 +415,29 @@ impl MainVertexDataset {
     ///
     /// Returns an error if the table query fails.
     pub async fn find_vids_by_label_name(
-        store: &LanceDbStore,
+        backend: &dyn StorageBackend,
         label: &str,
         version: Option<u64>,
     ) -> Result<Vec<Vid>> {
-        let table_name = Self::table_name();
+        let table_name = table_names::main_vertex_table_name();
 
-        if !store.table_exists(table_name).await? {
+        if !backend.table_exists(table_name).await? {
             return Ok(Vec::new());
         }
 
-        let table = store.open_table(table_name).await?;
         // Use SQL array_contains to filter by label
-        let mut query = format!("_deleted = false AND array_contains(labels, '{}')", label);
+        let mut filter = format!("_deleted = false AND array_contains(labels, '{}')", label);
         if let Some(hwm) = version {
-            query.push_str(&format!(" AND _version <= {}", hwm));
+            filter.push_str(&format!(" AND _version <= {}", hwm));
         }
 
-        let batches = table
-            .query()
-            .only_if(query)
-            .select(lancedb::query::Select::Columns(vec!["_vid".to_string()]))
-            .execute()
-            .await
-            .map_err(|e| anyhow!("Query failed: {}", e))?;
-
-        let results: Vec<RecordBatch> = batches.try_collect().await?;
+        let results = backend
+            .scan(
+                ScanRequest::all(table_name)
+                    .with_filter(filter)
+                    .with_columns(vec!["_vid".to_string()]),
+            )
+            .await?;
 
         let mut vids = Vec::new();
         for batch in results {
@@ -500,17 +463,15 @@ impl MainVertexDataset {
     /// # Arguments
     /// * `version` - Optional version high water mark for snapshot isolation.
     pub async fn find_vids_by_labels(
-        store: &LanceDbStore,
+        backend: &dyn StorageBackend,
         labels: &[&str],
         version: Option<u64>,
     ) -> Result<Vec<Vid>> {
-        let table_name = Self::table_name();
+        let table_name = table_names::main_vertex_table_name();
 
-        if labels.is_empty() || !store.table_exists(table_name).await? {
+        if labels.is_empty() || !backend.table_exists(table_name).await? {
             return Ok(Vec::new());
         }
-
-        let table = store.open_table(table_name).await?;
 
         // Build AND conditions for each label
         let label_conditions: Vec<String> = labels
@@ -521,20 +482,18 @@ impl MainVertexDataset {
             })
             .collect();
 
-        let mut query = format!("_deleted = false AND {}", label_conditions.join(" AND "));
+        let mut filter = format!("_deleted = false AND {}", label_conditions.join(" AND "));
         if let Some(hwm) = version {
-            query.push_str(&format!(" AND _version <= {}", hwm));
+            filter.push_str(&format!(" AND _version <= {}", hwm));
         }
 
-        let batches = table
-            .query()
-            .only_if(query)
-            .select(lancedb::query::Select::Columns(vec!["_vid".to_string()]))
-            .execute()
-            .await
-            .map_err(|e| anyhow!("Query failed: {}", e))?;
-
-        let results: Vec<RecordBatch> = batches.try_collect().await?;
+        let results = backend
+            .scan(
+                ScanRequest::all(table_name)
+                    .with_filter(filter)
+                    .with_columns(vec!["_vid".to_string()]),
+            )
+            .await?;
 
         let mut vids = Vec::new();
         for batch in results {
@@ -565,37 +524,30 @@ impl MainVertexDataset {
     ///
     /// Returns an error if the table query fails or JSON parsing fails.
     pub async fn find_batch_props_by_vids(
-        store: &LanceDbStore,
+        backend: &dyn StorageBackend,
         vids: &[Vid],
         version: Option<u64>,
     ) -> Result<HashMap<Vid, Properties>> {
-        let table_name = Self::table_name();
+        let table_name = table_names::main_vertex_table_name();
 
-        if vids.is_empty() || !store.table_exists(table_name).await? {
+        if vids.is_empty() || !backend.table_exists(table_name).await? {
             return Ok(HashMap::new());
         }
 
-        let table = store.open_table(table_name).await?;
-
         // Build IN clause for VIDs
         let vid_list: Vec<String> = vids.iter().map(|v| v.as_u64().to_string()).collect();
-        let mut query = format!("_vid IN ({}) AND _deleted = false", vid_list.join(", "));
+        let mut filter = format!("_vid IN ({}) AND _deleted = false", vid_list.join(", "));
         if let Some(hwm) = version {
-            query.push_str(&format!(" AND _version <= {}", hwm));
+            filter.push_str(&format!(" AND _version <= {}", hwm));
         }
 
-        let batches = table
-            .query()
-            .only_if(query)
-            .select(lancedb::query::Select::Columns(vec![
-                "_vid".to_string(),
-                "props_json".to_string(),
-            ]))
-            .execute()
-            .await
-            .map_err(|e| anyhow!("Query failed: {}", e))?;
-
-        let results: Vec<RecordBatch> = batches.try_collect().await?;
+        let results = backend
+            .scan(
+                ScanRequest::all(table_name)
+                    .with_filter(filter)
+                    .with_columns(vec!["_vid".to_string(), "props_json".to_string()]),
+            )
+            .await?;
 
         let mut props_map = HashMap::new();
 
@@ -645,34 +597,28 @@ impl MainVertexDataset {
     ///
     /// Returns an error if the table query fails or JSON parsing fails.
     pub async fn find_props_by_vid(
-        store: &LanceDbStore,
+        backend: &dyn StorageBackend,
         vid: Vid,
         version: Option<u64>,
     ) -> Result<Option<Properties>> {
-        let table_name = Self::table_name();
+        let table_name = table_names::main_vertex_table_name();
 
-        if !store.table_exists(table_name).await? {
+        if !backend.table_exists(table_name).await? {
             return Ok(None);
         }
 
-        let table = store.open_table(table_name).await?;
-        let mut query = format!("_vid = {} AND _deleted = false", vid.as_u64());
+        let mut filter = format!("_vid = {} AND _deleted = false", vid.as_u64());
         if let Some(hwm) = version {
-            query.push_str(&format!(" AND _version <= {}", hwm));
+            filter.push_str(&format!(" AND _version <= {}", hwm));
         }
 
-        let batches = table
-            .query()
-            .only_if(query)
-            .select(lancedb::query::Select::Columns(vec![
-                "props_json".to_string(),
-                "_version".to_string(),
-            ]))
-            .execute()
-            .await
-            .map_err(|e| anyhow!("Query failed: {}", e))?;
-
-        let results: Vec<RecordBatch> = batches.try_collect().await?;
+        let results = backend
+            .scan(
+                ScanRequest::all(table_name)
+                    .with_filter(filter)
+                    .with_columns(vec!["props_json".to_string(), "_version".to_string()]),
+            )
+            .await?;
 
         // Find the row with highest version (latest)
         let mut best_props: Option<Properties> = None;
@@ -719,37 +665,30 @@ impl MainVertexDataset {
     /// # Arguments
     /// * `version` - Optional version high water mark for snapshot isolation.
     pub async fn find_batch_labels_by_vids(
-        store: &LanceDbStore,
+        backend: &dyn StorageBackend,
         vids: &[Vid],
         version: Option<u64>,
     ) -> Result<HashMap<Vid, Vec<String>>> {
-        let table_name = Self::table_name();
+        let table_name = table_names::main_vertex_table_name();
 
-        if vids.is_empty() || !store.table_exists(table_name).await? {
+        if vids.is_empty() || !backend.table_exists(table_name).await? {
             return Ok(HashMap::new());
         }
 
-        let table = store.open_table(table_name).await?;
-
         // Build IN clause for VIDs
         let vid_list: Vec<String> = vids.iter().map(|v| v.as_u64().to_string()).collect();
-        let mut query = format!("_vid IN ({}) AND _deleted = false", vid_list.join(", "));
+        let mut filter = format!("_vid IN ({}) AND _deleted = false", vid_list.join(", "));
         if let Some(hwm) = version {
-            query.push_str(&format!(" AND _version <= {}", hwm));
+            filter.push_str(&format!(" AND _version <= {}", hwm));
         }
 
-        let batches = table
-            .query()
-            .only_if(query)
-            .select(lancedb::query::Select::Columns(vec![
-                "_vid".to_string(),
-                "labels".to_string(),
-            ]))
-            .execute()
-            .await
-            .map_err(|e| anyhow!("Query failed: {}", e))?;
-
-        let results: Vec<RecordBatch> = batches.try_collect().await?;
+        let results = backend
+            .scan(
+                ScanRequest::all(table_name)
+                    .with_filter(filter)
+                    .with_columns(vec!["_vid".to_string(), "labels".to_string()]),
+            )
+            .await?;
 
         let mut label_map = HashMap::new();
 

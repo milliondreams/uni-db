@@ -42,7 +42,6 @@ async fn test_regional_sales_analytics() -> anyhow::Result<()> {
         )
         .await?,
     );
-    let lancedb_store = storage.lancedb_store();
 
     // Data:
     // Region: "North" (Vid 0)
@@ -79,7 +78,7 @@ async fn test_regional_sales_analytics() -> anyhow::Result<()> {
         ],
     )?;
     region_ds
-        .write_batch_lancedb(lancedb_store, region_batch, &schema_manager.schema())
+        .write_batch(storage.backend(), region_batch, &schema_manager.schema())
         .await?;
 
     // Insert Orders (Batch of 100)
@@ -132,7 +131,7 @@ async fn test_regional_sales_analytics() -> anyhow::Result<()> {
         ],
     )?;
     order_ds
-        .write_batch_lancedb(lancedb_store, order_batch, &schema_manager.schema())
+        .write_batch(storage.backend(), order_batch, &schema_manager.schema())
         .await?;
 
     // Edges: Order(i) -> Region(0)
@@ -167,7 +166,7 @@ async fn test_regional_sales_analytics() -> anyhow::Result<()> {
             Arc::new(e_builder.finish()),
         ],
     )?;
-    adj_ds.write_chunk_lancedb(lancedb_store, adj_batch).await?;
+    adj_ds.write_chunk(storage.backend(), adj_batch).await?;
 
     // Warm the adjacency cache
     use uni_db::storage::direction::Direction as CacheDir;
@@ -321,7 +320,6 @@ async fn test_document_knowledge_graph() -> anyhow::Result<()> {
         )
         .await?,
     );
-    let lancedb_store = storage.lancedb_store();
 
     // Insert Papers using vertex dataset directly
     let paper_ds = storage.vertex_dataset("Paper")?;
@@ -358,7 +356,7 @@ async fn test_document_knowledge_graph() -> anyhow::Result<()> {
         ],
     )?;
     paper_ds
-        .write_batch_lancedb(lancedb_store, paper_batch, &schema_manager.schema())
+        .write_batch(storage.backend(), paper_batch, &schema_manager.schema())
         .await?;
 
     // Edge: 0 -> CITES -> 2
@@ -381,7 +379,7 @@ async fn test_document_knowledge_graph() -> anyhow::Result<()> {
             Arc::new(e_builder.finish()),
         ],
     )?;
-    adj_ds.write_chunk_lancedb(lancedb_store, batch).await?;
+    adj_ds.write_chunk(storage.backend(), batch).await?;
 
     // Warm the adjacency cache
     use uni_db::storage::direction::Direction as CacheDir3;
@@ -433,7 +431,6 @@ async fn test_identity_provenance() -> anyhow::Result<()> {
         )
         .await?,
     );
-    let lancedb_store = storage.lancedb_store();
 
     // Node A (VID 0) -> UID A
     // Node B (VID 1) -> UID B
@@ -477,7 +474,7 @@ async fn test_identity_provenance() -> anyhow::Result<()> {
             Arc::new(e_builder.finish()),
         ],
     )?;
-    adj_ds.write_chunk_lancedb(lancedb_store, batch).await?;
+    adj_ds.write_chunk(storage.backend(), batch).await?;
 
     // Warm the adjacency cache
     use uni_db::storage::direction::Direction as CacheDir4;

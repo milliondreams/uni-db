@@ -4,7 +4,6 @@
 use super::core::*;
 use crate::query::planner::LogicalPlan;
 use anyhow::{Result, anyhow};
-use lancedb::query::{ExecutableQuery, QueryBase};
 use std::collections::HashMap;
 use std::sync::Arc;
 use uni_common::DataType;
@@ -451,12 +450,11 @@ impl Executor {
         match format {
             "parquet" => self.export_vertex_label(label, path).await,
             "csv" => {
-                // Get dataset and open table
-                let dataset = self.storage.vertex_dataset(label)?;
-                let table = dataset.open_lancedb(self.storage.lancedb_store()).await?;
-
-                // Query all data
-                let mut stream = table.query().execute().await?;
+                let mut stream = self
+                    .storage
+                    .scan_vertex_table_stream(label)
+                    .await?
+                    .ok_or_else(|| anyhow!("No data for label '{}'", label))?;
 
                 // Collect all batches
                 let mut all_rows = Vec::new();
@@ -548,8 +546,7 @@ impl Executor {
     /// Write a stream of record batches to a Parquet file.
     /// Returns the total number of rows written, or 0 if the stream is empty.
     async fn write_batches_to_parquet(
-        mut stream: impl futures::Stream<Item = Result<arrow_array::RecordBatch, lancedb::Error>>
-        + Unpin,
+        mut stream: impl futures::Stream<Item = anyhow::Result<arrow_array::RecordBatch>> + Unpin,
         path: &str,
         entity_description: &str,
     ) -> Result<usize> {
@@ -592,11 +589,11 @@ impl Executor {
 
     /// Export vertices of a specific label to Parquet
     async fn export_vertex_label(&self, label: &str, path: &str) -> Result<usize> {
-        let dataset = self.storage.vertex_dataset(label)?;
-        let lancedb_store = self.storage.lancedb_store();
-        let table = dataset.open_lancedb(lancedb_store).await?;
-        let query = table.query();
-        let stream = query.execute().await?;
+        let stream = self
+            .storage
+            .scan_vertex_table_stream(label)
+            .await?
+            .ok_or_else(|| anyhow!("No data for label '{}'", label))?;
 
         Self::write_batches_to_parquet(stream, path, &format!("label '{}'", label)).await
     }
@@ -608,10 +605,12 @@ impl Executor {
             return Err(anyhow!("Edge type '{}' not found", edge_type));
         }
 
-        let lancedb_store = self.storage.lancedb_store();
-        let table = lancedb_store.open_main_edge_table().await?;
-        let query = table.query().only_if(format!("type = '{}'", edge_type));
-        let stream = query.execute().await?;
+        let filter = format!("type = '{}'", edge_type);
+        let stream = self
+            .storage
+            .scan_main_edge_table_stream(Some(&filter))
+            .await?
+            .ok_or_else(|| anyhow!("No edge data found"))?;
 
         Self::write_batches_to_parquet(stream, path, &format!("edge type '{}'", edge_type)).await
     }

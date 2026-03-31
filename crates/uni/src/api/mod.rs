@@ -791,7 +791,7 @@ impl Uni {
             let idx_mgr = uni_store::storage::IndexManager::new(
                 self.inner.storage.base_path(),
                 self.inner.schema.clone(),
-                self.inner.storage.lancedb_store_arc(),
+                self.inner.storage.backend_arc(),
             );
             idx_mgr
                 .rebuild_indexes_for_label(label)

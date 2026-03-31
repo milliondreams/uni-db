@@ -45,8 +45,6 @@ async fn test_query_integration() -> anyhow::Result<()> {
             .unwrap(),
     ));
 
-    let lancedb_store = storage.lancedb_store();
-
     // VIDs
     // A (0)
     // B (1)
@@ -108,7 +106,7 @@ async fn test_query_integration() -> anyhow::Result<()> {
     )?;
 
     vertex_ds
-        .write_batch_lancedb(lancedb_store, batch, &schema_manager.schema())
+        .write_batch(storage.backend(), batch, &schema_manager.schema())
         .await?;
 
     // 2b. Adjacency (A->B)
@@ -135,7 +133,7 @@ async fn test_query_integration() -> anyhow::Result<()> {
         ],
     )?;
 
-    adj_ds.write_chunk_lancedb(lancedb_store, batch).await?;
+    adj_ds.write_chunk(storage.backend(), batch).await?;
 
     // Warm the adjacency cache and adjacency manager
     use uni_db::storage::direction::Direction;

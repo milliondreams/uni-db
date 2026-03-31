@@ -69,7 +69,8 @@ name = "mutation_benchmarks"
 harness = false
 
 [features]
-default = ["provider-gemini", "provider-openai"]
+default = ["lance-backend", "provider-gemini", "provider-openai"]
+lance-backend = ["uni-store/lance-backend"]
 snapshot-internals = []
 storage-internals = []
 provider-candle = ["uni-xervo/provider-candle"]

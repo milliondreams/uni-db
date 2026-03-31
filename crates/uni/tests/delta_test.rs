@@ -29,8 +29,6 @@ async fn test_delta_operations() -> anyhow::Result<()> {
         )
         .await?,
     );
-    let lancedb_store = storage.lancedb_store();
-
     // Create DeltaDataset
     let delta = storage.delta_dataset("KNOWS", "fwd")?;
 
@@ -64,11 +62,11 @@ async fn test_delta_operations() -> anyhow::Result<()> {
     // Write deltas using LanceDB
     let schema = schema_manager.schema();
     let batch = delta.build_record_batch(&[op1.clone(), op2.clone()], &schema)?;
-    delta.write_run_lancedb(lancedb_store, batch).await?;
+    delta.write_run(storage.backend(), batch).await?;
 
     // Read deltas for vid1 using LanceDB
     let results = delta
-        .read_deltas_lancedb(lancedb_store, vid1, &schema, None)
+        .read_deltas(storage.backend(), vid1, &schema, None)
         .await?;
 
     assert_eq!(results.len(), 2);
@@ -95,7 +93,7 @@ async fn test_delta_operations() -> anyhow::Result<()> {
     // Test with non-existent VID
     let vid3 = Vid::new(3);
     let empty_results = delta
-        .read_deltas_lancedb(lancedb_store, vid3, &schema, None)
+        .read_deltas(storage.backend(), vid3, &schema, None)
         .await?;
     assert!(empty_results.is_empty());
 

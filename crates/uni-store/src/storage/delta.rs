@@ -3,7 +3,9 @@
 
 //! LSM-style delta dataset for accumulating edge mutations before compaction.
 
-use crate::lancedb::LanceDbStore;
+use crate::backend::StorageBackend;
+use crate::backend::table_names;
+use crate::backend::types::{ScalarIndexType, ScanRequest, WriteMode};
 use crate::storage::arrow_convert::build_timestamp_column;
 use crate::storage::property_builder::PropertyColumnBuilder;
 use crate::storage::value_codec::CrdtDecodeMode;
@@ -11,11 +13,10 @@ use anyhow::{Result, anyhow};
 use arrow_array::types::TimestampNanosecondType;
 use arrow_array::{Array, ArrayRef, PrimitiveArray, RecordBatch, UInt8Array, UInt64Array};
 use arrow_schema::{Field, Schema as ArrowSchema, TimeUnit};
+#[cfg(feature = "lance-backend")]
 use futures::TryStreamExt;
+#[cfg(feature = "lance-backend")]
 use lance::dataset::Dataset;
-use lancedb::Table;
-use lancedb::index::Index as LanceDbIndex;
-use lancedb::index::scalar::BTreeIndexBuilder;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::info;
@@ -88,6 +89,7 @@ pub struct L1Entry {
 /// merges them into the base CSR.
 #[derive(Debug)]
 pub struct DeltaDataset {
+    #[cfg_attr(not(feature = "lance-backend"), allow(dead_code))]
     uri: String,
     edge_type: String,
     direction: String, // "fwd" or "bwd"
@@ -105,11 +107,13 @@ impl DeltaDataset {
     }
 
     /// Open the delta dataset at its latest version.
+    #[cfg(feature = "lance-backend")]
     pub async fn open(&self) -> Result<Arc<Dataset>> {
         self.open_at(None).await
     }
 
     /// Open the delta dataset, optionally pinned to a specific Lance version.
+    #[cfg(feature = "lance-backend")]
     pub async fn open_at(&self, version: Option<u64>) -> Result<Arc<Dataset>> {
         let mut ds = Dataset::open(&self.uri).await?;
         if let Some(v) = version {
@@ -218,12 +222,14 @@ impl DeltaDataset {
     }
 
     /// Scan and return all L1 entries, sorted by direction key and version.
+    #[cfg(feature = "lance-backend")]
     pub async fn scan_all(&self, schema: &Schema) -> Result<Vec<L1Entry>> {
         self.scan_all_with_limit(schema, DEFAULT_MAX_COMPACTION_ROWS)
             .await
     }
 
     /// Scan all entries with a configurable row limit to prevent OOM.
+    #[cfg(feature = "lance-backend")]
     pub async fn scan_all_with_limit(
         &self,
         schema: &Schema,
@@ -389,108 +395,91 @@ impl DeltaDataset {
     }
 
     // ========================================================================
-    // LanceDB-based Methods
+    // Backend-agnostic Methods
     // ========================================================================
 
-    /// Open a delta table using LanceDB.
-    pub async fn open_lancedb(&self, store: &LanceDbStore) -> Result<Table> {
-        store
-            .open_delta_table(&self.edge_type, &self.direction)
-            .await
-    }
-
-    /// Open or create a delta table using LanceDB.
-    pub async fn open_or_create_lancedb(
+    /// Open or create a delta table via the storage backend.
+    pub async fn open_or_create(
         &self,
-        store: &LanceDbStore,
+        backend: &dyn StorageBackend,
         schema: &Schema,
-    ) -> Result<Table> {
+    ) -> Result<()> {
+        let table_name = table_names::delta_table_name(&self.edge_type, &self.direction);
         let arrow_schema = self.get_arrow_schema(schema)?;
-        store
-            .open_or_create_delta_table(&self.edge_type, &self.direction, arrow_schema)
+        backend
+            .open_or_create_table(&table_name, arrow_schema)
             .await
     }
 
-    /// Write a run to a LanceDB delta table.
+    /// Write a run to a delta table.
     ///
     /// Creates the table if it doesn't exist, otherwise appends to it.
-    pub async fn write_run_lancedb(
-        &self,
-        store: &LanceDbStore,
-        batch: RecordBatch,
-    ) -> Result<Table> {
-        let table_name = LanceDbStore::delta_table_name(&self.edge_type, &self.direction);
-
-        if store.table_exists(&table_name).await? {
-            let table = store.open_table(&table_name).await?;
-            store.append_to_table(&table, vec![batch]).await?;
-            Ok(table)
+    pub async fn write_run(&self, backend: &dyn StorageBackend, batch: RecordBatch) -> Result<()> {
+        let table_name = table_names::delta_table_name(&self.edge_type, &self.direction);
+        if backend.table_exists(&table_name).await? {
+            backend
+                .write(&table_name, vec![batch], WriteMode::Append)
+                .await
         } else {
-            store.create_table(&table_name, vec![batch]).await
+            backend.create_table(&table_name, vec![batch]).await
         }
     }
 
-    /// Ensure a BTree index exists on the 'eid' column using LanceDB.
-    pub async fn ensure_eid_index_lancedb(&self, table: &Table) -> Result<()> {
-        let indices = table
-            .list_indices()
-            .await
-            .map_err(|e| anyhow!("Failed to list indices: {}", e))?;
+    /// Ensure a BTree index exists on the 'eid' column.
+    pub async fn ensure_eid_index(&self, backend: &dyn StorageBackend) -> Result<()> {
+        let table_name = table_names::delta_table_name(&self.edge_type, &self.direction);
+        let indices = backend.list_indexes(&table_name).await?;
 
         if !indices
             .iter()
             .any(|idx| idx.columns.contains(&"eid".to_string()))
         {
             log::info!(
-                "Creating eid BTree index for edge type '{}' via LanceDB",
+                "Creating eid BTree index for edge type '{}'",
                 self.edge_type
             );
-            if let Err(e) = table
-                .create_index(&["eid"], LanceDbIndex::BTree(BTreeIndexBuilder::default()))
-                .execute()
+            if let Err(e) = backend
+                .create_scalar_index(&table_name, "eid", ScalarIndexType::BTree)
                 .await
             {
-                log::warn!(
-                    "Failed to create eid index for '{}' via LanceDB: {}",
-                    self.edge_type,
-                    e
-                );
+                log::warn!("Failed to create eid index for '{}': {}", self.edge_type, e);
             }
         }
 
         Ok(())
     }
 
-    /// Get the LanceDB table name for this delta dataset.
-    pub fn lancedb_table_name(&self) -> String {
-        LanceDbStore::delta_table_name(&self.edge_type, &self.direction)
+    /// Get the table name for this delta dataset.
+    pub fn table_name(&self) -> String {
+        table_names::delta_table_name(&self.edge_type, &self.direction)
     }
 
-    /// Scan all entries from LanceDB table.
+    /// Scan all entries from the backend table.
     ///
     /// Returns an empty vector if the table doesn't exist.
-    pub async fn scan_all_lancedb(
+    pub async fn scan_all_backend(
         &self,
-        store: &LanceDbStore,
+        backend: &dyn StorageBackend,
         schema: &Schema,
     ) -> Result<Vec<L1Entry>> {
-        self.scan_all_lancedb_with_limit(store, schema, DEFAULT_MAX_COMPACTION_ROWS)
+        self.scan_all_backend_with_limit(backend, schema, DEFAULT_MAX_COMPACTION_ROWS)
             .await
     }
 
-    /// Scan all entries from LanceDB table with a configurable row limit to prevent OOM.
-    pub async fn scan_all_lancedb_with_limit(
+    /// Scan all entries from the backend table with a configurable row limit to prevent OOM.
+    pub async fn scan_all_backend_with_limit(
         &self,
-        store: &LanceDbStore,
+        backend: &dyn StorageBackend,
         schema: &Schema,
         max_rows: usize,
     ) -> Result<Vec<L1Entry>> {
-        let table = match self.open_lancedb(store).await {
-            Ok(t) => t,
-            Err(_) => return Ok(vec![]),
-        };
+        let table_name = table_names::delta_table_name(&self.edge_type, &self.direction);
 
-        let row_count = table.count_rows(None).await?;
+        if !backend.table_exists(&table_name).await? {
+            return Ok(vec![]);
+        }
+
+        let row_count = backend.count_rows(&table_name, None).await?;
         check_oom_guard(row_count, max_rows, &self.edge_type, &self.direction)?;
 
         info!(
@@ -498,12 +487,10 @@ impl DeltaDataset {
             direction = %self.direction,
             row_count,
             estimated_bytes = row_count * ENTRY_SIZE_ESTIMATE,
-            "Starting delta scan for compaction (LanceDB)"
+            "Starting delta scan for compaction (backend)"
         );
 
-        use lancedb::query::ExecutableQuery;
-        let stream = table.query().execute().await?;
-        let batches: Vec<arrow_array::RecordBatch> = stream.try_collect().await?;
+        let batches = backend.scan(ScanRequest::all(&table_name)).await?;
 
         let mut entries = Vec::new();
         for batch in batches {
@@ -519,30 +506,29 @@ impl DeltaDataset {
     /// Replace the delta table with a new batch (atomic replacement).
     ///
     /// This is used during compaction to clear the delta table after merging into L2.
-    pub async fn replace_lancedb(&self, store: &LanceDbStore, batch: RecordBatch) -> Result<Table> {
-        let table_name = self.lancedb_table_name();
+    pub async fn replace(&self, backend: &dyn StorageBackend, batch: RecordBatch) -> Result<()> {
+        let table_name = self.table_name();
         let arrow_schema = batch.schema();
-        store
+        backend
             .replace_table_atomic(&table_name, vec![batch], arrow_schema)
             .await
     }
 
-    /// Read delta entries for a specific vertex ID from LanceDB.
+    /// Read delta entries for a specific vertex ID.
     ///
     /// Returns an empty vector if the table doesn't exist or no entries match.
-    pub async fn read_deltas_lancedb(
+    pub async fn read_deltas(
         &self,
-        store: &LanceDbStore,
+        backend: &dyn StorageBackend,
         vid: Vid,
         schema: &Schema,
         version_hwm: Option<u64>,
     ) -> Result<Vec<L1Entry>> {
-        let table = match self.open_lancedb(store).await {
-            Ok(t) => t,
-            Err(_) => return Ok(vec![]),
-        };
+        let table_name = table_names::delta_table_name(&self.edge_type, &self.direction);
 
-        use lancedb::query::{ExecutableQuery, QueryBase};
+        if !backend.table_exists(&table_name).await? {
+            return Ok(vec![]);
+        }
 
         let base_filter = format!("{} = {}", self.filter_column(), vid.as_u64());
 
@@ -553,9 +539,9 @@ impl DeltaDataset {
             base_filter
         };
 
-        let query = table.query().only_if(final_filter);
-        let stream = query.execute().await?;
-        let batches: Vec<arrow_array::RecordBatch> = stream.try_collect().await?;
+        let batches = backend
+            .scan(ScanRequest::all(&table_name).with_filter(final_filter))
+            .await?;
 
         let mut entries = Vec::new();
         for batch in batches {
@@ -566,13 +552,13 @@ impl DeltaDataset {
         Ok(entries)
     }
 
-    /// Read delta entries for multiple vertex IDs in a single batch query from LanceDB.
+    /// Read delta entries for multiple vertex IDs in a single batch query.
     ///
     /// Returns a HashMap mapping each vid to its delta entries.
     /// VIDs with no delta entries will not be in the map.
-    pub async fn read_deltas_lancedb_batch(
+    pub async fn read_deltas_batch(
         &self,
-        store: &LanceDbStore,
+        backend: &dyn StorageBackend,
         vids: &[Vid],
         schema: &Schema,
         version_hwm: Option<u64>,
@@ -581,12 +567,11 @@ impl DeltaDataset {
             return Ok(HashMap::new());
         }
 
-        let table = match self.open_lancedb(store).await {
-            Ok(t) => t,
-            Err(_) => return Ok(HashMap::new()),
-        };
+        let table_name = table_names::delta_table_name(&self.edge_type, &self.direction);
 
-        use lancedb::query::{ExecutableQuery, QueryBase};
+        if !backend.table_exists(&table_name).await? {
+            return Ok(HashMap::new());
+        }
 
         // Build IN filter for batch query
         let vid_list = vids
@@ -601,9 +586,9 @@ impl DeltaDataset {
             filter = format!("({}) AND (_version <= {})", filter, hwm);
         }
 
-        let query = table.query().only_if(filter);
-        let stream = query.execute().await?;
-        let batches: Vec<arrow_array::RecordBatch> = stream.try_collect().await?;
+        let batches = backend
+            .scan(ScanRequest::all(&table_name).with_filter(filter))
+            .await?;
 
         // Parse all batches and group by direction key VID
         let is_fwd = self.direction == "fwd";

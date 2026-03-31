@@ -47,7 +47,6 @@ async fn test_hybrid_vector_graph_query() -> anyhow::Result<()> {
     let schema_manager = Arc::new(schema_manager);
 
     let storage = Arc::new(StorageManager::new(storage_str, schema_manager.clone()).await?);
-    let lancedb_store = storage.lancedb_store();
     let prop_manager = PropertyManager::new(storage.clone(), schema_manager.clone(), 1000);
 
     // 2. Insert Data: Papers
@@ -111,7 +110,7 @@ async fn test_hybrid_vector_graph_query() -> anyhow::Result<()> {
             ],
         )?;
         dataset
-            .write_batch_lancedb(lancedb_store, batch, &schema_manager.schema())
+            .write_batch(storage.backend(), batch, &schema_manager.schema())
             .await?;
     }
 
@@ -158,7 +157,7 @@ async fn test_hybrid_vector_graph_query() -> anyhow::Result<()> {
             ],
         )?;
         dataset
-            .write_batch_lancedb(lancedb_store, batch, &schema_manager.schema())
+            .write_batch(storage.backend(), batch, &schema_manager.schema())
             .await?;
     }
 
@@ -190,7 +189,7 @@ async fn test_hybrid_vector_graph_query() -> anyhow::Result<()> {
                 vec![Arc::new(src_vids), Arc::new(neighbors), Arc::new(eids)],
             )?;
 
-            adj_ds.write_chunk_lancedb(lancedb_store, batch).await?;
+            adj_ds.write_chunk(storage.backend(), batch).await?;
         }
 
         // Backward: Paper -> Author
@@ -215,7 +214,7 @@ async fn test_hybrid_vector_graph_query() -> anyhow::Result<()> {
                 vec![Arc::new(src_vids), Arc::new(neighbors), Arc::new(eids)],
             )?;
 
-            adj_ds.write_chunk_lancedb(lancedb_store, batch).await?;
+            adj_ds.write_chunk(storage.backend(), batch).await?;
         }
     }
 

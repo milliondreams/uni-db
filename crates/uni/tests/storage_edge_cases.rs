@@ -24,7 +24,6 @@ async fn test_vertex_dataset_batch_writes() -> Result<()> {
     let schema_manager = Arc::new(schema_manager);
 
     let storage = StorageManager::new(base_path, schema_manager.clone()).await?;
-    let lancedb_store = storage.lancedb_store();
     let ds = storage.vertex_dataset("User")?;
 
     // Write a batch
@@ -39,8 +38,7 @@ async fn test_vertex_dataset_batch_writes() -> Result<()> {
         &[1],
         &schema,
     )?;
-    ds.write_batch_lancedb(lancedb_store, batch, &schema)
-        .await?;
+    ds.write_batch(storage.backend(), batch, &schema).await?;
 
     let vid2 = Vid::new(2);
     let mut props2 = HashMap::new();
@@ -51,12 +49,11 @@ async fn test_vertex_dataset_batch_writes() -> Result<()> {
         &[1],
         &schema,
     )?;
-    ds.write_batch_lancedb(lancedb_store, batch2, &schema)
-        .await?;
+    ds.write_batch(storage.backend(), batch2, &schema).await?;
 
-    // Verify count using LanceDB
-    let table = ds.open_lancedb(lancedb_store).await?;
-    assert_eq!(table.count_rows(None).await?, 2);
+    // Verify count using backend
+    let table_name = uni_db::store::backend::table_names::vertex_table_name("User");
+    assert_eq!(storage.backend().count_rows(&table_name, None).await?, 2);
 
     Ok(())
 }
@@ -73,7 +70,6 @@ async fn test_delta_dataset_merging() -> Result<()> {
     let schema_manager = Arc::new(schema_manager);
 
     let storage = StorageManager::new(base_path, schema_manager.clone()).await?;
-    let lancedb_store = storage.lancedb_store();
     let delta_ds = storage.delta_dataset("KNOWS", "fwd")?;
 
     // Write multiple runs using LanceDB
@@ -91,7 +87,7 @@ async fn test_delta_dataset_merging() -> Result<()> {
         updated_at: None,
     };
     let batch1 = delta_ds.build_record_batch(std::slice::from_ref(&entry1), &schema)?;
-    delta_ds.write_run_lancedb(lancedb_store, batch1).await?;
+    delta_ds.write_run(storage.backend(), batch1).await?;
 
     // Run 2: Delete E1 (ver 2)
     let entry2 = uni_db::storage::delta::L1Entry {
@@ -105,11 +101,11 @@ async fn test_delta_dataset_merging() -> Result<()> {
         updated_at: None,
     };
     let batch2 = delta_ds.build_record_batch(std::slice::from_ref(&entry2), &schema)?;
-    delta_ds.write_run_lancedb(lancedb_store, batch2).await?;
+    delta_ds.write_run(storage.backend(), batch2).await?;
 
     // Read deltas for src_vid using LanceDB
     let deltas = delta_ds
-        .read_deltas_lancedb(lancedb_store, Vid::new(1), &schema, None)
+        .read_deltas(storage.backend(), Vid::new(1), &schema, None)
         .await?;
 
     // Should get both? Or merged? read_deltas returns raw entries from runs.

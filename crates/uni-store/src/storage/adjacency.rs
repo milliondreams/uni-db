@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Dragonscale Team
 
-use crate::lancedb::LanceDbStore;
+use crate::backend::StorageBackend;
+use crate::backend::table_names;
+use crate::backend::types::{ScanRequest, WriteMode};
 use anyhow::{Result, anyhow};
 use arrow_array::{ListArray, RecordBatch, UInt64Array};
 use arrow_schema::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
+#[cfg(feature = "lance-backend")]
 use futures::TryStreamExt;
+#[cfg(feature = "lance-backend")]
 use lance::dataset::Dataset;
-use lancedb::Table;
 use std::collections::HashMap;
 use std::sync::Arc;
 use uni_common::core::id::{Eid, Vid};
@@ -116,6 +119,7 @@ fn extract_adjacency_from_batch_grouped(batch: &RecordBatch) -> Result<GroupedAd
 }
 
 pub struct AdjacencyDataset {
+    #[cfg_attr(not(feature = "lance-backend"), allow(dead_code))]
     uri: String,
     edge_type: String,
     direction: String,
@@ -134,10 +138,12 @@ impl AdjacencyDataset {
         }
     }
 
+    #[cfg(feature = "lance-backend")]
     pub async fn open(&self) -> Result<Arc<Dataset>> {
         self.open_at(None).await
     }
 
+    #[cfg(feature = "lance-backend")]
     pub async fn open_at(&self, version: Option<u64>) -> Result<Arc<Dataset>> {
         let mut ds = Dataset::open(&self.uri).await?;
         if let Some(v) = version {
@@ -166,10 +172,12 @@ impl AdjacencyDataset {
         Arc::new(ArrowSchema::new(fields))
     }
 
+    #[cfg(feature = "lance-backend")]
     pub async fn read_adjacency(&self, vid: Vid) -> Result<Option<(Vec<Vid>, Vec<Eid>)>> {
         self.read_adjacency_at(vid, None).await
     }
 
+    #[cfg(feature = "lance-backend")]
     pub async fn read_adjacency_at(
         &self,
         vid: Vid,
@@ -194,27 +202,27 @@ impl AdjacencyDataset {
     }
 
     // ========================================================================
-    // LanceDB-based Methods
+    // Backend-agnostic Methods
     // ========================================================================
 
-    /// Read adjacency data for a vertex from LanceDB.
+    /// Read adjacency data for a vertex from the storage backend.
     ///
     /// Returns `None` if the table doesn't exist or no data for the vertex.
-    pub async fn read_adjacency_lancedb(
+    pub async fn read_adjacency_backend(
         &self,
-        store: &LanceDbStore,
+        backend: &dyn StorageBackend,
         vid: Vid,
     ) -> Result<Option<(Vec<Vid>, Vec<Eid>)>> {
-        let table = match self.open_lancedb(store).await {
-            Ok(t) => t,
-            Err(_) => return Ok(None),
-        };
+        let table_name = table_names::adjacency_table_name(&self.edge_type, &self.direction);
 
-        use lancedb::query::{ExecutableQuery, QueryBase};
+        if !backend.table_exists(&table_name).await? {
+            return Ok(None);
+        }
 
-        let query = table.query().only_if(format!("src_vid = {}", vid.as_u64()));
-        let stream = query.execute().await?;
-        let batches: Vec<RecordBatch> = stream.try_collect().await?;
+        let filter = format!("src_vid = {}", vid.as_u64());
+        let batches = backend
+            .scan(ScanRequest::all(&table_name).with_filter(filter))
+            .await?;
 
         for batch in batches {
             if let Some(result) = extract_adjacency_from_batch(&batch)? {
@@ -229,21 +237,20 @@ impl AdjacencyDataset {
     ///
     /// Returns a HashMap mapping each vid to its (neighbors, edge_ids).
     /// VIDs with no adjacency data will not be in the map.
-    pub async fn read_adjacency_lancedb_batch(
+    pub async fn read_adjacency_backend_batch(
         &self,
-        store: &LanceDbStore,
+        backend: &dyn StorageBackend,
         vids: &[Vid],
     ) -> Result<HashMap<Vid, (Vec<Vid>, Vec<Eid>)>> {
         if vids.is_empty() {
             return Ok(HashMap::new());
         }
 
-        let table = match self.open_lancedb(store).await {
-            Ok(t) => t,
-            Err(_) => return Ok(HashMap::new()),
-        };
+        let table_name = table_names::adjacency_table_name(&self.edge_type, &self.direction);
 
-        use lancedb::query::{ExecutableQuery, QueryBase};
+        if !backend.table_exists(&table_name).await? {
+            return Ok(HashMap::new());
+        }
 
         // Build IN filter for batch query
         let vid_list = vids
@@ -251,9 +258,10 @@ impl AdjacencyDataset {
             .map(|v| v.as_u64().to_string())
             .collect::<Vec<_>>()
             .join(", ");
-        let query = table.query().only_if(format!("src_vid IN ({})", vid_list));
-        let stream = query.execute().await?;
-        let batches: Vec<RecordBatch> = stream.try_collect().await?;
+        let filter = format!("src_vid IN ({})", vid_list);
+        let batches = backend
+            .scan(ScanRequest::all(&table_name).with_filter(filter))
+            .await?;
 
         let mut result = HashMap::new();
         for batch in batches {
@@ -264,53 +272,45 @@ impl AdjacencyDataset {
         Ok(result)
     }
 
-    /// Open an adjacency table using LanceDB.
-    pub async fn open_lancedb(&self, store: &LanceDbStore) -> Result<Table> {
-        store
-            .open_adjacency_table(&self.edge_type, &self.direction)
-            .await
-    }
-
-    /// Open or create an adjacency table using LanceDB.
-    pub async fn open_or_create_lancedb(&self, store: &LanceDbStore) -> Result<Table> {
+    /// Open or create an adjacency table via the storage backend.
+    pub async fn open_or_create(&self, backend: &dyn StorageBackend) -> Result<()> {
+        let table_name = table_names::adjacency_table_name(&self.edge_type, &self.direction);
         let arrow_schema = self.get_arrow_schema();
-        store
-            .open_or_create_adjacency_table(&self.edge_type, &self.direction, arrow_schema)
+        backend
+            .open_or_create_table(&table_name, arrow_schema)
             .await
     }
 
-    /// Write a chunk to a LanceDB adjacency table.
+    /// Write a chunk to an adjacency table.
     ///
     /// Creates the table if it doesn't exist, otherwise appends to it.
-    pub async fn write_chunk_lancedb(
+    pub async fn write_chunk(
         &self,
-        store: &LanceDbStore,
+        backend: &dyn StorageBackend,
         batch: RecordBatch,
-    ) -> Result<Table> {
-        let table_name = LanceDbStore::adjacency_table_name(&self.edge_type, &self.direction);
-
-        if store.table_exists(&table_name).await? {
-            let table = store.open_table(&table_name).await?;
-            store.append_to_table(&table, vec![batch]).await?;
-            Ok(table)
+    ) -> Result<()> {
+        let table_name = table_names::adjacency_table_name(&self.edge_type, &self.direction);
+        if backend.table_exists(&table_name).await? {
+            backend
+                .write(&table_name, vec![batch], WriteMode::Append)
+                .await
         } else {
-            store.create_table(&table_name, vec![batch]).await
+            backend.create_table(&table_name, vec![batch]).await
         }
     }
 
-    /// Get the LanceDB table name for this adjacency dataset.
-    pub fn lancedb_table_name(&self) -> String {
-        LanceDbStore::adjacency_table_name(&self.edge_type, &self.direction)
+    /// Get the table name for this adjacency dataset.
+    pub fn table_name(&self) -> String {
+        table_names::adjacency_table_name(&self.edge_type, &self.direction)
     }
 
-    /// Replace an adjacency table's contents using LanceDB atomically.
+    /// Replace an adjacency table's contents atomically.
     ///
-    /// This uses a staging table for crash-safe replacement. Used by compaction
-    /// to rewrite the table with merged data.
-    pub async fn replace_lancedb(&self, store: &LanceDbStore, batch: RecordBatch) -> Result<Table> {
-        let table_name = self.lancedb_table_name();
+    /// Used by compaction to rewrite the table with merged data.
+    pub async fn replace(&self, backend: &dyn StorageBackend, batch: RecordBatch) -> Result<()> {
+        let table_name = self.table_name();
         let arrow_schema = self.get_arrow_schema();
-        store
+        backend
             .replace_table_atomic(&table_name, vec![batch], arrow_schema)
             .await
     }

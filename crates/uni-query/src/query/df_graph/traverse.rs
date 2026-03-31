@@ -2177,15 +2177,13 @@ async fn build_edge_adjacency_map(
     type_names: &[String],
     direction: Direction,
 ) -> DFResult<EdgeAdjacencyMap> {
-    use uni_store::storage::main_edge::MainEdgeDataset;
-
     let storage = graph_ctx.storage();
     let l0_ctx = graph_ctx.l0_context();
-    let lancedb_store = storage.lancedb_store();
 
     // Step 1: Query main edges table for all type names
     let type_refs: Vec<&str> = type_names.iter().map(|s| s.as_str()).collect();
-    let edges_with_type = MainEdgeDataset::find_edges_by_type_names(lancedb_store, &type_refs)
+    let edges_with_type = storage
+        .find_edges_by_type_names(&type_refs)
         .await
         .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
 

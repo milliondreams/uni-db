@@ -838,7 +838,9 @@ impl<'a> ExecuteBuilder<'a> {
             fut.await?
         };
         let after = self.tx.snapshot_l0();
-        Ok(Transaction::compute_execute_result(&before, &after, &result))
+        Ok(Transaction::compute_execute_result(
+            &before, &after, &result,
+        ))
     }
 }
 
@@ -889,7 +891,9 @@ impl<'a> TxQueryBuilder<'a> {
             fut.await?
         };
         let after = self.tx.snapshot_l0();
-        Ok(Transaction::compute_execute_result(&before, &after, &result))
+        Ok(Transaction::compute_execute_result(
+            &before, &after, &result,
+        ))
     }
 
     /// Execute as a query and return rows.

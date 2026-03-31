@@ -3,30 +3,46 @@
 
 //! Index lifecycle management: creation, rebuild, and incremental updates for all index types.
 
+#[cfg(feature = "lance-backend")]
 use crate::storage::inverted_index::InvertedIndex;
 use crate::storage::vertex::VertexDataset;
 use anyhow::{Result, anyhow};
 use arrow_array::UInt64Array;
 use chrono::{DateTime, Utc};
-use futures::TryStreamExt;
+#[cfg(feature = "lance-backend")]
 use lance::index::vector::VectorIndexParams;
+#[cfg(feature = "lance-backend")]
 use lance_index::progress::IndexBuildProgress;
+#[cfg(feature = "lance-backend")]
 use lance_index::scalar::{InvertedIndexParams, ScalarIndexParams};
+#[cfg(feature = "lance-backend")]
 use lance_index::vector::hnsw::builder::HnswBuildParams;
+#[cfg(feature = "lance-backend")]
 use lance_index::vector::ivf::IvfBuildParams;
+#[cfg(feature = "lance-backend")]
 use lance_index::vector::pq::PQBuildParams;
+#[cfg(feature = "lance-backend")]
 use lance_index::vector::sq::builder::SQBuildParams;
+#[cfg(feature = "lance-backend")]
 use lance_index::{DatasetIndexExt, IndexType};
+#[cfg(feature = "lance-backend")]
 use lance_linalg::distance::MetricType;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+#[cfg(feature = "lance-backend")]
+use std::collections::HashSet;
 use std::sync::Arc;
+#[cfg(feature = "lance-backend")]
 use tracing::{debug, info, instrument, warn};
 use uni_common::core::id::Vid;
+#[cfg(feature = "lance-backend")]
+use uni_common::core::schema::IndexDefinition;
+use uni_common::core::schema::SchemaManager;
+#[cfg(feature = "lance-backend")]
 use uni_common::core::schema::{
-    DistanceMetric, FullTextIndexConfig, IndexDefinition, InvertedIndexConfig, JsonFtsIndexConfig,
-    ScalarIndexConfig, SchemaManager, VectorIndexConfig, VectorIndexType,
+    DistanceMetric, FullTextIndexConfig, InvertedIndexConfig, JsonFtsIndexConfig,
+    ScalarIndexConfig, VectorIndexConfig, VectorIndexType,
 };
 
 /// Validates that a column name contains only safe characters to prevent SQL injection.
@@ -41,11 +57,13 @@ fn is_valid_column_name(name: &str) -> bool {
 ///
 /// Emits structured log events at each stage boundary, enabling
 /// observability into index build duration and progress.
+#[cfg(feature = "lance-backend")]
 #[derive(Debug)]
 pub struct TracingIndexProgress {
     index_name: String,
 }
 
+#[cfg(feature = "lance-backend")]
 impl TracingIndexProgress {
     pub fn arc(index_name: &str) -> Arc<dyn IndexBuildProgress> {
         Arc::new(Self {
@@ -54,6 +72,7 @@ impl TracingIndexProgress {
     }
 }
 
+#[cfg(feature = "lance-backend")]
 #[async_trait::async_trait]
 impl IndexBuildProgress for TracingIndexProgress {
     async fn stage_start(&self, stage: &str, total: Option<u64>, unit: &str) -> lance::Result<()> {
@@ -125,7 +144,7 @@ pub struct IndexRebuildTask {
 pub struct IndexManager {
     base_uri: String,
     schema_manager: Arc<SchemaManager>,
-    lancedb_store: Arc<crate::lancedb::LanceDbStore>,
+    backend: Arc<dyn crate::backend::StorageBackend>,
 }
 
 impl std::fmt::Debug for IndexManager {
@@ -137,20 +156,21 @@ impl std::fmt::Debug for IndexManager {
 }
 
 impl IndexManager {
-    /// Create a new `IndexManager` bound to `base_uri` and the given schema and LanceDB store.
+    /// Create a new `IndexManager` bound to `base_uri` and the given schema and backend.
     pub fn new(
         base_uri: &str,
         schema_manager: Arc<SchemaManager>,
-        lancedb_store: Arc<crate::lancedb::LanceDbStore>,
+        backend: Arc<dyn crate::backend::StorageBackend>,
     ) -> Self {
         Self {
             base_uri: base_uri.to_string(),
             schema_manager,
-            lancedb_store,
+            backend,
         }
     }
 
     /// Build and persist an inverted index for set-membership queries.
+    #[cfg(feature = "lance-backend")]
     #[instrument(skip(self), level = "info")]
     pub async fn create_inverted_index(&self, config: InvertedIndexConfig) -> Result<()> {
         let label = &config.label;
@@ -190,6 +210,7 @@ impl IndexManager {
     }
 
     /// Build and persist a vector (ANN) index on an embedding column.
+    #[cfg(feature = "lance-backend")]
     #[instrument(skip(self), level = "info")]
     pub async fn create_vector_index(&self, config: VectorIndexConfig) -> Result<()> {
         let label = &config.label;
@@ -296,6 +317,7 @@ impl IndexManager {
     }
 
     /// Build and persist a scalar (BTree) index for exact-match and range queries.
+    #[cfg(feature = "lance-backend")]
     #[instrument(skip(self), level = "info")]
     pub async fn create_scalar_index(&self, config: ScalarIndexConfig) -> Result<()> {
         let label = &config.label;
@@ -361,6 +383,7 @@ impl IndexManager {
     }
 
     /// Build and persist a full-text search (Lance inverted) index.
+    #[cfg(feature = "lance-backend")]
     #[instrument(skip(self), level = "info")]
     pub async fn create_fts_index(&self, config: FullTextIndexConfig) -> Result<()> {
         let label = &config.label;
@@ -427,6 +450,7 @@ impl IndexManager {
     ///
     /// This creates a Lance inverted index on the specified column,
     /// enabling BM25-based full-text search with optional phrase matching.
+    #[cfg(feature = "lance-backend")]
     #[instrument(skip(self), level = "info")]
     pub async fn create_json_fts_index(&self, config: JsonFtsIndexConfig) -> Result<()> {
         let label = &config.label;
@@ -489,6 +513,7 @@ impl IndexManager {
     }
 
     /// Remove an index both physically from the Lance dataset and from the schema.
+    #[cfg(feature = "lance-backend")]
     #[instrument(skip(self), level = "info")]
     pub async fn drop_index(&self, name: &str) -> Result<()> {
         info!("Dropping index '{}'", name);
@@ -531,6 +556,7 @@ impl IndexManager {
     }
 
     /// Rebuild all indexes registered for `label` from scratch.
+    #[cfg(feature = "lance-backend")]
     #[instrument(skip(self), level = "info")]
     pub async fn rebuild_indexes_for_label(&self, label: &str) -> Result<()> {
         info!("Rebuilding all indexes for label '{}'", label);
@@ -558,6 +584,7 @@ impl IndexManager {
     }
 
     /// Create composite index for unique constraint
+    #[cfg(feature = "lance-backend")]
     pub async fn create_composite_index(&self, label: &str, properties: &[String]) -> Result<()> {
         let schema = self.schema_manager.schema();
         let label_meta = schema
@@ -620,7 +647,7 @@ impl IndexManager {
         label: &str,
         key_values: &HashMap<String, Value>,
     ) -> Result<Option<Vid>> {
-        use lancedb::query::{ExecutableQuery, QueryBase, Select};
+        use crate::backend::types::ScanRequest;
 
         let schema = self.schema_manager.schema();
         let label_meta = schema
@@ -629,10 +656,12 @@ impl IndexManager {
             .ok_or_else(|| anyhow!("Label '{}' not found", label))?;
 
         let ds_wrapper = VertexDataset::new(&self.base_uri, label, label_meta.id);
-        let table = match ds_wrapper.open_lancedb(&self.lancedb_store).await {
-            Ok(t) => t,
-            Err(_) => return Ok(None),
-        };
+        let table_name = ds_wrapper.table_name();
+        let backend = self.backend.as_ref();
+
+        if !backend.table_exists(&table_name).await.unwrap_or(false) {
+            return Ok(None);
+        }
 
         // Build filter from key values
         let filter = key_values
@@ -656,18 +685,16 @@ impl IndexManager {
             .collect::<Result<Vec<_>>>()?
             .join(" AND ");
 
-        let query = table
-            .query()
-            .only_if(&filter)
-            .limit(1)
-            .select(Select::Columns(vec!["_vid".to_string()]));
+        let request = ScanRequest::all(&table_name)
+            .with_filter(filter)
+            .with_limit(1)
+            .with_columns(vec!["_vid".to_string()]);
 
-        let stream = match query.execute().await {
-            Ok(s) => s,
+        let batches = match backend.scan(request).await {
+            Ok(b) => b,
             Err(_) => return Ok(None),
         };
 
-        let batches: Vec<arrow_array::RecordBatch> = stream.try_collect().await.unwrap_or_default();
         for batch in batches {
             if batch.num_rows() > 0 {
                 let vid_col = batch
@@ -693,6 +720,7 @@ impl IndexManager {
     /// # Errors
     ///
     /// Returns an error if the index doesn't exist or the update fails.
+    #[cfg(feature = "lance-backend")]
     #[instrument(skip(self, added, removed), level = "info", fields(
         label = %config.label,
         property = %config.property

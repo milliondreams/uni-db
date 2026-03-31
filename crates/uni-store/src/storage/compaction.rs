@@ -7,7 +7,6 @@ use anyhow::{Result, anyhow};
 use arrow_array::Array;
 use arrow_array::builder::{ArrayBuilder, ListBuilder, UInt64Builder};
 use arrow_array::{ListArray, RecordBatch, UInt64Array};
-use futures::TryStreamExt;
 use metrics;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -97,17 +96,14 @@ impl Compactor {
             .collect();
 
         let dataset = self.storage.vertex_dataset(label)?;
-        let lancedb_store = self.storage.lancedb_store();
+        let backend = self.storage.backend();
+        let table_name = dataset.table_name();
 
-        // Try to open from LanceDB first (canonical storage)
-        let table = match dataset.open_lancedb(lancedb_store).await {
-            Ok(t) => t,
-            Err(_) => {
-                // Table doesn't exist - nothing to compact
-                info!("No vertex data to compact for label '{}'", label);
-                return Ok(());
-            }
-        };
+        // Check if table exists
+        if !backend.table_exists(&table_name).await.unwrap_or(false) {
+            info!("No vertex data to compact for label '{}'", label);
+            return Ok(());
+        }
 
         // In-memory compaction for now (MVP).
         // For large datasets, this needs to be streaming/chunked with external sort.
@@ -116,7 +112,7 @@ impl Compactor {
         // labels (millions of vertices). Refactor to use streaming merge-sort with
         // constant memory usage (e.g., external sort or Lance fragment-by-fragment merge).
 
-        let row_count = table.count_rows(None).await?;
+        let row_count = backend.count_rows(&table_name, None).await?;
         crate::storage::delta::check_oom_guard(
             row_count,
             self.storage.config.max_compaction_rows,
@@ -131,9 +127,8 @@ impl Compactor {
             "Starting vertex compaction"
         );
 
-        use lancedb::query::ExecutableQuery;
-        let stream = table.query().execute().await?;
-        let batches: Vec<RecordBatch> = stream.try_collect().await?;
+        use crate::backend::types::ScanRequest;
+        let batches: Vec<RecordBatch> = backend.scan(ScanRequest::all(&table_name)).await?;
 
         // Vid -> (Properties, Deleted)
         let mut vertex_state: HashMap<Vid, (Properties, bool)> = HashMap::new();
@@ -258,9 +253,8 @@ impl Compactor {
                 &valid_versions,
                 &schema,
             )?;
-            let lancedb_store = self.storage.lancedb_store();
             dataset
-                .replace_lancedb(lancedb_store, batch, &schema)
+                .replace(self.storage.backend(), batch, &schema)
                 .await?;
         }
 
@@ -362,10 +356,11 @@ impl Compactor {
         let start = std::time::Instant::now();
         let schema = self.storage.schema_manager().schema();
 
-        // 1. Load all L1 Deltas sorted by key from LanceDB
+        // 1. Load all L1 Deltas sorted by key
         let delta_ds = self.storage.delta_dataset(edge_type, direction)?;
-        let lancedb_store = self.storage.lancedb_store();
-        let deltas = delta_ds.scan_all_lancedb(lancedb_store, &schema).await?;
+        let deltas = delta_ds
+            .scan_all_backend(self.storage.backend(), &schema)
+            .await?;
 
         let delta_count = deltas.len();
         tracing::Span::current().record("delta_count", delta_count);
@@ -418,10 +413,11 @@ impl Compactor {
 
         let mut processed_vids = HashSet::new();
 
-        // Try to read from LanceDB (canonical storage)
-        let lancedb_store = self.storage.lancedb_store();
-        if let Ok(table) = adj_ds.open_lancedb(lancedb_store).await {
-            let adj_row_count = table.count_rows(None).await?;
+        // Try to read from backend (canonical storage)
+        let backend = self.storage.backend();
+        let adj_table_name = adj_ds.table_name();
+        if backend.table_exists(&adj_table_name).await.unwrap_or(false) {
+            let adj_row_count = backend.count_rows(&adj_table_name, None).await?;
             crate::storage::delta::check_oom_guard(
                 adj_row_count,
                 self.storage.config.max_compaction_rows,
@@ -439,9 +435,8 @@ impl Compactor {
                 "Starting adjacency compaction"
             );
 
-            use lancedb::query::ExecutableQuery;
-            let stream = table.query().execute().await?;
-            let batches: Vec<RecordBatch> = stream.try_collect().await?;
+            use crate::backend::types::ScanRequest;
+            let batches: Vec<RecordBatch> = backend.scan(ScanRequest::all(&adj_table_name)).await?;
 
             for batch in batches {
                 let src_col = batch
@@ -521,9 +516,8 @@ impl Compactor {
             let schema = adj_ds.get_arrow_schema();
             let batch = RecordBatch::try_new(schema, vec![src_arr, neighbors_arr, edge_ids_arr])?;
 
-            // Replace the table with compacted data using LanceDB
-            let lancedb_store = self.storage.lancedb_store();
-            adj_ds.replace_lancedb(lancedb_store, batch).await?;
+            // Replace the table with compacted data
+            adj_ds.replace(self.storage.backend(), batch).await?;
         }
 
         // CRITICAL: Clear Delta L1 after compaction
@@ -545,16 +539,16 @@ impl Compactor {
             #[cfg(debug_assertions)]
             {
                 use crate::storage::main_edge::MainEdgeDataset;
-                let lancedb_store = self.storage.lancedb_store();
 
                 let delta_eids: std::collections::HashSet<Eid> =
                     deltas.iter().map(|e| e.eid).collect();
 
                 for eid in delta_eids {
-                    let main_edge_exists = MainEdgeDataset::find_props_by_eid(lancedb_store, eid)
-                        .await
-                        .unwrap_or(None)
-                        .is_some();
+                    let main_edge_exists =
+                        MainEdgeDataset::find_props_by_eid(self.storage.backend(), eid)
+                            .await
+                            .unwrap_or(None)
+                            .is_some();
 
                     debug_assert!(
                         main_edge_exists,
@@ -567,10 +561,11 @@ impl Compactor {
 
             // Clear the Delta L1 table by replacing with empty batch
             let delta_ds = self.storage.delta_dataset(edge_type, direction)?;
-            let lancedb_store = self.storage.lancedb_store();
             let delta_schema = delta_ds.get_arrow_schema(&schema)?;
             let empty_batch = RecordBatch::new_empty(delta_schema);
-            delta_ds.replace_lancedb(lancedb_store, empty_batch).await?;
+            delta_ds
+                .replace(self.storage.backend(), empty_batch)
+                .await?;
         }
 
         let duration = start.elapsed();

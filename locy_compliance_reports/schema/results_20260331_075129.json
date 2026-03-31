@@ -1224,8 +1224,7 @@
             "keyword": "Scenario ",
             "name": "DERIVE edges do not persist to graph without tx.apply",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/derive/DeriveVisibility.feature:120:5\n      Step doesn't match any function\n[Summary]\n1 feature\n1 scenario (1 failed)\n5 steps (4 passed, 1 failed)\n"
+              "status": "passed"
             }
           }
         ]

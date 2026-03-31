@@ -44,8 +44,7 @@ async fn test_warm_from_delta_storage() -> anyhow::Result<()> {
     };
 
     let batch = delta.build_record_batch(&[op], &schema)?;
-    let lancedb_store = storage.lancedb_store();
-    delta.write_run_lancedb(lancedb_store, batch).await?;
+    delta.write_run(storage.backend(), batch).await?;
 
     // Warm AM from storage
     storage

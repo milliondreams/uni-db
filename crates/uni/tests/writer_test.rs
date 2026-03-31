@@ -43,11 +43,10 @@ async fn test_writer_flush() -> anyhow::Result<()> {
     // 4. Flush to L1
     writer.flush_to_l1(None).await?;
 
-    // 5. Verify L1 Delta Dataset via LanceDB
+    // 5. Verify L1 Delta Dataset via backend
     let delta_ds = storage.delta_dataset("knows", "fwd")?;
-    let lancedb_store = storage.lancedb_store();
-    let table = delta_ds.open_lancedb(lancedb_store).await?;
-    let count = table.count_rows(None).await?;
+    let table_name = delta_ds.table_name();
+    let count = storage.backend().count_rows(&table_name, None).await?;
 
     assert_eq!(count, 1);
 
@@ -87,11 +86,9 @@ async fn test_writer_vertex_flush() -> anyhow::Result<()> {
     // 4. Flush to L1
     writer.flush_to_l1(None).await?;
 
-    // 5. Verify Vertex Dataset via LanceDB
-    let ds = storage.vertex_dataset("Person")?;
-    let lancedb_store = storage.lancedb_store();
-    let table = ds.open_lancedb(lancedb_store).await?;
-    let count = table.count_rows(None).await?;
+    // 5. Verify Vertex Dataset via backend
+    let table_name = uni_db::store::backend::table_names::vertex_table_name("Person");
+    let count = storage.backend().count_rows(&table_name, None).await?;
     assert_eq!(count, 1);
 
     Ok(())

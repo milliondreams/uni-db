@@ -414,8 +414,6 @@ impl AdjacencyManager {
         };
 
         use arrow_array::{ListArray, UInt8Array, UInt64Array};
-        use futures::TryStreamExt;
-        use lancedb::query::{ExecutableQuery, QueryBase};
 
         let mut entries: Vec<(u64, Vid, Eid, u64)> = Vec::new();
         let mut deleted_eids = HashSet::new();
@@ -425,19 +423,20 @@ impl AdjacencyManager {
             for label_name in &labels_to_load {
                 // 1. Read L2 (Adjacency Dataset)
                 let adj_ds = storage.adjacency_dataset(&edge_type_name, label_name, dir_str);
-                let lancedb_store = storage.lancedb_store();
+                let backend = storage.backend();
 
-                if let Ok(adj_ds) = adj_ds
-                    && let Ok(table) = adj_ds.open_lancedb(lancedb_store).await
-                {
-                    let mut query = table.query();
-                    if let Some(hwm) = version {
-                        query = query.only_if(format!("_version <= {}", hwm));
-                    }
+                if let Ok(adj_ds) = adj_ds {
+                    let adj_table_name = adj_ds.table_name();
+                    let adj_exists = backend.table_exists(&adj_table_name).await.unwrap_or(false);
 
-                    if let Ok(stream) = query.execute().await {
+                    if adj_exists {
+                        let mut request = crate::backend::types::ScanRequest::all(&adj_table_name);
+                        if let Some(hwm) = version {
+                            request = request.with_filter(format!("_version <= {}", hwm));
+                        }
+
                         let batches: Vec<arrow_array::RecordBatch> =
-                            stream.try_collect().await.unwrap_or_default();
+                            backend.scan(request).await.unwrap_or_default();
 
                         for batch in batches {
                             let src_col = batch
@@ -493,18 +492,20 @@ impl AdjacencyManager {
 
             // 2. Read L1 (Delta)
             let delta_ds = storage.delta_dataset(&edge_type_name, dir_str)?;
-            let lancedb_store = storage.lancedb_store();
+            let backend = storage.backend();
+            let delta_table_name = delta_ds.table_name();
 
-            if let Ok(table) = delta_ds.open_lancedb(lancedb_store).await {
-                let mut query = table.query();
+            if backend
+                .table_exists(&delta_table_name)
+                .await
+                .unwrap_or(false)
+            {
+                let mut request = crate::backend::types::ScanRequest::all(&delta_table_name);
                 if let Some(hwm) = version {
-                    query = query.only_if(format!("_version <= {}", hwm));
+                    request = request.with_filter(format!("_version <= {}", hwm));
                 }
 
-                if let Ok(stream) = query.execute().await {
-                    let batches: Vec<arrow_array::RecordBatch> =
-                        stream.try_collect().await.unwrap_or_default();
-
+                if let Ok(batches) = backend.scan(request).await {
                     for batch in batches {
                         let src_col = batch
                             .column_by_name("src_vid")

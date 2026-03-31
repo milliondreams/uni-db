@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Dragonscale Team
 
+use crate::backend::StorageBackend;
+#[cfg(feature = "lance-backend")]
+use crate::backend::lance::LanceDbBackend;
+use crate::backend::table_names;
+use crate::backend::types::ScanRequest;
 use crate::compaction::{CompactionStats, CompactionStatus, CompactionTask};
-use crate::lancedb::LanceDbStore;
 use crate::runtime::WorkingGraph;
 use crate::runtime::context::QueryContext;
 use crate::runtime::l0::L0Buffer;
@@ -10,18 +14,19 @@ use crate::storage::adjacency::AdjacencyDataset;
 use crate::storage::compaction::Compactor;
 use crate::storage::delta::{DeltaDataset, ENTRY_SIZE_ESTIMATE, Op};
 use crate::storage::direction::Direction;
+#[cfg(feature = "lance-backend")]
 use crate::storage::edge::EdgeDataset;
+#[cfg(feature = "lance-backend")]
 use crate::storage::index::UidIndex;
+#[cfg(feature = "lance-backend")]
 use crate::storage::inverted_index::InvertedIndex;
 use crate::storage::main_edge::MainEdgeDataset;
 use crate::storage::main_vertex::MainVertexDataset;
 use crate::storage::vertex::VertexDataset;
 use anyhow::{Result, anyhow};
 use arrow_array::{Array, Float32Array, TimestampNanosecondArray, UInt64Array};
-use dashmap::DashMap;
-use futures::TryStreamExt;
-use lancedb::query::{ExecutableQuery, QueryBase, Select};
 use object_store::ObjectStore;
+#[cfg(feature = "lance-backend")]
 use object_store::local::LocalFileSystem;
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
@@ -29,8 +34,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::warn;
 use uni_common::config::UniConfig;
-use uni_common::core::id::{Eid, UniId, Vid};
-use uni_common::core::schema::{DistanceMetric, IndexDefinition, SchemaManager};
+#[cfg(feature = "lance-backend")]
+use uni_common::core::id::UniId;
+use uni_common::core::id::{Eid, Vid};
+#[cfg(feature = "lance-backend")]
+use uni_common::core::schema::IndexDefinition;
+use uni_common::core::schema::{DistanceMetric, SchemaManager};
 use uni_common::sync::acquire_mutex;
 
 use crate::snapshot::manager::SnapshotManager;
@@ -55,14 +64,12 @@ pub struct StorageManager {
     schema_manager: Arc<SchemaManager>,
     snapshot_manager: Arc<SnapshotManager>,
     adjacency_manager: Arc<AdjacencyManager>,
-    /// Cache of opened LanceDB tables by label name for vector search performance
-    table_cache: DashMap<String, lancedb::Table>,
     pub config: UniConfig,
     pub compaction_status: Arc<Mutex<CompactionStatus>>,
     /// Optional pinned snapshot for time-travel
     pinned_snapshot: Option<SnapshotManifest>,
-    /// LanceDB store for DataFusion-powered queries.
-    lancedb_store: Arc<LanceDbStore>,
+    /// Pluggable storage backend.
+    backend: Arc<dyn StorageBackend>,
     /// In-memory VID-to-labels index for O(1) lookups (optional, configurable)
     vid_labels_index: Option<Arc<parking_lot::RwLock<crate::storage::vid_labels::VidLabelsIndex>>>,
 }
@@ -109,12 +116,58 @@ impl Drop for CompactionGuard {
 }
 
 impl StorageManager {
+    /// Create a new StorageManager with a pre-configured backend.
+    pub async fn new_with_backend(
+        base_uri: &str,
+        store: Arc<dyn ObjectStore>,
+        backend: Arc<dyn StorageBackend>,
+        schema_manager: Arc<SchemaManager>,
+        config: UniConfig,
+    ) -> Result<Self> {
+        let resilient_store: Arc<dyn ObjectStore> = Arc::new(ResilientObjectStore::new(
+            store,
+            config.object_store.clone(),
+        ));
+
+        let snapshot_manager = Arc::new(SnapshotManager::new(resilient_store.clone()));
+
+        // Perform crash recovery for all known table patterns
+        Self::recover_all_staging_tables(backend.as_ref(), &schema_manager).await?;
+
+        let mut sm = Self {
+            base_uri: base_uri.to_string(),
+            store: resilient_store,
+            schema_manager,
+            snapshot_manager,
+            adjacency_manager: Arc::new(AdjacencyManager::new(config.cache_size)),
+            config,
+            compaction_status: Arc::new(Mutex::new(CompactionStatus::default())),
+            pinned_snapshot: None,
+            backend,
+            vid_labels_index: None,
+        };
+
+        // Rebuild VidLabelsIndex if enabled
+        if sm.config.enable_vid_labels_index
+            && let Err(e) = sm.rebuild_vid_labels_index().await
+        {
+            warn!(
+                "Failed to rebuild VidLabelsIndex on startup: {}. Falling back to storage queries.",
+                e
+            );
+        }
+
+        Ok(sm)
+    }
+
     /// Create a new StorageManager with LanceDB integration.
+    #[cfg(feature = "lance-backend")]
     pub async fn new(base_uri: &str, schema_manager: Arc<SchemaManager>) -> Result<Self> {
         Self::new_with_config(base_uri, schema_manager, UniConfig::default()).await
     }
 
     /// Create a new StorageManager with custom cache size.
+    #[cfg(feature = "lance-backend")]
     pub async fn new_with_cache(
         base_uri: &str,
         schema_manager: Arc<SchemaManager>,
@@ -128,6 +181,7 @@ impl StorageManager {
     }
 
     /// Create a new StorageManager with custom configuration.
+    #[cfg(feature = "lance-backend")]
     pub async fn new_with_config(
         base_uri: &str,
         schema_manager: Arc<SchemaManager>,
@@ -138,9 +192,7 @@ impl StorageManager {
     }
 
     /// Create a new StorageManager using an already-constructed object store.
-    ///
-    /// This is used by higher layers that need explicit store configuration
-    /// (for example custom S3 endpoints in hybrid/cloud modes).
+    #[cfg(feature = "lance-backend")]
     pub async fn new_with_store_and_config(
         base_uri: &str,
         store: Arc<dyn ObjectStore>,
@@ -151,8 +203,8 @@ impl StorageManager {
             .await
     }
 
-    /// Create a new StorageManager using an already-constructed object store
-    /// and explicit LanceDB storage options.
+    /// Create a new StorageManager with LanceDB storage options.
+    #[cfg(feature = "lance-backend")]
     pub async fn new_with_store_and_storage_options(
         base_uri: &str,
         store: Arc<dyn ObjectStore>,
@@ -160,45 +212,8 @@ impl StorageManager {
         config: UniConfig,
         lancedb_storage_options: Option<HashMap<String, String>>,
     ) -> Result<Self> {
-        let resilient_store: Arc<dyn ObjectStore> = Arc::new(ResilientObjectStore::new(
-            store,
-            config.object_store.clone(),
-        ));
-
-        let snapshot_manager = Arc::new(SnapshotManager::new(resilient_store.clone()));
-
-        // Connect to LanceDB
-        let lancedb_store =
-            LanceDbStore::connect_with_storage_options(base_uri, lancedb_storage_options).await?;
-
-        // Perform crash recovery for all known table patterns
-        Self::recover_all_staging_tables(&lancedb_store, &schema_manager).await?;
-
-        let mut sm = Self {
-            base_uri: base_uri.to_string(),
-            store: resilient_store,
-            schema_manager,
-            snapshot_manager,
-            adjacency_manager: Arc::new(AdjacencyManager::new(config.cache_size)),
-            table_cache: DashMap::new(),
-            config,
-            compaction_status: Arc::new(Mutex::new(CompactionStatus::default())),
-            pinned_snapshot: None,
-            lancedb_store: Arc::new(lancedb_store),
-            vid_labels_index: None,
-        };
-
-        // Rebuild VidLabelsIndex if enabled
-        if sm.config.enable_vid_labels_index
-            && let Err(e) = sm.rebuild_vid_labels_index().await
-        {
-            warn!(
-                "Failed to rebuild VidLabelsIndex on startup: {}. Falling back to LanceDB queries.",
-                e
-            );
-        }
-
-        Ok(sm)
+        let backend = Arc::new(LanceDbBackend::connect(base_uri, lancedb_storage_options).await?);
+        Self::new_with_backend(base_uri, store, backend, schema_manager, config).await
     }
 
     /// Recover all staging tables for known table patterns.
@@ -206,36 +221,36 @@ impl StorageManager {
     /// This runs on startup to handle crash recovery. It checks for staging tables
     /// for all vertex labels, adjacency tables, delta tables, and main tables.
     async fn recover_all_staging_tables(
-        lancedb_store: &LanceDbStore,
+        backend: &dyn StorageBackend,
         schema_manager: &SchemaManager,
     ) -> Result<()> {
         let schema = schema_manager.schema();
 
         // Recover main vertex and edge tables
-        lancedb_store
-            .recover_staging(LanceDbStore::main_vertex_table_name())
+        backend
+            .recover_staging(table_names::main_vertex_table_name())
             .await?;
-        lancedb_store
-            .recover_staging(LanceDbStore::main_edge_table_name())
+        backend
+            .recover_staging(table_names::main_edge_table_name())
             .await?;
 
         // Recover per-label vertex tables
         for label in schema.labels.keys() {
-            let table_name = LanceDbStore::vertex_table_name(label);
-            lancedb_store.recover_staging(&table_name).await?;
+            let name = table_names::vertex_table_name(label);
+            backend.recover_staging(&name).await?;
         }
 
         // Recover adjacency and delta tables for each edge type and direction
         for edge_type in schema.edge_types.keys() {
             for direction in &["fwd", "bwd"] {
                 // Recover delta tables
-                let delta_table_name = LanceDbStore::delta_table_name(edge_type, direction);
-                lancedb_store.recover_staging(&delta_table_name).await?;
+                let delta_name = table_names::delta_table_name(edge_type, direction);
+                backend.recover_staging(&delta_name).await?;
 
                 // Recover adjacency tables for each label
                 for _label in schema.labels.keys() {
-                    let adj_table_name = LanceDbStore::adjacency_table_name(edge_type, direction);
-                    lancedb_store.recover_staging(&adj_table_name).await?;
+                    let adj_name = table_names::adjacency_table_name(edge_type, direction);
+                    backend.recover_staging(&adj_name).await?;
                 }
             }
         }
@@ -243,6 +258,7 @@ impl StorageManager {
         Ok(())
     }
 
+    #[cfg(feature = "lance-backend")]
     fn build_store_from_uri(base_uri: &str) -> Result<Arc<dyn ObjectStore>> {
         if base_uri.contains("://") {
             let parsed = url::Url::parse(base_uri).map_err(|e| anyhow!("Invalid base URI: {e}"))?;
@@ -266,11 +282,10 @@ impl StorageManager {
             // warm() will load only edges visible at the snapshot's HWM.
             // This prevents live DB's CSR (with all edges) from leaking into snapshots.
             adjacency_manager: Arc::new(AdjacencyManager::new(self.adjacency_manager.max_bytes())),
-            table_cache: DashMap::new(),
             config: self.config.clone(),
             compaction_status: Arc::new(Mutex::new(CompactionStatus::default())),
             pinned_snapshot: Some(snapshot),
-            lancedb_store: self.lancedb_store.clone(),
+            backend: self.backend.clone(),
             vid_labels_index: self.vid_labels_index.clone(),
         }
     }
@@ -332,19 +347,17 @@ impl StorageManager {
     }
 
     pub async fn compact(&self) -> Result<CompactionStats> {
-        // LanceDB handles compaction internally via optimize()
-        // For now, call optimize on vertex tables
+        // Backend handles compaction internally via optimize_table()
         let start = std::time::Instant::now();
         let schema = self.schema_manager.schema();
         let mut files_compacted = 0;
 
         for label in schema.labels.keys() {
-            let table_name = LanceDbStore::vertex_table_name(label);
-            if self.lancedb_store.table_exists(&table_name).await? {
-                let table = self.lancedb_store.open_table(&table_name).await?;
-                table.optimize(lancedb::table::OptimizeAction::All).await?;
+            let name = table_names::vertex_table_name(label);
+            if self.backend.table_exists(&name).await? {
+                self.backend.optimize_table(&name).await?;
                 files_compacted += 1;
-                self.invalidate_table_cache(label);
+                self.backend.invalidate_cache(&name);
             }
         }
 
@@ -362,12 +375,11 @@ impl StorageManager {
             .ok_or_else(|| anyhow!("Compaction already in progress"))?;
 
         let start = std::time::Instant::now();
-        let table_name = LanceDbStore::vertex_table_name(label);
+        let name = table_names::vertex_table_name(label);
 
-        if self.lancedb_store.table_exists(&table_name).await? {
-            let table = self.lancedb_store.open_table(&table_name).await?;
-            table.optimize(lancedb::table::OptimizeAction::All).await?;
-            self.invalidate_table_cache(label);
+        if self.backend.table_exists(&name).await? {
+            self.backend.optimize_table(&name).await?;
+            self.backend.invalidate_cache(&name);
         }
 
         Ok(CompactionStats {
@@ -387,10 +399,9 @@ impl StorageManager {
         let mut files_compacted = 0;
 
         for dir in ["fwd", "bwd"] {
-            let table_name = LanceDbStore::delta_table_name(edge_type, dir);
-            if self.lancedb_store.table_exists(&table_name).await? {
-                let table = self.lancedb_store.open_table(&table_name).await?;
-                table.optimize(lancedb::table::OptimizeAction::All).await?;
+            let name = table_names::delta_table_name(edge_type, dir);
+            if self.backend.table_exists(&name).await? {
+                self.backend.optimize_table(&name).await?;
                 files_compacted += 1;
             }
         }
@@ -461,17 +472,18 @@ impl StorageManager {
 
     async fn update_compaction_status(&self) -> Result<()> {
         let schema = self.schema_manager.schema();
+        let backend = self.backend.as_ref();
         let mut total_tables = 0;
         let mut total_rows: usize = 0;
         let mut oldest_ts: Option<i64> = None;
 
         for name in schema.edge_types.keys() {
             for dir in ["fwd", "bwd"] {
-                let table_name = LanceDbStore::delta_table_name(name, dir);
-                let Ok(table) = self.lancedb_store.open_table(&table_name).await else {
+                let tbl_name = table_names::delta_table_name(name, dir);
+                if !backend.table_exists(&tbl_name).await.unwrap_or(false) {
                     continue;
-                };
-                let row_count = table.count_rows(None).await.unwrap_or(0);
+                }
+                let row_count = backend.count_rows(&tbl_name, None).await.unwrap_or(0);
                 if row_count == 0 {
                     continue;
                 }
@@ -479,15 +491,9 @@ impl StorageManager {
                 total_rows += row_count;
 
                 // Query oldest _created_at for age tracking
-                let Ok(stream) = table
-                    .query()
-                    .select(Select::Columns(vec!["_created_at".to_string()]))
-                    .execute()
-                    .await
-                else {
-                    continue;
-                };
-                let Ok(batches) = stream.try_collect::<Vec<_>>().await else {
+                let request =
+                    ScanRequest::all(&tbl_name).with_columns(vec!["_created_at".to_string()]);
+                let Ok(batches) = backend.scan(request).await else {
                     continue;
                 };
                 for batch in batches {
@@ -539,12 +545,9 @@ impl StorageManager {
         None
     }
 
-    /// Open a table by name and run `optimize(All)`, returning `true` on success.
-    async fn optimize_table(store: &LanceDbStore, table_name: &str) -> bool {
-        let Ok(table) = store.open_table(table_name).await else {
-            return false;
-        };
-        if let Err(e) = table.optimize(lancedb::table::OptimizeAction::All).await {
+    /// Optimize a table via the backend, returning `true` on success.
+    async fn try_optimize_table(backend: &dyn StorageBackend, table_name: &str) -> bool {
+        if let Err(e) = backend.optimize_table(table_name).await {
             log::warn!("Failed to optimize table {}: {}", table_name, e);
             return false;
         }
@@ -564,7 +567,7 @@ impl StorageManager {
         let compactor = Compactor::new(Arc::clone(&this));
         let compaction_results = compactor.compact_all().await.unwrap_or_else(|e| {
             log::error!(
-                "Semantic compaction failed (continuing with Lance optimize): {}",
+                "Semantic compaction failed (continuing with backend optimize): {}",
                 e
             );
             Vec::new()
@@ -590,18 +593,18 @@ impl StorageManager {
             }
         }
 
-        // ── Tier 3: Lance optimize ──
-        let store = &this.lancedb_store;
+        // ── Tier 3: Backend optimize ──
+        let backend = this.backend.as_ref();
 
         // Optimize edge delta and adjacency tables
         for name in schema.edge_types.keys() {
             for dir in ["fwd", "bwd"] {
-                let delta = LanceDbStore::delta_table_name(name, dir);
-                if Self::optimize_table(store, &delta).await {
+                let delta = table_names::delta_table_name(name, dir);
+                if Self::try_optimize_table(backend, &delta).await {
                     files_compacted += 1;
                 }
-                let adj = LanceDbStore::adjacency_table_name(name, dir);
-                if Self::optimize_table(store, &adj).await {
+                let adj = table_names::adjacency_table_name(name, dir);
+                if Self::try_optimize_table(backend, &adj).await {
                     files_compacted += 1;
                 }
             }
@@ -609,19 +612,19 @@ impl StorageManager {
 
         // Optimize vertex tables
         for label in schema.labels.keys() {
-            let table_name = LanceDbStore::vertex_table_name(label);
-            if Self::optimize_table(store, &table_name).await {
+            let tbl = table_names::vertex_table_name(label);
+            if Self::try_optimize_table(backend, &tbl).await {
                 files_compacted += 1;
-                this.invalidate_table_cache(label);
+                backend.invalidate_cache(&tbl);
             }
         }
 
         // Optimize main vertex and edge tables
-        for table_name in [
-            LanceDbStore::main_vertex_table_name(),
-            LanceDbStore::main_edge_table_name(),
+        for tbl in [
+            table_names::main_vertex_table_name(),
+            table_names::main_edge_table_name(),
         ] {
-            if Self::optimize_table(store, table_name).await {
+            if Self::try_optimize_table(backend, tbl).await {
                 files_compacted += 1;
             }
         }
@@ -640,29 +643,12 @@ impl StorageManager {
         })
     }
 
-    /// Get or open a cached table for a label
-    pub async fn get_cached_table(&self, label: &str) -> Result<lancedb::Table> {
-        // Check cache first
-        if let Some(table) = self.table_cache.get(label) {
-            return Ok(table.clone());
-        }
-
-        // Open and cache
-        let table_name = LanceDbStore::vertex_table_name(label);
-        let table = self.lancedb_store.open_table(&table_name).await?;
-
-        self.table_cache.insert(label.to_string(), table.clone());
-        Ok(table)
-    }
-
-    /// Invalidate cached table (call after writes)
+    /// Open a LanceDB table for a label.
+    ///
+    /// Invalidate cached table state (call after writes).
     pub fn invalidate_table_cache(&self, label: &str) {
-        self.table_cache.remove(label);
-    }
-
-    /// Clear all cached tables
-    pub fn clear_table_cache(&self) {
-        self.table_cache.clear();
+        let name = table_names::vertex_table_name(label);
+        self.backend.invalidate_cache(&name);
     }
 
     pub fn base_path(&self) -> &str {
@@ -733,49 +719,38 @@ impl StorageManager {
             .get_neighbors_at_version(vid, edge_type, direction, version)
     }
 
-    /// Get the LanceDB store.
-    pub fn lancedb_store(&self) -> &LanceDbStore {
-        &self.lancedb_store
+    /// Get the storage backend.
+    pub fn backend(&self) -> &dyn StorageBackend {
+        self.backend.as_ref()
     }
 
-    /// Get the LanceDB store as an Arc.
-    pub fn lancedb_store_arc(&self) -> Arc<LanceDbStore> {
-        self.lancedb_store.clone()
+    /// Get the storage backend as an Arc.
+    pub fn backend_arc(&self) -> Arc<dyn StorageBackend> {
+        self.backend.clone()
     }
 
     /// Rebuild the VidLabelsIndex from the main vertex table.
     /// This is called on startup if enable_vid_labels_index is true.
     async fn rebuild_vid_labels_index(&mut self) -> Result<()> {
-        use crate::lancedb::LanceDbStore;
         use crate::storage::vid_labels::VidLabelsIndex;
 
-        let lancedb_store = self.lancedb_store();
+        let backend = self.backend.as_ref();
+        let vtable = table_names::main_vertex_table_name();
 
-        // Open the main vertex table
-        let table = match lancedb_store
-            .open_table(LanceDbStore::main_vertex_table_name())
-            .await
-        {
-            Ok(t) => t,
-            Err(_) => {
-                // Table doesn't exist yet (fresh database)
-                self.vid_labels_index =
-                    Some(Arc::new(parking_lot::RwLock::new(VidLabelsIndex::new())));
-                return Ok(());
-            }
-        };
+        // Check if the table exists (fresh database)
+        if !backend.table_exists(vtable).await.unwrap_or(false) {
+            self.vid_labels_index = Some(Arc::new(parking_lot::RwLock::new(VidLabelsIndex::new())));
+            return Ok(());
+        }
 
         // Scan all non-deleted vertices and collect (VID, labels)
-        let batches = table
-            .query()
-            .only_if("_deleted = false")
-            .limit(100_000) // Reasonable batch size
-            .execute()
+        let request = ScanRequest::all(vtable)
+            .with_filter("_deleted = false")
+            .with_limit(100_000);
+        let batches = backend
+            .scan(request)
             .await
-            .map_err(|e| anyhow!("Failed to query main vertex table: {}", e))?
-            .try_collect::<Vec<_>>()
-            .await
-            .map_err(|e| anyhow!("Failed to collect vertex data: {}", e))?;
+            .map_err(|e| anyhow!("Failed to query main vertex table: {}", e))?;
 
         let mut index = VidLabelsIndex::new();
         for batch in batches {
@@ -919,8 +894,286 @@ impl StorageManager {
         IndexManager::new(
             &self.base_uri,
             self.schema_manager.clone(),
-            self.lancedb_store.clone(),
+            self.backend.clone(),
         )
+    }
+
+    // ========================================================================
+    // Domain-level scan methods — encapsulate LanceDB queries for consumers
+    // ========================================================================
+
+    /// Scan a per-label vertex table. Returns `None` if the table doesn't exist.
+    ///
+    /// Internally opens the table, filters requested columns to those that
+    /// physically exist, and applies the version HWM filter for snapshot isolation.
+    pub async fn scan_vertex_table(
+        &self,
+        label: &str,
+        columns: &[&str],
+        additional_filter: Option<&str>,
+    ) -> Result<Option<arrow_array::RecordBatch>> {
+        let backend = self.backend();
+        let table_name = table_names::vertex_table_name(label);
+
+        if !backend.table_exists(&table_name).await.unwrap_or(false) {
+            return Ok(None);
+        }
+
+        // Filter columns to those that exist in the table
+        let actual_columns =
+            if let Some(table_schema) = backend.get_table_schema(&table_name).await? {
+                let table_field_names: HashSet<&str> = table_schema
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().as_str())
+                    .collect();
+                columns
+                    .iter()
+                    .copied()
+                    .filter(|c| table_field_names.contains(c))
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()
+            } else {
+                return Ok(None);
+            };
+
+        // Build filter with version HWM + optional additional filter
+        let filter = match (self.version_high_water_mark(), additional_filter) {
+            (Some(hwm), Some(f)) => Some(format!("_version <= {} AND ({})", hwm, f)),
+            (Some(hwm), None) => Some(format!("_version <= {}", hwm)),
+            (None, Some(f)) => Some(f.to_string()),
+            (None, None) => None,
+        };
+
+        let mut request = ScanRequest::all(&table_name).with_columns(actual_columns);
+        if let Some(f) = filter {
+            request = request.with_filter(f);
+        }
+
+        match backend.scan(request).await {
+            Ok(batches) => {
+                if batches.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(arrow::compute::concat_batches(
+                        &batches[0].schema(),
+                        &batches,
+                    )?))
+                }
+            }
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// Scan a delta table for an edge type + direction.
+    /// Returns `None` if the table doesn't exist.
+    pub async fn scan_delta_table(
+        &self,
+        edge_type: &str,
+        direction: &str,
+        columns: &[&str],
+        additional_filter: Option<&str>,
+    ) -> Result<Option<arrow_array::RecordBatch>> {
+        let backend = self.backend();
+        let table_name = table_names::delta_table_name(edge_type, direction);
+
+        if !backend.table_exists(&table_name).await.unwrap_or(false) {
+            return Ok(None);
+        }
+
+        // Filter columns to those that exist
+        let actual_columns =
+            if let Some(table_schema) = backend.get_table_schema(&table_name).await? {
+                let table_field_names: HashSet<&str> = table_schema
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().as_str())
+                    .collect();
+                columns
+                    .iter()
+                    .copied()
+                    .filter(|c| table_field_names.contains(c))
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()
+            } else {
+                return Ok(None);
+            };
+
+        let filter = match (self.version_high_water_mark(), additional_filter) {
+            (Some(hwm), Some(f)) => Some(format!("_version <= {} AND ({})", hwm, f)),
+            (Some(hwm), None) => Some(format!("_version <= {}", hwm)),
+            (None, Some(f)) => Some(f.to_string()),
+            (None, None) => None,
+        };
+
+        let mut request = ScanRequest::all(&table_name).with_columns(actual_columns);
+        if let Some(f) = filter {
+            request = request.with_filter(f);
+        }
+
+        match backend.scan(request).await {
+            Ok(batches) => {
+                if batches.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(arrow::compute::concat_batches(
+                        &batches[0].schema(),
+                        &batches,
+                    )?))
+                }
+            }
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// Scan the unified main vertex table. Returns `None` if table doesn't exist.
+    ///
+    /// Applies version HWM filter internally for snapshot isolation, combined
+    /// with any caller-provided filter (label conditions, etc.).
+    pub async fn scan_main_vertex_table(
+        &self,
+        columns: &[&str],
+        filter: Option<&str>,
+    ) -> Result<Option<arrow_array::RecordBatch>> {
+        let backend = self.backend();
+        let table_name = table_names::main_vertex_table_name();
+
+        if !backend.table_exists(table_name).await.unwrap_or(false) {
+            return Ok(None);
+        }
+
+        // Combine caller filter with version HWM for snapshot isolation
+        let full_filter = match (self.version_high_water_mark(), filter) {
+            (Some(hwm), Some(f)) => Some(format!("_version <= {} AND ({})", hwm, f)),
+            (Some(hwm), None) => Some(format!("_version <= {}", hwm)),
+            (None, Some(f)) => Some(f.to_string()),
+            (None, None) => None,
+        };
+
+        let request = ScanRequest::all(table_name)
+            .with_columns(columns.iter().map(|s| s.to_string()).collect());
+        let request = match full_filter.as_deref() {
+            Some(f) => request.with_filter(f),
+            None => request,
+        };
+
+        match backend.scan(request).await {
+            Ok(batches) => {
+                if batches.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(arrow::compute::concat_batches(
+                        &batches[0].schema(),
+                        &batches,
+                    )?))
+                }
+            }
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// Scan the main edge table as a stream. Returns `None` if table doesn't exist.
+    pub async fn scan_main_edge_table_stream(
+        &self,
+        filter: Option<&str>,
+    ) -> Result<
+        Option<
+            std::pin::Pin<Box<dyn futures::Stream<Item = Result<arrow_array::RecordBatch>> + Send>>,
+        >,
+    > {
+        let backend = self.backend();
+        let table_name = table_names::main_edge_table_name();
+
+        if !backend.table_exists(table_name).await.unwrap_or(false) {
+            return Ok(None);
+        }
+
+        let mut request = ScanRequest::all(table_name);
+        if let Some(f) = filter {
+            request = request.with_filter(f);
+        }
+
+        let stream = backend.scan_stream(request).await?;
+        Ok(Some(stream))
+    }
+
+    /// Scan a per-label vertex table as a stream. Returns `None` if table doesn't exist.
+    pub async fn scan_vertex_table_stream(
+        &self,
+        label: &str,
+    ) -> Result<
+        Option<
+            std::pin::Pin<Box<dyn futures::Stream<Item = Result<arrow_array::RecordBatch>> + Send>>,
+        >,
+    > {
+        let backend = self.backend();
+        let table_name = table_names::vertex_table_name(label);
+
+        if !backend.table_exists(&table_name).await.unwrap_or(false) {
+            return Ok(None);
+        }
+
+        let stream = backend.scan_stream(ScanRequest::all(&table_name)).await?;
+        Ok(Some(stream))
+    }
+
+    /// Find a vertex VID by external ID. Uses pinned snapshot HWM if present.
+    pub async fn find_vertex_by_ext_id(&self, ext_id: &str) -> Result<Option<Vid>> {
+        MainVertexDataset::find_by_ext_id(self.backend(), ext_id, self.version_high_water_mark())
+            .await
+    }
+
+    /// Find labels for a vertex by VID. Uses pinned snapshot HWM if present.
+    pub async fn find_vertex_labels_by_vid(&self, vid: Vid) -> Result<Option<Vec<String>>> {
+        MainVertexDataset::find_labels_by_vid(self.backend(), vid, self.version_high_water_mark())
+            .await
+    }
+
+    /// Find edges from the main edge table by type names.
+    pub async fn find_edges_by_type_names(
+        &self,
+        type_names: &[&str],
+    ) -> Result<Vec<(Eid, Vid, Vid, String, uni_common::Properties)>> {
+        MainEdgeDataset::find_edges_by_type_names(self.backend(), type_names).await
+    }
+
+    /// Scan vertex candidates matching a filter. Returns VIDs where `_deleted = false`.
+    pub async fn scan_vertex_candidates(
+        &self,
+        label: &str,
+        filter: Option<&str>,
+    ) -> Result<Vec<Vid>> {
+        let backend = self.backend();
+        let table_name = table_names::vertex_table_name(label);
+
+        if !backend.table_exists(&table_name).await.unwrap_or(false) {
+            return Ok(Vec::new());
+        }
+
+        let full_filter = match filter {
+            Some(f) => format!("_deleted = false AND ({})", f),
+            None => "_deleted = false".to_string(),
+        };
+
+        let request = ScanRequest::all(&table_name)
+            .with_filter(full_filter)
+            .with_columns(vec!["_vid".to_string()]);
+
+        let batches = backend.scan(request).await?;
+
+        let mut vids = Vec::new();
+        for batch in batches {
+            let vid_col = batch
+                .column_by_name("_vid")
+                .ok_or(anyhow!("Missing _vid"))?
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or(anyhow!("Invalid _vid"))?;
+            for i in 0..batch.num_rows() {
+                vids.push(Vid::from(vid_col.value(i)));
+            }
+        }
+        Ok(vids)
     }
 
     pub fn vertex_dataset(&self, label: &str) -> Result<VertexDataset> {
@@ -932,6 +1185,7 @@ impl StorageManager {
         Ok(VertexDataset::new(&self.base_uri, label, label_meta.id))
     }
 
+    #[cfg(feature = "lance-backend")]
     pub fn edge_dataset(
         &self,
         edge_type: &str,
@@ -980,10 +1234,12 @@ impl StorageManager {
         MainEdgeDataset::new(&self.base_uri)
     }
 
+    #[cfg(feature = "lance-backend")]
     pub fn uid_index(&self, label: &str) -> Result<UidIndex> {
         Ok(UidIndex::new(&self.base_uri, label))
     }
 
+    #[cfg(feature = "lance-backend")]
     pub async fn inverted_index(&self, label: &str, property: &str) -> Result<InvertedIndex> {
         let schema = self.schema_manager.schema();
         let config = schema
@@ -1011,6 +1267,8 @@ impl StorageManager {
         filter: Option<&str>,
         ctx: Option<&QueryContext>,
     ) -> Result<Vec<(Vid, f32)>> {
+        use crate::backend::types::{DistanceMetric as BackendMetric, FilterExpr};
+
         // Look up vector index config to get the correct distance metric.
         let schema = self.schema_manager.schema();
         let metric = schema
@@ -1018,44 +1276,32 @@ impl StorageManager {
             .map(|config| config.metric.clone())
             .unwrap_or(DistanceMetric::L2);
 
-        // Try to open the cached table; if the label has no data yet the Lance
-        // table won't exist. In that case fall back to L0-only results.
-        let table = self.get_cached_table(label).await.ok();
+        let backend = self.backend.as_ref();
+        let name = table_names::vertex_table_name(label);
 
         let mut results = Vec::new();
 
-        if let Some(table) = table {
-            let distance_type = match &metric {
-                DistanceMetric::L2 => lancedb::DistanceType::L2,
-                DistanceMetric::Cosine => lancedb::DistanceType::Cosine,
-                DistanceMetric::Dot => lancedb::DistanceType::Dot,
-                _ => lancedb::DistanceType::L2,
+        // Only search if the table exists
+        if backend.table_exists(&name).await.unwrap_or(false) {
+            let backend_metric = match &metric {
+                DistanceMetric::L2 => BackendMetric::L2,
+                DistanceMetric::Cosine => BackendMetric::Cosine,
+                DistanceMetric::Dot => BackendMetric::Dot,
+                _ => BackendMetric::L2,
             };
 
-            // Use LanceDB's vector search API
-            let mut query_builder = table
-                .vector_search(query.to_vec())
-                .map_err(|e| anyhow!("Failed to create vector search: {}", e))?
-                .column(property)
-                .distance_type(distance_type)
-                .limit(k);
-
-            query_builder = query_builder.only_if(Self::build_active_filter(filter));
-
-            // Apply version filtering if snapshot is pinned
+            // Build combined filter: _deleted = false + optional user filter + HWM
+            let mut filter_parts = vec![Self::build_active_filter(filter)];
             if ctx.is_some()
                 && let Some(hwm) = self.version_high_water_mark()
             {
-                query_builder = query_builder.only_if(format!("_version <= {}", hwm));
+                filter_parts.push(format!("_version <= {}", hwm));
             }
+            let combined_filter = FilterExpr::Sql(filter_parts.join(" AND "));
 
-            let batches = query_builder
-                .execute()
-                .await
-                .map_err(|e| anyhow!("Vector search execution failed: {}", e))?
-                .try_collect::<Vec<_>>()
-                .await
-                .map_err(|e| anyhow!("Failed to collect vector search results: {}", e))?;
+            let batches = backend
+                .vector_search(&name, property, query, k, backend_metric, combined_filter)
+                .await?;
 
             results = extract_vid_score_pairs(&batches, "_vid", "_distance")?;
         }
@@ -1092,47 +1338,29 @@ impl StorageManager {
         filter: Option<&str>,
         ctx: Option<&QueryContext>,
     ) -> Result<Vec<(Vid, f32)>> {
-        use lance_index::scalar::FullTextSearchQuery;
-        use lance_index::scalar::inverted::query::MatchQuery;
+        use crate::backend::types::FilterExpr;
 
-        // Try to open the cached table; if the label has no data yet the Lance
-        // table won't exist. Fall through to L0 merge with empty results.
-        let table = self.get_cached_table(label).await.ok();
+        let backend = self.backend.as_ref();
+        let name = table_names::vertex_table_name(label);
 
-        let mut results = if let Some(table) = table {
-            // Build the FTS query with specific column
-            let match_query =
-                MatchQuery::new(query.to_string()).with_column(Some(property.to_string()));
-            let fts_query = FullTextSearchQuery {
-                query: match_query.into(),
-                limit: Some(k as i64),
-                wand_factor: None,
-            };
-
-            let mut query_builder = table.query().full_text_search(fts_query).limit(k);
-
-            query_builder = query_builder.only_if(Self::build_active_filter(filter));
-
-            // Apply version filtering if snapshot is pinned
+        let mut results = if backend.table_exists(&name).await.unwrap_or(false) {
+            // Build combined filter: _deleted = false + optional user filter + HWM
+            let mut filter_parts = vec![Self::build_active_filter(filter)];
             if ctx.is_some()
                 && let Some(hwm) = self.version_high_water_mark()
             {
-                query_builder = query_builder.only_if(format!("_version <= {}", hwm));
+                filter_parts.push(format!("_version <= {}", hwm));
             }
+            let combined_filter = FilterExpr::Sql(filter_parts.join(" AND "));
 
-            let batches = query_builder
-                .execute()
-                .await
-                .map_err(|e| anyhow!("FTS search execution failed: {}", e))?
-                .try_collect::<Vec<_>>()
-                .await
-                .map_err(|e| anyhow!("Failed to collect FTS search results: {}", e))?;
+            let batches = backend
+                .full_text_search(&name, property, query, k, combined_filter)
+                .await?;
 
-            let mut lance_results = extract_vid_score_pairs(&batches, "_vid", "_score")?;
-            // Results should already be sorted by score from Lance, but ensure descending order
-            lance_results
-                .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            lance_results
+            let mut fts_results = extract_vid_score_pairs(&batches, "_vid", "_score")?;
+            // Results should already be sorted by score from backend, but ensure descending order
+            fts_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            fts_results
         } else {
             Vec::new()
         };
@@ -1145,11 +1373,13 @@ impl StorageManager {
         Ok(results)
     }
 
+    #[cfg(feature = "lance-backend")]
     pub async fn get_vertex_by_uid(&self, uid: &UniId, label: &str) -> Result<Option<Vid>> {
         let index = self.uid_index(label)?;
         index.get_vid(uid).await
     }
 
+    #[cfg(feature = "lance-backend")]
     pub async fn insert_vertex_with_uid(&self, label: &str, vid: Vid, uid: UniId) -> Result<()> {
         let index = self.uid_index(label)?;
         index.write_mapping(&[(uid, vid)]).await
@@ -1236,7 +1466,7 @@ impl StorageManager {
                         .and_then(|s| s.edges.get(etype_name).map(|es| es.lance_version));
 
                     // Try each label until we find adjacency data
-                    let lancedb_store = self.lancedb_store();
+                    let backend = self.backend();
                     for current_src_label in label_map.values() {
                         let adj_ds =
                             match self.adjacency_dataset(etype_name, current_src_label, dir_str) {
@@ -1244,7 +1474,7 @@ impl StorageManager {
                                 Err(_) => continue,
                             };
                         if let Some((neighbors, eids)) =
-                            adj_ds.read_adjacency_lancedb(lancedb_store, vid).await?
+                            adj_ds.read_adjacency_backend(backend, vid).await?
                         {
                             for (n, eid) in neighbors.into_iter().zip(eids) {
                                 edges.insert(
@@ -1263,12 +1493,7 @@ impl StorageManager {
                     // 2. L1: Delta
                     let delta_ds = self.delta_dataset(etype_name, dir_str)?;
                     let delta_entries = delta_ds
-                        .read_deltas_lancedb(
-                            lancedb_store,
-                            vid,
-                            &schema,
-                            self.version_high_water_mark(),
-                        )
+                        .read_deltas(backend, vid, &schema, self.version_high_water_mark())
                         .await?;
                     Self::apply_delta_to_edges(&mut edges, delta_entries, neighbor_is_dst);
 

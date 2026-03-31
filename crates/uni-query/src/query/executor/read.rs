@@ -51,7 +51,6 @@ use uni_store::cloud::{build_store_from_url, copy_store_prefix, is_cloud_url};
 use uni_store::runtime::property_manager::PropertyManager;
 use uni_store::runtime::writer::Writer;
 use uni_store::storage::arrow_convert;
-use uni_store::storage::index_manager::IndexManager;
 
 // DataFusion engine imports
 use crate::query::df_graph::L0Context;
@@ -210,70 +209,16 @@ impl Executor {
             .label_name_by_id(label_id)
             .ok_or_else(|| anyhow!("Label ID {} not found", label_id))?;
 
-        let ds = self.storage.vertex_dataset(label_name)?;
-        let lancedb_store = self.storage.lancedb_store();
+        // Generate filter SQL from expression
+        let empty_props = std::collections::HashMap::new();
+        let label_props = schema.properties.get(label_name).unwrap_or(&empty_props);
+        let filter_sql = filter.and_then(|expr| {
+            LanceFilterGenerator::generate(std::slice::from_ref(expr), variable, Some(label_props))
+        });
 
-        // Try LanceDB first (canonical storage)
-        match ds.open_lancedb(lancedb_store).await {
-            Ok(table) => {
-                use arrow_array::UInt64Array;
-                use futures::TryStreamExt;
-                use lancedb::query::{ExecutableQuery, QueryBase, Select};
-
-                let mut query = table.query();
-
-                // Apply filter if provided, with schema awareness
-                // to skip overflow properties that aren't physical Lance columns.
-                // For labels with no registered properties (schemaless), use an empty
-                // map so all non-system properties are recognized as overflow.
-                let empty_props = std::collections::HashMap::new();
-                let label_props = schema.properties.get(label_name).unwrap_or(&empty_props);
-                if let Some(expr) = filter
-                    && let Some(sql) = LanceFilterGenerator::generate(
-                        std::slice::from_ref(expr),
-                        variable,
-                        Some(label_props),
-                    )
-                {
-                    query = query.only_if(format!("_deleted = false AND ({})", sql));
-                } else {
-                    query = query.only_if("_deleted = false");
-                }
-
-                // Project to only _vid
-                let query = query.select(Select::columns(&["_vid"]));
-                let stream = query.execute().await?;
-                let batches: Vec<arrow_array::RecordBatch> = stream.try_collect().await?;
-
-                let mut vids = Vec::new();
-                for batch in batches {
-                    let vid_col = batch
-                        .column_by_name("_vid")
-                        .ok_or(anyhow!("Missing _vid"))?
-                        .as_any()
-                        .downcast_ref::<UInt64Array>()
-                        .ok_or(anyhow!("Invalid _vid"))?;
-                    for i in 0..batch.num_rows() {
-                        vids.push(Vid::from(vid_col.value(i)));
-                    }
-                }
-                Ok(vids)
-            }
-            Err(e) => {
-                // Only treat "not found" / "does not exist" errors as empty results.
-                // Propagate all other errors (network, auth, corruption, etc.)
-                let err_msg = e.to_string().to_lowercase();
-                if err_msg.contains("not found")
-                    || err_msg.contains("does not exist")
-                    || err_msg.contains("no such file")
-                    || err_msg.contains("object not found")
-                {
-                    Ok(Vec::new())
-                } else {
-                    Err(e)
-                }
-            }
-        }
+        self.storage
+            .scan_vertex_candidates(label_name, filter_sql.as_deref())
+            .await
     }
 
     pub(crate) async fn scan_label_with_filter(
@@ -2334,11 +2279,7 @@ impl Executor {
                     if if_not_exists && self.index_exists_by_name(&config.name) {
                         return Ok(vec![]);
                     }
-                    let idx_mgr = IndexManager::new(
-                        self.storage.base_path(),
-                        self.storage.schema_manager_arc(),
-                        self.storage.lancedb_store_arc(),
-                    );
+                    let idx_mgr = self.storage.index_manager();
                     idx_mgr.create_vector_index(config).await?;
                     Ok(vec![])
                 }
@@ -2349,11 +2290,7 @@ impl Executor {
                     if if_not_exists && self.index_exists_by_name(&config.name) {
                         return Ok(vec![]);
                     }
-                    let idx_mgr = IndexManager::new(
-                        self.storage.base_path(),
-                        self.storage.schema_manager_arc(),
-                        self.storage.lancedb_store_arc(),
-                    );
+                    let idx_mgr = self.storage.index_manager();
                     idx_mgr.create_fts_index(config).await?;
                     Ok(vec![])
                 }
@@ -2393,11 +2330,7 @@ impl Executor {
 
                     config.properties = modified_properties;
 
-                    let idx_mgr = IndexManager::new(
-                        self.storage.base_path(),
-                        self.storage.schema_manager_arc(),
-                        self.storage.lancedb_store_arc(),
-                    );
+                    let idx_mgr = self.storage.index_manager();
                     idx_mgr.create_scalar_index(config).await?;
                     Ok(vec![])
                 }
@@ -2408,11 +2341,7 @@ impl Executor {
                     if if_not_exists && self.index_exists_by_name(&config.name) {
                         return Ok(vec![]);
                     }
-                    let idx_mgr = IndexManager::new(
-                        self.storage.base_path(),
-                        self.storage.schema_manager_arc(),
-                        self.storage.lancedb_store_arc(),
-                    );
+                    let idx_mgr = self.storage.index_manager();
                     idx_mgr.create_json_fts_index(config).await?;
                     Ok(vec![])
                 }
@@ -2487,11 +2416,7 @@ impl Executor {
                 }
                 LogicalPlan::ShowConstraints(clause) => Ok(self.execute_show_constraints(clause)),
                 LogicalPlan::DropIndex { name, if_exists } => {
-                    let idx_mgr = IndexManager::new(
-                        self.storage.base_path(),
-                        self.storage.schema_manager_arc(),
-                        self.storage.lancedb_store_arc(),
-                    );
+                    let idx_mgr = self.storage.index_manager();
                     match idx_mgr.drop_index(&name).await {
                         Ok(_) => Ok(vec![]),
                         Err(e) => {
@@ -4441,40 +4366,28 @@ impl Executor {
         edge_type: &str,
         edges: &mut HashMap<uni_common::core::id::Eid, (Vid, Vid)>,
     ) -> Result<()> {
-        use futures::TryStreamExt;
-        use lancedb::query::{ExecutableQuery, QueryBase, Select};
+        if let Ok(Some(batch)) = self
+            .storage
+            .scan_delta_table(
+                edge_type,
+                "fwd",
+                &["eid", "src_vid", "dst_vid", "op", "_version"],
+                None,
+            )
+            .await
+        {
+            // Collect ops with versions: eid -> (version, op, src, dst)
+            let mut versioned_ops: HashMap<uni_common::core::id::Eid, (u64, u8, Vid, Vid)> =
+                HashMap::new();
 
-        if let Ok(ds) = self.storage.delta_dataset(edge_type, "fwd") {
-            let lancedb_store = self.storage.lancedb_store();
-            if let Ok(table) = ds.open_lancedb(lancedb_store).await {
-                let query = table.query().select(Select::Columns(vec![
-                    "eid".into(),
-                    "src_vid".into(),
-                    "dst_vid".into(),
-                    "op".into(),
-                    "_version".into(),
-                ]));
+            self.process_delta_batch(&batch, &mut versioned_ops)?;
 
-                if let Ok(stream) = query.execute().await {
-                    let batches: Vec<arrow_array::RecordBatch> =
-                        stream.try_collect().await.unwrap_or_default();
-
-                    // Collect ops with versions: eid -> (version, op, src, dst)
-                    let mut versioned_ops: HashMap<uni_common::core::id::Eid, (u64, u8, Vid, Vid)> =
-                        HashMap::new();
-
-                    for batch in batches {
-                        self.process_delta_batch(&batch, &mut versioned_ops)?;
-                    }
-
-                    // Apply the winning ops
-                    for (eid, (_, op, src, dst)) in versioned_ops {
-                        if op == 0 {
-                            edges.insert(eid, (src, dst));
-                        } else if op == 1 {
-                            edges.remove(&eid);
-                        }
-                    }
+            // Apply the winning ops
+            for (eid, (_, op, src, dst)) in versioned_ops {
+                if op == 0 {
+                    edges.insert(eid, (src, dst));
+                } else if op == 1 {
+                    edges.remove(&eid);
                 }
             }
         }

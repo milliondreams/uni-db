@@ -13,7 +13,7 @@ use uni_common::{
         validate_identifier,
     },
 };
-use uni_store::storage::{IndexManager, StorageManager};
+use uni_store::storage::StorageManager;
 
 #[derive(Deserialize)]
 struct LabelConfig {
@@ -326,11 +326,7 @@ async fn create_index_internal(
     tracing::debug!("create_index_internal count for {}: {}", label, count);
 
     if count > 0 {
-        let idx_mgr = IndexManager::new(
-            storage.base_path(),
-            storage.schema_manager_arc(),
-            storage.lancedb_store_arc(),
-        );
+        let idx_mgr = storage.index_manager();
         match def {
             IndexDefinition::Vector(cfg) => {
                 idx_mgr.create_vector_index(cfg).await?;

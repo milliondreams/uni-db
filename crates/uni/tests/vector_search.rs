@@ -36,7 +36,6 @@ async fn test_vector_search() -> anyhow::Result<()> {
     let schema_manager = Arc::new(schema_manager);
 
     let storage = StorageManager::new(storage_str, schema_manager.clone()).await?;
-    let lancedb_store = storage.lancedb_store();
 
     // 2. Insert Data
     // Item 1: [0.0, 0.0] (Target)
@@ -105,7 +104,7 @@ async fn test_vector_search() -> anyhow::Result<()> {
     )?;
 
     vertex_ds
-        .write_batch_lancedb(lancedb_store, batch, &schema_manager.schema())
+        .write_batch(storage.backend(), batch, &schema_manager.schema())
         .await?;
 
     // 3. Search
@@ -208,7 +207,7 @@ async fn write_vectors_to_lancedb(
         ],
     )?;
 
-    ds.write_batch_lancedb(storage.lancedb_store(), batch, &schema_manager.schema())
+    ds.write_batch(storage.backend(), batch, &schema_manager.schema())
         .await?;
     Ok(())
 }

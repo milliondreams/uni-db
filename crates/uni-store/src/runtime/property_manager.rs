@@ -9,8 +9,6 @@ use crate::storage::manager::StorageManager;
 use crate::storage::value_codec::CrdtDecodeMode;
 use anyhow::{Result, anyhow};
 use arrow_array::{Array, BooleanArray, RecordBatch, UInt64Array};
-use futures::TryStreamExt;
-use lancedb::query::{ExecutableQuery, QueryBase, Select};
 use lru::LruCache;
 use metrics;
 use std::collections::HashMap;
@@ -198,7 +196,7 @@ impl PropertyManager {
         type_name_hint: Option<&str>,
     ) -> Result<Option<Properties>> {
         let schema = self.schema_manager.schema();
-        let lancedb_store = self.storage.lancedb_store();
+        let backend = self.storage.backend();
 
         // If hint provided, use it directly
         let type_names: Vec<&str> = if let Some(hint) = type_name_hint {
@@ -213,31 +211,29 @@ impl PropertyManager {
 
             // For now, edges are primarily in Delta runs before compaction to L2 CSR.
             // We check FWD delta runs.
-            let delta_ds = match self.storage.delta_dataset(type_name, "fwd") {
-                Ok(ds) => ds,
-                Err(_) => continue, // Edge type doesn't exist, try next
-            };
+            if self.storage.delta_dataset(type_name, "fwd").is_err() {
+                continue; // Edge type doesn't exist, try next
+            }
 
-            // Use LanceDB for edge property lookup
-            let table = match delta_ds.open_lancedb(lancedb_store).await {
-                Ok(t) => t,
-                Err(_) => continue, // No data for this type, try next
-            };
+            // Use backend for edge property lookup
+            use crate::backend::table_names;
+            use crate::backend::types::ScanRequest;
 
-            use lancedb::query::{ExecutableQuery, QueryBase};
+            let table_name = table_names::delta_table_name(type_name, "fwd");
+            if !backend.table_exists(&table_name).await.unwrap_or(false) {
+                continue; // No data for this type, try next
+            }
 
             let base_filter = format!("eid = {}", eid.as_u64());
-
             let filter_expr = self.storage.apply_version_filter(base_filter);
 
-            let query = table.query().only_if(filter_expr);
-            let stream = match query.execute().await {
-                Ok(s) => s,
+            let batches = match backend
+                .scan(ScanRequest::all(&table_name).with_filter(filter_expr))
+                .await
+            {
+                Ok(b) => b,
                 Err(_) => continue,
             };
-
-            let batches: Vec<arrow_array::RecordBatch> =
-                stream.try_collect().await.unwrap_or_default();
 
             // Collect all rows for this edge, sorted by version
             let mut rows: Vec<(u64, u8, Properties)> = Vec::new();
@@ -333,7 +329,8 @@ impl PropertyManager {
 
         // Fallback to main edges table props_json for unknown/schemaless types
         use crate::storage::main_edge::MainEdgeDataset;
-        if let Some(props) = MainEdgeDataset::find_props_by_eid(lancedb_store, eid).await? {
+        if let Some(props) = MainEdgeDataset::find_props_by_eid(self.storage.backend(), eid).await?
+        {
             return Ok(Some(props));
         }
 
@@ -387,25 +384,12 @@ impl PropertyManager {
             // Note: don't skip when valid_props is empty; overflow_json may have the properties
 
             let ds = self.storage.vertex_dataset(label_name)?;
-            let lancedb_store = self.storage.lancedb_store();
-            let table = match ds.open_lancedb(lancedb_store).await {
-                Ok(t) => t,
-                Err(e) => {
-                    let err_msg = e.to_string();
-                    if err_msg.contains("was not found")
-                        || err_msg.contains("does not exist")
-                        || err_msg.contains("not found")
-                    {
-                        continue; // Table doesn't exist yet — skip this label
-                    }
-                    warn!(
-                        label = %label_name,
-                        error = %e,
-                        "failed to open LanceDB table for label, skipping"
-                    );
-                    continue;
-                }
-            };
+            let backend = self.storage.backend();
+            let vtable_name = ds.table_name();
+
+            if !backend.table_exists(&vtable_name).await.unwrap_or(false) {
+                continue; // Table doesn't exist yet — skip this label
+            }
 
             // Construct filter: _vid IN (...)
             let vid_list = vids
@@ -426,30 +410,18 @@ impl PropertyManager {
             // Add overflow_json to fetch non-schema properties
             columns.push("overflow_json".to_string());
 
-            let query = table
-                .query()
-                .only_if(final_filter)
-                .select(Select::Columns(columns));
+            use crate::backend::types::ScanRequest;
+            let request = ScanRequest::all(&vtable_name)
+                .with_filter(final_filter)
+                .with_columns(columns);
 
-            let stream = match query.execute().await {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!(
-                        label = %label_name,
-                        error = %e,
-                        "failed to execute query on label table, skipping"
-                    );
-                    continue;
-                }
-            };
-
-            let batches: Vec<RecordBatch> = match stream.try_collect().await {
+            let batches: Vec<RecordBatch> = match backend.scan(request).await {
                 Ok(b) => b,
                 Err(e) => {
                     warn!(
                         label = %label_name,
                         error = %e,
-                        "failed to collect query results for label, skipping"
+                        "failed to scan label table, skipping"
                     );
                     continue;
                 }
@@ -625,25 +597,12 @@ impl PropertyManager {
                 Ok(ds) => ds,
                 Err(_) => continue,
             };
-            let lancedb_store = self.storage.lancedb_store();
-            let table = match delta_ds.open_lancedb(lancedb_store).await {
-                Ok(t) => t,
-                Err(e) => {
-                    let err_msg = e.to_string();
-                    if err_msg.contains("was not found")
-                        || err_msg.contains("does not exist")
-                        || err_msg.contains("not found")
-                    {
-                        continue; // Table doesn't exist yet — skip this edge type
-                    }
-                    warn!(
-                        edge_type = %type_name,
-                        error = %e,
-                        "failed to open LanceDB delta table for edge type, skipping"
-                    );
-                    continue;
-                }
-            };
+            let backend = self.storage.backend();
+            let dtable_name = delta_ds.table_name();
+
+            if !backend.table_exists(&dtable_name).await.unwrap_or(false) {
+                continue; // Table doesn't exist yet — skip this edge type
+            }
 
             let eid_list = eids
                 .iter()
@@ -663,30 +622,18 @@ impl PropertyManager {
             // Add overflow_json to fetch non-schema properties
             columns.push("overflow_json".to_string());
 
-            let query = table
-                .query()
-                .only_if(final_filter)
-                .select(Select::Columns(columns));
+            use crate::backend::types::ScanRequest;
+            let request = ScanRequest::all(&dtable_name)
+                .with_filter(final_filter)
+                .with_columns(columns);
 
-            let stream = match query.execute().await {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!(
-                        edge_type = %type_name,
-                        error = %e,
-                        "failed to execute query on edge delta table, skipping"
-                    );
-                    continue;
-                }
-            };
-
-            let batches: Vec<RecordBatch> = match stream.try_collect().await {
+            let batches: Vec<RecordBatch> = match backend.scan(request).await {
                 Ok(b) => b,
                 Err(e) => {
                     warn!(
                         edge_type = %type_name,
                         error = %e,
-                        "failed to collect query results for edge type, skipping"
+                        "failed to scan edge delta table, skipping"
                     );
                     continue;
                 }
@@ -929,12 +876,12 @@ impl PropertyManager {
             }
         }
 
-        // Fallback to LanceDB for VIDs not in the index
+        // Fallback to storage backend for VIDs not in the index
         if !vids_needing_lancedb.is_empty() {
-            let lancedb_store = self.storage.lancedb_store();
+            let backend = self.storage.backend();
             let version = self.storage.version_high_water_mark();
             let storage_labels = MainVertexDataset::find_batch_labels_by_vids(
-                lancedb_store,
+                backend,
                 &vids_needing_lancedb,
                 version,
             )
@@ -1046,22 +993,6 @@ impl PropertyManager {
         let schema = self.schema_manager.schema();
         let label_props = schema.properties.get(label);
 
-        let table = match self.storage.get_cached_table(label).await {
-            Ok(t) => t,
-            Err(e) => {
-                let err_msg = e.to_string();
-                if err_msg.contains("was not found")
-                    || err_msg.contains("does not exist")
-                    || err_msg.contains("not found")
-                {
-                    // Table doesn't exist — vertices only have L0 props (already in result).
-                    return Ok(result);
-                }
-                // Propagate unexpected errors (I/O, corruption, etc.)
-                return Err(e.context(format!("failed to open cached table for label '{}'", label)));
-            }
-        };
-
         let mut prop_names: Vec<String> = Vec::new();
         if let Some(props) = label_props {
             prop_names = props.keys().cloned().collect();
@@ -1085,24 +1016,16 @@ impl PropertyManager {
 
         let filter_expr = self.storage.apply_version_filter(base_filter);
 
-        let batches: Vec<RecordBatch> = table
-            .query()
-            .only_if(&filter_expr)
-            .select(Select::Columns(columns.clone()))
-            .execute()
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!("failed to execute query on label '{}' table: {}", label, e)
-            })?
-            .try_collect()
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "failed to collect query results for label '{}': {}",
-                    label,
-                    e
-                )
-            })?;
+        let table_name = crate::backend::table_names::vertex_table_name(label);
+        let batches: Vec<RecordBatch> = self
+            .storage
+            .backend()
+            .scan(
+                crate::backend::types::ScanRequest::all(&table_name)
+                    .with_filter(&filter_expr)
+                    .with_columns(columns.clone()),
+            )
+            .await?;
 
         let prop_name_refs: Vec<&str> = prop_names.iter().map(|s| s.as_str()).collect();
 
@@ -1400,11 +1323,6 @@ impl PropertyManager {
         for label_name in &label_names {
             let label_props = schema.properties.get(label_name);
 
-            let table = match self.storage.get_cached_table(label_name).await {
-                Ok(t) => t,
-                Err(_) => continue,
-            };
-
             // Get property names from schema
             let mut prop_names: Vec<String> = Vec::new();
             if let Some(props) = label_props {
@@ -1417,22 +1335,23 @@ impl PropertyManager {
             // Add overflow_json column to fetch non-schema properties
             columns.push("overflow_json".to_string());
 
-            // Query using LanceDB
+            // Query using backend scan API
             let base_filter = format!("_vid = {}", vid.as_u64());
 
             let filter_expr = self.storage.apply_version_filter(base_filter);
 
-            let batches: Vec<RecordBatch> = match table
-                .query()
-                .only_if(&filter_expr)
-                .select(Select::Columns(columns.clone()))
-                .execute()
+            let table_name = crate::backend::table_names::vertex_table_name(label_name);
+            let batches: Vec<RecordBatch> = match self
+                .storage
+                .backend()
+                .scan(
+                    crate::backend::types::ScanRequest::all(&table_name)
+                        .with_filter(&filter_expr)
+                        .with_columns(columns.clone()),
+                )
                 .await
             {
-                Ok(stream) => match stream.try_collect().await {
-                    Ok(b) => b,
-                    Err(_) => continue,
-                },
+                Ok(b) => b,
                 Err(_) => continue,
             };
 
@@ -1491,7 +1410,7 @@ impl PropertyManager {
         // Fallback to main table props_json for unknown/schemaless labels
         if merged_props.is_none()
             && let Some(main_props) = MainVertexDataset::find_props_by_vid(
-                self.storage.lancedb_store(),
+                self.storage.backend(),
                 vid,
                 self.storage.version_high_water_mark(),
             )
@@ -1657,12 +1576,8 @@ impl PropertyManager {
                 .and_then(|props| props.get(prop));
 
             // Even if property is not in schema, we still check overflow_json
-            let table = match self.storage.get_cached_table(label_name).await {
-                Ok(t) => t,
-                Err(_) => continue,
-            };
 
-            // Query using LanceDB
+            // Query using backend scan API
             let base_filter = format!("_vid = {}", vid.as_u64());
 
             let filter_expr = self.storage.apply_version_filter(base_filter);
@@ -1679,17 +1594,18 @@ impl PropertyManager {
                 columns.push(prop.to_string());
             }
 
-            let batches: Vec<RecordBatch> = match table
-                .query()
-                .only_if(&filter_expr)
-                .select(Select::Columns(columns))
-                .execute()
+            let table_name = crate::backend::table_names::vertex_table_name(label_name);
+            let batches: Vec<RecordBatch> = match self
+                .storage
+                .backend()
+                .scan(
+                    crate::backend::types::ScanRequest::all(&table_name)
+                        .with_filter(&filter_expr)
+                        .with_columns(columns),
+                )
                 .await
             {
-                Ok(stream) => match stream.try_collect().await {
-                    Ok(b) => b,
-                    Err(_) => continue,
-                },
+                Ok(b) => b,
                 Err(_) => continue,
             };
 

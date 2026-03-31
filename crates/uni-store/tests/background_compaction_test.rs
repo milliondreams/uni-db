@@ -10,7 +10,6 @@ use tempfile::tempdir;
 use uni_common::config::UniConfig;
 use uni_common::core::schema::SchemaManager;
 use uni_store::Writer;
-use uni_store::lancedb::LanceDbStore;
 use uni_store::storage::manager::StorageManager;
 
 #[tokio::test]
@@ -209,13 +208,12 @@ async fn test_background_compaction_runs_semantic() {
     write_and_flush(&storage, &schema_manager, edge_type_id, config).await;
 
     // Verify L1 has data before background compaction
-    let fwd_table_name = LanceDbStore::delta_table_name("KNOWS", "fwd");
-    let table = storage
-        .lancedb_store()
-        .open_table(&fwd_table_name)
+    let fwd_table_name = uni_store::backend::table_names::delta_table_name("KNOWS", "fwd");
+    let pre_count = storage
+        .backend()
+        .count_rows(&fwd_table_name, None)
         .await
         .unwrap();
-    let pre_count = table.count_rows(None).await.unwrap();
     assert!(
         pre_count > 0,
         "Delta table should have rows before compaction"
@@ -311,9 +309,8 @@ async fn test_l1_runs_counts_non_empty_only() {
     let status = run_compaction_cycle(&storage, Duration::from_secs(2)).await;
 
     // If the delta table still exists after compaction, it should be empty
-    let fwd_table_name = LanceDbStore::delta_table_name("KNOWS", "fwd");
-    if let Ok(table) = storage.lancedb_store().open_table(&fwd_table_name).await {
-        let count = table.count_rows(None).await.unwrap();
+    let fwd_table_name = uni_store::backend::table_names::delta_table_name("KNOWS", "fwd");
+    if let Ok(count) = storage.backend().count_rows(&fwd_table_name, None).await {
         assert_eq!(
             count, 0,
             "Delta table should be empty after semantic compaction"

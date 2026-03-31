@@ -88,12 +88,13 @@ async fn test_backup_and_restore() -> anyhow::Result<()> {
         .await?,
     );
 
-    // Check data via LanceDB store
-    let table = restore_storage
-        .lancedb_store()
-        .open_vertex_table("Person")
+    // Check data via storage backend
+    let vtable_name = uni_db::store::backend::table_names::vertex_table_name("Person");
+    let count = restore_storage
+        .backend()
+        .count_rows(&vtable_name, None)
         .await?;
-    assert!(table.count_rows(None).await? > 0);
+    assert!(count > 0);
 
     Ok(())
 }

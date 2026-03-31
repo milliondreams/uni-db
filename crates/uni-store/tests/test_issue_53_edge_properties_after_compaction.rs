@@ -102,11 +102,10 @@ async fn test_edge_properties_readable_after_compaction() -> Result<()> {
         .await?;
 
     // Verify Delta L1 is now empty (cleared after compaction)
-    let lancedb_store = storage.lancedb_store();
     let delta_ds = storage.delta_dataset("KNOWS", "fwd")?;
     let schema_ref = storage.schema_manager().schema();
     let delta_entries = delta_ds
-        .scan_all_lancedb(lancedb_store, &schema_ref)
+        .scan_all_backend(storage.backend(), &schema_ref)
         .await?;
     assert!(
         delta_entries.is_empty(),
@@ -165,16 +164,15 @@ async fn test_main_edges_fallback_when_delta_cleared() -> Result<()> {
     writer.flush_to_l1(None).await?;
 
     // Manually clear Delta L1 (simulates post-compaction state)
-    let lancedb_store = storage.lancedb_store();
     let delta_ds = storage.delta_dataset("KNOWS", "fwd")?;
     let schema_ref = storage.schema_manager().schema();
     let delta_schema = delta_ds.get_arrow_schema(&schema_ref)?;
     let empty_batch = arrow_array::RecordBatch::new_empty(delta_schema);
-    delta_ds.replace_lancedb(lancedb_store, empty_batch).await?;
+    delta_ds.replace(storage.backend(), empty_batch).await?;
 
     // Verify Delta L1 is empty
     let delta_entries = delta_ds
-        .scan_all_lancedb(lancedb_store, &schema_ref)
+        .scan_all_backend(storage.backend(), &schema_ref)
         .await?;
     assert!(
         delta_entries.is_empty(),

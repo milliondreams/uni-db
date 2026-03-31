@@ -22,13 +22,11 @@ pub use api::schema::{
     PropertyInfo, ScalarType, SchemaBuilder, VectorAlgo, VectorIndexCfg, VectorMetric,
 };
 pub use api::session::{
-    ProfileBuilder, Session, SessionCapabilities, SessionMetrics, TransactionBuilder,
-    WriteLeaseSummary,
+    Session, SessionCapabilities, SessionMetrics, TransactionBuilder, WriteLeaseSummary,
 };
 pub use api::sync::{
-    ApplyBuilderSync, ExecuteBuilderSync, LocyBuilderSync, ProfileBuilderSync, QueryBuilderSync,
-    SessionSync, TransactionBuilderSync, TransactionSync, TxLocyBuilderSync, TxQueryBuilderSync,
-    UniSync,
+    ApplyBuilderSync, ExecuteBuilderSync, LocyBuilderSync, QueryBuilderSync, SessionSync,
+    TransactionBuilderSync, TransactionSync, TxLocyBuilderSync, TxQueryBuilderSync, UniSync,
 };
 pub use api::template::{SessionTemplate, SessionTemplateBuilder};
 pub use api::transaction::{

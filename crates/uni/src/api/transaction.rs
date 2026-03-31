@@ -125,7 +125,7 @@ pub struct Transaction {
     /// Child cancellation token derived from the session's parent token.
     cancellation_token: CancellationToken,
     /// Hooks inherited from the session.
-    hooks: Vec<Arc<dyn crate::api::hooks::SessionHook>>,
+    hooks: Vec<Arc<dyn crate::api::hooks::SessionHook>>, // Flattened from session's HashMap
 }
 
 impl Transaction {
@@ -201,7 +201,7 @@ impl Transaction {
             started_at_version,
             deadline,
             cancellation_token,
-            hooks: session.hooks.clone(),
+            hooks: session.hooks.values().cloned().collect(),
         };
 
         // Transaction constructed successfully — its Drop impl will clear the
@@ -481,7 +481,7 @@ impl Transaction {
 
     /// Prepare a Locy program for repeated evaluation within this transaction.
     #[instrument(skip(self), fields(transaction_id = %self.id))]
-    pub fn prepare_locy(&self, program: &str) -> Result<crate::api::prepared::PreparedLocy> {
+    pub async fn prepare_locy(&self, program: &str) -> Result<crate::api::prepared::PreparedLocy> {
         self.check_completed()?;
         crate::api::prepared::PreparedLocy::new(
             self.db.clone(),

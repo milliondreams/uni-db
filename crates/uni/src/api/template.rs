@@ -42,7 +42,7 @@ pub struct SessionTemplate {
     db: Arc<UniInner>,
     params: HashMap<String, Value>,
     rule_registry: LocyRuleRegistry,
-    hooks: Vec<Arc<dyn SessionHook>>,
+    hooks: HashMap<String, Arc<dyn SessionHook>>,
     pub(crate) query_timeout: Option<Duration>,
     pub(crate) transaction_timeout: Option<Duration>,
 }
@@ -69,7 +69,7 @@ pub struct SessionTemplateBuilder {
     db: Arc<UniInner>,
     params: HashMap<String, Value>,
     rule_registry: LocyRuleRegistry,
-    hooks: Vec<Arc<dyn SessionHook>>,
+    hooks: HashMap<String, Arc<dyn SessionHook>>,
     query_timeout: Option<Duration>,
     transaction_timeout: Option<Duration>,
 }
@@ -85,7 +85,7 @@ impl SessionTemplateBuilder {
             db,
             params: HashMap::new(),
             rule_registry: registry,
-            hooks: Vec::new(),
+            hooks: HashMap::new(),
             query_timeout: None,
             transaction_timeout: None,
         }
@@ -107,9 +107,9 @@ impl SessionTemplateBuilder {
         Ok(self)
     }
 
-    /// Attach a hook that all sessions created from this template will inherit.
-    pub fn hook(mut self, hook: impl SessionHook + 'static) -> Self {
-        self.hooks.push(Arc::new(hook));
+    /// Attach a named hook that all sessions created from this template will inherit.
+    pub fn hook(mut self, name: impl Into<String>, hook: impl SessionHook + 'static) -> Self {
+        self.hooks.insert(name.into(), Arc::new(hook));
         self
     }
 

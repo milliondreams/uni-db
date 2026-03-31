@@ -262,15 +262,6 @@ impl crate::api::UniInner {
         ))
     }
 
-    pub(crate) async fn execute_cursor_internal(
-        &self,
-        cypher: &str,
-        params: HashMap<String, ApiValue>,
-    ) -> Result<QueryCursor> {
-        self.execute_cursor_internal_with_config(cypher, params, self.config.clone())
-            .await
-    }
-
     pub(crate) async fn execute_cursor_internal_with_config(
         &self,
         cypher: &str,

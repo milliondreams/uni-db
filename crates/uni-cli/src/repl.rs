@@ -78,7 +78,7 @@ pub async fn execute_query(db: &Uni, query: &str) {
     if query_upper.starts_with("EXPLAIN") {
         let result = {
             let s = db.session();
-            s.explain(query).await
+            s.query_with(query).explain().await
         };
         match result {
             Ok(output) => print_explain(output, start.elapsed()),
@@ -91,7 +91,7 @@ pub async fn execute_query(db: &Uni, query: &str) {
         let clean_query = query[7..].trim();
         let result = {
             let s = db.session();
-            s.profile(clean_query).await
+            s.query_with(clean_query).profile().await
         };
         match result {
             Ok((results, output)) => {

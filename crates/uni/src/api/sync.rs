@@ -3,7 +3,7 @@
 
 use crate::api::Uni;
 use crate::api::locy_builder::{LocyBuilder, TxLocyBuilder};
-use crate::api::session::{ProfileBuilder, QueryBuilder, Session, TransactionBuilder};
+use crate::api::session::{QueryBuilder, Session, TransactionBuilder};
 use crate::api::transaction::{
     ApplyBuilder, ApplyResult, CommitResult, Transaction, TxQueryBuilder,
 };
@@ -13,7 +13,7 @@ use uni_common::{Result, UniError, Value};
 use uni_locy::DerivedFactSet;
 
 use crate::api::locy_result::LocyResult;
-use uni_query::{ExecuteResult, ExplainOutput, ProfileOutput, QueryCursor, QueryResult, Row};
+use uni_query::{ExecuteResult, QueryResult, Row};
 
 /// Blocking API wrapper for Uni.
 pub struct UniSync {
@@ -119,31 +119,6 @@ impl<'a> SessionSync<'a> {
         }
     }
 
-    /// Execute a query returning a cursor for streaming results.
-    pub fn query_cursor(&self, cypher: &str) -> Result<QueryCursor> {
-        self.rt.block_on(self.session.query_cursor(cypher))
-    }
-
-    // ── Planning & Introspection ──────────────────────────────────────
-
-    /// Explain a Cypher query plan without executing it.
-    pub fn explain(&self, cypher: &str) -> Result<ExplainOutput> {
-        self.rt.block_on(self.session.explain(cypher))
-    }
-
-    /// Profile a Cypher query execution.
-    pub fn profile(&self, cypher: &str) -> Result<(QueryResult, ProfileOutput)> {
-        self.rt.block_on(self.session.profile(cypher))
-    }
-
-    /// Profile a Cypher query with a builder for parameters.
-    pub fn profile_with(&self, cypher: &str) -> ProfileBuilderSync<'_, 'a> {
-        ProfileBuilderSync {
-            inner: self.session.profile_with(cypher),
-            rt: self.rt,
-        }
-    }
-
     // ── Locy Evaluation ───────────────────────────────────────────────
 
     /// Evaluate a Locy program with default configuration.
@@ -172,14 +147,6 @@ impl<'a> SessionSync<'a> {
     }
 
     // ── Custom Functions ──────────────────────────────────────────────
-
-    /// Register a custom scalar function available to Cypher queries.
-    pub fn register_function<F>(&self, name: &str, func: F) -> Result<()>
-    where
-        F: Fn(&[Value]) -> Result<Value> + Send + Sync + 'static,
-    {
-        self.session.register_function(name, func)
-    }
 
     // ── Transactions ──────────────────────────────────────────────────
 
@@ -211,9 +178,28 @@ impl<'a> SessionSync<'a> {
 
     // ── Hooks ─────────────────────────────────────────────────────────
 
-    /// Add a session hook for query/commit interception.
-    pub fn add_hook(&mut self, hook: impl crate::api::hooks::SessionHook + 'static) {
-        self.session.add_hook(hook)
+    /// Add a named session hook for query/commit interception.
+    pub fn add_hook(
+        &mut self,
+        name: impl Into<String>,
+        hook: impl crate::api::hooks::SessionHook + 'static,
+    ) {
+        self.session.add_hook(name, hook)
+    }
+
+    /// Remove a hook by name. Returns true if it existed.
+    pub fn remove_hook(&mut self, name: &str) -> bool {
+        self.session.remove_hook(name)
+    }
+
+    /// List names of all registered hooks.
+    pub fn list_hooks(&self) -> Vec<String> {
+        self.session.list_hooks()
+    }
+
+    /// Remove all hooks.
+    pub fn clear_hooks(&mut self) {
+        self.session.clear_hooks()
     }
 
     // ── Version Pinning ──────────────────────────────────────────────
@@ -233,16 +219,6 @@ impl<'a> SessionSync<'a> {
         self.rt.block_on(self.session.refresh())
     }
 
-    // ── Planning & Introspection ──────────────────────────────────────
-
-    /// Explain a Locy program without executing it.
-    pub fn explain_locy(
-        &self,
-        program: &str,
-    ) -> Result<crate::api::locy_result::LocyExplainOutput> {
-        self.session.explain_locy(program)
-    }
-
     // ── Prepared Statements ──────────────────────────────────────────
 
     /// Prepare a Cypher query for repeated execution.
@@ -252,20 +228,14 @@ impl<'a> SessionSync<'a> {
 
     /// Prepare a Locy program for repeated evaluation.
     pub fn prepare_locy(&self, program: &str) -> Result<crate::api::prepared::PreparedLocy> {
-        self.session.prepare_locy(program)
+        self.rt.block_on(self.session.prepare_locy(program))
     }
 
     // ── Scoped Parameters ─────────────────────────────────────────────
 
-    /// Set a session-scoped parameter.
-    pub fn set<K: Into<String>, V: Into<Value>>(&mut self, key: K, value: V) -> &mut Self {
-        self.session.set(key, value);
-        self
-    }
-
-    /// Get a session-scoped parameter.
-    pub fn get(&self, key: &str) -> Option<&Value> {
-        self.session.get(key)
+    /// Access the session-scoped parameter store.
+    pub fn params(&self) -> crate::api::session::Params<'_> {
+        self.session.params()
     }
 
     // ── Lifecycle & Observability ─────────────────────────────────────
@@ -332,33 +302,6 @@ impl<'s, 'a> QueryBuilderSync<'s, 'a> {
     /// Execute the query and return the first row, or `None` if empty.
     pub fn fetch_one(self) -> Result<Option<Row>> {
         self.rt.block_on(self.inner.fetch_one())
-    }
-}
-
-// ── ProfileBuilderSync ──────────────────────────────────────────────────
-
-/// Blocking wrapper around [`ProfileBuilder`].
-pub struct ProfileBuilderSync<'s, 'a> {
-    inner: ProfileBuilder<'s>,
-    rt: &'a tokio::runtime::Runtime,
-}
-
-impl<'s, 'a> ProfileBuilderSync<'s, 'a> {
-    /// Bind a parameter to the profiled query.
-    pub fn param<K: Into<String>, V: Into<Value>>(mut self, key: K, value: V) -> Self {
-        self.inner = self.inner.param(key, value);
-        self
-    }
-
-    /// Bind multiple parameters from an iterator.
-    pub fn params<'p>(mut self, params: impl IntoIterator<Item = (&'p str, Value)>) -> Self {
-        self.inner = self.inner.params(params);
-        self
-    }
-
-    /// Execute the profiled query and return results with profiling output.
-    pub fn run(self) -> Result<(QueryResult, ProfileOutput)> {
-        self.rt.block_on(self.inner.run())
     }
 }
 
@@ -472,7 +415,7 @@ impl<'a> TransactionSync<'a> {
 
     /// Prepare a Locy program for repeated evaluation.
     pub fn prepare_locy(&self, program: &str) -> Result<crate::api::prepared::PreparedLocy> {
-        self.tx.prepare_locy(program)
+        self.rt.block_on(self.tx.prepare_locy(program))
     }
 
     pub fn commit(self) -> Result<CommitResult> {

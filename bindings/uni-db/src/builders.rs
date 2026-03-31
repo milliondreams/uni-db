@@ -586,26 +586,10 @@ pub struct Session {
 
 #[pymethods]
 impl Session {
-    /// Set a session-scoped parameter.
-    fn set<'py>(
-        mut slf: PyRefMut<'py, Self>,
-        key: String,
-        value: Py<PyAny>,
-    ) -> PyResult<PyRefMut<'py, Self>> {
-        let py = slf.py();
-        let val = convert::py_object_to_value(py, &value)?;
-        slf.inner.set(key, val);
-        Ok(slf)
-    }
-
-    /// Get a session-scoped parameter.
-    fn get(&self, py: Python, key: &str) -> PyResult<Option<Py<PyAny>>> {
-        match self.inner.get(key) {
-            Some(v) => {
-                let py_val = convert::value_to_py(py, v)?;
-                Ok(Some(py_val))
-            }
-            None => Ok(None),
+    /// Access the session-scoped parameter store.
+    fn params(&self) -> crate::sync_api::PyParams {
+        crate::sync_api::PyParams {
+            inner: self.inner.params().clone_store_arc(),
         }
     }
 
@@ -650,9 +634,24 @@ impl Session {
         self.inner.id()
     }
 
-    /// Add a session hook (Python object with optional before_query/after_query/before_commit/after_commit methods).
-    fn add_hook(&mut self, hook: Py<PyAny>) {
-        self.inner.add_hook(PySessionHook { py_obj: hook });
+    /// Add a named session hook.
+    fn add_hook(&mut self, name: &str, hook: Py<PyAny>) {
+        self.inner.add_hook(name, PySessionHook { py_obj: hook });
+    }
+
+    /// Remove a hook by name.
+    fn remove_hook(&mut self, name: &str) -> bool {
+        self.inner.remove_hook(name)
+    }
+
+    /// List names of all registered hooks.
+    fn list_hooks(&self) -> Vec<String> {
+        self.inner.list_hooks()
+    }
+
+    /// Remove all hooks.
+    fn clear_hooks(&mut self) {
+        self.inner.clear_hooks();
     }
 
     /// Get session capabilities.
@@ -714,44 +713,6 @@ impl Session {
     ///
     /// Returns a typed `ExplainOutput` with `.plan_text`, `.warnings`, `.cost_estimates`,
     /// `.index_usage`, `.suggestions`.
-    fn explain(&self, py: Python, cypher: &str) -> PyResult<crate::types::PyExplainOutput> {
-        let output = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(self.inner.explain(cypher))
-            .map_err(crate::exceptions::uni_error_to_pyerr)?;
-        convert::explain_output_to_py_class(py, output)
-    }
-
-    /// Explain a Locy program's evaluation plan.
-    ///
-    /// Returns a typed `LocyExplainOutput`.
-    fn explain_locy(
-        &self,
-        _py: Python,
-        program: &str,
-    ) -> PyResult<crate::types::PyLocyExplainOutput> {
-        let result = self
-            .inner
-            .explain_locy(program)
-            .map_err(crate::exceptions::uni_error_to_pyerr)?;
-        Ok(convert::locy_explain_to_py_class(result))
-    }
-
-    /// Profile a query with operator-level statistics.
-    ///
-    /// Returns `(QueryResult, ProfileOutput)`.
-    fn profile(
-        &self,
-        py: Python,
-        cypher: &str,
-    ) -> PyResult<(crate::types::PyQueryResult, crate::types::PyProfileOutput)> {
-        let (results, profile) = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(self.inner.profile(cypher))
-            .map_err(crate::exceptions::uni_error_to_pyerr)?;
-        let query_result = convert::query_result_to_py_class(py, results)?;
-        let profile_output = convert::profile_output_to_py_class(py, profile)?;
-        Ok((query_result, profile_output))
-    }
-
     /// Compile a Locy program without executing it.
     fn compile_locy(&self, program: &str) -> PyResult<crate::types::PyCompiledProgram> {
         let compiled = self
@@ -780,59 +741,7 @@ impl Session {
         }
     }
 
-    /// Set multiple session-scoped parameters at once.
-    fn set_all(&mut self, py: Python, params: HashMap<String, Py<PyAny>>) -> PyResult<()> {
-        for (k, v) in params {
-            let val = convert::py_object_to_value(py, &v)?;
-            self.inner.set(k, val);
-        }
-        Ok(())
-    }
-
     /// Register a user-defined function callable from Cypher/Locy.
-    fn register_function(&self, py: Python, name: &str, func: Py<PyAny>) -> PyResult<()> {
-        // Wrap the Python callable in a Send+Sync struct.
-        struct PyUdfWrapper {
-            py_obj: Py<PyAny>,
-        }
-        // Safety: Py<PyAny> is reference-counted and GIL-independent.
-        // All access goes through Python::attach.
-        unsafe impl Send for PyUdfWrapper {}
-        unsafe impl Sync for PyUdfWrapper {}
-
-        let wrapper = PyUdfWrapper {
-            py_obj: func.clone_ref(py),
-        };
-        self.inner
-            .register_function(name, move |args: &[::uni_db::Value]| {
-                Python::attach(|py| {
-                    let py_args: Vec<Py<PyAny>> = args
-                        .iter()
-                        .map(|v| convert::value_to_py(py, v))
-                        .collect::<PyResult<Vec<_>>>()
-                        .map_err(|e| {
-                            uni_common::UniError::Internal(anyhow::anyhow!(
-                                "UDF arg conversion: {}",
-                                e
-                            ))
-                        })?;
-                    let py_list = pyo3::types::PyList::new(py, &py_args).map_err(|e| {
-                        uni_common::UniError::Internal(anyhow::anyhow!("UDF list creation: {}", e))
-                    })?;
-                    let result = wrapper.py_obj.call1(py, (py_list,)).map_err(|e| {
-                        uni_common::UniError::Internal(anyhow::anyhow!("UDF call: {}", e))
-                    })?;
-                    convert::py_object_to_value(py, &result).map_err(|e| {
-                        uni_common::UniError::Internal(anyhow::anyhow!(
-                            "UDF result conversion: {}",
-                            e
-                        ))
-                    })
-                })
-            })
-            .map_err(crate::exceptions::uni_error_to_pyerr)
-    }
-
     /// Get a cancellation token for this session.
     fn cancellation_token(&self) -> crate::types::PyCancellationToken {
         crate::types::PyCancellationToken {
@@ -896,45 +805,6 @@ impl Session {
         }
     }
 
-    /// Create a builder for parameterized profile.
-    fn profile_with(slf: Py<Self>, cypher: &str) -> SessionProfileBuilder {
-        SessionProfileBuilder {
-            session: slf,
-            cypher: cypher.to_string(),
-            params: HashMap::new(),
-        }
-    }
-
-    /// Create a cursor-based query for streaming large result sets.
-    #[pyo3(signature = (cypher, params=None))]
-    fn query_cursor(
-        &self,
-        py: Python,
-        cypher: &str,
-        params: Option<HashMap<String, Py<PyAny>>>,
-    ) -> PyResult<super::sync_api::QueryCursor> {
-        let cursor = if let Some(p) = params {
-            let mut builder = self.inner.query_with(cypher);
-            for (k, v) in p {
-                let val = convert::py_object_to_value(py, &v)?;
-                builder = builder.param(&k, val);
-            }
-            pyo3_async_runtimes::tokio::get_runtime()
-                .block_on(builder.cursor())
-                .map_err(crate::exceptions::uni_error_to_pyerr)?
-        } else {
-            pyo3_async_runtimes::tokio::get_runtime()
-                .block_on(self.inner.query_cursor(cypher))
-                .map_err(crate::exceptions::uni_error_to_pyerr)?
-        };
-        let columns = cursor.columns().to_vec();
-        Ok(super::sync_api::QueryCursor {
-            cursor: std::sync::Mutex::new(Some(cursor)),
-            buffer: std::sync::Mutex::new(std::collections::VecDeque::new()),
-            columns,
-        })
-    }
-
     /// Check if this session is pinned to a specific version.
     fn is_pinned(&self) -> bool {
         self.inner.is_pinned()
@@ -942,9 +812,8 @@ impl Session {
 
     /// Prepare a Locy program for repeated execution.
     fn prepare_locy(&self, program: &str) -> PyResult<crate::types::PyPreparedLocy> {
-        let prepared = self
-            .inner
-            .prepare_locy(program)
+        let prepared = pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(self.inner.prepare_locy(program))
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
         Ok(crate::types::PyPreparedLocy {
             inner: std::sync::Mutex::new(prepared),
@@ -1103,6 +972,35 @@ impl SessionQueryBuilder {
             columns,
         })
     }
+
+    /// Explain the query plan without executing it.
+    fn explain(&self, py: Python) -> PyResult<crate::types::PyExplainOutput> {
+        let session = self.session.borrow(py);
+        let builder = session.inner.query_with(&self.cypher);
+        let output = pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(builder.explain())
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
+        convert::explain_output_to_py_class(py, output)
+    }
+
+    /// Profile the query execution, returning results with profiling output.
+    fn profile(
+        &self,
+        py: Python,
+    ) -> PyResult<(crate::types::PyQueryResult, crate::types::PyProfileOutput)> {
+        let session = self.session.borrow(py);
+        let mut builder = session.inner.query_with(&self.cypher);
+        for (k, v) in &self.params {
+            let val = convert::py_object_to_value(py, v)?;
+            builder = builder.param(k, val);
+        }
+        let (results, profile) = pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(builder.profile())
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
+        let query_result = convert::query_result_to_py_class(py, results)?;
+        let profile_output = convert::profile_output_to_py_class(py, profile)?;
+        Ok((query_result, profile_output))
+    }
 }
 
 /// Builder for Locy evaluation on a Session.
@@ -1195,41 +1093,15 @@ impl SessionLocyBuilder {
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
         convert::locy_result_to_py_class(py, result)
     }
-}
 
-/// Builder for profiling on a Session.
-#[pyclass(name = "ProfileBuilder")]
-pub struct SessionProfileBuilder {
-    pub(crate) session: Py<Session>,
-    pub(crate) cypher: String,
-    pub(crate) params: HashMap<String, Py<PyAny>>,
-}
-
-#[pymethods]
-impl SessionProfileBuilder {
-    /// Bind a parameter.
-    fn param(mut slf: PyRefMut<'_, Self>, name: String, value: Py<PyAny>) -> PyRefMut<'_, Self> {
-        slf.params.insert(name, value);
-        slf
-    }
-
-    /// Execute the profile, returning `(QueryResult, ProfileOutput)`.
-    fn run(
-        &self,
-        py: Python,
-    ) -> PyResult<(crate::types::PyQueryResult, crate::types::PyProfileOutput)> {
+    /// Explain the Locy program without executing it.
+    fn explain(&self, py: Python) -> PyResult<crate::types::PyLocyExplainOutput> {
         let session = self.session.borrow(py);
-        let mut builder = session.inner.profile_with(&self.cypher);
-        for (k, v) in &self.params {
-            let val = convert::py_object_to_value(py, v)?;
-            builder = builder.param(k, val);
-        }
-        let (results, profile) = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(builder.run())
+        let builder = session.inner.locy_with(&self.program);
+        let result = builder
+            .explain()
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
-        let query_result = convert::query_result_to_py_class(py, results)?;
-        let profile_output = convert::profile_output_to_py_class(py, profile)?;
-        Ok((query_result, profile_output))
+        Ok(convert::locy_explain_to_py_class(result))
     }
 }
 
@@ -1872,12 +1744,16 @@ impl SessionTemplateBuilder {
         Ok(slf)
     }
 
-    /// Attach a hook.
-    fn hook<'py>(mut slf: PyRefMut<'py, Self>, hook: Py<PyAny>) -> PyResult<PyRefMut<'py, Self>> {
+    /// Attach a named hook.
+    fn hook<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        name: String,
+        hook: Py<PyAny>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
         let builder = slf.inner.take().ok_or_else(|| {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Builder already consumed")
         })?;
-        slf.inner = Some(builder.hook(PySessionHook { py_obj: hook }));
+        slf.inner = Some(builder.hook(name, PySessionHook { py_obj: hook }));
         Ok(slf)
     }
 

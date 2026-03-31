@@ -147,7 +147,7 @@ pub struct Session {
     /// (live) db reference so `refresh()` can restore it.
     original_db: Option<Arc<UniInner>>,
     id: String,
-    params: HashMap<String, Value>,
+    params: Arc<std::sync::RwLock<HashMap<String, Value>>>,
     rule_registry: Arc<std::sync::RwLock<LocyRuleRegistry>>,
     /// Mutual exclusion for write contexts (transaction, bulk writer).
     /// Only one write context can be active per session.
@@ -163,8 +163,8 @@ pub struct Session {
     plan_cache: std::sync::Mutex<PlanCache>,
     /// Atomic plan cache hit/miss counters.
     plan_cache_metrics: Arc<PlanCacheMetrics>,
-    /// Session-level hooks for query/commit interception.
-    pub(crate) hooks: Vec<Arc<dyn SessionHook>>,
+    /// Session-level hooks for query/commit interception, keyed by name.
+    pub(crate) hooks: HashMap<String, Arc<dyn SessionHook>>,
     /// Default query timeout (from template or explicit configuration).
     pub(crate) query_timeout: Option<Duration>,
     /// Default transaction timeout (from template or explicit configuration).
@@ -185,7 +185,7 @@ impl Session {
             db,
             original_db: None,
             id: Uuid::new_v4().to_string(),
-            params: HashMap::new(),
+            params: Arc::new(std::sync::RwLock::new(HashMap::new())),
             rule_registry: Arc::new(std::sync::RwLock::new(session_registry)),
             active_write_guard: Arc::new(AtomicBool::new(false)),
             metrics_inner: Arc::new(SessionMetricsInner::new()),
@@ -196,7 +196,7 @@ impl Session {
                 hits: AtomicU64::new(0),
                 misses: AtomicU64::new(0),
             }),
-            hooks: Vec::new(),
+            hooks: HashMap::new(),
             query_timeout: None,
             transaction_timeout: None,
         }
@@ -207,7 +207,7 @@ impl Session {
         db: Arc<UniInner>,
         params: HashMap<String, Value>,
         rule_registry: LocyRuleRegistry,
-        hooks: Vec<Arc<dyn SessionHook>>,
+        hooks: HashMap<String, Arc<dyn SessionHook>>,
         query_timeout: Option<Duration>,
         transaction_timeout: Option<Duration>,
     ) -> Self {
@@ -217,7 +217,7 @@ impl Session {
             db,
             original_db: None,
             id: Uuid::new_v4().to_string(),
-            params,
+            params: Arc::new(std::sync::RwLock::new(params)),
             rule_registry: Arc::new(std::sync::RwLock::new(rule_registry)),
             active_write_guard: Arc::new(AtomicBool::new(false)),
             metrics_inner: Arc::new(SessionMetricsInner::new()),
@@ -236,28 +236,11 @@ impl Session {
 
     // ── Scoped Parameters ─────────────────────────────────────────────
 
-    /// Set a session-scoped parameter. Available to all queries in this session.
-    pub fn set<K: Into<String>, V: Into<Value>>(&mut self, key: K, value: V) -> &mut Self {
-        self.params.insert(key.into(), value.into());
-        self
-    }
-
-    /// Get a session-scoped parameter.
-    pub fn get(&self, key: &str) -> Option<&Value> {
-        self.params.get(key)
-    }
-
-    /// Set multiple session-scoped parameters.
-    pub fn set_all<I, K, V>(&mut self, params: I) -> &mut Self
-    where
-        I: IntoIterator<Item = (K, V)>,
-        K: Into<String>,
-        V: Into<Value>,
-    {
-        for (k, v) in params {
-            self.params.insert(k.into(), v.into());
+    /// Access the session-scoped parameter store.
+    pub fn params(&self) -> Params<'_> {
+        Params {
+            store: &self.params,
         }
-        self
     }
 
     // ── Cypher Reads ──────────────────────────────────────────────────
@@ -301,37 +284,6 @@ impl Session {
         }
     }
 
-    /// Execute a query returning a cursor for streaming results.
-    #[instrument(skip(self), fields(session_id = %self.id))]
-    pub async fn query_cursor(&self, cypher: &str) -> Result<QueryCursor> {
-        let params = self.merge_params(HashMap::new());
-        self.db.execute_cursor_internal(cypher, params).await
-    }
-
-    // ── Planning & Introspection ──────────────────────────────────────
-
-    /// Explain a Cypher query plan without executing it.
-    #[instrument(skip(self), fields(session_id = %self.id))]
-    pub async fn explain(&self, cypher: &str) -> Result<ExplainOutput> {
-        self.db.explain_internal(cypher).await
-    }
-
-    /// Profile a Cypher query execution.
-    #[instrument(skip(self), fields(session_id = %self.id))]
-    pub async fn profile(&self, cypher: &str) -> Result<(QueryResult, ProfileOutput)> {
-        let params = self.merge_params(HashMap::new());
-        self.db.profile_internal(cypher, params).await
-    }
-
-    /// Profile a Cypher query with a builder for parameters.
-    pub fn profile_with(&self, cypher: &str) -> ProfileBuilder<'_> {
-        ProfileBuilder {
-            session: self,
-            cypher: cypher.to_string(),
-            params: HashMap::new(),
-        }
-    }
-
     // ── Locy Evaluation ───────────────────────────────────────────────
 
     /// Evaluate a Locy program with default configuration.
@@ -343,22 +295,6 @@ impl Session {
             .locy_evaluations
             .fetch_add(1, Ordering::Relaxed);
         result
-    }
-
-    /// Explain a Locy program without executing it.
-    ///
-    /// Compiles the program and returns plan introspection data (strata,
-    /// rule names, recursion info, compiler warnings). No data is read or
-    /// written — this is a pure CPU operation.
-    #[instrument(skip(self), fields(session_id = %self.id))]
-    pub fn explain_locy(
-        &self,
-        program: &str,
-    ) -> Result<crate::api::locy_result::LocyExplainOutput> {
-        let compiled = self.compile_locy(program)?;
-        Ok(crate::api::locy_result::LocyExplainOutput::from_compiled(
-            &compiled,
-        ))
     }
 
     /// Evaluate a Locy program with parameters using a builder.
@@ -508,7 +444,7 @@ impl Session {
 
     /// Prepare a Locy program for repeated evaluation.
     #[instrument(skip(self), fields(session_id = %self.id))]
-    pub fn prepare_locy(&self, program: &str) -> Result<crate::api::prepared::PreparedLocy> {
+    pub async fn prepare_locy(&self, program: &str) -> Result<crate::api::prepared::PreparedLocy> {
         crate::api::prepared::PreparedLocy::new(
             self.db.clone(),
             self.rule_registry.clone(),
@@ -518,9 +454,24 @@ impl Session {
 
     // ── Hooks ─────────────────────────────────────────────────────────
 
-    /// Add a session hook for query/commit interception.
-    pub fn add_hook(&mut self, hook: impl SessionHook + 'static) {
-        self.hooks.push(Arc::new(hook));
+    /// Add a named session hook for query/commit interception.
+    pub fn add_hook(&mut self, name: impl Into<String>, hook: impl SessionHook + 'static) {
+        self.hooks.insert(name.into(), Arc::new(hook));
+    }
+
+    /// Remove a hook by name. Returns true if it existed.
+    pub fn remove_hook(&mut self, name: &str) -> bool {
+        self.hooks.remove(name).is_some()
+    }
+
+    /// List names of all registered hooks.
+    pub fn list_hooks(&self) -> Vec<String> {
+        self.hooks.keys().cloned().collect()
+    }
+
+    /// Remove all hooks.
+    pub fn clear_hooks(&mut self) {
+        self.hooks.clear();
     }
 
     /// Run before-query hooks. Returns `Err(HookRejected)` if any hook rejects.
@@ -539,7 +490,7 @@ impl Session {
             query_type,
             params: params.clone(),
         };
-        for hook in &self.hooks {
+        for hook in self.hooks.values() {
             hook.before_query(&ctx)?;
         }
         Ok(())
@@ -562,7 +513,7 @@ impl Session {
             query_type,
             params: params.clone(),
         };
-        for hook in &self.hooks {
+        for hook in self.hooks.values() {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 hook.after_query(&ctx, metrics);
             }));
@@ -584,39 +535,6 @@ impl Session {
     pub fn watch_with(&self) -> crate::api::notifications::WatchBuilder {
         let rx = self.db.commit_tx.subscribe();
         crate::api::notifications::WatchBuilder::new(rx)
-    }
-
-    // ── Custom Functions ──────────────────────────────────────────────
-
-    /// Register a custom scalar function available to Cypher queries.
-    ///
-    /// The function is registered at the database level and is visible to
-    /// all sessions sharing the same database instance.
-    ///
-    /// **Note:** The spec declares `&mut self`, but the implementation uses `&self`
-    /// with interior mutability (`RwLock`-protected registry). This is intentional:
-    /// `Session` is shared via `Arc` in the Python bindings and concurrent access
-    /// patterns, so requiring `&mut self` would be impractical.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// session.register_function("double", |args| {
-    ///     let n = args[0].as_i64().unwrap_or(0);
-    ///     Ok(Value::Int(n * 2))
-    /// })?;
-    /// let result = session.query("RETURN double(21) AS val").await?;
-    /// ```
-    #[instrument(skip(self, func), fields(session_id = %self.id))]
-    pub fn register_function<F>(&self, name: &str, func: F) -> Result<()>
-    where
-        F: Fn(&[Value]) -> Result<Value> + Send + Sync + 'static,
-    {
-        let mut registry = self.db.custom_functions.write().map_err(|_| {
-            UniError::Internal(anyhow::anyhow!("custom function registry lock poisoned"))
-        })?;
-        registry.register(name.to_string(), std::sync::Arc::new(func));
-        Ok(())
     }
 
     // ── Lifecycle & Observability ──────────────────────────────────────
@@ -760,8 +678,9 @@ impl Session {
         &self,
         mut query_params: HashMap<String, Value>,
     ) -> HashMap<String, Value> {
-        if !self.params.is_empty() {
-            let session_map: HashMap<String, Value> = self.params.clone();
+        let session_params = self.params.read().unwrap();
+        if !session_params.is_empty() {
+            let session_map: HashMap<String, Value> = session_params.clone();
             if let Some(Value::Map(existing)) = query_params.get_mut("session") {
                 for (k, v) in session_map {
                     existing.entry(k).or_insert(v);
@@ -771,6 +690,53 @@ impl Session {
             }
         }
         query_params
+    }
+}
+
+/// Facade for session-scoped parameters.
+///
+/// Obtained via `session.params()`.
+pub struct Params<'a> {
+    store: &'a Arc<std::sync::RwLock<HashMap<String, Value>>>,
+}
+
+impl<'a> Params<'a> {
+    /// Set a parameter.
+    pub fn set<K: Into<String>, V: Into<Value>>(&self, key: K, value: V) {
+        self.store.write().unwrap().insert(key.into(), value.into());
+    }
+
+    /// Get a parameter value by key.
+    pub fn get(&self, key: &str) -> Option<Value> {
+        self.store.read().unwrap().get(key).cloned()
+    }
+
+    /// Remove a parameter. Returns the previous value if it existed.
+    pub fn unset(&self, key: &str) -> Option<Value> {
+        self.store.write().unwrap().remove(key)
+    }
+
+    /// Get a snapshot of all parameters.
+    pub fn get_all(&self) -> HashMap<String, Value> {
+        self.store.read().unwrap().clone()
+    }
+
+    /// Set multiple parameters.
+    pub fn set_all<I, K, V>(&self, params: I)
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<Value>,
+    {
+        let mut store = self.store.write().unwrap();
+        for (k, v) in params {
+            store.insert(k.into(), v.into());
+        }
+    }
+
+    /// Clone the underlying store Arc for use in Python bindings.
+    pub fn clone_store_arc(&self) -> Arc<std::sync::RwLock<HashMap<String, Value>>> {
+        self.store.clone()
     }
 }
 
@@ -872,32 +838,14 @@ impl<'a> QueryBuilder<'a> {
             .execute_cursor_internal_with_config(&self.cypher, params, db_config)
             .await
     }
-}
 
-/// Builder for profiling a Cypher query with parameters.
-pub struct ProfileBuilder<'a> {
-    session: &'a Session,
-    cypher: String,
-    params: HashMap<String, Value>,
-}
-
-impl<'a> ProfileBuilder<'a> {
-    /// Bind a parameter to the profiled query.
-    pub fn param<K: Into<String>, V: Into<Value>>(mut self, key: K, value: V) -> Self {
-        self.params.insert(key.into(), value.into());
-        self
+    /// Explain the query plan without executing it.
+    pub async fn explain(self) -> Result<ExplainOutput> {
+        self.session.db.explain_internal(&self.cypher).await
     }
 
-    /// Bind multiple parameters from an iterator.
-    pub fn params<'p>(mut self, params: impl IntoIterator<Item = (&'p str, Value)>) -> Self {
-        for (k, v) in params {
-            self.params.insert(k.to_string(), v);
-        }
-        self
-    }
-
-    /// Execute the profiled query and return results with profiling output.
-    pub async fn run(self) -> Result<(QueryResult, ProfileOutput)> {
+    /// Profile the query execution, returning results with profiling output.
+    pub async fn profile(self) -> Result<(QueryResult, ProfileOutput)> {
         let params = self.session.merge_params(self.params);
         self.session.db.profile_internal(&self.cypher, params).await
     }

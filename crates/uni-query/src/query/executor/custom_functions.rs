@@ -48,6 +48,11 @@ impl CustomFunctionRegistry {
         self.functions.iter().map(|(k, v)| (k.as_str(), v))
     }
 
+    /// Remove a custom function by name. Returns true if it existed.
+    pub fn remove(&mut self, name: &str) -> bool {
+        self.functions.remove(&name.to_uppercase()).is_some()
+    }
+
     /// Returns `true` if no functions are registered.
     pub fn is_empty(&self) -> bool {
         self.functions.is_empty()

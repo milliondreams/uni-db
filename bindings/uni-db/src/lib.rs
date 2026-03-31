@@ -35,6 +35,7 @@ fn _uni_db(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<sync_api::PyRuleRegistry>()?;
     m.add_class::<sync_api::PyCompaction>()?;
     m.add_class::<sync_api::PyIndexes>()?;
+    m.add_class::<sync_api::PyParams>()?;
     m.add_class::<builders::DatabaseBuilder>()?;
     m.add_class::<sync_api::Transaction>()?;
 
@@ -51,7 +52,6 @@ fn _uni_db(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Session builders
     m.add_class::<builders::SessionQueryBuilder>()?;
     m.add_class::<builders::SessionLocyBuilder>()?;
-    m.add_class::<builders::SessionProfileBuilder>()?;
     m.add_class::<builders::PyTransactionBuilder>()?;
 
     // Transaction builders
@@ -145,7 +145,6 @@ fn _uni_db(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Async session/transaction builders
     m.add_class::<async_api::AsyncSessionQueryBuilder>()?;
     m.add_class::<async_api::AsyncSessionLocyBuilder>()?;
-    m.add_class::<async_api::AsyncSessionProfileBuilder>()?;
     m.add_class::<async_api::AsyncTxQueryBuilder>()?;
     m.add_class::<async_api::AsyncTxExecuteBuilder>()?;
     m.add_class::<async_api::AsyncTxLocyBuilder>()?;

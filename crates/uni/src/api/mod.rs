@@ -10,6 +10,7 @@ pub mod appender;
 pub mod builder;
 pub mod bulk;
 pub mod compaction;
+pub mod functions;
 pub mod hooks;
 pub mod impl_locy;
 pub mod impl_query;
@@ -772,6 +773,13 @@ impl Uni {
     /// Access index management operations.
     pub fn indexes(&self) -> indexes::Indexes<'_> {
         indexes::Indexes { inner: &self.inner }
+    }
+
+    // ── Custom Functions ──────────────────────────────────────────────
+
+    /// Access custom Cypher function management.
+    pub fn functions(&self) -> functions::Functions<'_> {
+        functions::Functions { inner: &self.inner }
     }
 
     /// Shutdown the database gracefully, flushing pending data and stopping background tasks.

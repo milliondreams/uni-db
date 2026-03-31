@@ -319,7 +319,7 @@ async fn test_register_custom_function() -> Result<()> {
     let db = Uni::in_memory().build().await?;
     let session = db.session();
 
-    session.register_function("double", |args| {
+    db.functions().register("double", |args| {
         let n = args.first().and_then(|v| v.as_i64()).unwrap_or(0);
         Ok(Value::Int(n * 2))
     })?;

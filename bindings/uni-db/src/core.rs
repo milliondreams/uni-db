@@ -113,21 +113,6 @@ pub async fn execute_with_params_core(
     Ok(affected)
 }
 
-/// Explain a query plan without executing.
-pub async fn explain_core(db: &Uni, cypher: &str) -> Result<ExplainOutput, UniError> {
-    let session = db.session();
-    session.explain(cypher).await
-}
-
-/// Profile query execution with operator-level statistics.
-pub async fn profile_core(
-    db: &Uni,
-    cypher: &str,
-) -> Result<(QueryResult, ProfileOutput), UniError> {
-    let session = db.session();
-    session.profile(cypher).await
-}
-
 /// Flush all uncommitted changes to persistent storage.
 pub async fn flush_core(db: &Uni) -> Result<(), UniError> {
     db.flush().await

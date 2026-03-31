@@ -160,6 +160,17 @@ impl<'a> LocyBuilder<'a> {
         )
         .await
     }
+
+    /// Explain the program without executing it.
+    ///
+    /// Compiles the program and returns plan introspection data (strata,
+    /// rule names, recursion info, compiler warnings).
+    pub fn explain(self) -> Result<crate::api::locy_result::LocyExplainOutput> {
+        let compiled = self.session.compile_locy(&self.program)?;
+        Ok(crate::api::locy_result::LocyExplainOutput::from_compiled(
+            &compiled,
+        ))
+    }
 }
 
 /// Builder for constructing and evaluating Locy programs (Transaction-level).

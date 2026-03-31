@@ -25,7 +25,8 @@ async fn test_query_cursor_streaming() -> Result<()> {
     // Query with cursor
     let mut cursor = db
         .session()
-        .query_cursor("MATCH (p:Person) RETURN p.name ORDER BY p.name")
+        .query_with("MATCH (p:Person) RETURN p.name ORDER BY p.name")
+        .cursor()
         .await?;
 
     assert_eq!(cursor.columns(), &["p.name"]);
@@ -64,7 +65,8 @@ async fn test_query_cursor_streaming() -> Result<()> {
 
     let mut cursor2 = db2
         .session()
-        .query_cursor("MATCH (p:Person) RETURN p.name")
+        .query_with("MATCH (p:Person) RETURN p.name")
+        .cursor()
         .await?;
     let first_batch = cursor2.next_batch().await.unwrap()?;
     assert_eq!(first_batch.len(), 10);

@@ -323,9 +323,11 @@ impl AsyncDatabase {
     fn session(&self) -> AsyncSession {
         let session = self.inner.session();
         let rule_reg = session.rules().clone_registry_arc();
+        let params_arc = session.params().clone_store_arc();
         AsyncSession {
             inner: Arc::new(tokio::sync::Mutex::new(session)),
             rule_registry_arc: rule_reg,
+            params_arc,
         }
     }
 
@@ -1131,6 +1133,7 @@ impl AsyncTransaction {
             })?;
             let prepared = tx
                 .prepare_locy(&program)
+                .await
                 .map_err(crate::exceptions::uni_error_to_pyerr)?;
             Ok(crate::types::PyPreparedLocy {
                 inner: std::sync::Mutex::new(prepared),
@@ -1509,63 +1512,17 @@ impl AsyncTxBulkWriterBuilder {
 pub struct AsyncSession {
     pub(crate) inner: Arc<tokio::sync::Mutex<::uni_db::Session>>,
     pub(crate) rule_registry_arc: std::sync::Arc<std::sync::RwLock<::uni_db::LocyRuleRegistry>>,
+    pub(crate) params_arc:
+        std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, ::uni_db::Value>>>,
 }
 
 #[pymethods]
 impl AsyncSession {
-    /// Set a session-scoped parameter.
-    fn set<'py>(
-        &self,
-        py: Python<'py>,
-        key: String,
-        value: Py<PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let val = convert::py_object_to_value(py, &value)?;
-        let inner = self.inner.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let mut guard = inner.lock().await;
-            guard.set(key, val);
-            Ok(())
-        })
-    }
-
-    /// Set multiple session-scoped parameters at once.
-    fn set_all<'py>(
-        &self,
-        py: Python<'py>,
-        params: HashMap<String, Py<PyAny>>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let mut rust_params = HashMap::new();
-        for (k, v) in params {
-            let val = convert::py_object_to_value(py, &v)?;
-            rust_params.insert(k, val);
+    /// Access the session-scoped parameter store.
+    fn params(&self) -> crate::sync_api::PyParams {
+        crate::sync_api::PyParams {
+            inner: self.params_arc.clone(),
         }
-        let inner = self.inner.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let mut guard = inner.lock().await;
-            for (k, v) in rust_params {
-                guard.set(k, v);
-            }
-            Ok(())
-        })
-    }
-
-    /// Get a session-scoped parameter.
-    fn get<'py>(&self, py: Python<'py>, key: String) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let guard = inner.lock().await;
-            match guard.get(&key) {
-                Some(v) => {
-                    let cloned = v.clone();
-                    Python::attach(|py| {
-                        let py_val = convert::value_to_py(py, &cloned)?;
-                        Ok(Some(py_val))
-                    })
-                }
-                None => Ok(None),
-            }
-        })
     }
 
     /// Execute a query with session variables.
@@ -1733,83 +1690,6 @@ impl AsyncSession {
         })
     }
 
-    /// Explain a query plan without executing.
-    ///
-    /// Returns a typed `ExplainOutput`.
-    fn explain<'py>(&self, py: Python<'py>, cypher: String) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let guard = inner.lock().await;
-            let output = guard
-                .explain(&cypher)
-                .await
-                .map_err(crate::exceptions::uni_error_to_pyerr)?;
-            Python::attach(|py| convert::explain_output_to_py_class(py, output))
-        })
-    }
-
-    /// Explain a Locy program's evaluation plan.
-    ///
-    /// Returns a typed `LocyExplainOutput`.
-    fn explain_locy<'py>(&self, py: Python<'py>, program: String) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
-        // explain_locy is now sync (compile-only, no I/O) — use spawn_blocking
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let result = tokio::task::spawn_blocking(move || {
-                tokio::runtime::Handle::current().block_on(async move {
-                    let guard = inner.lock().await;
-                    guard.explain_locy(&program)
-                })
-            })
-            .await
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
-            .map_err(crate::exceptions::uni_error_to_pyerr)?;
-            Ok(convert::locy_explain_to_py_class(result))
-        })
-    }
-
-    /// Profile a query with operator-level statistics.
-    ///
-    /// Returns `(QueryResult, ProfileOutput)`.
-    #[pyo3(signature = (cypher, params=None))]
-    fn profile<'py>(
-        &self,
-        py: Python<'py>,
-        cypher: String,
-        params: Option<HashMap<String, Py<PyAny>>>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let rust_params = if let Some(p) = params {
-            let mut map = HashMap::new();
-            for (k, v) in p {
-                let val = convert::py_object_to_value(py, &v)?;
-                map.insert(k, val);
-            }
-            Some(map)
-        } else {
-            None
-        };
-        let inner = self.inner.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let guard = inner.lock().await;
-            let (results, profile) = if let Some(params) = rust_params {
-                let mut builder = guard.profile_with(&cypher);
-                for (k, v) in params {
-                    builder = builder.param(k, v);
-                }
-                builder.run().await
-            } else {
-                guard.profile(&cypher).await
-            }
-            .map_err(crate::exceptions::uni_error_to_pyerr)?;
-            Python::attach(|py| {
-                let query_result = convert::query_result_to_py_class(py, results)?;
-                let profile_output = convert::profile_output_to_py_class(py, profile)?;
-                let tuple = (query_result, profile_output);
-                tuple.into_py_any(py)
-            })
-        })
-    }
-
     /// Compile a Locy program without executing it.
     fn compile_locy<'py>(&self, py: Python<'py>, program: String) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
@@ -1904,51 +1784,6 @@ impl AsyncSession {
         })
     }
 
-    /// Create a cursor-based query for streaming large result sets.
-    #[pyo3(signature = (cypher, params=None))]
-    fn query_cursor<'py>(
-        &self,
-        py: Python<'py>,
-        cypher: String,
-        params: Option<HashMap<String, Py<PyAny>>>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let rust_params = if let Some(p) = params {
-            let mut map = HashMap::new();
-            for (k, v) in p {
-                let val = convert::py_object_to_value(py, &v)?;
-                map.insert(k, val);
-            }
-            Some(map)
-        } else {
-            None
-        };
-        let inner = self.inner.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let guard = inner.lock().await;
-            let cursor = if let Some(params) = rust_params {
-                let mut builder = guard.query_with(&cypher);
-                for (k, v) in params {
-                    builder = builder.param(k, v);
-                }
-                builder
-                    .cursor()
-                    .await
-                    .map_err(crate::exceptions::uni_error_to_pyerr)?
-            } else {
-                guard
-                    .query_cursor(&cypher)
-                    .await
-                    .map_err(crate::exceptions::uni_error_to_pyerr)?
-            };
-            let columns = cursor.columns().to_vec();
-            Ok(AsyncQueryCursor {
-                cursor: Arc::new(tokio::sync::Mutex::new(Some(cursor))),
-                buffer: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
-                columns,
-            })
-        })
-    }
-
     /// Check if this session is pinned to a specific version.
     fn is_pinned<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
@@ -1965,6 +1800,7 @@ impl AsyncSession {
             let guard = inner.lock().await;
             let prepared = guard
                 .prepare_locy(&program)
+                .await
                 .map_err(crate::exceptions::uni_error_to_pyerr)?;
             Ok(crate::types::PyPreparedLocy {
                 inner: std::sync::Mutex::new(prepared),
@@ -1972,66 +1808,45 @@ impl AsyncSession {
         })
     }
 
-    /// Register a user-defined function callable from Cypher/Locy.
-    fn register_function<'py>(
+    /// Add a named session hook.
+    fn add_hook<'py>(
         &self,
         py: Python<'py>,
         name: String,
-        func: Py<PyAny>,
+        hook: Py<PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        struct PyUdfWrapper {
-            py_obj: Py<PyAny>,
-        }
-        unsafe impl Send for PyUdfWrapper {}
-        unsafe impl Sync for PyUdfWrapper {}
-
-        let wrapper = PyUdfWrapper {
-            py_obj: func.clone_ref(py),
-        };
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let guard = inner.lock().await;
-            guard
-                .register_function(&name, move |args: &[::uni_db::Value]| {
-                    Python::attach(|py| {
-                        let py_args: Vec<Py<PyAny>> = args
-                            .iter()
-                            .map(|v| crate::convert::value_to_py(py, v))
-                            .collect::<pyo3::PyResult<Vec<_>>>()
-                            .map_err(|e| {
-                                uni_common::UniError::Internal(anyhow::anyhow!(
-                                    "UDF arg conversion: {}",
-                                    e
-                                ))
-                            })?;
-                        let py_list = pyo3::types::PyList::new(py, &py_args).map_err(|e| {
-                            uni_common::UniError::Internal(anyhow::anyhow!(
-                                "UDF list creation: {}",
-                                e
-                            ))
-                        })?;
-                        let result = wrapper.py_obj.call1(py, (py_list,)).map_err(|e| {
-                            uni_common::UniError::Internal(anyhow::anyhow!("UDF call: {}", e))
-                        })?;
-                        crate::convert::py_object_to_value(py, &result).map_err(|e| {
-                            uni_common::UniError::Internal(anyhow::anyhow!(
-                                "UDF result conversion: {}",
-                                e
-                            ))
-                        })
-                    })
-                })
-                .map_err(crate::exceptions::uni_error_to_pyerr)?;
+            let mut guard = inner.lock().await;
+            guard.add_hook(name, crate::builders::PySessionHook { py_obj: hook });
             Ok(())
         })
     }
 
-    /// Add a session hook (Python object with optional before_query/after_query/before_commit/after_commit methods).
-    fn add_hook<'py>(&self, py: Python<'py>, hook: Py<PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    /// Remove a hook by name.
+    fn remove_hook<'py>(&self, py: Python<'py>, name: String) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let mut guard = inner.lock().await;
-            guard.add_hook(crate::builders::PySessionHook { py_obj: hook });
+            Ok(guard.remove_hook(&name))
+        })
+    }
+
+    /// List names of all registered hooks.
+    fn list_hooks<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let guard = inner.lock().await;
+            Ok(guard.list_hooks())
+        })
+    }
+
+    /// Remove all hooks.
+    fn clear_hooks<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let mut guard = inner.lock().await;
+            guard.clear_hooks();
             Ok(())
         })
     }
@@ -2084,15 +1899,6 @@ impl AsyncSession {
             max_iterations: None,
             locy_config: None,
             cancellation_token: None,
-        }
-    }
-
-    /// Create a profile builder with parameter binding.
-    fn profile_with(&self, cypher: &str) -> AsyncSessionProfileBuilder {
-        AsyncSessionProfileBuilder {
-            inner: self.inner.clone(),
-            cypher: cypher.to_string(),
-            params: HashMap::new(),
         }
     }
 
@@ -2916,6 +2722,54 @@ impl AsyncSessionQueryBuilder {
             })
         })
     }
+
+    /// Explain the query plan without executing it.
+    fn explain<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let mut rust_params = HashMap::new();
+        for (k, v) in &self.params {
+            let val = convert::py_object_to_value(py, v)?;
+            rust_params.insert(k.clone(), val);
+        }
+        let inner = self.inner.clone();
+        let cypher = self.cypher.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let guard = inner.lock().await;
+            let builder = guard.query_with(&cypher);
+            let output = builder
+                .explain()
+                .await
+                .map_err(crate::exceptions::uni_error_to_pyerr)?;
+            Python::attach(|py| convert::explain_output_to_py_class(py, output))
+        })
+    }
+
+    /// Profile the query execution, returning results with profiling output.
+    fn profile<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let mut rust_params = HashMap::new();
+        for (k, v) in &self.params {
+            let val = convert::py_object_to_value(py, v)?;
+            rust_params.insert(k.clone(), val);
+        }
+        let inner = self.inner.clone();
+        let cypher = self.cypher.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let guard = inner.lock().await;
+            let mut builder = guard.query_with(&cypher);
+            for (k, v) in rust_params {
+                builder = builder.param(k, v);
+            }
+            let (results, profile) = builder
+                .profile()
+                .await
+                .map_err(crate::exceptions::uni_error_to_pyerr)?;
+            Python::attach(|py| {
+                let query_result = convert::query_result_to_py_class(py, results)?;
+                let profile_output = convert::profile_output_to_py_class(py, profile)?;
+                let tuple = (query_result, profile_output);
+                tuple.into_py_any(py)
+            })
+        })
+    }
 }
 
 /// Async builder for Locy evaluation on a Session.
@@ -3026,64 +2880,22 @@ impl AsyncSessionLocyBuilder {
             Python::attach(|py| convert::locy_result_to_py_class(py, result))
         })
     }
-}
 
-/// Async builder for profiling on a Session.
-#[pyclass(name = "AsyncSessionProfileBuilder")]
-pub struct AsyncSessionProfileBuilder {
-    inner: Arc<tokio::sync::Mutex<::uni_db::Session>>,
-    cypher: String,
-    params: HashMap<String, Py<PyAny>>,
-}
-
-#[pymethods]
-impl AsyncSessionProfileBuilder {
-    /// Bind a parameter.
-    fn param(mut slf: PyRefMut<'_, Self>, name: String, value: Py<PyAny>) -> PyRefMut<'_, Self> {
-        slf.params.insert(name, value);
-        slf
-    }
-
-    /// Bind multiple parameters.
-    fn params(
-        mut slf: PyRefMut<'_, Self>,
-        params: HashMap<String, Py<PyAny>>,
-    ) -> PyRefMut<'_, Self> {
-        slf.params.extend(params);
-        slf
-    }
-
-    /// Execute and profile the query (returns awaitable (QueryResult, ProfileOutput)).
-    fn run<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let mut rust_params = HashMap::new();
-        for (k, v) in &self.params {
-            let val = convert::py_object_to_value(py, v)?;
-            rust_params.insert(k.clone(), val);
-        }
+    /// Explain the Locy program without executing it.
+    fn explain<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
-        let cypher = self.cypher.clone();
+        let program = self.program.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let guard = inner.lock().await;
-            let mut builder = guard.profile_with(&cypher);
-            for (k, v) in rust_params {
-                builder = builder.param(k, v);
-            }
-            let (results, profile) = builder
-                .run()
-                .await
-                .map_err(crate::exceptions::uni_error_to_pyerr)?;
-            Python::attach(|py| {
-                let query_result = convert::query_result_to_py_class(py, results)?;
-                let profile_output = convert::profile_output_to_py_class(py, profile)?;
-                let tuple = pyo3::types::PyTuple::new(
-                    py,
-                    [
-                        query_result.into_pyobject(py)?.into_any(),
-                        profile_output.into_pyobject(py)?.into_any(),
-                    ],
-                )?;
-                Ok(tuple.unbind().into_any())
+            let result = tokio::task::spawn_blocking(move || {
+                tokio::runtime::Handle::current().block_on(async move {
+                    let guard = inner.lock().await;
+                    guard.locy_with(&program).explain()
+                })
             })
+            .await
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
+            Ok(convert::locy_explain_to_py_class(result))
         })
     }
 }

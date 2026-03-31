@@ -294,8 +294,8 @@ impl Transaction {
     /// Prepare a Locy program for repeated execution within this transaction.
     fn prepare_locy(&self, program: &str) -> PyResult<PyPreparedLocy> {
         let tx = self.check_active()?;
-        let prepared = tx
-            .prepare_locy(program)
+        let prepared = pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(tx.prepare_locy(program))
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
         Ok(PyPreparedLocy {
             inner: std::sync::Mutex::new(prepared),
@@ -1207,5 +1207,76 @@ impl PyIndexes {
         pyo3_async_runtimes::tokio::get_runtime()
             .block_on(core::retry_index_rebuilds_core(&self.inner))
             .map_err(crate::exceptions::uni_error_to_pyerr)
+    }
+}
+
+// ============================================================================
+// Params (synchronous)
+// ============================================================================
+
+/// Facade for session-scoped parameters.
+///
+/// Obtained via `session.params()`.
+#[pyclass(name = "Params")]
+pub struct PyParams {
+    pub(crate) inner:
+        std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, uni_db::Value>>>,
+}
+
+#[pymethods]
+impl PyParams {
+    /// Set a parameter.
+    fn set(&self, py: Python, key: String, value: Py<PyAny>) -> PyResult<()> {
+        let val = convert::py_object_to_value(py, &value)?;
+        self.inner.write().unwrap().insert(key, val);
+        Ok(())
+    }
+
+    /// Get a parameter value by key.
+    fn get(&self, py: Python, key: &str) -> PyResult<Option<Py<PyAny>>> {
+        let store = self.inner.read().unwrap();
+        match store.get(key) {
+            Some(v) => {
+                let py_val = convert::value_to_py(py, v)?;
+                Ok(Some(py_val))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Remove a parameter. Returns the previous value if it existed.
+    fn unset(&self, py: Python, key: &str) -> PyResult<Option<Py<PyAny>>> {
+        let mut store = self.inner.write().unwrap();
+        match store.remove(key) {
+            Some(v) => {
+                let py_val = convert::value_to_py(py, &v)?;
+                Ok(Some(py_val))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Get a snapshot of all parameters as a dict.
+    fn get_all(&self, py: Python) -> PyResult<std::collections::HashMap<String, Py<PyAny>>> {
+        let store = self.inner.read().unwrap();
+        let mut result = std::collections::HashMap::new();
+        for (k, v) in store.iter() {
+            result.insert(k.clone(), convert::value_to_py(py, v)?);
+        }
+        Ok(result)
+    }
+
+    /// Set multiple parameters at once.
+    fn set_all(
+        &self,
+        py: Python,
+        params: std::collections::HashMap<String, Py<PyAny>>,
+    ) -> PyResult<()> {
+        let mut store = self.inner.write().unwrap();
+        for (k, v) in params {
+            let val = convert::py_object_to_value(py, &v)?;
+            store.insert(k, val);
+        }
+        Ok(())
     }
 }

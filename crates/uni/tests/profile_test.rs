@@ -35,7 +35,7 @@ async fn test_profile_basic() -> anyhow::Result<()> {
 
     // Profile query — the CLI strips "PROFILE" before calling profile()
     let clean_query = "MATCH (p:Person)-[:LIVES_IN]->(c:City) RETURN p.name, c.name";
-    let (result, profile) = db.session().profile(clean_query).await?;
+    let (result, profile) = db.session().query_with(clean_query).profile().await?;
 
     println!("Profile Stats: {:#?}", profile.runtime_stats);
 

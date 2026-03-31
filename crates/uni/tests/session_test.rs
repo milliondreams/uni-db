@@ -20,8 +20,8 @@ async fn test_session_variables() -> Result<()> {
     db.flush().await?;
 
     // Create session with scoped parameter
-    let mut session = db.session();
-    session.set("tenant_id", "A");
+    let session = db.session();
+    session.params().set("tenant_id", "A");
 
     // Query with session variable
     // $session.tenant_id should resolve to "A"

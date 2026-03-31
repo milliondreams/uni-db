@@ -606,7 +606,8 @@ async fn test_tck_match8_2_merge_optional_count() -> Result<()> {
     // Diagnostic: EXPLAIN to see logical plan
     let explain = db
         .session()
-        .explain("MATCH (a) MERGE (b) WITH * OPTIONAL MATCH (a)--(b) RETURN count(*)")
+        .query_with("MATCH (a) MERGE (b) WITH * OPTIONAL MATCH (a)--(b) RETURN count(*)")
+        .explain()
         .await?;
     eprintln!("EXPLAIN:\n{}", explain.plan_text);
 

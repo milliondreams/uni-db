@@ -45,26 +45,28 @@ async fn setup_doc_db() -> Result<Uni> {
         .apply()
         .await?;
 
-    db.execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (:Doc {title: 'Alpha', content: 'rust systems programming language', \
          embedding: [1.0, 0.0, 0.0]})",
     )
     .await?;
-    db.execute(
+    tx.execute(
         "CREATE (:Doc {title: 'Beta', content: 'python data science scripting', \
          embedding: [0.6, 0.8, 0.0]})",
     )
     .await?;
-    db.execute(
+    tx.execute(
         "CREATE (:Doc {title: 'Gamma', content: 'database storage engine systems', \
          embedding: [0.0, 0.0, 1.0]})",
     )
     .await?;
-    db.execute(
+    tx.execute(
         "CREATE (:Doc {title: 'Delta', content: 'rust memory safety programming', \
          embedding: [0.8, 0.6, 0.0]})",
     )
     .await?;
+    tx.commit().await?;
 
     db.flush().await?;
 
@@ -78,6 +80,7 @@ async fn test_similar_to_vector_vector() -> Result<()> {
     let db = setup_doc_db().await?;
 
     let result = db
+        .session()
         .query(
             "MATCH (d:Doc) \
              RETURN d.title AS title, similar_to(d.embedding, [1.0, 0.0, 0.0]) AS score \
@@ -89,7 +92,7 @@ async fn test_similar_to_vector_vector() -> Result<()> {
 
     // Check ordering: Alpha (1.0), Delta (0.8), Beta (0.6), Gamma (0.0)
     let titles: Vec<String> = result
-        .rows
+        .rows()
         .iter()
         .map(|r| r.get::<String>("title").unwrap())
         .collect();
@@ -97,7 +100,7 @@ async fn test_similar_to_vector_vector() -> Result<()> {
 
     // Check scores
     let scores: Vec<f64> = result
-        .rows
+        .rows()
         .iter()
         .map(|r| r.get::<f64>("score").unwrap())
         .collect();
@@ -131,6 +134,7 @@ async fn test_similar_to_in_where() -> Result<()> {
     let db = setup_doc_db().await?;
 
     let result = db
+        .session()
         .query(
             "MATCH (d:Doc) \
              WHERE similar_to(d.embedding, [1.0, 0.0, 0.0]) > 0.7 \
@@ -140,7 +144,7 @@ async fn test_similar_to_in_where() -> Result<()> {
         .await?;
 
     let titles: Vec<String> = result
-        .rows
+        .rows()
         .iter()
         .map(|r| r.get::<String>("title").unwrap())
         .collect();
@@ -155,6 +159,7 @@ async fn test_similar_to_in_order_by() -> Result<()> {
     let db = setup_doc_db().await?;
 
     let result = db
+        .session()
         .query(
             "MATCH (d:Doc) \
              RETURN d.title AS title \
@@ -163,7 +168,7 @@ async fn test_similar_to_in_order_by() -> Result<()> {
         .await?;
 
     let titles: Vec<String> = result
-        .rows
+        .rows()
         .iter()
         .map(|r| r.get::<String>("title").unwrap())
         .collect();
@@ -177,6 +182,7 @@ async fn test_similar_to_with_parameter() -> Result<()> {
     let db = setup_doc_db().await?;
 
     let result = db
+        .session()
         .query_with(
             "MATCH (d:Doc) \
              RETURN d.title AS title, similar_to(d.embedding, $q) AS score \
@@ -189,14 +195,14 @@ async fn test_similar_to_with_parameter() -> Result<()> {
     assert_eq!(result.len(), 4);
 
     let titles: Vec<String> = result
-        .rows
+        .rows()
         .iter()
         .map(|r| r.get::<String>("title").unwrap())
         .collect();
     assert_eq!(titles, vec!["Alpha", "Delta", "Beta", "Gamma"]);
 
     // Same scores as inline vector
-    let score0: f64 = result.rows[0].get("score")?;
+    let score0: f64 = result.rows()[0].get("score")?;
     assert!(
         (score0 - 1.0).abs() < 1e-5,
         "parameter-passed vector should give same score, got {}",
@@ -213,6 +219,7 @@ async fn test_similar_to_fts() -> Result<()> {
     let db = setup_doc_db().await?;
 
     let result = db
+        .session()
         .query(
             "MATCH (d:Doc) \
              RETURN d.title AS title, similar_to(d.content, 'rust') AS score \
@@ -222,7 +229,7 @@ async fn test_similar_to_fts() -> Result<()> {
 
     assert_eq!(result.len(), 4);
 
-    for row in &result.rows {
+    for row in result.rows() {
         let title: String = row.get("title")?;
         let score: f64 = row.get("score")?;
         assert!(
@@ -260,6 +267,7 @@ async fn test_similar_to_fts_in_where() -> Result<()> {
     let db = setup_doc_db().await?;
 
     let result = db
+        .session()
         .query(
             "MATCH (d:Doc) \
              WHERE similar_to(d.content, 'rust') > 0.0 \
@@ -269,7 +277,7 @@ async fn test_similar_to_fts_in_where() -> Result<()> {
         .await?;
 
     let titles: Vec<String> = result
-        .rows
+        .rows()
         .iter()
         .map(|r| r.get::<String>("title").unwrap())
         .collect();
@@ -291,11 +299,14 @@ async fn test_similar_to_string_no_fts_index() -> Result<()> {
         .apply()
         .await?;
 
-    db.execute("CREATE (:Doc {title: 'Hello'})").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Doc {title: 'Hello'})").await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // title has no FTS index → should error
     let err = db
+        .session()
         .query("MATCH (d:Doc) RETURN similar_to(d.title, 'hello') AS score")
         .await;
 
@@ -316,6 +327,7 @@ async fn test_similar_to_type_mismatch_fts_vector() -> Result<()> {
 
     // content has FTS index but query is a vector → should error
     let err = db
+        .session()
         .query("MATCH (d:Doc) RETURN similar_to(d.content, [1.0, 0.0, 0.0]) AS score")
         .await;
 
@@ -336,6 +348,7 @@ async fn test_similar_to_weights_length_mismatch() -> Result<()> {
 
     // 1 source (embedding) but 2 weights → should error
     let err = db
+        .session()
         .query(
             "MATCH (d:Doc) \
              RETURN similar_to(d.embedding, [1.0, 0.0, 0.0], \
@@ -361,6 +374,7 @@ async fn test_vector_similarity_still_works() -> Result<()> {
     let db = setup_doc_db().await?;
 
     let result = db
+        .session()
         .query(
             "MATCH (a:Doc), (b:Doc) \
              WHERE a.title = 'Alpha' AND b.title = 'Delta' \
@@ -369,7 +383,7 @@ async fn test_vector_similarity_still_works() -> Result<()> {
         .await?;
 
     assert_eq!(result.len(), 1);
-    let score: f64 = result.rows[0].get("score")?;
+    let score: f64 = result.rows()[0].get("score")?;
     // Alpha [1,0,0] vs Delta [0.8,0.6,0] → cosine = 0.8
     assert!(
         (0.0..=1.0).contains(&score),
@@ -386,6 +400,7 @@ async fn test_vector_similarity_matches_similar_to() -> Result<()> {
     let db = setup_doc_db().await?;
 
     let result = db
+        .session()
         .query(
             "MATCH (a:Doc), (b:Doc) \
              WHERE a.title = 'Alpha' AND b.title = 'Beta' \
@@ -395,8 +410,8 @@ async fn test_vector_similarity_matches_similar_to() -> Result<()> {
         .await?;
 
     assert_eq!(result.len(), 1);
-    let vs_score: f64 = result.rows[0].get("vs_score")?;
-    let st_score: f64 = result.rows[0].get("st_score")?;
+    let vs_score: f64 = result.rows()[0].get("vs_score")?;
+    let st_score: f64 = result.rows()[0].get("st_score")?;
 
     assert!(
         (vs_score - st_score).abs() < 1e-5,
@@ -413,6 +428,7 @@ async fn test_procedures_unchanged() -> Result<()> {
     let db = setup_doc_db().await?;
 
     let result = db
+        .session()
         .query(
             "CALL uni.vector.query('Doc', 'embedding', [1.0, 0.0, 0.0], 10) \
              YIELD node, score \
@@ -421,9 +437,9 @@ async fn test_procedures_unchanged() -> Result<()> {
         )
         .await?;
 
-    assert!(!result.rows.is_empty(), "procedure should return results");
+    assert!(!result.is_empty(), "procedure should return results");
 
-    let first_title: String = result.rows[0].get("title")?;
+    let first_title: String = result.rows()[0].get("title")?;
     assert_eq!(first_title, "Alpha", "most similar should be Alpha");
 
     Ok(())
@@ -436,8 +452,8 @@ async fn test_similar_to_in_locy_where() -> Result<()> {
     let db = setup_doc_db().await?;
 
     let result = db
-        .locy()
-        .evaluate(
+        .session()
+        .locy(
             "CREATE RULE relevant AS \
              MATCH (d:Doc) \
              WHERE similar_to(d.embedding, [1.0, 0.0, 0.0]) > 0.7 \
@@ -465,8 +481,8 @@ async fn test_similar_to_in_locy_yield() -> Result<()> {
     let db = setup_doc_db().await?;
 
     let result = db
-        .locy()
-        .evaluate(
+        .session()
+        .locy(
             "CREATE RULE scored AS \
              MATCH (d:Doc) \
              YIELD KEY d, similar_to(d.embedding, [1.0, 0.0, 0.0]) AS score",
@@ -518,20 +534,25 @@ async fn test_similar_to_in_locy_along() -> Result<()> {
         .await?;
 
     // Chain: A → B → C
-    db.execute(
-        "CREATE (a:Doc {title: 'A', embedding: [1.0, 0.0, 0.0]}), \
+    {
+        let s = db.session();
+        let tx = s.tx().await?;
+        tx.execute(
+            "CREATE (a:Doc {title: 'A', embedding: [1.0, 0.0, 0.0]}), \
          (b:Doc {title: 'B', embedding: [0.8, 0.6, 0.0]}), \
          (c:Doc {title: 'C', embedding: [0.0, 0.0, 1.0]}), \
          (a)-[:LINKS]->(b), \
          (b)-[:LINKS]->(c)",
-    )
-    .await?;
+        )
+        .await?;
+        tx.commit().await?;
+    }
     db.flush().await?;
 
     // ALONG accumulates similarity along the path
     let result = db
-        .locy()
-        .evaluate(
+        .session()
+        .locy(
             "CREATE RULE sim_path AS \
              MATCH (a:Doc)-[:LINKS]->(b:Doc) \
              ALONG score = similar_to(b.embedding, [1.0, 0.0, 0.0]) \
@@ -571,6 +592,7 @@ async fn test_similar_to_multi_source_default_rrf() -> Result<()> {
     // to avoid non-deterministic BM25 segment-level scoring that can flip
     // equally-relevant documents' scores by up to 2.4x across Tantivy segments.
     let result = db
+        .session()
         .query(
             "MATCH (d:Doc) \
              RETURN d.title AS title, \
@@ -582,12 +604,12 @@ async fn test_similar_to_multi_source_default_rrf() -> Result<()> {
     assert_eq!(result.len(), 4);
 
     let titles: Vec<String> = result
-        .rows
+        .rows()
         .iter()
         .map(|r| r.get::<String>("title").unwrap())
         .collect();
     let scores: Vec<f64> = result
-        .rows
+        .rows()
         .iter()
         .map(|r| r.get::<f64>("score").unwrap())
         .collect();
@@ -631,6 +653,7 @@ async fn test_similar_to_multi_source_weighted() -> Result<()> {
 
     // 80% vector, 20% FTS
     let result = db
+        .session()
         .query(
             "MATCH (d:Doc) \
              RETURN d.title AS title, \
@@ -643,12 +666,12 @@ async fn test_similar_to_multi_source_weighted() -> Result<()> {
     assert_eq!(result.len(), 4);
 
     let titles: Vec<String> = result
-        .rows
+        .rows()
         .iter()
         .map(|r| r.get::<String>("title").unwrap())
         .collect();
     let scores: Vec<f64> = result
-        .rows
+        .rows()
         .iter()
         .map(|r| r.get::<f64>("score").unwrap())
         .collect();
@@ -690,6 +713,7 @@ async fn test_similar_to_multi_source_weighted_fts_heavy() -> Result<()> {
 
     // Vector-heavy: 80% vector, 20% FTS
     let result_vh = db
+        .session()
         .query(
             "MATCH (d:Doc) \
              RETURN d.title AS title, \
@@ -701,6 +725,7 @@ async fn test_similar_to_multi_source_weighted_fts_heavy() -> Result<()> {
 
     // FTS-heavy: 20% vector, 80% FTS
     let result_fh = db
+        .session()
         .query(
             "MATCH (d:Doc) \
              RETURN d.title AS title, \
@@ -714,22 +739,22 @@ async fn test_similar_to_multi_source_weighted_fts_heavy() -> Result<()> {
     assert_eq!(result_fh.len(), 4);
 
     let titles_vh: Vec<String> = result_vh
-        .rows
+        .rows()
         .iter()
         .map(|r| r.get::<String>("title").unwrap())
         .collect();
     let scores_vh: Vec<f64> = result_vh
-        .rows
+        .rows()
         .iter()
         .map(|r| r.get::<f64>("score").unwrap())
         .collect();
     let titles_fh: Vec<String> = result_fh
-        .rows
+        .rows()
         .iter()
         .map(|r| r.get::<String>("title").unwrap())
         .collect();
     let scores_fh: Vec<f64> = result_fh
-        .rows
+        .rows()
         .iter()
         .map(|r| r.get::<f64>("score").unwrap())
         .collect();
@@ -765,6 +790,7 @@ async fn test_similar_to_fts_k_option() -> Result<()> {
     // Low fts_k → scores saturate faster (higher normalized scores)
     // High fts_k → scores saturate slower (lower normalized scores)
     let result = db
+        .session()
         .query(
             "MATCH (d:Doc) \
              RETURN d.title AS title, \
@@ -775,7 +801,7 @@ async fn test_similar_to_fts_k_option() -> Result<()> {
 
     assert_eq!(result.len(), 4);
 
-    for row in &result.rows {
+    for row in result.rows() {
         let title: String = row.get("title")?;
         let score_low_k: f64 = row.get("score_low_k")?;
         let score_high_k: f64 = row.get("score_high_k")?;
@@ -833,6 +859,7 @@ async fn test_similar_to_multi_source_in_where() -> Result<()> {
 
     // Multi-source fusion in WHERE clause for filtering
     let result = db
+        .session()
         .query(
             "MATCH (d:Doc) \
              WHERE similar_to([d.embedding, d.content], [[1.0, 0.0, 0.0], 'rust'], \
@@ -842,7 +869,7 @@ async fn test_similar_to_multi_source_in_where() -> Result<()> {
         .await?;
 
     let titles: Vec<String> = result
-        .rows
+        .rows()
         .iter()
         .map(|r| r.get::<String>("title").unwrap())
         .collect();
@@ -864,6 +891,7 @@ async fn test_similar_to_queries_length_mismatch() -> Result<()> {
 
     // 2 sources (embedding + content) but queries array has only 1 element
     let err = db
+        .session()
         .query(
             "MATCH (d:Doc) \
              RETURN similar_to([d.embedding, d.content], [[1.0, 0.0, 0.0]]) AS score",
@@ -888,6 +916,7 @@ async fn test_similar_to_multi_source_type_mismatch() -> Result<()> {
     // Source 1: d.embedding (vector) + [1,0,0] (vector) → OK
     // Source 2: d.content (FTS string) + [0.5,0.5,0] (vector) → type mismatch
     let err = db
+        .session()
         .query(
             "MATCH (d:Doc) \
              RETURN similar_to([d.embedding, d.content], \
@@ -932,22 +961,27 @@ async fn test_similar_to_in_locy_fold() -> Result<()> {
 
     // Alpha [1,0,0], Beta [0.6,0.8,0], Gamma [0,0,1], Delta [0.8,0.6,0]
     // Edges: Alpha→Beta, Alpha→Delta, Beta→Gamma
-    db.execute(
-        "CREATE (a:Doc {title: 'Alpha', embedding: [1.0, 0.0, 0.0]}), \
+    {
+        let s = db.session();
+        let tx = s.tx().await?;
+        tx.execute(
+            "CREATE (a:Doc {title: 'Alpha', embedding: [1.0, 0.0, 0.0]}), \
          (b:Doc {title: 'Beta', embedding: [0.6, 0.8, 0.0]}), \
          (g:Doc {title: 'Gamma', embedding: [0.0, 0.0, 1.0]}), \
          (d:Doc {title: 'Delta', embedding: [0.8, 0.6, 0.0]}), \
          (a)-[:LINKS]->(b), (a)-[:LINKS]->(d), (b)-[:LINKS]->(g)",
-    )
-    .await?;
+        )
+        .await?;
+        tx.commit().await?;
+    }
     db.flush().await?;
 
     // Rule 1: compute per-edge similarity scores
     // Rule 2: FOLD MAX to find best neighbor score per source node
     // Note: "best" is a reserved keyword in Locy (BEST BY), so use "max_sim"
     let result = db
-        .locy()
-        .evaluate(
+        .session()
+        .locy(
             "CREATE RULE scored_neighbors AS \
              MATCH (a:Doc)-[:LINKS]->(b:Doc) \
              YIELD KEY a, KEY b, similar_to(b.embedding, [1.0, 0.0, 0.0]) AS sim \n\
@@ -991,6 +1025,7 @@ async fn test_similar_to_weights_sum_not_one() -> Result<()> {
 
     // Weights [0.8, 0.8] sum to 1.6, not 1.0 → should error
     let err = db
+        .session()
         .query(
             "MATCH (d:Doc) \
              RETURN similar_to([d.embedding, d.content], [[1.0, 0.0, 0.0], 'rust'], \
@@ -1068,25 +1103,29 @@ mod auto_embed_tests {
             .await?;
 
         // Insert articles — auto-embed on write fills in embedding vectors.
-        db.execute(
-            "CREATE (:Article {title: 'Rust Guide', \
+        db.session()
+            .execute(
+                "CREATE (:Article {title: 'Rust Guide', \
              body: 'Rust is a systems programming language focused on safety and performance'})",
-        )
-        .await?;
-        db.execute(
-            "CREATE (:Article {title: 'Python Intro', \
+            )
+            .await?;
+        db.session()
+            .execute(
+                "CREATE (:Article {title: 'Python Intro', \
              body: 'Python is an interpreted language popular for data science and scripting'})",
-        )
-        .await?;
-        db.execute(
-            "CREATE (:Article {title: 'Graph Databases', \
+            )
+            .await?;
+        db.session()
+            .execute(
+                "CREATE (:Article {title: 'Graph Databases', \
              body: 'Graph databases store data as nodes and edges for relationship queries'})",
-        )
-        .await?;
+            )
+            .await?;
         db.flush().await?;
 
         // Key test: similar_to with a STRING query triggers auto-embed at query time
         let result = db
+            .session()
             .query(
                 "MATCH (a:Article) \
                  RETURN a.title AS title, \
@@ -1098,14 +1137,14 @@ mod auto_embed_tests {
         assert_eq!(result.len(), 3);
 
         // The Rust article should score highest for 'systems programming language'
-        let first_title: String = result.rows[0].get("title")?;
+        let first_title: String = result.rows()[0].get("title")?;
         assert_eq!(
             first_title, "Rust Guide",
             "Rust article should rank first for 'systems programming language'"
         );
 
         // All scores should be in [0, 1]
-        for row in &result.rows {
+        for row in result.rows() {
             let score: f64 = row.get("score")?;
             assert!(
                 (0.0..=1.0).contains(&score),
@@ -1147,20 +1186,23 @@ mod auto_embed_tests {
             .apply()
             .await?;
 
-        db.execute(
-            "CREATE (:Article {title: 'Rust Guide', \
+        db.session()
+            .execute(
+                "CREATE (:Article {title: 'Rust Guide', \
              body: 'Rust is a systems programming language focused on safety and performance'})",
-        )
-        .await?;
-        db.execute(
-            "CREATE (:Article {title: 'Cooking Tips', \
+            )
+            .await?;
+        db.session()
+            .execute(
+                "CREATE (:Article {title: 'Cooking Tips', \
              body: 'Learn how to make pasta carbonara with fresh ingredients'})",
-        )
-        .await?;
+            )
+            .await?;
         db.flush().await?;
 
         // Auto-embed 'programming' and filter by similarity threshold
         let result = db
+            .session()
             .query(
                 "MATCH (a:Article) \
                  WHERE similar_to(a.embedding, 'programming') > 0.5 \
@@ -1170,7 +1212,7 @@ mod auto_embed_tests {
 
         // Rust article should pass the threshold; Cooking should not
         let titles: Vec<String> = result
-            .rows
+            .rows()
             .iter()
             .map(|r| r.get::<String>("title").unwrap())
             .collect();
@@ -1213,12 +1255,17 @@ mod metric_tests {
             .await?;
 
         // Unit-length vectors for predictable scores
-        db.execute("CREATE (:Item {name: 'A', vec: [1.0, 0.0, 0.0]})")
-            .await?;
-        db.execute("CREATE (:Item {name: 'B', vec: [0.0, 1.0, 0.0]})")
-            .await?;
-        db.execute("CREATE (:Item {name: 'C', vec: [0.8, 0.6, 0.0]})")
-            .await?;
+        {
+            let s = db.session();
+            let tx = s.tx().await?;
+            tx.execute("CREATE (:Item {name: 'A', vec: [1.0, 0.0, 0.0]})")
+                .await?;
+            tx.execute("CREATE (:Item {name: 'B', vec: [0.0, 1.0, 0.0]})")
+                .await?;
+            tx.execute("CREATE (:Item {name: 'C', vec: [0.8, 0.6, 0.0]})")
+                .await?;
+            tx.commit().await?;
+        }
         db.flush().await?;
         Ok(db)
     }
@@ -1230,6 +1277,7 @@ mod metric_tests {
         let db = setup_metric_db(VectorMetric::L2).await?;
 
         let result = db
+            .session()
             .query(
                 "MATCH (i:Item) \
                  RETURN i.name AS name, similar_to(i.vec, [1.0, 0.0, 0.0]) AS score \
@@ -1240,12 +1288,12 @@ mod metric_tests {
         assert_eq!(result.len(), 3);
 
         let names: Vec<String> = result
-            .rows
+            .rows()
             .iter()
             .map(|r| r.get::<String>("name").unwrap())
             .collect();
         let scores: Vec<f64> = result
-            .rows
+            .rows()
             .iter()
             .map(|r| r.get::<f64>("score").unwrap())
             .collect();
@@ -1280,6 +1328,7 @@ mod metric_tests {
         let db = setup_metric_db(VectorMetric::Dot).await?;
 
         let result = db
+            .session()
             .query(
                 "MATCH (i:Item) \
                  RETURN i.name AS name, similar_to(i.vec, [1.0, 0.0, 0.0]) AS score \
@@ -1290,12 +1339,12 @@ mod metric_tests {
         assert_eq!(result.len(), 3);
 
         let names: Vec<String> = result
-            .rows
+            .rows()
             .iter()
             .map(|r| r.get::<String>("name").unwrap())
             .collect();
         let scores: Vec<f64> = result
-            .rows
+            .rows()
             .iter()
             .map(|r| r.get::<f64>("score").unwrap())
             .collect();
@@ -1322,6 +1371,7 @@ mod metric_tests {
         let db = setup_metric_db(VectorMetric::Cosine).await?;
 
         let result = db
+            .session()
             .query(
                 "MATCH (i:Item) \
                  RETURN i.name AS name, similar_to(i.vec, [1.0, 0.0, 0.0]) AS score \
@@ -1332,7 +1382,7 @@ mod metric_tests {
         assert_eq!(result.len(), 3);
 
         let scores: Vec<f64> = result
-            .rows
+            .rows()
             .iter()
             .map(|r| r.get::<f64>("score").unwrap())
             .collect();
@@ -1376,13 +1426,23 @@ mod metric_tests {
             .apply()
             .await?;
 
-        db.execute("CREATE (:Item {name: 'A', vec_cos: [1.0, 0.0, 0.0], vec_l2: [1.0, 0.0, 0.0]})")
+        {
+            let s = db.session();
+            let tx = s.tx().await?;
+            tx.execute(
+                "CREATE (:Item {name: 'A', vec_cos: [1.0, 0.0, 0.0], vec_l2: [1.0, 0.0, 0.0]})",
+            )
             .await?;
-        db.execute("CREATE (:Item {name: 'B', vec_cos: [0.0, 1.0, 0.0], vec_l2: [0.0, 1.0, 0.0]})")
+            tx.execute(
+                "CREATE (:Item {name: 'B', vec_cos: [0.0, 1.0, 0.0], vec_l2: [0.0, 1.0, 0.0]})",
+            )
             .await?;
+            tx.commit().await?;
+        }
         db.flush().await?;
 
         let result = db
+            .session()
             .query(
                 "MATCH (i:Item) \
                  RETURN i.name AS name, \
@@ -1395,12 +1455,12 @@ mod metric_tests {
         assert_eq!(result.len(), 2);
 
         let names: Vec<String> = result
-            .rows
+            .rows()
             .iter()
             .map(|r| r.get::<String>("name").unwrap())
             .collect();
         let scores: Vec<f64> = result
-            .rows
+            .rows()
             .iter()
             .map(|r| r.get::<f64>("score").unwrap())
             .collect();
@@ -1446,14 +1506,17 @@ mod metric_tests {
             .apply()
             .await?;
 
-        db.execute(
+        let tx = db.session().tx().await?;
+        tx.execute(
             "CREATE (:Doc {title: 'Alpha', content: 'rust programming', embedding: [1.0, 0.0, 0.0]})",
         )
         .await?;
+        tx.commit().await?;
         db.flush().await?;
 
         // Multi-source similar_to with default RRF fusion
         let result = db
+            .session()
             .query(
                 "MATCH (d:Doc) \
                  RETURN d.title AS title, \

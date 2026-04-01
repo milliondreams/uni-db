@@ -8,16 +8,16 @@ use uni_db::Uni;
 async fn test_composite_index_creation() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
-    // 1. Create label
-    db.execute("CREATE LABEL Person (firstName STRING, lastName STRING, age INT)")
+    // 1. Create label and composite index
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL Person (firstName STRING, lastName STRING, age INT)")
         .await?;
-
-    // 2. Create composite index
-    db.execute("CREATE INDEX idx_name FOR (p:Person) ON (p.lastName, p.firstName)")
+    tx.execute("CREATE INDEX idx_name FOR (p:Person) ON (p.lastName, p.firstName)")
         .await?;
+    tx.commit().await?;
 
     // 3. Verify schema
-    let schema = db.get_schema();
+    let schema = db.schema().current();
     let index = schema
         .indexes
         .iter()
@@ -38,24 +38,28 @@ async fn test_composite_index_creation() -> Result<()> {
     }
 
     // 4. Insert data
-    db.execute("CREATE (:Person {firstName: 'Alice', lastName: 'Smith', age: 30})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Person {firstName: 'Alice', lastName: 'Smith', age: 30})")
         .await?;
-    db.execute("CREATE (:Person {firstName: 'Bob', lastName: 'Smith', age: 40})")
+    tx.execute("CREATE (:Person {firstName: 'Bob', lastName: 'Smith', age: 40})")
         .await?;
+    tx.commit().await?;
 
     // 5. Query using composite predicates (Planner should push these)
-    let result = db.query("MATCH (p:Person) WHERE p.lastName = 'Smith' AND p.firstName = 'Alice' RETURN p.age AS age").await?;
+    let result = db.session().query("MATCH (p:Person) WHERE p.lastName = 'Smith' AND p.firstName = 'Alice' RETURN p.age AS age").await?;
     assert_eq!(result.len(), 1);
     assert_eq!(result.rows()[0].get::<i64>("age")?, 30);
 
     // 6. Create Partial Index
-    db.execute("CREATE LABEL User (email STRING, active BOOL)")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL User (email STRING, active BOOL)")
         .await?;
-    db.execute("CREATE INDEX idx_active FOR (u:User) ON (u.email) WHERE u.active = true")
+    tx.execute("CREATE INDEX idx_active FOR (u:User) ON (u.email) WHERE u.active = true")
         .await?;
+    tx.commit().await?;
 
     // Verify partial index metadata
-    let schema = db.get_schema();
+    let schema = db.schema().current();
     let partial_idx = schema
         .indexes
         .iter()

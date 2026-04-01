@@ -45,19 +45,22 @@ fn timeout_config() -> LocyConfig {
 #[tokio::test]
 async fn test_native_transitive_closure() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.execute("CREATE (:N {name: 'A'})-[:E]->(:N {name: 'B'})-[:E]->(:N {name: 'C'})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:N {name: 'A'})-[:E]->(:N {name: 'B'})-[:E]->(:N {name: 'C'})")
         .await?;
+    tx.commit().await?;
 
     let result = db
-        .locy()
-        .evaluate_with_config(
+        .session()
+        .locy_with(
             "CREATE RULE reachable AS \
              MATCH (a:N)-[:E]->(b:N) YIELD KEY a, b \n\
              CREATE RULE reachable AS \
              MATCH (a:N)-[:E]->(mid:N) WHERE mid IS reachable TO b \
              YIELD KEY a, b",
-            &default_config(),
         )
+        .with_config(default_config())
+        .run()
         .await?;
 
     let reachable = result
@@ -79,7 +82,8 @@ async fn test_native_transitive_closure() -> Result<()> {
 #[tokio::test]
 async fn test_native_fold_sum() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}), \
          (i1:Invoice {id: 1}), (i2:Invoice {id: 2}), (i3:Invoice {id: 3}), \
          (a)-[:PAID {amount: 100}]->(i1), \
@@ -87,16 +91,18 @@ async fn test_native_fold_sum() -> Result<()> {
          (b)-[:PAID {amount: 50}]->(i3)",
     )
     .await?;
+    tx.commit().await?;
 
     let result = db
-        .locy()
-        .evaluate_with_config(
+        .session()
+        .locy_with(
             "CREATE RULE spending AS \
              MATCH (p:Person)-[r:PAID]->(i:Invoice) \
              FOLD total = SUM(r.amount) \
              YIELD KEY p, total",
-            &default_config(),
         )
+        .with_config(default_config())
+        .run()
         .await?;
 
     let spending = result
@@ -117,7 +123,8 @@ async fn test_native_fold_sum() -> Result<()> {
 #[tokio::test]
 async fn test_native_best_by() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (a:Node {name: 'A'}), \
          (b:Node {name: 'B'}), (c:Node {name: 'C'}), (d:Node {name: 'D'}), \
          (a)-[:EDGE {cost: 5}]->(b), \
@@ -125,16 +132,18 @@ async fn test_native_best_by() -> Result<()> {
          (a)-[:EDGE {cost: 7}]->(d)",
     )
     .await?;
+    tx.commit().await?;
 
     let result = db
-        .locy()
-        .evaluate_with_config(
+        .session()
+        .locy_with(
             "CREATE RULE cheapest AS \
              MATCH (a:Node)-[e:EDGE]->(b:Node) \
              BEST BY e.cost ASC \
              YIELD KEY a, KEY b, e.cost AS cost",
-            &default_config(),
         )
+        .with_config(default_config())
+        .run()
         .await?;
 
     let cheapest = result
@@ -157,21 +166,24 @@ async fn test_native_best_by() -> Result<()> {
 #[tokio::test]
 async fn test_native_priority() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (:Item {name: 'A', risk: 0.8}), \
          (:Item {name: 'B', risk: 0.2})",
     )
     .await?;
+    tx.commit().await?;
 
     let result = db
-        .locy()
-        .evaluate_with_config(
+        .session()
+        .locy_with(
             "CREATE RULE classify PRIORITY 1 AS \
              MATCH (n:Item) YIELD KEY n, 'low' AS label \n\
              CREATE RULE classify PRIORITY 2 AS \
              MATCH (n:Item) WHERE n.risk > 0.5 YIELD KEY n, 'high' AS label",
-            &default_config(),
         )
+        .with_config(default_config())
+        .run()
         .await?;
 
     let classify = result
@@ -193,12 +205,14 @@ async fn test_native_priority() -> Result<()> {
 #[tokio::test]
 async fn test_native_multi_stratum() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.execute("CREATE (:N {name: 'A'})-[:E]->(:N {name: 'B'})-[:E]->(:N {name: 'C'})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:N {name: 'A'})-[:E]->(:N {name: 'B'})-[:E]->(:N {name: 'C'})")
         .await?;
+    tx.commit().await?;
 
     let result = db
-        .locy()
-        .evaluate_with_config(
+        .session()
+        .locy_with(
             "CREATE RULE base AS \
              MATCH (a:N)-[:E]->(b:N) YIELD KEY a, b \n\
              CREATE RULE extended AS \
@@ -206,8 +220,9 @@ async fn test_native_multi_stratum() -> Result<()> {
              CREATE RULE extended AS \
              MATCH (a:N)-[:E]->(mid:N) WHERE mid IS extended TO b \
              YIELD KEY a, b",
-            &default_config(),
         )
+        .with_config(default_config())
+        .run()
         .await?;
 
     let base = result.derived.get("base").expect("rule 'base' missing");
@@ -232,17 +247,19 @@ async fn test_native_multi_stratum() -> Result<()> {
 #[tokio::test]
 async fn test_native_along() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (a:Node {name: 'A'}), (b:Node {name: 'B'}), (c:Node {name: 'C'}), \
          (a)-[:EDGE {weight: 5.0}]->(b), \
          (b)-[:EDGE {weight: 3.0}]->(c), \
          (a)-[:EDGE {weight: 20.0}]->(c)",
     )
     .await?;
+    tx.commit().await?;
 
     let result = db
-        .locy()
-        .evaluate_with_config(
+        .session()
+        .locy_with(
             "CREATE RULE shortest AS \
              MATCH (a:Node)-[e:EDGE]->(b:Node) \
              ALONG cost = e.weight \
@@ -254,8 +271,9 @@ async fn test_native_along() -> Result<()> {
              ALONG cost = prev.cost + e.weight \
              BEST BY cost ASC \
              YIELD KEY a, KEY b, cost",
-            &default_config(),
         )
+        .with_config(default_config())
+        .run()
         .await?;
 
     let shortest = result
@@ -292,19 +310,22 @@ async fn test_native_along() -> Result<()> {
 #[tokio::test]
 async fn test_native_error_max_iterations() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.execute("CREATE (:N {name: 'A'})-[:E]->(:N {name: 'B'})-[:E]->(:N {name: 'C'})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:N {name: 'A'})-[:E]->(:N {name: 'B'})-[:E]->(:N {name: 'C'})")
         .await?;
+    tx.commit().await?;
 
     let err = db
-        .locy()
-        .evaluate_with_config(
+        .session()
+        .locy_with(
             "CREATE RULE reachable AS \
              MATCH (a:N)-[:E]->(b:N) YIELD KEY a, b \n\
              CREATE RULE reachable AS \
              MATCH (a:N)-[:E]->(mid:N) WHERE mid IS reachable TO b \
              YIELD KEY a, b",
-            &tight_config(1),
         )
+        .with_config(tight_config(1))
+        .run()
         .await
         .unwrap_err();
 
@@ -323,19 +344,22 @@ async fn test_native_error_max_iterations() -> Result<()> {
 #[tokio::test]
 async fn test_native_error_timeout() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.execute("CREATE (:N {name: 'A'})-[:E]->(:N {name: 'B'})-[:E]->(:N {name: 'C'})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:N {name: 'A'})-[:E]->(:N {name: 'B'})-[:E]->(:N {name: 'C'})")
         .await?;
+    tx.commit().await?;
 
     let err = db
-        .locy()
-        .evaluate_with_config(
+        .session()
+        .locy_with(
             "CREATE RULE reachable AS \
              MATCH (a:N)-[:E]->(b:N) YIELD KEY a, b \n\
              CREATE RULE reachable AS \
              MATCH (a:N)-[:E]->(mid:N) WHERE mid IS reachable TO b \
              YIELD KEY a, b",
-            &timeout_config(),
         )
+        .with_config(timeout_config())
+        .run()
         .await
         .unwrap_err();
 
@@ -356,20 +380,23 @@ async fn test_native_error_timeout() -> Result<()> {
 #[tokio::test]
 async fn test_native_goal_query_command() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.execute("CREATE (:Person {name: 'Alice'})-[:KNOWS]->(:Person {name: 'Bob'})-[:KNOWS]->(:Person {name: 'Carol'})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Person {name: 'Alice'})-[:KNOWS]->(:Person {name: 'Bob'})-[:KNOWS]->(:Person {name: 'Carol'})")
         .await?;
+    tx.commit().await?;
 
     let result = db
-        .locy()
-        .evaluate_with_config(
+        .session()
+        .locy_with(
             "CREATE RULE reachable AS \
              MATCH (a:Person)-[:KNOWS]->(b:Person) YIELD KEY a, b \n\
              CREATE RULE reachable AS \
              MATCH (a:Person)-[:KNOWS]->(mid:Person) WHERE mid IS reachable TO b \
              YIELD KEY a, b \n\
              QUERY reachable WHERE a.name = 'Alice'",
-            &default_config(),
         )
+        .with_config(default_config())
+        .run()
         .await?;
 
     // GoalQuery dispatches via SLG resolution → CommandResult::Query
@@ -398,17 +425,20 @@ async fn test_native_goal_query_command() -> Result<()> {
 #[tokio::test]
 async fn test_native_cypher_command() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.execute("CREATE (:Node {name: 'X'}), (:Node {name: 'Y'}), (:Node {name: 'Z'})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Node {name: 'X'}), (:Node {name: 'Y'}), (:Node {name: 'Z'})")
         .await?;
+    tx.commit().await?;
 
     let result = db
-        .locy()
-        .evaluate_with_config(
+        .session()
+        .locy_with(
             "CREATE RULE connected AS \
              MATCH (n:Node) YIELD KEY n \n\
              MATCH (n:Node) RETURN n.name AS name ORDER BY n.name",
-            &default_config(),
         )
+        .with_config(default_config())
+        .run()
         .await?;
 
     assert_eq!(
@@ -433,17 +463,20 @@ async fn test_native_cypher_command() -> Result<()> {
 #[tokio::test]
 async fn test_native_explain_rule_command() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.execute("CREATE (:Person {name: 'Alice'})-[:KNOWS]->(:Person {name: 'Bob'})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Person {name: 'Alice'})-[:KNOWS]->(:Person {name: 'Bob'})")
         .await?;
+    tx.commit().await?;
 
     let result = db
-        .locy()
-        .evaluate_with_config(
+        .session()
+        .locy_with(
             "CREATE RULE knows AS \
              MATCH (a:Person)-[:KNOWS]->(b:Person) YIELD KEY a, b \n\
              EXPLAIN RULE knows WHERE a.name = 'Alice'",
-            &default_config(),
         )
+        .with_config(default_config())
+        .run()
         .await?;
 
     assert_eq!(
@@ -470,14 +503,16 @@ async fn test_native_explain_rule_command() -> Result<()> {
 #[tokio::test]
 async fn test_native_multiple_commands() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (:City {name: 'A'})-[:ROAD]->(:City {name: 'B'})-[:ROAD]->(:City {name: 'C'})",
     )
     .await?;
+    tx.commit().await?;
 
     let result = db
-        .locy()
-        .evaluate_with_config(
+        .session()
+        .locy_with(
             "CREATE RULE reachable AS \
              MATCH (a:City)-[:ROAD]->(b:City) YIELD KEY a, b \n\
              CREATE RULE reachable AS \
@@ -485,8 +520,9 @@ async fn test_native_multiple_commands() -> Result<()> {
              YIELD KEY a, b \n\
              QUERY reachable WHERE a.name = 'A' \n\
              MATCH (c:City) RETURN c.name AS name",
-            &default_config(),
         )
+        .with_config(default_config())
+        .run()
         .await?;
 
     // Two commands: QUERY + raw Cypher

@@ -14,11 +14,12 @@ class TestSyncQueryCursor:
     """Synchronous QueryCursor tests."""
 
     def test_cursor_fetch_all(self, social_db_populated):
-        """fetch_all() returns same results as db.query()."""
+        """fetch_all() returns same results as session.query()."""
         db = social_db_populated
+        session = db.session()
         cypher = "MATCH (p:Person) RETURN p.name AS name ORDER BY name"
-        expected = db.query(cypher)
-        cursor = db.query_cursor(cypher)
+        expected = session.query(cypher)
+        cursor = session.query_with(cypher).cursor()
         result = cursor.fetch_all()
         assert len(result) == len(expected)
         assert [r["name"] for r in result] == [r["name"] for r in expected]
@@ -26,7 +27,10 @@ class TestSyncQueryCursor:
     def test_cursor_fetch_one(self, social_db_populated):
         """Iterate with fetch_one() until None."""
         db = social_db_populated
-        cursor = db.query_cursor("MATCH (p:Person) RETURN p.name AS name ORDER BY name")
+        session = db.session()
+        cursor = session.query_with(
+            "MATCH (p:Person) RETURN p.name AS name ORDER BY name"
+        ).cursor()
         names = []
         while True:
             row = cursor.fetch_one()
@@ -39,7 +43,10 @@ class TestSyncQueryCursor:
     def test_cursor_fetch_many(self, social_db_populated):
         """fetch_many(2) returns at most 2 rows per call."""
         db = social_db_populated
-        cursor = db.query_cursor("MATCH (p:Person) RETURN p.name AS name ORDER BY name")
+        session = db.session()
+        cursor = session.query_with(
+            "MATCH (p:Person) RETURN p.name AS name ORDER BY name"
+        ).cursor()
         batch1 = cursor.fetch_many(2)
         assert len(batch1) <= 2
         assert len(batch1) > 0
@@ -50,33 +57,41 @@ class TestSyncQueryCursor:
     def test_cursor_iterator(self, social_db_populated):
         """for row in cursor: iterates all rows."""
         db = social_db_populated
-        cursor = db.query_cursor("MATCH (p:Person) RETURN p.name AS name ORDER BY name")
+        session = db.session()
+        cursor = session.query_with(
+            "MATCH (p:Person) RETURN p.name AS name ORDER BY name"
+        ).cursor()
         names = [row["name"] for row in cursor]
         assert names == ["Alice", "Bob", "Charlie", "Diana", "Eve"]
 
     def test_cursor_columns(self, social_db_populated):
         """columns property returns expected column names."""
         db = social_db_populated
-        cursor = db.query_cursor(
+        session = db.session()
+        cursor = session.query_with(
             "MATCH (p:Person) RETURN p.name AS name, p.age AS age ORDER BY name"
-        )
+        ).cursor()
         assert cursor.columns == ["name", "age"]
         cursor.close()
 
     def test_cursor_close(self, social_db_populated):
         """close() makes subsequent calls return empty/None."""
         db = social_db_populated
-        cursor = db.query_cursor("MATCH (p:Person) RETURN p.name AS name ORDER BY name")
+        session = db.session()
+        cursor = session.query_with(
+            "MATCH (p:Person) RETURN p.name AS name ORDER BY name"
+        ).cursor()
         cursor.close()
         assert cursor.fetch_one() is None
         assert cursor.fetch_all() == []
 
     def test_cursor_context_manager(self, social_db_populated):
-        """with db.query_cursor() as cursor: auto-closes."""
+        """with query_with().cursor() as cursor: auto-closes."""
         db = social_db_populated
-        with db.query_cursor(
+        session = db.session()
+        with session.query_with(
             "MATCH (p:Person) RETURN p.name AS name ORDER BY name"
-        ) as cursor:
+        ).cursor() as cursor:
             first = cursor.fetch_one()
             assert first is not None
         # After exiting context, cursor should be closed
@@ -85,18 +100,23 @@ class TestSyncQueryCursor:
     def test_cursor_empty_result(self, social_db_populated):
         """Cursor on query returning 0 rows works correctly."""
         db = social_db_populated
-        cursor = db.query_cursor(
+        session = db.session()
+        cursor = session.query_with(
             "MATCH (p:Person {name: 'Nobody'}) RETURN p.name AS name"
-        )
+        ).cursor()
         assert cursor.fetch_one() is None
         assert cursor.fetch_all() == []
 
     def test_cursor_with_params(self, social_db_populated):
-        """query_cursor with params passes them correctly."""
+        """query_with with params passes them correctly."""
         db = social_db_populated
-        cursor = db.query_cursor(
-            "MATCH (p:Person) WHERE p.age > $min_age RETURN p.name AS name ORDER BY name",
-            {"min_age": 30},
+        session = db.session()
+        cursor = (
+            session.query_with(
+                "MATCH (p:Person) WHERE p.age > $min_age RETURN p.name AS name ORDER BY name"
+            )
+            .params({"min_age": 30})
+            .cursor()
         )
         names = [row["name"] for row in cursor]
         assert "Charlie" in names  # age 35
@@ -104,10 +124,11 @@ class TestSyncQueryCursor:
         assert "Bob" not in names  # age 25
 
     def test_query_builder_cursor(self, social_db_populated):
-        """db.query_with(cypher).timeout(10).cursor() works."""
+        """session.query_with(cypher).timeout(10).cursor() works."""
         db = social_db_populated
+        session = db.session()
         cursor = (
-            db.query_with("MATCH (p:Person) RETURN p.name AS name ORDER BY name")
+            session.query_with("MATCH (p:Person) RETURN p.name AS name ORDER BY name")
             .timeout(10.0)
             .cursor()
         )
@@ -126,10 +147,10 @@ class TestAsyncQueryCursor:
     @pytest.mark.asyncio
     async def test_async_cursor_fetch_all(self, async_social_db_populated):
         """await cursor.fetch_all() returns all rows."""
-        db = async_social_db_populated
-        cursor = await db.query_cursor(
+        session = async_social_db_populated.session()
+        cursor = await session.query_with(
             "MATCH (p:Person) RETURN p.name AS name ORDER BY name"
-        )
+        ).cursor()
         result = await cursor.fetch_all()
         assert len(result) == 5
         assert [r["name"] for r in result] == [
@@ -143,10 +164,10 @@ class TestAsyncQueryCursor:
     @pytest.mark.asyncio
     async def test_async_cursor_fetch_one(self, async_social_db_populated):
         """await cursor.fetch_one() iterates row by row."""
-        db = async_social_db_populated
-        cursor = await db.query_cursor(
+        session = async_social_db_populated.session()
+        cursor = await session.query_with(
             "MATCH (p:Person) RETURN p.name AS name ORDER BY name"
-        )
+        ).cursor()
         names = []
         while True:
             row = await cursor.fetch_one()
@@ -158,10 +179,10 @@ class TestAsyncQueryCursor:
     @pytest.mark.asyncio
     async def test_async_cursor_fetch_many(self, async_social_db_populated):
         """await cursor.fetch_many(2) returns at most 2 rows."""
-        db = async_social_db_populated
-        cursor = await db.query_cursor(
+        session = async_social_db_populated.session()
+        cursor = await session.query_with(
             "MATCH (p:Person) RETURN p.name AS name ORDER BY name"
-        )
+        ).cursor()
         batch1 = await cursor.fetch_many(2)
         assert len(batch1) <= 2
         assert len(batch1) > 0
@@ -171,10 +192,10 @@ class TestAsyncQueryCursor:
     @pytest.mark.asyncio
     async def test_async_cursor_async_for(self, async_social_db_populated):
         """async for row in cursor: iterates all rows."""
-        db = async_social_db_populated
-        cursor = await db.query_cursor(
+        session = async_social_db_populated.session()
+        cursor = await session.query_with(
             "MATCH (p:Person) RETURN p.name AS name ORDER BY name"
-        )
+        ).cursor()
         names = []
         async for row in cursor:
             names.append(row["name"])
@@ -182,11 +203,11 @@ class TestAsyncQueryCursor:
 
     @pytest.mark.asyncio
     async def test_async_cursor_context_manager(self, async_social_db_populated):
-        """async with await db.query_cursor() as cursor: auto-closes."""
-        db = async_social_db_populated
-        async with await db.query_cursor(
+        """async with await query_with().cursor() as cursor: auto-closes."""
+        session = async_social_db_populated.session()
+        async with await session.query_with(
             "MATCH (p:Person) RETURN p.name AS name ORDER BY name"
-        ) as cursor:
+        ).cursor() as cursor:
             first = await cursor.fetch_one()
             assert first is not None
         # After exiting context, cursor should be closed
@@ -195,10 +216,10 @@ class TestAsyncQueryCursor:
 
     @pytest.mark.asyncio
     async def test_async_query_builder_cursor(self, async_social_db_populated):
-        """await db.query_with(cypher).cursor() works."""
-        db = async_social_db_populated
+        """await session.query_with(cypher).cursor() works."""
+        session = async_social_db_populated.session()
         cursor = await (
-            db.query_with("MATCH (p:Person) RETURN p.name AS name ORDER BY name")
+            session.query_with("MATCH (p:Person) RETURN p.name AS name ORDER BY name")
             .timeout(10.0)
             .cursor()
         )

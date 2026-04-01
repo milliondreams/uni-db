@@ -40,7 +40,6 @@ async fn test_cypher_var_length() -> anyhow::Result<()> {
     );
 
     // Chain: A(0) -> B(1) -> C(2) -> D(3)
-    let lancedb_store = storage.lancedb_store();
     let vertex_ds = storage.vertex_dataset("Person")?;
     let batch = RecordBatch::try_new(
         vertex_ds.get_arrow_schema(&schema_manager.schema())?,
@@ -77,7 +76,7 @@ async fn test_cypher_var_length() -> anyhow::Result<()> {
         ],
     )?;
     vertex_ds
-        .write_batch_lancedb(lancedb_store, batch, &schema_manager.schema())
+        .write_batch(storage.backend(), batch, &schema_manager.schema())
         .await?;
 
     let adj_ds = storage.adjacency_dataset("KNOWS", "Person", "fwd")?;
@@ -119,7 +118,7 @@ async fn test_cypher_var_length() -> anyhow::Result<()> {
             Arc::new(e_builder.finish()),
         ],
     )?;
-    adj_ds.write_chunk_lancedb(lancedb_store, batch).await?;
+    adj_ds.write_chunk(storage.backend(), batch).await?;
 
     // Warm the adjacency cache so queries can find the edges
     use uni_db::storage::direction::Direction;

@@ -12,7 +12,6 @@
 
 use anyhow::{Result, anyhow};
 use arrow_array::RecordBatch;
-use arrow_array::RecordBatchIterator;
 use arrow_schema::Schema as ArrowSchema;
 use futures::TryStreamExt;
 use lancedb::Table;
@@ -100,11 +99,8 @@ impl LanceDbStore {
             ));
         }
 
-        let schema = batches[0].schema();
-        let batch_iter = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
-
         self.connection
-            .create_table(name, batch_iter)
+            .create_table(name, batches)
             .execute()
             .await
             .map_err(|e| anyhow!("Failed to create table '{}': {}", name, e))
@@ -154,11 +150,8 @@ impl LanceDbStore {
             return Ok(());
         }
 
-        let schema = batches[0].schema();
-        let batch_iter = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
-
         table
-            .add(batch_iter)
+            .add(batches)
             .execute()
             .await
             .map_err(|e| anyhow!("Failed to append to table: {}", e))?;
@@ -392,11 +385,8 @@ impl LanceDbStore {
                     .map_err(|e| anyhow!("Failed to clear table '{}': {}", name, e))?;
             } else {
                 use lancedb::table::AddDataMode;
-                let batch_schema = batches[0].schema();
-                let batch_iter =
-                    RecordBatchIterator::new(batches.into_iter().map(Ok), batch_schema);
                 table
-                    .add(batch_iter)
+                    .add(batches)
                     .mode(AddDataMode::Overwrite)
                     .execute()
                     .await

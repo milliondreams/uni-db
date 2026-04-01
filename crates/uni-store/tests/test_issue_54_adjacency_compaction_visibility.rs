@@ -47,22 +47,22 @@ async fn test_no_visibility_gap_during_compaction() -> Result<()> {
     let vid_c = writer.next_vid().await?;
 
     writer
-        .insert_vertex_with_labels(vid_a, HashMap::new(), &["Person".to_string()])
+        .insert_vertex_with_labels(vid_a, HashMap::new(), &["Person".to_string()], None)
         .await?;
     writer
-        .insert_vertex_with_labels(vid_b, HashMap::new(), &["Person".to_string()])
+        .insert_vertex_with_labels(vid_b, HashMap::new(), &["Person".to_string()], None)
         .await?;
     writer
-        .insert_vertex_with_labels(vid_c, HashMap::new(), &["Person".to_string()])
+        .insert_vertex_with_labels(vid_c, HashMap::new(), &["Person".to_string()], None)
         .await?;
 
     let eid1 = writer.next_eid(edge_type_id).await?;
     let eid2 = writer.next_eid(edge_type_id).await?;
     writer
-        .insert_edge(vid_a, vid_b, edge_type_id, eid1, HashMap::new(), None)
+        .insert_edge(vid_a, vid_b, edge_type_id, eid1, HashMap::new(), None, None)
         .await?;
     writer
-        .insert_edge(vid_b, vid_c, edge_type_id, eid2, HashMap::new(), None)
+        .insert_edge(vid_b, vid_c, edge_type_id, eid2, HashMap::new(), None, None)
         .await?;
 
     // Flush to create frozen segments
@@ -142,22 +142,22 @@ async fn test_rewarm_after_storage_compaction() -> Result<()> {
     let vid_c = writer.next_vid().await?;
 
     writer
-        .insert_vertex_with_labels(vid_a, HashMap::new(), &["Person".to_string()])
+        .insert_vertex_with_labels(vid_a, HashMap::new(), &["Person".to_string()], None)
         .await?;
     writer
-        .insert_vertex_with_labels(vid_b, HashMap::new(), &["Person".to_string()])
+        .insert_vertex_with_labels(vid_b, HashMap::new(), &["Person".to_string()], None)
         .await?;
     writer
-        .insert_vertex_with_labels(vid_c, HashMap::new(), &["Person".to_string()])
+        .insert_vertex_with_labels(vid_c, HashMap::new(), &["Person".to_string()], None)
         .await?;
 
     let eid1 = writer.next_eid(edge_type_id).await?;
     let eid2 = writer.next_eid(edge_type_id).await?;
     writer
-        .insert_edge(vid_a, vid_b, edge_type_id, eid1, HashMap::new(), None)
+        .insert_edge(vid_a, vid_b, edge_type_id, eid1, HashMap::new(), None, None)
         .await?;
     writer
-        .insert_edge(vid_b, vid_c, edge_type_id, eid2, HashMap::new(), None)
+        .insert_edge(vid_b, vid_c, edge_type_id, eid2, HashMap::new(), None, None)
         .await?;
 
     writer.flush_to_l1(None).await?;
@@ -236,15 +236,15 @@ async fn test_no_concurrent_compaction() -> Result<()> {
         props_b.insert("id".to_string(), uni_common::Value::Int((i * 2 + 1) as i64));
 
         writer
-            .insert_vertex_with_labels(vid_a, props_a, &["Person".to_string()])
+            .insert_vertex_with_labels(vid_a, props_a, &["Person".to_string()], None)
             .await?;
         writer
-            .insert_vertex_with_labels(vid_b, props_b, &["Person".to_string()])
+            .insert_vertex_with_labels(vid_b, props_b, &["Person".to_string()], None)
             .await?;
 
         let eid = writer.next_eid(edge_type_id).await?;
         writer
-            .insert_edge(vid_a, vid_b, edge_type_id, eid, HashMap::new(), None)
+            .insert_edge(vid_a, vid_b, edge_type_id, eid, HashMap::new(), None, None)
             .await?;
 
         // Flush multiple times to accumulate frozen segments
@@ -282,15 +282,15 @@ async fn test_frozen_segments_readable_until_csr_installed() -> Result<()> {
     let vid_a = writer.next_vid().await?;
     let vid_b = writer.next_vid().await?;
     writer
-        .insert_vertex_with_labels(vid_a, HashMap::new(), &["Person".to_string()])
+        .insert_vertex_with_labels(vid_a, HashMap::new(), &["Person".to_string()], None)
         .await?;
     writer
-        .insert_vertex_with_labels(vid_b, HashMap::new(), &["Person".to_string()])
+        .insert_vertex_with_labels(vid_b, HashMap::new(), &["Person".to_string()], None)
         .await?;
 
     let eid = writer.next_eid(edge_type_id).await?;
     writer
-        .insert_edge(vid_a, vid_b, edge_type_id, eid, HashMap::new(), None)
+        .insert_edge(vid_a, vid_b, edge_type_id, eid, HashMap::new(), None, None)
         .await?;
     writer.flush_to_l1(None).await?;
 

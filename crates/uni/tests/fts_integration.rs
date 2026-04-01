@@ -145,16 +145,21 @@ async fn test_fts_auto_build_on_create_index() -> Result<()> {
     let db = uni_db::Uni::open(path.to_str().unwrap()).build().await?;
 
     // Insert and flush so data lives in Lance
-    db.execute(r#"CREATE (:Doc { title: "Rust Guide", content: "Memory safety without garbage collection." })"#).await?;
-    db.execute(r#"CREATE (:Doc { title: "Go Manual", content: "Concurrency with goroutines and channels." })"#).await?;
+    let tx = db.session().tx().await?;
+    tx.execute(r#"CREATE (:Doc { title: "Rust Guide", content: "Memory safety without garbage collection." })"#).await?;
+    tx.execute(r#"CREATE (:Doc { title: "Go Manual", content: "Concurrency with goroutines and channels." })"#).await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // Create FTS index — should auto-build physical index (no rebuild_indexes needed)
-    db.execute("CREATE FULLTEXT INDEX doc_content_fts FOR (d:Doc) ON EACH [d.content]")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE FULLTEXT INDEX doc_content_fts FOR (d:Doc) ON EACH [d.content]")
         .await?;
+    tx.commit().await?;
 
     // Query via FTS procedure — should find results without manual rebuild
     let results = db
+        .session()
         .query(
             "CALL uni.fts.query('Doc', 'content', 'memory safety', 10) \
              YIELD node \
@@ -192,17 +197,22 @@ async fn test_fts_query_sees_l0_writes() -> Result<()> {
     let db = uni_db::Uni::open(path.to_str().unwrap()).build().await?;
 
     // 2. Insert initial articles and flush to Lance
-    db.execute(r#"CREATE (:Article { title: "Alpha", body: "The quick brown fox jumps over the lazy dog." })"#).await?;
-    db.execute(r#"CREATE (:Article { title: "Beta", body: "Machine learning transforms modern data pipelines." })"#).await?;
+    let tx = db.session().tx().await?;
+    tx.execute(r#"CREATE (:Article { title: "Alpha", body: "The quick brown fox jumps over the lazy dog." })"#).await?;
+    tx.execute(r#"CREATE (:Article { title: "Beta", body: "Machine learning transforms modern data pipelines." })"#).await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // 3. Create FTS index and rebuild so tantivy picks up the flushed data
-    db.execute("CREATE FULLTEXT INDEX article_body_fts FOR (a:Article) ON EACH [a.body]")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE FULLTEXT INDEX article_body_fts FOR (a:Article) ON EACH [a.body]")
         .await?;
-    db.rebuild_indexes("Article", false).await?;
+    tx.commit().await?;
+    db.indexes().rebuild("Article", false).await?;
 
     // Sanity: flushed data is findable via FTS
     let flushed = db
+        .session()
         .query(
             "CALL uni.fts.query('Article', 'body', 'machine learning', 10) \
              YIELD node \
@@ -214,10 +224,13 @@ async fn test_fts_query_sees_l0_writes() -> Result<()> {
     assert_eq!(title, "Beta");
 
     // 4. Insert a NEW article — do NOT flush (stays in L0)
-    db.execute(r#"CREATE (:Article { title: "Gamma", body: "Quantum computing breakthroughs in machine learning." })"#).await?;
+    let tx = db.session().tx().await?;
+    tx.execute(r#"CREATE (:Article { title: "Gamma", body: "Quantum computing breakthroughs in machine learning." })"#).await?;
+    tx.commit().await?;
 
     // 5. FTS query must find the L0-only article
     let l0_results = db
+        .session()
         .query(
             "CALL uni.fts.query('Article', 'body', 'quantum computing', 10) \
              YIELD node \
@@ -240,11 +253,14 @@ async fn test_fts_query_sees_l0_writes() -> Result<()> {
     );
 
     // 6. Delete a flushed article via Cypher (tombstone in L0, not flushed)
-    db.execute("MATCH (a:Article) WHERE a.title = 'Beta' DELETE a")
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (a:Article) WHERE a.title = 'Beta' DELETE a")
         .await?;
+    tx.commit().await?;
 
     // 7. FTS query for the deleted article's keywords should exclude it
     let after_delete = db
+        .session()
         .query(
             "CALL uni.fts.query('Article', 'body', 'machine learning', 10) \
              YIELD node \

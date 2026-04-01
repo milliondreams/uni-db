@@ -51,7 +51,6 @@ use uni_store::cloud::{build_store_from_url, copy_store_prefix, is_cloud_url};
 use uni_store::runtime::property_manager::PropertyManager;
 use uni_store::runtime::writer::Writer;
 use uni_store::storage::arrow_convert;
-use uni_store::storage::index_manager::IndexManager;
 
 // DataFusion engine imports
 use crate::query::df_graph::L0Context;
@@ -210,70 +209,16 @@ impl Executor {
             .label_name_by_id(label_id)
             .ok_or_else(|| anyhow!("Label ID {} not found", label_id))?;
 
-        let ds = self.storage.vertex_dataset(label_name)?;
-        let lancedb_store = self.storage.lancedb_store();
+        // Generate filter SQL from expression
+        let empty_props = std::collections::HashMap::new();
+        let label_props = schema.properties.get(label_name).unwrap_or(&empty_props);
+        let filter_sql = filter.and_then(|expr| {
+            LanceFilterGenerator::generate(std::slice::from_ref(expr), variable, Some(label_props))
+        });
 
-        // Try LanceDB first (canonical storage)
-        match ds.open_lancedb(lancedb_store).await {
-            Ok(table) => {
-                use arrow_array::UInt64Array;
-                use futures::TryStreamExt;
-                use lancedb::query::{ExecutableQuery, QueryBase, Select};
-
-                let mut query = table.query();
-
-                // Apply filter if provided, with schema awareness
-                // to skip overflow properties that aren't physical Lance columns.
-                // For labels with no registered properties (schemaless), use an empty
-                // map so all non-system properties are recognized as overflow.
-                let empty_props = std::collections::HashMap::new();
-                let label_props = schema.properties.get(label_name).unwrap_or(&empty_props);
-                if let Some(expr) = filter
-                    && let Some(sql) = LanceFilterGenerator::generate(
-                        std::slice::from_ref(expr),
-                        variable,
-                        Some(label_props),
-                    )
-                {
-                    query = query.only_if(format!("_deleted = false AND ({})", sql));
-                } else {
-                    query = query.only_if("_deleted = false");
-                }
-
-                // Project to only _vid
-                let query = query.select(Select::columns(&["_vid"]));
-                let stream = query.execute().await?;
-                let batches: Vec<arrow_array::RecordBatch> = stream.try_collect().await?;
-
-                let mut vids = Vec::new();
-                for batch in batches {
-                    let vid_col = batch
-                        .column_by_name("_vid")
-                        .ok_or(anyhow!("Missing _vid"))?
-                        .as_any()
-                        .downcast_ref::<UInt64Array>()
-                        .ok_or(anyhow!("Invalid _vid"))?;
-                    for i in 0..batch.num_rows() {
-                        vids.push(Vid::from(vid_col.value(i)));
-                    }
-                }
-                Ok(vids)
-            }
-            Err(e) => {
-                // Only treat "not found" / "does not exist" errors as empty results.
-                // Propagate all other errors (network, auth, corruption, etc.)
-                let err_msg = e.to_string().to_lowercase();
-                if err_msg.contains("not found")
-                    || err_msg.contains("does not exist")
-                    || err_msg.contains("no such file")
-                    || err_msg.contains("object not found")
-                {
-                    Ok(Vec::new())
-                } else {
-                    Err(e)
-                }
-            }
-        }
+        self.storage
+            .scan_vertex_candidates(label_name, filter_sql.as_deref())
+            .await
     }
 
     pub(crate) async fn scan_label_with_filter(
@@ -371,6 +316,9 @@ impl Executor {
 
         let session = SessionContext::new();
         crate::query::df_udfs::register_cypher_udfs(&session)?;
+        if let Some(ref registry) = self.custom_function_registry {
+            crate::query::df_udfs::register_custom_udfs(&session, registry)?;
+        }
         let session_ctx = Arc::new(SyncRwLock::new(session));
 
         let mut planner = HybridPhysicalPlanner::with_l0_context(
@@ -424,6 +372,27 @@ impl Executor {
         prop_manager: &PropertyManager,
         params: &HashMap<String, Value>,
     ) -> Result<Vec<RecordBatch>> {
+        let (batches, _plan) = self
+            .execute_datafusion_with_plan(plan, prop_manager, params)
+            .await?;
+        Ok(batches)
+    }
+
+    /// Executes a query using the DataFusion-based engine, returning both
+    /// result batches and the physical execution plan.
+    ///
+    /// The returned `Arc<dyn ExecutionPlan>` can be walked to extract per-operator
+    /// metrics (e.g., `output_rows`, `elapsed_compute`) that DataFusion's
+    /// `BaselineMetrics` recorded during execution.
+    pub async fn execute_datafusion_with_plan(
+        &self,
+        plan: LogicalPlan,
+        prop_manager: &PropertyManager,
+        params: &HashMap<String, Value>,
+    ) -> Result<(
+        Vec<RecordBatch>,
+        Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+    )> {
         let (session_ctx, mut planner, prop_manager_arc) =
             self.create_datafusion_planner(prop_manager, params).await?;
 
@@ -447,6 +416,7 @@ impl Executor {
                 prop_manager: prop_manager_arc,
                 params: params.clone(),
                 query_ctx,
+                tx_l0_override: self.transaction_l0_override.clone(),
             });
             planner = planner.with_mutation_context(mutation_ctx);
             tracing::debug!(
@@ -456,6 +426,7 @@ impl Executor {
         }
 
         let execution_plan = planner.plan(&plan)?;
+        let plan_clone = Arc::clone(&execution_plan);
         let result = Self::collect_batches(&session_ctx, execution_plan).await;
 
         // Harvest warnings from the graph execution context after query completion.
@@ -466,7 +437,7 @@ impl Executor {
             w.extend(graph_warnings);
         }
 
-        result
+        result.map(|batches| (batches, plan_clone))
     }
 
     /// Execute a MERGE read sub-plan through the DataFusion engine.
@@ -536,7 +507,7 @@ impl Executor {
     /// - `cv_encoded=true`: Parse the string value as JSON to restore original type
     ///
     /// Also normalizes path structures to user-facing format (converts _vid to _id).
-    fn record_batches_to_rows(
+    pub(crate) fn record_batches_to_rows(
         &self,
         batches: Vec<RecordBatch>,
     ) -> Result<Vec<HashMap<String, Value>>> {
@@ -936,7 +907,7 @@ impl Executor {
     /// DataFusion planner. Recurses through wrapper nodes (`Project`, `Sort`,
     /// `Limit`, etc.) to detect DDL/admin operations nested inside read
     /// wrappers (e.g. `CALL procedure(...) YIELD x RETURN x`).
-    fn is_ddl_or_admin(plan: &LogicalPlan) -> bool {
+    pub(crate) fn is_ddl_or_admin(plan: &LogicalPlan) -> bool {
         match plan {
             // DDL / schema operations
             LogicalPlan::CreateLabel(_)
@@ -963,9 +934,6 @@ impl Executor {
             | LogicalPlan::ShowStatistics
             | LogicalPlan::Vacuum
             | LogicalPlan::Checkpoint
-            | LogicalPlan::Begin
-            | LogicalPlan::Commit
-            | LogicalPlan::Rollback
             | LogicalPlan::Copy { .. }
             | LogicalPlan::CopyTo { .. }
             | LogicalPlan::CopyFrom { .. }
@@ -2143,7 +2111,11 @@ impl Executor {
 
                         evaluated_args.push(val);
                     }
-                    eval_scalar_function(name, &evaluated_args)
+                    eval_scalar_function(
+                        name,
+                        &evaluated_args,
+                        self.custom_function_registry.as_deref(),
+                    )
                 }
                 Expr::Reduce {
                     accumulator,
@@ -2307,11 +2279,7 @@ impl Executor {
                     if if_not_exists && self.index_exists_by_name(&config.name) {
                         return Ok(vec![]);
                     }
-                    let idx_mgr = IndexManager::new(
-                        self.storage.base_path(),
-                        self.storage.schema_manager_arc(),
-                        self.storage.lancedb_store_arc(),
-                    );
+                    let idx_mgr = self.storage.index_manager();
                     idx_mgr.create_vector_index(config).await?;
                     Ok(vec![])
                 }
@@ -2322,11 +2290,7 @@ impl Executor {
                     if if_not_exists && self.index_exists_by_name(&config.name) {
                         return Ok(vec![]);
                     }
-                    let idx_mgr = IndexManager::new(
-                        self.storage.base_path(),
-                        self.storage.schema_manager_arc(),
-                        self.storage.lancedb_store_arc(),
-                    );
+                    let idx_mgr = self.storage.index_manager();
                     idx_mgr.create_fts_index(config).await?;
                     Ok(vec![])
                 }
@@ -2366,11 +2330,7 @@ impl Executor {
 
                     config.properties = modified_properties;
 
-                    let idx_mgr = IndexManager::new(
-                        self.storage.base_path(),
-                        self.storage.schema_manager_arc(),
-                        self.storage.lancedb_store_arc(),
-                    );
+                    let idx_mgr = self.storage.index_manager();
                     idx_mgr.create_scalar_index(config).await?;
                     Ok(vec![])
                 }
@@ -2381,11 +2341,7 @@ impl Executor {
                     if if_not_exists && self.index_exists_by_name(&config.name) {
                         return Ok(vec![]);
                     }
-                    let idx_mgr = IndexManager::new(
-                        self.storage.base_path(),
-                        self.storage.schema_manager_arc(),
-                        self.storage.lancedb_store_arc(),
-                    );
+                    let idx_mgr = self.storage.index_manager();
                     idx_mgr.create_json_fts_index(config).await?;
                     Ok(vec![])
                 }
@@ -2460,11 +2416,7 @@ impl Executor {
                 }
                 LogicalPlan::ShowConstraints(clause) => Ok(self.execute_show_constraints(clause)),
                 LogicalPlan::DropIndex { name, if_exists } => {
-                    let idx_mgr = IndexManager::new(
-                        self.storage.base_path(),
-                        self.storage.schema_manager_arc(),
-                        self.storage.lancedb_store_arc(),
-                    );
+                    let idx_mgr = self.storage.index_manager();
                     match idx_mgr.drop_index(&name).await {
                         Ok(_) => Ok(vec![]),
                         Err(e) => {
@@ -2807,33 +2759,6 @@ impl Executor {
                 LogicalPlan::Delete { .. } => {
                     unreachable!("mutations are handled by DataFusion engine")
                 }
-                LogicalPlan::Begin => {
-                    if let Some(writer_lock) = &self.writer {
-                        let mut writer = writer_lock.write().await;
-                        writer.begin_transaction()?;
-                    } else {
-                        return Err(anyhow!("Transaction requires a Writer"));
-                    }
-                    Ok(vec![HashMap::new()])
-                }
-                LogicalPlan::Commit => {
-                    if let Some(writer_lock) = &self.writer {
-                        let mut writer = writer_lock.write().await;
-                        writer.commit_transaction().await?;
-                    } else {
-                        return Err(anyhow!("Transaction requires a Writer"));
-                    }
-                    Ok(vec![HashMap::new()])
-                }
-                LogicalPlan::Rollback => {
-                    if let Some(writer_lock) = &self.writer {
-                        let mut writer = writer_lock.write().await;
-                        writer.rollback_transaction()?;
-                    } else {
-                        return Err(anyhow!("Transaction requires a Writer"));
-                    }
-                    Ok(vec![HashMap::new()])
-                }
                 LogicalPlan::Copy {
                     target,
                     source,
@@ -2893,6 +2818,7 @@ impl Executor {
     ///
     /// Used by the DataFusion ForeachExec operator to delegate body clause
     /// execution back to the executor.
+    #[expect(clippy::too_many_arguments)]
     pub(crate) async fn execute_foreach_body_plan(
         &self,
         plan: LogicalPlan,
@@ -2901,14 +2827,23 @@ impl Executor {
         prop_manager: &PropertyManager,
         params: &HashMap<String, Value>,
         ctx: Option<&QueryContext>,
+        tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
     ) -> Result<()> {
         match plan {
             LogicalPlan::Set { items, .. } => {
-                self.execute_set_items_locked(&items, scope, writer, prop_manager, params, ctx)
-                    .await?;
+                self.execute_set_items_locked(
+                    &items,
+                    scope,
+                    writer,
+                    prop_manager,
+                    params,
+                    ctx,
+                    tx_l0,
+                )
+                .await?;
             }
             LogicalPlan::Remove { items, .. } => {
-                self.execute_remove_items_locked(&items, scope, writer, prop_manager, ctx)
+                self.execute_remove_items_locked(&items, scope, writer, prop_manager, ctx, tx_l0)
                     .await?;
             }
             LogicalPlan::Delete { items, detach, .. } => {
@@ -2916,18 +2851,34 @@ impl Executor {
                     let val = self
                         .evaluate_expr(expr, scope, prop_manager, params, ctx)
                         .await?;
-                    self.execute_delete_item_locked(&val, detach, writer)
+                    self.execute_delete_item_locked(&val, detach, writer, tx_l0)
                         .await?;
                 }
             }
             LogicalPlan::Create { pattern, .. } => {
-                self.execute_create_pattern(&pattern, scope, writer, prop_manager, params, ctx)
-                    .await?;
+                self.execute_create_pattern(
+                    &pattern,
+                    scope,
+                    writer,
+                    prop_manager,
+                    params,
+                    ctx,
+                    tx_l0,
+                )
+                .await?;
             }
             LogicalPlan::CreateBatch { patterns, .. } => {
                 for pattern in &patterns {
-                    self.execute_create_pattern(pattern, scope, writer, prop_manager, params, ctx)
-                        .await?;
+                    self.execute_create_pattern(
+                        pattern,
+                        scope,
+                        writer,
+                        prop_manager,
+                        params,
+                        ctx,
+                        tx_l0,
+                    )
+                    .await?;
                 }
             }
             LogicalPlan::Merge {
@@ -2936,8 +2887,16 @@ impl Executor {
                 on_create,
                 ..
             } => {
-                self.execute_create_pattern(&pattern, scope, writer, prop_manager, params, ctx)
-                    .await?;
+                self.execute_create_pattern(
+                    &pattern,
+                    scope,
+                    writer,
+                    prop_manager,
+                    params,
+                    ctx,
+                    tx_l0,
+                )
+                .await?;
                 if let Some(on_create_clause) = on_create {
                     self.execute_set_items_locked(
                         &on_create_clause.items,
@@ -2946,6 +2905,7 @@ impl Executor {
                         prop_manager,
                         params,
                         ctx,
+                        tx_l0,
                     )
                     .await?;
                 }
@@ -2975,6 +2935,7 @@ impl Executor {
                             prop_manager,
                             params,
                             ctx,
+                            tx_l0,
                         ))
                         .await?;
                     }
@@ -3643,8 +3604,7 @@ impl Executor {
 
         // 2. Loop
         // Safety: Max iterations to prevent infinite loop
-        // TODO: expose this via UniConfig for user control
-        let max_iterations = 1000;
+        let max_iterations = self.config.max_recursive_cte_iterations;
         for _iteration in 0..max_iterations {
             // CWE-400: Check timeout at each iteration to prevent resource exhaustion
             if let Some(ctx) = ctx {
@@ -4128,7 +4088,7 @@ impl Executor {
 
                 let vid = writer.next_vid().await?;
                 writer
-                    .insert_vertex_with_labels(vid, props, &[target.to_string()])
+                    .insert_vertex_with_labels(vid, props, &[target.to_string()], None)
                     .await?;
                 count += 1;
             }
@@ -4178,7 +4138,15 @@ impl Executor {
 
                 let eid = writer.next_eid(type_id).await?;
                 writer
-                    .insert_edge(src, dst, type_id, eid, props, Some(target.to_string()))
+                    .insert_edge(
+                        src,
+                        dst,
+                        type_id,
+                        eid,
+                        props,
+                        Some(target.to_string()),
+                        None,
+                    )
                     .await?;
                 count += 1;
             }
@@ -4255,7 +4223,7 @@ impl Executor {
                     }
                     let vid = writer.next_vid().await?;
                     writer
-                        .insert_vertex_with_labels(vid, props, &[target.to_string()])
+                        .insert_vertex_with_labels(vid, props, &[target.to_string()], None)
                         .await?;
                     count += 1;
                 }
@@ -4312,7 +4280,15 @@ impl Executor {
 
                     let eid = writer.next_eid(type_id).await?;
                     writer
-                        .insert_edge(src, dst, type_id, eid, props, Some(target.to_string()))
+                        .insert_edge(
+                            src,
+                            dst,
+                            type_id,
+                            eid,
+                            props,
+                            Some(target.to_string()),
+                            None,
+                        )
                         .await?;
                     count += 1;
                 }
@@ -4390,40 +4366,28 @@ impl Executor {
         edge_type: &str,
         edges: &mut HashMap<uni_common::core::id::Eid, (Vid, Vid)>,
     ) -> Result<()> {
-        use futures::TryStreamExt;
-        use lancedb::query::{ExecutableQuery, QueryBase, Select};
+        if let Ok(Some(batch)) = self
+            .storage
+            .scan_delta_table(
+                edge_type,
+                "fwd",
+                &["eid", "src_vid", "dst_vid", "op", "_version"],
+                None,
+            )
+            .await
+        {
+            // Collect ops with versions: eid -> (version, op, src, dst)
+            let mut versioned_ops: HashMap<uni_common::core::id::Eid, (u64, u8, Vid, Vid)> =
+                HashMap::new();
 
-        if let Ok(ds) = self.storage.delta_dataset(edge_type, "fwd") {
-            let lancedb_store = self.storage.lancedb_store();
-            if let Ok(table) = ds.open_lancedb(lancedb_store).await {
-                let query = table.query().select(Select::Columns(vec![
-                    "eid".into(),
-                    "src_vid".into(),
-                    "dst_vid".into(),
-                    "op".into(),
-                    "_version".into(),
-                ]));
+            self.process_delta_batch(&batch, &mut versioned_ops)?;
 
-                if let Ok(stream) = query.execute().await {
-                    let batches: Vec<arrow_array::RecordBatch> =
-                        stream.try_collect().await.unwrap_or_default();
-
-                    // Collect ops with versions: eid -> (version, op, src, dst)
-                    let mut versioned_ops: HashMap<uni_common::core::id::Eid, (u64, u8, Vid, Vid)> =
-                        HashMap::new();
-
-                    for batch in batches {
-                        self.process_delta_batch(&batch, &mut versioned_ops)?;
-                    }
-
-                    // Apply the winning ops
-                    for (eid, (_, op, src, dst)) in versioned_ops {
-                        if op == 0 {
-                            edges.insert(eid, (src, dst));
-                        } else if op == 1 {
-                            edges.remove(&eid);
-                        }
-                    }
+            // Apply the winning ops
+            for (eid, (_, op, src, dst)) in versioned_ops {
+                if op == 0 {
+                    edges.insert(eid, (src, dst));
+                } else if op == 1 {
+                    edges.remove(&eid);
                 }
             }
         }
@@ -5236,7 +5200,12 @@ impl Executor {
         }
     }
 
-    pub(crate) async fn detach_delete_vertex(&self, vid: Vid, writer: &mut Writer) -> Result<()> {
+    pub(crate) async fn detach_delete_vertex(
+        &self,
+        vid: Vid,
+        writer: &mut Writer,
+        tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
+    ) -> Result<()> {
         let schema = self.storage.schema_manager().schema();
         let edge_type_ids: Vec<u32> = schema.all_edge_type_ids();
 
@@ -5254,7 +5223,7 @@ impl Executor {
 
         for edge in out_graph.edges() {
             writer
-                .delete_edge(edge.eid, edge.src_vid, edge.dst_vid, edge.edge_type)
+                .delete_edge(edge.eid, edge.src_vid, edge.dst_vid, edge.edge_type, tx_l0)
                 .await?;
         }
 
@@ -5272,7 +5241,7 @@ impl Executor {
 
         for edge in in_graph.edges() {
             writer
-                .delete_edge(edge.eid, edge.src_vid, edge.dst_vid, edge.edge_type)
+                .delete_edge(edge.eid, edge.src_vid, edge.dst_vid, edge.edge_type, tx_l0)
                 .await?;
         }
 
@@ -5285,6 +5254,7 @@ impl Executor {
         vids: &[Vid],
         labels_per_vid: Vec<Option<Vec<String>>>,
         writer: &mut Writer,
+        tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
     ) -> Result<()> {
         let schema = self.storage.schema_manager().schema();
         let edge_type_ids: Vec<u32> = schema.all_edge_type_ids();
@@ -5303,7 +5273,7 @@ impl Executor {
 
         for edge in out_graph.edges() {
             writer
-                .delete_edge(edge.eid, edge.src_vid, edge.dst_vid, edge.edge_type)
+                .delete_edge(edge.eid, edge.src_vid, edge.dst_vid, edge.edge_type, tx_l0)
                 .await?;
         }
 
@@ -5321,13 +5291,13 @@ impl Executor {
 
         for edge in in_graph.edges() {
             writer
-                .delete_edge(edge.eid, edge.src_vid, edge.dst_vid, edge.edge_type)
+                .delete_edge(edge.eid, edge.src_vid, edge.dst_vid, edge.edge_type, tx_l0)
                 .await?;
         }
 
         // Delete all vertices.
         for (vid, labels) in vids.iter().zip(labels_per_vid) {
-            writer.delete_vertex(*vid, labels).await?;
+            writer.delete_vertex(*vid, labels, tx_l0).await?;
         }
 
         Ok(())

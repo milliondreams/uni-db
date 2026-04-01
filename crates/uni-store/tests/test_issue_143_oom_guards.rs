@@ -39,8 +39,6 @@ async fn test_delta_scan_under_limit() -> Result<()> {
 
     // Create a small delta table (well under limit)
     let delta_ds = storage.delta_dataset("KNOWS", "fwd")?;
-    let lancedb_store = storage.lancedb_store();
-
     let entries = vec![
         L1Entry {
             src_vid: Vid::from(1u64),
@@ -65,11 +63,11 @@ async fn test_delta_scan_under_limit() -> Result<()> {
     ];
 
     let batch = delta_ds.build_record_batch(&entries, &schema_manager.schema())?;
-    delta_ds.write_run_lancedb(lancedb_store, batch).await?;
+    delta_ds.write_run(storage.backend(), batch).await?;
 
     // Scan with a very low limit (should succeed since we have only 2 rows)
     let result = delta_ds
-        .scan_all_lancedb_with_limit(lancedb_store, &schema_manager.schema(), 10)
+        .scan_all_backend_with_limit(storage.backend(), &schema_manager.schema(), 10)
         .await;
     assert!(result.is_ok(), "Scan should succeed when under limit");
     let loaded_entries = result.unwrap();
@@ -99,8 +97,6 @@ async fn test_delta_scan_over_limit() -> Result<()> {
 
     // Create a delta table
     let delta_ds = storage.delta_dataset("KNOWS", "fwd")?;
-    let lancedb_store = storage.lancedb_store();
-
     // Create 100 entries (more than our test limit of 50)
     let mut entries = Vec::new();
     for i in 0..100 {
@@ -117,11 +113,11 @@ async fn test_delta_scan_over_limit() -> Result<()> {
     }
 
     let batch = delta_ds.build_record_batch(&entries, &schema_manager.schema())?;
-    delta_ds.write_run_lancedb(lancedb_store, batch).await?;
+    delta_ds.write_run(storage.backend(), batch).await?;
 
     // Scan with a limit of 50 (should fail since we have 100 rows)
     let result = delta_ds
-        .scan_all_lancedb_with_limit(lancedb_store, &schema_manager.schema(), 50)
+        .scan_all_backend_with_limit(storage.backend(), &schema_manager.schema(), 50)
         .await;
     assert!(result.is_err(), "Scan should fail when over limit");
 
@@ -160,8 +156,6 @@ async fn test_vertex_compaction_over_limit() -> Result<()> {
 
     // Create a vertex table with 100 vertices
     let vertex_ds = storage.vertex_dataset("Person")?;
-    let lancedb_store = storage.lancedb_store();
-
     let mut vertices = Vec::new();
     for i in 0..100 {
         let mut props = uni_common::Properties::new();
@@ -174,7 +168,7 @@ async fn test_vertex_compaction_over_limit() -> Result<()> {
     let batch =
         vertex_ds.build_record_batch(&vertices, &deleted, &versions, &schema_manager.schema())?;
     vertex_ds
-        .write_batch_lancedb(lancedb_store, batch, &schema_manager.schema())
+        .write_batch(storage.backend(), batch, &schema_manager.schema())
         .await?;
 
     // Create a compactor with a very low limit (using a mock)
@@ -217,8 +211,6 @@ async fn test_adjacency_compaction_delta_over_limit() -> Result<()> {
 
     // Create a large delta table (more than our mock limit)
     let delta_ds = storage.delta_dataset("KNOWS", "fwd")?;
-    let lancedb_store = storage.lancedb_store();
-
     // Create many entries in batches
     let batch_size = 1000;
     let num_batches = 10;
@@ -239,12 +231,12 @@ async fn test_adjacency_compaction_delta_over_limit() -> Result<()> {
             });
         }
         let batch = delta_ds.build_record_batch(&entries, &schema_manager.schema())?;
-        delta_ds.write_run_lancedb(lancedb_store, batch).await?;
+        delta_ds.write_run(storage.backend(), batch).await?;
     }
 
     // Verify the table has the expected number of rows
-    let table = delta_ds.open_lancedb(lancedb_store).await?;
-    let row_count = table.count_rows(None).await?;
+    let table_name = delta_ds.table_name();
+    let row_count = storage.backend().count_rows(&table_name, None).await?;
     assert_eq!(
         row_count,
         (batch_size * num_batches),
@@ -255,7 +247,7 @@ async fn test_adjacency_compaction_delta_over_limit() -> Result<()> {
     // Verify the scan works without triggering compaction
     // (Compaction would trigger debug assertion since we didn't create main_edges entries)
     let entries = delta_ds
-        .scan_all_lancedb(lancedb_store, &schema_manager.schema())
+        .scan_all_backend(storage.backend(), &schema_manager.schema())
         .await?;
     assert_eq!(
         entries.len(),
@@ -318,8 +310,6 @@ async fn test_custom_max_compaction_rows() -> Result<()> {
 
     // Create a vertex table with 100 vertices (exceeds our custom limit of 50)
     let vertex_ds = storage.vertex_dataset("Person")?;
-    let lancedb_store = storage.lancedb_store();
-
     let mut vertices = Vec::new();
     for i in 0..100 {
         let mut props = uni_common::Properties::new();
@@ -332,7 +322,7 @@ async fn test_custom_max_compaction_rows() -> Result<()> {
     let batch =
         vertex_ds.build_record_batch(&vertices, &deleted, &versions, &schema_manager.schema())?;
     vertex_ds
-        .write_batch_lancedb(lancedb_store, batch, &schema_manager.schema())
+        .write_batch(storage.backend(), batch, &schema_manager.schema())
         .await?;
 
     // Attempt compaction - should fail because 100 > 50

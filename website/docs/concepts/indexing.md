@@ -13,8 +13,8 @@ Uni supports five categories of indexes:
 │    VECTOR INDEXES   │   SCALAR INDEXES    │   FULL-TEXT INDEXES  │   JSON FTS INDEXES   │  INVERTED INDEXES  │
 ├─────────────────────┼─────────────────────┼──────────────────────┼──────────────────────┼────────────────────┤
 │ • HNSW              │ • BTree             │ • Inverted Index     │ • Lance Inverted     │ • Set Membership   │
-│ • IVF_PQ            │                     │ • Tokenizers         │ • BM25 Ranking       │ • ANY IN patterns  │
-│ • Flat (exact)      │                     │ • Scoring            │ • Path-Specific      │ • Tag filtering    │
+│ • IVF_PQ            │ • Hash              │ • Tokenizers         │ • BM25 Ranking       │ • ANY IN patterns  │
+│ • Flat (exact)      │ • Bitmap            │ • Scoring            │ • Path-Specific      │ • Tag filtering    │
 ├─────────────────────┼─────────────────────┼──────────────────────┼──────────────────────┼────────────────────┤
 │ Similarity search   │ Exact/range queries │ Keyword search       │ JSON document search │ List membership    │
 │ Nearest neighbors   │ Equality checks     │ Text matching        │ CONTAINS operator    │ Multi-value props  │
@@ -145,6 +145,8 @@ Scalar indexes optimize exact match and range queries on primitive properties.
 | Type | Operations | Best For |
 |------|------------|----------|
 | **BTree** | `=`, `<`, `>`, `<=`, `>=`, `BETWEEN` | General purpose, range queries |
+| **Hash** | `=`, `IN` | High-cardinality equality lookups |
+| **Bitmap** | `=`, `IN`, low-cardinality filters | Enum-like columns, boolean flags |
 
 ### Creating Scalar Indexes
 
@@ -154,7 +156,7 @@ Scalar indexes optimize exact match and range queries on primitive properties.
 CREATE INDEX author_email FOR (a:Author) ON (a.email)
 ```
 
-The storage layer currently builds BTree scalar indexes only.
+The storage layer supports BTree, Hash, and Bitmap scalar indexes. BTree is the default when no type is specified.
 
 ### Composite Indexes
 

@@ -1,130 +1,953 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Dragonscale Team
 
-use crate::api::Uni;
+//! Session — the primary read scope for all database access.
+//!
+//! Sessions are cheap, synchronous, and infallible to create. All reads go
+//! through sessions, and sessions are the factory for transactions (writes).
+
 use std::collections::HashMap;
 use std::sync::Arc;
-use uni_common::Result;
-use uni_query::{ExecuteResult, QueryResult, Value};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
-/// Builder for creating query sessions with scoped variables
-pub struct SessionBuilder<'a> {
-    db: &'a Uni,
-    variables: HashMap<String, Value>,
+use tokio_util::sync::CancellationToken;
+use tracing::instrument;
+use uuid::Uuid;
+
+use crate::api::UniInner;
+use crate::api::hooks::{HookContext, QueryType, SessionHook};
+use crate::api::impl_locy::LocyRuleRegistry;
+use crate::api::locy_result::LocyResult;
+use crate::api::transaction::{IsolationLevel, Transaction};
+use uni_common::{Result, UniError, Value};
+use uni_query::{ExplainOutput, ProfileOutput, QueryCursor, QueryResult, Row};
+
+/// Atomic counters for plan cache hits/misses, shared between Session and its
+/// query execution helpers.
+pub(crate) struct PlanCacheMetrics {
+    pub(crate) hits: AtomicU64,
+    pub(crate) misses: AtomicU64,
 }
 
-impl<'a> SessionBuilder<'a> {
-    pub fn new(db: &'a Uni) -> Self {
+/// Describes the capabilities of a session in its current mode.
+///
+/// This is a snapshot — capabilities may change if the underlying database
+/// configuration changes (e.g., read-only mode toggled).
+#[derive(Debug, Clone)]
+pub struct SessionCapabilities {
+    /// Whether the session can create transactions and execute writes.
+    pub can_write: bool,
+    /// Whether the session supports version pinning (read-at-version).
+    pub can_pin: bool,
+    /// The isolation level used for transactions in this session.
+    pub isolation: IsolationLevel,
+    /// Whether commit notifications are available.
+    pub has_notifications: bool,
+    /// Write lease strategy in effect, if any.
+    pub write_lease: Option<WriteLeaseSummary>,
+}
+
+/// Summary of the write lease strategy, suitable for capability snapshots.
+///
+/// This is a `Clone`-friendly description of the [`WriteLease`](crate::WriteLease)
+/// variant without carrying the actual provider trait object.
+#[derive(Debug, Clone)]
+pub enum WriteLeaseSummary {
+    /// Local single-process lock.
+    Local,
+    /// DynamoDB-based distributed lease.
+    DynamoDB { table: String },
+    /// Custom lease provider (opaque).
+    Custom,
+}
+
+/// Internal atomic counters for session-level metrics.
+pub(crate) struct SessionMetricsInner {
+    pub(crate) queries_executed: AtomicU64,
+    pub(crate) locy_evaluations: AtomicU64,
+    pub(crate) total_query_time_us: AtomicU64,
+    pub(crate) transactions_committed: AtomicU64,
+    pub(crate) transactions_rolled_back: AtomicU64,
+    pub(crate) total_rows_returned: AtomicU64,
+    pub(crate) total_rows_scanned: AtomicU64,
+}
+
+impl SessionMetricsInner {
+    fn new() -> Self {
+        Self {
+            queries_executed: AtomicU64::new(0),
+            locy_evaluations: AtomicU64::new(0),
+            total_query_time_us: AtomicU64::new(0),
+            transactions_committed: AtomicU64::new(0),
+            transactions_rolled_back: AtomicU64::new(0),
+            total_rows_returned: AtomicU64::new(0),
+            total_rows_scanned: AtomicU64::new(0),
+        }
+    }
+}
+
+/// Snapshot of session-level metrics.
+#[derive(Debug, Clone)]
+pub struct SessionMetrics {
+    /// The session ID.
+    pub session_id: String,
+    /// When the session was created.
+    pub active_since: Instant,
+    /// Number of queries executed.
+    pub queries_executed: u64,
+    /// Number of Locy evaluations.
+    pub locy_evaluations: u64,
+    /// Total time spent executing queries.
+    pub total_query_time: Duration,
+    /// Number of transactions that were committed.
+    pub transactions_committed: u64,
+    /// Number of transactions that were rolled back.
+    pub transactions_rolled_back: u64,
+    /// Total rows returned across all queries.
+    pub total_rows_returned: u64,
+    /// Total rows scanned across all queries (0 until executor instrumentation).
+    pub total_rows_scanned: u64,
+    /// Number of plan cache hits.
+    pub plan_cache_hits: u64,
+    /// Number of plan cache misses.
+    pub plan_cache_misses: u64,
+    /// Current plan cache size (entries).
+    pub plan_cache_size: usize,
+}
+
+/// A database session — the primary scope for reads.
+///
+/// All data access goes through sessions. Sessions hold scoped query parameters
+/// and a private copy of the Locy rule registry. They are the factory for
+/// [`Transaction`]s (write scope).
+///
+/// Sessions are cheap to create (sync, no I/O) and cheap to clone (Arc-based).
+///
+/// # Examples
+///
+/// ```no_run
+/// # use uni_db::Uni;
+/// # async fn example(db: &Uni) -> uni_db::Result<()> {
+/// let mut session = db.session();
+/// session.set("tenant", 42);
+///
+/// let rows = session.query("MATCH (n) WHERE n.tenant = $tenant RETURN n").await?;
+///
+/// // Transactions for writes
+/// let tx = session.tx().await?;
+/// tx.execute("CREATE (:Person {name: 'Alice'})").await?;
+/// tx.commit().await?;
+/// # Ok(())
+/// # }
+/// ```
+pub struct Session {
+    pub(crate) db: Arc<UniInner>,
+    /// When pinned via `pin_to_version`/`pin_to_timestamp`, holds the original
+    /// (live) db reference so `refresh()` can restore it.
+    original_db: Option<Arc<UniInner>>,
+    id: String,
+    params: Arc<std::sync::RwLock<HashMap<String, Value>>>,
+    rule_registry: Arc<std::sync::RwLock<LocyRuleRegistry>>,
+    /// Mutual exclusion for write contexts (transaction, bulk writer).
+    /// Only one write context can be active per session.
+    active_write_guard: Arc<AtomicBool>,
+    /// Atomic session-level metrics counters.
+    pub(crate) metrics_inner: Arc<SessionMetricsInner>,
+    /// Timestamp when this session was created.
+    created_at: Instant,
+    /// Cancellation token for cooperative query cancellation.
+    /// Behind `Arc<RwLock<>>` so `cancel()` can take `&self`.
+    cancellation_token: Arc<std::sync::RwLock<CancellationToken>>,
+    /// Transparent plan cache for parsed/planned queries.
+    plan_cache: std::sync::Mutex<PlanCache>,
+    /// Atomic plan cache hit/miss counters.
+    plan_cache_metrics: Arc<PlanCacheMetrics>,
+    /// Session-level hooks for query/commit interception, keyed by name.
+    pub(crate) hooks: HashMap<String, Arc<dyn SessionHook>>,
+    /// Default query timeout (from template or explicit configuration).
+    pub(crate) query_timeout: Option<Duration>,
+    /// Default transaction timeout (from template or explicit configuration).
+    pub(crate) transaction_timeout: Option<Duration>,
+}
+
+impl Session {
+    /// Create a new session from a shared database reference.
+    pub(crate) fn new(db: Arc<UniInner>) -> Self {
+        // Clone the global rule registry into this session
+        let global_registry = db.locy_rule_registry.read().unwrap();
+        let session_registry = global_registry.clone();
+        drop(global_registry);
+
+        db.active_session_count.fetch_add(1, Ordering::Relaxed);
+
         Self {
             db,
-            variables: HashMap::new(),
+            original_db: None,
+            id: Uuid::new_v4().to_string(),
+            params: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            rule_registry: Arc::new(std::sync::RwLock::new(session_registry)),
+            active_write_guard: Arc::new(AtomicBool::new(false)),
+            metrics_inner: Arc::new(SessionMetricsInner::new()),
+            created_at: Instant::now(),
+            cancellation_token: Arc::new(std::sync::RwLock::new(CancellationToken::new())),
+            plan_cache: std::sync::Mutex::new(PlanCache::new(1000)),
+            plan_cache_metrics: Arc::new(PlanCacheMetrics {
+                hits: AtomicU64::new(0),
+                misses: AtomicU64::new(0),
+            }),
+            hooks: HashMap::new(),
+            query_timeout: None,
+            transaction_timeout: None,
         }
     }
 
-    /// Set a session variable
-    pub fn set<K: Into<String>, V: Into<Value>>(mut self, key: K, value: V) -> Self {
-        self.variables.insert(key.into(), value.into());
-        self
-    }
+    /// Create a new session from a template's pre-compiled state.
+    pub(crate) fn new_from_template(
+        db: Arc<UniInner>,
+        params: HashMap<String, Value>,
+        rule_registry: LocyRuleRegistry,
+        hooks: HashMap<String, Arc<dyn SessionHook>>,
+        query_timeout: Option<Duration>,
+        transaction_timeout: Option<Duration>,
+    ) -> Self {
+        db.active_session_count.fetch_add(1, Ordering::Relaxed);
 
-    /// Build the session (variables become immutable)
-    pub fn build(self) -> Session<'a> {
-        Session {
-            db: self.db,
-            variables: Arc::new(self.variables),
+        Self {
+            db,
+            original_db: None,
+            id: Uuid::new_v4().to_string(),
+            params: Arc::new(std::sync::RwLock::new(params)),
+            rule_registry: Arc::new(std::sync::RwLock::new(rule_registry)),
+            active_write_guard: Arc::new(AtomicBool::new(false)),
+            metrics_inner: Arc::new(SessionMetricsInner::new()),
+            created_at: Instant::now(),
+            cancellation_token: Arc::new(std::sync::RwLock::new(CancellationToken::new())),
+            plan_cache: std::sync::Mutex::new(PlanCache::new(1000)),
+            plan_cache_metrics: Arc::new(PlanCacheMetrics {
+                hits: AtomicU64::new(0),
+                misses: AtomicU64::new(0),
+            }),
+            hooks,
+            query_timeout,
+            transaction_timeout,
         }
     }
-}
 
-/// A query session with scoped variables
-pub struct Session<'a> {
-    db: &'a Uni,
-    variables: Arc<HashMap<String, Value>>,
-}
+    // ── Scoped Parameters ─────────────────────────────────────────────
 
-impl<'a> Session<'a> {
-    /// Execute a query with session variables available
+    /// Access the session-scoped parameter store.
+    pub fn params(&self) -> Params<'_> {
+        Params {
+            store: &self.params,
+        }
+    }
+
+    // ── Cypher Reads ──────────────────────────────────────────────────
+
+    /// Execute a read-only Cypher query.
+    ///
+    /// Uses the transparent plan cache: repeated queries with the same text
+    /// skip parsing and planning. Cache entries auto-invalidate on schema
+    /// changes.
+    #[instrument(skip(self), fields(session_id = %self.id))]
     pub async fn query(&self, cypher: &str) -> Result<QueryResult> {
-        self.query_with(cypher).execute().await
+        let params = self.merge_params(HashMap::new());
+        self.run_before_query_hooks(cypher, QueryType::Cypher, &params)?;
+        let start = Instant::now();
+        let result = self.execute_cached(cypher, params.clone()).await;
+        self.metrics_inner
+            .queries_executed
+            .fetch_add(1, Ordering::Relaxed);
+        self.db.total_queries.fetch_add(1, Ordering::Relaxed);
+        self.metrics_inner
+            .total_query_time_us
+            .fetch_add(start.elapsed().as_micros() as u64, Ordering::Relaxed);
+        if let Ok(ref qr) = result {
+            self.metrics_inner
+                .total_rows_returned
+                .fetch_add(qr.len() as u64, Ordering::Relaxed);
+            self.run_after_query_hooks(cypher, QueryType::Cypher, &params, qr.metrics());
+        }
+        result
     }
 
-    /// Execute a query with additional parameters
-    pub fn query_with(&self, cypher: &str) -> SessionQueryBuilder<'a, '_> {
-        SessionQueryBuilder {
+    /// Execute a read-only Cypher query with a builder for parameters.
+    pub fn query_with(&self, cypher: &str) -> QueryBuilder<'_> {
+        QueryBuilder {
             session: self,
             cypher: cypher.to_string(),
             params: HashMap::new(),
+            timeout: self.query_timeout,
+            max_memory: None,
+            cancellation_token: None,
         }
     }
 
-    /// Execute a mutation
-    pub async fn execute(&self, cypher: &str) -> Result<ExecuteResult> {
-        self.query_with(cypher).execute_mutation().await
+    // ── Locy Evaluation ───────────────────────────────────────────────
+
+    /// Evaluate a Locy program with default configuration.
+    #[instrument(skip(self), fields(session_id = %self.id))]
+    pub async fn locy(&self, program: &str) -> Result<LocyResult> {
+        self.run_before_query_hooks(program, QueryType::Locy, &HashMap::new())?;
+        let result = self.locy_with(program).run().await;
+        self.metrics_inner
+            .locy_evaluations
+            .fetch_add(1, Ordering::Relaxed);
+        result
     }
 
-    /// Execute a mutation with additional parameters using a builder.
+    /// Evaluate a Locy program with parameters using a builder.
+    pub fn locy_with(&self, program: &str) -> crate::api::locy_builder::LocyBuilder<'_> {
+        crate::api::locy_builder::LocyBuilder::new(self, program)
+    }
+
+    // ── Rule Management ───────────────────────────────────────────────
+
+    /// Access the session-scoped rule registry.
+    pub fn rules(&self) -> super::rule_registry::RuleRegistry<'_> {
+        super::rule_registry::RuleRegistry::new(&self.rule_registry)
+    }
+
+    /// Compile a Locy program without executing it, using this session's rule registry.
+    #[instrument(skip(self), fields(session_id = %self.id))]
+    pub fn compile_locy(&self, program: &str) -> Result<uni_locy::CompiledProgram> {
+        let ast = uni_cypher::parse_locy(program).map_err(|e| UniError::Parse {
+            message: format!("LocyParseError: {e}"),
+            position: None,
+            line: None,
+            column: None,
+            context: None,
+        })?;
+        let registry = self.rule_registry.read().unwrap();
+        if registry.rules.is_empty() {
+            drop(registry);
+            uni_locy::compile(&ast).map_err(|e| UniError::Query {
+                message: format!("LocyCompileError: {e}"),
+                query: None,
+            })
+        } else {
+            let external_names: Vec<String> = registry.rules.keys().cloned().collect();
+            drop(registry);
+            uni_locy::compile_with_external_rules(&ast, &external_names).map_err(|e| {
+                UniError::Query {
+                    message: format!("LocyCompileError: {e}"),
+                    query: None,
+                }
+            })
+        }
+    }
+
+    // ── Transaction & Writer Factories ────────────────────────────────
+
+    /// Create a new transaction for multi-statement writes.
     ///
-    /// Alias for [`query_with`](Self::query_with) that clarifies intent for mutations.
-    pub fn execute_with(&self, cypher: &str) -> SessionQueryBuilder<'a, '_> {
-        self.query_with(cypher)
+    /// Only one write context (transaction or bulk writer) can be active
+    /// per session at a time. Returns `ReadOnly` if the session is pinned.
+    #[instrument(skip(self), fields(session_id = %self.id))]
+    pub async fn tx(&self) -> Result<Transaction> {
+        if self.is_pinned() {
+            return Err(UniError::ReadOnly {
+                operation: "start_transaction".to_string(),
+            });
+        }
+        Transaction::new(self).await
     }
 
-    /// Get a session variable value
-    pub fn get(&self, key: &str) -> Option<&Value> {
-        self.variables.get(key)
+    /// Create a transaction with builder options (timeout, isolation level).
+    pub fn tx_with(&self) -> TransactionBuilder<'_> {
+        TransactionBuilder {
+            session: self,
+            timeout: self.transaction_timeout,
+            isolation: IsolationLevel::default(),
+        }
+    }
+
+    // ── Version Pinning ──────────────────────────────────────────────
+
+    /// Pin this session to a specific snapshot version.
+    ///
+    /// All subsequent reads see data as of that version. Writes are rejected.
+    #[instrument(skip(self), fields(session_id = %self.id))]
+    pub async fn pin_to_version(&mut self, snapshot_id: &str) -> Result<()> {
+        let pinned = self.live_db().at_snapshot(snapshot_id).await?;
+        if self.original_db.is_none() {
+            self.original_db = Some(self.db.clone());
+        }
+        self.db = Arc::new(pinned);
+        Ok(())
+    }
+
+    /// Pin this session to a specific timestamp.
+    ///
+    /// Resolves the closest snapshot at or before the given timestamp, then
+    /// pins the session to that snapshot. Writes are rejected while pinned.
+    #[instrument(skip(self), fields(session_id = %self.id))]
+    pub async fn pin_to_timestamp(&mut self, ts: chrono::DateTime<chrono::Utc>) -> Result<()> {
+        let snapshot_id = self.live_db().resolve_time_travel_timestamp(ts).await?;
+        self.pin_to_version(&snapshot_id).await
+    }
+
+    /// Refresh: unpin the session, returning to the live database state.
+    ///
+    /// In single-process mode, this simply unpins the session.
+    /// In multi-agent mode (Phase 2), this picks up the latest
+    /// committed version from storage.
+    pub async fn refresh(&mut self) -> Result<()> {
+        if let Some(original) = self.original_db.take() {
+            self.db = original;
+        }
+        Ok(())
+    }
+
+    /// Returns `true` if the session is pinned to a specific version.
+    pub fn is_pinned(&self) -> bool {
+        self.original_db.is_some()
+    }
+
+    /// Get the live (unpinned) db reference for resolving snapshots.
+    fn live_db(&self) -> &Arc<UniInner> {
+        self.original_db.as_ref().unwrap_or(&self.db)
+    }
+
+    // ── Cancellation ─────────────────────────────────────────────────
+
+    /// Cancel all in-flight queries in this session.
+    ///
+    /// Queries check `is_cancelled()` at each operator boundary via
+    /// `check_timeout()`. After cancellation, a fresh token is created
+    /// so the session remains usable.
+    #[instrument(skip(self), fields(session_id = %self.id))]
+    pub fn cancel(&self) {
+        let mut token = self.cancellation_token.write().unwrap();
+        token.cancel();
+        *token = CancellationToken::new();
+    }
+
+    /// Get a clone of this session's cancellation token.
+    ///
+    /// Useful for external cancellation (e.g. from a timeout task).
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.cancellation_token.read().unwrap().clone()
+    }
+
+    // ── Prepared Statements ──────────────────────────────────────────
+
+    /// Prepare a Cypher query for repeated execution.
+    ///
+    /// The query is parsed and planned once; subsequent executions skip those
+    /// phases. If the schema changes, the prepared query auto-replans.
+    #[instrument(skip(self), fields(session_id = %self.id))]
+    pub async fn prepare(&self, cypher: &str) -> Result<crate::api::prepared::PreparedQuery> {
+        crate::api::prepared::PreparedQuery::new(self.db.clone(), cypher).await
+    }
+
+    /// Prepare a Locy program for repeated evaluation.
+    #[instrument(skip(self), fields(session_id = %self.id))]
+    pub async fn prepare_locy(&self, program: &str) -> Result<crate::api::prepared::PreparedLocy> {
+        crate::api::prepared::PreparedLocy::new(
+            self.db.clone(),
+            self.rule_registry.clone(),
+            program,
+        )
+    }
+
+    // ── Hooks ─────────────────────────────────────────────────────────
+
+    /// Add a named session hook for query/commit interception.
+    pub fn add_hook(&mut self, name: impl Into<String>, hook: impl SessionHook + 'static) {
+        self.hooks.insert(name.into(), Arc::new(hook));
+    }
+
+    /// Remove a hook by name. Returns true if it existed.
+    pub fn remove_hook(&mut self, name: &str) -> bool {
+        self.hooks.remove(name).is_some()
+    }
+
+    /// List names of all registered hooks.
+    pub fn list_hooks(&self) -> Vec<String> {
+        self.hooks.keys().cloned().collect()
+    }
+
+    /// Remove all hooks.
+    pub fn clear_hooks(&mut self) {
+        self.hooks.clear();
+    }
+
+    /// Run before-query hooks. Returns `Err(HookRejected)` if any hook rejects.
+    pub(crate) fn run_before_query_hooks(
+        &self,
+        query_text: &str,
+        query_type: QueryType,
+        params: &HashMap<String, Value>,
+    ) -> Result<()> {
+        if self.hooks.is_empty() {
+            return Ok(());
+        }
+        let ctx = HookContext {
+            session_id: self.id.clone(),
+            query_text: query_text.to_string(),
+            query_type,
+            params: params.clone(),
+        };
+        for hook in self.hooks.values() {
+            hook.before_query(&ctx)?;
+        }
+        Ok(())
+    }
+
+    /// Run after-query hooks. Panics in hooks are caught and logged.
+    pub(crate) fn run_after_query_hooks(
+        &self,
+        query_text: &str,
+        query_type: QueryType,
+        params: &HashMap<String, Value>,
+        metrics: &uni_query::QueryMetrics,
+    ) {
+        if self.hooks.is_empty() {
+            return;
+        }
+        let ctx = HookContext {
+            session_id: self.id.clone(),
+            query_text: query_text.to_string(),
+            query_type,
+            params: params.clone(),
+        };
+        for hook in self.hooks.values() {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                hook.after_query(&ctx, metrics);
+            }));
+            if let Err(e) = result {
+                tracing::error!("after_query hook panicked: {:?}", e);
+            }
+        }
+    }
+
+    // ── Commit Notifications ─────────────────────────────────────────
+
+    /// Watch for all commit notifications.
+    pub fn watch(&self) -> crate::api::notifications::CommitStream {
+        let rx = self.db.commit_tx.subscribe();
+        crate::api::notifications::WatchBuilder::new(rx).build()
+    }
+
+    /// Watch for commit notifications with filters.
+    pub fn watch_with(&self) -> crate::api::notifications::WatchBuilder {
+        let rx = self.db.commit_tx.subscribe();
+        crate::api::notifications::WatchBuilder::new(rx)
+    }
+
+    // ── Lifecycle & Observability ──────────────────────────────────────
+
+    /// Get the session ID.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Query the capabilities of this session.
+    ///
+    /// Returns a snapshot of what the session can do in its current mode.
+    pub fn capabilities(&self) -> SessionCapabilities {
+        use crate::api::multi_agent::WriteLease;
+        let write_lease = self.db.write_lease.as_ref().map(|wl| match wl {
+            WriteLease::Local => WriteLeaseSummary::Local,
+            WriteLease::DynamoDB { table } => WriteLeaseSummary::DynamoDB {
+                table: table.clone(),
+            },
+            WriteLease::Custom(_) => WriteLeaseSummary::Custom,
+        });
+        SessionCapabilities {
+            can_write: self.db.writer.is_some() && !self.is_pinned(),
+            can_pin: true,
+            isolation: IsolationLevel::default(),
+            has_notifications: true,
+            write_lease,
+        }
+    }
+
+    /// Snapshot the session's accumulated metrics.
+    pub fn metrics(&self) -> SessionMetrics {
+        let m = &self.metrics_inner;
+        SessionMetrics {
+            session_id: self.id.clone(),
+            active_since: self.created_at,
+            queries_executed: m.queries_executed.load(Ordering::Relaxed),
+            locy_evaluations: m.locy_evaluations.load(Ordering::Relaxed),
+            total_query_time: Duration::from_micros(m.total_query_time_us.load(Ordering::Relaxed)),
+            transactions_committed: m.transactions_committed.load(Ordering::Relaxed),
+            transactions_rolled_back: m.transactions_rolled_back.load(Ordering::Relaxed),
+            total_rows_returned: m.total_rows_returned.load(Ordering::Relaxed),
+            total_rows_scanned: m.total_rows_scanned.load(Ordering::Relaxed),
+            plan_cache_hits: self.plan_cache_metrics.hits.load(Ordering::Relaxed),
+            plan_cache_misses: self.plan_cache_metrics.misses.load(Ordering::Relaxed),
+            plan_cache_size: self.plan_cache.lock().map(|c| c.len()).unwrap_or(0),
+        }
+    }
+
+    // ── Internal Helpers ──────────────────────────────────────────────
+
+    /// Execute a query using the transparent plan cache.
+    ///
+    /// On cache hit: reuses the parsed AST and logical plan, skipping parse
+    /// and planning phases entirely. On cache miss: parses, plans, caches,
+    /// then executes normally. Cache entries are invalidated when the schema
+    /// version changes.
+    pub(crate) async fn execute_cached(
+        &self,
+        cypher: &str,
+        params: HashMap<String, Value>,
+    ) -> Result<QueryResult> {
+        let schema_version = self.db.schema.schema().schema_version;
+        let cache_key = plan_cache_key(cypher);
+
+        // Try cache lookup (brief lock, then release)
+        let cached = self.plan_cache.lock().ok().and_then(|mut cache| {
+            cache
+                .get(cache_key, schema_version)
+                .map(|entry| (entry.ast.clone(), entry.plan.clone()))
+        });
+
+        if let Some((_ast, plan)) = cached {
+            // Cache hit — skip parse and plan, execute the cached plan directly
+            self.plan_cache_metrics.hits.fetch_add(1, Ordering::Relaxed);
+            return self
+                .db
+                .execute_plan_internal(plan, cypher, params, self.db.config.clone(), None)
+                .await;
+        }
+
+        // Cache miss — parse, plan, cache, execute via the normal path
+        self.plan_cache_metrics
+            .misses
+            .fetch_add(1, Ordering::Relaxed);
+
+        // Parse
+        let ast = uni_cypher::parse(cypher).map_err(crate::api::impl_query::into_parse_error)?;
+
+        // Time-travel queries bypass the cache entirely
+        if matches!(ast, uni_cypher::ast::Query::TimeTravel { .. }) {
+            return self
+                .db
+                .execute_internal_with_config(cypher, params, self.db.config.clone())
+                .await;
+        }
+
+        // Plan
+        let planner = uni_query::QueryPlanner::new(self.db.schema.schema().clone())
+            .with_params(params.clone());
+        let plan = planner
+            .plan(ast.clone())
+            .map_err(|e| crate::api::impl_query::into_query_error(e, cypher))?;
+
+        // Cache the entry
+        if let Ok(mut cache) = self.plan_cache.lock() {
+            cache.insert(
+                cache_key,
+                PlanCacheEntry {
+                    ast,
+                    plan: plan.clone(),
+                    schema_version,
+                    hit_count: 0,
+                },
+            );
+        }
+
+        // Execute the freshly planned query
+        self.db
+            .execute_plan_internal(plan, cypher, params, self.db.config.clone(), None)
+            .await
+    }
+
+    /// Get the database inner reference (for Transaction, LocyEngine, etc.)
+    pub(crate) fn db(&self) -> &Arc<UniInner> {
+        &self.db
+    }
+
+    /// Get the session's rule registry.
+    pub(crate) fn rule_registry(&self) -> &Arc<std::sync::RwLock<LocyRuleRegistry>> {
+        &self.rule_registry
+    }
+
+    /// Get the active write guard.
+    pub(crate) fn active_write_guard(&self) -> &Arc<AtomicBool> {
+        &self.active_write_guard
+    }
+
+    /// Merge session params with per-query params (per-query takes precedence).
+    pub(crate) fn merge_params(
+        &self,
+        mut query_params: HashMap<String, Value>,
+    ) -> HashMap<String, Value> {
+        let session_params = self.params.read().unwrap();
+        if !session_params.is_empty() {
+            let session_map: HashMap<String, Value> = session_params.clone();
+            if let Some(Value::Map(existing)) = query_params.get_mut("session") {
+                for (k, v) in session_map {
+                    existing.entry(k).or_insert(v);
+                }
+            } else {
+                query_params.insert("session".to_string(), Value::Map(session_map));
+            }
+        }
+        query_params
     }
 }
 
-pub struct SessionQueryBuilder<'a, 'b> {
-    session: &'b Session<'a>,
+/// Facade for session-scoped parameters.
+///
+/// Obtained via `session.params()`.
+pub struct Params<'a> {
+    store: &'a Arc<std::sync::RwLock<HashMap<String, Value>>>,
+}
+
+impl<'a> Params<'a> {
+    /// Set a parameter.
+    pub fn set<K: Into<String>, V: Into<Value>>(&self, key: K, value: V) {
+        self.store.write().unwrap().insert(key.into(), value.into());
+    }
+
+    /// Get a parameter value by key.
+    pub fn get(&self, key: &str) -> Option<Value> {
+        self.store.read().unwrap().get(key).cloned()
+    }
+
+    /// Remove a parameter. Returns the previous value if it existed.
+    pub fn unset(&self, key: &str) -> Option<Value> {
+        self.store.write().unwrap().remove(key)
+    }
+
+    /// Get a snapshot of all parameters.
+    pub fn get_all(&self) -> HashMap<String, Value> {
+        self.store.read().unwrap().clone()
+    }
+
+    /// Set multiple parameters.
+    pub fn set_all<I, K, V>(&self, params: I)
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<Value>,
+    {
+        let mut store = self.store.write().unwrap();
+        for (k, v) in params {
+            store.insert(k.into(), v.into());
+        }
+    }
+
+    /// Clone the underlying store Arc for use in Python bindings.
+    pub fn clone_store_arc(&self) -> Arc<std::sync::RwLock<HashMap<String, Value>>> {
+        self.store.clone()
+    }
+}
+
+/// Builder for parameterized queries within a session.
+pub struct QueryBuilder<'a> {
+    session: &'a Session,
     cypher: String,
     params: HashMap<String, Value>,
+    timeout: Option<std::time::Duration>,
+    max_memory: Option<usize>,
+    cancellation_token: Option<CancellationToken>,
 }
 
-impl<'a, 'b> SessionQueryBuilder<'a, 'b> {
+impl<'a> QueryBuilder<'a> {
+    /// Bind a parameter to the query.
     pub fn param<K: Into<String>, V: Into<Value>>(mut self, key: K, value: V) -> Self {
         self.params.insert(key.into(), value.into());
         self
     }
 
-    pub async fn execute(self) -> Result<QueryResult> {
-        let params = Self::merge_params_internal(self.params, &self.session.variables);
-        self.session.db.execute_internal(&self.cypher, params).await
+    /// Bind multiple parameters from an iterator.
+    pub fn params<'p>(mut self, params: impl IntoIterator<Item = (&'p str, Value)>) -> Self {
+        for (k, v) in params {
+            self.params.insert(k.to_string(), v);
+        }
+        self
     }
 
-    pub async fn execute_mutation(self) -> Result<ExecuteResult> {
-        let params = Self::merge_params_internal(self.params, &self.session.variables);
-        let before = self.session.db.get_mutation_count().await;
-        let result = self
-            .session
-            .db
-            .execute_internal(&self.cypher, params)
-            .await?;
-        let affected_rows = if result.is_empty() {
+    /// Set maximum execution time for this query.
+    pub fn timeout(mut self, duration: std::time::Duration) -> Self {
+        self.timeout = Some(duration);
+        self
+    }
+
+    /// Set maximum memory per query in bytes.
+    pub fn max_memory(mut self, bytes: usize) -> Self {
+        self.max_memory = Some(bytes);
+        self
+    }
+
+    /// Attach a cancellation token for cooperative query cancellation.
+    pub fn cancellation_token(mut self, token: CancellationToken) -> Self {
+        self.cancellation_token = Some(token);
+        self
+    }
+
+    /// Execute the query and fetch all results.
+    ///
+    /// Uses the session's transparent plan cache when no custom timeout or
+    /// memory limit is set.
+    pub async fn fetch_all(self) -> Result<QueryResult> {
+        let has_overrides = self.timeout.is_some()
+            || self.max_memory.is_some()
+            || self.cancellation_token.is_some();
+        if has_overrides {
+            // Custom config — bypass cache and use the config-aware path
+            let mut db_config = self.session.db.config.clone();
+            if let Some(t) = self.timeout {
+                db_config.query_timeout = t;
+            }
+            if let Some(m) = self.max_memory {
+                db_config.max_query_memory = m;
+            }
+            let params = self.session.merge_params(self.params);
             self.session
                 .db
-                .get_mutation_count()
+                .execute_internal_with_config_and_token(
+                    &self.cypher,
+                    params,
+                    db_config,
+                    self.cancellation_token,
+                )
                 .await
-                .saturating_sub(before)
         } else {
-            result.len()
-        };
-        Ok(ExecuteResult { affected_rows })
-    }
-
-    fn merge_params_internal(
-        mut params: HashMap<String, Value>,
-        session_vars: &HashMap<String, Value>,
-    ) -> HashMap<String, Value> {
-        let session_map: HashMap<String, Value> = session_vars.clone();
-
-        if let Some(Value::Map(existing)) = params.get_mut("session") {
-            for (k, v) in session_map {
-                existing.entry(k).or_insert(v);
-            }
-        } else {
-            params.insert("session".to_string(), Value::Map(session_map));
+            // Default config — use the plan cache
+            let params = self.session.merge_params(self.params);
+            self.session.execute_cached(&self.cypher, params).await
         }
-        params
     }
+
+    /// Execute the query and return the first row, or `None` if empty.
+    pub async fn fetch_one(self) -> Result<Option<Row>> {
+        let result = self.fetch_all().await?;
+        Ok(result.into_rows().into_iter().next())
+    }
+
+    /// Execute the query and return a cursor for streaming results.
+    pub async fn cursor(self) -> Result<QueryCursor> {
+        let mut db_config = self.session.db.config.clone();
+        if let Some(t) = self.timeout {
+            db_config.query_timeout = t;
+        }
+        if let Some(m) = self.max_memory {
+            db_config.max_query_memory = m;
+        }
+        let params = self.session.merge_params(self.params);
+        self.session
+            .db
+            .execute_cursor_internal_with_config(&self.cypher, params, db_config)
+            .await
+    }
+
+    /// Explain the query plan without executing it.
+    pub async fn explain(self) -> Result<ExplainOutput> {
+        self.session.db.explain_internal(&self.cypher).await
+    }
+
+    /// Profile the query execution, returning results with profiling output.
+    pub async fn profile(self) -> Result<(QueryResult, ProfileOutput)> {
+        let params = self.session.merge_params(self.params);
+        self.session.db.profile_internal(&self.cypher, params).await
+    }
+}
+
+/// Builder for starting a transaction with options.
+pub struct TransactionBuilder<'a> {
+    session: &'a Session,
+    timeout: Option<Duration>,
+    isolation: IsolationLevel,
+}
+
+impl<'a> TransactionBuilder<'a> {
+    /// Set the transaction timeout. The transaction will expire if operations
+    /// are attempted after this duration.
+    pub fn timeout(mut self, d: Duration) -> Self {
+        self.timeout = Some(d);
+        self
+    }
+
+    /// Set the isolation level for the transaction.
+    pub fn isolation(mut self, level: IsolationLevel) -> Self {
+        self.isolation = level;
+        self
+    }
+
+    /// Start the transaction.
+    pub async fn start(self) -> Result<Transaction> {
+        if self.session.is_pinned() {
+            return Err(UniError::ReadOnly {
+                operation: "start_transaction".to_string(),
+            });
+        }
+        Transaction::new_with_options(self.session, self.timeout, self.isolation).await
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.db.active_session_count.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+// ── Plan Cache (internal) ─────────────────────────────────────────────
+
+/// Entry in the transparent plan cache.
+struct PlanCacheEntry {
+    ast: uni_query::CypherQuery,
+    plan: uni_query::LogicalPlan,
+    schema_version: u32,
+    hit_count: u64,
+}
+
+/// Transparent plan cache keyed by query text hash.
+///
+/// Caches parsed ASTs and logical plans to skip parsing and planning for
+/// repeated queries. Entries are evicted LFU-style when the cache is full.
+struct PlanCache {
+    entries: HashMap<u64, PlanCacheEntry>,
+    max_entries: usize,
+}
+
+impl PlanCache {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            max_entries,
+        }
+    }
+
+    fn get(&mut self, key: u64, current_schema_version: u32) -> Option<&PlanCacheEntry> {
+        if let Some(entry) = self.entries.get_mut(&key) {
+            if entry.schema_version == current_schema_version {
+                entry.hit_count += 1;
+                return self.entries.get(&key);
+            }
+            // Schema changed — evict stale entry
+            self.entries.remove(&key);
+        }
+        None
+    }
+
+    fn insert(&mut self, key: u64, entry: PlanCacheEntry) {
+        if self.entries.len() >= self.max_entries {
+            // Evict entry with lowest hit_count
+            if let Some((&evict_key, _)) = self.entries.iter().min_by_key(|(_, e)| e.hit_count) {
+                self.entries.remove(&evict_key);
+            }
+        }
+        self.entries.insert(key, entry);
+    }
+
+    /// Number of cached plans.
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// Compute a hash key from a query string.
+fn plan_cache_key(cypher: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    cypher.hash(&mut hasher);
+    hasher.finish()
 }

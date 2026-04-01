@@ -10,80 +10,85 @@ use uni_query::query::expr_eval::eval_scalar_function;
 
 #[test]
 fn test_bitwise_or() {
-    let result = eval_scalar_function("uni_bitwise_or", &[unival!(12), unival!(10)]).unwrap();
+    let result = eval_scalar_function("uni_bitwise_or", &[unival!(12), unival!(10)], None).unwrap();
     assert_eq!(result, unival!(14)); // 12 | 10 = 14 (0b1100 | 0b1010 = 0b1110)
 }
 
 #[test]
 fn test_bitwise_or_zero() {
-    let result = eval_scalar_function("uni_bitwise_or", &[unival!(5), unival!(0)]).unwrap();
+    let result = eval_scalar_function("uni_bitwise_or", &[unival!(5), unival!(0)], None).unwrap();
     assert_eq!(result, unival!(5)); // 5 | 0 = 5
 }
 
 #[test]
 fn test_bitwise_and() {
-    let result = eval_scalar_function("uni_bitwise_and", &[unival!(12), unival!(10)]).unwrap();
+    let result =
+        eval_scalar_function("uni_bitwise_and", &[unival!(12), unival!(10)], None).unwrap();
     assert_eq!(result, unival!(8)); // 12 & 10 = 8 (0b1100 & 0b1010 = 0b1000)
 }
 
 #[test]
 fn test_bitwise_and_zero() {
-    let result = eval_scalar_function("uni_bitwise_and", &[unival!(5), unival!(0)]).unwrap();
+    let result = eval_scalar_function("uni_bitwise_and", &[unival!(5), unival!(0)], None).unwrap();
     assert_eq!(result, unival!(0)); // 5 & 0 = 0
 }
 
 #[test]
 fn test_bitwise_xor() {
-    let result = eval_scalar_function("uni_bitwise_xor", &[unival!(12), unival!(10)]).unwrap();
+    let result =
+        eval_scalar_function("uni_bitwise_xor", &[unival!(12), unival!(10)], None).unwrap();
     assert_eq!(result, unival!(6)); // 12 ^ 10 = 6 (0b1100 ^ 0b1010 = 0b0110)
 }
 
 #[test]
 fn test_bitwise_xor_same() {
-    let result = eval_scalar_function("uni_bitwise_xor", &[unival!(7), unival!(7)]).unwrap();
+    let result = eval_scalar_function("uni_bitwise_xor", &[unival!(7), unival!(7)], None).unwrap();
     assert_eq!(result, unival!(0)); // 7 ^ 7 = 0
 }
 
 #[test]
 fn test_bitwise_not() {
-    let result = eval_scalar_function("uni_bitwise_not", &[unival!(5)]).unwrap();
+    let result = eval_scalar_function("uni_bitwise_not", &[unival!(5)], None).unwrap();
     assert_eq!(result, unival!(-6)); // !5 = -6 (two's complement)
 }
 
 #[test]
 fn test_bitwise_not_zero() {
-    let result = eval_scalar_function("uni_bitwise_not", &[unival!(0)]).unwrap();
+    let result = eval_scalar_function("uni_bitwise_not", &[unival!(0)], None).unwrap();
     assert_eq!(result, unival!(-1)); // !0 = -1
 }
 
 #[test]
 fn test_bitwise_not_negative() {
-    let result = eval_scalar_function("uni_bitwise_not", &[unival!(-1)]).unwrap();
+    let result = eval_scalar_function("uni_bitwise_not", &[unival!(-1)], None).unwrap();
     assert_eq!(result, unival!(0)); // !(-1) = 0
 }
 
 #[test]
 fn test_shift_left() {
-    let result = eval_scalar_function("uni_bitwise_shiftLeft", &[unival!(3), unival!(2)]).unwrap();
+    let result =
+        eval_scalar_function("uni_bitwise_shiftLeft", &[unival!(3), unival!(2)], None).unwrap();
     assert_eq!(result, unival!(12)); // 3 << 2 = 12
 }
 
 #[test]
 fn test_shift_left_zero() {
-    let result = eval_scalar_function("uni_bitwise_shiftLeft", &[unival!(5), unival!(0)]).unwrap();
+    let result =
+        eval_scalar_function("uni_bitwise_shiftLeft", &[unival!(5), unival!(0)], None).unwrap();
     assert_eq!(result, unival!(5)); // 5 << 0 = 5
 }
 
 #[test]
 fn test_shift_right() {
     let result =
-        eval_scalar_function("uni_bitwise_shiftRight", &[unival!(12), unival!(2)]).unwrap();
+        eval_scalar_function("uni_bitwise_shiftRight", &[unival!(12), unival!(2)], None).unwrap();
     assert_eq!(result, unival!(3)); // 12 >> 2 = 3
 }
 
 #[test]
 fn test_shift_right_zero() {
-    let result = eval_scalar_function("uni_bitwise_shiftRight", &[unival!(5), unival!(0)]).unwrap();
+    let result =
+        eval_scalar_function("uni_bitwise_shiftRight", &[unival!(5), unival!(0)], None).unwrap();
     assert_eq!(result, unival!(5)); // 5 >> 0 = 5
 }
 
@@ -93,7 +98,7 @@ fn test_shift_right_zero() {
 
 #[test]
 fn test_bitwise_or_wrong_arg_count() {
-    let result = eval_scalar_function("uni_bitwise_or", &[unival!(5)]);
+    let result = eval_scalar_function("uni_bitwise_or", &[unival!(5)], None);
     assert!(result.is_err());
     assert!(
         result
@@ -105,26 +110,26 @@ fn test_bitwise_or_wrong_arg_count() {
 
 #[test]
 fn test_bitwise_or_non_integer() {
-    let result = eval_scalar_function("uni_bitwise_or", &[unival!("5"), unival!(3)]);
+    let result = eval_scalar_function("uni_bitwise_or", &[unival!("5"), unival!(3)], None);
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("integer"));
 }
 
 #[test]
 fn test_bitwise_and_wrong_arg_count() {
-    let result = eval_scalar_function("uni_bitwise_and", &[unival!(5)]);
+    let result = eval_scalar_function("uni_bitwise_and", &[unival!(5)], None);
     assert!(result.is_err());
 }
 
 #[test]
 fn test_bitwise_xor_non_integer() {
-    let result = eval_scalar_function("uni_bitwise_xor", &[unival!(5.5), unival!(3)]);
+    let result = eval_scalar_function("uni_bitwise_xor", &[unival!(5.5), unival!(3)], None);
     assert!(result.is_err());
 }
 
 #[test]
 fn test_bitwise_not_wrong_arg_count() {
-    let result = eval_scalar_function("uni_bitwise_not", &[unival!(5), unival!(3)]);
+    let result = eval_scalar_function("uni_bitwise_not", &[unival!(5), unival!(3)], None);
     assert!(result.is_err());
     assert!(
         result
@@ -136,13 +141,13 @@ fn test_bitwise_not_wrong_arg_count() {
 
 #[test]
 fn test_shift_left_non_integer() {
-    let result = eval_scalar_function("uni_bitwise_shiftLeft", &[unival!(3.5), unival!(2)]);
+    let result = eval_scalar_function("uni_bitwise_shiftLeft", &[unival!(3.5), unival!(2)], None);
     assert!(result.is_err());
 }
 
 #[test]
 fn test_shift_right_wrong_arg_count() {
-    let result = eval_scalar_function("uni_bitwise_shiftRight", &[unival!(12)]);
+    let result = eval_scalar_function("uni_bitwise_shiftRight", &[unival!(12)], None);
     assert!(result.is_err());
 }
 
@@ -159,20 +164,32 @@ fn test_flag_manipulation() {
     let execute_flag = 0b0100;
 
     // Set read and write flags
-    let result =
-        eval_scalar_function("uni_bitwise_or", &[unival!(base_flags), unival!(read_flag)]).unwrap();
-    let result =
-        eval_scalar_function("uni_bitwise_or", &[result.clone(), unival!(write_flag)]).unwrap();
+    let result = eval_scalar_function(
+        "uni_bitwise_or",
+        &[unival!(base_flags), unival!(read_flag)],
+        None,
+    )
+    .unwrap();
+    let result = eval_scalar_function(
+        "uni_bitwise_or",
+        &[result.clone(), unival!(write_flag)],
+        None,
+    )
+    .unwrap();
     assert_eq!(result, unival!(0b0011)); // read + write = 3
 
     // Check if write flag is set
-    let has_write =
-        eval_scalar_function("uni_bitwise_and", &[result.clone(), unival!(write_flag)]).unwrap();
+    let has_write = eval_scalar_function(
+        "uni_bitwise_and",
+        &[result.clone(), unival!(write_flag)],
+        None,
+    )
+    .unwrap();
     assert_eq!(has_write, unival!(write_flag));
 
     // Check if execute flag is set
     let has_execute =
-        eval_scalar_function("uni_bitwise_and", &[result, unival!(execute_flag)]).unwrap();
+        eval_scalar_function("uni_bitwise_and", &[result, unival!(execute_flag)], None).unwrap();
     assert_eq!(has_execute, unival!(0)); // Not set
 }
 
@@ -182,7 +199,8 @@ fn test_bitmask() {
     let value = 0b11010110;
     let mask = 0b00001111;
 
-    let result = eval_scalar_function("uni_bitwise_and", &[unival!(value), unival!(mask)]).unwrap();
+    let result =
+        eval_scalar_function("uni_bitwise_and", &[unival!(value), unival!(mask)], None).unwrap();
     assert_eq!(result, unival!(0b00000110)); // Lower 4 bits = 6
 }
 
@@ -193,12 +211,12 @@ fn test_power_of_two_check() {
     let n_minus_1 = n - 1;
 
     let result =
-        eval_scalar_function("uni_bitwise_and", &[unival!(n), unival!(n_minus_1)]).unwrap();
+        eval_scalar_function("uni_bitwise_and", &[unival!(n), unival!(n_minus_1)], None).unwrap();
     assert_eq!(result, unival!(0)); // 16 is a power of 2
 
     let n = 15;
     let n_minus_1 = n - 1;
     let result =
-        eval_scalar_function("uni_bitwise_and", &[unival!(n), unival!(n_minus_1)]).unwrap();
+        eval_scalar_function("uni_bitwise_and", &[unival!(n), unival!(n_minus_1)], None).unwrap();
     assert!(result != unival!(0)); // 15 is not a power of 2
 }

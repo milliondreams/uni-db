@@ -4,10 +4,10 @@
 //! Abductive reasoning (ABDUCE) via `LocyExecutionContext`.
 //!
 //! Ported from `uni-locy/src/orchestrator/abduce.rs`. Uses `LocyExecutionContext`
-//! for savepoints, mutations, and strata re-evaluation. Three-phase pipeline:
+//! for L0 fork/restore, mutations, and strata re-evaluation. Three-phase pipeline:
 //! Phase 1: Build derivation tree via EXPLAIN.
 //! Phase 2: Generate candidate modifications from tree leaves.
-//! Phase 3: Validate each candidate via ASSUME (savepoint + mutate + re-eval + rollback).
+//! Phase 3: Validate each candidate via ASSUME (fork L0 + mutate + re-eval + restore).
 
 use std::collections::HashMap;
 
@@ -19,7 +19,7 @@ use uni_cypher::ast::{
 use uni_cypher::locy_ast::AbduceQuery;
 use uni_locy::result::{AbductionResult, Modification, ValidatedModification};
 use uni_locy::types::CompiledRule;
-use uni_locy::{CompiledProgram, LocyConfig, LocyError, LocyStats, Row};
+use uni_locy::{CompiledProgram, FactRow, LocyConfig, LocyError, LocyStats};
 
 use super::locy_delta::RowStore;
 
@@ -50,7 +50,7 @@ pub async fn evaluate_abduce(
     let facts = ctx.lookup_derived(&rule_name)?;
 
     // Filter by WHERE expression
-    let matching: Vec<Row> = if let Some(where_expr) = &query.where_expr {
+    let matching: Vec<FactRow> = if let Some(where_expr) = &query.where_expr {
         facts
             .into_iter()
             .filter(|row| {
@@ -131,7 +131,7 @@ pub async fn evaluate_abduce(
 fn extract_removal_candidates(
     tree: &uni_locy::DerivationNode,
     rule: &CompiledRule,
-    _matching: &[Row],
+    _matching: &[FactRow],
     program: &CompiledProgram,
 ) -> Vec<Modification> {
     let mut candidates = Vec::new();
@@ -193,7 +193,11 @@ fn collect_leaf_candidates(
 }
 
 /// Extract edge removal candidates from a path pattern.
-fn extract_edge_candidates(path: &PathPattern, bindings: &Row, candidates: &mut Vec<Modification>) {
+fn extract_edge_candidates(
+    path: &PathPattern,
+    bindings: &FactRow,
+    candidates: &mut Vec<Modification>,
+) {
     let mut source_var = String::new();
     for element in &path.elements {
         match element {
@@ -289,7 +293,7 @@ fn extract_addition_candidates(rule: &CompiledRule) -> Vec<Modification> {
     candidates
 }
 
-/// Phase 3: Validate a single modification via ASSUME (savepoint lifecycle).
+/// Phase 3: Validate a single modification via ASSUME (fork L0 + mutate + re-eval + restore).
 #[expect(
     clippy::too_many_arguments,
     reason = "validation requires full program and execution context"
@@ -306,12 +310,11 @@ async fn validate_modification(
 ) -> Result<bool, LocyError> {
     let mutation_query = modification_to_cypher(modification);
 
-    // Begin savepoint
-    let savepoint_id = ctx
-        .begin_savepoint()
+    // Fork L0 for hypothetical reasoning
+    ctx.fork_l0()
         .await
         .map_err(|e| LocyError::SavepointFailed {
-            message: format!("ABDUCE savepoint begin failed: {}", e),
+            message: format!("ABDUCE fork L0 failed: {}", e),
         })?;
 
     // Execute the mutation
@@ -327,7 +330,7 @@ async fn validate_modification(
         .map(|r| r.rows.clone())
         .unwrap_or_default();
 
-    let matching: Vec<Row> = if let Some(where_expr) = where_expr {
+    let matching: Vec<FactRow> = if let Some(where_expr) = where_expr {
         facts
             .into_iter()
             .filter(|row| {
@@ -340,11 +343,11 @@ async fn validate_modification(
         facts
     };
 
-    // Rollback
-    ctx.rollback_savepoint(savepoint_id)
+    // Restore L0 (discard hypothetical mutations)
+    ctx.restore_l0()
         .await
         .map_err(|e| LocyError::SavepointFailed {
-            message: format!("ABDUCE savepoint rollback failed: {}", e),
+            message: format!("ABDUCE restore L0 failed: {}", e),
         })?;
 
     if negated {

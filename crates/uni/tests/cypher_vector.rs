@@ -45,7 +45,6 @@ async fn test_cypher_vector_search() -> anyhow::Result<()> {
             .unwrap(),
     ));
 
-    let lancedb_store = storage.lancedb_store();
     let ds = storage.vertex_dataset("Item")?;
     let arrow_schema = ds.get_arrow_schema(&schema_manager.schema())?;
 
@@ -90,7 +89,7 @@ async fn test_cypher_vector_search() -> anyhow::Result<()> {
             Arc::new(LargeBinaryArray::from(vec![None::<&[u8]>; 2])), // overflow_json
         ],
     )?;
-    ds.write_batch_lancedb(lancedb_store, batch, &schema_manager.schema())
+    ds.write_batch(storage.backend(), batch, &schema_manager.schema())
         .await?;
 
     // 2. Query

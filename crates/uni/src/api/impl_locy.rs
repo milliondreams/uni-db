@@ -14,17 +14,18 @@ use uni_cypher::ast::{Expr, Pattern, Query};
 use uni_cypher::locy_ast::RuleOutput;
 use uni_locy::types::CompiledCommand;
 use uni_locy::{
-    CommandResult, CompiledProgram, LocyCompileError, LocyConfig, LocyError, LocyResult, LocyStats,
-    Row, RuntimeWarning, SavepointId, compile,
+    CommandResult, CompiledProgram, DerivedFactSet, FactRow, LocyCompileError, LocyConfig,
+    LocyError, LocyStats, RuntimeWarning, compile,
 };
-use uni_query::QueryPlanner;
+use uni_query::{QueryMetrics, QueryPlanner};
+
+use crate::api::locy_result::LocyResult;
 use uni_query::query::df_graph::locy_ast_builder::build_match_return_query;
 use uni_query::query::df_graph::locy_delta::{RowRelation, RowStore, extract_cypher_conditions};
+use uni_query::query::df_graph::locy_derive::CollectedDeriveOutput;
 use uni_query::query::df_graph::locy_eval::record_batches_to_locy_rows;
 use uni_query::query::df_graph::locy_explain::ProvenanceStore;
 use uni_query::query::df_graph::{DerivedFactSource, LocyExecutionContext};
-
-use crate::api::Uni;
 
 /// Session-level registry for pre-compiled Locy rules.
 ///
@@ -37,17 +38,135 @@ pub struct LocyRuleRegistry {
     pub rules: HashMap<String, uni_locy::types::CompiledRule>,
     /// Strata from registered programs, for execution ordering.
     pub strata: Vec<uni_locy::types::Stratum>,
+    /// Source program texts, stored for recompilation on rule removal.
+    pub sources: Vec<String>,
+}
+
+/// Compile and register rules into an existing rule registry.
+///
+/// Shared logic used by `Uni::register_rules()` and `Session::register_rules()`.
+pub(crate) fn register_rules_on_registry(
+    registry_lock: &std::sync::RwLock<LocyRuleRegistry>,
+    program: &str,
+) -> Result<()> {
+    let ast = uni_cypher::parse_locy(program).map_err(map_parse_error)?;
+    let registry = registry_lock.read().unwrap();
+    let compiled = if registry.rules.is_empty() {
+        drop(registry);
+        compile(&ast).map_err(map_compile_error)?
+    } else {
+        let external_names: Vec<String> = registry.rules.keys().cloned().collect();
+        drop(registry);
+        uni_locy::compile_with_external_rules(&ast, &external_names).map_err(map_compile_error)?
+    };
+    let mut registry = registry_lock.write().unwrap();
+    for (name, rule) in compiled.rule_catalog {
+        registry.rules.insert(name, rule);
+    }
+    let base_id = registry.strata.len();
+    for mut stratum in compiled.strata {
+        stratum.id += base_id;
+        stratum.depends_on = stratum.depends_on.iter().map(|d| base_id + d).collect();
+        registry.strata.push(stratum);
+    }
+    registry.sources.push(program.to_string());
+    Ok(())
+}
+
+/// Evaluate a Locy program against the database with a specific rule registry.
+///
+/// This is the core evaluation path used by Session and Transaction.
+pub(crate) async fn evaluate_with_db_and_config(
+    db: &crate::api::UniInner,
+    program: &str,
+    config: &LocyConfig,
+    rule_registry: &std::sync::RwLock<LocyRuleRegistry>,
+) -> Result<LocyResult> {
+    // Compile with the given registry
+    let ast = uni_cypher::parse_locy(program).map_err(map_parse_error)?;
+    let external_names: Option<Vec<String>> = {
+        let registry = rule_registry.read().unwrap();
+        if registry.rules.is_empty() {
+            None
+        } else {
+            Some(registry.rules.keys().cloned().collect())
+        }
+    };
+    let mut compiled = if let Some(names) = external_names {
+        uni_locy::compile_with_external_rules(&ast, &names).map_err(map_compile_error)?
+    } else {
+        compile(&ast).map_err(map_compile_error)?
+    };
+
+    // Merge registered rules
+    {
+        let registry = rule_registry.read().unwrap();
+        if !registry.rules.is_empty() {
+            for (name, rule) in &registry.rules {
+                compiled
+                    .rule_catalog
+                    .entry(name.clone())
+                    .or_insert_with(|| rule.clone());
+            }
+            let base_id = registry.strata.len();
+            for stratum in &mut compiled.strata {
+                stratum.id += base_id;
+                stratum.depends_on = stratum.depends_on.iter().map(|d| d + base_id).collect();
+            }
+            let mut merged_strata = registry.strata.clone();
+            merged_strata.append(&mut compiled.strata);
+            compiled.strata = merged_strata;
+        }
+    }
+
+    // Create a LocyEngine directly from &UniInner.
+    // Session-level: collect DERIVE output for deferred materialization.
+    // Always create an ephemeral locy_l0 for the evaluation scope — this provides:
+    // - DERIVE visibility: trailing Cypher sees DERIVE mutations
+    // - ASSUME/ABDUCE isolation: fork/restore from this buffer
+    let locy_l0 = if let Some(ref writer) = db.writer {
+        let w = writer.read().await;
+        Some(w.create_transaction_l0())
+    } else {
+        None // Read-only DB: degrade gracefully
+    };
+    let engine = LocyEngine {
+        db,
+        tx_l0_override: locy_l0.clone(),
+        locy_l0,
+        collect_derive: true,
+    };
+    engine.evaluate_compiled_with_config(compiled, config).await
 }
 
 /// Engine for evaluating Locy programs against a real database.
 pub struct LocyEngine<'a> {
-    db: &'a Uni,
+    pub(crate) db: &'a crate::api::UniInner,
+    /// When set, the engine routes reads/writes through this private L0 buffer
+    /// (commit-time serialization for transactions).
+    pub(crate) tx_l0_override: Option<Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
+    /// Ephemeral L0 buffer for Locy evaluation scope.
+    /// Session path: ephemeral per-locy() buffer (DERIVE writes here, discarded on return).
+    /// Transaction path: same as tx_l0 (DERIVE auto-applies).
+    /// ASSUME/ABDUCE fork from here via fork_l0/restore_l0.
+    pub(crate) locy_l0: Option<Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
+    /// When true, DERIVE commands collect ASTs + data instead of executing.
+    /// Session-level evaluation sets this to true; transaction-level sets false.
+    pub(crate) collect_derive: bool,
 }
 
-impl Uni {
-    /// Create a Locy evaluation engine bound to this database.
-    pub fn locy(&self) -> LocyEngine<'_> {
-        LocyEngine { db: self }
+impl crate::api::Uni {
+    /// Create a Locy evaluation engine bound to this database (internal).
+    ///
+    /// All external access goes through `Session::locy()` / `Session::locy_with()`.
+    #[allow(dead_code)]
+    pub(crate) fn locy(&self) -> LocyEngine<'_> {
+        LocyEngine {
+            db: &self.inner,
+            tx_l0_override: None,
+            locy_l0: None,
+            collect_derive: true,
+        }
     }
 }
 
@@ -85,8 +204,7 @@ impl<'a> LocyEngine<'a> {
         // Merge strata, assigning new IDs to avoid collisions.
         let base_id = registry.strata.len();
         for mut stratum in compiled.strata {
-            let old_id = stratum.id;
-            stratum.id = base_id + old_id;
+            stratum.id += base_id;
             stratum.depends_on = stratum.depends_on.iter().map(|d| base_id + d).collect();
             registry.strata.push(stratum);
         }
@@ -115,16 +233,16 @@ impl<'a> LocyEngine<'a> {
     /// ```no_run
     /// # use uni_db::Uni;
     /// # async fn example(db: &Uni) -> uni_db::Result<()> {
-    /// let result = db.locy()
-    ///     .evaluate_with("CREATE RULE ep AS MATCH (e:Episode) WHERE e.agent_id = $aid YIELD KEY e")
+    /// let result = db.session()
+    ///     .locy_with("CREATE RULE ep AS MATCH (e:Episode) WHERE e.agent_id = $aid YIELD KEY e")
     ///     .param("aid", "agent-123")
     ///     .run()
     ///     .await?;
     /// # Ok(())
     /// # }
     /// ```
-    pub fn evaluate_with(&self, program: &str) -> crate::api::locy_builder::LocyBuilder<'_> {
-        crate::api::locy_builder::LocyBuilder::new(self.db, program)
+    pub fn evaluate_with(&self, program: &str) -> crate::api::locy_builder::InnerLocyBuilder<'_> {
+        crate::api::locy_builder::InnerLocyBuilder::new(self.db, program)
     }
 
     /// Convenience wrapper for EXPLAIN RULE commands.
@@ -163,7 +281,37 @@ impl<'a> LocyEngine<'a> {
                 compiled.strata = merged_strata;
             }
         }
+
+        self.evaluate_compiled_with_config(compiled, config).await
+    }
+
+    /// Evaluate an already-compiled Locy program with custom config.
+    ///
+    /// This is the core execution path: it takes a `CompiledProgram` (with any
+    /// registry merges already applied) and runs it through planning, execution,
+    /// and command dispatch.
+    pub async fn evaluate_compiled_with_config(
+        &self,
+        compiled: CompiledProgram,
+        config: &LocyConfig,
+    ) -> Result<LocyResult> {
         let start = Instant::now();
+
+        // Capture current version for staleness detection in DerivedFactSet
+        let evaluated_at_version = if self.collect_derive {
+            if let Some(ref w) = self.db.writer {
+                w.read()
+                    .await
+                    .l0_manager
+                    .get_current()
+                    .read()
+                    .current_version
+            } else {
+                0
+            }
+        } else {
+            0
+        };
 
         // 1. Build logical plan
         let schema = self.db.schema.schema();
@@ -195,6 +343,11 @@ impl<'a> LocyEngine<'a> {
         }
         df_executor.set_xervo_runtime(self.db.xervo_runtime.clone());
         df_executor.set_procedure_registry(self.db.procedure_registry.clone());
+        if let Ok(reg) = self.db.custom_functions.read()
+            && !reg.is_empty()
+        {
+            df_executor.set_custom_functions(std::sync::Arc::new(reg.clone()));
+        }
 
         let (session_ctx, planner, _prop_mgr) = df_executor
             .create_datafusion_planner(&self.db.properties, &config.params)
@@ -235,6 +388,7 @@ impl<'a> LocyEngine<'a> {
             peak_memory_slot,
             warnings_slot,
             approximate_slot,
+            command_results_slot,
         ) = if let Some(program_exec) = exec_plan
             .as_any()
             .downcast_ref::<uni_query::query::df_graph::LocyProgramExec>(
@@ -248,6 +402,7 @@ impl<'a> LocyEngine<'a> {
                 program_exec.peak_memory_slot(),
                 program_exec.warnings_slot(),
                 program_exec.approximate_slot(),
+                program_exec.command_results_slot(),
             )
         } else {
             (
@@ -256,6 +411,7 @@ impl<'a> LocyEngine<'a> {
                 Arc::new(std::sync::RwLock::new(0usize)),
                 Arc::new(std::sync::RwLock::new(Vec::new())),
                 Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+                Arc::new(std::sync::RwLock::new(Vec::new())),
             )
         };
 
@@ -282,7 +438,10 @@ impl<'a> LocyEngine<'a> {
             planner.graph_ctx().clone(),
             planner.session_ctx().clone(),
             config.params.clone(),
+            self.tx_l0_override.clone(),
         );
+        // Propagate locy_l0 to the adapter for DERIVE/ASSUME/ABDUCE scoping.
+        *native_ctx.locy_l0.lock().unwrap() = self.locy_l0.clone();
         let mut locy_stats = LocyStats {
             total_iterations: iteration_counts_slot
                 .read()
@@ -295,8 +454,18 @@ impl<'a> LocyEngine<'a> {
             .read()
             .map(|a| a.clone())
             .unwrap_or_default();
+        // Collect inline results (QUERY, Cypher) already executed by run_program()
+        let inline_map: HashMap<usize, CommandResult> =
+            command_results_slot.write().unwrap().drain(..).collect();
+
         let mut command_results = Vec::new();
-        for cmd in &compiled.commands {
+        let mut collected_derives: Vec<CollectedDeriveOutput> = Vec::new();
+        for (cmd_idx, cmd) in compiled.commands.iter().enumerate() {
+            if let Some(result) = inline_map.get(&cmd_idx) {
+                // Already executed inline by run_program
+                command_results.push(result.clone());
+                continue;
+            }
             let result = dispatch_native_command(
                 cmd,
                 &compiled,
@@ -307,6 +476,8 @@ impl<'a> LocyEngine<'a> {
                 tracker.clone(),
                 start,
                 &approx_for_explain,
+                self.collect_derive,
+                &mut collected_derives,
             )
             .await
             .map_err(map_runtime_error)?;
@@ -316,7 +487,7 @@ impl<'a> LocyEngine<'a> {
         let evaluation_time = start.elapsed();
 
         // 9. Build derived map, enrich VID columns with full nodes
-        let mut base_derived: HashMap<String, Vec<Row>> = native_store
+        let mut base_derived: HashMap<String, Vec<FactRow>> = native_store
             .rule_names()
             .filter_map(|name| {
                 native_store
@@ -349,7 +520,33 @@ impl<'a> LocyEngine<'a> {
         )
         .await;
 
-        // 10. Build final LocyResult
+        // 10. Build DerivedFactSet from collected derives (session path only)
+        let derived_fact_set = if !collected_derives.is_empty() {
+            let mut all_vertices = HashMap::new();
+            let mut all_edges = Vec::new();
+            let mut all_queries = Vec::new();
+            for output in collected_derives {
+                for (label, verts) in output.vertices {
+                    all_vertices
+                        .entry(label)
+                        .or_insert_with(Vec::new)
+                        .extend(verts);
+                }
+                all_edges.extend(output.edges);
+                all_queries.extend(output.queries);
+            }
+            Some(DerivedFactSet {
+                vertices: all_vertices,
+                edges: all_edges,
+                stats: locy_stats.clone(),
+                evaluated_at_version,
+                mutation_queries: all_queries,
+            })
+        } else {
+            None
+        };
+
+        // 11. Build final LocyResult
         let warnings = warnings_slot.read().map(|w| w.clone()).unwrap_or_default();
         Ok(build_locy_result(
             enriched_derived,
@@ -359,6 +556,7 @@ impl<'a> LocyEngine<'a> {
             locy_stats,
             warnings,
             approximate_groups,
+            derived_fact_set,
         ))
     }
 
@@ -398,6 +596,11 @@ impl<'a> LocyEngine<'a> {
         if let Some(ref w) = self.db.writer {
             df_executor.set_writer(w.clone());
         }
+        // Pass the tx_l0_override so the fixpoint planner sees uncommitted mutations
+        // (ASSUME/ABDUCE hypothetical state, session DERIVE mutations, etc.)
+        if let Some(ref l0) = self.tx_l0_override {
+            df_executor.set_transaction_l0(l0.clone());
+        }
         df_executor.set_xervo_runtime(self.db.xervo_runtime.clone());
         df_executor.set_procedure_registry(self.db.procedure_registry.clone());
 
@@ -431,7 +634,7 @@ impl<'a> LocyEngine<'a> {
 // ── NativeExecutionAdapter — implements DerivedFactSource + LocyExecutionContext ─
 
 struct NativeExecutionAdapter<'a> {
-    db: &'a Uni,
+    db: &'a crate::api::UniInner,
     native_store: &'a uni_query::query::df_graph::DerivedStore,
     compiled: &'a CompiledProgram,
     /// Execution contexts from the fixpoint planner for columnar query execution.
@@ -440,16 +643,25 @@ struct NativeExecutionAdapter<'a> {
     /// Query parameters threaded from LocyConfig; passed to execute_subplan so
     /// that $param references in rule MATCH WHERE clauses are resolved.
     params: HashMap<String, Value>,
+    /// Private transaction L0 override for commit-time serialization.
+    tx_l0_override: Option<Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
+    /// Locy-scoped L0 buffer. DERIVE mutations go here. ASSUME/ABDUCE fork from here.
+    /// Protected by std::sync::Mutex for interior mutability (fork/restore swap the Arc).
+    locy_l0: std::sync::Mutex<Option<Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>>,
+    /// Stack of saved L0 states for nested fork/restore (ASSUME inside ASSUME).
+    l0_save_stack:
+        std::sync::Mutex<Vec<Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>>,
 }
 
 impl<'a> NativeExecutionAdapter<'a> {
     fn new(
-        db: &'a Uni,
+        db: &'a crate::api::UniInner,
         native_store: &'a uni_query::query::df_graph::DerivedStore,
         compiled: &'a CompiledProgram,
         graph_ctx: Arc<uni_query::query::df_graph::GraphExecutionContext>,
         session_ctx: Arc<parking_lot::RwLock<datafusion::prelude::SessionContext>>,
         params: HashMap<String, Value>,
+        tx_l0_override: Option<Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
     ) -> Self {
         Self {
             db,
@@ -458,6 +670,9 @@ impl<'a> NativeExecutionAdapter<'a> {
             graph_ctx,
             session_ctx,
             params,
+            tx_l0_override,
+            locy_l0: std::sync::Mutex::new(None),
+            l0_save_stack: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -491,7 +706,7 @@ impl<'a> NativeExecutionAdapter<'a> {
 
 #[async_trait(?Send)]
 impl DerivedFactSource for NativeExecutionAdapter<'_> {
-    fn lookup_derived(&self, rule_name: &str) -> std::result::Result<Vec<Row>, LocyError> {
+    fn lookup_derived(&self, rule_name: &str) -> std::result::Result<Vec<FactRow>, LocyError> {
         let batches = self
             .native_store
             .get(rule_name)
@@ -525,17 +740,22 @@ impl DerivedFactSource for NativeExecutionAdapter<'_> {
                     message: e.to_string(),
                 })?;
 
-        // When a savepoint transaction is active (e.g., inside ASSUME/ABDUCE mutations),
-        // the stored graph_ctx was built before the savepoint mutations and its L0Context
-        // does not include the transaction-local L0 buffer. Rebuild a temporary context
-        // that includes transaction_l0 so pattern queries see the hypothetical state.
+        // When a locy_l0 or transaction L0 is active, the stored graph_ctx may not
+        // include the local L0 buffer. Rebuild a temporary context that includes it
+        // so pattern queries see the uncommitted/hypothetical state.
+        let tx_l0_for_ctx = self
+            .locy_l0
+            .lock()
+            .unwrap()
+            .clone()
+            .or_else(|| self.tx_l0_override.clone());
         let transaction_ctx: Option<Arc<uni_query::query::df_graph::GraphExecutionContext>> =
-            if let Some(writer_arc) = &self.db.writer {
-                if let Ok(writer) = writer_arc.try_read() {
-                    if writer.transaction_l0.is_some() {
+            if let Some(tx_l0) = tx_l0_for_ctx {
+                if let Some(writer_arc) = &self.db.writer {
+                    if let Ok(writer) = writer_arc.try_read() {
                         let l0_ctx = uni_query::query::df_graph::L0Context {
                             current_l0: Some(writer.l0_manager.get_current()),
-                            transaction_l0: writer.transaction_l0.clone(),
+                            transaction_l0: Some(tx_l0),
                             pending_flush_l0s: writer.l0_manager.get_pending_flush(),
                         };
                         Some(Arc::new(
@@ -579,7 +799,7 @@ impl LocyExecutionContext for NativeExecutionAdapter<'_> {
     async fn lookup_derived_enriched(
         &self,
         rule_name: &str,
-    ) -> std::result::Result<Vec<Row>, LocyError> {
+    ) -> std::result::Result<Vec<FactRow>, LocyError> {
         use arrow_schema::DataType;
 
         if let Some(rule) = self.compiled.rule_catalog.get(rule_name) {
@@ -677,25 +897,47 @@ impl LocyExecutionContext for NativeExecutionAdapter<'_> {
             .collect())
     }
 
-    async fn execute_cypher_read(&self, ast: Query) -> std::result::Result<Vec<Row>, LocyError> {
-        // Must use execute_ast_internal (fresh SessionContext) so that savepoint
-        // mutations applied during ASSUME/ABDUCE body dispatch are visible.
-        let result = self
-            .db
-            .execute_ast_internal(ast, "<locy>", HashMap::new(), self.db.config.clone())
-            .await
-            .map_err(|e| LocyError::ExecutorError {
-                message: e.to_string(),
-            })?;
+    async fn execute_cypher_read(
+        &self,
+        ast: Query,
+    ) -> std::result::Result<Vec<FactRow>, LocyError> {
+        // Route through locy_l0 so trailing Cypher sees DERIVE/ASSUME mutations.
+        // locy_l0 is the "active" L0 for this evaluation scope.
+        let active_l0 = self.locy_l0.lock().unwrap().clone();
+        let result = if let Some(ref l0) = active_l0 {
+            self.db
+                .execute_ast_internal_with_tx_l0(
+                    ast,
+                    "<locy>",
+                    HashMap::new(),
+                    self.db.config.clone(),
+                    l0.clone(),
+                )
+                .await
+        } else if let Some(ref tx_l0) = self.tx_l0_override {
+            self.db
+                .execute_ast_internal_with_tx_l0(
+                    ast,
+                    "<locy>",
+                    HashMap::new(),
+                    self.db.config.clone(),
+                    tx_l0.clone(),
+                )
+                .await
+        } else {
+            self.db
+                .execute_ast_internal(ast, "<locy>", HashMap::new(), self.db.config.clone())
+                .await
+        }
+        .map_err(|e| LocyError::ExecutorError {
+            message: e.to_string(),
+        })?;
         Ok(result
-            .rows
+            .into_rows()
             .into_iter()
             .map(|row| {
-                row.columns
-                    .iter()
-                    .zip(row.values)
-                    .map(|(col, val)| (col.clone(), val))
-                    .collect()
+                let cols: Vec<String> = row.columns().to_vec();
+                cols.into_iter().zip(row.into_values()).collect()
             })
             .collect())
     }
@@ -705,6 +947,43 @@ impl LocyExecutionContext for NativeExecutionAdapter<'_> {
         ast: Query,
         params: HashMap<String, Value>,
     ) -> std::result::Result<usize, LocyError> {
+        // Route through locy_l0 for all mutations within this evaluation scope.
+        let active_l0 = self.locy_l0.lock().unwrap().clone();
+        if let Some(ref l0) = active_l0 {
+            let before = l0.read().mutation_count;
+            self.db
+                .execute_ast_internal_with_tx_l0(
+                    ast,
+                    "<locy>",
+                    params,
+                    self.db.config.clone(),
+                    l0.clone(),
+                )
+                .await
+                .map_err(|e| LocyError::ExecutorError {
+                    message: e.to_string(),
+                })?;
+            let after = l0.read().mutation_count;
+            return Ok(after.saturating_sub(before));
+        }
+        if let Some(ref tx_l0) = self.tx_l0_override {
+            let before = tx_l0.read().mutation_count;
+            self.db
+                .execute_ast_internal_with_tx_l0(
+                    ast,
+                    "<locy>",
+                    params,
+                    self.db.config.clone(),
+                    tx_l0.clone(),
+                )
+                .await
+                .map_err(|e| LocyError::ExecutorError {
+                    message: e.to_string(),
+                })?;
+            let after = tx_l0.read().mutation_count;
+            return Ok(after.saturating_sub(before));
+        }
+        // Standard path: mutations go through writer's global L0
         let before = self.db.get_mutation_count().await;
         self.db
             .execute_ast_internal(ast, "<locy>", params, self.db.config.clone())
@@ -716,35 +995,30 @@ impl LocyExecutionContext for NativeExecutionAdapter<'_> {
         Ok(after.saturating_sub(before))
     }
 
-    async fn begin_savepoint(&self) -> std::result::Result<SavepointId, LocyError> {
-        let writer = self
-            .db
-            .writer
-            .as_ref()
-            .ok_or_else(|| LocyError::SavepointFailed {
-                message: "database is read-only".to_string(),
-            })?;
-        let mut w = writer.write().await;
-        w.begin_transaction()
-            .map_err(|e| LocyError::SavepointFailed {
-                message: e.to_string(),
-            })?;
-        Ok(SavepointId(0))
+    async fn fork_l0(&self) -> std::result::Result<(), LocyError> {
+        let mut guard = self.locy_l0.lock().unwrap();
+        let current = guard.as_ref().ok_or_else(|| LocyError::SavepointFailed {
+            message: "no active Locy L0 to fork".into(),
+        })?;
+        // Clone the current L0 buffer (deep copy — forked WAL is None)
+        let cloned = Arc::new(parking_lot::RwLock::new(current.read().clone()));
+        // Save the original, replace with the clone for hypothetical mutations
+        let previous = guard.replace(cloned).unwrap();
+        self.l0_save_stack.lock().unwrap().push(previous);
+        Ok(())
     }
 
-    async fn rollback_savepoint(&self, _id: SavepointId) -> std::result::Result<(), LocyError> {
-        let writer = self
-            .db
-            .writer
-            .as_ref()
-            .ok_or_else(|| LocyError::SavepointFailed {
-                message: "database is read-only".to_string(),
-            })?;
-        let mut w = writer.write().await;
-        w.rollback_transaction()
-            .map_err(|e| LocyError::SavepointFailed {
-                message: e.to_string(),
-            })?;
+    async fn restore_l0(&self) -> std::result::Result<(), LocyError> {
+        let saved =
+            self.l0_save_stack
+                .lock()
+                .unwrap()
+                .pop()
+                .ok_or_else(|| LocyError::SavepointFailed {
+                    message: "no saved L0 to restore".into(),
+                })?;
+        let mut guard = self.locy_l0.lock().unwrap();
+        *guard = Some(saved);
         Ok(())
     }
 
@@ -759,7 +1033,14 @@ impl LocyExecutionContext for NativeExecutionAdapter<'_> {
             warnings: vec![],
             commands: vec![],
         };
-        let engine = self.db.locy();
+        // Pass the current locy_l0 so re-evaluation sees hypothetical state.
+        let locy_l0 = self.locy_l0.lock().unwrap().clone();
+        let engine = LocyEngine {
+            db: self.db,
+            tx_l0_override: locy_l0.clone(),
+            locy_l0,
+            collect_derive: false,
+        };
         let native_store = engine
             .run_strata_native(&strata_only, config)
             .await
@@ -783,6 +1064,8 @@ fn dispatch_native_command<'a>(
     tracker: Option<Arc<ProvenanceStore>>,
     start: Instant,
     approximate_groups: &'a HashMap<String, Vec<String>>,
+    collect_derive: bool,
+    collected_derives: &'a mut Vec<CollectedDeriveOutput>,
 ) -> std::pin::Pin<
     Box<dyn std::future::Future<Output = std::result::Result<CommandResult, LocyError>> + 'a>,
 > {
@@ -830,11 +1113,36 @@ fn dispatch_native_command<'a>(
                 Ok(CommandResult::Abduce(result))
             }
             CompiledCommand::DeriveCommand(dc) => {
-                let affected = uni_query::query::df_graph::locy_derive::derive_command(
-                    dc, program, ctx, stats,
-                )
-                .await?;
-                Ok(CommandResult::Derive { affected })
+                if collect_derive {
+                    // Session path: collect ASTs + data for deferred materialization.
+                    let output = uni_query::query::df_graph::locy_derive::collect_derive_facts(
+                        dc, program, ctx,
+                    )
+                    .await?;
+                    let affected = output.affected;
+
+                    // Replay mutations to the ephemeral L0 so that subsequent
+                    // trailing Cypher commands can read the derived edges.
+                    // Guard: skip when no L0 exists (read-only DB).
+                    // Replay mutations to the ephemeral L0 so that subsequent
+                    // trailing Cypher commands can read the derived edges.
+                    // Guard: skip when no L0 exists (read-only DB).
+                    if ctx.tx_l0_override.is_some() {
+                        for query in &output.queries {
+                            ctx.execute_mutation(query.clone(), HashMap::new()).await?;
+                        }
+                    }
+
+                    collected_derives.push(output);
+                    Ok(CommandResult::Derive { affected })
+                } else {
+                    // Transaction path: auto-apply mutations
+                    let affected = uni_query::query::df_graph::locy_derive::derive_command(
+                        dc, program, ctx, stats,
+                    )
+                    .await?;
+                    Ok(CommandResult::Derive { affected })
+                }
             }
             CompiledCommand::Cypher(q) => {
                 let rows = ctx.execute_cypher_read(q.clone()).await?;
@@ -848,12 +1156,12 @@ fn dispatch_native_command<'a>(
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 async fn enrich_vids_with_nodes(
-    db: &Uni,
+    db: &crate::api::UniInner,
     native_store: &uni_query::query::df_graph::DerivedStore,
-    derived: HashMap<String, Vec<Row>>,
+    derived: HashMap<String, Vec<FactRow>>,
     graph_ctx: &Arc<uni_query::query::df_graph::GraphExecutionContext>,
     session_ctx: &Arc<parking_lot::RwLock<datafusion::prelude::SessionContext>>,
-) -> HashMap<String, Vec<Row>> {
+) -> HashMap<String, Vec<FactRow>> {
     use arrow_schema::DataType;
     let mut enriched = HashMap::new();
 
@@ -927,7 +1235,7 @@ async fn enrich_vids_with_nodes(
             }
         }
 
-        let enriched_rows: Vec<Row> = rows
+        let enriched_rows: Vec<FactRow> = rows
             .into_iter()
             .map(|row| {
                 row.into_iter()
@@ -949,27 +1257,37 @@ async fn enrich_vids_with_nodes(
     enriched
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_locy_result(
-    derived: HashMap<String, Vec<Row>>,
+    derived: HashMap<String, Vec<FactRow>>,
     command_results: Vec<CommandResult>,
     compiled: &CompiledProgram,
     evaluation_time: Duration,
     mut orchestrator_stats: LocyStats,
     warnings: Vec<RuntimeWarning>,
     approximate_groups: HashMap<String, Vec<String>>,
+    derived_fact_set: Option<DerivedFactSet>,
 ) -> LocyResult {
     let total_facts: usize = derived.values().map(|v| v.len()).sum();
     orchestrator_stats.strata_evaluated = compiled.strata.len();
     orchestrator_stats.derived_nodes = total_facts;
     orchestrator_stats.evaluation_time = evaluation_time;
 
-    LocyResult {
+    let inner = uni_locy::LocyResult {
         derived,
         stats: orchestrator_stats,
         command_results,
         warnings,
         approximate_groups,
-    }
+        derived_fact_set,
+    };
+    let metrics = QueryMetrics {
+        total_time: evaluation_time,
+        exec_time: evaluation_time,
+        rows_returned: total_facts,
+        ..Default::default()
+    };
+    LocyResult::new(inner, metrics)
 }
 
 fn native_store_to_row_store(

@@ -3,8 +3,8 @@
 
 """Tests for async schema operations.
 
-Includes tests for both direct methods (create_label, add_property, etc.)
-and the AsyncSchemaBuilder pattern (db.schema().label(...).apply()).
+Includes tests for the AsyncSchemaBuilder pattern (db.schema().label(...).apply())
+and schema query methods.
 """
 
 import pytest
@@ -13,55 +13,82 @@ import uni_db
 
 
 class TestAsyncSchemaCreation:
-    """Tests for async schema creation using direct methods."""
+    """Tests for async schema creation using schema builder."""
 
     @pytest.fixture
     async def db(self):
         """Create a temporary async database."""
-        return await uni_db.AsyncDatabase.temporary()
+        return await uni_db.AsyncUni.temporary()
 
     @pytest.mark.asyncio
     async def test_create_label_and_properties(self, db):
-        """Test creating a label with properties."""
-        await db.create_label("Person")
-        await db.add_property("Person", "name", "string", False)
-        await db.add_property("Person", "age", "int", False)
+        """Test creating a label with properties via schema builder."""
+        await (
+            db.schema()
+            .label("Person")
+            .property("name", "string")
+            .property("age", "int")
+            .apply()
+        )
 
         assert await db.label_exists("Person")
-        await db.execute("CREATE (n:Person {name: 'Alice', age: 30})")
+        session = db.session()
+        tx = await session.tx()
+        await tx.execute("CREATE (n:Person {name: 'Alice', age: 30})")
+        await tx.commit()
         await db.flush()
-        results = await db.query("MATCH (n:Person) RETURN n.name, n.age")
+        results = await session.query("MATCH (n:Person) RETURN n.name, n.age")
         assert len(results) == 1
 
     @pytest.mark.asyncio
     async def test_create_label_with_nullable(self, db):
-        """Test creating a label with nullable property."""
-        await db.create_label("Person")
-        await db.add_property("Person", "name", "string", False)
-        await db.add_property("Person", "nickname", "string", True)
+        """Test creating a label with nullable property via schema builder."""
+        await (
+            db.schema()
+            .label("Person")
+            .property("name", "string")
+            .property_nullable("nickname", "string")
+            .apply()
+        )
 
-        await db.execute("CREATE (n:Person {name: 'Bob'})")
+        session = db.session()
+        tx = await session.tx()
+        await tx.execute("CREATE (n:Person {name: 'Bob'})")
+        await tx.commit()
         await db.flush()
-        results = await db.query("MATCH (n:Person) RETURN n.name, n.nickname")
+        results = await session.query("MATCH (n:Person) RETURN n.name, n.nickname")
         assert len(results) == 1
 
     @pytest.mark.asyncio
     async def test_create_edge_type(self, db):
-        """Test creating an edge type."""
-        await db.create_label("Person")
-        await db.add_property("Person", "name", "string", False)
-        await db.create_edge_type("KNOWS", ["Person"], ["Person"])
+        """Test creating an edge type via schema builder."""
+        await (
+            db.schema()
+            .label("Person")
+            .property("name", "string")
+            .done()
+            .edge_type("KNOWS", ["Person"], ["Person"])
+            .done()
+            .apply()
+        )
 
         assert await db.edge_type_exists("KNOWS")
 
     @pytest.mark.asyncio
     async def test_create_multiple_labels_and_edges(self, db):
-        """Test creating multiple labels and edge types."""
-        await db.create_label("Person")
-        await db.add_property("Person", "name", "string", False)
-        await db.create_label("Company")
-        await db.add_property("Company", "name", "string", False)
-        await db.create_edge_type("WORKS_AT", ["Person"], ["Company"])
+        """Test creating multiple labels and edge types via schema builder."""
+        await (
+            db.schema()
+            .label("Person")
+            .property("name", "string")
+            .done()
+            .label("Company")
+            .property("name", "string")
+            .done()
+            .edge_type("WORKS_AT", ["Person"], ["Company"])
+            .done()
+            .apply()
+        )
 
         assert await db.label_exists("Person")
         assert await db.label_exists("Company")
@@ -74,13 +101,20 @@ class TestAsyncSchemaQueries:
     @pytest.fixture
     async def db_with_schema(self):
         """Create a database with a predefined schema."""
-        db = await uni_db.AsyncDatabase.temporary()
-        await db.create_label("Person")
-        await db.add_property("Person", "name", "string", False)
-        await db.add_property("Person", "age", "int", False)
-        await db.create_label("Company")
-        await db.add_property("Company", "name", "string", False)
-        await db.create_edge_type("WORKS_AT", ["Person"], ["Company"])
+        db = await uni_db.AsyncUni.temporary()
+        await (
+            db.schema()
+            .label("Person")
+            .property("name", "string")
+            .property("age", "int")
+            .done()
+            .label("Company")
+            .property("name", "string")
+            .done()
+            .edge_type("WORKS_AT", ["Person"], ["Company"])
+            .done()
+            .apply()
+        )
         return db
 
     @pytest.mark.asyncio
@@ -124,46 +158,54 @@ class TestAsyncDataTypes:
     @pytest.fixture
     async def db(self):
         """Create a temporary async database."""
-        return await uni_db.AsyncDatabase.temporary()
+        return await uni_db.AsyncUni.temporary()
 
     @pytest.mark.asyncio
     async def test_string_type(self, db):
         """Test string data type."""
-        await db.create_label("Test")
-        await db.add_property("Test", "text", "string", False)
-        await db.execute("CREATE (n:Test {text: 'hello world'})")
+        await db.schema().label("Test").property("text", "string").apply()
+        session = db.session()
+        tx = await session.tx()
+        await tx.execute("CREATE (n:Test {text: 'hello world'})")
+        await tx.commit()
         await db.flush()
-        results = await db.query("MATCH (n:Test) RETURN n.text")
+        results = await session.query("MATCH (n:Test) RETURN n.text")
         assert results[0]["n.text"] == "hello world"
 
     @pytest.mark.asyncio
     async def test_int_type(self, db):
         """Test integer data type."""
-        await db.create_label("Test")
-        await db.add_property("Test", "num", "int", False)
-        await db.execute("CREATE (n:Test {num: 42})")
+        await db.schema().label("Test").property("num", "int").apply()
+        session = db.session()
+        tx = await session.tx()
+        await tx.execute("CREATE (n:Test {num: 42})")
+        await tx.commit()
         await db.flush()
-        results = await db.query("MATCH (n:Test) RETURN n.num")
+        results = await session.query("MATCH (n:Test) RETURN n.num")
         assert results[0]["n.num"] == 42
 
     @pytest.mark.asyncio
     async def test_float_type(self, db):
         """Test float data type."""
-        await db.create_label("Test")
-        await db.add_property("Test", "value", "float", False)
-        await db.execute("CREATE (n:Test {value: 3.14})")
+        await db.schema().label("Test").property("value", "float").apply()
+        session = db.session()
+        tx = await session.tx()
+        await tx.execute("CREATE (n:Test {value: 3.14})")
+        await tx.commit()
         await db.flush()
-        results = await db.query("MATCH (n:Test) RETURN n.value")
+        results = await session.query("MATCH (n:Test) RETURN n.value")
         assert abs(results[0]["n.value"] - 3.14) < 0.001
 
     @pytest.mark.asyncio
     async def test_bool_type(self, db):
         """Test boolean data type."""
-        await db.create_label("Test")
-        await db.add_property("Test", "active", "bool", False)
-        await db.execute("CREATE (n:Test {active: true})")
+        await db.schema().label("Test").property("active", "bool").apply()
+        session = db.session()
+        tx = await session.tx()
+        await tx.execute("CREATE (n:Test {active: true})")
+        await tx.commit()
         await db.flush()
-        results = await db.query("MATCH (n:Test) RETURN n.active")
+        results = await session.query("MATCH (n:Test) RETURN n.active")
         assert results[0]["n.active"] is True
 
 
@@ -173,7 +215,7 @@ class TestAsyncSchemaBuilder:
     @pytest.fixture
     async def db(self):
         """Create a temporary async database."""
-        return await uni_db.AsyncDatabase.temporary()
+        return await uni_db.AsyncUni.temporary()
 
     @pytest.mark.asyncio
     async def test_schema_builder_label(self, db):
@@ -188,9 +230,12 @@ class TestAsyncSchemaBuilder:
         )
 
         assert await db.label_exists("Person")
-        await db.execute("CREATE (n:Person {name: 'Alice', age: 30})")
+        session = db.session()
+        tx = await session.tx()
+        await tx.execute("CREATE (n:Person {name: 'Alice', age: 30})")
+        await tx.commit()
         await db.flush()
-        results = await db.query("MATCH (n:Person) RETURN n.name, n.age")
+        results = await session.query("MATCH (n:Person) RETURN n.name, n.age")
         assert len(results) == 1
 
     @pytest.mark.asyncio
@@ -232,9 +277,12 @@ class TestAsyncSchemaBuilder:
         )
 
         assert await db.label_exists("Contact")
-        await db.execute("CREATE (n:Contact {name: 'Bob'})")
+        session = db.session()
+        tx = await session.tx()
+        await tx.execute("CREATE (n:Contact {name: 'Bob'})")
+        await tx.commit()
         await db.flush()
-        results = await db.query("MATCH (n:Contact) RETURN n.name")
+        results = await session.query("MATCH (n:Contact) RETURN n.name")
         assert len(results) == 1
 
     @pytest.mark.asyncio

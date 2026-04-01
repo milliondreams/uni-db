@@ -82,7 +82,7 @@ def create_test_crate(notebooks_dir, output_dir):
     cargo_toml = '''[package]
 name = "notebook-tests"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
 uni = { path = "../../crates/uni" }
@@ -236,8 +236,6 @@ def transform_notebook_to_test(code, test_name):
 
     # Clean up any artifacts
     result = result.replace('.await.await', '.await')
-    result = result.replace('((', '(')
-    result = result.replace('))', ')')
 
     return result
 

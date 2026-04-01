@@ -1,0 +1,42 @@
+{
+  "eval_id": 2,
+  "eval_name": "pydantic-social-network",
+  "prompt": "Using uni-pydantic, model a social network with User nodes (name, bio, embedding vector) and FOLLOWS edges (since date, weight), then write code to create users, add follow relationships, query followers with filters, and do vector similarity search on user bios.",
+  "assertions": [
+    {
+      "id": "uninode-subclass",
+      "text": "User model inherits from UniNode with __label__ class attribute set",
+      "type": "code_pattern"
+    },
+    {
+      "id": "uniedge-subclass",
+      "text": "FOLLOWS model inherits from UniEdge with __edge_type__, __from__, and __to__ class attributes",
+      "type": "code_pattern"
+    },
+    {
+      "id": "vector-type",
+      "text": "Embedding field uses Vector[N] type annotation (e.g., Vector[384]) for the bio embedding",
+      "type": "code_pattern"
+    },
+    {
+      "id": "session-usage",
+      "text": "Uses UniSession or AsyncUniSession (not raw Uni session) for OGM operations",
+      "type": "code_pattern"
+    },
+    {
+      "id": "sync-schema",
+      "text": "Calls sync_schema() to apply Pydantic model definitions to the database",
+      "type": "code_pattern"
+    },
+    {
+      "id": "query-builder-filters",
+      "text": "Uses QueryBuilder with filter expressions (e.g., User.name == 'Alice' or PropertyProxy operators) for querying",
+      "type": "code_pattern"
+    },
+    {
+      "id": "vector-search",
+      "text": "Performs vector similarity search using vector_search() method or similar_to on the embedding field",
+      "type": "code_pattern"
+    }
+  ]
+}

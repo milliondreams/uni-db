@@ -416,24 +416,16 @@ pub(crate) fn find_common_result_type(
         return first.clone(); // All are Time structs, return first
     }
 
-    // Rule 6: LargeBinary mixed with List/LargeList → LargeBinary
-    // LargeBinary is the CypherValue encoding that can represent any list.
-    // Literal lists produce native List<T> while CypherValue operations return
-    // LargeBinary. When these mix in CASE branches, use LargeBinary as the
-    // common type to avoid corrupting binary data by casting to Utf8.
+    // Rule 6: Any LargeBinary → LargeBinary
+    // LargeBinary is the CypherValue encoding that can represent any type
+    // (scalars, lists, maps). When mixed with any other type in CASE branches,
+    // use LargeBinary as the common type — coerce_branch_to handles converting
+    // concrete types (Int64, Utf8, List, etc.) to CypherValue via UDFs.
     if non_null_types
         .iter()
         .any(|t| matches!(t, DataType::LargeBinary))
     {
-        let all_list_or_lb = non_null_types.iter().all(|t| {
-            matches!(
-                t,
-                DataType::LargeBinary | DataType::List(_) | DataType::LargeList(_)
-            )
-        });
-        if all_list_or_lb {
-            return DataType::LargeBinary;
-        }
+        return DataType::LargeBinary;
     }
 
     // Rule 7: Fallback → Utf8
@@ -446,10 +438,12 @@ pub(crate) fn find_common_result_type(
 /// (e.g., `List<T>` / `LargeList<T>` → `LargeBinary`). Falls back to a
 /// standard Arrow cast for all other type pairs.
 fn coerce_branch_to(expr: DfExpr, from_type: &DataType, target_type: &DataType) -> DfExpr {
-    if matches!(target_type, DataType::LargeBinary)
-        && matches!(from_type, DataType::List(_) | DataType::LargeList(_))
-    {
-        return super::df_expr::list_to_large_binary_expr(expr);
+    if matches!(target_type, DataType::LargeBinary) && !matches!(from_type, DataType::LargeBinary) {
+        if matches!(from_type, DataType::List(_) | DataType::LargeList(_)) {
+            return super::df_expr::list_to_large_binary_expr(expr);
+        }
+        // Scalar types (Int64, Float64, Utf8, Boolean, etc.) → CypherValue
+        return super::df_expr::scalar_to_large_binary_expr(expr);
     }
     super::df_expr::cast_expr(expr, target_type.clone())
 }

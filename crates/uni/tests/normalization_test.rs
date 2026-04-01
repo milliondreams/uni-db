@@ -11,23 +11,26 @@ async fn test_match_returns_node_type() -> Result<()> {
     let db = Uni::temporary().build().await?;
 
     // Create schema and data
-    db.execute("CREATE LABEL Person (name STRING, age INT32)")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL Person (name STRING, age INT32)")
         .await?;
-    db.execute("CREATE (:Person {name: 'Alice', age: 30})")
+    tx.execute("CREATE (:Person {name: 'Alice', age: 30})")
         .await?;
-    db.execute("CREATE (:Person {name: 'Bob', age: 25})")
+    tx.execute("CREATE (:Person {name: 'Bob', age: 25})")
         .await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // Test: MATCH should return Node types (not Map with _vid/_label)
     let results = db
+        .session()
         .query("MATCH (n:Person) RETURN n ORDER BY n.name")
         .await?;
 
     assert_eq!(results.len(), 2, "Expected 2 results");
 
     // Check first result
-    let node1 = results.rows[0].value("n").unwrap();
+    let node1 = results.rows()[0].value("n").unwrap();
     match node1 {
         Value::Node(node) => {
             assert_eq!(node.labels, &["Person".to_string()]);
@@ -44,7 +47,7 @@ async fn test_match_returns_node_type() -> Result<()> {
     }
 
     // Check second result
-    let node2 = results.rows[1].value("n").unwrap();
+    let node2 = results.rows()[1].value("n").unwrap();
     match node2 {
         Value::Node(node) => {
             assert_eq!(node.labels, &["Person".to_string()]);
@@ -64,28 +67,29 @@ async fn test_match_returns_node_type() -> Result<()> {
 async fn test_match_with_edge_returns_proper_types() -> Result<()> {
     let db = Uni::temporary().build().await?;
 
-    // Create schema
-    db.execute("CREATE LABEL Person (name STRING)").await?;
-    db.execute("CREATE EDGE TYPE KNOWS () FROM Person TO Person")
+    // Create schema and data
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL Person (name STRING)").await?;
+    tx.execute("CREATE EDGE TYPE KNOWS () FROM Person TO Person")
         .await?;
-
-    // Create nodes and edge
-    db.execute("CREATE (a:Person {name: 'Alice'})").await?;
-    db.execute("CREATE (b:Person {name: 'Bob'})").await?;
-    db.execute(
+    tx.execute("CREATE (a:Person {name: 'Alice'})").await?;
+    tx.execute("CREATE (b:Person {name: 'Bob'})").await?;
+    tx.execute(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) CREATE (a)-[:KNOWS]->(b)",
     )
     .await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // Test: Match with edge should return Node and Edge types
     let results = db
+        .session()
         .query("MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN a, r, b")
         .await?;
 
     assert_eq!(results.len(), 1, "Expected 1 result");
 
-    let row = &results.rows[0];
+    let row = &results.rows()[0];
 
     // Check node a
     match row.value("a").unwrap() {
@@ -129,20 +133,23 @@ async fn test_match_with_edge_returns_proper_types() -> Result<()> {
 async fn test_property_access_still_works() -> Result<()> {
     let db = Uni::temporary().build().await?;
 
-    db.execute("CREATE LABEL Person (name STRING, age INT32)")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL Person (name STRING, age INT32)")
         .await?;
-    db.execute("CREATE (:Person {name: 'Alice', age: 30})")
+    tx.execute("CREATE (:Person {name: 'Alice', age: 30})")
         .await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // Test: Property access should still work after normalization
     let results = db
+        .session()
         .query("MATCH (n:Person) RETURN n.name AS name, n.age AS age")
         .await?;
 
     assert_eq!(results.len(), 1);
 
-    let row = &results.rows[0];
+    let row = &results.rows()[0];
     assert_eq!(row.value("name"), Some(&Value::String("Alice".to_string())));
     assert_eq!(row.value("age"), Some(&Value::Int(30)));
 

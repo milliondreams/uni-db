@@ -5,6 +5,7 @@ use crate::runtime::l0::L0Buffer;
 use parking_lot::RwLock;
 use std::sync::Arc;
 use std::time::Instant;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]
 pub struct QueryContext {
@@ -14,6 +15,9 @@ pub struct QueryContext {
     /// These remain visible to reads until flush completes successfully.
     pub pending_flush_l0s: Vec<Arc<RwLock<L0Buffer>>>,
     pub deadline: Option<Instant>,
+    /// Cooperative cancellation token. Checked alongside the deadline in
+    /// `check_timeout()`.
+    pub cancellation_token: Option<CancellationToken>,
 }
 
 impl QueryContext {
@@ -23,6 +27,7 @@ impl QueryContext {
             transaction_l0: None,
             pending_flush_l0s: Vec::new(),
             deadline: None,
+            cancellation_token: None,
         }
     }
 
@@ -35,6 +40,7 @@ impl QueryContext {
             transaction_l0,
             pending_flush_l0s: Vec::new(),
             deadline: None,
+            cancellation_token: None,
         }
     }
 
@@ -48,6 +54,7 @@ impl QueryContext {
             transaction_l0,
             pending_flush_l0s,
             deadline: None,
+            cancellation_token: None,
         }
     }
 
@@ -55,7 +62,16 @@ impl QueryContext {
         self.deadline = Some(deadline);
     }
 
+    pub fn set_cancellation_token(&mut self, token: CancellationToken) {
+        self.cancellation_token = Some(token);
+    }
+
     pub fn check_timeout(&self) -> anyhow::Result<()> {
+        if let Some(ref token) = self.cancellation_token
+            && token.is_cancelled()
+        {
+            return Err(anyhow::anyhow!("Query cancelled"));
+        }
         if let Some(deadline) = self.deadline
             && Instant::now() > deadline
         {

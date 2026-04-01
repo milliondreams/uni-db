@@ -33,9 +33,6 @@ async fn test_compact_vertices_with_null_props() -> anyhow::Result<()> {
     let ds = storage.vertex_dataset("Node")?;
     let arrow_schema = ds.get_arrow_schema(&schema_manager.schema())?;
 
-    // Use LanceDB to write data (canonical storage path)
-    let lancedb_store = storage.lancedb_store();
-
     // Batch 1: VID 1, name="A"
     // Columns: _vid, _uid, _deleted, _version, ext_id, _labels, _created_at, _updated_at, name, overflow_json
     let batch1 = RecordBatch::try_new(
@@ -61,7 +58,7 @@ async fn test_compact_vertices_with_null_props() -> anyhow::Result<()> {
             Arc::new(LargeBinaryArray::from(vec![None::<&[u8]>])), // overflow_json
         ],
     )?;
-    ds.write_batch_lancedb(lancedb_store, batch1, &schema_manager.schema())
+    ds.write_batch(storage.backend(), batch1, &schema_manager.schema())
         .await?;
 
     // Batch 2: VID 2, name=NULL
@@ -88,7 +85,7 @@ async fn test_compact_vertices_with_null_props() -> anyhow::Result<()> {
             Arc::new(LargeBinaryArray::from(vec![None::<&[u8]>])), // overflow_json
         ],
     )?;
-    ds.write_batch_lancedb(lancedb_store, batch2, &schema_manager.schema())
+    ds.write_batch(storage.backend(), batch2, &schema_manager.schema())
         .await?;
 
     // Compact

@@ -19,8 +19,9 @@ Uni stores data in LanceDB tables and can persist to local disk or object storag
         .hybrid("./local_meta", "s3://my-bucket/graph-data")
         .build()
         .await?;
+    let session = db.session();
 
-    db.query("MATCH (n) RETURN count(n)").await?;
+    session.query("MATCH (n) RETURN count(n)").await?;
     # Ok(())
     # }
     ```
@@ -29,11 +30,12 @@ Uni stores data in LanceDB tables and can persist to local disk or object storag
     ```python
     import uni_db
 
-    db = uni_db.DatabaseBuilder.open("./local_meta") \
+    db = uni_db.Uni.open("./local_meta") \
         .hybrid("./local_meta", "s3://my-bucket/graph-data") \
         .build()
+    session = db.session()
 
-    db.query("MATCH (n) RETURN count(n)")
+    session.query("MATCH (n) RETURN count(n)")
     ```
 
 ## Use Cases

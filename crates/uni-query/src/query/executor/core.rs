@@ -237,6 +237,17 @@ pub struct Executor {
     pub(crate) xervo_runtime: Option<Arc<ModelRuntime>>,
     /// Warnings collected during the last execution.
     pub(crate) warnings: Arc<std::sync::Mutex<Vec<QueryWarning>>>,
+    /// Private transaction L0 buffer for query context and mutations.
+    /// Used by Transaction to route reads and writes through a private L0 buffer
+    /// without requiring the writer lock at transaction-creation time.
+    pub(crate) transaction_l0_override:
+        Option<Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
+    /// User-defined custom scalar function registry.
+    pub(crate) custom_function_registry:
+        Option<Arc<super::custom_functions::CustomFunctionRegistry>>,
+    /// Cooperative cancellation token. Passed to `QueryContext` and
+    /// `GraphExecutionContext` so in-flight operators can detect cancellation.
+    pub(crate) cancellation_token: Option<tokio_util::sync::CancellationToken>,
 }
 
 impl std::fmt::Debug for Executor {
@@ -265,6 +276,9 @@ impl Executor {
             procedure_registry: None,
             xervo_runtime: None,
             warnings: Arc::new(std::sync::Mutex::new(Vec::new())),
+            transaction_l0_override: None,
+            custom_function_registry: None,
+            cancellation_token: None,
         }
     }
 
@@ -321,22 +335,54 @@ impl Executor {
         self.use_transaction = use_transaction;
     }
 
+    /// Set a private transaction L0 buffer for both read visibility (QueryContext)
+    /// and mutation routing.
+    pub fn set_transaction_l0(
+        &mut self,
+        l0: Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>,
+    ) {
+        self.transaction_l0_override = Some(l0);
+    }
+
+    /// Attach a custom scalar function registry for user-defined functions.
+    pub fn set_custom_functions(
+        &mut self,
+        registry: Arc<super::custom_functions::CustomFunctionRegistry>,
+    ) {
+        self.custom_function_registry = Some(registry);
+    }
+
+    /// Set a cooperative cancellation token for in-flight query cancellation.
+    pub fn set_cancellation_token(&mut self, token: tokio_util::sync::CancellationToken) {
+        self.cancellation_token = Some(token);
+    }
+
     /// Build a `QueryContext` from the current writer or standalone L0 manager.
+    /// When `transaction_l0_override` is set, it is used as the transaction L0 —
+    /// this is how private-per-transaction L0 buffers become visible to reads
+    /// without requiring the writer lock at tx creation.
     pub(crate) async fn get_context(&self) -> Option<QueryContext> {
         if let Some(writer_lock) = &self.writer {
             let writer = writer_lock.read().await;
-            // Include pending_flush L0s so data being flushed remains visible
+            // Prefer the override (private tx L0) over the writer's slot
+            let tx_l0 = self.transaction_l0_override.clone();
             let mut ctx = QueryContext::new_with_pending(
                 writer.l0_manager.get_current(),
-                writer.transaction_l0.clone(),
+                tx_l0,
                 writer.l0_manager.get_pending_flush(),
             );
             ctx.set_deadline(Instant::now() + self.config.query_timeout);
+            if let Some(ref token) = self.cancellation_token {
+                ctx.set_cancellation_token(token.clone());
+            }
             Some(ctx)
         } else {
             self.l0_manager.as_ref().map(|m| {
                 let mut ctx = QueryContext::new(m.get_current());
                 ctx.set_deadline(Instant::now() + self.config.query_timeout);
+                if let Some(ref token) = self.cancellation_token {
+                    ctx.set_cancellation_token(token.clone());
+                }
                 ctx
             })
         }
@@ -671,11 +717,54 @@ pub struct OperatorStats {
     pub index_misses: Option<usize>,
 }
 
+/// Walk a DataFusion physical plan tree (post-order DFS) and collect
+/// per-operator metrics recorded by `BaselineMetrics` during execution.
+///
+/// Children are visited before parents so the resulting `Vec` flows from
+/// data-producers (leaf scans) up to consumers (projections, filters).
+fn collect_plan_metrics(
+    plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+) -> Vec<OperatorStats> {
+    let mut stats = Vec::new();
+    collect_plan_metrics_inner(plan, &mut stats);
+    stats
+}
+
+fn collect_plan_metrics_inner(
+    plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+    out: &mut Vec<OperatorStats>,
+) {
+    // Recurse into children first (post-order)
+    for child in plan.children() {
+        collect_plan_metrics_inner(child, out);
+    }
+
+    let operator = plan.name().to_string();
+
+    let (actual_rows, time_ms) = match plan.metrics() {
+        Some(metrics) => {
+            let rows = metrics.output_rows().unwrap_or(0);
+            // elapsed_compute() returns nanoseconds
+            let nanos = metrics.elapsed_compute().unwrap_or(0);
+            let ms = nanos as f64 / 1_000_000.0;
+            (rows, ms)
+        }
+        None => (0, 0.0),
+    };
+
+    out.push(OperatorStats {
+        operator,
+        actual_rows,
+        time_ms,
+        memory_bytes: 0,
+        index_hits: None,
+        index_misses: None,
+    });
+}
+
 impl Executor {
-    /// Profiles query execution and returns results with timing statistics.
-    ///
-    /// Uses the DataFusion-based executor for query execution. Granular operator
-    /// profiling will be added in a future release.
+    /// Profiles query execution and returns results with per-operator timing
+    /// statistics extracted from the DataFusion physical plan tree.
     pub async fn profile(
         &self,
         plan: crate::query::planner::LogicalPlan,
@@ -688,21 +777,34 @@ impl Executor {
 
         let start = Instant::now();
 
-        // Execute using the standard execute path (DataFusion-based)
         let prop_manager = self.create_prop_manager();
-        let results = self.execute(plan.clone(), &prop_manager, params).await?;
+
+        // DDL/admin queries don't flow through DataFusion — fall back to
+        // single aggregate stat.
+        let (results, stats) = if Self::is_ddl_or_admin(&plan) {
+            let results = self
+                .execute_subplan(plan, &prop_manager, params, None)
+                .await?;
+            let elapsed = start.elapsed();
+            let stats = vec![OperatorStats {
+                operator: "DDL/Admin Execution".to_string(),
+                actual_rows: results.len(),
+                time_ms: elapsed.as_secs_f64() * 1000.0,
+                memory_bytes: 0,
+                index_hits: None,
+                index_misses: None,
+            }];
+            (results, stats)
+        } else {
+            let (batches, execution_plan) = self
+                .execute_datafusion_with_plan(plan, &prop_manager, params)
+                .await?;
+            let results = self.record_batches_to_rows(batches)?;
+            let stats = collect_plan_metrics(&execution_plan);
+            (results, stats)
+        };
 
         let total_time = start.elapsed();
-
-        // Return aggregate stats (granular operator profiling to be added later)
-        let stats = vec![OperatorStats {
-            operator: "DataFusion Execution".to_string(),
-            actual_rows: results.len(),
-            time_ms: total_time.as_secs_f64() * 1000.0,
-            memory_bytes: 0,
-            index_hits: None,
-            index_misses: None,
-        }];
 
         Ok((
             results,

@@ -14,10 +14,12 @@
 - `max_explain_depth`: derivation tree depth bound.
 - `max_slg_depth`: goal-directed recursion bound.
 - `max_abduce_candidates` / `max_abduce_results`: abduction search bounds.
+- `deterministic_best_by`: enforce deterministic tie-breaking in `BEST BY` clauses.
 - `strict_probability_domain`: reject probability inputs outside `[0, 1]` instead of clamping.
 - `probability_epsilon`: MPROD threshold for switching to log-space accumulation.
 - `exact_probability`: enable BDD-based exact evaluation for shared-proof aggregate groups.
 - `max_bdd_variables`: cap per-group BDD complexity before fallback.
+- `top_k_proofs`: limit proof enumeration per aggregate group (controls memory/CPU for large proof spaces).
 
 ## Runtime Warning Codes
 

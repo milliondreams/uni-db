@@ -99,7 +99,9 @@ mod test_helpers {
     pub async fn setup_social_graph(db: &Uni) -> Result<()> {
         // Create persons and relationships using combined CREATE statements
         // Alice -> Bob -> Charlie, Alice -> Diana
-        db.execute(
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute(
             "CREATE (alice:Person {name: 'Alice', age: 30})
              CREATE (bob:Person {name: 'Bob', age: 25})
              CREATE (charlie:Person {name: 'Charlie', age: 35})
@@ -109,6 +111,7 @@ mod test_helpers {
              CREATE (alice)-[:KNOWS {since: 2019}]->(diana)",
         )
         .await?;
+        tx.commit().await?;
 
         db.flush().await?;
         Ok(())
@@ -129,17 +132,21 @@ mod data_type_tests {
         setup_all_types_schema(&db).await?;
 
         // Test various string values
-        db.execute("CREATE (:AllTypesNode {str_val: 'hello world'})")
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (:AllTypesNode {str_val: 'hello world'})")
             .await?;
-        db.execute("CREATE (:AllTypesNode {str_val: ''})").await?; // Empty string
-        db.execute("CREATE (:AllTypesNode {str_val: 'special chars: !@#$%^&*()'})")
+        tx.execute("CREATE (:AllTypesNode {str_val: ''})").await?; // Empty string
+        tx.execute("CREATE (:AllTypesNode {str_val: 'special chars: !@#$%^&*()'})")
             .await?;
-        db.execute("CREATE (:AllTypesNode {str_val: 'unicode: 你好世界 🎉'})")
+        tx.execute("CREATE (:AllTypesNode {str_val: 'unicode: 你好世界 🎉'})")
             .await?;
+        tx.commit().await?;
 
         db.flush().await?;
 
         let result = db
+            .session()
             .query("MATCH (n:AllTypesNode) RETURN n.str_val ORDER BY n.str_val")
             .await?;
         assert_eq!(result.len(), 4);
@@ -157,23 +164,25 @@ mod data_type_tests {
         setup_all_types_schema(&db).await?;
 
         // Test Int32 (note: negative literals not supported by parser)
-        db.execute("CREATE (:AllTypesNode {int32_val: 42})").await?;
-        db.execute("CREATE (:AllTypesNode {int32_val: 0})").await?;
-        db.execute("CREATE (:AllTypesNode {int32_val: 2147483647})")
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (:AllTypesNode {int32_val: 42})").await?;
+        tx.execute("CREATE (:AllTypesNode {int32_val: 0})").await?;
+        tx.execute("CREATE (:AllTypesNode {int32_val: 2147483647})")
             .await?; // Max Int32
-
         // Test Int64
-        db.execute("CREATE (:AllTypesNode {int64_val: 0})").await?;
-        db.execute("CREATE (:AllTypesNode {int64_val: 100})")
+        tx.execute("CREATE (:AllTypesNode {int64_val: 0})").await?;
+        tx.execute("CREATE (:AllTypesNode {int64_val: 100})")
             .await?;
-        db.execute("CREATE (:AllTypesNode {int64_val: 9223372036854775807})")
+        tx.execute("CREATE (:AllTypesNode {int64_val: 9223372036854775807})")
             .await?; // Max Int64
+        tx.commit().await?;
 
         db.flush().await?;
 
         // Verify Int32 values
         let result = db
-            .query("MATCH (n:AllTypesNode) WHERE n.int32_val IS NOT NULL RETURN n.int32_val ORDER BY n.int32_val")
+            .session().query("MATCH (n:AllTypesNode) WHERE n.int32_val IS NOT NULL RETURN n.int32_val ORDER BY n.int32_val")
             .await?;
         assert_eq!(result.len(), 3);
         let min_val: i32 = result.rows()[0].get("n.int32_val")?;
@@ -183,7 +192,7 @@ mod data_type_tests {
 
         // Verify Int64 values
         let result = db
-            .query("MATCH (n:AllTypesNode) WHERE n.int64_val IS NOT NULL RETURN n.int64_val ORDER BY n.int64_val")
+            .session().query("MATCH (n:AllTypesNode) WHERE n.int64_val IS NOT NULL RETURN n.int64_val ORDER BY n.int64_val")
             .await?;
         assert_eq!(result.len(), 3);
         let min_val: i64 = result.rows()[0].get("n.int64_val")?;
@@ -200,19 +209,22 @@ mod data_type_tests {
         setup_all_types_schema(&db).await?;
 
         // Test Float32 and Float64 (note: negative literals not supported by parser)
-        db.execute("CREATE (:AllTypesNode {float32_val: 3.5})")
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (:AllTypesNode {float32_val: 3.5})")
             .await?;
-        db.execute("CREATE (:AllTypesNode {float64_val: 2.718281828459045})")
+        tx.execute("CREATE (:AllTypesNode {float64_val: 2.718281828459045})")
             .await?;
-        db.execute("CREATE (:AllTypesNode {float64_val: 0.0})")
+        tx.execute("CREATE (:AllTypesNode {float64_val: 0.0})")
             .await?;
-        db.execute("CREATE (:AllTypesNode {float64_val: 1.5})")
+        tx.execute("CREATE (:AllTypesNode {float64_val: 1.5})")
             .await?;
+        tx.commit().await?;
 
         db.flush().await?;
 
         let result = db
-            .query("MATCH (n:AllTypesNode) WHERE n.float64_val IS NOT NULL RETURN n.float64_val ORDER BY n.float64_val")
+            .session().query("MATCH (n:AllTypesNode) WHERE n.float64_val IS NOT NULL RETURN n.float64_val ORDER BY n.float64_val")
             .await?;
         assert_eq!(result.len(), 3);
 
@@ -227,14 +239,18 @@ mod data_type_tests {
         let db = create_test_db().await?;
         setup_all_types_schema(&db).await?;
 
-        db.execute("CREATE (:AllTypesNode {bool_val: true})")
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (:AllTypesNode {bool_val: true})")
             .await?;
-        db.execute("CREATE (:AllTypesNode {bool_val: false})")
+        tx.execute("CREATE (:AllTypesNode {bool_val: false})")
             .await?;
+        tx.commit().await?;
 
         db.flush().await?;
 
         let result = db
+            .session()
             .query("MATCH (n:AllTypesNode) WHERE n.bool_val = true RETURN n.bool_val")
             .await?;
         assert_eq!(result.len(), 1);
@@ -242,6 +258,7 @@ mod data_type_tests {
         assert!(val);
 
         let result = db
+            .session()
             .query("MATCH (n:AllTypesNode) WHERE n.bool_val = false RETURN n.bool_val")
             .await?;
         assert_eq!(result.len(), 1);
@@ -257,12 +274,16 @@ mod data_type_tests {
         setup_all_types_schema(&db).await?;
 
         // Use TemporalNode which has non-nullable date_val
-        db.execute("CREATE (:TemporalNode {date_val: date('2024-01-15'), datetime_val: datetime('2024-01-15T00:00:00Z')})").await?;
-        db.execute("CREATE (:TemporalNode {date_val: date('2023-12-31'), datetime_val: datetime('2023-12-31T00:00:00Z')})").await?;
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (:TemporalNode {date_val: date('2024-01-15'), datetime_val: datetime('2024-01-15T00:00:00Z')})").await?;
+        tx.execute("CREATE (:TemporalNode {date_val: date('2023-12-31'), datetime_val: datetime('2023-12-31T00:00:00Z')})").await?;
+        tx.commit().await?;
 
         db.flush().await?;
 
         let result = db
+            .session()
             .query("MATCH (n:TemporalNode) RETURN n.date_val ORDER BY n.date_val")
             .await?;
         assert_eq!(result.len(), 2);
@@ -276,12 +297,16 @@ mod data_type_tests {
         setup_all_types_schema(&db).await?;
 
         // Use TemporalNode which has non-nullable datetime_val
-        db.execute("CREATE (:TemporalNode {date_val: date('2024-01-15'), datetime_val: datetime('2024-01-15T10:30:00Z')})").await?;
-        db.execute("CREATE (:TemporalNode {date_val: date('2024-06-01'), datetime_val: datetime('2024-06-01T23:59:59Z')})").await?;
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (:TemporalNode {date_val: date('2024-01-15'), datetime_val: datetime('2024-01-15T10:30:00Z')})").await?;
+        tx.execute("CREATE (:TemporalNode {date_val: date('2024-06-01'), datetime_val: datetime('2024-06-01T23:59:59Z')})").await?;
+        tx.commit().await?;
 
         db.flush().await?;
 
         let result = db
+            .session()
             .query("MATCH (n:TemporalNode) RETURN n.datetime_val ORDER BY n.datetime_val")
             .await?;
         assert_eq!(result.len(), 2);
@@ -298,25 +323,28 @@ mod data_type_tests {
 
         // Create nodes with DateTimes representing the same UTC instant but different offsets
         // 2024-01-01T01:00+01:00 = 2024-01-01T00:00+00:00 (same UTC instant)
-        db.execute(
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute(
             "CREATE (:TemporalNode {date_val: date('2024-01-01'), datetime_val: datetime('2024-01-01T01:00+01:00')})",
         )
         .await?;
-        db.execute(
+        tx.execute(
             "CREATE (:TemporalNode {date_val: date('2024-01-01'), datetime_val: datetime('2024-01-01T00:00+00:00')})",
         )
         .await?;
         // Different UTC instant for comparison
-        db.execute(
+        tx.execute(
             "CREATE (:TemporalNode {date_val: date('2024-01-01'), datetime_val: datetime('2024-01-01T02:00+00:00')})",
         )
         .await?;
+        tx.commit().await?;
 
         db.flush().await?;
 
         // Test equality: same UTC instant with different offsets should be equal
         let result = db
-            .query("MATCH (n:TemporalNode) WHERE n.datetime_val = datetime('2024-01-01T01:00+01:00') RETURN n.datetime_val")
+            .session().query("MATCH (n:TemporalNode) WHERE n.datetime_val = datetime('2024-01-01T01:00+01:00') RETURN n.datetime_val")
             .await?;
         // Should match both the +01:00 and +00:00 versions (same UTC)
         assert_eq!(
@@ -327,7 +355,7 @@ mod data_type_tests {
 
         // Test inequality: different UTC instant should not match
         let result = db
-            .query("MATCH (n:TemporalNode) WHERE n.datetime_val = datetime('2024-01-01T02:00+00:00') RETURN n.datetime_val")
+            .session().query("MATCH (n:TemporalNode) WHERE n.datetime_val = datetime('2024-01-01T02:00+00:00') RETURN n.datetime_val")
             .await?;
         assert_eq!(
             result.len(),
@@ -337,13 +365,14 @@ mod data_type_tests {
 
         // Test ordering: should order by UTC instant
         let result = db
+            .session()
             .query("MATCH (n:TemporalNode) RETURN n.datetime_val ORDER BY n.datetime_val")
             .await?;
         assert_eq!(result.len(), 3, "Should return all 3 nodes in UTC order");
 
         // Test grouping: same UTC instant should group together
         let result = db
-            .query("MATCH (n:TemporalNode) WITH n.datetime_val as dt, count(*) as cnt RETURN dt, cnt ORDER BY cnt DESC")
+            .session().query("MATCH (n:TemporalNode) WITH n.datetime_val as dt, count(*) as cnt RETURN dt, cnt ORDER BY cnt DESC")
             .await?;
         // Should have 2 groups: one with count=2 (same UTC), one with count=1
         assert_eq!(result.len(), 2, "Should group by UTC instant");
@@ -362,12 +391,16 @@ mod data_type_tests {
         setup_all_types_schema(&db).await?;
 
         // Note: JSON literals in Cypher are typically represented as maps
-        db.execute("CREATE (:AllTypesNode {json_val: '{\"key\": \"value\", \"number\": 42}'})")
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (:AllTypesNode {json_val: '{\"key\": \"value\", \"number\": 42}'})")
             .await?;
+        tx.commit().await?;
 
         db.flush().await?;
 
         let result = db
+            .session()
             .query("MATCH (n:AllTypesNode) WHERE n.json_val IS NOT NULL RETURN n.json_val")
             .await?;
         assert_eq!(result.len(), 1);
@@ -381,15 +414,19 @@ mod data_type_tests {
         setup_all_types_schema(&db).await?;
 
         // Create nodes with and without nullable property
-        db.execute("CREATE (:AllTypesNode {str_val: 'has nullable', nullable_str: 'present'})")
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (:AllTypesNode {str_val: 'has nullable', nullable_str: 'present'})")
             .await?;
-        db.execute("CREATE (:AllTypesNode {str_val: 'no nullable'})")
+        tx.execute("CREATE (:AllTypesNode {str_val: 'no nullable'})")
             .await?;
+        tx.commit().await?;
 
         db.flush().await?;
 
         // Query for NULL values
         let result = db
+            .session()
             .query("MATCH (n:AllTypesNode) WHERE n.nullable_str IS NULL RETURN n.str_val")
             .await?;
         assert_eq!(result.len(), 1);
@@ -398,6 +435,7 @@ mod data_type_tests {
 
         // Query for NOT NULL values
         let result = db
+            .session()
             .query("MATCH (n:AllTypesNode) WHERE n.nullable_str IS NOT NULL RETURN n.str_val")
             .await?;
         assert_eq!(result.len(), 1);
@@ -412,22 +450,26 @@ mod data_type_tests {
         let db = create_test_db().await?;
         setup_all_types_schema(&db).await?;
 
-        db.execute(
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute(
             "CREATE (:Document {title: 'Doc1', content: 'Test', embedding: [1.0, 0.0, 0.0, 0.0]})",
         )
         .await?;
-        db.execute(
+        tx.execute(
             "CREATE (:Document {title: 'Doc2', content: 'Test', embedding: [0.0, 1.0, 0.0, 0.0]})",
         )
         .await?;
-        db.execute(
+        tx.execute(
             "CREATE (:Document {title: 'Doc3', content: 'Test', embedding: [0.0, 0.0, 1.0, 0.0]})",
         )
         .await?;
+        tx.commit().await?;
 
         db.flush().await?;
 
         let result = db
+            .session()
             .query("MATCH (d:Document) RETURN d.title, d.embedding ORDER BY d.title")
             .await?;
         assert_eq!(result.len(), 3);
@@ -446,16 +488,20 @@ mod data_type_tests {
             .await?;
 
         // Create nodes with time values
-        db.execute("CREATE (:TimeNode {time_val: time('10:30:45')})")
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (:TimeNode {time_val: time('10:30:45')})")
             .await?;
-        db.execute("CREATE (:TimeNode {time_val: time('23:59:59')})")
+        tx.execute("CREATE (:TimeNode {time_val: time('23:59:59')})")
             .await?;
-        db.execute("CREATE (:TimeNode {time_val: time('00:00:00')})")
+        tx.execute("CREATE (:TimeNode {time_val: time('00:00:00')})")
             .await?;
+        tx.commit().await?;
 
         db.flush().await?;
 
         let result = db
+            .session()
             .query("MATCH (n:TimeNode) RETURN n.time_val ORDER BY n.time_val")
             .await?;
         assert_eq!(result.len(), 3);
@@ -482,16 +528,20 @@ mod data_type_tests {
             .await?;
 
         // Create nodes with duration values (stored as microseconds)
-        db.execute("CREATE (:DurationNode {duration_val: duration('PT1H30M')})")
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (:DurationNode {duration_val: duration('PT1H30M')})")
             .await?; // 1h30m
-        db.execute("CREATE (:DurationNode {duration_val: duration('P1D')})")
+        tx.execute("CREATE (:DurationNode {duration_val: duration('P1D')})")
             .await?; // 1 day
-        db.execute("CREATE (:DurationNode {duration_val: duration('PT90S')})")
+        tx.execute("CREATE (:DurationNode {duration_val: duration('PT90S')})")
             .await?; // 90 seconds
+        tx.commit().await?;
 
         db.flush().await?;
 
         let result = db
+            .session()
             .query("MATCH (n:DurationNode) RETURN n.duration_val ORDER BY n.duration_val")
             .await?;
         assert_eq!(result.len(), 3);
@@ -518,14 +568,18 @@ mod data_type_tests {
             .await?;
 
         // Timestamp is functionally same as DateTime
-        db.execute("CREATE (:TimestampNode {ts_val: datetime('2024-06-15T14:30:00Z')})")
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (:TimestampNode {ts_val: datetime('2024-06-15T14:30:00Z')})")
             .await?;
-        db.execute("CREATE (:TimestampNode {ts_val: datetime('2024-01-01T00:00:00Z')})")
+        tx.execute("CREATE (:TimestampNode {ts_val: datetime('2024-01-01T00:00:00Z')})")
             .await?;
+        tx.commit().await?;
 
         db.flush().await?;
 
         let result = db
+            .session()
             .query("MATCH (n:TimestampNode) RETURN n.ts_val ORDER BY n.ts_val")
             .await?;
         assert_eq!(result.len(), 2);
@@ -547,14 +601,18 @@ mod data_type_tests {
             .apply()
             .await?;
 
-        db.execute("CREATE (:ListNode {tags: ['rust', 'database', 'graph']})")
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (:ListNode {tags: ['rust', 'database', 'graph']})")
             .await?;
-        db.execute("CREATE (:ListNode {tags: ['python', 'ai']})")
+        tx.execute("CREATE (:ListNode {tags: ['python', 'ai']})")
             .await?;
+        tx.commit().await?;
 
         db.flush().await?;
 
         let result = db
+            .session()
             .query("MATCH (n:ListNode) RETURN n.tags ORDER BY size(n.tags)")
             .await?;
         assert_eq!(result.len(), 2);
@@ -579,14 +637,18 @@ mod data_type_tests {
             .apply()
             .await?;
 
-        db.execute("CREATE (:IntListNode {numbers: [1, 2, 3, 4, 5]})")
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (:IntListNode {numbers: [1, 2, 3, 4, 5]})")
             .await?;
-        db.execute("CREATE (:IntListNode {numbers: [10, 20]})")
+        tx.execute("CREATE (:IntListNode {numbers: [10, 20]})")
             .await?;
+        tx.commit().await?;
 
         db.flush().await?;
 
         let result = db
+            .session()
             .query("MATCH (n:IntListNode) RETURN n.numbers ORDER BY size(n.numbers)")
             .await?;
         assert_eq!(result.len(), 2);
@@ -613,12 +675,18 @@ mod data_type_tests {
             .apply()
             .await?;
 
-        db.execute("CREATE (:MapNode {metadata: {key1: 'value1', key2: 'value2'}})")
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (:MapNode {metadata: {key1: 'value1', key2: 'value2'}})")
             .await?;
+        tx.commit().await?;
 
         db.flush().await?;
 
-        let result = db.query("MATCH (n:MapNode) RETURN n.metadata").await?;
+        let result = db
+            .session()
+            .query("MATCH (n:MapNode) RETURN n.metadata")
+            .await?;
         assert_eq!(result.len(), 1);
 
         // Map is returned as a JSON object
@@ -676,14 +744,20 @@ mod crdt_type_tests {
             .await?;
 
         // GCounter JSON format: {"t": "gc", "d": {"counts": {"actor": n}}}
-        db.execute(
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute(
             r#"CREATE (:CounterNode {counter: '{"t": "gc", "d": {"counts": {"actor1": 5}}}'})"#,
         )
         .await?;
+        tx.commit().await?;
 
         db.flush().await?;
 
-        let result = db.query("MATCH (n:CounterNode) RETURN n.counter").await?;
+        let result = db
+            .session()
+            .query("MATCH (n:CounterNode) RETURN n.counter")
+            .await?;
         assert_eq!(result.len(), 1);
 
         let counter = get_crdt_value(&result.rows()[0], "n.counter");
@@ -703,14 +777,20 @@ mod crdt_type_tests {
             .await?;
 
         // GSet JSON format: {"t": "gs", "d": {"elements": [...]}}
-        db.execute(
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute(
             r#"CREATE (:SetNode {items: '{"t": "gs", "d": {"elements": ["a", "b", "c"]}}'})"#,
         )
         .await?;
+        tx.commit().await?;
 
         db.flush().await?;
 
-        let result = db.query("MATCH (n:SetNode) RETURN n.items").await?;
+        let result = db
+            .session()
+            .query("MATCH (n:SetNode) RETURN n.items")
+            .await?;
         assert_eq!(result.len(), 1);
 
         let items = get_crdt_value(&result.rows()[0], "n.items");
@@ -730,11 +810,17 @@ mod crdt_type_tests {
             .await?;
 
         // ORSet JSON format: {"t": "os", "d": {"elements": {...}, "tombstones": [...]}}
-        db.execute(r#"CREATE (:ORSetNode {items: '{"t": "os", "d": {"elements": {}, "tombstones": []}}'})"#).await?;
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute(r#"CREATE (:ORSetNode {items: '{"t": "os", "d": {"elements": {}, "tombstones": []}}'})"#).await?;
+        tx.commit().await?;
 
         db.flush().await?;
 
-        let result = db.query("MATCH (n:ORSetNode) RETURN n.items").await?;
+        let result = db
+            .session()
+            .query("MATCH (n:ORSetNode) RETURN n.items")
+            .await?;
         assert_eq!(result.len(), 1);
 
         let items = get_crdt_value(&result.rows()[0], "n.items");
@@ -754,11 +840,17 @@ mod crdt_type_tests {
             .await?;
 
         // LWWRegister JSON format: {"t": "lr", "d": {"value": v, "timestamp": n}}
-        db.execute(r#"CREATE (:RegisterNode {value: '{"t": "lr", "d": {"value": "hello", "timestamp": 1000}}'})"#).await?;
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute(r#"CREATE (:RegisterNode {value: '{"t": "lr", "d": {"value": "hello", "timestamp": 1000}}'})"#).await?;
+        tx.commit().await?;
 
         db.flush().await?;
 
-        let result = db.query("MATCH (n:RegisterNode) RETURN n.value").await?;
+        let result = db
+            .session()
+            .query("MATCH (n:RegisterNode) RETURN n.value")
+            .await?;
         assert_eq!(result.len(), 1);
 
         let value = get_crdt_value(&result.rows()[0], "n.value");
@@ -778,12 +870,18 @@ mod crdt_type_tests {
             .await?;
 
         // LWWMap JSON format: {"t": "lm", "d": {"map": {...}}}
-        db.execute(r#"CREATE (:LWWMapNode {data: '{"t": "lm", "d": {"map": {}}}'})"#)
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute(r#"CREATE (:LWWMapNode {data: '{"t": "lm", "d": {"map": {}}}'})"#)
             .await?;
+        tx.commit().await?;
 
         db.flush().await?;
 
-        let result = db.query("MATCH (n:LWWMapNode) RETURN n.data").await?;
+        let result = db
+            .session()
+            .query("MATCH (n:LWWMapNode) RETURN n.data")
+            .await?;
         assert_eq!(result.len(), 1);
 
         let data = get_crdt_value(&result.rows()[0], "n.data");
@@ -803,12 +901,18 @@ mod crdt_type_tests {
             .await?;
 
         // RGA JSON format: {"t": "rg", "d": {"nodes": {...}}}
-        db.execute(r#"CREATE (:RgaNode {sequence: '{"t": "rg", "d": {"nodes": {}}}'})"#)
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute(r#"CREATE (:RgaNode {sequence: '{"t": "rg", "d": {"nodes": {}}}'})"#)
             .await?;
+        tx.commit().await?;
 
         db.flush().await?;
 
-        let result = db.query("MATCH (n:RgaNode) RETURN n.sequence").await?;
+        let result = db
+            .session()
+            .query("MATCH (n:RgaNode) RETURN n.sequence")
+            .await?;
         assert_eq!(result.len(), 1);
 
         let sequence = get_crdt_value(&result.rows()[0], "n.sequence");
@@ -828,14 +932,20 @@ mod crdt_type_tests {
             .await?;
 
         // VectorClock JSON format: {"t": "vc", "d": {"clocks": {...}}}
-        db.execute(
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute(
             r#"CREATE (:VCNode {clock: '{"t": "vc", "d": {"clocks": {"node1": 1, "node2": 2}}}'})"#,
         )
         .await?;
+        tx.commit().await?;
 
         db.flush().await?;
 
-        let result = db.query("MATCH (n:VCNode) RETURN n.clock").await?;
+        let result = db
+            .session()
+            .query("MATCH (n:VCNode) RETURN n.clock")
+            .await?;
         assert_eq!(result.len(), 1);
 
         let clock = get_crdt_value(&result.rows()[0], "n.clock");
@@ -855,11 +965,17 @@ mod crdt_type_tests {
             .await?;
 
         // VCRegister JSON format: {"t": "vr", "d": {"value": v, "clock": {...}}}
-        db.execute(r#"CREATE (:VCRegNode {value: '{"t": "vr", "d": {"value": "test", "clock": {"clocks": {"node1": 1}}}}'})"#).await?;
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute(r#"CREATE (:VCRegNode {value: '{"t": "vr", "d": {"value": "test", "clock": {"clocks": {"node1": 1}}}}'})"#).await?;
+        tx.commit().await?;
 
         db.flush().await?;
 
-        let result = db.query("MATCH (n:VCRegNode) RETURN n.value").await?;
+        let result = db
+            .session()
+            .query("MATCH (n:VCRegNode) RETURN n.value")
+            .await?;
         assert_eq!(result.len(), 1);
 
         let value = get_crdt_value(&result.rows()[0], "n.value");
@@ -884,13 +1000,16 @@ mod clause_tests {
         let db = create_test_db().await?;
         setup_all_types_schema(&db).await?;
 
-        db.execute("CREATE (:Person {name: 'Alice', age: 30})")
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (:Person {name: 'Alice', age: 30})")
             .await?;
-        db.execute("CREATE (:Person {name: 'Bob', age: 25})")
+        tx.execute("CREATE (:Person {name: 'Bob', age: 25})")
             .await?;
+        tx.commit().await?;
         db.flush().await?;
 
-        let result = db.query("MATCH (n:Person) RETURN n.name").await?;
+        let result = db.session().query("MATCH (n:Person) RETURN n.name").await?;
         assert_eq!(result.len(), 2);
 
         Ok(())
@@ -903,6 +1022,7 @@ mod clause_tests {
         setup_social_graph(&db).await?;
 
         let result = db
+            .session()
             .query("MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN a.name, r.since, b.name")
             .await?;
         assert_eq!(result.len(), 3); // Alice->Bob, Bob->Charlie, Alice->Diana
@@ -916,17 +1036,21 @@ mod clause_tests {
         setup_all_types_schema(&db).await?;
 
         // Use combined CREATE pattern
-        db.execute(
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute(
             "CREATE (lonely:Person {name: 'Lonely', age: 40})
              CREATE (alice:Person {name: 'Alice', age: 30})
              CREATE (bob:Person {name: 'Bob', age: 25})
              CREATE (alice)-[:KNOWS {since: 2020}]->(bob)",
         )
         .await?;
+        tx.commit().await?;
         db.flush().await?;
 
         // OPTIONAL MATCH should return NULL for nodes without relationships
         let result = db
+            .session()
             .query(
                 "MATCH (a:Person)
                  OPTIONAL MATCH (a)-[r:KNOWS]->(b:Person)
@@ -953,6 +1077,7 @@ mod clause_tests {
 
         // Greater than
         let result = db
+            .session()
             .query("MATCH (n:Person) WHERE n.age > 30 RETURN n.name")
             .await?;
         assert_eq!(result.len(), 1);
@@ -961,12 +1086,14 @@ mod clause_tests {
 
         // Less than or equal
         let result = db
+            .session()
             .query("MATCH (n:Person) WHERE n.age <= 28 RETURN n.name ORDER BY n.name")
             .await?;
         assert_eq!(result.len(), 2); // Bob (25), Diana (28)
 
         // Not equal
         let result = db
+            .session()
             .query("MATCH (n:Person) WHERE n.name <> 'Alice' RETURN n.name ORDER BY n.name")
             .await?;
         assert_eq!(result.len(), 3);
@@ -982,18 +1109,20 @@ mod clause_tests {
 
         // AND
         let result = db
+            .session()
             .query("MATCH (n:Person) WHERE n.age > 25 AND n.age < 35 RETURN n.name ORDER BY n.name")
             .await?;
         assert_eq!(result.len(), 2); // Alice (30), Diana (28)
 
         // OR
         let result = db
-            .query("MATCH (n:Person) WHERE n.name = 'Alice' OR n.name = 'Bob' RETURN n.name ORDER BY n.name")
+            .session().query("MATCH (n:Person) WHERE n.name = 'Alice' OR n.name = 'Bob' RETURN n.name ORDER BY n.name")
             .await?;
         assert_eq!(result.len(), 2);
 
         // NOT
         let result = db
+            .session()
             .query("MATCH (n:Person) WHERE NOT n.age > 30 RETURN n.name ORDER BY n.name")
             .await?;
         assert_eq!(result.len(), 3); // Alice, Bob, Diana
@@ -1010,7 +1139,7 @@ mod clause_tests {
         setup_social_graph(&db).await?;
 
         let result = db
-            .query("MATCH (n:Person) RETURN n.name AS person_name, n.age + 1 AS next_age ORDER BY n.name LIMIT 1")
+            .session().query("MATCH (n:Person) RETURN n.name AS person_name, n.age + 1 AS next_age ORDER BY n.name LIMIT 1")
             .await?;
         assert_eq!(result.len(), 1);
         let name: String = result.rows()[0].get("person_name")?;
@@ -1026,17 +1155,21 @@ mod clause_tests {
         let db = create_test_db().await?;
         setup_all_types_schema(&db).await?;
 
-        db.execute("CREATE (:Person {name: 'Alice', age: 30})")
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (:Person {name: 'Alice', age: 30})")
             .await?;
-        db.execute("CREATE (:Person {name: 'Alice', age: 25})")
+        tx.execute("CREATE (:Person {name: 'Alice', age: 25})")
             .await?;
-        db.execute("CREATE (:Person {name: 'Bob', age: 30})")
+        tx.execute("CREATE (:Person {name: 'Bob', age: 30})")
             .await?;
+        tx.commit().await?;
         db.flush().await?;
 
         // Note: RETURN DISTINCT is not fully supported, use count(DISTINCT) or GROUP BY instead
         // Test using GROUP BY to achieve distinct names
         let result = db
+            .session()
             .query("MATCH (n:Person) RETURN n.name, count(*) AS cnt ORDER BY n.name")
             .await?;
         assert_eq!(result.len(), 2); // Alice, Bob (grouped)
@@ -1061,6 +1194,7 @@ mod clause_tests {
         setup_social_graph(&db).await?;
 
         let result = db
+            .session()
             .query(
                 "MATCH (n:Person)
                  WITH n.name AS name, n.age AS age
@@ -1084,6 +1218,7 @@ mod clause_tests {
 
         // ASC
         let result = db
+            .session()
             .query("MATCH (n:Person) RETURN n.name ORDER BY n.age ASC")
             .await?;
         assert_eq!(result.len(), 4);
@@ -1092,6 +1227,7 @@ mod clause_tests {
 
         // DESC
         let result = db
+            .session()
             .query("MATCH (n:Person) RETURN n.name ORDER BY n.age DESC")
             .await?;
         let first: String = result.rows()[0].get("n.name")?;
@@ -1099,6 +1235,7 @@ mod clause_tests {
 
         // Multiple columns
         let result = db
+            .session()
             .query("MATCH (n:Person) RETURN n.name, n.age ORDER BY n.age DESC, n.name ASC")
             .await?;
         assert_eq!(result.len(), 4);
@@ -1116,18 +1253,21 @@ mod clause_tests {
 
         // LIMIT
         let result = db
+            .session()
             .query("MATCH (n:Person) RETURN n.name ORDER BY n.name LIMIT 2")
             .await?;
         assert_eq!(result.len(), 2);
 
         // SKIP
         let result = db
+            .session()
             .query("MATCH (n:Person) RETURN n.name ORDER BY n.name SKIP 2")
             .await?;
         assert_eq!(result.len(), 2);
 
         // SKIP + LIMIT
         let result = db
+            .session()
             .query("MATCH (n:Person) RETURN n.name ORDER BY n.name SKIP 1 LIMIT 2")
             .await?;
         assert_eq!(result.len(), 2);
@@ -1143,7 +1283,10 @@ mod clause_tests {
     async fn test_unwind() -> Result<()> {
         let db = create_test_db().await?;
 
-        let result = db.query("UNWIND [1, 2, 3, 4, 5] AS x RETURN x").await?;
+        let result = db
+            .session()
+            .query("UNWIND [1, 2, 3, 4, 5] AS x RETURN x")
+            .await?;
         assert_eq!(result.len(), 5);
 
         let first: i64 = result.rows()[0].get("x")?;
@@ -1161,14 +1304,18 @@ mod clause_tests {
         let db = create_test_db().await?;
         setup_all_types_schema(&db).await?;
 
-        db.execute("CREATE (:Person {name: 'Alice', age: 30})")
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (:Person {name: 'Alice', age: 30})")
             .await?;
-        db.execute("CREATE (:Person {name: 'Bob', age: 25})")
+        tx.execute("CREATE (:Person {name: 'Bob', age: 25})")
             .await?;
+        tx.commit().await?;
         db.flush().await?;
 
         // UNION removes duplicates
         let result = db
+            .session()
             .query(
                 "MATCH (n:Person {name: 'Alice'}) RETURN n.name AS name
                  UNION
@@ -1179,6 +1326,7 @@ mod clause_tests {
 
         // UNION ALL keeps duplicates
         let result = db
+            .session()
             .query(
                 "MATCH (n:Person {name: 'Alice'}) RETURN n.name AS name
                  UNION ALL
@@ -1197,11 +1345,15 @@ mod clause_tests {
         let db = create_test_db().await?;
         setup_all_types_schema(&db).await?;
 
-        db.execute("CREATE (n:Person {name: 'NewPerson', age: 42})")
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (n:Person {name: 'NewPerson', age: 42})")
             .await?;
+        tx.commit().await?;
         db.flush().await?;
 
         let result = db
+            .session()
             .query("MATCH (n:Person {name: 'NewPerson'}) RETURN n.age")
             .await?;
         assert_eq!(result.len(), 1);
@@ -1217,15 +1369,19 @@ mod clause_tests {
         setup_all_types_schema(&db).await?;
 
         // Use combined CREATE pattern since MATCH+CREATE with variable references isn't supported
-        db.execute(
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute(
             "CREATE (a:Person {name: 'A', age: 1})
              CREATE (b:Person {name: 'B', age: 2})
              CREATE (a)-[:KNOWS {since: 2024}]->(b)",
         )
         .await?;
+        tx.commit().await?;
         db.flush().await?;
 
         let result = db
+            .session()
             .query("MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN a.name, r.since, b.name")
             .await?;
         assert_eq!(result.len(), 1);
@@ -1243,15 +1399,22 @@ mod clause_tests {
         let db = create_test_db().await?;
         setup_all_types_schema(&db).await?;
 
-        db.execute("CREATE (:Person {name: 'UpdateMe', age: 20})")
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (:Person {name: 'UpdateMe', age: 20})")
             .await?;
+        tx.commit().await?;
         db.flush().await?;
 
-        db.execute("MATCH (n:Person {name: 'UpdateMe'}) SET n.age = 21")
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("MATCH (n:Person {name: 'UpdateMe'}) SET n.age = 21")
             .await?;
+        tx.commit().await?;
         db.flush().await?;
 
         let result = db
+            .session()
             .query("MATCH (n:Person {name: 'UpdateMe'}) RETURN n.age")
             .await?;
         let age: i64 = result.rows()[0].get("n.age")?;
@@ -1265,17 +1428,24 @@ mod clause_tests {
         let db = create_test_db().await?;
         setup_all_types_schema(&db).await?;
 
-        db.execute("CREATE (:Person {name: 'MultiUpdate', age: 20})")
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (:Person {name: 'MultiUpdate', age: 20})")
             .await?;
+        tx.commit().await?;
         db.flush().await?;
 
-        db.execute(
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute(
             "MATCH (n:Person {name: 'MultiUpdate'}) SET n.age = 25, n.email = 'test@test.com'",
         )
         .await?;
+        tx.commit().await?;
         db.flush().await?;
 
         let result = db
+            .session()
             .query("MATCH (n:Person {name: 'MultiUpdate'}) RETURN n.age, n.email")
             .await?;
         let age: i64 = result.rows()[0].get("n.age")?;
@@ -1293,15 +1463,22 @@ mod clause_tests {
         let db = create_test_db().await?;
         setup_all_types_schema(&db).await?;
 
-        db.execute("CREATE (:Person {name: 'HasEmail', age: 30, email: 'remove@me.com'})")
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (:Person {name: 'HasEmail', age: 30, email: 'remove@me.com'})")
             .await?;
+        tx.commit().await?;
         db.flush().await?;
 
-        db.execute("MATCH (n:Person {name: 'HasEmail'}) REMOVE n.email")
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("MATCH (n:Person {name: 'HasEmail'}) REMOVE n.email")
             .await?;
+        tx.commit().await?;
         db.flush().await?;
 
         let result = db
+            .session()
             .query("MATCH (n:Person {name: 'HasEmail'}) RETURN n.email")
             .await?;
         // The property should be null after REMOVE
@@ -1317,23 +1494,31 @@ mod clause_tests {
         let db = create_test_db().await?;
         setup_all_types_schema(&db).await?;
 
-        db.execute("CREATE (:Person {name: 'ToDelete', age: 99})")
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (:Person {name: 'ToDelete', age: 99})")
             .await?;
+        tx.commit().await?;
         db.flush().await?;
 
         // Verify it exists
         let result = db
+            .session()
             .query("MATCH (n:Person {name: 'ToDelete'}) RETURN n")
             .await?;
         assert_eq!(result.len(), 1);
 
         // Delete it
-        db.execute("MATCH (n:Person {name: 'ToDelete'}) DELETE n")
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("MATCH (n:Person {name: 'ToDelete'}) DELETE n")
             .await?;
+        tx.commit().await?;
         db.flush().await?;
 
         // Verify it's gone
         let result = db
+            .session()
             .query("MATCH (n:Person {name: 'ToDelete'}) RETURN n")
             .await?;
         assert_eq!(result.len(), 0);
@@ -1347,27 +1532,34 @@ mod clause_tests {
         setup_all_types_schema(&db).await?;
 
         // Use combined CREATE pattern
-        db.execute(
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute(
             "CREATE (p:Person {name: 'DetachMe', age: 50})
              CREATE (friend:Person {name: 'Friend', age: 51})
              CREATE (p)-[:KNOWS {since: 2000}]->(friend)",
         )
         .await?;
+        tx.commit().await?;
         db.flush().await?;
 
         // DETACH DELETE removes node and its relationships
-        db.execute("MATCH (n:Person {name: 'DetachMe'}) DETACH DELETE n")
+        let tx2 = session.tx().await?;
+        tx2.execute("MATCH (n:Person {name: 'DetachMe'}) DETACH DELETE n")
             .await?;
+        tx2.commit().await?;
         db.flush().await?;
 
         // Node should be gone
         let result = db
+            .session()
             .query("MATCH (n:Person {name: 'DetachMe'}) RETURN n")
             .await?;
         assert_eq!(result.len(), 0);
 
         // Relationship should be gone too (use labeled node pattern since anonymous nodes aren't supported)
         let result = db
+            .session()
             .query("MATCH (src:Person)-[r:KNOWS]->(dst:Person {name: 'Friend'}) RETURN r")
             .await?;
         assert_eq!(result.len(), 0);
@@ -1383,11 +1575,15 @@ mod clause_tests {
         setup_all_types_schema(&db).await?;
 
         // MERGE should create when node doesn't exist
-        db.execute("MERGE (n:Person {name: 'MergeNew'}) ON CREATE SET n.age = 1")
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("MERGE (n:Person {name: 'MergeNew'}) ON CREATE SET n.age = 1")
             .await?;
+        tx.commit().await?;
         db.flush().await?;
 
         let result = db
+            .session()
             .query("MATCH (n:Person {name: 'MergeNew'}) RETURN n.age")
             .await?;
         assert_eq!(result.len(), 1);
@@ -1403,16 +1599,23 @@ mod clause_tests {
         setup_all_types_schema(&db).await?;
 
         // Create first
-        db.execute("CREATE (:Person {name: 'MergeExisting', age: 10})")
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (:Person {name: 'MergeExisting', age: 10})")
             .await?;
+        tx.commit().await?;
         db.flush().await?;
 
         // MERGE should match existing and run ON MATCH
-        db.execute("MERGE (n:Person {name: 'MergeExisting'}) ON MATCH SET n.age = 20")
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("MERGE (n:Person {name: 'MergeExisting'}) ON MATCH SET n.age = 20")
             .await?;
+        tx.commit().await?;
         db.flush().await?;
 
         let result = db
+            .session()
             .query("MATCH (n:Person {name: 'MergeExisting'}) RETURN n.age")
             .await?;
         assert_eq!(result.len(), 1);
@@ -1431,6 +1634,7 @@ mod clause_tests {
         setup_social_graph(&db).await?;
 
         let result = db
+            .session()
             .query(
                 "MATCH (n:Person)
                  RETURN n.name,
@@ -1473,7 +1677,7 @@ mod operator_tests {
         let db = create_test_db().await?;
 
         // Test all comparison operators with RETURN
-        let result = db.query("RETURN 5 = 5 AS eq, 5 <> 3 AS neq, 5 < 10 AS lt, 5 <= 5 AS lte, 10 > 5 AS gt, 10 >= 10 AS gte").await?;
+        let result = db.session().query("RETURN 5 = 5 AS eq, 5 <> 3 AS neq, 5 < 10 AS lt, 5 <= 5 AS lte, 10 > 5 AS gt, 10 >= 10 AS gte").await?;
 
         let eq: bool = result.rows()[0].get("eq")?;
         let neq: bool = result.rows()[0].get("neq")?;
@@ -1499,7 +1703,7 @@ mod operator_tests {
         let db = create_test_db().await?;
 
         let result = db
-            .query("RETURN true AND true AS and_tt, true AND false AS and_tf, true OR false AS or_tf, NOT true AS not_t")
+            .session().query("RETURN true AND true AS and_tt, true AND false AS and_tf, true OR false AS or_tf, NOT true AS not_t")
             .await?;
 
         let and_tt: bool = result.rows()[0].get("and_tt")?;
@@ -1522,29 +1726,32 @@ mod operator_tests {
         let db = create_test_db().await?;
         setup_all_types_schema(&db).await?;
 
-        db.execute("CREATE (:AllTypesNode {str_val: 'Hello World'})")
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (:AllTypesNode {str_val: 'Hello World'})")
             .await?;
-        db.execute("CREATE (:AllTypesNode {str_val: 'Goodbye World'})")
+        tx.execute("CREATE (:AllTypesNode {str_val: 'Goodbye World'})")
             .await?;
-        db.execute("CREATE (:AllTypesNode {str_val: 'Hello Universe'})")
+        tx.execute("CREATE (:AllTypesNode {str_val: 'Hello Universe'})")
             .await?;
+        tx.commit().await?;
         db.flush().await?;
 
         // CONTAINS
         let result = db
-            .query("MATCH (n:AllTypesNode) WHERE n.str_val CONTAINS 'World' RETURN n.str_val ORDER BY n.str_val")
+            .session().query("MATCH (n:AllTypesNode) WHERE n.str_val CONTAINS 'World' RETURN n.str_val ORDER BY n.str_val")
             .await?;
         assert_eq!(result.len(), 2);
 
         // STARTS WITH
         let result = db
-            .query("MATCH (n:AllTypesNode) WHERE n.str_val STARTS WITH 'Hello' RETURN n.str_val ORDER BY n.str_val")
+            .session().query("MATCH (n:AllTypesNode) WHERE n.str_val STARTS WITH 'Hello' RETURN n.str_val ORDER BY n.str_val")
             .await?;
         assert_eq!(result.len(), 2);
 
         // ENDS WITH
         let result = db
-            .query("MATCH (n:AllTypesNode) WHERE n.str_val ENDS WITH 'World' RETURN n.str_val ORDER BY n.str_val")
+            .session().query("MATCH (n:AllTypesNode) WHERE n.str_val ENDS WITH 'World' RETURN n.str_val ORDER BY n.str_val")
             .await?;
         assert_eq!(result.len(), 2);
 
@@ -1558,12 +1765,18 @@ mod operator_tests {
         let db = create_test_db().await?;
 
         // IN operator
-        let result = db.query("RETURN 3 IN [1, 2, 3, 4, 5] AS in_list").await?;
+        let result = db
+            .session()
+            .query("RETURN 3 IN [1, 2, 3, 4, 5] AS in_list")
+            .await?;
         let in_list: bool = result.rows()[0].get("in_list")?;
         assert!(in_list);
 
         // NOT IN
-        let result = db.query("RETURN 6 IN [1, 2, 3, 4, 5] AS in_list").await?;
+        let result = db
+            .session()
+            .query("RETURN 6 IN [1, 2, 3, 4, 5] AS in_list")
+            .await?;
         let in_list: bool = result.rows()[0].get("in_list")?;
         assert!(!in_list);
 
@@ -1575,49 +1788,71 @@ mod operator_tests {
         let db = create_test_db().await?;
 
         // List indexing with inline list literal
-        let result = db.query("RETURN [1, 2, 3, 4, 5][2] AS elem").await?;
+        let result = db
+            .session()
+            .query("RETURN [1, 2, 3, 4, 5][2] AS elem")
+            .await?;
         let elem: i64 = result.rows()[0].get("elem")?;
         assert_eq!(elem, 3); // 0-indexed
 
         // First element
-        let result = db.query("RETURN [10, 20, 30][0] AS first").await?;
+        let result = db
+            .session()
+            .query("RETURN [10, 20, 30][0] AS first")
+            .await?;
         let first: i64 = result.rows()[0].get("first")?;
         assert_eq!(first, 10);
 
         // Last element via explicit index
-        let result = db.query("RETURN ['a', 'b', 'c'][2] AS last").await?;
+        let result = db
+            .session()
+            .query("RETURN ['a', 'b', 'c'][2] AS last")
+            .await?;
         let last: String = result.rows()[0].get("last")?;
         assert_eq!(last, "c");
 
         // Negative indexing: -1 = last element
-        let result = db.query("RETURN [1, 2, 3, 4, 5][-1] AS last").await?;
+        let result = db
+            .session()
+            .query("RETURN [1, 2, 3, 4, 5][-1] AS last")
+            .await?;
         let last: i64 = result.rows()[0].get("last")?;
         assert_eq!(last, 5);
 
         // Negative indexing: -2 = second to last
         let result = db
+            .session()
             .query("RETURN [1, 2, 3, 4, 5][-2] AS second_last")
             .await?;
         let second_last: i64 = result.rows()[0].get("second_last")?;
         assert_eq!(second_last, 4);
 
         // List slicing: [start..end]
-        let result = db.query("RETURN [1, 2, 3, 4, 5][1..3] AS slice").await?;
+        let result = db
+            .session()
+            .query("RETURN [1, 2, 3, 4, 5][1..3] AS slice")
+            .await?;
         let slice: Vec<i64> = result.rows()[0].get("slice")?;
         assert_eq!(slice, vec![2, 3]); // Elements at indices 1 and 2
 
         // List slicing: from beginning [..end]
-        let result = db.query("RETURN [1, 2, 3, 4, 5][..2] AS slice").await?;
+        let result = db
+            .session()
+            .query("RETURN [1, 2, 3, 4, 5][..2] AS slice")
+            .await?;
         let slice: Vec<i64> = result.rows()[0].get("slice")?;
         assert_eq!(slice, vec![1, 2]); // Elements at indices 0 and 1
 
         // List slicing: to end [start..]
-        let result = db.query("RETURN [1, 2, 3, 4, 5][3..] AS slice").await?;
+        let result = db
+            .session()
+            .query("RETURN [1, 2, 3, 4, 5][3..] AS slice")
+            .await?;
         let slice: Vec<i64> = result.rows()[0].get("slice")?;
         assert_eq!(slice, vec![4, 5]); // Elements from index 3 to end
 
         // List slicing: full slice [..]
-        let result = db.query("RETURN [1, 2, 3][..] AS slice").await?;
+        let result = db.session().query("RETURN [1, 2, 3][..] AS slice").await?;
         let slice: Vec<i64> = result.rows()[0].get("slice")?;
         assert_eq!(slice, vec![1, 2, 3]);
 
@@ -1631,7 +1866,7 @@ mod operator_tests {
         let db = create_test_db().await?;
 
         let result = db
-            .query("RETURN 10 + 5 AS add, 10 - 5 AS sub, 10 * 5 AS mul, 10 / 5 AS div, 10 % 3 AS mod_op, 2 ^ 3 AS power")
+            .session().query("RETURN 10 + 5 AS add, 10 - 5 AS sub, 10 * 5 AS mul, 10 / 5 AS div, 10 % 3 AS mod_op, 2 ^ 3 AS power")
             .await?;
 
         let add: i64 = result.rows()[0].get("add")?;
@@ -1658,6 +1893,7 @@ mod operator_tests {
         let db = create_test_db().await?;
 
         let result = db
+            .session()
             .query("RETURN 'Hello' + ' ' + 'World' AS greeting")
             .await?;
         let greeting: String = result.rows()[0].get("greeting")?;
@@ -1685,6 +1921,7 @@ mod function_tests {
 
         // id() function
         let result = db
+            .session()
             .query("MATCH (n:Person {name: 'Alice'}) RETURN id(n) AS node_id")
             .await?;
         assert_eq!(result.len(), 1);
@@ -1696,6 +1933,7 @@ mod function_tests {
         // Note: type(r) currently returns the edge type ID as a string, not the name
         // This is a known limitation - standard Cypher returns the type name
         let result = db
+            .session()
             .query("MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN type(r) AS rel_type LIMIT 1")
             .await?;
         let rel_type: String = result.rows()[0].get("rel_type")?;
@@ -1714,6 +1952,7 @@ mod function_tests {
 
         // labels() function
         let result = db
+            .session()
             .query("MATCH (n:Person {name: 'Alice'}) RETURN labels(n) AS node_labels")
             .await?;
         assert_eq!(result.len(), 1);
@@ -1731,6 +1970,7 @@ mod function_tests {
 
         // toUpper, toLower
         let result = db
+            .session()
             .query("RETURN toUpper('hello') AS upper, toLower('WORLD') AS lower")
             .await?;
         let upper: String = result.rows()[0].get("upper")?;
@@ -1740,7 +1980,7 @@ mod function_tests {
 
         // trim, ltrim, rtrim
         let result = db
-            .query("RETURN trim('  hello  ') AS trimmed, ltrim('  hello') AS ltrimmed, rtrim('hello  ') AS rtrimmed")
+            .session().query("RETURN trim('  hello  ') AS trimmed, ltrim('  hello') AS ltrimmed, rtrim('hello  ') AS rtrimmed")
             .await?;
         let trimmed: String = result.rows()[0].get("trimmed")?;
         let ltrimmed: String = result.rows()[0].get("ltrimmed")?;
@@ -1751,6 +1991,7 @@ mod function_tests {
 
         // substring
         let result = db
+            .session()
             .query("RETURN substring('Hello World', 0, 5) AS sub")
             .await?;
         let sub: String = result.rows()[0].get("sub")?;
@@ -1758,6 +1999,7 @@ mod function_tests {
 
         // replace
         let result = db
+            .session()
             .query("RETURN replace('Hello World', 'World', 'Universe') AS replaced")
             .await?;
         let replaced: String = result.rows()[0].get("replaced")?;
@@ -1765,20 +2007,27 @@ mod function_tests {
 
         // split
         eprintln!("Testing split...");
-        let result = db.query("RETURN split('a,b,c', ',') AS parts").await?;
+        let result = db
+            .session()
+            .query("RETURN split('a,b,c', ',') AS parts")
+            .await?;
         eprintln!("split result: {:?}", result.rows()[0]);
         let parts: Vec<String> = result.rows()[0].get("parts")?;
         assert_eq!(parts, vec!["a", "b", "c"]);
 
         // reverse
         eprintln!("Testing reverse...");
-        let result = db.query("RETURN reverse('hello') AS reversed").await?;
+        let result = db
+            .session()
+            .query("RETURN reverse('hello') AS reversed")
+            .await?;
         let reversed: String = result.rows()[0].get("reversed")?;
         assert_eq!(reversed, "olleh");
 
         // left, right
         eprintln!("Testing left and right...");
         let result = db
+            .session()
             .query("RETURN left('Hello World', 5) AS l, right('Hello World', 5) AS r")
             .await?;
         eprintln!("left/right result: {:?}", result.rows()[0]);
@@ -1798,7 +2047,7 @@ mod function_tests {
 
         // Basic math (use 0-5 instead of -5 since parser doesn't support negative literals)
         let result = db
-            .query("RETURN abs(0-5) AS abs_val, ceil(4.3) AS ceil_val, floor(4.7) AS floor_val, round(4.5) AS round_val")
+            .session().query("RETURN abs(0-5) AS abs_val, ceil(4.3) AS ceil_val, floor(4.7) AS floor_val, round(4.5) AS round_val")
             .await?;
         let abs_val: i64 = result.rows()[0].get("abs_val")?;
         let ceil_val: f64 = result.rows()[0].get("ceil_val")?;
@@ -1811,6 +2060,7 @@ mod function_tests {
 
         // sqrt, sign (use 0-10 instead of -10 since parser doesn't support negative literals)
         let result = db
+            .session()
             .query("RETURN sqrt(16) AS sqrt_val, sign(0-10) AS sign_val")
             .await?;
         let sqrt_val: f64 = result.rows()[0].get("sqrt_val")?;
@@ -1820,6 +2070,7 @@ mod function_tests {
 
         // log, exp
         let result = db
+            .session()
             .query("RETURN log(2.718281828) AS log_val, exp(1) AS exp_val")
             .await?;
         let log_val: f64 = result.rows()[0].get("log_val")?;
@@ -1829,6 +2080,7 @@ mod function_tests {
 
         // Trigonometric
         let result = db
+            .session()
             .query("RETURN sin(0) AS sin_val, cos(0) AS cos_val")
             .await?;
         let sin_val: f64 = result.rows()[0].get("sin_val")?;
@@ -1837,14 +2089,17 @@ mod function_tests {
         assert!((cos_val - 1.0).abs() < 0.0001);
 
         // pi, e
-        let result = db.query("RETURN pi() AS pi_val, e() AS e_val").await?;
+        let result = db
+            .session()
+            .query("RETURN pi() AS pi_val, e() AS e_val")
+            .await?;
         let pi_val: f64 = result.rows()[0].get("pi_val")?;
         let e_val: f64 = result.rows()[0].get("e_val")?;
         assert!((pi_val - std::f64::consts::PI).abs() < 0.001);
         assert!((e_val - std::f64::consts::E).abs() < 0.001);
 
         // rand() should return value between 0 and 1
-        let result = db.query("RETURN rand() AS rand_val").await?;
+        let result = db.session().query("RETURN rand() AS rand_val").await?;
         let rand_val: f64 = result.rows()[0].get("rand_val")?;
         assert!((0.0..1.0).contains(&rand_val));
 
@@ -1859,6 +2114,7 @@ mod function_tests {
 
         // size / length
         let result = db
+            .session()
             .query("RETURN size([1, 2, 3, 4, 5]) AS list_size")
             .await?;
         let list_size: i64 = result.rows()[0].get("list_size")?;
@@ -1866,6 +2122,7 @@ mod function_tests {
 
         // head, last, tail
         let result = db
+            .session()
             .query("RETURN head([1, 2, 3]) AS h, last([1, 2, 3]) AS l, tail([1, 2, 3]) AS t")
             .await?;
         let h: i64 = result.rows()[0].get("h")?;
@@ -1876,12 +2133,12 @@ mod function_tests {
         assert_eq!(t, vec![2, 3]);
 
         // range
-        let result = db.query("RETURN range(1, 5) AS r").await?;
+        let result = db.session().query("RETURN range(1, 5) AS r").await?;
         let r: Vec<i64> = result.rows()[0].get("r")?;
         assert_eq!(r, vec![1, 2, 3, 4, 5]);
 
         // range with step
-        let result = db.query("RETURN range(0, 10, 2) AS r").await?;
+        let result = db.session().query("RETURN range(0, 10, 2) AS r").await?;
         let r: Vec<i64> = result.rows()[0].get("r")?;
         assert_eq!(r, vec![0, 2, 4, 6, 8, 10]);
 
@@ -1896,6 +2153,7 @@ mod function_tests {
 
         // toInteger
         let result = db
+            .session()
             .query("RETURN toInteger('42') AS int_val, toInteger(3.14) AS int_from_float")
             .await?;
         let int_val: i64 = result.rows()[0].get("int_val")?;
@@ -1905,6 +2163,7 @@ mod function_tests {
 
         // toFloat
         let result = db
+            .session()
             .query("RETURN toFloat('2.5') AS float_val, toFloat(42) AS float_from_int")
             .await?;
         let float_val: f64 = result.rows()[0].get("float_val")?;
@@ -1914,6 +2173,7 @@ mod function_tests {
 
         // toString
         let result = db
+            .session()
             .query("RETURN toString(42) AS str_from_int, toString(3.14) AS str_from_float")
             .await?;
         let str_from_int: String = result.rows()[0].get("str_from_int")?;
@@ -1923,6 +2183,7 @@ mod function_tests {
 
         // toBoolean
         let result = db
+            .session()
             .query("RETURN toBoolean('true') AS bool_true, toBoolean('false') AS bool_false")
             .await?;
         let bool_true: bool = result.rows()[0].get("bool_true")?;
@@ -1940,19 +2201,23 @@ mod function_tests {
         let db = create_test_db().await?;
         setup_all_types_schema(&db).await?;
 
-        db.execute("CREATE (:AllTypesNode {str_val: 'test'})")
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (:AllTypesNode {str_val: 'test'})")
             .await?;
+        tx.commit().await?;
         db.flush().await?;
 
         // coalesce - returns first non-null value
         let result = db
-            .query("MATCH (n:AllTypesNode) RETURN coalesce(n.nullable_str, n.str_val, 'default') AS val")
+            .session().query("MATCH (n:AllTypesNode) RETURN coalesce(n.nullable_str, n.str_val, 'default') AS val")
             .await?;
         let val: String = result.rows()[0].get("val")?;
         assert_eq!(val, "test");
 
         // coalesce with all nulls
         let result = db
+            .session()
             .query("RETURN coalesce(null, null, 'default') AS val")
             .await?;
         let val: String = result.rows()[0].get("val")?;
@@ -1971,6 +2236,7 @@ mod function_tests {
 
         // count(*)
         let result = db
+            .session()
             .query("MATCH (n:Person) RETURN count(*) AS total")
             .await?;
         let total: i64 = result.rows()[0].get("total")?;
@@ -1978,17 +2244,22 @@ mod function_tests {
 
         // count(expr)
         let result = db
+            .session()
             .query("MATCH (n:Person) RETURN count(n.email) AS with_email")
             .await?;
         let with_email: i64 = result.rows()[0].get("with_email")?;
         assert_eq!(with_email, 0); // No one has email set
 
         // count(DISTINCT expr)
-        db.execute("CREATE (:Person {name: 'Alice2', age: 30})")
+        let session2 = db.session();
+        let tx2 = session2.tx().await?;
+        tx2.execute("CREATE (:Person {name: 'Alice2', age: 30})")
             .await?; // Another person with age 30
+        tx2.commit().await?;
         db.flush().await?;
 
         let result = db
+            .session()
             .query("MATCH (n:Person) RETURN count(DISTINCT n.age) AS distinct_ages")
             .await?;
         let distinct_ages: i64 = result.rows()[0].get("distinct_ages")?;
@@ -2005,6 +2276,7 @@ mod function_tests {
 
         // sum
         let result = db
+            .session()
             .query("MATCH (n:Person) RETURN sum(n.age) AS total_age")
             .await?;
         let total_age: i64 = result.rows()[0].get("total_age")?;
@@ -2012,6 +2284,7 @@ mod function_tests {
 
         // avg
         let result = db
+            .session()
             .query("MATCH (n:Person) RETURN avg(n.age) AS avg_age")
             .await?;
         let avg_age: f64 = result.rows()[0].get("avg_age")?;
@@ -2027,6 +2300,7 @@ mod function_tests {
         setup_social_graph(&db).await?;
 
         let result = db
+            .session()
             .query("MATCH (n:Person) RETURN min(n.age) AS min_age, max(n.age) AS max_age")
             .await?;
         let min_age: i64 = result.rows()[0].get("min_age")?;
@@ -2044,6 +2318,7 @@ mod function_tests {
         setup_social_graph(&db).await?;
 
         let result = db
+            .session()
             .query("MATCH (n:Person) RETURN collect(n.name) AS names")
             .await?;
         let names: Vec<String> = result.rows()[0].get("names")?;
@@ -2060,14 +2335,18 @@ mod function_tests {
         setup_all_types_schema(&db).await?;
 
         // Create persons with duplicate ages
-        db.execute("CREATE (:Person {name: 'A1', age: 20})").await?;
-        db.execute("CREATE (:Person {name: 'A2', age: 20})").await?;
-        db.execute("CREATE (:Person {name: 'B1', age: 30})").await?;
-        db.execute("CREATE (:Person {name: 'B2', age: 30})").await?;
-        db.execute("CREATE (:Person {name: 'B3', age: 30})").await?;
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (:Person {name: 'A1', age: 20})").await?;
+        tx.execute("CREATE (:Person {name: 'A2', age: 20})").await?;
+        tx.execute("CREATE (:Person {name: 'B1', age: 30})").await?;
+        tx.execute("CREATE (:Person {name: 'B2', age: 30})").await?;
+        tx.execute("CREATE (:Person {name: 'B3', age: 30})").await?;
+        tx.commit().await?;
         db.flush().await?;
 
         let result = db
+            .session()
             .query("MATCH (n:Person) RETURN n.age, count(*) AS cnt ORDER BY n.age")
             .await?;
         assert_eq!(result.len(), 2);
@@ -2102,6 +2381,7 @@ mod path_tests {
 
         // Find all persons Alice can reach in 1-2 hops
         let result = db
+            .session()
             .query(
                 "MATCH (a:Person {name: 'Alice'})-[:KNOWS*1..2]->(b:Person)
                  RETURN DISTINCT b.name ORDER BY b.name",
@@ -2122,6 +2402,7 @@ mod path_tests {
 
         // Find persons exactly 2 hops from Alice
         let result = db
+            .session()
             .query(
                 "MATCH (a:Person {name: 'Alice'})-[:KNOWS*2]->(b:Person)
                  RETURN b.name",
@@ -2144,7 +2425,9 @@ mod path_tests {
         // Create a graph with multiple paths using combined CREATE
         // A -> B -> C -> D (long path)
         // A -> E -> D (shorter path)
-        db.execute(
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute(
             "CREATE (a:Person {name: 'A', age: 1})
              CREATE (b:Person {name: 'B', age: 2})
              CREATE (c:Person {name: 'C', age: 3})
@@ -2157,11 +2440,13 @@ mod path_tests {
              CREATE (e)-[:KNOWS {since: 5}]->(d)",
         )
         .await?;
+        tx.commit().await?;
 
         db.flush().await?;
 
         // shortestPath should find A -> E -> D
         let result = db
+            .session()
             .query(
                 "MATCH p = shortestPath((a:Person {name: 'A'})-[:KNOWS*]->(d:Person {name: 'D'}))
                  RETURN length(p) AS path_length",
@@ -2182,6 +2467,7 @@ mod path_tests {
 
         // Get path and extract nodes/relationships
         let result = db
+            .session()
             .query(
                 "MATCH p = (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'})
                  RETURN nodes(p) AS path_nodes, relationships(p) AS path_rels",
@@ -2219,7 +2505,9 @@ mod integration_tests {
             .await?;
 
         // 2. Create data using combined CREATE pattern
-        db.execute(
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute(
             "CREATE (electronics:Category {name: 'Electronics'})
              CREATE (books:Category {name: 'Books'})
              CREATE (laptop:Product {name: 'Laptop', price: 999.99, stock: 50})
@@ -2230,12 +2518,14 @@ mod integration_tests {
              CREATE (rustbook)-[:IN_CATEGORY]->(books)",
         )
         .await?;
+        tx.commit().await?;
 
         // 3. CRITICAL: Flush to storage
         db.flush().await?;
 
         // 4. Query and verify
         let result = db
+            .session()
             .query(
                 "MATCH (p:Product)-[:IN_CATEGORY]->(c:Category {name: 'Electronics'})
                  RETURN p.name, p.price
@@ -2252,6 +2542,7 @@ mod integration_tests {
 
         // Aggregation query
         let result = db
+            .session()
             .query(
                 "MATCH (p:Product)-[:IN_CATEGORY]->(c:Category)
                  RETURN c.name, count(p) AS product_count, sum(p.stock) AS total_stock
@@ -2281,21 +2572,27 @@ mod integration_tests {
             .await?;
 
         // Initial balance
-        db.execute("CREATE (:Account {balance: 1000})").await?;
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (:Account {balance: 1000})").await?;
+        tx.commit().await?;
         db.flush().await?;
 
         // Transaction that commits
-        let tx = db.begin().await?;
+        let tx = db.session().tx().await?;
         tx.execute("MATCH (a:Account) SET a.balance = a.balance + 500")
             .await?;
         tx.commit().await?;
 
-        let result = db.query("MATCH (a:Account) RETURN a.balance").await?;
+        let result = db
+            .session()
+            .query("MATCH (a:Account) RETURN a.balance")
+            .await?;
         let balance: i64 = result.rows()[0].get("a.balance")?;
         assert_eq!(balance, 1500);
 
         // Transaction that rolls back
-        let tx = db.begin().await?;
+        let tx = db.session().tx().await?;
         tx.execute("MATCH (a:Account) SET a.balance = 0").await?;
 
         // Verify within transaction
@@ -2303,10 +2600,13 @@ mod integration_tests {
         let inner_balance: i64 = inner_result.rows()[0].get("a.balance")?;
         assert_eq!(inner_balance, 0);
 
-        tx.rollback().await?;
+        tx.rollback();
 
         // Verify rollback
-        let result = db.query("MATCH (a:Account) RETURN a.balance").await?;
+        let result = db
+            .session()
+            .query("MATCH (a:Account) RETURN a.balance")
+            .await?;
         let balance: i64 = result.rows()[0].get("a.balance")?;
         assert_eq!(balance, 1500); // Should be unchanged
 
@@ -2320,14 +2620,18 @@ mod integration_tests {
         setup_all_types_schema(&db).await?;
 
         // Create data in multiple batches with flushes
+        let session = db.session();
+        let tx = session.tx().await?;
         for i in 0..5 {
-            db.execute(&format!("CREATE (:Counter {{val: {}}})", i))
+            tx.execute(&format!("CREATE (:Counter {{val: {}}})", i))
                 .await?;
             db.flush().await?;
         }
+        tx.commit().await?;
 
         // Verify all data is present
         let result = db
+            .session()
             .query("MATCH (c:Counter) RETURN c.val ORDER BY c.val")
             .await?;
         assert_eq!(result.len(), 5);
@@ -2350,6 +2654,7 @@ mod integration_tests {
         // Complex query with aggregation
         // (simplified to avoid ORDER BY on complex types which isn't fully supported)
         let result = db
+            .session()
             .query(
                 "MATCH (a:Person)-[r:KNOWS]->(b:Person)
                  WHERE a.age >= 28

@@ -1,914 +1,1320 @@
 # Rust API Reference
 
-Uni provides a comprehensive Rust API for embedding the graph database directly into your application. This reference covers all public APIs.
+Complete reference for the Uni 1.0.0 embedded graph database Rust API.
 
 ## Quick Start
 
 ```rust
-use uni_db::*;
+use uni_db::{Uni, Value};
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    // Open or create database
-    let db = Uni::open("./my-graph")
-        .schema_file("schema.json")
-        .build()
+async fn main() -> uni_db::Result<()> {
+    // Open or create a database
+    let db = Uni::open("./my-graph").build().await?;
+
+    // Define schema
+    db.schema()
+        .label("Person")
+            .property("name", uni_db::DataType::String)
+            .property("age", uni_db::DataType::Int64)
+        .edge_type("KNOWS", &["Person"], &["Person"])
+            .property("since", uni_db::DataType::Date)
+        .apply()
         .await?;
 
-    // Run a query
-    let results = db.query("MATCH (p:Paper) WHERE p.year > 2020 RETURN p.title LIMIT 10").await?;
+    // All data access goes through Sessions
+    let session = db.session();
 
-    for row in results.iter() {
-        let title: String = row.get("p.title")?;
-        println!("{}", title);
+    // Read with Cypher
+    let results = session.query("MATCH (p:Person) RETURN p.name, p.age").await?;
+    for row in results.rows() {
+        let name: String = row.get("p.name")?;
+        println!("{name}");
     }
 
+    // Write through Transactions
+    let tx = session.tx().await?;
+    tx.execute("CREATE (:Person {name: 'Alice', age: 30})").await?;
+    let result = tx.commit().await?;
+    println!("Committed {} mutations at version {}", result.mutations_committed, result.version);
+
+    db.shutdown().await?;
     Ok(())
 }
 ```
 
-## Locy API
+---
 
-Uni exposes Locy through a dedicated engine entry point:
+## Architecture Overview
 
-```rust
-let locy = db.locy();
-let result = locy.evaluate(program).await?;
+Uni 1.0.0 uses a three-tier access model:
+
+```
+Uni  (lifecycle / admin)
+ |
+ +-- Session  (read scope, cheap to create)
+      |
+      +-- Transaction  (write scope, ACID)
 ```
 
-Primary methods:
-
-- `compile_only(program)`
-- `evaluate(program)`
-- `evaluate_with_config(program, &LocyConfig)`
-- `explain(program)`
-
-For full Locy user docs, see [Locy Overview](../locy/index.md). For integration details, see [Locy Rust API Integration](../locy/api/rust.md).
+- **`Uni`** -- lifecycle handle. Creates sessions, manages schema, provides database-level metrics. Does **not** execute queries directly.
+- **`Session`** -- primary read scope. Executes Cypher queries, evaluates Locy programs, holds scoped parameters and rule registries, creates transactions. Cheap, synchronous, infallible to create.
+- **`Transaction`** -- explicit write scope. Executes mutations in a private L0 buffer with commit-time serialization. Changes are isolated until `commit()`.
 
 ---
 
-## Module: `uni_db`
+## Uni
 
-The main entry point for the database.
+The top-level database handle. Created via builder methods.
 
-### Uni
+### Opening a Database
 
 ```rust
-/// Main database instance
-pub struct Uni {
-    // Internal state
-}
+// Open or create at path
+let db = Uni::open("./my-graph").build().await?;
 
-impl Uni {
-    /// Open or create a database at the given path or object store URI
-    pub fn open(uri: impl Into<String>) -> UniBuilder;
+// Open existing only (fails if missing)
+let db = Uni::open_existing("./my-graph").build().await?;
 
-    /// Create an in-memory database
-    pub fn in_memory() -> UniBuilder;
+// Create new (fails if already exists)
+let db = Uni::create("./new-graph").build().await?;
 
-    /// Get current configuration
-    pub fn config(&self) -> &UniConfig;
+// In-memory / temporary database
+let db = Uni::in_memory().build().await?;
+let db = Uni::temporary().build().await?;
+```
 
-    /// Get current schema (read-only snapshot)
-    pub fn get_schema(&self) -> Schema;
+### Factory Methods
 
-    /// Flush uncommitted changes to storage
-    pub async fn flush(&self) -> Result<()>;
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `session()` | `Session` | Create a new session. Cheap, sync, infallible. |
+| `session_template()` | `SessionTemplateBuilder` | Create a pre-configured session factory. |
+| `schema()` | `SchemaBuilder` | Start building schema changes. |
+| `rules()` | `RuleRegistry` | Access global Locy rule registry. |
+
+### Admin / Lifecycle
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `metrics()` | `DatabaseMetrics` | Snapshot database-level metrics (sync, cheap). |
+| `flush()` | `Result<()>` | Flush L0 buffer to persistent L1 storage. |
+| `create_snapshot(name)` | `Result<String>` | Create a named point-in-time snapshot. Returns snapshot ID. |
+| `list_snapshots()` | `Result<Vec<SnapshotManifest>>` | List all available snapshots. |
+| `restore_snapshot(id)` | `Result<()>` | Restore database to a specific snapshot. |
+| `shutdown()` | `Result<()>` | Graceful shutdown: flush data, stop background tasks. |
+| `config()` | `&UniConfig` | Get current configuration. |
+| `write_lease()` | `Option<&WriteLease>` | Get write lease configuration, if any. |
+| `compaction()` | `Compaction` | Access compaction operations. |
+| `indexes()` | `Indexes` | Access index management operations. |
+| `functions()` | `Functions` | Access custom Cypher function management. |
+
+### Schema Introspection
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `label_exists(name)` | `Result<bool>` | Check if a label exists in the schema. |
+| `edge_type_exists(name)` | `Result<bool>` | Check if an edge type exists. |
+| `list_labels()` | `Result<Vec<String>>` | List all label names (schema + data). |
+| `list_edge_types()` | `Result<Vec<String>>` | List all edge type names. |
+| `get_label_info(name)` | `Result<Option<LabelInfo>>` | Detailed label info (properties, indexes, constraints, count). |
+| `get_edge_type_info(name)` | `Result<Option<EdgeTypeInfo>>` | Detailed edge type info. |
+| `load_schema(path)` | `Result<()>` | Load schema from a JSON file. |
+| `save_schema(path)` | `Result<()>` | Save current schema to a JSON file. |
+
+---
+
+## UniBuilder
+
+Returned by `Uni::open()`, `Uni::create()`, etc. Configures the database before opening.
+
+```rust
+let db = Uni::open("./my-graph")
+    .schema_file("schema.json")
+    .config(UniConfig { /* ... */ })
+    .read_only()
+    .write_lease(WriteLease::Local)
+    .remote_storage("s3://bucket/data", cloud_config)
+    .build()
+    .await?;
+```
+
+| Method | Description |
+|--------|-------------|
+| `schema_file(path)` | Load schema from JSON file on initialization. |
+| `config(config)` | Set `UniConfig` options. |
+| `read_only()` | Open in read-only mode (no writer created). |
+| `write_lease(lease)` | Set write lease strategy for multi-agent access. |
+| `xervo_catalog(catalog)` | Set Uni-Xervo model catalog. |
+| `remote_storage(url, config)` | Configure hybrid local+remote storage. |
+| `build()` | `async` -- Open the database. Returns `Result<Uni>`. |
+
+---
+
+## Session
+
+The primary read scope. Created via `db.session()`. Cheap, synchronous, infallible.
+
+```rust
+let session = db.session();
+
+// Queries
+let rows = session.query("MATCH (n:Person) RETURN n.name").await?;
+
+// Parameterized queries
+let rows = session.query_with("MATCH (n) WHERE n.age > $min RETURN n")
+    .param("min", 21)
+    .timeout(Duration::from_secs(5))
+    .fetch_all()
+    .await?;
+
+// Transactions for writes
+let tx = session.tx().await?;
+tx.execute("CREATE (:Person {name: 'Bob'})").await?;
+tx.commit().await?;
+```
+
+### Cypher Reads
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `query(cypher)` | `Result<QueryResult>` | Execute a read-only Cypher query. Uses transparent plan cache. |
+| `query_with(cypher)` | `QueryBuilder` | Build a parameterized query with `.param()`, `.timeout()`, `.max_memory()`. |
+
+### Locy Evaluation
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `locy(program)` | `Result<LocyResult>` | Evaluate a Locy program with default configuration. |
+| `locy_with(program)` | `LocyBuilder` | Build a parameterized Locy evaluation. |
+| `compile_locy(program)` | `Result<CompiledProgram>` | Compile without executing (uses session's rule registry). |
+
+### Rule Management
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `rules()` | `RuleRegistry` | Access the session-scoped rule registry. |
+
+### Transaction Factory
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `tx()` | `Result<Transaction>` | Create a new transaction. Fails if session is pinned or another write context is active. |
+| `tx_with()` | `TransactionBuilder` | Build a transaction with `.timeout()` and `.isolation()` options. |
+
+### Scoped Parameters
+
+```rust
+let session = db.session();
+session.params().set("tenant", 42);
+session.params().set("region", "us-east");
+
+// Parameters are auto-merged into queries as $session.tenant, $session.region
+let rows = session.query("MATCH (n) WHERE n.tenant = $session.tenant RETURN n").await?;
+```
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `params()` | `Params` | Access the session-scoped parameter store. |
+
+**`Params` methods:**
+
+| Method | Description |
+|--------|-------------|
+| `set(key, value)` | Set a parameter. |
+| `get(key)` | Get a parameter value. Returns `Option<Value>`. |
+| `unset(key)` | Remove a parameter. Returns previous value. |
+| `get_all()` | Snapshot all parameters as `HashMap<String, Value>`. |
+| `set_all(iter)` | Set multiple parameters from an iterator. |
+
+### Version Pinning
+
+```rust
+let mut session = db.session();
+
+// Pin to a named snapshot (read-only after pinning)
+session.pin_to_version("snapshot_20240101").await?;
+
+// Pin to a timestamp
+session.pin_to_timestamp(chrono::Utc::now() - chrono::Duration::hours(1)).await?;
+
+// Unpin and return to live state
+session.refresh().await?;
+```
+
+| Method | Description |
+|--------|-------------|
+| `pin_to_version(snapshot_id)` | Pin session to a specific snapshot. Writes rejected while pinned. |
+| `pin_to_timestamp(ts)` | Pin to the closest snapshot at or before the given timestamp. |
+| `refresh()` | Unpin and return to the live database state. |
+| `is_pinned()` | Returns `true` if pinned. |
+
+### Prepared Statements
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `prepare(cypher)` | `Result<PreparedQuery>` | Prepare a Cypher query for repeated execution. |
+| `prepare_locy(program)` | `Result<PreparedLocy>` | Prepare a Locy program for repeated evaluation. |
+
+### Notifications
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `watch()` | `CommitStream` | Watch for all commit notifications. |
+| `watch_with()` | `WatchBuilder` | Build a filtered commit notification stream. |
+
+### Hooks
+
+| Method | Description |
+|--------|-------------|
+| `add_hook(name, hook)` | Add a named session hook. Takes `&mut self`. |
+| `remove_hook(name)` | Remove a hook by name. Returns `true` if it existed. |
+| `list_hooks()` | List names of all registered hooks. |
+| `clear_hooks()` | Remove all hooks. |
+
+### Lifecycle & Observability
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `id()` | `&str` | Session ID (UUID). |
+| `metrics()` | `SessionMetrics` | Snapshot session-level metrics. |
+| `capabilities()` | `SessionCapabilities` | Query what the session can do in its current mode. |
+| `cancel()` | `()` | Cancel all in-flight queries. Session remains usable after. |
+| `cancellation_token()` | `CancellationToken` | Get a clone of the session's cancellation token. |
+
+---
+
+## QueryBuilder
+
+Fluent builder for parameterized Cypher queries within a session. Created by `session.query_with(cypher)`.
+
+```rust
+let result = session.query_with("MATCH (n:Person) WHERE n.age > $min RETURN n")
+    .param("min", 25)
+    .param("limit", 100)
+    .timeout(Duration::from_secs(10))
+    .max_memory(512 * 1024 * 1024) // 512 MB
+    .fetch_all()
+    .await?;
+```
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `param(name, value)` | `Self` | Bind a named parameter (no `$` prefix). |
+| `params(iter)` | `Self` | Bind multiple parameters from an iterator. |
+| `timeout(duration)` | `Self` | Set maximum execution time. |
+| `max_memory(bytes)` | `Self` | Set maximum memory per query. |
+| `cancellation_token(token)` | `Self` | Attach a cancellation token. |
+| `fetch_all()` | `Result<QueryResult>` | Execute and return all rows. |
+| `fetch_one()` | `Result<Option<Row>>` | Execute and return first row. |
+| `cursor()` | `Result<QueryCursor>` | Execute and return a streaming cursor. |
+| `explain()` | `Result<ExplainOutput>` | Explain the query plan without executing. |
+| `profile()` | `Result<(QueryResult, ProfileOutput)>` | Execute with profiling. |
+
+---
+
+## Transaction
+
+The explicit write scope. Created via `session.tx()`. Provides ACID guarantees with commit-time serialization.
+
+Each transaction owns a private L0 buffer. Reads within the transaction see both committed data and the transaction's own uncommitted writes. Changes are isolated from other transactions and sessions until `commit()`.
+
+```rust
+let tx = session.tx().await?;
+
+// Reads see uncommitted writes
+tx.execute("CREATE (:Person {name: 'Alice', age: 30})").await?;
+let rows = tx.query("MATCH (p:Person {name: 'Alice'}) RETURN p.age").await?;
+
+// Parameterized mutations
+tx.execute_with("CREATE (:Person {name: $name, age: $age})")
+    .param("name", "Bob")
+    .param("age", 25)
+    .run()
+    .await?;
+
+let result = tx.commit().await?;
+println!("Version: {}, Mutations: {}", result.version, result.mutations_committed);
+```
+
+### Cypher Reads (sees uncommitted writes)
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `query(cypher)` | `Result<QueryResult>` | Execute a Cypher query within the transaction. |
+| `query_with(cypher)` | `TxQueryBuilder` | Build a parameterized query. |
+
+**`TxQueryBuilder` methods:**
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `param(name, value)` | `Self` | Bind a parameter. |
+| `cancellation_token(token)` | `Self` | Attach a cancellation token. |
+| `timeout(duration)` | `Self` | Set maximum execution time. |
+| `execute()` | `Result<ExecuteResult>` | Execute as mutation; returns affected rows. |
+| `fetch_all()` | `Result<QueryResult>` | Execute as query; returns rows. |
+| `fetch_one()` | `Result<Option<Row>>` | Execute and return first row. |
+| `cursor()` | `Result<QueryCursor>` | Execute and return a streaming cursor. |
+
+### Cypher Writes
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `execute(cypher)` | `Result<ExecuteResult>` | Execute a Cypher mutation. |
+| `execute_with(cypher)` | `ExecuteBuilder` | Build a parameterized mutation. |
+
+**`ExecuteBuilder` methods:**
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `param(key, value)` | `Self` | Bind a parameter. |
+| `params(iter)` | `Self` | Bind multiple parameters. |
+| `timeout(duration)` | `Self` | Set maximum execution time. |
+| `run()` | `Result<ExecuteResult>` | Execute the mutation. |
+
+### DerivedFactSet Application
+
+Apply Locy DERIVE results to the transaction.
+
+```rust
+// Evaluate a Locy DERIVE at session level (collects derived facts)
+let result = session.locy("
+    reachable(X, Y) :- knows(X, Y).
+    reachable(X, Z) :- reachable(X, Y), knows(Y, Z).
+    ?DERIVE reachable(X, Y).
+").await?;
+
+// Apply the derived facts inside a transaction
+let tx = session.tx().await?;
+let apply_result = tx.apply(result.derived().unwrap().clone()).await?;
+println!("Applied {} facts, version gap: {}", apply_result.facts_applied, apply_result.version_gap);
+tx.commit().await?;
+```
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `apply(derived)` | `Result<ApplyResult>` | Apply a `DerivedFactSet` to this transaction. |
+| `apply_with(derived)` | `ApplyBuilder` | Build with staleness controls. |
+
+**`ApplyBuilder` methods:**
+
+| Method | Description |
+|--------|-------------|
+| `require_fresh()` | Reject if any commits occurred between evaluation and apply. |
+| `max_version_gap(n)` | Reject if gap exceeds `n` versions. |
+| `run()` | Execute the apply operation. Returns `Result<ApplyResult>`. |
+
+**`ApplyResult`:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `facts_applied` | `usize` | Number of mutation queries replayed. |
+| `version_gap` | `u64` | Versions committed between DERIVE and apply. 0 = fresh. |
+
+### Locy Evaluation (within Transaction)
+
+DERIVE commands auto-apply to the transaction's private L0.
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `locy(program)` | `Result<LocyResult>` | Evaluate a Locy program. DERIVE auto-applies to tx. |
+| `locy_with(program)` | `TxLocyBuilder` | Build a parameterized Locy evaluation. |
+
+### Rule Management
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `rules()` | `RuleRegistry` | Access the transaction-scoped rule registry. Rules promoted to session on commit. |
+
+### Bulk Loading (within Transaction)
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `bulk_writer()` | `BulkWriterBuilder` | Create a bulk writer that writes directly to storage. |
+| `appender(label)` | `AppenderBuilder` | Create a streaming appender for a single label. |
+| `bulk_insert_vertices(label, props)` | `Result<Vec<Vid>>` | Bulk insert vertices to the tx L0. Returns allocated VIDs. |
+| `bulk_insert_edges(type, edges)` | `Result<()>` | Bulk insert edges to the tx L0. |
+
+### Prepared Statements
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `prepare(cypher)` | `Result<PreparedQuery>` | Prepare a Cypher query. |
+| `prepare_locy(program)` | `Result<PreparedLocy>` | Prepare a Locy program. |
+
+### Lifecycle
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `commit()` | `Result<CommitResult>` | Commit all changes. Consumes the transaction. |
+| `rollback()` | `()` | Rollback all changes. Consumes the transaction. Infallible. |
+| `is_dirty()` | `bool` | Whether the transaction has uncommitted changes. |
+| `id()` | `&str` | Transaction ID (UUID). |
+| `started_at_version()` | `u64` | Database version when the transaction was created. |
+| `cancel()` | `()` | Cancel all in-flight queries in this transaction. |
+
+### Drop Behavior
+
+If a transaction is dropped without calling `commit()` or `rollback()`, the private L0 buffer is silently discarded. A warning is logged if the transaction was dirty.
+
+---
+
+## CommitResult
+
+Returned by `Transaction::commit()`.
+
+```rust
+let result = tx.commit().await?;
+println!("Version: {}", result.version);
+println!("Mutations: {}", result.mutations_committed);
+println!("Duration: {:?}", result.duration);
+println!("Version gap: {}", result.version_gap());
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `mutations_committed` | `usize` | Number of mutations committed. |
+| `rules_promoted` | `usize` | Number of rules promoted from tx to session. |
+| `version` | `u64` | Database version after commit. |
+| `started_at_version` | `u64` | Database version when the transaction started. |
+| `wal_lsn` | `u64` | WAL log sequence number (0 when no WAL). |
+| `duration` | `Duration` | Time for the commit operation (lock + WAL + merge). |
+| `rule_promotion_errors` | `Vec<RulePromotionError>` | Errors from best-effort rule promotion. |
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `version_gap()` | `u64` | Number of concurrent commits between tx start and commit. 0 = no contention. |
+
+---
+
+## IsolationLevel
+
+```rust
+pub enum IsolationLevel {
+    Serialized, // default — commit-time serialization with private L0 per tx
 }
 ```
 
-### UniBuilder
+Used with `session.tx_with().isolation(IsolationLevel::Serialized).start().await?`.
+
+---
+
+## Schema Management
+
+### SchemaBuilder
+
+Define labels, edge types, properties, and indexes with a fluent API. Changes are batched and applied atomically.
 
 ```rust
-/// Fluent builder for database instances
-pub struct UniBuilder {
-    // Internal state
+db.schema()
+    .label("Person")
+        .property("name", DataType::String)
+        .property("age", DataType::Int64)
+        .property_nullable("email", DataType::String)
+        .vector("embedding", 1536)
+        .index("name", IndexType::Scalar(ScalarType::BTree))
+    .label("Document")
+        .property("title", DataType::String)
+        .index("title", IndexType::FullText)
+    .edge_type("KNOWS", &["Person"], &["Person"])
+        .property("since", DataType::Date)
+        .property_nullable("weight", DataType::Float64)
+    .apply()
+    .await?;
+```
+
+**`SchemaBuilder` methods:**
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `label(name)` | `LabelBuilder` | Start defining a label. |
+| `edge_type(name, from, to)` | `EdgeTypeBuilder` | Start defining an edge type. |
+| `current()` | `Arc<Schema>` | Get the current schema (read-only snapshot). |
+| `with_changes(changes)` | `Self` | Add pre-built schema changes. |
+| `apply()` | `Result<()>` | Apply all batched changes atomically. |
+
+**`LabelBuilder` methods:**
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `property(name, data_type)` | `Self` | Add a required property. |
+| `property_nullable(name, data_type)` | `Self` | Add a nullable property. |
+| `vector(name, dimensions)` | `Self` | Add a vector property (shorthand for `DataType::Vector`). |
+| `index(property, index_type)` | `Self` | Add an index on a property. |
+| `done()` | `SchemaBuilder` | Return to the parent builder. |
+| `label(name)` | `LabelBuilder` | Chain to another label (calls `done()` first). |
+| `edge_type(name, from, to)` | `EdgeTypeBuilder` | Chain to an edge type. |
+| `apply()` | `Result<()>` | Apply (calls `done()` then `apply()`). |
+
+**`EdgeTypeBuilder` methods:**
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `property(name, data_type)` | `Self` | Add a required property. |
+| `property_nullable(name, data_type)` | `Self` | Add a nullable property. |
+| `done()` | `SchemaBuilder` | Return to the parent builder. |
+| `label(name)` | `LabelBuilder` | Chain to a label. |
+| `edge_type(name, from, to)` | `EdgeTypeBuilder` | Chain to another edge type. |
+| `apply()` | `Result<()>` | Apply. |
+
+### DataType Enum
+
+```rust
+pub enum DataType {
+    String,
+    Int64,
+    Float64,
+    Boolean,
+    Date,
+    DateTime,
+    Duration,
+    Bytes,
+    Json,
+    Vector { dimensions: usize },
+    // ... additional variants
+}
+```
+
+### IndexType Enum
+
+```rust
+pub enum IndexType {
+    Vector(VectorIndexCfg),
+    FullText,
+    Scalar(ScalarType),
+    Inverted(InvertedIndexConfig),
 }
 
-impl UniBuilder {
-    /// Set schema from JSON file
-    pub fn schema_file(self, path: impl AsRef<Path>) -> Self;
-
-    /// Set configuration
-    pub fn config(self, config: UniConfig) -> Self;
-
-    /// Set cache size in bytes
-    pub fn cache_size(self, bytes: usize) -> Self;
-
-    /// Set parallelism (worker threads)
-    pub fn parallelism(self, n: usize) -> Self;
-
-    /// Build the database instance (async)
-    pub async fn build(self) -> Result<Uni>;
-
-    /// Build the database instance (blocking)
-    pub fn build_sync(self) -> Result<Uni>;
+pub enum ScalarType {
+    BTree,
+    Hash,
+    Bitmap,
 }
 
-// Example
-let db = Uni::open("./data")
-    .schema_file("schema.json")
-    .cache_size(2 * 1024 * 1024 * 1024)  // 2 GB
-    .parallelism(8)
+pub struct VectorIndexCfg {
+    pub algorithm: VectorAlgo,
+    pub metric: VectorMetric,
+    pub embedding: Option<EmbeddingCfg>,
+}
+
+pub enum VectorAlgo {
+    Hnsw { m: u32, ef_construction: u32 },
+    IvfPq { partitions: u32, sub_vectors: u32 },
+    Flat,
+}
+
+pub enum VectorMetric {
+    Cosine,
+    L2,
+    Dot,
+}
+```
+
+### Schema Info Types
+
+**`LabelInfo`:**
+
+| Field | Type |
+|-------|------|
+| `name` | `String` |
+| `count` | `usize` |
+| `properties` | `Vec<PropertyInfo>` |
+| `indexes` | `Vec<IndexInfo>` |
+| `constraints` | `Vec<ConstraintInfo>` |
+
+**`EdgeTypeInfo`:**
+
+| Field | Type |
+|-------|------|
+| `name` | `String` |
+| `count` | `usize` |
+| `source_labels` | `Vec<String>` |
+| `target_labels` | `Vec<String>` |
+| `properties` | `Vec<PropertyInfo>` |
+| `indexes` | `Vec<IndexInfo>` |
+| `constraints` | `Vec<ConstraintInfo>` |
+
+**`PropertyInfo`:** `name: String`, `data_type: String`, `nullable: bool`, `is_indexed: bool`
+
+**`IndexInfo`:** `name: String`, `index_type: String`, `properties: Vec<String>`, `status: String`
+
+**`ConstraintInfo`:** `name: String`, `constraint_type: String`, `properties: Vec<String>`, `enabled: bool`
+
+---
+
+## Bulk Loading
+
+Two bulk loading mechanisms are available on `Transaction`:
+
+### BulkWriter
+
+High-throughput bulk writer that writes directly to storage, bypassing the L0 buffer. Supports deferred index building, constraint validation, progress callbacks, and automatic checkpointing.
+
+```rust
+let tx = session.tx().await?;
+
+let mut writer = tx.bulk_writer()
+    .batch_size(10_000)
+    .defer_vector_indexes(true)
+    .async_indexes(false)
+    .validate_constraints(true)
+    .max_buffer_size_bytes(1_073_741_824) // 1 GB
+    .on_progress(|p| println!("{:?}", p.phase))
+    .build()?;
+
+let vids = writer.insert_vertices("Person", vec![
+    HashMap::from([("name".into(), Value::from("Alice")), ("age".into(), Value::from(30))]),
+    HashMap::from([("name".into(), Value::from("Bob")), ("age".into(), Value::from(25))]),
+]).await?;
+
+writer.insert_edges("KNOWS", vec![
+    EdgeData::new(vids[0], vids[1], HashMap::new()),
+]).await?;
+
+let stats = writer.commit().await?;
+println!("Inserted {} vertices, {} edges", stats.vertices_inserted, stats.edges_inserted);
+
+tx.commit().await?;
+```
+
+**`BulkWriterBuilder` methods:**
+
+| Method | Description |
+|--------|-------------|
+| `batch_size(n)` | Rows to buffer before flush (default: 10,000). |
+| `defer_vector_indexes(bool)` | Defer vector index building until commit (default: true). |
+| `defer_scalar_indexes(bool)` | Defer scalar index building until commit (default: true). |
+| `async_indexes(bool)` | Build indexes asynchronously after commit (default: false). |
+| `validate_constraints(bool)` | Validate NOT NULL, UNIQUE, CHECK constraints (default: true). |
+| `max_buffer_size_bytes(n)` | Trigger checkpoint when buffer exceeds this (default: 1 GB). |
+| `on_progress(callback)` | Set progress callback. |
+| `build()` | Build the `BulkWriter`. Returns `Result<BulkWriter>`. |
+
+**`BulkWriter` methods:**
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `insert_vertices(label, data)` | `Result<Vec<Vid>>` | Insert vertices. Accepts `Vec<HashMap>` or `RecordBatch`. |
+| `insert_edges(type, edges)` | `Result<Vec<Eid>>` | Insert edges via `Vec<EdgeData>`. |
+| `commit()` | `Result<BulkStats>` | Flush and commit. Rebuilds deferred indexes. |
+| `abort()` | `Result<()>` | Discard all changes and roll back. |
+| `stats()` | `&BulkStats` | Current statistics snapshot. |
+
+**`BulkStats`:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `vertices_inserted` | `usize` | Total vertices inserted. |
+| `edges_inserted` | `usize` | Total edges inserted. |
+| `indexes_rebuilt` | `usize` | Indexes rebuilt at commit. |
+| `duration` | `Duration` | Total elapsed time. |
+| `index_build_duration` | `Duration` | Time spent rebuilding indexes. |
+| `index_task_ids` | `Vec<String>` | Background index task IDs (async mode). |
+| `indexes_pending` | `bool` | True if index builds are running in background. |
+
+### StreamingAppender
+
+Buffered, single-label row-by-row data loading.
+
+```rust
+let tx = session.tx().await?;
+
+let mut appender = tx.appender("Person")
+    .batch_size(5000)
+    .defer_vector_indexes(true)
+    .build()?;
+
+appender.append(HashMap::from([("name".into(), Value::from("Alice"))])).await?;
+appender.append(HashMap::from([("name".into(), Value::from("Bob"))])).await?;
+
+// Also supports Arrow RecordBatch
+// appender.write_batch(&record_batch).await?;
+
+let stats = appender.finish().await?;
+
+tx.commit().await?;
+```
+
+**`AppenderBuilder` methods:**
+
+| Method | Description |
+|--------|-------------|
+| `batch_size(n)` | Auto-flush threshold (default: 5000). |
+| `defer_vector_indexes(bool)` | Defer vector index building (default: true). |
+| `max_buffer_size_bytes(n)` | Max buffer size before checkpoint. |
+| `build()` | Build the `StreamingAppender`. Returns `Result<StreamingAppender>`. |
+
+**`StreamingAppender` methods:**
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `append(properties)` | `Result<()>` | Append a single row. Auto-flushes when buffer is full. |
+| `write_batch(record_batch)` | `Result<()>` | Append an Arrow `RecordBatch`. |
+| `finish()` | `Result<BulkStats>` | Flush remaining rows and commit. Consumes self. |
+| `abort()` | `()` | Discard all data. Consumes self. |
+| `buffered_count()` | `usize` | Number of rows currently buffered. |
+
+---
+
+## Locy Integration
+
+### LocyBuilder (Session-level)
+
+Created by `session.locy_with(program)`. Fluent builder for Locy evaluation with parameters.
+
+```rust
+let result = session.locy_with("
+    edge_rule(X, Y) :- knows(X, Y).
+    ?edge_rule(X, Y).
+")
+    .param("threshold", 0.5)
+    .timeout(Duration::from_secs(30))
+    .max_iterations(1000)
+    .run()
+    .await?;
+
+for row in result.rows() {
+    println!("{:?}", row);
+}
+```
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `param(name, value)` | `Self` | Bind a parameter. |
+| `params(iter)` | `Self` | Bind multiple parameters. |
+| `params_map(map)` | `Self` | Bind from a `HashMap`. |
+| `timeout(duration)` | `Self` | Override evaluation timeout. |
+| `max_iterations(n)` | `Self` | Override max fixpoint iterations. |
+| `cancellation_token(token)` | `Self` | Attach a cancellation token. |
+| `with_config(config)` | `Self` | Apply a full `LocyConfig`. |
+| `run()` | `Result<LocyResult>` | Evaluate and return results. |
+| `explain()` | `Result<LocyExplainOutput>` | Explain without executing. |
+
+### TxLocyBuilder (Transaction-level)
+
+Created by `tx.locy_with(program)`. Same API as `LocyBuilder` but sees the transaction's uncommitted writes. DERIVE commands auto-apply to the private L0.
+
+### LocyResult
+
+Wraps `uni_locy::LocyResult` with additional accessors.
+
+```rust
+let result = session.locy("?QUERY knows(X, Y).").await?;
+
+// Access rows (via Deref to inner LocyResult)
+for row in result.rows() { /* ... */ }
+
+// Execution metrics
+let metrics = result.metrics();
+println!("Duration: {:?}", metrics.duration);
+
+// Derived facts (from DERIVE commands)
+if let Some(derived) = result.derived() {
+    let tx = session.tx().await?;
+    tx.apply(derived.clone()).await?;
+    tx.commit().await?;
+}
+
+// Warnings (from inner LocyResult via Deref)
+for warning in result.warnings() {
+    println!("Warning: {}", warning.message);
+}
+```
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `metrics()` | `&QueryMetrics` | Execution metrics (timing, row counts). |
+| `derived()` | `Option<&DerivedFactSet>` | Derived facts from DERIVE commands. |
+| `into_inner()` | `uni_locy::LocyResult` | Unwrap, discarding metrics. |
+| `into_parts()` | `(LocyResult, QueryMetrics)` | Decompose into parts. |
+| *Deref* | `uni_locy::LocyResult` | All inner fields/methods (`rows()`, `stats`, `warnings()`, etc.). |
+
+### LocyExplainOutput
+
+Returned by `session.locy_with(program).explain()`.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `plan_text` | `String` | Human-readable evaluation plan. |
+| `strata_count` | `usize` | Number of evaluation strata. |
+| `rule_names` | `Vec<String>` | Names of rules in the program. |
+| `has_recursive_strata` | `bool` | Whether fixpoint iteration is needed. |
+| `warnings` | `Vec<String>` | Compiler warnings from static analysis. |
+| `command_count` | `usize` | Number of commands (QUERY, DERIVE, ASSUME, etc.). |
+
+For full Locy language documentation, see the [Locy Overview](../locy/index.md).
+
+---
+
+## Prepared Statements
+
+Cache parse/plan results for repeated execution. Auto-replan on schema changes.
+
+### PreparedQuery
+
+```rust
+let prepared = session.prepare("MATCH (n:Person) WHERE n.age > $min RETURN n").await?;
+
+// Execute with positional params
+let result = prepared.execute(&[("min", Value::from(21))]).await?;
+
+// Or use the fluent binder
+let result = prepared.bind()
+    .param("min", 21)
+    .execute()
+    .await?;
+
+// Can be shared across threads via Arc
+let shared = Arc::new(prepared);
+```
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `execute(params)` | `Result<QueryResult>` | Execute with `&[(&str, Value)]` params. |
+| `bind()` | `PreparedQueryBinder` | Fluent parameter binder. |
+| `query_text()` | `&str` | Original query text. |
+
+### PreparedLocy
+
+```rust
+let prepared = session.prepare_locy("edge_rule(X, Y) :- knows(X, Y). ?edge_rule(X, Y).").await?;
+
+let result = prepared.execute(&[("threshold", Value::from(0.5))]).await?;
+
+let result = prepared.bind()
+    .param("threshold", 0.5)
+    .execute()
+    .await?;
+```
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `execute(params)` | `Result<LocyResult>` | Execute with `&[(&str, Value)]` params. |
+| `bind()` | `PreparedLocyBinder` | Fluent parameter binder. |
+| `program_text()` | `&str` | Original program text. |
+
+---
+
+## Notifications
+
+Reactive awareness of database changes. Sessions can subscribe to commit events.
+
+### CommitNotification
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `version` | `u64` | Database version after commit. |
+| `mutation_count` | `usize` | Number of mutations in the transaction. |
+| `labels_affected` | `Vec<String>` | Vertex labels affected. |
+| `edge_types_affected` | `Vec<String>` | Edge types affected. |
+| `rules_promoted` | `usize` | Rules promoted from tx to session. |
+| `timestamp` | `DateTime<Utc>` | Commit timestamp. |
+| `tx_id` | `String` | Transaction ID. |
+| `session_id` | `String` | Session ID that committed. |
+| `causal_version` | `u64` | Version when the transaction started (for causal ordering). |
+
+### CommitStream
+
+Async stream of commit notifications.
+
+```rust
+let mut stream = session.watch();
+while let Some(notif) = stream.next().await {
+    println!("Version {} committed with {} mutations", notif.version, notif.mutation_count);
+}
+```
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `next()` | `Option<CommitNotification>` | Wait for the next matching notification. `None` if channel closed. |
+
+### WatchBuilder
+
+Build a filtered commit stream. Created by `session.watch_with()`.
+
+```rust
+let mut stream = session.watch_with()
+    .labels(&["Person", "Document"])
+    .edge_types(&["KNOWS"])
+    .exclude_session(session.id())
+    .debounce(Duration::from_millis(100))
+    .build();
+```
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `labels(labels)` | `Self` | Only receive notifications affecting these labels. |
+| `edge_types(types)` | `Self` | Only receive notifications affecting these edge types. |
+| `exclude_session(id)` | `Self` | Exclude notifications from a specific session. |
+| `debounce(interval)` | `Self` | Collapse notifications within interval. |
+| `build()` | `CommitStream` | Build the filtered stream. |
+
+---
+
+## Session Hooks
+
+Intercept queries and commits at the session level. Useful for audit logging, authorization, and metrics.
+
+### SessionHook Trait
+
+```rust
+pub trait SessionHook: Send + Sync {
+    /// Called before a query. Return Err to reject.
+    fn before_query(&self, ctx: &HookContext) -> Result<()> { Ok(()) }
+
+    /// Called after a query completes. Panics are caught and logged.
+    fn after_query(&self, ctx: &HookContext, metrics: &QueryMetrics) {}
+
+    /// Called before commit. Return Err to reject.
+    fn before_commit(&self, ctx: &CommitHookContext) -> Result<()> { Ok(()) }
+
+    /// Called after commit succeeds. Panics are caught and logged.
+    fn after_commit(&self, ctx: &CommitHookContext, result: &CommitResult) {}
+}
+```
+
+### Hook Context Types
+
+**`HookContext`:**
+
+| Field | Type |
+|-------|------|
+| `session_id` | `String` |
+| `query_text` | `String` |
+| `query_type` | `QueryType` (`Cypher`, `Locy`, `Execute`) |
+| `params` | `HashMap<String, Value>` |
+
+**`CommitHookContext`:**
+
+| Field | Type |
+|-------|------|
+| `session_id` | `String` |
+| `tx_id` | `String` |
+| `mutation_count` | `usize` |
+
+### Usage Example
+
+```rust
+struct AuditHook;
+
+impl SessionHook for AuditHook {
+    fn before_query(&self, ctx: &HookContext) -> uni_db::Result<()> {
+        tracing::info!(session = %ctx.session_id, query = %ctx.query_text, "Query started");
+        Ok(())
+    }
+
+    fn before_commit(&self, ctx: &CommitHookContext) -> uni_db::Result<()> {
+        if ctx.mutation_count > 10_000 {
+            return Err(uni_db::UniError::HookRejected {
+                message: "Too many mutations in one commit".into(),
+            });
+        }
+        Ok(())
+    }
+}
+
+let mut session = db.session();
+session.add_hook("audit", AuditHook);
+```
+
+---
+
+## Multi-Agent Access
+
+Coordinate write access across multiple processes sharing the same database.
+
+### WriteLease
+
+```rust
+pub enum WriteLease {
+    Local,                          // Single-process lock (default)
+    DynamoDB { table: String },     // DynamoDB-based distributed lease
+    Custom(Box<dyn WriteLeaseProvider>),  // Custom provider
+}
+```
+
+### WriteLeaseProvider Trait
+
+```rust
+#[async_trait]
+pub trait WriteLeaseProvider: Send + Sync {
+    async fn acquire(&self) -> Result<LeaseGuard>;
+    async fn heartbeat(&self, guard: &LeaseGuard) -> Result<()>;
+    async fn release(&self, guard: LeaseGuard) -> Result<()>;
+}
+```
+
+**`LeaseGuard`:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `lease_id` | `String` | Unique lease acquisition ID. |
+| `expires_at` | `DateTime<Utc>` | Expiration time (renew via heartbeat before this). |
+
+### Configuration
+
+```rust
+let db = Uni::open("./shared-db")
+    .write_lease(WriteLease::Local)
+    .build()
+    .await?;
+
+// Or with read-only mode (no writer)
+let db = Uni::open("./shared-db")
+    .read_only()
     .build()
     .await?;
 ```
 
 ---
 
-## Queries
+## Synchronous Wrappers
 
-### Basic Queries
+Blocking API wrappers for non-async contexts. Each wraps the corresponding async type with a Tokio runtime.
 
-```rust
-impl Uni {
-    /// Execute a Cypher query
-    pub async fn query(&self, cypher: &str) -> Result<QueryResult>;
-
-    /// Execute a query with parameters
-    pub fn query_with(&self, cypher: &str) -> QueryBuilder<'_>;
-
-    /// Execute a mutation (CREATE, SET, DELETE, MERGE)
-    pub async fn execute(&self, cypher: &str) -> Result<ExecuteResult>;
-
-    /// Execute query returning a cursor for streaming results
-    pub async fn query_cursor(&self, cypher: &str) -> Result<QueryCursor>;
-
-    /// Explain a query plan without executing it
-    pub async fn explain(&self, cypher: &str) -> Result<ExplainOutput>;
-
-    /// Profile a query execution with timing information
-    pub async fn profile(&self, cypher: &str) -> Result<(QueryResult, ProfileOutput)>;
-}
-
-// Simple query
-let results = db.query("MATCH (p:Paper) RETURN p.title, p.year").await?;
-
-// Query with parameters
-let results = db.query_with("MATCH (p:Paper) WHERE p.year > $year RETURN p")
-    .param("year", 2020)
-    .fetch_all()
-    .await?;
-
-// Mutation
-let result = db.execute("CREATE (p:Paper {title: 'New Paper', year: 2024})").await?;
-println!("Created {} nodes", result.affected_rows);
-```
-
-### QueryBuilder
+### UniSync
 
 ```rust
-/// Builder for parameterized queries
-pub struct QueryBuilder<'a> {
-    // Internal state
-}
-
-impl<'a> QueryBuilder<'a> {
-    /// Add a parameter
-    pub fn param<V: Into<Value>>(self, name: &str, value: V) -> Self;
-
-    /// Add multiple parameters
-    pub fn params(self, params: HashMap<String, Value>) -> Self;
-
-    /// Set maximum execution time for this query
-    pub fn timeout(self, duration: Duration) -> Self;
-
-    /// Set maximum memory per query in bytes
-    pub fn max_memory(self, bytes: usize) -> Self;
-
-    /// Execute the query and fetch all results into memory
-    pub async fn fetch_all(self) -> Result<QueryResult>;
-
-    /// Execute the query and return a cursor for streaming results
-    pub async fn query_cursor(self) -> Result<QueryCursor>;
-}
-
-// Example with multiple parameters
-let results = db.query_with(
-    "MATCH (a:Author)-[:AUTHORED]->(p:Paper)
-     WHERE a.name = $name AND p.year >= $min_year
-     RETURN p.title, p.year"
-)
-    .param("name", "Jane Smith")
-    .param("min_year", 2020)
-    .fetch_all()
-    .await?;
+let db = UniSync::in_memory()?;
+let session = db.session();
+let rows = session.query("MATCH (n) RETURN count(n)")?;
+db.shutdown()?;
 ```
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `UniSync::new(uni)` | `Result<Self>` | Wrap an existing `Uni` in a blocking runtime. |
+| `UniSync::in_memory()` | `Result<Self>` | Open an in-memory database (blocking). |
+| `session()` | `SessionSync` | Create a sync session. |
+| `schema()` | `SchemaBuilderSync` | Access schema builder (sync). |
+| `schema_meta()` | `Arc<Schema>` | Get current schema snapshot. |
+| `shutdown()` | `Result<()>` | Graceful shutdown (blocking). |
+
+### SessionSync
+
+Mirrors the `Session` API, with all async methods wrapped in `block_on()`.
+
+| Method | Returns | Notes |
+|--------|---------|-------|
+| `query(cypher)` | `Result<QueryResult>` | |
+| `query_with(cypher)` | `QueryBuilderSync` | `.param().fetch_all()` |
+| `locy(program)` | `Result<LocyResult>` | |
+| `locy_with(program)` | `LocyBuilderSync` | `.param().run()` |
+| `rules()` | `RuleRegistry` | |
+| `compile_locy(program)` | `Result<CompiledProgram>` | |
+| `tx()` | `Result<TransactionSync>` | |
+| `tx_with()` | `TransactionBuilderSync` | |
+| `watch()` | `CommitStream` | |
+| `watch_with()` | `WatchBuilder` | |
+| `add_hook(name, hook)` | | Takes `&mut self` |
+| `remove_hook(name)` | `bool` | |
+| `pin_to_version(id)` | `Result<()>` | Takes `&mut self` |
+| `pin_to_timestamp(ts)` | `Result<()>` | Takes `&mut self` |
+| `refresh()` | `Result<()>` | Takes `&mut self` |
+| `prepare(cypher)` | `Result<PreparedQuery>` | |
+| `prepare_locy(program)` | `Result<PreparedLocy>` | |
+| `params()` | `Params` | |
+| `id()` | `&str` | |
+| `capabilities()` | `SessionCapabilities` | |
+| `metrics()` | `SessionMetrics` | |
+| `cancel()` | | |
+
+### TransactionSync
+
+| Method | Returns | Notes |
+|--------|---------|-------|
+| `query(cypher)` | `Result<QueryResult>` | |
+| `query_with(cypher)` | `TxQueryBuilderSync` | |
+| `execute(cypher)` | `Result<ExecuteResult>` | |
+| `execute_with(cypher)` | `ExecuteBuilderSync` | `.param().run()` |
+| `locy(program)` | `Result<LocyResult>` | |
+| `locy_with(program)` | `TxLocyBuilderSync` | `.param().run()` |
+| `apply(derived)` | `Result<ApplyResult>` | |
+| `apply_with(derived)` | `ApplyBuilderSync` | |
+| `prepare(cypher)` | `Result<PreparedQuery>` | |
+| `prepare_locy(program)` | `Result<PreparedLocy>` | |
+| `bulk_writer()` | `BulkWriterBuilder` | |
+| `appender(label)` | `AppenderBuilder` | |
+| `bulk_insert_vertices(label, props)` | `Result<Vec<Vid>>` | |
+| `bulk_insert_edges(type, edges)` | `Result<()>` | |
+| `commit()` | `Result<CommitResult>` | Consumes self |
+| `rollback()` | `()` | Consumes self |
+| `is_dirty()` | `bool` | |
+| `id()` | `&str` | |
 
 ---
 
-## Sessions
+## Session Templates
 
-Sessions provide scoped context for multi-tenant and security-aware queries.
-
-### SessionBuilder
+Pre-configured session factories for per-request session creation.
 
 ```rust
-impl Uni {
-    /// Create a session builder with scoped variables
-    pub fn session(&self) -> SessionBuilder<'_>;
-}
-
-/// Builder for creating query sessions
-pub struct SessionBuilder<'a> {
-    // Internal state
-}
-
-impl<'a> SessionBuilder<'a> {
-    /// Set a session variable
-    pub fn set<K: Into<String>, V: Into<Value>>(self, key: K, value: V) -> Self;
-
-    /// Build the session (variables become immutable)
-    pub fn build(self) -> Session<'a>;
-}
-```
-
-### Session
-
-```rust
-/// A query session with scoped variables
-pub struct Session<'a> {
-    // Internal state
-}
-
-impl<'a> Session<'a> {
-    /// Execute a query with session variables available
-    pub async fn query(&self, cypher: &str) -> Result<QueryResult>;
-
-    /// Execute a query with additional parameters
-    pub fn query_with(&self, cypher: &str) -> SessionQueryBuilder<'a, '_>;
-
-    /// Execute a mutation
-    pub async fn execute(&self, cypher: &str) -> Result<ExecuteResult>;
-
-    /// Get a session variable value
-    pub fn get(&self, key: &str) -> Option<&Value>;
-}
-```
-
-### Session Example
-
-```rust
-// Create session with tenant context
-let session = db.session()
-    .set("tenant_id", "acme-corp")
-    .set("user_id", "user-123")
-    .set("granted_tags", vec!["public", "team:eng"])
-    .build();
-
-// All queries automatically have access to $session.*
-let results = session.query(
-    "MATCH (d:Document)
-     WHERE d.tenant_id = $session.tenant_id
-     RETURN d.title"
-).await?;
-
-// Query with additional parameters
-let results = session.query_with(
-    "MATCH (d:Document)
-     WHERE d.tenant_id = $session.tenant_id
-       AND d.status = $status
-     RETURN d"
-)
-    .param("status", "published")
-    .execute()
-    .await?;
-```
-
----
-
-## Schema Introspection
-
-Query schema metadata and check existence of labels and edge types.
-
-```rust
-impl Uni {
-    /// Check if a label exists in the schema
-    pub async fn label_exists(&self, name: &str) -> Result<bool>;
-
-    /// Check if an edge type exists in the schema
-    pub async fn edge_type_exists(&self, name: &str) -> Result<bool>;
-
-    /// Get all label names
-    pub async fn list_labels(&self) -> Result<Vec<String>>;
-
-    /// Get all edge type names
-    pub async fn list_edge_types(&self) -> Result<Vec<String>>;
-
-    /// Get detailed information about a label
-    pub async fn get_label_info(&self, name: &str) -> Result<Option<LabelInfo>>;
-}
-
-/// Detailed label information
-#[derive(Debug, Clone)]
-pub struct LabelInfo {
-    pub name: String,
-    pub count: usize,
-    pub properties: Vec<PropertyInfo>,
-    pub indexes: Vec<IndexInfo>,
-    pub constraints: Vec<ConstraintInfo>,
-}
-
-/// Property information
-#[derive(Debug, Clone)]
-pub struct PropertyInfo {
-    pub name: String,
-    pub data_type: String,
-    pub nullable: bool,
-    pub is_indexed: bool,
-}
-
-/// Index information
-#[derive(Debug, Clone)]
-pub struct IndexInfo {
-    pub name: String,
-    pub index_type: String,  // "VECTOR", "SCALAR", "FULLTEXT", "JSON_FTS"
-    pub properties: Vec<String>,
-    pub status: String,
-}
-```
-
-### Schema Introspection Example
-
-```rust
-// Check label existence before creating
-if !db.label_exists("Paper").await? {
-    db.schema()
-        .label("Paper")
-            .property("title", DataType::String)
-        .apply()
-        .await?;
-}
-
-// List all labels
-let labels = db.list_labels().await?;
-println!("Labels: {:?}", labels);
-
-// Get detailed label info
-if let Some(info) = db.get_label_info("Paper").await? {
-    println!("Label: {} ({} vertices)", info.name, info.count);
-    for prop in &info.properties {
-        println!("  - {} ({})", prop.name, prop.data_type);
-    }
-    for idx in &info.indexes {
-        println!("  Index: {} ({}) on {:?}", idx.name, idx.index_type, idx.properties);
-    }
-}
-```
-
----
-
-## Compaction & Index Management
-
-Control compaction and monitor index rebuild operations.
-
-```rust
-impl Uni {
-    /// Manually trigger compaction for a specific label
-    /// Merges L1 files into larger files for improved read performance
-    pub async fn compact_label(&self, label: &str) -> Result<CompactionStats>;
-
-    /// Manually trigger compaction for a specific edge type
-    pub async fn compact_edge_type(&self, edge_type: &str) -> Result<CompactionStats>;
-
-    /// Wait for any ongoing compaction to complete
-    pub async fn wait_for_compaction(&self) -> Result<()>;
-
-    /// Force rebuild indexes for a specific label
-    /// If async_ is true, returns task ID for tracking; otherwise blocks until complete
-    pub async fn rebuild_indexes(&self, label: &str, async_: bool) -> Result<Option<String>>;
-
-    /// Get status of background index rebuild tasks
-    pub async fn index_rebuild_status(&self) -> Result<Vec<IndexRebuildTask>>;
-
-    /// Retry failed index rebuild tasks
-    pub async fn retry_index_rebuilds(&self) -> Result<Vec<String>>;
-
-    /// Check if an index is currently being rebuilt for a label
-    pub async fn is_index_building(&self, label: &str) -> Result<bool>;
-}
-
-/// Compaction statistics
-#[derive(Debug, Clone, Default)]
-pub struct CompactionStats {
-    pub files_compacted: usize,
-    pub rows_processed: usize,
-    pub bytes_written: usize,
-    pub duration: Duration,
-}
-
-/// Index rebuild task status
-#[derive(Debug, Clone)]
-pub struct IndexRebuildTask {
-    pub id: String,
-    pub label: String,
-    pub status: IndexRebuildStatus,
-    pub created_at: DateTime<Utc>,
-    pub completed_at: Option<DateTime<Utc>>,
-    pub error: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub enum IndexRebuildStatus {
-    Pending,
-    InProgress,
-    Completed,
-    Failed,
-}
-```
-
-### Compaction Example
-
-```rust
-// Manually compact a label after bulk operations
-let stats = db.compact_label("Paper").await?;
-println!(
-    "Compacted {} files, {} rows in {:?}",
-    stats.files_compacted, stats.rows_processed, stats.duration
-);
-
-// Wait for background compaction
-db.wait_for_compaction().await?;
-```
-
-### Index Rebuild Example
-
-```rust
-// Rebuild indexes synchronously (blocks until complete)
-db.rebuild_indexes("Paper", false).await?;
-
-// Rebuild indexes asynchronously (returns immediately)
-let task_id = db.rebuild_indexes("Paper", true).await?;
-println!("Started index rebuild: {:?}", task_id);
-
-// Monitor rebuild status
-loop {
-    let tasks = db.index_rebuild_status().await?;
-    let building = tasks.iter().any(|t| matches!(t.status, IndexRebuildStatus::InProgress));
-    if !building {
-        break;
-    }
-    tokio::time::sleep(Duration::from_secs(1)).await;
-}
-
-// Check if specific label is building
-if db.is_index_building("Paper").await? {
-    println!("Index rebuild in progress...");
-}
-
-// Retry failed rebuilds
-let retried = db.retry_index_rebuilds().await?;
-if !retried.is_empty() {
-    println!("Retrying {} failed tasks", retried.len());
-}
-```
-
----
-
-## Bulk Loading
-
-High-performance data loading with deferred indexing.
-
-### BulkWriter
-
-```rust
-impl Uni {
-    /// Create a bulk writer builder
-    pub fn bulk_writer(&self) -> BulkWriterBuilder<'_>;
-}
-
-/// Builder for bulk write operations
-pub struct BulkWriterBuilder<'a> {
-    // Internal state
-}
-
-impl<'a> BulkWriterBuilder<'a> {
-    /// Defer vector index updates until commit
-    pub fn defer_vector_indexes(self, defer: bool) -> Self;
-
-    /// Defer scalar index updates until commit
-    pub fn defer_scalar_indexes(self, defer: bool) -> Self;
-
-    /// Set batch size for flushing
-    pub fn batch_size(self, size: usize) -> Self;
-
-    /// Build indexes asynchronously after commit
-    pub fn async_indexes(self, async_build: bool) -> Self;
-
-    /// Set progress callback
-    pub fn on_progress<F: Fn(BulkProgress) + Send + 'static>(self, f: F) -> Self;
-
-    /// Build the bulk writer
-    pub fn build(self) -> Result<BulkWriter<'a>>;
-}
-
-/// Bulk writer for high-performance data loading
-pub struct BulkWriter<'a> {
-    // Internal state
-}
-
-impl<'a> BulkWriter<'a> {
-    /// Insert vertices in bulk
-    pub async fn insert_vertices(
-        &mut self,
-        label: &str,
-        vertices: Vec<HashMap<String, Value>>,
-    ) -> Result<Vec<Vid>>;
-
-    /// Insert edges in bulk
-    pub async fn insert_edges(
-        &mut self,
-        edge_type: &str,
-        edges: Vec<EdgeData>,
-    ) -> Result<Vec<Eid>>;
-
-    /// Commit all pending data and rebuild indexes
-    pub async fn commit(self) -> Result<BulkStats>;
-
-    /// Abort bulk operation, discarding uncommitted data
-    pub async fn abort(self) -> Result<()>;
-}
-
-/// Bulk loading progress information
-#[derive(Debug, Clone)]
-pub struct BulkProgress {
-    pub phase: BulkPhase,
-    pub rows_processed: usize,
-    pub total_rows: Option<usize>,
-    pub current_label: Option<String>,
-    pub elapsed: Duration,
-}
-
-/// Bulk loading phase
-#[derive(Debug, Clone)]
-pub enum BulkPhase {
-    Inserting,
-    RebuildingVectorIndex { label: String, property: String },
-    RebuildingScalarIndex { label: String, property: String },
-    UpdatingAdjacency,
-    Finalizing,
-}
-
-/// Bulk loading statistics
-#[derive(Debug, Clone, Default)]
-pub struct BulkStats {
-    pub vertices_inserted: usize,
-    pub edges_inserted: usize,
-    pub indexes_rebuilt: usize,
-    pub duration: Duration,
-    pub index_build_duration: Duration,
-}
-```
-
-### BulkWriter Example
-
-```rust
-// Create bulk writer with deferred indexing
-let mut bulk = db.bulk_writer()
-    .defer_vector_indexes(true)
-    .defer_scalar_indexes(true)
-    .batch_size(50_000)
-    .on_progress(|p| println!("{:?}: {} rows", p.phase, p.rows_processed))
+let template = db.session_template()
+    .param("tenant", 42)
+    .rules("edge_rule(X, Y) :- knows(X, Y).")?
+    .hook("audit", AuditHook)
+    .query_timeout(Duration::from_secs(30))
+    .transaction_timeout(Duration::from_secs(60))
     .build()?;
 
-// Insert 100K vertices
-let vertices: Vec<HashMap<String, Value>> = (0..100_000)
-    .map(|i| {
-        hashmap! {
-            "name" => format!("item-{}", i).into(),
-            "embedding" => random_vector(128).into(),
-        }
-    })
-    .collect();
-
-let vids = bulk.insert_vertices("Item", vertices).await?;
-assert_eq!(vids.len(), 100_000);
-
-// Commit and rebuild indexes
-let stats = bulk.commit().await?;
-println!("Loaded {} vertices, rebuilt {} indexes in {:?}",
-    stats.vertices_inserted, stats.indexes_rebuilt, stats.duration);
+// Cheap per-request session creation (sync, no recompilation)
+let session = template.create();
 ```
+
+**`SessionTemplateBuilder` methods:**
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `param(key, value)` | `Self` | Bind a parameter for all sessions. |
+| `rules(program)` | `Result<Self>` | Pre-compile Locy rules (eager compilation). |
+| `hook(name, hook)` | `Self` | Attach a named session hook. |
+| `query_timeout(duration)` | `Self` | Default query timeout. |
+| `transaction_timeout(duration)` | `Self` | Default transaction timeout. |
+| `build()` | `Result<SessionTemplate>` | Build the template. |
+
+**`SessionTemplate` methods:**
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `create()` | `Session` | Create a new session. Cheap: rules cloned, params cloned, hooks Arc-cloned. |
 
 ---
 
-## Snapshots and Time Travel
+## Database Metrics
 
-Create/list/restore snapshots, and query historical state via Cypher.
-
-### Snapshot Management (Rust API)
+Snapshot of database-level metrics. Returned by `db.metrics()`.
 
 ```rust
-impl Uni {
-    /// Create a point-in-time snapshot (flushes current changes)
-    /// Returns the snapshot ID
-    pub async fn create_snapshot(&self, name: Option<&str>) -> Result<String>;
-
-    /// Create a persisted named snapshot
-    pub async fn create_named_snapshot(&self, name: &str) -> Result<String>;
-
-    /// List all available snapshots
-    pub async fn list_snapshots(&self) -> Result<Vec<SnapshotManifest>>;
-
-    /// Restore database to a snapshot state
-    /// Note: Requires restart or re-opening to fully take effect
-    pub async fn restore_snapshot(&self, snapshot_id: &str) -> Result<()>;
-}
+let m = db.metrics();
+println!("L0 mutations: {}", m.l0_mutation_count);
+println!("Active sessions: {}", m.active_sessions);
+println!("Uptime: {:?}", m.uptime);
+println!("Total queries: {}", m.total_queries);
 ```
 
-### Snapshot Procedures (Cypher)
+| Field | Type | Description |
+|-------|------|-------------|
+| `l0_mutation_count` | `usize` | Cumulative L0 mutations since last flush. |
+| `l0_estimated_size_bytes` | `usize` | Estimated L0 buffer size. |
+| `schema_version` | `u64` | Current schema version number. |
+| `uptime` | `Duration` | Time since database instance was created. |
+| `active_sessions` | `usize` | Currently active sessions. |
+| `l1_run_count` | `usize` | L1 compaction runs completed. |
+| `write_throttle_pressure` | `ThrottlePressure` | Write back-pressure (0.0--1.0). |
+| `compaction_status` | `CompactionStatus` | Current compaction state. |
+| `wal_size_bytes` | `u64` | WAL size in bytes. |
+| `wal_lsn` | `u64` | Highest flushed WAL log sequence number. |
+| `total_queries` | `u64` | Total queries across all sessions. |
+| `total_commits` | `u64` | Total committed transactions. |
 
-```cypher
-CALL uni.admin.snapshot.create('before_migration')
-YIELD snapshot_id
+### SessionMetrics
 
-CALL uni.admin.snapshot.list()
-YIELD snapshot_id, name, created_at, version_hwm
+Returned by `session.metrics()`.
 
-CALL uni.admin.snapshot.restore('before_migration')
-YIELD status
-```
+| Field | Type | Description |
+|-------|------|-------------|
+| `session_id` | `String` | The session ID. |
+| `active_since` | `Instant` | When the session was created. |
+| `queries_executed` | `u64` | Number of queries. |
+| `locy_evaluations` | `u64` | Number of Locy evaluations. |
+| `total_query_time` | `Duration` | Cumulative query execution time. |
+| `transactions_committed` | `u64` | Committed transactions. |
+| `transactions_rolled_back` | `u64` | Rolled-back transactions. |
+| `total_rows_returned` | `u64` | Rows returned across all queries. |
+| `total_rows_scanned` | `u64` | Rows scanned. |
+| `plan_cache_hits` | `u64` | Plan cache hits. |
+| `plan_cache_misses` | `u64` | Plan cache misses. |
+| `plan_cache_size` | `usize` | Current plan cache entries. |
 
-### Time Travel Queries (Cypher)
+### SessionCapabilities
 
-```rust
-// Query a specific snapshot by ID
-let results = db.query(r#"
-    MATCH (n:Person)
-    RETURN n.name AS name
-    VERSION AS OF 'snap_123'
-"#).await?;
+Returned by `session.capabilities()`.
 
-// Query the snapshot that was current at a timestamp
-let results = db.query(r#"
-    MATCH (n:Person)
-    RETURN n.name AS name
-    TIMESTAMP AS OF '2025-02-01T12:00:00Z'
-"#).await?;
-```
+| Field | Type | Description |
+|-------|------|-------------|
+| `can_write` | `bool` | Can create transactions and execute writes. |
+| `can_pin` | `bool` | Supports version pinning. |
+| `isolation` | `IsolationLevel` | Isolation level for transactions. |
+| `has_notifications` | `bool` | Commit notifications available. |
+| `write_lease` | `Option<WriteLeaseSummary>` | Write lease strategy summary. |
 
 ---
 
-## Transactions
-
-```rust
-impl Uni {
-    /// Begin an explicit transaction
-    pub async fn begin(&self) -> Result<Transaction<'_>>;
-
-    /// Run a closure within a transaction
-    pub async fn transaction<'a, F, T>(&'a self, f: F) -> Result<T>
-    where
-        F: for<'b> FnOnce(&'b mut Transaction<'a>) -> BoxFuture<'b, Result<T>>;
-}
-
-/// Active transaction handle
-pub struct Transaction<'a> {
-    // Internal state
-}
-
-impl<'a> Transaction<'a> {
-    /// Execute a query within the transaction
-    pub async fn query(&self, cypher: &str) -> Result<QueryResult>;
-
-    /// Execute a mutation within the transaction
-    pub async fn execute(&self, cypher: &str) -> Result<ExecuteResult>;
-
-    /// Commit the transaction
-    pub async fn commit(self) -> Result<()>;
-
-    /// Rollback the transaction
-    pub async fn rollback(self) -> Result<()>;
-}
-```
-
-### Transaction Examples
-
-```rust
-// Explicit transaction
-let tx = db.begin().await?;
-tx.execute("CREATE (p:Paper {title: 'Paper 1'})").await?;
-tx.execute("CREATE (p:Paper {title: 'Paper 2'})").await?;
-tx.commit().await?;
-
-// Closure-based transaction (auto-commit on success, rollback on error)
-db.transaction(|tx| async move {
-    tx.execute("CREATE (a:Author {name: 'Alice'})").await?;
-    tx.execute("CREATE (a:Author {name: 'Bob'})").await?;
-    Ok(())
-}).await?;
-
-// Transaction with rollback
-let tx = db.begin().await?;
-tx.execute("DELETE (p:Paper) WHERE p.year < 2000").await?;
-// Changed our mind
-tx.rollback().await?;
-```
-
----
-
-## Query Results
+## Result Types
 
 ### QueryResult
 
+Returned by `session.query()`, `tx.query()`, and builder terminals.
+
 ```rust
-/// Collection of result rows
-pub struct QueryResult {
-    // Internal state
+let result = session.query("MATCH (n:Person) RETURN n.name, n.age").await?;
+
+// Iterate rows
+for row in result.rows() {
+    let name: String = row.get("n.name")?;
+    let age: i64 = row.get("n.age")?;
 }
 
-impl QueryResult {
-    /// Get column names
-    pub fn columns(&self) -> &[String];
+// Metadata
+println!("Columns: {:?}", result.columns());
+println!("Row count: {}", result.len());
+println!("Empty: {}", result.is_empty());
 
-    /// Get number of rows
-    pub fn len(&self) -> usize;
+// Metrics
+let metrics = result.metrics();
+println!("Duration: {:?}", metrics.duration);
 
-    /// Check if empty
-    pub fn is_empty(&self) -> bool;
+// Consume into owned rows
+let rows: Vec<Row> = result.into_rows();
+```
 
-    /// Get rows as slice
-    pub fn rows(&self) -> &[Row];
+### ExecuteResult
 
-    /// Consume into owned rows
-    pub fn into_rows(self) -> Vec<Row>;
+Returned by `tx.execute()` and `ExecuteBuilder::run()`.
 
-    /// Iterate over rows
-    pub fn iter(&self) -> impl Iterator<Item = &Row>;
-}
-
-// Implements IntoIterator
-for row in results {
-    // ...
-}
-
-// Or by reference
-for row in &results {
-    // ...
-}
+```rust
+let result = tx.execute("CREATE (:Person {name: 'Alice'})").await?;
+println!("Affected rows: {}", result.affected_rows);
+println!("Nodes created: {}", result.nodes_created);
+println!("Relationships created: {}", result.relationships_created);
+println!("Properties set: {}", result.properties_set);
 ```
 
 ### Row
 
 ```rust
-/// Single result row
-pub struct Row {
-    // Internal state
-}
+let row: &Row = result.rows().first().unwrap();
 
-impl Row {
-    /// Get typed value by column name
-    pub fn get<T: FromValue>(&self, column: &str) -> Result<T>;
+// Typed access by column name
+let name: String = row.get("n.name")?;
+let age: i64 = row.get("n.age")?;
+let maybe_email: Option<String> = row.get("n.email").ok();
 
-    /// Get typed value by index
-    pub fn get_idx<T: FromValue>(&self, index: usize) -> Result<T>;
+// Access by index
+let first_value: &Value = row.get_by_index(0)?;
+```
 
-    /// Try to get value (returns None if missing or wrong type)
-    pub fn try_get<T: FromValue>(&self, column: &str) -> Option<T>;
+### QueryCursor
 
-    /// Get raw Value by column name
-    pub fn value(&self, column: &str) -> Option<&Value>;
+Streaming cursor for large result sets.
 
-    /// Convert to HashMap
-    pub fn as_map(&self) -> HashMap<&str, &Value>;
+```rust
+let mut cursor = session.query_with("MATCH (n) RETURN n")
+    .cursor()
+    .await?;
 
-    /// Convert to JSON
-    pub fn to_json(&self) -> serde_json::Value;
-}
-
-// Index access
-impl Index<usize> for Row {
-    type Output = Value;
-    fn index(&self, index: usize) -> &Value;
-}
-
-// Example
-for row in &results {
-    let title: String = row.get("p.title")?;
-    let year: i32 = row.get("p.year")?;
-    let citations: Option<i64> = row.try_get("p.citations");
-    println!("{} ({}) - {:?} citations", title, year, citations);
+while let Some(row) = cursor.next().await? {
+    // Process row without loading entire result set
 }
 ```
 
-### Node
+---
+
+## Value Types
+
+The `Value` enum represents all data types in Uni:
 
 ```rust
-/// Graph node returned from queries
-pub struct Node {
-    // Internal state
-}
-
-impl Node {
-    /// Get vertex ID
-    pub fn id(&self) -> Vid;
-
-    /// Get label name
-    pub fn label(&self) -> &str;
-
-    /// Get all properties
-    pub fn properties(&self) -> &HashMap<String, Value>;
-
-    /// Get typed property value
-    pub fn get<T: FromValue>(&self, property: &str) -> Result<T>;
-
-    /// Try to get property (returns None if missing)
-    pub fn try_get<T: FromValue>(&self, property: &str) -> Option<T>;
-}
-
-// Example: Query returns nodes
-let results = db.query("MATCH (p:Paper) RETURN p").await?;
-for row in &results {
-    let node: Node = row.get("p")?;
-    println!("Label: {}, ID: {}", node.label(), node.id());
-    println!("Title: {}", node.get::<String>("title")?);
-}
-```
-
-### Edge
-
-```rust
-/// Graph edge returned from queries
-pub struct Edge {
-    // Internal state
-}
-
-impl Edge {
-    /// Get edge ID
-    pub fn id(&self) -> Eid;
-
-    /// Get edge type name
-    pub fn edge_type(&self) -> &str;
-
-    /// Get source vertex ID
-    pub fn src(&self) -> Vid;
-
-    /// Get destination vertex ID
-    pub fn dst(&self) -> Vid;
-
-    /// Get all properties
-    pub fn properties(&self) -> &HashMap<String, Value>;
-
-    /// Get typed property value
-    pub fn get<T: FromValue>(&self, property: &str) -> Result<T>;
-}
-
-// Example
-let results = db.query("MATCH (a:Author)-[r:AUTHORED]->(p:Paper) RETURN r").await?;
-for row in &results {
-    let edge: Edge = row.get("r")?;
-    println!("Type: {}, From: {} To: {}", edge.edge_type(), edge.src(), edge.dst());
-}
-```
-
-### Path
-
-```rust
-/// Graph path (sequence of nodes and edges)
-pub struct Path {
-    // Internal state
-}
-
-impl Path {
-    /// Get all nodes in the path
-    pub fn nodes(&self) -> &[Node];
-
-    /// Get all edges in the path
-    pub fn edges(&self) -> &[Edge];
-
-    /// Get path length (number of edges)
-    pub fn len(&self) -> usize;
-
-    /// Check if path is empty
-    pub fn is_empty(&self) -> bool;
-
-    /// Get start node
-    pub fn start(&self) -> &Node;
-
-    /// Get end node
-    pub fn end(&self) -> &Node;
-}
-
-// Example: Variable-length path query
-let results = db.query(
-    "MATCH path = (a:Paper)-[:CITES*1..3]->(b:Paper)
-     WHERE a.title = 'Attention Is All You Need'
-     RETURN path"
-).await?;
-
-for row in &results {
-    let path: Path = row.get("path")?;
-    println!("Path length: {} hops", path.len());
-    println!("Start: {}", path.start().get::<String>("title")?);
-    println!("End: {}", path.end().get::<String>("title")?);
-}
-```
-
-### Value
-
-```rust
-/// Dynamic value type for properties and results
-#[derive(Clone, Debug, PartialEq)]
 pub enum Value {
     Null,
     Bool(bool),
@@ -918,1087 +1324,139 @@ pub enum Value {
     Bytes(Vec<u8>),
     List(Vec<Value>),
     Map(HashMap<String, Value>),
-    Node(Node),
-    Edge(Edge),
-    Path(Path),
     Vector(Vec<f32>),
+    Node { id: Vid, labels: Vec<String>, properties: HashMap<String, Value> },
+    Edge { id: Eid, src: Vid, dst: Vid, edge_type: String, properties: HashMap<String, Value> },
+    Path { nodes: Vec<Value>, edges: Vec<Value> },
+    // ... additional variants (Date, DateTime, Duration)
 }
-
-impl Value {
-    // Type checking
-    pub fn is_null(&self) -> bool;
-    pub fn is_bool(&self) -> bool;
-    pub fn is_int(&self) -> bool;
-    pub fn is_float(&self) -> bool;
-    pub fn is_string(&self) -> bool;
-    pub fn is_list(&self) -> bool;
-    pub fn is_map(&self) -> bool;
-    pub fn is_node(&self) -> bool;
-    pub fn is_edge(&self) -> bool;
-    pub fn is_path(&self) -> bool;
-    pub fn is_vector(&self) -> bool;
-
-    // Accessors (return None if wrong type)
-    pub fn as_bool(&self) -> Option<bool>;
-    pub fn as_i64(&self) -> Option<i64>;
-    pub fn as_f64(&self) -> Option<f64>;
-    pub fn as_str(&self) -> Option<&str>;
-    pub fn as_bytes(&self) -> Option<&[u8]>;
-    pub fn as_list(&self) -> Option<&[Value]>;
-    pub fn as_map(&self) -> Option<&HashMap<String, Value>>;
-    pub fn as_node(&self) -> Option<&Node>;
-    pub fn as_edge(&self) -> Option<&Edge>;
-    pub fn as_path(&self) -> Option<&Path>;
-    pub fn as_vector(&self) -> Option<&[f32]>;
-}
-
-// From implementations for common types
-impl From<bool> for Value { ... }
-impl From<i32> for Value { ... }
-impl From<i64> for Value { ... }
-impl From<f64> for Value { ... }
-impl From<String> for Value { ... }
-impl From<&str> for Value { ... }
-impl From<Vec<f32>> for Value { ... }
 ```
 
-### FromValue Trait
+Conversions from Rust types are provided via `Into<Value>`:
 
 ```rust
-/// Trait for converting from Value
-pub trait FromValue: Sized {
-    fn from_value(value: &Value) -> Result<Self>;
-}
-
-// Implemented for:
-// - String, &str
-// - bool
-// - i32, i64, u32, u64
-// - f32, f64
-// - Vec<T> where T: FromValue
-// - Option<T> where T: FromValue
-// - Node, Edge, Path
-// - Vid, Eid
-// - Vec<f32> (vectors)
+Value::from(42_i64)        // Int
+Value::from(3.14_f64)      // Float
+Value::from("hello")       // String
+Value::from(true)          // Bool
+Value::from(vec![1.0_f32, 2.0, 3.0])  // Vector
 ```
 
 ---
 
-## Schema Management
+## Compaction & Index Management
 
-### Schema Builder
+### Compaction
 
-```rust
-impl Uni {
-    /// Get schema builder for modifications
-    pub fn schema(&self) -> SchemaBuilder<'_>;
-
-    /// Load schema from file
-    pub async fn load_schema(&self, path: impl AsRef<Path>) -> Result<()>;
-
-    /// Save schema to file
-    pub async fn save_schema(&self, path: impl AsRef<Path>) -> Result<()>;
-}
-
-/// Fluent schema builder
-pub struct SchemaBuilder<'a> {
-    // Internal state
-}
-
-impl<'a> SchemaBuilder<'a> {
-    /// Add a new label (vertex type)
-    pub fn label(self, name: &str) -> LabelBuilder<'a>;
-
-    /// Add a new edge type
-    pub fn edge_type(
-        self,
-        name: &str,
-        from_labels: &[&str],
-        to_labels: &[&str],
-    ) -> EdgeTypeBuilder<'a>;
-
-    /// Apply all schema changes
-    pub async fn apply(self) -> Result<()>;
-}
-```
-
-### LabelBuilder
+Accessed via `db.compaction()`.
 
 ```rust
-/// Builder for label definitions
-pub struct LabelBuilder<'a> {
-    // Internal state
-}
+// Compact a specific label or edge type
+let stats = db.compaction().compact("Person").await?;
 
-impl<'a> LabelBuilder<'a> {
-    /// Add a required property
-    pub fn property(self, name: &str, data_type: DataType) -> Self;
-
-    /// Add a nullable property
-    pub fn property_nullable(self, name: &str, data_type: DataType) -> Self;
-
-    /// Add a vector property
-    pub fn vector(self, name: &str, dimensions: usize) -> Self;
-
-    /// Add an index on a property
-    pub fn index(self, property: &str, index_type: IndexType) -> Self;
-
-    /// Finish this label and return to SchemaBuilder
-    pub fn done(self) -> SchemaBuilder<'a>;
-
-    /// Chain to another label
-    pub fn label(self, name: &str) -> LabelBuilder<'a>;
-
-    /// Chain to an edge type
-    pub fn edge_type(
-        self,
-        name: &str,
-        from: &[&str],
-        to: &[&str],
-    ) -> EdgeTypeBuilder<'a>;
-
-    /// Apply all schema changes
-    pub async fn apply(self) -> Result<()>;
-}
+// Wait for all background compaction
+db.compaction().wait().await?;
 ```
 
-### EdgeTypeBuilder
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `compact(name)` | `Result<CompactionStats>` | Compact data for a label or edge type. |
+| `wait()` | `Result<()>` | Wait for all background compaction. |
+
+### Index Management
+
+Accessed via `db.indexes()`.
 
 ```rust
-/// Builder for edge type definitions
-pub struct EdgeTypeBuilder<'a> {
-    // Internal state
-}
+// List all indexes
+let all_indexes = db.indexes().list(None);
 
-impl<'a> EdgeTypeBuilder<'a> {
-    /// Add a required property
-    pub fn property(self, name: &str, data_type: DataType) -> Self;
+// List indexes for a label
+let person_indexes = db.indexes().list(Some("Person"));
 
-    /// Add a nullable property
-    pub fn property_nullable(self, name: &str, data_type: DataType) -> Self;
+// Rebuild indexes (blocking)
+db.indexes().rebuild("Person", false).await?;
 
-    /// Finish and return to SchemaBuilder
-    pub fn done(self) -> SchemaBuilder<'a>;
+// Rebuild indexes (background)
+let task_id = db.indexes().rebuild("Person", true).await?;
 
-    /// Chain to a label
-    pub fn label(self, name: &str) -> LabelBuilder<'a>;
+// Check rebuild status
+let status = db.indexes().rebuild_status().await?;
 
-    /// Chain to another edge type
-    pub fn edge_type(
-        self,
-        name: &str,
-        from: &[&str],
-        to: &[&str],
-    ) -> EdgeTypeBuilder<'a>;
-
-    /// Apply all schema changes
-    pub async fn apply(self) -> Result<()>;
-}
+// Retry failed rebuilds
+let retried = db.indexes().retry_failed().await?;
 ```
 
-### Schema Example
-
-```rust
-// Define schema using fluent API
-db.schema()
-    .label("Paper")
-        .property("title", DataType::String)
-        .property("year", DataType::Int32)
-        .property_nullable("abstract", DataType::String)
-        .vector("embedding", 768)
-        .index("year", IndexType::Scalar(ScalarType::BTree))
-        .index("embedding", IndexType::Vector(VectorIndexCfg {
-            algorithm: VectorAlgo::Hnsw { m: 16, ef_construction: 200 },
-            metric: VectorMetric::Cosine,
-        }))
-    .label("Author")
-        .property("name", DataType::String)
-        .property_nullable("email", DataType::String)
-        .index("name", IndexType::Scalar(ScalarType::BTree))
-    .edge_type("AUTHORED", &["Author"], &["Paper"])
-        .property_nullable("position", DataType::Int32)
-    .edge_type("CITES", &["Paper"], &["Paper"])
-    .apply()
-    .await?;
-```
-
-### Schema Types
-
-```rust
-/// Property data type
-#[derive(Clone, Debug, PartialEq)]
-pub enum DataType {
-    String,
-    Int32,
-    Int64,
-    Float32,
-    Float64,
-    Bool,
-    Timestamp,
-    Json,
-    Vector { dimensions: usize },
-    Crdt(CrdtType),
-}
-
-/// CRDT type variants
-#[derive(Clone, Debug, PartialEq)]
-pub enum CrdtType {
-    GCounter,
-    GSet,
-    ORSet,
-    LWWRegister,
-    LWWMap,
-    Rga,
-}
-
-/// Index type configuration
-#[derive(Clone, Debug)]
-pub enum IndexType {
-    Vector(VectorIndexCfg),
-    FullText,
-    Scalar(ScalarType),
-}
-
-/// Vector index configuration
-#[derive(Clone, Debug)]
-pub struct VectorIndexCfg {
-    pub algorithm: VectorAlgo,
-    pub metric: VectorMetric,
-}
-
-/// Vector index algorithms
-#[derive(Clone, Debug)]
-pub enum VectorAlgo {
-    /// HNSW index (fast, high recall)
-    Hnsw { m: u32, ef_construction: u32 },
-    /// IVF-PQ index (memory efficient)
-    IvfPq { partitions: u32, sub_vectors: u32 },
-    /// Flat index (exact, slow)
-    Flat,
-}
-
-/// Vector distance metrics
-#[derive(Clone, Copy, Debug)]
-pub enum VectorMetric {
-    Cosine,
-    L2,
-    Dot,
-}
-
-/// Scalar index types
-#[derive(Clone, Copy, Debug)]
-pub enum ScalarType {
-    BTree,   // Range queries
-    Hash,    // Equality queries (planned)
-    Bitmap,  // Low cardinality (planned)
-}
-```
-
-Note: Scalar index variants other than `BTree` are accepted but currently map to BTree in the storage layer.
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `list(label)` | `Vec<IndexDefinition>` | List index definitions. `None` for all indexes. |
+| `rebuild(label, background)` | `Result<Option<String>>` | Rebuild indexes. Returns task ID if background. |
+| `rebuild_status()` | `Result<Vec<IndexRebuildTask>>` | Status of all rebuild tasks. |
+| `retry_failed()` | `Result<Vec<String>>` | Retry failed rebuild tasks. Returns retried IDs. |
 
 ---
 
-## Vector Search
+## Snapshots
 
-Vector search is exposed via Cypher:
-
-### Procedure Call
+Named point-in-time snapshots for time travel and backup.
 
 ```rust
-let query_embedding = embedding_service.embed("machine learning")?;
+// Create a snapshot
+let snapshot_id = db.create_snapshot("before_migration").await?;
 
-let results = db.query_with(r#"
-    CALL uni.vector.query('Paper', 'embedding', $vec, 10)
-    YIELD node, distance
-    RETURN node.title AS title, distance
-    ORDER BY distance
-"#)
-    .param("vec", query_embedding.clone())
-    .fetch_all()
-    .await?;
-```
+// List snapshots
+let snapshots = db.list_snapshots().await?;
+for s in &snapshots {
+    println!("{}: {:?}", s.id, s.created_at);
+}
 
-### Operator Form (`~=`) with Scores
+// Pin a session to a snapshot
+let mut session = db.session();
+session.pin_to_version(&snapshot_id).await?;
+let old_data = session.query("MATCH (n) RETURN count(n)").await?;
+session.refresh().await?;  // Return to live state
 
-```rust
-let results = db.query_with(r#"
-    MATCH (p:Paper)
-    WHERE p.embedding ~= $vec
-    RETURN p.title AS title, p._score AS score
-    ORDER BY score DESC
-    LIMIT 10
-"#)
-    .param("vec", query_embedding)
-    .fetch_all()
-    .await?;
+// Restore to a snapshot (requires restart to fully take effect)
+db.restore_snapshot(&snapshot_id).await?;
 ```
 
 ---
 
-## Graph Algorithms
+## Rule Registry
 
-### AlgoBuilder
-
-```rust
-impl Uni {
-    /// Access algorithm builder
-    pub fn algo(&self) -> AlgoBuilder<'_>;
-}
-
-/// Builder for graph algorithms
-pub struct AlgoBuilder<'a> {
-    // Internal state
-}
-
-impl<'a> AlgoBuilder<'a> {
-    /// PageRank centrality algorithm
-    pub fn pagerank(self) -> PageRankBuilder<'a>;
-
-    /// Weakly Connected Components
-    pub fn wcc(self) -> WccBuilder<'a>;
-}
-```
-
-### PageRank
+Manage pre-compiled Locy rules at database, session, or transaction scope. Rules registered at the database level are cloned into every new session.
 
 ```rust
-/// PageRank algorithm builder
-pub struct PageRankBuilder<'a> {
-    // Internal state
-}
+// Database-level (global)
+db.rules().register("edge_rule(X, Y) :- knows(X, Y).")?;
 
-impl<'a> PageRankBuilder<'a> {
-    /// Filter to specific labels
-    pub fn labels(self, labels: &[&str]) -> Self;
+// Session-level
+let session = db.session();
+session.rules().register("path_rule(X, Z) :- edge_rule(X, Y), edge_rule(Y, Z).")?;
 
-    /// Filter to specific edge types
-    pub fn edge_types(self, types: &[&str]) -> Self;
+// Query registered rules
+let names = session.rules().list();
+let info = session.rules().get("edge_rule");
+println!("Rules: {:?}, count: {}", names, session.rules().count());
 
-    /// Set damping factor (default: 0.85)
-    pub fn damping(self, d: f64) -> Self;
-
-    /// Set maximum iterations (default: 20)
-    pub fn max_iterations(self, n: usize) -> Self;
-
-    /// Set convergence tolerance (default: 1e-6)
-    pub fn tolerance(self, tol: f64) -> Self;
-
-    /// Run the algorithm
-    pub async fn run(self) -> Result<Vec<(Vid, f64)>>;
-}
-
-// Example
-let rankings = db.algo()
-    .pagerank()
-    .labels(&["Paper"])
-    .edge_types(&["CITES"])
-    .damping(0.85)
-    .max_iterations(50)
-    .run()
-    .await?;
-
-for (vid, score) in rankings.iter().take(10) {
-    println!("VID: {}, PageRank: {:.6}", vid, score);
-}
+// Remove and clear
+session.rules().remove("edge_rule")?;
+session.rules().clear();
 ```
 
-### Weakly Connected Components
-
-```rust
-/// WCC algorithm builder
-pub struct WccBuilder<'a> {
-    // Internal state
-}
-
-impl<'a> WccBuilder<'a> {
-    /// Filter to specific labels
-    pub fn labels(self, labels: &[&str]) -> Self;
-
-    /// Filter to specific edge types
-    pub fn edge_types(self, types: &[&str]) -> Self;
-
-    /// Run the algorithm
-    pub async fn run(self) -> Result<Vec<(Vid, i64)>>;
-}
-
-// Example: Find connected components
-let components = db.algo()
-    .wcc()
-    .labels(&["Paper", "Author"])
-    .edge_types(&["AUTHORED", "CITES"])
-    .run()
-    .await?;
-
-// Count component sizes
-let mut component_sizes: HashMap<i64, usize> = HashMap::new();
-for (_, component_id) in &components {
-    *component_sizes.entry(*component_id).or_default() += 1;
-}
-println!("Found {} components", component_sizes.len());
-```
-
-### Algorithms via Cypher
-
-```rust
-// PageRank via Cypher CALL
-let results = db.query(
-    "CALL uni.algo.pageRank(['Paper'], ['CITES'], 0.85, 20, 1e-6)
-     YIELD nodeId, score
-     RETURN nodeId, score
-     ORDER BY score DESC
-     LIMIT 10"
-).await?;
-
-// Shortest path
-let results = db.query_with(
-    "CALL uni.algo.shortestPath($startVid, $endVid, ['CITES'])
-     YIELD nodeIds, edgeIds, length
-     RETURN nodeIds, edgeIds, length"
-)
-    .param("startVid", start_vid.as_u64() as i64)
-    .param("endVid", end_vid.as_u64() as i64)
-    .fetch_all()
-    .await?;
-
-// Louvain community detection
-let results = db.query(
-    "CALL uni.algo.louvain(['Paper'], ['CITES'])
-     YIELD nodeId, communityId
-     RETURN communityId, COUNT(*) AS size
-     ORDER BY size DESC"
-).await?;
-```
-
----
-
-## Core Types
-
-### Vid (Vertex ID)
-
-```rust
-/// 64-bit vertex identifier
-/// Encoding: label_id (16 bits) | local_offset (48 bits)
-#[derive(Clone, Copy, Hash, Eq, PartialEq, Ord, PartialOrd)]
-pub struct Vid(u64);
-
-impl Vid {
-    /// Create from label ID and offset
-    pub fn new(label_id: u16, local_offset: u64) -> Self;
-
-    /// Extract label ID (upper 16 bits)
-    pub fn label_id(&self) -> u16;
-
-    /// Extract local offset (lower 48 bits)
-    pub fn local_offset(&self) -> u64;
-
-    /// Get raw u64 value
-    pub fn as_u64(&self) -> u64;
-}
-
-impl From<u64> for Vid { ... }
-impl Display for Vid { ... }  // Formats as "0x{:016x}"
-
-// Example
-let vid = Vid::new(1, 12345);
-assert_eq!(vid.label_id(), 1);
-assert_eq!(vid.local_offset(), 12345);
-```
-
-### Eid (Edge ID)
-
-```rust
-/// 64-bit edge identifier
-/// Encoding: type_id (16 bits) | local_offset (48 bits)
-#[derive(Clone, Copy, Hash, Eq, PartialEq, Ord, PartialOrd)]
-pub struct Eid(u64);
-
-impl Eid {
-    /// Create from edge type ID and offset
-    pub fn new(type_id: u16, local_offset: u64) -> Self;
-
-    /// Extract edge type ID
-    pub fn type_id(&self) -> u16;
-
-    /// Extract local offset
-    pub fn local_offset(&self) -> u64;
-
-    /// Get raw u64 value
-    pub fn as_u64(&self) -> u64;
-}
-
-impl From<u64> for Eid { ... }
-impl Display for Eid { ... }
-```
-
-### UniId
-
-```rust
-/// Content-addressed identifier (SHA3-256 hash)
-/// Used for provenance tracking and distributed sync
-#[derive(Clone, Hash, Eq, PartialEq)]
-pub struct UniId([u8; 32]);
-
-impl UniId {
-    /// Create from raw bytes
-    pub fn from_bytes(bytes: [u8; 32]) -> Self;
-
-    /// Compute from content
-    pub fn compute(content: &[u8]) -> Self;
-
-    /// Get as hex string
-    pub fn to_hex(&self) -> String;
-
-    /// Parse from hex string
-    pub fn from_hex(s: &str) -> Result<Self>;
-
-    /// Get raw bytes
-    pub fn as_bytes(&self) -> &[u8; 32];
-}
-```
-
----
-
-## Blocking API (UniSync)
-
-For applications that cannot use async/await.
-
-```rust
-/// Blocking wrapper for Uni
-pub struct UniSync {
-    // Internal state
-}
-
-impl UniSync {
-    /// Open database (blocking)
-    pub fn open(path: impl AsRef<Path>) -> Result<Self>;
-
-    /// Create in-memory database (blocking)
-    pub fn in_memory() -> Result<Self>;
-
-    /// Execute query (blocking)
-    pub fn query(&self, cypher: &str) -> Result<QueryResult>;
-
-    /// Execute mutation (blocking)
-    pub fn execute(&self, cypher: &str) -> Result<ExecuteResult>;
-
-    /// Query with parameters
-    pub fn query_with(&self, cypher: &str) -> QueryBuilderSync<'_>;
-
-    /// Get current schema
-    pub fn schema_meta(&self) -> Schema;
-
-    /// Get schema builder
-    pub fn schema(&self) -> SchemaBuilderSync<'_>;
-
-    /// Begin transaction (blocking)
-    pub fn begin(&self) -> Result<TransactionSync<'_>>;
-}
-
-/// Blocking transaction
-pub struct TransactionSync<'a> {
-    // Internal state
-}
-
-impl<'a> TransactionSync<'a> {
-    pub fn query(&self, cypher: &str) -> Result<QueryResult>;
-    pub fn execute(&self, cypher: &str) -> Result<ExecuteResult>;
-    pub fn commit(self) -> Result<()>;
-    pub fn rollback(self) -> Result<()>;
-}
-
-// Example
-let db = UniSync::open("./data")?;
-let results = db.query("MATCH (p:Paper) RETURN p.title LIMIT 10")?;
-for row in &results {
-    println!("{}", row.get::<String>("p.title")?);
-}
-```
-
----
-
-## Configuration
-
-```rust
-/// Database configuration
-#[derive(Clone, Debug)]
-pub struct UniConfig {
-    /// Cache size in bytes (default: 1 GB)
-    pub cache_size: usize,
-
-    /// Worker thread count (default: available cores)
-    pub parallelism: usize,
-
-    /// Batch size for vectorized execution (default: 1024)
-    pub batch_size: usize,
-
-    /// Maximum frontier size for traversals (default: 1M)
-    pub max_frontier_size: usize,
-
-    /// Auto-flush after this many mutations (default: 10K)
-    pub auto_flush_threshold: usize,
-
-    /// Enable write-ahead log (default: true)
-    pub wal_enabled: bool,
-}
-
-impl Default for UniConfig {
-    fn default() -> Self {
-        Self {
-            cache_size: 1024 * 1024 * 1024,  // 1 GB
-            parallelism: num_cpus::get(),
-            batch_size: 1024,
-            max_frontier_size: 1_000_000,
-            auto_flush_threshold: 10_000,
-            wal_enabled: true,
-        }
-    }
-}
-
-// Example
-let config = UniConfig {
-    cache_size: 4 * 1024 * 1024 * 1024,  // 4 GB
-    parallelism: 16,
-    ..Default::default()
-};
-
-let db = Uni::open("./data")
-    .config(config)
-    .build()
-    .await?;
-```
-
----
-
-## Error Handling
-
-```rust
-/// Main error type
-#[derive(Debug, thiserror::Error)]
-pub enum UniError {
-    #[error("Database not found: {path}")]
-    NotFound { path: PathBuf },
-
-    #[error("Schema error: {message}")]
-    Schema { message: String },
-
-    #[error("Parse error: {message}")]
-    Parse {
-        message: String,
-        position: Option<usize>,
-        line: Option<usize>,
-        column: Option<usize>,
-        context: Option<String>,
-    },
-
-    #[error("Query error: {message}")]
-    Query {
-        message: String,
-        query: Option<String>,
-    },
-
-    #[error("Transaction error: {message}")]
-    Transaction { message: String },
-
-    #[error("Transaction conflict: {message}")]
-    TransactionConflict { message: String },
-
-    #[error("Database is locked by another process")]
-    DatabaseLocked,
-
-    #[error("Query timeout after {timeout_ms}ms")]
-    Timeout { timeout_ms: u64 },
-
-    #[error("Type error: expected {expected}, got {actual}")]
-    Type { expected: String, actual: String },
-
-    #[error("Constraint violation: {message}")]
-    Constraint { message: String },
-
-    #[error("Storage error: {message}")]
-    Storage {
-        message: String,
-        source: Option<Box<dyn std::error::Error + Send + Sync>>,
-    },
-
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
-
-    #[error("Internal error: {0}")]
-    Internal(#[from] anyhow::Error),
-}
-
-/// Result type alias
-pub type Result<T> = std::result::Result<T, UniError>;
-
-// Error handling example
-match db.query("INVALID QUERY").await {
-    Ok(results) => { /* ... */ }
-    Err(UniError::Parse { message, line, column, .. }) => {
-        eprintln!("Parse error at {}:{}: {}", line.unwrap_or(0), column.unwrap_or(0), message);
-    }
-    Err(UniError::Query { message, query }) => {
-        eprintln!("Query failed: {}", message);
-    }
-    Err(e) => {
-        eprintln!("Error: {}", e);
-    }
-}
-```
-
----
-
-## Prelude
-
-Convenient re-exports for common usage.
-
-```rust
-pub use crate::{
-    Uni, UniBuilder, UniSync, UniConfig, UniError, Result,
-    Transaction, QueryBuilder,
-};
-pub use crate::query::{
-    QueryResult, Row, Node, Edge, Path, Value, FromValue, ExecuteResult,
-};
-pub use crate::core::{Vid, Eid, UniId};
-pub use crate::schema::{
-    Schema, DataType, CrdtType, IndexType, VectorIndexCfg,
-    VectorAlgo, VectorMetric, ScalarType,
-};
-pub use crate::vector::VectorMatch;
-```
-
----
-
-## Complete Example
-
-```rust
-use uni_db::*;
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    // Create database with schema
-    let db = Uni::open("./academic-graph")
-        .cache_size(2 * 1024 * 1024 * 1024)
-        .build()
-        .await?;
-
-    // Define schema
-    db.schema()
-        .label("Paper")
-            .property("title", DataType::String)
-            .property("year", DataType::Int32)
-            .vector("embedding", 768)
-            .index("year", IndexType::Scalar(ScalarType::BTree))
-        .label("Author")
-            .property("name", DataType::String)
-        .edge_type("AUTHORED", &["Author"], &["Paper"])
-        .edge_type("CITES", &["Paper"], &["Paper"])
-        .apply()
-        .await?;
-
-    // Insert data in a transaction
-    db.transaction(|tx| async move {
-        tx.execute("CREATE (a:Author {name: 'Alice'})").await?;
-        tx.execute("CREATE (p:Paper {title: 'Graph Databases', year: 2024})").await?;
-        tx.execute(
-            "MATCH (a:Author {name: 'Alice'}), (p:Paper {title: 'Graph Databases'})
-             CREATE (a)-[:AUTHORED]->(p)"
-        ).await?;
-        Ok(())
-    }).await?;
-
-    // Query with parameters
-    let results = db.query_with(
-        "MATCH (a:Author)-[:AUTHORED]->(p:Paper)
-         WHERE p.year >= $min_year
-         RETURN a.name AS author, p.title AS paper, p.year AS year
-         ORDER BY p.year DESC"
-    )
-        .param("min_year", 2020)
-        .fetch_all()
-        .await?;
-
-    println!("Found {} results:", results.len());
-    for row in &results {
-        println!(
-            "  {} wrote '{}' ({})",
-            row.get::<String>("author")?,
-            row.get::<String>("paper")?,
-            row.get::<i32>("year")?
-        );
-    }
-
-    // Run PageRank on citation network
-    let rankings = db.algo()
-        .pagerank()
-        .labels(&["Paper"])
-        .edge_types(&["CITES"])
-        .run()
-        .await?;
-
-    println!("\nTop 5 papers by PageRank:");
-    for (vid, score) in rankings.iter().take(5) {
-        let result = db.query_with("MATCH (p:Paper) WHERE id(p) = $vid RETURN p.title")
-            .param("vid", vid.as_u64() as i64)
-            .fetch_all()
-            .await?;
-        if let Some(row) = result.rows().first() {
-            println!("  {:.6}: {}", score, row.get::<String>("p.title")?);
-        }
-    }
-
-    Ok(())
-}
-```
-
----
-
-## API Gaps & Workarounds
-
-The following features exist internally but have limited or no exposure through the public Rust API. This section documents what's available and workarounds where applicable.
-
-### Feature Availability Summary
-
-| Feature | Rust API | Cypher | Notes |
-|---------|----------|--------|-------|
-| Basic CRUD | ✅ | ✅ | `query()`, `execute()` |
-| Parameterized queries | ✅ | ✅ | `query_with().param()` |
-| Streaming queries | ✅ | — | `query_cursor()` for large result sets |
-| Transactions | ✅ | ✅ | `begin()`, `transaction()` |
-| Schema definition | ✅ | ✅ | `schema()` builder |
-| Schema introspection | ✅ | ✅ | `list_labels()`, `get_label_info()`, `uni.schema.labels()` |
-| Vector search | ✅ | ✅ | `uni.vector.query()` + `~=` operator |
-| PageRank / WCC | ✅ | ✅ | `algo().pagerank()` |
-| Session variables | ✅ | ✅ | `session().set().build()` + `$session.*` |
-| Bulk loading | ✅ | — | `bulk_writer()` with deferred indexing |
-| Snapshots | ✅ | ✅ | `create_named_snapshot()`, `uni.admin.snapshot.*` |
-| EXPLAIN/PROFILE | ✅ | ✅ | `explain()`, `profile()` |
-| Compaction control | ✅ | — | `compact_label()`, `wait_for_compaction()` |
-| Index management | ✅ | — | `rebuild_indexes()`, `index_rebuild_status()` |
-| Temporal queries | — | ✅ | `uni.temporal.validAt()`, `VALID_AT` macro |
-| Schema DDL procedures | — | ✅ | `uni.schema.createLabel()`, `uni.schema.createIndex()` |
-| Import/Export | — | ✅ | Use `COPY` (see below) |
-| Embedding generation | — | ✅ | Auto on CREATE with schema config |
-| Other algorithms | — | ✅ | Use `CALL uni.algo.*` |
-| CRDT operations | — | ✅ | Schema type + Cypher |
-| S3/GCS storage | — | — | Filesystem assumptions in metadata ops |
-
-### Batch Ingestion
-
-No direct `put_batch()` method exists. Use Cypher `UNWIND` for batch operations:
-
-```rust
-// Batch insert via UNWIND
-let papers = vec![
-    json!({"title": "Paper 1", "year": 2024}),
-    json!({"title": "Paper 2", "year": 2023}),
-    json!({"title": "Paper 3", "year": 2024}),
-];
-
-db.query_with(
-    "UNWIND $papers AS p
-     CREATE (n:Paper {title: p.title, year: p.year})"
-)
-    .param("papers", papers)
-    .fetch_all()
-    .await?;
-```
-
-### Import/Export
-
-No direct import/export methods. Use Cypher `COPY`:
-
-```rust
-// Import from CSV
-db.execute("COPY Paper FROM 'papers.csv'").await?;
-
-// Export to Parquet
-db.execute("COPY Paper TO 'papers.parquet' WITH {format: 'parquet'}").await?;
-
-// Export to CSV
-db.execute("COPY Paper TO 'papers.csv' WITH {format: 'csv'}").await?;
-```
-
-### Graph Algorithms
-
-Only PageRank and WCC have dedicated builder APIs. Other algorithms are accessible via Cypher:
-
-```rust
-// Louvain community detection
-let results = db.query(
-    "CALL uni.algo.louvain(['Paper'], ['CITES'])
-     YIELD nodeId, communityId
-     RETURN communityId, COUNT(*) AS size
-     ORDER BY size DESC"
-).await?;
-
-// Shortest path
-let results = db.query_with(
-    "CALL uni.algo.shortestPath($start, $end, ['CITES'])
-     YIELD nodeIds, edgeIds, length
-     RETURN nodeIds, edgeIds, length"
-)
-    .param("start", start_vid.as_u64() as i64)
-    .param("end", end_vid.as_u64() as i64)
-    .fetch_all()
-    .await?;
-
-// Label propagation
-let results = db.query(
-    "CALL uni.algo.labelPropagation(['Paper'], ['CITES'])
-     YIELD nodeId, communityId
-     RETURN communityId, COUNT(*) AS size"
-).await?;
-```
-
-### Uni-Xervo Runtime (Embedding & Generation)
-
-Access the Uni-Xervo runtime via `db.xervo()`. This requires a Uni-Xervo catalog configured at database open time (see [Vector Search Guide](../guides/vector-search.md)).
-
-```rust
-use uni_db::xervo::{Message, GenerationOptions, GenerationResult};
-
-let xervo = db.xervo()?;
-```
-
-**Embedding:**
-
-```rust
-// Embed text directly using a configured model alias
-let vectors: Vec<Vec<f32>> = xervo.embed("embed/default", &["query text"]).await?;
-```
-
-Embeddings are also auto-generated on `CREATE` when a vector index has an `embedding` configuration. No explicit call needed in that case:
-
-```rust
-db.schema()
-    .label("Paper")
-        .property("title", DataType::String)
-        .property("abstract", DataType::String)
-        .vector("embedding", 384)
-    .apply()
-    .await?;
-
-// Embedding generated automatically from configured source properties
-db.execute("CREATE (p:Paper {title: 'ML Paper', abstract: 'Deep learning...'})").await?;
-```
-
-**Text Generation:**
-
-```rust
-// Structured messages with explicit roles
-let result: GenerationResult = xervo.generate("llm/default", &[
-    Message::system("You are a helpful assistant."),
-    Message::user("Summarize the following paper abstract."),
-], GenerationOptions::default()).await?;
-println!("{}", result.text);
-
-// Convenience: plain strings (each treated as a user message)
-let result = xervo.generate_text(
-    "llm/default",
-    &["Explain graph databases."],
-    GenerationOptions::default(),
-).await?;
-
-let runtime = xervo.raw_runtime();
-```
-
-**Key types** (re-exported from `uni_db::xervo`):
-
-| Type | Description |
-|------|-------------|
-| `Message` | Structured message with role and content blocks. Constructors: `Message::user()`, `Message::system()`, `Message::assistant()` |
-| `MessageRole` | Enum: `System`, `User`, `Assistant` |
-| `ContentBlock` | Enum: `Text(String)`, `Image(ImageInput)` |
-| `GenerationOptions` | Options: `max_tokens`, `temperature`, `top_p`, `width`, `height` |
-| `GenerationResult` | Result: `text`, `usage`, `images: Vec<GeneratedImage>`, `audio: Option<AudioOutput>` |
-
-**Vector search with embeddings:**
-
-```rust
-let results = db.query_with(
-    "CALL uni.vector.query('Paper', 'embedding', $query_vec, 10)
-     YIELD node, distance
-     RETURN node.title, distance"
-)
-    .param("query_vec", query_embedding)
-    .fetch_all()
-    .await?;
-```
-
-### CRDT Types
-
-CRDTs can be defined in schema but manipulated only via Cypher:
-
-```rust
-// Define CRDT property
-db.schema()
-    .label("Counter")
-        .property("value", DataType::Crdt(CrdtType::GCounter))
-    .apply()
-    .await?;
-
-// Increment counter via Cypher
-db.execute("MATCH (c:Counter {id: 'visits'}) SET c.value = crdt.increment(c.value, 1)").await?;
-
-// Read counter
-let results = db.query("MATCH (c:Counter {id: 'visits'}) RETURN crdt.value(c.value) AS count").await?;
-```
-
-### Storage Backend
-
-Currently only local filesystem paths are supported. While Lance (the underlying storage) supports S3/GCS/Azure natively, Uni's metadata operations (schema, snapshots, WAL, ID allocation) use `std::fs` directly:
-
-```rust
-// Local storage (supported)
-let db = Uni::open("./my-graph").build().await?;
-
-// S3/GCS/Azure (NOT SUPPORTED)
-// Blocked by filesystem assumptions in:
-// - SchemaManager (fs::read_to_string, fs::write)
-// - SnapshotManager (fs::create_dir_all, fs::write)
-// - WriteAheadLog (File::open)
-// - IdAllocator (fs::rename for atomic writes)
-```
-
-Supporting object stores would require abstracting these operations to use `object_store` crate throughout.
-
-### Full-Text Search
-
-FTS indexes and queries are fully supported:
-
-```rust
-// Create FTS index
-db.execute("CREATE FULLTEXT INDEX bio_fts FOR (p:Person) ON EACH [p.bio]").await?;
-
-// FTS queries with CONTAINS, STARTS WITH, ENDS WITH
-let results = db.query(r#"
-    MATCH (p:Person)
-    WHERE p.bio CONTAINS 'machine learning'
-    RETURN p.name, p.bio
-"#).await?;
-
-let results = db.query(r#"
-    MATCH (p:Person)
-    WHERE p.name STARTS WITH 'John'
-    RETURN p.name
-"#).await?;
-```
-
-### What's NOT Accessible
-
-These internal features have no public access path:
-
-- **WAL management**: Only `wal_enabled` config flag; no rotation/recovery API
-- **ID allocation**: Internal `IdAllocator`; no public ID control
-- **Subgraph extraction**: Internal `load_subgraph_cached()`; no public method
-- **Property lazy-loading**: Internal `PropertyManager`; transparent to users
-
----
-
-## Next Steps
-
-- [Configuration Reference](configuration.md) — All configuration options
-- [Cypher Querying](../guides/cypher-querying.md) — Query language guide
-- [Vector Search](../guides/vector-search.md) — Embedding search patterns
-- [Troubleshooting](troubleshooting.md) — Common issues and solutions
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `register(program)` | `Result<()>` | Compile and register rules from a Locy program. |
+| `remove(name)` | `Result<bool>` | Remove a rule by name. Recompiles remaining rules. |
+| `list()` | `Vec<String>` | List all rule names. |
+| `get(name)` | `Option<RuleInfo>` | Get metadata about a rule. |
+| `count()` | `usize` | Number of registered rules. |
+| `clear()` | `()` | Clear all rules. |
+
+**`RuleInfo`:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | `String` | Rule name. |
+| `clause_count` | `usize` | Number of clauses. |
+| `is_recursive` | `bool` | Whether the rule is recursive. |

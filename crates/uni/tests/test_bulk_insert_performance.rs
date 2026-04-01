@@ -61,7 +61,9 @@ async fn test_bulk_insert_performance() {
             props.push(p);
         }
 
-        db.bulk_insert_vertices("Person", props).await.unwrap();
+        let tx = db.session().tx().await.unwrap();
+        tx.bulk_insert_vertices("Person", props).await.unwrap();
+        tx.commit().await.unwrap();
         let insert_elapsed = create_start.elapsed();
 
         let flush_start = Instant::now();
@@ -83,7 +85,10 @@ async fn test_bulk_insert_performance() {
         eprintln!();
 
         // Clean up for next test and flush to reset L0
-        db.query("MATCH (n:Person) DETACH DELETE n").await.unwrap();
+        db.session()
+            .query("MATCH (n:Person) DETACH DELETE n")
+            .await
+            .unwrap();
         db.flush().await.unwrap();
     }
 }
@@ -154,7 +159,9 @@ async fn test_bulk_insert_with_constraints() {
             props.push(p);
         }
 
-        db.bulk_insert_vertices("User", props).await.unwrap();
+        let tx = db.session().tx().await.unwrap();
+        tx.bulk_insert_vertices("User", props).await.unwrap();
+        tx.commit().await.unwrap();
         let insert_elapsed = create_start.elapsed();
 
         let flush_start = Instant::now();
@@ -177,17 +184,21 @@ async fn test_bulk_insert_with_constraints() {
 
         // Verify all vertices were created
         let result = db
+            .session()
             .query("MATCH (n:User) RETURN count(n) as cnt")
             .await
             .unwrap();
-        if let uni_db::Value::Int(count) = &result.rows[0].values[0] {
+        if let uni_db::Value::Int(count) = &result.rows()[0].values()[0] {
             assert_eq!(*count, scale as i64);
         } else {
             panic!("Expected Int value");
         }
 
         // Clean up for next test and flush to reset L0
-        db.query("MATCH (n:User) DETACH DELETE n").await.unwrap();
+        db.session()
+            .query("MATCH (n:User) DETACH DELETE n")
+            .await
+            .unwrap();
         db.flush().await.unwrap();
     }
 

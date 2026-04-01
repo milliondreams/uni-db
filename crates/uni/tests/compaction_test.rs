@@ -41,13 +41,13 @@ async fn test_compaction_l1_to_l2() -> anyhow::Result<()> {
     // Insert A -> B
     let eid1 = writer.next_eid(1).await?;
     writer
-        .insert_edge(vid_a, vid_b, 1, eid1, HashMap::new(), None)
+        .insert_edge(vid_a, vid_b, 1, eid1, HashMap::new(), None, None)
         .await?;
 
     // Insert A -> C
     let eid2 = writer.next_eid(1).await?;
     writer
-        .insert_edge(vid_a, vid_c, 1, eid2, HashMap::new(), None)
+        .insert_edge(vid_a, vid_c, 1, eid2, HashMap::new(), None, None)
         .await?;
 
     // Flush to L1
@@ -55,14 +55,15 @@ async fn test_compaction_l1_to_l2() -> anyhow::Result<()> {
 
     // 3. Verify L1 has data and L2 is empty
     let delta_ds = storage.delta_dataset("knows", "fwd")?;
-    let lancedb_store = storage.lancedb_store();
     let deltas = delta_ds
-        .scan_all_lancedb(lancedb_store, &schema_manager.schema())
+        .scan_all_backend(storage.backend(), &schema_manager.schema())
         .await?;
     assert_eq!(deltas.len(), 2);
 
     let adj_ds = storage.adjacency_dataset("knows", "Person", "fwd")?;
-    let l2_data = adj_ds.read_adjacency_lancedb(lancedb_store, vid_a).await?;
+    let l2_data = adj_ds
+        .read_adjacency_backend(storage.backend(), vid_a)
+        .await?;
     assert!(l2_data.is_none());
 
     // 4. Run Compaction
@@ -71,7 +72,9 @@ async fn test_compaction_l1_to_l2() -> anyhow::Result<()> {
         .await?;
 
     // 5. Verify L2 has data
-    let l2_data = adj_ds.read_adjacency_lancedb(lancedb_store, vid_a).await?;
+    let l2_data = adj_ds
+        .read_adjacency_backend(storage.backend(), vid_a)
+        .await?;
     assert!(l2_data.is_some());
     let (neighbors, eids) = l2_data.unwrap();
 
@@ -84,12 +87,12 @@ async fn test_compaction_l1_to_l2() -> anyhow::Result<()> {
 
     // 6. Test Updates (Delete + Insert new)
     // Delete A -> B
-    writer.delete_edge(eid1, vid_a, vid_b, 1).await?;
+    writer.delete_edge(eid1, vid_a, vid_b, 1, None).await?;
 
     // Insert B -> C (different source, check multi-row)
     let eid3 = writer.next_eid(1).await?;
     writer
-        .insert_edge(vid_b, vid_c, 1, eid3, HashMap::new(), None)
+        .insert_edge(vid_b, vid_c, 1, eid3, HashMap::new(), None, None)
         .await?;
 
     writer.flush_to_l1(None).await?;
@@ -102,7 +105,7 @@ async fn test_compaction_l1_to_l2() -> anyhow::Result<()> {
     // 7. Verify L2 Updates
     // A should only have C
     let l2_data_a = adj_ds
-        .read_adjacency_lancedb(lancedb_store, vid_a)
+        .read_adjacency_backend(storage.backend(), vid_a)
         .await?
         .unwrap();
     assert_eq!(l2_data_a.0.len(), 1);
@@ -110,7 +113,7 @@ async fn test_compaction_l1_to_l2() -> anyhow::Result<()> {
 
     // B should have C
     let l2_data_b = adj_ds
-        .read_adjacency_lancedb(lancedb_store, vid_b)
+        .read_adjacency_backend(storage.backend(), vid_b)
         .await?
         .unwrap();
     assert_eq!(l2_data_b.0.len(), 1);
@@ -164,7 +167,7 @@ async fn test_compaction_vertices_crdt() -> anyhow::Result<()> {
         ("name".to_string(), Value::String("Version1".to_string())),
     ]);
     writer
-        .insert_vertex_with_labels(vid, props1, &["CounterNode".to_string()])
+        .insert_vertex_with_labels(vid, props1, &["CounterNode".to_string()], None)
         .await?;
     writer.flush_to_l1(None).await?;
 
@@ -180,24 +183,20 @@ async fn test_compaction_vertices_crdt() -> anyhow::Result<()> {
         ("name".to_string(), Value::String("Version2".to_string())),
     ]);
     writer
-        .insert_vertex_with_labels(vid, props2, &["CounterNode".to_string()])
+        .insert_vertex_with_labels(vid, props2, &["CounterNode".to_string()], None)
         .await?;
     writer.flush_to_l1(None).await?;
 
-    // Verify before compaction: LanceDB table has 2 rows
-    let ds = storage.vertex_dataset("CounterNode")?;
-    let lancedb_store = storage.lancedb_store();
-    let table = ds.open_lancedb(lancedb_store).await?;
-    let count = table.count_rows(None).await?;
+    // Verify before compaction: table has 2 rows
+    let table_name = uni_db::store::backend::table_names::vertex_table_name("CounterNode");
+    let count = storage.backend().count_rows(&table_name, None).await?;
     assert_eq!(count, 2);
 
     // 4. Run Compaction
     compactor.compact_vertices("CounterNode").await?;
 
     // 5. Verify after compaction
-    let ds_compacted = storage.vertex_dataset("CounterNode")?;
-    let table_compacted = ds_compacted.open_lancedb(lancedb_store).await?;
-    let count_compacted = table_compacted.count_rows(None).await?;
+    let count_compacted = storage.backend().count_rows(&table_name, None).await?;
 
     // Should be 1 row (latest state)
     assert_eq!(count_compacted, 1);

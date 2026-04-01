@@ -12,7 +12,7 @@ use uni_common::Value;
 use uni_cypher::ast::Expr;
 use uni_cypher::locy_ast::{IsReference, RuleCondition};
 use uni_locy::types::CompiledClause;
-use uni_locy::{LocyError, Row};
+use uni_locy::{FactRow, LocyError};
 
 use super::locy_ast_builder::expr_references_var;
 use super::locy_eval::{
@@ -27,11 +27,11 @@ pub type KeyTuple = Vec<Value>;
 #[derive(Debug, Clone)]
 pub struct RowRelation {
     pub columns: Vec<String>,
-    pub rows: Vec<Row>,
+    pub rows: Vec<FactRow>,
 }
 
 impl RowRelation {
-    pub fn new(columns: Vec<String>, rows: Vec<Row>) -> Self {
+    pub fn new(columns: Vec<String>, rows: Vec<FactRow>) -> Self {
         Self { columns, rows }
     }
 
@@ -48,7 +48,7 @@ impl RowRelation {
 pub type RowStore = HashMap<String, RowRelation>;
 
 /// Extracts the key tuple from a row given key column names.
-pub fn extract_key(row: &Row, key_cols: &[String]) -> KeyTuple {
+pub fn extract_key(row: &FactRow, key_cols: &[String]) -> KeyTuple {
     key_cols
         .iter()
         .map(|k| row.get(k).cloned().unwrap_or(Value::Null))
@@ -72,8 +72,8 @@ pub fn extract_cypher_conditions(conditions: &[RuleCondition]) -> Vec<Expr> {
 ///
 /// Positional: `subjects[i]` maps to `schema[i]` in the derived relation.
 fn is_ref_matches(
-    base_row: &Row,
-    derived_fact: &Row,
+    base_row: &FactRow,
+    derived_fact: &FactRow,
     is_ref: &IsReference,
     schema: &[String],
 ) -> bool {
@@ -94,11 +94,11 @@ fn is_ref_matches(
 /// derived fact, binding the optional target variable and stashing derived fact
 /// columns under `__prev_{col}` for ALONG PrevRef resolution.
 fn semi_join_is_ref(
-    base_rows: &[Row],
-    derived_facts: &[Row],
+    base_rows: &[FactRow],
+    derived_facts: &[FactRow],
     is_ref: &IsReference,
     schema: &[String],
-) -> Vec<Row> {
+) -> Vec<FactRow> {
     let mut result = Vec::new();
     for base_row in base_rows {
         for derived_fact in derived_facts {
@@ -131,11 +131,11 @@ fn semi_join_is_ref(
 
 /// Negative IS anti-join: retain base rows where no derived fact matches.
 fn anti_join_is_ref(
-    base_rows: &[Row],
-    derived_facts: &[Row],
+    base_rows: &[FactRow],
+    derived_facts: &[FactRow],
     is_ref: &IsReference,
     schema: &[String],
-) -> Vec<Row> {
+) -> Vec<FactRow> {
     base_rows
         .iter()
         .filter(|base_row| {
@@ -156,7 +156,7 @@ pub async fn resolve_clause_with_is_refs(
     clause: &CompiledClause,
     fact_source: &dyn DerivedFactSource,
     derived_store: &RowStore,
-) -> Result<Vec<Row>, LocyError> {
+) -> Result<Vec<FactRow>, LocyError> {
     // Collect target variable names from positive IS-refs.
     let target_vars: Vec<String> = clause
         .where_conditions
@@ -225,7 +225,7 @@ pub async fn resolve_clause_with_is_refs(
     if !clause.along.is_empty() {
         let mut new_rows = Vec::with_capacity(rows.len());
         for mut row in rows {
-            let prev_values: Row = row
+            let prev_values: FactRow = row
                 .iter()
                 .filter_map(|(k, v)| {
                     k.strip_prefix("__prev_")

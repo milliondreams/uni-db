@@ -62,7 +62,7 @@ async fn test_transaction_memory_limit_rejects_mutation() -> Result<()> {
     let mut writer = create_test_writer(config).await?;
 
     // Begin transaction
-    writer.begin_transaction()?;
+    let tx_l0 = writer.create_transaction_l0();
 
     // Insert vertices until we hit the memory limit
     let mut count = 0;
@@ -79,7 +79,7 @@ async fn test_transaction_memory_limit_rejects_mutation() -> Result<()> {
         );
 
         let result = writer
-            .insert_vertex_with_labels(vid, properties, &["TestLabel".to_string()])
+            .insert_vertex_with_labels(vid, properties, &["TestLabel".to_string()], Some(&tx_l0))
             .await;
 
         if let Err(e) = result {
@@ -121,7 +121,7 @@ async fn test_transaction_memory_limit_allows_rollback() -> Result<()> {
 
     let mut writer = create_test_writer(config).await?;
 
-    writer.begin_transaction()?;
+    let tx_l0 = writer.create_transaction_l0();
 
     // Fill up the transaction buffer
     for i in 0..20 {
@@ -130,17 +130,12 @@ async fn test_transaction_memory_limit_allows_rollback() -> Result<()> {
         properties.insert(format!("prop_{}", i), Value::String("x".repeat(1000)));
 
         let _ = writer
-            .insert_vertex_with_labels(vid, properties, &["TestLabel".to_string()])
+            .insert_vertex_with_labels(vid, properties, &["TestLabel".to_string()], Some(&tx_l0))
             .await;
     }
 
-    // Rollback should succeed even if we hit the limit
-    let rollback_result = writer.rollback_transaction();
-    assert!(
-        rollback_result.is_ok(),
-        "Rollback should succeed after hitting memory limit: {:?}",
-        rollback_result
-    );
+    // Rollback (drop transaction L0) should succeed even if we hit the limit
+    drop(tx_l0);
 
     Ok(())
 }
@@ -164,7 +159,7 @@ async fn test_no_limit_check_without_transaction() -> Result<()> {
         properties.insert(format!("prop_{}", i), Value::String("x".repeat(1000))); // 1KB
 
         let result = writer
-            .insert_vertex_with_labels(vid, properties, &["TestLabel".to_string()])
+            .insert_vertex_with_labels(vid, properties, &["TestLabel".to_string()], None)
             .await;
 
         assert!(

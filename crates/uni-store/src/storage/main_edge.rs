@@ -15,17 +15,14 @@
 //! - `_created_at`: Creation timestamp
 //! - `_updated_at`: Update timestamp
 
-use crate::lancedb::LanceDbStore;
+use crate::backend::StorageBackend;
+use crate::backend::table_names;
+use crate::backend::types::{ScalarIndexType, ScanRequest, WriteMode};
 use crate::storage::arrow_convert::build_timestamp_column_from_eid_map;
-use crate::storage::index_utils::ensure_btree_index;
 use anyhow::{Result, anyhow};
 use arrow_array::builder::{LargeBinaryBuilder, StringBuilder};
 use arrow_array::{Array, ArrayRef, BooleanArray, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema, TimeUnit};
-use futures::TryStreamExt;
-use futures::future;
-use lancedb::Table;
-use lancedb::query::{ExecutableQuery, QueryBase, Select};
 use std::collections::HashMap;
 use std::sync::Arc;
 use uni_common::Properties;
@@ -153,57 +150,43 @@ impl MainEdgeDataset {
     /// Write a batch to the main edges table.
     ///
     /// Creates the table if it doesn't exist, otherwise appends to it.
-    pub async fn write_batch_lancedb(store: &LanceDbStore, batch: RecordBatch) -> Result<Table> {
-        let table_name = Self::table_name();
+    pub async fn write_batch(backend: &dyn StorageBackend, batch: RecordBatch) -> Result<()> {
+        let table_name = table_names::main_edge_table_name();
 
-        if store.table_exists(table_name).await? {
-            let table = store.open_table(table_name).await?;
-            store.append_to_table(&table, vec![batch]).await?;
-            Ok(table)
+        if backend.table_exists(table_name).await? {
+            backend
+                .write(table_name, vec![batch], WriteMode::Append)
+                .await
         } else {
-            store.create_table(table_name, vec![batch]).await
+            backend.create_table(table_name, vec![batch]).await
         }
     }
 
     /// Ensure default indexes exist on the main edges table.
-    pub async fn ensure_default_indexes_lancedb(table: &Table) -> Result<()> {
-        let indices = table
-            .list_indices()
-            .await
-            .map_err(|e| anyhow!("Failed to list indices: {}", e))?;
-
-        future::join_all(
-            ["_eid", "src_vid", "dst_vid", "type"]
-                .iter()
-                .map(|col| ensure_btree_index(table, &indices, col, "main edges")),
-        )
-        .await;
-
+    pub async fn ensure_default_indexes(backend: &dyn StorageBackend) -> Result<()> {
+        let table_name = table_names::main_edge_table_name();
+        let _ = backend
+            .create_scalar_index(table_name, "_eid", ScalarIndexType::BTree)
+            .await;
+        let _ = backend
+            .create_scalar_index(table_name, "src_vid", ScalarIndexType::BTree)
+            .await;
+        let _ = backend
+            .create_scalar_index(table_name, "dst_vid", ScalarIndexType::BTree)
+            .await;
+        let _ = backend
+            .create_scalar_index(table_name, "type", ScalarIndexType::BTree)
+            .await;
         Ok(())
     }
 
     /// Query the main edges table for an edge by eid.
     pub async fn find_by_eid(
-        store: &LanceDbStore,
+        backend: &dyn StorageBackend,
         eid: Eid,
     ) -> Result<Option<(Vid, Vid, String, Properties)>> {
-        let table_name = Self::table_name();
-
-        if !store.table_exists(table_name).await? {
-            return Ok(None);
-        }
-
-        let table = store.open_table(table_name).await?;
-        let query = format!("_eid = {}", eid.as_u64());
-
-        let batches = table
-            .query()
-            .only_if(query)
-            .execute()
-            .await
-            .map_err(|e| anyhow!("Query failed: {}", e))?;
-
-        let results: Vec<RecordBatch> = batches.try_collect().await?;
+        let filter = format!("_eid = {}", eid.as_u64());
+        let results = Self::execute_query(backend, &filter, None).await?;
 
         for batch in results {
             if batch.num_rows() > 0 {
@@ -245,47 +228,26 @@ impl MainEdgeDataset {
         Ok(None)
     }
 
-    /// Open the main edges table.
-    ///
-    /// Returns None if the table doesn't exist yet.
-    pub async fn open_table(store: &LanceDbStore) -> Result<Option<Table>> {
-        let table_name = Self::table_name();
-
-        if !store.table_exists(table_name).await? {
-            return Ok(None);
-        }
-
-        let table = store.open_table(table_name).await?;
-        Ok(Some(table))
-    }
-
     /// Execute a query on the main edges table.
     ///
     /// Returns empty vec if table doesn't exist.
     async fn execute_query(
-        store: &LanceDbStore,
+        backend: &dyn StorageBackend,
         filter: &str,
         columns: Option<Vec<&str>>,
     ) -> Result<Vec<RecordBatch>> {
-        let Some(table) = Self::open_table(store).await? else {
+        let table_name = table_names::main_edge_table_name();
+
+        if !backend.table_exists(table_name).await? {
             return Ok(Vec::new());
-        };
-
-        let mut query = table.query();
-        query = query.only_if(filter);
-
-        if let Some(cols) = columns {
-            query = query.select(Select::Columns(
-                cols.into_iter().map(String::from).collect(),
-            ));
         }
 
-        let batches = query
-            .execute()
-            .await
-            .map_err(|e| anyhow!("Query failed: {}", e))?;
+        let mut request = ScanRequest::all(table_name).with_filter(filter);
+        if let Some(cols) = columns {
+            request = request.with_columns(cols.into_iter().map(String::from).collect());
+        }
 
-        batches.try_collect().await.map_err(Into::into)
+        backend.scan(request).await
     }
 
     /// Extract EIDs from record batches.
@@ -306,18 +268,21 @@ impl MainEdgeDataset {
     }
 
     /// Find all non-deleted EIDs from the main edges table.
-    pub async fn find_all_eids(store: &LanceDbStore) -> Result<Vec<Eid>> {
-        let batches = Self::execute_query(store, "_deleted = false", Some(vec!["_eid"])).await?;
+    pub async fn find_all_eids(backend: &dyn StorageBackend) -> Result<Vec<Eid>> {
+        let batches = Self::execute_query(backend, "_deleted = false", Some(vec!["_eid"])).await?;
         Ok(Self::extract_eids(&batches))
     }
 
     /// Find EIDs by type name in the main edges table.
-    pub async fn find_eids_by_type_name(store: &LanceDbStore, type_name: &str) -> Result<Vec<Eid>> {
+    pub async fn find_eids_by_type_name(
+        backend: &dyn StorageBackend,
+        type_name: &str,
+    ) -> Result<Vec<Eid>> {
         let filter = format!(
             "_deleted = false AND type = '{}'",
             type_name.replace('\'', "''")
         );
-        let batches = Self::execute_query(store, &filter, Some(vec!["_eid"])).await?;
+        let batches = Self::execute_query(backend, &filter, Some(vec!["_eid"])).await?;
         Ok(Self::extract_eids(&batches))
     }
 
@@ -325,10 +290,13 @@ impl MainEdgeDataset {
     ///
     /// Returns the props_json parsed into a Properties HashMap if found.
     /// This is used as a fallback for unknown/schemaless edge types.
-    pub async fn find_props_by_eid(store: &LanceDbStore, eid: Eid) -> Result<Option<Properties>> {
+    pub async fn find_props_by_eid(
+        backend: &dyn StorageBackend,
+        eid: Eid,
+    ) -> Result<Option<Properties>> {
         let filter = format!("_eid = {} AND _deleted = false", eid.as_u64());
         let batches =
-            Self::execute_query(store, &filter, Some(vec!["props_json", "_version"])).await?;
+            Self::execute_query(backend, &filter, Some(vec!["props_json", "_version"])).await?;
 
         if batches.is_empty() {
             return Ok(None);
@@ -377,9 +345,12 @@ impl MainEdgeDataset {
     }
 
     /// Find edge type name by EID in the main edges table.
-    pub async fn find_type_by_eid(store: &LanceDbStore, eid: Eid) -> Result<Option<String>> {
+    pub async fn find_type_by_eid(
+        backend: &dyn StorageBackend,
+        eid: Eid,
+    ) -> Result<Option<String>> {
         let filter = format!("_eid = {} AND _deleted = false", eid.as_u64());
-        let batches = Self::execute_query(store, &filter, Some(vec!["type"])).await?;
+        let batches = Self::execute_query(backend, &filter, Some(vec!["type"])).await?;
 
         for batch in batches {
             if batch.num_rows() > 0
@@ -398,7 +369,7 @@ impl MainEdgeDataset {
     ///
     /// Returns all non-deleted edges with the given type name.
     pub async fn find_edges_by_type_name(
-        store: &LanceDbStore,
+        backend: &dyn StorageBackend,
         type_name: &str,
     ) -> Result<Vec<(Eid, Vid, Vid, Properties)>> {
         let filter = format!(
@@ -406,7 +377,7 @@ impl MainEdgeDataset {
             type_name.replace('\'', "''")
         );
         // Fetch all columns for edge data
-        let batches = Self::execute_query(store, &filter, None).await?;
+        let batches = Self::execute_query(backend, &filter, None).await?;
 
         let mut edges = Vec::new();
         for batch in &batches {
@@ -421,7 +392,7 @@ impl MainEdgeDataset {
     /// Returns all non-deleted edges with any of the given type names.
     /// This is used for OR relationship type queries like `[:KNOWS|HATES]`.
     pub async fn find_edges_by_type_names(
-        store: &LanceDbStore,
+        backend: &dyn StorageBackend,
         type_names: &[&str],
     ) -> Result<Vec<(Eid, Vid, Vid, String, Properties)>> {
         if type_names.is_empty() {
@@ -439,7 +410,7 @@ impl MainEdgeDataset {
         );
 
         // Fetch all columns for edge data
-        let batches = Self::execute_query(store, &filter, None).await?;
+        let batches = Self::execute_query(backend, &filter, None).await?;
 
         let mut edges = Vec::new();
         for batch in &batches {

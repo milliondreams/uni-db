@@ -36,6 +36,7 @@ async fn test_return_order_by_single_variable_primitives() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
     let bools = db
+        .session()
         .query("UNWIND [true, false] AS bools RETURN bools ORDER BY bools")
         .await?;
     let bool_values: Vec<bool> = bools
@@ -46,6 +47,7 @@ async fn test_return_order_by_single_variable_primitives() -> Result<()> {
     assert_eq!(bool_values, vec![false, true]);
 
     let strings = db
+        .session()
         .query("UNWIND ['.*', '', ' ', 'one'] AS strings RETURN strings ORDER BY strings DESC")
         .await?;
     let string_values: Vec<String> = strings
@@ -64,6 +66,7 @@ async fn test_return_order_by_single_variable_primitives() -> Result<()> {
     );
 
     let ints = db
+        .session()
         .query("UNWIND [1, 3, 2] AS ints RETURN ints ORDER BY ints")
         .await?;
     let int_values: Vec<i64> = ints
@@ -74,6 +77,7 @@ async fn test_return_order_by_single_variable_primitives() -> Result<()> {
     assert_eq!(int_values, vec![1, 2, 3]);
 
     let floats = db
+        .session()
         .query("UNWIND [1.5, 1.3, 999.99] AS floats RETURN floats ORDER BY floats DESC")
         .await?;
     let float_values: Vec<f64> = floats
@@ -91,6 +95,7 @@ async fn test_return_order_by_lists() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
     let lists_asc = db
+        .session()
         .query(
             "UNWIND [[], ['a'], ['a', 1], [1], [1, 'a'], [1, null], [null, 1], [null, 2]] AS lists \
              RETURN lists ORDER BY lists",
@@ -116,6 +121,7 @@ async fn test_return_order_by_lists() -> Result<()> {
     );
 
     let lists_desc = db
+        .session()
         .query(
             "UNWIND [[], ['a'], ['a', 1], [1], [1, 'a'], [1, null], [null, 1], [null, 2]] AS lists \
              RETURN lists ORDER BY lists DESC",
@@ -147,8 +153,11 @@ async fn test_return_order_by_lists() -> Result<()> {
 async fn test_return_order_by_distinct_type_precedence() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
-    db.execute("CREATE (:N)-[:REL]->()").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:N)-[:REL]->()").await?;
+    tx.commit().await?;
     let mixed = db
+        .session()
         .query(
             "MATCH p = (n:N)-[r:REL]->() \
              UNWIND [n, r, p, 1.5, ['list'], 'text', null, false, 0.0 / 0.0, {a: 'map'}] AS types \
@@ -170,6 +179,7 @@ async fn test_return_order_by_distinct_type_precedence() -> Result<()> {
     );
 
     let mixed_desc = db
+        .session()
         .query(
             "MATCH p = (n:N)-[r:REL]->() \
              UNWIND [n, r, p, 1.5, ['list'], 'text', null, false, 0.0 / 0.0, {a: 'map'}] AS types \
@@ -195,12 +205,15 @@ async fn test_return_order_by_distinct_type_precedence() -> Result<()> {
 async fn test_return_order_by_aggregate_function_expression() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
-    db.execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE ({division: 'A', age: 22}), ({division: 'B', age: 33}), ({division: 'B', age: 44}), ({division: 'C', age: 55})",
     )
     .await?;
+    tx.commit().await?;
 
     let aggregate_sorted = db
+        .session()
         .query("MATCH (n) RETURN n.division, max(n.age) ORDER BY max(n.age)")
         .await?;
     let actual: Vec<(String, i64)> = aggregate_sorted
@@ -229,10 +242,13 @@ async fn test_return_order_by_aggregate_function_expression() -> Result<()> {
 #[tokio::test]
 async fn test_return_order_by_distinct_alias_and_columns_shape() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.execute("CREATE ({id: 1}), ({id: 10}), ({id: 10})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE ({id: 1}), ({id: 10}), ({id: 10})")
         .await?;
+    tx.commit().await?;
 
     let alias_distinct = db
+        .session()
         .query("MATCH (n) RETURN DISTINCT n.id AS id ORDER BY id DESC")
         .await?;
     let ids: Vec<i64> = alias_distinct
@@ -243,6 +259,7 @@ async fn test_return_order_by_distinct_alias_and_columns_shape() -> Result<()> {
     assert_eq!(ids, vec![10, 1]);
 
     let distinct_nodes = db
+        .session()
         .query("MATCH (n) RETURN DISTINCT n ORDER BY n.id")
         .await?;
     assert_eq!(distinct_nodes.columns(), &["n".to_string()]);
@@ -261,13 +278,16 @@ async fn test_return_order_by_distinct_alias_and_columns_shape() -> Result<()> {
 #[tokio::test]
 async fn test_return_order_by_distinct_node_identity_deduplicates_same_binding() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (a:Start {id: 0}), (b:Target {id: 10}), (c:Target {id: 20}), \
          (a)-[:R]->(b), (a)-[:R]->(b), (a)-[:R]->(c)",
     )
     .await?;
+    tx.commit().await?;
 
     let distinct_nodes = db
+        .session()
         .query("MATCH (:Start)-[:R]->(n:Target) RETURN DISTINCT n ORDER BY n.id")
         .await?;
     let ids: Vec<i64> = distinct_nodes
@@ -284,12 +304,15 @@ async fn test_return_order_by_distinct_node_identity_deduplicates_same_binding()
 async fn test_return_order_by_multi_expression_with_aggregate_and_property() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
-    db.execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE ({division: 'Sweden'}), ({division: 'Germany'}), ({division: 'England'}), ({division: 'Sweden'})",
     )
     .await?;
+    tx.commit().await?;
 
     let multi = db
+        .session()
         .query(
             "MATCH (n) \
              RETURN n.division, count(*) \
@@ -324,6 +347,7 @@ async fn test_return_order_by_projection_column_from_prior_scope() -> Result<()>
     let db = Uni::in_memory().build().await?;
 
     let projection_sort = db
+        .session()
         .query(
             "WITH [0, 1] AS prows, [[2], [3, 4]] AS qrows \
              UNWIND prows AS p \
@@ -349,6 +373,7 @@ async fn test_return_order_by_aggregation_expression_with_constant_and_param() -
     let db = Uni::in_memory().build().await?;
 
     let with_param = db
+        .session()
         .query_with(
             "MATCH (person) \
              RETURN avg(person.age) AS avgAge \
@@ -368,6 +393,7 @@ async fn test_return_order_by_aggregation_expression_with_alias_reference() -> R
     let db = Uni::in_memory().build().await?;
 
     let alias_in_order_by = db
+        .session()
         .query(
             "MATCH (me:Person)--(you:Person) \
              RETURN me.age AS age, count(you.age) AS cnt \
@@ -385,6 +411,7 @@ async fn test_return_order_by_aggregation_expression_with_property_access_refere
     let db = Uni::in_memory().build().await?;
 
     let property_access_in_order_by = db
+        .session()
         .query(
             "MATCH (me:Person)--(you:Person) \
              RETURN me.age AS age, count(you.age) AS cnt \
@@ -401,6 +428,7 @@ async fn test_with_order_by_lists() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
     let with_lists = db
+        .session()
         .query(
             "UNWIND [[], ['a'], ['a', 1], [1], [1, 'a'], [1, null], [null, 1], [null, 2]] AS lists \
              WITH lists ORDER BY lists LIMIT 4 \
@@ -430,6 +458,7 @@ async fn test_with_order_by_dates() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
     let with_dates = db
+        .session()
         .query(
             "UNWIND [date({year: 1910, month: 5, day: 6}), \
                      date({year: 1980, month: 12, day: 24}), \
@@ -456,7 +485,7 @@ async fn test_with_order_by_local_times_desc() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
     let with_local_times = db
-        .query(
+        .session().query(
             "UNWIND [localtime({hour: 10, minute: 35}), \
                      localtime({hour: 12, minute: 31, second: 14, nanosecond: 645876123}), \
                      localtime({hour: 12, minute: 31, second: 14, nanosecond: 645876124}), \
@@ -483,8 +512,11 @@ async fn test_with_order_by_local_times_desc() -> Result<()> {
 async fn test_with_order_by_distinct_type_precedence_with_limit() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
-    db.execute("CREATE (:N)-[:REL]->()").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:N)-[:REL]->()").await?;
+    tx.commit().await?;
     let with_mixed = db
+        .session()
         .query(
             "MATCH p = (n:N)-[r:REL]->() \
              UNWIND [n, r, p, 1.5, ['list'], 'text', null, false, 0.0 / 0.0, {a: 'map'}] AS types \
@@ -508,6 +540,7 @@ async fn test_with_order_by_aggregation_expression_with_constant_and_param() -> 
     let db = Uni::in_memory().build().await?;
 
     let with_param = db
+        .session()
         .query_with(
             "MATCH (person) \
              WITH avg(person.age) AS avgAge \
@@ -528,6 +561,7 @@ async fn test_with_order_by_aggregation_expression_with_alias_reference() -> Res
     let db = Uni::in_memory().build().await?;
 
     let alias_in_order_by = db
+        .session()
         .query(
             "MATCH (me:Person)--(you:Person) \
              WITH me.age AS age, count(you.age) AS cnt \
@@ -545,6 +579,7 @@ async fn test_with_order_by_aggregation_expression_with_property_access_referenc
     let db = Uni::in_memory().build().await?;
 
     let property_access_in_order_by = db
+        .session()
         .query(
             "MATCH (me:Person)--(you:Person) \
              WITH me.age AS age, count(you.age) AS cnt \

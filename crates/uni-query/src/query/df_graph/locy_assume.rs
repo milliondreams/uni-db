@@ -4,7 +4,7 @@
 //! ASSUME block evaluation via `LocyExecutionContext`.
 //!
 //! Ported from `uni-locy/src/orchestrator/assume.rs`. Uses `LocyExecutionContext`
-//! for savepoints, mutations, and strata re-evaluation.
+//! for L0 fork/restore, mutations, and strata re-evaluation.
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -12,28 +12,27 @@ use std::time::Instant;
 use uni_cypher::ast::Query;
 use uni_locy::result::CommandResult;
 use uni_locy::types::{CompiledAssume, CompiledCommand};
-use uni_locy::{CompiledProgram, LocyConfig, LocyError, LocyStats, Row};
+use uni_locy::{CompiledProgram, FactRow, LocyConfig, LocyError, LocyStats};
 
 use super::locy_delta::RowStore;
 
 use super::locy_explain::ProvenanceStore;
 use super::locy_traits::LocyExecutionContext;
 
-/// Evaluate an ASSUME block: begin savepoint, apply mutations, re-evaluate rules,
-/// execute body commands, collect results, then rollback.
+/// Evaluate an ASSUME block: fork L0, apply mutations, re-evaluate rules,
+/// execute body commands, collect results, then restore.
 pub async fn evaluate_assume(
     assume: &CompiledAssume,
     parent_program: &CompiledProgram,
     ctx: &dyn LocyExecutionContext,
     config: &LocyConfig,
     stats: &mut LocyStats,
-) -> Result<Vec<Row>, LocyError> {
-    // 1. Begin savepoint
-    let savepoint_id = ctx
-        .begin_savepoint()
+) -> Result<Vec<FactRow>, LocyError> {
+    // 1. Fork L0 for hypothetical reasoning
+    ctx.fork_l0()
         .await
         .map_err(|e| LocyError::SavepointFailed {
-            message: format!("failed to begin savepoint: {}", e),
+            message: format!("failed to fork L0: {}", e),
         })?;
 
     // 2. Execute mutations
@@ -85,11 +84,11 @@ pub async fn evaluate_assume(
         }
     }
 
-    // 6. Rollback
-    ctx.rollback_savepoint(savepoint_id)
+    // 6. Restore L0 (discard hypothetical mutations)
+    ctx.restore_l0()
         .await
         .map_err(|e| LocyError::SavepointFailed {
-            message: format!("failed to rollback savepoint: {}", e),
+            message: format!("failed to restore L0: {}", e),
         })?;
 
     Ok(result_rows)

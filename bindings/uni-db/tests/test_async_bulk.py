@@ -11,27 +11,38 @@ import uni_db
 @pytest.fixture
 async def bulk_db():
     """Create an async database with schema for bulk loading."""
-    db = await uni_db.AsyncDatabase.temporary()
-    await db.create_label("Person")
-    await db.add_property("Person", "name", "string", False)
-    await db.add_property("Person", "age", "int", False)
-    await db.create_label("Company")
-    await db.add_property("Company", "name", "string", False)
-    await db.create_edge_type("WORKS_AT", ["Person"], ["Company"])
+    db = await uni_db.AsyncUni.temporary()
+    await (
+        db.schema()
+        .label("Person")
+        .property("name", "string")
+        .property("age", "int")
+        .done()
+        .label("Company")
+        .property("name", "string")
+        .done()
+        .edge_type("WORKS_AT", ["Person"], ["Company"])
+        .done()
+        .apply()
+    )
     return db
 
 
 @pytest.mark.asyncio
 async def test_async_bulk_writer_builder(bulk_db):
     """Test creating an async bulk writer with builder."""
-    writer = bulk_db.bulk_writer().build()
+    session = bulk_db.session()
+    tx = await session.tx()
+    writer = await tx.bulk_writer().build()
     assert writer is not None
 
 
 @pytest.mark.asyncio
 async def test_async_bulk_insert_vertices(bulk_db):
     """Test async bulk inserting vertices."""
-    writer = bulk_db.bulk_writer().build()
+    session = bulk_db.session()
+    tx = await session.tx()
+    writer = await tx.bulk_writer().build()
 
     vids = await writer.insert_vertices(
         "Person",
@@ -44,8 +55,9 @@ async def test_async_bulk_insert_vertices(bulk_db):
 
     assert len(vids) == 3
     await writer.commit()
+    await tx.commit()
 
-    results = await bulk_db.query(
+    results = await session.query(
         "MATCH (n:Person) RETURN n.name AS name ORDER BY n.name"
     )
     assert len(results) == 3
@@ -55,7 +67,9 @@ async def test_async_bulk_insert_vertices(bulk_db):
 @pytest.mark.asyncio
 async def test_async_bulk_insert_edges(bulk_db):
     """Test async bulk inserting edges."""
-    writer = bulk_db.bulk_writer().build()
+    session = bulk_db.session()
+    tx = await session.tx()
+    writer = await tx.bulk_writer().build()
 
     person_vids = await writer.insert_vertices(
         "Person",
@@ -72,8 +86,9 @@ async def test_async_bulk_insert_edges(bulk_db):
     )
 
     await writer.commit()
+    await tx.commit()
 
-    results = await bulk_db.query(
+    results = await session.query(
         "MATCH (p:Person)-[:WORKS_AT]->(c:Company) "
         "RETURN p.name AS p_name, c.name AS c_name"
     )
@@ -83,7 +98,9 @@ async def test_async_bulk_insert_edges(bulk_db):
 @pytest.mark.asyncio
 async def test_async_bulk_writer_abort(bulk_db):
     """Test aborting an async bulk write operation."""
-    writer = bulk_db.bulk_writer().build()
+    session = bulk_db.session()
+    tx = await session.tx()
+    writer = await tx.bulk_writer().build()
 
     await writer.insert_vertices(
         "Person",
@@ -91,6 +108,7 @@ async def test_async_bulk_writer_abort(bulk_db):
     )
 
     writer.abort()
+    await tx.rollback()
 
     with pytest.raises(RuntimeError):
         await writer.insert_vertices("Person", [{"name": "AfterAbort", "age": 100}])
@@ -99,12 +117,15 @@ async def test_async_bulk_writer_abort(bulk_db):
 @pytest.mark.asyncio
 async def test_async_bulk_stats_attributes(bulk_db):
     """Test BulkStats attributes from async commit."""
-    writer = bulk_db.bulk_writer().build()
+    session = bulk_db.session()
+    tx = await session.tx()
+    writer = await tx.bulk_writer().build()
     await writer.insert_vertices(
         "Person",
         [{"name": f"Person{i}", "age": i} for i in range(10)],
     )
     stats = await writer.commit()
+    await tx.commit()
 
     assert hasattr(stats, "vertices_inserted")
     assert hasattr(stats, "edges_inserted")
@@ -115,8 +136,10 @@ async def test_async_bulk_stats_attributes(bulk_db):
 @pytest.mark.asyncio
 async def test_async_bulk_writer_builder_config(bulk_db):
     """Test async bulk writer builder with configuration options."""
-    writer = (
-        bulk_db.bulk_writer()
+    session = bulk_db.session()
+    tx = await session.tx()
+    writer = await (
+        tx.bulk_writer()
         .defer_vector_indexes(True)
         .defer_scalar_indexes(True)
         .batch_size(5000)
@@ -131,20 +154,26 @@ async def test_async_bulk_writer_builder_config(bulk_db):
     )
     assert len(vids) == 1
     await writer.commit()
+    await tx.commit()
 
 
 @pytest.mark.asyncio
 async def test_async_bulk_insert_vertices_convenience(bulk_db):
-    """Test bulk_insert_vertices convenience method on AsyncDatabase."""
-    vids = await bulk_db.bulk_insert_vertices(
+    """Test bulk_insert_vertices convenience method via session."""
+    session = bulk_db.session()
+    tx = await session.tx()
+    bw = await tx.bulk_writer().build()
+    vids = await bw.insert_vertices(
         "Person",
         [
             {"name": "Alice", "age": 30},
             {"name": "Bob", "age": 25},
         ],
     )
+    await bw.commit()
+    await tx.commit()
     assert len(vids) == 2
-    results = await bulk_db.query(
+    results = await session.query(
         "MATCH (n:Person) RETURN n.name AS name ORDER BY n.name"
     )
     assert len(results) == 2
@@ -152,22 +181,27 @@ async def test_async_bulk_insert_vertices_convenience(bulk_db):
 
 @pytest.mark.asyncio
 async def test_async_bulk_insert_edges_convenience(bulk_db):
-    """Test bulk_insert_edges convenience method on AsyncDatabase."""
-    person_vids = await bulk_db.bulk_insert_vertices(
+    """Test bulk_insert_edges convenience method via session."""
+    session = bulk_db.session()
+    tx = await session.tx()
+    bw = await tx.bulk_writer().build()
+    person_vids = await bw.insert_vertices(
         "Person",
         [{"name": "Alice", "age": 30}, {"name": "Bob", "age": 25}],
     )
-    company_vids = await bulk_db.bulk_insert_vertices("Company", [{"name": "TechCorp"}])
+    company_vids = await bw.insert_vertices("Company", [{"name": "TechCorp"}])
 
-    await bulk_db.bulk_insert_edges(
+    await bw.insert_edges(
         "WORKS_AT",
         [
             (person_vids[0], company_vids[0], {}),
             (person_vids[1], company_vids[0], {}),
         ],
     )
+    await bw.commit()
+    await tx.commit()
 
-    results = await bulk_db.query(
+    results = await session.query(
         "MATCH (p:Person)-[:WORKS_AT]->(c:Company) "
         "RETURN p.name AS p_name, c.name AS c_name"
     )

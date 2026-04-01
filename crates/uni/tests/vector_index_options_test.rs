@@ -51,7 +51,7 @@ async fn test_vector_index_preserves_embedding_alias_config() -> Result<()> {
         .apply()
         .await?;
 
-    let schema = db.get_schema();
+    let schema = db.schema().current();
     let index = schema
         .indexes
         .iter()
@@ -84,8 +84,9 @@ async fn test_procedure_api_embedding_alias_config() -> Result<()> {
         .apply()
         .await?;
 
-    db.query(
-        r#"
+    db.session()
+        .query(
+            r#"
         CALL uni.schema.createIndex('Article', 'embedding', {
             "type": "VECTOR",
             "name": "article_embed_idx",
@@ -96,10 +97,10 @@ async fn test_procedure_api_embedding_alias_config() -> Result<()> {
             }
         })
     "#,
-    )
-    .await?;
+        )
+        .await?;
 
-    let schema = db.get_schema();
+    let schema = db.schema().current();
     let index = schema
         .indexes
         .iter()
@@ -132,7 +133,8 @@ async fn test_auto_embed_string_query_requires_xervo_runtime() -> Result<()> {
         .apply()
         .await?;
 
-    db.execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         r#"
         CREATE VECTOR INDEX item_vec_idx
         FOR (i:Item) ON (i.embedding)
@@ -146,8 +148,10 @@ async fn test_auto_embed_string_query_requires_xervo_runtime() -> Result<()> {
     "#,
     )
     .await?;
+    tx.commit().await?;
 
     let result = db
+        .session()
         .query(
             r#"
             CALL uni.vector.query('Item', 'embedding', 'search text', 5)
@@ -190,17 +194,23 @@ async fn test_vector_e2e_lifecycle_create_insert_flush_query_delete_query() -> R
         .apply()
         .await?;
 
-    db.execute("CREATE (d:Doc {id: 1, content: 'alpha', embedding: [0.0, 0.0]})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (d:Doc {id: 1, content: 'alpha', embedding: [0.0, 0.0]})")
         .await?;
-    db.execute("CREATE (d:Doc {id: 2, content: 'beta', embedding: [1.0, 1.0]})")
+    tx.execute("CREATE (d:Doc {id: 2, content: 'beta', embedding: [1.0, 1.0]})")
         .await?;
+    tx.commit().await?;
 
     db.flush().await?;
 
-    let before = db.query("MATCH (d:Doc) RETURN count(d) AS c").await?;
+    let before = db
+        .session()
+        .query("MATCH (d:Doc) RETURN count(d) AS c")
+        .await?;
     assert_eq!(before.rows()[0].get::<i64>("c")?, 2);
 
     let nearest = db
+        .session()
         .query_with(
             "
             MATCH (d:Doc)
@@ -214,13 +224,21 @@ async fn test_vector_e2e_lifecycle_create_insert_flush_query_delete_query() -> R
         .await?;
     assert_eq!(nearest.rows()[0].get::<i64>("d.id")?, 1);
 
-    db.execute("MATCH (d:Doc {id: 1}) DETACH DELETE d").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (d:Doc {id: 1}) DETACH DELETE d").await?;
+    tx.commit().await?;
     db.flush().await?;
 
-    let after = db.query("MATCH (d:Doc) RETURN count(d) AS c").await?;
+    let after = db
+        .session()
+        .query("MATCH (d:Doc) RETURN count(d) AS c")
+        .await?;
     assert_eq!(after.rows()[0].get::<i64>("c")?, 1);
 
-    let remaining = db.query("MATCH (d:Doc) RETURN d.id AS id").await?;
+    let remaining = db
+        .session()
+        .query("MATCH (d:Doc) RETURN d.id AS id")
+        .await?;
     assert_eq!(remaining.rows()[0].get::<i64>("id")?, 2);
 
     Ok(())
@@ -249,13 +267,16 @@ async fn test_vector_match_operator_with_embedding_alias_config() -> Result<()> 
         .apply()
         .await?;
 
-    db.execute("CREATE (i:Item {id: 1, embedding: [0.0, 0.0]})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (i:Item {id: 1, embedding: [0.0, 0.0]})")
         .await?;
-    db.execute("CREATE (i:Item {id: 2, embedding: [2.0, 2.0]})")
+    tx.execute("CREATE (i:Item {id: 2, embedding: [2.0, 2.0]})")
         .await?;
+    tx.commit().await?;
     db.flush().await?;
 
     let results = db
+        .session()
         .query_with(
             "
             MATCH (i:Item)
@@ -268,8 +289,8 @@ async fn test_vector_match_operator_with_embedding_alias_config() -> Result<()> 
         .fetch_all()
         .await?;
 
-    assert_eq!(results.rows.len(), 1);
-    assert_eq!(results.rows[0].get::<i64>("i.id")?, 1);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results.rows()[0].get::<i64>("i.id")?, 1);
 
     Ok(())
 }
@@ -281,7 +302,7 @@ async fn test_uni_xervo_facade_exposed_when_catalog_configured() -> Result<()> {
         .xervo_catalog(vec![mistral_embed_alias("embed/default")])
         .build()
         .await?;
-    db.xervo()?;
+    assert!(db.xervo().is_available());
     Ok(())
 }
 

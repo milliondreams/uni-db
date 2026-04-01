@@ -51,7 +51,7 @@ async fn test_reader_isolation_lifecycle() -> anyhow::Result<()> {
         let v1 = w.next_vid().await?;
         let mut p1 = HashMap::new();
         p1.insert("name".to_string(), unival!("Alice"));
-        w.insert_vertex_with_labels(v1, p1, &["Person".to_string()])
+        w.insert_vertex_with_labels(v1, p1, &["Person".to_string()], None)
             .await?;
     }
 
@@ -99,7 +99,7 @@ async fn test_reader_isolation_lifecycle() -> anyhow::Result<()> {
 
     {
         let mut w = writer.write().await;
-        w.delete_vertex(alice_vid, None).await?;
+        w.delete_vertex(alice_vid, None, None).await?;
     }
 
     // 7. Query (Should NOT see Alice due to L0 tombstone)

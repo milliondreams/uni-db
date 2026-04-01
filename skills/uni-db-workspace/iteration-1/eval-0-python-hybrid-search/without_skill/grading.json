@@ -1,0 +1,38 @@
+{
+  "eval_id": 0,
+  "eval_name": "python-hybrid-search",
+  "configuration": "without_skill",
+  "expectations": [
+    {
+      "text": "Uses Uni.open(), Uni.create(), Uni.temporary(), Uni.in_memory(), or UniBuilder to create a database instance",
+      "passed": true,
+      "evidence": "db = uni_db.UniBuilder.open(db_path).build() (line 191)"
+    },
+    {
+      "text": "Schema definition includes a vector() call with dimension and metric parameters (e.g., .vector('embedding', 384, 'cosine')) OR creates a vector index via Cypher DDL (CREATE VECTOR INDEX)",
+      "passed": true,
+      "evidence": ".vector(\"embedding\", 64) in schema builder (line 201), plus db.schema().label(\"Document\").index(\"embedding\", {\"type\": \"vector\", \"metric\": \"cosine\"}).apply() for vector index creation (lines 267-269)"
+    },
+    {
+      "text": "Creates a full-text/BM25 index via schema builder or Cypher DDL (CREATE FULLTEXT INDEX or .index() on a text property)",
+      "passed": true,
+      "evidence": "db.schema().label(\"Document\").index(\"content\", \"fulltext\").apply() (lines 273-274)"
+    },
+    {
+      "text": "Uses Transaction (via session.tx() or context manager) for data ingestion, not direct session writes",
+      "passed": true,
+      "evidence": "tx = session.tx() followed by tx.execute() calls and tx.commit() for all data ingestion (lines 219-258)"
+    },
+    {
+      "text": "Uses CALL uni.search, similar_to() with multiple sources, or combines uni.vector.query + uni.fts.query for hybrid search",
+      "passed": true,
+      "evidence": "Uses CALL uni.search('Document', {vector: 'embedding', fts: 'content'}, ...) (lines 342-350), and also CALL uni.vector.query (line 290) + CALL uni.fts.query (line 304)"
+    },
+    {
+      "text": "Import statements reference actual uni_db module names (e.g., from uni_db import Uni, DataType, not hallucinated module paths)",
+      "passed": true,
+      "evidence": "import uni_db (line 15), then uses uni_db.Uni and uni_db.UniBuilder which are valid module references"
+    }
+  ],
+  "pass_rate": 1.0
+}

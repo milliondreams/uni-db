@@ -52,7 +52,6 @@ impl<'a> ExpressionWalker<'a> {
                 all,
             },
             Query::Schema(schema_cmd) => Query::Schema(schema_cmd),
-            Query::Transaction(txn_cmd) => Query::Transaction(txn_cmd),
             Query::Explain(inner) => Query::Explain(Box::new(self.rewrite_query(*inner))),
             Query::TimeTravel { .. } => {
                 unreachable!("TimeTravel should be resolved at API layer before rewriting")
@@ -312,9 +311,9 @@ impl<'a> ExpressionWalker<'a> {
                 where_clause: where_clause.map(|e| Box::new(self.rewrite_expr(*e))),
                 map_expr: Box::new(self.rewrite_expr(*map_expr)),
             },
-            // TODO: Recurse into CollectSubquery inner query for consistency
-            // with Exists and CountSubquery handling below
-            Expr::CollectSubquery(_) => expr,
+            Expr::CollectSubquery(query) => {
+                Expr::CollectSubquery(Box::new(self.rewrite_query(*query)))
+            }
             // Try to rewrite function calls
             Expr::FunctionCall {
                 name,

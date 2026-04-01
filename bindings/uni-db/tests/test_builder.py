@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2024-2026 Dragonscale Team
 
-"""Tests for DatabaseBuilder API."""
+"""Tests for UniBuilder API."""
 
 import os
 import shutil
@@ -12,18 +12,19 @@ import pytest
 import uni_db
 
 
-class TestDatabaseBuilderOpenModes:
+class TestUniBuilderOpenModes:
     """Tests for different database open modes."""
 
     def test_create_new_database(self):
         """Test creating a new database."""
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "testdb")
-            db = uni_db.DatabaseBuilder.create(path).build()
+            db = uni_db.UniBuilder.create(path).build()
             assert db is not None
             # Database should be empty
-            db.create_label("Test")
-            results = db.query("MATCH (n:Test) RETURN n")
+            db.schema().label("Test").apply()
+            session = db.session()
+            results = session.query("MATCH (n:Test) RETURN n")
             assert len(results) == 0
 
     def test_create_fails_if_exists(self):
@@ -32,14 +33,14 @@ class TestDatabaseBuilderOpenModes:
         try:
             path = os.path.join(tmpdir, "testdb")
             # Create first
-            db1 = uni_db.DatabaseBuilder.create(path).build()
-            db1.create_label("Test")
+            db1 = uni_db.UniBuilder.create(path).build()
+            db1.schema().label("Test").apply()
             db1.flush()
             del db1
 
             # Create again should fail
-            with pytest.raises(OSError):
-                uni_db.DatabaseBuilder.create(path).build()
+            with pytest.raises(uni_db.UniError):
+                uni_db.UniBuilder.create(path).build()
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -48,16 +49,18 @@ class TestDatabaseBuilderOpenModes:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "testdb")
             # Create and add data
-            db1 = uni_db.DatabaseBuilder.create(path).build()
-            db1.create_label("Person")
-            db1.add_property("Person", "name", "string", False)
-            db1.query("CREATE (n:Person {name: 'Alice'})")
+            db1 = uni_db.UniBuilder.create(path).build()
+            db1.schema().label("Person").property("name", "string").apply()
+            session1 = db1.session()
+            session1.query("CREATE (n:Person {name: 'Alice'})")
             db1.flush()
+            del session1
             del db1
 
             # Open existing
-            db2 = uni_db.DatabaseBuilder.open_existing(path).build()
-            results = db2.query("MATCH (n:Person) RETURN n.name AS name")
+            db2 = uni_db.UniBuilder.open_existing(path).build()
+            session2 = db2.session()
+            results = session2.query("MATCH (n:Person) RETURN n.name AS name")
             assert len(results) == 1
             assert results[0]["name"] == "Alice"
 
@@ -65,17 +68,20 @@ class TestDatabaseBuilderOpenModes:
         """Test that open_existing() fails if database doesn't exist."""
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "nonexistent")
-            with pytest.raises(OSError):
-                uni_db.DatabaseBuilder.open_existing(path).build()
+            with pytest.raises(uni_db.UniNotFoundError):
+                uni_db.UniBuilder.open_existing(path).build()
 
     def test_open_creates_if_needed(self):
         """Test that open() creates database if it doesn't exist."""
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "testdb")
-            db = uni_db.DatabaseBuilder.open(path).build()
+            db = uni_db.UniBuilder.open(path).build()
             assert db is not None
-            db.create_label("Test")
-            db.execute("CREATE (n:Test)")
+            db.schema().label("Test").apply()
+            session = db.session()
+            tx = session.tx()
+            tx.execute("CREATE (n:Test)")
+            tx.commit()
             db.flush()
 
     def test_open_reuses_existing(self):
@@ -83,33 +89,35 @@ class TestDatabaseBuilderOpenModes:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "testdb")
             # Create and add data
-            db1 = uni_db.DatabaseBuilder.create(path).build()
-            db1.create_label("Person")
-            db1.add_property("Person", "name", "string", False)
-            db1.query("CREATE (n:Person {name: 'Bob'})")
+            db1 = uni_db.UniBuilder.create(path).build()
+            db1.schema().label("Person").property("name", "string").apply()
+            session1 = db1.session()
+            session1.query("CREATE (n:Person {name: 'Bob'})")
             db1.flush()
+            del session1
             del db1
 
             # Open should see existing data
-            db2 = uni_db.DatabaseBuilder.open(path).build()
-            results = db2.query("MATCH (n:Person) RETURN n.name AS name")
+            db2 = uni_db.UniBuilder.open(path).build()
+            session2 = db2.session()
+            results = session2.query("MATCH (n:Person) RETURN n.name AS name")
             assert len(results) == 1
             assert results[0]["name"] == "Bob"
 
     def test_temporary_database(self):
         """Test creating a temporary database."""
-        db = uni_db.DatabaseBuilder.temporary().build()
+        db = uni_db.UniBuilder.temporary().build()
         assert db is not None
-        db.create_label("Temp")
-        db.add_property("Temp", "value", "int", False)
-        db.query("CREATE (n:Temp {value: 42})")
+        db.schema().label("Temp").property("value", "int").apply()
+        session = db.session()
+        session.query("CREATE (n:Temp {value: 42})")
         db.flush()
-        results = db.query("MATCH (n:Temp) RETURN n.value AS value")
+        results = session.query("MATCH (n:Temp) RETURN n.value AS value")
         assert len(results) == 1
         assert results[0]["value"] == 42
 
 
-class TestDatabaseBuilderConfiguration:
+class TestUniBuilderConfiguration:
     """Tests for database builder configuration options."""
 
     def test_cache_size(self):
@@ -117,7 +125,7 @@ class TestDatabaseBuilderConfiguration:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "testdb")
             db = (
-                uni_db.DatabaseBuilder.create(path)
+                uni_db.UniBuilder.create(path)
                 .cache_size(1024 * 1024 * 100)  # 100 MB
                 .build()
             )
@@ -127,7 +135,7 @@ class TestDatabaseBuilderConfiguration:
         """Test setting parallelism level."""
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "testdb")
-            db = uni_db.DatabaseBuilder.create(path).parallelism(4).build()
+            db = uni_db.UniBuilder.create(path).parallelism(4).build()
             assert db is not None
 
     def test_chained_configuration(self):
@@ -135,30 +143,36 @@ class TestDatabaseBuilderConfiguration:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "testdb")
             db = (
-                uni_db.DatabaseBuilder.create(path)
+                uni_db.UniBuilder.create(path)
                 .cache_size(1024 * 1024 * 50)
                 .parallelism(2)
                 .build()
             )
             assert db is not None
             # Verify database works
-            db.create_label("Test")
-            db.execute("CREATE (n:Test)")
+            db.schema().label("Test").apply()
+            session = db.session()
+            tx = session.tx()
+            tx.execute("CREATE (n:Test)")
+            tx.commit()
             db.flush()
-            results = db.query("MATCH (n:Test) RETURN n")
+            results = session.query("MATCH (n:Test) RETURN n")
             assert len(results) == 1
 
 
 class TestBackwardCompatibility:
-    """Tests for backward compatibility with Database() constructor."""
+    """Tests for backward compatibility with Uni() constructor."""
 
     def test_database_constructor(self):
-        """Test that Database(path) constructor still works."""
+        """Test that Uni.open(path) static factory works."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            db = uni_db.Database(tmpdir)
+            db = uni_db.Uni.open(tmpdir)
             assert db is not None
-            db.create_label("Legacy")
-            db.execute("CREATE (n:Legacy)")
+            db.schema().label("Legacy").apply()
+            session = db.session()
+            tx = session.tx()
+            tx.execute("CREATE (n:Legacy)")
+            tx.commit()
             db.flush()
-            results = db.query("MATCH (n:Legacy) RETURN n")
+            results = session.query("MATCH (n:Legacy) RETURN n")
             assert len(results) == 1

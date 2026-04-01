@@ -233,6 +233,7 @@ async fn execute_foreach_inner(
                     pm,
                     params,
                     ctx,
+                    mutation_ctx.tx_l0_override.as_ref(),
                 )
                 .await
                 .map_err(|e| df_err("body execution failed", &e))?;

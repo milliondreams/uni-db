@@ -283,13 +283,13 @@ pub fn cypher_expr_to_df(expr: &Expr, context: Option<&TranslationContext>) -> R
         Expr::PatternComprehension { .. } => Err(anyhow!(
             "Pattern comprehensions require fallback executor (graph traversal)"
         )),
-        // TODO: Resolve wildcard to concrete expressions per DataFusion guidance
-        // See: https://github.com/apache/datafusion/issues/7765
-        #[expect(deprecated)]
-        Expr::Wildcard => Ok(DfExpr::Wildcard {
-            qualifier: None,
-            options: Default::default(),
-        }),
+        // count(*) is the only Cypher path that produces Expr::Wildcard here;
+        // RETURN * expansion is handled at the planner level.  Map to literal 1
+        // so count(*) → count(1), avoiding the deprecated DfExpr::Wildcard.
+        Expr::Wildcard => Ok(DfExpr::Literal(
+            datafusion::common::ScalarValue::Int32(Some(1)),
+            None,
+        )),
 
         Expr::Variable(name) => {
             // Priority 1: Known structural variable (Node/Edge/Path)
@@ -912,7 +912,34 @@ fn translate_list_literal(items: &[Expr], context: Option<&TranslationContext>) 
             promoted_args,
         ))
     } else {
-        Ok(datafusion::functions_nested::expr_fn::make_array(df_args))
+        // When the list contains Null-typed literals mixed with typed values,
+        // cast the nulls to the dominant non-null type so that make_array's
+        // planned return type matches its runtime return type (DF 52+).
+        let non_null_type = df_args.iter().find_map(|e| {
+            if let DfExpr::Literal(sv, _) = e {
+                let dt = sv.data_type();
+                if dt != datafusion::arrow::datatypes::DataType::Null {
+                    return Some(dt);
+                }
+            }
+            None
+        });
+        if let Some(ref target_type) = non_null_type {
+            let coerced = df_args
+                .into_iter()
+                .map(|e| {
+                    if matches!(&e, DfExpr::Literal(sv, _) if sv.data_type() == datafusion::arrow::datatypes::DataType::Null)
+                    {
+                        cast_expr(e, target_type.clone())
+                    } else {
+                        e
+                    }
+                })
+                .collect();
+            Ok(datafusion::functions_nested::expr_fn::make_array(coerced))
+        } else {
+            Ok(datafusion::functions_nested::expr_fn::make_array(df_args))
+        }
     }
 }
 
@@ -2102,7 +2129,25 @@ fn translate_function_call(
     match name_upper.as_str() {
         "COALESCE" => {
             require_arg(&df_args, "coalesce")?;
-            return Ok(datafusion::functions::expr_fn::coalesce(df_args));
+            // DF 52+ rewrites coalesce → CASE WHEN during simplification, but
+            // our plans may bypass the optimizer. Build the CASE directly:
+            //   CASE WHEN a1 IS NOT NULL THEN a1
+            //        WHEN a2 IS NOT NULL THEN a2 ... ELSE last END
+            if df_args.len() == 1 {
+                return Ok(df_args.into_iter().next().unwrap());
+            }
+            let n = df_args.len();
+            let (init, last) = df_args.split_at(n - 1);
+            let mut builder = datafusion::logical_expr::conditional_expressions::CaseBuilder::new(
+                None,
+                vec![],
+                vec![],
+                None,
+            );
+            for arg in init {
+                builder.when(arg.clone().is_not_null(), arg.clone());
+            }
+            return Ok(builder.otherwise(last[0].clone())?);
         }
         "NULLIF" => {
             require_args(&df_args, 2, "nullif")?;

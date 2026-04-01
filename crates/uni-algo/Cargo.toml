@@ -20,5 +20,4 @@ rayon = { workspace = true }
 fxhash = { workspace = true }
 rand = { workspace = true }
 arrow-array = { workspace = true }
-lancedb = { workspace = true }
 async-stream = "0.3"

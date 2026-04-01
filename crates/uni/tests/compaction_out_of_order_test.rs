@@ -7,11 +7,13 @@
 use arrow_array::{
     LargeBinaryArray, RecordBatch, TimestampNanosecondArray, UInt8Array, UInt64Array,
 };
+use std::collections::HashMap;
 use std::sync::Arc;
 use tempfile::tempdir;
 use uni_db::core::id::{Eid, Vid};
 use uni_db::core::schema::SchemaManager;
 use uni_db::storage::compaction::Compactor;
+use uni_db::storage::main_edge::MainEdgeDataset;
 use uni_db::storage::manager::StorageManager;
 
 #[tokio::test]
@@ -46,7 +48,6 @@ async fn test_out_of_order_delta_operations() -> anyhow::Result<()> {
 
     let delta_ds = storage.delta_dataset("knows", "fwd")?;
     let arrow_schema = delta_ds.get_arrow_schema(&schema_manager.schema())?;
-    let lancedb_store = storage.lancedb_store();
 
     // Batch 1: Delete(eid=1, version=2) - later operation written first
     use arrow_array::LargeBinaryArray;
@@ -64,7 +65,7 @@ async fn test_out_of_order_delta_operations() -> anyhow::Result<()> {
         ],
     )?;
 
-    delta_ds.write_run_lancedb(lancedb_store, batch1).await?;
+    delta_ds.write_run(storage.backend(), batch1).await?;
 
     // Batch 2: Insert(eid=1, version=1) - earlier operation written second
     let batch2 = RecordBatch::try_new(
@@ -81,7 +82,20 @@ async fn test_out_of_order_delta_operations() -> anyhow::Result<()> {
         ],
     )?;
 
-    delta_ds.write_run_lancedb(lancedb_store, batch2).await?;
+    delta_ds.write_run(storage.backend(), batch2).await?;
+
+    // 2b. Populate main_edges so the dual-write invariant holds
+    let main_edges = vec![(
+        eid1,
+        vid_a,
+        vid_b,
+        "knows".to_string(),
+        HashMap::new(),
+        false,
+        1u64,
+    )];
+    let main_batch = MainEdgeDataset::build_record_batch(&main_edges, None, None)?;
+    MainEdgeDataset::write_batch(storage.backend(), main_batch).await?;
 
     // 3. Run Compaction
     let _ = compactor
@@ -90,7 +104,9 @@ async fn test_out_of_order_delta_operations() -> anyhow::Result<()> {
 
     // 4. Verify: eid=1 should be ABSENT because Delete(v=2) wins over Insert(v=1)
     let adj_ds = storage.adjacency_dataset("knows", "Person", "fwd")?;
-    let l2_data = adj_ds.read_adjacency_lancedb(lancedb_store, vid_a).await?;
+    let l2_data = adj_ds
+        .read_adjacency_backend(storage.backend(), vid_a)
+        .await?;
 
     // The edge should not exist after compaction
     assert!(
@@ -128,7 +144,6 @@ async fn test_multiple_out_of_order_operations() -> anyhow::Result<()> {
 
     let delta_ds = storage.delta_dataset("knows", "fwd")?;
     let arrow_schema = delta_ds.get_arrow_schema(&schema_manager.schema())?;
-    let lancedb_store = storage.lancedb_store();
 
     // Write operations in scrambled order:
     // 1. Delete(eid1, v=3) - should win
@@ -158,8 +173,32 @@ async fn test_multiple_out_of_order_operations() -> anyhow::Result<()> {
             ],
         )?;
 
-        delta_ds.write_run_lancedb(lancedb_store, batch).await?;
+        delta_ds.write_run(storage.backend(), batch).await?;
     }
+
+    // Populate main_edges so the dual-write invariant holds
+    let main_edges = vec![
+        (
+            eid1,
+            vid_a,
+            vid_b,
+            "knows".to_string(),
+            HashMap::new(),
+            false,
+            1u64,
+        ),
+        (
+            eid2,
+            vid_a,
+            vid_c,
+            "knows".to_string(),
+            HashMap::new(),
+            false,
+            2u64,
+        ),
+    ];
+    let main_batch = MainEdgeDataset::build_record_batch(&main_edges, None, None)?;
+    MainEdgeDataset::write_batch(storage.backend(), main_batch).await?;
 
     // Run Compaction
     let _ = compactor
@@ -168,7 +207,9 @@ async fn test_multiple_out_of_order_operations() -> anyhow::Result<()> {
 
     // Verify: Only eid2 should exist (eid1 was deleted)
     let adj_ds = storage.adjacency_dataset("knows", "Person", "fwd")?;
-    let l2_data = adj_ds.read_adjacency_lancedb(lancedb_store, vid_a).await?;
+    let l2_data = adj_ds
+        .read_adjacency_backend(storage.backend(), vid_a)
+        .await?;
 
     assert!(l2_data.is_some(), "Should have at least one edge");
     let (neighbors, eids) = l2_data.unwrap();
@@ -206,7 +247,6 @@ async fn test_insert_delete_insert_sequence() -> anyhow::Result<()> {
 
     let delta_ds = storage.delta_dataset("knows", "fwd")?;
     let arrow_schema = delta_ds.get_arrow_schema(&schema_manager.schema())?;
-    let lancedb_store = storage.lancedb_store();
 
     // Write in reverse order to test sorting
     let operations = vec![
@@ -230,8 +270,21 @@ async fn test_insert_delete_insert_sequence() -> anyhow::Result<()> {
             ],
         )?;
 
-        delta_ds.write_run_lancedb(lancedb_store, batch).await?;
+        delta_ds.write_run(storage.backend(), batch).await?;
     }
+
+    // Populate main_edges so the dual-write invariant holds
+    let main_edges = vec![(
+        eid1,
+        vid_a,
+        vid_b,
+        "knows".to_string(),
+        HashMap::new(),
+        false,
+        1u64,
+    )];
+    let main_batch = MainEdgeDataset::build_record_batch(&main_edges, None, None)?;
+    MainEdgeDataset::write_batch(storage.backend(), main_batch).await?;
 
     // Run Compaction
     let _ = compactor
@@ -240,7 +293,9 @@ async fn test_insert_delete_insert_sequence() -> anyhow::Result<()> {
 
     // Verify: Edge should exist (Insert(v=3) wins over Delete(v=2))
     let adj_ds = storage.adjacency_dataset("knows", "Person", "fwd")?;
-    let l2_data = adj_ds.read_adjacency_lancedb(lancedb_store, vid_a).await?;
+    let l2_data = adj_ds
+        .read_adjacency_backend(storage.backend(), vid_a)
+        .await?;
 
     assert!(l2_data.is_some(), "Edge should exist after Insert(v=3)");
     let (neighbors, eids) = l2_data.unwrap();

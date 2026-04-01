@@ -2027,10 +2027,6 @@ pub enum LogicalPlan {
     CreateConstraint(CreateConstraint),
     DropConstraint(DropConstraint),
     ShowConstraints(ShowConstraints),
-    // Transaction Plans
-    Begin,
-    Commit,
-    Rollback,
     /// Bind a zero-length path (single node pattern with path variable).
     /// E.g., `p = (a)` creates a Path with one node and zero edges.
     BindZeroLengthPath {
@@ -2355,7 +2351,6 @@ impl QueryPlanner {
                 })
             }
             Query::Schema(cmd) => self.plan_schema_command(*cmd),
-            Query::Transaction(cmd) => self.plan_transaction_command(cmd),
             Query::Explain(inner) => {
                 let inner_plan = self.plan_with_scope(*inner, vars)?;
                 Ok(LogicalPlan::Explain {
@@ -2377,7 +2372,7 @@ impl QueryPlanner {
             }
             Query::Explain(inner) => Self::collect_union_modes(inner, out),
             Query::TimeTravel { query, .. } => Self::collect_union_modes(query, out),
-            Query::Single(_) | Query::Schema(_) | Query::Transaction(_) => {}
+            Query::Single(_) | Query::Schema(_) => {}
         }
     }
 
@@ -7306,18 +7301,6 @@ impl QueryPlanner {
                 format: cmd.format,
                 options: cmd.options,
             }),
-        }
-    }
-
-    fn plan_transaction_command(
-        &self,
-        cmd: uni_cypher::ast::TransactionCommand,
-    ) -> Result<LogicalPlan> {
-        use uni_cypher::ast::TransactionCommand;
-        match cmd {
-            TransactionCommand::Begin => Ok(LogicalPlan::Begin),
-            TransactionCommand::Commit => Ok(LogicalPlan::Commit),
-            TransactionCommand::Rollback => Ok(LogicalPlan::Rollback),
         }
     }
 

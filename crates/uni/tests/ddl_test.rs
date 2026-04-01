@@ -9,8 +9,9 @@ async fn test_ddl_procedures() -> Result<()> {
     let db = Uni::temporary().build().await?;
 
     // 1. Create Label
-    db.query(
-        r#"
+    db.session()
+        .query(
+            r#"
         CALL uni.schema.createLabel('Product', {
             "properties": {
                 "name": { "type": "STRING" },
@@ -25,8 +26,8 @@ async fn test_ddl_procedures() -> Result<()> {
             ]
         })
     "#,
-    )
-    .await?;
+        )
+        .await?;
 
     assert!(db.label_exists("Product").await?);
 
@@ -48,39 +49,42 @@ async fn test_ddl_procedures() -> Result<()> {
     );
 
     // 2. Create Edge Type
-    db.query(
-        r#"
+    db.session()
+        .query(
+            r#"
         CALL uni.schema.createEdgeType('RELATED_TO', ['Product'], ['Product'], {
             "properties": {
                 "weight": { "type": "FLOAT" }
             }
         })
     "#,
-    )
-    .await?;
+        )
+        .await?;
     assert!(db.edge_type_exists("RELATED_TO").await?);
 
     // 3. Create Index separately
-    db.query(
-        r#"
+    db.session()
+        .query(
+            r#"
         CALL uni.schema.createIndex('Product', 'price', {
             "type": "BTREE",
             "name": "idx_price"
         })
     "#,
-    )
-    .await?;
+        )
+        .await?;
 
     let info_updated = db.get_label_info("Product").await?.unwrap();
     assert!(info_updated.indexes.iter().any(|i| i.name == "idx_price"));
 
     // 4. Create Constraint separately
-    db.query(
-        r#"
+    db.session()
+        .query(
+            r#"
         CALL uni.schema.createConstraint('Product', 'EXISTS', ['price'])
     "#,
-    )
-    .await?;
+        )
+        .await?;
     let info_updated_2 = db.get_label_info("Product").await?.unwrap();
     assert!(
         info_updated_2
@@ -90,7 +94,9 @@ async fn test_ddl_procedures() -> Result<()> {
     );
 
     // 5. Drop Index
-    db.query("CALL uni.schema.dropIndex('idx_price')").await?;
+    db.session()
+        .query("CALL uni.schema.dropIndex('idx_price')")
+        .await?;
     let info_dropped_idx = db.get_label_info("Product").await?.unwrap();
     assert!(
         !info_dropped_idx
@@ -100,7 +106,9 @@ async fn test_ddl_procedures() -> Result<()> {
     );
 
     // 6. Drop Label
-    db.query("CALL uni.schema.dropLabel('Product')").await?;
+    db.session()
+        .query("CALL uni.schema.dropLabel('Product')")
+        .await?;
     assert!(!db.label_exists("Product").await?);
 
     Ok(())
@@ -112,6 +120,7 @@ async fn test_ddl_validation() -> Result<()> {
 
     // Invalid identifier
     let res = db
+        .session()
         .query("CALL uni.schema.createLabel('Invalid-Name!', {})")
         .await;
     assert!(res.is_err());
@@ -122,12 +131,16 @@ async fn test_ddl_validation() -> Result<()> {
     );
 
     // Reserved word
-    let res = db.query("CALL uni.schema.createLabel('MATCH', {})").await;
+    let res = db
+        .session()
+        .query("CALL uni.schema.createLabel('MATCH', {})")
+        .await;
     assert!(res.is_err());
     assert!(res.unwrap_err().to_string().contains("reserved word"));
 
     // Invalid Data Type
     let res = db
+        .session()
         .query(
             r#"
         CALL uni.schema.createLabel('ValidName', {

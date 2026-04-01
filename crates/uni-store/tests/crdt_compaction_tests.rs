@@ -88,14 +88,14 @@ mod basic_compaction {
         // Version 1: actor1 = 10
         let props1 = HashMap::from([("count".to_string(), gcounter_val(&[("actor1", 10)]))]);
         let _ = writer
-            .insert_vertex_with_labels(vid, props1, &["Counter".to_string()])
+            .insert_vertex_with_labels(vid, props1, &["Counter".to_string()], None)
             .await?;
         writer.flush_to_l1(None).await?;
 
         // Version 2: actor2 = 20
         let props2 = HashMap::from([("count".to_string(), gcounter_val(&[("actor2", 20)]))]);
         let _ = writer
-            .insert_vertex_with_labels(vid, props2, &["Counter".to_string()])
+            .insert_vertex_with_labels(vid, props2, &["Counter".to_string()], None)
             .await?;
         writer.flush_to_l1(None).await?;
 
@@ -149,7 +149,7 @@ mod basic_compaction {
                 gcounter_val(&[(&actor, (i + 1) as u64 * 10)]),
             )]);
             let _ = writer
-                .insert_vertex_with_labels(vid, props, &["Counter".to_string()])
+                .insert_vertex_with_labels(vid, props, &["Counter".to_string()], None)
                 .await?;
             writer.flush_to_l1(None).await?;
         }
@@ -205,12 +205,12 @@ mod tombstone_handling {
         // Create vertex with CRDT
         let props = HashMap::from([("count".to_string(), gcounter_val(&[("actor1", 100)]))]);
         let _ = writer
-            .insert_vertex_with_labels(vid, props, &["Counter".to_string()])
+            .insert_vertex_with_labels(vid, props, &["Counter".to_string()], None)
             .await?;
         writer.flush_to_l1(None).await?;
 
         // Delete vertex
-        writer.delete_vertex(vid, None).await?;
+        writer.delete_vertex(vid, None, None).await?;
         writer.flush_to_l1(None).await?;
 
         // Vertex should be deleted
@@ -269,7 +269,7 @@ mod multiple_crdt_types {
             ("items".to_string(), gset_val(&["x", "y"])),
         ]);
         let _ = writer
-            .insert_vertex_with_labels(vid, props1, &["MultiCrdt".to_string()])
+            .insert_vertex_with_labels(vid, props1, &["MultiCrdt".to_string()], None)
             .await?;
         writer.flush_to_l1(None).await?;
 
@@ -280,7 +280,7 @@ mod multiple_crdt_types {
             ("clock".to_string(), vector_clock_val(&[("n1", 2)])),
         ]);
         let _ = writer
-            .insert_vertex_with_labels(vid, props2, &["MultiCrdt".to_string()])
+            .insert_vertex_with_labels(vid, props2, &["MultiCrdt".to_string()], None)
             .await?;
         writer.flush_to_l1(None).await?;
 
@@ -356,7 +356,7 @@ mod mixed_properties {
             ("score".to_string(), Value::Int(100)),
         ]);
         let _ = writer
-            .insert_vertex_with_labels(vid, props1, &["MixedNode".to_string()])
+            .insert_vertex_with_labels(vid, props1, &["MixedNode".to_string()], None)
             .await?;
         writer.flush_to_l1(None).await?;
 
@@ -367,7 +367,7 @@ mod mixed_properties {
             ("score".to_string(), Value::Int(200)),
         ]);
         let _ = writer
-            .insert_vertex_with_labels(vid, props2, &["MixedNode".to_string()])
+            .insert_vertex_with_labels(vid, props2, &["MixedNode".to_string()], None)
             .await?;
         writer.flush_to_l1(None).await?;
 
@@ -436,7 +436,7 @@ mod large_scale {
 
             let props = HashMap::from([("count".to_string(), gcounter_val(&[(&actor, value)]))]);
             let _ = writer
-                .insert_vertex_with_labels(vid, props, &["Counter".to_string()])
+                .insert_vertex_with_labels(vid, props, &["Counter".to_string()], None)
                 .await?;
             writer.flush_to_l1(None).await?;
         }
@@ -503,24 +503,24 @@ mod edge_compaction {
 
         // Create vertices
         let _ = writer
-            .insert_vertex_with_labels(vid_a, HashMap::new(), &["Node".to_string()])
+            .insert_vertex_with_labels(vid_a, HashMap::new(), &["Node".to_string()], None)
             .await?;
         let _ = writer
-            .insert_vertex_with_labels(vid_b, HashMap::new(), &["Node".to_string()])
+            .insert_vertex_with_labels(vid_b, HashMap::new(), &["Node".to_string()], None)
             .await?;
 
         // Create edge with CRDT weight
         let eid = writer.next_eid(edge_type).await?;
         let props1 = HashMap::from([("weight".to_string(), gcounter_val(&[("a", 5)]))]);
         writer
-            .insert_edge(vid_a, vid_b, edge_type, eid, props1, None)
+            .insert_edge(vid_a, vid_b, edge_type, eid, props1, None, None)
             .await?;
         writer.flush_to_l1(None).await?;
 
         // Update edge weight
         let props2 = HashMap::from([("weight".to_string(), gcounter_val(&[("b", 10)]))]);
         writer
-            .insert_edge(vid_a, vid_b, edge_type, eid, props2, None)
+            .insert_edge(vid_a, vid_b, edge_type, eid, props2, None, None)
             .await?;
         writer.flush_to_l1(None).await?;
 

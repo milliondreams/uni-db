@@ -60,7 +60,9 @@ def _download_zip(cache_dir: Path) -> Path:
     if zip_path.exists():
         return zip_path
 
-    req = urllib.request.Request(SECOM_ZIP_URL, headers={"User-Agent": "uni-locy-data-prep"})
+    req = urllib.request.Request(
+        SECOM_ZIP_URL, headers={"User-Agent": "uni-locy-data-prep"}
+    )
     with urllib.request.urlopen(req) as response:
         zip_path.write_bytes(response.read())
     return zip_path
@@ -198,7 +200,9 @@ def _format_float(value: object) -> str:
     return str(value)
 
 
-def _write_csv(path: Path, fieldnames: list[str], rows: list[dict[str, object]]) -> None:
+def _write_csv(
+    path: Path, fieldnames: list[str], rows: list[dict[str, object]]
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -219,7 +223,9 @@ def main() -> int:
         features = _load_features(zf)
 
     if len(labels) != len(features):
-        raise ValueError(f"Label count ({len(labels)}) != feature row count ({len(features)})")
+        raise ValueError(
+            f"Label count ({len(labels)}) != feature row count ({len(features)})"
+        )
     if not features:
         raise ValueError("No feature rows loaded from SECOM.")
 
@@ -303,7 +309,9 @@ def main() -> int:
         fail_lot_excursions[lot_id] = fail_lot_excursions.get(lot_id, 0) + 1
     notebook_cases_rows = [
         {"lot_id": lot_id, "fail_excursion_count": count}
-        for lot_id, count in sorted(fail_lot_excursions.items(), key=lambda x: (-x[1], x[0]))[:30]
+        for lot_id, count in sorted(
+            fail_lot_excursions.items(), key=lambda x: (-x[1], x[0])
+        )[:30]
     ]
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -374,12 +382,18 @@ def main() -> int:
             "zscore_threshold": args.zscore_threshold,
         },
     }
-    (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    (output_dir / "manifest.json").write_text(
+        json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+    )
 
     print(f"wrote {output_dir / 'secom_lots.csv'} ({len(lots_rows)} rows)")
-    print(f"wrote {output_dir / 'secom_feature_catalog.csv'} ({len(feature_catalog_rows)} rows)")
+    print(
+        f"wrote {output_dir / 'secom_feature_catalog.csv'} ({len(feature_catalog_rows)} rows)"
+    )
     print(f"wrote {output_dir / 'secom_excursions.csv'} ({len(excursion_rows)} rows)")
-    print(f"wrote {output_dir / 'secom_notebook_cases.csv'} ({len(notebook_cases_rows)} rows)")
+    print(
+        f"wrote {output_dir / 'secom_notebook_cases.csv'} ({len(notebook_cases_rows)} rows)"
+    )
     print(f"wrote {output_dir / 'manifest.json'}")
     return 0
 

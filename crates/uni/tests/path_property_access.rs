@@ -60,17 +60,25 @@ async fn test_path_property_access() -> anyhow::Result<()> {
     let mut props_a = HashMap::new();
     props_a.insert("name".to_string(), unival!("Alice"));
     writer
-        .insert_vertex_with_labels(vid_a, props_a, &["Person".to_string()])
+        .insert_vertex_with_labels(vid_a, props_a, &["Person".to_string()], None)
         .await?;
 
     let mut props_b = HashMap::new();
     props_b.insert("name".to_string(), unival!("Bob"));
     writer
-        .insert_vertex_with_labels(vid_b, props_b, &["Person".to_string()])
+        .insert_vertex_with_labels(vid_b, props_b, &["Person".to_string()], None)
         .await?;
 
     writer
-        .insert_edge(vid_a, vid_b, knows_edge, Eid::new(10), HashMap::new(), None)
+        .insert_edge(
+            vid_a,
+            vid_b,
+            knows_edge,
+            Eid::new(10),
+            HashMap::new(),
+            None,
+            None,
+        )
         .await?;
 
     // Keep data in L0 to verify L0 lookup in vectorized engine

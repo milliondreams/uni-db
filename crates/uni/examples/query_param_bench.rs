@@ -46,7 +46,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "CREATE (n:Person {{name: 'Bench_{}', age: 30, embedding: {}}})",
             i, embedding_str
         );
-        db1.execute(&cypher).await?;
+        let s = db1.session();
+        let tx = s.tx().await?;
+        tx.execute(&cypher).await?;
+        tx.commit().await?;
     }
     let duration1 = start.elapsed();
     let per_query1 = duration1.as_micros() as f64 / ITERATIONS as f64;
@@ -69,11 +72,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cypher = "CREATE (n:Person {name: $name, age: $age, embedding: $embedding})";
 
     for i in 0..ITERATIONS {
-        db2.query_with(cypher)
+        db2.session()
+            .query_with(cypher)
             .param("name", Value::String(format!("Bench_{}", i)))
             .param("age", Value::Int(30))
             .param("embedding", embedding_value.clone())
-            .execute()
+            .fetch_all()
             .await?;
     }
     let duration2 = start.elapsed();

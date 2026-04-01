@@ -38,6 +38,8 @@ uni-locy = { workspace = true }
 async-trait = { workspace = true }
 parking_lot = { workspace = true }
 datafusion = { workspace = true }
+tokio-util = { workspace = true }
+scopeguard = "1"
 
 [dev-dependencies]
 criterion = "0.5"
@@ -67,7 +69,8 @@ name = "mutation_benchmarks"
 harness = false
 
 [features]
-default = ["provider-gemini", "provider-openai"]
+default = ["lance-backend", "provider-gemini", "provider-openai"]
+lance-backend = ["uni-store/lance-backend"]
 snapshot-internals = []
 storage-internals = []
 provider-candle = ["uni-xervo/provider-candle"]

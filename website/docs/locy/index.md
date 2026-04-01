@@ -35,7 +35,10 @@ Use plain Cypher when you need direct reads/writes on existing graph state. Use 
 
 ## API Entry Points
 
-- Rust: `db.locy().evaluate(...)` and `db.locy().evaluate_with_config(...)`.
-- Python: `db.locy_evaluate(...)` and `await adb.locy_evaluate(...)`.
+- **Rust:** `session.locy(program).await?` and the `LocyBuilder` fluent API via `session.locy_with(program).param(...).timeout(...).with_config(...).run().await?`.
+- **Python (sync):** `session.locy(program)` and the fluent API via `session.locy_with(program).param(...).with_config(...).run()`.
+- **Python (async):** `await session.locy(program)` and `await session.locy_with(program).run()`.
+
+Sessions are created from a `Uni` instance: `session = db.session()`.
 
 See [Rust API Integration](api/rust.md) and [Python API Integration](api/python.md).

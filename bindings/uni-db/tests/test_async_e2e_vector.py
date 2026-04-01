@@ -10,7 +10,9 @@ import pytest
 async def test_basic_vector_search_knn(async_ecommerce_db_populated):
     """Test basic K-NN vector search returns top k results."""
 
-    results = await async_ecommerce_db_populated.query("""
+    session = async_ecommerce_db_populated.session()
+
+    results = await session.query("""
         CALL uni.vector.query('Product', 'embedding', [1.0, 0.0, 0.0, 0.0], 3)
         YIELD vid, distance
         RETURN vid, distance
@@ -23,7 +25,9 @@ async def test_basic_vector_search_knn(async_ecommerce_db_populated):
 async def test_vector_search_ordered_by_distance(async_ecommerce_db_populated):
     """Test vector search results are ordered by increasing distance."""
 
-    results = await async_ecommerce_db_populated.query("""
+    session = async_ecommerce_db_populated.session()
+
+    results = await session.query("""
         CALL uni.vector.query('Product', 'embedding', [1.0, 0.0, 0.0, 0.0], 4)
         YIELD vid, distance
         RETURN vid, distance
@@ -40,7 +44,9 @@ async def test_vector_search_ordered_by_distance(async_ecommerce_db_populated):
 async def test_vector_search_vid_and_distance(async_ecommerce_db_populated):
     """Test vector search returns vid and distance with correct types."""
 
-    results = await async_ecommerce_db_populated.query("""
+    session = async_ecommerce_db_populated.session()
+
+    results = await session.query("""
         CALL uni.vector.query('Product', 'embedding', [1.0, 0.0, 0.0, 0.0], 1)
         YIELD vid, distance
         RETURN vid, distance
@@ -58,7 +64,9 @@ async def test_vector_search_vid_and_distance(async_ecommerce_db_populated):
 async def test_vector_search_with_k(async_ecommerce_db_populated):
     """Test vector search with different k values."""
 
-    results = await async_ecommerce_db_populated.query("""
+    session = async_ecommerce_db_populated.session()
+
+    results = await session.query("""
         CALL uni.vector.query('Product', 'embedding', [1.0, 0.0, 0.0, 0.0], 2)
         YIELD vid, distance
         RETURN vid, distance
@@ -71,8 +79,10 @@ async def test_vector_search_with_k(async_ecommerce_db_populated):
 async def test_vector_search_with_threshold(async_ecommerce_db_populated):
     """Test vector search with distance threshold filtering."""
 
+    session = async_ecommerce_db_populated.session()
+
     # Small threshold: only very close matches
-    results_tight = await async_ecommerce_db_populated.query("""
+    results_tight = await session.query("""
         CALL uni.vector.query('Product', 'embedding', [1.0, 0.0, 0.0, 0.0], 10, NULL, 0.5)
         YIELD vid, distance
         RETURN vid, distance
@@ -83,7 +93,7 @@ async def test_vector_search_with_threshold(async_ecommerce_db_populated):
     )
 
     # Larger threshold: more results
-    results_wide = await async_ecommerce_db_populated.query("""
+    results_wide = await session.query("""
         CALL uni.vector.query('Product', 'embedding', [1.0, 0.0, 0.0, 0.0], 10, NULL, 2.0)
         YIELD vid, distance
         RETURN vid, distance
@@ -98,7 +108,9 @@ async def test_vector_search_with_threshold(async_ecommerce_db_populated):
 async def test_vector_search_fetch_nodes(async_ecommerce_db_populated):
     """Test vector search with YIELD node to get full node properties."""
 
-    results = await async_ecommerce_db_populated.query("""
+    session = async_ecommerce_db_populated.session()
+
+    results = await session.query("""
         CALL uni.vector.query('Product', 'embedding', [1.0, 0.0, 0.0, 0.0], 3)
         YIELD node, distance
         RETURN node.name AS name, node.price AS price, distance
@@ -119,7 +131,9 @@ async def test_fetch_nodes_returns_properties_and_distance(
 ):
     """Test fetch_nodes returns node properties and ordered distances."""
 
-    results = await async_ecommerce_db_populated.query("""
+    session = async_ecommerce_db_populated.session()
+
+    results = await session.query("""
         CALL uni.vector.query('Product', 'embedding', [1.0, 0.0, 0.0, 0.0], 2)
         YIELD node, distance
         RETURN node.name AS name, node.price AS price, distance
@@ -142,20 +156,23 @@ async def test_cosine_metric_index(async_empty_db):
         .apply()
     )
 
-    await async_empty_db.execute(
-        "CREATE (d:CosineDoc {title: 'Doc1', vec: [1.0, 0.0, 0.0]})"
-    )
-    await async_empty_db.execute(
-        "CREATE (d:CosineDoc {title: 'Doc2', vec: [0.0, 1.0, 0.0]})"
-    )
-    await async_empty_db.execute(
-        "CREATE (d:CosineDoc {title: 'Doc3', vec: [0.707, 0.707, 0.0]})"
-    )
+    session = async_empty_db.session()
+
+    tx = await session.tx()
+    await tx.execute("CREATE (d:CosineDoc {title: 'Doc1', vec: [1.0, 0.0, 0.0]})")
+    await tx.execute("CREATE (d:CosineDoc {title: 'Doc2', vec: [0.0, 1.0, 0.0]})")
+    await tx.execute("CREATE (d:CosineDoc {title: 'Doc3', vec: [0.707, 0.707, 0.0]})")
+    await tx.commit()
     await async_empty_db.flush()
 
-    await async_empty_db.create_vector_index("CosineDoc", "vec", "cosine")
+    await (
+        async_empty_db.schema()
+        .label("CosineDoc")
+        .index("vec", {"type": "vector", "metric": "cosine"})
+        .apply()
+    )
 
-    results = await async_empty_db.query("""
+    results = await session.query("""
         CALL uni.vector.query('CosineDoc', 'vec', [1.0, 0.0, 0.0], 3)
         YIELD node, distance
         RETURN node.title AS title, distance
@@ -172,7 +189,9 @@ async def test_cosine_metric_index(async_empty_db):
 async def test_vector_search_with_graph_traversal(async_ecommerce_db_populated):
     """Test combining vector search with graph traversal."""
 
-    results = await async_ecommerce_db_populated.query("""
+    session = async_ecommerce_db_populated.session()
+
+    results = await session.query("""
         CALL uni.vector.query('Product', 'embedding', [1.0, 0.0, 0.0, 0.0], 3)
         YIELD node, distance
         MATCH (node)-[:IN_CATEGORY]->(c:Category)
@@ -186,8 +205,10 @@ async def test_vector_search_with_graph_traversal(async_ecommerce_db_populated):
 async def test_vector_search_with_filter_expression(async_ecommerce_db_populated):
     """Test vector search with pre-filter expression."""
 
+    session = async_ecommerce_db_populated.session()
+
     # Filter for expensive products (price > 500)
-    results_expensive = await async_ecommerce_db_populated.query("""
+    results_expensive = await session.query("""
         CALL uni.vector.query('Product', 'embedding', [1.0, 0.0, 0.0, 0.0], 10, 'price > 500')
         YIELD node, distance
         RETURN node.name AS name, node.price AS price, distance
@@ -197,7 +218,7 @@ async def test_vector_search_with_filter_expression(async_ecommerce_db_populated
         assert row["price"] > 500, f"Product {row['name']} should have price > 500"
 
     # Filter for cheap products (price < 100)
-    results_cheap = await async_ecommerce_db_populated.query("""
+    results_cheap = await session.query("""
         CALL uni.vector.query('Product', 'embedding', [1.0, 0.0, 0.0, 0.0], 10, 'price < 100')
         YIELD node, distance
         RETURN node.name AS name, node.price AS price, distance
@@ -226,22 +247,31 @@ async def test_vector_search_empty_results(async_empty_db):
         .apply()
     )
 
-    await async_empty_db.create_vector_index("EmptyLabel", "vec", "l2")
+    await (
+        async_empty_db.schema()
+        .label("EmptyLabel")
+        .index("vec", {"type": "vector", "metric": "l2"})
+        .apply()
+    )
 
-    results = await async_empty_db.query("""
+    session = async_empty_db.session()
+
+    results = await session.query("""
         CALL uni.vector.query('EmptyLabel', 'vec', [1.0, 0.0, 0.0, 0.0], 5)
         YIELD vid, distance
         RETURN vid, distance
     """)
 
-    assert results == [], "Should return empty list for label with no data"
+    assert len(results) == 0, "Should return empty result for label with no data"
 
 
 @pytest.mark.asyncio
 async def test_vector_search_k_larger_than_dataset(async_ecommerce_db_populated):
     """Test vector search with k larger than available nodes."""
 
-    results = await async_ecommerce_db_populated.query("""
+    session = async_ecommerce_db_populated.session()
+
+    results = await session.query("""
         CALL uni.vector.query('Product', 'embedding', [1.0, 0.0, 0.0, 0.0], 100)
         YIELD vid, distance
         RETURN vid, distance
@@ -257,8 +287,10 @@ async def test_vector_search_threshold_excludes_distant_results(
 ):
     """Test threshold properly excludes results beyond distance limit."""
 
+    session = async_ecommerce_db_populated.session()
+
     # Search for Book [0,0,1,0] with very tight threshold
-    results = await async_ecommerce_db_populated.query("""
+    results = await session.query("""
         CALL uni.vector.query('Product', 'embedding', [0.0, 0.0, 1.0, 0.0], 10, NULL, 0.1)
         YIELD node, distance
         RETURN node.name AS name, distance
@@ -273,13 +305,15 @@ async def test_vector_search_threshold_excludes_distant_results(
 async def test_vector_search_chained_constraints(async_ecommerce_db_populated):
     """Test vector search with both filter and threshold."""
 
-    results = await async_ecommerce_db_populated.query("""
+    session = async_ecommerce_db_populated.session()
+
+    results = await session.query("""
         CALL uni.vector.query('Product', 'embedding', [1.0, 0.0, 0.0, 0.0], 5, 'price > 0', 1.5)
         YIELD node, distance
         RETURN node.name AS name, node.price AS price, distance
     """)
 
-    assert isinstance(results, list)
+    assert len(results) >= 0
     for row in results:
         assert row["distance"] <= 1.5, "Distance should be within threshold"
         assert row["price"] > 0, "Price should satisfy filter"
@@ -298,20 +332,23 @@ async def test_vector_search_different_dimensions(async_empty_db):
         .apply()
     )
 
-    await async_empty_db.execute(
-        "CREATE (d:Doc5D {name: 'A', vec5: [1.0, 0.0, 0.0, 0.0, 0.0]})"
-    )
-    await async_empty_db.execute(
-        "CREATE (d:Doc5D {name: 'B', vec5: [0.0, 1.0, 0.0, 0.0, 0.0]})"
-    )
-    await async_empty_db.execute(
-        "CREATE (d:Doc5D {name: 'C', vec5: [0.0, 0.0, 1.0, 0.0, 0.0]})"
-    )
+    session = async_empty_db.session()
+
+    tx = await session.tx()
+    await tx.execute("CREATE (d:Doc5D {name: 'A', vec5: [1.0, 0.0, 0.0, 0.0, 0.0]})")
+    await tx.execute("CREATE (d:Doc5D {name: 'B', vec5: [0.0, 1.0, 0.0, 0.0, 0.0]})")
+    await tx.execute("CREATE (d:Doc5D {name: 'C', vec5: [0.0, 0.0, 1.0, 0.0, 0.0]})")
+    await tx.commit()
     await async_empty_db.flush()
 
-    await async_empty_db.create_vector_index("Doc5D", "vec5", "l2")
+    await (
+        async_empty_db.schema()
+        .label("Doc5D")
+        .index("vec5", {"type": "vector", "metric": "l2"})
+        .apply()
+    )
 
-    results = await async_empty_db.query("""
+    results = await session.query("""
         CALL uni.vector.query('Doc5D', 'vec5', [1.0, 0.0, 0.0, 0.0, 0.0], 2)
         YIELD vid, distance
         RETURN vid, distance
@@ -334,13 +371,22 @@ async def test_create_vector_index_l2(async_empty_db):
         .apply()
     )
 
-    await async_empty_db.execute("CREATE (:Item {name: 'Item1', vec: [1.0, 2.0, 3.0]})")
-    await async_empty_db.execute("CREATE (:Item {name: 'Item2', vec: [2.0, 3.0, 4.0]})")
+    session = async_empty_db.session()
+
+    tx = await session.tx()
+    await tx.execute("CREATE (:Item {name: 'Item1', vec: [1.0, 2.0, 3.0]})")
+    await tx.execute("CREATE (:Item {name: 'Item2', vec: [2.0, 3.0, 4.0]})")
+    await tx.commit()
     await async_empty_db.flush()
 
-    await async_empty_db.create_vector_index("Item", "vec", "l2")
+    await (
+        async_empty_db.schema()
+        .label("Item")
+        .index("vec", {"type": "vector", "metric": "l2"})
+        .apply()
+    )
 
-    results = await async_empty_db.query("""
+    results = await session.query("""
         CALL uni.vector.query('Item', 'vec', [1.5, 2.5, 3.5], 2)
         YIELD vid, distance
         RETURN vid, distance

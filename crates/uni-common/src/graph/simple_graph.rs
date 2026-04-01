@@ -31,7 +31,7 @@ type FxHashMap<K, V> = HashMap<K, V, FxBuildHasher>;
 ///
 /// Stores outgoing and incoming edge lists per vertex for O(degree) traversal,
 /// plus a direct Eid-to-edge map for O(1) edge lookup.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct SimpleGraph {
     /// Set of vertices in the graph
     vertices: FxHashMap<Vid, ()>,

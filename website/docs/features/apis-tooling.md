@@ -16,7 +16,8 @@ Uni provides first-class Rust and Python APIs, plus a CLI for exploration and sc
 
     # async fn demo() -> Result<(), uni_db::UniError> {
     let db = Uni::open("./my_db").build().await?;
-    let rows = db.query("MATCH (n) RETURN count(n)").await?;
+    let session = db.session();
+    let rows = session.query("MATCH (n) RETURN count(n)").await?;
     println!("{:?}", rows);
     # Ok(())
     # }
@@ -26,8 +27,9 @@ Uni provides first-class Rust and Python APIs, plus a CLI for exploration and sc
     ```python
     import uni_db
 
-    db = uni_db.Database("./my_db")
-    rows = db.query("MATCH (n) RETURN count(n)")
+    db = uni_db.Uni.open("./my_db")
+    session = db.session()
+    rows = session.query("MATCH (n) RETURN count(n)")
     print(rows)
     ```
 

@@ -12,7 +12,7 @@ use std::time::Instant;
 use uni_common::Value;
 use uni_cypher::ast::{CypherLiteral, Expr, ReturnItem};
 use uni_cypher::locy_ast::GoalQuery;
-use uni_locy::{CompiledProgram, LocyConfig, LocyError, LocyStats, Row};
+use uni_locy::{CompiledProgram, FactRow, LocyConfig, LocyError, LocyStats};
 
 use super::locy_delta::RowStore;
 
@@ -29,10 +29,10 @@ pub async fn evaluate_query(
     program: &CompiledProgram,
     fact_source: &dyn DerivedFactSource,
     config: &LocyConfig,
-    _derived_store: &mut RowStore,
+    derived_store: &mut RowStore,
     stats: &mut LocyStats,
     start: Instant,
-) -> Result<Vec<Row>, LocyError> {
+) -> Result<Vec<FactRow>, LocyError> {
     let rule_name = query.rule_name.to_string();
     let rule =
         program
@@ -55,6 +55,19 @@ pub async fn evaluate_query(
         None => std::collections::HashMap::new(),
     };
 
+    // For FOLD rules (MNOR/MPROD/SUM), the SLG resolver does not apply
+    // post-fixpoint aggregation and would return raw pre-FOLD match rows.
+    // Use pre-computed facts from derived_store (which ran the full native
+    // fixpoint including FOLD aggregation) when available.
+    // KEY columns in derived_store rows are VIDs (not full Node objects),
+    // so property-based WHERE filters are skipped; only RETURN projection
+    // is applied.
+    let is_fold_rule = rule.clauses.iter().any(|c| !c.fold.is_empty());
+    if is_fold_rule && derived_store.contains_key(&rule_name) {
+        let rows = derived_store[&rule_name].rows.clone();
+        return apply_return_clause(rows, &query.return_clause, &config.params);
+    }
+
     // Use a fresh store rather than the pre-computed orch_store.
     // The native fixpoint stores node columns as VIDs (UInt64), not full node objects,
     // so orch_store rows would fail property-based WHERE/RETURN evaluation (a.name etc.).
@@ -69,7 +82,7 @@ pub async fn evaluate_query(
 
     // Apply WHERE filter (SLG may return superset if goal bindings are partial).
     // Params are injected into each row so $name references resolve correctly.
-    let filtered: Vec<Row> = if let Some(where_expr) = &query.where_expr {
+    let filtered: Vec<FactRow> = if let Some(where_expr) = &query.where_expr {
         results
             .into_iter()
             .filter(|row| {
@@ -89,10 +102,10 @@ pub async fn evaluate_query(
 
 /// Apply a RETURN clause (projection, ordering, skip, limit) to results.
 pub(super) fn apply_return_clause(
-    rows: Vec<Row>,
+    rows: Vec<FactRow>,
     return_clause: &Option<uni_cypher::ast::ReturnClause>,
     params: &HashMap<String, Value>,
-) -> Result<Vec<Row>, LocyError> {
+) -> Result<Vec<FactRow>, LocyError> {
     let rc = match return_clause {
         Some(rc) => rc,
         None => return Ok(rows),
@@ -100,11 +113,11 @@ pub(super) fn apply_return_clause(
 
     // Project columns. Params are merged into each row so $name references
     // in RETURN expressions (e.g. RETURN $agent_id AS id) resolve correctly.
-    let mut projected: Vec<Row> = rows
+    let mut projected: Vec<FactRow> = rows
         .into_iter()
         .map(|row| {
             let merged = merge_params(&row, params);
-            let mut new_row = Row::new();
+            let mut new_row = FactRow::new();
             for item in &rc.items {
                 match item {
                     ReturnItem::All => return Ok(row.clone()),
@@ -169,8 +182,8 @@ pub(super) fn apply_return_clause(
 /// resolve `$name` references during in-memory expression evaluation.
 ///
 /// Row values take precedence — parameters only fill in keys that are absent.
-fn merge_params(row: &Row, params: &HashMap<String, Value>) -> Row {
-    let mut merged: Row = params.clone();
+pub(super) fn merge_params(row: &FactRow, params: &HashMap<String, Value>) -> FactRow {
+    let mut merged: FactRow = params.clone();
     merged.extend(row.iter().map(|(k, v)| (k.clone(), v.clone())));
     merged
 }

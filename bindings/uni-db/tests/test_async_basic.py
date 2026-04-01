@@ -17,13 +17,22 @@ def test_dir(tmp_path):
 @pytest.mark.asyncio
 async def test_async_open_and_query(test_dir):
     """Test basic open, create label, insert, and query."""
-    db = await uni_db.AsyncDatabase.open(test_dir)
-    await db.create_label("Person")
-    await db.add_property("Person", "name", "string", False)
-    await db.add_property("Person", "age", "int", False)
-    await db.execute("CREATE (n:Person {name: 'Alice', age: 30})")
+    db = await uni_db.AsyncUni.open(test_dir)
+    session = db.session()
+    await (
+        db.schema()
+        .label("Person")
+        .property("name", "string")
+        .property("age", "int")
+        .apply()
+    )
+    tx = await session.tx()
+    await tx.execute("CREATE (n:Person {name: 'Alice', age: 30})")
+    await tx.commit()
 
-    results = await db.query("MATCH (n:Person) RETURN n.name AS name, n.age AS age")
+    results = await session.query(
+        "MATCH (n:Person) RETURN n.name AS name, n.age AS age"
+    )
     assert len(results) == 1
     assert results[0]["name"] == "Alice"
     assert results[0]["age"] == 30
@@ -32,12 +41,14 @@ async def test_async_open_and_query(test_dir):
 @pytest.mark.asyncio
 async def test_async_temporary():
     """Test temporary in-memory database."""
-    db = await uni_db.AsyncDatabase.temporary()
-    await db.create_label("Thing")
-    await db.add_property("Thing", "value", "int", False)
-    await db.execute("CREATE (n:Thing {value: 42})")
+    db = await uni_db.AsyncUni.temporary()
+    session = db.session()
+    await db.schema().label("Thing").property("value", "int").apply()
+    tx = await session.tx()
+    await tx.execute("CREATE (n:Thing {value: 42})")
+    await tx.commit()
 
-    results = await db.query("MATCH (n:Thing) RETURN n.value AS value")
+    results = await session.query("MATCH (n:Thing) RETURN n.value AS value")
     assert len(results) == 1
     assert results[0]["value"] == 42
 
@@ -45,13 +56,20 @@ async def test_async_temporary():
 @pytest.mark.asyncio
 async def test_async_query_with_params(test_dir):
     """Test parameterized queries."""
-    db = await uni_db.AsyncDatabase.open(test_dir)
-    await db.create_label("Person")
-    await db.add_property("Person", "name", "string", False)
-    await db.add_property("Person", "age", "int", False)
-    await db.execute("CREATE (n:Person {name: 'Bob', age: 25})")
+    db = await uni_db.AsyncUni.open(test_dir)
+    session = db.session()
+    await (
+        db.schema()
+        .label("Person")
+        .property("name", "string")
+        .property("age", "int")
+        .apply()
+    )
+    tx = await session.tx()
+    await tx.execute("CREATE (n:Person {name: 'Bob', age: 25})")
+    await tx.commit()
 
-    results = await db.query(
+    results = await session.query(
         "MATCH (n:Person {name: 'Bob'}) RETURN n.age AS age",
     )
     assert len(results) == 1
@@ -61,45 +79,58 @@ async def test_async_query_with_params(test_dir):
 @pytest.mark.asyncio
 async def test_async_execute_returns_count(test_dir):
     """Test that execute returns affected row count."""
-    db = await uni_db.AsyncDatabase.open(test_dir)
-    await db.create_label("Counter")
-    count = await db.execute("CREATE (n:Counter {value: 1})")
-    assert isinstance(count, int)
+    db = await uni_db.AsyncUni.open(test_dir)
+    session = db.session()
+    await db.schema().label("Counter").apply()
+    tx = await session.tx()
+    result = await tx.execute("CREATE (n:Counter {value: 1})")
+    await tx.commit()
+    assert isinstance(result, uni_db.ExecuteResult)
+    assert result.affected_rows >= 0
+    assert result.nodes_created >= 1
 
 
 @pytest.mark.asyncio
 async def test_async_flush(test_dir):
     """Test flushing writes to storage."""
-    db = await uni_db.AsyncDatabase.open(test_dir)
-    await db.create_label("Flushed")
-    await db.execute("CREATE (n:Flushed {val: 1})")
+    db = await uni_db.AsyncUni.open(test_dir)
+    session = db.session()
+    await db.schema().label("Flushed").apply()
+    tx = await session.tx()
+    await tx.execute("CREATE (n:Flushed {val: 1})")
+    await tx.commit()
     await db.flush()
 
     # After flush, data should be persisted
-    results = await db.query("MATCH (n:Flushed) RETURN n.val AS val")
+    results = await session.query("MATCH (n:Flushed) RETURN n.val AS val")
     assert len(results) == 1
 
 
 @pytest.mark.asyncio
 async def test_async_explain(test_dir):
     """Test query plan explanation."""
-    db = await uni_db.AsyncDatabase.open(test_dir)
-    await db.create_label("Person")
+    db = await uni_db.AsyncUni.open(test_dir)
+    session = db.session()
+    await db.schema().label("Person").apply()
 
-    plan = await db.explain("MATCH (n:Person) RETURN n")
-    assert "plan_text" in plan
-    assert "cost_estimates" in plan
+    plan = await session.query_with("MATCH (n:Person) RETURN n").explain()
+    assert isinstance(plan, uni_db.ExplainOutput)
+    assert isinstance(plan.plan_text, str)
+    assert len(plan.plan_text) > 0
+    assert plan.cost_estimates is not None
 
 
 @pytest.mark.asyncio
 async def test_async_builder():
-    """Test AsyncDatabaseBuilder."""
-    builder = uni_db.AsyncDatabaseBuilder.temporary()
+    """Test AsyncUniBuilder."""
+    builder = uni_db.AsyncUniBuilder.temporary()
     db = await builder.build()
-    await db.create_label("Built")
-    await db.add_property("Built", "x", "int", False)
-    await db.execute("CREATE (n:Built {x: 1})")
-    results = await db.query("MATCH (n:Built) RETURN n.x AS x")
+    session = db.session()
+    await db.schema().label("Built").property("x", "int").apply()
+    tx = await session.tx()
+    await tx.execute("CREATE (n:Built {x: 1})")
+    await tx.commit()
+    results = await session.query("MATCH (n:Built) RETURN n.x AS x")
     assert len(results) == 1
     assert results[0]["x"] == 1
 
@@ -107,14 +138,16 @@ async def test_async_builder():
 @pytest.mark.asyncio
 async def test_async_multiple_queries():
     """Test running multiple queries sequentially."""
-    db = await uni_db.AsyncDatabase.temporary()
-    await db.create_label("Node")
-    await db.add_property("Node", "idx", "int", False)
+    db = await uni_db.AsyncUni.temporary()
+    session = db.session()
+    await db.schema().label("Node").property("idx", "int").apply()
 
+    tx = await session.tx()
     for i in range(10):
-        await db.execute(f"CREATE (n:Node {{idx: {i}}})")
+        await tx.execute(f"CREATE (n:Node {{idx: {i}}})")
+    await tx.commit()
 
-    results = await db.query("MATCH (n:Node) RETURN n.idx AS idx ORDER BY n.idx")
+    results = await session.query("MATCH (n:Node) RETURN n.idx AS idx ORDER BY n.idx")
     assert len(results) == 10
     assert results[0]["idx"] == 0
     assert results[9]["idx"] == 9
@@ -123,17 +156,24 @@ async def test_async_multiple_queries():
 @pytest.mark.asyncio
 async def test_async_query_with_builder():
     """Test AsyncQueryBuilder via query_with()."""
-    db = await uni_db.AsyncDatabase.temporary()
-    await db.create_label("Item")
-    await db.add_property("Item", "name", "string", False)
-    await db.add_property("Item", "value", "int", False)
-    await db.execute("CREATE (n:Item {name: 'Widget', value: 42})")
+    db = await uni_db.AsyncUni.temporary()
+    session = db.session()
+    await (
+        db.schema()
+        .label("Item")
+        .property("name", "string")
+        .property("value", "int")
+        .apply()
+    )
+    tx = await session.tx()
+    await tx.execute("CREATE (n:Item {name: 'Widget', value: 42})")
+    await tx.commit()
     await db.flush()
 
     results = await (
-        db.query_with("MATCH (n:Item) WHERE n.value = $val RETURN n.name AS name")
+        session.query_with("MATCH (n:Item) WHERE n.value = $val RETURN n.name AS name")
         .param("val", 42)
-        .run()
+        .fetch_all()
     )
     assert len(results) == 1
     assert results[0]["name"] == "Widget"
@@ -142,10 +182,16 @@ async def test_async_query_with_builder():
 @pytest.mark.asyncio
 async def test_async_query_with_timeout():
     """Test AsyncQueryBuilder with timeout."""
-    db = await uni_db.AsyncDatabase.temporary()
-    await db.create_label("Node")
-    await db.add_property("Node", "x", "int", False)
-    await db.execute("CREATE (n:Node {x: 1})")
+    db = await uni_db.AsyncUni.temporary()
+    session = db.session()
+    await db.schema().label("Node").property("x", "int").apply()
+    tx = await session.tx()
+    await tx.execute("CREATE (n:Node {x: 1})")
+    await tx.commit()
 
-    results = await db.query_with("MATCH (n:Node) RETURN n.x AS x").timeout(30.0).run()
+    results = (
+        await session.query_with("MATCH (n:Node) RETURN n.x AS x")
+        .timeout(30.0)
+        .fetch_all()
+    )
     assert len(results) == 1

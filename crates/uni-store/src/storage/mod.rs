@@ -9,12 +9,15 @@ pub mod compaction;
 pub mod csr;
 pub mod delta;
 pub mod direction;
+#[cfg(feature = "lance-backend")]
 pub mod edge;
+#[cfg(feature = "lance-backend")]
 pub mod index;
 pub mod index_manager;
 pub mod index_rebuild;
-pub(super) mod index_utils;
+#[cfg(feature = "lance-backend")]
 pub mod inverted_index;
+#[cfg(feature = "lance-backend")]
 pub mod json_index;
 pub mod main_edge;
 pub mod main_vertex;
@@ -31,10 +34,13 @@ pub use adjacency_manager::AdjacencyManager;
 pub use csr::CompressedSparseRow;
 pub use delta::DeltaDataset;
 pub use direction::Direction;
+#[cfg(feature = "lance-backend")]
 pub use edge::EdgeDataset;
+#[cfg(feature = "lance-backend")]
 pub use index::UidIndex;
 pub use index_manager::{IndexManager, IndexRebuildStatus, IndexRebuildTask};
 pub use index_rebuild::IndexRebuildManager;
+#[cfg(feature = "lance-backend")]
 pub use inverted_index::InvertedIndex;
 pub use main_edge::MainEdgeDataset;
 pub use main_vertex::MainVertexDataset;

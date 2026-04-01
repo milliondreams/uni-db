@@ -9,7 +9,7 @@ import uni_db
 def social_db(tmp_path):
     """Create a database with social network schema."""
     db_path = tmp_path / "social_db"
-    db = uni_db.DatabaseBuilder.open(str(db_path)).build()
+    db = uni_db.UniBuilder.open(str(db_path)).build()
 
     # Create schema
     (
@@ -36,35 +36,38 @@ def social_db(tmp_path):
     )
 
     # Add test data
-    db.execute("""
+    session = db.session()
+    tx = session.tx()
+    tx.execute("""
         CREATE (:User {username: 'alice', email: 'alice@example.com', age: 30})
     """)
-    db.execute("""
+    tx.execute("""
         CREATE (:User {username: 'bob', email: 'bob@example.com', age: 25})
     """)
-    db.execute("""
+    tx.execute("""
         CREATE (:User {username: 'charlie', email: 'charlie@example.com', age: 35})
     """)
-    db.execute("""
+    tx.execute("""
         CREATE (:Post {title: 'Hello World', content: 'My first post!', likes: 5})
     """)
-    db.execute("""
+    tx.execute("""
         CREATE (:Post {title: 'Graph Databases', content: 'They are awesome!', likes: 10})
     """)
 
     # Create relationships
-    db.execute("""
+    tx.execute("""
         MATCH (a:User {username: 'alice'}), (b:User {username: 'bob'})
         CREATE (a)-[:FOLLOWS]->(b)
     """)
-    db.execute("""
+    tx.execute("""
         MATCH (a:User {username: 'alice'}), (p:Post {title: 'Hello World'})
         CREATE (a)-[:POSTED {timestamp: 1234567890}]->(p)
     """)
-    db.execute("""
+    tx.execute("""
         MATCH (b:User {username: 'bob'}), (p:Post {title: 'Hello World'})
         CREATE (b)-[:LIKES {timestamp: 1234567900}]->(p)
     """)
+    tx.commit()
 
     db.flush()
     yield db
@@ -74,13 +77,12 @@ def test_session_with_single_variable(social_db):
     """Test creating a session with a single variable."""
     db = social_db
 
-    # Create session with a variable
-    builder = db.session()
-    builder.set("username", "alice")
-    session = builder.build()
+    # Create session and set a variable
+    session = db.session()
+    session.params().set("username", "alice")
 
     # Verify we can get the variable back
-    value = session.get("username")
+    value = session.params().get("username")
     assert value == "alice"
 
 
@@ -88,44 +90,41 @@ def test_session_with_multiple_variables(social_db):
     """Test creating a session with multiple variables."""
     db = social_db
 
-    # Create session with multiple variables
-    builder = db.session()
-    builder.set("username", "bob")
-    builder.set("min_age", 20)
-    builder.set("max_age", 30)
-    builder.set("is_active", True)
-    session = builder.build()
+    # Create session and set multiple variables
+    session = db.session()
+    session.params().set("username", "bob")
+    session.params().set("min_age", 20)
+    session.params().set("max_age", 30)
+    session.params().set("is_active", True)
 
     # Verify all variables
-    assert session.get("username") == "bob"
-    assert session.get("min_age") == 20
-    assert session.get("max_age") == 30
-    assert session.get("is_active") is True
+    assert session.params().get("username") == "bob"
+    assert session.params().get("min_age") == 20
+    assert session.params().get("max_age") == 30
+    assert session.params().get("is_active") is True
 
 
 def test_session_get_nonexistent_returns_none(social_db):
     """Test that getting a non-existent variable returns None."""
     db = social_db
 
-    builder = db.session()
-    builder.set("existing_key", "value")
-    session = builder.build()
+    session = db.session()
+    session.params().set("existing_key", "value")
 
     # Get existing key
-    assert session.get("existing_key") == "value"
+    assert session.params().get("existing_key") == "value"
 
     # Get non-existent key
-    assert session.get("nonexistent_key") is None
+    assert session.params().get("nonexistent_key") is None
 
 
 def test_session_query(social_db):
     """Test executing queries within a session."""
     db = social_db
 
-    # Create session
-    builder = db.session()
-    builder.set("target_username", "alice")
-    session = builder.build()
+    # Create session and set variable
+    session = db.session()
+    session.params().set("target_username", "alice")
 
     # Execute query using session variable
     results = session.query("""
@@ -144,9 +143,8 @@ def test_session_query_with_params(social_db):
     db = social_db
 
     # Create session with one variable
-    builder = db.session()
-    builder.set("min_likes", 5)
-    session = builder.build()
+    session = db.session()
+    session.params().set("min_likes", 5)
 
     # Query with additional params
     results = session.query(
@@ -170,23 +168,24 @@ def test_session_execute(social_db):
     """Test executing write operations within a session."""
     db = social_db
 
-    # Create session
-    builder = db.session()
-    builder.set("new_username", "diana")
-    builder.set("new_email", "diana@example.com")
-    builder.set("new_age", 28)
-    session = builder.build()
+    # Create session and set variables
+    session = db.session()
+    params = session.params()
+    params.set("new_username", "diana")
+    params.set("new_email", "diana@example.com")
+    params.set("new_age", 28)
 
-    # Execute create operation
-    count = session.execute("""
-        CREATE (:User {username: $session.new_username, email: $session.new_email, age: $session.new_age})
-    """)
+    # Execute create operation using transaction with explicit params
+    tx = session.tx()
+    tx.execute(
+        "CREATE (:User {username: $new_username, email: $new_email, age: $new_age})",
+        params=params.get_all(),
+    )
+    tx.commit()
 
-    # execute returns number of affected rows/nodes
-    assert isinstance(count, int)
-
-    # Verify the user was created
-    results = db.query(
+    # Verify the user was created using a plain session
+    verify_session = db.session()
+    results = verify_session.query(
         "MATCH (u:User {username: 'diana'}) RETURN u.username AS username"
     )
     assert len(results) == 1
@@ -197,11 +196,10 @@ def test_session_variables_persist_across_queries(social_db):
     """Test that session variables persist across multiple queries."""
     db = social_db
 
-    # Create session
-    builder = db.session()
-    builder.set("user1", "alice")
-    builder.set("user2", "bob")
-    session = builder.build()
+    # Create session and set variables
+    session = db.session()
+    session.params().set("user1", "alice")
+    session.params().set("user2", "bob")
 
     # First query
     results1 = session.query("""
@@ -231,45 +229,50 @@ def test_session_with_complex_types(social_db):
     """Test session variables with complex types."""
     db = social_db
 
-    # Create session with various types
-    builder = db.session()
-    builder.set("string_val", "test")
-    builder.set("int_val", 42)
-    builder.set("float_val", 3.14)
-    builder.set("bool_val", True)
-    builder.set("list_val", [1, 2, 3])
-    builder.set("dict_val", {"key": "value", "nested": {"deep": "data"}})
-    session = builder.build()
+    # Create session and set various types
+    session = db.session()
+    session.params().set("string_val", "test")
+    session.params().set("int_val", 42)
+    session.params().set("float_val", 3.14)
+    session.params().set("bool_val", True)
+    session.params().set("list_val", [1, 2, 3])
+    session.params().set("dict_val", {"key": "value", "nested": {"deep": "data"}})
 
     # Verify all types
-    assert session.get("string_val") == "test"
-    assert session.get("int_val") == 42
-    assert session.get("float_val") == 3.14
-    assert session.get("bool_val") is True
-    assert session.get("list_val") == [1, 2, 3]
-    assert session.get("dict_val") == {"key": "value", "nested": {"deep": "data"}}
+    assert session.params().get("string_val") == "test"
+    assert session.params().get("int_val") == 42
+    assert session.params().get("float_val") == 3.14
+    assert session.params().get("bool_val") is True
+    assert session.params().get("list_val") == [1, 2, 3]
+    assert session.params().get("dict_val") == {
+        "key": "value",
+        "nested": {"deep": "data"},
+    }
 
 
 def test_session_execute_update(social_db):
     """Test executing update operations within a session."""
     db = social_db
 
-    # Create session
-    builder = db.session()
-    builder.set("target_user", "charlie")
-    builder.set("new_age", 36)
-    session = builder.build()
+    # Create session and set variables
+    session = db.session()
+    params = session.params()
+    params.set("target_user", "charlie")
+    params.set("new_age", 36)
 
-    # Execute update
-    count = session.execute("""
-        MATCH (u:User {username: $session.target_user})
-        SET u.age = $session.new_age
-    """)
+    # Execute update using transaction with explicit params
+    tx = session.tx()
+    tx.execute(
+        "MATCH (u:User {username: $target_user}) SET u.age = $new_age",
+        params=params.get_all(),
+    )
+    tx.commit()
 
-    assert isinstance(count, int)
-
-    # Verify update
-    results = db.query("MATCH (u:User {username: 'charlie'}) RETURN u.age AS age")
+    # Verify update using a plain session
+    verify_session = db.session()
+    results = verify_session.query(
+        "MATCH (u:User {username: 'charlie'}) RETURN u.age AS age"
+    )
     assert results[0]["age"] == 36
 
 
@@ -277,27 +280,28 @@ def test_session_execute_delete(social_db):
     """Test executing delete operations within a session."""
     db = social_db
 
-    # Verify initial state
-    initial = db.query(
+    # Verify initial state using a plain session
+    verify_session = db.session()
+    initial = verify_session.query(
         "MATCH (p:Post {title: 'Graph Databases'}) RETURN count(p) AS count"
     )
     assert initial[0]["count"] == 1
 
-    # Create session
-    builder = db.session()
-    builder.set("post_title", "Graph Databases")
-    session = builder.build()
+    # Create session and set variable
+    session = db.session()
+    params = session.params()
+    params.set("post_title", "Graph Databases")
 
-    # Execute delete
-    count = session.execute("""
-        MATCH (p:Post {title: $session.post_title})
-        DELETE p
-    """)
-
-    assert isinstance(count, int)
+    # Execute delete using transaction with explicit params
+    tx = session.tx()
+    tx.execute(
+        "MATCH (p:Post {title: $post_title}) DELETE p",
+        params=params.get_all(),
+    )
+    tx.commit()
 
     # Verify deletion
-    results = db.query(
+    results = verify_session.query(
         "MATCH (p:Post {title: 'Graph Databases'}) RETURN count(p) AS count"
     )
     assert results[0]["count"] == 0
@@ -307,19 +311,17 @@ def test_multiple_independent_sessions(social_db):
     """Test that multiple sessions are independent."""
     db = social_db
 
-    # Create first session
-    builder1 = db.session()
-    builder1.set("username", "alice")
-    session1 = builder1.build()
+    # Create first session and set variable
+    session1 = db.session()
+    session1.params().set("username", "alice")
 
-    # Create second session with different values
-    builder2 = db.session()
-    builder2.set("username", "bob")
-    session2 = builder2.build()
+    # Create second session with different value
+    session2 = db.session()
+    session2.params().set("username", "bob")
 
     # Verify sessions are independent
-    assert session1.get("username") == "alice"
-    assert session2.get("username") == "bob"
+    assert session1.params().get("username") == "alice"
+    assert session2.params().get("username") == "bob"
 
     # Query using both sessions
     results1 = session1.query(
@@ -337,10 +339,9 @@ def test_session_with_aggregations(social_db):
     """Test session queries with aggregation functions."""
     db = social_db
 
-    # Create session
-    builder = db.session()
-    builder.set("min_age", 25)
-    session = builder.build()
+    # Create session and set variable
+    session = db.session()
+    session.params().set("min_age", 25)
 
     # Query with aggregation
     results = session.query("""
@@ -354,31 +355,29 @@ def test_session_with_aggregations(social_db):
     assert isinstance(results[0]["avg_age"], (int, float))
 
 
-def test_session_builder_chaining(social_db):
-    """Test that session builder methods can be chained."""
+def test_session_set_chaining(social_db):
+    """Test that session set calls work correctly."""
     db = social_db
 
-    # Build session with chained calls (if API supports it)
-    builder = db.session()
-    builder.set("var1", "value1")
-    builder.set("var2", "value2")
-    builder.set("var3", "value3")
-    session = builder.build()
+    # Set variables on session
+    session = db.session()
+    session.params().set("var1", "value1")
+    session.params().set("var2", "value2")
+    session.params().set("var3", "value3")
 
     # Verify all variables were set
-    assert session.get("var1") == "value1"
-    assert session.get("var2") == "value2"
-    assert session.get("var3") == "value3"
+    assert session.params().get("var1") == "value1"
+    assert session.params().get("var2") == "value2"
+    assert session.params().get("var3") == "value3"
 
 
 def test_session_with_relationship_queries(social_db):
     """Test session queries involving relationships."""
     db = social_db
 
-    # Create session
-    builder = db.session()
-    builder.set("follower", "alice")
-    session = builder.build()
+    # Create session and set variable
+    session = db.session()
+    session.params().set("follower", "alice")
 
     # Query relationships
     results = session.query("""
@@ -391,17 +390,15 @@ def test_session_with_relationship_queries(social_db):
 
 
 def test_session_query_returns_empty_list(social_db):
-    """Test that session query returns empty list when no matches."""
+    """Test that session query returns empty result when no matches."""
     db = social_db
 
-    builder = db.session()
-    builder.set("username", "nonexistent_user")
-    session = builder.build()
+    session = db.session()
+    session.params().set("username", "nonexistent_user")
 
     results = session.query("""
         MATCH (u:User {username: $session.username})
         RETURN u.username AS username
     """)
 
-    assert results == []
-    assert isinstance(results, list)
+    assert len(results) == 0

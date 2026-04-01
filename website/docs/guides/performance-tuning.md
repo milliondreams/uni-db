@@ -199,10 +199,12 @@ Tune batch sizes for your workload:
 
 ```rust
 // BulkWriter with larger batches (more memory, faster)
-let bulk = db.bulk_writer().batch_size(50_000).build()?;
+let session = db.session();
+let tx = session.tx();
+let bulk = tx.bulk_writer().batch_size(50_000).build()?;
 
 // BulkWriter with smaller batches (less memory)
-let bulk = db.bulk_writer().batch_size(5_000).build()?;
+let bulk = tx.bulk_writer().batch_size(5_000).build()?;
 ```
 
 **Guidelines:**

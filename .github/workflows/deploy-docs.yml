@@ -83,18 +83,22 @@ jobs:
           rm -rf target/release
           df -h
 
-      # Install MkDocs and all dependencies for notebook execution
-      - name: Install MkDocs dependencies
+      # Install Zensical and all dependencies
+      - name: Install documentation dependencies
         run: |
-          pip install mkdocs mkdocs-material mkdocs-jupyter pymdown-extensions pdoc
+          pip install zensical pymdown-extensions nbconvert pdoc
 
-      # Build MkDocs (executes notebooks via mkdocs-jupyter, cleans site directory)
-      - name: Build MkDocs Documentation
+      # Convert Jupyter notebooks to Markdown (Zensical doesn't support mkdocs-jupyter)
+      - name: Convert notebooks to Markdown
+        run: python website/scripts/convert_notebooks.py
+
+      # Build documentation with Zensical
+      - name: Build Documentation
         run: |
           cd website
-          mkdocs build
+          zensical build
 
-      # Build and copy API docs AFTER MkDocs (since mkdocs cleans site/)
+      # Build and copy API docs AFTER Zensical (since zensical cleans site/)
       - name: Build Rust documentation
         run: |
           cargo doc --no-deps --document-private-items \

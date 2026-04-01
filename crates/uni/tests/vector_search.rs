@@ -36,7 +36,6 @@ async fn test_vector_search() -> anyhow::Result<()> {
     let schema_manager = Arc::new(schema_manager);
 
     let storage = StorageManager::new(storage_str, schema_manager.clone()).await?;
-    let lancedb_store = storage.lancedb_store();
 
     // 2. Insert Data
     // Item 1: [0.0, 0.0] (Target)
@@ -105,7 +104,7 @@ async fn test_vector_search() -> anyhow::Result<()> {
     )?;
 
     vertex_ds
-        .write_batch_lancedb(lancedb_store, batch, &schema_manager.schema())
+        .write_batch(storage.backend(), batch, &schema_manager.schema())
         .await?;
 
     // 3. Search
@@ -208,7 +207,7 @@ async fn write_vectors_to_lancedb(
         ],
     )?;
 
-    ds.write_batch_lancedb(storage.lancedb_store(), batch, &schema_manager.schema())
+    ds.write_batch(storage.backend(), batch, &schema_manager.schema())
         .await?;
     Ok(())
 }
@@ -229,7 +228,7 @@ async fn test_l0_vertex_appears_in_vector_search() -> anyhow::Result<()> {
         serde_json::json!([0.0, 0.0]).into(),
     );
     writer
-        .insert_vertex_with_labels(vid2, props, &["Item".to_string()])
+        .insert_vertex_with_labels(vid2, props, &["Item".to_string()], None)
         .await?;
 
     // Build QueryContext from writer's L0.
@@ -274,7 +273,7 @@ async fn test_l0_tombstone_hides_flushed_vertex() -> anyhow::Result<()> {
 
     // Delete VID 1 via the writer (tombstone in L0).
     writer
-        .delete_vertex(Vid::new(1), Some(vec!["Item".to_string()]))
+        .delete_vertex(Vid::new(1), Some(vec!["Item".to_string()]), None)
         .await?;
 
     let l0_arc = writer.l0_manager.get_current();

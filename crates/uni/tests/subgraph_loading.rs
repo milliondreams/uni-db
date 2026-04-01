@@ -32,8 +32,6 @@ async fn test_subgraph_loading_merge_logic() -> anyhow::Result<()> {
     let schema_manager = Arc::new(schema_manager);
 
     let storage = StorageManager::new(storage_str, schema_manager.clone()).await?;
-    let lancedb_store = storage.lancedb_store();
-
     // VIDs
     let vid_a = Vid::new(1);
     let vid_b = Vid::new(2);
@@ -71,7 +69,7 @@ async fn test_subgraph_loading_merge_logic() -> anyhow::Result<()> {
         ],
     )?;
 
-    adj_ds.write_chunk_lancedb(lancedb_store, batch).await?;
+    adj_ds.write_chunk(storage.backend(), batch).await?;
 
     // Warm the adjacency cache for L2 data
     use uni_db::storage::direction::Direction as CacheDir;
@@ -106,7 +104,7 @@ async fn test_subgraph_loading_merge_logic() -> anyhow::Result<()> {
     ];
 
     let batch = delta_ds.build_record_batch(&entries, &schema_manager.schema())?;
-    delta_ds.write_run_lancedb(lancedb_store, batch).await?;
+    delta_ds.write_run(storage.backend(), batch).await?;
 
     // 4. Setup L0 (Buffer): Insert A -> D, Delete A -> C
     let mut l0 = L0Buffer::new(20, None);

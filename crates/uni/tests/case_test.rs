@@ -61,7 +61,7 @@ async fn test_case_expression() -> anyhow::Result<()> {
             uni_common::Value::String("Alice".to_string()),
         );
         props1.insert("age".to_string(), uni_common::Value::Int(10));
-        w.insert_vertex_with_labels(vid1, props1, &["Person".to_string()])
+        w.insert_vertex_with_labels(vid1, props1, &["Person".to_string()], None)
             .await?;
 
         // Bob: 20
@@ -72,7 +72,7 @@ async fn test_case_expression() -> anyhow::Result<()> {
             uni_common::Value::String("Bob".to_string()),
         );
         props2.insert("age".to_string(), uni_common::Value::Int(20));
-        w.insert_vertex_with_labels(vid2, props2, &["Person".to_string()])
+        w.insert_vertex_with_labels(vid2, props2, &["Person".to_string()], None)
             .await?;
 
         // Charlie: 30
@@ -83,7 +83,7 @@ async fn test_case_expression() -> anyhow::Result<()> {
             uni_common::Value::String("Charlie".to_string()),
         );
         props3.insert("age".to_string(), uni_common::Value::Int(30));
-        w.insert_vertex_with_labels(vid3, props3, &["Person".to_string()])
+        w.insert_vertex_with_labels(vid3, props3, &["Person".to_string()], None)
             .await?;
 
         w.flush_to_l1(None).await?;

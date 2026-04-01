@@ -9,11 +9,15 @@ isolation, error handling, and edge cases using the social_db fixture.
 
 import pytest
 
+import uni_db
+
 
 def test_begin_and_commit(social_db):
     """Test basic transaction lifecycle: begin, query, commit, verify persistence."""
+    session = social_db.session()
+
     # Begin transaction
-    tx = social_db.begin()
+    tx = session.tx()
 
     # Insert data within transaction
     tx.query("CREATE (p:Person {name: 'Alice', age: 30})")
@@ -22,7 +26,7 @@ def test_begin_and_commit(social_db):
     tx.commit()
 
     # Verify data persists after commit
-    results = social_db.query(
+    results = session.query(
         "MATCH (p:Person {name: 'Alice'}) RETURN p.name AS name, p.age AS age"
     )
     assert len(results) == 1
@@ -32,12 +36,16 @@ def test_begin_and_commit(social_db):
 
 def test_begin_and_rollback(social_db):
     """Test rollback: data should be reverted after rollback."""
+    session = social_db.session()
+
     # Insert initial data
-    social_db.execute("CREATE (p:Person {name: 'Bob', age: 25})")
+    tx = session.tx()
+    tx.execute("CREATE (p:Person {name: 'Bob', age: 25})")
+    tx.commit()
     social_db.flush()
 
     # Begin transaction
-    tx = social_db.begin()
+    tx = session.tx()
 
     # Insert new data within transaction
     tx.query("CREATE (p:Person {name: 'Charlie', age: 35})")
@@ -46,19 +54,18 @@ def test_begin_and_rollback(social_db):
     tx.rollback()
 
     # Verify rollback: Charlie should not exist
-    results = social_db.query(
-        "MATCH (p:Person {name: 'Charlie'}) RETURN p.name AS name"
-    )
+    results = session.query("MATCH (p:Person {name: 'Charlie'}) RETURN p.name AS name")
     assert len(results) == 0
 
     # Verify Bob still exists (committed before transaction)
-    results = social_db.query("MATCH (p:Person {name: 'Bob'}) RETURN p.name AS name")
+    results = session.query("MATCH (p:Person {name: 'Bob'}) RETURN p.name AS name")
     assert len(results) == 1
 
 
 def test_transaction_query_with_parameters(social_db):
     """Test transaction query with parameters."""
-    tx = social_db.begin()
+    session = social_db.session()
+    tx = session.tx()
 
     # Use parameters in transaction query
     params = {"name": "Diana", "age": 28, "email": "diana@example.com"}
@@ -67,7 +74,7 @@ def test_transaction_query_with_parameters(social_db):
     tx.commit()
 
     # Verify data was created with correct parameters
-    results = social_db.query(
+    results = session.query(
         "MATCH (p:Person {name: 'Diana'}) RETURN p.name AS name, p.age AS age, p.email AS email"
     )
     assert len(results) == 1
@@ -78,7 +85,8 @@ def test_transaction_query_with_parameters(social_db):
 
 def test_multiple_operations_in_one_transaction(social_db):
     """Test multiple operations within a single transaction."""
-    tx = social_db.begin()
+    session = social_db.session()
+    tx = session.tx()
 
     # Multiple creates
     tx.query("CREATE (p:Person {name: 'Alice', age: 30})")
@@ -94,13 +102,13 @@ def test_multiple_operations_in_one_transaction(social_db):
     tx.commit()
 
     # Verify all data was committed
-    person_count = social_db.query("MATCH (p:Person) RETURN count(p) AS count")
+    person_count = session.query("MATCH (p:Person) RETURN count(p) AS count")
     assert person_count[0]["count"] == 2
 
-    company_count = social_db.query("MATCH (c:Company) RETURN count(c) AS count")
+    company_count = session.query("MATCH (c:Company) RETURN count(c) AS count")
     assert company_count[0]["count"] == 1
 
-    works_at = social_db.query(
+    works_at = session.query(
         "MATCH (p:Person {name: 'Alice'})-[r:WORKS_AT]->(c:Company) "
         "RETURN r.role AS role"
     )
@@ -110,7 +118,8 @@ def test_multiple_operations_in_one_transaction(social_db):
 
 def test_transaction_isolation_changes_visible_inside_tx(social_db):
     """Test transaction isolation: changes visible inside transaction."""
-    tx = social_db.begin()
+    session = social_db.session()
+    tx = session.tx()
 
     # Create person
     tx.query("CREATE (p:Person {name: 'Eve', age: 32})")
@@ -129,7 +138,8 @@ def test_transaction_isolation_changes_visible_inside_tx(social_db):
 
 def test_transaction_commit_makes_changes_visible_outside(social_db):
     """Test that committed transaction changes are visible outside."""
-    tx = social_db.begin()
+    session = social_db.session()
+    tx = session.tx()
 
     # Create data within transaction
     tx.query("CREATE (p:Person {name: 'Frank', age: 40})")
@@ -138,79 +148,87 @@ def test_transaction_commit_makes_changes_visible_outside(social_db):
     tx.commit()
 
     # After commit, data should be visible outside
-    results = social_db.query("MATCH (p:Person {name: 'Frank'}) RETURN p.name AS name")
+    results = session.query("MATCH (p:Person {name: 'Frank'}) RETURN p.name AS name")
     assert len(results) == 1
     assert results[0]["name"] == "Frank"
 
 
 def test_double_commit_raises_error(social_db):
-    """Test that double commit raises RuntimeError."""
-    tx = social_db.begin()
+    """Test that double commit raises UniTransactionAlreadyCompletedError."""
+    session = social_db.session()
+    tx = session.tx()
     tx.query("CREATE (p:Person {name: 'Grace', age: 29})")
 
     # First commit should succeed
     tx.commit()
 
     # Second commit should raise RuntimeError
-    with pytest.raises(RuntimeError, match="Transaction already completed"):
+    with pytest.raises(uni_db.UniTransactionAlreadyCompletedError):
         tx.commit()
 
 
 def test_double_rollback_raises_error(social_db):
-    """Test that double rollback raises RuntimeError."""
-    tx = social_db.begin()
+    """Test that double rollback raises UniTransactionAlreadyCompletedError."""
+    session = social_db.session()
+    tx = session.tx()
     tx.query("CREATE (p:Person {name: 'Henry', age: 33})")
 
     # First rollback should succeed
     tx.rollback()
 
-    # Second rollback should raise RuntimeError
-    with pytest.raises(RuntimeError, match="Transaction already completed"):
+    # Second rollback should raise UniTransactionAlreadyCompletedError
+    with pytest.raises(uni_db.UniTransactionAlreadyCompletedError):
         tx.rollback()
 
 
 def test_operations_after_commit_raise_error(social_db):
-    """Test that operations after commit raise RuntimeError."""
-    tx = social_db.begin()
+    """Test that operations after commit raise UniTransactionAlreadyCompletedError."""
+    session = social_db.session()
+    tx = session.tx()
     tx.query("CREATE (p:Person {name: 'Iris', age: 27})")
 
     # Commit transaction
     tx.commit()
 
-    # Attempting to query after commit should raise RuntimeError
-    with pytest.raises(RuntimeError, match="Transaction already completed"):
+    # Attempting to query after commit should raise UniTransactionAlreadyCompletedError
+    with pytest.raises(uni_db.UniTransactionAlreadyCompletedError):
         tx.query("CREATE (p:Person {name: 'Jack', age: 31})")
 
-    # Attempting to rollback after commit should raise RuntimeError
-    with pytest.raises(RuntimeError, match="Transaction already completed"):
+    # Attempting to rollback after commit should raise UniTransactionAlreadyCompletedError
+    with pytest.raises(uni_db.UniTransactionAlreadyCompletedError):
         tx.rollback()
 
 
 def test_operations_after_rollback_raise_error(social_db):
-    """Test that operations after rollback raise RuntimeError."""
-    tx = social_db.begin()
+    """Test that operations after rollback raise UniTransactionAlreadyCompletedError."""
+    session = social_db.session()
+    tx = session.tx()
     tx.query("CREATE (p:Person {name: 'Kate', age: 26})")
 
     # Rollback transaction
     tx.rollback()
 
-    # Attempting to query after rollback should raise RuntimeError
-    with pytest.raises(RuntimeError, match="Transaction already completed"):
+    # Attempting to query after rollback should raise UniTransactionAlreadyCompletedError
+    with pytest.raises(uni_db.UniTransactionAlreadyCompletedError):
         tx.query("CREATE (p:Person {name: 'Leo', age: 34})")
 
-    # Attempting to commit after rollback should raise RuntimeError
-    with pytest.raises(RuntimeError, match="Transaction already completed"):
+    # Attempting to commit after rollback should raise UniTransactionAlreadyCompletedError
+    with pytest.raises(uni_db.UniTransactionAlreadyCompletedError):
         tx.commit()
 
 
 def test_rollback_after_partial_writes(social_db):
     """Test rollback reverts all partial writes within a transaction."""
+    session = social_db.session()
+
     # Insert initial data
-    social_db.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+    tx = session.tx()
+    tx.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+    tx.commit()
     social_db.flush()
 
     # Begin transaction
-    tx = social_db.begin()
+    tx = session.tx()
 
     # Multiple partial writes (avoid cross-context MATCH for edges)
     tx.query("CREATE (p:Person {name: 'Bob', age: 25})")
@@ -220,19 +238,17 @@ def test_rollback_after_partial_writes(social_db):
     tx.rollback()
 
     # Verify Bob was not created
-    bob_results = social_db.query(
-        "MATCH (p:Person {name: 'Bob'}) RETURN p.name AS name"
-    )
+    bob_results = session.query("MATCH (p:Person {name: 'Bob'}) RETURN p.name AS name")
     assert len(bob_results) == 0
 
     # Verify StartupInc was not created
-    company_results = social_db.query(
+    company_results = session.query(
         "MATCH (c:Company {name: 'StartupInc'}) RETURN c.name AS name"
     )
     assert len(company_results) == 0
 
     # Verify Alice still exists (committed before transaction)
-    alice_results = social_db.query(
+    alice_results = session.query(
         "MATCH (p:Person {name: 'Alice'}) RETURN p.name AS name"
     )
     assert len(alice_results) == 1

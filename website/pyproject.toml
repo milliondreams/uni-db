@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "uni-docs"
-version = "0.1.18"
+version = "1.0.0"
 description = "Documentation site for Uni — Reasoning and Memory Infrastructure for Intelligent Systems"
 authors = ["Dragonscale Industries Inc. <dev@dragonscale.ai>"]
 readme = "README.md"
@@ -10,12 +10,16 @@ repository = "https://github.com/rustic-ai/uni-db"
 
 [tool.poetry.dependencies]
 python = "^3.10"
-mkdocs = "^1.6"
-mkdocs-material = "^9.5"
+zensical = ">=0.0.31"
 pymdown-extensions = "^10.0"
-mkdocs-jupyter = "^0.25"
+nbconvert = "^7.0"
 uni-db = { path = "../bindings/uni-db", develop = true }
 
 [build-system]
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
+
+[dependency-groups]
+dev = [
+    "uni-pydantic @ file:///home/rohit/work/dragonscale/uni-lance-upgrade/bindings/uni-pydantic"
+]

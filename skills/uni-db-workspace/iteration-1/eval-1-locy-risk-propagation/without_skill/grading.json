@@ -1,0 +1,43 @@
+{
+  "eval_id": 1,
+  "eval_name": "locy-risk-propagation",
+  "configuration": "without_skill",
+  "expectations": [
+    {
+      "text": "Uses CREATE RULE ... AS syntax (not Datalog-style :- notation or other formats)",
+      "passed": true,
+      "evidence": "CREATE RULE supply_risk AS — both clauses use correct syntax (lines 149 and 154)"
+    },
+    {
+      "text": "Uses IS references (e.g., 'risk IS propagated_risk' or 'mid IS supply_risk TO b') for recursive rule composition",
+      "passed": true,
+      "evidence": "WHERE mid IS supply_risk TO b"
+    },
+    {
+      "text": "YIELD clause includes KEY designation for grouping columns and PROB for probability column",
+      "passed": false,
+      "evidence": "YIELD KEY a, KEY b, prob — uses KEY for grouping columns but 'prob' is not annotated with PROB keyword (should be 'prob PROB')"
+    },
+    {
+      "text": "Uses FOLD with MNOR (monotonic noisy-or) for combining probabilities across paths",
+      "passed": true,
+      "evidence": "FOLD prob = MNOR(e.risk) appears in both the base and recursive clauses"
+    },
+    {
+      "text": "Python code uses session.locy() or tx.locy() builder pattern to create rules and run queries",
+      "passed": true,
+      "evidence": "result = session.locy(LOCY_PROGRAM)"
+    },
+    {
+      "text": "Seeds base facts via Cypher CREATE statements in a Transaction (creates nodes and edges with risk properties)",
+      "passed": false,
+      "evidence": "Uses bulk_writer API (bw.insert_vertices / bw.insert_edges) instead of Cypher CREATE statements. No tx.execute(\"CREATE ...\") calls are present."
+    },
+    {
+      "text": "Uses QUERY command (not just DERIVE or bare rule name) to retrieve results from Locy rules",
+      "passed": false,
+      "evidence": "No QUERY command in the Locy program. Results are accessed via result.derived.get(\"supply_risk\", []) without a QUERY directive."
+    }
+  ],
+  "pass_rate": 0.57
+}

@@ -6,7 +6,9 @@
 //! This module provides `IndexRebuildManager` which handles background index
 //! rebuilding with status tracking, retry logic, and persistence for restart recovery.
 
-use crate::storage::index_manager::{IndexManager, IndexRebuildStatus, IndexRebuildTask};
+#[cfg(feature = "lance-backend")]
+use crate::storage::index_manager::IndexManager;
+use crate::storage::index_manager::{IndexRebuildStatus, IndexRebuildTask};
 use crate::storage::manager::StorageManager;
 use anyhow::{Result, anyhow};
 use chrono::Utc;
@@ -521,13 +523,20 @@ impl IndexRebuildManager {
     }
 
     /// Execute the actual index rebuild for a label.
+    #[cfg(feature = "lance-backend")]
     async fn execute_rebuild(&self, label: &str) -> Result<()> {
         let idx_mgr = IndexManager::new(
             self.storage.base_path(),
             self.schema_manager.clone(),
-            self.storage.lancedb_store_arc(),
+            self.storage.backend_arc(),
         );
         idx_mgr.rebuild_indexes_for_label(label).await
+    }
+
+    /// Execute the actual index rebuild for a label (stub when lance-backend is disabled).
+    #[cfg(not(feature = "lance-backend"))]
+    async fn execute_rebuild(&self, _label: &str) -> Result<()> {
+        Err(anyhow!("Index rebuild requires the lance-backend feature"))
     }
 }
 

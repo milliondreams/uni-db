@@ -20,11 +20,16 @@ async fn test_vlp_empty_interval_min_gt_max() -> Result<()> {
         .apply()
         .await?;
     db.schema().edge_type("R", &[], &[]).apply().await?;
-    db.execute("CREATE (a:N {name: 'A'})-[:R]->(b:N {name: 'B'})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (a:N {name: 'A'})-[:R]->(b:N {name: 'B'})")
         .await?;
+    tx.commit().await?;
 
     // [*2..1] means min_hops=2, max_hops=1 — empty interval, must not panic
-    let result = db.query("MATCH (a:N)-[:R*2..1]->(b) RETURN b").await?;
+    let result = db
+        .session()
+        .query("MATCH (a:N)-[:R*2..1]->(b) RETURN b")
+        .await?;
     assert_eq!(
         result.rows().len(),
         0,
@@ -43,11 +48,16 @@ async fn test_vlp_empty_interval_star_to_zero() -> Result<()> {
         .apply()
         .await?;
     db.schema().edge_type("R", &[], &[]).apply().await?;
-    db.execute("CREATE (a:N {name: 'A'})-[:R]->(b:N {name: 'B'})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (a:N {name: 'A'})-[:R]->(b:N {name: 'B'})")
         .await?;
+    tx.commit().await?;
 
     // [*..0] means min_hops=1 (default), max_hops=0 — empty interval, must not panic
-    let result = db.query("MATCH (a:N)-[:R*..0]->(b) RETURN b").await?;
+    let result = db
+        .session()
+        .query("MATCH (a:N)-[:R*..0]->(b) RETURN b")
+        .await?;
     assert_eq!(
         result.rows().len(),
         0,
@@ -66,14 +76,17 @@ async fn test_vlp_empty_interval_exact_zero_regression() -> Result<()> {
         .apply()
         .await?;
     db.schema().edge_type("R", &[], &[]).apply().await?;
-    db.execute("CREATE (a:N {name: 'A'})-[:R]->(b:N {name: 'B'})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (a:N {name: 'A'})-[:R]->(b:N {name: 'B'})")
         .await?;
+    tx.commit().await?;
 
     // [*0..1] means min_hops=0, max_hops=1 — valid interval, regression guard
     // Starting from A: 0-hop gives A, 1-hop gives B → 2 results from source A
     // Starting from B: 0-hop gives B, no outgoing R → 1 result from source B
     // Total: 3 rows
     let result = db
+        .session()
         .query("MATCH (a:N)-[:R*0..1]->(b) RETURN a.name, b.name ORDER BY a.name, b.name")
         .await?;
     assert!(
@@ -102,7 +115,8 @@ async fn test_vlp_edge_property_filter_single_match() -> Result<()> {
         .apply()
         .await?;
 
-    db.execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         r#"
         CREATE (a:P {name: 'A'}), (b:P {name: 'B'}), (c:P {name: 'C'})
         CREATE (a)-[:W {year: 1988}]->(b)
@@ -110,9 +124,11 @@ async fn test_vlp_edge_property_filter_single_match() -> Result<()> {
     "#,
     )
     .await?;
+    tx.commit().await?;
 
     // VLP with edge property filter — only edges with year=1988 should be traversed
     let result = db
+        .session()
         .query("MATCH (a:P {name: 'A'})-[:W* {year: 1988}]->(x) RETURN x.name")
         .await?;
     assert_eq!(
@@ -139,11 +155,14 @@ async fn test_vlp_edge_property_filter_no_match() -> Result<()> {
         .apply()
         .await?;
 
-    db.execute("CREATE (a:P {name: 'A'})-[:W {year: 2020}]->(b:P {name: 'B'})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (a:P {name: 'A'})-[:W {year: 2020}]->(b:P {name: 'B'})")
         .await?;
+    tx.commit().await?;
 
     // No edge has year=9999
     let result = db
+        .session()
         .query("MATCH (a:P {name: 'A'})-[:W* {year: 9999}]->(x) RETURN x.name")
         .await?;
     assert_eq!(result.rows().len(), 0, "No edges match year=9999");
@@ -165,7 +184,8 @@ async fn test_vlp_edge_property_filter_multi_hop() -> Result<()> {
         .apply()
         .await?;
 
-    db.execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         r#"
         CREATE (a:P {name: 'A'}), (b:P {name: 'B'}), (c:P {name: 'C'})
         CREATE (a)-[:K {s: 10}]->(b)
@@ -173,9 +193,11 @@ async fn test_vlp_edge_property_filter_multi_hop() -> Result<()> {
     "#,
     )
     .await?;
+    tx.commit().await?;
 
     // All edges have s=10, so multi-hop VLP should follow all
     let result = db
+        .session()
         .query("MATCH (a:P {name: 'A'})-[:K*1..3 {s: 10}]->(x) RETURN x.name ORDER BY x.name")
         .await?;
     assert_eq!(
@@ -203,7 +225,8 @@ async fn test_vlp_long_chain_single_result() -> Result<()> {
     db.schema().edge_type("N", &[], &[]).apply().await?;
 
     // Create 5-node chain: 0→1→2→3→4 where node 4 has var='end'
-    db.execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         r#"
         CREATE (n0:X {id: 0, var: 'mid'}), (n1:X {id: 1, var: 'mid'}), (n2:X {id: 2, var: 'mid'}), (n3:X {id: 3, var: 'mid'}), (n4:X {id: 4, var: 'end'})
         CREATE (n0)-[:N]->(n1)
@@ -213,9 +236,11 @@ async fn test_vlp_long_chain_single_result() -> Result<()> {
     "#,
     )
     .await?;
+    tx.commit().await?;
 
     // Only one path from 0 to the node with var='end'
     let result = db
+        .session()
         .query("MATCH (a:X {id: 0})-[:N*]->(b:X {var: 'end'}) RETURN b.id")
         .await?;
     assert_eq!(
@@ -239,7 +264,8 @@ async fn test_vlp_chain_all_reachable() -> Result<()> {
     db.schema().edge_type("N", &[], &[]).apply().await?;
 
     // Create 5-node chain: 0→1→2→3→4
-    db.execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         r#"
         CREATE (n0:X {id: 0}), (n1:X {id: 1}), (n2:X {id: 2}), (n3:X {id: 3}), (n4:X {id: 4})
         CREATE (n0)-[:N]->(n1)
@@ -249,9 +275,11 @@ async fn test_vlp_chain_all_reachable() -> Result<()> {
     "#,
     )
     .await?;
+    tx.commit().await?;
 
     // From node 0, should reach all 4 other nodes
     let result = db
+        .session()
         .query("MATCH (a:X {id: 0})-[:N*]->(b) RETURN b.id ORDER BY b.id")
         .await?;
     assert_eq!(
@@ -278,7 +306,8 @@ async fn test_vlp_mixed_directions_simple() -> Result<()> {
     db.schema().edge_type("R", &[], &[]).apply().await?;
 
     // A→B, C→B (B has both incoming edges)
-    db.execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         r#"
         CREATE (a:M {name: 'A'}), (b:M {name: 'B'}), (c:M {name: 'C'})
         CREATE (a)-[:R]->(b)
@@ -286,9 +315,11 @@ async fn test_vlp_mixed_directions_simple() -> Result<()> {
     "#,
     )
     .await?;
+    tx.commit().await?;
 
     // Undirected VLP from A — should reach B (direct) and C (via B)
     let result = db
+        .session()
         .query("MATCH (a:M {name: 'A'})-[:R*1..2]-(x) RETURN DISTINCT x.name ORDER BY x.name")
         .await?;
     // A→B (1 hop), A→B←C (2 hops) → reach B and C
@@ -312,7 +343,8 @@ async fn test_vlp_zero_one_hop_count() -> Result<()> {
     db.schema().edge_type("E", &[], &[]).apply().await?;
 
     // 3-node chain: 0→1→2
-    db.execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         r#"
         CREATE (a:Z {id: 0}), (b:Z {id: 1}), (c:Z {id: 2})
         CREATE (a)-[:E]->(b)
@@ -320,9 +352,11 @@ async fn test_vlp_zero_one_hop_count() -> Result<()> {
     "#,
     )
     .await?;
+    tx.commit().await?;
 
     // [*0..1] from node 0: zero-hop=self(0), one-hop=1 → 2 results
     let result = db
+        .session()
         .query("MATCH (a:Z {id: 0})-[:E*0..1]->(b) RETURN b.id ORDER BY b.id")
         .await?;
     assert_eq!(result.rows().len(), 2, "Zero+one hop should give 2 results");
@@ -342,15 +376,18 @@ async fn test_tck_match4_5_vlp_edge_property_predicate() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
     // TCK creates multi-label nodes and edges with properties — no schema
-    db.execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (a:Artist:A), (b:Artist:B), (c:Artist:C) \
          CREATE (a)-[:WORKED_WITH {year: 1987}]->(b), \
                 (b)-[:WORKED_WITH {year: 1988}]->(c)",
     )
     .await?;
+    tx.commit().await?;
 
     // Only B->C edge has year=1988, so only one path should match: B->C
     let result = db
+        .session()
         .query("MATCH (a:Artist)-[:WORKED_WITH* {year: 1988}]->(b:Artist) RETURN count(*) AS cnt")
         .await?;
 
@@ -369,15 +406,18 @@ async fn test_tck_match4_5_vlp_edge_property_predicate() -> Result<()> {
 async fn test_tck_match4_5_schemaless_vlp_edge_property() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
-    db.execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (a:X {name: 'a'}), (b:X {name: 'b'}), (c:X {name: 'c'}) \
          CREATE (a)-[:R {val: 10}]->(b), \
                 (b)-[:R {val: 20}]->(c)",
     )
     .await?;
+    tx.commit().await?;
 
     // Only a->b edge has val=10
     let result = db
+        .session()
         .query("MATCH (a:X)-[:R* {val: 10}]->(b:X) RETURN count(*) AS cnt")
         .await?;
 
@@ -402,7 +442,8 @@ async fn test_tck_match4_4_long_chain_simple() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
     // Build a 22-node chain: start -> n1 -> n2 -> ... -> n20 -> end
-    db.execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (s {var: 'start'}), \
          (n1 {var: 1}), (n2 {var: 2}), (n3 {var: 3}), (n4 {var: 4}), \
          (n5 {var: 5}), (n6 {var: 6}), (n7 {var: 7}), (n8 {var: 8}), \
@@ -418,8 +459,10 @@ async fn test_tck_match4_4_long_chain_simple() -> Result<()> {
          (n20)-[:T]->(e)",
     )
     .await?;
+    tx.commit().await?;
 
     let result = db
+        .session()
         .query("MATCH (n {var: 'start'})-[:T*]->(m {var: 'end'}) RETURN m")
         .await?;
     assert_eq!(
@@ -437,7 +480,8 @@ async fn test_tck_match4_4_exact_unwind_collect() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
     // Exact TCK setup
-    db.execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (a {var: 'start'}), (b {var: 'end'}) \
          WITH * \
          UNWIND range(1, 20) AS i \
@@ -448,8 +492,10 @@ async fn test_tck_match4_4_exact_unwind_collect() -> Result<()> {
          CREATE (n1)-[:T]->(n2)",
     )
     .await?;
+    tx.commit().await?;
 
     let result = db
+        .session()
         .query("MATCH (n {var: 'start'})-[:T*]->(m {var: 'end'}) RETURN m")
         .await?;
     assert_eq!(
@@ -469,14 +515,17 @@ async fn test_tck_match4_4_exact_unwind_collect() -> Result<()> {
 async fn test_tck_match4_7_bound_relationship_vlp() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
-    db.execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (n0:Node), (n1:Node), (n2:Node), (n3:Node), \
          (n0)-[:EDGE]->(n1), (n1)-[:EDGE]->(n2), (n2)-[:EDGE]->(n3)",
     )
     .await?;
+    tx.commit().await?;
 
     // First match all edges, then use bound relationship r in a complex pattern
     let result = db
+        .session()
         .query(
             "MATCH ()-[r:EDGE]-() \
              MATCH p = (n)-[*0..1]-()-[r]-()-[*0..1]-(m) \
@@ -499,9 +548,12 @@ async fn test_tck_match4_7_bound_relationship_vlp() -> Result<()> {
 async fn test_tck_match3_24_rebound_edge_re_verification() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
-    db.execute("CREATE (:A)-[:T]->(:B)").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:A)-[:T]->(:B)").await?;
+    tx.commit().await?;
 
     let result = db
+        .session()
         .query(
             "MATCH (a1)-[r:T]->() \
              WITH r, a1 \
@@ -527,19 +579,25 @@ async fn test_tck_match3_24_rebound_edge_re_verification() -> Result<()> {
 async fn test_tck_match8_2_merge_optional_count() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
-    db.execute("CREATE (a:A), (b:B) CREATE (a)-[:T1]->(b), (b)-[:T2]->(a)")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (a:A), (b:B) CREATE (a)-[:T1]->(b), (b)-[:T2]->(a)")
         .await?;
+    tx.commit().await?;
 
     // Diagnostic: check MERGE cross-product step by step
-    let r1 = db.query("MATCH (a) RETURN count(*) AS c").await?;
+    let r1 = db.session().query("MATCH (a) RETURN count(*) AS c").await?;
     let c1 = r1.rows()[0].get::<i64>("c")?;
     eprintln!("Step 1 - MATCH (a): {c1}");
 
-    let r2 = db.query("MATCH (a) MERGE (b) RETURN count(*) AS c").await?;
+    let r2 = db
+        .session()
+        .query("MATCH (a) MERGE (b) RETURN count(*) AS c")
+        .await?;
     let c2 = r2.rows()[0].get::<i64>("c")?;
     eprintln!("Step 2 - MATCH (a) MERGE (b): {c2}");
 
     let r3 = db
+        .session()
         .query("MATCH (a) MERGE (b) WITH * RETURN count(*) AS c")
         .await?;
     let c3 = r3.rows()[0].get::<i64>("c")?;
@@ -547,18 +605,22 @@ async fn test_tck_match8_2_merge_optional_count() -> Result<()> {
 
     // Diagnostic: EXPLAIN to see logical plan
     let explain = db
-        .explain("MATCH (a) MERGE (b) WITH * OPTIONAL MATCH (a)--(b) RETURN count(*)")
+        .session()
+        .query_with("MATCH (a) MERGE (b) WITH * OPTIONAL MATCH (a)--(b) RETURN count(*)")
+        .explain()
         .await?;
     eprintln!("EXPLAIN:\n{}", explain.plan_text);
 
     // Test with unbound target — to verify optional traverse works in general
     let r_unbound = db
+        .session()
         .query("MATCH (a) MERGE (b) WITH * OPTIONAL MATCH (a)-[r]-(x) RETURN count(*) AS c")
         .await?;
     let c_unbound = r_unbound.rows()[0].get::<i64>("c")?;
     eprintln!("Unbound target OPTIONAL: {c_unbound}");
 
     let result = db
+        .session()
         .query("MATCH (a) MERGE (b) WITH * OPTIONAL MATCH (a)--(b) RETURN count(*)")
         .await?;
 
@@ -567,6 +629,7 @@ async fn test_tck_match8_2_merge_optional_count() -> Result<()> {
 
     // Also check without WITH *
     let r_no_with = db
+        .session()
         .query("MATCH (a) MERGE (b) OPTIONAL MATCH (a)--(b) RETURN count(*) AS c")
         .await?;
     let c_no_with = r_no_with.rows()[0].get::<i64>("c")?;

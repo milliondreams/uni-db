@@ -8,29 +8,32 @@ use uni_db::Uni;
 async fn test_window_row_number() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
-    db.execute("CREATE LABEL Employee (dept STRING, salary INT)")
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE LABEL Employee (dept STRING, salary INT)")
         .await?;
 
     // Dept A
-    db.execute("CREATE (e:Employee {dept: 'A', salary: 100})")
+    tx.execute("CREATE (e:Employee {dept: 'A', salary: 100})")
         .await?;
-    db.execute("CREATE (e:Employee {dept: 'A', salary: 200})")
+    tx.execute("CREATE (e:Employee {dept: 'A', salary: 200})")
         .await?;
-    db.execute("CREATE (e:Employee {dept: 'A', salary: 300})")
+    tx.execute("CREATE (e:Employee {dept: 'A', salary: 300})")
         .await?;
 
     // Dept B
-    db.execute("CREATE (e:Employee {dept: 'B', salary: 150})")
+    tx.execute("CREATE (e:Employee {dept: 'B', salary: 150})")
         .await?;
-    db.execute("CREATE (e:Employee {dept: 'B', salary: 250})")
+    tx.execute("CREATE (e:Employee {dept: 'B', salary: 250})")
         .await?;
+    tx.commit().await?;
 
     // Query: ROW_NUMBER partitioned by dept, ordered by salary DESC
     // Expected:
     // A: 300 -> 1, 200 -> 2, 100 -> 3
     // B: 250 -> 1, 150 -> 2
 
-    let result = db.query("MATCH (e:Employee) RETURN e.dept AS dept, e.salary AS salary, row_number() OVER (PARTITION BY e.dept ORDER BY e.salary DESC) AS rn ORDER BY e.dept, row_number() OVER (PARTITION BY e.dept ORDER BY e.salary DESC)").await?;
+    let result = db.session().query("MATCH (e:Employee) RETURN e.dept AS dept, e.salary AS salary, row_number() OVER (PARTITION BY e.dept ORDER BY e.salary DESC) AS rn ORDER BY e.dept, row_number() OVER (PARTITION BY e.dept ORDER BY e.salary DESC)").await?;
 
     assert_eq!(result.len(), 5);
 
@@ -67,13 +70,16 @@ async fn test_window_row_number() -> Result<()> {
 #[tokio::test]
 async fn test_window_lag_basic() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.execute("CREATE LABEL Employee (salary INT)").await?;
-
-    db.execute("CREATE (e:Employee {salary: 100})").await?;
-    db.execute("CREATE (e:Employee {salary: 200})").await?;
-    db.execute("CREATE (e:Employee {salary: 300})").await?;
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE LABEL Employee (salary INT)").await?;
+    tx.execute("CREATE (e:Employee {salary: 100})").await?;
+    tx.execute("CREATE (e:Employee {salary: 200})").await?;
+    tx.execute("CREATE (e:Employee {salary: 300})").await?;
+    tx.commit().await?;
 
     let result = db
+        .session()
         .query(
             "MATCH (e:Employee)
          RETURN e.salary AS salary,
@@ -103,14 +109,17 @@ async fn test_window_lag_basic() -> Result<()> {
 #[tokio::test]
 async fn test_window_lag_with_offset() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.execute("CREATE LABEL Employee (salary INT)").await?;
-
-    db.execute("CREATE (e:Employee {salary: 100})").await?;
-    db.execute("CREATE (e:Employee {salary: 200})").await?;
-    db.execute("CREATE (e:Employee {salary: 300})").await?;
-    db.execute("CREATE (e:Employee {salary: 400})").await?;
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE LABEL Employee (salary INT)").await?;
+    tx.execute("CREATE (e:Employee {salary: 100})").await?;
+    tx.execute("CREATE (e:Employee {salary: 200})").await?;
+    tx.execute("CREATE (e:Employee {salary: 300})").await?;
+    tx.execute("CREATE (e:Employee {salary: 400})").await?;
+    tx.commit().await?;
 
     let result = db
+        .session()
         .query(
             "MATCH (e:Employee)
          RETURN e.salary AS salary,
@@ -143,12 +152,15 @@ async fn test_window_lag_with_offset() -> Result<()> {
 #[tokio::test]
 async fn test_window_lag_with_default() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.execute("CREATE LABEL Employee (salary INT)").await?;
-
-    db.execute("CREATE (e:Employee {salary: 100})").await?;
-    db.execute("CREATE (e:Employee {salary: 200})").await?;
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE LABEL Employee (salary INT)").await?;
+    tx.execute("CREATE (e:Employee {salary: 100})").await?;
+    tx.execute("CREATE (e:Employee {salary: 200})").await?;
+    tx.commit().await?;
 
     let result = db
+        .session()
         .query(
             "MATCH (e:Employee)
          RETURN e.salary AS salary,
@@ -174,22 +186,24 @@ async fn test_window_lag_with_default() -> Result<()> {
 #[tokio::test]
 async fn test_window_lag_partition() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.execute("CREATE LABEL Employee (dept STRING, salary INT)")
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE LABEL Employee (dept STRING, salary INT)")
         .await?;
-
     // Dept A
-    db.execute("CREATE (e:Employee {dept: 'A', salary: 100})")
+    tx.execute("CREATE (e:Employee {dept: 'A', salary: 100})")
         .await?;
-    db.execute("CREATE (e:Employee {dept: 'A', salary: 200})")
+    tx.execute("CREATE (e:Employee {dept: 'A', salary: 200})")
         .await?;
-
     // Dept B
-    db.execute("CREATE (e:Employee {dept: 'B', salary: 150})")
+    tx.execute("CREATE (e:Employee {dept: 'B', salary: 150})")
         .await?;
-    db.execute("CREATE (e:Employee {dept: 'B', salary: 250})")
+    tx.execute("CREATE (e:Employee {dept: 'B', salary: 250})")
         .await?;
+    tx.commit().await?;
 
     let result = db
+        .session()
         .query(
             "MATCH (e:Employee)
          RETURN e.dept AS dept,
@@ -225,13 +239,16 @@ async fn test_window_lag_partition() -> Result<()> {
 #[tokio::test]
 async fn test_window_lead_basic() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.execute("CREATE LABEL Employee (salary INT)").await?;
-
-    db.execute("CREATE (e:Employee {salary: 100})").await?;
-    db.execute("CREATE (e:Employee {salary: 200})").await?;
-    db.execute("CREATE (e:Employee {salary: 300})").await?;
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE LABEL Employee (salary INT)").await?;
+    tx.execute("CREATE (e:Employee {salary: 100})").await?;
+    tx.execute("CREATE (e:Employee {salary: 200})").await?;
+    tx.execute("CREATE (e:Employee {salary: 300})").await?;
+    tx.commit().await?;
 
     let result = db
+        .session()
         .query(
             "MATCH (e:Employee)
          RETURN e.salary AS salary,
@@ -261,14 +278,17 @@ async fn test_window_lead_basic() -> Result<()> {
 #[tokio::test]
 async fn test_window_lead_with_offset() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.execute("CREATE LABEL Employee (salary INT)").await?;
-
-    db.execute("CREATE (e:Employee {salary: 100})").await?;
-    db.execute("CREATE (e:Employee {salary: 200})").await?;
-    db.execute("CREATE (e:Employee {salary: 300})").await?;
-    db.execute("CREATE (e:Employee {salary: 400})").await?;
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE LABEL Employee (salary INT)").await?;
+    tx.execute("CREATE (e:Employee {salary: 100})").await?;
+    tx.execute("CREATE (e:Employee {salary: 200})").await?;
+    tx.execute("CREATE (e:Employee {salary: 300})").await?;
+    tx.execute("CREATE (e:Employee {salary: 400})").await?;
+    tx.commit().await?;
 
     let result = db
+        .session()
         .query(
             "MATCH (e:Employee)
          RETURN e.salary AS salary,
@@ -301,12 +321,15 @@ async fn test_window_lead_with_offset() -> Result<()> {
 #[tokio::test]
 async fn test_window_lead_with_default() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.execute("CREATE LABEL Employee (salary INT)").await?;
-
-    db.execute("CREATE (e:Employee {salary: 100})").await?;
-    db.execute("CREATE (e:Employee {salary: 200})").await?;
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE LABEL Employee (salary INT)").await?;
+    tx.execute("CREATE (e:Employee {salary: 100})").await?;
+    tx.execute("CREATE (e:Employee {salary: 200})").await?;
+    tx.commit().await?;
 
     let result = db
+        .session()
         .query(
             "MATCH (e:Employee)
          RETURN e.salary AS salary,
@@ -332,22 +355,24 @@ async fn test_window_lead_with_default() -> Result<()> {
 #[tokio::test]
 async fn test_window_lead_partition() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.execute("CREATE LABEL Employee (dept STRING, salary INT)")
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE LABEL Employee (dept STRING, salary INT)")
         .await?;
-
     // Dept A
-    db.execute("CREATE (e:Employee {dept: 'A', salary: 100})")
+    tx.execute("CREATE (e:Employee {dept: 'A', salary: 100})")
         .await?;
-    db.execute("CREATE (e:Employee {dept: 'A', salary: 200})")
+    tx.execute("CREATE (e:Employee {dept: 'A', salary: 200})")
         .await?;
-
     // Dept B
-    db.execute("CREATE (e:Employee {dept: 'B', salary: 150})")
+    tx.execute("CREATE (e:Employee {dept: 'B', salary: 150})")
         .await?;
-    db.execute("CREATE (e:Employee {dept: 'B', salary: 250})")
+    tx.execute("CREATE (e:Employee {dept: 'B', salary: 250})")
         .await?;
+    tx.commit().await?;
 
     let result = db
+        .session()
         .query(
             "MATCH (e:Employee)
          RETURN e.dept AS dept,
@@ -383,15 +408,18 @@ async fn test_window_lead_partition() -> Result<()> {
 #[tokio::test]
 async fn test_window_ntile_even() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.execute("CREATE LABEL Employee (salary INT)").await?;
-
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE LABEL Employee (salary INT)").await?;
     // Create 4 rows
-    db.execute("CREATE (e:Employee {salary: 100})").await?;
-    db.execute("CREATE (e:Employee {salary: 200})").await?;
-    db.execute("CREATE (e:Employee {salary: 300})").await?;
-    db.execute("CREATE (e:Employee {salary: 400})").await?;
+    tx.execute("CREATE (e:Employee {salary: 100})").await?;
+    tx.execute("CREATE (e:Employee {salary: 200})").await?;
+    tx.execute("CREATE (e:Employee {salary: 300})").await?;
+    tx.execute("CREATE (e:Employee {salary: 400})").await?;
+    tx.commit().await?;
 
     let result = db
+        .session()
         .query(
             "MATCH (e:Employee)
          RETURN e.salary AS salary,
@@ -423,15 +451,18 @@ async fn test_window_ntile_even() -> Result<()> {
 #[allow(clippy::needless_range_loop)]
 async fn test_window_ntile_uneven() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.execute("CREATE LABEL Employee (salary INT)").await?;
-
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE LABEL Employee (salary INT)").await?;
     // Create 10 rows
     for i in 1..=10 {
-        db.execute(&format!("CREATE (e:Employee {{salary: {}}})", i * 100))
+        tx.execute(&format!("CREATE (e:Employee {{salary: {}}})", i * 100))
             .await?;
     }
+    tx.commit().await?;
 
     let result = db
+        .session()
         .query(
             "MATCH (e:Employee)
          RETURN e.salary AS salary,
@@ -466,15 +497,18 @@ async fn test_window_ntile_uneven() -> Result<()> {
 #[allow(clippy::needless_range_loop)]
 async fn test_window_ntile_more_buckets_than_rows() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.execute("CREATE LABEL Employee (salary INT)").await?;
-
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE LABEL Employee (salary INT)").await?;
     // Create 5 rows
     for i in 1..=5 {
-        db.execute(&format!("CREATE (e:Employee {{salary: {}}})", i * 100))
+        tx.execute(&format!("CREATE (e:Employee {{salary: {}}})", i * 100))
             .await?;
     }
+    tx.commit().await?;
 
     let result = db
+        .session()
         .query(
             "MATCH (e:Employee)
          RETURN e.salary AS salary,
@@ -498,13 +532,16 @@ async fn test_window_ntile_more_buckets_than_rows() -> Result<()> {
 #[allow(clippy::needless_range_loop)]
 async fn test_window_ntile_single_bucket() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.execute("CREATE LABEL Employee (salary INT)").await?;
-
-    db.execute("CREATE (e:Employee {salary: 100})").await?;
-    db.execute("CREATE (e:Employee {salary: 200})").await?;
-    db.execute("CREATE (e:Employee {salary: 300})").await?;
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE LABEL Employee (salary INT)").await?;
+    tx.execute("CREATE (e:Employee {salary: 100})").await?;
+    tx.execute("CREATE (e:Employee {salary: 200})").await?;
+    tx.execute("CREATE (e:Employee {salary: 300})").await?;
+    tx.commit().await?;
 
     let result = db
+        .session()
         .query(
             "MATCH (e:Employee)
          RETURN e.salary AS salary,
@@ -527,11 +564,14 @@ async fn test_window_ntile_single_bucket() -> Result<()> {
 #[tokio::test]
 async fn test_window_ntile_zero_buckets() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.execute("CREATE LABEL Employee (salary INT)").await?;
-
-    db.execute("CREATE (e:Employee {salary: 100})").await?;
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE LABEL Employee (salary INT)").await?;
+    tx.execute("CREATE (e:Employee {salary: 100})").await?;
+    tx.commit().await?;
 
     let result = db
+        .session()
         .query(
             "MATCH (e:Employee)
          RETURN e.salary AS salary,
@@ -550,14 +590,17 @@ async fn test_window_ntile_zero_buckets() -> Result<()> {
 #[tokio::test]
 async fn test_window_rank() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.execute("CREATE LABEL Employee (salary INT)").await?;
-
-    db.execute("CREATE (e:Employee {salary: 100})").await?;
-    db.execute("CREATE (e:Employee {salary: 200})").await?;
-    db.execute("CREATE (e:Employee {salary: 200})").await?; // Tie
-    db.execute("CREATE (e:Employee {salary: 300})").await?;
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE LABEL Employee (salary INT)").await?;
+    tx.execute("CREATE (e:Employee {salary: 100})").await?;
+    tx.execute("CREATE (e:Employee {salary: 200})").await?;
+    tx.execute("CREATE (e:Employee {salary: 200})").await?; // Tie
+    tx.execute("CREATE (e:Employee {salary: 300})").await?;
+    tx.commit().await?;
 
     let result = db
+        .session()
         .query(
             "MATCH (e:Employee)
          RETURN e.salary AS salary,
@@ -590,14 +633,17 @@ async fn test_window_rank() -> Result<()> {
 #[tokio::test]
 async fn test_window_dense_rank() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-    db.execute("CREATE LABEL Employee (salary INT)").await?;
-
-    db.execute("CREATE (e:Employee {salary: 100})").await?;
-    db.execute("CREATE (e:Employee {salary: 200})").await?;
-    db.execute("CREATE (e:Employee {salary: 200})").await?; // Tie
-    db.execute("CREATE (e:Employee {salary: 300})").await?;
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE LABEL Employee (salary INT)").await?;
+    tx.execute("CREATE (e:Employee {salary: 100})").await?;
+    tx.execute("CREATE (e:Employee {salary: 200})").await?;
+    tx.execute("CREATE (e:Employee {salary: 200})").await?; // Tie
+    tx.execute("CREATE (e:Employee {salary: 300})").await?;
+    tx.commit().await?;
 
     let result = db
+        .session()
         .query(
             "MATCH (e:Employee)
          RETURN e.salary AS salary,
@@ -633,23 +679,25 @@ async fn test_window_dense_rank() -> Result<()> {
 #[tokio::test]
 async fn test_window_first_value() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-
-    db.execute("CREATE LABEL Employee (dept STRING, salary INT)")
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE LABEL Employee (dept STRING, salary INT)")
         .await?;
-
-    db.execute("CREATE (e:Employee {dept: 'A', salary: 100})")
+    tx.execute("CREATE (e:Employee {dept: 'A', salary: 100})")
         .await?;
-    db.execute("CREATE (e:Employee {dept: 'A', salary: 200})")
+    tx.execute("CREATE (e:Employee {dept: 'A', salary: 200})")
         .await?;
-    db.execute("CREATE (e:Employee {dept: 'A', salary: 300})")
+    tx.execute("CREATE (e:Employee {dept: 'A', salary: 300})")
         .await?;
-    db.execute("CREATE (e:Employee {dept: 'B', salary: 150})")
+    tx.execute("CREATE (e:Employee {dept: 'B', salary: 150})")
         .await?;
-    db.execute("CREATE (e:Employee {dept: 'B', salary: 250})")
+    tx.execute("CREATE (e:Employee {dept: 'B', salary: 250})")
         .await?;
+    tx.commit().await?;
 
     // FIRST_VALUE returns the first value in the partition (after ordering)
     let result = db
+        .session()
         .query(
             "MATCH (e:Employee) 
              RETURN e.dept AS dept, e.salary AS salary, 
@@ -676,23 +724,25 @@ async fn test_window_first_value() -> Result<()> {
 #[tokio::test]
 async fn test_window_last_value() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-
-    db.execute("CREATE LABEL Employee (dept STRING, salary INT)")
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE LABEL Employee (dept STRING, salary INT)")
         .await?;
-
-    db.execute("CREATE (e:Employee {dept: 'A', salary: 100})")
+    tx.execute("CREATE (e:Employee {dept: 'A', salary: 100})")
         .await?;
-    db.execute("CREATE (e:Employee {dept: 'A', salary: 200})")
+    tx.execute("CREATE (e:Employee {dept: 'A', salary: 200})")
         .await?;
-    db.execute("CREATE (e:Employee {dept: 'A', salary: 300})")
+    tx.execute("CREATE (e:Employee {dept: 'A', salary: 300})")
         .await?;
-    db.execute("CREATE (e:Employee {dept: 'B', salary: 150})")
+    tx.execute("CREATE (e:Employee {dept: 'B', salary: 150})")
         .await?;
-    db.execute("CREATE (e:Employee {dept: 'B', salary: 250})")
+    tx.execute("CREATE (e:Employee {dept: 'B', salary: 250})")
         .await?;
+    tx.commit().await?;
 
     // LAST_VALUE returns the last value in the partition (after ordering)
     let result = db
+        .session()
         .query(
             "MATCH (e:Employee) 
              RETURN e.dept AS dept, e.salary AS salary, 
@@ -719,24 +769,25 @@ async fn test_window_last_value() -> Result<()> {
 #[tokio::test]
 async fn test_window_nth_value() -> Result<()> {
     let db = Uni::in_memory().build().await?;
-
-    db.execute("CREATE LABEL Employee (dept STRING, salary INT)")
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE LABEL Employee (dept STRING, salary INT)")
         .await?;
-
-    db.execute("CREATE (e:Employee {dept: 'A', salary: 100})")
+    tx.execute("CREATE (e:Employee {dept: 'A', salary: 100})")
         .await?;
-    db.execute("CREATE (e:Employee {dept: 'A', salary: 200})")
+    tx.execute("CREATE (e:Employee {dept: 'A', salary: 200})")
         .await?;
-    db.execute("CREATE (e:Employee {dept: 'A', salary: 300})")
+    tx.execute("CREATE (e:Employee {dept: 'A', salary: 300})")
         .await?;
-    db.execute("CREATE (e:Employee {dept: 'B', salary: 150})")
+    tx.execute("CREATE (e:Employee {dept: 'B', salary: 150})")
         .await?;
-    db.execute("CREATE (e:Employee {dept: 'B', salary: 250})")
+    tx.execute("CREATE (e:Employee {dept: 'B', salary: 250})")
         .await?;
+    tx.commit().await?;
 
     // NTH_VALUE(expr, 2) returns the 2nd value in the partition
     let result = db
-        .query(
+        .session().query(
             "MATCH (e:Employee) 
              RETURN e.dept AS dept, e.salary AS salary, 
                     nth_value(e.salary, 2) OVER (PARTITION BY e.dept ORDER BY e.salary) AS second_sal

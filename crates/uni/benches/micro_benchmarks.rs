@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Dragonscale Team
 
-use arrow_array::builder::FixedSizeListBuilder;
-use arrow_array::builder::Float32Builder;
-use arrow_array::builder::ListBuilder;
-use arrow_array::builder::UInt64Builder;
-use arrow_array::{BooleanArray, RecordBatch, UInt64Array};
+use arrow_array::builder::{
+    FixedSizeListBuilder, Float32Builder, GenericListBuilder, LargeBinaryBuilder, ListBuilder,
+    StringBuilder, TimestampNanosecondBuilder, UInt64Builder,
+};
+use arrow_array::{BooleanArray, RecordBatch, StringArray, UInt64Array};
 use criterion::{Criterion, criterion_group, criterion_main};
 use std::sync::Arc;
 use tempfile::tempdir;
@@ -59,24 +59,59 @@ fn bench_vector_search(c: &mut Criterion) {
             vec_builder.append(true);
         }
 
+        // Build nullable metadata columns
+        let n = num_items as usize;
+        let ext_id_array = StringArray::from(vec![None::<&str>; n]); // ext_id (nullable)
+
+        let mut labels_builder: GenericListBuilder<i32, StringBuilder> =
+            ListBuilder::new(StringBuilder::new());
+        for _ in 0..n {
+            labels_builder.values().append_value("Item");
+            labels_builder.append(true);
+        }
+        let labels_array = labels_builder.finish();
+
+        let mut created_builder = TimestampNanosecondBuilder::new().with_timezone("UTC");
+        for _ in 0..n {
+            created_builder.append_null();
+        }
+        let created_array = created_builder.finish();
+
+        let mut updated_builder = TimestampNanosecondBuilder::new().with_timezone("UTC");
+        for _ in 0..n {
+            updated_builder.append_null();
+        }
+        let updated_array = updated_builder.finish();
+
+        let mut overflow_builder = LargeBinaryBuilder::new();
+        for _ in 0..n {
+            overflow_builder.append_null();
+        }
+        let overflow_array = overflow_builder.finish();
+
         let batch = RecordBatch::try_new(
             schema,
             vec![
                 Arc::new(UInt64Array::from(vids)), // _vid
                 Arc::new(arrow_array::FixedSizeBinaryArray::new(
                     32,
-                    vec![0u8; 32 * num_items as usize].into(),
+                    vec![0u8; 32 * n].into(),
                     None,
                 )), // _uid
-                Arc::new(BooleanArray::from(vec![false; num_items as usize])), // _deleted
-                Arc::new(UInt64Array::from(vec![1; num_items as usize])), // _version
+                Arc::new(BooleanArray::from(vec![false; n])), // _deleted
+                Arc::new(UInt64Array::from(vec![1; n])), // _version
+                Arc::new(ext_id_array),            // ext_id
+                Arc::new(labels_array),            // _labels
+                Arc::new(created_array),           // _created_at
+                Arc::new(updated_array),           // _updated_at
                 Arc::new(vec_builder.finish()),    // embedding
+                Arc::new(overflow_array),          // overflow_json
             ],
         )
         .unwrap();
 
-        let lancedb_store = storage.lancedb_store();
-        ds.write_batch_lancedb(lancedb_store, batch, &schema_manager.schema())
+        let backend = storage.backend();
+        ds.write_batch(backend, batch, &schema_manager.schema())
             .await
             .unwrap();
     });
@@ -156,11 +191,8 @@ fn bench_graph_traversal(c: &mut Criterion) {
             ],
         )
         .unwrap();
-        let lancedb_store = storage.lancedb_store();
-        adj_ds
-            .write_chunk_lancedb(lancedb_store, batch)
-            .await
-            .unwrap();
+        let backend = storage.backend();
+        adj_ds.write_chunk(backend, batch).await.unwrap();
     });
 
     let schema_manager = rt

@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 """Generate example Jupyter notebooks for uni-pydantic."""
 
+import hashlib
 import json
 import os
-import uuid
 
 
-def generate_cell_id():
-    """Generate a unique cell ID."""
-    return str(uuid.uuid4()).replace("-", "")[:32]
+def _cell_id(notebook_key: str, index: int, cell_type: str) -> str:
+    """Generate a deterministic cell ID from notebook key, index, and type."""
+    raw = f"{notebook_key}:{index}:{cell_type}".encode()
+    return hashlib.sha256(raw).hexdigest()[:32]
 
 
-def create_notebook(cells):
+def create_notebook(notebook_key, cells):
     """Create a notebook structure with cells."""
-    for cell in cells:
-        if "id" not in cell:
-            cell["id"] = generate_cell_id()
+    for i, cell in enumerate(cells):
+        cell["id"] = _cell_id(notebook_key, i, cell["cell_type"])
     return {
         "cells": cells,
         "metadata": {
@@ -42,7 +42,6 @@ def create_notebook(cells):
 def md_cell(source):
     """Create a markdown cell."""
     return {
-        "id": generate_cell_id(),
         "cell_type": "markdown",
         "metadata": {},
         "source": [line + "\n" for line in source],
@@ -52,7 +51,6 @@ def md_cell(source):
 def code_cell(source):
     """Create a code cell."""
     return {
-        "id": generate_cell_id(),
         "cell_type": "code",
         "execution_count": None,
         "metadata": {},
@@ -87,7 +85,7 @@ def db_setup(name):
         f'db_path = os.path.join(tempfile.gettempdir(), "{name}_pydantic_db")',
         "if os.path.exists(db_path):",
         "    shutil.rmtree(db_path)",
-        "db = uni_db.Database(db_path)",
+        "db = uni_db.Uni.open(db_path)",
         "",
         "# Create session and register models",
         "session = UniSession(db)",
@@ -98,6 +96,7 @@ def db_setup(name):
 # 1. Supply Chain Notebook
 # =============================================================================
 supply_chain_nb = create_notebook(
+    "supply_chain",
     [
         md_cell(
             [
@@ -357,7 +356,7 @@ supply_chain_nb = create_notebook(
                 '    print(f"  - {part.name} ({part.sku}): ${part.cost:,.2f}")',
             ]
         ),
-    ]
+    ],
 )
 
 
@@ -365,6 +364,7 @@ supply_chain_nb = create_notebook(
 # 2. Recommendation Notebook
 # =============================================================================
 rec_nb = create_notebook(
+    "recommendation",
     [
         md_cell(
             [
@@ -448,9 +448,7 @@ rec_nb = create_notebook(
                 "                 alice, bob, carol, dave])",
                 "session.commit()",
                 "",
-                "# Create vector index AFTER commit",
-                'db.create_vector_index("Book", "embedding", "l2")',
-                'print("Data ingested and vector index created")',
+                'print("Data ingested")',
             ]
         ),
         code_cell(
@@ -585,7 +583,7 @@ rec_nb = create_notebook(
                 '    print(f"  - {book.name}")',
             ]
         ),
-    ]
+    ],
 )
 
 
@@ -593,6 +591,7 @@ rec_nb = create_notebook(
 # 3. RAG Notebook
 # =============================================================================
 rag_nb = create_notebook(
+    "rag",
     [
         md_cell(
             [
@@ -690,9 +689,7 @@ rag_nb = create_notebook(
                 "                 jwt, auth_entity, routing_ent, db_entity, bcrypt_ent, pool_entity])",
                 "session.commit()",
                 "",
-                "# Create vector index AFTER commit",
-                'db.create_vector_index("Chunk", "embedding", "l2")',
-                'print("Data ingested and vector index created")',
+                'print("Data ingested")',
             ]
         ),
         code_cell(
@@ -840,7 +837,7 @@ rag_nb = create_notebook(
                 'print(f"Total chunks in knowledge base: {total_chunks}")',
             ]
         ),
-    ]
+    ],
 )
 
 
@@ -848,6 +845,7 @@ rag_nb = create_notebook(
 # 4. Fraud Detection Notebook
 # =============================================================================
 fraud_nb = create_notebook(
+    "fraud_detection",
     [
         md_cell(
             [
@@ -1089,7 +1087,7 @@ fraud_nb = create_notebook(
                 '    print(f"  {user.name} (risk={user.risk_score})")',
             ]
         ),
-    ]
+    ],
 )
 
 
@@ -1097,6 +1095,7 @@ fraud_nb = create_notebook(
 # 5. Sales Analytics Notebook
 # =============================================================================
 sales_nb = create_notebook(
+    "sales_analytics",
     [
         md_cell(
             [
@@ -1381,7 +1380,7 @@ sales_nb = create_notebook(
                 'print(f"  Large  (>=$500):    {large}")',
             ]
         ),
-    ]
+    ],
 )
 
 

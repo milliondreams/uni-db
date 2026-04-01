@@ -26,9 +26,12 @@ use uni_db::{DataType, Uni};
 async fn test_create_node_return_id() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
-    db.execute("CREATE LABEL Person (name STRING)").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL Person (name STRING)").await?;
+    tx.commit().await?;
 
     let result = db
+        .session()
         .query("CREATE (n:Person {name: 'Alice'}) RETURN id(n) AS vid")
         .await?;
 
@@ -43,11 +46,14 @@ async fn test_create_node_return_id() -> Result<()> {
 async fn test_create_edge_return_id() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
-    db.execute("CREATE LABEL Person (name STRING)").await?;
-    db.execute("CREATE EDGE TYPE KNOWS FROM Person TO Person")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL Person (name STRING)").await?;
+    tx.execute("CREATE EDGE TYPE KNOWS FROM Person TO Person")
         .await?;
+    tx.commit().await?;
 
     let result = db
+        .session()
         .query(
             "CREATE (a:Person {name: 'Alice'})-[r:KNOWS]->(b:Person {name: 'Bob'}) \
              RETURN id(r) AS eid",
@@ -65,9 +71,12 @@ async fn test_create_edge_return_id() -> Result<()> {
 async fn test_create_node_return_id_and_properties() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
-    db.execute("CREATE LABEL Person (name STRING)").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL Person (name STRING)").await?;
+    tx.commit().await?;
 
     let result = db
+        .session()
         .query("CREATE (n:Person {name: 'Alice'}) RETURN id(n) AS vid, n.name AS name")
         .await?;
 
@@ -91,14 +100,18 @@ async fn test_create_node_return_id_and_properties() -> Result<()> {
 async fn test_execute_create_returns_affected_rows() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
-    db.execute("CREATE LABEL Person (name STRING)").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL Person (name STRING)").await?;
+    tx.commit().await?;
 
-    let result = db.execute("CREATE (:Person {name: 'Alice'})").await?;
+    let tx = db.session().tx().await?;
+    let result = tx.execute("CREATE (:Person {name: 'Alice'})").await?;
+    tx.commit().await?;
 
     assert!(
-        result.affected_rows >= 1,
+        result.affected_rows() >= 1,
         "CREATE of 1 node should report affected_rows >= 1, got {}",
-        result.affected_rows,
+        result.affected_rows(),
     );
 
     Ok(())
@@ -108,16 +121,20 @@ async fn test_execute_create_returns_affected_rows() -> Result<()> {
 async fn test_execute_create_multiple_returns_affected_rows() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
-    db.execute("CREATE LABEL Person (name STRING)").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL Person (name STRING)").await?;
+    tx.commit().await?;
 
-    let result = db
+    let tx = db.session().tx().await?;
+    let result = tx
         .execute("CREATE (:Person {name: 'Alice'}), (:Person {name: 'Bob'})")
         .await?;
+    tx.commit().await?;
 
     assert!(
-        result.affected_rows >= 2,
+        result.affected_rows() >= 2,
         "CREATE of 2 nodes should report affected_rows >= 2, got {}",
-        result.affected_rows,
+        result.affected_rows(),
     );
 
     Ok(())
@@ -127,17 +144,21 @@ async fn test_execute_create_multiple_returns_affected_rows() -> Result<()> {
 async fn test_execute_delete_returns_affected_rows() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
-    db.execute("CREATE LABEL Person (name STRING)").await?;
-    db.execute("CREATE (:Person {name: 'Alice'})").await?;
-    db.execute("CREATE (:Person {name: 'Bob'})").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL Person (name STRING)").await?;
+    tx.execute("CREATE (:Person {name: 'Alice'})").await?;
+    tx.execute("CREATE (:Person {name: 'Bob'})").await?;
+    tx.commit().await?;
     db.flush().await?;
 
-    let result = db.execute("MATCH (n:Person) DELETE n").await?;
+    let tx = db.session().tx().await?;
+    let result = tx.execute("MATCH (n:Person) DELETE n").await?;
+    tx.commit().await?;
 
     assert!(
-        result.affected_rows >= 1,
+        result.affected_rows() >= 1,
         "DELETE should report affected_rows >= 1, got {}",
-        result.affected_rows,
+        result.affected_rows(),
     );
 
     Ok(())
@@ -147,20 +168,24 @@ async fn test_execute_delete_returns_affected_rows() -> Result<()> {
 async fn test_execute_set_returns_affected_rows() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
-    db.execute("CREATE LABEL Person (name STRING, age INT)")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL Person (name STRING, age INT)")
         .await?;
-    db.execute("CREATE (:Person {name: 'Alice', age: 25})")
+    tx.execute("CREATE (:Person {name: 'Alice', age: 25})")
         .await?;
+    tx.commit().await?;
     db.flush().await?;
 
-    let result = db
+    let tx = db.session().tx().await?;
+    let result = tx
         .execute("MATCH (n:Person {name: 'Alice'}) SET n.age = 30")
         .await?;
+    tx.commit().await?;
 
     assert!(
-        result.affected_rows >= 1,
+        result.affected_rows() >= 1,
         "SET should report affected_rows >= 1, got {}",
-        result.affected_rows,
+        result.affected_rows(),
     );
 
     Ok(())
@@ -215,7 +240,9 @@ async fn test_list_labels_after_schema_then_create() -> Result<()> {
     );
 
     // Step 2: Create a vertex — label should still appear.
-    db.execute("CREATE (:Person {name: 'Alice'})").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Person {name: 'Alice'})").await?;
+    tx.commit().await?;
     db.flush().await?;
 
     let labels = db.list_labels().await?;

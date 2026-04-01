@@ -2,6 +2,9 @@
 
 This document describes how Uni transforms Cypher queries into optimized physical execution plans. The query planner is responsible for parsing, semantic analysis, optimization, and code generation.
 
+!!! note "Design Model"
+    This document describes the **design model** behind Uni's query planning pipeline. The six-phase flow (parse → rewrite → analyze → plan → optimize → execute) and the optimization principles (predicate pushdown, projection pushdown, limit pushdown, scan-to-index) are accurate. The actual implementation delegates to **Apache DataFusion** for logical/physical planning and execution, so the Rust struct and enum names shown here (e.g., `LogicalPlan`, `PhysicalPlan`, `CypherParser`) are **conceptual illustrations**, not literal source code.
+
 ## Planning Pipeline Overview
 
 ```mermaid

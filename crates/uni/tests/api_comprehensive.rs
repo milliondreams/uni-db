@@ -21,16 +21,17 @@ async fn test_complex_cypher() -> Result<()> {
         .await?;
 
     // Data
-    db.execute("CREATE (p1:Product {name: 'Apple', price: 1.2})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (p1:Product {name: 'Apple', price: 1.2})")
         .await?;
-    db.execute("CREATE (p2:Product {name: 'Banana', price: 0.8})")
+    tx.execute("CREATE (p2:Product {name: 'Banana', price: 0.8})")
         .await?;
-    db.execute("CREATE (o1:Order {date: '2024-01-01'})").await?;
-    db.execute("CREATE (o2:Order {date: '2024-01-02'})").await?;
-
-    db.execute("MATCH (o:Order {date: '2024-01-01'}), (p:Product {name: 'Apple'}) CREATE (o)-[:CONTAINS {qty: 10}]->(p)").await?;
-    db.execute("MATCH (o:Order {date: '2024-01-01'}), (p:Product {name: 'Banana'}) CREATE (o)-[:CONTAINS {qty: 5}]->(p)").await?;
-    db.execute("MATCH (o:Order {date: '2024-01-02'}), (p:Product {name: 'Apple'}) CREATE (o)-[:CONTAINS {qty: 20}]->(p)").await?;
+    tx.execute("CREATE (o1:Order {date: '2024-01-01'})").await?;
+    tx.execute("CREATE (o2:Order {date: '2024-01-02'})").await?;
+    tx.execute("MATCH (o:Order {date: '2024-01-01'}), (p:Product {name: 'Apple'}) CREATE (o)-[:CONTAINS {qty: 10}]->(p)").await?;
+    tx.execute("MATCH (o:Order {date: '2024-01-01'}), (p:Product {name: 'Banana'}) CREATE (o)-[:CONTAINS {qty: 5}]->(p)").await?;
+    tx.execute("MATCH (o:Order {date: '2024-01-02'}), (p:Product {name: 'Apple'}) CREATE (o)-[:CONTAINS {qty: 20}]->(p)").await?;
+    tx.commit().await?;
 
     // Aggregation
     // Total quantity per product
@@ -38,7 +39,7 @@ async fn test_complex_cypher() -> Result<()> {
         MATCH (o:Order)-[r:CONTAINS]->(p:Product)
         RETURN p.name, sum(r.qty) as total_qty
     ";
-    let result = db.query(query).await?;
+    let result = db.session().query(query).await?;
     assert_eq!(result.len(), 2);
 
     let mut map = std::collections::HashMap::new();
@@ -59,12 +60,12 @@ async fn test_error_handling() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
     // 1. Invalid Syntax
-    let res = db.query("MATCH (n").await;
+    let res = db.session().query("MATCH (n").await;
     assert!(matches!(res, Err(UniError::Parse { .. })));
 
     // 2. Unknown Label - now supported via schemaless mode (ScanMainByLabel)
     // Instead of erroring, it returns empty results for unknown labels
-    let res = db.query("MATCH (n:NonExistent) RETURN n").await;
+    let res = db.session().query("MATCH (n:NonExistent) RETURN n").await;
     // Schemaless support: unknown labels return empty result set (not an error)
     assert!(
         res.is_ok(),
@@ -83,8 +84,10 @@ async fn test_error_handling() -> Result<()> {
         .await?;
     // Uni currently doesn't enforce schema constraints on write strictly in L0
     // (L0 is schema-less/flexible), but read might fail or cast?
-    db.execute("CREATE (:User {age: 25})").await?;
-    let res = db.query("MATCH (u:User) RETURN u.age").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:User {age: 25})").await?;
+    tx.commit().await?;
+    let res = db.session().query("MATCH (u:User) RETURN u.age").await?;
     let row = &res.rows()[0];
 
     // Try to get int as bool (should fail)
@@ -96,7 +99,6 @@ async fn test_error_handling() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "Uni is single-writer by design; test validates proper concurrent write rejection"]
 async fn test_concurrency() -> Result<()> {
     let db = Arc::new(Uni::in_memory().build().await?);
 
@@ -105,14 +107,17 @@ async fn test_concurrency() -> Result<()> {
         .property("val", DataType::Int32)
         .apply()
         .await?;
-    db.execute("CREATE (:Counter {val: 0})").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Counter {val: 0})").await?;
+    tx.commit().await?;
 
     let mut handles = Vec::new();
     for _ in 0..10 {
         let db_clone = db.clone();
         handles.push(tokio::spawn(async move {
             // Read-modify-write in transaction
-            let tx = db_clone.begin().await.unwrap();
+            let session = db_clone.session();
+            let tx = session.tx().await.unwrap();
             // Note: Uni Cypher doesn't support "SET n.val = n.val + 1" atomically in one go
             // if planner doesn't support expression on RHS of SET referencing LHS?
             // Planner supports generic SET expressions.
@@ -141,7 +146,10 @@ async fn test_concurrency() -> Result<()> {
         h.await?;
     }
 
-    let count = db.query("MATCH (c:Counter) RETURN count(c) as cnt").await?;
+    let count = db
+        .session()
+        .query("MATCH (c:Counter) RETURN count(c) as cnt")
+        .await?;
     // 1 initial + 10 inserts = 11
     let cnt = count.rows()[0].get::<i64>("cnt")?;
     assert_eq!(cnt, 11);
@@ -152,8 +160,11 @@ async fn test_concurrency() -> Result<()> {
 #[tokio::test]
 async fn test_builder_config() -> Result<()> {
     let db = Uni::open("tmp/test_config")
-        .cache_size(1024 * 1024) // 1MB
-        .parallelism(2)
+        .config(uni_db::UniConfig {
+            cache_size: 1024 * 1024, // 1MB
+            parallelism: 2,
+            ..Default::default()
+        })
         .build()
         .await?;
 

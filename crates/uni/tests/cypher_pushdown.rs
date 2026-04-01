@@ -137,13 +137,13 @@ async fn test_pushdown_execution() -> anyhow::Result<()> {
         let v1 = w.next_vid().await?;
         let mut p1 = std::collections::HashMap::new();
         p1.insert("name".to_string(), unival!("Alice"));
-        w.insert_vertex_with_labels(v1, p1, &["Person".to_string()])
+        w.insert_vertex_with_labels(v1, p1, &["Person".to_string()], None)
             .await?;
 
         let v2 = w.next_vid().await?;
         let mut p2 = std::collections::HashMap::new();
         p2.insert("name".to_string(), unival!("Bob"));
-        w.insert_vertex_with_labels(v2, p2, &["Person".to_string()])
+        w.insert_vertex_with_labels(v2, p2, &["Person".to_string()], None)
             .await?;
 
         w.flush_to_l1(None).await?;
@@ -196,19 +196,19 @@ async fn test_or_pushdown_execution() -> anyhow::Result<()> {
         let v1 = w.next_vid().await?;
         let mut p1 = std::collections::HashMap::new();
         p1.insert("status".to_string(), unival!("active"));
-        w.insert_vertex_with_labels(v1, p1, &["Person".to_string()])
+        w.insert_vertex_with_labels(v1, p1, &["Person".to_string()], None)
             .await?;
 
         let v2 = w.next_vid().await?;
         let mut p2 = std::collections::HashMap::new();
         p2.insert("status".to_string(), unival!("pending"));
-        w.insert_vertex_with_labels(v2, p2, &["Person".to_string()])
+        w.insert_vertex_with_labels(v2, p2, &["Person".to_string()], None)
             .await?;
 
         let v3 = w.next_vid().await?;
         let mut p3 = std::collections::HashMap::new();
         p3.insert("status".to_string(), unival!("archived"));
-        w.insert_vertex_with_labels(v3, p3, &["Person".to_string()])
+        w.insert_vertex_with_labels(v3, p3, &["Person".to_string()], None)
             .await?;
 
         w.flush_to_l1(None).await?;
@@ -265,14 +265,14 @@ async fn test_is_null_execution() -> anyhow::Result<()> {
         let v1 = w.next_vid().await?;
         let mut p1 = std::collections::HashMap::new();
         p1.insert("email".to_string(), unival!("alice@example.com"));
-        w.insert_vertex_with_labels(v1, p1, &["Person".to_string()])
+        w.insert_vertex_with_labels(v1, p1, &["Person".to_string()], None)
             .await?;
 
         // v2: null email (explicit null or missing property?)
         // Missing property is treated as null in lookups
         let v2 = w.next_vid().await?;
         let p2 = std::collections::HashMap::new();
-        w.insert_vertex_with_labels(v2, p2, &["Person".to_string()])
+        w.insert_vertex_with_labels(v2, p2, &["Person".to_string()], None)
             .await?;
 
         w.flush_to_l1(None).await?;
@@ -351,18 +351,21 @@ async fn test_traverse_target_pushdown() -> anyhow::Result<()> {
             v1,
             [("name".to_string(), unival!("Source"))].into(),
             &["Person".to_string()],
+            None,
         )
         .await?;
         w.insert_vertex_with_labels(
             v2,
             [("age".to_string(), unival!(25))].into(),
             &["Person".to_string()],
+            None,
         )
         .await?;
         w.insert_vertex_with_labels(
             v3,
             [("age".to_string(), unival!(35))].into(),
             &["Person".to_string()],
+            None,
         )
         .await?;
 
@@ -374,6 +377,7 @@ async fn test_traverse_target_pushdown() -> anyhow::Result<()> {
             eid1,
             std::collections::HashMap::new(),
             None,
+            None,
         )
         .await?;
 
@@ -384,6 +388,7 @@ async fn test_traverse_target_pushdown() -> anyhow::Result<()> {
             knows_type,
             eid2,
             std::collections::HashMap::new(),
+            None,
             None,
         )
         .await?;
@@ -483,6 +488,7 @@ async fn test_apply_input_filter_pushdown() -> anyhow::Result<()> {
             ]
             .into(),
             &["Person".to_string()],
+            None,
         )
         .await?;
         w.insert_vertex_with_labels(
@@ -494,6 +500,7 @@ async fn test_apply_input_filter_pushdown() -> anyhow::Result<()> {
             ]
             .into(),
             &["Person".to_string()],
+            None,
         )
         .await?;
         w.insert_vertex_with_labels(
@@ -505,6 +512,7 @@ async fn test_apply_input_filter_pushdown() -> anyhow::Result<()> {
             ]
             .into(),
             &["Person".to_string()],
+            None,
         )
         .await?;
 
@@ -603,6 +611,7 @@ async fn test_call_subquery_input_filter_pushdown() -> anyhow::Result<()> {
             ]
             .into(),
             &["Person".to_string()],
+            None,
         )
         .await?;
         w.insert_vertex_with_labels(
@@ -613,6 +622,7 @@ async fn test_call_subquery_input_filter_pushdown() -> anyhow::Result<()> {
             ]
             .into(),
             &["Person".to_string()],
+            None,
         )
         .await?;
         w.insert_vertex_with_labels(
@@ -623,6 +633,7 @@ async fn test_call_subquery_input_filter_pushdown() -> anyhow::Result<()> {
             ]
             .into(),
             &["Person".to_string()],
+            None,
         )
         .await?;
 

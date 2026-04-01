@@ -64,19 +64,19 @@ The first step is opening or creating a database. Uni uses a builder pattern for
     import uni_db
 
     # Open or create a database (creates if doesn't exist)
-    db = uni_db.DatabaseBuilder.open("./my-graph").build()
+    db = uni_db.Uni.open("./my-graph")
 
     # Open existing database (fails if doesn't exist)
-    db = uni_db.DatabaseBuilder.open_existing("./my-graph").build()
+    db = uni_db.Uni.open_existing("./my-graph")
 
     # Create new database (fails if already exists)
-    db = uni_db.DatabaseBuilder.create("./my-graph").build()
+    db = uni_db.Uni.create("./my-graph")
 
     # Temporary in-memory database
-    db = uni_db.DatabaseBuilder.temporary().build()
+    db = uni_db.Uni.temporary()
 
-    # Simple shorthand (open or create)
-    db = uni_db.Database("./my-graph")
+    # Use the builder for advanced configuration
+    db = uni_db.UniBuilder.open("./my-graph").cache_size(1024 * 1024 * 1024).build()
     ```
 
 ### Configuration Options
@@ -97,7 +97,7 @@ Configure cache size, parallelism, and other options:
 
     ```python
     db = (
-        uni_db.DatabaseBuilder.open("./my-graph")
+        uni_db.UniBuilder.open("./my-graph")
         .cache_size(2 * 1024 * 1024 * 1024)  # 2 GB cache
         .parallelism(8)                       # 8 worker threads
         .build()
@@ -125,13 +125,13 @@ Open databases directly from cloud object stores:
 
     ```python
     # Amazon S3
-    db = uni_db.DatabaseBuilder.open("s3://my-bucket/graph-data").build()
+    db = uni_db.UniBuilder.open("s3://my-bucket/graph-data").build()
 
     # Google Cloud Storage
-    db = uni_db.DatabaseBuilder.open("gs://my-bucket/graph-data").build()
+    db = uni_db.UniBuilder.open("gs://my-bucket/graph-data").build()
 
     # Azure Blob Storage
-    db = uni_db.DatabaseBuilder.open("az://my-container/graph-data").build()
+    db = uni_db.UniBuilder.open("az://my-container/graph-data").build()
     ```
 
 Credentials are resolved automatically from environment variables or standard config files (AWS credentials, GCP Application Default Credentials, Azure CLI).
@@ -166,7 +166,7 @@ For optimal write performance with cloud durability, use hybrid mode:
     ```python
     # Local cache with S3 backend
     db = (
-        uni_db.DatabaseBuilder.open("./local-cache")
+        uni_db.UniBuilder.open("./local-cache")
         .hybrid("./local-cache", "s3://my-bucket/graph-data")
         .build()
     )
@@ -296,15 +296,15 @@ For simple cases, use the schema builder (Rust) or direct schema calls (Python):
 === "Python"
 
     ```python
-    # Create label
-    db.create_label("Person")
-
-    # Add property (label, name, type, nullable)
-    db.add_property("Person", "name", "string", False)  # required
-    db.add_property("Person", "email", "string", True)  # nullable
-
-    # Create index
-    db.create_scalar_index("Person", "name", "btree")
+    # Use the schema builder for quick definitions too
+    (
+        db.schema()
+        .label("Person")
+        .property("name", "string")
+        .property_nullable("email", "string")
+        .index("name", "btree")
+        .apply()
+    )
     ```
 
 ### Schemaless Labels
@@ -318,16 +318,20 @@ For simple cases, use the schema builder (Rust) or direct schema calls (Python):
     // Create a label with NO properties defined
     db.schema().label("Document").apply().await?;
 
+    let session = db.session();
+
     // Insert with arbitrary properties
-    db.execute("CREATE (:Document {
+    let tx = session.tx().await?;
+    tx.execute("CREATE (:Document {
         title: 'Research Paper',
         author: 'Alice',
         tags: ['ml', 'nlp'],
         year: 2024
     })").await?;
+    tx.commit().await?;
 
     // Query works normally (automatic rewriting)
-    let results = db.query("
+    let results = session.query("
         MATCH (d:Document)
         WHERE d.author = 'Alice' AND d.year > 2023
         RETURN d.title, d.tags
@@ -348,16 +352,20 @@ For simple cases, use the schema builder (Rust) or direct schema calls (Python):
     # Create a label with NO properties defined
     db.schema().label("Document").apply()
 
+    session = db.session()
+
     # Insert with arbitrary properties
-    db.execute("""CREATE (:Document {
+    tx = session.tx()
+    tx.execute("""CREATE (:Document {
         title: 'Research Paper',
         author: 'Alice',
         tags: ['ml', 'nlp'],
         year: 2024
     })""")
+    tx.commit()
 
     # Query works normally (automatic rewriting)
-    results = db.query("""
+    results = session.query("""
         MATCH (d:Document)
         WHERE d.author = 'Alice' AND d.year > 2023
         RETURN d.title, d.tags
@@ -397,41 +405,51 @@ Execute Cypher queries to read and write data.
 === "Rust"
 
     ```rust
+    let session = db.session();
+    let tx = session.tx().await?;
+
     // Create a single vertex
-    db.execute("CREATE (p:Person {name: 'Alice', age: 30})").await?;
+    tx.execute("CREATE (p:Person {name: 'Alice', age: 30})").await?;
 
     // Create multiple vertices and an edge
-    db.execute(r#"
+    tx.execute(r#"
         CREATE (alice:Person {name: 'Alice', age: 30})
         CREATE (bob:Person {name: 'Bob', age: 25})
         CREATE (alice)-[:KNOWS {since: 2020}]->(bob)
     "#).await?;
 
     // Create edge between existing vertices
-    db.execute(r#"
+    tx.execute(r#"
         MATCH (a:Person {name: 'Alice'}), (c:Company {name: 'TechCorp'})
         CREATE (a)-[:WORKS_AT {since: 2022, role: 'Engineer'}]->(c)
     "#).await?;
+
+    tx.commit().await?;
     ```
 
 === "Python"
 
     ```python
+    session = db.session()
+    tx = session.tx()
+
     # Create a single vertex
-    db.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+    tx.execute("CREATE (p:Person {name: 'Alice', age: 30})")
 
     # Create multiple vertices and an edge
-    db.execute("""
+    tx.execute("""
         CREATE (alice:Person {name: 'Alice', age: 30})
         CREATE (bob:Person {name: 'Bob', age: 25})
         CREATE (alice)-[:KNOWS {since: 2020}]->(bob)
     """)
 
     # Create edge between existing vertices
-    db.execute("""
+    tx.execute("""
         MATCH (a:Person {name: 'Alice'}), (c:Company {name: 'TechCorp'})
         CREATE (a)-[:WORKS_AT {since: 2022, role: 'Engineer'}]->(c)
     """)
+
+    tx.commit()
     ```
 
 ### Reading Data
@@ -439,8 +457,10 @@ Execute Cypher queries to read and write data.
 === "Rust"
 
     ```rust
+    let session = db.session();
+
     // Simple query
-    let results = db.query("MATCH (p:Person) RETURN p.name, p.age").await?;
+    let results = session.query("MATCH (p:Person) RETURN p.name, p.age").await?;
 
     for row in &results {
         let name: String = row.get("p.name")?;
@@ -449,7 +469,7 @@ Execute Cypher queries to read and write data.
     }
 
     // Query with filtering and ordering
-    let results = db.query(r#"
+    let results = session.query(r#"
         MATCH (p:Person)
         WHERE p.age >= 25
         RETURN p.name AS name, p.age AS age
@@ -465,14 +485,16 @@ Execute Cypher queries to read and write data.
 === "Python"
 
     ```python
+    session = db.session()
+
     # Simple query
-    results = db.query("MATCH (p:Person) RETURN p.name AS name, p.age AS age")
+    results = session.query("MATCH (p:Person) RETURN p.name AS name, p.age AS age")
 
     for row in results:
         print(f"{row['name']} is {row['age']} years old")
 
     # Query with filtering and ordering
-    results = db.query("""
+    results = session.query("""
         MATCH (p:Person)
         WHERE p.age >= 25
         RETURN p.name AS name, p.age AS age
@@ -491,14 +513,16 @@ Always use parameters for user-provided values to prevent injection attacks:
 === "Rust"
 
     ```rust
+    let session = db.session();
+
     // Single parameter
-    let results = db.query_with("MATCH (p:Person) WHERE p.name = $name RETURN p")
+    let results = session.query_with("MATCH (p:Person) WHERE p.name = $name RETURN p")
         .param("name", "Alice")
         .fetch_all()
         .await?;
 
     // Multiple parameters
-    let results = db.query_with(r#"
+    let results = session.query_with(r#"
         MATCH (p:Person)
         WHERE p.age >= $min_age AND p.age <= $max_age
         RETURN p.name AS name, p.age AS age
@@ -513,7 +537,7 @@ Always use parameters for user-provided values to prevent injection attacks:
         "name" => "Alice".into(),
         "company" => "TechCorp".into(),
     };
-    let results = db.query_with(
+    let results = session.query_with(
         "MATCH (p:Person {name: $name})-[:WORKS_AT]->(c:Company {name: $company}) RETURN p, c"
     )
         .params(params)
@@ -524,16 +548,18 @@ Always use parameters for user-provided values to prevent injection attacks:
 === "Python"
 
     ```python
+    session = db.session()
+
     # Single parameter
     results = (
-        db.query_with("MATCH (p:Person) WHERE p.name = $name RETURN p.name AS name")
+        session.query_with("MATCH (p:Person) WHERE p.name = $name RETURN p.name AS name")
         .param("name", "Alice")
         .fetch_all()
     )
 
     # Multiple parameters
     results = (
-        db.query_with("""
+        session.query_with("""
             MATCH (p:Person)
             WHERE p.age >= $min_age AND p.age <= $max_age
             RETURN p.name AS name, p.age AS age
@@ -546,7 +572,7 @@ Always use parameters for user-provided values to prevent injection attacks:
     # Parameters from dict
     params = {"name": "Alice", "company": "TechCorp"}
     results = (
-        db.query_with("""
+        session.query_with("""
             MATCH (p:Person {name: $name})-[:WORKS_AT]->(c:Company {name: $company})
             RETURN p.name AS person, c.name AS company
         """)
@@ -566,21 +592,23 @@ Traverse relationships to explore connected data.
 === "Rust"
 
     ```rust
+    let session = db.session();
+
     // Find all people that Alice knows
-    let results = db.query(r#"
+    let results = session.query(r#"
         MATCH (alice:Person {name: 'Alice'})-[:KNOWS]->(friend:Person)
         RETURN friend.name AS name
     "#).await?;
 
     // Find friends of friends
-    let results = db.query(r#"
+    let results = session.query(r#"
         MATCH (alice:Person {name: 'Alice'})-[:KNOWS*2]->(fof:Person)
         WHERE fof.name <> 'Alice'
         RETURN DISTINCT fof.name AS name
     "#).await?;
 
     // Variable-length paths (1 to 3 hops)
-    let results = db.query(r#"
+    let results = session.query(r#"
         MATCH path = (alice:Person {name: 'Alice'})-[:KNOWS*1..3]->(other:Person)
         RETURN other.name AS name, length(path) AS distance
     "#).await?;
@@ -589,21 +617,23 @@ Traverse relationships to explore connected data.
 === "Python"
 
     ```python
+    session = db.session()
+
     # Find all people that Alice knows
-    results = db.query("""
+    results = session.query("""
         MATCH (alice:Person {name: 'Alice'})-[:KNOWS]->(friend:Person)
         RETURN friend.name AS name
     """)
 
     # Find friends of friends
-    results = db.query("""
+    results = session.query("""
         MATCH (alice:Person {name: 'Alice'})-[:KNOWS*2]->(fof:Person)
         WHERE fof.name <> 'Alice'
         RETURN DISTINCT fof.name AS name
     """)
 
     # Variable-length paths (1 to 3 hops)
-    results = db.query("""
+    results = session.query("""
         MATCH path = (alice:Person {name: 'Alice'})-[:KNOWS*1..3]->(other:Person)
         RETURN other.name AS name, length(path) AS distance
     """)
@@ -614,15 +644,17 @@ Traverse relationships to explore connected data.
 === "Rust"
 
     ```rust
+    let session = db.session();
+
     // Count friends per person
-    let results = db.query(r#"
+    let results = session.query(r#"
         MATCH (p:Person)-[:KNOWS]->(friend:Person)
         RETURN p.name AS person, COUNT(friend) AS friend_count
         ORDER BY friend_count DESC
     "#).await?;
 
     // Average age by company
-    let results = db.query(r#"
+    let results = session.query(r#"
         MATCH (p:Person)-[:WORKS_AT]->(c:Company)
         RETURN c.name AS company, AVG(p.age) AS avg_age, COUNT(p) AS employees
     "#).await?;
@@ -631,15 +663,17 @@ Traverse relationships to explore connected data.
 === "Python"
 
     ```python
+    session = db.session()
+
     # Count friends per person
-    results = db.query("""
+    results = session.query("""
         MATCH (p:Person)-[:KNOWS]->(friend:Person)
         RETURN p.name AS person, COUNT(friend) AS friend_count
         ORDER BY friend_count DESC
     """)
 
     # Average age by company
-    results = db.query("""
+    results = session.query("""
         MATCH (p:Person)-[:WORKS_AT]->(c:Company)
         RETURN c.name AS company, AVG(p.age) AS avg_age, COUNT(p) AS employees
     """)
@@ -656,8 +690,10 @@ Group multiple operations into atomic transactions.
 === "Rust"
 
     ```rust
+    let session = db.session();
+
     // Begin transaction
-    let tx = db.begin().await?;
+    let tx = session.tx().await?;
 
     // Execute operations
     tx.execute("CREATE (p:Person {name: 'Carol', age: 28})").await?;
@@ -674,14 +710,16 @@ Group multiple operations into atomic transactions.
 === "Python"
 
     ```python
+    session = db.session()
+
     # Begin transaction
-    tx = db.begin()
+    tx = session.tx()
 
     try:
         # Execute operations
-        tx.query("CREATE (p:Person {name: 'Carol', age: 28})")
-        tx.query("CREATE (p:Person {name: 'Dave', age: 32})")
-        tx.query("""
+        tx.execute("CREATE (p:Person {name: 'Carol', age: 28})")
+        tx.execute("CREATE (p:Person {name: 'Dave', age: 32})")
+        tx.execute("""
             MATCH (c:Person {name: 'Carol'}), (d:Person {name: 'Dave'})
             CREATE (c)-[:KNOWS]->(d)
         """)
@@ -694,28 +732,38 @@ Group multiple operations into atomic transactions.
         raise e
     ```
 
-### Transaction Closure (Rust)
+### Transaction Context Manager
 
 === "Rust"
 
     ```rust
-    // Auto-commit on success, auto-rollback on error
-    db.transaction(|tx| async move {
-        tx.execute("CREATE (a:Person {name: 'Eve', age: 26})").await?;
-        tx.execute("CREATE (b:Person {name: 'Frank', age: 29})").await?;
-        tx.execute(r#"
-            MATCH (e:Person {name: 'Eve'}), (f:Person {name: 'Frank'})
-            CREATE (e)-[:KNOWS]->(f)
-        "#).await?;
-        Ok(())
-    }).await?;
+    let session = db.session();
+
+    // Use explicit tx for auto-rollback on error
+    let tx = session.tx().await?;
+    tx.execute("CREATE (a:Person {name: 'Eve', age: 26})").await?;
+    tx.execute("CREATE (b:Person {name: 'Frank', age: 29})").await?;
+    tx.execute(r#"
+        MATCH (e:Person {name: 'Eve'}), (f:Person {name: 'Frank'})
+        CREATE (e)-[:KNOWS]->(f)
+    "#).await?;
+    tx.commit().await?;
     ```
 
 === "Python"
 
     ```python
-    # Python uses explicit try/except pattern shown above
-    # No closure-based API available
+    session = db.session()
+
+    # Use as context manager for auto-rollback on error
+    with session.tx() as tx:
+        tx.execute("CREATE (a:Person {name: 'Eve', age: 26})")
+        tx.execute("CREATE (b:Person {name: 'Frank', age: 29})")
+        tx.execute("""
+            MATCH (e:Person {name: 'Eve'}), (f:Person {name: 'Frank'})
+            CREATE (e)-[:KNOWS]->(f)
+        """)
+        tx.commit()
     ```
 
 ---
@@ -746,11 +794,16 @@ Store and search vector embeddings for semantic similarity.
 === "Python"
 
     ```python
-    # Add vector property (vector:N syntax for N dimensions)
-    db.add_property("Document", "embedding", "vector:384", False)
-
-    # Create vector index (label, property, metric)
-    db.create_vector_index("Document", "embedding", "cosine")
+    # Add vector property and index via schema builder
+    (
+        db.schema()
+        .label("Document")
+        .property("title", "string")
+        .property("content", "string")
+        .vector("embedding", 384)
+        .index("embedding", {"type": "vector", "metric": "cosine"})
+        .apply()
+    )
     ```
 
 ### Inserting Vectors
@@ -758,10 +811,13 @@ Store and search vector embeddings for semantic similarity.
 === "Rust"
 
     ```rust
+    let session = db.session();
+    let tx = session.tx().await?;
+
     // Insert document with embedding
     let embedding: Vec<f32> = compute_embedding("Machine learning fundamentals");
 
-    db.query_with(r#"
+    tx.execute_with(r#"
         CREATE (d:Document {
             title: $title,
             content: $content,
@@ -771,17 +827,22 @@ Store and search vector embeddings for semantic similarity.
         .param("title", "ML Basics")
         .param("content", "Machine learning fundamentals...")
         .param("embedding", embedding)
-        .fetch_all()
+        .run()
         .await?;
+
+    tx.commit().await?;
     ```
 
 === "Python"
 
     ```python
+    session = db.session()
+    tx = session.tx()
+
     # Insert document with embedding
     embedding = compute_embedding("Machine learning fundamentals")
 
-    db.query_with("""
+    tx.execute_with("""
         CREATE (d:Document {
             title: $title,
             content: $content,
@@ -790,7 +851,9 @@ Store and search vector embeddings for semantic similarity.
     """).param("title", "ML Basics") \
        .param("content", "Machine learning fundamentals...") \
        .param("embedding", embedding) \
-       .fetch_all()
+       .run()
+
+    tx.commit()
     ```
 
 ### Searching Vectors
@@ -798,10 +861,11 @@ Store and search vector embeddings for semantic similarity.
 === "Rust"
 
     ```rust
+    let session = db.session();
     let query_vec = compute_embedding("deep learning neural networks");
 
     // Vector search via Cypher (procedure)
-    let results = db.query_with(r#"
+    let results = session.query_with(r#"
         CALL uni.vector.query('Document', 'embedding', $vec, 10)
         YIELD node, distance
         RETURN node.title AS title, distance
@@ -812,7 +876,7 @@ Store and search vector embeddings for semantic similarity.
         .await?;
 
     // Vector search via Cypher (operator)
-    let results = db.query_with(r#"
+    let results = session.query_with(r#"
         MATCH (d:Document)
         WHERE d.embedding ~= $vec
         RETURN d.title AS title, d._score AS score
@@ -827,10 +891,11 @@ Store and search vector embeddings for semantic similarity.
 === "Python"
 
     ```python
+    session = db.session()
     query_vec = compute_embedding("deep learning neural networks")
 
     # Vector search via Cypher (procedure)
-    results = db.query_with("""
+    results = session.query_with("""
         CALL uni.vector.query('Document', 'embedding', $vec, 10)
         YIELD node, distance
         RETURN node.title AS title, distance
@@ -841,7 +906,7 @@ Store and search vector embeddings for semantic similarity.
         print(f"{row['title']}: {row['distance']:.4f}")
 
     # Vector search via Cypher (operator)
-    results = db.query_with("""
+    results = session.query_with("""
         MATCH (d:Document)
         WHERE d.embedding ~= $vec
         RETURN d.title AS title, d._score AS score
@@ -859,8 +924,11 @@ For large datasets, use the bulk writer for efficient loading.
 === "Rust"
 
     ```rust
+    let session = db.session();
+    let tx = session.tx().await?;
+
     // Create bulk writer with deferred indexing
-    let mut bulk = db.bulk_writer()
+    let mut bulk = tx.bulk_writer()
         .defer_vector_indexes(true)
         .defer_scalar_indexes(true)
         .batch_size(50_000)
@@ -892,6 +960,7 @@ For large datasets, use the bulk writer for efficient loading.
 
     // Commit and rebuild indexes
     let stats = bulk.commit().await?;
+    tx.commit().await?;
     println!(
         "Loaded {} vertices, {} edges in {:?}",
         stats.vertices_inserted, stats.edges_inserted, stats.duration
@@ -901,9 +970,12 @@ For large datasets, use the bulk writer for efficient loading.
 === "Python"
 
     ```python
+    session = db.session()
+    tx = session.tx()
+
     # Create bulk writer with configuration
     writer = (
-        db.bulk_writer()
+        tx.bulk_writer()
         .batch_size(50_000)
         .build()
     )
@@ -926,6 +998,7 @@ For large datasets, use the bulk writer for efficient loading.
 
     # Commit and rebuild indexes
     stats = writer.commit()
+    tx.commit()
     print(f"Loaded {stats.vertices_inserted} vertices, {stats.edges_inserted} edges")
     ```
 
@@ -933,52 +1006,50 @@ For large datasets, use the bulk writer for efficient loading.
 
 ## Sessions
 
-Sessions provide scoped context for multi-tenant queries.
+Sessions provide scoped context for multi-tenant queries and are the primary scope for reads.
 
 === "Rust"
 
     ```rust
-    // Create session with tenant context
-    let session = db.session()
-        .set("tenant_id", "acme-corp")
-        .set("user_id", "user-123")
-        .build();
+    // Create session and set tenant context
+    let session = db.session();
+    session.set("tenant_id", "acme-corp");
+    session.set("user_id", "user-123");
 
-    // All queries have access to $session.* variables
+    // All queries have access to session parameters
     let results = session.query(r#"
         MATCH (d:Document)
-        WHERE d.tenant_id = $session.tenant_id
+        WHERE d.tenant_id = $tenant_id
         RETURN d.title AS title
     "#).await?;
 
     // Query with additional parameters
     let results = session.query_with(r#"
         MATCH (d:Document)
-        WHERE d.tenant_id = $session.tenant_id
+        WHERE d.tenant_id = $tenant_id
           AND d.status = $status
         RETURN d.title AS title
     "#)
         .param("status", "published")
-        .execute()
+        .fetch_all()
         .await?;
 
     // Read session variable
-    let tenant: &str = session.get("tenant_id").unwrap().as_str().unwrap();
+    let tenant = session.get("tenant_id");
     ```
 
 === "Python"
 
     ```python
-    # Create session with tenant context
-    builder = db.session()
-    builder.set("tenant_id", "acme-corp")
-    builder.set("user_id", "user-123")
-    session = builder.build()
+    # Create session and set tenant context
+    session = db.session()
+    session.set("tenant_id", "acme-corp")
+    session.set("user_id", "user-123")
 
     # Execute queries with session context
     results = session.query("""
         MATCH (d:Document)
-        WHERE d.tenant_id = $session.tenant_id
+        WHERE d.tenant_id = $tenant_id
         RETURN d.title AS title
     """)
 
@@ -996,13 +1067,15 @@ Analyze query execution plans.
 === "Rust"
 
     ```rust
+    let session = db.session();
+
     // Get query plan without executing
-    let plan = db.explain("MATCH (p:Person) WHERE p.age > 25 RETURN p.name").await?;
+    let plan = session.explain("MATCH (p:Person) WHERE p.age > 25 RETURN p.name").await?;
     println!("Plan:\n{}", plan.plan_text);
     println!("Estimated cost: {}", plan.cost_estimates.estimated_cost);
 
     // Execute with profiling
-    let (results, profile) = db.profile("MATCH (p:Person) WHERE p.age > 25 RETURN p.name").await?;
+    let (results, profile) = session.profile("MATCH (p:Person) WHERE p.age > 25 RETURN p.name").await?;
     println!("Total time: {}ms", profile.total_time_ms);
     println!("Peak memory: {} bytes", profile.peak_memory_bytes);
     ```
@@ -1010,13 +1083,15 @@ Analyze query execution plans.
 === "Python"
 
     ```python
+    session = db.session()
+
     # Get query plan without executing
-    plan = db.explain("MATCH (p:Person) WHERE p.age > 25 RETURN p.name AS name")
+    plan = session.explain("MATCH (p:Person) WHERE p.age > 25 RETURN p.name AS name")
     print(f"Plan:\n{plan['plan_text']}")
     print(f"Estimated cost: {plan['cost_estimates']}")
 
     # Execute with profiling
-    results, profile = db.profile("MATCH (p:Person) WHERE p.age > 25 RETURN p.name AS name")
+    results, profile = session.profile("MATCH (p:Person) WHERE p.age > 25 RETURN p.name AS name")
     print(f"Total time: {profile['total_time_ms']}ms")
     print(f"Peak memory: {profile['peak_memory_bytes']} bytes")
     ```
@@ -1030,15 +1105,17 @@ Access historical database states using Cypher clauses.
 === "Rust"
 
     ```rust
+    let session = db.session();
+
     // Query a specific snapshot by ID
-    let results = db.query(r#"
+    let results = session.query(r#"
         MATCH (n:Person)
         RETURN n.name AS name
         VERSION AS OF 'snap_123'
     "#).await?;
 
     // Query the snapshot that was current at a timestamp
-    let results = db.query(r#"
+    let results = session.query(r#"
         MATCH (n:Person)
         RETURN n.name AS name
         TIMESTAMP AS OF '2025-02-01T12:00:00Z'
@@ -1048,15 +1125,17 @@ Access historical database states using Cypher clauses.
 === "Python"
 
     ```python
+    session = db.session()
+
     # Query a specific snapshot by ID
-    results = db.query("""
+    results = session.query("""
         MATCH (n:Person)
         RETURN n.name AS name
         VERSION AS OF 'snap_123'
     """)
 
     # Query the snapshot that was current at a timestamp
-    results = db.query("""
+    results = session.query("""
         MATCH (n:Person)
         RETURN n.name AS name
         TIMESTAMP AS OF '2025-02-01T12:00:00Z'
@@ -1074,22 +1153,10 @@ Run built-in graph algorithms.
 === "Rust"
 
     ```rust
-    // Using the algorithm builder
-    let rankings = db.algo()
-        .pagerank()
-        .labels(&["Person"])
-        .edge_types(&["KNOWS"])
-        .damping(0.85)
-        .max_iterations(50)
-        .run()
-        .await?;
-
-    for (vid, score) in rankings.iter().take(10) {
-        println!("VID: {}, Score: {:.6}", vid, score);
-    }
+    let session = db.session();
 
     // Via Cypher
-    let results = db.query(r#"
+    let results = session.query(r#"
         CALL algo.pageRank(['Person'], ['KNOWS'])
         YIELD nodeId, score
         RETURN nodeId, score
@@ -1101,8 +1168,10 @@ Run built-in graph algorithms.
 === "Python"
 
     ```python
+    session = db.session()
+
     # PageRank via Cypher
-    results = db.query("""
+    results = session.query("""
         CALL algo.pageRank(['Person'], ['KNOWS'])
         YIELD nodeId, score
         RETURN nodeId, score
@@ -1119,27 +1188,24 @@ Run built-in graph algorithms.
 === "Rust"
 
     ```rust
-    // Find connected components
-    let components = db.algo()
-        .wcc()
-        .labels(&["Person"])
-        .edge_types(&["KNOWS"])
-        .run()
-        .await?;
+    let session = db.session();
 
-    // Count component sizes
-    let mut sizes: HashMap<i64, usize> = HashMap::new();
-    for (_, component_id) in &components {
-        *sizes.entry(*component_id).or_default() += 1;
-    }
-    println!("Found {} components", sizes.len());
+    // WCC via Cypher
+    let results = session.query(r#"
+        CALL algo.wcc(['Person'], ['KNOWS'])
+        YIELD nodeId, componentId
+        RETURN componentId, COUNT(*) AS size
+        ORDER BY size DESC
+    "#).await?;
     ```
 
 === "Python"
 
     ```python
+    session = db.session()
+
     # WCC via Cypher
-    results = db.query("""
+    results = session.query("""
         CALL algo.wcc(['Person'], ['KNOWS'])
         YIELD nodeId, componentId
         RETURN componentId, COUNT(*) AS size
@@ -1156,8 +1222,10 @@ Run built-in graph algorithms.
 === "Rust"
 
     ```rust
+    let session = db.session();
+
     // Louvain community detection via Cypher
-    let results = db.query(r#"
+    let results = session.query(r#"
         CALL algo.louvain(['Person'], ['KNOWS'])
         YIELD nodeId, communityId
         RETURN communityId, COUNT(*) AS size
@@ -1169,8 +1237,10 @@ Run built-in graph algorithms.
 === "Python"
 
     ```python
+    session = db.session()
+
     # Louvain community detection
-    results = db.query("""
+    results = session.query("""
         CALL algo.louvain(['Person'], ['KNOWS'])
         YIELD nodeId, communityId
         RETURN communityId, COUNT(*) AS size
@@ -1193,7 +1263,8 @@ Handle errors appropriately in your application.
     ```rust
     use uni_db::*;
 
-    match db.query("INVALID CYPHER").await {
+    let session = db.session();
+    match session.query("INVALID CYPHER").await {
         Ok(results) => {
             // Process results
         }
@@ -1220,8 +1291,9 @@ Handle errors appropriately in your application.
 === "Python"
 
     ```python
+    session = db.session()
     try:
-        results = db.query("INVALID CYPHER")
+        results = session.query("INVALID CYPHER")
     except RuntimeError as e:
         print(f"Query error: {e}")
     except ValueError as e:
@@ -1266,33 +1338,33 @@ Here's a complete example building a simple social network application.
             .apply()
             .await?;
 
+        let session = db.session();
+
         // Create users
-        db.transaction(|tx| async move {
-            tx.execute("CREATE (u:User {username: 'alice', email: 'alice@example.com', joined: 2023})").await?;
-            tx.execute("CREATE (u:User {username: 'bob', email: 'bob@example.com', joined: 2023})").await?;
-            tx.execute("CREATE (u:User {username: 'carol', email: 'carol@example.com', joined: 2024})").await?;
+        let tx = session.tx().await?;
+        tx.execute("CREATE (u:User {username: 'alice', email: 'alice@example.com', joined: 2023})").await?;
+        tx.execute("CREATE (u:User {username: 'bob', email: 'bob@example.com', joined: 2023})").await?;
+        tx.execute("CREATE (u:User {username: 'carol', email: 'carol@example.com', joined: 2024})").await?;
 
-            // Create follow relationships
-            tx.execute(r#"
-                MATCH (a:User {username: 'alice'}), (b:User {username: 'bob'})
-                CREATE (a)-[:FOLLOWS]->(b)
-            "#).await?;
-            tx.execute(r#"
-                MATCH (b:User {username: 'bob'}), (c:User {username: 'carol'})
-                CREATE (b)-[:FOLLOWS]->(c)
-            "#).await?;
-
-            Ok(())
-        }).await?;
+        // Create follow relationships
+        tx.execute(r#"
+            MATCH (a:User {username: 'alice'}), (b:User {username: 'bob'})
+            CREATE (a)-[:FOLLOWS]->(b)
+        "#).await?;
+        tx.execute(r#"
+            MATCH (b:User {username: 'bob'}), (c:User {username: 'carol'})
+            CREATE (b)-[:FOLLOWS]->(c)
+        "#).await?;
 
         // Create posts
-        db.execute(r#"
+        tx.execute(r#"
             MATCH (a:User {username: 'alice'})
             CREATE (a)-[:POSTED]->(p:Post {content: 'Hello world!', timestamp: 1704067200000})
         "#).await?;
+        tx.commit().await?;
 
         // Query: Get user's feed (posts from people they follow)
-        let feed = db.query_with(r#"
+        let feed = session.query_with(r#"
             MATCH (me:User {username: $username})-[:FOLLOWS]->(friend:User)-[:POSTED]->(post:Post)
             RETURN friend.username AS author, post.content AS content, post.timestamp AS ts
             ORDER BY post.timestamp DESC
@@ -1311,7 +1383,7 @@ Here's a complete example building a simple social network application.
         }
 
         // Query: Suggest friends (friends of friends not already following)
-        let suggestions = db.query_with(r#"
+        let suggestions = session.query_with(r#"
             MATCH (me:User {username: $username})-[:FOLLOWS*2]->(suggestion:User)
             WHERE NOT (me)-[:FOLLOWS]->(suggestion)
               AND suggestion.username <> $username
@@ -1332,7 +1404,7 @@ Here's a complete example building a simple social network application.
         }
 
         // Run PageRank to find influential users
-        let influential = db.query(r#"
+        let influential = session.query(r#"
             CALL algo.pageRank(['User'], ['FOLLOWS'])
             YIELD nodeId, score
             MATCH (u:User) WHERE id(u) = nodeId
@@ -1360,55 +1432,60 @@ Here's a complete example building a simple social network application.
 
     def main():
         # Create database
-        db = uni_db.DatabaseBuilder.open("./social-network") \
+        db = uni_db.UniBuilder.open("./social-network") \
             .cache_size(512 * 1024 * 1024) \
             .build()
 
         # Define schema
-        db.create_label("User")
-        db.add_property("User", "username", "string", False)
-        db.add_property("User", "email", "string", False)
-        db.add_property("User", "joined", "int", False)
-        db.create_scalar_index("User", "username", "btree")
+        (
+            db.schema()
+            .label("User")
+            .property("username", "string")
+            .property("email", "string")
+            .property("joined", "int")
+            .index("username", "btree")
+            .done()
+            .label("Post")
+            .property("content", "string")
+            .property("timestamp", "int")
+            .done()
+            .edge_type("FOLLOWS", ["User"], ["User"])
+            .done()
+            .edge_type("POSTED", ["User"], ["Post"])
+            .done()
+            .edge_type("LIKES", ["User"], ["Post"])
+            .done()
+            .apply()
+        )
 
-        db.create_label("Post")
-        db.add_property("Post", "content", "string", False)
-        db.add_property("Post", "timestamp", "int", False)
-
-        db.create_edge_type("FOLLOWS", ["User"], ["User"])
-        db.create_edge_type("POSTED", ["User"], ["Post"])
-        db.create_edge_type("LIKES", ["User"], ["Post"])
+        session = db.session()
 
         # Create users in transaction
-        tx = db.begin()
-        try:
-            tx.query("CREATE (u:User {username: 'alice', email: 'alice@example.com', joined: 2023})")
-            tx.query("CREATE (u:User {username: 'bob', email: 'bob@example.com', joined: 2023})")
-            tx.query("CREATE (u:User {username: 'carol', email: 'carol@example.com', joined: 2024})")
+        with session.tx() as tx:
+            tx.execute("CREATE (u:User {username: 'alice', email: 'alice@example.com', joined: 2023})")
+            tx.execute("CREATE (u:User {username: 'bob', email: 'bob@example.com', joined: 2023})")
+            tx.execute("CREATE (u:User {username: 'carol', email: 'carol@example.com', joined: 2024})")
 
             # Create follow relationships
-            tx.query("""
+            tx.execute("""
                 MATCH (a:User {username: 'alice'}), (b:User {username: 'bob'})
                 CREATE (a)-[:FOLLOWS]->(b)
             """)
-            tx.query("""
+            tx.execute("""
                 MATCH (b:User {username: 'bob'}), (c:User {username: 'carol'})
                 CREATE (b)-[:FOLLOWS]->(c)
             """)
 
-            tx.commit()
-        except Exception as e:
-            tx.rollback()
-            raise e
+            # Create posts
+            tx.execute("""
+                MATCH (a:User {username: 'alice'})
+                CREATE (a)-[:POSTED]->(p:Post {content: 'Hello world!', timestamp: 1704067200000})
+            """)
 
-        # Create posts
-        db.execute("""
-            MATCH (a:User {username: 'alice'})
-            CREATE (a)-[:POSTED]->(p:Post {content: 'Hello world!', timestamp: 1704067200000})
-        """)
+            tx.commit()
 
         # Query: Get user's feed
-        feed = db.query_with("""
+        feed = session.query_with("""
             MATCH (me:User {username: $username})-[:FOLLOWS]->(friend:User)-[:POSTED]->(post:Post)
             RETURN friend.username AS author, post.content AS content, post.timestamp AS ts
             ORDER BY post.timestamp DESC
@@ -1420,7 +1497,7 @@ Here's a complete example building a simple social network application.
             print(f"  @{row['author']}: {row['content']}")
 
         # Query: Suggest friends
-        suggestions = db.query_with("""
+        suggestions = session.query_with("""
             MATCH (me:User {username: $username})-[:FOLLOWS*2]->(suggestion:User)
             WHERE NOT (me)-[:FOLLOWS]->(suggestion)
               AND suggestion.username <> $username
@@ -1434,7 +1511,7 @@ Here's a complete example building a simple social network application.
             print(f"  @{row['username']} ({row['mutual']} mutual)")
 
         # Run PageRank
-        influential = db.query("""
+        influential = session.query("""
             CALL algo.pageRank(['User'], ['FOLLOWS'])
             YIELD nodeId, score
             MATCH (u:User) WHERE id(u) = nodeId

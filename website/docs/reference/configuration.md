@@ -90,6 +90,9 @@ pub struct UniConfig {
     /// Object store resilience configuration
     pub object_store: ObjectStoreConfig,
 
+    /// Maximum iterations for recursive CTE evaluation (default: 1000)
+    pub max_recursive_cte_iterations: usize,
+
     /// Background index rebuild configuration
     pub index_rebuild: IndexRebuildConfig,
 }
@@ -112,6 +115,7 @@ pub struct UniConfig {
 | `max_transaction_memory` | bytes | 1 GB | Maximum memory per transaction |
 | `max_compaction_rows` | rows | 5,000,000 | OOM guard for in-memory compaction |
 | `enable_vid_labels_index` | bool | true | Enable O(1) VID→labels lookups |
+| `max_recursive_cte_iterations` | count | 1,000 | Maximum iterations for recursive CTE evaluation |
 
 ### CompactionConfig
 
@@ -203,6 +207,89 @@ pub struct IndexRebuildConfig {
     pub auto_rebuild_enabled: bool,
 }
 ```
+
+---
+
+## Locy Configuration
+
+### LocyConfig
+
+Configuration for the Locy (Datalog) rule engine. These settings control fixpoint evaluation, probabilistic reasoning, abductive inference, and other Locy-specific behavior.
+
+```rust
+pub struct LocyConfig {
+    /// Maximum fixpoint iterations per recursive stratum (default: 1000)
+    pub max_iterations: usize,
+
+    /// Overall evaluation timeout (default: 300s)
+    pub timeout: Duration,
+
+    /// Maximum bytes of derived facts to hold in memory per relation (default: 256MB)
+    pub max_derived_bytes: usize,
+
+    /// Maximum recursion depth for EXPLAIN derivation trees (default: 100)
+    pub max_explain_depth: usize,
+
+    /// Maximum recursion depth for SLG resolution (default: 1000)
+    pub max_slg_depth: usize,
+
+    /// Maximum candidate modifications to generate during ABDUCE (default: 20)
+    pub max_abduce_candidates: usize,
+
+    /// Maximum validated results to return from ABDUCE (default: 10)
+    pub max_abduce_results: usize,
+
+    /// When true, MNOR/MPROD reject values outside [0,1] with an error
+    /// instead of clamping (default: false)
+    pub strict_probability_domain: bool,
+
+    /// Underflow threshold for MPROD log-space switch (default: 1e-15)
+    pub probability_epsilon: f64,
+
+    /// When true, use exact BDD-based probability computation for groups
+    /// with shared dependencies instead of independence assumption (default: false)
+    pub exact_probability: bool,
+
+    /// Maximum BDD variables per aggregation group (default: 1000)
+    pub max_bdd_variables: usize,
+
+    /// Top-k proof filtering: retain at most k proofs per derived fact.
+    /// 0 means unlimited (default: 0)
+    pub top_k_proofs: usize,
+
+    /// Override top_k_proofs during training. None uses top_k_proofs
+    /// for both training and inference (default: None)
+    pub top_k_proofs_training: Option<usize>,
+
+    /// When true, BEST BY applies secondary sort for deterministic
+    /// tie-breaking (default: true)
+    pub deterministic_best_by: bool,
+
+    /// Parameters bound to $name references inside rules and
+    /// QUERY/RETURN expressions (default: empty)
+    pub params: HashMap<String, Value>,
+}
+```
+
+### Locy Parameter Reference
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `max_iterations` | count | 1,000 | Maximum fixpoint iterations per recursive stratum |
+| `timeout` | duration | 300s | Overall Locy evaluation timeout |
+| `max_derived_bytes` | bytes | 256 MB | Maximum derived facts memory per relation |
+| `max_explain_depth` | count | 100 | Maximum recursion depth for EXPLAIN trees |
+| `max_slg_depth` | count | 1,000 | Maximum recursion depth for SLG resolution |
+| `max_abduce_candidates` | count | 20 | Maximum candidate modifications for ABDUCE |
+| `max_abduce_results` | count | 10 | Maximum validated ABDUCE results |
+| `strict_probability_domain` | bool | false | Reject MNOR/MPROD values outside [0,1] instead of clamping |
+| `probability_epsilon` | float | 1e-15 | Underflow threshold for MPROD log-space switch |
+| `exact_probability` | bool | false | Use BDD-based exact probability for shared-dependency groups |
+| `max_bdd_variables` | count | 1,000 | Maximum BDD variables per aggregation group |
+| `top_k_proofs` | count | 0 (unlimited) | Retain at most k proofs per derived fact (0 = all) |
+| `top_k_proofs_training` | count | None | Override `top_k_proofs` during training |
+| `deterministic_best_by` | bool | true | Deterministic tie-breaking for BEST BY |
+| `params` | map | empty | Named parameters bound to `$name` references |
 
 ---
 

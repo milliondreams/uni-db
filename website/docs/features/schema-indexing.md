@@ -33,7 +33,7 @@ Uni lets you define schema, constraints, and indexes to enforce correctness and 
     ```python
     import uni_db
 
-    db = uni_db.Database("./my_db")
+    db = uni_db.Uni.open("./my_db")
 
     db.schema() \
         .label("User") \

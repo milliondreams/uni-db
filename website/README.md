@@ -8,11 +8,14 @@ Documentation site for Uni, the embedded multi-model graph database.
 # Install dependencies
 poetry install
 
+# Convert Jupyter notebooks to Markdown (required before build/serve)
+poetry run python scripts/convert_notebooks.py
+
 # Serve locally with hot reload
-poetry run mkdocs serve
+poetry run zensical serve
 
 # Build static site
-poetry run mkdocs build
+poetry run zensical build
 ```
 
 ## Structure
@@ -26,20 +29,23 @@ website/
 │   ├── guides/             # Cypher, vector search, ingestion
 │   ├── internals/          # Implementation details
 │   ├── reference/          # API, config, troubleshooting
-│   ├── stylesheets/        # Custom CSS
-│   └── javascripts/        # Custom JS
-├── mkdocs.yml              # MkDocs configuration
+│   └── assets/             # Custom CSS and JS
+├── scripts/                # Build and notebook generation scripts
+├── mkdocs.yml              # Zensical configuration (backward-compatible format)
 └── pyproject.toml          # Python dependencies
 ```
 
 ## Development
 
-The site uses [MkDocs](https://www.mkdocs.org/) with the [Material](https://squidfunk.github.io/mkdocs-material/) theme.
+The site uses [Zensical](https://zensical.org/) (from the creators of Material for MkDocs).
 
 ### Local Preview
 
 ```bash
-poetry run mkdocs serve
+# Convert notebooks first (only needed after notebook changes)
+poetry run python scripts/convert_notebooks.py
+
+poetry run zensical serve
 ```
 
 Visit http://localhost:8000
@@ -47,7 +53,8 @@ Visit http://localhost:8000
 ### Building
 
 ```bash
-poetry run mkdocs build
+poetry run python scripts/convert_notebooks.py
+poetry run zensical build
 ```
 
 Output goes to `site/` directory.
@@ -90,8 +97,4 @@ uv run --with ./bindings/uni-db python website/scripts/verify_cyber_flagship_not
 
 ## Deployment
 
-The site can be deployed to GitHub Pages:
-
-```bash
-poetry run mkdocs gh-deploy
-```
+The site is deployed to GitHub Pages via the `deploy-docs` GitHub Actions workflow. It runs automatically on releases and can be triggered manually via `workflow_dispatch`.

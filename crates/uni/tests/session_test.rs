@@ -9,17 +9,19 @@ async fn test_session_variables() -> Result<()> {
     let db = Uni::temporary().build().await?;
 
     // Create Schema
-    db.execute("CREATE LABEL User (name STRING, tenant STRING)")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL User (name STRING, tenant STRING)")
         .await?;
-
-    db.execute("CREATE (n:User {name: 'Alice', tenant: 'A'})")
+    tx.execute("CREATE (n:User {name: 'Alice', tenant: 'A'})")
         .await?;
-    db.execute("CREATE (n:User {name: 'Bob', tenant: 'B'})")
+    tx.execute("CREATE (n:User {name: 'Bob', tenant: 'B'})")
         .await?;
+    tx.commit().await?;
     db.flush().await?;
 
-    // Create session
-    let session = db.session().set("tenant_id", "A").build();
+    // Create session with scoped parameter
+    let session = db.session();
+    session.params().set("tenant_id", "A");
 
     // Query with session variable
     // $session.tenant_id should resolve to "A"
@@ -28,7 +30,7 @@ async fn test_session_variables() -> Result<()> {
         .await?;
 
     assert_eq!(results.len(), 1);
-    assert_eq!(results.rows[0].get::<String>("n.name")?, "Alice");
+    assert_eq!(results.rows()[0].get::<String>("n.name")?, "Alice");
 
     Ok(())
 }

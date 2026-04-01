@@ -1,0 +1,43 @@
+{
+  "eval_id": 2,
+  "eval_name": "pydantic-social-network",
+  "configuration": "without_skill",
+  "expectations": [
+    {
+      "text": "User model inherits from UniNode with __label__ class attribute set",
+      "passed": true,
+      "evidence": "class User(UniNode): ... __label__ = \"User\" (lines 32, 35)"
+    },
+    {
+      "text": "FOLLOWS model inherits from UniEdge with __edge_type__, __from__, and __to__ class attributes",
+      "passed": true,
+      "evidence": "class FollowsEdge(UniEdge): ... __edge_type__ = \"FOLLOWS\", __from__ = User, __to__ = User (lines 46-50)"
+    },
+    {
+      "text": "Embedding field uses Vector[N] type annotation (e.g., Vector[384]) for the bio embedding",
+      "passed": true,
+      "evidence": "embedding: Vector[8] = Field(metric=\"cosine\") (line 39)"
+    },
+    {
+      "text": "Uses UniSession or AsyncUniSession (not raw Uni session) for OGM operations",
+      "passed": true,
+      "evidence": "with UniSession(db) as session: (line 86)"
+    },
+    {
+      "text": "Calls sync_schema() to apply Pydantic model definitions to the database",
+      "passed": true,
+      "evidence": "session.sync_schema() (line 89)"
+    },
+    {
+      "text": "Uses QueryBuilder with filter expressions (e.g., User.name == 'Alice' or PropertyProxy operators like .starts_with(), .in_()) for querying",
+      "passed": true,
+      "evidence": "session.query(User).filter(User.name.starts_with(\"A\")).all() (line 153); session.query(User).filter(User.name != \"Alice\").all() (line 240)"
+    },
+    {
+      "text": "Performs vector similarity search using vector_search() method or similar_to on the embedding field",
+      "passed": true,
+      "evidence": "session.query(User).vector_search(\"embedding\", query_vec, k=5).all() (lines 227-230)"
+    }
+  ],
+  "pass_rate": 1.0
+}

@@ -87,7 +87,9 @@ def _rust_metadata() -> dict[str, Any]:
     }
 
 
-def _create_notebook(cells: list[dict[str, Any]], metadata: dict[str, Any]) -> dict[str, Any]:
+def _create_notebook(
+    cells: list[dict[str, Any]], metadata: dict[str, Any]
+) -> dict[str, Any]:
     return {
         "cells": cells,
         "metadata": metadata,
@@ -105,15 +107,18 @@ def _python_setup_lines() -> list[str]:
         "",
         "import uni_db",
         "",
-        "DB_DIR = tempfile.mkdtemp(prefix=\"uni_locy_\")",
-        "print(\"DB_DIR:\", DB_DIR)",
+        'DB_DIR = tempfile.mkdtemp(prefix="uni_locy_")',
+        'print("DB_DIR:", DB_DIR)',
         "",
-        "db = uni_db.Database(DB_DIR)",
+        "db = uni_db.Uni.open(DB_DIR)",
+        "session = db.session()",
     ]
 
 
 def _python_seed_lines(statements: list[str]) -> list[str]:
-    lines = [f"db.execute({json.dumps(stmt)})" for stmt in statements]
+    lines = ["tx = session.tx()"]
+    lines.extend(f"tx.execute({json.dumps(stmt)})" for stmt in statements)
+    lines.append("tx.commit()")
     lines.append("print('Seeded graph data')")
     return lines
 
@@ -139,7 +144,10 @@ def _rust_setup_lines() -> list[str]:
 
 
 def _rust_seed_lines(statements: list[str]) -> list[str]:
-    lines = [f"db.execute({json.dumps(stmt)}).await?;" for stmt in statements]
+    lines = ["let session = db.session();"]
+    lines.append("let tx = session.tx().await?;")
+    lines.extend(f"tx.execute({json.dumps(stmt)}).await?;" for stmt in statements)
+    lines.append("tx.commit().await?;")
     lines.append('println!("Seeded graph data");')
     return lines
 
@@ -166,60 +174,61 @@ def _python_program_lines(program_lines: list[str]) -> list[str]:
 
 def _rust_program_lines(program_lines: list[str]) -> list[str]:
     return [
-        "let program = r#\"" + "\\n".join(program_lines) + "\"#;",
+        'let program = r#"' + "\\n".join(program_lines) + '"#;',
     ]
 
 
 def _python_eval_lines() -> list[str]:
     return [
-        "out = db.locy_evaluate(program)",
+        "out = session.locy(program)",
         "",
-        "print(\"Derived relations:\", list(out[\"derived\"].keys()))",
-        "stats = out[\"stats\"]",
-        "print(\"Iterations:\", stats.total_iterations)",
-        "print(\"Strata:\", stats.strata_evaluated)",
-        "print(\"Queries executed:\", stats.queries_executed)",
+        'print("Derived relations:", list(out.derived.keys()))',
+        "stats = out.stats",
+        'print("Iterations:", stats.total_iterations)',
+        'print("Strata:", stats.strata_evaluated)',
+        'print("Queries executed:", stats.queries_executed)',
     ]
 
 
 def _python_results_lines() -> list[str]:
     return [
-        "print(\"Derived relation snapshots:\")",
-        "for rel_name, rel_rows in out[\"derived\"].items():",
-        "    print(f\"\\\\n{rel_name}: {len(rel_rows)} row(s)\")",
+        'print("Derived relation snapshots:")',
+        "for rel_name, rel_rows in out.derived.items():",
+        '    print(f"\\\\n{rel_name}: {len(rel_rows)} row(s)")',
         "    pprint(rel_rows)",
         "",
-        "if out[\"command_results\"]:",
-        "    print(\"\\\\nCommand results:\")",
-        "for i, cmd in enumerate(out[\"command_results\"], start=1):",
-        "    print(f\"\\\\nCommand #{i}:\", cmd.get(\"type\"))",
-        "    rows = cmd.get(\"rows\")",
+        "if out.command_results:",
+        '    print("\\\\nCommand results:")',
+        "for i, cmd in enumerate(out.command_results, start=1):",
+        '    print(f"\\\\nCommand #{i}:", cmd.command_type)',
+        "    rows = getattr(cmd, 'rows', None)",
         "    if rows is not None:",
         "        pprint(rows)",
-        "if not out[\"command_results\"]:",
-        "    print(\"\\\\nNo QUERY/EXPLAIN/ABDUCE command outputs in this program.\")",
+        "if not out.command_results:",
+        '    print("\\\\nNo QUERY/EXPLAIN/ABDUCE command outputs in this program.")',
     ]
 
 
 def _python_cleanup_lines() -> list[str]:
     return [
         "shutil.rmtree(DB_DIR, ignore_errors=True)",
-        "print(\"Cleaned up\", DB_DIR)",
+        'print("Cleaned up", DB_DIR)',
     ]
 
 
 def _rust_eval_lines() -> list[str]:
     return [
-        "let result = db.locy().evaluate(program).await?;",
-        "println!(\"Derived relations: {:?}\", result.derived.keys().collect::<Vec<_>>());",
-        "println!(\"Iterations: {}\", result.stats().total_iterations);",
-        "println!(\"Queries executed: {}\", result.stats().queries_executed);",
+        "let session = db.session();",
+        "let result = session.locy(program).await?;",
+        'println!("Derived relations: {:?}", result.derived.keys().collect::<Vec<_>>());',
+        'println!("Iterations: {}", result.stats().total_iterations);',
+        'println!("Queries executed: {}", result.stats().queries_executed);',
         "for (name, rows) in &result.derived {",
-        "    println!(\"{}: {} row(s)\", name, rows.len());",
+        '    println!("{}: {} row(s)", name, rows.len());',
         "}",
         "",
         "if let Some(rows) = result.rows() {",
-        "    println!(\"Rows: {:?}\", rows);",
+        '    println!("Rows: {:?}", rows);',
         "}",
     ]
 
@@ -292,7 +301,11 @@ def _python_notebook(case: LocyUseCase) -> dict[str, Any]:
             ],
         )
     )
-    cells.append(_code_cell(notebook_key, len(cells), _python_schema_lines(case.python_schema_lines)))
+    cells.append(
+        _code_cell(
+            notebook_key, len(cells), _python_schema_lines(case.python_schema_lines)
+        )
+    )
 
     cells.append(
         _md_cell(
@@ -305,7 +318,9 @@ def _python_notebook(case: LocyUseCase) -> dict[str, Any]:
             ],
         )
     )
-    cells.append(_code_cell(notebook_key, len(cells), _python_seed_lines(case.seed_statements)))
+    cells.append(
+        _code_cell(notebook_key, len(cells), _python_seed_lines(case.seed_statements))
+    )
 
     cells.append(
         _md_cell(
@@ -318,7 +333,9 @@ def _python_notebook(case: LocyUseCase) -> dict[str, Any]:
             ],
         )
     )
-    cells.append(_code_cell(notebook_key, len(cells), _python_program_lines(case.program_lines)))
+    cells.append(
+        _code_cell(notebook_key, len(cells), _python_program_lines(case.program_lines))
+    )
 
     cells.append(
         _md_cell(
@@ -420,7 +437,9 @@ def _rust_notebook(case: LocyUseCase) -> dict[str, Any]:
             ],
         )
     )
-    cells.append(_code_cell(notebook_key, len(cells), _rust_schema_lines(case.rust_schema_lines)))
+    cells.append(
+        _code_cell(notebook_key, len(cells), _rust_schema_lines(case.rust_schema_lines))
+    )
 
     cells.append(
         _md_cell(
@@ -433,7 +452,9 @@ def _rust_notebook(case: LocyUseCase) -> dict[str, Any]:
             ],
         )
     )
-    cells.append(_code_cell(notebook_key, len(cells), _rust_seed_lines(case.seed_statements)))
+    cells.append(
+        _code_cell(notebook_key, len(cells), _rust_seed_lines(case.seed_statements))
+    )
 
     cells.append(
         _md_cell(
@@ -446,7 +467,9 @@ def _rust_notebook(case: LocyUseCase) -> dict[str, Any]:
             ],
         )
     )
-    cells.append(_code_cell(notebook_key, len(cells), _rust_program_lines(case.program_lines)))
+    cells.append(
+        _code_cell(notebook_key, len(cells), _rust_program_lines(case.program_lines))
+    )
 
     cells.append(
         _md_cell(
@@ -825,7 +848,7 @@ def _cases() -> list[LocyUseCase]:
                 "CREATE RULE vendor_reliability AS",
                 "MATCH (v:Vendor)-[:SUPPLIES]->(c:Component)",
                 "WHERE c IS component_failure_risk",
-                "FOLD reliability = MPROD(1.0 - component_failure_risk.risk)",
+                "FOLD reliability = MPROD(1.0 - risk)",
                 "YIELD KEY v, reliability",
                 "",
                 "QUERY component_failure_risk RETURN c.name AS component, risk",

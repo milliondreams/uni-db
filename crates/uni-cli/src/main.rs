@@ -63,8 +63,8 @@ enum SnapshotCmd {
     List,
     /// Create a new snapshot
     Create {
-        /// Optional name for the snapshot
-        name: Option<String>,
+        /// Name for the snapshot
+        name: String,
     },
     /// Restore the database to a specific snapshot
     Restore {
@@ -136,7 +136,7 @@ async fn main() -> Result<()> {
                     }
                 }
                 SnapshotCmd::Create { name } => {
-                    let id = db.create_snapshot(name.as_deref()).await?;
+                    let id = db.create_snapshot(&name).await?;
                     println!("{} Snapshot created: {}", "Success:".green(), id);
                 }
                 SnapshotCmd::Restore { id } => {

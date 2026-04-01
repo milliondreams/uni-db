@@ -5,7 +5,6 @@ use anyhow::Result;
 use uni_db::{DataType, Uni};
 
 #[tokio::test]
-#[ignore = "Query streaming/cursor functionality not yet implemented"]
 async fn test_query_cursor_streaming() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
@@ -16,14 +15,18 @@ async fn test_query_cursor_streaming() -> Result<()> {
         .await?;
 
     // Insert 100 persons
+    let tx = db.session().tx().await?;
     for i in 0..100 {
-        db.execute(&format!("CREATE (:Person {{name: 'Person {}'}})", i))
+        tx.execute(&format!("CREATE (:Person {{name: 'Person {}'}})", i))
             .await?;
     }
+    tx.commit().await?;
 
     // Query with cursor
     let mut cursor = db
-        .query_cursor("MATCH (p:Person) RETURN p.name ORDER BY p.name")
+        .session()
+        .query_with("MATCH (p:Person) RETURN p.name ORDER BY p.name")
+        .cursor()
         .await?;
 
     assert_eq!(cursor.columns(), &["p.name"]);
@@ -53,12 +56,18 @@ async fn test_query_cursor_streaming() -> Result<()> {
         .apply()
         .await?;
 
+    let tx2 = db2.session().tx().await?;
     for i in 0..100 {
-        db2.execute(&format!("CREATE (:Person {{name: 'Person {}'}})", i))
+        tx2.execute(&format!("CREATE (:Person {{name: 'Person {}'}})", i))
             .await?;
     }
+    tx2.commit().await?;
 
-    let mut cursor2 = db2.query_cursor("MATCH (p:Person) RETURN p.name").await?;
+    let mut cursor2 = db2
+        .session()
+        .query_with("MATCH (p:Person) RETURN p.name")
+        .cursor()
+        .await?;
     let first_batch = cursor2.next_batch().await.unwrap()?;
     assert_eq!(first_batch.len(), 10);
 

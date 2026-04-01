@@ -4,7 +4,7 @@
 use crate::api::Uni;
 use std::collections::HashMap;
 use uni_common::Result;
-use uni_query::{ExecuteResult, QueryCursor, QueryResult, Value};
+use uni_query::{ExecuteResult, QueryCursor, QueryResult, Row, Value};
 
 /// Builder for constructing and executing Cypher queries.
 ///
@@ -15,7 +15,8 @@ use uni_query::{ExecuteResult, QueryCursor, QueryResult, Value};
 /// ```no_run
 /// # use uni_db::{Uni, Value};
 /// # async fn example(db: &Uni) -> uni_db::Result<()> {
-/// let results = db.query_with("MATCH (n:Person) WHERE n.age > $min_age RETURN n")
+/// let session = db.session();
+/// let results = session.query_with("MATCH (n:Person) WHERE n.age > $min_age RETURN n")
 ///     .param("min_age", 18)
 ///     .timeout(std::time::Duration::from_secs(5))
 ///     .fetch_all()
@@ -23,7 +24,7 @@ use uni_query::{ExecuteResult, QueryCursor, QueryResult, Value};
 /// # Ok(())
 /// # }
 /// ```
-#[must_use = "query builders do nothing until .fetch_all(), .execute(), or .query_cursor() is called"]
+#[must_use = "query builders do nothing until .fetch_all(), .fetch_one(), or .query_cursor() is called"]
 pub struct QueryBuilder<'a> {
     db: &'a Uni,
     cypher: String,
@@ -75,7 +76,7 @@ impl<'a> QueryBuilder<'a> {
 
     /// Execute the query and fetch all results into memory.
     pub async fn fetch_all(self) -> Result<QueryResult> {
-        let mut db_config = self.db.config().clone();
+        let mut db_config = self.db.inner.config.clone();
         if let Some(t) = self.timeout {
             db_config.query_timeout = t;
         }
@@ -84,28 +85,39 @@ impl<'a> QueryBuilder<'a> {
         }
 
         self.db
+            .inner
             .execute_internal_with_config(&self.cypher, self.params, db_config)
             .await
     }
 
+    /// Execute the query and return the first row, or `None` if empty.
+    pub async fn fetch_one(self) -> Result<Option<Row>> {
+        let result = self.fetch_all().await?;
+        Ok(result.into_rows().into_iter().next())
+    }
+
     /// Execute a mutation (CREATE, SET, DELETE, etc.) and return affected row count.
+    #[deprecated(
+        since = "0.4.0",
+        note = "Use `session.execute_with(cypher).run()` for auto-committed writes, or `fetch_all()` for queries"
+    )]
     pub async fn execute(self) -> Result<ExecuteResult> {
-        let db = self.db;
-        let before = db.get_mutation_count().await;
+        let inner = &self.db.inner;
+        let before = inner.get_mutation_count().await;
         let result = self.fetch_all().await?;
         let affected_rows = if result.is_empty() {
-            db.get_mutation_count().await.saturating_sub(before)
+            inner.get_mutation_count().await.saturating_sub(before)
         } else {
             result.len()
         };
-        Ok(ExecuteResult { affected_rows })
+        Ok(ExecuteResult::new(affected_rows))
     }
 
     /// Execute the query and return a cursor for streaming results.
     ///
     /// Useful for large result sets to avoid loading everything into memory.
     pub async fn query_cursor(self) -> Result<QueryCursor> {
-        let mut db_config = self.db.config().clone();
+        let mut db_config = self.db.inner.config.clone();
         if let Some(t) = self.timeout {
             db_config.query_timeout = t;
         }
@@ -114,6 +126,7 @@ impl<'a> QueryBuilder<'a> {
         }
 
         self.db
+            .inner
             .execute_cursor_internal_with_config(&self.cypher, self.params, db_config)
             .await
     }

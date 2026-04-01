@@ -1,15 +1,15 @@
 # TCK Compliance Report
 
-**Generated:** 2026-03-24 15:40:39
-**Results:** `results_20260324_154038.json`
-**Compared to:** `results_20260324_153532.json`
+**Generated:** 2026-03-31 07:51:12
+**Results:** `results_20260331_075112.json`
+**Compared to:** `results_20260330_212927.json`
 
 ## Summary
 
 | Metric | Current | Previous | Delta |
 |--------|---------|----------|-------|
-| Scenarios | 242 | 242 |  |
-| Passed | 242 | 242 |  |
+| Scenarios | 263 | 263 |  |
+| Passed | 263 | 263 |  |
 | Failed | 0 | 0 |  |
 | Pass Rate | 100.0% | 100.0% | ➡️ +0.0pp |
 
@@ -22,7 +22,9 @@
 | ✅ AlongWithIsRef | 3 | 3 | 0 | 100% |  |
 | ✅ AssumeAbduce | 3 | 3 | 0 | 100% |  |
 | ✅ BasicRules | 6 | 6 | 0 | 100% |  |
+| ✅ CypherFunctions | 9 | 9 | 0 | 100% |  |
 | ✅ DeriveEdges | 9 | 9 | 0 | 100% |  |
+| ✅ DeriveVisibility | 7 | 7 | 0 | 100% |  |
 | ✅ ErrorConditions | 5 | 5 | 0 | 100% |  |
 | ✅ ExactProbability | 15 | 15 | 0 | 100% |  |
 | ✅ ExplainCombinations | 6 | 6 | 0 | 100% |  |
@@ -33,6 +35,7 @@
 | ✅ MultiStratum | 3 | 3 | 0 | 100% |  |
 | ✅ NonRecursive | 4 | 4 | 0 | 100% |  |
 | ✅ OptimizedSelection | 6 | 6 | 0 | 100% |  |
+| ✅ ParameterBinding | 5 | 5 | 0 | 100% |  |
 | ✅ PathCarriedValues | 9 | 9 | 0 | 100% |  |
 | ✅ PathCombinations | 5 | 5 | 0 | 100% |  |
 | ✅ PrioritizedRules | 5 | 5 | 0 | 100% |  |

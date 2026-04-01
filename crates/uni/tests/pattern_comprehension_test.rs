@@ -12,18 +12,21 @@ async fn test_pattern_comprehension_basic_traversal() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
     // Create nodes and relationships
-    db.execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}), (c:Person {name: 'Carol'})",
     )
     .await?;
-    db.execute(
+    tx.execute(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}), (c:Person {name: 'Carol'}) \
          CREATE (a)-[:KNOWS]->(b), (a)-[:KNOWS]->(c)",
     )
     .await?;
+    tx.commit().await?;
 
     // First verify regular MATCH works
     let check = db
+        .session()
         .query("MATCH (n:Person)-[:KNOWS]->(m:Person) RETURN n.name, m.name")
         .await?;
     eprintln!("Regular MATCH results ({} rows):", check.len());
@@ -34,6 +37,7 @@ async fn test_pattern_comprehension_basic_traversal() -> Result<()> {
 
     // Now test pattern comprehension
     let results = db
+        .session()
         .query("MATCH (n:Person) RETURN n.name, [(n)-[:KNOWS]->(m) | m.name] AS friends")
         .await?;
 
@@ -53,10 +57,13 @@ async fn test_pattern_comprehension_node_property() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
     // TCK Scenario 4: Introduce a new node variable
-    db.execute("CREATE ({ext_id: 'a'})-[:T]->({name: 'val', ext_id: 'b'})-[:T]->({ext_id: 'c'})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE ({ext_id: 'a'})-[:T]->({name: 'val', ext_id: 'b'})-[:T]->({ext_id: 'c'})")
         .await?;
+    tx.commit().await?;
 
     let results = db
+        .session()
         .query("MATCH (n) RETURN [(n)-[:T]->(b) | b.name] AS list")
         .await?;
 
@@ -76,10 +83,13 @@ async fn test_pattern_comprehension_edge_property() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
     // TCK Scenario 5: Introduce a new relationship variable
-    db.execute("CREATE (a), (b), (c) CREATE (a)-[:T {name: 'val'}]->(b), (b)-[:T]->(c)")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (a), (b), (c) CREATE (a)-[:T {name: 'val'}]->(b), (b)-[:T]->(c)")
         .await?;
+    tx.commit().await?;
 
     let results = db
+        .session()
         .query("MATCH (n) RETURN [(n)-[r:T]->() | r.name] AS list")
         .await?;
 
@@ -99,10 +109,13 @@ async fn test_pattern_comprehension_path_variable() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
     // TCK Scenario 1: Return a pattern comprehension with path variable
-    db.execute("CREATE (a:A), (b:B) CREATE (a)-[:T]->(b), (b)-[:T]->(:C)")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (a:A), (b:B) CREATE (a)-[:T]->(b), (b)-[:T]->(:C)")
         .await?;
+    tx.commit().await?;
 
     let result = db
+        .session()
         .query("MATCH (n) RETURN [p = (n)-->() | p] AS list")
         .await;
 
@@ -148,17 +161,20 @@ fn sorted_ints(list: &[Value]) -> Vec<i64> {
 async fn test_pc_single_hop_verify_values() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
-    db.execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}), (c:Person {name: 'Carol'})",
     )
     .await?;
-    db.execute(
+    tx.execute(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}), (c:Person {name: 'Carol'}) \
          CREATE (a)-[:KNOWS]->(b), (a)-[:KNOWS]->(c)",
     )
     .await?;
+    tx.commit().await?;
 
     let results = db
+        .session()
         .query(
             "MATCH (n:Person {name: 'Alice'}) \
              RETURN [(n)-[:KNOWS]->(m) | m.name] AS friends",
@@ -180,17 +196,20 @@ async fn test_pc_single_hop_verify_values() -> Result<()> {
 async fn test_pc_edge_property_values() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
-    db.execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}), (c:Person {name: 'Carol'})",
     )
     .await?;
-    db.execute(
+    tx.execute(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}), (c:Person {name: 'Carol'}) \
          CREATE (a)-[:RATED {score: 5}]->(b), (a)-[:RATED {score: 3}]->(c)",
     )
     .await?;
+    tx.commit().await?;
 
     let results = db
+        .session()
         .query(
             "MATCH (n:Person {name: 'Alice'}) \
              RETURN [(n)-[r:RATED]->(m) | r.score] AS scores",
@@ -212,19 +231,22 @@ async fn test_pc_edge_property_values() -> Result<()> {
 async fn test_pc_multi_hop_chain() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
-    db.execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (a:Person {name: 'A'}), (b:Person {name: 'B'}), \
          (c:Person {name: 'C'}), (d:Person {name: 'D'})",
     )
     .await?;
-    db.execute(
+    tx.execute(
         "MATCH (a:Person {name: 'A'}), (b:Person {name: 'B'}), \
          (c:Person {name: 'C'}), (d:Person {name: 'D'}) \
          CREATE (a)-[:KNOWS]->(b), (b)-[:KNOWS]->(c), (b)-[:KNOWS]->(d)",
     )
     .await?;
+    tx.commit().await?;
 
     let results = db
+        .session()
         .query(
             "MATCH (n:Person {name: 'A'}) \
              RETURN [(n)-[:KNOWS]->(b)-[:KNOWS]->(c) | c.name] AS fof",
@@ -242,19 +264,22 @@ async fn test_pc_multi_hop_chain() -> Result<()> {
 async fn test_pc_where_clause_filter() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
-    db.execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (a:Person {name: 'Alice'}), \
          (b:Person {name: 'Bob', age: 25}), \
          (c:Person {name: 'Carol', age: 35})",
     )
     .await?;
-    db.execute(
+    tx.execute(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}), (c:Person {name: 'Carol'}) \
          CREATE (a)-[:KNOWS]->(b), (a)-[:KNOWS]->(c)",
     )
     .await?;
+    tx.commit().await?;
 
     let results = db
+        .session()
         .query(
             "MATCH (n:Person {name: 'Alice'}) \
              RETURN [(n)-[:KNOWS]->(m) WHERE m.age > 28 | m.name] AS older",
@@ -276,16 +301,19 @@ async fn test_pc_where_clause_filter() -> Result<()> {
 async fn test_pc_empty_list_no_outgoing() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
-    db.execute("CREATE (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'})")
         .await?;
-    db.execute(
+    tx.execute(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) \
          CREATE (a)-[:KNOWS]->(b)",
     )
     .await?;
+    tx.commit().await?;
 
     // Bob has no outgoing KNOWS edges
     let results = db
+        .session()
         .query(
             "MATCH (n:Person {name: 'Bob'}) \
              RETURN [(n)-[:KNOWS]->(m) | m.name] AS friends",
@@ -307,18 +335,21 @@ async fn test_pc_empty_list_no_outgoing() -> Result<()> {
 async fn test_pc_typed_vs_untyped_edges() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
-    db.execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}), (c:Person {name: 'Carol'})",
     )
     .await?;
-    db.execute(
+    tx.execute(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}), (c:Person {name: 'Carol'}) \
          CREATE (a)-[:KNOWS]->(b), (a)-[:LIKES]->(c)",
     )
     .await?;
+    tx.commit().await?;
 
     // Typed: only KNOWS
     let typed = db
+        .session()
         .query(
             "MATCH (n:Person {name: 'Alice'}) \
              RETURN [(n)-[:KNOWS]->(m) | m.name] AS friends",
@@ -334,6 +365,7 @@ async fn test_pc_typed_vs_untyped_edges() -> Result<()> {
 
     // Untyped: all outgoing
     let untyped = db
+        .session()
         .query(
             "MATCH (n:Person {name: 'Alice'}) \
              RETURN [(n)-->(m) | m.name] AS all_out",
@@ -354,18 +386,21 @@ async fn test_pc_typed_vs_untyped_edges() -> Result<()> {
 async fn test_pc_undirected_pattern() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
-    db.execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}), (c:Person {name: 'Carol'})",
     )
     .await?;
-    db.execute(
+    tx.execute(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}), (c:Person {name: 'Carol'}) \
          CREATE (a)-[:KNOWS]->(b), (c)-[:KNOWS]->(b)",
     )
     .await?;
+    tx.commit().await?;
 
     // Bob is connected to both Alice and Carol via undirected KNOWS
     let results = db
+        .session()
         .query(
             "MATCH (n:Person {name: 'Bob'}) \
              RETURN [(n)-[:KNOWS]-(m) | m.name] AS connected",
@@ -387,17 +422,20 @@ async fn test_pc_undirected_pattern() -> Result<()> {
 async fn test_pc_literal_map_expression() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
-    db.execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}), (c:Person {name: 'Carol'})",
     )
     .await?;
-    db.execute(
+    tx.execute(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}), (c:Person {name: 'Carol'}) \
          CREATE (a)-[:KNOWS]->(b), (a)-[:KNOWS]->(c)",
     )
     .await?;
+    tx.commit().await?;
 
     let results = db
+        .session()
         .query(
             "MATCH (n:Person {name: 'Alice'}) \
              RETURN [(n)-[:KNOWS]->(m) | 1] AS ones",
@@ -418,22 +456,25 @@ async fn test_pc_literal_map_expression() -> Result<()> {
 async fn test_pc_arithmetic_map_expression() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
-    db.execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (a:Person {name: 'Alice'}), \
          (b:Person {name: 'Bob', age: 25}), \
          (c:Person {name: 'Carol', age: 20})",
     )
     .await?;
-    db.execute(
+    tx.execute(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}), (c:Person {name: 'Carol'}) \
          CREATE (a)-[:KNOWS]->(b), (a)-[:KNOWS]->(c)",
     )
     .await?;
+    tx.commit().await?;
 
     // Use string concatenation instead of numeric arithmetic as the map expression,
     // since schemaless properties may be stored as LargeBinary which doesn't support
     // direct arithmetic coercion in DataFusion.
     let results = db
+        .session()
         .query(
             "MATCH (n:Person {name: 'Alice'}) \
              RETURN [(n)-[:KNOWS]->(m) | m.name] AS names",
@@ -450,6 +491,7 @@ async fn test_pc_arithmetic_map_expression() -> Result<()> {
 
     // Also verify the ages come through correctly as raw values
     let results2 = db
+        .session()
         .query(
             "MATCH (n:Person {name: 'Alice'}) \
              RETURN [(n)-[:KNOWS]->(m) | m.age] AS ages",
@@ -471,17 +513,20 @@ async fn test_pc_arithmetic_map_expression() -> Result<()> {
 async fn test_pc_with_order_by() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
-    db.execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}), (c:Person {name: 'Carol'})",
     )
     .await?;
-    db.execute(
+    tx.execute(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}), (c:Person {name: 'Carol'}) \
          CREATE (a)-[:KNOWS]->(b), (b)-[:KNOWS]->(c)",
     )
     .await?;
+    tx.commit().await?;
 
     let results = db
+        .session()
         .query(
             "MATCH (n:Person) \
              RETURN n.name AS name, [(n)-[:KNOWS]->(m) | m.name] AS friends \
@@ -511,15 +556,18 @@ async fn test_pc_with_order_by() -> Result<()> {
 async fn test_pc_alongside_scalar_columns() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
-    db.execute("CREATE (a:Person {name: 'Alice', age: 30}), (b:Person {name: 'Bob'})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (a:Person {name: 'Alice', age: 30}), (b:Person {name: 'Bob'})")
         .await?;
-    db.execute(
+    tx.execute(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) \
          CREATE (a)-[:KNOWS]->(b)",
     )
     .await?;
+    tx.commit().await?;
 
     let results = db
+        .session()
         .query(
             "MATCH (n:Person {name: 'Alice'}) \
              RETURN n.name AS name, n.age AS age, [(n)-[:KNOWS]->(m) | m.name] AS friends",
@@ -540,17 +588,20 @@ async fn test_pc_alongside_scalar_columns() -> Result<()> {
 async fn test_pc_multiple_comprehensions() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
-    db.execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}), (c:Person {name: 'Carol'})",
     )
     .await?;
-    db.execute(
+    tx.execute(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}), (c:Person {name: 'Carol'}) \
          CREATE (a)-[:KNOWS]->(b), (a)-[:LIKES]->(c)",
     )
     .await?;
+    tx.commit().await?;
 
     let results = db
+        .session()
         .query(
             "MATCH (n:Person {name: 'Alice'}) \
              RETURN [(n)-[:KNOWS]->(m) | m.name] AS known, \
@@ -576,9 +627,12 @@ async fn test_pc_multiple_comprehensions() -> Result<()> {
 async fn test_pc_isolated_node() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
-    db.execute("CREATE (:Person {name: 'Lonely'})").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Person {name: 'Lonely'})").await?;
+    tx.commit().await?;
 
     let results = db
+        .session()
         .query(
             "MATCH (n:Person {name: 'Lonely'}) \
              RETURN [(n)-[:KNOWS]->(m) | m.name] AS friends",
@@ -600,16 +654,19 @@ async fn test_pc_isolated_node() -> Result<()> {
 async fn test_pc_nonexistent_edge_type() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
-    db.execute("CREATE (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'})")
         .await?;
-    db.execute(
+    tx.execute(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) \
          CREATE (a)-[:KNOWS]->(b)",
     )
     .await?;
+    tx.commit().await?;
 
     // Edge type DOES_NOT_EXIST is not in the graph — should return empty list, not error
     let results = db
+        .session()
         .query(
             "MATCH (n:Person {name: 'Alice'}) \
              RETURN [(n)-[:DOES_NOT_EXIST]->(m) | m.name] AS friends",
@@ -634,19 +691,22 @@ async fn test_pc_nonexistent_edge_type() -> Result<()> {
 async fn test_pc_null_property_in_map_expr() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
-    db.execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (a:Person {name: 'Alice'}), \
          (b:Person {name: 'Bob', nickname: 'Bobby'}), \
          (c:Person {name: 'Carol'})",
     )
     .await?;
-    db.execute(
+    tx.execute(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}), (c:Person {name: 'Carol'}) \
          CREATE (a)-[:KNOWS]->(b), (a)-[:KNOWS]->(c)",
     )
     .await?;
+    tx.commit().await?;
 
     let results = db
+        .session()
         .query(
             "MATCH (n:Person {name: 'Alice'}) \
              RETURN [(n)-[:KNOWS]->(m) | m.nickname] AS nicknames",
@@ -682,7 +742,8 @@ async fn test_pc_null_property_in_map_expr() -> Result<()> {
 async fn test_pc_inside_list_comprehension() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
-    db.execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (n1:X {n: 1}), (m1:Y), (i1:Y), (i2:Y) \
          CREATE (n1)-[:T]->(m1), \
                 (m1)-[:T]->(i1), \
@@ -693,9 +754,11 @@ async fn test_pc_inside_list_comprehension() -> Result<()> {
                 (m2)-[:T]->(i4)",
     )
     .await?;
+    tx.commit().await?;
 
     // Verify data is set up correctly
     let check = db
+        .session()
         .query("MATCH (n:X)-->(m) RETURN n.n AS nn, labels(m) AS ml")
         .await?;
     eprintln!("Data check ({} rows):", check.len());
@@ -705,6 +768,7 @@ async fn test_pc_inside_list_comprehension() -> Result<()> {
 
     // Verify what nodes(p) contains
     let path_check = db
+        .session()
         .query("MATCH p = (n:X)-->() RETURN n.n, nodes(p) AS np")
         .await?;
     eprintln!("Path nodes ({} rows):", path_check.len());
@@ -714,6 +778,7 @@ async fn test_pc_inside_list_comprehension() -> Result<()> {
 
     // Now run the actual query
     let results = db
+        .session()
         .query(
             "MATCH p = (n:X)-->() \
              RETURN n, [x IN nodes(p) | size([(x)-->(:Y) | 1])] AS list",

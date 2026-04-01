@@ -10,12 +10,15 @@
 use ::uni_db::{Uni, Value, Vid};
 use std::collections::HashMap;
 use std::time::Duration;
+use uni_common::UniError;
 use uni_common::core::schema::{
-    DataType, DistanceMetric, IndexDefinition, ScalarIndexConfig, ScalarIndexType,
-    VectorIndexConfig, VectorIndexType,
+    DataType, DistanceMetric, EmbeddingConfig, FullTextIndexConfig, IndexDefinition,
+    InvertedIndexConfig, ScalarIndexConfig, ScalarIndexType, TokenizerConfig, VectorIndexConfig,
+    VectorIndexType,
 };
 
 // Re-export types used by the sync and async API modules.
+pub use ::uni_db::api::schema::EdgeTypeInfo as UniEdgeTypeInfo;
 pub use ::uni_db::api::schema::LabelInfo as UniLabelInfo;
 pub use ::uni_db::query_crate::QueryCursor;
 pub use ::uni_db::{ExplainOutput, ProfileOutput, QueryResult, Row};
@@ -29,12 +32,13 @@ pub async fn query_core(
     db: &Uni,
     cypher: &str,
     params: HashMap<String, Value>,
-) -> Result<QueryResult, String> {
-    let mut builder = db.query_with(cypher);
+) -> Result<QueryResult, UniError> {
+    let session = db.session();
+    let mut builder = session.query_with(cypher);
     for (k, v) in params {
         builder = builder.param(&k, v);
     }
-    builder.fetch_all().await.map_err(|e| e.to_string())
+    builder.fetch_all().await
 }
 
 /// Execute a query with parameters, timeout, and memory limit.
@@ -44,8 +48,9 @@ pub async fn query_builder_core(
     params: HashMap<String, Value>,
     timeout_secs: Option<f64>,
     max_memory: Option<usize>,
-) -> Result<QueryResult, String> {
-    let mut builder = db.query_with(cypher);
+) -> Result<QueryResult, UniError> {
+    let session = db.session();
+    let mut builder = session.query_with(cypher);
     for (k, v) in params {
         builder = builder.param(&k, v);
     }
@@ -55,7 +60,7 @@ pub async fn query_builder_core(
     if let Some(m) = max_memory {
         builder = builder.max_memory(m);
     }
-    builder.fetch_all().await.map_err(|e| e.to_string())
+    builder.fetch_all().await
 }
 
 /// Open a streaming cursor for a query with parameters, timeout, and memory limit.
@@ -65,8 +70,9 @@ pub async fn query_cursor_core(
     params: HashMap<String, Value>,
     timeout_secs: Option<f64>,
     max_memory: Option<usize>,
-) -> Result<QueryCursor, String> {
-    let mut builder = db.query_with(cypher);
+) -> Result<QueryCursor, UniError> {
+    let session = db.session();
+    let mut builder = session.query_with(cypher);
     for (k, v) in params {
         builder = builder.param(&k, v);
     }
@@ -76,13 +82,17 @@ pub async fn query_cursor_core(
     if let Some(m) = max_memory {
         builder = builder.max_memory(m);
     }
-    builder.query_cursor().await.map_err(|e| e.to_string())
+    builder.cursor().await
 }
 
 /// Execute a mutation query, returning affected row count.
-pub async fn execute_core(db: &Uni, cypher: &str) -> Result<usize, String> {
-    let result = db.execute(cypher).await.map_err(|e| e.to_string())?;
-    Ok(result.affected_rows)
+pub async fn execute_core(db: &Uni, cypher: &str) -> Result<usize, UniError> {
+    let session = db.session();
+    let tx = session.tx().await?;
+    let result = tx.execute(cypher).await?;
+    let affected = result.affected_rows();
+    tx.commit().await?;
+    Ok(affected)
 }
 
 /// Execute a mutation query with parameters, returning affected row count.
@@ -90,237 +100,118 @@ pub async fn execute_with_params_core(
     db: &Uni,
     cypher: &str,
     params: HashMap<String, Value>,
-) -> Result<usize, String> {
-    let mut builder = db.query_with(cypher);
+) -> Result<usize, UniError> {
+    let session = db.session();
+    let tx = session.tx().await?;
+    let mut builder = tx.execute_with(cypher);
     for (k, v) in params {
         builder = builder.param(&k, v);
     }
-    let result = builder.execute().await.map_err(|e| e.to_string())?;
-    Ok(result.affected_rows)
-}
-
-/// Explain a query plan without executing.
-pub async fn explain_core(db: &Uni, cypher: &str) -> Result<ExplainOutput, String> {
-    db.explain(cypher).await.map_err(|e| e.to_string())
-}
-
-/// Profile query execution with operator-level statistics.
-pub async fn profile_core(db: &Uni, cypher: &str) -> Result<(QueryResult, ProfileOutput), String> {
-    db.profile(cypher).await.map_err(|e| e.to_string())
+    let result = builder.run().await?;
+    let affected = result.affected_rows();
+    tx.commit().await?;
+    Ok(affected)
 }
 
 /// Flush all uncommitted changes to persistent storage.
-pub async fn flush_core(db: &Uni) -> Result<(), String> {
-    db.flush().await.map_err(|e| e.to_string())
-}
-
-// ============================================================================
-// Transaction Core
-// ============================================================================
-
-/// Begin a new transaction.
-pub async fn begin_transaction_core(db: &Uni) -> Result<(), String> {
-    let writer_lock = db.writer().ok_or_else(|| "Read only".to_string())?;
-    let mut writer = writer_lock.write().await;
-    writer.begin_transaction().map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-/// Commit a transaction.
-pub async fn commit_transaction_core(db: &Uni) -> Result<(), String> {
-    let writer_lock = db.writer().ok_or_else(|| "Read only".to_string())?;
-    let mut writer = writer_lock.write().await;
-    writer
-        .commit_transaction()
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-/// Rollback a transaction.
-pub async fn rollback_transaction_core(db: &Uni) -> Result<(), String> {
-    let writer_lock = db.writer().ok_or_else(|| "Read only".to_string())?;
-    let mut writer = writer_lock.write().await;
-    writer.rollback_transaction().map_err(|e| e.to_string())?;
-    Ok(())
+pub async fn flush_core(db: &Uni) -> Result<(), UniError> {
+    db.flush().await
 }
 
 // ============================================================================
 // Schema Core
 // ============================================================================
 
-/// Create a label.
-pub async fn create_label_core(db: &Uni, name: &str) -> Result<u16, String> {
-    let sm = db.schema_manager();
-    let id = sm.add_label(name).map_err(|e| e.to_string())?;
-    sm.save().await.map_err(|e| e.to_string())?;
-    Ok(id)
-}
-
-/// Create an edge type.
-pub async fn create_edge_type_core(
-    db: &Uni,
-    name: &str,
-    from_labels: Vec<String>,
-    to_labels: Vec<String>,
-) -> Result<u32, String> {
-    let sm = db.schema_manager();
-    let id = sm
-        .add_edge_type(name, from_labels, to_labels)
-        .map_err(|e| e.to_string())?;
-    sm.save().await.map_err(|e| e.to_string())?;
-    Ok(id)
-}
-
-/// Add a property to a label or edge type.
-pub async fn add_property_core(
-    db: &Uni,
-    label_or_type: &str,
-    name: &str,
-    dt: DataType,
-    nullable: bool,
-) -> Result<(), String> {
-    let sm = db.schema_manager();
-    sm.add_property(label_or_type, name, dt, nullable)
-        .map_err(|e| e.to_string())?;
-    sm.save().await.map_err(|e| e.to_string())?;
-    Ok(())
-}
-
 /// Check if a label exists.
-pub async fn label_exists_core(db: &Uni, name: &str) -> Result<bool, String> {
-    db.label_exists(name).await.map_err(|e| e.to_string())
+pub async fn label_exists_core(db: &Uni, name: &str) -> Result<bool, UniError> {
+    db.label_exists(name).await
 }
 
 /// Check if an edge type exists.
-pub async fn edge_type_exists_core(db: &Uni, name: &str) -> Result<bool, String> {
-    db.edge_type_exists(name).await.map_err(|e| e.to_string())
+pub async fn edge_type_exists_core(db: &Uni, name: &str) -> Result<bool, UniError> {
+    db.edge_type_exists(name).await
 }
 
 /// List all label names.
-pub async fn list_labels_core(db: &Uni) -> Result<Vec<String>, String> {
-    db.list_labels().await.map_err(|e| e.to_string())
+pub async fn list_labels_core(db: &Uni) -> Result<Vec<String>, UniError> {
+    db.list_labels().await
 }
 
 /// List all edge type names.
-pub async fn list_edge_types_core(db: &Uni) -> Result<Vec<String>, String> {
-    db.list_edge_types().await.map_err(|e| e.to_string())
+pub async fn list_edge_types_core(db: &Uni) -> Result<Vec<String>, UniError> {
+    db.list_edge_types().await
 }
 
 /// Get detailed information about a label.
-pub async fn get_label_info_core(db: &Uni, name: &str) -> Result<Option<UniLabelInfo>, String> {
-    db.get_label_info(name).await.map_err(|e| e.to_string())
+pub async fn get_label_info_core(db: &Uni, name: &str) -> Result<Option<UniLabelInfo>, UniError> {
+    db.get_label_info(name).await
+}
+
+/// Get detailed information about an edge type.
+pub async fn get_edge_type_info_core(
+    db: &Uni,
+    name: &str,
+) -> Result<Option<UniEdgeTypeInfo>, UniError> {
+    db.get_edge_type_info(name).await
 }
 
 /// Load schema from a JSON file.
-pub async fn load_schema_core(db: &Uni, path: &str) -> Result<(), String> {
-    db.load_schema(path).await.map_err(|e| e.to_string())
+pub async fn load_schema_core(db: &Uni, path: &str) -> Result<(), UniError> {
+    db.load_schema(path).await
 }
 
 /// Save schema to a JSON file.
-pub async fn save_schema_core(db: &Uni, path: &str) -> Result<(), String> {
-    db.save_schema(path).await.map_err(|e| e.to_string())
+pub async fn save_schema_core(db: &Uni, path: &str) -> Result<(), UniError> {
+    db.save_schema(path).await
 }
 
 /// Apply pending schema changes.
+///
+/// This is additive/idempotent: labels and edge types that already exist are
+/// silently skipped so that the schema builder can be used to add properties
+/// or indexes to existing schema elements.
 pub async fn apply_schema_core(
     db: &Uni,
     pending_labels: &[String],
     pending_edge_types: &[(String, Vec<String>, Vec<String>)],
     pending_properties: &[(String, String, DataType, bool)],
     pending_indexes: &[IndexDefinition],
-) -> Result<(), String> {
-    let sm = db.schema_manager();
+) -> Result<(), UniError> {
+    use ::uni_db::api::schema::SchemaChange;
+
+    let mut changes = Vec::new();
 
     for name in pending_labels {
-        sm.add_label(name).map_err(|e| e.to_string())?;
+        changes.push(SchemaChange::AddLabel { name: name.clone() });
     }
 
     for (name, from, to) in pending_edge_types {
-        sm.add_edge_type(name, from.clone(), to.clone())
-            .map_err(|e| e.to_string())?;
+        changes.push(SchemaChange::AddEdgeType {
+            name: name.clone(),
+            from_labels: from.clone(),
+            to_labels: to.clone(),
+        });
     }
 
     for (label_or_type, prop_name, data_type, nullable) in pending_properties {
-        sm.add_property(label_or_type, prop_name, data_type.clone(), *nullable)
-            .map_err(|e| e.to_string())?;
+        changes.push(SchemaChange::AddProperty {
+            label_or_type: label_or_type.clone(),
+            name: prop_name.clone(),
+            data_type: data_type.clone(),
+            nullable: *nullable,
+        });
     }
 
     for idx in pending_indexes {
-        sm.add_index(idx.clone()).map_err(|e| e.to_string())?;
+        changes.push(SchemaChange::AddIndex(idx.clone()));
     }
 
-    sm.save().await.map_err(|e| e.to_string())?;
-    Ok(())
+    db.schema().with_changes(changes).apply().await
 }
 
 // ============================================================================
 // Index Core
 // ============================================================================
-
-/// Create a scalar index.
-pub async fn create_scalar_index_core(
-    db: &Uni,
-    label: &str,
-    property: &str,
-    index_type: &str,
-) -> Result<(), String> {
-    let it = match index_type.to_lowercase().as_str() {
-        "btree" => ScalarIndexType::BTree,
-        "hash" => ScalarIndexType::Hash,
-        "bitmap" => ScalarIndexType::Bitmap,
-        _ => return Err(format!("Unknown index type: {}", index_type)),
-    };
-
-    let sm = db.schema_manager();
-    let idx_config = ScalarIndexConfig {
-        name: format!("idx_{}_{}", label, property),
-        label: label.to_string(),
-        properties: vec![property.to_string()],
-        index_type: it,
-        where_clause: None,
-        metadata: Default::default(),
-    };
-    let def = IndexDefinition::Scalar(idx_config);
-    sm.add_index(def).map_err(|e| e.to_string())?;
-    sm.save().await.map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-/// Create a vector index.
-pub async fn create_vector_index_core(
-    db: &Uni,
-    label: &str,
-    property: &str,
-    metric: &str,
-) -> Result<(), String> {
-    let metric_type = match metric.to_lowercase().as_str() {
-        "l2" => DistanceMetric::L2,
-        "cosine" => DistanceMetric::Cosine,
-        "dot" => DistanceMetric::Dot,
-        _ => return Err(format!("Unknown metric: {}", metric)),
-    };
-
-    let sm = db.schema_manager();
-    let idx_config = VectorIndexConfig {
-        name: format!("idx_{}_{}_vec", label, property),
-        label: label.to_string(),
-        property: property.to_string(),
-        index_type: VectorIndexType::Hnsw {
-            m: 16,
-            ef_construction: 200,
-            ef_search: 50,
-        },
-        metric: metric_type,
-        embedding_config: None,
-        metadata: Default::default(),
-    };
-
-    let def = IndexDefinition::Vector(idx_config);
-    sm.add_index(def).map_err(|e| e.to_string())?;
-    sm.save().await.map_err(|e| e.to_string())?;
-    Ok(())
-}
 
 // ============================================================================
 // Bulk Loading Core
@@ -331,14 +222,16 @@ pub async fn bulk_insert_vertices_core(
     db: &Uni,
     label: &str,
     rust_props: Vec<HashMap<String, serde_json::Value>>,
-) -> Result<Vec<Vid>, String> {
+) -> Result<Vec<Vid>, UniError> {
     let uni_props: Vec<uni_common::Properties> = rust_props
         .into_iter()
         .map(|m| m.into_iter().map(|(k, v)| (k, v.into())).collect())
         .collect();
-    db.bulk_insert_vertices(label, uni_props)
-        .await
-        .map_err(|e| e.to_string())
+    let session = db.session();
+    let tx = session.tx().await?;
+    let vids = tx.bulk_insert_vertices(label, uni_props).await?;
+    tx.commit().await?;
+    Ok(vids)
 }
 
 /// Bulk insert edges.
@@ -346,14 +239,16 @@ pub async fn bulk_insert_edges_core(
     db: &Uni,
     edge_type: &str,
     edges: Vec<(Vid, Vid, HashMap<String, serde_json::Value>)>,
-) -> Result<(), String> {
+) -> Result<(), UniError> {
     let uni_edges: Vec<(Vid, Vid, uni_common::Properties)> = edges
         .into_iter()
         .map(|(s, d, m)| (s, d, m.into_iter().map(|(k, v)| (k, v.into())).collect()))
         .collect();
-    db.bulk_insert_edges(edge_type, uni_edges)
-        .await
-        .map_err(|e| e.to_string())
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.bulk_insert_edges(edge_type, uni_edges).await?;
+    tx.commit().await?;
+    Ok(())
 }
 
 // ============================================================================
@@ -365,13 +260,10 @@ pub async fn xervo_embed_core(
     db: &Uni,
     alias: &str,
     texts: Vec<String>,
-) -> Result<Vec<Vec<f32>>, String> {
-    let xervo = db.xervo().map_err(|e| e.to_string())?;
+) -> Result<Vec<Vec<f32>>, UniError> {
+    let xervo = db.xervo();
     let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
-    xervo
-        .embed(alias, &text_refs)
-        .await
-        .map_err(|e| e.to_string())
+    xervo.embed(alias, &text_refs).await
 }
 
 /// Generate text using structured messages via a configured Xervo model alias.
@@ -382,9 +274,9 @@ pub async fn xervo_generate_core(
     max_tokens: Option<usize>,
     temperature: Option<f32>,
     top_p: Option<f32>,
-) -> Result<::uni_db::api::xervo::GenerationResult, String> {
+) -> Result<::uni_db::api::xervo::GenerationResult, UniError> {
     use ::uni_db::api::xervo::{GenerationOptions, Message};
-    let xervo = db.xervo().map_err(|e| e.to_string())?;
+    let xervo = db.xervo();
     let rust_messages: Vec<Message> = messages
         .into_iter()
         .map(|(role, content)| match role.as_str() {
@@ -401,10 +293,7 @@ pub async fn xervo_generate_core(
         width: None,
         height: None,
     };
-    xervo
-        .generate(alias, &rust_messages, opts)
-        .await
-        .map_err(|e| e.to_string())
+    xervo.generate(alias, &rust_messages, opts).await
 }
 
 // ============================================================================
@@ -412,24 +301,44 @@ pub async fn xervo_generate_core(
 // ============================================================================
 
 /// Create a point-in-time snapshot of the database.
-pub async fn create_snapshot_core(db: &Uni, name: Option<String>) -> Result<String, String> {
-    db.create_snapshot(name.as_deref())
-        .await
-        .map_err(|e| e.to_string())
+pub async fn create_snapshot_core(db: &Uni, name: &str) -> Result<String, UniError> {
+    db.create_snapshot(name).await
 }
 
 /// List all available snapshots.
 pub async fn list_snapshots_core(
     db: &Uni,
-) -> Result<Vec<uni_common::core::snapshot::SnapshotManifest>, String> {
-    db.list_snapshots().await.map_err(|e| e.to_string())
+) -> Result<Vec<uni_common::core::snapshot::SnapshotManifest>, UniError> {
+    db.list_snapshots().await
 }
 
 /// Restore the database to a specific snapshot.
-pub async fn restore_snapshot_core(db: &Uni, snapshot_id: &str) -> Result<(), String> {
-    db.restore_snapshot(snapshot_id)
-        .await
-        .map_err(|e| e.to_string())
+pub async fn restore_snapshot_core(db: &Uni, snapshot_id: &str) -> Result<(), UniError> {
+    db.restore_snapshot(snapshot_id).await
+}
+
+// ============================================================================
+// Compaction Core
+// ============================================================================
+
+/// Compact a label or edge type's storage files.
+pub async fn compact_core(
+    db: &Uni,
+    name: &str,
+) -> Result<crate::types::PyCompactionStats, UniError> {
+    let stats = db.compaction().compact(name).await?;
+    Ok(crate::types::PyCompactionStats {
+        files_compacted: stats.files_compacted,
+        bytes_before: stats.bytes_before,
+        bytes_after: stats.bytes_after,
+        duration_secs: stats.duration.as_secs_f64(),
+        crdt_merges: stats.crdt_merges,
+    })
+}
+
+/// Wait for any ongoing compaction to complete.
+pub async fn wait_for_compaction_core(db: &Uni) -> Result<(), UniError> {
+    db.compaction().wait().await
 }
 
 // ============================================================================
@@ -439,39 +348,32 @@ pub async fn restore_snapshot_core(db: &Uni, snapshot_id: &str) -> Result<(), St
 /// Get status of background index rebuild tasks.
 pub async fn index_rebuild_status_core(
     db: &Uni,
-) -> Result<Vec<uni_store::storage::IndexRebuildTask>, String> {
-    db.index_rebuild_status().await.map_err(|e| e.to_string())
+) -> Result<Vec<uni_store::storage::IndexRebuildTask>, UniError> {
+    db.indexes().rebuild_status().await
 }
 
 /// Retry failed index rebuild tasks.
-pub async fn retry_index_rebuilds_core(db: &Uni) -> Result<Vec<String>, String> {
-    db.retry_index_rebuilds().await.map_err(|e| e.to_string())
+pub async fn retry_index_rebuilds_core(db: &Uni) -> Result<Vec<String>, UniError> {
+    db.indexes().retry_failed().await
 }
 
-/// Force rebuild indexes for a label (async_ = true runs in background).
+/// Force rebuild indexes for a label (background = true runs in background).
 pub async fn rebuild_indexes_core(
     db: &Uni,
     label: &str,
-    async_: bool,
-) -> Result<Option<String>, String> {
-    db.rebuild_indexes(label, async_)
-        .await
-        .map_err(|e| e.to_string())
-}
-
-/// Check if an index is currently being rebuilt for a label.
-pub async fn is_index_building_core(db: &Uni, label: &str) -> Result<bool, String> {
-    db.is_index_building(label).await.map_err(|e| e.to_string())
+    background: bool,
+) -> Result<Option<String>, UniError> {
+    db.indexes().rebuild(label, background).await
 }
 
 /// List all indexes defined on a specific label.
 pub fn list_indexes_core(db: &Uni, label: &str) -> Vec<uni_common::core::schema::IndexDefinition> {
-    db.list_indexes(label)
+    db.indexes().list(Some(label))
 }
 
 /// List all indexes in the database.
 pub fn list_all_indexes_core(db: &Uni) -> Vec<uni_common::core::schema::IndexDefinition> {
-    db.list_all_indexes()
+    db.indexes().list(None)
 }
 
 // ============================================================================
@@ -482,8 +384,8 @@ pub fn list_all_indexes_core(db: &Uni) -> Vec<uni_common::core::schema::IndexDef
 pub async fn locy_evaluate_core(
     db: &Uni,
     program: &str,
-) -> Result<::uni_db::locy::LocyResult, String> {
-    db.locy().evaluate(program).await.map_err(|e| e.to_string())
+) -> Result<::uni_db::locy::LocyResult, UniError> {
+    db.session().locy(program).await
 }
 
 /// Evaluate a Locy program with custom configuration.
@@ -491,11 +393,20 @@ pub async fn locy_evaluate_with_config_core(
     db: &Uni,
     program: &str,
     config: ::uni_db::locy::LocyConfig,
-) -> Result<::uni_db::locy::LocyResult, String> {
-    db.locy()
-        .evaluate_with_config(program, &config)
+) -> Result<::uni_db::locy::LocyResult, UniError> {
+    db.session()
+        .locy_with(program)
+        .with_config(config)
+        .run()
         .await
-        .map_err(|e| e.to_string())
+}
+
+/// Compile a Locy program without executing it.
+pub fn locy_compile_only_core(
+    db: &Uni,
+    program: &str,
+) -> Result<::uni_locy::CompiledProgram, UniError> {
+    db.session().compile_locy(program)
 }
 
 // ============================================================================
@@ -525,7 +436,9 @@ pub async fn build_database_core(
     xervo_catalog_file: Option<&str>,
     cloud_config: Option<uni_common::CloudStorageConfig>,
     uni_config: Option<uni_common::UniConfig>,
-) -> Result<Uni, String> {
+    read_only: bool,
+    write_lease: Option<::uni_db::api::multi_agent::WriteLease>,
+) -> Result<Uni, UniError> {
     let mut builder = match mode {
         OpenMode::Open => Uni::open(uri),
         OpenMode::OpenExisting => Uni::open_existing(uri),
@@ -533,41 +446,53 @@ pub async fn build_database_core(
         OpenMode::Temporary => Uni::temporary(),
     };
 
-    if let (Some(local), Some(remote)) = (hybrid_local, hybrid_remote) {
-        builder = builder.hybrid(local, remote);
-    }
+    // Apply uni_config first so cache_size/parallelism overrides below take effect
+    let mut config = uni_config.unwrap_or_default();
 
     if let Some(size) = cache_size {
-        builder = builder.cache_size(size);
+        config.cache_size = size;
     }
 
     if let Some(n) = parallelism {
-        builder = builder.parallelism(n);
+        config.parallelism = n;
     }
+
+    builder = builder.config(config);
 
     if let Some(path) = schema_file {
         builder = builder.schema_file(path);
     }
 
     if let Some(json) = xervo_catalog_json {
-        builder = builder
-            .xervo_catalog_from_str(json)
-            .map_err(|e| e.to_string())?;
+        let catalog = ::uni_db::xervo_catalog_from_str(json)
+            .map_err(|e| UniError::Internal(anyhow::anyhow!(e.to_string())))?;
+        builder = builder.xervo_catalog(catalog);
     } else if let Some(path) = xervo_catalog_file {
-        builder = builder
-            .xervo_catalog_from_file(path)
-            .map_err(|e| e.to_string())?;
+        let catalog = ::uni_db::xervo_catalog_from_file(path)
+            .map_err(|e| UniError::Internal(anyhow::anyhow!(e.to_string())))?;
+        builder = builder.xervo_catalog(catalog);
     }
 
-    if let Some(cc) = cloud_config {
-        builder = builder.cloud_config(cc);
+    if let (Some(_local), Some(remote)) = (hybrid_local, hybrid_remote) {
+        if let Some(cc) = cloud_config {
+            builder = builder.remote_storage(remote, cc);
+        } else {
+            // remote_storage requires config; create a minimal one from the URL scheme
+            return Err(UniError::Internal(anyhow::anyhow!(
+                "remote_storage requires a CloudStorageConfig"
+            )));
+        }
     }
 
-    if let Some(cfg) = uni_config {
-        builder = builder.config(cfg);
+    if read_only {
+        builder = builder.read_only();
     }
 
-    builder.build().await.map_err(|e| e.to_string())
+    if let Some(wl) = write_lease {
+        builder = builder.write_lease(wl);
+    }
+
+    builder.build().await
 }
 
 // ============================================================================
@@ -645,6 +570,166 @@ pub fn create_index_definition(
             embedding_config: None,
             metadata: Default::default(),
         })),
+        "inverted" => Ok(IndexDefinition::Inverted(InvertedIndexConfig {
+            name: format!("idx_{}_{}_inv", label, property),
+            label: label.to_string(),
+            property: property.to_string(),
+            normalize: true,
+            max_terms_per_doc: 1024,
+            metadata: Default::default(),
+        })),
+        "fulltext" => Ok(IndexDefinition::FullText(FullTextIndexConfig {
+            name: format!("idx_{}_{}_ft", label, property),
+            label: label.to_string(),
+            properties: vec![property.to_string()],
+            tokenizer: TokenizerConfig::Standard,
+            with_positions: true,
+            metadata: Default::default(),
+        })),
         _ => Err(format!("Unknown index type: {}", index_type)),
+    }
+}
+
+/// Create an index definition from a rich configuration dict.
+///
+/// The config dict must have a `"type"` key. Supported types:
+/// - `"vector"`: optional `algorithm`, `metric`, `m`, `ef_construction`, `embedding`
+/// - `"fulltext"`: optional `tokenizer`, `ngram_min`, `ngram_max`
+/// - `"inverted"`: no extra options
+/// - `"btree"`, `"hash"`, `"scalar"`: no extra options
+pub fn create_index_definition_from_config(
+    label: &str,
+    property: &str,
+    config: &HashMap<String, serde_json::Value>,
+) -> Result<IndexDefinition, String> {
+    let idx_type = config
+        .get("type")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "Index config must contain a 'type' key".to_string())?;
+
+    match idx_type.to_lowercase().as_str() {
+        "btree" | "scalar" => create_index_definition(label, property, "btree"),
+        "hash" => create_index_definition(label, property, "hash"),
+        "inverted" => create_index_definition(label, property, "inverted"),
+
+        "vector" => {
+            let algorithm = config
+                .get("algorithm")
+                .and_then(|v| v.as_str())
+                .unwrap_or("hnsw");
+            let metric = match config
+                .get("metric")
+                .and_then(|v| v.as_str())
+                .unwrap_or("cosine")
+                .to_lowercase()
+                .as_str()
+            {
+                "l2" => DistanceMetric::L2,
+                "dot" => DistanceMetric::Dot,
+                _ => DistanceMetric::Cosine,
+            };
+
+            let index_type = match algorithm.to_lowercase().as_str() {
+                "ivf_pq" | "ivfpq" => VectorIndexType::IvfPq {
+                    num_partitions: config
+                        .get("partitions")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(256) as u32,
+                    num_sub_vectors: config
+                        .get("sub_vectors")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(16) as u32,
+                    bits_per_subvector: config
+                        .get("bits_per_subvector")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(8) as u8,
+                },
+                "flat" => VectorIndexType::Flat,
+                _ => VectorIndexType::Hnsw {
+                    m: config.get("m").and_then(|v| v.as_u64()).unwrap_or(16) as u32,
+                    ef_construction: config
+                        .get("ef_construction")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(200) as u32,
+                    ef_search: config
+                        .get("ef_search")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(50) as u32,
+                },
+            };
+
+            let embedding_config = config.get("embedding").and_then(|v| {
+                let obj = v.as_object()?;
+                Some(EmbeddingConfig {
+                    alias: obj.get("alias")?.as_str()?.to_string(),
+                    source_properties: obj
+                        .get("source_properties")?
+                        .as_array()?
+                        .iter()
+                        .filter_map(|s| s.as_str().map(|s| s.to_string()))
+                        .collect(),
+                    batch_size: obj
+                        .get("batch_size")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(100) as usize,
+                })
+            });
+
+            Ok(IndexDefinition::Vector(VectorIndexConfig {
+                name: format!("idx_{}_{}_vec", label, property),
+                label: label.to_string(),
+                property: property.to_string(),
+                index_type,
+                metric,
+                embedding_config,
+                metadata: Default::default(),
+            }))
+        }
+
+        "fulltext" => {
+            let tokenizer = match config
+                .get("tokenizer")
+                .and_then(|v| v.as_str())
+                .unwrap_or("standard")
+                .to_lowercase()
+                .as_str()
+            {
+                "whitespace" => TokenizerConfig::Whitespace,
+                "ngram" => {
+                    let min = config
+                        .get("ngram_min")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(2) as u8;
+                    let max = config
+                        .get("ngram_max")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(4) as u8;
+                    TokenizerConfig::Ngram { min, max }
+                }
+                "custom" => {
+                    let name = config
+                        .get("custom_name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("default")
+                        .to_string();
+                    TokenizerConfig::Custom { name }
+                }
+                _ => TokenizerConfig::Standard,
+            };
+
+            Ok(IndexDefinition::FullText(FullTextIndexConfig {
+                name: format!("idx_{}_{}_ft", label, property),
+                label: label.to_string(),
+                properties: vec![property.to_string()],
+                tokenizer,
+                with_positions: config
+                    .get("with_positions")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true),
+                metadata: Default::default(),
+            }))
+        }
+
+        _ => Err(format!("Unknown index type in config: {}", idx_type)),
     }
 }

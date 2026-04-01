@@ -6,8 +6,8 @@ use bytes::Bytes;
 use futures::stream::{BoxStream, StreamExt};
 use object_store::path::Path;
 use object_store::{
-    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOpts,
-    PutOptions, PutPayload, PutResult, Result as StoreResult,
+    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as StoreResult,
 };
 use std::fmt::{Debug, Display};
 use std::ops::Range;
@@ -208,14 +208,14 @@ impl ObjectStore for ResilientObjectStore {
     }
 
     async fn put_multipart(&self, location: &Path) -> StoreResult<Box<dyn MultipartUpload>> {
-        self.put_multipart_opts(location, PutMultipartOpts::default())
+        self.put_multipart_opts(location, PutMultipartOptions::default())
             .await
     }
 
     async fn put_multipart_opts(
         &self,
         location: &Path,
-        opts: PutMultipartOpts,
+        opts: PutMultipartOptions,
     ) -> StoreResult<Box<dyn MultipartUpload>> {
         let timeout = self.config.write_timeout;
         self.retry(
@@ -247,7 +247,7 @@ impl ObjectStore for ResilientObjectStore {
         .await
     }
 
-    async fn get_range(&self, location: &Path, range: Range<usize>) -> StoreResult<Bytes> {
+    async fn get_range(&self, location: &Path, range: Range<u64>) -> StoreResult<Bytes> {
         let timeout = self.config.read_timeout;
         self.retry(
             || async {
@@ -259,11 +259,7 @@ impl ObjectStore for ResilientObjectStore {
         .await
     }
 
-    async fn get_ranges(
-        &self,
-        location: &Path,
-        ranges: &[Range<usize>],
-    ) -> StoreResult<Vec<Bytes>> {
+    async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> StoreResult<Vec<Bytes>> {
         let timeout = self.config.read_timeout;
         self.retry(
             || async {
@@ -293,7 +289,7 @@ impl ObjectStore for ResilientObjectStore {
         .await
     }
 
-    fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, StoreResult<ObjectMeta>> {
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, StoreResult<ObjectMeta>> {
         // Check CB? List returns stream.
         // We can check CB on initial call.
         if !self.cb.allow_request() {
@@ -318,7 +314,7 @@ impl ObjectStore for ResilientObjectStore {
         &self,
         prefix: Option<&Path>,
         offset: &Path,
-    ) -> BoxStream<'_, StoreResult<ObjectMeta>> {
+    ) -> BoxStream<'static, StoreResult<ObjectMeta>> {
         if !self.cb.allow_request() {
             return futures::stream::once(async {
                 Err(object_store::Error::Generic {

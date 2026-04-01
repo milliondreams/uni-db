@@ -61,14 +61,38 @@ pub struct L0Buffer {
     /// Vertex properties (separate from graph structure)
     pub vertex_properties: HashMap<Vid, Properties>,
 
-    /// Edge endpoint mapping (eid -> (src, dst, type_id))
-    pub edge_endpoints: HashMap<Eid, (Vid, Vid, u16)>,
+    /// Edge endpoint mapping (eid -> (src, dst, edge_type))
+    pub edge_endpoints: HashMap<Eid, (Vid, Vid, u32)>,
+
+    /// Vertex labels (VID -> list of label names)
+    pub vertex_labels: HashMap<Vid, Vec<String>>,
+
+    /// Edge type names (EID -> edge type name)
+    pub edge_types: HashMap<Eid, String>,
 
     /// Current version number
     pub current_version: u64,
 
     /// Mutation counter for flush triggering
     pub mutation_count: usize,
+
+    /// Mutation statistics (vertices/edges created/deleted)
+    pub mutation_stats: MutationStats,
+
+    /// Estimated memory usage in bytes
+    pub estimated_size: usize,
+
+    /// Constraint index for uniqueness enforcement
+    pub constraint_index: HashMap<Vec<u8>, Vid>,
+
+    /// Creation timestamps per vertex
+    pub vertex_created_at: HashMap<Vid, i64>,
+    /// Update timestamps per vertex
+    pub vertex_updated_at: HashMap<Vid, i64>,
+    /// Creation timestamps per edge
+    pub edge_created_at: HashMap<Eid, i64>,
+    /// Update timestamps per edge
+    pub edge_updated_at: HashMap<Eid, i64>,
 
     /// Write-ahead log reference
     pub wal: Option<Arc<WriteAheadLog>>,
@@ -89,13 +113,16 @@ pub struct L0Buffer {
 
 **Write Path:**
 
+Each `Transaction` owns a private L0 buffer. Writes accumulate in the transaction's buffer without holding any global lock. At commit time, the transaction acquires a serialization lock, validates against the current database version, and merges its buffer into the shared state.
+
 ```
-1. Acquire write lock (single-writer)
-2. Append to WAL (sync or async based on config)
-3. Insert into SimpleGraph (vertex/edge)
-4. Store properties in HashMap
-5. Increment mutation counter
-6. If threshold reached → trigger async flush
+1. Write into transaction-private L0 buffer (lock-free)
+2. On commit: acquire serialization lock (commit-time, not write-time)
+3. Append to WAL (sync or async based on config)
+4. Merge into shared SimpleGraph (vertex/edge)
+5. Merge properties into shared HashMap
+6. Increment mutation counter, release lock
+7. If threshold reached → trigger async flush
 ```
 
 ### Auto-Flush Triggers
@@ -545,10 +572,9 @@ pub enum Mutation {
     InsertEdge {
         src_vid: Vid,
         dst_vid: Vid,
-        edge_type: u16,
+        edge_type: u32,
         eid: Eid,
         version: u64,
-        properties: Properties,
     },
 
     /// Delete an existing edge
@@ -556,24 +582,26 @@ pub enum Mutation {
         eid: Eid,
         src_vid: Vid,
         dst_vid: Vid,
-        edge_type: u16,
+        edge_type: u32,
         version: u64,
     },
 
-    /// Insert a new vertex
+    /// Insert a new vertex (labels carried for tombstone flushing)
     InsertVertex {
         vid: Vid,
         properties: Properties,
+        labels: Vec<String>,   // serde(default) for backward compat
     },
 
-    /// Delete an existing vertex
+    /// Delete an existing vertex (labels needed for per-label tombstone flushing)
     DeleteVertex {
         vid: Vid,
+        labels: Vec<String>,   // serde(default) for backward compat
     },
 }
 ```
 
-Note: The label_id is encoded in the VID itself, so `InsertVertex` doesn't need a separate label_id field.
+Note: The label_id is encoded in the VID, but `labels` is carried explicitly so the flush path can write tombstones to the correct per-label Lance dataset. The `serde(default)` attribute ensures backward compatibility with older WAL entries that omit labels.
 
 ### Recovery Process
 
@@ -593,15 +621,15 @@ impl Wal {
                     break;
                 }
 
-                // Replay entry
-                match entry.entry_type {
-                    EntryType::InsertVertex { vid, label_id, props } => {
-                        l0.insert_vertex(vid, label_id, props)?;
+                // Replay mutation
+                match entry.mutation {
+                    Mutation::InsertVertex { vid, properties, labels } => {
+                        l0.insert_vertex(vid, properties, labels)?;
                     }
-                    EntryType::InsertEdge { eid, src, dst, type_id, props } => {
-                        l0.insert_edge(eid, src, dst, type_id, props)?;
+                    Mutation::InsertEdge { src_vid, dst_vid, edge_type, eid, .. } => {
+                        l0.insert_edge(eid, src_vid, dst_vid, edge_type)?;
                     }
-                    // ... handle other types
+                    // ... handle DeleteVertex, DeleteEdge
                 }
             }
         }
@@ -915,19 +943,23 @@ RETURN p.name, p.city, p.age  -- Mixed access
 // Create label without property definitions
 db.schema().label("Document").apply().await?;
 
+let session = db.session();
+
 // Create with arbitrary properties
-db.execute("CREATE (:Document {
+let tx = session.tx().await?;
+tx.execute("CREATE (:Document {
     title: 'Article',
     author: 'Alice',
     tags: ['tech', 'ai'],
     year: 2024
 })").await?;
+tx.commit().await?;
 
 // All properties stored in overflow_json
 db.flush().await?;
 
 // Query works transparently (automatic rewriting)
-let results = db.query("
+let results = session.query("
     MATCH (d:Document)
     WHERE d.author = 'Alice' AND d.year > 2020
     RETURN d.title, d.tags
@@ -944,18 +976,22 @@ db.schema()
     .property("age", DataType::Int)      // Schema property
     .apply().await?;
 
+let session = db.session();
+
 // Create with schema + overflow properties
-db.execute("CREATE (:Person {
+let tx = session.tx().await?;
+tx.execute("CREATE (:Person {
     name: 'Bob',       -- Schema (typed column)
     age: 25,           -- Schema (typed column)
     city: 'NYC',       -- Overflow (overflow_json)
     verified: true     -- Overflow (overflow_json)
 })").await?;
+tx.commit().await?;
 
 db.flush().await?;
 
 // Query mixing both (transparent to user)
-let results = db.query("
+let results = session.query("
     MATCH (p:Person)
     WHERE p.name = 'Bob'      -- Fast: typed column
       AND p.city = 'NYC'      -- Rewritten: json_get_string(...)

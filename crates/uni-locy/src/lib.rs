@@ -12,7 +12,7 @@ pub use compiler::modules::ModuleContext;
 pub use config::LocyConfig;
 pub use errors::LocyError;
 pub use result::{
-    AbductionResult, CommandResult, DerivationNode, LocyResult, LocyStats, Modification, Row,
-    SavepointId, ValidatedModification,
+    AbductionResult, CommandResult, DerivationNode, DerivedEdge, DerivedFactSet, FactRow,
+    LocyResult, LocyStats, Modification, ValidatedModification,
 };
 pub use types::{CompiledCommand, CompiledProgram, RuntimeWarning, RuntimeWarningCode};

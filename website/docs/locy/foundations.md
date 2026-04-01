@@ -38,6 +38,7 @@ A rule typically has:
 - Rule schemas are validated at compile time.
 - Cyclic negation is rejected.
 - `LocyConfig` lets you cap iterations, memory, and timeout.
+- Probabilistic guardrails: `top_k_proofs` limits proof enumeration per aggregate group, `exact_probability` enables BDD-based exact evaluation for shared-proof groups (capped by `max_bdd_variables`).
 
 ## Next
 

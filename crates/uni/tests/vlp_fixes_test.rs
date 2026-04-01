@@ -34,7 +34,8 @@ async fn setup_multi_path_graph() -> Result<Uni> {
         .await?;
 
     // Create: a-[:R]->b1, a-[:R]->b2, a-[:R]->b3
-    db.execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         r#"
         CREATE (a:A {num: 1})
         CREATE (b1:B {num: 10}), (b2:B {num: 20}), (b3:B {num: 30})
@@ -48,6 +49,7 @@ async fn setup_multi_path_graph() -> Result<Uni> {
     "#,
     )
     .await?;
+    tx.commit().await?;
 
     Ok(db)
 }
@@ -62,6 +64,7 @@ async fn test_optional_vlp_returns_all_matches() -> Result<()> {
 
     // Should return ALL 3 b nodes, not just first match
     let result = db
+        .session()
         .query("MATCH (a:A {num: 1}) OPTIONAL MATCH (a)-[*1..1]->(b:B) RETURN b.num ORDER BY b.num")
         .await?;
 
@@ -80,10 +83,13 @@ async fn test_optional_vlp_returns_all_matches() -> Result<()> {
 #[tokio::test]
 async fn test_optional_vlp_emits_row_when_no_match() -> Result<()> {
     let db = setup_multi_path_graph().await?;
-    db.execute("CREATE (:A {num: 999})").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:A {num: 999})").await?;
+    tx.commit().await?;
 
     // Should return 1 row (with null target), not 0 rows
     let result = db
+        .session()
         .query("MATCH (a:A {num: 999}) OPTIONAL MATCH (a)-[*1..2]->(x) RETURN a.num")
         .await?;
 
@@ -103,6 +109,7 @@ async fn test_optional_vlp_returns_all_multi_hop_paths() -> Result<()> {
 
     // Should return 6 paths: 3 at hop-1 (to B nodes) + 3 at hop-2 (to C nodes)
     let result = db
+        .session()
         .query("MATCH (a:A {num: 1}) OPTIONAL MATCH (a)-[*1..2]->(c) RETURN c._vid")
         .await?;
 
@@ -131,7 +138,8 @@ async fn test_vlp_hydrates_unlabeled_target_properties() -> Result<()> {
     db.schema().edge_type("LINK", &[], &[]).apply().await?;
 
     // Create unlabeled nodes with properties
-    db.execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         r#"
         CREATE (start:Start {id: 1})
         CREATE (n1 {name: "node1"}), (n2 {name: "node2"})
@@ -139,9 +147,11 @@ async fn test_vlp_hydrates_unlabeled_target_properties() -> Result<()> {
     "#,
     )
     .await?;
+    tx.commit().await?;
 
     // Query unlabeled targets via VLP - properties should be hydrated
     let result = db
+        .session()
         .query("MATCH (start:Start)-[*1..2]->(c) RETURN c.name ORDER BY c.name")
         .await?;
 
@@ -164,6 +174,7 @@ async fn test_vlp_step_variable_returns_edge_list() -> Result<()> {
 
     // Step variable should be List<Edge>
     let result = db
+        .session()
         .query("MATCH (a:A {num: 1})-[r*1..1]->(b) RETURN size(r) AS edge_count LIMIT 1")
         .await?;
 
@@ -191,6 +202,7 @@ async fn test_vlp_step_variable_has_edge_fields() -> Result<()> {
 
     // Edge list should have _eid, _type_name fields
     let result = db
+        .session()
         .query("MATCH (a:A {num: 1})-[r*1..1]->(b) RETURN r[0]._type_name AS type LIMIT 1")
         .await?;
 
@@ -206,6 +218,7 @@ async fn test_vlp_step_variable_different_lengths() -> Result<()> {
 
     // Paths of length 1 and 2 should have correctly sized edge lists
     let result = db
+        .session()
         .query("MATCH (a:A {num: 1})-[r*1..2]->(c) RETURN size(r) AS len ORDER BY len")
         .await?;
 
@@ -237,6 +250,7 @@ async fn test_vlp_step_variable_eid_access_works() -> Result<()> {
     // This was Match9 TCK failure: "No field named r._eid"
     // With EdgeList variant, r[0]._eid should work
     let result = db
+        .session()
         .query("MATCH (a:A {num: 1})-[r*1..1]->(b) RETURN r[0]._eid AS eid LIMIT 1")
         .await?;
 
@@ -257,6 +271,7 @@ async fn test_optional_vlp_with_step_variable() -> Result<()> {
 
     // Comprehensive: OPTIONAL + VLP + step_variable + properties
     let result = db
+        .session()
         .query(
             r#"
             MATCH (a:A {num: 1})
@@ -285,6 +300,7 @@ async fn test_vlp_with_filter_on_step_variable() -> Result<()> {
 
     // Filter on edge list properties
     let result = db
+        .session()
         .query(
             r#"
             MATCH (a:A {num: 1})-[r*1..1]->(b)

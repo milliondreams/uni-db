@@ -153,12 +153,12 @@ graph TB
 
 The query layer translates OpenCypher text into a streaming execution plan:
 
-1. **Parser** (`uni-cypher`): sqlparser-based Cypher parser that produces an AST supporting MATCH, CREATE, MERGE, WITH, RETURN, WHERE, UNWIND, DELETE, SET, REMOVE, CALL, WITH RECURSIVE, UNION, and DDL commands.
+1. **Parser** (`uni-cypher`): pest-based Cypher parser that produces an AST supporting MATCH, CREATE, MERGE, WITH, RETURN, WHERE, UNWIND, DELETE, SET, REMOVE, CALL, WITH RECURSIVE, UNION, and DDL commands.
 2. **Planner** (`uni-query`): Converts AST into a logical plan, extracting vector similarity calls, inverted index lookups, and pushdown predicates.
 3. **Physical Planner**: Maps logical plan to DataFusion physical operators — `GraphScanExec`, `GraphTraverseExec`, `GraphVectorKnnExec`, `MutationExec`, etc.
 4. **Executor**: Streams Arrow `RecordBatch` results through the DataFusion pipeline.
 
-### Graph Runtime (`uni-algo` + `uni`)
+### Graph Runtime (`uni-common` + `uni-algo` + `uni`)
 
 The runtime manages in-memory graph state and write coordination:
 
@@ -183,11 +183,11 @@ Persistent storage using LanceDB (Arrow-native columnar format):
 ```
 crates/
 ├── uni/            # Main library crate — public API, Session, Transaction, UniBuilder
-├── uni-common/     # Identity (Vid/Eid/UniId), Schema, DataType, Config, Snapshots
+├── uni-common/     # Identity (Vid/Eid/UniId), Schema, DataType, Config, Snapshots, SimpleGraph
 ├── uni-store/      # Lance datasets, CSR adjacency, L0Buffer, Writer, WAL, Indexes
-├── uni-algo/       # 38+ graph algorithms, SimpleGraph, GraphProjection
+├── uni-algo/       # 35 graph algorithms, GraphProjection
 ├── uni-query/      # Query executor, DataFusion integration, pushdown, UDFs
-├── uni-cypher/     # Cypher parser (sqlparser-based), Locy parser
+├── uni-cypher/     # Cypher parser (pest-based), Locy parser
 ├── uni-crdt/       # 8 CRDT types with merge semantics
 ├── uni-locy/       # Locy compiler (stratify, wardedness, typecheck, orchestrator)
 ├── uni-cli/        # CLI (import, query, repl, snapshot)
@@ -234,7 +234,7 @@ graph TB
 | `lancedb` / `lance` | Columnar storage with versioning, vector indexes, full-text search |
 | `arrow` / `arrow-array` | In-memory columnar data format (RecordBatch, Array types) |
 | `datafusion` | Query engine — physical planning, expression evaluation, aggregation |
-| `sqlparser` | Base SQL/Cypher parser that `uni-cypher` extends |
+| `pest` / `pest_derive` | PEG parser generator powering `uni-cypher`'s Cypher and Locy grammars |
 | `object_store` | S3/GCS/Azure/local filesystem abstraction |
 | `pyo3` | Python bindings (FFI) |
 | `candle-core` / `candle-transformers` | Native Rust ML inference for auto-embedding |
@@ -410,7 +410,7 @@ A SHA3-256 hash that provides **stable, content-addressed identity** for vertice
 | Field | Details |
 |---|---|
 | **Type** | `[u8; 32]` (256-bit SHA3 hash) |
-| **Encoding** | 44-character Base32Lower multibase string |
+| **Encoding** | 53-character Base32Lower multibase string |
 | **Example** | `z3asjk42...` (z prefix = Base32Lower) |
 | **Computation** | `SHA3-256(label ‖ ext_id ‖ sorted_properties)` |
 
@@ -713,33 +713,31 @@ Key rules:
 
 ## Defining a Schema
 
-### Rust API (Builder Pattern)
+### Rust API (SchemaBuilder)
 
 ```rust
-use uni::Uni;
+use uni_db::{Uni, DataType, IndexType, ScalarType};
 
 let db = Uni::open("./my-graph")
-    .schema_file("schema.json")  // Load from file
+    .schema_file("schema.json")  // Load from file at build time
     .build()
     .await?;
 
-// Or build programmatically via Cypher
-db.execute("CREATE LABEL Person {
-    name: STRING,
-    age: INTEGER,
-    email: STRING UNIQUE
-}").await?;
-
-db.execute("CREATE LABEL Document {
-    title: STRING,
-    content: STRING,
-    embedding: VECTOR(384)
-}").await?;
-
-db.execute("CREATE EDGE TYPE KNOWS FROM [Person] TO [Person] {
-    since: DATE,
-    weight: FLOAT
-}").await?;
+// Or build programmatically via the fluent SchemaBuilder
+db.schema()
+    .label("Person")
+        .property("name", DataType::String)
+        .property("age", DataType::Int64)
+        .property_nullable("email", DataType::String)
+        .index("name", IndexType::Scalar(ScalarType::BTree))
+    .label("Document")
+        .property("title", DataType::String)
+        .property("content", DataType::String)
+        .vector("embedding", 384)
+    .edge_type("KNOWS", &["Person"], &["Person"])
+        .property("since", DataType::Date)
+        .property("weight", DataType::Float64)
+    .apply().await?;
 ```
 
 ### Cypher DDL
@@ -779,25 +777,22 @@ DROP EDGE TYPE IF EXISTS OLD_RELATION
 ### Python API
 
 ```python
-from uni_db import Database, SchemaBuilder
+from uni_db import Uni, DataType
 
-db = Database("./my-graph")
+db = Uni.open("./my-graph")
 
-# Fluent schema builder
-schema = SchemaBuilder(db)
-schema.label("Person") \
-    .property("name", "String") \
-    .property("age", "Int64") \
-    .property_nullable("email", "String") \
-    .vector("embedding", 384) \
-    .done()
-
-schema.edge_type("KNOWS", from_labels=["Person"], to_labels=["Person"]) \
-    .property("since", "Date") \
-    .property("weight", "Float64") \
-    .done()
-
-schema.apply()
+# Fluent schema builder via db.schema()
+db.schema() \
+    .label("Person") \
+        .property("name", DataType.STRING()) \
+        .property("age", DataType.INT64()) \
+        .property_nullable("email", DataType.STRING()) \
+        .vector("embedding", 384) \
+    .done() \
+    .edge_type("KNOWS", ["Person"], ["Person"]) \
+        .property("since", DataType.DATE()) \
+        .property("weight", DataType.FLOAT64()) \
+    .apply()
 ```
 
 ## Schema Design Best Practices
@@ -1099,7 +1094,7 @@ L1Entry {
     eid: Eid,
     op: Op,            // Insert or Delete
     version: u64,
-    properties: HashMap<String, Properties>,
+    properties: Properties,
     created_at: Option<i64>,
     updated_at: Option<i64>,
 }
@@ -1169,7 +1164,7 @@ Each `CsrEdgeEntry` carries a `created_version` field, enabling snapshot queries
 
 ### AdjacencyDataset (Persistent CSR)
 
-Stored as a LanceDB table (`adjacency_{direction}_{edge_type}_{label}`) with row-per-vertex format:
+Stored as a LanceDB table (`adjacency_{edge_type}_{direction}`) with row-per-vertex format:
 
 | Column | Arrow Type |
 |---|---|
@@ -1239,10 +1234,14 @@ L0Buffer {
     edge_types: HashMap<Eid, String>,            // EID → type name
     current_version: u64,                        // MVCC version counter
     mutation_count: usize,                       // For flush decisions
+    mutation_stats: MutationStats,               // Per-type mutation counters
     estimated_size: usize,                       // O(1) maintained estimate
     constraint_index: HashMap<Vec<u8>, Vid>,     // Unique constraint lookups
     wal: Option<Arc<WriteAheadLog>>,             // Durability
     wal_lsn_at_flush: u64,                       // WAL LSN at rotation
+    // Version tracking
+    edge_versions: HashMap<Eid, u64>,            // MVCC edge version
+    vertex_versions: HashMap<Vid, u64>,          // MVCC vertex version
     // Timestamp tracking
     vertex_created_at: HashMap<Vid, i64>,
     vertex_updated_at: HashMap<Vid, i64>,
@@ -1477,10 +1476,15 @@ Term-to-VID mapping for `ANY(x IN list WHERE x IN allowed)` query patterns:
 
 ```rust
 InvertedIndex {
-    config: InvertedIndexConfig { label, property, normalize, max_terms_per_doc },
-    postings: HashMap<String, Vec<u64>>,  // term → VIDs
+    dataset: Option<Dataset>,           // Backing Lance dataset
+    base_uri: String,                   // Storage URI
+    label: String,                      // Vertex label
+    property: String,                   // Indexed property
+    config: InvertedIndexConfig,        // { label, property, normalize, max_terms_per_doc }
 }
 ```
+
+Postings (`term → VIDs`) are built transiently during index operations, not stored as a struct field.
 
 **Memory guard**: `DEFAULT_MAX_POSTINGS_MEMORY = 256 MB`. Build uses temp segment flushing when memory limit is reached.
 
@@ -1593,7 +1597,7 @@ graph TB
 
 ## Overview
 
-Uni implements a substantial subset of the OpenCypher query language, extended with vector search, full-text search, DDL commands, time travel, and window functions. The parser is based on `sqlparser` and produces an AST that the query planner converts to DataFusion physical plans.
+Uni implements a substantial subset of the OpenCypher query language, extended with vector search, full-text search, DDL commands, time travel, and window functions. The parser is based on `pest` (PEG grammar) and produces an AST that the query planner converts to DataFusion physical plans.
 
 ```mermaid
 graph LR
@@ -2294,7 +2298,7 @@ Combines vector and full-text search with score fusion:
 
 | Option | Values | Description |
 |---|---|---|
-| `fusion` | `'rrf'` (default), `'weighted'` | Score fusion method |
+| `method` | `'rrf'` (default), `'weighted'` | Score fusion method |
 | `alpha` | 0.0 - 1.0 | Weight for vector vs FTS (weighted mode) |
 | `over_fetch` | Float (default: 2.0) | Over-fetch factor for pagination |
 
@@ -2313,7 +2317,7 @@ Applications can access configured embedding and generation aliases directly thr
 ```rust
 use uni_xervo::Message;
 
-let xervo = db.xervo()?;
+let xervo = db.xervo();  // Always succeeds; individual methods error if unconfigured
 
 let vectors = xervo
     .embed("embed/default", &["graph databases for beginners"])
@@ -2326,23 +2330,25 @@ let answer = xervo
             Message::system("You summarize technical material."),
             Message::user("Explain what snapshot isolation means in Uni."),
         ],
+        GenerationOptions::default(),
     )
     .await?;
 
-// Convenience wrapper — wraps prompt as a single user message
+// Convenience wrapper — each string is treated as a user message
 let quick = xervo
     .generate_text(
         "llm/default",
-        "List three use cases for hybrid search.",
+        &["List three use cases for hybrid search."],
+        GenerationOptions::default(),
     )
     .await?;
 ```
 
 - `embed(alias, texts)` returns `Vec<Vec<f32>>`
-- `generate(alias, messages)` accepts `&[Message]` with roles `system`, `user`, `assistant`
-- `generate_text(alias, prompt)` is the convenience wrapper that wraps the prompt as a user message
+- `generate(alias, messages, options)` accepts `&[Message]` with roles `system`, `user`, `assistant` and a `GenerationOptions` struct
+- `generate_text(alias, messages, options)` is a convenience wrapper — each string becomes a user message
 - `raw_runtime()` exposes the underlying `ModelRuntime` for advanced orchestration
-- Optional keyword args `max_tokens`, `temperature`, `top_p` control generation on both methods
+- `GenerationOptions` supports `max_tokens`, `temperature`, `top_p` fields
 
 This is the same runtime used by vector-index auto-embedding on writes and by text-query auto-embedding in `uni.vector.query(...)` / `similar_to(...)`.
 
@@ -2486,7 +2492,7 @@ PROFILE MATCH (n:Person)-[:KNOWS]->(m:Person) RETURN n, m
 
 # Part IX: Graph Algorithms
 
-Uni includes **38+ graph algorithms** organized by category, accessible as procedures via `CALL algo.*`.
+Uni includes **35 graph algorithms** organized by category, accessible as procedures via `CALL algo.*`.
 
 ## Algorithm Catalog
 
@@ -2578,7 +2584,6 @@ graph TB
 | `algo.maximalCliques` | Maximal clique enumeration | Dense groups |
 | `algo.graphColoring` | Graph coloring | Scheduling, register allocation |
 | `algo.graphMetrics` | Global metrics (diameter, density, avg clustering) | Graph summary |
-| `algo.diameter` | Graph diameter | Network span |
 
 ## Execution Modes
 
@@ -2711,7 +2716,7 @@ From the Locy design document:
 
 ```mermaid
 graph LR
-    SRC[Locy Source] --> PARSE[Parse<br/>LALRPOP Grammar]
+    SRC[Locy Source] --> PARSE[Parse<br/>Pest Grammar]
     PARSE --> AST[LocyProgram AST]
     AST --> MOD[Module Resolution<br/>USE declarations]
     MOD --> DEP[Dependency Graph<br/>Rule-to-rule refs]
@@ -2721,7 +2726,7 @@ graph LR
     TYPE --> COMP[CompiledProgram<br/>Topological strata order]
 ```
 
-1. **Parse**: LALRPOP grammar produces `LocyProgram` AST with rules and commands
+1. **Parse**: Pest grammar (`locy.pest` stacked on `cypher.pest`) produces `LocyProgram` AST with rules and commands
 2. **Module Resolution**: Resolve `USE module { rule1, rule2 }` imports
 3. **Dependency Graph**: Build rule-to-rule reference graph
 4. **Stratify**: Detect strongly connected components (SCCs) — these are recursive rule groups
@@ -3103,6 +3108,9 @@ LocyConfig {
     deterministic_best_by: bool,    // Stable tie-breaking for BEST BY
     strict_probability_domain: bool, // Error instead of clamp for values outside [0,1]
     probability_epsilon: f64,       // MPROD log-space threshold (default: 1e-15)
+    top_k_proofs: usize,           // Top-k proof filtering (0 = unlimited)
+    top_k_proofs_training: Option<usize>, // Override top_k_proofs during training
+    params: HashMap<String, Value>, // Parameters bound to $name references in rules/queries
     exact_probability: bool,        // Enable BDD-based exact evaluation for shared proofs
     max_bdd_variables: usize,       // Per-group BDD variable cap before fallback
 }
@@ -3213,85 +3221,134 @@ stateDiagram-v2
 - **No read locks**: Readers never block writers; writers never block readers
 - **Auto-rollback on drop**: If a transaction is dropped without commit/rollback, it auto-rolls back with a warning
 
+## Three-Scope Model
+
+All data access flows through three scopes with strict separation of concerns:
+
+```
+Uni (database handle)
+  ├─ Lifecycle: open, shutdown, schema, snapshots
+  ├─ Facades: rules(), compaction(), indexes(), functions(), xervo()
+  └─ Factory: session() → Session
+
+Session (read scope)
+  ├─ Parameters: params().set(), params().get()
+  ├─ Reads: query(), query_with() → QueryBuilder
+  ├─ Locy: locy(), locy_with() → LocyBuilder
+  ├─ Analysis: query_with().explain(), query_with().profile()
+  └─ Factory: tx() → Transaction
+
+Transaction (write scope)
+  ├─ Reads: query() (sees uncommitted writes)
+  ├─ Writes: execute(), bulk_insert_*(), bulk_writer()
+  ├─ Locy: locy() (DERIVE auto-applies to tx L0)
+  ├─ Apply: apply(derived_fact_set)
+  └─ Lifecycle: commit(), rollback(), drop (auto-rollback)
+```
+
+- **Uni** does not execute queries or mutations — it only provides factories and admin.
+- **Session** is a long-lived, cheap read context. It holds scoped parameters, a private Locy rule registry, and a plan cache. Sessions are the factory for Transactions.
+- **Transaction** is a short-lived write context with a private L0 buffer. No lock is held until `commit()`.
+
 ## Transaction API
 
 ### Rust
 
 ```rust
-// Begin a transaction
-let txn = db.begin().await?;
+// Create a session (sync, infallible, cheap)
+let session = db.session();
 
-// Execute queries within the transaction
-txn.execute("CREATE (n:Person {name: 'Alice', age: 30})").await?;
-txn.execute("CREATE (n:Person {name: 'Bob', age: 25})").await?;
+// Start a transaction from the session
+let tx = session.tx().await?;
 
-// Parameterized mutations
-txn.execute_with("CREATE (n:Person {name: $name})")
+// Execute mutations within the transaction
+tx.execute("CREATE (n:Person {name: 'Alice', age: 30})").await?;
+tx.execute("CREATE (n:Person {name: 'Bob', age: 25})").await?;
+
+// Parameterized mutations via builder
+tx.execute_with("CREATE (n:Person {name: $name})")
     .param("name", "Charlie")
-    .execute()
+    .run()
     .await?;
 
 // Read within transaction (sees uncommitted writes)
-let result = txn.query("MATCH (n:Person) RETURN count(*) AS cnt").await?;
+let result = tx.query("MATCH (n:Person) RETURN count(*) AS cnt").await?;
 
 // Commit or rollback
-txn.commit().await?;
-// OR: txn.rollback().await?;
-// OR: drop txn (auto-rollback)
+let commit_result = tx.commit().await?;
+println!("Version: {}, mutations: {}", commit_result.version, commit_result.mutations_committed);
+// OR: tx.rollback();
+// OR: drop tx (auto-rollback with warning if dirty)
 ```
 
-### Transaction Fields
+### DerivedFactSet Workflow
+
+Locy DERIVE can produce facts at the session level (read-only), then apply them in a transaction:
 
 ```rust
-Transaction {
-    db: &Uni,           // Database reference
-    completed: bool,    // Guard against double commit/rollback
-    id: String,         // UUID for tracing
-    start_time: Instant, // Performance metrics
-}
-```
+// Session-level DERIVE (does not mutate)
+let result = session.locy("DERIVE similar_to(x, y) :- ...").await?;
+let derived = result.derived().unwrap().clone();
 
-### Auto-Commit Wrapper
+// Apply in a transaction
+let tx = session.tx().await?;
+tx.apply(derived).await?;
+tx.commit().await?;
 
-For simple single-statement mutations, use the database directly (auto-commit):
-
-```rust
-// Single statement, auto-committed
-db.execute("CREATE (n:Person {name: 'Alice'})").await?;
-
-// Equivalent to:
-let txn = db.begin().await?;
-txn.execute("CREATE (n:Person {name: 'Alice'})").await?;
-txn.commit().await?;
+// OR: DERIVE within transaction (auto-applies to tx's private L0)
+let tx = session.tx().await?;
+tx.locy("DERIVE similar_to(x, y) :- ...").await?;
+tx.commit().await?;
 ```
 
 ## Session API
 
-Sessions provide **scoped variables** that persist across multiple queries:
+Sessions are the primary read scope. Create via `db.session()` (sync, infallible).
 
 ```rust
-// Create a session with variables
-let session = db.session()
-    .set("user_id", "alice-123")
-    .set("role", "admin")
-    .build();
+// Create a session
+let session = db.session();
 
-// Query using session variables
-let result = session.query(
-    "MATCH (u:User {id: $session.user_id}) RETURN u"
-).await?;
+// Set scoped parameters (injected into every query as $key)
+session.params().set("user_id", "alice-123");
+session.params().set("role", "admin");
 
-// Parameterized query with session
+// Query using session parameters
+let result = session.query("MATCH (u:User {id: $user_id}) RETURN u").await?;
+
+// Query builder with parameters, timeout, and terminal methods
 let result = session.query_with("MATCH (n:Person) WHERE n.age > $min_age RETURN n")
     .param("min_age", 25)
-    .execute()
+    .timeout(Duration::from_secs(5))
+    .fetch_all()
     .await?;
 
-// Get session variable
-let user_id = session.get("user_id");
+// Explain and profile are builder terminals
+let plan = session.query_with("MATCH (n:Person) RETURN n").explain().await?;
+let (result, profile) = session.query_with("MATCH (n) RETURN n").profile().await?;
+
+// Get a parameter value
+let user_id = session.params().get("user_id");
 ```
 
-Session variables are merged with explicit query parameters. Explicit parameters take precedence.
+Session parameters are merged with explicit query parameters. Explicit parameters take precedence.
+
+## Facade Accessors
+
+Sub-APIs are accessed via accessor methods on `Uni`, `Session`, or `Transaction`:
+
+```rust
+// Locy rule management (available at all three scopes)
+db.rules().register("risk(x) :- ...")?;
+session.rules().list();
+tx.rules().register("local_rule(x) :- ...")?;
+
+// Database administration (on Uni only)
+db.compaction().compact("Person").await?;
+db.indexes().rebuild("Person", true).await?;
+db.functions().register("my_fn", |args| Ok(args[0].clone()))?;
+let xervo = db.xervo();
+```
 
 ## L0 Visibility and QueryContext
 
@@ -3346,18 +3403,20 @@ WriteThrottleConfig {
 
 | Practice | Details |
 |---|---|
-| **Keep transactions short** | Long transactions hold the writer lock |
-| **Use auto-commit** | For simple single-statement operations |
+| **Keep transactions short** | Long transactions accumulate large L0 buffers; the writer lock is only held at commit time |
+| **Use context managers** | `with session.tx() as tx:` ensures auto-rollback on error |
 | **Monitor write throttle** | Alert on `l1_runs` approaching `soft_limit` |
 | **Break bulk operations** | Split large imports into batches of 10-50k |
+| **Session for reads, Transaction for writes** | Never try to write outside a transaction |
 
 ## Transaction Anti-Patterns
 
 | Anti-Pattern | Problem | Solution |
 |---|---|---|
-| **Long-running write txns** | Blocks all other writers | Keep under a few seconds |
+| **Long-running write txns** | Large L0 buffers; commit serialization delays | Keep under a few seconds |
 | **Reading without snapshots** | May see inconsistent data during compaction | Use snapshot isolation |
 | **Ignoring auto-rollback warning** | Resource leak indication | Always explicitly commit or rollback |
+| **Writing on Session** | Session is read-only | Use `session.tx()` to create a Transaction |
 
 ---
 
@@ -3580,226 +3639,202 @@ graph TB
     CORE --> RUST
 ```
 
+Both packages provide **synchronous** and **asynchronous** APIs. The sync API uses `Uni`/`Session`/`Transaction`; the async API uses `AsyncUni`/`AsyncSession`/`AsyncTransaction`.
+
 ## uni-db (PyO3 Core Bindings)
 
 ### Database Connection
 
 ```python
-from uni_db import Database, DatabaseBuilder
+from uni_db import Uni, UniBuilder
 
 # Simple open (creates if missing)
-db = Database("./my-graph")
+db = Uni.open("./my-graph")
 
-# Builder pattern
-db = DatabaseBuilder.open("./my-graph") \
-    .cache_size(2 * 1024**3) \      # 2 GB cache
+# Builder pattern for advanced config
+db = UniBuilder.open("./my-graph") \
+    .cache_size(2 * 1024**3) \
     .parallelism(8) \
     .build()
 
 # Open existing (fails if missing)
-db = DatabaseBuilder.open_existing("./my-graph").build()
+db = Uni.open_existing("./my-graph")
 
 # Create new (fails if exists)
-db = DatabaseBuilder.create("./my-graph").build()
+db = Uni.create("./my-graph")
 
 # Temporary / in-memory
-db = DatabaseBuilder.temporary().build()
-db = DatabaseBuilder.in_memory().build()
+db = Uni.temporary()
+db = Uni.in_memory()
 
-# Hybrid (local WAL + cloud storage)
-db = DatabaseBuilder.open("./local-wal") \
-    .hybrid("./local-wal", "s3://my-bucket/graph") \
-    .build()
-
-# Fluent config — both methods return self for chaining
-db = DatabaseBuilder.temporary() \
+# Fluent config via builder
+db = UniBuilder.temporary() \
     .config({"query_timeout": 30.0, "parallelism": 8}) \
     .cache_size(4 * 1024**3) \
+    .wal_enabled(True) \
     .build()
 
 # Cloud credentials (all fields optional; uses env vars if omitted)
-db = DatabaseBuilder.open("s3://my-bucket/graph") \
+db = UniBuilder.open("s3://my-bucket/graph") \
     .cloud_config({
         "provider": "s3",
         "bucket": "my-bucket",
         "region": "us-east-1",
-        # access_key_id / secret_access_key / session_token optional
     }) \
     .build()
 ```
 
 ### Querying
 
+All reads go through **Session**, all writes through **Transaction**:
+
 ```python
+# Create a session (sync, cheap, no I/O)
+session = db.session()
+
 # Simple query
-rows = db.query("MATCH (n:Person) RETURN n.name, n.age")
-for row in rows:
-    print(row["name"], row["age"])
+result = session.query("MATCH (n:Person) RETURN n.name, n.age")
+for row in result:
+    print(row["n.name"], row["n.age"])
 
 # Parameterized query
-rows = db.query(
+result = session.query(
     "MATCH (n:Person) WHERE n.age > $min_age RETURN n",
     params={"min_age": 25}
 )
 
 # Query builder with timeout and memory limit
-from uni_db import QueryBuilder
-result = QueryBuilder(db, "MATCH (n:Person) RETURN n") \
+result = session.query_with("MATCH (n:Person) RETURN n") \
     .param("limit", 100) \
     .timeout(5.0) \
     .max_memory(512 * 1024**2) \
     .fetch_all()
 
-# Mutations
-affected = db.execute("CREATE (n:Person {name: 'Alice', age: 30})")
-affected = db.execute(
-    "CREATE (n:Person {name: $name})",
-    params={"name": "Bob"}
-)
+# Mutations via Transaction
+with session.tx() as tx:
+    tx.execute("CREATE (n:Person {name: 'Alice', age: 30})")
+    tx.execute("CREATE (n:Person {name: $name})", params={"name": "Bob"})
+    tx.commit()
 ```
 
 ### Query Analysis
 
 ```python
 # EXPLAIN (plan without execution)
-plan = db.explain("MATCH (n:Person)-[:KNOWS]->(m) RETURN n, m")
-print(plan["plan_text"])
-print(plan["index_usage"])
-print(plan["suggestions"])
+plan = session.query_with("MATCH (n:Person)-[:KNOWS]->(m) RETURN n, m").explain()
+print(plan.plan_text)
+print(plan.index_usage)
 
 # PROFILE (execute + timing)
-rows, stats = db.profile("MATCH (n:Person) RETURN n")
-for op, timing in stats["operators"].items():
-    print(f"{op}: {timing['duration_ms']}ms")
+result, stats = session.query_with("MATCH (n:Person) RETURN n").profile()
 ```
 
 ### Schema Management
 
 ```python
-from uni_db import SchemaBuilder
+from uni_db import DataType
 
-# Fluent schema builder
-schema = SchemaBuilder(db)
-
-schema.label("Person") \
-    .property("name", "String") \
-    .property("age", "Int64") \
-    .property_nullable("email", "String") \
-    .vector("embedding", 384) \
-    .done()
-
-schema.edge_type("KNOWS", from_labels=["Person"], to_labels=["Person"]) \
-    .property("since", "Date") \
-    .property("weight", "Float64") \
-    .done()
-
-schema.apply()
-
-# Direct schema methods
-db.create_label("Product")
-db.add_property("Product", "price", "Float64", nullable=False)
-db.create_edge_type("PURCHASED", from_labels=["Person"], to_labels=["Product"])
+# Fluent schema builder via db.schema()
+db.schema() \
+    .label("Person") \
+        .property("name", DataType.STRING()) \
+        .property("age", DataType.INT64()) \
+        .property_nullable("email", DataType.STRING()) \
+        .vector("embedding", 384) \
+    .done() \
+    .edge_type("KNOWS", ["Person"], ["Person"]) \
+        .property("since", DataType.DATE()) \
+        .property("weight", DataType.FLOAT64()) \
+    .apply()
 
 # Introspection
-labels = db.list_labels()           # ["Person", "Product"]
-info = db.get_label_info("Person")  # LabelInfo with properties, indexes, constraints
-schema = db.get_schema()            # Full schema dict
-```
-
-### Transactions
-
-```python
-# Manual transaction
-txn = db.begin()
-try:
-    txn.execute("CREATE (n:Person {name: 'Alice'})")
-    txn.execute("CREATE (n:Person {name: 'Bob'})")
-    rows = txn.query("MATCH (n:Person) RETURN count(*)")
-    txn.commit()
-except Exception:
-    txn.rollback()
-    raise
-
-# Flush uncommitted changes
-db.flush()
+labels = db.list_labels()                    # ["Person"]
+info = db.get_label_info("Person")           # LabelInfo with properties, indexes, constraints
+edge_info = db.get_edge_type_info("KNOWS")   # EdgeTypeInfo
 ```
 
 ### Sessions
 
 ```python
-from uni_db import SessionBuilder
+# Create a session and set scoped parameters
+session = db.session()
+session.params().set("user_id", "alice-123")
+session.params().set("role", "admin")
 
-session = SessionBuilder(db) \
-    .set("user_id", "alice-123") \
-    .set("role", "admin") \
-    .build()
+# Query with session parameters (injected as $user_id, $role)
+result = session.query("MATCH (u:User {id: $user_id}) RETURN u")
 
-# Query with session variables
-rows = session.query(
-    "MATCH (u:User {id: $session.user_id}) RETURN u"
-)
+# Get a parameter
+user_id = session.params().get("user_id")
+```
 
-# Get session variable
-user_id = session.get("user_id")
+### Transactions
+
+```python
+# Context manager (auto-rollback on exception)
+with session.tx() as tx:
+    tx.execute("CREATE (n:Person {name: 'Alice'})")
+    tx.execute("CREATE (n:Person {name: 'Bob'})")
+    result = tx.query("MATCH (n:Person) RETURN count(*)")
+    tx.commit()
+
+# Flush uncommitted changes to durable storage
+db.flush()
 ```
 
 ### Bulk Loading
 
+Bulk operations are accessed through **Transaction**:
+
 ```python
-from uni_db import BulkWriterBuilder
+with session.tx() as tx:
+    writer = tx.bulk_writer() \
+        .batch_size(50000) \
+        .defer_vector_indexes(True) \
+        .defer_scalar_indexes(True) \
+        .build()
 
-bulk = BulkWriterBuilder(db) \
-    .batch_size(50000) \
-    .defer_vector_indexes(True) \
-    .defer_scalar_indexes(True) \
-    .async_indexes(True) \
-    .build()
+    # Insert vertices
+    vids = writer.insert_vertices("Person", [
+        {"name": "Alice", "age": 30},
+        {"name": "Bob", "age": 25},
+        {"name": "Charlie", "age": 35},
+    ])
 
-# Insert vertices
-vids = bulk.insert_vertices("Person", [
-    {"name": "Alice", "age": 30},
-    {"name": "Bob", "age": 25},
-    {"name": "Charlie", "age": 35},
-])
+    # Insert edges
+    writer.insert_edges("KNOWS", [
+        (vids[0], vids[1], {"since": "2023-01-01"}),
+        (vids[1], vids[2], {"since": "2023-06-15"}),
+    ])
 
-# Insert edges
-bulk.insert_edges("KNOWS", [
-    (vids[0], vids[1], {"since": "2023-01-01"}),
-    (vids[1], vids[2], {"since": "2023-06-15"}),
-])
+    stats = writer.commit()
+    tx.commit()
 
-# Commit (rebuilds deferred indexes)
-stats = bulk.commit()
 print(f"Inserted {stats.vertices_inserted} vertices, {stats.edges_inserted} edges")
-print(f"Duration: {stats.duration_secs:.2f}s")
-
-# Or abort
-# bulk.abort()
 ```
 
 ### Indexes
 
 ```python
-# Scalar index
-db.create_scalar_index("Person", "name", "btree")
-db.create_scalar_index("Order", "status", "hash")
-
-# Vector index
-db.create_vector_index("Document", "embedding", "cosine")
+# Manage indexes via the indexes() facade
+indexes = db.indexes()
+all_indexes = indexes.list()                    # All indexes
+person_indexes = indexes.list("Person")         # Indexes for a label
+task_id = indexes.rebuild("Person", background=True)  # Background rebuild
 ```
 
 ### Locy
 
 ```python
-program = """
-MODULE fraud
-CREATE RULE flagged AS
-    MATCH (a:Account) WHERE a.fraud_score > 0.8
-    YIELD KEY a
-"""
-
-result = db.locy_evaluate(program)
-print(result["stats"])  # LocyStats
+# Evaluate a Locy program via session
+result = session.locy("""
+    MODULE fraud
+    CREATE RULE flagged AS
+        MATCH (a:Account) WHERE a.fraud_score > 0.8
+        YIELD KEY a
+""")
+print(result.stats)       # LocyStats
+print(result.warnings)    # Runtime warnings
 ```
 
 ### Xervo (Embedding & Generation)
@@ -3848,62 +3883,59 @@ result = xervo.generate_text(
 #### Message
 
 ```python
-# Constructors
 msg = Message("user", "hello")        # positional role + content
 msg = Message.user("hello")           # role = "user"
 msg = Message.assistant("response")   # role = "assistant"
 msg = Message.system("Be helpful.")   # role = "system"
-
-msg.role     # str: "user" | "assistant" | "system"
-msg.content  # str
-repr(msg)    # Message(role='user', content='hello')
 ```
 
-`generate()` accepts a mixed list of `Message` objects and/or dicts — dicts must have `"role"` and `"content"` keys. A `TypeError` is raised at call time if an element is neither, or if a dict is missing a required key.
+`generate()` accepts a mixed list of `Message` objects and/or dicts — dicts must have `"role"` and `"content"` keys.
 
-#### TokenUsage
-
-```python
-result.usage.prompt_tokens      # int
-result.usage.completion_tokens  # int
-result.usage.total_tokens       # int
-```
-
-`result.usage` is `None` when the provider does not report token counts.
-
-#### GenerationResult
+#### TokenUsage / GenerationResult
 
 ```python
-result.text   # str — the generated output
-result.usage  # TokenUsage | None
-```
-
-#### Async Xervo
-
-`AsyncDatabase.xervo()` returns an `AsyncXervo` proxy with identical methods returning coroutines:
-
-```python
-async def main():
-    db = await AsyncDatabase.temporary()
-    xervo = db.xervo()
-    result = await xervo.generate_text("llm/default", "Hello!")
-    vectors = await xervo.embed("embed/default", ["hello"])
+result.text                        # str — the generated output
+result.usage                       # TokenUsage | None
+result.usage.prompt_tokens         # int
+result.usage.completion_tokens     # int
+result.usage.total_tokens          # int
 ```
 
 ### Async API
 
 ```python
 import asyncio
-from uni_db import AsyncDatabase, AsyncDatabaseBuilder
+from uni_db import AsyncUni
 
 async def main():
-    db = await AsyncDatabaseBuilder.open("./my-graph").build()
-    rows = await db.query("MATCH (n:Person) RETURN n.name")
-    txn = await db.begin()
-    await txn.execute("CREATE (n:Person {name: 'Async Alice'})")
-    await txn.commit()
+    db = await AsyncUni.open("./my-graph")
+    session = db.session()
+
+    result = await session.query("MATCH (n:Person) RETURN n.name")
+
+    async with await session.tx() as tx:
+        await tx.execute("CREATE (n:Person {name: 'Async Alice'})")
+        await tx.commit()
+
+    await db.shutdown()
 
 asyncio.run(main())
+```
+
+### Facades
+
+```python
+# Rule management
+db.rules().register("risk(x) :- ...")
+db.rules().list()
+
+# Compaction
+db.compaction().compact("Person")
+db.compaction().wait()
+
+# Index management
+db.indexes().list()
+db.indexes().rebuild("Person", background=True)
 ```
 
 ### Data Classes
@@ -3919,15 +3951,15 @@ LabelInfo:
 
 PropertyInfo:
     name: str
-    data_type: str      # "String", "Int64", "Vector{128}"
+    data_type: str
     nullable: bool
     is_indexed: bool
 
 IndexInfo:
     name: str
-    index_type: str     # SCALAR, VECTOR, FULLTEXT
+    index_type: str
     properties: list[str]
-    status: str         # ONLINE, BUILDING, FAILED
+    status: str
 
 BulkStats:
     vertices_inserted: int
@@ -3953,9 +3985,8 @@ class Person(UniNode):
     name: str = Field(index="btree")
     age: int
     email: str | None = Field(default=None, unique=True)
-    embedding: Vector[384] | None = Field(default=None, index="vector", metric="cosine")
+    embedding: Vector[384] | None = Field(default=None, metric="cosine")
 
-    # Relationships
     friends: list["Person"] = Relationship("FRIEND_OF", direction="outgoing")
     employer: "Company | None" = Relationship("WORKS_AT", direction="outgoing")
 
@@ -3990,10 +4021,10 @@ stateDiagram-v2
 ### Session Operations
 
 ```python
-from uni_db import Database
+from uni_db import Uni
 from uni_pydantic import UniSession
 
-db = Database("./my-graph")
+db = Uni.temporary()
 session = UniSession(db)
 
 # Register models (generates schema)
@@ -4007,9 +4038,8 @@ session.commit()
 
 print(alice.vid)  # VID assigned after commit
 
-# Update
+# Update (dirty tracking is automatic — just mutate and commit)
 alice.age = 31
-session.update(alice)
 session.commit()
 
 # Query
@@ -4023,10 +4053,11 @@ session.commit()
 ### Query Builder
 
 ```python
-# Filter expressions using PropertyProxy
+# Filter expressions using PropertyProxy (one filter per call, chain for multiple)
 people = session.query(Person) \
-    .filter(Person.age >= 25, Person.name.STARTS_WITH("A")) \
-    .order_by(Person.age.desc()) \
+    .filter(Person.age >= 25) \
+    .filter(Person.name.starts_with("A")) \
+    .order_by(Person.age, descending=True) \
     .limit(10) \
     .skip(0) \
     .distinct() \
@@ -4040,42 +4071,33 @@ alice = session.query(Person) \
 # Count
 total = session.query(Person).count()
 
-# Vector search
+# Vector search (k for result count, metric set at schema level)
 similar = session.query(Person) \
-    .vector_search("embedding", query_vector, limit=10, metric="cosine") \
+    .vector_search("embedding", query_vector, k=10) \
     .all()
 
 # Eager load relationships
 people = session.query(Person) \
     .eager_load("friends", "employer") \
     .all()
-
-# Get Cypher string
-cypher = session.query(Person) \
-    .filter(Person.age > 25) \
-    .to_cypher()
-# → "MATCH (n:Person) WHERE n.age > 25 RETURN n"
-
-# Query plan
-plan = session.query(Person).filter(Person.age > 25).explain()
 ```
 
 ### Filter Operators
 
 ```python
-Person.age == 30                # Equality
-Person.age != 30                # Inequality
-Person.age > 25                 # Greater than
-Person.age >= 25                # Greater or equal
-Person.age < 65                 # Less than
-Person.name.IN(["Alice", "Bob"])     # IN list
-Person.name.NOT_IN(["Charlie"])      # NOT IN list
-Person.name.STARTS_WITH("A")        # Prefix match
-Person.name.ENDS_WITH("ce")         # Suffix match
-Person.name.CONTAINS("li")          # Substring
-Person.name.LIKE("A.*ce")           # Regex
-Person.email.IS_NULL                 # NULL check
-Person.email.IS_NOT_NULL             # NOT NULL check
+Person.age == 30                     # Equality
+Person.age != 30                     # Inequality
+Person.age > 25                      # Greater than
+Person.age >= 25                     # Greater or equal
+Person.age < 65                      # Less than
+Person.name.in_(["Alice", "Bob"])    # IN list
+Person.name.not_in(["Charlie"])      # NOT IN list
+Person.name.starts_with("A")        # Prefix match
+Person.name.ends_with("ce")         # Suffix match
+Person.name.contains("li")          # Substring
+Person.name.like("A.*ce")           # Regex
+Person.email.is_null()              # NULL check
+Person.email.is_not_null()          # NOT NULL check
 ```
 
 ### Transactions
@@ -4176,11 +4198,11 @@ UniPydanticError (base)
 ### Async OGM
 
 ```python
-from uni_db import AsyncDatabase
+from uni_db import AsyncUni
 from uni_pydantic import AsyncUniSession
 
 async def main():
-    db = await AsyncDatabase.open("./my-graph")
+    db = await AsyncUni.open("./my-graph")
     session = AsyncUniSession(db)
     session.register(Person, Company)
     await session.sync_schema()
@@ -4235,6 +4257,7 @@ graph TB
 | `max_transaction_memory` | `usize` | 1 GB | Transaction buffer limit |
 | `max_compaction_rows` | `usize` | 5,000,000 | OOM guard for in-memory compaction |
 | `enable_vid_labels_index` | `bool` | `true` | O(1) VID→labels lookups |
+| `max_recursive_cte_iterations` | `usize` | 1,000 | Maximum iterations for recursive CTE evaluation |
 
 ### Flush Settings
 
@@ -4297,10 +4320,10 @@ Environment: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`,
 
 ```python
 # Python
-db = DatabaseBuilder.open("s3://my-bucket/graph-data").build()
-# Or with explicit config
-db = DatabaseBuilder.open("./local") \
-    .hybrid("./local", "s3://my-bucket/graph-data") \
+db = UniBuilder.open("s3://my-bucket/graph-data").build()
+# Or with explicit cloud config
+db = UniBuilder.open("s3://my-bucket/graph-data") \
+    .cloud_config({"provider": "s3", "bucket": "my-bucket", "region": "us-east-1"}) \
     .build()
 ```
 
@@ -4317,7 +4340,7 @@ CloudStorageConfig::Gcs {
 Environment: `GOOGLE_APPLICATION_CREDENTIALS`
 
 ```python
-db = DatabaseBuilder.open("gs://my-bucket/graph-data").build()
+db = UniBuilder.open("gs://my-bucket/graph-data").build()
 ```
 
 #### Azure Blob Storage
@@ -4334,7 +4357,7 @@ CloudStorageConfig::Azure {
 Environment: `AZURE_STORAGE_ACCOUNT`, `AZURE_STORAGE_ACCESS_KEY`
 
 ```python
-db = DatabaseBuilder.open("az://account/container/graph-data").build()
+db = UniBuilder.open("az://account/container/graph-data").build()
 ```
 
 ### FileSandboxConfig
@@ -4381,8 +4404,8 @@ let db = Uni::open("./dev-graph")
 ### S3 Production
 
 ```rust
+// Uses env vars: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION
 let db = Uni::open("s3://prod-bucket/graph")
-    .cloud_config(CloudStorageConfig::s3_from_env())
     .config(UniConfig {
         cache_size: 4 * 1024 * 1024 * 1024,  // 4 GB
         parallelism: 16,
@@ -4407,8 +4430,7 @@ let db = Uni::open("s3://prod-bucket/graph")
 
 ```rust
 let db = Uni::open("./local-wal")
-    .hybrid("./local-wal", "s3://prod-bucket/graph")
-    .cloud_config(CloudStorageConfig::s3_from_env())
+    .remote_storage("s3://prod-bucket/graph", CloudStorageConfig::s3_from_env("prod-bucket"))
     .build()
     .await?;
 ```
@@ -4566,7 +4588,7 @@ Quick reference of all anti-patterns from every chapter:
 
 | Anti-Pattern | Problem | Solution |
 |---|---|---|
-| Long write transactions | Blocks all writers | Keep under a few seconds |
+| Long write transactions | Large L0 buffers; commit serialization delays | Keep under a few seconds |
 | No snapshot isolation | Inconsistent reads | Use snapshot-based reads |
 | Ignoring auto-rollback | Resource leaks | Explicit commit/rollback |
 
@@ -4609,7 +4631,7 @@ Quick reference of all anti-patterns from every chapter:
 | **PropertyManager** | Component handling lazy property loading with LRU cache and L0 overlay |
 | **Rga** | Replicated Growable Array CRDT — ordered sequence for collaborative editing |
 | **RRF** | Reciprocal Rank Fusion — score fusion method for hybrid search |
-| **SimpleGraph** | Custom in-memory graph data structure used for L0 buffer and algorithms |
+| **SimpleGraph** | Custom in-memory graph data structure (in `uni-common`) used for L0 buffer and algorithms |
 | **Snapshot** | JSON manifest capturing a consistent point-in-time view of all datasets |
 | **Stratum** | Group of mutually-recursive Locy rules evaluated together in fixpoint |
 | **UniId** | Content-addressed identifier — SHA3-256 hash of (label, ext_id, properties) |

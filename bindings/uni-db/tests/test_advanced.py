@@ -13,15 +13,17 @@ import uni_db
 class TestAdvanced(unittest.TestCase):
     def setUp(self):
         self.test_dir = tempfile.mkdtemp(prefix="test_db_adv_")
-        self.db = uni_db.Database(self.test_dir)
-        self.db.create_label("Entity")
+        self.db = uni_db.Uni.open(self.test_dir)
+        self.session = self.db.session()
+        self.db.schema().label("Entity").apply()
 
     def tearDown(self):
+        del self.session
         del self.db
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
     def test_transaction_commit(self):
-        tx = self.db.begin()
+        tx = self.session.tx()
         tx.query("CREATE (n:Entity {id: 1})")
         # In same tx, should see it? (Uni supports Read Your Own Writes within tx usually if configured)
         # But L0 overlay might not be visible in query if query doesn't use tx context correctly?
@@ -46,27 +48,33 @@ class TestAdvanced(unittest.TestCase):
         tx.commit()
 
         # Check after commit
-        results = self.db.query("MATCH (n:Entity {id: 1}) RETURN n.id as id")
+        results = self.session.query("MATCH (n:Entity {id: 1}) RETURN n.id as id")
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0]["id"], 1)
 
     def test_transaction_rollback(self):
-        tx = self.db.begin()
+        tx = self.session.tx()
         tx.query("CREATE (n:Entity {id: 2})")
         tx.rollback()
 
-        results = self.db.query("MATCH (n:Entity {id: 2}) RETURN n.id as id")
+        results = self.session.query("MATCH (n:Entity {id: 2}) RETURN n.id as id")
         self.assertEqual(len(results), 0)
 
     def test_vector_index(self):
         # Add vector property and create vector index
-        self.db.add_property("Entity", "embedding", "vector:3", False)
-        self.db.create_vector_index("Entity", "embedding", "l2")
+        (
+            self.db.schema()
+            .label("Entity")
+            .vector("embedding", 3)
+            .index("embedding", {"type": "vector", "metric": "l2"})
+            .done()
+            .apply()
+        )
 
         # Insert data with vector
         # Uni supports vector literals or array?
         # Cypher: CREATE (n:Entity {embedding: [0.1, 0.2, 0.3]})
-        self.db.query("CREATE (n:Entity {id: 3, embedding: [0.1, 0.2, 0.3]})")
+        self.session.query("CREATE (n:Entity {id: 3, embedding: [0.1, 0.2, 0.3]})")
 
         # Query using vector search (knn)
         # CALL db.index.vector.queryNodes('Entity', 'embedding', 1, [0.1, 0.2, 0.3])
@@ -76,7 +84,9 @@ class TestAdvanced(unittest.TestCase):
         # Assuming vector search works via CALL or match.
         # Let's just verify insertion works without error.
 
-        results = self.db.query("MATCH (n:Entity {id: 3}) RETURN n.embedding as vec")
+        results = self.session.query(
+            "MATCH (n:Entity {id: 3}) RETURN n.embedding as vec"
+        )
         self.assertEqual(len(results), 1)
         # Verify it comes back as list
         vec = results[0]["vec"]

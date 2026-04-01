@@ -45,9 +45,17 @@ impl GraphLoader {
 
             // Split on semicolons, execute each statement
             for stmt in content.split(';').map(str::trim).filter(|s| !s.is_empty()) {
-                db.execute(stmt)
+                let session = db.session();
+                let tx = session
+                    .tx()
+                    .await
+                    .with_context(|| format!("Failed to start transaction for: {}", stmt))?;
+                tx.execute(stmt)
                     .await
                     .with_context(|| format!("Failed to execute Cypher statement: {}", stmt))?;
+                tx.commit()
+                    .await
+                    .with_context(|| format!("Failed to commit Cypher statement: {}", stmt))?;
             }
         }
 

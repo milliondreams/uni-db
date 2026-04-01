@@ -303,38 +303,24 @@ impl ProjectionBuilder {
         label_ids: &[u16],
     ) -> Result<Vec<Vid>> {
         use arrow_array::UInt64Array;
-        use futures::TryStreamExt;
-        use lancedb::query::{ExecutableQuery, QueryBase, Select};
 
         let mut all_vids = Vec::new();
-        let lancedb_store = self.storage.lancedb_store();
 
-        // Scan storage for each label via LanceDB
         for &lid in label_ids {
             let label_name = schema.label_name_by_id(lid).unwrap();
-
-            let ds = self.storage.vertex_dataset(label_name)?;
-            if let Ok(table) = ds.open_lancedb(lancedb_store).await {
-                let batches: Vec<arrow_array::RecordBatch> = table
-                    .query()
-                    .select(Select::Columns(vec!["_vid".to_string()]))
-                    .execute()
-                    .await
-                    .map_err(|e| anyhow!("Failed to query table: {}", e))?
-                    .try_collect()
-                    .await
-                    .map_err(|e| anyhow!("Failed to collect batches: {}", e))?;
-
-                for batch in batches {
-                    let vid_col = batch
-                        .column_by_name("_vid")
-                        .unwrap()
-                        .as_any()
-                        .downcast_ref::<UInt64Array>()
-                        .unwrap();
-                    for i in 0..batch.num_rows() {
-                        all_vids.push(Vid::from(vid_col.value(i)));
-                    }
+            if let Ok(Some(batch)) = self
+                .storage
+                .scan_vertex_table(label_name, &["_vid"], None)
+                .await
+            {
+                let vid_col = batch
+                    .column_by_name("_vid")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .unwrap();
+                for i in 0..batch.num_rows() {
+                    all_vids.push(Vid::from(vid_col.value(i)));
                 }
             }
         }

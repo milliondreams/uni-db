@@ -27,10 +27,12 @@ async fn test_vector_match_operator_coverage() -> Result<()> {
         .await?;
 
     // 2. Insert Data
-    db.execute("CREATE (i:Item {id: 1, embedding: [0.0, 0.0]})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (i:Item {id: 1, embedding: [0.0, 0.0]})")
         .await?;
-    db.execute("CREATE (i:Item {id: 2, embedding: [1.0, 1.0]})")
+    tx.execute("CREATE (i:Item {id: 2, embedding: [1.0, 1.0]})")
         .await?;
+    tx.commit().await?;
 
     // Flush to ensure data is visible to vector index (which uses Lance)
     db.flush().await?;
@@ -39,6 +41,7 @@ async fn test_vector_match_operator_coverage() -> Result<()> {
     // Target [0.1, 0.1] should match id 1
     let query_vec = vec![0.1, 0.1];
     let results = db
+        .session()
         .query_with(
             "
         MATCH (i:Item)
@@ -51,8 +54,8 @@ async fn test_vector_match_operator_coverage() -> Result<()> {
         .fetch_all()
         .await?;
 
-    assert_eq!(results.rows.len(), 1);
-    assert_eq!(results.rows[0].get::<i64>("i.id")?, 1);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results.rows()[0].get::<i64>("i.id")?, 1);
 
     Ok(())
 }
@@ -64,8 +67,9 @@ async fn test_merge_composite_key_coverage() -> Result<()> {
     // 1. Schema with Composite Unique Constraint
     // We must use procedures/DDL or manually add constraint as SchemaBuilder doesn't support composite constraints directly yet in high-level API?
     // Let's use the DDL procedure which we know works.
-    db.query(
-        r#"
+    db.session()
+        .query(
+            r#"
         CALL uni.schema.createLabel('User', {
             "properties": {
                 "org": { "type": "STRING" },
@@ -76,8 +80,8 @@ async fn test_merge_composite_key_coverage() -> Result<()> {
             ]
         })
     "#,
-    )
-    .await?;
+        )
+        .await?;
 
     // Also create the index to back it up (DDL might do it? `createLabel` does not implied create index for constraint yet in all paths, let's ensure it)
     // The Executor::execute_merge optimization checks for constraint AND existence of index via `composite_lookup`.
@@ -85,25 +89,34 @@ async fn test_merge_composite_key_coverage() -> Result<()> {
     // Wait, `IndexManager::composite_lookup` uses `scan().filter(...)`. It doesn't strictly require a *composite index structure*, just the dataset.
     // So explicit index creation might not be strictly required for correctness, but good for perf.
     // Let's create it to be sure.
-    db.execute("CREATE INDEX idx_user_comp FOR (u:User) ON (u.org, u.username)")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE INDEX idx_user_comp FOR (u:User) ON (u.org, u.username)")
         .await?;
+    tx.commit().await?;
 
     // 2. Merge First Time (Create)
-    let res1 = db
+    let tx = db.session().tx().await?;
+    let res1 = tx
         .execute("MERGE (u:User {org: 'Acme', username: 'alice'}) RETURN u")
         .await?;
-    assert_eq!(res1.affected_rows, 1);
+    assert_eq!(res1.affected_rows(), 1);
+    tx.commit().await?;
 
     db.flush().await?;
 
     // 3. Merge Second Time (Match)
-    let _res2 = db
+    let tx = db.session().tx().await?;
+    let _res2 = tx
         .execute("MERGE (u:User {org: 'Acme', username: 'alice'}) RETURN u")
         .await?;
+    tx.commit().await?;
 
     // Verify count is still 1 (deduplicated)
-    let count = db.query("MATCH (u:User) RETURN count(u) AS c").await?;
-    assert_eq!(count.rows[0].get::<i64>("c")?, 1);
+    let count = db
+        .session()
+        .query("MATCH (u:User) RETURN count(u) AS c")
+        .await?;
+    assert_eq!(count.rows()[0].get::<i64>("c")?, 1);
 
     Ok(())
 }
@@ -131,8 +144,10 @@ async fn test_inverted_index_edge_cases() -> Result<()> {
         .await?;
 
     // 2. Insert Edge Cases
-    db.execute("CREATE (p:Post {id: 1, tags: []})").await?; // Empty list
-    db.execute("CREATE (p:Post {id: 2, tags: ['a']})").await?; // Normal
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (p:Post {id: 1, tags: []})").await?; // Empty list
+    tx.execute("CREATE (p:Post {id: 2, tags: ['a']})").await?; // Normal
+    tx.commit().await?;
     // Null list handled by nullable property? Default is not nullable in builder unless property_nullable called.
     // Let's test empty list behavior.
 
@@ -141,16 +156,18 @@ async fn test_inverted_index_edge_cases() -> Result<()> {
     // 3. Query
     // ANY IN empty list -> should match nothing
     let res = db
+        .session()
         .query("MATCH (p:Post) WHERE ANY(t IN p.tags WHERE t IN ['a']) RETURN p.id")
         .await?;
-    assert_eq!(res.rows.len(), 1);
-    assert_eq!(res.rows[0].get::<i64>("p.id")?, 2);
+    assert_eq!(res.len(), 1);
+    assert_eq!(res.rows()[0].get::<i64>("p.id")?, 2);
 
     // Query for something that shouldn't match empty
     let res_empty = db
+        .session()
         .query("MATCH (p:Post) WHERE ANY(t IN p.tags WHERE t IN ['b']) RETURN p.id")
         .await?;
-    assert_eq!(res_empty.rows.len(), 0);
+    assert_eq!(res_empty.len(), 0);
 
     Ok(())
 }

@@ -17,7 +17,7 @@ class TestSchemaBuilder:
     def db(self):
         """Create a temporary database."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            yield uni_db.DatabaseBuilder.open(tmpdir).build()
+            yield uni_db.UniBuilder.open(tmpdir).build()
 
     def test_label_builder_basic(self, db):
         """Test creating a label with basic properties."""
@@ -27,9 +27,12 @@ class TestSchemaBuilder:
 
         assert db.label_exists("Person")
         # Verify we can insert data
-        db.execute("CREATE (n:Person {name: 'Alice', age: 30})")
+        session = db.session()
+        tx = session.tx()
+        tx.execute("CREATE (n:Person {name: 'Alice', age: 30})")
+        tx.commit()
         db.flush()
-        results = db.query("MATCH (n:Person) RETURN n.name, n.age")
+        results = session.query("MATCH (n:Person) RETURN n.name, n.age")
         assert len(results) == 1
 
     def test_label_builder_nullable(self, db):
@@ -39,9 +42,12 @@ class TestSchemaBuilder:
         ).apply()
 
         # Insert without nickname
-        db.execute("CREATE (n:Person {name: 'Bob'})")
+        session = db.session()
+        tx = session.tx()
+        tx.execute("CREATE (n:Person {name: 'Bob'})")
+        tx.commit()
         db.flush()
-        results = db.query("MATCH (n:Person) RETURN n.name, n.nickname")
+        results = session.query("MATCH (n:Person) RETURN n.name, n.nickname")
         assert len(results) == 1
 
     def test_label_builder_with_index(self, db):
@@ -86,13 +92,20 @@ class TestSchemaQueries:
     def db_with_schema(self):
         """Create a database with a predefined schema."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            db = uni_db.DatabaseBuilder.open(tmpdir).build()
-            db.create_label("Person")
-            db.add_property("Person", "name", "string", False)
-            db.add_property("Person", "age", "int", False)
-            db.create_label("Company")
-            db.add_property("Company", "name", "string", False)
-            db.create_edge_type("WORKS_AT", ["Person"], ["Company"])
+            db = uni_db.UniBuilder.open(tmpdir).build()
+            (
+                db.schema()
+                .label("Person")
+                .property("name", "string")
+                .property("age", "int")
+                .done()
+                .label("Company")
+                .property("name", "string")
+                .done()
+                .edge_type("WORKS_AT", ["Person"], ["Company"])
+                .done()
+                .apply()
+            )
             yield db
 
     def test_label_exists(self, db_with_schema):
@@ -132,40 +145,48 @@ class TestDataTypes:
     def db(self):
         """Create a temporary database."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            yield uni_db.DatabaseBuilder.open(tmpdir).build()
+            yield uni_db.UniBuilder.open(tmpdir).build()
 
     def test_string_type(self, db):
         """Test string data type."""
-        db.create_label("Test")
-        db.add_property("Test", "text", "string", False)
-        db.execute("CREATE (n:Test {text: 'hello world'})")
+        db.schema().label("Test").property("text", "string").apply()
+        session = db.session()
+        tx = session.tx()
+        tx.execute("CREATE (n:Test {text: 'hello world'})")
+        tx.commit()
         db.flush()
-        results = db.query("MATCH (n:Test) RETURN n.text")
+        results = session.query("MATCH (n:Test) RETURN n.text")
         assert results[0]["n.text"] == "hello world"
 
     def test_int_type(self, db):
         """Test integer data type."""
-        db.create_label("Test")
-        db.add_property("Test", "num", "int", False)
-        db.execute("CREATE (n:Test {num: 42})")
+        db.schema().label("Test").property("num", "int").apply()
+        session = db.session()
+        tx = session.tx()
+        tx.execute("CREATE (n:Test {num: 42})")
+        tx.commit()
         db.flush()
-        results = db.query("MATCH (n:Test) RETURN n.num")
+        results = session.query("MATCH (n:Test) RETURN n.num")
         assert results[0]["n.num"] == 42
 
     def test_float_type(self, db):
         """Test float data type."""
-        db.create_label("Test")
-        db.add_property("Test", "value", "float", False)
-        db.execute("CREATE (n:Test {value: 3.14})")
+        db.schema().label("Test").property("value", "float").apply()
+        session = db.session()
+        tx = session.tx()
+        tx.execute("CREATE (n:Test {value: 3.14})")
+        tx.commit()
         db.flush()
-        results = db.query("MATCH (n:Test) RETURN n.value")
+        results = session.query("MATCH (n:Test) RETURN n.value")
         assert abs(results[0]["n.value"] - 3.14) < 0.001
 
     def test_bool_type(self, db):
         """Test boolean data type."""
-        db.create_label("Test")
-        db.add_property("Test", "active", "bool", False)
-        db.execute("CREATE (n:Test {active: true})")
+        db.schema().label("Test").property("active", "bool").apply()
+        session = db.session()
+        tx = session.tx()
+        tx.execute("CREATE (n:Test {active: true})")
+        tx.commit()
         db.flush()
-        results = db.query("MATCH (n:Test) RETURN n.active")
+        results = session.query("MATCH (n:Test) RETURN n.active")
         assert results[0]["n.active"] is True

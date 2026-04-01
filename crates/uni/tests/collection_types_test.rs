@@ -40,47 +40,50 @@ async fn test_collection_types_storage_and_query() -> anyhow::Result<()> {
         .await?;
 
     // 3. Insert Data via Cypher (Testing parser/planner/executor for collections)
-    db.execute("CREATE (n:Node {tags: ['alpha', 'beta', 'gamma'], counters: {a: 10, b: 20}})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (n:Node {tags: ['alpha', 'beta', 'gamma'], counters: {a: 10, b: 20}})")
         .await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // 4. Query Data
     // Basic Fetch
     let query_fetch = "MATCH (n:Node) RETURN n.tags, n.counters";
-    let res = db.query(query_fetch).await?;
+    let res = db.session().query(query_fetch).await?;
 
     // Rows are uni_db::Value. Convert to JSON for easier assertion.
     let fetched_tags: Vec<String> =
-        serde_json::from_value(res.rows[0].value("n.tags").unwrap().clone().into())?;
+        serde_json::from_value(res.rows()[0].value("n.tags").unwrap().clone().into())?;
     assert_eq!(fetched_tags, vec!["alpha", "beta", "gamma"]);
 
     let fetched_counters: HashMap<String, i64> =
-        serde_json::from_value(res.rows[0].value("n.counters").unwrap().clone().into())?;
+        serde_json::from_value(res.rows()[0].value("n.counters").unwrap().clone().into())?;
     assert_eq!(fetched_counters.get("a"), Some(&10));
     assert_eq!(fetched_counters.get("b"), Some(&20));
 
     // 5. Test Functions
     // size(), head(), tail() on List
     let query_list_funcs = "MATCH (n:Node) RETURN size(n.tags), head(n.tags), size(tail(n.tags))";
-    let res_list = db.query(query_list_funcs).await?;
+    let res_list = db.session().query(query_list_funcs).await?;
 
-    let size_tags: i64 = serde_json::from_value(res_list.rows[0].values[0].clone().into())?;
+    let size_tags: i64 = serde_json::from_value(res_list.rows()[0].values()[0].clone().into())?;
     assert_eq!(size_tags, 3);
 
-    let head_tags: String = serde_json::from_value(res_list.rows[0].values[1].clone().into())?;
+    let head_tags: String = serde_json::from_value(res_list.rows()[0].values()[1].clone().into())?;
     assert_eq!(head_tags, "alpha");
 
-    let size_tail: i64 = serde_json::from_value(res_list.rows[0].values[2].clone().into())?;
+    let size_tail: i64 = serde_json::from_value(res_list.rows()[0].values()[2].clone().into())?;
     assert_eq!(size_tail, 2);
 
     // size(), keys() on Map
     let query_map_funcs = "MATCH (n:Node) RETURN size(n.counters), keys(n.counters)";
-    let res_map = db.query(query_map_funcs).await?;
+    let res_map = db.session().query(query_map_funcs).await?;
 
-    let size_map: i64 = serde_json::from_value(res_map.rows[0].values[0].clone().into())?;
+    let size_map: i64 = serde_json::from_value(res_map.rows()[0].values()[0].clone().into())?;
     assert_eq!(size_map, 2);
 
-    let keys_map: Vec<String> = serde_json::from_value(res_map.rows[0].values[1].clone().into())?;
+    let keys_map: Vec<String> =
+        serde_json::from_value(res_map.rows()[0].values()[1].clone().into())?;
     assert!(keys_map.contains(&"a".to_string()));
     assert!(keys_map.contains(&"b".to_string()));
 

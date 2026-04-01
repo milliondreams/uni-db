@@ -16,11 +16,11 @@ async fn test_candle_embedding_basic() -> Result<()> {
     let db = Uni::temporary().build().await?;
 
     // 1. Create label with content property
-    db.execute("CREATE LABEL Document (content STRING)").await?;
-
     // 2. Create vector index with Candle auto-embedding
     // all-MiniLM-L6-v2 produces 384-dimensional embeddings
-    db.execute(
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL Document (content STRING)").await?;
+    tx.execute(
         r#"
         CREATE VECTOR INDEX doc_embed_idx
         FOR (d:Document) ON (d.embedding)
@@ -35,16 +35,17 @@ async fn test_candle_embedding_basic() -> Result<()> {
     "#,
     )
     .await?;
-
     // 3. Insert a document - this triggers auto-embedding
-    db.execute(r#"CREATE (:Document {content: "Test content for embedding generation."})"#)
+    tx.execute(r#"CREATE (:Document {content: "Test content for embedding generation."})"#)
         .await?;
+    tx.commit().await?;
 
     // 4. Flush to persist the data
     db.flush().await?;
 
     // 5. Verify the embedding was generated
     let result = db
+        .session()
         .query("MATCH (d:Document) RETURN count(d) AS cnt")
         .await?;
     let count: i64 = result.rows()[0].get("cnt")?;
@@ -52,6 +53,7 @@ async fn test_candle_embedding_basic() -> Result<()> {
 
     // Verify embedding was stored
     let result = db
+        .session()
         .query("MATCH (d:Document) WHERE d.embedding IS NOT NULL RETURN count(d) AS cnt")
         .await?;
     let emb_count: i64 = result.rows()[0].get("cnt")?;
@@ -66,10 +68,10 @@ async fn test_candle_embedding_basic() -> Result<()> {
 async fn test_candle_multiple_embeddings() -> Result<()> {
     let db = Uni::temporary().build().await?;
 
-    db.execute("CREATE LABEL Article (title STRING, body STRING)")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL Article (title STRING, body STRING)")
         .await?;
-
-    db.execute(
+    tx.execute(
         r#"
         CREATE VECTOR INDEX article_embed_idx
         FOR (a:Article) ON (a.embedding)
@@ -84,25 +86,32 @@ async fn test_candle_multiple_embeddings() -> Result<()> {
     "#,
     )
     .await?;
+    tx.commit().await?;
 
     // Insert multiple documents
     for i in 1..=5 {
-        db.execute(&format!(
+        let tx = db.session().tx().await?;
+        tx.execute(&format!(
             r#"CREATE (:Article {{title: "Article {}", body: "This is the body of article number {}."}})"#,
             i, i
         ))
         .await?;
+        tx.commit().await?;
     }
 
     db.flush().await?;
 
     // Verify all documents have embeddings
-    let result = db.query("MATCH (a:Article) RETURN count(a) AS cnt").await?;
+    let result = db
+        .session()
+        .query("MATCH (a:Article) RETURN count(a) AS cnt")
+        .await?;
     let count: i64 = result.rows()[0].get("cnt")?;
     assert_eq!(count, 5, "Expected 5 articles");
 
     // Verify embeddings were generated for all
     let result = db
+        .session()
         .query("MATCH (a:Article) WHERE a.embedding IS NOT NULL RETURN count(a) AS cnt")
         .await?;
     let emb_count: i64 = result.rows()[0].get("cnt")?;
@@ -175,15 +184,18 @@ mod mistralrs_tests {
             .await?;
 
         // Insert without providing an embedding — auto-embedding fills it in.
-        db.execute(
+        let tx = db.session().tx().await?;
+        tx.execute(
             r#"CREATE (:Document {content: "MistralRS EmbeddingGemma produces dense vectors."})"#,
         )
         .await?;
+        tx.commit().await?;
 
         db.flush().await?;
 
         // Embedding should have been generated and persisted.
         let result = db
+            .session()
             .query("MATCH (d:Document) WHERE d.embedding IS NOT NULL RETURN count(d) AS cnt")
             .await?;
         let emb_count: i64 = result.rows()[0].get("cnt")?;
@@ -226,16 +238,19 @@ mod mistralrs_tests {
 
         // Insert multiple articles — each triggers auto-embedding on write.
         for i in 1..=3_u32 {
-            db.execute(&format!(
+            let tx = db.session().tx().await?;
+            tx.execute(&format!(
                 r#"CREATE (:Article {{title: "Article {i}", body: "Body text for article number {i}."}})"#,
             ))
             .await?;
+            tx.commit().await?;
         }
 
         db.flush().await?;
 
         // All three articles should carry auto-generated embeddings.
         let result = db
+            .session()
             .query("MATCH (a:Article) WHERE a.embedding IS NOT NULL RETURN count(a) AS cnt")
             .await?;
         let emb_count: i64 = result.rows()[0].get("cnt")?;
@@ -245,15 +260,12 @@ mod mistralrs_tests {
         // Using 0.01 rather than 0.0 to avoid division-by-zero in cosine distance.
         let probe: Vec<f32> = vec![0.01; 768];
         let results = db
+            .session()
             .query_with("MATCH (a:Article) WHERE a.embedding ~= $q RETURN a.title LIMIT 1")
             .param("q", probe)
             .fetch_all()
             .await?;
-        assert_eq!(
-            results.rows.len(),
-            1,
-            "Vector search should return 1 result"
-        );
+        assert_eq!(results.len(), 1, "Vector search should return 1 result");
 
         Ok(())
     }
@@ -273,11 +285,13 @@ mod fastembed_tests {
         let db = Uni::temporary().build().await?;
 
         // 1. Create label with content property
-        db.execute("CREATE LABEL Document (content STRING)").await?;
-
         // 2. Create vector index with fastembed auto-embedding
         // BGESmallENV15 produces 384-dimensional embeddings
-        db.execute(
+        // 3. Insert a document - this triggers auto-embedding
+        // Without the stack overflow fix, this would crash
+        let tx = db.session().tx().await?;
+        tx.execute("CREATE LABEL Document (content STRING)").await?;
+        tx.execute(
             r#"
             CREATE VECTOR INDEX doc_embed_idx
             FOR (d:Document) ON (d.embedding)
@@ -292,17 +306,16 @@ mod fastembed_tests {
         "#,
         )
         .await?;
-
-        // 3. Insert a document - this triggers auto-embedding
-        // Without the stack overflow fix, this would crash
-        db.execute(r#"CREATE (:Document {content: "Test content for embedding generation."})"#)
+        tx.execute(r#"CREATE (:Document {content: "Test content for embedding generation."})"#)
             .await?;
+        tx.commit().await?;
 
         // 4. Flush to persist the data
         db.flush().await?;
 
         // 5. Verify the embedding was generated (reaching this point means no stack overflow)
         let result = db
+            .session()
             .query("MATCH (d:Document) RETURN count(d) AS cnt")
             .await?;
         let count: i64 = result.rows()[0].get("cnt")?;
@@ -310,6 +323,7 @@ mod fastembed_tests {
 
         // Verify embedding was stored
         let result = db
+            .session()
             .query("MATCH (d:Document) WHERE d.embedding IS NOT NULL RETURN count(d) AS cnt")
             .await?;
         let emb_count: i64 = result.rows()[0].get("cnt")?;
@@ -323,10 +337,10 @@ mod fastembed_tests {
     async fn test_fastembed_multiple_embeddings() -> Result<()> {
         let db = Uni::temporary().build().await?;
 
-        db.execute("CREATE LABEL Article (title STRING, body STRING)")
+        let tx = db.session().tx().await?;
+        tx.execute("CREATE LABEL Article (title STRING, body STRING)")
             .await?;
-
-        db.execute(
+        tx.execute(
             r#"
             CREATE VECTOR INDEX article_embed_idx
             FOR (a:Article) ON (a.embedding)
@@ -341,25 +355,32 @@ mod fastembed_tests {
         "#,
         )
         .await?;
+        tx.commit().await?;
 
         // Insert multiple documents
         for i in 1..=5 {
-            db.execute(&format!(
+            let tx = db.session().tx().await?;
+            tx.execute(&format!(
                 r#"CREATE (:Article {{title: "Article {}", body: "This is the body of article number {}."}})"#,
                 i, i
             ))
             .await?;
+            tx.commit().await?;
         }
 
         db.flush().await?;
 
         // Verify all documents have embeddings
-        let result = db.query("MATCH (a:Article) RETURN count(a) AS cnt").await?;
+        let result = db
+            .session()
+            .query("MATCH (a:Article) RETURN count(a) AS cnt")
+            .await?;
         let count: i64 = result.rows()[0].get("cnt")?;
         assert_eq!(count, 5, "Expected 5 articles");
 
         // Verify embeddings were generated for all
         let result = db
+            .session()
             .query("MATCH (a:Article) WHERE a.embedding IS NOT NULL RETURN count(a) AS cnt")
             .await?;
         let emb_count: i64 = result.rows()[0].get("cnt")?;

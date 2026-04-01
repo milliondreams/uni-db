@@ -20,15 +20,19 @@ async fn test_where_property_simple() -> Result<()> {
         .apply()
         .await?;
 
-    db.execute("CREATE (n:Person {name: 'Alice', age: 30})")
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE (n:Person {name: 'Alice', age: 30})")
         .await?;
-    db.execute("CREATE (n:Person {name: 'Bob', age: 25})")
+    tx.execute("CREATE (n:Person {name: 'Bob', age: 25})")
         .await?;
-    db.execute("CREATE (n:Person {name: 'Charlie', age: 35})")
+    tx.execute("CREATE (n:Person {name: 'Charlie', age: 35})")
         .await?;
+    tx.commit().await?;
 
     // Simple WHERE with greater than
     let result = db
+        .session()
         .query("MATCH (n:Person) WHERE n.age > 28 RETURN n.name ORDER BY n.name")
         .await?;
 
@@ -55,12 +59,16 @@ async fn test_where_equality() -> Result<()> {
         .apply()
         .await?;
 
-    db.execute("CREATE (n:Person {name: 'Alice', age: 30})")
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE (n:Person {name: 'Alice', age: 30})")
         .await?;
-    db.execute("CREATE (n:Person {name: 'Bob', age: 25})")
+    tx.execute("CREATE (n:Person {name: 'Bob', age: 25})")
         .await?;
+    tx.commit().await?;
 
     let result = db
+        .session()
         .query("MATCH (n:Person) WHERE n.age = 30 RETURN n.name")
         .await?;
 
@@ -82,10 +90,14 @@ async fn test_where_string_equality() -> Result<()> {
         .apply()
         .await?;
 
-    db.execute("CREATE (n:Person {name: 'Alice'})").await?;
-    db.execute("CREATE (n:Person {name: 'Bob'})").await?;
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE (n:Person {name: 'Alice'})").await?;
+    tx.execute("CREATE (n:Person {name: 'Bob'})").await?;
+    tx.commit().await?;
 
     let result = db
+        .session()
         .query("MATCH (n:Person) WHERE n.name = 'Alice' RETURN n.name")
         .await?;
 
@@ -108,14 +120,18 @@ async fn test_where_and_condition() -> Result<()> {
         .apply()
         .await?;
 
-    db.execute("CREATE (n:Person {name: 'Alice', age: 30})")
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE (n:Person {name: 'Alice', age: 30})")
         .await?;
-    db.execute("CREATE (n:Person {name: 'Bob', age: 30})")
+    tx.execute("CREATE (n:Person {name: 'Bob', age: 30})")
         .await?;
-    db.execute("CREATE (n:Person {name: 'Alice', age: 25})")
+    tx.execute("CREATE (n:Person {name: 'Alice', age: 25})")
         .await?;
+    tx.commit().await?;
 
     let result = db
+        .session()
         .query("MATCH (n:Person) WHERE n.name = 'Alice' AND n.age = 30 RETURN n")
         .await?;
 
@@ -137,13 +153,17 @@ async fn test_where_edge_property() -> Result<()> {
         .apply()
         .await?;
 
-    db.execute("CREATE (a:Person {name: 'Alice'})").await?;
-    db.execute("CREATE (b:Person {name: 'Bob'})").await?;
-    db.execute("CREATE (c:Person {name: 'Charlie'})").await?;
-    db.execute("MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) CREATE (a)-[:KNOWS {since: 2020}]->(b)").await?;
-    db.execute("MATCH (a:Person {name: 'Alice'}), (c:Person {name: 'Charlie'}) CREATE (a)-[:KNOWS {since: 2022}]->(c)").await?;
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE (a:Person {name: 'Alice'})").await?;
+    tx.execute("CREATE (b:Person {name: 'Bob'})").await?;
+    tx.execute("CREATE (c:Person {name: 'Charlie'})").await?;
+    tx.execute("MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) CREATE (a)-[:KNOWS {since: 2020}]->(b)").await?;
+    tx.execute("MATCH (a:Person {name: 'Alice'}), (c:Person {name: 'Charlie'}) CREATE (a)-[:KNOWS {since: 2022}]->(c)").await?;
+    tx.commit().await?;
 
     let result = db
+        .session()
         .query("MATCH (a:Person)-[r:KNOWS]->(b:Person) WHERE r.since = 2020 RETURN b.name")
         .await?;
 
@@ -166,14 +186,18 @@ async fn test_where_or_condition() -> Result<()> {
         .apply()
         .await?;
 
-    db.execute("CREATE (n:Person {name: 'Alice', age: 30})")
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE (n:Person {name: 'Alice', age: 30})")
         .await?;
-    db.execute("CREATE (n:Person {name: 'Bob', age: 25})")
+    tx.execute("CREATE (n:Person {name: 'Bob', age: 25})")
         .await?;
-    db.execute("CREATE (n:Person {name: 'Charlie', age: 35})")
+    tx.execute("CREATE (n:Person {name: 'Charlie', age: 35})")
         .await?;
+    tx.commit().await?;
 
     let result = db
+        .session()
         .query("MATCH (n:Person) WHERE n.age = 25 OR n.age = 35 RETURN n.name ORDER BY n.name")
         .await?;
 
@@ -198,14 +222,18 @@ async fn test_where_less_than() -> Result<()> {
         .apply()
         .await?;
 
-    db.execute("CREATE (n:Person {name: 'Alice', age: 30})")
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE (n:Person {name: 'Alice', age: 30})")
         .await?;
-    db.execute("CREATE (n:Person {name: 'Bob', age: 25})")
+    tx.execute("CREATE (n:Person {name: 'Bob', age: 25})")
         .await?;
-    db.execute("CREATE (n:Person {name: 'Charlie', age: 35})")
+    tx.execute("CREATE (n:Person {name: 'Charlie', age: 35})")
         .await?;
+    tx.commit().await?;
 
     let result = db
+        .session()
         .query("MATCH (n:Person) WHERE n.age < 30 RETURN n.name")
         .await?;
 
@@ -228,12 +256,16 @@ async fn test_where_not() -> Result<()> {
         .apply()
         .await?;
 
-    db.execute("CREATE (n:Person {name: 'Alice', age: 30})")
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE (n:Person {name: 'Alice', age: 30})")
         .await?;
-    db.execute("CREATE (n:Person {name: 'Bob', age: 25})")
+    tx.execute("CREATE (n:Person {name: 'Bob', age: 25})")
         .await?;
+    tx.commit().await?;
 
     let result = db
+        .session()
         .query("MATCH (n:Person) WHERE NOT n.age = 30 RETURN n.name")
         .await?;
 
@@ -255,12 +287,16 @@ async fn test_where_type_coercion() -> Result<()> {
         .apply()
         .await?;
 
-    db.execute("CREATE (n:Item {price: 10.5})").await?;
-    db.execute("CREATE (n:Item {price: 20.0})").await?;
-    db.execute("CREATE (n:Item {price: 5.5})").await?;
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE (n:Item {price: 10.5})").await?;
+    tx.execute("CREATE (n:Item {price: 20.0})").await?;
+    tx.execute("CREATE (n:Item {price: 5.5})").await?;
+    tx.commit().await?;
 
     // Compare float with integer literal
     let result = db
+        .session()
         .query("MATCH (n:Item) WHERE n.price > 10 RETURN n.price ORDER BY n.price")
         .await?;
 
@@ -287,15 +323,21 @@ async fn test_where_label_predicate() -> Result<()> {
         .await?;
 
     // Create: (:A {id: 0})<-[:ADMIN]-(:B {id: 1})-[:ADMIN]->(:C {id: 2, a: 'A'})
-    db.execute("CREATE (a:A {id: 0}), (b:B {id: 1}), (c:C {id: 2, a: 'A'})")
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE (a:A {id: 0}), (b:B {id: 1}), (c:C {id: 2, a: 'A'})")
         .await?;
-    db.execute("MATCH (a:A {id: 0}), (b:B {id: 1}) CREATE (b)-[:ADMIN]->(a)")
+    tx.execute("MATCH (a:A {id: 0}), (b:B {id: 1}) CREATE (b)-[:ADMIN]->(a)")
         .await?;
-    db.execute("MATCH (b:B {id: 1}), (c:C {id: 2}) CREATE (b)-[:ADMIN]->(c)")
+    tx.execute("MATCH (b:B {id: 1}), (c:C {id: 2}) CREATE (b)-[:ADMIN]->(c)")
         .await?;
+    tx.commit().await?;
 
     // First check: match all nodes without label predicate
-    let result_all = db.query("MATCH (n) RETURN n, labels(n) as lbls").await?;
+    let result_all = db
+        .session()
+        .query("MATCH (n) RETURN n, labels(n) as lbls")
+        .await?;
     eprintln!("All nodes ({}):", result_all.len());
     for row in result_all.rows() {
         let n_val = row.value("n");
@@ -304,7 +346,7 @@ async fn test_where_label_predicate() -> Result<()> {
     }
 
     // Second check: simple label predicate
-    let result = db.query("MATCH (n) WHERE n:A RETURN n").await?;
+    let result = db.session().query("MATCH (n) WHERE n:A RETURN n").await?;
     eprintln!("Nodes with label A: {}", result.len());
     for row in result.rows() {
         let n_val = row.value("n");
@@ -319,6 +361,7 @@ async fn test_where_label_predicate() -> Result<()> {
 
     // Test label predicate in WHERE with edge pattern
     let result = db
+        .session()
         .query("MATCH (a)-[:ADMIN]-(b) WHERE a:A RETURN a.id, b.id")
         .await?;
 
@@ -343,12 +386,16 @@ async fn test_where_is_null() -> Result<()> {
         .apply()
         .await?;
 
-    db.execute("CREATE (n:Person {name: 'Alice', age: 30})")
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE (n:Person {name: 'Alice', age: 30})")
         .await?;
-    db.execute("CREATE (n:Person {name: 'Bob'})").await?; // No age property
+    tx.execute("CREATE (n:Person {name: 'Bob'})").await?; // No age property
+    tx.commit().await?;
 
     // Match people where age is null
     let result = db
+        .session()
         .query("MATCH (n:Person) WHERE n.age IS NULL RETURN n.name")
         .await?;
 
@@ -371,12 +418,16 @@ async fn test_where_is_not_null() -> Result<()> {
         .apply()
         .await?;
 
-    db.execute("CREATE (n:Person {name: 'Alice', age: 30})")
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE (n:Person {name: 'Alice', age: 30})")
         .await?;
-    db.execute("CREATE (n:Person {name: 'Bob'})").await?; // No age property
+    tx.execute("CREATE (n:Person {name: 'Bob'})").await?; // No age property
+    tx.commit().await?;
 
     // Match people where age is not null
     let result = db
+        .session()
         .query("MATCH (n:Person) WHERE n.age IS NOT NULL RETURN n.name")
         .await?;
 
@@ -399,15 +450,19 @@ async fn test_where_undirected_edge() -> Result<()> {
         .apply()
         .await?;
 
-    db.execute("CREATE (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'})")
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'})")
         .await?;
-    db.execute(
+    tx.execute(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) CREATE (a)-[:KNOWS]->(b)",
     )
     .await?;
+    tx.commit().await?;
 
     // Undirected edge match
     let result = db
+        .session()
         .query("MATCH (a)-[:KNOWS]-(b) WHERE a.name = 'Alice' RETURN b.name")
         .await?;
 
@@ -434,13 +489,19 @@ async fn test_where_start_node_property() -> Result<()> {
     // TCK setup: CREATE (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}), (c), (d)
     //            CREATE (a)-[:T]->(c), (b)-[:T]->(d)
     // Use single CREATE with unique node IDs to avoid cross-product issues
-    db.execute("CREATE (a:Person {name: 'Alice'})-[:T]->(:Other)")
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE (a:Person {name: 'Alice'})-[:T]->(:Other)")
         .await?;
-    db.execute("CREATE (b:Person {name: 'Bob'})-[:T]->(:Other)")
+    tx.execute("CREATE (b:Person {name: 'Bob'})-[:T]->(:Other)")
         .await?;
+    tx.commit().await?;
 
     // First check what we have without WHERE
-    let all = db.query("MATCH (n:Person)-->() RETURN n.name").await?;
+    let all = db
+        .session()
+        .query("MATCH (n:Person)-->() RETURN n.name")
+        .await?;
     eprintln!("All Person nodes with outgoing edges: {} rows", all.len());
     for row in all.rows() {
         eprintln!("  n.name = {:?}", row.value("n.name"));
@@ -448,6 +509,7 @@ async fn test_where_start_node_property() -> Result<()> {
 
     // Now with WHERE
     let result = db
+        .session()
         .query("MATCH (n:Person)-->() WHERE n.name = 'Bob' RETURN n")
         .await?;
     eprintln!("After WHERE n.name = 'Bob': {} rows", result.len());
@@ -469,15 +531,20 @@ async fn test_where_start_node_schemaless() -> Result<()> {
 
     // Create nodes and edges in a way that works with our system
     // Since variables don't persist across statements, use MATCH to bind
-    db.execute("CREATE (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}), (c), (d)")
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}), (c), (d)")
         .await?;
-
     // Use MATCH to find the specific nodes by property
-    db.execute("MATCH (a:Person {name: 'Alice'}), (c) WHERE c.name IS NULL RETURN a, c LIMIT 1")
+    tx.execute("MATCH (a:Person {name: 'Alice'}), (c) WHERE c.name IS NULL RETURN a, c LIMIT 1")
         .await?;
+    tx.commit().await?;
 
     // Debug: Check what we created
-    let all_nodes = db.query("MATCH (n) RETURN n, labels(n) as lbls").await?;
+    let all_nodes = db
+        .session()
+        .query("MATCH (n) RETURN n, labels(n) as lbls")
+        .await?;
     eprintln!("All nodes ({}): ", all_nodes.len());
     for row in all_nodes.rows() {
         eprintln!("  n={:?}, labels={:?}", row.value("n"), row.value("lbls"));
@@ -485,32 +552,47 @@ async fn test_where_start_node_schemaless() -> Result<()> {
 
     // Try to create edges using MATCH
     // First, let's check if we can find unlabeled nodes
-    let unlabeled = db.query("MATCH (n) WHERE NOT n:Person RETURN n").await?;
+    let unlabeled = db
+        .session()
+        .query("MATCH (n) WHERE NOT n:Person RETURN n")
+        .await?;
     eprintln!("Unlabeled nodes ({}): ", unlabeled.len());
 
     // Since we can't easily reference unlabeled nodes, let's simplify:
     // Just create Person nodes with edges in one statement
     let db2 = Uni::in_memory().build().await?;
-    db2.execute("CREATE (a:Person {name: 'Alice'})-[:T]->(:Other)")
+    let session2 = db2.session();
+    let tx2 = session2.tx().await?;
+    tx2.execute("CREATE (a:Person {name: 'Alice'})-[:T]->(:Other)")
         .await?;
-    db2.execute("CREATE (b:Person {name: 'Bob'})-[:T]->(:Other)")
+    tx2.execute("CREATE (b:Person {name: 'Bob'})-[:T]->(:Other)")
         .await?;
+    tx2.commit().await?;
 
     // Debug: Check what we created
-    let all_nodes2 = db2.query("MATCH (n) RETURN n, labels(n) as lbls").await?;
+    let all_nodes2 = db2
+        .session()
+        .query("MATCH (n) RETURN n, labels(n) as lbls")
+        .await?;
     eprintln!("All nodes in db2 ({}): ", all_nodes2.len());
     for row in all_nodes2.rows() {
         eprintln!("  n={:?}, labels={:?}", row.value("n"), row.value("lbls"));
     }
 
-    let all_edges2 = db2.query("MATCH ()-[r]->() RETURN r, type(r) as t").await?;
+    let all_edges2 = db2
+        .session()
+        .query("MATCH ()-[r]->() RETURN r, type(r) as t")
+        .await?;
     eprintln!("All edges in db2 ({}): ", all_edges2.len());
     for row in all_edges2.rows() {
         eprintln!("  r={:?}, type={:?}", row.value("r"), row.value("t"));
     }
 
     // Check Person nodes with outgoing edges
-    let with_edges2 = db2.query("MATCH (n:Person)-->() RETURN n.name").await?;
+    let with_edges2 = db2
+        .session()
+        .query("MATCH (n:Person)-->() RETURN n.name")
+        .await?;
     eprintln!(
         "Person nodes with outgoing edges in db2 ({}): ",
         with_edges2.len()
@@ -521,6 +603,7 @@ async fn test_where_start_node_schemaless() -> Result<()> {
 
     // The actual query on db2
     let result = db2
+        .session()
         .query("MATCH (n:Person)-->() WHERE n.name = 'Bob' RETURN n")
         .await?;
     eprintln!("After WHERE n.name = 'Bob': {} rows", result.len());
@@ -540,12 +623,19 @@ async fn test_schemaless_edge_basic() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
     // Step 1: Try creating a node first
-    db.execute("CREATE (:Test {name: 'foo'})").await?;
-    let nodes = db.query("MATCH (n) RETURN n").await?;
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE (:Test {name: 'foo'})").await?;
+    tx.commit().await?;
+    let nodes = db.session().query("MATCH (n) RETURN n").await?;
     eprintln!("After CREATE (:Test): {} nodes", nodes.len());
 
     // Step 2: Try creating edge with inline node
-    let create_result = db.execute("CREATE (:A)-[:REL]->(:B)").await;
+    let tx2 = session.tx().await?;
+    let create_result = tx2.execute("CREATE (:A)-[:REL]->(:B)").await;
+    if create_result.is_ok() {
+        tx2.commit().await?;
+    }
     match &create_result {
         Ok(_) => eprintln!("CREATE (:A)-[:REL]->(:B) succeeded"),
         Err(e) => eprintln!("CREATE (:A)-[:REL]->(:B) FAILED: {:?}", e),
@@ -553,13 +643,19 @@ async fn test_schemaless_edge_basic() -> Result<()> {
     create_result?;
 
     // Check what was created
-    let nodes2 = db.query("MATCH (n) RETURN n, labels(n) as l").await?;
+    let nodes2 = db
+        .session()
+        .query("MATCH (n) RETURN n, labels(n) as l")
+        .await?;
     eprintln!("After CREATE (:A)-[:REL]->(:B): {} nodes", nodes2.len());
     for row in nodes2.rows() {
         eprintln!("  node: {:?}, labels: {:?}", row.value("n"), row.value("l"));
     }
 
-    let edges = db.query("MATCH ()-[r]->() RETURN r, type(r) as t").await?;
+    let edges = db
+        .session()
+        .query("MATCH ()-[r]->() RETURN r, type(r) as t")
+        .await?;
     eprintln!("Edges: {} rows", edges.len());
     for row in edges.rows() {
         eprintln!("  edge: {:?}, type: {:?}", row.value("r"), row.value("t"));
@@ -589,15 +685,19 @@ async fn test_where_type_predicate() -> Result<()> {
         .await?;
 
     // Setup
-    db.execute("CREATE (a:A {name: 'A'}), (b:B {name: 'B'}), (c:C {name: 'C'})")
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE (a:A {name: 'A'}), (b:B {name: 'B'}), (c:C {name: 'C'})")
         .await?;
-    db.execute("MATCH (a:A), (b:B) CREATE (a)-[:KNOWS]->(b)")
+    tx.execute("MATCH (a:A), (b:B) CREATE (a)-[:KNOWS]->(b)")
         .await?;
-    db.execute("MATCH (a:A), (c:C) CREATE (a)-[:HATES]->(c)")
+    tx.execute("MATCH (a:A), (c:C) CREATE (a)-[:HATES]->(c)")
         .await?;
+    tx.commit().await?;
 
     // Debug: all edges
     let all_edges = db
+        .session()
         .query("MATCH (n {name: 'A'})-[r]->(x) RETURN type(r) as t, x.name")
         .await?;
     eprintln!("All edges from A ({}): ", all_edges.len());
@@ -611,6 +711,7 @@ async fn test_where_type_predicate() -> Result<()> {
 
     // Filter by type
     let result = db
+        .session()
         .query("MATCH (n {name: 'A'})-[r]->(x) WHERE type(r) = 'KNOWS' RETURN x")
         .await?;
     eprintln!("After WHERE type(r) = 'KNOWS': {} rows", result.len());
@@ -636,13 +737,17 @@ async fn test_where_edge_property_predicate() -> Result<()> {
 
     // Setup: (:A)<-[:KNOWS {name: 'monkey'}]-(:X)-[:KNOWS {name: 'woot'}]->(:B)
     // Use single CREATE with inline edges to ensure correct structure
-    db.execute("CREATE (:X)-[:KNOWS {name: 'monkey'}]->(:A)")
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE (:X)-[:KNOWS {name: 'monkey'}]->(:A)")
         .await?;
-    db.execute("MATCH (x:X) CREATE (x)-[:KNOWS {name: 'woot'}]->(:B)")
+    tx.execute("MATCH (x:X) CREATE (x)-[:KNOWS {name: 'woot'}]->(:B)")
         .await?;
+    tx.commit().await?;
 
     // Debug: all edges
     let all_edges = db
+        .session()
         .query("MATCH (node)-[r:KNOWS]->(a) RETURN r.name, labels(a) as lbls")
         .await?;
     eprintln!("All KNOWS edges ({}): ", all_edges.len());
@@ -656,6 +761,7 @@ async fn test_where_edge_property_predicate() -> Result<()> {
 
     // Filter by edge property
     let result = db
+        .session()
         .query("MATCH (node)-[r:KNOWS]->(a) WHERE r.name = 'monkey' RETURN a")
         .await?;
     eprintln!("After WHERE r.name = 'monkey': {} rows", result.len());
@@ -688,16 +794,22 @@ async fn test_matchwhere5_filter_on_null() -> Result<()> {
     //        (child2:IntNode {var: 0})
     // CREATE (root)-[:T]->(child1),
     //        (root)-[:T]->(child2)
-    db.execute("CREATE (r:Root {name: 'x'})").await?;
-    db.execute("CREATE (t:TextNode {var: 'text'})").await?;
-    db.execute("CREATE (i:IntNode {var: 0})").await?;
-    db.execute("MATCH (r:Root), (t:TextNode) CREATE (r)-[:T]->(t)")
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE (r:Root {name: 'x'})").await?;
+    tx.execute("CREATE (t:TextNode {var: 'text'})").await?;
+    tx.execute("CREATE (i:IntNode {var: 0})").await?;
+    tx.execute("MATCH (r:Root), (t:TextNode) CREATE (r)-[:T]->(t)")
         .await?;
-    db.execute("MATCH (r:Root), (i:IntNode) CREATE (r)-[:T]->(i)")
+    tx.execute("MATCH (r:Root), (i:IntNode) CREATE (r)-[:T]->(i)")
         .await?;
+    tx.commit().await?;
 
     // Debug: Check all nodes
-    let all_nodes = db.query("MATCH (n) RETURN labels(n) as lbls, n").await?;
+    let all_nodes = db
+        .session()
+        .query("MATCH (n) RETURN labels(n) as lbls, n")
+        .await?;
     eprintln!("All nodes ({}):", all_nodes.len());
     for row in all_nodes.rows() {
         eprintln!("  labels={:?}, n={:?}", row.value("lbls"), row.value("n"));
@@ -705,6 +817,7 @@ async fn test_matchwhere5_filter_on_null() -> Result<()> {
 
     // Debug: Check all edges from Root
     let all_edges = db
+        .session()
         .query("MATCH (:Root {name: 'x'})-->(n) RETURN labels(n) as lbls, n")
         .await?;
     eprintln!("All edges from Root ({}):", all_edges.len());
@@ -714,6 +827,7 @@ async fn test_matchwhere5_filter_on_null() -> Result<()> {
 
     // Debug: Check TextNode traversal specifically
     let text_edges = db
+        .session()
         .query("MATCH (:Root {name: 'x'})-->(i:TextNode) RETURN i")
         .await?;
     eprintln!("TextNode edges from Root ({}):", text_edges.len());
@@ -725,6 +839,7 @@ async fn test_matchwhere5_filter_on_null() -> Result<()> {
     // For TextNode: 'text' > 'te' = true → include
     // For IntNode: 0 > 'te' = NULL → filter out
     let result = db
+        .session()
         .query("MATCH (:Root {name: 'x'})-->(i:TextNode) WHERE i.var > 'te' RETURN i")
         .await?;
     eprintln!("After WHERE i.var > 'te' ({}):", result.len());
@@ -744,10 +859,14 @@ async fn test_labels_function_schemaless() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
     // Create schemaless nodes with labels
-    db.execute("CREATE (a:MyLabel {name: 'test'})").await?;
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE (a:MyLabel {name: 'test'})").await?;
+    tx.commit().await?;
 
     // Check labels function
     let result = db
+        .session()
         .query("MATCH (n:MyLabel) RETURN n, labels(n) as lbls")
         .await?;
     eprintln!("labels() result ({}):", result.len());
@@ -772,11 +891,15 @@ async fn test_labels_after_traverse_schemaless() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
     // Create schemaless nodes and edge
-    db.execute("CREATE (:Root {name: 'x'})-[:CONNECTS]->(:Target {val: 1})")
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE (:Root {name: 'x'})-[:CONNECTS]->(:Target {val: 1})")
         .await?;
+    tx.commit().await?;
 
     // Check source node labels
     let source = db
+        .session()
         .query("MATCH (n:Root) RETURN n, labels(n) as lbls")
         .await?;
     eprintln!("Source node ({}):", source.len());
@@ -786,6 +909,7 @@ async fn test_labels_after_traverse_schemaless() -> Result<()> {
 
     // Check target node labels after traversal
     let target = db
+        .session()
         .query("MATCH (:Root)-->(t) RETURN t, labels(t) as lbls")
         .await?;
     eprintln!("Target node after traverse ({}):", target.len());
@@ -819,24 +943,33 @@ async fn test_matchwhere5_schemaless() -> Result<()> {
     //        (root)-[:T]->(child2)
 
     // Split into separate CREATE statements for debug
-    db.execute("CREATE (root:Root {name: 'x'}), (child1:TextNode {var: 'text'}), (child2:IntNode {var: 0})").await?;
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE (root:Root {name: 'x'}), (child1:TextNode {var: 'text'}), (child2:IntNode {var: 0})").await?;
+    tx.commit().await?;
 
     // Debug: Check nodes
-    let all_nodes = db.query("MATCH (n) RETURN labels(n) as lbls, n").await?;
+    let all_nodes = db
+        .session()
+        .query("MATCH (n) RETURN labels(n) as lbls, n")
+        .await?;
     eprintln!("After CREATE nodes - All nodes ({}):", all_nodes.len());
     for row in all_nodes.rows() {
         eprintln!("  labels={:?}, n={:?}", row.value("lbls"), row.value("n"));
     }
 
     // Create edges using MATCH
-    db.execute("MATCH (root:Root {name: 'x'}), (child1:TextNode {var: 'text'}) CREATE (root)-[:T]->(child1)").await?;
-    db.execute(
+    let tx2 = session.tx().await?;
+    tx2.execute("MATCH (root:Root {name: 'x'}), (child1:TextNode {var: 'text'}) CREATE (root)-[:T]->(child1)").await?;
+    tx2.execute(
         "MATCH (root:Root {name: 'x'}), (child2:IntNode {var: 0}) CREATE (root)-[:T]->(child2)",
     )
     .await?;
+    tx2.commit().await?;
 
     // Debug: Check all edges from Root
     let all_edges = db
+        .session()
         .query("MATCH (:Root {name: 'x'})-->(n) RETURN labels(n) as lbls, n.var")
         .await?;
     eprintln!("All edges from Root ({}):", all_edges.len());
@@ -850,6 +983,7 @@ async fn test_matchwhere5_schemaless() -> Result<()> {
 
     // Debug: Check TextNode traversal specifically
     let text_edges = db
+        .session()
         .query("MATCH (:Root {name: 'x'})-->(i:TextNode) RETURN i.var")
         .await?;
     eprintln!("TextNode edges from Root ({}):", text_edges.len());
@@ -859,6 +993,7 @@ async fn test_matchwhere5_schemaless() -> Result<()> {
 
     // The actual TCK query
     let result = db
+        .session()
         .query("MATCH (:Root {name: 'x'})-->(i:TextNode) WHERE i.var > 'te' RETURN i")
         .await?;
     eprintln!("After WHERE i.var > 'te' ({}):", result.len());
@@ -880,19 +1015,23 @@ async fn test_optional_match_where_false_label() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
     // Create the graph in schemaless mode
-    db.execute("CREATE (s:Single), (a:A {num: 42}), (b:B {num: 46}), (c:C)")
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE (s:Single), (a:A {num: 42}), (b:B {num: 46}), (c:C)")
         .await?;
-    db.execute("MATCH (s:Single), (a:A {num: 42}) CREATE (s)-[:REL]->(a)")
+    tx.execute("MATCH (s:Single), (a:A {num: 42}) CREATE (s)-[:REL]->(a)")
         .await?;
-    db.execute("MATCH (s:Single), (b:B {num: 46}) CREATE (s)-[:REL]->(b)")
+    tx.execute("MATCH (s:Single), (b:B {num: 46}) CREATE (s)-[:REL]->(b)")
         .await?;
-    db.execute("MATCH (a:A {num: 42}), (c:C) CREATE (a)-[:REL]->(c)")
+    tx.execute("MATCH (a:A {num: 42}), (c:C) CREATE (a)-[:REL]->(c)")
         .await?;
-    db.execute("MATCH (b:B {num: 46}) CREATE (b)-[:LOOP]->(b)")
+    tx.execute("MATCH (b:B {num: 46}) CREATE (b)-[:LOOP]->(b)")
         .await?;
+    tx.commit().await?;
 
     // Debug: Check what relationships exist
     let all_rels = db
+        .session()
         .query("MATCH (n:Single)-[r]-(m) RETURN labels(m) as lbls, r")
         .await?;
     eprintln!("Single's relationships ({}):", all_rels.len());
@@ -903,6 +1042,7 @@ async fn test_optional_match_where_false_label() -> Result<()> {
     // The TCK query: OPTIONAL MATCH with WHERE that filters everything out
     // Expected: 1 row with r=null (because m:NonExistent matches nothing)
     let result = db
+        .session()
         .query("MATCH (n:Single) OPTIONAL MATCH (n)-[r]-(m) WHERE m:NonExistent RETURN r")
         .await?;
     eprintln!("OPTIONAL MATCH result ({} rows):", result.len());
@@ -932,14 +1072,20 @@ async fn test_optional_match_non_equality_join() -> Result<()> {
     // (:X {val: 1})-[:E1]->(:Y {val: 2})-[:E2]->(:Z {val: 3}),
     // (:X {val: 4})-[:E1]->(:Y {val: 5}),
     // (:X {val: 6})
-    db.execute("CREATE (:X {val: 1})-[:E1]->(:Y {val: 2})-[:E2]->(:Z {val: 3})")
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE (:X {val: 1})-[:E1]->(:Y {val: 2})-[:E2]->(:Z {val: 3})")
         .await?;
-    db.execute("CREATE (:X {val: 4})-[:E1]->(:Y {val: 5})")
+    tx.execute("CREATE (:X {val: 4})-[:E1]->(:Y {val: 5})")
         .await?;
-    db.execute("CREATE (:X {val: 6})").await?;
+    tx.execute("CREATE (:X {val: 6})").await?;
+    tx.commit().await?;
 
     // Debug: Check all X nodes
-    let x_nodes = db.query("MATCH (x:X) RETURN x.val ORDER BY x.val").await?;
+    let x_nodes = db
+        .session()
+        .query("MATCH (x:X) RETURN x.val ORDER BY x.val")
+        .await?;
     eprintln!("X nodes ({}):", x_nodes.len());
     for row in x_nodes.rows() {
         eprintln!("  x.val={:?}", row.value("x.val"));
@@ -948,6 +1094,7 @@ async fn test_optional_match_non_equality_join() -> Result<()> {
 
     // Debug: Check E1 edges from each X
     let e1_edges = db
+        .session()
         .query("MATCH (x:X)-[:E1]->(y:Y) RETURN x.val, y.val ORDER BY x.val")
         .await?;
     eprintln!("E1 edges ({}):", e1_edges.len());
@@ -961,6 +1108,7 @@ async fn test_optional_match_non_equality_join() -> Result<()> {
 
     // Debug: Check OPTIONAL MATCH without WHERE
     let opt_no_where = db
+        .session()
         .query("MATCH (x:X) OPTIONAL MATCH (x)-[:E1]->(y:Y) RETURN x.val, y.val ORDER BY x.val")
         .await?;
     eprintln!("OPTIONAL MATCH without WHERE ({}):", opt_no_where.len());
@@ -978,7 +1126,7 @@ async fn test_optional_match_non_equality_join() -> Result<()> {
     );
 
     // The actual TCK query
-    let result = db.query("MATCH (x:X) OPTIONAL MATCH (x)-[:E1]->(y:Y) WHERE x.val < y.val RETURN x.val, y.val ORDER BY x.val").await?;
+    let result = db.session().query("MATCH (x:X) OPTIONAL MATCH (x)-[:E1]->(y:Y) WHERE x.val < y.val RETURN x.val, y.val ORDER BY x.val").await?;
     eprintln!("OPTIONAL MATCH with WHERE ({}):", result.len());
     for row in result.rows() {
         eprintln!(
@@ -1007,20 +1155,27 @@ async fn test_optional_match_multi_hop() -> Result<()> {
     // (:X {val: 1})-[:E1]->(:Y {val: 2})-[:E2]->(:Z {val: 3}),
     // (:X {val: 4})-[:E1]->(:Y {val: 5}),  <- Y has no E2 edge!
     // (:X {val: 6})
-    db.execute("CREATE (:X {val: 1})-[:E1]->(:Y {val: 2})-[:E2]->(:Z {val: 3})")
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE (:X {val: 1})-[:E1]->(:Y {val: 2})-[:E2]->(:Z {val: 3})")
         .await?;
-    db.execute("CREATE (:X {val: 4})-[:E1]->(:Y {val: 5})")
+    tx.execute("CREATE (:X {val: 4})-[:E1]->(:Y {val: 5})")
         .await?;
-    db.execute("CREATE (:X {val: 6})").await?;
+    tx.execute("CREATE (:X {val: 6})").await?;
+    tx.commit().await?;
 
     // Debug: Check the graph structure
-    let x_nodes = db.query("MATCH (x:X) RETURN x.val ORDER BY x.val").await?;
+    let x_nodes = db
+        .session()
+        .query("MATCH (x:X) RETURN x.val ORDER BY x.val")
+        .await?;
     eprintln!("X nodes ({}):", x_nodes.len());
     for row in x_nodes.rows() {
         eprintln!("  x.val={:?}", row.value("x.val"));
     }
 
     let e1_edges = db
+        .session()
         .query("MATCH (x:X)-[:E1]->(y:Y) RETURN x.val, y.val ORDER BY x.val")
         .await?;
     eprintln!("E1 edges ({}):", e1_edges.len());
@@ -1033,6 +1188,7 @@ async fn test_optional_match_multi_hop() -> Result<()> {
     }
 
     let e2_edges = db
+        .session()
         .query("MATCH (y:Y)-[:E2]->(z:Z) RETURN y.val, z.val")
         .await?;
     eprintln!("E2 edges ({}):", e2_edges.len());
@@ -1045,7 +1201,7 @@ async fn test_optional_match_multi_hop() -> Result<()> {
     }
 
     // The actual TCK query - multi-hop OPTIONAL MATCH
-    let result = db.query("MATCH (x:X) OPTIONAL MATCH (x)-[:E1]->(y:Y)-[:E2]->(z:Z) WHERE x.val < z.val RETURN x.val, y.val, z.val ORDER BY x.val").await?;
+    let result = db.session().query("MATCH (x:X) OPTIONAL MATCH (x)-[:E1]->(y:Y)-[:E2]->(z:Z) WHERE x.val < z.val RETURN x.val, y.val, z.val ORDER BY x.val").await?;
     eprintln!("Multi-hop OPTIONAL MATCH result ({}):", result.len());
     for row in result.rows() {
         eprintln!(
@@ -1087,11 +1243,15 @@ async fn test_where_parameter_filter_return_edge() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
     // Setup: CREATE (:A)-[:T {name: 'bar'}]->(:B {name: 'me'})
-    db.execute("CREATE (:A)-[:T {name: 'bar'}]->(:B {name: 'me'})")
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE (:A)-[:T {name: 'bar'}]->(:B {name: 'me'})")
         .await?;
+    tx.commit().await?;
 
     // Debug: Check the graph
     let edges = db
+        .session()
         .query("MATCH (a)-[r]->(b) RETURN a, r, b, r.name as r_name, b.name as b_name")
         .await?;
     eprintln!("All edges ({}):", edges.len());
@@ -1108,6 +1268,7 @@ async fn test_where_parameter_filter_return_edge() -> Result<()> {
 
     // Step 1: Query without parameter (hardcoded filter)
     let result_hardcoded = db
+        .session()
         .query("MATCH (a)-[r]->(b) WHERE b.name = 'me' RETURN r")
         .await?;
     eprintln!("Hardcoded filter result ({}):", result_hardcoded.len());
@@ -1117,6 +1278,7 @@ async fn test_where_parameter_filter_return_edge() -> Result<()> {
 
     // Step 2: Query with parameter
     let result = db
+        .session()
         .query_with("MATCH (a)-[r]->(b) WHERE b.name = $param RETURN r")
         .param("param", "me")
         .fetch_all()
@@ -1142,9 +1304,13 @@ async fn test_where_parameter_filter_return_edge() -> Result<()> {
 async fn test_optional_match_reused_relationship() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
-    db.execute("CREATE (:A)-[:T]->(:B)").await?;
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE (:A)-[:T]->(:B)").await?;
+    tx.commit().await?;
 
     let result = db
+        .session()
         .query(
             "
         MATCH (a1)-[r]->()

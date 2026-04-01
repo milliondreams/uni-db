@@ -17,8 +17,9 @@ Uni includes a built-in graph algorithm library exposed through Cypher procedure
 
     # async fn demo() -> Result<(), uni_db::UniError> {
     let db = Uni::open("./my_db").build().await?;
+    let session = db.session();
 
-    let rows = db.query(
+    let rows = session.query(
         "CALL uni.algo.pageRank() YIELD nodeId, score RETURN nodeId, score ORDER BY score DESC LIMIT 10"
     ).await?;
 
@@ -31,8 +32,9 @@ Uni includes a built-in graph algorithm library exposed through Cypher procedure
     ```python
     import uni_db
 
-    db = uni_db.Database("./my_db")
-    rows = db.query(
+    db = uni_db.Uni.open("./my_db")
+    session = db.session()
+    rows = session.query(
         "CALL uni.algo.pageRank() YIELD nodeId, score RETURN nodeId, score ORDER BY score DESC LIMIT 10"
     )
     print(rows)

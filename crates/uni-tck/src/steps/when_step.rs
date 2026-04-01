@@ -12,7 +12,8 @@ async fn executing_query(world: &mut UniWorld, step: &cucumber::gherkin::Step) {
     }
 
     // Build query with parameters if any are set
-    let mut query_builder = world.db().query_with(query);
+    let session = world.db().session();
+    let mut query_builder = session.query_with(query);
     for (key, value) in world.params() {
         query_builder = query_builder.param(key, value.clone());
     }
@@ -39,7 +40,8 @@ async fn executing_control_query(world: &mut UniWorld, step: &cucumber::gherkin:
     }
 
     // Build query with parameters if any are set
-    let mut query_builder = world.db().query_with(query);
+    let session = world.db().session();
+    let mut query_builder = session.query_with(query);
     for (key, value) in world.params() {
         query_builder = query_builder.param(key, value.clone());
     }
@@ -66,7 +68,8 @@ async fn executing_query_with_params(world: &mut UniWorld, step: &cucumber::gher
     }
 
     // Build query with parameters
-    let mut query_builder = world.db().query_with(query);
+    let session = world.db().session();
+    let mut query_builder = session.query_with(query);
     for (key, value) in world.params() {
         query_builder = query_builder.param(key, value.clone());
     }

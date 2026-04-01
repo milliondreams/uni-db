@@ -18,8 +18,9 @@ Uni uses OpenCypher as its primary query language, with extensions for vector se
 
     # async fn demo() -> Result<(), uni_db::UniError> {
     let db = Uni::open("./my_db").build().await?;
+    let session = db.session();
 
-    let results = db
+    let results = session
         .query_with("MATCH (p:Person) WHERE p.age > $min RETURN p.name")
         .param("min", 30)
         .fetch_all()
@@ -34,8 +35,9 @@ Uni uses OpenCypher as its primary query language, with extensions for vector se
     ```python
     import uni_db
 
-    db = uni_db.Database("./my_db")
-    results = db.query_with(
+    db = uni_db.Uni.open("./my_db")
+    session = db.session()
+    results = session.query_with(
         "MATCH (p:Person) WHERE p.age > $min RETURN p.name"
     ).param("min", 30).fetch_all()
 

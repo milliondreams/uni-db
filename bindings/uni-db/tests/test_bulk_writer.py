@@ -17,23 +17,34 @@ class TestBulkWriter:
     def db(self):
         """Create a database with schema for bulk loading."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            db = uni_db.DatabaseBuilder.open(tmpdir).build()
-            db.create_label("Person")
-            db.add_property("Person", "name", "string", False)
-            db.add_property("Person", "age", "int", False)
-            db.create_label("Company")
-            db.add_property("Company", "name", "string", False)
-            db.create_edge_type("WORKS_AT", ["Person"], ["Company"])
+            db = uni_db.UniBuilder.open(tmpdir).build()
+            (
+                db.schema()
+                .label("Person")
+                .property("name", "string")
+                .property("age", "int")
+                .done()
+                .label("Company")
+                .property("name", "string")
+                .done()
+                .edge_type("WORKS_AT", ["Person"], ["Company"])
+                .done()
+                .apply()
+            )
             yield db
 
     def test_bulk_writer_builder(self, db):
         """Test creating a bulk writer with builder."""
-        writer = db.bulk_writer().batch_size(1000).build()
+        session = db.session()
+        tx = session.tx()
+        writer = tx.bulk_writer().batch_size(1000).build()
         assert writer is not None
 
     def test_bulk_insert_vertices(self, db):
         """Test bulk inserting vertices."""
-        writer = db.bulk_writer().build()
+        session = db.session()
+        tx = session.tx()
+        writer = tx.bulk_writer().build()
 
         # Insert multiple vertices
         vids = writer.insert_vertices(
@@ -47,15 +58,20 @@ class TestBulkWriter:
 
         assert len(vids) == 3
         writer.commit()
+        tx.commit()
 
         # Verify vertices were inserted
-        results = db.query("MATCH (n:Person) RETURN n.name AS name ORDER BY n.name")
+        results = session.query(
+            "MATCH (n:Person) RETURN n.name AS name ORDER BY n.name"
+        )
         assert len(results) == 3
         assert results[0]["name"] == "Alice"
 
     def test_bulk_insert_edges(self, db):
         """Test bulk inserting edges."""
-        writer = db.bulk_writer().build()
+        session = db.session()
+        tx = session.tx()
+        writer = tx.bulk_writer().build()
 
         # First insert vertices
         person_vids = writer.insert_vertices(
@@ -74,16 +90,19 @@ class TestBulkWriter:
         )
 
         writer.commit()
+        tx.commit()
 
         # Verify edges
-        results = db.query(
+        results = session.query(
             "MATCH (p:Person)-[:WORKS_AT]->(c:Company) RETURN p.name AS p_name, c.name AS c_name"
         )
         assert len(results) == 2
 
     def test_bulk_writer_abort(self, db):
         """Test aborting a bulk write operation prevents further operations."""
-        writer = db.bulk_writer().build()
+        session = db.session()
+        tx = session.tx()
+        writer = tx.bulk_writer().build()
 
         writer.insert_vertices(
             "Person",
@@ -91,6 +110,7 @@ class TestBulkWriter:
         )
 
         writer.abort()
+        tx.rollback()
 
         # After abort, further operations should fail
         with pytest.raises(RuntimeError):
@@ -98,8 +118,10 @@ class TestBulkWriter:
 
     def test_bulk_writer_deferred_indexes(self, db):
         """Test bulk writer with deferred index building."""
+        session = db.session()
+        tx = session.tx()
         writer = (
-            db.bulk_writer()
+            tx.bulk_writer()
             .defer_scalar_indexes(True)
             .defer_vector_indexes(True)
             .build()
@@ -111,6 +133,7 @@ class TestBulkWriter:
         )
 
         stats = writer.commit()
+        tx.commit()
         assert stats.vertices_inserted == 100
 
 
@@ -120,12 +143,15 @@ class TestBulkStats:
     def test_bulk_stats_attributes(self):
         """Test BulkStats has expected attributes."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            db = uni_db.DatabaseBuilder.open(tmpdir).build()
-            db.create_label("Test")
+            db = uni_db.UniBuilder.open(tmpdir).build()
+            db.schema().label("Test").apply()
 
-            writer = db.bulk_writer().build()
+            session = db.session()
+            tx = session.tx()
+            writer = tx.bulk_writer().build()
             writer.insert_vertices("Test", [{"value": 1}])
             stats = writer.commit()
+            tx.commit()
 
             assert hasattr(stats, "vertices_inserted")
             assert hasattr(stats, "edges_inserted")

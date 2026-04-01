@@ -6,15 +6,17 @@ async fn test_vlp_simple() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
     // Create simple chain: A -> B
-    db.execute("CREATE (a:A)-[:REL]->(b:B)").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (a:A)-[:REL]->(b:B)").await?;
+    tx.commit().await?;
 
     // First verify we have 2 nodes
-    let all_nodes = db.query("MATCH (n) RETURN n").await?;
+    let all_nodes = db.session().query("MATCH (n) RETURN n").await?;
     println!("Total nodes: {}", all_nodes.len());
     assert_eq!(all_nodes.len(), 2, "Should have 2 nodes");
 
     // Test cartesian product
-    let cartesian = db.query("MATCH (n), (m) RETURN n, m").await?;
+    let cartesian = db.session().query("MATCH (n), (m) RETURN n, m").await?;
     println!("Cartesian product: {}", cartesian.len());
     for (i, row) in cartesian.iter().enumerate() {
         println!("Row {}: {:?}", i, row);
@@ -23,6 +25,7 @@ async fn test_vlp_simple() -> Result<()> {
 
     // Test single-hop pattern predicate (this works)
     let single_hop = db
+        .session()
         .query("MATCH (n), (m) WHERE (n)-[:REL]->(m) RETURN n, m")
         .await?;
     println!("Single-hop pattern predicate: {}", single_hop.len());
@@ -33,6 +36,7 @@ async fn test_vlp_simple() -> Result<()> {
 
     // Test VLP pattern predicate (this fails)
     let vlp = db
+        .session()
         .query("MATCH (n), (m) WHERE (n)-[:REL*1..1]->(m) RETURN n, m")
         .await?;
     println!("VLP pattern predicate: {}", vlp.len());

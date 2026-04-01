@@ -5,14 +5,16 @@ use uni_query::Value;
 async fn test_labels_function() {
     let db = Uni::in_memory().build().await.unwrap();
 
-    db.query("CREATE (:Person:Student {name: 'Alice'})")
+    db.session()
+        .query("CREATE (:Person:Student {name: 'Alice'})")
         .await
         .unwrap();
     let result = db
+        .session()
         .query("MATCH (n:Person) RETURN labels(n) AS l")
         .await
         .unwrap();
-    let val = result.rows[0].value("l").unwrap();
+    let val = result.rows()[0].value("l").unwrap();
     println!("Labels: {:?}", val);
 
     if let Value::List(l) = val {
@@ -28,18 +30,20 @@ async fn test_labels_function() {
 async fn test_path_functions() {
     let db = Uni::in_memory().build().await.unwrap();
 
-    db.query("CREATE (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'})")
+    db.session()
+        .query("CREATE (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'})")
         .await
         .unwrap();
     let result = db
+        .session()
         .query(
             "MATCH p = (a:Person)-[:KNOWS]->(b:Person) RETURN nodes(p) AS n, relationships(p) AS r",
         )
         .await
         .unwrap();
 
-    let nodes = result.rows[0].value("n").unwrap();
-    let rels = result.rows[0].value("r").unwrap();
+    let nodes = result.rows()[0].value("n").unwrap();
+    let rels = result.rows()[0].value("r").unwrap();
 
     // nodes(p) should return a list of Node objects
     if let Value::List(l) = nodes {

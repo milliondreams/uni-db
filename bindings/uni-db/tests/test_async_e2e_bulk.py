@@ -9,18 +9,21 @@ import pytest
 @pytest.mark.asyncio
 async def test_create_bulk_writer_with_builder(async_social_db):
     """Test creating bulk writer using builder pattern."""
-
-    writer = async_social_db.bulk_writer().build()
+    session = async_social_db.session()
+    tx = await session.tx()
+    writer = await tx.bulk_writer().build()
     assert writer is not None
 
     writer.abort()
+    await tx.rollback()
 
 
 @pytest.mark.asyncio
 async def test_bulk_insert_vertices(async_social_db):
     """Test bulk insertion of vertices."""
-
-    writer = async_social_db.bulk_writer().build()
+    session = async_social_db.session()
+    tx = await session.tx()
+    writer = await tx.bulk_writer().build()
 
     vertices = [
         {"name": "Alice", "age": 30},
@@ -30,13 +33,12 @@ async def test_bulk_insert_vertices(async_social_db):
 
     vids = await writer.insert_vertices("Person", vertices)
     await writer.commit()
+    await tx.commit()
 
     assert len(vids) == 3
     assert all(isinstance(vid, int) for vid in vids)
 
-    result = await async_social_db.query(
-        "MATCH (p:Person) RETURN p.name ORDER BY p.name"
-    )
+    result = await session.query("MATCH (p:Person) RETURN p.name ORDER BY p.name")
     assert len(result) == 3
     assert result[0]["p.name"] == "Alice"
     assert result[1]["p.name"] == "Bob"
@@ -46,8 +48,9 @@ async def test_bulk_insert_vertices(async_social_db):
 @pytest.mark.asyncio
 async def test_bulk_insert_edges(async_social_db):
     """Test bulk insertion of edges."""
-
-    writer1 = async_social_db.bulk_writer().build()
+    session = async_social_db.session()
+    tx1 = await session.tx()
+    writer1 = await tx1.bulk_writer().build()
     vids = await writer1.insert_vertices(
         "Person",
         [
@@ -56,13 +59,16 @@ async def test_bulk_insert_edges(async_social_db):
         ],
     )
     await writer1.commit()
+    await tx1.commit()
 
-    writer2 = async_social_db.bulk_writer().build()
+    tx2 = await session.tx()
+    writer2 = await tx2.bulk_writer().build()
     edges = [(vids[0], vids[1], {"since": 2020})]
     await writer2.insert_edges("KNOWS", edges)
     await writer2.commit()
+    await tx2.commit()
 
-    result = await async_social_db.query("""
+    result = await session.query("""
         MATCH (p1:Person {name: 'David'})-[k:KNOWS]->(p2:Person {name: 'Eve'})
         RETURN k.since
     """)
@@ -73,9 +79,10 @@ async def test_bulk_insert_edges(async_social_db):
 @pytest.mark.asyncio
 async def test_builder_config_options(async_social_db):
     """Test bulk writer builder configuration options."""
-
-    writer = (
-        async_social_db.bulk_writer()
+    session = async_social_db.session()
+    tx = await session.tx()
+    writer = await (
+        tx.bulk_writer()
         .defer_vector_indexes(True)
         .defer_scalar_indexes(True)
         .batch_size(500)
@@ -89,24 +96,25 @@ async def test_builder_config_options(async_social_db):
         "Person", [{"name": "Frank", "age": 40, "email": "frank@example.com"}]
     )
     await writer.commit()
+    await tx.commit()
 
     assert len(vids) == 1
 
-    result = await async_social_db.query(
-        "MATCH (p:Person {name: 'Frank'}) RETURN p.name"
-    )
+    result = await session.query("MATCH (p:Person {name: 'Frank'}) RETURN p.name")
     assert len(result) == 1
 
 
 @pytest.mark.asyncio
 async def test_bulk_stats_attributes(async_social_db):
     """Test BulkStats attributes are accessible."""
-
-    writer = async_social_db.bulk_writer().build()
+    session = async_social_db.session()
+    tx = await session.tx()
+    writer = await tx.bulk_writer().build()
     await writer.insert_vertices(
         "Person", [{"name": "Grace", "age": 29}, {"name": "Henry", "age": 35}]
     )
     stats = await writer.commit()
+    await tx.commit()
 
     assert hasattr(stats, "vertices_inserted")
     assert hasattr(stats, "edges_inserted")
@@ -119,26 +127,28 @@ async def test_bulk_stats_attributes(async_social_db):
 )
 async def test_bulk_writer_abort(async_social_db):
     """Test bulk writer abort functionality."""
-
-    writer = async_social_db.bulk_writer().build()
+    session = async_social_db.session()
+    tx = await session.tx()
+    writer = await tx.bulk_writer().build()
     await writer.insert_vertices(
         "Person", [{"name": "Iris", "age": 27, "email": "iris@example.com"}]
     )
 
     writer.abort()
+    await tx.rollback()
 
-    result = await async_social_db.query(
-        "MATCH (p:Person {name: 'Iris'}) RETURN p.name"
-    )
+    result = await session.query("MATCH (p:Person {name: 'Iris'}) RETURN p.name")
     assert len(result) == 0
 
 
 @pytest.mark.asyncio
 async def test_ops_after_abort_raise_error(async_social_db):
     """Test that operations after abort raise RuntimeError."""
-
-    writer = async_social_db.bulk_writer().build()
+    session = async_social_db.session()
+    tx = await session.tx()
+    writer = await tx.bulk_writer().build()
     writer.abort()
+    await tx.rollback()
 
     with pytest.raises(
         RuntimeError, match=".*completed.*|.*finished.*|.*invalid.*|.*abort.*"
@@ -149,15 +159,19 @@ async def test_ops_after_abort_raise_error(async_social_db):
 @pytest.mark.asyncio
 async def test_convenience_bulk_insert_vertices(async_social_db):
     """Test convenience method bulk_insert_vertices."""
-
+    session = async_social_db.session()
     vertices = [{"name": "Kate", "age": 28}, {"name": "Liam", "age": 32}]
 
-    vids = await async_social_db.bulk_insert_vertices("Person", vertices)
+    tx = await session.tx()
+    bw = await tx.bulk_writer().build()
+    vids = await bw.insert_vertices("Person", vertices)
+    await bw.commit()
+    await tx.commit()
 
     assert len(vids) == 2
     assert all(isinstance(vid, int) for vid in vids)
 
-    result = await async_social_db.query(
+    result = await session.query(
         "MATCH (p:Person) WHERE p.name IN ['Kate', 'Liam'] RETURN p.name ORDER BY p.name"
     )
     assert len(result) == 2
@@ -168,8 +182,10 @@ async def test_convenience_bulk_insert_vertices(async_social_db):
 @pytest.mark.asyncio
 async def test_convenience_bulk_insert_edges(async_social_db):
     """Test convenience method bulk_insert_edges."""
-
-    vids = await async_social_db.bulk_insert_vertices(
+    session = async_social_db.session()
+    tx = await session.tx()
+    bw = await tx.bulk_writer().build()
+    vids = await bw.insert_vertices(
         "Person",
         [
             {"name": "Mia", "age": 26, "email": "mia@example.com"},
@@ -178,9 +194,11 @@ async def test_convenience_bulk_insert_edges(async_social_db):
     )
 
     edges = [(vids[0], vids[1], {"since": 2023})]
-    await async_social_db.bulk_insert_edges("KNOWS", edges)
+    await bw.insert_edges("KNOWS", edges)
+    await bw.commit()
+    await tx.commit()
 
-    result = await async_social_db.query("""
+    result = await session.query("""
         MATCH (p1:Person {name: 'Mia'})-[k:KNOWS]->(p2:Person {name: 'Noah'})
         RETURN k.since
     """)
@@ -191,27 +209,34 @@ async def test_convenience_bulk_insert_edges(async_social_db):
 @pytest.mark.asyncio
 async def test_large_batch_insert(async_social_db):
     """Test inserting a large batch (1000+) of vertices."""
-
+    session = async_social_db.session()
     vertices = [{"name": f"Person_{i}", "age": i} for i in range(1000)]
 
-    writer = async_social_db.bulk_writer().batch_size(200).build()
+    tx = await session.tx()
+    writer = await tx.bulk_writer().batch_size(200).build()
     vids = await writer.insert_vertices("Person", vertices)
     await writer.commit()
+    await tx.commit()
 
     assert len(vids) == 1000
 
-    result = await async_social_db.query("MATCH (p:Person) RETURN count(p) as cnt")
+    result = await session.query("MATCH (p:Person) RETURN count(p) as cnt")
     assert result[0]["cnt"] == 1000
 
 
 @pytest.mark.asyncio
 async def test_data_correctness_after_bulk_insert(async_empty_db):
     """Test that bulk inserted data maintains correctness."""
-    await async_empty_db.create_label("Member")
-    await async_empty_db.add_property("Member", "name", "string", False)
-    await async_empty_db.add_property("Member", "age", "int", True)
-    await async_empty_db.add_property("Member", "active", "bool", True)
-    await async_empty_db.add_property("Member", "score", "float", True)
+    await (
+        async_empty_db.schema()
+        .label("Member")
+        .property("name", "string")
+        .property_nullable("age", "int")
+        .property_nullable("active", "bool")
+        .property_nullable("score", "float")
+        .done()
+        .apply()
+    )
 
     vertices = [
         {"name": "Olivia", "age": 29, "active": True, "score": 95.5},
@@ -219,11 +244,14 @@ async def test_data_correctness_after_bulk_insert(async_empty_db):
         {"name": "Quinn", "age": 33, "active": True, "score": 92.1},
     ]
 
-    writer = async_empty_db.bulk_writer().build()
+    session = async_empty_db.session()
+    tx = await session.tx()
+    writer = await tx.bulk_writer().build()
     await writer.insert_vertices("Member", vertices)
     await writer.commit()
+    await tx.commit()
 
-    result = await async_empty_db.query("""
+    result = await session.query("""
         MATCH (m:Member {name: 'Olivia'})
         RETURN m.age, m.active, m.score
     """)
@@ -232,7 +260,7 @@ async def test_data_correctness_after_bulk_insert(async_empty_db):
     assert result[0]["m.active"] is True
     assert abs(result[0]["m.score"] - 95.5) < 0.01
 
-    result2 = await async_empty_db.query("""
+    result2 = await session.query("""
         MATCH (m:Member {name: 'Peter'})
         RETURN m.age, m.active, m.score
     """)

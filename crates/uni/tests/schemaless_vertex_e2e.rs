@@ -52,11 +52,16 @@ async fn test_schemaless_vertex_basic_return() -> Result<()> {
     let (db, _dir) = open_temp_db().await?;
     // No schema registration — "Gadget" is completely unknown.
 
-    db.execute("CREATE (:Gadget {name: 'Wrench', weight: 3})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Gadget {name: 'Wrench', weight: 3})")
         .await?;
+    tx.commit().await?;
 
     // L0 read
-    let rows = db.query("MATCH (g:Gadget) RETURN g.name, g.weight").await?;
+    let rows = db
+        .session()
+        .query("MATCH (g:Gadget) RETURN g.name, g.weight")
+        .await?;
     assert_eq!(rows.len(), 1, "should find 1 vertex in L0");
     assert_eq!(rows.rows()[0].get::<String>("g.name")?, "Wrench");
 
@@ -71,7 +76,10 @@ async fn test_schemaless_vertex_basic_return() -> Result<()> {
     db.flush().await?;
 
     // Post-flush read
-    let rows = db.query("MATCH (g:Gadget) RETURN g.name, g.weight").await?;
+    let rows = db
+        .session()
+        .query("MATCH (g:Gadget) RETURN g.name, g.weight")
+        .await?;
     assert_eq!(rows.len(), 1, "should find 1 vertex after flush");
     assert_eq!(rows.rows()[0].get::<String>("g.name")?, "Wrench");
 
@@ -88,17 +96,20 @@ async fn test_schemaless_vertex_basic_return() -> Result<()> {
 async fn test_schemaless_vertex_where_clause() -> Result<()> {
     let (db, _dir) = open_temp_db().await?;
 
-    db.execute("CREATE (:Animal {species: 'Cat', legs: 4})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Animal {species: 'Cat', legs: 4})")
         .await?;
-    db.execute("CREATE (:Animal {species: 'Snake', legs: 0})")
+    tx.execute("CREATE (:Animal {species: 'Snake', legs: 0})")
         .await?;
-    db.execute("CREATE (:Animal {species: 'Dog', legs: 4})")
+    tx.execute("CREATE (:Animal {species: 'Dog', legs: 4})")
         .await?;
+    tx.commit().await?;
 
     db.flush().await?;
 
     // Filter on a string property
     let rows = db
+        .session()
         .query("MATCH (a:Animal) WHERE a.species = 'Cat' RETURN a.legs")
         .await?;
     assert_eq!(rows.len(), 1, "should find exactly one Cat");
@@ -112,6 +123,7 @@ async fn test_schemaless_vertex_where_clause() -> Result<()> {
 
     // Filter returning multiple matches
     let rows = db
+        .session()
         .query("MATCH (a:Animal) WHERE a.legs = 4 RETURN a.species")
         .await?;
 
@@ -138,26 +150,36 @@ async fn test_schemaless_vertex_multiple_flushes() -> Result<()> {
     let (db, _dir) = open_temp_db().await?;
 
     // Batch 1
-    db.execute("CREATE (:Metric {source: 'cpu', value: 82})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Metric {source: 'cpu', value: 82})")
         .await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // Batch 2
-    db.execute("CREATE (:Metric {source: 'mem', value: 64})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Metric {source: 'mem', value: 64})")
         .await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // Batch 3
-    db.execute("CREATE (:Metric {source: 'disk', value: 45})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Metric {source: 'disk', value: 45})")
         .await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // All three should be present
-    let rows = db.query("MATCH (m:Metric) RETURN count(m) as cnt").await?;
+    let rows = db
+        .session()
+        .query("MATCH (m:Metric) RETURN count(m) as cnt")
+        .await?;
     assert_eq!(rows.rows()[0].get::<i64>("cnt")?, 3);
 
     // Return all properties
     let rows = db
+        .session()
         .query("MATCH (m:Metric) RETURN m.source, m.value")
         .await?;
     assert_eq!(rows.len(), 3);
@@ -173,6 +195,7 @@ async fn test_schemaless_vertex_multiple_flushes() -> Result<()> {
 
     // Filter across flush boundaries
     let rows = db
+        .session()
         .query("MATCH (m:Metric) WHERE m.source = 'mem' RETURN m.value")
         .await?;
     assert_eq!(rows.len(), 1);
@@ -190,7 +213,8 @@ async fn test_schemaless_vertex_multiple_flushes() -> Result<()> {
 async fn test_schemaless_vertex_mixed_types() -> Result<()> {
     let (db, _dir) = open_temp_db().await?;
 
-    db.execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         r#"CREATE (:Config {
             name: 'prod',
             replicas: 3,
@@ -200,10 +224,12 @@ async fn test_schemaless_vertex_mixed_types() -> Result<()> {
         })"#,
     )
     .await?;
+    tx.commit().await?;
 
     db.flush().await?;
 
     let rows = db
+        .session()
         .query("MATCH (c:Config) RETURN c.name, c.replicas, c.cpu_limit, c.enabled, c.regions")
         .await?;
     assert_eq!(rows.len(), 1);
@@ -266,15 +292,18 @@ async fn test_schemaless_vertex_null_handling() -> Result<()> {
     let (db, _dir) = open_temp_db().await?;
 
     // Explicit null, present property, and missing property across vertices
-    db.execute("CREATE (:Reading {sensor: 'temp', value: 22.5})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Reading {sensor: 'temp', value: 22.5})")
         .await?;
-    db.execute("CREATE (:Reading {sensor: 'humidity', value: null})")
+    tx.execute("CREATE (:Reading {sensor: 'humidity', value: null})")
         .await?;
-    db.execute("CREATE (:Reading {sensor: 'pressure'})").await?; // value omitted entirely
+    tx.execute("CREATE (:Reading {sensor: 'pressure'})").await?; // value omitted entirely
+    tx.commit().await?;
 
     db.flush().await?;
 
     let rows = db
+        .session()
         .query("MATCH (r:Reading) RETURN r.sensor, r.value")
         .await?;
     assert_eq!(rows.len(), 3);
@@ -326,23 +355,27 @@ async fn test_schemaless_vertex_null_handling() -> Result<()> {
 async fn test_schemaless_vertex_bulk() -> Result<()> {
     let (db, _dir) = open_temp_db().await?;
 
+    let tx = db.session().tx().await?;
     for i in 0..500 {
-        db.execute(&format!(
+        tx.execute(&format!(
             "CREATE (:LogEntry {{seq: {i}, level: 'info', msg: 'event_{i}'}})"
         ))
         .await?;
     }
+    tx.commit().await?;
 
     db.flush().await?;
 
     // Count
     let rows = db
+        .session()
         .query("MATCH (l:LogEntry) RETURN count(l) as cnt")
         .await?;
     assert_eq!(rows.rows()[0].get::<i64>("cnt")?, 500);
 
     // Property access with LIMIT
     let rows = db
+        .session()
         .query("MATCH (l:LogEntry) RETURN l.seq, l.level, l.msg LIMIT 5")
         .await?;
     assert_eq!(rows.len(), 5);
@@ -357,6 +390,7 @@ async fn test_schemaless_vertex_bulk() -> Result<()> {
 
     // WHERE filter on schemaless property
     let rows = db
+        .session()
         .query("MATCH (l:LogEntry) WHERE l.level = 'info' RETURN l.seq LIMIT 10")
         .await?;
     if !rows.is_empty() {
@@ -377,32 +411,44 @@ async fn test_schemaless_vertex_count_across_flushes() -> Result<()> {
     let (db, _dir) = open_temp_db().await?;
 
     // Generation 1
+    let tx = db.session().tx().await?;
     for i in 0..10 {
-        db.execute(&format!("CREATE (:Tick {{id: {i}, gen: 1}})"))
+        tx.execute(&format!("CREATE (:Tick {{id: {i}, gen: 1}})"))
             .await?;
     }
+    tx.commit().await?;
     db.flush().await?;
 
     // Generation 2
+    let tx = db.session().tx().await?;
     for i in 10..25 {
-        db.execute(&format!("CREATE (:Tick {{id: {i}, gen: 2}})"))
+        tx.execute(&format!("CREATE (:Tick {{id: {i}, gen: 2}})"))
             .await?;
     }
+    tx.commit().await?;
     db.flush().await?;
 
     // Generation 3 (still in L0, not flushed)
+    let tx = db.session().tx().await?;
     for i in 25..30 {
-        db.execute(&format!("CREATE (:Tick {{id: {i}, gen: 3}})"))
+        tx.execute(&format!("CREATE (:Tick {{id: {i}, gen: 3}})"))
             .await?;
     }
+    tx.commit().await?;
 
     // Total across flushed + L0
-    let rows = db.query("MATCH (t:Tick) RETURN count(t) as cnt").await?;
+    let rows = db
+        .session()
+        .query("MATCH (t:Tick) RETURN count(t) as cnt")
+        .await?;
     assert_eq!(rows.rows()[0].get::<i64>("cnt")?, 30);
 
     // Flush the rest and re-check
     db.flush().await?;
-    let rows = db.query("MATCH (t:Tick) RETURN count(t) as cnt").await?;
+    let rows = db
+        .session()
+        .query("MATCH (t:Tick) RETURN count(t) as cnt")
+        .await?;
     assert_eq!(rows.rows()[0].get::<i64>("cnt")?, 30);
 
     Ok(())
@@ -418,22 +464,31 @@ async fn test_schemaless_vertex_count_across_flushes() -> Result<()> {
 async fn test_schemaless_vertex_multiple_labels() -> Result<()> {
     let (db, _dir) = open_temp_db().await?;
 
-    db.execute("CREATE (:Planet {name: 'Mars', moons: 2})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Planet {name: 'Mars', moons: 2})")
         .await?;
-    db.execute("CREATE (:Planet {name: 'Jupiter', moons: 95})")
+    tx.execute("CREATE (:Planet {name: 'Jupiter', moons: 95})")
         .await?;
-    db.execute("CREATE (:Star {name: 'Sirius', spectral: 'A1V'})")
+    tx.execute("CREATE (:Star {name: 'Sirius', spectral: 'A1V'})")
         .await?;
+    tx.commit().await?;
 
     db.flush().await?;
 
-    let planets = db.query("MATCH (p:Planet) RETURN count(p) as cnt").await?;
+    let planets = db
+        .session()
+        .query("MATCH (p:Planet) RETURN count(p) as cnt")
+        .await?;
     assert_eq!(planets.rows()[0].get::<i64>("cnt")?, 2);
 
-    let stars = db.query("MATCH (s:Star) RETURN count(s) as cnt").await?;
+    let stars = db
+        .session()
+        .query("MATCH (s:Star) RETURN count(s) as cnt")
+        .await?;
     assert_eq!(stars.rows()[0].get::<i64>("cnt")?, 1);
 
     let rows = db
+        .session()
         .query("MATCH (p:Planet) WHERE p.name = 'Mars' RETURN p.moons")
         .await?;
     assert_eq!(rows.len(), 1);
@@ -451,12 +506,15 @@ async fn test_schemaless_vertex_multiple_labels() -> Result<()> {
 async fn test_schemaless_vertex_special_strings() -> Result<()> {
     let (db, _dir) = open_temp_db().await?;
 
-    db.execute(r#"CREATE (:Note {title: '', body: "line1\nline2", tag: 'it''s'})"#)
+    let tx = db.session().tx().await?;
+    tx.execute(r#"CREATE (:Note {title: '', body: "line1\nline2", tag: 'it''s'})"#)
         .await?;
+    tx.commit().await?;
 
     db.flush().await?;
 
     let rows = db
+        .session()
         .query("MATCH (n:Note) RETURN n.title, n.body, n.tag")
         .await?;
     assert_eq!(rows.len(), 1);

@@ -3,7 +3,7 @@
 import pytest
 
 import uni_db
-from uni_db import AsyncDatabaseBuilder, DatabaseBuilder, Message
+from uni_db import AsyncUniBuilder, Message, UniBuilder
 
 
 class TestXervoTypeNames:
@@ -47,20 +47,20 @@ class TestMessageApi:
 
 class TestBuilderChaining:
     def test_config_returns_self(self):
-        builder = DatabaseBuilder.temporary()
+        builder = UniBuilder.temporary()
         result = builder.config({"query_timeout": 5.0})
         assert result is builder
         db = result.build()
         assert db is not None
 
     def test_cloud_config_returns_self(self):
-        builder = DatabaseBuilder.temporary()
+        builder = UniBuilder.temporary()
         result = builder.cloud_config({"provider": "s3", "bucket": "test"})
         assert result is builder
 
     def test_config_chain_with_other_methods(self):
         db = (
-            DatabaseBuilder.temporary()
+            UniBuilder.temporary()
             .config({"parallelism": 2})
             .cache_size(1024 * 1024)
             .build()
@@ -70,20 +70,20 @@ class TestBuilderChaining:
 
 class TestAsyncBuilderChaining:
     async def test_config_returns_self(self):
-        builder = AsyncDatabaseBuilder.temporary()
+        builder = AsyncUniBuilder.temporary()
         result = builder.config({"query_timeout": 5.0})
         assert result is builder
         db = await result.build()
         assert db is not None
 
     async def test_cloud_config_returns_self(self):
-        builder = AsyncDatabaseBuilder.temporary()
+        builder = AsyncUniBuilder.temporary()
         result = builder.cloud_config({"provider": "s3", "bucket": "test"})
         assert result is builder
 
     async def test_config_chain_with_other_methods(self):
         db = await (
-            AsyncDatabaseBuilder.temporary()
+            AsyncUniBuilder.temporary()
             .config({"parallelism": 2})
             .cache_size(1024 * 1024)
             .build()
@@ -93,15 +93,15 @@ class TestAsyncBuilderChaining:
 
 class TestGenerateDictMessages:
     def test_generate_accepts_message_objects(self, empty_db):
-        with pytest.raises(RuntimeError):
+        with pytest.raises(uni_db.UniInternalError):
             empty_db.xervo().generate("m", [Message.user("hi")])
 
     def test_generate_accepts_dicts(self, empty_db):
-        with pytest.raises(RuntimeError):
+        with pytest.raises(uni_db.UniInternalError):
             empty_db.xervo().generate("m", [{"role": "user", "content": "hi"}])
 
     def test_generate_accepts_mixed(self, empty_db):
-        with pytest.raises(RuntimeError):
+        with pytest.raises(uni_db.UniInternalError):
             empty_db.xervo().generate(
                 "m", [Message.user("hi"), {"role": "assistant", "content": "hello"}]
             )
@@ -121,11 +121,11 @@ class TestGenerateDictMessages:
 
 class TestGenerateText:
     def test_generate_text_exists(self, empty_db):
-        with pytest.raises(RuntimeError):
+        with pytest.raises(uni_db.UniInternalError):
             empty_db.xervo().generate_text("m", "hello")
 
     def test_generate_text_with_options(self, empty_db):
-        with pytest.raises(RuntimeError):
+        with pytest.raises(uni_db.UniInternalError):
             empty_db.xervo().generate_text(
                 "m", "hello", max_tokens=100, temperature=0.7
             )
@@ -133,17 +133,17 @@ class TestGenerateText:
 
 class TestAsyncGenerateDictMessages:
     async def test_generate_accepts_message_objects(self, async_empty_db):
-        with pytest.raises(RuntimeError):
+        with pytest.raises(uni_db.UniInternalError):
             await async_empty_db.xervo().generate("m", [Message.user("hi")])
 
     async def test_generate_accepts_dicts(self, async_empty_db):
-        with pytest.raises(RuntimeError):
+        with pytest.raises(uni_db.UniInternalError):
             await async_empty_db.xervo().generate(
                 "m", [{"role": "user", "content": "hi"}]
             )
 
     async def test_generate_accepts_mixed(self, async_empty_db):
-        with pytest.raises(RuntimeError):
+        with pytest.raises(uni_db.UniInternalError):
             await async_empty_db.xervo().generate(
                 "m", [Message.user("hi"), {"role": "assistant", "content": "hello"}]
             )
@@ -163,11 +163,11 @@ class TestAsyncGenerateDictMessages:
 
 class TestAsyncGenerateText:
     async def test_generate_text_exists(self, async_empty_db):
-        with pytest.raises(RuntimeError):
+        with pytest.raises(uni_db.UniInternalError):
             await async_empty_db.xervo().generate_text("m", "hello")
 
     async def test_generate_text_with_options(self, async_empty_db):
-        with pytest.raises(RuntimeError):
+        with pytest.raises(uni_db.UniInternalError):
             await async_empty_db.xervo().generate_text(
                 "m", "hello", max_tokens=100, temperature=0.7
             )

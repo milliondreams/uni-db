@@ -33,8 +33,9 @@ Uni provides hybrid search that combines vector similarity and full-text search 
 
     # async fn demo() -> Result<(), uni_db::UniError> {
     let db = Uni::open("./my_db").build().await?;
+    let session = db.session();
 
-    let rows = db.query(r#"
+    let rows = session.query(r#"
         CALL uni.search(
             'Document',
             {vector: 'embedding', fts: 'content'},
@@ -55,9 +56,10 @@ Uni provides hybrid search that combines vector similarity and full-text search 
     ```python
     import uni_db
 
-    db = uni_db.Database("./my_db")
+    db = uni_db.Uni.open("./my_db")
+    session = db.session()
 
-    rows = db.query("""
+    rows = session.query("""
         CALL uni.search(
             'Document',
             {vector: 'embedding', fts: 'content'},

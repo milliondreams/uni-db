@@ -37,12 +37,12 @@ async fn test_delete_vertex_persistence() -> anyhow::Result<()> {
     let mut props = HashMap::new();
     props.insert("name".to_string(), Value::String("Alice".to_string()));
     writer
-        .insert_vertex_with_labels(vid, props, &["Person".to_string()])
+        .insert_vertex_with_labels(vid, props, &["Person".to_string()], None)
         .await?;
     writer.flush_to_l1(None).await?;
 
     // 2. Delete vertex
-    writer.delete_vertex(vid, None).await?;
+    writer.delete_vertex(vid, None, None).await?;
     writer.flush_to_l1(None).await?;
 
     // 3. Verify vertex is deleted via PropertyManager

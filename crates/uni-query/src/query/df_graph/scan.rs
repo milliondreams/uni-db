@@ -1598,65 +1598,12 @@ async fn columnar_scan_vertex_batch_static(
         push_column_if_absent(&mut lance_columns, "overflow_json");
     }
 
-    // Try to query Lance
-    let ds = storage
-        .vertex_dataset(label)
+    // Try to query Lance via StorageManager domain method
+    let lance_columns_refs: Vec<&str> = lance_columns.iter().map(|s| s.as_str()).collect();
+    let lance_batch = storage
+        .scan_vertex_table(label, &lance_columns_refs, None)
+        .await
         .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
-    let lancedb_store = storage.lancedb_store();
-
-    let lance_batch = match ds.open_lancedb(lancedb_store).await {
-        Ok(table) => {
-            use lancedb::query::{ExecutableQuery, QueryBase, Select};
-
-            // Check which columns actually exist in the Lance table
-            let table_schema = table
-                .schema()
-                .await
-                .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
-            let table_field_names: HashSet<&str> = table_schema
-                .fields()
-                .iter()
-                .map(|f| f.name().as_str())
-                .collect();
-
-            let actual_columns: Vec<&str> = lance_columns
-                .iter()
-                .filter(|c| table_field_names.contains(c.as_str()))
-                .map(|c| c.as_str())
-                .collect();
-
-            let query = table.query().select(Select::columns(&actual_columns));
-            // Do NOT filter _deleted here — MVCC dedup must see the
-            // highest-version row first (which may be a deletion tombstone).
-            // Deleted rows are filtered out after dedup.
-            let query = match storage.version_high_water_mark() {
-                Some(hwm) => query.only_if(format!("_version <= {}", hwm)),
-                None => query,
-            };
-
-            match query.execute().await {
-                Ok(stream) => {
-                    use futures::TryStreamExt;
-                    let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap_or_default();
-                    if batches.is_empty() {
-                        None
-                    } else {
-                        Some(
-                            arrow::compute::concat_batches(&batches[0].schema(), &batches)
-                                .map_err(|e| {
-                                    datafusion::error::DataFusionError::ArrowError(
-                                        Box::new(e),
-                                        None,
-                                    )
-                                })?,
-                        )
-                    }
-                }
-                Err(_) => None,
-            }
-        }
-        Err(_) => None, // Table doesn't exist yet — only L0 data
-    };
 
     // MVCC dedup the Lance batch
     let lance_deduped = mvcc_dedup_to_option(lance_batch, "_vid")?;
@@ -1767,65 +1714,12 @@ async fn columnar_scan_edge_batch_static(
         push_column_if_absent(&mut lance_columns, "overflow_json");
     }
 
-    // Try to query DeltaDataset (forward direction)
-    let ds = storage
-        .delta_dataset(edge_type, "fwd")
+    // Try to query DeltaDataset (forward direction) via StorageManager domain method
+    let lance_columns_refs: Vec<&str> = lance_columns.iter().map(|s| s.as_str()).collect();
+    let lance_batch = storage
+        .scan_delta_table(edge_type, "fwd", &lance_columns_refs, None)
+        .await
         .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
-    let lancedb_store = storage.lancedb_store();
-
-    let lance_batch = match ds.open_lancedb(lancedb_store).await {
-        Ok(table) => {
-            use lancedb::query::{ExecutableQuery, QueryBase, Select};
-
-            // Check which columns actually exist in the Lance table
-            let table_schema = table
-                .schema()
-                .await
-                .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
-            let table_field_names: HashSet<&str> = table_schema
-                .fields()
-                .iter()
-                .map(|f| f.name().as_str())
-                .collect();
-
-            let actual_columns: Vec<&str> = lance_columns
-                .iter()
-                .filter(|c| table_field_names.contains(c.as_str()))
-                .map(|c| c.as_str())
-                .collect();
-
-            // Do NOT filter op here — MVCC dedup must see DELETE ops
-            // (op != 0) to pick the highest version. Deleted edges are
-            // filtered out after dedup.
-            let query = table.query().select(Select::columns(&actual_columns));
-            let query = match storage.version_high_water_mark() {
-                Some(hwm) => query.only_if(format!("_version <= {}", hwm)),
-                None => query,
-            };
-
-            match query.execute().await {
-                Ok(stream) => {
-                    use futures::TryStreamExt;
-                    let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap_or_default();
-                    if batches.is_empty() {
-                        None
-                    } else {
-                        Some(
-                            arrow::compute::concat_batches(&batches[0].schema(), &batches)
-                                .map_err(|e| {
-                                    datafusion::error::DataFusionError::ArrowError(
-                                        Box::new(e),
-                                        None,
-                                    )
-                                })?,
-                        )
-                    }
-                }
-                Err(_) => None,
-            }
-        }
-        Err(_) => None, // Table doesn't exist yet — only L0 data
-    };
 
     // MVCC dedup the Lance batch (by eid)
     let lance_deduped = mvcc_dedup_to_option(lance_batch, "eid")?;
@@ -1901,11 +1795,8 @@ async fn columnar_scan_schemaless_vertex_batch_static(
     projected_properties: &[String],
     output_schema: &SchemaRef,
 ) -> DFResult<RecordBatch> {
-    use uni_store::storage::main_vertex::MainVertexDataset;
-
     let storage = graph_ctx.storage();
     let l0_ctx = graph_ctx.l0_context();
-    let lancedb_store = storage.lancedb_store();
 
     // Build the Lance filter expression — do NOT filter _deleted here;
     // MVCC dedup must see deletion tombstones to pick the highest version.
@@ -1924,11 +1815,6 @@ async fn columnar_scan_schemaless_vertex_batch_static(
             }
         }
 
-        // MVCC version filter
-        if let Some(hwm) = storage.version_high_water_mark() {
-            parts.push(format!("_version <= {}", hwm));
-        }
-
         if parts.is_empty() {
             None
         } else {
@@ -1936,46 +1822,14 @@ async fn columnar_scan_schemaless_vertex_batch_static(
         }
     };
 
-    // Single Lance query: SELECT _vid, _deleted, labels, props_json, _version WHERE <filter>
-    let lance_batch = match MainVertexDataset::open_table(lancedb_store).await {
-        Ok(table) => {
-            use lancedb::query::{ExecutableQuery, QueryBase, Select};
-
-            let query = table.query().select(Select::columns(&[
-                "_vid",
-                "_deleted",
-                "labels",
-                "props_json",
-                "_version",
-            ]));
-            let query = match filter {
-                Some(f) => query.only_if(f),
-                None => query,
-            };
-
-            match query.execute().await {
-                Ok(stream) => {
-                    use futures::TryStreamExt;
-                    let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap_or_default();
-                    if batches.is_empty() {
-                        None
-                    } else {
-                        Some(
-                            arrow::compute::concat_batches(&batches[0].schema(), &batches)
-                                .map_err(|e| {
-                                    datafusion::error::DataFusionError::ArrowError(
-                                        Box::new(e),
-                                        None,
-                                    )
-                                })?,
-                        )
-                    }
-                }
-                Err(_) => None,
-            }
-        }
-        Err(_) => None, // Table doesn't exist yet — only L0 data
-    };
+    // Single Lance query via StorageManager domain method
+    let lance_batch = storage
+        .scan_main_vertex_table(
+            &["_vid", "_deleted", "labels", "props_json", "_version"],
+            filter.as_deref(),
+        )
+        .await
+        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
 
     // MVCC dedup the Lance batch
     let lance_deduped = mvcc_dedup_to_option(lance_batch, "_vid")?;

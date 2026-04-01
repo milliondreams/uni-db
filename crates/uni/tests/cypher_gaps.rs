@@ -15,23 +15,25 @@ async fn test_relationship_disjunction() -> Result<()> {
         .apply()
         .await?;
 
-    db.execute("CREATE (a:Person {name: 'A'})").await?;
-    db.execute("CREATE (b:Person {name: 'B'})").await?;
-    db.execute("CREATE (c:Person {name: 'C'})").await?;
-
-    db.execute("MATCH (a:Person {name: 'A'}), (b:Person {name: 'B'}) CREATE (a)-[:KNOWS]->(b)")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (a:Person {name: 'A'})").await?;
+    tx.execute("CREATE (b:Person {name: 'B'})").await?;
+    tx.execute("CREATE (c:Person {name: 'C'})").await?;
+    tx.execute("MATCH (a:Person {name: 'A'}), (b:Person {name: 'B'}) CREATE (a)-[:KNOWS]->(b)")
         .await?;
-    db.execute("MATCH (a:Person {name: 'A'}), (c:Person {name: 'C'}) CREATE (a)-[:LIKES]->(c)")
+    tx.execute("MATCH (a:Person {name: 'A'}), (c:Person {name: 'C'}) CREATE (a)-[:LIKES]->(c)")
         .await?;
+    tx.commit().await?;
 
     // Query with disjunction
     let result = db
+        .session()
         .query("MATCH (a:Person {name: 'A'})-[r:KNOWS|LIKES]->(other) RETURN other.name")
         .await?;
 
     assert_eq!(result.len(), 2);
     let mut names: Vec<String> = result
-        .rows
+        .rows()
         .iter()
         .map(|r| r.get::<String>("other.name").unwrap())
         .collect();
@@ -51,28 +53,28 @@ async fn test_undirected_relationship_match() -> Result<()> {
         .apply()
         .await?;
 
-    db.execute("CREATE (a:Person {name: 'Alice'})").await?;
-    db.execute("CREATE (b:Person {name: 'Bob'})").await?;
-    db.execute("CREATE (c:Person {name: 'Charlie'})").await?;
-
-    // Alice -> Bob
-    db.execute(
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (a:Person {name: 'Alice'})").await?;
+    tx.execute("CREATE (b:Person {name: 'Bob'})").await?;
+    tx.execute("CREATE (c:Person {name: 'Charlie'})").await?;
+    tx.execute(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) CREATE (a)-[:KNOWS]->(b)",
     )
     .await?;
-    // Bob -> Charlie
-    db.execute(
+    tx.execute(
         "MATCH (b:Person {name: 'Bob'}), (c:Person {name: 'Charlie'}) CREATE (b)-[:KNOWS]->(c)",
     )
     .await?;
+    tx.commit().await?;
 
     // Undirected match from Bob: should find both Alice (incoming) and Charlie (outgoing)
     let result = db
+        .session()
         .query("MATCH (a:Person {name: 'Bob'})-[:KNOWS]-(b:Person) RETURN b.name AS name")
         .await?;
 
     let mut names: Vec<String> = result
-        .rows
+        .rows()
         .iter()
         .map(|r| r.get::<String>("name").unwrap())
         .collect();
@@ -92,6 +94,7 @@ async fn test_yield_aliasing() -> Result<()> {
 
     // uni.schema.labels() returns "label" column
     let _result = db
+        .session()
         .query("CALL uni.schema.labels() YIELD label AS l RETURN l")
         .await?;
 
@@ -100,6 +103,7 @@ async fn test_yield_aliasing() -> Result<()> {
     db.schema().label("TestLabel").apply().await?;
 
     let result = db
+        .session()
         .query("CALL uni.schema.labels() YIELD label AS l RETURN l")
         .await?;
     assert!(!result.is_empty());
@@ -108,11 +112,11 @@ async fn test_yield_aliasing() -> Result<()> {
     // Note: Uni query result columns might be sorted or as projected.
     // The columns in QueryResult should reflect the RETURN clause.
     let _col_idx = result
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "l")
         .expect("Column 'l' not found");
-    assert!(!result.rows.is_empty());
+    assert!(!result.is_empty());
 
     Ok(())
 }
@@ -121,7 +125,9 @@ async fn test_yield_aliasing() -> Result<()> {
 async fn test_call_composition() -> Result<()> {
     let db = Uni::in_memory().build().await?;
     db.schema().label("Person").apply().await?;
-    db.execute("CREATE (:Person {name: 'Alice'})").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Person {name: 'Alice'})").await?;
+    tx.commit().await?;
 
     // CALL ... YIELD ... MATCH ...
     // Note: MATCH (n) WHERE n:Person is not yet fully supported for label inference in Scan.
@@ -132,10 +138,10 @@ async fn test_call_composition() -> Result<()> {
         RETURN n.name, label
     ";
 
-    let result = db.query(query).await?;
+    let result = db.session().query(query).await?;
     // uni.schema.labels() returns "Person". So filter label='Person' matches.
     assert_eq!(result.len(), 1);
-    let name: String = result.rows[0].get("n.name")?;
+    let name: String = result.rows()[0].get("n.name")?;
     assert_eq!(name, "Alice");
 
     Ok(())

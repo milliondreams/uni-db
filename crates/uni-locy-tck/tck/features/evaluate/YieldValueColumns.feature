@@ -56,6 +56,23 @@ Feature: YIELD Value Columns
     And the command result 0 should be a Query with 1 rows
     And the command result 0 should be a Query containing row where score = 0.5
 
+  # ── String constant in YIELD ─────────────────────────────────────────────
+
+  Scenario: String constant in YIELD via QUERY RETURN
+    Given having executed:
+      """
+      CREATE (:Node {name: 'A'}), (:Node {name: 'B'})
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE tagged AS MATCH (n:Node) YIELD KEY n, 'patch-now' AS action
+      QUERY tagged WHERE n.name = 'A' RETURN n.name AS nid, action
+      """
+    Then evaluation should succeed
+    And the command result 0 should be a Query with 1 rows
+    And the command result 0 should be a Query containing row where nid = 'A'
+    And the command result 0 should be a Query containing row where action = 'patch-now'
+
   # ── Computed expression in YIELD ─────────────────────────────────────────
 
   Scenario: Computed expression in YIELD

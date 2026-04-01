@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2024-2026 Dragonscale Team
 
-"""Tests for AsyncDatabaseBuilder API."""
+"""Tests for AsyncUniBuilder API."""
 
 import os
 import tempfile
@@ -11,7 +11,7 @@ import pytest
 import uni_db
 
 
-class TestAsyncDatabaseBuilderOpenModes:
+class TestAsyncUniBuilderOpenModes:
     """Tests for different async database open modes."""
 
     @pytest.mark.asyncio
@@ -19,10 +19,11 @@ class TestAsyncDatabaseBuilderOpenModes:
         """Test creating a new database."""
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "testdb")
-            db = await uni_db.AsyncDatabaseBuilder.create(path).build()
+            db = await uni_db.AsyncUniBuilder.create(path).build()
             assert db is not None
-            await db.create_label("Test")
-            results = await db.query("MATCH (n:Test) RETURN n")
+            session = db.session()
+            await db.schema().label("Test").apply()
+            results = await session.query("MATCH (n:Test) RETURN n")
             assert len(results) == 0
 
     @pytest.mark.asyncio
@@ -30,28 +31,31 @@ class TestAsyncDatabaseBuilderOpenModes:
         """Test that create() fails if database exists."""
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "testdb")
-            db1 = await uni_db.AsyncDatabaseBuilder.create(path).build()
-            await db1.create_label("Test")
+            db1 = await uni_db.AsyncUniBuilder.create(path).build()
+            await db1.schema().label("Test").apply()
             await db1.flush()
             del db1
 
-            with pytest.raises(Exception):
-                await uni_db.AsyncDatabaseBuilder.create(path).build()
+            with pytest.raises(uni_db.UniError):
+                await uni_db.AsyncUniBuilder.create(path).build()
 
     @pytest.mark.asyncio
     async def test_open_existing_database(self):
         """Test opening an existing database."""
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "testdb")
-            db1 = await uni_db.AsyncDatabaseBuilder.create(path).build()
-            await db1.create_label("Person")
-            await db1.add_property("Person", "name", "string", False)
-            await db1.query("CREATE (n:Person {name: 'Alice'})")
+            db1 = await uni_db.AsyncUniBuilder.create(path).build()
+            session1 = db1.session()
+            await db1.schema().label("Person").property("name", "string").apply()
+            tx1 = await session1.tx()
+            await tx1.execute("CREATE (n:Person {name: 'Alice'})")
+            await tx1.commit()
             await db1.flush()
             del db1
 
-            db2 = await uni_db.AsyncDatabaseBuilder.open_existing(path).build()
-            results = await db2.query("MATCH (n:Person) RETURN n.name AS name")
+            db2 = await uni_db.AsyncUniBuilder.open_existing(path).build()
+            session2 = db2.session()
+            results = await session2.query("MATCH (n:Person) RETURN n.name AS name")
             assert len(results) == 1
             assert results[0]["name"] == "Alice"
 
@@ -60,18 +64,21 @@ class TestAsyncDatabaseBuilderOpenModes:
         """Test that open_existing() fails if database doesn't exist."""
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "nonexistent")
-            with pytest.raises(Exception):
-                await uni_db.AsyncDatabaseBuilder.open_existing(path).build()
+            with pytest.raises(uni_db.UniNotFoundError):
+                await uni_db.AsyncUniBuilder.open_existing(path).build()
 
     @pytest.mark.asyncio
     async def test_open_creates_if_needed(self):
         """Test that open() creates database if it doesn't exist."""
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "testdb")
-            db = await uni_db.AsyncDatabaseBuilder.open(path).build()
+            db = await uni_db.AsyncUniBuilder.open(path).build()
             assert db is not None
-            await db.create_label("Test")
-            await db.execute("CREATE (n:Test)")
+            session = db.session()
+            await db.schema().label("Test").apply()
+            tx = await session.tx()
+            await tx.execute("CREATE (n:Test)")
+            await tx.commit()
             await db.flush()
 
     @pytest.mark.asyncio
@@ -79,33 +86,38 @@ class TestAsyncDatabaseBuilderOpenModes:
         """Test that open() reuses existing database."""
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "testdb")
-            db1 = await uni_db.AsyncDatabaseBuilder.create(path).build()
-            await db1.create_label("Person")
-            await db1.add_property("Person", "name", "string", False)
-            await db1.query("CREATE (n:Person {name: 'Bob'})")
+            db1 = await uni_db.AsyncUniBuilder.create(path).build()
+            session1 = db1.session()
+            await db1.schema().label("Person").property("name", "string").apply()
+            tx1 = await session1.tx()
+            await tx1.execute("CREATE (n:Person {name: 'Bob'})")
+            await tx1.commit()
             await db1.flush()
             del db1
 
-            db2 = await uni_db.AsyncDatabaseBuilder.open(path).build()
-            results = await db2.query("MATCH (n:Person) RETURN n.name AS name")
+            db2 = await uni_db.AsyncUniBuilder.open(path).build()
+            session2 = db2.session()
+            results = await session2.query("MATCH (n:Person) RETURN n.name AS name")
             assert len(results) == 1
             assert results[0]["name"] == "Bob"
 
     @pytest.mark.asyncio
     async def test_temporary_database(self):
         """Test creating a temporary database."""
-        db = await uni_db.AsyncDatabaseBuilder.temporary().build()
+        db = await uni_db.AsyncUniBuilder.temporary().build()
         assert db is not None
-        await db.create_label("Temp")
-        await db.add_property("Temp", "value", "int", False)
-        await db.query("CREATE (n:Temp {value: 42})")
+        session = db.session()
+        await db.schema().label("Temp").property("value", "int").apply()
+        tx = await session.tx()
+        await tx.execute("CREATE (n:Temp {value: 42})")
+        await tx.commit()
         await db.flush()
-        results = await db.query("MATCH (n:Temp) RETURN n.value AS value")
+        results = await session.query("MATCH (n:Temp) RETURN n.value AS value")
         assert len(results) == 1
         assert results[0]["value"] == 42
 
 
-class TestAsyncDatabaseBuilderConfiguration:
+class TestAsyncUniBuilderConfiguration:
     """Tests for async database builder configuration options."""
 
     @pytest.mark.asyncio
@@ -114,7 +126,7 @@ class TestAsyncDatabaseBuilderConfiguration:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "testdb")
             db = await (
-                uni_db.AsyncDatabaseBuilder.create(path)
+                uni_db.AsyncUniBuilder.create(path)
                 .cache_size(1024 * 1024 * 100)
                 .build()
             )
@@ -125,7 +137,7 @@ class TestAsyncDatabaseBuilderConfiguration:
         """Test setting parallelism level."""
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "testdb")
-            db = await uni_db.AsyncDatabaseBuilder.create(path).parallelism(4).build()
+            db = await uni_db.AsyncUniBuilder.create(path).parallelism(4).build()
             assert db is not None
 
     @pytest.mark.asyncio
@@ -134,16 +146,19 @@ class TestAsyncDatabaseBuilderConfiguration:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "testdb")
             db = await (
-                uni_db.AsyncDatabaseBuilder.create(path)
+                uni_db.AsyncUniBuilder.create(path)
                 .cache_size(1024 * 1024 * 50)
                 .parallelism(2)
                 .build()
             )
             assert db is not None
-            await db.create_label("Test")
-            await db.execute("CREATE (n:Test)")
+            session = db.session()
+            await db.schema().label("Test").apply()
+            tx = await session.tx()
+            await tx.execute("CREATE (n:Test)")
+            await tx.commit()
             await db.flush()
-            results = await db.query("MATCH (n:Test) RETURN n")
+            results = await session.query("MATCH (n:Test) RETURN n")
             assert len(results) == 1
 
 
@@ -153,28 +168,33 @@ class TestAsyncInMemory:
     @pytest.mark.asyncio
     async def test_in_memory_database(self):
         """Test creating an in-memory database via builder."""
-        db = await uni_db.AsyncDatabaseBuilder.in_memory().build()
+        db = await uni_db.AsyncUniBuilder.in_memory().build()
         assert db is not None
-        await db.create_label("Mem")
-        await db.add_property("Mem", "x", "int", False)
-        await db.execute("CREATE (n:Mem {x: 42})")
+        session = db.session()
+        await db.schema().label("Mem").property("x", "int").apply()
+        tx = await session.tx()
+        await tx.execute("CREATE (n:Mem {x: 42})")
+        await tx.commit()
         await db.flush()
-        results = await db.query("MATCH (n:Mem) RETURN n.x AS x")
+        results = await session.query("MATCH (n:Mem) RETURN n.x AS x")
         assert len(results) == 1
         assert results[0]["x"] == 42
 
 
 class TestAsyncBackwardCompatibility:
-    """Tests for backward compatibility with AsyncDatabase constructors."""
+    """Tests for backward compatibility with AsyncUni constructors."""
 
     @pytest.mark.asyncio
     async def test_async_database_open(self):
-        """Test that AsyncDatabase.open() still works."""
+        """Test that AsyncUni.open() still works."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            db = await uni_db.AsyncDatabase.open(tmpdir)
+            db = await uni_db.AsyncUni.open(tmpdir)
             assert db is not None
-            await db.create_label("Legacy")
-            await db.execute("CREATE (n:Legacy)")
+            session = db.session()
+            await db.schema().label("Legacy").apply()
+            tx = await session.tx()
+            await tx.execute("CREATE (n:Legacy)")
+            await tx.commit()
             await db.flush()
-            results = await db.query("MATCH (n:Legacy) RETURN n")
+            results = await session.query("MATCH (n:Legacy) RETURN n")
             assert len(results) == 1

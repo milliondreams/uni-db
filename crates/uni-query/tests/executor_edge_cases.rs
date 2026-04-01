@@ -141,15 +141,14 @@ async fn test_execute_match_with_null_properties() {
     )
     .unwrap();
 
-    // Write using LanceDB
-    let lancedb_store = storage.lancedb_store();
-    let table = vertex_ds
-        .write_batch_lancedb(lancedb_store, batch, schema)
+    // Write using storage backend
+    vertex_ds
+        .write_batch(storage.backend(), batch, schema)
         .await
         .unwrap();
     // Ensure defaults are indexed
     vertex_ds
-        .ensure_default_indexes_lancedb(&table)
+        .ensure_default_indexes(storage.backend())
         .await
         .unwrap();
 

@@ -23,7 +23,7 @@ import uni_db
 @pytest.fixture
 async def async_empty_db():
     """Async temporary database with no schema."""
-    return await uni_db.AsyncDatabase.temporary()
+    return await uni_db.AsyncUni.temporary()
 
 
 @pytest.fixture
@@ -33,7 +33,7 @@ async def async_social_db():
     Labels: Person(name, age, email?), Company(name, founded?)
     Edges: KNOWS(since?), WORKS_AT(role?)
     """
-    db = await uni_db.AsyncDatabase.temporary()
+    db = await uni_db.AsyncUni.temporary()
     await (
         db.schema()
         .label("Person")
@@ -67,48 +67,51 @@ async def async_social_db_populated(async_social_db):
                    Charlie-WORKS_AT->StartupInc
     """
     db = async_social_db
-    await db.execute(
+    session = db.session()
+    tx = await session.tx()
+    await tx.execute(
         "CREATE (p:Person {name: 'Alice', age: 30, email: 'alice@example.com'})"
     )
-    await db.execute(
+    await tx.execute(
         "CREATE (p:Person {name: 'Bob', age: 25, email: 'bob@example.com'})"
     )
-    await db.execute("CREATE (p:Person {name: 'Charlie', age: 35})")
-    await db.execute(
+    await tx.execute("CREATE (p:Person {name: 'Charlie', age: 35})")
+    await tx.execute(
         "CREATE (p:Person {name: 'Diana', age: 28, email: 'diana@example.com'})"
     )
-    await db.execute("CREATE (p:Person {name: 'Eve', age: 32})")
-    await db.execute("CREATE (c:Company {name: 'TechCorp', founded: 2010})")
-    await db.execute("CREATE (c:Company {name: 'StartupInc', founded: 2020})")
+    await tx.execute("CREATE (p:Person {name: 'Eve', age: 32})")
+    await tx.execute("CREATE (c:Company {name: 'TechCorp', founded: 2010})")
+    await tx.execute("CREATE (c:Company {name: 'StartupInc', founded: 2020})")
 
-    await db.execute(
+    await tx.execute(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) "
         "CREATE (a)-[:KNOWS {since: 2015}]->(b)"
     )
-    await db.execute(
+    await tx.execute(
         "MATCH (b:Person {name: 'Bob'}), (c:Person {name: 'Charlie'}) "
         "CREATE (b)-[:KNOWS {since: 2018}]->(c)"
     )
-    await db.execute(
+    await tx.execute(
         "MATCH (a:Person {name: 'Alice'}), (c:Person {name: 'Charlie'}) "
         "CREATE (a)-[:KNOWS {since: 2020}]->(c)"
     )
-    await db.execute(
+    await tx.execute(
         "MATCH (d:Person {name: 'Diana'}), (e:Person {name: 'Eve'}) "
         "CREATE (d)-[:KNOWS]->(e)"
     )
-    await db.execute(
+    await tx.execute(
         "MATCH (a:Person {name: 'Alice'}), (t:Company {name: 'TechCorp'}) "
         "CREATE (a)-[:WORKS_AT {role: 'Engineer'}]->(t)"
     )
-    await db.execute(
+    await tx.execute(
         "MATCH (b:Person {name: 'Bob'}), (t:Company {name: 'TechCorp'}) "
         "CREATE (b)-[:WORKS_AT {role: 'Designer'}]->(t)"
     )
-    await db.execute(
+    await tx.execute(
         "MATCH (c:Person {name: 'Charlie'}), (s:Company {name: 'StartupInc'}) "
         "CREATE (c)-[:WORKS_AT {role: 'CTO'}]->(s)"
     )
+    await tx.commit()
     await db.flush()
     return db
 
@@ -120,7 +123,7 @@ async def async_ecommerce_db():
     Labels: User(name), Product(name, price, embedding:vec4), Category(name), Order(amount)
     Edges: VIEWED, PURCHASED, IN_CATEGORY, PLACED
     """
-    db = await uni_db.AsyncDatabase.temporary()
+    db = await uni_db.AsyncUni.temporary()
     await (
         db.schema()
         .label("User")
@@ -154,51 +157,59 @@ async def async_ecommerce_db():
 async def async_ecommerce_db_populated(async_ecommerce_db):
     """Async e-commerce database pre-populated with data including embeddings."""
     db = async_ecommerce_db
-    await db.execute("CREATE (u:User {name: 'Alice'})")
-    await db.execute("CREATE (u:User {name: 'Bob'})")
-    await db.execute(
+    session = db.session()
+    tx = await session.tx()
+    await tx.execute("CREATE (u:User {name: 'Alice'})")
+    await tx.execute("CREATE (u:User {name: 'Bob'})")
+    await tx.execute(
         "CREATE (p:Product {name: 'Laptop', price: 999.99, embedding: [1.0, 0.0, 0.0, 0.0]})"
     )
-    await db.execute(
+    await tx.execute(
         "CREATE (p:Product {name: 'Phone', price: 699.99, embedding: [0.9, 0.1, 0.0, 0.0]})"
     )
-    await db.execute(
+    await tx.execute(
         "CREATE (p:Product {name: 'Book', price: 19.99, embedding: [0.0, 0.0, 1.0, 0.0]})"
     )
-    await db.execute(
+    await tx.execute(
         "CREATE (p:Product {name: 'Headphones', price: 149.99, embedding: [0.8, 0.2, 0.0, 0.0]})"
     )
-    await db.execute("CREATE (c:Category {name: 'Electronics'})")
-    await db.execute("CREATE (c:Category {name: 'Books'})")
-    await db.execute("CREATE (o:Order {amount: 999.99})")
+    await tx.execute("CREATE (c:Category {name: 'Electronics'})")
+    await tx.execute("CREATE (c:Category {name: 'Books'})")
+    await tx.execute("CREATE (o:Order {amount: 999.99})")
 
     # Edges
-    await db.execute(
+    await tx.execute(
         "MATCH (u:User {name: 'Alice'}), (p:Product {name: 'Laptop'}) CREATE (u)-[:VIEWED]->(p)"
     )
-    await db.execute(
+    await tx.execute(
         "MATCH (u:User {name: 'Alice'}), (p:Product {name: 'Laptop'}) CREATE (u)-[:PURCHASED]->(p)"
     )
-    await db.execute(
+    await tx.execute(
         "MATCH (u:User {name: 'Bob'}), (p:Product {name: 'Book'}) CREATE (u)-[:VIEWED]->(p)"
     )
-    await db.execute(
+    await tx.execute(
         "MATCH (p:Product {name: 'Laptop'}), (c:Category {name: 'Electronics'}) "
         "CREATE (p)-[:IN_CATEGORY]->(c)"
     )
-    await db.execute(
+    await tx.execute(
         "MATCH (p:Product {name: 'Phone'}), (c:Category {name: 'Electronics'}) "
         "CREATE (p)-[:IN_CATEGORY]->(c)"
     )
-    await db.execute(
+    await tx.execute(
         "MATCH (p:Product {name: 'Book'}), (c:Category {name: 'Books'}) "
         "CREATE (p)-[:IN_CATEGORY]->(c)"
     )
-    await db.execute(
+    await tx.execute(
         "MATCH (u:User {name: 'Alice'}), (o:Order {amount: 999.99}) CREATE (u)-[:PLACED]->(o)"
     )
+    await tx.commit()
 
-    await db.create_vector_index("Product", "embedding", "l2")
+    await (
+        db.schema()
+        .label("Product")
+        .index("embedding", {"type": "vector", "metric": "l2"})
+        .apply()
+    )
     await db.flush()
     return db
 
@@ -210,7 +221,7 @@ async def async_document_db():
     Labels: Document(title, text, embedding:vec4), Author(name), Tag(name)
     Edges: AUTHORED_BY, TAGGED, CITES
     """
-    db = await uni_db.AsyncDatabase.temporary()
+    db = await uni_db.AsyncUni.temporary()
     await (
         db.schema()
         .label("Document")
@@ -243,7 +254,7 @@ async def async_indexed_db():
             vector index on embedding
     Edges: RELATED_TO(weight?)
     """
-    db = await uni_db.AsyncDatabase.temporary()
+    db = await uni_db.AsyncUni.temporary()
     await (
         db.schema()
         .label("Item")
@@ -260,7 +271,12 @@ async def async_indexed_db():
         .done()
         .apply()
     )
-    await db.create_vector_index("Item", "embedding", "l2")
+    await (
+        db.schema()
+        .label("Item")
+        .index("embedding", {"type": "vector", "metric": "l2"})
+        .apply()
+    )
     return db
 
 
@@ -272,7 +288,7 @@ async def async_indexed_db():
 @pytest.fixture
 def empty_db():
     """Sync temporary database with no schema."""
-    return uni_db.DatabaseBuilder.temporary().build()
+    return uni_db.UniBuilder.temporary().build()
 
 
 @pytest.fixture
@@ -282,7 +298,7 @@ def social_db():
     Labels: Person(name, age, email?), Company(name, founded?)
     Edges: KNOWS(since?), WORKS_AT(role?)
     """
-    db = uni_db.DatabaseBuilder.temporary().build()
+    db = uni_db.UniBuilder.temporary().build()
     (
         db.schema()
         .label("Person")
@@ -309,42 +325,45 @@ def social_db():
 def social_db_populated(social_db):
     """Sync social database pre-populated with test data."""
     db = social_db
-    db.execute("CREATE (p:Person {name: 'Alice', age: 30, email: 'alice@example.com'})")
-    db.execute("CREATE (p:Person {name: 'Bob', age: 25, email: 'bob@example.com'})")
-    db.execute("CREATE (p:Person {name: 'Charlie', age: 35})")
-    db.execute("CREATE (p:Person {name: 'Diana', age: 28, email: 'diana@example.com'})")
-    db.execute("CREATE (p:Person {name: 'Eve', age: 32})")
-    db.execute("CREATE (c:Company {name: 'TechCorp', founded: 2010})")
-    db.execute("CREATE (c:Company {name: 'StartupInc', founded: 2020})")
+    session = db.session()
+    tx = session.tx()
+    tx.execute("CREATE (p:Person {name: 'Alice', age: 30, email: 'alice@example.com'})")
+    tx.execute("CREATE (p:Person {name: 'Bob', age: 25, email: 'bob@example.com'})")
+    tx.execute("CREATE (p:Person {name: 'Charlie', age: 35})")
+    tx.execute("CREATE (p:Person {name: 'Diana', age: 28, email: 'diana@example.com'})")
+    tx.execute("CREATE (p:Person {name: 'Eve', age: 32})")
+    tx.execute("CREATE (c:Company {name: 'TechCorp', founded: 2010})")
+    tx.execute("CREATE (c:Company {name: 'StartupInc', founded: 2020})")
 
-    db.execute(
+    tx.execute(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) "
         "CREATE (a)-[:KNOWS {since: 2015}]->(b)"
     )
-    db.execute(
+    tx.execute(
         "MATCH (b:Person {name: 'Bob'}), (c:Person {name: 'Charlie'}) "
         "CREATE (b)-[:KNOWS {since: 2018}]->(c)"
     )
-    db.execute(
+    tx.execute(
         "MATCH (a:Person {name: 'Alice'}), (c:Person {name: 'Charlie'}) "
         "CREATE (a)-[:KNOWS {since: 2020}]->(c)"
     )
-    db.execute(
+    tx.execute(
         "MATCH (d:Person {name: 'Diana'}), (e:Person {name: 'Eve'}) "
         "CREATE (d)-[:KNOWS]->(e)"
     )
-    db.execute(
+    tx.execute(
         "MATCH (a:Person {name: 'Alice'}), (t:Company {name: 'TechCorp'}) "
         "CREATE (a)-[:WORKS_AT {role: 'Engineer'}]->(t)"
     )
-    db.execute(
+    tx.execute(
         "MATCH (b:Person {name: 'Bob'}), (t:Company {name: 'TechCorp'}) "
         "CREATE (b)-[:WORKS_AT {role: 'Designer'}]->(t)"
     )
-    db.execute(
+    tx.execute(
         "MATCH (c:Person {name: 'Charlie'}), (s:Company {name: 'StartupInc'}) "
         "CREATE (c)-[:WORKS_AT {role: 'CTO'}]->(s)"
     )
+    tx.commit()
     db.flush()
     return db
 
@@ -352,7 +371,7 @@ def social_db_populated(social_db):
 @pytest.fixture
 def ecommerce_db():
     """Sync database with e-commerce schema."""
-    db = uni_db.DatabaseBuilder.temporary().build()
+    db = uni_db.UniBuilder.temporary().build()
     (
         db.schema()
         .label("User")
@@ -386,50 +405,55 @@ def ecommerce_db():
 def ecommerce_db_populated(ecommerce_db):
     """Sync e-commerce database pre-populated with data including embeddings."""
     db = ecommerce_db
-    db.execute("CREATE (u:User {name: 'Alice'})")
-    db.execute("CREATE (u:User {name: 'Bob'})")
-    db.execute(
+    session = db.session()
+    tx = session.tx()
+    tx.execute("CREATE (u:User {name: 'Alice'})")
+    tx.execute("CREATE (u:User {name: 'Bob'})")
+    tx.execute(
         "CREATE (p:Product {name: 'Laptop', price: 999.99, embedding: [1.0, 0.0, 0.0, 0.0]})"
     )
-    db.execute(
+    tx.execute(
         "CREATE (p:Product {name: 'Phone', price: 699.99, embedding: [0.9, 0.1, 0.0, 0.0]})"
     )
-    db.execute(
+    tx.execute(
         "CREATE (p:Product {name: 'Book', price: 19.99, embedding: [0.0, 0.0, 1.0, 0.0]})"
     )
-    db.execute(
+    tx.execute(
         "CREATE (p:Product {name: 'Headphones', price: 149.99, embedding: [0.8, 0.2, 0.0, 0.0]})"
     )
-    db.execute("CREATE (c:Category {name: 'Electronics'})")
-    db.execute("CREATE (c:Category {name: 'Books'})")
-    db.execute("CREATE (o:Order {amount: 999.99})")
+    tx.execute("CREATE (c:Category {name: 'Electronics'})")
+    tx.execute("CREATE (c:Category {name: 'Books'})")
+    tx.execute("CREATE (o:Order {amount: 999.99})")
 
-    db.execute(
+    tx.execute(
         "MATCH (u:User {name: 'Alice'}), (p:Product {name: 'Laptop'}) CREATE (u)-[:VIEWED]->(p)"
     )
-    db.execute(
+    tx.execute(
         "MATCH (u:User {name: 'Alice'}), (p:Product {name: 'Laptop'}) CREATE (u)-[:PURCHASED]->(p)"
     )
-    db.execute(
+    tx.execute(
         "MATCH (u:User {name: 'Bob'}), (p:Product {name: 'Book'}) CREATE (u)-[:VIEWED]->(p)"
     )
-    db.execute(
+    tx.execute(
         "MATCH (p:Product {name: 'Laptop'}), (c:Category {name: 'Electronics'}) "
         "CREATE (p)-[:IN_CATEGORY]->(c)"
     )
-    db.execute(
+    tx.execute(
         "MATCH (p:Product {name: 'Phone'}), (c:Category {name: 'Electronics'}) "
         "CREATE (p)-[:IN_CATEGORY]->(c)"
     )
-    db.execute(
+    tx.execute(
         "MATCH (p:Product {name: 'Book'}), (c:Category {name: 'Books'}) "
         "CREATE (p)-[:IN_CATEGORY]->(c)"
     )
-    db.execute(
+    tx.execute(
         "MATCH (u:User {name: 'Alice'}), (o:Order {amount: 999.99}) CREATE (u)-[:PLACED]->(o)"
     )
+    tx.commit()
 
-    db.create_vector_index("Product", "embedding", "l2")
+    db.schema().label("Product").index(
+        "embedding", {"type": "vector", "metric": "l2"}
+    ).apply()
     db.flush()
     return db
 
@@ -437,7 +461,7 @@ def ecommerce_db_populated(ecommerce_db):
 @pytest.fixture
 def document_db():
     """Sync database with document/RAG schema."""
-    db = uni_db.DatabaseBuilder.temporary().build()
+    db = uni_db.UniBuilder.temporary().build()
     (
         db.schema()
         .label("Document")
@@ -465,7 +489,7 @@ def document_db():
 @pytest.fixture
 def indexed_db():
     """Sync database with indexed schema."""
-    db = uni_db.DatabaseBuilder.temporary().build()
+    db = uni_db.UniBuilder.temporary().build()
     (
         db.schema()
         .label("Item")
@@ -482,5 +506,7 @@ def indexed_db():
         .done()
         .apply()
     )
-    db.create_vector_index("Item", "embedding", "l2")
+    db.schema().label("Item").index(
+        "embedding", {"type": "vector", "metric": "l2"}
+    ).apply()
     return db

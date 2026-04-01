@@ -40,13 +40,16 @@ async fn test_schemaless_vertex_create_and_query() -> Result<()> {
     // Create a completely schemaless label (no properties defined)
     db.schema().label("Person").apply().await?;
 
-    db.execute("CREATE (:Person {name: 'Alice', age: 30, city: 'NYC'})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Person {name: 'Alice', age: 30, city: 'NYC'})")
         .await?;
-    db.execute("CREATE (:Person {name: 'Bob', age: 25, country: 'USA'})")
+    tx.execute("CREATE (:Person {name: 'Bob', age: 25, country: 'USA'})")
         .await?;
+    tx.commit().await?;
 
     // Query from L0 (before flush) - schemaless properties are accessible
     let results = db
+        .session()
         .query("MATCH (p:Person) RETURN p.name, p.age, p.city, p.country")
         .await?;
     assert_eq!(results.len(), 2);
@@ -100,10 +103,13 @@ async fn test_schemaless_edge_create_and_query() -> Result<()> {
         .await?;
 
     // Create vertices and edge with schemaless properties
-    db.execute("CREATE (a:Person {name: 'Alice'})-[:KNOWS {since: 2020, strength: 0.9}]->(b:Person {name: 'Bob'})").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (a:Person {name: 'Alice'})-[:KNOWS {since: 2020, strength: 0.9}]->(b:Person {name: 'Bob'})").await?;
+    tx.commit().await?;
 
     // Query edge properties from L0 (before flush)
     let results = db
+        .session()
         .query("MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN r.since, r.strength")
         .await?;
     assert_eq!(results.len(), 1);
@@ -128,7 +134,8 @@ async fn test_schemaless_mixed_types() -> Result<()> {
     db.schema().label("Product").apply().await?;
 
     // Create with various data types
-    db.execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         r#"
         CREATE (:Product {
             name: 'Widget',
@@ -140,9 +147,11 @@ async fn test_schemaless_mixed_types() -> Result<()> {
     "#,
     )
     .await?;
+    tx.commit().await?;
 
     // Query from L0 (before flush) - all property types accessible
     let results = db
+        .session()
         .query("MATCH (p:Product) RETURN p.name, p.price, p.in_stock, p.quantity, p.tags")
         .await?;
     assert_eq!(results.len(), 1);
@@ -202,11 +211,16 @@ async fn test_schemaless_update_properties() -> Result<()> {
     db.schema().label("User").apply().await?;
 
     // Create with initial properties
-    db.execute("CREATE (:User {name: 'Alice', email: 'alice@example.com'})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:User {name: 'Alice', email: 'alice@example.com'})")
         .await?;
+    tx.commit().await?;
 
     // Verify properties are accessible from L0
-    let results = db.query("MATCH (u:User) RETURN u.name, u.email").await?;
+    let results = db
+        .session()
+        .query("MATCH (u:User) RETURN u.name, u.email")
+        .await?;
     assert_eq!(results.len(), 1);
     let row = &results.rows()[0];
     assert_eq!(row.get::<String>("u.name")?, "Alice");
@@ -225,13 +239,18 @@ async fn test_schemaless_null_properties() -> Result<()> {
     db.schema().label("Person").apply().await?;
 
     // Create with some null properties
-    db.execute("CREATE (:Person {name: 'Alice', age: 30})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Person {name: 'Alice', age: 30})")
         .await?;
-    db.execute("CREATE (:Person {name: 'Bob', age: null})")
+    tx.execute("CREATE (:Person {name: 'Bob', age: null})")
         .await?;
+    tx.commit().await?;
 
     // Query from L0 - should handle null gracefully
-    let results = db.query("MATCH (p:Person) RETURN p.name, p.age").await?;
+    let results = db
+        .session()
+        .query("MATCH (p:Person) RETURN p.name, p.age")
+        .await?;
     assert_eq!(results.len(), 2);
 
     // Find Bob's row
@@ -259,19 +278,24 @@ async fn test_schemaless_performance() -> Result<()> {
 
     // Insert many vertices with schemaless properties
     for i in 0..100 {
-        db.execute(&format!(
+        let tx = db.session().tx().await?;
+        tx.execute(&format!(
             "CREATE (:Event {{id: {}, type: 'click', timestamp: {}, user_id: 'user_{}'}})",
             i,
             1000000 + i,
             i % 10
         ))
         .await?;
+        tx.commit().await?;
     }
 
     db.flush().await?;
 
     // Query all events (can't filter on overflow properties in WHERE clause)
-    let results = db.query("MATCH (e:Event) RETURN count(e) as cnt").await?;
+    let results = db
+        .session()
+        .query("MATCH (e:Event) RETURN count(e) as cnt")
+        .await?;
     assert_eq!(results.len(), 1);
     let row = &results.rows()[0];
     assert_eq!(row.get::<i64>("cnt")?, 100);
@@ -291,11 +315,14 @@ async fn test_schemaless_unknown_edge_type_returns_empty() -> Result<()> {
     db.schema().label("Person").apply().await?;
 
     // Create some vertices
-    db.execute("CREATE (:Person {name: 'Alice'})").await?;
-    db.execute("CREATE (:Person {name: 'Bob'})").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Person {name: 'Alice'})").await?;
+    tx.execute("CREATE (:Person {name: 'Bob'})").await?;
+    tx.commit().await?;
 
     // Query with an unknown edge type - should return empty, not error
     let results = db
+        .session()
         .query("MATCH (a:Person)-[:UNKNOWN_TYPE]->(b:Person) RETURN a.name, b.name")
         .await?;
 
@@ -324,18 +351,21 @@ async fn test_schemaless_edge_type_query_with_data() -> Result<()> {
         .await?;
 
     // Create vertices and an edge with the KNOWN type
-    db.execute("CREATE (:Person {name: 'Alice', ext_id: 'alice'})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Person {name: 'Alice', ext_id: 'alice'})")
         .await?;
-    db.execute("CREATE (:Person {name: 'Bob', ext_id: 'bob'})")
+    tx.execute("CREATE (:Person {name: 'Bob', ext_id: 'bob'})")
         .await?;
-    db.execute(
-        "MATCH (a:Person {ext_id: 'alice'}), (b:Person {ext_id: 'bob'}) 
+    tx.execute(
+        "MATCH (a:Person {ext_id: 'alice'}), (b:Person {ext_id: 'bob'})
          CREATE (a)-[:KNOWS {weight: 0.5, note: 'friends'}]->(b)",
     )
     .await?;
+    tx.commit().await?;
 
     // Query using the KNOWN edge type - should work
     let results = db
+        .session()
         .query("MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN a.name, b.name, r.weight")
         .await?;
     assert_eq!(results.len(), 1);
@@ -346,6 +376,7 @@ async fn test_schemaless_edge_type_query_with_data() -> Result<()> {
 
     // Query using an UNKNOWN edge type - should return empty (not error)
     let results = db
+        .session()
         .query("MATCH (a:Person)-[r:UNKNOWN_TYPE]->(b:Person) RETURN a.name, b.name")
         .await?;
     assert_eq!(results.len(), 0);

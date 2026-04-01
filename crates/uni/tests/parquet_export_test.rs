@@ -36,7 +36,6 @@ async fn test_parquet_export() -> anyhow::Result<()> {
     );
 
     // Insert 2 Persons
-    let lancedb_store = storage.lancedb_store();
     let ds = storage.vertex_dataset("Person")?;
     let arrow_schema = ds.get_arrow_schema(&schema_manager.schema())?;
 
@@ -73,7 +72,7 @@ async fn test_parquet_export() -> anyhow::Result<()> {
             Arc::new(LargeBinaryArray::from(vec![None::<&[u8]>; 2])), // overflow_json
         ],
     )?;
-    ds.write_batch_lancedb(lancedb_store, batch, &schema_manager.schema())
+    ds.write_batch(storage.backend(), batch, &schema_manager.schema())
         .await?;
 
     // 2. Execute COPY TO Parquet

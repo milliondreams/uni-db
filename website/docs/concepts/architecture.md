@@ -12,7 +12,7 @@ Before diving into the architecture, understand the key principles that guided U
 | **Multi-Model Unity** | Graph, vector, document, and columnar in one engine, not bolted together |
 | **Object-Store Native** | Designed for cloud storage (S3/GCS/Azure) with local caching for low-latency |
 | **Vectorized Execution** | Batch processing with Apache Arrow for 100x+ speedups |
-| **Single-Writer Simplicity** | No distributed consensus; one writer, many readers, snapshot isolation |
+| **Commit-Time Serialization** | No distributed consensus; multiple transactions coexist, writer lock only at commit |
 | **Late Materialization** | Load properties only when needed to minimize I/O |
 | **Time-Based Durability** | Auto-flush ensures data reaches storage within configurable intervals |
 
@@ -25,11 +25,21 @@ Before diving into the architecture, understand the key principles that guided U
 │                              APPLICATION                                     │
 │                                                                             │
 │   ┌───────────────┐   ┌───────────────┐   ┌───────────────┐                │
-│   │  Rust Crate   │   │    CLI Tool   │   │  HTTP Server  │                │
-│   │   (Library)   │   │               │   │   (Optional)  │                │
+│   │  Rust Crate   │   │ Python Bindings│   │  CLI Tool    │                │
+│   │   (Library)   │   │  (uni_db)     │   │              │                │
 │   └───────┬───────┘   └───────┬───────┘   └───────┬───────┘                │
 │           │                   │                   │                         │
 │           └───────────────────┴───────────────────┘                         │
+│                               │                                             │
+├───────────────────────────────┼─────────────────────────────────────────────┤
+│                               ▼                                             │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │                        SESSION LAYER                                 │   │
+│   │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────────┐   │   │
+│   │  │   Session    │  │ Transaction  │  │   Plan Cache             │   │   │
+│   │  │  (per-user)  │  │  (read/write)│  │   (per-session)          │   │   │
+│   │  └──────────────┘  └──────────────┘  └──────────────────────────┘   │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
 │                               │                                             │
 ├───────────────────────────────┼─────────────────────────────────────────────┤
 │                               ▼                                             │
@@ -39,6 +49,9 @@ Before diving into the architecture, understand the key principles that guided U
 │   │  │    Parser    │→ │   Planner    │→ │  Vectorized Executor     │   │   │
 │   │  │   (Cypher)   │  │ (Optimizer)  │  │    (Arrow Batches)       │   │   │
 │   │  └──────────────┘  └──────────────┘  └──────────────────────────┘   │   │
+│   │  ┌──────────────────────────────────────────────────────────────┐   │   │
+│   │  │  Locy Runtime (rule-based reasoning, Datalog evaluation)    │   │   │
+│   │  └──────────────────────────────────────────────────────────────┘   │   │
 │   └─────────────────────────────────────────────────────────────────────┘   │
 │                               │                                             │
 ├───────────────────────────────┼─────────────────────────────────────────────┤
@@ -88,11 +101,16 @@ Before diving into the architecture, understand the key principles that guided U
 ```mermaid
 flowchart TB
     subgraph Application
-        A[Rust Crate / CLI / HTTP]
+        A[Rust Crate / Python Bindings / CLI]
+    end
+
+    subgraph Session["Session Layer"]
+        S[Session + Transaction + Plan Cache]
     end
 
     subgraph Query["Query Layer"]
         B[Parser] --> C[Planner] --> D[Executor]
+        E2[Locy Runtime]
     end
 
     subgraph Runtime["Runtime Layer"]
@@ -111,7 +129,8 @@ flowchart TB
         K[Local / S3 / GCS]
     end
 
-    Application --> Query
+    Application --> Session
+    Session --> Query
     Query --> Runtime
     Runtime --> Storage
     Storage --> ObjectStore
@@ -205,13 +224,13 @@ The Runtime Layer manages in-memory state, caching, and write coordination.
 
 ### L0 Buffer
 
-In-memory buffer for uncommitted mutations. All writes land here first.
+Per-transaction private buffer for uncommitted mutations. Each transaction gets its own L0 buffer, providing isolation between concurrent transactions. Buffers are merged into shared storage at commit time via a serialization lock.
 
 ```mermaid
 flowchart TB
     M["Mutations (INSERT/DELETE)"]
 
-    subgraph L0["L0 Buffer"]
+    subgraph L0["L0 Buffer (per-transaction)"]
         DG["Graph<br/>(SimpleGraph)"]
         PM["Property Maps<br/>vertex_props, edge_props"]
         TS["Tombstones<br/>(Deletes)"]
@@ -221,14 +240,15 @@ flowchart TB
     Lance["Lance Datasets"]
 
     M --> L0
-    L0 -->|on flush| Lance
+    L0 -->|on commit| Lance
 ```
 
 **Characteristics:**
+- Per-transaction private buffers for write isolation
 - Row-oriented for fast single-record inserts
-- Backed by Write-Ahead Log for durability
+- Commit-time serialization (writer lock acquired only at commit, not at write time)
+- Read-your-writes semantics within the transaction
 - Flushed to L1 (Lance) when size threshold reached
-- Read-your-writes semantics for queries
 
 ### Adjacency Cache
 

@@ -44,8 +44,7 @@ async fn test_warm_from_delta_storage() -> anyhow::Result<()> {
     };
 
     let batch = delta.build_record_batch(&[op], &schema)?;
-    let lancedb_store = storage.lancedb_store();
-    delta.write_run_lancedb(lancedb_store, batch).await?;
+    delta.write_run(storage.backend(), batch).await?;
 
     // Warm AM from storage
     storage
@@ -95,7 +94,7 @@ async fn test_overlay_neighbors_via_writer() -> anyhow::Result<()> {
 
     // Insert via Writer (dual-writes to L0 data + AM overlay)
     writer
-        .insert_edge(src, dst, type_id, eid, HashMap::new(), None)
+        .insert_edge(src, dst, type_id, eid, HashMap::new(), None, None)
         .await?;
 
     // Edge should be immediately visible in AM overlay

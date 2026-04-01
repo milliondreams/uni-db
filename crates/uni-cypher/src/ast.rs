@@ -20,7 +20,6 @@ pub enum Query {
         all: bool,
     },
     Schema(Box<SchemaCommand>),
-    Transaction(TransactionCommand),
     Explain(Box<Query>),
     /// Query with time-travel: wraps any query with a VERSION/TIMESTAMP AS OF clause.
     /// Resolved at the API layer before planning.
@@ -28,13 +27,6 @@ pub enum Query {
         query: Box<Query>,
         spec: TimeTravelSpec,
     },
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum TransactionCommand {
-    Begin,
-    Commit,
-    Rollback,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

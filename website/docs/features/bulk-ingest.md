@@ -17,8 +17,10 @@ Uni includes a bulk writer optimized for high-throughput ingestion. It batches w
 
     # async fn demo() -> Result<(), uni_db::UniError> {
     let db = Uni::open("./my_db").build().await?;
+    let session = db.session();
+    let tx = session.tx().await?;
 
-    let mut writer = db.bulk_writer().build()?;
+    let mut writer = tx.bulk_writer().build()?;
 
     let mut v1 = HashMap::new();
     v1.insert("name".to_string(), serde_json::json!("Alice"));
@@ -38,8 +40,10 @@ Uni includes a bulk writer optimized for high-throughput ingestion. It batches w
     ```python
     import uni_db
 
-    db = uni_db.Database("./my_db")
-    writer = db.bulk_writer().build()
+    db = uni_db.Uni.open("./my_db")
+    session = db.session()
+    tx = session.tx()
+    writer = tx.bulk_writer().build()
 
     vids = writer.insert_vertices("Person", [
         {"name": "Alice"},

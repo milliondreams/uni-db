@@ -1,0 +1,23 @@
+{
+  "skill_name": "uni-db",
+  "evals": [
+    {
+      "id": 0,
+      "prompt": "Write a Python script that creates a uni-db, defines a schema for a document store with vector and full-text indexes, ingests sample documents with embeddings, and performs hybrid search combining vector similarity with BM25 full-text search.",
+      "expected_output": "A working Python script that correctly uses UniBuilder, SchemaBuilder with vector() and index() calls, Transaction for writing, and CALL uni.search or similar_to for hybrid search.",
+      "files": []
+    },
+    {
+      "id": 1,
+      "prompt": "Write Locy rules for transitive risk propagation in a supply chain network using MNOR to combine probabilities, then write the Python code to create the rules, seed base facts via Cypher, run a QUERY, and print the results.",
+      "expected_output": "Locy rules using CREATE RULE with IS references, YIELD with KEY and PROB, FOLD with MNOR for probability combination. Python code using session.locy() to create rules and query.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "Using uni-pydantic, model a social network with User nodes (name, bio, embedding vector) and FOLLOWS edges (since date, weight), then write code to create users, add follow relationships, query followers with filters, and do vector similarity search on user bios.",
+      "expected_output": "Pydantic models with UniNode/UniEdge, Vector[N] type, Relationship definitions. Code using UniSession to register models, sync schema, add nodes/edges, QueryBuilder with filters, and vector_search.",
+      "files": []
+    }
+  ]
+}

@@ -115,7 +115,7 @@ After installation, verify Uni is working correctly:
 
 ```bash
 uni --version
-# Output: uni 0.1.0
+# Output: uni 1.0.0
 ```
 
 ### Display Help

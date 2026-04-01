@@ -72,7 +72,7 @@ Fix: This is a fundamental limitation when shared evidence crosses group boundar
 
 ## Debug Workflow
 
-1. `compile_only` to validate program structure.
+1. `session.compile_locy(program)` to validate program structure.
 2. Run with smaller datasets.
 3. Use `EXPLAIN RULE` on specific bindings.
 4. Add constraints to `QUERY`/`ABDUCE` scopes.

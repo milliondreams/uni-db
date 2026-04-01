@@ -8,7 +8,7 @@ This package provides a type-safe Object-Graph Mapping layer on top of
 the Uni graph database, using Pydantic v2 for model definitions.
 
 Example:
-    >>> from uni_db import Database
+    >>> from uni_db import Uni
     >>> from uni_pydantic import UniNode, UniSession, Field, Relationship, Vector
     >>>
     >>> class Person(UniNode):
@@ -18,7 +18,7 @@ Example:
     ...     embedding: Vector[1536]
     ...     friends: list["Person"] = Relationship("FRIEND_OF", direction="both")
     >>>
-    >>> db = Database("./my_graph")
+    >>> db = Uni("./my_graph")
     >>> session = UniSession(db)
     >>> session.register(Person)
     >>> session.sync_schema()
@@ -31,7 +31,7 @@ Example:
     >>> adults = session.query(Person).filter(Person.age >= 18).all()
 """
 
-__version__ = "0.1.0"
+__version__ = "1.0.0"
 
 # Base classes
 # Async support

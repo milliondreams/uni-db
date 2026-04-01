@@ -67,13 +67,14 @@ async fn test_recommendation_use_case() -> anyhow::Result<()> {
             ("embedding".to_string(), Value::Vector(p2_vec.clone())),
         ]),
     ];
-    let product_vids = db.bulk_insert_vertices("Product", products).await?;
+    let tx = db.session().tx().await?;
+    let product_vids = tx.bulk_insert_vertices("Product", products).await?;
     let p1 = product_vids[0];
     let _p2 = product_vids[1];
 
     // Users: U1, U2, U3
     let users = vec![HashMap::new(), HashMap::new(), HashMap::new()];
-    let user_vids = db.bulk_insert_vertices("User", users).await?;
+    let user_vids = tx.bulk_insert_vertices("User", users).await?;
     let u1 = user_vids[0];
     let u2 = user_vids[1];
     let u3 = user_vids[2];
@@ -84,7 +85,8 @@ async fn test_recommendation_use_case() -> anyhow::Result<()> {
         (u2, p1, HashMap::new()),
         (u3, p1, HashMap::new()),
     ];
-    db.bulk_insert_edges("PURCHASED", purchased).await?;
+    tx.bulk_insert_edges("PURCHASED", purchased).await?;
+    tx.commit().await?;
 
     db.flush().await?;
 
@@ -94,16 +96,17 @@ async fn test_recommendation_use_case() -> anyhow::Result<()> {
     let search_vec: Vec<f32> = vec![1.0, 0.0, 0.0, 0.0];
     let vec_query = "CALL uni.vector.query('Product', 'embedding', $vec, 10) YIELD node, distance RETURN node._vid AS vid, distance";
     let vec_result = db
+        .session()
         .query_with(vec_query)
         .param("vec", Value::Vector(search_vec))
         .fetch_all()
         .await?;
 
     // Verify we got results
-    assert!(!vec_result.rows.is_empty());
+    assert!(!vec_result.is_empty());
 
     // Assume P1 is top result (dist 0)
-    let p1_node_vid_str: String = String::try_from(&vec_result.rows[0].values[0]).unwrap();
+    let p1_node_vid_str: String = String::try_from(&vec_result.rows()[0].values()[0]).unwrap();
     // Verify it matches P1
     assert_eq!(p1_node_vid_str, p1.to_string());
 
@@ -111,23 +114,24 @@ async fn test_recommendation_use_case() -> anyhow::Result<()> {
 
     // Debug Graph Query
     let debug_graph = "MATCH (u:User)-[:PURCHASED]->(p:Product) RETURN u._vid, p._vid";
-    let debug_res = db.query_with(debug_graph).fetch_all().await?;
-    println!("Debug Graph: {} rows", debug_res.rows.len());
-    for row in &debug_res.rows {
-        println!("  Row: {:?}", row.values);
+    let debug_res = db.session().query_with(debug_graph).fetch_all().await?;
+    println!("Debug Graph: {} rows", debug_res.len());
+    for row in debug_res.rows() {
+        println!("  Row: {:?}", row.values());
     }
 
     // B. Graph Scoring (Collaborative)
     // MATCH (other_user:User)-[:PURCHASED]->(product) WHERE product._vid = $pid RETURN COUNT(other_user)
     let graph_query = "MATCH (other_user:User)-[:PURCHASED]->(product) WHERE product._vid = $pid RETURN COUNT(other_user) as count";
     let graph_result = db
+        .session()
         .query_with(graph_query)
         .param("pid", Value::Int(p1.as_u64() as i64))
         .fetch_all()
         .await?;
 
-    assert_eq!(graph_result.rows.len(), 1);
-    let count: i64 = i64::try_from(&graph_result.rows[0].values[0]).unwrap();
+    assert_eq!(graph_result.len(), 1);
+    let count: i64 = i64::try_from(&graph_result.rows()[0].values()[0]).unwrap();
     assert_eq!(count, 3);
 
     Ok(())

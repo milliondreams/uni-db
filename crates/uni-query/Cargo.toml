@@ -30,8 +30,6 @@ arrow = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-row = { workspace = true }
-lance = { workspace = true }
-lancedb = { workspace = true }
 regex = { workspace = true }
 chrono = { workspace = true }
 chrono-tz = { workspace = true }
@@ -45,6 +43,7 @@ datafusion = { workspace = true }
 bitvec = "1"
 fxhash = { workspace = true }
 biodivine-lib-bdd = { workspace = true }
+tokio-util = { workspace = true }
 
 [features]
 default = []

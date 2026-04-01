@@ -17,27 +17,28 @@ class TestDemo01SemanticScholar(unittest.TestCase):
         self.test_dir = "./test_db_demo01"
         if os.path.exists(self.test_dir):
             shutil.rmtree(self.test_dir)
-        self.db = uni_db.Database(self.test_dir)
+        self.db = uni_db.Uni.open(self.test_dir)
+        self.session = self.db.session()
         self.setup_schema()
         self.generate_data()
 
     def tearDown(self):
+        del self.session
         del self.db
         if os.path.exists(self.test_dir):
             shutil.rmtree(self.test_dir)
 
     def setup_schema(self):
-        # Vertex Labels
-        self.db.create_label("Paper")
-        self.db.create_label("Author")
-
-        # Edge Types
-        self.db.create_edge_type("CITES")
-        self.db.create_edge_type("AUTHORED_BY")
+        # Vertex Labels, Edge Types, and Vector Index
+        self.db.schema().label("Paper").done().label("Author").done().edge_type(
+            "CITES"
+        ).done().edge_type("AUTHORED_BY").done().apply()
 
         # Vector Index
         # Assuming 3 dimensions for simplicity in test (real demo uses 768)
-        self.db.create_vector_index("Paper", "embedding", 3, "l2")
+        self.db.schema().label("Paper").index(
+            "embedding", {"type": "vector", "metric": "l2"}
+        ).apply()
 
     def generate_data(self):
         self.papers = []
@@ -68,7 +69,7 @@ class TestDemo01SemanticScholar(unittest.TestCase):
                     _doc: $_doc
                 })
             """
-            self.db.query(cypher, paper)
+            self.session.query(cypher, paper)
 
         # Create Citations (Random graph)
         for i in range(50):
@@ -78,7 +79,7 @@ class TestDemo01SemanticScholar(unittest.TestCase):
             for cited_id in cited_ids:
                 if cited_id == i:
                     continue
-                self.db.query(
+                self.session.query(
                     "MATCH (a:Paper {id: $src}), (b:Paper {id: $dst}) CREATE (a)-[:CITES]->(b)",
                     {"src": i, "dst": cited_id},
                 )
@@ -103,7 +104,7 @@ class TestDemo01SemanticScholar(unittest.TestCase):
             LIMIT 10
         """
 
-        results = self.db.query(
+        results = self.session.query(
             cypher, {"seed_id": seed_id, "seed_embedding": seed_embedding}
         )
 
@@ -146,7 +147,7 @@ class TestDemo01SemanticScholar(unittest.TestCase):
         # Assuming for test purposes I just want to run it.
         # I'll use a loose threshold or just verify it runs.
 
-        results = self.db.query(cypher, {"vec": target_vec})
+        results = self.session.query(cypher, {"vec": target_vec})
         # Just ensure it doesn't crash
         self.assertTrue(isinstance(results, list))
 

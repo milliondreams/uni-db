@@ -113,7 +113,7 @@ pub async fn import_semantic_scholar(
             // Insert vertex — convert serde_json values to uni_common values
             let uni_props: uni_common::Properties =
                 props.into_iter().map(|(k, v)| (k, v.into())).collect();
-            w.insert_vertex(vid, uni_props).await?;
+            w.insert_vertex(vid, uni_props, None).await?;
 
             count += 1;
             if count % 1000 == 0 {
@@ -162,6 +162,7 @@ pub async fn import_semantic_scholar(
                 eid,
                 HashMap::new(),
                 Some("CITES".to_string()),
+                None,
             )
             .await?;
 

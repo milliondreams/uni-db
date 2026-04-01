@@ -40,10 +40,12 @@ async fn test_gcounter_merge_on_write() -> Result<()> {
 
     // 1. Initial Create: Actor A = 10
     // JSON: {"t": "gc", "d": {"counts": {"A": 10}}}
-    db.execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         r#"CREATE (c:CrdtCounter {id: 1, count: '{"t": "gc", "d": {"counts": {"A": 10}}}'})"#,
     )
     .await?;
+    tx.commit().await?;
 
     // Flush to ensure it's in storage/L1 for the next read
     db.flush().await?;
@@ -51,13 +53,16 @@ async fn test_gcounter_merge_on_write() -> Result<()> {
     // 2. Update: Actor B = 5
     // This MATCH + SET should trigger `Writer::prepare_vertex_upsert`
     // The writer will fetch the existing value (A=10) and merge with new value (B=5)
-    db.execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         r#"MATCH (c:CrdtCounter {id: 1}) SET c.count = '{"t": "gc", "d": {"counts": {"B": 5}}}'"#,
     )
     .await?;
+    tx.commit().await?;
 
     // 3. Verify immediately (Read from L0 overlay)
     let result = db
+        .session()
         .query("MATCH (c:CrdtCounter {id: 1}) RETURN c.count")
         .await?;
 
@@ -81,8 +86,10 @@ async fn test_gset_merge_on_read() -> Result<()> {
     let db = test_helpers::create_db().await?;
 
     // 1. Create with Item "Apple"
-    db.execute(r#"CREATE (s:CrdtSet {id: 1, items: '{"t": "gs", "d": {"elements": ["Apple"]}}'})"#)
+    let tx = db.session().tx().await?;
+    tx.execute(r#"CREATE (s:CrdtSet {id: 1, items: '{"t": "gs", "d": {"elements": ["Apple"]}}'})"#)
         .await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // 2. Update with Item "Banana"
@@ -91,15 +98,20 @@ async fn test_gset_merge_on_read() -> Result<()> {
     // (though Writer usually compacts on write).
     // Alternatively, we can leave one in L0.
 
-    db.execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         r#"MATCH (s:CrdtSet {id: 1}) SET s.items = '{"t": "gs", "d": {"elements": ["Banana"]}}'"#,
     )
     .await?;
+    tx.commit().await?;
 
     // We do NOT flush here, so "Banana" is in L0, "Apple" is in Storage.
     // `get_vertex_prop` should merge Storage("Apple") + L0("Banana")
 
-    let result = db.query("MATCH (s:CrdtSet {id: 1}) RETURN s.items").await?;
+    let result = db
+        .session()
+        .query("MATCH (s:CrdtSet {id: 1}) RETURN s.items")
+        .await?;
     assert_eq!(result.len(), 1, "Expected 1 row");
 
     let items_val = result.rows()[0].value("s.items").unwrap();

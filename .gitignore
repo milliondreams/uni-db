@@ -36,6 +36,10 @@ tarpaulin-report.html
 # Website build output
 website/site/
 
+# Generated notebook markdown (from convert_notebooks.py)
+website/docs/examples/**/*.md
+!website/docs/examples/index.md
+
 # Performance profiling data
 perf.data
 perf.data.old

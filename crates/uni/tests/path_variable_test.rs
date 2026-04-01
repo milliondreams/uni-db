@@ -16,15 +16,17 @@ async fn test_path_variable() -> Result<()> {
         .apply()
         .await?;
 
-    db.execute("CREATE (a:Person {name: 'Alice'})").await?;
-    db.execute("CREATE (b:Person {name: 'Bob'})").await?;
-    db.execute("CREATE (c:Person {name: 'Charlie'})").await?;
-    db.execute("MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) CREATE (a)-[:KNOWS {since: 2020}]->(b)").await?;
-    db.execute("MATCH (b:Person {name: 'Bob'}), (c:Person {name: 'Charlie'}) CREATE (b)-[:KNOWS {since: 2021}]->(c)").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (a:Person {name: 'Alice'})").await?;
+    tx.execute("CREATE (b:Person {name: 'Bob'})").await?;
+    tx.execute("CREATE (c:Person {name: 'Charlie'})").await?;
+    tx.execute("MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) CREATE (a)-[:KNOWS {since: 2020}]->(b)").await?;
+    tx.execute("MATCH (b:Person {name: 'Bob'}), (c:Person {name: 'Charlie'}) CREATE (b)-[:KNOWS {since: 2021}]->(c)").await?;
+    tx.commit().await?;
 
     // 1. Path variable in Variable Length Traversal
     // MATCH p = (a)-[:KNOWS*1..2]->(b) WHERE a.name = 'Alice' RETURN p
-    let result = db.query("MATCH p = (a:Person {name: 'Alice'})-[:KNOWS*1..2]->(b) RETURN p, length(p) AS len ORDER BY len").await?;
+    let result = db.session().query("MATCH p = (a:Person {name: 'Alice'})-[:KNOWS*1..2]->(b) RETURN p, length(p) AS len ORDER BY len").await?;
 
     // Should have 2 paths: Alice->Bob (len 1), Alice->Bob->Charlie (len 2)
     assert_eq!(result.len(), 2);
@@ -54,7 +56,7 @@ async fn test_path_variable() -> Result<()> {
     assert_eq!(p2.edges.len(), 2); // KNOWS, KNOWS
 
     // 2. NODES() and RELATIONSHIPS() functions
-    let result = db.query("MATCH p = (a:Person {name: 'Alice'})-[:KNOWS]->(b) RETURN nodes(p) AS ns, relationships(p) AS rels").await?;
+    let result = db.session().query("MATCH p = (a:Person {name: 'Alice'})-[:KNOWS]->(b) RETURN nodes(p) AS ns, relationships(p) AS rels").await?;
     assert_eq!(result.len(), 1);
     let row = &result.rows()[0];
 
@@ -88,21 +90,23 @@ async fn test_multihop_chained_path_variable() -> Result<()> {
         .apply()
         .await?;
 
-    db.execute("CREATE (a:Person {name: 'Alice'})").await?;
-    db.execute("CREATE (b:Person {name: 'Bob'})").await?;
-    db.execute("CREATE (c:Person {name: 'Charlie'})").await?;
-    db.execute(
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (a:Person {name: 'Alice'})").await?;
+    tx.execute("CREATE (b:Person {name: 'Bob'})").await?;
+    tx.execute("CREATE (c:Person {name: 'Charlie'})").await?;
+    tx.execute(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) CREATE (a)-[:KNOWS]->(b)",
     )
     .await?;
-    db.execute(
+    tx.execute(
         "MATCH (b:Person {name: 'Bob'}), (c:Person {name: 'Charlie'}) CREATE (b)-[:KNOWS]->(c)",
     )
     .await?;
+    tx.commit().await?;
 
     // Test chained multi-hop pattern with path variable
     // This pattern was previously blocked with "Named path variables not yet supported for multi-hop patterns"
-    let result = db.query(
+    let result = db.session().query(
         "MATCH p = (a:Person {name: 'Alice'})-[r1:KNOWS]->(b:Person)-[r2:KNOWS]->(c:Person) RETURN p, a.name AS a_name, c.name AS c_name"
     ).await?;
 

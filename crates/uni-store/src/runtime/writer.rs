@@ -14,7 +14,6 @@ use crate::storage::main_vertex::MainVertexDataset;
 use crate::storage::manager::StorageManager;
 use anyhow::{Result, anyhow};
 use chrono::Utc;
-use futures::TryStreamExt;
 use metrics;
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
@@ -49,7 +48,6 @@ pub struct Writer {
     pub allocator: Arc<IdAllocator>,
     pub config: UniConfig,
     pub xervo_runtime: Option<Arc<ModelRuntime>>,
-    pub transaction_l0: Option<Arc<RwLock<L0Buffer>>>,
     /// Property manager for cache invalidation after flush
     pub property_manager: Option<Arc<PropertyManager>>,
     /// Adjacency manager for dual-write (edges survive flush).
@@ -112,7 +110,6 @@ impl Writer {
             allocator,
             config,
             xervo_runtime: None,
-            transaction_l0: None,
             property_manager,
             adjacency_manager,
             last_flush_time: std::time::Instant::now(),
@@ -179,21 +176,24 @@ impl Writer {
         self.xervo_runtime.clone()
     }
 
-    pub fn begin_transaction(&mut self) -> Result<()> {
-        if self.transaction_l0.is_some() {
-            return Err(anyhow!("Transaction already active"));
-        }
+    /// Create a new empty L0 buffer for transaction-scoped mutations.
+    ///
+    /// Only reads the current version — no exclusive lock required on Writer.
+    /// The returned buffer has no WAL reference; mutations are logged at
+    /// commit time via [`Self::commit_transaction_l0`].
+    pub fn create_transaction_l0(&self) -> Arc<RwLock<L0Buffer>> {
         let current_version = self.l0_manager.get_current().read().current_version;
         // Transaction mutations are logged to WAL at COMMIT time, not during the transaction.
-        self.transaction_l0 = Some(Arc::new(RwLock::new(L0Buffer::new(current_version, None))));
-        Ok(())
+        Arc::new(RwLock::new(L0Buffer::new(current_version, None)))
     }
 
-    /// Returns the active L0 buffer: the transaction L0 if a transaction is open,
-    /// otherwise the current L0 from the manager.
-    fn active_l0(&self) -> Arc<RwLock<L0Buffer>> {
-        self.transaction_l0
-            .clone()
+    /// Resolve the target L0 buffer for a mutation.
+    ///
+    /// When `tx_l0` is `Some`, the mutation targets a transaction-private buffer.
+    /// When `None`, it targets the global L0 from the manager.
+    fn resolve_l0(&self, tx_l0: Option<&Arc<RwLock<L0Buffer>>>) -> Arc<RwLock<L0Buffer>> {
+        tx_l0
+            .cloned()
             .unwrap_or_else(|| self.l0_manager.get_current())
     }
 
@@ -201,28 +201,16 @@ impl Writer {
         let l0 = self.l0_manager.get_current();
         let size = l0.read().estimated_size;
         metrics::gauge!("l0_buffer_size_bytes").set(size as f64);
-
-        if let Some(tx_l0) = &self.transaction_l0 {
-            metrics::gauge!("active_transactions").set(1.0);
-            let tx_size = tx_l0.read().estimated_size;
-            metrics::gauge!("transaction_l0_size_bytes").set(tx_size as f64);
-        } else {
-            metrics::gauge!("active_transactions").set(0.0);
-            metrics::gauge!("transaction_l0_size_bytes").set(0.0);
-        }
     }
 
-    pub async fn commit_transaction(&mut self) -> Result<()> {
-        // 1. Borrow transaction L0 - keep available for rollback if commit fails
-        let tx_l0_arc = self
-            .transaction_l0
-            .as_ref()
-            .ok_or_else(|| anyhow!("No active transaction"))?
-            .clone();
-
-        // 2. Write transaction mutations to WAL BEFORE merging into main L0
+    /// Commit an externally-owned transaction L0 buffer.
+    ///
+    /// Writes mutations to WAL, flushes, merges into main L0, and replays
+    /// edges into the AdjacencyManager. Returns the WAL LSN of the commit
+    /// (0 when no WAL is configured).
+    pub async fn commit_transaction_l0(&mut self, tx_l0_arc: Arc<RwLock<L0Buffer>>) -> Result<u64> {
+        // 1. Write transaction mutations to WAL BEFORE merging into main L0
         // This ensures durability before visibility.
-        // Note: WAL is optional - if present, we get durability; if absent, we skip this step.
         {
             let tx_l0 = tx_l0_arc.read();
             let main_l0_arc = self.l0_manager.get_current();
@@ -230,7 +218,6 @@ impl Writer {
 
             // If WAL exists, write mutations to it for durability
             if let Some(wal) = main_l0.wal.as_ref() {
-                // Append all transaction mutations to WAL
                 // Order: vertices first, then edges (to ensure src/dst exist on replay)
 
                 // Vertex insertions
@@ -251,10 +238,9 @@ impl Writer {
                     wal.append(&crate::runtime::wal::Mutation::DeleteVertex { vid: *vid, labels })?;
                 }
 
-                // Edge insertions and deletions
+                // Edge insertions and deletions from edge_endpoints
                 for (eid, (src_vid, dst_vid, edge_type)) in &tx_l0.edge_endpoints {
                     if tx_l0.tombstones.contains_key(eid) {
-                        // Edge deletion
                         let version = tx_l0.edge_versions.get(eid).copied().unwrap_or(0);
                         wal.append(&crate::runtime::wal::Mutation::DeleteEdge {
                             eid: *eid,
@@ -264,7 +250,6 @@ impl Writer {
                             version,
                         })?;
                     } else {
-                        // Edge insertion
                         let properties =
                             tx_l0.edge_properties.get(eid).cloned().unwrap_or_default();
                         let version = tx_l0.edge_versions.get(eid).copied().unwrap_or(0);
@@ -280,23 +265,36 @@ impl Writer {
                         })?;
                     }
                 }
+
+                // Tombstones for edges that only exist in the global L0 (not in
+                // this transaction's edge_endpoints).  Without this, deletes of
+                // pre-existing edges would be silently lost.
+                for (eid, tombstone) in &tx_l0.tombstones {
+                    if !tx_l0.edge_endpoints.contains_key(eid) {
+                        let version = tx_l0.edge_versions.get(eid).copied().unwrap_or(0);
+                        wal.append(&crate::runtime::wal::Mutation::DeleteEdge {
+                            eid: *eid,
+                            src_vid: tombstone.src_vid,
+                            dst_vid: tombstone.dst_vid,
+                            edge_type: tombstone.edge_type,
+                            version,
+                        })?;
+                    }
+                }
             }
         }
 
-        // 3. Flush WAL to durable storage - THIS IS THE COMMIT POINT
-        // If this fails, transaction remains active and can be retried or rolled back.
-        self.flush_wal().await?;
+        // 2. Flush WAL to durable storage - THIS IS THE COMMIT POINT
+        let wal_lsn = self.flush_wal().await?;
 
-        // 4. Now that mutations are durable, merge into main L0 and make visible
+        // 3. Merge into main L0 and make visible
         {
             let tx_l0 = tx_l0_arc.read();
             let main_l0_arc = self.l0_manager.get_current();
             let mut main_l0 = main_l0_arc.write();
             main_l0.merge(&tx_l0)?;
 
-            // Replay transaction edges into the AdjacencyManager overlay so they
-            // become visible to queries that read from the AM (post-migration path).
-            // Use per-edge versions from tx_l0.edge_versions, falling back to current version.
+            // Replay transaction edges into the AdjacencyManager overlay
             for (eid, (src, dst, etype)) in &tx_l0.edge_endpoints {
                 let edge_version = tx_l0
                     .edge_versions
@@ -311,44 +309,59 @@ impl Writer {
                         .insert_edge(*src, *dst, *eid, *etype, edge_version);
                 }
             }
+
+            // Replay tombstones for edges that only exist in the global L0
+            // (not in this transaction's edge_endpoints).
+            for (eid, tombstone) in &tx_l0.tombstones {
+                if !tx_l0.edge_endpoints.contains_key(eid) {
+                    let edge_version = tx_l0
+                        .edge_versions
+                        .get(eid)
+                        .copied()
+                        .unwrap_or(main_l0.current_version);
+                    self.adjacency_manager.add_tombstone(
+                        *eid,
+                        tombstone.src_vid,
+                        tombstone.dst_vid,
+                        tombstone.edge_type,
+                        edge_version,
+                    );
+                }
+            }
         }
 
         self.update_metrics();
 
-        // 5. Clear transaction (all critical steps succeeded)
-        self.transaction_l0 = None;
-
-        // 6. check_flush is best-effort compaction, not critical
+        // 4. Best-effort compaction
         if let Err(e) = self.check_flush().await {
             tracing::warn!("Post-commit flush check failed (non-critical): {}", e);
         }
 
-        Ok(())
+        Ok(wal_lsn)
     }
 
     /// Flush the WAL buffer to durable storage.
-    pub async fn flush_wal(&self) -> Result<()> {
+    ///
+    /// Returns the LSN of the flushed segment, or `0` when no WAL is configured.
+    pub async fn flush_wal(&self) -> Result<u64> {
         let l0 = self.l0_manager.get_current();
         let wal = l0.read().wal.clone();
 
-        if let Some(wal) = wal {
-            wal.flush().await?;
+        match wal {
+            Some(wal) => Ok(wal.flush().await?),
+            None => Ok(0),
         }
-        Ok(())
     }
 
-    pub fn rollback_transaction(&mut self) -> Result<()> {
-        // Idempotent: no error if already cleared (commit succeeded or Drop already cleaned up)
-        self.transaction_l0 = None;
-        Ok(())
-    }
-
-    /// Force-rollback any active transaction. Safe to call if no transaction active.
-    /// Used by Transaction::Drop for cleanup.
-    pub fn force_rollback(&mut self) {
-        if self.transaction_l0.take().is_some() {
-            tracing::warn!("Force-rolled back leaked transaction");
+    /// Record property removals in the active L0 mutation stats.
+    ///
+    /// Routes to the transaction L0 if provided, otherwise to the main L0.
+    pub fn track_properties_removed(&self, count: usize, tx_l0: Option<&Arc<RwLock<L0Buffer>>>) {
+        if count == 0 {
+            return;
         }
+        let l0 = self.resolve_l0(tx_l0);
+        l0.write().mutation_stats.properties_removed += count;
     }
 
     /// Validates vertex constraints for the given properties.
@@ -358,6 +371,7 @@ impl Writer {
         vid: Vid,
         properties: &Properties,
         label: &str,
+        tx_l0: Option<&Arc<RwLock<L0Buffer>>>,
     ) -> Result<()> {
         let schema = self.schema_manager.schema();
 
@@ -409,7 +423,7 @@ impl Writer {
                             }
 
                             if !missing {
-                                self.check_unique_constraint_multi(label, &key_values, vid)
+                                self.check_unique_constraint_multi(label, &key_values, vid, tx_l0)
                                     .await?;
                             }
                         }
@@ -453,6 +467,7 @@ impl Writer {
         vid: Vid,
         properties: &Properties,
         labels: &[String],
+        tx_l0: Option<&Arc<RwLock<L0Buffer>>>,
     ) -> Result<()> {
         let schema = self.schema_manager.schema();
 
@@ -462,13 +477,13 @@ impl Writer {
             if schema.get_label_case_insensitive(label).is_none() {
                 continue;
             }
-            self.validate_vertex_constraints_for_label(vid, properties, label)
+            self.validate_vertex_constraints_for_label(vid, properties, label, tx_l0)
                 .await?;
         }
 
         // Check global ext_id uniqueness if ext_id is provided
         if let Some(ext_id) = properties.get("ext_id").and_then(|v| v.as_str()) {
-            self.check_extid_globally_unique(ext_id, vid).await?;
+            self.check_extid_globally_unique(ext_id, vid, tx_l0).await?;
         }
 
         Ok(())
@@ -546,6 +561,7 @@ impl Writer {
         vids: &[Vid],
         properties_batch: &[Properties],
         label: &str,
+        tx_l0: Option<&Arc<RwLock<L0Buffer>>>,
     ) -> Result<()> {
         if vids.len() != properties_batch.len() {
             return Err(anyhow!("VID/properties length mismatch"));
@@ -586,7 +602,7 @@ impl Writer {
         }
 
         // Scan transaction L0 if present
-        if let Some(tx_l0) = &self.transaction_l0 {
+        if let Some(tx_l0) = tx_l0 {
             let tx_l0_guard = tx_l0.read();
             Self::collect_constraint_keys_from_properties(
                 tx_l0_guard.vertex_properties.values(),
@@ -747,6 +763,7 @@ impl Writer {
                     }
                 }
 
+                #[cfg(feature = "lance-backend")]
                 if !or_filters.is_empty() {
                     let vid_list: Vec<String> =
                         vids.iter().map(|v| v.as_u64().to_string()).collect();
@@ -783,11 +800,16 @@ impl Writer {
     /// # Errors
     ///
     /// Returns error if another vertex with the same ext_id exists.
-    async fn check_extid_globally_unique(&self, ext_id: &str, current_vid: Vid) -> Result<()> {
+    async fn check_extid_globally_unique(
+        &self,
+        ext_id: &str,
+        current_vid: Vid,
+        tx_l0: Option<&Arc<RwLock<L0Buffer>>>,
+    ) -> Result<()> {
         // Check L0 buffers: current, transaction, and pending flush
         let l0_buffers_to_check: Vec<Arc<RwLock<L0Buffer>>> = {
             let mut buffers = vec![self.l0_manager.get_current()];
-            if let Some(tx_l0) = &self.transaction_l0 {
+            if let Some(tx_l0) = tx_l0 {
                 buffers.push(tx_l0.clone());
             }
             buffers.extend(self.l0_manager.get_pending_flush());
@@ -808,8 +830,8 @@ impl Writer {
 
         // Check main vertices table (if it exists)
         // Pass None for global uniqueness check (not snapshot-isolated)
-        let lancedb = self.storage.lancedb_store();
-        if let Ok(Some(found_vid)) = MainVertexDataset::find_by_ext_id(lancedb, ext_id, None).await
+        let backend = self.storage.backend();
+        if let Ok(Some(found_vid)) = MainVertexDataset::find_by_ext_id(backend, ext_id, None).await
             && found_vid != current_vid
         {
             return Err(anyhow!(
@@ -851,14 +873,18 @@ impl Writer {
     /// Get vertex labels from all sources: current L0, pending L0s, and storage.
     /// This is the proper way to read vertex labels after a flush, as it checks both
     /// in-memory buffers and persisted storage.
-    pub async fn get_vertex_labels(&self, vid: Vid) -> Option<Vec<String>> {
+    pub async fn get_vertex_labels(
+        &self,
+        vid: Vid,
+        tx_l0: Option<&Arc<RwLock<L0Buffer>>>,
+    ) -> Option<Vec<String>> {
         // 1. Check current L0
         if let Some(labels) = self.get_vertex_labels_from_l0(vid) {
             return Some(labels);
         }
 
         // 2. Check transaction L0 if present
-        if let Some(tx_l0) = &self.transaction_l0 {
+        if let Some(tx_l0) = tx_l0 {
             let guard = tx_l0.read();
             if guard.vertex_tombstones.contains(&vid) {
                 return None;
@@ -892,9 +918,13 @@ impl Writer {
 
     /// Look up the edge type ID (u32) for an EID from the L0 buffer's edge endpoints.
     /// Falls back to the transaction L0 if available.
-    pub fn get_edge_type_id_from_l0(&self, eid: Eid) -> Option<u32> {
+    pub fn get_edge_type_id_from_l0(
+        &self,
+        eid: Eid,
+        tx_l0: Option<&Arc<RwLock<L0Buffer>>>,
+    ) -> Option<u32> {
         // Check transaction L0 first
-        if let Some(tx_l0) = &self.transaction_l0 {
+        if let Some(tx_l0) = tx_l0 {
             let guard = tx_l0.read();
             if let Some((_, _, etype)) = guard.get_edge_endpoint_full(eid) {
                 return Some(etype);
@@ -910,8 +940,13 @@ impl Writer {
 
     /// Set the type name for an edge (used for schemaless edge types).
     /// This is called during CREATE for edge types not found in the schema.
-    pub fn set_edge_type(&self, eid: Eid, type_name: String) {
-        self.active_l0().write().set_edge_type(eid, type_name);
+    pub fn set_edge_type(
+        &self,
+        eid: Eid,
+        type_name: String,
+        tx_l0: Option<&Arc<RwLock<L0Buffer>>>,
+    ) {
+        self.resolve_l0(tx_l0).write().set_edge_type(eid, type_name);
     }
 
     /// Evaluate a simple CHECK constraint expression.
@@ -1019,6 +1054,7 @@ impl Writer {
         label: &str,
         key_values: &[(String, Value)],
         current_vid: Vid,
+        tx_l0: Option<&Arc<RwLock<L0Buffer>>>,
     ) -> Result<()> {
         // Serialize constraint key once for O(1) lookups
         let key = serialize_constraint_key(label, key_values);
@@ -1036,7 +1072,7 @@ impl Writer {
         }
 
         // Check Transaction L0
-        if let Some(tx_l0) = &self.transaction_l0 {
+        if let Some(tx_l0) = tx_l0 {
             let tx_l0_guard = tx_l0.read();
             if tx_l0_guard.has_constraint_key(&key, current_vid) {
                 return Err(anyhow!(
@@ -1067,6 +1103,7 @@ impl Writer {
             current_vid.as_u64()
         ));
 
+        #[cfg(feature = "lance-backend")]
         if let Ok(ds) = self.storage.vertex_dataset(label)
             && let Ok(lance_ds) = ds.open_raw().await
         {
@@ -1116,8 +1153,8 @@ impl Writer {
 
     /// Check transaction memory limit to prevent OOM.
     /// No-op when no transaction is active.
-    fn check_transaction_memory(&self) -> Result<()> {
-        if let Some(tx_l0) = &self.transaction_l0 {
+    fn check_transaction_memory(&self, tx_l0: Option<&Arc<RwLock<L0Buffer>>>) -> Result<()> {
+        if let Some(tx_l0) = tx_l0 {
             let size = tx_l0.read().estimated_size;
             if size > self.config.max_transaction_memory {
                 return Err(anyhow!(
@@ -1131,10 +1168,13 @@ impl Writer {
         Ok(())
     }
 
-    async fn get_query_context(&self) -> Option<QueryContext> {
+    async fn get_query_context(
+        &self,
+        tx_l0: Option<&Arc<RwLock<L0Buffer>>>,
+    ) -> Option<QueryContext> {
         Some(QueryContext::new_with_pending(
             self.l0_manager.get_current(),
-            self.transaction_l0.clone(),
+            tx_l0.cloned(),
             self.l0_manager.get_pending_flush(),
         ))
     }
@@ -1152,6 +1192,7 @@ impl Writer {
         vid: Vid,
         properties: &mut Properties,
         label: Option<&str>,
+        tx_l0: Option<&Arc<RwLock<L0Buffer>>>,
     ) -> Result<()> {
         let Some(pm) = &self.property_manager else {
             return Ok(());
@@ -1164,7 +1205,7 @@ impl Writer {
         let label_name = if let Some(l) = label {
             Some(l)
         } else {
-            discovered_labels = self.get_vertex_labels(vid).await;
+            discovered_labels = self.get_vertex_labels(vid, tx_l0).await;
             discovered_labels
                 .as_ref()
                 .and_then(|l| l.first().map(|s| s.as_str()))
@@ -1192,7 +1233,7 @@ impl Writer {
             return Ok(());
         }
 
-        let ctx = self.get_query_context().await;
+        let ctx = self.get_query_context(tx_l0).await;
         for key in crdt_keys {
             let existing = pm.get_vertex_prop_with_ctx(vid, &key, ctx.as_ref()).await?;
             if !existing.is_null()
@@ -1205,7 +1246,12 @@ impl Writer {
         Ok(())
     }
 
-    async fn prepare_edge_upsert(&self, eid: Eid, properties: &mut Properties) -> Result<()> {
+    async fn prepare_edge_upsert(
+        &self,
+        eid: Eid,
+        properties: &mut Properties,
+        tx_l0: Option<&Arc<RwLock<L0Buffer>>>,
+    ) -> Result<()> {
         if let Some(pm) = &self.property_manager {
             let schema = self.schema_manager.schema();
             // Get edge type from L0 buffer instead of from EID
@@ -1224,7 +1270,7 @@ impl Writer {
                 }
 
                 if !crdt_keys.is_empty() {
-                    let ctx = self.get_query_context().await;
+                    let ctx = self.get_query_context(tx_l0).await;
                     for key in crdt_keys {
                         let existing = pm.get_edge_prop(eid, &key, ctx.as_ref()).await?;
 
@@ -1241,8 +1287,14 @@ impl Writer {
     }
 
     #[instrument(skip(self, properties), level = "trace")]
-    pub async fn insert_vertex(&mut self, vid: Vid, properties: Properties) -> Result<()> {
-        self.insert_vertex_with_labels(vid, properties, &[]).await?;
+    pub async fn insert_vertex(
+        &mut self,
+        vid: Vid,
+        properties: Properties,
+        tx_l0: Option<&Arc<RwLock<L0Buffer>>>,
+    ) -> Result<()> {
+        self.insert_vertex_with_labels(vid, properties, &[], tx_l0)
+            .await?;
         Ok(())
     }
 
@@ -1252,23 +1304,29 @@ impl Writer {
         vid: Vid,
         mut properties: Properties,
         labels: &[String],
+        tx_l0: Option<&Arc<RwLock<L0Buffer>>>,
     ) -> Result<Properties> {
         let start = std::time::Instant::now();
         self.check_write_pressure().await?;
-        self.check_transaction_memory()?;
+        self.check_transaction_memory(tx_l0)?;
         self.process_embeddings_for_labels(labels, &mut properties)
             .await?;
-        self.validate_vertex_constraints(vid, &properties, labels)
+        self.validate_vertex_constraints(vid, &properties, labels, tx_l0)
             .await?;
-        self.prepare_vertex_upsert(vid, &mut properties, labels.first().map(|s| s.as_str()))
-            .await?;
+        self.prepare_vertex_upsert(
+            vid,
+            &mut properties,
+            labels.first().map(|s| s.as_str()),
+            tx_l0,
+        )
+        .await?;
 
         // Clone properties and labels before moving into L0 to return them and populate constraint index
         let properties_copy = properties.clone();
         let labels_copy = labels.to_vec();
 
         {
-            let l0 = self.active_l0();
+            let l0 = self.resolve_l0(tx_l0);
             let mut l0_guard = l0.write();
             l0_guard.insert_vertex_with_labels(vid, properties, labels);
 
@@ -1320,7 +1378,7 @@ impl Writer {
         metrics::counter!("uni_l0_buffer_mutations_total").increment(1);
         self.update_metrics();
 
-        if self.transaction_l0.is_none() {
+        if tx_l0.is_none() {
             self.check_flush().await?;
         }
         if start.elapsed().as_millis() > 100 {
@@ -1359,6 +1417,7 @@ impl Writer {
         vids: Vec<Vid>,
         mut properties_batch: Vec<Properties>,
         labels: Vec<String>,
+        tx_l0: Option<&Arc<RwLock<L0Buffer>>>,
     ) -> Result<Vec<Properties>> {
         let start = std::time::Instant::now();
 
@@ -1375,16 +1434,11 @@ impl Writer {
             return Ok(Vec::new());
         }
 
-        // Start transaction if not already in one
-        let is_nested = self.transaction_l0.is_some();
-        if !is_nested {
-            self.begin_transaction()?;
-        }
-
-        // Batch operations
+        // Batch operations — writes go directly to the resolved L0.
+        // Atomicity is guaranteed by the caller holding the writer lock.
         let result = async {
             self.check_write_pressure().await?;
-            self.check_transaction_memory()?;
+            self.check_transaction_memory(tx_l0)?;
 
             // Batch embedding generation (1 API call per config)
             self.process_embeddings_for_batch(&labels, &mut properties_batch)
@@ -1394,7 +1448,7 @@ impl Writer {
             let label = labels
                 .first()
                 .ok_or_else(|| anyhow!("No labels provided"))?;
-            self.validate_vertex_batch_constraints(&vids, &properties_batch, label)
+            self.validate_vertex_batch_constraints(&vids, &properties_batch, label, tx_l0)
                 .await?;
 
             // Batch prepare (CRDT merging if needed)
@@ -1432,7 +1486,7 @@ impl Writer {
                     .unwrap_or_default();
 
                 if let Some(pm) = &self.property_manager {
-                    let ctx = self.get_query_context().await;
+                    let ctx = self.get_query_context(tx_l0).await;
                     for (vid, props) in vids.iter().zip(&mut properties_batch) {
                         for key in &crdt_keys {
                             if props.contains_key(key) {
@@ -1449,15 +1503,12 @@ impl Writer {
                 }
             }
 
-            // Batch L0 writes (WAL batched automatically via transaction)
-            let tx_l0 = self
-                .transaction_l0
-                .as_ref()
-                .ok_or_else(|| anyhow!("Transaction L0 missing"))?;
+            // Batch L0 writes — route to active L0 (transaction L0 if active, else current).
+            let target_l0 = self.resolve_l0(tx_l0);
 
             let properties_result = properties_batch.clone();
             {
-                let mut l0_guard = tx_l0.write();
+                let mut l0_guard = target_l0.write();
                 for (vid, props) in vids.iter().zip(properties_batch.iter()) {
                     l0_guard.insert_vertex_with_labels(*vid, props.clone(), &labels);
                 }
@@ -1471,32 +1522,17 @@ impl Writer {
         }
         .await;
 
-        // Handle transaction commit/rollback
-        match result {
-            Ok(props) => {
-                // Commit if we started the transaction
-                if !is_nested {
-                    self.commit_transaction().await?;
-                }
+        let props = result?;
 
-                if start.elapsed().as_millis() > 100 {
-                    log::warn!(
-                        "Slow insert_vertices_batch ({} vertices): {}ms",
-                        vids.len(),
-                        start.elapsed().as_millis()
-                    );
-                }
-
-                Ok(props)
-            }
-            Err(e) => {
-                // Rollback if we started the transaction
-                if !is_nested {
-                    self.rollback_transaction()?;
-                }
-                Err(e)
-            }
+        if start.elapsed().as_millis() > 100 {
+            log::warn!(
+                "Slow insert_vertices_batch ({} vertices): {}ms",
+                vids.len(),
+                start.elapsed().as_millis()
+            );
         }
+
+        Ok(props)
     }
 
     /// Delete a vertex by VID.
@@ -1510,11 +1546,16 @@ impl Writer {
     /// Returns an error if write pressure stalls, label lookup fails, or
     /// the L0 delete operation fails.
     #[instrument(skip(self, labels), level = "trace")]
-    pub async fn delete_vertex(&mut self, vid: Vid, labels: Option<Vec<String>>) -> Result<()> {
+    pub async fn delete_vertex(
+        &mut self,
+        vid: Vid,
+        labels: Option<Vec<String>>,
+        tx_l0: Option<&Arc<RwLock<L0Buffer>>>,
+    ) -> Result<()> {
         let start = std::time::Instant::now();
         self.check_write_pressure().await?;
-        self.check_transaction_memory()?;
-        let l0 = self.active_l0();
+        self.check_transaction_memory(tx_l0)?;
+        let l0 = self.resolve_l0(tx_l0);
 
         // Before deleting, ensure we have the vertex's labels stored in L0
         // so the tombstone can be properly flushed to the correct label datasets.
@@ -1553,7 +1594,7 @@ impl Writer {
         metrics::counter!("uni_l0_buffer_mutations_total").increment(1);
         self.update_metrics();
 
-        if self.transaction_l0.is_none() {
+        if tx_l0.is_none() {
             self.check_flush().await?;
         }
         if start.elapsed().as_millis() > 100 {
@@ -1565,31 +1606,33 @@ impl Writer {
     /// Find vertex labels from storage by querying the main vertices table.
     /// Returns the labels from the latest non-deleted version of the vertex.
     async fn find_vertex_labels_in_storage(&self, vid: Vid) -> Result<Option<Vec<String>>> {
+        use crate::backend::types::ScanRequest;
         use arrow_array::Array;
         use arrow_array::cast::AsArray;
-        use lancedb::query::{ExecutableQuery, QueryBase, Select};
 
-        let lancedb_store = self.storage.lancedb_store();
+        let backend = self.storage.backend();
         let table_name = MainVertexDataset::table_name();
 
         // Check if table exists first; if not, vertex hasn't been flushed to storage yet
-        if !lancedb_store.table_exists(table_name).await? {
+        if !backend.table_exists(table_name).await? {
             return Ok(None);
         }
 
-        let table = lancedb_store.open_table(table_name).await?;
-
         // Query for this specific vid (don't filter by _deleted yet - we need to find the latest version first)
         let filter = format!("_vid = {}", vid.as_u64());
-        let query = table.query().only_if(filter).select(Select::Columns(vec![
-            "_vid".to_string(),
-            "labels".to_string(),
-            "_version".to_string(),
-            "_deleted".to_string(),
-        ]));
-
-        let stream = query.execute().await?;
-        let batches: Vec<arrow_array::RecordBatch> = stream.try_collect().await.unwrap_or_default();
+        let batches = backend
+            .scan(
+                ScanRequest::all(table_name)
+                    .with_filter(filter)
+                    .with_columns(vec![
+                        "_vid".to_string(),
+                        "labels".to_string(),
+                        "_version".to_string(),
+                        "_deleted".to_string(),
+                    ]),
+            )
+            .await
+            .unwrap_or_default();
 
         // Find the row with the highest version number
         let mut max_version: Option<u64> = None;
@@ -1633,6 +1676,7 @@ impl Writer {
         if is_deleted { Ok(None) } else { Ok(labels) }
     }
 
+    #[expect(clippy::too_many_arguments)]
     #[instrument(skip(self, properties), level = "trace")]
     pub async fn insert_edge(
         &mut self,
@@ -1642,19 +1686,21 @@ impl Writer {
         eid: Eid,
         mut properties: Properties,
         edge_type_name: Option<String>,
+        tx_l0: Option<&Arc<RwLock<L0Buffer>>>,
     ) -> Result<()> {
         let start = std::time::Instant::now();
         self.check_write_pressure().await?;
-        self.check_transaction_memory()?;
-        self.prepare_edge_upsert(eid, &mut properties).await?;
+        self.check_transaction_memory(tx_l0)?;
+        self.prepare_edge_upsert(eid, &mut properties, tx_l0)
+            .await?;
 
-        let l0 = self.active_l0();
+        let l0 = self.resolve_l0(tx_l0);
         l0.write()
             .insert_edge(src_vid, dst_vid, edge_type, eid, properties, edge_type_name)?;
 
         // Dual-write to AdjacencyManager overlay (survives flush).
         // Skip for transaction-local L0 -- transaction edges are overlaid separately.
-        if self.transaction_l0.is_none() {
+        if tx_l0.is_none() {
             let version = l0.read().current_version;
             self.adjacency_manager
                 .insert_edge(src_vid, dst_vid, eid, edge_type, version);
@@ -1663,7 +1709,7 @@ impl Writer {
         metrics::counter!("uni_l0_buffer_mutations_total").increment(1);
         self.update_metrics();
 
-        if self.transaction_l0.is_none() {
+        if tx_l0.is_none() {
             self.check_flush().await?;
         }
         if start.elapsed().as_millis() > 100 {
@@ -1679,16 +1725,17 @@ impl Writer {
         src_vid: Vid,
         dst_vid: Vid,
         edge_type: u32,
+        tx_l0: Option<&Arc<RwLock<L0Buffer>>>,
     ) -> Result<()> {
         let start = std::time::Instant::now();
         self.check_write_pressure().await?;
-        self.check_transaction_memory()?;
-        let l0 = self.active_l0();
+        self.check_transaction_memory(tx_l0)?;
+        let l0 = self.resolve_l0(tx_l0);
 
         l0.write().delete_edge(eid, src_vid, dst_vid, edge_type)?;
 
         // Dual-write tombstone to AdjacencyManager overlay.
-        if self.transaction_l0.is_none() {
+        if tx_l0.is_none() {
             let version = l0.read().current_version;
             self.adjacency_manager
                 .add_tombstone(eid, src_vid, dst_vid, edge_type, version);
@@ -1696,7 +1743,7 @@ impl Writer {
         metrics::counter!("uni_l0_buffer_mutations_total").increment(1);
         self.update_metrics();
 
-        if self.transaction_l0.is_none() {
+        if tx_l0.is_none() {
             self.check_flush().await?;
         }
         if start.elapsed().as_millis() > 100 {
@@ -2143,8 +2190,6 @@ impl Writer {
         tracing::Span::current().record("snapshot_id", &snapshot_id);
 
         // 2. For each edge type, write FWD and BWD runs
-        let lancedb_store = self.storage.lancedb_store();
-
         for (&edge_type_id, entries) in entries_by_type.iter() {
             // Get edge type name from unified lookup (handles both schema'd and schemaless)
             let edge_type_name = self
@@ -2159,9 +2204,10 @@ impl Writer {
             let fwd_ds = self.storage.delta_dataset(&edge_type_name, "fwd")?;
             let fwd_batch = fwd_ds.build_record_batch(&fwd_entries, &schema)?;
 
-            // Write using LanceDB
-            let table = fwd_ds.write_run_lancedb(lancedb_store, fwd_batch).await?;
-            fwd_ds.ensure_eid_index_lancedb(&table).await?;
+            // Write using backend
+            let backend = self.storage.backend();
+            fwd_ds.write_run(backend, fwd_batch).await?;
+            fwd_ds.ensure_eid_index(backend).await?;
 
             // BWD Run (sorted by dst_vid)
             let mut bwd_entries = entries.clone();
@@ -2169,8 +2215,9 @@ impl Writer {
             let bwd_ds = self.storage.delta_dataset(&edge_type_name, "bwd")?;
             let bwd_batch = bwd_ds.build_record_batch(&bwd_entries, &schema)?;
 
-            let bwd_table = bwd_ds.write_run_lancedb(lancedb_store, bwd_batch).await?;
-            bwd_ds.ensure_eid_index_lancedb(&bwd_table).await?;
+            let backend = self.storage.backend();
+            bwd_ds.write_run(backend, bwd_batch).await?;
+            bwd_ds.ensure_eid_index(backend).await?;
 
             // Update Manifest
             let current_snap =
@@ -2252,11 +2299,10 @@ impl Writer {
                 Some(&vertex_updated_at),
             )?;
 
-            // Write using LanceDB
-            let table = ds
-                .write_batch_lancedb(lancedb_store, batch, &schema)
-                .await?;
-            ds.ensure_default_indexes_lancedb(&table).await?;
+            // Write using backend
+            let backend = self.storage.backend();
+            ds.write_batch(backend, batch, &schema).await?;
+            ds.ensure_default_indexes(backend).await?;
 
             // Update VidLabelsIndex (if enabled)
             for ((vid, labels, _props), &deleted) in v_data.iter().zip(d_data.iter()) {
@@ -2286,6 +2332,7 @@ impl Writer {
             self.storage.invalidate_table_cache(label_name);
 
             // Apply inverted index updates incrementally
+            #[cfg(feature = "lance-backend")]
             for idx in &schema.indexes {
                 if let IndexDefinition::Inverted(cfg) = idx
                     && cfg.label == label_name
@@ -2300,19 +2347,22 @@ impl Writer {
 
             // Update UID index with new vertex mappings
             // Collect (UniId, Vid) mappings from non-deleted vertices
-            let mut uid_mappings: Vec<(uni_common::core::id::UniId, Vid)> = Vec::new();
-            for (vid, _labels, props) in &v_data {
-                let ext_id = props.get("ext_id").and_then(|v| v.as_str());
-                let uid = crate::storage::vertex::VertexDataset::compute_vertex_uid(
-                    label_name, ext_id, props,
-                );
-                uid_mappings.push((uid, *vid));
-            }
-
-            if !uid_mappings.is_empty()
-                && let Ok(uid_index) = self.storage.uid_index(label_name)
+            #[cfg(feature = "lance-backend")]
             {
-                uid_index.write_mapping(&uid_mappings).await?;
+                let mut uid_mappings: Vec<(uni_common::core::id::UniId, Vid)> = Vec::new();
+                for (vid, _labels, props) in &v_data {
+                    let ext_id = props.get("ext_id").and_then(|v| v.as_str());
+                    let uid = crate::storage::vertex::VertexDataset::compute_vertex_uid(
+                        label_name, ext_id, props,
+                    );
+                    uid_mappings.push((uid, *vid));
+                }
+
+                if !uid_mappings.is_empty()
+                    && let Ok(uid_index) = self.storage.uid_index(label_name)
+                {
+                    uid_index.write_mapping(&uid_mappings).await?;
+                }
             }
         }
 
@@ -2371,9 +2421,8 @@ impl Writer {
                 Some(&edge_created_at_map),
                 Some(&edge_updated_at_map),
             )?;
-            let main_edge_table =
-                MainEdgeDataset::write_batch_lancedb(lancedb_store, main_edge_batch).await?;
-            MainEdgeDataset::ensure_default_indexes_lancedb(&main_edge_table).await?;
+            MainEdgeDataset::write_batch(self.storage.backend(), main_edge_batch).await?;
+            MainEdgeDataset::ensure_default_indexes(self.storage.backend()).await?;
         }
 
         // 3.2 Write to main vertices table
@@ -2405,9 +2454,8 @@ impl Writer {
                 Some(&vertex_created_at),
                 Some(&vertex_updated_at),
             )?;
-            let main_vertex_table =
-                MainVertexDataset::write_batch_lancedb(lancedb_store, main_vertex_batch).await?;
-            MainVertexDataset::ensure_default_indexes_lancedb(&main_vertex_table).await?;
+            MainVertexDataset::write_batch(self.storage.backend(), main_vertex_batch).await?;
+            MainVertexDataset::ensure_default_indexes(self.storage.backend()).await?;
         }
 
         // Save Snapshot
@@ -2568,8 +2616,8 @@ mod tests {
         )
         .await?;
 
-        // Begin transaction
-        writer.begin_transaction()?;
+        // Begin transaction — create a transaction L0
+        let tx_l0 = writer.create_transaction_l0();
 
         // Insert data in transaction
         let vid_a = writer.next_vid().await?;
@@ -2579,19 +2627,28 @@ mod tests {
         props.insert("test".to_string(), Value::String("data".to_string()));
 
         writer
-            .insert_vertex_with_labels(vid_a, props.clone(), &["Test".to_string()])
+            .insert_vertex_with_labels(vid_a, props.clone(), &["Test".to_string()], Some(&tx_l0))
             .await?;
         writer
             .insert_vertex_with_labels(
                 vid_b,
                 std::collections::HashMap::new(),
                 &["Test".to_string()],
+                Some(&tx_l0),
             )
             .await?;
 
         let eid = writer.next_eid(1).await?;
         writer
-            .insert_edge(vid_a, vid_b, 1, eid, std::collections::HashMap::new(), None)
+            .insert_edge(
+                vid_a,
+                vid_b,
+                1,
+                eid,
+                std::collections::HashMap::new(),
+                None,
+                Some(&tx_l0),
+            )
             .await?;
 
         // Get WAL before commit
@@ -2601,7 +2658,7 @@ mod tests {
         let count_before = mutations_before.len();
 
         // Commit transaction - this should write to WAL first
-        writer.commit_transaction().await?;
+        writer.commit_transaction_l0(tx_l0).await?;
 
         // Verify WAL has the new mutations
         let mutations_after = wal.replay().await?;
@@ -2711,11 +2768,12 @@ mod tests {
                     .into_iter()
                     .collect(),
                 &["Baseline".to_string()],
+                None,
             )
             .await?;
 
-        // Begin transaction
-        writer.begin_transaction()?;
+        // Begin transaction — create a transaction L0
+        let tx_l0 = writer.create_transaction_l0();
 
         // Insert data in transaction
         let tx_vid = writer.next_vid().await?;
@@ -2726,6 +2784,7 @@ mod tests {
                     .into_iter()
                     .collect(),
                 &["TxData".to_string()],
+                Some(&tx_l0),
             )
             .await?;
 
@@ -2734,7 +2793,7 @@ mod tests {
         let vertex_count_before = l0.read().vertex_properties.len();
 
         // Rollback transaction (simulating what would happen after WAL flush failure)
-        writer.rollback_transaction()?;
+        drop(tx_l0);
 
         // Verify main L0 is unchanged
         let vertex_count_after = l0.read().vertex_properties.len();
@@ -2790,7 +2849,9 @@ mod tests {
             let vid = writer.next_vid().await?;
             let mut props = std::collections::HashMap::new();
             props.insert("id".to_string(), Value::Int(i));
-            writer.insert_vertex_with_labels(vid, props, labels).await?;
+            writer
+                .insert_vertex_with_labels(vid, props, labels, None)
+                .await?;
             vids.push(vid);
         }
 
@@ -2848,7 +2909,9 @@ mod tests {
             let mut props = std::collections::HashMap::new();
             props.insert("name".to_string(), Value::String(format!("vertex_{}", i)));
             props.insert("index".to_string(), Value::Int(i));
-            writer.insert_vertex_with_labels(vid, props, &[]).await?;
+            writer
+                .insert_vertex_with_labels(vid, props, &[], None)
+                .await?;
             vids.push(vid);
         }
 
@@ -2882,6 +2945,7 @@ mod tests {
                     eid,
                     std::collections::HashMap::new(),
                     Some("NEXT".to_string()),
+                    None,
                 )
                 .await?;
         }

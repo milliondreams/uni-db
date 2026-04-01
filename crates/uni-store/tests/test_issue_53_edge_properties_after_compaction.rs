@@ -60,10 +60,10 @@ async fn test_edge_properties_readable_after_compaction() -> Result<()> {
     let v1 = writer.next_vid().await?;
     let v2 = writer.next_vid().await?;
     writer
-        .insert_vertex_with_labels(v1, HashMap::new(), &["Person".to_string()])
+        .insert_vertex_with_labels(v1, HashMap::new(), &["Person".to_string()], None)
         .await?;
     writer
-        .insert_vertex_with_labels(v2, HashMap::new(), &["Person".to_string()])
+        .insert_vertex_with_labels(v2, HashMap::new(), &["Person".to_string()], None)
         .await?;
 
     // Create edge with properties
@@ -73,7 +73,7 @@ async fn test_edge_properties_readable_after_compaction() -> Result<()> {
 
     let eid = writer.next_eid(edge_type_id).await?;
     writer
-        .insert_edge(v1, v2, edge_type_id, eid, edge_props.clone(), None)
+        .insert_edge(v1, v2, edge_type_id, eid, edge_props.clone(), None, None)
         .await?;
 
     // Flush to storage (dual-writes to Delta L1 and main_edges)
@@ -102,11 +102,10 @@ async fn test_edge_properties_readable_after_compaction() -> Result<()> {
         .await?;
 
     // Verify Delta L1 is now empty (cleared after compaction)
-    let lancedb_store = storage.lancedb_store();
     let delta_ds = storage.delta_dataset("KNOWS", "fwd")?;
     let schema_ref = storage.schema_manager().schema();
     let delta_entries = delta_ds
-        .scan_all_lancedb(lancedb_store, &schema_ref)
+        .scan_all_backend(storage.backend(), &schema_ref)
         .await?;
     assert!(
         delta_entries.is_empty(),
@@ -146,10 +145,10 @@ async fn test_main_edges_fallback_when_delta_cleared() -> Result<()> {
     let v1 = writer.next_vid().await?;
     let v2 = writer.next_vid().await?;
     writer
-        .insert_vertex_with_labels(v1, HashMap::new(), &["Person".to_string()])
+        .insert_vertex_with_labels(v1, HashMap::new(), &["Person".to_string()], None)
         .await?;
     writer
-        .insert_vertex_with_labels(v2, HashMap::new(), &["Person".to_string()])
+        .insert_vertex_with_labels(v2, HashMap::new(), &["Person".to_string()], None)
         .await?;
 
     let mut edge_props = Properties::new();
@@ -158,23 +157,22 @@ async fn test_main_edges_fallback_when_delta_cleared() -> Result<()> {
 
     let eid = writer.next_eid(edge_type_id).await?;
     writer
-        .insert_edge(v1, v2, edge_type_id, eid, edge_props.clone(), None)
+        .insert_edge(v1, v2, edge_type_id, eid, edge_props.clone(), None, None)
         .await?;
 
     // Flush to storage
     writer.flush_to_l1(None).await?;
 
     // Manually clear Delta L1 (simulates post-compaction state)
-    let lancedb_store = storage.lancedb_store();
     let delta_ds = storage.delta_dataset("KNOWS", "fwd")?;
     let schema_ref = storage.schema_manager().schema();
     let delta_schema = delta_ds.get_arrow_schema(&schema_ref)?;
     let empty_batch = arrow_array::RecordBatch::new_empty(delta_schema);
-    delta_ds.replace_lancedb(lancedb_store, empty_batch).await?;
+    delta_ds.replace(storage.backend(), empty_batch).await?;
 
     // Verify Delta L1 is empty
     let delta_entries = delta_ds
-        .scan_all_lancedb(lancedb_store, &schema_ref)
+        .scan_all_backend(storage.backend(), &schema_ref)
         .await?;
     assert!(
         delta_entries.is_empty(),
@@ -206,13 +204,13 @@ async fn test_multiple_edges_properties_after_compaction() -> Result<()> {
     let v2 = writer.next_vid().await?;
     let v3 = writer.next_vid().await?;
     writer
-        .insert_vertex_with_labels(v1, HashMap::new(), &["Person".to_string()])
+        .insert_vertex_with_labels(v1, HashMap::new(), &["Person".to_string()], None)
         .await?;
     writer
-        .insert_vertex_with_labels(v2, HashMap::new(), &["Person".to_string()])
+        .insert_vertex_with_labels(v2, HashMap::new(), &["Person".to_string()], None)
         .await?;
     writer
-        .insert_vertex_with_labels(v3, HashMap::new(), &["Person".to_string()])
+        .insert_vertex_with_labels(v3, HashMap::new(), &["Person".to_string()], None)
         .await?;
 
     // Create multiple edges with different properties
@@ -230,15 +228,15 @@ async fn test_multiple_edges_properties_after_compaction() -> Result<()> {
 
     let eid1 = writer.next_eid(edge_type_id).await?;
     writer
-        .insert_edge(v1, v2, edge_type_id, eid1, props1, None)
+        .insert_edge(v1, v2, edge_type_id, eid1, props1, None, None)
         .await?;
     let eid2 = writer.next_eid(edge_type_id).await?;
     writer
-        .insert_edge(v1, v3, edge_type_id, eid2, props2, None)
+        .insert_edge(v1, v3, edge_type_id, eid2, props2, None, None)
         .await?;
     let eid3 = writer.next_eid(edge_type_id).await?;
     writer
-        .insert_edge(v2, v3, edge_type_id, eid3, props3, None)
+        .insert_edge(v2, v3, edge_type_id, eid3, props3, None, None)
         .await?;
 
     // Flush to storage
@@ -288,15 +286,15 @@ async fn test_edge_with_no_properties_after_compaction() -> Result<()> {
     let v1 = writer.next_vid().await?;
     let v2 = writer.next_vid().await?;
     writer
-        .insert_vertex_with_labels(v1, HashMap::new(), &["Person".to_string()])
+        .insert_vertex_with_labels(v1, HashMap::new(), &["Person".to_string()], None)
         .await?;
     writer
-        .insert_vertex_with_labels(v2, HashMap::new(), &["Person".to_string()])
+        .insert_vertex_with_labels(v2, HashMap::new(), &["Person".to_string()], None)
         .await?;
 
     let eid = writer.next_eid(edge_type_id).await?;
     writer
-        .insert_edge(v1, v2, edge_type_id, eid, HashMap::new(), None)
+        .insert_edge(v1, v2, edge_type_id, eid, HashMap::new(), None, None)
         .await?;
 
     // Flush and compact

@@ -81,7 +81,8 @@ async fn test_rag_use_case() -> anyhow::Result<()> {
             ("embedding".to_string(), unival!(c3_vec)),
         ]),
     ];
-    let chunk_vids = db.bulk_insert_vertices("Chunk", chunks).await?;
+    let tx = db.session().tx().await?;
+    let chunk_vids = tx.bulk_insert_vertices("Chunk", chunks).await?;
     let c1 = chunk_vids[0];
     let c2 = chunk_vids[1];
     let _c3 = chunk_vids[2];
@@ -90,12 +91,13 @@ async fn test_rag_use_case() -> anyhow::Result<()> {
         ("name".to_string(), unival!("verify")),
         ("type".to_string(), unival!("function")),
     ])];
-    let entity_vids = db.bulk_insert_vertices("Entity", entities).await?;
+    let entity_vids = tx.bulk_insert_vertices("Entity", entities).await?;
     let e1 = entity_vids[0];
 
     // Insert Edges
     let edges_mentions = vec![(c1, e1, HashMap::new()), (c2, e1, HashMap::new())];
-    db.bulk_insert_edges("MENTIONS", edges_mentions).await?;
+    tx.bulk_insert_edges("MENTIONS", edges_mentions).await?;
+    tx.commit().await?;
 
     // Flush to ensure data is in Lance (Vector query usually reads from L1/L2)
     // Note: Vector query might NOT read from L0?
@@ -118,13 +120,14 @@ async fn test_rag_use_case() -> anyhow::Result<()> {
     // Debug: Run vector query only
     let debug_query = "CALL uni.vector.query('Chunk', 'embedding', $query_vec, 5) YIELD node, distance RETURN node, distance";
     let debug_result = db
+        .session()
         .query_with(debug_query)
         .param("query_vec", unival!(query_vec.clone()))
         .fetch_all()
         .await?;
-    println!("Debug Vector Query: {} rows", debug_result.rows.len());
+    println!("Debug Vector Query: {} rows", debug_result.len());
     assert!(
-        !debug_result.rows.is_empty(),
+        !debug_result.is_empty(),
         "Vector search should return results"
     );
 
@@ -140,14 +143,15 @@ async fn test_rag_use_case() -> anyhow::Result<()> {
     ";
 
     let result = db
+        .session()
         .query_with(query)
         .param("query_vec", unival!(query_vec))
         .fetch_all()
         .await?;
 
-    println!("Columns: {:?}", result.columns);
-    for (i, row) in result.rows.iter().enumerate() {
-        println!("Row {}: {:?}", i, row.values);
+    println!("Columns: {:?}", result.columns());
+    for (i, row) in result.iter().enumerate() {
+        println!("Row {}: {:?}", i, row.values());
     }
 
     // Expect:
@@ -155,15 +159,12 @@ async fn test_rag_use_case() -> anyhow::Result<()> {
     // primary=C2, topic=E1, related=C1 (maybe, depending on vector search result order)
 
     // We expect at least one row.
-    assert!(
-        !result.rows.is_empty(),
-        "Should find related chunks via graph"
-    );
+    assert!(!result.is_empty(), "Should find related chunks via graph");
 
-    let row = &result.rows[0];
-    let p_text: String = String::try_from(&row.values[0]).unwrap();
-    let topic: String = String::try_from(&row.values[1]).unwrap();
-    let r_text: String = String::try_from(&row.values[2]).unwrap();
+    let row = &result.rows()[0];
+    let p_text: String = String::try_from(&row.values()[0]).unwrap();
+    let topic: String = String::try_from(&row.values()[1]).unwrap();
+    let r_text: String = String::try_from(&row.values()[2]).unwrap();
 
     println!("Row: {} | {} | {}", p_text, topic, r_text);
 

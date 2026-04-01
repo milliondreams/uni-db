@@ -43,12 +43,21 @@ impl GraphLoader {
                 format!("Failed to read Cypher script: {}", cypher_path.display())
             })?;
 
-            // Split on semicolons, execute each statement
+            // Batch all statements from a script into a single transaction.
+            // This avoids repeated L0 merge cycles and is semantically correct
+            // because the script represents a single logical graph setup.
+            let session = db.session();
+            let tx = session.tx().await.with_context(|| {
+                format!("Failed to start transaction for script: {}", script_name)
+            })?;
             for stmt in content.split(';').map(str::trim).filter(|s| !s.is_empty()) {
-                db.execute(stmt)
+                tx.execute(stmt)
                     .await
                     .with_context(|| format!("Failed to execute Cypher statement: {}", stmt))?;
             }
+            tx.commit()
+                .await
+                .with_context(|| format!("Failed to commit script: {}", script_name))?;
         }
 
         Ok(())

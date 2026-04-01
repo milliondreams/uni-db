@@ -62,7 +62,7 @@ class AsyncUniTransaction:
         self._rolled_back = False
 
     async def __aenter__(self) -> AsyncUniTransaction:
-        self._tx = await self._session._db.begin()
+        self._tx = await self._session._db_session.tx()
         return self
 
     async def __aexit__(
@@ -134,13 +134,13 @@ class AsyncUniSession:
     """
     Async session for interacting with the graph database.
 
-    Mirrors UniSession with async methods. Uses AsyncDatabase.
+    Mirrors UniSession with async methods. Uses AsyncUni.
 
     Example:
-        >>> from uni_db import AsyncDatabase
+        >>> from uni_db import AsyncUni
         >>> from uni_pydantic import AsyncUniSession
         >>>
-        >>> db = await AsyncDatabase.open("./my_graph")
+        >>> db = await AsyncUni.open("./my_graph")
         >>> async with AsyncUniSession(db) as session:
         ...     session.register(Person)
         ...     await session.sync_schema()
@@ -149,8 +149,9 @@ class AsyncUniSession:
         ...     await session.commit()
     """
 
-    def __init__(self, db: uni_db.AsyncDatabase) -> None:
+    def __init__(self, db: uni_db.AsyncUni) -> None:
         self._db = db
+        self._db_session = db.session()
         self._schema_gen = SchemaGenerator()
         self._identity_map: WeakValueDictionary[tuple[str, int], UniNode] = (
             WeakValueDictionary()
@@ -175,17 +176,17 @@ class AsyncUniSession:
         self._pending_delete.clear()
 
     @property
-    def db(self) -> uni_db.AsyncDatabase:
-        """Access the underlying uni_db.AsyncDatabase for low-level operations."""
+    def db(self) -> uni_db.AsyncUni:
+        """Access the underlying uni_db.AsyncUni for low-level operations."""
         return self._db
 
-    async def locy(self, program: str, config: dict | None = None) -> dict:
+    async def locy(self, program: str, params: dict[str, Any] | None = None) -> Any:
         """
         Evaluate a Locy program and return derived facts, stats, and warnings.
 
-        Delegates directly to the underlying ``uni_db.AsyncDatabase.locy_evaluate()``.
+        Delegates to the underlying ``uni_db.AsyncSession.locy()``.
         """
-        return await self._db.locy_evaluate(program, config)
+        return await self._db_session.locy(program, params)
 
     def register(self, *models: type[UniNode] | type[UniEdge]) -> None:
         """Register model classes with the session (sync)."""
@@ -248,11 +249,11 @@ class AsyncUniSession:
         else:
             raise ValueError("Must provide vid, uid, or property filters")
 
-        results = await self._db.query(cypher, params)
+        results = await self._db_session.query(cypher, params)
         if not results:
             return None
 
-        node_data = _row_to_node_dict(results[0])
+        node_data = _row_to_node_dict(results[0].to_dict())
         if node_data is None:
             return None
         return self._result_to_model(node_data, model)
@@ -264,12 +265,12 @@ class AsyncUniSession:
 
         label = entity.__class__.__label__
         cypher = f"MATCH (n:{label}) WHERE id(n) = $vid RETURN {_NODE_RETURN}"
-        results = await self._db.query(cypher, {"vid": entity._vid})
+        results = await self._db_session.query(cypher, {"vid": entity._vid})
 
         if not results:
             raise SessionError(f"Entity with vid={entity._vid} no longer exists")
 
-        props = _row_to_node_dict(results[0])
+        props = _row_to_node_dict(results[0].to_dict())
         if props is None:
             raise SessionError(f"Entity with vid={entity._vid} no longer exists")
         try:
@@ -323,13 +324,14 @@ class AsyncUniSession:
         result_type: type[NodeT] | None = None,
     ) -> list[NodeT] | list[dict[str, Any]]:
         """Execute a raw Cypher query."""
-        results = await self._db.query(query, params)
+        results = await self._db_session.query(query, params)
 
         if result_type is None:
-            return cast(list[dict[str, Any]], results)
+            return [r.to_dict() for r in results]
 
         mapped = []
-        for row in results:
+        for raw_row in results:
+            row = raw_row.to_dict()
             for key, value in row.items():
                 if isinstance(value, dict):
                     if "_id" in value and "_label" in value:
@@ -373,7 +375,9 @@ class AsyncUniSession:
         else:
             cypher = f"MATCH (a:{src_label}), (b:{dst_label}) WHERE a._vid = $src AND b._vid = $dst CREATE (a)-[r:{edge_type}]->(b)"
 
-        await self._db.query(cypher, {"src": src_vid, "dst": dst_vid, **props})
+        async with await self._db_session.tx() as tx:
+            await tx.execute(cypher, {"src": src_vid, "dst": dst_vid, **props})
+            await tx.commit()
 
     async def delete_edge(
         self, source: UniNode, edge_type: str, target: UniNode
@@ -387,11 +391,13 @@ class AsyncUniSession:
             f"WHERE a._vid = $src AND b._vid = $dst "
             f"DELETE r RETURN count(r) as count"
         )
-        results = await self._db.query(cypher, {"src": src_vid, "dst": dst_vid})
+        async with await self._db_session.tx() as tx:
+            results = await tx.query(cypher, {"src": src_vid, "dst": dst_vid})
+            await tx.commit()
         return cast(int, results[0]["count"]) if results else 0
 
     async def bulk_add(self, entities: Sequence[UniNode]) -> list[int]:
-        """Bulk-add entities using bulk_insert_vertices."""
+        """Bulk-add entities using bulk_writer."""
         if not entities:
             return []
 
@@ -408,7 +414,11 @@ class AsyncUniSession:
                 for entity in group:
                     run_hooks(entity, _BEFORE_CREATE)
                 prop_dicts = [e.to_properties() for e in group]
-                vids = await self._db.bulk_insert_vertices(label, prop_dicts)
+                tx = await self._db_session.tx()
+                async with await tx.bulk_writer().build() as bw:
+                    vids = await bw.insert_vertices(label, prop_dicts)
+                    await bw.commit()
+                await tx.commit()
                 for entity, vid in zip(group, vids):
                     entity._attach_session(self, vid)
                     self._identity_map[(label, vid)] = entity
@@ -420,13 +430,13 @@ class AsyncUniSession:
 
         return all_vids
 
-    async def explain(self, cypher: str) -> dict[str, Any]:
+    async def explain(self, cypher: str) -> Any:
         """Get the query execution plan."""
-        return await self._db.explain(cypher)
+        return await self._db_session.explain(cypher)
 
-    async def profile(self, cypher: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        """Run the query with profiling."""
-        return await self._db.profile(cypher)
+    async def profile(self, cypher: str) -> Any:
+        """Run the query with profiling and return results + stats."""
+        return await self._db_session.profile(cypher)
 
     async def save_schema(self, path: str) -> None:
         """Save the database schema to a file."""
@@ -444,7 +454,9 @@ class AsyncUniSession:
         props = entity.to_properties()
         props_str = ", ".join(f"{k}: ${k}" for k in props)
         cypher = f"CREATE (n:{label} {{{props_str}}}) RETURN id(n) as vid"
-        results = await self._db.query(cypher, props)
+        async with await self._db_session.tx() as tx:
+            results = await tx.query(cypher, props)
+            await tx.commit()
         if results:
             vid = results[0]["vid"]
             entity._attach_session(self, vid)
@@ -504,7 +516,9 @@ class AsyncUniSession:
         set_clause = ", ".join(f"n.{k} = ${k}" for k in dirty_props)
         cypher = f"MATCH (n:{label}) WHERE id(n) = $vid SET {set_clause}"
         params = {"vid": entity._vid, **dirty_props}
-        await self._db.query(cypher, params)
+        async with await self._db_session.tx() as tx:
+            await tx.execute(cypher, params)
+            await tx.commit()
         run_hooks(entity, _AFTER_UPDATE)
         entity._mark_clean()
 
@@ -513,7 +527,9 @@ class AsyncUniSession:
         label = entity.__class__.__label__
         vid = entity._vid
         cypher = f"MATCH (n:{label}) WHERE id(n) = $vid DETACH DELETE n"
-        await self._db.query(cypher, {"vid": vid})
+        async with await self._db_session.tx() as tx:
+            await tx.execute(cypher, {"vid": vid})
+            await tx.commit()
         if vid is not None and (label, vid) in self._identity_map:
             del self._identity_map[(label, vid)]
         entity._vid = None
@@ -599,10 +615,11 @@ class AsyncUniSession:
                 f"MATCH (a:{label}){pattern}(b) WHERE id(a) IN $vids "
                 f"RETURN id(a) as src_vid, properties(b) AS _props, id(b) AS _vid, labels(b) AS _labels"
             )
-            results = await self._db.query(cypher, {"vids": vids})
+            results = await self._db_session.query(cypher, {"vids": vids})
 
             by_source: dict[int, list[Any]] = {}
-            for row in results:
+            for raw_row in results:
+                row = raw_row.to_dict()
                 src_vid = row["src_vid"]
                 node_data = _row_to_node_dict(row)
                 if node_data is None:

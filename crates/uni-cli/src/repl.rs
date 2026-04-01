@@ -76,7 +76,11 @@ pub async fn execute_query(db: &Uni, query: &str) {
 
     let query_upper = query.trim_start().to_uppercase();
     if query_upper.starts_with("EXPLAIN") {
-        match db.explain(query).await {
+        let result = {
+            let s = db.session();
+            s.query_with(query).explain().await
+        };
+        match result {
             Ok(output) => print_explain(output, start.elapsed()),
             Err(e) => println!("{}", format!("Error: {}", e).red()),
         }
@@ -85,7 +89,11 @@ pub async fn execute_query(db: &Uni, query: &str) {
 
     if query_upper.starts_with("PROFILE") {
         let clean_query = query[7..].trim();
-        match db.profile(clean_query).await {
+        let result = {
+            let s = db.session();
+            s.query_with(clean_query).profile().await
+        };
+        match result {
             Ok((results, output)) => {
                 print_results(results, start.elapsed());
                 println!();
@@ -96,7 +104,11 @@ pub async fn execute_query(db: &Uni, query: &str) {
         return;
     }
 
-    match db.query(query).await {
+    let result = {
+        let s = db.session();
+        s.query(query).await
+    };
+    match result {
         Ok(results) => print_results(results, start.elapsed()),
         Err(e) => {
             println!("{}", format!("Error: {}", e).red());
@@ -106,8 +118,8 @@ pub async fn execute_query(db: &Uni, query: &str) {
 
 fn print_results(results: QueryResult, duration: std::time::Duration) {
     // Handle empty results (e.g. CREATE, SET, or no matches)
-    if results.rows.is_empty() {
-        if results.columns.is_empty() {
+    if results.is_empty() {
+        if results.columns().is_empty() {
             println!(
                 "{}",
                 format!("Query executed successfully in {:?}", duration).dimmed()
@@ -122,16 +134,16 @@ fn print_results(results: QueryResult, duration: std::time::Duration) {
 
     // Add header
     let header_cells: Vec<Cell> = results
-        .columns
+        .columns()
         .iter()
         .map(|c| Cell::new(c).style_spec("bfg"))
         .collect();
     table.add_row(Row::new(header_cells));
 
     // Add rows
-    for row in results.rows {
+    for row in results.into_rows() {
         let cells: Vec<Cell> = row
-            .values
+            .values()
             .iter()
             .map(|v| {
                 let json_val = serde_json::Value::from(v.clone());

@@ -25,16 +25,20 @@ async fn test_granular_compaction_public_api() -> anyhow::Result<()> {
 
     // 2. Write Data (Fragments)
     // Fragment 1
-    db.execute("CREATE (:Node {name: 'A'})").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Node {name: 'A'})").await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // Fragment 2
-    db.execute("CREATE (:Node {name: 'B'})").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Node {name: 'B'})").await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // 4. Compact Label (Granular)
     // We expect compaction to run because we have 2 fragments (files).
-    let stats = db.compact_label("Node").await?;
+    let stats = db.compaction().compact("Node").await?;
     assert_eq!(
         stats.files_compacted, 1,
         "Expected 1 compaction operation on vertex label"
@@ -42,17 +46,21 @@ async fn test_granular_compaction_public_api() -> anyhow::Result<()> {
 
     // 5. Test Edge Compaction
     // Fragment 1
-    db.execute("MATCH (a:Node {name: 'A'}), (b:Node {name: 'B'}) CREATE (a)-[:REL]->(b)")
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (a:Node {name: 'A'}), (b:Node {name: 'B'}) CREATE (a)-[:REL]->(b)")
         .await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // Fragment 2
-    db.execute("MATCH (a:Node {name: 'A'}), (b:Node {name: 'B'}) CREATE (b)-[:REL]->(a)")
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (a:Node {name: 'A'}), (b:Node {name: 'B'}) CREATE (b)-[:REL]->(a)")
         .await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // Compact Edge Type
-    let stats_edge = db.compact_edge_type("REL").await?;
+    let stats_edge = db.compaction().compact("REL").await?;
     assert!(
         stats_edge.files_compacted >= 1,
         "Expected at least 1 edge compaction"
@@ -60,7 +68,7 @@ async fn test_granular_compaction_public_api() -> anyhow::Result<()> {
 
     // 7. Test Wait For Compaction (Should return immediately)
     let start = std::time::Instant::now();
-    db.wait_for_compaction().await?;
+    db.compaction().wait().await?;
     assert!(start.elapsed() < std::time::Duration::from_millis(500));
 
     Ok(())

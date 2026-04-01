@@ -12,14 +12,14 @@ use arrow_array::RecordBatch;
 use uni_common::Value;
 use uni_cypher::ast::{BinaryOp, CypherLiteral, Expr, UnaryOp};
 use uni_cypher::locy_ast::{LocyBinaryOp, LocyExpr};
-use uni_locy::{LocyError, Row};
+use uni_locy::{FactRow, LocyError};
 
 /// Evaluate a Locy expression (which may contain prev references) given current bindings
 /// and optional previous-iteration values.
 pub fn eval_locy_expr(
     expr: &LocyExpr,
-    bindings: &Row,
-    prev_values: Option<&Row>,
+    bindings: &FactRow,
+    prev_values: Option<&FactRow>,
 ) -> Result<Value, LocyError> {
     match expr {
         LocyExpr::PrevRef(field) => Ok(prev_values
@@ -39,7 +39,7 @@ pub fn eval_locy_expr(
 }
 
 /// Evaluate a Cypher expression given variable bindings.
-pub fn eval_expr(expr: &Expr, bindings: &Row) -> Result<Value, LocyError> {
+pub fn eval_expr(expr: &Expr, bindings: &FactRow) -> Result<Value, LocyError> {
     match expr {
         Expr::Literal(lit) => Ok(literal_to_value(lit)),
         Expr::Variable(name) => Ok(bindings.get(name).cloned().unwrap_or(Value::Null)),
@@ -92,7 +92,7 @@ pub fn eval_expr(expr: &Expr, bindings: &Row) -> Result<Value, LocyError> {
 pub fn eval_aggregate_over_group(
     func_name: &str,
     arg_expr: &Expr,
-    group: &[Row],
+    group: &[FactRow],
     rule_name: &str,
     fold_name: &str,
 ) -> Result<Value, LocyError> {
@@ -460,7 +460,7 @@ fn eval_function(name: &str, args: &[Value]) -> Result<Value, LocyError> {
         // function available in Cypher (temporal, math, string, spatial, …) is
         // automatically available in Locy. Both sides use uni_common::Value, so
         // no type conversion is needed.
-        _ => crate::query::expr_eval::eval_scalar_function(name, args).map_err(|e| {
+        _ => crate::query::expr_eval::eval_scalar_function(name, args, None).map_err(|e| {
             LocyError::EvaluationError {
                 message: e.to_string(),
             }
@@ -539,7 +539,7 @@ pub fn value_compare(a: &Value, b: &Value, null_last: bool) -> std::cmp::Orderin
 /// Node/edge struct columns (`_vid`/`_labels`/`_all_props`) are normalized to
 /// `Value::Node` / `Value::Edge` and dotted helper columns (e.g. `a._vid`) are
 /// stripped, matching the behaviour of `Executor::record_batches_to_rows`.
-pub fn record_batches_to_locy_rows(batches: &[RecordBatch]) -> Vec<Row> {
+pub fn record_batches_to_locy_rows(batches: &[RecordBatch]) -> Vec<FactRow> {
     let mut rows = Vec::new();
     for batch in batches {
         let schema = batch.schema();
@@ -576,7 +576,7 @@ pub fn record_batches_to_locy_rows(batches: &[RecordBatch]) -> Vec<Row> {
 /// column is `Value::Map({_vid, _labels, _all_props})` after `arrow_to_value`.
 /// This function detects these maps and converts them to proper `Value::Node` or
 /// `Value::Edge`, then strips the helpers.
-fn normalize_graph_row(row: &mut Row) {
+fn normalize_graph_row(row: &mut FactRow) {
     // Detect bare graph-entity variables: keys without '.' that are Map values
     // containing the internal `_vid` or `_eid` field.
     let entity_vars: Vec<String> = row

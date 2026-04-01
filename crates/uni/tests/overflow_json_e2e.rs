@@ -49,12 +49,14 @@ async fn test_mixed_schema_and_overflow_properties() -> Result<()> {
     println!("✓ Created Person label with schema property 'name'");
 
     // Create vertices with mixed properties
-    db.execute("CREATE (:Person {name: 'Alice', city: 'NYC', age: 30})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Person {name: 'Alice', city: 'NYC', age: 30})")
         .await?;
-    db.execute("CREATE (:Person {name: 'Bob', city: 'SF', age: 25})")
+    tx.execute("CREATE (:Person {name: 'Bob', city: 'SF', age: 25})")
         .await?;
-    db.execute("CREATE (:Person {name: 'Charlie', city: 'LA', age: 35})")
+    tx.execute("CREATE (:Person {name: 'Charlie', city: 'LA', age: 35})")
         .await?;
+    tx.commit().await?;
 
     println!("✓ Created 3 vertices with mixed schema + overflow properties");
 
@@ -64,6 +66,7 @@ async fn test_mixed_schema_and_overflow_properties() -> Result<()> {
 
     // Query mixing schema and overflow properties
     let results = db
+        .session()
         .query("MATCH (p:Person) WHERE p.name = 'Alice' AND p.city = 'NYC' RETURN p.age")
         .await?;
 
@@ -88,6 +91,7 @@ async fn test_mixed_schema_and_overflow_properties() -> Result<()> {
 
     // Test filtering on overflow property only
     let results = db
+        .session()
         .query("MATCH (p:Person) WHERE p.city = 'SF' RETURN p.name, p.age")
         .await?;
 
@@ -117,14 +121,19 @@ async fn test_set_overflow_properties() -> Result<()> {
     db.schema().label("User").apply().await?;
 
     // Create vertex, flush to Lance storage
-    db.execute("CREATE (:User {name: 'Alice'})").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:User {name: 'Alice'})").await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // SET a new overflow property — writes to L0, no flush
-    db.execute("MATCH (u:User) SET u.extra = 42").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (u:User) SET u.extra = 42").await?;
+    tx.commit().await?;
 
     // properties(n) must include the L0-buffered property
     let results = db
+        .session()
         .query("MATCH (u:User) RETURN properties(u) AS props")
         .await?;
     assert_eq!(results.len(), 1);
@@ -138,7 +147,10 @@ async fn test_set_overflow_properties() -> Result<()> {
     );
 
     // Individual property access must also work
-    let results = db.query("MATCH (u:User) RETURN u.extra AS extra").await?;
+    let results = db
+        .session()
+        .query("MATCH (u:User) RETURN u.extra AS extra")
+        .await?;
     assert_eq!(results.len(), 1);
     let row = &results.rows()[0];
     let extra = row.get::<i64>("extra")?;
@@ -160,15 +172,20 @@ async fn test_set_properties_read_your_writes_no_flush() -> Result<()> {
     db.schema().label("Person").apply().await?;
 
     // Create vertex — no flush
-    db.execute("CREATE (:Person {name: 'Alice', age: 30})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Person {name: 'Alice', age: 30})")
         .await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // SET another property — no flush
-    db.execute("MATCH (p:Person) SET p.pagerank = 0.5").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (p:Person) SET p.pagerank = 0.5").await?;
+    tx.commit().await?;
 
     // properties(p) must include name, age, AND pagerank
     let results = db
+        .session()
         .query("MATCH (p:Person) RETURN properties(p) AS props")
         .await?;
     assert_eq!(results.len(), 1);
@@ -192,7 +209,10 @@ async fn test_set_properties_read_your_writes_no_flush() -> Result<()> {
     );
 
     // Individual property access
-    let results = db.query("MATCH (p:Person) RETURN p.pagerank AS pr").await?;
+    let results = db
+        .session()
+        .query("MATCH (p:Person) RETURN p.pagerank AS pr")
+        .await?;
     assert_eq!(results.len(), 1);
     let row = &results.rows()[0];
     let pr = row.get::<f64>("pr")?;
@@ -218,25 +238,34 @@ async fn test_overflow_properties_across_multiple_flushes() -> Result<()> {
     println!("✓ Created Event label (schemaless)");
 
     // Batch 1
-    db.execute("CREATE (:Event {type: 'click', timestamp: 1000, user: 'alice'})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Event {type: 'click', timestamp: 1000, user: 'alice'})")
         .await?;
+    tx.commit().await?;
     db.flush().await?;
     println!("✓ Batch 1 flushed");
 
     // Batch 2
-    db.execute("CREATE (:Event {type: 'view', timestamp: 2000, user: 'bob'})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Event {type: 'view', timestamp: 2000, user: 'bob'})")
         .await?;
+    tx.commit().await?;
     db.flush().await?;
     println!("✓ Batch 2 flushed");
 
     // Batch 3
-    db.execute("CREATE (:Event {type: 'purchase', timestamp: 3000, user: 'charlie'})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Event {type: 'purchase', timestamp: 3000, user: 'charlie'})")
         .await?;
+    tx.commit().await?;
     db.flush().await?;
     println!("✓ Batch 3 flushed");
 
     // Query across all batches
-    let results = db.query("MATCH (e:Event) RETURN count(e) as cnt").await?;
+    let results = db
+        .session()
+        .query("MATCH (e:Event) RETURN count(e) as cnt")
+        .await?;
     assert_eq!(results.len(), 1);
     let row = &results.rows()[0];
     assert_eq!(
@@ -249,6 +278,7 @@ async fn test_overflow_properties_across_multiple_flushes() -> Result<()> {
 
     // Filter on overflow property across batches
     let results = db
+        .session()
         .query("MATCH (e:Event) WHERE e.type = 'click' RETURN e.timestamp, e.user")
         .await?;
 
@@ -267,6 +297,7 @@ async fn test_overflow_properties_across_multiple_flushes() -> Result<()> {
 
     // Verify all events are accessible with their overflow properties
     let results = db
+        .session()
         .query("MATCH (e:Event) RETURN e.type, e.timestamp, e.user")
         .await?;
 
@@ -306,16 +337,18 @@ async fn test_aggregation_on_overflow_properties() -> Result<()> {
     println!("✓ Created Order label (schemaless)");
 
     // Create orders with overflow properties
-    db.execute("CREATE (:Order {total: 100, status: 'completed'})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Order {total: 100, status: 'completed'})")
         .await?;
-    db.execute("CREATE (:Order {total: 200, status: 'completed'})")
+    tx.execute("CREATE (:Order {total: 200, status: 'completed'})")
         .await?;
-    db.execute("CREATE (:Order {total: 150, status: 'pending'})")
+    tx.execute("CREATE (:Order {total: 150, status: 'pending'})")
         .await?;
-    db.execute("CREATE (:Order {total: 300, status: 'completed'})")
+    tx.execute("CREATE (:Order {total: 300, status: 'completed'})")
         .await?;
-    db.execute("CREATE (:Order {total: 75, status: 'pending'})")
+    tx.execute("CREATE (:Order {total: 75, status: 'pending'})")
         .await?;
+    tx.commit().await?;
 
     println!("✓ Created 5 orders with overflow properties");
 
@@ -325,7 +358,7 @@ async fn test_aggregation_on_overflow_properties() -> Result<()> {
     // TODO: GROUP BY not yet implemented for overflow properties
     // Once query rewriting supports GROUP BY on overflow properties, uncomment:
 
-    // let results = db.query(
+    // let results = db.session().query(
     //     "MATCH (o:Order) RETURN o.status, count(o) as cnt"
     // ).await?;
 
@@ -346,7 +379,10 @@ async fn test_aggregation_on_overflow_properties() -> Result<()> {
     println!("⚠ GROUP BY on overflow properties test skipped - not yet implemented");
 
     // Test simple count (this should work)
-    let results = db.query("MATCH (o:Order) RETURN count(o) as cnt").await?;
+    let results = db
+        .session()
+        .query("MATCH (o:Order) RETURN count(o) as cnt")
+        .await?;
     assert_eq!(results.len(), 1);
     assert_eq!(results.rows()[0].get::<i64>("cnt")?, 5);
 
@@ -375,12 +411,14 @@ async fn test_edge_overflow_properties_e2e() -> Result<()> {
     println!("✓ Created Person label and KNOWS edge type");
 
     // Create vertices and edges with overflow properties
-    db.execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (a:Person {name: 'Alice'})-[:KNOWS {since: 2020, strength: 0.9, context: 'work'}]->(b:Person {name: 'Bob'})"
     ).await?;
-    db.execute(
+    tx.execute(
         "CREATE (c:Person {name: 'Charlie'})-[:KNOWS {since: 2021, strength: 0.7, context: 'school'}]->(d:Person {name: 'Dave'})"
     ).await?;
+    tx.commit().await?;
 
     println!("✓ Created edges with overflow properties");
 
@@ -390,6 +428,7 @@ async fn test_edge_overflow_properties_e2e() -> Result<()> {
 
     // Query edge properties after flush
     let results = db
+        .session()
         .query("MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN r.since, r.strength, r.context")
         .await?;
 
@@ -398,7 +437,7 @@ async fn test_edge_overflow_properties_e2e() -> Result<()> {
     println!("✓ Edge overflow properties readable after flush");
 
     // Filter on edge overflow property
-    let results = db.query(
+    let results = db.session().query(
         "MATCH (a:Person)-[r:KNOWS]->(b:Person) WHERE r.context = 'work' RETURN a.name, b.name, r.strength"
     ).await?;
 
@@ -432,14 +471,16 @@ async fn test_comprehensive_null_handling() -> Result<()> {
     println!("✓ Created Person label (schemaless)");
 
     // Create vertices with various null scenarios
-    db.execute("CREATE (:Person {name: 'Alice', age: 30, email: 'alice@example.com'})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Person {name: 'Alice', age: 30, email: 'alice@example.com'})")
         .await?; // All properties set
-    db.execute("CREATE (:Person {name: 'Bob', age: null, email: 'bob@example.com'})")
+    tx.execute("CREATE (:Person {name: 'Bob', age: null, email: 'bob@example.com'})")
         .await?; // Explicit null
-    db.execute("CREATE (:Person {name: 'Charlie', email: 'charlie@example.com'})")
+    tx.execute("CREATE (:Person {name: 'Charlie', email: 'charlie@example.com'})")
         .await?; // Missing property (no age)
-    db.execute("CREATE (:Person {name: 'Dave', age: 40, email: ''})")
+    tx.execute("CREATE (:Person {name: 'Dave', age: 40, email: ''})")
         .await?; // Empty string
+    tx.commit().await?;
 
     println!("✓ Created vertices with various null scenarios");
 
@@ -448,6 +489,7 @@ async fn test_comprehensive_null_handling() -> Result<()> {
 
     // Query all and check null handling
     let results = db
+        .session()
         .query("MATCH (p:Person) RETURN p.name, p.age, p.email")
         .await?;
     assert_eq!(results.len(), 4, "Should have all 4 vertices");
@@ -530,26 +572,31 @@ async fn test_set_overflow_property_persistence_after_flush() -> Result<()> {
     // Create 8 File nodes and flush to Lance first
     let count = 8;
     let names: Vec<String> = (0..count).map(|i| format!("file_{i:03}.txt")).collect();
+    let tx = db.session().tx().await?;
     for name in &names {
-        db.execute(&format!("CREATE (:File {{name: '{name}'}})"))
+        tx.execute(&format!("CREATE (:File {{name: '{name}'}})"))
             .await?;
     }
+    tx.commit().await?;
 
     // First flush: nodes now in Lance storage (no overflow properties yet)
     db.flush().await?;
 
     // SET pagerank on each node individually (each is a separate MATCH/SET)
     // This creates L0 entries that overlay the Lance data
+    let tx = db.session().tx().await?;
     for (i, name) in names.iter().enumerate() {
         let rank = (i + 1) as f64 * 0.1;
-        db.execute(&format!(
+        tx.execute(&format!(
             "MATCH (f:File {{name: '{name}'}}) SET f.pagerank = {rank}"
         ))
         .await?;
     }
+    tx.commit().await?;
 
     // Pre-flush: verify all 8 nodes have pagerank via L0
     let results = db
+        .session()
         .query("MATCH (f:File) RETURN f.name, f.pagerank ORDER BY f.name")
         .await?;
     assert_eq!(
@@ -574,6 +621,7 @@ async fn test_set_overflow_property_persistence_after_flush() -> Result<()> {
 
     // Post-flush: verify ALL nodes retain pagerank
     let results = db
+        .session()
         .query("MATCH (f:File) RETURN f.name, f.pagerank ORDER BY f.name")
         .await?;
     assert_eq!(
@@ -601,6 +649,7 @@ async fn test_set_overflow_property_persistence_after_flush() -> Result<()> {
 
     // Also verify via properties() function
     let results = db
+        .session()
         .query("MATCH (f:File) RETURN f.name, properties(f) AS props ORDER BY f.name")
         .await?;
     assert_eq!(results.len(), count);
@@ -637,17 +686,21 @@ async fn test_set_overflow_all_at_once_persistence_after_flush() -> Result<()> {
         .await?;
 
     let count = 10;
+    let tx = db.session().tx().await?;
     for i in 0..count {
-        db.execute(&format!("CREATE (:Doc {{title: 'doc_{i}'}})"))
+        tx.execute(&format!("CREATE (:Doc {{title: 'doc_{i}'}})"))
             .await?;
     }
+    tx.commit().await?;
     db.flush().await?;
 
     // SET overflow property on ALL nodes at once (single MATCH)
-    db.execute("MATCH (d:Doc) SET d.score = 42.0").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (d:Doc) SET d.score = 42.0").await?;
+    tx.commit().await?;
 
     // Pre-flush check
-    let results = db.query("MATCH (d:Doc) RETURN d.score").await?;
+    let results = db.session().query("MATCH (d:Doc) RETURN d.score").await?;
     assert_eq!(results.len(), count);
     for row in results.rows() {
         assert_ne!(
@@ -661,6 +714,7 @@ async fn test_set_overflow_all_at_once_persistence_after_flush() -> Result<()> {
 
     // Post-flush check
     let results = db
+        .session()
         .query("MATCH (d:Doc) RETURN d.title, d.score ORDER BY d.title")
         .await?;
     assert_eq!(results.len(), count);
@@ -677,6 +731,7 @@ async fn test_set_overflow_all_at_once_persistence_after_flush() -> Result<()> {
 
     // Also check properties() includes overflow
     let results = db
+        .session()
         .query("MATCH (d:Doc) RETURN properties(d) AS props")
         .await?;
     assert_eq!(results.len(), count);
@@ -707,8 +762,9 @@ async fn test_bulk_overflow_properties() -> Result<()> {
     println!("✓ Created Log label (schemaless)");
 
     // Insert 1000 records with overflow properties
+    let tx = db.session().tx().await?;
     for i in 0..1000 {
-        db.execute(&format!(
+        tx.execute(&format!(
             "CREATE (:Log {{id: {}, level: 'info', message: 'msg_{}', timestamp: {}}})",
             i,
             i,
@@ -716,6 +772,7 @@ async fn test_bulk_overflow_properties() -> Result<()> {
         ))
         .await?;
     }
+    tx.commit().await?;
 
     println!("✓ Inserted 1000 log entries with overflow properties");
 
@@ -723,7 +780,10 @@ async fn test_bulk_overflow_properties() -> Result<()> {
     println!("✓ Flushed to storage");
 
     // First, just count all logs without WHERE clause
-    let results = db.query("MATCH (l:Log) RETURN count(*) as cnt").await?;
+    let results = db
+        .session()
+        .query("MATCH (l:Log) RETURN count(*) as cnt")
+        .await?;
     assert_eq!(results.len(), 1);
     assert_eq!(
         results.rows()[0].get::<i64>("cnt")?,
@@ -734,6 +794,7 @@ async fn test_bulk_overflow_properties() -> Result<()> {
 
     // Now try filtering on overflow property and returning properties (simpler than COUNT)
     let results = db
+        .session()
         .query("MATCH (l:Log) WHERE l.level = 'info' RETURN l.id, l.message LIMIT 10")
         .await?;
 
@@ -756,6 +817,7 @@ async fn test_bulk_overflow_properties() -> Result<()> {
 
     // Try a simple property return without WHERE clause to verify properties are accessible
     let results = db
+        .session()
         .query("MATCH (l:Log) RETURN l.id, l.level, l.message LIMIT 5")
         .await?;
 
@@ -804,11 +866,14 @@ async fn test_bulk_insert_vertices_overflow_properties() -> Result<()> {
         props_list.push(p);
     }
 
-    let vids = db.bulk_insert_vertices("Item", props_list).await?;
+    let tx = db.session().tx().await?;
+    let vids = tx.bulk_insert_vertices("Item", props_list).await?;
+    tx.commit().await?;
     assert_eq!(vids.len(), 5);
 
     // ── Pre-flush: L0 buffer should already expose overflow properties ──
     let results = db
+        .session()
         .query("MATCH (i:Item) WHERE i.name = 'item_2' RETURN i.city, i.score")
         .await?;
     assert_eq!(results.len(), 1, "should find item_2 before flush");
@@ -822,6 +887,7 @@ async fn test_bulk_insert_vertices_overflow_properties() -> Result<()> {
     db.flush().await?;
 
     let results = db
+        .session()
         .query("MATCH (i:Item) RETURN i.name, i.city, i.score ORDER BY i.name")
         .await?;
     assert_eq!(results.len(), 5, "all 5 items should survive flush");
@@ -836,6 +902,7 @@ async fn test_bulk_insert_vertices_overflow_properties() -> Result<()> {
 
     // ── WHERE on overflow property should also work ─────────────────────
     let results = db
+        .session()
         .query("MATCH (i:Item) WHERE i.city = 'city_3' RETURN i.name")
         .await?;
     assert_eq!(results.len(), 1);
@@ -846,6 +913,7 @@ async fn test_bulk_insert_vertices_overflow_properties() -> Result<()> {
 
     // ── properties() should include both schema and overflow fields ─────
     let results = db
+        .session()
         .query("MATCH (i:Item) WHERE i.name = 'item_0' RETURN properties(i) AS props")
         .await?;
     assert_eq!(results.len(), 1);

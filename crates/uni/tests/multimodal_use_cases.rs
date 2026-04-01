@@ -42,7 +42,6 @@ async fn test_regional_sales_analytics() -> anyhow::Result<()> {
         )
         .await?,
     );
-    let lancedb_store = storage.lancedb_store();
 
     // Data:
     // Region: "North" (Vid 0)
@@ -79,7 +78,7 @@ async fn test_regional_sales_analytics() -> anyhow::Result<()> {
         ],
     )?;
     region_ds
-        .write_batch_lancedb(lancedb_store, region_batch, &schema_manager.schema())
+        .write_batch(storage.backend(), region_batch, &schema_manager.schema())
         .await?;
 
     // Insert Orders (Batch of 100)
@@ -132,7 +131,7 @@ async fn test_regional_sales_analytics() -> anyhow::Result<()> {
         ],
     )?;
     order_ds
-        .write_batch_lancedb(lancedb_store, order_batch, &schema_manager.schema())
+        .write_batch(storage.backend(), order_batch, &schema_manager.schema())
         .await?;
 
     // Edges: Order(i) -> Region(0)
@@ -167,7 +166,7 @@ async fn test_regional_sales_analytics() -> anyhow::Result<()> {
             Arc::new(e_builder.finish()),
         ],
     )?;
-    adj_ds.write_chunk_lancedb(lancedb_store, adj_batch).await?;
+    adj_ds.write_chunk(storage.backend(), adj_batch).await?;
 
     // Warm the adjacency cache
     use uni_db::storage::direction::Direction as CacheDir;
@@ -249,19 +248,21 @@ async fn test_ecommerce_recommendation() -> anyhow::Result<()> {
     let db = Uni::open(path.to_str().unwrap()).build().await?;
 
     // 2. Create data using high-level API
-    db.execute("CREATE (alice:User {name: 'Alice'})").await?;
-    db.execute("CREATE (laptop:Product {name: 'Laptop', embedding: [1.0, 0.0]})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (alice:User {name: 'Alice'})").await?;
+    tx.execute("CREATE (laptop:Product {name: 'Laptop', embedding: [1.0, 0.0]})")
         .await?;
-    db.execute("CREATE (mouse:Product {name: 'Mouse', embedding: [0.9, 0.1]})")
+    tx.execute("CREATE (mouse:Product {name: 'Mouse', embedding: [0.9, 0.1]})")
         .await?;
-    db.execute("CREATE (shampoo:Product {name: 'Shampoo', embedding: [0.0, 1.0]})")
+    tx.execute("CREATE (shampoo:Product {name: 'Shampoo', embedding: [0.0, 1.0]})")
         .await?;
 
     // Create the VIEWED edge: Alice -> Laptop
-    db.execute(
+    tx.execute(
         "MATCH (u:User {name: 'Alice'}), (p:Product {name: 'Laptop'}) CREATE (u)-[:VIEWED]->(p)",
     )
     .await?;
+    tx.commit().await?;
 
     // Flush to storage
     db.flush().await?;
@@ -269,6 +270,7 @@ async fn test_ecommerce_recommendation() -> anyhow::Result<()> {
     // 3. Execution Logic
     // Step A: Find products Alice viewed
     let result = db
+        .session()
         .query("MATCH (u:User)-[:VIEWED]->(p:Product) RETURN p.embedding, p.name")
         .await?;
     assert_eq!(result.len(), 1);
@@ -280,7 +282,7 @@ async fn test_ecommerce_recommendation() -> anyhow::Result<()> {
     // Step B: Vector Search using that embedding
     // Find top 2 (should be Laptop itself and Mouse)
     let similar = db
-        .query("CALL uni.vector.query('Product', 'embedding', [1.0, 0.0], 2) YIELD node RETURN node.name AS name")
+        .session().query("CALL uni.vector.query('Product', 'embedding', [1.0, 0.0], 2) YIELD node RETURN node.name AS name")
         .await?;
 
     // Verify we got Laptop and Mouse (both have similar embeddings to [1.0, 0.0])
@@ -318,7 +320,6 @@ async fn test_document_knowledge_graph() -> anyhow::Result<()> {
         )
         .await?,
     );
-    let lancedb_store = storage.lancedb_store();
 
     // Insert Papers using vertex dataset directly
     let paper_ds = storage.vertex_dataset("Paper")?;
@@ -355,7 +356,7 @@ async fn test_document_knowledge_graph() -> anyhow::Result<()> {
         ],
     )?;
     paper_ds
-        .write_batch_lancedb(lancedb_store, paper_batch, &schema_manager.schema())
+        .write_batch(storage.backend(), paper_batch, &schema_manager.schema())
         .await?;
 
     // Edge: 0 -> CITES -> 2
@@ -378,7 +379,7 @@ async fn test_document_knowledge_graph() -> anyhow::Result<()> {
             Arc::new(e_builder.finish()),
         ],
     )?;
-    adj_ds.write_chunk_lancedb(lancedb_store, batch).await?;
+    adj_ds.write_chunk(storage.backend(), batch).await?;
 
     // Warm the adjacency cache
     use uni_db::storage::direction::Direction as CacheDir3;
@@ -430,7 +431,6 @@ async fn test_identity_provenance() -> anyhow::Result<()> {
         )
         .await?,
     );
-    let lancedb_store = storage.lancedb_store();
 
     // Node A (VID 0) -> UID A
     // Node B (VID 1) -> UID B
@@ -474,7 +474,7 @@ async fn test_identity_provenance() -> anyhow::Result<()> {
             Arc::new(e_builder.finish()),
         ],
     )?;
-    adj_ds.write_chunk_lancedb(lancedb_store, batch).await?;
+    adj_ds.write_chunk(storage.backend(), batch).await?;
 
     // Warm the adjacency cache
     use uni_db::storage::direction::Direction as CacheDir4;

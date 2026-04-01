@@ -5,16 +5,20 @@
 
 import pytest
 
+import uni_db
+
 
 @pytest.mark.asyncio
 async def test_begin_commit_data_persists(async_social_db):
     """Test that committed transaction data persists."""
 
-    tx = await async_social_db.begin()
+    session = async_social_db.session()
+
+    tx = await session.tx()
     await tx.query("CREATE (p:Person {name: 'Alice', age: 30})")
     await tx.commit()
 
-    result = await async_social_db.query(
+    result = await session.query(
         "MATCH (p:Person {name: 'Alice'}) RETURN p.name, p.age"
     )
     assert len(result) == 1
@@ -26,11 +30,13 @@ async def test_begin_commit_data_persists(async_social_db):
 async def test_begin_rollback_data_reverted(async_social_db):
     """Test that rolled back transaction data is reverted."""
 
-    tx = await async_social_db.begin()
+    session = async_social_db.session()
+
+    tx = await session.tx()
     await tx.query("CREATE (p:Person {name: 'Bob', age: 25})")
     await tx.rollback()
 
-    result = await async_social_db.query("MATCH (p:Person {name: 'Bob'}) RETURN p.name")
+    result = await session.query("MATCH (p:Person {name: 'Bob'}) RETURN p.name")
     assert len(result) == 0
 
 
@@ -38,16 +44,16 @@ async def test_begin_rollback_data_reverted(async_social_db):
 async def test_transaction_query_with_params(async_social_db):
     """Test transaction query with parameters."""
 
-    tx = await async_social_db.begin()
+    session = async_social_db.session()
+
+    tx = await session.tx()
     await tx.query(
         "CREATE (p:Person {name: $name, age: $age})",
         params={"name": "Charlie", "age": 35},
     )
     await tx.commit()
 
-    result = await async_social_db.query(
-        "MATCH (p:Person {name: 'Charlie'}) RETURN p.age"
-    )
+    result = await session.query("MATCH (p:Person {name: 'Charlie'}) RETURN p.age")
     assert len(result) == 1
     assert result[0]["p.age"] == 35
 
@@ -56,7 +62,9 @@ async def test_transaction_query_with_params(async_social_db):
 async def test_multiple_operations_in_one_transaction(async_social_db):
     """Test multiple operations within a single transaction."""
 
-    tx = await async_social_db.begin()
+    session = async_social_db.session()
+
+    tx = await session.tx()
 
     await tx.query("CREATE (p:Person {name: 'David', age: 28})")
     await tx.query("CREATE (p:Person {name: 'Eve', age: 32})")
@@ -68,14 +76,14 @@ async def test_multiple_operations_in_one_transaction(async_social_db):
 
     await tx.commit()
 
-    people = await async_social_db.query(
+    people = await session.query(
         "MATCH (p:Person) WHERE p.name IN ['David', 'Eve'] RETURN p.name ORDER BY p.name"
     )
     assert len(people) == 2
     assert people[0]["p.name"] == "David"
     assert people[1]["p.name"] == "Eve"
 
-    knows = await async_social_db.query("""
+    knows = await session.query("""
         MATCH (p1:Person {name: 'David'})-[:KNOWS]->(p2:Person {name: 'Eve'})
         RETURN p1.name, p2.name
     """)
@@ -83,16 +91,21 @@ async def test_multiple_operations_in_one_transaction(async_social_db):
 
 
 @pytest.mark.asyncio
-async def test_context_manager_auto_commit(async_social_db):
-    """Test that context manager auto-commits on success."""
+async def test_context_manager_with_explicit_commit(async_social_db):
+    """Test that explicit commit inside context manager persists data.
 
-    tx = await async_social_db.begin()
+    The async context manager auto-rollbacks uncommitted transactions on exit.
+    To persist data, commit explicitly inside the block.
+    """
+
+    session = async_social_db.session()
+
+    tx = await session.tx()
     async with tx:
-        await tx.query("CREATE (p:Person {name: 'Frank', age: 40})")
+        await tx.execute("CREATE (p:Person {name: 'Frank', age: 40})")
+        await tx.commit()
 
-    result = await async_social_db.query(
-        "MATCH (p:Person {name: 'Frank'}) RETURN p.age"
-    )
+    result = await session.query("MATCH (p:Person {name: 'Frank'}) RETURN p.age")
     assert len(result) == 1
     assert result[0]["p.age"] == 40
 
@@ -101,7 +114,9 @@ async def test_context_manager_auto_commit(async_social_db):
 async def test_context_manager_auto_rollback_on_exception(async_social_db):
     """Test that context manager auto-rolls back on exception."""
 
-    tx = await async_social_db.begin()
+    session = async_social_db.session()
+
+    tx = await session.tx()
     try:
         async with tx:
             await tx.query("CREATE (p:Person {name: 'Grace', age: 45})")
@@ -109,55 +124,61 @@ async def test_context_manager_auto_rollback_on_exception(async_social_db):
     except ValueError:
         pass
 
-    result = await async_social_db.query(
-        "MATCH (p:Person {name: 'Grace'}) RETURN p.name"
-    )
+    result = await session.query("MATCH (p:Person {name: 'Grace'}) RETURN p.name")
     assert len(result) == 0
 
 
 @pytest.mark.asyncio
 async def test_double_commit_raises_error(async_social_db):
-    """Test that committing twice raises RuntimeError."""
+    """Test that committing twice raises UniTransactionAlreadyCompletedError."""
 
-    tx = await async_social_db.begin()
+    session = async_social_db.session()
+
+    tx = await session.tx()
     await tx.query("CREATE (p:Person {name: 'Henry', age: 50})")
     await tx.commit()
 
-    with pytest.raises(RuntimeError, match=".*completed.*|.*committed.*"):
+    with pytest.raises(uni_db.UniTransactionAlreadyCompletedError):
         await tx.commit()
 
 
 @pytest.mark.asyncio
 async def test_double_rollback_raises_error(async_social_db):
-    """Test that rolling back twice raises RuntimeError."""
+    """Test that rolling back twice raises UniTransactionAlreadyCompletedError."""
 
-    tx = await async_social_db.begin()
+    session = async_social_db.session()
+
+    tx = await session.tx()
     await tx.query("CREATE (p:Person {name: 'Iris', age: 55})")
     await tx.rollback()
 
-    with pytest.raises(RuntimeError, match=".*completed.*|.*rolled.*back.*"):
+    with pytest.raises(uni_db.UniTransactionAlreadyCompletedError):
         await tx.rollback()
 
 
 @pytest.mark.asyncio
 async def test_operations_after_commit_raise_error(async_social_db):
-    """Test that operations after commit raise RuntimeError."""
+    """Test that operations after commit raise UniTransactionAlreadyCompletedError."""
 
-    tx = await async_social_db.begin()
+    session = async_social_db.session()
+
+    tx = await session.tx()
     await tx.query("CREATE (p:Person {name: 'Jack', age: 60})")
     await tx.commit()
 
-    with pytest.raises(RuntimeError, match=".*completed.*|.*committed.*"):
+    with pytest.raises(uni_db.UniTransactionAlreadyCompletedError):
         await tx.query("CREATE (p:Person {name: 'Kate', age: 65})")
 
 
 @pytest.mark.asyncio
 async def test_operations_after_rollback_raise_error(async_social_db):
-    """Test that operations after rollback raise RuntimeError."""
+    """Test that operations after rollback raise UniTransactionAlreadyCompletedError."""
 
-    tx = await async_social_db.begin()
+    session = async_social_db.session()
+
+    tx = await session.tx()
     await tx.query("CREATE (p:Person {name: 'Liam', age: 70})")
     await tx.rollback()
 
-    with pytest.raises(RuntimeError, match=".*completed.*|.*rolled.*back.*"):
+    with pytest.raises(uni_db.UniTransactionAlreadyCompletedError):
         await tx.query("CREATE (p:Person {name: 'Mia', age: 75})")

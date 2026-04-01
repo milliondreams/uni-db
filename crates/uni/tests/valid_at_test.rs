@@ -20,16 +20,19 @@ async fn test_valid_at_function() -> Result<()> {
 
     // Create events with validity
     // e1: valid [2023-01-01, 2023-01-02)
-    db.execute("CREATE (e:Event {id: 1, valid_from: datetime('2023-01-01T00:00:00Z'), valid_to: datetime('2023-01-02T00:00:00Z')})").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (e:Event {id: 1, valid_from: datetime('2023-01-01T00:00:00Z'), valid_to: datetime('2023-01-02T00:00:00Z')})").await?;
     // e2: valid [2023-01-02, infinity)
-    db.execute(
+    tx.execute(
         "CREATE (e:Event {id: 2, valid_from: datetime('2023-01-02T00:00:00Z'), valid_to: null})",
     )
     .await?;
+    tx.commit().await?;
 
     // Test 1: Function call
     // Query at 2023-01-01T12:00:00Z. Should match e1.
     let results = db
+        .session()
         .query(
             "
         MATCH (e:Event) 
@@ -40,10 +43,11 @@ async fn test_valid_at_function() -> Result<()> {
         )
         .await?;
     assert_eq!(results.len(), 1);
-    assert_eq!(results.rows[0].get::<i64>("e.id")?, 1);
+    assert_eq!(results.rows()[0].get::<i64>("e.id")?, 1);
 
     // Query at 2023-01-02T12:00:00Z. Should match e2.
     let results = db
+        .session()
         .query(
             "
         MATCH (e:Event) 
@@ -53,10 +57,11 @@ async fn test_valid_at_function() -> Result<()> {
         )
         .await?;
     assert_eq!(results.len(), 1);
-    assert_eq!(results.rows[0].get::<i64>("e.id")?, 2);
+    assert_eq!(results.rows()[0].get::<i64>("e.id")?, 2);
 
     // Query at 2023-01-05. Should match e2.
     let results = db
+        .session()
         .query(
             "
         MATCH (e:Event) 
@@ -66,7 +71,7 @@ async fn test_valid_at_function() -> Result<()> {
         )
         .await?;
     assert_eq!(results.len(), 1);
-    assert_eq!(results.rows[0].get::<i64>("e.id")?, 2);
+    assert_eq!(results.rows()[0].get::<i64>("e.id")?, 2);
 
     Ok(())
 }
@@ -84,16 +89,19 @@ async fn test_valid_at_macro() -> Result<()> {
         .await?;
 
     // e1: valid [2023-01-01, 2023-01-02)
-    db.execute("CREATE (e:Event {id: 1, valid_from: datetime('2023-01-01T00:00:00Z'), valid_to: datetime('2023-01-02T00:00:00Z')})").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (e:Event {id: 1, valid_from: datetime('2023-01-01T00:00:00Z'), valid_to: datetime('2023-01-02T00:00:00Z')})").await?;
     // e2: valid [2023-01-02, infinity)
-    db.execute(
+    tx.execute(
         "CREATE (e:Event {id: 2, valid_from: datetime('2023-01-02T00:00:00Z'), valid_to: null})",
     )
     .await?;
+    tx.commit().await?;
 
     // Test 2: Macro simple
     // MATCH (e:Event) WHERE e VALID_AT datetime(...)
     let results = db
+        .session()
         .query(
             "
         MATCH (e:Event) 
@@ -103,10 +111,11 @@ async fn test_valid_at_macro() -> Result<()> {
         )
         .await?;
     assert_eq!(results.len(), 1);
-    assert_eq!(results.rows[0].get::<i64>("e.id")?, 2);
+    assert_eq!(results.rows()[0].get::<i64>("e.id")?, 2);
 
     // Test macro with valid_from/valid_to defaults on e1 (should fail query at 2023-01-03)
     let results = db
+        .session()
         .query(
             "
         MATCH (e:Event) 
@@ -133,10 +142,13 @@ async fn test_valid_at_macro_custom_props() -> Result<()> {
         .await?;
 
     // Test 3: Macro with custom props
-    db.execute("CREATE (t:Task {id: 3, start: datetime('2023-01-01T00:00:00Z'), end: datetime('2023-01-05T00:00:00Z')})").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (t:Task {id: 3, start: datetime('2023-01-01T00:00:00Z'), end: datetime('2023-01-05T00:00:00Z')})").await?;
+    tx.commit().await?;
 
     // MATCH (t:Task) WHERE t VALID_AT(datetime(...), 'start', 'end')
     let results = db
+        .session()
         .query(
             "
         MATCH (t:Task) 
@@ -146,10 +158,11 @@ async fn test_valid_at_macro_custom_props() -> Result<()> {
         )
         .await?;
     assert_eq!(results.len(), 1);
-    assert_eq!(results.rows[0].get::<i64>("t.id")?, 3);
+    assert_eq!(results.rows()[0].get::<i64>("t.id")?, 3);
 
     // Query outside range
     let results = db
+        .session()
         .query(
             "
         MATCH (t:Task)
@@ -188,15 +201,16 @@ async fn test_valid_at_edge_temporal() -> Result<()> {
         .apply()
         .await?;
 
-    // Create nodes
-    db.execute("CREATE (p:Person {name: 'Alice'})").await?;
-    db.execute("CREATE (c:Company {name: 'Acme Corp'})").await?;
-    db.execute("CREATE (c:Company {name: 'Globex Inc'})")
+    // Create nodes and employment history
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (p:Person {name: 'Alice'})").await?;
+    tx.execute("CREATE (c:Company {name: 'Acme Corp'})").await?;
+    tx.execute("CREATE (c:Company {name: 'Globex Inc'})")
         .await?;
 
     // Create employment history with temporal validity
     // Job 1: 2020-01-01 to 2022-06-30 at Acme Corp
-    db.execute(
+    tx.execute(
         "
         MATCH (p:Person {name: 'Alice'}), (c:Company {name: 'Acme Corp'})
         CREATE (p)-[:EMPLOYED_BY {
@@ -209,7 +223,7 @@ async fn test_valid_at_edge_temporal() -> Result<()> {
     .await?;
 
     // Job 2: 2022-07-01 to present at Globex Inc
-    db.execute(
+    tx.execute(
         "
         MATCH (p:Person {name: 'Alice'}), (c:Company {name: 'Globex Inc'})
         CREATE (p)-[:EMPLOYED_BY {
@@ -220,29 +234,31 @@ async fn test_valid_at_edge_temporal() -> Result<()> {
     ",
     )
     .await?;
+    tx.commit().await?;
 
     // Flush to ensure edges are persisted
     db.flush().await?;
 
     // Debug: Check if edges exist without WHERE clause
     let debug_results = db
-        .query("MATCH (p:Person {name: 'Alice'})-[e:EMPLOYED_BY]->(c:Company) RETURN c.name, e.role, e.valid_from, e.valid_to, e")
+        .session().query("MATCH (p:Person {name: 'Alice'})-[e:EMPLOYED_BY]->(c:Company) RETURN c.name, e.role, e.valid_from, e.valid_to, e")
         .await?;
     println!("Debug: Found {} edges", debug_results.len());
-    for row in &debug_results.rows {
+    for row in debug_results.rows() {
         println!(
             "  Edge properties: company={:?}, role={:?}, valid_from={:?}, valid_to={:?}",
-            row.values.first(),
-            row.values.get(1),
-            row.values.get(2),
-            row.values.get(3)
+            row.values().first(),
+            row.values().get(1),
+            row.values().get(2),
+            row.values().get(3)
         );
-        println!("  Full edge object: {:?}", row.values.get(4));
+        println!("  Full edge object: {:?}", row.values().get(4));
     }
 
     // Test: Query where Alice worked in 2021 (should be Acme Corp)
     // Using VALID_AT macro syntax
     let results = db
+        .session()
         .query(
             "
         MATCH (p:Person {name: 'Alice'})-[e:EMPLOYED_BY]->(c:Company)
@@ -252,12 +268,13 @@ async fn test_valid_at_edge_temporal() -> Result<()> {
         )
         .await?;
     assert_eq!(results.len(), 1);
-    assert_eq!(results.rows[0].get::<String>("company")?, "Acme Corp");
-    assert_eq!(results.rows[0].get::<String>("role")?, "Engineer");
+    assert_eq!(results.rows()[0].get::<String>("company")?, "Acme Corp");
+    assert_eq!(results.rows()[0].get::<String>("role")?, "Engineer");
 
     // Test: Query where Alice works in 2024 (should be Globex Inc)
     // Using VALID_AT macro syntax
     let results = db
+        .session()
         .query(
             "
         MATCH (p:Person {name: 'Alice'})-[e:EMPLOYED_BY]->(c:Company)
@@ -267,12 +284,13 @@ async fn test_valid_at_edge_temporal() -> Result<()> {
         )
         .await?;
     assert_eq!(results.len(), 1);
-    assert_eq!(results.rows[0].get::<String>("company")?, "Globex Inc");
-    assert_eq!(results.rows[0].get::<String>("role")?, "Senior Engineer");
+    assert_eq!(results.rows()[0].get::<String>("company")?, "Globex Inc");
+    assert_eq!(results.rows()[0].get::<String>("role")?, "Senior Engineer");
 
     // Test: Query at the boundary of a half-open interval.
     // At 2022-06-30T00:00:00Z: [2020-01-01, 2022-06-30) does NOT include the end instant.
     let results = db
+        .session()
         .query(
             "
         MATCH (p:Person {name: 'Alice'})-[e:EMPLOYED_BY]->(c:Company)
@@ -289,6 +307,7 @@ async fn test_valid_at_edge_temporal() -> Result<()> {
 
     // At 2022-06-29T23:59:59Z: should still be at Acme
     let results = db
+        .session()
         .query(
             "
         MATCH (p:Person {name: 'Alice'})-[e:EMPLOYED_BY]->(c:Company)
@@ -298,7 +317,7 @@ async fn test_valid_at_edge_temporal() -> Result<()> {
         )
         .await?;
     assert_eq!(results.len(), 1);
-    assert_eq!(results.rows[0].get::<String>("company")?, "Acme Corp");
+    assert_eq!(results.rows()[0].get::<String>("company")?, "Acme Corp");
 
     Ok(())
 }
@@ -316,10 +335,13 @@ async fn test_valid_at_boundary_conditions() -> Result<()> {
         .await?;
 
     // Contract valid exactly from start to end
-    db.execute("CREATE (c:Contract {id: 1, valid_from: datetime('2023-01-01T00:00:00Z'), valid_to: datetime('2023-12-31T23:59:59Z')})").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (c:Contract {id: 1, valid_from: datetime('2023-01-01T00:00:00Z'), valid_to: datetime('2023-12-31T23:59:59Z')})").await?;
+    tx.commit().await?;
 
     // Test: Exactly at start time (should be valid)
     let results = db
+        .session()
         .query(
             "
         MATCH (c:Contract)
@@ -332,6 +354,7 @@ async fn test_valid_at_boundary_conditions() -> Result<()> {
 
     // Test: One second before start (should be invalid)
     let results = db
+        .session()
         .query(
             "
         MATCH (c:Contract)
@@ -344,6 +367,7 @@ async fn test_valid_at_boundary_conditions() -> Result<()> {
 
     // Test: Exactly at end time (should be invalid - half-open interval)
     let results = db
+        .session()
         .query(
             "
         MATCH (c:Contract)
@@ -360,6 +384,7 @@ async fn test_valid_at_boundary_conditions() -> Result<()> {
 
     // Test: One second before end (should be valid)
     let results = db
+        .session()
         .query(
             "
         MATCH (c:Contract)
@@ -390,12 +415,15 @@ async fn test_valid_at_open_ended() -> Result<()> {
         .await?;
 
     // Active subscription with no end date
-    db.execute("CREATE (s:Subscription {id: 1, valid_from: datetime('2020-01-01T00:00:00Z'), valid_to: null})").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (s:Subscription {id: 1, valid_from: datetime('2020-01-01T00:00:00Z'), valid_to: null})").await?;
     // Cancelled subscription
-    db.execute("CREATE (s:Subscription {id: 2, valid_from: datetime('2020-01-01T00:00:00Z'), valid_to: datetime('2022-01-01T00:00:00Z')})").await?;
+    tx.execute("CREATE (s:Subscription {id: 2, valid_from: datetime('2020-01-01T00:00:00Z'), valid_to: datetime('2022-01-01T00:00:00Z')})").await?;
+    tx.commit().await?;
 
     // Test: Far future date should only match open-ended subscription
     let results = db
+        .session()
         .query(
             "
         MATCH (s:Subscription)
@@ -406,10 +434,11 @@ async fn test_valid_at_open_ended() -> Result<()> {
         )
         .await?;
     assert_eq!(results.len(), 1);
-    assert_eq!(results.rows[0].get::<i64>("s.id")?, 1);
+    assert_eq!(results.rows()[0].get::<i64>("s.id")?, 1);
 
     // Test: Date when both were active
     let results = db
+        .session()
         .query(
             "
         MATCH (s:Subscription)
@@ -504,8 +533,10 @@ async fn test_valid_at_no_suggestion_with_index() -> Result<()> {
         .await?;
 
     // Create a scalar index on valid_from
-    db.execute("CREATE INDEX idx_valid_from FOR (t:Task) ON (t.valid_from)")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE INDEX idx_valid_from FOR (t:Task) ON (t.valid_from)")
         .await?;
+    tx.commit().await?;
 
     // Parse and plan a query - index now exists
     let query = "MATCH (t:Task) WHERE t VALID_AT datetime('2023-01-01T00:00:00Z') RETURN t.id";
@@ -589,12 +620,11 @@ async fn test_valid_at_schemaless_edge_temporal() -> Result<()> {
         .apply()
         .await?;
 
-    // Create nodes
-    db.execute("CREATE (w:Worker {name: 'Bob'})").await?;
-    db.execute("CREATE (e:Employer {name: 'TechCo'})").await?;
-
-    // Create edge with temporal properties (schemaless — not declared in schema)
-    db.execute(
+    // Create nodes and edge with temporal properties (schemaless — not declared in schema)
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (w:Worker {name: 'Bob'})").await?;
+    tx.execute("CREATE (e:Employer {name: 'TechCo'})").await?;
+    tx.execute(
         "
         MATCH (w:Worker {name: 'Bob'}), (e:Employer {name: 'TechCo'})
         CREATE (w)-[:WORKS_FOR {
@@ -605,9 +635,11 @@ async fn test_valid_at_schemaless_edge_temporal() -> Result<()> {
     ",
     )
     .await?;
+    tx.commit().await?;
 
     // Pre-flush: named property access should work (data in L0)
     let results = db
+        .session()
         .query(
             "
         MATCH (w:Worker {name: 'Bob'})-[r:WORKS_FOR]->(e:Employer)
@@ -616,13 +648,14 @@ async fn test_valid_at_schemaless_edge_temporal() -> Result<()> {
         )
         .await?;
     assert_eq!(results.len(), 1, "Should find the edge pre-flush");
-    assert_eq!(results.rows[0].get::<String>("role")?, "Developer");
+    assert_eq!(results.rows()[0].get::<String>("role")?, "Developer");
 
     // Flush to persist edges to storage
     db.flush().await?;
 
     // Post-flush: named property access on schemaless edge — this is the regression
     let results = db
+        .session()
         .query(
             "
         MATCH (w:Worker {name: 'Bob'})-[r:WORKS_FOR]->(e:Employer)
@@ -632,13 +665,14 @@ async fn test_valid_at_schemaless_edge_temporal() -> Result<()> {
         .await?;
     assert_eq!(results.len(), 1, "Should find the edge post-flush");
     assert_eq!(
-        results.rows[0].get::<String>("role")?,
+        results.rows()[0].get::<String>("role")?,
         "Developer",
         "Schemaless edge property should be accessible after flush"
     );
 
     // Post-flush: VALID_AT on schemaless edge
     let results = db
+        .session()
         .query(
             "
         MATCH (w:Worker {name: 'Bob'})-[r:WORKS_FOR]->(e:Employer)
@@ -652,8 +686,8 @@ async fn test_valid_at_schemaless_edge_temporal() -> Result<()> {
         1,
         "VALID_AT should work on schemaless edge post-flush"
     );
-    assert_eq!(results.rows[0].get::<String>("employer")?, "TechCo");
-    assert_eq!(results.rows[0].get::<String>("role")?, "Developer");
+    assert_eq!(results.rows()[0].get::<String>("employer")?, "TechCo");
+    assert_eq!(results.rows()[0].get::<String>("role")?, "Developer");
 
     Ok(())
 }

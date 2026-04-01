@@ -9,14 +9,16 @@ async fn test_expression_index() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
     // 1. Create label
-    db.execute("CREATE LABEL User (email STRING)").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL User (email STRING)").await?;
 
     // 2. Create Expression Index
-    db.execute("CREATE INDEX lower_email FOR (u:User) ON (lower(u.email))")
+    tx.execute("CREATE INDEX lower_email FOR (u:User) ON (lower(u.email))")
         .await?;
+    tx.commit().await?;
 
     // 3. Verify schema metadata
-    let schema = db.get_schema();
+    let schema = db.schema().current();
     let _idx = schema
         .indexes
         .iter()
@@ -47,12 +49,15 @@ async fn test_expression_index() -> Result<()> {
     assert_eq!(meta.generation_expression, Some(original_expr.to_string()));
 
     // 4. Insert Data (should compute generated column)
-    db.execute("CREATE (:User {email: 'Alice@Example.com'})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:User {email: 'Alice@Example.com'})")
         .await?;
+    tx.commit().await?;
 
     // 5. Verify data (querying generated column directly)
     // Use ALIAS because default column name includes variable prefix (e.g. "u._gen...")
     let result = db
+        .session()
         .query(&format!("MATCH (u:User) RETURN u.{} AS val", gen_col))
         .await?;
     assert_eq!(result.len(), 1);
@@ -63,6 +68,7 @@ async fn test_expression_index() -> Result<()> {
     // The planner should rewrite `lower(u.email)` to `u._gen_LOWER_u_email`
     // And since we have an index on it, it should be fast (though here we just check correctness)
     let result = db
+        .session()
         .query("MATCH (u:User) WHERE lower(u.email) = 'alice@example.com' RETURN u.email AS email")
         .await?;
     assert_eq!(result.len(), 1);

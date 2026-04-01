@@ -34,18 +34,18 @@ async fn test_list_indexes_with_metadata() -> Result<()> {
     db.schema_manager().add_index(idx)?;
 
     // list_indexes returns indexes for a specific label
-    let indexes = db.list_indexes("Person");
+    let indexes = db.indexes().list(Some("Person"));
     assert_eq!(indexes.len(), 1);
     assert_eq!(indexes[0].name(), "idx_person_name");
     assert_eq!(indexes[0].metadata().status, IndexStatus::Online);
     assert!(indexes[0].metadata().last_built_at.is_none());
 
     // list_all_indexes returns all
-    let all = db.list_all_indexes();
+    let all = db.indexes().list(None);
     assert_eq!(all.len(), 1);
 
     // No indexes for a non-existent label
-    let empty = db.list_indexes("NoSuchLabel");
+    let empty = db.indexes().list(Some("NoSuchLabel"));
     assert!(empty.is_empty());
 
     Ok(())
@@ -76,13 +76,13 @@ async fn test_update_index_metadata_persists() -> Result<()> {
         })?;
 
     // Verify through list_indexes
-    let indexes = db.list_indexes("Product");
+    let indexes = db.indexes().list(Some("Product"));
     assert_eq!(indexes[0].metadata().status, IndexStatus::Stale);
     assert_eq!(indexes[0].metadata().row_count_at_build, Some(500));
 
     // Save and reload
     db.schema_manager().save().await?;
-    let indexes2 = db.list_indexes("Product");
+    let indexes2 = db.indexes().list(Some("Product"));
     assert_eq!(indexes2[0].metadata().status, IndexStatus::Stale);
 
     Ok(())
@@ -114,7 +114,9 @@ async fn test_bulk_sync_sets_metadata() -> Result<()> {
     db.schema_manager().save().await?;
 
     // Bulk load some data with sync index rebuild
-    let mut bulk = db
+    let s = db.session();
+    let tx = s.tx().await?;
+    let mut bulk = tx
         .bulk_writer()
         .defer_scalar_indexes(true)
         .async_indexes(false)
@@ -132,7 +134,7 @@ async fn test_bulk_sync_sets_metadata() -> Result<()> {
     assert_eq!(stats.indexes_rebuilt, 1);
 
     // Verify metadata was updated on our original index
-    let indexes = db.list_indexes("Item");
+    let indexes = db.indexes().list(Some("Item"));
     assert!(!indexes.is_empty());
     let our_idx = indexes
         .iter()

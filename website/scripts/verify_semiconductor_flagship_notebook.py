@@ -11,12 +11,16 @@ import os
 from pathlib import Path
 
 
-DEFAULT_NOTEBOOK = Path("website/docs/examples/python/locy_semiconductor_yield_excursion.ipynb")
+DEFAULT_NOTEBOOK = Path(
+    "website/docs/examples/python/locy_semiconductor_yield_excursion.ipynb"
+)
 
 
 def _require(name: str, env: dict[str, object]) -> object:
     if name not in env:
-        raise AssertionError(f"Expected variable '{name}' to be defined by notebook execution.")
+        raise AssertionError(
+            f"Expected variable '{name}' to be defined by notebook execution."
+        )
     return env[name]
 
 
@@ -25,7 +29,9 @@ def _as_int(name: str, value: object) -> int:
         raise AssertionError(f"Expected '{name}' to be int-like, got bool.")
     if isinstance(value, int):
         return value
-    raise AssertionError(f"Expected '{name}' to be int-like, got {type(value).__name__}.")
+    raise AssertionError(
+        f"Expected '{name}' to be int-like, got {type(value).__name__}."
+    )
 
 
 def _as_str(name: str, value: object) -> str:
@@ -37,6 +43,9 @@ def _as_str(name: str, value: object) -> str:
 def _as_list(name: str, value: object) -> list[object]:
     if isinstance(value, list):
         return value
+    # Accept QueryResult and other sequence-like objects from the bindings.
+    if hasattr(value, "__len__") and hasattr(value, "__iter__"):
+        return list(value)
     raise AssertionError(f"Expected '{name}' to be a list, got {type(value).__name__}.")
 
 
@@ -79,15 +88,23 @@ def validate_results(env: dict[str, object]) -> dict[str, int | str]:
     hot_tool = _as_str("hot_tool", _require("hot_tool", env))
     hot_tool_rows = _as_list("hot_tool_rows", _require("hot_tool_rows", env))
     if len(hot_tool_rows) < 3:
-        raise AssertionError("Expected at least 3 hotspot tool rows from baseline ranking.")
+        raise AssertionError(
+            "Expected at least 3 hotspot tool rows from baseline ranking."
+        )
 
     total_fail_lots = _as_int("total_fail_lots", _require("total_fail_lots", env))
-    contained_fail_lots = _as_int("contained_fail_lots", _require("contained_fail_lots", env))
-    residual_fail_lots = _as_int("residual_fail_lots", _require("residual_fail_lots", env))
+    contained_fail_lots = _as_int(
+        "contained_fail_lots", _require("contained_fail_lots", env)
+    )
+    residual_fail_lots = _as_int(
+        "residual_fail_lots", _require("residual_fail_lots", env)
+    )
     if total_fail_lots <= 0:
         raise AssertionError("Expected total_fail_lots > 0.")
     if contained_fail_lots <= 0:
-        raise AssertionError("Expected contained_fail_lots > 0 for meaningful ASSUME output.")
+        raise AssertionError(
+            "Expected contained_fail_lots > 0 for meaningful ASSUME output."
+        )
     if residual_fail_lots >= total_fail_lots:
         raise AssertionError("Expected residual_fail_lots < total_fail_lots.")
 
@@ -99,7 +116,9 @@ def validate_results(env: dict[str, object]) -> dict[str, int | str]:
 
     tree = _require("tree", env)
     if not isinstance(tree, dict) or not tree.get("rule"):
-        raise AssertionError("Expected EXPLAIN RULE to produce a derivation tree with a rule name.")
+        raise AssertionError(
+            "Expected EXPLAIN RULE to produce a derivation tree with a rule name."
+        )
     children = tree.get("children")
     if not isinstance(children, list) or not children:
         raise AssertionError("Expected EXPLAIN RULE tree to include child derivations.")
@@ -137,13 +156,19 @@ def main() -> int:
 
     os.environ.setdefault(
         "LOCY_DATA_DIR",
-        str((notebook_path.parent.parent / "data/locy_semiconductor_yield_excursion").resolve()),
+        str(
+            (
+                notebook_path.parent.parent / "data/locy_semiconductor_yield_excursion"
+            ).resolve()
+        ),
     )
 
     env, nb = execute_notebook(notebook_path, write_outputs=args.write_outputs)
     summary = validate_results(env)
     if args.write_outputs:
-        notebook_path.write_text(json.dumps(nb, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        notebook_path.write_text(
+            json.dumps(nb, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
         print(f"Wrote executed outputs to: {notebook_path}")
     print("Flagship notebook validation passed.")
     print(

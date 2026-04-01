@@ -1,17 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Dragonscale Team
 
-use crate::lancedb::LanceDbStore;
+use crate::backend::StorageBackend;
+use crate::backend::table_names;
+use crate::backend::types::{ScalarIndexType, WriteMode};
 use crate::storage::arrow_convert::build_timestamp_column_from_vid_map;
 use crate::storage::property_builder::PropertyColumnBuilder;
 use anyhow::{Result, anyhow};
 use arrow_array::builder::{FixedSizeBinaryBuilder, ListBuilder, StringBuilder};
 use arrow_array::{ArrayRef, BooleanArray, RecordBatch, UInt64Array};
 use arrow_schema::{Field, Schema as ArrowSchema, TimeUnit};
+#[cfg(feature = "lance-backend")]
 use lance::dataset::Dataset;
-use lancedb::Table;
-use lancedb::index::Index as LanceDbIndex;
-use lancedb::index::scalar::BTreeIndexBuilder;
 use sha3::{Digest, Sha3_256};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -20,6 +20,7 @@ use uni_common::core::id::{UniId, Vid};
 use uni_common::core::schema::Schema;
 
 pub struct VertexDataset {
+    #[cfg_attr(not(feature = "lance-backend"), allow(dead_code))]
     uri: String,
     label: String,
     _label_id: u16,
@@ -64,10 +65,12 @@ impl VertexDataset {
         UniId::from_bytes(hash)
     }
 
+    #[cfg(feature = "lance-backend")]
     pub async fn open(&self) -> Result<Arc<Dataset>> {
         self.open_at(None).await
     }
 
+    #[cfg(feature = "lance-backend")]
     pub async fn open_at(&self, version: Option<u64>) -> Result<Arc<Dataset>> {
         let mut ds = Dataset::open(&self.uri).await?;
         if let Some(v) = version {
@@ -76,6 +79,7 @@ impl VertexDataset {
         Ok(Arc::new(ds))
     }
 
+    #[cfg(feature = "lance-backend")]
     pub async fn open_raw(&self) -> Result<Dataset> {
         let ds = Dataset::open(&self.uri).await?;
         Ok(ds)
@@ -237,56 +241,45 @@ impl VertexDataset {
     }
 
     // ========================================================================
-    // LanceDB-based Methods
+    // Backend-agnostic Methods
     // ========================================================================
 
-    /// Open a vertex table using LanceDB.
-    ///
-    /// This is the preferred method for new code as it enables DataFusion queries.
-    pub async fn open_lancedb(&self, store: &LanceDbStore) -> Result<Table> {
-        store.open_vertex_table(&self.label).await
-    }
-
-    /// Open or create a vertex table using LanceDB.
-    pub async fn open_or_create_lancedb(
+    /// Open or create a vertex table via the storage backend.
+    pub async fn open_or_create(
         &self,
-        store: &LanceDbStore,
+        backend: &dyn StorageBackend,
         schema: &Schema,
-    ) -> Result<Table> {
+    ) -> Result<()> {
+        let table_name = table_names::vertex_table_name(&self.label);
         let arrow_schema = self.get_arrow_schema(schema)?;
-        store
-            .open_or_create_vertex_table(&self.label, arrow_schema)
+        backend
+            .open_or_create_table(&table_name, arrow_schema)
             .await
     }
 
-    /// Write a batch to a LanceDB vertex table.
+    /// Write a batch to a vertex table.
     ///
     /// Creates the table if it doesn't exist, otherwise appends to it.
-    pub async fn write_batch_lancedb(
+    pub async fn write_batch(
         &self,
-        store: &LanceDbStore,
+        backend: &dyn StorageBackend,
         batch: RecordBatch,
         _schema: &Schema,
-    ) -> Result<Table> {
-        let table_name = LanceDbStore::vertex_table_name(&self.label);
-
-        if store.table_exists(&table_name).await? {
-            let table = store.open_table(&table_name).await?;
-            store.append_to_table(&table, vec![batch]).await?;
-            Ok(table)
+    ) -> Result<()> {
+        let table_name = table_names::vertex_table_name(&self.label);
+        if backend.table_exists(&table_name).await? {
+            backend
+                .write(&table_name, vec![batch], WriteMode::Append)
+                .await
         } else {
-            store.create_table(&table_name, vec![batch]).await
+            backend.create_table(&table_name, vec![batch]).await
         }
     }
 
-    /// Ensure default scalar indexes exist on system columns (_vid, _uid, ext_id) using LanceDB.
-    ///
-    /// LanceDB uses BTree indexes for scalar columns.
-    pub async fn ensure_default_indexes_lancedb(&self, table: &Table) -> Result<()> {
-        let indices = table
-            .list_indices()
-            .await
-            .map_err(|e| anyhow!("Failed to list indices: {}", e))?;
+    /// Ensure default scalar indexes exist on system columns (_vid, _uid, ext_id).
+    pub async fn ensure_default_indexes(&self, backend: &dyn StorageBackend) -> Result<()> {
+        let table_name = table_names::vertex_table_name(&self.label);
+        let indices = backend.list_indexes(&table_name).await?;
 
         let has_index = |col: &str| {
             indices
@@ -298,18 +291,13 @@ impl VertexDataset {
             if has_index(column) {
                 continue;
             }
-            log::info!(
-                "Creating {} BTree index for label '{}' via LanceDB",
-                column,
-                self.label
-            );
-            if let Err(e) = table
-                .create_index(&[column], LanceDbIndex::BTree(BTreeIndexBuilder::default()))
-                .execute()
+            log::info!("Creating {} BTree index for label '{}'", column, self.label);
+            if let Err(e) = backend
+                .create_scalar_index(&table_name, column, ScalarIndexType::BTree)
                 .await
             {
                 log::warn!(
-                    "Failed to create {} index for '{}' via LanceDB: {}",
+                    "Failed to create {} index for '{}': {}",
                     column,
                     self.label,
                     e
@@ -320,24 +308,23 @@ impl VertexDataset {
         Ok(())
     }
 
-    /// Get the LanceDB table name for this vertex dataset.
-    pub fn lancedb_table_name(&self) -> String {
-        LanceDbStore::vertex_table_name(&self.label)
+    /// Get the table name for this vertex dataset.
+    pub fn table_name(&self) -> String {
+        table_names::vertex_table_name(&self.label)
     }
 
-    /// Replace a vertex table's contents using LanceDB atomically.
+    /// Replace a vertex table's contents atomically.
     ///
-    /// This uses a staging table for crash-safe replacement. Used by compaction
-    /// to rewrite the table with merged data.
-    pub async fn replace_lancedb(
+    /// Used by compaction to rewrite the table with merged data.
+    pub async fn replace(
         &self,
-        store: &LanceDbStore,
+        backend: &dyn StorageBackend,
         batch: RecordBatch,
         schema: &Schema,
-    ) -> Result<Table> {
-        let table_name = self.lancedb_table_name();
+    ) -> Result<()> {
+        let table_name = self.table_name();
         let arrow_schema = self.get_arrow_schema(schema)?;
-        store
+        backend
             .replace_table_atomic(&table_name, vec![batch], arrow_schema)
             .await
     }

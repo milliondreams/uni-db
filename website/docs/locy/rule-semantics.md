@@ -74,5 +74,7 @@ Key guardrails come from `LocyConfig`:
 - `probability_epsilon`
 - `exact_probability`
 - `max_bdd_variables`
+- `top_k_proofs`
+- `deterministic_best_by`
 
 See [Errors & Limits](reference/errors-limits.md) for operational guidance.

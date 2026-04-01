@@ -13,13 +13,16 @@ async fn test_overflow_json_post_flush() -> Result<()> {
     db.schema().label("Person").apply().await?;
 
     // Create with overflow properties
-    db.execute("CREATE (:Person {name: 'Alice', city: 'NYC', age: 30})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Person {name: 'Alice', city: 'NYC', age: 30})")
         .await?;
+    tx.commit().await?;
 
     println!("✓ Created vertex with overflow properties");
 
     // Verify before flush (L0)
     let results = db
+        .session()
         .query("MATCH (p:Person) RETURN p.name, p.city, p.age")
         .await?;
     assert_eq!(results.len(), 1);
@@ -35,16 +38,20 @@ async fn test_overflow_json_post_flush() -> Result<()> {
 
     // Verify after flush (this is what we're fixing!)
     let results = db
+        .session()
         .query("MATCH (p:Person) RETURN p.name, p.city, p.age")
         .await?;
     println!("Results after flush: {} rows", results.len());
     if results.is_empty() {
         // Try simpler query
-        let results2 = db.query("MATCH (p:Person) RETURN p").await?;
+        let results2 = db.session().query("MATCH (p:Person) RETURN p").await?;
         println!("Simpler query results: {} rows", results2.len());
 
         // Try just count
-        let results3 = db.query("MATCH (p:Person) RETURN count(p) as cnt").await?;
+        let results3 = db
+            .session()
+            .query("MATCH (p:Person) RETURN count(p) as cnt")
+            .await?;
         if !results3.is_empty() {
             println!("Count query: {}", results3.rows()[0].get::<i64>("cnt")?);
         }
@@ -71,12 +78,15 @@ async fn test_overflow_properties_returned() -> Result<()> {
 
     db.schema().label("Product").apply().await?;
 
-    db.execute("CREATE (:Product {name: 'Book A', category: 'books'})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Product {name: 'Book A', category: 'books'})")
         .await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // First verify we can return overflow properties at all
     let results = db
+        .session()
         .query("MATCH (p:Product) RETURN p.name, p.category")
         .await?;
 
@@ -105,12 +115,14 @@ async fn test_where_clause_on_overflow_property() -> Result<()> {
     db.schema().label("Product").apply().await?;
 
     // Create test data
-    db.execute("CREATE (:Product {name: 'Book A', category: 'books', price: 10})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Product {name: 'Book A', category: 'books', price: 10})")
         .await?;
-    db.execute("CREATE (:Product {name: 'Book B', category: 'books', price: 20})")
+    tx.execute("CREATE (:Product {name: 'Book B', category: 'books', price: 20})")
         .await?;
-    db.execute("CREATE (:Product {name: 'Phone', category: 'electronics', price: 500})")
+    tx.execute("CREATE (:Product {name: 'Phone', category: 'electronics', price: 500})")
         .await?;
+    tx.commit().await?;
 
     println!("✓ Created 3 products with overflow properties");
 
@@ -120,6 +132,7 @@ async fn test_where_clause_on_overflow_property() -> Result<()> {
 
     // Test WHERE clause on overflow property (requires query rewriting)
     let results = db
+        .session()
         .query("MATCH (p:Product) WHERE p.category = 'books' RETURN p.name, p.price")
         .await?;
 

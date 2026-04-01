@@ -121,7 +121,7 @@ impl AlgoBenchContext {
         // Create nodes
         for i in 0..nodes {
             let vid = Vid::new(i as u64);
-            w.insert_vertex_with_labels(vid, HashMap::new(), &["Node".to_string()])
+            w.insert_vertex_with_labels(vid, HashMap::new(), &["Node".to_string()], None)
                 .await
                 .unwrap();
         }
@@ -135,7 +135,7 @@ impl AlgoBenchContext {
                 if target_idx != i {
                     let dst = Vid::new(target_idx as u64);
                     let eid = w.next_eid(link_type).await.unwrap();
-                    w.insert_edge(src, dst, link_type, eid, HashMap::new(), None)
+                    w.insert_edge(src, dst, link_type, eid, HashMap::new(), None, None)
                         .await
                         .unwrap();
                 }

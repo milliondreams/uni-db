@@ -8,16 +8,19 @@ async fn test_pattern_two_nodes_vlp_undirected() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
     // Create graph: (a:A)-[:REL1]->(b:B), (b)-[:REL2]->(a), (a)-[:REL3]->(c:C), (a)-[:REL1]->(d:D)
-    db.execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         r#"
         CREATE (a:A)-[:REL1]->(b:B), (b)-[:REL2]->(a), (a)-[:REL3]->(:C), (a)-[:REL1]->(:D)
         "#,
     )
     .await?;
+    tx.commit().await?;
 
     // Query: MATCH (n), (m) WHERE (n)-[:REL1*2]-(m) RETURN n, m
     // Expected: D and B (via path D <-REL1- A -REL1-> B)
     let results = db
+        .session()
         .query(
             r#"
             MATCH (n), (m) WHERE (n)-[:REL1*2]-(m) RETURN n, m
@@ -39,15 +42,17 @@ async fn test_pattern_two_nodes_simple() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
     // Simpler test: just two nodes with a single edge
-    db.execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         r#"
         CREATE (a:A)-[:REL]->(b:B)
         "#,
     )
     .await?;
+    tx.commit().await?;
 
     // First, let's see what the Cartesian product gives us
-    let cartesian = db.query("MATCH (n), (m) RETURN n, m").await?;
+    let cartesian = db.session().query("MATCH (n), (m) RETURN n, m").await?;
     println!("Cartesian product rows: {}", cartesian.len());
     for (i, row) in cartesian.iter().enumerate() {
         println!("  Row {}: {:?}", i, row);
@@ -55,6 +60,7 @@ async fn test_pattern_two_nodes_simple() -> Result<()> {
 
     // Query: MATCH (n), (m) WHERE (n)-[:REL]->(m) RETURN n, m
     let results = db
+        .session()
         .query(
             r#"
             MATCH (n), (m) WHERE (n)-[:REL]->(m) RETURN n, m
@@ -76,11 +82,14 @@ async fn test_pattern_two_nodes_simple() -> Result<()> {
 async fn test_pattern_two_nodes_directed() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
-    db.execute("CREATE (a:A)-[:REL]->(b:B)").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (a:A)-[:REL]->(b:B)").await?;
+    tx.commit().await?;
 
     // MATCH (n), (m) WHERE (n)-[:REL]->(m) RETURN n, m
     // Expected: 1 row (A, B)
     let results = db
+        .session()
         .query("MATCH (n), (m) WHERE (n)-[:REL]->(m) RETURN n, m")
         .await?;
 
@@ -94,11 +103,14 @@ async fn test_pattern_two_nodes_directed() -> Result<()> {
 async fn test_pattern_two_nodes_undirected() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
-    db.execute("CREATE (a:A)-[:REL]->(b:B)").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (a:A)-[:REL]->(b:B)").await?;
+    tx.commit().await?;
 
     // MATCH (n), (m) WHERE (n)-[:REL]-(m) RETURN n, m
     // Expected: 2 rows (A, B) and (B, A)
     let results = db
+        .session()
         .query("MATCH (n), (m) WHERE (n)-[:REL]-(m) RETURN n, m")
         .await?;
 
@@ -113,12 +125,15 @@ async fn test_pattern_two_nodes_typed_undirected() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
     // Create multiple edge types
-    db.execute("CREATE (a:A)-[:REL]->(b:B), (a)-[:OTHER]->(c:C)")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (a:A)-[:REL]->(b:B), (a)-[:OTHER]->(c:C)")
         .await?;
+    tx.commit().await?;
 
     // MATCH (n), (m) WHERE (n)-[:REL]-(m) RETURN n, m
     // Expected: 2 rows (A, B) and (B, A), NOT (A, C)
     let results = db
+        .session()
         .query("MATCH (n), (m) WHERE (n)-[:REL]-(m) RETURN n, m")
         .await?;
 
@@ -133,12 +148,15 @@ async fn test_pattern_two_nodes_vlp_directed() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
     // Create chain: A -> B -> C
-    db.execute("CREATE (a:A)-[:REL]->(b:B)-[:REL]->(c:C)")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (a:A)-[:REL]->(b:B)-[:REL]->(c:C)")
         .await?;
+    tx.commit().await?;
 
     // MATCH (n), (m) WHERE (n)-[:REL*1..2]->(m) RETURN n, m
     // Expected: 3 rows (A, B), (B, C), (A, C)
     let results = db
+        .session()
         .query("MATCH (n), (m) WHERE (n)-[:REL*1..2]->(m) RETURN n, m")
         .await?;
 
@@ -152,11 +170,14 @@ async fn test_pattern_two_nodes_vlp_directed() -> Result<()> {
 async fn test_pattern_two_nodes_vlp_undirected_single() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
-    db.execute("CREATE (a:A)-[:REL]->(b:B)").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (a:A)-[:REL]->(b:B)").await?;
+    tx.commit().await?;
 
     // MATCH (n), (m) WHERE (n)-[:REL*1..2]-(m) RETURN n, m
     // Expected: 2 rows (A, B) and (B, A)
     let results = db
+        .session()
         .query("MATCH (n), (m) WHERE (n)-[:REL*1..2]-(m) RETURN n, m")
         .await?;
 
@@ -174,11 +195,14 @@ async fn test_pattern_two_nodes_vlp_undirected_single() -> Result<()> {
 async fn test_pattern_two_nodes_no_match() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
-    db.execute("CREATE (a:A), (b:B)").await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (a:A), (b:B)").await?;
+    tx.commit().await?;
 
     // MATCH (n), (m) WHERE (n)-[:NONEXISTENT]->(m) RETURN n, m
     // Expected: 0 rows
     let results = db
+        .session()
         .query("MATCH (n), (m) WHERE (n)-[:NONEXISTENT]->(m) RETURN n, m")
         .await?;
 
@@ -193,12 +217,15 @@ async fn test_pattern_two_nodes_self_loop() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
     // Create self-loop and regular edge
-    db.execute("CREATE (a:A)-[:REL]->(a), (a)-[:REL]->(b:B)")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (a:A)-[:REL]->(a), (a)-[:REL]->(b:B)")
         .await?;
+    tx.commit().await?;
 
     // MATCH (n), (m) WHERE (n)-[:REL]->(m) RETURN n, m
     // Expected: 2 rows (A, A) and (A, B)
     let results = db
+        .session()
         .query("MATCH (n), (m) WHERE (n)-[:REL]->(m) RETURN n, m")
         .await?;
 
@@ -213,12 +240,15 @@ async fn test_pattern_two_nodes_vlp_multiple_types() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
     // Create graph with multiple types
-    db.execute("CREATE (a:A)-[:REL1]->(b:B), (a)-[:REL2]->(c:C)")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (a:A)-[:REL1]->(b:B), (a)-[:REL2]->(c:C)")
         .await?;
+    tx.commit().await?;
 
     // MATCH (n), (m) WHERE (n)-[:REL1*1..1]->(m) RETURN n, m
     // Expected: 1 row (A, B), NOT (A, C)
     let results = db
+        .session()
         .query("MATCH (n), (m) WHERE (n)-[:REL1*1..1]->(m) RETURN n, m")
         .await?;
 

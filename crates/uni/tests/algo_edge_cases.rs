@@ -47,12 +47,20 @@ async fn test_pagerank_dangling_nodes() -> anyhow::Result<()> {
 
     {
         let mut w = writer.write().await;
-        w.insert_vertex_with_labels(vid_a, HashMap::new(), &["Node".to_string()])
+        w.insert_vertex_with_labels(vid_a, HashMap::new(), &["Node".to_string()], None)
             .await?;
-        w.insert_vertex_with_labels(vid_b, HashMap::new(), &["Node".to_string()])
+        w.insert_vertex_with_labels(vid_b, HashMap::new(), &["Node".to_string()], None)
             .await?;
-        w.insert_edge(vid_a, vid_b, link_edge, Eid::new(0), HashMap::new(), None)
-            .await?;
+        w.insert_edge(
+            vid_a,
+            vid_b,
+            link_edge,
+            Eid::new(0),
+            HashMap::new(),
+            None,
+            None,
+        )
+        .await?;
         w.flush_to_l1(None).await?;
     }
 
@@ -129,13 +137,29 @@ async fn test_shortest_path_unreachable() -> anyhow::Result<()> {
     {
         let mut w = writer.write().await;
         for &v in &[vid_a, vid_b, vid_c, vid_d] {
-            w.insert_vertex_with_labels(v, HashMap::new(), &["Node".to_string()])
+            w.insert_vertex_with_labels(v, HashMap::new(), &["Node".to_string()], None)
                 .await?;
         }
-        w.insert_edge(vid_a, vid_b, link_edge, Eid::new(0), HashMap::new(), None)
-            .await?;
-        w.insert_edge(vid_c, vid_d, link_edge, Eid::new(1), HashMap::new(), None)
-            .await?;
+        w.insert_edge(
+            vid_a,
+            vid_b,
+            link_edge,
+            Eid::new(0),
+            HashMap::new(),
+            None,
+            None,
+        )
+        .await?;
+        w.insert_edge(
+            vid_c,
+            vid_d,
+            link_edge,
+            Eid::new(1),
+            HashMap::new(),
+            None,
+            None,
+        )
+        .await?;
         w.flush_to_l1(None).await?;
     }
 
@@ -195,7 +219,7 @@ async fn test_wcc_singletons() -> anyhow::Result<()> {
     {
         let mut w = writer.write().await;
         for &v in &[vid_a, vid_b, vid_c] {
-            w.insert_vertex_with_labels(v, HashMap::new(), &["Node".to_string()])
+            w.insert_vertex_with_labels(v, HashMap::new(), &["Node".to_string()], None)
                 .await?;
         }
         w.flush_to_l1(None).await?;
@@ -258,7 +282,7 @@ async fn test_louvain_disconnected() -> anyhow::Result<()> {
     {
         let mut w = writer.write().await;
         for &v in &vids {
-            w.insert_vertex_with_labels(v, HashMap::new(), &["Node".to_string()])
+            w.insert_vertex_with_labels(v, HashMap::new(), &["Node".to_string()], None)
                 .await?;
         }
         // Clique 1
@@ -269,6 +293,7 @@ async fn test_louvain_disconnected() -> anyhow::Result<()> {
             Eid::new(0),
             HashMap::new(),
             None,
+            None,
         )
         .await?;
         w.insert_edge(
@@ -277,6 +302,7 @@ async fn test_louvain_disconnected() -> anyhow::Result<()> {
             link_edge,
             Eid::new(1),
             HashMap::new(),
+            None,
             None,
         )
         .await?;
@@ -288,6 +314,7 @@ async fn test_louvain_disconnected() -> anyhow::Result<()> {
             Eid::new(2),
             HashMap::new(),
             None,
+            None,
         )
         .await?;
         w.insert_edge(
@@ -296,6 +323,7 @@ async fn test_louvain_disconnected() -> anyhow::Result<()> {
             link_edge,
             Eid::new(3),
             HashMap::new(),
+            None,
             None,
         )
         .await?;
@@ -367,8 +395,13 @@ async fn test_algo_grid_graph() -> anyhow::Result<()> {
     {
         let mut w = writer.write().await;
         for i in 0..n {
-            w.insert_vertex_with_labels(Vid::new(i as u64), HashMap::new(), &["Node".to_string()])
-                .await?;
+            w.insert_vertex_with_labels(
+                Vid::new(i as u64),
+                HashMap::new(),
+                &["Node".to_string()],
+                None,
+            )
+            .await?;
         }
 
         // Add edges (Grid structure)
@@ -387,6 +420,7 @@ async fn test_algo_grid_graph() -> anyhow::Result<()> {
                         Eid::new(edge_id),
                         HashMap::new(),
                         None,
+                        None,
                     )
                     .await?;
                     edge_id += 1;
@@ -397,6 +431,7 @@ async fn test_algo_grid_graph() -> anyhow::Result<()> {
                         link_edge,
                         Eid::new(edge_id),
                         HashMap::new(),
+                        None,
                         None,
                     )
                     .await?;
@@ -413,6 +448,7 @@ async fn test_algo_grid_graph() -> anyhow::Result<()> {
                         Eid::new(edge_id),
                         HashMap::new(),
                         None,
+                        None,
                     )
                     .await?;
                     edge_id += 1;
@@ -422,6 +458,7 @@ async fn test_algo_grid_graph() -> anyhow::Result<()> {
                         link_edge,
                         Eid::new(edge_id),
                         HashMap::new(),
+                        None,
                         None,
                     )
                     .await?;
@@ -486,7 +523,7 @@ async fn test_shortest_path_self() -> anyhow::Result<()> {
     let vid_a = Vid::new(0);
     {
         let mut w = writer.write().await;
-        w.insert_vertex_with_labels(vid_a, HashMap::new(), &["Node".to_string()])
+        w.insert_vertex_with_labels(vid_a, HashMap::new(), &["Node".to_string()], None)
             .await?;
         w.flush_to_l1(None).await?;
     }

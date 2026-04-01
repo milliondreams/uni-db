@@ -1,0 +1,57 @@
+{
+  "edge_types": {},
+  "indexes": [],
+  "labels": {
+    "Item": {
+      "id": 1
+    },
+    "Tag": {
+      "id": 2
+    },
+    "Event": {
+      "id": 3
+    },
+    "Episode": {
+      "id": 4
+    }
+  },
+  "properties": {
+    "Item": {
+      "name": {
+        "nullable": true,
+        "type": "String"
+      },
+      "val": {
+        "nullable": true,
+        "type": "Float64"
+      }
+    },
+    "Tag": {
+      "name": {
+        "nullable": true,
+        "type": "String"
+      }
+    },
+    "Event": {
+      "name": {
+        "nullable": true,
+        "type": "String"
+      }
+    },
+    "Episode": {
+      "eid": {
+        "nullable": true,
+        "type": "String"
+      },
+      "importance": {
+        "nullable": true,
+        "type": "Float64"
+      },
+      "age_days": {
+        "nullable": true,
+        "type": "Float64"
+      }
+    }
+  },
+  "schema_version": 1
+}

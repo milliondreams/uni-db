@@ -86,7 +86,9 @@ async fn test_100k_property_lookup() {
         let prep_time = prep_start.elapsed();
 
         let insert_start = Instant::now();
-        let vids = db.bulk_insert_vertices("Person", props).await.unwrap();
+        let tx = db.session().tx().await.unwrap();
+        let vids = tx.bulk_insert_vertices("Person", props).await.unwrap();
+        tx.commit().await.unwrap();
         let insert_time = insert_start.elapsed();
 
         all_vids.extend(vids);
@@ -105,12 +107,13 @@ async fn test_100k_property_lookup() {
     // Check properties BEFORE creating edges
     let query_start = Instant::now();
     let pre_edge_sample = db
+        .session()
         .query("MATCH (n:Person) RETURN n.name LIMIT 3")
         .await
         .unwrap();
     eprintln!(
         "BEFORE EDGES - Sample names: {:?} (query time: {:?})",
-        pre_edge_sample.rows,
+        pre_edge_sample.rows(),
         query_start.elapsed()
     );
 
@@ -135,7 +138,9 @@ async fn test_100k_property_lookup() {
         let edge_prep_time = edge_prep_start.elapsed();
 
         let edge_insert_start = Instant::now();
-        db.bulk_insert_edges("KNOWS", edges).await.unwrap();
+        let tx = db.session().tx().await.unwrap();
+        tx.bulk_insert_edges("KNOWS", edges).await.unwrap();
+        tx.commit().await.unwrap();
         let edge_insert_time = edge_insert_start.elapsed();
 
         eprintln!(
@@ -152,12 +157,13 @@ async fn test_100k_property_lookup() {
     // Check properties AFTER edges, BEFORE flush
     let query_start = Instant::now();
     let post_edge_sample = db
+        .session()
         .query("MATCH (n:Person) RETURN n.name LIMIT 3")
         .await
         .unwrap();
     eprintln!(
         "AFTER EDGES, BEFORE FLUSH - Sample names: {:?} (query time: {:?})",
-        post_edge_sample.rows,
+        post_edge_sample.rows(),
         query_start.elapsed()
     );
 
@@ -169,12 +175,13 @@ async fn test_100k_property_lookup() {
     // Check properties AFTER flush
     let query_start = Instant::now();
     let post_flush_sample = db
+        .session()
         .query("MATCH (n:Person) RETURN n.name LIMIT 3")
         .await
         .unwrap();
     eprintln!(
         "AFTER FLUSH - Sample names: {:?} (query time: {:?})",
-        post_flush_sample.rows,
+        post_flush_sample.rows(),
         query_start.elapsed()
     );
 
@@ -183,42 +190,45 @@ async fn test_100k_property_lookup() {
     // Test count
     let query_start = Instant::now();
     let count = db
+        .session()
         .query("MATCH (n:Person) RETURN count(n) as cnt")
         .await
         .unwrap();
     eprintln!(
         "Count query: {:?} (time: {:?})",
-        count.rows.first(),
+        count.rows().first(),
         query_start.elapsed()
     );
 
     // Diagnostic: Check if properties are accessible at all
     let query_start = Instant::now();
     let sample = db
+        .session()
         .query("MATCH (n:Person) RETURN n.name LIMIT 5")
         .await
         .unwrap();
     eprintln!(
         "Sample names (LIMIT 5): {:?} (time: {:?})",
-        sample.rows,
+        sample.rows(),
         query_start.elapsed()
     );
 
     // Check if Person_0 exists without filter
     let query_start = Instant::now();
     let all_names = db
+        .session()
         .query("MATCH (n:Person) WHERE n.name IS NOT NULL RETURN n.name")
         .await
         .unwrap();
     eprintln!(
         "Total rows with name: {} (time: {:?})",
-        all_names.rows.len(),
+        all_names.len(),
         query_start.elapsed()
     );
 
     // Check if we can find Person_0 in the returned names
-    let has_person_0 = all_names.rows.iter().any(|row| {
-        row.values
+    let has_person_0 = all_names.rows().iter().any(|row| {
+        row.values()
             .iter()
             .any(|v| matches!(v, uni_db::Value::String(s) if s == "Person_0"))
     });
@@ -227,12 +237,13 @@ async fn test_100k_property_lookup() {
     // Try a simple equality filter without the edge pattern
     let query_start = Instant::now();
     let simple_lookup = db
+        .session()
         .query("MATCH (n:Person) WHERE n.name = 'Person_0' RETURN n.name")
         .await
         .unwrap();
     eprintln!(
         "Simple lookup Person_0: {} rows (time: {:?})",
-        simple_lookup.rows.len(),
+        simple_lookup.len(),
         query_start.elapsed()
     );
 
@@ -246,15 +257,15 @@ async fn test_100k_property_lookup() {
             target
         );
         let query_start = Instant::now();
-        let result = db.query(&query).await.unwrap();
+        let result = db.session().query(&query).await.unwrap();
         let query_time = query_start.elapsed();
         eprintln!(
             "Lookup Person_{}: {} rows (time: {:?})",
             target,
-            result.rows.len(),
+            result.len(),
             query_time
         );
-        assert_eq!(result.rows.len(), 1, "Expected 1 row for Person_{}", target);
+        assert_eq!(result.len(), 1, "Expected 1 row for Person_{}", target);
     }
     eprintln!(
         "\nAll lookup tests completed in {:?}",

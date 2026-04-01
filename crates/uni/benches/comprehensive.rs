@@ -142,9 +142,11 @@ impl BenchContext {
             vertex_props.push(props);
         }
 
+        let s = self.db.session();
+        let tx = s.tx().await.unwrap();
+
         // Bulk insert vertices
-        let vids = self
-            .db
+        let vids = tx
             .bulk_insert_vertices("Person", vertex_props)
             .await
             .unwrap();
@@ -158,7 +160,8 @@ impl BenchContext {
         }
 
         // Bulk insert edges
-        self.db.bulk_insert_edges("KNOWS", edges).await.unwrap();
+        tx.bulk_insert_edges("KNOWS", edges).await.unwrap();
+        tx.commit().await.unwrap();
     }
 }
 
@@ -179,13 +182,16 @@ fn bench_ingest_vertices(c: &mut Criterion) {
                     rt.block_on(async {
                         let embedding: Vec<f32> = (0..128).map(|x| x as f32).collect();
                         let embedding_str = json!(embedding).to_string();
+                        let s = ctx.db.session();
+                        let tx = s.tx().await.unwrap();
                         for i in 0..cfg.nodes {
                             let cypher = format!(
                                 "CREATE (n:Person {{name: 'Bench_{}', age: 30, embedding: {}}})",
                                 i, embedding_str
                             );
-                            ctx.db.execute(&cypher).await.unwrap();
+                            tx.execute(&cypher).await.unwrap();
                         }
+                        tx.commit().await.unwrap();
                     })
                 },
                 BatchSize::SmallInput,
@@ -212,11 +218,12 @@ fn bench_ingest_vertices(c: &mut Criterion) {
 
                         for i in 0..cfg.nodes {
                             ctx.db
+                                .session()
                                 .query_with(cypher)
                                 .param("name", Value::String(format!("Bench_{}", i)))
                                 .param("age", Value::Int(30))
                                 .param("embedding", embedding_value.clone())
-                                .execute()
+                                .fetch_all()
                                 .await
                                 .unwrap();
                         }
@@ -268,23 +275,24 @@ fn bench_query_point_lookup(c: &mut Criterion) {
     rt.block_on(async {
         let count_result = ctx
             .db
+            .session()
             .query("MATCH (n:Person) RETURN count(n) as cnt")
             .await
             .unwrap();
         eprintln!(
             "DEBUG: Total Person count after flush: {:?}",
-            count_result.rows.first()
+            count_result.rows().first()
         );
 
         let lookup = format!(
             "MATCH (n:Person) WHERE n.name = 'Person_{}' RETURN n.name, n.age",
             target_id
         );
-        let result = ctx.db.query(&lookup).await.unwrap();
+        let result = ctx.db.session().query(&lookup).await.unwrap();
         eprintln!(
             "DEBUG: Person_{} lookup result: {} rows",
             target_id,
-            result.rows.len()
+            result.rows().len()
         );
     });
 
@@ -301,13 +309,13 @@ fn bench_query_point_lookup(c: &mut Criterion) {
                         "MATCH (n:Person) WHERE n.name = 'Person_{}' RETURN n.age",
                         tid
                     );
-                    let result = ctx.db.query(&cypher).await.unwrap();
+                    let result = ctx.db.session().query(&cypher).await.unwrap();
                     assert_eq!(
-                        result.rows.len(),
+                        result.rows().len(),
                         1,
                         "Expected 1 result for Person_{}, got {} results",
                         tid,
-                        result.rows.len()
+                        result.rows().len()
                     );
                 })
             })
@@ -336,8 +344,8 @@ fn bench_query_traversal(c: &mut Criterion) {
                 rt.block_on(async {
                     let cypher =
                         "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE a.name = 'Person_0' RETURN b.name";
-                    let result = ctx.db.query(cypher).await.unwrap();
-                    assert!(!result.rows.is_empty());
+                    let result = ctx.db.session().query(cypher).await.unwrap();
+                    assert!(!result.rows().is_empty());
                 })
             })
         },
@@ -352,8 +360,8 @@ fn bench_query_traversal(c: &mut Criterion) {
                 rt.block_on(async {
                     let cypher =
                         "MATCH (a:Person)-[:KNOWS*2..2]->(b:Person) WHERE a.name = 'Person_0' RETURN b.name";
-                    let result = ctx.db.query(cypher).await.unwrap();
-                    assert!(!result.rows.is_empty());
+                    let result = ctx.db.session().query(cypher).await.unwrap();
+                    assert!(!result.rows().is_empty());
                 })
             })
         },
@@ -368,8 +376,8 @@ fn bench_query_traversal(c: &mut Criterion) {
                 rt.block_on(async {
                     let cypher =
                         "MATCH (a:Person)-[:KNOWS*3..3]->(b:Person) WHERE a.name = 'Person_0' RETURN b.name";
-                    let result = ctx.db.query(cypher).await.unwrap();
-                    assert!(!result.rows.is_empty());
+                    let result = ctx.db.session().query(cypher).await.unwrap();
+                    assert!(!result.rows().is_empty());
                 })
             })
         },
@@ -396,8 +404,8 @@ fn bench_aggregation(c: &mut Criterion) {
             b.iter(|| {
                 rt.block_on(async {
                     let cypher = "MATCH (n:Person) RETURN count(n) as cnt";
-                    let result = ctx.db.query(cypher).await.unwrap();
-                    assert_eq!(result.rows.len(), 1);
+                    let result = ctx.db.session().query(cypher).await.unwrap();
+                    assert_eq!(result.rows().len(), 1);
                 })
             })
         },
@@ -410,8 +418,8 @@ fn bench_aggregation(c: &mut Criterion) {
             b.iter(|| {
                 rt.block_on(async {
                     let cypher = "MATCH (n:Person) RETURN n.age, count(n) as cnt";
-                    let result = ctx.db.query(cypher).await.unwrap();
-                    assert!(!result.rows.is_empty());
+                    let result = ctx.db.session().query(cypher).await.unwrap();
+                    assert!(!result.rows().is_empty());
                 })
             })
         },
@@ -424,8 +432,8 @@ fn bench_aggregation(c: &mut Criterion) {
             b.iter(|| {
                 rt.block_on(async {
                     let cypher = "MATCH (n:Person) RETURN avg(n.age) as avg_age";
-                    let result = ctx.db.query(cypher).await.unwrap();
-                    assert_eq!(result.rows.len(), 1);
+                    let result = ctx.db.session().query(cypher).await.unwrap();
+                    assert_eq!(result.rows().len(), 1);
                 })
             })
         },
@@ -458,7 +466,7 @@ fn bench_vector_search(c: &mut Criterion) {
                         "MATCH (n:Person) WHERE vector_similarity(n.embedding, {}) > 0.8 RETURN n.name LIMIT 5",
                         qj
                     );
-                    let _result = ctx.db.query(&cypher).await.unwrap();
+                    let _result = ctx.db.session().query(&cypher).await.unwrap();
                 })
             })
         },
@@ -490,8 +498,8 @@ fn bench_hybrid_query(c: &mut Criterion) {
                         "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE vector_similarity(a.embedding, {}) > 0.8 AND b.age >= 1 RETURN b.name",
                         qj
                     );
-                    let result = ctx.db.query(&cypher).await.unwrap();
-                    assert!(!result.rows.is_empty());
+                    let result = ctx.db.session().query(&cypher).await.unwrap();
+                    assert!(!result.rows().is_empty());
                 })
             })
         },
@@ -509,10 +517,12 @@ fn bench_scalar_index(c: &mut Criterion) {
 
     // Create scalar index on age property using Cypher
     rt.block_on(async {
-        ctx.db
-            .execute("CREATE INDEX idx_person_age FOR (n:Person) ON (n.age)")
+        let s = ctx.db.session();
+        let tx = s.tx().await.unwrap();
+        tx.execute("CREATE INDEX idx_person_age FOR (n:Person) ON (n.age)")
             .await
             .unwrap();
+        tx.commit().await.unwrap();
     });
 
     let mut group = c.benchmark_group("scalar_index");
@@ -526,7 +536,7 @@ fn bench_scalar_index(c: &mut Criterion) {
             b.iter(|| {
                 rt.block_on(async {
                     let cypher = "MATCH (n:Person) WHERE n.age = 25 RETURN n.name";
-                    let _result = ctx.db.query(cypher).await.unwrap();
+                    let _result = ctx.db.session().query(cypher).await.unwrap();
                 })
             })
         },
@@ -540,7 +550,7 @@ fn bench_scalar_index(c: &mut Criterion) {
             b.iter(|| {
                 rt.block_on(async {
                     let cypher = "MATCH (n:Person) WHERE n.age >= 20 AND n.age <= 30 RETURN n.name";
-                    let _result = ctx.db.query(cypher).await.unwrap();
+                    let _result = ctx.db.session().query(cypher).await.unwrap();
                 })
             })
         },
@@ -559,10 +569,12 @@ fn bench_vector_index(c: &mut Criterion) {
 
     // Create vector index using Cypher
     rt.block_on(async {
-        ctx.db
-            .execute("CREATE VECTOR INDEX idx_person_embedding FOR (n:Person) ON n.embedding OPTIONS {metric: 'cosine', index_type: 'hnsw'}")
+        let s = ctx.db.session();
+        let tx = s.tx().await.unwrap();
+        tx.execute("CREATE VECTOR INDEX idx_person_embedding FOR (n:Person) ON n.embedding OPTIONS {metric: 'cosine', index_type: 'hnsw'}")
             .await
             .unwrap();
+        tx.commit().await.unwrap();
     });
 
     let query_vec: Vec<f32> = (0..128).map(|x| (x as f32) / 128.0).collect();
@@ -582,8 +594,8 @@ fn bench_vector_index(c: &mut Criterion) {
                         "CALL uni.vector.query('Person', 'embedding', {}, 10) YIELD node, distance RETURN node, distance",
                         qj
                     );
-                    let result = ctx.db.query(&cypher).await.unwrap();
-                    assert!(!result.rows.is_empty());
+                    let result = ctx.db.session().query(&cypher).await.unwrap();
+                    assert!(!result.rows().is_empty());
                 })
             })
         },
@@ -602,10 +614,12 @@ fn bench_fulltext_index(c: &mut Criterion) {
 
     // Create fulltext index using Cypher (ON EACH [properties])
     rt.block_on(async {
-        ctx.db
-            .execute("CREATE FULLTEXT INDEX idx_person_name FOR (n:Person) ON EACH [n.name]")
+        let s = ctx.db.session();
+        let tx = s.tx().await.unwrap();
+        tx.execute("CREATE FULLTEXT INDEX idx_person_name FOR (n:Person) ON EACH [n.name]")
             .await
             .unwrap();
+        tx.commit().await.unwrap();
     });
 
     let mut group = c.benchmark_group("fulltext_index");
@@ -623,8 +637,8 @@ fn bench_fulltext_index(c: &mut Criterion) {
                         "MATCH (n:Person) WHERE n.name = '{}' RETURN n.age",
                         search_term
                     );
-                    let result = ctx.db.query(&cypher).await.unwrap();
-                    assert_eq!(result.rows.len(), 1);
+                    let result = ctx.db.session().query(&cypher).await.unwrap();
+                    assert_eq!(result.rows().len(), 1);
                 })
             })
         },
@@ -653,10 +667,12 @@ fn bench_index_creation(c: &mut Criterion) {
                 },
                 |ctx| {
                     rt.block_on(async {
-                        ctx.db
-                            .execute("CREATE INDEX idx_age FOR (n:Person) ON (n.age)")
+                        let s = ctx.db.session();
+                        let tx = s.tx().await.unwrap();
+                        tx.execute("CREATE INDEX idx_age FOR (n:Person) ON (n.age)")
                             .await
                             .unwrap();
+                        tx.commit().await.unwrap();
                     })
                 },
                 BatchSize::LargeInput,
@@ -678,10 +694,12 @@ fn bench_index_creation(c: &mut Criterion) {
                 },
                 |ctx| {
                     rt.block_on(async {
-                        ctx.db
-                            .execute("CREATE VECTOR INDEX idx_emb FOR (n:Person) ON n.embedding OPTIONS {metric: 'cosine', index_type: 'hnsw'}")
+                        let s = ctx.db.session();
+                        let tx = s.tx().await.unwrap();
+                        tx.execute("CREATE VECTOR INDEX idx_emb FOR (n:Person) ON n.embedding OPTIONS {metric: 'cosine', index_type: 'hnsw'}")
                             .await
                             .unwrap();
+                        tx.commit().await.unwrap();
                     })
                 },
                 BatchSize::LargeInput,
@@ -703,12 +721,14 @@ fn bench_index_creation(c: &mut Criterion) {
                 },
                 |ctx| {
                     rt.block_on(async {
-                        ctx.db
-                            .execute(
-                                "CREATE FULLTEXT INDEX idx_name FOR (n:Person) ON EACH [n.name]",
-                            )
-                            .await
-                            .unwrap();
+                        let s = ctx.db.session();
+                        let tx = s.tx().await.unwrap();
+                        tx.execute(
+                            "CREATE FULLTEXT INDEX idx_name FOR (n:Person) ON EACH [n.name]",
+                        )
+                        .await
+                        .unwrap();
+                        tx.commit().await.unwrap();
                     })
                 },
                 BatchSize::LargeInput,
@@ -737,8 +757,8 @@ fn bench_order_and_limit(c: &mut Criterion) {
             b.iter(|| {
                 rt.block_on(async {
                     let cypher = "MATCH (n:Person) RETURN n.name, n.age ORDER BY n.age LIMIT 10";
-                    let result = ctx.db.query(cypher).await.unwrap();
-                    assert_eq!(result.rows.len(), 10);
+                    let result = ctx.db.session().query(cypher).await.unwrap();
+                    assert_eq!(result.rows().len(), 10);
                 })
             })
         },
@@ -752,8 +772,8 @@ fn bench_order_and_limit(c: &mut Criterion) {
                 rt.block_on(async {
                     let cypher =
                         "MATCH (n:Person) RETURN n.name, n.age ORDER BY n.name DESC LIMIT 10";
-                    let result = ctx.db.query(cypher).await.unwrap();
-                    assert_eq!(result.rows.len(), 10);
+                    let result = ctx.db.session().query(cypher).await.unwrap();
+                    assert_eq!(result.rows().len(), 10);
                 })
             })
         },

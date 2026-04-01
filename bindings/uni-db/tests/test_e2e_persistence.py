@@ -15,7 +15,7 @@ def test_data_persists_across_reopens(tmp_path):
     db_path = tmp_path / "persist_db"
 
     # Create and populate database
-    db = uni_db.DatabaseBuilder.open(str(db_path)).build()
+    db = uni_db.UniBuilder.open(str(db_path)).build()
 
     # Create schema
     (
@@ -28,9 +28,12 @@ def test_data_persists_across_reopens(tmp_path):
     )
 
     # Insert data
-    db.execute("CREATE (p:Person {name: 'Alice', age: 30})")
-    db.execute("CREATE (p:Person {name: 'Bob', age: 25})")
-    db.execute("CREATE (p:Person {name: 'Charlie', age: 35})")
+    session = db.session()
+    tx = session.tx()
+    tx.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+    tx.execute("CREATE (p:Person {name: 'Bob', age: 25})")
+    tx.execute("CREATE (p:Person {name: 'Charlie', age: 35})")
+    tx.commit()
 
     # Flush to disk
     db.flush()
@@ -39,10 +42,11 @@ def test_data_persists_across_reopens(tmp_path):
     del db
 
     # Reopen database
-    db2 = uni_db.DatabaseBuilder.open(str(db_path)).build()
+    db2 = uni_db.UniBuilder.open(str(db_path)).build()
+    session2 = db2.session()
 
     # Query and verify data exists
-    results = db2.query(
+    results = session2.query(
         "MATCH (p:Person) RETURN p.name as name, p.age as age ORDER BY p.name"
     )
 
@@ -60,7 +64,7 @@ def test_schema_persists_across_reopens(tmp_path):
     db_path = tmp_path / "schema_db"
 
     # Create database with schema
-    db = uni_db.DatabaseBuilder.open(str(db_path)).build()
+    db = uni_db.UniBuilder.open(str(db_path)).build()
 
     (
         db.schema()
@@ -80,30 +84,38 @@ def test_schema_persists_across_reopens(tmp_path):
     )
 
     # Insert some data using the schema
-    db.execute("CREATE (p:Person {name: 'Alice', age: 30, email: 'alice@example.com'})")
-    db.execute("CREATE (c:Company {name: 'TechCorp', founded: 2010})")
-    db.execute(
+    session = db.session()
+    tx = session.tx()
+    tx.execute("CREATE (p:Person {name: 'Alice', age: 30, email: 'alice@example.com'})")
+    tx.execute("CREATE (c:Company {name: 'TechCorp', founded: 2010})")
+    tx.execute(
         "MATCH (p:Person {name: 'Alice'}), (c:Company {name: 'TechCorp'}) "
         "CREATE (p)-[:WORKS_AT {role: 'Engineer'}]->(c)"
     )
+    tx.commit()
 
     db.flush()
     del db
 
     # Reopen and verify schema works
-    db2 = uni_db.DatabaseBuilder.open(str(db_path)).build()
+    db2 = uni_db.UniBuilder.open(str(db_path)).build()
+    session2 = db2.session()
 
     # Should be able to insert using the schema without redefining it
-    db2.execute("CREATE (p:Person {name: 'Bob', age: 25})")
+    tx2 = session2.tx()
+    tx2.execute("CREATE (p:Person {name: 'Bob', age: 25})")
+    tx2.commit()
 
     # Query to verify both old and new data
-    person_results = db2.query("MATCH (p:Person) RETURN p.name as name ORDER BY p.name")
+    person_results = session2.query(
+        "MATCH (p:Person) RETURN p.name as name ORDER BY p.name"
+    )
     assert len(person_results) == 2
     assert person_results[0]["name"] == "Alice"
     assert person_results[1]["name"] == "Bob"
 
     # Verify edge type works
-    edge_results = db2.query(
+    edge_results = session2.query(
         "MATCH (p:Person)-[r:WORKS_AT]->(c:Company) "
         "RETURN p.name as person, c.name as company, r.role as role"
     )
@@ -118,7 +130,7 @@ def test_indexes_persist_across_reopens(tmp_path):
     db_path = tmp_path / "index_db"
 
     # Create database with indexed schema
-    db = uni_db.DatabaseBuilder.open(str(db_path)).build()
+    db = uni_db.UniBuilder.open(str(db_path)).build()
 
     (
         db.schema()
@@ -133,18 +145,22 @@ def test_indexes_persist_across_reopens(tmp_path):
     )
 
     # Insert data
-    db.execute("CREATE (i:Item {sku: 'SKU001', name: 'Widget', price: 19.99})")
-    db.execute("CREATE (i:Item {sku: 'SKU002', name: 'Gadget', price: 29.99})")
-    db.execute("CREATE (i:Item {sku: 'SKU003', name: 'Doohickey', price: 9.99})")
+    session = db.session()
+    tx = session.tx()
+    tx.execute("CREATE (i:Item {sku: 'SKU001', name: 'Widget', price: 19.99})")
+    tx.execute("CREATE (i:Item {sku: 'SKU002', name: 'Gadget', price: 29.99})")
+    tx.execute("CREATE (i:Item {sku: 'SKU003', name: 'Doohickey', price: 9.99})")
+    tx.commit()
 
     db.flush()
     del db
 
     # Reopen database
-    db2 = uni_db.DatabaseBuilder.open(str(db_path)).build()
+    db2 = uni_db.UniBuilder.open(str(db_path)).build()
+    session2 = db2.session()
 
     # Query using indexed properties - should work efficiently
-    results = db2.query(
+    results = session2.query(
         "MATCH (i:Item {sku: 'SKU002'}) RETURN i.name as name, i.price as price"
     )
     assert len(results) == 1
@@ -152,7 +168,7 @@ def test_indexes_persist_across_reopens(tmp_path):
     assert results[0]["price"] == 29.99
 
     # Query by name (also indexed)
-    results2 = db2.query(
+    results2 = session2.query(
         "MATCH (i:Item {name: 'Widget'}) RETURN i.sku as sku, i.price as price"
     )
     assert len(results2) == 1
@@ -165,7 +181,7 @@ def test_vector_indexes_persist_across_reopens(tmp_path):
     db_path = tmp_path / "vector_db"
 
     # Create database with vector property
-    db = uni_db.DatabaseBuilder.open(str(db_path)).build()
+    db = uni_db.UniBuilder.open(str(db_path)).build()
 
     (
         db.schema()
@@ -177,21 +193,27 @@ def test_vector_indexes_persist_across_reopens(tmp_path):
     )
 
     # Insert data with vectors
-    db.execute("CREATE (d:Document {title: 'Doc1', embedding: [1.0, 0.0, 0.0, 0.0]})")
-    db.execute("CREATE (d:Document {title: 'Doc2', embedding: [0.9, 0.1, 0.0, 0.0]})")
-    db.execute("CREATE (d:Document {title: 'Doc3', embedding: [0.0, 0.0, 1.0, 0.0]})")
+    session = db.session()
+    tx = session.tx()
+    tx.execute("CREATE (d:Document {title: 'Doc1', embedding: [1.0, 0.0, 0.0, 0.0]})")
+    tx.execute("CREATE (d:Document {title: 'Doc2', embedding: [0.9, 0.1, 0.0, 0.0]})")
+    tx.execute("CREATE (d:Document {title: 'Doc3', embedding: [0.0, 0.0, 1.0, 0.0]})")
+    tx.commit()
 
     # Create vector index
-    db.create_vector_index("Document", "embedding", "l2")
+    db.schema().label("Document").index(
+        "embedding", {"type": "vector", "metric": "l2"}
+    ).apply()
 
     db.flush()
     del db
 
     # Reopen database
-    db2 = uni_db.DatabaseBuilder.open(str(db_path)).build()
+    db2 = uni_db.UniBuilder.open(str(db_path)).build()
+    session2 = db2.session()
 
     # Vector search should still work via Cypher
-    results = db2.query("""
+    results = session2.query("""
         CALL uni.vector.query('Document', 'embedding', [1.0, 0.0, 0.0, 0.0], 2)
         YIELD vid, distance
         RETURN vid, distance
@@ -208,27 +230,39 @@ def test_multiple_reopen_cycles(tmp_path):
     db_path = tmp_path / "multi_reopen_db"
 
     # First cycle: create and add data
-    db = uni_db.DatabaseBuilder.open(str(db_path)).build()
+    db = uni_db.UniBuilder.open(str(db_path)).build()
     (db.schema().label("Counter").property("value", "int").done().apply())
-    db.execute("CREATE (c:Counter {value: 1})")
+    session = db.session()
+    tx = session.tx()
+    tx.execute("CREATE (c:Counter {value: 1})")
+    tx.commit()
     db.flush()
     del db
 
     # Second cycle: reopen and add more data
-    db = uni_db.DatabaseBuilder.open(str(db_path)).build()
-    db.execute("CREATE (c:Counter {value: 2})")
+    db = uni_db.UniBuilder.open(str(db_path)).build()
+    session = db.session()
+    tx = session.tx()
+    tx.execute("CREATE (c:Counter {value: 2})")
+    tx.commit()
     db.flush()
     del db
 
     # Third cycle: reopen and add more data
-    db = uni_db.DatabaseBuilder.open(str(db_path)).build()
-    db.execute("CREATE (c:Counter {value: 3})")
+    db = uni_db.UniBuilder.open(str(db_path)).build()
+    session = db.session()
+    tx = session.tx()
+    tx.execute("CREATE (c:Counter {value: 3})")
+    tx.commit()
     db.flush()
     del db
 
     # Fourth cycle: reopen and verify all data
-    db = uni_db.DatabaseBuilder.open(str(db_path)).build()
-    results = db.query("MATCH (c:Counter) RETURN c.value as value ORDER BY c.value")
+    db = uni_db.UniBuilder.open(str(db_path)).build()
+    session = db.session()
+    results = session.query(
+        "MATCH (c:Counter) RETURN c.value as value ORDER BY c.value"
+    )
 
     assert len(results) == 3
     assert results[0]["value"] == 1
@@ -241,7 +275,7 @@ def test_relationships_persist_across_reopens(tmp_path):
     db_path = tmp_path / "rel_persist_db"
 
     # Create database with nodes and relationships
-    db = uni_db.DatabaseBuilder.open(str(db_path)).build()
+    db = uni_db.UniBuilder.open(str(db_path)).build()
 
     (
         db.schema()
@@ -254,20 +288,24 @@ def test_relationships_persist_across_reopens(tmp_path):
         .apply()
     )
 
-    db.execute("CREATE (p:Person {name: 'Alice'})")
-    db.execute("CREATE (p:Person {name: 'Bob'})")
-    db.execute(
+    session = db.session()
+    tx = session.tx()
+    tx.execute("CREATE (p:Person {name: 'Alice'})")
+    tx.execute("CREATE (p:Person {name: 'Bob'})")
+    tx.execute(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) "
         "CREATE (a)-[:KNOWS {since: 2020}]->(b)"
     )
+    tx.commit()
 
     db.flush()
     del db
 
     # Reopen and verify relationships
-    db2 = uni_db.DatabaseBuilder.open(str(db_path)).build()
+    db2 = uni_db.UniBuilder.open(str(db_path)).build()
+    session2 = db2.session()
 
-    results = db2.query(
+    results = session2.query(
         "MATCH (a:Person)-[r:KNOWS]->(b:Person) "
         "RETURN a.name as from, b.name as to, r.since as since"
     )
@@ -283,7 +321,7 @@ def test_complex_graph_persists(tmp_path):
     db_path = tmp_path / "complex_graph_db"
 
     # Create complex schema
-    db = uni_db.DatabaseBuilder.open(str(db_path)).build()
+    db = uni_db.UniBuilder.open(str(db_path)).build()
 
     (
         db.schema()
@@ -305,25 +343,29 @@ def test_complex_graph_persists(tmp_path):
     )
 
     # Create complex graph
-    db.execute("CREATE (u:User {name: 'Alice'})")
-    db.execute("CREATE (p:Product {name: 'Laptop', price: 999.99})")
-    db.execute("CREATE (c:Category {name: 'Electronics'})")
-    db.execute(
+    session = db.session()
+    tx = session.tx()
+    tx.execute("CREATE (u:User {name: 'Alice'})")
+    tx.execute("CREATE (p:Product {name: 'Laptop', price: 999.99})")
+    tx.execute("CREATE (c:Category {name: 'Electronics'})")
+    tx.execute(
         "MATCH (u:User {name: 'Alice'}), (p:Product {name: 'Laptop'}) "
         "CREATE (u)-[:PURCHASED]->(p)"
     )
-    db.execute(
+    tx.execute(
         "MATCH (p:Product {name: 'Laptop'}), (c:Category {name: 'Electronics'}) "
         "CREATE (p)-[:IN_CATEGORY]->(c)"
     )
+    tx.commit()
 
     db.flush()
     del db
 
     # Reopen and verify complex queries work
-    db2 = uni_db.DatabaseBuilder.open(str(db_path)).build()
+    db2 = uni_db.UniBuilder.open(str(db_path)).build()
+    session2 = db2.session()
 
-    results = db2.query(
+    results = session2.query(
         "MATCH (u:User)-[:PURCHASED]->(p:Product)-[:IN_CATEGORY]->(c:Category) "
         "RETURN u.name as user, p.name as product, p.price as price, c.name as category"
     )
@@ -340,7 +382,7 @@ def test_empty_database_persists(tmp_path):
     db_path = tmp_path / "empty_persist_db"
 
     # Create database with schema but no data
-    db = uni_db.DatabaseBuilder.open(str(db_path)).build()
+    db = uni_db.UniBuilder.open(str(db_path)).build()
 
     (db.schema().label("Node").property("value", "int").done().apply())
 
@@ -348,14 +390,17 @@ def test_empty_database_persists(tmp_path):
     del db
 
     # Reopen and verify schema exists
-    db2 = uni_db.DatabaseBuilder.open(str(db_path)).build()
+    db2 = uni_db.UniBuilder.open(str(db_path)).build()
+    session2 = db2.session()
 
     # Should return empty results but not error
-    results = db2.query("MATCH (n:Node) RETURN n.value as value")
+    results = session2.query("MATCH (n:Node) RETURN n.value as value")
     assert len(results) == 0
 
     # Should be able to insert data using persisted schema
-    db2.execute("CREATE (n:Node {value: 42})")
-    results2 = db2.query("MATCH (n:Node) RETURN n.value as value")
+    tx2 = session2.tx()
+    tx2.execute("CREATE (n:Node {value: 42})")
+    tx2.commit()
+    results2 = session2.query("MATCH (n:Node) RETURN n.value as value")
     assert len(results2) == 1
     assert results2[0]["value"] == 42

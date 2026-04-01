@@ -57,6 +57,10 @@ pub struct MutationContext {
 
     /// Query context for L0 buffer visibility.
     pub query_ctx: Option<uni_store::QueryContext>,
+
+    /// When set, mutations are routed to this private L0 buffer instead of
+    /// the global L0. Passed explicitly to Writer methods during mutation execution.
+    pub tx_l0_override: Option<Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
 }
 
 impl std::fmt::Debug for MutationContext {
@@ -508,6 +512,7 @@ async fn execute_mutation_inner(
                 pm,
                 params,
                 ctx,
+                mutation_ctx.tx_l0_override.as_ref(),
             )
             .await
             .map_err(|e| {
@@ -535,8 +540,11 @@ async fn execute_mutation_inner(
     }
 
     let mut writer = mutation_ctx.writer.write().await;
-    apply_mutations(&mutation_ctx, &mutation_kind, &mut rows, &mut writer).await?;
+    let tx_l0 = mutation_ctx.tx_l0_override.as_ref();
+    let result =
+        apply_mutations(&mutation_ctx, &mutation_kind, &mut rows, &mut writer, tx_l0).await;
     drop(writer);
+    result?;
 
     tracing::debug!(
         mutation = mutation_label,
@@ -635,6 +643,7 @@ async fn apply_mutations(
     mutation_kind: &MutationKind,
     rows: &mut [HashMap<String, Value>],
     writer: &mut Writer,
+    tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
 ) -> DFResult<()> {
     tracing::trace!(
         mutation = mutation_kind_label(mutation_kind),
@@ -654,7 +663,7 @@ async fn apply_mutations(
     match mutation_kind {
         MutationKind::Create { pattern } => {
             for row in rows.iter_mut() {
-                exec.execute_create_pattern(pattern, row, writer, pm, params, ctx)
+                exec.execute_create_pattern(pattern, row, writer, pm, params, ctx, tx_l0)
                     .await
                     .map_err(|e| df_err("CREATE failed", e))?;
             }
@@ -662,7 +671,7 @@ async fn apply_mutations(
         MutationKind::CreateBatch { patterns } => {
             for row in rows.iter_mut() {
                 for pattern in patterns {
-                    exec.execute_create_pattern(pattern, row, writer, pm, params, ctx)
+                    exec.execute_create_pattern(pattern, row, writer, pm, params, ctx, tx_l0)
                         .await
                         .map_err(|e| df_err("CREATE failed", e))?;
                 }
@@ -670,14 +679,14 @@ async fn apply_mutations(
         }
         MutationKind::Set { items } => {
             for row in rows.iter_mut() {
-                exec.execute_set_items_locked(items, row, writer, pm, params, ctx)
+                exec.execute_set_items_locked(items, row, writer, pm, params, ctx, tx_l0)
                     .await
                     .map_err(|e| df_err("SET failed", e))?;
             }
         }
         MutationKind::Remove { items } => {
             for row in rows.iter_mut() {
-                exec.execute_remove_items_locked(items, row, writer, pm, ctx)
+                exec.execute_remove_items_locked(items, row, writer, pm, ctx, tx_l0)
                     .await
                     .map_err(|e| df_err("REMOVE failed", e))?;
             }
@@ -697,7 +706,7 @@ async fn apply_mutations(
 
             // Delete edges before nodes so non-detach DELETE satisfies constraints.
             for val in &collector.edge_vals {
-                exec.execute_delete_item_locked(val, false, writer)
+                exec.execute_delete_item_locked(val, false, writer, tx_l0)
                     .await
                     .map_err(|e| df_err("DELETE edge failed", e))?;
             }
@@ -705,12 +714,12 @@ async fn apply_mutations(
             if *detach {
                 let (vids, labels): (Vec<Vid>, Vec<Option<Vec<String>>>) =
                     collector.node_entries.into_iter().unzip();
-                exec.batch_detach_delete_vertices(&vids, labels, writer)
+                exec.batch_detach_delete_vertices(&vids, labels, writer, tx_l0)
                     .await
                     .map_err(|e| df_err("DETACH DELETE failed", e))?;
             } else {
                 for (vid, labels) in &collector.node_entries {
-                    exec.execute_delete_vertex(*vid, false, labels.clone(), writer)
+                    exec.execute_delete_vertex(*vid, false, labels.clone(), writer, tx_l0)
                         .await
                         .map_err(|e| df_err("DELETE node failed", e))?;
                 }

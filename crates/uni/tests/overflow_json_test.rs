@@ -12,17 +12,20 @@ async fn test_edge_properties_no_overflow_json() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
     // Create nodes and edge with properties
-    db.execute("CREATE (a:Person {name: 'Alice'})-[r:KNOWS {since: 2020, strength: 0.8}]->(b:Person {name: 'Bob'})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (a:Person {name: 'Alice'})-[r:KNOWS {since: 2020, strength: 0.8}]->(b:Person {name: 'Bob'})")
         .await?;
+    tx.commit().await?;
 
     // Query that returns edge with dotted properties
     let result = db
+        .session()
         .query("MATCH (a)-[r:KNOWS]->(b) RETURN r.since, r.strength")
         .await?;
 
     // Check that overflow_json is not in the column names
     let column_names = result
-        .columns
+        .columns()
         .iter()
         .map(|c| c.as_str())
         .collect::<Vec<_>>();
@@ -42,17 +45,22 @@ async fn test_edge_struct_no_overflow_json() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
     // Create nodes and edge
-    db.execute(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (a:Person {name: 'Alice'})-[r:KNOWS {since: 2020}]->(b:Person {name: 'Bob'})",
     )
     .await?;
+    tx.commit().await?;
 
     // Query that returns full edge struct
-    let result = db.query("MATCH (a)-[r:KNOWS]->(b) RETURN r").await?;
+    let result = db
+        .session()
+        .query("MATCH (a)-[r:KNOWS]->(b) RETURN r")
+        .await?;
 
     // The struct form should have a single "r" column, not r.overflow_json
     let column_names = result
-        .columns
+        .columns()
         .iter()
         .map(|c| c.as_str())
         .collect::<Vec<_>>();

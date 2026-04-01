@@ -16,8 +16,9 @@ Uni supports Cypher window queries with `OVER (...)` clauses for both manual win
 
     # async fn demo() -> Result<(), uni_db::UniError> {
     let db = Uni::open("./my_db").build().await?;
+    let session = db.session();
 
-    let rows = db.query(
+    let rows = session.query(
         "MATCH (p:Purchase) RETURN p.userId, p.amount, ROW_NUMBER() OVER (PARTITION BY p.userId ORDER BY p.timestamp) AS rn"
     ).await?;
 
@@ -30,8 +31,9 @@ Uni supports Cypher window queries with `OVER (...)` clauses for both manual win
     ```python
     import uni_db
 
-    db = uni_db.Database("./my_db")
-    rows = db.query(
+    db = uni_db.Uni.open("./my_db")
+    session = db.session()
+    rows = session.query(
         "MATCH (p:Purchase) RETURN p.userId, p.amount, ROW_NUMBER() OVER (PARTITION BY p.userId ORDER BY p.timestamp) AS rn"
     )
     print(rows)
@@ -45,8 +47,9 @@ Uni supports Cypher window queries with `OVER (...)` clauses for both manual win
 
     # async fn demo() -> Result<(), uni_db::UniError> {
     let db = Uni::open("./my_db").build().await?;
+    let session = db.session();
 
-    let rows = db.query(
+    let rows = session.query(
         "MATCH (p:Price) RETURN p.symbol, p.ts, p.value, LAG(p.value) OVER (PARTITION BY p.symbol ORDER BY p.ts) AS prev_value"
     ).await?;
 
@@ -59,8 +62,9 @@ Uni supports Cypher window queries with `OVER (...)` clauses for both manual win
     ```python
     import uni_db
 
-    db = uni_db.Database("./my_db")
-    rows = db.query(
+    db = uni_db.Uni.open("./my_db")
+    session = db.session()
+    rows = session.query(
         "MATCH (p:Price) RETURN p.symbol, p.ts, p.value, LAG(p.value) OVER (PARTITION BY p.symbol ORDER BY p.ts) AS prev_value"
     )
     print(rows)
@@ -74,8 +78,9 @@ Uni supports Cypher window queries with `OVER (...)` clauses for both manual win
 
     # async fn demo() -> Result<(), uni_db::UniError> {
     let db = Uni::open("./my_db").build().await?;
+    let session = db.session();
 
-    let rows = db.query(
+    let rows = session.query(
         "MATCH (p:Purchase) RETURN p.userId, p.amount, SUM(p.amount) OVER (PARTITION BY p.userId ORDER BY p.timestamp) AS running_total"
     ).await?;
 
@@ -88,8 +93,9 @@ Uni supports Cypher window queries with `OVER (...)` clauses for both manual win
     ```python
     import uni_db
 
-    db = uni_db.Database("./my_db")
-    rows = db.query(
+    db = uni_db.Uni.open("./my_db")
+    session = db.session()
+    rows = session.query(
         "MATCH (p:Purchase) RETURN p.userId, p.amount, SUM(p.amount) OVER (PARTITION BY p.userId ORDER BY p.timestamp) AS running_total"
     )
     print(rows)
@@ -103,8 +109,9 @@ Uni supports Cypher window queries with `OVER (...)` clauses for both manual win
 
     # async fn demo() -> Result<(), uni_db::UniError> {
     let db = Uni::open("./my_db").build().await?;
+    let session = db.session();
 
-    let rows = db.query(
+    let rows = session.query(
         "MATCH (p:Purchase) RETURN p.userId, p.amount, COUNT(*) OVER (PARTITION BY p.userId) AS user_count"
     ).await?;
 
@@ -117,8 +124,9 @@ Uni supports Cypher window queries with `OVER (...)` clauses for both manual win
     ```python
     import uni_db
 
-    db = uni_db.Database("./my_db")
-    rows = db.query(
+    db = uni_db.Uni.open("./my_db")
+    session = db.session()
+    rows = session.query(
         "MATCH (p:Purchase) RETURN p.userId, p.amount, COUNT(*) OVER (PARTITION BY p.userId) AS user_count"
     )
     print(rows)

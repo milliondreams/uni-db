@@ -66,6 +66,7 @@ mod gcounter_lifecycle {
                     vid,
                     HashMap::from([("counter".to_string(), val1.into())]),
                     &["CounterNode".to_string()],
+                    None,
                 )
                 .await?;
             writer.flush_to_l1(None).await?;
@@ -83,6 +84,7 @@ mod gcounter_lifecycle {
                     vid,
                     HashMap::from([("counter".to_string(), val2.into())]),
                     &["CounterNode".to_string()],
+                    None,
                 )
                 .await?;
             writer.flush_to_l1(None).await?;
@@ -142,6 +144,7 @@ mod gcounter_lifecycle {
                         vid,
                         HashMap::from([("counter".to_string(), val.into())]),
                         &["CounterNode".to_string()],
+                        None,
                     )
                     .await?;
                 writer.flush_to_l1(None).await?;
@@ -203,6 +206,7 @@ mod gset_lifecycle {
                     vid,
                     HashMap::from([("items".to_string(), val1.into())]),
                     &["SetNode".to_string()],
+                    None,
                 )
                 .await?;
             writer.flush_to_l1(None).await?;
@@ -221,6 +225,7 @@ mod gset_lifecycle {
                     vid,
                     HashMap::from([("items".to_string(), val2.into())]),
                     &["SetNode".to_string()],
+                    None,
                 )
                 .await?;
             writer.flush_to_l1(None).await?;
@@ -285,6 +290,7 @@ mod orset_lifecycle {
                     vid,
                     HashMap::from([("items".to_string(), val1.into())]),
                     &["ORSetNode".to_string()],
+                    None,
                 )
                 .await?;
             writer.flush_to_l1(None).await?;
@@ -302,6 +308,7 @@ mod orset_lifecycle {
                     vid,
                     HashMap::from([("items".to_string(), val2.into())]),
                     &["ORSetNode".to_string()],
+                    None,
                 )
                 .await?;
             writer.flush_to_l1(None).await?;
@@ -368,6 +375,7 @@ mod lww_register_lifecycle {
                     vid,
                     HashMap::from([("value".to_string(), val1.into())]),
                     &["RegisterNode".to_string()],
+                    None,
                 )
                 .await?;
             writer.flush_to_l1(None).await?;
@@ -384,6 +392,7 @@ mod lww_register_lifecycle {
                     vid,
                     HashMap::from([("value".to_string(), val2.into())]),
                     &["RegisterNode".to_string()],
+                    None,
                 )
                 .await?;
             writer.flush_to_l1(None).await?;
@@ -444,6 +453,7 @@ mod lww_map_lifecycle {
                     vid,
                     HashMap::from([("data".to_string(), val1.into())]),
                     &["MapNode".to_string()],
+                    None,
                 )
                 .await?;
             writer.flush_to_l1(None).await?;
@@ -461,6 +471,7 @@ mod lww_map_lifecycle {
                     vid,
                     HashMap::from([("data".to_string(), val2.into())]),
                     &["MapNode".to_string()],
+                    None,
                 )
                 .await?;
             writer.flush_to_l1(None).await?;
@@ -528,6 +539,7 @@ mod rga_lifecycle {
                     vid,
                     HashMap::from([("sequence".to_string(), val1.into())]),
                     &["RgaNode".to_string()],
+                    None,
                 )
                 .await?;
             writer.flush_to_l1(None).await?;
@@ -545,6 +557,7 @@ mod rga_lifecycle {
                     vid,
                     HashMap::from([("sequence".to_string(), val2.into())]),
                     &["RgaNode".to_string()],
+                    None,
                 )
                 .await?;
             writer.flush_to_l1(None).await?;
@@ -611,6 +624,7 @@ mod vector_clock_lifecycle {
                     vid,
                     HashMap::from([("clock".to_string(), val1.into())]),
                     &["VCNode".to_string()],
+                    None,
                 )
                 .await?;
             writer.flush_to_l1(None).await?;
@@ -631,6 +645,7 @@ mod vector_clock_lifecycle {
                     vid,
                     HashMap::from([("clock".to_string(), val2.into())]),
                     &["VCNode".to_string()],
+                    None,
                 )
                 .await?;
             writer.flush_to_l1(None).await?;
@@ -690,6 +705,7 @@ mod vc_register_lifecycle {
                     vid,
                     HashMap::from([("state".to_string(), val1.into())]),
                     &["VCRegNode".to_string()],
+                    None,
                 )
                 .await?;
             writer.flush_to_l1(None).await?;
@@ -707,6 +723,7 @@ mod vc_register_lifecycle {
                     vid,
                     HashMap::from([("state".to_string(), val2.into())]),
                     &["VCRegNode".to_string()],
+                    None,
                 )
                 .await?;
             writer.flush_to_l1(None).await?;
@@ -785,6 +802,7 @@ mod multi_crdt {
                         ),
                     ]),
                     &["MultiCrdtNode".to_string()],
+                    None,
                 )
                 .await?;
             writer.flush_to_l1(None).await?;
@@ -820,6 +838,7 @@ mod multi_crdt {
                         ),
                     ]),
                     &["MultiCrdtNode".to_string()],
+                    None,
                 )
                 .await?;
             writer.flush_to_l1(None).await?;
@@ -896,10 +915,10 @@ mod edge_crdt {
         {
             let mut writer = writer_lock.write().await;
             writer
-                .insert_vertex_with_labels(vid_a, HashMap::new(), &["Node".to_string()])
+                .insert_vertex_with_labels(vid_a, HashMap::new(), &["Node".to_string()], None)
                 .await?;
             writer
-                .insert_vertex_with_labels(vid_b, HashMap::new(), &["Node".to_string()])
+                .insert_vertex_with_labels(vid_b, HashMap::new(), &["Node".to_string()], None)
                 .await?;
 
             // Create edge with initial weight
@@ -918,6 +937,7 @@ mod edge_crdt {
                         serde_json::to_value(Crdt::GCounter(gc1))?.into(),
                     )]),
                     None,
+                    None,
                 )
                 .await?;
             writer.flush_to_l1(None).await?;
@@ -935,6 +955,7 @@ mod edge_crdt {
                         "weight".to_string(),
                         serde_json::to_value(Crdt::GCounter(gc2))?.into(),
                     )]),
+                    None,
                     None,
                 )
                 .await?;

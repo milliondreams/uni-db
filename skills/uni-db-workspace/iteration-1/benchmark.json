@@ -1,0 +1,148 @@
+{
+  "metadata": {
+    "skill_name": "uni-db",
+    "skill_path": "/home/rohit/work/dragonscale/uni-lance-upgrade/skills/uni-db",
+    "executor_model": "claude-opus-4-6",
+    "analyzer_model": "claude-opus-4-6",
+    "timestamp": "2026-04-01T18:25:56Z",
+    "evals_run": ["python-hybrid-search", "locy-risk-propagation", "pydantic-social-network"],
+    "runs_per_configuration": 1
+  },
+  "runs": [
+    {
+      "eval_id": 0,
+      "eval_name": "python-hybrid-search",
+      "configuration": "with_skill",
+      "pass_rate": 1.0,
+      "passed": 6,
+      "total": 6,
+      "time_seconds": 95.3,
+      "total_tokens": 46517,
+      "expectations": [
+        {"text": "Uses Uni.open(), Uni.create(), Uni.temporary(), Uni.in_memory(), or UniBuilder to create a database instance", "passed": true, "evidence": "Uses Uni.in_memory()"},
+        {"text": "Schema definition includes a vector() call with dimension and metric parameters", "passed": true, "evidence": "Schema builder .vector('embedding', EMBEDDING_DIM) plus CREATE VECTOR INDEX via Cypher DDL"},
+        {"text": "Creates a full-text/BM25 index via schema builder or Cypher DDL", "passed": true, "evidence": "CREATE FULLTEXT INDEX via Cypher DDL"},
+        {"text": "Uses Transaction for data ingestion, not direct session writes", "passed": true, "evidence": "with session.tx() as tx: context manager"},
+        {"text": "Uses CALL uni.search, similar_to() with multiple sources, or combines uni.vector.query + uni.fts.query for hybrid search", "passed": true, "evidence": "Demonstrates all three: CALL uni.search, similar_to() with multiple sources, and separate uni.vector.query + uni.fts.query"},
+        {"text": "Import statements reference actual uni_db module names", "passed": true, "evidence": "from uni_db import Uni, DataType"}
+      ]
+    },
+    {
+      "eval_id": 0,
+      "eval_name": "python-hybrid-search",
+      "configuration": "without_skill",
+      "pass_rate": 1.0,
+      "passed": 6,
+      "total": 6,
+      "time_seconds": 189.6,
+      "total_tokens": 101704,
+      "expectations": [
+        {"text": "Uses Uni.open(), Uni.create(), Uni.temporary(), Uni.in_memory(), or UniBuilder to create a database instance", "passed": true, "evidence": "Uses uni_db.UniBuilder.open(db_path).build()"},
+        {"text": "Schema definition includes a vector() call with dimension and metric parameters", "passed": true, "evidence": "Schema builder .vector('embedding', 64) plus .index with vector config"},
+        {"text": "Creates a full-text/BM25 index via schema builder or Cypher DDL", "passed": true, "evidence": ".index('content', 'fulltext') via schema builder"},
+        {"text": "Uses Transaction for data ingestion, not direct session writes", "passed": true, "evidence": "tx = session.tx() with tx.execute() / tx.commit()"},
+        {"text": "Uses CALL uni.search, similar_to() with multiple sources, or combines uni.vector.query + uni.fts.query for hybrid search", "passed": true, "evidence": "CALL uni.search plus individual uni.vector.query and uni.fts.query"},
+        {"text": "Import statements reference actual uni_db module names", "passed": true, "evidence": "import uni_db"}
+      ]
+    },
+    {
+      "eval_id": 1,
+      "eval_name": "locy-risk-propagation",
+      "configuration": "with_skill",
+      "pass_rate": 1.0,
+      "passed": 7,
+      "total": 7,
+      "time_seconds": 83.0,
+      "total_tokens": 41319,
+      "expectations": [
+        {"text": "Uses CREATE RULE ... AS syntax (not Datalog-style :- notation)", "passed": true, "evidence": "CREATE RULE supplier_risk AS, CREATE RULE chain_risk AS, CREATE RULE safe_node AS"},
+        {"text": "Uses IS references for recursive rule composition", "passed": true, "evidence": "IS references for recursive composition and IS NOT for complements"},
+        {"text": "YIELD clause includes KEY designation and PROB annotation", "passed": true, "evidence": "YIELD KEY ... PROB annotations present"},
+        {"text": "Uses FOLD with MNOR for combining probabilities", "passed": true, "evidence": "FOLD risk = MNOR(sig.probability), FOLD exposure = MNOR(...)"},
+        {"text": "Python code uses session.locy() or tx.locy() builder", "passed": true, "evidence": "session.locy() builder API"},
+        {"text": "Seeds base facts via Cypher CREATE statements in Transaction", "passed": true, "evidence": "Cypher CREATE via tx.execute()"},
+        {"text": "Uses QUERY command to retrieve results", "passed": true, "evidence": "Explicit QUERY commands in Locy program"}
+      ]
+    },
+    {
+      "eval_id": 1,
+      "eval_name": "locy-risk-propagation",
+      "configuration": "without_skill",
+      "pass_rate": 0.57,
+      "passed": 4,
+      "total": 7,
+      "time_seconds": 363.2,
+      "total_tokens": 84749,
+      "expectations": [
+        {"text": "Uses CREATE RULE ... AS syntax (not Datalog-style :- notation)", "passed": true, "evidence": "CREATE RULE supply_risk AS"},
+        {"text": "Uses IS references for recursive rule composition", "passed": true, "evidence": "mid IS supply_risk TO b"},
+        {"text": "YIELD clause includes KEY designation and PROB annotation", "passed": false, "evidence": "YIELD KEY a, KEY b, prob — missing PROB annotation on probability column"},
+        {"text": "Uses FOLD with MNOR for combining probabilities", "passed": true, "evidence": "FOLD prob = MNOR(e.risk)"},
+        {"text": "Python code uses session.locy() or tx.locy() builder", "passed": true, "evidence": "session.locy() used"},
+        {"text": "Seeds base facts via Cypher CREATE statements in Transaction", "passed": false, "evidence": "Uses bulk_writer API (bw.insert_vertices / bw.insert_edges) instead of Cypher CREATE"},
+        {"text": "Uses QUERY command to retrieve results", "passed": false, "evidence": "No QUERY command; results accessed via result.derived.get('supply_risk', [])"}
+      ]
+    },
+    {
+      "eval_id": 2,
+      "eval_name": "pydantic-social-network",
+      "configuration": "with_skill",
+      "pass_rate": 1.0,
+      "passed": 7,
+      "total": 7,
+      "time_seconds": 69.8,
+      "total_tokens": 34261,
+      "expectations": [
+        {"text": "User model inherits from UniNode with __label__ class attribute", "passed": true, "evidence": "class User(UniNode) with __label__"},
+        {"text": "FOLLOWS model inherits from UniEdge with __edge_type__, __from__, __to__", "passed": true, "evidence": "class Follows(UniEdge) with __edge_type__, __from__, __to__"},
+        {"text": "Embedding field uses Vector[N] type annotation", "passed": true, "evidence": "Vector[384] type annotation"},
+        {"text": "Uses UniSession or AsyncUniSession for OGM operations", "passed": true, "evidence": "UniSession(db)"},
+        {"text": "Calls sync_schema() to apply models", "passed": true, "evidence": "session.sync_schema()"},
+        {"text": "Uses QueryBuilder with filter expressions", "passed": true, "evidence": "QueryBuilder with .in_() filter"},
+        {"text": "Performs vector similarity search", "passed": true, "evidence": "vector_search() and similar_to() both demonstrated"}
+      ]
+    },
+    {
+      "eval_id": 2,
+      "eval_name": "pydantic-social-network",
+      "configuration": "without_skill",
+      "pass_rate": 1.0,
+      "passed": 7,
+      "total": 7,
+      "time_seconds": 231.2,
+      "total_tokens": 95731,
+      "expectations": [
+        {"text": "User model inherits from UniNode with __label__ class attribute", "passed": true, "evidence": "class User(UniNode) with __label__"},
+        {"text": "FOLLOWS model inherits from UniEdge with __edge_type__, __from__, __to__", "passed": true, "evidence": "class FollowsEdge(UniEdge) with __edge_type__, __from__, __to__"},
+        {"text": "Embedding field uses Vector[N] type annotation", "passed": true, "evidence": "Vector[8] type annotation"},
+        {"text": "Uses UniSession or AsyncUniSession for OGM operations", "passed": true, "evidence": "UniSession as context manager"},
+        {"text": "Calls sync_schema() to apply models", "passed": true, "evidence": "session.sync_schema()"},
+        {"text": "Uses QueryBuilder with filter expressions", "passed": true, "evidence": "QueryBuilder with .starts_with() and != operators"},
+        {"text": "Performs vector similarity search", "passed": true, "evidence": "vector_search() method"}
+      ]
+    }
+  ],
+  "run_summary": {
+    "with_skill": {
+      "pass_rate": {"mean": 1.0, "stddev": 0.0},
+      "time_seconds": {"mean": 82.7, "stddev": 12.8},
+      "tokens": {"mean": 40699, "stddev": 6136}
+    },
+    "without_skill": {
+      "pass_rate": {"mean": 0.857, "stddev": 0.248},
+      "time_seconds": {"mean": 261.3, "stddev": 89.2},
+      "tokens": {"mean": 94061, "stddev": 8528}
+    },
+    "delta": {
+      "pass_rate": "+0.143",
+      "time_seconds": "-178.6",
+      "tokens": "-53362"
+    }
+  },
+  "notes": [
+    "Eval 0 (hybrid search): Tied on assertions. Baseline searched repo source code to find correct APIs. With-skill was 2x faster and used 55% fewer tokens.",
+    "Eval 1 (Locy): With-skill 100% vs baseline 57%. Baseline missed PROB annotation, used bulk_writer instead of Cypher, and skipped QUERY command. This eval shows the skill's core value — Locy has zero LLM training data.",
+    "Eval 2 (Pydantic OGM): Tied on assertions. Baseline searched repo source code. With-skill was 3.3x faster and used 64% fewer tokens.",
+    "Key finding: Even when assertions tie, with-skill runs are consistently faster (2-4x) and cheaper (50-64% fewer tokens) because the skill provides direct answers instead of requiring source code exploration."
+  ]
+}

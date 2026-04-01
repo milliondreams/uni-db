@@ -48,7 +48,7 @@ async fn test_crdt_merge_on_write() -> anyhow::Result<()> {
     {
         let mut writer = writer_lock.write().await;
         writer
-            .insert_vertex_with_labels(vid, props1, &["CounterNode".to_string()])
+            .insert_vertex_with_labels(vid, props1, &["CounterNode".to_string()], None)
             .await?;
         writer.flush_to_l1(None).await?;
     }
@@ -65,7 +65,7 @@ async fn test_crdt_merge_on_write() -> anyhow::Result<()> {
     {
         let mut writer = writer_lock.write().await;
         writer
-            .insert_vertex_with_labels(vid, props2, &["CounterNode".to_string()])
+            .insert_vertex_with_labels(vid, props2, &["CounterNode".to_string()], None)
             .await?;
         writer.flush_to_l1(None).await?;
     }

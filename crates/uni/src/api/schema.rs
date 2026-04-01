@@ -31,9 +31,9 @@ use uni_common::{Result, UniError};
 /// # Ok(())
 /// # }
 /// ```
-#[must_use = "schema builders do nothing until .apply() is called"]
+#[must_use = "schema builders do nothing until .apply() or .current() is called"]
 pub struct SchemaBuilder<'a> {
-    db: &'a Uni,
+    pub(crate) db: &'a Uni,
     pending: Vec<SchemaChange>,
 }
 
@@ -61,6 +61,17 @@ impl<'a> SchemaBuilder<'a> {
             db,
             pending: Vec::new(),
         }
+    }
+
+    /// Get the current schema (read-only snapshot).
+    pub fn current(&self) -> std::sync::Arc<uni_common::core::schema::Schema> {
+        self.db.inner.schema.schema()
+    }
+
+    /// Add pre-built schema changes to this builder.
+    pub fn with_changes(mut self, changes: Vec<SchemaChange>) -> Self {
+        self.pending.extend(changes);
+        self
     }
 
     /// Create a label (node type) in the schema.
@@ -123,28 +134,34 @@ impl<'a> SchemaBuilder<'a> {
     }
 
     pub async fn apply(self) -> Result<()> {
-        let manager = &self.db.schema;
+        let manager = &self.db.inner.schema;
         let mut indexes_to_build = Vec::new();
 
         for change in self.pending {
             match change {
-                SchemaChange::AddLabel { name } => {
-                    manager.add_label(&name).map_err(|e| UniError::Schema {
-                        message: e.to_string(),
-                    })?;
-                }
+                SchemaChange::AddLabel { name } => match manager.add_label(&name) {
+                    Ok(_) => {}
+                    Err(e) if e.to_string().contains("already exists") => {}
+                    Err(e) => {
+                        return Err(UniError::Schema {
+                            message: e.to_string(),
+                        });
+                    }
+                },
                 SchemaChange::AddProperty {
                     label_or_type,
                     name,
                     data_type,
                     nullable,
-                } => {
-                    manager
-                        .add_property(&label_or_type, &name, data_type, nullable)
-                        .map_err(|e| UniError::Schema {
+                } => match manager.add_property(&label_or_type, &name, data_type, nullable) {
+                    Ok(_) => {}
+                    Err(e) if e.to_string().contains("already exists") => {}
+                    Err(e) => {
+                        return Err(UniError::Schema {
                             message: e.to_string(),
-                        })?;
-                }
+                        });
+                    }
+                },
                 SchemaChange::AddIndex(idx) => {
                     manager
                         .add_index(idx.clone())
@@ -158,13 +175,15 @@ impl<'a> SchemaBuilder<'a> {
                     name,
                     from_labels,
                     to_labels,
-                } => {
-                    manager
-                        .add_edge_type(&name, from_labels, to_labels)
-                        .map_err(|e| UniError::Schema {
+                } => match manager.add_edge_type(&name, from_labels, to_labels) {
+                    Ok(_) => {}
+                    Err(e) if e.to_string().contains("already exists") => {}
+                    Err(e) => {
+                        return Err(UniError::Schema {
                             message: e.to_string(),
-                        })?;
-                }
+                        });
+                    }
+                },
             }
         }
 
@@ -180,7 +199,7 @@ impl<'a> SchemaBuilder<'a> {
             // But usually schema changes should be fast, so async build is better?
             // The prompt says "Indexes Not Built During Schema Changes", implying they should be.
             // Let's do it synchronously to ensure they are ready, matching user expectation.
-            self.db.rebuild_indexes(&label, false).await?;
+            self.db.indexes().rebuild(&label, false).await?;
         }
 
         Ok(())
@@ -354,6 +373,17 @@ pub struct LabelInfo {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct EdgeTypeInfo {
+    pub name: String,
+    pub count: usize,
+    pub source_labels: Vec<String>,
+    pub target_labels: Vec<String>,
+    pub properties: Vec<PropertyInfo>,
+    pub indexes: Vec<IndexInfo>,
+    pub constraints: Vec<ConstraintInfo>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PropertyInfo {
     pub name: String,
     pub data_type: String,
@@ -490,15 +520,16 @@ impl Uni {
 
         // We need a way to update the schema in SchemaManager.
         // I'll add a `replace_schema` or similar to SchemaManager.
-        self.schema.replace_schema(schema);
+        self.inner.schema.replace_schema(schema);
         Ok(())
     }
 
     pub async fn save_schema(&self, path: impl AsRef<Path>) -> Result<()> {
-        let content =
-            serde_json::to_string_pretty(&self.schema.schema()).map_err(|e| UniError::Schema {
+        let content = serde_json::to_string_pretty(&self.inner.schema.schema()).map_err(|e| {
+            UniError::Schema {
                 message: e.to_string(),
-            })?;
+            }
+        })?;
         tokio::fs::write(path, content)
             .await
             .map_err(UniError::Io)?;

@@ -9,7 +9,7 @@ import uni_db
 def indexed_db(tmp_path):
     """Create a database with pre-defined indexes."""
     db_path = tmp_path / "indexed_db"
-    db = uni_db.DatabaseBuilder.open(str(db_path)).build()
+    db = uni_db.UniBuilder.open(str(db_path)).build()
 
     # Create Item label with indexes
     (
@@ -26,18 +26,23 @@ def indexed_db(tmp_path):
         .done()
         .apply()
     )
-    db.create_vector_index("Item", "embedding", "l2")
+    db.schema().label("Item").index(
+        "embedding", {"type": "vector", "metric": "l2"}
+    ).apply()
 
     # Add some test data
-    db.execute("""
+    session = db.session()
+    tx = session.tx()
+    tx.execute("""
         CREATE (:Item {sku: 'SKU001', name: 'Widget', embedding: [1.0, 0.0, 0.0, 0.0]})
     """)
-    db.execute("""
+    tx.execute("""
         CREATE (:Item {sku: 'SKU002', name: 'Gadget', embedding: [0.0, 1.0, 0.0, 0.0]})
     """)
-    db.execute("""
+    tx.execute("""
         CREATE (:Item {sku: 'SKU003', name: 'Doohickey', embedding: [0.0, 0.0, 1.0, 0.0]})
     """)
+    tx.commit()
     db.flush()
 
     yield db
@@ -69,15 +74,18 @@ def test_verify_pre_existing_indexes(indexed_db):
 def test_create_additional_scalar_index(indexed_db):
     """Test creating an additional scalar index."""
     db = indexed_db
+    session = db.session()
 
     # Add a new property to schema
-    db.execute(
+    tx = session.tx()
+    tx.execute(
         "CREATE (:Item {sku: 'SKU004', name: 'Thingamajig', embedding: [0.5, 0.5, 0.0, 0.0]})"
     )
+    tx.commit()
     db.flush()
 
     # Verify new item exists
-    results = db.query("MATCH (i:Item {sku: 'SKU004'}) RETURN i.name AS name")
+    results = session.query("MATCH (i:Item {sku: 'SKU004'}) RETURN i.name AS name")
     assert len(results) == 1
     assert results[0]["name"] == "Thingamajig"
 
@@ -89,6 +97,7 @@ def test_create_additional_scalar_index(indexed_db):
 def test_create_additional_vector_index(indexed_db):
     """Test creating an additional vector index."""
     db = indexed_db
+    session = db.session()
 
     # Create another label with vector property
     (
@@ -99,13 +108,17 @@ def test_create_additional_vector_index(indexed_db):
         .done()
         .apply()
     )
-    db.execute("""
+    tx = session.tx()
+    tx.execute("""
         CREATE (:Document {title: 'Doc1', vector: [1.0, 0.0, 0.0, 0.0]})
     """)
+    tx.commit()
     db.flush()
 
     # Create vector index with cosine similarity
-    db.create_vector_index("Document", "vector", "cosine")
+    db.schema().label("Document").index(
+        "vector", {"type": "vector", "metric": "cosine"}
+    ).apply()
 
     # Verify index was created
     label_info = db.get_label_info("Document")
@@ -118,19 +131,20 @@ def test_create_additional_vector_index(indexed_db):
 def test_indexed_queries_return_correct_results(indexed_db):
     """Test that queries using indexes return correct results."""
     db = indexed_db
+    session = db.session()
 
     # Test btree index query (sku)
-    results = db.query("MATCH (i:Item {sku: 'SKU001'}) RETURN i.name AS name")
+    results = session.query("MATCH (i:Item {sku: 'SKU001'}) RETURN i.name AS name")
     assert len(results) == 1
     assert results[0]["name"] == "Widget"
 
     # Test hash index query (name)
-    results = db.query("MATCH (i:Item {name: 'Gadget'}) RETURN i.sku AS sku")
+    results = session.query("MATCH (i:Item {name: 'Gadget'}) RETURN i.sku AS sku")
     assert len(results) == 1
     assert results[0]["sku"] == "SKU002"
 
     # Test range query on btree index
-    results = db.query("""
+    results = session.query("""
         MATCH (i:Item)
         WHERE i.sku >= 'SKU002' AND i.sku <= 'SKU003'
         RETURN i.sku AS sku
@@ -141,7 +155,7 @@ def test_indexed_queries_return_correct_results(indexed_db):
     assert results[1]["sku"] == "SKU003"
 
     # Test vector similarity query
-    results = db.query("""
+    results = session.query("""
         MATCH (i:Item)
         WHERE i.embedding IS NOT NULL
         RETURN i.sku AS sku, i.embedding AS emb
@@ -153,20 +167,23 @@ def test_indexed_queries_return_correct_results(indexed_db):
 def test_index_on_edge_type_properties(indexed_db):
     """Test creating and using indexes on edge type properties."""
     db = indexed_db
+    session = db.session()
 
     # Create some edges with weights
-    db.execute("""
+    tx = session.tx()
+    tx.execute("""
         MATCH (i1:Item {sku: 'SKU001'}), (i2:Item {sku: 'SKU002'})
         CREATE (i1)-[:RELATED_TO {weight: 0.8}]->(i2)
     """)
-    db.execute("""
+    tx.execute("""
         MATCH (i1:Item {sku: 'SKU002'}), (i2:Item {sku: 'SKU003'})
         CREATE (i1)-[:RELATED_TO {weight: 0.6}]->(i2)
     """)
+    tx.commit()
     db.flush()
 
     # Query edges by weight
-    results = db.query("""
+    results = session.query("""
         MATCH (a:Item)-[r:RELATED_TO]->(b:Item)
         WHERE r.weight > 0.7
         RETURN r.weight AS weight
@@ -178,16 +195,21 @@ def test_index_on_edge_type_properties(indexed_db):
 def test_multiple_indexes_same_label(indexed_db):
     """Test that multiple indexes on the same label work correctly."""
     db = indexed_db
+    session = db.session()
 
     # Verify Item has multiple indexes
     label_info = db.get_label_info("Item")
     assert len(label_info.indexes) >= 3
 
     # Query using different indexed properties
-    results_sku = db.query("MATCH (i:Item {sku: 'SKU001'}) RETURN count(i) AS count")
+    results_sku = session.query(
+        "MATCH (i:Item {sku: 'SKU001'}) RETURN count(i) AS count"
+    )
     assert results_sku[0]["count"] == 1
 
-    results_name = db.query("MATCH (i:Item {name: 'Gadget'}) RETURN count(i) AS count")
+    results_name = session.query(
+        "MATCH (i:Item {name: 'Gadget'}) RETURN count(i) AS count"
+    )
     assert results_name[0]["count"] == 1
 
     # Both queries should work efficiently with their respective indexes

@@ -137,7 +137,7 @@ theme:
   icon:
     repo: fontawesome/brands/github
   # favicon: assets/images/favicon.png
-  # logo: assets/images/logo.svg
+  logo: assets/images/uni_logo_only.png
   palette:
     primary: custom
   features:

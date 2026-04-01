@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Generate example Jupyter notebooks for uni-pydantic."""
 
+import hashlib
 import json
 import os
-import hashlib
 
 
 def _cell_id(notebook_key: str, index: int, cell_type: str) -> str:
     """Generate a deterministic cell ID from notebook key, index, and type."""
-    raw = f"{notebook_key}:{index}:{cell_type}".encode("utf-8")
+    raw = f"{notebook_key}:{index}:{cell_type}".encode()
     return hashlib.sha256(raw).hexdigest()[:32]
 
 
@@ -356,7 +356,7 @@ supply_chain_nb = create_notebook(
                 '    print(f"  - {part.name} ({part.sku}): ${part.cost:,.2f}")',
             ]
         ),
-    ]
+    ],
 )
 
 
@@ -583,7 +583,7 @@ rec_nb = create_notebook(
                 '    print(f"  - {book.name}")',
             ]
         ),
-    ]
+    ],
 )
 
 
@@ -837,7 +837,7 @@ rag_nb = create_notebook(
                 'print(f"Total chunks in knowledge base: {total_chunks}")',
             ]
         ),
-    ]
+    ],
 )
 
 
@@ -1087,7 +1087,7 @@ fraud_nb = create_notebook(
                 '    print(f"  {user.name} (risk={user.risk_score})")',
             ]
         ),
-    ]
+    ],
 )
 
 
@@ -1380,7 +1380,7 @@ sales_nb = create_notebook(
                 'print(f"  Large  (>=$500):    {large}")',
             ]
         ),
-    ]
+    ],
 )
 
 

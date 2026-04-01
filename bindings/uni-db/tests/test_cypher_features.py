@@ -41,7 +41,7 @@ class TestExplainProfile:
     def test_explain_returns_plan(self, db_with_data):
         """Test that explain returns a query plan."""
         db, session = db_with_data
-        result = session.explain("MATCH (n:Person) RETURN n.name")
+        result = session.query_with("MATCH (n:Person) RETURN n.name").explain()
 
         assert hasattr(result, "plan_text")
         assert isinstance(result.plan_text, str)
@@ -50,7 +50,7 @@ class TestExplainProfile:
     def test_explain_includes_cost_estimates(self, db_with_data):
         """Test that explain includes cost estimates."""
         db, session = db_with_data
-        result = session.explain("MATCH (n:Person) RETURN n.name")
+        result = session.query_with("MATCH (n:Person) RETURN n.name").explain()
 
         assert hasattr(result, "cost_estimates")
         # cost_estimates is a dict
@@ -59,7 +59,9 @@ class TestExplainProfile:
     def test_explain_includes_index_usage(self, db_with_data):
         """Test that explain shows index usage information."""
         db, session = db_with_data
-        result = session.explain("MATCH (n:Person) WHERE n.name = 'Alice' RETURN n")
+        result = session.query_with(
+            "MATCH (n:Person) WHERE n.name = 'Alice' RETURN n"
+        ).explain()
 
         assert hasattr(result, "index_usage")
         assert isinstance(result.index_usage, list)
@@ -67,7 +69,9 @@ class TestExplainProfile:
     def test_profile_returns_results_and_stats(self, db_with_data):
         """Test that profile returns both results and execution statistics."""
         db, session = db_with_data
-        results, profile = session.profile("MATCH (n:Person) RETURN n.name")
+        results, profile = session.query_with(
+            "MATCH (n:Person) RETURN n.name"
+        ).profile()
 
         # Check results - QueryResult supports len() and iteration
         assert len(results) == 3
@@ -80,7 +84,7 @@ class TestExplainProfile:
     def test_profile_operator_stats(self, db_with_data):
         """Test that profile includes detailed operator statistics."""
         db, session = db_with_data
-        _, profile = session.profile("MATCH (n:Person) RETURN n.name")
+        _, profile = session.query_with("MATCH (n:Person) RETURN n.name").profile()
 
         assert hasattr(profile, "operators")
         operators = profile.operators

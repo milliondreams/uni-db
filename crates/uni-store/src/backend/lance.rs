@@ -576,7 +576,7 @@ impl StorageBackend for LanceDbBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{Int64Array, StringArray, UInt64Array};
+    use arrow_array::{Int64Array, UInt64Array};
     use arrow_schema::{DataType, Field};
     use tempfile::TempDir;
 

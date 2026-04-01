@@ -113,7 +113,7 @@ async def test_async_explain(test_dir):
     session = db.session()
     await db.schema().label("Person").apply()
 
-    plan = await session.explain("MATCH (n:Person) RETURN n")
+    plan = await session.query_with("MATCH (n:Person) RETURN n").explain()
     assert isinstance(plan, uni_db.ExplainOutput)
     assert isinstance(plan.plan_text, str)
     assert len(plan.plan_text) > 0

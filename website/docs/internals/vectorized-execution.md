@@ -1,5 +1,8 @@
 # Vectorized Execution Engine
 
+!!! note "Design Model"
+    This document describes the **design model** behind Uni's query execution. The principles — batch processing, selection vectors, late materialization, SIMD kernels, and morsel-driven parallelism — are accurate. The actual implementation delegates to **Apache DataFusion's ExecutionPlan** infrastructure, so the concrete Rust struct and enum names shown here (e.g., `VectorizedBatch`, `ScanOperator`) are **conceptual illustrations**, not literal code.
+
 Uni's query engine uses **vectorized execution** inspired by systems like DuckDB, Velox, and KuzuDB. Instead of the traditional tuple-at-a-time (Volcano) model, the engine processes data in batches (vectors), achieving significant performance gains through reduced interpretation overhead and improved CPU cache utilization.
 
 ## Why Vectorized Execution?

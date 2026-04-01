@@ -99,13 +99,11 @@ impl PyQueryResult {
     }
 
     fn __getitem__(&self, py: Python<'_>, key: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        if let Ok(slice) = key.downcast::<PySlice>() {
+        if let Ok(slice) = key.cast::<PySlice>() {
             let indices = slice.indices(self.rows.len() as isize)?;
             let mut items: Vec<Py<PyAny>> = Vec::new();
             let mut i = indices.start;
-            while (indices.step > 0 && i < indices.stop)
-                || (indices.step < 0 && i > indices.stop)
-            {
+            while (indices.step > 0 && i < indices.stop) || (indices.step < 0 && i > indices.stop) {
                 items.push(self.rows[i as usize].clone_ref(py));
                 i += indices.step;
             }

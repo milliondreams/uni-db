@@ -61,14 +61,38 @@ pub struct L0Buffer {
     /// Vertex properties (separate from graph structure)
     pub vertex_properties: HashMap<Vid, Properties>,
 
-    /// Edge endpoint mapping (eid -> (src, dst, type_id))
-    pub edge_endpoints: HashMap<Eid, (Vid, Vid, u16)>,
+    /// Edge endpoint mapping (eid -> (src, dst, edge_type))
+    pub edge_endpoints: HashMap<Eid, (Vid, Vid, u32)>,
+
+    /// Vertex labels (VID -> list of label names)
+    pub vertex_labels: HashMap<Vid, Vec<String>>,
+
+    /// Edge type names (EID -> edge type name)
+    pub edge_types: HashMap<Eid, String>,
 
     /// Current version number
     pub current_version: u64,
 
     /// Mutation counter for flush triggering
     pub mutation_count: usize,
+
+    /// Mutation statistics (vertices/edges created/deleted)
+    pub mutation_stats: MutationStats,
+
+    /// Estimated memory usage in bytes
+    pub estimated_size: usize,
+
+    /// Constraint index for uniqueness enforcement
+    pub constraint_index: HashMap<Vec<u8>, Vid>,
+
+    /// Creation timestamps per vertex
+    pub vertex_created_at: HashMap<Vid, i64>,
+    /// Update timestamps per vertex
+    pub vertex_updated_at: HashMap<Vid, i64>,
+    /// Creation timestamps per edge
+    pub edge_created_at: HashMap<Eid, i64>,
+    /// Update timestamps per edge
+    pub edge_updated_at: HashMap<Eid, i64>,
 
     /// Write-ahead log reference
     pub wal: Option<Arc<WriteAheadLog>>,
@@ -548,10 +572,9 @@ pub enum Mutation {
     InsertEdge {
         src_vid: Vid,
         dst_vid: Vid,
-        edge_type: u16,
+        edge_type: u32,
         eid: Eid,
         version: u64,
-        properties: Properties,
     },
 
     /// Delete an existing edge
@@ -559,24 +582,26 @@ pub enum Mutation {
         eid: Eid,
         src_vid: Vid,
         dst_vid: Vid,
-        edge_type: u16,
+        edge_type: u32,
         version: u64,
     },
 
-    /// Insert a new vertex
+    /// Insert a new vertex (labels carried for tombstone flushing)
     InsertVertex {
         vid: Vid,
         properties: Properties,
+        labels: Vec<String>,   // serde(default) for backward compat
     },
 
-    /// Delete an existing vertex
+    /// Delete an existing vertex (labels needed for per-label tombstone flushing)
     DeleteVertex {
         vid: Vid,
+        labels: Vec<String>,   // serde(default) for backward compat
     },
 }
 ```
 
-Note: The label_id is encoded in the VID itself, so `InsertVertex` doesn't need a separate label_id field.
+Note: The label_id is encoded in the VID, but `labels` is carried explicitly so the flush path can write tombstones to the correct per-label Lance dataset. The `serde(default)` attribute ensures backward compatibility with older WAL entries that omit labels.
 
 ### Recovery Process
 
@@ -596,15 +621,15 @@ impl Wal {
                     break;
                 }
 
-                // Replay entry
-                match entry.entry_type {
-                    EntryType::InsertVertex { vid, label_id, props } => {
-                        l0.insert_vertex(vid, label_id, props)?;
+                // Replay mutation
+                match entry.mutation {
+                    Mutation::InsertVertex { vid, properties, labels } => {
+                        l0.insert_vertex(vid, properties, labels)?;
                     }
-                    EntryType::InsertEdge { eid, src, dst, type_id, props } => {
-                        l0.insert_edge(eid, src, dst, type_id, props)?;
+                    Mutation::InsertEdge { src_vid, dst_vid, edge_type, eid, .. } => {
+                        l0.insert_edge(eid, src_vid, dst_vid, edge_type)?;
                     }
-                    // ... handle other types
+                    // ... handle DeleteVertex, DeleteEdge
                 }
             }
         }

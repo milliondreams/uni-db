@@ -48,7 +48,7 @@ class TestAsyncExplainProfile:
     async def test_explain_returns_plan(self, db_with_data):
         """Test that explain returns a query plan."""
         db, session = db_with_data
-        result = await session.explain("MATCH (n:Person) RETURN n.name")
+        result = await session.query_with("MATCH (n:Person) RETURN n.name").explain()
 
         assert isinstance(result, uni_db.ExplainOutput)
         assert isinstance(result.plan_text, str)
@@ -58,7 +58,7 @@ class TestAsyncExplainProfile:
     async def test_explain_includes_cost_estimates(self, db_with_data):
         """Test that explain includes cost estimates."""
         db, session = db_with_data
-        result = await session.explain("MATCH (n:Person) RETURN n.name")
+        result = await session.query_with("MATCH (n:Person) RETURN n.name").explain()
 
         assert isinstance(result, uni_db.ExplainOutput)
         assert result.cost_estimates is not None
@@ -70,9 +70,9 @@ class TestAsyncExplainProfile:
     async def test_explain_includes_index_usage(self, db_with_data):
         """Test that explain shows index usage information."""
         db, session = db_with_data
-        result = await session.explain(
+        result = await session.query_with(
             "MATCH (n:Person) WHERE n.name = 'Alice' RETURN n"
-        )
+        ).explain()
 
         assert isinstance(result, uni_db.ExplainOutput)
         assert result.index_usage is not None
@@ -81,7 +81,9 @@ class TestAsyncExplainProfile:
     async def test_profile_returns_results_and_stats(self, db_with_data):
         """Test that profile returns both results and execution statistics."""
         db, session = db_with_data
-        results, profile = await session.profile("MATCH (n:Person) RETURN n.name")
+        results, profile = await session.query_with(
+            "MATCH (n:Person) RETURN n.name"
+        ).profile()
 
         assert isinstance(results, uni_db.QueryResult)
         assert len(results) == 3
@@ -95,7 +97,9 @@ class TestAsyncExplainProfile:
     async def test_profile_operator_stats(self, db_with_data):
         """Test that profile includes detailed operator statistics."""
         db, session = db_with_data
-        _, profile = await session.profile("MATCH (n:Person) RETURN n.name")
+        _, profile = await session.query_with(
+            "MATCH (n:Person) RETURN n.name"
+        ).profile()
 
         assert isinstance(profile, uni_db.ProfileOutput)
         assert profile.operators is not None

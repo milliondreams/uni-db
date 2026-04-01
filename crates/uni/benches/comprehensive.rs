@@ -143,9 +143,10 @@ impl BenchContext {
         }
 
         let s = self.db.session();
+        let tx = s.tx().await.unwrap();
 
         // Bulk insert vertices
-        let vids = s
+        let vids = tx
             .bulk_insert_vertices("Person", vertex_props)
             .await
             .unwrap();
@@ -159,7 +160,8 @@ impl BenchContext {
         }
 
         // Bulk insert edges
-        s.bulk_insert_edges("KNOWS", edges).await.unwrap();
+        tx.bulk_insert_edges("KNOWS", edges).await.unwrap();
+        tx.commit().await.unwrap();
     }
 }
 
@@ -180,13 +182,16 @@ fn bench_ingest_vertices(c: &mut Criterion) {
                     rt.block_on(async {
                         let embedding: Vec<f32> = (0..128).map(|x| x as f32).collect();
                         let embedding_str = json!(embedding).to_string();
+                        let s = ctx.db.session();
+                        let tx = s.tx().await.unwrap();
                         for i in 0..cfg.nodes {
                             let cypher = format!(
                                 "CREATE (n:Person {{name: 'Bench_{}', age: 30, embedding: {}}})",
                                 i, embedding_str
                             );
-                            ctx.db.session().execute(&cypher).await.unwrap();
+                            tx.execute(&cypher).await.unwrap();
                         }
+                        tx.commit().await.unwrap();
                     })
                 },
                 BatchSize::SmallInput,
@@ -512,11 +517,12 @@ fn bench_scalar_index(c: &mut Criterion) {
 
     // Create scalar index on age property using Cypher
     rt.block_on(async {
-        ctx.db
-            .session()
-            .execute("CREATE INDEX idx_person_age FOR (n:Person) ON (n.age)")
+        let s = ctx.db.session();
+        let tx = s.tx().await.unwrap();
+        tx.execute("CREATE INDEX idx_person_age FOR (n:Person) ON (n.age)")
             .await
             .unwrap();
+        tx.commit().await.unwrap();
     });
 
     let mut group = c.benchmark_group("scalar_index");
@@ -563,11 +569,12 @@ fn bench_vector_index(c: &mut Criterion) {
 
     // Create vector index using Cypher
     rt.block_on(async {
-        ctx.db
-            .session()
-            .execute("CREATE VECTOR INDEX idx_person_embedding FOR (n:Person) ON n.embedding OPTIONS {metric: 'cosine', index_type: 'hnsw'}")
+        let s = ctx.db.session();
+        let tx = s.tx().await.unwrap();
+        tx.execute("CREATE VECTOR INDEX idx_person_embedding FOR (n:Person) ON n.embedding OPTIONS {metric: 'cosine', index_type: 'hnsw'}")
             .await
             .unwrap();
+        tx.commit().await.unwrap();
     });
 
     let query_vec: Vec<f32> = (0..128).map(|x| (x as f32) / 128.0).collect();
@@ -607,11 +614,12 @@ fn bench_fulltext_index(c: &mut Criterion) {
 
     // Create fulltext index using Cypher (ON EACH [properties])
     rt.block_on(async {
-        ctx.db
-            .session()
-            .execute("CREATE FULLTEXT INDEX idx_person_name FOR (n:Person) ON EACH [n.name]")
+        let s = ctx.db.session();
+        let tx = s.tx().await.unwrap();
+        tx.execute("CREATE FULLTEXT INDEX idx_person_name FOR (n:Person) ON EACH [n.name]")
             .await
             .unwrap();
+        tx.commit().await.unwrap();
     });
 
     let mut group = c.benchmark_group("fulltext_index");
@@ -659,11 +667,12 @@ fn bench_index_creation(c: &mut Criterion) {
                 },
                 |ctx| {
                     rt.block_on(async {
-                        ctx.db
-                            .session()
-                            .execute("CREATE INDEX idx_age FOR (n:Person) ON (n.age)")
+                        let s = ctx.db.session();
+                        let tx = s.tx().await.unwrap();
+                        tx.execute("CREATE INDEX idx_age FOR (n:Person) ON (n.age)")
                             .await
                             .unwrap();
+                        tx.commit().await.unwrap();
                     })
                 },
                 BatchSize::LargeInput,
@@ -685,11 +694,12 @@ fn bench_index_creation(c: &mut Criterion) {
                 },
                 |ctx| {
                     rt.block_on(async {
-                        ctx.db
-                            .session()
-                            .execute("CREATE VECTOR INDEX idx_emb FOR (n:Person) ON n.embedding OPTIONS {metric: 'cosine', index_type: 'hnsw'}")
+                        let s = ctx.db.session();
+                        let tx = s.tx().await.unwrap();
+                        tx.execute("CREATE VECTOR INDEX idx_emb FOR (n:Person) ON n.embedding OPTIONS {metric: 'cosine', index_type: 'hnsw'}")
                             .await
                             .unwrap();
+                        tx.commit().await.unwrap();
                     })
                 },
                 BatchSize::LargeInput,
@@ -711,13 +721,14 @@ fn bench_index_creation(c: &mut Criterion) {
                 },
                 |ctx| {
                     rt.block_on(async {
-                        ctx.db
-                            .session()
-                            .execute(
-                                "CREATE FULLTEXT INDEX idx_name FOR (n:Person) ON EACH [n.name]",
-                            )
-                            .await
-                            .unwrap();
+                        let s = ctx.db.session();
+                        let tx = s.tx().await.unwrap();
+                        tx.execute(
+                            "CREATE FULLTEXT INDEX idx_name FOR (n:Person) ON EACH [n.name]",
+                        )
+                        .await
+                        .unwrap();
+                        tx.commit().await.unwrap();
                     })
                 },
                 BatchSize::LargeInput,

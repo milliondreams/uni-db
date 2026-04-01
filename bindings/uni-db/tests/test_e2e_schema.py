@@ -399,7 +399,7 @@ def test_get_label_info(empty_db):
 
 
 def test_get_schema(empty_db):
-    """Test get_schema returns complete schema dictionary."""
+    """Test schema introspection returns complete schema information."""
     db = empty_db
 
     (
@@ -416,11 +416,19 @@ def test_get_schema(empty_db):
         .apply()
     )
 
-    schema = db.get_schema()
-    assert isinstance(schema, dict)
+    # Verify labels
+    labels = db.list_labels()
+    assert set(labels) == {"Person", "Company"}
 
-    # Schema should contain labels and edge types
-    assert "labels" in schema or "vertices" in schema or len(schema) > 0
+    # Verify edge types
+    edge_types = db.list_edge_types()
+    assert set(edge_types) == {"WORKS_AT"}
+
+    # Verify label details
+    person_info = db.get_label_info("Person")
+    assert person_info is not None
+    prop_names = {p.name for p in person_info.properties}
+    assert prop_names == {"name", "age"}
 
 
 # =============================================================================

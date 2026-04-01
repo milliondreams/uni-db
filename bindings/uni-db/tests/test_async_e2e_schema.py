@@ -412,10 +412,13 @@ async def test_get_schema(async_empty_db):
         .apply()
     )
 
-    schema = async_empty_db.get_schema()
+    # Verify labels
+    labels = await async_empty_db.list_labels()
+    assert set(labels) == {"User", "Post"}
 
-    assert isinstance(schema, dict)
-    assert "labels" in schema or "nodes" in schema or len(schema) > 0
+    # Verify edge types
+    edge_types = await async_empty_db.list_edge_types()
+    assert set(edge_types) == {"AUTHORED"}
 
 
 @pytest.mark.asyncio

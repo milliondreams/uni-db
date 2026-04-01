@@ -62,7 +62,7 @@ impl Deref for LocyResult {
 
 // ── Explain Output ──────────────────────────────────────────────────────
 
-/// Output of [`Session::explain_locy()`] — plan introspection without execution.
+/// Output of Locy `explain()` — plan introspection without execution.
 ///
 /// Contains the stratification plan, rule names, and compiler warnings
 /// produced by compiling the Locy program. No data is read or written.

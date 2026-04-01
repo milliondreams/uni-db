@@ -506,7 +506,7 @@ impl<'t, 'a> ExecuteBuilderSync<'t, 'a> {
 
 // ── TransactionBuilderSync ───────────────────────────────────────────────
 
-/// Blocking wrapper around [`TransactionBuilder`](crate::api::session::TransactionBuilder).
+/// Blocking wrapper around [`TransactionBuilder`].
 pub struct TransactionBuilderSync<'s, 'a> {
     inner: TransactionBuilder<'s>,
     rt: &'a tokio::runtime::Runtime,

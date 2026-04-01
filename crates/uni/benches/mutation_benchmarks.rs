@@ -19,11 +19,13 @@ async fn make_db() -> Uni {
 /// Seed `count` schemaless nodes with an `idx` property.
 async fn seed_nodes(db: &Uni, count: usize) {
     let s = db.session();
+    let tx = s.tx().await.unwrap();
     for i in 0..count {
-        s.execute(&format!("CREATE (n:BenchNode {{idx: {i}}})"))
+        tx.execute(&format!("CREATE (n:BenchNode {{idx: {i}}})"))
             .await
             .unwrap();
     }
+    tx.commit().await.unwrap();
 }
 
 fn bench_create_100_nodes(c: &mut Criterion) {
@@ -37,11 +39,13 @@ fn bench_create_100_nodes(c: &mut Criterion) {
             |db| {
                 rt.block_on(async {
                     let s = db.session();
+                    let tx = s.tx().await.unwrap();
                     for i in 0..100 {
-                        s.execute(&format!("CREATE (n:BenchNode {{idx: {i}}})"))
+                        tx.execute(&format!("CREATE (n:BenchNode {{idx: {i}}})"))
                             .await
                             .unwrap();
                     }
+                    tx.commit().await.unwrap();
                 })
             },
             BatchSize::SmallInput,
@@ -64,10 +68,12 @@ fn bench_set_100_properties(c: &mut Criterion) {
             },
             |db| {
                 rt.block_on(async {
-                    db.session()
-                        .execute("MATCH (n:BenchNode) SET n.updated = true")
+                    let s = db.session();
+                    let tx = s.tx().await.unwrap();
+                    tx.execute("MATCH (n:BenchNode) SET n.updated = true")
                         .await
                         .unwrap();
+                    tx.commit().await.unwrap();
                 })
             },
             BatchSize::SmallInput,
@@ -90,10 +96,12 @@ fn bench_delete_100_nodes(c: &mut Criterion) {
             },
             |db| {
                 rt.block_on(async {
-                    db.session()
-                        .execute("MATCH (n:BenchNode) DETACH DELETE n")
+                    let s = db.session();
+                    let tx = s.tx().await.unwrap();
+                    tx.execute("MATCH (n:BenchNode) DETACH DELETE n")
                         .await
                         .unwrap();
+                    tx.commit().await.unwrap();
                 })
             },
             BatchSize::SmallInput,
@@ -113,11 +121,13 @@ fn bench_create_then_match(c: &mut Criterion) {
             |db| {
                 rt.block_on(async {
                     let s = db.session();
+                    let tx = s.tx().await.unwrap();
                     for i in 0..50 {
-                        s.execute(&format!("CREATE (n:BenchNode {{idx: {i}}})"))
+                        tx.execute(&format!("CREATE (n:BenchNode {{idx: {i}}})"))
                             .await
                             .unwrap();
                     }
+                    tx.commit().await.unwrap();
                     let result = s
                         .query("MATCH (n:BenchNode) RETURN count(n) AS cnt")
                         .await
@@ -142,18 +152,20 @@ fn bench_merge_50_nodes(c: &mut Criterion) {
             |db| {
                 rt.block_on(async {
                     let s = db.session();
+                    let tx = s.tx().await.unwrap();
                     // First pass: all creates
                     for i in 0..50 {
-                        s.execute(&format!("MERGE (n:BenchNode {{idx: {i}}})"))
+                        tx.execute(&format!("MERGE (n:BenchNode {{idx: {i}}})"))
                             .await
                             .unwrap();
                     }
                     // Second pass: all matches
                     for i in 0..50 {
-                        s.execute(&format!("MERGE (n:BenchNode {{idx: {i}}})"))
+                        tx.execute(&format!("MERGE (n:BenchNode {{idx: {i}}})"))
                             .await
                             .unwrap();
                     }
+                    tx.commit().await.unwrap();
                 })
             },
             BatchSize::SmallInput,

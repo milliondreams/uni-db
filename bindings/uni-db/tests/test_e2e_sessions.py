@@ -79,10 +79,10 @@ def test_session_with_single_variable(social_db):
 
     # Create session and set a variable
     session = db.session()
-    session.set("username", "alice")
+    session.params().set("username", "alice")
 
     # Verify we can get the variable back
-    value = session.get("username")
+    value = session.params().get("username")
     assert value == "alice"
 
 
@@ -92,16 +92,16 @@ def test_session_with_multiple_variables(social_db):
 
     # Create session and set multiple variables
     session = db.session()
-    session.set("username", "bob")
-    session.set("min_age", 20)
-    session.set("max_age", 30)
-    session.set("is_active", True)
+    session.params().set("username", "bob")
+    session.params().set("min_age", 20)
+    session.params().set("max_age", 30)
+    session.params().set("is_active", True)
 
     # Verify all variables
-    assert session.get("username") == "bob"
-    assert session.get("min_age") == 20
-    assert session.get("max_age") == 30
-    assert session.get("is_active") is True
+    assert session.params().get("username") == "bob"
+    assert session.params().get("min_age") == 20
+    assert session.params().get("max_age") == 30
+    assert session.params().get("is_active") is True
 
 
 def test_session_get_nonexistent_returns_none(social_db):
@@ -109,13 +109,13 @@ def test_session_get_nonexistent_returns_none(social_db):
     db = social_db
 
     session = db.session()
-    session.set("existing_key", "value")
+    session.params().set("existing_key", "value")
 
     # Get existing key
-    assert session.get("existing_key") == "value"
+    assert session.params().get("existing_key") == "value"
 
     # Get non-existent key
-    assert session.get("nonexistent_key") is None
+    assert session.params().get("nonexistent_key") is None
 
 
 def test_session_query(social_db):
@@ -124,7 +124,7 @@ def test_session_query(social_db):
 
     # Create session and set variable
     session = db.session()
-    session.set("target_username", "alice")
+    session.params().set("target_username", "alice")
 
     # Execute query using session variable
     results = session.query("""
@@ -144,7 +144,7 @@ def test_session_query_with_params(social_db):
 
     # Create session with one variable
     session = db.session()
-    session.set("min_likes", 5)
+    session.params().set("min_likes", 5)
 
     # Query with additional params
     results = session.query(
@@ -170,15 +170,17 @@ def test_session_execute(social_db):
 
     # Create session and set variables
     session = db.session()
-    session.set("new_username", "diana")
-    session.set("new_email", "diana@example.com")
-    session.set("new_age", 28)
+    params = session.params()
+    params.set("new_username", "diana")
+    params.set("new_email", "diana@example.com")
+    params.set("new_age", 28)
 
-    # Execute create operation using transaction (resolves $session.xxx params)
+    # Execute create operation using transaction with explicit params
     tx = session.tx()
-    tx.execute("""
-        CREATE (:User {username: $session.new_username, email: $session.new_email, age: $session.new_age})
-    """)
+    tx.execute(
+        "CREATE (:User {username: $new_username, email: $new_email, age: $new_age})",
+        params=params.get_all(),
+    )
     tx.commit()
 
     # Verify the user was created using a plain session
@@ -196,8 +198,8 @@ def test_session_variables_persist_across_queries(social_db):
 
     # Create session and set variables
     session = db.session()
-    session.set("user1", "alice")
-    session.set("user2", "bob")
+    session.params().set("user1", "alice")
+    session.params().set("user2", "bob")
 
     # First query
     results1 = session.query("""
@@ -229,20 +231,23 @@ def test_session_with_complex_types(social_db):
 
     # Create session and set various types
     session = db.session()
-    session.set("string_val", "test")
-    session.set("int_val", 42)
-    session.set("float_val", 3.14)
-    session.set("bool_val", True)
-    session.set("list_val", [1, 2, 3])
-    session.set("dict_val", {"key": "value", "nested": {"deep": "data"}})
+    session.params().set("string_val", "test")
+    session.params().set("int_val", 42)
+    session.params().set("float_val", 3.14)
+    session.params().set("bool_val", True)
+    session.params().set("list_val", [1, 2, 3])
+    session.params().set("dict_val", {"key": "value", "nested": {"deep": "data"}})
 
     # Verify all types
-    assert session.get("string_val") == "test"
-    assert session.get("int_val") == 42
-    assert session.get("float_val") == 3.14
-    assert session.get("bool_val") is True
-    assert session.get("list_val") == [1, 2, 3]
-    assert session.get("dict_val") == {"key": "value", "nested": {"deep": "data"}}
+    assert session.params().get("string_val") == "test"
+    assert session.params().get("int_val") == 42
+    assert session.params().get("float_val") == 3.14
+    assert session.params().get("bool_val") is True
+    assert session.params().get("list_val") == [1, 2, 3]
+    assert session.params().get("dict_val") == {
+        "key": "value",
+        "nested": {"deep": "data"},
+    }
 
 
 def test_session_execute_update(social_db):
@@ -251,15 +256,16 @@ def test_session_execute_update(social_db):
 
     # Create session and set variables
     session = db.session()
-    session.set("target_user", "charlie")
-    session.set("new_age", 36)
+    params = session.params()
+    params.set("target_user", "charlie")
+    params.set("new_age", 36)
 
-    # Execute update using transaction (resolves $session.xxx params)
+    # Execute update using transaction with explicit params
     tx = session.tx()
-    tx.execute("""
-        MATCH (u:User {username: $session.target_user})
-        SET u.age = $session.new_age
-    """)
+    tx.execute(
+        "MATCH (u:User {username: $target_user}) SET u.age = $new_age",
+        params=params.get_all(),
+    )
     tx.commit()
 
     # Verify update using a plain session
@@ -283,14 +289,15 @@ def test_session_execute_delete(social_db):
 
     # Create session and set variable
     session = db.session()
-    session.set("post_title", "Graph Databases")
+    params = session.params()
+    params.set("post_title", "Graph Databases")
 
-    # Execute delete using transaction (resolves $session.xxx params)
+    # Execute delete using transaction with explicit params
     tx = session.tx()
-    tx.execute("""
-        MATCH (p:Post {title: $session.post_title})
-        DELETE p
-    """)
+    tx.execute(
+        "MATCH (p:Post {title: $post_title}) DELETE p",
+        params=params.get_all(),
+    )
     tx.commit()
 
     # Verify deletion
@@ -306,15 +313,15 @@ def test_multiple_independent_sessions(social_db):
 
     # Create first session and set variable
     session1 = db.session()
-    session1.set("username", "alice")
+    session1.params().set("username", "alice")
 
     # Create second session with different value
     session2 = db.session()
-    session2.set("username", "bob")
+    session2.params().set("username", "bob")
 
     # Verify sessions are independent
-    assert session1.get("username") == "alice"
-    assert session2.get("username") == "bob"
+    assert session1.params().get("username") == "alice"
+    assert session2.params().get("username") == "bob"
 
     # Query using both sessions
     results1 = session1.query(
@@ -334,7 +341,7 @@ def test_session_with_aggregations(social_db):
 
     # Create session and set variable
     session = db.session()
-    session.set("min_age", 25)
+    session.params().set("min_age", 25)
 
     # Query with aggregation
     results = session.query("""
@@ -354,14 +361,14 @@ def test_session_set_chaining(social_db):
 
     # Set variables on session
     session = db.session()
-    session.set("var1", "value1")
-    session.set("var2", "value2")
-    session.set("var3", "value3")
+    session.params().set("var1", "value1")
+    session.params().set("var2", "value2")
+    session.params().set("var3", "value3")
 
     # Verify all variables were set
-    assert session.get("var1") == "value1"
-    assert session.get("var2") == "value2"
-    assert session.get("var3") == "value3"
+    assert session.params().get("var1") == "value1"
+    assert session.params().get("var2") == "value2"
+    assert session.params().get("var3") == "value3"
 
 
 def test_session_with_relationship_queries(social_db):
@@ -370,7 +377,7 @@ def test_session_with_relationship_queries(social_db):
 
     # Create session and set variable
     session = db.session()
-    session.set("follower", "alice")
+    session.params().set("follower", "alice")
 
     # Query relationships
     results = session.query("""
@@ -387,7 +394,7 @@ def test_session_query_returns_empty_list(social_db):
     db = social_db
 
     session = db.session()
-    session.set("username", "nonexistent_user")
+    session.params().set("username", "nonexistent_user")
 
     results = session.query("""
         MATCH (u:User {username: $session.username})

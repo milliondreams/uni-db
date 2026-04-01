@@ -441,7 +441,7 @@ class TestExplainAndProfile:
     def test_explain_returns_plan(self, social_db_populated):
         """Test that explain returns a query plan."""
         session = social_db_populated.session()
-        result = session.explain("MATCH (n:Person) RETURN n.name")
+        result = session.query_with("MATCH (n:Person) RETURN n.name").explain()
 
         assert hasattr(result, "plan_text")
         assert isinstance(result.plan_text, str)
@@ -450,7 +450,7 @@ class TestExplainAndProfile:
     def test_explain_includes_cost_estimates(self, social_db_populated):
         """Test that explain includes cost estimates."""
         session = social_db_populated.session()
-        result = session.explain("MATCH (n:Person) RETURN n.name")
+        result = session.query_with("MATCH (n:Person) RETURN n.name").explain()
 
         assert hasattr(result, "cost_estimates")
         # cost_estimates is a Python object with estimated_rows and estimated_cost
@@ -459,7 +459,9 @@ class TestExplainAndProfile:
     def test_explain_includes_index_usage(self, social_db_populated):
         """Test that explain shows index usage information."""
         session = social_db_populated.session()
-        result = session.explain("MATCH (n:Person) WHERE n.name = 'Alice' RETURN n")
+        result = session.query_with(
+            "MATCH (n:Person) WHERE n.name = 'Alice' RETURN n"
+        ).explain()
 
         assert hasattr(result, "index_usage")
         assert result.index_usage is not None
@@ -467,7 +469,9 @@ class TestExplainAndProfile:
     def test_profile_returns_results_and_stats(self, social_db_populated):
         """Test that profile returns both results and execution statistics."""
         session = social_db_populated.session()
-        results, profile = session.profile("MATCH (n:Person) RETURN n.name AS name")
+        results, profile = session.query_with(
+            "MATCH (n:Person) RETURN n.name AS name"
+        ).profile()
 
         assert len(results) == 5
 
@@ -478,9 +482,9 @@ class TestExplainAndProfile:
     def test_profile_operator_stats(self, social_db_populated):
         """Test that profile includes detailed operator statistics."""
         session = social_db_populated.session()
-        _, profile = session.profile(
+        _, profile = session.query_with(
             "MATCH (n:Person) RETURN n.name AS name ORDER BY name"
-        )
+        ).profile()
 
         assert hasattr(profile, "operators")
         # operators is a Python object (list of dicts or similar)

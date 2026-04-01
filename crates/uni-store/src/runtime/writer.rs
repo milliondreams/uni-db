@@ -180,7 +180,7 @@ impl Writer {
     ///
     /// Only reads the current version — no exclusive lock required on Writer.
     /// The returned buffer has no WAL reference; mutations are logged at
-    /// commit time via [`commit_transaction_l0`].
+    /// commit time via [`Self::commit_transaction_l0`].
     pub fn create_transaction_l0(&self) -> Arc<RwLock<L0Buffer>> {
         let current_version = self.l0_manager.get_current().read().current_version;
         // Transaction mutations are logged to WAL at COMMIT time, not during the transaction.

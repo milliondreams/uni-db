@@ -32,10 +32,10 @@ class TestSession:
     def test_session_set_and_get_variable(self, db):
         """Test setting and getting a session variable."""
         session = db.session()
-        session.set("user_name", "Alice")
+        session.params().set("user_name", "Alice")
 
-        # The session variable should be accessible via session.get()
-        name = session.get("user_name")
+        # The session variable should be accessible via session.params().get()
+        name = session.params().get("user_name")
         assert name == "Alice"
 
     def test_session_query(self, db):
@@ -63,16 +63,16 @@ class TestSession:
     def test_session_set_multiple_variables(self, db):
         """Test session with multiple variables."""
         session = db.session()
-        session.set("var1", "value1")
-        session.set("var2", 42)
-        session.set("var3", True)
+        session.params().set("var1", "value1")
+        session.params().set("var2", 42)
+        session.params().set("var3", True)
 
-        assert session.get("var1") == "value1"
-        assert session.get("var2") == 42
-        assert session.get("var3") is True
+        assert session.params().get("var1") == "value1"
+        assert session.params().get("var2") == 42
+        assert session.params().get("var3") is True
 
     def test_session_get_nonexistent(self, db):
         """Test getting a nonexistent session variable."""
         session = db.session()
-        result = session.get("nonexistent")
+        result = session.params().get("nonexistent")
         assert result is None

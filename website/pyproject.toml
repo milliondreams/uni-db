@@ -10,10 +10,9 @@ repository = "https://github.com/rustic-ai/uni-db"
 
 [tool.poetry.dependencies]
 python = "^3.10"
-mkdocs = "^1.6"
-mkdocs-material = "^9.5"
+zensical = ">=0.0.31"
 pymdown-extensions = "^10.0"
-mkdocs-jupyter = "^0.25"
+nbconvert = "^7.0"
 uni-db = { path = "../bindings/uni-db", develop = true }
 
 [build-system]

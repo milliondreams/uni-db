@@ -408,7 +408,9 @@ async def test_explain(async_social_db_populated):
     """Test explain() to get query execution plan."""
     session = async_social_db_populated.session()
 
-    plan = await session.explain("MATCH (p:Person) WHERE p.age > 30 RETURN p.name")
+    plan = await session.query_with(
+        "MATCH (p:Person) WHERE p.age > 30 RETURN p.name"
+    ).explain()
 
     assert plan is not None
     assert hasattr(plan, "plan_text")
@@ -419,9 +421,9 @@ async def test_profile(async_social_db_populated):
     """Test profile() to get query execution statistics."""
     session = async_social_db_populated.session()
 
-    results, stats = await session.profile(
+    results, stats = await session.query_with(
         "MATCH (p:Person) WHERE p.age > 30 RETURN p.name AS name"
-    )
+    ).profile()
 
     assert len(results) == 2
     names = sorted([r["name"] for r in results])

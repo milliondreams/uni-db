@@ -32,9 +32,9 @@ async def db():
 async def test_async_session_set_and_get_variable(db):
     """Test setting and getting an async session variable."""
     session = db.session()
-    await session.set("user_name", "Alice")
+    session.params().set("user_name", "Alice")
 
-    name = await session.get("user_name")
+    name = session.params().get("user_name")
     assert name == "Alice"
 
 
@@ -66,18 +66,18 @@ async def test_async_session_execute(db):
 async def test_async_session_set_multiple_variables(db):
     """Test async session with multiple variables."""
     session = db.session()
-    await session.set("var1", "value1")
-    await session.set("var2", 42)
-    await session.set("var3", True)
+    session.params().set("var1", "value1")
+    session.params().set("var2", 42)
+    session.params().set("var3", True)
 
-    assert await session.get("var1") == "value1"
-    assert await session.get("var2") == 42
-    assert await session.get("var3") is True
+    assert session.params().get("var1") == "value1"
+    assert session.params().get("var2") == 42
+    assert session.params().get("var3") is True
 
 
 @pytest.mark.asyncio
 async def test_async_session_get_nonexistent(db):
     """Test getting a nonexistent async session variable."""
     session = db.session()
-    result = await session.get("nonexistent")
+    result = session.params().get("nonexistent")
     assert result is None

@@ -260,9 +260,9 @@ async def test_explain():
     await tx.execute("CREATE (:Person {name: 'Bob', age: 25})")
     await tx.commit()
 
-    plan = await session.explain(
+    plan = await session.query_with(
         "MATCH (n:Person) WHERE n.age > 20 RETURN n.name, n.age"
-    )
+    ).explain()
 
     assert isinstance(plan, uni_db.ExplainOutput)
     assert isinstance(plan.plan_text, str)
@@ -290,9 +290,9 @@ async def test_profile():
     await tx.execute("CREATE (:Product {name: 'Widget C', price: 29.99})")
     await tx.commit()
 
-    results, stats = await session.profile(
+    results, stats = await session.query_with(
         "MATCH (p:Product) WHERE p.price < 25.0 RETURN p.name, p.price"
-    )
+    ).profile()
 
     assert isinstance(results, uni_db.QueryResult)
     assert isinstance(stats, uni_db.ProfileOutput)
@@ -330,10 +330,10 @@ async def test_explain_with_complex_query():
     """)
     await tx.commit()
 
-    plan = await session.explain("""
+    plan = await session.query_with("""
         MATCH (u:User)-[:AUTHORED]->(p:Post)
         RETURN u.username, p.title
-    """)
+    """).explain()
 
     assert isinstance(plan, uni_db.ExplainOutput)
     assert isinstance(plan.plan_text, str)
@@ -353,10 +353,10 @@ async def test_profile_with_aggregation():
         await tx.execute(f"CREATE (:Order {{amount: {(i + 1) * 10.0}}})")
     await tx.commit()
 
-    results, stats = await session.profile("""
+    results, stats = await session.query_with("""
         MATCH (o:Order)
         RETURN count(o) AS total_orders, sum(o.amount) AS total_amount
-    """)
+    """).profile()
 
     assert isinstance(results, uni_db.QueryResult)
     assert isinstance(stats, uni_db.ProfileOutput)

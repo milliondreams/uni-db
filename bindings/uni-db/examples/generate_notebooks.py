@@ -5,7 +5,7 @@ import os
 
 def _cell_id(notebook_key: str, index: int, cell_type: str) -> str:
     """Generate a deterministic cell ID from notebook key, index, and type."""
-    raw = f"{notebook_key}:{index}:{cell_type}".encode("utf-8")
+    raw = f"{notebook_key}:{index}:{cell_type}".encode()
     return hashlib.sha256(raw).hexdigest()[:32]
 
 
@@ -284,7 +284,7 @@ if __name__ == "__main__":
                     "assert top['products_at_risk'] == 2, f\"Expected 2, got {top['products_at_risk']}\"",
                 ]
             ),
-        ]
+        ],
     )
 
     # ===========================================================================
@@ -464,7 +464,7 @@ if __name__ == "__main__":
                     "    print(f\"  {r['book']}: {r['buyers']} buyer(s)\")",
                 ]
             ),
-        ]
+        ],
     )
 
     # ===========================================================================
@@ -673,7 +673,7 @@ if __name__ == "__main__":
                     "    print(f'  [{cid}] {text[:70]}...')",
                 ]
             ),
-        ]
+        ],
     )
 
     # ===========================================================================
@@ -873,7 +873,7 @@ if __name__ == "__main__":
                     "assert 'Alice' in combined, f'Alice should be in combined alert, got {combined}'",
                 ]
             ),
-        ]
+        ],
     )
 
     # ===========================================================================
@@ -1096,7 +1096,7 @@ if __name__ == "__main__":
                     "assert len(set(best_cats)) > 1, f'Expected variance across regions, got {best_cats}'",
                 ]
             ),
-        ]
+        ],
     )
 
     # Write notebooks to the same directory as this script

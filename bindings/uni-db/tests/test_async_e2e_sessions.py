@@ -18,7 +18,7 @@ async def test_session_with_single_variable(async_social_db):
 
     # Create session and set single variable
     session = async_social_db.session()
-    await session.set("min_age", 25)
+    session.params().set("min_age", 25)
 
     result = await session.query(
         "MATCH (p:Person) WHERE p.age >= $session.min_age RETURN p.name as name ORDER BY name"
@@ -44,8 +44,8 @@ async def test_session_with_multiple_variables(async_social_db):
     await async_social_db.flush()
 
     session = async_social_db.session()
-    await session.set("min_age", 28)
-    await session.set("max_age", 40)
+    session.params().set("min_age", 28)
+    session.params().set("max_age", 40)
 
     result = await session.query(
         "MATCH (p:Person) WHERE p.age >= $session.min_age AND p.age <= $session.max_age RETURN p.name as name ORDER BY name"
@@ -59,12 +59,12 @@ async def test_session_with_multiple_variables(async_social_db):
 async def test_session_get_nonexistent_returns_none(async_social_db):
     """Test that getting a nonexistent variable returns None."""
     session = async_social_db.session()
-    await session.set("existing_key", "value")
+    session.params().set("existing_key", "value")
 
-    value = await session.get("existing_key")
+    value = session.params().get("existing_key")
     assert value == "value"
 
-    value = await session.get("nonexistent_key")
+    value = session.params().get("nonexistent_key")
     assert value is None
 
 
@@ -82,7 +82,7 @@ async def test_session_query(async_social_db):
     await async_social_db.flush()
 
     session = async_social_db.session()
-    await session.set("person_name", "Alice")
+    session.params().set("person_name", "Alice")
 
     result = await session.query(
         "MATCH (p:Person {name: $session.person_name})-[:KNOWS]->(friend) RETURN friend.name as friend_name"
@@ -103,12 +103,13 @@ async def test_session_query(async_social_db):
 async def test_session_execute(async_social_db):
     """Test executing mutations through a session."""
     session = async_social_db.session()
-    await session.set("person_name", "SessionPerson")
-    await session.set("person_age", 40)
+    session.params().set("person_name", "SessionPerson")
+    session.params().set("person_age", 40)
 
     tx = await session.tx()
     result = await tx.execute(
-        "CREATE (p:Person {name: $session.person_name, age: $session.person_age})"
+        "CREATE (p:Person {name: $person_name, age: $person_age})",
+        params=session.params().get_all(),
     )
     assert result.nodes_created >= 1
     await tx.commit()
@@ -121,12 +122,13 @@ async def test_session_execute(async_social_db):
     assert result[0]["age"] == 40
 
     session2 = async_social_db.session()
-    await session2.set("name_to_update", "SessionPerson")
-    await session2.set("new_age", 41)
+    session2.params().set("name_to_update", "SessionPerson")
+    session2.params().set("new_age", 41)
 
     tx2 = await session2.tx()
     result = await tx2.execute(
-        "MATCH (p:Person {name: $session.name_to_update}) SET p.age = $session.new_age"
+        "MATCH (p:Person {name: $name_to_update}) SET p.age = $new_age",
+        params=session2.params().get_all(),
     )
     assert result.properties_set >= 1
     await tx2.commit()
@@ -150,8 +152,8 @@ async def test_session_variables_persist_across_queries(async_social_db):
     await async_social_db.flush()
 
     session = async_social_db.session()
-    await session.set("min_age", 30)
-    await session.set("max_age", 40)
+    session.params().set("min_age", 30)
+    session.params().set("max_age", 40)
 
     # First query using min_age
     result = await session.query(
@@ -175,13 +177,14 @@ async def test_session_variables_persist_across_queries(async_social_db):
     assert result[0]["name"] == "Alice"
     assert result[1]["name"] == "Charlie"
 
-    assert await session.get("min_age") == 30
-    assert await session.get("max_age") == 40
+    assert session.params().get("min_age") == 30
+    assert session.params().get("max_age") == 40
 
-    # Execute mutation using session variables
+    # Execute mutation using explicit params
     tx_mut = await session.tx()
     result = await tx_mut.execute(
-        "MATCH (p:Person) WHERE p.age >= $session.min_age SET p.email = 'senior@example.com'"
+        "MATCH (p:Person) WHERE p.age >= $min_age SET p.email = 'senior@example.com'",
+        params={"min_age": session.params().get("min_age")},
     )
     assert result.properties_set >= 1
     await tx_mut.commit()

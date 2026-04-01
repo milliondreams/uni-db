@@ -69,7 +69,7 @@ Uni's internals are organized into four major subsystems:
 
 1. **Lance Datasets** — Columnar storage with versioning
 2. **WAL** — Write-ahead log for durability
-3. **Indexes** — Vector (HNSW/IVF_PQ), scalar (BTree)
+3. **Indexes** — Vector (HNSW/IVF_PQ), scalar (BTree, Hash, Bitmap)
 
 ### Object Store
 
@@ -84,7 +84,7 @@ Uni's internals are organized into four major subsystems:
 | Vectorized execution | 100-500x faster than row-at-a-time |
 | Lance for storage | Native vector indexes + versioning |
 | SimpleGraph for in-memory | Fast graph algorithms in Rust |
-| Single-writer model | Simplicity over distributed complexity |
+| Commit-time serialization | Private L0 buffers per transaction, lock only at commit |
 | Query rewriting | Compile-time optimization for predicate pushdown |
 
 ## Next Steps

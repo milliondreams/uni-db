@@ -228,7 +228,7 @@ pub fn register_cypher_udfs(ctx: &SessionContext) -> DFResult<()> {
     Ok(())
 }
 
-/// Register user-defined custom scalar functions from a [`CustomFunctionRegistry`]
+/// Register user-defined custom scalar functions from a [`super::executor::custom_functions::CustomFunctionRegistry`]
 /// as DataFusion UDFs on the given session context.
 pub fn register_custom_udfs(
     ctx: &SessionContext,

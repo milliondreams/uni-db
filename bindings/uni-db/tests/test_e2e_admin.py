@@ -208,7 +208,9 @@ def test_explain_returns_plan_info():
     session = db.session()
 
     # Explain a query
-    plan = session.explain("MATCH (p:Person) WHERE p.age > 25 RETURN p.name")
+    plan = session.query_with(
+        "MATCH (p:Person) WHERE p.age > 25 RETURN p.name"
+    ).explain()
 
     # Should return an ExplainOutput object (not a dict)
     assert (
@@ -246,9 +248,9 @@ def test_profile_returns_results_and_stats():
     tx.commit()
 
     # Profile a query
-    results, profile = session.profile(
+    results, profile = session.query_with(
         "MATCH (p:Person) RETURN p.name as name, p.age as age"
-    )
+    ).profile()
 
     # Results should be a QueryResult (supports len and indexing)
     assert len(results) == 2
@@ -287,11 +289,11 @@ def test_explain_complex_query():
     session = db.session()
 
     # Complex query with joins
-    plan = session.explain(
+    plan = session.query_with(
         "MATCH (p:Person)-[:WORKS_AT]->(c:Company) "
         "WHERE c.name = 'TechCorp' "
         "RETURN p.name, c.name"
-    )
+    ).explain()
 
     # Should return an ExplainOutput object
     assert plan is not None
@@ -320,9 +322,9 @@ def test_profile_with_filters():
     tx.commit()
 
     # Profile with filter
-    results, profile = session.profile(
+    results, profile = session.query_with(
         "MATCH (p:Product) WHERE p.price > 15.0 RETURN p.name as name ORDER BY p.price"
-    )
+    ).profile()
 
     assert len(results) == 2  # Only Widget and Gadget
     assert profile is not None
@@ -337,7 +339,7 @@ def test_explain_on_empty_database():
     session = db.session()
 
     # Explain without any data
-    plan = session.explain("MATCH (n:Node) RETURN n.value")
+    plan = session.query_with("MATCH (n:Node) RETURN n.value").explain()
 
     assert plan is not None
 
@@ -351,7 +353,7 @@ def test_profile_on_empty_results():
     session = db.session()
 
     # No data inserted, query returns empty
-    results, profile = session.profile("MATCH (i:Item) RETURN i.name")
+    results, profile = session.query_with("MATCH (i:Item) RETURN i.name").profile()
 
     assert len(results) == 0
     assert profile is not None

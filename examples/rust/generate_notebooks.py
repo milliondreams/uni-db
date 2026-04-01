@@ -5,21 +5,22 @@ These notebooks use evcxr_jupyter as the Rust kernel for Jupyter.
 Install with: cargo install evcxr_jupyter && evcxr_jupyter --install
 """
 
+import hashlib
 import json
 import os
-import uuid
 
 
-def generate_cell_id():
-    """Generate a unique cell ID."""
-    return str(uuid.uuid4()).replace("-", "")[:32]
+def _cell_id(notebook_key: str, index: int, cell_type: str) -> str:
+    """Generate a deterministic cell ID from notebook key, index and cell type."""
+    raw = f"{notebook_key}:{index}:{cell_type}".encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()[:32]
 
 
-def create_notebook(cells):
-    # Add IDs to all cells if missing
-    for cell in cells:
+def create_notebook(notebook_key, cells):
+    # Assign deterministic IDs to all cells
+    for i, cell in enumerate(cells):
         if "id" not in cell:
-            cell["id"] = generate_cell_id()
+            cell["id"] = _cell_id(notebook_key, i, cell.get("cell_type", "code"))
     return {
         "cells": cells,
         "metadata": {
@@ -33,7 +34,7 @@ def create_notebook(cells):
                 "file_extension": ".rs",
                 "mimetype": "text/rust",
                 "name": "Rust",
-                "pygment_lexer": "rust",
+                "pygments_lexer": "rust",
                 "version": "",
             },
         },
@@ -46,7 +47,6 @@ def md_cell(source):
     if isinstance(source, list):
         source = "\n".join(source)
     return {
-        "id": generate_cell_id(),
         "cell_type": "markdown",
         "metadata": {},
         "source": source,
@@ -57,7 +57,6 @@ def code_cell(source):
     if isinstance(source, list):
         source = "\n".join(source)
     return {
-        "id": generate_cell_id(),
         "cell_type": "code",
         "execution_count": None,
         "metadata": {},
@@ -72,7 +71,7 @@ common_deps = """:dep uni-db = { path = "../../../crates/uni" }
 :dep serde_json = "1"
 """
 
-common_imports = """use uni::{Uni, DataType, IndexType, ScalarType, VectorMetric, VectorAlgo, VectorIndexCfg};
+common_imports = """use uni_db::{Uni, DataType, IndexType, ScalarType, VectorMetric, VectorAlgo, VectorIndexCfg};
 use std::collections::HashMap;
 use serde_json::json;
 
@@ -102,6 +101,7 @@ println!("Opened database at {{}}", db_path);
 # 1. Supply Chain
 # =============================================================================
 supply_chain_nb = create_notebook(
+    "supply_chain",
     [
         md_cell(
             [
@@ -314,6 +314,7 @@ println!("Top supplier: {:?}", results.rows[0]);"""
 # 2. Recommendation Engine
 # =============================================================================
 recommendation_nb = create_notebook(
+    "recommendation",
     [
         md_cell(
             [
@@ -516,6 +517,7 @@ for row in &results.rows {
 # 3. RAG (Retrieval-Augmented Generation)
 # =============================================================================
 rag_nb = create_notebook(
+    "rag",
     [
         md_cell(
             [
@@ -710,6 +712,7 @@ for row in &results.rows {
 # 4. Fraud Detection
 # =============================================================================
 fraud_nb = create_notebook(
+    "fraud_detection",
     [
         md_cell(
             [
@@ -889,6 +892,7 @@ assert!(!results.rows.is_empty(), "Expected at least one combined alert");"""
 # 5. Sales Analytics
 # =============================================================================
 sales_nb = create_notebook(
+    "sales_analytics",
     [
         md_cell(
             [
@@ -1076,25 +1080,26 @@ for row in &results.rows {
 )
 
 
-# Write notebooks
-script_dir = os.path.dirname(os.path.abspath(__file__))
+if __name__ == "__main__":
+    # Write notebooks
+    script_dir = os.path.dirname(os.path.abspath(__file__))
 
-notebooks = [
-    ("supply_chain.ipynb", supply_chain_nb),
-    ("recommendation.ipynb", recommendation_nb),
-    ("rag.ipynb", rag_nb),
-    ("fraud_detection.ipynb", fraud_nb),
-    ("sales_analytics.ipynb", sales_nb),
-]
+    notebooks = [
+        ("supply_chain.ipynb", supply_chain_nb),
+        ("recommendation.ipynb", recommendation_nb),
+        ("rag.ipynb", rag_nb),
+        ("fraud_detection.ipynb", fraud_nb),
+        ("sales_analytics.ipynb", sales_nb),
+    ]
 
-for filename, nb in notebooks:
-    path = os.path.join(script_dir, filename)
-    with open(path, "w") as f:
-        json.dump(nb, f, indent=2)
-    print(f"Created {filename}")
+    for filename, nb in notebooks:
+        path = os.path.join(script_dir, filename)
+        with open(path, "w") as f:
+            json.dump(nb, f, indent=2)
+        print(f"Created {filename}")
 
-print("\nAll Rust notebooks created successfully!")
-print("\nTo use these notebooks:")
-print("1. Install evcxr_jupyter: cargo install evcxr_jupyter && evcxr_jupyter --install")
-print("2. Run: jupyter notebook")
-print("3. Open any .ipynb file and select the Rust kernel")
+    print("\nAll Rust notebooks created successfully!")
+    print("\nTo use these notebooks:")
+    print("1. Install evcxr_jupyter: cargo install evcxr_jupyter && evcxr_jupyter --install")
+    print("2. Run: jupyter notebook")
+    print("3. Open any .ipynb file and select the Rust kernel")

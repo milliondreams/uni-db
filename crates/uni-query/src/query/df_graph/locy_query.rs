@@ -29,7 +29,7 @@ pub async fn evaluate_query(
     program: &CompiledProgram,
     fact_source: &dyn DerivedFactSource,
     config: &LocyConfig,
-    _derived_store: &mut RowStore,
+    derived_store: &mut RowStore,
     stats: &mut LocyStats,
     start: Instant,
 ) -> Result<Vec<FactRow>, LocyError> {
@@ -54,6 +54,19 @@ pub async fn evaluate_query(
         Some(expr) => extract_goal_bindings(expr, &key_columns),
         None => std::collections::HashMap::new(),
     };
+
+    // For FOLD rules (MNOR/MPROD/SUM), the SLG resolver does not apply
+    // post-fixpoint aggregation and would return raw pre-FOLD match rows.
+    // Use pre-computed facts from derived_store (which ran the full native
+    // fixpoint including FOLD aggregation) when available.
+    // KEY columns in derived_store rows are VIDs (not full Node objects),
+    // so property-based WHERE filters are skipped; only RETURN projection
+    // is applied.
+    let is_fold_rule = rule.clauses.iter().any(|c| !c.fold.is_empty());
+    if is_fold_rule && derived_store.contains_key(&rule_name) {
+        let rows = derived_store[&rule_name].rows.clone();
+        return apply_return_clause(rows, &query.return_clause, &config.params);
+    }
 
     // Use a fresh store rather than the pre-computed orch_store.
     // The native fixpoint stores node columns as VIDs (UInt64), not full node objects,

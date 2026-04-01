@@ -18,19 +18,18 @@ def run_notebook(notebook_path):
         code += source + "\n\n"
 
     # Execute
-    try:
-        # We need to set up the environment so imports work
-        # The notebooks assume sys.path.append(".." works to find 'uni'
-        # We are running this script likely from bindings/uni-db/examples or bindings/uni-db/
-        # Let's adjust cwd to the notebook directory to match its perspective
+    # We need to set up the environment so imports work
+    # The notebooks assume sys.path.append(".." works to find 'uni'
+    # We are running this script likely from bindings/uni-db/examples or bindings/uni-db/
+    # Let's adjust cwd to the notebook directory to match its perspective
 
-        original_cwd = os.getcwd()
+    original_cwd = os.getcwd()
+    try:
         os.chdir(os.path.dirname(os.path.abspath(notebook_path)))
 
         exec_globals = {}
         exec(code, exec_globals)
 
-        os.chdir(original_cwd)
         print(f"SUCCESS: {notebook_path}")
         return True
     except Exception as e:
@@ -40,6 +39,8 @@ def run_notebook(notebook_path):
 
         traceback.print_exc()
         return False
+    finally:
+        os.chdir(original_cwd)
 
 
 def main():

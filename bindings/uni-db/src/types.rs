@@ -5,7 +5,7 @@
 
 use pyo3::IntoPyObjectExt;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::{PyDict, PyList, PySlice};
 use std::collections::HashMap;
 
 // ============================================================================
@@ -98,7 +98,21 @@ impl PyQueryResult {
         self.rows.len()
     }
 
-    fn __getitem__(&self, py: Python<'_>, idx: isize) -> PyResult<Py<PyAny>> {
+    fn __getitem__(&self, py: Python<'_>, key: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        if let Ok(slice) = key.downcast::<PySlice>() {
+            let indices = slice.indices(self.rows.len() as isize)?;
+            let mut items: Vec<Py<PyAny>> = Vec::new();
+            let mut i = indices.start;
+            while (indices.step > 0 && i < indices.stop)
+                || (indices.step < 0 && i > indices.stop)
+            {
+                items.push(self.rows[i as usize].clone_ref(py));
+                i += indices.step;
+            }
+            let list = PyList::new(py, items.iter().map(|r| r.bind(py)))?;
+            return Ok(list.into_any().unbind());
+        }
+        let idx: isize = key.extract()?;
         let len = self.rows.len() as isize;
         let actual = if idx < 0 { len + idx } else { idx };
         if actual < 0 || actual >= len {
@@ -2646,17 +2660,15 @@ impl PyRow {
         self.columns.clone()
     }
 
-    /// Get value by column name.
-    fn get(&self, py: Python<'_>, column: &str) -> PyResult<Py<PyAny>> {
+    /// Get value by column name, returning *default* if absent.
+    #[pyo3(signature = (column, default=None))]
+    fn get(&self, py: Python<'_>, column: &str, default: Option<Py<PyAny>>) -> Py<PyAny> {
         for (i, col) in self.columns.iter().enumerate() {
             if col == column {
-                return Ok(self.values[i].clone_ref(py));
+                return self.values[i].clone_ref(py);
             }
         }
-        Err(pyo3::exceptions::PyKeyError::new_err(format!(
-            "Column '{}' not found",
-            column
-        )))
+        default.unwrap_or_else(|| py.None())
     }
 
     /// Convert to a plain Python dict.
@@ -2679,7 +2691,15 @@ impl PyRow {
             }
             Ok(self.values[actual as usize].clone_ref(py))
         } else if let Ok(col) = key.extract::<String>() {
-            self.get(py, &col)
+            for (i, c) in self.columns.iter().enumerate() {
+                if *c == col {
+                    return Ok(self.values[i].clone_ref(py));
+                }
+            }
+            Err(pyo3::exceptions::PyKeyError::new_err(format!(
+                "Column '{}' not found",
+                col
+            )))
         } else {
             Err(pyo3::exceptions::PyTypeError::new_err(
                 "Row indices must be integers or column name strings",

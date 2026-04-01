@@ -1135,6 +1135,7 @@ fn build_assume_block(pair: Pair<LocyRule>) -> Result<AssumeBlock, ParseError> {
 
 fn build_assume_body(pair: Pair<LocyRule>) -> Result<Vec<LocyStatement>, ParseError> {
     // assume_body = { "{" ~ locy_clause+ ~ "}" | locy_clause }
+    // Handles all locy_clause variants, mirroring build_locy_statement_block.
     let mut statements = Vec::new();
     let mut cypher_clause_texts: Vec<String> = Vec::new();
 
@@ -1152,6 +1153,22 @@ fn build_assume_body(pair: Pair<LocyRule>) -> Result<Vec<LocyStatement>, ParseEr
                 LocyRule::goal_query => {
                     flush_cypher_clauses(&mut cypher_clause_texts, &mut statements)?;
                     statements.push(LocyStatement::GoalQuery(build_goal_query(inner)?));
+                }
+                LocyRule::derive_command => {
+                    flush_cypher_clauses(&mut cypher_clause_texts, &mut statements)?;
+                    statements.push(LocyStatement::DeriveCommand(build_derive_command(inner)?));
+                }
+                LocyRule::assume_block => {
+                    flush_cypher_clauses(&mut cypher_clause_texts, &mut statements)?;
+                    statements.push(LocyStatement::AssumeBlock(build_assume_block(inner)?));
+                }
+                LocyRule::abduce_query => {
+                    flush_cypher_clauses(&mut cypher_clause_texts, &mut statements)?;
+                    statements.push(LocyStatement::AbduceQuery(build_abduce_query(inner)?));
+                }
+                LocyRule::explain_rule_query => {
+                    flush_cypher_clauses(&mut cypher_clause_texts, &mut statements)?;
+                    statements.push(LocyStatement::ExplainRule(build_explain_rule_query(inner)?));
                 }
                 _ => {
                     // Treat as Cypher

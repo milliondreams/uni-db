@@ -1,7 +1,7 @@
 # Uni — Complete Rust Public API Reference
 
 **Source-verified: March 2026**
-**Crate:** `uni-db` v0.3.0
+**Crate:** `uni-db` v1.0.0
 
 This document catalogs every public type, method, and field in the Uni Rust API. It is organized by the three core scoping concepts: **Uni** (lifecycle & admin), **Session** (read scope), and **Transaction** (write scope), with supporting types following.
 

@@ -43,6 +43,9 @@ def _as_str(name: str, value: object) -> str:
 def _as_list(name: str, value: object) -> list[object]:
     if isinstance(value, list):
         return value
+    # Accept QueryResult and other sequence-like objects from the bindings.
+    if hasattr(value, "__len__") and hasattr(value, "__iter__"):
+        return list(value)
     raise AssertionError(f"Expected '{name}' to be a list, got {type(value).__name__}.")
 
 

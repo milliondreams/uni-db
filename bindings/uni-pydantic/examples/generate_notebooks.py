@@ -3,19 +3,19 @@
 
 import json
 import os
-import uuid
+import hashlib
 
 
-def generate_cell_id():
-    """Generate a unique cell ID."""
-    return str(uuid.uuid4()).replace("-", "")[:32]
+def _cell_id(notebook_key: str, index: int, cell_type: str) -> str:
+    """Generate a deterministic cell ID from notebook key, index, and type."""
+    raw = f"{notebook_key}:{index}:{cell_type}".encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()[:32]
 
 
-def create_notebook(cells):
+def create_notebook(notebook_key, cells):
     """Create a notebook structure with cells."""
-    for cell in cells:
-        if "id" not in cell:
-            cell["id"] = generate_cell_id()
+    for i, cell in enumerate(cells):
+        cell["id"] = _cell_id(notebook_key, i, cell["cell_type"])
     return {
         "cells": cells,
         "metadata": {
@@ -42,7 +42,6 @@ def create_notebook(cells):
 def md_cell(source):
     """Create a markdown cell."""
     return {
-        "id": generate_cell_id(),
         "cell_type": "markdown",
         "metadata": {},
         "source": [line + "\n" for line in source],
@@ -52,7 +51,6 @@ def md_cell(source):
 def code_cell(source):
     """Create a code cell."""
     return {
-        "id": generate_cell_id(),
         "cell_type": "code",
         "execution_count": None,
         "metadata": {},
@@ -98,6 +96,7 @@ def db_setup(name):
 # 1. Supply Chain Notebook
 # =============================================================================
 supply_chain_nb = create_notebook(
+    "supply_chain",
     [
         md_cell(
             [
@@ -365,6 +364,7 @@ supply_chain_nb = create_notebook(
 # 2. Recommendation Notebook
 # =============================================================================
 rec_nb = create_notebook(
+    "recommendation",
     [
         md_cell(
             [
@@ -591,6 +591,7 @@ rec_nb = create_notebook(
 # 3. RAG Notebook
 # =============================================================================
 rag_nb = create_notebook(
+    "rag",
     [
         md_cell(
             [
@@ -844,6 +845,7 @@ rag_nb = create_notebook(
 # 4. Fraud Detection Notebook
 # =============================================================================
 fraud_nb = create_notebook(
+    "fraud_detection",
     [
         md_cell(
             [
@@ -1093,6 +1095,7 @@ fraud_nb = create_notebook(
 # 5. Sales Analytics Notebook
 # =============================================================================
 sales_nb = create_notebook(
+    "sales_analytics",
     [
         md_cell(
             [

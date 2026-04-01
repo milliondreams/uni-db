@@ -1120,6 +1120,7 @@ fn numeric_promotion(left: &DataType, right: &DataType) -> DataType {
 /// - Literal values
 /// - Parameter references ($param)
 /// - Literal lists
+/// - Literal maps ({key: value, ...})
 pub(crate) fn evaluate_simple_expr(
     expr: &Expr,
     params: &HashMap<String, Value>,
@@ -1137,6 +1138,14 @@ pub(crate) fn evaluate_simple_expr(
                 .map(|item| evaluate_simple_expr(item, params))
                 .collect::<DFResult<_>>()?;
             Ok(Value::List(values))
+        }
+
+        Expr::Map(entries) => {
+            let map: HashMap<String, Value> = entries
+                .iter()
+                .map(|(k, v)| evaluate_simple_expr(v, params).map(|val| (k.clone(), val)))
+                .collect::<DFResult<_>>()?;
+            Ok(Value::Map(map))
         }
 
         _ => Err(datafusion::error::DataFusionError::Execution(format!(

@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "uni-docs"
-version = "0.1.18"
+version = "1.0.0"
 description = "Documentation site for Uni — Reasoning and Memory Infrastructure for Intelligent Systems"
 authors = ["Dragonscale Industries Inc. <dev@dragonscale.ai>"]
 readme = "README.md"

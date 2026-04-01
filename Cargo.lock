@@ -10640,7 +10640,7 @@ checksum = "eeba86d422ce181a719445e51872fa30f1f7413b62becb52e95ec91aa262d85c"
 
 [[package]]
 name = "uni-algo"
-version = "0.3.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -10659,7 +10659,7 @@ dependencies = [
 
 [[package]]
 name = "uni-cli"
-version = "0.3.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -10677,7 +10677,7 @@ dependencies = [
 
 [[package]]
 name = "uni-common"
-version = "0.3.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "arrow-schema",
@@ -10696,7 +10696,7 @@ dependencies = [
 
 [[package]]
 name = "uni-crdt"
-version = "0.3.0"
+version = "1.0.0"
 dependencies = [
  "fxhash",
  "proptest",
@@ -10709,7 +10709,7 @@ dependencies = [
 
 [[package]]
 name = "uni-cypher"
-version = "0.3.0"
+version = "1.0.0"
 dependencies = [
  "pest",
  "pest_derive",
@@ -10720,7 +10720,7 @@ dependencies = [
 
 [[package]]
 name = "uni-db"
-version = "0.3.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -10762,7 +10762,7 @@ dependencies = [
 
 [[package]]
 name = "uni-locy"
-version = "0.3.0"
+version = "1.0.0"
 dependencies = [
  "thiserror 1.0.69",
  "tokio",
@@ -10772,7 +10772,7 @@ dependencies = [
 
 [[package]]
 name = "uni-locy-tck"
-version = "0.3.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10798,7 +10798,7 @@ dependencies = [
 
 [[package]]
 name = "uni-python"
-version = "0.3.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -10817,7 +10817,7 @@ dependencies = [
 
 [[package]]
 name = "uni-query"
-version = "0.3.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -10861,7 +10861,7 @@ dependencies = [
 
 [[package]]
 name = "uni-store"
-version = "0.3.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -10898,7 +10898,7 @@ dependencies = [
 
 [[package]]
 name = "uni-tck"
-version = "0.3.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-trait",

@@ -1,7 +1,7 @@
 # uni-pydantic — Complete API Reference
 
 **Source-verified: March 2026**
-**Package:** `uni-pydantic` v0.3.0
+**Package:** `uni-pydantic` v1.0.0
 
 uni-pydantic is a Pydantic v2-based Object-Graph Mapping (OGM) layer for the Uni graph database. It provides type-safe model definitions, automatic schema generation, a query builder DSL, lifecycle hooks, and full async support.
 

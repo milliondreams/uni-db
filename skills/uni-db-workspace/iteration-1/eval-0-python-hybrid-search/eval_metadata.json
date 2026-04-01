@@ -1,0 +1,37 @@
+{
+  "eval_id": 0,
+  "eval_name": "python-hybrid-search",
+  "prompt": "Write a Python script that creates a uni-db, defines a schema for a document store with vector and full-text indexes, ingests sample documents with embeddings, and performs hybrid search combining vector similarity with BM25 full-text search.",
+  "assertions": [
+    {
+      "id": "db-creation",
+      "text": "Uses Uni.open(), Uni.create(), Uni.temporary(), or UniBuilder to create a database instance",
+      "type": "code_pattern"
+    },
+    {
+      "id": "vector-index-schema",
+      "text": "Schema definition includes a vector() call with dimension and metric parameters (e.g., .vector('embedding', 384, 'cosine'))",
+      "type": "code_pattern"
+    },
+    {
+      "id": "fulltext-index",
+      "text": "Creates a full-text/BM25 index via schema builder or Cypher DDL (CREATE FULLTEXT INDEX or .index() on a text property)",
+      "type": "code_pattern"
+    },
+    {
+      "id": "transaction-writes",
+      "text": "Uses Transaction (via session.tx() or context manager) for data ingestion, not direct session writes",
+      "type": "code_pattern"
+    },
+    {
+      "id": "hybrid-search-api",
+      "text": "Uses CALL uni.search, similar_to() with multiple sources, or combines uni.vector.query + uni.fts.query for hybrid search",
+      "type": "code_pattern"
+    },
+    {
+      "id": "correct-imports",
+      "text": "Import statements reference actual uni_db module names (e.g., from uni_db import Uni, DataType, not hallucinated module paths)",
+      "type": "code_pattern"
+    }
+  ]
+}

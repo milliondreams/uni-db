@@ -1,0 +1,38 @@
+{
+  "eval_id": 0,
+  "eval_name": "python-hybrid-search",
+  "configuration": "with_skill",
+  "expectations": [
+    {
+      "text": "Uses Uni.open(), Uni.create(), Uni.temporary(), Uni.in_memory(), or UniBuilder to create a database instance",
+      "passed": true,
+      "evidence": "db = Uni.in_memory() (line 206)"
+    },
+    {
+      "text": "Schema definition includes a vector() call with dimension and metric parameters (e.g., .vector('embedding', 384, 'cosine')) OR creates a vector index via Cypher DDL (CREATE VECTOR INDEX)",
+      "passed": true,
+      "evidence": ".vector(\"embedding\", EMBEDDING_DIM) in schema builder (line 216), plus CREATE VECTOR INDEX doc_embed FOR (d:Document) ON (d.embedding) OPTIONS { type: 'hnsw', metric: 'cosine' } via Cypher DDL (lines 225-228)"
+    },
+    {
+      "text": "Creates a full-text/BM25 index via schema builder or Cypher DDL (CREATE FULLTEXT INDEX or .index() on a text property)",
+      "passed": true,
+      "evidence": "CREATE FULLTEXT INDEX doc_fts FOR (d:Document) ON (d.content) via Cypher DDL (lines 233-235)"
+    },
+    {
+      "text": "Uses Transaction (via session.tx() or context manager) for data ingestion, not direct session writes",
+      "passed": true,
+      "evidence": "with session.tx() as tx: used for all data ingestion (lines 224, 244, 415)"
+    },
+    {
+      "text": "Uses CALL uni.search, similar_to() with multiple sources, or combines uni.vector.query + uni.fts.query for hybrid search",
+      "passed": true,
+      "evidence": "Uses all three: CALL uni.search('Document', {vector: 'embedding', fts: 'content'}, ...) (line 321), similar_to([d.embedding, d.content], [$query_vector, $query_text], {method: 'weighted', weights: [0.6, 0.4]}) (lines 397-401), and CALL uni.vector.query + CALL uni.fts.query (lines 286, 303)"
+    },
+    {
+      "text": "Import statements reference actual uni_db module names (e.g., from uni_db import Uni, DataType, not hallucinated module paths)",
+      "passed": true,
+      "evidence": "from uni_db import Uni, DataType (line 13)"
+    }
+  ],
+  "pass_rate": 1.0
+}

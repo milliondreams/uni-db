@@ -1,0 +1,42 @@
+{
+  "eval_id": 1,
+  "eval_name": "locy-risk-propagation",
+  "prompt": "Write Locy rules for transitive risk propagation in a supply chain network using MNOR to combine probabilities, then write the Python code to create the rules, seed base facts via Cypher, run a QUERY, and print the results.",
+  "assertions": [
+    {
+      "id": "create-rule-syntax",
+      "text": "Uses CREATE RULE ... AS syntax (not Datalog-style :- notation or other formats)",
+      "type": "code_pattern"
+    },
+    {
+      "id": "is-references",
+      "text": "Uses IS references (e.g., 'risk IS propagated_risk') for recursive rule composition",
+      "type": "code_pattern"
+    },
+    {
+      "id": "yield-key-prob",
+      "text": "YIELD clause includes KEY designation for grouping columns and PROB for probability column",
+      "type": "code_pattern"
+    },
+    {
+      "id": "fold-mnor",
+      "text": "Uses FOLD with MNOR (monotonic noisy-or) for combining probabilities across paths",
+      "type": "code_pattern"
+    },
+    {
+      "id": "locy-builder-api",
+      "text": "Python code uses session.locy() or tx.locy() builder pattern to create rules and run queries",
+      "type": "code_pattern"
+    },
+    {
+      "id": "cypher-seed-data",
+      "text": "Seeds base facts via Cypher CREATE statements in a Transaction (creates nodes and edges with risk properties)",
+      "type": "code_pattern"
+    },
+    {
+      "id": "query-command",
+      "text": "Uses QUERY command (not just DERIVE or bare rule name) to retrieve results from Locy rules",
+      "type": "code_pattern"
+    }
+  ]
+}

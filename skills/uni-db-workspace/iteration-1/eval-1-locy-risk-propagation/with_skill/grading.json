@@ -1,0 +1,43 @@
+{
+  "eval_id": 1,
+  "eval_name": "locy-risk-propagation",
+  "configuration": "with_skill",
+  "expectations": [
+    {
+      "text": "Uses CREATE RULE ... AS syntax (not Datalog-style :- notation or other formats)",
+      "passed": true,
+      "evidence": "CREATE RULE supplier_risk AS, CREATE RULE chain_risk AS, CREATE RULE safe_node AS — all rules use correct syntax"
+    },
+    {
+      "text": "Uses IS references (e.g., 'risk IS propagated_risk' or 'mid IS supply_risk TO b') for recursive rule composition",
+      "passed": true,
+      "evidence": "WHERE s IS supplier_risk, WHERE m IS chain_risk, WHERE d IS chain_risk, WHERE m IS NOT chain_risk, WHERE d IS NOT chain_risk, WHERE r IS NOT chain_risk"
+    },
+    {
+      "text": "YIELD clause includes KEY designation for grouping columns and PROB for probability column",
+      "passed": true,
+      "evidence": "YIELD KEY s, risk PROB — and similarly YIELD KEY m, exposure PROB / YIELD KEY d, exposure PROB / YIELD KEY r, exposure PROB / YIELD KEY m, 1.0 AS safety PROB"
+    },
+    {
+      "text": "Uses FOLD with MNOR (monotonic noisy-or) for combining probabilities across paths",
+      "passed": true,
+      "evidence": "FOLD risk = MNOR(sig.probability) and FOLD exposure = MNOR(risk * e.dependency) appear in multiple rules"
+    },
+    {
+      "text": "Python code uses session.locy() or tx.locy() builder pattern to create rules and run queries",
+      "passed": true,
+      "evidence": "result = session.locy(LOCY_PROGRAM)"
+    },
+    {
+      "text": "Seeds base facts via Cypher CREATE statements in a Transaction (creates nodes and edges with risk properties)",
+      "passed": true,
+      "evidence": "with session.tx() as tx: tx.execute(\"CREATE (:Supplier {name: 'ChipCo'})\") and tx.execute(\"CREATE (s)-[:SUPPLIES {dependency: 0.9}]->(m)\") etc."
+    },
+    {
+      "text": "Uses QUERY command (not just DERIVE or bare rule name) to retrieve results from Locy rules",
+      "passed": true,
+      "evidence": "QUERY supplier_risk / QUERY chain_risk / QUERY safe_node"
+    }
+  ],
+  "pass_rate": 1.0
+}

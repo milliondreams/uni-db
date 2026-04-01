@@ -1,12 +1,13 @@
 # Transactions & Consistency
 
-Uni provides ACID transactions with snapshot isolation. Reads see a consistent snapshot, and writes are applied atomically on commit. Uni uses a single-writer model for simplicity and predictable performance.
+Uni provides ACID transactions with snapshot isolation. Reads see a consistent snapshot, and writes are applied atomically on commit. Uni uses commit-time serialization for simplicity and predictable performance.
 
 ## What It Provides
 
 - Snapshot isolation for consistent reads.
-- Single writer with concurrent readers.
+- Commit-time serialization with concurrent transaction preparation.
 - WAL-backed durability for committed changes.
+- `CommitResult` type returned on successful commit with metadata.
 
 ## Example
 
@@ -16,8 +17,9 @@ Uni provides ACID transactions with snapshot isolation. Reads see a consistent s
 
     # async fn demo() -> Result<(), uni_db::UniError> {
     let db = Uni::open("./my_db").build().await?;
+    let session = db.session();
 
-    let mut tx = db.begin().await?;
+    let tx = session.tx().await?;
     tx.execute("CREATE (:User {email: 'a@b.com'})").await?;
     tx.commit().await?;
     # Ok(())
@@ -28,9 +30,10 @@ Uni provides ACID transactions with snapshot isolation. Reads see a consistent s
     ```python
     import uni_db
 
-    db = uni_db.Database("./my_db")
-    tx = db.begin()
-    tx.query("CREATE (:User {email: 'a@b.com'})")
+    db = uni_db.Uni.open("./my_db")
+    session = db.session()
+    tx = session.tx()
+    tx.execute("CREATE (:User {email: 'a@b.com'})")
     tx.commit()
     ```
 

@@ -88,7 +88,8 @@ Switch to Python to use Uni's [Locy](../locy/language-guide.md) reasoning engine
 ```python
 import uni_db
 
-db = uni_db.Database("/tmp/security-quickstart")
+db = uni_db.Uni.open("/tmp/security-quickstart")
+session = db.session()
 
 RULES = r'''
 CREATE RULE depends_on AS
@@ -124,9 +125,9 @@ program = RULES + r'''
 QUERY non_compliant WHERE s.name = s.name RETURN s.name AS service
 '''
 
-out = db.locy_evaluate(program)
+out = session.locy(program)
 
-for cmd in out["command_results"]:
+for cmd in out.command_results:
     if cmd.get("type") == "query":
         for row in cmd["rows"]:
             print(row["service"])
@@ -166,7 +167,7 @@ ASSUME {
 }
 '''
 
-out = db.locy_evaluate(program)
+out = session.locy(program)
 ```
 
 The `ASSUME` block creates a hypothetical world where `api.cve_score = 3.0`, evaluates the rules inside `THEN`, then **rolls back** the change. The result: `api` drops off the non-compliant list, but `db` remains — its own CVE score (8.4) still exceeds the threshold, and it's still transitively exposed.
@@ -176,7 +177,8 @@ The `ASSUME` block creates a hypothetical world where `api.cve_score = 3.0`, eva
     ```python
     import uni_db
 
-    db = uni_db.Database("/tmp/security-quickstart")
+    db = uni_db.Uni.open("/tmp/security-quickstart")
+    session = db.session()
 
     RULES = r'''
     CREATE RULE depends_on AS
@@ -217,8 +219,8 @@ The `ASSUME` block creates a hypothetical world where `api.cve_score = 3.0`, eva
     }
     '''
 
-    out = db.locy_evaluate(program)
-    for cmd in out["command_results"]:
+    out = session.locy(program)
+    for cmd in out.command_results:
         print(cmd.get("type"), cmd.get("rows", []))
     ```
 
@@ -235,9 +237,9 @@ program = RULES + r'''
 EXPLAIN RULE non_compliant WHERE s.name = 'db'
 '''
 
-out = db.locy_evaluate(program)
+out = session.locy(program)
 
-explain_cmd = next(cmd for cmd in out["command_results"] if cmd.get("type") == "explain")
+explain_cmd = next(cmd for cmd in out.command_results if cmd.get("type") == "explain")
 tree = explain_cmd["tree"]
 ```
 
@@ -255,7 +257,8 @@ This isn't a log or a confidence score — it's a formal proof trace. Every step
     import json
     import uni_db
 
-    db = uni_db.Database("/tmp/security-quickstart")
+    db = uni_db.Uni.open("/tmp/security-quickstart")
+    session = db.session()
 
     RULES = r'''
     CREATE RULE depends_on AS
@@ -291,8 +294,8 @@ This isn't a log or a confidence score — it's a formal proof trace. Every step
     EXPLAIN RULE non_compliant WHERE s.name = 'db'
     '''
 
-    out = db.locy_evaluate(program)
-    explain_cmd = next(cmd for cmd in out["command_results"] if cmd.get("type") == "explain")
+    out = session.locy(program)
+    explain_cmd = next(cmd for cmd in out.command_results if cmd.get("type") == "explain")
     print(json.dumps(explain_cmd["tree"], indent=2))
     ```
 
@@ -309,9 +312,9 @@ program = RULES + r'''
 ABDUCE NOT non_compliant WHERE s.name = 'db' RETURN s
 '''
 
-out = db.locy_evaluate(program)
+out = session.locy(program)
 
-abduce_cmd = next(cmd for cmd in out["command_results"] if cmd.get("type") == "abduce")
+abduce_cmd = next(cmd for cmd in out.command_results if cmd.get("type") == "abduce")
 modifications = abduce_cmd.get("modifications", [])
 ```
 
@@ -322,7 +325,8 @@ The engine searches backward from the goal (`NOT non_compliant`) and returns the
     ```python
     import uni_db
 
-    db = uni_db.Database("/tmp/security-quickstart")
+    db = uni_db.Uni.open("/tmp/security-quickstart")
+    session = db.session()
 
     RULES = r'''
     CREATE RULE depends_on AS
@@ -358,8 +362,8 @@ The engine searches backward from the goal (`NOT non_compliant`) and returns the
     ABDUCE NOT non_compliant WHERE s.name = 'db' RETURN s
     '''
 
-    out = db.locy_evaluate(program)
-    abduce_cmd = next(cmd for cmd in out["command_results"] if cmd.get("type") == "abduce")
+    out = session.locy(program)
+    abduce_cmd = next(cmd for cmd in out.command_results if cmd.get("type") == "abduce")
     for mod in abduce_cmd.get("modifications", []):
         print(mod)
     ```
@@ -400,4 +404,4 @@ You've touched all five cognitive pillars:
 
 **"No module named uni_db"** — Install the Python package: `pip install uni-db`.
 
-**"Locy returns no results"** — Ensure the graph data was created first (Step 1). Each `locy_evaluate()` call reads from the current graph state; if the graph is empty, rules derive nothing.
+**"Locy returns no results"** — Ensure the graph data was created first (Step 1). Each `session.locy()` call reads from the current graph state; if the graph is empty, rules derive nothing.

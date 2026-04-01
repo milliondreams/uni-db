@@ -310,16 +310,19 @@ Uni supports **schemaless properties** - properties not defined in the schema th
 db.schema().label("Document").apply().await?;
 
 // Create with arbitrary properties
-db.execute("CREATE (:Document {
+let session = db.session();
+let tx = session.tx();
+tx.execute("CREATE (:Document {
     title: 'Research Paper',
     author: 'Alice',
     tags: ['ml', 'nlp'],
     year: 2024,
     conference: 'NeurIPS'
 })").await?;
+tx.commit().await?;
 
 // Query works normally (automatic rewriting)
-let results = db.query("
+let results = session.query("
     MATCH (d:Document)
     WHERE d.author = 'Alice' AND d.year > 2023
     RETURN d.title, d.conference
@@ -337,13 +340,16 @@ db.schema()
     .apply().await?;
 
 // Create with schema + overflow properties
-db.execute("CREATE (:Person {
+let session = db.session();
+let tx = session.tx();
+tx.execute("CREATE (:Person {
     name: 'Bob',           -- Schema (typed column)
     email: 'bob@x.com',    -- Schema (typed column)
     city: 'NYC',           -- Overflow (overflow_json)
     github: 'bob123',      -- Overflow (overflow_json)
     verified: true         -- Overflow (overflow_json)
 })").await?;
+tx.commit().await?;
 ```
 
 ### Storage and Performance
@@ -429,7 +435,9 @@ db.schema()
     .apply().await?;
 
 // Create with overflow for optional metadata
-db.execute("CREATE (:Product {
+let session = db.session();
+let tx = session.tx();
+tx.execute("CREATE (:Product {
     name: 'Widget',
     price: 19.99,
     category: 'electronics',
@@ -438,6 +446,7 @@ db.execute("CREATE (:Product {
     warranty_months: 24,
     color: 'blue'
 })").await?;
+tx.commit().await?;
 ```
 
 #### Bad: Frequently-Queried Properties in Overflow
@@ -447,14 +456,17 @@ db.execute("CREATE (:Product {
 db.schema().label("Product").apply().await?;  // No properties
 
 // All properties in overflow (slow queries!)
-db.execute("CREATE (:Product {
+let session = db.session();
+let tx = session.tx();
+tx.execute("CREATE (:Product {
     name: 'Widget',     -- Should be schema property!
     price: 19.99,       -- Should be schema property!
     category: 'electronics'  -- Should be schema property!
 })").await?;
+tx.commit().await?;
 
 // This query will be slow (JSONB parsing for every row)
-db.query("
+session.query("
     MATCH (p:Product)
     WHERE p.price < 50 AND p.category = 'electronics'
     ORDER BY p.price
@@ -473,11 +485,13 @@ db.schema()
     .apply().await?;
 
 // Step 2: Backfill existing data (one-time operation)
-db.execute("
+let tx = session.tx();
+tx.execute("
     MATCH (p:Product)
     WHERE p.manufacturer IS NOT NULL
     SET p.manufacturer = p.manufacturer
 ").await?;
+tx.commit().await?;
 
 // Future writes automatically use typed column
 ```
@@ -495,17 +509,20 @@ db.schema()
 
 db.schema()
     .properties("KNOWS")
-    .property("since", DataType::Int)
+    .property("since", DataType::Int32)
     .apply().await?;
 
 // Create with overflow edge properties
-db.execute("CREATE
+let session = db.session();
+let tx = session.tx();
+tx.execute("CREATE
     (a:Person {name: 'Alice'})-[:KNOWS {
         since: 2020,         -- Schema property
         context: 'work',     -- Overflow property
         strength: 0.9        -- Overflow property
     }]->(b:Person {name: 'Bob'})
 ").await?;
+tx.commit().await?;
 ```
 
 ### Null Handling

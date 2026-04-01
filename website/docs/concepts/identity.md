@@ -233,32 +233,11 @@ pub enum Direction {
 
 ## ID Allocation
 
-IDs are allocated by the `IdAllocator`, which is backed by the object store for durability:
-
-```rust
-pub struct IdAllocator {
-    path: PathBuf,
-    store: Arc<dyn ObjectStore>,
-    state: Arc<Mutex<AllocatorState>>,
-    batch_size: usize,  // Pre-allocate IDs in batches
-}
-
-impl IdAllocator {
-    /// Allocate a new VID for a label (async, object-store backed)
-    pub async fn allocate_vid(&self, label_id: u16) -> Result<Vid>;
-
-    /// Allocate a new EID for an edge type
-    pub async fn allocate_eid(&self, type_id: u16) -> Result<Eid>;
-
-    /// Persist current state to object store
-    pub async fn persist(&self) -> Result<()>;
-}
-```
+IDs are allocated internally by the `IdAllocator`. This is an internal component not exposed in the user-facing API -- VIDs and EIDs are assigned automatically when vertices and edges are created via Cypher `CREATE` statements or the bulk writer.
 
 **Allocation Properties:**
 - Object-store backed for durability (S3, GCS, local filesystem)
-- Async API with `Result<Vid>` return type
-- Batch allocation for performance (configurable `batch_size`)
+- Batch allocation for performance (configurable batch size)
 - Manifest-based persistence for recovery
 - Sequential within each label/type
 - Never reuses IDs (even after deletes)

@@ -32,6 +32,12 @@ A balanced tree data structure for ordered data. Used for range queries (`<`, `>
 
 ## C
 
+### CommitResult
+Returned by `Transaction.commit()`. Contains the mutation count, database version, WAL LSN, and commit duration.
+
+### CommitStream
+Async stream of commit notifications. Created via `session.watch()`. Allows reactive patterns where consumers are notified whenever a new version is committed.
+
 ### Compaction
 The process of merging multiple data files into fewer, larger files. In Uni, L1 runs are compacted into L2. See [Storage Engine](../internals/storage-engine.md).
 
@@ -180,6 +186,9 @@ An open standard for the Cypher query language. Uni implements a substantial sub
 
 ## P
 
+### Prepared Statement
+A pre-parsed and pre-planned query for repeated execution with different parameters. Created via `session.prepare()` (Cypher) or `session.prepare_locy()` (Locy). Avoids re-parsing and re-planning overhead on each invocation.
+
 ### Predicate Pushdown
 An optimization that pushes filter conditions down to the storage layer. Reduces I/O by filtering at scan time rather than after loading. See [Query Planning](../internals/query-planning.md).
 
@@ -203,6 +212,9 @@ The sequence of operations that will execute a query. Includes logical plan (wha
 
 ## R
 
+### RuleRegistry
+Session-scoped or transaction-scoped store of pre-compiled Locy rules. Accessed via `session.rules()`. Rules registered in the registry are available to all Locy evaluations within that session without re-compilation.
+
 ### RecordBatch
 An Apache Arrow data structure containing a batch of columnar data with a shared schema. The fundamental data unit in vectorized execution.
 
@@ -212,6 +224,15 @@ See [Edge](#edge).
 ---
 
 ## S
+
+### Session
+The primary read scope for all database access. Created via `db.session()`. Cheap, sync, and `Arc`-based — sessions can be cloned and shared across threads. All queries, Locy evaluations, and transaction creation go through a session.
+
+### SessionHook
+A trait for intercepting query and commit events. Registered via `session.add_hook()`. Hooks receive callbacks before/after queries and commits, enabling logging, metrics, and custom middleware patterns.
+
+### SessionTemplate
+A pre-configured session factory for repeated session creation with identical parameters, rules, and hooks. Useful when many sessions share the same configuration.
 
 ### Schema
 The structure definition for a graph, including:
@@ -235,6 +256,9 @@ A concurrency model where each reader sees a consistent snapshot. Readers don't 
 ---
 
 ## T
+
+### Transaction
+An explicit write scope with ACID guarantees. Created via `session.tx()`. Each transaction owns a private L0 buffer and uses commit-time serialization — writes accumulate without holding a global lock, and conflicts are detected at commit time.
 
 ### Tombstone
 A marker indicating deleted data. Soft deletes mark rows as deleted; compaction removes tombstoned data.
@@ -274,6 +298,9 @@ A 64-bit identifier for vertices. Encoded as `label_id (16 bits) | local_offset 
 
 ### WAL (Write-Ahead Log)
 A durability mechanism that logs mutations before applying them. Enables recovery after crashes.
+
+### WriteLease
+A coordination mechanism for multi-agent database access. Ensures only one writer can commit at a time in distributed or multi-process deployments. Variants include `Local` (in-process mutex), `DynamoDB` (distributed lock via AWS DynamoDB), and `Custom` (user-provided implementation).
 
 ### UniId
 A content-addressed identifier using SHA3-256 hash (32 bytes). Used for provenance tracking and distributed synchronization with CRDT systems. See [Identity Model](../concepts/identity.md).

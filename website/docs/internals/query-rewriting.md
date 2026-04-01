@@ -324,14 +324,15 @@ Test semantic equivalence:
 #[tokio::test]
 async fn test_semantic_equivalence() {
     let db = setup_test_db().await?;
+    let session = db.session();
 
     // Query with function (will be rewritten)
-    let result_function = db.query(
+    let result_function = session.query(
         "MATCH (n) WHERE myFunc(n, 'prop', 42) RETURN count(*)"
     ).await?;
 
     // Query with explicit predicate (baseline)
-    let result_predicate = db.query(
+    let result_predicate = session.query(
         "MATCH (n) WHERE n.prop >= 42 RETURN count(*)"
     ).await?;
 

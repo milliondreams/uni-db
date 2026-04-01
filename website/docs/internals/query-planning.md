@@ -2,6 +2,9 @@
 
 This document describes how Uni transforms Cypher queries into optimized physical execution plans. The query planner is responsible for parsing, semantic analysis, optimization, and code generation.
 
+!!! note "Conceptual Overview"
+    The AST, logical plan, and physical plan diagrams in this document are **conceptual representations** of the planning pipeline. The actual implementation uses DataFusion's logical and physical planning infrastructure, so the concrete struct and enum names may differ from what is shown here. The optimization principles (predicate pushdown, projection pushdown, scan-to-index, etc.) are accurate.
+
 ## Planning Pipeline Overview
 
 ```mermaid

@@ -133,4 +133,4 @@ See the [Vector Search guide](../../guides/vector-search.md#similar_to-expressio
 ## Related
 
 - [Rule Semantics](../rule-semantics.md)
-- [Internals: Native Execution](../../internals/locy/native-execution.md)
+- [Internals: Architecture](../../internals/locy/architecture.md)

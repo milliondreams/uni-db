@@ -37,7 +37,7 @@ class Knows(UniEdge):
     since: int
 
 # Connect and sync schema
-db = uni_db.Database("./my_graph")
+db = uni_db.Uni.open("./my_graph")
 session = UniSession(db)
 session.register(Person, Knows)
 session.sync_schema()
@@ -247,7 +247,7 @@ Session for database operations.
 from uni_pydantic import UniSession
 import uni_db
 
-db = uni_db.Database("./my_graph")
+db = uni_db.Uni.open("./my_graph")
 session = UniSession(db)
 ```
 
@@ -548,7 +548,7 @@ class Follows(UniEdge):
     since: date
 
 # Usage
-db = uni_db.Database("./social_graph")
+db = uni_db.Uni.open("./social_graph")
 session = UniSession(db)
 session.register(User, Post, Follows)
 session.sync_schema()

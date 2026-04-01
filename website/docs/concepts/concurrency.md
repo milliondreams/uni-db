@@ -1,6 +1,6 @@
 # Concurrency Model
 
-Uni uses a single-writer, multi-reader concurrency model with snapshot-based isolation. This design provides simplicity, consistency, and predictable performance without the complexity of distributed consensus.
+Uni uses a commit-time serialization model with snapshot-based isolation. Multiple sessions and transactions can coexist, each with its own plan cache and private write buffers. A writer lock is acquired only at commit time, allowing concurrent transaction preparation while serializing the actual commits.
 
 ## Design Philosophy
 
@@ -8,14 +8,15 @@ Traditional distributed databases require complex consensus protocols (Raft, Pax
 
 | Traditional Distributed | Uni's Approach |
 |------------------------|----------------|
-| Multiple writers | Single writer |
+| Multiple writers | Commit-time serialization |
 | Network consensus | Local coordination |
 | Eventual consistency | Snapshot isolation |
-| Complex conflict resolution | No conflicts by design |
+| Complex conflict resolution | Serialized commits |
 | Operational complexity | Embedded simplicity |
 
 This model is ideal for:
 - Embedded databases in applications
+- Multi-session workloads (each session has its own plan cache)
 - Batch processing pipelines
 - Single-node analytics workloads
 - Development and testing environments
@@ -50,44 +51,50 @@ flowchart TB
 
 ---
 
-## Single Writer
+## Sessions and Transactions
 
-### Exclusive Write Access
+### Multi-Session Architecture
 
-Only one writer can modify the database at a time:
+Multiple sessions can coexist, each with its own plan cache. Sessions are created from the `Uni` instance:
 
 ```rust
-pub struct Writer {
-    l0_manager: Arc<L0Manager>,      // Exclusive L0 access
-    storage: Arc<StorageManager>,     // Storage coordination
-    allocator: Arc<IdAllocator>,      // ID allocation
-    // ...
-}
+let db = Uni::open("./my_db").build().await?;
+let session = db.session();              // Each session has its own plan cache
+let tx = session.tx().await?;            // Start a transaction
+tx.execute("CREATE (:User {name: 'Alice'})").await?;
+tx.commit().await?;                      // Writer lock acquired here
 ```
 
-### Write Flow
+### Commit-Time Serialization
+
+Multiple transactions can prepare writes concurrently in their private L0 buffers. The writer lock is only acquired at commit time:
 
 ```mermaid
 flowchart TB
-    A["1. Application calls<br/>writer.insert_vertex(vid, props)"]
-    B["2. Acquire write lock<br/>on L0 buffer (Mutex)"]
-    C["3. Append to WAL<br/>(durability)"]
-    D["4. Insert into L0 buffer<br/>(in-memory graph + properties)"]
-    E["5. Increment version counter"]
-    F["6. Release lock,<br/>return to application"]
+    A["1. Application calls<br/>tx.execute(mutation)"]
+    B["2. Write to private<br/>L0 buffer (no lock)"]
+    C["3. On tx.commit():<br/>acquire writer lock"]
+    D["4. Merge private buffer<br/>into shared storage"]
+    E["5. Append to WAL<br/>(durability)"]
+    F["6. Release writer lock,<br/>return CommitResult"]
 
     A --> B --> C --> D --> E --> F
 ```
 
-### Why Single Writer?
+### Why Commit-Time Serialization?
 
 | Benefit | Explanation |
 |---------|-------------|
-| **No conflicts** | Writes are serialized, no concurrent modification issues |
+| **Concurrent preparation** | Multiple transactions can prepare writes in parallel |
+| **No conflicts** | Commits are serialized, no concurrent modification issues |
 | **Simple recovery** | WAL replay is deterministic |
-| **Predictable latency** | No lock contention or retry loops |
-| **Easier reasoning** | No need to reason about interleaved operations |
+| **Predictable latency** | No lock contention during write preparation |
+| **Easier reasoning** | No need to reason about interleaved commits |
 | **Efficient batching** | Buffer many writes before flush |
+
+### WriteLease
+
+For distributed or multi-agent deployments, Uni supports a `WriteLease` mechanism to coordinate write access across processes. This ensures only one process holds the write lease at a time, preventing conflicting commits from separate instances.
 
 ---
 

@@ -1,26 +1,51 @@
 # Locy Python API Integration
 
+## Setup
+
+All Locy operations go through a **Session** (sync) or **AsyncSession** (async), created from a `Uni` instance:
+
+```python
+import uni_db
+
+db = uni_db.Uni.open("./my-graph")   # or Uni.temporary() for in-memory
+session = db.session()
+```
+
 ## Sync API
 
 ```python
-out = db.locy_evaluate(program)
+out = session.locy(program)
+```
+
+With parameters:
+
+```python
+out = session.locy(program, {"threshold": 0.5})
 ```
 
 ## Async API
 
 ```python
-out = await adb.locy_evaluate(program)
+out = await session.locy(program)
 ```
 
-## Optional Config
+With parameters:
 
 ```python
-out = db.locy_evaluate(
-    program,
-    {
-        # Evaluation limits
-        "max_iterations": 500,
-        "timeout": 60.0,
+out = await session.locy(program, {"threshold": 0.5})
+```
+
+## Fluent Builder (`SessionLocyBuilder`)
+
+For advanced configuration, use the builder API:
+
+```python
+out = (
+    session.locy_with(program)
+    .param("threshold", 0.5)
+    .timeout(60.0)
+    .max_iterations(500)
+    .with_config({
         "max_explain_depth": 50,
         "max_slg_depth": 500,
         "max_abduce_candidates": 30,
@@ -28,23 +53,60 @@ out = db.locy_evaluate(
         "max_derived_bytes": 64 * 1024 * 1024,
         "deterministic_best_by": True,
         # Probabilistic reasoning
-        "strict_probability_domain": True,   # Error on values outside [0, 1] instead of clamping
-        "probability_epsilon": 1e-15,        # MPROD log-space threshold
-        "exact_probability": True,           # Enable BDD-based exact evaluation for shared-proof groups
-        "max_bdd_variables": 1000,           # Per-group BDD variable cap before fallback
-    },
+        "strict_probability_domain": True,
+        "probability_epsilon": 1e-15,
+        "exact_probability": True,
+        "max_bdd_variables": 1000,
+        "top_k_proofs": 100,
+    })
+    .run()
 )
 ```
 
-## Return Contract
+Builder methods:
 
-Returned dict includes:
+| Method | Description |
+|--------|-------------|
+| `.param(name, value)` | Add a named parameter |
+| `.params(dict)` | Add multiple parameters |
+| `.timeout(seconds)` | Set evaluation timeout |
+| `.max_iterations(n)` | Set recursion iteration cap |
+| `.with_config(dict)` | Set full `LocyConfig` options |
+| `.cancellation_token(token)` | Attach a cancellation token |
+| `.run()` | Execute and return `LocyResult` |
 
-- `derived`: `dict[str, list[dict]]` — facts derived by each rule (keyed by rule name)
-- `stats`: `LocyStats` — iteration counts, timing, stratum info
-- `command_results`: `list[dict]` — output rows from `QUERY`, `ABDUCE`, `EXPLAIN RULE`
-- `warnings`: `list[dict]` — runtime warnings (e.g., `SharedProbabilisticDependency`)
-- `approximate_groups`: `dict[str, list[str]]` — rule/key groups that fell back to approximate probability mode
+## Compile-Only Check
+
+Validate a program without evaluating it:
+
+```python
+compiled = session.compile_locy(program)
+print(compiled.num_strata, compiled.num_rules, compiled.rule_names)
+```
+
+## Return Contract (`LocyResult`)
+
+`LocyResult` is a class with the following attributes:
+
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| `derived` | `dict[str, list[dict]]` | Facts derived by each rule (keyed by rule name) |
+| `stats` | `LocyStats` | Iteration counts, timing, stratum info |
+| `command_results` | `list[dict]` | Output rows from `QUERY`, `ABDUCE`, `EXPLAIN RULE` |
+| `warnings` | `list[dict]` | Runtime warnings (e.g., `SharedProbabilisticDependency`) |
+| `approximate_groups` | `dict[str, list[str]]` | Rule/key groups that fell back to approximate probability mode |
+| `derived_fact_set` | `DerivedFactSet` | Opaque fact set for `tx.apply()` materialization |
+
+Helper methods:
+
+| Method | Description |
+|--------|-------------|
+| `.has_warning(code)` | Check if a specific warning code is present |
+| `.warnings_list()` | Get all warnings |
+| `.derived_facts(rule)` | Get derived facts for a specific rule |
+| `.rows()` | Get query result rows (from first `QUERY` command) |
+| `.columns()` | Get query result column names |
+| `.iterations` | Number of fixpoint iterations performed |
 
 ### Warnings
 
@@ -73,17 +135,17 @@ Rows from approximate groups are marked with `_approximate = True` in the derive
 ### Checking Warnings
 
 ```python
-out = db.locy_evaluate(program)
+out = session.locy(program)
 
-if out["warnings"]:
-    for w in out["warnings"]:
+if out.warnings:
+    for w in out.warnings:
         print(f"[{w['code']}] {w['message']}")
 
 # Check for a specific warning code
-has_shared = any(w["code"] == "SharedProbabilisticDependency" for w in out["warnings"])
+has_shared = out.has_warning("SharedProbabilisticDependency")
 
 # Inspect which groups are approximate
-for rule, groups in out["approximate_groups"].items():
+for rule, groups in out.approximate_groups.items():
     print(f"Rule '{rule}' has approximate groups: {groups}")
 ```
 

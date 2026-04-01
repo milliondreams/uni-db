@@ -17,8 +17,9 @@ Uni executes filters, projections, and aggregations using columnar, vectorized e
 
     # async fn demo() -> Result<(), uni_db::UniError> {
     let db = Uni::open("./my_db").build().await?;
+    let session = db.session();
 
-    let results = db.query(
+    let results = session.query(
         "MATCH (p:Purchase) RETURN p.category, SUM(p.amount) AS revenue"
     ).await?;
 
@@ -31,8 +32,9 @@ Uni executes filters, projections, and aggregations using columnar, vectorized e
     ```python
     import uni_db
 
-    db = uni_db.Database("./my_db")
-    rows = db.query(
+    db = uni_db.Uni.open("./my_db")
+    session = db.session()
+    rows = session.query(
         "MATCH (p:Purchase) RETURN p.category, SUM(p.amount) AS revenue"
     )
     print(rows)

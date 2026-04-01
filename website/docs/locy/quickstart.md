@@ -9,9 +9,12 @@ use uni_db::Uni;
 
 # async fn run() -> Result<(), uni_db::UniError> {
 let db = Uni::in_memory().build().await?;
+let session = db.session();
 
-db.execute("CREATE (:Node {name: 'A'})-[:EDGE]->(:Node {name: 'B'})").await?;
-db.execute("MATCH (b:Node {name:'B'}), (c:Node {name:'C'}) CREATE (b)-[:EDGE]->(c)").await?;
+let tx = session.tx().await?;
+tx.execute("CREATE (:Node {name: 'A'})-[:EDGE]->(:Node {name: 'B'})").await?;
+tx.execute("MATCH (b:Node {name:'B'}), (c:Node {name:'C'}) CREATE (b)-[:EDGE]->(c)").await?;
+tx.commit().await?;
 
 let program = r#"
 CREATE RULE reachable AS
@@ -26,7 +29,7 @@ YIELD KEY a, KEY b
 QUERY reachable WHERE a.name = 'A' RETURN b.name AS target
 "#;
 
-let result = db.locy().evaluate(program).await?;
+let result = session.locy(program).await?;
 println!("rows = {:?}", result.rows());
 # Ok(())
 # }
@@ -37,7 +40,8 @@ println!("rows = {:?}", result.rows());
 ```python
 import uni_db
 
-db = uni_db.Database(":memory:")
+db = uni_db.Uni.temporary()
+session = db.session()
 
 program = """
 CREATE RULE adults AS
@@ -48,9 +52,9 @@ YIELD KEY p, p.name AS name
 QUERY adults RETURN name
 """
 
-out = db.locy_evaluate(program)
-print(out["derived"].keys())
-print(out["stats"]) 
+out = session.locy(program)
+print(out.derived.keys())
+print(out.stats)
 ```
 
 ## Explain a Derivation

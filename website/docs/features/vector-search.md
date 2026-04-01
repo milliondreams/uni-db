@@ -31,7 +31,8 @@ Uni provides native vector search over embedding properties with ANN indexes (HN
         .apply()
         .await?;
 
-    let rows = db.query_with(
+    let session = db.session();
+    let rows = session.query_with(
         "CALL uni.vector.query('Document', 'embedding', $q, 10) YIELD node, score RETURN node, score"
     )
     .param("q", vec![0.1_f32, 0.2, 0.3])
@@ -47,7 +48,7 @@ Uni provides native vector search over embedding properties with ANN indexes (HN
     ```python
     import uni_db
 
-    db = uni_db.Database("./my_db")
+    db = uni_db.Uni.open("./my_db")
 
     db.schema() \
         .label("Document") \
@@ -57,7 +58,8 @@ Uni provides native vector search over embedding properties with ANN indexes (HN
             .done() \
         .apply()
 
-    rows = db.query(
+    session = db.session()
+    rows = session.query(
         "CALL uni.vector.query('Document', 'embedding', $q, 10) YIELD node, score RETURN node, score",
         {"q": [0.1, 0.2, 0.3]}
     )

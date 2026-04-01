@@ -89,13 +89,16 @@ pub struct L0Buffer {
 
 **Write Path:**
 
+Each `Transaction` owns a private L0 buffer. Writes accumulate in the transaction's buffer without holding any global lock. At commit time, the transaction acquires a serialization lock, validates against the current database version, and merges its buffer into the shared state.
+
 ```
-1. Acquire write lock (single-writer)
-2. Append to WAL (sync or async based on config)
-3. Insert into SimpleGraph (vertex/edge)
-4. Store properties in HashMap
-5. Increment mutation counter
-6. If threshold reached → trigger async flush
+1. Write into transaction-private L0 buffer (lock-free)
+2. On commit: acquire serialization lock (commit-time, not write-time)
+3. Append to WAL (sync or async based on config)
+4. Merge into shared SimpleGraph (vertex/edge)
+5. Merge properties into shared HashMap
+6. Increment mutation counter, release lock
+7. If threshold reached → trigger async flush
 ```
 
 ### Auto-Flush Triggers
@@ -915,19 +918,23 @@ RETURN p.name, p.city, p.age  -- Mixed access
 // Create label without property definitions
 db.schema().label("Document").apply().await?;
 
+let session = db.session();
+
 // Create with arbitrary properties
-db.execute("CREATE (:Document {
+let tx = session.tx().await?;
+tx.execute("CREATE (:Document {
     title: 'Article',
     author: 'Alice',
     tags: ['tech', 'ai'],
     year: 2024
 })").await?;
+tx.commit().await?;
 
 // All properties stored in overflow_json
 db.flush().await?;
 
 // Query works transparently (automatic rewriting)
-let results = db.query("
+let results = session.query("
     MATCH (d:Document)
     WHERE d.author = 'Alice' AND d.year > 2020
     RETURN d.title, d.tags
@@ -944,18 +951,22 @@ db.schema()
     .property("age", DataType::Int)      // Schema property
     .apply().await?;
 
+let session = db.session();
+
 // Create with schema + overflow properties
-db.execute("CREATE (:Person {
+let tx = session.tx().await?;
+tx.execute("CREATE (:Person {
     name: 'Bob',       -- Schema (typed column)
     age: 25,           -- Schema (typed column)
     city: 'NYC',       -- Overflow (overflow_json)
     verified: true     -- Overflow (overflow_json)
 })").await?;
+tx.commit().await?;
 
 db.flush().await?;
 
 // Query mixing both (transparent to user)
-let results = db.query("
+let results = session.query("
     MATCH (p:Person)
     WHERE p.name = 'Bob'      -- Fast: typed column
       AND p.city = 'NYC'      -- Rewritten: json_get_string(...)

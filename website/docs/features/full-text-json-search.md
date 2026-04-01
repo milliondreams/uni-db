@@ -17,11 +17,14 @@ Uni supports full-text search over string properties and JSON documents, plus JS
 
     # async fn demo() -> Result<(), uni_db::UniError> {
     let db = Uni::open("./my_db").build().await?;
+    let session = db.session();
 
-    db.execute("CREATE FULLTEXT INDEX doc_fts FOR (d:Doc) ON (d.title, d.body)")
+    let tx = session.tx().await?;
+    tx.execute("CREATE FULLTEXT INDEX doc_fts FOR (d:Doc) ON (d.title, d.body)")
         .await?;
+    tx.commit().await?;
 
-    let rows = db.query(
+    let rows = session.query(
         "MATCH (d:Doc) WHERE d.body CONTAINS 'vector' RETURN d.title"
     ).await?;
 
@@ -34,10 +37,14 @@ Uni supports full-text search over string properties and JSON documents, plus JS
     ```python
     import uni_db
 
-    db = uni_db.Database("./my_db")
-    db.execute("CREATE FULLTEXT INDEX doc_fts FOR (d:Doc) ON (d.title, d.body)")
+    db = uni_db.Uni.open("./my_db")
+    session = db.session()
 
-    rows = db.query(
+    tx = session.tx()
+    tx.execute("CREATE FULLTEXT INDEX doc_fts FOR (d:Doc) ON (d.title, d.body)")
+    tx.commit()
+
+    rows = session.query(
         "MATCH (d:Doc) WHERE d.body CONTAINS 'vector' RETURN d.title"
     )
     print(rows)

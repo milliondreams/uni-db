@@ -52,7 +52,7 @@ Today Rust users can call `db.xervo()`, but Python users cannot access the same 
 ```python
 import uni_db
 
-db = uni_db.DatabaseBuilder.open("./graph") \
+db = uni_db.UniBuilder.open("./graph") \
     .xervo_catalog_from_file("./models.json") \
     .build()
 
@@ -79,7 +79,7 @@ quick = xervo.generate_text(
 Async:
 
 ```python
-adb = await uni_db.AsyncDatabaseBuilder.open("./graph") \
+adb = await uni_db.AsyncUniBuilder.open("./graph") \
     .xervo_catalog_from_file("./models.json") \
     .build()
 
@@ -161,7 +161,7 @@ Current gap:
 Keep the existing entry point:
 
 ```python
-out = db.locy_evaluate(
+out = session.locy(
     program,
     config={
         "max_iterations": 500,
@@ -356,7 +356,7 @@ Valid use cases:
 
 ```python
 builder = (
-    uni_db.DatabaseBuilder.open("./graph")
+    uni_db.UniBuilder.open("./graph")
     .schema_file("./schema.json")
     .xervo_catalog_from_file("./models.json")
     .cache_size(512 * 1024 * 1024)
@@ -378,7 +378,7 @@ Cloud and hybrid:
 
 ```python
 db = (
-    uni_db.DatabaseBuilder.open("./local-meta")
+    uni_db.UniBuilder.open("./local-meta")
     .hybrid("./local-meta", "s3://bucket/graph")
     .cloud_config(
         {
@@ -485,7 +485,7 @@ session = UniSession(db)
 
 raw_db = session.db
 snapshots = raw_db.list_snapshots()
-out = raw_db.locy_evaluate(program, config={"exact_probability": True})
+out = session.locy(program, config={"exact_probability": True})
 ```
 
 Add explicit raw query helpers that preserve the session as the unit of work:

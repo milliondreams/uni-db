@@ -17,7 +17,8 @@ Uni runs as a library inside your application process. There is no separate serv
     #[tokio::main]
     async fn main() -> Result<(), uni_db::UniError> {
         let db = Uni::open("./my_db").build().await?;
-        let rows = db.query("MATCH (n) RETURN count(n) as c").await?;
+        let session = db.session();
+        let rows = session.query("MATCH (n) RETURN count(n) as c").await?;
         println!("{:?}", rows);
         Ok(())
     }
@@ -27,8 +28,9 @@ Uni runs as a library inside your application process. There is no separate serv
     ```python
     import uni_db
 
-    db = uni_db.Database("./my_db")
-    rows = db.query("MATCH (n) RETURN count(n) AS c")
+    db = uni_db.Uni.open("./my_db")
+    session = db.session()
+    rows = session.query("MATCH (n) RETURN count(n) AS c")
     print(rows)
     ```
 

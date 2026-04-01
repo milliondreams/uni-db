@@ -131,12 +131,15 @@ db.schema()
     .apply().await?;
 
 // Create with schema + overflow properties
-db.execute("CREATE (:Person {
+let session = db.session();
+let tx = session.tx().await?;
+tx.execute("CREATE (:Person {
     name: 'Bob',           -- Schema property (typed column)
     email: 'bob@x.com',    -- Schema property (typed column)
     city: 'NYC',           -- Overflow property (overflow_json)
     verified: true         -- Overflow property (overflow_json)
 })").await?;
+tx.commit().await?;
 ```
 
 **Best Practice:** Use schema properties for frequently-queried core fields, overflow properties for optional metadata.
@@ -222,6 +225,15 @@ Uni supports a rich set of data types for properties:
 | `Bool` | 1 byte | true / false | `true` |
 | `Timestamp` | 8 bytes | Microsecond precision UTC | `"2024-01-15T10:30:00Z"` |
 
+### Temporal Types
+
+| Type | Description | Example |
+|------|-------------|---------|
+| `Date` | Calendar date | `2024-01-15` |
+| `Time` | Time of day | `10:30:00` |
+| `DateTime` | Date + time with timezone | `2024-01-15T10:30:00Z` |
+| `Duration` | Time duration | `P1Y2M3DT4H5M6S` |
+
 ### Complex Types
 
 | Type | Description | Example |
@@ -229,6 +241,10 @@ Uni supports a rich set of data types for properties:
 | `Json` | Structured JSON document | `{"nested": {"key": [1, 2, 3]}}` |
 | `Vector` | Fixed-dimension float32 array | `[0.1, -0.2, 0.3, ...]` |
 | `List<T>` | Variable-length array | `["a", "b", "c"]` |
+| `Map(K, V)` | Key-value map | `{key1: "value1", key2: "value2"}` |
+| `CypherValue` | Dynamic Cypher value | Any Cypher-compatible value |
+| `Point(PointType)` | Spatial point | `point({x: 1.0, y: 2.0})` |
+| `Crdt(CrdtType)` | Conflict-free replicated data type | CRDT-specific values |
 
 ### Vector Type
 

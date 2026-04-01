@@ -205,9 +205,11 @@ use uni_db::api::bulk::EdgeData;
 #[tokio::main]
 async fn main() -> Result<()> {
     let db = Uni::open("./my-graph").build().await?;
+    let session = db.session();
+    let tx = session.tx();
 
     // Create a bulk writer with deferred indexing
-    let mut bulk = db.bulk_writer()
+    let mut bulk = tx.bulk_writer()
         .defer_vector_indexes(true)   // Defer vector index updates
         .defer_scalar_indexes(true)   // Defer scalar index updates
         .batch_size(10_000)           // Flush every 10K records
@@ -268,7 +270,7 @@ async fn main() -> Result<()> {
 ### Progress Monitoring
 
 ```rust
-let mut bulk = db.bulk_writer()
+let mut bulk = tx.bulk_writer()
     .on_progress(|progress| {
         match progress.phase {
             BulkPhase::Inserting => {
@@ -290,7 +292,7 @@ let mut bulk = db.bulk_writer()
 ### Aborting Bulk Operations
 
 ```rust
-let mut bulk = db.bulk_writer().build()?;
+let mut bulk = tx.bulk_writer().build()?;
 bulk.insert_vertices("Paper", vertices).await?;
 
 // Something went wrong - abort without committing
@@ -495,7 +497,7 @@ MERGE (src)-[:CITES]->(dst)
 BulkWriter validates NOT NULL / UNIQUE / CHECK constraints by default. For trusted data sources, you can skip validation:
 
 ```rust
-let bulk = db.bulk_writer()
+let bulk = tx.bulk_writer()
     .validate_constraints(false)
     .build()?;
 ```
@@ -528,7 +530,7 @@ split -l 1000000 huge_file.jsonl chunk_
 For BulkWriter pipelines, tune batch sizes and buffer limits:
 
 ```rust
-let bulk = db.bulk_writer()
+let bulk = tx.bulk_writer()
     .batch_size(5_000)
     .max_buffer_size_bytes(256 * 1024 * 1024) // 256 MB
     .build()?;

@@ -27,8 +27,11 @@ Uni combines a property graph with vectors and JSON documents. You can model ent
         .apply()
         .await?;
 
-    db.execute("CREATE (:Person {name: 'Ada', age: 31, city: 'London'})")
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE (:Person {name: 'Ada', age: 31, city: 'London'})")
         .await?;
+    tx.commit().await?;
     # Ok(())
     # }
     ```
@@ -37,7 +40,7 @@ Uni combines a property graph with vectors and JSON documents. You can model ent
     ```python
     import uni_db
 
-    db = uni_db.Database("./my_db")
+    db = uni_db.Uni.open("./my_db")
 
     db.schema() \
         .label("Person") \
@@ -50,7 +53,10 @@ Uni combines a property graph with vectors and JSON documents. You can model ent
             .done() \
         .apply()
 
-    db.execute("CREATE (:Person {name: 'Ada', age: 31, city: 'London'})")
+    session = db.session()
+    tx = session.tx()
+    tx.execute("CREATE (:Person {name: 'Ada', age: 31, city: 'London'})")
+    tx.commit()
     ```
 
 ## Use Cases

@@ -95,7 +95,7 @@ from uni_pydantic import UniSession
 import uni_db
 
 # Open database
-db = uni_db.Database("./my_graph")
+db = uni_db.Uni.open("./my_graph")
 
 # Create session
 session = UniSession(db)

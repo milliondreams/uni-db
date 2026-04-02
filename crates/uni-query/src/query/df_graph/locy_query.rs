@@ -58,10 +58,7 @@ pub async fn evaluate_query(
     // For FOLD rules (MNOR/MPROD/SUM), the SLG resolver does not apply
     // post-fixpoint aggregation and would return raw pre-FOLD match rows.
     // Use pre-computed facts from derived_store (which ran the full native
-    // fixpoint including FOLD aggregation) when available.
-    // KEY columns in derived_store rows are VIDs (not full Node objects),
-    // so property-based WHERE filters are skipped; only RETURN projection
-    // is applied.
+    // fixpoint including FOLD aggregation and VID→Node enrichment).
     let is_fold_rule = rule.clauses.iter().any(|c| !c.fold.is_empty());
     if is_fold_rule && derived_store.contains_key(&rule_name) {
         let rows = derived_store[&rule_name].rows.clone();
@@ -72,7 +69,18 @@ pub async fn evaluate_query(
     // The native fixpoint stores node columns as VIDs (UInt64), not full node objects,
     // so orch_store rows would fail property-based WHERE/RETURN evaluation (a.name etc.).
     // SLG re-evaluation executes actual Cypher queries which return full node objects.
+    //
+    // However, FOLD rules (MNOR/MPROD/SUM) require fixpoint aggregation that the SLG
+    // resolver cannot perform. Seed the fresh store with pre-computed FOLD rule data
+    // so that downstream rules using IS NOT on FOLD rules can find their derived facts.
     let mut fresh_store = RowStore::new();
+    for (name, relation) in derived_store.iter() {
+        if let Some(r) = program.rule_catalog.get(name) {
+            if r.clauses.iter().any(|c| !c.fold.is_empty()) {
+                fresh_store.insert(name.clone(), relation.clone());
+            }
+        }
+    }
     let mut resolver = SLGResolver::new(program, fact_source, config, &mut fresh_store, start);
     let results = resolver.resolve_goal(&rule_name, &goal_bindings).await?;
 

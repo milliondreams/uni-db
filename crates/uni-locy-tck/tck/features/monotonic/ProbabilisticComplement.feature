@@ -244,3 +244,182 @@ Feature: Probabilistic Complement (PROB + IS NOT)
     And the derived relation 'safe' should contain a fact where n.name = 'Alice' and safety = 0.2
     And the derived relation 'safe' should contain a fact where n.name = 'Bob' and safety = 0.6
     And the derived relation 'safe' should contain a fact where n.name = 'Charlie' and safety = 1.0
+
+  # ── QUERY path (SLG) complement tests ─────────────────────────────────
+
+  Scenario: QUERY returns IS NOT PROB complement rows
+    Given having executed:
+      """
+      CREATE (:Node {name: 'Alice'})-[:HAS_RISK]->(:Risk {score: 0.7}),
+             (:Node {name: 'Bob'})-[:HAS_RISK]->(:Risk {score: 0.3}),
+             (:Node {name: 'Charlie'})
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE risky AS
+        MATCH (n:Node)-[:HAS_RISK]->(r:Risk)
+        YIELD KEY n, r.score AS risk_score PROB
+
+      CREATE RULE safe AS
+        MATCH (n:Node)
+        WHERE n IS NOT risky
+        YIELD KEY n, 1.0 AS safety PROB
+
+      QUERY safe WHERE n = n RETURN n.name AS name, safety ORDER BY name
+      """
+    Then evaluation should succeed
+    And the command result 0 should be a Query with 3 rows
+    And the command result 0 should be a Query containing row where name = 'Alice' and safety = 0.3
+    And the command result 0 should be a Query containing row where name = 'Bob' and safety = 0.7
+    And the command result 0 should be a Query containing row where name = 'Charlie' and safety = 1.0
+
+  Scenario: QUERY with IS NOT PROB absent key returns 1.0
+    Given having executed:
+      """
+      CREATE (:Node {name: 'Alice'})-[:HAS_RISK]->(:Risk {score: 0.5}),
+             (:Node {name: 'Bob'})
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE risky AS
+        MATCH (n:Node)-[:HAS_RISK]->(r:Risk)
+        YIELD KEY n, r.score AS risk_score PROB
+
+      CREATE RULE safe AS
+        MATCH (n:Node)
+        WHERE n IS NOT risky
+        YIELD KEY n, 1.0 AS safety PROB
+
+      QUERY safe WHERE n.name = 'Bob' RETURN n.name AS name, safety
+      """
+    Then evaluation should succeed
+    And the command result 0 should be a Query with 1 rows
+    And the command result 0 should be a Query containing row where name = 'Bob' and safety = 1.0
+
+  Scenario: QUERY IS NOT PROB complement with FOLD MNOR target
+    Given having executed:
+      """
+      CREATE (:Drug {name: 'DrugA'}),
+             (:Drug {name: 'DrugB'}),
+             (:SE {name: 'nausea', sev: 0.9}),
+             (:SE {name: 'headache', sev: 0.2})
+      """
+    And having executed:
+      """
+      MATCH (d:Drug {name: 'DrugA'}), (s:SE {name: 'nausea'})
+      CREATE (d)-[:ADR {freq: 0.7}]->(s)
+      """
+    And having executed:
+      """
+      MATCH (d:Drug {name: 'DrugA'}), (s:SE {name: 'headache'})
+      CREATE (d)-[:ADR {freq: 0.3}]->(s)
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE adr_risk AS
+        MATCH (d:Drug)-[c:ADR]->(se:SE)
+        YIELD KEY d, c.freq * se.sev AS hazard PROB
+
+      CREATE RULE safety_penalty AS
+        MATCH (d:Drug)
+        WHERE d IS adr_risk
+        FOLD penalty = MNOR(hazard)
+        YIELD KEY d, penalty
+
+      CREATE RULE safe_drug AS
+        MATCH (d:Drug)
+        WHERE d IS NOT safety_penalty
+        YIELD KEY d, 1.0 AS safety PROB
+
+      QUERY safe_drug WHERE d = d RETURN d.name AS drug, safety ORDER BY drug
+      """
+    Then evaluation should succeed
+    And the command result 0 should be a Query with 2 rows
+
+  Scenario: QUERY with cross-predicate IS + IS NOT PROB
+    Given having executed:
+      """
+      CREATE (:Account {name: 'Alice'})-[:HAS_RISK]->(:Risk {score: 0.8}),
+             (:Account {name: 'Alice'})-[:HAS_TRUST]->(:Trust {level: 0.6}),
+             (:Account {name: 'Bob'})-[:HAS_RISK]->(:Risk {score: 0.5}),
+             (:Account {name: 'Charlie'})
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE risky AS
+        MATCH (a:Account)-[:HAS_RISK]->(r:Risk)
+        YIELD KEY a, r.score AS risk_score PROB
+
+      CREATE RULE trusted AS
+        MATCH (a:Account)-[:HAS_TRUST]->(t:Trust)
+        YIELD KEY a, t.level AS trust_score PROB
+
+      CREATE RULE net_risk AS
+        MATCH (a:Account)
+        WHERE a IS risky, a IS NOT trusted
+        YIELD KEY a, risk_score AS combined PROB
+
+      QUERY net_risk WHERE a = a RETURN a.name AS name, combined ORDER BY name
+      """
+    Then evaluation should succeed
+    And the command result 0 should be a Query with 2 rows
+
+  Scenario: QUERY FOLD rule returns node properties after enrichment
+    Given having executed:
+      """
+      CREATE (:Node {name: 'Alice'})-[:HAS_RISK]->(:Risk {score: 0.7}),
+             (:Node {name: 'Bob'})-[:HAS_RISK]->(:Risk {score: 0.3})
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE risk_agg AS
+        MATCH (n:Node)-[:HAS_RISK]->(r:Risk)
+        FOLD total_risk = MNOR(r.score)
+        YIELD KEY n, total_risk
+
+      QUERY risk_agg WHERE n = n RETURN n.name AS name, total_risk ORDER BY name
+      """
+    Then evaluation should succeed
+    And the command result 0 should be a Query with 2 rows
+    And the command result 0 should be a Query containing row where name = 'Alice'
+    And the command result 0 should be a Query containing row where name = 'Bob'
+
+  Scenario: Composite-key IS NOT with target variable
+    Given having executed:
+      """
+      CREATE (:Drug {name: 'A'}), (:Disease {name: 'Flu'}), (:Disease {name: 'Cold'})
+      """
+    And having executed:
+      """
+      MATCH (d:Drug {name: 'A'}), (dis:Disease {name: 'Flu'}) CREATE (d)-[:IND]->(dis)
+      """
+    And having executed:
+      """
+      MATCH (d:Drug {name: 'A'}), (dis:Disease {name: 'Flu'}) CREATE (d)-[:SIG]->(dis)
+      """
+    And having executed:
+      """
+      MATCH (d:Drug {name: 'A'}), (dis:Disease {name: 'Cold'}) CREATE (d)-[:SIG]->(dis)
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE signal AS
+        MATCH (d:Drug)-[:SIG]->(dis:Disease)
+        YIELD KEY d, KEY dis
+
+      CREATE RULE known AS
+        MATCH (d:Drug)-[:IND]->(dis:Disease)
+        YIELD KEY d, KEY dis
+
+      CREATE RULE novel AS
+        MATCH (d:Drug)
+        WHERE d IS signal TO dis, d IS NOT known TO dis
+        YIELD KEY d, KEY dis
+
+      QUERY novel WHERE d = d RETURN d.name AS drug, dis.name AS disease
+      """
+    Then evaluation should succeed
+    And the derived relation 'novel' should have 1 facts
+    And the derived relation 'novel' should contain a fact where d.name = 'A' and dis.name = 'Cold'
+    And the command result 0 should be a Query with 1 rows
+    And the command result 0 should be a Query containing row where disease = 'Cold'

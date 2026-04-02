@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use uni_common::Value;
 use uni_cypher::ast::Expr;
 use uni_cypher::locy_ast::{IsReference, RuleCondition};
-use uni_locy::types::CompiledClause;
+use uni_locy::types::{CompiledClause, CompiledRule};
 use uni_locy::{FactRow, LocyError};
 
 use super::locy_ast_builder::expr_references_var;
@@ -77,6 +77,7 @@ fn is_ref_matches(
     is_ref: &IsReference,
     schema: &[String],
 ) -> bool {
+    // Check subject columns.
     for (i, subject) in is_ref.subjects.iter().enumerate() {
         if i >= schema.len() {
             break;
@@ -85,6 +86,25 @@ fn is_ref_matches(
         let fact_val = derived_fact.get(&schema[i]).cloned().unwrap_or(Value::Null);
         if !values_equal_for_join(&base_val, &fact_val) {
             return false;
+        }
+    }
+    // Also check target variable for composite-key matching (negated IS NOT).
+    // Without this, `d IS NOT known TO dis` only checks d, not (d, dis).
+    // Skip when base_val is Null (target not yet bound — positive IS-ref binding).
+    if let Some(target) = &is_ref.target {
+        let target_idx = is_ref.subjects.len();
+        if target_idx < schema.len() {
+            let base_val = base_row.get(target).cloned().unwrap_or(Value::Null);
+            let fact_val = derived_fact
+                .get(&schema[target_idx])
+                .cloned()
+                .unwrap_or(Value::Null);
+            if base_val != Value::Null
+                && fact_val != Value::Null
+                && !values_equal_for_join(&base_val, &fact_val)
+            {
+                return false;
+            }
         }
     }
     true
@@ -114,6 +134,18 @@ fn semi_join_is_ref(
                             .cloned()
                             .unwrap_or(Value::Null);
                         row.insert(target.clone(), val);
+                    }
+                }
+
+                // Bind non-KEY value columns from the derived fact so that
+                // downstream YIELD expressions can reference them (e.g.,
+                // `WHERE d IS signal TO dis ... YIELD KEY d, KEY dis, agg`
+                // needs `agg` to be present in the row).
+                let bound_count = is_ref.subjects.len()
+                    + if is_ref.target.is_some() { 1 } else { 0 };
+                for col in schema.iter().skip(bound_count) {
+                    if let Some(val) = derived_fact.get(col) {
+                        row.entry(col.clone()).or_insert_with(|| val.clone());
                     }
                 }
 
@@ -147,6 +179,71 @@ fn anti_join_is_ref(
         .collect()
 }
 
+/// Probabilistic complement for IS NOT with PROB target.
+///
+/// Instead of filtering out matched rows (anti-join), retains ALL rows and
+/// attaches a complement column: `1-p` for matched keys, `1.0` for absent keys.
+/// When multiple derived facts match the same key, probabilities are combined
+/// via noisy-OR: `p_combined = 1 - ∏(1 - pᵢ)`.
+///
+/// Mirrors [`super::locy_fixpoint::apply_prob_complement_composite`] but
+/// operates on `Vec<FactRow>` instead of `Vec<RecordBatch>`.
+fn prob_complement_is_ref(
+    base_rows: &[FactRow],
+    derived_facts: &[FactRow],
+    is_ref: &IsReference,
+    schema: &[String],
+    target_prob_col: &str,
+    complement_col_name: &str,
+) -> Vec<FactRow> {
+    base_rows
+        .iter()
+        .map(|base_row| {
+            // Find all matching derived facts and combine via noisy-OR.
+            let mut combined_p = 0.0_f64;
+            for df in derived_facts {
+                if is_ref_matches(base_row, df, is_ref, schema) {
+                    let p = df
+                        .get(target_prob_col)
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0)
+                        .clamp(0.0, 1.0);
+                    combined_p = 1.0 - (1.0 - combined_p) * (1.0 - p);
+                }
+            }
+            let complement = 1.0 - combined_p;
+            let mut row = base_row.clone();
+            row.insert(complement_col_name.to_string(), Value::Float(complement));
+            row
+        })
+        .collect()
+}
+
+/// Multiply `__prob_complement_*` columns into the PROB column and remove them.
+///
+/// Mirrors [`super::locy_fixpoint::multiply_prob_factors`] but operates on
+/// `Vec<FactRow>` instead of `Vec<RecordBatch>`.
+pub fn multiply_prob_factors_rows(
+    rows: &mut [FactRow],
+    prob_col: &str,
+    complement_cols: &[String],
+) {
+    for row in rows.iter_mut() {
+        let mut factor = 1.0_f64;
+        for col in complement_cols {
+            if let Some(v) = row.get(col).and_then(|v| v.as_f64()) {
+                factor *= v;
+            }
+            row.remove(col);
+        }
+        let current = row
+            .get(prob_col)
+            .and_then(|v| v.as_f64())
+            .unwrap_or(1.0);
+        row.insert(prob_col.to_string(), Value::Float(current * factor));
+    }
+}
+
 /// Resolve a clause by executing its MATCH pattern and applying IS-ref joins in memory.
 ///
 /// Replaces the serialize-UNWIND-execute round-trip used by SLG and EXPLAIN Mode B.
@@ -156,30 +253,37 @@ pub async fn resolve_clause_with_is_refs(
     clause: &CompiledClause,
     fact_source: &dyn DerivedFactSource,
     derived_store: &RowStore,
+    rule_catalog: &HashMap<String, CompiledRule>,
+    calling_rule_prob_col: Option<&str>,
 ) -> Result<Vec<FactRow>, LocyError> {
-    // Collect target variable names from positive IS-refs.
-    let target_vars: Vec<String> = clause
-        .where_conditions
-        .iter()
-        .filter_map(|c| {
-            if let RuleCondition::IsReference(is_ref) = c {
-                if !is_ref.negated {
-                    is_ref.target.clone()
-                } else {
-                    None
-                }
-            } else {
-                None
+    // Collect all variable names introduced by IS-ref joins:
+    // target variables AND non-KEY value columns from target rules.
+    // These must be deferred until after the IS-ref join resolves.
+    let mut is_ref_vars: Vec<String> = Vec::new();
+    for cond in &clause.where_conditions {
+        if let RuleCondition::IsReference(is_ref) = cond
+            && !is_ref.negated
+        {
+            if let Some(target) = &is_ref.target {
+                is_ref_vars.push(target.clone());
             }
-        })
-        .collect();
+            let rule_name = is_ref.rule_name.to_string();
+            if let Some(target_rule) = rule_catalog.get(&rule_name) {
+                for col in &target_rule.yield_schema {
+                    if !col.is_key {
+                        is_ref_vars.push(col.name.clone());
+                    }
+                }
+            }
+        }
+    }
 
-    // Partition Cypher conditions: match-safe vs. target-dependent.
+    // Partition Cypher conditions: match-safe vs. IS-ref-dependent.
     let all_cypher = extract_cypher_conditions(&clause.where_conditions);
     let mut match_safe = Vec::new();
     let mut target_dependent = Vec::new();
     for expr in all_cypher {
-        if target_vars.iter().any(|v| expr_references_var(&expr, v)) {
+        if is_ref_vars.iter().any(|v| expr_references_var(&expr, v)) {
             target_dependent.push(expr);
         } else {
             match_safe.push(expr);
@@ -203,12 +307,33 @@ pub async fn resolve_clause_with_is_refs(
             };
 
             if is_ref.negated {
-                rows = anti_join_is_ref(&rows, &derived_facts, is_ref, &schema);
+                // Check if target rule has PROB column for complement semantics.
+                let target_prob_col = rule_catalog
+                    .get(&rule_name)
+                    .and_then(|r| {
+                        r.yield_schema.iter().find(|c| c.is_prob).map(|c| c.name.clone())
+                    });
+
+                if let (Some(tpc), Some(_)) = (&target_prob_col, &calling_rule_prob_col) {
+                    // Probabilistic complement: keep all rows, compute 1-p.
+                    let complement_col = format!("__prob_complement_{}", rule_name);
+                    rows = prob_complement_is_ref(
+                        &rows, &derived_facts, is_ref, &schema, tpc, &complement_col,
+                    );
+                } else {
+                    // Boolean anti-join (existing behavior).
+                    rows = anti_join_is_ref(&rows, &derived_facts, is_ref, &schema);
+                }
             } else {
                 rows = semi_join_is_ref(&rows, &derived_facts, is_ref, &schema);
             }
         }
     }
+
+    // NOTE: __prob_complement_* columns are left in the rows for the caller
+    // (locy_slg.rs) to multiply into the PROB column AFTER yield projections.
+    // This is because apply_yield_projections() re-evaluates the YIELD expression
+    // (e.g., "1.0 AS safety PROB") and would overwrite any pre-multiplied value.
 
     // Apply target-dependent Cypher conditions.
     if !target_dependent.is_empty() {
@@ -248,4 +373,119 @@ pub async fn resolve_clause_with_is_refs(
     }
 
     Ok(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uni_common::Value;
+    use uni_cypher::locy_ast::{IsReference, QualifiedName};
+
+    fn make_is_ref(subject: &str, rule: &str) -> IsReference {
+        IsReference {
+            subjects: vec![subject.to_string()],
+            rule_name: QualifiedName {
+                parts: vec![rule.to_string()],
+            },
+            target: None,
+            negated: true,
+        }
+    }
+
+    fn row_int(pairs: &[(&str, i64)]) -> FactRow {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), Value::Int(*v)))
+            .collect()
+    }
+
+    #[test]
+    fn test_prob_complement_basic() {
+        // Alice in risky with p=0.7 → complement=0.3
+        // Bob in risky with p=0.3 → complement=0.7
+        // Charlie absent → complement=1.0
+        let base = vec![row_int(&[("n", 1)]), row_int(&[("n", 2)]), row_int(&[("n", 3)])];
+        let derived = vec![
+            {
+                let mut r = row_int(&[("n", 1)]);
+                r.insert("risk_score".into(), Value::Float(0.7));
+                r
+            },
+            {
+                let mut r = row_int(&[("n", 2)]);
+                r.insert("risk_score".into(), Value::Float(0.3));
+                r
+            },
+        ];
+        let is_ref = make_is_ref("n", "risky");
+        let schema = vec!["n".to_string(), "risk_score".to_string()];
+
+        let result =
+            prob_complement_is_ref(&base, &derived, &is_ref, &schema, "risk_score", "__c");
+
+        assert_eq!(result.len(), 3);
+        let c0 = result[0].get("__c").unwrap().as_f64().unwrap();
+        let c1 = result[1].get("__c").unwrap().as_f64().unwrap();
+        let c2 = result[2].get("__c").unwrap().as_f64().unwrap();
+        assert!((c0 - 0.3).abs() < 1e-10, "Alice: expected 0.3, got {c0}");
+        assert!((c1 - 0.7).abs() < 1e-10, "Bob: expected 0.7, got {c1}");
+        assert!((c2 - 1.0).abs() < 1e-10, "Charlie: expected 1.0, got {c2}");
+    }
+
+    #[test]
+    fn test_prob_complement_noisy_or_duplicates() {
+        // n=1 appears twice with p=0.3 and p=0.5
+        // Noisy-OR: 1-(1-0.3)(1-0.5) = 0.65, complement = 0.35
+        let base = vec![row_int(&[("n", 1)])];
+        let derived = vec![
+            {
+                let mut r = row_int(&[("n", 1)]);
+                r.insert("prob".into(), Value::Float(0.3));
+                r
+            },
+            {
+                let mut r = row_int(&[("n", 1)]);
+                r.insert("prob".into(), Value::Float(0.5));
+                r
+            },
+        ];
+        let is_ref = make_is_ref("n", "rule");
+        let schema = vec!["n".to_string(), "prob".to_string()];
+
+        let result = prob_complement_is_ref(&base, &derived, &is_ref, &schema, "prob", "__c");
+        let c = result[0].get("__c").unwrap().as_f64().unwrap();
+        assert!((c - 0.35).abs() < 1e-10, "expected 0.35, got {c}");
+    }
+
+    #[test]
+    fn test_multiply_prob_factors_rows_basic() {
+        // safety=1.0, complement=0.3 → result safety=0.3, complement col removed
+        let mut rows = vec![{
+            let mut r = FactRow::new();
+            r.insert("safety".into(), Value::Float(1.0));
+            r.insert("__prob_complement_risky".into(), Value::Float(0.3));
+            r
+        }];
+        multiply_prob_factors_rows(&mut rows, "safety", &["__prob_complement_risky".into()]);
+
+        assert!(
+            rows[0].get("__prob_complement_risky").is_none(),
+            "complement col should be removed"
+        );
+        let safety = rows[0].get("safety").unwrap().as_f64().unwrap();
+        assert!((safety - 0.3).abs() < 1e-10, "expected 0.3, got {safety}");
+    }
+
+    #[test]
+    fn test_anti_join_unchanged_without_prob() {
+        // Boolean IS NOT: n=1 in flagged → excluded, n=2 not → kept
+        let base = vec![row_int(&[("n", 1)]), row_int(&[("n", 2)])];
+        let derived = vec![row_int(&[("n", 1)])];
+        let is_ref = make_is_ref("n", "flagged");
+        let schema = vec!["n".to_string()];
+
+        let result = anti_join_is_ref(&base, &derived, &is_ref, &schema);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].get("n").unwrap().as_i64(), Some(2));
+    }
 }

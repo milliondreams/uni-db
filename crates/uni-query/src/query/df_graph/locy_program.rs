@@ -1075,7 +1075,7 @@ fn convert_is_refs(
             // the body column is `{var}._vid` (UInt64). The derived column name is taken
             // positionally from the registry entry's schema (KEY columns come first).
             let anti_join_cols = if is_ref.negated {
-                is_ref
+                let mut cols: Vec<(String, String)> = is_ref
                     .subjects
                     .iter()
                     .enumerate()
@@ -1094,7 +1094,18 @@ fn convert_is_refs(
                             None
                         }
                     })
-                    .collect()
+                    .collect();
+                // Include target variable in anti-join for composite-key IS NOT.
+                // Without this, `d IS NOT known TO dis` only checks d, not (d, dis),
+                // filtering ALL pairs where the drug has ANY indication regardless
+                // of disease.
+                if let Some(uni_cypher::ast::Expr::Variable(target_var)) = &is_ref.target {
+                    let target_idx = is_ref.subjects.len();
+                    if let Some(field) = entry.schema.fields().get(target_idx) {
+                        cols.push((target_var.clone(), field.name().clone()));
+                    }
+                }
+                cols
             } else {
                 Vec::new()
             };

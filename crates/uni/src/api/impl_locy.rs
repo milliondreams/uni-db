@@ -430,6 +430,29 @@ impl<'a> LocyEngine<'a> {
         // 7. Convert native DerivedStore → row-based RowStore for SLG/EXPLAIN
         let mut orch_store = native_store_to_row_store(&native_store, &compiled);
 
+        // 7b. Enrich VID integers → full Node objects so SLG/QUERY can access
+        //     node properties (d.name etc.) and IS-ref joins work correctly
+        //     across FOLD-rule boundaries.
+        {
+            let orch_rows: HashMap<String, Vec<FactRow>> = orch_store
+                .iter()
+                .map(|(k, v)| (k.clone(), v.rows.clone()))
+                .collect();
+            let enriched_rows = enrich_vids_with_nodes(
+                self.db,
+                &native_store,
+                orch_rows,
+                planner.graph_ctx(),
+                planner.session_ctx(),
+            )
+            .await;
+            for (name, rows) in enriched_rows {
+                if let Some(rel) = orch_store.get_mut(&name) {
+                    rel.rows = rows;
+                }
+            }
+        }
+
         // 8. Dispatch commands via native trait interfaces
         let native_ctx = NativeExecutionAdapter::new(
             self.db,

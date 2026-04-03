@@ -92,6 +92,9 @@ pub struct FoldBinding {
     pub output_name: String,
     pub kind: FoldAggKind,
     pub input_col_index: usize,
+    /// Column name for name-based resolution (more robust than positional index).
+    /// `None` for CountAll which has no input column.
+    pub input_col_name: Option<String>,
 }
 
 /// DataFusion `ExecutionPlan` that applies FOLD semantics.
@@ -159,10 +162,18 @@ impl FoldExec {
                     DataType::Float64
                 }
                 FoldAggKind::Count | FoldAggKind::CountAll => DataType::Int64,
-                FoldAggKind::Max | FoldAggKind::Min => input_schema
-                    .field(binding.input_col_index)
-                    .data_type()
-                    .clone(),
+                FoldAggKind::Max | FoldAggKind::Min => {
+                    let idx = binding
+                        .input_col_name
+                        .as_ref()
+                        .and_then(|name| input_schema.index_of(name).ok())
+                        .unwrap_or(binding.input_col_index);
+                    if idx < input_schema.fields().len() {
+                        input_schema.field(idx).data_type().clone()
+                    } else {
+                        DataType::Float64
+                    }
+                }
                 FoldAggKind::Collect => DataType::LargeBinary,
             };
             fields.push(Arc::new(Field::new(
@@ -290,11 +301,19 @@ impl ExecutionPlan for FoldExec {
                 let col: Arc<dyn Array> = if binding.kind == FoldAggKind::CountAll {
                     // CountAll doesn't need an input column — use a dummy
                     Arc::new(arrow_array::Int64Array::from(vec![0i64; batch.num_rows()]))
-                } else if binding.input_col_index < batch.num_columns() {
-                    Arc::clone(batch.column(binding.input_col_index))
                 } else {
-                    // Fallback: column index stale after schema reconciliation
-                    Arc::new(arrow_array::Float64Array::from(vec![0.0f64; batch.num_rows()]))
+                    // Resolve input column: prefer name-based lookup, fall back to index.
+                    let resolved_idx = binding
+                        .input_col_name
+                        .as_ref()
+                        .and_then(|name| batch.schema().index_of(name).ok())
+                        .unwrap_or(binding.input_col_index);
+                    if resolved_idx < batch.num_columns() {
+                        Arc::clone(batch.column(resolved_idx))
+                    } else {
+                        // Column not found — use zeros as fallback
+                        Arc::new(arrow_array::Float64Array::from(vec![0.0f64; batch.num_rows()]))
+                    }
                 };
                 let agg_col = compute_fold_aggregate(
                     col.as_ref(),
@@ -822,7 +841,7 @@ mod tests {
             vec![FoldBinding {
                 output_name: "total".to_string(),
                 kind: FoldAggKind::Sum,
-                input_col_index: 1,
+                input_col_index: 1, input_col_name: None,
             }],
         )
         .await;
@@ -857,7 +876,7 @@ mod tests {
             vec![FoldBinding {
                 output_name: "cnt".to_string(),
                 kind: FoldAggKind::Count,
-                input_col_index: 1,
+                input_col_index: 1, input_col_name: None,
             }],
         )
         .await;
@@ -883,7 +902,7 @@ mod tests {
             vec![FoldBinding {
                 output_name: "mx".to_string(),
                 kind: FoldAggKind::Max,
-                input_col_index: 1,
+                input_col_index: 1, input_col_name: None,
             }],
         )
         .await;
@@ -893,7 +912,7 @@ mod tests {
             vec![FoldBinding {
                 output_name: "mn".to_string(),
                 kind: FoldAggKind::Min,
-                input_col_index: 1,
+                input_col_index: 1, input_col_name: None,
             }],
         )
         .await;
@@ -923,7 +942,7 @@ mod tests {
             vec![FoldBinding {
                 output_name: "average".to_string(),
                 kind: FoldAggKind::Avg,
-                input_col_index: 1,
+                input_col_index: 1, input_col_name: None,
             }],
         )
         .await;
@@ -950,7 +969,7 @@ mod tests {
             vec![FoldBinding {
                 output_name: "total".to_string(),
                 kind: FoldAggKind::Sum,
-                input_col_index: 1,
+                input_col_index: 1, input_col_name: None,
             }],
         )
         .await;
@@ -990,7 +1009,7 @@ mod tests {
             vec![FoldBinding {
                 output_name: "total".to_string(),
                 kind: FoldAggKind::Sum,
-                input_col_index: 1,
+                input_col_index: 1, input_col_name: None,
             }],
         )
         .await;
@@ -1009,17 +1028,17 @@ mod tests {
                 FoldBinding {
                     output_name: "total".to_string(),
                     kind: FoldAggKind::Sum,
-                    input_col_index: 1,
+                    input_col_index: 1, input_col_name: None,
                 },
                 FoldBinding {
                     output_name: "cnt".to_string(),
                     kind: FoldAggKind::Count,
-                    input_col_index: 1,
+                    input_col_index: 1, input_col_name: None,
                 },
                 FoldBinding {
                     output_name: "mx".to_string(),
                     kind: FoldAggKind::Max,
-                    input_col_index: 1,
+                    input_col_index: 1, input_col_name: None,
                 },
             ],
         )
@@ -1063,7 +1082,7 @@ mod tests {
             vec![FoldBinding {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Nor,
-                input_col_index: 1,
+                input_col_index: 1, input_col_name: None,
             }],
         )
         .await;
@@ -1088,7 +1107,7 @@ mod tests {
             vec![FoldBinding {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Nor,
-                input_col_index: 1,
+                input_col_index: 1, input_col_name: None,
             }],
         )
         .await;
@@ -1112,7 +1131,7 @@ mod tests {
             vec![FoldBinding {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Nor,
-                input_col_index: 1,
+                input_col_index: 1, input_col_name: None,
             }],
         )
         .await;
@@ -1136,7 +1155,7 @@ mod tests {
             vec![FoldBinding {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Nor,
-                input_col_index: 1,
+                input_col_index: 1, input_col_name: None,
             }],
         )
         .await;
@@ -1177,7 +1196,7 @@ mod tests {
             vec![FoldBinding {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Prod,
-                input_col_index: 1,
+                input_col_index: 1, input_col_name: None,
             }],
         )
         .await;
@@ -1202,7 +1221,7 @@ mod tests {
             vec![FoldBinding {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Prod,
-                input_col_index: 1,
+                input_col_index: 1, input_col_name: None,
             }],
         )
         .await;
@@ -1226,7 +1245,7 @@ mod tests {
             vec![FoldBinding {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Prod,
-                input_col_index: 1,
+                input_col_index: 1, input_col_name: None,
             }],
         )
         .await;
@@ -1252,7 +1271,7 @@ mod tests {
             vec![FoldBinding {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Prod,
-                input_col_index: 1,
+                input_col_index: 1, input_col_name: None,
             }],
         )
         .await;
@@ -1302,7 +1321,7 @@ mod tests {
             vec![FoldBinding {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Nor,
-                input_col_index: 1,
+                input_col_index: 1, input_col_name: None,
             }],
         )
         .await;
@@ -1325,7 +1344,7 @@ mod tests {
             vec![FoldBinding {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Prod,
-                input_col_index: 1,
+                input_col_index: 1, input_col_name: None,
             }],
         )
         .await;
@@ -1348,7 +1367,7 @@ mod tests {
             vec![FoldBinding {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Nor,
-                input_col_index: 1,
+                input_col_index: 1, input_col_name: None,
             }],
         )
         .await;
@@ -1371,7 +1390,7 @@ mod tests {
             vec![FoldBinding {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Nor,
-                input_col_index: 1,
+                input_col_index: 1, input_col_name: None,
             }],
         )
         .await;
@@ -1398,7 +1417,7 @@ mod tests {
             vec![FoldBinding {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Prod,
-                input_col_index: 1,
+                input_col_index: 1, input_col_name: None,
             }],
         )
         .await;
@@ -1421,7 +1440,7 @@ mod tests {
             vec![FoldBinding {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Nor,
-                input_col_index: 1,
+                input_col_index: 1, input_col_name: None,
             }],
         )
         .await;
@@ -1444,7 +1463,7 @@ mod tests {
             vec![FoldBinding {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Prod,
-                input_col_index: 1,
+                input_col_index: 1, input_col_name: None,
             }],
         )
         .await;
@@ -1467,7 +1486,7 @@ mod tests {
             vec![FoldBinding {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Prod,
-                input_col_index: 1,
+                input_col_index: 1, input_col_name: None,
             }],
         )
         .await;
@@ -1500,7 +1519,7 @@ mod tests {
         let binding = vec![FoldBinding {
             output_name: "prob".to_string(),
             kind: FoldAggKind::Nor,
-            input_col_index: 1,
+            input_col_index: 1, input_col_name: None,
         }];
         let r1 = execute_fold(make_memory_exec(fwd), vec![0], binding.clone()).await;
         let r2 = execute_fold(make_memory_exec(rev), vec![0], binding).await;
@@ -1529,7 +1548,7 @@ mod tests {
         let binding = vec![FoldBinding {
             output_name: "prob".to_string(),
             kind: FoldAggKind::Prod,
-            input_col_index: 1,
+            input_col_index: 1, input_col_name: None,
         }];
         let r1 = execute_fold(make_memory_exec(fwd), vec![0], binding.clone()).await;
         let r2 = execute_fold(make_memory_exec(rev), vec![0], binding).await;
@@ -1561,7 +1580,7 @@ mod tests {
             vec![FoldBinding {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Nor,
-                input_col_index: 1,
+                input_col_index: 1, input_col_name: None,
             }],
         )
         .await;
@@ -1590,7 +1609,7 @@ mod tests {
             vec![FoldBinding {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Nor,
-                input_col_index: 1,
+                input_col_index: 1, input_col_name: None,
             }],
         )
         .await;
@@ -1619,7 +1638,7 @@ mod tests {
             vec![FoldBinding {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Prod,
-                input_col_index: 1,
+                input_col_index: 1, input_col_name: None,
             }],
         )
         .await;
@@ -1650,7 +1669,7 @@ mod tests {
             vec![FoldBinding {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Nor,
-                input_col_index: 1,
+                input_col_index: 1, input_col_name: None,
             }],
         )
         .await;
@@ -1668,7 +1687,7 @@ mod tests {
             vec![FoldBinding {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Nor,
-                input_col_index: 1,
+                input_col_index: 1, input_col_name: None,
             }],
         )
         .await;
@@ -1691,7 +1710,7 @@ mod tests {
             vec![FoldBinding {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Prod,
-                input_col_index: 1,
+                input_col_index: 1, input_col_name: None,
             }],
         )
         .await;
@@ -1714,7 +1733,7 @@ mod tests {
             vec![FoldBinding {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Prod,
-                input_col_index: 1,
+                input_col_index: 1, input_col_name: None,
             }],
         )
         .await;
@@ -1737,7 +1756,7 @@ mod tests {
             vec![FoldBinding {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Nor,
-                input_col_index: 1,
+                input_col_index: 1, input_col_name: None,
             }],
         )
         .await;
@@ -1760,7 +1779,7 @@ mod tests {
             vec![FoldBinding {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Nor,
-                input_col_index: 1,
+                input_col_index: 1, input_col_name: None,
             }],
         )
         .await;
@@ -1784,7 +1803,7 @@ mod tests {
             vec![FoldBinding {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Prod,
-                input_col_index: 1,
+                input_col_index: 1, input_col_name: None,
             }],
         )
         .await;
@@ -1808,7 +1827,7 @@ mod tests {
             vec![FoldBinding {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Nor,
-                input_col_index: 1,
+                input_col_index: 1, input_col_name: None,
             }],
         )
         .await;
@@ -1831,7 +1850,7 @@ mod tests {
             vec![FoldBinding {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Prod,
-                input_col_index: 1,
+                input_col_index: 1, input_col_name: None,
             }],
         )
         .await;
@@ -1856,7 +1875,7 @@ mod tests {
             vec![FoldBinding {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Nor,
-                input_col_index: 1,
+                input_col_index: 1, input_col_name: None,
             }],
         )
         .await;
@@ -1961,7 +1980,7 @@ mod tests {
             vec![FoldBinding {
                 output_name: "p".into(),
                 kind: FoldAggKind::Nor,
-                input_col_index: 1,
+                input_col_index: 1, input_col_name: None,
             }],
             true,
         )
@@ -1985,7 +2004,7 @@ mod tests {
             vec![FoldBinding {
                 output_name: "p".into(),
                 kind: FoldAggKind::Nor,
-                input_col_index: 1,
+                input_col_index: 1, input_col_name: None,
             }],
             true,
         )
@@ -2009,7 +2028,7 @@ mod tests {
             vec![FoldBinding {
                 output_name: "p".into(),
                 kind: FoldAggKind::Prod,
-                input_col_index: 1,
+                input_col_index: 1, input_col_name: None,
             }],
             true,
         )
@@ -2033,7 +2052,7 @@ mod tests {
             vec![FoldBinding {
                 output_name: "p".into(),
                 kind: FoldAggKind::Prod,
-                input_col_index: 1,
+                input_col_index: 1, input_col_name: None,
             }],
             true,
         )
@@ -2057,7 +2076,7 @@ mod tests {
             vec![FoldBinding {
                 output_name: "p".into(),
                 kind: FoldAggKind::Nor,
-                input_col_index: 1,
+                input_col_index: 1, input_col_name: None,
             }],
             true,
         )

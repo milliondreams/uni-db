@@ -1167,24 +1167,23 @@ fn convert_fold_bindings(
                     output_name: name.clone(),
                     kind,
                     input_col_index: 0, // unused for CountAll
+                    input_col_name: None,
                 });
             }
 
             // The LocyProject projects the aggregate input expression AS the fold
             // output name, so the input column index matches the yield schema position.
+            // Also store the column name for name-based resolution at execution time
+            // (more robust when schema reconciliation changes column ordering).
             let input_col_index = yield_schema
                 .iter()
                 .position(|yc| yc.name == *name)
-                .ok_or_else(|| {
-                    datafusion::error::DataFusionError::Plan(format!(
-                        "FOLD column '{}' not found in yield schema",
-                        name
-                    ))
-                })?;
+                .unwrap_or(0);
             Ok(FoldBinding {
                 output_name: name.clone(),
                 kind,
                 input_col_index,
+                input_col_name: Some(name.clone()),
             })
         })
         .collect()

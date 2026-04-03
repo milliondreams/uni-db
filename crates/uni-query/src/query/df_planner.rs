@@ -4611,6 +4611,7 @@ fn resolve_fold_bindings(
                             output_name: output_name.clone(),
                             kind: super::df_graph::locy_fold::FoldAggKind::CountAll,
                             input_col_index: 0, // unused for CountAll
+                            input_col_name: None,
                         });
                     }
 
@@ -4661,6 +4662,7 @@ fn resolve_fold_bindings(
                         output_name: output_name.clone(),
                         kind,
                         input_col_index,
+                        input_col_name: Some(output_name.clone()),
                     })
                 }
                 _ => Err(anyhow::anyhow!(

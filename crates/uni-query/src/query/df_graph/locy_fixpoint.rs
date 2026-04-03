@@ -396,6 +396,8 @@ pub struct FixpointState {
     delta: Vec<RecordBatch>,
     schema: SchemaRef,
     key_column_indices: Vec<usize>,
+    /// KEY column names for recomputing indices after schema reconciliation.
+    key_column_names: Vec<String>,
     /// All column indices for full-row dedup (legacy path only).
     all_column_indices: Vec<usize>,
     /// Running total of facts bytes for memory limit tracking.
@@ -422,12 +424,17 @@ impl FixpointState {
     ) -> Self {
         let num_cols = schema.fields().len();
         let row_dedup = RowDedupState::try_new(&schema);
+        let key_column_names: Vec<String> = key_column_indices
+            .iter()
+            .filter_map(|&i| schema.fields().get(i).map(|f| f.name().clone()))
+            .collect();
         Self {
             rule_name,
             facts: Vec::new(),
             delta: Vec::new(),
             schema,
             key_column_indices,
+            key_column_names,
             all_column_indices: (0..num_cols).collect(),
             facts_bytes: 0,
             max_derived_bytes,
@@ -451,6 +458,20 @@ impl FixpointState {
             );
             self.schema = Arc::clone(actual_schema);
             self.row_dedup = RowDedupState::try_new(&self.schema);
+            // Recompute key_column_indices from stored KEY column names.
+            // Without this, FoldExec groups by wrong columns when the
+            // physical plan reorders columns vs the pre-inferred schema.
+            let new_indices: Vec<usize> = self
+                .key_column_names
+                .iter()
+                .filter_map(|name| actual_schema.index_of(name).ok())
+                .collect();
+            if new_indices.len() == self.key_column_names.len() {
+                self.key_column_indices = new_indices;
+            }
+            // else: not all KEY columns found in new schema — keep original indices
+            let num_cols = actual_schema.fields().len();
+            self.all_column_indices = (0..num_cols).collect();
         }
     }
 

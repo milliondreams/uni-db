@@ -1070,7 +1070,29 @@ impl LocyExecutionContext for NativeExecutionAdapter<'_> {
             .map_err(|e| LocyError::ExecutorError {
                 message: e.to_string(),
             })?;
-        Ok(native_store_to_row_store(&native_store, program))
+        let mut store = native_store_to_row_store(&native_store, program);
+
+        // Enrich VID integers → full Node objects so SLG/QUERY inside
+        // ASSUME/ABDUCE can access node properties and IS-ref joins work.
+        let store_rows: HashMap<String, Vec<FactRow>> = store
+            .iter()
+            .map(|(k, v)| (k.clone(), v.rows.clone()))
+            .collect();
+        let enriched = enrich_vids_with_nodes(
+            self.db,
+            &native_store,
+            store_rows,
+            &self.graph_ctx,
+            &self.session_ctx,
+        )
+        .await;
+        for (name, rows) in enriched {
+            if let Some(rel) = store.get_mut(&name) {
+                rel.rows = rows;
+            }
+        }
+
+        Ok(store)
     }
 }
 

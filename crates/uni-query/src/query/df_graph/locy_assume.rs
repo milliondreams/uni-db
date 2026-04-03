@@ -112,9 +112,7 @@ fn dispatch_body_command<'a>(
                 // For FOLD rules (MNOR/MPROD), the SLG resolver does not apply
                 // post-fixpoint aggregation and would return raw pre-FOLD match rows.
                 // Use the pre-computed `derived_store` (which ran the full native fixpoint
-                // including FOLD aggregation) when the rule is available there.
-                // The KEY columns in derived_store rows are VIDs (not full Node objects),
-                // so WHERE filters on properties are skipped; only RETURN projection is applied.
+                // including FOLD aggregation and VID→Node enrichment).
                 let rule_name_str = gq.rule_name.to_string();
                 let is_fold_rule = program
                     .rule_catalog

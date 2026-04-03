@@ -75,10 +75,10 @@ pub async fn evaluate_query(
     // so that downstream rules using IS NOT on FOLD rules can find their derived facts.
     let mut fresh_store = RowStore::new();
     for (name, relation) in derived_store.iter() {
-        if let Some(r) = program.rule_catalog.get(name) {
-            if r.clauses.iter().any(|c| !c.fold.is_empty()) {
-                fresh_store.insert(name.clone(), relation.clone());
-            }
+        if let Some(r) = program.rule_catalog.get(name)
+            && r.clauses.iter().any(|c| !c.fold.is_empty())
+        {
+            fresh_store.insert(name.clone(), relation.clone());
         }
     }
     let mut resolver = SLGResolver::new(program, fact_source, config, &mut fresh_store, start);

@@ -2115,6 +2115,7 @@ mod tests {
                 output_name: "cnt".to_string(),
                 kind: FoldAggKind::CountAll,
                 input_col_index: 0, // unused for CountAll
+                input_col_name: None,
             }],
         )
         .await;

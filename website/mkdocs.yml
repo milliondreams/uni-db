@@ -96,6 +96,9 @@ nav:
           - "Locy: Pharma Batch Genealogy (Flagship #2)": examples/python/locy_pharma_batch_genealogy.md
           - "Locy: Cyber Exposure-to-Remediation Twin (Flagship #3)": examples/python/locy_cyber_exposure_twin.md
           - "Locy: Probabilistic Risk Scoring": examples/python/locy_probabilistic_risk_scoring.md
+          - "Locy: Drug Repurposing (Probabilistic)": examples/python/locy_drug_repurposing.md
+          - "Locy: Patent FTO Analysis (Probabilistic)": examples/python/locy_patent_fto.md
+          - "Locy: Regulatory Impact Assessment (Probabilistic)": examples/python/locy_regulatory_impact.md
       - Pydantic OGM:
           - Supply Chain: examples/pydantic/supply_chain.md
           - Recommendation: examples/pydantic/recommendation.md

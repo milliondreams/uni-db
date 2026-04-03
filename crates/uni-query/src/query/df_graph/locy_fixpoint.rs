@@ -120,6 +120,8 @@ pub struct MonotonicFoldBinding {
     pub fold_name: String,
     pub kind: crate::query::df_graph::locy_fold::FoldAggKind,
     pub input_col_index: usize,
+    /// Column name for name-based resolution (more robust than positional index).
+    pub input_col_name: Option<String>,
 }
 
 /// Tracks monotonic aggregate accumulators across fixpoint iterations.
@@ -165,7 +167,16 @@ impl MonotonicAggState {
             for row_idx in 0..batch.num_rows() {
                 let group_key = extract_scalar_key(batch, key_indices, row_idx);
                 for binding in &self.bindings {
-                    let col = batch.column(binding.input_col_index);
+                    // Resolve input column by name first, fall back to index.
+                    let idx = binding
+                        .input_col_name
+                        .as_ref()
+                        .and_then(|name| batch.schema().index_of(name).ok())
+                        .unwrap_or(binding.input_col_index);
+                    if idx >= batch.num_columns() {
+                        continue;
+                    }
+                    let col = batch.column(idx);
                     let val = extract_f64(col.as_ref(), row_idx);
                     if let Some(val) = val {
                         let map_key = (group_key.clone(), binding.fold_name.clone());
@@ -702,6 +713,9 @@ impl FixpointState {
         // first.
         let mut sort_columns = Vec::new();
         for &ki in &self.key_column_indices {
+            if ki >= combined.num_columns() {
+                continue;
+            }
             sort_columns.push(arrow::compute::SortColumn {
                 values: Arc::clone(combined.column(ki)),
                 options: Some(arrow::compute::SortOptions {
@@ -711,6 +725,9 @@ impl FixpointState {
             });
         }
         for criterion in sort_criteria {
+            if criterion.col_index >= combined.num_columns() {
+                continue;
+            }
             sort_columns.push(arrow::compute::SortColumn {
                 values: Arc::clone(combined.column(criterion.col_index)),
                 options: Some(arrow::compute::SortOptions {
@@ -1060,6 +1077,7 @@ async fn run_fixpoint_loop(
                         fold_name: fb.output_name.clone(),
                         kind: fb.kind.clone(),
                         input_col_index: fb.input_col_index,
+                        input_col_name: fb.input_col_name.clone(),
                     })
                     .collect();
                 Some(MonotonicAggState::new(bindings))
@@ -1898,7 +1916,7 @@ pub(crate) fn apply_exact_wmc(
             .map(|&row_idx| overrides.get(&(batch_idx, row_idx)).copied())
             .collect();
 
-        if override_map.iter().any(|o| o.is_some()) {
+        if override_map.iter().any(|o| o.is_some()) && prob_col_idx < columns.len() {
             // Rebuild the PROB column with overrides.
             let existing_prob = columns[prob_col_idx]
                 .as_any()
@@ -3383,6 +3401,7 @@ mod tests {
             fold_name: "total".into(),
             kind: FoldAggKind::Sum,
             input_col_index: 1,
+            input_col_name: None,
         }];
         let mut agg = MonotonicAggState::new(bindings);
 
@@ -3467,6 +3486,7 @@ mod tests {
             fold_name: "prob".into(),
             kind: FoldAggKind::Nor,
             input_col_index: 1,
+            input_col_name: None,
         }]
     }
 
@@ -3476,6 +3496,7 @@ mod tests {
             fold_name: "prob".into(),
             kind: FoldAggKind::Prod,
             input_col_index: 1,
+            input_col_name: None,
         }]
     }
 

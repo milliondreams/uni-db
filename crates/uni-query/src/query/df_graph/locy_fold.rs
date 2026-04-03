@@ -257,8 +257,14 @@ impl ExecutionPlan for FoldExec {
                 return Ok(RecordBatch::new_empty(output_schema));
             }
 
+            // Use the actual batch schema (may differ from pre-computed input_schema
+            // after schema reconciliation in schemaless mode).
+            let actual_schema = batches
+                .first()
+                .map(|b| b.schema())
+                .unwrap_or(input_schema.clone());
             let batch =
-                arrow::compute::concat_batches(&input_schema, &batches).map_err(arrow_err)?;
+                arrow::compute::concat_batches(&actual_schema, &batches).map_err(arrow_err)?;
 
             if batch.num_rows() == 0 {
                 return Ok(RecordBatch::new_empty(output_schema));

@@ -8,9 +8,9 @@ Feature: FOLD Execution Paths — All 6 FOLD Operators Across Execution Paths
   Background:
     Given an empty graph
 
-  # Known limitations (scenarios removed pending engine fixes):
-  # - MCOUNT via ABDUCE finds modification candidate: ABDUCE on MCOUNT rule causes index-out-of-bounds
-  # - All six FOLD operators produce correct values on shared graph: multiple FOLD rules in same program causes index-out-of-bounds
+  # Known limitations resolved:
+  # - MCOUNT ABDUCE: fixed via FoldExec schema reconciliation
+  # - Multi-FOLD same program: fixed via name-based column resolution
 
   # ═══════════════════════════════════════════════════════════════════════════
   # MNOR — noisy-OR: 1 - (1-0.3)*(1-0.5) = 0.65
@@ -960,4 +960,78 @@ Feature: FOLD Execution Paths — All 6 FOLD Operators Across Execution Paths
     And the derived relation 'peak' should contain a fact where mx = 7.0
     And the derived relation 'trough' should have 1 facts
     And the derived relation 'trough' should contain a fact where mn = 3.0
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Re-added scenarios (previously removed, now fixed)
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  Scenario: MCOUNT via ABDUCE finds modification candidate
+    Given having executed:
+      """
+      CREATE (:Team {name: 'Eng'}), (:Person {name: 'Alice'}), (:Person {name: 'Bob'})
+      """
+    And having executed:
+      """
+      MATCH (t:Team {name: 'Eng'}), (p:Person {name: 'Alice'})
+      CREATE (p)-[:MEMBER_OF]->(t)
+      """
+    And having executed:
+      """
+      MATCH (t:Team {name: 'Eng'}), (p:Person {name: 'Bob'})
+      CREATE (p)-[:MEMBER_OF]->(t)
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE team_size AS
+        MATCH (p:Person)-[:MEMBER_OF]->(t:Team)
+        FOLD cnt = MCOUNT()
+        YIELD KEY t, cnt
+
+      ABDUCE NOT team_size WHERE t.name = 'Eng'
+      """
+    Then evaluation should succeed
+    And the command result 0 should be an Abduce with at least 1 modifications
+
+  Scenario: Two independent FOLD rules produce correct values in same program
+    Given having executed:
+      """
+      CREATE (:Node {name: 'A'}), (:Node {name: 'B'})
+      """
+    And having executed:
+      """
+      MATCH (a:Node {name: 'A'}), (b:Node {name: 'B'})
+      CREATE (a)-[:CAUSE {prob: 0.3}]->(b)
+      """
+    And having executed:
+      """
+      MATCH (a:Node {name: 'A'}), (b:Node {name: 'B'})
+      CREATE (a)-[:CAUSE {prob: 0.5}]->(b)
+      """
+    And having executed:
+      """
+      MATCH (a:Node {name: 'A'}), (b:Node {name: 'B'})
+      CREATE (a)-[:CHECK {amt: 10}]->(b)
+      """
+    And having executed:
+      """
+      MATCH (a:Node {name: 'A'}), (b:Node {name: 'B'})
+      CREATE (a)-[:CHECK {amt: 20}]->(b)
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE risk AS
+        MATCH (a:Node)-[e:CAUSE]->(b:Node)
+        FOLD p = MNOR(e.prob)
+        YIELD KEY a, KEY b, p
+
+      CREATE RULE total AS
+        MATCH (a:Node)-[e:CHECK]->(b:Node)
+        FOLD s = MSUM(e.amt)
+        YIELD KEY a, KEY b, s
+      """
+    Then evaluation should succeed
+    And the derived relation 'risk' should have 1 facts
+    And the derived relation 'risk' should contain a fact where p = 0.65
+    And the derived relation 'total' should have 1 facts
+    And the derived relation 'total' should contain a fact where s = 30.0
 

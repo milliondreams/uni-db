@@ -8,8 +8,9 @@ Feature: ASSUME and ABDUCE Extended Combinations (COMB-AAX)
   Background:
     Given an empty graph
 
-  # Known limitations (scenarios removed pending engine fixes):
-  # - 4a-3 ASSUME SET edge weight with FOLD MSUM re-evaluation: ASSUME SET applies to all matched edges instead of filtered subset
+  # Known limitations:
+  # - 4a-3 ASSUME SET + FOLD MSUM: Core Cypher SET applies to all matched edges
+  #   instead of filtered subset (database-layer bug, not Locy-specific)
 
   # ── 4a: ASSUME SET + FOLD + QUERY ───────────────────────────────────
 

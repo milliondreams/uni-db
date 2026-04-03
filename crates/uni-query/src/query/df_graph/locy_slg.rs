@@ -21,8 +21,8 @@ use uni_locy::{CompiledProgram, FactRow, LocyConfig, LocyError, LocyStats};
 
 use super::locy_ast_builder::value_to_expr;
 use super::locy_delta::{
-    RowRelation, RowStore, extract_cypher_conditions, extract_key,
-    multiply_prob_factors_rows, resolve_clause_with_is_refs,
+    RowRelation, RowStore, extract_cypher_conditions, extract_key, multiply_prob_factors_rows,
+    resolve_clause_with_is_refs,
 };
 use super::locy_eval::{eval_expr, literal_to_value, record_batches_to_locy_rows};
 use super::locy_traits::DerivedFactSource;

@@ -141,8 +141,8 @@ fn semi_join_is_ref(
                 // downstream YIELD expressions can reference them (e.g.,
                 // `WHERE d IS signal TO dis ... YIELD KEY d, KEY dis, agg`
                 // needs `agg` to be present in the row).
-                let bound_count = is_ref.subjects.len()
-                    + if is_ref.target.is_some() { 1 } else { 0 };
+                let bound_count =
+                    is_ref.subjects.len() + if is_ref.target.is_some() { 1 } else { 0 };
                 for col in schema.iter().skip(bound_count) {
                     if let Some(val) = derived_fact.get(col) {
                         row.entry(col.clone()).or_insert_with(|| val.clone());
@@ -236,10 +236,7 @@ pub fn multiply_prob_factors_rows(
             }
             row.remove(col);
         }
-        let current = row
-            .get(prob_col)
-            .and_then(|v| v.as_f64())
-            .unwrap_or(1.0);
+        let current = row.get(prob_col).and_then(|v| v.as_f64()).unwrap_or(1.0);
         row.insert(prob_col.to_string(), Value::Float(current * factor));
     }
 }
@@ -308,17 +305,23 @@ pub async fn resolve_clause_with_is_refs(
 
             if is_ref.negated {
                 // Check if target rule has PROB column for complement semantics.
-                let target_prob_col = rule_catalog
-                    .get(&rule_name)
-                    .and_then(|r| {
-                        r.yield_schema.iter().find(|c| c.is_prob).map(|c| c.name.clone())
-                    });
+                let target_prob_col = rule_catalog.get(&rule_name).and_then(|r| {
+                    r.yield_schema
+                        .iter()
+                        .find(|c| c.is_prob)
+                        .map(|c| c.name.clone())
+                });
 
                 if let (Some(tpc), Some(_)) = (&target_prob_col, &calling_rule_prob_col) {
                     // Probabilistic complement: keep all rows, compute 1-p.
                     let complement_col = format!("__prob_complement_{}", rule_name);
                     rows = prob_complement_is_ref(
-                        &rows, &derived_facts, is_ref, &schema, tpc, &complement_col,
+                        &rows,
+                        &derived_facts,
+                        is_ref,
+                        &schema,
+                        tpc,
+                        &complement_col,
                     );
                 } else {
                     // Boolean anti-join (existing behavior).
@@ -404,7 +407,11 @@ mod tests {
         // Alice in risky with p=0.7 → complement=0.3
         // Bob in risky with p=0.3 → complement=0.7
         // Charlie absent → complement=1.0
-        let base = vec![row_int(&[("n", 1)]), row_int(&[("n", 2)]), row_int(&[("n", 3)])];
+        let base = vec![
+            row_int(&[("n", 1)]),
+            row_int(&[("n", 2)]),
+            row_int(&[("n", 3)]),
+        ];
         let derived = vec![
             {
                 let mut r = row_int(&[("n", 1)]);
@@ -420,8 +427,7 @@ mod tests {
         let is_ref = make_is_ref("n", "risky");
         let schema = vec!["n".to_string(), "risk_score".to_string()];
 
-        let result =
-            prob_complement_is_ref(&base, &derived, &is_ref, &schema, "risk_score", "__c");
+        let result = prob_complement_is_ref(&base, &derived, &is_ref, &schema, "risk_score", "__c");
 
         assert_eq!(result.len(), 3);
         let c0 = result[0].get("__c").unwrap().as_f64().unwrap();

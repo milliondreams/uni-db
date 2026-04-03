@@ -8,11 +8,7 @@ Feature: Composite Patterns (COMB-COMP)
     Given an empty graph
 
   # Known limitations (scenarios removed pending engine fixes):
-  # - 3a-5 Four-stratum: two independent FOLD rules feeding a join then IS NOT: two FOLD rules in same stratum causes "FOLD column not found in yield schema"
-  # - 3c-3 Shortest path BEST BY then FOLD SUM all shortest costs with QUERY: BEST BY + FOLD chain not aggregated via QUERY (SLG path)
-  # - 3e-1 Recursive transitive closure then FOLD COUNT then QUERY: recursive rule + FOLD not aggregated via QUERY
-  # - 3e-2 Recursive ALONG cost then FOLD SUM then QUERY per source: recursive ALONG + FOLD not aggregated via QUERY
-  # - 3e-3 Recursive shortest path BEST BY then FOLD MIN then QUERY: recursive BEST BY + FOLD not aggregated via QUERY
+  # - 3a-5 Four-stratum: two independent FOLD rules in same stratum causes "FOLD column not found in yield schema"
 
   # ══════════════════════════════════════════════════════════════════════
   # Group 3a: Multi-stratum chains (3-4 strata)
@@ -444,6 +440,53 @@ Feature: Composite Patterns (COMB-COMP)
     And the derived relation 'shortest' should contain a fact where a.name = 'A' and b.name = 'C' and cost = 4.0
     And the derived relation 'expensive' should contain at least 1 facts
 
+  Scenario: 3c-3 Shortest path BEST BY then FOLD SUM all shortest costs with QUERY
+    Given having executed:
+      """
+      CREATE (:Node {name: 'A'}), (:Node {name: 'B'}), (:Node {name: 'C'})
+      """
+    And having executed:
+      """
+      MATCH (a:Node {name: 'A'}), (b:Node {name: 'B'})
+      CREATE (a)-[:EDGE {w: 3}]->(b)
+      """
+    And having executed:
+      """
+      MATCH (a:Node {name: 'A'}), (c:Node {name: 'C'})
+      CREATE (a)-[:EDGE {w: 10}]->(c)
+      """
+    And having executed:
+      """
+      MATCH (b:Node {name: 'B'}), (c:Node {name: 'C'})
+      CREATE (b)-[:EDGE {w: 2}]->(c)
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE shortest AS
+        MATCH (a:Node)-[e:EDGE]->(b:Node)
+        ALONG cost = e.w
+        BEST BY cost ASC
+        YIELD KEY a, KEY b, cost
+
+      CREATE RULE shortest AS
+        MATCH (a:Node)-[e:EDGE]->(mid:Node)
+        WHERE mid IS shortest TO b
+        ALONG cost = prev.cost + e.w
+        BEST BY cost ASC
+        YIELD KEY a, KEY b, cost
+
+      CREATE RULE total_cost AS
+        MATCH (a:Node)
+        WHERE a IS shortest TO b
+        FOLD s = SUM(cost)
+        YIELD KEY a, s
+
+      QUERY total_cost WHERE a = a RETURN a.name AS name, s
+      """
+    Then evaluation should succeed
+    And the derived relation 'total_cost' should have 2 facts
+    And the command result 0 should be a Query with 2 rows
+
   # ══════════════════════════════════════════════════════════════════════
   # Group 3d: similar_to + WHERE + IS NOT + QUERY
   # ══════════════════════════════════════════════════════════════════════
@@ -607,6 +650,138 @@ Feature: Composite Patterns (COMB-COMP)
   # ══════════════════════════════════════════════════════════════════════
   # Group 3e: Recursive + FOLD + QUERY
   # ══════════════════════════════════════════════════════════════════════
+
+  Scenario: 3e-1 Recursive transitive closure then FOLD COUNT then QUERY
+    Given having executed:
+      """
+      CREATE (:Person {name: 'A'}), (:Person {name: 'B'}), (:Person {name: 'C'})
+      """
+    And having executed:
+      """
+      MATCH (a:Person {name: 'A'}), (b:Person {name: 'B'})
+      CREATE (a)-[:KNOWS]->(b)
+      """
+    And having executed:
+      """
+      MATCH (b:Person {name: 'B'}), (c:Person {name: 'C'})
+      CREATE (b)-[:KNOWS]->(c)
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE reach AS
+        MATCH (a:Person)-[:KNOWS]->(b:Person)
+        YIELD KEY a, KEY b
+
+      CREATE RULE reach AS
+        MATCH (a:Person)-[:KNOWS]->(mid:Person)
+        WHERE mid IS reach TO b
+        YIELD KEY a, KEY b
+
+      CREATE RULE summary AS
+        MATCH (a:Person)
+        WHERE a IS reach TO b
+        FOLD cnt = MCOUNT()
+        YIELD KEY a, cnt
+
+      QUERY summary WHERE a = a RETURN a.name AS name, cnt
+      """
+    Then evaluation should succeed
+    And the derived relation 'summary' should have 2 facts
+    And the command result 0 should be a Query with 2 rows
+
+  Scenario: 3e-2 Recursive ALONG cost then FOLD SUM then QUERY per source
+    Given having executed:
+      """
+      CREATE (:Node {name: 'A'}), (:Node {name: 'B'}), (:Node {name: 'C'})
+      """
+    And having executed:
+      """
+      MATCH (a:Node {name: 'A'}), (b:Node {name: 'B'})
+      CREATE (a)-[:EDGE {w: 3}]->(b)
+      """
+    And having executed:
+      """
+      MATCH (b:Node {name: 'B'}), (c:Node {name: 'C'})
+      CREATE (b)-[:EDGE {w: 2}]->(c)
+      """
+    And having executed:
+      """
+      MATCH (a:Node {name: 'A'}), (c:Node {name: 'C'})
+      CREATE (a)-[:EDGE {w: 10}]->(c)
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE path AS
+        MATCH (a:Node)-[e:EDGE]->(b:Node)
+        ALONG cost = e.w
+        BEST BY cost ASC
+        YIELD KEY a, KEY b, cost
+
+      CREATE RULE path AS
+        MATCH (a:Node)-[e:EDGE]->(mid:Node)
+        WHERE mid IS path TO b
+        ALONG cost = prev.cost + e.w
+        BEST BY cost ASC
+        YIELD KEY a, KEY b, cost
+
+      CREATE RULE total AS
+        MATCH (a:Node)
+        WHERE a IS path TO b
+        FOLD s = SUM(cost)
+        YIELD KEY a, s
+
+      QUERY total WHERE a = a RETURN a.name AS name, s
+      """
+    Then evaluation should succeed
+    And the derived relation 'total' should have 2 facts
+    And the command result 0 should be a Query with 2 rows
+
+  Scenario: 3e-3 Recursive shortest path BEST BY then FOLD MIN then QUERY
+    Given having executed:
+      """
+      CREATE (:Node {name: 'A'}), (:Node {name: 'B'}), (:Node {name: 'C'})
+      """
+    And having executed:
+      """
+      MATCH (a:Node {name: 'A'}), (b:Node {name: 'B'})
+      CREATE (a)-[:EDGE {w: 3}]->(b)
+      """
+    And having executed:
+      """
+      MATCH (b:Node {name: 'B'}), (c:Node {name: 'C'})
+      CREATE (b)-[:EDGE {w: 2}]->(c)
+      """
+    And having executed:
+      """
+      MATCH (a:Node {name: 'A'}), (c:Node {name: 'C'})
+      CREATE (a)-[:EDGE {w: 10}]->(c)
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE path AS
+        MATCH (a:Node)-[e:EDGE]->(b:Node)
+        ALONG cost = e.w
+        BEST BY cost ASC
+        YIELD KEY a, KEY b, cost
+
+      CREATE RULE path AS
+        MATCH (a:Node)-[e:EDGE]->(mid:Node)
+        WHERE mid IS path TO b
+        ALONG cost = prev.cost + e.w
+        BEST BY cost ASC
+        YIELD KEY a, KEY b, cost
+
+      CREATE RULE cheapest AS
+        MATCH (a:Node)
+        WHERE a IS path TO b
+        FOLD mn = MIN(cost)
+        YIELD KEY a, mn
+
+      QUERY cheapest WHERE a = a RETURN a.name AS name, mn
+      """
+    Then evaluation should succeed
+    And the derived relation 'cheapest' should have 2 facts
+    And the command result 0 should be a Query with 2 rows
 
   Scenario: 3e-4 Recursive reachability then FOLD MCOUNT then IS NOT then QUERY
     Given having executed:

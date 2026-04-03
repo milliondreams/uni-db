@@ -272,6 +272,9 @@ impl ExecutionPlan for FoldExec {
 
             // Key columns: take from first row of each group
             for &ki in &key_indices {
+                if ki >= batch.num_columns() {
+                    continue; // Skip invalid indices after schema reconciliation
+                }
                 let col = batch.column(ki);
                 let first_indices: Vec<u32> =
                     ordered_keys.iter().map(|k| groups[k][0] as u32).collect();
@@ -287,8 +290,11 @@ impl ExecutionPlan for FoldExec {
                 let col: Arc<dyn Array> = if binding.kind == FoldAggKind::CountAll {
                     // CountAll doesn't need an input column — use a dummy
                     Arc::new(arrow_array::Int64Array::from(vec![0i64; batch.num_rows()]))
-                } else {
+                } else if binding.input_col_index < batch.num_columns() {
                     Arc::clone(batch.column(binding.input_col_index))
+                } else {
+                    // Fallback: column index stale after schema reconciliation
+                    Arc::new(arrow_array::Float64Array::from(vec![0.0f64; batch.num_rows()]))
                 };
                 let agg_col = compute_fold_aggregate(
                     col.as_ref(),

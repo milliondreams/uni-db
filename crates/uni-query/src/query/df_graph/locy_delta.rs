@@ -475,7 +475,7 @@ mod tests {
         multiply_prob_factors_rows(&mut rows, "safety", &["__prob_complement_risky".into()]);
 
         assert!(
-            rows[0].get("__prob_complement_risky").is_none(),
+            !rows[0].contains_key("__prob_complement_risky"),
             "complement col should be removed"
         );
         let safety = rows[0].get("safety").unwrap().as_f64().unwrap();

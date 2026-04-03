@@ -1,0 +1,4 @@
+sys_id,reason
+SYS-01,ERP Core: multi-regulation exposure via DORA+SOX+PCI obligation chains
+SYS-02,Trading Platform: DORA resilience gaps propagate through trade execution and fraud detection
+SYS-03,CRM System: GDPR data protection obligations with partial control coverage

@@ -1,0 +1,27 @@
+{
+  "generated_at": "2026-04-01T20:21:00.923046+00:00",
+  "snapshot_date": "2026-03-01",
+  "source": {
+    "description": "Synthetic biomedical knowledge graph for drug repurposing demo. Inspired by Hetionet, DrugBank, STRING, DisGeNET, and OpenTargets but fully synthetic.",
+    "urls": {
+      "hetionet": "https://het.io",
+      "drugbank": "https://go.drugbank.com",
+      "string_db": "https://string-db.org",
+      "disgenet": "https://www.disgenet.org",
+      "opentargets": "https://platform.opentargets.org"
+    },
+    "license_note": "All data is synthetic and generated for demonstration purposes only. Not for clinical use."
+  },
+  "shape": {
+    "drugs": 30,
+    "proteins": 50,
+    "diseases": 20,
+    "side_effects": 15,
+    "binds": 73,
+    "interacts": 72,
+    "associated_with": 46,
+    "indicated_for": 22,
+    "causes_adr": 34,
+    "notebook_cases": 4
+  }
+}

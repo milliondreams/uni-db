@@ -1,0 +1,28 @@
+{
+  "generated_at": "2026-04-01T20:21:01.741120+00:00",
+  "snapshot_date": "2026-03-01",
+  "source": {
+    "description": "Synthetic patent portfolio and product feature data for freedom-to-operate analysis demo. Domain: wireless IoT sensor networks.",
+    "urls": {
+      "uspto": "https://www.uspto.gov",
+      "epo": "https://www.epo.org",
+      "google_patents": "https://patents.google.com"
+    },
+    "license_note": "All data is synthetic and generated for demonstration purposes only. Not legal advice."
+  },
+  "shape": {
+    "patents": 8,
+    "claims": 18,
+    "claim_elements": 48,
+    "products": 3,
+    "features": 15,
+    "publications": 10,
+    "has_claim": 18,
+    "depends_on": 9,
+    "has_element": 48,
+    "has_feature": 15,
+    "reads_on": 26,
+    "prior_art_for": 15,
+    "notebook_cases": 1
+  }
+}

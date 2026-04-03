@@ -1,0 +1,51 @@
+protein_id,name,gene_symbol,family
+PROT_001,AMP-activated protein kinase,AMPK,kinase
+PROT_002,Mechanistic target of rapamycin,mTOR,kinase
+PROT_003,Epidermal growth factor receptor,EGFR,kinase
+PROT_004,Janus kinase 1,JAK1,kinase
+PROT_005,Janus kinase 2,JAK2,kinase
+PROT_006,Janus kinase 3,JAK3,kinase
+PROT_007,Phosphodiesterase 5A,PDE5A,phosphodiesterase
+PROT_008,Cereblon,CRBN,E3_ligase
+PROT_009,Ikaros family zinc finger 1,IKZF1,transcription_factor
+PROT_010,Ikaros family zinc finger 3,IKZF3,transcription_factor
+PROT_011,AP2-associated kinase 1,AAK1,kinase
+PROT_012,Angiotensin-converting enzyme 2,ACE2,enzyme
+PROT_013,Interleukin 6,IL6,receptor
+PROT_014,Tumor necrosis factor,TNF,receptor
+PROT_015,Vascular endothelial growth factor receptor 2,VEGFR2,kinase
+PROT_016,Cyclooxygenase 1,COX1,enzyme
+PROT_017,Cyclooxygenase 2,COX2,enzyme
+PROT_018,B-Raf proto-oncogene,BRAF,kinase
+PROT_019,Phosphoinositide 3-kinase,PI3K,kinase
+PROT_020,Protein kinase B,AKT,kinase
+PROT_021,Mitogen-activated protein kinase 1,MAPK1,kinase
+PROT_022,Signal transducer and activator of transcription 3,STAT3,transcription_factor
+PROT_023,Nuclear factor kappa-B,NFKB1,transcription_factor
+PROT_024,Peroxisome proliferator-activated receptor gamma,PPARG,receptor
+PROT_025,N-methyl-D-aspartate receptor subunit 1,GRIN1,ion_channel
+PROT_026,Acetylcholinesterase,ACHE,enzyme
+PROT_027,Butyrylcholinesterase,BCHE,enzyme
+PROT_028,Gamma-aminobutyric acid receptor subunit alpha-1,GABRA1,ion_channel
+PROT_029,Voltage-gated calcium channel subunit alpha-2/delta-1,CACNA2D1,ion_channel
+PROT_030,Estrogen receptor alpha,ESR1,receptor
+PROT_031,Angiotensin II receptor type 1,AGTR1,receptor
+PROT_032,Beta-2 adrenergic receptor,ADRB2,receptor
+PROT_033,Histone deacetylase 1,HDAC1,enzyme
+PROT_034,Matrix metalloproteinase 9,MMP9,protease
+PROT_035,Caspase 3,CASP3,protease
+PROT_036,Hypoxia-inducible factor 1-alpha,HIF1A,transcription_factor
+PROT_037,Sirtuin 1,SIRT1,enzyme
+PROT_038,Glycogen synthase kinase 3 beta,GSK3B,kinase
+PROT_039,Tumor protein p53,TP53,transcription_factor
+PROT_040,BCL2 apoptosis regulator,BCL2,enzyme
+PROT_041,Interleukin 1 beta,IL1B,receptor
+PROT_042,Transforming growth factor beta 1,TGFB1,receptor
+PROT_043,Solute carrier family 6 member 3,SLC6A3,transporter
+PROT_044,Solute carrier family 6 member 4,SLC6A4,transporter
+PROT_045,Transmembrane serine protease 2,TMPRSS2,protease
+PROT_046,Cathepsin L,CTSL,protease
+PROT_047,Dihydrofolate reductase,DHFR,enzyme
+PROT_048,Aldehyde dehydrogenase 2,ALDH2,enzyme
+PROT_049,Wnt signaling pathway component DVL1,DVL1,enzyme
+PROT_050,Cyclin-dependent kinase 4,CDK4,kinase

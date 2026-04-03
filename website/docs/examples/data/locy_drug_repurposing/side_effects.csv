@@ -1,0 +1,16 @@
+se_id,name,severity,severity_weight
+SE_001,Lactic acidosis,severe,0.9
+SE_002,Teratogenicity,severe,0.9
+SE_003,Hypotension,moderate,0.5
+SE_004,Immunosuppression,severe,0.9
+SE_005,Nausea,mild,0.2
+SE_006,Hepatotoxicity,severe,0.9
+SE_007,QT prolongation,severe,0.9
+SE_008,Nephrotoxicity,severe,0.9
+SE_009,Neutropenia,severe,0.9
+SE_010,Peripheral neuropathy,moderate,0.5
+SE_011,Drowsiness,mild,0.2
+SE_012,Weight gain,moderate,0.5
+SE_013,GI bleeding,severe,0.9
+SE_014,Photosensitivity,mild,0.2
+SE_015,Rash,mild,0.2

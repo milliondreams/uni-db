@@ -1,0 +1,30 @@
+{
+  "generated_at": "2026-04-01T20:21:02.044084+00:00",
+  "snapshot_date": "2026-03-01",
+  "source": {
+    "description": "Synthetic regulatory compliance data for change impact analysis demo. Modeled on financial services GRC requirements across GDPR, SOX, DORA, HIPAA, and PCI-DSS.",
+    "urls": {
+      "nist_800_53": "https://csrc.nist.gov/publications/detail/sp/800-53/rev-5/final",
+      "dora_regulation": "https://eur-lex.europa.eu/eli/reg/2022/2554",
+      "gdpr": "https://gdpr.eu",
+      "sox": "https://www.sec.gov/spotlight/sarbanes-oxley.htm"
+    },
+    "license_note": "All data is synthetic and generated for demonstration purposes only. Not compliance advice."
+  },
+  "shape": {
+    "regulations": 5,
+    "obligations": 20,
+    "controls": 25,
+    "processes": 10,
+    "systems": 8,
+    "vendors": 6,
+    "contracts": 6,
+    "requires": 20,
+    "satisfied_by": 34,
+    "protects": 30,
+    "runs_on": 15,
+    "operated_by": 8,
+    "governed_by": 6,
+    "notebook_cases": 3
+  }
+}

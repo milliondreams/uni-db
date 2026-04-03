@@ -1,0 +1,21 @@
+disease_id,name,therapeutic_area
+DIS_001,Type 2 diabetes,metabolic
+DIS_002,Rheumatoid arthritis,autoimmune
+DIS_003,Erectile dysfunction,sexual_health
+DIS_004,COVID-19,infectious
+DIS_005,Multiple myeloma,oncology
+DIS_006,Alzheimer disease,neurodegenerative
+DIS_007,Parkinson disease,neurodegenerative
+DIS_008,Breast cancer,oncology
+DIS_009,Lung cancer,oncology
+DIS_010,Colorectal cancer,oncology
+DIS_011,Glioblastoma,oncology
+DIS_012,Hypertension,cardiovascular
+DIS_013,Pulmonary arterial hypertension,pulmonary
+DIS_014,Epilepsy,neurological
+DIS_015,Neuropathic pain,neurological
+DIS_016,Depression,psychiatric
+DIS_017,Psoriasis,autoimmune
+DIS_018,Crohn disease,gastrointestinal
+DIS_019,Ulcerative colitis,gastrointestinal
+DIS_020,Idiopathic pulmonary fibrosis,pulmonary

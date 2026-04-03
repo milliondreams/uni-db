@@ -1,0 +1,11 @@
+proc_id,name,department,criticality
+PROC-01,Payment processing,operations,0.98
+PROC-02,Customer onboarding (KYC),compliance,0.9
+PROC-03,Trade execution,trading,0.95
+PROC-04,Risk reporting,risk,0.85
+PROC-05,Regulatory filing,compliance,0.88
+PROC-06,IT change management,IT,0.75
+PROC-07,Vendor management,legal,0.72
+PROC-08,Data analytics,risk,0.7
+PROC-09,Customer service,operations,0.65
+PROC-10,Fraud detection,risk,0.92

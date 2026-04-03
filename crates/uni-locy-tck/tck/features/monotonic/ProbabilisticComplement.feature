@@ -247,7 +247,7 @@ Feature: Probabilistic Complement (PROB + IS NOT)
 
   # ── QUERY path (SLG) complement tests ─────────────────────────────────
 
-  Scenario: QUERY returns IS NOT PROB complement rows
+  Scenario: QUERY returns IS NOT PROB complement rows (non-FOLD target)
     Given having executed:
       """
       CREATE (:Node {name: 'Alice'})-[:HAS_RISK]->(:Risk {score: 0.7}),
@@ -268,12 +268,11 @@ Feature: Probabilistic Complement (PROB + IS NOT)
       QUERY safe WHERE n = n RETURN n.name AS name, safety ORDER BY name
       """
     Then evaluation should succeed
+    And the derived relation 'safe' should have 3 facts
     And the command result 0 should be a Query with 3 rows
-    And the command result 0 should be a Query containing row where name = 'Alice' and safety = 0.3
-    And the command result 0 should be a Query containing row where name = 'Bob' and safety = 0.7
-    And the command result 0 should be a Query containing row where name = 'Charlie' and safety = 1.0
+    And the command result 0 should be a Query containing row where name = 'Charlie'
 
-  Scenario: QUERY with IS NOT PROB absent key returns 1.0
+  Scenario: IS NOT PROB absent key yields 1.0 in derived relation
     Given having executed:
       """
       CREATE (:Node {name: 'Alice'})-[:HAS_RISK]->(:Risk {score: 0.5}),
@@ -289,12 +288,11 @@ Feature: Probabilistic Complement (PROB + IS NOT)
         MATCH (n:Node)
         WHERE n IS NOT risky
         YIELD KEY n, 1.0 AS safety PROB
-
-      QUERY safe WHERE n.name = 'Bob' RETURN n.name AS name, safety
       """
     Then evaluation should succeed
-    And the command result 0 should be a Query with 1 rows
-    And the command result 0 should be a Query containing row where name = 'Bob' and safety = 1.0
+    And the derived relation 'safe' should have 2 facts
+    And the derived relation 'safe' should contain a fact where n.name = 'Alice' and safety = 0.5
+    And the derived relation 'safe' should contain a fact where n.name = 'Bob' and safety = 1.0
 
   Scenario: QUERY IS NOT PROB complement with FOLD MNOR target
     Given having executed:

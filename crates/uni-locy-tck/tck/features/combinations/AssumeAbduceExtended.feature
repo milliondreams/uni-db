@@ -8,9 +8,7 @@ Feature: ASSUME and ABDUCE Extended Combinations (COMB-AAX)
   Background:
     Given an empty graph
 
-  # Known limitations:
-  # - 4a-3 ASSUME SET + FOLD MSUM: Core Cypher SET applies to all matched edges
-  #   instead of filtered subset (database-layer bug, not Locy-specific)
+  # All known limitations resolved.
 
   # ── 4a: ASSUME SET + FOLD + QUERY ───────────────────────────────────
 
@@ -81,6 +79,41 @@ Feature: ASSUME and ABDUCE Extended Combinations (COMB-AAX)
     And the derived relation 'joint' should contain a fact where p = 0.72
     And the command result 0 should be an Assume with 1 rows
     And the command result 0 should be an Assume containing row where p = 0.4
+
+  Scenario: 4a-3 ASSUME SET edge weight with FOLD MSUM re-evaluation scoped to target
+    Given having executed:
+      """
+      CREATE (:Dept {name: 'Sales'}), (:Invoice {id: 'I1'}), (:Invoice {id: 'I2'})
+      """
+    And having executed:
+      """
+      MATCH (d:Dept {name: 'Sales'}), (i:Invoice {id: 'I1'})
+      CREATE (d)-[:PAID {amount: 100}]->(i)
+      """
+    And having executed:
+      """
+      MATCH (d:Dept {name: 'Sales'}), (i:Invoice {id: 'I2'})
+      CREATE (d)-[:PAID {amount: 200}]->(i)
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE spending AS
+        MATCH (d:Dept)-[r:PAID]->(i:Invoice)
+        FOLD total = MSUM(r.amount)
+        YIELD KEY d, total
+
+      ASSUME {
+        MATCH (d:Dept {name: 'Sales'})-[r:PAID]->(i:Invoice {id: 'I2'})
+        SET r.amount = 500
+      } THEN {
+        QUERY spending WHERE d.name = 'Sales' RETURN total
+      }
+      """
+    Then evaluation should succeed
+    And the derived relation 'spending' should have 1 facts
+    And the derived relation 'spending' should contain a fact where total = 300.0
+    And the command result 0 should be an Assume with 1 rows
+    And the command result 0 should be an Assume containing row where total = 600.0
 
   Scenario: 4a-4 ASSUME CREATE new edge with FOLD MNOR adds new cause
     Given having executed:

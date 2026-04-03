@@ -691,14 +691,28 @@ impl HybridPhysicalPlanner {
                         all_properties,
                         scope_match_variables,
                     )?;
-                    self.apply_schemaless_traverse_filter(
+                    // Apply edge property filter first, then target node filter.
+                    // Without the target_filter, MATCH (a)-[r]->(b {prop: val}) SET r.x
+                    // would apply SET to ALL edges from a, ignoring b's properties.
+                    let edge_filtered = self.apply_schemaless_traverse_filter(
                         base_plan,
                         edge_filter_expr.as_ref(),
                         source_variable,
                         target_variable,
                         step_variable.as_deref(),
                         path_variable.as_deref(),
-                        false, // is_variable_length
+                        false,
+                        *optional,
+                        optional_pattern_vars,
+                    )?;
+                    self.apply_schemaless_traverse_filter(
+                        edge_filtered,
+                        target_filter.as_ref(),
+                        source_variable,
+                        target_variable,
+                        step_variable.as_deref(),
+                        path_variable.as_deref(),
+                        false,
                         *optional,
                         optional_pattern_vars,
                     )

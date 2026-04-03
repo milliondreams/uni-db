@@ -707,6 +707,10 @@ async fn run_program(
             // works because recursive stratum rules share compatible schemas.
             // Revisit when cross-stratum consumption of individual recursive rules is needed.
             for rule in &stratum.rules {
+                // Skip DERIVE-only rules (empty yield_schema).
+                if rule.yield_schema.is_empty() {
+                    continue;
+                }
                 // Write converged facts into registry handles for cross-stratum consumers
                 let rule_entries = registry.entries_for_rule(&rule.name);
                 for entry in rule_entries {
@@ -740,6 +744,14 @@ async fn run_program(
             let task_ctx = session_ctx.read().task_ctx();
 
             for (rule, fp_rule) in stratum.rules.iter().zip(fixpoint_rules.iter()) {
+                // DERIVE-only rules have empty yield_schema (the compiler's
+                // infer_yield_schema only matches RuleOutput::Yield). Skip them
+                // in the fixpoint loop — DERIVE materialization is handled by
+                // the DERIVE command dispatch, not by the fixpoint.
+                if rule.yield_schema.is_empty() {
+                    continue;
+                }
+
                 // Process each clause independently (per-clause IS NOT).
                 let mut tagged_clause_facts: Vec<(usize, Vec<RecordBatch>)> = Vec::new();
                 for (clause_idx, (clause, fp_clause)) in

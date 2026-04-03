@@ -239,17 +239,38 @@ def _prob_db():
     db = uni_db.UniBuilder.temporary().build()
     (
         db.schema()
-        .label("Node").property("name", "string").done()
-        .label("Drug").property("name", "string").done()
-        .label("Disease").property("name", "string").done()
-        .label("SE").property("name", "string").property("sev", "float64").done()
-        .label("Risk").property("score", "float64").done()
-        .edge_type("CAUSE", ["Node"], ["Node"]).property("prob", "float64").done()
-        .edge_type("CHECK", ["Node"], ["Node"]).property("conf", "float64").done()
-        .edge_type("HAS_RISK", ["Node"], ["Risk"]).done()
-        .edge_type("SIG", ["Drug"], ["Disease"]).property("s", "float64").done()
-        .edge_type("IND", ["Drug"], ["Disease"]).done()
-        .edge_type("ADR", ["Drug"], ["SE"]).property("freq", "float64").done()
+        .label("Node")
+        .property("name", "string")
+        .done()
+        .label("Drug")
+        .property("name", "string")
+        .done()
+        .label("Disease")
+        .property("name", "string")
+        .done()
+        .label("SE")
+        .property("name", "string")
+        .property("sev", "float64")
+        .done()
+        .label("Risk")
+        .property("score", "float64")
+        .done()
+        .edge_type("CAUSE", ["Node"], ["Node"])
+        .property("prob", "float64")
+        .done()
+        .edge_type("CHECK", ["Node"], ["Node"])
+        .property("conf", "float64")
+        .done()
+        .edge_type("HAS_RISK", ["Node"], ["Risk"])
+        .done()
+        .edge_type("SIG", ["Drug"], ["Disease"])
+        .property("s", "float64")
+        .done()
+        .edge_type("IND", ["Drug"], ["Disease"])
+        .done()
+        .edge_type("ADR", ["Drug"], ["SE"])
+        .property("freq", "float64")
+        .done()
         .apply()
     )
     return db
@@ -262,8 +283,12 @@ def test_mnor_basic():
     tx = session.tx()
     tx.execute("CREATE (:Node {name: 'A'})")
     tx.execute("CREATE (:Node {name: 'B'})")
-    tx.execute("MATCH (a:Node {name:'A'}),(b:Node {name:'B'}) CREATE (a)-[:CAUSE {prob:0.3}]->(b)")
-    tx.execute("MATCH (a:Node {name:'A'}),(b:Node {name:'B'}) CREATE (a)-[:CAUSE {prob:0.5}]->(b)")
+    tx.execute(
+        "MATCH (a:Node {name:'A'}),(b:Node {name:'B'}) CREATE (a)-[:CAUSE {prob:0.3}]->(b)"
+    )
+    tx.execute(
+        "MATCH (a:Node {name:'A'}),(b:Node {name:'B'}) CREATE (a)-[:CAUSE {prob:0.5}]->(b)"
+    )
     tx.commit()
     result = session.locy("""
 CREATE RULE risk AS MATCH (a:Node)-[e:CAUSE]->(b:Node) FOLD p=MNOR(e.prob) YIELD KEY a, KEY b, p
@@ -280,8 +305,12 @@ def test_mprod_basic():
     tx = session.tx()
     tx.execute("CREATE (:Node {name: 'A'})")
     tx.execute("CREATE (:Node {name: 'B'})")
-    tx.execute("MATCH (a:Node {name:'A'}),(b:Node {name:'B'}) CREATE (a)-[:CHECK {conf:0.8}]->(b)")
-    tx.execute("MATCH (a:Node {name:'A'}),(b:Node {name:'B'}) CREATE (a)-[:CHECK {conf:0.9}]->(b)")
+    tx.execute(
+        "MATCH (a:Node {name:'A'}),(b:Node {name:'B'}) CREATE (a)-[:CHECK {conf:0.8}]->(b)"
+    )
+    tx.execute(
+        "MATCH (a:Node {name:'A'}),(b:Node {name:'B'}) CREATE (a)-[:CHECK {conf:0.9}]->(b)"
+    )
     tx.commit()
     result = session.locy("""
 CREATE RULE cov AS MATCH (a:Node)-[e:CHECK]->(b:Node) FOLD p=MPROD(e.conf) YIELD KEY a, KEY b, p
@@ -318,7 +347,9 @@ def test_fold_query_node_properties():
     tx = session.tx()
     tx.execute("CREATE (:Node {name: 'A'})")
     tx.execute("CREATE (:Node {name: 'B'})")
-    tx.execute("MATCH (a:Node {name:'A'}),(b:Node {name:'B'}) CREATE (a)-[:CAUSE {prob:0.7}]->(b)")
+    tx.execute(
+        "MATCH (a:Node {name:'A'}),(b:Node {name:'B'}) CREATE (a)-[:CAUSE {prob:0.7}]->(b)"
+    )
     tx.commit()
     result = session.locy("""
 CREATE RULE risk AS MATCH (a:Node)-[e:CAUSE]->(b:Node) FOLD p=MNOR(e.prob) YIELD KEY a, KEY b, p
@@ -338,9 +369,15 @@ def test_composite_key_is_not():
     tx.execute("CREATE (:Drug {name: 'A'})")
     tx.execute("CREATE (:Disease {name: 'Flu'})")
     tx.execute("CREATE (:Disease {name: 'Cold'})")
-    tx.execute("MATCH (d:Drug {name:'A'}),(dis:Disease {name:'Flu'}) CREATE (d)-[:IND]->(dis)")
-    tx.execute("MATCH (d:Drug {name:'A'}),(dis:Disease {name:'Flu'}) CREATE (d)-[:SIG {s:0.8}]->(dis)")
-    tx.execute("MATCH (d:Drug {name:'A'}),(dis:Disease {name:'Cold'}) CREATE (d)-[:SIG {s:0.6}]->(dis)")
+    tx.execute(
+        "MATCH (d:Drug {name:'A'}),(dis:Disease {name:'Flu'}) CREATE (d)-[:IND]->(dis)"
+    )
+    tx.execute(
+        "MATCH (d:Drug {name:'A'}),(dis:Disease {name:'Flu'}) CREATE (d)-[:SIG {s:0.8}]->(dis)"
+    )
+    tx.execute(
+        "MATCH (d:Drug {name:'A'}),(dis:Disease {name:'Cold'}) CREATE (d)-[:SIG {s:0.6}]->(dis)"
+    )
     tx.commit()
     result = session.locy("""
 CREATE RULE signal AS MATCH (d:Drug)-[e:SIG]->(dis:Disease) FOLD ev=MNOR(e.s) YIELD KEY d, KEY dis, ev
@@ -382,13 +419,19 @@ def test_assume_fold_query():
     tx = session.tx()
     tx.execute("CREATE (:Node {name: 'A'})")
     tx.execute("CREATE (:Node {name: 'B'})")
-    tx.execute("MATCH (a:Node {name:'A'}),(b:Node {name:'B'}) CREATE (a)-[:CAUSE {prob:0.4}]->(b)")
+    tx.execute(
+        "MATCH (a:Node {name:'A'}),(b:Node {name:'B'}) CREATE (a)-[:CAUSE {prob:0.4}]->(b)"
+    )
     tx.commit()
-    result = session.locy_with("""
+    result = (
+        session.locy_with("""
 CREATE RULE risk AS MATCH (a:Node)-[e:CAUSE]->(b:Node) FOLD p=MNOR(e.prob) YIELD KEY a, KEY b, p
 ASSUME { MATCH (a:Node {name:'A'})-[e:CAUSE]->(b:Node {name:'B'}) SET e.prob = 0.9 }
 THEN { QUERY risk WHERE a.name = 'A' RETURN a.name AS name, p }
-""").max_iterations(200).run()
+""")
+        .max_iterations(200)
+        .run()
+    )
     # Baseline should be 0.4
     baseline = result.derived.get("risk", [])
     assert baseline[0]["p"] == pytest.approx(0.4, abs=1e-6)

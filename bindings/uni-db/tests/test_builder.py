@@ -52,7 +52,9 @@ class TestUniBuilderOpenModes:
             db1 = uni_db.UniBuilder.create(path).build()
             db1.schema().label("Person").property("name", "string").apply()
             session1 = db1.session()
-            session1.query("CREATE (n:Person {name: 'Alice'})")
+            tx = session1.tx()
+            tx.execute("CREATE (n:Person {name: 'Alice'})")
+            tx.commit()
             db1.flush()
             del session1
             del db1
@@ -92,7 +94,9 @@ class TestUniBuilderOpenModes:
             db1 = uni_db.UniBuilder.create(path).build()
             db1.schema().label("Person").property("name", "string").apply()
             session1 = db1.session()
-            session1.query("CREATE (n:Person {name: 'Bob'})")
+            tx = session1.tx()
+            tx.execute("CREATE (n:Person {name: 'Bob'})")
+            tx.commit()
             db1.flush()
             del session1
             del db1
@@ -110,7 +114,9 @@ class TestUniBuilderOpenModes:
         assert db is not None
         db.schema().label("Temp").property("value", "int").apply()
         session = db.session()
-        session.query("CREATE (n:Temp {value: 42})")
+        tx = session.tx()
+        tx.execute("CREATE (n:Temp {value: 42})")
+        tx.commit()
         db.flush()
         results = session.query("MATCH (n:Temp) RETURN n.value AS value")
         assert len(results) == 1

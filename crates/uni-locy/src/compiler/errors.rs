@@ -17,6 +17,9 @@ pub enum LocyCompileError {
     #[error("BEST BY with monotonic fold '{fold}' in rule '{rule}'")]
     BestByWithMonotonicFold { rule: String, fold: String },
 
+    #[error("post-FOLD WHERE in rule '{rule}' requires a FOLD clause")]
+    HavingWithoutFold { rule: String },
+
     #[error("wardedness violation: variable '{variable}' in rule '{rule}' not bound by MATCH")]
     WardednessViolation { rule: String, variable: String },
 

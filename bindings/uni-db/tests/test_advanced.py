@@ -74,7 +74,9 @@ class TestAdvanced(unittest.TestCase):
         # Insert data with vector
         # Uni supports vector literals or array?
         # Cypher: CREATE (n:Entity {embedding: [0.1, 0.2, 0.3]})
-        self.session.query("CREATE (n:Entity {id: 3, embedding: [0.1, 0.2, 0.3]})")
+        tx = self.session.tx()
+        tx.execute("CREATE (n:Entity {id: 3, embedding: [0.1, 0.2, 0.3]})")
+        tx.commit()
 
         # Query using vector search (knn)
         # CALL db.index.vector.queryNodes('Entity', 'embedding', 1, [0.1, 0.2, 0.3])

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use uni_cypher::ast::{Clause, Pattern, Query};
+use uni_cypher::ast::{Clause, Expr, Pattern, Query};
 use uni_cypher::locy_ast::{
     AbduceQuery, AlongBinding, BestByClause, DeriveCommand, ExplainRule, FoldBinding, GoalQuery,
     RuleCondition, RuleOutput,
@@ -59,6 +59,8 @@ pub struct CompiledClause {
     pub where_conditions: Vec<RuleCondition>,
     pub along: Vec<AlongBinding>,
     pub fold: Vec<FoldBinding>,
+    /// Post-FOLD filter conditions (HAVING semantics).
+    pub having: Vec<Expr>,
     pub best_by: Option<BestByClause>,
     pub output: RuleOutput,
     pub priority: Option<i64>,

@@ -2742,9 +2742,10 @@ USE other.module { rule1, rule2 }
 
 CREATE RULE ruleName [PRIORITY n] AS
     MATCH pattern
-    WHERE conditions
+    WHERE conditions                     -- pre-aggregation filter
     [ALONG name = expr]
     [FOLD name = aggregate]
+    [WHERE aggregate_condition]          -- post-FOLD filter (HAVING)
     [BEST BY expr [ASC|DESC], ...]
     [YIELD [KEY] expr [AS alias] [PROB], ...
     | DERIVE pattern, ... ]
@@ -2798,6 +2799,20 @@ CREATE RULE total_exposure AS
 ```
 
 Supported aggregators: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `COLLECT`, `MSUM`, `MMAX`, `MMIN`, `MCOUNT`, `MNOR`, `MPROD`
+
+### Post-FOLD WHERE (HAVING)
+
+A `WHERE` clause after `FOLD` filters aggregated groups — equivalent to SQL's `HAVING`:
+
+```cypher
+CREATE RULE frequent_payer AS
+    MATCH (p:Person)-[r:PAID]->(i:Invoice)
+    FOLD n = COUNT(*), total = SUM(r.amount)
+    WHERE n >= 3 AND total >= 100
+    YIELD KEY p, n, total
+```
+
+The post-FOLD `WHERE` runs after all FOLD aggregates are computed and before BEST BY. It can reference FOLD output columns and KEY columns. Multiple conditions are combined with `AND`.
 
 ### Probabilistic Aggregation (MNOR / MPROD)
 
@@ -3247,7 +3262,7 @@ Transaction (write scope)
 ```
 
 - **Uni** does not execute queries or mutations — it only provides factories and admin.
-- **Session** is a long-lived, cheap read context. It holds scoped parameters, a private Locy rule registry, and a plan cache. Sessions are the factory for Transactions.
+- **Session** is a long-lived, cheap read context. It holds scoped parameters, a private Locy rule registry, and a plan cache. Sessions are the factory for Transactions. `session.query()` rejects mutation clauses (CREATE, SET, DELETE, MERGE, REMOVE) with a clear error — mutations require a Transaction. Sessions implement `Clone`: clones share the plan cache but get independent parameters, metrics, and write guards.
 - **Transaction** is a short-lived write context with a private L0 buffer. No lock is held until `commit()`.
 
 ## Transaction API
@@ -3416,7 +3431,7 @@ WriteThrottleConfig {
 | **Long-running write txns** | Large L0 buffers; commit serialization delays | Keep under a few seconds |
 | **Reading without snapshots** | May see inconsistent data during compaction | Use snapshot isolation |
 | **Ignoring auto-rollback warning** | Resource leak indication | Always explicitly commit or rollback |
-| **Writing on Session** | Session is read-only | Use `session.tx()` to create a Transaction |
+| **Writing on Session** | Session is read-only; mutation queries return an error | Use `session.tx()` to create a Transaction |
 
 ---
 

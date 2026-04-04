@@ -31,16 +31,20 @@ class TestAlgoShowcase(unittest.TestCase):
         # A -> B, A -> C, B -> C, C -> A (cycle), D -> C (dangling source)
 
         nodes = ["A", "B", "C", "D"]
+        tx = self.session.tx()
         for n in nodes:
-            self.session.query(f"CREATE (:Page {{name: '{n}'}})")
+            tx.execute(f"CREATE (:Page {{name: '{n}'}})")
+        tx.commit()
 
         edges = [("A", "B"), ("A", "C"), ("B", "C"), ("C", "A"), ("D", "C")]
 
+        tx = self.session.tx()
         for src, dst in edges:
-            self.session.query(
+            tx.execute(
                 "MATCH (a:Page {name: $src}), (b:Page {name: $dst}) CREATE (a)-[:LINKS]->(b)",
                 {"src": src, "dst": dst},
             )
+        tx.commit()
 
     def test_pagerank(self):
         # CALL algo.pageRank('Page', 'LINKS') YIELD node, score
@@ -60,7 +64,9 @@ class TestAlgoShowcase(unittest.TestCase):
 
     def test_wcc(self):
         # Create disjoint component
-        self.session.query("CREATE (:Page {name: 'E'})-[:LINKS]->(:Page {name: 'F'})")
+        tx = self.session.tx()
+        tx.execute("CREATE (:Page {name: 'E'})-[:LINKS]->(:Page {name: 'F'})")
+        tx.commit()
 
         results = self.session.query(
             "CALL algo.wcc('Page', 'LINKS') YIELD node, componentId RETURN node.name as name, componentId ORDER BY componentId"

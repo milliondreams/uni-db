@@ -59,7 +59,7 @@ pub enum LocyStatement {
 // RULE DEFINITION
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// `CREATE RULE name [PRIORITY n] AS MATCH pattern [WHERE conds] [ALONG ...] [FOLD ...] [BEST BY ...] YIELD/DERIVE ...`
+/// `CREATE RULE name [PRIORITY n] AS MATCH pattern [WHERE conds] [ALONG ...] [FOLD ...] [WHERE having] [BEST BY ...] YIELD/DERIVE ...`
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RuleDefinition {
     pub name: QualifiedName,
@@ -68,6 +68,9 @@ pub struct RuleDefinition {
     pub where_conditions: Vec<RuleCondition>,
     pub along: Vec<AlongBinding>,
     pub fold: Vec<FoldBinding>,
+    /// Post-FOLD filter conditions (HAVING semantics). These filter on
+    /// aggregate results after FOLD computation.
+    pub having: Vec<Expr>,
     pub best_by: Option<BestByClause>,
     pub output: RuleOutput,
 }

@@ -24,7 +24,7 @@ After strata converge, commands (`QUERY`, `DERIVE`, `ABDUCE`, `ASSUME`) execute 
 | Context | Execution | Vector | Auto-Embed | FTS |
 |---------|-----------|--------|------------|-----|
 | Rule `MATCH ... WHERE/YIELD` | DataFusion | ✓ | ✓ | ✓ |
-| Rule `ALONG / FOLD` | DataFusion | ✓ | ✓ | ✓ |
+| Rule `ALONG / FOLD / post-FOLD WHERE` | DataFusion | ✓ | ✓ | ✓ |
 | `DERIVE ... WHERE` | In-memory | ✓ | ✗ | ✗ |
 | `ABDUCE ... WHERE` | In-memory | ✓ | ✗ | ✗ |
 | `ASSUME ... WHERE` | In-memory | ✓ | ✗ | ✗ |

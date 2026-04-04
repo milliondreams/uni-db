@@ -22,19 +22,21 @@ class TestExplainProfile:
                 "age", "int"
             ).done().edge_type("KNOWS", ["Person"], ["Person"]).done().apply()
 
-            # Insert test data
+            # Insert test data via transaction
             session = db.session()
-            session.query("CREATE (p:Person {name: 'Alice', age: 30})")
-            session.query("CREATE (p:Person {name: 'Bob', age: 25})")
-            session.query("CREATE (p:Person {name: 'Charlie', age: 35})")
-            session.query("""
+            tx = session.tx()
+            tx.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+            tx.execute("CREATE (p:Person {name: 'Bob', age: 25})")
+            tx.execute("CREATE (p:Person {name: 'Charlie', age: 35})")
+            tx.execute("""
                 MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'})
                 CREATE (a)-[:KNOWS]->(b)
             """)
-            session.query("""
+            tx.execute("""
                 MATCH (b:Person {name: 'Bob'}), (c:Person {name: 'Charlie'})
                 CREATE (b)-[:KNOWS]->(c)
             """)
+            tx.commit()
             db.flush()
             yield db, session
 
@@ -109,8 +111,10 @@ class TestQueryWithParameters:
                 "age", "int"
             ).apply()
             session = db.session()
-            session.query("CREATE (p:Person {name: 'Alice', age: 30})")
-            session.query("CREATE (p:Person {name: 'Bob', age: 25})")
+            tx = session.tx()
+            tx.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+            tx.execute("CREATE (p:Person {name: 'Bob', age: 25})")
+            tx.commit()
             db.flush()
             yield db, session
 
@@ -239,8 +243,10 @@ class TestOrderingAndLimits:
             ).apply()
 
             session = db.session()
+            tx = session.tx()
             for i in range(10):
-                session.query(f"CREATE (n:Item {{num: {i}, name: 'Item{i}'}})")
+                tx.execute(f"CREATE (n:Item {{num: {i}, name: 'Item{i}'}})")
+            tx.commit()
             db.flush()
             yield db, session
 
@@ -287,25 +293,26 @@ class TestPatternMatching:
                 "KNOWS", ["Person"], ["Person"]
             ).done().edge_type("WORKS_WITH", ["Person"], ["Person"]).done().apply()
 
-            # Create a small social network
+            # Create a small social network via transaction
             session = db.session()
-            session.query("CREATE (p:Person {name: 'Alice'})")
-            session.query("CREATE (p:Person {name: 'Bob'})")
-            session.query("CREATE (p:Person {name: 'Charlie'})")
-            session.query("CREATE (p:Person {name: 'David'})")
-
-            session.query("""
+            tx = session.tx()
+            tx.execute("CREATE (p:Person {name: 'Alice'})")
+            tx.execute("CREATE (p:Person {name: 'Bob'})")
+            tx.execute("CREATE (p:Person {name: 'Charlie'})")
+            tx.execute("CREATE (p:Person {name: 'David'})")
+            tx.execute("""
                 MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'})
                 CREATE (a)-[:KNOWS]->(b)
             """)
-            session.query("""
+            tx.execute("""
                 MATCH (b:Person {name: 'Bob'}), (c:Person {name: 'Charlie'})
                 CREATE (b)-[:KNOWS]->(c)
             """)
-            session.query("""
+            tx.execute("""
                 MATCH (a:Person {name: 'Alice'}), (c:Person {name: 'Charlie'})
                 CREATE (a)-[:WORKS_WITH]->(c)
             """)
+            tx.commit()
             db.flush()
             yield db, session
 

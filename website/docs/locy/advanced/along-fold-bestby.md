@@ -77,6 +77,57 @@ FOLD path_count = MCOUNT(*)
 YIELD KEY a, total, path_count
 ```
 
+## Post-FOLD WHERE (HAVING)
+
+A `WHERE` clause after `FOLD` filters aggregated groups — equivalent to SQL's `HAVING`. Only rows where the condition holds are kept.
+
+```cypher
+CREATE RULE frequent_payer AS
+MATCH (p:Person)-[r:PAID]->(i:Invoice)
+FOLD n = COUNT(*)
+WHERE n >= 3
+YIELD KEY p, n
+```
+
+This yields only people who made 3 or more payments. The `WHERE n >= 3` runs *after* FOLD computes the count.
+
+### Multiple Conditions
+
+Combine conditions with `AND`:
+
+```cypher
+CREATE RULE big_spenders AS
+MATCH (p:Person)-[r:PAID]->(i:Invoice)
+FOLD n = COUNT(*), total = SUM(r.amount)
+WHERE n >= 2 AND total >= 1000
+YIELD KEY p, n, total
+```
+
+### Available Columns
+
+Post-FOLD `WHERE` can reference:
+- **FOLD output columns** (`n`, `total` in the examples above)
+- **KEY columns** (the grouped-by entities)
+
+It **cannot** reference pre-aggregation columns that were consumed by FOLD.
+
+### Relationship to QUERY WHERE
+
+Post-FOLD `WHERE` filters during rule evaluation. `QUERY ... WHERE` filters after:
+
+```cypher
+-- Filter inside the rule (during FOLD):
+CREATE RULE counts AS
+MATCH (e:Ev) FOLD n = COUNT(*)
+WHERE n >= 3
+YIELD KEY e.action, n
+
+-- Filter outside (at query time):
+QUERY counts WHERE n >= 5 RETURN *
+```
+
+Both are valid. Use post-FOLD `WHERE` when the filter is intrinsic to the rule's semantics. Use `QUERY WHERE` for ad-hoc filtering at call sites.
+
 ## BEST BY (Witness Selection)
 
 `BEST BY` picks the best candidate row by ordering expression.
@@ -128,6 +179,7 @@ See the [Vector Search guide](../../guides/vector-search.md#similar_to-expressio
 
 - Use `ALONG` for accumulators (distance, risk, confidence, similarity).
 - Use `FOLD` when you need grouped summaries.
+- Use post-FOLD `WHERE` to discard groups that don't meet a threshold (e.g., `WHERE count >= 3`).
 - Use `BEST BY` when you need one witness path, not all candidates.
 
 ## Related

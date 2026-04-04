@@ -159,8 +159,8 @@ pub struct Session {
     /// Cancellation token for cooperative query cancellation.
     /// Behind `Arc<RwLock<>>` so `cancel()` can take `&self`.
     cancellation_token: Arc<std::sync::RwLock<CancellationToken>>,
-    /// Transparent plan cache for parsed/planned queries.
-    plan_cache: std::sync::Mutex<PlanCache>,
+    /// Transparent plan cache for parsed/planned queries (shared across clones).
+    plan_cache: Arc<std::sync::Mutex<PlanCache>>,
     /// Atomic plan cache hit/miss counters.
     plan_cache_metrics: Arc<PlanCacheMetrics>,
     /// Session-level hooks for query/commit interception, keyed by name.
@@ -191,7 +191,7 @@ impl Session {
             metrics_inner: Arc::new(SessionMetricsInner::new()),
             created_at: Instant::now(),
             cancellation_token: Arc::new(std::sync::RwLock::new(CancellationToken::new())),
-            plan_cache: std::sync::Mutex::new(PlanCache::new(1000)),
+            plan_cache: Arc::new(std::sync::Mutex::new(PlanCache::new(1000))),
             plan_cache_metrics: Arc::new(PlanCacheMetrics {
                 hits: AtomicU64::new(0),
                 misses: AtomicU64::new(0),
@@ -223,7 +223,7 @@ impl Session {
             metrics_inner: Arc::new(SessionMetricsInner::new()),
             created_at: Instant::now(),
             cancellation_token: Arc::new(std::sync::RwLock::new(CancellationToken::new())),
-            plan_cache: std::sync::Mutex::new(PlanCache::new(1000)),
+            plan_cache: Arc::new(std::sync::Mutex::new(PlanCache::new(1000))),
             plan_cache_metrics: Arc::new(PlanCacheMetrics {
                 hits: AtomicU64::new(0),
                 misses: AtomicU64::new(0),
@@ -624,6 +624,16 @@ impl Session {
         // Parse
         let ast = uni_cypher::parse(cypher).map_err(crate::api::impl_query::into_parse_error)?;
 
+        // Enforce read-only semantics for session queries — mutations require
+        // a transaction for isolation, WAL protection, and commit hooks.
+        uni_query::validate_read_only(&ast).map_err(|_| UniError::Query {
+            message:
+                "Session.query() is read-only. Mutation clauses (CREATE, MERGE, DELETE, SET, \
+                 REMOVE) require a transaction. Use session.tx() to start one."
+                    .to_string(),
+            query: Some(cypher.to_string()),
+        })?;
+
         // Time-travel queries bypass the cache entirely
         if matches!(ast, uni_cypher::ast::Query::TimeTravel { .. }) {
             return self
@@ -792,6 +802,18 @@ impl<'a> QueryBuilder<'a> {
             || self.max_memory.is_some()
             || self.cancellation_token.is_some();
         if has_overrides {
+            // Validate read-only before bypassing the cache (which has its
+            // own validation). Parse is cheap relative to execution.
+            let ast = uni_cypher::parse(&self.cypher)
+                .map_err(crate::api::impl_query::into_parse_error)?;
+            uni_query::validate_read_only(&ast).map_err(|_| UniError::Query {
+                message:
+                    "Session.query() is read-only. Mutation clauses (CREATE, MERGE, DELETE, \
+                     SET, REMOVE) require a transaction. Use session.tx() to start one."
+                        .to_string(),
+                query: Some(self.cypher.clone()),
+            })?;
+
             // Custom config — bypass cache and use the config-aware path
             let mut db_config = self.session.db.config.clone();
             if let Some(t) = self.timeout {
@@ -880,6 +902,37 @@ impl<'a> TransactionBuilder<'a> {
             });
         }
         Transaction::new_with_options(self.session, self.timeout, self.isolation).await
+    }
+}
+
+impl Clone for Session {
+    /// Clone the session, sharing the plan cache with the original.
+    ///
+    /// The cloned session gets a fresh ID, fresh metrics counters, and a fresh
+    /// cancellation token, but shares the plan cache so cache hits benefit all
+    /// clones. The database's active session count is incremented.
+    fn clone(&self) -> Self {
+        self.db.active_session_count.fetch_add(1, Ordering::Relaxed);
+        Self {
+            db: self.db.clone(),
+            original_db: self.original_db.clone(),
+            id: Uuid::new_v4().to_string(),
+            params: Arc::new(std::sync::RwLock::new(
+                self.params.read().unwrap().clone(),
+            )),
+            rule_registry: Arc::new(std::sync::RwLock::new(
+                self.rule_registry.read().unwrap().clone(),
+            )),
+            active_write_guard: Arc::new(AtomicBool::new(false)),
+            metrics_inner: Arc::new(SessionMetricsInner::new()),
+            created_at: Instant::now(),
+            cancellation_token: Arc::new(std::sync::RwLock::new(CancellationToken::new())),
+            plan_cache: self.plan_cache.clone(),
+            plan_cache_metrics: self.plan_cache_metrics.clone(),
+            hooks: self.hooks.clone(),
+            query_timeout: self.query_timeout,
+            transaction_timeout: self.transaction_timeout,
+        }
     }
 }
 

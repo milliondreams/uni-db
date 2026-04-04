@@ -175,8 +175,9 @@ impl GraphScanExec {
             .filter(|p| p != "_vid" && p != "_labels")
             .collect();
 
-        // Build schema - all properties are Utf8 (from JSON) except _vid
-        let schema = Self::build_schemaless_vertex_schema(&variable, &projected_properties);
+        let uni_schema = graph_ctx.storage().schema_manager().schema();
+        let schema =
+            Self::build_schemaless_vertex_schema(&variable, &projected_properties, &uni_schema);
         let properties = compute_plan_properties(schema.clone());
 
         Self {
@@ -209,7 +210,9 @@ impl GraphScanExec {
             .into_iter()
             .filter(|p| p != "_vid" && p != "_labels")
             .collect();
-        let schema = Self::build_schemaless_vertex_schema(&variable, &projected_properties);
+        let uni_schema = graph_ctx.storage().schema_manager().schema();
+        let schema =
+            Self::build_schemaless_vertex_schema(&variable, &projected_properties, &uni_schema);
         let properties = compute_plan_properties(schema.clone());
 
         // Encode labels as colon-separated for the stream to parse
@@ -246,8 +249,9 @@ impl GraphScanExec {
             .filter(|p| p != "_vid" && p != "_labels")
             .collect();
 
-        // Build schema - all properties are Utf8 (from JSON) except _vid
-        let schema = Self::build_schemaless_vertex_schema(&variable, &projected_properties);
+        let uni_schema = graph_ctx.storage().schema_manager().schema();
+        let schema =
+            Self::build_schemaless_vertex_schema(&variable, &projected_properties, &uni_schema);
         let properties = compute_plan_properties(schema.clone());
 
         Self {
@@ -264,8 +268,27 @@ impl GraphScanExec {
         }
     }
 
-    /// Build schema for schemaless vertex scan (all properties as LargeBinary/CypherValue).
-    fn build_schemaless_vertex_schema(variable: &str, properties: &[String]) -> SchemaRef {
+    /// Build schema for schemaless vertex scan.
+    ///
+    /// Resolves property types from all labels in the schema. Falls back to
+    /// LargeBinary (CypherValue encoding) for properties not found in any
+    /// label's schema.
+    fn build_schemaless_vertex_schema(
+        variable: &str,
+        properties: &[String],
+        uni_schema: &uni_common::core::schema::Schema,
+    ) -> SchemaRef {
+        // Merge property metadata from all labels for type resolution.
+        let mut merged: std::collections::HashMap<
+            &str,
+            &uni_common::core::schema::PropertyMeta,
+        > = std::collections::HashMap::new();
+        for label_props in uni_schema.properties.values() {
+            for (name, meta) in label_props {
+                merged.entry(name.as_str()).or_insert(meta);
+            }
+        }
+
         let mut fields = vec![
             Field::new(format!("{}._vid", variable), DataType::UInt64, false),
             Field::new(format!("{}._labels", variable), labels_data_type(), true),
@@ -273,8 +296,11 @@ impl GraphScanExec {
 
         for prop in properties {
             let col_name = format!("{}.{}", variable, prop);
-            // Schemaless properties use LargeBinary with CypherValue encoding to preserve types
-            fields.push(Field::new(&col_name, DataType::LargeBinary, true));
+            let arrow_type = merged
+                .get(prop.as_str())
+                .map(|meta| meta.r#type.to_arrow())
+                .unwrap_or(DataType::LargeBinary);
+            fields.push(Field::new(&col_name, arrow_type, true));
         }
 
         Arc::new(Schema::new(fields))
@@ -2136,10 +2162,59 @@ fn map_to_schemaless_output_schema(
                 columns.push(col);
             }
         } else {
-            // Extract individual property from CypherValue blob with L0 overlay
-            let col =
-                build_overflow_property_column(batch.num_rows(), vid_arr, props_arr, prop, l0_ctx);
-            columns.push(col);
+            // Extract individual property from CypherValue blob with L0 overlay.
+            // The raw column is LargeBinary (CypherValue-encoded). If the output
+            // schema expects a typed column (e.g., Utf8 for String properties),
+            // decode the CypherValue and build the correct Arrow type.
+            let expected_type = output_schema
+                .field_with_name(&format!("{_variable}.{prop}"))
+                .map(|f| f.data_type().clone())
+                .unwrap_or(DataType::LargeBinary);
+
+            if expected_type == DataType::LargeBinary {
+                let col = build_overflow_property_column(
+                    batch.num_rows(),
+                    vid_arr,
+                    props_arr,
+                    prop,
+                    l0_ctx,
+                );
+                columns.push(col);
+            } else {
+                // Decode CypherValue to the expected type via build_property_column_static.
+                let mut prop_values: HashMap<Vid, Properties> = HashMap::new();
+                for i in 0..batch.num_rows() {
+                    let vid = Vid::from(vid_arr.value(i));
+                    if let Some(val_opt) = resolve_l0_property(&vid, prop, l0_ctx) {
+                        if let Some(v) = val_opt {
+                            let mut map = HashMap::new();
+                            map.insert(prop.to_string(), v);
+                            prop_values.insert(vid, map);
+                        }
+                    } else if let Some(bytes) =
+                        extract_from_overflow_blob(props_arr, i, prop)
+                    {
+                        if let Ok(val) = uni_common::cypher_value_codec::decode(&bytes) {
+                            let mut map = HashMap::new();
+                            map.insert(prop.to_string(), val);
+                            prop_values.insert(vid, map);
+                        }
+                    }
+                }
+                let vids: Vec<Vid> = (0..batch.num_rows())
+                    .map(|i| Vid::from(vid_arr.value(i)))
+                    .collect();
+                let col = build_property_column_static(
+                    &vids,
+                    &prop_values,
+                    prop,
+                    &expected_type,
+                )
+                .unwrap_or_else(|_| {
+                    arrow_array::new_null_array(&expected_type, batch.num_rows())
+                });
+                columns.push(col);
+            }
         }
     }
 
@@ -3077,9 +3152,11 @@ mod tests {
 
     #[test]
     fn test_build_schemaless_vertex_schema() {
+        let empty_schema = uni_common::core::schema::Schema::default();
         let schema = GraphScanExec::build_schemaless_vertex_schema(
             "n",
             &["name".to_string(), "age".to_string()],
+            &empty_schema,
         );
 
         assert_eq!(schema.fields().len(), 4);
@@ -3087,6 +3164,7 @@ mod tests {
         assert_eq!(schema.field(0).data_type(), &DataType::UInt64);
         assert_eq!(schema.field(1).name(), "n._labels");
         assert_eq!(schema.field(2).name(), "n.name");
+        // With empty schema, falls back to LargeBinary
         assert_eq!(schema.field(2).data_type(), &DataType::LargeBinary);
         assert_eq!(schema.field(3).name(), "n.age");
         assert_eq!(schema.field(3).data_type(), &DataType::LargeBinary);
@@ -3094,11 +3172,8 @@ mod tests {
 
     #[test]
     fn test_schemaless_all_scan_has_empty_label() {
-        // This test verifies that new_schemaless_all_scan creates a scan with empty label
-        // We can't fully test execution without a GraphExecutionContext, but we can verify
-        // the constructor sets the empty label correctly by checking the struct internals
-        // This is a structural test to ensure the "empty label signals scan all" pattern works
-        let schema = GraphScanExec::build_schemaless_vertex_schema("n", &[]);
+        let empty_schema = uni_common::core::schema::Schema::default();
+        let schema = GraphScanExec::build_schemaless_vertex_schema("n", &[], &empty_schema);
 
         // Verify the schema has _vid and _labels columns for a scan with no properties
         assert_eq!(schema.fields().len(), 2);

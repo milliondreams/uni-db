@@ -18,6 +18,7 @@ use crate::query::df_graph::locy_explain::{
 };
 use crate::query::df_graph::locy_fold::{FoldBinding, FoldExec};
 use crate::query::df_graph::locy_priority::PriorityExec;
+use uni_cypher::ast::Expr;
 use crate::query::planner::LogicalPlan;
 use arrow_array::RecordBatch;
 use arrow_row::{RowConverter, SortField};
@@ -1017,6 +1018,8 @@ pub struct FixpointRulePlan {
     pub has_fold: bool,
     /// FOLD bindings for post-fixpoint aggregation.
     pub fold_bindings: Vec<FoldBinding>,
+    /// Post-FOLD filter expressions (HAVING semantics).
+    pub having: Vec<Expr>,
     /// Whether this rule has BEST BY semantics.
     pub has_best_by: bool,
     /// BEST BY sort criteria for post-fixpoint selection.
@@ -2736,7 +2739,111 @@ impl ExecutionPlan for InMemoryExec {
 // Post-fixpoint chain — FOLD and BEST BY on converged facts
 // ---------------------------------------------------------------------------
 
-/// Apply post-fixpoint operators (FOLD, BEST BY, PRIORITY) to converged facts.
+/// Apply post-FOLD WHERE (HAVING) filter to aggregated batches.
+///
+/// Converts each Cypher HAVING expression to a DataFusion physical expression
+/// via `cypher_expr_to_df` → type coercion → `create_physical_expr`, evaluates
+/// against the FOLD output, and keeps only rows where all conditions hold.
+fn apply_having_filter(
+    batches: Vec<RecordBatch>,
+    having_exprs: &[Expr],
+    schema: &SchemaRef,
+) -> DFResult<Vec<RecordBatch>> {
+    use arrow::compute::{and, filter_record_batch};
+    use arrow_array::BooleanArray;
+    use datafusion::common::DFSchema;
+    use datafusion::logical_expr::LogicalPlanBuilder;
+    use datafusion::optimizer::AnalyzerRule;
+    use datafusion::optimizer::analyzer::type_coercion::TypeCoercion;
+    use datafusion::physical_expr::create_physical_expr;
+    use datafusion::prelude::SessionContext;
+
+    if batches.is_empty() {
+        return Ok(batches);
+    }
+
+    // Build DFSchema from the FOLD output Arrow schema.
+    let df_schema = DFSchema::try_from(schema.as_ref().clone()).map_err(|e| {
+        datafusion::common::DataFusionError::Internal(format!(
+            "HAVING schema conversion: {e}"
+        ))
+    })?;
+
+    let ctx = SessionContext::new();
+    let state = ctx.state();
+    let config = state.config_options().clone();
+    let props = state.execution_props();
+
+    // Cypher Expr → DataFusion DfExpr → type-coerced DfExpr → PhysicalExpr.
+    //
+    // Type coercion is needed because FOLD aggregates produce Float64 (SUM,
+    // AVG) or Int64 (COUNT), and literal comparisons like `total >= 100`
+    // may mix Float64 columns with Int64 literals.
+    let physical_exprs: Vec<Arc<dyn datafusion::physical_expr::PhysicalExpr>> = having_exprs
+        .iter()
+        .map(|expr| {
+            let df_expr =
+                crate::query::df_expr::cypher_expr_to_df(expr, None).map_err(|e| {
+                    datafusion::common::DataFusionError::Internal(format!(
+                        "HAVING expression conversion: {e}"
+                    ))
+                })?;
+
+            // Run DataFusion's type coercion by wrapping in a Filter plan,
+            // applying the TypeCoercion analyzer rule, then extracting the
+            // coerced predicate.
+            let empty = datafusion::logical_expr::LogicalPlan::EmptyRelation(
+                datafusion::logical_expr::EmptyRelation {
+                    produce_one_row: false,
+                    schema: Arc::new(df_schema.clone()),
+                },
+            );
+            let filter_plan = LogicalPlanBuilder::from(empty)
+                .filter(df_expr.clone())?
+                .build()?;
+            let coerced_expr =
+                match TypeCoercion::new().analyze(filter_plan, &config) {
+                    Ok(datafusion::logical_expr::LogicalPlan::Filter(f)) => f.predicate,
+                    _ => df_expr,
+                };
+
+            create_physical_expr(&coerced_expr, &df_schema, props)
+        })
+        .collect::<DFResult<Vec<_>>>()?;
+
+    let mut result = Vec::new();
+    for batch in batches {
+        // Evaluate each condition and AND the boolean masks.
+        let mut mask: Option<BooleanArray> = None;
+        for phys_expr in &physical_exprs {
+            let value = phys_expr.evaluate(&batch)?;
+            let arr = value.into_array(batch.num_rows())?;
+            let bool_arr =
+                arr.as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .ok_or_else(|| {
+                        datafusion::common::DataFusionError::Internal(
+                            "HAVING condition must evaluate to boolean".into(),
+                        )
+                    })?;
+            mask = Some(match mask {
+                None => bool_arr.clone(),
+                Some(prev) => and(&prev, bool_arr).map_err(arrow_err)?,
+            });
+        }
+        if let Some(ref m) = mask {
+            let filtered = filter_record_batch(&batch, m).map_err(arrow_err)?;
+            if filtered.num_rows() > 0 {
+                result.push(filtered);
+            }
+        } else {
+            result.push(batch);
+        }
+    }
+    Ok(result)
+}
+
+/// Apply post-fixpoint operators (FOLD, HAVING, BEST BY, PRIORITY) to converged facts.
 pub(crate) async fn apply_post_fixpoint_chain(
     facts: Vec<RecordBatch>,
     rule: &FixpointRulePlan,
@@ -2787,6 +2894,18 @@ pub(crate) async fn apply_post_fixpoint_chain(
             strict_probability_domain,
             probability_epsilon,
         ))
+    } else {
+        current
+    };
+
+    // Apply HAVING (post-FOLD WHERE filter)
+    let current: Arc<dyn ExecutionPlan> = if !rule.having.is_empty() {
+        let batches = collect_all_partitions(&current, Arc::clone(task_ctx)).await?;
+        let filtered = apply_having_filter(batches, &rule.having, &current.schema())?;
+        if filtered.is_empty() {
+            return Ok(filtered);
+        }
+        Arc::new(InMemoryExec::new(filtered, Arc::clone(&current.schema())))
     } else {
         current
     };
@@ -2999,6 +3118,7 @@ impl ExecutionPlan for FixpointExec {
                     priority: r.priority,
                     has_fold: r.has_fold,
                     fold_bindings: r.fold_bindings.clone(),
+                    having: r.having.clone(),
                     has_best_by: r.has_best_by,
                     best_by_criteria: r.best_by_criteria.clone(),
                     has_priority: r.has_priority,

@@ -628,7 +628,7 @@ impl<'a> LocyEngine<'a> {
         df_executor.set_procedure_registry(self.db.procedure_registry.clone());
 
         let (session_ctx, planner, _) = df_executor
-            .create_datafusion_planner(&self.db.properties, &HashMap::new())
+            .create_datafusion_planner(&self.db.properties, &config.params)
             .await
             .map_err(map_native_df_error)?;
         let exec_plan = planner.plan(&logical).map_err(map_native_df_error)?;

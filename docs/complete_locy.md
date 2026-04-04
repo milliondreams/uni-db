@@ -17,7 +17,7 @@
   - [5. IS References (Rule Composition)](#5-is-references-rule-composition)
   - [6. YIELD Clause (Output Schema)](#6-yield-clause-output-schema)
   - [7. ALONG (Path-Carried Values)](#7-along-path-carried-values)
-  - [8. FOLD (Aggregation)](#8-fold-aggregation)
+  - [8. FOLD (Aggregation)](#8-fold-aggregation) (including post-FOLD WHERE / HAVING)
   - [9. BEST BY (Witness Selection)](#9-best-by-witness-selection)
   - [10. DERIVE (Graph Materialization)](#10-derive-graph-materialization)
   - [11. PRIORITY (Default/Exception Reasoning)](#11-priority-defaultexception-reasoning)
@@ -330,14 +330,15 @@ CREATE RULE r2 AS ... YIELD KEY b
 ```
 CREATE RULE name [PRIORITY n] AS
     MATCH pattern
-    [WHERE conditions]
+    [WHERE conditions]              -- pre-aggregation filter
     [ALONG accumulations]
     [FOLD aggregations]
+    [WHERE aggregate_conditions]    -- post-FOLD filter (HAVING semantics)
     [BEST BY selections]
     (YIELD items | DERIVE patterns)
 ```
 
-Every clause is optional except MATCH and the terminal (YIELD or DERIVE).
+Every clause is optional except MATCH and the terminal (YIELD or DERIVE). The second `WHERE` (after `FOLD`) filters aggregated groups — e.g., `WHERE count >= 3`.
 
 ## 4.2 Rule Names
 
@@ -648,7 +649,27 @@ Fixpoint converges when:
 - **MsumNonNegativity**: MSUM argument is not a literal — may be negative, violating monotonicity.
 - **ProbabilityDomainViolation**: MNOR/MPROD argument is not a literal — may be outside [0, 1].
 
-## 8.3 FOLD + BEST BY Restriction
+## 8.3 Post-FOLD WHERE (HAVING)
+
+A `WHERE` clause after `FOLD` filters aggregated groups — equivalent to SQL's `HAVING`. Only rows where the condition holds are kept.
+
+```
+CREATE RULE frequent_payer AS
+    MATCH (p:Person)-[r:PAID]->(i:Invoice)
+    FOLD n = COUNT(*), total = SUM(r.amount)
+    WHERE n >= 3 AND total >= 100
+    YIELD KEY p, n, total
+```
+
+**Available columns:** Post-FOLD `WHERE` can reference FOLD output columns (`n`, `total`) and KEY columns (`p`). It cannot reference pre-aggregation columns consumed by FOLD.
+
+**Evaluation:** The filter runs after FOLD computation and before BEST BY, inside `apply_post_fixpoint_chain`. Expressions are compiled via `cypher_expr_to_df` → DataFusion `TypeCoercion` → `create_physical_expr`, then evaluated on the FOLD output batches.
+
+**Type coercion:** DataFusion automatically coerces types in comparisons (e.g., `Float64 >= Int64`).
+
+**Restriction:** Post-FOLD `WHERE` requires a FOLD clause. Using it without FOLD produces a compile error (`HavingWithoutFold`).
+
+## 8.4 FOLD + BEST BY Restriction
 
 BEST BY cannot be combined with monotonic FOLD in the same clause. They are semantically contradictory: BEST BY selects one witness row, while monotonic FOLD aggregates across all rows. The compiler rejects this with `BestByWithMonotonicFold`.
 

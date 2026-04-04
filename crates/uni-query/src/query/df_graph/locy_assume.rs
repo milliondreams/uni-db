@@ -6,7 +6,6 @@
 //! Ported from `uni-locy/src/orchestrator/assume.rs`. Uses `LocyExecutionContext`
 //! for L0 fork/restore, mutations, and strata re-evaluation.
 
-use std::collections::HashMap;
 use std::time::Instant;
 
 use uni_cypher::ast::Query;
@@ -40,7 +39,7 @@ pub async fn evaluate_assume(
         let query = Query::Single(uni_cypher::ast::Statement {
             clauses: assume.mutations.clone(),
         });
-        ctx.execute_mutation(query, HashMap::new()).await?;
+        ctx.execute_mutation(query, config.params.clone()).await?;
         stats.mutations_executed += 1;
     }
 

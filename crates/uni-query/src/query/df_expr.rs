@@ -3225,9 +3225,38 @@ fn coerce_scalar_function(
                     },
                 ));
             } else {
-                let unified_args = coerced_args
+                // Only cast to Utf8 when all types are string-like.
+                // Struct (DateTime), LargeBinary (CypherValue), and other
+                // non-string types cannot be safely cast to Utf8.
+                let all_string_like = types.iter().all(|t| {
+                    matches!(
+                        t,
+                        DataType::Utf8 | DataType::LargeUtf8 | DataType::Null
+                    )
+                });
+                if all_string_like {
+                    let unified_args = coerced_args
+                        .into_iter()
+                        .map(|a| datafusion::logical_expr::cast(a, DataType::Utf8))
+                        .collect();
+                    return Ok(DfExpr::ScalarFunction(
+                        datafusion::logical_expr::expr::ScalarFunction {
+                            func: func.func.clone(),
+                            args: unified_args,
+                        },
+                    ));
+                }
+                // Non-string types present — convert all to LargeBinary.
+                let unified_args: Vec<DfExpr> = coerced_args
                     .into_iter()
-                    .map(|a| datafusion::logical_expr::cast(a, DataType::Utf8))
+                    .zip(types.iter())
+                    .map(|(arg, t)| match t {
+                        DataType::LargeBinary | DataType::Null => arg,
+                        DataType::List(_) | DataType::LargeList(_) => {
+                            list_to_large_binary_expr(arg)
+                        }
+                        _ => scalar_to_large_binary_expr(arg),
+                    })
                     .collect();
                 return Ok(DfExpr::ScalarFunction(
                     datafusion::logical_expr::expr::ScalarFunction {

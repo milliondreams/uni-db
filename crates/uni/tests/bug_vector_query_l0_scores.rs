@@ -186,3 +186,67 @@ async fn test_vector_query_score_consistency_with_and_without_index() -> anyhow:
 
     Ok(())
 }
+
+/// BUG-1 regression: vector search must see L0 data after tx.commit()
+/// WITHOUT an explicit flush.
+#[tokio::test]
+async fn test_vector_query_sees_l0_data_without_flush() -> anyhow::Result<()> {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let temp_dir = tempdir()?;
+    let path = temp_dir.path();
+
+    let schema_manager = SchemaManager::load(&path.join("schema.json")).await?;
+    schema_manager.add_label("Doc")?;
+    schema_manager.add_property("Doc", "title", DataType::String, false)?;
+    schema_manager.add_property(
+        "Doc",
+        "embedding",
+        DataType::Vector { dimensions: 3 },
+        false,
+    )?;
+    schema_manager.save().await?;
+
+    let db = Uni::open(path.to_str().unwrap()).build().await?;
+
+    // Insert data and commit — but do NOT flush
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Doc {title: 'hello', embedding: [1.0, 0.0, 0.0]})")
+        .await?;
+    tx.execute("CREATE (:Doc {title: 'world', embedding: [0.0, 1.0, 0.0]})")
+        .await?;
+    tx.commit().await?;
+
+    // No flush! Data is still in L0 only.
+    // Vector search must still find it via merge_l0_into_vector_results.
+    let res = db
+        .session()
+        .query(
+            "CALL uni.vector.query('Doc', 'embedding', [1.0, 0.0, 0.0], 10)
+             YIELD node, score
+             RETURN node.title AS title, score
+             ORDER BY score DESC",
+        )
+        .await?;
+
+    assert!(
+        res.len() >= 2,
+        "Vector search should find L0 data without flush, got {} rows",
+        res.len()
+    );
+
+    // Top result should be the identical vector
+    let top_title: String = res.rows()[0].get("title")?;
+    assert_eq!(
+        top_title, "hello",
+        "Identical vector should be top result"
+    );
+
+    let top_score: f64 = res.rows()[0].get("score")?;
+    assert!(
+        top_score > 0.9,
+        "Identical vector should have score near 1.0, got {}",
+        top_score
+    );
+
+    Ok(())
+}

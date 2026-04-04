@@ -153,12 +153,14 @@ let db = Uni::open("./my-graph")
 
 ## Session
 
-The primary read scope. Created via `db.session()`. Cheap, synchronous, infallible.
+The primary read scope. Created via `db.session()`. Cheap, synchronous, infallible. Implements `Clone` (clones share the plan cache).
+
+`session.query()` is **read-only** — mutation clauses (CREATE, SET, DELETE, MERGE, REMOVE) return an error. Use `session.tx()` for writes.
 
 ```rust
 let session = db.session();
 
-// Queries
+// Queries (read-only)
 let rows = session.query("MATCH (n:Person) RETURN n.name").await?;
 
 // Parameterized queries
@@ -172,14 +174,17 @@ let rows = session.query_with("MATCH (n) WHERE n.age > $min RETURN n")
 let tx = session.tx().await?;
 tx.execute("CREATE (:Person {name: 'Bob'})").await?;
 tx.commit().await?;
+
+// Cloning (shares plan cache, independent params/metrics)
+let session2 = session.clone();
 ```
 
 ### Cypher Reads
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `query(cypher)` | `Result<QueryResult>` | Execute a read-only Cypher query. Uses transparent plan cache. |
-| `query_with(cypher)` | `QueryBuilder` | Build a parameterized query with `.param()`, `.timeout()`, `.max_memory()`. |
+| `query(cypher)` | `Result<QueryResult>` | Execute a read-only Cypher query. Rejects mutations with an error. Uses transparent plan cache. |
+| `query_with(cypher)` | `QueryBuilder` | Build a parameterized read query with `.param()`, `.timeout()`, `.max_memory()`. |
 
 ### Locy Evaluation
 

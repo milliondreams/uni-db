@@ -190,6 +190,8 @@ The primary scope for reads and the factory for transactions. Created via `db.se
 
 Sessions are lightweight and can be created freely. Each session maintains its own plan cache, parameter store, rule registry, and version pin state.
 
+`session.query()` is **read-only** — mutation clauses (CREATE, SET, DELETE, MERGE, REMOVE) return an error. Use `session.tx()` for writes.
+
 ```python
 session = db.session()
 ```
@@ -198,8 +200,8 @@ session = db.session()
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `session.query(cypher, params=None)` | `QueryResult` | Execute a read query |
-| `session.query_with(cypher)` | `SessionQueryBuilder` | Fluent query builder |
+| `session.query(cypher, params=None)` | `QueryResult` | Execute a read-only query. Rejects mutations with an error. |
+| `session.query_with(cypher)` | `SessionQueryBuilder` | Fluent read query builder |
 
 ```python
 # Simple query

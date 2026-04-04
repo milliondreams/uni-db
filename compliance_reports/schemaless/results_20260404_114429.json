@@ -2132,7 +2132,8 @@
             "keyword": "Scenario ",
             "name": "[1] Undirected expand followed by delete and count",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/clauses/delete/Delete4.feature:45:5\n      Matched: crates/uni-tck/src/steps/then.rs:20:1\n      Step panicked. Captured output: Query returned error instead of result: Query { message: \"Execution error: DELETE node failed: ConstraintVerificationFailed: DeleteConnectedNode - Cannot delete node 0, because it still has relationships. To delete the node and its relationships, use DETACH DELETE.\", query: Some(\"\\nMATCH (a)-[r]-(b)\\nDELETE r, a, b\\nRETURN count(*) AS c\\n\") }\n[Summary]\n1 feature\n1 scenario (1 failed)\n4 steps (3 passed, 1 failed)\n"
             }
           }
         ]
@@ -2264,7 +2265,8 @@
             "keyword": "Scenario ",
             "name": "[7] Delete paths from nested map/list",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/clauses/delete/Delete5.feature:164:5\n      Matched: crates/uni-tck/src/steps/then.rs:9:1\n      Step panicked. Captured output: No result found\n[Summary]\n1 feature\n1 scenario (1 failed)\n4 steps (3 passed, 1 failed)\n"
             }
           }
         ]
@@ -9124,7 +9126,8 @@
             "keyword": "Scenario ",
             "name": "[20] Do not match on deleted entities",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/clauses/merge/Merge5.feature:412:5\n      Matched: crates/uni-tck/src/steps/then.rs:9:1\n      Step panicked. Captured output: No result found\n[Summary]\n1 feature\n1 scenario (1 failed)\n4 steps (3 passed, 1 failed)\n"
             }
           }
         ]

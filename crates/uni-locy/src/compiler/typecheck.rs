@@ -76,7 +76,7 @@ pub fn check(
             // HAVING (post-FOLD WHERE) requires a FOLD clause.
             if !def.having.is_empty() && def.fold.is_empty() {
                 return Err(LocyCompileError::HavingWithoutFold {
-                    rule: rule_name.to_string(),
+                    rule: rule_name.clone(),
                 });
             }
 

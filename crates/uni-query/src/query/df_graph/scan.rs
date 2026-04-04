@@ -235,7 +235,7 @@ impl GraphScanExec {
     /// Create a new schemaless scan for all vertices.
     ///
     /// Scans the main vertices table for all vertices regardless of label.
-    /// Properties are extracted from props_json (all treated as Utf8/JSON).
+    /// Properties are extracted from props_json with types resolved from the schema.
     /// This is used for `MATCH (n)` without label filter.
     pub fn new_schemaless_all_scan(
         graph_ctx: Arc<GraphExecutionContext>,
@@ -2185,20 +2185,16 @@ fn map_to_schemaless_output_schema(
                 let mut prop_values: HashMap<Vid, Properties> = HashMap::new();
                 for i in 0..batch.num_rows() {
                     let vid = Vid::from(vid_arr.value(i));
-                    if let Some(val_opt) = resolve_l0_property(&vid, prop, l0_ctx) {
-                        if let Some(v) = val_opt {
-                            let mut map = HashMap::new();
-                            map.insert(prop.to_string(), v);
-                            prop_values.insert(vid, map);
-                        }
-                    } else if let Some(bytes) =
-                        extract_from_overflow_blob(props_arr, i, prop)
-                    {
-                        if let Ok(val) = uni_common::cypher_value_codec::decode(&bytes) {
-                            let mut map = HashMap::new();
-                            map.insert(prop.to_string(), val);
-                            prop_values.insert(vid, map);
-                        }
+                    let resolved = resolve_l0_property(&vid, prop, l0_ctx)
+                        .flatten()
+                        .or_else(|| {
+                            extract_from_overflow_blob(props_arr, i, prop)
+                                .and_then(|bytes| {
+                                    uni_common::cypher_value_codec::decode(&bytes).ok()
+                                })
+                        });
+                    if let Some(val) = resolved {
+                        prop_values.insert(vid, HashMap::from([(prop.to_string(), val)]));
                     }
                 }
                 let vids: Vec<Vid> = (0..batch.num_rows())

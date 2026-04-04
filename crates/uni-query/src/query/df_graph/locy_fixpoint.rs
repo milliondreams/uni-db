@@ -18,7 +18,6 @@ use crate::query::df_graph::locy_explain::{
 };
 use crate::query::df_graph::locy_fold::{FoldBinding, FoldExec};
 use crate::query::df_graph::locy_priority::PriorityExec;
-use uni_cypher::ast::Expr;
 use crate::query::planner::LogicalPlan;
 use arrow_array::RecordBatch;
 use arrow_row::{RowConverter, SortField};
@@ -41,6 +40,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use uni_common::Value;
 use uni_common::core::schema::Schema as UniSchema;
+use uni_cypher::ast::Expr;
 use uni_locy::RuntimeWarning;
 use uni_store::storage::manager::StorageManager;
 
@@ -2851,7 +2851,7 @@ pub(crate) async fn apply_post_fixpoint_chain(
     strict_probability_domain: bool,
     probability_epsilon: f64,
 ) -> DFResult<Vec<RecordBatch>> {
-    if !rule.has_fold && !rule.has_best_by && !rule.has_priority {
+    if !rule.has_fold && !rule.has_best_by && !rule.has_priority && rule.having.is_empty() {
         return Ok(facts);
     }
 

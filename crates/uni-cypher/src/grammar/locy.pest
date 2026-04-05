@@ -207,7 +207,7 @@ prob_projection = {
     | expression ~ PROB
 }
 
-key_projection = { KEY ~ locy_identifier }
+key_projection = { KEY ~ expression ~ (AS ~ alias_identifier)? }
 
 
 // ═══════════════════════════════════════════════════════════════════════════

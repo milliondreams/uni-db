@@ -398,6 +398,7 @@ impl<'a> LocyPlanBuilder<'a> {
                     .collect()
             })
             .unwrap_or_default();
+        let having = first_clause.map(|c| c.having.clone()).unwrap_or_default();
         let best_by_criteria = first_clause
             .and_then(|c| c.best_by.as_ref())
             .map(|bb| {
@@ -440,6 +441,7 @@ impl<'a> LocyPlanBuilder<'a> {
             yield_schema,
             priority: rule.priority,
             fold_bindings,
+            having,
             best_by_criteria,
         })
     }
@@ -474,16 +476,29 @@ impl<'a> LocyPlanBuilder<'a> {
             .context("planning MATCH pattern")?;
 
         // Step 2: WHERE filter (non-IS conditions only).
-        // Conditions referencing IS-ref target variables must be deferred until
-        // after the IS-ref joins that introduce those variables.
-        let is_ref_target_vars: HashSet<String> = clause
-            .where_conditions
-            .iter()
-            .filter_map(|c| match c {
-                RuleCondition::IsReference(ir) if !ir.negated => ir.target.clone(),
-                _ => None,
-            })
-            .collect();
+        // Conditions referencing IS-ref-introduced variables must be deferred
+        // until after the IS-ref CrossJoin resolves. This includes:
+        //   - Target variables (e.g., `pub` from `c IS rule TO pub`)
+        //   - Non-KEY value columns from the target rule's yield schema
+        //     (e.g., `relevance` from a rule that YIELDs KEY c, KEY pub, relevance)
+        let mut is_ref_deferred_vars: HashSet<String> = HashSet::new();
+        for cond in &clause.where_conditions {
+            if let RuleCondition::IsReference(ir) = cond
+                && !ir.negated
+            {
+                if let Some(target) = &ir.target {
+                    is_ref_deferred_vars.insert(target.clone());
+                }
+                let target_rule_name = ir.rule_name.to_string();
+                if let Some(target_rule) = rule_catalog.get(&target_rule_name) {
+                    for col in &target_rule.yield_schema {
+                        if !col.is_key {
+                            is_ref_deferred_vars.insert(col.name.clone());
+                        }
+                    }
+                }
+            }
+        }
 
         let all_filter_exprs: Vec<&Expr> = clause
             .where_conditions
@@ -495,12 +510,12 @@ impl<'a> LocyPlanBuilder<'a> {
             .collect();
 
         let (deferred_filter_exprs, immediate_filter_exprs): (Vec<&Expr>, Vec<&Expr>) =
-            if is_ref_target_vars.is_empty() {
+            if is_ref_deferred_vars.is_empty() {
                 (Vec::new(), all_filter_exprs)
             } else {
                 all_filter_exprs
                     .into_iter()
-                    .partition(|e| expr_references_any(e, &is_ref_target_vars))
+                    .partition(|e| expr_references_any(e, &is_ref_deferred_vars))
             };
 
         if !immediate_filter_exprs.is_empty() {
@@ -1265,6 +1280,7 @@ mod tests {
             where_conditions: vec![],
             along: vec![],
             fold: vec![],
+            having: vec![],
             best_by: None,
             output: simple_yield_output(yield_names),
             priority: None,
@@ -1783,6 +1799,7 @@ mod tests {
             })],
             along: vec![],
             fold: vec![],
+            having: vec![],
             best_by: None,
             output: simple_yield_output(&["n"]),
             priority: None,
@@ -1835,6 +1852,7 @@ mod tests {
             })],
             along: vec![],
             fold: vec![],
+            having: vec![],
             best_by: None,
             output: simple_yield_output(&["x"]),
             priority: None,
@@ -1896,6 +1914,7 @@ mod tests {
             })],
             along: vec![],
             fold: vec![],
+            having: vec![],
             best_by: None,
             output: simple_yield_output(&["x", "y"]),
             priority: None,
@@ -1945,6 +1964,7 @@ mod tests {
             })],
             along: vec![],
             fold: vec![],
+            having: vec![],
             best_by: None,
             output: simple_yield_output(&["x"]),
             priority: None,
@@ -2016,6 +2036,7 @@ mod tests {
             ],
             along: vec![],
             fold: vec![],
+            having: vec![],
             best_by: None,
             output: simple_yield_output(&["x"]),
             priority: None,
@@ -2070,6 +2091,7 @@ mod tests {
                 },
             }],
             fold: vec![],
+            having: vec![],
             best_by: None,
             output: simple_yield_output(&["a", "b", "cost"]),
             priority: None,
@@ -2124,6 +2146,7 @@ mod tests {
                     window_spec: None,
                 },
             }],
+            having: vec![],
             best_by: None,
             output: simple_yield_output(&["n", "total"]),
             priority: None,
@@ -2168,6 +2191,7 @@ mod tests {
                     window_spec: None,
                 },
             }],
+            having: vec![],
             best_by: None,
             output: simple_yield_output(&["n", "total"]),
             priority: None,
@@ -2204,6 +2228,7 @@ mod tests {
             where_conditions: vec![],
             along: vec![],
             fold: vec![],
+            having: vec![],
             best_by: Some(BestByClause {
                 items: vec![BestByItem {
                     expr: Expr::Variable("cost".to_string()),
@@ -2312,6 +2337,7 @@ mod tests {
                     window_spec: None,
                 },
             }],
+            having: vec![],
             best_by: Some(BestByClause {
                 items: vec![BestByItem {
                     expr: Expr::Variable("total".to_string()),
@@ -2420,6 +2446,7 @@ mod tests {
                 })],
                 along: vec![],
                 fold: vec![],
+                having: vec![],
                 best_by: None,
                 output: simple_yield_output(&["a", "b"]),
                 priority: None,
@@ -2488,6 +2515,7 @@ mod tests {
                 })],
                 along: vec![],
                 fold: vec![],
+                having: vec![],
                 best_by: None,
                 output: simple_yield_output(&["x"]),
                 priority: None,
@@ -2563,6 +2591,7 @@ mod tests {
                 })],
                 along: vec![],
                 fold: vec![],
+                having: vec![],
                 best_by: None,
                 output: simple_yield_output(&["x"]),
                 priority: None,
@@ -2636,6 +2665,7 @@ mod tests {
                 })],
                 along: vec![],
                 fold: vec![],
+                having: vec![],
                 best_by: None,
                 output: simple_yield_output(&["n"]),
                 priority: None,
@@ -2654,6 +2684,7 @@ mod tests {
                 })],
                 along: vec![],
                 fold: vec![],
+                having: vec![],
                 best_by: None,
                 output: simple_yield_output(&["n"]),
                 priority: None,
@@ -2731,6 +2762,7 @@ mod tests {
                     })],
                     along: vec![],
                     fold: vec![],
+                    having: vec![],
                     best_by: None,
                     output: simple_yield_output(&["x"]),
                     priority: None,
@@ -2745,6 +2777,7 @@ mod tests {
                     })],
                     along: vec![],
                     fold: vec![],
+                    having: vec![],
                     best_by: None,
                     output: simple_yield_output(&["y"]),
                     priority: None,
@@ -2897,6 +2930,7 @@ mod tests {
                 })],
                 along: vec![],
                 fold: vec![],
+                having: vec![],
                 best_by: None,
                 output: simple_yield_output(&["x"]),
                 priority: None,
@@ -2923,6 +2957,7 @@ mod tests {
                 ],
                 along: vec![],
                 fold: vec![],
+                having: vec![],
                 best_by: None,
                 output: simple_yield_output(&["y"]),
                 priority: None,
@@ -3022,6 +3057,7 @@ mod tests {
             })],
             along: vec![],
             fold: vec![],
+            having: vec![],
             best_by: None,
             output: simple_yield_output(&["x"]),
             priority: None,
@@ -3067,6 +3103,7 @@ mod tests {
             })],
             along: vec![],
             fold: vec![],
+            having: vec![],
             best_by: None,
             output: simple_yield_output(&["x"]),
             priority: None,
@@ -3114,6 +3151,7 @@ mod tests {
                 expr: LocyExpr::PrevRef("nonexistent".to_string()),
             }],
             fold: vec![],
+            having: vec![],
             best_by: None,
             output: simple_yield_output(&["x", "cost"]),
             priority: None,
@@ -3154,6 +3192,7 @@ mod tests {
                     window_spec: None,
                 },
             }],
+            having: vec![],
             best_by: None,
             output: simple_yield_output(&["n", "total"]),
             priority: None,

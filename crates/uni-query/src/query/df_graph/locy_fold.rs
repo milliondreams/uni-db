@@ -92,6 +92,9 @@ pub struct FoldBinding {
     pub output_name: String,
     pub kind: FoldAggKind,
     pub input_col_index: usize,
+    /// Column name for name-based resolution (more robust than positional index).
+    /// `None` for CountAll which has no input column.
+    pub input_col_name: Option<String>,
 }
 
 /// DataFusion `ExecutionPlan` that applies FOLD semantics.
@@ -159,10 +162,18 @@ impl FoldExec {
                     DataType::Float64
                 }
                 FoldAggKind::Count | FoldAggKind::CountAll => DataType::Int64,
-                FoldAggKind::Max | FoldAggKind::Min => input_schema
-                    .field(binding.input_col_index)
-                    .data_type()
-                    .clone(),
+                FoldAggKind::Max | FoldAggKind::Min => {
+                    let idx = binding
+                        .input_col_name
+                        .as_ref()
+                        .and_then(|name| input_schema.index_of(name).ok())
+                        .unwrap_or(binding.input_col_index);
+                    if idx < input_schema.fields().len() {
+                        input_schema.field(idx).data_type().clone()
+                    } else {
+                        DataType::Float64
+                    }
+                }
                 FoldAggKind::Collect => DataType::LargeBinary,
             };
             fields.push(Arc::new(Field::new(
@@ -246,8 +257,14 @@ impl ExecutionPlan for FoldExec {
                 return Ok(RecordBatch::new_empty(output_schema));
             }
 
+            // Use the actual batch schema (may differ from pre-computed input_schema
+            // after schema reconciliation in schemaless mode).
+            let actual_schema = batches
+                .first()
+                .map(|b| b.schema())
+                .unwrap_or(input_schema.clone());
             let batch =
-                arrow::compute::concat_batches(&input_schema, &batches).map_err(arrow_err)?;
+                arrow::compute::concat_batches(&actual_schema, &batches).map_err(arrow_err)?;
 
             if batch.num_rows() == 0 {
                 return Ok(RecordBatch::new_empty(output_schema));
@@ -272,6 +289,9 @@ impl ExecutionPlan for FoldExec {
 
             // Key columns: take from first row of each group
             for &ki in &key_indices {
+                if ki >= batch.num_columns() {
+                    continue; // Skip invalid indices after schema reconciliation
+                }
                 let col = batch.column(ki);
                 let first_indices: Vec<u32> =
                     ordered_keys.iter().map(|k| groups[k][0] as u32).collect();
@@ -288,7 +308,21 @@ impl ExecutionPlan for FoldExec {
                     // CountAll doesn't need an input column — use a dummy
                     Arc::new(arrow_array::Int64Array::from(vec![0i64; batch.num_rows()]))
                 } else {
-                    Arc::clone(batch.column(binding.input_col_index))
+                    // Resolve input column: prefer name-based lookup, fall back to index.
+                    let resolved_idx = binding
+                        .input_col_name
+                        .as_ref()
+                        .and_then(|name| batch.schema().index_of(name).ok())
+                        .unwrap_or(binding.input_col_index);
+                    if resolved_idx < batch.num_columns() {
+                        Arc::clone(batch.column(resolved_idx))
+                    } else {
+                        // Column not found — use zeros as fallback
+                        Arc::new(arrow_array::Float64Array::from(vec![
+                            0.0f64;
+                            batch.num_rows()
+                        ]))
+                    }
                 };
                 let agg_col = compute_fold_aggregate(
                     col.as_ref(),
@@ -817,6 +851,7 @@ mod tests {
                 output_name: "total".to_string(),
                 kind: FoldAggKind::Sum,
                 input_col_index: 1,
+                input_col_name: None,
             }],
         )
         .await;
@@ -852,6 +887,7 @@ mod tests {
                 output_name: "cnt".to_string(),
                 kind: FoldAggKind::Count,
                 input_col_index: 1,
+                input_col_name: None,
             }],
         )
         .await;
@@ -878,6 +914,7 @@ mod tests {
                 output_name: "mx".to_string(),
                 kind: FoldAggKind::Max,
                 input_col_index: 1,
+                input_col_name: None,
             }],
         )
         .await;
@@ -888,6 +925,7 @@ mod tests {
                 output_name: "mn".to_string(),
                 kind: FoldAggKind::Min,
                 input_col_index: 1,
+                input_col_name: None,
             }],
         )
         .await;
@@ -918,6 +956,7 @@ mod tests {
                 output_name: "average".to_string(),
                 kind: FoldAggKind::Avg,
                 input_col_index: 1,
+                input_col_name: None,
             }],
         )
         .await;
@@ -945,6 +984,7 @@ mod tests {
                 output_name: "total".to_string(),
                 kind: FoldAggKind::Sum,
                 input_col_index: 1,
+                input_col_name: None,
             }],
         )
         .await;
@@ -985,6 +1025,7 @@ mod tests {
                 output_name: "total".to_string(),
                 kind: FoldAggKind::Sum,
                 input_col_index: 1,
+                input_col_name: None,
             }],
         )
         .await;
@@ -1004,16 +1045,19 @@ mod tests {
                     output_name: "total".to_string(),
                     kind: FoldAggKind::Sum,
                     input_col_index: 1,
+                    input_col_name: None,
                 },
                 FoldBinding {
                     output_name: "cnt".to_string(),
                     kind: FoldAggKind::Count,
                     input_col_index: 1,
+                    input_col_name: None,
                 },
                 FoldBinding {
                     output_name: "mx".to_string(),
                     kind: FoldAggKind::Max,
                     input_col_index: 1,
+                    input_col_name: None,
                 },
             ],
         )
@@ -1058,6 +1102,7 @@ mod tests {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Nor,
                 input_col_index: 1,
+                input_col_name: None,
             }],
         )
         .await;
@@ -1083,6 +1128,7 @@ mod tests {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Nor,
                 input_col_index: 1,
+                input_col_name: None,
             }],
         )
         .await;
@@ -1107,6 +1153,7 @@ mod tests {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Nor,
                 input_col_index: 1,
+                input_col_name: None,
             }],
         )
         .await;
@@ -1131,6 +1178,7 @@ mod tests {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Nor,
                 input_col_index: 1,
+                input_col_name: None,
             }],
         )
         .await;
@@ -1172,6 +1220,7 @@ mod tests {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Prod,
                 input_col_index: 1,
+                input_col_name: None,
             }],
         )
         .await;
@@ -1197,6 +1246,7 @@ mod tests {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Prod,
                 input_col_index: 1,
+                input_col_name: None,
             }],
         )
         .await;
@@ -1221,6 +1271,7 @@ mod tests {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Prod,
                 input_col_index: 1,
+                input_col_name: None,
             }],
         )
         .await;
@@ -1247,6 +1298,7 @@ mod tests {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Prod,
                 input_col_index: 1,
+                input_col_name: None,
             }],
         )
         .await;
@@ -1297,6 +1349,7 @@ mod tests {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Nor,
                 input_col_index: 1,
+                input_col_name: None,
             }],
         )
         .await;
@@ -1320,6 +1373,7 @@ mod tests {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Prod,
                 input_col_index: 1,
+                input_col_name: None,
             }],
         )
         .await;
@@ -1343,6 +1397,7 @@ mod tests {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Nor,
                 input_col_index: 1,
+                input_col_name: None,
             }],
         )
         .await;
@@ -1366,6 +1421,7 @@ mod tests {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Nor,
                 input_col_index: 1,
+                input_col_name: None,
             }],
         )
         .await;
@@ -1393,6 +1449,7 @@ mod tests {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Prod,
                 input_col_index: 1,
+                input_col_name: None,
             }],
         )
         .await;
@@ -1416,6 +1473,7 @@ mod tests {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Nor,
                 input_col_index: 1,
+                input_col_name: None,
             }],
         )
         .await;
@@ -1439,6 +1497,7 @@ mod tests {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Prod,
                 input_col_index: 1,
+                input_col_name: None,
             }],
         )
         .await;
@@ -1462,6 +1521,7 @@ mod tests {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Prod,
                 input_col_index: 1,
+                input_col_name: None,
             }],
         )
         .await;
@@ -1495,6 +1555,7 @@ mod tests {
             output_name: "prob".to_string(),
             kind: FoldAggKind::Nor,
             input_col_index: 1,
+            input_col_name: None,
         }];
         let r1 = execute_fold(make_memory_exec(fwd), vec![0], binding.clone()).await;
         let r2 = execute_fold(make_memory_exec(rev), vec![0], binding).await;
@@ -1524,6 +1585,7 @@ mod tests {
             output_name: "prob".to_string(),
             kind: FoldAggKind::Prod,
             input_col_index: 1,
+            input_col_name: None,
         }];
         let r1 = execute_fold(make_memory_exec(fwd), vec![0], binding.clone()).await;
         let r2 = execute_fold(make_memory_exec(rev), vec![0], binding).await;
@@ -1556,6 +1618,7 @@ mod tests {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Nor,
                 input_col_index: 1,
+                input_col_name: None,
             }],
         )
         .await;
@@ -1585,6 +1648,7 @@ mod tests {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Nor,
                 input_col_index: 1,
+                input_col_name: None,
             }],
         )
         .await;
@@ -1614,6 +1678,7 @@ mod tests {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Prod,
                 input_col_index: 1,
+                input_col_name: None,
             }],
         )
         .await;
@@ -1645,6 +1710,7 @@ mod tests {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Nor,
                 input_col_index: 1,
+                input_col_name: None,
             }],
         )
         .await;
@@ -1663,6 +1729,7 @@ mod tests {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Nor,
                 input_col_index: 1,
+                input_col_name: None,
             }],
         )
         .await;
@@ -1686,6 +1753,7 @@ mod tests {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Prod,
                 input_col_index: 1,
+                input_col_name: None,
             }],
         )
         .await;
@@ -1709,6 +1777,7 @@ mod tests {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Prod,
                 input_col_index: 1,
+                input_col_name: None,
             }],
         )
         .await;
@@ -1732,6 +1801,7 @@ mod tests {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Nor,
                 input_col_index: 1,
+                input_col_name: None,
             }],
         )
         .await;
@@ -1755,6 +1825,7 @@ mod tests {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Nor,
                 input_col_index: 1,
+                input_col_name: None,
             }],
         )
         .await;
@@ -1779,6 +1850,7 @@ mod tests {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Prod,
                 input_col_index: 1,
+                input_col_name: None,
             }],
         )
         .await;
@@ -1803,6 +1875,7 @@ mod tests {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Nor,
                 input_col_index: 1,
+                input_col_name: None,
             }],
         )
         .await;
@@ -1826,6 +1899,7 @@ mod tests {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Prod,
                 input_col_index: 1,
+                input_col_name: None,
             }],
         )
         .await;
@@ -1851,6 +1925,7 @@ mod tests {
                 output_name: "prob".to_string(),
                 kind: FoldAggKind::Nor,
                 input_col_index: 1,
+                input_col_name: None,
             }],
         )
         .await;
@@ -1956,6 +2031,7 @@ mod tests {
                 output_name: "p".into(),
                 kind: FoldAggKind::Nor,
                 input_col_index: 1,
+                input_col_name: None,
             }],
             true,
         )
@@ -1980,6 +2056,7 @@ mod tests {
                 output_name: "p".into(),
                 kind: FoldAggKind::Nor,
                 input_col_index: 1,
+                input_col_name: None,
             }],
             true,
         )
@@ -2004,6 +2081,7 @@ mod tests {
                 output_name: "p".into(),
                 kind: FoldAggKind::Prod,
                 input_col_index: 1,
+                input_col_name: None,
             }],
             true,
         )
@@ -2028,6 +2106,7 @@ mod tests {
                 output_name: "p".into(),
                 kind: FoldAggKind::Prod,
                 input_col_index: 1,
+                input_col_name: None,
             }],
             true,
         )
@@ -2052,6 +2131,7 @@ mod tests {
                 output_name: "p".into(),
                 kind: FoldAggKind::Nor,
                 input_col_index: 1,
+                input_col_name: None,
             }],
             true,
         )
@@ -2084,6 +2164,7 @@ mod tests {
                 output_name: "cnt".to_string(),
                 kind: FoldAggKind::CountAll,
                 input_col_index: 0, // unused for CountAll
+                input_col_name: None,
             }],
         )
         .await;

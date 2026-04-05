@@ -5,12 +5,15 @@
 ```cypher
 CREATE RULE rule_name [PRIORITY n] AS
 MATCH ...
-[WHERE ...]
+[WHERE ...]              -- pre-aggregation filter
 [ALONG ...]
 [FOLD ...]
+[WHERE ...]              -- post-FOLD filter (HAVING semantics)
 [BEST BY ...]
 YIELD ...
 ```
+
+The first `WHERE` filters rows before aggregation. The second `WHERE` (after `FOLD`) filters aggregated groups — e.g., `WHERE count >= 3`.
 
 ## Rule References
 

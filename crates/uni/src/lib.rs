@@ -37,7 +37,8 @@ pub use api::xervo::UniXervo;
 // Re-exports from xervo for catalog parsing
 pub use api::{DatabaseMetrics, ThrottlePressure, Uni, UniBuilder};
 pub use uni_xervo::api::{
-    catalog_from_file as xervo_catalog_from_file, catalog_from_str as xervo_catalog_from_str,
+    ModelAliasSpec, ModelTask, WarmupPolicy, catalog_from_file as xervo_catalog_from_file,
+    catalog_from_str as xervo_catalog_from_str,
 };
 
 // Re-exports from internal crates

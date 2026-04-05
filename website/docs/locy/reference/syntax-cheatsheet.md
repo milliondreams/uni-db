@@ -5,14 +5,17 @@
 ```cypher
 CREATE RULE name [PRIORITY n] AS
 MATCH ...
-[WHERE ...]
+[WHERE ...]                         -- pre-aggregation filter
 [ALONG x = expr]
 [FOLD agg = aggregate(expr)]
+[WHERE agg_condition]               -- post-FOLD filter (HAVING)
 [BEST BY expr ASC|DESC]
 YIELD KEY a, value AS alias, prob_expr AS PROB
 -- OR, for graph mutation rules:
 DERIVE (src)-[:TYPE]->(dst) [SET property = expr]
 ```
+
+The second `WHERE` (after `FOLD`) filters on aggregated values — equivalent to SQL's `HAVING`. It can reference FOLD output columns and KEY columns.
 
 ### FOLD Aggregators
 

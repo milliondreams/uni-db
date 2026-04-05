@@ -1,0 +1,4 @@
+product_id,name,description
+PROD-001,SensorHub Pro,"Full-featured IoT gateway with BLE mesh networking, sensor fusion, data aggregation, and edge ML inference capabilities for industrial wireless sensor deployments."
+PROD-002,SensorLite,Basic low-power sensor node with BLE connectivity and minimal onboard processing for environmental monitoring applications.
+PROD-003,MeshBridge,Dedicated mesh relay device providing range extension and protocol bridging between BLE sensor networks and Wi-Fi backhaul infrastructure.

@@ -268,6 +268,7 @@ fn build_rule_definition(pair: Pair<LocyRule>) -> Result<RuleDefinition, ParseEr
     let mut where_conditions = Vec::new();
     let mut along = Vec::new();
     let mut fold = Vec::new();
+    let mut having = Vec::new();
     let mut best_by = None;
     let mut output = None;
 
@@ -298,6 +299,9 @@ fn build_rule_definition(pair: Pair<LocyRule>) -> Result<RuleDefinition, ParseEr
             LocyRule::fold_clause => {
                 fold = build_fold_clause(child)?;
             }
+            LocyRule::fold_having_clause => {
+                having = build_fold_having_clause(child)?;
+            }
             LocyRule::best_by_clause => {
                 let items = build_best_by_clause(child)?;
                 if !items.is_empty() {
@@ -320,6 +324,7 @@ fn build_rule_definition(pair: Pair<LocyRule>) -> Result<RuleDefinition, ParseEr
         where_conditions,
         along,
         fold,
+        having,
         best_by,
         output: output.unwrap(),
     })
@@ -778,6 +783,17 @@ fn build_fold_declaration(pair: Pair<LocyRule>) -> Result<FoldBinding, ParseErro
     })
 }
 
+/// Parse post-FOLD WHERE (HAVING) clause into filter expressions.
+fn build_fold_having_clause(pair: Pair<LocyRule>) -> Result<Vec<ast::Expr>, ParseError> {
+    let mut conditions = Vec::new();
+    for child in pair.into_inner() {
+        if child.as_rule() == LocyRule::expression {
+            conditions.push(reparse_as_cypher_expression(child.as_str())?);
+        }
+    }
+    Ok(conditions)
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // BEST BY CLAUSE
 // ═══════════════════════════════════════════════════════════════════════════
@@ -853,16 +869,21 @@ fn build_locy_yield_item(pair: Pair<LocyRule>) -> Result<LocyYieldItem, ParseErr
     let first = &children[0];
 
     if first.as_rule() == LocyRule::key_projection {
-        let ident = first
-            .clone()
-            .into_inner()
-            .find(|p| p.as_rule() == LocyRule::locy_identifier)
+        let inner: Vec<_> = first.clone().into_inner().collect();
+        let expr_pair = inner
+            .iter()
+            .find(|p| p.as_rule() == LocyRule::expression)
             .unwrap();
+        let expr = reparse_as_cypher_expression(expr_pair.as_str())?;
+        let alias = inner
+            .iter()
+            .find(|p| p.as_rule() == LocyRule::alias_identifier)
+            .map(|p| normalize_locy_identifier(p.as_str()));
         return Ok(LocyYieldItem {
             is_key: true,
             is_prob: false,
-            expr: ast::Expr::Variable(normalize_locy_identifier(ident.as_str())),
-            alias: None,
+            expr,
+            alias,
         });
     }
 

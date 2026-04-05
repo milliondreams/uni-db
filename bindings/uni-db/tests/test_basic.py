@@ -43,8 +43,10 @@ class TestUni(unittest.TestCase):
             "age", "int"
         ).apply()
 
-        # Create a node
-        self.session.query("CREATE (n:Person {name: 'Alice', age: 30})")
+        # Create a node via transaction
+        tx = self.session.tx()
+        tx.execute("CREATE (n:Person {name: 'Alice', age: 30})")
+        tx.commit()
 
         # Query it back
         results = self.session.query(
@@ -60,9 +62,11 @@ class TestUni(unittest.TestCase):
             "age", "int"
         ).apply()
 
-        # Create using params
+        # Create using params via transaction
         params = {"name": "Bob", "age": 25}
-        self.session.query("CREATE (n:Person {name: $name, age: $age})", params)
+        tx = self.session.tx()
+        tx.execute("CREATE (n:Person {name: $name, age: $age})", params)
+        tx.commit()
 
         # Query back
         # Note: returning 'n' might return VID string in current vectorized engine.
@@ -78,8 +82,10 @@ class TestUni(unittest.TestCase):
     def test_list_and_map(self):
         self.db.schema().label("Item").property("tags", "list:string").apply()
 
-        # Test passing a list parameter.
-        self.session.query("CREATE (n:Item {tags: $tags})", {"tags": ["a", "b"]})
+        # Test passing a list parameter via transaction.
+        tx = self.session.tx()
+        tx.execute("CREATE (n:Item {tags: $tags})", {"tags": ["a", "b"]})
+        tx.commit()
 
         results = self.session.query("MATCH (n:Item) RETURN n.tags as tags")
         self.assertEqual(len(results), 1)

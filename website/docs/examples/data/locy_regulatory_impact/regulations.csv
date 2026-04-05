@@ -1,0 +1,6 @@
+reg_id,name,jurisdiction,effective_date,penalty_factor
+REG-GDPR,GDPR,EU,2018-05-25,0.85
+REG-SOX,SOX,US,2002-07-30,0.7
+REG-DORA,DORA,EU,2025-01-17,0.9
+REG-HIPAA,HIPAA,US,1996-08-21,0.65
+REG-PCI,PCI-DSS,Global,2004-12-15,0.75

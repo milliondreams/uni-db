@@ -42,6 +42,8 @@ pub struct LocyRulePlan {
     pub priority: Option<i64>,
     /// FOLD bindings for post-fixpoint aggregation (name, aggregate expr).
     pub fold_bindings: Vec<(String, Expr)>,
+    /// Post-FOLD filter expressions (HAVING semantics).
+    pub having: Vec<Expr>,
     /// BEST BY criteria for post-fixpoint selection (expr, ascending).
     pub best_by_criteria: Vec<(Expr, bool)>,
 }

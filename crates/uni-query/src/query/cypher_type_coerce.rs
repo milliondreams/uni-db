@@ -290,12 +290,35 @@ pub(crate) fn build_cypher_plus(
         ));
     }
 
-    // 8. Otherwise: Error
+    // 8. Temporal + Duration arithmetic (Date/DateTime + Interval)
+    if is_temporal_or_interval(left_type) || is_temporal_or_interval(right_type) {
+        return Ok(super::df_expr::dummy_udf_expr(
+            "_cypher_add",
+            vec![left, right],
+        ));
+    }
+
+    // 9. Otherwise: Error
     Err(anyhow!(
         "Incompatible types for Plus operator: {:?} + {:?}",
         left_type,
         right_type
     ))
+}
+
+/// Check if a DataType is temporal (Date, DateTime struct) or interval/duration.
+fn is_temporal_or_interval(dt: &datafusion::arrow::datatypes::DataType) -> bool {
+    use datafusion::arrow::datatypes::DataType;
+    matches!(
+        dt,
+        DataType::Date32
+            | DataType::Date64
+            | DataType::Time32(_)
+            | DataType::Time64(_)
+            | DataType::Timestamp(_, _)
+            | DataType::Interval(_)
+            | DataType::Duration(_)
+    ) || matches!(dt, DataType::Struct(_)) // DateTime struct
 }
 
 /// Converts a value to a string expression for concatenation.

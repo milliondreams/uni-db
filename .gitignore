@@ -39,6 +39,7 @@ website/site/
 # Generated notebook markdown (from convert_notebooks.py)
 website/docs/examples/**/*.md
 !website/docs/examples/index.md
+!website/docs/examples/**/*_overview.md
 
 # Performance profiling data
 perf.data

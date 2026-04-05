@@ -14,24 +14,21 @@ async fn test_profile_basic() -> anyhow::Result<()> {
         .await?;
 
     // Create schema
-    db.session()
-        .query("CREATE LABEL Person (name STRING, age INT)")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL Person (name STRING, age INT)")
         .await?;
-    db.session()
-        .query("CREATE LABEL City (name STRING)")
+    tx.execute("CREATE LABEL City (name STRING)").await?;
+    tx.execute("CREATE EDGE TYPE LIVES_IN () FROM Person TO City")
         .await?;
-    db.session()
-        .query("CREATE EDGE TYPE LIVES_IN () FROM Person TO City")
-        .await?;
+    tx.commit().await?;
 
     // Insert data
-    db.session()
-        .query("CREATE (p:Person {name: 'Alice', age: 30})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (p:Person {name: 'Alice', age: 30})")
         .await?;
-    db.session()
-        .query("CREATE (c:City {name: 'London'})")
-        .await?;
-    db.session().query("MATCH (p:Person), (c:City) WHERE p.name = 'Alice' AND c.name = 'London' CREATE (p)-[:LIVES_IN]->(c)").await?;
+    tx.execute("CREATE (c:City {name: 'London'})").await?;
+    tx.execute("MATCH (p:Person), (c:City) WHERE p.name = 'Alice' AND c.name = 'London' CREATE (p)-[:LIVES_IN]->(c)").await?;
+    tx.commit().await?;
 
     // Profile query — the CLI strips "PROFILE" before calling profile()
     let clean_query = "MATCH (p:Person)-[:LIVES_IN]->(c:City) RETURN p.name, c.name";

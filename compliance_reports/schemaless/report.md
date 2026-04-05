@@ -1,17 +1,19 @@
 # TCK Compliance Report
 
-**Generated:** 2026-03-31 00:44:03
-**Results:** `results_20260331_004403.json`
-**Compared to:** `results_20260330_205522.json`
+**Generated:** 2026-04-04 19:29:23
+**Results:** `results_20260404_192923.json`
+**Compared to:** `results_20260404_191518.json`
 
 ## Summary
 
 | Metric | Current | Previous | Delta |
 |--------|---------|----------|-------|
 | Scenarios | 3897 | 3897 |  |
-| Passed | 3896 | 3896 |  |
-| Failed | 0 | 0 |  |
-| Pass Rate | 100.0% | 100.0% | ➡️ +0.0pp |
+| Passed | 3896 | 3783 | +113 |
+| Failed | 0 | 113 | -113 |
+| Pass Rate | 100.0% | 97.1% | 📈 +2.9pp |
+
+**🟢 Fixed:** 113 scenarios now passing
 
 ## Feature Breakdown
 
@@ -40,7 +42,7 @@
 | ✅ Comparison4 | 1 | 1 | 0 | 100% |  |
 | ✅ Conditional1 | 1 | 1 | 0 | 100% |  |
 | ✅ Conditional2 | 12 | 12 | 0 | 100% |  |
-| ✅ CountingSubgraphMatches1 | 11 | 11 | 0 | 100% |  |
+| ✅ CountingSubgraphMatches1 | 11 | 11 | 0 | 100% | +100pp |
 | ✅ Create1 | 20 | 20 | 0 | 100% |  |
 | ✅ Create2 | 24 | 24 | 0 | 100% |  |
 | ✅ Create3 | 13 | 13 | 0 | 100% |  |
@@ -178,12 +180,12 @@
 | ✅ Temporal6 | 17 | 17 | 0 | 100% |  |
 | ✅ Temporal7 | 18 | 18 | 0 | 100% |  |
 | ✅ Temporal8 | 27 | 27 | 0 | 100% |  |
-| ✅ Temporal9 | 322 | 322 | 0 | 100% |  |
-| ✅ TriadicSelection1 | 19 | 19 | 0 | 100% |  |
-| ✅ TypeConversion1 | 10 | 10 | 0 | 100% |  |
-| ✅ TypeConversion2 | 12 | 12 | 0 | 100% |  |
-| ✅ TypeConversion3 | 11 | 11 | 0 | 100% |  |
-| ✅ TypeConversion4 | 14 | 14 | 0 | 100% |  |
+| ✅ Temporal9 | 322 | 322 | 0 | 100% | +12pp |
+| ✅ TriadicSelection1 | 19 | 19 | 0 | 100% | +89pp |
+| ✅ TypeConversion1 | 10 | 10 | 0 | 100% | +100pp |
+| ✅ TypeConversion2 | 12 | 12 | 0 | 100% | +92pp |
+| ✅ TypeConversion3 | 11 | 11 | 0 | 100% | +91pp |
+| ✅ TypeConversion4 | 14 | 14 | 0 | 100% | +100pp |
 | ✅ Union1 | 5 | 5 | 0 | 100% |  |
 | ✅ Union2 | 5 | 5 | 0 | 100% |  |
 | ✅ Union3 | 2 | 2 | 0 | 100% |  |
@@ -209,6 +211,124 @@
 | ✅ WithWhere5 | 4 | 4 | 0 | 100% |  |
 | ✅ WithWhere6 | 1 | 1 | 0 | 100% |  |
 | ✅ WithWhere7 | 3 | 3 | 0 | 100% |  |
+
+## 🟢 Newly Passing
+
+Scenarios that were failing but are now passing:
+
+- **CountingSubgraphMatches1** — [10] Mixing directed and undirected pattern parts with self-relationship, count (line 178)
+- **CountingSubgraphMatches1** — [11] Mixing directed and undirected pattern parts with self-relationship, undirected count (line 196)
+- **CountingSubgraphMatches1** — [1] Undirected match in self-relationship graph, count (line 33)
+- **CountingSubgraphMatches1** — [2] Undirected match of self-relationship in self-relationship graph, count (line 49)
+- **CountingSubgraphMatches1** — [3] Undirected match on simple relationship graph, count (line 65)
+- **CountingSubgraphMatches1** — [4] Directed match on self-relationship graph, count (line 81)
+- **CountingSubgraphMatches1** — [5] Directed match of self-relationship on self-relationship graph, count (line 97)
+- **CountingSubgraphMatches1** — [6] Counting undirected self-relationships in self-relationship graph (line 113)
+- **CountingSubgraphMatches1** — [7] Counting distinct undirected self-relationships in self-relationship graph (line 129)
+- **CountingSubgraphMatches1** — [8] Directed match of a simple relationship, count (line 145)
+- **CountingSubgraphMatches1** — [9] Counting directed self-relationships (line 161)
+- **Temporal9** — [5] Should truncate time (line 380)
+- **Temporal9** — [5] Should truncate time (line 381)
+- **Temporal9** — [5] Should truncate time (line 382)
+- **Temporal9** — [5] Should truncate time (line 383)
+- **Temporal9** — [5] Should truncate time (line 384)
+- **Temporal9** — [5] Should truncate time (line 385)
+- **Temporal9** — [5] Should truncate time (line 386)
+- **Temporal9** — [5] Should truncate time (line 387)
+- **Temporal9** — [5] Should truncate time (line 388)
+- **Temporal9** — [5] Should truncate time (line 389)
+- **Temporal9** — [5] Should truncate time (line 390)
+- **Temporal9** — [5] Should truncate time (line 391)
+- **Temporal9** — [5] Should truncate time (line 392)
+- **Temporal9** — [5] Should truncate time (line 393)
+- **Temporal9** — [5] Should truncate time (line 394)
+- **Temporal9** — [5] Should truncate time (line 395)
+- **Temporal9** — [5] Should truncate time (line 396)
+- **Temporal9** — [5] Should truncate time (line 397)
+- **Temporal9** — [5] Should truncate time (line 398)
+- **Temporal9** — [5] Should truncate time (line 399)
+- **Temporal9** — [5] Should truncate time (line 401)
+- **Temporal9** — [5] Should truncate time (line 402)
+- **Temporal9** — [5] Should truncate time (line 403)
+- **Temporal9** — [5] Should truncate time (line 404)
+- **Temporal9** — [5] Should truncate time (line 405)
+- **Temporal9** — [5] Should truncate time (line 407)
+- **Temporal9** — [5] Should truncate time (line 409)
+- **Temporal9** — [5] Should truncate time (line 410)
+- **Temporal9** — [5] Should truncate time (line 411)
+- **Temporal9** — [5] Should truncate time (line 412)
+- **Temporal9** — [5] Should truncate time (line 413)
+- **Temporal9** — [5] Should truncate time (line 414)
+- **Temporal9** — [5] Should truncate time (line 415)
+- **Temporal9** — [5] Should truncate time (line 416)
+- **Temporal9** — [5] Should truncate time (line 417)
+- **Temporal9** — [5] Should truncate time (line 418)
+- **Temporal9** — [5] Should truncate time (line 419)
+- **Temporal9** — [5] Should truncate time (line 420)
+- **Temporal9** — [5] Should truncate time (line 421)
+- **Temporal9** — [5] Should truncate time (line 423)
+- **TriadicSelection1** — [10] Handling triadic friend of a friend that is not a friend with implicit superset of labels (line 196)
+- **TriadicSelection1** — [11] Handling triadic friend of a friend that is a friend (line 214)
+- **TriadicSelection1** — [12] Handling triadic friend of a friend that is a friend with different relationship type (line 228)
+- **TriadicSelection1** — [13] Handling triadic friend of a friend that is a friend with superset of relationship type (line 242)
+- **TriadicSelection1** — [14] Handling triadic friend of a friend that is a friend with implicit subset of relationship type (line 257)
+- **TriadicSelection1** — [15] Handling triadic friend of a friend that is a friend with explicit subset of relationship type (line 272)
+- **TriadicSelection1** — [16] Handling triadic friend of a friend that is a friend with same labels (line 287)
+- **TriadicSelection1** — [17] Handling triadic friend of a friend that is a friend with different labels (line 301)
+- **TriadicSelection1** — [18] Handling triadic friend of a friend that is a friend with implicit subset of labels (line 314)
+- **TriadicSelection1** — [19] Handling triadic friend of a friend that is a friend with implicit superset of labels (line 328)
+- **TriadicSelection1** — [2] Handling triadic friend of a friend that is not a friend (line 50)
+- **TriadicSelection1** — [4] Handling triadic friend of a friend that is not a friend with superset of relationship type (line 86)
+- **TriadicSelection1** — [5] Handling triadic friend of a friend that is not a friend with implicit subset of relationship type (line 103)
+- **TriadicSelection1** — [6] Handling triadic friend of a friend that is not a friend with explicit subset of relationship type (line 126)
+- **TriadicSelection1** — [7] Handling triadic friend of a friend that is not a friend with same labels (line 149)
+- **TriadicSelection1** — [8] Handling triadic friend of a friend that is not a friend with different labels (line 165)
+- **TriadicSelection1** — [9] Handling triadic friend of a friend that is not a friend with implicit subset of labels (line 180)
+- **TypeConversion1** — [1] `toBoolean()` on booleans (line 33)
+- **TypeConversion1** — [2] `toBoolean()` on valid literal string (line 46)
+- **TypeConversion1** — [3] `toBoolean()` on variables with valid string values (line 57)
+- **TypeConversion1** — [4] `toBoolean()` on invalid strings (line 70)
+- **TypeConversion1** — [5] Fail `toBoolean()` on invalid types #Example: float (line 102)
+- **TypeConversion1** — [5] Fail `toBoolean()` on invalid types #Example: list (line 100)
+- **TypeConversion1** — [5] Fail `toBoolean()` on invalid types #Example: map (line 101)
+- **TypeConversion1** — [5] Fail `toBoolean()` on invalid types #Example: node (line 103)
+- **TypeConversion1** — [5] Fail `toBoolean()` on invalid types #Example: path (line 105)
+- **TypeConversion1** — [5] Fail `toBoolean()` on invalid types #Example: relationship (line 104)
+- **TypeConversion2** — [1] `toInteger()` on float (line 33)
+- **TypeConversion2** — [2] `toInteger()` returning null on non-numerical string (line 45)
+- **TypeConversion2** — [4] `toInteger()` handling Any type (line 69)
+- **TypeConversion2** — [5] `toInteger()` on a list of strings (line 81)
+- **TypeConversion2** — [6] `toInteger()` on a complex-typed expression (line 93)
+- **TypeConversion2** — [7] `toInteger()` on node property (line 106)
+- **TypeConversion2** — [8] Fail `toInteger()` on invalid types #Example: list (line 139)
+- **TypeConversion2** — [8] Fail `toInteger()` on invalid types #Example: map (line 140)
+- **TypeConversion2** — [8] Fail `toInteger()` on invalid types #Example: node (line 141)
+- **TypeConversion2** — [8] Fail `toInteger()` on invalid types #Example: path (line 143)
+- **TypeConversion2** — [8] Fail `toInteger()` on invalid types #Example: relationship (line 142)
+- **TypeConversion3** — [2] `toFloat()` returning null on non-numerical string (line 45)
+- **TypeConversion3** — [3] `toFloat()` handling Any type (line 57)
+- **TypeConversion3** — [4] `toFloat()` on a list of strings (line 69)
+- **TypeConversion3** — [5] `toFloat()` on node property (line 81)
+- **TypeConversion3** — [6] Fail `toFloat()` on invalid types #Example: boolean (line 114)
+- **TypeConversion3** — [6] Fail `toFloat()` on invalid types #Example: list (line 115)
+- **TypeConversion3** — [6] Fail `toFloat()` on invalid types #Example: map (line 116)
+- **TypeConversion3** — [6] Fail `toFloat()` on invalid types #Example: node (line 117)
+- **TypeConversion3** — [6] Fail `toFloat()` on invalid types #Example: path (line 119)
+- **TypeConversion3** — [6] Fail `toFloat()` on invalid types #Example: relationship (line 118)
+- **TypeConversion4** — [10] Fail `toString()` on invalid types #Example: list (line 166)
+- **TypeConversion4** — [10] Fail `toString()` on invalid types #Example: map (line 167)
+- **TypeConversion4** — [10] Fail `toString()` on invalid types #Example: node (line 168)
+- **TypeConversion4** — [10] Fail `toString()` on invalid types #Example: path (line 170)
+- **TypeConversion4** — [10] Fail `toString()` on invalid types #Example: relationship (line 169)
+- **TypeConversion4** — [1] `toString()` handling integer literal (line 33)
+- **TypeConversion4** — [2] `toString()` handling boolean literal (line 44)
+- **TypeConversion4** — [3] `toString()` handling inlined boolean (line 55)
+- **TypeConversion4** — [4] `toString()` handling boolean properties (line 66)
+- **TypeConversion4** — [5] `toString()` should work on Any type (line 82)
+- **TypeConversion4** — [6] `toString()` on a list of integers (line 93)
+- **TypeConversion4** — [7] `toString()` on node property (line 105)
+- **TypeConversion4** — [8] `toString()` should accept potentially correct types 1 (line 123)
+- **TypeConversion4** — [9] `toString()` should accept potentially correct types 2 (line 137)
 
 ## Failed Scenarios
 

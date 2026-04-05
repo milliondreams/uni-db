@@ -40,6 +40,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use uni_common::Value;
 use uni_common::core::schema::Schema as UniSchema;
+use uni_cypher::ast::Expr;
 use uni_locy::RuntimeWarning;
 use uni_store::storage::manager::StorageManager;
 
@@ -120,6 +121,8 @@ pub struct MonotonicFoldBinding {
     pub fold_name: String,
     pub kind: crate::query::df_graph::locy_fold::FoldAggKind,
     pub input_col_index: usize,
+    /// Column name for name-based resolution (more robust than positional index).
+    pub input_col_name: Option<String>,
 }
 
 /// Tracks monotonic aggregate accumulators across fixpoint iterations.
@@ -165,7 +168,16 @@ impl MonotonicAggState {
             for row_idx in 0..batch.num_rows() {
                 let group_key = extract_scalar_key(batch, key_indices, row_idx);
                 for binding in &self.bindings {
-                    let col = batch.column(binding.input_col_index);
+                    // Resolve input column by name first, fall back to index.
+                    let idx = binding
+                        .input_col_name
+                        .as_ref()
+                        .and_then(|name| batch.schema().index_of(name).ok())
+                        .unwrap_or(binding.input_col_index);
+                    if idx >= batch.num_columns() {
+                        continue;
+                    }
+                    let col = batch.column(idx);
                     let val = extract_f64(col.as_ref(), row_idx);
                     if let Some(val) = val {
                         let map_key = (group_key.clone(), binding.fold_name.clone());
@@ -396,6 +408,8 @@ pub struct FixpointState {
     delta: Vec<RecordBatch>,
     schema: SchemaRef,
     key_column_indices: Vec<usize>,
+    /// KEY column names for recomputing indices after schema reconciliation.
+    key_column_names: Vec<String>,
     /// All column indices for full-row dedup (legacy path only).
     all_column_indices: Vec<usize>,
     /// Running total of facts bytes for memory limit tracking.
@@ -422,12 +436,17 @@ impl FixpointState {
     ) -> Self {
         let num_cols = schema.fields().len();
         let row_dedup = RowDedupState::try_new(&schema);
+        let key_column_names: Vec<String> = key_column_indices
+            .iter()
+            .filter_map(|&i| schema.fields().get(i).map(|f| f.name().clone()))
+            .collect();
         Self {
             rule_name,
             facts: Vec::new(),
             delta: Vec::new(),
             schema,
             key_column_indices,
+            key_column_names,
             all_column_indices: (0..num_cols).collect(),
             facts_bytes: 0,
             max_derived_bytes,
@@ -451,6 +470,20 @@ impl FixpointState {
             );
             self.schema = Arc::clone(actual_schema);
             self.row_dedup = RowDedupState::try_new(&self.schema);
+            // Recompute key_column_indices from stored KEY column names.
+            // Without this, FoldExec groups by wrong columns when the
+            // physical plan reorders columns vs the pre-inferred schema.
+            let new_indices: Vec<usize> = self
+                .key_column_names
+                .iter()
+                .filter_map(|name| actual_schema.index_of(name).ok())
+                .collect();
+            if new_indices.len() == self.key_column_names.len() {
+                self.key_column_indices = new_indices;
+            }
+            // else: not all KEY columns found in new schema — keep original indices
+            let num_cols = actual_schema.fields().len();
+            self.all_column_indices = (0..num_cols).collect();
         }
     }
 
@@ -681,6 +714,9 @@ impl FixpointState {
         // first.
         let mut sort_columns = Vec::new();
         for &ki in &self.key_column_indices {
+            if ki >= combined.num_columns() {
+                continue;
+            }
             sort_columns.push(arrow::compute::SortColumn {
                 values: Arc::clone(combined.column(ki)),
                 options: Some(arrow::compute::SortOptions {
@@ -690,6 +726,9 @@ impl FixpointState {
             });
         }
         for criterion in sort_criteria {
+            if criterion.col_index >= combined.num_columns() {
+                continue;
+            }
             sort_columns.push(arrow::compute::SortColumn {
                 values: Arc::clone(combined.column(criterion.col_index)),
                 options: Some(arrow::compute::SortOptions {
@@ -979,6 +1018,8 @@ pub struct FixpointRulePlan {
     pub has_fold: bool,
     /// FOLD bindings for post-fixpoint aggregation.
     pub fold_bindings: Vec<FoldBinding>,
+    /// Post-FOLD filter expressions (HAVING semantics).
+    pub having: Vec<Expr>,
     /// Whether this rule has BEST BY semantics.
     pub has_best_by: bool,
     /// BEST BY sort criteria for post-fixpoint selection.
@@ -1039,6 +1080,7 @@ async fn run_fixpoint_loop(
                         fold_name: fb.output_name.clone(),
                         kind: fb.kind.clone(),
                         input_col_index: fb.input_col_index,
+                        input_col_name: fb.input_col_name.clone(),
                     })
                     .collect();
                 Some(MonotonicAggState::new(bindings))
@@ -1877,7 +1919,7 @@ pub(crate) fn apply_exact_wmc(
             .map(|&row_idx| overrides.get(&(batch_idx, row_idx)).copied())
             .collect();
 
-        if override_map.iter().any(|o| o.is_some()) {
+        if override_map.iter().any(|o| o.is_some()) && prob_col_idx < columns.len() {
             // Rebuild the PROB column with overrides.
             let existing_prob = columns[prob_col_idx]
                 .as_any()
@@ -2697,7 +2739,104 @@ impl ExecutionPlan for InMemoryExec {
 // Post-fixpoint chain — FOLD and BEST BY on converged facts
 // ---------------------------------------------------------------------------
 
-/// Apply post-fixpoint operators (FOLD, BEST BY, PRIORITY) to converged facts.
+/// Apply post-FOLD WHERE (HAVING) filter to aggregated batches.
+///
+/// Converts each Cypher HAVING expression to a DataFusion physical expression
+/// via `cypher_expr_to_df` → type coercion → `create_physical_expr`, evaluates
+/// against the FOLD output, and keeps only rows where all conditions hold.
+fn apply_having_filter(
+    batches: Vec<RecordBatch>,
+    having_exprs: &[Expr],
+    schema: &SchemaRef,
+) -> DFResult<Vec<RecordBatch>> {
+    use arrow::compute::{and, filter_record_batch};
+    use arrow_array::BooleanArray;
+    use datafusion::common::DFSchema;
+    use datafusion::logical_expr::LogicalPlanBuilder;
+    use datafusion::optimizer::AnalyzerRule;
+    use datafusion::optimizer::analyzer::type_coercion::TypeCoercion;
+    use datafusion::physical_expr::create_physical_expr;
+    use datafusion::prelude::SessionContext;
+
+    if batches.is_empty() {
+        return Ok(batches);
+    }
+
+    // Build DFSchema from the FOLD output Arrow schema.
+    let df_schema = DFSchema::try_from(schema.as_ref().clone()).map_err(|e| {
+        datafusion::common::DataFusionError::Internal(format!("HAVING schema conversion: {e}"))
+    })?;
+
+    let ctx = SessionContext::new();
+    let state = ctx.state();
+    let config = state.config_options().clone();
+    let props = state.execution_props();
+
+    // Cypher Expr → DataFusion DfExpr → type-coerced DfExpr → PhysicalExpr.
+    //
+    // Type coercion is needed because FOLD aggregates produce Float64 (SUM,
+    // AVG) or Int64 (COUNT), and literal comparisons like `total >= 100`
+    // may mix Float64 columns with Int64 literals.
+    let physical_exprs: Vec<Arc<dyn datafusion::physical_expr::PhysicalExpr>> = having_exprs
+        .iter()
+        .map(|expr| {
+            let df_expr = crate::query::df_expr::cypher_expr_to_df(expr, None).map_err(|e| {
+                datafusion::common::DataFusionError::Internal(format!(
+                    "HAVING expression conversion: {e}"
+                ))
+            })?;
+
+            // Run DataFusion's type coercion by wrapping in a Filter plan,
+            // applying the TypeCoercion analyzer rule, then extracting the
+            // coerced predicate.
+            let empty = datafusion::logical_expr::LogicalPlan::EmptyRelation(
+                datafusion::logical_expr::EmptyRelation {
+                    produce_one_row: false,
+                    schema: Arc::new(df_schema.clone()),
+                },
+            );
+            let filter_plan = LogicalPlanBuilder::from(empty)
+                .filter(df_expr.clone())?
+                .build()?;
+            let coerced_expr = match TypeCoercion::new().analyze(filter_plan, &config) {
+                Ok(datafusion::logical_expr::LogicalPlan::Filter(f)) => f.predicate,
+                _ => df_expr,
+            };
+
+            create_physical_expr(&coerced_expr, &df_schema, props)
+        })
+        .collect::<DFResult<Vec<_>>>()?;
+
+    let mut result = Vec::new();
+    for batch in batches {
+        // Evaluate each condition and AND the boolean masks.
+        let mut mask: Option<BooleanArray> = None;
+        for phys_expr in &physical_exprs {
+            let value = phys_expr.evaluate(&batch)?;
+            let arr = value.into_array(batch.num_rows())?;
+            let bool_arr = arr.as_any().downcast_ref::<BooleanArray>().ok_or_else(|| {
+                datafusion::common::DataFusionError::Internal(
+                    "HAVING condition must evaluate to boolean".into(),
+                )
+            })?;
+            mask = Some(match mask {
+                None => bool_arr.clone(),
+                Some(prev) => and(&prev, bool_arr).map_err(arrow_err)?,
+            });
+        }
+        if let Some(ref m) = mask {
+            let filtered = filter_record_batch(&batch, m).map_err(arrow_err)?;
+            if filtered.num_rows() > 0 {
+                result.push(filtered);
+            }
+        } else {
+            result.push(batch);
+        }
+    }
+    Ok(result)
+}
+
+/// Apply post-fixpoint operators (FOLD, HAVING, BEST BY, PRIORITY) to converged facts.
 pub(crate) async fn apply_post_fixpoint_chain(
     facts: Vec<RecordBatch>,
     rule: &FixpointRulePlan,
@@ -2705,7 +2844,7 @@ pub(crate) async fn apply_post_fixpoint_chain(
     strict_probability_domain: bool,
     probability_epsilon: f64,
 ) -> DFResult<Vec<RecordBatch>> {
-    if !rule.has_fold && !rule.has_best_by && !rule.has_priority {
+    if !rule.has_fold && !rule.has_best_by && !rule.has_priority && rule.having.is_empty() {
         return Ok(facts);
     }
 
@@ -2748,6 +2887,18 @@ pub(crate) async fn apply_post_fixpoint_chain(
             strict_probability_domain,
             probability_epsilon,
         ))
+    } else {
+        current
+    };
+
+    // Apply HAVING (post-FOLD WHERE filter)
+    let current: Arc<dyn ExecutionPlan> = if !rule.having.is_empty() {
+        let batches = collect_all_partitions(&current, Arc::clone(task_ctx)).await?;
+        let filtered = apply_having_filter(batches, &rule.having, &current.schema())?;
+        if filtered.is_empty() {
+            return Ok(filtered);
+        }
+        Arc::new(InMemoryExec::new(filtered, Arc::clone(&current.schema())))
     } else {
         current
     };
@@ -2960,6 +3111,7 @@ impl ExecutionPlan for FixpointExec {
                     priority: r.priority,
                     has_fold: r.has_fold,
                     fold_bindings: r.fold_bindings.clone(),
+                    having: r.having.clone(),
                     has_best_by: r.has_best_by,
                     best_by_criteria: r.best_by_criteria.clone(),
                     has_priority: r.has_priority,
@@ -3362,6 +3514,7 @@ mod tests {
             fold_name: "total".into(),
             kind: FoldAggKind::Sum,
             input_col_index: 1,
+            input_col_name: None,
         }];
         let mut agg = MonotonicAggState::new(bindings);
 
@@ -3446,6 +3599,7 @@ mod tests {
             fold_name: "prob".into(),
             kind: FoldAggKind::Nor,
             input_col_index: 1,
+            input_col_name: None,
         }]
     }
 
@@ -3455,6 +3609,7 @@ mod tests {
             fold_name: "prob".into(),
             kind: FoldAggKind::Prod,
             input_col_index: 1,
+            input_col_name: None,
         }]
     }
 

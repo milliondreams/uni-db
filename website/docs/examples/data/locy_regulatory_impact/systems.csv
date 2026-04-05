@@ -1,0 +1,9 @@
+sys_id,name,env,tier
+SYS-01,ERP Core,prod,1
+SYS-02,Trading Platform,prod,1
+SYS-03,CRM System,prod,2
+SYS-04,Data Warehouse,prod,2
+SYS-05,Email Gateway,prod,3
+SYS-06,HR Portal,prod,3
+SYS-07,Dev/Test Environment,non-prod,4
+SYS-08,Disaster Recovery,dr,2

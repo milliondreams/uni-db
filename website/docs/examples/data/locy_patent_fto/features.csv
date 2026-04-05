@@ -1,0 +1,16 @@
+feature_id,product_id,name,description
+FEAT-001,PROD-001,BLE Radio Module,Bluetooth Low Energy 5.0 transceiver operating at 2.4 GHz with support for coded PHY and extended advertising for long-range communication.
+FEAT-002,PROD-001,Mesh Networking Stack,"Adaptive mesh routing protocol that dynamically selects optimal relay paths based on RSSI link quality metrics, supporting up to 128 concurrent nodes."
+FEAT-003,PROD-001,Sensor Fusion Engine,"Multi-sensor data fusion using weighted Kalman filtering to combine accelerometer, gyroscope, magnetometer, and environmental sensor readings."
+FEAT-004,PROD-001,Low-Power Sleep Controller,Duty-cycle management system that transitions between active and deep-sleep states with configurable wake intervals and mesh keepalive maintenance.
+FEAT-005,PROD-001,Data Aggregation Pipeline,"Sliding window aggregation with configurable window size, overlap, and delta-encoded compressed batch uplink to gateway nodes."
+FEAT-006,PROD-001,Edge ML Inference,On-device neural network inference engine supporting INT8-quantized models for real-time anomaly detection and predictive maintenance.
+FEAT-007,PROD-002,BLE Radio (Basic),Bluetooth Low Energy 5.0 transceiver at 2.4 GHz with standard advertising for short-range sensor data transmission.
+FEAT-008,PROD-002,Environmental Sensor Array,"Onboard temperature, humidity, and barometric pressure sensors with 12-bit ADC resolution."
+FEAT-009,PROD-002,Sleep Mode Controller,Basic duty-cycle sleep management with fixed wake intervals to conserve battery power.
+FEAT-010,PROD-002,OTA Update Module,Over-the-air firmware update capability using BLE DFU protocol with integrity verification.
+FEAT-011,PROD-003,BLE Mesh Relay,High-throughput BLE 5.0 mesh relay with multi-path routing and automatic topology discovery.
+FEAT-012,PROD-003,Wi-Fi Backhaul Bridge,Protocol bridge translating BLE mesh packets to Wi-Fi for cloud connectivity via TLS 1.3 encrypted channels.
+FEAT-013,PROD-003,Packet Aggregation Buffer,Store-and-forward buffer that batches sensor packets for efficient uplink transmission with configurable flush intervals.
+FEAT-014,PROD-003,Link Quality Monitor,Real-time RSSI and packet error rate monitoring for adaptive route selection across the mesh network.
+FEAT-015,PROD-003,Power Management Unit,PoE and battery-backed power supply with intelligent load balancing for continuous relay operation.

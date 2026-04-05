@@ -483,7 +483,14 @@ fn build_derivation_node<'a>(
             let has_along = !clause.along.is_empty();
 
             let resolved = if has_is_refs || has_along {
-                let rows = resolve_clause_with_is_refs(clause, fact_source, derived_store).await?;
+                let rows = resolve_clause_with_is_refs(
+                    clause,
+                    fact_source,
+                    derived_store,
+                    &program.rule_catalog,
+                    None, // EXPLAIN traces proofs, doesn't compute probabilities
+                )
+                .await?;
                 stats.queries_executed += 1;
                 rows
             } else {

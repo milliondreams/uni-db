@@ -5,10 +5,11 @@ use uni_query::Value;
 async fn test_labels_function() {
     let db = Uni::in_memory().build().await.unwrap();
 
-    db.session()
-        .query("CREATE (:Person:Student {name: 'Alice'})")
+    let tx = db.session().tx().await.unwrap();
+    tx.execute("CREATE (:Person:Student {name: 'Alice'})")
         .await
         .unwrap();
+    tx.commit().await.unwrap();
     let result = db
         .session()
         .query("MATCH (n:Person) RETURN labels(n) AS l")
@@ -30,10 +31,11 @@ async fn test_labels_function() {
 async fn test_path_functions() {
     let db = Uni::in_memory().build().await.unwrap();
 
-    db.session()
-        .query("CREATE (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'})")
+    let tx = db.session().tx().await.unwrap();
+    tx.execute("CREATE (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'})")
         .await
         .unwrap();
+    tx.commit().await.unwrap();
     let result = db
         .session()
         .query(

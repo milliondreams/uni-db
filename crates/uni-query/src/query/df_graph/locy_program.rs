@@ -707,6 +707,10 @@ async fn run_program(
             // works because recursive stratum rules share compatible schemas.
             // Revisit when cross-stratum consumption of individual recursive rules is needed.
             for rule in &stratum.rules {
+                // Skip DERIVE-only rules (empty yield_schema).
+                if rule.yield_schema.is_empty() {
+                    continue;
+                }
                 // Write converged facts into registry handles for cross-stratum consumers
                 let rule_entries = registry.entries_for_rule(&rule.name);
                 for entry in rule_entries {
@@ -740,6 +744,14 @@ async fn run_program(
             let task_ctx = session_ctx.read().task_ctx();
 
             for (rule, fp_rule) in stratum.rules.iter().zip(fixpoint_rules.iter()) {
+                // DERIVE-only rules have empty yield_schema (the compiler's
+                // infer_yield_schema only matches RuleOutput::Yield). Skip them
+                // in the fixpoint loop — DERIVE materialization is handled by
+                // the DERIVE command dispatch, not by the fixpoint.
+                if rule.yield_schema.is_empty() {
+                    continue;
+                }
+
                 // Process each clause independently (per-clause IS NOT).
                 let mut tagged_clause_facts: Vec<(usize, Vec<RecordBatch>)> = Vec::new();
                 for (clause_idx, (clause, fp_clause)) in
@@ -1039,6 +1051,7 @@ fn convert_to_fixpoint_plans(
                 priority: rule.priority,
                 has_fold: !rule.fold_bindings.is_empty(),
                 fold_bindings,
+                having: rule.having.clone(),
                 has_best_by: !rule.best_by_criteria.is_empty(),
                 best_by_criteria,
                 has_priority,
@@ -1075,7 +1088,7 @@ fn convert_is_refs(
             // the body column is `{var}._vid` (UInt64). The derived column name is taken
             // positionally from the registry entry's schema (KEY columns come first).
             let anti_join_cols = if is_ref.negated {
-                is_ref
+                let mut cols: Vec<(String, String)> = is_ref
                     .subjects
                     .iter()
                     .enumerate()
@@ -1094,7 +1107,18 @@ fn convert_is_refs(
                             None
                         }
                     })
-                    .collect()
+                    .collect();
+                // Include target variable in anti-join for composite-key IS NOT.
+                // Without this, `d IS NOT known TO dis` only checks d, not (d, dis),
+                // filtering ALL pairs where the drug has ANY indication regardless
+                // of disease.
+                if let Some(uni_cypher::ast::Expr::Variable(target_var)) = &is_ref.target {
+                    let target_idx = is_ref.subjects.len();
+                    if let Some(field) = entry.schema.fields().get(target_idx) {
+                        cols.push((target_var.clone(), field.name().clone()));
+                    }
+                }
+                cols
             } else {
                 Vec::new()
             };
@@ -1156,24 +1180,23 @@ fn convert_fold_bindings(
                     output_name: name.clone(),
                     kind,
                     input_col_index: 0, // unused for CountAll
+                    input_col_name: None,
                 });
             }
 
             // The LocyProject projects the aggregate input expression AS the fold
             // output name, so the input column index matches the yield schema position.
+            // Also store the column name for name-based resolution at execution time
+            // (more robust when schema reconciliation changes column ordering).
             let input_col_index = yield_schema
                 .iter()
                 .position(|yc| yc.name == *name)
-                .ok_or_else(|| {
-                    datafusion::error::DataFusionError::Plan(format!(
-                        "FOLD column '{}' not found in yield schema",
-                        name
-                    ))
-                })?;
+                .unwrap_or(0);
             Ok(FoldBinding {
                 output_name: name.clone(),
                 kind,
                 input_col_index,
+                input_col_name: Some(name.clone()),
             })
         })
         .collect()

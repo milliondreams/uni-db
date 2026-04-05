@@ -73,11 +73,19 @@ pub fn check(
 
             check_best_by_monotonic_fold(rule_name, def)?;
 
+            // HAVING (post-FOLD WHERE) requires a FOLD clause.
+            if !def.having.is_empty() && def.fold.is_empty() {
+                return Err(LocyCompileError::HavingWithoutFold {
+                    rule: rule_name.clone(),
+                });
+            }
+
             clauses.push(CompiledClause {
                 match_pattern: def.match_pattern.clone(),
                 where_conditions: def.where_conditions.clone(),
                 along: def.along.clone(),
                 fold: def.fold.clone(),
+                having: def.having.clone(),
                 best_by: def.best_by.clone(),
                 output: def.output.clone(),
                 priority: def.priority,

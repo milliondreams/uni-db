@@ -55,14 +55,19 @@ flowchart TB
 
 ### Multi-Session Architecture
 
-Multiple sessions can coexist, each with its own plan cache. Sessions are created from the `Uni` instance:
+Multiple sessions can coexist, each with its own plan cache. Sessions are created from the `Uni` instance and implement `Clone` (clones share the plan cache but get independent parameters and write guards):
 
 ```rust
 let db = Uni::open("./my_db").build().await?;
 let session = db.session();              // Each session has its own plan cache
+let session2 = session.clone();          // Shares plan cache, independent params
+
+// Sessions are read-only — mutations require a transaction
 let tx = session.tx().await?;            // Start a transaction
 tx.execute("CREATE (:User {name: 'Alice'})").await?;
 tx.commit().await?;                      // Writer lock acquired here
+
+// session.query("CREATE ...") would return an error
 ```
 
 ### Commit-Time Serialization

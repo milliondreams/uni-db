@@ -21,7 +21,8 @@ use uni_locy::{CompiledProgram, FactRow, LocyConfig, LocyError, LocyStats};
 
 use super::locy_ast_builder::value_to_expr;
 use super::locy_delta::{
-    RowRelation, RowStore, extract_cypher_conditions, extract_key, resolve_clause_with_is_refs,
+    RowRelation, RowStore, extract_cypher_conditions, extract_key, multiply_prob_factors_rows,
+    resolve_clause_with_is_refs,
 };
 use super::locy_eval::{eval_expr, literal_to_value, record_batches_to_locy_rows};
 use super::locy_traits::DerivedFactSource;
@@ -204,14 +205,44 @@ impl<'a> SLGResolver<'a> {
                     }
                 }
 
+                // Detect calling rule's PROB column for complement semantics.
+                let prob_column_name: Option<String> = rule
+                    .yield_schema
+                    .iter()
+                    .find(|c| c.is_prob)
+                    .map(|c| c.name.clone());
+
                 // In-memory join (no UNWIND serialization).
-                let rows =
-                    resolve_clause_with_is_refs(clause, self.fact_source, self.derived_store)
-                        .await?;
+                let rows = resolve_clause_with_is_refs(
+                    clause,
+                    self.fact_source,
+                    self.derived_store,
+                    &self.program.rule_catalog,
+                    prob_column_name.as_deref(),
+                )
+                .await?;
                 self.stats.queries_executed += 1;
 
                 // Apply YIELD projections to compute non-key columns.
-                let projected = apply_yield_projections(rows, clause);
+                let mut projected = apply_yield_projections(rows, clause);
+
+                // Multiply __prob_complement_* columns into the PROB column.
+                // This must happen AFTER yield projections because YIELD
+                // re-evaluates the expression (e.g., "1.0 AS safety PROB").
+                if let Some(ref pc) = prob_column_name {
+                    let complement_cols: Vec<String> = projected
+                        .first()
+                        .map(|r| {
+                            r.keys()
+                                .filter(|k| k.starts_with("__prob_complement_"))
+                                .cloned()
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if !complement_cols.is_empty() {
+                        multiply_prob_factors_rows(&mut projected, pc, &complement_cols);
+                    }
+                }
 
                 // Filter by goal bindings.
                 let filtered: Vec<FactRow> = projected
@@ -382,6 +413,14 @@ fn apply_yield_projections(raw_rows: Vec<FactRow>, clause: &CompiledClause) -> V
                             projected.insert(name, Value::Null);
                         }
                     }
+                }
+            }
+
+            // Carry through __prob_complement_* columns for post-projection
+            // multiplication (IS NOT PROB complement semantics).
+            for (k, v) in &raw_row {
+                if k.starts_with("__prob_complement_") {
+                    projected.insert(k.clone(), v.clone());
                 }
             }
 

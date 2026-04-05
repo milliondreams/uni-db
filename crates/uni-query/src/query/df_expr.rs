@@ -3175,10 +3175,20 @@ fn coerce_scalar_function(
             .collect();
         let has_mixed_types = types.windows(2).any(|w| w[0] != w[1]);
         if has_mixed_types {
-            let has_large_binary = types.iter().any(|t| matches!(t, DataType::LargeBinary));
-
-            if has_large_binary {
-                let unified_args: Vec<DfExpr> = coerced_args
+            // Only cast to Utf8 when all types are string-like.
+            // Struct (DateTime), LargeBinary (CypherValue), List, and other
+            // non-string types cannot be safely cast to Utf8.
+            let all_string_like = types
+                .iter()
+                .all(|t| matches!(t, DataType::Utf8 | DataType::LargeUtf8 | DataType::Null));
+            let unified_args: Vec<DfExpr> = if all_string_like {
+                coerced_args
+                    .into_iter()
+                    .map(|a| datafusion::logical_expr::cast(a, DataType::Utf8))
+                    .collect()
+            } else {
+                // Convert all to LargeBinary (CypherValue encoding).
+                coerced_args
                     .into_iter()
                     .zip(types.iter())
                     .map(|(arg, t)| match t {
@@ -3188,54 +3198,14 @@ fn coerce_scalar_function(
                         }
                         _ => scalar_to_large_binary_expr(arg),
                     })
-                    .collect();
-                return Ok(DfExpr::ScalarFunction(
-                    datafusion::logical_expr::expr::ScalarFunction {
-                        func: func.func.clone(),
-                        args: unified_args,
-                    },
-                ));
-            }
-
-            let all_list_or_lb = types.iter().all(|t| {
-                matches!(
-                    t,
-                    DataType::Null
-                        | DataType::LargeBinary
-                        | DataType::List(_)
-                        | DataType::LargeList(_)
-                )
-            });
-            if all_list_or_lb {
-                let unified_args: Vec<DfExpr> = coerced_args
-                    .into_iter()
-                    .zip(types.iter())
-                    .map(|(arg, t)| {
-                        if matches!(t, DataType::List(_) | DataType::LargeList(_)) {
-                            list_to_large_binary_expr(arg)
-                        } else {
-                            arg
-                        }
-                    })
-                    .collect();
-                return Ok(DfExpr::ScalarFunction(
-                    datafusion::logical_expr::expr::ScalarFunction {
-                        func: func.func.clone(),
-                        args: unified_args,
-                    },
-                ));
-            } else {
-                let unified_args = coerced_args
-                    .into_iter()
-                    .map(|a| datafusion::logical_expr::cast(a, DataType::Utf8))
-                    .collect();
-                return Ok(DfExpr::ScalarFunction(
-                    datafusion::logical_expr::expr::ScalarFunction {
-                        func: func.func.clone(),
-                        args: unified_args,
-                    },
-                ));
-            }
+                    .collect()
+            };
+            return Ok(DfExpr::ScalarFunction(
+                datafusion::logical_expr::expr::ScalarFunction {
+                    func: func.func.clone(),
+                    args: unified_args,
+                },
+            ));
         }
     }
 

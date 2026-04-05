@@ -15,9 +15,9 @@ async fn test_inverted_index() -> Result<()> {
     let db = Uni::temporary().build().await?;
 
     // 1. Create Schema
-    db.session()
-        .query(
-            r#"
+    let tx = db.session().tx().await?;
+    tx.execute(
+        r#"
         CALL uni.schema.createLabel('Product', {
             "properties": {
                 "name": { "type": "STRING" },
@@ -28,38 +28,37 @@ async fn test_inverted_index() -> Result<()> {
             ]
         })
     "#,
-        )
-        .await?;
+    )
+    .await?;
+    tx.commit().await?;
 
     // 2. Insert Data
-    db.session()
-        .query("CREATE (p:Product {name: 'A', tags: ['rust', 'db']})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (p:Product {name: 'A', tags: ['rust', 'db']})")
         .await?;
-    db.session()
-        .query("CREATE (p:Product {name: 'B', tags: ['rust', 'web']})")
+    tx.execute("CREATE (p:Product {name: 'B', tags: ['rust', 'web']})")
         .await?;
-    db.session()
-        .query("CREATE (p:Product {name: 'C', tags: ['python', 'ml']})")
+    tx.execute("CREATE (p:Product {name: 'C', tags: ['python', 'ml']})")
         .await?;
-    db.session()
-        .query("CREATE (p:Product {name: 'D', tags: ['rust']})")
+    tx.execute("CREATE (p:Product {name: 'D', tags: ['rust']})")
         .await?;
+    tx.commit().await?;
 
     // 3. Flush to persistence (Inverted Index reads from persistent storage)
     db.flush().await?;
 
     // 4. Rebuild index (since we don't have incremental updates yet)
     // Drop and Recreate
-    db.session()
-        .query("CALL uni.schema.dropIndex('Product_tags_inverted')")
+    let tx = db.session().tx().await?;
+    tx.execute("CALL uni.schema.dropIndex('Product_tags_inverted')")
         .await?;
-    db.session()
-        .query(
-            r#"
+    tx.execute(
+        r#"
         CALL uni.schema.createIndex('Product', 'tags', { "type": "Inverted" })
     "#,
-        )
-        .await?;
+    )
+    .await?;
+    tx.commit().await?;
 
     // 5. Query
     let results = db.session().query("MATCH (p:Product) WHERE ANY(t IN p.tags WHERE t IN ['rust']) RETURN p.name ORDER BY p.name").await?;
@@ -88,9 +87,9 @@ async fn test_inverted_index_incremental_updates() -> Result<()> {
     let db = Uni::temporary().build().await?;
 
     // 1. Create Schema with inverted index
-    db.session()
-        .query(
-            r#"
+    let tx = db.session().tx().await?;
+    tx.execute(
+        r#"
         CALL uni.schema.createLabel('Article', {
             "properties": {
                 "title": { "type": "STRING" },
@@ -101,18 +100,19 @@ async fn test_inverted_index_incremental_updates() -> Result<()> {
             ]
         })
     "#,
-        )
-        .await?;
+    )
+    .await?;
+    tx.commit().await?;
 
     // 2. Insert initial batch of data
-    db.session()
-        .query("CREATE (a:Article {title: 'Rust Guide', categories: ['programming', 'rust']})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (a:Article {title: 'Rust Guide', categories: ['programming', 'rust']})")
         .await?;
-    db.session()
-        .query(
-            "CREATE (a:Article {title: 'Python Tutorial', categories: ['programming', 'python']})",
-        )
-        .await?;
+    tx.execute(
+        "CREATE (a:Article {title: 'Python Tutorial', categories: ['programming', 'python']})",
+    )
+    .await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // 3. Verify initial query works (NO index rebuild needed!)
@@ -124,13 +124,14 @@ async fn test_inverted_index_incremental_updates() -> Result<()> {
     assert_eq!(results.rows()[0].get::<String>("a.title")?, "Rust Guide");
 
     // 4. Add more data (incremental update)
-    db.session().query(
+    let tx = db.session().tx().await?;
+    tx.execute(
         "CREATE (a:Article {title: 'Rust Web Dev', categories: ['programming', 'rust', 'web']})",
     )
     .await?;
-    db.session()
-        .query("CREATE (a:Article {title: 'ML Basics', categories: ['ml', 'python']})")
+    tx.execute("CREATE (a:Article {title: 'ML Basics', categories: ['ml', 'python']})")
         .await?;
+    tx.commit().await?;
     db.flush().await?;
 
     // 5. Verify new data is in the index (NO index rebuild needed!)
@@ -168,9 +169,9 @@ async fn test_inverted_index_edge_cases() -> Result<()> {
     let db = Uni::temporary().build().await?;
 
     // Create Schema
-    db.session()
-        .query(
-            r#"
+    let tx = db.session().tx().await?;
+    tx.execute(
+        r#"
         CALL uni.schema.createLabel('Item', {
             "properties": {
                 "name": { "type": "STRING" },
@@ -181,23 +182,23 @@ async fn test_inverted_index_edge_cases() -> Result<()> {
             ]
         })
     "#,
-        )
-        .await?;
+    )
+    .await?;
+    tx.commit().await?;
 
     // Insert item with empty tags list
-    db.session()
-        .query("CREATE (i:Item {name: 'Empty', tags: []})")
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (i:Item {name: 'Empty', tags: []})")
         .await?;
 
     // Insert item with single tag
-    db.session()
-        .query("CREATE (i:Item {name: 'Single', tags: ['only']})")
+    tx.execute("CREATE (i:Item {name: 'Single', tags: ['only']})")
         .await?;
 
     // Insert item with duplicate tags (should be deduplicated by index)
-    db.session()
-        .query("CREATE (i:Item {name: 'Dupes', tags: ['tag', 'tag', 'tag']})")
+    tx.execute("CREATE (i:Item {name: 'Dupes', tags: ['tag', 'tag', 'tag']})")
         .await?;
+    tx.commit().await?;
 
     db.flush().await?;
 

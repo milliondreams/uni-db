@@ -82,20 +82,57 @@ nav:
   - Examples:
       - Overview: examples/index.md
       - Python:
-          - Supply Chain: examples/python/supply_chain.md
-          - Recommendation: examples/python/recommendation.md
-          - RAG: examples/python/rag.md
-          - Fraud Detection: examples/python/fraud_detection.md
-          - Sales Analytics: examples/python/sales_analytics.md
-          - "Locy: Compliance Remediation": examples/python/locy_compliance_remediation.md
-          - "Locy: RBAC Priority": examples/python/locy_rbac_priority.md
-          - "Locy: Infrastructure Blast Radius": examples/python/locy_infrastructure_blast_radius.md
-          - "Locy: Supply Chain Provenance": examples/python/locy_supply_chain_provenance.md
-          - "Locy: Fraud Risk Propagation": examples/python/locy_fraud_risk_propagation.md
-          - "Locy: Semiconductor Yield Excursion (Flagship)": examples/python/locy_semiconductor_yield_excursion.md
-          - "Locy: Pharma Batch Genealogy (Flagship #2)": examples/python/locy_pharma_batch_genealogy.md
-          - "Locy: Cyber Exposure-to-Remediation Twin (Flagship #3)": examples/python/locy_cyber_exposure_twin.md
-          - "Locy: Probabilistic Risk Scoring": examples/python/locy_probabilistic_risk_scoring.md
+          - Supply Chain:
+              - Overview: examples/python/supply_chain_overview.md
+              - Notebook: examples/python/supply_chain.md
+          - Recommendation:
+              - Overview: examples/python/recommendation_overview.md
+              - Notebook: examples/python/recommendation.md
+          - RAG:
+              - Overview: examples/python/rag_overview.md
+              - Notebook: examples/python/rag.md
+          - Fraud Detection:
+              - Overview: examples/python/fraud_detection_overview.md
+              - Notebook: examples/python/fraud_detection.md
+          - Sales Analytics:
+              - Overview: examples/python/sales_analytics_overview.md
+              - Notebook: examples/python/sales_analytics.md
+          - "Locy: Compliance Remediation":
+              - Overview: examples/python/locy_compliance_remediation_overview.md
+              - Notebook: examples/python/locy_compliance_remediation.md
+          - "Locy: RBAC Priority":
+              - Overview: examples/python/locy_rbac_priority_overview.md
+              - Notebook: examples/python/locy_rbac_priority.md
+          - "Locy: Infrastructure Blast Radius":
+              - Overview: examples/python/locy_infrastructure_blast_radius_overview.md
+              - Notebook: examples/python/locy_infrastructure_blast_radius.md
+          - "Locy: Supply Chain Provenance":
+              - Overview: examples/python/locy_supply_chain_provenance_overview.md
+              - Notebook: examples/python/locy_supply_chain_provenance.md
+          - "Locy: Fraud Risk Propagation":
+              - Overview: examples/python/locy_fraud_risk_propagation_overview.md
+              - Notebook: examples/python/locy_fraud_risk_propagation.md
+          - "Locy: Semiconductor Yield Excursion":
+              - Overview: examples/python/locy_semiconductor_yield_excursion_overview.md
+              - Notebook: examples/python/locy_semiconductor_yield_excursion.md
+          - "Locy: Pharma Batch Genealogy":
+              - Overview: examples/python/locy_pharma_batch_genealogy_overview.md
+              - Notebook: examples/python/locy_pharma_batch_genealogy.md
+          - "Locy: Cyber Exposure Twin":
+              - Overview: examples/python/locy_cyber_exposure_twin_overview.md
+              - Notebook: examples/python/locy_cyber_exposure_twin.md
+          - "Locy: Probabilistic Risk Scoring":
+              - Overview: examples/python/locy_probabilistic_risk_scoring_overview.md
+              - Notebook: examples/python/locy_probabilistic_risk_scoring.md
+          - "Locy: Drug Repurposing":
+              - Overview: examples/python/locy_drug_repurposing_overview.md
+              - Notebook: examples/python/locy_drug_repurposing.md
+          - "Locy: Patent FTO Analysis":
+              - Overview: examples/python/locy_patent_fto_overview.md
+              - Notebook: examples/python/locy_patent_fto.md
+          - "Locy: Regulatory Impact":
+              - Overview: examples/python/locy_regulatory_impact_overview.md
+              - Notebook: examples/python/locy_regulatory_impact.md
       - Pydantic OGM:
           - Supply Chain: examples/pydantic/supply_chain.md
           - Recommendation: examples/pydantic/recommendation.md

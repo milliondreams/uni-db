@@ -1,0 +1,9 @@
+patent_id,title,assignee,priority_date,status,jurisdiction
+US-11234567,Wireless Sensor Network with Adaptive Mesh Routing and Low-Power Operation,SensorTech Corp,2021-06-15,active,US
+US-11234568,Low-Power Wireless Sensor Node with BLE Mesh Relay Capability,SensorTech Corp,2021-06-15,active,US
+EP-3456789,Wireless Sensor Network with Adaptive Mesh Routing and Low-Power Operation,SensorTech Corp,2021-06-15,active,EP
+CN-112345678,Wireless Sensor Network with Adaptive Mesh Routing and Low-Power Operation,SensorTech Corp,2021-06-15,pending,CN
+US-10987654,IoT Data Aggregation System with Edge-Based Sensor Fusion,IoT Solutions Ltd,2020-09-22,active,US
+US-10987655,Enhanced IoT Data Aggregation with Machine Learning Inference at the Edge,IoT Solutions Ltd,2020-09-22,active,US
+JP-2024567890,IoT Data Aggregation System with Edge-Based Sensor Fusion,IoT Solutions Ltd,2020-09-22,active,JP
+KR-1023456789,IoT Data Aggregation System with Edge-Based Sensor Fusion,IoT Solutions Ltd,2020-09-22,pending,KR

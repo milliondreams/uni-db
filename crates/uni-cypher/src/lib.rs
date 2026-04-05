@@ -609,6 +609,58 @@ mod locy_tests {
         }
     }
 
+    #[test]
+    fn test_locy_yield_key_with_property() {
+        let program = parse_locy(
+            "CREATE RULE r AS MATCH (e:Event) YIELD KEY e.action, KEY e.outcome, n AS support",
+        )
+        .unwrap();
+        if let locy_ast::LocyStatement::Rule(rule) = &program.statements[0] {
+            if let locy_ast::RuleOutput::Yield(yc) = &rule.output {
+                let items = &yc.items;
+                assert_eq!(items.len(), 3);
+                assert!(items[0].is_key);
+                assert_eq!(
+                    items[0].expr,
+                    ast::Expr::Property(
+                        Box::new(ast::Expr::Variable("e".to_string())),
+                        "action".to_string()
+                    )
+                );
+                assert!(items[1].is_key);
+                assert_eq!(
+                    items[1].expr,
+                    ast::Expr::Property(
+                        Box::new(ast::Expr::Variable("e".to_string())),
+                        "outcome".to_string()
+                    )
+                );
+                assert!(!items[2].is_key);
+                assert_eq!(items[2].alias, Some("support".to_string()));
+            } else {
+                panic!("Expected Yield output");
+            }
+        } else {
+            panic!("Expected Rule");
+        }
+    }
+
+    #[test]
+    fn test_locy_yield_key_with_alias() {
+        let program =
+            parse_locy("CREATE RULE r AS MATCH (e:Event) YIELD KEY e.action AS act").unwrap();
+        if let locy_ast::LocyStatement::Rule(rule) = &program.statements[0] {
+            if let locy_ast::RuleOutput::Yield(yc) = &rule.output {
+                assert!(yc.items[0].is_key);
+                assert_eq!(yc.items[0].alias, Some("act".to_string()));
+            } else {
+                panic!("Expected Yield output");
+            }
+        } else {
+            panic!("Expected Rule");
+        }
+    }
+
     // ══════════════════════════════════════════════════════════════════════
     // Step 16: QUERY (goal-directed)
     // ══════════════════════════════════════════════════════════════════════

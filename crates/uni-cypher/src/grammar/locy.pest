@@ -111,6 +111,7 @@ rule_definition = {
     ~ rule_where_clause?
     ~ along_clause?
     ~ fold_clause?
+    ~ fold_having_clause?
     ~ best_by_clause?
     ~ rule_terminal_clause
 }
@@ -206,7 +207,7 @@ prob_projection = {
     | expression ~ PROB
 }
 
-key_projection = { KEY ~ locy_identifier }
+key_projection = { KEY ~ expression ~ (AS ~ alias_identifier)? }
 
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -270,6 +271,11 @@ fold_clause = { FOLD ~ fold_declaration ~ ("," ~ fold_declaration)* }
 fold_declaration = { locy_identifier ~ eq ~ fold_expression }
 
 fold_expression = { expression }
+
+// Post-FOLD filter (HAVING semantics).  Uses the WHERE keyword positionally:
+// the first WHERE in a rule filters rows pre-aggregation; this second WHERE
+// (after FOLD) filters aggregated groups.
+fold_having_clause = { WHERE ~ expression ~ ((AND | ",") ~ expression)* }
 
 
 // ═══════════════════════════════════════════════════════════════════════════

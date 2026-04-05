@@ -1,0 +1,49 @@
+element_id,claim_id,element_text
+CE-Pat1-C1-01,Pat1-C1,a plurality of sensor nodes each having a wireless transceiver operating in the 2.4 GHz ISM band
+CE-Pat1-C1-02,Pat1-C1,a mesh networking protocol with adaptive routing that dynamically selects relay paths based on link quality metrics
+CE-Pat1-C1-03,Pat1-C1,a low-power sleep controller that transitions each node between active and dormant states based on a configurable duty cycle
+CE-Pat1-C2-01,Pat1-C2,the wireless transceiver implements Bluetooth Low Energy 5.0
+CE-Pat1-C2-02,Pat1-C2,coded PHY for extended range operation
+CE-Pat1-C3-01,Pat1-C3,receiving sensor data from a plurality of distributed nodes via a BLE mesh transport layer
+CE-Pat1-C3-02,Pat1-C3,aggregating sensor readings using a sliding window algorithm with configurable window size and overlap
+CE-Pat1-C3-03,Pat1-C3,transmitting aggregated results to a gateway node using multi-hop adaptive routing
+CE-Pat1-C4-01,Pat1-C4,the mesh networking protocol supports at least 64 concurrent relay nodes
+CE-Pat1-C4-02,Pat1-C4,sub-100ms end-to-end latency
+CE-Pat2-C1-01,Pat2-C1,a BLE 5.0 radio module configured for mesh relay operation
+CE-Pat2-C1-02,Pat2-C1,an energy harvesting circuit coupled to a rechargeable power source
+CE-Pat2-C1-03,Pat2-C1,a microcontroller executing a duty-cycle scheduler that maintains mesh connectivity during sleep intervals
+CE-Pat2-C2-01,Pat2-C2,a sensor fusion module that combines accelerometer and gyroscope data
+CE-Pat2-C2-02,Pat2-C2,a complementary filter to produce orientation estimates
+CE-Pat3-C1-01,Pat3-C1,a plurality of sensor nodes each having a wireless transceiver operating in the 2.4 GHz ISM band
+CE-Pat3-C1-02,Pat3-C1,a mesh networking protocol with adaptive routing that dynamically selects relay paths based on link quality metrics
+CE-Pat3-C1-03,Pat3-C1,a low-power sleep controller that transitions each node between active and dormant states based on a configurable duty cycle
+CE-Pat3-C2-01,Pat3-C2,the adaptive routing protocol employs a Received Signal Strength Indicator threshold
+CE-Pat3-C2-02,Pat3-C2,link quality assessment based on RSSI
+CE-Pat4-C1-01,Pat4-C1,a plurality of sensor nodes each having a wireless transceiver operating in the 2.4 GHz ISM band
+CE-Pat4-C1-02,Pat4-C1,a mesh networking protocol with adaptive routing
+CE-Pat4-C1-03,Pat4-C1,a low-power sleep controller implementing a configurable duty cycle
+CE-Pat5-C1-01,Pat5-C1,a sensor fusion module that combines heterogeneous sensor inputs using weighted Kalman filtering
+CE-Pat5-C1-02,Pat5-C1,an edge processing unit that performs real-time statistical analysis on fused sensor streams
+CE-Pat5-C1-03,Pat5-C1,a data aggregation pipeline that compresses and batches processed readings for periodic uplink transmission
+CE-Pat5-C1-04,Pat5-C1,a secure communication channel using TLS 1.3 with certificate pinning
+CE-Pat5-C2-01,Pat5-C2,an Extended Kalman Filter with adaptive noise covariance estimation
+CE-Pat5-C2-02,Pat5-C2,sensor fusion module implementing the Extended Kalman Filter
+CE-Pat5-C3-01,Pat5-C3,delta encoding applied to sensor readings
+CE-Pat5-C3-02,Pat5-C3,LZ4 compression to reduce transmission bandwidth
+CE-Pat5-C4-01,Pat5-C4,anomaly detection on the edge processing unit
+CE-Pat5-C4-02,Pat5-C4,a sliding window z-score algorithm for anomaly detection
+CE-Pat6-C1-01,Pat6-C1,collecting sensor data from a plurality of heterogeneous sensors
+CE-Pat6-C1-02,Pat6-C1,preprocessing collected data using a feature extraction pipeline
+CE-Pat6-C1-03,Pat6-C1,executing a quantized neural network model on an edge processor to generate predictions
+CE-Pat6-C1-04,Pat6-C1,transmitting prediction results alongside raw sensor metadata to a cloud endpoint
+CE-Pat6-C2-01,Pat6-C2,an INT8-quantized convolutional neural network
+CE-Pat6-C2-02,Pat6-C2,optimized for microcontroller deployment
+CE-Pat6-C3-01,Pat6-C3,fast Fourier transform applied to accelerometer time-series data
+CE-Pat6-C3-02,Pat6-C3,feature extraction prior to model inference
+CE-Pat7-C1-01,Pat7-C1,a sensor fusion module that combines heterogeneous sensor inputs using weighted Kalman filtering
+CE-Pat7-C1-02,Pat7-C1,an edge processing unit that performs real-time statistical analysis
+CE-Pat7-C1-03,Pat7-C1,a data aggregation pipeline for compressed periodic uplink
+CE-Pat7-C1-04,Pat7-C1,a secure communication channel using TLS 1.3
+CE-Pat8-C1-01,Pat8-C1,a sensor fusion module combining heterogeneous sensor inputs
+CE-Pat8-C1-02,Pat8-C1,an edge processing unit for real-time analysis
+CE-Pat8-C1-03,Pat8-C1,a data aggregation pipeline with compressed uplink transmission

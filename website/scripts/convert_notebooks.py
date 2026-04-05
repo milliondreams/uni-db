@@ -1,13 +1,21 @@
 #!/usr/bin/env python3
-"""Convert Jupyter notebooks to Markdown for Zensical documentation build.
+"""Execute and convert Jupyter notebooks to Markdown for Zensical documentation.
 
-Zensical does not support the mkdocs-jupyter plugin, so we pre-convert
-all .ipynb files referenced in the nav to .md files using nbconvert.
+Zensical does not support the mkdocs-jupyter plugin, so we pre-execute
+and convert all .ipynb files to .md. This replaces the old mkdocs-jupyter
+``execute: true`` behaviour.
+
+Each notebook is executed in a **separate subprocess** to avoid conflicts
+between the Jupyter kernel's event loop and native extensions (e.g.
+uni_db's tokio runtime + bundled OpenSSL vs. zmq's OpenSSL in the parent).
+
+Rust notebooks (examples/rust/) are skipped — they require the evcxr
+kernel which is not available in CI.
 
 Usage:
     python website/scripts/convert_notebooks.py
 
-Run this before `zensical build` or `zensical serve`.
+Run this before ``zensical build`` or ``zensical serve``.
 """
 
 import subprocess
@@ -16,14 +24,51 @@ from pathlib import Path
 
 DOCS_DIR = Path(__file__).resolve().parent.parent / "docs"
 
+# Directories whose notebooks should NOT be executed (no kernel available).
+# They are still converted to Markdown, just without execution.
+EXECUTE_IGNORE = {"rust"}
+
+EXECUTE_TIMEOUT = 120  # seconds per cell
+
 
 def find_notebooks(docs_dir: Path) -> list[Path]:
     """Find all .ipynb files under the docs directory."""
     return sorted(docs_dir.rglob("*.ipynb"))
 
 
-def convert_notebook(notebook_path: Path) -> Path:
-    """Convert a single notebook to markdown using nbconvert."""
+def should_execute(notebook_path: Path) -> bool:
+    """Return True if this notebook should be executed before conversion."""
+    return not any(part in EXECUTE_IGNORE for part in notebook_path.parts)
+
+
+def execute_notebook(notebook_path: Path) -> bool:
+    """Execute a notebook in a subprocess, writing outputs back into the .ipynb."""
+    script = f"""\
+import nbformat
+from nbclient import NotebookClient
+
+nb = nbformat.read({str(notebook_path)!r}, as_version=4)
+client = NotebookClient(nb, timeout={EXECUTE_TIMEOUT}, kernel_name="python3")
+client.execute()
+nbformat.write(nb, {str(notebook_path)!r})
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=EXECUTE_TIMEOUT * 15,  # generous overall timeout
+    )
+    if result.returncode != 0:
+        stderr = result.stderr.strip().splitlines()
+        # Show last 3 lines of error for context
+        err_summary = "\n    ".join(stderr[-3:]) if stderr else "unknown error"
+        print(f"  EXEC ERROR:\n    {err_summary}")
+        return False
+    return True
+
+
+def convert_to_markdown(notebook_path: Path) -> Path | None:
+    """Convert an .ipynb (which may already contain outputs) to .md."""
     output_md = notebook_path.with_suffix(".md")
 
     cmd = [
@@ -39,7 +84,7 @@ def convert_notebook(notebook_path: Path) -> Path:
 
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        print(f"  ERROR converting {notebook_path.name}: {result.stderr.strip()}")
+        print(f"  CONVERT ERROR: {result.stderr.strip()}")
         return None
 
     return output_md
@@ -55,14 +100,25 @@ def main():
 
     converted = 0
     failed = 0
-    for nb in notebooks:
-        rel = nb.relative_to(DOCS_DIR)
-        print(f"  {rel} ", end="")
-        out = convert_notebook(nb)
-        if out:
-            print(f"-> {out.name}")
-            converted += 1
-        else:
+    for nb_path in notebooks:
+        rel = nb_path.relative_to(DOCS_DIR)
+        execute = should_execute(nb_path)
+        tag = "execute+convert" if execute else "convert only"
+        print(f"  {rel} ({tag}) ", end="", flush=True)
+
+        try:
+            if execute:
+                if not execute_notebook(nb_path):
+                    failed += 1
+                    continue
+            out = convert_to_markdown(nb_path)
+            if out:
+                print(f"-> {out.name}")
+                converted += 1
+            else:
+                failed += 1
+        except Exception as exc:
+            print(f"  ERROR: {exc}")
             failed += 1
 
     print(f"\nDone: {converted} converted, {failed} failed.")

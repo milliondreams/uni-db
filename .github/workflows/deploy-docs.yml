@@ -86,7 +86,7 @@ jobs:
       # Install Zensical and all dependencies
       - name: Install documentation dependencies
         run: |
-          pip install zensical pymdown-extensions nbconvert pdoc
+          pip install zensical pymdown-extensions nbconvert nbclient nbformat ipykernel pdoc
 
       # Convert Jupyter notebooks to Markdown (Zensical doesn't support mkdocs-jupyter)
       - name: Convert notebooks to Markdown

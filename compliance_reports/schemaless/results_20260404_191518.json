@@ -2132,8 +2132,7 @@
             "keyword": "Scenario ",
             "name": "[1] Undirected expand followed by delete and count",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/clauses/delete/Delete4.feature:45:5\n      Matched: crates/uni-tck/src/steps/then.rs:20:1\n      Step panicked. Captured output: Query returned error instead of result: Query { message: \"Execution error: DELETE node failed: ConstraintVerificationFailed: DeleteConnectedNode - Cannot delete node 0, because it still has relationships. To delete the node and its relationships, use DETACH DELETE.\", query: Some(\"\\nMATCH (a)-[r]-(b)\\nDELETE r, a, b\\nRETURN count(*) AS c\\n\") }\n[Summary]\n1 feature\n1 scenario (1 failed)\n4 steps (3 passed, 1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -2265,8 +2264,7 @@
             "keyword": "Scenario ",
             "name": "[7] Delete paths from nested map/list",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/clauses/delete/Delete5.feature:164:5\n      Matched: crates/uni-tck/src/steps/then.rs:9:1\n      Step panicked. Captured output: No result found\n[Summary]\n1 feature\n1 scenario (1 failed)\n4 steps (3 passed, 1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -9126,8 +9124,7 @@
             "keyword": "Scenario ",
             "name": "[20] Do not match on deleted entities",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/clauses/merge/Merge5.feature:412:5\n      Matched: crates/uni-tck/src/steps/then.rs:9:1\n      Step panicked. Captured output: No result found\n[Summary]\n1 feature\n1 scenario (1 failed)\n4 steps (3 passed, 1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -13453,8 +13450,7 @@
             "keyword": "Scenario ",
             "name": "[25] Sort by an integer variable projected from a node property in ascending order",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/clauses/with-orderBy/WithOrderBy1.feature:536:5\n      Matched: crates/uni-tck/src/steps/then.rs:20:1\n      Step panicked. Captured output: Result mismatch (any order): No match found for actual row 0. Actual values: [(\"a\", Some(Node(Node { vid: Vid(3), labels: [\"D\"], properties: {\"num\": Int(-11)} }))), (\"num\", Some(Float(-11.0)))]. Expected: [{\"a\": Node(Node { vid: Vid(0), labels: [\"D\"], properties: {\"num\": Int(-11)} }), \"num\": Int(-11)}, {\"num\": Int(5), \"a\": Node(Node { vid: Vid(0), labels: [\"B\"], properties: {\"num\": Int(5)} })}, {\"a\": Node(Node { vid: Vid(0), labels: [\"A\"], properties: {\"num\": Int(9)} }), \"num\": Int(9)}]\n[Summary]\n1 feature\n1 scenario (1 failed)\n4 steps (3 passed, 1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -13468,8 +13464,7 @@
             "keyword": "Scenario ",
             "name": "[25] Sort by an integer variable projected from a node property in ascending order",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/clauses/with-orderBy/WithOrderBy1.feature:536:5\n      Matched: crates/uni-tck/src/steps/then.rs:20:1\n      Step panicked. Captured output: Result mismatch (any order): No match found for actual row 0. Actual values: [(\"num\", Some(Float(-11.0))), (\"a\", Some(Node(Node { vid: Vid(3), labels: [\"D\"], properties: {\"num\": Int(-11)} })))]. Expected: [{\"num\": Int(-11), \"a\": Node(Node { vid: Vid(0), labels: [\"D\"], properties: {\"num\": Int(-11)} })}, {\"a\": Node(Node { vid: Vid(0), labels: [\"B\"], properties: {\"num\": Int(5)} }), \"num\": Int(5)}, {\"a\": Node(Node { vid: Vid(0), labels: [\"A\"], properties: {\"num\": Int(9)} }), \"num\": Int(9)}]\n[Summary]\n1 feature\n1 scenario (1 failed)\n4 steps (3 passed, 1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -13483,8 +13478,7 @@
             "keyword": "Scenario ",
             "name": "[25] Sort by an integer variable projected from a node property in ascending order",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/clauses/with-orderBy/WithOrderBy1.feature:536:5\n      Matched: crates/uni-tck/src/steps/then.rs:20:1\n      Step panicked. Captured output: Result mismatch (any order): No match found for actual row 0. Actual values: [(\"a\", Some(Node(Node { vid: Vid(3), labels: [\"D\"], properties: {\"num\": Int(-11)} }))), (\"num\", Some(Float(-11.0)))]. Expected: [{\"a\": Node(Node { vid: Vid(0), labels: [\"D\"], properties: {\"num\": Int(-11)} }), \"num\": Int(-11)}, {\"a\": Node(Node { vid: Vid(0), labels: [\"B\"], properties: {\"num\": Int(5)} }), \"num\": Int(5)}, {\"a\": Node(Node { vid: Vid(0), labels: [\"A\"], properties: {\"num\": Int(9)} }), \"num\": Int(9)}]\n[Summary]\n1 feature\n1 scenario (1 failed)\n4 steps (3 passed, 1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -13498,8 +13492,7 @@
             "keyword": "Scenario ",
             "name": "[26] Sort by an integer variable projected from a node property in descending order",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/clauses/with-orderBy/WithOrderBy1.feature:568:5\n      Matched: crates/uni-tck/src/steps/then.rs:20:1\n      Step panicked. Captured output: Result mismatch (any order): No match found for actual row 0. Actual values: [(\"a\", Some(Node(Node { vid: Vid(4), labels: [\"E\"], properties: {\"num\": Int(7054)} }))), (\"num\", Some(Float(7054.0)))]. Expected: [{\"a\": Node(Node { vid: Vid(0), labels: [\"E\"], properties: {\"num\": Int(7054)} }), \"num\": Int(7054)}, {\"num\": Int(30), \"a\": Node(Node { vid: Vid(0), labels: [\"C\"], properties: {\"num\": Int(30)} })}, {\"num\": Int(9), \"a\": Node(Node { vid: Vid(0), labels: [\"A\"], properties: {\"num\": Int(9)} })}]\n[Summary]\n1 feature\n1 scenario (1 failed)\n4 steps (3 passed, 1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -13513,8 +13506,7 @@
             "keyword": "Scenario ",
             "name": "[26] Sort by an integer variable projected from a node property in descending order",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/clauses/with-orderBy/WithOrderBy1.feature:568:5\n      Matched: crates/uni-tck/src/steps/then.rs:20:1\n      Step panicked. Captured output: Result mismatch (any order): No match found for actual row 0. Actual values: [(\"a\", Some(Node(Node { vid: Vid(4), labels: [\"E\"], properties: {\"num\": Int(7054)} }))), (\"num\", Some(Float(7054.0)))]. Expected: [{\"a\": Node(Node { vid: Vid(0), labels: [\"E\"], properties: {\"num\": Int(7054)} }), \"num\": Int(7054)}, {\"num\": Int(30), \"a\": Node(Node { vid: Vid(0), labels: [\"C\"], properties: {\"num\": Int(30)} })}, {\"num\": Int(9), \"a\": Node(Node { vid: Vid(0), labels: [\"A\"], properties: {\"num\": Int(9)} })}]\n[Summary]\n1 feature\n1 scenario (1 failed)\n4 steps (3 passed, 1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -14780,8 +14772,7 @@
             "keyword": "Scenario ",
             "name": "[11] Sort by a date expression in ascending order",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/clauses/with-orderBy/WithOrderBy2.feature:358:5\n      Matched: crates/uni-tck/src/steps/then.rs:20:1\n      Step panicked. Captured output: Query returned error instead of result: Query { message: \"Incompatible types for Plus operator: Date32 + Interval(MonthDayNano)\", query: Some(\"\\nMATCH (a)\\nWITH a\\n  ORDER BY a.date + duration({months: 1, days: 2})\\n  LIMIT 2\\nRETURN a\\n\") }\n[Summary]\n1 feature\n1 scenario (1 failed)\n4 steps (3 passed, 1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -14795,8 +14786,7 @@
             "keyword": "Scenario ",
             "name": "[11] Sort by a date expression in ascending order",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/clauses/with-orderBy/WithOrderBy2.feature:358:5\n      Matched: crates/uni-tck/src/steps/then.rs:20:1\n      Step panicked. Captured output: Query returned error instead of result: Query { message: \"Incompatible types for Plus operator: Date32 + Interval(MonthDayNano)\", query: Some(\"\\nMATCH (a)\\nWITH a\\n  ORDER BY a.date + duration({months: 1, days: 2}) ASC\\n  LIMIT 2\\nRETURN a\\n\") }\n[Summary]\n1 feature\n1 scenario (1 failed)\n4 steps (3 passed, 1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -14810,8 +14800,7 @@
             "keyword": "Scenario ",
             "name": "[11] Sort by a date expression in ascending order",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/clauses/with-orderBy/WithOrderBy2.feature:358:5\n      Matched: crates/uni-tck/src/steps/then.rs:20:1\n      Step panicked. Captured output: Query returned error instead of result: Query { message: \"Incompatible types for Plus operator: Date32 + Interval(MonthDayNano)\", query: Some(\"\\nMATCH (a)\\nWITH a\\n  ORDER BY a.date + duration({months: 1, days: 2}) ASCENDING\\n  LIMIT 2\\nRETURN a\\n\") }\n[Summary]\n1 feature\n1 scenario (1 failed)\n4 steps (3 passed, 1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -14825,8 +14814,7 @@
             "keyword": "Scenario ",
             "name": "[12] Sort by a date expression in descending order",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/clauses/with-orderBy/WithOrderBy2.feature:389:5\n      Matched: crates/uni-tck/src/steps/then.rs:20:1\n      Step panicked. Captured output: Query returned error instead of result: Query { message: \"Incompatible types for Plus operator: Date32 + Interval(MonthDayNano)\", query: Some(\"\\nMATCH (a)\\nWITH a\\n  ORDER BY a.date + duration({months: 1, days: 2}) DESC\\n  LIMIT 2\\nRETURN a\\n\") }\n[Summary]\n1 feature\n1 scenario (1 failed)\n4 steps (3 passed, 1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -14840,8 +14828,7 @@
             "keyword": "Scenario ",
             "name": "[12] Sort by a date expression in descending order",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/clauses/with-orderBy/WithOrderBy2.feature:389:5\n      Matched: crates/uni-tck/src/steps/then.rs:20:1\n      Step panicked. Captured output: Query returned error instead of result: Query { message: \"Incompatible types for Plus operator: Date32 + Interval(MonthDayNano)\", query: Some(\"\\nMATCH (a)\\nWITH a\\n  ORDER BY a.date + duration({months: 1, days: 2}) DESCENDING\\n  LIMIT 2\\nRETURN a\\n\") }\n[Summary]\n1 feature\n1 scenario (1 failed)\n4 steps (3 passed, 1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -54000,7 +53987,8 @@
             "keyword": "Scenario ",
             "name": "[5] Should truncate time",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/temporal/Temporal9.feature:364:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54014,7 +54002,8 @@
             "keyword": "Scenario ",
             "name": "[5] Should truncate time",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/temporal/Temporal9.feature:364:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54028,7 +54017,8 @@
             "keyword": "Scenario ",
             "name": "[5] Should truncate time",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/temporal/Temporal9.feature:364:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54042,7 +54032,8 @@
             "keyword": "Scenario ",
             "name": "[5] Should truncate time",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/temporal/Temporal9.feature:364:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54056,7 +54047,8 @@
             "keyword": "Scenario ",
             "name": "[5] Should truncate time",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/temporal/Temporal9.feature:364:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54070,7 +54062,8 @@
             "keyword": "Scenario ",
             "name": "[5] Should truncate time",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/temporal/Temporal9.feature:364:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54084,7 +54077,8 @@
             "keyword": "Scenario ",
             "name": "[5] Should truncate time",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/temporal/Temporal9.feature:364:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54098,7 +54092,8 @@
             "keyword": "Scenario ",
             "name": "[5] Should truncate time",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/temporal/Temporal9.feature:364:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54112,7 +54107,8 @@
             "keyword": "Scenario ",
             "name": "[5] Should truncate time",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/temporal/Temporal9.feature:364:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54126,7 +54122,8 @@
             "keyword": "Scenario ",
             "name": "[5] Should truncate time",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/temporal/Temporal9.feature:364:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54140,7 +54137,8 @@
             "keyword": "Scenario ",
             "name": "[5] Should truncate time",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/temporal/Temporal9.feature:364:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54154,7 +54152,8 @@
             "keyword": "Scenario ",
             "name": "[5] Should truncate time",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/temporal/Temporal9.feature:364:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54168,7 +54167,8 @@
             "keyword": "Scenario ",
             "name": "[5] Should truncate time",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/temporal/Temporal9.feature:364:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54182,7 +54182,8 @@
             "keyword": "Scenario ",
             "name": "[5] Should truncate time",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/temporal/Temporal9.feature:364:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54196,7 +54197,8 @@
             "keyword": "Scenario ",
             "name": "[5] Should truncate time",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/temporal/Temporal9.feature:364:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54210,7 +54212,8 @@
             "keyword": "Scenario ",
             "name": "[5] Should truncate time",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/temporal/Temporal9.feature:364:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54224,7 +54227,8 @@
             "keyword": "Scenario ",
             "name": "[5] Should truncate time",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/temporal/Temporal9.feature:364:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54238,7 +54242,8 @@
             "keyword": "Scenario ",
             "name": "[5] Should truncate time",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/temporal/Temporal9.feature:364:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54252,7 +54257,8 @@
             "keyword": "Scenario ",
             "name": "[5] Should truncate time",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/temporal/Temporal9.feature:364:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54266,7 +54272,8 @@
             "keyword": "Scenario ",
             "name": "[5] Should truncate time",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/temporal/Temporal9.feature:364:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54294,7 +54301,8 @@
             "keyword": "Scenario ",
             "name": "[5] Should truncate time",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/temporal/Temporal9.feature:364:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54308,7 +54316,8 @@
             "keyword": "Scenario ",
             "name": "[5] Should truncate time",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/temporal/Temporal9.feature:364:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54322,7 +54331,8 @@
             "keyword": "Scenario ",
             "name": "[5] Should truncate time",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/temporal/Temporal9.feature:364:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54336,7 +54346,8 @@
             "keyword": "Scenario ",
             "name": "[5] Should truncate time",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/temporal/Temporal9.feature:364:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54350,7 +54361,8 @@
             "keyword": "Scenario ",
             "name": "[5] Should truncate time",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/temporal/Temporal9.feature:364:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54378,7 +54390,8 @@
             "keyword": "Scenario ",
             "name": "[5] Should truncate time",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/temporal/Temporal9.feature:364:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54406,7 +54419,8 @@
             "keyword": "Scenario ",
             "name": "[5] Should truncate time",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/temporal/Temporal9.feature:364:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54420,7 +54434,8 @@
             "keyword": "Scenario ",
             "name": "[5] Should truncate time",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/temporal/Temporal9.feature:364:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54434,7 +54449,8 @@
             "keyword": "Scenario ",
             "name": "[5] Should truncate time",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/temporal/Temporal9.feature:364:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54448,7 +54464,8 @@
             "keyword": "Scenario ",
             "name": "[5] Should truncate time",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/temporal/Temporal9.feature:364:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54462,7 +54479,8 @@
             "keyword": "Scenario ",
             "name": "[5] Should truncate time",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/temporal/Temporal9.feature:364:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54476,7 +54494,8 @@
             "keyword": "Scenario ",
             "name": "[5] Should truncate time",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/temporal/Temporal9.feature:364:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54490,7 +54509,8 @@
             "keyword": "Scenario ",
             "name": "[5] Should truncate time",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/temporal/Temporal9.feature:364:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54504,7 +54524,8 @@
             "keyword": "Scenario ",
             "name": "[5] Should truncate time",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/temporal/Temporal9.feature:364:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54518,7 +54539,8 @@
             "keyword": "Scenario ",
             "name": "[5] Should truncate time",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/temporal/Temporal9.feature:364:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54532,7 +54554,8 @@
             "keyword": "Scenario ",
             "name": "[5] Should truncate time",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/temporal/Temporal9.feature:364:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54546,7 +54569,8 @@
             "keyword": "Scenario ",
             "name": "[5] Should truncate time",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/temporal/Temporal9.feature:364:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54560,7 +54584,8 @@
             "keyword": "Scenario ",
             "name": "[5] Should truncate time",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/temporal/Temporal9.feature:364:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54574,7 +54599,8 @@
             "keyword": "Scenario ",
             "name": "[5] Should truncate time",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/temporal/Temporal9.feature:364:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54602,7 +54628,8 @@
             "keyword": "Scenario ",
             "name": "[5] Should truncate time",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/temporal/Temporal9.feature:364:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54622,7 +54649,8 @@
             "keyword": "Scenario ",
             "name": "[1] `toBoolean()` on booleans",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/typeConversion/TypeConversion1.feature:34:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54636,7 +54664,8 @@
             "keyword": "Scenario ",
             "name": "[2] `toBoolean()` on valid literal string",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/typeConversion/TypeConversion1.feature:47:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54650,7 +54679,8 @@
             "keyword": "Scenario ",
             "name": "[3] `toBoolean()` on variables with valid string values",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/typeConversion/TypeConversion1.feature:58:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54664,7 +54694,8 @@
             "keyword": "Scenario ",
             "name": "[4] `toBoolean()` on invalid strings",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/typeConversion/TypeConversion1.feature:71:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54678,7 +54709,8 @@
             "keyword": "Scenario ",
             "name": "[5] Fail `toBoolean()` on invalid types #Example: list",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/typeConversion/TypeConversion1.feature:86:5\n      Matched: crates/uni-tck/src/steps/given.rs:5:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54692,7 +54724,8 @@
             "keyword": "Scenario ",
             "name": "[5] Fail `toBoolean()` on invalid types #Example: map",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/typeConversion/TypeConversion1.feature:86:5\n      Matched: crates/uni-tck/src/steps/given.rs:5:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54706,7 +54739,8 @@
             "keyword": "Scenario ",
             "name": "[5] Fail `toBoolean()` on invalid types #Example: float",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/typeConversion/TypeConversion1.feature:86:5\n      Matched: crates/uni-tck/src/steps/given.rs:5:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54720,7 +54754,8 @@
             "keyword": "Scenario ",
             "name": "[5] Fail `toBoolean()` on invalid types #Example: node",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/typeConversion/TypeConversion1.feature:86:5\n      Matched: crates/uni-tck/src/steps/given.rs:5:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54734,7 +54769,8 @@
             "keyword": "Scenario ",
             "name": "[5] Fail `toBoolean()` on invalid types #Example: relationship",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/typeConversion/TypeConversion1.feature:86:5\n      Matched: crates/uni-tck/src/steps/given.rs:5:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54748,7 +54784,8 @@
             "keyword": "Scenario ",
             "name": "[5] Fail `toBoolean()` on invalid types #Example: path",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/typeConversion/TypeConversion1.feature:86:5\n      Matched: crates/uni-tck/src/steps/given.rs:5:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54768,7 +54805,8 @@
             "keyword": "Scenario ",
             "name": "[1] `toInteger()` on float",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/typeConversion/TypeConversion2.feature:34:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54782,7 +54820,8 @@
             "keyword": "Scenario ",
             "name": "[2] `toInteger()` returning null on non-numerical string",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/typeConversion/TypeConversion2.feature:46:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54810,7 +54849,8 @@
             "keyword": "Scenario ",
             "name": "[4] `toInteger()` handling Any type",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/typeConversion/TypeConversion2.feature:70:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54824,7 +54864,8 @@
             "keyword": "Scenario ",
             "name": "[5] `toInteger()` on a list of strings",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/typeConversion/TypeConversion2.feature:82:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54838,7 +54879,8 @@
             "keyword": "Scenario ",
             "name": "[6] `toInteger()` on a complex-typed expression",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/typeConversion/TypeConversion2.feature:94:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54852,7 +54894,8 @@
             "keyword": "Scenario ",
             "name": "[7] `toInteger()` on node property",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/typeConversion/TypeConversion2.feature:107:5\n      Matched: crates/uni-tck/src/steps/given.rs:5:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54866,7 +54909,8 @@
             "keyword": "Scenario ",
             "name": "[8] Fail `toInteger()` on invalid types #Example: list",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/typeConversion/TypeConversion2.feature:125:5\n      Matched: crates/uni-tck/src/steps/given.rs:5:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54880,7 +54924,8 @@
             "keyword": "Scenario ",
             "name": "[8] Fail `toInteger()` on invalid types #Example: map",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/typeConversion/TypeConversion2.feature:125:5\n      Matched: crates/uni-tck/src/steps/given.rs:5:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54894,7 +54939,8 @@
             "keyword": "Scenario ",
             "name": "[8] Fail `toInteger()` on invalid types #Example: node",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/typeConversion/TypeConversion2.feature:125:5\n      Matched: crates/uni-tck/src/steps/given.rs:5:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54908,7 +54954,8 @@
             "keyword": "Scenario ",
             "name": "[8] Fail `toInteger()` on invalid types #Example: relationship",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/typeConversion/TypeConversion2.feature:125:5\n      Matched: crates/uni-tck/src/steps/given.rs:5:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54922,7 +54969,8 @@
             "keyword": "Scenario ",
             "name": "[8] Fail `toInteger()` on invalid types #Example: path",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/typeConversion/TypeConversion2.feature:125:5\n      Matched: crates/uni-tck/src/steps/given.rs:5:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54956,7 +55004,8 @@
             "keyword": "Scenario ",
             "name": "[2] `toFloat()` returning null on non-numerical string",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/typeConversion/TypeConversion3.feature:46:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54970,7 +55019,8 @@
             "keyword": "Scenario ",
             "name": "[3] `toFloat()` handling Any type",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/typeConversion/TypeConversion3.feature:58:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54984,7 +55034,8 @@
             "keyword": "Scenario ",
             "name": "[4] `toFloat()` on a list of strings",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/typeConversion/TypeConversion3.feature:70:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -54998,7 +55049,8 @@
             "keyword": "Scenario ",
             "name": "[5] `toFloat()` on node property",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/typeConversion/TypeConversion3.feature:82:5\n      Matched: crates/uni-tck/src/steps/given.rs:5:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -55012,7 +55064,8 @@
             "keyword": "Scenario ",
             "name": "[6] Fail `toFloat()` on invalid types #Example: boolean",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/typeConversion/TypeConversion3.feature:100:5\n      Matched: crates/uni-tck/src/steps/given.rs:5:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -55026,7 +55079,8 @@
             "keyword": "Scenario ",
             "name": "[6] Fail `toFloat()` on invalid types #Example: list",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/typeConversion/TypeConversion3.feature:100:5\n      Matched: crates/uni-tck/src/steps/given.rs:5:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -55040,7 +55094,8 @@
             "keyword": "Scenario ",
             "name": "[6] Fail `toFloat()` on invalid types #Example: map",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/typeConversion/TypeConversion3.feature:100:5\n      Matched: crates/uni-tck/src/steps/given.rs:5:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -55054,7 +55109,8 @@
             "keyword": "Scenario ",
             "name": "[6] Fail `toFloat()` on invalid types #Example: node",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/typeConversion/TypeConversion3.feature:100:5\n      Matched: crates/uni-tck/src/steps/given.rs:5:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -55068,7 +55124,8 @@
             "keyword": "Scenario ",
             "name": "[6] Fail `toFloat()` on invalid types #Example: relationship",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/typeConversion/TypeConversion3.feature:100:5\n      Matched: crates/uni-tck/src/steps/given.rs:5:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -55082,7 +55139,8 @@
             "keyword": "Scenario ",
             "name": "[6] Fail `toFloat()` on invalid types #Example: path",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/typeConversion/TypeConversion3.feature:100:5\n      Matched: crates/uni-tck/src/steps/given.rs:5:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -55102,7 +55160,8 @@
             "keyword": "Scenario ",
             "name": "[1] `toString()` handling integer literal",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/typeConversion/TypeConversion4.feature:34:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -55116,7 +55175,8 @@
             "keyword": "Scenario ",
             "name": "[2] `toString()` handling boolean literal",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/typeConversion/TypeConversion4.feature:45:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -55130,7 +55190,8 @@
             "keyword": "Scenario ",
             "name": "[3] `toString()` handling inlined boolean",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/typeConversion/TypeConversion4.feature:56:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -55144,7 +55205,8 @@
             "keyword": "Scenario ",
             "name": "[4] `toString()` handling boolean properties",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/typeConversion/TypeConversion4.feature:67:5\n      Matched: crates/uni-tck/src/steps/given.rs:5:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -55158,7 +55220,8 @@
             "keyword": "Scenario ",
             "name": "[5] `toString()` should work on Any type",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/typeConversion/TypeConversion4.feature:83:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -55172,7 +55235,8 @@
             "keyword": "Scenario ",
             "name": "[6] `toString()` on a list of integers",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/typeConversion/TypeConversion4.feature:94:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -55186,7 +55250,8 @@
             "keyword": "Scenario ",
             "name": "[7] `toString()` on node property",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/typeConversion/TypeConversion4.feature:106:5\n      Matched: crates/uni-tck/src/steps/given.rs:5:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -55200,7 +55265,8 @@
             "keyword": "Scenario ",
             "name": "[8] `toString()` should accept potentially correct types 1",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/typeConversion/TypeConversion4.feature:124:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -55214,7 +55280,8 @@
             "keyword": "Scenario ",
             "name": "[9] `toString()` should accept potentially correct types 2",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/typeConversion/TypeConversion4.feature:138:5\n      Matched: crates/uni-tck/src/steps/given.rs:13:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -55228,7 +55295,8 @@
             "keyword": "Scenario ",
             "name": "[10] Fail `toString()` on invalid types #Example: list",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/typeConversion/TypeConversion4.feature:152:5\n      Matched: crates/uni-tck/src/steps/given.rs:5:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -55242,7 +55310,8 @@
             "keyword": "Scenario ",
             "name": "[10] Fail `toString()` on invalid types #Example: map",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/typeConversion/TypeConversion4.feature:152:5\n      Matched: crates/uni-tck/src/steps/given.rs:5:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -55256,7 +55325,8 @@
             "keyword": "Scenario ",
             "name": "[10] Fail `toString()` on invalid types #Example: node",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/typeConversion/TypeConversion4.feature:152:5\n      Matched: crates/uni-tck/src/steps/given.rs:5:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -55270,7 +55340,8 @@
             "keyword": "Scenario ",
             "name": "[10] Fail `toString()` on invalid types #Example: relationship",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/typeConversion/TypeConversion4.feature:152:5\n      Matched: crates/uni-tck/src/steps/given.rs:5:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -55284,7 +55355,8 @@
             "keyword": "Scenario ",
             "name": "[10] Fail `toString()` on invalid types #Example: path",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/expressions/typeConversion/TypeConversion4.feature:152:5\n      Matched: crates/uni-tck/src/steps/given.rs:5:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -55304,7 +55376,8 @@
             "keyword": "Scenario ",
             "name": "[1] Undirected match in self-relationship graph, count",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/useCases/countingSubgraphMatches/CountingSubgraphMatches1.feature:34:5\n      Matched: crates/uni-tck/src/steps/given.rs:5:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -55318,7 +55391,8 @@
             "keyword": "Scenario ",
             "name": "[2] Undirected match of self-relationship in self-relationship graph, count",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/useCases/countingSubgraphMatches/CountingSubgraphMatches1.feature:50:5\n      Matched: crates/uni-tck/src/steps/given.rs:5:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -55332,7 +55406,8 @@
             "keyword": "Scenario ",
             "name": "[3] Undirected match on simple relationship graph, count",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/useCases/countingSubgraphMatches/CountingSubgraphMatches1.feature:66:5\n      Matched: crates/uni-tck/src/steps/given.rs:5:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -55346,7 +55421,8 @@
             "keyword": "Scenario ",
             "name": "[4] Directed match on self-relationship graph, count",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/useCases/countingSubgraphMatches/CountingSubgraphMatches1.feature:82:5\n      Matched: crates/uni-tck/src/steps/given.rs:5:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -55360,7 +55436,8 @@
             "keyword": "Scenario ",
             "name": "[5] Directed match of self-relationship on self-relationship graph, count",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/useCases/countingSubgraphMatches/CountingSubgraphMatches1.feature:98:5\n      Matched: crates/uni-tck/src/steps/given.rs:5:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -55374,7 +55451,8 @@
             "keyword": "Scenario ",
             "name": "[6] Counting undirected self-relationships in self-relationship graph",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/useCases/countingSubgraphMatches/CountingSubgraphMatches1.feature:114:5\n      Matched: crates/uni-tck/src/steps/given.rs:5:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -55388,7 +55466,8 @@
             "keyword": "Scenario ",
             "name": "[7] Counting distinct undirected self-relationships in self-relationship graph",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/useCases/countingSubgraphMatches/CountingSubgraphMatches1.feature:130:5\n      Matched: crates/uni-tck/src/steps/given.rs:5:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -55402,7 +55481,8 @@
             "keyword": "Scenario ",
             "name": "[8] Directed match of a simple relationship, count",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/useCases/countingSubgraphMatches/CountingSubgraphMatches1.feature:146:5\n      Matched: crates/uni-tck/src/steps/given.rs:5:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -55416,7 +55496,8 @@
             "keyword": "Scenario ",
             "name": "[9] Counting directed self-relationships",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/useCases/countingSubgraphMatches/CountingSubgraphMatches1.feature:162:5\n      Matched: crates/uni-tck/src/steps/given.rs:5:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -55430,7 +55511,8 @@
             "keyword": "Scenario ",
             "name": "[10] Mixing directed and undirected pattern parts with self-relationship, count",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/useCases/countingSubgraphMatches/CountingSubgraphMatches1.feature:179:5\n      Matched: crates/uni-tck/src/steps/given.rs:5:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -55444,7 +55526,8 @@
             "keyword": "Scenario ",
             "name": "[11] Mixing directed and undirected pattern parts with self-relationship, undirected count",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/useCases/countingSubgraphMatches/CountingSubgraphMatches1.feature:197:5\n      Matched: crates/uni-tck/src/steps/given.rs:5:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -55478,7 +55561,8 @@
             "keyword": "Scenario ",
             "name": "[2] Handling triadic friend of a friend that is not a friend",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/useCases/triadicSelection/TriadicSelection1.feature:51:5\n      Matched: crates/uni-tck/src/steps/given.rs:21:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -55506,7 +55590,8 @@
             "keyword": "Scenario ",
             "name": "[4] Handling triadic friend of a friend that is not a friend with superset of relationship type",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/useCases/triadicSelection/TriadicSelection1.feature:87:5\n      Matched: crates/uni-tck/src/steps/given.rs:21:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -55520,7 +55605,8 @@
             "keyword": "Scenario ",
             "name": "[5] Handling triadic friend of a friend that is not a friend with implicit subset of relationship type",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/useCases/triadicSelection/TriadicSelection1.feature:104:5\n      Matched: crates/uni-tck/src/steps/given.rs:21:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -55534,7 +55620,8 @@
             "keyword": "Scenario ",
             "name": "[6] Handling triadic friend of a friend that is not a friend with explicit subset of relationship type",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/useCases/triadicSelection/TriadicSelection1.feature:127:5\n      Matched: crates/uni-tck/src/steps/given.rs:21:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -55548,7 +55635,8 @@
             "keyword": "Scenario ",
             "name": "[7] Handling triadic friend of a friend that is not a friend with same labels",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/useCases/triadicSelection/TriadicSelection1.feature:150:5\n      Matched: crates/uni-tck/src/steps/given.rs:21:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -55562,7 +55650,8 @@
             "keyword": "Scenario ",
             "name": "[8] Handling triadic friend of a friend that is not a friend with different labels",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/useCases/triadicSelection/TriadicSelection1.feature:166:5\n      Matched: crates/uni-tck/src/steps/given.rs:21:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -55576,7 +55665,8 @@
             "keyword": "Scenario ",
             "name": "[9] Handling triadic friend of a friend that is not a friend with implicit subset of labels",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/useCases/triadicSelection/TriadicSelection1.feature:181:5\n      Matched: crates/uni-tck/src/steps/given.rs:21:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -55590,7 +55680,8 @@
             "keyword": "Scenario ",
             "name": "[10] Handling triadic friend of a friend that is not a friend with implicit superset of labels",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/useCases/triadicSelection/TriadicSelection1.feature:197:5\n      Matched: crates/uni-tck/src/steps/given.rs:21:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -55604,7 +55695,8 @@
             "keyword": "Scenario ",
             "name": "[11] Handling triadic friend of a friend that is a friend",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/useCases/triadicSelection/TriadicSelection1.feature:215:5\n      Matched: crates/uni-tck/src/steps/given.rs:21:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -55618,7 +55710,8 @@
             "keyword": "Scenario ",
             "name": "[12] Handling triadic friend of a friend that is a friend with different relationship type",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/useCases/triadicSelection/TriadicSelection1.feature:229:5\n      Matched: crates/uni-tck/src/steps/given.rs:21:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -55632,7 +55725,8 @@
             "keyword": "Scenario ",
             "name": "[13] Handling triadic friend of a friend that is a friend with superset of relationship type",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/useCases/triadicSelection/TriadicSelection1.feature:243:5\n      Matched: crates/uni-tck/src/steps/given.rs:21:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -55646,7 +55740,8 @@
             "keyword": "Scenario ",
             "name": "[14] Handling triadic friend of a friend that is a friend with implicit subset of relationship type",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/useCases/triadicSelection/TriadicSelection1.feature:258:5\n      Matched: crates/uni-tck/src/steps/given.rs:21:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -55660,7 +55755,8 @@
             "keyword": "Scenario ",
             "name": "[15] Handling triadic friend of a friend that is a friend with explicit subset of relationship type",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/useCases/triadicSelection/TriadicSelection1.feature:273:5\n      Matched: crates/uni-tck/src/steps/given.rs:21:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -55674,7 +55770,8 @@
             "keyword": "Scenario ",
             "name": "[16] Handling triadic friend of a friend that is a friend with same labels",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/useCases/triadicSelection/TriadicSelection1.feature:288:5\n      Matched: crates/uni-tck/src/steps/given.rs:21:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -55688,7 +55785,8 @@
             "keyword": "Scenario ",
             "name": "[17] Handling triadic friend of a friend that is a friend with different labels",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/useCases/triadicSelection/TriadicSelection1.feature:302:5\n      Matched: crates/uni-tck/src/steps/given.rs:21:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -55702,7 +55800,8 @@
             "keyword": "Scenario ",
             "name": "[18] Handling triadic friend of a friend that is a friend with implicit subset of labels",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/useCases/triadicSelection/TriadicSelection1.feature:315:5\n      Matched: crates/uni-tck/src/steps/given.rs:21:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]
@@ -55716,7 +55815,8 @@
             "keyword": "Scenario ",
             "name": "[19] Handling triadic friend of a friend that is a friend with implicit superset of labels",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/useCases/triadicSelection/TriadicSelection1.feature:329:5\n      Matched: crates/uni-tck/src/steps/given.rs:21:1\n      Step panicked. Captured output: Failed to initialize database: IO error: No space left on device (os error 28)\n      \n      Caused by:\n          No space left on device (os error 28)\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
             }
           }
         ]

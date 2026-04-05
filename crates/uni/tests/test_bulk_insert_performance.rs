@@ -85,10 +85,11 @@ async fn test_bulk_insert_performance() {
         eprintln!();
 
         // Clean up for next test and flush to reset L0
-        db.session()
-            .query("MATCH (n:Person) DETACH DELETE n")
+        let tx = db.session().tx().await.unwrap();
+        tx.execute("MATCH (n:Person) DETACH DELETE n")
             .await
             .unwrap();
+        tx.commit().await.unwrap();
         db.flush().await.unwrap();
     }
 }
@@ -195,10 +196,9 @@ async fn test_bulk_insert_with_constraints() {
         }
 
         // Clean up for next test and flush to reset L0
-        db.session()
-            .query("MATCH (n:User) DETACH DELETE n")
-            .await
-            .unwrap();
+        let tx = db.session().tx().await.unwrap();
+        tx.execute("MATCH (n:User) DETACH DELETE n").await.unwrap();
+        tx.commit().await.unwrap();
         db.flush().await.unwrap();
     }
 

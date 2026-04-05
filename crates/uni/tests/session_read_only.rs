@@ -154,9 +154,7 @@ async fn test_mutations_via_transaction_work() -> Result<()> {
     tx.commit().await?;
 
     // Read back via session.query()
-    let result = session
-        .query("MATCH (i:Item) RETURN i.val AS val")
-        .await?;
+    let result = session.query("MATCH (i:Item) RETURN i.val AS val").await?;
     assert_eq!(result.len(), 1);
     let val: i64 = result.rows()[0].get("val")?;
     assert_eq!(val, 42);

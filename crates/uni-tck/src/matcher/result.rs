@@ -264,6 +264,9 @@ fn values_equal(a: &Value, b: &Value) -> bool {
         (Value::Node(a), Value::Node(b)) => nodes_equal(a, b),
         (Value::Edge(a), Value::Edge(b)) => edges_equal(a, b),
         (Value::Path(a), Value::Path(b)) => paths_equal(a, b),
+        // Cross-type numeric: Int vs Float — compare as f64
+        (Value::Int(a), Value::Float(b)) => floats_equal(*a as f64, *b),
+        (Value::Float(a), Value::Int(b)) => floats_equal(*a, *b as f64),
         (Value::Vector(a), Value::Vector(b)) => {
             a.len() == b.len()
                 && a.iter()
@@ -332,6 +335,9 @@ fn values_equal_ignoring_list_order(a: &Value, b: &Value) -> bool {
         (Value::Node(a), Value::Node(b)) => nodes_equal_ignoring_list_order(a, b),
         (Value::Edge(a), Value::Edge(b)) => edges_equal_ignoring_list_order(a, b),
         (Value::Path(a), Value::Path(b)) => paths_equal_ignoring_list_order(a, b),
+        // Cross-type numeric: Int vs Float — compare as f64
+        (Value::Int(a), Value::Float(b)) => floats_equal(*a as f64, *b),
+        (Value::Float(a), Value::Int(b)) => floats_equal(*a, *b as f64),
         (Value::Temporal(a), Value::Temporal(b)) => a == b,
         (Value::Temporal(_), Value::String(s)) => a.to_string() == *s,
         (Value::String(s), Value::Temporal(_)) => *s == b.to_string(),

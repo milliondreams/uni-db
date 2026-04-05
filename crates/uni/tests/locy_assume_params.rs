@@ -15,10 +15,8 @@ async fn test_assume_mutation_uses_params() -> Result<()> {
 
     // Seed data: two agents
     let tx = db.session().tx().await?;
-    tx.execute(
-        "CREATE (:Agent {name: 'alice', score: 10}), (:Agent {name: 'bob', score: 20})",
-    )
-    .await?;
+    tx.execute("CREATE (:Agent {name: 'alice', score: 10}), (:Agent {name: 'bob', score: 20})")
+        .await?;
     tx.commit().await?;
 
     // ASSUME mutation references $target_name — should resolve from params.
@@ -38,14 +36,18 @@ async fn test_assume_mutation_uses_params() -> Result<()> {
     // In the hypothetical state, alice has score=99 so she should appear
     // alongside bob (who already has score=20).
     let rows = match &result.command_results[0] {
-        uni_db::locy::CommandResult::Assume(rows)
-        | uni_db::locy::CommandResult::Query(rows) => rows,
+        uni_db::locy::CommandResult::Assume(rows) | uni_db::locy::CommandResult::Query(rows) => {
+            rows
+        }
         other => panic!("expected Assume/Query result, got: {other:?}"),
     };
 
     let names: Vec<String> = rows
         .iter()
-        .filter_map(|r| r.get("name").map(|v| v.to_string().trim_matches('"').to_string()))
+        .filter_map(|r| {
+            r.get("name")
+                .map(|v| v.to_string().trim_matches('"').to_string())
+        })
         .collect();
 
     assert!(
@@ -91,15 +93,19 @@ async fn test_assume_rule_reevaluation_uses_params() -> Result<()> {
         .await?;
 
     let rows = match &result.command_results[0] {
-        uni_db::locy::CommandResult::Assume(rows)
-        | uni_db::locy::CommandResult::Query(rows) => rows,
+        uni_db::locy::CommandResult::Assume(rows) | uni_db::locy::CommandResult::Query(rows) => {
+            rows
+        }
         other => panic!("expected Assume/Query result, got: {other:?}"),
     };
 
     // Alice had 2 episodes. After ASSUME, 'deploy' became 'rollback'.
     let actions: Vec<String> = rows
         .iter()
-        .filter_map(|r| r.get("action").map(|v| v.to_string().trim_matches('"').to_string()))
+        .filter_map(|r| {
+            r.get("action")
+                .map(|v| v.to_string().trim_matches('"').to_string())
+        })
         .collect();
 
     assert_eq!(

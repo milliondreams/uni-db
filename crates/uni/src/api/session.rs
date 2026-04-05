@@ -627,10 +627,9 @@ impl Session {
         // Enforce read-only semantics for session queries — mutations require
         // a transaction for isolation, WAL protection, and commit hooks.
         uni_query::validate_read_only(&ast).map_err(|_| UniError::Query {
-            message:
-                "Session.query() is read-only. Mutation clauses (CREATE, MERGE, DELETE, SET, \
+            message: "Session.query() is read-only. Mutation clauses (CREATE, MERGE, DELETE, SET, \
                  REMOVE) require a transaction. Use session.tx() to start one."
-                    .to_string(),
+                .to_string(),
             query: Some(cypher.to_string()),
         })?;
 
@@ -807,10 +806,9 @@ impl<'a> QueryBuilder<'a> {
             let ast = uni_cypher::parse(&self.cypher)
                 .map_err(crate::api::impl_query::into_parse_error)?;
             uni_query::validate_read_only(&ast).map_err(|_| UniError::Query {
-                message:
-                    "Session.query() is read-only. Mutation clauses (CREATE, MERGE, DELETE, \
+                message: "Session.query() is read-only. Mutation clauses (CREATE, MERGE, DELETE, \
                      SET, REMOVE) require a transaction. Use session.tx() to start one."
-                        .to_string(),
+                    .to_string(),
                 query: Some(self.cypher.clone()),
             })?;
 
@@ -917,9 +915,7 @@ impl Clone for Session {
             db: self.db.clone(),
             original_db: self.original_db.clone(),
             id: Uuid::new_v4().to_string(),
-            params: Arc::new(std::sync::RwLock::new(
-                self.params.read().unwrap().clone(),
-            )),
+            params: Arc::new(std::sync::RwLock::new(self.params.read().unwrap().clone())),
             rule_registry: Arc::new(std::sync::RwLock::new(
                 self.rule_registry.read().unwrap().clone(),
             )),

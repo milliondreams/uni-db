@@ -22,10 +22,11 @@ async fn test_dynamic_map_access() {
     assert_eq!(result.rows()[0].value("val").unwrap(), &Value::Int(42));
 
     // Forced DataFusion path via scan
-    db.session()
-        .query("CREATE (:Person {name: 'Alice'})")
+    let tx = db.session().tx().await.unwrap();
+    tx.execute("CREATE (:Person {name: 'Alice'})")
         .await
         .unwrap();
+    tx.commit().await.unwrap();
 
     // Check direct property access
     let result = db
@@ -73,10 +74,11 @@ async fn test_keys_function_structural() {
 async fn test_keys_function_node() {
     let db = Uni::in_memory().build().await.unwrap();
 
-    db.session()
-        .query("CREATE (n:Person {name: 'Alice', age: 30})")
+    let tx = db.session().tx().await.unwrap();
+    tx.execute("CREATE (n:Person {name: 'Alice', age: 30})")
         .await
         .unwrap();
+    tx.commit().await.unwrap();
     let result = db
         .session()
         .query("MATCH (n:Person) RETURN keys(n) AS k")

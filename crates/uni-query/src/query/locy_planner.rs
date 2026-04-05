@@ -398,9 +398,7 @@ impl<'a> LocyPlanBuilder<'a> {
                     .collect()
             })
             .unwrap_or_default();
-        let having = first_clause
-            .map(|c| c.having.clone())
-            .unwrap_or_default();
+        let having = first_clause.map(|c| c.having.clone()).unwrap_or_default();
         let best_by_criteria = first_clause
             .and_then(|c| c.best_by.as_ref())
             .map(|bb| {

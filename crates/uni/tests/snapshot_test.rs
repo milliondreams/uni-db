@@ -188,8 +188,10 @@ async fn test_time_travel_rejects_writes() -> Result<()> {
     assert!(result.is_err());
     let err_msg = result.unwrap_err().to_string();
     assert!(
-        err_msg.contains("Write clauses") || err_msg.contains("not allowed"),
-        "Expected write clause error, got: {}",
+        err_msg.contains("Write clauses")
+            || err_msg.contains("not allowed")
+            || err_msg.contains("read-only"),
+        "Expected write rejection error, got: {}",
         err_msg
     );
 

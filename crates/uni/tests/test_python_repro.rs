@@ -30,10 +30,11 @@ async fn test_create_node_return_id() -> Result<()> {
     tx.execute("CREATE LABEL Person (name STRING)").await?;
     tx.commit().await?;
 
-    let result = db
-        .session()
+    let tx = db.session().tx().await?;
+    let result = tx
         .query("CREATE (n:Person {name: 'Alice'}) RETURN id(n) AS vid")
         .await?;
+    tx.commit().await?;
 
     assert_eq!(result.len(), 1, "Should return exactly 1 row");
     let vid = result.rows()[0].get::<i64>("vid")?;
@@ -52,13 +53,14 @@ async fn test_create_edge_return_id() -> Result<()> {
         .await?;
     tx.commit().await?;
 
-    let result = db
-        .session()
+    let tx = db.session().tx().await?;
+    let result = tx
         .query(
             "CREATE (a:Person {name: 'Alice'})-[r:KNOWS]->(b:Person {name: 'Bob'}) \
              RETURN id(r) AS eid",
         )
         .await?;
+    tx.commit().await?;
 
     assert_eq!(result.len(), 1, "Should return exactly 1 row");
     let eid = result.rows()[0].get::<i64>("eid")?;
@@ -75,10 +77,11 @@ async fn test_create_node_return_id_and_properties() -> Result<()> {
     tx.execute("CREATE LABEL Person (name STRING)").await?;
     tx.commit().await?;
 
-    let result = db
-        .session()
+    let tx = db.session().tx().await?;
+    let result = tx
         .query("CREATE (n:Person {name: 'Alice'}) RETURN id(n) AS vid, n.name AS name")
         .await?;
+    tx.commit().await?;
 
     assert_eq!(result.len(), 1, "Should return exactly 1 row");
     let vid = result.rows()[0].get::<i64>("vid")?;

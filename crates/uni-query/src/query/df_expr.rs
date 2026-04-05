@@ -3178,9 +3178,9 @@ fn coerce_scalar_function(
             // Only cast to Utf8 when all types are string-like.
             // Struct (DateTime), LargeBinary (CypherValue), List, and other
             // non-string types cannot be safely cast to Utf8.
-            let all_string_like = types.iter().all(|t| {
-                matches!(t, DataType::Utf8 | DataType::LargeUtf8 | DataType::Null)
-            });
+            let all_string_like = types
+                .iter()
+                .all(|t| matches!(t, DataType::Utf8 | DataType::LargeUtf8 | DataType::Null));
             let unified_args: Vec<DfExpr> = if all_string_like {
                 coerced_args
                     .into_iter()

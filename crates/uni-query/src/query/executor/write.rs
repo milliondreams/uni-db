@@ -2192,16 +2192,41 @@ impl Executor {
         if detach {
             self.detach_delete_vertex(vid, writer, tx_l0).await?;
         } else {
-            self.check_vertex_has_no_edges(vid, writer).await?;
+            self.check_vertex_has_no_edges(vid, writer, tx_l0).await?;
         }
         writer.delete_vertex(vid, labels, tx_l0).await?;
         Ok(())
     }
 
     /// Check that a vertex has no edges (required for non-DETACH DELETE).
-    pub(crate) async fn check_vertex_has_no_edges(&self, vid: Vid, writer: &Writer) -> Result<()> {
+    ///
+    /// Loads the subgraph from storage, then excludes edges that have been
+    /// tombstoned in the writer's L0 or the transaction's L0. This ensures
+    /// edges deleted earlier in the same DELETE clause are properly excluded.
+    pub(crate) async fn check_vertex_has_no_edges(
+        &self,
+        vid: Vid,
+        writer: &Writer,
+        tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
+    ) -> Result<()> {
         let schema = self.storage.schema_manager().schema();
         let edge_type_ids: Vec<u32> = schema.all_edge_type_ids();
+
+        // Collect tombstoned edge IDs from both the writer L0 and tx L0.
+        let mut tombstoned_eids = std::collections::HashSet::new();
+        {
+            let writer_l0 = writer.l0_manager.get_current();
+            let guard = writer_l0.read();
+            for &eid in guard.tombstones.keys() {
+                tombstoned_eids.insert(eid);
+            }
+        }
+        if let Some(tx) = tx_l0 {
+            let guard = tx.read();
+            for &eid in guard.tombstones.keys() {
+                tombstoned_eids.insert(eid);
+            }
+        }
 
         let out_graph = self
             .storage
@@ -2213,7 +2238,7 @@ impl Executor {
                 Some(writer.l0_manager.get_current()),
             )
             .await?;
-        let has_out = out_graph.edges().next().is_some();
+        let has_out = out_graph.edges().any(|e| !tombstoned_eids.contains(&e.eid));
 
         let in_graph = self
             .storage
@@ -2225,7 +2250,7 @@ impl Executor {
                 Some(writer.l0_manager.get_current()),
             )
             .await?;
-        let has_in = in_graph.edges().next().is_some();
+        let has_in = in_graph.edges().any(|e| !tombstoned_eids.contains(&e.eid));
 
         if has_out || has_in {
             return Err(anyhow!(

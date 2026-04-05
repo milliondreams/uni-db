@@ -2132,8 +2132,7 @@
             "keyword": "Scenario ",
             "name": "[1] Undirected expand followed by delete and count",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/clauses/delete/Delete4.feature:45:5\n      Matched: crates/uni-tck/src/steps/then.rs:20:1\n      Step panicked. Captured output: Query returned error instead of result: Query { message: \"Execution error: DELETE node failed: ConstraintVerificationFailed: DeleteConnectedNode - Cannot delete node 0, because it still has relationships. To delete the node and its relationships, use DETACH DELETE.\", query: Some(\"\\nMATCH (a)-[r]-(b)\\nDELETE r, a, b\\nRETURN count(*) AS c\\n\") }\n[Summary]\n1 feature\n1 scenario (1 failed)\n4 steps (3 passed, 1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -2265,8 +2264,7 @@
             "keyword": "Scenario ",
             "name": "[7] Delete paths from nested map/list",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/clauses/delete/Delete5.feature:164:5\n      Matched: crates/uni-tck/src/steps/then.rs:9:1\n      Step panicked. Captured output: No result found\n[Summary]\n1 feature\n1 scenario (1 failed)\n4 steps (3 passed, 1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -9126,8 +9124,7 @@
             "keyword": "Scenario ",
             "name": "[20] Do not match on deleted entities",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/clauses/merge/Merge5.feature:412:5\n      Matched: crates/uni-tck/src/steps/then.rs:9:1\n      Step panicked. Captured output: No result found\n[Summary]\n1 feature\n1 scenario (1 failed)\n4 steps (3 passed, 1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -13453,8 +13450,7 @@
             "keyword": "Scenario ",
             "name": "[25] Sort by an integer variable projected from a node property in ascending order",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/clauses/with-orderBy/WithOrderBy1.feature:536:5\n      Matched: crates/uni-tck/src/steps/then.rs:20:1\n      Step panicked. Captured output: Result mismatch (any order): No match found for actual row 0. Actual values: [(\"a\", Some(Node(Node { vid: Vid(3), labels: [\"D\"], properties: {\"num\": Int(-11)} }))), (\"num\", Some(Float(-11.0)))]. Expected: [{\"a\": Node(Node { vid: Vid(0), labels: [\"D\"], properties: {\"num\": Int(-11)} }), \"num\": Int(-11)}, {\"num\": Int(5), \"a\": Node(Node { vid: Vid(0), labels: [\"B\"], properties: {\"num\": Int(5)} })}, {\"a\": Node(Node { vid: Vid(0), labels: [\"A\"], properties: {\"num\": Int(9)} }), \"num\": Int(9)}]\n[Summary]\n1 feature\n1 scenario (1 failed)\n4 steps (3 passed, 1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -13468,8 +13464,7 @@
             "keyword": "Scenario ",
             "name": "[25] Sort by an integer variable projected from a node property in ascending order",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/clauses/with-orderBy/WithOrderBy1.feature:536:5\n      Matched: crates/uni-tck/src/steps/then.rs:20:1\n      Step panicked. Captured output: Result mismatch (any order): No match found for actual row 0. Actual values: [(\"num\", Some(Float(-11.0))), (\"a\", Some(Node(Node { vid: Vid(3), labels: [\"D\"], properties: {\"num\": Int(-11)} })))]. Expected: [{\"num\": Int(-11), \"a\": Node(Node { vid: Vid(0), labels: [\"D\"], properties: {\"num\": Int(-11)} })}, {\"a\": Node(Node { vid: Vid(0), labels: [\"B\"], properties: {\"num\": Int(5)} }), \"num\": Int(5)}, {\"a\": Node(Node { vid: Vid(0), labels: [\"A\"], properties: {\"num\": Int(9)} }), \"num\": Int(9)}]\n[Summary]\n1 feature\n1 scenario (1 failed)\n4 steps (3 passed, 1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -13483,8 +13478,7 @@
             "keyword": "Scenario ",
             "name": "[25] Sort by an integer variable projected from a node property in ascending order",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/clauses/with-orderBy/WithOrderBy1.feature:536:5\n      Matched: crates/uni-tck/src/steps/then.rs:20:1\n      Step panicked. Captured output: Result mismatch (any order): No match found for actual row 0. Actual values: [(\"a\", Some(Node(Node { vid: Vid(3), labels: [\"D\"], properties: {\"num\": Int(-11)} }))), (\"num\", Some(Float(-11.0)))]. Expected: [{\"a\": Node(Node { vid: Vid(0), labels: [\"D\"], properties: {\"num\": Int(-11)} }), \"num\": Int(-11)}, {\"a\": Node(Node { vid: Vid(0), labels: [\"B\"], properties: {\"num\": Int(5)} }), \"num\": Int(5)}, {\"a\": Node(Node { vid: Vid(0), labels: [\"A\"], properties: {\"num\": Int(9)} }), \"num\": Int(9)}]\n[Summary]\n1 feature\n1 scenario (1 failed)\n4 steps (3 passed, 1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -13498,8 +13492,7 @@
             "keyword": "Scenario ",
             "name": "[26] Sort by an integer variable projected from a node property in descending order",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/clauses/with-orderBy/WithOrderBy1.feature:568:5\n      Matched: crates/uni-tck/src/steps/then.rs:20:1\n      Step panicked. Captured output: Result mismatch (any order): No match found for actual row 0. Actual values: [(\"a\", Some(Node(Node { vid: Vid(4), labels: [\"E\"], properties: {\"num\": Int(7054)} }))), (\"num\", Some(Float(7054.0)))]. Expected: [{\"a\": Node(Node { vid: Vid(0), labels: [\"E\"], properties: {\"num\": Int(7054)} }), \"num\": Int(7054)}, {\"num\": Int(30), \"a\": Node(Node { vid: Vid(0), labels: [\"C\"], properties: {\"num\": Int(30)} })}, {\"num\": Int(9), \"a\": Node(Node { vid: Vid(0), labels: [\"A\"], properties: {\"num\": Int(9)} })}]\n[Summary]\n1 feature\n1 scenario (1 failed)\n4 steps (3 passed, 1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -13513,8 +13506,7 @@
             "keyword": "Scenario ",
             "name": "[26] Sort by an integer variable projected from a node property in descending order",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/clauses/with-orderBy/WithOrderBy1.feature:568:5\n      Matched: crates/uni-tck/src/steps/then.rs:20:1\n      Step panicked. Captured output: Result mismatch (any order): No match found for actual row 0. Actual values: [(\"a\", Some(Node(Node { vid: Vid(4), labels: [\"E\"], properties: {\"num\": Int(7054)} }))), (\"num\", Some(Float(7054.0)))]. Expected: [{\"a\": Node(Node { vid: Vid(0), labels: [\"E\"], properties: {\"num\": Int(7054)} }), \"num\": Int(7054)}, {\"num\": Int(30), \"a\": Node(Node { vid: Vid(0), labels: [\"C\"], properties: {\"num\": Int(30)} })}, {\"num\": Int(9), \"a\": Node(Node { vid: Vid(0), labels: [\"A\"], properties: {\"num\": Int(9)} })}]\n[Summary]\n1 feature\n1 scenario (1 failed)\n4 steps (3 passed, 1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -14780,8 +14772,7 @@
             "keyword": "Scenario ",
             "name": "[11] Sort by a date expression in ascending order",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/clauses/with-orderBy/WithOrderBy2.feature:358:5\n      Matched: crates/uni-tck/src/steps/then.rs:20:1\n      Step panicked. Captured output: Query returned error instead of result: Query { message: \"Incompatible types for Plus operator: Date32 + Interval(MonthDayNano)\", query: Some(\"\\nMATCH (a)\\nWITH a\\n  ORDER BY a.date + duration({months: 1, days: 2})\\n  LIMIT 2\\nRETURN a\\n\") }\n[Summary]\n1 feature\n1 scenario (1 failed)\n4 steps (3 passed, 1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -14795,8 +14786,7 @@
             "keyword": "Scenario ",
             "name": "[11] Sort by a date expression in ascending order",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/clauses/with-orderBy/WithOrderBy2.feature:358:5\n      Matched: crates/uni-tck/src/steps/then.rs:20:1\n      Step panicked. Captured output: Query returned error instead of result: Query { message: \"Incompatible types for Plus operator: Date32 + Interval(MonthDayNano)\", query: Some(\"\\nMATCH (a)\\nWITH a\\n  ORDER BY a.date + duration({months: 1, days: 2}) ASC\\n  LIMIT 2\\nRETURN a\\n\") }\n[Summary]\n1 feature\n1 scenario (1 failed)\n4 steps (3 passed, 1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -14810,8 +14800,7 @@
             "keyword": "Scenario ",
             "name": "[11] Sort by a date expression in ascending order",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/clauses/with-orderBy/WithOrderBy2.feature:358:5\n      Matched: crates/uni-tck/src/steps/then.rs:20:1\n      Step panicked. Captured output: Query returned error instead of result: Query { message: \"Incompatible types for Plus operator: Date32 + Interval(MonthDayNano)\", query: Some(\"\\nMATCH (a)\\nWITH a\\n  ORDER BY a.date + duration({months: 1, days: 2}) ASCENDING\\n  LIMIT 2\\nRETURN a\\n\") }\n[Summary]\n1 feature\n1 scenario (1 failed)\n4 steps (3 passed, 1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -14825,8 +14814,7 @@
             "keyword": "Scenario ",
             "name": "[12] Sort by a date expression in descending order",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/clauses/with-orderBy/WithOrderBy2.feature:389:5\n      Matched: crates/uni-tck/src/steps/then.rs:20:1\n      Step panicked. Captured output: Query returned error instead of result: Query { message: \"Incompatible types for Plus operator: Date32 + Interval(MonthDayNano)\", query: Some(\"\\nMATCH (a)\\nWITH a\\n  ORDER BY a.date + duration({months: 1, days: 2}) DESC\\n  LIMIT 2\\nRETURN a\\n\") }\n[Summary]\n1 feature\n1 scenario (1 failed)\n4 steps (3 passed, 1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -14840,8 +14828,7 @@
             "keyword": "Scenario ",
             "name": "[12] Sort by a date expression in descending order",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/clauses/with-orderBy/WithOrderBy2.feature:389:5\n      Matched: crates/uni-tck/src/steps/then.rs:20:1\n      Step panicked. Captured output: Query returned error instead of result: Query { message: \"Incompatible types for Plus operator: Date32 + Interval(MonthDayNano)\", query: Some(\"\\nMATCH (a)\\nWITH a\\n  ORDER BY a.date + duration({months: 1, days: 2}) DESCENDING\\n  LIMIT 2\\nRETURN a\\n\") }\n[Summary]\n1 feature\n1 scenario (1 failed)\n4 steps (3 passed, 1 failed)\n"
+              "status": "passed"
             }
           }
         ]

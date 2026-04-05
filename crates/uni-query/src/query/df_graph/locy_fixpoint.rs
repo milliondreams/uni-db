@@ -2764,9 +2764,7 @@ fn apply_having_filter(
 
     // Build DFSchema from the FOLD output Arrow schema.
     let df_schema = DFSchema::try_from(schema.as_ref().clone()).map_err(|e| {
-        datafusion::common::DataFusionError::Internal(format!(
-            "HAVING schema conversion: {e}"
-        ))
+        datafusion::common::DataFusionError::Internal(format!("HAVING schema conversion: {e}"))
     })?;
 
     let ctx = SessionContext::new();
@@ -2782,12 +2780,11 @@ fn apply_having_filter(
     let physical_exprs: Vec<Arc<dyn datafusion::physical_expr::PhysicalExpr>> = having_exprs
         .iter()
         .map(|expr| {
-            let df_expr =
-                crate::query::df_expr::cypher_expr_to_df(expr, None).map_err(|e| {
-                    datafusion::common::DataFusionError::Internal(format!(
-                        "HAVING expression conversion: {e}"
-                    ))
-                })?;
+            let df_expr = crate::query::df_expr::cypher_expr_to_df(expr, None).map_err(|e| {
+                datafusion::common::DataFusionError::Internal(format!(
+                    "HAVING expression conversion: {e}"
+                ))
+            })?;
 
             // Run DataFusion's type coercion by wrapping in a Filter plan,
             // applying the TypeCoercion analyzer rule, then extracting the
@@ -2801,11 +2798,10 @@ fn apply_having_filter(
             let filter_plan = LogicalPlanBuilder::from(empty)
                 .filter(df_expr.clone())?
                 .build()?;
-            let coerced_expr =
-                match TypeCoercion::new().analyze(filter_plan, &config) {
-                    Ok(datafusion::logical_expr::LogicalPlan::Filter(f)) => f.predicate,
-                    _ => df_expr,
-                };
+            let coerced_expr = match TypeCoercion::new().analyze(filter_plan, &config) {
+                Ok(datafusion::logical_expr::LogicalPlan::Filter(f)) => f.predicate,
+                _ => df_expr,
+            };
 
             create_physical_expr(&coerced_expr, &df_schema, props)
         })
@@ -2818,14 +2814,11 @@ fn apply_having_filter(
         for phys_expr in &physical_exprs {
             let value = phys_expr.evaluate(&batch)?;
             let arr = value.into_array(batch.num_rows())?;
-            let bool_arr =
-                arr.as_any()
-                    .downcast_ref::<BooleanArray>()
-                    .ok_or_else(|| {
-                        datafusion::common::DataFusionError::Internal(
-                            "HAVING condition must evaluate to boolean".into(),
-                        )
-                    })?;
+            let bool_arr = arr.as_any().downcast_ref::<BooleanArray>().ok_or_else(|| {
+                datafusion::common::DataFusionError::Internal(
+                    "HAVING condition must evaluate to boolean".into(),
+                )
+            })?;
             mask = Some(match mask {
                 None => bool_arr.clone(),
                 Some(prev) => and(&prev, bool_arr).map_err(arrow_err)?,

@@ -79,10 +79,8 @@ async fn test_datetime_and_scalar_set_in_same_query() -> Result<()> {
 
     // Create node with both scalar and datetime properties
     let tx = db.session().tx().await?;
-    tx.execute(
-        "CREATE (:Event {name: 'initial', count: 0, ts: datetime('2025-01-01T00:00:00Z')})",
-    )
-    .await?;
+    tx.execute("CREATE (:Event {name: 'initial', count: 0, ts: datetime('2025-01-01T00:00:00Z')})")
+        .await?;
     tx.commit().await?;
 
     // Update BOTH scalar and DateTime in a single SET clause

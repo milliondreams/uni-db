@@ -79,9 +79,21 @@ pub fn validate_read_only(query: &CypherQuery) -> Result<(), String> {
             }
             Query::Explain(inner) => check_query(inner),
             Query::TimeTravel { query, .. } => check_query(query),
-            Query::Schema(_) => Err("Schema commands are not allowed \
-                 with VERSION AS OF / TIMESTAMP AS OF"
-                .to_string()),
+            Query::Schema(cmd) => {
+                use uni_cypher::ast::SchemaCommand;
+                match cmd.as_ref() {
+                    // Read-only schema commands are allowed
+                    SchemaCommand::ShowConstraints(_)
+                    | SchemaCommand::ShowIndexes(_)
+                    | SchemaCommand::ShowDatabase
+                    | SchemaCommand::ShowConfig
+                    | SchemaCommand::ShowStatistics => Ok(()),
+                    // All other schema commands mutate state
+                    _ => Err(
+                        "Mutating schema commands are not allowed in read-only context".to_string(),
+                    ),
+                }
+            }
         }
     }
 

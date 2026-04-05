@@ -589,17 +589,17 @@ async fn test_tck_match8_2_merge_optional_count() -> Result<()> {
     let c1 = r1.rows()[0].get::<i64>("c")?;
     eprintln!("Step 1 - MATCH (a): {c1}");
 
-    let r2 = db
-        .session()
-        .query("MATCH (a) MERGE (b) RETURN count(*) AS c")
-        .await?;
+    let tx = db.session().tx().await?;
+    let r2 = tx.query("MATCH (a) MERGE (b) RETURN count(*) AS c").await?;
+    tx.commit().await?;
     let c2 = r2.rows()[0].get::<i64>("c")?;
     eprintln!("Step 2 - MATCH (a) MERGE (b): {c2}");
 
-    let r3 = db
-        .session()
+    let tx = db.session().tx().await?;
+    let r3 = tx
         .query("MATCH (a) MERGE (b) WITH * RETURN count(*) AS c")
         .await?;
+    tx.commit().await?;
     let c3 = r3.rows()[0].get::<i64>("c")?;
     eprintln!("Step 3 - MATCH (a) MERGE (b) WITH *: {c3}");
 
@@ -612,26 +612,29 @@ async fn test_tck_match8_2_merge_optional_count() -> Result<()> {
     eprintln!("EXPLAIN:\n{}", explain.plan_text);
 
     // Test with unbound target — to verify optional traverse works in general
-    let r_unbound = db
-        .session()
+    let tx = db.session().tx().await?;
+    let r_unbound = tx
         .query("MATCH (a) MERGE (b) WITH * OPTIONAL MATCH (a)-[r]-(x) RETURN count(*) AS c")
         .await?;
+    tx.commit().await?;
     let c_unbound = r_unbound.rows()[0].get::<i64>("c")?;
     eprintln!("Unbound target OPTIONAL: {c_unbound}");
 
-    let result = db
-        .session()
+    let tx = db.session().tx().await?;
+    let result = tx
         .query("MATCH (a) MERGE (b) WITH * OPTIONAL MATCH (a)--(b) RETURN count(*)")
         .await?;
+    tx.commit().await?;
 
     let cnt = result.rows()[0].get::<i64>("count(*)")?;
     eprintln!("Full query: {cnt}");
 
     // Also check without WITH *
-    let r_no_with = db
-        .session()
+    let tx = db.session().tx().await?;
+    let r_no_with = tx
         .query("MATCH (a) MERGE (b) OPTIONAL MATCH (a)--(b) RETURN count(*) AS c")
         .await?;
+    tx.commit().await?;
     let c_no_with = r_no_with.rows()[0].get::<i64>("c")?;
     eprintln!("Without WITH *: {c_no_with}");
     assert_eq!(cnt, 6, "TCK Match8[2]: expected 6 rows");

@@ -236,10 +236,7 @@ async fn test_vector_query_sees_l0_data_without_flush() -> anyhow::Result<()> {
 
     // Top result should be the identical vector
     let top_title: String = res.rows()[0].get("title")?;
-    assert_eq!(
-        top_title, "hello",
-        "Identical vector should be top result"
-    );
+    assert_eq!(top_title, "hello", "Identical vector should be top result");
 
     let top_score: f64 = res.rows()[0].get("score")?;
     assert!(

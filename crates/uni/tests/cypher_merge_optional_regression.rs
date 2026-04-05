@@ -39,11 +39,12 @@ async fn test_merge_optional_match_count() -> Result<()> {
     // MERGE (b:B {name: 'b1'}) creates/merges 1 node → cross product = 2 rows
     // OPTIONAL MATCH (a)--(b) finds 0 edges (no edges from A to B label)
     // count(*) should be 2 (preserving unmatched rows)
-    let result = db
-        .session().query(
+    let tx = db.session().tx().await?;
+    let result = tx.query(
             "MATCH (a:A) MERGE (b:B {name: 'b1'}) WITH a, b OPTIONAL MATCH (a)--(b) RETURN count(*) AS cnt",
         )
         .await?;
+    tx.commit().await?;
     assert_eq!(result.rows().len(), 1, "Should return 1 row with count");
     let cnt = result.rows()[0].get::<i64>("cnt")?;
     assert_eq!(

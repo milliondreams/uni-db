@@ -98,10 +98,11 @@ async fn test_count_scaling() {
         );
 
         // Clear for next test
-        db.session()
-            .query("MATCH (n:Person) DETACH DELETE n")
+        let tx = db.session().tx().await.unwrap();
+        tx.execute("MATCH (n:Person) DETACH DELETE n")
             .await
             .unwrap();
+        tx.commit().await.unwrap();
         eprintln!();
     }
 }

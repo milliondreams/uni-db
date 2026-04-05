@@ -279,10 +279,8 @@ impl GraphScanExec {
         uni_schema: &uni_common::core::schema::Schema,
     ) -> SchemaRef {
         // Merge property metadata from all labels for type resolution.
-        let mut merged: std::collections::HashMap<
-            &str,
-            &uni_common::core::schema::PropertyMeta,
-        > = std::collections::HashMap::new();
+        let mut merged: std::collections::HashMap<&str, &uni_common::core::schema::PropertyMeta> =
+            std::collections::HashMap::new();
         for label_props in uni_schema.properties.values() {
             for (name, meta) in label_props {
                 merged.entry(name.as_str()).or_insert(meta);
@@ -2185,14 +2183,14 @@ fn map_to_schemaless_output_schema(
                 let mut prop_values: HashMap<Vid, Properties> = HashMap::new();
                 for i in 0..batch.num_rows() {
                     let vid = Vid::from(vid_arr.value(i));
-                    let resolved = resolve_l0_property(&vid, prop, l0_ctx)
-                        .flatten()
-                        .or_else(|| {
-                            extract_from_overflow_blob(props_arr, i, prop)
-                                .and_then(|bytes| {
+                    let resolved =
+                        resolve_l0_property(&vid, prop, l0_ctx)
+                            .flatten()
+                            .or_else(|| {
+                                extract_from_overflow_blob(props_arr, i, prop).and_then(|bytes| {
                                     uni_common::cypher_value_codec::decode(&bytes).ok()
                                 })
-                        });
+                            });
                     if let Some(val) = resolved {
                         prop_values.insert(vid, HashMap::from([(prop.to_string(), val)]));
                     }
@@ -2200,15 +2198,10 @@ fn map_to_schemaless_output_schema(
                 let vids: Vec<Vid> = (0..batch.num_rows())
                     .map(|i| Vid::from(vid_arr.value(i)))
                     .collect();
-                let col = build_property_column_static(
-                    &vids,
-                    &prop_values,
-                    prop,
-                    &expected_type,
-                )
-                .unwrap_or_else(|_| {
-                    arrow_array::new_null_array(&expected_type, batch.num_rows())
-                });
+                let col = build_property_column_static(&vids, &prop_values, prop, &expected_type)
+                    .unwrap_or_else(|_| {
+                        arrow_array::new_null_array(&expected_type, batch.num_rows())
+                    });
                 columns.push(col);
             }
         }

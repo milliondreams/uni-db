@@ -168,18 +168,22 @@ class TestAggregations:
             ).property("quantity", "int").apply()
 
             session = db.session()
-            session.query(
+            tx = session.tx()
+            tx.execute(
                 "CREATE (p:Product {category: 'Electronics', price: 100.0, quantity: 5})"
             )
-            session.query(
+            tx.execute(
                 "CREATE (p:Product {category: 'Electronics', price: 200.0, quantity: 3})"
             )
-            session.query(
+            tx.execute(
                 "CREATE (p:Product {category: 'Books', price: 20.0, quantity: 10})"
             )
-            session.query(
+            tx.commit()
+            tx = session.tx()
+            tx.execute(
                 "CREATE (p:Product {category: 'Books', price: 30.0, quantity: 8})"
             )
+            tx.commit()
             db.flush()
             yield db, session
 

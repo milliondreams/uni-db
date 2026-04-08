@@ -14,8 +14,10 @@ categories.workspace = true
 [dependencies]
 uni-cypher = { workspace = true }
 uni-common = { workspace = true }
+serde = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
 uni-cypher = { workspace = true }
+serde_json = { workspace = true }
 tokio = { workspace = true }

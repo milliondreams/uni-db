@@ -134,6 +134,9 @@ pub struct LocyProgramExec {
     command_results_slot: Arc<StdRwLock<Vec<(usize, CommandResult)>>>,
     /// Top-k proof filtering: 0 = unlimited (default), >0 = retain at most k proofs per fact.
     top_k_proofs: usize,
+    /// Shared flag set to true when the evaluation is cut short by a timeout.
+    /// Checked after execution to populate `LocyResult.timed_out`.
+    timeout_flag: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl fmt::Debug for LocyProgramExec {
@@ -203,6 +206,7 @@ impl LocyProgramExec {
             warnings_slot: Arc::new(StdRwLock::new(Vec::new())),
             command_results_slot: Arc::new(StdRwLock::new(Vec::new())),
             top_k_proofs,
+            timeout_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -262,6 +266,14 @@ impl LocyProgramExec {
     /// for commands that were executed inline by `run_program()` (QUERY, Cypher).
     pub fn command_results_slot(&self) -> Arc<StdRwLock<Vec<(usize, CommandResult)>>> {
         Arc::clone(&self.command_results_slot)
+    }
+
+    /// Returns the shared timeout flag.
+    ///
+    /// After execution, if this flag is true, the evaluation was cut short by
+    /// a timeout and the derived store contains partial results.
+    pub fn timeout_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.timeout_flag)
     }
 }
 
@@ -343,6 +355,7 @@ impl ExecutionPlan for LocyProgramExec {
         let commands = self.commands.clone();
         let command_results_slot = Arc::clone(&self.command_results_slot);
         let top_k_proofs = self.top_k_proofs;
+        let timeout_flag = Arc::clone(&self.timeout_flag);
 
         let fut = async move {
             run_program(
@@ -371,6 +384,7 @@ impl ExecutionPlan for LocyProgramExec {
                 warnings_slot,
                 command_results_slot,
                 top_k_proofs,
+                timeout_flag,
             )
             .await
         };
@@ -647,6 +661,7 @@ async fn run_program(
     warnings_slot: Arc<StdRwLock<Vec<RuntimeWarning>>>,
     command_results_slot: Arc<StdRwLock<Vec<(usize, CommandResult)>>>,
     top_k_proofs: usize,
+    timeout_flag: Arc<std::sync::atomic::AtomicBool>,
 ) -> DFResult<Vec<RecordBatch>> {
     let start = Instant::now();
     let mut derived_store = DerivedStore::new();
@@ -658,9 +673,9 @@ async fn run_program(
 
         let remaining_timeout = timeout.saturating_sub(start.elapsed());
         if remaining_timeout.is_zero() {
-            return Err(datafusion::error::DataFusionError::Execution(
-                "Locy program timeout exceeded during stratum evaluation".to_string(),
-            ));
+            tracing::warn!("Locy program timeout exceeded during stratum evaluation");
+            timeout_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            break;
         }
 
         if stratum.is_recursive {
@@ -690,6 +705,7 @@ async fn run_program(
                 Arc::clone(&warnings_slot),
                 Arc::clone(&approximate_slot),
                 top_k_proofs,
+                Arc::clone(&timeout_flag),
             );
 
             let task_ctx = session_ctx.read().task_ctx();
@@ -1165,19 +1181,19 @@ fn convert_is_refs(
 /// in the yield schema, since the LocyProject aliases the aggregate input expression
 /// to the fold output name.
 fn convert_fold_bindings(
-    fold_bindings: &[(String, Expr)],
+    fold_bindings: &[(String, String, Expr)],
     yield_schema: &[LocyYieldColumn],
 ) -> DFResult<Vec<FoldBinding>> {
     fold_bindings
         .iter()
-        .map(|(name, expr)| {
+        .map(|(name, yield_alias, expr)| {
             let (kind, _input_col_name) = parse_fold_aggregate(expr)?;
 
             // CountAll has no input column — LocyProject skips the output column
             // entirely, so there is nothing to look up.
             if kind == FoldAggKind::CountAll {
                 return Ok(FoldBinding {
-                    output_name: name.clone(),
+                    output_name: yield_alias.clone(),
                     kind,
                     input_col_index: 0, // unused for CountAll
                     input_col_name: None,
@@ -1190,10 +1206,10 @@ fn convert_fold_bindings(
             // (more robust when schema reconciliation changes column ordering).
             let input_col_index = yield_schema
                 .iter()
-                .position(|yc| yc.name == *name)
+                .position(|yc| yc.name == *name || yc.name == *yield_alias)
                 .unwrap_or(0);
             Ok(FoldBinding {
-                output_name: name.clone(),
+                output_name: yield_alias.clone(),
                 kind,
                 input_col_index,
                 input_col_name: Some(name.clone()),

@@ -46,7 +46,7 @@ Feature: Evaluation Error Conditions
 
   # ── Runtime errors ────────────────────────────────────────────────────
 
-  Scenario: Max iterations exceeded
+  Scenario: Max iterations exceeded returns partial results
     Given having executed:
       """
       CREATE (a:Node {name: 'A'})-[:EDGE]->(b:Node {name: 'B'}), (b)-[:EDGE]->(a)
@@ -56,5 +56,4 @@ Feature: Evaluation Error Conditions
       CREATE RULE reachable AS MATCH (a:Node)-[:EDGE]->(b:Node) YIELD KEY a, KEY b
       CREATE RULE reachable AS MATCH (a:Node)-[:EDGE]->(mid:Node) WHERE mid IS reachable TO b YIELD KEY a, KEY b
       """
-    Then evaluation should fail
-    And the evaluation error should mention 'max iterations'
+    Then evaluation should succeed with timed_out true

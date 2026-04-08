@@ -40,8 +40,10 @@ pub struct LocyRulePlan {
     pub yield_schema: Vec<LocyYieldColumn>,
     /// Optional priority weight for PRIORITY semantics.
     pub priority: Option<i64>,
-    /// FOLD bindings for post-fixpoint aggregation (name, aggregate expr).
-    pub fold_bindings: Vec<(String, Expr)>,
+    /// FOLD bindings for post-fixpoint aggregation (fold_name, yield_alias, aggregate_expr).
+    /// The yield_alias is the output column name from YIELD (may differ from fold_name
+    /// when the user writes e.g. `YIELD ... n AS support`).
+    pub fold_bindings: Vec<(String, String, Expr)>,
     /// Post-FOLD filter expressions (HAVING semantics).
     pub having: Vec<Expr>,
     /// BEST BY criteria for post-fixpoint selection (expr, ascending).

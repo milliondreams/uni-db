@@ -10764,6 +10764,8 @@ dependencies = [
 name = "uni-locy"
 version = "1.0.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "thiserror 1.0.69",
  "tokio",
  "uni-common",

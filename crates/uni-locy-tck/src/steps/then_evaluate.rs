@@ -67,6 +67,24 @@ async fn evaluation_should_succeed(world: &mut LocyWorld) {
     }
 }
 
+#[then(regex = r#"^evaluation should succeed with timed_out (true|false)$"#)]
+async fn evaluation_should_succeed_with_timed_out(world: &mut LocyWorld, expected: String) {
+    let locy_result = world
+        .locy_result()
+        .expect("No evaluation result found - did you forget to evaluate a program?");
+
+    let result = locy_result
+        .as_ref()
+        .unwrap_or_else(|e| panic!("Expected successful evaluation, but got error: {e}"));
+
+    let expected_flag = expected == "true";
+    assert_eq!(
+        result.timed_out, expected_flag,
+        "expected timed_out={expected_flag}, got timed_out={}",
+        result.timed_out,
+    );
+}
+
 #[then("evaluation should fail")]
 async fn evaluation_should_fail(world: &mut LocyWorld) {
     let locy_result = world

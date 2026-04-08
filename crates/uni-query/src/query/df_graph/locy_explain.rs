@@ -441,7 +441,9 @@ fn build_derivation_node<'a>(
     stats: &'a mut LocyStats,
     visited: &'a mut VisitedSet,
     max_depth: usize,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<DerivationNode, LocyError>> + 'a>> {
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<DerivationNode, LocyError>> + Send + 'a>,
+> {
     Box::pin(async move {
         let rule =
             program

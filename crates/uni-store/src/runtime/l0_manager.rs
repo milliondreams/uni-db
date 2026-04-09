@@ -26,6 +26,20 @@ impl L0Manager {
         }
     }
 
+    /// Create a read-only snapshot L0Manager from existing buffers.
+    ///
+    /// Used by the algorithm execution path to provide L0 visibility
+    /// without owning the actual L0 lifecycle (rotation, flush, WAL).
+    pub fn from_snapshot(
+        current: Arc<RwLock<L0Buffer>>,
+        pending_flush: Vec<Arc<RwLock<L0Buffer>>>,
+    ) -> Self {
+        Self {
+            current: RwLock::new(current),
+            pending_flush: RwLock::new(pending_flush),
+        }
+    }
+
     /// Get the current L0 buffer.
     pub fn get_current(&self) -> Arc<RwLock<L0Buffer>> {
         self.current.read().clone()

@@ -1080,8 +1080,21 @@ async fn execute_algo_procedure(
     // already validates and fills defaults internally.
     let serde_args: Vec<serde_json::Value> = args.iter().cloned().map(|v| v.into()).collect();
 
-    // Build AlgoContext — no L0Manager in the DF path (read-only snapshot)
-    let algo_ctx = AlgoContext::new(graph_ctx.storage().clone(), None);
+    // Build AlgoContext with L0 visibility so algorithms see uncommitted-but-committed data.
+    let l0_mgr = {
+        let l0_ctx = graph_ctx.l0_context();
+        l0_ctx.current_l0.as_ref().map(|current| {
+            let mut pending = l0_ctx.pending_flush_l0s.clone();
+            if let Some(tx_l0) = &l0_ctx.transaction_l0 {
+                pending.push(tx_l0.clone());
+            }
+            Arc::new(uni_store::runtime::l0_manager::L0Manager::from_snapshot(
+                current.clone(),
+                pending,
+            ))
+        })
+    };
+    let algo_ctx = AlgoContext::new(graph_ctx.storage().clone(), l0_mgr);
 
     // Execute and collect stream
     let mut stream = procedure.execute(algo_ctx, serde_args);

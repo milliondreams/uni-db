@@ -176,6 +176,17 @@ pub fn value_to_py(py: Python, value: &Value) -> PyResult<Py<PyAny>> {
                     let result = td_class.call1((total_days, total_secs, remaining_micros))?;
                     Ok(result.into_py_any(py)?)
                 }
+                TemporalValue::Btic { lo, hi, meta } => {
+                    // Return as a dict with lo, hi, meta, and display string
+                    let dict = pyo3::types::PyDict::new(py);
+                    dict.set_item("lo", lo)?;
+                    dict.set_item("hi", hi)?;
+                    dict.set_item("meta", *meta as i64)?;
+                    if let Ok(btic) = uni_common::uni_btic::Btic::new(*lo, *hi, *meta) {
+                        dict.set_item("display", btic.to_string())?;
+                    }
+                    Ok(dict.into_py_any(py)?)
+                }
             }
         }
         _ => Ok(py.None()),

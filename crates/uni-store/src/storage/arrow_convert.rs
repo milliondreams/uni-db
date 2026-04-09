@@ -16,9 +16,10 @@ use arrow_array::builder::{
     UInt64Builder,
 };
 use arrow_array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, FixedSizeListArray, Float32Array,
-    Float64Array, Int32Array, Int64Array, IntervalMonthDayNanoArray, LargeBinaryArray, ListArray,
-    StringArray, StructArray, Time64NanosecondArray, TimestampNanosecondArray, UInt64Array,
+    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, FixedSizeBinaryArray,
+    FixedSizeListArray, Float32Array, Float64Array, Int32Array, Int64Array,
+    IntervalMonthDayNanoArray, LargeBinaryArray, ListArray, StringArray, StructArray,
+    Time64NanosecondArray, TimestampNanosecondArray, UInt64Array,
 };
 use arrow_schema::{DataType as ArrowDataType, Field};
 use std::collections::HashMap;
@@ -257,6 +258,24 @@ pub fn arrow_to_value(col: &dyn Array, row: usize, data_type: Option<&DataType>)
                         offset_seconds: 0,
                     });
                 }
+            }
+            DataType::Btic => {
+                let Some(fsb) = col.as_any().downcast_ref::<FixedSizeBinaryArray>() else {
+                    log::warn!("BTIC column is not FixedSizeBinaryArray");
+                    return Value::Null;
+                };
+                let bytes = fsb.value(row);
+                return match uni_btic::encode::decode_slice(bytes) {
+                    Ok(btic) => Value::Temporal(uni_common::TemporalValue::Btic {
+                        lo: btic.lo(),
+                        hi: btic.hi(),
+                        meta: btic.meta(),
+                    }),
+                    Err(e) => {
+                        log::warn!("BTIC decode error: {}", e);
+                        Value::Null
+                    }
+                };
             }
             _ => {}
         }
@@ -1040,6 +1059,7 @@ impl<'a> PropertyExtractor<'a> {
             DataType::Date => self.build_date32_column(len, deleted, get_props),
             DataType::Time => self.build_time_struct_column(len, deleted, get_props),
             DataType::Duration => self.build_duration_column(len, deleted, get_props),
+            DataType::Btic => self.build_btic_column(len, deleted, get_props),
             _ => Err(anyhow!(
                 "Unsupported data type for arrow conversion: {:?}",
                 self.data_type
@@ -1249,6 +1269,37 @@ impl<'a> PropertyExtractor<'a> {
                 });
                 let encoded = uni_common::cypher_value_codec::encode(&zero);
                 builder.append_value(&encoded);
+            } else {
+                builder.append_null();
+            }
+        }
+        Ok(Arc::new(builder.finish()))
+    }
+
+    fn build_btic_column<F>(&self, len: usize, deleted: &[bool], get_props: F) -> Result<ArrayRef>
+    where
+        F: Fn(usize) -> Option<&'a Value>,
+    {
+        const ENCODED_LEN: i32 = 24;
+        let mut builder = FixedSizeBinaryBuilder::with_capacity(len, ENCODED_LEN);
+        for (i, &is_deleted) in deleted.iter().enumerate().take(len) {
+            let raw_val = get_props(i);
+            let btic = match raw_val {
+                Some(Value::Temporal(uni_common::TemporalValue::Btic { lo, hi, meta })) => Some(
+                    uni_btic::Btic::new(*lo, *hi, *meta)
+                        .map_err(|e| anyhow!("invalid BTIC value: {}", e))?,
+                ),
+                Some(Value::String(s)) => Some(
+                    uni_btic::parse::parse_btic_literal(s)
+                        .map_err(|e| anyhow!("BTIC parse error for '{}': {}", s, e))?,
+                ),
+                _ => None,
+            };
+
+            if let Some(b) = btic {
+                builder.append_value(uni_btic::encode::encode(&b))?;
+            } else if is_deleted {
+                builder.append_value([0u8; ENCODED_LEN as usize])?;
             } else {
                 builder.append_null();
             }

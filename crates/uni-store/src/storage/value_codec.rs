@@ -371,9 +371,15 @@ pub fn decode_column_value(
     crdt_mode: CrdtDecodeMode,
 ) -> anyhow::Result<uni_common::Value> {
     match data_type {
-        DataType::DateTime | DataType::Timestamp | DataType::Date | DataType::Time => Ok(
-            super::arrow_convert::arrow_to_value(col, row, Some(data_type)),
-        ),
+        DataType::DateTime
+        | DataType::Timestamp
+        | DataType::Date
+        | DataType::Time
+        | DataType::Btic => Ok(super::arrow_convert::arrow_to_value(
+            col,
+            row,
+            Some(data_type),
+        )),
         _ => value_from_column(col, data_type, row, crdt_mode).map(uni_common::Value::from),
     }
 }

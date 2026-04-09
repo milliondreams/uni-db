@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 uni-common = { workspace = true }
+uni-btic = { workspace = true }
 uni-store = { workspace = true }
 uni-algo = { workspace = true }
 uni-xervo = { workspace = true }

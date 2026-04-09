@@ -1,0 +1,53 @@
+{
+  "edge_types": {
+    "EDGE": { "id": 1, "src_labels": [], "dst_labels": [] },
+    "CAUSE": { "id": 2, "src_labels": [], "dst_labels": [] },
+    "CHECK": { "id": 3, "src_labels": [], "dst_labels": [] },
+    "HAS_RISK": { "id": 4, "src_labels": [], "dst_labels": [] },
+    "IND": { "id": 5, "src_labels": [], "dst_labels": [] },
+    "SIG": { "id": 6, "src_labels": [], "dst_labels": [] },
+    "ADR": { "id": 7, "src_labels": [], "dst_labels": [] },
+    "SIGNAL": { "id": 8, "src_labels": [], "dst_labels": [] }
+  },
+  "indexes": [],
+  "labels": {
+    "Node": { "id": 1 },
+    "Risk": { "id": 2 },
+    "Drug": { "id": 3 },
+    "Disease": { "id": 4 },
+    "SE": { "id": 5 }
+  },
+  "properties": {
+    "Node": {
+      "name": { "type": "String", "nullable": true },
+      "score": { "type": "Float64", "nullable": true },
+      "risk": { "type": "Float64", "nullable": true }
+    },
+    "Risk": {
+      "score": { "type": "Float64", "nullable": true }
+    },
+    "Drug": {
+      "name": { "type": "String", "nullable": true }
+    },
+    "Disease": {
+      "name": { "type": "String", "nullable": true }
+    },
+    "SE": {
+      "name": { "type": "String", "nullable": true },
+      "sev": { "type": "Float64", "nullable": true }
+    },
+    "CAUSE": {
+      "prob": { "type": "Float64", "nullable": true }
+    },
+    "CHECK": {
+      "conf": { "type": "Float64", "nullable": true }
+    },
+    "ADR": {
+      "freq": { "type": "Float64", "nullable": true }
+    },
+    "SIGNAL": {
+      "strength": { "type": "Float64", "nullable": true }
+    }
+  },
+  "schema_version": 1
+}

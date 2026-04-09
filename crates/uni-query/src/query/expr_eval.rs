@@ -282,8 +282,8 @@ fn add_temporal_duration_to_value(val: &Value, dur: &CypherDuration) -> Result<V
                 TemporalType::Time => add_cypher_duration_to_time(s, dur)?,
                 TemporalType::LocalDateTime => add_cypher_duration_to_localdatetime(s, dur)?,
                 TemporalType::DateTime => add_cypher_duration_to_datetime(s, dur)?,
-                TemporalType::Duration => {
-                    return Err(anyhow!("Cannot add duration to duration this way"));
+                TemporalType::Duration | TemporalType::Btic => {
+                    return Err(anyhow!("Cannot add duration to {:?} this way", ttype));
                 }
             };
             Ok(Value::String(result_str))
@@ -304,7 +304,9 @@ fn add_temporal_duration_typed(tv: &TemporalValue, dur: &CypherDuration) -> Resu
         TemporalType::Time => add_cypher_duration_to_time(&s, dur)?,
         TemporalType::LocalDateTime => add_cypher_duration_to_localdatetime(&s, dur)?,
         TemporalType::DateTime => add_cypher_duration_to_datetime(&s, dur)?,
-        TemporalType::Duration => return Err(anyhow!("Cannot add duration to duration this way")),
+        TemporalType::Duration | TemporalType::Btic => {
+            return Err(anyhow!("Cannot add duration to {:?} this way", ttype));
+        }
     };
     // Re-parse through the datetime constructor to get a Value::Temporal
     let args = [Value::String(result_str)];
@@ -314,7 +316,7 @@ fn add_temporal_duration_typed(tv: &TemporalValue, dur: &CypherDuration) -> Resu
         TemporalType::Time => eval_datetime_function("TIME", &args),
         TemporalType::LocalDateTime => eval_datetime_function("LOCALDATETIME", &args),
         TemporalType::DateTime => eval_datetime_function("DATETIME", &args),
-        TemporalType::Duration => unreachable!(),
+        TemporalType::Duration | TemporalType::Btic => unreachable!(),
     }
 }
 
@@ -831,6 +833,7 @@ pub(crate) fn temporal_from_human_readable_str(s: &str) -> Option<TemporalValue>
         TemporalType::LocalDateTime => "LOCALDATETIME",
         TemporalType::DateTime => "DATETIME",
         TemporalType::Duration => "DURATION",
+        TemporalType::Btic => return None, // BTIC literals are parsed via property type context
     };
     match eval_datetime_function(fn_name, &[Value::String(s.to_string())]).ok()? {
         Value::Temporal(tv) => Some(tv),
@@ -994,6 +997,7 @@ fn temporal_string_cmp(l: &str, r: &str, ttype: TemporalType) -> Option<Ordering
             ldt.and_then(|l| rdt.map(|r| l.cmp(&r)))
         }
         TemporalType::Duration => None, // Durations are not orderable
+        TemporalType::Btic => None,     // BTIC comparison uses packed byte ordering
     }
 }
 
@@ -1814,6 +1818,9 @@ pub fn eval_scalar_function(
             eval_vector_similarity(&args[0], &args[1])
         }
 
+        // BTIC functions — dispatch via is_btic_function check
+        _ if is_btic_function(&name_upper) => eval_btic_function(&name_upper, args),
+
         _ => {
             // Fall back to custom function registry before reporting an error.
             if let Some(func) = custom_fns.and_then(|r| r.get(name)) {
@@ -2095,7 +2102,287 @@ pub fn is_scalar_function(name: &str) -> bool {
             | "ALL"
             | "NONE"
             | "SINGLE"
+    ) || is_btic_function(&name_upper)
+}
+
+/// Check if an uppercase function name is a known BTIC scalar function.
+pub fn is_btic_function(name_upper: &str) -> bool {
+    matches!(
+        name_upper,
+        "BTIC_LO"
+            | "BTIC_HI"
+            | "BTIC_DURATION"
+            | "BTIC_CONTAINS_POINT"
+            | "BTIC_OVERLAPS"
+            | "BTIC_IS_INSTANT"
+            | "BTIC_IS_UNBOUNDED"
+            | "BTIC_IS_FINITE"
+            | "BTIC_GRANULARITY"
+            | "BTIC_LO_GRANULARITY"
+            | "BTIC_HI_GRANULARITY"
+            | "BTIC_CERTAINTY"
+            | "BTIC_LO_CERTAINTY"
+            | "BTIC_HI_CERTAINTY"
+            | "BTIC_CONTAINS"
+            | "BTIC_BEFORE"
+            | "BTIC_AFTER"
+            | "BTIC_MEETS"
+            | "BTIC_ADJACENT"
+            | "BTIC_DISJOINT"
+            | "BTIC_EQUALS"
+            | "BTIC_STARTS"
+            | "BTIC_DURING"
+            | "BTIC_FINISHES"
+            | "BTIC_INTERSECTION"
+            | "BTIC_SPAN"
+            | "BTIC_GAP"
     )
+}
+
+/// Evaluate BTIC accessor and predicate functions.
+pub fn eval_btic_function(name: &str, args: &[Value]) -> Result<Value> {
+    match name {
+        "BTIC_LO" => {
+            let Some((lo, _, _)) = require_btic_1arg(name, args)? else {
+                return Ok(Value::Null);
+            };
+            if lo == i64::MIN {
+                return Ok(Value::Null);
+            }
+            Ok(ms_to_utc_datetime(lo))
+        }
+        "BTIC_HI" => {
+            let Some((_, hi, _)) = require_btic_1arg(name, args)? else {
+                return Ok(Value::Null);
+            };
+            if hi == i64::MAX {
+                return Ok(Value::Null);
+            }
+            Ok(ms_to_utc_datetime(hi))
+        }
+        "BTIC_DURATION" => {
+            let Some((lo, hi, _)) = require_btic_1arg(name, args)? else {
+                return Ok(Value::Null);
+            };
+            if lo == i64::MIN || hi == i64::MAX {
+                Ok(Value::Null)
+            } else {
+                Ok(Value::Int(hi - lo))
+            }
+        }
+        "BTIC_IS_INSTANT" => {
+            let Some((lo, hi, _)) = require_btic_1arg(name, args)? else {
+                return Ok(Value::Null);
+            };
+            Ok(Value::Bool(hi == lo + 1))
+        }
+        "BTIC_IS_UNBOUNDED" => {
+            let Some((lo, hi, _)) = require_btic_1arg(name, args)? else {
+                return Ok(Value::Null);
+            };
+            Ok(Value::Bool(lo == i64::MIN || hi == i64::MAX))
+        }
+        "BTIC_IS_FINITE" => {
+            let Some((lo, hi, _)) = require_btic_1arg(name, args)? else {
+                return Ok(Value::Null);
+            };
+            Ok(Value::Bool(lo != i64::MIN && hi != i64::MAX))
+        }
+        "BTIC_GRANULARITY" | "BTIC_LO_GRANULARITY" => {
+            let Some(btic) = require_btic_1arg_parsed(name, args)? else {
+                return Ok(Value::Null);
+            };
+            Ok(Value::String(btic.lo_granularity().name().to_string()))
+        }
+        "BTIC_HI_GRANULARITY" => {
+            let Some(btic) = require_btic_1arg_parsed(name, args)? else {
+                return Ok(Value::Null);
+            };
+            Ok(Value::String(btic.hi_granularity().name().to_string()))
+        }
+        "BTIC_CERTAINTY" | "BTIC_LO_CERTAINTY" => {
+            let Some(btic) = require_btic_1arg_parsed(name, args)? else {
+                return Ok(Value::Null);
+            };
+            if name == "BTIC_CERTAINTY" {
+                let lc = btic.lo_certainty();
+                let hc = btic.hi_certainty();
+                Ok(Value::String(lc.least_certain(hc).name().to_string()))
+            } else {
+                Ok(Value::String(btic.lo_certainty().name().to_string()))
+            }
+        }
+        "BTIC_HI_CERTAINTY" => {
+            let Some(btic) = require_btic_1arg_parsed(name, args)? else {
+                return Ok(Value::Null);
+            };
+            Ok(Value::String(btic.hi_certainty().name().to_string()))
+        }
+        "BTIC_CONTAINS_POINT" => {
+            if args.len() != 2 {
+                return Err(anyhow!("btic_contains_point requires 2 arguments"));
+            }
+            if args[0].is_null() || args[1].is_null() {
+                return Ok(Value::Null);
+            }
+            match &args[0] {
+                Value::Temporal(TemporalValue::Btic { lo, hi, .. }) => {
+                    let point_ms = extract_point_ms(&args[1])?;
+                    Ok(Value::Bool(*lo <= point_ms && point_ms < *hi))
+                }
+                _ => Err(anyhow!("btic_contains_point: first arg must be BTIC")),
+            }
+        }
+        // All 2-arg (Btic, Btic) -> Bool predicates
+        "BTIC_OVERLAPS" | "BTIC_CONTAINS" | "BTIC_BEFORE" | "BTIC_AFTER" | "BTIC_MEETS"
+        | "BTIC_ADJACENT" | "BTIC_DISJOINT" | "BTIC_EQUALS" | "BTIC_STARTS" | "BTIC_DURING"
+        | "BTIC_FINISHES" => eval_btic_binary_predicate(name, args),
+        // Set operations: (Btic, Btic) -> Btic or Null
+        "BTIC_INTERSECTION" => eval_btic_set_op(name, args, uni_btic::set_ops::intersection),
+        "BTIC_SPAN" => eval_btic_set_op(name, args, |a, b| Some(uni_btic::set_ops::span(a, b))),
+        "BTIC_GAP" => eval_btic_set_op(name, args, uni_btic::set_ops::gap),
+        _ => Err(anyhow!("unknown BTIC function: {}", name)),
+    }
+}
+
+/// Validate and extract raw BTIC fields (lo, hi, meta) from a 1-arg call.
+/// Returns `Ok(None)` when the argument is null (caller should return `Value::Null`).
+fn require_btic_1arg(name: &str, args: &[Value]) -> Result<Option<(i64, i64, u64)>> {
+    if args.len() != 1 {
+        return Err(anyhow!("{} requires 1 argument", name.to_lowercase()));
+    }
+    match &args[0] {
+        Value::Temporal(TemporalValue::Btic { lo, hi, meta }) => Ok(Some((*lo, *hi, *meta))),
+        Value::Null => Ok(None),
+        _ => Err(anyhow!("{}: expected BTIC value", name.to_lowercase())),
+    }
+}
+
+/// Validate and construct a parsed `Btic` from a 1-arg call.
+/// Returns `Ok(None)` when the argument is null (caller should return `Value::Null`).
+fn require_btic_1arg_parsed(name: &str, args: &[Value]) -> Result<Option<uni_btic::Btic>> {
+    let Some((lo, hi, meta)) = require_btic_1arg(name, args)? else {
+        return Ok(None);
+    };
+    uni_btic::Btic::new(lo, hi, meta)
+        .map(Some)
+        .map_err(|e| anyhow!("invalid BTIC: {}", e))
+}
+
+/// Convert milliseconds since epoch to a UTC DateTime value.
+fn ms_to_utc_datetime(ms: i64) -> Value {
+    Value::Temporal(TemporalValue::DateTime {
+        nanos_since_epoch: ms * 1_000_000,
+        offset_seconds: 0,
+        timezone_name: Some("UTC".to_string()),
+    })
+}
+
+/// Evaluate a 2-arg BTIC predicate that takes (Btic, Btic) -> Bool.
+fn eval_btic_binary_predicate(name: &str, args: &[Value]) -> Result<Value> {
+    if args.len() != 2 {
+        return Err(anyhow!("{} requires 2 arguments", name.to_lowercase()));
+    }
+    if args[0].is_null() || args[1].is_null() {
+        return Ok(Value::Null);
+    }
+    match (&args[0], &args[1]) {
+        (
+            Value::Temporal(TemporalValue::Btic {
+                lo: a_lo, hi: a_hi, ..
+            }),
+            Value::Temporal(TemporalValue::Btic {
+                lo: b_lo, hi: b_hi, ..
+            }),
+        ) => {
+            let result = match name {
+                "BTIC_OVERLAPS" => *a_lo < *b_hi && *b_lo < *a_hi,
+                "BTIC_CONTAINS" => *a_lo <= *b_lo && *b_hi <= *a_hi,
+                "BTIC_BEFORE" => *a_hi <= *b_lo,
+                "BTIC_AFTER" => *b_hi <= *a_lo,
+                "BTIC_MEETS" => *a_hi == *b_lo,
+                "BTIC_ADJACENT" => *a_hi == *b_lo || *b_hi == *a_lo,
+                "BTIC_DISJOINT" => *a_hi <= *b_lo || *b_hi <= *a_lo,
+                "BTIC_EQUALS" => *a_lo == *b_lo && *a_hi == *b_hi,
+                "BTIC_STARTS" => *a_lo == *b_lo && *a_hi < *b_hi,
+                "BTIC_DURING" => *b_lo < *a_lo && *a_hi < *b_hi,
+                "BTIC_FINISHES" => *a_hi == *b_hi && *b_lo < *a_lo,
+                _ => unreachable!(),
+            };
+            Ok(Value::Bool(result))
+        }
+        _ => Err(anyhow!(
+            "{}: both args must be BTIC values",
+            name.to_lowercase()
+        )),
+    }
+}
+
+/// Evaluate a 2-arg BTIC set operation: (Btic, Btic) -> Btic or Null.
+///
+/// The `op` closure receives two parsed `Btic` values and returns `Some(result)`
+/// for a valid result or `None` to produce `Value::Null`.
+fn eval_btic_set_op<F>(name: &str, args: &[Value], op: F) -> Result<Value>
+where
+    F: FnOnce(&uni_btic::Btic, &uni_btic::Btic) -> Option<uni_btic::Btic>,
+{
+    if args.len() != 2 {
+        return Err(anyhow!("{} requires 2 arguments", name.to_lowercase()));
+    }
+    if args[0].is_null() || args[1].is_null() {
+        return Ok(Value::Null);
+    }
+    match (&args[0], &args[1]) {
+        (
+            Value::Temporal(TemporalValue::Btic {
+                lo: a_lo,
+                hi: a_hi,
+                meta: a_meta,
+            }),
+            Value::Temporal(TemporalValue::Btic {
+                lo: b_lo,
+                hi: b_hi,
+                meta: b_meta,
+            }),
+        ) => {
+            let a = uni_btic::Btic::new(*a_lo, *a_hi, *a_meta)
+                .map_err(|e| anyhow!("invalid BTIC: {}", e))?;
+            let b = uni_btic::Btic::new(*b_lo, *b_hi, *b_meta)
+                .map_err(|e| anyhow!("invalid BTIC: {}", e))?;
+            match op(&a, &b) {
+                Some(r) => Ok(Value::Temporal(TemporalValue::Btic {
+                    lo: r.lo(),
+                    hi: r.hi(),
+                    meta: r.meta(),
+                })),
+                None => Ok(Value::Null),
+            }
+        }
+        _ => Err(anyhow!(
+            "{}: both args must be BTIC values",
+            name.to_lowercase()
+        )),
+    }
+}
+
+/// Extract a point in time as milliseconds since epoch from a Value.
+fn extract_point_ms(val: &Value) -> Result<i64> {
+    match val {
+        Value::Int(ms) => Ok(*ms),
+        Value::Temporal(TemporalValue::DateTime {
+            nanos_since_epoch, ..
+        }) => Ok(*nanos_since_epoch / 1_000_000),
+        Value::Temporal(TemporalValue::LocalDateTime {
+            nanos_since_epoch, ..
+        }) => Ok(*nanos_since_epoch / 1_000_000),
+        Value::Temporal(TemporalValue::Date { days_since_epoch }) => {
+            Ok(*days_since_epoch as i64 * 86_400_000)
+        }
+        _ => Err(anyhow!(
+            "expected a temporal point value (datetime, integer ms), got {:?}",
+            val
+        )),
+    }
 }
 
 /// Evaluate bitwise functions (uni_bitwise_*)

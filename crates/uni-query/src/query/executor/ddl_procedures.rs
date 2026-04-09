@@ -424,6 +424,7 @@ fn parse_data_type(s: &str) -> Result<DataType> {
         "BOOL" | "BOOLEAN" => Ok(DataType::Bool),
         "DATETIME" => Ok(DataType::DateTime),
         "DATE" => Ok(DataType::Date),
+        "BTIC" => Ok(DataType::Btic),
         "VECTOR" => Ok(DataType::Vector { dimensions: 0 }),
         _ => Err(UniError::InvalidArgument {
             arg: "type".into(),

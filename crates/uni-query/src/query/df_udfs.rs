@@ -26,8 +26,8 @@
 use arrow::array::ArrayRef;
 use arrow::datatypes::DataType;
 use arrow_array::{
-    Array, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array, LargeBinaryArray,
-    LargeStringArray, StringArray, UInt64Array,
+    Array, BooleanArray, FixedSizeBinaryArray, Float32Array, Float64Array, Int32Array, Int64Array,
+    LargeBinaryArray, LargeStringArray, StringArray, UInt64Array,
 };
 use chrono::Offset;
 use datafusion::error::Result as DFResult;
@@ -224,6 +224,15 @@ pub fn register_cypher_udfs(ctx: &SessionContext) -> DFResult<()> {
     // Cypher percentileDisc/percentileCont UDAFs
     ctx.register_udaf(create_cypher_percentile_disc_udaf());
     ctx.register_udaf(create_cypher_percentile_cont_udaf());
+
+    // BTIC scalar UDFs
+    register_btic_scalar_udfs(ctx)?;
+
+    // BTIC aggregation UDAFs
+    ctx.register_udaf(create_btic_min_udaf());
+    ctx.register_udaf(create_btic_max_udaf());
+    ctx.register_udaf(create_btic_span_agg_udaf());
+    ctx.register_udaf(create_btic_count_at_udaf());
 
     Ok(())
 }
@@ -2318,6 +2327,13 @@ fn value_to_columnar(val: &Value) -> DFResult<ColumnarValue> {
                         nanoseconds: *nanos,
                     },
                 )),
+                TemporalValue::Btic { lo, hi, meta } => {
+                    let btic = uni_btic::Btic::new(*lo, *hi, *meta).map_err(|e| {
+                        datafusion::error::DataFusionError::Execution(format!("invalid BTIC: {e}"))
+                    })?;
+                    let packed = uni_btic::encode::encode(&btic);
+                    ScalarValue::FixedSizeBinary(24, Some(packed.to_vec()))
+                }
             }
         }
         other => {
@@ -3235,7 +3251,488 @@ fn encode_temporal_payload(tv: &uni_common::TemporalValue, buf: &mut Vec<u8>) {
             buf.extend_from_slice(&encode_order_preserving_i64(*days));
             buf.extend_from_slice(&encode_order_preserving_i64(*nanos));
         }
+        uni_common::TemporalValue::Btic { lo, hi, meta } => {
+            buf.push(0x06); // variant rank: Btic
+            // BTIC has its own order-preserving encoding via sign-flip + big-endian
+            if let Ok(btic) = uni_btic::Btic::new(*lo, *hi, *meta) {
+                buf.extend_from_slice(&uni_btic::encode::encode(&btic));
+            } else {
+                buf.extend_from_slice(&encode_order_preserving_i64(*lo));
+                buf.extend_from_slice(&encode_order_preserving_i64(*hi));
+            }
+        }
     }
+}
+
+// ============================================================================
+// BTIC Scalar UDFs
+// ============================================================================
+
+/// A parameterized DataFusion scalar UDF for all BTIC functions.
+///
+/// Delegates to `eval_btic_function` from `expr_eval.rs` via `invoke_cypher_udf`,
+/// supporting both scalar and columnar execution paths.
+#[derive(Debug)]
+struct BticScalarUdf {
+    name: String,
+    signature: Signature,
+    return_type: DataType,
+}
+
+impl BticScalarUdf {
+    fn new(name: &str, num_args: usize, return_type: DataType) -> Self {
+        Self {
+            name: name.to_string(),
+            signature: Signature::new(TypeSignature::Any(num_args), Volatility::Immutable),
+            return_type,
+        }
+    }
+}
+
+impl_udf_eq_hash!(BticScalarUdf);
+
+impl ScalarUDFImpl for BticScalarUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+        Ok(self.return_type.clone())
+    }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let fname = self.name.to_uppercase();
+        let rt = self.return_type.clone();
+        invoke_cypher_udf(args, &rt, |val_args| {
+            crate::query::expr_eval::eval_btic_function(&fname, val_args)
+                .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))
+        })
+    }
+}
+
+/// Register all BTIC scalar UDFs with the session context.
+fn register_btic_scalar_udfs(ctx: &SessionContext) -> DFResult<()> {
+    // 1-arg accessors returning LargeBinary (temporal values encoded as CypherValue)
+    for name in &["btic_lo", "btic_hi"] {
+        ctx.register_udf(ScalarUDF::new_from_impl(BticScalarUdf::new(
+            name,
+            1,
+            DataType::LargeBinary,
+        )));
+    }
+    // 1-arg accessor returning Int64
+    ctx.register_udf(ScalarUDF::new_from_impl(BticScalarUdf::new(
+        "btic_duration",
+        1,
+        DataType::Int64,
+    )));
+    // 1-arg boolean accessors
+    for name in &["btic_is_instant", "btic_is_unbounded", "btic_is_finite"] {
+        ctx.register_udf(ScalarUDF::new_from_impl(BticScalarUdf::new(
+            name,
+            1,
+            DataType::Boolean,
+        )));
+    }
+    // 1-arg string accessors (granularity/certainty names)
+    for name in &[
+        "btic_granularity",
+        "btic_lo_granularity",
+        "btic_hi_granularity",
+        "btic_certainty",
+        "btic_lo_certainty",
+        "btic_hi_certainty",
+    ] {
+        ctx.register_udf(ScalarUDF::new_from_impl(BticScalarUdf::new(
+            name,
+            1,
+            DataType::Utf8,
+        )));
+    }
+    // 2-arg boolean predicates
+    for name in &[
+        "btic_contains_point",
+        "btic_overlaps",
+        "btic_contains",
+        "btic_before",
+        "btic_after",
+        "btic_meets",
+        "btic_adjacent",
+        "btic_disjoint",
+        "btic_equals",
+        "btic_starts",
+        "btic_during",
+        "btic_finishes",
+    ] {
+        ctx.register_udf(ScalarUDF::new_from_impl(BticScalarUdf::new(
+            name,
+            2,
+            DataType::Boolean,
+        )));
+    }
+    // 2-arg set operations returning LargeBinary (BTIC value as CypherValue)
+    for name in &["btic_intersection", "btic_span", "btic_gap"] {
+        ctx.register_udf(ScalarUDF::new_from_impl(BticScalarUdf::new(
+            name,
+            2,
+            DataType::LargeBinary,
+        )));
+    }
+    Ok(())
+}
+
+// ============================================================================
+// BTIC Aggregation UDAFs
+// ============================================================================
+
+/// UDAF for `btic_min` and `btic_max` — returns earliest/latest interval in total order.
+#[derive(Debug, Clone)]
+struct BticMinMaxUdaf {
+    name: String,
+    signature: Signature,
+    is_max: bool,
+}
+
+impl BticMinMaxUdaf {
+    fn new(is_max: bool) -> Self {
+        Self {
+            name: (if is_max { "btic_max" } else { "btic_min" }).to_string(),
+            signature: Signature::new(TypeSignature::Any(1), Volatility::Immutable),
+            is_max,
+        }
+    }
+}
+
+impl_udf_eq_hash!(BticMinMaxUdaf);
+
+impl AggregateUDFImpl for BticMinMaxUdaf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _args: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::LargeBinary)
+    }
+    fn accumulator(
+        &self,
+        _acc_args: datafusion::logical_expr::function::AccumulatorArgs,
+    ) -> DFResult<Box<dyn DfAccumulator>> {
+        Ok(Box::new(BticMinMaxAccumulator {
+            current: None,
+            is_max: self.is_max,
+        }))
+    }
+    fn state_fields(
+        &self,
+        args: datafusion::logical_expr::function::StateFieldsArgs,
+    ) -> DFResult<Vec<Arc<arrow::datatypes::Field>>> {
+        Ok(vec![Arc::new(arrow::datatypes::Field::new(
+            args.name,
+            DataType::LargeBinary,
+            true,
+        ))])
+    }
+}
+
+#[derive(Debug)]
+struct BticMinMaxAccumulator {
+    current: Option<uni_btic::Btic>,
+    is_max: bool,
+}
+
+impl DfAccumulator for BticMinMaxAccumulator {
+    fn update_batch(&mut self, values: &[ArrayRef]) -> DFResult<()> {
+        let arr = &values[0];
+        for i in 0..arr.len() {
+            if arr.is_null(i) {
+                continue;
+            }
+            let Some(btic) = decode_btic_from_array(arr, i)? else {
+                continue;
+            };
+            self.current = Some(match self.current.take() {
+                None => btic,
+                Some(cur) => {
+                    if (self.is_max && btic > cur) || (!self.is_max && btic < cur) {
+                        btic
+                    } else {
+                        cur
+                    }
+                }
+            });
+        }
+        Ok(())
+    }
+    fn evaluate(&mut self) -> DFResult<ScalarValue> {
+        Ok(btic_to_scalar_value(self.current.as_ref()))
+    }
+    fn size(&self) -> usize {
+        std::mem::size_of::<Self>()
+    }
+    fn state(&mut self) -> DFResult<Vec<ScalarValue>> {
+        Ok(vec![self.evaluate()?])
+    }
+    fn merge_batch(&mut self, states: &[ArrayRef]) -> DFResult<()> {
+        self.update_batch(states)
+    }
+}
+
+/// UDAF for `btic_span_agg` — bounding interval across all values.
+#[derive(Debug, Clone)]
+struct BticSpanAggUdaf {
+    signature: Signature,
+}
+
+impl BticSpanAggUdaf {
+    fn new() -> Self {
+        Self {
+            signature: Signature::new(TypeSignature::Any(1), Volatility::Immutable),
+        }
+    }
+}
+
+impl_udf_eq_hash!(BticSpanAggUdaf);
+
+impl AggregateUDFImpl for BticSpanAggUdaf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "btic_span_agg"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _args: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::LargeBinary)
+    }
+    fn accumulator(
+        &self,
+        _acc_args: datafusion::logical_expr::function::AccumulatorArgs,
+    ) -> DFResult<Box<dyn DfAccumulator>> {
+        Ok(Box::new(BticSpanAggAccumulator { current: None }))
+    }
+    fn state_fields(
+        &self,
+        args: datafusion::logical_expr::function::StateFieldsArgs,
+    ) -> DFResult<Vec<Arc<arrow::datatypes::Field>>> {
+        Ok(vec![Arc::new(arrow::datatypes::Field::new(
+            args.name,
+            DataType::LargeBinary,
+            true,
+        ))])
+    }
+}
+
+#[derive(Debug)]
+struct BticSpanAggAccumulator {
+    current: Option<uni_btic::Btic>,
+}
+
+impl DfAccumulator for BticSpanAggAccumulator {
+    fn update_batch(&mut self, values: &[ArrayRef]) -> DFResult<()> {
+        let arr = &values[0];
+        for i in 0..arr.len() {
+            if arr.is_null(i) {
+                continue;
+            }
+            let Some(btic) = decode_btic_from_array(arr, i)? else {
+                continue;
+            };
+            self.current = Some(match self.current.take() {
+                None => btic,
+                Some(cur) => uni_btic::set_ops::span(&cur, &btic),
+            });
+        }
+        Ok(())
+    }
+    fn evaluate(&mut self) -> DFResult<ScalarValue> {
+        Ok(btic_to_scalar_value(self.current.as_ref()))
+    }
+    fn size(&self) -> usize {
+        std::mem::size_of::<Self>()
+    }
+    fn state(&mut self) -> DFResult<Vec<ScalarValue>> {
+        Ok(vec![self.evaluate()?])
+    }
+    fn merge_batch(&mut self, states: &[ArrayRef]) -> DFResult<()> {
+        self.update_batch(states)
+    }
+}
+
+/// UDAF for `btic_count_at(collection, point)` — count intervals containing a point.
+#[derive(Debug, Clone)]
+struct BticCountAtUdaf {
+    signature: Signature,
+}
+
+impl BticCountAtUdaf {
+    fn new() -> Self {
+        Self {
+            signature: Signature::new(TypeSignature::Any(2), Volatility::Immutable),
+        }
+    }
+}
+
+impl_udf_eq_hash!(BticCountAtUdaf);
+
+impl AggregateUDFImpl for BticCountAtUdaf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "btic_count_at"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _args: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Int64)
+    }
+    fn accumulator(
+        &self,
+        _acc_args: datafusion::logical_expr::function::AccumulatorArgs,
+    ) -> DFResult<Box<dyn DfAccumulator>> {
+        Ok(Box::new(BticCountAtAccumulator { count: 0 }))
+    }
+    fn state_fields(
+        &self,
+        args: datafusion::logical_expr::function::StateFieldsArgs,
+    ) -> DFResult<Vec<Arc<arrow::datatypes::Field>>> {
+        Ok(vec![Arc::new(arrow::datatypes::Field::new(
+            args.name,
+            DataType::Int64,
+            true,
+        ))])
+    }
+}
+
+#[derive(Debug)]
+struct BticCountAtAccumulator {
+    count: i64,
+}
+
+impl DfAccumulator for BticCountAtAccumulator {
+    fn update_batch(&mut self, values: &[ArrayRef]) -> DFResult<()> {
+        if values.len() < 2 {
+            return Ok(());
+        }
+        let btic_arr = &values[0];
+        let point_arr = &values[1];
+
+        for i in 0..btic_arr.len() {
+            if btic_arr.is_null(i) || point_arr.is_null(i) {
+                continue;
+            }
+            let Some(btic) = decode_btic_from_array(btic_arr, i)? else {
+                continue;
+            };
+
+            // Extract point as ms from the second column
+            let point_ms = if let Some(int_arr) = point_arr.as_any().downcast_ref::<Int64Array>() {
+                int_arr.value(i)
+            } else if let Some(lb) = point_arr.as_any().downcast_ref::<LargeBinaryArray>() {
+                let val = scalar_binary_to_value(lb.value(i));
+                match &val {
+                    Value::Int(ms) => *ms,
+                    Value::Temporal(uni_common::TemporalValue::DateTime {
+                        nanos_since_epoch,
+                        ..
+                    }) => nanos_since_epoch / 1_000_000,
+                    _ => continue,
+                }
+            } else {
+                continue;
+            };
+
+            if uni_btic::predicates::contains_point(&btic, point_ms) {
+                self.count += 1;
+            }
+        }
+        Ok(())
+    }
+    fn evaluate(&mut self) -> DFResult<ScalarValue> {
+        Ok(ScalarValue::Int64(Some(self.count)))
+    }
+    fn size(&self) -> usize {
+        std::mem::size_of::<Self>()
+    }
+    fn state(&mut self) -> DFResult<Vec<ScalarValue>> {
+        Ok(vec![ScalarValue::Int64(Some(self.count))])
+    }
+    fn merge_batch(&mut self, states: &[ArrayRef]) -> DFResult<()> {
+        let arr = &states[0];
+        if let Some(int_arr) = arr.as_any().downcast_ref::<Int64Array>() {
+            for i in 0..int_arr.len() {
+                if !int_arr.is_null(i) {
+                    self.count += int_arr.value(i);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Encode an optional `Btic` as a `ScalarValue::LargeBinary` via CypherValue codec.
+fn btic_to_scalar_value(btic: Option<&uni_btic::Btic>) -> ScalarValue {
+    match btic {
+        None => ScalarValue::LargeBinary(None),
+        Some(b) => {
+            let val = Value::Temporal(uni_common::TemporalValue::Btic {
+                lo: b.lo(),
+                hi: b.hi(),
+                meta: b.meta(),
+            });
+            ScalarValue::LargeBinary(Some(uni_common::cypher_value_codec::encode(&val)))
+        }
+    }
+}
+
+/// Decode a BTIC value from an Arrow array at the given row.
+fn decode_btic_from_array(arr: &ArrayRef, row: usize) -> DFResult<Option<uni_btic::Btic>> {
+    // Try FixedSizeBinary(24) first (native BTIC storage)
+    if let Some(fsb) = arr.as_any().downcast_ref::<FixedSizeBinaryArray>() {
+        let bytes = fsb.value(row);
+        return uni_btic::encode::decode_slice(bytes)
+            .map(Some)
+            .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()));
+    }
+    // Try LargeBinary (CypherValue encoded)
+    if let Some(lb) = arr.as_any().downcast_ref::<LargeBinaryArray>() {
+        let val = scalar_binary_to_value(lb.value(row));
+        if let Value::Temporal(uni_common::TemporalValue::Btic { lo, hi, meta }) = val {
+            return uni_btic::Btic::new(lo, hi, meta)
+                .map(Some)
+                .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()));
+        }
+        return Ok(None);
+    }
+    Ok(None)
+}
+
+pub(crate) fn create_btic_min_udaf() -> AggregateUDF {
+    AggregateUDF::from(BticMinMaxUdaf::new(false))
+}
+
+pub(crate) fn create_btic_max_udaf() -> AggregateUDF {
+    AggregateUDF::from(BticMinMaxUdaf::new(true))
+}
+
+pub(crate) fn create_btic_span_agg_udaf() -> AggregateUDF {
+    AggregateUDF::from(BticSpanAggUdaf::new())
+}
+
+pub(crate) fn create_btic_count_at_udaf() -> AggregateUDF {
+    AggregateUDF::from(BticCountAtUdaf::new())
 }
 
 // ============================================================================

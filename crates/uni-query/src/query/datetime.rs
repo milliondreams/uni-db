@@ -4636,7 +4636,9 @@ fn parse_temporal_value_typed(val: &Value) -> Result<ParsedTemporal> {
                         named_tz: None,
                     })
                 }
-                TemporalType::Duration => Err(anyhow!("Cannot use duration as temporal argument")),
+                TemporalType::Duration | TemporalType::Btic => {
+                    Err(anyhow!("Cannot use {:?} as temporal argument", ttype))
+                }
             }
         }
         Value::Temporal(tv) => {
@@ -4718,9 +4720,10 @@ fn parse_temporal_value_typed(val: &Value) -> Result<ParsedTemporal> {
                         named_tz: iana_tz,
                     })
                 }
-                TemporalValue::Duration { .. } => {
-                    Err(anyhow!("Cannot use duration as temporal argument"))
-                }
+                TemporalValue::Duration { .. } | TemporalValue::Btic { .. } => Err(anyhow!(
+                    "Cannot use {:?} as temporal argument",
+                    tv.temporal_type()
+                )),
             }
         }
         _ => Err(anyhow!("Expected temporal value, got: {:?}", val)),

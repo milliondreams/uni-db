@@ -1,0 +1,73 @@
+{
+  "edge_types": {
+    "ADR": { "id": 1, "src_labels": [], "dst_labels": [] },
+    "IND": { "id": 2, "src_labels": [], "dst_labels": [] },
+    "SIG": { "id": 3, "src_labels": [], "dst_labels": [] },
+    "CAUSE": { "id": 4, "src_labels": [], "dst_labels": [] },
+    "RISK": { "id": 5, "src_labels": [], "dst_labels": [] },
+    "TRUST": { "id": 6, "src_labels": [], "dst_labels": [] },
+    "CHECK": { "id": 7, "src_labels": [], "dst_labels": [] }
+  },
+  "indexes": [],
+  "labels": {
+    "Drug": { "id": 1 },
+    "SE": { "id": 2 },
+    "Disease": { "id": 3 },
+    "Node": { "id": 4 },
+    "Account": { "id": 5 },
+    "Factor": { "id": 6 },
+    "Source": { "id": 7 },
+    "Doc": { "id": 8 },
+    "Category": { "id": 9 }
+  },
+  "properties": {
+    "Drug": {
+      "name": { "type": "String", "nullable": true }
+    },
+    "SE": {
+      "name": { "type": "String", "nullable": true },
+      "sev": { "type": "Float64", "nullable": true }
+    },
+    "Disease": {
+      "name": { "type": "String", "nullable": true }
+    },
+    "Node": {
+      "name": { "type": "String", "nullable": true }
+    },
+    "Account": {
+      "name": { "type": "String", "nullable": true }
+    },
+    "Factor": {
+      "type": { "type": "String", "nullable": true }
+    },
+    "Source": {
+      "type": { "type": "String", "nullable": true }
+    },
+    "Doc": {
+      "name": { "type": "String", "nullable": true },
+      "emb": { "type": "CypherValue", "nullable": true }
+    },
+    "Category": {
+      "type": { "type": "String", "nullable": true }
+    },
+    "ADR": {
+      "freq": { "type": "Float64", "nullable": true }
+    },
+    "SIG": {
+      "s": { "type": "Float64", "nullable": true }
+    },
+    "CAUSE": {
+      "prob": { "type": "Float64", "nullable": true }
+    },
+    "RISK": {
+      "prob": { "type": "Float64", "nullable": true }
+    },
+    "TRUST": {
+      "level": { "type": "Float64", "nullable": true }
+    },
+    "CHECK": {
+      "conf": { "type": "Float64", "nullable": true }
+    }
+  },
+  "schema_version": 1
+}

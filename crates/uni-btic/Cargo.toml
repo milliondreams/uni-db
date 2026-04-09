@@ -1,0 +1,16 @@
+[package]
+name = "uni-btic"
+description = "Binary Temporal Interval Codec for Uni graph database"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+chrono = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

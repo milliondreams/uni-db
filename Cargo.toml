@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/uni-common",
+    "crates/uni-btic",
     "crates/uni-store",
     "crates/uni-algo",
     "crates/uni-query",
@@ -16,6 +17,7 @@ members = [
 # Exclude uni-tck from default builds - run on-demand only
 default-members = [
     "crates/uni-common",
+    "crates/uni-btic",
     "crates/uni-store",
     "crates/uni-algo",
     "crates/uni-query",
@@ -49,6 +51,7 @@ uni-db = { path = "crates/uni", version = "1.0.1" }
 uni-crdt = { path = "crates/uni-crdt", version = "1.0.1" }
 uni-cypher = { path = "crates/uni-cypher", version = "1.0.1" }
 uni-locy = { path = "crates/uni-locy", version = "1.0.1" }
+uni-btic = { path = "crates/uni-btic", version = "1.0.1" }
 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

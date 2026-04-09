@@ -1,0 +1,43 @@
+{
+  "edge_types": {
+    "CAUSE": { "id": 1, "src_labels": [], "dst_labels": [] },
+    "CHECK": { "id": 2, "src_labels": [], "dst_labels": [] },
+    "SIGNAL": { "id": 3, "src_labels": [], "dst_labels": [] },
+    "ADR": { "id": 4, "src_labels": [], "dst_labels": [] }
+  },
+  "indexes": [],
+  "labels": {
+    "Node": { "id": 1 },
+    "Drug": { "id": 2 },
+    "Disease": { "id": 3 },
+    "SE": { "id": 4 }
+  },
+  "properties": {
+    "Node": {
+      "name": { "type": "String", "nullable": true }
+    },
+    "Drug": {
+      "name": { "type": "String", "nullable": true }
+    },
+    "Disease": {
+      "name": { "type": "String", "nullable": true }
+    },
+    "SE": {
+      "name": { "type": "String", "nullable": true },
+      "sev": { "type": "Float64", "nullable": true }
+    },
+    "CAUSE": {
+      "prob": { "type": "Float64", "nullable": true }
+    },
+    "CHECK": {
+      "conf": { "type": "Float64", "nullable": true }
+    },
+    "SIGNAL": {
+      "strength": { "type": "Float64", "nullable": true }
+    },
+    "ADR": {
+      "freq": { "type": "Float64", "nullable": true }
+    }
+  },
+  "schema_version": 1
+}

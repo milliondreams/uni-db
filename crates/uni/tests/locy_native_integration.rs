@@ -315,7 +315,7 @@ async fn test_native_error_max_iterations() -> Result<()> {
         .await?;
     tx.commit().await?;
 
-    let err = db
+    let result = db
         .session()
         .locy_with(
             "CREATE RULE reachable AS \
@@ -326,15 +326,11 @@ async fn test_native_error_max_iterations() -> Result<()> {
         )
         .with_config(tight_config(1))
         .run()
-        .await
-        .unwrap_err();
+        .await?;
 
-    let msg = err.to_string();
     assert!(
-        msg.to_lowercase().contains("iteration")
-            || msg.to_lowercase().contains("converge")
-            || msg.to_lowercase().contains("fixpoint"),
-        "expected convergence/iteration error, got: {msg}"
+        result.timed_out,
+        "expected timed_out=true when max_iterations=1 is exceeded"
     );
     Ok(())
 }
@@ -349,7 +345,7 @@ async fn test_native_error_timeout() -> Result<()> {
         .await?;
     tx.commit().await?;
 
-    let err = db
+    let result = db
         .session()
         .locy_with(
             "CREATE RULE reachable AS \
@@ -360,15 +356,11 @@ async fn test_native_error_timeout() -> Result<()> {
         )
         .with_config(timeout_config())
         .run()
-        .await
-        .unwrap_err();
+        .await?;
 
-    let msg = err.to_string();
     assert!(
-        msg.to_lowercase().contains("timeout")
-            || msg.to_lowercase().contains("timed out")
-            || msg.to_lowercase().contains("deadline"),
-        "expected timeout error, got: {msg}"
+        result.timed_out,
+        "expected timed_out=true for expired timeout"
     );
     Ok(())
 }

@@ -25,6 +25,10 @@ pub struct LocyResult {
     /// When present, contains the derived facts from a session-level DERIVE
     /// that have not yet been applied. Use `tx.apply(derived)` to materialize.
     pub derived_fact_set: Option<DerivedFactSet>,
+    /// True when the evaluation was cut short by a timeout. The `derived` map
+    /// contains whatever facts were accumulated before the timeout fired.
+    /// Partial results may not satisfy the fixpoint invariant.
+    pub timed_out: bool,
 }
 
 /// Result of executing a single Phase 4 command.
@@ -57,27 +61,30 @@ pub struct DerivationNode {
 }
 
 /// Result of an ABDUCE query.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct AbductionResult {
     pub modifications: Vec<ValidatedModification>,
 }
 
 /// A modification with validation status and cost.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ValidatedModification {
     pub modification: Modification,
+    /// Whether this modification satisfies the ABDUCE goal when applied via savepoint.
     pub validated: bool,
+    /// Cost metric for ranking modifications: RemoveEdge=1.0, ChangeProperty=0.5, AddEdge=1.5.
     pub cost: f64,
 }
 
 /// A proposed graph modification from ABDUCE.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub enum Modification {
     RemoveEdge {
         source_var: String,
         target_var: String,
         edge_var: String,
         edge_type: String,
+        /// Property constraints used to identify the specific edge to remove.
         match_properties: HashMap<String, Value>,
     },
     ChangeProperty {
@@ -210,5 +217,58 @@ impl CommandResult {
             CommandResult::Abduce(result) => Some(result),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn abduce_result_serializes_to_json() {
+        let result = AbductionResult {
+            modifications: vec![
+                ValidatedModification {
+                    modification: Modification::ChangeProperty {
+                        element_var: "a".into(),
+                        property: "flagged".into(),
+                        old_value: Box::new(Value::String("false".into())),
+                        new_value: Box::new(Value::String("true".into())),
+                    },
+                    validated: true,
+                    cost: 0.5,
+                },
+                ValidatedModification {
+                    modification: Modification::RemoveEdge {
+                        source_var: "a".into(),
+                        target_var: "b".into(),
+                        edge_var: "e".into(),
+                        edge_type: "TRANSFERS_TO".into(),
+                        match_properties: HashMap::from([("amount".into(), Value::Float(1000.0))]),
+                    },
+                    validated: false,
+                    cost: 1.0,
+                },
+                ValidatedModification {
+                    modification: Modification::AddEdge {
+                        source_var: "a".into(),
+                        target_var: "b".into(),
+                        edge_type: "FLAGGED_BY".into(),
+                        properties: HashMap::new(),
+                    },
+                    validated: true,
+                    cost: 1.5,
+                },
+            ],
+        };
+
+        let json = serde_json::to_value(&result).expect("serialization failed");
+        let mods = json["modifications"].as_array().unwrap();
+        assert_eq!(mods.len(), 3);
+        assert_eq!(mods[0]["validated"], true);
+        assert_eq!(mods[0]["cost"], 0.5);
+        assert!(mods[0]["modification"]["ChangeProperty"].is_object());
+        assert!(mods[1]["modification"]["RemoveEdge"].is_object());
+        assert!(mods[2]["modification"]["AddEdge"].is_object());
     }
 }

@@ -1064,6 +1064,7 @@ async fn run_fixpoint_loop(
     warnings_slot: Arc<StdRwLock<Vec<RuntimeWarning>>>,
     approximate_slot: Arc<StdRwLock<HashMap<String, Vec<String>>>>,
     top_k_proofs: usize,
+    timeout_flag: Arc<std::sync::atomic::AtomicBool>,
 ) -> DFResult<Vec<RecordBatch>> {
     let start = Instant::now();
     let task_ctx = session_ctx.read().task_ctx();
@@ -1225,12 +1226,12 @@ async fn run_fixpoint_loop(
 
         // Check timeout
         if start.elapsed() > timeout {
-            return Err(datafusion::error::DataFusionError::Execution(
-                LocyRuntimeError::NonConvergence {
-                    iterations: iteration + 1,
-                }
-                .to_string(),
-            ));
+            tracing::warn!(
+                "fixpoint timeout after {} iterations; returning partial results",
+                iteration + 1,
+            );
+            timeout_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            break;
         }
     }
 
@@ -1241,14 +1242,13 @@ async fn run_fixpoint_loop(
         }
     }
 
-    // If we exhausted all iterations without converging, return a non-convergence error.
-    if !converged {
-        return Err(datafusion::error::DataFusionError::Execution(
-            LocyRuntimeError::NonConvergence {
-                iterations: max_iterations,
-            }
-            .to_string(),
-        ));
+    // If we exhausted all iterations without converging, set timeout flag
+    // and proceed with partial results rather than discarding all work.
+    if !converged && !timeout_flag.load(std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            "fixpoint did not converge after {max_iterations} iterations; returning partial results",
+        );
+        timeout_flag.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     // Post-fixpoint processing per rule and collect output
@@ -2857,7 +2857,20 @@ pub(crate) async fn apply_post_fixpoint_chain(
         .find(|b| b.num_rows() > 0)
         .map(|b| b.schema())
         .unwrap_or_else(|| Arc::clone(&rule.yield_schema));
-    let input: Arc<dyn ExecutionPlan> = Arc::new(InMemoryExec::new(facts, schema));
+    let input: Arc<dyn ExecutionPlan> = Arc::new(InMemoryExec::new(facts, schema.clone()));
+
+    // Reconcile key indices: rule's indices are yield-schema positions but
+    // the actual batch may have different column ordering after schema
+    // reconciliation during fixpoint iteration (same pattern as
+    // FixpointState::reconcile_schema).
+    let key_column_indices: Vec<usize> = rule
+        .key_column_indices
+        .iter()
+        .filter_map(|&i| {
+            let name = rule.yield_schema.field(i).name();
+            schema.index_of(name).ok()
+        })
+        .collect();
 
     // Apply PRIORITY first — keeps only rows with max __priority per KEY group,
     // then strips the __priority column from output.
@@ -2871,7 +2884,7 @@ pub(crate) async fn apply_post_fixpoint_chain(
         })?;
         Arc::new(PriorityExec::new(
             input,
-            rule.key_column_indices.clone(),
+            key_column_indices.clone(),
             priority_idx,
         ))
     } else {
@@ -2882,7 +2895,7 @@ pub(crate) async fn apply_post_fixpoint_chain(
     let current: Arc<dyn ExecutionPlan> = if rule.has_fold && !rule.fold_bindings.is_empty() {
         Arc::new(FoldExec::new(
             current,
-            rule.key_column_indices.clone(),
+            key_column_indices.clone(),
             rule.fold_bindings.clone(),
             strict_probability_domain,
             probability_epsilon,
@@ -2907,7 +2920,7 @@ pub(crate) async fn apply_post_fixpoint_chain(
     let current: Arc<dyn ExecutionPlan> = if rule.has_best_by && !rule.best_by_criteria.is_empty() {
         Arc::new(BestByExec::new(
             current,
-            rule.key_column_indices.clone(),
+            key_column_indices.clone(),
             rule.best_by_criteria.clone(),
             rule.deterministic,
         ))
@@ -2954,6 +2967,8 @@ pub struct FixpointExec {
     approximate_slot: Arc<StdRwLock<HashMap<String, Vec<String>>>>,
     /// When > 0, retain at most this many proofs per fact (top-k provenance).
     top_k_proofs: usize,
+    /// Shared flag: set to true on timeout to signal partial results.
+    timeout_flag: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl fmt::Debug for FixpointExec {
@@ -2995,6 +3010,7 @@ impl FixpointExec {
         warnings_slot: Arc<StdRwLock<Vec<RuntimeWarning>>>,
         approximate_slot: Arc<StdRwLock<HashMap<String, Vec<String>>>>,
         top_k_proofs: usize,
+        timeout_flag: Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         let properties = compute_plan_properties(Arc::clone(&output_schema));
         Self {
@@ -3020,6 +3036,7 @@ impl FixpointExec {
             warnings_slot,
             approximate_slot,
             top_k_proofs,
+            timeout_flag,
         }
     }
 
@@ -3140,6 +3157,7 @@ impl ExecutionPlan for FixpointExec {
         let warnings_slot = Arc::clone(&self.warnings_slot);
         let approximate_slot = Arc::clone(&self.approximate_slot);
         let top_k_proofs = self.top_k_proofs;
+        let timeout_flag = Arc::clone(&self.timeout_flag);
 
         let fut = async move {
             run_fixpoint_loop(
@@ -3163,6 +3181,7 @@ impl ExecutionPlan for FixpointExec {
                 warnings_slot,
                 approximate_slot,
                 top_k_proofs,
+                timeout_flag,
             )
             .await
         };

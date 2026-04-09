@@ -389,6 +389,7 @@ impl<'a> LocyEngine<'a> {
             warnings_slot,
             approximate_slot,
             command_results_slot,
+            timeout_flag,
         ) = if let Some(program_exec) = exec_plan
             .as_any()
             .downcast_ref::<uni_query::query::df_graph::LocyProgramExec>(
@@ -403,6 +404,7 @@ impl<'a> LocyEngine<'a> {
                 program_exec.warnings_slot(),
                 program_exec.approximate_slot(),
                 program_exec.command_results_slot(),
+                program_exec.timeout_flag(),
             )
         } else {
             (
@@ -412,6 +414,7 @@ impl<'a> LocyEngine<'a> {
                 Arc::new(std::sync::RwLock::new(Vec::new())),
                 Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
                 Arc::new(std::sync::RwLock::new(Vec::new())),
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
             )
         };
 
@@ -483,28 +486,33 @@ impl<'a> LocyEngine<'a> {
 
         let mut command_results = Vec::new();
         let mut collected_derives: Vec<CollectedDeriveOutput> = Vec::new();
-        for (cmd_idx, cmd) in compiled.commands.iter().enumerate() {
-            if let Some(result) = inline_map.get(&cmd_idx) {
-                // Already executed inline by run_program
-                command_results.push(result.clone());
-                continue;
+        let timed_out_early = timeout_flag.load(std::sync::atomic::Ordering::Relaxed);
+        // Skip command dispatch when evaluation timed out — the partial derived
+        // store may be incomplete and SLG/QUERY would hit the expired timeout.
+        if !timed_out_early {
+            for (cmd_idx, cmd) in compiled.commands.iter().enumerate() {
+                if let Some(result) = inline_map.get(&cmd_idx) {
+                    // Already executed inline by run_program
+                    command_results.push(result.clone());
+                    continue;
+                }
+                let result = dispatch_native_command(
+                    cmd,
+                    &compiled,
+                    &native_ctx,
+                    config,
+                    &mut orch_store,
+                    &mut locy_stats,
+                    tracker.clone(),
+                    start,
+                    &approx_for_explain,
+                    self.collect_derive,
+                    &mut collected_derives,
+                )
+                .await
+                .map_err(map_runtime_error)?;
+                command_results.push(result);
             }
-            let result = dispatch_native_command(
-                cmd,
-                &compiled,
-                &native_ctx,
-                config,
-                &mut orch_store,
-                &mut locy_stats,
-                tracker.clone(),
-                start,
-                &approx_for_explain,
-                self.collect_derive,
-                &mut collected_derives,
-            )
-            .await
-            .map_err(map_runtime_error)?;
-            command_results.push(result);
         }
 
         let evaluation_time = start.elapsed();
@@ -571,6 +579,7 @@ impl<'a> LocyEngine<'a> {
 
         // 11. Build final LocyResult
         let warnings = warnings_slot.read().map(|w| w.clone()).unwrap_or_default();
+        let timed_out = timeout_flag.load(std::sync::atomic::Ordering::Relaxed);
         Ok(build_locy_result(
             enriched_derived,
             command_results,
@@ -580,6 +589,7 @@ impl<'a> LocyEngine<'a> {
             warnings,
             approximate_groups,
             derived_fact_set,
+            timed_out,
         ))
     }
 
@@ -727,7 +737,7 @@ impl<'a> NativeExecutionAdapter<'a> {
     }
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl DerivedFactSource for NativeExecutionAdapter<'_> {
     fn lookup_derived(&self, rule_name: &str) -> std::result::Result<Vec<FactRow>, LocyError> {
         let batches = self
@@ -817,7 +827,7 @@ impl DerivedFactSource for NativeExecutionAdapter<'_> {
     }
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl LocyExecutionContext for NativeExecutionAdapter<'_> {
     async fn lookup_derived_enriched(
         &self,
@@ -1112,7 +1122,9 @@ fn dispatch_native_command<'a>(
     collect_derive: bool,
     collected_derives: &'a mut Vec<CollectedDeriveOutput>,
 ) -> std::pin::Pin<
-    Box<dyn std::future::Future<Output = std::result::Result<CommandResult, LocyError>> + 'a>,
+    Box<
+        dyn std::future::Future<Output = std::result::Result<CommandResult, LocyError>> + Send + 'a,
+    >,
 > {
     Box::pin(async move {
         match cmd {
@@ -1312,6 +1324,7 @@ fn build_locy_result(
     warnings: Vec<RuntimeWarning>,
     approximate_groups: HashMap<String, Vec<String>>,
     derived_fact_set: Option<DerivedFactSet>,
+    timed_out: bool,
 ) -> LocyResult {
     let total_facts: usize = derived.values().map(|v| v.len()).sum();
     orchestrator_stats.strata_evaluated = compiled.strata.len();
@@ -1325,6 +1338,7 @@ fn build_locy_result(
         warnings,
         approximate_groups,
         derived_fact_set,
+        timed_out,
     };
     let metrics = QueryMetrics {
         total_time: evaluation_time,

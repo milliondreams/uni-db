@@ -2264,7 +2264,7 @@ pub struct QueryPlanner {
     /// Cache of parsed generation expressions, keyed by (label_name, gen_col_name).
     gen_expr_cache: HashMap<(String, String), Expr>,
     /// Counter for generating unique anonymous variable names.
-    anon_counter: std::cell::Cell<usize>,
+    anon_counter: std::sync::atomic::AtomicUsize,
     /// Optional query parameters for resolving $param in SKIP/LIMIT.
     params: HashMap<String, uni_common::Value>,
 }
@@ -2299,7 +2299,7 @@ impl QueryPlanner {
         Self {
             schema,
             gen_expr_cache,
-            anon_counter: std::cell::Cell::new(0),
+            anon_counter: std::sync::atomic::AtomicUsize::new(0),
             params: HashMap::new(),
         }
     }
@@ -2383,8 +2383,9 @@ impl QueryPlanner {
     }
 
     fn next_anon_var(&self) -> String {
-        let id = self.anon_counter.get();
-        self.anon_counter.set(id + 1);
+        let id = self
+            .anon_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         format!("_anon_{}", id)
     }
 

@@ -23,7 +23,7 @@ use super::locy_delta::RowStore;
 ///
 /// Replaces `CypherExecutor` for read operations in the native command dispatch path.
 /// `lookup_derived` converts RecordBatch-based native facts to `FactRow` format internally.
-#[async_trait(?Send)]
+#[async_trait]
 pub trait DerivedFactSource: Send + Sync {
     /// Look up all facts for a rule. Returns `FactRow`-based results.
     fn lookup_derived(&self, rule_name: &str) -> Result<Vec<FactRow>, LocyError>;
@@ -55,7 +55,7 @@ pub trait DerivedFactSource: Send + Sync {
 /// DB operations needed by ASSUME, DERIVE, and ABDUCE.
 ///
 /// Extends `DerivedFactSource` with write operations.
-#[async_trait(?Send)]
+#[async_trait]
 pub trait LocyExecutionContext: DerivedFactSource {
     /// Look up facts enriched with full node objects (for VID-based stores).
     ///

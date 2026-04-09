@@ -387,24 +387,69 @@ impl<'a> LocyPlanBuilder<'a> {
         // Collect fold bindings from the first clause that has them.
         // A rule may have a base clause (no FOLD) plus recursive clauses (with FOLD);
         // we need the FOLD metadata from whichever clause provides it.
-        let fold_bindings: Vec<(String, Expr)> = rule
+        //
+        // Each entry is (fold_name, yield_alias, aggregate_expr). The yield_alias
+        // is the output column name from the YIELD clause (may differ from fold_name
+        // when the user writes e.g. `YIELD ... n AS support`).
+        let fold_bindings: Vec<(String, String, Expr)> = rule
             .clauses
             .iter()
             .find(|c| !c.fold.is_empty())
             .map(|c| {
+                // Build fold_name → yield alias mapping from the YIELD items.
+                let yield_alias_map: HashMap<&str, &str> = match &c.output {
+                    RuleOutput::Yield(yc) => yc
+                        .items
+                        .iter()
+                        .filter_map(|item| {
+                            if let Expr::Variable(ref v) = item.expr {
+                                item.alias.as_deref().map(|alias| (v.as_str(), alias))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect(),
+                    _ => HashMap::new(),
+                };
                 c.fold
                     .iter()
-                    .map(|fb| (fb.name.clone(), fb.aggregate.clone()))
+                    .map(|fb| {
+                        let alias = yield_alias_map
+                            .get(fb.name.as_str())
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| fb.name.clone());
+                        (fb.name.clone(), alias, fb.aggregate.clone())
+                    })
                     .collect()
             })
             .unwrap_or_default();
-        let having = first_clause.map(|c| c.having.clone()).unwrap_or_default();
+        // Build fold_name → yield_alias substitution map for HAVING / BEST BY
+        // expressions that reference FOLD outputs by their original name.
+        let fold_alias_subs: HashMap<String, String> = fold_bindings
+            .iter()
+            .filter(|(name, alias, _)| name != alias)
+            .map(|(name, alias, _)| (name.clone(), alias.clone()))
+            .collect();
+
+        let having = first_clause
+            .map(|c| {
+                c.having
+                    .iter()
+                    .map(|expr| substitute_fold_aliases(expr.clone(), &fold_alias_subs))
+                    .collect()
+            })
+            .unwrap_or_default();
         let best_by_criteria = first_clause
             .and_then(|c| c.best_by.as_ref())
             .map(|bb| {
                 bb.items
                     .iter()
-                    .map(|item| (item.expr.clone(), item.ascending))
+                    .map(|item| {
+                        (
+                            substitute_fold_aliases(item.expr.clone(), &fold_alias_subs),
+                            item.ascending,
+                        )
+                    })
                     .collect()
             })
             .unwrap_or_default();
@@ -776,7 +821,14 @@ impl<'a> LocyPlanBuilder<'a> {
                 continue;
             } else if let Some(orig_expr) = yield_expr_map.get(&yc.name) {
                 let e = (*orig_expr).clone();
-                substitute_along_vars(e, &rewritten_along)
+                let e = substitute_along_vars(e, &rewritten_along);
+                // If the resolved expression is a FOLD output variable (e.g.
+                // `n AS support` where n is from FOLD), skip it — FoldExec
+                // will produce this column after fixpoint iteration.
+                if matches!(&e, Expr::Variable(v) if fold_output_names.contains(v.as_str())) {
+                    continue;
+                }
+                e
             } else {
                 let e = Expr::Variable(yc.name.clone());
                 substitute_along_vars(e, &rewritten_along)
@@ -1083,6 +1135,46 @@ fn substitute_along_vars(expr: Expr, along: &HashMap<&str, Expr>) -> Expr {
             args: args
                 .into_iter()
                 .map(|a| substitute_along_vars(a, along))
+                .collect(),
+            distinct,
+            window_spec,
+        },
+        other => other,
+    }
+}
+
+/// Replace FOLD output variable names with their yield aliases.
+///
+/// When a FOLD binding is aliased (e.g. `FOLD n = COUNT(*)` with `YIELD ... n AS support`),
+/// HAVING and BEST BY expressions reference "n" but after FoldExec the column is named
+/// "support". This function rewrites Variable("n") → Variable("support").
+fn substitute_fold_aliases(expr: Expr, aliases: &HashMap<String, String>) -> Expr {
+    if aliases.is_empty() {
+        return expr;
+    }
+    match expr {
+        Expr::Variable(ref name) if aliases.contains_key(name) => {
+            Expr::Variable(aliases[name].clone())
+        }
+        Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
+            left: Box::new(substitute_fold_aliases(*left, aliases)),
+            op,
+            right: Box::new(substitute_fold_aliases(*right, aliases)),
+        },
+        Expr::UnaryOp { op, expr: inner } => Expr::UnaryOp {
+            op,
+            expr: Box::new(substitute_fold_aliases(*inner, aliases)),
+        },
+        Expr::FunctionCall {
+            name,
+            args,
+            distinct,
+            window_spec,
+        } => Expr::FunctionCall {
+            name,
+            args: args
+                .into_iter()
+                .map(|a| substitute_fold_aliases(a, aliases))
                 .collect(),
             distinct,
             window_spec,

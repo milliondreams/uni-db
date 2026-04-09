@@ -86,8 +86,9 @@ impl<'a> SLGResolver<'a> {
         &'s mut self,
         rule_name: &'s str,
         goal_bindings: &'s HashMap<String, Value>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<FactRow>, LocyError>> + 's>>
-    {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<FactRow>, LocyError>> + Send + 's>,
+    > {
         Box::pin(async move {
             let elapsed = self.start.elapsed();
             if elapsed > self.config.timeout {

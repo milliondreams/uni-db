@@ -104,7 +104,9 @@ fn dispatch_body_command<'a>(
     derived_store: &'a mut RowStore,
     stats: &'a mut LocyStats,
     start: Instant,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<CommandResult, LocyError>> + 'a>> {
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<CommandResult, LocyError>> + Send + 'a>,
+> {
     Box::pin(async move {
         match cmd {
             CompiledCommand::GoalQuery(gq) => {

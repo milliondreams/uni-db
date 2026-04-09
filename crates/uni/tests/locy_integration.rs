@@ -224,7 +224,7 @@ async fn test_runtime_error_max_iterations() -> Result<()> {
         ..Default::default()
     };
 
-    let err = db
+    let result = db
         .session()
         .locy_with(
             "CREATE RULE reachable AS \
@@ -235,15 +235,12 @@ async fn test_runtime_error_max_iterations() -> Result<()> {
         )
         .with_config(config)
         .run()
-        .await
-        .unwrap_err();
+        .await?;
 
-    let msg = err.to_string();
     assert!(
-        msg.contains("LocyRuntimeError"),
-        "expected LocyRuntimeError, got: {msg}"
+        result.timed_out,
+        "expected timed_out=true when max_iterations=1 is exceeded"
     );
-    assert!(matches!(err, uni_db::UniError::Query { .. }));
     Ok(())
 }
 

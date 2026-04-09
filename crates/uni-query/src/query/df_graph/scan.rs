@@ -2863,6 +2863,11 @@ fn temporal_to_struct_map(tv: &uni_common::value::TemporalValue) -> HashMap<Stri
             m.insert("days".into(), Value::Int(*days));
             m.insert("nanos".into(), Value::Int(*nanos));
         }
+        TemporalValue::Btic { lo, hi, meta } => {
+            m.insert("lo".into(), Value::Int(*lo));
+            m.insert("hi".into(), Value::Int(*hi));
+            m.insert("meta".into(), Value::Int(*meta as i64));
+        }
     }
     m
 }

@@ -3072,6 +3072,9 @@ impl Executor {
                 days,
                 nanos,
             } => format!("duration:{months}:{days}:{nanos}"),
+            uni_common::TemporalValue::Btic { lo, hi, meta } => {
+                format!("btic:{lo}:{hi}:{meta}")
+            }
         }
     }
 
@@ -3083,6 +3086,7 @@ impl Executor {
             uni_common::TemporalType::LocalDateTime => "LOCALDATETIME",
             uni_common::TemporalType::DateTime => "DATETIME",
             uni_common::TemporalType::Duration => "DURATION",
+            uni_common::TemporalType::Btic => return None, // BTIC uses dedicated parsing
         };
         match eval_datetime_function(fn_name, &[Value::String(s.to_string())]).ok()? {
             Value::Temporal(tv) => Some(Self::canonical_temporal_key(&tv)),

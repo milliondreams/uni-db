@@ -993,6 +993,7 @@ impl Executor {
             "time" => Ok(DataType::Time),
             "datetime" => Ok(DataType::DateTime),
             "duration" => Ok(DataType::Duration),
+            "btic" => Ok(DataType::Btic),
             "json" | "jsonb" => Ok(DataType::CypherValue),
             "point" => Ok(DataType::Point(PointType::Cartesian2D)),
             "point3d" => Ok(DataType::Point(PointType::Cartesian3D)),

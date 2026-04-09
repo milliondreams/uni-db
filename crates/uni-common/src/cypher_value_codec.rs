@@ -36,6 +36,9 @@
 //! | 14 | Duration | msgpack {months, days, nanos} |
 //! | 15 | Point | msgpack {srid, coords} |
 //! | 16 | Vector | msgpack array of f32 |
+//! | 17 | LocalTime | msgpack i64 (nanoseconds since midnight) |
+//! | 18 | LocalDateTime | msgpack i64 (nanoseconds since epoch) |
+//! | 19 | Btic | 24-byte packed BTIC (lo, hi, meta) |
 //!
 //! Nested values (List elements, Map values, Node/Edge properties) are
 //! recursively encoded as `[tag][payload]` blobs.
@@ -66,6 +69,7 @@ pub const TAG_DURATION: u8 = 14;
 pub const TAG_VECTOR: u8 = 16;
 pub const TAG_LOCALTIME: u8 = 17;
 pub const TAG_LOCALDATETIME: u8 = 18;
+pub const TAG_BTIC: u8 = 19;
 
 // ---------------------------------------------------------------------------
 // Public encode/decode API
@@ -283,6 +287,17 @@ pub fn decode(bytes: &[u8]) -> Result<Value, UniError> {
                 months: dp.months,
                 days: dp.days,
                 nanos: dp.nanos,
+            }))
+        }
+        TAG_BTIC => {
+            let btic = uni_btic::encode::decode_slice(payload).map_err(|e| UniError::Storage {
+                message: format!("failed to decode BTIC: {}", e),
+                source: None,
+            })?;
+            Ok(Value::Temporal(crate::value::TemporalValue::Btic {
+                lo: btic.lo(),
+                hi: btic.hi(),
+                meta: btic.meta(),
             }))
         }
         _ => Err(UniError::Storage {
@@ -548,6 +563,11 @@ fn encode_to_buf(value: &Value, buf: &mut Vec<u8>) {
                     nanos: *nanos,
                 };
                 rmp_serde::encode::write(buf, &payload).expect("duration encode failed");
+            }
+            crate::value::TemporalValue::Btic { lo, hi, meta } => {
+                buf.push(TAG_BTIC);
+                let btic = uni_btic::Btic::new(*lo, *hi, *meta).expect("invalid BTIC value");
+                buf.extend_from_slice(&uni_btic::encode::encode(&btic));
             }
         },
     }
@@ -843,5 +863,60 @@ mod tests {
         // Decode preserves distinction
         assert_eq!(decode(&int_bytes).unwrap(), Value::Int(42));
         assert_eq!(decode(&float_bytes).unwrap(), Value::Float(42.0));
+    }
+
+    #[test]
+    fn test_round_trip_btic_epoch_instant() {
+        let v = Value::Temporal(crate::value::TemporalValue::Btic {
+            lo: 0,
+            hi: 1,
+            meta: 0x0000_0000_0000_0000,
+        });
+        let bytes = encode(&v);
+        assert_eq!(bytes[0], TAG_BTIC);
+        assert_eq!(bytes.len(), 25); // 1 tag + 24 packed
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(decoded, v);
+    }
+
+    #[test]
+    fn test_round_trip_btic_year_1985() {
+        let meta = 0x7700_0000_0000_0000u64; // year/year, definite/definite
+        let v = Value::Temporal(crate::value::TemporalValue::Btic {
+            lo: 473_385_600_000,
+            hi: 504_921_600_000,
+            meta,
+        });
+        let bytes = encode(&v);
+        assert_eq!(bytes[0], TAG_BTIC);
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(decoded, v);
+    }
+
+    #[test]
+    fn test_round_trip_btic_unbounded() {
+        let v = Value::Temporal(crate::value::TemporalValue::Btic {
+            lo: i64::MIN,
+            hi: i64::MAX,
+            meta: 0,
+        });
+        let bytes = encode(&v);
+        assert_eq!(bytes[0], TAG_BTIC);
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(decoded, v);
+    }
+
+    #[test]
+    fn test_round_trip_btic_with_certainty() {
+        // approximate certainty on both bounds
+        let meta = 0x7750_0000_0000_0000u64; // year/year, approximate/approximate
+        let v = Value::Temporal(crate::value::TemporalValue::Btic {
+            lo: -77_914_137_600_000, // 500 BCE
+            hi: -77_882_601_600_000,
+            meta,
+        });
+        let bytes = encode(&v);
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(decoded, v);
     }
 }

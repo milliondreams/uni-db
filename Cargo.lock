@@ -10780,6 +10780,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "uni-btic"
+version = "1.0.1"
+dependencies = [
+ "chrono",
+ "proptest",
+ "serde",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "uni-cli"
 version = "1.0.1"
 dependencies = [
@@ -10814,6 +10824,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "uni-btic",
 ]
 
 [[package]]
@@ -10975,6 +10986,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uni-algo",
+ "uni-btic",
  "uni-common",
  "uni-crdt",
  "uni-cypher",
@@ -11013,6 +11025,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "uni-btic",
  "uni-common",
  "uni-crdt",
  "uni-xervo",

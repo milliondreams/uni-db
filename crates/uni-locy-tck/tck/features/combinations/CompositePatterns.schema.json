@@ -1,0 +1,131 @@
+{
+  "edge_types": {
+    "ALERT": { "id": 1, "src_labels": [], "dst_labels": [] },
+    "FAULT": { "id": 2, "src_labels": [], "dst_labels": [] },
+    "ROAD": { "id": 3, "src_labels": [], "dst_labels": [] },
+    "STAGE": { "id": 4, "src_labels": [], "dst_labels": [] },
+    "EDGE": { "id": 5, "src_labels": [], "dst_labels": [] },
+    "EMPLOYS": { "id": 6, "src_labels": [], "dst_labels": [] },
+    "MEMBER": { "id": 7, "src_labels": [], "dst_labels": [] },
+    "LINK": { "id": 8, "src_labels": [], "dst_labels": [] },
+    "REVIEWED": { "id": 9, "src_labels": [], "dst_labels": [] },
+    "KNOWN_SIM": { "id": 10, "src_labels": [], "dst_labels": [] },
+    "CAUSE": { "id": 11, "src_labels": [], "dst_labels": [] },
+    "KNOWS": { "id": 12, "src_labels": [], "dst_labels": [] }
+  },
+  "indexes": [],
+  "labels": {
+    "Sensor": { "id": 1 },
+    "Zone": { "id": 2 },
+    "Machine": { "id": 3 },
+    "Component": { "id": 4 },
+    "City": { "id": 5 },
+    "Pipeline": { "id": 6 },
+    "Step": { "id": 7 },
+    "Node": { "id": 8 },
+    "Dept": { "id": 9 },
+    "Person": { "id": 10 },
+    "Team": { "id": 11 },
+    "Player": { "id": 12 },
+    "Doc": { "id": 13 },
+    "Item": { "id": 14 },
+    "Asset": { "id": 15 },
+    "Signal": { "id": 16 },
+    "Target": { "id": 17 },
+    "Device": { "id": 18 },
+    "Employee": { "id": 19 }
+  },
+  "properties": {
+    "Sensor": {
+      "name": { "type": "String", "nullable": true },
+      "val": { "type": "Float64", "nullable": true }
+    },
+    "Zone": {
+      "name": { "type": "String", "nullable": true }
+    },
+    "Machine": {
+      "name": { "type": "String", "nullable": true }
+    },
+    "Component": {
+      "name": { "type": "String", "nullable": true }
+    },
+    "City": {
+      "name": { "type": "String", "nullable": true }
+    },
+    "Pipeline": {
+      "name": { "type": "String", "nullable": true }
+    },
+    "Step": {
+      "name": { "type": "String", "nullable": true }
+    },
+    "Node": {
+      "name": { "type": "String", "nullable": true }
+    },
+    "Dept": {
+      "name": { "type": "String", "nullable": true }
+    },
+    "Person": {
+      "name": { "type": "String", "nullable": true }
+    },
+    "Team": {
+      "name": { "type": "String", "nullable": true }
+    },
+    "Player": {
+      "name": { "type": "String", "nullable": true }
+    },
+    "Doc": {
+      "name": { "type": "String", "nullable": true },
+      "emb": { "type": "CypherValue", "nullable": true }
+    },
+    "Item": {
+      "name": { "type": "String", "nullable": true },
+      "emb": { "type": "CypherValue", "nullable": true }
+    },
+    "Asset": {
+      "name": { "type": "String", "nullable": true },
+      "ref": { "type": "CypherValue", "nullable": true }
+    },
+    "Signal": {
+      "name": { "type": "String", "nullable": true },
+      "vec": { "type": "CypherValue", "nullable": true }
+    },
+    "Target": {
+      "name": { "type": "String", "nullable": true }
+    },
+    "Device": {
+      "name": { "type": "String", "nullable": true }
+    },
+    "Employee": {
+      "name": { "type": "String", "nullable": true },
+      "salary": { "type": "Float64", "nullable": true },
+      "bonus": { "type": "Float64", "nullable": true }
+    },
+    "ALERT": {
+      "prob": { "type": "Float64", "nullable": true }
+    },
+    "FAULT": {
+      "prob": { "type": "Float64", "nullable": true }
+    },
+    "STAGE": {
+      "reliability": { "type": "Float64", "nullable": true }
+    },
+    "EDGE": {
+      "weight": { "type": "Float64", "nullable": true },
+      "w": { "type": "Float64", "nullable": true }
+    },
+    "EMPLOYS": {
+      "salary": { "type": "Float64", "nullable": true }
+    },
+    "MEMBER": {
+      "score": { "type": "Float64", "nullable": true }
+    },
+    "LINK": {
+      "rel": { "type": "Float64", "nullable": true },
+      "weight": { "type": "Float64", "nullable": true }
+    },
+    "CAUSE": {
+      "prob": { "type": "Float64", "nullable": true }
+    }
+  },
+  "schema_version": 1
+}

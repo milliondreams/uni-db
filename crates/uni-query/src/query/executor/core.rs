@@ -680,6 +680,7 @@ impl Executor {
             TemporalValue::LocalDateTime { .. } => 3,
             TemporalValue::DateTime { .. } => 4,
             TemporalValue::Duration { .. } => 5,
+            TemporalValue::Btic { .. } => 6,
         }
     }
 }

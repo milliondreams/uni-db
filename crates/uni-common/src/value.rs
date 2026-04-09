@@ -31,6 +31,7 @@ pub enum TemporalType {
     LocalDateTime,
     DateTime,
     Duration,
+    Btic,
 }
 
 /// Typed temporal value representation.
@@ -61,6 +62,9 @@ pub enum TemporalValue {
     /// Duration with calendar semantics: months + days + nanoseconds.
     /// Matches Cypher's duration model which preserves calendar components.
     Duration { months: i64, days: i64, nanos: i64 },
+    /// Binary Temporal Interval Codec: half-open `[lo, hi)` in milliseconds since epoch,
+    /// with per-bound granularity and certainty packed in a 64-bit meta word.
+    Btic { lo: i64, hi: i64, meta: u64 },
 }
 
 impl Eq for TemporalValue {}
@@ -99,6 +103,11 @@ impl Hash for TemporalValue {
                 days.hash(state);
                 nanos.hash(state);
             }
+            TemporalValue::Btic { lo, hi, meta } => {
+                lo.hash(state);
+                hi.hash(state);
+                meta.hash(state);
+            }
         }
     }
 }
@@ -113,6 +122,7 @@ impl TemporalValue {
             TemporalValue::LocalDateTime { .. } => TemporalType::LocalDateTime,
             TemporalValue::DateTime { .. } => TemporalType::DateTime,
             TemporalValue::Duration { .. } => TemporalType::Duration,
+            TemporalValue::Btic { .. } => TemporalType::Btic,
         }
     }
 
@@ -483,6 +493,10 @@ impl fmt::Display for TemporalValue {
                 }
                 Ok(())
             }
+            TemporalValue::Btic { lo, hi, meta } => match uni_btic::Btic::new(*lo, *hi, *meta) {
+                Ok(btic) => write!(f, "{btic}"),
+                Err(_) => write!(f, "Btic[lo={lo}, hi={hi}, meta={meta:#x}]"),
+            },
         }
     }
 }

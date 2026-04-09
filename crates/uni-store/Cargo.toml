@@ -13,6 +13,7 @@ lance-backend = ["dep:lance", "dep:lancedb", "dep:lance-index", "dep:lance-linal
 
 [dependencies]
 uni-common = { workspace = true }
+uni-btic = { workspace = true }
 uni-crdt = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -1285,6 +1285,12 @@ fn value_to_scalar(value: &Value) -> Result<ScalarValue> {
                         nanoseconds: *nanos,
                     },
                 ))),
+                TemporalValue::Btic { lo, hi, meta } => {
+                    let btic = uni_btic::Btic::new(*lo, *hi, *meta)
+                        .map_err(|e| anyhow::anyhow!("invalid BTIC value: {}", e))?;
+                    let packed = uni_btic::encode::encode(&btic);
+                    Ok(ScalarValue::FixedSizeBinary(24, Some(packed.to_vec())))
+                }
             }
         }
         Value::Vector(v) => {
@@ -1563,6 +1569,29 @@ fn translate_aggregate_function(
                 first_arg(df_args),
                 distinct,
             )))
+        }
+        // BTIC aggregates
+        "BTIC_MIN" => {
+            check_args!(1, df_args, "btic_min");
+            let udaf = Arc::new(crate::query::df_udfs::create_btic_min_udaf());
+            Some(Ok(udaf.call(vec![first_arg(df_args)])))
+        }
+        "BTIC_MAX" => {
+            check_args!(1, df_args, "btic_max");
+            let udaf = Arc::new(crate::query::df_udfs::create_btic_max_udaf());
+            Some(Ok(udaf.call(vec![first_arg(df_args)])))
+        }
+        "BTIC_SPAN_AGG" => {
+            check_args!(1, df_args, "btic_span_agg");
+            let udaf = Arc::new(crate::query::df_udfs::create_btic_span_agg_udaf());
+            Some(Ok(udaf.call(vec![first_arg(df_args)])))
+        }
+        "BTIC_COUNT_AT" => {
+            if df_args.len() != 2 {
+                return Some(Err(anyhow!("btic_count_at requires 2 arguments")));
+            }
+            let udaf = Arc::new(crate::query::df_udfs::create_btic_count_at_udaf());
+            Some(Ok(udaf.call(df_args.to_vec())))
         }
         _ => None,
     }
@@ -1902,6 +1931,20 @@ fn extract_constant_value(expr: &DfExpr) -> Result<Value> {
     }
 }
 
+/// Try to translate a BTIC function (btic_lo, btic_hi, btic_overlaps, etc.).
+/// Returns `Some(result)` if the function name matches, `None` otherwise.
+fn translate_btic_function(
+    name_upper: &str,
+    name: &str,
+    df_args: &[DfExpr],
+) -> Option<Result<DfExpr>> {
+    if crate::query::expr_eval::is_btic_function(name_upper) {
+        Some(Ok(dummy_udf_expr(name, df_args.to_vec())))
+    } else {
+        None
+    }
+}
+
 /// Try to translate a list function (HEAD, LAST, TAIL, RANGE).
 /// Returns `Some(result)` if the function name matches, `None` otherwise.
 fn translate_list_function(name_upper: &str, df_args: &[DfExpr]) -> Option<Result<DfExpr>> {
@@ -2114,6 +2157,10 @@ fn translate_function_call(
     }
 
     if let Some(result) = translate_temporal_function(&name_upper, name, &df_args, context) {
+        return result;
+    }
+
+    if let Some(result) = translate_btic_function(&name_upper, name, &df_args) {
         return result;
     }
 

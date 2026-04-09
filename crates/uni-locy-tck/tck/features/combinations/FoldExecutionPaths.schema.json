@@ -1,0 +1,69 @@
+{
+  "edge_types": {
+    "CAUSE": { "id": 1, "src_labels": [], "dst_labels": [] },
+    "CHECK": { "id": 2, "src_labels": [], "dst_labels": [] },
+    "WORKS_IN": { "id": 3, "src_labels": [], "dst_labels": [] },
+    "FROM": { "id": 4, "src_labels": [], "dst_labels": [] },
+    "MEASURED": { "id": 5, "src_labels": [], "dst_labels": [] },
+    "BELONGS_TO": { "id": 6, "src_labels": [], "dst_labels": [] },
+    "MEMBER_OF": { "id": 7, "src_labels": [], "dst_labels": [] }
+  },
+  "indexes": [],
+  "labels": {
+    "Node": { "id": 1 },
+    "Dept": { "id": 2 },
+    "Person": { "id": 3 },
+    "Sensor": { "id": 4 },
+    "Reading": { "id": 5 },
+    "Server": { "id": 6 },
+    "Metric": { "id": 7 },
+    "Team": { "id": 8 },
+    "Member": { "id": 9 }
+  },
+  "properties": {
+    "Node": {
+      "name": { "type": "String", "nullable": true }
+    },
+    "Dept": {
+      "name": { "type": "String", "nullable": true }
+    },
+    "Person": {
+      "name": { "type": "String", "nullable": true }
+    },
+    "Sensor": {
+      "name": { "type": "String", "nullable": true }
+    },
+    "Reading": {
+      "ts": { "type": "Int64", "nullable": true }
+    },
+    "Server": {
+      "name": { "type": "String", "nullable": true }
+    },
+    "Metric": {
+      "id": { "type": "Int64", "nullable": true }
+    },
+    "Team": {
+      "name": { "type": "String", "nullable": true }
+    },
+    "Member": {
+      "name": { "type": "String", "nullable": true }
+    },
+    "CAUSE": {
+      "prob": { "type": "Float64", "nullable": true }
+    },
+    "CHECK": {
+      "conf": { "type": "Float64", "nullable": true },
+      "amt": { "type": "Float64", "nullable": true }
+    },
+    "WORKS_IN": {
+      "hours": { "type": "Float64", "nullable": true }
+    },
+    "FROM": {
+      "value": { "type": "Float64", "nullable": true }
+    },
+    "MEASURED": {
+      "latency": { "type": "Float64", "nullable": true }
+    }
+  },
+  "schema_version": 1
+}

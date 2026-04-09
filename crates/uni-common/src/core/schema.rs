@@ -109,6 +109,7 @@ pub enum DataType {
     CypherValue,
     Point(PointType),
     Vector { dimensions: usize },
+    Btic,
     Crdt(CrdtType),
     List(Box<DataType>),
     Map(Box<DataType>, Box<DataType>),
@@ -159,6 +160,7 @@ impl DataType {
                 Arc::new(Field::new("item", ArrowDataType::Float32, true)),
                 *dimensions as i32,
             ),
+            DataType::Btic => ArrowDataType::FixedSizeBinary(24),
             DataType::Crdt(_) => ArrowDataType::Binary, // Store CRDT as binary MessagePack
             DataType::List(inner) => {
                 ArrowDataType::List(Arc::new(Field::new("item", inner.to_arrow(), true)))

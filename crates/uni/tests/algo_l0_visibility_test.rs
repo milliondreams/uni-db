@@ -22,14 +22,10 @@ async fn pagerank_sees_l0_data_without_flush() -> anyhow::Result<()> {
     tx.execute("CREATE (:Node {name: 'A'})").await?;
     tx.execute("CREATE (:Node {name: 'B'})").await?;
     tx.execute("CREATE (:Node {name: 'C'})").await?;
-    tx.execute(
-        "MATCH (a:Node {name: 'A'}), (b:Node {name: 'B'}) CREATE (b)-[:LINKS]->(a)",
-    )
-    .await?;
-    tx.execute(
-        "MATCH (a:Node {name: 'A'}), (c:Node {name: 'C'}) CREATE (c)-[:LINKS]->(a)",
-    )
-    .await?;
+    tx.execute("MATCH (a:Node {name: 'A'}), (b:Node {name: 'B'}) CREATE (b)-[:LINKS]->(a)")
+        .await?;
+    tx.execute("MATCH (a:Node {name: 'A'}), (c:Node {name: 'C'}) CREATE (c)-[:LINKS]->(a)")
+        .await?;
     tx.commit().await?;
 
     // DO NOT flush — data is in L0 only.
@@ -78,10 +74,8 @@ async fn wcc_sees_l0_data_without_flush() -> anyhow::Result<()> {
     let tx = session.tx().await?;
     tx.execute("CREATE (:Node {name: 'A'})").await?;
     tx.execute("CREATE (:Node {name: 'B'})").await?;
-    tx.execute(
-        "MATCH (a:Node {name: 'A'}), (b:Node {name: 'B'}) CREATE (a)-[:LINKS]->(b)",
-    )
-    .await?;
+    tx.execute("MATCH (a:Node {name: 'A'}), (b:Node {name: 'B'}) CREATE (a)-[:LINKS]->(b)")
+        .await?;
     tx.commit().await?;
 
     // No flush — L0 only.

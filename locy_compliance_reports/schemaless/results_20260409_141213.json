@@ -434,8 +434,7 @@
             "keyword": "Scenario ",
             "name": "4a-1 ASSUME SET edge probability with FOLD MNOR re-evaluation",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/AssumeAbduceExtended.feature:9:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/AssumeAbduceExtended.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/AssumeAbduceExtended.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -449,8 +448,7 @@
             "keyword": "Scenario ",
             "name": "4a-2 ASSUME SET edge probability with FOLD MPROD re-evaluation",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/AssumeAbduceExtended.feature:9:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/AssumeAbduceExtended.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/AssumeAbduceExtended.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -464,8 +462,7 @@
             "keyword": "Scenario ",
             "name": "4a-3 ASSUME SET edge weight with FOLD MSUM re-evaluation scoped to target",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/AssumeAbduceExtended.feature:9:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/AssumeAbduceExtended.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/AssumeAbduceExtended.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -479,8 +476,7 @@
             "keyword": "Scenario ",
             "name": "4a-4 ASSUME CREATE new edge with FOLD MNOR adds new cause",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/AssumeAbduceExtended.feature:9:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/AssumeAbduceExtended.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/AssumeAbduceExtended.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -494,8 +490,7 @@
             "keyword": "Scenario ",
             "name": "4a-5 ASSUME SET with multi-group FOLD MNOR and QUERY",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/AssumeAbduceExtended.feature:9:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/AssumeAbduceExtended.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/AssumeAbduceExtended.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -509,8 +504,7 @@
             "keyword": "Scenario ",
             "name": "4b-1 ASSUME DELETE removes one cause and reduces MNOR then IS NOT complement",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/AssumeAbduceExtended.feature:9:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/AssumeAbduceExtended.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/AssumeAbduceExtended.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -524,8 +518,7 @@
             "keyword": "Scenario ",
             "name": "4b-2 ASSUME DELETE removes all causes making IS NOT yield 1.0",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/AssumeAbduceExtended.feature:9:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/AssumeAbduceExtended.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/AssumeAbduceExtended.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -539,8 +532,7 @@
             "keyword": "Scenario ",
             "name": "4b-3 ASSUME DELETE edge with FOLD MPROD and boolean IS NOT",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/AssumeAbduceExtended.feature:9:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/AssumeAbduceExtended.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/AssumeAbduceExtended.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -554,8 +546,7 @@
             "keyword": "Scenario ",
             "name": "4b-4 ASSUME DELETE with FOLD MSUM and IS NOT filter",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/AssumeAbduceExtended.feature:9:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/AssumeAbduceExtended.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/AssumeAbduceExtended.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -569,8 +560,7 @@
             "keyword": "Scenario ",
             "name": "4b-5 ASSUME DELETE on composite-key with FOLD MNOR and IS NOT",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/AssumeAbduceExtended.feature:9:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/AssumeAbduceExtended.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/AssumeAbduceExtended.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -584,8 +574,7 @@
             "keyword": "Scenario ",
             "name": "4c-1 ABDUCE NOT on FOLD MNOR rule with single key",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/AssumeAbduceExtended.feature:9:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/AssumeAbduceExtended.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/AssumeAbduceExtended.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -599,8 +588,7 @@
             "keyword": "Scenario ",
             "name": "4c-2 ABDUCE NOT on FOLD MPROD rule with composite key",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/AssumeAbduceExtended.feature:9:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/AssumeAbduceExtended.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/AssumeAbduceExtended.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -614,8 +602,7 @@
             "keyword": "Scenario ",
             "name": "4c-3 ABDUCE NOT on composite-key signal with FOLD MNOR",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/AssumeAbduceExtended.feature:9:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/AssumeAbduceExtended.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/AssumeAbduceExtended.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -629,8 +616,7 @@
             "keyword": "Scenario ",
             "name": "4c-4 ABDUCE NOT with ASSUME on same FOLD MNOR composite-key rule",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/AssumeAbduceExtended.feature:9:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/AssumeAbduceExtended.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/AssumeAbduceExtended.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -644,8 +630,7 @@
             "keyword": "Scenario ",
             "name": "4c-5 ABDUCE NOT on FOLD MSUM rule with composite key",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/AssumeAbduceExtended.feature:9:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/AssumeAbduceExtended.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/AssumeAbduceExtended.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -659,8 +644,7 @@
             "keyword": "Scenario ",
             "name": "4d-1 ASSUME on empty graph with FOLD MNOR returns no rows",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/AssumeAbduceExtended.feature:9:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/AssumeAbduceExtended.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/AssumeAbduceExtended.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -674,8 +658,7 @@
             "keyword": "Scenario ",
             "name": "4d-2 ABDUCE NOT on empty graph with FOLD MNOR yields no modifications",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/AssumeAbduceExtended.feature:9:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/AssumeAbduceExtended.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/AssumeAbduceExtended.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -689,8 +672,7 @@
             "keyword": "Scenario ",
             "name": "4d-3 ASSUME SET with FOLD MNOR and IS NOT complement combined",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/AssumeAbduceExtended.feature:9:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/AssumeAbduceExtended.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/AssumeAbduceExtended.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -704,8 +686,7 @@
             "keyword": "Scenario ",
             "name": "4d-4 ASSUME DELETE with FOLD MNOR then ABDUCE NOT on same rule",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/AssumeAbduceExtended.feature:9:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/AssumeAbduceExtended.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/AssumeAbduceExtended.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -719,8 +700,7 @@
             "keyword": "Scenario ",
             "name": "4d-5 ASSUME CREATE new node and edge with FOLD MSUM and QUERY",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/AssumeAbduceExtended.feature:9:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/AssumeAbduceExtended.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/AssumeAbduceExtended.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -740,8 +720,7 @@
             "keyword": "Scenario ",
             "name": "ABDUCE NOT inside ASSUME THEN parses",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/AssumeNestedAbduce.feature:11:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/AssumeNestedAbduce.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/AssumeNestedAbduce.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -755,8 +734,7 @@
             "keyword": "Scenario ",
             "name": "ABDUCE NOT with MNOR inside ASSUME THEN parses",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/AssumeNestedAbduce.feature:11:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/AssumeNestedAbduce.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/AssumeNestedAbduce.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -770,8 +748,7 @@
             "keyword": "Scenario ",
             "name": "ABDUCE NOT inside ASSUME THEN evaluates without error",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/AssumeNestedAbduce.feature:11:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/AssumeNestedAbduce.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/AssumeNestedAbduce.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -785,8 +762,7 @@
             "keyword": "Scenario ",
             "name": "QUERY and ABDUCE NOT on MNOR rule inside ASSUME THEN",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/AssumeNestedAbduce.feature:11:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/AssumeNestedAbduce.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/AssumeNestedAbduce.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -806,8 +782,7 @@
             "keyword": "Scenario ",
             "name": "3a-1 Three-stratum chain: base to MNOR to IS NOT complement",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/CompositePatterns.feature:8:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/CompositePatterns.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/CompositePatterns.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -821,8 +796,7 @@
             "keyword": "Scenario ",
             "name": "3a-2 Four-stratum pipeline: facts to FOLD to IS NOT to filter",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/CompositePatterns.feature:8:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/CompositePatterns.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/CompositePatterns.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -836,8 +810,7 @@
             "keyword": "Scenario ",
             "name": "3a-3 Three-stratum: transitive closure to FOLD COUNT to filter",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/CompositePatterns.feature:8:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/CompositePatterns.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/CompositePatterns.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -851,8 +824,7 @@
             "keyword": "Scenario ",
             "name": "3a-4 Three-stratum: PROB scores to MPROD joint to IS NOT complement",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/CompositePatterns.feature:8:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/CompositePatterns.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/CompositePatterns.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -866,8 +838,7 @@
             "keyword": "Scenario ",
             "name": "3b-1 ALONG cost then FOLD SUM across all paths per source",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/CompositePatterns.feature:8:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/CompositePatterns.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/CompositePatterns.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -881,8 +852,7 @@
             "keyword": "Scenario ",
             "name": "3b-2 ALONG hops then FOLD MAX to find longest path per source",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/CompositePatterns.feature:8:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/CompositePatterns.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/CompositePatterns.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -896,8 +866,7 @@
             "keyword": "Scenario ",
             "name": "3b-3 ALONG reliability then FOLD MNOR aggregation across paths",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/CompositePatterns.feature:8:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/CompositePatterns.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/CompositePatterns.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -911,8 +880,7 @@
             "keyword": "Scenario ",
             "name": "3b-4 ALONG with two variables then FOLD COUNT paths",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/CompositePatterns.feature:8:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/CompositePatterns.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/CompositePatterns.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -926,8 +894,7 @@
             "keyword": "Scenario ",
             "name": "3b-5 ALONG cost with BEST BY then FOLD SUM of shortest paths",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/CompositePatterns.feature:8:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/CompositePatterns.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/CompositePatterns.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -941,8 +908,7 @@
             "keyword": "Scenario ",
             "name": "3c-1 BEST BY ASC selects minimum then FOLD SUM across groups",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/CompositePatterns.feature:8:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/CompositePatterns.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/CompositePatterns.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -956,8 +922,7 @@
             "keyword": "Scenario ",
             "name": "3c-2 BEST BY DESC selects maximum then FOLD COUNT",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/CompositePatterns.feature:8:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/CompositePatterns.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/CompositePatterns.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -971,8 +936,7 @@
             "keyword": "Scenario ",
             "name": "3c-4 BEST BY on recursive ALONG then IS NOT complement",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/CompositePatterns.feature:8:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/CompositePatterns.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/CompositePatterns.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -986,8 +950,7 @@
             "keyword": "Scenario ",
             "name": "3c-3 Shortest path BEST BY then FOLD SUM all shortest costs with QUERY",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/CompositePatterns.feature:8:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/CompositePatterns.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/CompositePatterns.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1001,8 +964,7 @@
             "keyword": "Scenario ",
             "name": "3d-1 similar_to with WHERE filter on score then QUERY",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/CompositePatterns.feature:8:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/CompositePatterns.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/CompositePatterns.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1016,8 +978,7 @@
             "keyword": "Scenario ",
             "name": "3d-2 similar_to score as PROB with IS NOT complement",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/CompositePatterns.feature:8:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/CompositePatterns.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/CompositePatterns.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1031,8 +992,7 @@
             "keyword": "Scenario ",
             "name": "3d-3 similar_to pairwise then IS NOT known then QUERY novel pairs",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/CompositePatterns.feature:8:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/CompositePatterns.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/CompositePatterns.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1046,8 +1006,7 @@
             "keyword": "Scenario ",
             "name": "3d-4 similar_to to MNOR aggregation then QUERY with filter",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/CompositePatterns.feature:8:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/CompositePatterns.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/CompositePatterns.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1061,8 +1020,7 @@
             "keyword": "Scenario ",
             "name": "3d-5 similar_to with WHERE threshold and IS NOT exclusion combined",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/CompositePatterns.feature:8:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/CompositePatterns.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/CompositePatterns.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1076,8 +1034,7 @@
             "keyword": "Scenario ",
             "name": "3e-1 Recursive transitive closure then FOLD COUNT then QUERY",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/CompositePatterns.feature:8:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/CompositePatterns.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/CompositePatterns.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1091,8 +1048,7 @@
             "keyword": "Scenario ",
             "name": "3e-2 Recursive ALONG cost then FOLD SUM then QUERY per source",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/CompositePatterns.feature:8:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/CompositePatterns.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/CompositePatterns.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1106,8 +1062,7 @@
             "keyword": "Scenario ",
             "name": "3e-3 Recursive shortest path BEST BY then FOLD MIN then QUERY",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/CompositePatterns.feature:8:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/CompositePatterns.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/CompositePatterns.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1121,8 +1076,7 @@
             "keyword": "Scenario ",
             "name": "3e-4 Recursive reachability then FOLD MCOUNT then IS NOT then QUERY",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/CompositePatterns.feature:8:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/CompositePatterns.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/CompositePatterns.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1136,8 +1090,7 @@
             "keyword": "Scenario ",
             "name": "3f-1 WHERE filter on numeric value column from IS-ref",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/CompositePatterns.feature:8:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/CompositePatterns.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/CompositePatterns.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1151,8 +1104,7 @@
             "keyword": "Scenario ",
             "name": "3f-2 WHERE filter on FOLD value column from IS-ref",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/CompositePatterns.feature:8:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/CompositePatterns.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/CompositePatterns.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1166,8 +1118,7 @@
             "keyword": "Scenario ",
             "name": "3f-3 WHERE range filter on IS-ref value column",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/CompositePatterns.feature:8:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/CompositePatterns.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/CompositePatterns.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1181,8 +1132,7 @@
             "keyword": "Scenario ",
             "name": "3f-4 WHERE filter on IS-ref value column with ALONG cost",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/CompositePatterns.feature:8:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/CompositePatterns.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/CompositePatterns.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1196,8 +1146,7 @@
             "keyword": "Scenario ",
             "name": "3f-5 WHERE comparison on two IS-ref value columns",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/CompositePatterns.feature:8:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/CompositePatterns.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/CompositePatterns.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1307,8 +1256,7 @@
             "keyword": "Scenario ",
             "name": "FOLD MNOR penalty then IS NOT complement then QUERY",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/FeatureCombinationMatrix.feature:8:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FeatureCombinationMatrix.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FeatureCombinationMatrix.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1322,8 +1270,7 @@
             "keyword": "Scenario ",
             "name": "FOLD MNOR signal then composite-key IS NOT novel then QUERY",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/FeatureCombinationMatrix.feature:8:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FeatureCombinationMatrix.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FeatureCombinationMatrix.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1337,8 +1284,7 @@
             "keyword": "Scenario ",
             "name": "ASSUME mutation with FOLD MNOR re-evaluation",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/FeatureCombinationMatrix.feature:8:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FeatureCombinationMatrix.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FeatureCombinationMatrix.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1352,8 +1298,7 @@
             "keyword": "Scenario ",
             "name": "Facts to MNOR to IS NOT PROB complement with QUERY",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/FeatureCombinationMatrix.feature:8:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FeatureCombinationMatrix.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FeatureCombinationMatrix.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1367,8 +1312,7 @@
             "keyword": "Scenario ",
             "name": "WHERE filter on similar_to score from IS-ref",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/FeatureCombinationMatrix.feature:8:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FeatureCombinationMatrix.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FeatureCombinationMatrix.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1382,8 +1326,7 @@
             "keyword": "Scenario ",
             "name": "ABDUCE NOT on FOLD MNOR rule finds modification",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/FeatureCombinationMatrix.feature:8:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FeatureCombinationMatrix.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FeatureCombinationMatrix.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1403,8 +1346,7 @@
             "keyword": "Scenario ",
             "name": "MNOR derived relation computes correct noisy-OR",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/FoldExecutionPaths.feature:9:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1418,8 +1360,7 @@
             "keyword": "Scenario ",
             "name": "MNOR via QUERY returns correct value",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/FoldExecutionPaths.feature:9:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1433,8 +1374,7 @@
             "keyword": "Scenario ",
             "name": "MNOR via ASSUME reflects hypothetical edge removal",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/FoldExecutionPaths.feature:9:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1448,8 +1388,7 @@
             "keyword": "Scenario ",
             "name": "MNOR via ABDUCE finds edge removal candidate",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/FoldExecutionPaths.feature:9:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1463,8 +1402,7 @@
             "keyword": "Scenario ",
             "name": "MPROD derived relation computes correct product",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/FoldExecutionPaths.feature:9:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1478,8 +1416,7 @@
             "keyword": "Scenario ",
             "name": "MPROD via QUERY returns correct value",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/FoldExecutionPaths.feature:9:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1493,8 +1430,7 @@
             "keyword": "Scenario ",
             "name": "MPROD via ASSUME reflects hypothetical edge removal",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/FoldExecutionPaths.feature:9:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1508,8 +1444,7 @@
             "keyword": "Scenario ",
             "name": "MPROD via ABDUCE finds edge removal candidate",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/FoldExecutionPaths.feature:9:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1523,8 +1458,7 @@
             "keyword": "Scenario ",
             "name": "MSUM derived relation computes correct sum",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/FoldExecutionPaths.feature:9:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1538,8 +1472,7 @@
             "keyword": "Scenario ",
             "name": "MSUM via QUERY returns correct value",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/FoldExecutionPaths.feature:9:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1553,8 +1486,7 @@
             "keyword": "Scenario ",
             "name": "MSUM via ASSUME reflects hypothetical edge addition",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/FoldExecutionPaths.feature:9:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1568,8 +1500,7 @@
             "keyword": "Scenario ",
             "name": "MSUM via ABDUCE finds modification candidate",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/FoldExecutionPaths.feature:9:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1583,8 +1514,7 @@
             "keyword": "Scenario ",
             "name": "MMAX derived relation computes correct maximum",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/FoldExecutionPaths.feature:9:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1598,8 +1528,7 @@
             "keyword": "Scenario ",
             "name": "MMAX via QUERY returns correct value",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/FoldExecutionPaths.feature:9:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1613,8 +1542,7 @@
             "keyword": "Scenario ",
             "name": "MMAX via ASSUME reflects hypothetical new reading",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/FoldExecutionPaths.feature:9:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1628,8 +1556,7 @@
             "keyword": "Scenario ",
             "name": "MMAX via ABDUCE finds modification candidate",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/FoldExecutionPaths.feature:9:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1643,8 +1570,7 @@
             "keyword": "Scenario ",
             "name": "MMIN derived relation computes correct minimum",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/FoldExecutionPaths.feature:9:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1658,8 +1584,7 @@
             "keyword": "Scenario ",
             "name": "MMIN via QUERY returns correct value",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/FoldExecutionPaths.feature:9:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1673,8 +1598,7 @@
             "keyword": "Scenario ",
             "name": "MMIN via ASSUME reflects hypothetical faster measurement",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/FoldExecutionPaths.feature:9:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1688,8 +1612,7 @@
             "keyword": "Scenario ",
             "name": "MMIN via ABDUCE finds modification candidate",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/FoldExecutionPaths.feature:9:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1703,8 +1626,7 @@
             "keyword": "Scenario ",
             "name": "MCOUNT derived relation computes correct count",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/FoldExecutionPaths.feature:9:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1718,8 +1640,7 @@
             "keyword": "Scenario ",
             "name": "MCOUNT via QUERY returns correct value",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/FoldExecutionPaths.feature:9:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1733,8 +1654,7 @@
             "keyword": "Scenario ",
             "name": "MCOUNT via ASSUME reflects hypothetical member addition",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/FoldExecutionPaths.feature:9:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1748,8 +1668,7 @@
             "keyword": "Scenario ",
             "name": "MSUM groups independently across two departments",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/FoldExecutionPaths.feature:9:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1763,8 +1682,7 @@
             "keyword": "Scenario ",
             "name": "MMAX groups independently across two sensors",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/FoldExecutionPaths.feature:9:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1778,8 +1696,7 @@
             "keyword": "Scenario ",
             "name": "MMIN groups independently across two servers",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/FoldExecutionPaths.feature:9:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1793,8 +1710,7 @@
             "keyword": "Scenario ",
             "name": "MCOUNT groups independently across two teams",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/FoldExecutionPaths.feature:9:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1808,8 +1724,7 @@
             "keyword": "Scenario ",
             "name": "MNOR and MPROD coexist as separate rules",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/FoldExecutionPaths.feature:9:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1823,8 +1738,7 @@
             "keyword": "Scenario ",
             "name": "MSUM and MCOUNT on same graph with different rules",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/FoldExecutionPaths.feature:9:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1838,8 +1752,7 @@
             "keyword": "Scenario ",
             "name": "MMAX and MMIN on same graph yield complementary extremes",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/FoldExecutionPaths.feature:9:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1853,8 +1766,7 @@
             "keyword": "Scenario ",
             "name": "MCOUNT via ABDUCE finds modification candidate",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/FoldExecutionPaths.feature:9:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1868,8 +1780,7 @@
             "keyword": "Scenario ",
             "name": "Two independent FOLD rules produce correct values in same program",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/FoldExecutionPaths.feature:9:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1889,8 +1800,7 @@
             "keyword": "Scenario ",
             "name": "2a-1 Boolean IS NOT with FOLD MNOR and QUERY",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/IsNotFoldQueryMatrix.feature:10:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/IsNotFoldQueryMatrix.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/IsNotFoldQueryMatrix.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1904,8 +1814,7 @@
             "keyword": "Scenario ",
             "name": "2a-2 Boolean IS NOT passes unflagged nodes to FOLD MNOR with QUERY",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/IsNotFoldQueryMatrix.feature:10:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/IsNotFoldQueryMatrix.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/IsNotFoldQueryMatrix.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1919,8 +1828,7 @@
             "keyword": "Scenario ",
             "name": "2a-3 Boolean IS NOT with FOLD MPROD and QUERY",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/IsNotFoldQueryMatrix.feature:10:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/IsNotFoldQueryMatrix.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/IsNotFoldQueryMatrix.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1934,8 +1842,7 @@
             "keyword": "Scenario ",
             "name": "2a-4 Boolean IS NOT with FOLD MSUM and QUERY",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/IsNotFoldQueryMatrix.feature:10:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/IsNotFoldQueryMatrix.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/IsNotFoldQueryMatrix.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1949,8 +1856,7 @@
             "keyword": "Scenario ",
             "name": "2a-5 Boolean IS NOT with empty negated relation passes all to FOLD MNOR",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/IsNotFoldQueryMatrix.feature:10:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/IsNotFoldQueryMatrix.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/IsNotFoldQueryMatrix.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1964,8 +1870,7 @@
             "keyword": "Scenario ",
             "name": "2a-6 Boolean IS NOT multi-group FOLD MNOR with QUERY",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/IsNotFoldQueryMatrix.feature:10:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/IsNotFoldQueryMatrix.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/IsNotFoldQueryMatrix.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1979,8 +1884,7 @@
             "keyword": "Scenario ",
             "name": "2b-1 PROB complement after FOLD MNOR with QUERY",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/IsNotFoldQueryMatrix.feature:10:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/IsNotFoldQueryMatrix.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/IsNotFoldQueryMatrix.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -1994,8 +1898,7 @@
             "keyword": "Scenario ",
             "name": "2b-2 PROB complement after FOLD MPROD with QUERY",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/IsNotFoldQueryMatrix.feature:10:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/IsNotFoldQueryMatrix.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/IsNotFoldQueryMatrix.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -2009,8 +1912,7 @@
             "keyword": "Scenario ",
             "name": "2b-3 PROB complement absent key yields 1.0 with FOLD MNOR and QUERY",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/IsNotFoldQueryMatrix.feature:10:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/IsNotFoldQueryMatrix.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/IsNotFoldQueryMatrix.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -2024,8 +1926,7 @@
             "keyword": "Scenario ",
             "name": "2b-4 Cross-predicate IS + IS NOT PROB with FOLD MNOR and QUERY",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/IsNotFoldQueryMatrix.feature:10:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/IsNotFoldQueryMatrix.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/IsNotFoldQueryMatrix.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -2039,8 +1940,7 @@
             "keyword": "Scenario ",
             "name": "2b-5 Double complement recovers original FOLD MNOR probability",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/IsNotFoldQueryMatrix.feature:10:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/IsNotFoldQueryMatrix.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/IsNotFoldQueryMatrix.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -2054,8 +1954,7 @@
             "keyword": "Scenario ",
             "name": "2b-6 PROB complement with FOLD MNOR three causes and QUERY",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/IsNotFoldQueryMatrix.feature:10:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/IsNotFoldQueryMatrix.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/IsNotFoldQueryMatrix.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -2069,8 +1968,7 @@
             "keyword": "Scenario ",
             "name": "2c-1 Composite-key boolean IS NOT with FOLD MNOR and QUERY",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/IsNotFoldQueryMatrix.feature:10:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/IsNotFoldQueryMatrix.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/IsNotFoldQueryMatrix.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -2084,8 +1982,7 @@
             "keyword": "Scenario ",
             "name": "2c-2 Composite-key PROB IS NOT complement with FOLD MNOR and QUERY",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/IsNotFoldQueryMatrix.feature:10:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/IsNotFoldQueryMatrix.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/IsNotFoldQueryMatrix.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -2099,8 +1996,7 @@
             "keyword": "Scenario ",
             "name": "2c-3 Composite-key IS NOT all pairs known yields empty novel set",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/IsNotFoldQueryMatrix.feature:10:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/IsNotFoldQueryMatrix.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/IsNotFoldQueryMatrix.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -2114,8 +2010,7 @@
             "keyword": "Scenario ",
             "name": "2c-4 Composite-key IS NOT with multiple drugs and FOLD MNOR QUERY",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/IsNotFoldQueryMatrix.feature:10:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/IsNotFoldQueryMatrix.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/IsNotFoldQueryMatrix.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -2129,8 +2024,7 @@
             "keyword": "Scenario ",
             "name": "2d-1 Boolean IS NOT feeding recursive FOLD MSUM with QUERY",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/IsNotFoldQueryMatrix.feature:10:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/IsNotFoldQueryMatrix.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/IsNotFoldQueryMatrix.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -2144,8 +2038,7 @@
             "keyword": "Scenario ",
             "name": "2d-2 PROB complement IS NOT with recursive MNOR transitive risk and QUERY",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/IsNotFoldQueryMatrix.feature:10:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/IsNotFoldQueryMatrix.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/IsNotFoldQueryMatrix.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -2159,8 +2052,7 @@
             "keyword": "Scenario ",
             "name": "2d-3 Boolean IS NOT chain with FOLD MSUM at each stage and QUERY",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/IsNotFoldQueryMatrix.feature:10:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/IsNotFoldQueryMatrix.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/IsNotFoldQueryMatrix.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -2174,8 +2066,7 @@
             "keyword": "Scenario ",
             "name": "2d-4 IS NOT PROB complement with FOLD MPROD and chained QUERY",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/IsNotFoldQueryMatrix.feature:10:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/IsNotFoldQueryMatrix.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/IsNotFoldQueryMatrix.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -2361,8 +2252,7 @@
             "keyword": "Scenario ",
             "name": "Simple non-recursive rule QUERY matches derived",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/SemanticParity.feature:8:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/SemanticParity.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/SemanticParity.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -2376,8 +2266,7 @@
             "keyword": "Scenario ",
             "name": "FOLD MNOR QUERY matches derived",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/SemanticParity.feature:8:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/SemanticParity.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/SemanticParity.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -2391,8 +2280,7 @@
             "keyword": "Scenario ",
             "name": "FOLD MPROD QUERY matches derived",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/SemanticParity.feature:8:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/SemanticParity.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/SemanticParity.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -2406,8 +2294,7 @@
             "keyword": "Scenario ",
             "name": "Boolean IS NOT QUERY matches derived",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/SemanticParity.feature:8:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/SemanticParity.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/SemanticParity.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -2421,8 +2308,7 @@
             "keyword": "Scenario ",
             "name": "IS NOT PROB complement derived relation correctness",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/SemanticParity.feature:8:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/SemanticParity.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/SemanticParity.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -2436,8 +2322,7 @@
             "keyword": "Scenario ",
             "name": "Composite-key IS NOT QUERY matches derived",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/SemanticParity.feature:8:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/SemanticParity.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/SemanticParity.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -2451,8 +2336,7 @@
             "keyword": "Scenario ",
             "name": "Three-stratum FOLD chain QUERY matches derived",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/combinations/SemanticParity.feature:8:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/SemanticParity.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/SemanticParity.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -4406,8 +4290,7 @@
             "keyword": "Scenario ",
             "name": "MNOR single value 0.3",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/monotonic/MathematicalReference.feature:7:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/monotonic/MathematicalReference.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/monotonic/MathematicalReference.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -4421,8 +4304,7 @@
             "keyword": "Scenario ",
             "name": "MNOR two values 1-(0.7)(0.5) = 0.65",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/monotonic/MathematicalReference.feature:7:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/monotonic/MathematicalReference.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/monotonic/MathematicalReference.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -4436,8 +4318,7 @@
             "keyword": "Scenario ",
             "name": "MNOR three values 1-(0.7)(0.5)(0.3) = 0.895",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/monotonic/MathematicalReference.feature:7:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/monotonic/MathematicalReference.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/monotonic/MathematicalReference.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -4451,8 +4332,7 @@
             "keyword": "Scenario ",
             "name": "MNOR five values 1-(0.9)(0.8)(0.7)(0.6)(0.5) = 0.8488",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/monotonic/MathematicalReference.feature:7:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/monotonic/MathematicalReference.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/monotonic/MathematicalReference.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -4466,8 +4346,7 @@
             "keyword": "Scenario ",
             "name": "MNOR edge case zero MNOR(0.0) = 0.0",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/monotonic/MathematicalReference.feature:7:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/monotonic/MathematicalReference.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/monotonic/MathematicalReference.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -4481,8 +4360,7 @@
             "keyword": "Scenario ",
             "name": "MNOR edge case one MNOR(1.0) = 1.0",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/monotonic/MathematicalReference.feature:7:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/monotonic/MathematicalReference.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/monotonic/MathematicalReference.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -4496,8 +4374,7 @@
             "keyword": "Scenario ",
             "name": "MPROD two values 0.8 * 0.9 = 0.72",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/monotonic/MathematicalReference.feature:7:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/monotonic/MathematicalReference.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/monotonic/MathematicalReference.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -4511,8 +4388,7 @@
             "keyword": "Scenario ",
             "name": "MPROD three values 0.8 * 0.9 * 0.7 = 0.504",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/monotonic/MathematicalReference.feature:7:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/monotonic/MathematicalReference.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/monotonic/MathematicalReference.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -4526,8 +4402,7 @@
             "keyword": "Scenario ",
             "name": "MPROD edge case with zero 0.0 * 0.5 = 0.0",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/monotonic/MathematicalReference.feature:7:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/monotonic/MathematicalReference.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/monotonic/MathematicalReference.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -4541,8 +4416,7 @@
             "keyword": "Scenario ",
             "name": "MPROD edge case with one 1.0 * 0.5 = 0.5",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/monotonic/MathematicalReference.feature:7:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/monotonic/MathematicalReference.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/monotonic/MathematicalReference.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -4556,8 +4430,7 @@
             "keyword": "Scenario ",
             "name": "IS NOT complement of MNOR(0.3, 0.5) = 1 - 0.65 = 0.35",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/monotonic/MathematicalReference.feature:7:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/monotonic/MathematicalReference.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/monotonic/MathematicalReference.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -4571,8 +4444,7 @@
             "keyword": "Scenario ",
             "name": "Complement chain evidence * safety with hand-computed values",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/monotonic/MathematicalReference.feature:7:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/monotonic/MathematicalReference.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/monotonic/MathematicalReference.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -5712,8 +5584,7 @@
             "keyword": "Scenario ",
             "name": "MNOR fold value projects through plain QUERY RETURN",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/query/FoldQueryProjection.feature:11:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/query/FoldQueryProjection.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/query/FoldQueryProjection.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -5727,8 +5598,7 @@
             "keyword": "Scenario ",
             "name": "MPROD fold value projects through plain QUERY RETURN",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/query/FoldQueryProjection.feature:11:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/query/FoldQueryProjection.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/query/FoldQueryProjection.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -5742,8 +5612,7 @@
             "keyword": "Scenario ",
             "name": "SUM fold value projects through plain QUERY RETURN",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/query/FoldQueryProjection.feature:11:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/query/FoldQueryProjection.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/query/FoldQueryProjection.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]
@@ -5757,8 +5626,7 @@
             "keyword": "Scenario ",
             "name": "MNOR with multiple groups returns all groups via plain QUERY",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/query/FoldQueryProjection.feature:11:5\n      Matched: crates/uni-locy-tck/src/steps/given.rs:6:1\n      Step panicked. Captured output: Failed to initialize database: Missing sidecar schema for feature '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/query/FoldQueryProjection.feature': '/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/query/FoldQueryProjection.schema.json'\n[Summary]\n1 feature\n1 scenario (1 failed)\n1 step (1 failed)\n"
+              "status": "passed"
             }
           }
         ]

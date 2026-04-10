@@ -545,10 +545,9 @@ impl Compactor {
 
                 for eid in delta_eids {
                     let main_edge_exists =
-                        MainEdgeDataset::find_props_by_eid(self.storage.backend(), eid)
+                        MainEdgeDataset::exists_by_eid(self.storage.backend(), eid)
                             .await
-                            .unwrap_or(None)
-                            .is_some();
+                            .unwrap_or(false);
 
                     debug_assert!(
                         main_edge_exists,

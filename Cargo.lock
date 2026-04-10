@@ -10762,7 +10762,7 @@ checksum = "eeba86d422ce181a719445e51872fa30f1f7413b62becb52e95ec91aa262d85c"
 
 [[package]]
 name = "uni-algo"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -10781,7 +10781,7 @@ dependencies = [
 
 [[package]]
 name = "uni-btic"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "chrono",
  "proptest",
@@ -10791,7 +10791,7 @@ dependencies = [
 
 [[package]]
 name = "uni-cli"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -10809,7 +10809,7 @@ dependencies = [
 
 [[package]]
 name = "uni-common"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "arrow-schema",
@@ -10829,7 +10829,7 @@ dependencies = [
 
 [[package]]
 name = "uni-crdt"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "fxhash",
  "proptest",
@@ -10842,7 +10842,7 @@ dependencies = [
 
 [[package]]
 name = "uni-cypher"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "pest",
  "pest_derive",
@@ -10853,7 +10853,7 @@ dependencies = [
 
 [[package]]
 name = "uni-db"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "arrow",
@@ -10895,7 +10895,7 @@ dependencies = [
 
 [[package]]
 name = "uni-locy"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -10933,7 +10933,7 @@ dependencies = [
 
 [[package]]
 name = "uni-python"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -10952,7 +10952,7 @@ dependencies = [
 
 [[package]]
 name = "uni-query"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "arrow",
@@ -10997,7 +10997,7 @@ dependencies = [
 
 [[package]]
 name = "uni-store"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "arrow",

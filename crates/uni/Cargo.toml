@@ -40,10 +40,10 @@ parking_lot = { workspace = true }
 datafusion = { workspace = true }
 tokio-util = { workspace = true }
 scopeguard = "1"
+tempfile = { workspace = true }
 
 [dev-dependencies]
 criterion = "0.5"
-tempfile = { workspace = true }
 rand = { workspace = true }
 arrow = { workspace = true }
 lance = { workspace = true }

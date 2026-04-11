@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+use tempfile::TempDir;
 
 pub mod appender;
 pub mod builder;
@@ -95,6 +96,8 @@ pub struct UniInner {
     pub(crate) cached_l0_estimated_size: AtomicUsize,
     /// Cached WAL log sequence number (updated after every commit).
     pub(crate) cached_wal_lsn: AtomicU64,
+    /// Temp directory guard — auto-deletes on drop. Only set for `Uni::temporary()`.
+    pub(crate) _temp_dir: Option<TempDir>,
 }
 
 /// Write throttle pressure as a value in 0.0–1.0.
@@ -236,6 +239,7 @@ impl UniInner {
             cached_l0_mutation_count: AtomicUsize::new(0),
             cached_l0_estimated_size: AtomicUsize::new(0),
             cached_wal_lsn: AtomicU64::new(0),
+            _temp_dir: None,
         })
     }
 }
@@ -273,10 +277,16 @@ impl Uni {
     /// Create a temporary database that is deleted when dropped.
     ///
     /// Useful for tests and short-lived processing.
-    /// Note: Currently uses a temporary directory on the filesystem.
+    /// The underlying directory is automatically cleaned up when the `Uni` is dropped.
     pub fn temporary() -> UniBuilder {
-        let temp_dir = std::env::temp_dir().join(format!("uni_mem_{}", uuid::Uuid::new_v4()));
-        UniBuilder::new(temp_dir.to_string_lossy().to_string())
+        let temp_dir = tempfile::Builder::new()
+            .prefix("uni_mem_")
+            .tempdir()
+            .expect("failed to create temporary directory");
+        let uri = temp_dir.path().to_string_lossy().to_string();
+        let mut builder = UniBuilder::new(uri);
+        builder.temp_dir = Some(temp_dir);
+        builder
     }
 
     /// Open an in-memory database (alias for temporary).
@@ -823,6 +833,7 @@ pub struct UniBuilder {
     fail_if_exists: bool,
     read_only: bool,
     write_lease: Option<multi_agent::WriteLease>,
+    temp_dir: Option<TempDir>,
 }
 
 impl UniBuilder {
@@ -839,6 +850,7 @@ impl UniBuilder {
             fail_if_exists: false,
             read_only: false,
             write_lease: None,
+            temp_dir: None,
         }
     }
 
@@ -1425,6 +1437,7 @@ impl UniBuilder {
                 cached_l0_mutation_count: AtomicUsize::new(0),
                 cached_l0_estimated_size: AtomicUsize::new(0),
                 cached_wal_lsn: AtomicU64::new(0),
+                _temp_dir: self.temp_dir,
             }),
         })
     }

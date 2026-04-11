@@ -320,3 +320,50 @@ async fn test_edge_with_no_properties_after_compaction() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn test_deleted_edge_compaction_does_not_assert() -> Result<()> {
+    let (_temp_dir, storage, mut writer, _property_manager, edge_type_id) = setup_test_db().await?;
+
+    // Create two vertices
+    let v1 = writer.next_vid().await?;
+    let v2 = writer.next_vid().await?;
+    writer
+        .insert_vertex_with_labels(v1, HashMap::new(), &["Person".to_string()], None)
+        .await?;
+    writer
+        .insert_vertex_with_labels(v2, HashMap::new(), &["Person".to_string()], None)
+        .await?;
+
+    // Create edge with properties
+    let mut edge_props = Properties::new();
+    edge_props.insert("since".to_string(), Value::Int(2020));
+    edge_props.insert("weight".to_string(), Value::Float(0.85));
+
+    let eid = writer.next_eid(edge_type_id).await?;
+    writer
+        .insert_edge(v1, v2, edge_type_id, eid, edge_props, None, None)
+        .await?;
+
+    // Flush to storage (dual-writes insert to Delta L1 + main_edges)
+    writer.flush_to_l1(None).await?;
+
+    // Delete the edge
+    writer.delete_edge(eid, v1, v2, edge_type_id, None).await?;
+
+    // Flush again (dual-writes the delete tombstone — main_edges gets _deleted=true)
+    writer.flush_to_l1(None).await?;
+
+    // Compact adjacency — previously triggered a false-positive debug_assert
+    // because find_props_by_eid filtered _deleted=false, missing the deleted edge
+    let compactor = Compactor::new(storage.clone());
+    let _ = compactor
+        .compact_adjacency("KNOWS", "Person", "fwd")
+        .await?;
+    let _ = compactor
+        .compact_adjacency("KNOWS", "Person", "bwd")
+        .await?;
+
+    // If we reach here, the debug_assert passed — the fix works
+    Ok(())
+}

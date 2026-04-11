@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "uni-db"
-version = "1.0.1"
+version = "1.0.2"
 description = "Python bindings for Uni Graph Database"
 authors = [
     { name = "Dragonscale Industries Inc.", email = "dev@dragonscale.ai" }

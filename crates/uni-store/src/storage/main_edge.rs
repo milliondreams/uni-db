@@ -228,6 +228,17 @@ impl MainEdgeDataset {
         Ok(None)
     }
 
+    /// Check whether an edge exists by EID, regardless of deletion status.
+    ///
+    /// Unlike `find_props_by_eid`, this does NOT filter by `_deleted = false`,
+    /// so it returns true for both active and soft-deleted edges. Used by the
+    /// compaction invariant check to verify dual-writes occurred.
+    pub async fn exists_by_eid(backend: &dyn StorageBackend, eid: Eid) -> Result<bool> {
+        let filter = format!("_eid = {}", eid.as_u64());
+        let batches = Self::execute_query(backend, &filter, Some(vec!["_eid"])).await?;
+        Ok(!batches.is_empty() && batches.iter().any(|b| b.num_rows() > 0))
+    }
+
     /// Execute a query on the main edges table.
     ///
     /// Returns empty vec if table doesn't exist.

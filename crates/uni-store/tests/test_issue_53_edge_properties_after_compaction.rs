@@ -323,8 +323,7 @@ async fn test_edge_with_no_properties_after_compaction() -> Result<()> {
 
 #[tokio::test]
 async fn test_deleted_edge_compaction_does_not_assert() -> Result<()> {
-    let (_temp_dir, storage, mut writer, _property_manager, edge_type_id) =
-        setup_test_db().await?;
+    let (_temp_dir, storage, mut writer, _property_manager, edge_type_id) = setup_test_db().await?;
 
     // Create two vertices
     let v1 = writer.next_vid().await?;
@@ -350,9 +349,7 @@ async fn test_deleted_edge_compaction_does_not_assert() -> Result<()> {
     writer.flush_to_l1(None).await?;
 
     // Delete the edge
-    writer
-        .delete_edge(eid, v1, v2, edge_type_id, None)
-        .await?;
+    writer.delete_edge(eid, v1, v2, edge_type_id, None).await?;
 
     // Flush again (dual-writes the delete tombstone — main_edges gets _deleted=true)
     writer.flush_to_l1(None).await?;

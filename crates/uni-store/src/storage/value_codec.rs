@@ -452,4 +452,186 @@ mod tests {
             value_from_column(&array, &DataType::CypherValue, 2, CrdtDecodeMode::Strict).unwrap();
         assert_eq!(val, Value::String("plain text".to_string()));
     }
+
+    #[test]
+    fn test_decode_bool() {
+        use arrow_array::builder::BooleanBuilder;
+        let mut builder = BooleanBuilder::new();
+        builder.append_value(true);
+        builder.append_value(false);
+        let array = builder.finish();
+
+        let val = value_from_column(&array, &DataType::Bool, 0, CrdtDecodeMode::Strict).unwrap();
+        assert_eq!(val, serde_json::json!(true));
+
+        let val = value_from_column(&array, &DataType::Bool, 1, CrdtDecodeMode::Strict).unwrap();
+        assert_eq!(val, serde_json::json!(false));
+    }
+
+    #[test]
+    fn test_decode_float64() {
+        use arrow_array::builder::Float64Builder;
+        let mut builder = Float64Builder::new();
+        builder.append_value(3.14159);
+        builder.append_value(-0.5);
+        let array = builder.finish();
+
+        let val =
+            value_from_column(&array, &DataType::Float64, 0, CrdtDecodeMode::Strict).unwrap();
+        assert_eq!(val, serde_json::json!(3.14159));
+
+        let val =
+            value_from_column(&array, &DataType::Float64, 1, CrdtDecodeMode::Strict).unwrap();
+        assert_eq!(val, serde_json::json!(-0.5));
+    }
+
+    #[test]
+    fn test_decode_int32() {
+        use arrow_array::builder::Int32Builder;
+        let mut builder = Int32Builder::new();
+        builder.append_value(42);
+        builder.append_value(-1);
+        let array = builder.finish();
+
+        let val = value_from_column(&array, &DataType::Int32, 0, CrdtDecodeMode::Strict).unwrap();
+        assert_eq!(val, serde_json::json!(42));
+
+        let val = value_from_column(&array, &DataType::Int32, 1, CrdtDecodeMode::Strict).unwrap();
+        assert_eq!(val, serde_json::json!(-1));
+    }
+
+    #[test]
+    fn test_decode_float32() {
+        use arrow_array::builder::Float32Builder;
+        let mut builder = Float32Builder::new();
+        builder.append_value(1.5);
+        let array = builder.finish();
+
+        let val =
+            value_from_column(&array, &DataType::Float32, 0, CrdtDecodeMode::Strict).unwrap();
+        // Float32 has limited precision so compare approximately
+        let f = val.as_f64().unwrap();
+        assert!((f - 1.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_decode_vector() {
+        use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
+        let values_builder = Float32Builder::new();
+        let mut builder = FixedSizeListBuilder::new(values_builder, 3);
+        builder.values().append_value(1.0);
+        builder.values().append_value(2.0);
+        builder.values().append_value(3.0);
+        builder.append(true);
+        let array = builder.finish();
+
+        let val = value_from_column(
+            &array,
+            &DataType::Vector { dimensions: 3 },
+            0,
+            CrdtDecodeMode::Strict,
+        )
+        .unwrap();
+        assert_eq!(val, serde_json::json!([1.0, 2.0, 3.0]));
+    }
+
+    #[test]
+    fn test_decode_date() {
+        use arrow_array::builder::Date32Builder;
+        let mut builder = Date32Builder::new();
+        // 2021-01-01 = 18628 days since epoch
+        builder.append_value(18628);
+        let array = builder.finish();
+
+        let val = value_from_column(&array, &DataType::Date, 0, CrdtDecodeMode::Strict).unwrap();
+        assert_eq!(val, Value::String("2021-01-01".to_string()));
+    }
+
+    #[test]
+    fn test_decode_date_null() {
+        use arrow_array::builder::Date32Builder;
+        let mut builder = Date32Builder::new();
+        builder.append_null();
+        let array = builder.finish();
+
+        let val = value_from_column(&array, &DataType::Date, 0, CrdtDecodeMode::Strict).unwrap();
+        assert_eq!(val, Value::Null);
+    }
+
+    #[test]
+    fn test_decode_list_of_strings() {
+        use arrow_array::builder::{ListBuilder, StringBuilder};
+        let values_builder = StringBuilder::new();
+        let mut builder = ListBuilder::new(values_builder);
+        builder.values().append_value("a");
+        builder.values().append_value("b");
+        builder.values().append_value("c");
+        builder.append(true);
+        let array = builder.finish();
+
+        let val = value_from_column(
+            &array,
+            &DataType::List(Box::new(DataType::String)),
+            0,
+            CrdtDecodeMode::Strict,
+        )
+        .unwrap();
+        assert_eq!(val, serde_json::json!(["a", "b", "c"]));
+    }
+
+    #[test]
+    fn test_decode_list_of_ints() {
+        use arrow_array::builder::{Int64Builder, ListBuilder};
+        let values_builder = Int64Builder::new();
+        let mut builder = ListBuilder::new(values_builder);
+        builder.values().append_value(1);
+        builder.values().append_value(2);
+        builder.values().append_value(3);
+        builder.append(true);
+        let array = builder.finish();
+
+        let val = value_from_column(
+            &array,
+            &DataType::List(Box::new(DataType::Int64)),
+            0,
+            CrdtDecodeMode::Strict,
+        )
+        .unwrap();
+        assert_eq!(val, serde_json::json!([1, 2, 3]));
+    }
+
+    #[test]
+    fn test_decode_list_null() {
+        use arrow_array::builder::{Int64Builder, ListBuilder};
+        let values_builder = Int64Builder::new();
+        let mut builder = ListBuilder::new(values_builder);
+        builder.append_null();
+        let array = builder.finish();
+
+        let val = value_from_column(
+            &array,
+            &DataType::List(Box::new(DataType::Int64)),
+            0,
+            CrdtDecodeMode::Strict,
+        )
+        .unwrap();
+        assert_eq!(val, Value::Null);
+    }
+
+    #[test]
+    fn test_decode_unknown_type_returns_null() {
+        // Using a String array but decoding with an unhandled type should return Null
+        let mut builder = StringBuilder::new();
+        builder.append_value("test");
+        let array = builder.finish();
+
+        let val = value_from_column(
+            &array,
+            &DataType::Point(uni_common::core::schema::PointType::Geographic),
+            0,
+            CrdtDecodeMode::Strict,
+        );
+        // Point type falls through to the _ => Ok(Value::Null) arm
+        assert_eq!(val.unwrap(), Value::Null);
+    }
 }

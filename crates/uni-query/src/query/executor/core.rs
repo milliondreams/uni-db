@@ -826,3 +826,128 @@ impl Executor {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Accumulator tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_accumulator_count_basic() {
+        let mut acc = Accumulator::new("COUNT", false);
+        acc.update(&Value::Int(1), false);
+        acc.update(&Value::Null, false); // null skipped
+        acc.update(&Value::Int(2), false);
+        assert_eq!(acc.finish(), Value::Int(2));
+    }
+
+    #[test]
+    fn test_accumulator_count_wildcard() {
+        let mut acc = Accumulator::new("COUNT", false);
+        acc.update(&Value::Int(1), true);
+        acc.update(&Value::Null, true); // wildcard counts nulls
+        acc.update(&Value::Int(2), true);
+        assert_eq!(acc.finish(), Value::Int(3));
+    }
+
+    #[test]
+    fn test_accumulator_sum() {
+        let mut acc = Accumulator::new("SUM", false);
+        acc.update(&Value::Int(10), false);
+        acc.update(&Value::Float(2.5), false);
+        acc.update(&Value::Null, false); // null skipped
+        assert_eq!(acc.finish(), Value::Float(12.5));
+    }
+
+    #[test]
+    fn test_accumulator_avg() {
+        let mut acc = Accumulator::new("AVG", false);
+        acc.update(&Value::Int(10), false);
+        acc.update(&Value::Int(20), false);
+        acc.update(&Value::Int(30), false);
+        assert_eq!(acc.finish(), Value::Float(20.0));
+    }
+
+    #[test]
+    fn test_accumulator_avg_empty() {
+        let acc = Accumulator::new("AVG", false);
+        assert_eq!(acc.finish(), Value::Null);
+    }
+
+    #[test]
+    fn test_accumulator_min_max() {
+        let mut min_acc = Accumulator::new("MIN", false);
+        let mut max_acc = Accumulator::new("MAX", false);
+        for v in &[Value::Int(3), Value::Int(1), Value::Int(2)] {
+            min_acc.update(v, false);
+            max_acc.update(v, false);
+        }
+        assert_eq!(min_acc.finish(), Value::Int(1));
+        assert_eq!(max_acc.finish(), Value::Int(3));
+    }
+
+    #[test]
+    fn test_accumulator_collect() {
+        let mut acc = Accumulator::new("COLLECT", false);
+        acc.update(&Value::String("a".into()), false);
+        acc.update(&Value::Null, false); // null skipped
+        acc.update(&Value::String("b".into()), false);
+        assert_eq!(
+            acc.finish(),
+            Value::List(vec![
+                Value::String("a".into()),
+                Value::String("b".into()),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_accumulator_count_distinct() {
+        let mut acc = Accumulator::new("COUNT", true);
+        acc.update(&Value::String("a".into()), false);
+        acc.update(&Value::String("b".into()), false);
+        acc.update(&Value::String("a".into()), false); // duplicate
+        acc.update(&Value::Null, false); // null skipped
+        assert_eq!(acc.finish(), Value::Int(2));
+    }
+
+    #[test]
+    fn test_accumulator_percentile_empty() {
+        let acc = Accumulator::new_with_percentile("PERCENTILEDISC", false, 0.5);
+        assert_eq!(acc.finish(), Value::Null);
+    }
+
+    // ── compare_values tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_compare_values_int_ordering() {
+        assert!(Executor::compare_values(&Value::Int(1), &Value::Int(2)).is_lt());
+        assert!(Executor::compare_values(&Value::Int(5), &Value::Int(5)).is_eq());
+        assert!(Executor::compare_values(&Value::Int(9), &Value::Int(3)).is_gt());
+    }
+
+    #[test]
+    fn test_compare_values_null_last() {
+        // Null should sort after everything
+        assert!(Executor::compare_values(&Value::Int(1), &Value::Null).is_lt());
+        assert!(Executor::compare_values(&Value::Null, &Value::Int(1)).is_gt());
+        assert!(Executor::compare_values(&Value::Null, &Value::Null).is_eq());
+    }
+
+    #[test]
+    fn test_compare_values_cross_type_rank() {
+        // String should sort before Bool which sorts before Int
+        assert!(
+            Executor::compare_values(&Value::String("z".into()), &Value::Bool(false)).is_lt()
+        );
+        assert!(Executor::compare_values(&Value::Bool(true), &Value::Int(1)).is_lt());
+    }
+
+    #[test]
+    fn test_compare_values_lists() {
+        let l1 = Value::List(vec![Value::Int(1), Value::Int(2)]);
+        let l2 = Value::List(vec![Value::Int(1), Value::Int(3)]);
+        assert!(Executor::compare_values(&l1, &l2).is_lt());
+    }
+}

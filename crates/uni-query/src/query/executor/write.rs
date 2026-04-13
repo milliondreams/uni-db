@@ -2977,3 +2977,169 @@ impl Executor {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── merge_props tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_merge_props_replace_tombstones_missing_keys() {
+        let current: HashMap<String, Value> = [
+            ("name".into(), Value::String("Alice".into())),
+            ("age".into(), Value::Int(30)),
+        ]
+        .into();
+        let incoming: HashMap<String, Value> =
+            [("name".into(), Value::String("Bob".into()))].into();
+
+        let result = Executor::merge_props(current, incoming, true);
+        assert_eq!(result.get("name"), Some(&Value::String("Bob".into())));
+        assert_eq!(
+            result.get("age"),
+            Some(&Value::Null),
+            "Missing keys should be tombstoned in replace mode"
+        );
+    }
+
+    #[test]
+    fn test_merge_props_merge_preserves_existing() {
+        let current: HashMap<String, Value> = [
+            ("name".into(), Value::String("Alice".into())),
+            ("age".into(), Value::Int(30)),
+        ]
+        .into();
+        let incoming: HashMap<String, Value> =
+            [("city".into(), Value::String("NYC".into()))].into();
+
+        let result = Executor::merge_props(current, incoming, false);
+        assert_eq!(result.get("name"), Some(&Value::String("Alice".into())));
+        assert_eq!(result.get("age"), Some(&Value::Int(30)));
+        assert_eq!(result.get("city"), Some(&Value::String("NYC".into())));
+    }
+
+    #[test]
+    fn test_merge_props_null_incoming_is_tombstone() {
+        let current: HashMap<String, Value> =
+            [("name".into(), Value::String("Alice".into()))].into();
+        let incoming: HashMap<String, Value> = [("name".into(), Value::Null)].into();
+
+        // Merge mode: null overwrites
+        let result = Executor::merge_props(current.clone(), incoming.clone(), false);
+        assert_eq!(result.get("name"), Some(&Value::Null));
+
+        // Replace mode: null is tombstone
+        let result = Executor::merge_props(current, incoming, true);
+        assert_eq!(result.get("name"), Some(&Value::Null));
+    }
+
+    #[test]
+    fn test_merge_props_empty_current() {
+        let current: HashMap<String, Value> = HashMap::new();
+        let incoming: HashMap<String, Value> =
+            [("name".into(), Value::String("Alice".into()))].into();
+
+        let result = Executor::merge_props(current, incoming, false);
+        assert_eq!(result.get("name"), Some(&Value::String("Alice".into())));
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn test_merge_props_empty_incoming_replace_tombstones_all() {
+        let current: HashMap<String, Value> = [
+            ("name".into(), Value::String("Alice".into())),
+            ("age".into(), Value::Int(30)),
+        ]
+        .into();
+        let incoming: HashMap<String, Value> = HashMap::new();
+
+        let result = Executor::merge_props(current, incoming, true);
+        assert_eq!(result.get("name"), Some(&Value::Null));
+        assert_eq!(result.get("age"), Some(&Value::Null));
+    }
+
+    // ── extract_labels_from_node tests ───────────────────────────────
+
+    #[test]
+    fn test_extract_labels_from_map() {
+        let mut map = HashMap::new();
+        map.insert("_vid".into(), Value::Int(1));
+        map.insert(
+            "_labels".into(),
+            Value::List(vec![
+                Value::String("Person".into()),
+                Value::String("Employee".into()),
+            ]),
+        );
+        let val = Value::Map(map);
+
+        let labels = Executor::extract_labels_from_node(&val);
+        assert_eq!(
+            labels,
+            Some(vec!["Person".to_string(), "Employee".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_extract_labels_from_value_node() {
+        let node = uni_common::Node {
+            vid: uni_common::core::id::Vid::from(1u64),
+            labels: vec!["Person".to_string()],
+            properties: HashMap::new(),
+        };
+        let labels = Executor::extract_labels_from_node(&Value::Node(node));
+        assert_eq!(labels, Some(vec!["Person".to_string()]));
+    }
+
+    #[test]
+    fn test_extract_labels_non_node_returns_none() {
+        assert_eq!(Executor::extract_labels_from_node(&Value::Int(42)), None);
+        assert_eq!(
+            Executor::extract_labels_from_node(&Value::String("hello".into())),
+            None
+        );
+    }
+
+    // ── extract_user_properties_from_value tests ─────────────────────
+
+    #[test]
+    fn test_extract_user_props_strips_internal_keys() {
+        let mut map = HashMap::new();
+        map.insert("_vid".into(), Value::Int(1));
+        map.insert(
+            "_labels".into(),
+            Value::List(vec![Value::String("Person".into())]),
+        );
+        map.insert("name".into(), Value::String("Alice".into()));
+        map.insert("age".into(), Value::Int(30));
+
+        let props = Executor::extract_user_properties_from_value(&Value::Map(map)).unwrap();
+        assert_eq!(props.get("name"), Some(&Value::String("Alice".into())));
+        assert_eq!(props.get("age"), Some(&Value::Int(30)));
+        assert!(!props.contains_key("_vid"));
+        assert!(!props.contains_key("_labels"));
+    }
+
+    #[test]
+    fn test_extract_user_props_plain_map_returns_as_is() {
+        let mut map = HashMap::new();
+        map.insert("key".into(), Value::String("value".into()));
+
+        let props = Executor::extract_user_properties_from_value(&Value::Map(map.clone())).unwrap();
+        assert_eq!(props, map);
+    }
+
+    #[test]
+    fn test_extract_user_props_from_value_node() {
+        let mut properties = HashMap::new();
+        properties.insert("name".into(), Value::String("Alice".into()));
+        let node = uni_common::Node {
+            vid: uni_common::core::id::Vid::from(1u64),
+            labels: vec!["Person".to_string()],
+            properties,
+        };
+        let props = Executor::extract_user_properties_from_value(&Value::Node(node)).unwrap();
+        assert_eq!(props.get("name"), Some(&Value::String("Alice".into())));
+    }
+}

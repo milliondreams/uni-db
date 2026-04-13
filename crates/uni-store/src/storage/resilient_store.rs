@@ -369,3 +369,170 @@ impl ObjectStore for ResilientObjectStore {
         .await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use object_store::memory::InMemory;
+
+    // ── CircuitBreaker unit tests ────────────────────────────────────
+
+    #[test]
+    fn test_circuit_breaker_starts_closed() {
+        let cb = CircuitBreaker::new(5, Duration::from_secs(30));
+        assert!(cb.allow_request());
+        assert_eq!(cb.failures.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_cb_closed_to_open_after_threshold() {
+        let cb = CircuitBreaker::new(5, Duration::from_secs(30));
+        for _ in 0..5 {
+            cb.report_failure();
+        }
+        assert!(!cb.allow_request(), "CB should be open after 5 failures");
+    }
+
+    #[test]
+    fn test_cb_stays_closed_below_threshold() {
+        let cb = CircuitBreaker::new(5, Duration::from_secs(30));
+        for _ in 0..4 {
+            cb.report_failure();
+        }
+        assert!(cb.allow_request(), "CB should stay closed with 4 failures");
+    }
+
+    #[test]
+    fn test_cb_open_to_half_open_after_timeout() {
+        let cb = CircuitBreaker::new(2, Duration::from_millis(1));
+        cb.report_failure();
+        cb.report_failure();
+        assert!(!cb.allow_request(), "CB should be open");
+
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(
+            cb.allow_request(),
+            "CB should allow probe after reset timeout"
+        );
+    }
+
+    #[test]
+    fn test_cb_half_open_to_closed_on_success() {
+        let cb = CircuitBreaker::new(2, Duration::from_millis(1));
+        cb.report_failure();
+        cb.report_failure();
+        std::thread::sleep(Duration::from_millis(5));
+
+        // In half-open state, report success
+        cb.report_success();
+        assert_eq!(cb.failures.load(Ordering::Relaxed), 0);
+        assert!(cb.allow_request());
+    }
+
+    #[test]
+    fn test_cb_half_open_to_open_on_failure() {
+        let cb = CircuitBreaker::new(2, Duration::from_millis(1));
+        cb.report_failure();
+        cb.report_failure();
+        std::thread::sleep(Duration::from_millis(5));
+
+        // In half-open state, report another failure
+        cb.report_failure();
+        assert!(
+            !cb.allow_request(),
+            "CB should be open again after failure in half-open"
+        );
+    }
+
+    #[test]
+    fn test_cb_success_resets_failures() {
+        let cb = CircuitBreaker::new(5, Duration::from_secs(30));
+        cb.report_failure();
+        cb.report_failure();
+        cb.report_failure();
+        assert_eq!(cb.failures.load(Ordering::Relaxed), 3);
+
+        cb.report_success();
+        assert_eq!(cb.failures.load(Ordering::Relaxed), 0);
+    }
+
+    // ── ResilientObjectStore integration tests ───────────────────────
+
+    #[tokio::test]
+    async fn test_resilient_store_retry_succeeds() {
+        // InMemory store succeeds on first try — verify success path
+        let inner = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let config = ObjectStoreConfig {
+            connect_timeout: Duration::from_secs(5),
+            max_retries: 3,
+            retry_backoff_base: Duration::from_millis(1),
+            retry_backoff_max: Duration::from_millis(10),
+            read_timeout: Duration::from_secs(5),
+            write_timeout: Duration::from_secs(5),
+        };
+        let store = ResilientObjectStore::new(inner, config);
+
+        // Write and read back
+        let path = Path::from("test/key");
+        store
+            .put(&path, PutPayload::from_static(b"hello"))
+            .await
+            .unwrap();
+        let result = store.get(&path).await.unwrap();
+        let bytes = result.bytes().await.unwrap();
+        assert_eq!(bytes.as_ref(), b"hello");
+
+        // CB should be healthy
+        assert_eq!(store.cb.failures.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn test_resilient_store_circuit_open_rejects() {
+        let inner = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let config = ObjectStoreConfig {
+            connect_timeout: Duration::from_secs(5),
+            max_retries: 1,
+            retry_backoff_base: Duration::from_millis(1),
+            retry_backoff_max: Duration::from_millis(10),
+            read_timeout: Duration::from_secs(5),
+            write_timeout: Duration::from_secs(5),
+        };
+        let store = ResilientObjectStore::new(inner, config);
+
+        // Manually trip the circuit breaker
+        for _ in 0..5 {
+            store.cb.report_failure();
+        }
+
+        // All operations should fail with circuit breaker error
+        let err = store.get(&Path::from("any")).await.unwrap_err();
+        assert!(
+            err.to_string().contains("Circuit breaker open"),
+            "Expected circuit breaker error, got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resilient_store_not_found_skips_retry() {
+        let inner = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let config = ObjectStoreConfig {
+            connect_timeout: Duration::from_secs(5),
+            max_retries: 3,
+            retry_backoff_base: Duration::from_millis(1),
+            retry_backoff_max: Duration::from_millis(10),
+            read_timeout: Duration::from_secs(5),
+            write_timeout: Duration::from_secs(5),
+        };
+        let store = ResilientObjectStore::new(inner, config);
+
+        // Get a non-existent key — should return error but NOT increment CB
+        let err = store.get(&Path::from("nonexistent")).await.unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("not found"));
+        assert_eq!(
+            store.cb.failures.load(Ordering::Relaxed),
+            0,
+            "Not-found errors should not count as CB failures"
+        );
+    }
+}

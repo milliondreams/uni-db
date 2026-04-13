@@ -644,4 +644,33 @@ mod tests {
             "10M rows should be 1-2 GB"
         );
     }
+
+    #[test]
+    fn test_check_oom_guard_below_limit() {
+        let result = check_oom_guard(1_000_000, 5_000_000, "KNOWS", "fwd");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_check_oom_guard_at_limit() {
+        let result = check_oom_guard(5_000_000, 5_000_000, "KNOWS", "fwd");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_check_oom_guard_above_limit() {
+        let result = check_oom_guard(5_000_001, 5_000_000, "KNOWS", "fwd");
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("KNOWS_fwd"), "Error should name the entity");
+        assert!(msg.contains("5000001"), "Error should state the row count");
+        assert!(msg.contains("GB"), "Error should show GB estimate");
+        assert!(msg.contains("issue #143"), "Error should reference issue");
+    }
+
+    #[test]
+    fn test_op_values() {
+        assert_eq!(Op::Insert as u8, 0);
+        assert_eq!(Op::Delete as u8, 1);
+    }
 }

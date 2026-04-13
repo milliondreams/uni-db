@@ -641,3 +641,30 @@ async fn test_in_query_call_with_yield_star_fails_unexpected_syntax() {
         "UnexpectedSyntax",
     );
 }
+
+// ── Plan node generation tests ───────────────────────────────────────
+
+/// Verify that planning a window function (ROW_NUMBER) succeeds.
+#[tokio::test]
+async fn test_plan_window_function() {
+    let (schema_manager, _dir) = setup_schema().await;
+    schema_manager.add_label("Person").unwrap();
+    schema_manager
+        .add_property("Person", "name", DataType::String, true)
+        .unwrap();
+    schema_manager
+        .add_property("Person", "age", DataType::Int32, true)
+        .unwrap();
+    let planner = planner_from(&schema_manager);
+
+    let ast =
+        uni_cypher::parse("MATCH (n:Person) RETURN n.name, ROW_NUMBER() OVER (ORDER BY n.age) AS rn")
+            .unwrap();
+    let plan = planner.plan(ast);
+    assert!(
+        plan.is_ok(),
+        "Window function should plan successfully: {:?}",
+        plan
+    );
+}
+

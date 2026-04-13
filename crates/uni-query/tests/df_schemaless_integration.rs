@@ -274,3 +274,69 @@ async fn test_optional_traverse_main_by_type() {
         "Should return both vertices with NULL target"
     );
 }
+
+// ── Schemaless expansion tests ───────────────────────────────────────
+
+#[tokio::test]
+async fn test_schemaless_create_unknown_label() {
+    let temp_dir = tempdir().unwrap();
+    let path = temp_dir.path();
+    let (executor, prop_manager, schema_manager, _) = setup_executor(path).await;
+    let planner = QueryPlanner::new(schema_manager.schema());
+
+    // Create a vertex with a label NOT registered in the schema
+    let create_sql = "CREATE (a:Animal {species: 'Cat'}) RETURN a.species AS species";
+    let query = uni_cypher::parse(create_sql).unwrap();
+    let plan = planner.plan(query).unwrap();
+    let results = executor
+        .execute(plan, &prop_manager, &HashMap::new())
+        .await
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+
+    // Now match by that unknown label
+    let match_sql = "MATCH (a:Animal) RETURN a.species AS species";
+    let query = uni_cypher::parse(match_sql).unwrap();
+    let plan = planner.plan(query).unwrap();
+    let results = executor
+        .execute(plan, &prop_manager, &HashMap::new())
+        .await
+        .unwrap();
+
+    assert_eq!(results.len(), 1, "Schemaless label should be queryable");
+}
+
+#[tokio::test]
+async fn test_schemaless_aggregation() {
+    let temp_dir = tempdir().unwrap();
+    let path = temp_dir.path();
+    let (executor, prop_manager, schema_manager, _) = setup_executor(path).await;
+    let planner = QueryPlanner::new(schema_manager.schema());
+
+    // Create multiple nodes
+    let create_sql =
+        "CREATE (:Person {name: 'A'}), (:Person {name: 'B'}), (:Person {name: 'C'})";
+    let query = uni_cypher::parse(create_sql).unwrap();
+    let plan = planner.plan(query).unwrap();
+    executor
+        .execute(plan, &prop_manager, &HashMap::new())
+        .await
+        .unwrap();
+
+    // Aggregate
+    let match_sql = "MATCH (n:Person) RETURN count(n) AS cnt";
+    let query = uni_cypher::parse(match_sql).unwrap();
+    let plan = planner.plan(query).unwrap();
+    let results = executor
+        .execute(plan, &prop_manager, &HashMap::new())
+        .await
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0].get("cnt"),
+        Some(&uni_common::Value::Int(3)),
+        "Should count 3 nodes"
+    );
+}

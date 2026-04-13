@@ -1,113 +1,49 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Dragonscale Team
-
-//! # Persistence Restart Integration Test
-//!
-//! Verifies that data written to the database actually persists to disk
-//! and can be recovered after a complete "restart" (dropping all memory state).
+//
+// Verifies that data written to the database persists to disk and survives restart.
 
 use anyhow::Result;
-use std::collections::HashMap;
-use std::sync::Arc;
 use tempfile::tempdir;
-use uni_db::core::id::Vid;
-use uni_db::core::schema::{DataType, SchemaManager};
-use uni_db::runtime::writer::Writer;
-use uni_db::storage::manager::StorageManager;
-use uni_db::store::backend::table_names;
-use uni_db::store::backend::types::{ColumnProjection, ScanRequest};
+use uni_db::{DataType, Uni};
 
 #[tokio::test]
 async fn test_data_survives_restart() -> Result<()> {
     let temp_dir = tempdir()?;
-    let path = temp_dir.path();
-    let schema_path = path.join("schema.json");
-    let storage_path = path.join("storage");
-    let storage_str = storage_path.to_str().unwrap();
+    let path = temp_dir.path().to_str().unwrap().to_string();
 
-    // --- PHASE 1: Write and Flush ---
+    // --- PHASE 1: Write data and shut down ---
     {
-        // 1. Setup Schema
-        let schema_manager = SchemaManager::load(&schema_path).await?;
-        let _label_id = schema_manager.add_label("Person")?;
-        schema_manager.add_property("Person", "name", DataType::String, false)?;
-        schema_manager.save().await?;
-        let schema_manager = Arc::new(schema_manager);
-
-        let storage = Arc::new(StorageManager::new(storage_str, schema_manager.clone()).await?);
-        let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 0)
-            .await
-            .unwrap();
-
-        // 2. Insert Data
-        let vid = Vid::new(42);
-        let mut props = HashMap::new();
-        props.insert(
-            "name".to_string(),
-            serde_json::json!("PersistenceCheck").into(),
-        );
-        writer
-            .insert_vertex_with_labels(vid, props, &["Person".to_string()], None)
+        let db = Uni::open(&path).build().await?;
+        db.schema()
+            .label("Person")
+            .property("name", DataType::String)
+            .apply()
             .await?;
 
-        // 3. Flush to Disk
-        writer.flush_to_l1(None).await?;
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (:Person {name: 'PersistenceCheck'})")
+            .await?;
+        tx.commit().await?;
 
-        // 4. Verify explicit file existence (White-box check)
-        // LanceDB creates a directory with .lance extension
-        let vertex_path = storage_path.join("vertices_Person.lance");
-        if !vertex_path.exists() {
-            println!("Storage content ({:?}):", storage_path);
-            if let Ok(entries) = std::fs::read_dir(&storage_path) {
-                for entry in entries {
-                    println!("{:?}", entry.unwrap().path());
-                }
-            } else {
-                println!("Could not read storage dir");
-            }
-        }
-        assert!(
-            vertex_path.exists(),
-            "Vertex dataset directory should exist at {:?}",
-            vertex_path
-        );
-        assert!(
-            vertex_path.join("data").exists(),
-            "Data directory should exist"
-        );
+        // Flush to disk
+        db.flush().await?;
+
+        // db is dropped here, simulating shutdown
     }
-    // `writer`, `storage`, `schema_manager` are dropped here, simulating shutdown.
 
-    // --- PHASE 2: Restart and Verify ---
+    // --- PHASE 2: Restart and verify data survived ---
     {
-        // 1. Re-load Schema
-        let schema_manager = SchemaManager::load(&schema_path).await?;
-        let schema_manager = Arc::new(schema_manager);
+        let db = Uni::open(&path).build().await?;
 
-        // 2. Re-initialize Storage (Cold Start)
-        let storage = Arc::new(StorageManager::new(storage_str, schema_manager.clone()).await?);
+        let result = db
+            .session()
+            .query("MATCH (n:Person) RETURN n.name AS name")
+            .await?;
 
-        // 3. Verify Data via backend API
-        let table_name = table_names::vertex_table_name("Person");
-        let count = storage.backend().count_rows(&table_name, None).await?;
-        assert_eq!(count, 1, "Data should persist after restart");
-
-        // 4. Verify Data Content via backend scan
-        let scan_req = ScanRequest {
-            table_name: table_name.clone(),
-            columns: ColumnProjection::Columns(vec!["name".to_string()]),
-            filter: uni_store::backend::types::FilterExpr::None,
-            limit: None,
-        };
-        let batches = storage.backend().scan(scan_req).await?;
-        assert!(!batches.is_empty(), "Should have at least one batch");
-        let batch = &batches[0];
-        let name_col = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<arrow_array::StringArray>()
-            .unwrap();
-        assert_eq!(name_col.value(0), "PersistenceCheck");
+        assert_eq!(result.len(), 1, "Data should persist after restart");
+        assert_eq!(result.rows()[0].get::<String>("name")?, "PersistenceCheck");
     }
 
     Ok(())

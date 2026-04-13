@@ -181,7 +181,7 @@ impl GraphVectorKnnExec {
 
     /// Evaluate the query expression to extract the query vector.
     fn evaluate_query_vector(&self) -> DFResult<Vec<f32>> {
-        let value = evaluate_simple_expr(&self.query_expr, &self.params)?;
+        let value = evaluate_simple_expr(&self.query_expr, &self.params, &HashMap::new())?;
 
         match value {
             Value::Vector(vec) => Ok(vec),
@@ -592,7 +592,7 @@ mod tests {
             Expr::Literal(CypherLiteral::Float(0.3)),
         ]);
 
-        let result = evaluate_simple_expr(&expr, &HashMap::new()).unwrap();
+        let result = evaluate_simple_expr(&expr, &HashMap::new(), &HashMap::new()).unwrap();
         match result {
             Value::List(arr) => {
                 assert_eq!(arr.len(), 3);
@@ -610,7 +610,7 @@ mod tests {
             Value::List(vec![Value::Float(0.1), Value::Float(0.2)]),
         );
 
-        let result = evaluate_simple_expr(&expr, &params).unwrap();
+        let result = evaluate_simple_expr(&expr, &params, &HashMap::new()).unwrap();
         match result {
             Value::List(arr) => {
                 assert_eq!(arr.len(), 2);

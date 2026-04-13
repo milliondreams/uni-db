@@ -1551,6 +1551,7 @@ impl HybridPhysicalPlanner {
             arguments.to_vec(),
             yield_items.to_vec(),
             self.params.clone(),
+            self.outer_values.clone(),
             target_properties,
         );
 

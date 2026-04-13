@@ -439,7 +439,62 @@ async fn test_recursive_cte_execution() {
     );
 }
 
+// ── EXISTS subquery test ─────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_exists_subquery() {
+    let dir = tempdir().unwrap();
+    let (executor, prop_manager, _schema, planner) = setup_graph_executor(dir.path()).await;
+    seed_test_data(&executor, &planner, &prop_manager).await;
+
+    // Alice and Bob have outgoing KNOWS edges, Charlie does not
+    let rows = execute_cypher(
+        &executor,
+        &planner,
+        &prop_manager,
+        "MATCH (n:Person) WHERE EXISTS { MATCH (n)-[:KNOWS]->() } RETURN n.name AS name ORDER BY name",
+    )
+    .await;
+
+    // Alice->Bob and Bob->Charlie, so Alice and Bob have outgoing KNOWS
+    assert_eq!(rows.len(), 2, "Only persons with outgoing KNOWS should match");
+    let names: Vec<&str> = rows
+        .iter()
+        .filter_map(|r| r.get("name").and_then(|v| v.as_str()))
+        .collect();
+    assert!(names.contains(&"Alice"));
+    assert!(names.contains(&"Bob"));
+}
+
+// ── Time-travel read-only enforcement test ───────────────────────────
+
+#[tokio::test]
+async fn test_time_travel_read_only_enforcement() {
+    // validate_read_only works on the AST (Query), rejecting write clauses
+    let write_query = uni_cypher::parse("CREATE (:Person {name: 'Bob'})").unwrap();
+    let result = uni_query::validate_read_only(&write_query);
+    assert!(
+        result.is_err(),
+        "CREATE should be rejected as non-read-only"
+    );
+
+    let read_query = uni_cypher::parse("MATCH (n:Person) RETURN n").unwrap();
+    let result = uni_query::validate_read_only(&read_query);
+    assert!(
+        result.is_ok(),
+        "MATCH RETURN should be considered read-only"
+    );
+
+    // SET is a mutation too
+    let set_query =
+        uni_cypher::parse("MATCH (n:Person) SET n.age = 30 RETURN n").unwrap();
+    let result = uni_query::validate_read_only(&set_query);
+    assert!(
+        result.is_err(),
+        "SET should be rejected as non-read-only"
+    );
+}
+
 // ── Advanced execution tests ─────────────────────────────────────────
-// NOTE: Procedure calls (CALL db.labels()) and time-travel queries require
-// additional setup (ProcedureRegistry, snapshot pinning) that goes beyond
+// NOTE: Procedure calls (CALL db.labels()) require a ProcedureRegistry
 // the basic executor setup. These are covered by the TCK test suite.

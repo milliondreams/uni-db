@@ -379,7 +379,40 @@ pub fn eval_datetime_function(name: &str, args: &[Value]) -> Result<Value> {
         "DURATION.INDAYS" => eval_duration_in_days(args),
         "DURATION.INSECONDS" => eval_duration_in_seconds(args),
 
+        // BTIC temporal interval constructor
+        "BTIC" => eval_btic(args),
+
         _ => Err(anyhow!("Unknown datetime function: {}", name)),
+    }
+}
+
+/// Construct a BTIC temporal interval from a string literal.
+///
+/// Accepts ISO 8601 inspired formats via `uni_btic::parse::parse_btic_literal`:
+/// - `btic('1985')` → year interval
+/// - `btic('1985-03/2024-06')` → range with solidus
+/// - `btic('~1985')` → approximate certainty
+/// - `btic('2020-03/')` → ongoing (unbounded hi)
+/// - `btic('/')` → fully unbounded
+fn eval_btic(args: &[Value]) -> Result<Value> {
+    if args.is_empty() {
+        return Err(anyhow!("btic() requires exactly 1 argument"));
+    }
+    if args.len() > 1 {
+        return Err(anyhow!("btic() accepts 1 argument, got {}", args.len()));
+    }
+    match &args[0] {
+        Value::Null => Ok(Value::Null),
+        Value::String(s) => {
+            let btic = uni_btic::parse::parse_btic_literal(s)
+                .map_err(|e| anyhow!("btic('{}') parse error: {}", s, e))?;
+            Ok(Value::Temporal(uni_common::TemporalValue::Btic {
+                lo: btic.lo(),
+                hi: btic.hi(),
+                meta: btic.meta(),
+            }))
+        }
+        other => Err(anyhow!("btic() argument must be a string, got: {}", other)),
     }
 }
 

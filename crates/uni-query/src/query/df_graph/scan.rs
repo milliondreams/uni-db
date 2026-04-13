@@ -2293,6 +2293,11 @@ pub(crate) fn build_property_column_static(
                             }
                         }
                     }
+                    Some(val @ Value::Temporal(_)) => {
+                        // Temporal values (including BTIC) must be encoded directly
+                        // via CypherValue codec — serde_json round-trip loses the type.
+                        builder.append_value(uni_common::cypher_value_codec::encode(&val));
+                    }
                     Some(val) => {
                         // Value from PropertyManager — convert to serde_json and re-encode to CypherValue binary
                         let json_val: serde_json::Value = val.into();
@@ -2542,6 +2547,36 @@ pub(crate) fn build_property_column_static(
         }
         DataType::Struct(fields) => {
             build_struct_property_column(vids, props_map, prop_name, fields)
+        }
+        DataType::FixedSizeBinary(24) => {
+            // BTIC temporal interval columns: encode as FixedSizeBinary(24)
+            use arrow_array::builder::FixedSizeBinaryBuilder;
+            const BTIC_LEN: i32 = 24;
+            let mut builder = FixedSizeBinaryBuilder::with_capacity(vids.len(), BTIC_LEN);
+            for vid in vids {
+                match get_property_value(vid, props_map, prop_name) {
+                    Some(Value::Temporal(uni_common::TemporalValue::Btic { lo, hi, meta })) => {
+                        match uni_btic::Btic::new(lo, hi, meta) {
+                            Ok(b) => {
+                                builder
+                                    .append_value(uni_btic::encode::encode(&b))
+                                    .map_err(arrow_err)?;
+                            }
+                            Err(_) => builder.append_null(),
+                        }
+                    }
+                    Some(Value::String(s)) => match uni_btic::parse::parse_btic_literal(&s) {
+                        Ok(b) => {
+                            builder
+                                .append_value(uni_btic::encode::encode(&b))
+                                .map_err(arrow_err)?;
+                        }
+                        Err(_) => builder.append_null(),
+                    },
+                    _ => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
         }
         // Default: convert to string
         _ => {

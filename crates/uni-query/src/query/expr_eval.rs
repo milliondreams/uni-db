@@ -1735,13 +1735,14 @@ pub fn eval_scalar_function(
             eval_string_function(&name_upper, args)
         }
 
-        // Date/Time functions
+        // Date/Time/BTIC functions
         "DATE"
         | "TIME"
         | "DATETIME"
         | "LOCALDATETIME"
         | "LOCALTIME"
         | "DURATION"
+        | "BTIC"
         | "YEAR"
         | "MONTH"
         | "DAY"

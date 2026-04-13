@@ -535,6 +535,24 @@ pub fn arrow_to_value(col: &dyn Array, row: usize, data_type: Option<&DataType>)
         });
     }
 
+    // FixedSizeBinary(24) — BTIC temporal interval
+    if let Some(fsb) = col.as_any().downcast_ref::<FixedSizeBinaryArray>()
+        && fsb.value_length() == 24
+    {
+        let bytes = fsb.value(row);
+        return match uni_btic::encode::decode_slice(bytes) {
+            Ok(btic) => Value::Temporal(uni_common::TemporalValue::Btic {
+                lo: btic.lo(),
+                hi: btic.hi(),
+                meta: btic.meta(),
+            }),
+            Err(e) => {
+                log::warn!("BTIC decode error: {}", e);
+                Value::Null
+            }
+        };
+    }
+
     // Binary (CRDT MessagePack) - decode to Value via serde_json boundary
     if let Some(b) = col.as_any().downcast_ref::<BinaryArray>() {
         let bytes = b.value(row);
@@ -638,18 +656,28 @@ fn values_to_float64_array(values: &[Value]) -> ArrayRef {
 fn values_to_fixed_size_binary_array(values: &[Value], size: i32) -> Result<ArrayRef> {
     let mut builder = FixedSizeBinaryBuilder::with_capacity(values.len(), size);
     for v in values {
-        if let Value::List(bytes) = v {
-            let b: Vec<u8> = bytes
-                .iter()
-                .map(|bv| bv.as_u64().unwrap_or(0) as u8)
-                .collect();
-            if b.len() as i32 == size {
-                builder.append_value(&b)?;
-            } else {
-                builder.append_null();
+        match v {
+            Value::Temporal(uni_common::TemporalValue::Btic { lo, hi, meta }) if size == 24 => {
+                let btic = uni_btic::Btic::new(*lo, *hi, *meta)
+                    .map_err(|e| anyhow!("invalid BTIC value: {}", e))?;
+                builder.append_value(uni_btic::encode::encode(&btic))?;
             }
-        } else {
-            builder.append_null();
+            Value::String(s) if size == 24 => match uni_btic::parse::parse_btic_literal(s) {
+                Ok(b) => builder.append_value(uni_btic::encode::encode(&b))?,
+                Err(_) => builder.append_null(),
+            },
+            Value::List(bytes) => {
+                let b: Vec<u8> = bytes
+                    .iter()
+                    .map(|bv| bv.as_u64().unwrap_or(0) as u8)
+                    .collect();
+                if b.len() as i32 == size {
+                    builder.append_value(&b)?;
+                } else {
+                    builder.append_null();
+                }
+            }
+            _ => builder.append_null(),
         }
     }
     Ok(Arc::new(builder.finish()))

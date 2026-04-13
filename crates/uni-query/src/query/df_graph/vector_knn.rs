@@ -618,4 +618,42 @@ mod tests {
             _ => panic!("Expected list"),
         }
     }
+
+    #[test]
+    fn test_build_schema_with_extra_properties() {
+        let extra_props = vec!["name".to_string(), "embedding".to_string()];
+        let schema = GraphVectorKnnExec::build_schema("doc", &extra_props, None);
+
+        // Should have base fields + extra properties
+        assert!(schema.field_with_name("doc._vid").is_ok());
+        assert!(schema.field_with_name("doc").is_ok());
+        assert!(schema.field_with_name("doc._score").is_ok());
+        assert!(
+            schema.field_with_name("doc.name").is_ok(),
+            "Extra property 'name' should be in schema"
+        );
+        assert!(
+            schema.field_with_name("doc.embedding").is_ok(),
+            "Extra property 'embedding' should be in schema"
+        );
+    }
+
+    #[test]
+    fn test_evaluate_variable() {
+        // Test that a variable expression resolves to the variable's value
+        let expr = Expr::Variable("x".to_string());
+        let mut variables = HashMap::new();
+        variables.insert(
+            "x".to_string(),
+            Value::List(vec![Value::Float(0.5), Value::Float(0.6)]),
+        );
+
+        let result = evaluate_simple_expr(&expr, &HashMap::new(), &variables).unwrap();
+        match result {
+            Value::List(arr) => {
+                assert_eq!(arr.len(), 2);
+            }
+            _ => panic!("Expected list, got {:?}", result),
+        }
+    }
 }

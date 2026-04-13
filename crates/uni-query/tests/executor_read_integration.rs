@@ -406,6 +406,39 @@ async fn test_case_expression() {
     }
 }
 
+// ── Recursive CTE test ───────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_recursive_cte_execution() {
+    let dir = tempdir().unwrap();
+    let (executor, prop_manager, _schema, planner) = setup_graph_executor(dir.path()).await;
+    seed_test_data(&executor, &planner, &prop_manager).await;
+
+    // WITH RECURSIVE to find all reachable nodes from Alice via KNOWS
+    let rows = execute_cypher(
+        &executor,
+        &planner,
+        &prop_manager,
+        r#"
+        WITH RECURSIVE reachable AS (
+            MATCH (n:Person {name: 'Alice'}) RETURN n AS node
+            UNION
+            MATCH (prev:Person)-[:KNOWS]->(next:Person)
+            WHERE prev IN reachable
+            RETURN next AS node
+        )
+        MATCH (n) WHERE n IN reachable RETURN n.name AS name ORDER BY name
+        "#,
+    )
+    .await;
+
+    // Should reach Alice, Bob, Charlie
+    assert!(
+        !rows.is_empty(),
+        "Recursive CTE should return reachable nodes"
+    );
+}
+
 // ── Advanced execution tests ─────────────────────────────────────────
 // NOTE: Procedure calls (CALL db.labels()) and time-travel queries require
 // additional setup (ProcedureRegistry, snapshot pinning) that goes beyond

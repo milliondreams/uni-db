@@ -2970,4 +2970,120 @@ mod tests {
 
         Ok(())
     }
+
+    /// Test that flushing WAL on a writer with no mutations succeeds cleanly.
+    #[tokio::test]
+    async fn test_flush_wal_empty_l0_is_noop() -> Result<()> {
+        use crate::runtime::wal::WriteAheadLog;
+        use crate::storage::manager::StorageManager;
+        use object_store::local::LocalFileSystem;
+        use object_store::path::Path as ObjectStorePath;
+        use uni_common::core::schema::SchemaManager;
+
+        let dir = tempdir()?;
+        let path = dir.path().to_str().unwrap();
+        let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path())?);
+        let schema_path = ObjectStorePath::from("schema.json");
+
+        let schema_manager =
+            Arc::new(SchemaManager::load_from_store(store.clone(), &schema_path).await?);
+        schema_manager.save().await?;
+
+        let storage = Arc::new(StorageManager::new(path, schema_manager.clone()).await?);
+
+        let wal_path = ObjectStorePath::from("wal");
+        let wal = Arc::new(WriteAheadLog::new(store.clone(), wal_path));
+
+        let writer = Writer::new_with_config(
+            storage.clone(),
+            schema_manager.clone(),
+            1,
+            UniConfig::default(),
+            Some(wal.clone()),
+            None,
+        )
+        .await?;
+
+        // Flush with no mutations — should succeed cleanly
+        let lsn = writer.flush_wal().await?;
+        // LSN should be 0 or 1 (no real mutations flushed)
+        assert!(lsn <= 1, "Empty flush should produce low LSN, got {}", lsn);
+
+        Ok(())
+    }
+
+    /// Test that transaction data does not leak into main L0 without commit.
+    #[tokio::test]
+    async fn test_transaction_isolation_without_commit() -> Result<()> {
+        use crate::runtime::wal::WriteAheadLog;
+        use crate::storage::manager::StorageManager;
+        use object_store::local::LocalFileSystem;
+        use object_store::path::Path as ObjectStorePath;
+        use uni_common::core::schema::SchemaManager;
+
+        let dir = tempdir()?;
+        let path = dir.path().to_str().unwrap();
+        let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path())?);
+        let schema_path = ObjectStorePath::from("schema.json");
+
+        let schema_manager =
+            Arc::new(SchemaManager::load_from_store(store.clone(), &schema_path).await?);
+        let _label_id = schema_manager.add_label("Person")?;
+        schema_manager.save().await?;
+
+        let storage = Arc::new(StorageManager::new(path, schema_manager.clone()).await?);
+
+        let wal_path = ObjectStorePath::from("wal");
+        let wal = Arc::new(WriteAheadLog::new(store.clone(), wal_path));
+
+        let mut writer = Writer::new_with_config(
+            storage.clone(),
+            schema_manager.clone(),
+            1,
+            UniConfig::default(),
+            Some(wal),
+            None,
+        )
+        .await?;
+
+        // Create transaction L0
+        let tx_l0 = writer.create_transaction_l0();
+
+        // Insert vertex into transaction L0
+        let vid = writer.next_vid().await?;
+        writer
+            .insert_vertex_with_labels(
+                vid,
+                [("name".to_string(), Value::String("Ghost".to_string()))]
+                    .into_iter()
+                    .collect(),
+                &["Person".to_string()],
+                Some(&tx_l0),
+            )
+            .await?;
+
+        // Verify data is in transaction L0
+        assert!(
+            tx_l0.read().vertex_properties.contains_key(&vid),
+            "Transaction L0 should contain the vertex"
+        );
+
+        // Verify data is NOT in main L0
+        let main_l0 = writer.l0_manager.get_current();
+        assert!(
+            !main_l0.read().vertex_properties.contains_key(&vid),
+            "Main L0 should NOT contain uncommitted transaction data"
+        );
+
+        // Drop transaction without committing — data should be lost
+        drop(tx_l0);
+
+        // Main L0 still should not have it
+        assert!(
+            !main_l0.read().vertex_properties.contains_key(&vid),
+            "Main L0 should remain clean after dropped transaction"
+        );
+
+        Ok(())
+    }
 }

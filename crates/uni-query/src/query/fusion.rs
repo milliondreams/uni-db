@@ -147,4 +147,36 @@ mod tests {
         assert!(!used_fallback);
         assert!((result - 0.0).abs() < 1e-6);
     }
+
+    #[test]
+    fn test_fuse_rrf_disjoint_lists() {
+        let vec_results = vec![(Vid::from(1u64), 0.9), (Vid::from(2u64), 0.7)];
+        let fts_results = vec![(Vid::from(3u64), 0.8), (Vid::from(4u64), 0.6)];
+        let fused = fuse_rrf(&vec_results, &fts_results, 60);
+
+        // All 4 VIDs should appear (disjoint union)
+        assert_eq!(fused.len(), 4);
+        let vids: HashSet<Vid> = fused.iter().map(|(v, _)| *v).collect();
+        assert!(vids.contains(&Vid::from(1u64)));
+        assert!(vids.contains(&Vid::from(2u64)));
+        assert!(vids.contains(&Vid::from(3u64)));
+        assert!(vids.contains(&Vid::from(4u64)));
+    }
+
+    #[test]
+    fn test_fuse_rrf_overlapping_lists() {
+        let vec_results = vec![(Vid::from(1u64), 0.9), (Vid::from(2u64), 0.7)];
+        let fts_results = vec![(Vid::from(1u64), 0.8), (Vid::from(3u64), 0.6)];
+        let fused = fuse_rrf(&vec_results, &fts_results, 60);
+
+        // VID 1 appears in both lists → should have highest fused score
+        assert_eq!(fused.len(), 3);
+        assert_eq!(fused[0].0, Vid::from(1u64), "Overlapping VID should rank first");
+    }
+
+    #[test]
+    fn test_fuse_rrf_empty_lists() {
+        let fused = fuse_rrf(&[], &[], 60);
+        assert!(fused.is_empty());
+    }
 }

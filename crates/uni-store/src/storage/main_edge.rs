@@ -540,4 +540,82 @@ mod tests {
         assert_eq!(batch.num_rows(), 1);
         assert_eq!(batch.num_columns(), 9);
     }
+
+    #[test]
+    fn test_build_record_batch_multiple_edges() {
+        use uni_common::Value;
+
+        let edges = vec![
+            (
+                Eid::new(1),
+                Vid::new(1),
+                Vid::new(2),
+                "KNOWS".to_string(),
+                HashMap::from([("since".to_string(), Value::Int(2020))]),
+                false,
+                1u64,
+            ),
+            (
+                Eid::new(2),
+                Vid::new(2),
+                Vid::new(3),
+                "WORKS_AT".to_string(),
+                HashMap::new(),
+                false,
+                2u64,
+            ),
+            (
+                Eid::new(3),
+                Vid::new(1),
+                Vid::new(3),
+                "KNOWS".to_string(),
+                HashMap::new(),
+                true, // deleted
+                3u64,
+            ),
+        ];
+
+        let batch = MainEdgeDataset::build_record_batch(&edges, None, None).unwrap();
+        assert_eq!(batch.num_rows(), 3);
+        assert_eq!(batch.num_columns(), 9);
+
+        // Verify type column has correct values
+        let type_col = batch
+            .column_by_name("type")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap();
+        assert_eq!(type_col.value(0), "KNOWS");
+        assert_eq!(type_col.value(1), "WORKS_AT");
+        assert_eq!(type_col.value(2), "KNOWS");
+    }
+
+    #[test]
+    fn test_build_record_batch_with_timestamps() {
+        let edges = vec![(
+            Eid::new(1),
+            Vid::new(1),
+            Vid::new(2),
+            "KNOWS".to_string(),
+            HashMap::new(),
+            false,
+            1u64,
+        )];
+
+        let mut created_at: HashMap<Eid, i64> = HashMap::new();
+        created_at.insert(Eid::new(1), 1_000_000_000);
+
+        let mut updated_at: HashMap<Eid, i64> = HashMap::new();
+        updated_at.insert(Eid::new(1), 2_000_000_000);
+
+        let batch =
+            MainEdgeDataset::build_record_batch(&edges, Some(&created_at), Some(&updated_at))
+                .unwrap();
+        assert_eq!(batch.num_rows(), 1);
+
+        // Timestamp columns should exist and not be all null
+        let created_col = batch.column_by_name("_created_at").unwrap();
+        assert!(!created_col.is_null(0), "created_at should be populated");
+    }
 }

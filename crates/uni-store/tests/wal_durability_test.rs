@@ -621,6 +621,78 @@ async fn test_wal_serde_backward_compat_missing_edge_type_name() -> Result<()> {
     Ok(())
 }
 
+// ── WAL Corruption Recovery Tests ────────────────────────────────────
+
+#[tokio::test]
+async fn test_wal_truncated_segment_recovery() {
+    let store = create_memory_store();
+    let wal = WriteAheadLog::new(store.clone(), Path::from("wal"));
+    wal.initialize().await.unwrap();
+
+    // Write a valid segment first
+    wal.append(&Mutation::InsertVertex {
+        vid: Vid::new(1),
+        labels: vec!["Person".to_string()],
+        properties: HashMap::new(),
+    })
+    .unwrap();
+    wal.flush().await.unwrap();
+
+    // Write a truncated (invalid JSON) segment directly
+    let truncated_path = Path::from("wal/00000000000000000099_bad.wal");
+    store
+        .put(
+            &truncated_path,
+            bytes::Bytes::from(b"{\"lsn\":99,\"mutations\":[{\"Inser" as &[u8]).into(),
+        )
+        .await
+        .unwrap();
+
+    // Replaying should fail on the corrupt segment or skip it.
+    // We verify it doesn't panic.
+    let result = wal.replay_since(0).await;
+    let _ = result;
+}
+
+#[tokio::test]
+async fn test_wal_corrupted_segment_data() {
+    let store = create_memory_store();
+    let wal = WriteAheadLog::new(store.clone(), Path::from("wal"));
+    wal.initialize().await.unwrap();
+
+    // Write random bytes as a WAL segment
+    let bad_path = Path::from("wal/00000000000000000001_corrupt.wal");
+    store
+        .put(
+            &bad_path,
+            bytes::Bytes::from(vec![0xDE, 0xAD, 0xBE, 0xEF]).into(),
+        )
+        .await
+        .unwrap();
+
+    // Replay should handle corrupt data gracefully (error or skip)
+    let result = wal.replay_since(0).await;
+    let _ = result; // Should not panic
+}
+
+#[tokio::test]
+async fn test_wal_empty_segment_file() {
+    let store = create_memory_store();
+    let wal = WriteAheadLog::new(store.clone(), Path::from("wal"));
+    wal.initialize().await.unwrap();
+
+    // Write a zero-byte WAL segment
+    let empty_path = Path::from("wal/00000000000000000001_empty.wal");
+    store
+        .put(&empty_path, bytes::Bytes::new().into())
+        .await
+        .unwrap();
+
+    // Empty segments should be handled gracefully
+    let result = wal.replay_since(0).await;
+    let _ = result; // Should not panic
+}
+
 // ============================================================================
 // Transaction Commit Atomicity Tests (Issue #137)
 // ============================================================================

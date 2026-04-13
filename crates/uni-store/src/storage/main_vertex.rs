@@ -767,4 +767,46 @@ mod tests {
         let ext_id_arr = ext_id_col.as_any().downcast_ref::<StringArray>().unwrap();
         assert_eq!(ext_id_arr.value(0), "user_001");
     }
+
+    #[test]
+    fn test_compute_vertex_uid_deterministic() {
+        use uni_common::Value;
+        let labels = vec!["Person".to_string()];
+        let mut props = HashMap::new();
+        props.insert("name".to_string(), Value::String("Alice".to_string()));
+
+        let uid1 = MainVertexDataset::compute_vertex_uid(&labels, None, &props);
+        let uid2 = MainVertexDataset::compute_vertex_uid(&labels, None, &props);
+        assert_eq!(uid1, uid2, "Same inputs should produce same UID");
+    }
+
+    #[test]
+    fn test_compute_vertex_uid_label_order_independence() {
+        use uni_common::Value;
+        let mut props = HashMap::new();
+        props.insert("name".to_string(), Value::String("Alice".to_string()));
+
+        let labels_ab = vec!["Admin".to_string(), "Person".to_string()];
+        let labels_ba = vec!["Person".to_string(), "Admin".to_string()];
+
+        let uid1 = MainVertexDataset::compute_vertex_uid(&labels_ab, None, &props);
+        let uid2 = MainVertexDataset::compute_vertex_uid(&labels_ba, None, &props);
+        assert_eq!(uid1, uid2, "Label order should not affect UID");
+    }
+
+    #[test]
+    fn test_compute_vertex_uid_different_props_different_uid() {
+        use uni_common::Value;
+        let labels = vec!["Person".to_string()];
+
+        let mut props1 = HashMap::new();
+        props1.insert("name".to_string(), Value::String("Alice".to_string()));
+
+        let mut props2 = HashMap::new();
+        props2.insert("name".to_string(), Value::String("Bob".to_string()));
+
+        let uid1 = MainVertexDataset::compute_vertex_uid(&labels, None, &props1);
+        let uid2 = MainVertexDataset::compute_vertex_uid(&labels, None, &props2);
+        assert_ne!(uid1, uid2, "Different properties should produce different UIDs");
+    }
 }

@@ -472,13 +472,13 @@ mod tests {
     fn test_decode_float64() {
         use arrow_array::builder::Float64Builder;
         let mut builder = Float64Builder::new();
-        builder.append_value(3.14159);
+        builder.append_value(3.25);
         builder.append_value(-0.5);
         let array = builder.finish();
 
         let val =
             value_from_column(&array, &DataType::Float64, 0, CrdtDecodeMode::Strict).unwrap();
-        assert_eq!(val, serde_json::json!(3.14159));
+        assert_eq!(val, serde_json::json!(3.25));
 
         let val =
             value_from_column(&array, &DataType::Float64, 1, CrdtDecodeMode::Strict).unwrap();

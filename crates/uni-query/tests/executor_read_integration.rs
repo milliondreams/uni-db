@@ -158,6 +158,30 @@ async fn test_traverse_outgoing() {
     assert_eq!(rows.len(), 2, "Alice->Bob and Bob->Charlie");
 }
 
+// ── Variable-length path test ────────────────────────────────────────
+
+#[tokio::test]
+async fn test_traverse_variable_length() {
+    let dir = tempdir().unwrap();
+    let (executor, prop_manager, _schema, planner) = setup_graph_executor(dir.path()).await;
+    seed_test_data(&executor, &planner, &prop_manager).await;
+
+    // Alice->Bob->Charlie: variable-length 1..2 from Alice should reach both Bob and Charlie
+    let rows = execute_cypher(
+        &executor,
+        &planner,
+        &prop_manager,
+        "MATCH (a:Person {name: 'Alice'})-[:KNOWS*1..2]->(b:Person) RETURN b.name AS name ORDER BY name",
+    )
+    .await;
+
+    assert!(
+        rows.len() >= 2,
+        "Variable-length path should reach at least Bob and Charlie, got {} rows",
+        rows.len()
+    );
+}
+
 // ── Aggregation tests ────────────────────────────────────────────────
 
 #[tokio::test]
@@ -232,6 +256,38 @@ async fn test_aggregation_collect() {
             rows[0].get("names")
         );
     }
+}
+
+// ── GROUP BY test ────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_aggregation_group_by() {
+    let dir = tempdir().unwrap();
+    let (executor, prop_manager, _schema, planner) = setup_graph_executor(dir.path()).await;
+
+    // Create persons with overlapping ages
+    execute_cypher(
+        &executor,
+        &planner,
+        &prop_manager,
+        "CREATE (:Person {name: 'A', age: 30}), (:Person {name: 'B', age: 25}), (:Person {name: 'C', age: 30})",
+    )
+    .await;
+
+    let rows = execute_cypher(
+        &executor,
+        &planner,
+        &prop_manager,
+        "MATCH (n:Person) RETURN n.age AS age, count(n) AS cnt ORDER BY age",
+    )
+    .await;
+
+    assert_eq!(rows.len(), 2, "Two distinct age groups");
+    // age 25: 1 person, age 30: 2 persons
+    assert_eq!(rows[0].get("age"), Some(&Value::Int(25)));
+    assert_eq!(rows[0].get("cnt"), Some(&Value::Int(1)));
+    assert_eq!(rows[1].get("age"), Some(&Value::Int(30)));
+    assert_eq!(rows[1].get("cnt"), Some(&Value::Int(2)));
 }
 
 // ── OPTIONAL MATCH tests ─────────────────────────────────────────────
@@ -349,3 +405,8 @@ async fn test_case_expression() {
         }
     }
 }
+
+// ── Advanced execution tests ─────────────────────────────────────────
+// NOTE: Procedure calls (CALL db.labels()) and time-travel queries require
+// additional setup (ProcedureRegistry, snapshot pinning) that goes beyond
+// the basic executor setup. These are covered by the TCK test suite.

@@ -369,6 +369,74 @@ async fn test_unwind_list() {
     assert_eq!(rows.len(), 3);
 }
 
+// ── SET replace/merge tests ──────────────────────────────────────────
+
+#[tokio::test]
+async fn test_set_merge_properties() {
+    let dir = tempdir().unwrap();
+    let (executor, prop_manager, _schema, planner) = setup_graph_executor(dir.path()).await;
+
+    execute_cypher(
+        &executor,
+        &planner,
+        &prop_manager,
+        "CREATE (:Person {name: 'Alice', age: 30})",
+    )
+    .await;
+
+    execute_cypher(
+        &executor,
+        &planner,
+        &prop_manager,
+        "MATCH (n:Person {name: 'Alice'}) SET n += {city: 'NYC'}",
+    )
+    .await;
+
+    let rows = execute_cypher(
+        &executor,
+        &planner,
+        &prop_manager,
+        "MATCH (n:Person {name: 'Alice'}) RETURN n.age AS age, n.city AS city",
+    )
+    .await;
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].get("age"),
+        Some(&Value::Int(30)),
+        "Merge mode should preserve existing age"
+    );
+    assert_eq!(
+        rows[0].get("city"),
+        Some(&Value::String("NYC".into())),
+        "Merge mode should add new city"
+    );
+}
+
+// ── MERGE ON CREATE SET test ─────────────────────────────────────────
+
+#[tokio::test]
+async fn test_merge_on_create_set() {
+    let dir = tempdir().unwrap();
+    let (executor, prop_manager, _schema, planner) = setup_graph_executor(dir.path()).await;
+
+    let rows = execute_cypher(
+        &executor,
+        &planner,
+        &prop_manager,
+        "MERGE (n:Person {name: 'Alice'}) ON CREATE SET n.age = 30 RETURN n.name AS name, n.age AS age",
+    )
+    .await;
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("name"), Some(&Value::String("Alice".into())));
+    assert_eq!(
+        rows[0].get("age"),
+        Some(&Value::Int(30)),
+        "ON CREATE SET should set age on new node"
+    );
+}
+
 #[tokio::test]
 async fn test_unwind_empty() {
     let dir = tempdir().unwrap();

@@ -177,15 +177,10 @@ pub fn value_to_py(py: Python, value: &Value) -> PyResult<Py<PyAny>> {
                     Ok(result.into_py_any(py)?)
                 }
                 TemporalValue::Btic { lo, hi, meta } => {
-                    // Return as a dict with lo, hi, meta, and display string
-                    let dict = pyo3::types::PyDict::new(py);
-                    dict.set_item("lo", lo)?;
-                    dict.set_item("hi", hi)?;
-                    dict.set_item("meta", *meta as i64)?;
-                    if let Ok(btic) = uni_common::uni_btic::Btic::new(*lo, *hi, *meta) {
-                        dict.set_item("display", btic.to_string())?;
-                    }
-                    Ok(dict.into_py_any(py)?)
+                    let btic = uni_common::uni_btic::Btic::new(*lo, *hi, *meta).map_err(|e| {
+                        pyo3::exceptions::PyValueError::new_err(format!("invalid BTIC: {e}"))
+                    })?;
+                    Ok(Py::new(py, crate::btic::PyBtic { inner: btic })?.into_any())
                 }
             }
         }
@@ -336,6 +331,15 @@ pub fn py_object_to_value(py: Python, obj: &Py<PyAny>) -> PyResult<Value> {
                 offset_seconds,
             }));
         }
+    }
+
+    // Check for BTIC temporal interval (PyBtic instance)
+    if let Ok(btic) = bound.extract::<crate::btic::PyBtic>() {
+        return Ok(Value::Temporal(TemporalValue::Btic {
+            lo: btic.inner.lo(),
+            hi: btic.inner.hi(),
+            meta: btic.inner.meta(),
+        }));
     }
 
     // Check primitive types in order of specificity

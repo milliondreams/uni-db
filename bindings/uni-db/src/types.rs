@@ -2444,6 +2444,13 @@ impl PyDataType {
             inner: uni_common::DataType::CypherValue,
         }
     }
+    #[staticmethod]
+    #[pyo3(name = "BTIC")]
+    fn btic() -> Self {
+        Self {
+            inner: uni_common::DataType::Btic,
+        }
+    }
 
     // Parameterized variants
     #[staticmethod]
@@ -2507,6 +2514,7 @@ impl PyDataType {
                 let py_ct = PyCrdtType { inner: ct.clone() };
                 format!("crdt({})", py_ct.__repr__())
             }
+            uni_common::DataType::Btic => "BTIC".to_string(),
             uni_common::DataType::Point(_) => "POINT".to_string(),
             _ => "UNKNOWN".to_string(),
         };
@@ -2585,6 +2593,21 @@ impl PyValue {
         }
     }
 
+    /// Create a BTIC temporal interval from a string literal.
+    #[staticmethod]
+    fn btic(literal: &str) -> PyResult<Self> {
+        let b = uni_common::uni_btic::parse::parse_btic_literal(literal).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!("invalid BTIC literal: {e}"))
+        })?;
+        Ok(Self {
+            inner: ::uni_db::Value::Temporal(uni_common::value::TemporalValue::Btic {
+                lo: b.lo(),
+                hi: b.hi(),
+                meta: b.meta(),
+            }),
+        })
+    }
+
     /// The type discriminator name.
     #[getter]
     fn type_name(&self) -> &str {
@@ -2601,6 +2624,7 @@ impl PyValue {
             ::uni_db::Value::Edge(_) => "edge",
             ::uni_db::Value::Path(_) => "path",
             ::uni_db::Value::Vector(_) => "vector",
+            ::uni_db::Value::Temporal(uni_common::value::TemporalValue::Btic { .. }) => "btic",
             ::uni_db::Value::Temporal(_) => "temporal",
             _ => "unknown",
         }
@@ -2620,6 +2644,12 @@ impl PyValue {
     }
     fn is_string(&self) -> bool {
         matches!(&self.inner, ::uni_db::Value::String(_))
+    }
+    fn is_btic(&self) -> bool {
+        matches!(
+            &self.inner,
+            ::uni_db::Value::Temporal(uni_common::value::TemporalValue::Btic { .. })
+        )
     }
 
     /// Convert to the corresponding native Python type.

@@ -113,6 +113,7 @@ from .session import UniSession, UniTransaction
 # Type utilities
 from .types import (
     DATETIME_TYPES,
+    Btic,
     Vector,
     db_to_python_value,
     get_vector_dimensions,
@@ -147,6 +148,7 @@ __all__ = [
     "Direction",
     "VectorMetric",
     # Types
+    "Btic",
     "Vector",
     "python_type_to_uni",
     "uni_to_python_type",

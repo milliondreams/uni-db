@@ -596,6 +596,10 @@ fn is_aggregate_function_name(name: &str) -> bool {
             | "stdevp"
             | "percentiledisc"
             | "percentilecont"
+            | "btic_min"
+            | "btic_max"
+            | "btic_span_agg"
+            | "btic_count_at"
     )
 }
 

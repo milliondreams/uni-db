@@ -378,3 +378,75 @@ class TestBticE2E:
         )
         tx.commit()
         assert isinstance(result.rows[0]["w"], Btic)
+
+    def test_delete_vertex_with_btic(self, btic_db):
+        """DELETE removes vertex with BTIC property."""
+        session = btic_db.session()
+        tx = session.tx()
+        tx.execute("CREATE (e:Event {name: 'ToDelete', when: btic('1985')})")
+        tx.commit()
+        btic_db.flush()
+
+        tx2 = btic_db.session().tx()
+        tx2.execute("MATCH (e:Event {name: 'ToDelete'}) DELETE e")
+        tx2.commit()
+        btic_db.flush()
+
+        result = btic_db.session().query(
+            "MATCH (e:Event {name: 'ToDelete'}) RETURN e"
+        )
+        assert len(result) == 0
+
+    def test_remove_btic_property(self, btic_db):
+        """REMOVE sets BTIC property to None."""
+        session = btic_db.session()
+        tx = session.tx()
+        tx.execute("CREATE (e:Event {name: 'RemTest', when: btic('1985')})")
+        tx.commit()
+        btic_db.flush()
+
+        tx2 = btic_db.session().tx()
+        tx2.execute("MATCH (e:Event {name: 'RemTest'}) REMOVE e.when")
+        tx2.commit()
+        btic_db.flush()
+
+        result = btic_db.session().query(
+            "MATCH (e:Event {name: 'RemTest'}) RETURN e.when AS w"
+        )
+        assert len(result) == 1
+        assert result.rows[0]["w"] is None
+
+    def test_transaction_rollback_with_btic(self, btic_db):
+        """Rolled-back BTIC mutations are invisible."""
+        session = btic_db.session()
+        tx = session.tx()
+        tx.execute("CREATE (e:Event {name: 'Kept', when: btic('1985')})")
+        tx.commit()
+        btic_db.flush()
+
+        tx2 = btic_db.session().tx()
+        tx2.execute("CREATE (e:Event {name: 'Lost', when: btic('2024')})")
+        tx2.rollback()
+
+        result = btic_db.session().query(
+            "MATCH (e:Event) RETURN e.name AS name"
+        )
+        names = [row["name"] for row in result.rows]
+        assert "Kept" in names
+        assert "Lost" not in names
+
+    def test_btic_in_where_filter(self, btic_db):
+        """btic_overlaps() works in WHERE clause."""
+        session = btic_db.session()
+        tx = session.tx()
+        tx.execute("CREATE (e:Event {name: 'WW2', when: btic('1939/1945')})")
+        tx.execute("CREATE (e:Event {name: 'Moon', when: btic('1969-07-20')})")
+        tx.commit()
+        btic_db.flush()
+
+        result = btic_db.session().query(
+            "MATCH (e:Event) WHERE btic_overlaps(e.when, btic('1940')) "
+            "RETURN e.name AS name"
+        )
+        assert len(result) == 1
+        assert result.rows[0]["name"] == "WW2"

@@ -664,7 +664,6 @@ async fn test_btic_distinct() -> Result<()> {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore = "BTIC UDAFs (btic_min/max/span_agg) hit DataFusion physical planner gap — tracked separately"]
 async fn test_btic_aggregation_udfs() -> Result<()> {
     let db = Uni::in_memory().build().await?;
 
@@ -694,6 +693,44 @@ async fn test_btic_aggregation_udfs() -> Result<()> {
             assert_eq!(*lo, 473_385_600_000); // 1985
         }
         other => panic!("expected Temporal(Btic), got: {other:?}"),
+    }
+
+    // btic_max should return the latest (2024)
+    let result = db
+        .session()
+        .query("MATCH (n:BticAgg) RETURN btic_max(n.period) AS latest")
+        .await?;
+    assert_eq!(result.len(), 1);
+    match result.rows()[0].value("latest").unwrap() {
+        Value::Temporal(TemporalValue::Btic { lo, .. }) => {
+            assert_eq!(*lo, 1_704_067_200_000); // 2024-01-01
+        }
+        other => panic!("expected Temporal(Btic), got: {other:?}"),
+    }
+
+    // btic_span_agg should return the bounding interval [1985, 2025)
+    let result = db
+        .session()
+        .query("MATCH (n:BticAgg) RETURN btic_span_agg(n.period) AS span")
+        .await?;
+    assert_eq!(result.len(), 1);
+    match result.rows()[0].value("span").unwrap() {
+        Value::Temporal(TemporalValue::Btic { lo, hi, .. }) => {
+            assert_eq!(*lo, 473_385_600_000); // 1985-01-01
+            assert_eq!(*hi, 1_735_689_600_000); // 2025-01-01
+        }
+        other => panic!("expected Temporal(Btic), got: {other:?}"),
+    }
+
+    // btic_count_at: mid-1985 point should be contained in only 1 interval
+    let result = db
+        .session()
+        .query("MATCH (n:BticAgg) RETURN btic_count_at(n.period, 489024000000) AS cnt")
+        .await?;
+    assert_eq!(result.len(), 1);
+    match result.rows()[0].value("cnt").unwrap() {
+        Value::Int(cnt) => assert_eq!(*cnt, 1),
+        other => panic!("expected Int, got: {other:?}"),
     }
 
     Ok(())
@@ -736,6 +773,216 @@ async fn test_btic_set_ops_in_query() -> Result<()> {
         }
         other => panic!("expected Temporal(Btic), got: {other:?}"),
     }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// DELETE vertex with BTIC property
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_btic_delete_vertex() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+
+    db.schema()
+        .label("BticDel")
+        .property("name", DataType::String)
+        .property("period", DataType::Btic)
+        .apply()
+        .await?;
+
+    let s = db.session();
+    let tx = s.tx().await?;
+    tx.execute("CREATE (n:BticDel {name: 'target', period: btic('1985')})")
+        .await?;
+    tx.commit().await?;
+
+    // Verify it exists
+    let result = db
+        .session()
+        .query("MATCH (n:BticDel) RETURN count(n) AS cnt")
+        .await?;
+    assert_eq!(result.rows()[0].value("cnt").unwrap(), &Value::Int(1));
+
+    // Delete
+    let s = db.session();
+    let tx = s.tx().await?;
+    tx.execute("MATCH (n:BticDel {name: 'target'}) DELETE n")
+        .await?;
+    tx.commit().await?;
+
+    // Verify gone
+    let result = db
+        .session()
+        .query("MATCH (n:BticDel) RETURN count(n) AS cnt")
+        .await?;
+    assert_eq!(result.rows()[0].value("cnt").unwrap(), &Value::Int(0));
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// REMOVE BTIC property
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_btic_remove_property() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+
+    db.schema()
+        .label("BticRem")
+        .property("name", DataType::String)
+        .property_nullable("period", DataType::Btic)
+        .apply()
+        .await?;
+
+    let s = db.session();
+    let tx = s.tx().await?;
+    tx.execute("CREATE (n:BticRem {name: 'rm_test', period: btic('1985')})")
+        .await?;
+    tx.commit().await?;
+
+    // Verify BTIC exists
+    let result = db
+        .session()
+        .query("MATCH (n:BticRem) RETURN n.period AS p")
+        .await?;
+    assert!(matches!(
+        result.rows()[0].value("p").unwrap(),
+        Value::Temporal(TemporalValue::Btic { .. })
+    ));
+
+    // REMOVE the property
+    let s = db.session();
+    let tx = s.tx().await?;
+    tx.execute("MATCH (n:BticRem {name: 'rm_test'}) REMOVE n.period")
+        .await?;
+    tx.commit().await?;
+
+    // Verify it's null
+    let result = db
+        .session()
+        .query("MATCH (n:BticRem {name: 'rm_test'}) RETURN n.period AS p")
+        .await?;
+    assert_eq!(result.rows()[0].value("p").unwrap(), &Value::Null);
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Transaction rollback with BTIC
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_btic_transaction_rollback() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+
+    db.schema()
+        .label("BticTx")
+        .property("name", DataType::String)
+        .property("period", DataType::Btic)
+        .apply()
+        .await?;
+
+    // Commit one node
+    let s = db.session();
+    let tx = s.tx().await?;
+    tx.execute("CREATE (n:BticTx {name: 'committed', period: btic('1985')})")
+        .await?;
+    tx.commit().await?;
+
+    // Create another in a rolled-back transaction
+    let s = db.session();
+    let tx = s.tx().await?;
+    tx.execute("CREATE (n:BticTx {name: 'rolled_back', period: btic('2024')})")
+        .await?;
+    tx.rollback();
+
+    // Verify only the committed node exists
+    let result = db
+        .session()
+        .query("MATCH (n:BticTx) RETURN n.name AS name")
+        .await?;
+    assert_eq!(result.len(), 1);
+    assert_eq!(
+        result.rows()[0].value("name").unwrap(),
+        &Value::String("committed".into())
+    );
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// BTIC survives WITH clause projection
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_btic_with_clause() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+
+    db.schema()
+        .label("BticWith")
+        .property("name", DataType::String)
+        .property("period", DataType::Btic)
+        .apply()
+        .await?;
+
+    let s = db.session();
+    let tx = s.tx().await?;
+    tx.execute("CREATE (n:BticWith {name: 'test', period: btic('1985')})")
+        .await?;
+    tx.commit().await?;
+
+    let result = db
+        .session()
+        .query("MATCH (n:BticWith) WITH n.period AS p RETURN p")
+        .await?;
+    assert_eq!(result.len(), 1);
+    match result.rows()[0].value("p").unwrap() {
+        Value::Temporal(TemporalValue::Btic { lo, .. }) => {
+            assert_eq!(*lo, 473_385_600_000); // 1985-01-01
+        }
+        other => panic!("expected Temporal(Btic), got: {other:?}"),
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// SET BTIC property to null
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_btic_set_null() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+
+    db.schema()
+        .label("BticSetNull")
+        .property("name", DataType::String)
+        .property_nullable("period", DataType::Btic)
+        .apply()
+        .await?;
+
+    let s = db.session();
+    let tx = s.tx().await?;
+    tx.execute("CREATE (n:BticSetNull {name: 'test', period: btic('1985')})")
+        .await?;
+    tx.commit().await?;
+
+    // SET to null
+    let s = db.session();
+    let tx = s.tx().await?;
+    tx.execute("MATCH (n:BticSetNull {name: 'test'}) SET n.period = null")
+        .await?;
+    tx.commit().await?;
+
+    // Verify null persisted
+    let result = db
+        .session()
+        .query("MATCH (n:BticSetNull {name: 'test'}) RETURN n.period AS p")
+        .await?;
+    assert_eq!(result.rows()[0].value("p").unwrap(), &Value::Null);
 
     Ok(())
 }

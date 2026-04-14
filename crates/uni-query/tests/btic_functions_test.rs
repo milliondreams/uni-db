@@ -761,3 +761,78 @@ fn btic_gap_null_propagation() {
 fn btic_gap_is_recognized_as_scalar() {
     assert!(is_scalar_function("btic_gap"));
 }
+
+// =======================================================================
+// Per-bound certainty accessors
+// =======================================================================
+
+#[test]
+fn btic_lo_certainty_definite() {
+    let val = btic_year_1985();
+    let result = eval_scalar_function("btic_lo_certainty", &[val], None).unwrap();
+    assert_eq!(result, Value::String("definite".to_string()));
+}
+
+#[test]
+fn btic_lo_certainty_approximate() {
+    let val = btic_500_bce_approx();
+    let result = eval_scalar_function("btic_lo_certainty", &[val], None).unwrap();
+    assert_eq!(result, Value::String("approximate".to_string()));
+}
+
+#[test]
+fn btic_hi_certainty_definite() {
+    let val = btic_year_1985();
+    let result = eval_scalar_function("btic_hi_certainty", &[val], None).unwrap();
+    assert_eq!(result, Value::String("definite".to_string()));
+}
+
+#[test]
+fn btic_hi_certainty_approximate() {
+    let val = btic_500_bce_approx();
+    let result = eval_scalar_function("btic_hi_certainty", &[val], None).unwrap();
+    assert_eq!(result, Value::String("approximate".to_string()));
+}
+
+#[test]
+fn btic_mixed_certainty_lo_vs_hi() {
+    // Approximate lo, Definite hi — verify per-bound accessors return different values
+    let meta = uni_btic::Btic::build_meta(
+        uni_btic::Granularity::Year,
+        uni_btic::Granularity::Month,
+        uni_btic::Certainty::Approximate,
+        uni_btic::Certainty::Definite,
+    );
+    let val = Value::Temporal(TemporalValue::Btic {
+        lo: 473_385_600_000,   // 1985-01-01
+        hi: 1_719_792_000_000, // 2024-07-01
+        meta,
+    });
+
+    let lo_c = eval_scalar_function("btic_lo_certainty", &[val.clone()], None).unwrap();
+    let hi_c = eval_scalar_function("btic_hi_certainty", &[val.clone()], None).unwrap();
+    let combined = eval_scalar_function("btic_certainty", &[val], None).unwrap();
+
+    assert_eq!(lo_c, Value::String("approximate".to_string()));
+    assert_eq!(hi_c, Value::String("definite".to_string()));
+    // btic_certainty returns least_certain = approximate
+    assert_eq!(combined, Value::String("approximate".to_string()));
+}
+
+#[test]
+fn btic_certainty_functions_null_propagation() {
+    let null = Value::Null;
+
+    assert_eq!(
+        eval_scalar_function("btic_certainty", &[null.clone()], None).unwrap(),
+        Value::Null
+    );
+    assert_eq!(
+        eval_scalar_function("btic_lo_certainty", &[null.clone()], None).unwrap(),
+        Value::Null
+    );
+    assert_eq!(
+        eval_scalar_function("btic_hi_certainty", &[null], None).unwrap(),
+        Value::Null
+    );
+}

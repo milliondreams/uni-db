@@ -19,9 +19,12 @@ pub fn encode(btic: &Btic) -> [u8; 24] {
 ///
 /// Validates all invariants after decoding.
 pub fn decode(bytes: &[u8; 24]) -> Result<Btic, BticError> {
-    let lo_encoded = u64::from_be_bytes(bytes[0..8].try_into().unwrap());
-    let hi_encoded = u64::from_be_bytes(bytes[8..16].try_into().unwrap());
-    let meta = u64::from_be_bytes(bytes[16..24].try_into().unwrap());
+    let lo_encoded =
+        u64::from_be_bytes(bytes[0..8].try_into().expect("infallible: 8-byte slice from 24-byte array"));
+    let hi_encoded =
+        u64::from_be_bytes(bytes[8..16].try_into().expect("infallible: 8-byte slice from 24-byte array"));
+    let meta =
+        u64::from_be_bytes(bytes[16..24].try_into().expect("infallible: 8-byte slice from 24-byte array"));
 
     let lo = (lo_encoded ^ SIGN_FLIP) as i64;
     let hi = (hi_encoded ^ SIGN_FLIP) as i64;
@@ -34,7 +37,7 @@ pub fn decode_slice(bytes: &[u8]) -> Result<Btic, BticError> {
     if bytes.len() != 24 {
         return Err(BticError::InvalidLength(bytes.len()));
     }
-    let arr: &[u8; 24] = bytes.try_into().unwrap();
+    let arr: &[u8; 24] = bytes.try_into().expect("infallible: length validated above");
     decode(arr)
 }
 

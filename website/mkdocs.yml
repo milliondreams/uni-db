@@ -43,6 +43,7 @@ nav:
       - Overview: guides/index.md
       - Programming Guide: getting-started/programming-guide.md
       - Cypher Querying: guides/cypher-querying.md
+      - Temporal Intervals (BTIC): guides/temporal-intervals.md
       - Vector Search: guides/vector-search.md
       - Data Ingestion: guides/data-ingestion.md
       - Schema Design: guides/schema-design.md

@@ -305,3 +305,99 @@ Feature: Btic1 - BTIC Temporal Interval Functions
     Then the result should be, in any order:
       | p                                                                          |
       | '[1990-01-01T00:00:00.000Z, 1991-01-01T00:00:00.000Z) ~year'               |
+
+  # =========================================================================
+  # Additional Allen algebra predicates
+  # =========================================================================
+
+  @extension
+  Scenario: [22] btic_meets should detect adjacent intervals
+    Given any graph
+    When executing query:
+      """
+      RETURN btic_meets(btic('1985'), btic('1986')) AS meets,
+             btic_meets(btic('1985'), btic('1990')) AS gap
+      """
+    Then the result should be, in any order:
+      | meets | gap   |
+      | true  | false |
+    And no side effects
+
+  @extension
+  Scenario: [23] btic_adjacent should detect symmetric adjacency
+    Given any graph
+    When executing query:
+      """
+      RETURN btic_adjacent(btic('1985'), btic('1986')) AS fwd,
+             btic_adjacent(btic('1986'), btic('1985')) AS rev,
+             btic_adjacent(btic('1985'), btic('2020')) AS gap
+      """
+    Then the result should be, in any order:
+      | fwd  | rev  | gap   |
+      | true | true | false |
+    And no side effects
+
+  @extension
+  Scenario: [24] btic_disjoint should detect non-overlapping intervals
+    Given any graph
+    When executing query:
+      """
+      RETURN btic_disjoint(btic('1985'), btic('2020')) AS disjoint,
+             btic_disjoint(btic('1985'), btic('1985-06/1986-06')) AS overlapping
+      """
+    Then the result should be, in any order:
+      | disjoint | overlapping |
+      | true     | false       |
+    And no side effects
+
+  # =========================================================================
+  # Comparison operators
+  # =========================================================================
+
+  @extension
+  Scenario: [25] BTIC values should support comparison operators
+    Given any graph
+    When executing query:
+      """
+      RETURN btic('1985') < btic('2000') AS lt,
+             btic('2000') > btic('1985') AS gt,
+             btic('1985') = btic('1985') AS eq,
+             btic('1985') <> btic('2000') AS neq,
+             btic('1985') <= btic('1985') AS lteq,
+             btic('1985') >= btic('1985') AS gteq
+      """
+    Then the result should be, in any order:
+      | lt   | gt   | eq   | neq  | lteq | gteq |
+      | true | true | true | true | true | true |
+    And no side effects
+
+  # =========================================================================
+  # Allen algebra completeness: starts, during, finishes
+  # =========================================================================
+
+  @extension
+  Scenario: [26] btic_starts, btic_during, btic_finishes should test Allen relations
+    Given any graph
+    When executing query:
+      """
+      RETURN btic_starts(btic('1985-01/1985-06'), btic('1985')) AS starts,
+             btic_during(btic('1985-03/1985-09'), btic('1985')) AS during,
+             btic_finishes(btic('1985-06/1986'), btic('1985')) AS finishes
+      """
+    Then the result should be, in any order:
+      | starts | during | finishes |
+      | true   | true   | true     |
+    And no side effects
+
+  # =========================================================================
+  # Error handling
+  # =========================================================================
+
+  @extension
+  Scenario: [27] Invalid BTIC literal should produce an error
+    Given any graph
+    When executing query:
+      """
+      RETURN btic('not-a-date') AS b
+      """
+    Then a TypeError should be raised at runtime: InvalidArgumentValue

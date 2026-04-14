@@ -282,8 +282,15 @@ fn add_temporal_duration_to_value(val: &Value, dur: &CypherDuration) -> Result<V
                 TemporalType::Time => add_cypher_duration_to_time(s, dur)?,
                 TemporalType::LocalDateTime => add_cypher_duration_to_localdatetime(s, dur)?,
                 TemporalType::DateTime => add_cypher_duration_to_datetime(s, dur)?,
-                TemporalType::Duration | TemporalType::Btic => {
-                    return Err(anyhow!("Cannot add duration to {:?} this way", ttype));
+                TemporalType::Duration => {
+                    return Err(anyhow!("Cannot add duration to Duration this way"));
+                }
+                TemporalType::Btic => {
+                    return Err(anyhow!(
+                        "TypeError: Cannot add duration to BTIC interval. \
+                         BTIC represents a time interval, not a point. \
+                         Use btic_span() to combine intervals or construct a new btic() literal."
+                    ));
                 }
             };
             Ok(Value::String(result_str))
@@ -304,8 +311,15 @@ fn add_temporal_duration_typed(tv: &TemporalValue, dur: &CypherDuration) -> Resu
         TemporalType::Time => add_cypher_duration_to_time(&s, dur)?,
         TemporalType::LocalDateTime => add_cypher_duration_to_localdatetime(&s, dur)?,
         TemporalType::DateTime => add_cypher_duration_to_datetime(&s, dur)?,
-        TemporalType::Duration | TemporalType::Btic => {
-            return Err(anyhow!("Cannot add duration to {:?} this way", ttype));
+        TemporalType::Duration => {
+            return Err(anyhow!("Cannot add duration to Duration this way"));
+        }
+        TemporalType::Btic => {
+            return Err(anyhow!(
+                "TypeError: Cannot add duration to BTIC interval. \
+                 BTIC represents a time interval, not a point. \
+                 Use btic_span() to combine intervals or construct a new btic() literal."
+            ));
         }
     };
     // Re-parse through the datetime constructor to get a Value::Temporal
@@ -799,6 +813,25 @@ fn temporal_partial_cmp(left: &TemporalValue, right: &TemporalValue) -> Option<O
             // Both are in UTC, so direct comparison
             Some(l.cmp(r))
         }
+        // BTIC intervals: use canonical (lo, hi, meta) total order from Btic::Ord
+        (
+            TemporalValue::Btic {
+                lo: l_lo,
+                hi: l_hi,
+                meta: l_meta,
+            },
+            TemporalValue::Btic {
+                lo: r_lo,
+                hi: r_hi,
+                meta: r_meta,
+            },
+        ) => match (
+            uni_btic::Btic::new(*l_lo, *l_hi, *l_meta),
+            uni_btic::Btic::new(*r_lo, *r_hi, *r_meta),
+        ) {
+            (Ok(l), Ok(r)) => Some(l.cmp(&r)),
+            _ => None,
+        },
         // Durations are not orderable
         (TemporalValue::Duration { .. }, TemporalValue::Duration { .. }) => None,
         // Different temporal types are not comparable

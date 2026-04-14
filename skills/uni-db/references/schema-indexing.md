@@ -73,6 +73,9 @@ Same packed `u64` auto-increment as VID. Sentinel: `Eid::INVALID = u64::MAX`.
 | `Time` | Struct(nanos_since_midnight, offset_seconds) | `TIME` | `DataType::Time` |
 | `DateTime` | Struct(nanos_since_epoch, offset_seconds, timezone_name) | `DATETIME` | `DataType::DateTime` |
 | `Duration` | `LargeBinary` (CypherValue codec) | `DURATION` | `DataType::Duration` |
+| `Btic` | `FixedSizeBinary(24)` | `BTIC` | `DataType::Btic` |
+
+**BTIC (Binary Temporal Interval Codec):** Encodes half-open temporal intervals `[lo, hi)` as 24 bytes with per-bound granularity and certainty. Construct with `btic('literal')`: `btic('1985')` (year), `btic('1985-03/2024-06')` (range), `btic('~1985')` (approximate), `btic('2020-03/')` (ongoing). Supports comparison operators (`<`, `>`, `<=`, `>=`, `=`, `<>`) and 30+ dedicated functions (`btic_lo`, `btic_overlaps`, `btic_contains_point`, `btic_span`, etc.).
 
 ### Complex Types
 

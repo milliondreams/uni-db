@@ -836,3 +836,52 @@ fn btic_certainty_functions_null_propagation() {
         Value::Null
     );
 }
+
+// =======================================================================
+// BTIC comparison operators
+// =======================================================================
+
+#[test]
+fn btic_comparison_ordering() {
+    use uni_cypher::ast::BinaryOp;
+    use uni_query::query::expr_eval::eval_binary_op;
+
+    let earlier = btic_year_1985(); // [1985, 1986)
+    let later = year_2020(); // [2020, 2021)
+
+    // earlier < later
+    assert_eq!(
+        eval_binary_op(&earlier, &BinaryOp::Lt, &later).unwrap(),
+        Value::Bool(true)
+    );
+    // later > earlier
+    assert_eq!(
+        eval_binary_op(&later, &BinaryOp::Gt, &earlier).unwrap(),
+        Value::Bool(true)
+    );
+    // earlier < earlier (equal → false)
+    assert_eq!(
+        eval_binary_op(&earlier, &BinaryOp::Lt, &earlier).unwrap(),
+        Value::Bool(false)
+    );
+    // earlier <= earlier (equal → true)
+    assert_eq!(
+        eval_binary_op(&earlier, &BinaryOp::LtEq, &earlier).unwrap(),
+        Value::Bool(true)
+    );
+    // earlier >= later (false)
+    assert_eq!(
+        eval_binary_op(&earlier, &BinaryOp::GtEq, &later).unwrap(),
+        Value::Bool(false)
+    );
+    // earlier <> later (not equal → true)
+    assert_eq!(
+        eval_binary_op(&earlier, &BinaryOp::NotEq, &later).unwrap(),
+        Value::Bool(true)
+    );
+    // earlier <> earlier (equal → false)
+    assert_eq!(
+        eval_binary_op(&earlier, &BinaryOp::NotEq, &earlier).unwrap(),
+        Value::Bool(false)
+    );
+}

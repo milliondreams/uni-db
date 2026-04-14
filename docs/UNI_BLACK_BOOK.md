@@ -459,6 +459,7 @@ Uni supports a rich type system mapped to Apache Arrow types for columnar storag
 | `Time` | Struct(`nanos_since_midnight: i64`, `offset_seconds: i32`) | Time of day with timezone offset |
 | `DateTime` | Struct(`nanos_since_epoch: i64`, `offset_seconds: i32`, `timezone_name: Option<Utf8>`) | Full date-time with timezone |
 | `Duration` | `LargeBinary` (CypherValue codec) | Time duration |
+| `Btic` | `FixedSizeBinary(24)` | Binary Temporal Interval Codec — half-open interval `[lo, hi)` with per-bound granularity and certainty |
 
 ### Complex Types
 
@@ -2019,6 +2020,9 @@ RETURN n.name, n.salary, n.department,
 | `datetime(year, month, day, hour, min, sec, tz)` | DateTime |
 | `localdatetime(year, month, day, hour, min, sec)` | LocalDateTime |
 | `duration(months, days, seconds, nanos)` | Duration |
+| `btic(literal)` | Btic — temporal interval from ISO 8601 string |
+
+**BTIC literal formats:** `btic('1985')` (year), `btic('1985-03')` (month), `btic('1939/1945')` (range), `btic('~1985')` (approximate), `btic('2020-03/')` (ongoing), `btic('/')` (unbounded).
 
 **Dotted functions:**
 
@@ -2040,6 +2044,77 @@ RETURN n.name, n.salary, n.department,
 | `datetime.realtime()` | Current wall clock |
 
 **Property accessors:** `year`, `month`, `day`, `hour`, `minute`, `second`, `timezone`
+
+### BTIC Temporal Interval Functions
+
+BTIC (Binary Temporal Interval Codec) encodes half-open time intervals `[lo, hi)` with per-bound granularity (millisecond through millennium) and epistemic certainty (definite, approximate, uncertain, unknown) into a single 24-byte property value. The packed format is `memcmp`-compatible for efficient B-tree ordering.
+
+**Accessors:**
+
+| Function | Returns | Description |
+|---|---|---|
+| `btic_lo(b)` | DateTime | Lower bound (inclusive); NULL if unbounded |
+| `btic_hi(b)` | DateTime | Upper bound (exclusive); NULL if unbounded |
+| `btic_duration(b)` | Int64 | Duration in milliseconds; NULL if unbounded |
+| `btic_granularity(b)` | String | Lower bound granularity (`"year"`, `"month"`, `"day"`, ...) |
+| `btic_lo_granularity(b)` / `btic_hi_granularity(b)` | String | Per-bound granularity |
+| `btic_certainty(b)` | String | Least-certain bound (`"definite"`, `"approximate"`, `"uncertain"`, `"unknown"`) |
+| `btic_lo_certainty(b)` / `btic_hi_certainty(b)` | String | Per-bound certainty |
+| `btic_is_finite(b)` | Boolean | True if both bounds are finite |
+| `btic_is_unbounded(b)` | Boolean | True if either bound is infinite |
+| `btic_is_instant(b)` | Boolean | True if interval is 1ms wide |
+
+**Allen's interval algebra predicates (2-arg → Boolean):**
+
+| Function | True when |
+|---|---|
+| `btic_contains_point(b, point)` | `b.lo <= point < b.hi` |
+| `btic_overlaps(a, b)` | intervals share at least one tick |
+| `btic_contains(a, b)` | `a` fully contains `b` |
+| `btic_before(a, b)` | `a` ends at or before `b` starts |
+| `btic_after(a, b)` | `a` starts at or after `b` ends |
+| `btic_meets(a, b)` | `a.hi == b.lo` (adjacent, no gap) |
+| `btic_adjacent(a, b)` | either meets or met-by (symmetric) |
+| `btic_disjoint(a, b)` | no shared ticks |
+| `btic_equals(a, b)` | same bounds, ignoring metadata |
+| `btic_starts(a, b)` | same `lo`, `a` ends earlier |
+| `btic_during(a, b)` | `a` strictly inside `b` |
+| `btic_finishes(a, b)` | same `hi`, `a` starts later |
+
+**Set operations (2-arg → Btic or NULL):**
+
+| Function | Returns |
+|---|---|
+| `btic_intersection(a, b)` | Overlapping portion; NULL if disjoint |
+| `btic_span(a, b)` | Smallest interval spanning both |
+| `btic_gap(a, b)` | Gap between disjoint intervals; NULL if overlapping |
+
+**Aggregation:**
+
+| Function | Returns | Description |
+|---|---|---|
+| `btic_min(collection)` | Btic | Earliest interval by total order |
+| `btic_max(collection)` | Btic | Latest interval by total order |
+| `btic_span_agg(collection)` | Btic | Bounding interval of all inputs |
+| `btic_count_at(collection, point)` | Int64 | Count of intervals containing the point |
+
+**Comparison operators:** BTIC values support `<`, `>`, `<=`, `>=`, `=`, `<>` using the canonical `(lo, hi, meta)` lexicographic total order.
+
+**Example:**
+
+```cypher
+// Store fuzzy historical dates
+CREATE (e:Event {name: 'Renaissance', period: btic('1400/1600')})
+
+// Query: find events overlapping with the 15th century
+MATCH (e:Event)
+WHERE btic_overlaps(e.period, btic('1400/1500'))
+RETURN e.name, btic_lo(e.period) AS start, btic_hi(e.period) AS end
+
+// Aggregation: span of all events
+MATCH (e:Event)
+RETURN btic_span_agg(e.period) AS total_span
+```
 
 ### Bitwise Functions
 

@@ -986,3 +986,84 @@ async fn test_btic_set_null() -> Result<()> {
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Comparison operators on BTIC columns
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_btic_comparison_operators() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+
+    db.schema()
+        .label("BticCmp")
+        .property("name", DataType::String)
+        .property("period", DataType::CypherValue)
+        .apply()
+        .await?;
+
+    let s = db.session();
+    let tx = s.tx().await?;
+    tx.execute("CREATE (n:BticCmp {name: 'a', period: btic('1985')})")
+        .await?;
+    tx.execute("CREATE (n:BticCmp {name: 'b', period: btic('1990')})")
+        .await?;
+    tx.execute("CREATE (n:BticCmp {name: 'c', period: btic('2020')})")
+        .await?;
+    tx.commit().await?;
+
+    // Less than: periods before 2000
+    let result = db
+        .session()
+        .query("MATCH (n:BticCmp) WHERE n.period < btic('2000') RETURN n.name AS name ORDER BY n.name")
+        .await?;
+    assert_eq!(result.len(), 2);
+    assert_eq!(result.rows()[0].get::<String>("name")?, "a");
+    assert_eq!(result.rows()[1].get::<String>("name")?, "b");
+
+    // Greater than: periods after 1985
+    let result = db
+        .session()
+        .query("MATCH (n:BticCmp) WHERE n.period > btic('1985') RETURN n.name AS name ORDER BY n.name")
+        .await?;
+    assert_eq!(result.len(), 2);
+    assert_eq!(result.rows()[0].get::<String>("name")?, "b");
+    assert_eq!(result.rows()[1].get::<String>("name")?, "c");
+
+    // Less than or equal: periods <= 1990
+    let result = db
+        .session()
+        .query("MATCH (n:BticCmp) WHERE n.period <= btic('1990') RETURN n.name AS name ORDER BY n.name")
+        .await?;
+    assert_eq!(result.len(), 2);
+    assert_eq!(result.rows()[0].get::<String>("name")?, "a");
+    assert_eq!(result.rows()[1].get::<String>("name")?, "b");
+
+    // Greater than or equal: periods >= 1990
+    let result = db
+        .session()
+        .query("MATCH (n:BticCmp) WHERE n.period >= btic('1990') RETURN n.name AS name ORDER BY n.name")
+        .await?;
+    assert_eq!(result.len(), 2);
+    assert_eq!(result.rows()[0].get::<String>("name")?, "b");
+    assert_eq!(result.rows()[1].get::<String>("name")?, "c");
+
+    // Not equal: periods <> 1990
+    let result = db
+        .session()
+        .query("MATCH (n:BticCmp) WHERE n.period <> btic('1990') RETURN n.name AS name ORDER BY n.name")
+        .await?;
+    assert_eq!(result.len(), 2);
+    assert_eq!(result.rows()[0].get::<String>("name")?, "a");
+    assert_eq!(result.rows()[1].get::<String>("name")?, "c");
+
+    // Equal: only 1990
+    let result = db
+        .session()
+        .query("MATCH (n:BticCmp) WHERE n.period = btic('1990') RETURN n.name AS name")
+        .await?;
+    assert_eq!(result.len(), 1);
+    assert_eq!(result.rows()[0].get::<String>("name")?, "b");
+
+    Ok(())
+}

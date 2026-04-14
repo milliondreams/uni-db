@@ -2562,7 +2562,13 @@ pub(crate) fn build_property_column_static(
                                     .append_value(uni_btic::encode::encode(&b))
                                     .map_err(arrow_err)?;
                             }
-                            Err(_) => builder.append_null(),
+                            Err(e) => {
+                                tracing::warn!(
+                                    "BTIC coercion failed for property '{}': invalid value (lo={}, hi={}, meta={:#x}): {}",
+                                    prop_name, lo, hi, meta, e
+                                );
+                                builder.append_null()
+                            }
                         }
                     }
                     Some(Value::String(s)) => match uni_btic::parse::parse_btic_literal(&s) {
@@ -2571,7 +2577,13 @@ pub(crate) fn build_property_column_static(
                                 .append_value(uni_btic::encode::encode(&b))
                                 .map_err(arrow_err)?;
                         }
-                        Err(_) => builder.append_null(),
+                        Err(e) => {
+                            tracing::warn!(
+                                "BTIC coercion failed for property '{}': '{}' is not a valid BTIC literal: {}",
+                                prop_name, s, e
+                            );
+                            builder.append_null()
+                        }
                     },
                     _ => builder.append_null(),
                 }

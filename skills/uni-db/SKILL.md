@@ -164,6 +164,7 @@ async fn main() -> uni_db::Result<()> {
 | Date | `DataType.DATE()` | `DataType::Date` | `DATE` |
 | DateTime | `DataType.DATETIME()` | `DataType::DateTime` | `DATETIME` |
 | Duration | `DataType.DURATION()` | `DataType::Duration` | `DURATION` |
+| Btic | `DataType.BTIC()` | `DataType::Btic` | `BTIC` |
 | Vector(N) | `DataType.vector(N)` | `DataType::Vector { dimensions: N }` | `VECTOR(N)` |
 | List(T) | `DataType.list(inner)` | `DataType::List(Box<T>)` | `LIST(T)` |
 | Map(K,V) | `DataType.map(k, v)` | `DataType::Map(Box<K>, Box<V>)` | `MAP(K, V)` |

@@ -13,6 +13,13 @@ Complete OpenCypher reference with pattern matching, filtering, and aggregations
 
 <div class="feature-card">
 
+### [Temporal Intervals](temporal-intervals.md)
+BTIC temporal intervals with granularity, certainty, and Allen's interval algebra.
+
+</div>
+
+<div class="feature-card">
+
 ### [Vector Search](vector-search.md)
 Semantic similarity search with HNSW and IVF_PQ indexes.
 

@@ -784,8 +784,9 @@ Store and search vector embeddings for semantic similarity.
             .property("content", DataType::String)
             .vector("embedding", 384)  // 384 dimensions
             .index("embedding", IndexType::Vector(VectorIndexCfg {
-                algorithm: VectorAlgo::Hnsw { m: 16, ef_construction: 200 },
+                algorithm: VectorAlgo::HnswSq { m: 16, ef_construction: 200, partitions: None },
                 metric: VectorMetric::Cosine,
+                embedding: None,
             }))
         .apply()
         .await?;

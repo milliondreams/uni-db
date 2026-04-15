@@ -235,7 +235,7 @@ RETURN node.title, score, vector_score, fts_score
 
 ### Algorithm Variants
 
-All 7 algorithms available, grouped by architecture:
+All 8 algorithms available, grouped by architecture:
 
 **Flat (no index structure):**
 
@@ -249,24 +249,26 @@ All 7 algorithms available, grouped by architecture:
 |---|---|---|---|
 | **IVF-Flat** | None | `partitions` | Medium datasets, exact within partitions |
 | **IVF-SQ** | Scalar (int8) | `partitions` | Large datasets, good recall/memory tradeoff |
-| **IVF-PQ** | Product | `partitions`, `sub_vectors` | Very large datasets, minimum memory |
-| **IVF-RQ** | Residual | `partitions` | Experimental; better accuracy than PQ at same compression |
+| **IVF-PQ** | Product | `partitions`, `sub_vectors`, `num_bits` | Very large datasets, minimum memory |
+| **IVF-RQ** | RaBitQ (1-bit) | `partitions`, `num_bits` | Better accuracy than PQ at similar compression |
 
 **HNSW (Hierarchical Navigable Small World — graph-based):**
 
 | Type | Quantization | Parameters | Best For |
 |---|---|---|---|
-| **HNSW-SQ** | Scalar (int8) | `m`, `ef_construction` | Default choice. Best recall-latency tradeoff |
-| **HNSW-PQ** | Product | `m`, `ef_construction`, `sub_vectors` | Large datasets needing graph-speed with memory savings |
+| **HNSW-Flat** | None | `m`, `ef_construction`, `partitions` | Exact graph search, no compression loss |
+| **HNSW-SQ** | Scalar (int8) | `m`, `ef_construction`, `partitions` | Default choice. Best recall-latency tradeoff |
+| **HNSW-PQ** | Product | `m`, `ef_construction`, `sub_vectors`, `partitions` | Large datasets needing graph-speed with memory savings |
 
 ### Parameter Reference
 
 | Parameter | Applies To | Default | Description |
 |---|---|---|---|
-| `partitions` | All IVF variants | 256 | Number of Voronoi partitions. More = faster search, less recall |
+| `partitions` | All IVF variants, all HNSW variants | 256 (IVF) / 1 (HNSW) | Number of Voronoi partitions. HNSW default 1 = single global graph. Increase for >1M vectors. |
 | `sub_vectors` | IVF-PQ, HNSW-PQ | 16 | Number of PQ sub-quantizers. More = better recall, more memory |
-| `m` | HNSW-SQ, HNSW-PQ | 16 | Edges per node in HNSW graph. Higher = better recall, more memory |
-| `ef_construction` | HNSW-SQ, HNSW-PQ | 200 | Build-time search width. Higher = better graph quality, slower build |
+| `num_bits` | IVF-PQ, IVF-RQ | 8 (PQ) / 1 (RQ) | Bits per subvector (PQ) or per dimension (RQ/RaBitQ). RQ: 1=classic RaBitQ, 2/4/8 for higher fidelity |
+| `m` | All HNSW variants | 16 | Edges per node in HNSW graph. Higher = better recall, more memory |
+| `ef_construction` | All HNSW variants | 200 | Build-time search width. Higher = better graph quality, slower build |
 
 ### Distance Metrics
 
@@ -301,9 +303,21 @@ OPTIONS { type: 'ivf_pq', metric: 'l2', partitions: 256, sub_vectors: 16 }
 CREATE VECTOR INDEX idx_embed FOR (d:Document) ON (d.embedding)
 OPTIONS { type: 'ivf_sq', metric: 'cosine', partitions: 256 }
 
--- IVF-RQ (residual quantization)
+-- IVF-RQ (RaBitQ quantization — 1 bit per dimension by default)
 CREATE VECTOR INDEX idx_embed FOR (d:Document) ON (d.embedding)
 OPTIONS { type: 'ivf_rq', metric: 'cosine', partitions: 256 }
+
+-- IVF-RQ with higher fidelity (4 bits per dimension)
+CREATE VECTOR INDEX idx_embed FOR (d:Document) ON (d.embedding)
+OPTIONS { type: 'ivf_rq', metric: 'cosine', partitions: 256, num_bits: '4' }
+
+-- HNSW-Flat (graph search, no quantization — exact results)
+CREATE VECTOR INDEX idx_embed FOR (d:Document) ON (d.embedding)
+OPTIONS { type: 'hnsw_flat', metric: 'cosine', m: 16, ef_construction: 200 }
+
+-- HNSW-SQ with IVF partitions (for very large datasets >1M)
+CREATE VECTOR INDEX idx_embed FOR (d:Document) ON (d.embedding)
+OPTIONS { type: 'hnsw_sq', metric: 'cosine', m: 16, ef_construction: 200, partitions: '32' }
 
 -- IVF-Flat (no quantization, exact within partitions)
 CREATE VECTOR INDEX idx_embed FOR (d:Document) ON (d.embedding)
@@ -338,22 +352,23 @@ db.schema()
         .property("title", DataType::String)
         .property("embedding", DataType::Vector { dimensions: 384 })
         .index("embedding", IndexType::Vector(VectorIndexCfg {
-            algorithm: VectorAlgo::HnswSq { m: 16, ef_construction: 200 },
+            algorithm: VectorAlgo::HnswSq { m: 16, ef_construction: 200, partitions: None },
             metric: VectorMetric::Cosine,
             embedding: None,
         }))
     .apply()
     .await?;
 
-// Other algorithm variants:
+// All algorithm variants:
 // VectorAlgo::Flat
 // VectorAlgo::IvfFlat { partitions: 256 }
 // VectorAlgo::IvfPq { partitions: 256, sub_vectors: 16 }
 // VectorAlgo::IvfSq { partitions: 256 }
-// VectorAlgo::IvfRq { partitions: 256 }
-// VectorAlgo::Hnsw { m: 16, ef_construction: 200 }   // alias for HnswSq
-// VectorAlgo::HnswSq { m: 16, ef_construction: 200 }
-// VectorAlgo::HnswPq { m: 16, ef_construction: 200, sub_vectors: 16 }
+// VectorAlgo::IvfRq { partitions: 256, num_bits: None }           // RaBitQ (default 1-bit)
+// VectorAlgo::HnswFlat { m: 16, ef_construction: 200, partitions: None }  // no quantization
+// VectorAlgo::Hnsw { m: 16, ef_construction: 200, partitions: None }      // alias for HnswSq
+// VectorAlgo::HnswSq { m: 16, ef_construction: 200, partitions: None }
+// VectorAlgo::HnswPq { m: 16, ef_construction: 200, sub_vectors: 16, partitions: None }
 ```
 
 ### Python API

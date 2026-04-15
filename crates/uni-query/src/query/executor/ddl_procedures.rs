@@ -51,6 +51,7 @@ struct IndexConfig {
     m: Option<u32>,
     ef_construction: Option<u32>,
     sub_vectors: Option<u32>,
+    num_bits: Option<u8>,
     embedding: Option<EmbeddingOptions>,
     // Generic
     name: Option<String>,
@@ -285,22 +286,30 @@ async fn create_index_internal(
                 "ivf_pq" => VectorIndexType::IvfPq {
                     num_partitions: config.partitions.unwrap_or(256),
                     num_sub_vectors: config.sub_vectors.unwrap_or(16),
-                    bits_per_subvector: 8,
+                    bits_per_subvector: config.num_bits.unwrap_or(8),
                 },
                 "ivf_sq" => VectorIndexType::IvfSq {
                     num_partitions: config.partitions.unwrap_or(256),
                 },
                 "ivf_rq" => VectorIndexType::IvfRq {
                     num_partitions: config.partitions.unwrap_or(256),
+                    num_bits: config.num_bits,
+                },
+                "hnsw_flat" => VectorIndexType::HnswFlat {
+                    m: config.m.unwrap_or(16),
+                    ef_construction: config.ef_construction.unwrap_or(200),
+                    num_partitions: config.partitions,
                 },
                 "hnsw_pq" => VectorIndexType::HnswPq {
                     m: config.m.unwrap_or(16),
                     ef_construction: config.ef_construction.unwrap_or(200),
                     num_sub_vectors: config.sub_vectors.unwrap_or(16),
+                    num_partitions: config.partitions,
                 },
                 _ => VectorIndexType::HnswSq {
                     m: config.m.unwrap_or(16),
                     ef_construction: config.ef_construction.unwrap_or(200),
+                    num_partitions: config.partitions,
                 },
             };
 
@@ -319,6 +328,22 @@ async fn create_index_internal(
             label: label.to_string(),
             properties: vec![prop_name.clone()],
             index_type: ScalarIndexType::BTree,
+            where_clause: None,
+            metadata: Default::default(),
+        }),
+        "BITMAP" => IndexDefinition::Scalar(ScalarIndexConfig {
+            name: index_name,
+            label: label.to_string(),
+            properties: vec![prop_name.clone()],
+            index_type: ScalarIndexType::Bitmap,
+            where_clause: None,
+            metadata: Default::default(),
+        }),
+        "LABEL_LIST" | "LABELLIST" => IndexDefinition::Scalar(ScalarIndexConfig {
+            name: index_name,
+            label: label.to_string(),
+            properties: vec![prop_name.clone()],
+            index_type: ScalarIndexType::LabelList,
             where_clause: None,
             metadata: Default::default(),
         }),

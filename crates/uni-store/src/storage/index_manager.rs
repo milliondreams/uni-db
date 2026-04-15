@@ -14,7 +14,7 @@ use lance::index::vector::VectorIndexParams;
 #[cfg(feature = "lance-backend")]
 use lance_index::progress::IndexBuildProgress;
 #[cfg(feature = "lance-backend")]
-use lance_index::scalar::{InvertedIndexParams, ScalarIndexParams};
+use lance_index::scalar::{BuiltinIndexType, InvertedIndexParams, ScalarIndexParams};
 #[cfg(feature = "lance-backend")]
 use lance_index::vector::bq::RQBuildParams;
 #[cfg(feature = "lance-backend")]
@@ -44,7 +44,7 @@ use uni_common::core::schema::SchemaManager;
 #[cfg(feature = "lance-backend")]
 use uni_common::core::schema::{
     DistanceMetric, FullTextIndexConfig, InvertedIndexConfig, JsonFtsIndexConfig,
-    ScalarIndexConfig, VectorIndexConfig, VectorIndexType,
+    ScalarIndexConfig, ScalarIndexType, VectorIndexConfig, VectorIndexType,
 };
 
 /// Validates that a column name contains only safe characters to prevent SQL injection.
@@ -265,13 +265,34 @@ impl IndexManager {
                         let sq = SQBuildParams::default();
                         VectorIndexParams::with_ivf_sq_params(metric_type, ivf, sq)
                     }
-                    VectorIndexType::IvfRq { num_partitions } => {
+                    VectorIndexType::IvfRq {
+                        num_partitions,
+                        num_bits,
+                    } => {
                         let ivf = IvfBuildParams::new(num_partitions as usize);
-                        let rq = RQBuildParams::default();
+                        let mut rq = RQBuildParams::default();
+                        if let Some(bits) = num_bits {
+                            rq.num_bits = bits;
+                        }
                         VectorIndexParams::with_ivf_rq_params(metric_type, ivf, rq)
                     }
-                    VectorIndexType::HnswSq { m, ef_construction } => {
-                        let ivf = IvfBuildParams::new(1);
+                    VectorIndexType::HnswFlat {
+                        m,
+                        ef_construction,
+                        num_partitions,
+                    } => {
+                        let ivf = IvfBuildParams::new(num_partitions.unwrap_or(1) as usize);
+                        let hnsw = HnswBuildParams::default()
+                            .num_edges(m as usize)
+                            .ef_construction(ef_construction as usize);
+                        VectorIndexParams::ivf_hnsw(metric_type, ivf, hnsw)
+                    }
+                    VectorIndexType::HnswSq {
+                        m,
+                        ef_construction,
+                        num_partitions,
+                    } => {
+                        let ivf = IvfBuildParams::new(num_partitions.unwrap_or(1) as usize);
                         let hnsw = HnswBuildParams::default()
                             .num_edges(m as usize)
                             .ef_construction(ef_construction as usize);
@@ -282,8 +303,9 @@ impl IndexManager {
                         m,
                         ef_construction,
                         num_sub_vectors,
+                        num_partitions,
                     } => {
-                        let ivf = IvfBuildParams::new(1);
+                        let ivf = IvfBuildParams::new(num_partitions.unwrap_or(1) as usize);
                         let hnsw = HnswBuildParams::default()
                             .num_edges(m as usize)
                             .ef_construction(ef_construction as usize);
@@ -362,12 +384,17 @@ impl IndexManager {
                 let columns: Vec<&str> = properties.iter().map(|s| s.as_str()).collect();
 
                 let progress = TracingIndexProgress::arc(&config.name);
+                let scalar_params = match config.index_type {
+                    ScalarIndexType::Bitmap => {
+                        ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap)
+                    }
+                    ScalarIndexType::LabelList => {
+                        ScalarIndexParams::for_builtin(BuiltinIndexType::LabelList)
+                    }
+                    _ => ScalarIndexParams::default(),
+                };
                 match lance_ds
-                    .create_index_builder(
-                        &columns,
-                        IndexType::Scalar,
-                        &ScalarIndexParams::default(),
-                    )
+                    .create_index_builder(&columns, IndexType::Scalar, &scalar_params)
                     .name(config.name.clone())
                     .replace(true)
                     .progress(progress)

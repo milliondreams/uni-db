@@ -140,8 +140,9 @@ db.schema()
     .label("Paper")
         .property("embedding", DataType::Vector { dimensions: 768 })
         .index("embedding", IndexType::Vector(VectorIndexCfg {
-            algorithm: VectorAlgo::Hnsw { m: 32, ef_construction: 200 },
+            algorithm: VectorAlgo::HnswSq { m: 32, ef_construction: 200, partitions: None },
             metric: VectorMetric::Cosine,
+            embedding: None,
         }))
     .apply()
     .await?;

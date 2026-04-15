@@ -308,11 +308,11 @@ pub enum IndexType {
     Vector(VectorIndexCfg),  FullText,  Scalar(ScalarType),  Inverted(InvertedIndexConfig),
 }
 pub struct VectorIndexCfg {
-    pub algorithm: VectorAlgo,  // Flat | IvfFlat | IvfPq | IvfSq | IvfRq | Hnsw | HnswSq | HnswPq
+    pub algorithm: VectorAlgo,  // Flat | IvfFlat | IvfPq | IvfSq | IvfRq | HnswFlat | Hnsw | HnswSq | HnswPq
     pub metric: VectorMetric,   // Cosine | L2 | Dot
     pub embedding: Option<EmbeddingCfg>,
 }
-pub enum ScalarType { BTree, Hash, Bitmap }
+pub enum ScalarType { BTree, Hash, Bitmap, LabelList }
 ```
 
 ### SchemaChange

@@ -641,15 +641,27 @@ pub enum VectorIndexType {
     },
     IvfRq {
         num_partitions: u32,
+        #[serde(default)]
+        num_bits: Option<u8>,
+    },
+    HnswFlat {
+        m: u32,
+        ef_construction: u32,
+        #[serde(default)]
+        num_partitions: Option<u32>,
     },
     HnswSq {
         m: u32,
         ef_construction: u32,
+        #[serde(default)]
+        num_partitions: Option<u32>,
     },
     HnswPq {
         m: u32,
         ef_construction: u32,
         num_sub_vectors: u32,
+        #[serde(default)]
+        num_partitions: Option<u32>,
     },
 }
 
@@ -742,6 +754,7 @@ pub enum ScalarIndexType {
     BTree,
     Hash,
     Bitmap,
+    LabelList,
 }
 
 pub struct SchemaManager {

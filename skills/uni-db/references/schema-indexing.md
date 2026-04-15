@@ -221,12 +221,17 @@ All CRDTs implement `CrdtMerge` (commutative, associative, idempotent). Serializ
 
 | Type | Best For | Query Pattern | Creation |
 |------|----------|---------------|----------|
-| **BTree** | Range queries, ordering, prefix | `WHERE x > 5`, `STARTS WITH` | `CREATE INDEX idx ON Label (prop)` |
-| **Hash** | Exact match lookups | `WHERE x = 123` | Rust: `IndexType::Scalar(ScalarType::Hash)` |
-| **Bitmap** | Low-cardinality columns | `WHERE status = 'active'` | Rust: `IndexType::Scalar(ScalarType::Bitmap)` |
+| **BTree** | Range queries, ordering, prefix | `WHERE x > 5`, `STARTS WITH` | Default. `CREATE INDEX idx ON Label (prop)` |
+| **Hash** | Exact match lookups | `WHERE x = 123` | Rust: `ScalarType::Hash` |
+| **Bitmap** | Low-cardinality columns (< 1000 distinct values) | `WHERE status = 'active'` | DDL: `"BITMAP"`, Rust: `ScalarType::Bitmap` |
+| **LabelList** | List columns with containment queries | `array_contains_any`, `array_contains_all` | DDL: `"LABEL_LIST"`, Rust: `ScalarType::LabelList` |
 
 ```cypher
 CREATE INDEX idx_name ON Person (name)          -- Default: BTree
+
+-- Via procedure API
+CALL uni.schema.createIndex('Event', 'status', {"type": "BITMAP"})
+CALL uni.schema.createIndex('Doc', 'tags', {"type": "LABEL_LIST"})
 ```
 
 ```rust
@@ -238,34 +243,39 @@ db.schema().label("User")
 
 ### Vector Indexes
 
-7 algorithm variants with different quantization strategies:
+8 algorithm variants with different quantization strategies:
 
 | Type | Quantization | Best For | Key Parameters |
 |------|-------------|----------|----------------|
 | **Flat** | None | < 10k vectors, exact search | — |
 | **IVF-Flat** | None | Medium datasets, exact within partitions | `partitions` |
 | **IVF-SQ** | Scalar (int8) | Large datasets, good recall/memory tradeoff | `partitions` |
-| **IVF-PQ** | Product | Very large datasets, minimum memory | `partitions`, `sub_vectors` |
-| **IVF-RQ** | Residual | Experimental; better accuracy than PQ at same compression | `partitions` |
-| **HNSW-SQ** | Scalar (int8) | Default. Best recall-latency tradeoff | `m`, `ef_construction` |
-| **HNSW-PQ** | Product | Large datasets with graph speed + compression | `m`, `ef_construction`, `sub_vectors` |
+| **IVF-PQ** | Product | Very large datasets, minimum memory | `partitions`, `sub_vectors`, `num_bits` |
+| **IVF-RQ** | RaBitQ | Better accuracy than PQ at similar compression | `partitions`, `num_bits` |
+| **HNSW-Flat** | None | Exact graph search, no compression loss | `m`, `ef_construction`, `partitions` |
+| **HNSW-SQ** | Scalar (int8) | Default. Best recall-latency tradeoff | `m`, `ef_construction`, `partitions` |
+| **HNSW-PQ** | Product | Large datasets with graph speed + compression | `m`, `ef_construction`, `sub_vectors`, `partitions` |
 
 ```cypher
 -- HNSW-SQ (default if no type specified)
 CREATE VECTOR INDEX idx_embed ON Document (embedding)
   WITH { metric: 'cosine', type: 'hnsw_sq' }
 
--- HNSW-PQ with explicit parameters
+-- HNSW-Flat (no quantization, exact graph search)
 CREATE VECTOR INDEX idx_embed ON Document (embedding)
-  WITH { metric: 'cosine', type: 'hnsw_pq', m: 16, ef_construction: 200, sub_vectors: 8 }
+  WITH { metric: 'cosine', type: 'hnsw_flat' }
+
+-- HNSW-SQ with IVF partitions for very large datasets
+CREATE VECTOR INDEX idx_embed ON Document (embedding)
+  WITH { metric: 'cosine', type: 'hnsw_sq', partitions: 32 }
+
+-- IVF-RQ (RaBitQ, 1-bit per dimension by default)
+CREATE VECTOR INDEX idx_embed ON Document (embedding)
+  WITH { metric: 'cosine', type: 'ivf_rq', partitions: 256 }
 
 -- IVF-PQ for memory-constrained large datasets
 CREATE VECTOR INDEX idx_embed ON Document (embedding)
   WITH { metric: 'l2', type: 'ivf_pq', partitions: 256, sub_vectors: 16 }
-
--- IVF-SQ for large datasets with better recall than PQ
-CREATE VECTOR INDEX idx_embed ON Document (embedding)
-  WITH { metric: 'cosine', type: 'ivf_sq', partitions: 256 }
 ```
 
 **Distance Metrics:**

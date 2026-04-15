@@ -423,8 +423,14 @@ async fn test_schema_round_trip_ivf_sq() {
 #[tokio::test]
 async fn test_schema_round_trip_ivf_rq() {
     assert_schema_stores_index_type(
-        VectorAlgo::IvfRq { partitions: 32 },
-        VectorIndexType::IvfRq { num_partitions: 32 },
+        VectorAlgo::IvfRq {
+            partitions: 32,
+            num_bits: None,
+        },
+        VectorIndexType::IvfRq {
+            num_partitions: 32,
+            num_bits: None,
+        },
     )
     .await;
 }
@@ -435,10 +441,12 @@ async fn test_schema_round_trip_hnsw() {
         VectorAlgo::Hnsw {
             m: 12,
             ef_construction: 100,
+            partitions: None,
         },
         VectorIndexType::HnswSq {
             m: 12,
             ef_construction: 100,
+            num_partitions: None,
         },
     )
     .await;
@@ -450,10 +458,12 @@ async fn test_schema_round_trip_hnsw_sq() {
         VectorAlgo::HnswSq {
             m: 8,
             ef_construction: 64,
+            partitions: None,
         },
         VectorIndexType::HnswSq {
             m: 8,
             ef_construction: 64,
+            num_partitions: None,
         },
     )
     .await;
@@ -466,11 +476,13 @@ async fn test_schema_round_trip_hnsw_pq() {
             m: 16,
             ef_construction: 200,
             sub_vectors: 4,
+            partitions: None,
         },
         VectorIndexType::HnswPq {
             m: 16,
             ef_construction: 200,
             num_sub_vectors: 4,
+            num_partitions: None,
         },
     )
     .await;
@@ -549,7 +561,11 @@ async fn test_vector_query_ivf_sq() {
 
 #[tokio::test]
 async fn test_vector_query_ivf_rq() {
-    assert_vector_query_works(VectorAlgo::IvfRq { partitions: 2 }).await;
+    assert_vector_query_works(VectorAlgo::IvfRq {
+        partitions: 2,
+        num_bits: None,
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -557,6 +573,7 @@ async fn test_vector_query_hnsw_sq() {
     assert_vector_query_works(VectorAlgo::HnswSq {
         m: 4,
         ef_construction: 16,
+        partitions: None,
     })
     .await;
 }
@@ -567,6 +584,7 @@ async fn test_vector_query_hnsw_pq() {
         m: 4,
         ef_construction: 16,
         sub_vectors: 4,
+        partitions: None,
     })
     .await;
 }
@@ -647,6 +665,7 @@ async fn test_ddl_procedure_algorithm_hnsw_pq() -> Result<()> {
                 m: 8,
                 ef_construction: 100,
                 num_sub_vectors: 4,
+                num_partitions: None,
             }
         );
     } else {
@@ -687,6 +706,7 @@ async fn test_ddl_procedure_default_algorithm_is_hnsw_sq() -> Result<()> {
             VectorIndexType::HnswSq {
                 m: 16,
                 ef_construction: 200,
+                num_partitions: None,
             }
         );
     } else {

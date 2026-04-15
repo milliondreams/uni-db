@@ -15,7 +15,7 @@ description: >-
 
 ## What is uni-db?
 
-uni-db is an **embedded, serverless multi-model graph database** (graph + vector + document + columnar) that runs inside your process with no server required. It supports **OpenCypher** queries with extensions for vector search, full-text search, DDL, and time travel. **Locy** is its Datalog-inspired logic programming language for recursive rules, probabilistic reasoning, and abductive inference. APIs are available in **Python** (sync/async via PyO3) and **Rust** (async/blocking), with a **Pydantic OGM** layer. Built-in capabilities include 7 vector index algorithms (Flat, IVF-Flat/SQ/PQ/RQ, HNSW-SQ/PQ) with scalar and product quantization, BM25 full-text search, hybrid search with RRF fusion, and 36+ graph algorithms.
+uni-db is an **embedded, serverless multi-model graph database** (graph + vector + document + columnar) that runs inside your process with no server required. It supports **OpenCypher** queries with extensions for vector search, full-text search, DDL, and time travel. **Locy** is its Datalog-inspired logic programming language for recursive rules, probabilistic reasoning, and abductive inference. APIs are available in **Python** (sync/async via PyO3) and **Rust** (async/blocking), with a **Pydantic OGM** layer. Built-in capabilities include 8 vector index algorithms (Flat, IVF-Flat/SQ/PQ/RQ, HNSW-Flat/SQ/PQ) with scalar, product, and RaBitQ quantization, 4 scalar index types (BTree, Hash, Bitmap, LabelList), BM25 full-text search, hybrid search with RRF fusion, and 36+ graph algorithms.
 
 ---
 

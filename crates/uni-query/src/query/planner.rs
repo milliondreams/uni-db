@@ -7185,6 +7185,12 @@ impl QueryPlanner {
                         .and_then(|v| v.as_str())
                         .and_then(|s| s.parse::<u32>().ok())
                 };
+                let opt_u8 = |key: &str| -> Option<u8> {
+                    c.options
+                        .get(key)
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| s.parse::<u8>().ok())
+                };
                 let index_type = match c.options.get("type").and_then(|v| v.as_str()) {
                     Some("flat") => VectorIndexType::Flat,
                     Some("ivf_flat") => VectorIndexType::IvfFlat {
@@ -7195,20 +7201,28 @@ impl QueryPlanner {
                     },
                     Some("ivf_rq") => VectorIndexType::IvfRq {
                         num_partitions: opt("partitions").unwrap_or(256),
+                        num_bits: opt_u8("num_bits"),
+                    },
+                    Some("hnsw_flat") => VectorIndexType::HnswFlat {
+                        m: opt("m").unwrap_or(16),
+                        ef_construction: opt("ef_construction").unwrap_or(200),
+                        num_partitions: opt("partitions"),
                     },
                     Some("hnsw") | Some("hnsw_sq") => VectorIndexType::HnswSq {
                         m: opt("m").unwrap_or(16),
                         ef_construction: opt("ef_construction").unwrap_or(200),
+                        num_partitions: opt("partitions"),
                     },
                     Some("hnsw_pq") => VectorIndexType::HnswPq {
                         m: opt("m").unwrap_or(16),
                         ef_construction: opt("ef_construction").unwrap_or(200),
                         num_sub_vectors: opt("sub_vectors").unwrap_or(16),
+                        num_partitions: opt("partitions"),
                     },
                     _ => VectorIndexType::IvfPq {
                         num_partitions: opt("partitions").unwrap_or(256),
                         num_sub_vectors: opt("sub_vectors").unwrap_or(16),
-                        bits_per_subvector: 8,
+                        bits_per_subvector: opt_u8("num_bits").unwrap_or(8),
                     },
                 };
 

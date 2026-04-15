@@ -617,7 +617,27 @@ For Cosine and L2, you can compare scores across queries without worrying about 
 
 ## Index Tuning
 
-DDL currently supports selecting the index type (`hnsw`, `flat`, `ivf_pq`) but uses default parameters. To tune HNSW or IVF_PQ parameters, use the Rust schema builder:
+DDL supports selecting the index type and tuning parameters directly:
+
+```cypher
+-- HNSW-SQ with custom parameters (default algorithm)
+CREATE VECTOR INDEX idx FOR (p:Paper) ON p.embedding
+OPTIONS { type: 'hnsw_sq', m: '32', ef_construction: '200' }
+
+-- HNSW-Flat for exact graph search (no quantization loss)
+CREATE VECTOR INDEX idx FOR (p:Paper) ON p.embedding
+OPTIONS { type: 'hnsw_flat', m: '16', ef_construction: '200' }
+
+-- IVF-RQ (RaBitQ) for best accuracy/compression tradeoff
+CREATE VECTOR INDEX idx FOR (p:Paper) ON p.embedding
+OPTIONS { type: 'ivf_rq', partitions: '256' }
+
+-- HNSW-SQ with IVF partitions for very large datasets (>1M vectors)
+CREATE VECTOR INDEX idx FOR (p:Paper) ON p.embedding
+OPTIONS { type: 'hnsw_sq', partitions: '32' }
+```
+
+Or via the Rust schema builder:
 
 ```rust
 use uni_db::{DataType, IndexType, VectorAlgo, VectorIndexCfg, VectorMetric};
@@ -626,12 +646,15 @@ db.schema()
     .label("Paper")
         .property("embedding", DataType::Vector { dimensions: 768 })
         .index("embedding", IndexType::Vector(VectorIndexCfg {
-            algorithm: VectorAlgo::Hnsw { m: 32, ef_construction: 200 },
+            algorithm: VectorAlgo::HnswSq { m: 32, ef_construction: 200, partitions: None },
             metric: VectorMetric::Cosine,
+            embedding: None,
         }))
     .apply()
     .await?;
 ```
+
+All 8 algorithms are available: `Flat`, `IvfFlat`, `IvfSq`, `IvfPq`, `IvfRq`, `HnswFlat`, `HnswSq` (default), `HnswPq`. See [Indexing Concepts](../concepts/indexing.md) for the full parameter reference.
 
 ---
 

@@ -225,19 +225,48 @@ RETURN node.title, score, vector_score, fts_score
 
 ### Index Type Decision Tree
 
-| Dataset Size | Index Type | Notes |
+| Dataset Size | Recommended | Notes |
 |---|---|---|
 | < 10k vectors | **Flat** | Exact brute-force; no tuning needed |
-| < 1M vectors | **HNSW** | Best recall-latency tradeoff |
-| > 1M vectors | **IVF-PQ** | Memory-efficient, acceptable recall |
+| 10k - 1M vectors | **HNSW-SQ** (default) | Best recall-latency tradeoff with scalar quantization |
+| > 1M vectors, high recall | **HNSW-PQ** | Graph-based with product quantization for memory savings |
+| > 1M vectors, memory-constrained | **IVF-PQ** | Partition-based with product quantization, smallest footprint |
+| > 1M vectors, quality priority | **IVF-SQ** | Partition-based with scalar quantization, better recall than PQ |
 
-### Index Parameters
+### Algorithm Variants
 
-| Type | Parameters | Description |
-|---|---|---|
-| **HNSW** | `m` (connections per node), `ef_construction` (build quality), `ef_search` (query quality) | Higher `m`/`ef_construction` = better recall, more memory |
-| **IVF-PQ** | `num_partitions`, `num_sub_vectors`, `bits` | More partitions = faster search, less recall |
-| **Flat** | None | Brute force, always exact |
+All 7 algorithms available, grouped by architecture:
+
+**Flat (no index structure):**
+
+| Type | Quantization | Parameters | Best For |
+|---|---|---|---|
+| **Flat** | None | — | < 10k vectors, exact results |
+
+**IVF (Inverted File — partition-based):**
+
+| Type | Quantization | Parameters | Best For |
+|---|---|---|---|
+| **IVF-Flat** | None | `partitions` | Medium datasets, exact within partitions |
+| **IVF-SQ** | Scalar (int8) | `partitions` | Large datasets, good recall/memory tradeoff |
+| **IVF-PQ** | Product | `partitions`, `sub_vectors` | Very large datasets, minimum memory |
+| **IVF-RQ** | Residual | `partitions` | Experimental; better accuracy than PQ at same compression |
+
+**HNSW (Hierarchical Navigable Small World — graph-based):**
+
+| Type | Quantization | Parameters | Best For |
+|---|---|---|---|
+| **HNSW-SQ** | Scalar (int8) | `m`, `ef_construction` | Default choice. Best recall-latency tradeoff |
+| **HNSW-PQ** | Product | `m`, `ef_construction`, `sub_vectors` | Large datasets needing graph-speed with memory savings |
+
+### Parameter Reference
+
+| Parameter | Applies To | Default | Description |
+|---|---|---|---|
+| `partitions` | All IVF variants | 256 | Number of Voronoi partitions. More = faster search, less recall |
+| `sub_vectors` | IVF-PQ, HNSW-PQ | 16 | Number of PQ sub-quantizers. More = better recall, more memory |
+| `m` | HNSW-SQ, HNSW-PQ | 16 | Edges per node in HNSW graph. Higher = better recall, more memory |
+| `ef_construction` | HNSW-SQ, HNSW-PQ | 200 | Build-time search width. Higher = better graph quality, slower build |
 
 ### Distance Metrics
 
@@ -256,15 +285,35 @@ Score conversion is **metric-aware** and shared across `uni.vector.query`, `uni.
 ### Cypher DDL
 
 ```cypher
--- HNSW (default, recommended)
+-- HNSW-SQ (default, recommended)
 CREATE VECTOR INDEX idx_embed FOR (d:Document) ON (d.embedding)
-OPTIONS { type: 'hnsw', metric: 'cosine' }
+OPTIONS { type: 'hnsw_sq', metric: 'cosine' }
 
--- IVF-PQ for large datasets
+-- HNSW-PQ for large datasets needing graph speed + compression
 CREATE VECTOR INDEX idx_embed FOR (d:Document) ON (d.embedding)
-OPTIONS { type: 'ivf_pq', metric: 'l2', num_partitions: 256 }
+OPTIONS { type: 'hnsw_pq', metric: 'cosine', m: 16, ef_construction: 200, sub_vectors: 8 }
 
--- With auto-embedding config
+-- IVF-PQ for very large datasets, minimum memory
+CREATE VECTOR INDEX idx_embed FOR (d:Document) ON (d.embedding)
+OPTIONS { type: 'ivf_pq', metric: 'l2', partitions: 256, sub_vectors: 16 }
+
+-- IVF-SQ for large datasets, better recall than PQ
+CREATE VECTOR INDEX idx_embed FOR (d:Document) ON (d.embedding)
+OPTIONS { type: 'ivf_sq', metric: 'cosine', partitions: 256 }
+
+-- IVF-RQ (residual quantization)
+CREATE VECTOR INDEX idx_embed FOR (d:Document) ON (d.embedding)
+OPTIONS { type: 'ivf_rq', metric: 'cosine', partitions: 256 }
+
+-- IVF-Flat (no quantization, exact within partitions)
+CREATE VECTOR INDEX idx_embed FOR (d:Document) ON (d.embedding)
+OPTIONS { type: 'ivf_flat', metric: 'cosine', partitions: 128 }
+
+-- Flat (brute-force, exact)
+CREATE VECTOR INDEX idx_embed FOR (d:Document) ON (d.embedding)
+OPTIONS { type: 'flat', metric: 'cosine' }
+
+-- With auto-embedding config (works with any algorithm)
 CREATE VECTOR INDEX doc_embed FOR (d:Document) ON (d.embedding)
 OPTIONS {
     metric: 'cosine',
@@ -275,7 +324,7 @@ OPTIONS {
     }
 }
 
--- Short form (also valid)
+-- Short form (defaults to HNSW-SQ)
 CREATE VECTOR INDEX idx_embed ON Document (embedding) WITH { metric: 'cosine' }
 ```
 
@@ -289,12 +338,22 @@ db.schema()
         .property("title", DataType::String)
         .property("embedding", DataType::Vector { dimensions: 384 })
         .index("embedding", IndexType::Vector(VectorIndexCfg {
-            algorithm: VectorAlgo::Hnsw { m: 16, ef_construction: 200 },
+            algorithm: VectorAlgo::HnswSq { m: 16, ef_construction: 200 },
             metric: VectorMetric::Cosine,
-            embedding: None,  // Or configure auto-embed
+            embedding: None,
         }))
     .apply()
     .await?;
+
+// Other algorithm variants:
+// VectorAlgo::Flat
+// VectorAlgo::IvfFlat { partitions: 256 }
+// VectorAlgo::IvfPq { partitions: 256, sub_vectors: 16 }
+// VectorAlgo::IvfSq { partitions: 256 }
+// VectorAlgo::IvfRq { partitions: 256 }
+// VectorAlgo::Hnsw { m: 16, ef_construction: 200 }   // alias for HnswSq
+// VectorAlgo::HnswSq { m: 16, ef_construction: 200 }
+// VectorAlgo::HnswPq { m: 16, ef_construction: 200, sub_vectors: 16 }
 ```
 
 ### Python API
@@ -407,9 +466,11 @@ vectors = xervo.embed("embed/default", ["graph databases", "neural search"])
 - Use **Dot** for maximum inner product search. Check your model's documentation.
 
 ### Index Type Selection
-- **< 10k rows:** Flat (exact). HNSW/IVF-PQ need minimum data to be effective.
-- **< 1M rows:** HNSW (best recall-latency).
-- **> 1M rows:** IVF-PQ (memory-efficient).
+- **< 10k rows:** Flat (exact). Graph/partition-based indexes need minimum data to be effective.
+- **10k - 1M rows:** HNSW-SQ (default, best recall-latency tradeoff with scalar quantization).
+- **> 1M rows, quality priority:** HNSW-PQ or IVF-SQ (graph speed or good recall with moderate compression).
+- **> 1M rows, memory-constrained:** IVF-PQ (most aggressive compression, smallest footprint).
+- **Experimental:** IVF-RQ (residual quantization, potentially better accuracy than PQ at same compression).
 
 ### Hybrid Search Tuning
 - Start with **RRF** (robust default, no tuning needed).

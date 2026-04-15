@@ -238,18 +238,34 @@ db.schema().label("User")
 
 ### Vector Indexes
 
-| Type | Best For | Key Parameters |
-|------|----------|----------------|
-| **HNSW** | < 1M vectors, high recall | `m`, `ef_construction`, `ef_search` |
-| **IVF-PQ** | > 1M vectors, memory-efficient | `num_partitions`, `num_sub_vectors`, `bits` |
-| **Flat** | < 10k vectors, exact search | None (brute force) |
+7 algorithm variants with different quantization strategies:
+
+| Type | Quantization | Best For | Key Parameters |
+|------|-------------|----------|----------------|
+| **Flat** | None | < 10k vectors, exact search | — |
+| **IVF-Flat** | None | Medium datasets, exact within partitions | `partitions` |
+| **IVF-SQ** | Scalar (int8) | Large datasets, good recall/memory tradeoff | `partitions` |
+| **IVF-PQ** | Product | Very large datasets, minimum memory | `partitions`, `sub_vectors` |
+| **IVF-RQ** | Residual | Experimental; better accuracy than PQ at same compression | `partitions` |
+| **HNSW-SQ** | Scalar (int8) | Default. Best recall-latency tradeoff | `m`, `ef_construction` |
+| **HNSW-PQ** | Product | Large datasets with graph speed + compression | `m`, `ef_construction`, `sub_vectors` |
 
 ```cypher
+-- HNSW-SQ (default if no type specified)
 CREATE VECTOR INDEX idx_embed ON Document (embedding)
-  WITH { metric: 'cosine', type: 'hnsw' }
+  WITH { metric: 'cosine', type: 'hnsw_sq' }
 
+-- HNSW-PQ with explicit parameters
 CREATE VECTOR INDEX idx_embed ON Document (embedding)
-  WITH { metric: 'l2', type: 'ivf_pq', num_partitions: 256 }
+  WITH { metric: 'cosine', type: 'hnsw_pq', m: 16, ef_construction: 200, sub_vectors: 8 }
+
+-- IVF-PQ for memory-constrained large datasets
+CREATE VECTOR INDEX idx_embed ON Document (embedding)
+  WITH { metric: 'l2', type: 'ivf_pq', partitions: 256, sub_vectors: 16 }
+
+-- IVF-SQ for large datasets with better recall than PQ
+CREATE VECTOR INDEX idx_embed ON Document (embedding)
+  WITH { metric: 'cosine', type: 'ivf_sq', partitions: 256 }
 ```
 
 **Distance Metrics:**
@@ -385,7 +401,7 @@ Limit to 2-3 labels per vertex to avoid excessive storage duplication.
 | **Schemaless everything** | Overflow JSONB loses columnar benefits | Define schema for frequently-queried properties |
 | **Over-indexing** | Index maintenance cost on every write | Only index properties used in queries |
 | **Wrong distance metric** | Cosine on unnormalized vectors = poor results | Check embedding model docs |
-| **Vector index without enough data** | HNSW/IVF-PQ need minimum data | Use Flat for < 1000 rows |
+| **Vector index without enough data** | HNSW/IVF need minimum data | Use Flat for < 10k rows |
 | **Relationships as properties** | Loses graph traversal power | Use edges: `(a)-[:KNOWS]->(b)` not `a.friend_ids` |
 | **Labels for states** | Unstable label categories | Use a property: `status: 'draft'` not `:DraftPaper` |
 | **Frequently-queried overflow** | Slow JSONB parsing on every row | Promote to schema property |

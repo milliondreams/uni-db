@@ -308,7 +308,7 @@ pub enum IndexType {
     Vector(VectorIndexCfg),  FullText,  Scalar(ScalarType),  Inverted(InvertedIndexConfig),
 }
 pub struct VectorIndexCfg {
-    pub algorithm: VectorAlgo,  // Hnsw { m, ef_construction } | IvfPq { partitions, sub_vectors } | Flat
+    pub algorithm: VectorAlgo,  // Flat | IvfFlat | IvfPq | IvfSq | IvfRq | Hnsw | HnswSq | HnswPq
     pub metric: VectorMetric,   // Cosine | L2 | Dot
     pub embedding: Option<EmbeddingCfg>,
 }

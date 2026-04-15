@@ -437,6 +437,8 @@ When the SKILL.md overview is insufficient for the user's task, load the appropr
 | Vector search, FTS, hybrid search, similar_to, embeddings | `references/vector-hybrid-search.md` |
 | Locy rules, recursive logic, ALONG/FOLD/DERIVE/ASSUME/ABDUCE | `references/locy.md` |
 | Schema design, data types, indexes, identity (ext_id/VID) | `references/schema-indexing.md` |
+| BTIC temporal intervals, Allen algebra, certainty/granularity | `references/btic.md` |
+| Xervo ML runtime, providers, model catalog, auto-embedding | `references/xervo.md` |
 | Graph algorithms (PageRank, WCC, shortest path, etc.) | `references/graph-algorithms.md` |
 
 Load **multiple references** when a task spans domains. Examples:
@@ -444,3 +446,5 @@ Load **multiple references** when a task spans domains. Examples:
 - Locy with vector similarity: `references/locy.md` + `references/vector-hybrid-search.md`
 - Schema + bulk loading: `references/schema-indexing.md` + `references/python-api.md`
 - Rust graph algorithms: `references/graph-algorithms.md` + `references/rust-api.md`
+- BTIC temporal queries in Python: `references/btic.md` + `references/python-api.md`
+- RAG with Xervo embeddings: `references/xervo.md` + `references/vector-hybrid-search.md`

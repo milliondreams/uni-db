@@ -73,6 +73,9 @@ Same packed `u64` auto-increment as VID. Sentinel: `Eid::INVALID = u64::MAX`.
 | `Time` | Struct(nanos_since_midnight, offset_seconds) | `TIME` | `DataType::Time` |
 | `DateTime` | Struct(nanos_since_epoch, offset_seconds, timezone_name) | `DATETIME` | `DataType::DateTime` |
 | `Duration` | `LargeBinary` (CypherValue codec) | `DURATION` | `DataType::Duration` |
+| `Btic` | `FixedSizeBinary(24)` | `BTIC` | `DataType::Btic` |
+
+**BTIC (Binary Temporal Interval Codec):** Encodes half-open temporal intervals `[lo, hi)` as 24 bytes with per-bound granularity and certainty. Construct with `btic('literal')`: `btic('1985')` (year), `btic('1985-03/2024-06')` (range), `btic('~1985')` (approximate), `btic('2020-03/')` (ongoing). Supports comparison operators (`<`, `>`, `<=`, `>=`, `=`, `<>`) and 30+ dedicated functions (`btic_lo`, `btic_overlaps`, `btic_contains_point`, `btic_span`, etc.).
 
 ### Complex Types
 
@@ -218,12 +221,17 @@ All CRDTs implement `CrdtMerge` (commutative, associative, idempotent). Serializ
 
 | Type | Best For | Query Pattern | Creation |
 |------|----------|---------------|----------|
-| **BTree** | Range queries, ordering, prefix | `WHERE x > 5`, `STARTS WITH` | `CREATE INDEX idx ON Label (prop)` |
-| **Hash** | Exact match lookups | `WHERE x = 123` | Rust: `IndexType::Scalar(ScalarType::Hash)` |
-| **Bitmap** | Low-cardinality columns | `WHERE status = 'active'` | Rust: `IndexType::Scalar(ScalarType::Bitmap)` |
+| **BTree** | Range queries, ordering, prefix | `WHERE x > 5`, `STARTS WITH` | Default. `CREATE INDEX idx ON Label (prop)` |
+| **Hash** | Exact match lookups | `WHERE x = 123` | Rust: `ScalarType::Hash` |
+| **Bitmap** | Low-cardinality columns (< 1000 distinct values) | `WHERE status = 'active'` | DDL: `"BITMAP"`, Rust: `ScalarType::Bitmap` |
+| **LabelList** | List columns with containment queries | `array_contains_any`, `array_contains_all` | DDL: `"LABEL_LIST"`, Rust: `ScalarType::LabelList` |
 
 ```cypher
 CREATE INDEX idx_name ON Person (name)          -- Default: BTree
+
+-- Via procedure API
+CALL uni.schema.createIndex('Event', 'status', {"type": "BITMAP"})
+CALL uni.schema.createIndex('Doc', 'tags', {"type": "LABEL_LIST"})
 ```
 
 ```rust
@@ -235,18 +243,39 @@ db.schema().label("User")
 
 ### Vector Indexes
 
-| Type | Best For | Key Parameters |
-|------|----------|----------------|
-| **HNSW** | < 1M vectors, high recall | `m`, `ef_construction`, `ef_search` |
-| **IVF-PQ** | > 1M vectors, memory-efficient | `num_partitions`, `num_sub_vectors`, `bits` |
-| **Flat** | < 10k vectors, exact search | None (brute force) |
+8 algorithm variants with different quantization strategies:
+
+| Type | Quantization | Best For | Key Parameters |
+|------|-------------|----------|----------------|
+| **Flat** | None | < 10k vectors, exact search | — |
+| **IVF-Flat** | None | Medium datasets, exact within partitions | `partitions` |
+| **IVF-SQ** | Scalar (int8) | Large datasets, good recall/memory tradeoff | `partitions` |
+| **IVF-PQ** | Product | Very large datasets, minimum memory | `partitions`, `sub_vectors`, `num_bits` |
+| **IVF-RQ** | RaBitQ | Better accuracy than PQ at similar compression | `partitions`, `num_bits` |
+| **HNSW-Flat** | None | Exact graph search, no compression loss | `m`, `ef_construction`, `partitions` |
+| **HNSW-SQ** | Scalar (int8) | Default. Best recall-latency tradeoff | `m`, `ef_construction`, `partitions` |
+| **HNSW-PQ** | Product | Large datasets with graph speed + compression | `m`, `ef_construction`, `sub_vectors`, `partitions` |
 
 ```cypher
+-- HNSW-SQ (default if no type specified)
 CREATE VECTOR INDEX idx_embed ON Document (embedding)
-  WITH { metric: 'cosine', type: 'hnsw' }
+  WITH { metric: 'cosine', type: 'hnsw_sq' }
 
+-- HNSW-Flat (no quantization, exact graph search)
 CREATE VECTOR INDEX idx_embed ON Document (embedding)
-  WITH { metric: 'l2', type: 'ivf_pq', num_partitions: 256 }
+  WITH { metric: 'cosine', type: 'hnsw_flat' }
+
+-- HNSW-SQ with IVF partitions for very large datasets
+CREATE VECTOR INDEX idx_embed ON Document (embedding)
+  WITH { metric: 'cosine', type: 'hnsw_sq', partitions: 32 }
+
+-- IVF-RQ (RaBitQ, 1-bit per dimension by default)
+CREATE VECTOR INDEX idx_embed ON Document (embedding)
+  WITH { metric: 'cosine', type: 'ivf_rq', partitions: 256 }
+
+-- IVF-PQ for memory-constrained large datasets
+CREATE VECTOR INDEX idx_embed ON Document (embedding)
+  WITH { metric: 'l2', type: 'ivf_pq', partitions: 256, sub_vectors: 16 }
 ```
 
 **Distance Metrics:**
@@ -382,7 +411,7 @@ Limit to 2-3 labels per vertex to avoid excessive storage duplication.
 | **Schemaless everything** | Overflow JSONB loses columnar benefits | Define schema for frequently-queried properties |
 | **Over-indexing** | Index maintenance cost on every write | Only index properties used in queries |
 | **Wrong distance metric** | Cosine on unnormalized vectors = poor results | Check embedding model docs |
-| **Vector index without enough data** | HNSW/IVF-PQ need minimum data | Use Flat for < 1000 rows |
+| **Vector index without enough data** | HNSW/IVF need minimum data | Use Flat for < 10k rows |
 | **Relationships as properties** | Loses graph traversal power | Use edges: `(a)-[:KNOWS]->(b)` not `a.friend_ids` |
 | **Labels for states** | Unstable label categories | Use a property: `status: 'draft'` not `:DraftPaper` |
 | **Frequently-queried overflow** | Slow JSONB parsing on every row | Promote to schema property |

@@ -441,18 +441,50 @@ impl EmbeddingCfg {
 
 #[non_exhaustive]
 pub enum VectorAlgo {
-    Hnsw { m: u32, ef_construction: u32 },
-    IvfPq { partitions: u32, sub_vectors: u32 },
     Flat,
+    IvfFlat {
+        partitions: u32,
+    },
+    IvfPq {
+        partitions: u32,
+        sub_vectors: u32,
+    },
+    IvfSq {
+        partitions: u32,
+    },
+    IvfRq {
+        partitions: u32,
+        num_bits: Option<u8>,
+    },
+    Hnsw {
+        m: u32,
+        ef_construction: u32,
+        partitions: Option<u32>,
+    },
+    HnswFlat {
+        m: u32,
+        ef_construction: u32,
+        partitions: Option<u32>,
+    },
+    HnswSq {
+        m: u32,
+        ef_construction: u32,
+        partitions: Option<u32>,
+    },
+    HnswPq {
+        m: u32,
+        ef_construction: u32,
+        sub_vectors: u32,
+        partitions: Option<u32>,
+    },
 }
 
 impl VectorAlgo {
     fn into_internal(self) -> VectorIndexType {
         match self {
-            VectorAlgo::Hnsw { m, ef_construction } => VectorIndexType::Hnsw {
-                m,
-                ef_construction,
-                ef_search: 50,
+            VectorAlgo::Flat => VectorIndexType::Flat,
+            VectorAlgo::IvfFlat { partitions } => VectorIndexType::IvfFlat {
+                num_partitions: partitions,
             },
             VectorAlgo::IvfPq {
                 partitions,
@@ -462,7 +494,50 @@ impl VectorAlgo {
                 num_sub_vectors: sub_vectors,
                 bits_per_subvector: 8,
             },
-            VectorAlgo::Flat => VectorIndexType::Flat,
+            VectorAlgo::IvfSq { partitions } => VectorIndexType::IvfSq {
+                num_partitions: partitions,
+            },
+            VectorAlgo::IvfRq {
+                partitions,
+                num_bits,
+            } => VectorIndexType::IvfRq {
+                num_partitions: partitions,
+                num_bits,
+            },
+            VectorAlgo::HnswFlat {
+                m,
+                ef_construction,
+                partitions,
+            } => VectorIndexType::HnswFlat {
+                m,
+                ef_construction,
+                num_partitions: partitions,
+            },
+            VectorAlgo::Hnsw {
+                m,
+                ef_construction,
+                partitions,
+            }
+            | VectorAlgo::HnswSq {
+                m,
+                ef_construction,
+                partitions,
+            } => VectorIndexType::HnswSq {
+                m,
+                ef_construction,
+                num_partitions: partitions,
+            },
+            VectorAlgo::HnswPq {
+                m,
+                ef_construction,
+                sub_vectors,
+                partitions,
+            } => VectorIndexType::HnswPq {
+                m,
+                ef_construction,
+                num_sub_vectors: sub_vectors,
+                num_partitions: partitions,
+            },
         }
     }
 }
@@ -489,6 +564,7 @@ pub enum ScalarType {
     BTree,
     Hash,
     Bitmap,
+    LabelList,
 }
 
 impl ScalarType {
@@ -497,6 +573,7 @@ impl ScalarType {
             ScalarType::BTree => ScalarIndexType::BTree,
             ScalarType::Hash => ScalarIndexType::Hash,
             ScalarType::Bitmap => ScalarIndexType::Bitmap,
+            ScalarType::LabelList => ScalarIndexType::LabelList,
         }
     }
 }

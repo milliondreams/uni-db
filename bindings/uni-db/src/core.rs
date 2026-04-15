@@ -528,6 +528,7 @@ pub fn parse_data_type(data_type: &str) -> Result<DataType, String> {
             "time" => Ok(DataType::Time),
             "duration" => Ok(DataType::Duration),
             "json" => Ok(DataType::CypherValue),
+            "btic" => Ok(DataType::Btic),
             "bytes" => Ok(DataType::String),
             _ => Err(format!("Unknown data type: {}", data_type)),
         }
@@ -557,14 +558,30 @@ pub fn create_index_definition(
             where_clause: None,
             metadata: Default::default(),
         })),
+        "bitmap" => Ok(IndexDefinition::Scalar(ScalarIndexConfig {
+            name: format!("idx_{}_{}", label, property),
+            label: label.to_string(),
+            properties: vec![property.to_string()],
+            index_type: ScalarIndexType::Bitmap,
+            where_clause: None,
+            metadata: Default::default(),
+        })),
+        "label_list" | "labellist" => Ok(IndexDefinition::Scalar(ScalarIndexConfig {
+            name: format!("idx_{}_{}", label, property),
+            label: label.to_string(),
+            properties: vec![property.to_string()],
+            index_type: ScalarIndexType::LabelList,
+            where_clause: None,
+            metadata: Default::default(),
+        })),
         "vector" => Ok(IndexDefinition::Vector(VectorIndexConfig {
             name: format!("idx_{}_{}_vec", label, property),
             label: label.to_string(),
             property: property.to_string(),
-            index_type: VectorIndexType::Hnsw {
+            index_type: VectorIndexType::HnswSq {
                 m: 16,
                 ef_construction: 200,
-                ef_search: 50,
+                num_partitions: None,
             },
             metric: DistanceMetric::Cosine,
             embedding_config: None,
@@ -610,6 +627,8 @@ pub fn create_index_definition_from_config(
     match idx_type.to_lowercase().as_str() {
         "btree" | "scalar" => create_index_definition(label, property, "btree"),
         "hash" => create_index_definition(label, property, "hash"),
+        "bitmap" => create_index_definition(label, property, "bitmap"),
+        "label_list" | "labellist" => create_index_definition(label, property, "label_list"),
         "inverted" => create_index_definition(label, property, "inverted"),
 
         "vector" => {
@@ -629,12 +648,27 @@ pub fn create_index_definition_from_config(
                 _ => DistanceMetric::Cosine,
             };
 
+            let partitions = || {
+                config
+                    .get("partitions")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(256) as u32
+            };
+            let m = || config.get("m").and_then(|v| v.as_u64()).unwrap_or(16) as u32;
+            let ef_construction = || {
+                config
+                    .get("ef_construction")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(200) as u32
+            };
+
             let index_type = match algorithm.to_lowercase().as_str() {
+                "flat" => VectorIndexType::Flat,
+                "ivf_flat" | "ivfflat" => VectorIndexType::IvfFlat {
+                    num_partitions: partitions(),
+                },
                 "ivf_pq" | "ivfpq" => VectorIndexType::IvfPq {
-                    num_partitions: config
-                        .get("partitions")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(256) as u32,
+                    num_partitions: partitions(),
                     num_sub_vectors: config
                         .get("sub_vectors")
                         .and_then(|v| v.as_u64())
@@ -644,17 +678,43 @@ pub fn create_index_definition_from_config(
                         .and_then(|v| v.as_u64())
                         .unwrap_or(8) as u8,
                 },
-                "flat" => VectorIndexType::Flat,
-                _ => VectorIndexType::Hnsw {
-                    m: config.get("m").and_then(|v| v.as_u64()).unwrap_or(16) as u32,
-                    ef_construction: config
-                        .get("ef_construction")
+                "ivf_sq" | "ivfsq" => VectorIndexType::IvfSq {
+                    num_partitions: partitions(),
+                },
+                "ivf_rq" | "ivfrq" => VectorIndexType::IvfRq {
+                    num_partitions: partitions(),
+                    num_bits: config
+                        .get("num_bits")
                         .and_then(|v| v.as_u64())
-                        .unwrap_or(200) as u32,
-                    ef_search: config
-                        .get("ef_search")
+                        .map(|v| v as u8),
+                },
+                "hnsw_flat" | "hnswflat" => VectorIndexType::HnswFlat {
+                    m: m(),
+                    ef_construction: ef_construction(),
+                    num_partitions: config
+                        .get("partitions")
                         .and_then(|v| v.as_u64())
-                        .unwrap_or(50) as u32,
+                        .map(|v| v as u32),
+                },
+                "hnsw_pq" | "hnswpq" => VectorIndexType::HnswPq {
+                    m: m(),
+                    ef_construction: ef_construction(),
+                    num_sub_vectors: config
+                        .get("sub_vectors")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(16) as u32,
+                    num_partitions: config
+                        .get("partitions")
+                        .and_then(|v| v.as_u64())
+                        .map(|v| v as u32),
+                },
+                _ => VectorIndexType::HnswSq {
+                    m: m(),
+                    ef_construction: ef_construction(),
+                    num_partitions: config
+                        .get("partitions")
+                        .and_then(|v| v.as_u64())
+                        .map(|v| v as u32),
                 },
             };
 

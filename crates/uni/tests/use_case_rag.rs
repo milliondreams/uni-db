@@ -39,7 +39,7 @@ async fn test_rag_use_case() -> anyhow::Result<()> {
           "name": "chunk_embeddings",
           "label": "Chunk",
           "property": "embedding",
-          "index_type": { "Hnsw": { "m": 32, "ef_construction": 200, "ef_search": 100 } },
+          "index_type": { "HnswSq": { "m": 32, "ef_construction": 200 } },
           "metric": "Cosine",
           "embedding_config": null
         }

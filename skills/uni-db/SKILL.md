@@ -15,7 +15,7 @@ description: >-
 
 ## What is uni-db?
 
-uni-db is an **embedded, serverless multi-model graph database** (graph + vector + document + columnar) that runs inside your process with no server required. It supports **OpenCypher** queries with extensions for vector search, full-text search, DDL, and time travel. **Locy** is its Datalog-inspired logic programming language for recursive rules, probabilistic reasoning, and abductive inference. APIs are available in **Python** (sync/async via PyO3) and **Rust** (async/blocking), with a **Pydantic OGM** layer. Built-in capabilities include HNSW/IVF-PQ vector indexes, BM25 full-text search, hybrid search with RRF fusion, and 36+ graph algorithms.
+uni-db is an **embedded, serverless multi-model graph database** (graph + vector + document + columnar) that runs inside your process with no server required. It supports **OpenCypher** queries with extensions for vector search, full-text search, DDL, and time travel. **Locy** is its Datalog-inspired logic programming language for recursive rules, probabilistic reasoning, and abductive inference. APIs are available in **Python** (sync/async via PyO3) and **Rust** (async/blocking), with a **Pydantic OGM** layer. Built-in capabilities include 8 vector index algorithms (Flat, IVF-Flat/SQ/PQ/RQ, HNSW-Flat/SQ/PQ) with scalar, product, and RaBitQ quantization, 4 scalar index types (BTree, Hash, Bitmap, LabelList), BM25 full-text search, hybrid search with RRF fusion, and 36+ graph algorithms.
 
 ---
 
@@ -164,6 +164,7 @@ async fn main() -> uni_db::Result<()> {
 | Date | `DataType.DATE()` | `DataType::Date` | `DATE` |
 | DateTime | `DataType.DATETIME()` | `DataType::DateTime` | `DATETIME` |
 | Duration | `DataType.DURATION()` | `DataType::Duration` | `DURATION` |
+| Btic | `DataType.BTIC()` | `DataType::Btic` | `BTIC` |
 | Vector(N) | `DataType.vector(N)` | `DataType::Vector { dimensions: N }` | `VECTOR(N)` |
 | List(T) | `DataType.list(inner)` | `DataType::List(Box<T>)` | `LIST(T)` |
 | Map(K,V) | `DataType.map(k, v)` | `DataType::Map(Box<K>, Box<V>)` | `MAP(K, V)` |
@@ -436,6 +437,8 @@ When the SKILL.md overview is insufficient for the user's task, load the appropr
 | Vector search, FTS, hybrid search, similar_to, embeddings | `references/vector-hybrid-search.md` |
 | Locy rules, recursive logic, ALONG/FOLD/DERIVE/ASSUME/ABDUCE | `references/locy.md` |
 | Schema design, data types, indexes, identity (ext_id/VID) | `references/schema-indexing.md` |
+| BTIC temporal intervals, Allen algebra, certainty/granularity | `references/btic.md` |
+| Xervo ML runtime, providers, model catalog, auto-embedding | `references/xervo.md` |
 | Graph algorithms (PageRank, WCC, shortest path, etc.) | `references/graph-algorithms.md` |
 
 Load **multiple references** when a task spans domains. Examples:
@@ -443,3 +446,5 @@ Load **multiple references** when a task spans domains. Examples:
 - Locy with vector similarity: `references/locy.md` + `references/vector-hybrid-search.md`
 - Schema + bulk loading: `references/schema-indexing.md` + `references/python-api.md`
 - Rust graph algorithms: `references/graph-algorithms.md` + `references/rust-api.md`
+- BTIC temporal queries in Python: `references/btic.md` + `references/python-api.md`
+- RAG with Xervo embeddings: `references/xervo.md` + `references/vector-hybrid-search.md`

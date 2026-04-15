@@ -103,18 +103,25 @@ A Rust graph library providing in-memory graph structures and algorithms. Uni us
 
 ## H
 
-### Hash Index (planned)
-A scalar index type for O(1) equality lookups on high-cardinality columns. Uni currently builds BTree scalar indexes only.
+### Hash Index
+A scalar index type for O(1) equality lookups on high-cardinality columns.
 
 ### HNSW (Hierarchical Navigable Small World)
-A graph-based algorithm for approximate nearest neighbor search. Provides high recall and fast queries at the cost of memory. See [Indexing](../concepts/indexing.md).
+A graph-based algorithm for approximate nearest neighbor search. Uni supports three HNSW variants: **HNSW-Flat** (no quantization), **HNSW-SQ** (scalar quantization, default), and **HNSW-PQ** (product quantization). All support optional IVF partitioning for very large datasets. See [Indexing](../concepts/indexing.md).
 
 ---
 
 ## I
 
-### IVF_PQ (Inverted File with Product Quantization)
-A vector index that partitions vectors into clusters and compresses them. Lower memory than HNSW but typically lower recall.
+### IVF (Inverted File)
+A partition-based vector index family. Uni supports **IVF-Flat** (no compression), **IVF-SQ** (scalar quantization), **IVF-PQ** (product quantization), and **IVF-RQ** (RaBitQ quantization).
+
+---
+
+## L
+
+### LabelList Index
+A scalar index type for `List<T>` columns that enables efficient `array_contains_any` and `array_contains_all` queries. Created via `"LABEL_LIST"` in the procedure API.
 
 ---
 

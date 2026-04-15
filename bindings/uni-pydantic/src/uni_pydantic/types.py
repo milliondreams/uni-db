@@ -22,6 +22,13 @@ from pydantic_core import CoreSchema, core_schema
 
 from .exceptions import TypeMappingError
 
+# Import the Rust BTIC binding (optional — allows pydantic layer to work
+# for type annotations even when the Rust extension is not installed).
+try:
+    from uni_db import Btic as _PyBtic
+except ImportError:
+    _PyBtic = None
+
 # Type variable for vector dimensions
 N = TypeVar("N", bound=int)
 
@@ -139,6 +146,127 @@ def get_vector_dimensions(type_hint: Any) -> int | None:
     return None
 
 
+class Btic:
+    """A BTIC temporal interval value for Uni graph database.
+
+    Construct from an ISO 8601-inspired string literal::
+
+        Btic("1985")
+        Btic("1985-03/2024-06")
+        Btic("~1985")           # approximate certainty
+        Btic("2020-03/")        # ongoing (unbounded hi)
+
+    Use as a Pydantic model field type::
+
+        class Event(UniNode):
+            when: Btic
+    """
+
+    def __init__(self, value: str | object) -> None:
+        if _PyBtic is None:
+            raise ImportError("uni_db is required for Btic type")
+        if isinstance(value, str):
+            self._inner = _PyBtic(value)
+        elif _PyBtic is not None and isinstance(value, _PyBtic):
+            self._inner = value
+        elif isinstance(value, Btic):
+            self._inner = value._inner
+        else:
+            raise TypeError(f"Expected str or Btic, got {type(value)}")
+
+    @property
+    def lo(self) -> int:
+        """Lower bound in milliseconds since epoch."""
+        return self._inner.lo
+
+    @property
+    def hi(self) -> int:
+        """Upper bound in milliseconds since epoch."""
+        return self._inner.hi
+
+    @property
+    def meta(self) -> int:
+        """Raw 64-bit metadata word."""
+        return self._inner.meta
+
+    @property
+    def lo_granularity(self) -> str:
+        """Lower bound granularity name."""
+        return self._inner.lo_granularity
+
+    @property
+    def hi_granularity(self) -> str:
+        """Upper bound granularity name."""
+        return self._inner.hi_granularity
+
+    @property
+    def lo_certainty(self) -> str:
+        """Lower bound certainty name."""
+        return self._inner.lo_certainty
+
+    @property
+    def hi_certainty(self) -> str:
+        """Upper bound certainty name."""
+        return self._inner.hi_certainty
+
+    @property
+    def duration_ms(self) -> int | None:
+        """Duration in milliseconds, or None if unbounded."""
+        return self._inner.duration_ms
+
+    @property
+    def is_instant(self) -> bool:
+        """True if the interval is exactly 1 millisecond wide."""
+        return self._inner.is_instant
+
+    @property
+    def is_unbounded(self) -> bool:
+        """True if either bound is infinite."""
+        return self._inner.is_unbounded
+
+    @property
+    def is_finite(self) -> bool:
+        """True if both bounds are finite."""
+        return self._inner.is_finite
+
+    def __repr__(self) -> str:
+        return f'Btic("{self._inner}")'
+
+    def __str__(self) -> str:
+        return str(self._inner)
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, Btic):
+            return self._inner == other._inner
+        return False
+
+    def __hash__(self) -> int:
+        return hash(self._inner)
+
+    @classmethod
+    def __get_pydantic_core_schema__(
+        cls, source_type: Any, handler: GetCoreSchemaHandler
+    ) -> CoreSchema:
+        """Make Btic compatible with Pydantic v2."""
+
+        def validate_btic(v: Any) -> Btic:
+            if isinstance(v, Btic):
+                return v
+            if isinstance(v, str):
+                return Btic(v)
+            if _PyBtic is not None and isinstance(v, _PyBtic):
+                return Btic(v)
+            raise TypeError(f"Expected str or Btic, got {type(v)}")
+
+        return core_schema.no_info_plain_validator_function(
+            validate_btic,
+            serialization=core_schema.plain_serializer_function_ser_schema(
+                lambda v: str(v._inner) if isinstance(v, Btic) else str(v),
+                info_arg=False,
+            ),
+        )
+
+
 def is_optional(type_hint: Any) -> tuple[bool, Any]:
     """
     Check if a type hint is Optional (T | None).
@@ -194,7 +322,7 @@ def unwrap_annotated(type_hint: Any) -> tuple[Any, tuple[Any, ...]]:
 
 
 # Datetime types that need special round-trip handling
-DATETIME_TYPES: set[type] = {datetime, date, time, timedelta}
+DATETIME_TYPES: set[type] = {datetime, date, time, timedelta, Btic}
 
 
 def python_to_db_value(value: Any, type_hint: Any) -> Any:
@@ -210,6 +338,10 @@ def python_to_db_value(value: Any, type_hint: Any) -> Any:
     # Vector → list[float]
     if isinstance(value, Vector):
         return value.values
+
+    # Btic → unwrap to the Rust PyBtic for py_object_to_value
+    if isinstance(value, Btic):
+        return value._inner
 
     # datetime/date/time/timedelta pass through — the Rust py_object_to_value
     # handles conversion to Value::Temporal with proper type information.
@@ -243,6 +375,10 @@ def db_to_python_value(value: Any, type_hint: Any) -> Any:
     if type_hint is timedelta and isinstance(value, timedelta):
         return value
 
+    # Btic — wrap Rust PyBtic in the pydantic Btic wrapper
+    if type_hint is Btic and _PyBtic is not None and isinstance(value, _PyBtic):
+        return Btic(value)
+
     # Handle struct dict from Arrow deserialization (e.g. datetime struct)
     if type_hint is datetime and isinstance(value, dict):
         nanos = value.get("nanos_since_epoch")
@@ -271,6 +407,7 @@ TYPE_MAP: dict[type, str] = {
     timedelta: "duration",
     bytes: "string",  # uni-db maps bytes→String
     dict: "json",
+    Btic: "btic",
 }
 
 
@@ -354,6 +491,7 @@ def uni_to_python_type(uni_type: str) -> type:
         "time": time,
         "duration": timedelta,
         "json": dict,
+        "btic": Btic,
     }
 
     # Handle vector types

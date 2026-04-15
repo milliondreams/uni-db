@@ -475,3 +475,53 @@ impl InvertedIndex {
         &self.property
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_estimated_postings_memory_empty() {
+        let postings: HashMap<String, Vec<u64>> = HashMap::new();
+        assert_eq!(estimated_postings_memory(&postings), 0);
+    }
+
+    #[test]
+    fn test_estimated_postings_memory_nonempty() {
+        let mut postings = HashMap::new();
+        postings.insert("hello".to_string(), vec![1, 2, 3]);
+        let mem = estimated_postings_memory(&postings);
+        // "hello" = 5 bytes + size_of::<Vec<u64>>() + 3 * 8 bytes
+        let expected = 5 + std::mem::size_of::<Vec<u64>>() + 3 * 8;
+        assert_eq!(mem, expected);
+    }
+
+    #[test]
+    fn test_merge_postings_segments_empty() {
+        let segments: Vec<HashMap<String, Vec<u64>>> = vec![];
+        let merged = merge_postings_segments(segments);
+        assert!(merged.is_empty());
+    }
+
+    #[test]
+    fn test_merge_postings_segments_overlapping() {
+        let seg1: HashMap<String, Vec<u64>> =
+            [("a".to_string(), vec![1, 2]), ("b".to_string(), vec![3])]
+                .into_iter()
+                .collect();
+        let seg2: HashMap<String, Vec<u64>> =
+            [("a".to_string(), vec![4, 5]), ("c".to_string(), vec![6])]
+                .into_iter()
+                .collect();
+        let merged = merge_postings_segments(vec![seg1, seg2]);
+
+        assert_eq!(merged.get("a").unwrap().len(), 4); // [1,2,4,5]
+        assert_eq!(merged.get("b").unwrap(), &vec![3]);
+        assert_eq!(merged.get("c").unwrap(), &vec![6]);
+    }
+
+    #[test]
+    fn test_default_max_postings_memory() {
+        assert_eq!(DEFAULT_MAX_POSTINGS_MEMORY, 256 * 1024 * 1024);
+    }
+}

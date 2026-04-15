@@ -61,8 +61,9 @@ db.schema()
         .property("text", DataType::String)
         .vector("embedding", 384)
         .index("embedding", IndexType::Vector(VectorIndexCfg {
-            algorithm: VectorAlgo::Hnsw { m: 32, ef_construction: 200 },
+            algorithm: VectorAlgo::HnswSq { m: 32, ef_construction: 200, partitions: None },
             metric: VectorMetric::Cosine,
+            embedding: None,
         }))
         .done()
     .label("Entity")

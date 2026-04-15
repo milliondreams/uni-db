@@ -141,7 +141,7 @@ keyword_reserved = {
     AND | OR | XOR | NOT |
     IN | CONTAINS | STARTS | ENDS | IS |
     NULL | TRUE | FALSE |
-    CASE | WHEN | THEN | ELSE | END |
+    CASE | WHEN | THEN | ELSE |
     IF | FROM | TO | ON |
     DROP_KW | ALTER | SHOW |
     OVER | PARTITION | EXPLAIN |
@@ -157,7 +157,7 @@ keyword_nonreserved = {
     VECTOR | FULLTEXT | JSON | OPTIONS | FOR | NODE | RELATIONSHIP |
     TRANSACTION | VACUUM | CHECKPOINT |
     DATABASE | CONFIG | STATISTICS | BACKUP | COPY |
-    VERSION | TIMESTAMP_KW | OF
+    VERSION | TIMESTAMP_KW | OF | END
 }
 
 // All keywords (for backward compatibility in some rules)

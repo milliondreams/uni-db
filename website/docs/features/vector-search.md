@@ -1,6 +1,6 @@
 # Vector Search
 
-Uni provides native vector search over embedding properties with ANN indexes (HNSW, IVF_PQ, Flat). Use it for semantic search, RAG, and similarity-based retrieval.
+Uni provides native vector search over embedding properties with 8 ANN index algorithms (Flat, IVF-Flat/SQ/PQ/RQ, HNSW-Flat/SQ/PQ) featuring scalar, product, and RaBitQ quantization. Use it for semantic search, RAG, and similarity-based retrieval.
 
 ## What It Provides
 
@@ -24,7 +24,7 @@ Uni provides native vector search over embedding properties with ANN indexes (HN
             .property("title", DataType::String)
             .property("embedding", DataType::Vector { dimensions: 384 })
             .index("embedding", IndexType::Vector(VectorIndexCfg {
-                algorithm: VectorAlgo::Hnsw { m: 16, ef_construction: 200 },
+                algorithm: VectorAlgo::HnswSq { m: 16, ef_construction: 200, partitions: None },
                 metric: VectorMetric::Cosine,
                 embedding: None,  // Or configure auto-embed
             }))

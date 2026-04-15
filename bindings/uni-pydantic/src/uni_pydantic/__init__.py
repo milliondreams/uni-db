@@ -31,7 +31,7 @@ Example:
     >>> adults = session.query(Person).filter(Person.age >= 18).all()
 """
 
-__version__ = "1.0.2"
+__version__ = "1.1.0"
 
 # Base classes
 # Async support
@@ -113,6 +113,7 @@ from .session import UniSession, UniTransaction
 # Type utilities
 from .types import (
     DATETIME_TYPES,
+    Btic,
     Vector,
     db_to_python_value,
     get_vector_dimensions,
@@ -147,6 +148,7 @@ __all__ = [
     "Direction",
     "VectorMetric",
     # Types
+    "Btic",
     "Vector",
     "python_type_to_uni",
     "uni_to_python_type",

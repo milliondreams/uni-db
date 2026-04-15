@@ -761,3 +761,127 @@ fn btic_gap_null_propagation() {
 fn btic_gap_is_recognized_as_scalar() {
     assert!(is_scalar_function("btic_gap"));
 }
+
+// =======================================================================
+// Per-bound certainty accessors
+// =======================================================================
+
+#[test]
+fn btic_lo_certainty_definite() {
+    let val = btic_year_1985();
+    let result = eval_scalar_function("btic_lo_certainty", &[val], None).unwrap();
+    assert_eq!(result, Value::String("definite".to_string()));
+}
+
+#[test]
+fn btic_lo_certainty_approximate() {
+    let val = btic_500_bce_approx();
+    let result = eval_scalar_function("btic_lo_certainty", &[val], None).unwrap();
+    assert_eq!(result, Value::String("approximate".to_string()));
+}
+
+#[test]
+fn btic_hi_certainty_definite() {
+    let val = btic_year_1985();
+    let result = eval_scalar_function("btic_hi_certainty", &[val], None).unwrap();
+    assert_eq!(result, Value::String("definite".to_string()));
+}
+
+#[test]
+fn btic_hi_certainty_approximate() {
+    let val = btic_500_bce_approx();
+    let result = eval_scalar_function("btic_hi_certainty", &[val], None).unwrap();
+    assert_eq!(result, Value::String("approximate".to_string()));
+}
+
+#[test]
+fn btic_mixed_certainty_lo_vs_hi() {
+    // Approximate lo, Definite hi — verify per-bound accessors return different values
+    let meta = uni_btic::Btic::build_meta(
+        uni_btic::Granularity::Year,
+        uni_btic::Granularity::Month,
+        uni_btic::Certainty::Approximate,
+        uni_btic::Certainty::Definite,
+    );
+    let val = Value::Temporal(TemporalValue::Btic {
+        lo: 473_385_600_000,   // 1985-01-01
+        hi: 1_719_792_000_000, // 2024-07-01
+        meta,
+    });
+
+    let lo_c = eval_scalar_function("btic_lo_certainty", &[val.clone()], None).unwrap();
+    let hi_c = eval_scalar_function("btic_hi_certainty", &[val.clone()], None).unwrap();
+    let combined = eval_scalar_function("btic_certainty", &[val], None).unwrap();
+
+    assert_eq!(lo_c, Value::String("approximate".to_string()));
+    assert_eq!(hi_c, Value::String("definite".to_string()));
+    // btic_certainty returns least_certain = approximate
+    assert_eq!(combined, Value::String("approximate".to_string()));
+}
+
+#[test]
+fn btic_certainty_functions_null_propagation() {
+    let null = Value::Null;
+
+    assert_eq!(
+        eval_scalar_function("btic_certainty", &[null.clone()], None).unwrap(),
+        Value::Null
+    );
+    assert_eq!(
+        eval_scalar_function("btic_lo_certainty", &[null.clone()], None).unwrap(),
+        Value::Null
+    );
+    assert_eq!(
+        eval_scalar_function("btic_hi_certainty", &[null], None).unwrap(),
+        Value::Null
+    );
+}
+
+// =======================================================================
+// BTIC comparison operators
+// =======================================================================
+
+#[test]
+fn btic_comparison_ordering() {
+    use uni_cypher::ast::BinaryOp;
+    use uni_query::query::expr_eval::eval_binary_op;
+
+    let earlier = btic_year_1985(); // [1985, 1986)
+    let later = year_2020(); // [2020, 2021)
+
+    // earlier < later
+    assert_eq!(
+        eval_binary_op(&earlier, &BinaryOp::Lt, &later).unwrap(),
+        Value::Bool(true)
+    );
+    // later > earlier
+    assert_eq!(
+        eval_binary_op(&later, &BinaryOp::Gt, &earlier).unwrap(),
+        Value::Bool(true)
+    );
+    // earlier < earlier (equal → false)
+    assert_eq!(
+        eval_binary_op(&earlier, &BinaryOp::Lt, &earlier).unwrap(),
+        Value::Bool(false)
+    );
+    // earlier <= earlier (equal → true)
+    assert_eq!(
+        eval_binary_op(&earlier, &BinaryOp::LtEq, &earlier).unwrap(),
+        Value::Bool(true)
+    );
+    // earlier >= later (false)
+    assert_eq!(
+        eval_binary_op(&earlier, &BinaryOp::GtEq, &later).unwrap(),
+        Value::Bool(false)
+    );
+    // earlier <> later (not equal → true)
+    assert_eq!(
+        eval_binary_op(&earlier, &BinaryOp::NotEq, &later).unwrap(),
+        Value::Bool(true)
+    );
+    // earlier <> earlier (equal → false)
+    assert_eq!(
+        eval_binary_op(&earlier, &BinaryOp::NotEq, &earlier).unwrap(),
+        Value::Bool(false)
+    );
+}

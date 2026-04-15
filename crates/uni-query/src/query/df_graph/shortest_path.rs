@@ -713,4 +713,40 @@ mod tests {
         assert_eq!(output_schema.field(3).name(), "p._path");
         assert_eq!(output_schema.field(4).name(), "p._length");
     }
+
+    #[test]
+    fn test_shortest_path_schema_with_extra_input_fields() {
+        let input_schema = Arc::new(Schema::new(vec![
+            Field::new("_source_vid", DataType::UInt64, false),
+            Field::new("_target_vid", DataType::UInt64, false),
+            Field::new("extra_col", DataType::Utf8, true),
+        ]));
+
+        let output_schema = GraphShortestPathExec::build_schema(input_schema, "route");
+        // Extra input fields should be preserved in output
+        assert!(
+            output_schema.field_with_name("extra_col").is_ok(),
+            "Extra input columns should pass through"
+        );
+        assert!(
+            output_schema.field_with_name("route").is_ok(),
+            "Path variable should be in output"
+        );
+        assert!(
+            output_schema.field_with_name("route._length").is_ok(),
+            "Path length should be in output"
+        );
+    }
+
+    #[test]
+    fn test_shortest_path_schema_empty_path_var() {
+        let input_schema = Arc::new(Schema::new(vec![
+            Field::new("_source_vid", DataType::UInt64, false),
+            Field::new("_target_vid", DataType::UInt64, false),
+        ]));
+
+        // Empty string path variable name should still work
+        let output_schema = GraphShortestPathExec::build_schema(input_schema, "");
+        assert!(output_schema.fields().len() >= 4);
+    }
 }

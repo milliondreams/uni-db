@@ -1,60 +1,81 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Dragonscale Team
+//
+// Tests for vertex deletion and persistence.
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use tempfile::tempdir;
-use uni_db::Value;
-use uni_db::core::schema::{DataType, SchemaManager};
-use uni_db::runtime::property_manager::PropertyManager;
-use uni_db::runtime::writer::Writer;
-use uni_db::storage::manager::StorageManager;
+use anyhow::Result;
+use uni_db::{DataType, Uni};
 
 #[tokio::test]
-async fn test_delete_vertex_persistence() -> anyhow::Result<()> {
-    let temp_dir = tempdir()?;
-    let path = temp_dir.path();
-
-    let schema_manager = SchemaManager::load(&path.join("schema.json")).await?;
-    let _person_lbl = schema_manager.add_label("Person")?;
-    schema_manager.add_property("Person", "name", DataType::String, false)?;
-    schema_manager.save().await?;
-    let schema_manager = Arc::new(schema_manager);
-    let storage = Arc::new(
-        StorageManager::new(
-            path.join("storage").to_str().unwrap(),
-            schema_manager.clone(),
-        )
-        .await?,
-    );
-
-    let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 0)
-        .await
-        .unwrap();
-
-    // 2. Insert Vertex
-    let vid = writer.next_vid().await?;
-    let mut props = HashMap::new();
-    props.insert("name".to_string(), Value::String("Alice".to_string()));
-    writer
-        .insert_vertex_with_labels(vid, props, &["Person".to_string()], None)
+async fn test_delete_vertex_persistence() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("Person")
+        .property("name", DataType::String)
+        .apply()
         .await?;
-    writer.flush_to_l1(None).await?;
 
-    // 2. Delete vertex
-    writer.delete_vertex(vid, None, None).await?;
-    writer.flush_to_l1(None).await?;
+    // Insert a vertex
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE (:Person {name: 'Alice'})").await?;
+    tx.commit().await?;
 
-    // 3. Verify vertex is deleted via PropertyManager
-    // If vertex is deleted, getting its property should return null
-    let prop_mgr = PropertyManager::new(storage.clone(), schema_manager.clone(), 100);
-    let result = prop_mgr.get_vertex_prop(vid, "name").await?;
+    // Verify it exists
+    let result = db
+        .session()
+        .query("MATCH (n:Person) RETURN count(n) AS cnt")
+        .await?;
+    assert_eq!(result.rows()[0].get::<i64>("cnt")?, 1);
 
-    assert!(
-        result.is_null(),
-        "Deleted vertex property should return null, got: {:?}",
-        result
+    // Delete the vertex
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("MATCH (n:Person {name: 'Alice'}) DELETE n")
+        .await?;
+    tx.commit().await?;
+
+    // Verify deletion persists
+    let result = db
+        .session()
+        .query("MATCH (n:Person) RETURN count(n) AS cnt")
+        .await?;
+    assert_eq!(
+        result.rows()[0].get::<i64>("cnt")?,
+        0,
+        "Deleted vertex should not appear in MATCH"
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_delete_vertex_properties_not_accessible() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("Person")
+        .property("name", DataType::String)
+        .apply()
+        .await?;
+
+    // Create and then delete
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE (:Person {name: 'Alice'})").await?;
+    tx.commit().await?;
+
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("MATCH (n:Person {name: 'Alice'}) DELETE n")
+        .await?;
+    tx.commit().await?;
+
+    // Query for the deleted vertex's property — should return 0 rows
+    let result = db
+        .session()
+        .query("MATCH (n:Person) WHERE n.name = 'Alice' RETURN n.name")
+        .await?;
+    assert_eq!(result.len(), 0, "Deleted vertex should not be queryable");
 
     Ok(())
 }

@@ -594,6 +594,7 @@ pub enum ScalarType {
     BTree,
     Hash,
     Bitmap,
+    LabelList,
 }
 
 pub struct VectorIndexCfg {
@@ -603,9 +604,15 @@ pub struct VectorIndexCfg {
 }
 
 pub enum VectorAlgo {
-    Hnsw { m: u32, ef_construction: u32 },
-    IvfPq { partitions: u32, sub_vectors: u32 },
     Flat,
+    IvfFlat { partitions: u32 },
+    IvfPq { partitions: u32, sub_vectors: u32 },
+    IvfSq { partitions: u32 },
+    IvfRq { partitions: u32, num_bits: Option<u8> },
+    Hnsw { m: u32, ef_construction: u32, partitions: Option<u32> },      // alias for HnswSq
+    HnswFlat { m: u32, ef_construction: u32, partitions: Option<u32> },
+    HnswSq { m: u32, ef_construction: u32, partitions: Option<u32> },
+    HnswPq { m: u32, ef_construction: u32, sub_vectors: u32, partitions: Option<u32> },
 }
 
 pub enum VectorMetric {

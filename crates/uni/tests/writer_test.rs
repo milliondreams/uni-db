@@ -1,95 +1,67 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Dragonscale Team
+//
+// Tests for data persistence through the write pipeline (create → flush → query).
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use tempfile::tempdir;
-use uni_db::core::id::{Eid, Vid};
-use uni_db::core::schema::{DataType, SchemaManager};
-use uni_db::runtime::writer::Writer;
-use uni_db::storage::manager::StorageManager;
-use uni_db::unival;
+use anyhow::Result;
+use uni_db::{DataType, Uni};
 
 #[tokio::test]
-async fn test_writer_flush() -> anyhow::Result<()> {
-    let temp_dir = tempdir()?;
-    let path = temp_dir.path();
-    let schema_path = path.join("schema.json");
-    let storage_path = path.join("storage");
-    let storage_str = storage_path.to_str().unwrap();
-
-    // 1. Setup Schema
-    let schema_manager = SchemaManager::load(&schema_path).await?;
-    schema_manager.add_label("Person")?;
-    schema_manager.add_edge_type("knows", vec!["Person".into()], vec!["Person".into()])?;
-    schema_manager.save().await?;
-    let schema_manager = Arc::new(schema_manager);
-
-    let storage = Arc::new(StorageManager::new(storage_str, schema_manager.clone()).await?);
-
-    // 2. Initialize Writer
-    let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 0)
-        .await
-        .unwrap();
-
-    // 3. Insert Edge
-    let vid_a = Vid::new(1);
-    let vid_b = Vid::new(2);
-    let eid = Eid::new(100);
-    writer
-        .insert_edge(vid_a, vid_b, 1, eid, HashMap::new(), None, None)
+async fn test_writer_flush() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("Person")
+        .property("name", DataType::String)
+        .done()
+        .edge_type("knows", &["Person"], &["Person"])
+        .apply()
         .await?;
 
-    // 4. Flush to L1
-    writer.flush_to_l1(None).await?;
+    // Create an edge via transaction
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE (a:Person {name: 'Alice'})-[:knows]->(b:Person {name: 'Bob'})")
+        .await?;
+    tx.commit().await?;
 
-    // 5. Verify L1 Delta Dataset via backend
-    let delta_ds = storage.delta_dataset("knows", "fwd")?;
-    let table_name = delta_ds.table_name();
-    let count = storage.backend().count_rows(&table_name, None).await?;
+    // Flush to ensure data is persisted to storage
+    db.flush().await?;
 
-    assert_eq!(count, 1);
+    // Verify edge is queryable
+    let result = db
+        .session()
+        .query("MATCH ()-[r:knows]->() RETURN count(r) AS cnt")
+        .await?;
+    assert_eq!(result.rows()[0].get::<i64>("cnt")?, 1);
 
     Ok(())
 }
 
 #[tokio::test]
-async fn test_writer_vertex_flush() -> anyhow::Result<()> {
-    let temp_dir = tempdir()?;
-    let path = temp_dir.path();
-    let schema_path = path.join("schema.json");
-    let storage_path = path.join("storage");
-    let storage_str = storage_path.to_str().unwrap();
-
-    // 1. Setup Schema
-    let schema_manager = SchemaManager::load(&schema_path).await?;
-    schema_manager.add_label("Person")?;
-    schema_manager.add_property("Person", "name", DataType::String, false)?;
-    schema_manager.save().await?;
-    let schema_manager = Arc::new(schema_manager);
-
-    let storage = Arc::new(StorageManager::new(storage_str, schema_manager.clone()).await?);
-
-    // 2. Initialize Writer
-    let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 0)
-        .await
-        .unwrap();
-
-    // 3. Insert Vertex
-    let vid = Vid::new(10);
-    let mut props = HashMap::new();
-    props.insert("name".to_string(), unival!("Alice"));
-    writer
-        .insert_vertex_with_labels(vid, props, &["Person".to_string()], None)
+async fn test_writer_vertex_flush() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("Person")
+        .property("name", DataType::String)
+        .apply()
         .await?;
 
-    // 4. Flush to L1
-    writer.flush_to_l1(None).await?;
+    // Create vertex via transaction
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE (:Person {name: 'Alice'})").await?;
+    tx.commit().await?;
 
-    // 5. Verify Vertex Dataset via backend
-    let table_name = uni_db::store::backend::table_names::vertex_table_name("Person");
-    let count = storage.backend().count_rows(&table_name, None).await?;
-    assert_eq!(count, 1);
+    // Flush to storage
+    db.flush().await?;
+
+    // Verify vertex is queryable with correct property
+    let result = db
+        .session()
+        .query("MATCH (n:Person) RETURN n.name AS name")
+        .await?;
+    assert_eq!(result.len(), 1);
+    assert_eq!(result.rows()[0].get::<String>("name")?, "Alice");
 
     Ok(())
 }

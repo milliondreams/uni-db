@@ -32,9 +32,10 @@ use uni_cypher::ast::{
 };
 use uni_store::storage::manager::StorageManager;
 
-/// Check if a data type represents CypherValue (LargeBinary).
+/// Check if a data type represents CypherValue (LargeBinary) or BTIC (FixedSizeBinary(24)).
+/// Both need to route through Cypher UDFs for comparison operators.
 fn is_cypher_value_type(dt: Option<&DataType>) -> bool {
-    dt.is_some_and(|t| *t == DataType::LargeBinary)
+    dt.is_some_and(|t| matches!(t, DataType::LargeBinary | DataType::FixedSizeBinary(24)))
 }
 
 /// Resolve the element type for a list expression.

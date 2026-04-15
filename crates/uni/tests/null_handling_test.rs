@@ -1,151 +1,69 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Dragonscale Team
+//
+// Tests for NULL handling functions (COALESCE, nullIf).
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use tempfile::tempdir;
-use tokio::sync::RwLock;
-use uni_db::UniConfig;
-use uni_db::core::id::Vid;
-use uni_db::core::schema::{DataType, SchemaManager};
-use uni_db::query::executor::Executor;
-use uni_db::{Value, unival};
-
-use uni_db::query::planner::QueryPlanner;
-use uni_db::runtime::property_manager::PropertyManager;
-use uni_db::runtime::writer::Writer;
-use uni_db::storage::manager::StorageManager;
+use anyhow::Result;
+use uni_db::{DataType, Uni, Value};
 
 #[tokio::test]
-async fn test_null_handling_functions() -> anyhow::Result<()> {
-    let _ = env_logger::builder().is_test(true).try_init();
-    let temp_dir = tempdir()?;
-    let path = temp_dir.path();
-
-    // 1. Setup Schema
-    let schema_manager = SchemaManager::load(&path.join("schema.json")).await?;
-    let _person_lbl = schema_manager.add_label("Person")?;
-
-    // Add properties, including nullable ones
-    schema_manager.add_property("Person", "name", DataType::String, false)?;
-    schema_manager.add_property("Person", "age", DataType::Int64, true)?; // Nullable
-    schema_manager.add_property("Person", "nickname", DataType::String, true)?; // Nullable
-
-    schema_manager.save().await?;
-    let schema_manager = Arc::new(schema_manager);
-
-    let storage = Arc::new(
-        StorageManager::new(
-            path.join("storage").to_str().unwrap(),
-            schema_manager.clone(),
-        )
-        .await?,
-    );
-
-    let writer = Arc::new(RwLock::new(
-        Writer::new_with_config(
-            storage.clone(),
-            schema_manager.clone(),
-            0,
-            UniConfig::default(),
-            None,
-            None,
-        )
-        .await
-        .unwrap(),
-    ));
-
-    // 2. Insert Data
-    {
-        let mut w = writer.write().await;
-
-        // Person 1: Alice, age 30, no nickname
-        let vid1 = Vid::new(1);
-        let mut props1 = HashMap::new();
-        props1.insert("name".to_string(), unival!("Alice"));
-        props1.insert("age".to_string(), unival!(30));
-        w.insert_vertex_with_labels(vid1, props1, &["Person".to_string()], None)
-            .await?;
-
-        // Person 2: Bob, no age, nickname 'Bobby'
-        let vid2 = Vid::new(2);
-        let mut props2 = HashMap::new();
-        props2.insert("name".to_string(), unival!("Bob"));
-        props2.insert("nickname".to_string(), unival!("Bobby"));
-        w.insert_vertex_with_labels(vid2, props2, &["Person".to_string()], None)
-            .await?;
-
-        // Person 3: Charlie, no age, no nickname
-        let vid3 = Vid::new(3);
-        let mut props3 = HashMap::new();
-        props3.insert("name".to_string(), unival!("Charlie"));
-        w.insert_vertex_with_labels(vid3, props3, &["Person".to_string()], None)
-            .await?;
-
-        w.flush_to_l1(None).await?;
-    }
-
-    // 3. Test COALESCE
-    // MATCH (n:Person) RETURN n.name, coalesce(n.nickname, n.age, 'Unknown') ORDER BY n.name
-    let cypher_coalesce =
-        "MATCH (n:Person) RETURN n.name, coalesce(n.nickname, n.age, 'Unknown') ORDER BY n.name";
-
-    let query_ast = uni_cypher::parse(cypher_coalesce)?;
-
-    let planner = QueryPlanner::new(schema_manager.schema());
-    let plan = planner.plan(query_ast)?;
-
-    let executor = Executor::new_with_writer(storage.clone(), writer.clone());
-    let prop_manager = PropertyManager::new(storage.clone(), schema_manager.clone(), 100);
-
-    let results = executor
-        .execute(plan, &prop_manager, &HashMap::new())
+async fn test_null_handling_functions() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("Person")
+        .property("name", DataType::String)
+        .property_nullable("age", DataType::Int64)
+        .property_nullable("nickname", DataType::String)
+        .apply()
         .await?;
 
-    let coalesce_key = "coalesce(n.nickname, n.age, 'Unknown')";
+    // Insert data with varying null patterns
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE (:Person {name: 'Alice', age: 30})")
+        .await?; // no nickname
+    tx.execute("CREATE (:Person {name: 'Bob', nickname: 'Bobby'})")
+        .await?; // no age
+    tx.execute("CREATE (:Person {name: 'Charlie'})").await?; // no age, no nickname
+    tx.commit().await?;
 
-    // Expected results sorted by name: Alice, Bob, Charlie
-    // Alice: nickname=null, age=30 -> 30 (may be string "30" in vectorized engine due to mixed type promotion)
-    assert_eq!(results[0].get("n.name"), Some(&unival!("Alice")));
-    let alice_coalesce = results[0].get(coalesce_key).unwrap();
+    // Test COALESCE: returns first non-null argument
+    let results = db
+        .session()
+        .query("MATCH (n:Person) RETURN n.name, coalesce(n.nickname, n.age, 'Unknown') AS val ORDER BY n.name")
+        .await?;
+
+    // Alice: nickname=null, age=30 → 30
+    assert_eq!(results.rows()[0].get::<String>("n.name")?, "Alice");
+    let alice_val = results.rows()[0].value("val").unwrap();
     assert!(
-        alice_coalesce == &unival!(30) || alice_coalesce == &Value::String("30".to_string()),
-        "Alice coalesce mismatch: {:?}",
-        alice_coalesce
+        alice_val == &Value::Int(30) || alice_val == &Value::String("30".to_string()),
+        "Alice coalesce should be 30, got: {:?}",
+        alice_val
     );
 
-    // Bob: nickname='Bobby', age=null -> 'Bobby'
-    assert_eq!(results[1].get("n.name"), Some(&unival!("Bob")));
-    assert_eq!(results[1].get(coalesce_key), Some(&unival!("Bobby")));
+    // Bob: nickname='Bobby', age=null → 'Bobby'
+    assert_eq!(results.rows()[1].get::<String>("n.name")?, "Bob");
+    assert_eq!(results.rows()[1].get::<String>("val")?, "Bobby");
 
-    // Charlie: nickname=null, age=null -> 'Unknown'
-    assert_eq!(results[2].get("n.name"), Some(&unival!("Charlie")));
-    assert_eq!(results[2].get(coalesce_key), Some(&unival!("Unknown")));
+    // Charlie: nickname=null, age=null → 'Unknown'
+    assert_eq!(results.rows()[2].get::<String>("n.name")?, "Charlie");
+    assert_eq!(results.rows()[2].get::<String>("val")?, "Unknown");
 
-    // 4. Test nullIf
-    // MATCH (n:Person) RETURN n.name, nullIf(n.name, 'Bob') ORDER BY n.name
-    let cypher_nullif = "MATCH (n:Person) RETURN n.name, nullIf(n.name, 'Bob') ORDER BY n.name";
-
-    let query_ast = uni_cypher::parse(cypher_nullif)?;
-    let plan = planner.plan(query_ast)?;
-
-    let results = executor
-        .execute(plan, &prop_manager, &HashMap::new())
+    // Test nullIf: returns null when value equals second argument
+    let results = db
+        .session()
+        .query("MATCH (n:Person) RETURN n.name, nullIf(n.name, 'Bob') AS val ORDER BY n.name")
         .await?;
 
-    let nullif_key = "nullIf(n.name, 'Bob')";
+    // Alice: 'Alice' != 'Bob' → 'Alice'
+    assert_eq!(results.rows()[0].get::<String>("val")?, "Alice");
 
-    // Alice: 'Alice' != 'Bob' -> 'Alice'
-    assert_eq!(results[0].get("n.name"), Some(&unival!("Alice")));
-    assert_eq!(results[0].get(nullif_key), Some(&unival!("Alice")));
+    // Bob: 'Bob' == 'Bob' → null
+    assert_eq!(results.rows()[1].value("val"), Some(&Value::Null));
 
-    // Bob: 'Bob' == 'Bob' -> null
-    assert_eq!(results[1].get("n.name"), Some(&unival!("Bob")));
-    assert_eq!(results[1].get(nullif_key), Some(&Value::Null));
-
-    // Charlie: 'Charlie' != 'Bob' -> 'Charlie'
-    assert_eq!(results[2].get("n.name"), Some(&unival!("Charlie")));
-    assert_eq!(results[2].get(nullif_key), Some(&unival!("Charlie")));
+    // Charlie: 'Charlie' != 'Bob' → 'Charlie'
+    assert_eq!(results.rows()[2].get::<String>("val")?, "Charlie");
 
     Ok(())
 }

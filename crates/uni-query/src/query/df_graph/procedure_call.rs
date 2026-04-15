@@ -79,6 +79,9 @@ pub struct GraphProcedureCallExec {
     /// Query parameters for expression evaluation.
     params: HashMap<String, Value>,
 
+    /// Outer values from correlated context (e.g. MATCH variables).
+    outer_values: HashMap<String, Value>,
+
     /// Target properties per variable (for node-like yields).
     target_properties: HashMap<String, Vec<String>>,
 
@@ -109,6 +112,7 @@ impl GraphProcedureCallExec {
         arguments: Vec<Expr>,
         yield_items: Vec<(String, Option<String>)>,
         params: HashMap<String, Value>,
+        outer_values: HashMap<String, Value>,
         target_properties: HashMap<String, Vec<String>>,
     ) -> Self {
         let schema = Self::build_schema(
@@ -125,6 +129,7 @@ impl GraphProcedureCallExec {
             arguments,
             yield_items,
             params,
+            outer_values,
             target_properties,
             schema,
             properties,
@@ -410,10 +415,10 @@ impl ExecutionPlan for GraphProcedureCallExec {
     ) -> DFResult<SendableRecordBatchStream> {
         let metrics = BaselineMetrics::new(&self.metrics, partition);
 
-        // Evaluate arguments upfront
+        // Evaluate arguments upfront (outer_values provides MATCH-bound variables)
         let mut evaluated_args = Vec::with_capacity(self.arguments.len());
         for arg in &self.arguments {
-            evaluated_args.push(evaluate_simple_expr(arg, &self.params)?);
+            evaluated_args.push(evaluate_simple_expr(arg, &self.params, &self.outer_values)?);
         }
 
         Ok(Box::pin(ProcedureCallStream::new(

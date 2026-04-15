@@ -9,6 +9,7 @@ from typing import Annotated
 import pytest
 
 from uni_pydantic import (
+    Btic,
     Vector,
     db_to_python_value,
     get_vector_dimensions,
@@ -93,6 +94,77 @@ class TestVector:
         doc = Doc(title="test", embedding=vec)
         assert isinstance(doc.embedding, Vector)
         assert doc.embedding.values == [1.0, 2.0, 3.0]
+
+
+class TestBtic:
+    """Tests for Btic type."""
+
+    def test_btic_from_string(self):
+        """Test creating Btic from string literal."""
+        b = Btic("1985")
+        assert b.lo_granularity == "year"
+        assert b.is_finite
+
+    def test_btic_formats(self):
+        """Test various BTIC literal formats."""
+        assert Btic("1985-03").lo_granularity == "month"
+        assert Btic("1985-03-15").lo_granularity == "day"
+        assert Btic("1985-03/2024-06").is_finite
+        assert Btic("~1985").lo_certainty == "approximate"
+        assert Btic("/").is_unbounded
+
+    def test_btic_invalid(self):
+        """Test invalid BTIC literal."""
+        with pytest.raises((ValueError, TypeError)):
+            Btic("not-a-date")
+
+    def test_btic_equality(self):
+        """Test Btic equality."""
+        a = Btic("1985")
+        b = Btic("1985")
+        c = Btic("1986")
+        assert a == b
+        assert a != c
+
+    def test_btic_hash(self):
+        """Test Btic hashability."""
+        s = {Btic("1985"), Btic("1985")}
+        assert len(s) == 1
+
+    def test_btic_properties(self):
+        """Test Btic property accessors."""
+        b = Btic("1985")
+        assert isinstance(b.lo, int)
+        assert isinstance(b.hi, int)
+        assert b.duration_ms is not None
+        assert b.duration_ms > 0
+
+    def test_btic_isinstance(self):
+        """Test that Pydantic schema returns Btic instances."""
+        from uni_pydantic import UniNode
+
+        class Event(UniNode):
+            __label__ = "Event"
+            name: str
+            when: Btic
+
+        event = Event(name="test", when="1985")
+        assert isinstance(event.when, Btic)
+        assert event.when.lo_granularity == "year"
+
+    def test_btic_from_btic_instance(self):
+        """Test constructing model with Btic instance."""
+        from uni_pydantic import UniNode
+
+        class Event(UniNode):
+            __label__ = "Event"
+            name: str
+            when: Btic
+
+        b = Btic("1985")
+        event = Event(name="test", when=b)
+        assert isinstance(event.when, Btic)
+        assert event.when == b
 
 
 class TestGetVectorDimensions:
@@ -193,6 +265,14 @@ class TestPythonTypeToUni:
         assert python_type_to_uni(time) == ("time", False)
         assert python_type_to_uni(timedelta) == ("duration", False)
 
+    def test_btic_type(self):
+        """Test BTIC type mapping."""
+        assert python_type_to_uni(Btic) == ("btic", False)
+
+    def test_btic_optional(self):
+        """Test optional BTIC type mapping."""
+        assert python_type_to_uni(Btic | None) == ("btic", True)
+
     def test_optional_types(self):
         """Test optional type mapping."""
         assert python_type_to_uni(str | None) == ("string", True)
@@ -236,6 +316,10 @@ class TestUniToPythonType:
     def test_vector_type(self):
         """Test vector type reverse mapping."""
         assert uni_to_python_type("vector:128") is list
+
+    def test_btic_type(self):
+        """Test BTIC type reverse mapping."""
+        assert uni_to_python_type("btic") is Btic
 
     def test_list_type(self):
         """Test list type reverse mapping."""
@@ -298,8 +382,27 @@ class TestPythonToDbValue:
         assert python_to_db_value("hello", str) == "hello"
         assert db_to_python_value("hello", str) == "hello"
 
+    def test_btic_passthrough(self):
+        """Test Btic unwraps to inner PyBtic for Rust layer."""
+        b = Btic("1985")
+        result = python_to_db_value(b, Btic)
+        # Should be the unwrapped Rust PyBtic, not the pydantic wrapper
+        assert result is b._inner
+
     def test_db_to_python_vector(self):
         """Test list[float] → Vector for vector type hints."""
         result = db_to_python_value([1.0, 2.0, 3.0], Vector[3])
         assert isinstance(result, Vector)
         assert result.values == [1.0, 2.0, 3.0]
+
+    def test_db_to_python_btic(self):
+        """Test PyBtic → Btic wrapping for btic type hints."""
+        try:
+            from uni_db import Btic as PyBtic
+
+            py_btic = PyBtic("1985")
+            result = db_to_python_value(py_btic, Btic)
+            assert isinstance(result, Btic)
+            assert result.lo_granularity == "year"
+        except ImportError:
+            pytest.skip("uni_db not available")

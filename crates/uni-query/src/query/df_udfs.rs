@@ -111,6 +111,7 @@ pub fn register_cypher_udfs(ctx: &SessionContext) -> DFResult<()> {
         "localdatetime",
         "datetime",
         "duration",
+        "btic",
         // Dotted functions
         "duration.between",
         "duration.inmonths",
@@ -1695,7 +1696,8 @@ impl ScalarUDFImpl for TemporalUdf {
             | "localtime.realtime"
             | "localdatetime.transaction"
             | "localdatetime.statement"
-            | "localdatetime.realtime" => Ok(DataType::LargeBinary),
+            | "localdatetime.realtime"
+            | "btic" => Ok(DataType::LargeBinary),
             _ => Ok(DataType::Utf8),
         }
     }
@@ -2249,6 +2251,20 @@ pub(crate) fn scalar_to_value(scalar: &ScalarValue) -> DFResult<Value> {
         }
         ScalarValue::Float32(Some(f)) => Ok(Value::Float(*f as f64)),
 
+        // FixedSizeBinary(24) — BTIC temporal interval
+        ScalarValue::FixedSizeBinary(24, Some(bytes)) => {
+            match uni_btic::encode::decode_slice(bytes) {
+                Ok(btic) => Ok(Value::Temporal(uni_common::TemporalValue::Btic {
+                    lo: btic.lo(),
+                    hi: btic.hi(),
+                    meta: btic.meta(),
+                })),
+                Err(e) => Err(datafusion::error::DataFusionError::Execution(format!(
+                    "BTIC decode error: {e}"
+                ))),
+            }
+        }
+
         // All None variants for the above types
         ScalarValue::Null
         | ScalarValue::Utf8(None)
@@ -2277,7 +2293,8 @@ pub(crate) fn scalar_to_value(scalar: &ScalarValue) -> DFResult<Value> {
         | ScalarValue::DurationMillisecond(None)
         | ScalarValue::DurationSecond(None)
         | ScalarValue::DurationNanosecond(None)
-        | ScalarValue::IntervalMonthDayNano(None) => Ok(Value::Null),
+        | ScalarValue::IntervalMonthDayNano(None)
+        | ScalarValue::FixedSizeBinary(_, None) => Ok(Value::Null),
         other => Err(datafusion::error::DataFusionError::Execution(format!(
             "scalar_to_value(): unsupported scalar type {other:?}"
         ))),

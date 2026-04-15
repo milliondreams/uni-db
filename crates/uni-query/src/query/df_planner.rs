@@ -1551,6 +1551,7 @@ impl HybridPhysicalPlanner {
             arguments.to_vec(),
             yield_items.to_vec(),
             self.params.clone(),
+            self.outer_values.clone(),
             target_properties,
         );
 
@@ -3287,6 +3288,30 @@ impl HybridPhysicalPlanner {
                     // empty list (not null) when all inputs are null.
                     let arg = get_arg()?;
                     crate::query::df_udfs::create_cypher_collect_expr(arg, *distinct)
+                }
+                "btic_min" => {
+                    let arg = get_arg()?;
+                    let udaf = Arc::new(crate::query::df_udfs::create_btic_min_udaf());
+                    udaf.call(vec![arg])
+                }
+                "btic_max" => {
+                    let arg = get_arg()?;
+                    let udaf = Arc::new(crate::query::df_udfs::create_btic_max_udaf());
+                    udaf.call(vec![arg])
+                }
+                "btic_span_agg" => {
+                    let arg = get_arg()?;
+                    let udaf = Arc::new(crate::query::df_udfs::create_btic_span_agg_udaf());
+                    udaf.call(vec![arg])
+                }
+                "btic_count_at" => {
+                    if args.len() != 2 {
+                        return Err(anyhow!("btic_count_at() requires exactly 2 arguments"));
+                    }
+                    let btic_arg = cypher_expr_to_df(&args[0], Some(ctx))?;
+                    let point_arg = cypher_expr_to_df(&args[1], Some(ctx))?;
+                    let udaf = Arc::new(crate::query::df_udfs::create_btic_count_at_udaf());
+                    udaf.call(vec![btic_arg, point_arg])
                 }
                 _ => return Err(anyhow!("Unsupported aggregate function: {}", name)),
             };

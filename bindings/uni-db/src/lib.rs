@@ -10,6 +10,7 @@
 //! and bulk loading.
 
 pub mod async_api;
+pub mod btic;
 pub mod builders;
 pub mod convert;
 pub mod core;
@@ -174,6 +175,9 @@ fn _uni_db(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<types::PyVid>()?;
     m.add_class::<types::PyEid>()?;
     m.add_class::<types::PyUniId>()?;
+
+    // BTIC temporal interval
+    m.add_class::<btic::PyBtic>()?;
 
     // Value and Row types
     m.add_class::<types::PyValue>()?;

@@ -30,11 +30,16 @@ Vector indexes enable fast approximate nearest neighbor (ANN) search on embeddin
 
 ### Supported Algorithms
 
-| Algorithm | Description | Trade-offs |
+| Algorithm | Quantization | Trade-offs |
 |-----------|-------------|------------|
-| **HNSW** | Hierarchical Navigable Small World | Best recall, higher memory |
-| **IVF_PQ** | Inverted File + Product Quantization | Lower memory, good recall |
-| **Flat** | Exact brute-force search | Perfect recall, O(n) speed |
+| **Flat** | None | Perfect recall, O(n) speed. Best for < 10k vectors. |
+| **IVF-Flat** | None | Partition-based, exact within partitions |
+| **IVF-SQ** | Scalar (int8) | Large datasets, good recall/memory tradeoff |
+| **IVF-PQ** | Product | Very large datasets, minimum memory |
+| **IVF-RQ** | RaBitQ (1-bit) | Better accuracy than PQ at similar compression |
+| **HNSW-Flat** | None | Graph search, no compression loss |
+| **HNSW-SQ** | Scalar (int8) | **Default.** Best recall-latency tradeoff |
+| **HNSW-PQ** | Product | Large datasets needing graph speed + compression |
 
 ### Distance Metrics
 
@@ -53,14 +58,29 @@ CREATE VECTOR INDEX paper_embeddings
 FOR (p:Paper)
 ON p.embedding
 OPTIONS {
-  type: "hnsw"
+  type: "hnsw_sq"
 }
 ```
-DDL uses cosine distance and default parameters. For metric choice or tuning, use the Rust schema builder.
 
-### HNSW Configuration (Rust-only)
+DDL supports all algorithm types via the `type` option: `flat`, `ivf_flat`, `ivf_sq`, `ivf_pq`, `ivf_rq`, `hnsw_flat`, `hnsw_sq` (or `hnsw`), `hnsw_pq`. Parameters like `m`, `ef_construction`, `partitions`, `sub_vectors`, and `num_bits` can also be passed in OPTIONS. Default is HNSW-SQ with cosine distance.
 
-HNSW parameters are configurable only via the Rust schema builder:
+### HNSW Configuration
+
+HNSW parameters are configurable via DDL or the Rust schema builder:
+
+```cypher
+-- HNSW-SQ with custom parameters
+CREATE VECTOR INDEX paper_embeddings FOR (p:Paper) ON p.embedding
+OPTIONS { type: 'hnsw_sq', m: '32', ef_construction: '200' }
+
+-- HNSW-Flat (no quantization, exact graph search)
+CREATE VECTOR INDEX paper_embeddings FOR (p:Paper) ON p.embedding
+OPTIONS { type: 'hnsw_flat', m: '16', ef_construction: '200' }
+
+-- HNSW-SQ with IVF partitions for very large datasets (>1M vectors)
+CREATE VECTOR INDEX paper_embeddings FOR (p:Paper) ON p.embedding
+OPTIONS { type: 'hnsw_sq', partitions: '32' }
+```
 
 ```rust
 use uni_db::{DataType, IndexType, VectorAlgo, VectorIndexCfg, VectorMetric};
@@ -69,37 +89,38 @@ db.schema()
     .label("Paper")
         .property("embedding", DataType::Vector { dimensions: 768 })
         .index("embedding", IndexType::Vector(VectorIndexCfg {
-            algorithm: VectorAlgo::Hnsw { m: 32, ef_construction: 200 },
+            algorithm: VectorAlgo::HnswSq { m: 32, ef_construction: 200, partitions: None },
             metric: VectorMetric::Cosine,
+            embedding: None,
         }))
     .apply()
     .await?;
 ```
 
-`ef_search` is not configurable yet (uses an internal default).
-
-### IVF_PQ Configuration (Rust-only)
-
-DDL can select IVF_PQ, but uses default parameters:
+### IVF Configuration
 
 ```cypher
-CREATE VECTOR INDEX product_embeddings
-FOR (p:Product)
-ON p.embedding
-OPTIONS { type: "ivf_pq" }
+-- IVF-PQ with tuned parameters
+CREATE VECTOR INDEX product_embeddings FOR (p:Product) ON p.embedding
+OPTIONS { type: 'ivf_pq', partitions: '256', sub_vectors: '16' }
+
+-- IVF-RQ (RaBitQ — 1 bit per dimension, best accuracy/compression)
+CREATE VECTOR INDEX product_embeddings FOR (p:Product) ON p.embedding
+OPTIONS { type: 'ivf_rq', partitions: '256' }
+
+-- IVF-RQ with higher fidelity (4 bits per dimension)
+CREATE VECTOR INDEX product_embeddings FOR (p:Product) ON p.embedding
+OPTIONS { type: 'ivf_rq', partitions: '256', num_bits: '4' }
 ```
 
-For tuning, use Rust:
-
 ```rust
-use uni_db::{DataType, IndexType, VectorAlgo, VectorIndexCfg, VectorMetric};
-
 db.schema()
     .label("Product")
         .property("embedding", DataType::Vector { dimensions: 384 })
         .index("embedding", IndexType::Vector(VectorIndexCfg {
-            algorithm: VectorAlgo::IvfPq { partitions: 256, sub_vectors: 16 },
+            algorithm: VectorAlgo::IvfRq { partitions: 256, num_bits: None },
             metric: VectorMetric::Cosine,
+            embedding: None,
         }))
     .apply()
     .await?;
@@ -146,7 +167,8 @@ Scalar indexes optimize exact match and range queries on primitive properties.
 |------|------------|----------|
 | **BTree** | `=`, `<`, `>`, `<=`, `>=`, `BETWEEN` | General purpose, range queries |
 | **Hash** | `=`, `IN` | High-cardinality equality lookups |
-| **Bitmap** | `=`, `IN`, low-cardinality filters | Enum-like columns, boolean flags |
+| **Bitmap** | `=`, `IN`, low-cardinality filters | Enum-like columns (< 1000 distinct values), boolean flags |
+| **LabelList** | `array_contains_any`, `array_contains_all` | List columns with tag/category filtering |
 
 ### Creating Scalar Indexes
 
@@ -156,7 +178,14 @@ Scalar indexes optimize exact match and range queries on primitive properties.
 CREATE INDEX author_email FOR (a:Author) ON (a.email)
 ```
 
-The storage layer supports BTree, Hash, and Bitmap scalar indexes. BTree is the default when no type is specified.
+**Via procedure API (Bitmap and LabelList):**
+
+```cypher
+CALL uni.schema.createIndex('Event', 'status', {"type": "BITMAP"})
+CALL uni.schema.createIndex('Doc', 'tags', {"type": "LABEL_LIST"})
+```
+
+The storage layer supports BTree, Hash, Bitmap, and LabelList scalar indexes. BTree is the default when no type is specified.
 
 ### Composite Indexes
 

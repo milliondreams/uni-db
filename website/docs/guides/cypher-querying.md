@@ -883,6 +883,25 @@ WHERE m.valid_to IS NULL
 RETURN m
 ```
 
+### BTIC Temporal Intervals
+
+For fuzzy historical dates, variable-precision intervals, or Allen's interval algebra, use **BTIC** — a single-column temporal interval type with per-bound granularity and certainty metadata.
+
+```cypher
+// Create an event with a year-precision interval
+CREATE (e:Event {name: 'WW2', period: btic('1939/1945')})
+
+// Query: find events overlapping with the 1940s
+MATCH (e:Event) WHERE btic_overlaps(e.period, btic('1940')) RETURN e.name
+
+// Comparison operators work on BTIC
+MATCH (e:Event) WHERE e.period < btic('1950') RETURN e.name
+```
+
+BTIC includes 30+ functions: accessors (`btic_lo`, `btic_hi`, `btic_duration`), 12 Allen algebra predicates (`btic_overlaps`, `btic_before`, `btic_meets`, ...), set operations (`btic_intersection`, `btic_span`, `btic_gap`), and aggregation (`btic_min`, `btic_max`, `btic_span_agg`).
+
+**See the full guide: [Temporal Intervals (BTIC)](temporal-intervals.md).**
+
 ---
 
 ## SET / REMOVE Clause

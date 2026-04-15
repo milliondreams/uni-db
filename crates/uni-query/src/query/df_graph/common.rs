@@ -901,7 +901,7 @@ pub async fn execute_subplan(
     storage: &Arc<StorageManager>,
     schema_info: &Arc<UniSchema>,
 ) -> DFResult<Vec<RecordBatch>> {
-    let planner = HybridPhysicalPlanner::with_l0_context(
+    let mut planner = HybridPhysicalPlanner::with_l0_context(
         session_ctx.clone(),
         storage.clone(),
         graph_ctx.l0_context().clone(),
@@ -910,6 +910,18 @@ pub async fn execute_subplan(
         params.clone(),
         outer_values.clone(),
     );
+
+    // Propagate registries from parent context so procedures remain available
+    // inside correlated subqueries (Apply operator).
+    if let Some(registry) = graph_ctx.algo_registry() {
+        planner = planner.with_algo_registry(registry.clone());
+    }
+    if let Some(registry) = graph_ctx.procedure_registry() {
+        planner = planner.with_procedure_registry(registry.clone());
+    }
+    if let Some(runtime) = graph_ctx.xervo_runtime() {
+        planner = planner.with_xervo_runtime(runtime.clone());
+    }
 
     let execution_plan = planner.plan(plan).map_err(|e| {
         datafusion::error::DataFusionError::Execution(format!("Sub-plan error: {e}"))
@@ -1119,11 +1131,13 @@ fn numeric_promotion(left: &DataType, right: &DataType) -> DataType {
 /// Supports:
 /// - Literal values
 /// - Parameter references ($param)
+/// - Variable references (node/edge variables from MATCH)
 /// - Literal lists
 /// - Literal maps ({key: value, ...})
 pub(crate) fn evaluate_simple_expr(
     expr: &Expr,
     params: &HashMap<String, Value>,
+    outer_values: &HashMap<String, Value>,
 ) -> DFResult<Value> {
     match expr {
         Expr::Literal(lit) => Ok(lit.to_value()),
@@ -1132,10 +1146,25 @@ pub(crate) fn evaluate_simple_expr(
             datafusion::error::DataFusionError::Execution(format!("Parameter '{}' not found", name))
         }),
 
+        Expr::Variable(name) => {
+            // Node variables are stored as "{name}._vid" in outer_values
+            let vid_key = format!("{}._vid", name);
+            if let Some(val) = outer_values.get(&vid_key) {
+                return Ok(val.clone());
+            }
+            // Fall back to plain name (edge variables, scalar columns)
+            outer_values.get(name).cloned().ok_or_else(|| {
+                datafusion::error::DataFusionError::Execution(format!(
+                    "Variable '{}' not found in scope (looked for '{}' and '{}')",
+                    name, vid_key, name
+                ))
+            })
+        }
+
         Expr::List(items) => {
             let values: Vec<Value> = items
                 .iter()
-                .map(|item| evaluate_simple_expr(item, params))
+                .map(|item| evaluate_simple_expr(item, params, outer_values))
                 .collect::<DFResult<_>>()?;
             Ok(Value::List(values))
         }
@@ -1143,7 +1172,9 @@ pub(crate) fn evaluate_simple_expr(
         Expr::Map(entries) => {
             let map: HashMap<String, Value> = entries
                 .iter()
-                .map(|(k, v)| evaluate_simple_expr(v, params).map(|val| (k.clone(), val)))
+                .map(|(k, v)| {
+                    evaluate_simple_expr(v, params, outer_values).map(|val| (k.clone(), val))
+                })
                 .collect::<DFResult<_>>()?;
             Ok(Value::Map(map))
         }

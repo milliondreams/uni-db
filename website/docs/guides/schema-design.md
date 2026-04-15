@@ -178,6 +178,7 @@ Use edge properties sparingly for relationship metadata:
 | `Float64` | Decimal values | price, score |
 | `Bool` | Flags | is_published, is_retracted |
 | `Timestamp` | Date/time | created_at, published_at |
+| `Btic` | Temporal intervals with granularity | valid_period, event_when |
 | `Vector` | Embeddings | embedding, image_vector |
 | `Json` | Semi-structured | metadata, config |
 

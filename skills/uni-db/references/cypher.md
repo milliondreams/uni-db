@@ -333,7 +333,7 @@ Non-aggregated columns in RETURN become implicit GROUP BY keys.
 
 ### Temporal Functions
 
-**Constructors:** `date()`, `time()`, `localtime()`, `datetime()`, `localdatetime()`, `duration()`
+**Constructors:** `date()`, `time()`, `localtime()`, `datetime()`, `localdatetime()`, `duration()`, `btic()`
 
 **Clock functions:** `datetime.transaction()`, `datetime.statement()`, `datetime.realtime()`
 
@@ -350,6 +350,32 @@ WHERE uni.temporal.validAt(e, 'valid_from', 'valid_to', datetime($time))  -- hal
 WHERE e VALID_AT datetime('2024-06-15T12:00:00Z')                          -- macro shorthand
 WHERE c VALID_AT(datetime($t), 'start_date', 'end_date')                   -- custom props
 ```
+
+### BTIC Temporal Intervals
+
+BTIC encodes half-open time intervals `[lo, hi)` as a single 24-byte property with per-bound granularity and certainty.
+
+**Literal formats:** `btic('1985')` (year), `btic('1985-03')` (month), `btic('1939/1945')` (range), `btic('~1985')` (approximate), `btic('2020-03/')` (ongoing), `btic('/')` (unbounded).
+
+**Accessors:** `btic_lo(b)`, `btic_hi(b)` (DateTime), `btic_duration(b)` (Int64 ms), `btic_granularity(b)`, `btic_certainty(b)` (String), `btic_is_finite(b)`, `btic_is_unbounded(b)`, `btic_is_instant(b)` (Boolean).
+
+**Predicates (2-arg → Boolean):** `btic_contains_point(b, point)`, `btic_overlaps(a, b)`, `btic_contains(a, b)`, `btic_before(a, b)`, `btic_after(a, b)`, `btic_meets(a, b)`, `btic_adjacent(a, b)`, `btic_disjoint(a, b)`, `btic_equals(a, b)`, `btic_starts(a, b)`, `btic_during(a, b)`, `btic_finishes(a, b)`.
+
+**Set operations:** `btic_intersection(a, b)`, `btic_span(a, b)`, `btic_gap(a, b)` — return Btic or NULL.
+
+**Aggregation:** `btic_min(col)`, `btic_max(col)`, `btic_span_agg(col)`, `btic_count_at(col, point)`.
+
+**Comparison operators:** `<`, `>`, `<=`, `>=`, `=`, `<>` work on BTIC values (lexicographic on `lo`, `hi`, `meta`).
+
+```cypher
+-- Store and query fuzzy historical dates
+CREATE (e:Event {name: 'WW2', period: btic('1939/1945')})
+MATCH (e:Event) WHERE btic_overlaps(e.period, btic('1940')) RETURN e.name
+MATCH (e:Event) WHERE e.period < btic('1950') RETURN e.name             -- comparison operators
+MATCH (e:Event) RETURN btic_span_agg(e.period) AS total                 -- aggregation
+```
+
+**When to use BTIC vs `uni.temporal.validAt`:** Use `validAt` for exact date ranges stored as two columns (`start_date`/`end_date`). Use BTIC for single-column fuzzy intervals with granularity metadata (historical dates, uncertain periods).
 
 ### Similarity Functions
 

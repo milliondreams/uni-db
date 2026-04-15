@@ -56,22 +56,12 @@ impl SessionHook for RecorderHook {
     }
 
     fn before_commit(&self, ctx: &CommitHookContext) -> uni_common::Result<()> {
-        self.before_commits
-            .lock()
-            .unwrap()
-            .push(ctx.tx_id.clone());
+        self.before_commits.lock().unwrap().push(ctx.tx_id.clone());
         Ok(())
     }
 
-    fn after_commit(
-        &self,
-        ctx: &CommitHookContext,
-        _result: &uni_db::CommitResult,
-    ) {
-        self.after_commits
-            .lock()
-            .unwrap()
-            .push(ctx.tx_id.clone());
+    fn after_commit(&self, ctx: &CommitHookContext, _result: &uni_db::CommitResult) {
+        self.after_commits.lock().unwrap().push(ctx.tx_id.clone());
     }
 }
 
@@ -176,8 +166,15 @@ async fn test_before_commit_hook_rejects() -> Result<()> {
     assert!(result.is_err(), "Rejecting commit hook should abort commit");
 
     // Data should NOT be visible
-    let check = db.session().query("MATCH (n:Person) RETURN count(n) AS cnt").await?;
-    assert_eq!(check.rows()[0].get::<i64>("cnt")?, 0, "Rejected commit should not persist data");
+    let check = db
+        .session()
+        .query("MATCH (n:Person) RETURN count(n) AS cnt")
+        .await?;
+    assert_eq!(
+        check.rows()[0].get::<i64>("cnt")?,
+        0,
+        "Rejected commit should not persist data"
+    );
 
     Ok(())
 }

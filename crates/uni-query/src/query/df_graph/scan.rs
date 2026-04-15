@@ -2565,7 +2565,11 @@ pub(crate) fn build_property_column_static(
                             Err(e) => {
                                 tracing::warn!(
                                     "BTIC coercion failed for property '{}': invalid value (lo={}, hi={}, meta={:#x}): {}",
-                                    prop_name, lo, hi, meta, e
+                                    prop_name,
+                                    lo,
+                                    hi,
+                                    meta,
+                                    e
                                 );
                                 builder.append_null()
                             }
@@ -2580,7 +2584,9 @@ pub(crate) fn build_property_column_static(
                         Err(e) => {
                             tracing::warn!(
                                 "BTIC coercion failed for property '{}': '{}' is not a valid BTIC literal: {}",
-                                prop_name, s, e
+                                prop_name,
+                                s,
+                                e
                             );
                             builder.append_null()
                         }

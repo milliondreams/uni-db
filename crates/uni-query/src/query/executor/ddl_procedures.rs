@@ -42,10 +42,15 @@ struct IndexConfig {
     property: Option<String>,
     #[serde(rename = "type")]
     index_type: String,
-    // Vector specific (accepted in JSON but not consumed at runtime)
+    // Vector specific
     #[expect(dead_code)]
     dimensions: Option<usize>,
     metric: Option<String>,
+    algorithm: Option<String>,
+    partitions: Option<u32>,
+    m: Option<u32>,
+    ef_construction: Option<u32>,
+    sub_vectors: Option<u32>,
     embedding: Option<EmbeddingOptions>,
     // Generic
     name: Option<String>,
@@ -271,15 +276,39 @@ async fn create_index_internal(
                 batch_size: emb.batch_size,
             });
 
+            let algorithm = config.algorithm.as_deref().unwrap_or("hnsw");
+            let index_type = match algorithm.to_lowercase().as_str() {
+                "flat" => VectorIndexType::Flat,
+                "ivf_flat" => VectorIndexType::IvfFlat {
+                    num_partitions: config.partitions.unwrap_or(256),
+                },
+                "ivf_pq" => VectorIndexType::IvfPq {
+                    num_partitions: config.partitions.unwrap_or(256),
+                    num_sub_vectors: config.sub_vectors.unwrap_or(16),
+                    bits_per_subvector: 8,
+                },
+                "ivf_sq" => VectorIndexType::IvfSq {
+                    num_partitions: config.partitions.unwrap_or(256),
+                },
+                "ivf_rq" => VectorIndexType::IvfRq {
+                    num_partitions: config.partitions.unwrap_or(256),
+                },
+                "hnsw_pq" => VectorIndexType::HnswPq {
+                    m: config.m.unwrap_or(16),
+                    ef_construction: config.ef_construction.unwrap_or(200),
+                    num_sub_vectors: config.sub_vectors.unwrap_or(16),
+                },
+                _ => VectorIndexType::HnswSq {
+                    m: config.m.unwrap_or(16),
+                    ef_construction: config.ef_construction.unwrap_or(200),
+                },
+            };
+
             IndexDefinition::Vector(VectorIndexConfig {
                 name: index_name,
                 label: label.to_string(),
                 property: prop_name.clone(),
-                index_type: VectorIndexType::Hnsw {
-                    m: 16,
-                    ef_construction: 200,
-                    ef_search: 50,
-                }, // Default params
+                index_type,
                 metric,
                 embedding_config,
                 metadata: Default::default(),

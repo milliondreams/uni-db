@@ -2,7 +2,7 @@
 // Copyright 2024-2026 Dragonscale Team
 
 use anyhow::Result;
-use uni_common::core::schema::{DataType, IndexDefinition};
+use uni_common::core::schema::{DataType, IndexDefinition, VectorIndexType};
 use uni_db::Uni;
 use uni_db::api::schema::{EmbeddingCfg, IndexType, VectorAlgo, VectorIndexCfg, VectorMetric};
 
@@ -342,6 +342,356 @@ async fn test_reopen_fails_fast_when_schema_has_alias_but_catalog_missing() -> R
         err.contains("Uni-Xervo catalog is required"),
         "Unexpected error: {err}"
     );
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// T1: Schema round-trip — verify each VectorAlgo persists correct VectorIndexType
+// ---------------------------------------------------------------------------
+
+async fn assert_schema_stores_index_type(algo: VectorAlgo, expected: VectorIndexType) {
+    let db = Uni::temporary().build().await.unwrap();
+    db.schema()
+        .label("V")
+        .property("emb", DataType::Vector { dimensions: 8 })
+        .index(
+            "emb",
+            IndexType::Vector(VectorIndexCfg {
+                algorithm: algo,
+                metric: VectorMetric::Cosine,
+                embedding: None,
+            }),
+        )
+        .apply()
+        .await
+        .unwrap();
+
+    let schema = db.schema().current();
+    let idx = schema
+        .indexes
+        .iter()
+        .find(|i| matches!(i, IndexDefinition::Vector(v) if v.label == "V"))
+        .expect("vector index not found");
+
+    if let IndexDefinition::Vector(cfg) = idx {
+        assert_eq!(cfg.index_type, expected, "index_type mismatch for label V");
+    } else {
+        panic!("Expected vector index");
+    }
+}
+
+#[tokio::test]
+async fn test_schema_round_trip_flat() {
+    assert_schema_stores_index_type(VectorAlgo::Flat, VectorIndexType::Flat).await;
+}
+
+#[tokio::test]
+async fn test_schema_round_trip_ivf_flat() {
+    assert_schema_stores_index_type(
+        VectorAlgo::IvfFlat { partitions: 4 },
+        VectorIndexType::IvfFlat { num_partitions: 4 },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_schema_round_trip_ivf_pq() {
+    assert_schema_stores_index_type(
+        VectorAlgo::IvfPq {
+            partitions: 8,
+            sub_vectors: 4,
+        },
+        VectorIndexType::IvfPq {
+            num_partitions: 8,
+            num_sub_vectors: 4,
+            bits_per_subvector: 8,
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_schema_round_trip_ivf_sq() {
+    assert_schema_stores_index_type(
+        VectorAlgo::IvfSq { partitions: 16 },
+        VectorIndexType::IvfSq { num_partitions: 16 },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_schema_round_trip_ivf_rq() {
+    assert_schema_stores_index_type(
+        VectorAlgo::IvfRq { partitions: 32 },
+        VectorIndexType::IvfRq { num_partitions: 32 },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_schema_round_trip_hnsw() {
+    assert_schema_stores_index_type(
+        VectorAlgo::Hnsw {
+            m: 12,
+            ef_construction: 100,
+        },
+        VectorIndexType::HnswSq {
+            m: 12,
+            ef_construction: 100,
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_schema_round_trip_hnsw_sq() {
+    assert_schema_stores_index_type(
+        VectorAlgo::HnswSq {
+            m: 8,
+            ef_construction: 64,
+        },
+        VectorIndexType::HnswSq {
+            m: 8,
+            ef_construction: 64,
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_schema_round_trip_hnsw_pq() {
+    assert_schema_stores_index_type(
+        VectorAlgo::HnswPq {
+            m: 16,
+            ef_construction: 200,
+            sub_vectors: 4,
+        },
+        VectorIndexType::HnswPq {
+            m: 16,
+            ef_construction: 200,
+            num_sub_vectors: 4,
+        },
+    )
+    .await;
+}
+
+// ---------------------------------------------------------------------------
+// T2: Integration — insert data, build index, query nearest neighbor
+// ---------------------------------------------------------------------------
+
+/// Insert 20 8-dim vectors, flush, and query for the nearest to [0.1; 8].
+/// The closest vector is id=0 at [0.0; 8].
+async fn assert_vector_query_works(algo: VectorAlgo) {
+    let db = Uni::temporary().build().await.unwrap();
+
+    db.schema()
+        .label("N")
+        .property("id", DataType::Int64)
+        .property("emb", DataType::Vector { dimensions: 8 })
+        .index(
+            "emb",
+            IndexType::Vector(VectorIndexCfg {
+                algorithm: algo,
+                metric: VectorMetric::L2,
+                embedding: None,
+            }),
+        )
+        .apply()
+        .await
+        .unwrap();
+
+    // Insert 20 vectors — id i has component values i as f32
+    let tx = db.session().tx().await.unwrap();
+    for i in 0..20i64 {
+        let v = format!("[{0}.0,{0}.0,{0}.0,{0}.0,{0}.0,{0}.0,{0}.0,{0}.0]", i);
+        tx.execute(&format!("CREATE (n:N {{id: {i}, emb: {v}}})"))
+            .await
+            .unwrap();
+    }
+    tx.commit().await.unwrap();
+    db.flush().await.unwrap();
+
+    let result = db
+        .session()
+        .query_with("MATCH (n:N) WHERE n.emb ~= $q RETURN n.id LIMIT 1")
+        .param("q", vec![0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1])
+        .fetch_all()
+        .await
+        .unwrap();
+
+    assert_eq!(result.rows()[0].get::<i64>("n.id").unwrap(), 0);
+}
+
+#[tokio::test]
+async fn test_vector_query_flat() {
+    assert_vector_query_works(VectorAlgo::Flat).await;
+}
+
+#[tokio::test]
+async fn test_vector_query_ivf_flat() {
+    assert_vector_query_works(VectorAlgo::IvfFlat { partitions: 2 }).await;
+}
+
+#[tokio::test]
+async fn test_vector_query_ivf_pq() {
+    assert_vector_query_works(VectorAlgo::IvfPq {
+        partitions: 2,
+        sub_vectors: 4,
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_vector_query_ivf_sq() {
+    assert_vector_query_works(VectorAlgo::IvfSq { partitions: 2 }).await;
+}
+
+#[tokio::test]
+async fn test_vector_query_ivf_rq() {
+    assert_vector_query_works(VectorAlgo::IvfRq { partitions: 2 }).await;
+}
+
+#[tokio::test]
+async fn test_vector_query_hnsw_sq() {
+    assert_vector_query_works(VectorAlgo::HnswSq {
+        m: 4,
+        ef_construction: 16,
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_vector_query_hnsw_pq() {
+    assert_vector_query_works(VectorAlgo::HnswPq {
+        m: 4,
+        ef_construction: 16,
+        sub_vectors: 4,
+    })
+    .await;
+}
+
+// ---------------------------------------------------------------------------
+// T3: DDL procedure — verify algorithm selection via Cypher procedure call
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_ddl_procedure_algorithm_ivf_sq() -> Result<()> {
+    let db = Uni::temporary().build().await?;
+
+    db.schema()
+        .label("Doc")
+        .property("emb", DataType::Vector { dimensions: 8 })
+        .apply()
+        .await?;
+
+    db.session()
+        .query(
+            r#"CALL uni.schema.createIndex('Doc', 'emb', {
+                "type": "VECTOR",
+                "algorithm": "ivf_sq",
+                "partitions": 4
+            })"#,
+        )
+        .await?;
+
+    let schema = db.schema().current();
+    let idx = schema
+        .indexes
+        .iter()
+        .find(|i| matches!(i, IndexDefinition::Vector(v) if v.label == "Doc"))
+        .expect("index not found");
+
+    if let IndexDefinition::Vector(cfg) = idx {
+        assert_eq!(cfg.index_type, VectorIndexType::IvfSq { num_partitions: 4 });
+    } else {
+        panic!("Expected vector index");
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_ddl_procedure_algorithm_hnsw_pq() -> Result<()> {
+    let db = Uni::temporary().build().await?;
+
+    db.schema()
+        .label("Doc")
+        .property("emb", DataType::Vector { dimensions: 8 })
+        .apply()
+        .await?;
+
+    db.session()
+        .query(
+            r#"CALL uni.schema.createIndex('Doc', 'emb', {
+                "type": "VECTOR",
+                "algorithm": "hnsw_pq",
+                "m": 8,
+                "ef_construction": 100,
+                "sub_vectors": 4
+            })"#,
+        )
+        .await?;
+
+    let schema = db.schema().current();
+    let idx = schema
+        .indexes
+        .iter()
+        .find(|i| matches!(i, IndexDefinition::Vector(v) if v.label == "Doc"))
+        .expect("index not found");
+
+    if let IndexDefinition::Vector(cfg) = idx {
+        assert_eq!(
+            cfg.index_type,
+            VectorIndexType::HnswPq {
+                m: 8,
+                ef_construction: 100,
+                num_sub_vectors: 4,
+            }
+        );
+    } else {
+        panic!("Expected vector index");
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_ddl_procedure_default_algorithm_is_hnsw_sq() -> Result<()> {
+    let db = Uni::temporary().build().await?;
+
+    db.schema()
+        .label("Doc")
+        .property("emb", DataType::Vector { dimensions: 8 })
+        .apply()
+        .await?;
+
+    db.session()
+        .query(
+            r#"CALL uni.schema.createIndex('Doc', 'emb', {
+                "type": "VECTOR"
+            })"#,
+        )
+        .await?;
+
+    let schema = db.schema().current();
+    let idx = schema
+        .indexes
+        .iter()
+        .find(|i| matches!(i, IndexDefinition::Vector(v) if v.label == "Doc"))
+        .expect("index not found");
+
+    if let IndexDefinition::Vector(cfg) = idx {
+        assert_eq!(
+            cfg.index_type,
+            VectorIndexType::HnswSq {
+                m: 16,
+                ef_construction: 200,
+            }
+        );
+    } else {
+        panic!("Expected vector index");
+    }
 
     Ok(())
 }

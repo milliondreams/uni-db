@@ -807,6 +807,9 @@ mod tests {
 
         let uid1 = MainVertexDataset::compute_vertex_uid(&labels, None, &props1);
         let uid2 = MainVertexDataset::compute_vertex_uid(&labels, None, &props2);
-        assert_ne!(uid1, uid2, "Different properties should produce different UIDs");
+        assert_ne!(
+            uid1, uid2,
+            "Different properties should produce different UIDs"
+        );
     }
 }

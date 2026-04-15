@@ -61,7 +61,11 @@ async fn test_reader_isolation_lifecycle() -> Result<()> {
         .session()
         .query("MATCH (n:Person {name: 'Alice'}) RETURN n.name")
         .await?;
-    assert_eq!(result.len(), 0, "Should NOT find Alice (deleted in storage)");
+    assert_eq!(
+        result.len(),
+        0,
+        "Should NOT find Alice (deleted in storage)"
+    );
 
     Ok(())
 }

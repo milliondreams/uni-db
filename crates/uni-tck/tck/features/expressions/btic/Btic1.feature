@@ -382,7 +382,7 @@ Feature: Btic1 - BTIC Temporal Interval Functions
       """
       RETURN btic_starts(btic('1985-01/1985-06'), btic('1985')) AS starts,
              btic_during(btic('1985-03/1985-09'), btic('1985')) AS during,
-             btic_finishes(btic('1985-06/1986'), btic('1985')) AS finishes
+             btic_finishes(btic('1985-06/1985-12'), btic('1985')) AS finishes
       """
     Then the result should be, in any order:
       | starts | during | finishes |

@@ -43,7 +43,11 @@ async fn test_prepared_query_basic() -> Result<()> {
 
     // Execute again — should use cached plan
     let result2 = pq.execute(&[]).await?;
-    assert_eq!(result2.len(), 2, "Second execution should return same results");
+    assert_eq!(
+        result2.len(),
+        2,
+        "Second execution should return same results"
+    );
 
     // Verify query text is preserved
     assert_eq!(
@@ -84,9 +88,7 @@ async fn test_prepared_query_execute_with_params_array() -> Result<()> {
         .prepare("MATCH (p:Person) WHERE p.name = $name RETURN p.age AS age")
         .await?;
 
-    let result = pq
-        .execute(&[("name", Value::String("Bob".into()))])
-        .await?;
+    let result = pq.execute(&[("name", Value::String("Bob".into()))]).await?;
 
     assert_eq!(result.len(), 1);
     assert_eq!(result.rows()[0].get::<i32>("age")?, 25);
@@ -145,7 +147,11 @@ async fn test_prepared_query_concurrent_execution() -> Result<()> {
 
     for handle in handles {
         let result = handle.await??;
-        assert_eq!(result.len(), 2, "Each concurrent execution should return 2 rows");
+        assert_eq!(
+            result.len(),
+            2,
+            "Each concurrent execution should return 2 rows"
+        );
     }
 
     Ok(())

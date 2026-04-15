@@ -895,10 +895,7 @@ mod tests {
         acc.update(&Value::String("b".into()), false);
         assert_eq!(
             acc.finish(),
-            Value::List(vec![
-                Value::String("a".into()),
-                Value::String("b".into()),
-            ])
+            Value::List(vec![Value::String("a".into()), Value::String("b".into()),])
         );
     }
 
@@ -938,9 +935,7 @@ mod tests {
     #[test]
     fn test_compare_values_cross_type_rank() {
         // String should sort before Bool which sorts before Int
-        assert!(
-            Executor::compare_values(&Value::String("z".into()), &Value::Bool(false)).is_lt()
-        );
+        assert!(Executor::compare_values(&Value::String("z".into()), &Value::Bool(false)).is_lt());
         assert!(Executor::compare_values(&Value::Bool(true), &Value::Int(1)).is_lt());
     }
 

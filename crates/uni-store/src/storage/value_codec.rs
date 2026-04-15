@@ -476,12 +476,10 @@ mod tests {
         builder.append_value(-0.5);
         let array = builder.finish();
 
-        let val =
-            value_from_column(&array, &DataType::Float64, 0, CrdtDecodeMode::Strict).unwrap();
+        let val = value_from_column(&array, &DataType::Float64, 0, CrdtDecodeMode::Strict).unwrap();
         assert_eq!(val, serde_json::json!(3.25));
 
-        let val =
-            value_from_column(&array, &DataType::Float64, 1, CrdtDecodeMode::Strict).unwrap();
+        let val = value_from_column(&array, &DataType::Float64, 1, CrdtDecodeMode::Strict).unwrap();
         assert_eq!(val, serde_json::json!(-0.5));
     }
 
@@ -507,8 +505,7 @@ mod tests {
         builder.append_value(1.5);
         let array = builder.finish();
 
-        let val =
-            value_from_column(&array, &DataType::Float32, 0, CrdtDecodeMode::Strict).unwrap();
+        let val = value_from_column(&array, &DataType::Float32, 0, CrdtDecodeMode::Strict).unwrap();
         // Float32 has limited precision so compare approximately
         let f = val.as_f64().unwrap();
         assert!((f - 1.5).abs() < 0.001);

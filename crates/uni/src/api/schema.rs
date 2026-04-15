@@ -441,18 +441,41 @@ impl EmbeddingCfg {
 
 #[non_exhaustive]
 pub enum VectorAlgo {
-    Hnsw { m: u32, ef_construction: u32 },
-    IvfPq { partitions: u32, sub_vectors: u32 },
     Flat,
+    IvfFlat {
+        partitions: u32,
+    },
+    IvfPq {
+        partitions: u32,
+        sub_vectors: u32,
+    },
+    IvfSq {
+        partitions: u32,
+    },
+    IvfRq {
+        partitions: u32,
+    },
+    Hnsw {
+        m: u32,
+        ef_construction: u32,
+    },
+    HnswSq {
+        m: u32,
+        ef_construction: u32,
+    },
+    HnswPq {
+        m: u32,
+        ef_construction: u32,
+        sub_vectors: u32,
+    },
 }
 
 impl VectorAlgo {
     fn into_internal(self) -> VectorIndexType {
         match self {
-            VectorAlgo::Hnsw { m, ef_construction } => VectorIndexType::Hnsw {
-                m,
-                ef_construction,
-                ef_search: 50,
+            VectorAlgo::Flat => VectorIndexType::Flat,
+            VectorAlgo::IvfFlat { partitions } => VectorIndexType::IvfFlat {
+                num_partitions: partitions,
             },
             VectorAlgo::IvfPq {
                 partitions,
@@ -462,7 +485,24 @@ impl VectorAlgo {
                 num_sub_vectors: sub_vectors,
                 bits_per_subvector: 8,
             },
-            VectorAlgo::Flat => VectorIndexType::Flat,
+            VectorAlgo::IvfSq { partitions } => VectorIndexType::IvfSq {
+                num_partitions: partitions,
+            },
+            VectorAlgo::IvfRq { partitions } => VectorIndexType::IvfRq {
+                num_partitions: partitions,
+            },
+            VectorAlgo::Hnsw { m, ef_construction } | VectorAlgo::HnswSq { m, ef_construction } => {
+                VectorIndexType::HnswSq { m, ef_construction }
+            }
+            VectorAlgo::HnswPq {
+                m,
+                ef_construction,
+                sub_vectors,
+            } => VectorIndexType::HnswPq {
+                m,
+                ef_construction,
+                num_sub_vectors: sub_vectors,
+            },
         }
     }
 }

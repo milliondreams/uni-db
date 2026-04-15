@@ -124,9 +124,8 @@ fn test_sync_api_edge_operations() -> Result<()> {
     tx.commit()?;
 
     // Verify traversal
-    let result = session.query(
-        "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name AS src, b.name AS dst",
-    )?;
+    let result = session
+        .query("MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name AS src, b.name AS dst")?;
     assert_eq!(result.len(), 1);
     assert_eq!(result.rows()[0].get::<String>("src")?, "Alice");
     assert_eq!(result.rows()[0].get::<String>("dst")?, "Bob");

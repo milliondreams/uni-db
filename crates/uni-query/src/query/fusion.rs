@@ -171,7 +171,11 @@ mod tests {
 
         // VID 1 appears in both lists → should have highest fused score
         assert_eq!(fused.len(), 3);
-        assert_eq!(fused[0].0, Vid::from(1u64), "Overlapping VID should rank first");
+        assert_eq!(
+            fused[0].0,
+            Vid::from(1u64),
+            "Overlapping VID should rank first"
+        );
     }
 
     #[test]

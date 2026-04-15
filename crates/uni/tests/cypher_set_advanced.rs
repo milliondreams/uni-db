@@ -45,10 +45,8 @@ async fn test_cypher_set_advanced() -> Result<()> {
     // 3. Update properties via SET
     let session = db.session();
     let tx = session.tx().await?;
-    tx.execute(
-        "MATCH (i:Item) SET i.embedding = [0.4, 0.5, 0.6], i.metadata = {valid: false}",
-    )
-    .await?;
+    tx.execute("MATCH (i:Item) SET i.embedding = [0.4, 0.5, 0.6], i.metadata = {valid: false}")
+        .await?;
     tx.commit().await?;
 
     // 4. Verify updated values

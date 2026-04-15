@@ -404,8 +404,13 @@ fn eval_btic(args: &[Value]) -> Result<Value> {
     match &args[0] {
         Value::Null => Ok(Value::Null),
         Value::String(s) => {
-            let btic = uni_btic::parse::parse_btic_literal(s)
-                .map_err(|e| anyhow!("btic('{}') parse error: {}", s, e))?;
+            let btic = uni_btic::parse::parse_btic_literal(s).map_err(|e| {
+                anyhow!(
+                    "TypeError: InvalidArgumentValue - btic() failed to parse '{}': {}",
+                    s,
+                    e
+                )
+            })?;
             Ok(Value::Temporal(uni_common::TemporalValue::Btic {
                 lo: btic.lo(),
                 hi: btic.hi(),

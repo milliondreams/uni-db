@@ -657,9 +657,10 @@ async fn test_plan_window_function() {
         .unwrap();
     let planner = planner_from(&schema_manager);
 
-    let ast =
-        uni_cypher::parse("MATCH (n:Person) RETURN n.name, ROW_NUMBER() OVER (ORDER BY n.age) AS rn")
-            .unwrap();
+    let ast = uni_cypher::parse(
+        "MATCH (n:Person) RETURN n.name, ROW_NUMBER() OVER (ORDER BY n.age) AS rn",
+    )
+    .unwrap();
     let plan = planner.plan(ast);
     assert!(
         plan.is_ok(),
@@ -667,4 +668,3 @@ async fn test_plan_window_function() {
         plan
     );
 }
-

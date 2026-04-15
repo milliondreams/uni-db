@@ -16,6 +16,8 @@ use lance_index::progress::IndexBuildProgress;
 #[cfg(feature = "lance-backend")]
 use lance_index::scalar::{InvertedIndexParams, ScalarIndexParams};
 #[cfg(feature = "lance-backend")]
+use lance_index::vector::bq::RQBuildParams;
+#[cfg(feature = "lance-backend")]
 use lance_index::vector::hnsw::builder::HnswBuildParams;
 #[cfg(feature = "lance-backend")]
 use lance_index::vector::ivf::IvfBuildParams;
@@ -238,6 +240,14 @@ impl IndexManager {
                 };
 
                 let params = match config.index_type {
+                    VectorIndexType::Flat => {
+                        let ivf = IvfBuildParams::new(1);
+                        VectorIndexParams::with_ivf_flat_params(metric_type, ivf)
+                    }
+                    VectorIndexType::IvfFlat { num_partitions } => {
+                        let ivf = IvfBuildParams::new(num_partitions as usize);
+                        VectorIndexParams::with_ivf_flat_params(metric_type, ivf)
+                    }
                     VectorIndexType::IvfPq {
                         num_partitions,
                         num_sub_vectors,
@@ -250,11 +260,17 @@ impl IndexManager {
                         );
                         VectorIndexParams::with_ivf_pq_params(metric_type, ivf, pq)
                     }
-                    VectorIndexType::Hnsw {
-                        m,
-                        ef_construction,
-                        ef_search: _,
-                    } => {
+                    VectorIndexType::IvfSq { num_partitions } => {
+                        let ivf = IvfBuildParams::new(num_partitions as usize);
+                        let sq = SQBuildParams::default();
+                        VectorIndexParams::with_ivf_sq_params(metric_type, ivf, sq)
+                    }
+                    VectorIndexType::IvfRq { num_partitions } => {
+                        let ivf = IvfBuildParams::new(num_partitions as usize);
+                        let rq = RQBuildParams::default();
+                        VectorIndexParams::with_ivf_rq_params(metric_type, ivf, rq)
+                    }
+                    VectorIndexType::HnswSq { m, ef_construction } => {
                         let ivf = IvfBuildParams::new(1);
                         let hnsw = HnswBuildParams::default()
                             .num_edges(m as usize)
@@ -262,11 +278,17 @@ impl IndexManager {
                         let sq = SQBuildParams::default();
                         VectorIndexParams::with_ivf_hnsw_sq_params(metric_type, ivf, hnsw, sq)
                     }
-                    VectorIndexType::Flat => {
-                        // Fallback to basic IVF-PQ
+                    VectorIndexType::HnswPq {
+                        m,
+                        ef_construction,
+                        num_sub_vectors,
+                    } => {
                         let ivf = IvfBuildParams::new(1);
-                        let pq = PQBuildParams::default();
-                        VectorIndexParams::with_ivf_pq_params(metric_type, ivf, pq)
+                        let hnsw = HnswBuildParams::default()
+                            .num_edges(m as usize)
+                            .ef_construction(ef_construction as usize);
+                        let pq = PQBuildParams::new(num_sub_vectors as usize, 8);
+                        VectorIndexParams::with_ivf_hnsw_pq_params(metric_type, ivf, hnsw, pq)
                     }
                     _ => {
                         return Err(anyhow!(

@@ -7179,26 +7179,37 @@ impl QueryPlanner {
         match cmd {
             SchemaCommand::CreateVectorIndex(c) => {
                 // Parse index type from options (default: IvfPq)
-                let index_type = if let Some(type_val) = c.options.get("type") {
-                    match type_val.as_str() {
-                        Some("hnsw") => VectorIndexType::Hnsw {
-                            m: 16,
-                            ef_construction: 200,
-                            ef_search: 100,
-                        },
-                        Some("flat") => VectorIndexType::Flat,
-                        _ => VectorIndexType::IvfPq {
-                            num_partitions: 256,
-                            num_sub_vectors: 16,
-                            bits_per_subvector: 8,
-                        },
-                    }
-                } else {
-                    VectorIndexType::IvfPq {
-                        num_partitions: 256,
-                        num_sub_vectors: 16,
+                let opt = |key: &str| {
+                    c.options
+                        .get(key)
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| s.parse::<u32>().ok())
+                };
+                let index_type = match c.options.get("type").and_then(|v| v.as_str()) {
+                    Some("flat") => VectorIndexType::Flat,
+                    Some("ivf_flat") => VectorIndexType::IvfFlat {
+                        num_partitions: opt("partitions").unwrap_or(256),
+                    },
+                    Some("ivf_sq") => VectorIndexType::IvfSq {
+                        num_partitions: opt("partitions").unwrap_or(256),
+                    },
+                    Some("ivf_rq") => VectorIndexType::IvfRq {
+                        num_partitions: opt("partitions").unwrap_or(256),
+                    },
+                    Some("hnsw") | Some("hnsw_sq") => VectorIndexType::HnswSq {
+                        m: opt("m").unwrap_or(16),
+                        ef_construction: opt("ef_construction").unwrap_or(200),
+                    },
+                    Some("hnsw_pq") => VectorIndexType::HnswPq {
+                        m: opt("m").unwrap_or(16),
+                        ef_construction: opt("ef_construction").unwrap_or(200),
+                        num_sub_vectors: opt("sub_vectors").unwrap_or(16),
+                    },
+                    _ => VectorIndexType::IvfPq {
+                        num_partitions: opt("partitions").unwrap_or(256),
+                        num_sub_vectors: opt("sub_vectors").unwrap_or(16),
                         bits_per_subvector: 8,
-                    }
+                    },
                 };
 
                 // Parse embedding config from options

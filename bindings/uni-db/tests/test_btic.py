@@ -392,9 +392,7 @@ class TestBticE2E:
         tx2.commit()
         btic_db.flush()
 
-        result = btic_db.session().query(
-            "MATCH (e:Event {name: 'ToDelete'}) RETURN e"
-        )
+        result = btic_db.session().query("MATCH (e:Event {name: 'ToDelete'}) RETURN e")
         assert len(result) == 0
 
     def test_remove_btic_property(self, btic_db):
@@ -428,9 +426,7 @@ class TestBticE2E:
         tx2.execute("CREATE (e:Event {name: 'Lost', when: btic('2024')})")
         tx2.rollback()
 
-        result = btic_db.session().query(
-            "MATCH (e:Event) RETURN e.name AS name"
-        )
+        result = btic_db.session().query("MATCH (e:Event) RETURN e.name AS name")
         names = [row["name"] for row in result.rows]
         assert "Kept" in names
         assert "Lost" not in names

@@ -627,17 +627,30 @@ pub struct EmbeddingConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[non_exhaustive]
 pub enum VectorIndexType {
+    Flat,
+    IvfFlat {
+        num_partitions: u32,
+    },
     IvfPq {
         num_partitions: u32,
         num_sub_vectors: u32,
         bits_per_subvector: u8,
     },
-    Hnsw {
+    IvfSq {
+        num_partitions: u32,
+    },
+    IvfRq {
+        num_partitions: u32,
+    },
+    HnswSq {
         m: u32,
         ef_construction: u32,
-        ef_search: u32,
     },
-    Flat,
+    HnswPq {
+        m: u32,
+        ef_construction: u32,
+        num_sub_vectors: u32,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

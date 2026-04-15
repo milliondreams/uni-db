@@ -34,7 +34,9 @@ async fn test_watch_basic_notification() -> Result<()> {
     let commit_session = db.session();
     tokio::spawn(async move {
         let tx = commit_session.tx().await.unwrap();
-        tx.execute("CREATE (:Person {name: 'Alice'})").await.unwrap();
+        tx.execute("CREATE (:Person {name: 'Alice'})")
+            .await
+            .unwrap();
         tx.commit().await.unwrap();
     });
 
@@ -76,8 +78,7 @@ async fn test_watch_label_filter() -> Result<()> {
     tx2.commit().await?;
 
     // The first notification we receive should be the Car commit
-    let notification =
-        tokio::time::timeout(Duration::from_secs(5), stream.next()).await?;
+    let notification = tokio::time::timeout(Duration::from_secs(5), stream.next()).await?;
 
     assert!(notification.is_some());
     let n = notification.unwrap();
@@ -98,10 +99,7 @@ async fn test_watch_exclude_session() -> Result<()> {
     let session_id = session.id().to_string();
 
     // Watch excluding our own session
-    let mut stream = session
-        .watch_with()
-        .exclude_session(&session_id)
-        .build();
+    let mut stream = session.watch_with().exclude_session(&session_id).build();
 
     // Commit from same session (should be excluded)
     let tx = session.tx().await?;
@@ -115,8 +113,7 @@ async fn test_watch_exclude_session() -> Result<()> {
     tx2.commit().await?;
 
     // Should receive the "Other" commit, not the "Self" commit
-    let notification =
-        tokio::time::timeout(Duration::from_secs(5), stream.next()).await?;
+    let notification = tokio::time::timeout(Duration::from_secs(5), stream.next()).await?;
     assert!(notification.is_some());
     let n = notification.unwrap();
     assert_ne!(
@@ -148,8 +145,7 @@ async fn test_watch_edge_type_filter() -> Result<()> {
         .await?;
     tx2.commit().await?;
 
-    let notification =
-        tokio::time::timeout(Duration::from_secs(5), stream.next()).await?;
+    let notification = tokio::time::timeout(Duration::from_secs(5), stream.next()).await?;
     assert!(notification.is_some());
     let n = notification.unwrap();
     assert!(

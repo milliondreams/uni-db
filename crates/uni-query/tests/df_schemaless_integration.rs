@@ -315,8 +315,7 @@ async fn test_schemaless_aggregation() {
     let planner = QueryPlanner::new(schema_manager.schema());
 
     // Create multiple nodes
-    let create_sql =
-        "CREATE (:Person {name: 'A'}), (:Person {name: 'B'}), (:Person {name: 'C'})";
+    let create_sql = "CREATE (:Person {name: 'A'}), (:Person {name: 'B'}), (:Person {name: 'C'})";
     let query = uni_cypher::parse(create_sql).unwrap();
     let plan = planner.plan(query).unwrap();
     executor

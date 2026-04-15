@@ -8,8 +8,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tempfile::tempdir;
 use tokio::sync::RwLock;
-use uni_common::core::schema::{DataType, SchemaManager};
 use uni_common::Value;
+use uni_common::core::schema::{DataType, SchemaManager};
 use uni_query::query::executor::Executor;
 use uni_query::query::planner::QueryPlanner;
 use uni_store::runtime::property_manager::PropertyManager;
@@ -457,7 +457,11 @@ async fn test_exists_subquery() {
     .await;
 
     // Alice->Bob and Bob->Charlie, so Alice and Bob have outgoing KNOWS
-    assert_eq!(rows.len(), 2, "Only persons with outgoing KNOWS should match");
+    assert_eq!(
+        rows.len(),
+        2,
+        "Only persons with outgoing KNOWS should match"
+    );
     let names: Vec<&str> = rows
         .iter()
         .filter_map(|r| r.get("name").and_then(|v| v.as_str()))
@@ -486,13 +490,9 @@ async fn test_time_travel_read_only_enforcement() {
     );
 
     // SET is a mutation too
-    let set_query =
-        uni_cypher::parse("MATCH (n:Person) SET n.age = 30 RETURN n").unwrap();
+    let set_query = uni_cypher::parse("MATCH (n:Person) SET n.age = 30 RETURN n").unwrap();
     let result = uni_query::validate_read_only(&set_query);
-    assert!(
-        result.is_err(),
-        "SET should be rejected as non-read-only"
-    );
+    assert!(result.is_err(), "SET should be rejected as non-read-only");
 }
 
 // ── Advanced execution tests ─────────────────────────────────────────

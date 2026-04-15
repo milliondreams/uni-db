@@ -12,7 +12,11 @@ use uni_store::storage::manager::StorageManager;
 async fn setup_property_manager(
     path: &std::path::Path,
     capacity: usize,
-) -> (Arc<PropertyManager>, Arc<StorageManager>, Arc<SchemaManager>) {
+) -> (
+    Arc<PropertyManager>,
+    Arc<StorageManager>,
+    Arc<SchemaManager>,
+) {
     let schema_manager = SchemaManager::load(&path.join("schema.json"))
         .await
         .unwrap();

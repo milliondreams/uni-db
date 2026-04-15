@@ -66,11 +66,27 @@ async fn test_batch_insert_and_flush() {
     let e1 = writer.next_eid(0).await.unwrap();
     let e2 = writer.next_eid(0).await.unwrap();
     writer
-        .insert_edge(v1, v2, 0, e1, HashMap::new(), Some("KNOWS".to_string()), None)
+        .insert_edge(
+            v1,
+            v2,
+            0,
+            e1,
+            HashMap::new(),
+            Some("KNOWS".to_string()),
+            None,
+        )
         .await
         .unwrap();
     writer
-        .insert_edge(v2, v3, 0, e2, HashMap::new(), Some("KNOWS".to_string()), None)
+        .insert_edge(
+            v2,
+            v3,
+            0,
+            e2,
+            HashMap::new(),
+            Some("KNOWS".to_string()),
+            None,
+        )
         .await
         .unwrap();
 

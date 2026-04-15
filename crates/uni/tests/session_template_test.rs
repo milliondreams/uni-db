@@ -105,7 +105,11 @@ async fn test_template_create_is_cheap() -> Result<()> {
         sessions.push(template.create());
     }
 
-    assert_eq!(sessions.len(), 100, "Should create 100 sessions without error");
+    assert_eq!(
+        sessions.len(),
+        100,
+        "Should create 100 sessions without error"
+    );
 
     // Each should have a unique ID
     let ids: std::collections::HashSet<_> = sessions.iter().map(|s| s.id().to_string()).collect();

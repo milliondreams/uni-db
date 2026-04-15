@@ -110,7 +110,11 @@ async fn test_create_returns_created_data() -> Result<()> {
         .await?;
     tx.commit().await?;
 
-    assert_eq!(result.len(), 1, "CREATE...RETURN should return created node");
+    assert_eq!(
+        result.len(),
+        1,
+        "CREATE...RETURN should return created node"
+    );
     assert_eq!(result.rows()[0].get::<String>("name")?, "Alice");
     assert_eq!(result.rows()[0].get::<i32>("age")?, 30);
 
@@ -159,11 +163,12 @@ async fn test_create_multiple_labels() -> Result<()> {
 async fn test_match_nonexistent_label_returns_empty() -> Result<()> {
     let db = setup_db().await?;
 
-    let result = db
-        .session()
-        .query("MATCH (n:NonExistent) RETURN n")
-        .await?;
-    assert_eq!(result.len(), 0, "Unknown label should return empty, not error");
+    let result = db.session().query("MATCH (n:NonExistent) RETURN n").await?;
+    assert_eq!(
+        result.len(),
+        0,
+        "Unknown label should return empty, not error"
+    );
 
     Ok(())
 }

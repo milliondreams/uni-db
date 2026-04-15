@@ -1977,7 +1977,7 @@ wheels = [
 
 [[package]]
 name = "uni-db"
-version = "1.0.3"
+version = "1.1.0"
 source = { editable = "../uni-db" }
 
 [package.metadata]
@@ -1998,7 +1998,7 @@ dev = [
 
 [[package]]
 name = "uni-pydantic"
-version = "1.0.3"
+version = "1.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "pydantic" },

@@ -168,6 +168,36 @@ fn invalid_unicode_character(input: &str, pos: usize) -> Option<char> {
     matches!(ch, '—' | '–' | '−').then_some(ch)
 }
 
+/// All Cypher reserved keywords (from `keyword_reserved` in cypher.pest).
+/// Stored lowercase for case-insensitive comparison.
+const CYPHER_RESERVED_KEYWORDS: &[&str] = &[
+    "match", "optional", "where", "create", "merge", "set", "remove", "delete", "detach",
+    "return", "with", "unwind", "union", "call", "yield", "distinct", "order", "by", "asc",
+    "desc", "skip", "limit", "as", "and", "or", "xor", "not", "in", "contains", "starts",
+    "ends", "is", "null", "true", "false", "case", "when", "then", "else", "if", "from", "to",
+    "on", "drop", "alter", "show", "over", "partition", "explain", "recursive", "valid_at",
+    "each",
+];
+
+/// Additional Locy-only reserved keywords (from `locy_keyword_reserved` in locy.pest).
+const LOCY_RESERVED_KEYWORDS: &[&str] = &[
+    "rule", "along", "prev", "fold", "best", "derive", "assume", "abduce", "query",
+];
+
+/// If the token at the error position is a reserved keyword, return it.
+fn reserved_keyword_at(input: &str, pos: usize, extra_keywords: &[&str]) -> Option<String> {
+    let (start, end) = extract_token_span_at(input, pos)?;
+    let token = &input[start..end];
+    let lower = token.to_lowercase();
+    if CYPHER_RESERVED_KEYWORDS.contains(&lower.as_str())
+        || extra_keywords.contains(&lower.as_str())
+    {
+        Some(token.to_string())
+    } else {
+        None
+    }
+}
+
 fn locy_error_position(e: &pest::error::Error<locy_parser::Rule>) -> usize {
     match e.location {
         pest::error::InputLocation::Pos(p) => p,
@@ -221,6 +251,12 @@ fn map_locy_pest_error(input: &str, e: pest::error::Error<locy_parser::Rule>) ->
             "LocySyntaxError: InvalidUnicodeCharacter - Invalid character '{ch}'"
         ));
     }
+    if let Some(kw) = reserved_keyword_at(input, pos, LOCY_RESERVED_KEYWORDS) {
+        return ParseError::new(format!(
+            "LocySyntaxError: ReservedKeyword - \"{kw}\" is a reserved keyword \
+             and cannot be used as a variable name. Use backtick-quoting: `{kw}`\n{e}"
+        ));
+    }
 
     // Locy-specific context categorization
     if let Some(category) = locy_context_category(input, pos) {
@@ -241,6 +277,12 @@ fn map_pest_error(input: &str, e: pest::error::Error<Rule>) -> ParseError {
     if let Some(ch) = invalid_unicode_character(input, pos) {
         return ParseError::new(format!(
             "SyntaxError: InvalidUnicodeCharacter - Invalid character '{ch}'"
+        ));
+    }
+    if let Some(kw) = reserved_keyword_at(input, pos, &[]) {
+        return ParseError::new(format!(
+            "SyntaxError: ReservedKeyword - \"{kw}\" is a reserved keyword \
+             and cannot be used as a variable name. Use backtick-quoting: `{kw}`\n{e}"
         ));
     }
 
@@ -522,6 +564,45 @@ mod tests {
         assert!(
             parse("MATCH (n) WHERE 1 < n.num < 3 RETURN n").is_ok(),
             "range chaining 1 < n.num < 3 should be allowed"
+        );
+    }
+
+    #[test]
+    fn test_reserved_keyword_as_variable_name() {
+        let msg = parse_err_msg("MATCH (match:N) RETURN match");
+        assert!(
+            msg.contains("ReservedKeyword"),
+            "expected ReservedKeyword, got: {msg}"
+        );
+        assert!(
+            msg.contains("backtick-quoting"),
+            "expected backtick hint, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_reserved_keyword_return_as_variable() {
+        let msg = parse_err_msg("MATCH (return:N) RETURN return");
+        assert!(
+            msg.contains("ReservedKeyword"),
+            "expected ReservedKeyword, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_non_reserved_keyword_allowed() {
+        // `end` was moved to keyword_nonreserved — should parse fine
+        assert!(
+            parse("MATCH (end:N) RETURN end").is_ok(),
+            "non-reserved keyword 'end' should be allowed as variable name"
+        );
+    }
+
+    #[test]
+    fn test_backtick_escaped_reserved_keyword() {
+        assert!(
+            parse("MATCH (`match`:N) RETURN `match`").is_ok(),
+            "backtick-escaped reserved keyword should be allowed"
         );
     }
 }

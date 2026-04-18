@@ -47,6 +47,19 @@ pub fn parse_locy(input: &str) -> Result<LocyProgram, ParseError> {
     locy_walker::build_program(pairs.into_iter().next().unwrap())
 }
 
+/// Returns true if the pest error expects an identifier-like rule at the error position.
+/// Used to gate the reserved-keyword check so it only fires when a keyword is used
+/// where a variable name is expected, not when it appears after unrelated syntax errors.
+fn expects_identifier(e: &pest::error::Error<Rule>) -> bool {
+    use pest::error::ErrorVariant;
+    match &e.variant {
+        ErrorVariant::ParsingError { positives, .. } => positives.iter().any(|r| {
+            matches!(r, Rule::identifier | Rule::identifier_or_keyword)
+        }),
+        _ => false,
+    }
+}
+
 fn error_position(e: &pest::error::Error<Rule>) -> usize {
     match e.location {
         pest::error::InputLocation::Pos(p) => p,
@@ -279,7 +292,10 @@ fn map_pest_error(input: &str, e: pest::error::Error<Rule>) -> ParseError {
             "SyntaxError: InvalidUnicodeCharacter - Invalid character '{ch}'"
         ));
     }
-    if let Some(kw) = reserved_keyword_at(input, pos, &[]) {
+    if let Some(kw) = expects_identifier(&e)
+        .then(|| reserved_keyword_at(input, pos, &[]))
+        .flatten()
+    {
         return ParseError::new(format!(
             "SyntaxError: ReservedKeyword - \"{kw}\" is a reserved keyword \
              and cannot be used as a variable name. Use backtick-quoting: `{kw}`\n{e}"

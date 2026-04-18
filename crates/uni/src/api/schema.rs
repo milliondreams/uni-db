@@ -160,9 +160,13 @@ impl<'a> SchemaBuilder<'a> {
                     nullable,
                     description,
                 } => {
-                    match manager
-                        .add_property_with_desc(&label_or_type, &name, data_type, nullable, description)
-                    {
+                    match manager.add_property_with_desc(
+                        &label_or_type,
+                        &name,
+                        data_type,
+                        nullable,
+                        description,
+                    ) {
                         Ok(_) => {}
                         Err(e) if e.to_string().contains("already exists") => {}
                         Err(e) => {
@@ -187,8 +191,12 @@ impl<'a> SchemaBuilder<'a> {
                     to_labels,
                     description,
                 } => {
-                    match manager.add_edge_type_with_desc(&name, from_labels, to_labels, description)
-                    {
+                    match manager.add_edge_type_with_desc(
+                        &name,
+                        from_labels,
+                        to_labels,
+                        description,
+                    ) {
                         Ok(_) => {}
                         Err(e) if e.to_string().contains("already exists") => {}
                         Err(e) => {

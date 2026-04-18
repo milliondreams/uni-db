@@ -158,9 +158,12 @@ pub async fn create_edge_type(
             message: e.to_string(),
         })?;
 
-    storage
-        .schema_manager()
-        .add_edge_type_with_desc(name, src_labels, dst_labels, config.description)?;
+    storage.schema_manager().add_edge_type_with_desc(
+        name,
+        src_labels,
+        dst_labels,
+        config.description,
+    )?;
 
     for (prop_name, prop_config) in config.properties {
         validate_identifier(&prop_name)?;

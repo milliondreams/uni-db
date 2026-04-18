@@ -1024,7 +1024,13 @@ impl Executor {
         sm.add_label_with_desc(&clause.name, clause.description)?;
         for prop in clause.properties {
             let dt = Self::parse_data_type(&prop.data_type)?;
-            sm.add_property_with_desc(&clause.name, &prop.name, dt, prop.nullable, prop.description)?;
+            sm.add_property_with_desc(
+                &clause.name,
+                &prop.name,
+                dt,
+                prop.nullable,
+                prop.description,
+            )?;
             if prop.unique {
                 let constraint = Constraint {
                     name: format!("{}_{}_unique", clause.name, prop.name),
@@ -1104,10 +1110,21 @@ impl Executor {
         if clause.if_not_exists && sm.schema().edge_types.contains_key(&clause.name) {
             return Ok(());
         }
-        sm.add_edge_type_with_desc(&clause.name, clause.src_labels, clause.dst_labels, clause.description)?;
+        sm.add_edge_type_with_desc(
+            &clause.name,
+            clause.src_labels,
+            clause.dst_labels,
+            clause.description,
+        )?;
         for prop in clause.properties {
             let dt = Self::parse_data_type(&prop.data_type)?;
-            sm.add_property_with_desc(&clause.name, &prop.name, dt, prop.nullable, prop.description)?;
+            sm.add_property_with_desc(
+                &clause.name,
+                &prop.name,
+                dt,
+                prop.nullable,
+                prop.description,
+            )?;
         }
         sm.save().await?;
         Ok(())
@@ -1125,7 +1142,13 @@ impl Executor {
         match action {
             AlterAction::AddProperty(prop) => {
                 let dt = Self::parse_data_type(&prop.data_type)?;
-                sm.add_property_with_desc(entity_name, &prop.name, dt, prop.nullable, prop.description)?;
+                sm.add_property_with_desc(
+                    entity_name,
+                    &prop.name,
+                    dt,
+                    prop.nullable,
+                    prop.description,
+                )?;
             }
             AlterAction::DropProperty(prop_name) => {
                 sm.drop_property(entity_name, &prop_name)?;

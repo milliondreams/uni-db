@@ -53,9 +53,9 @@ pub fn parse_locy(input: &str) -> Result<LocyProgram, ParseError> {
 fn expects_identifier(e: &pest::error::Error<Rule>) -> bool {
     use pest::error::ErrorVariant;
     match &e.variant {
-        ErrorVariant::ParsingError { positives, .. } => positives.iter().any(|r| {
-            matches!(r, Rule::identifier | Rule::identifier_or_keyword)
-        }),
+        ErrorVariant::ParsingError { positives, .. } => positives
+            .iter()
+            .any(|r| matches!(r, Rule::identifier | Rule::identifier_or_keyword)),
         _ => false,
     }
 }
@@ -184,11 +184,57 @@ fn invalid_unicode_character(input: &str, pos: usize) -> Option<char> {
 /// All Cypher reserved keywords (from `keyword_reserved` in cypher.pest).
 /// Stored lowercase for case-insensitive comparison.
 const CYPHER_RESERVED_KEYWORDS: &[&str] = &[
-    "match", "optional", "where", "create", "merge", "set", "remove", "delete", "detach",
-    "return", "with", "unwind", "union", "call", "yield", "distinct", "order", "by", "asc",
-    "desc", "skip", "limit", "as", "and", "or", "xor", "not", "in", "contains", "starts",
-    "ends", "is", "null", "true", "false", "case", "when", "then", "else", "if", "from", "to",
-    "on", "drop", "alter", "show", "over", "partition", "explain", "recursive", "valid_at",
+    "match",
+    "optional",
+    "where",
+    "create",
+    "merge",
+    "set",
+    "remove",
+    "delete",
+    "detach",
+    "return",
+    "with",
+    "unwind",
+    "union",
+    "call",
+    "yield",
+    "distinct",
+    "order",
+    "by",
+    "asc",
+    "desc",
+    "skip",
+    "limit",
+    "as",
+    "and",
+    "or",
+    "xor",
+    "not",
+    "in",
+    "contains",
+    "starts",
+    "ends",
+    "is",
+    "null",
+    "true",
+    "false",
+    "case",
+    "when",
+    "then",
+    "else",
+    "if",
+    "from",
+    "to",
+    "on",
+    "drop",
+    "alter",
+    "show",
+    "over",
+    "partition",
+    "explain",
+    "recursive",
+    "valid_at",
     "each",
 ];
 

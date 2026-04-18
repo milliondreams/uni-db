@@ -127,9 +127,15 @@ pub struct AlterEdgeType {
 pub enum AlterAction {
     AddProperty(PropertyDefinition),
     DropProperty(String),
-    RenameProperty { old_name: String, new_name: String },
+    RenameProperty {
+        old_name: String,
+        new_name: String,
+    },
     SetDescription(Option<String>),
-    SetPropertyDescription { property: String, description: Option<String> },
+    SetPropertyDescription {
+        property: String,
+        description: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

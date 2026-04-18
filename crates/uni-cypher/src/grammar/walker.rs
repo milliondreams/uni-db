@@ -2313,9 +2313,7 @@ fn build_alter_action(pair: Pair<Rule>) -> Result<AlterAction, ParseError> {
                         Ok(AlterAction::DropProperty(name))
                     }
                 }
-                Rule::DESCRIPTION_KW => {
-                    Ok(AlterAction::SetDescription(None))
-                }
+                Rule::DESCRIPTION_KW => Ok(AlterAction::SetDescription(None)),
                 _ => unreachable!(),
             }
         }

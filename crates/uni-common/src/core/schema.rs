@@ -1159,11 +1159,7 @@ impl SchemaManager {
         Ok(())
     }
 
-    pub fn set_label_description(
-        &self,
-        name: &str,
-        description: Option<String>,
-    ) -> Result<()> {
+    pub fn set_label_description(&self, name: &str, description: Option<String>) -> Result<()> {
         let mut guard = acquire_write(&self.schema, "schema")?;
         let schema = Arc::make_mut(&mut *guard);
         let meta = schema
@@ -1174,11 +1170,7 @@ impl SchemaManager {
         Ok(())
     }
 
-    pub fn set_edge_type_description(
-        &self,
-        name: &str,
-        description: Option<String>,
-    ) -> Result<()> {
+    pub fn set_edge_type_description(&self, name: &str, description: Option<String>) -> Result<()> {
         let mut guard = acquire_write(&self.schema, "schema")?;
         let schema = Arc::make_mut(&mut *guard);
         let meta = schema

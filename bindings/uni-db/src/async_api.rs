@@ -3408,7 +3408,12 @@ pub struct AsyncLabelBuilder {
     parent_indexes: Vec<uni_common::core::schema::IndexDefinition>,
     name: String,
     description: Option<String>,
-    properties: Vec<(String, uni_common::core::schema::DataType, bool, Option<String>)>,
+    properties: Vec<(
+        String,
+        uni_common::core::schema::DataType,
+        bool,
+        Option<String>,
+    )>,
     indexes: Vec<uni_common::core::schema::IndexDefinition>,
 }
 
@@ -3528,7 +3533,12 @@ pub struct AsyncEdgeTypeBuilder {
     description: Option<String>,
     from_labels: Vec<String>,
     to_labels: Vec<String>,
-    properties: Vec<(String, uni_common::core::schema::DataType, bool, Option<String>)>,
+    properties: Vec<(
+        String,
+        uni_common::core::schema::DataType,
+        bool,
+        Option<String>,
+    )>,
 }
 
 #[pymethods]

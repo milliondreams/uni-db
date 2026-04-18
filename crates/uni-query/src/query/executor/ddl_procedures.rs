@@ -23,6 +23,8 @@ struct LabelConfig {
     indexes: Vec<IndexConfig>,
     #[serde(default)]
     constraints: Vec<ConstraintConfig>,
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -31,6 +33,8 @@ struct PropertyConfig {
     data_type: String,
     #[serde(default = "default_nullable")]
     nullable: bool,
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 fn default_nullable() -> bool {
@@ -100,15 +104,21 @@ pub async fn create_label(
         })?;
 
     // Create label
-    storage.schema_manager().add_label(name)?;
+    storage
+        .schema_manager()
+        .add_label_with_desc(name, config.description)?;
 
     // Add properties
     for (prop_name, prop_config) in config.properties {
         validate_identifier(&prop_name)?;
         let data_type = parse_data_type(&prop_config.data_type)?;
-        storage
-            .schema_manager()
-            .add_property(name, &prop_name, data_type, prop_config.nullable)?;
+        storage.schema_manager().add_property_with_desc(
+            name,
+            &prop_name,
+            data_type,
+            prop_config.nullable,
+            prop_config.description,
+        )?;
     }
 
     // Add indexes
@@ -150,14 +160,18 @@ pub async fn create_edge_type(
 
     storage
         .schema_manager()
-        .add_edge_type(name, src_labels, dst_labels)?;
+        .add_edge_type_with_desc(name, src_labels, dst_labels, config.description)?;
 
     for (prop_name, prop_config) in config.properties {
         validate_identifier(&prop_name)?;
         let data_type = parse_data_type(&prop_config.data_type)?;
-        storage
-            .schema_manager()
-            .add_property(name, &prop_name, data_type, prop_config.nullable)?;
+        storage.schema_manager().add_property_with_desc(
+            name,
+            &prop_name,
+            data_type,
+            prop_config.nullable,
+            prop_config.description,
+        )?;
     }
 
     // Constraints

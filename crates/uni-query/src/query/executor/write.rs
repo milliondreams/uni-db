@@ -1021,10 +1021,10 @@ impl Executor {
         if clause.if_not_exists && sm.schema().labels.contains_key(&clause.name) {
             return Ok(());
         }
-        sm.add_label(&clause.name)?;
+        sm.add_label_with_desc(&clause.name, clause.description)?;
         for prop in clause.properties {
             let dt = Self::parse_data_type(&prop.data_type)?;
-            sm.add_property(&clause.name, &prop.name, dt, prop.nullable)?;
+            sm.add_property_with_desc(&clause.name, &prop.name, dt, prop.nullable, prop.description)?;
             if prop.unique {
                 let constraint = Constraint {
                     name: format!("{}_{}_unique", clause.name, prop.name),
@@ -1104,10 +1104,10 @@ impl Executor {
         if clause.if_not_exists && sm.schema().edge_types.contains_key(&clause.name) {
             return Ok(());
         }
-        sm.add_edge_type(&clause.name, clause.src_labels, clause.dst_labels)?;
+        sm.add_edge_type_with_desc(&clause.name, clause.src_labels, clause.dst_labels, clause.description)?;
         for prop in clause.properties {
             let dt = Self::parse_data_type(&prop.data_type)?;
-            sm.add_property(&clause.name, &prop.name, dt, prop.nullable)?;
+            sm.add_property_with_desc(&clause.name, &prop.name, dt, prop.nullable, prop.description)?;
         }
         sm.save().await?;
         Ok(())
@@ -1125,13 +1125,26 @@ impl Executor {
         match action {
             AlterAction::AddProperty(prop) => {
                 let dt = Self::parse_data_type(&prop.data_type)?;
-                sm.add_property(entity_name, &prop.name, dt, prop.nullable)?;
+                sm.add_property_with_desc(entity_name, &prop.name, dt, prop.nullable, prop.description)?;
             }
             AlterAction::DropProperty(prop_name) => {
                 sm.drop_property(entity_name, &prop_name)?;
             }
             AlterAction::RenameProperty { old_name, new_name } => {
                 sm.rename_property(entity_name, &old_name, &new_name)?;
+            }
+            AlterAction::SetDescription(desc) => {
+                if sm.schema().labels.contains_key(entity_name) {
+                    sm.set_label_description(entity_name, desc)?;
+                } else {
+                    sm.set_edge_type_description(entity_name, desc)?;
+                }
+            }
+            AlterAction::SetPropertyDescription {
+                property,
+                description,
+            } => {
+                sm.set_property_description(entity_name, &property, description)?;
             }
         }
         sm.save().await?;

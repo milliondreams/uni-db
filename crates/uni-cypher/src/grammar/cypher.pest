@@ -80,6 +80,7 @@ VECTOR    = @{ ^"vector" ~ !ident_char }
 FULLTEXT  = @{ ^"fulltext" ~ !ident_char }
 PROPERTY  = @{ ^"property" ~ !ident_char }
 UNIQUE    = @{ ^"unique" ~ !ident_char }
+DESCRIPTION_KW = @{ ^"description" ~ !ident_char }
 OPTIONS   = @{ ^"options" ~ !ident_char }
 ON        = @{ ^"on" ~ !ident_char }
 FOR       = @{ ^"for" ~ !ident_char }
@@ -157,7 +158,8 @@ keyword_nonreserved = {
     VECTOR | FULLTEXT | JSON | OPTIONS | FOR | NODE | RELATIONSHIP |
     TRANSACTION | VACUUM | CHECKPOINT |
     DATABASE | CONFIG | STATISTICS | BACKUP | COPY |
-    VERSION | TIMESTAMP_KW | OF | END
+    VERSION | TIMESTAMP_KW | OF | END |
+    DESCRIPTION_KW
 }
 
 // All keywords (for backward compatibility in some rules)
@@ -689,14 +691,15 @@ constraint_assertion = {
 drop_constraint = { DROP_KW ~ CONSTRAINT ~ if_exists? ~ identifier }
 
 create_label = {
-    CREATE ~ LABEL ~ if_not_exists? ~ identifier_or_keyword 
-    ~ "(" ~ property_definitions ~ ")"
+    CREATE ~ LABEL ~ if_not_exists? ~ identifier_or_keyword
+    ~ "(" ~ property_definitions ~ ")" ~ description_clause?
 }
 
 create_edge_type = {
     CREATE ~ EDGE ~ TYPE ~ if_not_exists? ~ identifier_or_keyword
-    ~ ("(" ~ property_definitions? ~ ")")? 
+    ~ ("(" ~ property_definitions? ~ ")")?
     ~ FROM ~ identifier_or_keyword ~ TO ~ identifier_or_keyword
+    ~ description_clause?
 }
 
 alter_label = { ALTER ~ LABEL ~ identifier_or_keyword ~ alter_action }
@@ -704,8 +707,12 @@ alter_edge_type = { ALTER ~ EDGE ~ TYPE ~ identifier_or_keyword ~ alter_action }
 
 alter_action = {
     ADD ~ PROPERTY ~ property_definition
+    | DROP_KW ~ PROPERTY ~ identifier ~ DESCRIPTION_KW
     | DROP_KW ~ PROPERTY ~ identifier
     | RENAME ~ PROPERTY ~ identifier ~ TO ~ identifier
+    | SET ~ PROPERTY ~ identifier ~ DESCRIPTION_KW ~ string
+    | SET ~ DESCRIPTION_KW ~ string
+    | DROP_KW ~ DESCRIPTION_KW
 }
 
 drop_label = { DROP_KW ~ LABEL ~ if_exists? ~ identifier_or_keyword }
@@ -730,10 +737,11 @@ copy_from = { COPY ~ identifier_or_keyword ~ FROM ~ string ~ (WITH ~ map_literal
 
 property_definitions = { property_definition ~ ("," ~ property_definition)* }
 property_definition = {
-    identifier ~ identifier_or_keyword ~ nullable_constraint? ~ UNIQUE? ~ default_value?
+    identifier ~ identifier_or_keyword ~ nullable_constraint? ~ UNIQUE? ~ default_value? ~ description_clause?
 }
 nullable_constraint = { NOT ~ NULL | NULL }
 default_value = { DEFAULT ~ expression }
+description_clause = { DESCRIPTION_KW ~ string }
 
 if_not_exists = { IF ~ NOT ~ EXISTS }
 if_exists = { IF ~ EXISTS }

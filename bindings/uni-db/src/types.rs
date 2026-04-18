@@ -673,6 +673,8 @@ pub struct LabelInfo {
     pub indexes: Vec<IndexInfo>,
     /// Constraints defined on this label.
     pub constraints: Vec<ConstraintInfo>,
+    /// Optional human-readable description.
+    pub description: Option<String>,
 }
 
 #[pymethods]
@@ -700,6 +702,8 @@ pub struct PropertyInfo {
     pub nullable: bool,
     /// Whether an index exists on this property.
     pub is_indexed: bool,
+    /// Optional human-readable description.
+    pub description: Option<String>,
 }
 
 #[pymethods]
@@ -778,6 +782,8 @@ pub struct EdgeTypeInfo {
     pub indexes: Vec<IndexInfo>,
     /// Constraints defined on this edge type.
     pub constraints: Vec<ConstraintInfo>,
+    /// Optional human-readable description.
+    pub description: Option<String>,
 }
 
 #[pymethods]
@@ -2972,11 +2978,12 @@ impl PySchema {
                 data_type: format!("{:?}", pmeta.r#type),
                 nullable: pmeta.nullable,
                 is_indexed: false,
+                description: pmeta.description.clone(),
             })
             .collect();
-        let _ = meta;
         Some(LabelInfo {
             name: name.to_string(),
+            description: meta.description.clone(),
             count: 0, // Not available from schema alone
             properties: property_infos,
             indexes: vec![],

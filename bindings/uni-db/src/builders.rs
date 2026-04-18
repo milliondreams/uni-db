@@ -260,9 +260,9 @@ impl DatabaseBuilder {
 #[derive(Clone)]
 pub struct SchemaBuilder {
     pub(crate) inner: Arc<Uni>,
-    pub(crate) pending_labels: Vec<String>,
-    pub(crate) pending_edge_types: Vec<(String, Vec<String>, Vec<String>)>,
-    pub(crate) pending_properties: Vec<(String, String, DataType, bool)>,
+    pub(crate) pending_labels: Vec<crate::core::PendingLabel>,
+    pub(crate) pending_edge_types: Vec<crate::core::PendingEdgeType>,
+    pub(crate) pending_properties: Vec<crate::core::PendingProperty>,
     pub(crate) pending_indexes: Vec<IndexDefinition>,
 }
 
@@ -300,7 +300,8 @@ impl SchemaBuilder {
     }
 
     /// Start defining a new label.
-    fn label(&self, name: &str) -> PyResult<LabelBuilder> {
+    #[pyo3(signature = (name, *, description=None))]
+    fn label(&self, name: &str, description: Option<String>) -> PyResult<LabelBuilder> {
         Ok(LabelBuilder {
             parent_inner: self.inner.clone(),
             parent_labels: self.pending_labels.clone(),
@@ -308,17 +309,20 @@ impl SchemaBuilder {
             parent_properties: self.pending_properties.clone(),
             parent_indexes: self.pending_indexes.clone(),
             name: name.to_string(),
+            description,
             properties: Vec::new(),
             indexes: Vec::new(),
         })
     }
 
     /// Start defining a new edge type.
+    #[pyo3(signature = (name, from_labels, to_labels, *, description=None))]
     fn edge_type(
         &self,
         name: &str,
         from_labels: Vec<String>,
         to_labels: Vec<String>,
+        description: Option<String>,
     ) -> PyResult<EdgeTypeBuilder> {
         Ok(EdgeTypeBuilder {
             parent_inner: self.inner.clone(),
@@ -327,6 +331,7 @@ impl SchemaBuilder {
             parent_properties: self.pending_properties.clone(),
             parent_indexes: self.pending_indexes.clone(),
             name: name.to_string(),
+            description,
             from_labels,
             to_labels,
             properties: Vec::new(),
@@ -380,22 +385,25 @@ pub(crate) fn parse_index_config(
 #[derive(Clone)]
 pub struct LabelBuilder {
     parent_inner: Arc<Uni>,
-    parent_labels: Vec<String>,
-    parent_edge_types: Vec<(String, Vec<String>, Vec<String>)>,
-    parent_properties: Vec<(String, String, DataType, bool)>,
+    parent_labels: Vec<crate::core::PendingLabel>,
+    parent_edge_types: Vec<crate::core::PendingEdgeType>,
+    parent_properties: Vec<crate::core::PendingProperty>,
     parent_indexes: Vec<IndexDefinition>,
     name: String,
-    properties: Vec<(String, DataType, bool)>,
+    description: Option<String>,
+    properties: Vec<(String, DataType, bool, Option<String>)>,
     indexes: Vec<IndexDefinition>,
 }
 
 #[pymethods]
 impl LabelBuilder {
     /// Add a required property to this label.
+    #[pyo3(signature = (name, data_type, *, description=None))]
     fn property<'py>(
         mut slf: PyRefMut<'py, Self>,
         name: String,
         data_type: &Bound<'py, PyAny>,
+        description: Option<String>,
     ) -> PyResult<PyRefMut<'py, Self>> {
         let dt = if let Ok(py_dt) = data_type.extract::<crate::types::PyDataType>() {
             py_dt.inner
@@ -404,15 +412,17 @@ impl LabelBuilder {
             crate::core::parse_data_type(&s)
                 .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?
         };
-        slf.properties.push((name, dt, false));
+        slf.properties.push((name, dt, false, description));
         Ok(slf)
     }
 
     /// Add a nullable property to this label.
+    #[pyo3(signature = (name, data_type, *, description=None))]
     fn property_nullable<'py>(
         mut slf: PyRefMut<'py, Self>,
         name: String,
         data_type: &Bound<'py, PyAny>,
+        description: Option<String>,
     ) -> PyResult<PyRefMut<'py, Self>> {
         let dt = if let Ok(py_dt) = data_type.extract::<crate::types::PyDataType>() {
             py_dt.inner
@@ -421,14 +431,14 @@ impl LabelBuilder {
             crate::core::parse_data_type(&s)
                 .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?
         };
-        slf.properties.push((name, dt, true));
+        slf.properties.push((name, dt, true, description));
         Ok(slf)
     }
 
     /// Add a vector property (shorthand for vector type + index).
     fn vector(mut slf: PyRefMut<'_, Self>, name: String, dimensions: usize) -> PyRefMut<'_, Self> {
         slf.properties
-            .push((name, DataType::Vector { dimensions }, false));
+            .push((name, DataType::Vector { dimensions }, false, None));
         slf
     }
 
@@ -466,11 +476,20 @@ impl LabelBuilder {
     /// Finish this label and return to SchemaBuilder.
     fn done(&self) -> PyResult<SchemaBuilder> {
         let mut labels = self.parent_labels.clone();
-        labels.push(self.name.clone());
+        labels.push(crate::core::PendingLabel {
+            name: self.name.clone(),
+            description: self.description.clone(),
+        });
 
         let mut properties = self.parent_properties.clone();
-        for (prop_name, dt, nullable) in &self.properties {
-            properties.push((self.name.clone(), prop_name.clone(), dt.clone(), *nullable));
+        for (prop_name, dt, nullable, desc) in &self.properties {
+            properties.push(crate::core::PendingProperty {
+                label_or_type: self.name.clone(),
+                name: prop_name.clone(),
+                data_type: dt.clone(),
+                nullable: *nullable,
+                description: desc.clone(),
+            });
         }
 
         let mut indexes = self.parent_indexes.clone();
@@ -496,23 +515,26 @@ impl LabelBuilder {
 #[derive(Clone)]
 pub struct EdgeTypeBuilder {
     parent_inner: Arc<Uni>,
-    parent_labels: Vec<String>,
-    parent_edge_types: Vec<(String, Vec<String>, Vec<String>)>,
-    parent_properties: Vec<(String, String, DataType, bool)>,
+    parent_labels: Vec<crate::core::PendingLabel>,
+    parent_edge_types: Vec<crate::core::PendingEdgeType>,
+    parent_properties: Vec<crate::core::PendingProperty>,
     parent_indexes: Vec<IndexDefinition>,
     name: String,
+    description: Option<String>,
     from_labels: Vec<String>,
     to_labels: Vec<String>,
-    properties: Vec<(String, DataType, bool)>,
+    properties: Vec<(String, DataType, bool, Option<String>)>,
 }
 
 #[pymethods]
 impl EdgeTypeBuilder {
     /// Add a required property to this edge type.
+    #[pyo3(signature = (name, data_type, *, description=None))]
     fn property<'py>(
         mut slf: PyRefMut<'py, Self>,
         name: String,
         data_type: &Bound<'py, PyAny>,
+        description: Option<String>,
     ) -> PyResult<PyRefMut<'py, Self>> {
         let dt = if let Ok(py_dt) = data_type.extract::<crate::types::PyDataType>() {
             py_dt.inner
@@ -521,15 +543,17 @@ impl EdgeTypeBuilder {
             crate::core::parse_data_type(&s)
                 .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?
         };
-        slf.properties.push((name, dt, false));
+        slf.properties.push((name, dt, false, description));
         Ok(slf)
     }
 
     /// Add a nullable property to this edge type.
+    #[pyo3(signature = (name, data_type, *, description=None))]
     fn property_nullable<'py>(
         mut slf: PyRefMut<'py, Self>,
         name: String,
         data_type: &Bound<'py, PyAny>,
+        description: Option<String>,
     ) -> PyResult<PyRefMut<'py, Self>> {
         let dt = if let Ok(py_dt) = data_type.extract::<crate::types::PyDataType>() {
             py_dt.inner
@@ -538,22 +562,29 @@ impl EdgeTypeBuilder {
             crate::core::parse_data_type(&s)
                 .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?
         };
-        slf.properties.push((name, dt, true));
+        slf.properties.push((name, dt, true, description));
         Ok(slf)
     }
 
     /// Finish this edge type and return to SchemaBuilder.
     fn done(&self) -> PyResult<SchemaBuilder> {
         let mut edge_types = self.parent_edge_types.clone();
-        edge_types.push((
-            self.name.clone(),
-            self.from_labels.clone(),
-            self.to_labels.clone(),
-        ));
+        edge_types.push(crate::core::PendingEdgeType {
+            name: self.name.clone(),
+            from: self.from_labels.clone(),
+            to: self.to_labels.clone(),
+            description: self.description.clone(),
+        });
 
         let mut properties = self.parent_properties.clone();
-        for (prop_name, dt, nullable) in &self.properties {
-            properties.push((self.name.clone(), prop_name.clone(), dt.clone(), *nullable));
+        for (prop_name, dt, nullable, desc) in &self.properties {
+            properties.push(crate::core::PendingProperty {
+                label_or_type: self.name.clone(),
+                name: prop_name.clone(),
+                data_type: dt.clone(),
+                nullable: *nullable,
+                description: desc.clone(),
+            });
         }
 
         Ok(SchemaBuilder {

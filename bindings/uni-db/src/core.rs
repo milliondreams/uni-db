@@ -119,6 +119,33 @@ pub async fn flush_core(db: &Uni) -> Result<(), UniError> {
 }
 
 // ============================================================================
+// Schema Core — Pending Types
+// ============================================================================
+
+#[derive(Clone)]
+pub(crate) struct PendingLabel {
+    pub name: String,
+    pub description: Option<String>,
+}
+
+#[derive(Clone)]
+pub(crate) struct PendingEdgeType {
+    pub name: String,
+    pub from: Vec<String>,
+    pub to: Vec<String>,
+    pub description: Option<String>,
+}
+
+#[derive(Clone)]
+pub(crate) struct PendingProperty {
+    pub label_or_type: String,
+    pub name: String,
+    pub data_type: DataType,
+    pub nullable: bool,
+    pub description: Option<String>,
+}
+
+// ============================================================================
 // Schema Core
 // ============================================================================
 
@@ -170,35 +197,40 @@ pub async fn save_schema_core(db: &Uni, path: &str) -> Result<(), UniError> {
 /// This is additive/idempotent: labels and edge types that already exist are
 /// silently skipped so that the schema builder can be used to add properties
 /// or indexes to existing schema elements.
-pub async fn apply_schema_core(
+pub(crate) async fn apply_schema_core(
     db: &Uni,
-    pending_labels: &[String],
-    pending_edge_types: &[(String, Vec<String>, Vec<String>)],
-    pending_properties: &[(String, String, DataType, bool)],
+    pending_labels: &[PendingLabel],
+    pending_edge_types: &[PendingEdgeType],
+    pending_properties: &[PendingProperty],
     pending_indexes: &[IndexDefinition],
 ) -> Result<(), UniError> {
     use ::uni_db::api::schema::SchemaChange;
 
     let mut changes = Vec::new();
 
-    for name in pending_labels {
-        changes.push(SchemaChange::AddLabel { name: name.clone() });
-    }
-
-    for (name, from, to) in pending_edge_types {
-        changes.push(SchemaChange::AddEdgeType {
-            name: name.clone(),
-            from_labels: from.clone(),
-            to_labels: to.clone(),
+    for label in pending_labels {
+        changes.push(SchemaChange::AddLabel {
+            name: label.name.clone(),
+            description: label.description.clone(),
         });
     }
 
-    for (label_or_type, prop_name, data_type, nullable) in pending_properties {
+    for et in pending_edge_types {
+        changes.push(SchemaChange::AddEdgeType {
+            name: et.name.clone(),
+            from_labels: et.from.clone(),
+            to_labels: et.to.clone(),
+            description: et.description.clone(),
+        });
+    }
+
+    for prop in pending_properties {
         changes.push(SchemaChange::AddProperty {
-            label_or_type: label_or_type.clone(),
-            name: prop_name.clone(),
-            data_type: data_type.clone(),
-            nullable: *nullable,
+            label_or_type: prop.label_or_type.clone(),
+            name: prop.name.clone(),
+            data_type: prop.data_type.clone(),
+            nullable: prop.nullable,
+            description: prop.description.clone(),
         });
     }
 

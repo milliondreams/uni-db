@@ -782,6 +782,7 @@ impl Database {
                     data_type: p.data_type,
                     nullable: p.nullable,
                     is_indexed: p.is_indexed,
+                    description: p.description,
                 })
                 .collect(),
             indexes: i
@@ -804,6 +805,7 @@ impl Database {
                     enabled: c.enabled,
                 })
                 .collect(),
+            description: i.description,
         }))
     }
 
@@ -826,6 +828,7 @@ impl Database {
                     data_type: p.data_type,
                     nullable: p.nullable,
                     is_indexed: p.is_indexed,
+                    description: p.description,
                 })
                 .collect(),
             indexes: i
@@ -848,6 +851,7 @@ impl Database {
                     enabled: c.enabled,
                 })
                 .collect(),
+            description: i.description,
         }))
     }
 

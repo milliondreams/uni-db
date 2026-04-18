@@ -29,6 +29,7 @@ fn create_test_schema_with_partial_props() -> Schema {
             id: 1,
             created_at: Utc::now(),
             state: SchemaElementState::Active,
+            description: None,
         },
     );
 
@@ -42,6 +43,7 @@ fn create_test_schema_with_partial_props() -> Schema {
             added_in: 1,
             state: SchemaElementState::Active,
             generation_expression: None,
+            description: None,
         },
     );
     person_props.insert(
@@ -52,6 +54,7 @@ fn create_test_schema_with_partial_props() -> Schema {
             added_in: 1,
             state: SchemaElementState::Active,
             generation_expression: None,
+            description: None,
         },
     );
     schema.properties.insert("Person".to_string(), person_props);
@@ -255,6 +258,7 @@ mod delta_tests {
                 id: 1,
                 created_at: Utc::now(),
                 state: SchemaElementState::Active,
+                description: None,
             },
         );
 
@@ -266,6 +270,7 @@ mod delta_tests {
                 src_labels: vec!["Person".to_string()],
                 dst_labels: vec!["Person".to_string()],
                 state: SchemaElementState::Active,
+                description: None,
             },
         );
 
@@ -279,6 +284,7 @@ mod delta_tests {
                 added_in: 1,
                 state: SchemaElementState::Active,
                 generation_expression: None,
+                description: None,
             },
         );
         schema.properties.insert("KNOWS".to_string(), knows_props);

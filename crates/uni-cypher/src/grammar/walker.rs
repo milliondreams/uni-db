@@ -2209,10 +2209,17 @@ fn build_create_label(pair: Pair<Rule>) -> Result<SchemaCommand, ParseError> {
     let prop_defs = inner.next().unwrap();
     let properties = build_property_definitions(prop_defs)?;
 
+    let description = if inner.peek().map(|p| p.as_rule()) == Some(Rule::description_clause) {
+        Some(build_description_clause(inner.next().unwrap())?)
+    } else {
+        None
+    };
+
     Ok(SchemaCommand::CreateLabel(CreateLabel {
         name,
         properties,
         if_not_exists,
+        description,
     }))
 }
 
@@ -2239,12 +2246,19 @@ fn build_create_edge_type(pair: Pair<Rule>) -> Result<SchemaCommand, ParseError>
     inner.next(); // TO
     let dst_label = normalize_identifier(inner.next().unwrap().as_str());
 
+    let description = if inner.peek().map(|p| p.as_rule()) == Some(Rule::description_clause) {
+        Some(build_description_clause(inner.next().unwrap())?)
+    } else {
+        None
+    };
+
     Ok(SchemaCommand::CreateEdgeType(CreateEdgeType {
         name,
         src_labels: vec![src_label],
         dst_labels: vec![dst_label],
         properties,
         if_not_exists,
+        description,
     }))
 }
 
@@ -2272,7 +2286,7 @@ fn build_alter_edge_type(pair: Pair<Rule>) -> Result<SchemaCommand, ParseError> 
 }
 
 fn build_alter_action(pair: Pair<Rule>) -> Result<AlterAction, ParseError> {
-    let mut inner = pair.into_inner();
+    let mut inner = pair.into_inner().peekable();
     let first = inner.next().unwrap();
 
     match first.as_rule() {
@@ -2284,9 +2298,26 @@ fn build_alter_action(pair: Pair<Rule>) -> Result<AlterAction, ParseError> {
             )?))
         }
         Rule::DROP_KW => {
-            inner.next(); // PROPERTY
-            let name = inner.next().unwrap().as_str().to_string();
-            Ok(AlterAction::DropProperty(name))
+            let second = inner.next().unwrap();
+            match second.as_rule() {
+                Rule::PROPERTY => {
+                    let name = inner.next().unwrap().as_str().to_string();
+                    // Check if followed by DESCRIPTION_KW (drop property description)
+                    if inner.peek().map(|p| p.as_rule()) == Some(Rule::DESCRIPTION_KW) {
+                        inner.next(); // consume DESCRIPTION_KW
+                        Ok(AlterAction::SetPropertyDescription {
+                            property: name,
+                            description: None,
+                        })
+                    } else {
+                        Ok(AlterAction::DropProperty(name))
+                    }
+                }
+                Rule::DESCRIPTION_KW => {
+                    Ok(AlterAction::SetDescription(None))
+                }
+                _ => unreachable!(),
+            }
         }
         Rule::RENAME => {
             inner.next(); // PROPERTY
@@ -2294,6 +2325,27 @@ fn build_alter_action(pair: Pair<Rule>) -> Result<AlterAction, ParseError> {
             inner.next(); // TO
             let new_name = inner.next().unwrap().as_str().to_string();
             Ok(AlterAction::RenameProperty { old_name, new_name })
+        }
+        Rule::SET => {
+            let second = inner.next().unwrap();
+            match second.as_rule() {
+                Rule::PROPERTY => {
+                    let name = inner.next().unwrap().as_str().to_string();
+                    inner.next(); // DESCRIPTION_KW
+                    let string_pair = inner.next().unwrap();
+                    let desc = build_string_literal(string_pair)?;
+                    Ok(AlterAction::SetPropertyDescription {
+                        property: name,
+                        description: Some(desc),
+                    })
+                }
+                Rule::DESCRIPTION_KW => {
+                    let string_pair = inner.next().unwrap();
+                    let desc = build_string_literal(string_pair)?;
+                    Ok(AlterAction::SetDescription(Some(desc)))
+                }
+                _ => unreachable!(),
+            }
         }
         _ => unreachable!(),
     }
@@ -2461,6 +2513,7 @@ fn build_property_definition(pair: Pair<Rule>) -> Result<PropertyDefinition, Par
     let mut nullable = true;
     let mut unique = false;
     let mut default = None;
+    let mut description = None;
 
     for p in inner {
         match p.as_rule() {
@@ -2474,6 +2527,9 @@ fn build_property_definition(pair: Pair<Rule>) -> Result<PropertyDefinition, Par
             Rule::default_value => {
                 default = Some(build_expression(p.into_inner().nth(1).unwrap())?);
             }
+            Rule::description_clause => {
+                description = Some(build_description_clause(p)?);
+            }
             _ => {}
         }
     }
@@ -2484,6 +2540,7 @@ fn build_property_definition(pair: Pair<Rule>) -> Result<PropertyDefinition, Par
         nullable,
         unique,
         default,
+        description,
     })
 }
 
@@ -2524,6 +2581,14 @@ fn build_map_options(pair: Pair<Rule>) -> Result<HashMap<String, Value>, ParseEr
         .into_iter()
         .map(|(key, expr)| Ok((key, expr_to_value(expr)?)))
         .collect()
+}
+
+fn build_description_clause(pair: Pair<Rule>) -> Result<String, ParseError> {
+    let s = pair
+        .into_inner()
+        .find(|p| p.as_rule() == Rule::string)
+        .unwrap();
+    build_string_literal(s)
 }
 
 pub(crate) fn build_string_literal(pair: Pair<Rule>) -> Result<String, ParseError> {

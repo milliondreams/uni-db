@@ -1,17 +1,19 @@
 # TCK Compliance Report
 
-**Generated:** 2026-04-09 14:04:47
-**Results:** `results_20260409_140447.json`
-**Compared to:** `results_20260409_014315.json`
+**Generated:** 2026-04-17 20:06:10
+**Results:** `results_20260417_200610.json`
+**Compared to:** `results_20260409_140447.json`
 
 ## Summary
 
 | Metric | Current | Previous | Delta |
 |--------|---------|----------|-------|
-| Scenarios | 3897 | 3897 |  |
-| Passed | 3896 | 3896 |  |
+| Scenarios | 3926 | 3897 | +29 |
+| Passed | 3925 | 3896 | +29 |
 | Failed | 0 | 0 |  |
-| Pass Rate | 100.0% | 100.0% | ➡️ +0.0pp |
+| Pass Rate | 100.0% | 100.0% | 📈 +0.0pp |
+
+**🆕 New:** 29 scenarios added
 
 ## Feature Breakdown
 
@@ -28,6 +30,7 @@
 | ✅ Boolean3 | 30 | 30 | 0 | 100% |  |
 | ✅ Boolean4 | 52 | 52 | 0 | 100% |  |
 | ✅ Boolean5 | 8 | 8 | 0 | 100% |  |
+| ✅ Btic1 | 29 | 29 | 0 | 100% | 🆕 |
 | ✅ Call1 | 16 | 16 | 0 | 100% |  |
 | ✅ Call2 | 6 | 6 | 0 | 100% |  |
 | ✅ Call3 | 6 | 6 | 0 | 100% |  |

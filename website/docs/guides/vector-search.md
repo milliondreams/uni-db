@@ -204,9 +204,9 @@ OPTIONS {
 }
 ```
 
-### Operator Form (`~=`) with Scores
+### Operator Form (`~=`)
 
-You can also use the `~=` operator to run a vector search and get a similarity score:
+The `~=` (approximate equality) operator is shorthand for a **top-K vector index scan**. It desugars to `uni.vector.query` under the hood:
 
 ```cypher
 MATCH (p:Paper)
@@ -215,6 +215,11 @@ RETURN p.title, p._score AS score
 ORDER BY score DESC
 LIMIT 10
 ```
+
+`~=` is **vector-only** — it cannot do FTS or hybrid search. For hybrid, use `similar_to()` with multi-source arrays (see [below](#similar_to-expression-function)).
+
+!!! note "`=~` is regex, `~=` is vector similarity"
+    These are unrelated operators that look similar. `n.name =~ '(?i)john'` is a regex match. `n.embedding ~= $vec` is a vector similarity scan.
 
 ### With Distance Threshold
 
@@ -431,6 +436,36 @@ RETURN d.title, similar_to([d.embedding, d.content], 'query',
   {method: 'weighted', weights: [0.7, 0.3]}) AS score
 ORDER BY score DESC
 ```
+
+### Correct vs Incorrect Hybrid
+
+Always use a **single** `similar_to` call with multi-source arrays:
+
+```cypher
+// ✅ CORRECT: single call with fusion and BM25 normalization
+MATCH (d:Document)
+RETURN d.title,
+  similar_to([d.embedding, d.content], [$qvec, $qtxt]) AS score
+ORDER BY score DESC
+
+// ❌ INCORRECT: naive addition mixes incompatible score scales
+MATCH (d:Document)
+RETURN d.title,
+  (similar_to(d.embedding, $qvec) + similar_to(d.content, $qtxt)) AS score
+ORDER BY score DESC
+```
+
+Adding two separate `similar_to` calls produces raw score addition without normalization — cosine similarity ([0, 1]) and BM25 (unbounded) live on different scales. The multi-source form normalizes BM25 via `score / (score + fts_k)` before fusion.
+
+### `~=` Operator vs `similar_to()`
+
+| Syntax | Operation | Capabilities |
+|---|---|---|
+| `n.embedding ~= $q` | Top-K index scan (desugars to `uni.vector.query`) | Vector only |
+| `similar_to(n.embedding, $q)` | Per-row scoring on bound nodes | Vector, Auto-Embed, FTS |
+| `similar_to([sources], [queries])` | Multi-source hybrid fusion | Vector + FTS with RRF/weighted |
+
+Use `~=` to **find** candidates; use `similar_to()` to **score** or **fuse** on bound nodes.
 
 ### Procedures vs `similar_to`
 

@@ -1845,7 +1845,8 @@ MATCH (n:Person) RETURN n.name UNION ALL MATCH (n:Company) RETURN n.name
 | **Comparison** | `=`, `<>`, `<`, `<=`, `>`, `>=` |
 | **Logical** | `AND`, `OR`, `XOR`, `NOT` |
 | **String** | `CONTAINS`, `STARTS WITH`, `ENDS WITH`, `=~` (regex) |
-| **Membership** | `IN`, `~=` (approximate) |
+| **Membership** | `IN` |
+| **Similarity** | `~=` (vector similarity — desugars to `uni.vector.query` top-K scan) |
 | **Null** | `IS NULL`, `IS NOT NULL` |
 
 ### CASE Expression
@@ -2219,13 +2220,27 @@ similar_to(source, query [, options]) → Float
 
 Unlike the `uni.vector.query` / `uni.fts.query` / `uni.search` procedures which are standalone scan operators, `similar_to()` is a **per-row expression** evaluated inline within any `MATCH` query. It supports three scoring modes that are auto-detected from argument types:
 
+### `~=` Operator vs `similar_to()` Function
+
+Uni provides two syntaxes for similarity search. They serve **different purposes**:
+
+| Syntax | What It Does | Best For |
+|---|---|---|
+| `n.embedding ~= $query` | **Top-K index scan** — desugars to `uni.vector.query` procedure, returns nearest neighbors from the vector index | "Find the 10 most similar documents from millions" |
+| `similar_to(n.embedding, $q)` | **Per-row scoring** — evaluates inline within `MATCH`, scores each already-bound node | "Score this matched node's similarity" |
+| `similar_to([sources], [queries])` | **Hybrid fusion** — combines vector + FTS scores via RRF or weighted fusion in a single expression | "Rank by combined semantic + keyword relevance" |
+
+The `~=` operator is **vector-only** and cannot do FTS or hybrid search. For hybrid search, use `similar_to()` with multi-source arrays.
+
+> **Common confusion:** `=~` is regex match (`n.name =~ '(?i)john'`), `~=` is vector similarity. They are unrelated operators.
+
 ### Scoring Modes
 
 | Source Type | Query Type | Mode | Behavior |
 |---|---|---|---|
-| Vector property | Vector literal | **Cosine** | Cosine similarity per row |
-| Vector property (with embedding config) | String literal | **AutoEmbed** | Auto-embeds query string once, cosine per row |
-| String property (with FTS index) | String literal | **FTS** | BM25 full-text search, VID lookup per row |
+| Vector property | Vector literal | **Vector** | Metric-aware similarity per row (cosine, L2, or dot — resolved from vector index) |
+| Vector property (with embedding config) | String literal | **AutoEmbed** | Auto-embeds query string once, then metric-aware similarity per row |
+| String property (with FTS index) | String literal | **FTS** | BM25 full-text search, normalized via `score / (score + fts_k)` saturation to [0, 1] |
 
 ### Single-Source Examples
 
@@ -2272,6 +2287,27 @@ RETURN d.title,
   ) AS score
 ORDER BY score DESC
 ```
+
+### Correct vs Incorrect Hybrid Search
+
+**Correct — single `similar_to` with multi-source arrays and fusion:**
+```cypher
+MATCH (d:Doc)
+RETURN d.title,
+  similar_to([d.embedding, d.content], [$qvec, $qtxt]) AS score
+ORDER BY score DESC
+```
+This uses RRF fusion by default, with proper BM25 score normalization (saturation to [0, 1]).
+
+**Incorrect — naive addition of two separate calls:**
+```cypher
+-- DON'T DO THIS: scores are on different scales, no normalization
+MATCH (d:Doc)
+RETURN d.title,
+  (similar_to(d.embedding, $qvec) + similar_to(d.content, $qtxt)) AS score
+ORDER BY score DESC
+```
+Adding raw scores mixes incompatible scales (cosine similarity [0, 1] vs unbounded BM25). The multi-source form normalizes BM25 via `score / (score + fts_k)` before fusion.
 
 ### Options Map
 

@@ -647,8 +647,9 @@ async fn fts_search_batch(
     fts_k: f32,
 ) -> datafusion::error::Result<HashMap<Vid, f32>> {
     let storage = graph_ctx.storage();
+    let query_ctx = graph_ctx.query_context();
     let results = storage
-        .fts_search(label, property, query_text, 1000, None, None)
+        .fts_search(label, property, query_text, 1000, None, Some(&query_ctx))
         .await
         .map_err(|e| {
             datafusion::error::DataFusionError::Execution(format!(

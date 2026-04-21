@@ -70,6 +70,7 @@ pub mod mutation_set;
 pub mod nfa;
 pub mod optional_filter;
 pub mod pattern_comprehension;
+pub mod pattern_exists;
 pub mod pred_dag;
 pub mod procedure_call;
 pub mod quantifier;

@@ -408,7 +408,7 @@ SKIP 10 LIMIT 20
 
 5. **VID vs UniId vs ext_id** -- VID is internal (u64 auto-increment), UniId is content-hash (SHA3-256), ext_id is user-supplied string. Use `ext_id` for MERGE and user-facing lookups.
 
-6. **Schema-first for columnar performance** -- Define labels and properties via `db.schema()` before bulk loading. Without schema, properties go to JSONB overflow and lose columnar benefits.
+6. **Schema-first for columnar performance** -- Define labels and properties via `db.schema()` before bulk loading. Without schema, properties go to JSONB overflow and lose columnar benefits. Use `strict_schema: true` in `UniConfig` to reject writes with undeclared labels/edge types.
 
 7. **DETACH DELETE required when node has edges** -- `DELETE` alone fails if the node has any edges. Use `DETACH DELETE` to remove edges first.
 

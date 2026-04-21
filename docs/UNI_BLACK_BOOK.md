@@ -877,7 +877,7 @@ Use multi-labels when an entity naturally belongs to multiple categories. Avoid 
 | **Missing indexes** | Full table scans on filtered properties | Index every property used in WHERE clauses |
 | **Strings for numbers** | Can't do range queries or aggregations | Use Int64/Float64 for numeric data |
 | **Large blobs as properties** | Bloats Lance tables, slows scans | Store blobs externally, keep references |
-| **Schemaless everything** | Properties in overflow JSONB lose columnar benefits | Define schema for frequently-queried properties |
+| **Schemaless everything** | Properties in overflow JSONB lose columnar benefits | Define schema for frequently-queried properties; use `strict_schema: true` to enforce |
 
 ---
 
@@ -4384,6 +4384,21 @@ graph TB
 | `max_compaction_rows` | `usize` | 5,000,000 | OOM guard for in-memory compaction |
 | `enable_vid_labels_index` | `bool` | `true` | O(1) VID→labels lookups |
 | `max_recursive_cte_iterations` | `usize` | 1,000 | Maximum iterations for recursive CTE evaluation |
+| `strict_schema` | `bool` | `false` | Reject writes referencing undeclared labels or edge types |
+
+### strict_schema
+
+When enabled, CREATE and MERGE operations that reference a label or edge type not declared in the schema are rejected with an error. This enforces schema-first discipline and catches typos at write time. Properties are not affected — unknown properties still go to overflow.
+
+```rust
+let config = UniConfig { strict_schema: true, ..UniConfig::default() };
+let db = Uni::in_memory().config(config).build().await?;
+
+// This will fail:
+tx.execute("CREATE (:Animl {name: 'Cat'})").await; // → Error: Label 'Animl' is not defined
+```
+
+Python: `UniBuilder.in_memory().strict_schema(True).build()` or `.config({"strict_schema": True})`.
 
 ### Flush Settings
 

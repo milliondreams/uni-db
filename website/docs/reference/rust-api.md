@@ -142,7 +142,7 @@ let db = Uni::open("./my-graph")
 | Method | Description |
 |--------|-------------|
 | `schema_file(path)` | Load schema from JSON file on initialization. |
-| `config(config)` | Set `UniConfig` options. |
+| `config(config)` | Set `UniConfig` options (includes `strict_schema`, timeouts, cache, etc.). |
 | `read_only()` | Open in read-only mode (no writer created). |
 | `write_lease(lease)` | Set write lease strategy for multi-agent access. |
 | `xervo_catalog(catalog)` | Set Uni-Xervo model catalog. |

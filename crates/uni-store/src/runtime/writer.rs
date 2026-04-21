@@ -1333,9 +1333,15 @@ impl Writer {
             // Populate constraint index for O(1) duplicate detection
             let schema = self.schema_manager.schema();
             for label in &labels_copy {
-                // Skip unknown labels (schemaless support)
                 if schema.get_label_case_insensitive(label).is_none() {
-                    continue;
+                    if self.config.strict_schema {
+                        return Err(anyhow::anyhow!(
+                            "Label '{}' is not defined in the schema \
+                             (strict_schema is enabled).",
+                            label
+                        ));
+                    }
+                    continue; // Schemaless: skip unknown labels.
                 }
 
                 // For each unique constraint on this label, insert into constraint index

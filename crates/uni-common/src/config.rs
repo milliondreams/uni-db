@@ -461,6 +461,11 @@ pub struct UniConfig {
 
     /// Background index rebuild configuration
     pub index_rebuild: IndexRebuildConfig,
+
+    /// When true, reject writes that reference labels or edge types not declared
+    /// in the schema. Default: false (schemaless mode — any label or edge type
+    /// is accepted and dynamically registered).
+    pub strict_schema: bool,
 }
 
 impl Default for UniConfig {
@@ -489,6 +494,7 @@ impl Default for UniConfig {
             max_recursive_cte_iterations: 1000,
             object_store: ObjectStoreConfig::default(),
             index_rebuild: IndexRebuildConfig::default(),
+            strict_schema: false,
         }
     }
 }

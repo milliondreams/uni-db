@@ -355,12 +355,25 @@ impl Executor {
         match type_val {
             Value::Int(i) => Ok(*i as u32),
             Value::String(name) => {
-                // Use get_or_assign to support schemaless edge types
-                // (will create new ID if not found in schema or registry)
-                Ok(self
-                    .storage
-                    .schema_manager()
-                    .get_or_assign_edge_type_id(name))
+                if self.config.strict_schema {
+                    let schema = self.storage.schema_manager().schema();
+                    schema
+                        .edge_type_id_by_name_case_insensitive(name)
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "Edge type '{}' is not defined in the schema \
+                                 (strict_schema is enabled). \
+                                 Declare it with db.schema().edge_type(...).apply() first.",
+                                name
+                            )
+                        })
+                } else {
+                    // Schemaless: assign new ID if not found in schema or registry.
+                    Ok(self
+                        .storage
+                        .schema_manager()
+                        .get_or_assign_edge_type_id(name))
+                }
             }
             _ => Err(anyhow!(
                 "Invalid _type value: expected Int or String, got {:?}",
@@ -1481,8 +1494,21 @@ impl Executor {
                                 }
                             }
 
-                            // Support unlabeled nodes and unknown labels (schemaless)
                             let schema = self.storage.schema_manager().schema();
+
+                            // Strict schema: reject undeclared labels.
+                            if self.config.strict_schema {
+                                for label_name in &n.labels {
+                                    if schema.get_label_case_insensitive(label_name).is_none() {
+                                        return Err(anyhow!(
+                                            "Label '{}' is not defined in the schema \
+                                             (strict_schema is enabled). \
+                                             Declare it with db.schema().label(...).apply() first.",
+                                            label_name
+                                        ));
+                                    }
+                                }
+                            }
 
                             // VID generation is label-independent
                             let new_vid = writer.next_vid().await?;
@@ -1602,11 +1628,24 @@ impl Executor {
                             ));
                         }
                         let type_name = &r.types[0];
-                        // Get or assign edge type ID (schemaless types get bit 31 = 1)
-                        let type_id = self
-                            .storage
-                            .schema_manager()
-                            .get_or_assign_edge_type_id(type_name);
+                        let type_id = if self.config.strict_schema {
+                            let schema = self.storage.schema_manager().schema();
+                            schema
+                                .edge_type_id_by_name_case_insensitive(type_name)
+                                .ok_or_else(|| {
+                                    anyhow!(
+                                        "Edge type '{}' is not defined in the schema \
+                                         (strict_schema is enabled). \
+                                         Declare it with db.schema().edge_type(...).apply() first.",
+                                        type_name
+                                    )
+                                })?
+                        } else {
+                            // Schemaless: get or assign edge type ID (bit 31 = 1 for dynamic).
+                            self.storage
+                                .schema_manager()
+                                .get_or_assign_edge_type_id(type_name)
+                        };
 
                         rel_pending = Some((
                             r.variable.clone().unwrap_or_default(),
@@ -2527,12 +2566,25 @@ impl Executor {
                             } else {
                                 let label_name = &n.labels[0];
                                 let schema = self.storage.schema_manager().schema();
-                                // Fall back to label_id 0 (any/schemaless) when the label is not
-                                // in the schema — this allows MERGE to work in schemaless mode.
-                                schema
-                                    .get_label_case_insensitive(label_name)
-                                    .map(|m| m.id)
-                                    .unwrap_or(0)
+                                if self.config.strict_schema {
+                                    schema
+                                        .get_label_case_insensitive(label_name)
+                                        .map(|m| m.id)
+                                        .ok_or_else(|| {
+                                            anyhow!(
+                                                "Label '{}' is not defined in the schema \
+                                                 (strict_schema is enabled). \
+                                                 Declare it with db.schema().label(...).apply() first.",
+                                                label_name
+                                            )
+                                        })?
+                                } else {
+                                    // Fall back to label_id 0 (any/schemaless) when not in schema.
+                                    schema
+                                        .get_label_case_insensitive(label_name)
+                                        .map(|m| m.id)
+                                        .unwrap_or(0)
+                                }
                             };
 
                             let resolved_props = self
@@ -2595,12 +2647,22 @@ impl Executor {
                                         ));
                                     } else {
                                         let type_name = &r.types[0];
-                                        // Use get_or_assign so schemaless edge types work without
-                                        // a prior schema declaration (same approach as CREATE).
-                                        let type_id = self
-                                            .storage
-                                            .schema_manager()
-                                            .get_or_assign_edge_type_id(type_name);
+                                        let type_id = if self.config.strict_schema {
+                                            let s = self.storage.schema_manager().schema();
+                                            s.edge_type_id_by_name_case_insensitive(type_name)
+                                                .ok_or_else(|| {
+                                                    anyhow!(
+                                                        "Edge type '{}' is not defined in the schema \
+                                                         (strict_schema is enabled).",
+                                                        type_name
+                                                    )
+                                                })?
+                                        } else {
+                                            // Schemaless: assign new ID if not found.
+                                            self.storage
+                                                .schema_manager()
+                                                .get_or_assign_edge_type_id(type_name)
+                                        };
                                         edge_type_ids.push(type_id);
                                     }
 

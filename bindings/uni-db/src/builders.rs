@@ -202,6 +202,17 @@ impl DatabaseBuilder {
         slf
     }
 
+    /// Enforce strict schema mode (default false).
+    ///
+    /// When enabled, writes that reference labels or edge types not declared
+    /// in the schema are rejected with an error.
+    fn strict_schema(mut slf: PyRefMut<'_, Self>, enabled: bool) -> PyRefMut<'_, Self> {
+        slf.uni_config
+            .get_or_insert_with(uni_common::UniConfig::default)
+            .strict_schema = enabled;
+        slf
+    }
+
     /// Open the database in read-only mode (no writes allowed).
     fn read_only(mut slf: PyRefMut<'_, Self>) -> PyRefMut<'_, Self> {
         slf.read_only = true;

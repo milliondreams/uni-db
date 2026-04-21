@@ -11053,6 +11053,7 @@ dependencies = [
  "candle-core",
  "candle-nn",
  "candle-transformers",
+ "dashmap",
  "fastembed",
  "hf-hub 0.5.0",
  "image",

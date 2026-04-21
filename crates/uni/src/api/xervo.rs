@@ -10,6 +10,8 @@ pub use uni_xervo::traits::{
     AudioOutput, ContentBlock, GeneratedImage, GenerationOptions, GenerationResult, ImageInput,
     Message, MessageRole, TokenUsage,
 };
+#[cfg(feature = "provider-onnx")]
+pub use uni_xervo::traits::{OnnxRunner, TensorBatch, TensorSpec, TensorValue};
 
 fn into_uni_error<E: std::fmt::Display>(err: E) -> UniError {
     UniError::Internal(anyhow::anyhow!(err.to_string()))
@@ -70,6 +72,22 @@ impl UniXervo {
     ) -> Result<GenerationResult> {
         let structured: Vec<Message> = messages.iter().map(|s| Message::user(*s)).collect();
         self.generate(alias, &structured, options).await
+    }
+
+    /// Obtain an [`OnnxRunner`] for the given model alias.
+    ///
+    /// The runner provides tensor-in/tensor-out ONNX inference via the
+    /// [`LocalOnnxProvider`](uni_xervo::provider::LocalOnnxProvider).
+    /// Models are downloaded from HuggingFace and cached on first use.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UniError`] if the runtime is not configured or the alias
+    /// is not registered in the catalog.
+    #[cfg(feature = "provider-onnx")]
+    pub async fn onnx_runner(&self, alias: &str) -> Result<Arc<dyn uni_xervo::traits::OnnxRunner>> {
+        let runtime = self.runtime.as_ref().ok_or_else(not_configured)?;
+        runtime.onnx_runner(alias).await.map_err(into_uni_error)
     }
 
     /// Access the underlying Uni-Xervo runtime, if configured.

@@ -1,19 +1,19 @@
 # TCK Compliance Report
 
-**Generated:** 2026-04-17 20:06:10
-**Results:** `results_20260417_200610.json`
-**Compared to:** `results_20260409_140447.json`
+**Generated:** 2026-04-20 21:47:20
+**Results:** `results_20260420_214720.json`
+**Compared to:** `results_20260420_202510.json`
 
 ## Summary
 
 | Metric | Current | Previous | Delta |
 |--------|---------|----------|-------|
-| Scenarios | 3926 | 3897 | +29 |
-| Passed | 3925 | 3896 | +29 |
-| Failed | 0 | 0 |  |
-| Pass Rate | 100.0% | 100.0% | 📈 +0.0pp |
+| Scenarios | 3926 | 3926 |  |
+| Passed | 3925 | 3924 | +1 |
+| Failed | 0 | 1 | -1 |
+| Pass Rate | 100.0% | 99.9% | 📈 +0.0pp |
 
-**🆕 New:** 29 scenarios added
+**🟢 Fixed:** 1 scenarios now passing
 
 ## Feature Breakdown
 
@@ -30,7 +30,7 @@
 | ✅ Boolean3 | 30 | 30 | 0 | 100% |  |
 | ✅ Boolean4 | 52 | 52 | 0 | 100% |  |
 | ✅ Boolean5 | 8 | 8 | 0 | 100% |  |
-| ✅ Btic1 | 29 | 29 | 0 | 100% | 🆕 |
+| ✅ Btic1 | 29 | 29 | 0 | 100% |  |
 | ✅ Call1 | 16 | 16 | 0 | 100% |  |
 | ✅ Call2 | 6 | 6 | 0 | 100% |  |
 | ✅ Call3 | 6 | 6 | 0 | 100% |  |
@@ -58,7 +58,7 @@
 | ✅ Delete6 | 14 | 14 | 0 | 100% |  |
 | ✅ ExistentialSubquery1 | 4 | 4 | 0 | 100% |  |
 | ✅ ExistentialSubquery2 | 3 | 3 | 0 | 100% |  |
-| ✅ ExistentialSubquery3 | 3 | 3 | 0 | 100% |  |
+| ✅ ExistentialSubquery3 | 3 | 3 | 0 | 100% | +33pp |
 | ✅ Graph3 | 9 | 9 | 0 | 100% |  |
 | ✅ Graph4 | 11 | 11 | 0 | 100% |  |
 | ✅ Graph5 | 9 | 9 | 0 | 100% |  |
@@ -212,6 +212,12 @@
 | ✅ WithWhere5 | 4 | 4 | 0 | 100% |  |
 | ✅ WithWhere6 | 1 | 1 | 0 | 100% |  |
 | ✅ WithWhere7 | 3 | 3 | 0 | 100% |  |
+
+## 🟢 Newly Passing
+
+Scenarios that were failing but are now passing:
+
+- **ExistentialSubquery3** — [3] Nested full existential subquery with pattern predicate (line 79)
 
 ## Failed Scenarios
 

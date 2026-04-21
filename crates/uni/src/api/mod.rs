@@ -1333,6 +1333,11 @@ impl UniBuilder {
                 runtime_builder = runtime_builder
                     .register_provider(uni_xervo::provider::LocalMistralRsProvider::new());
             }
+            #[cfg(feature = "provider-onnx")]
+            {
+                runtime_builder = runtime_builder
+                    .register_provider(uni_xervo::provider::LocalOnnxProvider::new());
+            }
 
             Some(
                 runtime_builder

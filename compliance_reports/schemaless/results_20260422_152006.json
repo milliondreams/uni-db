@@ -22516,8 +22516,7 @@
             "keyword": "Scenario ",
             "name": "[3] Nested full existential subquery with pattern predicate",
             "result": {
-              "status": "failed",
-              "error_message": "Step failed:\n      Defined: tck/features/expressions/existentialSubqueries/ExistentialSubquery3.feature:97:5\n      Matched: crates/uni-tck/src/steps/then.rs:20:1\n      Step panicked. Captured output: Result mismatch (any order): Row count mismatch: expected 1, got 4\n[Summary]\n1 feature\n1 scenario (1 failed)\n4 steps (3 passed, 1 failed)\n"
+              "status": "passed"
             }
           }
         ]

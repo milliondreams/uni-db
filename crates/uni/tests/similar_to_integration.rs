@@ -1095,6 +1095,8 @@ mod auto_embed_tests {
                         alias: "embed/default".to_string(),
                         source_properties: vec!["title".to_string(), "body".to_string()],
                         batch_size: 32,
+                        document_prefix: None,
+                        query_prefix: None,
                     }),
                 }),
             )
@@ -1179,6 +1181,8 @@ mod auto_embed_tests {
                         alias: "embed/default".to_string(),
                         source_properties: vec!["title".to_string(), "body".to_string()],
                         batch_size: 32,
+                        document_prefix: None,
+                        query_prefix: None,
                     }),
                 }),
             )

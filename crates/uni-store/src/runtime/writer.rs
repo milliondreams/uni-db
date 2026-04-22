@@ -1857,6 +1857,10 @@ impl Writer {
 
                     if !inputs.is_empty() {
                         let input_text = inputs.join(" ");
+                        let input_text = match &emb_config.document_prefix {
+                            Some(prefix) => format!("{prefix}{input_text}"),
+                            None => input_text,
+                        };
                         input_texts.push(input_text);
                         needs_embedding.push(idx);
                     }
@@ -1932,7 +1936,11 @@ impl Writer {
                     continue;
                 }
 
-                let input_text = inputs.join(" "); // Simple concatenation
+                let input_text = inputs.join(" ");
+                let input_text = match &emb_config.document_prefix {
+                    Some(prefix) => format!("{prefix}{input_text}"),
+                    None => input_text,
+                };
 
                 let runtime = self.xervo_runtime.as_ref().ok_or_else(|| {
                     anyhow!("Uni-Xervo runtime not configured for auto-embedding")

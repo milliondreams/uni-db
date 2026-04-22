@@ -500,6 +500,12 @@ pub struct EmbeddingCfg {
     pub alias: String,
     pub source_properties: Vec<String>,
     pub batch_size: usize,
+    /// Prefix prepended to text before embedding during auto-embed (document side).
+    /// Example: `"search_document: "` for Nomic models. Include any trailing space.
+    pub document_prefix: Option<String>,
+    /// Prefix prepended to text before embedding during query-time embed calls.
+    /// Example: `"search_query: "` for Nomic models. Include any trailing space.
+    pub query_prefix: Option<String>,
 }
 
 impl EmbeddingCfg {
@@ -508,6 +514,8 @@ impl EmbeddingCfg {
             alias: self.alias,
             source_properties: self.source_properties,
             batch_size: self.batch_size,
+            document_prefix: self.document_prefix,
+            query_prefix: self.query_prefix,
         }
     }
 }

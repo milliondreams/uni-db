@@ -51,6 +51,8 @@ mod tests {
                         alias: "embed/default".to_string(),
                         source_properties: vec!["content".to_string()],
                         batch_size: 32,
+                        document_prefix: None,
+                        query_prefix: None,
                     }),
                 }),
             )
@@ -62,8 +64,7 @@ mod tests {
 
     fn report(latencies: &[u64]) {
         let first_50_avg = latencies[1..50].iter().sum::<u64>() / 49; // skip cold start
-        let last_50_avg =
-            latencies[150..].iter().sum::<u64>() / (latencies.len() - 150) as u64;
+        let last_50_avg = latencies[150..].iter().sum::<u64>() / (latencies.len() - 150) as u64;
         let ratio = last_50_avg as f64 / first_50_avg.max(1) as f64;
 
         eprintln!("---");
@@ -110,10 +111,10 @@ mod tests {
 
         report(&latencies);
 
-        let ratio =
-            latencies[150..].iter().sum::<u64>() as f64 / latencies[1..50].iter().sum::<u64>().max(1) as f64
-                * 49.0
-                / (latencies.len() - 150) as f64;
+        let ratio = latencies[150..].iter().sum::<u64>() as f64
+            / latencies[1..50].iter().sum::<u64>().max(1) as f64
+            * 49.0
+            / (latencies.len() - 150) as f64;
         if ratio > 5.0 {
             eprintln!("*** REPRODUCED: {:.1}x slowdown detected ***", ratio);
         } else {
@@ -165,8 +166,7 @@ mod tests {
         report(&latencies);
 
         let first_50_avg = latencies[1..50].iter().sum::<u64>() / 49;
-        let last_50_avg =
-            latencies[150..].iter().sum::<u64>() / (latencies.len() - 150) as u64;
+        let last_50_avg = latencies[150..].iter().sum::<u64>() / (latencies.len() - 150) as u64;
         let ratio = last_50_avg as f64 / first_50_avg.max(1) as f64;
         if ratio > 5.0 {
             eprintln!("*** JUMP STILL PRESENT without flush → NOT flush related ***");
@@ -218,8 +218,7 @@ mod tests {
             let elapsed = start.elapsed();
             latencies.push(elapsed.as_millis() as u64);
 
-            if i % 20 == 0 || (i >= 48 && i <= 55) || (i >= 140 && i <= 170)
-                || i == NUM_INSERTS - 1
+            if i % 20 == 0 || (i >= 48 && i <= 55) || (i >= 140 && i <= 170) || i == NUM_INSERTS - 1
             {
                 eprintln!("insert {:>4}: {:>6}ms", i, elapsed.as_millis());
             }
@@ -227,8 +226,7 @@ mod tests {
 
         let pre_flush_avg = latencies[1..50].iter().sum::<u64>() / 49;
         let post_flush_avg = latencies[51..100].iter().sum::<u64>() / 49;
-        let late_avg =
-            latencies[150..].iter().sum::<u64>() / (latencies.len() - 150) as u64;
+        let late_avg = latencies[150..].iter().sum::<u64>() / (latencies.len() - 150) as u64;
 
         eprintln!("---");
         eprintln!("Pre-flush avg (1-49):    {}ms", pre_flush_avg);
@@ -296,8 +294,8 @@ mod tests {
     #[ignore]
     async fn issue43_forced_early_flush() -> Result<()> {
         let config = UniConfig {
-            auto_flush_threshold: 50,        // Flush after 50 mutations
-            auto_flush_interval: None,       // Disable time-based flush
+            auto_flush_threshold: 50,  // Flush after 50 mutations
+            auto_flush_interval: None, // Disable time-based flush
             ..Default::default()
         };
         let db = Uni::temporary()
@@ -325,8 +323,7 @@ mod tests {
             let elapsed = start.elapsed();
             latencies.push(elapsed.as_millis() as u64);
 
-            if i % 10 == 0 || (i >= 48 && i <= 55) || (i >= 98 && i <= 105)
-                || i == NUM_INSERTS - 1
+            if i % 10 == 0 || (i >= 48 && i <= 55) || (i >= 98 && i <= 105) || i == NUM_INSERTS - 1
             {
                 eprintln!("insert {:>4}: {:>6}ms", i, elapsed.as_millis());
             }
@@ -336,8 +333,7 @@ mod tests {
         let around_flush = latencies[48..55].iter().sum::<u64>() / 7;
         let post_flush_avg = latencies[55..95].iter().sum::<u64>() / 40;
         let second_flush = latencies[98..105].iter().sum::<u64>() / 7;
-        let late_avg =
-            latencies[110..].iter().sum::<u64>() / (latencies.len() - 110) as u64;
+        let late_avg = latencies[110..].iter().sum::<u64>() / (latencies.len() - 110) as u64;
 
         eprintln!("---");
         eprintln!("Pre-flush avg (1-47):     {}ms", pre_flush_avg);
@@ -476,8 +472,7 @@ async fn issue43_control_no_embed() -> anyhow::Result<()> {
     }
 
     let first_50_avg = latencies[1..50].iter().sum::<u64>() / 49;
-    let last_50_avg =
-        latencies[150..].iter().sum::<u64>() / (latencies.len() - 150) as u64;
+    let last_50_avg = latencies[150..].iter().sum::<u64>() / (latencies.len() - 150) as u64;
     let ratio = last_50_avg as f64 / first_50_avg.max(1) as f64;
 
     eprintln!("---");
@@ -538,8 +533,7 @@ async fn issue43_embed_only_no_db() -> anyhow::Result<()> {
     }
 
     let first_50_avg = latencies[1..50].iter().sum::<u64>() / 49;
-    let last_50_avg =
-        latencies[150..].iter().sum::<u64>() / (latencies.len() - 150) as u64;
+    let last_50_avg = latencies[150..].iter().sum::<u64>() / (latencies.len() - 150) as u64;
     let ratio = last_50_avg as f64 / first_50_avg.max(1) as f64;
 
     eprintln!("---");

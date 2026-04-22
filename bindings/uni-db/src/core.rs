@@ -764,6 +764,14 @@ pub fn create_index_definition_from_config(
                         .get("batch_size")
                         .and_then(|v| v.as_u64())
                         .unwrap_or(100) as usize,
+                    document_prefix: obj
+                        .get("document_prefix")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                    query_prefix: obj
+                        .get("query_prefix")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
                 })
             });
 

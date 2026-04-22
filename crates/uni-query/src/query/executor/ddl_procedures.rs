@@ -68,6 +68,10 @@ struct EmbeddingOptions {
     source: Vec<String>,
     #[serde(default = "default_batch_size")]
     batch_size: usize,
+    #[serde(default)]
+    document_prefix: Option<String>,
+    #[serde(default)]
+    query_prefix: Option<String>,
 }
 
 fn default_batch_size() -> usize {
@@ -292,6 +296,8 @@ async fn create_index_internal(
                 alias: emb.alias.clone(),
                 source_properties: emb.source.clone(),
                 batch_size: emb.batch_size,
+                document_prefix: emb.document_prefix.clone(),
+                query_prefix: emb.query_prefix.clone(),
             });
 
             let algorithm = config.algorithm.as_deref().unwrap_or("hnsw");

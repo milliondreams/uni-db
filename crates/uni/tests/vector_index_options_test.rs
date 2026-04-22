@@ -45,6 +45,8 @@ async fn test_vector_index_preserves_embedding_alias_config() -> Result<()> {
                     alias: "embed/default".to_string(),
                     source_properties: vec!["content".to_string()],
                     batch_size: 32,
+                    document_prefix: None,
+                    query_prefix: None,
                 }),
             }),
         )
@@ -188,6 +190,8 @@ async fn test_vector_e2e_lifecycle_create_insert_flush_query_delete_query() -> R
                     alias: "embed/default".to_string(),
                     source_properties: vec!["content".to_string()],
                     batch_size: 16,
+                    document_prefix: None,
+                    query_prefix: None,
                 }),
             }),
         )
@@ -261,6 +265,8 @@ async fn test_vector_match_operator_with_embedding_alias_config() -> Result<()> 
                     alias: "embed/default".to_string(),
                     source_properties: vec!["id".to_string()],
                     batch_size: 4,
+                    document_prefix: None,
+                    query_prefix: None,
                 }),
             }),
         )
@@ -326,6 +332,8 @@ async fn test_reopen_fails_fast_when_schema_has_alias_but_catalog_missing() -> R
                     alias: "embed/default".to_string(),
                     source_properties: vec!["txt".to_string()],
                     batch_size: 4,
+                    document_prefix: None,
+                    query_prefix: None,
                 }),
             }),
         )

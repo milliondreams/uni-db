@@ -7366,10 +7366,22 @@ impl QueryPlanner {
             .map(|v| v as usize)
             .unwrap_or(32);
 
+        let document_prefix = obj
+            .get("document_prefix")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        let query_prefix = obj
+            .get("query_prefix")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
         Ok(Some(EmbeddingConfig {
             alias: alias.to_string(),
             source_properties,
             batch_size,
+            document_prefix,
+            query_prefix,
         }))
     }
 }

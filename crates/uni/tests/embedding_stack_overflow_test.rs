@@ -177,6 +177,8 @@ mod mistralrs_tests {
                         alias: "embed/default".to_string(),
                         source_properties: vec!["content".to_string()],
                         batch_size: 32,
+                        document_prefix: None,
+                        query_prefix: None,
                     }),
                 }),
             )
@@ -230,6 +232,8 @@ mod mistralrs_tests {
                         alias: "embed/default".to_string(),
                         source_properties: vec!["title".to_string(), "body".to_string()],
                         batch_size: 32,
+                        document_prefix: None,
+                        query_prefix: None,
                     }),
                 }),
             )

@@ -42,7 +42,13 @@ where
         }
         match tokio::time::timeout(timeout, op()).await {
             Ok(Ok(res)) => return Ok(res),
-            Ok(Err(e)) => last_err = anyhow!(e),
+            Ok(Err(e)) => {
+                // NotFound is permanent — the object won't appear after backoff.
+                if matches!(e, object_store::Error::NotFound { .. }) {
+                    return Err(anyhow::Error::from(e));
+                }
+                last_err = anyhow!(e);
+            }
             Err(_) => last_err = anyhow!("{}", timeout_msg),
         }
     }
@@ -238,6 +244,31 @@ mod tests {
 
         let results = list_with_timeout(&store, None, DEFAULT_TIMEOUT).await?;
         assert_eq!(results.len(), 2);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_not_found_returns_immediately() -> Result<()> {
+        let dir = tempdir()?;
+        let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new_with_prefix(dir.path())?);
+        let path = Path::from("does_not_exist.txt");
+
+        let start = std::time::Instant::now();
+        let result = get_with_timeout(&store, &path, DEFAULT_TIMEOUT).await;
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err(), "should return error for missing file");
+        assert!(
+            result.unwrap_err().to_string().contains("not found"),
+            "error should contain 'not found'"
+        );
+        // Without the fix, this would take ~600ms (3 retries with backoff).
+        assert!(
+            elapsed.as_millis() < 200,
+            "NotFound should not retry — took {}ms",
+            elapsed.as_millis()
+        );
 
         Ok(())
     }

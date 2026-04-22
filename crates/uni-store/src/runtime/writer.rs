@@ -58,6 +58,9 @@ pub struct Writer {
     compaction_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
     /// Optional index rebuild manager for post-flush automatic rebuild scheduling
     index_rebuild_manager: Option<Arc<crate::storage::index_rebuild::IndexRebuildManager>>,
+    /// Cached snapshot manifest from the last flush. Avoids re-reading from
+    /// object store on every flush_to_l1 call.
+    cached_manifest: Option<SnapshotManifest>,
 }
 
 impl Writer {
@@ -115,6 +118,7 @@ impl Writer {
             last_flush_time: std::time::Instant::now(),
             compaction_handle: Arc::new(RwLock::new(None)),
             index_rebuild_manager: None,
+            cached_manifest: None,
         })
     }
 
@@ -2172,15 +2176,18 @@ impl Writer {
             }
         }
 
-        // 0. Load previous snapshot or create new
-        let mut manifest = self
-            .storage
-            .snapshot_manager()
-            .load_latest_snapshot()
-            .await?
-            .unwrap_or_else(|| {
-                SnapshotManifest::new(Uuid::new_v4().to_string(), schema.schema_version)
-            });
+        // 0. Load previous snapshot from cache, or fall back to storage
+        let mut manifest = if let Some(cached) = self.cached_manifest.take() {
+            cached
+        } else {
+            self.storage
+                .snapshot_manager()
+                .load_latest_snapshot()
+                .await?
+                .unwrap_or_else(|| {
+                    SnapshotManifest::new(Uuid::new_v4().to_string(), schema.schema_version)
+                })
+        };
 
         // Update snapshot metadata
         // Save parent snapshot ID before generating new one (for lineage tracking)
@@ -2473,6 +2480,9 @@ impl Writer {
             .snapshot_manager()
             .set_latest_snapshot(&manifest.snapshot_id)
             .await?;
+
+        // Cache manifest for next flush to avoid re-reading from object store
+        self.cached_manifest = Some(manifest.clone());
 
         // Complete flush: remove old L0 from pending list now that L1 writes succeeded.
         // This must happen BEFORE WAL truncation so min_pending_wal_lsn is accurate.

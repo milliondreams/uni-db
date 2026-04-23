@@ -473,7 +473,6 @@ impl StorageManager {
     async fn update_compaction_status(&self) -> Result<()> {
         let schema = self.schema_manager.schema();
         let backend = self.backend.as_ref();
-        let mut total_tables = 0;
         let mut total_rows: usize = 0;
         let mut oldest_ts: Option<i64> = None;
 
@@ -487,7 +486,6 @@ impl StorageManager {
                 if row_count == 0 {
                     continue;
                 }
-                total_tables += 1;
                 total_rows += row_count;
 
                 // Query oldest _created_at for age tracking
@@ -521,7 +519,8 @@ impl StorageManager {
             .unwrap_or(Duration::ZERO);
 
         let mut status = acquire_mutex(&self.compaction_status, "compaction_status")?;
-        status.l1_runs = total_tables;
+        // Note: l1_runs is managed by flush_to_l1 (increment) and execute_compaction
+        // (reset). It counts flush generations, not delta table count.
         status.l1_size_bytes = (total_rows * ENTRY_SIZE_ESTIMATE) as u64;
         status.oldest_l1_age = oldest_l1_age;
         Ok(())
@@ -554,7 +553,22 @@ impl StorageManager {
         true
     }
 
-    async fn execute_compaction(this: Arc<Self>, _task: CompactionTask) -> Result<CompactionStats> {
+    /// Trigger L1 compaction asynchronously without blocking the caller.
+    /// Safe to call frequently — CompactionGuard prevents concurrent runs.
+    pub fn trigger_async_compaction(self: &Arc<Self>) {
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            if let Err(e) = Self::execute_compaction(this, CompactionTask::ByRunCount).await {
+                // "Compaction already in progress" is expected when called frequently
+                log::debug!("Post-flush compaction skipped: {}", e);
+            }
+        });
+    }
+
+    pub(crate) async fn execute_compaction(
+        this: Arc<Self>,
+        _task: CompactionTask,
+    ) -> Result<CompactionStats> {
         let start = std::time::Instant::now();
         let _guard = CompactionGuard::new(this.compaction_status.clone())
             .ok_or_else(|| anyhow!("Compaction already in progress"))?;
@@ -632,6 +646,7 @@ impl StorageManager {
         {
             let mut status = acquire_mutex(&this.compaction_status, "compaction_status")?;
             status.total_compactions += 1;
+            status.l1_runs = 0; // Reset flush generation counter
         }
 
         Ok(CompactionStats {

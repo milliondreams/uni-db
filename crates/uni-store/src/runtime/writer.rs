@@ -1773,18 +1773,36 @@ impl Writer {
             return Ok(());
         }
 
+        let mut flushed = false;
+
         // Flush on mutation count threshold (10,000 default)
         if count >= self.config.auto_flush_threshold {
             self.flush_to_l1(None).await?;
-            return Ok(());
+            flushed = true;
         }
 
         // Flush on time interval IF minimum mutations met
-        if let Some(interval) = self.config.auto_flush_interval
+        if !flushed
+            && let Some(interval) = self.config.auto_flush_interval
             && self.last_flush_time.elapsed() >= interval
             && count >= self.config.auto_flush_min_mutations
         {
             self.flush_to_l1(None).await?;
+            flushed = true;
+        }
+
+        // After flush, trigger async L1 compaction if flush generations exceed threshold.
+        // Non-blocking: spawns background task. CompactionGuard prevents concurrent runs.
+        if flushed && self.config.compaction.enabled {
+            let current_runs = uni_common::sync::acquire_mutex(
+                &self.storage.compaction_status,
+                "compaction_status",
+            )
+            .map(|s| s.l1_runs)
+            .unwrap_or(0);
+            if current_runs >= self.config.compaction.max_l1_runs {
+                self.storage.trigger_async_compaction();
+            }
         }
 
         Ok(())
@@ -2526,6 +2544,16 @@ impl Writer {
         metrics::histogram!("uni_flush_duration_seconds").record(start.elapsed().as_secs_f64());
         metrics::counter!("uni_flush_bytes_total").increment(initial_size as u64);
         metrics::counter!("uni_flush_rows_total").increment(initial_count as u64);
+
+        // Increment flush generation counter for write throttling.
+        // l1_runs counts uncompacted flush generations (reset by compaction).
+        {
+            let mut status = uni_common::sync::acquire_mutex(
+                &self.storage.compaction_status,
+                "compaction_status",
+            )?;
+            status.l1_runs += 1;
+        }
 
         // Trigger CSR compaction if enough frozen segments have accumulated.
         // After flush, the old L0 data is now in L1; the overlay segments can be merged

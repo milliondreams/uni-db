@@ -443,6 +443,7 @@ impl ExecutionPlan for GraphScanExec {
             self.projected_properties.clone(),
             self.is_edge_scan,
             self.is_schemaless,
+            self.filter.clone(),
             self.schema.clone(),
             metrics,
         )))
@@ -487,6 +488,9 @@ struct GraphScanStream {
     /// Whether this is a schemaless scan.
     is_schemaless: bool,
 
+    /// Pushed-down filter expression (used for VID short-circuit in L0 scans).
+    filter: Option<Arc<dyn PhysicalExpr>>,
+
     /// Output schema.
     schema: SchemaRef,
 
@@ -507,6 +511,7 @@ impl GraphScanStream {
         properties: Vec<String>,
         is_edge_scan: bool,
         is_schemaless: bool,
+        filter: Option<Arc<dyn PhysicalExpr>>,
         schema: SchemaRef,
         metrics: BaselineMetrics,
     ) -> Self {
@@ -517,6 +522,7 @@ impl GraphScanStream {
             properties,
             is_edge_scan,
             is_schemaless,
+            filter,
             schema,
             state: GraphScanState::Init,
             metrics,
@@ -1008,16 +1014,96 @@ fn filter_l0_edge_tombstones(
     arrow::compute::filter_record_batch(batch, &mask).map_err(arrow_err)
 }
 
+/// Extract a target VID from a DataFusion physical filter expression.
+///
+/// Looks for patterns like `_vid = <uint64_literal>` or `<uint64_literal> = _vid`
+/// in the top-level expression or as a conjunct of an AND chain. Returns the first
+/// VID literal found, or `None` if the filter does not contain such a pattern.
+///
+/// This also handles `CAST(literal AS UInt64)` which DataFusion may insert when
+/// the original literal is Int64.
+fn extract_vid_from_physical_filter(filter: &Arc<dyn PhysicalExpr>) -> Option<u64> {
+    use datafusion::logical_expr::Operator;
+    use datafusion::physical_expr::expressions::BinaryExpr;
+
+    // Try to match this expression as `_vid = literal`
+    if let Some(bin) = filter.as_any().downcast_ref::<BinaryExpr>() {
+        if bin.op() == &Operator::Eq {
+            // Check both directions: col = lit and lit = col
+            if let Some(vid) = try_extract_vid_eq(bin.left(), bin.right()) {
+                return Some(vid);
+            }
+            if let Some(vid) = try_extract_vid_eq(bin.right(), bin.left()) {
+                return Some(vid);
+            }
+        }
+        // Recurse into AND conjuncts
+        if bin.op() == &Operator::And {
+            if let Some(vid) = extract_vid_from_physical_filter(bin.left()) {
+                return Some(vid);
+            }
+            return extract_vid_from_physical_filter(bin.right());
+        }
+    }
+    None
+}
+
+/// Try to extract a VID value from a `(column_expr, value_expr)` pair where
+/// `column_expr` is a `Column` named `_vid` and `value_expr` is a UInt64 or
+/// non-negative Int64 literal (possibly wrapped in a CAST to UInt64).
+fn try_extract_vid_eq(
+    col_side: &Arc<dyn PhysicalExpr>,
+    val_side: &Arc<dyn PhysicalExpr>,
+) -> Option<u64> {
+    use datafusion::physical_expr::expressions::{CastExpr, Column, Literal};
+
+    // Check that col_side is Column("_vid")
+    let col = col_side.as_any().downcast_ref::<Column>()?;
+    if col.name() != "_vid" {
+        return None;
+    }
+
+    // Try direct literal
+    if let Some(lit) = val_side.as_any().downcast_ref::<Literal>() {
+        return scalar_to_u64(lit.value());
+    }
+
+    // Try CAST(literal AS UInt64)
+    if let Some(cast) = val_side.as_any().downcast_ref::<CastExpr>()
+        && let Some(lit) = cast.expr().as_any().downcast_ref::<Literal>()
+    {
+        return scalar_to_u64(lit.value());
+    }
+
+    None
+}
+
+/// Convert a `ScalarValue` to `u64` if it is a non-negative integer type.
+fn scalar_to_u64(sv: &datafusion::common::ScalarValue) -> Option<u64> {
+    use datafusion::common::ScalarValue;
+    match sv {
+        ScalarValue::UInt64(Some(v)) => Some(*v),
+        ScalarValue::Int64(Some(v)) if *v >= 0 => Some(*v as u64),
+        ScalarValue::UInt32(Some(v)) => Some(*v as u64),
+        ScalarValue::Int32(Some(v)) if *v >= 0 => Some(*v as u64),
+        _ => None,
+    }
+}
+
 /// Build a RecordBatch from L0 buffer data for a given label, matching the
 /// Lance query's column set.
 ///
 /// Merges L0 buffers in visibility order (pending_flush → current → transaction),
 /// with later buffers overwriting earlier ones for the same VID.
+///
+/// When `target_vid` is `Some`, only that single VID is collected (direct HashMap
+/// lookup instead of iterating all VIDs for the label).
 fn build_l0_vertex_batch(
     l0_ctx: &crate::query::df_graph::L0Context,
     label: &str,
     lance_schema: &SchemaRef,
     label_props: Option<&HashMap<String, uni_common::core::schema::PropertyMeta>>,
+    target_vid: Option<u64>,
 ) -> DFResult<RecordBatch> {
     // Collect all L0 vertex data, merging in visibility order
     let mut vid_data: HashMap<u64, (Properties, u64)> = HashMap::new(); // vid -> (props, version)
@@ -1029,8 +1115,25 @@ fn build_l0_vertex_batch(
         for vid in guard.vertex_tombstones.iter() {
             tombstones.insert(vid.as_u64());
         }
-        // Collect vertices for this label
-        for vid in guard.vids_for_label(label) {
+        // Collect vertices — either a single target or all for the label
+        let candidate_vids: Vec<Vid> = if let Some(tv) = target_vid {
+            let vid = Vid::from(tv);
+            // Only include if this VID exists in this L0 buffer and has the right label
+            if guard.vertex_properties.contains_key(&vid)
+                && (label.is_empty()
+                    || guard
+                        .label_to_vids
+                        .get(label)
+                        .is_some_and(|s| s.contains(&vid)))
+            {
+                vec![vid]
+            } else {
+                vec![]
+            }
+        } else {
+            guard.vids_for_label(label)
+        };
+        for vid in candidate_vids {
             let vid_u64 = vid.as_u64();
             if tombstones.contains(&vid_u64) {
                 continue;
@@ -1591,11 +1694,15 @@ async fn columnar_scan_vertex_batch_static(
     variable: &str,
     projected_properties: &[String],
     output_schema: &SchemaRef,
+    filter: &Option<Arc<dyn PhysicalExpr>>,
 ) -> DFResult<RecordBatch> {
     let storage = graph_ctx.storage();
     let l0_ctx = graph_ctx.l0_context();
     let uni_schema = storage.schema_manager().schema();
     let label_props = uni_schema.properties.get(label);
+
+    // Extract target VID from filter for short-circuit lookup
+    let target_vid = filter.as_ref().and_then(extract_vid_from_physical_filter);
 
     // Build the list of columns to request from Lance
     let mut lance_columns: Vec<String> = vec![
@@ -1661,7 +1768,7 @@ async fn columnar_scan_vertex_batch_static(
     };
 
     // Build L0 batch
-    let l0_batch = build_l0_vertex_batch(l0_ctx, label, &internal_schema, label_props)?;
+    let l0_batch = build_l0_vertex_batch(l0_ctx, label, &internal_schema, label_props, target_vid)?;
 
     // Merge Lance + L0
     let Some(merged) = merge_lance_and_l0(lance_deduped, l0_batch, &internal_schema, "_vid")?
@@ -1818,9 +1925,13 @@ async fn columnar_scan_schemaless_vertex_batch_static(
     variable: &str,
     projected_properties: &[String],
     output_schema: &SchemaRef,
+    filter: &Option<Arc<dyn PhysicalExpr>>,
 ) -> DFResult<RecordBatch> {
     let storage = graph_ctx.storage();
     let l0_ctx = graph_ctx.l0_context();
+
+    // Extract target VID from filter for short-circuit lookup
+    let target_vid = filter.as_ref().and_then(extract_vid_from_physical_filter);
 
     // Build the Lance filter expression — do NOT filter _deleted here;
     // MVCC dedup must see deletion tombstones to pick the highest version.
@@ -1872,7 +1983,7 @@ async fn columnar_scan_schemaless_vertex_batch_static(
     };
 
     // Build L0 batch
-    let l0_batch = build_l0_schemaless_vertex_batch(l0_ctx, label, &internal_schema)?;
+    let l0_batch = build_l0_schemaless_vertex_batch(l0_ctx, label, &internal_schema, target_vid)?;
 
     // Merge Lance + L0
     let Some(merged) = merge_lance_and_l0(lance_deduped, l0_batch, &internal_schema, "_vid")?
@@ -1912,6 +2023,7 @@ fn build_l0_schemaless_vertex_batch(
     l0_ctx: &crate::query::df_graph::L0Context,
     label: &str,
     internal_schema: &SchemaRef,
+    target_vid: Option<u64>,
 ) -> DFResult<RecordBatch> {
     // Collect all L0 vertex data, merging in visibility order
     // vid -> (merged_props, highest_version, labels)
@@ -1935,8 +2047,26 @@ fn build_l0_schemaless_vertex_batch(
             tombstones.insert(vid.as_u64());
         }
 
-        // Collect VIDs matching the label filter
-        let vids: Vec<Vid> = if label_filter.is_empty() {
+        // Collect VIDs matching the label filter — short-circuit when target_vid is set
+        let vids: Vec<Vid> = if let Some(tv) = target_vid {
+            let vid = Vid::from(tv);
+            // Only include if this VID exists in this L0 buffer
+            if guard.vertex_properties.contains_key(&vid) {
+                // Check label filter if applicable
+                let label_ok = if label_filter.is_empty() {
+                    true
+                } else if let Some(labels) = guard.vertex_labels.get(&vid) {
+                    label_filter
+                        .iter()
+                        .all(|lf| labels.contains(&lf.to_string()))
+                } else {
+                    false
+                };
+                if label_ok { vec![vid] } else { vec![] }
+            } else {
+                vec![]
+            }
+        } else if label_filter.is_empty() {
             guard.all_vertex_vids()
         } else if label_filter.len() == 1 {
             guard.vids_for_label(label_filter[0])
@@ -3092,6 +3222,7 @@ impl Stream for GraphScanStream {
                     let properties = self.properties.clone();
                     let is_edge_scan = self.is_edge_scan;
                     let is_schemaless = self.is_schemaless;
+                    let filter = self.filter.clone();
                     let schema = self.schema.clone();
 
                     let fut = async move {
@@ -3115,6 +3246,7 @@ impl Stream for GraphScanStream {
                                 &variable,
                                 &properties,
                                 &schema,
+                                &filter,
                             )
                             .await?
                         } else {
@@ -3124,6 +3256,7 @@ impl Stream for GraphScanStream {
                                 &variable,
                                 &properties,
                                 &schema,
+                                &filter,
                             )
                             .await?
                         };

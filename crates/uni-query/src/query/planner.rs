@@ -3347,14 +3347,14 @@ impl QueryPlanner {
 
     fn collect_properties_from_expr(expr: &Expr, collected: &mut Vec<Expr>) {
         match expr {
-            Expr::Property(_, _) => {
+            Expr::Property(_, _)
                 if !collected
                     .iter()
-                    .any(|e| e.to_string_repr() == expr.to_string_repr())
-                {
-                    collected.push(expr.clone());
-                }
+                    .any(|e| e.to_string_repr() == expr.to_string_repr()) =>
+            {
+                collected.push(expr.clone());
             }
+            Expr::Property(_, _) => {}
             Expr::Variable(_) => {
                 // Variables are already available, don't need to project them
             }
@@ -7053,22 +7053,21 @@ impl QueryPlanner {
         match expr {
             // Pattern 1: uni.temporal.validAt() function call
             Expr::FunctionCall { name, args, .. }
-                if name.eq_ignore_ascii_case("uni.temporal.validAt")
-                    || name.eq_ignore_ascii_case("validAt") =>
+                if (name.eq_ignore_ascii_case("uni.temporal.validAt")
+                    || name.eq_ignore_ascii_case("validAt"))
+                    && args.len() >= 2 =>
             {
                 // args[0] = node, args[1] = start_prop, args[2] = end_prop, args[3] = time
-                if args.len() >= 2 {
-                    let start_prop =
-                        if let Some(Expr::Literal(CypherLiteral::String(s))) = args.get(1) {
-                            s.clone()
-                        } else {
-                            "valid_from".to_string()
-                        };
+                let start_prop = if let Some(Expr::Literal(CypherLiteral::String(s))) = args.get(1)
+                {
+                    s.clone()
+                } else {
+                    "valid_from".to_string()
+                };
 
-                    // Try to extract label from the node expression
-                    if let Some(var) = args.first().and_then(|e| e.extract_variable()) {
-                        self.suggest_temporal_index(&var, &start_prop, suggestions);
-                    }
+                // Try to extract label from the node expression
+                if let Some(var) = args.first().and_then(|e| e.extract_variable()) {
+                    self.suggest_temporal_index(&var, &start_prop, suggestions);
                 }
             }
 

@@ -487,7 +487,7 @@ mod decoding {
             DataType::Crdt(CrdtType::VCRegister),
         ];
 
-        for (crdt, dt) in test_cases.into_iter().zip(data_types.into_iter()) {
+        for (crdt, dt) in test_cases.into_iter().zip(data_types) {
             let array = crdt_to_binary_array(&crdt);
             let val = value_from_column(&array, &dt, 0, CrdtDecodeMode::Strict)
                 .expect("decode should succeed");

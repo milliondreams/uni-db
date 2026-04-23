@@ -64,10 +64,14 @@ async fn instrumented_node_edge_ingestion() {
         .unwrap();
 
     // Accumulate per-step timings
+    #[allow(dead_code)]
     struct StepTiming {
         create_node_ms: u128,
         commit_node_ms: u128,
         edge1_exec_ms: u128,
+        edge1_parse_us: u128,
+        edge1_plan_us: u128,
+        edge1_run_us: u128,
         edge1_commit_ms: u128,
         edge2_exec_ms: u128,
         edge2_commit_ms: u128,
@@ -97,19 +101,23 @@ async fn instrumented_node_edge_ingestion() {
         tx.commit().await.unwrap();
         let commit_node_ms = t.elapsed().as_millis();
 
-        // Step 3: Create SENT_BY edge (execute)
+        // Step 3: Create SENT_BY edge (execute) — capture internal metrics
         let t = Instant::now();
         let tx = session.tx().await.unwrap();
-        tx.query_with(
-            "MATCH (m), (u) WHERE id(m) = $mid AND id(u) = $uid \
-             CREATE (m)-[:SENT_BY]->(u)",
-        )
-        .param("mid", Value::Int(msg_vid))
-        .param("uid", Value::Int(user_vid))
-        .fetch_all()
-        .await
-        .unwrap();
+        let edge1_result = tx
+            .query_with(
+                "MATCH (m), (u) WHERE id(m) = $mid AND id(u) = $uid \
+                 CREATE (m)-[:SENT_BY]->(u)",
+            )
+            .param("mid", Value::Int(msg_vid))
+            .param("uid", Value::Int(user_vid))
+            .fetch_all()
+            .await
+            .unwrap();
         let edge1_exec_ms = t.elapsed().as_millis();
+        let edge1_parse_us = edge1_result.metrics().parse_time.as_micros();
+        let edge1_plan_us = edge1_result.metrics().plan_time.as_micros();
+        let edge1_run_us = edge1_result.metrics().exec_time.as_micros();
 
         // Step 4: Commit SENT_BY edge
         let t = Instant::now();
@@ -141,6 +149,9 @@ async fn instrumented_node_edge_ingestion() {
             create_node_ms,
             commit_node_ms,
             edge1_exec_ms,
+            edge1_parse_us,
+            edge1_plan_us,
+            edge1_run_us,
             edge1_commit_ms,
             edge2_exec_ms,
             edge2_commit_ms,
@@ -149,10 +160,14 @@ async fn instrumented_node_edge_ingestion() {
 
         if i % 50 == 0 || i == NUM_NODES - 1 {
             eprintln!(
-                "i={:>4} | node={:>4}ms commit={:>4}ms | e1={:>4}ms c1={:>4}ms | e2={:>4}ms c2={:>4}ms | total={:>4}ms",
-                i, create_node_ms, commit_node_ms,
-                edge1_exec_ms, edge1_commit_ms,
-                edge2_exec_ms, edge2_commit_ms,
+                "i={:>4} | node={:>3}ms | e1={:>4}ms [parse={:>4}us plan={:>5}us exec={:>5}us] | e2={:>4}ms | total={:>4}ms",
+                i,
+                create_node_ms,
+                edge1_exec_ms,
+                edge1_parse_us,
+                edge1_plan_us,
+                edge1_run_us,
+                edge2_exec_ms,
                 total_ms
             );
         }
@@ -161,32 +176,31 @@ async fn instrumented_node_edge_ingestion() {
     let total_secs = total_start.elapsed().as_secs_f64();
 
     // Bucket analysis (50-item buckets)
-    eprintln!("\n--- Bucket averages (50-item) ---");
+    eprintln!("\n--- Bucket averages (50-item) — edge1 internal breakdown ---");
     eprintln!(
-        "{:>10} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8}",
-        "range", "node", "c_node", "edge1", "c_edge1", "edge2", "c_edge2", "total"
+        "{:>10} {:>6} {:>7} {:>8} {:>8} {:>8} {:>7} {:>7}",
+        "range", "node", "e1_ms", "parse_us", "plan_us", "exec_us", "e2_ms", "total"
     );
     for chunk_start in (0..NUM_NODES).step_by(50) {
         let chunk_end = (chunk_start + 50).min(NUM_NODES);
-        let skip = if chunk_start == 0 { 1 } else { 0 }; // skip cold start
+        let skip = if chunk_start == 0 { 1 } else { 0 };
         let slice = &timings[chunk_start + skip..chunk_end];
         if slice.is_empty() {
             continue;
         }
         let n = slice.len() as f64;
-        let avg = |f: fn(&StepTiming) -> u128| -> f64 {
-            slice.iter().map(f).sum::<u128>() as f64 / n
-        };
+        let avg =
+            |f: fn(&StepTiming) -> u128| -> f64 { slice.iter().map(f).sum::<u128>() as f64 / n };
         eprintln!(
-            "{:>4}-{:>4} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1}",
+            "{:>4}-{:>4} {:>6.1} {:>7.1} {:>8.0} {:>8.0} {:>8.0} {:>7.1} {:>7.1}",
             chunk_start,
             chunk_end - 1,
             avg(|t| t.create_node_ms),
-            avg(|t| t.commit_node_ms),
             avg(|t| t.edge1_exec_ms),
-            avg(|t| t.edge1_commit_ms),
+            avg(|t| t.edge1_parse_us),
+            avg(|t| t.edge1_plan_us),
+            avg(|t| t.edge1_run_us),
             avg(|t| t.edge2_exec_ms),
-            avg(|t| t.edge2_commit_ms),
             avg(|t| t.total_ms),
         );
     }
@@ -200,7 +214,10 @@ async fn instrumented_node_edge_ingestion() {
     let ratio = avg_total(last_50) / avg_total(first_50).max(1.0);
 
     eprintln!("\n--- Summary ---");
-    eprintln!("Total: {total_secs:.1}s for {NUM_NODES} nodes + {} edges", NUM_NODES * 2);
+    eprintln!(
+        "Total: {total_secs:.1}s for {NUM_NODES} nodes + {} edges",
+        NUM_NODES * 2
+    );
     eprintln!("First 50 avg total: {:.1}ms", avg_total(first_50));
     eprintln!("Last 50 avg total:  {:.1}ms", avg_total(last_50));
     eprintln!("Growth ratio: {ratio:.1}x");

@@ -1057,9 +1057,9 @@ fn try_extract_vid_eq(
 ) -> Option<u64> {
     use datafusion::physical_expr::expressions::{CastExpr, Column, Literal};
 
-    // Check that col_side is Column("_vid")
+    // Check that col_side is Column("_vid") or Column("variable._vid")
     let col = col_side.as_any().downcast_ref::<Column>()?;
-    if col.name() != "_vid" {
+    if col.name() != "_vid" && !col.name().ends_with("._vid") {
         return None;
     }
 

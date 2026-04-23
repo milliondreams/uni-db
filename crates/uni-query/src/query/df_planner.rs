@@ -1287,6 +1287,77 @@ impl HybridPhysicalPlanner {
     /// Wraps the input plan with a `FilterExec` if `filter` is `Some`.
     /// Builds a `TranslationContext` marking `variable` as `VariableKind::Node`
     /// for correct expression translation.
+    /// Extract a VID literal from a Cypher filter expression for scan-level
+    /// optimization. Looks for `_vid = <int>` patterns (produced by the
+    /// `id()` → `_vid` rewrite). Returns the VID if found, enabling L0
+    /// short-circuit and Lance _vid pushdown inside the scan.
+    fn extract_vid_from_cypher_filter(
+        filter: Option<&Expr>,
+        variable: &str,
+        params: &HashMap<String, uni_common::Value>,
+    ) -> Option<u64> {
+        use uni_cypher::ast::BinaryOp;
+        let filter = filter?;
+        match filter {
+            Expr::BinaryOp {
+                left,
+                op: BinaryOp::Eq,
+                right,
+            } => {
+                // Check: variable._vid = literal/param
+                if let Expr::Property(var_expr, prop) = left.as_ref()
+                    && let Expr::Variable(v) = var_expr.as_ref()
+                    && v == variable
+                    && prop == "_vid"
+                {
+                    return Self::resolve_vid_value(right, params);
+                }
+                // Check: literal/param = variable._vid
+                if let Expr::Property(var_expr, prop) = right.as_ref()
+                    && let Expr::Variable(v) = var_expr.as_ref()
+                    && v == variable
+                    && prop == "_vid"
+                {
+                    return Self::resolve_vid_value(left, params);
+                }
+                None
+            }
+            Expr::BinaryOp {
+                left,
+                op: BinaryOp::And,
+                right,
+            } => Self::extract_vid_from_cypher_filter(Some(left), variable, params)
+                .or_else(|| Self::extract_vid_from_cypher_filter(Some(right), variable, params)),
+            _ => None,
+        }
+    }
+
+    /// Build a physical `_vid = literal` filter expression for scan-level optimization.
+    fn build_vid_physical_filter(
+        col_name: &str,
+        vid: u64,
+    ) -> Arc<dyn datafusion::physical_expr::PhysicalExpr> {
+        use datafusion::physical_expr::expressions::{BinaryExpr, Column, Literal};
+        Arc::new(BinaryExpr::new(
+            Arc::new(Column::new(col_name, 0)),
+            datafusion::logical_expr::Operator::Eq,
+            Arc::new(Literal::new(datafusion::common::ScalarValue::UInt64(Some(
+                vid,
+            )))),
+        ))
+    }
+
+    fn resolve_vid_value(expr: &Expr, params: &HashMap<String, uni_common::Value>) -> Option<u64> {
+        match expr {
+            Expr::Literal(CypherLiteral::Integer(v)) if *v >= 0 => Some(*v as u64),
+            Expr::Parameter(name) => match params.get(name) {
+                Some(uni_common::Value::Int(v)) if *v >= 0 => Some(*v as u64),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     fn apply_scan_filter(
         &self,
         plan: Arc<dyn ExecutionPlan>,
@@ -1625,12 +1696,17 @@ impl HybridPhysicalPlanner {
             }
         }
 
+        // Extract VID from filter for scan-level optimization (L0 short-circuit +
+        // Lance _vid pushdown). Build a physical _vid = literal expression that
+        // the scan can use internally. FilterExec is still added on top.
+        let scan_filter = Self::extract_vid_from_cypher_filter(filter, variable, &self.params)
+            .map(|vid| Self::build_vid_physical_filter(&format!("{variable}._vid"), vid));
         let mut scan_plan: Arc<dyn ExecutionPlan> = Arc::new(GraphScanExec::new_vertex_scan(
             self.graph_ctx.clone(),
             label_name.to_string(),
             variable.to_string(),
             properties.clone(),
-            None, // Filter will be applied as FilterExec on top
+            scan_filter,
         ));
 
         // Apply filter BEFORE structural projection so that the schema is
@@ -1907,11 +1983,14 @@ impl HybridPhysicalPlanner {
         all_properties: &HashMap<String, HashSet<String>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let (properties, need_full) = Self::resolve_schemaless_properties(variable, all_properties);
+        // Extract VID from filter for scan-level optimization.
+        let scan_filter = Self::extract_vid_from_cypher_filter(filter, variable, &self.params)
+            .map(|vid| Self::build_vid_physical_filter(&format!("{variable}._vid"), vid));
         let scan_plan: Arc<dyn ExecutionPlan> = Arc::new(GraphScanExec::new_schemaless_all_scan(
             self.graph_ctx.clone(),
             variable.to_string(),
             properties.clone(),
-            None,
+            scan_filter,
         ));
         self.finalize_schemaless_scan(
             scan_plan,

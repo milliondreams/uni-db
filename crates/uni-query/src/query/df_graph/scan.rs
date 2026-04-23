@@ -1729,10 +1729,12 @@ async fn columnar_scan_vertex_batch_static(
         push_column_if_absent(&mut lance_columns, "overflow_json");
     }
 
-    // Try to query Lance via StorageManager domain method
+    // Try to query Lance via StorageManager domain method.
+    // Push _vid filter to Lance for O(log N) BTree index lookup instead of full scan.
+    let vid_filter = target_vid.map(|v| format!("_vid = {v}"));
     let lance_columns_refs: Vec<&str> = lance_columns.iter().map(|s| s.as_str()).collect();
     let lance_batch = storage
-        .scan_vertex_table(label, &lance_columns_refs, None)
+        .scan_vertex_table(label, &lance_columns_refs, vid_filter.as_deref())
         .await
         .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
 
@@ -1937,6 +1939,11 @@ async fn columnar_scan_schemaless_vertex_batch_static(
     // MVCC dedup must see deletion tombstones to pick the highest version.
     let filter = {
         let mut parts = Vec::new();
+
+        // VID point-lookup filter — uses BTree index on _vid
+        if let Some(vid) = target_vid {
+            parts.push(format!("_vid = {vid}"));
+        }
 
         // Label filter
         if !label.is_empty() {

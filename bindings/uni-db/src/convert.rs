@@ -1193,6 +1193,9 @@ pub fn extract_uni_config(
     if let Some(v) = config.get("wal_enabled") {
         uni_config.wal_enabled = v.extract::<bool>(py)?;
     }
+    if let Some(v) = config.get("strict_schema") {
+        uni_config.strict_schema = v.extract::<bool>(py)?;
+    }
     Ok(uni_config)
 }
 

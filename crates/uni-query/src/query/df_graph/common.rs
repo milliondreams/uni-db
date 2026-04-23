@@ -901,6 +901,38 @@ pub async fn execute_subplan(
     storage: &Arc<StorageManager>,
     schema_info: &Arc<UniSchema>,
 ) -> DFResult<Vec<RecordBatch>> {
+    execute_subplan_with_outer_vars(
+        plan,
+        params,
+        outer_values,
+        graph_ctx,
+        session_ctx,
+        storage,
+        schema_info,
+        &std::collections::HashSet::new(),
+    )
+    .await
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Threading outer_entity_vars for nested EXISTS"
+)]
+/// Like `execute_subplan`, but with outer entity variable names for nested EXISTS.
+///
+/// The `outer_entity_vars` set is threaded to the `HybridPhysicalPlanner` so its
+/// expression compiler can distinguish fresh pattern bindings from correlated
+/// references in nested pattern-predicate EXISTS.
+pub async fn execute_subplan_with_outer_vars(
+    plan: &LogicalPlan,
+    params: &HashMap<String, Value>,
+    outer_values: &HashMap<String, Value>,
+    graph_ctx: &Arc<GraphExecutionContext>,
+    session_ctx: &Arc<RwLock<SessionContext>>,
+    storage: &Arc<StorageManager>,
+    schema_info: &Arc<UniSchema>,
+    outer_entity_vars: &std::collections::HashSet<String>,
+) -> DFResult<Vec<RecordBatch>> {
     let mut planner = HybridPhysicalPlanner::with_l0_context(
         session_ctx.clone(),
         storage.clone(),
@@ -910,6 +942,7 @@ pub async fn execute_subplan(
         params.clone(),
         outer_values.clone(),
     );
+    planner.set_outer_entity_vars(outer_entity_vars.clone());
 
     // Propagate registries from parent context so procedures remain available
     // inside correlated subqueries (Apply operator).

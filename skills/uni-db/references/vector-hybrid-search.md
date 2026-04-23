@@ -61,6 +61,18 @@ similar_to(source, query [, options]) -> Float
 
 A per-row expression for `WHERE`, `RETURN`, `ORDER BY`, and Locy rule bodies. Scores one already-bound node (not a top-K scan like `CALL` procedures).
 
+### `~=` Operator vs `similar_to()` Function
+
+| Syntax | What It Does | Best For |
+|---|---|---|
+| `n.embedding ~= $query` | **Top-K index scan** — desugars to `uni.vector.query`, returns nearest neighbors from vector index | "Find top 10 from millions" |
+| `similar_to(n.embedding, $q)` | **Per-row scoring** — evaluates inline, scores each already-bound node | "Score this matched node" |
+| `similar_to([sources], [queries])` | **Hybrid fusion** — combines vector + FTS via RRF or weighted fusion | "Rank by semantic + keyword" |
+
+`~=` is **vector-only** (no FTS, no hybrid). For hybrid, use `similar_to()` with multi-source arrays.
+
+> **`=~` is regex** (`n.name =~ '(?i)john'`), **`~=` is vector similarity** — unrelated operators.
+
 ### Scoring Modes (auto-detected)
 
 | Source Type | Query Type | Mode | Behavior |
@@ -115,6 +127,26 @@ RETURN p.name, similar_to(
 | `fts_k` | Float | `1.0` | BM25 saturation constant: `score / (score + fts_k)` |
 
 **Gotcha -- RRF in point context:** `similar_to()` scores one node at a time (no ranked list), so RRF degenerates to equal-weight averaging. A `RrfPointContext` warning is emitted. Use `method: 'weighted'` for explicit control.
+
+### Correct vs Incorrect Hybrid Search
+
+**Correct — single `similar_to` with multi-source arrays:**
+```cypher
+-- RRF fusion (default), proper BM25 normalization
+MATCH (d:Doc)
+RETURN d.title,
+  similar_to([d.embedding, d.content], [$qvec, $qtxt]) AS score
+ORDER BY score DESC
+```
+
+**Incorrect — naive addition of two separate calls:**
+```cypher
+-- DON'T: mixes incompatible scales (cosine [0,1] vs unbounded BM25)
+MATCH (d:Doc)
+RETURN d.title,
+  (similar_to(d.embedding, $qvec) + similar_to(d.content, $qtxt)) AS score
+```
+The multi-source form normalizes BM25 via `score / (score + fts_k)` before fusion. Raw addition skips this.
 
 ### Execution Path Capability
 

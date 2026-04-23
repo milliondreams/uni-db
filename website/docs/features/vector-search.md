@@ -88,6 +88,22 @@ YIELD node, score
 RETURN node.title, score
 ```
 
+## The `~=` Operator
+
+The `~=` (approximate equality) operator is shorthand for a **top-K vector index scan** — it desugars to `uni.vector.query` under the hood:
+
+```cypher
+-- ~= operator: top-K scan against the vector index
+MATCH (p:Paper) WHERE p.embedding ~= $query_vector
+RETURN p.title, p._score AS score
+ORDER BY score DESC LIMIT 10
+```
+
+`~=` is **vector-only** — it cannot do FTS or hybrid search. For hybrid search, use `similar_to()` with multi-source arrays.
+
+!!! note "`=~` is regex, `~=` is vector similarity"
+    These are unrelated operators that look similar. `n.name =~  '(?i)john'` is a regex match on strings. `n.embedding ~= $vec` is vector similarity search.
+
 ## Expression-Based Scoring: `similar_to`
 
 For scoring already-bound nodes rather than top-K retrieval, use `similar_to()`:
@@ -98,7 +114,17 @@ WHERE similar_to(b.embedding, 'attention mechanisms') > 0.7
 RETURN b.title, similar_to(b.embedding, 'attention mechanisms') AS score
 ```
 
-`similar_to` supports metric-aware vector scoring (Cosine, L2, Dot Product), FTS scoring, and multi-source hybrid fusion. It automatically uses the distance metric configured on the vector index. It works in `WHERE`, `RETURN`, `ORDER BY`, and Locy rule bodies. See the [Vector Search guide](../guides/vector-search.md#similar_to-expression-function) for full details.
+For **hybrid search** (vector + FTS combined), use multi-source arrays with fusion:
+
+```cypher
+-- Correct hybrid: single similar_to with multi-source arrays
+MATCH (d:Doc)
+RETURN d.title,
+  similar_to([d.embedding, d.content], [$query_vector, $query_text]) AS score
+ORDER BY score DESC
+```
+
+`similar_to` supports metric-aware vector scoring (Cosine, L2, Dot Product), FTS scoring, and multi-source hybrid fusion with RRF or weighted algorithms. It automatically uses the distance metric configured on the vector index. It works in `WHERE`, `RETURN`, `ORDER BY`, and Locy rule bodies. See the [Vector Search guide](../guides/vector-search.md#similar_to-expression-function) for full details.
 
 ## Uni-Xervo Runtime
 

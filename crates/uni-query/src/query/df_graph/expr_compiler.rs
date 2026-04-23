@@ -3,10 +3,13 @@
 
 use crate::query::df_expr::{TranslationContext, VariableKind, cypher_expr_to_df};
 use crate::query::df_graph::GraphExecutionContext;
-use crate::query::df_graph::common::{execute_subplan, extract_row_params};
+use crate::query::df_graph::common::{execute_subplan_with_outer_vars, extract_row_params};
 use crate::query::df_graph::comprehension::ListComprehensionExecExpr;
 use crate::query::df_graph::pattern_comprehension::{
     PatternComprehensionExecExpr, analyze_pattern, build_inner_schema, collect_inner_properties,
+};
+use crate::query::df_graph::pattern_exists::{
+    PatternExistsExecExpr, extract_pattern_from_exists_query, extract_target_property_predicates,
 };
 use crate::query::df_graph::quantifier::{QuantifierExecExpr, QuantifierType};
 use crate::query::df_graph::reduce::ReduceExecExpr;
@@ -200,6 +203,10 @@ pub struct CypherPhysicalExprCompiler<'a> {
     storage: Option<Arc<StorageManager>>,
     /// Query parameters for EXISTS subquery execution.
     params: HashMap<String, Value>,
+    /// Entity variable names from outer scopes (for nested EXISTS).
+    /// A target variable in a pattern predicate that appears here is a
+    /// correlated reference requiring per-row evaluation, not a fresh binding.
+    outer_entity_vars: HashSet<String>,
 }
 
 impl<'a> CypherPhysicalExprCompiler<'a> {
@@ -212,6 +219,7 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
             session_ctx: None,
             storage: None,
             params: HashMap::new(),
+            outer_entity_vars: HashSet::new(),
         }
     }
 
@@ -268,6 +276,7 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
             session_ctx: self.session_ctx.clone(),
             storage: self.storage.clone(),
             params: self.params.clone(),
+            outer_entity_vars: self.outer_entity_vars.clone(),
         }
     }
 
@@ -290,12 +299,14 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
         session_ctx: Arc<RwLock<SessionContext>>,
         storage: Arc<StorageManager>,
         params: HashMap<String, Value>,
+        outer_entity_vars: HashSet<String>,
     ) -> Self {
         self.graph_ctx = Some(graph_ctx);
         self.uni_schema = Some(uni_schema);
         self.session_ctx = Some(session_ctx);
         self.storage = Some(storage);
         self.params = params;
+        self.outer_entity_vars = outer_entity_vars;
         self
     }
 
@@ -420,8 +431,25 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
                 input_schema,
             ),
 
-            // EXISTS subquery: plan + execute per row, return boolean
-            Expr::Exists { query, .. } => self.compile_exists(query),
+            // EXISTS subquery: vectorized for pattern predicates, per-row for general EXISTS.
+            Expr::Exists {
+                query,
+                from_pattern_predicate,
+            } => {
+                if *from_pattern_predicate {
+                    match self.compile_pattern_exists(query, input_schema) {
+                        Ok(expr) => Ok(expr),
+                        Err(e) => {
+                            log::debug!(
+                                "Pattern exists vectorization failed, falling back to subquery: {e}"
+                            );
+                            self.compile_exists(query)
+                        }
+                    }
+                } else {
+                    self.compile_exists(query)
+                }
+            }
 
             // FunctionCall wrapping a custom expression (e.g. size(comprehension))
             Expr::FunctionCall {
@@ -687,6 +715,66 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
             session_ctx,
             storage,
             uni_schema,
+            self.params.clone(),
+            self.outer_entity_vars.clone(),
+        )))
+    }
+
+    /// Compile a pattern-predicate EXISTS into a vectorized `PatternExistsExecExpr`.
+    ///
+    /// Returns `Err` for unsupported patterns (triggers fallback to `ExistsExecExpr`).
+    fn compile_pattern_exists(
+        &self,
+        query: &Query,
+        input_schema: &Schema,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        let pattern = extract_pattern_from_exists_query(query)?;
+
+        let graph_ctx = self
+            .graph_ctx
+            .as_ref()
+            .ok_or_else(|| anyhow!("Pattern exists requires GraphExecutionContext"))?;
+        let uni_schema = self
+            .uni_schema
+            .as_ref()
+            .ok_or_else(|| anyhow!("Pattern exists requires UniSchema"))?;
+
+        let (anchor_col, steps) = analyze_pattern(&pattern, input_schema, uni_schema)?;
+
+        // Detect bound and correlated targets.
+        // - Bound: target variable has `._vid` column in input schema → check specific VID.
+        // - Correlated: target has a named variable NOT in the schema (from an outer EXISTS
+        //   scope, passed as a parameter). We can't resolve it → bail out.
+        let mut bound_target_columns: Vec<Option<String>> = Vec::with_capacity(steps.len());
+        for step in &steps {
+            if let Some(var) = &step.target_variable {
+                let vid_col = format!("{}._vid", var);
+                if input_schema.column_with_name(&vid_col).is_some() {
+                    bound_target_columns.push(Some(vid_col));
+                } else if self.outer_entity_vars.contains(var) {
+                    // Named variable from outer scope — correlated, can't vectorize.
+                    anyhow::bail!(
+                        "Pattern target '{}' is a correlated reference from an outer scope",
+                        var
+                    );
+                } else {
+                    // Fresh binding introduced by the pattern — not correlated.
+                    bound_target_columns.push(None);
+                }
+            } else {
+                bound_target_columns.push(None);
+            }
+        }
+
+        let property_preds = extract_target_property_predicates(&pattern, &steps, uni_schema)?;
+
+        Ok(Arc::new(PatternExistsExecExpr::new(
+            graph_ctx.clone(),
+            anchor_col,
+            steps,
+            Arc::new(input_schema.clone()),
+            property_preds,
+            bound_target_columns,
             self.params.clone(),
         )))
     }
@@ -2055,6 +2143,9 @@ struct ExistsExecExpr {
     storage: Arc<StorageManager>,
     uni_schema: Arc<UniSchema>,
     params: HashMap<String, Value>,
+    /// Entity variable names from outer scopes, threaded into nested subplans
+    /// so the inner expression compiler can detect correlated references.
+    outer_entity_vars: HashSet<String>,
 }
 
 impl std::fmt::Debug for ExistsExecExpr {
@@ -2071,6 +2162,7 @@ impl ExistsExecExpr {
         storage: Arc<StorageManager>,
         uni_schema: Arc<UniSchema>,
         params: HashMap<String, Value>,
+        outer_entity_vars: HashSet<String>,
     ) -> Self {
         Self {
             query,
@@ -2079,6 +2171,7 @@ impl ExistsExecExpr {
             storage,
             uni_schema,
             params,
+            outer_entity_vars,
         }
     }
 }
@@ -2206,6 +2299,11 @@ impl PhysicalExpr for ExistsExecExpr {
                         ))
                     })?;
 
+                // Merge stored outer entity vars with batch-extracted vars
+                // so the inner planner's compiler can detect correlated refs.
+                let mut combined_entity_vars = self.outer_entity_vars.clone();
+                combined_entity_vars.extend(entity_vars.iter().cloned());
+
                 for row_idx in 0..num_rows {
                     let row_params = extract_row_params(batch, row_idx);
                     let mut sub_params = base_params.clone();
@@ -2220,7 +2318,7 @@ impl PhysicalExpr for ExistsExecExpr {
                         }
                     }
 
-                    let batches = rt.block_on(execute_subplan(
+                    let batches = rt.block_on(execute_subplan_with_outer_vars(
                         &logical_plan,
                         &sub_params,
                         &HashMap::new(), // No outer values for EXISTS subquery
@@ -2228,6 +2326,7 @@ impl PhysicalExpr for ExistsExecExpr {
                         &session_ctx,
                         &storage,
                         &uni_schema,
+                        &combined_entity_vars,
                     ))?;
 
                     let has_rows = batches.iter().any(|b| b.num_rows() > 0);

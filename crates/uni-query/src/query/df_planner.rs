@@ -136,6 +136,11 @@ pub struct HybridPhysicalPlanner {
     /// Mutation context for write operations (CREATE, SET, REMOVE, DELETE).
     /// Present only when the query contains write clauses.
     mutation_ctx: Option<Arc<MutationContext>>,
+
+    /// Entity variable names from outer scopes, threaded through for nested EXISTS
+    /// so the expression compiler can distinguish fresh pattern bindings from
+    /// correlated references.
+    outer_entity_vars: HashSet<String>,
 }
 
 impl std::fmt::Debug for HybridPhysicalPlanner {
@@ -182,6 +187,7 @@ impl HybridPhysicalPlanner {
             params,
             outer_values: HashMap::new(),
             mutation_ctx: None,
+            outer_entity_vars: HashSet::new(),
         }
     }
 
@@ -271,6 +277,7 @@ impl HybridPhysicalPlanner {
             params,
             outer_values,
             mutation_ctx: None,
+            outer_entity_vars: HashSet::new(),
         }
     }
 
@@ -308,6 +315,11 @@ impl HybridPhysicalPlanner {
     /// Set the algorithm registry for `uni.algo.*` procedure dispatch.
     ///
     /// Rebuilds the inner `GraphExecutionContext` with the registry attached.
+    /// Set outer entity variable names for nested EXISTS correlated reference detection.
+    pub fn set_outer_entity_vars(&mut self, vars: HashSet<String>) {
+        self.outer_entity_vars = vars;
+    }
+
     pub fn with_algo_registry(mut self, registry: Arc<AlgorithmRegistry>) -> Self {
         let ctx = self.take_graph_ctx().with_algo_registry(registry);
         self.graph_ctx = Arc::new(ctx);
@@ -2640,6 +2652,7 @@ impl HybridPhysicalPlanner {
             self.session_ctx.clone(),
             self.storage.clone(),
             self.params.clone(),
+            self.outer_entity_vars.clone(),
         );
         let physical_predicate = compiler.compile(predicate, &schema)?;
 
@@ -2842,6 +2855,7 @@ impl HybridPhysicalPlanner {
                 self.session_ctx.clone(),
                 self.storage.clone(),
                 self.params.clone(),
+                self.outer_entity_vars.clone(),
             );
             let physical_expr = compiler.compile(expr, &schema)?;
 
@@ -2920,6 +2934,7 @@ impl HybridPhysicalPlanner {
                 self.session_ctx.clone(),
                 self.storage.clone(),
                 self.params.clone(),
+                self.outer_entity_vars.clone(),
             );
             let physical_expr = compiler.compile(expr, &schema)?;
 
@@ -3004,6 +3019,7 @@ impl HybridPhysicalPlanner {
                         self.session_ctx.clone(),
                         self.storage.clone(),
                         self.params.clone(),
+                        self.outer_entity_vars.clone(),
                     );
                 compiler.compile(expr, &schema)?
             } else {
@@ -3397,6 +3413,7 @@ impl HybridPhysicalPlanner {
                             self.session_ctx.clone(),
                             self.storage.clone(),
                             self.params.clone(),
+                            self.outer_entity_vars.clone(),
                         );
                     let physical_expr = compiler.compile(arg, schema)?;
 
@@ -3503,6 +3520,7 @@ impl HybridPhysicalPlanner {
                         self.session_ctx.clone(),
                         self.storage.clone(),
                         self.params.clone(),
+                        self.outer_entity_vars.clone(),
                     );
                 let inner_physical = compiler.compile(&sort_expr, &schema)?;
 

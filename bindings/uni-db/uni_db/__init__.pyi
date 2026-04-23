@@ -525,6 +525,7 @@ class PropertyInfo:
     data_type: str
     nullable: bool
     is_indexed: bool
+    description: str | None
 
 class IndexInfo:
     """Information about an index."""
@@ -550,6 +551,7 @@ class LabelInfo:
     properties: list[PropertyInfo]
     indexes: list[IndexInfo]
     constraints: list[ConstraintInfo]
+    description: str | None
 
 class EdgeTypeInfo:
     """Information about an edge type."""
@@ -561,6 +563,7 @@ class EdgeTypeInfo:
     properties: list[PropertyInfo]
     indexes: list[IndexInfo]
     constraints: list[ConstraintInfo]
+    description: str | None
 
 class RuleInfo:
     """Metadata about a registered Locy rule."""
@@ -983,18 +986,25 @@ class SchemaBuilder:
 
     def current(self) -> dict[str, Any]: ...
     def current_typed(self) -> Schema: ...
-    def label(self, name: str) -> LabelBuilder: ...
+    def label(self, name: str, *, description: str | None = None) -> LabelBuilder: ...
     def edge_type(
-        self, name: str, from_labels: list[str], to_labels: list[str]
+        self,
+        name: str,
+        from_labels: list[str],
+        to_labels: list[str],
+        *,
+        description: str | None = None,
     ) -> EdgeTypeBuilder: ...
     def apply(self) -> None: ...
 
 class LabelBuilder:
     """Builder for defining a vertex label."""
 
-    def property(self, name: str, data_type: str | DataType) -> LabelBuilder: ...
+    def property(
+        self, name: str, data_type: str | DataType, *, description: str | None = None
+    ) -> LabelBuilder: ...
     def property_nullable(
-        self, name: str, data_type: str | DataType
+        self, name: str, data_type: str | DataType, *, description: str | None = None
     ) -> LabelBuilder: ...
     def vector(self, name: str, dimensions: int) -> LabelBuilder: ...
     def index(
@@ -1006,9 +1016,11 @@ class LabelBuilder:
 class EdgeTypeBuilder:
     """Builder for defining an edge type."""
 
-    def property(self, name: str, data_type: str | DataType) -> EdgeTypeBuilder: ...
+    def property(
+        self, name: str, data_type: str | DataType, *, description: str | None = None
+    ) -> EdgeTypeBuilder: ...
     def property_nullable(
-        self, name: str, data_type: str | DataType
+        self, name: str, data_type: str | DataType, *, description: str | None = None
     ) -> EdgeTypeBuilder: ...
     def done(self) -> SchemaBuilder: ...
     def apply(self) -> None: ...
@@ -2082,18 +2094,27 @@ class AsyncSchemaBuilder:
 
     def current(self) -> dict[str, Any]: ...
     def current_typed(self) -> Schema: ...
-    def label(self, name: str) -> AsyncLabelBuilder: ...
+    def label(
+        self, name: str, *, description: str | None = None
+    ) -> AsyncLabelBuilder: ...
     def edge_type(
-        self, name: str, from_labels: list[str], to_labels: list[str]
+        self,
+        name: str,
+        from_labels: list[str],
+        to_labels: list[str],
+        *,
+        description: str | None = None,
     ) -> AsyncEdgeTypeBuilder: ...
     async def apply(self) -> None: ...
 
 class AsyncLabelBuilder:
     """Async builder for defining a vertex label."""
 
-    def property(self, name: str, data_type: str | DataType) -> AsyncLabelBuilder: ...
+    def property(
+        self, name: str, data_type: str | DataType, *, description: str | None = None
+    ) -> AsyncLabelBuilder: ...
     def property_nullable(
-        self, name: str, data_type: str | DataType
+        self, name: str, data_type: str | DataType, *, description: str | None = None
     ) -> AsyncLabelBuilder: ...
     def vector(self, name: str, dimensions: int) -> AsyncLabelBuilder: ...
     def index(
@@ -2106,9 +2127,11 @@ class AsyncEdgeTypeBuilder:
     """Async builder for defining an edge type."""
 
     def property(
-        self, name: str, data_type: str | DataType
+        self, name: str, data_type: str | DataType, *, description: str | None = None
     ) -> AsyncEdgeTypeBuilder: ...
-    def property_nullable(self, name: str, data_type: str) -> AsyncEdgeTypeBuilder: ...
+    def property_nullable(
+        self, name: str, data_type: str | DataType, *, description: str | None = None
+    ) -> AsyncEdgeTypeBuilder: ...
     def done(self) -> AsyncSchemaBuilder: ...
     async def apply(self) -> None: ...
 

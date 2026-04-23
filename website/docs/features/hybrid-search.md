@@ -174,7 +174,7 @@ RETURN node.title, score, vector_score, fts_score
 For scoring already-bound nodes (rather than top-K retrieval), use the `similar_to()` expression function. It works in `WHERE`, `RETURN`, `ORDER BY`, and Locy rule bodies:
 
 ```cypher
--- Hybrid scoring as an expression
+-- Hybrid scoring as an expression (correct way)
 MATCH (d:Document)
 RETURN d.title,
   similar_to([d.embedding, d.content], 'machine learning') AS relevance
@@ -192,6 +192,26 @@ RETURN d.title
 
 !!! note "RRF in point-computation context"
     Because `similar_to()` scores one node at a time (no ranked list), RRF fusion degenerates to equal-weight averaging. A `RrfPointContext` warning is emitted in this case. Use `method: 'weighted'` for explicit control over source weights.
+
+### Correct vs Incorrect Hybrid
+
+Always use a **single** `similar_to` call with multi-source arrays for hybrid search:
+
+```cypher
+-- ✅ CORRECT: single call with fusion and BM25 normalization
+MATCH (d:Document)
+RETURN d.title,
+  similar_to([d.embedding, d.content], [$qvec, $qtxt]) AS score
+ORDER BY score DESC
+
+-- ❌ INCORRECT: naive addition mixes incompatible score scales
+MATCH (d:Document)
+RETURN d.title,
+  (similar_to(d.embedding, $qvec) + similar_to(d.content, $qtxt)) AS score
+ORDER BY score DESC
+```
+
+Adding two separate `similar_to` calls produces raw score addition without normalization — cosine similarity scores ([0, 1]) and BM25 scores (unbounded) live on different scales. The multi-source form normalizes BM25 via a saturation function (`score / (score + fts_k)`) before fusion.
 
 See the [Vector Search guide](../guides/vector-search.md#similar_to-expression-function) for full documentation.
 

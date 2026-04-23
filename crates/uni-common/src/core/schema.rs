@@ -199,6 +199,8 @@ pub struct PropertyMeta {
     pub state: SchemaElementState,
     #[serde(default)]
     pub generation_expression: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -208,6 +210,8 @@ pub struct LabelMeta {
     pub created_at: DateTime<Utc>,
     #[serde(default = "default_state")]
     pub state: SchemaElementState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -218,6 +222,8 @@ pub struct EdgeTypeMeta {
     pub dst_labels: Vec<String>,
     #[serde(default = "default_state")]
     pub state: SchemaElementState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -622,6 +628,14 @@ pub struct EmbeddingConfig {
     pub alias: String,
     pub source_properties: Vec<String>,
     pub batch_size: usize,
+    /// Prefix prepended to text before embedding during auto-embed (document side).
+    /// Example: `"search_document: "` for Nomic models. Include any trailing space.
+    #[serde(default)]
+    pub document_prefix: Option<String>,
+    /// Prefix prepended to text before embedding during query-time embed calls.
+    /// Example: `"search_query: "` for Nomic models. Include any trailing space.
+    #[serde(default)]
+    pub query_prefix: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -940,6 +954,27 @@ impl SchemaManager {
                 id,
                 created_at: Utc::now(),
                 state: SchemaElementState::Active,
+                description: None,
+            },
+        );
+        Ok(id)
+    }
+
+    pub fn add_label_with_desc(&self, name: &str, description: Option<String>) -> Result<u16> {
+        let mut guard = acquire_write(&self.schema, "schema")?;
+        let schema = Arc::make_mut(&mut *guard);
+        if schema.labels.contains_key(name) {
+            return Err(anyhow!("Label '{}' already exists", name));
+        }
+
+        let id = schema.labels.values().map(|l| l.id).max().unwrap_or(0) + 1;
+        schema.labels.insert(
+            name.to_string(),
+            LabelMeta {
+                id,
+                created_at: Utc::now(),
+                state: SchemaElementState::Active,
+                description,
             },
         );
         Ok(id)
@@ -971,6 +1006,39 @@ impl SchemaManager {
                 src_labels,
                 dst_labels,
                 state: SchemaElementState::Active,
+                description: None,
+            },
+        );
+        Ok(id)
+    }
+
+    pub fn add_edge_type_with_desc(
+        &self,
+        name: &str,
+        src_labels: Vec<String>,
+        dst_labels: Vec<String>,
+        description: Option<String>,
+    ) -> Result<u32> {
+        let mut guard = acquire_write(&self.schema, "schema")?;
+        let schema = Arc::make_mut(&mut *guard);
+        if schema.edge_types.contains_key(name) {
+            return Err(anyhow!("Edge type '{}' already exists", name));
+        }
+
+        let id = schema.edge_types.values().map(|t| t.id).max().unwrap_or(0) + 1;
+
+        if id >= MAX_SCHEMA_TYPE_ID {
+            return Err(anyhow!("Schema edge type ID exhaustion"));
+        }
+
+        schema.edge_types.insert(
+            name.to_string(),
+            EdgeTypeMeta {
+                id,
+                src_labels,
+                dst_labels,
+                state: SchemaElementState::Active,
+                description,
             },
         );
         Ok(id)
@@ -1022,6 +1090,45 @@ impl SchemaManager {
                 added_in: version,
                 state: SchemaElementState::Active,
                 generation_expression: None,
+                description: None,
+            },
+        );
+        Ok(())
+    }
+
+    pub fn add_property_with_desc(
+        &self,
+        label_or_type: &str,
+        prop_name: &str,
+        data_type: DataType,
+        nullable: bool,
+        description: Option<String>,
+    ) -> Result<()> {
+        let mut guard = acquire_write(&self.schema, "schema")?;
+        let schema = Arc::make_mut(&mut *guard);
+        let version = schema.schema_version;
+        let props = schema
+            .properties
+            .entry(label_or_type.to_string())
+            .or_default();
+
+        if props.contains_key(prop_name) {
+            return Err(anyhow!(
+                "Property '{}' already exists for '{}'",
+                prop_name,
+                label_or_type
+            ));
+        }
+
+        props.insert(
+            prop_name.to_string(),
+            PropertyMeta {
+                r#type: data_type,
+                nullable,
+                added_in: version,
+                state: SchemaElementState::Active,
+                generation_expression: None,
+                description,
             },
         );
         Ok(())
@@ -1054,8 +1161,50 @@ impl SchemaManager {
                 added_in: version,
                 state: SchemaElementState::Active,
                 generation_expression: Some(expr),
+                description: None,
             },
         );
+        Ok(())
+    }
+
+    pub fn set_label_description(&self, name: &str, description: Option<String>) -> Result<()> {
+        let mut guard = acquire_write(&self.schema, "schema")?;
+        let schema = Arc::make_mut(&mut *guard);
+        let meta = schema
+            .labels
+            .get_mut(name)
+            .ok_or_else(|| anyhow!("Label '{}' does not exist", name))?;
+        meta.description = description;
+        Ok(())
+    }
+
+    pub fn set_edge_type_description(&self, name: &str, description: Option<String>) -> Result<()> {
+        let mut guard = acquire_write(&self.schema, "schema")?;
+        let schema = Arc::make_mut(&mut *guard);
+        let meta = schema
+            .edge_types
+            .get_mut(name)
+            .ok_or_else(|| anyhow!("Edge type '{}' does not exist", name))?;
+        meta.description = description;
+        Ok(())
+    }
+
+    pub fn set_property_description(
+        &self,
+        entity: &str,
+        prop_name: &str,
+        description: Option<String>,
+    ) -> Result<()> {
+        let mut guard = acquire_write(&self.schema, "schema")?;
+        let schema = Arc::make_mut(&mut *guard);
+        let props = schema
+            .properties
+            .get_mut(entity)
+            .ok_or_else(|| anyhow!("Entity '{}' does not exist", entity))?;
+        let meta = props
+            .get_mut(prop_name)
+            .ok_or_else(|| anyhow!("Property '{}' does not exist on '{}'", prop_name, entity))?;
+        meta.description = description;
         Ok(())
     }
 
@@ -1403,6 +1552,7 @@ mod tests {
                 id: 1,
                 created_at: chrono::Utc::now(),
                 state: SchemaElementState::Active,
+                description: None,
             },
         );
 

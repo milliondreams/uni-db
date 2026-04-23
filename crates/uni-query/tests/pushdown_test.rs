@@ -159,6 +159,7 @@ fn create_test_schema_with_label(label: &str, label_id: u16) -> Schema {
             id: label_id,
             created_at: chrono::Utc::now(),
             state: SchemaElementState::Active,
+            description: None,
         },
     );
     schema
@@ -288,6 +289,7 @@ fn create_test_schema_with_btree_index(label: &str, label_id: u16, index_propert
             id: label_id,
             created_at: chrono::Utc::now(),
             state: SchemaElementState::Active,
+            description: None,
         },
     );
     schema

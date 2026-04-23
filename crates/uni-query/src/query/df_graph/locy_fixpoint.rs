@@ -188,16 +188,14 @@ impl MonotonicAggState {
                         let old = *entry;
                         match binding.kind {
                             FoldAggKind::Sum | FoldAggKind::Count => *entry += val,
-                            FoldAggKind::Max => {
-                                if val > *entry {
-                                    *entry = val;
-                                }
+                            FoldAggKind::Max if val > *entry => {
+                                *entry = val;
                             }
-                            FoldAggKind::Min => {
-                                if val < *entry {
-                                    *entry = val;
-                                }
+                            FoldAggKind::Max => {}
+                            FoldAggKind::Min if val < *entry => {
+                                *entry = val;
                             }
+                            FoldAggKind::Min => {}
                             FoldAggKind::Nor => {
                                 if strict && !(0.0..=1.0).contains(&val) {
                                     return Err(datafusion::error::DataFusionError::Execution(
@@ -1590,7 +1588,7 @@ fn detect_shared_lineage(
             // Collect the group rows with their base facts for BDD use.
             let rows: Vec<SharedGroupRow> = fact_hashes
                 .iter()
-                .zip(per_row_bases.into_iter())
+                .zip(per_row_bases)
                 .map(|(fh, bases)| SharedGroupRow {
                     fact_hash: fh.clone(),
                     lineage: bases,

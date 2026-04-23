@@ -1095,6 +1095,8 @@ mod auto_embed_tests {
                         alias: "embed/default".to_string(),
                         source_properties: vec!["title".to_string(), "body".to_string()],
                         batch_size: 32,
+                        document_prefix: None,
+                        query_prefix: None,
                     }),
                 }),
             )
@@ -1179,6 +1181,8 @@ mod auto_embed_tests {
                         alias: "embed/default".to_string(),
                         source_properties: vec!["title".to_string(), "body".to_string()],
                         batch_size: 32,
+                        document_prefix: None,
+                        query_prefix: None,
                     }),
                 }),
             )
@@ -1542,4 +1546,63 @@ mod metric_tests {
 
         Ok(())
     }
+}
+
+// ── Regression: Issue #39 — similar_to FTS must work without flush ───────────
+
+/// Verifies that `similar_to()` in FTS mode returns correct scores for data
+/// that has been committed but not yet flushed to Lance storage (L0-only data).
+///
+/// Previously, `fts_search_batch()` did not pass a `QueryContext`, so L0 data
+/// was invisible to the FTS search path. The `CALL uni.fts.query()` procedure
+/// worked correctly because it passed the query context.
+///
+/// See: https://github.com/rustic-ai/uni-db/issues/39
+#[tokio::test]
+async fn test_similar_to_fts_without_flush() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+
+    db.schema()
+        .label("Doc")
+        .property("title", DataType::String)
+        .property("content", DataType::String)
+        .index("content", IndexType::FullText)
+        .done()
+        .apply()
+        .await?;
+
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE (:Doc {title: 'Alpha', content: 'rust systems programming language'})")
+        .await?;
+    tx.execute("CREATE (:Doc {title: 'Beta', content: 'python data science scripting'})")
+        .await?;
+    tx.commit().await?;
+    // Intentionally NO db.flush() — data is in L0 only
+
+    let result = session
+        .query(
+            "MATCH (d:Doc) \
+             RETURN d.title AS title, similar_to(d.content, 'rust') AS score \
+             ORDER BY score DESC",
+        )
+        .await?;
+
+    assert_eq!(result.len(), 2);
+
+    let top_title: String = result.rows()[0].get("title")?;
+    let top_score: f64 = result.rows()[0].get("score")?;
+    let bot_score: f64 = result.rows()[1].get("score")?;
+
+    assert_eq!(top_title, "Alpha");
+    assert!(
+        top_score > 0.0,
+        "Alpha contains 'rust' but similar_to returned {top_score} (L0-only, no flush)"
+    );
+    assert!(
+        bot_score.abs() < 1e-5,
+        "Beta doesn't contain 'rust' but got {bot_score}"
+    );
+
+    Ok(())
 }

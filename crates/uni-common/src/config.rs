@@ -10,7 +10,7 @@ pub struct CompactionConfig {
     /// Enable background compaction (default: true)
     pub enabled: bool,
 
-    /// Max L1 runs before triggering compaction (default: 4)
+    /// Max uncompacted flush generations before triggering compaction (default: 8)
     pub max_l1_runs: usize,
 
     /// Max L1 size in bytes before compaction (default: 256MB)
@@ -19,7 +19,7 @@ pub struct CompactionConfig {
     /// Max age of oldest L1 run before compaction (default: 1 hour)
     pub max_l1_age: Duration,
 
-    /// Background check interval (default: 30s)
+    /// Background check interval (default: 10s)
     pub check_interval: Duration,
 
     /// Number of compaction worker threads (default: 1)
@@ -30,10 +30,10 @@ impl Default for CompactionConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            max_l1_runs: 4,
+            max_l1_runs: 8,
             max_l1_size_bytes: 256 * 1024 * 1024,
             max_l1_age: Duration::from_secs(3600),
-            check_interval: Duration::from_secs(30),
+            check_interval: Duration::from_secs(10),
             worker_threads: 1,
         }
     }
@@ -76,10 +76,10 @@ impl Default for IndexRebuildConfig {
 
 #[derive(Clone, Copy, Debug)]
 pub struct WriteThrottleConfig {
-    /// L1 run count to start throttling (default: 8)
+    /// Uncompacted flush generations to start throttling (default: 16)
     pub soft_limit: usize,
 
-    /// L1 run count to stop writes entirely (default: 16)
+    /// Uncompacted flush generations to stop writes entirely (default: 32)
     pub hard_limit: usize,
 
     /// Base delay when throttling (default: 10ms)
@@ -89,8 +89,8 @@ pub struct WriteThrottleConfig {
 impl Default for WriteThrottleConfig {
     fn default() -> Self {
         Self {
-            soft_limit: 8,
-            hard_limit: 16,
+            soft_limit: 16,
+            hard_limit: 32,
             base_delay: Duration::from_millis(10),
         }
     }
@@ -461,6 +461,11 @@ pub struct UniConfig {
 
     /// Background index rebuild configuration
     pub index_rebuild: IndexRebuildConfig,
+
+    /// When true, reject writes that reference labels or edge types not declared
+    /// in the schema. Default: false (schemaless mode — any label or edge type
+    /// is accepted and dynamically registered).
+    pub strict_schema: bool,
 }
 
 impl Default for UniConfig {
@@ -489,6 +494,7 @@ impl Default for UniConfig {
             max_recursive_cte_iterations: 1000,
             object_store: ObjectStoreConfig::default(),
             index_rebuild: IndexRebuildConfig::default(),
+            strict_schema: false,
         }
     }
 }

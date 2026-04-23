@@ -1,7 +1,7 @@
 [
   {
     "name": "AbductiveReasoning",
-    "uri": "/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/abduce/AbductiveReasoning.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/abduce/AbductiveReasoning.feature",
     "elements": [
       {
         "type": "scenario",
@@ -63,7 +63,7 @@
   },
   {
     "name": "PathCarriedValues",
-    "uri": "/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/along/PathCarriedValues.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/along/PathCarriedValues.feature",
     "elements": [
       {
         "type": "scenario",
@@ -195,7 +195,7 @@
   },
   {
     "name": "Hypothetical",
-    "uri": "/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/assume/Hypothetical.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/assume/Hypothetical.feature",
     "elements": [
       {
         "type": "scenario",
@@ -285,7 +285,7 @@
   },
   {
     "name": "OptimizedSelection",
-    "uri": "/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/bestby/OptimizedSelection.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/bestby/OptimizedSelection.feature",
     "elements": [
       {
         "type": "scenario",
@@ -375,7 +375,7 @@
   },
   {
     "name": "AssumeAbduce",
-    "uri": "/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/AssumeAbduce.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/combinations/AssumeAbduce.feature",
     "elements": [
       {
         "type": "scenario",
@@ -423,7 +423,7 @@
   },
   {
     "name": "AssumeAbduceExtended",
-    "uri": "/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/AssumeAbduceExtended.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/combinations/AssumeAbduceExtended.feature",
     "elements": [
       {
         "type": "scenario",
@@ -709,7 +709,7 @@
   },
   {
     "name": "AssumeNestedAbduce",
-    "uri": "/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/AssumeNestedAbduce.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/combinations/AssumeNestedAbduce.feature",
     "elements": [
       {
         "type": "scenario",
@@ -771,7 +771,7 @@
   },
   {
     "name": "CompositePatterns",
-    "uri": "/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/CompositePatterns.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/combinations/CompositePatterns.feature",
     "elements": [
       {
         "type": "scenario",
@@ -1155,7 +1155,7 @@
   },
   {
     "name": "ExplainCombinations",
-    "uri": "/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/ExplainCombinations.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/combinations/ExplainCombinations.feature",
     "elements": [
       {
         "type": "scenario",
@@ -1245,7 +1245,7 @@
   },
   {
     "name": "FeatureCombinationMatrix",
-    "uri": "/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FeatureCombinationMatrix.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/combinations/FeatureCombinationMatrix.feature",
     "elements": [
       {
         "type": "scenario",
@@ -1335,7 +1335,7 @@
   },
   {
     "name": "FoldExecutionPaths",
-    "uri": "/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/combinations/FoldExecutionPaths.feature",
     "elements": [
       {
         "type": "scenario",
@@ -1789,7 +1789,7 @@
   },
   {
     "name": "IsNotFoldQueryMatrix",
-    "uri": "/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/IsNotFoldQueryMatrix.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/combinations/IsNotFoldQueryMatrix.feature",
     "elements": [
       {
         "type": "scenario",
@@ -2075,7 +2075,7 @@
   },
   {
     "name": "PathCombinations",
-    "uri": "/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/PathCombinations.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/combinations/PathCombinations.feature",
     "elements": [
       {
         "type": "scenario",
@@ -2151,7 +2151,7 @@
   },
   {
     "name": "ProbAbduceAssume",
-    "uri": "/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/ProbAbduceAssume.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/combinations/ProbAbduceAssume.feature",
     "elements": [
       {
         "type": "scenario",
@@ -2241,7 +2241,7 @@
   },
   {
     "name": "SemanticParity",
-    "uri": "/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/SemanticParity.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/combinations/SemanticParity.feature",
     "elements": [
       {
         "type": "scenario",
@@ -2345,7 +2345,7 @@
   },
   {
     "name": "SimilarToAbduceAssume",
-    "uri": "/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/SimilarToAbduceAssume.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/combinations/SimilarToAbduceAssume.feature",
     "elements": [
       {
         "type": "scenario",
@@ -2421,7 +2421,7 @@
   },
   {
     "name": "SimilarToProbability",
-    "uri": "/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/SimilarToProbability.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/combinations/SimilarToProbability.feature",
     "elements": [
       {
         "type": "scenario",
@@ -2511,7 +2511,7 @@
   },
   {
     "name": "TripleCombinations",
-    "uri": "/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/combinations/TripleCombinations.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/combinations/TripleCombinations.feature",
     "elements": [
       {
         "type": "scenario",
@@ -2587,7 +2587,7 @@
   },
   {
     "name": "Stratification",
-    "uri": "/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/compile/Stratification.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/compile/Stratification.feature",
     "elements": [
       {
         "type": "scenario",
@@ -2677,7 +2677,7 @@
   },
   {
     "name": "DeriveEdges",
-    "uri": "/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/derive/DeriveEdges.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/derive/DeriveEdges.feature",
     "elements": [
       {
         "type": "scenario",
@@ -2809,7 +2809,7 @@
   },
   {
     "name": "DeriveVisibility",
-    "uri": "/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/derive/DeriveVisibility.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/derive/DeriveVisibility.feature",
     "elements": [
       {
         "type": "scenario",
@@ -2913,7 +2913,7 @@
   },
   {
     "name": "AlongWithIsRef",
-    "uri": "/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/evaluate/AlongWithIsRef.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/evaluate/AlongWithIsRef.feature",
     "elements": [
       {
         "type": "scenario",
@@ -2961,7 +2961,7 @@
   },
   {
     "name": "CypherFunctions",
-    "uri": "/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/evaluate/CypherFunctions.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/evaluate/CypherFunctions.feature",
     "elements": [
       {
         "type": "scenario",
@@ -3093,7 +3093,7 @@
   },
   {
     "name": "ErrorConditions",
-    "uri": "/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/evaluate/ErrorConditions.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/evaluate/ErrorConditions.feature",
     "elements": [
       {
         "type": "scenario",
@@ -3169,7 +3169,7 @@
   },
   {
     "name": "MultiStratum",
-    "uri": "/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/evaluate/MultiStratum.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/evaluate/MultiStratum.feature",
     "elements": [
       {
         "type": "scenario",
@@ -3217,7 +3217,7 @@
   },
   {
     "name": "NonRecursive",
-    "uri": "/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/evaluate/NonRecursive.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/evaluate/NonRecursive.feature",
     "elements": [
       {
         "type": "scenario",
@@ -3279,7 +3279,7 @@
   },
   {
     "name": "ParameterBinding",
-    "uri": "/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/evaluate/ParameterBinding.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/evaluate/ParameterBinding.feature",
     "elements": [
       {
         "type": "scenario",
@@ -3355,7 +3355,7 @@
   },
   {
     "name": "TransitiveClosure",
-    "uri": "/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/evaluate/TransitiveClosure.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/evaluate/TransitiveClosure.feature",
     "elements": [
       {
         "type": "scenario",
@@ -3389,7 +3389,7 @@
   },
   {
     "name": "YieldValueColumns",
-    "uri": "/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/evaluate/YieldValueColumns.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/evaluate/YieldValueColumns.feature",
     "elements": [
       {
         "type": "scenario",
@@ -3479,7 +3479,7 @@
   },
   {
     "name": "ProofTraces",
-    "uri": "/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/explain/ProofTraces.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/explain/ProofTraces.feature",
     "elements": [
       {
         "type": "scenario",
@@ -3527,7 +3527,7 @@
   },
   {
     "name": "Aggregation",
-    "uri": "/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/fold/Aggregation.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/fold/Aggregation.feature",
     "elements": [
       {
         "type": "scenario",
@@ -3687,7 +3687,7 @@
   },
   {
     "name": "ReservedKeywords",
-    "uri": "/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/lexical/ReservedKeywords.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/lexical/ReservedKeywords.feature",
     "elements": [
       {
         "type": "scenario",
@@ -3945,7 +3945,7 @@
   },
   {
     "name": "ModuleComposition",
-    "uri": "/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/modules/ModuleComposition.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/modules/ModuleComposition.feature",
     "elements": [
       {
         "type": "scenario",
@@ -4063,7 +4063,7 @@
   },
   {
     "name": "ExactProbability",
-    "uri": "/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/monotonic/ExactProbability.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/monotonic/ExactProbability.feature",
     "elements": [
       {
         "type": "scenario",
@@ -4279,7 +4279,7 @@
   },
   {
     "name": "MathematicalReference",
-    "uri": "/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/monotonic/MathematicalReference.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/monotonic/MathematicalReference.feature",
     "elements": [
       {
         "type": "scenario",
@@ -4453,7 +4453,7 @@
   },
   {
     "name": "MonotonicAggregation",
-    "uri": "/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/monotonic/MonotonicAggregation.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/monotonic/MonotonicAggregation.feature",
     "elements": [
       {
         "type": "scenario",
@@ -4879,7 +4879,7 @@
   },
   {
     "name": "ProbabilisticComplement",
-    "uri": "/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/monotonic/ProbabilisticComplement.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/monotonic/ProbabilisticComplement.feature",
     "elements": [
       {
         "type": "scenario",
@@ -5151,7 +5151,7 @@
   },
   {
     "name": "ProbabilisticStress",
-    "uri": "/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/monotonic/ProbabilisticStress.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/monotonic/ProbabilisticStress.feature",
     "elements": [
       {
         "type": "scenario",
@@ -5297,7 +5297,7 @@
   },
   {
     "name": "SharedProofDetection",
-    "uri": "/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/monotonic/SharedProofDetection.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/monotonic/SharedProofDetection.feature",
     "elements": [
       {
         "type": "scenario",
@@ -5359,7 +5359,7 @@
   },
   {
     "name": "TopKProofs",
-    "uri": "/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/monotonic/TopKProofs.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/monotonic/TopKProofs.feature",
     "elements": [
       {
         "type": "scenario",
@@ -5421,7 +5421,7 @@
   },
   {
     "name": "StratifiedNegation",
-    "uri": "/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/negation/StratifiedNegation.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/negation/StratifiedNegation.feature",
     "elements": [
       {
         "type": "scenario",
@@ -5497,7 +5497,7 @@
   },
   {
     "name": "PrioritizedRules",
-    "uri": "/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/priority/PrioritizedRules.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/priority/PrioritizedRules.feature",
     "elements": [
       {
         "type": "scenario",
@@ -5573,7 +5573,7 @@
   },
   {
     "name": "FoldQueryProjection",
-    "uri": "/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/query/FoldQueryProjection.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/query/FoldQueryProjection.feature",
     "elements": [
       {
         "type": "scenario",
@@ -5635,7 +5635,7 @@
   },
   {
     "name": "GoalDirected",
-    "uri": "/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/query/GoalDirected.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/query/GoalDirected.feature",
     "elements": [
       {
         "type": "scenario",
@@ -5767,7 +5767,7 @@
   },
   {
     "name": "BasicRules",
-    "uri": "/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/rules/BasicRules.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/rules/BasicRules.feature",
     "elements": [
       {
         "type": "scenario",
@@ -5857,7 +5857,7 @@
   },
   {
     "name": "RecursiveRules",
-    "uri": "/home/rohit/work/dragonscale/uni-lance-upgrade/crates/uni-locy-tck/tck/features/rules/RecursiveRules.feature",
+    "uri": "/home/rohit/work/dragonscale/uni/crates/uni-locy-tck/tck/features/rules/RecursiveRules.feature",
     "elements": [
       {
         "type": "scenario",

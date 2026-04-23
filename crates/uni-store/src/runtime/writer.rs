@@ -58,6 +58,9 @@ pub struct Writer {
     compaction_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
     /// Optional index rebuild manager for post-flush automatic rebuild scheduling
     index_rebuild_manager: Option<Arc<crate::storage::index_rebuild::IndexRebuildManager>>,
+    /// Cached snapshot manifest from the last flush. Avoids re-reading from
+    /// object store on every flush_to_l1 call.
+    cached_manifest: Option<SnapshotManifest>,
 }
 
 impl Writer {
@@ -115,6 +118,7 @@ impl Writer {
             last_flush_time: std::time::Instant::now(),
             compaction_handle: Arc::new(RwLock::new(None)),
             index_rebuild_manager: None,
+            cached_manifest: None,
         })
     }
 
@@ -695,23 +699,23 @@ impl Writer {
                             batch_constraint_keys.insert(key, idx);
                         }
                     }
-                    ConstraintType::Exists { property } => {
-                        if properties.get(property).is_none_or(|v| v.is_null()) {
-                            return Err(anyhow!(
-                                "Constraint violation at index {}: Property '{}' must exist",
-                                idx,
-                                property
-                            ));
-                        }
+                    ConstraintType::Exists { property }
+                        if properties.get(property).is_none_or(|v| v.is_null()) =>
+                    {
+                        return Err(anyhow!(
+                            "Constraint violation at index {}: Property '{}' must exist",
+                            idx,
+                            property
+                        ));
                     }
-                    ConstraintType::Check { expression } => {
-                        if !self.evaluate_check_constraint(expression, properties)? {
-                            return Err(anyhow!(
-                                "Constraint violation at index {}: CHECK constraint '{}' violated",
-                                idx,
-                                constraint.name
-                            ));
-                        }
+                    ConstraintType::Check { expression }
+                        if !self.evaluate_check_constraint(expression, properties)? =>
+                    {
+                        return Err(anyhow!(
+                            "Constraint violation at index {}: CHECK constraint '{}' violated",
+                            idx,
+                            constraint.name
+                        ));
                     }
                     _ => {}
                 }
@@ -1333,9 +1337,15 @@ impl Writer {
             // Populate constraint index for O(1) duplicate detection
             let schema = self.schema_manager.schema();
             for label in &labels_copy {
-                // Skip unknown labels (schemaless support)
                 if schema.get_label_case_insensitive(label).is_none() {
-                    continue;
+                    if self.config.strict_schema {
+                        return Err(anyhow::anyhow!(
+                            "Label '{}' is not defined in the schema \
+                             (strict_schema is enabled).",
+                            label
+                        ));
+                    }
+                    continue; // Schemaless: skip unknown labels.
                 }
 
                 // For each unique constraint on this label, insert into constraint index
@@ -1847,6 +1857,10 @@ impl Writer {
 
                     if !inputs.is_empty() {
                         let input_text = inputs.join(" ");
+                        let input_text = match &emb_config.document_prefix {
+                            Some(prefix) => format!("{prefix}{input_text}"),
+                            None => input_text,
+                        };
                         input_texts.push(input_text);
                         needs_embedding.push(idx);
                     }
@@ -1922,7 +1936,11 @@ impl Writer {
                     continue;
                 }
 
-                let input_text = inputs.join(" "); // Simple concatenation
+                let input_text = inputs.join(" ");
+                let input_text = match &emb_config.document_prefix {
+                    Some(prefix) => format!("{prefix}{input_text}"),
+                    None => input_text,
+                };
 
                 let runtime = self.xervo_runtime.as_ref().ok_or_else(|| {
                     anyhow!("Uni-Xervo runtime not configured for auto-embedding")
@@ -1958,6 +1976,11 @@ impl Writer {
     pub async fn flush_to_l1(&mut self, name: Option<String>) -> Result<String> {
         let start = std::time::Instant::now();
         let schema = self.schema_manager.schema();
+
+        // Signal that a flush is in progress so compaction skips delta clears.
+        self.storage
+            .flush_in_progress
+            .store(true, std::sync::atomic::Ordering::Release);
 
         let (initial_size, initial_count) = {
             let l0_arc = self.l0_manager.get_current();
@@ -2166,15 +2189,18 @@ impl Writer {
             }
         }
 
-        // 0. Load previous snapshot or create new
-        let mut manifest = self
-            .storage
-            .snapshot_manager()
-            .load_latest_snapshot()
-            .await?
-            .unwrap_or_else(|| {
-                SnapshotManifest::new(Uuid::new_v4().to_string(), schema.schema_version)
-            });
+        // 0. Load previous snapshot from cache, or fall back to storage
+        let mut manifest = if let Some(cached) = self.cached_manifest.take() {
+            cached
+        } else {
+            self.storage
+                .snapshot_manager()
+                .load_latest_snapshot()
+                .await?
+                .unwrap_or_else(|| {
+                    SnapshotManifest::new(Uuid::new_v4().to_string(), schema.schema_version)
+                })
+        };
 
         // Update snapshot metadata
         // Save parent snapshot ID before generating new one (for lineage tracking)
@@ -2468,6 +2494,9 @@ impl Writer {
             .set_latest_snapshot(&manifest.snapshot_id)
             .await?;
 
+        // Cache manifest for next flush to avoid re-reading from object store
+        self.cached_manifest = Some(manifest.clone());
+
         // Complete flush: remove old L0 from pending list now that L1 writes succeeded.
         // This must happen BEFORE WAL truncation so min_pending_wal_lsn is accurate.
         self.l0_manager.complete_flush(&old_l0_arc);
@@ -2502,6 +2531,21 @@ impl Writer {
         metrics::histogram!("uni_flush_duration_seconds").record(start.elapsed().as_secs_f64());
         metrics::counter!("uni_flush_bytes_total").increment(initial_size as u64);
         metrics::counter!("uni_flush_rows_total").increment(initial_count as u64);
+
+        // Clear flush-in-progress flag so compaction can proceed with delta clears.
+        self.storage
+            .flush_in_progress
+            .store(false, std::sync::atomic::Ordering::Release);
+
+        // Increment flush generation counter for write throttling.
+        // l1_runs counts uncompacted flush generations (reset by compaction).
+        {
+            let mut status = uni_common::sync::acquire_mutex(
+                &self.storage.compaction_status,
+                "compaction_status",
+            )?;
+            status.l1_runs += 1;
+        }
 
         // Trigger CSR compaction if enough frozen segments have accumulated.
         // After flush, the old L0 data is now in L1; the overlay segments can be merged

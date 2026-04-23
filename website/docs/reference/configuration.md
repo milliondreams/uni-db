@@ -95,6 +95,9 @@ pub struct UniConfig {
 
     /// Background index rebuild configuration
     pub index_rebuild: IndexRebuildConfig,
+
+    /// When true, reject writes with undeclared labels or edge types (default: false).
+    pub strict_schema: bool,
 }
 ```
 
@@ -116,6 +119,26 @@ pub struct UniConfig {
 | `max_compaction_rows` | rows | 5,000,000 | OOM guard for in-memory compaction |
 | `enable_vid_labels_index` | bool | true | Enable O(1) VID→labels lookups |
 | `max_recursive_cte_iterations` | count | 1,000 | Maximum iterations for recursive CTE evaluation |
+| `strict_schema` | bool | false | Reject writes with undeclared labels or edge types |
+
+### strict_schema
+
+When `strict_schema` is `true`, CREATE and MERGE operations reject any label or edge type not previously declared via `db.schema()`. This catches typos and enforces schema-first discipline. Properties are not affected — unknown properties are still stored in overflow.
+
+=== "Rust"
+    ```rust
+    let config = UniConfig { strict_schema: true, ..UniConfig::default() };
+    let db = Uni::in_memory().config(config).build().await?;
+    ```
+
+=== "Python"
+    ```python
+    db = uni_db.UniBuilder.in_memory().strict_schema(True).build()
+    # or via config dict:
+    db = uni_db.UniBuilder.in_memory().config({"strict_schema": True}).build()
+    ```
+
+Error messages include the undeclared name and suggest using `db.schema()` to declare it.
 
 ### CompactionConfig
 

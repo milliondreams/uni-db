@@ -40,18 +40,21 @@ pub struct SchemaBuilder<'a> {
 pub enum SchemaChange {
     AddLabel {
         name: String,
+        description: Option<String>,
     },
     AddProperty {
         label_or_type: String,
         name: String,
         data_type: DataType,
         nullable: bool,
+        description: Option<String>,
     },
     AddIndex(IndexDefinition),
     AddEdgeType {
         name: String,
         from_labels: Vec<String>,
         to_labels: Vec<String>,
+        description: Option<String>,
     },
 }
 
@@ -139,29 +142,40 @@ impl<'a> SchemaBuilder<'a> {
 
         for change in self.pending {
             match change {
-                SchemaChange::AddLabel { name } => match manager.add_label(&name) {
-                    Ok(_) => {}
-                    Err(e) if e.to_string().contains("already exists") => {}
-                    Err(e) => {
-                        return Err(UniError::Schema {
-                            message: e.to_string(),
-                        });
+                SchemaChange::AddLabel { name, description } => {
+                    match manager.add_label_with_desc(&name, description) {
+                        Ok(_) => {}
+                        Err(e) if e.to_string().contains("already exists") => {}
+                        Err(e) => {
+                            return Err(UniError::Schema {
+                                message: e.to_string(),
+                            });
+                        }
                     }
-                },
+                }
                 SchemaChange::AddProperty {
                     label_or_type,
                     name,
                     data_type,
                     nullable,
-                } => match manager.add_property(&label_or_type, &name, data_type, nullable) {
-                    Ok(_) => {}
-                    Err(e) if e.to_string().contains("already exists") => {}
-                    Err(e) => {
-                        return Err(UniError::Schema {
-                            message: e.to_string(),
-                        });
+                    description,
+                } => {
+                    match manager.add_property_with_desc(
+                        &label_or_type,
+                        &name,
+                        data_type,
+                        nullable,
+                        description,
+                    ) {
+                        Ok(_) => {}
+                        Err(e) if e.to_string().contains("already exists") => {}
+                        Err(e) => {
+                            return Err(UniError::Schema {
+                                message: e.to_string(),
+                            });
+                        }
                     }
-                },
+                }
                 SchemaChange::AddIndex(idx) => {
                     manager
                         .add_index(idx.clone())
@@ -175,15 +189,23 @@ impl<'a> SchemaBuilder<'a> {
                     name,
                     from_labels,
                     to_labels,
-                } => match manager.add_edge_type(&name, from_labels, to_labels) {
-                    Ok(_) => {}
-                    Err(e) if e.to_string().contains("already exists") => {}
-                    Err(e) => {
-                        return Err(UniError::Schema {
-                            message: e.to_string(),
-                        });
+                    description,
+                } => {
+                    match manager.add_edge_type_with_desc(
+                        &name,
+                        from_labels,
+                        to_labels,
+                        description,
+                    ) {
+                        Ok(_) => {}
+                        Err(e) if e.to_string().contains("already exists") => {}
+                        Err(e) => {
+                            return Err(UniError::Schema {
+                                message: e.to_string(),
+                            });
+                        }
                     }
-                },
+                }
             }
         }
 
@@ -210,11 +232,21 @@ impl<'a> SchemaBuilder<'a> {
 pub struct LabelBuilder<'a> {
     builder: SchemaBuilder<'a>,
     name: String,
+    description: Option<String>,
 }
 
 impl<'a> LabelBuilder<'a> {
     fn new(builder: SchemaBuilder<'a>, name: String) -> Self {
-        Self { builder, name }
+        Self {
+            builder,
+            name,
+            description: None,
+        }
+    }
+
+    pub fn description(mut self, desc: &str) -> Self {
+        self.description = Some(desc.to_string());
+        self
     }
 
     pub fn property(mut self, name: &str, data_type: DataType) -> Self {
@@ -223,6 +255,7 @@ impl<'a> LabelBuilder<'a> {
             name: name.to_string(),
             data_type,
             nullable: false,
+            description: None,
         });
         self
     }
@@ -233,6 +266,18 @@ impl<'a> LabelBuilder<'a> {
             name: name.to_string(),
             data_type,
             nullable: true,
+            description: None,
+        });
+        self
+    }
+
+    pub fn property_described(mut self, name: &str, data_type: DataType, desc: &str) -> Self {
+        self.builder.pending.push(SchemaChange::AddProperty {
+            label_or_type: self.name.clone(),
+            name: name.to_string(),
+            data_type,
+            nullable: false,
+            description: Some(desc.to_string()),
         });
         self
     }
@@ -275,9 +320,13 @@ impl<'a> LabelBuilder<'a> {
     }
 
     pub fn done(mut self) -> SchemaBuilder<'a> {
-        self.builder
-            .pending
-            .insert(0, SchemaChange::AddLabel { name: self.name });
+        self.builder.pending.insert(
+            0,
+            SchemaChange::AddLabel {
+                name: self.name,
+                description: self.description,
+            },
+        );
         self.builder
     }
 
@@ -301,6 +350,7 @@ pub struct EdgeTypeBuilder<'a> {
     name: String,
     from_labels: Vec<String>,
     to_labels: Vec<String>,
+    description: Option<String>,
 }
 
 impl<'a> EdgeTypeBuilder<'a> {
@@ -315,7 +365,13 @@ impl<'a> EdgeTypeBuilder<'a> {
             name,
             from_labels,
             to_labels,
+            description: None,
         }
+    }
+
+    pub fn description(mut self, desc: &str) -> Self {
+        self.description = Some(desc.to_string());
+        self
     }
 
     pub fn property(mut self, name: &str, data_type: DataType) -> Self {
@@ -324,6 +380,7 @@ impl<'a> EdgeTypeBuilder<'a> {
             name: name.to_string(),
             data_type,
             nullable: false,
+            description: None,
         });
         self
     }
@@ -334,6 +391,18 @@ impl<'a> EdgeTypeBuilder<'a> {
             name: name.to_string(),
             data_type,
             nullable: true,
+            description: None,
+        });
+        self
+    }
+
+    pub fn property_described(mut self, name: &str, data_type: DataType, desc: &str) -> Self {
+        self.builder.pending.push(SchemaChange::AddProperty {
+            label_or_type: self.name.clone(),
+            name: name.to_string(),
+            data_type,
+            nullable: false,
+            description: Some(desc.to_string()),
         });
         self
     }
@@ -345,6 +414,7 @@ impl<'a> EdgeTypeBuilder<'a> {
                 name: self.name,
                 from_labels: self.from_labels,
                 to_labels: self.to_labels,
+                description: self.description,
             },
         );
         self.builder
@@ -370,6 +440,7 @@ pub struct LabelInfo {
     pub properties: Vec<PropertyInfo>,
     pub indexes: Vec<IndexInfo>,
     pub constraints: Vec<ConstraintInfo>,
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -381,6 +452,7 @@ pub struct EdgeTypeInfo {
     pub properties: Vec<PropertyInfo>,
     pub indexes: Vec<IndexInfo>,
     pub constraints: Vec<ConstraintInfo>,
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -389,6 +461,7 @@ pub struct PropertyInfo {
     pub data_type: String,
     pub nullable: bool,
     pub is_indexed: bool,
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -427,6 +500,12 @@ pub struct EmbeddingCfg {
     pub alias: String,
     pub source_properties: Vec<String>,
     pub batch_size: usize,
+    /// Prefix prepended to text before embedding during auto-embed (document side).
+    /// Example: `"search_document: "` for Nomic models. Include any trailing space.
+    pub document_prefix: Option<String>,
+    /// Prefix prepended to text before embedding during query-time embed calls.
+    /// Example: `"search_query: "` for Nomic models. Include any trailing space.
+    pub query_prefix: Option<String>,
 }
 
 impl EmbeddingCfg {
@@ -435,6 +514,8 @@ impl EmbeddingCfg {
             alias: self.alias,
             source_properties: self.source_properties,
             batch_size: self.batch_size,
+            document_prefix: self.document_prefix,
+            query_prefix: self.query_prefix,
         }
     }
 }

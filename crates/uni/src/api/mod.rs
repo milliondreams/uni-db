@@ -560,7 +560,7 @@ impl Uni {
         name: &str,
     ) -> Result<Option<crate::api::schema::LabelInfo>> {
         let schema = self.inner.schema.schema();
-        if schema.labels.contains_key(name) {
+        if let Some(label_meta) = schema.labels.get(name) {
             let count = if let Ok(ds) = self.inner.storage.vertex_dataset(name) {
                 if let Ok(raw) = ds.open_raw().await {
                     raw.count_rows(None)
@@ -600,6 +600,7 @@ impl Uni {
                         data_type: format!("{:?}", prop_meta.r#type),
                         nullable: prop_meta.nullable,
                         is_indexed,
+                        description: prop_meta.description.clone(),
                     });
                 }
             }
@@ -657,6 +658,7 @@ impl Uni {
                 properties,
                 indexes,
                 constraints,
+                description: label_meta.description.clone(),
             }))
         } else {
             Ok(None)
@@ -711,6 +713,7 @@ impl Uni {
                     data_type: format!("{:?}", prop_meta.r#type),
                     nullable: prop_meta.nullable,
                     is_indexed,
+                    description: prop_meta.description.clone(),
                 });
             }
         }
@@ -768,6 +771,7 @@ impl Uni {
             properties,
             indexes,
             constraints,
+            description: edge_meta.description.clone(),
         }))
     }
 
@@ -1328,6 +1332,11 @@ impl UniBuilder {
             {
                 runtime_builder = runtime_builder
                     .register_provider(uni_xervo::provider::LocalMistralRsProvider::new());
+            }
+            #[cfg(feature = "provider-onnx")]
+            {
+                runtime_builder = runtime_builder
+                    .register_provider(uni_xervo::provider::LocalOnnxProvider::new());
             }
 
             Some(

@@ -16,6 +16,7 @@ fn create_fts_test_schema() -> Schema {
         id: 1,
         created_at: Utc::now(),
         state: SchemaElementState::Active,
+        description: None,
     };
     schema.labels.insert("Article".to_string(), article_meta);
 

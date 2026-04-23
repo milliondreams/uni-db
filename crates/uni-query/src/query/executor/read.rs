@@ -2952,7 +2952,7 @@ impl Executor {
 
     fn canonical_row_key(row: &HashMap<String, Value>) -> String {
         let mut pairs: Vec<_> = row.iter().collect();
-        pairs.sort_by(|(lk, _), (rk, _)| lk.cmp(rk));
+        pairs.sort_by_key(|(k, _)| *k);
 
         pairs
             .into_iter()
@@ -2999,7 +2999,7 @@ impl Executor {
             ),
             Value::Map(map) => {
                 let mut pairs: Vec<_> = map.iter().collect();
-                pairs.sort_by(|(lk, _), (rk, _)| lk.cmp(rk));
+                pairs.sort_by_key(|(k, _)| *k);
                 format!(
                     "map:{{{}}}",
                     pairs

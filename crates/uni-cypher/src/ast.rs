@@ -98,6 +98,7 @@ pub struct CreateLabel {
     pub name: String,
     pub properties: Vec<PropertyDefinition>,
     pub if_not_exists: bool,
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -107,6 +108,7 @@ pub struct CreateEdgeType {
     pub dst_labels: Vec<String>,
     pub properties: Vec<PropertyDefinition>,
     pub if_not_exists: bool,
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -125,7 +127,15 @@ pub struct AlterEdgeType {
 pub enum AlterAction {
     AddProperty(PropertyDefinition),
     DropProperty(String),
-    RenameProperty { old_name: String, new_name: String },
+    RenameProperty {
+        old_name: String,
+        new_name: String,
+    },
+    SetDescription(Option<String>),
+    SetPropertyDescription {
+        property: String,
+        description: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -179,6 +189,7 @@ pub struct PropertyDefinition {
     pub nullable: bool,
     pub unique: bool,
     pub default: Option<Expr>,
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

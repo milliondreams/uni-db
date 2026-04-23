@@ -583,26 +583,31 @@ async fn auto_embed_query(
     let schema = storage.schema_manager().schema();
 
     // Try to find embedding config for the specific label.property
-    let embedding_alias = if let (Some(lbl), Some(prop)) = (label, property) {
-        schema
-            .vector_index_for_property(lbl, prop)
-            .and_then(|cfg| cfg.embedding_config.as_ref().map(|ec| ec.alias.clone()))
+    let embedding_info = if let (Some(lbl), Some(prop)) = (label, property) {
+        schema.vector_index_for_property(lbl, prop).and_then(|cfg| {
+            cfg.embedding_config
+                .as_ref()
+                .map(|ec| (ec.alias.clone(), ec.query_prefix.clone()))
+        })
     } else {
         None
     };
 
     // Fallback: find first vector index with embedding config
-    let embedding_alias = embedding_alias.or_else(|| {
+    let embedding_info = embedding_info.or_else(|| {
         schema.indexes.iter().find_map(|idx| {
             if let uni_common::core::schema::IndexDefinition::Vector(config) = idx {
-                config.embedding_config.as_ref().map(|ec| ec.alias.clone())
+                config
+                    .embedding_config
+                    .as_ref()
+                    .map(|ec| (ec.alias.clone(), ec.query_prefix.clone()))
             } else {
                 None
             }
         })
     });
 
-    let alias = embedding_alias.ok_or_else(|| {
+    let (alias, query_prefix) = embedding_info.ok_or_else(|| {
         datafusion::error::DataFusionError::Execution(
             "similar_to: no vector index with embedding config found. \
              Cannot auto-embed text query."
@@ -625,12 +630,20 @@ async fn auto_embed_query(
         ))
     })?;
 
-    let embeddings = embedder.embed(vec![query_text]).await.map_err(|e| {
-        datafusion::error::DataFusionError::Execution(format!(
-            "similar_to: embedding failed: {}",
-            e
-        ))
-    })?;
+    let prefixed_query = match &query_prefix {
+        Some(prefix) => format!("{prefix}{query_text}"),
+        None => query_text.to_string(),
+    };
+
+    let embeddings = embedder
+        .embed(vec![prefixed_query.as_str()])
+        .await
+        .map_err(|e| {
+            datafusion::error::DataFusionError::Execution(format!(
+                "similar_to: embedding failed: {}",
+                e
+            ))
+        })?;
 
     embeddings.into_iter().next().ok_or_else(|| {
         datafusion::error::DataFusionError::Execution(
@@ -647,8 +660,9 @@ async fn fts_search_batch(
     fts_k: f32,
 ) -> datafusion::error::Result<HashMap<Vid, f32>> {
     let storage = graph_ctx.storage();
+    let query_ctx = graph_ctx.query_context();
     let results = storage
-        .fts_search(label, property, query_text, 1000, None, None)
+        .fts_search(label, property, query_text, 1000, None, Some(&query_ctx))
         .await
         .map_err(|e| {
             datafusion::error::DataFusionError::Execution(format!(

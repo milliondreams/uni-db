@@ -827,13 +827,12 @@ fn translate_list_literal(items: &[Expr], context: Option<&TranslationContext>) 
             Expr::Map(_) => has_map = true,
             // Check if a variable is a graph entity (Node/Edge/Path) — these have struct
             // Arrow types that cannot be unified with scalar types in make_array.
-            Expr::Variable(name) => {
+            Expr::Variable(name)
                 if context
                     .and_then(|ctx| ctx.variable_kinds.get(name))
-                    .is_some()
-                {
-                    has_graph_entity = true;
-                }
+                    .is_some() =>
+            {
+                has_graph_entity = true;
             }
             // Temporal function calls produce Timestamp/Date32/Struct types that
             // make_array cannot unify. Route through _make_cypher_list instead.

@@ -214,6 +214,7 @@ impl AsyncDatabase {
                         data_type: p.data_type,
                         nullable: p.nullable,
                         is_indexed: p.is_indexed,
+                        description: p.description,
                     })
                     .collect(),
                 indexes: i
@@ -236,6 +237,7 @@ impl AsyncDatabase {
                         enabled: c.enabled,
                     })
                     .collect(),
+                description: i.description,
             }))
         })
     }
@@ -265,6 +267,7 @@ impl AsyncDatabase {
                         data_type: p.data_type,
                         nullable: p.nullable,
                         is_indexed: p.is_indexed,
+                        description: p.description,
                     })
                     .collect(),
                 indexes: i
@@ -287,6 +290,7 @@ impl AsyncDatabase {
                         enabled: c.enabled,
                     })
                     .collect(),
+                description: i.description,
             }))
         })
     }
@@ -3300,9 +3304,9 @@ impl AsyncApplyBuilder {
 #[derive(Clone)]
 pub struct AsyncSchemaBuilder {
     inner: Arc<Uni>,
-    pending_labels: Vec<String>,
-    pending_edge_types: Vec<(String, Vec<String>, Vec<String>)>,
-    pending_properties: Vec<(String, String, uni_common::core::schema::DataType, bool)>,
+    pending_labels: Vec<crate::core::PendingLabel>,
+    pending_edge_types: Vec<crate::core::PendingEdgeType>,
+    pending_properties: Vec<crate::core::PendingProperty>,
     pending_indexes: Vec<uni_common::core::schema::IndexDefinition>,
 }
 
@@ -3340,7 +3344,8 @@ impl AsyncSchemaBuilder {
     }
 
     /// Start defining a new label.
-    fn label(&self, name: &str) -> PyResult<AsyncLabelBuilder> {
+    #[pyo3(signature = (name, *, description=None))]
+    fn label(&self, name: &str, description: Option<String>) -> PyResult<AsyncLabelBuilder> {
         Ok(AsyncLabelBuilder {
             parent_inner: self.inner.clone(),
             parent_labels: self.pending_labels.clone(),
@@ -3348,17 +3353,20 @@ impl AsyncSchemaBuilder {
             parent_properties: self.pending_properties.clone(),
             parent_indexes: self.pending_indexes.clone(),
             name: name.to_string(),
+            description,
             properties: Vec::new(),
             indexes: Vec::new(),
         })
     }
 
     /// Start defining a new edge type.
+    #[pyo3(signature = (name, from_labels, to_labels, *, description=None))]
     fn edge_type(
         &self,
         name: &str,
         from_labels: Vec<String>,
         to_labels: Vec<String>,
+        description: Option<String>,
     ) -> PyResult<AsyncEdgeTypeBuilder> {
         Ok(AsyncEdgeTypeBuilder {
             parent_inner: self.inner.clone(),
@@ -3367,6 +3375,7 @@ impl AsyncSchemaBuilder {
             parent_properties: self.pending_properties.clone(),
             parent_indexes: self.pending_indexes.clone(),
             name: name.to_string(),
+            description,
             from_labels,
             to_labels,
             properties: Vec::new(),
@@ -3393,22 +3402,30 @@ impl AsyncSchemaBuilder {
 #[derive(Clone)]
 pub struct AsyncLabelBuilder {
     parent_inner: Arc<Uni>,
-    parent_labels: Vec<String>,
-    parent_edge_types: Vec<(String, Vec<String>, Vec<String>)>,
-    parent_properties: Vec<(String, String, uni_common::core::schema::DataType, bool)>,
+    parent_labels: Vec<crate::core::PendingLabel>,
+    parent_edge_types: Vec<crate::core::PendingEdgeType>,
+    parent_properties: Vec<crate::core::PendingProperty>,
     parent_indexes: Vec<uni_common::core::schema::IndexDefinition>,
     name: String,
-    properties: Vec<(String, uni_common::core::schema::DataType, bool)>,
+    description: Option<String>,
+    properties: Vec<(
+        String,
+        uni_common::core::schema::DataType,
+        bool,
+        Option<String>,
+    )>,
     indexes: Vec<uni_common::core::schema::IndexDefinition>,
 }
 
 #[pymethods]
 impl AsyncLabelBuilder {
     /// Add a required property to this label.
+    #[pyo3(signature = (name, data_type, *, description=None))]
     fn property<'py>(
         mut slf: PyRefMut<'py, Self>,
         name: String,
         data_type: &Bound<'py, PyAny>,
+        description: Option<String>,
     ) -> PyResult<PyRefMut<'py, Self>> {
         let dt = if let Ok(py_dt) = data_type.extract::<crate::types::PyDataType>() {
             py_dt.inner
@@ -3417,15 +3434,17 @@ impl AsyncLabelBuilder {
             crate::core::parse_data_type(&s)
                 .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?
         };
-        slf.properties.push((name, dt, false));
+        slf.properties.push((name, dt, false, description));
         Ok(slf)
     }
 
     /// Add a nullable property to this label.
+    #[pyo3(signature = (name, data_type, *, description=None))]
     fn property_nullable<'py>(
         mut slf: PyRefMut<'py, Self>,
         name: String,
         data_type: &Bound<'py, PyAny>,
+        description: Option<String>,
     ) -> PyResult<PyRefMut<'py, Self>> {
         let dt = if let Ok(py_dt) = data_type.extract::<crate::types::PyDataType>() {
             py_dt.inner
@@ -3434,7 +3453,7 @@ impl AsyncLabelBuilder {
             crate::core::parse_data_type(&s)
                 .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?
         };
-        slf.properties.push((name, dt, true));
+        slf.properties.push((name, dt, true, description));
         Ok(slf)
     }
 
@@ -3444,6 +3463,7 @@ impl AsyncLabelBuilder {
             name,
             uni_common::core::schema::DataType::Vector { dimensions },
             false,
+            None,
         ));
         slf
     }
@@ -3466,11 +3486,20 @@ impl AsyncLabelBuilder {
     /// Finish this label and return to AsyncSchemaBuilder.
     fn done(&self) -> PyResult<AsyncSchemaBuilder> {
         let mut labels = self.parent_labels.clone();
-        labels.push(self.name.clone());
+        labels.push(crate::core::PendingLabel {
+            name: self.name.clone(),
+            description: self.description.clone(),
+        });
 
         let mut properties = self.parent_properties.clone();
-        for (prop_name, dt, nullable) in &self.properties {
-            properties.push((self.name.clone(), prop_name.clone(), dt.clone(), *nullable));
+        for (prop_name, dt, nullable, desc) in &self.properties {
+            properties.push(crate::core::PendingProperty {
+                label_or_type: self.name.clone(),
+                name: prop_name.clone(),
+                data_type: dt.clone(),
+                nullable: *nullable,
+                description: desc.clone(),
+            });
         }
 
         let mut indexes = self.parent_indexes.clone();
@@ -3496,23 +3525,31 @@ impl AsyncLabelBuilder {
 #[derive(Clone)]
 pub struct AsyncEdgeTypeBuilder {
     parent_inner: Arc<Uni>,
-    parent_labels: Vec<String>,
-    parent_edge_types: Vec<(String, Vec<String>, Vec<String>)>,
-    parent_properties: Vec<(String, String, uni_common::core::schema::DataType, bool)>,
+    parent_labels: Vec<crate::core::PendingLabel>,
+    parent_edge_types: Vec<crate::core::PendingEdgeType>,
+    parent_properties: Vec<crate::core::PendingProperty>,
     parent_indexes: Vec<uni_common::core::schema::IndexDefinition>,
     name: String,
+    description: Option<String>,
     from_labels: Vec<String>,
     to_labels: Vec<String>,
-    properties: Vec<(String, uni_common::core::schema::DataType, bool)>,
+    properties: Vec<(
+        String,
+        uni_common::core::schema::DataType,
+        bool,
+        Option<String>,
+    )>,
 }
 
 #[pymethods]
 impl AsyncEdgeTypeBuilder {
     /// Add a required property to this edge type.
+    #[pyo3(signature = (name, data_type, *, description=None))]
     fn property<'py>(
         mut slf: PyRefMut<'py, Self>,
         name: String,
         data_type: &Bound<'py, PyAny>,
+        description: Option<String>,
     ) -> PyResult<PyRefMut<'py, Self>> {
         let dt = if let Ok(py_dt) = data_type.extract::<crate::types::PyDataType>() {
             py_dt.inner
@@ -3521,15 +3558,17 @@ impl AsyncEdgeTypeBuilder {
             crate::core::parse_data_type(&s)
                 .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?
         };
-        slf.properties.push((name, dt, false));
+        slf.properties.push((name, dt, false, description));
         Ok(slf)
     }
 
     /// Add a nullable property to this edge type.
+    #[pyo3(signature = (name, data_type, *, description=None))]
     fn property_nullable<'py>(
         mut slf: PyRefMut<'py, Self>,
         name: String,
         data_type: &Bound<'py, PyAny>,
+        description: Option<String>,
     ) -> PyResult<PyRefMut<'py, Self>> {
         let dt = if let Ok(py_dt) = data_type.extract::<crate::types::PyDataType>() {
             py_dt.inner
@@ -3538,22 +3577,29 @@ impl AsyncEdgeTypeBuilder {
             crate::core::parse_data_type(&s)
                 .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?
         };
-        slf.properties.push((name, dt, true));
+        slf.properties.push((name, dt, true, description));
         Ok(slf)
     }
 
     /// Finish this edge type and return to AsyncSchemaBuilder.
     fn done(&self) -> PyResult<AsyncSchemaBuilder> {
         let mut edge_types = self.parent_edge_types.clone();
-        edge_types.push((
-            self.name.clone(),
-            self.from_labels.clone(),
-            self.to_labels.clone(),
-        ));
+        edge_types.push(crate::core::PendingEdgeType {
+            name: self.name.clone(),
+            from: self.from_labels.clone(),
+            to: self.to_labels.clone(),
+            description: self.description.clone(),
+        });
 
         let mut properties = self.parent_properties.clone();
-        for (prop_name, dt, nullable) in &self.properties {
-            properties.push((self.name.clone(), prop_name.clone(), dt.clone(), *nullable));
+        for (prop_name, dt, nullable, desc) in &self.properties {
+            properties.push(crate::core::PendingProperty {
+                label_or_type: self.name.clone(),
+                name: prop_name.clone(),
+                data_type: dt.clone(),
+                nullable: *nullable,
+                description: desc.clone(),
+            });
         }
 
         Ok(AsyncSchemaBuilder {

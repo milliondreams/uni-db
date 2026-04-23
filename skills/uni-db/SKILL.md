@@ -281,27 +281,33 @@ result = session.query("MATCH (c:Company {name: $company}) RETURN c")
 ### Vector Search
 
 ```cypher
--- Basic vector search
+-- Basic vector search (top-K scan)
 CALL uni.vector.query('Document', 'embedding', $query_vector, 10)
 YIELD node, score
 RETURN node.title, score ORDER BY score DESC
 
--- Vector search with metadata filter
-CALL uni.vector.query('Document', 'embedding', $query_vector, 20, 'category = "tech"')
-YIELD node, score
-WHERE score > 0.7
-RETURN node.title, score
+-- ~= operator (shorthand for vector top-K scan, desugars to uni.vector.query)
+MATCH (d:Doc) WHERE d.embedding ~= $query_vector RETURN d.title LIMIT 10
 
--- Inline similarity scoring (no CALL/YIELD needed)
+-- Inline per-row similarity scoring (no CALL/YIELD needed)
 MATCH (d:Doc)
 RETURN d.title, similar_to(d.embedding, $query_vector) AS score
 ORDER BY score DESC
 
--- Hybrid search: vector + full-text with RRF fusion
-CALL uni.search('Document', ['embedding', 'content'], 'graph databases', $query_vector, 10)
+-- Hybrid search: vector + FTS with RRF fusion (correct way)
+MATCH (d:Doc)
+RETURN d.title,
+  similar_to([d.embedding, d.content], [$query_vector, $query_text]) AS score
+ORDER BY score DESC
+
+-- Hybrid search via procedure
+CALL uni.search('Document', {vector: 'embedding', fts: 'content'},
+    'graph databases', null, 10)
 YIELD node, score, vector_score, fts_score
 RETURN node.title, score
 ```
+
+> **Note:** `=~` is regex match, `~=` is vector similarity — they are unrelated operators.
 
 ### Locy Quick Example
 
@@ -402,7 +408,7 @@ SKIP 10 LIMIT 20
 
 5. **VID vs UniId vs ext_id** -- VID is internal (u64 auto-increment), UniId is content-hash (SHA3-256), ext_id is user-supplied string. Use `ext_id` for MERGE and user-facing lookups.
 
-6. **Schema-first for columnar performance** -- Define labels and properties via `db.schema()` before bulk loading. Without schema, properties go to JSONB overflow and lose columnar benefits.
+6. **Schema-first for columnar performance** -- Define labels and properties via `db.schema()` before bulk loading. Without schema, properties go to JSONB overflow and lose columnar benefits. Use `strict_schema: true` in `UniConfig` to reject writes with undeclared labels/edge types.
 
 7. **DETACH DELETE required when node has edges** -- `DELETE` alone fails if the node has any edges. Use `DETACH DELETE` to remove edges first.
 

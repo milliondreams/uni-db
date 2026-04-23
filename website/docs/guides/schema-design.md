@@ -422,6 +422,30 @@ RETURN json_get_string(p.overflow_json, 'github')
 - `json_get_float(overflow_json, 'key')` - Extract float
 - `json_get_bool(overflow_json, 'key')` - Extract boolean
 
+### Enforcing Strict Schema
+
+If you want to disable schemaless labels and edge types entirely, enable `strict_schema`:
+
+=== "Rust"
+    ```rust
+    let config = UniConfig { strict_schema: true, ..UniConfig::default() };
+    let db = Uni::in_memory().config(config).build().await?;
+    ```
+
+=== "Python"
+    ```python
+    db = uni_db.UniBuilder.in_memory().strict_schema(True).build()
+    ```
+
+With `strict_schema` enabled:
+
+- `CREATE (:UndeclaredLabel {...})` → error
+- `CREATE (a)-[:UNDECLARED_TYPE]->(b)` → error
+- `MERGE (:UndeclaredLabel {...})` → error
+- Unknown **properties** are still accepted (stored in overflow) — only labels and edge types are enforced
+
+This is useful in production to catch typos and enforce schema-first discipline. Error messages include the undeclared name and suggest using `db.schema()` to declare it.
+
 ### Design Guidelines
 
 #### Good: Core Properties in Schema, Optional in Overflow

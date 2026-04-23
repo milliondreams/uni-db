@@ -1258,8 +1258,14 @@ async fn auto_embed_text(
         .embedding(&embedding_config.alias)
         .await
         .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+
+    let prefixed_query = match &embedding_config.query_prefix {
+        Some(prefix) => format!("{prefix}{query_text}"),
+        None => query_text.to_string(),
+    };
+
     let embeddings = embedder
-        .embed(vec![query_text])
+        .embed(vec![prefixed_query.as_str()])
         .await
         .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
     embeddings.into_iter().next().ok_or_else(|| {

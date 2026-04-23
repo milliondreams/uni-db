@@ -167,6 +167,7 @@ Fluent builder for advanced database configuration. Exposed as `uni_db.UniBuilde
 | `.config(config_dict)` | Database options (`query_timeout`, `max_query_memory`, etc.) |
 | `.batch_size(n)` | I/O batch size (default 1024) |
 | `.wal_enabled(bool)` | Enable/disable write-ahead log (default `True`) |
+| `.strict_schema(bool)` | Reject writes with undeclared labels/edge types (default `False`) |
 | `.read_only()` | Open in read-only mode |
 | `.write_lease(lease)` | Multi-agent write coordination |
 | `.hybrid(local_path, remote_url)` | Hybrid storage (local metadata + remote data) |

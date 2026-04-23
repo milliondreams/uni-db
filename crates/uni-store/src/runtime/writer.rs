@@ -2101,7 +2101,7 @@ impl Writer {
                     });
             }
 
-            // 2.5 Flush Vertices - Collect by label (using vertex_labels from L0)
+            // 1b. Collect vertices by label (using vertex_labels from L0)
             //
             // Helper: fan-out a single vertex entry into per-label buckets.
             // Each per-label table row carries the full label set so multi-label
@@ -2189,7 +2189,7 @@ impl Writer {
             }
         }
 
-        // 0. Load previous snapshot from cache, or fall back to storage
+        // 1. Load previous snapshot from cache, or fall back to storage
         let mut manifest = if let Some(cached) = self.cached_manifest.take() {
             cached
         } else {
@@ -2215,7 +2215,99 @@ impl Writer {
 
         tracing::Span::current().record("snapshot_id", &snapshot_id);
 
-        // 2. For each edge type, write FWD and BWD runs
+        // 2. Write main unified tables FIRST (before deltas).
+        //    Ensures the dual-write invariant: by the time an EID appears in a
+        //    delta table, it already exists in main_edges. This prevents the
+        //    compaction debug_assert from firing when compaction interleaves
+        //    with flush at async yield points.
+        //
+        // 2.1 Main edges table
+        let (main_edges, edge_created_at_map, edge_updated_at_map) = {
+            let _old_l0 = old_l0_arc.read();
+            let mut main_edges: Vec<(
+                uni_common::core::id::Eid,
+                Vid,
+                Vid,
+                String,
+                Properties,
+                bool,
+                u64,
+            )> = Vec::new();
+            let mut edge_created_at_map: HashMap<uni_common::core::id::Eid, i64> = HashMap::new();
+            let mut edge_updated_at_map: HashMap<uni_common::core::id::Eid, i64> = HashMap::new();
+
+            for (&edge_type_id, entries) in entries_by_type.iter() {
+                for entry in entries {
+                    let edge_type_name = self
+                        .storage
+                        .schema_manager()
+                        .edge_type_name_by_id_unified(edge_type_id)
+                        .unwrap_or_else(|| "unknown".to_string());
+
+                    let deleted = matches!(entry.op, Op::Delete);
+                    main_edges.push((
+                        entry.eid,
+                        entry.src_vid,
+                        entry.dst_vid,
+                        edge_type_name,
+                        entry.properties.clone(),
+                        deleted,
+                        entry.version,
+                    ));
+
+                    if let Some(ts) = entry.created_at {
+                        edge_created_at_map.insert(entry.eid, ts);
+                    }
+                    if let Some(ts) = entry.updated_at {
+                        edge_updated_at_map.insert(entry.eid, ts);
+                    }
+                }
+            }
+
+            (main_edges, edge_created_at_map, edge_updated_at_map)
+        };
+
+        if !main_edges.is_empty() {
+            let main_edge_batch = MainEdgeDataset::build_record_batch(
+                &main_edges,
+                Some(&edge_created_at_map),
+                Some(&edge_updated_at_map),
+            )?;
+            MainEdgeDataset::write_batch(self.storage.backend(), main_edge_batch).await?;
+            MainEdgeDataset::ensure_default_indexes(self.storage.backend()).await?;
+        }
+
+        // 2.2 Main vertices table
+        let main_vertices: Vec<(Vid, Vec<String>, Properties, bool, u64)> = {
+            let old_l0 = old_l0_arc.read();
+            let mut vertices = Vec::new();
+
+            for (vid, props) in &old_l0.vertex_properties {
+                let version = old_l0.vertex_versions.get(vid).copied().unwrap_or(0);
+                let labels = old_l0.vertex_labels.get(vid).cloned().unwrap_or_default();
+                vertices.push((*vid, labels, props.clone(), false, version));
+            }
+
+            for &vid in &old_l0.vertex_tombstones {
+                let version = old_l0.vertex_versions.get(&vid).copied().unwrap_or(0);
+                let labels = old_l0.vertex_labels.get(&vid).cloned().unwrap_or_default();
+                vertices.push((vid, labels, HashMap::new(), true, version));
+            }
+
+            vertices
+        };
+
+        if !main_vertices.is_empty() {
+            let main_vertex_batch = MainVertexDataset::build_record_batch(
+                &main_vertices,
+                Some(&vertex_created_at),
+                Some(&vertex_updated_at),
+            )?;
+            MainVertexDataset::write_batch(self.storage.backend(), main_vertex_batch).await?;
+            MainVertexDataset::ensure_default_indexes(self.storage.backend()).await?;
+        }
+
+        // 3. For each edge type, write FWD and BWD delta runs
         for (&edge_type_id, entries) in entries_by_type.iter() {
             // Get edge type name from unified lookup (handles both schema'd and schemaless)
             let edge_type_name = self
@@ -2264,7 +2356,7 @@ impl Writer {
             // already has these edges via dual-write in insert_edge/delete_edge.
         }
 
-        // 2.5 Flush Vertices
+        // 4. Per-label vertex table writes
         for (label_id, vertices) in vertices_by_label {
             let label_name = schema
                 .label_name_by_id(label_id)
@@ -2392,99 +2484,7 @@ impl Writer {
             }
         }
 
-        // 3. Write to main unified tables (dual-write for fast ID-based lookups)
-        // 3.1 Write to main edges table
-        // Collect data while holding the lock, then release before async operations
-        let (main_edges, edge_created_at_map, edge_updated_at_map) = {
-            let _old_l0 = old_l0_arc.read();
-            let mut main_edges: Vec<(
-                uni_common::core::id::Eid,
-                Vid,
-                Vid,
-                String,
-                Properties,
-                bool,
-                u64,
-            )> = Vec::new();
-            let mut edge_created_at_map: HashMap<uni_common::core::id::Eid, i64> = HashMap::new();
-            let mut edge_updated_at_map: HashMap<uni_common::core::id::Eid, i64> = HashMap::new();
-
-            for (&edge_type_id, entries) in entries_by_type.iter() {
-                for entry in entries {
-                    // Get edge type name from unified lookup (handles both schema'd and schemaless)
-                    let edge_type_name = self
-                        .storage
-                        .schema_manager()
-                        .edge_type_name_by_id_unified(edge_type_id)
-                        .unwrap_or_else(|| "unknown".to_string());
-
-                    let deleted = matches!(entry.op, Op::Delete);
-                    main_edges.push((
-                        entry.eid,
-                        entry.src_vid,
-                        entry.dst_vid,
-                        edge_type_name,
-                        entry.properties.clone(),
-                        deleted,
-                        entry.version,
-                    ));
-
-                    if let Some(ts) = entry.created_at {
-                        edge_created_at_map.insert(entry.eid, ts);
-                    }
-                    if let Some(ts) = entry.updated_at {
-                        edge_updated_at_map.insert(entry.eid, ts);
-                    }
-                }
-            }
-
-            (main_edges, edge_created_at_map, edge_updated_at_map)
-        }; // Lock released here
-
-        if !main_edges.is_empty() {
-            let main_edge_batch = MainEdgeDataset::build_record_batch(
-                &main_edges,
-                Some(&edge_created_at_map),
-                Some(&edge_updated_at_map),
-            )?;
-            MainEdgeDataset::write_batch(self.storage.backend(), main_edge_batch).await?;
-            MainEdgeDataset::ensure_default_indexes(self.storage.backend()).await?;
-        }
-
-        // 3.2 Write to main vertices table
-        // Collect data while holding the lock, then release before async operations
-        let main_vertices: Vec<(Vid, Vec<String>, Properties, bool, u64)> = {
-            let old_l0 = old_l0_arc.read();
-            let mut vertices = Vec::new();
-
-            // Collect all vertices from vertex_properties
-            for (vid, props) in &old_l0.vertex_properties {
-                let version = old_l0.vertex_versions.get(vid).copied().unwrap_or(0);
-                let labels = old_l0.vertex_labels.get(vid).cloned().unwrap_or_default();
-                vertices.push((*vid, labels, props.clone(), false, version));
-            }
-
-            // Collect tombstones
-            for &vid in &old_l0.vertex_tombstones {
-                let version = old_l0.vertex_versions.get(&vid).copied().unwrap_or(0);
-                let labels = old_l0.vertex_labels.get(&vid).cloned().unwrap_or_default();
-                vertices.push((vid, labels, HashMap::new(), true, version));
-            }
-
-            vertices
-        }; // Lock released here
-
-        if !main_vertices.is_empty() {
-            let main_vertex_batch = MainVertexDataset::build_record_batch(
-                &main_vertices,
-                Some(&vertex_created_at),
-                Some(&vertex_updated_at),
-            )?;
-            MainVertexDataset::write_batch(self.storage.backend(), main_vertex_batch).await?;
-            MainVertexDataset::ensure_default_indexes(self.storage.backend()).await?;
-        }
-
-        // Save Snapshot
+        // 5. Save Snapshot
         self.storage
             .snapshot_manager()
             .save_snapshot(&manifest)

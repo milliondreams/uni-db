@@ -104,6 +104,9 @@ pub struct L0Buffer {
     /// Vertex labels (VID -> list of label names)
     /// New in storage design: vertices can have multiple labels
     pub vertex_labels: HashMap<Vid, Vec<String>>,
+    /// Reverse index: label name → set of VIDs with that label. Maintained
+    /// alongside `vertex_labels` for O(1) label-based vertex lookups.
+    pub label_to_vids: HashMap<String, HashSet<Vid>>,
     /// Edge types (EID -> type name)
     pub edge_types: HashMap<Eid, String>,
     /// Current version counter
@@ -163,6 +166,7 @@ impl Clone for L0Buffer {
             vertex_properties: self.vertex_properties.clone(),
             edge_endpoints: self.edge_endpoints.clone(),
             vertex_labels: self.vertex_labels.clone(),
+            label_to_vids: self.label_to_vids.clone(),
             edge_types: self.edge_types.clone(),
             current_version: self.current_version,
             mutation_count: self.mutation_count,
@@ -185,6 +189,27 @@ impl L0Buffer {
         for label in labels {
             if !existing.contains(label) {
                 existing.push(label.clone());
+            }
+        }
+    }
+
+    /// Add a VID to the reverse label index for each of the given labels.
+    fn index_labels_for_vid(&mut self, vid: Vid, labels: &[String]) {
+        for label in labels {
+            self.label_to_vids
+                .entry(label.clone())
+                .or_default()
+                .insert(vid);
+        }
+    }
+
+    /// Remove a VID from all label entries in the reverse index.
+    fn remove_vid_from_label_index(&mut self, vid: Vid) {
+        if let Some(labels) = self.vertex_labels.get(&vid) {
+            for label in labels {
+                if let Some(set) = self.label_to_vids.get_mut(label) {
+                    set.remove(&vid);
+                }
             }
         }
     }
@@ -247,6 +272,11 @@ impl L0Buffer {
             total += labels.iter().map(|l| l.len() + 24).sum::<usize>();
         }
 
+        // Reverse label index (label_to_vids)
+        for (label, vids) in &self.label_to_vids {
+            total += label.len() + 24 + vids.len() * 8 + 48; // string + HashSet overhead
+        }
+
         // Edge types
         for type_name in self.edge_types.values() {
             total += type_name.len() + 24;
@@ -272,6 +302,7 @@ impl L0Buffer {
             vertex_properties: HashMap::new(),
             edge_endpoints: HashMap::new(),
             vertex_labels: HashMap::new(),
+            label_to_vids: HashMap::new(),
             edge_types: HashMap::new(),
             current_version: start_version,
             mutation_count: 0,
@@ -325,6 +356,7 @@ impl L0Buffer {
         let labels_size: usize = labels.iter().map(|l| l.len() + 24).sum();
         let existing = self.vertex_labels.entry(vid).or_default();
         Self::append_unique_labels(existing, labels);
+        self.index_labels_for_vid(vid, labels);
 
         self.graph.add_vertex(vid);
         self.mutation_count += 1;
@@ -340,6 +372,7 @@ impl L0Buffer {
     pub fn add_vertex_labels(&mut self, vid: Vid, labels: &[String]) {
         let existing = self.vertex_labels.entry(vid).or_default();
         Self::append_unique_labels(existing, labels);
+        self.index_labels_for_vid(vid, labels);
     }
 
     /// Remove a label from an existing vertex.
@@ -349,6 +382,9 @@ impl L0Buffer {
             && let Some(pos) = labels.iter().position(|l| l == label)
         {
             labels.remove(pos);
+            if let Some(set) = self.label_to_vids.get_mut(label) {
+                set.remove(&vid);
+            }
             self.current_version += 1;
             self.mutation_count += 1;
             self.mutation_stats.labels_removed += 1;
@@ -419,6 +455,7 @@ impl L0Buffer {
             }
         }
 
+        self.remove_vid_from_label_index(vid);
         self.vertex_tombstones.insert(vid);
         self.vertex_properties.remove(&vid);
         self.vertex_versions.insert(vid, version);
@@ -626,13 +663,12 @@ impl L0Buffer {
     }
 
     /// Returns all VIDs in vertex_labels that match the given label name.
-    /// Used for L0 overlay during vertex scanning.
+    /// O(1) lookup via the reverse label index.
     pub fn vids_for_label(&self, label_name: &str) -> Vec<Vid> {
-        self.vertex_labels
-            .iter()
-            .filter(|(_, labels)| labels.iter().any(|l| l == label_name))
-            .map(|(vid, _)| *vid)
-            .collect()
+        self.label_to_vids
+            .get(label_name)
+            .map(|set| set.iter().copied().collect())
+            .unwrap_or_default()
     }
 
     /// Returns all vertex VIDs in the L0 buffer.
@@ -643,21 +679,39 @@ impl L0Buffer {
     }
 
     /// Returns all VIDs in vertex_labels that match any of the given label names.
-    /// Used for L0 overlay during multi-label vertex scanning.
+    /// Uses the reverse label index — O(sum of matching set sizes).
     pub fn vids_for_labels(&self, label_names: &[&str]) -> Vec<Vid> {
-        self.vertex_labels
-            .iter()
-            .filter(|(_, labels)| label_names.iter().any(|ln| labels.iter().any(|l| l == *ln)))
-            .map(|(vid, _)| *vid)
-            .collect()
+        let mut result = HashSet::new();
+        for label_name in label_names {
+            if let Some(set) = self.label_to_vids.get(*label_name) {
+                result.extend(set.iter().copied());
+            }
+        }
+        result.into_iter().collect()
     }
 
     /// Returns all VIDs that have ALL specified labels.
+    /// Uses the reverse label index — intersects the per-label sets.
     pub fn vids_with_all_labels(&self, label_names: &[&str]) -> Vec<Vid> {
-        self.vertex_labels
+        if label_names.is_empty() {
+            return Vec::new();
+        }
+        // Collect the per-label sets; if any label is missing from the index,
+        // the intersection is empty.
+        let sets: Vec<&HashSet<Vid>> = match label_names
             .iter()
-            .filter(|(_, labels)| label_names.iter().all(|ln| labels.iter().any(|l| l == *ln)))
-            .map(|(vid, _)| *vid)
+            .map(|ln| self.label_to_vids.get(*ln))
+            .collect::<Option<Vec<_>>>()
+        {
+            Some(s) => s,
+            None => return Vec::new(),
+        };
+        // Start from the smallest set for efficiency.
+        let smallest = sets.iter().min_by_key(|s| s.len()).unwrap();
+        smallest
+            .iter()
+            .copied()
+            .filter(|vid| sets.iter().all(|s| s.contains(vid)))
             .collect()
     }
 
@@ -737,6 +791,12 @@ impl L0Buffer {
         for (vid, labels) in &other.vertex_labels {
             if !self.vertex_labels.contains_key(vid) {
                 self.vertex_labels.insert(*vid, labels.clone());
+                for label in labels {
+                    self.label_to_vids
+                        .entry(label.clone())
+                        .or_default()
+                        .insert(*vid);
+                }
             }
         }
 
@@ -822,6 +882,12 @@ impl L0Buffer {
                     // Restore vertex labels from WAL
                     let existing = self.vertex_labels.entry(vid).or_default();
                     Self::append_unique_labels(existing, &labels);
+                    for label in &labels {
+                        self.label_to_vids
+                            .entry(label.clone())
+                            .or_default()
+                            .insert(vid);
+                    }
                 }
                 Mutation::DeleteVertex { vid, labels } => {
                     self.current_version += 1;
@@ -829,6 +895,12 @@ impl L0Buffer {
                     if !labels.is_empty() {
                         let existing = self.vertex_labels.entry(vid).or_default();
                         Self::append_unique_labels(existing, &labels);
+                        for label in &labels {
+                            self.label_to_vids
+                                .entry(label.clone())
+                                .or_default()
+                                .insert(vid);
+                        }
                     }
                     self.apply_vertex_deletion(vid);
                 }

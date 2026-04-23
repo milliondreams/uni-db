@@ -1773,36 +1773,18 @@ impl Writer {
             return Ok(());
         }
 
-        let mut flushed = false;
-
         // Flush on mutation count threshold (10,000 default)
         if count >= self.config.auto_flush_threshold {
             self.flush_to_l1(None).await?;
-            flushed = true;
+            return Ok(());
         }
 
         // Flush on time interval IF minimum mutations met
-        if !flushed
-            && let Some(interval) = self.config.auto_flush_interval
+        if let Some(interval) = self.config.auto_flush_interval
             && self.last_flush_time.elapsed() >= interval
             && count >= self.config.auto_flush_min_mutations
         {
             self.flush_to_l1(None).await?;
-            flushed = true;
-        }
-
-        // After flush, trigger async L1 compaction if flush generations exceed threshold.
-        // Non-blocking: spawns background task. CompactionGuard prevents concurrent runs.
-        if flushed && self.config.compaction.enabled {
-            let current_runs = uni_common::sync::acquire_mutex(
-                &self.storage.compaction_status,
-                "compaction_status",
-            )
-            .map(|s| s.l1_runs)
-            .unwrap_or(0);
-            if current_runs >= self.config.compaction.max_l1_runs {
-                self.storage.trigger_async_compaction();
-            }
         }
 
         Ok(())
@@ -1994,6 +1976,11 @@ impl Writer {
     pub async fn flush_to_l1(&mut self, name: Option<String>) -> Result<String> {
         let start = std::time::Instant::now();
         let schema = self.schema_manager.schema();
+
+        // Signal that a flush is in progress so compaction skips delta clears.
+        self.storage
+            .flush_in_progress
+            .store(true, std::sync::atomic::Ordering::Release);
 
         let (initial_size, initial_count) = {
             let l0_arc = self.l0_manager.get_current();
@@ -2544,6 +2531,11 @@ impl Writer {
         metrics::histogram!("uni_flush_duration_seconds").record(start.elapsed().as_secs_f64());
         metrics::counter!("uni_flush_bytes_total").increment(initial_size as u64);
         metrics::counter!("uni_flush_rows_total").increment(initial_count as u64);
+
+        // Clear flush-in-progress flag so compaction can proceed with delta clears.
+        self.storage
+            .flush_in_progress
+            .store(false, std::sync::atomic::Ordering::Release);
 
         // Increment flush generation counter for write throttling.
         // l1_runs counts uncompacted flush generations (reset by compaction).

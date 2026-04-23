@@ -66,6 +66,9 @@ pub struct StorageManager {
     adjacency_manager: Arc<AdjacencyManager>,
     pub config: UniConfig,
     pub compaction_status: Arc<Mutex<CompactionStatus>>,
+    /// Flag set during flush_to_l1 to prevent compaction from clearing delta
+    /// tables while new data is being appended.
+    pub flush_in_progress: std::sync::atomic::AtomicBool,
     /// Optional pinned snapshot for time-travel
     pinned_snapshot: Option<SnapshotManifest>,
     /// Pluggable storage backend.
@@ -142,6 +145,7 @@ impl StorageManager {
             adjacency_manager: Arc::new(AdjacencyManager::new(config.cache_size)),
             config,
             compaction_status: Arc::new(Mutex::new(CompactionStatus::default())),
+            flush_in_progress: std::sync::atomic::AtomicBool::new(false),
             pinned_snapshot: None,
             backend,
             vid_labels_index: None,
@@ -284,6 +288,7 @@ impl StorageManager {
             adjacency_manager: Arc::new(AdjacencyManager::new(self.adjacency_manager.max_bytes())),
             config: self.config.clone(),
             compaction_status: Arc::new(Mutex::new(CompactionStatus::default())),
+            flush_in_progress: std::sync::atomic::AtomicBool::new(false),
             pinned_snapshot: Some(snapshot),
             backend: self.backend.clone(),
             vid_labels_index: self.vid_labels_index.clone(),

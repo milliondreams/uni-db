@@ -558,13 +558,28 @@ impl Compactor {
                 }
             }
 
-            // Clear the Delta L1 table by replacing with empty batch
-            let delta_ds = self.storage.delta_dataset(edge_type, direction)?;
-            let delta_schema = delta_ds.get_arrow_schema(&schema)?;
-            let empty_batch = RecordBatch::new_empty(delta_schema);
-            delta_ds
-                .replace(self.storage.backend(), empty_batch)
-                .await?;
+            // Clear the Delta L1 table by replacing with empty batch.
+            // Skip if a flush is in progress to avoid a race where flush appends
+            // new data between our read (above) and this replace, destroying it.
+            // Skipped deltas survive and are reprocessed next compaction (idempotent).
+            if self
+                .storage
+                .flush_in_progress
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                log::info!(
+                    "Skipping delta clear for {}/{}: flush in progress",
+                    edge_type,
+                    direction
+                );
+            } else {
+                let delta_ds = self.storage.delta_dataset(edge_type, direction)?;
+                let delta_schema = delta_ds.get_arrow_schema(&schema)?;
+                let empty_batch = RecordBatch::new_empty(delta_schema);
+                delta_ds
+                    .replace(self.storage.backend(), empty_batch)
+                    .await?;
+            }
         }
 
         let duration = start.elapsed();

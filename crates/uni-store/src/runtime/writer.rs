@@ -699,23 +699,23 @@ impl Writer {
                             batch_constraint_keys.insert(key, idx);
                         }
                     }
-                    ConstraintType::Exists { property } => {
-                        if properties.get(property).is_none_or(|v| v.is_null()) {
-                            return Err(anyhow!(
-                                "Constraint violation at index {}: Property '{}' must exist",
-                                idx,
-                                property
-                            ));
-                        }
+                    ConstraintType::Exists { property }
+                        if properties.get(property).is_none_or(|v| v.is_null()) =>
+                    {
+                        return Err(anyhow!(
+                            "Constraint violation at index {}: Property '{}' must exist",
+                            idx,
+                            property
+                        ));
                     }
-                    ConstraintType::Check { expression } => {
-                        if !self.evaluate_check_constraint(expression, properties)? {
-                            return Err(anyhow!(
-                                "Constraint violation at index {}: CHECK constraint '{}' violated",
-                                idx,
-                                constraint.name
-                            ));
-                        }
+                    ConstraintType::Check { expression }
+                        if !self.evaluate_check_constraint(expression, properties)? =>
+                    {
+                        return Err(anyhow!(
+                            "Constraint violation at index {}: CHECK constraint '{}' violated",
+                            idx,
+                            constraint.name
+                        ));
                     }
                     _ => {}
                 }

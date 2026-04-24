@@ -822,6 +822,14 @@ if xervo.is_available():
 
     # Convenience wrapper -- single prompt string
     result = xervo.generate_text("llm/default", "Explain hybrid search in one sentence.")
+
+    # Rerank documents by relevance
+    scored = xervo.rerank(
+        "rerank/minilm",
+        "How do graph databases work?",
+        ["Graphs use edges for relationships.", "SQL uses tables and joins."],
+    )
+    # → list[ScoredDoc] with index, score, text
 ```
 
 ### Async Xervo
@@ -835,6 +843,7 @@ db = await uni_db.AsyncUni.builder() \
 xervo = db.xervo()
 vectors = await xervo.embed("embed/default", ["hello"])
 result = await xervo.generate_text("llm/default", "Hello!")
+scored = await xervo.rerank("rerank/minilm", "query", ["doc1", "doc2"])
 ```
 
 ### Message Constructors

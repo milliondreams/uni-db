@@ -22,6 +22,8 @@ pub mod multi_agent;
 pub mod notifications;
 pub mod prepared;
 pub mod query_builder;
+#[cfg(feature = "provider-onnx")]
+pub mod reranker;
 pub mod rule_registry;
 pub mod schema;
 pub mod session;
@@ -831,6 +833,8 @@ pub struct UniBuilder {
     config: UniConfig,
     schema_file: Option<PathBuf>,
     xervo_catalog: Option<Vec<ModelAliasSpec>>,
+    /// Pre-built Xervo runtime (bypasses catalog-based builder when set).
+    prebuilt_xervo_runtime: Option<Arc<ModelRuntime>>,
     hybrid_remote_url: Option<String>,
     cloud_config: Option<CloudStorageConfig>,
     create_if_missing: bool,
@@ -848,6 +852,7 @@ impl UniBuilder {
             config: UniConfig::default(),
             schema_file: None,
             xervo_catalog: None,
+            prebuilt_xervo_runtime: None,
             hybrid_remote_url: None,
             cloud_config: None,
             create_if_missing: true,
@@ -867,6 +872,19 @@ impl UniBuilder {
     /// Set Uni-Xervo catalog explicitly.
     pub fn xervo_catalog(mut self, catalog: Vec<ModelAliasSpec>) -> Self {
         self.xervo_catalog = Some(catalog);
+        self
+    }
+
+    /// Set a pre-built Xervo runtime directly.
+    ///
+    /// This bypasses the catalog-based provider registration and uses the
+    /// provided runtime as-is. Useful for testing with mock providers or
+    /// for advanced scenarios where the caller controls runtime construction.
+    ///
+    /// Mutually exclusive with [`xervo_catalog()`](Self::xervo_catalog) —
+    /// when both are set, this takes precedence.
+    pub fn xervo_runtime(mut self, runtime: Arc<ModelRuntime>) -> Self {
+        self.prebuilt_xervo_runtime = Some(runtime);
         self
     }
 
@@ -1261,7 +1279,9 @@ impl UniBuilder {
             )));
         }
 
-        let xervo_runtime = if let Some(catalog) = self.xervo_catalog {
+        let xervo_runtime = if let Some(runtime) = self.prebuilt_xervo_runtime {
+            Some(runtime)
+        } else if let Some(catalog) = self.xervo_catalog {
             for alias in &required_embed_aliases {
                 let spec = catalog.iter().find(|s| &s.alias == alias).ok_or_else(|| {
                     UniError::Internal(anyhow::anyhow!(
@@ -1337,6 +1357,8 @@ impl UniBuilder {
             {
                 runtime_builder = runtime_builder
                     .register_provider(uni_xervo::provider::LocalOnnxProvider::new());
+                runtime_builder =
+                    runtime_builder.register_provider(reranker::OnnxCrossEncoderProvider);
             }
 
             Some(

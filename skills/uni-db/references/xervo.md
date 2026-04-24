@@ -23,6 +23,7 @@ Run inference on the host machine. No API keys needed.
 | `local/candle` | HuggingFace Candle | Embed | Lightweight CPU embeddings (Bert, JinaBert, Gemma) |
 | `local/fastembed` | ONNX Runtime | Embed | Fastest CPU embeddings, smallest footprint |
 | `local/mistralrs` | mistral.rs | Embed, Generate | GPU inference, quantized models, multi-modal |
+| `local/onnx-reranker` | ONNX Runtime | Rerank | Local cross-encoder reranking (BERT-style models) |
 
 **Local provider options:**
 
@@ -414,8 +415,23 @@ Automatic instrumentation (when metrics enabled):
 
 | Use Case | Provider | Model ID | Notes |
 |---|---|---|---|
+| **Local (CPU)** | `local/onnx-reranker` | `cross-encoder/ms-marco-MiniLM-L6-v2` | ~80MB, no API key, `provider-onnx` feature |
 | **Best quality** | `remote/voyageai` | `rerank-2` | Top-tier reranking accuracy |
 | **Cost-effective** | `remote/cohere` | `rerank-english-v3.0` | Good quality, lower cost |
+
+The `local/onnx-reranker` provider handles tokenization (WordPiece) and batched ONNX inference internally. Any BERT-style cross-encoder from HuggingFace that accepts `input_ids`, `attention_mask`, `token_type_ids` and outputs a single logit per pair should work.
+
+### Reranker API
+
+```rust
+// Via UniXervo facade
+let scored = db.xervo().rerank("rerank/minilm", "query text", &["doc1", "doc2"]).await?;
+// scored: Vec<ScoredDoc> { index, score, text }
+
+// Via search procedures (see vector-hybrid-search.md Section 11)
+// Add reranker options to any CALL procedure:
+// {reranker: 'rerank/minilm', reranker_property: 'content'}
+```
 
 ---
 

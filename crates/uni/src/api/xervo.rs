@@ -8,7 +8,7 @@ use uni_common::{Result, UniError};
 use uni_xervo::runtime::ModelRuntime;
 pub use uni_xervo::traits::{
     AudioOutput, ContentBlock, GeneratedImage, GenerationOptions, GenerationResult, ImageInput,
-    Message, MessageRole, TokenUsage,
+    Message, MessageRole, RerankerModel, ScoredDoc, TokenUsage,
 };
 #[cfg(feature = "provider-onnx")]
 pub use uni_xervo::traits::{OnnxRunner, TensorBatch, TensorSpec, TensorValue};
@@ -88,6 +88,29 @@ impl UniXervo {
     pub async fn onnx_runner(&self, alias: &str) -> Result<Arc<dyn uni_xervo::traits::OnnxRunner>> {
         let runtime = self.runtime.as_ref().ok_or_else(not_configured)?;
         runtime.onnx_runner(alias).await.map_err(into_uni_error)
+    }
+
+    /// Rerank documents against a query using a configured cross-encoder model.
+    ///
+    /// Returns [`ScoredDoc`]s sorted by relevance score (descending).
+    /// The model alias must point to a catalog entry with `task: Rerank`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UniError`] if the runtime is not configured, the alias
+    /// is not registered, or inference fails.
+    pub async fn rerank(
+        &self,
+        alias: &str,
+        query: &str,
+        documents: &[&str],
+    ) -> Result<Vec<uni_xervo::traits::ScoredDoc>> {
+        let runtime = self.runtime.as_ref().ok_or_else(not_configured)?;
+        let reranker = runtime.reranker(alias).await.map_err(into_uni_error)?;
+        reranker
+            .rerank(query, documents)
+            .await
+            .map_err(into_uni_error)
     }
 
     /// Access the underlying Uni-Xervo runtime, if configured.

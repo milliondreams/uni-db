@@ -164,11 +164,26 @@ Uni-Xervo supports local providers (MistralRS, Candle, FastEmbed) and remote pro
 - Scoring graph-traversed nodes with `similar_to()` in `WHERE` and Locy rules.
 - LLM generation with context from graph queries.
 
+## Cross-Encoder Reranking
+
+For higher-precision results, add a cross-encoder reranking stage to `uni.vector.query`. The reranker re-scores over-fetched candidates using a (query, document) cross-encoder model:
+
+```cypher
+CALL uni.vector.query('Document', 'embedding', 'graph databases', 10,
+    null, null,
+    {reranker: 'rerank/minilm', reranker_property: 'content'})
+YIELD node, score, rerank_score
+RETURN node.title, score
+```
+
+Supports local ONNX models (`local/onnx-reranker`) and remote APIs (Cohere, Voyage AI). See [Hybrid Search — Reranking](hybrid-search.md#cross-encoder-reranking) for full details.
+
 ## When To Use
 
 Choose vector search when you need semantic similarity rather than exact matching. Pair it with graph traversal for contextual results.
 
 - Use `CALL uni.vector.query(...)` to **find** top-K candidates from a full label.
 - Use `similar_to()` to **score** nodes already bound by `MATCH`.
+- Add a `reranker` option for higher-precision results on the final candidate set.
 
 See also: [Full-Text Search](full-text-json-search.md) | [Hybrid Search](hybrid-search.md)

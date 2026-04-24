@@ -2169,8 +2169,8 @@ graph TB
 ## Vector Search
 
 ```cypher
-CALL uni.vector.query(label, property, query_vector, k [, filter] [, threshold])
-YIELD node, score, distance, vector_score, vid
+CALL uni.vector.query(label, property, query_vector, k [, filter] [, threshold] [, options])
+YIELD node, score, distance, vector_score, rerank_score, vid
 ```
 
 | Parameter | Type | Description |
@@ -2181,6 +2181,7 @@ YIELD node, score, distance, vector_score, vid
 | `k` | Integer | Number of results |
 | `filter` | String (optional) | WHERE predicate string |
 | `threshold` | Float (optional) | Minimum similarity score |
+| `options` | Map (optional) | Reranker configuration (see [Cross-Encoder Reranking](#cross-encoder-reranking)) |
 
 **Example — basic vector search:**
 
@@ -2209,6 +2210,17 @@ RETURN node.title, score
 ```
 
 Score normalization: Returns a 0-1 similarity score regardless of distance metric. Uses metric-aware conversion: Cosine → `(2-d)/2`, L2 → `1/(1+d)`, Dot → pass-through.
+
+**Example — vector search with cross-encoder reranking:**
+
+```cypher
+CALL uni.vector.query('Document', 'embedding', 'graph databases', 10,
+    null, null,
+    {reranker: 'rerank/minilm', reranker_property: 'content'})
+YIELD node, score, rerank_score
+RETURN node.title, score
+ORDER BY score DESC
+```
 
 ## similar_to() Expression Function
 
@@ -2385,11 +2397,11 @@ The `GraphExecutionContext` and `SessionContext` are available in `NativeExecuti
 ## Full-Text Search
 
 ```cypher
-CALL uni.fts.query(label, property, search_term, k [, threshold])
-YIELD node, score, fts_score, vid
+CALL uni.fts.query(label, property, search_term, k [, filter] [, threshold] [, options])
+YIELD node, score, fts_score, rerank_score, vid
 ```
 
-BM25-based full-text search. Scores are normalized to 0-1 relative to the top match.
+BM25-based full-text search. Scores are normalized to 0-1 relative to the top match. Supports optional cross-encoder reranking via the `options` map.
 
 ```cypher
 CALL uni.fts.query('Article', 'content', 'distributed graph database', 10)
@@ -2402,7 +2414,7 @@ RETURN node.title, score
 ```cypher
 CALL uni.search(label, properties, query_text [, query_vector] [, k]
     [, filter] [, options])
-YIELD node, score, vector_score, fts_score, vid
+YIELD node, score, vector_score, fts_score, rerank_score, vid
 ```
 
 Combines vector and full-text search with score fusion:
@@ -2412,12 +2424,23 @@ Combines vector and full-text search with score fusion:
 | `method` | `'rrf'` (default), `'weighted'` | Score fusion method |
 | `alpha` | 0.0 - 1.0 | Weight for vector vs FTS (weighted mode) |
 | `over_fetch` | Float (default: 2.0) | Over-fetch factor for pagination |
+| `reranker` | String | Xervo alias for cross-encoder model (see below) |
+| `reranker_property` | String | Node text property for cross-encoder document input |
+| `reranker_k` | Integer (default: k×3) | Over-fetch for reranking (clamped to [k, 1000]) |
+| `reranker_query` | String | Override query text for cross-encoder |
 
 ```cypher
-CALL uni.search('Document', ['embedding', 'content'],
-    'graph databases', $query_vector, 10,
-    NULL, {fusion: 'rrf'})
+-- Basic hybrid search with RRF
+CALL uni.search('Document', {vector: 'embedding', fts: 'content'},
+    'graph databases', null, 10)
 YIELD node, score
+RETURN node.title, score
+
+-- Hybrid search with cross-encoder reranking
+CALL uni.search('Document', {vector: 'embedding', fts: 'content'},
+    'graph databases', null, 10, null,
+    {method: 'rrf', reranker: 'rerank/minilm', reranker_property: 'content'})
+YIELD node, score, rerank_score, vector_score, fts_score
 RETURN node.title, score
 ```
 
@@ -2456,12 +2479,55 @@ let quick = xervo
 ```
 
 - `embed(alias, texts)` returns `Vec<Vec<f32>>`
+- `rerank(alias, query, documents)` returns `Vec<ScoredDoc>` — cross-encoder relevance scoring for reranking search results
 - `generate(alias, messages, options)` accepts `&[Message]` with roles `system`, `user`, `assistant` and a `GenerationOptions` struct
 - `generate_text(alias, messages, options)` is a convenience wrapper — each string becomes a user message
 - `raw_runtime()` exposes the underlying `ModelRuntime` for advanced orchestration
 - `GenerationOptions` supports `max_tokens`, `temperature`, `top_p` fields
 
-This is the same runtime used by vector-index auto-embedding on writes and by text-query auto-embedding in `uni.vector.query(...)` / `similar_to(...)`.
+This is the same runtime used by vector-index auto-embedding on writes, by text-query auto-embedding in `uni.vector.query(...)` / `similar_to(...)`, and by cross-encoder reranking in search procedures.
+
+## Cross-Encoder Reranking
+
+All three search procedures support an optional **cross-encoder reranking** stage. A cross-encoder jointly attends to a (query, document) pair to produce a more accurate relevance score than bi-encoder similarity or BM25, but is too expensive to run on the full corpus. It runs on a small over-fetched candidate set for fast retrieval with high-precision final ranking.
+
+**Pipeline:** `Retrieval (vector/FTS/hybrid) → Over-fetch reranker_k candidates → Cross-encoder scores (query, doc) pairs → Top k returned`
+
+Reranking is opt-in — enabled by adding `reranker` to the options map of any search procedure.
+
+### Reranker Options
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `reranker` | String | `null` (disabled) | Xervo model alias (e.g. `'rerank/minilm'`) |
+| `reranker_property` | String | FTS property (hybrid/FTS) or required (vector) | Text property fed as cross-encoder "document" |
+| `reranker_k` | Integer | `k × 3` | Candidates to over-fetch for reranking (clamped to [k, 1000]) |
+| `reranker_query` | String | Query arg | Override query text. Required when `uni.vector.query` receives a pre-computed vector |
+
+When reranking is active, `score` reflects the reranker score and `rerank_score` is populated. Original retrieval scores (`vector_score`, `fts_score`, `distance`) remain available.
+
+### Available Providers
+
+| Provider | Provider ID | Model Example | Type |
+|---|---|---|---|
+| ONNX (local) | `local/onnx-reranker` | `cross-encoder/ms-marco-MiniLM-L6-v2` | Local CPU inference, `provider-onnx` feature |
+| Cohere | `remote/cohere` | `rerank-english-v3.0` | Remote API |
+| Voyage AI | `remote/voyageai` | `rerank-2` | Remote API |
+
+### Catalog Configuration
+
+```json
+{
+  "alias": "rerank/minilm",
+  "task": "Rerank",
+  "provider_id": "local/onnx-reranker",
+  "model_id": "cross-encoder/ms-marco-MiniLM-L6-v2"
+}
+```
+
+### Reranking Does Not Apply to `similar_to()`
+
+`similar_to()` is a per-row scalar expression with no bounded candidate set. Cross-encoders are only effective on small candidate sets, so reranking is limited to the three search procedures.
 
 ## Admin Procedures
 
@@ -4004,6 +4070,14 @@ result = xervo.generate_text(
     "List three graph database use cases.",
     max_tokens=128,
 )
+
+# Rerank documents by relevance to a query
+scored = xervo.rerank(
+    "rerank/minilm",
+    "How do graph databases handle relationships?",
+    ["Graph DBs use edges to model relationships.", "SQL uses foreign keys."],
+)
+# → list[ScoredDoc] with index, score, text
 ```
 
 #### Message

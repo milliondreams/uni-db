@@ -7,8 +7,8 @@ Quick reference for Uni DB's vector similarity, full-text, and hybrid search cap
 ## 1. Vector Search -- `uni.vector.query`
 
 ```cypher
-CALL uni.vector.query(label, property, query_vector, k [, filter] [, threshold])
-YIELD node, score, distance, vector_score, vid
+CALL uni.vector.query(label, property, query_vector, k [, filter] [, threshold] [, options])
+YIELD node, score, distance, vector_score, rerank_score, vid
 ```
 
 | Parameter | Type | Required | Description |
@@ -19,14 +19,16 @@ YIELD node, score, distance, vector_score, vid
 | `k` | Integer | Yes | Number of results |
 | `filter` | String | No | Lance/DataFusion WHERE predicate for **pre-filtering** |
 | `threshold` | Float | No | Minimum similarity score (0-1); results below are excluded |
+| `options` | Map | No | Reranker configuration (see [Section 11](#11-cross-encoder-reranking)) |
 
 | YIELD Column | Type | Description |
 |---|---|---|
 | `node` | Object | Full node with all properties (slower for large k) |
 | `vid` | Integer | Vertex ID for efficient joins (faster than `node`) |
-| `score` | Float | Normalized similarity 0-1 (higher = more similar) |
+| `score` | Float | Normalized similarity 0-1, or reranker score when reranker is active |
 | `distance` | Float | Raw distance (lower = closer; metric-dependent) |
 | `vector_score` | Float | Same as `score` (for parity with `uni.search`) |
+| `rerank_score` | Float | Cross-encoder score (null when reranker is not configured) |
 
 **Basic search:**
 ```cypher
@@ -170,8 +172,8 @@ The multi-source form normalizes BM25 via `score / (score + fts_k)` before fusio
 ## 3. Full-Text Search -- `uni.fts.query`
 
 ```cypher
-CALL uni.fts.query(label, property, search_term, k [, threshold])
-YIELD node, score, fts_score, vid
+CALL uni.fts.query(label, property, search_term, k [, filter] [, threshold] [, options])
+YIELD node, score, fts_score, rerank_score, vid
 ```
 
 | Parameter | Type | Required | Description |
@@ -180,7 +182,9 @@ YIELD node, score, fts_score, vid
 | `property` | String | Yes | Text property with fulltext index |
 | `search_term` | String | Yes | Search query |
 | `k` | Integer | Yes | Number of results |
+| `filter` | String | No | Pre-filter predicate |
 | `threshold` | Float | No | Minimum score (0-1) |
+| `options` | Map | No | Reranker configuration (see [Section 11](#11-cross-encoder-reranking)) |
 
 Scores are BM25, normalized to 0-1 relative to top match.
 
@@ -200,7 +204,7 @@ ORDER BY score DESC
 ```cypher
 CALL uni.search(label, properties, query_text [, query_vector] [, k]
     [, filter] [, options])
-YIELD node, score, vector_score, fts_score, vid
+YIELD node, score, vector_score, fts_score, rerank_score, vid
 ```
 
 | Parameter | Type | Required | Description |
@@ -220,6 +224,10 @@ YIELD node, score, vector_score, fts_score, vid
 | `method` | `'rrf'`, `'weighted'` | `'rrf'` | Fusion algorithm |
 | `alpha` | 0.0 - 1.0 | 0.5 | Vector weight for weighted fusion |
 | `over_fetch` | Float | 2.0 | Over-fetch factor; each branch retrieves `k * over_fetch` |
+| `reranker` | String | `null` | Xervo alias for cross-encoder model (see [Section 11](#11-cross-encoder-reranking)) |
+| `reranker_property` | String | FTS property | Node text property for cross-encoder document input |
+| `reranker_k` | Integer | `k * 3` | Over-fetch for reranking (clamped to [k, 1000]) |
+| `reranker_query` | String | `query_text` | Override query text for cross-encoder |
 
 ### Fusion Formulas
 
@@ -614,4 +622,134 @@ RETURN d.title,
     {method: 'weighted', weights: [0.7, 0.3]}) AS relevance
 ORDER BY relevance DESC
 LIMIT 20
+```
+
+---
+
+## 11. Cross-Encoder Reranking
+
+All three search procedures (`uni.vector.query`, `uni.fts.query`, `uni.search`) support an optional **cross-encoder reranking** stage. A cross-encoder jointly attends to a (query, document) pair to produce a more accurate relevance score than bi-encoder similarity or BM25, but is too expensive to run on the full corpus. By running it on a small over-fetched candidate set, you get fast retrieval with high-precision final ranking.
+
+### How It Works
+
+```
+Retrieval (vector/FTS/hybrid)  ->  Over-fetch reranker_k candidates  ->  Cross-encoder scores each (query, doc) pair  ->  Top k returned
+```
+
+Reranking is **opt-in** — enabled by adding `reranker` to the options map.
+
+### Reranker Options
+
+Added to the options map (last argument) of any search procedure:
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `reranker` | String | `null` (disabled) | Xervo model alias for the cross-encoder (e.g. `'rerank/minilm'`). Enables reranking when present. |
+| `reranker_property` | String | FTS property (hybrid/FTS) or **required** (vector) | Node property whose text is fed as the "document" side of the cross-encoder. |
+| `reranker_k` | Integer | `k * 3` | Number of candidates to over-fetch for reranking. Clamped to `[k, 1000]`. |
+| `reranker_query` | String | Query arg | Override query text for the cross-encoder. **Required** when `uni.vector.query` receives a pre-computed vector (not text). |
+
+### YIELD Columns
+
+When reranking is enabled, a new column is available:
+
+| Column | Type | Description |
+|---|---|---|
+| `rerank_score` | Float | Sigmoid-normalized cross-encoder relevance score (0-1). `null` when reranker is not configured. |
+
+When reranking is active, the `score` column reflects the **reranker score** (not the retrieval/fusion score). This means `ORDER BY score DESC` always gives the best available relevance signal regardless of whether reranking is on.
+
+### Examples
+
+**Vector search with reranking (text query):**
+```cypher
+CALL uni.vector.query('Document', 'embedding', 'graph database architecture', 10,
+    null, null,
+    {reranker: 'rerank/minilm', reranker_property: 'content'})
+YIELD node, score, rerank_score, distance
+RETURN node.title, score, rerank_score
+ORDER BY score DESC
+```
+
+**Vector search with reranking (pre-computed vector — must provide reranker_query):**
+```cypher
+CALL uni.vector.query('Document', 'embedding', $query_vector, 10,
+    null, null,
+    {reranker: 'rerank/minilm', reranker_property: 'content',
+     reranker_query: 'graph database architecture'})
+YIELD node, score
+RETURN node.title, score
+```
+
+**FTS search with reranking (reranker_property defaults to FTS property):**
+```cypher
+CALL uni.fts.query('Article', 'body', 'machine learning transformers', 10,
+    null, null,
+    {reranker: 'rerank/minilm'})
+YIELD node, score, rerank_score
+RETURN node.title, score
+```
+
+**Hybrid search with reranking:**
+```cypher
+CALL uni.search('Document', {vector: 'embedding', fts: 'content'},
+    'quantum computing applications', null, 10, null,
+    {method: 'rrf', reranker: 'rerank/minilm', reranker_property: 'content'})
+YIELD node, score, rerank_score, vector_score, fts_score
+RETURN node.title, score, vector_score, fts_score
+```
+
+**Controlling over-fetch:**
+```cypher
+-- Reranker sees 30 candidates, returns top 10
+CALL uni.vector.query('Document', 'embedding', 'search query', 10,
+    null, null,
+    {reranker: 'rerank/minilm', reranker_property: 'content', reranker_k: 30})
+YIELD node, score
+RETURN node.title, score
+```
+
+### Available Reranker Providers
+
+| Provider | Provider ID | Model Example | Type |
+|---|---|---|---|
+| ONNX (local) | `local/onnx-reranker` | `cross-encoder/ms-marco-MiniLM-L6-v2` | Local CPU/GPU inference |
+| Cohere | `remote/cohere` | `rerank-english-v3.0` | Remote API |
+| Voyage AI | `remote/voyageai` | `rerank-2` | Remote API |
+
+**Catalog configuration example:**
+```json
+[
+  {
+    "alias": "rerank/minilm",
+    "task": "Rerank",
+    "provider_id": "local/onnx-reranker",
+    "model_id": "cross-encoder/ms-marco-MiniLM-L6-v2"
+  }
+]
+```
+
+The local ONNX provider (`local/onnx-reranker`) requires the `provider-onnx` feature flag. It downloads the model and tokenizer from HuggingFace on first use and caches them locally.
+
+### Reranking Does NOT Apply to `similar_to()`
+
+`similar_to()` is a per-row scalar expression — it scores every row DataFusion hands it and has no bounded candidate set. Cross-encoders are only effective on small candidate sets (tens to hundreds), so reranking is limited to the three search procedures which control their own retrieval and top-k.
+
+### Direct Reranker API
+
+```rust
+let scored = db.xervo().rerank(
+    "rerank/minilm",
+    "How does Rust handle memory safety?",
+    &["Rust uses ownership and borrowing.", "Python uses garbage collection."],
+).await?;
+// scored: Vec<ScoredDoc> sorted by relevance descending
+```
+
+```python
+scored = db.xervo().rerank(
+    "rerank/minilm",
+    "How does Rust handle memory safety?",
+    ["Rust uses ownership and borrowing.", "Python uses garbage collection."],
+)
 ```

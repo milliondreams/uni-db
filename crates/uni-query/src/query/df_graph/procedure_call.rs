@@ -54,6 +54,7 @@ pub(crate) fn map_yield_to_canonical(yield_name: &str) -> String {
         "vector_score" => "vector_score",
         "fts_score" => "fts_score",
         "raw_score" => "raw_score",
+        "rerank_score" | "_rerank_score" => "rerank_score",
         _ => "node",
     }
     .to_string()
@@ -248,7 +249,7 @@ impl GraphProcedureCallExec {
                         "distance" => {
                             fields.push(Field::new(output_name, DataType::Float64, true));
                         }
-                        "score" | "vector_score" | "fts_score" | "raw_score" => {
+                        "score" | "vector_score" | "fts_score" | "raw_score" | "rerank_score" => {
                             fields.push(Field::new(output_name, DataType::Float32, true));
                         }
                         "vid" => {
@@ -1275,6 +1276,143 @@ async fn auto_embed_text(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Cross-encoder reranking helpers
+// ---------------------------------------------------------------------------
+
+/// Configuration for an optional cross-encoder reranking stage.
+struct RerankerConfig {
+    /// Model alias in the Xervo catalog (e.g. "rerank/minilm").
+    alias: String,
+    /// Node property whose text value is fed as the "document" side.
+    property: String,
+    /// Number of candidates to pass to the reranker (over-fetch count).
+    k: usize,
+    /// Override query text for the cross-encoder (required when the search
+    /// query is a pre-computed vector, not text).
+    query_override: Option<String>,
+}
+
+/// Parse reranker options from an options map.
+///
+/// Returns `None` when the `reranker` key is absent (reranking disabled).
+/// Accepts `HashMap<String, Value>` (the type returned by `Value::as_object()`
+/// on `uni_common::Value`).
+fn parse_reranker_options(
+    options_map: Option<&HashMap<String, Value>>,
+    k: usize,
+    default_text_property: Option<&str>,
+) -> Option<RerankerConfig> {
+    let map = options_map?;
+    let alias = map.get("reranker")?.as_str()?.to_string();
+
+    let property = map
+        .get("reranker_property")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .or_else(|| default_text_property.map(String::from))
+        .unwrap_or_default();
+
+    let reranker_k = map
+        .get("reranker_k")
+        .and_then(|v| v.as_u64())
+        .map(|v| (v as usize).clamp(k, 1000))
+        .unwrap_or((k * 3).min(1000));
+
+    let query_override = map
+        .get("reranker_query")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    Some(RerankerConfig {
+        alias,
+        property,
+        k: reranker_k,
+        query_override,
+    })
+}
+
+/// Apply sigmoid to normalize a raw cross-encoder logit to [0, 1].
+fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+/// Rerank a set of candidates using a cross-encoder model.
+///
+/// Returns `(final_results, rerank_score_map, props_map)`:
+/// - `final_results`: top-k results sorted by reranker score (Vid, rerank_score)
+/// - `rerank_score_map`: Vid → normalized reranker score for all reranked candidates
+/// - `props_map`: hydrated properties (reusable by the batch builder to avoid a
+///   second storage fetch)
+async fn rerank_candidates(
+    graph_ctx: &GraphExecutionContext,
+    candidates: Vec<(Vid, f32)>,
+    label: &str,
+    query_text: &str,
+    config: &RerankerConfig,
+    k: usize,
+) -> DFResult<(Vec<(Vid, f32)>, RerankContext)> {
+    let vids: Vec<Vid> = candidates.iter().map(|(v, _)| *v).collect();
+
+    // 1. Hydrate document text
+    let property_manager = graph_ctx.property_manager();
+    let query_ctx = graph_ctx.query_context();
+    let props_map = property_manager
+        .get_batch_vertex_props_for_label(&vids, label, Some(&query_ctx))
+        .await
+        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+
+    // 2. Extract text from the reranker property
+    let doc_texts: Vec<String> = vids
+        .iter()
+        .map(|vid| {
+            props_map
+                .get(vid)
+                .and_then(|p| p.get(&config.property))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        })
+        .collect();
+
+    // 3. Call the reranker
+    let runtime = graph_ctx.xervo_runtime().ok_or_else(|| {
+        datafusion::error::DataFusionError::Execution(
+            "Cannot rerank: Uni-Xervo runtime not configured".to_string(),
+        )
+    })?;
+    let reranker = runtime
+        .reranker(&config.alias)
+        .await
+        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+    let doc_refs: Vec<&str> = doc_texts.iter().map(|s| s.as_str()).collect();
+    let scored = reranker.rerank(query_text, &doc_refs).await.map_err(|e| {
+        datafusion::error::DataFusionError::Execution(format!("Reranker inference failed: {e}"))
+    })?;
+
+    // 4. Build results sorted by normalized reranker score, take top k
+    let mut reranked: Vec<(Vid, f32)> = scored
+        .iter()
+        .map(|sd| (vids[sd.index], sigmoid(sd.score)))
+        .collect();
+    reranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    reranked.truncate(k);
+
+    // 5. Build rerank_score map for all reranked candidates (not just top k)
+    let rerank_map: HashMap<Vid, f32> = scored
+        .iter()
+        .map(|sd| (vids[sd.index], sigmoid(sd.score)))
+        .collect();
+
+    Ok((
+        reranked,
+        RerankContext {
+            scores: rerank_map,
+            props: props_map,
+        },
+    ))
+}
+
 async fn execute_vector_query(
     graph_ctx: &GraphExecutionContext,
     args: &[Value],
@@ -1293,7 +1431,10 @@ async fn execute_vector_query(
 
     let storage = graph_ctx.storage();
 
-    let query_vector: Vec<f32> = if let Some(query_text) = query_val.as_str() {
+    // Capture query text if the query arg is a string (for reranker use)
+    let query_text_from_arg = query_val.as_str().map(String::from);
+
+    let query_vector: Vec<f32> = if let Some(ref query_text) = query_text_from_arg {
         auto_embed_text(graph_ctx, &label, &property, query_text).await?
     } else {
         extract_vector(query_val)?
@@ -1302,6 +1443,30 @@ async fn execute_vector_query(
     let k = require_int_arg(args, 3, "uni.vector.query: fourth argument (k)")?;
     let filter = extract_optional_filter(args, 4);
     let threshold = extract_optional_threshold(args, 5);
+
+    // Arg 6: optional options map (for reranker configuration)
+    let options_val = args.get(6);
+    let options_map = options_val.and_then(|v| if v.is_null() { None } else { v.as_object() });
+    let reranker_config = parse_reranker_options(options_map, k, None);
+
+    // Validate: reranker requires query text
+    if let Some(ref rcfg) = reranker_config {
+        if query_text_from_arg.is_none() && rcfg.query_override.is_none() {
+            return Err(datafusion::error::DataFusionError::Execution(
+                "Cannot rerank: query is a pre-computed vector. \
+                 Provide reranker_query in options."
+                    .to_string(),
+            ));
+        }
+        if rcfg.property.is_empty() {
+            return Err(datafusion::error::DataFusionError::Execution(
+                "reranker_property is required when using reranker with uni.vector.query"
+                    .to_string(),
+            ));
+        }
+    }
+
+    let retrieval_k = reranker_config.as_ref().map_or(k, |rc| rc.k);
     let query_ctx = graph_ctx.query_context();
 
     let mut results = storage
@@ -1309,7 +1474,7 @@ async fn execute_vector_query(
             &label,
             &property,
             &query_vector,
-            k,
+            retrieval_k,
             filter.as_deref(),
             Some(&query_ctx),
         )
@@ -1333,16 +1498,28 @@ async fn execute_vector_query(
         .map(|config| config.metric.clone())
         .unwrap_or(DistanceMetric::L2);
 
-    build_search_result_batch(
-        &results,
-        &label,
-        &metric,
+    // Rerank if configured
+    let (results, rerank_ctx) = if let Some(ref rcfg) = reranker_config {
+        let reranker_query = rcfg
+            .query_override
+            .as_deref()
+            .or(query_text_from_arg.as_deref())
+            .unwrap_or("");
+        let (reranked, ctx) =
+            rerank_candidates(graph_ctx, results, &label, reranker_query, rcfg, k).await?;
+        (reranked, Some(ctx))
+    } else {
+        (results, None)
+    };
+
+    let batch_ctx = BatchBuildCtx {
         yield_items,
         target_properties,
         graph_ctx,
         schema,
-    )
-    .await
+        rerank_ctx: rerank_ctx.as_ref(),
+    };
+    build_search_result_batch(&results, &label, &metric, &batch_ctx).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1363,6 +1540,12 @@ async fn execute_fts_query(
     let filter = extract_optional_filter(args, 4);
     let threshold = extract_optional_threshold(args, 5);
 
+    // Arg 6: optional options map (for reranker configuration)
+    let options_val = args.get(6);
+    let options_map = options_val.and_then(|v| if v.is_null() { None } else { v.as_object() });
+    let reranker_config = parse_reranker_options(options_map, k, Some(&property));
+
+    let retrieval_k = reranker_config.as_ref().map_or(k, |rc| rc.k);
     let storage = graph_ctx.storage();
     let query_ctx = graph_ctx.query_context();
 
@@ -1371,7 +1554,7 @@ async fn execute_fts_query(
             &label,
             &property,
             &search_term,
-            k,
+            retrieval_k,
             filter.as_deref(),
             Some(&query_ctx),
         )
@@ -1386,18 +1569,26 @@ async fn execute_fts_query(
         return Ok(Some(create_empty_batch(schema.clone())?));
     }
 
+    // Rerank if configured
+    let (results, rerank_ctx) = if let Some(ref rcfg) = reranker_config {
+        let reranker_query = rcfg.query_override.as_deref().unwrap_or(&search_term);
+        let (reranked, ctx) =
+            rerank_candidates(graph_ctx, results, &label, reranker_query, rcfg, k).await?;
+        (reranked, Some(ctx))
+    } else {
+        (results, None)
+    };
+
     // FTS uses a "fake" L2 metric for the batch builder — scores are already BM25
     // We use L2 as a placeholder; the actual score column is built differently.
-    build_search_result_batch(
-        &results,
-        &label,
-        &DistanceMetric::L2,
+    let batch_ctx = BatchBuildCtx {
         yield_items,
         target_properties,
         graph_ctx,
         schema,
-    )
-    .await
+        rerank_ctx: rerank_ctx.as_ref(),
+    };
+    build_search_result_batch(&results, &label, &DistanceMetric::L2, &batch_ctx).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1477,7 +1668,13 @@ async fn execute_hybrid_search(
         .and_then(|v| v.as_u64())
         .unwrap_or(60) as usize;
 
+    let reranker_config = parse_reranker_options(options_map, k, fts_prop.as_deref());
+
     let over_fetch_k = (k as f32 * over_fetch_factor).ceil() as usize;
+    // When reranking, ensure we retrieve enough candidates
+    let effective_retrieval_k = reranker_config
+        .as_ref()
+        .map_or(over_fetch_k, |rc| rc.k.max(over_fetch_k));
 
     let storage = graph_ctx.storage();
     let query_ctx = graph_ctx.query_context();
@@ -1501,7 +1698,7 @@ async fn execute_hybrid_search(
                     &label,
                     vec_prop,
                     &qvec,
-                    over_fetch_k,
+                    effective_retrieval_k,
                     filter.as_deref(),
                     Some(&query_ctx),
                 )
@@ -1518,7 +1715,7 @@ async fn execute_hybrid_search(
                 &label,
                 fts_prop,
                 &query_text,
-                over_fetch_k,
+                effective_retrieval_k,
                 filter.as_deref(),
                 Some(&query_ctx),
             )
@@ -1532,8 +1729,20 @@ async fn execute_hybrid_search(
         _ => fuse_rrf(&vector_results, &fts_results, rrf_k),
     };
 
-    // Limit to k results
-    let final_results: Vec<_> = fused_results.into_iter().take(k).collect();
+    // Rerank if configured, otherwise just take top k
+    let (final_results, rerank_ctx) = if let Some(ref rcfg) = reranker_config {
+        let candidates: Vec<_> = fused_results.into_iter().take(rcfg.k).collect();
+        if candidates.is_empty() {
+            return Ok(Some(create_empty_batch(schema.clone())?));
+        }
+        let reranker_query = rcfg.query_override.as_deref().unwrap_or(&query_text);
+        let (reranked, ctx) =
+            rerank_candidates(graph_ctx, candidates, &label, reranker_query, rcfg, k).await?;
+        (reranked, Some(ctx))
+    } else {
+        let results: Vec<_> = fused_results.into_iter().take(k).collect();
+        (results, None)
+    };
 
     if final_results.is_empty() {
         return Ok(Some(create_empty_batch(schema.clone())?));
@@ -1562,16 +1771,14 @@ async fn execute_hybrid_search(
         metric: &metric,
     };
 
-    build_hybrid_search_batch(
-        &final_results,
-        &score_ctx,
-        &label,
+    let batch_ctx = BatchBuildCtx {
         yield_items,
         target_properties,
         graph_ctx,
         schema,
-    )
-    .await
+        rerank_ctx: rerank_ctx.as_ref(),
+    };
+    build_hybrid_search_batch(&final_results, &score_ctx, &label, &batch_ctx).await
 }
 
 /// Reciprocal Rank Fusion (RRF) for combining search results.
@@ -1598,42 +1805,68 @@ struct HybridScoreContext<'a> {
     metric: &'a DistanceMetric,
 }
 
+/// Context from a cross-encoder reranking stage (if enabled).
+///
+/// Carries the reranker scores and any pre-fetched properties so batch
+/// builders can reuse them without a second storage round-trip.
+struct RerankContext {
+    /// Vid → sigmoid-normalized reranker score.
+    scores: HashMap<Vid, f32>,
+    /// Pre-fetched properties (reused for node YIELD columns).
+    props: HashMap<Vid, uni_common::Properties>,
+}
+
+/// Common parameters for building search result batches.
+///
+/// Groups the four context arguments that every batch builder needs,
+/// keeping function signatures under the clippy `too_many_arguments` limit.
+struct BatchBuildCtx<'a> {
+    yield_items: &'a [(String, Option<String>)],
+    target_properties: &'a HashMap<String, Vec<String>>,
+    graph_ctx: &'a GraphExecutionContext,
+    schema: &'a SchemaRef,
+    rerank_ctx: Option<&'a RerankContext>,
+}
+
 /// Build a RecordBatch for hybrid search results with fused, vector, and FTS scores.
 async fn build_hybrid_search_batch(
     results: &[(Vid, f32)],
     scores: &HybridScoreContext<'_>,
     label: &str,
-    yield_items: &[(String, Option<String>)],
-    target_properties: &HashMap<String, Vec<String>>,
-    graph_ctx: &GraphExecutionContext,
-    schema: &SchemaRef,
+    batch_ctx: &BatchBuildCtx<'_>,
 ) -> DFResult<Option<RecordBatch>> {
     let num_rows = results.len();
     let vids: Vec<Vid> = results.iter().map(|(vid, _)| *vid).collect();
     let fused_scores: Vec<f32> = results.iter().map(|(_, s)| *s).collect();
 
-    // Pre-load properties for node-like yields
-    let property_manager = graph_ctx.property_manager();
-    let query_ctx = graph_ctx.query_context();
-    let uni_schema = graph_ctx.storage().schema_manager().schema();
+    // Pre-load properties for node-like yields (reuse prefetched if available)
+    let query_ctx = batch_ctx.graph_ctx.query_context();
+    let uni_schema = batch_ctx.graph_ctx.storage().schema_manager().schema();
     let label_props = uni_schema.properties.get(label);
 
-    let has_node_yield = yield_items
+    let has_node_yield = batch_ctx
+        .yield_items
         .iter()
         .any(|(name, _)| map_yield_to_canonical(name) == "node");
 
-    let props_map = if has_node_yield {
-        property_manager
+    let owned_props;
+    let props_map = if let Some(rctx) = batch_ctx.rerank_ctx {
+        &rctx.props
+    } else if has_node_yield {
+        let property_manager = batch_ctx.graph_ctx.property_manager();
+        owned_props = property_manager
             .get_batch_vertex_props_for_label(&vids, label, Some(&query_ctx))
             .await
-            .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?
+            .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+        &owned_props
     } else {
-        HashMap::new()
+        owned_props = HashMap::new();
+        &owned_props
     };
 
     let mut columns: Vec<ArrayRef> = Vec::new();
 
-    for (name, alias) in yield_items {
+    for (name, alias) in batch_ctx.yield_items {
         let output_name = alias.as_ref().unwrap_or(name);
         let canonical = map_yield_to_canonical(name);
 
@@ -1643,8 +1876,8 @@ async fn build_hybrid_search_batch(
                     &vids,
                     label,
                     output_name,
-                    target_properties,
-                    &props_map,
+                    batch_ctx.target_properties,
+                    props_map,
                     label_props,
                 )?);
             }
@@ -1656,9 +1889,24 @@ async fn build_hybrid_search_batch(
                 columns.push(Arc::new(builder.finish()));
             }
             "score" => {
+                // When reranker is active, score reflects the reranker score
                 let mut builder = Float32Builder::with_capacity(num_rows);
-                for score in &fused_scores {
-                    builder.append_value(*score);
+                for (i, vid) in vids.iter().enumerate() {
+                    let score = batch_ctx
+                        .rerank_ctx
+                        .and_then(|rctx| rctx.scores.get(vid).copied())
+                        .unwrap_or(fused_scores[i]);
+                    builder.append_value(score);
+                }
+                columns.push(Arc::new(builder.finish()));
+            }
+            "rerank_score" => {
+                let mut builder = Float32Builder::with_capacity(num_rows);
+                for vid in &vids {
+                    match batch_ctx.rerank_ctx.and_then(|rctx| rctx.scores.get(vid)) {
+                        Some(&s) => builder.append_value(s),
+                        None => builder.append_null(),
+                    }
                 }
                 columns.push(Arc::new(builder.finish()));
             }
@@ -1712,7 +1960,7 @@ async fn build_hybrid_search_batch(
         }
     }
 
-    let batch = RecordBatch::try_new(schema.clone(), columns).map_err(arrow_err)?;
+    let batch = RecordBatch::try_new(batch_ctx.schema.clone(), columns).map_err(arrow_err)?;
     Ok(Some(batch))
 }
 
@@ -1726,45 +1974,48 @@ async fn build_search_result_batch(
     results: &[(Vid, f32)],
     label: &str,
     metric: &DistanceMetric,
-    yield_items: &[(String, Option<String>)],
-    target_properties: &HashMap<String, Vec<String>>,
-    graph_ctx: &GraphExecutionContext,
-    schema: &SchemaRef,
+    batch_ctx: &BatchBuildCtx<'_>,
 ) -> DFResult<Option<RecordBatch>> {
     let num_rows = results.len();
     let vids: Vec<Vid> = results.iter().map(|(vid, _)| *vid).collect();
     let distances: Vec<f32> = results.iter().map(|(_, d)| *d).collect();
 
     // Pre-compute scores
-    let scores: Vec<f32> = distances
+    let retrieval_scores: Vec<f32> = distances
         .iter()
         .map(|dist| calculate_score(*dist, metric))
         .collect();
 
-    // Pre-load properties for all node-like yields
-    let property_manager = graph_ctx.property_manager();
-    let query_ctx = graph_ctx.query_context();
-    let uni_schema = graph_ctx.storage().schema_manager().schema();
+    // Pre-load properties for all node-like yields (reuse prefetched if available)
+    let query_ctx = batch_ctx.graph_ctx.query_context();
+    let uni_schema = batch_ctx.graph_ctx.storage().schema_manager().schema();
     let label_props = uni_schema.properties.get(label);
 
     // Load properties if any node-like yield needs them
-    let has_node_yield = yield_items
+    let has_node_yield = batch_ctx
+        .yield_items
         .iter()
         .any(|(name, _)| map_yield_to_canonical(name) == "node");
 
-    let props_map = if has_node_yield {
-        property_manager
+    let owned_props;
+    let props_map = if let Some(rctx) = batch_ctx.rerank_ctx {
+        &rctx.props
+    } else if has_node_yield {
+        let property_manager = batch_ctx.graph_ctx.property_manager();
+        owned_props = property_manager
             .get_batch_vertex_props_for_label(&vids, label, Some(&query_ctx))
             .await
-            .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?
+            .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+        &owned_props
     } else {
-        HashMap::new()
+        owned_props = HashMap::new();
+        &owned_props
     };
 
     // Build columns in schema order
     let mut columns: Vec<ArrayRef> = Vec::new();
 
-    for (name, alias) in yield_items {
+    for (name, alias) in batch_ctx.yield_items {
         let output_name = alias.as_ref().unwrap_or(name);
         let canonical = map_yield_to_canonical(name);
 
@@ -1774,8 +2025,8 @@ async fn build_search_result_batch(
                     &vids,
                     label,
                     output_name,
-                    target_properties,
-                    &props_map,
+                    batch_ctx.target_properties,
+                    props_map,
                     label_props,
                 )?);
             }
@@ -1787,9 +2038,24 @@ async fn build_search_result_batch(
                 columns.push(Arc::new(builder.finish()));
             }
             "score" => {
+                // When reranker is active, score reflects the reranker score
                 let mut builder = Float32Builder::with_capacity(num_rows);
-                for score in &scores {
-                    builder.append_value(*score);
+                for (i, vid) in vids.iter().enumerate() {
+                    let score = batch_ctx
+                        .rerank_ctx
+                        .and_then(|rctx| rctx.scores.get(vid).copied())
+                        .unwrap_or(retrieval_scores[i]);
+                    builder.append_value(score);
+                }
+                columns.push(Arc::new(builder.finish()));
+            }
+            "rerank_score" => {
+                let mut builder = Float32Builder::with_capacity(num_rows);
+                for vid in &vids {
+                    match batch_ctx.rerank_ctx.and_then(|rctx| rctx.scores.get(vid)) {
+                        Some(&s) => builder.append_value(s),
+                        None => builder.append_null(),
+                    }
                 }
                 columns.push(Arc::new(builder.finish()));
             }
@@ -1811,7 +2077,7 @@ async fn build_search_result_batch(
         }
     }
 
-    let batch = RecordBatch::try_new(schema.clone(), columns).map_err(arrow_err)?;
+    let batch = RecordBatch::try_new(batch_ctx.schema.clone(), columns).map_err(arrow_err)?;
     Ok(Some(batch))
 }
 

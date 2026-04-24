@@ -99,6 +99,10 @@ YIELD vid, score, node [, vector_score] [, fts_score]
 | `method` | `'rrf'` (default), `'weighted'` | Fusion algorithm |
 | `alpha` | 0.0 - 1.0 | Vector weight for weighted fusion |
 | `over_fetch` | Float | Over-fetch factor (default: 2.0) |
+| `reranker` | String | Xervo alias for cross-encoder model (see [Reranking](#cross-encoder-reranking)) |
+| `reranker_property` | String | Node text property for cross-encoder input |
+| `reranker_k` | Integer | Candidates for reranking (default: k×3, max: 1000) |
+| `reranker_query` | String | Override query text for cross-encoder |
 
 ## Fusion Methods
 
@@ -214,6 +218,46 @@ ORDER BY score DESC
 Adding two separate `similar_to` calls produces raw score addition without normalization — cosine similarity scores ([0, 1]) and BM25 scores (unbounded) live on different scales. The multi-source form normalizes BM25 via a saturation function (`score / (score + fts_k)`) before fusion.
 
 See the [Vector Search guide](../guides/vector-search.md#similar_to-expression-function) for full documentation.
+
+## Cross-Encoder Reranking
+
+All three search procedures (`uni.search`, `uni.vector.query`, `uni.fts.query`) support an optional cross-encoder reranking stage. A cross-encoder jointly attends to a (query, document) pair to produce a more accurate relevance score, but is too expensive to run on the full corpus. By running it on a small over-fetched candidate set, you get fast retrieval with high-precision final ranking.
+
+### How It Works
+
+```
+Retrieval (vector/FTS/hybrid) → Over-fetch reranker_k candidates → Cross-encoder re-scores → Top k returned
+```
+
+### Example
+
+```cypher
+CALL uni.search(
+    'Document',
+    {vector: 'embedding', fts: 'content'},
+    'transformer attention mechanisms',
+    null,
+    10,
+    null,
+    {reranker: 'rerank/minilm', reranker_property: 'content'}
+)
+YIELD node, score, rerank_score, vector_score, fts_score
+RETURN node.title, score
+ORDER BY score DESC
+```
+
+When reranking is active, `score` reflects the reranker score. Original retrieval scores remain available via `vector_score` and `fts_score`. The `rerank_score` column is `null` when no reranker is configured.
+
+### Available Providers
+
+| Provider | Provider ID | Model | Type |
+|----------|-------------|-------|------|
+| ONNX (local) | `local/onnx-reranker` | `cross-encoder/ms-marco-MiniLM-L6-v2` | Local CPU, `provider-onnx` feature |
+| Cohere | `remote/cohere` | `rerank-english-v3.0` | Remote API |
+| Voyage AI | `remote/voyageai` | `rerank-2` | Remote API |
+
+!!! note "Reranking does not apply to `similar_to()`"
+    `similar_to()` is a per-row expression with no bounded candidate set. Cross-encoders are only effective on small candidate sets, so reranking is limited to the three search procedures.
 
 ## Use Cases
 

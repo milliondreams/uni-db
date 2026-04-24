@@ -163,20 +163,37 @@ impl MainEdgeDataset {
     }
 
     /// Ensure default indexes exist on the main edges table.
+    ///
+    /// Checks for existing indexes before creating to avoid expensive
+    /// full-table rebuilds on every flush (LanceDB replaces indexes on create).
     pub async fn ensure_default_indexes(backend: &dyn StorageBackend) -> Result<()> {
         let table_name = table_names::main_edge_table_name();
-        let _ = backend
-            .create_scalar_index(table_name, "_eid", ScalarIndexType::BTree)
-            .await;
-        let _ = backend
-            .create_scalar_index(table_name, "src_vid", ScalarIndexType::BTree)
-            .await;
-        let _ = backend
-            .create_scalar_index(table_name, "dst_vid", ScalarIndexType::BTree)
-            .await;
-        let _ = backend
-            .create_scalar_index(table_name, "type", ScalarIndexType::BTree)
-            .await;
+        let indices = backend.list_indexes(table_name).await?;
+
+        let has_index = |col: &str| {
+            indices
+                .iter()
+                .any(|idx| idx.columns.contains(&col.to_string()))
+        };
+
+        for (column, idx_type) in [
+            ("_eid", ScalarIndexType::BTree),
+            ("src_vid", ScalarIndexType::BTree),
+            ("dst_vid", ScalarIndexType::BTree),
+            ("type", ScalarIndexType::BTree),
+        ] {
+            if has_index(column) {
+                continue;
+            }
+            log::info!("Creating {} index on main_edges", column);
+            if let Err(e) = backend
+                .create_scalar_index(table_name, column, idx_type)
+                .await
+            {
+                log::warn!("Failed to create {} index on main_edges: {}", column, e);
+            }
+        }
+
         Ok(())
     }
 

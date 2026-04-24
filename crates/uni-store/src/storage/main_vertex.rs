@@ -216,24 +216,36 @@ impl MainVertexDataset {
     }
 
     /// Ensure default indexes exist on the main vertices table.
+    ///
+    /// Checks for existing indexes before creating to avoid expensive
+    /// full-table rebuilds on every flush (LanceDB replaces indexes on create).
     pub async fn ensure_default_indexes(backend: &dyn StorageBackend) -> Result<()> {
         let table_name = table_names::main_vertex_table_name();
+        let indices = backend.list_indexes(table_name).await?;
 
-        // BTree indexes for primary key and lookup columns
-        let _ = backend
-            .create_scalar_index(table_name, "_vid", ScalarIndexType::BTree)
-            .await;
-        let _ = backend
-            .create_scalar_index(table_name, "ext_id", ScalarIndexType::BTree)
-            .await;
-        let _ = backend
-            .create_scalar_index(table_name, "_uid", ScalarIndexType::BTree)
-            .await;
+        let has_index = |col: &str| {
+            indices
+                .iter()
+                .any(|idx| idx.columns.contains(&col.to_string()))
+        };
 
-        // LabelList index for array_contains() queries on labels
-        let _ = backend
-            .create_scalar_index(table_name, "labels", ScalarIndexType::LabelList)
-            .await;
+        for (column, idx_type) in [
+            ("_vid", ScalarIndexType::BTree),
+            ("ext_id", ScalarIndexType::BTree),
+            ("_uid", ScalarIndexType::BTree),
+            ("labels", ScalarIndexType::LabelList),
+        ] {
+            if has_index(column) {
+                continue;
+            }
+            log::info!("Creating {} index on main_vertices", column);
+            if let Err(e) = backend
+                .create_scalar_index(table_name, column, idx_type)
+                .await
+            {
+                log::warn!("Failed to create {} index on main_vertices: {}", column, e);
+            }
+        }
 
         Ok(())
     }

@@ -216,7 +216,16 @@ impl L0Buffer {
 
     /// Merge CRDT properties into an existing property map.
     /// Attempts CRDT merge if both values are valid CRDTs, falls back to overwrite.
+    ///
+    /// When the entry is empty (new vertex insert), skips the expensive JSON
+    /// round-trip and directly assigns the properties.
     fn merge_crdt_properties(entry: &mut Properties, properties: Properties) {
+        // Fast path: new vertex with no existing properties — skip JSON round-trip
+        if entry.is_empty() {
+            *entry = properties;
+            return;
+        }
+
         for (k, v) in properties {
             // Attempt merge if CRDT — convert to serde_json::Value for CRDT deserialization
             let json_v: serde_json::Value = v.clone().into();
@@ -329,11 +338,23 @@ impl L0Buffer {
         properties: Properties,
         labels: &[String],
     ) {
+        self.insert_vertex_with_labels_impl(vid, properties, labels, false);
+    }
+
+    /// Core vertex insertion. When `skip_wal` is true, skips WAL append
+    /// (used during merge where the caller already wrote to WAL).
+    fn insert_vertex_with_labels_impl(
+        &mut self,
+        vid: Vid,
+        properties: Properties,
+        labels: &[String],
+        skip_wal: bool,
+    ) {
         self.current_version += 1;
         let version = self.current_version;
         let now = now_nanos();
 
-        if let Some(wal) = &self.wal {
+        if !skip_wal && let Some(wal) = &self.wal {
             let _ = wal.append(&Mutation::InsertVertex {
                 vid,
                 properties: properties.clone(),
@@ -784,7 +805,9 @@ impl L0Buffer {
 
         for (vid, props) in &other.vertex_properties {
             let labels = other.vertex_labels.get(vid).cloned().unwrap_or_default();
-            self.insert_vertex_with_labels(*vid, props.clone(), &labels);
+            // skip_wal=true: the caller (commit_transaction_l0) already wrote
+            // these mutations to WAL before invoking merge.
+            self.insert_vertex_with_labels_impl(*vid, props.clone(), &labels, true);
         }
 
         // Merge vertex labels that might not have properties

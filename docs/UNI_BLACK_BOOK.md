@@ -2482,8 +2482,20 @@ let quick = xervo
 - `rerank(alias, query, documents)` returns `Vec<ScoredDoc>` — cross-encoder relevance scoring for reranking search results
 - `generate(alias, messages, options)` accepts `&[Message]` with roles `system`, `user`, `assistant` and a `GenerationOptions` struct
 - `generate_text(alias, messages, options)` is a convenience wrapper — each string becomes a user message
+- `prefetch(aliases)` pre-loads and caches specific model aliases — downloads model files, builds sessions, runs warmup
+- `prefetch_all()` pre-loads every model in the catalog
 - `raw_runtime()` exposes the underlying `ModelRuntime` for advanced orchestration
 - `GenerationOptions` supports `max_tokens`, `temperature`, `top_p` fields
+
+**Best practice — prefetch at startup:**
+
+```rust
+let xervo = db.xervo();
+xervo.prefetch(&["embed/default", "llm/default"]).await?;
+// All subsequent embed/generate calls skip cold-start latency
+```
+
+Both `prefetch` methods are awaitable and fail-fast. Use them instead of relying on first-call lazy loading, especially in latency-sensitive pipelines. For models that must be available at startup, prefer `warmup: "Eager"` in the catalog with `required: true`.
 
 This is the same runtime used by vector-index auto-embedding on writes, by text-query auto-embedding in `uni.vector.query(...)` / `similar_to(...)`, and by cross-encoder reranking in search procedures.
 
@@ -4078,6 +4090,10 @@ scored = xervo.rerank(
     ["Graph DBs use edges to model relationships.", "SQL uses foreign keys."],
 )
 # → list[ScoredDoc] with index, score, text
+
+# Prefetch models at startup (best practice for latency-sensitive pipelines)
+xervo.prefetch(["embed/default", "llm/default"])   # specific aliases
+xervo.prefetch_all()                                # everything in the catalog
 ```
 
 #### Message

@@ -126,10 +126,13 @@ Auto-embedding requires a Uni-Xervo catalog with an alias that matches the vecto
 
 ### Using the Uni-Xervo Runtime Directly
 
-`Uni::xervo()` exposes the underlying runtime so you can generate ad-hoc embeddings, run text generation, or pre-warm models from your application:
+`Uni::xervo()` exposes the underlying runtime so you can generate ad-hoc embeddings, run text generation, or pre-load models at startup:
 
 ```rust
-let xervo = db.xervo()?;
+let xervo = db.xervo();
+
+// Best practice: prefetch models at startup to avoid cold-start latency
+xervo.prefetch(&["embed/default", "llm/default"]).await?;
 
 // Embed text directly
 let vectors = xervo.embed("embed/default", &["some query text"]).await?;

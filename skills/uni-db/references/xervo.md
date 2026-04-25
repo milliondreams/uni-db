@@ -268,6 +268,36 @@ result = xervo.generate("llm/default", [
 ])
 ```
 
+### Prefetching (Best Practice)
+
+**Always prefetch models at startup** to avoid cold-start latency on first inference. Without prefetch, the first call to `embed()`, `generate()`, or `rerank()` pays the full model load cost (download, session initialization, warmup). Subsequent calls are served from cache.
+
+```python
+xervo = db.xervo()
+
+# Prefetch specific aliases (recommended — explicit and selective)
+xervo.prefetch(["embed/default", "llm/default"])
+
+# Or prefetch everything in the catalog
+xervo.prefetch_all()
+
+# Async equivalents
+await async_db.xervo().prefetch(["embed/default"])
+await async_db.xervo().prefetch_all()
+```
+
+```rust
+// Rust
+db.xervo().prefetch(&["embed/default", "llm/default"]).await?;
+db.xervo().prefetch_all().await?;
+```
+
+Both methods are **awaitable** and **fail-fast** — they return when all requested models are fully loaded, or error on the first failure. Models already loaded are skipped.
+
+**When to use `prefetch()` vs `warmup: "Eager"`:**
+- Use **`warmup: "Eager"`** in the catalog when the model is always needed and you want startup to fail if loading fails (`required: true`)
+- Use **`prefetch()`** after startup when you want programmatic control over which models to load and when (e.g., load models conditionally based on runtime config, or load after other initialization is complete)
+
 ### Availability Check
 
 ```python
@@ -551,6 +581,7 @@ db = Uni.open("./rag_db") \
     .build()
 
 xervo = db.xervo()
+xervo.prefetch(["embed/default", "llm/default"])  # avoid cold-start on first call
 session = db.session()
 
 # Embed and insert documents
@@ -622,7 +653,7 @@ results = db.session().query("""
 
 4. **Anthropic is generate-only** -- `remote/anthropic` does not support embeddings. Use a different provider for `Embed` tasks.
 
-5. **Local models download on first use** -- `local/candle` and `local/fastembed` download models from HuggingFace on first load. Use `warmup: "Eager"` with `required: true` to catch download failures at startup rather than at first request.
+5. **Local models download on first use** -- `local/candle` and `local/fastembed` download models from HuggingFace on first load. Use `warmup: "Eager"` with `required: true` to catch download failures at startup, or call `xervo.prefetch(["alias"])` after startup to pre-load specific models before first inference.
 
 6. **API keys are read at model load time** -- Environment variables are resolved when the model is first loaded (or at startup for eager warmup), not when the database is opened.
 

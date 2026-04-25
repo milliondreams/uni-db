@@ -187,7 +187,8 @@ let context: String = context_rows.iter()
     .join("\n\n");
 
 // 3. Generate answer using Uni-Xervo
-let xervo = db.xervo()?;
+let xervo = db.xervo();
+xervo.prefetch(&["llm/default"]).await?;  // pre-load model if not already cached
 let result = xervo.generate("llm/default", &[
     Message::system("Answer using only the provided context."),
     Message::user(&format!("Context:\n{context}\n\nQuestion: how does verify() work?")),

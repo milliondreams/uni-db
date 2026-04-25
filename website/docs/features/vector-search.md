@@ -154,6 +154,15 @@ Beyond auto-embedding, the `Uni::xervo()` facade gives direct access to embeddin
     ).await?;
     ```
 
+=== "Prefetch (Best Practice)"
+    ```rust
+    let xervo = db.xervo();
+    // Pre-load models at startup to avoid cold-start latency
+    xervo.prefetch(&["embed/default", "llm/default"]).await?;
+    // Or load everything in the catalog
+    xervo.prefetch_all().await?;
+    ```
+
 Uni-Xervo supports local providers (MistralRS, Candle, FastEmbed) and remote providers (OpenAI, Gemini, Anthropic, Cohere, Vertex AI, Mistral, Voyage AI, Azure OpenAI). See the [Vector Search Guide](../guides/vector-search.md) for the full provider table and configuration details.
 
 ## Use Cases

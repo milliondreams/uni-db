@@ -113,6 +113,25 @@ impl UniXervo {
             .map_err(into_uni_error)
     }
 
+    /// Pre-load and cache every model in the Xervo catalog.
+    ///
+    /// Models already loaded are skipped. Fails fast on the first error.
+    /// Call this during application startup to avoid cold-start latency on
+    /// first inference.
+    pub async fn prefetch_all(&self) -> Result<()> {
+        let runtime = self.runtime.as_ref().ok_or_else(not_configured)?;
+        runtime.prefetch_all().await.map_err(into_uni_error)
+    }
+
+    /// Pre-load and cache specific model aliases.
+    ///
+    /// Returns an error immediately if an alias is not found in the catalog
+    /// or if any model fails to load. Models already loaded are skipped.
+    pub async fn prefetch(&self, aliases: &[&str]) -> Result<()> {
+        let runtime = self.runtime.as_ref().ok_or_else(not_configured)?;
+        runtime.prefetch(aliases).await.map_err(into_uni_error)
+    }
+
     /// Access the underlying Uni-Xervo runtime, if configured.
     pub fn raw_runtime(&self) -> Option<&Arc<ModelRuntime>> {
         self.runtime.as_ref()

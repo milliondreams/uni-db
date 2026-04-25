@@ -830,7 +830,23 @@ if xervo.is_available():
         ["Graphs use edges for relationships.", "SQL uses tables and joins."],
     )
     # → list[ScoredDoc] with index, score, text
+
+    # Prefetch models at startup (best practice)
+    xervo.prefetch(["embed/default", "llm/default"])   # specific aliases
+    xervo.prefetch_all()                                # everything in catalog
 ```
+
+### Prefetch (Best Practice)
+
+Pre-load models at startup to avoid cold-start latency on first inference. Without prefetch, the first call to `embed()`, `generate()`, or `rerank()` pays the full model load cost (download, session init, warmup).
+
+```python
+xervo = db.xervo()
+xervo.prefetch(["embed/default", "llm/default"])  # blocks until loaded
+# All subsequent calls are instant
+```
+
+Both methods are **blocking/awaitable** and **fail-fast** — they return when all models are loaded, or raise on the first failure. Models already loaded are skipped.
 
 ### Async Xervo
 
@@ -841,6 +857,7 @@ db = await uni_db.AsyncUni.builder() \
     .build()
 
 xervo = db.xervo()
+await xervo.prefetch(["embed/default"])  # async prefetch
 vectors = await xervo.embed("embed/default", ["hello"])
 result = await xervo.generate_text("llm/default", "Hello!")
 scored = await xervo.rerank("rerank/minilm", "query", ["doc1", "doc2"])

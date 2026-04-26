@@ -41,10 +41,9 @@ datafusion = { workspace = true }
 tokio-util = { workspace = true }
 scopeguard = "1"
 tempfile = { workspace = true }
-tokenizers = { version = "0.22", default-features = false, features = ["onig"], optional = true }
-hf-hub = { version = "0.5", features = ["tokio"], optional = true }
-ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic", "ndarray", "api-24"], optional = true }
-ndarray = { version = "0.17", optional = true }
+# Note: uni-db has no direct ort / tokenizers / hf-hub / ndarray consumers
+# after the LocalOnnxRerankerProvider hoist into uni-xervo (0.5.2). All ONNX
+# access flows through uni-xervo's provider facades.
 
 [dev-dependencies]
 criterion = "0.5"
@@ -88,5 +87,17 @@ provider-voyageai = ["uni-xervo/provider-voyageai"]
 provider-cohere = ["uni-xervo/provider-cohere"]
 provider-azure-openai = ["uni-xervo/provider-azure-openai"]
 provider-mistralrs = ["uni-xervo/provider-mistralrs"]
-provider-onnx = ["uni-xervo/provider-onnx", "dep:tokenizers", "dep:hf-hub", "dep:ort", "dep:ndarray"]
+# ONNX provider — two mutually-exclusive linking modes (mirroring uni-xervo).
+# See `../../../uni-xervo/docs/migrations/0.5.6-bundled-cpu-default.md`.
+provider-onnx = ["uni-xervo/provider-onnx"]
+provider-onnx-dynamic = ["uni-xervo/provider-onnx-dynamic"]
+
+# GPU acceleration features. Each (except gpu-metal) implies provider-onnx-dynamic
+# upstream because pyke's bundled CPU lib has no GPU EPs.
 gpu-cuda = ["uni-xervo/gpu-cuda"]
+gpu-rocm = ["uni-xervo/gpu-rocm"]
+gpu-coreml = ["uni-xervo/gpu-coreml"]
+gpu-directml = ["uni-xervo/gpu-directml"]
+gpu-openvino = ["uni-xervo/gpu-openvino"]
+gpu-qnn = ["uni-xervo/gpu-qnn"]
+gpu-metal = ["uni-xervo/gpu-metal"]

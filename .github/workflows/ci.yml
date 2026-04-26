@@ -57,6 +57,25 @@ jobs:
       - name: Run tests
         run: cargo nextest run --workspace --exclude uni-tck
 
+      # Provider-onnx is opt-in (not in default features). The two ONNX
+      # linking modes are mutually exclusive at compile time, so we test
+      # them in separate steps.
+      - name: Run reranker integration tests (bundled CPU ONNX)
+        # `provider-onnx` statically links pyke's CPU libonnxruntime.a — no
+        # ORT_DYLIB_PATH needed; the E2E `#[ignore]` real-ONNX tests run
+        # because the lib is in the binary.
+        run: cargo nextest run -p uni-db --features provider-onnx --test reranker_integration --run-ignored all
+
+      - name: Run reranker integration tests (load-dynamic ONNX)
+        # `provider-onnx-dynamic` requires an ONNX Runtime tarball at
+        # runtime. We download Microsoft's CPU build for CI; mock tests pass
+        # without it but we set ORT_DYLIB_PATH to keep the dep symmetrical.
+        run: |
+          curl -sSL -o /tmp/ort.tgz https://github.com/microsoft/onnxruntime/releases/download/v1.20.1/onnxruntime-linux-x64-1.20.1.tgz
+          tar xzf /tmp/ort.tgz -C /tmp
+          export ORT_DYLIB_PATH=/tmp/onnxruntime-linux-x64-1.20.1/lib/libonnxruntime.so
+          cargo nextest run -p uni-db --features provider-onnx-dynamic --test reranker_integration
+
       - name: Run TCK (schemaless + schema)
         run: |
           cargo nextest run -p uni-tck --test tck

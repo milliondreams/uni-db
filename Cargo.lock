@@ -9012,7 +9012,7 @@ checksum = "4db5a4a562bcc0017c34cd0efbabf447be783f00576a2a516947f884e6a7ed57"
 dependencies = [
  "ahash",
  "annotate-snippets",
- "base64 0.21.7",
+ "base64 0.22.1",
  "encoding_rs_io",
  "nohash-hasher",
  "num-traits",
@@ -11039,7 +11039,7 @@ dependencies = [
 
 [[package]]
 name = "uni-xervo"
-version = "0.5.4"
+version = "0.5.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -11052,6 +11052,7 @@ dependencies = [
  "hf-hub 0.5.0",
  "image",
  "indexmap 2.14.0",
+ "libloading 0.8.9",
  "metrics 0.24.3",
  "mistralrs",
  "ndarray 0.17.2",

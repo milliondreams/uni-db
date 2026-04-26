@@ -95,7 +95,7 @@ url = "2.5"
 proptest = "1.4"
 datafusion = "52.3.0"
 lancedb = { version = "=0.27.1", default-features = false, features = ["aws", "gcs", "azure"] }
-uni-xervo = { version = "0.5.6", default-features = false }
+uni-xervo = { version = "0.7.0", default-features = false }
 biodivine-lib-bdd = "0.5"
 candle-core = "0.9.2"
 candle-nn = "0.9.2"
@@ -105,7 +105,8 @@ fastembed = "5.11.0"
 hf-hub = "0.4.3"
 tokenizers = "0.22.2"
 
-# Local override during the cross-repo hoist (uni-xervo 0.5.2 not yet on crates.io).
-# Remove this section once uni-xervo 0.5.2 is published.
+# Temporary local override while uni-xervo 0.7.0 is unpublished. Remove this
+# section once 0.7.0 hits crates.io.
 [patch.crates-io]
 uni-xervo = { path = "../uni-xervo" }
+

@@ -847,14 +847,14 @@ async fn test_hybrid_search_existing_options_unchanged() -> anyhow::Result<()> {
 #[tokio::test]
 #[ignore]
 async fn test_real_onnx_cross_encoder_reranks_by_relevance() -> anyhow::Result<()> {
-    use uni_xervo::provider::LocalOnnxRerankerProvider;
+    use uni_xervo::provider::LocalOnnxProvider;
 
     let runtime = ModelRuntime::builder()
-        .register_provider(LocalOnnxRerankerProvider)
+        .register_provider(LocalOnnxProvider::new())
         .catalog(vec![ModelAliasSpec {
             alias: "rerank/minilm".to_string(),
             task: ModelTask::Rerank,
-            provider_id: "local/onnx-reranker".to_string(),
+            provider_id: "local/onnx".to_string(),
             model_id: "cross-encoder/ms-marco-MiniLM-L6-v2".to_string(),
             revision: None,
             warmup: WarmupPolicy::Lazy,
@@ -958,14 +958,14 @@ async fn test_real_onnx_cross_encoder_reranks_by_relevance() -> anyhow::Result<(
 #[tokio::test]
 #[ignore]
 async fn test_real_onnx_cross_encoder_via_facade() -> anyhow::Result<()> {
-    use uni_xervo::provider::LocalOnnxRerankerProvider;
+    use uni_xervo::provider::LocalOnnxProvider;
 
     let runtime = ModelRuntime::builder()
-        .register_provider(LocalOnnxRerankerProvider)
+        .register_provider(LocalOnnxProvider::new())
         .catalog(vec![ModelAliasSpec {
             alias: "rerank/minilm".to_string(),
             task: ModelTask::Rerank,
-            provider_id: "local/onnx-reranker".to_string(),
+            provider_id: "local/onnx".to_string(),
             model_id: "cross-encoder/ms-marco-MiniLM-L6-v2".to_string(),
             revision: None,
             warmup: WarmupPolicy::Lazy,

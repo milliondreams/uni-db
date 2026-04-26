@@ -2715,14 +2715,16 @@ impl HybridPhysicalPlanner {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // Optimization (issue #53): when input is a CrossJoin and the predicate
         // contains equi-join conditions across the two sides, emit HashJoinExec
-        // instead of FilterExec(CrossJoinExec). Skipped for OPTIONAL MATCH
-        // (NULL-preservation needs different join semantics).
-        if optional_variables.is_empty()
-            && let LogicalPlan::CrossJoin { left, right } = input
+        // instead of FilterExec(CrossJoinExec). Issue #54 extends this to
+        // OPTIONAL MATCH (LeftOuter/RightOuter HashJoin) when the predicate is
+        // a pure equi-join — see try_plan_cross_join_as_hash_join for the
+        // safety conditions.
+        if let LogicalPlan::CrossJoin { left, right } = input
             && let Some(plan) = self.try_plan_cross_join_as_hash_join(
                 left,
                 right,
                 predicate,
+                optional_variables,
                 all_properties,
             )?
         {
@@ -2779,6 +2781,7 @@ impl HybridPhysicalPlanner {
         left: &LogicalPlan,
         right: &LogicalPlan,
         predicate: &Expr,
+        optional_variables: &HashSet<String>,
         all_properties: &HashMap<String, HashSet<String>>,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         use datafusion::common::NullEquality;
@@ -2792,11 +2795,86 @@ impl HybridPhysicalPlanner {
             return Ok(None);
         }
 
-        // Push left/right-only conjuncts into the respective subtree as a
-        // Filter wrapper. Recursion through plan_internal will re-fire this
-        // optimization on inner CrossJoins.
-        let left_with_filter = wrap_with_filter(left.clone(), &cls.left_only);
-        let right_with_filter = wrap_with_filter(right.clone(), &cls.right_only);
+        // Determine join type from optional_variables.
+        //
+        // OPTIONAL MATCH semantics (per OptionalFilterExec) require that for
+        // each "source group" (rows of the required side), if all rows fail
+        // the predicate we still emit one row with the optional side NULLed.
+        // A LeftOuter HashJoin gives the same behavior **only when** the
+        // predicate is a pure equi-join across the required and optional
+        // sides — any non-equi conjunct (left_only, right_only, residual) on
+        // either side could drop a row that OPTIONAL semantics would have
+        // NULL-preserved. So for the OPTIONAL path we accept only pure
+        // equi-joins; everything else falls back to OptionalFilterExec.
+        let left_optional: HashSet<&String> = optional_variables
+            .iter()
+            .filter(|v| left_vars.contains(*v))
+            .collect();
+        let right_optional: HashSet<&String> = optional_variables
+            .iter()
+            .filter(|v| right_vars.contains(*v))
+            .collect();
+
+        let join_type = match (left_optional.is_empty(), right_optional.is_empty()) {
+            (true, true) => JoinType::Inner,
+            (true, false) => JoinType::Left,
+            (false, true) => JoinType::Right,
+            (false, false) => return Ok(None), // optional vars on both sides — bail
+        };
+
+        // For outer joins: only safe when the predicate is purely equi-joins
+        // (no left_only/right_only/residual conjuncts).
+        if !matches!(join_type, JoinType::Inner)
+            && (!cls.left_only.is_empty() || !cls.right_only.is_empty() || cls.residual.is_some())
+        {
+            return Ok(None);
+        }
+
+        // Issue #54 part 3: IN-list scan pushdown for static UNWIND.
+        //
+        // For each equi-pair, if one side is `Property(Variable(unwind_var), _)`
+        // and the UNWIND source is statically resolvable (literal list or known
+        // parameter list), build `Expr::In { expr: <other-side>, list: [...] }`
+        // and inject it as a scan-side filter on the opposite subtree. The
+        // existing `is_pushable` / property-IN pushdown path then prunes the
+        // scan before it ever reaches the HashJoin.
+        //
+        // Conditions for pushdown:
+        // - The unwind side is `Property(Variable(v), _)`.
+        // - The opposite side is `Property(Variable(other), _)` (a scan-side
+        //   property that `is_pushable` will accept). We deliberately skip
+        //   `id(scan_var)` — the existing pushdown doesn't accept it, and
+        //   building an artificial filter that can't be pushed is wasted work.
+        // - The UNWIND source resolves at plan time via
+        //   `extract_static_unwind_values`.
+        //
+        // We detect the unwind variable on the LEFT or RIGHT subtree (whichever
+        // contains it) and inject the IN filter on the OPPOSITE subtree.
+        let mut left_extra_in: Vec<Expr> = Vec::new();
+        let mut right_extra_in: Vec<Expr> = Vec::new();
+        for (l_expr, r_expr) in &cls.equi_pairs {
+            // Left side is unwind property → push IN onto right side (scan).
+            if let Some(in_filter) = build_in_pushdown(l_expr, r_expr, left, &self.params) {
+                right_extra_in.push(in_filter);
+                continue;
+            }
+            // Right side is unwind property → push IN onto left side (scan).
+            if let Some(in_filter) = build_in_pushdown(r_expr, l_expr, right, &self.params) {
+                left_extra_in.push(in_filter);
+            }
+        }
+
+        // Push left/right-only conjuncts (and any IN filters from the UNWIND
+        // pre-pass) into the respective subtree as a Filter wrapper.
+        // Recursion through plan_internal will re-fire this optimization on
+        // inner CrossJoins. (Inner-join case only — for outer joins we've
+        // already bailed above when these are non-empty.)
+        let mut left_filters: Vec<Expr> = cls.left_only.clone();
+        left_filters.append(&mut left_extra_in);
+        let mut right_filters: Vec<Expr> = cls.right_only.clone();
+        right_filters.append(&mut right_extra_in);
+        let left_with_filter = wrap_with_filter(left.clone(), &left_filters);
+        let right_with_filter = wrap_with_filter(right.clone(), &right_filters);
         let left_plan = self.plan_internal(&left_with_filter, all_properties)?;
         let right_plan = self.plan_internal(&right_with_filter, all_properties)?;
 
@@ -2818,36 +2896,32 @@ impl HybridPhysicalPlanner {
             let session = self.session_ctx.read();
             let state = session.state();
 
-            let left_compiler = crate::query::df_graph::expr_compiler::CypherPhysicalExprCompiler::new(
-                &state,
-                Some(&left_ctx),
-            )
-            .with_subquery_ctx(
-                self.graph_ctx.clone(),
-                self.schema.clone(),
-                self.session_ctx.clone(),
-                self.storage.clone(),
-                self.params.clone(),
-                self.outer_entity_vars.clone(),
-            );
-            let right_compiler = crate::query::df_graph::expr_compiler::CypherPhysicalExprCompiler::new(
-                &state,
-                Some(&right_ctx),
-            )
-            .with_subquery_ctx(
-                self.graph_ctx.clone(),
-                self.schema.clone(),
-                self.session_ctx.clone(),
-                self.storage.clone(),
-                self.params.clone(),
-                self.outer_entity_vars.clone(),
-            );
-
-            let tointeger_udf = state
-                .scalar_functions()
-                .get("tointeger")
-                .ok_or_else(|| anyhow!("tointeger UDF not registered"))?
-                .clone();
+            let left_compiler =
+                crate::query::df_graph::expr_compiler::CypherPhysicalExprCompiler::new(
+                    &state,
+                    Some(&left_ctx),
+                )
+                .with_subquery_ctx(
+                    self.graph_ctx.clone(),
+                    self.schema.clone(),
+                    self.session_ctx.clone(),
+                    self.storage.clone(),
+                    self.params.clone(),
+                    self.outer_entity_vars.clone(),
+                );
+            let right_compiler =
+                crate::query::df_graph::expr_compiler::CypherPhysicalExprCompiler::new(
+                    &state,
+                    Some(&right_ctx),
+                )
+                .with_subquery_ctx(
+                    self.graph_ctx.clone(),
+                    self.schema.clone(),
+                    self.session_ctx.clone(),
+                    self.storage.clone(),
+                    self.params.clone(),
+                    self.outer_entity_vars.clone(),
+                );
 
             let mut pairs: Vec<(
                 Arc<dyn datafusion::physical_plan::PhysicalExpr>,
@@ -2857,13 +2931,8 @@ impl HybridPhysicalPlanner {
             for (l_expr, r_expr) in &cls.equi_pairs {
                 let l_phys = left_compiler.compile(l_expr, &left_schema)?;
                 let r_phys = right_compiler.compile(r_expr, &right_schema)?;
-                let Some(l_key) =
-                    wrap_in_to_integer(l_phys, &left_schema, tointeger_udf.clone())
-                else {
-                    return Ok(None);
-                };
-                let Some(r_key) =
-                    wrap_in_to_integer(r_phys, &right_schema, tointeger_udf.clone())
+                let Some((l_key, r_key)) =
+                    unify_join_key_types(l_phys, r_phys, &left_schema, &right_schema, &state)
                 else {
                     return Ok(None);
                 };
@@ -2877,7 +2946,7 @@ impl HybridPhysicalPlanner {
             right_plan,
             on,
             None,
-            &JoinType::Inner,
+            &join_type,
             None,
             PartitionMode::CollectLeft,
             NullEquality::NullEqualsNothing,
@@ -5423,7 +5492,9 @@ fn collect_plan_variables_into(plan: &LogicalPlan, out: &mut HashSet<String>) {
         | LogicalPlan::ScanMainByLabels { variable, .. } => {
             out.insert(variable.clone());
         }
-        LogicalPlan::Unwind { input, variable, .. } => {
+        LogicalPlan::Unwind {
+            input, variable, ..
+        } => {
             out.insert(variable.clone());
             collect_plan_variables_into(input, out);
         }
@@ -5467,7 +5538,9 @@ fn collect_plan_variables_into(plan: &LogicalPlan, out: &mut HashSet<String>) {
             collect_plan_variables_into(left, out);
             collect_plan_variables_into(right, out);
         }
-        LogicalPlan::Apply { input, subquery, .. } => {
+        LogicalPlan::Apply {
+            input, subquery, ..
+        } => {
             collect_plan_variables_into(input, out);
             collect_plan_variables_into(subquery, out);
         }
@@ -5511,10 +5584,9 @@ fn collect_expr_variables_into(expr: &Expr, out: &mut HashSet<String>) {
             collect_expr_variables_into(left, out);
             collect_expr_variables_into(right, out);
         }
-        E::UnaryOp { expr, .. }
-        | E::IsNull(expr)
-        | E::IsNotNull(expr)
-        | E::IsUnique(expr) => collect_expr_variables_into(expr, out),
+        E::UnaryOp { expr, .. } | E::IsNull(expr) | E::IsNotNull(expr) | E::IsUnique(expr) => {
+            collect_expr_variables_into(expr, out)
+        }
         E::FunctionCall { args, .. } => {
             for a in args {
                 collect_expr_variables_into(a, out);
@@ -5529,7 +5601,11 @@ fn collect_expr_variables_into(expr: &Expr, out: &mut HashSet<String>) {
             collect_expr_variables_into(expr, out);
             collect_expr_variables_into(list, out);
         }
-        E::Case { expr, when_then, else_expr } => {
+        E::Case {
+            expr,
+            when_then,
+            else_expr,
+        } => {
             if let Some(e) = expr {
                 collect_expr_variables_into(e, out);
             }
@@ -5553,8 +5629,12 @@ fn collect_expr_variables_into(expr: &Expr, out: &mut HashSet<String>) {
         }
         E::ArraySlice { array, start, end } => {
             collect_expr_variables_into(array, out);
-            if let Some(s) = start { collect_expr_variables_into(s, out); }
-            if let Some(e) = end { collect_expr_variables_into(e, out); }
+            if let Some(s) = start {
+                collect_expr_variables_into(s, out);
+            }
+            if let Some(e) = end {
+                collect_expr_variables_into(e, out);
+            }
         }
         // Skip Quantifier/Reduce/ListComprehension/PatternComprehension —
         // they introduce local bindings not in outer scope.
@@ -5567,7 +5647,12 @@ fn split_and_conjuncts(predicate: &Expr) -> Vec<Expr> {
     use uni_cypher::ast::BinaryOp;
     let mut out = Vec::new();
     fn walk(e: &Expr, out: &mut Vec<Expr>) {
-        if let Expr::BinaryOp { left, op: BinaryOp::And, right } = e {
+        if let Expr::BinaryOp {
+            left,
+            op: BinaryOp::And,
+            right,
+        } = e
+        {
             walk(left, out);
             walk(right, out);
         } else {
@@ -5607,7 +5692,12 @@ fn classify_join_predicate(
     for conjunct in split_and_conjuncts(predicate) {
         // Try equi-join: BinaryOp::Eq with one side referencing only left vars
         // and the other only right vars.
-        if let Expr::BinaryOp { left, op: BinaryOp::Eq, right } = &conjunct {
+        if let Expr::BinaryOp {
+            left,
+            op: BinaryOp::Eq,
+            right,
+        } = &conjunct
+        {
             let lv = collect_expr_variables_set(left);
             let rv = collect_expr_variables_set(right);
             let l_in_left = !lv.is_empty() && lv.is_subset(left_vars);
@@ -5644,6 +5734,157 @@ fn classify_join_predicate(
     }
 }
 
+/// Maximum static UNWIND list size for IN-list scan pushdown. Beyond this,
+/// the cost of injecting a giant `IN` filter outweighs the savings vs. the
+/// HashJoin alone, so we skip the pushdown.
+const MAX_UNWIND_IN_PUSHDOWN_VALUES: usize = 10_000;
+
+/// Convert a `uni_common::Value` primitive into a `CypherLiteral` for use in
+/// AST `Expr::List` items. Returns `None` for non-primitive Values (lists,
+/// maps, nodes, etc.) — those don't make sense as `IN` list elements anyway.
+fn value_to_cypher_literal(v: &uni_common::Value) -> Option<CypherLiteral> {
+    use uni_common::Value;
+    match v {
+        Value::Null => Some(CypherLiteral::Null),
+        Value::Bool(b) => Some(CypherLiteral::Bool(*b)),
+        Value::Int(n) => Some(CypherLiteral::Integer(*n)),
+        Value::Float(f) => Some(CypherLiteral::Float(*f)),
+        Value::String(s) => Some(CypherLiteral::String(s.clone())),
+        _ => None,
+    }
+}
+
+/// Walk a logical-plan subtree looking for `LogicalPlan::Unwind { variable, expr, .. }`
+/// where `variable == target_var`, and return the bound list of values **if**
+/// the UNWIND source is statically resolvable at plan time:
+///
+/// - `Expr::List(items)` where every item is an `Expr::Literal(_)` → use them directly.
+/// - `Expr::Parameter(name)` where `params[name]` is `Value::List(...)` → convert
+///   each primitive element into an `Expr::Literal`.
+///
+/// Returns `None` for any other source (sub-MATCH, correlated, runtime-only),
+/// or when the list contains non-primitive values, or exceeds
+/// `MAX_UNWIND_IN_PUSHDOWN_VALUES`.
+fn extract_static_unwind_values(
+    plan: &LogicalPlan,
+    target_var: &str,
+    params: &HashMap<String, uni_common::Value>,
+) -> Option<Vec<Expr>> {
+    fn walk(
+        plan: &LogicalPlan,
+        target_var: &str,
+        params: &HashMap<String, uni_common::Value>,
+    ) -> Option<Vec<Expr>> {
+        match plan {
+            LogicalPlan::Unwind {
+                input,
+                expr,
+                variable,
+            } if variable == target_var => {
+                materialize_unwind_source(expr, params).or_else(|| walk(input, target_var, params))
+            }
+            // Single-input plan nodes: recurse into the input.
+            LogicalPlan::Filter { input, .. }
+            | LogicalPlan::Project { input, .. }
+            | LogicalPlan::Unwind { input, .. } => walk(input, target_var, params),
+            _ => None,
+        }
+    }
+    walk(plan, target_var, params)
+}
+
+/// Materialize a UNWIND source `Expr` into a vec of literal `Expr`s if possible.
+fn materialize_unwind_source(
+    expr: &Expr,
+    params: &HashMap<String, uni_common::Value>,
+) -> Option<Vec<Expr>> {
+    match expr {
+        Expr::List(items) => {
+            if items.len() > MAX_UNWIND_IN_PUSHDOWN_VALUES {
+                return None;
+            }
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    Expr::Literal(_) => out.push(item.clone()),
+                    _ => return None,
+                }
+            }
+            Some(out)
+        }
+        Expr::Parameter(name) => match params.get(name)? {
+            uni_common::Value::List(values) => {
+                if values.len() > MAX_UNWIND_IN_PUSHDOWN_VALUES {
+                    return None;
+                }
+                let mut out = Vec::with_capacity(values.len());
+                for v in values {
+                    out.push(Expr::Literal(value_to_cypher_literal(v)?));
+                }
+                Some(out)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// If `unwind_side_expr` is bound to a variable produced by a static UNWIND
+/// in `unwind_subplan`, and `scan_side_expr` is a property of a scan variable,
+/// build an `Expr::In { expr: scan_side_expr, list: [literals...] }` to inject
+/// as a scan-side filter. Returns `None` if any condition fails.
+///
+/// Accepts two forms on the unwind side:
+/// - `Variable(v)` — direct list element (e.g. `UNWIND $names AS n ... = n`).
+/// - `Property(Variable(v), _)` — list of maps (e.g. `UNWIND $rows AS r ... = r.k`).
+///   Property form requires the parameter list to be a list of `Value::Map`s,
+///   so we conservatively skip it here (the materializer rejects non-primitive
+///   values anyway).
+fn build_in_pushdown(
+    unwind_side_expr: &Expr,
+    scan_side_expr: &Expr,
+    unwind_subplan: &LogicalPlan,
+    params: &HashMap<String, uni_common::Value>,
+) -> Option<Expr> {
+    // Identify the UNWIND variable on the unwind side.
+    let unwind_var = match unwind_side_expr {
+        Expr::Variable(v) => v,
+        Expr::Property(box_var, _) => match box_var.as_ref() {
+            Expr::Variable(v) => v,
+            _ => return None,
+        },
+        _ => return None,
+    };
+
+    // Scan side must be `Property(Variable(_), _)` so that `is_pushable`
+    // (which accepts `Property(Variable(scan_var), prop)` on the LHS of an IN)
+    // will push the filter into the scan.
+    let Expr::Property(scan_box_var, _scan_field) = scan_side_expr else {
+        return None;
+    };
+    if !matches!(scan_box_var.as_ref(), Expr::Variable(_)) {
+        return None;
+    }
+
+    let values = extract_static_unwind_values(unwind_subplan, unwind_var, params)?;
+    if values.is_empty() {
+        return None;
+    }
+
+    // For the `Variable(v)` direct case, values are the IN list as-is.
+    // For `Property(Variable(v), field)` case, extract_static_unwind_values
+    // would only succeed on primitive lists — so skip the property case for
+    // now (would need per-element field projection).
+    if matches!(unwind_side_expr, Expr::Property(..)) {
+        return None;
+    }
+
+    Some(Expr::In {
+        expr: Box::new(scan_side_expr.clone()),
+        list: Box::new(Expr::List(values)),
+    })
+}
+
 /// Wrap `plan` with a `LogicalPlan::Filter` AND-combining `filters` if any.
 fn wrap_with_filter(plan: LogicalPlan, filters: &[Expr]) -> LogicalPlan {
     if filters.is_empty() {
@@ -5657,16 +5898,36 @@ fn wrap_with_filter(plan: LogicalPlan, filters: &[Expr]) -> LogicalPlan {
     }
 }
 
-/// Wrap a PhysicalExpr in the `tointeger` UDF for HashJoin key type unification.
-/// Returns `None` for types `tointeger` won't handle (anything non-numeric and
-/// non-CV — currently strings); caller falls back to FilterExec+CrossJoinExec.
-fn wrap_in_to_integer(
-    expr: Arc<dyn datafusion::physical_plan::PhysicalExpr>,
-    schema: &Schema,
-    tointeger_udf: Arc<datafusion::logical_expr::ScalarUDF>,
-) -> Option<Arc<dyn datafusion::physical_plan::PhysicalExpr>> {
-    let dt = expr.data_type(schema).ok()?;
-    let supported = matches!(
+/// Returns `true` if `dt` is hashable directly by Arrow's HashJoinExec without
+/// any value transformation. When both join keys share such a dtype, we can
+/// skip the `tointeger` / `_cypher_sort_key` wrap entirely.
+fn is_hashable_native_dtype(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Binary
+            | DataType::LargeBinary
+            | DataType::Date32
+            | DataType::Date64
+    )
+}
+
+/// Returns `true` if `dt` is one of the types `tointeger` UDF accepts as input
+/// (numeric primitives plus CV-encoded `LargeBinary`).
+fn tointeger_accepts_dtype(dt: &DataType) -> bool {
+    matches!(
         dt,
         DataType::Int8
             | DataType::Int16
@@ -5679,21 +5940,70 @@ fn wrap_in_to_integer(
             | DataType::Float32
             | DataType::Float64
             | DataType::LargeBinary
-    );
-    if !supported {
-        return None;
-    }
+    )
+}
+
+/// Wrap `expr` with a 1-arg scalar UDF that returns `return_dt`.
+fn wrap_with_unary_udf(
+    expr: Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+    udf: Arc<datafusion::logical_expr::ScalarUDF>,
+    return_dt: DataType,
+) -> Arc<dyn datafusion::physical_plan::PhysicalExpr> {
     let config_options = Arc::new(datafusion::config::ConfigOptions::default());
-    let udf_name = tointeger_udf.name().to_string();
-    let return_field = Arc::new(arrow_schema::Field::new(&udf_name, DataType::Int64, true));
-    let scalar = datafusion::physical_expr::ScalarFunctionExpr::new(
+    let udf_name = udf.name().to_string();
+    let return_field = Arc::new(arrow_schema::Field::new(&udf_name, return_dt, true));
+    Arc::new(datafusion::physical_expr::ScalarFunctionExpr::new(
         &udf_name,
-        tointeger_udf,
+        udf,
         vec![expr],
         return_field,
         config_options,
-    );
-    Some(Arc::new(scalar))
+    ))
+}
+
+/// Bilateral type unification for a HashJoin equi-pair.
+///
+/// Strategy (in order of preference):
+/// 1. Same dtype + natively hashable → return both unchanged (fast path,
+///    e.g. `Utf8 = Utf8`, `Int64 = Int64`).
+/// 2. Both dtypes accepted by `tointeger` (numeric or CV-encoded
+///    `LargeBinary`) → wrap both in `tointeger` to unify on `Int64`. This is
+///    the original issue #53 behavior.
+/// 3. Otherwise (mixed string/CV/other Cypher types) → wrap both in
+///    `_cypher_sort_key`, which produces an order-preserving `LargeBinary`
+///    encoding that hashes equal iff the underlying Cypher values are equal.
+///
+/// Returns `None` only when the required UDFs aren't registered or a side's
+/// dtype can't be inferred — the caller falls back to FilterExec+CrossJoin.
+fn unify_join_key_types(
+    left: Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+    right: Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+    left_schema: &Schema,
+    right_schema: &Schema,
+    state: &SessionState,
+) -> Option<(
+    Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+    Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+)> {
+    let l_dt = left.data_type(left_schema).ok()?;
+    let r_dt = right.data_type(right_schema).ok()?;
+
+    if l_dt == r_dt && is_hashable_native_dtype(&l_dt) {
+        return Some((left, right));
+    }
+
+    if tointeger_accepts_dtype(&l_dt) && tointeger_accepts_dtype(&r_dt) {
+        let udf = state.scalar_functions().get("tointeger")?.clone();
+        return Some((
+            wrap_with_unary_udf(left, udf.clone(), DataType::Int64),
+            wrap_with_unary_udf(right, udf, DataType::Int64),
+        ));
+    }
+
+    // Cross-domain unification (e.g. Utf8 ↔ LargeBinary CV-encoded) is not yet
+    // implemented at the HashJoin layer — fall through to FilterExec, which
+    // handles these via Cypher-aware comparison UDFs.
+    None
 }
 
 #[cfg(test)]

@@ -22,8 +22,6 @@ pub mod multi_agent;
 pub mod notifications;
 pub mod prepared;
 pub mod query_builder;
-#[cfg(feature = "provider-onnx")]
-pub mod reranker;
 pub mod rule_registry;
 pub mod schema;
 pub mod session;
@@ -1357,8 +1355,8 @@ impl UniBuilder {
             {
                 runtime_builder = runtime_builder
                     .register_provider(uni_xervo::provider::LocalOnnxProvider::new());
-                runtime_builder =
-                    runtime_builder.register_provider(reranker::OnnxCrossEncoderProvider);
+                runtime_builder = runtime_builder
+                    .register_provider(uni_xervo::provider::LocalOnnxRerankerProvider);
             }
 
             Some(

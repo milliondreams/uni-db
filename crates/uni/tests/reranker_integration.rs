@@ -847,10 +847,10 @@ async fn test_hybrid_search_existing_options_unchanged() -> anyhow::Result<()> {
 #[tokio::test]
 #[ignore]
 async fn test_real_onnx_cross_encoder_reranks_by_relevance() -> anyhow::Result<()> {
-    use uni_db::api::reranker::OnnxCrossEncoderProvider;
+    use uni_xervo::provider::LocalOnnxRerankerProvider;
 
     let runtime = ModelRuntime::builder()
-        .register_provider(OnnxCrossEncoderProvider)
+        .register_provider(LocalOnnxRerankerProvider)
         .catalog(vec![ModelAliasSpec {
             alias: "rerank/minilm".to_string(),
             task: ModelTask::Rerank,
@@ -958,10 +958,10 @@ async fn test_real_onnx_cross_encoder_reranks_by_relevance() -> anyhow::Result<(
 #[tokio::test]
 #[ignore]
 async fn test_real_onnx_cross_encoder_via_facade() -> anyhow::Result<()> {
-    use uni_db::api::reranker::OnnxCrossEncoderProvider;
+    use uni_xervo::provider::LocalOnnxRerankerProvider;
 
     let runtime = ModelRuntime::builder()
-        .register_provider(OnnxCrossEncoderProvider)
+        .register_provider(LocalOnnxRerankerProvider)
         .catalog(vec![ModelAliasSpec {
             alias: "rerank/minilm".to_string(),
             task: ModelTask::Rerank,

@@ -213,7 +213,7 @@ Initial providers (each behind a feature flag):
 | ONNX (local) | `provider-onnx` | `cross-encoder/ms-marco-MiniLM-L-6-v2`, `BAAI/bge-reranker-v2-m3` |
 | Jina AI | `provider-jina` | `jina-reranker-v2-base-multilingual` |
 
-Each provider implements the `Reranker` trait. The ONNX provider uses the existing `OnnxRunner` infrastructure for local inference.
+Each provider implements the `Reranker` trait. The ONNX provider uses the existing `RawTensorModel` infrastructure for local inference.
 
 ### 3.6 Catalog Configuration
 

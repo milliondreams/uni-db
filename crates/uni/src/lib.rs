@@ -33,7 +33,7 @@ pub use api::transaction::{
     ApplyBuilder, ApplyResult, CommitResult, ExecuteBuilder, IsolationLevel, Transaction,
 };
 #[cfg(feature = "provider-onnx")]
-pub use api::xervo::{OnnxRunner, TensorBatch, TensorSpec, TensorValue};
+pub use api::xervo::{RawTensorModel, TensorBatch, TensorSpec, TensorValue};
 pub use api::xervo::{RerankerModel, ScoredDoc, UniXervo};
 
 // Re-exports from xervo for catalog parsing

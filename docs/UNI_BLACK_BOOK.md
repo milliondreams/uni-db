@@ -466,6 +466,7 @@ Uni supports a rich type system mapped to Apache Arrow types for columnar storag
 | Uni Type | Arrow Type | Description |
 |---|---|---|
 | `CypherValue` | `LargeBinary` | MessagePack-tagged binary (any Cypher value) |
+| `Bytes` | `LargeBinary` | Raw byte buffer (no codec wrapping) — images, audio, blobs |
 | `Vector { dimensions }` | `FixedSizeList(Float32, N)` | Fixed-dimension embedding vector |
 | `List(T)` | `List(T)` | Variable-length list of type T |
 | `Map(K, V)` | `List(Struct(key: K, value: V))` | Key-value map |

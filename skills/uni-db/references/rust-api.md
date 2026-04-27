@@ -292,7 +292,7 @@ impl<'a> LabelBuilder<'a> {
 ```rust
 pub enum DataType {
     String, Int32, Int64, Float32, Float64, Bool,
-    Timestamp, Date, Time, DateTime, Duration, CypherValue,
+    Timestamp, Date, Time, DateTime, Duration, CypherValue, Bytes,
     Point(PointType),              // Geographic | Cartesian2D | Cartesian3D
     Vector { dimensions: usize },
     Crdt(CrdtType),                // GCounter | GSet | ORSet | LWWRegister | LWWMap | Rga | VectorClock | VCRegister

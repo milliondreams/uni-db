@@ -181,6 +181,7 @@ Use edge properties sparingly for relationship metadata:
 | `Btic` | Temporal intervals with granularity | valid_period, event_when |
 | `Vector` | Embeddings | embedding, image_vector |
 | `Json` | Semi-structured | metadata, config |
+| `Bytes` | Raw binary blobs | image, audio, pdf, model_weights |
 
 ### Nullability
 

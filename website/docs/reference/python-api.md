@@ -1004,6 +1004,7 @@ When defining properties with strings in `SchemaBuilder`:
 | `"datetime"` | `datetime` | Date and time |
 | `"duration"` | `timedelta` | Duration |
 | `"json"` | `Any` | Arbitrary JSON-like value |
+| `"bytes"` / `"blob"` / `"binary"` | `bytes` | Raw byte buffer |
 
 ### DataType Class
 
@@ -1039,6 +1040,7 @@ Available constructors:
 | `DataType.DATETIME()` | Date and time |
 | `DataType.DURATION()` | Duration |
 | `DataType.JSON()` | Arbitrary value |
+| `DataType.BYTES()` | Raw byte buffer (images, audio, blobs) |
 | `DataType.vector(dimensions)` | N-dimensional float vector |
 | `DataType.list(element_type)` | Typed list |
 | `DataType.map(key_type, value_type)` | Typed map |

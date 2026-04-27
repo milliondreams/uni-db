@@ -169,6 +169,7 @@ async fn main() -> uni_db::Result<()> {
 | List(T) | `DataType.list(inner)` | `DataType::List(Box<T>)` | `LIST(T)` |
 | Map(K,V) | `DataType.map(k, v)` | `DataType::Map(Box<K>, Box<V>)` | `MAP(K, V)` |
 | JSON | `DataType.JSON()` | `DataType::CypherValue` | `JSON` |
+| Bytes | `DataType.BYTES()` | `DataType::Bytes` | `BYTES` |
 | CRDT types | `DataType.crdt(CrdtType.G_COUNTER())` | `DataType::Crdt(CrdtKind::GCounter)` | `CRDT(GCOUNTER)` |
 
 CRDT types: `GCounter`, `GSet`, `ORSet`, `LWWRegister`, `LWWMap`, `Rga`, `VectorClock`, `VCRegister`.

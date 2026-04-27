@@ -9,6 +9,21 @@ members = [
     "crates/uni",
     "crates/uni-crdt",
     "bindings/uni-db",
+    # Wheel-matrix sibling crates — share `bindings/uni-db/src/lib.rs` via
+    # `[lib].path`; differ only in the cargo features they activate. See
+    # `docs/proposals/python-wheel-matrix.md`.
+    "bindings/uni-db-onnx",
+    "bindings/uni-db-onnx-cuda",
+    "bindings/uni-db-onnx-metal",
+    "bindings/uni-db-fastembed",
+    "bindings/uni-db-fastembed-cuda",
+    "bindings/uni-db-fastembed-metal",
+    "bindings/uni-db-mistralrs",
+    "bindings/uni-db-mistralrs-cuda",
+    "bindings/uni-db-mistralrs-metal",
+    "bindings/uni-db-all",
+    "bindings/uni-db-all-cuda",
+    "bindings/uni-db-all-metal",
     "crates/uni-cypher",
     "crates/uni-tck",
     "crates/uni-locy-tck",

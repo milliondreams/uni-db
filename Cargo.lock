@@ -11183,6 +11183,234 @@ dependencies = [
 ]
 
 [[package]]
+name = "uni-python-all"
+version = "1.1.1"
+dependencies = [
+ "anyhow",
+ "arrow-array",
+ "arrow-schema",
+ "chrono",
+ "pyo3",
+ "pyo3-async-runtimes",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "uni-common",
+ "uni-db",
+ "uni-locy",
+ "uni-store",
+]
+
+[[package]]
+name = "uni-python-all-cuda"
+version = "1.1.1"
+dependencies = [
+ "anyhow",
+ "arrow-array",
+ "arrow-schema",
+ "chrono",
+ "pyo3",
+ "pyo3-async-runtimes",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "uni-common",
+ "uni-db",
+ "uni-locy",
+ "uni-store",
+]
+
+[[package]]
+name = "uni-python-all-metal"
+version = "1.1.1"
+dependencies = [
+ "anyhow",
+ "arrow-array",
+ "arrow-schema",
+ "chrono",
+ "pyo3",
+ "pyo3-async-runtimes",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "uni-common",
+ "uni-db",
+ "uni-locy",
+ "uni-store",
+]
+
+[[package]]
+name = "uni-python-fastembed"
+version = "1.1.1"
+dependencies = [
+ "anyhow",
+ "arrow-array",
+ "arrow-schema",
+ "chrono",
+ "pyo3",
+ "pyo3-async-runtimes",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "uni-common",
+ "uni-db",
+ "uni-locy",
+ "uni-store",
+]
+
+[[package]]
+name = "uni-python-fastembed-cuda"
+version = "1.1.1"
+dependencies = [
+ "anyhow",
+ "arrow-array",
+ "arrow-schema",
+ "chrono",
+ "pyo3",
+ "pyo3-async-runtimes",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "uni-common",
+ "uni-db",
+ "uni-locy",
+ "uni-store",
+]
+
+[[package]]
+name = "uni-python-fastembed-metal"
+version = "1.1.1"
+dependencies = [
+ "anyhow",
+ "arrow-array",
+ "arrow-schema",
+ "chrono",
+ "pyo3",
+ "pyo3-async-runtimes",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "uni-common",
+ "uni-db",
+ "uni-locy",
+ "uni-store",
+]
+
+[[package]]
+name = "uni-python-mistralrs"
+version = "1.1.1"
+dependencies = [
+ "anyhow",
+ "arrow-array",
+ "arrow-schema",
+ "chrono",
+ "pyo3",
+ "pyo3-async-runtimes",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "uni-common",
+ "uni-db",
+ "uni-locy",
+ "uni-store",
+]
+
+[[package]]
+name = "uni-python-mistralrs-cuda"
+version = "1.1.1"
+dependencies = [
+ "anyhow",
+ "arrow-array",
+ "arrow-schema",
+ "chrono",
+ "pyo3",
+ "pyo3-async-runtimes",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "uni-common",
+ "uni-db",
+ "uni-locy",
+ "uni-store",
+]
+
+[[package]]
+name = "uni-python-mistralrs-metal"
+version = "1.1.1"
+dependencies = [
+ "anyhow",
+ "arrow-array",
+ "arrow-schema",
+ "chrono",
+ "pyo3",
+ "pyo3-async-runtimes",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "uni-common",
+ "uni-db",
+ "uni-locy",
+ "uni-store",
+]
+
+[[package]]
+name = "uni-python-onnx"
+version = "1.1.1"
+dependencies = [
+ "anyhow",
+ "arrow-array",
+ "arrow-schema",
+ "chrono",
+ "pyo3",
+ "pyo3-async-runtimes",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "uni-common",
+ "uni-db",
+ "uni-locy",
+ "uni-store",
+]
+
+[[package]]
+name = "uni-python-onnx-cuda"
+version = "1.1.1"
+dependencies = [
+ "anyhow",
+ "arrow-array",
+ "arrow-schema",
+ "chrono",
+ "pyo3",
+ "pyo3-async-runtimes",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "uni-common",
+ "uni-db",
+ "uni-locy",
+ "uni-store",
+]
+
+[[package]]
+name = "uni-python-onnx-metal"
+version = "1.1.1"
+dependencies = [
+ "anyhow",
+ "arrow-array",
+ "arrow-schema",
+ "chrono",
+ "pyo3",
+ "pyo3-async-runtimes",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "uni-common",
+ "uni-db",
+ "uni-locy",
+ "uni-store",
+]
+
+[[package]]
 name = "uni-query"
 version = "1.1.1"
 dependencies = [

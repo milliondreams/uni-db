@@ -277,11 +277,7 @@ Worth shipping this as a one-page table in user-facing docs. Possibly with a `pi
 
 3. **Where to host wheels.** Initial plan is PyPI for all 13. The CUDA wheels (especially `uni-db-onnx-cuda`, `uni-db-fastembed-cuda`, `uni-db-all-cuda`) may exceed PyPI's 100 MB per-file soft limit and need an exemption request. Alternative: custom index for CUDA wheels (PyTorch's model). Decide before publishing the first CUDA wheel.
 
-4. **Post-install probe** — `uni_db._probe()` and a CLI `uni-db check`:
-   - Detect host: NVIDIA driver + cuDNN versions, Metal availability, ORT version, etc.
-   - Detect installed wheel variant.
-   - Cross-check: warn if installed wheel can't actually run on this host (`uni-db-cuda` on a host without cuDNN, `uni-db-metal` on Linux, etc.).
-   - Recommend: `uni_db._recommend()` returns the suggested wheel name based purely on host probe — useful for `pip install` instructions.
+4. **Post-install probe.** **Resolved.** Implemented in `bindings/uni-db/uni_db/_probe.py` (Step 9). `python -m uni_db check` prints a host report; `python -m uni_db recommend` suggests the best wheel for the host. `bindings/uni-db/uni_db/_variant.py` carries a `VARIANT` constant that the bootstrap script overrides per-variant — the probe reads this to decide which checks apply (NVIDIA driver + cuDNN for `*-cuda` wheels, Metal-on-macOS for `*-metal` wheels, extension-load for all). Tested in `bindings/uni-db/tests/test_probe.py` (16 cases).
 
 5. **Lock-step versioning across wheels.** When `uni-db` bumps from 1.1.1 to 1.2.0, do all 13 sibling wheels follow lock-step? If yes (recommended), publish pipeline must release all before announcing. If asymmetric, users hit version drift. Lock-step is the only honest model.
 

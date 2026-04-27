@@ -231,6 +231,94 @@ jobs:
           name: wheels-${{ matrix.variant }}-windows-x86_64
           path: dist
 
+  # CUDA-equipped Linux builds. Currently uses the same manylinux_2_28
+  # container as `build-linux` because `uni-db-fastembed-cuda` doesn't need
+  # nvcc — pyke's `ort/download-binaries` fetches a prebuilt CUDA EP sidecar
+  # (`libonnxruntime_providers_cuda.so` ~180 MB) at Rust build time.
+  #
+  # When `uni-db-mistralrs-cuda` lands in Step 6, candle's CUDA kernels need
+  # `nvcc` for per-SM PTX compilation — switch the container at that point
+  # to one with the CUDA toolkit installed (e.g.
+  # `nvidia/cuda:13.0.0-devel-rockylinux9` for manylinux_2_34 compatibility).
+  # See `docs/proposals/python-wheel-matrix.md` open question #1.
+  build-cuda-linux:
+    name: Build ${{ matrix.variant }} Linux wheels (x86_64, CUDA)
+    needs: [validate]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [uni-db-fastembed-cuda]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Bootstrap variant Python sources
+        shell: bash
+        run: ./scripts/bootstrap-wheel-variants.sh
+
+      # We build with `--auditwheel skip` because auditwheel's default repair
+      # bundles every NEEDED shared library into the wheel, including the
+      # CUDA driver lib (`libcuda.so.1`) and CUDA runtime/math libs
+      # (`libcudart`, `libcublas`, `libcublasLt`, `libcurand`, `libnvrtc`,
+      # plus `libcudnn` once it's in the picture). Those are *host-supplied*
+      # — bundling them produces 620+ MB wheels that exceed PyPI's per-file
+      # limit and risk runtime conflicts with the user's NVIDIA driver
+      # install. The post-build repair step below excludes them.
+      #
+      # See `docs/proposals/python-wheel-matrix.md` "What is not bundled"
+      # for the canonical list.
+      - name: Build wheels (skip auditwheel)
+        uses: PyO3/maturin-action@v1
+        env:
+          RUSTFLAGS: ""
+        with:
+          target: x86_64
+          args: --release --strip --auditwheel skip --out dist-raw -m bindings/${{ matrix.variant }}/Cargo.toml
+          manylinux: 2_28
+          before-script-linux: |
+            yum install -y openssl-devel unzip
+            PROTOC_VERSION="28.3"
+            curl -sSLO "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+            unzip -q "protoc-${PROTOC_VERSION}-linux-x86_64.zip" -d /usr/local
+            rm "protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+
+      - name: Repair wheel with CUDA host-lib excludes
+        run: |
+          set -euo pipefail
+          pip install auditwheel patchelf
+          mkdir -p dist
+          # CUDA driver, runtime, and math libs are host-supplied via the
+          # user's NVIDIA driver / CUDA toolkit install. cuDNN is also
+          # host-supplied (see uni-xervo build.rs warning). Exclude all of
+          # them from the wheel so they're left as runtime-resolved
+          # NEEDED entries rather than bundled.
+          for whl in dist-raw/*.whl; do
+            auditwheel repair \
+              --plat manylinux_2_28_x86_64 \
+              --wheel-dir dist \
+              --exclude 'libcuda.so.*' \
+              --exclude 'libcudart.so.*' \
+              --exclude 'libcublas.so.*' \
+              --exclude 'libcublasLt.so.*' \
+              --exclude 'libcurand.so.*' \
+              --exclude 'libcudnn.so.*' \
+              --exclude 'libnvrtc.so.*' \
+              --exclude 'libnvJitLink.so.*' \
+              "$whl"
+          done
+          ls -lh dist/
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.variant }}-linux-x86_64
+          path: dist
+
   build-sdist:
     name: Build ${{ matrix.variant }} source distribution
     needs: [validate]
@@ -261,7 +349,7 @@ jobs:
 
   publish-testpypi:
     name: Publish uni-db wheels to TestPyPI
-    needs: [build-linux, build-macos, build-windows, build-sdist]
+    needs: [build-linux, build-cuda-linux, build-macos, build-windows, build-sdist]
     runs-on: ubuntu-latest
     environment: testpypi
     permissions:
@@ -288,7 +376,7 @@ jobs:
 
   publish-pypi:
     name: Publish uni-db wheels to PyPI
-    needs: [build-linux, build-macos, build-windows, build-sdist]
+    needs: [build-linux, build-cuda-linux, build-macos, build-windows, build-sdist]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:

@@ -150,3 +150,33 @@ jobs:
       - name: Run Python tests (uni-pydantic)
         working-directory: bindings/uni-pydantic
         run: uv run pytest tests/ -v -n auto
+
+  # CUDA wheel smoke build — catches feature-flag breakage in the
+  # `uni-db-fastembed-cuda` variant early, without paying for the full
+  # 13-wheel release matrix on every PR. `cargo check --release` validates
+  # the entire dependency graph compiles (including pyke's
+  # `ort/download-binaries` fetch) but skips the linker/maturin packaging
+  # step, which keeps CI time reasonable. Real wheel builds happen in
+  # `release-wheels.yml` on tag/dispatch.
+  wheels-fastembed-cuda-smoke:
+    name: Wheel smoke build (uni-db-fastembed-cuda)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mold protobuf-compiler
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci"
+          cache-on-failure: true
+
+      - name: Cargo check (uni-db-fastembed-cuda)
+        run: cargo check --release --manifest-path bindings/uni-db-fastembed-cuda/Cargo.toml

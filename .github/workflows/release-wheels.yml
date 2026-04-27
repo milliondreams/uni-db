@@ -110,7 +110,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [uni-db, uni-db-fastembed]
+        variant: [uni-db, uni-db-fastembed, uni-db-mistralrs]
         target: [x86_64, aarch64]
         include:
           - target: x86_64
@@ -165,7 +165,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [uni-db, uni-db-fastembed]
+        variant: [uni-db, uni-db-fastembed, uni-db-mistralrs]
         target: [x86_64, aarch64]
     steps:
       - uses: actions/checkout@v4
@@ -212,7 +212,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [uni-db-fastembed-metal]
+        variant: [uni-db-fastembed-metal, uni-db-mistralrs-metal]
     steps:
       - uses: actions/checkout@v4
 
@@ -247,7 +247,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [uni-db, uni-db-fastembed]
+        variant: [uni-db, uni-db-fastembed, uni-db-mistralrs]
     steps:
       - uses: actions/checkout@v4
 
@@ -364,6 +364,93 @@ jobs:
           name: wheels-${{ matrix.variant }}-linux-x86_64
           path: dist
 
+  # CUDA Linux builds that need `nvcc` (candle's per-SM PTX compilation).
+  # Currently `uni-db-mistralrs-cuda`; Step 7 adds `uni-db-all-cuda`.
+  #
+  # Uses manylinux_2_34 (AlmaLinux 9 base) instead of manylinux_2_28
+  # because the CUDA 13.0 toolkit is published as RHEL/AlmaLinux 9 RPMs
+  # by NVIDIA. Trade-off: marginally narrower runtime compatibility
+  # (excludes EL8 / Ubuntu 18.04-class hosts), but those Linux distros
+  # are EOL and unlikely to have driver 580+ anyway.
+  #
+  # `before-script-linux` adds NVIDIA's CUDA repo and installs the
+  # toolkit into `/usr/local/cuda-13.0/`; the `bin` dir is exported via
+  # `export PATH=...`, which propagates to the maturin step inside the
+  # same container session.
+  build-cuda-toolkit-linux:
+    name: Build ${{ matrix.variant }} Linux wheels (x86_64, CUDA toolkit)
+    needs: [validate]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [uni-db-mistralrs-cuda]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Bootstrap variant Python sources
+        shell: bash
+        run: ./scripts/bootstrap-wheel-variants.sh
+
+      - name: Build wheels (skip auditwheel)
+        uses: PyO3/maturin-action@v1
+        env:
+          RUSTFLAGS: ""
+        with:
+          target: x86_64
+          args: --release --strip --auditwheel skip --out dist-raw -m bindings/${{ matrix.variant }}/Cargo.toml
+          manylinux: 2_34
+          before-script-linux: |
+            set -euxo pipefail
+            dnf install -y openssl-devel unzip dnf-plugins-core
+            PROTOC_VERSION="28.3"
+            curl -sSLO "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+            unzip -q "protoc-${PROTOC_VERSION}-linux-x86_64.zip" -d /usr/local
+            rm "protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+            # Install CUDA 13.0 toolkit from NVIDIA's RHEL 9 repo. AlmaLinux 9
+            # is binary-compatible with RHEL 9.
+            dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel9/x86_64/cuda-rhel9.repo
+            dnf install -y cuda-toolkit-13-0
+            export PATH="/usr/local/cuda-13.0/bin:$PATH"
+            export CUDA_HOME="/usr/local/cuda-13.0"
+            nvcc --version
+
+      - name: Repair wheel with CUDA host-lib excludes
+        run: |
+          set -euo pipefail
+          pip install auditwheel patchelf
+          mkdir -p dist
+          # Same exclude list as `build-cuda-linux`. Note: candle's CUDA
+          # path uses `cudarc` which dlopens libcudart at runtime; that's
+          # host-supplied so we exclude it. cuBLAS/cuRAND are pulled in
+          # transitively for matrix ops.
+          for whl in dist-raw/*.whl; do
+            auditwheel repair \
+              --plat manylinux_2_34_x86_64 \
+              --wheel-dir dist \
+              --exclude 'libcuda.so.*' \
+              --exclude 'libcudart.so.*' \
+              --exclude 'libcublas.so.*' \
+              --exclude 'libcublasLt.so.*' \
+              --exclude 'libcurand.so.*' \
+              --exclude 'libcudnn.so.*' \
+              --exclude 'libnvrtc.so.*' \
+              --exclude 'libnvJitLink.so.*' \
+              "$whl"
+          done
+          ls -lh dist/
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.variant }}-linux-x86_64
+          path: dist
+
   build-sdist:
     name: Build ${{ matrix.variant }} source distribution
     needs: [validate]
@@ -371,7 +458,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [uni-db, uni-db-fastembed]
+        variant: [uni-db, uni-db-fastembed, uni-db-mistralrs]
     steps:
       - uses: actions/checkout@v4
 
@@ -394,7 +481,7 @@ jobs:
 
   publish-testpypi:
     name: Publish uni-db wheels to TestPyPI
-    needs: [build-linux, build-cuda-linux, build-macos, build-metal, build-windows, build-sdist]
+    needs: [build-linux, build-cuda-linux, build-cuda-toolkit-linux, build-macos, build-metal, build-windows, build-sdist]
     runs-on: ubuntu-latest
     environment: testpypi
     permissions:
@@ -421,7 +508,7 @@ jobs:
 
   publish-pypi:
     name: Publish uni-db wheels to PyPI
-    needs: [build-linux, build-cuda-linux, build-macos, build-metal, build-windows, build-sdist]
+    needs: [build-linux, build-cuda-linux, build-cuda-toolkit-linux, build-macos, build-metal, build-windows, build-sdist]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:

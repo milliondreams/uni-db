@@ -50,17 +50,21 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      # Wheel-matrix metal variants don't compile on Linux (gpu-coreml /
-      # gpu-metal pull in objc2 which is Apple-only). Skip them in
-      # `--workspace` operations; they're built on macOS runners via
-      # `release-wheels.yml`.
+      # Wheel-matrix accelerator variants don't fit on the regular CI
+      # runner: metal variants pull in `objc2` (Apple-only); cuda variants
+      # pull in `cudarc` whose build.rs requires `nvcc`. They're built in
+      # dedicated `release-wheels.yml` jobs with the right container/runner.
       - name: Run clippy
         run: |
           cargo clippy --workspace \
             --exclude uni-tck \
+            --exclude uni-python-onnx-cuda \
             --exclude uni-python-onnx-metal \
+            --exclude uni-python-fastembed-cuda \
             --exclude uni-python-fastembed-metal \
+            --exclude uni-python-mistralrs-cuda \
             --exclude uni-python-mistralrs-metal \
+            --exclude uni-python-all-cuda \
             --exclude uni-python-all-metal \
             --all-targets -- -D warnings
 
@@ -92,9 +96,13 @@ jobs:
         run: |
           cargo nextest run --workspace \
             --exclude uni-tck \
+            --exclude uni-python-onnx-cuda \
             --exclude uni-python-onnx-metal \
+            --exclude uni-python-fastembed-cuda \
             --exclude uni-python-fastembed-metal \
+            --exclude uni-python-mistralrs-cuda \
             --exclude uni-python-mistralrs-metal \
+            --exclude uni-python-all-cuda \
             --exclude uni-python-all-metal
 
   # Python bindings tests

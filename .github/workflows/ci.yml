@@ -51,18 +51,31 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      # Wheel-matrix metal variants don't compile on Linux (gpu-coreml /
-      # gpu-metal pull in objc2 which is Apple-only). They are workspace
-      # members so their feature lists can use { workspace = true }, but
-      # `--workspace` operations on Linux must skip them. They're built
-      # via dedicated jobs in `release-wheels.yml` on macOS arm64 runners.
+      # Wheel-matrix accelerator variants are excluded from `--workspace`
+      # operations on the regular CI runner:
+      #
+      # - The metal variants (`*-metal`) pull in `objc2` which is Apple-only
+      #   and won't compile on Linux at all.
+      # - The cuda variants (`*-cuda`) cause feature unification to activate
+      #   `gpu-cuda` on `uni-xervo`, which pulls in `cudarc` whose `build.rs`
+      #   requires `nvcc`. ubuntu-latest doesn't have CUDA installed.
+      #
+      # Both are workspace members so their feature lists can use
+      # `{ workspace = true }`, but `--workspace` operations on the regular
+      # CI runner must skip them. They get tested in dedicated jobs in
+      # `release-wheels.yml` (CUDA toolkit container for `*-cuda`, macOS
+      # arm64 runner for `*-metal`).
       - name: Run clippy
         run: |
           cargo clippy --workspace \
             --exclude uni-tck \
+            --exclude uni-python-onnx-cuda \
             --exclude uni-python-onnx-metal \
+            --exclude uni-python-fastembed-cuda \
             --exclude uni-python-fastembed-metal \
+            --exclude uni-python-mistralrs-cuda \
             --exclude uni-python-mistralrs-metal \
+            --exclude uni-python-all-cuda \
             --exclude uni-python-all-metal \
             --all-targets -- -D warnings
 
@@ -70,9 +83,13 @@ jobs:
         run: |
           cargo nextest run --workspace \
             --exclude uni-tck \
+            --exclude uni-python-onnx-cuda \
             --exclude uni-python-onnx-metal \
+            --exclude uni-python-fastembed-cuda \
             --exclude uni-python-fastembed-metal \
+            --exclude uni-python-mistralrs-cuda \
             --exclude uni-python-mistralrs-metal \
+            --exclude uni-python-all-cuda \
             --exclude uni-python-all-metal
 
       # Provider-onnx is opt-in (not in default features). The two ONNX

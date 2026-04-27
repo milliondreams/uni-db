@@ -195,6 +195,51 @@ jobs:
           name: wheels-${{ matrix.variant }}-macos-${{ matrix.target }}
           path: dist
 
+  # macOS arm64 builds with Apple-platform GPU acceleration. ORT-using
+  # variants (`*-metal`) get `gpu-coreml` for the CoreML execution provider;
+  # the CoreML EP is statically linked into pyke's macOS bundle, so no
+  # separate sidecar `.dylib` ships in the wheel. candle/mistralrs-using
+  # variants (Step 6+) get `gpu-metal` for candle's Metal kernels (compiled
+  # to `.metallib` and baked into the binary at build time).
+  #
+  # Apple Silicon only — macOS x86_64 isn't a target because the
+  # Metal/CoreML stacks aren't worth supporting separately for retired
+  # Intel Macs.
+  build-metal:
+    name: Build ${{ matrix.variant }} macOS wheels (aarch64)
+    needs: [validate]
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [uni-db-fastembed-metal]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install protobuf
+        run: brew install protobuf
+
+      - name: Bootstrap variant Python sources
+        shell: bash
+        run: ./scripts/bootstrap-wheel-variants.sh
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: aarch64-apple-darwin
+          args: --release --strip --out dist -m bindings/${{ matrix.variant }}/Cargo.toml
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.variant }}-macos-aarch64
+          path: dist
+
   build-windows:
     name: Build ${{ matrix.variant }} Windows wheels (x86_64)
     needs: [validate]
@@ -349,7 +394,7 @@ jobs:
 
   publish-testpypi:
     name: Publish uni-db wheels to TestPyPI
-    needs: [build-linux, build-cuda-linux, build-macos, build-windows, build-sdist]
+    needs: [build-linux, build-cuda-linux, build-macos, build-metal, build-windows, build-sdist]
     runs-on: ubuntu-latest
     environment: testpypi
     permissions:
@@ -376,7 +421,7 @@ jobs:
 
   publish-pypi:
     name: Publish uni-db wheels to PyPI
-    needs: [build-linux, build-cuda-linux, build-macos, build-windows, build-sdist]
+    needs: [build-linux, build-cuda-linux, build-macos, build-metal, build-windows, build-sdist]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:

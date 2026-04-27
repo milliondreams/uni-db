@@ -85,9 +85,15 @@ impl UniXervo {
     /// Returns [`UniError`] if the runtime is not configured or the alias
     /// is not registered in the catalog.
     #[cfg(feature = "provider-onnx")]
-    pub async fn raw_tensor_model(&self, alias: &str) -> Result<Arc<dyn uni_xervo::traits::RawTensorModel>> {
+    pub async fn raw_tensor_model(
+        &self,
+        alias: &str,
+    ) -> Result<Arc<dyn uni_xervo::traits::RawTensorModel>> {
         let runtime = self.runtime.as_ref().ok_or_else(not_configured)?;
-        runtime.raw_tensor_model(alias).await.map_err(into_uni_error)
+        runtime
+            .raw_tensor_model(alias)
+            .await
+            .map_err(into_uni_error)
     }
 
     /// Rerank documents against a query using a configured cross-encoder model.

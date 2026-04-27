@@ -119,9 +119,3 @@ tokio-util = { version = "0.7", features = ["rt"] }
 fastembed = "5.11.0"
 hf-hub = "0.4.3"
 tokenizers = "0.22.2"
-
-# Temporary local override while uni-xervo 0.7.0 is unpublished. Remove this
-# section once 0.7.0 hits crates.io.
-[patch.crates-io]
-uni-xervo = { path = "../uni-xervo" }
-

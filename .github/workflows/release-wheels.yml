@@ -104,11 +104,14 @@ jobs:
   # pointing at a different `bindings/uni-db-<variant>/Cargo.toml`.
 
   build-linux:
-    name: Build uni-db Linux wheels (${{ matrix.target }})
+    name: Build ${{ matrix.variant }} Linux wheels (${{ matrix.target }})
     needs: [validate]
     runs-on: ${{ matrix.runner }}
     strategy:
+      fail-fast: false
       matrix:
+        variant: [uni-db, uni-db-fastembed]
+        target: [x86_64, aarch64]
         include:
           - target: x86_64
             runner: ubuntu-latest
@@ -122,6 +125,11 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Bootstrap variant Python sources
+        if: matrix.variant != 'uni-db'
+        shell: bash
+        run: ./scripts/bootstrap-wheel-variants.sh
+
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         env:
@@ -130,7 +138,7 @@ jobs:
           RUSTFLAGS: ""
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist -m bindings/uni-db/Cargo.toml
+          args: --release --out dist -m bindings/${{ matrix.variant }}/Cargo.toml
           manylinux: 2_28
           before-script-linux: |
             yum install -y openssl-devel unzip
@@ -147,15 +155,17 @@ jobs:
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
-          name: wheels-uni-db-linux-${{ matrix.target }}
+          name: wheels-${{ matrix.variant }}-linux-${{ matrix.target }}
           path: dist
 
   build-macos:
-    name: Build uni-db macOS wheels (${{ matrix.target }})
+    name: Build ${{ matrix.variant }} macOS wheels (${{ matrix.target }})
     needs: [validate]
     runs-on: macos-latest-large
     strategy:
+      fail-fast: false
       matrix:
+        variant: [uni-db, uni-db-fastembed]
         target: [x86_64, aarch64]
     steps:
       - uses: actions/checkout@v4
@@ -168,22 +178,31 @@ jobs:
       - name: Install protobuf
         run: brew install protobuf
 
+      - name: Bootstrap variant Python sources
+        if: matrix.variant != 'uni-db'
+        shell: bash
+        run: ./scripts/bootstrap-wheel-variants.sh
+
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}-apple-darwin
-          args: --release --out dist -m bindings/uni-db/Cargo.toml
+          args: --release --out dist -m bindings/${{ matrix.variant }}/Cargo.toml
 
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
-          name: wheels-uni-db-macos-${{ matrix.target }}
+          name: wheels-${{ matrix.variant }}-macos-${{ matrix.target }}
           path: dist
 
   build-windows:
-    name: Build uni-db Windows wheels (x86_64)
+    name: Build ${{ matrix.variant }} Windows wheels (x86_64)
     needs: [validate]
     runs-on: windows-latest-l
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [uni-db, uni-db-fastembed]
     steps:
       - uses: actions/checkout@v4
 
@@ -195,35 +214,49 @@ jobs:
       - name: Install protobuf
         run: choco install protoc
 
+      - name: Bootstrap variant Python sources
+        if: matrix.variant != 'uni-db'
+        shell: bash
+        run: ./scripts/bootstrap-wheel-variants.sh
+
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
           target: x86_64-pc-windows-msvc
-          args: --release --out dist -m bindings/uni-db/Cargo.toml
+          args: --release --out dist -m bindings/${{ matrix.variant }}/Cargo.toml
 
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
-          name: wheels-uni-db-windows-x86_64
+          name: wheels-${{ matrix.variant }}-windows-x86_64
           path: dist
 
   build-sdist:
-    name: Build uni-db source distribution
+    name: Build ${{ matrix.variant }} source distribution
     needs: [validate]
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [uni-db, uni-db-fastembed]
     steps:
       - uses: actions/checkout@v4
+
+      - name: Bootstrap variant Python sources
+        if: matrix.variant != 'uni-db'
+        shell: bash
+        run: ./scripts/bootstrap-wheel-variants.sh
 
       - name: Build sdist
         uses: PyO3/maturin-action@v1
         with:
           command: sdist
-          args: --out dist -m bindings/uni-db/Cargo.toml
+          args: --out dist -m bindings/${{ matrix.variant }}/Cargo.toml
 
       - name: Upload sdist
         uses: actions/upload-artifact@v4
         with:
-          name: wheels-uni-db-sdist
+          name: wheels-${{ matrix.variant }}-sdist
           path: dist
 
   publish-testpypi:

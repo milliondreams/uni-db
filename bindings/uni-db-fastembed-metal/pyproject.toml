@@ -33,4 +33,3 @@ Issues = "https://github.com/rustic-ai/uni-db/issues"
 
 [tool.maturin]
 module-name = "uni_db._uni_db"
-python-source = "../uni-db"

@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Bootstrap the Python source directory for each wheel-matrix variant.
+#
+# Each `bindings/uni-db-<variant>/` is a packaging shim with only Cargo.toml,
+# pyproject.toml, and README.md tracked in git. The Python package (`uni_db/`)
+# is shared with the canonical `bindings/uni-db/uni_db/` and copied in by this
+# script. Maturin doesn't follow symlinks for `python-source` and doesn't
+# resolve parent-relative `python-source` paths reliably, so we materialize
+# the directory.
+#
+# Run this once after fresh checkout, after pulling changes that modify the
+# canonical Python sources, and as a CI step before each `maturin build` of
+# a variant wheel.
+#
+# The copies are gitignored (see top-level `.gitignore`).
+
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+SOURCE="bindings/uni-db/uni_db"
+
+if [[ ! -d "$SOURCE" ]]; then
+    echo "ERROR: $SOURCE does not exist. Are you running from the repo root?" >&2
+    exit 1
+fi
+
+VARIANTS=(
+    onnx
+    onnx-cuda
+    onnx-metal
+    fastembed
+    fastembed-cuda
+    fastembed-metal
+    mistralrs
+    mistralrs-cuda
+    mistralrs-metal
+    all
+    all-cuda
+    all-metal
+)
+
+for variant in "${VARIANTS[@]}"; do
+    target="bindings/uni-db-${variant}/uni_db"
+    if [[ ! -d "bindings/uni-db-${variant}" ]]; then
+        echo "WARN: bindings/uni-db-${variant} does not exist, skipping" >&2
+        continue
+    fi
+    rm -rf "$target"
+    cp -r "$SOURCE" "$target"
+    # Strip the __pycache__ that may have been copied; CI doesn't need it.
+    rm -rf "$target/__pycache__"
+    echo "Bootstrapped: $target"
+done
+
+echo "Done. ${#VARIANTS[@]} variant directories populated."

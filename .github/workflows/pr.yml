@@ -183,9 +183,18 @@ jobs:
   # `ort/download-binaries` fetch) but skips the linker/maturin packaging
   # step, which keeps CI time reasonable. Real wheel builds happen in
   # `release-wheels.yml` on tag/dispatch.
+  #
+  # `CUDARC_CUDA_VERSION` tells `cudarc`'s `build.rs` the CUDA version
+  # without making it run `nvcc --version`. The smoke check doesn't link
+  # against any CUDA libs (cargo check, no linker invoked), so we can
+  # validate the compile graph on a runner that has no CUDA toolkit
+  # installed. Value 13000 = CUDA 13.0.0, matching the wheel-matrix
+  # production pin in `release-wheels.yml`.
   wheels-fastembed-cuda-smoke:
     name: Wheel smoke build (uni-db-fastembed-cuda)
     runs-on: ubuntu-latest
+    env:
+      CUDARC_CUDA_VERSION: "13000"
     steps:
       - uses: actions/checkout@v4
 

@@ -922,9 +922,9 @@ async fn test_real_onnx_cross_encoder_reranks_by_relevance() -> anyhow::Result<(
 
     let order = titles(&result);
     eprintln!("Reranked order: {:?}", order);
-    for i in 0..result.len() {
+    for (i, title) in order.iter().enumerate() {
         let rs = get_f64(&result, i, "rerank_score").unwrap();
-        eprintln!("  {}: rerank_score={:.4}", order[i], rs);
+        eprintln!("  {}: rerank_score={:.4}", title, rs);
     }
 
     // The top result should be one of the Rust articles

@@ -1105,24 +1105,23 @@ mod auto_embed_tests {
             .await?;
 
         // Insert articles — auto-embed on write fills in embedding vectors.
-        db.session()
-            .execute(
-                "CREATE (:Article {title: 'Rust Guide', \
+        let tx = db.session().tx().await?;
+        tx.execute(
+            "CREATE (:Article {title: 'Rust Guide', \
              body: 'Rust is a systems programming language focused on safety and performance'})",
-            )
-            .await?;
-        db.session()
-            .execute(
-                "CREATE (:Article {title: 'Python Intro', \
+        )
+        .await?;
+        tx.execute(
+            "CREATE (:Article {title: 'Python Intro', \
              body: 'Python is an interpreted language popular for data science and scripting'})",
-            )
-            .await?;
-        db.session()
-            .execute(
-                "CREATE (:Article {title: 'Graph Databases', \
+        )
+        .await?;
+        tx.execute(
+            "CREATE (:Article {title: 'Graph Databases', \
              body: 'Graph databases store data as nodes and edges for relationship queries'})",
-            )
-            .await?;
+        )
+        .await?;
+        tx.commit().await?;
         db.flush().await?;
 
         // Key test: similar_to with a STRING query triggers auto-embed at query time
@@ -1190,18 +1189,18 @@ mod auto_embed_tests {
             .apply()
             .await?;
 
-        db.session()
-            .execute(
-                "CREATE (:Article {title: 'Rust Guide', \
+        let tx = db.session().tx().await?;
+        tx.execute(
+            "CREATE (:Article {title: 'Rust Guide', \
              body: 'Rust is a systems programming language focused on safety and performance'})",
-            )
-            .await?;
-        db.session()
-            .execute(
-                "CREATE (:Article {title: 'Cooking Tips', \
+        )
+        .await?;
+        tx.execute(
+            "CREATE (:Article {title: 'Cooking Tips', \
              body: 'Learn how to make pasta carbonara with fresh ingredients'})",
-            )
-            .await?;
+        )
+        .await?;
+        tx.commit().await?;
         db.flush().await?;
 
         // Auto-embed 'programming' and filter by similarity threshold

@@ -50,8 +50,19 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      # Wheel-matrix metal variants don't compile on Linux (gpu-coreml /
+      # gpu-metal pull in objc2 which is Apple-only). Skip them in
+      # `--workspace` operations; they're built on macOS runners via
+      # `release-wheels.yml`.
       - name: Run clippy
-        run: cargo clippy --workspace --exclude uni-tck --all-targets -- -D warnings
+        run: |
+          cargo clippy --workspace \
+            --exclude uni-tck \
+            --exclude uni-python-onnx-metal \
+            --exclude uni-python-fastembed-metal \
+            --exclude uni-python-mistralrs-metal \
+            --exclude uni-python-all-metal \
+            --all-targets -- -D warnings
 
   # Rust tests
   rust-tests:
@@ -78,7 +89,13 @@ jobs:
           cache-on-failure: true
 
       - name: Run tests
-        run: cargo nextest run --workspace --exclude uni-tck
+        run: |
+          cargo nextest run --workspace \
+            --exclude uni-tck \
+            --exclude uni-python-onnx-metal \
+            --exclude uni-python-fastembed-metal \
+            --exclude uni-python-mistralrs-metal \
+            --exclude uni-python-all-metal
 
   # Python bindings tests
   python-tests:

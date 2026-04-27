@@ -104,7 +104,7 @@ mod tests {
             let elapsed = start.elapsed();
             latencies.push(elapsed.as_millis() as u64);
 
-            if i % 20 == 0 || (i >= 140 && i <= 170) || i == NUM_INSERTS - 1 {
+            if i % 20 == 0 || (140..=170).contains(&i) || i == NUM_INSERTS - 1 {
                 eprintln!("insert {:>4}: {:>6}ms", i, elapsed.as_millis());
             }
         }
@@ -158,7 +158,7 @@ mod tests {
             let elapsed = start.elapsed();
             latencies.push(elapsed.as_millis() as u64);
 
-            if i % 20 == 0 || (i >= 140 && i <= 170) || i == NUM_INSERTS - 1 {
+            if i % 20 == 0 || (140..=170).contains(&i) || i == NUM_INSERTS - 1 {
                 eprintln!("insert {:>4}: {:>6}ms", i, elapsed.as_millis());
             }
         }
@@ -218,7 +218,10 @@ mod tests {
             let elapsed = start.elapsed();
             latencies.push(elapsed.as_millis() as u64);
 
-            if i % 20 == 0 || (i >= 48 && i <= 55) || (i >= 140 && i <= 170) || i == NUM_INSERTS - 1
+            if i % 20 == 0
+                || (48..=55).contains(&i)
+                || (140..=170).contains(&i)
+                || i == NUM_INSERTS - 1
             {
                 eprintln!("insert {:>4}: {:>6}ms", i, elapsed.as_millis());
             }
@@ -274,7 +277,7 @@ mod tests {
             tx.commit().await?;
             let commit_ms = commit_start.elapsed().as_millis();
 
-            if i % 20 == 0 || (i >= 140 && i <= 170) || i == NUM_INSERTS - 1 {
+            if i % 20 == 0 || (140..=170).contains(&i) || i == NUM_INSERTS - 1 {
                 eprintln!(
                     "insert {:>4}: exec={:>6}ms  commit={:>6}ms  total={:>6}ms",
                     i,
@@ -323,7 +326,10 @@ mod tests {
             let elapsed = start.elapsed();
             latencies.push(elapsed.as_millis() as u64);
 
-            if i % 10 == 0 || (i >= 48 && i <= 55) || (i >= 98 && i <= 105) || i == NUM_INSERTS - 1
+            if i % 10 == 0
+                || (48..=55).contains(&i)
+                || (98..=105).contains(&i)
+                || i == NUM_INSERTS - 1
             {
                 eprintln!("insert {:>4}: {:>6}ms", i, elapsed.as_millis());
             }
@@ -527,7 +533,7 @@ async fn issue43_embed_only_no_db() -> anyhow::Result<()> {
         let elapsed = start.elapsed();
         latencies.push(elapsed.as_millis() as u64);
 
-        if i % 20 == 0 || (i >= 140 && i <= 170) || i == NUM_INSERTS - 1 {
+        if i % 20 == 0 || (140..=170).contains(&i) || i == NUM_INSERTS - 1 {
             eprintln!("embed {:>4}: {:>6}ms", i, elapsed.as_millis());
         }
     }

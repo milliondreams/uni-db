@@ -51,11 +51,29 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      # Wheel-matrix metal variants don't compile on Linux (gpu-coreml /
+      # gpu-metal pull in objc2 which is Apple-only). They are workspace
+      # members so their feature lists can use { workspace = true }, but
+      # `--workspace` operations on Linux must skip them. They're built
+      # via dedicated jobs in `release-wheels.yml` on macOS arm64 runners.
       - name: Run clippy
-        run: cargo clippy --workspace --exclude uni-tck --all-targets -- -D warnings
+        run: |
+          cargo clippy --workspace \
+            --exclude uni-tck \
+            --exclude uni-python-onnx-metal \
+            --exclude uni-python-fastembed-metal \
+            --exclude uni-python-mistralrs-metal \
+            --exclude uni-python-all-metal \
+            --all-targets -- -D warnings
 
       - name: Run tests
-        run: cargo nextest run --workspace --exclude uni-tck
+        run: |
+          cargo nextest run --workspace \
+            --exclude uni-tck \
+            --exclude uni-python-onnx-metal \
+            --exclude uni-python-fastembed-metal \
+            --exclude uni-python-mistralrs-metal \
+            --exclude uni-python-all-metal
 
       # Provider-onnx is opt-in (not in default features). The two ONNX
       # linking modes are mutually exclusive at compile time, so we test
@@ -253,7 +271,28 @@ jobs:
           cache-on-failure: true
           save-if: false
 
+      # All wheel-matrix variant crates share the same `[lib].name = "_uni_db"`
+      # (so the import name `uni_db` works across all wheels). cargo doc
+      # rejects that as a "document output filename collision," so we exclude
+      # the variants from the doc build. They have no original source — they
+      # all reuse `bindings/uni-db/src/lib.rs` via `[lib].path`, so excluding
+      # them loses no documentation content.
       - name: Build documentation
-        run: cargo doc --no-deps --workspace --exclude uni-python --exclude uni-tck
+        run: |
+          cargo doc --no-deps --workspace \
+            --exclude uni-python \
+            --exclude uni-tck \
+            --exclude uni-python-onnx \
+            --exclude uni-python-onnx-cuda \
+            --exclude uni-python-onnx-metal \
+            --exclude uni-python-fastembed \
+            --exclude uni-python-fastembed-cuda \
+            --exclude uni-python-fastembed-metal \
+            --exclude uni-python-mistralrs \
+            --exclude uni-python-mistralrs-cuda \
+            --exclude uni-python-mistralrs-metal \
+            --exclude uni-python-all \
+            --exclude uni-python-all-cuda \
+            --exclude uni-python-all-metal
         env:
           RUSTDOCFLAGS: -D warnings

@@ -25,9 +25,7 @@ def main(argv: list[str] | None = None) -> int:
     if not args or args[0] in ("check", "probe"):
         result = probe()
         print(format_report(result))
-        any_failed = any(
-            c["status"] in ("missing", "error") for c in result["checks"]
-        )
+        any_failed = any(c["status"] in ("missing", "error") for c in result["checks"])
         return 1 if any_failed else 0
 
     if args[0] == "recommend":

@@ -23,6 +23,7 @@ Run inference on the host machine. No API keys needed.
 | `local/candle` | HuggingFace Candle | Embed | Lightweight CPU embeddings (Bert, JinaBert, Gemma) |
 | `local/fastembed` | ONNX Runtime | Embed | Fastest CPU embeddings, smallest footprint |
 | `local/mistralrs` | mistral.rs | Embed, Generate | GPU inference, quantized models, multi-modal |
+| `local/onnx-reranker` | ONNX Runtime | Rerank | Local cross-encoder reranking (BERT-style models) |
 
 **Local provider options:**
 
@@ -267,6 +268,36 @@ result = xervo.generate("llm/default", [
 ])
 ```
 
+### Prefetching (Best Practice)
+
+**Always prefetch models at startup** to avoid cold-start latency on first inference. Without prefetch, the first call to `embed()`, `generate()`, or `rerank()` pays the full model load cost (download, session initialization, warmup). Subsequent calls are served from cache.
+
+```python
+xervo = db.xervo()
+
+# Prefetch specific aliases (recommended — explicit and selective)
+xervo.prefetch(["embed/default", "llm/default"])
+
+# Or prefetch everything in the catalog
+xervo.prefetch_all()
+
+# Async equivalents
+await async_db.xervo().prefetch(["embed/default"])
+await async_db.xervo().prefetch_all()
+```
+
+```rust
+// Rust
+db.xervo().prefetch(&["embed/default", "llm/default"]).await?;
+db.xervo().prefetch_all().await?;
+```
+
+Both methods are **awaitable** and **fail-fast** — they return when all requested models are fully loaded, or error on the first failure. Models already loaded are skipped.
+
+**When to use `prefetch()` vs `warmup: "Eager"`:**
+- Use **`warmup: "Eager"`** in the catalog when the model is always needed and you want startup to fail if loading fails (`required: true`)
+- Use **`prefetch()`** after startup when you want programmatic control over which models to load and when (e.g., load models conditionally based on runtime config, or load after other initialization is complete)
+
 ### Availability Check
 
 ```python
@@ -414,8 +445,23 @@ Automatic instrumentation (when metrics enabled):
 
 | Use Case | Provider | Model ID | Notes |
 |---|---|---|---|
+| **Local (CPU)** | `local/onnx-reranker` | `cross-encoder/ms-marco-MiniLM-L6-v2` | ~80MB, no API key, `provider-onnx` feature |
 | **Best quality** | `remote/voyageai` | `rerank-2` | Top-tier reranking accuracy |
 | **Cost-effective** | `remote/cohere` | `rerank-english-v3.0` | Good quality, lower cost |
+
+The `local/onnx-reranker` provider handles tokenization (WordPiece) and batched ONNX inference internally. Any BERT-style cross-encoder from HuggingFace that accepts `input_ids`, `attention_mask`, `token_type_ids` and outputs a single logit per pair should work.
+
+### Reranker API
+
+```rust
+// Via UniXervo facade
+let scored = db.xervo().rerank("rerank/minilm", "query text", &["doc1", "doc2"]).await?;
+// scored: Vec<ScoredDoc> { index, score, text }
+
+// Via search procedures (see vector-hybrid-search.md Section 11)
+// Add reranker options to any CALL procedure:
+// {reranker: 'rerank/minilm', reranker_property: 'content'}
+```
 
 ---
 
@@ -535,6 +581,7 @@ db = Uni.open("./rag_db") \
     .build()
 
 xervo = db.xervo()
+xervo.prefetch(["embed/default", "llm/default"])  # avoid cold-start on first call
 session = db.session()
 
 # Embed and insert documents
@@ -606,7 +653,7 @@ results = db.session().query("""
 
 4. **Anthropic is generate-only** -- `remote/anthropic` does not support embeddings. Use a different provider for `Embed` tasks.
 
-5. **Local models download on first use** -- `local/candle` and `local/fastembed` download models from HuggingFace on first load. Use `warmup: "Eager"` with `required: true` to catch download failures at startup rather than at first request.
+5. **Local models download on first use** -- `local/candle` and `local/fastembed` download models from HuggingFace on first load. Use `warmup: "Eager"` with `required: true` to catch download failures at startup, or call `xervo.prefetch(["alias"])` after startup to pre-load specific models before first inference.
 
 6. **API keys are read at model load time** -- Environment variables are resolved when the model is first loaded (or at startup for eager warmup), not when the database is opened.
 

@@ -69,6 +69,13 @@ test_db_*/
 /bindings/uni-db/docs/
 /bindings/uni-pydantic/docs/
 
+# Wheel-matrix variant Python source dirs — bootstrapped from
+# bindings/uni-db/uni_db/ via scripts/bootstrap-wheel-variants.sh and
+# never tracked in git. The base bindings/uni-db/uni_db/ is the source
+# of truth; matches `bindings/uni-db-*/uni_db/` (the dash after `db`
+# means the base directory does NOT match this pattern).
+/bindings/uni-db-*/uni_db/
+
 # Local binaries
 bin/
 

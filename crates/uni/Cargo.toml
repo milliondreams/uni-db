@@ -41,6 +41,9 @@ datafusion = { workspace = true }
 tokio-util = { workspace = true }
 scopeguard = "1"
 tempfile = { workspace = true }
+# Note: uni-db has no direct ort / tokenizers / hf-hub / ndarray consumers
+# after the LocalOnnxRerankerProvider hoist into uni-xervo (0.5.2). All ONNX
+# access flows through uni-xervo's provider facades.
 
 [dev-dependencies]
 criterion = "0.5"
@@ -84,5 +87,20 @@ provider-voyageai = ["uni-xervo/provider-voyageai"]
 provider-cohere = ["uni-xervo/provider-cohere"]
 provider-azure-openai = ["uni-xervo/provider-azure-openai"]
 provider-mistralrs = ["uni-xervo/provider-mistralrs"]
+# ONNX/GPU provider features — mirrors uni-xervo's 0.6.0 surface.
+# See `../../../uni-xervo/docs/migrations/0.6.0-final-feature-surface.md` for
+# the full migration story; in short, every gpu-* feature now bundles its
+# ONNX Runtime automatically at build time (via pyke or via uni-xervo's
+# build.rs MS fetcher) — no ORT_DYLIB_PATH setup at runtime for the vendors
+# that have a prebuilt distribution.
 provider-onnx = ["uni-xervo/provider-onnx"]
+provider-onnx-dynamic = ["uni-xervo/provider-onnx-dynamic"]
 gpu-cuda = ["uni-xervo/gpu-cuda"]
+gpu-tensorrt = ["uni-xervo/gpu-tensorrt"]
+gpu-rocm = ["uni-xervo/gpu-rocm"]
+gpu-coreml = ["uni-xervo/gpu-coreml"]
+gpu-directml = ["uni-xervo/gpu-directml"]
+gpu-openvino = ["uni-xervo/gpu-openvino"]
+gpu-qnn = ["uni-xervo/gpu-qnn"]
+gpu-wgpu = ["uni-xervo/gpu-wgpu"]
+gpu-metal = ["uni-xervo/gpu-metal"]

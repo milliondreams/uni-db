@@ -50,8 +50,23 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      # Wheel-matrix accelerator variants don't fit on the regular CI
+      # runner: metal variants pull in `objc2` (Apple-only); cuda variants
+      # pull in `cudarc` whose build.rs requires `nvcc`. They're built in
+      # dedicated `release-wheels.yml` jobs with the right container/runner.
       - name: Run clippy
-        run: cargo clippy --workspace --exclude uni-tck --all-targets -- -D warnings
+        run: |
+          cargo clippy --workspace \
+            --exclude uni-tck \
+            --exclude uni-python-onnx-cuda \
+            --exclude uni-python-onnx-metal \
+            --exclude uni-python-fastembed-cuda \
+            --exclude uni-python-fastembed-metal \
+            --exclude uni-python-mistralrs-cuda \
+            --exclude uni-python-mistralrs-metal \
+            --exclude uni-python-all-cuda \
+            --exclude uni-python-all-metal \
+            --all-targets -- -D warnings
 
   # Rust tests
   rust-tests:
@@ -78,7 +93,17 @@ jobs:
           cache-on-failure: true
 
       - name: Run tests
-        run: cargo nextest run --workspace --exclude uni-tck
+        run: |
+          cargo nextest run --workspace \
+            --exclude uni-tck \
+            --exclude uni-python-onnx-cuda \
+            --exclude uni-python-onnx-metal \
+            --exclude uni-python-fastembed-cuda \
+            --exclude uni-python-fastembed-metal \
+            --exclude uni-python-mistralrs-cuda \
+            --exclude uni-python-mistralrs-metal \
+            --exclude uni-python-all-cuda \
+            --exclude uni-python-all-metal
 
   # Python bindings tests
   python-tests:
@@ -150,3 +175,37 @@ jobs:
       - name: Run Python tests (uni-pydantic)
         working-directory: bindings/uni-pydantic
         run: uv run pytest tests/ -v -n auto
+
+  # CUDA wheel-graph smoke check — catches Cargo-dep-graph breakage in
+  # the `uni-db-fastembed-cuda` variant early, without paying the price
+  # of compiling its CUDA build scripts on every PR.
+  #
+  # We use `cargo metadata` instead of `cargo check` because:
+  #
+  #  - `cargo check` runs build scripts. `candle-kernels`'s build.rs
+  #    invokes `nvcc` to compile CUDA C++ kernels to PTX, and there's
+  #    no env-var bypass — it genuinely needs a working CUDA toolkit
+  #    (~3-5 GB install). Adding that to every PR run is heavy.
+  #  - `cargo metadata` only resolves features and reads Cargo.toml
+  #    files; it does not run any build scripts. Catches the "feature
+  #    X doesn't exist anymore" / "this dep is incompatible" class of
+  #    breakage that's most likely to come up in PRs.
+  #
+  # Real CUDA wheel builds (with full nvcc + cudarc + candle-kernels
+  # compilation) run in `release-wheels.yml::build-cuda-toolkit-linux`
+  # on tag-push or workflow_dispatch. Source-level CUDA-specific bugs
+  # are detected there.
+  wheels-fastembed-cuda-smoke:
+    name: Wheel-graph smoke check (uni-db-fastembed-cuda)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Resolve Cargo metadata for uni-db-fastembed-cuda
+        run: |
+          cargo metadata --format-version=1 \
+            --manifest-path bindings/uni-db-fastembed-cuda/Cargo.toml \
+            > /dev/null

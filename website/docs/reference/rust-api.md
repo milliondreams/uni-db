@@ -146,6 +146,7 @@ let db = Uni::open("./my-graph")
 | `read_only()` | Open in read-only mode (no writer created). |
 | `write_lease(lease)` | Set write lease strategy for multi-agent access. |
 | `xervo_catalog(catalog)` | Set Uni-Xervo model catalog. |
+| `xervo_runtime(runtime)` | Set pre-built Xervo `ModelRuntime` directly (for testing or advanced use). |
 | `remote_storage(url, config)` | Configure hybrid local+remote storage. |
 | `build()` | `async` -- Open the database. Returns `Result<Uni>`. |
 

@@ -1066,6 +1066,20 @@ impl Xervo {
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
         convert::generation_result_to_py(py, result)
     }
+
+    /// Pre-load and cache specific model aliases so first inference is instant.
+    fn prefetch(&self, aliases: Vec<String>) -> PyResult<()> {
+        pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(core::xervo_prefetch_core(&self.inner, aliases))
+            .map_err(crate::exceptions::uni_error_to_pyerr)
+    }
+
+    /// Pre-load and cache every model in the Xervo catalog.
+    fn prefetch_all(&self) -> PyResult<()> {
+        pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(core::xervo_prefetch_all_core(&self.inner))
+            .map_err(crate::exceptions::uni_error_to_pyerr)
+    }
 }
 
 // ============================================================================

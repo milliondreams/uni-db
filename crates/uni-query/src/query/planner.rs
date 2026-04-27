@@ -3655,6 +3655,41 @@ impl QueryPlanner {
         }
     }
 
+    /// Rewrite `id(variable)` function calls to `variable._vid` property access.
+    /// `id()` is a pass-through for `_vid` — this normalization enables predicate
+    /// pushdown since Property patterns are recognized by PredicateAnalyzer.
+    fn rewrite_id_to_vid(expr: Expr) -> Expr {
+        match expr {
+            Expr::FunctionCall {
+                name,
+                args,
+                distinct,
+                window_spec,
+            } if name.eq_ignore_ascii_case("id") && args.len() == 1 => {
+                if let Expr::Variable(ref var) = args[0] {
+                    Expr::Property(Box::new(Expr::Variable(var.clone())), "_vid".to_string())
+                } else {
+                    Expr::FunctionCall {
+                        name,
+                        args,
+                        distinct,
+                        window_spec,
+                    }
+                }
+            }
+            Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
+                left: Box::new(Self::rewrite_id_to_vid(*left)),
+                op,
+                right: Box::new(Self::rewrite_id_to_vid(*right)),
+            },
+            Expr::UnaryOp { op, expr: inner } => Expr::UnaryOp {
+                op,
+                expr: Box::new(Self::rewrite_id_to_vid(*inner)),
+            },
+            other => other,
+        }
+    }
+
     /// Plan a MATCH clause, handling both shortestPath and regular patterns.
     fn plan_match_clause(
         &self,
@@ -5299,6 +5334,9 @@ impl QueryPlanner {
         // Transform VALID_AT macro to function call
         let transformed_predicate = Self::transform_valid_at_to_function(predicate.clone());
 
+        // Rewrite id(var) to var._vid so PredicateAnalyzer can push it down
+        let transformed_predicate = Self::rewrite_id_to_vid(transformed_predicate);
+
         let mut current_predicate =
             self.rewrite_predicates_using_indexes(&transformed_predicate, &plan, vars_in_scope)?;
 
@@ -6363,6 +6401,7 @@ impl QueryPlanner {
                 variable: var,
                 ..
             } if var == variable => Some(*label_id),
+            LogicalPlan::ScanAll { variable: var, .. } if var == variable => Some(0),
             LogicalPlan::Filter { input, .. }
             | LogicalPlan::Project { input, .. }
             | LogicalPlan::Sort { input, .. }
@@ -6398,6 +6437,25 @@ impl QueryPlanner {
                 LogicalPlan::Scan {
                     label_id,
                     labels,
+                    variable: var,
+                    filter: new_filter,
+                    optional,
+                }
+            }
+            LogicalPlan::ScanAll {
+                variable: var,
+                filter,
+                optional,
+            } if var == variable => {
+                let new_filter = match filter {
+                    Some(existing) => Some(Expr::BinaryOp {
+                        left: Box::new(existing),
+                        op: BinaryOp::And,
+                        right: Box::new(predicate),
+                    }),
+                    None => Some(predicate),
+                };
+                LogicalPlan::ScanAll {
                     variable: var,
                     filter: new_filter,
                     optional,

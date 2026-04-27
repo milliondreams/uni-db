@@ -1,0 +1,44 @@
+[package]
+name = "uni-python-all"
+description = "Python bindings for Uni graph database (all providers, CPU)"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "_uni_db"
+crate-type = ["cdylib"]
+path = "../uni-db/src/lib.rs"
+
+[dependencies]
+pyo3 = { version = "0.27", features = ["extension-module", "abi3-py310"] }
+pyo3-async-runtimes = { version = "0.27", features = ["tokio-runtime"] }
+# Every provider feature. provider-openai and provider-gemini are already in
+# the workspace defaults but listed explicitly for clarity.
+uni-db = { workspace = true, features = [
+    "provider-onnx",
+    "provider-fastembed",
+    "provider-mistralrs",
+    "provider-candle",
+    "provider-openai",
+    "provider-gemini",
+    "provider-vertexai",
+    "provider-mistral",
+    "provider-anthropic",
+    "provider-voyageai",
+    "provider-cohere",
+    "provider-azure-openai",
+] }
+uni-locy = { workspace = true }
+uni-common = { workspace = true }
+uni-store = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+anyhow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+chrono = { workspace = true }
+serde_json = { workspace = true }

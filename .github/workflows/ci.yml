@@ -51,11 +51,65 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      # Wheel-matrix accelerator variants are excluded from `--workspace`
+      # operations on the regular CI runner:
+      #
+      # - The metal variants (`*-metal`) pull in `objc2` which is Apple-only
+      #   and won't compile on Linux at all.
+      # - The cuda variants (`*-cuda`) cause feature unification to activate
+      #   `gpu-cuda` on `uni-xervo`, which pulls in `cudarc` whose `build.rs`
+      #   requires `nvcc`. ubuntu-latest doesn't have CUDA installed.
+      #
+      # Both are workspace members so their feature lists can use
+      # `{ workspace = true }`, but `--workspace` operations on the regular
+      # CI runner must skip them. They get tested in dedicated jobs in
+      # `release-wheels.yml` (CUDA toolkit container for `*-cuda`, macOS
+      # arm64 runner for `*-metal`).
       - name: Run clippy
-        run: cargo clippy --workspace --exclude uni-tck --all-targets -- -D warnings
+        run: |
+          cargo clippy --workspace \
+            --exclude uni-tck \
+            --exclude uni-python-onnx-cuda \
+            --exclude uni-python-onnx-metal \
+            --exclude uni-python-fastembed-cuda \
+            --exclude uni-python-fastembed-metal \
+            --exclude uni-python-mistralrs-cuda \
+            --exclude uni-python-mistralrs-metal \
+            --exclude uni-python-all-cuda \
+            --exclude uni-python-all-metal \
+            --all-targets -- -D warnings
 
       - name: Run tests
-        run: cargo nextest run --workspace --exclude uni-tck
+        run: |
+          cargo nextest run --workspace \
+            --exclude uni-tck \
+            --exclude uni-python-onnx-cuda \
+            --exclude uni-python-onnx-metal \
+            --exclude uni-python-fastembed-cuda \
+            --exclude uni-python-fastembed-metal \
+            --exclude uni-python-mistralrs-cuda \
+            --exclude uni-python-mistralrs-metal \
+            --exclude uni-python-all-cuda \
+            --exclude uni-python-all-metal
+
+      # Provider-onnx is opt-in (not in default features). The two ONNX
+      # linking modes are mutually exclusive at compile time, so we test
+      # them in separate steps.
+      - name: Run reranker integration tests (bundled CPU ONNX)
+        # `provider-onnx` statically links pyke's CPU libonnxruntime.a — no
+        # ORT_DYLIB_PATH needed; the E2E `#[ignore]` real-ONNX tests run
+        # because the lib is in the binary.
+        run: cargo nextest run -p uni-db --features provider-onnx --test reranker_integration --run-ignored all
+
+      - name: Run reranker integration tests (load-dynamic ONNX)
+        # `provider-onnx-dynamic` requires an ONNX Runtime tarball at
+        # runtime. We download Microsoft's CPU build for CI; mock tests pass
+        # without it but we set ORT_DYLIB_PATH to keep the dep symmetrical.
+        run: |
+          curl -sSL -o /tmp/ort.tgz https://github.com/microsoft/onnxruntime/releases/download/v1.20.1/onnxruntime-linux-x64-1.20.1.tgz
+          tar xzf /tmp/ort.tgz -C /tmp
+          export ORT_DYLIB_PATH=/tmp/onnxruntime-linux-x64-1.20.1/lib/libonnxruntime.so
+          cargo nextest run -p uni-db --features provider-onnx-dynamic --test reranker_integration
 
       - name: Run TCK (schemaless + schema)
         run: |
@@ -234,7 +288,28 @@ jobs:
           cache-on-failure: true
           save-if: false
 
+      # All wheel-matrix variant crates share the same `[lib].name = "_uni_db"`
+      # (so the import name `uni_db` works across all wheels). cargo doc
+      # rejects that as a "document output filename collision," so we exclude
+      # the variants from the doc build. They have no original source — they
+      # all reuse `bindings/uni-db/src/lib.rs` via `[lib].path`, so excluding
+      # them loses no documentation content.
       - name: Build documentation
-        run: cargo doc --no-deps --workspace --exclude uni-python --exclude uni-tck
+        run: |
+          cargo doc --no-deps --workspace \
+            --exclude uni-python \
+            --exclude uni-tck \
+            --exclude uni-python-onnx \
+            --exclude uni-python-onnx-cuda \
+            --exclude uni-python-onnx-metal \
+            --exclude uni-python-fastembed \
+            --exclude uni-python-fastembed-cuda \
+            --exclude uni-python-fastembed-metal \
+            --exclude uni-python-mistralrs \
+            --exclude uni-python-mistralrs-cuda \
+            --exclude uni-python-mistralrs-metal \
+            --exclude uni-python-all \
+            --exclude uni-python-all-cuda \
+            --exclude uni-python-all-metal
         env:
           RUSTDOCFLAGS: -D warnings

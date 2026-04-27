@@ -544,6 +544,26 @@ impl AsyncXervo {
             Python::attach(|py| crate::convert::generation_result_to_py(py, result))
         })
     }
+
+    /// Pre-load and cache specific model aliases so first inference is instant.
+    fn prefetch<'py>(&self, py: Python<'py>, aliases: Vec<String>) -> PyResult<Bound<'py, PyAny>> {
+        let db = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            core::xervo_prefetch_core(&db, aliases)
+                .await
+                .map_err(crate::exceptions::uni_error_to_pyerr)
+        })
+    }
+
+    /// Pre-load and cache every model in the Xervo catalog.
+    fn prefetch_all<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let db = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            core::xervo_prefetch_all_core(&db)
+                .await
+                .map_err(crate::exceptions::uni_error_to_pyerr)
+        })
+    }
 }
 
 // ============================================================================

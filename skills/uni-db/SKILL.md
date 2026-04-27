@@ -55,7 +55,7 @@ Transaction / AsyncTransaction (write scope)
 | `db.rules()` | `RuleRegistry` | Locy rule management (register, list, remove) |
 | `db.compaction()` | `Compaction` / `AsyncCompaction` | Storage compaction |
 | `db.indexes()` | `Indexes` / `AsyncIndexes` | Index management (list, rebuild) |
-| `db.xervo()` | `Xervo` / `AsyncXervo` | ML model runtime (embed, generate) |
+| `db.xervo()` | `Xervo` / `AsyncXervo` | ML model runtime (embed, generate, prefetch) |
 
 **Key builder terminal methods:**
 

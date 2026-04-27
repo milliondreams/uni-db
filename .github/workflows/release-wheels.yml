@@ -1,0 +1,536 @@
+name: Build and Publish Wheels
+
+# Owns the uni-db Python wheel matrix.
+#
+# Currently builds and publishes the base `uni-db` wheel only. Future steps
+# extend the matrix (per `docs/proposals/python-wheel-matrix.md`) to include
+# 12 sibling variants with different cargo-feature combinations:
+#   - CPU:    uni-db-{onnx,fastembed,mistralrs,all}
+#   - CUDA:   uni-db-{onnx,fastembed,mistralrs,all}-cuda
+#   - Metal:  uni-db-{onnx,fastembed,mistralrs,all}-metal
+#
+# Runs in parallel with `release.yml`. That file owns validate-for-non-wheel,
+# tag, GitHub release, crates.io publish, and the uni-pydantic chain.
+# `build-pydantic` in `release.yml` polls PyPI for the published `uni-db`
+# version, so it doesn't need a job-graph dependency on this workflow.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g. 0.1.0). Required for manual dispatch.'
+        required: true
+        type: string
+      dry_run:
+        description: 'Build and validate without publishing'
+        type: boolean
+        default: false
+      target:
+        description: 'Publish target (ignored for dry_run)'
+        type: choice
+        options: [pypi, testpypi]
+        default: testpypi
+  push:
+    tags: ['v*.*.*']
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.set-version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set version
+        id: set-version
+        run: |
+          if [ "${{ github.event_name }}" == "push" ]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+          else
+            VERSION="${{ inputs.version }}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Version: $VERSION"
+
+      - name: Check version consistency across all wheel-matrix pyprojects
+        env:
+          VERSION: ${{ steps.set-version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          if [ "$VERSION" != "$CARGO_VERSION" ]; then
+            echo "Error: Input version ($VERSION) does not match Cargo.toml ($CARGO_VERSION)"
+            exit 1
+          fi
+
+          # Every wheel-matrix sibling pyproject shares the same lock-step
+          # version. This list must be kept in sync with workspace members
+          # under `bindings/uni-db*/`.
+          for pyproject in \
+            bindings/uni-db/pyproject.toml \
+            bindings/uni-db-onnx/pyproject.toml \
+            bindings/uni-db-onnx-cuda/pyproject.toml \
+            bindings/uni-db-onnx-metal/pyproject.toml \
+            bindings/uni-db-fastembed/pyproject.toml \
+            bindings/uni-db-fastembed-cuda/pyproject.toml \
+            bindings/uni-db-fastembed-metal/pyproject.toml \
+            bindings/uni-db-mistralrs/pyproject.toml \
+            bindings/uni-db-mistralrs-cuda/pyproject.toml \
+            bindings/uni-db-mistralrs-metal/pyproject.toml \
+            bindings/uni-db-all/pyproject.toml \
+            bindings/uni-db-all-cuda/pyproject.toml \
+            bindings/uni-db-all-metal/pyproject.toml; do
+            PYPI_VERSION=$(grep '^version' "$pyproject" | head -1 | sed 's/.*"\(.*\)".*/\1/')
+            if [ "$VERSION" != "$PYPI_VERSION" ]; then
+              echo "Error: Input version ($VERSION) does not match $pyproject ($PYPI_VERSION)"
+              exit 1
+            fi
+            echo "OK: $pyproject = $PYPI_VERSION"
+          done
+
+  # Build matrix: at Step 2 we ship only the base `uni-db` wheel. Subsequent
+  # steps extend the matrix by adding new entries to a `variant` axis, each
+  # pointing at a different `bindings/uni-db-<variant>/Cargo.toml`.
+
+  build-linux:
+    name: Build ${{ matrix.variant }} Linux wheels (${{ matrix.target }})
+    needs: [validate]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [uni-db, uni-db-onnx, uni-db-fastembed, uni-db-mistralrs, uni-db-all]
+        target: [x86_64, aarch64]
+        include:
+          - target: x86_64
+            runner: ubuntu-latest
+          - target: aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Bootstrap variant Python sources
+        if: matrix.variant != 'uni-db'
+        shell: bash
+        run: ./scripts/bootstrap-wheel-variants.sh
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        env:
+          # .cargo/config.toml sets -fuse-ld=mold for Linux, but mold is not
+          # available inside the manylinux container — clear it here.
+          RUSTFLAGS: ""
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist -m bindings/${{ matrix.variant }}/Cargo.toml
+          manylinux: 2_28
+          before-script-linux: |
+            yum install -y openssl-devel unzip
+            PROTOC_VERSION="28.3"
+            if [ "$(uname -m)" = "aarch64" ]; then
+              PROTOC_ARCH="linux-aarch_64"
+            else
+              PROTOC_ARCH="linux-x86_64"
+            fi
+            curl -sSLO "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-${PROTOC_ARCH}.zip"
+            unzip -q "protoc-${PROTOC_VERSION}-${PROTOC_ARCH}.zip" -d /usr/local
+            rm "protoc-${PROTOC_VERSION}-${PROTOC_ARCH}.zip"
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.variant }}-linux-${{ matrix.target }}
+          path: dist
+
+  build-macos:
+    name: Build ${{ matrix.variant }} macOS wheels (${{ matrix.target }})
+    needs: [validate]
+    runs-on: macos-latest-large
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [uni-db, uni-db-onnx, uni-db-fastembed, uni-db-mistralrs, uni-db-all]
+        target: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install protobuf
+        run: brew install protobuf
+
+      - name: Bootstrap variant Python sources
+        if: matrix.variant != 'uni-db'
+        shell: bash
+        run: ./scripts/bootstrap-wheel-variants.sh
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}-apple-darwin
+          args: --release --out dist -m bindings/${{ matrix.variant }}/Cargo.toml
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.variant }}-macos-${{ matrix.target }}
+          path: dist
+
+  # macOS arm64 builds with Apple-platform GPU acceleration. ORT-using
+  # variants (`*-metal`) get `gpu-coreml` for the CoreML execution provider;
+  # the CoreML EP is statically linked into pyke's macOS bundle, so no
+  # separate sidecar `.dylib` ships in the wheel. candle/mistralrs-using
+  # variants (Step 6+) get `gpu-metal` for candle's Metal kernels (compiled
+  # to `.metallib` and baked into the binary at build time).
+  #
+  # Apple Silicon only — macOS x86_64 isn't a target because the
+  # Metal/CoreML stacks aren't worth supporting separately for retired
+  # Intel Macs.
+  build-metal:
+    name: Build ${{ matrix.variant }} macOS wheels (aarch64)
+    needs: [validate]
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [uni-db-onnx-metal, uni-db-fastembed-metal, uni-db-mistralrs-metal, uni-db-all-metal]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install protobuf
+        run: brew install protobuf
+
+      - name: Bootstrap variant Python sources
+        shell: bash
+        run: ./scripts/bootstrap-wheel-variants.sh
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: aarch64-apple-darwin
+          args: --release --strip --out dist -m bindings/${{ matrix.variant }}/Cargo.toml
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.variant }}-macos-aarch64
+          path: dist
+
+  build-windows:
+    name: Build ${{ matrix.variant }} Windows wheels (x86_64)
+    needs: [validate]
+    runs-on: windows-latest-l
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [uni-db, uni-db-onnx, uni-db-fastembed, uni-db-mistralrs, uni-db-all]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install protobuf
+        run: choco install protoc
+
+      - name: Bootstrap variant Python sources
+        if: matrix.variant != 'uni-db'
+        shell: bash
+        run: ./scripts/bootstrap-wheel-variants.sh
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: x86_64-pc-windows-msvc
+          args: --release --out dist -m bindings/${{ matrix.variant }}/Cargo.toml
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.variant }}-windows-x86_64
+          path: dist
+
+  # CUDA-equipped Linux builds. Currently uses the same manylinux_2_28
+  # container as `build-linux` because `uni-db-fastembed-cuda` doesn't need
+  # nvcc — pyke's `ort/download-binaries` fetches a prebuilt CUDA EP sidecar
+  # (`libonnxruntime_providers_cuda.so` ~180 MB) at Rust build time.
+  #
+  # When `uni-db-mistralrs-cuda` lands in Step 6, candle's CUDA kernels need
+  # `nvcc` for per-SM PTX compilation — switch the container at that point
+  # to one with the CUDA toolkit installed (e.g.
+  # `nvidia/cuda:13.0.0-devel-rockylinux9` for manylinux_2_34 compatibility).
+  # See `docs/proposals/python-wheel-matrix.md` open question #1.
+  build-cuda-linux:
+    name: Build ${{ matrix.variant }} Linux wheels (x86_64, CUDA)
+    needs: [validate]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [uni-db-onnx-cuda, uni-db-fastembed-cuda]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Bootstrap variant Python sources
+        shell: bash
+        run: ./scripts/bootstrap-wheel-variants.sh
+
+      # We build with `--auditwheel skip` because auditwheel's default repair
+      # bundles every NEEDED shared library into the wheel, including the
+      # CUDA driver lib (`libcuda.so.1`) and CUDA runtime/math libs
+      # (`libcudart`, `libcublas`, `libcublasLt`, `libcurand`, `libnvrtc`,
+      # plus `libcudnn` once it's in the picture). Those are *host-supplied*
+      # — bundling them produces 620+ MB wheels that exceed PyPI's per-file
+      # limit and risk runtime conflicts with the user's NVIDIA driver
+      # install. The post-build repair step below excludes them.
+      #
+      # See `docs/proposals/python-wheel-matrix.md` "What is not bundled"
+      # for the canonical list.
+      - name: Build wheels (skip auditwheel)
+        uses: PyO3/maturin-action@v1
+        env:
+          RUSTFLAGS: ""
+        with:
+          target: x86_64
+          args: --release --strip --auditwheel skip --out dist-raw -m bindings/${{ matrix.variant }}/Cargo.toml
+          manylinux: 2_28
+          before-script-linux: |
+            yum install -y openssl-devel unzip
+            PROTOC_VERSION="28.3"
+            curl -sSLO "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+            unzip -q "protoc-${PROTOC_VERSION}-linux-x86_64.zip" -d /usr/local
+            rm "protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+
+      - name: Repair wheel with CUDA host-lib excludes
+        run: |
+          set -euo pipefail
+          pip install auditwheel patchelf
+          mkdir -p dist
+          # CUDA driver, runtime, and math libs are host-supplied via the
+          # user's NVIDIA driver / CUDA toolkit install. cuDNN is also
+          # host-supplied (see uni-xervo build.rs warning). Exclude all of
+          # them from the wheel so they're left as runtime-resolved
+          # NEEDED entries rather than bundled.
+          for whl in dist-raw/*.whl; do
+            auditwheel repair \
+              --plat manylinux_2_28_x86_64 \
+              --wheel-dir dist \
+              --exclude 'libcuda.so.*' \
+              --exclude 'libcudart.so.*' \
+              --exclude 'libcublas.so.*' \
+              --exclude 'libcublasLt.so.*' \
+              --exclude 'libcurand.so.*' \
+              --exclude 'libcudnn.so.*' \
+              --exclude 'libnvrtc.so.*' \
+              --exclude 'libnvJitLink.so.*' \
+              "$whl"
+          done
+          ls -lh dist/
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.variant }}-linux-x86_64
+          path: dist
+
+  # CUDA Linux builds that need `nvcc` (candle's per-SM PTX compilation).
+  # Currently `uni-db-mistralrs-cuda`; Step 7 adds `uni-db-all-cuda`.
+  #
+  # Uses manylinux_2_34 (AlmaLinux 9 base) instead of manylinux_2_28
+  # because the CUDA 13.0 toolkit is published as RHEL/AlmaLinux 9 RPMs
+  # by NVIDIA. Trade-off: marginally narrower runtime compatibility
+  # (excludes EL8 / Ubuntu 18.04-class hosts), but those Linux distros
+  # are EOL and unlikely to have driver 580+ anyway.
+  #
+  # `before-script-linux` adds NVIDIA's CUDA repo and installs the
+  # toolkit into `/usr/local/cuda-13.0/`; the `bin` dir is exported via
+  # `export PATH=...`, which propagates to the maturin step inside the
+  # same container session.
+  build-cuda-toolkit-linux:
+    name: Build ${{ matrix.variant }} Linux wheels (x86_64, CUDA toolkit)
+    needs: [validate]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # uni-db-all-cuda also needs nvcc because it bundles candle/mistralrs
+        # alongside the ORT CUDA path.
+        variant: [uni-db-mistralrs-cuda, uni-db-all-cuda]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Bootstrap variant Python sources
+        shell: bash
+        run: ./scripts/bootstrap-wheel-variants.sh
+
+      - name: Build wheels (skip auditwheel)
+        uses: PyO3/maturin-action@v1
+        env:
+          RUSTFLAGS: ""
+        with:
+          target: x86_64
+          args: --release --strip --auditwheel skip --out dist-raw -m bindings/${{ matrix.variant }}/Cargo.toml
+          manylinux: 2_34
+          before-script-linux: |
+            set -euxo pipefail
+            dnf install -y openssl-devel unzip dnf-plugins-core
+            PROTOC_VERSION="28.3"
+            curl -sSLO "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+            unzip -q "protoc-${PROTOC_VERSION}-linux-x86_64.zip" -d /usr/local
+            rm "protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+            # Install CUDA 13.0 toolkit from NVIDIA's RHEL 9 repo. AlmaLinux 9
+            # is binary-compatible with RHEL 9.
+            dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel9/x86_64/cuda-rhel9.repo
+            dnf install -y cuda-toolkit-13-0
+            export PATH="/usr/local/cuda-13.0/bin:$PATH"
+            export CUDA_HOME="/usr/local/cuda-13.0"
+            nvcc --version
+
+      - name: Repair wheel with CUDA host-lib excludes
+        run: |
+          set -euo pipefail
+          pip install auditwheel patchelf
+          mkdir -p dist
+          # Same exclude list as `build-cuda-linux`. Note: candle's CUDA
+          # path uses `cudarc` which dlopens libcudart at runtime; that's
+          # host-supplied so we exclude it. cuBLAS/cuRAND are pulled in
+          # transitively for matrix ops.
+          for whl in dist-raw/*.whl; do
+            auditwheel repair \
+              --plat manylinux_2_34_x86_64 \
+              --wheel-dir dist \
+              --exclude 'libcuda.so.*' \
+              --exclude 'libcudart.so.*' \
+              --exclude 'libcublas.so.*' \
+              --exclude 'libcublasLt.so.*' \
+              --exclude 'libcurand.so.*' \
+              --exclude 'libcudnn.so.*' \
+              --exclude 'libnvrtc.so.*' \
+              --exclude 'libnvJitLink.so.*' \
+              "$whl"
+          done
+          ls -lh dist/
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.variant }}-linux-x86_64
+          path: dist
+
+  build-sdist:
+    name: Build ${{ matrix.variant }} source distribution
+    needs: [validate]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [uni-db, uni-db-onnx, uni-db-fastembed, uni-db-mistralrs, uni-db-all]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bootstrap variant Python sources
+        if: matrix.variant != 'uni-db'
+        shell: bash
+        run: ./scripts/bootstrap-wheel-variants.sh
+
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist -m bindings/${{ matrix.variant }}/Cargo.toml
+
+      - name: Upload sdist
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.variant }}-sdist
+          path: dist
+
+  publish-testpypi:
+    name: Publish uni-db wheels to TestPyPI
+    needs: [build-linux, build-cuda-linux, build-cuda-toolkit-linux, build-macos, build-metal, build-windows, build-sdist]
+    runs-on: ubuntu-latest
+    environment: testpypi
+    permissions:
+      id-token: write
+    if: github.event_name == 'workflow_dispatch' && inputs.target == 'testpypi'
+    steps:
+      - name: Download all wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-uni-db-*
+          path: dist
+          merge-multiple: true
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Publish to TestPyPI (dry run)
+        if: inputs.dry_run == true
+        run: uv publish --dry-run --publish-url https://test.pypi.org/legacy/ dist/*
+
+      - name: Publish to TestPyPI
+        if: inputs.dry_run != true
+        run: uv publish --trusted-publishing always --check-url https://test.pypi.org/simple/ --publish-url https://test.pypi.org/legacy/ dist/*
+
+  publish-pypi:
+    name: Publish uni-db wheels to PyPI
+    needs: [build-linux, build-cuda-linux, build-cuda-toolkit-linux, build-macos, build-metal, build-windows, build-sdist]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.target == 'pypi')
+    steps:
+      - name: Download all wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-uni-db-*
+          path: dist
+          merge-multiple: true
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Publish to PyPI (dry run)
+        if: inputs.dry_run == true
+        run: uv publish --dry-run dist/*
+
+      - name: Publish to PyPI
+        if: inputs.dry_run != true
+        run: uv publish --trusted-publishing always --check-url https://pypi.org/simple/ dist/*

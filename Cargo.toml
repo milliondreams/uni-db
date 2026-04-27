@@ -9,6 +9,21 @@ members = [
     "crates/uni",
     "crates/uni-crdt",
     "bindings/uni-db",
+    # Wheel-matrix sibling crates — share `bindings/uni-db/src/lib.rs` via
+    # `[lib].path`; differ only in the cargo features they activate. See
+    # `docs/proposals/python-wheel-matrix.md`.
+    "bindings/uni-db-onnx",
+    "bindings/uni-db-onnx-cuda",
+    "bindings/uni-db-onnx-metal",
+    "bindings/uni-db-fastembed",
+    "bindings/uni-db-fastembed-cuda",
+    "bindings/uni-db-fastembed-metal",
+    "bindings/uni-db-mistralrs",
+    "bindings/uni-db-mistralrs-cuda",
+    "bindings/uni-db-mistralrs-metal",
+    "bindings/uni-db-all",
+    "bindings/uni-db-all-cuda",
+    "bindings/uni-db-all-metal",
     "crates/uni-cypher",
     "crates/uni-tck",
     "crates/uni-locy-tck",
@@ -31,7 +46,7 @@ default-members = [
 resolver = "2"
 
 [workspace.package]
-version = "1.1.1"
+version = "1.2.0"
 edition = "2024"
 authors = ["Dragonscale Industries Inc. <dev@dragonscale.ai>"]
 license = "Apache-2.0"
@@ -42,16 +57,16 @@ keywords = ["graph", "database", "cypher", "vector", "embedded"]
 categories = ["database", "data-structures"]
 
 [workspace.dependencies]
-uni-common = { path = "crates/uni-common", version = "1.1.0" }
-uni-store = { path = "crates/uni-store", version = "1.1.0" }
-uni-algo = { path = "crates/uni-algo", version = "1.1.0" }
-uni-query = { path = "crates/uni-query", version = "1.1.0" }
-uni-cli = { path = "crates/uni-cli", version = "1.1.0" }
-uni-db = { path = "crates/uni", version = "1.1.0" }
-uni-crdt = { path = "crates/uni-crdt", version = "1.1.0" }
-uni-cypher = { path = "crates/uni-cypher", version = "1.1.0" }
-uni-locy = { path = "crates/uni-locy", version = "1.1.0" }
-uni-btic = { path = "crates/uni-btic", version = "1.1.0" }
+uni-common = { path = "crates/uni-common", version = "1.2.0" }
+uni-store = { path = "crates/uni-store", version = "1.2.0" }
+uni-algo = { path = "crates/uni-algo", version = "1.2.0" }
+uni-query = { path = "crates/uni-query", version = "1.2.0" }
+uni-cli = { path = "crates/uni-cli", version = "1.2.0" }
+uni-db = { path = "crates/uni", version = "1.2.0" }
+uni-crdt = { path = "crates/uni-crdt", version = "1.2.0" }
+uni-cypher = { path = "crates/uni-cypher", version = "1.2.0" }
+uni-locy = { path = "crates/uni-locy", version = "1.2.0" }
+uni-btic = { path = "crates/uni-btic", version = "1.2.0" }
 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -95,7 +110,7 @@ url = "2.5"
 proptest = "1.4"
 datafusion = "52.3.0"
 lancedb = { version = "=0.27.1", default-features = false, features = ["aws", "gcs", "azure"] }
-uni-xervo = { version = "0.5.0", default-features = false }
+uni-xervo = { version = "0.7.0", default-features = false }
 biodivine-lib-bdd = "0.5"
 candle-core = "0.9.2"
 candle-nn = "0.9.2"

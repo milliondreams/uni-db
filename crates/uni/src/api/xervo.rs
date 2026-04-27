@@ -8,10 +8,10 @@ use uni_common::{Result, UniError};
 use uni_xervo::runtime::ModelRuntime;
 pub use uni_xervo::traits::{
     AudioOutput, ContentBlock, GeneratedImage, GenerationOptions, GenerationResult, ImageInput,
-    Message, MessageRole, TokenUsage,
+    Message, MessageRole, RerankerModel, ScoredDoc, TokenUsage,
 };
 #[cfg(feature = "provider-onnx")]
-pub use uni_xervo::traits::{OnnxRunner, TensorBatch, TensorSpec, TensorValue};
+pub use uni_xervo::traits::{RawTensorModel, TensorBatch, TensorSpec, TensorValue};
 
 fn into_uni_error<E: std::fmt::Display>(err: E) -> UniError {
     UniError::Internal(anyhow::anyhow!(err.to_string()))
@@ -74,7 +74,7 @@ impl UniXervo {
         self.generate(alias, &structured, options).await
     }
 
-    /// Obtain an [`OnnxRunner`] for the given model alias.
+    /// Obtain an [`RawTensorModel`] for the given model alias.
     ///
     /// The runner provides tensor-in/tensor-out ONNX inference via the
     /// [`LocalOnnxProvider`](uni_xervo::provider::LocalOnnxProvider).
@@ -85,9 +85,57 @@ impl UniXervo {
     /// Returns [`UniError`] if the runtime is not configured or the alias
     /// is not registered in the catalog.
     #[cfg(feature = "provider-onnx")]
-    pub async fn onnx_runner(&self, alias: &str) -> Result<Arc<dyn uni_xervo::traits::OnnxRunner>> {
+    pub async fn raw_tensor_model(
+        &self,
+        alias: &str,
+    ) -> Result<Arc<dyn uni_xervo::traits::RawTensorModel>> {
         let runtime = self.runtime.as_ref().ok_or_else(not_configured)?;
-        runtime.onnx_runner(alias).await.map_err(into_uni_error)
+        runtime
+            .raw_tensor_model(alias)
+            .await
+            .map_err(into_uni_error)
+    }
+
+    /// Rerank documents against a query using a configured cross-encoder model.
+    ///
+    /// Returns [`ScoredDoc`]s sorted by relevance score (descending).
+    /// The model alias must point to a catalog entry with `task: Rerank`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UniError`] if the runtime is not configured, the alias
+    /// is not registered, or inference fails.
+    pub async fn rerank(
+        &self,
+        alias: &str,
+        query: &str,
+        documents: &[&str],
+    ) -> Result<Vec<uni_xervo::traits::ScoredDoc>> {
+        let runtime = self.runtime.as_ref().ok_or_else(not_configured)?;
+        let reranker = runtime.reranker(alias).await.map_err(into_uni_error)?;
+        reranker
+            .rerank(query, documents)
+            .await
+            .map_err(into_uni_error)
+    }
+
+    /// Pre-load and cache every model in the Xervo catalog.
+    ///
+    /// Models already loaded are skipped. Fails fast on the first error.
+    /// Call this during application startup to avoid cold-start latency on
+    /// first inference.
+    pub async fn prefetch_all(&self) -> Result<()> {
+        let runtime = self.runtime.as_ref().ok_or_else(not_configured)?;
+        runtime.prefetch_all().await.map_err(into_uni_error)
+    }
+
+    /// Pre-load and cache specific model aliases.
+    ///
+    /// Returns an error immediately if an alias is not found in the catalog
+    /// or if any model fails to load. Models already loaded are skipped.
+    pub async fn prefetch(&self, aliases: &[&str]) -> Result<()> {
+        let runtime = self.runtime.as_ref().ok_or_else(not_configured)?;
+        runtime.prefetch(aliases).await.map_err(into_uni_error)
     }
 
     /// Access the underlying Uni-Xervo runtime, if configured.

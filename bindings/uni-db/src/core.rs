@@ -328,6 +328,18 @@ pub async fn xervo_generate_core(
     xervo.generate(alias, &rust_messages, opts).await
 }
 
+/// Pre-load and cache specific Xervo model aliases.
+pub async fn xervo_prefetch_core(db: &Uni, aliases: Vec<String>) -> Result<(), UniError> {
+    let xervo = db.xervo();
+    let alias_refs: Vec<&str> = aliases.iter().map(|s| s.as_str()).collect();
+    xervo.prefetch(&alias_refs).await
+}
+
+/// Pre-load and cache every model in the Xervo catalog.
+pub async fn xervo_prefetch_all_core(db: &Uni) -> Result<(), UniError> {
+    db.xervo().prefetch_all().await
+}
+
 // ============================================================================
 // Snapshot Core
 // ============================================================================

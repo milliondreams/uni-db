@@ -1,0 +1,281 @@
+name: Build and Publish Wheels
+
+# Owns the uni-db Python wheel matrix.
+#
+# Currently builds and publishes the base `uni-db` wheel only. Future steps
+# extend the matrix (per `docs/proposals/python-wheel-matrix.md`) to include
+# 12 sibling variants with different cargo-feature combinations:
+#   - CPU:    uni-db-{onnx,fastembed,mistralrs,all}
+#   - CUDA:   uni-db-{onnx,fastembed,mistralrs,all}-cuda
+#   - Metal:  uni-db-{onnx,fastembed,mistralrs,all}-metal
+#
+# Runs in parallel with `release.yml`. That file owns validate-for-non-wheel,
+# tag, GitHub release, crates.io publish, and the uni-pydantic chain.
+# `build-pydantic` in `release.yml` polls PyPI for the published `uni-db`
+# version, so it doesn't need a job-graph dependency on this workflow.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g. 0.1.0). Required for manual dispatch.'
+        required: true
+        type: string
+      dry_run:
+        description: 'Build and validate without publishing'
+        type: boolean
+        default: false
+      target:
+        description: 'Publish target (ignored for dry_run)'
+        type: choice
+        options: [pypi, testpypi]
+        default: testpypi
+  push:
+    tags: ['v*.*.*']
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.set-version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set version
+        id: set-version
+        run: |
+          if [ "${{ github.event_name }}" == "push" ]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+          else
+            VERSION="${{ inputs.version }}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Version: $VERSION"
+
+      - name: Check version consistency across all wheel-matrix pyprojects
+        env:
+          VERSION: ${{ steps.set-version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          if [ "$VERSION" != "$CARGO_VERSION" ]; then
+            echo "Error: Input version ($VERSION) does not match Cargo.toml ($CARGO_VERSION)"
+            exit 1
+          fi
+
+          # Every wheel-matrix sibling pyproject shares the same lock-step
+          # version. This list must be kept in sync with workspace members
+          # under `bindings/uni-db*/`.
+          for pyproject in \
+            bindings/uni-db/pyproject.toml \
+            bindings/uni-db-onnx/pyproject.toml \
+            bindings/uni-db-onnx-cuda/pyproject.toml \
+            bindings/uni-db-onnx-metal/pyproject.toml \
+            bindings/uni-db-fastembed/pyproject.toml \
+            bindings/uni-db-fastembed-cuda/pyproject.toml \
+            bindings/uni-db-fastembed-metal/pyproject.toml \
+            bindings/uni-db-mistralrs/pyproject.toml \
+            bindings/uni-db-mistralrs-cuda/pyproject.toml \
+            bindings/uni-db-mistralrs-metal/pyproject.toml \
+            bindings/uni-db-all/pyproject.toml \
+            bindings/uni-db-all-cuda/pyproject.toml \
+            bindings/uni-db-all-metal/pyproject.toml; do
+            PYPI_VERSION=$(grep '^version' "$pyproject" | head -1 | sed 's/.*"\(.*\)".*/\1/')
+            if [ "$VERSION" != "$PYPI_VERSION" ]; then
+              echo "Error: Input version ($VERSION) does not match $pyproject ($PYPI_VERSION)"
+              exit 1
+            fi
+            echo "OK: $pyproject = $PYPI_VERSION"
+          done
+
+  # Build matrix: at Step 2 we ship only the base `uni-db` wheel. Subsequent
+  # steps extend the matrix by adding new entries to a `variant` axis, each
+  # pointing at a different `bindings/uni-db-<variant>/Cargo.toml`.
+
+  build-linux:
+    name: Build uni-db Linux wheels (${{ matrix.target }})
+    needs: [validate]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - target: x86_64
+            runner: ubuntu-latest
+          - target: aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        env:
+          # .cargo/config.toml sets -fuse-ld=mold for Linux, but mold is not
+          # available inside the manylinux container — clear it here.
+          RUSTFLAGS: ""
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist -m bindings/uni-db/Cargo.toml
+          manylinux: 2_28
+          before-script-linux: |
+            yum install -y openssl-devel unzip
+            PROTOC_VERSION="28.3"
+            if [ "$(uname -m)" = "aarch64" ]; then
+              PROTOC_ARCH="linux-aarch_64"
+            else
+              PROTOC_ARCH="linux-x86_64"
+            fi
+            curl -sSLO "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-${PROTOC_ARCH}.zip"
+            unzip -q "protoc-${PROTOC_VERSION}-${PROTOC_ARCH}.zip" -d /usr/local
+            rm "protoc-${PROTOC_VERSION}-${PROTOC_ARCH}.zip"
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-uni-db-linux-${{ matrix.target }}
+          path: dist
+
+  build-macos:
+    name: Build uni-db macOS wheels (${{ matrix.target }})
+    needs: [validate]
+    runs-on: macos-latest-large
+    strategy:
+      matrix:
+        target: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install protobuf
+        run: brew install protobuf
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}-apple-darwin
+          args: --release --out dist -m bindings/uni-db/Cargo.toml
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-uni-db-macos-${{ matrix.target }}
+          path: dist
+
+  build-windows:
+    name: Build uni-db Windows wheels (x86_64)
+    needs: [validate]
+    runs-on: windows-latest-l
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install protobuf
+        run: choco install protoc
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: x86_64-pc-windows-msvc
+          args: --release --out dist -m bindings/uni-db/Cargo.toml
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-uni-db-windows-x86_64
+          path: dist
+
+  build-sdist:
+    name: Build uni-db source distribution
+    needs: [validate]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist -m bindings/uni-db/Cargo.toml
+
+      - name: Upload sdist
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-uni-db-sdist
+          path: dist
+
+  publish-testpypi:
+    name: Publish uni-db wheels to TestPyPI
+    needs: [build-linux, build-macos, build-windows, build-sdist]
+    runs-on: ubuntu-latest
+    environment: testpypi
+    permissions:
+      id-token: write
+    if: github.event_name == 'workflow_dispatch' && inputs.target == 'testpypi'
+    steps:
+      - name: Download all wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-uni-db-*
+          path: dist
+          merge-multiple: true
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Publish to TestPyPI (dry run)
+        if: inputs.dry_run == true
+        run: uv publish --dry-run --publish-url https://test.pypi.org/legacy/ dist/*
+
+      - name: Publish to TestPyPI
+        if: inputs.dry_run != true
+        run: uv publish --trusted-publishing always --check-url https://test.pypi.org/simple/ --publish-url https://test.pypi.org/legacy/ dist/*
+
+  publish-pypi:
+    name: Publish uni-db wheels to PyPI
+    needs: [build-linux, build-macos, build-windows, build-sdist]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.target == 'pypi')
+    steps:
+      - name: Download all wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-uni-db-*
+          path: dist
+          merge-multiple: true
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Publish to PyPI (dry run)
+        if: inputs.dry_run == true
+        run: uv publish --dry-run dist/*
+
+      - name: Publish to PyPI
+        if: inputs.dry_run != true
+        run: uv publish --trusted-publishing always --check-url https://pypi.org/simple/ dist/*

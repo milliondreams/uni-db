@@ -1,5 +1,17 @@
 name: Release
 
+# Owns the non-wheel parts of a release:
+#   - version/CI validation
+#   - tag creation
+#   - GitHub release notes
+#   - crates.io publish (Rust crates)
+#   - uni-pydantic build + publish (depends on uni-db being on PyPI)
+#
+# Wheel build + publish lives in `release-wheels.yml`, which runs in parallel
+# on the same triggers. `build-pydantic` below polls PyPI for the published
+# `uni-db` version, so it doesn't need a job-graph dependency on the wheels
+# workflow — it just retries until the wheel lands on the index.
+
 on:
   workflow_dispatch:
     inputs:
@@ -53,38 +65,44 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Version: $VERSION"
 
-      - name: Check version consistency
+      - name: Check version consistency across all wheel-matrix pyprojects
         env:
           VERSION: ${{ steps.set-version.outputs.version }}
         run: |
-          # Get version from workspace Cargo.toml
+          set -euo pipefail
+
           CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-
-          # Get version from uni-db pyproject.toml
-          PYPI_VERSION=$(grep '^version' bindings/uni-db/pyproject.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-
-          # Get version from uni-pydantic pyproject.toml
-          PYDANTIC_VERSION=$(grep '^version' bindings/uni-pydantic/pyproject.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-
-          echo "Input version: $VERSION"
-          echo "Cargo.toml version: $CARGO_VERSION"
-          echo "uni-db pyproject.toml version: $PYPI_VERSION"
-          echo "uni-pydantic pyproject.toml version: $PYDANTIC_VERSION"
-
           if [ "$VERSION" != "$CARGO_VERSION" ]; then
             echo "Error: Input version ($VERSION) does not match Cargo.toml ($CARGO_VERSION)"
             exit 1
           fi
 
-          if [ "$VERSION" != "$PYPI_VERSION" ]; then
-            echo "Error: Input version ($VERSION) does not match uni-db pyproject.toml ($PYPI_VERSION)"
-            exit 1
-          fi
-
-          if [ "$VERSION" != "$PYDANTIC_VERSION" ]; then
-            echo "Error: Input version ($VERSION) does not match uni-pydantic pyproject.toml ($PYDANTIC_VERSION)"
-            exit 1
-          fi
+          # Every wheel-matrix sibling pyproject + uni-pydantic shares the
+          # same lock-step version. Keep this list in sync with workspace
+          # members under `bindings/uni-db*/`. The wheel build workflow
+          # (`release-wheels.yml`) runs the same check independently.
+          for pyproject in \
+            bindings/uni-db/pyproject.toml \
+            bindings/uni-db-onnx/pyproject.toml \
+            bindings/uni-db-onnx-cuda/pyproject.toml \
+            bindings/uni-db-onnx-metal/pyproject.toml \
+            bindings/uni-db-fastembed/pyproject.toml \
+            bindings/uni-db-fastembed-cuda/pyproject.toml \
+            bindings/uni-db-fastembed-metal/pyproject.toml \
+            bindings/uni-db-mistralrs/pyproject.toml \
+            bindings/uni-db-mistralrs-cuda/pyproject.toml \
+            bindings/uni-db-mistralrs-metal/pyproject.toml \
+            bindings/uni-db-all/pyproject.toml \
+            bindings/uni-db-all-cuda/pyproject.toml \
+            bindings/uni-db-all-metal/pyproject.toml \
+            bindings/uni-pydantic/pyproject.toml; do
+            PYPI_VERSION=$(grep '^version' "$pyproject" | head -1 | sed 's/.*"\(.*\)".*/\1/')
+            if [ "$VERSION" != "$PYPI_VERSION" ]; then
+              echo "Error: Input version ($VERSION) does not match $pyproject ($PYPI_VERSION)"
+              exit 1
+            fi
+            echo "OK: $pyproject = $PYPI_VERSION"
+          done
 
           echo "All versions match: $VERSION"
 
@@ -210,191 +228,24 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.UNI_CRATES_IO }}
 
-  build-linux:
-    name: Build uni-db Linux wheels (${{ matrix.target }})
-    needs: [validate]
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      matrix:
-        include:
-          - target: x86_64
-            runner: ubuntu-latest
-          - target: aarch64
-            runner: ubuntu-24.04-arm
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Build wheels
-        uses: PyO3/maturin-action@v1
-        env:
-          # .cargo/config.toml sets -fuse-ld=mold for Linux, but mold is not
-          # available inside the manylinux container — clear it here.
-          RUSTFLAGS: ""
-        with:
-          target: ${{ matrix.target }}
-          args: --release --out dist -m bindings/uni-db/Cargo.toml
-          manylinux: 2_28
-          before-script-linux: |
-            # Both x86_64 and aarch64 run natively inside manylinux_2_28 (AlmaLinux 8)
-            yum install -y openssl-devel unzip
-            PROTOC_VERSION="28.3"
-            if [ "$(uname -m)" = "aarch64" ]; then
-              PROTOC_ARCH="linux-aarch_64"
-            else
-              PROTOC_ARCH="linux-x86_64"
-            fi
-            curl -sSLO "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-${PROTOC_ARCH}.zip"
-            unzip -q "protoc-${PROTOC_VERSION}-${PROTOC_ARCH}.zip" -d /usr/local
-            rm "protoc-${PROTOC_VERSION}-${PROTOC_ARCH}.zip"
-
-      - name: Upload wheels
-        uses: actions/upload-artifact@v4
-        with:
-          name: wheels-linux-${{ matrix.target }}
-          path: dist
-
-  build-macos:
-    name: Build uni-db macOS wheels (${{ matrix.target }})
-    needs: [validate]
-    runs-on: macos-latest-large
-    strategy:
-      matrix:
-        target: [x86_64, aarch64]
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Install protobuf
-        run: brew install protobuf
-
-      - name: Build wheels
-        uses: PyO3/maturin-action@v1
-        with:
-          target: ${{ matrix.target }}-apple-darwin
-          args: --release --out dist -m bindings/uni-db/Cargo.toml
-
-      - name: Upload wheels
-        uses: actions/upload-artifact@v4
-        with:
-          name: wheels-macos-${{ matrix.target }}
-          path: dist
-
-  build-windows:
-    name: Build uni-db Windows wheels (x86_64)
-    needs: [validate]
-    runs-on: windows-latest-l
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Install protobuf
-        run: choco install protoc
-
-      - name: Build wheels
-        uses: PyO3/maturin-action@v1
-        with:
-          target: x86_64-pc-windows-msvc
-          args: --release --out dist -m bindings/uni-db/Cargo.toml
-
-      - name: Upload wheels
-        uses: actions/upload-artifact@v4
-        with:
-          name: wheels-windows-x86_64
-          path: dist
-
-  build-sdist:
-    name: Build uni-db source distribution
-    needs: [validate]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Build sdist
-        uses: PyO3/maturin-action@v1
-        with:
-          command: sdist
-          args: --out dist -m bindings/uni-db/Cargo.toml
-
-      - name: Upload sdist
-        uses: actions/upload-artifact@v4
-        with:
-          name: wheels-sdist
-          path: dist
-
-  publish-testpypi:
-    name: Publish uni-db to TestPyPI
-    needs: [build-linux, build-macos, build-windows, build-sdist]
-    runs-on: ubuntu-latest
-    environment: testpypi
-    permissions:
-      id-token: write
-    if: github.event_name == 'workflow_dispatch' && inputs.target == 'testpypi'
-    steps:
-      - name: Download all wheels
-        uses: actions/download-artifact@v4
-        with:
-          pattern: wheels-*
-          path: dist
-          merge-multiple: true
-
-      - name: Setup uv
-        uses: astral-sh/setup-uv@v6
-
-      - name: Publish to TestPyPI (dry run)
-        if: inputs.dry_run == true
-        run: uv publish --dry-run --publish-url https://test.pypi.org/legacy/ dist/*
-
-      - name: Publish to TestPyPI
-        if: inputs.dry_run != true
-        run: uv publish --trusted-publishing always --check-url https://test.pypi.org/simple/ --publish-url https://test.pypi.org/legacy/ dist/*
-
-  publish-pypi:
-    name: Publish uni-db to PyPI
-    needs: [build-linux, build-macos, build-windows, build-sdist]
-    runs-on: ubuntu-latest
-    environment: pypi
-    permissions:
-      id-token: write
-    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.target == 'pypi')
-    steps:
-      - name: Download all wheels
-        uses: actions/download-artifact@v4
-        with:
-          pattern: wheels-*
-          path: dist
-          merge-multiple: true
-
-      - name: Setup uv
-        uses: astral-sh/setup-uv@v6
-
-      - name: Publish to PyPI (dry run)
-        if: inputs.dry_run == true
-        run: uv publish --dry-run dist/*
-
-      - name: Publish to PyPI
-        if: inputs.dry_run != true
-        run: uv publish --trusted-publishing always --check-url https://pypi.org/simple/ dist/*
-
   build-pydantic:
     name: Build uni-pydantic
-    needs: [validate, publish-testpypi, publish-pypi]
+    needs: [validate]
     runs-on: ubuntu-latest
-    if: always() && inputs.dry_run != true && (needs.publish-testpypi.result == 'success' || needs.publish-pypi.result == 'success')
+    # Wheels are published by `release-wheels.yml` running in parallel.
+    # `build-pydantic` waits for the wheel to land on PyPI/TestPyPI via the
+    # retry loop in the install step below, rather than via a job-graph
+    # dependency on the other workflow.
+    if: |
+      always() && inputs.dry_run != true && needs.validate.result == 'success'
+      && (
+        github.event_name == 'push'
+        || (github.event_name == 'workflow_dispatch' && (inputs.target == 'pypi' || inputs.target == 'testpypi'))
+      )
     env:
-      REGISTRY: ${{ needs.publish-testpypi.result == 'success' && 'testpypi' || 'pypi' }}
+      # `push` events (tag) always go to pypi. `workflow_dispatch` honors the
+      # `target` input. Mirrors the same logic in `release-wheels.yml`.
+      REGISTRY: ${{ (github.event_name == 'workflow_dispatch' && inputs.target == 'testpypi') && 'testpypi' || 'pypi' }}
       UV_PYTHON: "3.12"
     steps:
       - uses: actions/checkout@v4
@@ -453,12 +304,16 @@ jobs:
 
   publish-pydantic-testpypi:
     name: Publish uni-pydantic to TestPyPI
-    needs: [build-pydantic, publish-testpypi]
+    needs: [build-pydantic]
     runs-on: ubuntu-latest
     environment: testpypi
     permissions:
       id-token: write
-    if: always() && needs.build-pydantic.result == 'success' && needs.publish-testpypi.result == 'success'
+    # Mirrors the testpypi gate from `release-wheels.yml`'s `publish-testpypi`.
+    if: |
+      needs.build-pydantic.result == 'success'
+      && github.event_name == 'workflow_dispatch'
+      && inputs.target == 'testpypi'
     steps:
       - name: Download pydantic dist
         uses: actions/download-artifact@v4
@@ -474,12 +329,15 @@ jobs:
 
   publish-pydantic-pypi:
     name: Publish uni-pydantic to PyPI
-    needs: [build-pydantic, publish-pypi]
+    needs: [build-pydantic]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
       id-token: write
-    if: always() && needs.build-pydantic.result == 'success' && needs.publish-pypi.result == 'success'
+    # Mirrors the pypi gate from `release-wheels.yml`'s `publish-pypi`.
+    if: |
+      needs.build-pydantic.result == 'success'
+      && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.target == 'pypi'))
     steps:
       - name: Download pydantic dist
         uses: actions/download-artifact@v4

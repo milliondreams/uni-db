@@ -176,41 +176,36 @@ jobs:
         working-directory: bindings/uni-pydantic
         run: uv run pytest tests/ -v -n auto
 
-  # CUDA wheel smoke build — catches feature-flag breakage in the
-  # `uni-db-fastembed-cuda` variant early, without paying for the full
-  # 13-wheel release matrix on every PR. `cargo check --release` validates
-  # the entire dependency graph compiles (including pyke's
-  # `ort/download-binaries` fetch) but skips the linker/maturin packaging
-  # step, which keeps CI time reasonable. Real wheel builds happen in
-  # `release-wheels.yml` on tag/dispatch.
+  # CUDA wheel-graph smoke check — catches Cargo-dep-graph breakage in
+  # the `uni-db-fastembed-cuda` variant early, without paying the price
+  # of compiling its CUDA build scripts on every PR.
   #
-  # `CUDARC_CUDA_VERSION` tells `cudarc`'s `build.rs` the CUDA version
-  # without making it run `nvcc --version`. The smoke check doesn't link
-  # against any CUDA libs (cargo check, no linker invoked), so we can
-  # validate the compile graph on a runner that has no CUDA toolkit
-  # installed. Value 13000 = CUDA 13.0.0, matching the wheel-matrix
-  # production pin in `release-wheels.yml`.
+  # We use `cargo metadata` instead of `cargo check` because:
+  #
+  #  - `cargo check` runs build scripts. `candle-kernels`'s build.rs
+  #    invokes `nvcc` to compile CUDA C++ kernels to PTX, and there's
+  #    no env-var bypass — it genuinely needs a working CUDA toolkit
+  #    (~3-5 GB install). Adding that to every PR run is heavy.
+  #  - `cargo metadata` only resolves features and reads Cargo.toml
+  #    files; it does not run any build scripts. Catches the "feature
+  #    X doesn't exist anymore" / "this dep is incompatible" class of
+  #    breakage that's most likely to come up in PRs.
+  #
+  # Real CUDA wheel builds (with full nvcc + cudarc + candle-kernels
+  # compilation) run in `release-wheels.yml::build-cuda-toolkit-linux`
+  # on tag-push or workflow_dispatch. Source-level CUDA-specific bugs
+  # are detected there.
   wheels-fastembed-cuda-smoke:
-    name: Wheel smoke build (uni-db-fastembed-cuda)
+    name: Wheel-graph smoke check (uni-db-fastembed-cuda)
     runs-on: ubuntu-latest
-    env:
-      CUDARC_CUDA_VERSION: "13000"
     steps:
       - uses: actions/checkout@v4
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install system dependencies
+      - name: Resolve Cargo metadata for uni-db-fastembed-cuda
         run: |
-          sudo apt-get update
-          sudo apt-get install -y mold protobuf-compiler
-
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: "ci"
-          cache-on-failure: true
-
-      - name: Cargo check (uni-db-fastembed-cuda)
-        run: cargo check --release --manifest-path bindings/uni-db-fastembed-cuda/Cargo.toml
+          cargo metadata --format-version=1 \
+            --manifest-path bindings/uni-db-fastembed-cuda/Cargo.toml \
+            > /dev/null

@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "uni-db-mistralrs-metal"
-version = "1.1.1"
+version = "1.2.0"
 description = "Python bindings for Uni Graph Database (mistralrs + candle + Metal variant for Apple Silicon)"
 authors = [
     { name = "Dragonscale Industries Inc.", email = "dev@dragonscale.ai" }

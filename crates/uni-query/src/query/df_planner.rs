@@ -3014,21 +3014,18 @@ impl HybridPhysicalPlanner {
             pairs
         };
 
-        // Issue #55 PR #5: cross-MATCH dynamic VID-filter pushdown.
-        // When the join is a single-pair INNER equi-join on a probe-side
-        // `_vid` column, and the probe-side planned subtree is a fresh
-        // `GraphScanExec`, replace `HashJoinExec{build, full_label_scan}`
-        // with `VidLookupJoinExec{build, probe_scan_with_runtime_in_list}`.
-        // The build is materialized at execute time, its keys are pushed
-        // as `_vid IN (...)` to Lance, and the join runs in memory. Falls
-        // through to the HashJoinExec below for any non-matching shape
-        // (multi-key, non-Inner, non-Scan probe, build_expr that doesn't
-        // compile to a column reference, etc.).
-        if join_type == JoinType::Inner
-            && cls.equi_pairs.len() == 1
+        // Issue #55 PR #5+#6: cross-MATCH dynamic VID-filter pushdown.
+        // When the equi-pairs include exactly one anchor pair on the
+        // probe-side `_vid`, and the probe-side planned subtree is a
+        // fresh `GraphScanExec`, replace `HashJoinExec{build, full_scan}`
+        // with `VidLookupJoinExec`. Supports INNER and LEFT outer; falls
+        // through to HashJoinExec for RIGHT outer, non-Scan probes, or
+        // computed (non-Column) join keys.
+        if matches!(join_type, JoinType::Inner | JoinType::Left)
             && cls.residual.is_none()
             && let Some(plan) = self.try_emit_vid_lookup_join(
-                &cls.equi_pairs[0],
+                &cls.equi_pairs,
+                join_type,
                 &left_plan,
                 &right_plan,
                 &left_with_filter,
@@ -3082,50 +3079,74 @@ impl HybridPhysicalPlanner {
         Ok(Some(join))
     }
 
-    /// Issue #55 PR #5: detect the cross-MATCH dynamic VID-filter pushdown
+    /// Issue #55 PR #5+#6: detect the cross-MATCH dynamic VID-filter pushdown
     /// pattern and emit `VidLookupJoinExec` instead of `HashJoinExec`.
     /// Returns `Ok(None)` for any pattern that doesn't match — the caller
     /// falls through to the standard HashJoin emission.
     ///
     /// Pattern recognised:
-    ///   * Single equi-pair `(l_expr, r_expr)` where exactly one side is
-    ///     `Property(Variable(scan_var), "_vid")`.
-    ///   * The corresponding planned subtree is a top-level `GraphScanExec`
-    ///     for `scan_var` (no FilterExec/Projection on top).
-    ///   * The other side (`build_expr`) compiles to a `Column` reference
-    ///     against the build's schema. Computed expressions on the build
-    ///     side fall through to HashJoin.
+    ///   * One equi-pair (the *anchor*) has the probe side equal to
+    ///     `Property(Variable(scan_var), "_vid")`. Its values drive the
+    ///     IN-list pushdown.
+    ///   * Other equi-pairs (if any) compile to `Column` references on
+    ///     both sides; they're applied in-memory as post-match filters.
+    ///   * The probe-side planned subtree is a top-level `GraphScanExec`.
+    ///   * The anchor build column is UInt64 (a VID).
+    ///   * Join is INNER or LEFT outer (RIGHT outer rejected — we can't
+    ///     produce probe rows that don't match any build VID).
     fn try_emit_vid_lookup_join(
         &self,
-        equi_pair: &(Expr, Expr),
+        equi_pairs: &[(Expr, Expr)],
+        join_type: JoinType,
         left_plan: &Arc<dyn ExecutionPlan>,
         right_plan: &Arc<dyn ExecutionPlan>,
         left_logical: &LogicalPlan,
         right_logical: &LogicalPlan,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         use crate::query::df_graph::scan::GraphScanExec;
-        use crate::query::df_graph::vid_lookup_join::VidLookupJoinExec;
+        use crate::query::df_graph::vid_lookup_join::{
+            EquiPair, ProbeSide, VidJoinKind, VidLookupJoinExec,
+        };
         use datafusion::physical_expr::expressions::Column;
 
-        let (l_expr, r_expr) = equi_pair;
+        if equi_pairs.is_empty() {
+            return Ok(None);
+        }
 
-        // Identify which side is the probe (`Property(Variable(_), "_vid")`).
-        // Per the equi-pair classifier's invariant, l_expr's variables come
-        // from the LEFT subtree, r_expr's from the RIGHT subtree — so
-        // `is_vid_property(l_expr)` ⇒ probe is left, etc.
-        let (probe_expr, build_expr, probe_plan, build_plan, build_logical) =
+        // 1. Find the anchor pair: the one where the probe side is
+        // `Property(Variable(_), "_vid")`. The classifier's invariant is
+        // that `l_expr` references LEFT subtree variables and `r_expr`
+        // references RIGHT subtree variables, so detecting `_vid` on
+        // `l_expr` means the probe is on the left.
+        let mut anchor_idx: Option<(usize, ProbeSide)> = None;
+        for (i, (l_expr, r_expr)) in equi_pairs.iter().enumerate() {
             if expr_is_vid_property(l_expr) {
-                (l_expr, r_expr, left_plan, right_plan, right_logical)
-            } else if expr_is_vid_property(r_expr) {
-                (r_expr, l_expr, right_plan, left_plan, left_logical)
-            } else {
-                return Ok(None);
-            };
-        let _ = probe_expr; // kept for clarity / future debug
+                anchor_idx = Some((i, ProbeSide::Left));
+                break;
+            }
+            if expr_is_vid_property(r_expr) {
+                anchor_idx = Some((i, ProbeSide::Right));
+                break;
+            }
+        }
+        let Some((anchor_pair_idx, probe_side)) = anchor_idx else {
+            return Ok(None);
+        };
 
-        // Probe-side planned tree must be a top-level GraphScanExec. Any
-        // wrapper (FilterExec/Project/etc.) means we don't have a clean
-        // probe to inject the IN-list filter into.
+        let probe_plan = match probe_side {
+            ProbeSide::Left => left_plan,
+            ProbeSide::Right => right_plan,
+        };
+        let build_plan = match probe_side {
+            ProbeSide::Left => right_plan,
+            ProbeSide::Right => left_plan,
+        };
+        let build_logical = match probe_side {
+            ProbeSide::Left => right_logical,
+            ProbeSide::Right => left_logical,
+        };
+
+        // 2. Probe-side plan must be a top-level GraphScanExec.
         if probe_plan
             .as_any()
             .downcast_ref::<GraphScanExec>()
@@ -3134,17 +3155,21 @@ impl HybridPhysicalPlanner {
             return Ok(None);
         }
 
-        // Compile build_expr against build's schema. We require it to
-        // resolve to a single Column reference — computed expressions
-        // (e.g. `a.x + a.y`) on the build side aren't supported here.
-        let build_schema = build_plan.schema();
-        let build_ctx = self.translation_context_for_plan(build_logical);
-        let build_phys = {
-            let session = self.session_ctx.read();
-            let state = session.state();
-            let compiler = crate::query::df_graph::expr_compiler::CypherPhysicalExprCompiler::new(
+        // 3. Compile every equi-pair's expressions against their respective
+        // schemas, requiring each side to resolve to a Column. The anchor
+        // pair additionally requires the build side to be UInt64.
+        let left_schema = left_plan.schema();
+        let right_schema = right_plan.schema();
+        let left_ctx = self.translation_context_for_plan(left_logical);
+        let right_ctx = self.translation_context_for_plan(right_logical);
+        let _ = build_logical; // contexts already covered by left/right_ctx
+
+        let session = self.session_ctx.read();
+        let state = session.state();
+        let left_compiler =
+            crate::query::df_graph::expr_compiler::CypherPhysicalExprCompiler::new(
                 &state,
-                Some(&build_ctx),
+                Some(&left_ctx),
             )
             .with_subquery_ctx(
                 self.graph_ctx.clone(),
@@ -3154,28 +3179,73 @@ impl HybridPhysicalPlanner {
                 self.params.clone(),
                 self.outer_entity_vars.clone(),
             );
-            compiler.compile(build_expr, &build_schema)?
-        };
+        let right_compiler =
+            crate::query::df_graph::expr_compiler::CypherPhysicalExprCompiler::new(
+                &state,
+                Some(&right_ctx),
+            )
+            .with_subquery_ctx(
+                self.graph_ctx.clone(),
+                self.schema.clone(),
+                self.session_ctx.clone(),
+                self.storage.clone(),
+                self.params.clone(),
+                self.outer_entity_vars.clone(),
+            );
 
-        let Some(build_col) = build_phys.as_any().downcast_ref::<Column>() else {
-            return Ok(None);
-        };
-        let build_key_col_idx = build_col.index();
+        let mut compiled: Vec<EquiPair> = Vec::with_capacity(equi_pairs.len());
+        for (l_expr, r_expr) in equi_pairs {
+            let l_phys = left_compiler.compile(l_expr, &left_schema)?;
+            let r_phys = right_compiler.compile(r_expr, &right_schema)?;
+            let (Some(l_col), Some(r_col)) = (
+                l_phys.as_any().downcast_ref::<Column>(),
+                r_phys.as_any().downcast_ref::<Column>(),
+            ) else {
+                // Computed expression on either side → bail to HashJoinExec.
+                return Ok(None);
+            };
+            compiled.push(EquiPair {
+                left_col_idx: l_col.index(),
+                right_col_idx: r_col.index(),
+            });
+        }
 
-        // Build-side column must be UInt64 (a VID). Anything else is a
-        // type-mismatch we'd rather route through HashJoinExec's
-        // unify_join_key_types path that handles wrapping.
+        // 4. Anchor build column must be UInt64.
+        let anchor = compiled[anchor_pair_idx];
+        let anchor_build_idx = match probe_side {
+            ProbeSide::Left => anchor.right_col_idx,
+            ProbeSide::Right => anchor.left_col_idx,
+        };
+        let build_schema = build_plan.schema();
         if !matches!(
-            build_schema.field(build_key_col_idx).data_type(),
+            build_schema.field(anchor_build_idx).data_type(),
             datafusion::arrow::datatypes::DataType::UInt64
         ) {
             return Ok(None);
         }
 
+        // 5. Reorder so the anchor pair is at index 0 (operator's invariant).
+        if anchor_pair_idx != 0 {
+            compiled.swap(0, anchor_pair_idx);
+        }
+
+        // 6. Translate join_type. RIGHT outer is rejected — we can't
+        // produce probe rows that don't match any build VID, since our
+        // probe scan only fetches rows whose `_vid` is in the build set.
+        let join_kind = match join_type {
+            JoinType::Inner => VidJoinKind::Inner,
+            JoinType::Left => VidJoinKind::Left,
+            _ => return Ok(None),
+        };
+
+        drop(session);
+
         Ok(Some(Arc::new(VidLookupJoinExec::try_new(
-            build_plan.clone(),
-            probe_plan.clone(),
-            build_key_col_idx,
+            left_plan.clone(),
+            right_plan.clone(),
+            probe_side,
+            compiled,
+            join_kind,
         )?)))
     }
 

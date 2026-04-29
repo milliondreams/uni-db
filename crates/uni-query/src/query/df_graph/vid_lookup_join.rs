@@ -1,45 +1,51 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Dragonscale Team
 
-//! Cross-MATCH dynamic VID-filter pushdown (issue #55 PR #5).
+//! Cross-MATCH dynamic VID-filter pushdown (issue #55 PR #5+#6).
 //!
-//! Specializes the inner-equi-join `Filter[id(probe) = build_expr] ←
-//! CrossJoin{build, probe_scan}` pattern when `probe_scan` is a vertex
-//! `GraphScanExec` and the build side is materialisable at runtime. Replaces
-//! the would-be `HashJoinExec{build, full_table_scan}` (which fully scans the
-//! probe label and discards mismatches) with a runtime IN-list pushdown:
+//! Specializes equi-joins where one of the equi-pairs is on the probe side's
+//! `_vid` column. The probe is a `GraphScanExec`; the build is any plan whose
+//! output we can materialize. At execute time:
 //!
-//! 1. Run the build child to completion. Collect its rows.
-//! 2. Extract the distinct VIDs from the build side's join-key column.
-//! 3. Hand them to the probe `GraphScanExec` as an `_vid IN (v1, v2, ...)`
-//!    Lance filter, executing the scan ONCE.
-//! 4. In-memory hash-join the build batches with the probe batch on
-//!    `(build_key_col, probe._vid)`, emitting `(build_cols | probe_cols)`.
+//!   1. Run the build side fully and collect its rows.
+//!   2. Extract distinct VIDs from the build side's anchor-pair column.
+//!   3. Push them as `_vid IN (...)` to the probe scan via
+//!      `GraphScanExec::execute_with_vid_filter`. If the build VID set
+//!      exceeds [`MAX_VIDS_PER_CHUNK`] we chunk into multiple `_vid IN`
+//!      filters and concat the batches — bounded list size, indexed lookup
+//!      preserved at scale.
+//!   4. Index probe by `_vid` and join in memory. Non-anchor equi-pairs
+//!      become per-candidate post-filters.
 //!
-//! ## When this operator fires
+//! Output column order is `left.schema() ++ right.schema()` in plan order
+//! (matches `HashJoinExec`'s convention) regardless of which side is the
+//! probe — important because downstream operators reference columns by
+//! index.
 //!
-//! Triggered by the planner in `try_plan_cross_join_as_hash_join` when:
-//! - The equi-pair predicate has exactly one pair where one side is
-//!   `Property(Variable(scan_var), "_vid")` (or `id(scan_var)` lowered the
-//!   same way),
-//! - The subtree containing `scan_var` is a single `LogicalPlan::Scan` (or
-//!   `ScanMainByLabels`) — i.e. the probe is a fresh label scan with no
-//!   conflicting filters,
-//! - The join is INNER (LEFT/RIGHT outer joins fall back to HashJoinExec —
-//!   they would need NULL-padding when the probe scan returns nothing for a
-//!   build VID),
-//! - There is exactly one equi-pair (multi-key joins fall back to HashJoin).
+//! ## When the planner emits this
 //!
-//! The plan-time IN-list pushdown for `UNWIND $list` (PR #4) takes precedence
-//! when both apply — it's cheaper (no runtime materialization).
+//! See `try_emit_vid_lookup_join` in `df_planner.rs`. Conditions:
+//! - The join is INNER or LEFT outer (RIGHT outer falls back to
+//!   `HashJoinExec` — we'd need NULL-padding for the build's *complement*,
+//!   which our materialize-then-probe shape can't produce).
+//! - At least one equi-pair has the probe side equal to
+//!   `Property(Variable(scan_var), "_vid")`. That pair becomes the
+//!   "anchor" — its values drive the IN-list pushdown.
+//! - The probe-side planned subtree is a top-level `GraphScanExec`.
+//! - All non-anchor equi-pairs compile to `Column` references on both
+//!   sides (no computed expressions).
+//! - The anchor build-side column is `UInt64` (a VID).
 //!
-//! ## Build-size cap
+//! Any failed condition → planner emits `HashJoinExec` instead.
 //!
-//! If the build side returns more distinct VIDs than [`MAX_VIDS`] (10 000),
-//! the operator falls back to a full probe scan + post-join filter via the
-//! same in-memory hash-join. This bounds the IN-list size we send to Lance
-//! (which has practical SQL parser limits) and prevents OOM on pathological
-//! build sides.
+//! ## Out of scope
+//!
+//! - RIGHT outer joins (preserving probe-side rows that don't match).
+//!   Rejected at the planner.
+//! - Computed build-side expressions in any equi-pair. Rejected at the
+//!   planner; falls back to `HashJoinExec`.
+//! - Anchor-pair build column types other than `UInt64`. Rejected at the
+//!   planner.
 
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
@@ -48,9 +54,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use arrow_array::builder::UInt32Builder;
 use arrow_array::{Array, ArrayRef, RecordBatch, UInt64Array};
 use arrow_schema::{Field, Schema, SchemaRef};
-use datafusion::common::Result as DFResult;
+use datafusion::common::{Result as DFResult, ScalarValue};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
@@ -59,28 +66,62 @@ use futures::{Stream, TryStreamExt};
 use super::common::compute_plan_properties;
 use super::scan::GraphScanExec;
 
-/// Cap on the number of distinct VIDs we'll push as an `_vid IN (...)`
-/// filter. Mirrors the equivalent constant in `df_planner.rs` so the
-/// behaviour is consistent across the static-UNWIND and runtime paths.
-pub(crate) const MAX_VIDS: usize = 10_000;
+/// Maximum VIDs per `_vid IN (...)` chunk. Larger build sets are split into
+/// multiple sequential probe scans whose results are concatenated. Mirrors
+/// the equivalent cap in `df_planner.rs`.
+pub(crate) const MAX_VIDS_PER_CHUNK: usize = 10_000;
+
+/// Which side of the join is the probe (the `GraphScanExec`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeSide {
+    Left,
+    Right,
+}
+
+/// One equi-join pair. Indices are into the respective side's schema.
+/// `pairs[0]` is always the anchor — its probe side is the `_vid` column
+/// whose values drive the IN-list pushdown.
+#[derive(Debug, Clone, Copy)]
+pub struct EquiPair {
+    pub left_col_idx: usize,
+    pub right_col_idx: usize,
+}
+
+impl EquiPair {
+    /// Column index on the build side, given which side is the probe.
+    fn build_col(&self, probe_side: ProbeSide) -> usize {
+        match probe_side {
+            ProbeSide::Left => self.right_col_idx,
+            ProbeSide::Right => self.left_col_idx,
+        }
+    }
+
+    /// Column index on the probe side, given which side is the probe.
+    fn probe_col(&self, probe_side: ProbeSide) -> usize {
+        match probe_side {
+            ProbeSide::Left => self.left_col_idx,
+            ProbeSide::Right => self.right_col_idx,
+        }
+    }
+}
+
+/// Join semantic. RIGHT outer is rejected at the planner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VidJoinKind {
+    Inner,
+    Left,
+}
 
 /// Cross-MATCH dynamic VID-filter pushdown operator.
-///
-/// See module-level docs for the pattern this targets and the conditions
-/// under which the planner emits it instead of `HashJoinExec`.
 pub struct VidLookupJoinExec {
-    /// Build-side child (any ExecutionPlan). Materialized fully at execute
-    /// time to extract VIDs.
-    build: Arc<dyn ExecutionPlan>,
-    /// Probe-side scan, stored as `Arc<dyn ExecutionPlan>` so it slots into
-    /// DataFusion plumbing; must downcast to `GraphScanExec`. We don't
-    /// invoke its standard `execute()` — instead we call
-    /// `execute_with_vid_filter` after materializing the build side.
-    probe_scan: Arc<dyn ExecutionPlan>,
-    /// Index into the build's output schema for the join-key column. The
-    /// column must be UInt64 (a VID).
-    build_key_col_idx: usize,
-    /// Combined output schema = build_schema ++ probe_schema.
+    left: Arc<dyn ExecutionPlan>,
+    right: Arc<dyn ExecutionPlan>,
+    probe_side: ProbeSide,
+    /// Equi-pairs. Index 0 is the anchor (probe side is `_vid`); the rest
+    /// are post-match filters during the in-memory hash join.
+    pairs: Vec<EquiPair>,
+    join_kind: VidJoinKind,
+    /// Output schema = `left.schema() ++ right.schema()` in plan order.
     output_schema: SchemaRef,
     properties: PlanProperties,
     metrics: ExecutionPlanMetricsSet,
@@ -89,7 +130,9 @@ pub struct VidLookupJoinExec {
 impl fmt::Debug for VidLookupJoinExec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("VidLookupJoinExec")
-            .field("build_key_col_idx", &self.build_key_col_idx)
+            .field("probe_side", &self.probe_side)
+            .field("pairs", &self.pairs.len())
+            .field("join_kind", &self.join_kind)
             .finish()
     }
 }
@@ -97,41 +140,63 @@ impl fmt::Debug for VidLookupJoinExec {
 impl VidLookupJoinExec {
     /// Construct a new VID-lookup-join.
     ///
-    /// The output schema is `build.schema()` concatenated with
-    /// `probe_scan.schema()`. The caller must guarantee that
-    /// `build.schema().field(build_key_col_idx)` is a UInt64 column whose
-    /// values are valid VIDs for the probe label.
+    /// The output schema is `left.schema()` concatenated with
+    /// `right.schema()`. The caller (the planner pre-check) must ensure:
+    /// - `pairs[0]`'s probe side is the `_vid` column (UInt64).
+    /// - `pairs[0]`'s build side is a UInt64 column.
+    /// - The `probe_side`'s child is a `GraphScanExec`.
+    /// - `pairs` is non-empty.
     pub fn try_new(
-        build: Arc<dyn ExecutionPlan>,
-        probe_scan: Arc<dyn ExecutionPlan>,
-        build_key_col_idx: usize,
+        left: Arc<dyn ExecutionPlan>,
+        right: Arc<dyn ExecutionPlan>,
+        probe_side: ProbeSide,
+        pairs: Vec<EquiPair>,
+        join_kind: VidJoinKind,
     ) -> DFResult<Self> {
-        // Probe must be a GraphScanExec. Downcast eagerly to fail fast on
-        // construction rather than at execute() time.
-        if probe_scan.as_any().downcast_ref::<GraphScanExec>().is_none() {
+        if pairs.is_empty() {
             return Err(datafusion::error::DataFusionError::Plan(
-                "VidLookupJoinExec: probe_scan must be a GraphScanExec".into(),
+                "VidLookupJoinExec: pairs must be non-empty".into(),
             ));
         }
-        let build_schema = build.schema();
-        if build_key_col_idx >= build_schema.fields().len() {
-            return Err(datafusion::error::DataFusionError::Plan(format!(
-                "VidLookupJoinExec: build_key_col_idx={} out of bounds for build schema (fields={})",
-                build_key_col_idx,
-                build_schema.fields().len()
-            )));
+        let probe_plan = match probe_side {
+            ProbeSide::Left => &left,
+            ProbeSide::Right => &right,
+        };
+        if probe_plan
+            .as_any()
+            .downcast_ref::<GraphScanExec>()
+            .is_none()
+        {
+            return Err(datafusion::error::DataFusionError::Plan(
+                "VidLookupJoinExec: probe-side child must be a GraphScanExec".into(),
+            ));
         }
-        let probe_schema = probe_scan.schema();
-        let output_schema = concat_schemas(&build_schema, &probe_schema);
+        let output_schema = concat_schemas(&left.schema(), &right.schema());
         let properties = compute_plan_properties(output_schema.clone());
         Ok(Self {
-            build,
-            probe_scan,
-            build_key_col_idx,
+            left,
+            right,
+            probe_side,
+            pairs,
+            join_kind,
             output_schema,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         })
+    }
+
+    fn build_child(&self) -> &Arc<dyn ExecutionPlan> {
+        match self.probe_side {
+            ProbeSide::Left => &self.right,
+            ProbeSide::Right => &self.left,
+        }
+    }
+
+    fn probe_child(&self) -> &Arc<dyn ExecutionPlan> {
+        match self.probe_side {
+            ProbeSide::Left => &self.left,
+            ProbeSide::Right => &self.right,
+        }
     }
 }
 
@@ -139,8 +204,10 @@ impl DisplayAs for VidLookupJoinExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "VidLookupJoinExec: build_key_col_idx={}",
-            self.build_key_col_idx
+            "VidLookupJoinExec: probe={:?}, pairs={}, kind={:?}",
+            self.probe_side,
+            self.pairs.len(),
+            self.join_kind
         )
     }
 }
@@ -163,12 +230,11 @@ impl ExecutionPlan for VidLookupJoinExec {
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        // We expose the build child only. The probe scan is conceptually a
-        // child but we drive it with a runtime-supplied filter that
-        // DataFusion's plan-tree walking can't represent — so it's kept
-        // private to the operator. with_new_children below preserves the
-        // probe scan as-is.
-        vec![&self.build]
+        // Expose the build child only — DataFusion's plan walker will see
+        // exactly the side that we'll execute through its standard
+        // `execute()` API. The probe is driven via the GraphScanExec
+        // helper at runtime and isn't a child in the traditional sense.
+        vec![self.build_child()]
     }
 
     fn with_new_children(
@@ -181,10 +247,17 @@ impl ExecutionPlan for VidLookupJoinExec {
                 children.len()
             )));
         }
+        let new_build = children.into_iter().next().unwrap();
+        let (new_left, new_right) = match self.probe_side {
+            ProbeSide::Left => (self.left.clone(), new_build),
+            ProbeSide::Right => (new_build, self.right.clone()),
+        };
         Ok(Arc::new(Self::try_new(
-            children.into_iter().next().unwrap(),
-            self.probe_scan.clone(),
-            self.build_key_col_idx,
+            new_left,
+            new_right,
+            self.probe_side,
+            self.pairs.clone(),
+            self.join_kind,
         )?))
     }
 
@@ -194,16 +267,24 @@ impl ExecutionPlan for VidLookupJoinExec {
         context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         let metrics = BaselineMetrics::new(&self.metrics, partition);
-        let build = self.build.clone();
-        let probe_scan = self.probe_scan.clone();
-        let build_key_col_idx = self.build_key_col_idx;
+        let build = self.build_child().clone();
+        let probe = self.probe_child().clone();
+        let probe_side = self.probe_side;
+        let pairs = self.pairs.clone();
+        let join_kind = self.join_kind;
         let output_schema = self.output_schema.clone();
+        let left_schema = self.left.schema();
+        let right_schema = self.right.schema();
 
         let fut = async move {
-            run_vid_lookup_join(
+            run_join(
                 build,
-                probe_scan,
-                build_key_col_idx,
+                probe,
+                probe_side,
+                pairs,
+                join_kind,
+                left_schema,
+                right_schema,
                 output_schema.clone(),
                 partition,
                 context,
@@ -270,42 +351,40 @@ impl RecordBatchStream for VidLookupJoinStream {
 // Core join logic
 // ---------------------------------------------------------------------------
 
-async fn run_vid_lookup_join(
+#[allow(clippy::too_many_arguments)]
+async fn run_join(
     build: Arc<dyn ExecutionPlan>,
-    probe_scan: Arc<dyn ExecutionPlan>,
-    build_key_col_idx: usize,
+    probe: Arc<dyn ExecutionPlan>,
+    probe_side: ProbeSide,
+    pairs: Vec<EquiPair>,
+    join_kind: VidJoinKind,
+    left_schema: SchemaRef,
+    right_schema: SchemaRef,
     output_schema: SchemaRef,
     partition: usize,
     context: Arc<TaskContext>,
 ) -> DFResult<RecordBatch> {
-    // Downcast verified at construction; safe to unwrap here.
-    let probe_scan = probe_scan
-        .as_any()
-        .downcast_ref::<GraphScanExec>()
-        .expect("VidLookupJoinExec::try_new ensured probe_scan is GraphScanExec");
     // 1. Materialize the build side fully.
     let build_stream = build.execute(partition, context)?;
     let build_batches: Vec<RecordBatch> = build_stream.try_collect().await?;
 
     if build_batches.is_empty() {
-        // No build rows → empty join.
         return Ok(RecordBatch::new_empty(output_schema));
     }
 
-    // 2. Extract distinct VIDs from build.
+    // 2. Extract distinct VIDs from the anchor build column.
+    let anchor = pairs[0];
+    let build_anchor_col_idx = anchor.build_col(probe_side);
     let mut vid_set: HashSet<u64> = HashSet::new();
     for batch in &build_batches {
-        let arr = batch.column(build_key_col_idx);
-        let u64_arr = arr
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .ok_or_else(|| {
-                datafusion::error::DataFusionError::Plan(format!(
-                    "VidLookupJoinExec: build_key_col_idx={} is not UInt64 (got {:?})",
-                    build_key_col_idx,
-                    arr.data_type()
-                ))
-            })?;
+        let arr = batch.column(build_anchor_col_idx);
+        let u64_arr = arr.as_any().downcast_ref::<UInt64Array>().ok_or_else(|| {
+            datafusion::error::DataFusionError::Plan(format!(
+                "VidLookupJoinExec: build anchor column at idx {} is not UInt64 (got {:?})",
+                build_anchor_col_idx,
+                arr.data_type()
+            ))
+        })?;
         for i in 0..u64_arr.len() {
             if !u64_arr.is_null(i) {
                 vid_set.insert(u64_arr.value(i));
@@ -313,62 +392,179 @@ async fn run_vid_lookup_join(
         }
     }
 
-    if vid_set.is_empty() {
-        // All build rows had NULL VIDs → empty join.
-        return Ok(RecordBatch::new_empty(output_schema));
-    }
+    // 3. Execute the probe scan with chunked IN-list filters and concat
+    // the batches. With cap-busting build sizes we chunk into
+    // MAX_VIDS_PER_CHUNK pieces; total Lance work scales the same as a
+    // single big scan, but no chunk's IN-list exceeds the safe bound.
+    let probe_scan = probe
+        .as_any()
+        .downcast_ref::<GraphScanExec>()
+        .expect("planner ensured probe is GraphScanExec");
+    let probe_batch = if vid_set.is_empty() {
+        // No build VIDs → no probe rows to fetch. Still need an empty
+        // batch with the correct schema for downstream NULL-padding logic.
+        RecordBatch::new_empty(probe_scan.schema())
+    } else {
+        let vids: Vec<u64> = vid_set.iter().copied().collect();
+        let mut chunks: Vec<RecordBatch> = Vec::new();
+        for chunk in vids.chunks(MAX_VIDS_PER_CHUNK) {
+            let batch = probe_scan.execute_with_vid_filter(chunk).await?;
+            if batch.num_rows() > 0 {
+                chunks.push(batch);
+            }
+        }
+        if chunks.is_empty() {
+            RecordBatch::new_empty(probe_scan.schema())
+        } else if chunks.len() == 1 {
+            chunks.into_iter().next().unwrap()
+        } else {
+            let schema = chunks[0].schema();
+            arrow::compute::concat_batches(&schema, &chunks)
+                .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?
+        }
+    };
 
-    // 3. Defensive cap. Planner-side check should have steered above-cap
-    // workloads to plain HashJoinExec; if we ever reach this, fail loud
-    // rather than silently OOM the Lance scanner.
-    if vid_set.len() > MAX_VIDS {
-        return Err(datafusion::error::DataFusionError::Execution(format!(
-            "VidLookupJoinExec: build side produced {} distinct VIDs, exceeds cap {}. \
-             Planner should have selected HashJoinExec instead. This is a planner bug.",
-            vid_set.len(),
-            MAX_VIDS
+    // 4. Index probe by `_vid`. The probe scan's schema always carries a
+    // `_vid` column at a known position relative to its projected
+    // properties; we resolve by name so a future schema-shape change
+    // doesn't silently break us.
+    let probe_vid_idx = locate_vid_column(&probe_batch.schema())?;
+    let probe_anchor_col_idx = anchor.probe_col(probe_side);
+    // Sanity: anchor's probe column SHOULD be the `_vid` column. If the
+    // planner classified differently, fail loudly.
+    if probe_anchor_col_idx != probe_vid_idx {
+        return Err(datafusion::error::DataFusionError::Plan(format!(
+            "VidLookupJoinExec: anchor probe column idx {} != probe schema's _vid idx {} \
+             (planner pre-check should have aligned these)",
+            probe_anchor_col_idx, probe_vid_idx
         )));
     }
+    let probe_index = build_probe_vid_index(&probe_batch, probe_vid_idx)?;
 
-    let vids: Vec<u64> = vid_set.into_iter().collect();
+    // 5. Walk build rows; for each, find probe candidates by anchor VID
+    // and post-filter by non-anchor pairs. Record matching pairs as
+    // (build_batch_idx, build_row_idx, probe_row_idx) for batched take(...)
+    // at the end. For LEFT-outer, also note any build row with zero
+    // matches so we can emit NULL-padded.
+    let n_non_anchor = pairs.len() - 1;
+    let mut matches: Vec<JoinMatch> = Vec::new();
+    let mut unmatched: Vec<(usize, usize)> = Vec::new(); // (build_batch_idx, build_row_idx)
 
-    // 4. Run the probe scan once with the IN-list filter.
-    let probe_batch = probe_scan.execute_with_vid_filter(&vids).await?;
+    for (build_batch_idx, build_batch) in build_batches.iter().enumerate() {
+        let build_anchor_arr = build_batch
+            .column(build_anchor_col_idx)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .expect("validated above");
+        for build_row_idx in 0..build_anchor_arr.len() {
+            if build_anchor_arr.is_null(build_row_idx) {
+                if join_kind == VidJoinKind::Left {
+                    unmatched.push((build_batch_idx, build_row_idx));
+                }
+                continue;
+            }
+            let key = build_anchor_arr.value(build_row_idx);
+            let Some(probe_rows) = probe_index.get(&key) else {
+                if join_kind == VidJoinKind::Left {
+                    unmatched.push((build_batch_idx, build_row_idx));
+                }
+                continue;
+            };
 
-    // 5. In-memory hash-join build × probe on the VID equi-pair. Build a
-    // map from probe `_vid` to the row indices that hold it; then walk
-    // build rows and emit (build | probe) for each match.
-    let probe_vid_idx = locate_vid_column(&probe_batch.schema())?;
-    let probe_vid_arr = probe_batch
+            // For each candidate probe row, check the non-anchor pairs.
+            let mut had_match_for_this_build_row = false;
+            for &probe_row_idx in probe_rows {
+                let mut all_match = true;
+                for pair in &pairs[1..1 + n_non_anchor] {
+                    let build_col_idx = pair.build_col(probe_side);
+                    let probe_col_idx = pair.probe_col(probe_side);
+                    if !values_equal(
+                        build_batch.column(build_col_idx),
+                        build_row_idx,
+                        probe_batch.column(probe_col_idx),
+                        probe_row_idx,
+                    )? {
+                        all_match = false;
+                        break;
+                    }
+                }
+                if all_match {
+                    matches.push(JoinMatch {
+                        build_batch_idx,
+                        build_row_idx,
+                        probe_row_idx,
+                    });
+                    had_match_for_this_build_row = true;
+                }
+            }
+            if !had_match_for_this_build_row && join_kind == VidJoinKind::Left {
+                unmatched.push((build_batch_idx, build_row_idx));
+            }
+        }
+    }
+
+    // 6. Emit one combined RecordBatch in left-then-right plan order.
+    emit_joined_batch(
+        &build_batches,
+        &probe_batch,
+        &matches,
+        &unmatched,
+        probe_side,
+        &left_schema,
+        &right_schema,
+        &output_schema,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Hash-join helpers
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy)]
+struct JoinMatch {
+    build_batch_idx: usize,
+    build_row_idx: usize,
+    probe_row_idx: usize,
+}
+
+fn build_probe_vid_index(
+    probe_batch: &RecordBatch,
+    probe_vid_idx: usize,
+) -> DFResult<HashMap<u64, Vec<usize>>> {
+    let arr = probe_batch
         .column(probe_vid_idx)
         .as_any()
         .downcast_ref::<UInt64Array>()
         .ok_or_else(|| {
             datafusion::error::DataFusionError::Plan(
-                "VidLookupJoinExec: probe _vid column is not UInt64".into(),
+                "VidLookupJoinExec: probe `_vid` column is not UInt64".into(),
             )
         })?;
-    let mut probe_index: HashMap<u64, Vec<usize>> = HashMap::with_capacity(probe_vid_arr.len());
-    for i in 0..probe_vid_arr.len() {
-        if !probe_vid_arr.is_null(i) {
-            probe_index.entry(probe_vid_arr.value(i)).or_default().push(i);
+    let mut index: HashMap<u64, Vec<usize>> = HashMap::with_capacity(arr.len());
+    for i in 0..arr.len() {
+        if !arr.is_null(i) {
+            index.entry(arr.value(i)).or_default().push(i);
         }
     }
-
-    let joined = join_batches(
-        &build_batches,
-        build_key_col_idx,
-        &probe_batch,
-        &probe_index,
-        &output_schema,
-    )?;
-
-    Ok(joined)
+    Ok(index)
 }
 
-/// Find the `_vid` column in a probe-side `RecordBatch` schema. The probe
-/// scan emits a column literally named `_vid` (the bare underscore form,
-/// not `<var>._vid`), per `build_vertex_schema` in scan.rs.
+/// Compare two cells for equality. Used by the non-anchor equi-pair filter.
+/// Uses `ScalarValue` for type-erased comparison so the operator works for
+/// any column type Arrow can lift into a `ScalarValue` (which covers all
+/// types we currently materialize from Lance).
+fn values_equal(
+    a_col: &ArrayRef,
+    a_row: usize,
+    b_col: &ArrayRef,
+    b_row: usize,
+) -> DFResult<bool> {
+    let a = ScalarValue::try_from_array(a_col, a_row)?;
+    let b = ScalarValue::try_from_array(b_col, b_row)?;
+    Ok(a == b)
+}
+
+/// Find the `_vid` column in a probe batch's schema.
 fn locate_vid_column(schema: &SchemaRef) -> DFResult<usize> {
     schema
         .fields()
@@ -388,119 +584,142 @@ fn locate_vid_column(schema: &SchemaRef) -> DFResult<usize> {
         })
 }
 
-/// Concatenate build_schema and probe_schema into a single output schema.
-/// Field names are kept as-is — uniqueness across the two sides is the
-/// caller's responsibility (it's enforced upstream by Cypher's
-/// variable-naming rules).
-fn concat_schemas(build_schema: &SchemaRef, probe_schema: &SchemaRef) -> SchemaRef {
-    let mut fields: Vec<Field> = Vec::with_capacity(
-        build_schema.fields().len() + probe_schema.fields().len(),
-    );
-    for f in build_schema.fields() {
+/// Concatenate two schemas in plan order. Field names kept as-is; Cypher
+/// variable-naming rules guarantee uniqueness across the two sides.
+fn concat_schemas(left: &SchemaRef, right: &SchemaRef) -> SchemaRef {
+    let mut fields: Vec<Field> =
+        Vec::with_capacity(left.fields().len() + right.fields().len());
+    for f in left.fields() {
         fields.push(f.as_ref().clone());
     }
-    for f in probe_schema.fields() {
+    for f in right.fields() {
         fields.push(f.as_ref().clone());
     }
     Arc::new(Schema::new(fields))
 }
 
-/// Inner equi-join build batches with a single probe batch on `(build[key_col], probe._vid)`.
-/// Returns ONE concatenated `RecordBatch` matching `output_schema`.
-fn join_batches(
+// ---------------------------------------------------------------------------
+// Output batch construction
+// ---------------------------------------------------------------------------
+
+/// Build the output RecordBatch from inner-match indices and (for LEFT
+/// outer) NULL-padded unmatched build rows. Output column order is
+/// `left_schema ++ right_schema` regardless of which side is the probe.
+#[allow(clippy::too_many_arguments)]
+fn emit_joined_batch(
     build_batches: &[RecordBatch],
-    build_key_col_idx: usize,
     probe_batch: &RecordBatch,
-    probe_index: &HashMap<u64, Vec<usize>>,
+    matches: &[JoinMatch],
+    unmatched: &[(usize, usize)],
+    probe_side: ProbeSide,
+    left_schema: &SchemaRef,
+    right_schema: &SchemaRef,
     output_schema: &SchemaRef,
 ) -> DFResult<RecordBatch> {
-    use arrow_array::builder::UInt32Builder;
-
-    // For each (build row, probe row) match, record the corresponding
-    // (build_batch_idx, build_row_idx, probe_row_idx) so we can do a
-    // single take(...) on each side at the end.
-    let mut build_take_indices_per_batch: Vec<Vec<u32>> =
-        (0..build_batches.len()).map(|_| Vec::new()).collect();
-    let mut probe_take: Vec<u32> = Vec::new();
-
-    for (build_batch_idx, build_batch) in build_batches.iter().enumerate() {
-        let key_arr = build_batch
-            .column(build_key_col_idx)
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .ok_or_else(|| {
-                datafusion::error::DataFusionError::Plan(
-                    "VidLookupJoinExec: build key column is not UInt64".into(),
-                )
-            })?;
-        for build_row_idx in 0..key_arr.len() {
-            if key_arr.is_null(build_row_idx) {
-                continue;
-            }
-            let key = key_arr.value(build_row_idx);
-            if let Some(probe_rows) = probe_index.get(&key) {
-                for &probe_row in probe_rows {
-                    build_take_indices_per_batch[build_batch_idx].push(build_row_idx as u32);
-                    probe_take.push(probe_row as u32);
-                }
-            }
-        }
-    }
-
-    let total_rows = probe_take.len();
+    let total_rows = matches.len() + unmatched.len();
     if total_rows == 0 {
         return Ok(RecordBatch::new_empty(output_schema.clone()));
     }
 
-    // Build side: take per batch, then concatenate columns column-by-column.
+    // Group match build rows by their batch index for a single take(...) per
+    // build batch.
+    let n_build_batches = build_batches.len();
+    let mut match_take_per_build_batch: Vec<Vec<u32>> =
+        (0..n_build_batches).map(|_| Vec::new()).collect();
+    let mut match_probe_take: Vec<u32> = Vec::with_capacity(matches.len());
+    for m in matches {
+        match_take_per_build_batch[m.build_batch_idx].push(m.build_row_idx as u32);
+        match_probe_take.push(m.probe_row_idx as u32);
+    }
+
+    // Same for unmatched build rows (LEFT outer only).
+    let mut unmatched_take_per_build_batch: Vec<Vec<u32>> =
+        (0..n_build_batches).map(|_| Vec::new()).collect();
+    for &(bb_idx, br_idx) in unmatched {
+        unmatched_take_per_build_batch[bb_idx].push(br_idx as u32);
+    }
+
+    // Build "build side" output columns: take match rows and unmatched
+    // rows from each build batch, then concat across batches.
     let n_build_cols = build_batches[0].num_columns();
-    let mut build_col_arrays: Vec<Vec<ArrayRef>> = (0..n_build_cols).map(|_| Vec::new()).collect();
-    for (batch_idx, take_idx) in build_take_indices_per_batch.iter().enumerate() {
-        if take_idx.is_empty() {
-            continue;
-        }
-        let mut builder = UInt32Builder::with_capacity(take_idx.len());
-        for &i in take_idx {
-            builder.append_value(i);
-        }
-        let take_array = builder.finish();
-        let batch = &build_batches[batch_idx];
-        for (col_idx, col_arrs) in build_col_arrays.iter_mut().enumerate() {
-            let taken = arrow::compute::take(batch.column(col_idx), &take_array, None)
-                .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
-            col_arrs.push(taken);
-        }
-    }
-    let build_columns: Vec<ArrayRef> = build_col_arrays
-        .into_iter()
-        .map(|arrs| {
-            if arrs.len() == 1 {
-                Ok(arrs.into_iter().next().unwrap())
-            } else {
-                let refs: Vec<&dyn Array> = arrs.iter().map(|a| a.as_ref()).collect();
-                arrow::compute::concat(&refs)
-                    .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+    let mut build_columns: Vec<ArrayRef> = Vec::with_capacity(n_build_cols);
+    for col_idx in 0..n_build_cols {
+        let mut chunks: Vec<ArrayRef> = Vec::new();
+        for batch_idx in 0..n_build_batches {
+            // Match rows
+            if !match_take_per_build_batch[batch_idx].is_empty() {
+                chunks.push(take_indices(
+                    build_batches[batch_idx].column(col_idx),
+                    &match_take_per_build_batch[batch_idx],
+                )?);
             }
-        })
-        .collect::<DFResult<_>>()?;
-
-    // Probe side: single take.
-    let mut probe_take_builder = UInt32Builder::with_capacity(probe_take.len());
-    for v in &probe_take {
-        probe_take_builder.append_value(*v);
+            // Unmatched rows (LEFT outer)
+            if !unmatched_take_per_build_batch[batch_idx].is_empty() {
+                chunks.push(take_indices(
+                    build_batches[batch_idx].column(col_idx),
+                    &unmatched_take_per_build_batch[batch_idx],
+                )?);
+            }
+        }
+        build_columns.push(concat_arrays(&chunks)?);
     }
-    let probe_take_array = probe_take_builder.finish();
-    let probe_columns: Vec<ArrayRef> = (0..probe_batch.num_columns())
-        .map(|i| {
-            arrow::compute::take(probe_batch.column(i), &probe_take_array, None)
-                .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
-        })
-        .collect::<DFResult<_>>()?;
 
-    let mut all_columns: Vec<ArrayRef> = Vec::with_capacity(n_build_cols + probe_batch.num_columns());
-    all_columns.extend(build_columns);
-    all_columns.extend(probe_columns);
+    // Build "probe side" output columns: take match rows from probe batch,
+    // then NULL-pad for unmatched.
+    let n_probe_cols = probe_batch.num_columns();
+    let mut probe_columns: Vec<ArrayRef> = Vec::with_capacity(n_probe_cols);
+    let probe_match_arr = take_indices_u32_slice(&match_probe_take);
+    let n_unmatched = unmatched.len();
+    for col_idx in 0..n_probe_cols {
+        let probe_col = probe_batch.column(col_idx);
+        let matched_part = if match_probe_take.is_empty() {
+            arrow_array::new_empty_array(probe_col.data_type())
+        } else {
+            arrow::compute::take(probe_col.as_ref(), &probe_match_arr, None)
+                .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?
+        };
+        if n_unmatched == 0 {
+            probe_columns.push(matched_part);
+        } else {
+            let null_part = arrow_array::new_null_array(probe_col.data_type(), n_unmatched);
+            probe_columns.push(concat_arrays(&[matched_part, null_part])?);
+        }
+    }
+
+    // Compose left/right output columns based on which side is build.
+    let (left_columns, right_columns) = match probe_side {
+        ProbeSide::Left => (probe_columns, build_columns),
+        ProbeSide::Right => (build_columns, probe_columns),
+    };
+
+    let _ = (left_schema, right_schema); // kept in signature for symmetry / debugging
+
+    let mut all_columns = left_columns;
+    all_columns.extend(right_columns);
 
     RecordBatch::try_new(output_schema.clone(), all_columns)
+        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+}
+
+fn take_indices(col: &ArrayRef, indices: &[u32]) -> DFResult<ArrayRef> {
+    let take_array = take_indices_u32_slice(indices);
+    arrow::compute::take(col.as_ref(), &take_array, None)
+        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+}
+
+fn take_indices_u32_slice(indices: &[u32]) -> arrow_array::UInt32Array {
+    let mut b = UInt32Builder::with_capacity(indices.len());
+    for &i in indices {
+        b.append_value(i);
+    }
+    b.finish()
+}
+
+fn concat_arrays(arrays: &[ArrayRef]) -> DFResult<ArrayRef> {
+    if arrays.len() == 1 {
+        return Ok(arrays[0].clone());
+    }
+    let refs: Vec<&dyn Array> = arrays.iter().map(|a| a.as_ref()).collect();
+    arrow::compute::concat(&refs)
         .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
 }

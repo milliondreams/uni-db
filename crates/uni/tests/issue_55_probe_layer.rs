@@ -105,6 +105,7 @@ async fn measure_query(db: &Uni, query: &str, nid: i64, samples: usize) -> f64 {
 }
 
 #[tokio::test]
+#[cfg_attr(debug_assertions, allow(unused_variables, unused_assignments))]
 async fn probe_get_edges_layer_attribution() {
     let db = setup_db().await;
 
@@ -141,11 +142,14 @@ async fn probe_get_edges_layer_attribution() {
         eprintln!("{stage:>22} | {a:>10.2} | {b:>10.2} | {c:>10.2}");
     };
 
-    let a = measure_query(&db, q_a, participant_id, SAMPLES_PER_ROUND).await;
-    let b = measure_query(&db, q_b, participant_id, SAMPLES_PER_ROUND).await;
-    let c = measure_query(&db, q_c, participant_id, SAMPLES_PER_ROUND).await;
-    report("baseline (~21 nodes)", a, b, c);
+    let baseline_a = measure_query(&db, q_a, participant_id, SAMPLES_PER_ROUND).await;
+    let baseline_b = measure_query(&db, q_b, participant_id, SAMPLES_PER_ROUND).await;
+    let baseline_c = measure_query(&db, q_c, participant_id, SAMPLES_PER_ROUND).await;
+    report("baseline (~21 nodes)", baseline_a, baseline_b, baseline_c);
 
+    let mut last_a = baseline_a;
+    let mut last_b = baseline_b;
+    let mut last_c = baseline_c;
     let mut total_filler = 0usize;
     for round in 0..ROUNDS {
         for j in 0..FILLER_PER_ROUND {
@@ -168,6 +172,32 @@ async fn probe_get_edges_layer_attribution() {
         let c = measure_query(&db, q_c, participant_id, SAMPLES_PER_ROUND).await;
         let stage = format!("round {round} (+{total_filler})");
         report(&stage, a, b, c);
+        last_a = a;
+        last_b = b;
+        last_c = c;
+    }
+
+    // Issue #55 layer-attribution guard. After the table_exists/schema cache
+    // landed (PR #2), per-query Lance overhead post-flush is bounded but
+    // not zero. Assert ≤3× of baseline for each query shape, plus a 10 ms
+    // floor for CI noise. Only enforced in release mode where the numbers
+    // are stable enough not to flake.
+    if !cfg!(debug_assertions) {
+        let bound_a = (baseline_a * 3.0).max(10.0);
+        let bound_b = (baseline_b * 3.0).max(10.0);
+        let bound_c = (baseline_c * 3.0).max(10.0);
+        assert!(
+            last_a <= bound_a,
+            "issue #55 query A regression: {last_a:.2}ms > {bound_a:.2}ms (baseline {baseline_a:.2}ms)"
+        );
+        assert!(
+            last_b <= bound_b,
+            "issue #55 query B regression: {last_b:.2}ms > {bound_b:.2}ms (baseline {baseline_b:.2}ms)"
+        );
+        assert!(
+            last_c <= bound_c,
+            "issue #55 query C regression: {last_c:.2}ms > {bound_c:.2}ms (baseline {baseline_c:.2}ms)"
+        );
     }
 
     db.shutdown().await.unwrap();

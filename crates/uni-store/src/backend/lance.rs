@@ -29,6 +29,24 @@ pub struct LanceDbBackend {
     base_uri: String,
     /// Internal table cache keyed by full table name.
     table_cache: DashMap<String, Table>,
+    /// Existence cache populated lazily by [`Self::table_exists`].
+    ///
+    /// Avoids paying for [`Connection::table_names`] (which lists every
+    /// table in the database) on every `table_exists` call. uni-db's
+    /// query planner calls `table_exists` per-table per-query, so without
+    /// this cache, post-flush latency scales with total schema size.
+    /// Updated synchronously by `create_table`, `create_empty_table`,
+    /// `open_or_create_table`, and `drop_table` so the cache is the
+    /// authoritative source after first population. See issue #55.
+    existence_cache: DashMap<String, bool>,
+    /// Schema cache populated lazily by [`Self::get_table_schema`].
+    ///
+    /// Lance schemas are stable for the table's lifetime under our usage
+    /// (we never alter columns in place — schema-evolving migrations would
+    /// drop/recreate the table). Caching avoids the per-query
+    /// `table.schema().await` round-trip for every Cypher query that
+    /// scans a label or edge type. See issue #55.
+    schema_cache: DashMap<String, Arc<ArrowSchema>>,
 }
 
 impl LanceDbBackend {
@@ -50,6 +68,8 @@ impl LanceDbBackend {
             connection,
             base_uri: uri.to_string(),
             table_cache: DashMap::new(),
+            existence_cache: DashMap::new(),
+            schema_cache: DashMap::new(),
         })
     }
 
@@ -116,8 +136,20 @@ impl StorageBackend for LanceDbBackend {
     }
 
     async fn table_exists(&self, name: &str) -> Result<bool> {
+        if let Some(entry) = self.existence_cache.get(name) {
+            return Ok(*entry);
+        }
         let tables = self.table_names().await?;
-        Ok(tables.contains(&name.to_string()))
+        let exists = tables.iter().any(|t| t == name);
+        // entry().or_insert preserves a value written by a concurrent
+        // create_table/drop_table during our `table_names` await, which
+        // is the authoritative state. Plain `insert` would race and
+        // could overwrite a writer's `true` with our stale `false`.
+        let final_value = *self
+            .existence_cache
+            .entry(name.to_string())
+            .or_insert(exists);
+        Ok(final_value)
     }
 
     async fn create_table(&self, name: &str, batches: Vec<RecordBatch>) -> Result<()> {
@@ -132,6 +164,7 @@ impl StorageBackend for LanceDbBackend {
             .execute()
             .await
             .map_err(|e| anyhow!("Failed to create table '{}': {}", name, e))?;
+        self.existence_cache.insert(name.to_string(), true);
         Ok(())
     }
 
@@ -141,6 +174,7 @@ impl StorageBackend for LanceDbBackend {
             .execute()
             .await
             .map_err(|e| anyhow!("Failed to create empty table '{}': {}", name, e))?;
+        self.existence_cache.insert(name.to_string(), true);
         Ok(())
     }
 
@@ -156,10 +190,13 @@ impl StorageBackend for LanceDbBackend {
 
     async fn drop_table(&self, name: &str) -> Result<()> {
         self.table_cache.remove(name);
+        self.schema_cache.remove(name);
         self.connection
             .drop_table(name, &[])
             .await
-            .map_err(|e| anyhow!("Failed to drop table '{}': {}", name, e))
+            .map_err(|e| anyhow!("Failed to drop table '{}': {}", name, e))?;
+        self.existence_cache.insert(name.to_string(), false);
+        Ok(())
     }
 
     // ========================
@@ -187,12 +224,16 @@ impl StorageBackend for LanceDbBackend {
     }
 
     async fn get_table_schema(&self, name: &str) -> Result<Option<Arc<ArrowSchema>>> {
+        if let Some(entry) = self.schema_cache.get(name) {
+            return Ok(Some(entry.clone()));
+        }
         match self.get_or_open_table(name).await {
             Ok(table) => {
                 let schema = table
                     .schema()
                     .await
                     .map_err(|e| anyhow!("Failed to get schema for '{}': {}", name, e))?;
+                self.schema_cache.insert(name.to_string(), schema.clone());
                 Ok(Some(schema))
             }
             Err(_) => Ok(None),

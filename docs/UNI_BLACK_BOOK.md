@@ -1199,7 +1199,7 @@ Stored as a LanceDB table (`adjacency_{edge_type}_{direction}`) with row-per-ver
 
 ### L0 → L1 Flush
 
-Triggered when `mutation_count >= auto_flush_threshold` (default: 10,000) or `auto_flush_interval` (default: 5s) elapses with `auto_flush_min_mutations` met:
+Triggered when `mutation_count >= auto_flush_threshold` (default: 10,000) or `auto_flush_interval` (default: 5s) elapses with `auto_flush_min_mutations` (default: 100) met:
 
 1. Flush WAL to durable storage → capture LSN
 2. Rotate L0: old → `pending_flush` list, new empty L0 → `current`
@@ -4510,6 +4510,34 @@ Python: `UniBuilder.in_memory().strict_schema(True).build()` or `.config({"stric
 | `max_l1_age` | `Duration` | 1 hour | L1 age trigger (planned) |
 | `check_interval` | `Duration` | 30s | Background check frequency |
 | `worker_threads` | `usize` | 1 | Compaction worker threads |
+| `frozen_segments_compact_threshold` | `usize` | 2 | Frozen overlay segments before CSR compact |
+
+#### Tuning for ingest-heavy workloads (issue #55)
+
+Each L0 → L1 flush rotates the active overlay into a frozen segment that
+subsequent reads must consult. Under high write rates (e.g., embedding
+pipelines), segments can accumulate faster than `frozen_segments_compact_threshold`
+triggers a merge, inflating per-query latency. Two levers help:
+
+- **Lower `compaction.frozen_segments_compact_threshold`** (e.g., to `2`) to
+  compact more aggressively, keeping the frozen-segment list short.
+- **Raise `auto_flush_min_mutations`** or **disable `auto_flush_interval`**
+  (`None`) when running benchmarks to suppress the 5-second timer flushes
+  that would otherwise rotate small overlays for negligible durability gain.
+
+Example for an ingest-heavy benchmark:
+
+```rust
+let config = UniConfig {
+    auto_flush_interval: None,                     // count-based only
+    auto_flush_threshold: 50_000,                  // bigger flushes
+    compaction: CompactionConfig {
+        frozen_segments_compact_threshold: 2,      // compact sooner
+        ..CompactionConfig::default()
+    },
+    ..UniConfig::default()
+};
+```
 
 ### WriteThrottleConfig
 

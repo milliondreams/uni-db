@@ -2549,9 +2549,10 @@ impl Writer {
 
         // Trigger CSR compaction if enough frozen segments have accumulated.
         // After flush, the old L0 data is now in L1; the overlay segments can be merged
-        // into the Main CSR to reduce lookup overhead.
+        // into the Main CSR to reduce lookup overhead. Threshold is configurable
+        // via `CompactionConfig::frozen_segments_compact_threshold` (default 4).
         let am = self.adjacency_manager.clone();
-        if am.should_compact(4) {
+        if am.should_compact(self.config.compaction.frozen_segments_compact_threshold) {
             let previous_still_running = {
                 let guard = self.compaction_handle.read();
                 guard.as_ref().is_some_and(|h| !h.is_finished())

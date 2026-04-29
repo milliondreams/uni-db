@@ -431,6 +431,45 @@ SKIP 10 LIMIT 20
 
 ---
 
+## Tuning for Ingest-Heavy Workloads
+
+Per-read latency in uni-db is sensitive to how many *frozen overlay segments* have accumulated since the last CSR compaction. Each L0 → L1 flush adds one frozen segment; subsequent reads consult main CSR + every frozen segment + the active overlay. The defaults are tuned for mixed read/write traffic, but ingest-heavy benchmarks (embedding pipelines, bulk imports interleaved with reads) can accumulate segments faster than the default compaction threshold catches up.
+
+Symptoms: read latency that is flat early in the run and then steps up to several milliseconds and stays there. See issue #55 for the reference investigation.
+
+Levers (`UniConfig`):
+
+```rust
+let config = UniConfig {
+    // Suppress the 5-second timer-based flush; rely only on the count
+    // threshold (default 10,000 mutations). Useful for benchmark runs
+    // where you don't need fine-grained durability checkpoints.
+    auto_flush_interval: None,
+
+    // OR: keep the timer but require more mutations before it fires.
+    // Default 1 — single inserts wake the timer. Raise to coalesce
+    // small bursts. Higher values reduce flush frequency, which can
+    // hurt read latency if not paired with aggressive compaction below.
+    auto_flush_min_mutations: 100,
+
+    // Bigger flushes amortize the per-flush cost; fewer frozen segments.
+    auto_flush_threshold: 50_000,
+
+    compaction: CompactionConfig {
+        // Compact frozen segments back into Main CSR sooner. Default 2
+        // (lowered from 4 in the issue #55 fix). Set to 1 to compact
+        // after every flush — minimal read latency, max compaction CPU.
+        frozen_segments_compact_threshold: 1,
+        ..CompactionConfig::default()
+    },
+    ..UniConfig::default()
+};
+```
+
+Diagnostic: if `MATCH (a)-[r:LINK]->(b) WHERE id(a)=$nid` for a small constant out-degree gets noticeably slower over a long write-heavy run, this is the regime.
+
+---
+
 ## When to Load References
 
 When the SKILL.md overview is insufficient for the user's task, load the appropriate reference file for detailed API signatures, examples, and patterns.

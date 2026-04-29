@@ -9,6 +9,12 @@
 //! Test imported verbatim from the customer's `uniko-store` repro at
 //! `uniko2/crates/uniko-store/tests/get_edges_scaling_repro.rs` so that
 //! we can investigate against the same workload they ran.
+//!
+//! Fixes: PR #1 (`0aabd2b4`) per-segment short-circuit in
+//! `AdjacencyManager::get_neighbors`; PR #2 (`6d8e1035`) `table_exists` /
+//! `get_table_schema` cache in `LanceDbBackend`; PR #3 makes the CSR
+//! compaction threshold and time-based flush minimum-mutation default
+//! tunable for ingest-heavy workloads.
 
 use std::time::Instant;
 

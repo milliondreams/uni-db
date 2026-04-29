@@ -85,8 +85,16 @@ pub struct GraphScanExec {
     /// Properties to materialize as columns.
     projected_properties: Vec<String>,
 
-    /// Filter expression to push down.
+    /// Filter expression to push down (used for L0 short-circuit and
+    /// single-VID Lance pushdown). For multi-VID IN-list pushdown, use
+    /// `vid_list_filter` — see issue #55 PR #4.
     filter: Option<Arc<dyn PhysicalExpr>>,
+
+    /// Multi-VID IN-list filter to push to Lance as `_vid IN (v1, v2, ...)`.
+    /// Set when the planner has resolved a static set of vids from an
+    /// `Expr::In { Property(_, "_vid"), List }` predicate. Bypasses the
+    /// PhysicalExpr roundtrip used by `filter`. See issue #55 PR #4.
+    vid_list_filter: Option<Vec<u64>>,
 
     /// Whether this is an edge scan (vs vertex scan).
     is_edge_scan: bool,
@@ -110,8 +118,20 @@ impl fmt::Debug for GraphScanExec {
             .field("label", &self.label)
             .field("variable", &self.variable)
             .field("projected_properties", &self.projected_properties)
+            .field("vid_list_filter_len", &self.vid_list_filter.as_ref().map(Vec::len))
             .field("is_edge_scan", &self.is_edge_scan)
             .finish()
+    }
+}
+
+impl GraphScanExec {
+    /// Attach a multi-VID IN-list filter to this scan, pushing
+    /// `_vid IN (v1, v2, ...)` to Lance at execute time. Use this for
+    /// pre-resolved vid sets (e.g. from `UNWIND $list AS e WHERE id(x)=e.field`).
+    /// See issue #55 PR #4.
+    pub fn with_vid_list_filter(mut self, vids: Vec<u64>) -> Self {
+        self.vid_list_filter = Some(vids);
+        self
     }
 }
 
@@ -143,6 +163,7 @@ impl GraphScanExec {
             variable,
             projected_properties,
             filter,
+            vid_list_filter: None,
             is_edge_scan: false,
             is_schemaless: false,
             schema,
@@ -186,6 +207,7 @@ impl GraphScanExec {
             variable,
             projected_properties,
             filter,
+            vid_list_filter: None,
             is_edge_scan: false,
             is_schemaless: true,
             schema,
@@ -224,6 +246,7 @@ impl GraphScanExec {
             variable,
             projected_properties,
             filter,
+            vid_list_filter: None,
             is_edge_scan: false,
             is_schemaless: true,
             schema,
@@ -260,6 +283,7 @@ impl GraphScanExec {
             variable,
             projected_properties,
             filter,
+            vid_list_filter: None,
             is_edge_scan: false,
             is_schemaless: true,
             schema,
@@ -330,6 +354,7 @@ impl GraphScanExec {
             variable,
             projected_properties,
             filter,
+            vid_list_filter: None,
             is_edge_scan: true,
             is_schemaless: false,
             schema,
@@ -444,6 +469,7 @@ impl ExecutionPlan for GraphScanExec {
             self.is_edge_scan,
             self.is_schemaless,
             self.filter.clone(),
+            self.vid_list_filter.clone(),
             self.schema.clone(),
             metrics,
         )))
@@ -491,6 +517,9 @@ struct GraphScanStream {
     /// Pushed-down filter expression (used for VID short-circuit in L0 scans).
     filter: Option<Arc<dyn PhysicalExpr>>,
 
+    /// Multi-VID IN-list filter for Lance pushdown. See issue #55 PR #4.
+    vid_list_filter: Option<Vec<u64>>,
+
     /// Output schema.
     schema: SchemaRef,
 
@@ -512,6 +541,7 @@ impl GraphScanStream {
         is_edge_scan: bool,
         is_schemaless: bool,
         filter: Option<Arc<dyn PhysicalExpr>>,
+        vid_list_filter: Option<Vec<u64>>,
         schema: SchemaRef,
         metrics: BaselineMetrics,
     ) -> Self {
@@ -523,6 +553,7 @@ impl GraphScanStream {
             is_edge_scan,
             is_schemaless,
             filter,
+            vid_list_filter,
             schema,
             state: GraphScanState::Init,
             metrics,
@@ -1076,6 +1107,23 @@ fn try_extract_vid_eq(
     }
 
     None
+}
+
+/// Format a slice of VIDs as a Lance `_vid IN (v1, v2, ...)` filter clause.
+/// Used by the scan-side IN-list pushdown introduced in issue #55 PR #4.
+fn format_vid_in_list(vids: &[u64]) -> String {
+    use std::fmt::Write;
+    debug_assert!(!vids.is_empty());
+    let mut s = String::with_capacity(vids.len() * 8 + 12);
+    s.push_str("_vid IN (");
+    for (i, v) in vids.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        let _ = write!(s, "{v}");
+    }
+    s.push(')');
+    s
 }
 
 /// Convert a `ScalarValue` to `u64` if it is a non-negative integer type.
@@ -1695,13 +1743,17 @@ async fn columnar_scan_vertex_batch_static(
     projected_properties: &[String],
     output_schema: &SchemaRef,
     filter: &Option<Arc<dyn PhysicalExpr>>,
+    vid_list_filter: Option<&[u64]>,
 ) -> DFResult<RecordBatch> {
     let storage = graph_ctx.storage();
     let l0_ctx = graph_ctx.l0_context();
     let uni_schema = storage.schema_manager().schema();
     let label_props = uni_schema.properties.get(label);
 
-    // Extract target VID from filter for short-circuit lookup
+    // Extract target VID from filter for short-circuit lookup. Single-VID
+    // pushdown is from the WHERE-clause `id(x) = $literal` path; multi-VID
+    // pushdown is from the IN-list path (`UNWIND ... WHERE id(x) = e.field`,
+    // see issue #55 PR #4).
     let target_vid = filter.as_ref().and_then(extract_vid_from_physical_filter);
 
     // Build the list of columns to request from Lance
@@ -1729,9 +1781,14 @@ async fn columnar_scan_vertex_batch_static(
         push_column_if_absent(&mut lance_columns, "overflow_json");
     }
 
-    // Try to query Lance via StorageManager domain method.
     // Push _vid filter to Lance for O(log N) BTree index lookup instead of full scan.
-    let vid_filter = target_vid.map(|v| format!("_vid = {v}"));
+    // Prefer the multi-VID list (formats as `_vid IN (...)`); fall back to
+    // single-VID `_vid = N` from the WHERE-clause path.
+    let vid_filter = match (vid_list_filter, target_vid) {
+        (Some(vs), _) if !vs.is_empty() => Some(format_vid_in_list(vs)),
+        (_, Some(v)) => Some(format!("_vid = {v}")),
+        _ => None,
+    };
     let lance_columns_refs: Vec<&str> = lance_columns.iter().map(|s| s.as_str()).collect();
     let lance_batch = storage
         .scan_vertex_table(label, &lance_columns_refs, vid_filter.as_deref())
@@ -1928,11 +1985,14 @@ async fn columnar_scan_schemaless_vertex_batch_static(
     projected_properties: &[String],
     output_schema: &SchemaRef,
     filter: &Option<Arc<dyn PhysicalExpr>>,
+    vid_list_filter: Option<&[u64]>,
 ) -> DFResult<RecordBatch> {
     let storage = graph_ctx.storage();
     let l0_ctx = graph_ctx.l0_context();
 
-    // Extract target VID from filter for short-circuit lookup
+    // Extract target VID from filter for short-circuit lookup. See the
+    // detailed comment on the per-label scan for the IN-list path
+    // (issue #55 PR #4).
     let target_vid = filter.as_ref().and_then(extract_vid_from_physical_filter);
 
     // Build the Lance filter expression — do NOT filter _deleted here;
@@ -1940,9 +2000,12 @@ async fn columnar_scan_schemaless_vertex_batch_static(
     let filter = {
         let mut parts = Vec::new();
 
-        // VID point-lookup filter — uses BTree index on _vid
-        if let Some(vid) = target_vid {
-            parts.push(format!("_vid = {vid}"));
+        // VID point-lookup filter — uses BTree index on _vid. Prefer the
+        // multi-VID list (formats as `_vid IN (...)`); fall back to single-VID.
+        match (vid_list_filter, target_vid) {
+            (Some(vs), _) if !vs.is_empty() => parts.push(format_vid_in_list(vs)),
+            (_, Some(vid)) => parts.push(format!("_vid = {vid}")),
+            _ => {}
         }
 
         // Label filter
@@ -3230,6 +3293,7 @@ impl Stream for GraphScanStream {
                     let is_edge_scan = self.is_edge_scan;
                     let is_schemaless = self.is_schemaless;
                     let filter = self.filter.clone();
+                    let vid_list_filter = self.vid_list_filter.clone();
                     let schema = self.schema.clone();
 
                     let fut = async move {
@@ -3254,6 +3318,7 @@ impl Stream for GraphScanStream {
                                 &properties,
                                 &schema,
                                 &filter,
+                                vid_list_filter.as_deref(),
                             )
                             .await?
                         } else {
@@ -3264,6 +3329,7 @@ impl Stream for GraphScanStream {
                                 &properties,
                                 &schema,
                                 &filter,
+                                vid_list_filter.as_deref(),
                             )
                             .await?
                         };

@@ -10,6 +10,28 @@
 //!
 //! Regular queries read Main CSR + overlay with zero version filtering.
 //! Snapshot queries additionally filter by version and resurrect shadow entries.
+//!
+//! # Read-path cost model
+//!
+//! Every read consults three layers in order:
+//! 1. **Main CSR** — single `DashMap` lookup keyed by `(edge_type, direction)` →
+//!    O(out-degree) entry scan.
+//! 2. **Frozen segments** — a `Vec<Arc<FrozenCsrSegment>>`. Each frozen segment is a
+//!    plain `HashMap` (lock-free read). The read iterates this vec; each segment is
+//!    short-circuited via [`FrozenCsrSegment::has_entries_for`] when it contributed
+//!    no edges of the queried `(edge_type, direction)`, AND its tombstones map is
+//!    empty. Both checks are O(1).
+//! 3. **Active overlay** — single `RwLock<L0CsrSegment>` taken once per read; same
+//!    short-circuits applied as for frozen segments.
+//!
+//! Frozen segments are pure RAM. The on-disk Lance L1 delta is a write-through redo
+//! log, not consulted on the read hot path. Frozen segments are merged back into the
+//! Main CSR by [`AdjacencyManager::compact`], spawned from the writer's flush path
+//! once the segment count exceeds a small threshold.
+//!
+//! When extending the read path, preserve the invariant that any segment carrying a
+//! tombstone — even for an unrelated edge type — must run the `retain` pass against
+//! `result`, because tombstones can shadow edges materialized from layers below.
 
 use crate::storage::adjacency_overlay::{FrozenCsrSegment, L0CsrSegment};
 use crate::storage::csr::MainCsr;
@@ -82,30 +104,50 @@ impl AdjacencyManager {
                 }
             }
 
-            // 2. Frozen segments (oldest first) — add inserts, then remove tombstones
+            // 2. Frozen segments (oldest first) — add inserts, then remove tombstones.
+            // Skip whole segment when it has no inserts for this (edge_type, dir)
+            // AND no tombstones at all — both is_empty checks are O(1) on plain HashMaps,
+            // so this is a strict speedup that scales away with frozen-segment count
+            // when most segments don't touch the queried edge type. See issue #55.
             for segment in self.frozen_segments.read().iter() {
-                if let Some(adj) = segment.inserts.get(&(edge_type, dir))
+                let has_inserts = segment.has_entries_for(edge_type, dir);
+                let has_tombstones = !segment.tombstones.is_empty();
+                if !has_inserts && !has_tombstones {
+                    continue;
+                }
+                if has_inserts
+                    && let Some(adj) = segment.inserts.get(&(edge_type, dir))
                     && let Some(neighbors) = adj.get(&vid)
                 {
                     for &(neighbor, eid, _version) in neighbors {
                         result.insert(eid, neighbor);
                     }
                 }
-                // Apply tombstones against ALL prior results (Main CSR + older segments)
-                result.retain(|eid, _| !segment.tombstones.contains_key(eid));
+                // Apply tombstones against ALL prior results (Main CSR + older segments).
+                // Skip the retain pass entirely when there are no tombstones — it would
+                // be a no-op but still O(result_size) due to the closure call.
+                if has_tombstones {
+                    result.retain(|eid, _| !segment.tombstones.contains_key(eid));
+                }
             }
 
-            // 3. Active overlay — add inserts, then remove tombstones
+            // 3. Active overlay — add inserts, then remove tombstones.
+            // Same short-circuits as the frozen branch, plus we hold the read lock
+            // for the whole branch so DashMap atomic-op cost is paid once, not twice.
             let active = self.active_overlay.read();
-            if let Some(adj) = active.inserts.get(&(edge_type, dir))
+            let active_has_inserts = active.has_entries_for(edge_type, dir);
+            let active_has_tombstones = !active.tombstones.is_empty();
+            if active_has_inserts
+                && let Some(adj) = active.inserts.get(&(edge_type, dir))
                 && let Some(neighbors) = adj.get(&vid)
             {
                 for &(neighbor, eid, _version) in neighbors {
                     result.insert(eid, neighbor);
                 }
             }
-            // Apply active overlay tombstones against ALL prior results
-            result.retain(|eid, _| !active.tombstones.contains_key(eid));
+            if active_has_tombstones {
+                result.retain(|eid, _| !active.tombstones.contains_key(eid));
+            }
         }
 
         result.into_iter().map(|(e, n)| (n, e)).collect()
@@ -135,9 +177,16 @@ impl AdjacencyManager {
                 }
             }
 
-            // 2. Frozen segments — filter inserts by version, apply tombstones
+            // 2. Frozen segments — filter inserts by version, apply tombstones.
+            // Same skip-irrelevant-segment short-circuit as get_neighbors. See issue #55.
             for segment in self.frozen_segments.read().iter() {
-                if let Some(adj) = segment.inserts.get(&(edge_type, dir))
+                let has_inserts = segment.has_entries_for(edge_type, dir);
+                let has_tombstones = !segment.tombstones.is_empty();
+                if !has_inserts && !has_tombstones {
+                    continue;
+                }
+                if has_inserts
+                    && let Some(adj) = segment.inserts.get(&(edge_type, dir))
                     && let Some(neighbors) = adj.get(&vid)
                 {
                     for &(neighbor, eid, ver) in neighbors {
@@ -146,17 +195,22 @@ impl AdjacencyManager {
                         }
                     }
                 }
-                result.retain(|eid, _| {
-                    segment
-                        .tombstones
-                        .get(eid)
-                        .is_none_or(|ts| ts.version > version)
-                });
+                if has_tombstones {
+                    result.retain(|eid, _| {
+                        segment
+                            .tombstones
+                            .get(eid)
+                            .is_none_or(|ts| ts.version > version)
+                    });
+                }
             }
 
             // 3. Active overlay — add version-filtered inserts, then apply tombstones
             let active = self.active_overlay.read();
-            if let Some(adj) = active.inserts.get(&(edge_type, dir))
+            let active_has_inserts = active.has_entries_for(edge_type, dir);
+            let active_has_tombstones = !active.tombstones.is_empty();
+            if active_has_inserts
+                && let Some(adj) = active.inserts.get(&(edge_type, dir))
                 && let Some(neighbors) = adj.get(&vid)
             {
                 for &(neighbor, eid, ver) in neighbors {
@@ -169,13 +223,14 @@ impl AdjacencyManager {
                     }
                 }
             }
-            // Apply active overlay tombstones against ALL prior results
-            result.retain(|eid, _| {
-                active
-                    .tombstones
-                    .get(eid)
-                    .is_none_or(|ts| ts.version > version)
-            });
+            if active_has_tombstones {
+                result.retain(|eid, _| {
+                    active
+                        .tombstones
+                        .get(eid)
+                        .is_none_or(|ts| ts.version > version)
+                });
+            }
 
             // 4. Shadow CSR — resurrect edges alive at version
             for (neighbor, eid) in self
@@ -1123,5 +1178,101 @@ mod tests {
             0,
             "Vertex B should have no neighbors (all deleted)"
         );
+    }
+
+    /// Verify that the irrelevant-segment short-circuit (issue #55) doesn't
+    /// change observable behavior: with many frozen segments where only one
+    /// holds the queried edge, `get_neighbors` returns exactly that edge.
+    ///
+    /// Also covers `get_neighbors_at_version` with the same short-circuit.
+    #[test]
+    fn test_get_neighbors_skips_irrelevant_segments() {
+        let am = AdjacencyManager::new(1024 * 1024);
+        let participant = Vid::new(1);
+        let session = Vid::new(2);
+        let link_eid = Eid::new(100);
+        let link_etype: u32 = 1;
+        let unrelated_etype: u32 = 2;
+
+        // Build up 50 frozen segments. Only segment #17 carries the LINK
+        // edge from `participant`. The others are populated with unrelated
+        // edges that share neither edge_type nor vid with the query.
+        for i in 0..50 {
+            if i == 17 {
+                am.insert_edge(participant, session, link_eid, link_etype, i as u64 + 1);
+            } else {
+                // Unrelated traffic: different edge_type, different vids.
+                let src = Vid::new(1000 + i as u64);
+                let dst = Vid::new(2000 + i as u64);
+                let eid = Eid::new(10_000 + i as u64);
+                am.insert_edge(src, dst, eid, unrelated_etype, i as u64 + 1);
+            }
+            // Freeze the active overlay into a new frozen segment.
+            let frozen = {
+                let mut active = am.active_overlay.write();
+                let old = std::mem::take(&mut *active);
+                Arc::new(old.freeze())
+            };
+            am.frozen_segments.write().push(frozen);
+        }
+
+        // Sanity: 50 frozen segments accumulated, none compacted yet.
+        assert_eq!(am.frozen_segment_count(), 50);
+
+        // Hot path: returns exactly the one LINK edge.
+        let n = am.get_neighbors(participant, link_etype, Direction::Outgoing);
+        assert_eq!(n.len(), 1);
+        assert_eq!(n[0], (session, link_eid));
+
+        // Snapshot path: same answer at a version that includes segment #17.
+        let n_at = am.get_neighbors_at_version(participant, link_etype, Direction::Outgoing, 100);
+        assert_eq!(n_at.len(), 1);
+        assert_eq!(n_at[0], (session, link_eid));
+
+        // Snapshot path: at a version BEFORE segment #17 was created (#17's
+        // version is 18), the edge must not be visible.
+        let n_before = am.get_neighbors_at_version(participant, link_etype, Direction::Outgoing, 17);
+        assert!(n_before.is_empty());
+
+        // The unrelated `unrelated_etype` edges must still be reachable —
+        // short-circuiting must not have hidden them from their own queries.
+        // i=18 was an unrelated insert (i=17 was the LINK), so Vid(1018) is
+        // a valid source for an unrelated edge.
+        let unrelated = am.get_neighbors(Vid::new(1018), unrelated_etype, Direction::Outgoing);
+        assert_eq!(unrelated.len(), 1);
+    }
+
+    /// Verify that the tombstone short-circuit (issue #55) doesn't drop
+    /// transitively-shadowed edges: a frozen segment that has a tombstone
+    /// for an edge present in Main CSR must still apply that tombstone,
+    /// even if the segment has no inserts of its own for the queried type.
+    #[test]
+    fn test_tombstone_in_unrelated_segment_still_applied() {
+        let am = AdjacencyManager::new(1024 * 1024);
+        let src = Vid::new(0);
+        let dst = Vid::new(10);
+        let eid = Eid::new(100);
+        let etype: u32 = 1;
+
+        // Edge exists in Main CSR.
+        let csr = MainCsr::from_edge_entries(0, vec![(0, dst, eid, 1)]);
+        am.set_main_csr(etype, Direction::Outgoing, csr);
+
+        // Add a tombstone in the active overlay deleting the Main CSR edge.
+        am.add_tombstone(eid, src, dst, etype, 2);
+
+        // Freeze the active overlay so the tombstone now lives in a frozen
+        // segment whose `inserts` is empty for `etype`. The short-circuit
+        // for "no inserts AND no tombstones" must NOT skip this segment —
+        // it has a tombstone we still need to honour.
+        let frozen = {
+            let mut active = am.active_overlay.write();
+            let old = std::mem::take(&mut *active);
+            Arc::new(old.freeze())
+        };
+        am.frozen_segments.write().push(frozen);
+
+        let n = am.get_neighbors(src, etype, Direction::Outgoing);
+        assert!(n.is_empty(), "tombstone in frozen segment must still hide Main CSR edge");
     }
 }

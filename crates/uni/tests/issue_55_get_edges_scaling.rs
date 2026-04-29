@@ -186,5 +186,23 @@ async fn repro_get_edges_scales_with_graph_size() {
         );
     }
 
+    // Issue #55 regression guard. Only enforced in release mode where the
+    // numbers are stable enough not to flake; debug-mode timings are too
+    // noisy to bound reliably (see commit log on this file).
+    //
+    // Pre-fix the slowdown was 2.7-4.6× across runs and machines. Post-fix
+    // (PR #1: hot-path short-circuits in AdjacencyManager) the latency stays
+    // flat. We allow up to 3× plus a 10ms floor to absorb CI noise.
+    #[cfg(not(debug_assertions))]
+    {
+        let allowed_ms = (baseline_ms * 3.0).max(10.0);
+        assert!(
+            final_ms <= allowed_ms,
+            "issue #55 regression: final {final_ms:.1}ms exceeds {allowed_ms:.1}ms \
+             (baseline {baseline_ms:.1}ms, ratio {:.1}×)",
+            final_ms / baseline_ms
+        );
+    }
+
     db.shutdown().await.unwrap();
 }

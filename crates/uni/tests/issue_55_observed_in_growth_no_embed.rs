@@ -151,8 +151,7 @@ async fn probe_observed_in_growth_no_embed() {
         }
     }
 
-    let first_50_mean: f64 =
-        samples[..50].iter().map(|v| *v as f64).sum::<f64>() / 50.0 / 1000.0;
+    let first_50_mean: f64 = samples[..50].iter().map(|v| *v as f64).sum::<f64>() / 50.0 / 1000.0;
     let last_50_mean: f64 = samples[samples.len() - 50..]
         .iter()
         .map(|v| *v as f64)

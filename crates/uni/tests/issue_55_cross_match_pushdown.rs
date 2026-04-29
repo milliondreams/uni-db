@@ -54,9 +54,7 @@ async fn create_source(db: &Uni, name: &str, linked_vid: i64, score: f64) -> i64
     let session = db.session();
     let tx = session.tx().await.unwrap();
     let r = tx
-        .query_with(
-            "CREATE (n:Source {name: $n, linked_vid: $v, score: $s}) RETURN id(n) AS vid",
-        )
+        .query_with("CREATE (n:Source {name: $n, linked_vid: $v, score: $s}) RETURN id(n) AS vid")
         .param("n", Value::String(name.to_string()))
         .param("v", Value::Int(linked_vid))
         .param("s", Value::Float(score))
@@ -83,7 +81,7 @@ async fn cross_match_returns_correct_pairs() {
 
     create_source(&db, "s_high_a", target_vids[0], 0.9).await;
     create_source(&db, "s_high_b", target_vids[2], 0.7).await;
-    create_source(&db, "s_low",    target_vids[3], 0.1).await;
+    create_source(&db, "s_low", target_vids[3], 0.1).await;
 
     let session = db.session();
     let result = session
@@ -149,8 +147,8 @@ async fn cross_match_unmatched_build_keys_are_dropped() {
     let db = setup_db().await;
     let t0 = create_target(&db, "t0").await;
 
-    create_source(&db, "matches_t0",  t0,           0.9).await;
-    create_source(&db, "matches_none", 9_999_999,    0.9).await;
+    create_source(&db, "matches_t0", t0, 0.9).await;
+    create_source(&db, "matches_none", 9_999_999, 0.9).await;
 
     let session = db.session();
     let result = session
@@ -270,9 +268,7 @@ async fn create_source_t(db: &Uni, name: &str, linked_vid: i64, tenant: &str) ->
     let session = db.session();
     let tx = session.tx().await.unwrap();
     let r = tx
-        .query_with(
-            "CREATE (n:Source {name: $n, linked_vid: $v, tenant: $t}) RETURN id(n) AS vid",
-        )
+        .query_with("CREATE (n:Source {name: $n, linked_vid: $v, tenant: $t}) RETURN id(n) AS vid")
         .param("n", Value::String(name.to_string()))
         .param("v", Value::Int(linked_vid))
         .param("t", Value::String(tenant.to_string()))
@@ -334,8 +330,8 @@ async fn cross_match_left_outer_preserves_build_with_null() {
     let db = setup_db().await;
 
     let t = create_target(&db, "t").await;
-    create_source(&db, "matches",   t,           1.0).await;
-    create_source(&db, "unmatched", 9_999_999,   1.0).await;
+    create_source(&db, "matches", t, 1.0).await;
+    create_source(&db, "unmatched", 9_999_999, 1.0).await;
 
     let session = db.session();
     let result = session
@@ -364,7 +360,10 @@ async fn cross_match_left_outer_preserves_build_with_null() {
     assert_eq!(summary[0].0, "matches");
     assert_eq!(summary[0].1.as_deref(), Some("t"));
     assert_eq!(summary[1].0, "unmatched");
-    assert_eq!(summary[1].1, None, "unmatched build row's probe column should be NULL");
+    assert_eq!(
+        summary[1].1, None,
+        "unmatched build row's probe column should be NULL"
+    );
 
     db.shutdown().await.unwrap();
 }
@@ -391,7 +390,10 @@ async fn cross_match_left_outer_all_unmatched() {
     assert_eq!(result.rows().len(), 2);
     for row in result.rows() {
         let bn = row.try_get::<String>("bname");
-        assert!(bn.is_none(), "bname should be None for all unmatched, got {bn:?}");
+        assert!(
+            bn.is_none(),
+            "bname should be None for all unmatched, got {bn:?}"
+        );
     }
     db.shutdown().await.unwrap();
 }

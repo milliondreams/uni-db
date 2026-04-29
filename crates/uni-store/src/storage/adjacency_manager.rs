@@ -1231,7 +1231,8 @@ mod tests {
 
         // Snapshot path: at a version BEFORE segment #17 was created (#17's
         // version is 18), the edge must not be visible.
-        let n_before = am.get_neighbors_at_version(participant, link_etype, Direction::Outgoing, 17);
+        let n_before =
+            am.get_neighbors_at_version(participant, link_etype, Direction::Outgoing, 17);
         assert!(n_before.is_empty());
 
         // The unrelated `unrelated_etype` edges must still be reachable —
@@ -1273,6 +1274,9 @@ mod tests {
         am.frozen_segments.write().push(frozen);
 
         let n = am.get_neighbors(src, etype, Direction::Outgoing);
-        assert!(n.is_empty(), "tombstone in frozen segment must still hide Main CSR edge");
+        assert!(
+            n.is_empty(),
+            "tombstone in frozen segment must still hide Main CSR edge"
+        );
     }
 }

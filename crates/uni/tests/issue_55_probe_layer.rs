@@ -156,10 +156,7 @@ async fn probe_get_edges_layer_attribution() {
             let msg_id = create_node(
                 &db,
                 "Message",
-                &[(
-                    "content",
-                    Value::String(format!("filler r{round}-{j}")),
-                )],
+                &[("content", Value::String(format!("filler r{round}-{j}")))],
             )
             .await;
             let target_session = session_ids[j % session_ids.len()];

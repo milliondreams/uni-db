@@ -11,7 +11,7 @@
 //!   2. Extract distinct VIDs from the build side's anchor-pair column.
 //!   3. Push them as `_vid IN (...)` to the probe scan via
 //!      `GraphScanExec::execute_with_vid_filter`. If the build VID set
-//!      exceeds [`MAX_VIDS_PER_CHUNK`] we chunk into multiple `_vid IN`
+//!      exceeds `MAX_VIDS_PER_CHUNK` we chunk into multiple `_vid IN`
 //!      filters and concat the batches — bounded list size, indexed lookup
 //!      preserved at scale.
 //!   4. Index probe by `_vid` and join in memory. Non-anchor equi-pairs
@@ -553,12 +553,7 @@ fn build_probe_vid_index(
 /// Uses `ScalarValue` for type-erased comparison so the operator works for
 /// any column type Arrow can lift into a `ScalarValue` (which covers all
 /// types we currently materialize from Lance).
-fn values_equal(
-    a_col: &ArrayRef,
-    a_row: usize,
-    b_col: &ArrayRef,
-    b_row: usize,
-) -> DFResult<bool> {
+fn values_equal(a_col: &ArrayRef, a_row: usize, b_col: &ArrayRef, b_row: usize) -> DFResult<bool> {
     let a = ScalarValue::try_from_array(a_col, a_row)?;
     let b = ScalarValue::try_from_array(b_col, b_row)?;
     Ok(a == b)
@@ -587,8 +582,7 @@ fn locate_vid_column(schema: &SchemaRef) -> DFResult<usize> {
 /// Concatenate two schemas in plan order. Field names kept as-is; Cypher
 /// variable-naming rules guarantee uniqueness across the two sides.
 fn concat_schemas(left: &SchemaRef, right: &SchemaRef) -> SchemaRef {
-    let mut fields: Vec<Field> =
-        Vec::with_capacity(left.fields().len() + right.fields().len());
+    let mut fields: Vec<Field> = Vec::with_capacity(left.fields().len() + right.fields().len());
     for f in left.fields() {
         fields.push(f.as_ref().clone());
     }

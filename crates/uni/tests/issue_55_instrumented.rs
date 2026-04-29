@@ -25,9 +25,9 @@
 
 use std::time::Instant;
 
-use uni_db::{Uni, Value};
 #[allow(unused_imports)] // used when toggling the diagnostic experiment
 use uni_db::UniConfig;
+use uni_db::{Uni, Value};
 
 const PARTICIPANT_EDGES: usize = 20;
 const FILLER_PER_ROUND: usize = 200;
@@ -184,7 +184,11 @@ async fn instrumented_get_edges_scaling() {
         baseline_cold.push(c);
         baseline_warm.push(w);
     }
-    report("baseline (~21 nodes)", &mut baseline_cold, &mut baseline_warm);
+    report(
+        "baseline (~21 nodes)",
+        &mut baseline_cold,
+        &mut baseline_warm,
+    );
 
     let mut total_filler = 0usize;
     for round in 0..ROUNDS {
@@ -192,10 +196,7 @@ async fn instrumented_get_edges_scaling() {
             let msg_id = create_node(
                 &db,
                 "Message",
-                &[(
-                    "content",
-                    Value::String(format!("filler r{round}-{j}")),
-                )],
+                &[("content", Value::String(format!("filler r{round}-{j}")))],
             )
             .await;
             let target_session = session_ids[j % session_ids.len()];

@@ -94,7 +94,7 @@ async fn create_node(db: &Uni, cypher: &str, params: &[(&str, Value)]) -> i64 {
     let tx = session.tx().await.unwrap();
     let mut qb = tx.query_with(cypher);
     for (k, v) in params {
-        qb = qb.param(*k, v.clone());
+        qb = qb.param(k, v.clone());
     }
     let result = qb.fetch_all().await.unwrap();
     tx.commit().await.unwrap();
@@ -172,7 +172,10 @@ async fn repro_get_edges_scales_with_autoembed() {
                  timestamp: $p2}) RETURN id(n) AS vid",
                 &[
                     ("p0", Value::String(format!("msg-r{round}-{j:03}"))),
-                    ("p1", Value::String(format!("{MESSAGE_TEXT} (r{round} #{j})"))),
+                    (
+                        "p1",
+                        Value::String(format!("{MESSAGE_TEXT} (r{round} #{j})")),
+                    ),
                     ("p2", Value::String(chrono::Utc::now().to_rfc3339())),
                 ],
             )

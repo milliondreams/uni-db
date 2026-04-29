@@ -7013,11 +7013,35 @@ impl QueryPlanner {
 
     fn collect_index_usage(&self, plan: &LogicalPlan, usage: &mut Vec<IndexUsage>) {
         match plan {
-            LogicalPlan::Scan { .. } => {
-                // Placeholder: Scan might use index if it was optimized
-                // Ideally LogicalPlan::Scan should store if it uses index.
-                // But typically Planner converts Scan to specific index scan or we infer it here.
+            LogicalPlan::Scan {
+                label_id,
+                filter: Some(filter),
+                ..
+            } => {
+                // Detect indexed-property pushdown — issue #57. Run the same
+                // analyzer the physical planner uses; if it reports a
+                // hash-index hit, surface it in EXPLAIN.
+                if let Some(label_name) = self.schema.label_name_by_id(*label_id) {
+                    let analyzer = crate::query::pushdown::IndexAwareAnalyzer::new(&self.schema);
+                    // The variable name is the scan's binding variable; we
+                    // reach for it via the Scan node directly.
+                    if let LogicalPlan::Scan { variable, .. } = plan {
+                        let strategy = analyzer.analyze(filter, variable, *label_id);
+                        for prop in strategy.hash_index_columns {
+                            usage.push(IndexUsage {
+                                label_or_type: label_name.to_string(),
+                                property: prop,
+                                index_type: "HASH".to_string(),
+                                used: true,
+                                reason: Some(
+                                    "Hash index point lookup pushed into Lance scan".to_string(),
+                                ),
+                            });
+                        }
+                    }
+                }
             }
+            LogicalPlan::Scan { .. } => {}
             LogicalPlan::VectorKnn {
                 label_id, property, ..
             } => {

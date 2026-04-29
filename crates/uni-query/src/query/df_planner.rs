@@ -1387,6 +1387,100 @@ impl HybridPhysicalPlanner {
         }
     }
 
+    /// AND-combine a non-empty list of predicates into a single `Expr`.
+    /// Trivial for length 0/1 (returns true / the single expr); folds left
+    /// for length >= 2.
+    fn and_join_predicates(mut preds: Vec<Expr>) -> Expr {
+        if preds.is_empty() {
+            return uni_cypher::ast::Expr::TRUE;
+        }
+        let mut acc = preds.remove(0);
+        for p in preds {
+            acc = Expr::BinaryOp {
+                left: Box::new(acc),
+                op: uni_cypher::ast::BinaryOp::And,
+                right: Box::new(p),
+            };
+        }
+        acc
+    }
+
+    /// Build the indexed-property pushdown for a vertex scan: a Lance SQL
+    /// filter string AND an Arrow-side `PhysicalExpr`, both derived from the
+    /// same set of indexed-property conjuncts.
+    ///
+    /// - The Lance string drives an O(1) hash-index lookup against on-disk data.
+    /// - The Arrow filter applies to the merged (Lance + L0) batch in-process,
+    ///   so L0 rows that haven't been flushed yet are still index-bounded.
+    ///
+    /// Returns `None` when no indexed predicate exists or any parameter
+    /// resolution fails — in that case the planner falls back to the regular
+    /// post-scan `FilterExec`. See issue #57.
+    fn build_indexed_property_pushdown(
+        &self,
+        filter: Option<&Expr>,
+        variable: &str,
+        label_id: u16,
+        scan_schema: &SchemaRef,
+    ) -> Option<(String, Arc<dyn datafusion::physical_expr::PhysicalExpr>)> {
+        let filter = filter?;
+        let analyzer = crate::query::pushdown::IndexAwareAnalyzer::new(&self.schema);
+        let strategy = analyzer.analyze(filter, variable, label_id);
+        if strategy.hash_index_columns.is_empty() {
+            return None;
+        }
+
+        // Collect lance_predicates that touch a hash-indexed column. Other
+        // lance_predicates (e.g. range on non-indexed props) are deliberately
+        // left for the outer FilterExec: pushing them inside the scan
+        // would also filter L0 rows that match the indexed conjunct but not
+        // the residual conjunct on the SAME row — which is fine — but the
+        // outer FilterExec already handles them, so keeping the boundary
+        // simple keeps the merge behaviour obvious.
+        let label_name = self.schema.label_name_by_id(label_id)?;
+        let label_props = self.schema.properties.get(label_name);
+        let mut indexed_preds: Vec<Expr> = Vec::new();
+        for pred in &strategy.lance_predicates {
+            if let Some(col) = crate::query::pushdown::predicate_target_column(pred, variable)
+                && strategy.hash_index_columns.iter().any(|c| c == &col)
+            {
+                let resolved = crate::query::pushdown::substitute_params(pred, &self.params)?;
+                indexed_preds.push(resolved);
+            }
+        }
+        if indexed_preds.is_empty() {
+            return None;
+        }
+
+        // Render the Lance SQL filter string for storage-side pushdown.
+        let lance_str = crate::query::pushdown::LanceFilterGenerator::generate(
+            &indexed_preds,
+            variable,
+            label_props,
+        )?;
+
+        // Build the Arrow-side PhysicalExpr from the same predicates. The
+        // GraphScanExec applies it to the merged (Lance+L0) batch so the
+        // scan output is index-bounded regardless of where the data lives.
+        let combined = Self::and_join_predicates(indexed_preds.clone());
+        let mut variable_kinds = HashMap::new();
+        variable_kinds.insert(variable.to_string(), VariableKind::Node);
+        let mut variable_labels = HashMap::new();
+        variable_labels.insert(variable.to_string(), label_name.to_string());
+        let ctx = TranslationContext {
+            parameters: self.params.clone(),
+            variable_labels,
+            variable_kinds,
+            ..Default::default()
+        };
+        let df_filter = cypher_expr_to_df(&combined, Some(&ctx)).ok()?;
+        let session = self.session_ctx.read();
+        let physical = self
+            .create_physical_filter_expr(&df_filter, scan_schema, &session)
+            .ok()?;
+        Some((lance_str, physical))
+    }
+
     fn apply_scan_filter(
         &self,
         plan: Arc<dyn ExecutionPlan>,
@@ -1732,8 +1826,7 @@ impl HybridPhysicalPlanner {
         // `_vid IN (literals)`) bypasses the PhysicalExpr roundtrip and goes
         // direct to GraphScanExec via `with_vid_list_filter` — at runtime
         // it becomes `_vid IN (v1, v2, ...)` for Lance pushdown. See issue #55 PR #4.
-        let extracted_vids =
-            Self::extract_vid_from_cypher_filter(filter, variable, &self.params);
+        let extracted_vids = Self::extract_vid_from_cypher_filter(filter, variable, &self.params);
         let scan_filter = extracted_vids
             .as_deref()
             .filter(|v| v.len() == 1)
@@ -1749,6 +1842,22 @@ impl HybridPhysicalPlanner {
             && vids.len() > 1
         {
             scan_exec = scan_exec.with_vid_list_filter(vids);
+        }
+
+        // Indexed-property pushdown — issue #57. Detect equality / IN
+        // predicates against hash-indexed properties on (label, prop), resolve
+        // any parameters at plan time, render BOTH a Lance SQL filter (for
+        // on-disk index lookup) and an Arrow PhysicalExpr (for in-process
+        // L0 filtering). The redundant FilterExec on top (added by
+        // `apply_scan_filter` below) is harmless and keeps residual conjuncts
+        // (e.g. non-indexed multi-property AND) correct.
+        let scan_schema_for_idx = scan_exec.schema();
+        if let Some((lance_str, runtime_filter)) =
+            self.build_indexed_property_pushdown(filter, variable, label_id, &scan_schema_for_idx)
+        {
+            scan_exec = scan_exec
+                .with_extra_lance_filter(lance_str)
+                .with_extra_runtime_filter(runtime_filter);
         }
         let mut scan_plan: Arc<dyn ExecutionPlan> = Arc::new(scan_exec);
 
@@ -2028,8 +2137,7 @@ impl HybridPhysicalPlanner {
         let (properties, need_full) = Self::resolve_schemaless_properties(variable, all_properties);
         // Extract VID(s) from filter for scan-level optimization. See the
         // detailed comment at the per-label scan site (issue #55 PR #4).
-        let extracted_vids =
-            Self::extract_vid_from_cypher_filter(filter, variable, &self.params);
+        let extracted_vids = Self::extract_vid_from_cypher_filter(filter, variable, &self.params);
         let scan_filter = extracted_vids
             .as_deref()
             .filter(|v| v.len() == 1)
@@ -3166,19 +3274,18 @@ impl HybridPhysicalPlanner {
 
         let session = self.session_ctx.read();
         let state = session.state();
-        let left_compiler =
-            crate::query::df_graph::expr_compiler::CypherPhysicalExprCompiler::new(
-                &state,
-                Some(&left_ctx),
-            )
-            .with_subquery_ctx(
-                self.graph_ctx.clone(),
-                self.schema.clone(),
-                self.session_ctx.clone(),
-                self.storage.clone(),
-                self.params.clone(),
-                self.outer_entity_vars.clone(),
-            );
+        let left_compiler = crate::query::df_graph::expr_compiler::CypherPhysicalExprCompiler::new(
+            &state,
+            Some(&left_ctx),
+        )
+        .with_subquery_ctx(
+            self.graph_ctx.clone(),
+            self.schema.clone(),
+            self.session_ctx.clone(),
+            self.storage.clone(),
+            self.params.clone(),
+            self.outer_entity_vars.clone(),
+        );
         let right_compiler =
             crate::query::df_graph::expr_compiler::CypherPhysicalExprCompiler::new(
                 &state,
@@ -6053,8 +6160,9 @@ fn extract_static_unwind_values(
             | LogicalPlan::Unwind { input, .. } => walk(input, target_var, params),
             // CrossJoin: search both subtrees. The UNWIND of `target_var`
             // lives in exactly one side; the other returns None.
-            LogicalPlan::CrossJoin { left, right } => walk(left, target_var, params)
-                .or_else(|| walk(right, target_var, params)),
+            LogicalPlan::CrossJoin { left, right } => {
+                walk(left, target_var, params).or_else(|| walk(right, target_var, params))
+            }
             _ => None,
         }
     }

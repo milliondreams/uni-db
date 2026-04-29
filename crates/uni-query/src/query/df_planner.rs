@@ -3014,6 +3014,30 @@ impl HybridPhysicalPlanner {
             pairs
         };
 
+        // Issue #55 PR #5: cross-MATCH dynamic VID-filter pushdown.
+        // When the join is a single-pair INNER equi-join on a probe-side
+        // `_vid` column, and the probe-side planned subtree is a fresh
+        // `GraphScanExec`, replace `HashJoinExec{build, full_label_scan}`
+        // with `VidLookupJoinExec{build, probe_scan_with_runtime_in_list}`.
+        // The build is materialized at execute time, its keys are pushed
+        // as `_vid IN (...)` to Lance, and the join runs in memory. Falls
+        // through to the HashJoinExec below for any non-matching shape
+        // (multi-key, non-Inner, non-Scan probe, build_expr that doesn't
+        // compile to a column reference, etc.).
+        if join_type == JoinType::Inner
+            && cls.equi_pairs.len() == 1
+            && cls.residual.is_none()
+            && let Some(plan) = self.try_emit_vid_lookup_join(
+                &cls.equi_pairs[0],
+                &left_plan,
+                &right_plan,
+                &left_with_filter,
+                &right_with_filter,
+            )?
+        {
+            return Ok(Some(plan));
+        }
+
         let join: Arc<dyn ExecutionPlan> = Arc::new(HashJoinExec::try_new(
             left_plan,
             right_plan,
@@ -3056,6 +3080,103 @@ impl HybridPhysicalPlanner {
         }
 
         Ok(Some(join))
+    }
+
+    /// Issue #55 PR #5: detect the cross-MATCH dynamic VID-filter pushdown
+    /// pattern and emit `VidLookupJoinExec` instead of `HashJoinExec`.
+    /// Returns `Ok(None)` for any pattern that doesn't match — the caller
+    /// falls through to the standard HashJoin emission.
+    ///
+    /// Pattern recognised:
+    ///   * Single equi-pair `(l_expr, r_expr)` where exactly one side is
+    ///     `Property(Variable(scan_var), "_vid")`.
+    ///   * The corresponding planned subtree is a top-level `GraphScanExec`
+    ///     for `scan_var` (no FilterExec/Projection on top).
+    ///   * The other side (`build_expr`) compiles to a `Column` reference
+    ///     against the build's schema. Computed expressions on the build
+    ///     side fall through to HashJoin.
+    fn try_emit_vid_lookup_join(
+        &self,
+        equi_pair: &(Expr, Expr),
+        left_plan: &Arc<dyn ExecutionPlan>,
+        right_plan: &Arc<dyn ExecutionPlan>,
+        left_logical: &LogicalPlan,
+        right_logical: &LogicalPlan,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        use crate::query::df_graph::scan::GraphScanExec;
+        use crate::query::df_graph::vid_lookup_join::VidLookupJoinExec;
+        use datafusion::physical_expr::expressions::Column;
+
+        let (l_expr, r_expr) = equi_pair;
+
+        // Identify which side is the probe (`Property(Variable(_), "_vid")`).
+        // Per the equi-pair classifier's invariant, l_expr's variables come
+        // from the LEFT subtree, r_expr's from the RIGHT subtree — so
+        // `is_vid_property(l_expr)` ⇒ probe is left, etc.
+        let (probe_expr, build_expr, probe_plan, build_plan, build_logical) =
+            if expr_is_vid_property(l_expr) {
+                (l_expr, r_expr, left_plan, right_plan, right_logical)
+            } else if expr_is_vid_property(r_expr) {
+                (r_expr, l_expr, right_plan, left_plan, left_logical)
+            } else {
+                return Ok(None);
+            };
+        let _ = probe_expr; // kept for clarity / future debug
+
+        // Probe-side planned tree must be a top-level GraphScanExec. Any
+        // wrapper (FilterExec/Project/etc.) means we don't have a clean
+        // probe to inject the IN-list filter into.
+        if probe_plan
+            .as_any()
+            .downcast_ref::<GraphScanExec>()
+            .is_none()
+        {
+            return Ok(None);
+        }
+
+        // Compile build_expr against build's schema. We require it to
+        // resolve to a single Column reference — computed expressions
+        // (e.g. `a.x + a.y`) on the build side aren't supported here.
+        let build_schema = build_plan.schema();
+        let build_ctx = self.translation_context_for_plan(build_logical);
+        let build_phys = {
+            let session = self.session_ctx.read();
+            let state = session.state();
+            let compiler = crate::query::df_graph::expr_compiler::CypherPhysicalExprCompiler::new(
+                &state,
+                Some(&build_ctx),
+            )
+            .with_subquery_ctx(
+                self.graph_ctx.clone(),
+                self.schema.clone(),
+                self.session_ctx.clone(),
+                self.storage.clone(),
+                self.params.clone(),
+                self.outer_entity_vars.clone(),
+            );
+            compiler.compile(build_expr, &build_schema)?
+        };
+
+        let Some(build_col) = build_phys.as_any().downcast_ref::<Column>() else {
+            return Ok(None);
+        };
+        let build_key_col_idx = build_col.index();
+
+        // Build-side column must be UInt64 (a VID). Anything else is a
+        // type-mismatch we'd rather route through HashJoinExec's
+        // unify_join_key_types path that handles wrapping.
+        if !matches!(
+            build_schema.field(build_key_col_idx).data_type(),
+            datafusion::arrow::datatypes::DataType::UInt64
+        ) {
+            return Ok(None);
+        }
+
+        Ok(Some(Arc::new(VidLookupJoinExec::try_new(
+            build_plan.clone(),
+            probe_plan.clone(),
+            build_key_col_idx,
+        )?)))
     }
 
     /// Plan a projection, passing alias map through to Sort nodes in the input chain.
@@ -6045,6 +6166,19 @@ fn build_in_pushdown(
 }
 
 /// Wrap `plan` with a `LogicalPlan::Filter` AND-combining `filters` if any.
+/// Returns true if `expr` is `Property(Variable(_), "_vid")`. Used by
+/// [`try_emit_vid_lookup_join`] (issue #55 PR #5) to identify the probe side
+/// of an inner-equi-join. `id(x)` is lowered to this shape during AST→
+/// logical-plan translation, so we don't need a separate `FunctionCall`
+/// arm here.
+fn expr_is_vid_property(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Property(inner, prop)
+            if prop == "_vid" && matches!(inner.as_ref(), Expr::Variable(_))
+    )
+}
+
 fn wrap_with_filter(plan: LogicalPlan, filters: &[Expr]) -> LogicalPlan {
     if filters.is_empty() {
         return plan;

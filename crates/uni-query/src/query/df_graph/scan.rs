@@ -133,6 +133,46 @@ impl GraphScanExec {
         self.vid_list_filter = Some(vids);
         self
     }
+
+    /// Execute this scan once with a runtime-supplied list of VIDs as the
+    /// pushdown filter (`_vid IN (v1, v2, ...)`). Returns a single merged
+    /// `RecordBatch`. Used by `VidLookupJoinExec` (issue #55 PR #5) for
+    /// cross-MATCH dynamic pushdown — the build side materializes its keys at
+    /// runtime, then the probe scan runs once with those keys.
+    ///
+    /// Only supported for vertex and schemaless-vertex scans; edge scans
+    /// have a different shape and aren't currently a join target for this
+    /// optimization.
+    pub(crate) async fn execute_with_vid_filter(&self, vids: &[u64]) -> DFResult<RecordBatch> {
+        if self.is_edge_scan {
+            return Err(datafusion::error::DataFusionError::Plan(
+                "execute_with_vid_filter not supported for edge scans".into(),
+            ));
+        }
+        if self.is_schemaless {
+            columnar_scan_schemaless_vertex_batch_static(
+                &self.graph_ctx,
+                &self.label,
+                &self.variable,
+                &self.projected_properties,
+                &self.schema,
+                &self.filter,
+                Some(vids),
+            )
+            .await
+        } else {
+            columnar_scan_vertex_batch_static(
+                &self.graph_ctx,
+                &self.label,
+                &self.variable,
+                &self.projected_properties,
+                &self.schema,
+                &self.filter,
+                Some(vids),
+            )
+            .await
+        }
+    }
 }
 
 impl GraphScanExec {

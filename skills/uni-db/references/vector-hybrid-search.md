@@ -479,7 +479,7 @@ OPTIONS {
 |---|---|---|
 | MistralRS | Local | `provider-mistralrs` |
 | Candle | Local | `provider-candle` |
-| FastEmbed | Local | `provider-fastembed` |
+| ONNX (raw / rerank / embed) | Local | `provider-onnx` |
 | OpenAI | Remote | `provider-openai` |
 | Gemini | Remote | `provider-gemini` |
 | Anthropic | Remote | `provider-anthropic` |
@@ -713,7 +713,7 @@ RETURN node.title, score
 
 | Provider | Provider ID | Model Example | Type |
 |---|---|---|---|
-| ONNX (local) | `local/onnx-reranker` | `cross-encoder/ms-marco-MiniLM-L6-v2` | Local CPU/GPU inference |
+| ONNX (local) | `local/onnx` | `cross-encoder/ms-marco-MiniLM-L6-v2` | Local CPU/GPU inference |
 | Cohere | `remote/cohere` | `rerank-english-v3.0` | Remote API |
 | Voyage AI | `remote/voyageai` | `rerank-2` | Remote API |
 
@@ -723,13 +723,13 @@ RETURN node.title, score
   {
     "alias": "rerank/minilm",
     "task": "Rerank",
-    "provider_id": "local/onnx-reranker",
+    "provider_id": "local/onnx",
     "model_id": "cross-encoder/ms-marco-MiniLM-L6-v2"
   }
 ]
 ```
 
-The local ONNX provider (`local/onnx-reranker`) requires the `provider-onnx` feature flag. It downloads the model and tokenizer from HuggingFace on first use and caches them locally.
+The local ONNX provider (`local/onnx`) requires the `provider-onnx` feature flag. It downloads the model and tokenizer from HuggingFace on first use and caches them locally.
 
 ### Reranking Does NOT Apply to `similar_to()`
 

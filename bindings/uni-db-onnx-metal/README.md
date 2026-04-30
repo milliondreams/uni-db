@@ -1,11 +1,11 @@
 # uni-db-onnx-metal
 
-Python bindings for Uni Graph Database with the **ONNX provider on Apple CoreML**.
+Python bindings for Uni Graph Database — **slim ONNX + remote APIs + Apple GPU/ANE**. ORT models accelerate via the CoreML execution provider; no host setup required beyond a supported macOS.
 
-Apple Silicon only (macOS arm64). ORT models accelerate via the CoreML execution provider; no host setup required beyond a supported macOS.
-
-For the full wheel matrix (CPU / CUDA / Metal variants, other provider combos), see [the wheel matrix doc](https://github.com/rustic-ai/uni-db/blob/main/docs/proposals/python-wheel-matrix.md). For full documentation, see https://rustic-ai.github.io/uni-db.
+Apple Silicon only (macOS arm64).
 
 ```
 pip install uni-db-onnx-metal
 ```
+
+For the full wheel matrix (default-everything, slim, CUDA, Apple GPU/ANE), see the [migration guide](https://github.com/rustic-ai/uni-db/blob/main/docs/migrations/0.9.0-wheel-matrix-collapse.md).

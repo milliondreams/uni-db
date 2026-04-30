@@ -299,7 +299,7 @@ Error: Query execution failed: Out of memory
 **Causes and Solutions:**
 
 1. **Embedding model mismatch:** Ensure the same embedding model is used for indexing and querying.
-   - Auto-embedding uses `Candle` (default) or `FastEmbed` (optional feature). `openai`/`ollama` configs are planned but not yet implemented.
+   - Auto-embedding routes through any provider in the catalog. `local/candle` (BERT-style) and `local/onnx` (FastEmbed-compatible alias strings via the unified ONNX Embed task) are the two local backends. Remote APIs (OpenAI, Gemini, Vertex, Voyage, Cohere) are supported through their respective `provider-*` features.
 
 2. **Dimension mismatch:**
    ```bash

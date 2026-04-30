@@ -69,28 +69,20 @@ jobs:
         run: |
           cargo clippy --workspace \
             --exclude uni-tck \
+            --exclude uni-python-cuda \
+            --exclude uni-python-metal \
             --exclude uni-python-onnx-cuda \
             --exclude uni-python-onnx-metal \
-            --exclude uni-python-fastembed-cuda \
-            --exclude uni-python-fastembed-metal \
-            --exclude uni-python-mistralrs-cuda \
-            --exclude uni-python-mistralrs-metal \
-            --exclude uni-python-all-cuda \
-            --exclude uni-python-all-metal \
             --all-targets -- -D warnings
 
       - name: Run tests
         run: |
           cargo nextest run --workspace \
             --exclude uni-tck \
+            --exclude uni-python-cuda \
+            --exclude uni-python-metal \
             --exclude uni-python-onnx-cuda \
-            --exclude uni-python-onnx-metal \
-            --exclude uni-python-fastembed-cuda \
-            --exclude uni-python-fastembed-metal \
-            --exclude uni-python-mistralrs-cuda \
-            --exclude uni-python-mistralrs-metal \
-            --exclude uni-python-all-cuda \
-            --exclude uni-python-all-metal
+            --exclude uni-python-onnx-metal
 
       # Provider-onnx is opt-in (not in default features). The two ONNX
       # linking modes are mutually exclusive at compile time, so we test
@@ -300,16 +292,9 @@ jobs:
             --exclude uni-python \
             --exclude uni-tck \
             --exclude uni-python-onnx \
+            --exclude uni-python-cuda \
+            --exclude uni-python-metal \
             --exclude uni-python-onnx-cuda \
-            --exclude uni-python-onnx-metal \
-            --exclude uni-python-fastembed \
-            --exclude uni-python-fastembed-cuda \
-            --exclude uni-python-fastembed-metal \
-            --exclude uni-python-mistralrs \
-            --exclude uni-python-mistralrs-cuda \
-            --exclude uni-python-mistralrs-metal \
-            --exclude uni-python-all \
-            --exclude uni-python-all-cuda \
-            --exclude uni-python-all-metal
+            --exclude uni-python-onnx-metal
         env:
           RUSTDOCFLAGS: -D warnings

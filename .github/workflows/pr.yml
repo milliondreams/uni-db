@@ -58,14 +58,10 @@ jobs:
         run: |
           cargo clippy --workspace \
             --exclude uni-tck \
+            --exclude uni-python-cuda \
+            --exclude uni-python-metal \
             --exclude uni-python-onnx-cuda \
             --exclude uni-python-onnx-metal \
-            --exclude uni-python-fastembed-cuda \
-            --exclude uni-python-fastembed-metal \
-            --exclude uni-python-mistralrs-cuda \
-            --exclude uni-python-mistralrs-metal \
-            --exclude uni-python-all-cuda \
-            --exclude uni-python-all-metal \
             --all-targets -- -D warnings
 
   # Rust tests
@@ -96,14 +92,10 @@ jobs:
         run: |
           cargo nextest run --workspace \
             --exclude uni-tck \
+            --exclude uni-python-cuda \
+            --exclude uni-python-metal \
             --exclude uni-python-onnx-cuda \
-            --exclude uni-python-onnx-metal \
-            --exclude uni-python-fastembed-cuda \
-            --exclude uni-python-fastembed-metal \
-            --exclude uni-python-mistralrs-cuda \
-            --exclude uni-python-mistralrs-metal \
-            --exclude uni-python-all-cuda \
-            --exclude uni-python-all-metal
+            --exclude uni-python-onnx-metal
 
   # Python bindings tests
   python-tests:
@@ -177,8 +169,9 @@ jobs:
         run: uv run pytest tests/ -v -n auto
 
   # CUDA wheel-graph smoke check — catches Cargo-dep-graph breakage in
-  # the `uni-db-fastembed-cuda` variant early, without paying the price
-  # of compiling its CUDA build scripts on every PR.
+  # the `uni-db-cuda` variant (default-everything + CUDA, the largest CUDA
+  # dep graph) early, without paying the price of compiling its CUDA build
+  # scripts on every PR.
   #
   # We use `cargo metadata` instead of `cargo check` because:
   #
@@ -195,8 +188,8 @@ jobs:
   # compilation) run in `release-wheels.yml::build-cuda-toolkit-linux`
   # on tag-push or workflow_dispatch. Source-level CUDA-specific bugs
   # are detected there.
-  wheels-fastembed-cuda-smoke:
-    name: Wheel-graph smoke check (uni-db-fastembed-cuda)
+  wheels-cuda-smoke:
+    name: Wheel-graph smoke check (uni-db-cuda)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -204,8 +197,8 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Resolve Cargo metadata for uni-db-fastembed-cuda
+      - name: Resolve Cargo metadata for uni-db-cuda
         run: |
           cargo metadata --format-version=1 \
-            --manifest-path bindings/uni-db-fastembed-cuda/Cargo.toml \
+            --manifest-path bindings/uni-db-cuda/Cargo.toml \
             > /dev/null

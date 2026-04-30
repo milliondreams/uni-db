@@ -1,7 +1,20 @@
 # Python wheel matrix for `uni-db`
 
-**Status:** Draft
+> **Historical record (preserved 2026-04-29).** This document describes the
+> 12-wheel matrix designed against uni-xervo 0.6.x's feature surface. That
+> design was superseded by the 6-wheel collapse in `uni-db 1.2.0`, driven
+> by uni-xervo 0.9.0's three-axis model (provider × linking × acceleration).
+> See `docs/migrations/0.9.0-wheel-matrix-collapse.md` for the current
+> design, the deletion rationale, and the upgrade mapping for users on the
+> old wheels (`uni-db-fastembed*`, `uni-db-mistralrs*`, `uni-db-all*`).
+>
+> The body below remains as it was authored — useful as context for *why*
+> the original 12 variants were chosen, but no longer authoritative. Do not
+> refer to this document when picking a wheel today.
+
+**Status:** Superseded (was Draft)
 **Created:** 2026-04-26
+**Superseded:** 2026-04-29 by `docs/migrations/0.9.0-wheel-matrix-collapse.md`
 **Audience:** anyone deciding which `uni-db` wheel to install, or working on the publish pipeline
 **Scope:** the maturin-built Python package at `bindings/uni-db/` (PyPI name `uni-db`, import `uni_db`)
 

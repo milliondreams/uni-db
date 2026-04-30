@@ -259,6 +259,16 @@ pub fn arrow_to_value(col: &dyn Array, row: usize, data_type: Option<&DataType>)
                     });
                 }
             }
+            DataType::Bytes => {
+                let Some(arr) = col.as_any().downcast_ref::<LargeBinaryArray>() else {
+                    log::warn!("Bytes column is not LargeBinaryArray");
+                    return Value::Null;
+                };
+                if arr.is_null(row) {
+                    return Value::Null;
+                }
+                return Value::Bytes(arr.value(row).to_vec());
+            }
             DataType::Btic => {
                 let Some(fsb) = col.as_any().downcast_ref::<FixedSizeBinaryArray>() else {
                     log::warn!("BTIC column is not FixedSizeBinaryArray");
@@ -1079,6 +1089,7 @@ impl<'a> PropertyExtractor<'a> {
                 self.build_vector_column(len, deleted, get_props, *dimensions)
             }
             DataType::CypherValue => self.build_json_column(len, deleted, get_props),
+            DataType::Bytes => self.build_bytes_column(len, deleted, get_props),
             DataType::List(inner) => self.build_list_column(len, deleted, get_props, inner),
             DataType::Map(key, value) => self.build_map_column(len, deleted, get_props, key, value),
             DataType::Crdt(_) => self.build_crdt_column(len, deleted, get_props),
@@ -1432,6 +1443,24 @@ impl<'a> PropertyExtractor<'a> {
             // Encode to CypherValue (MessagePack-tagged)
             let cv_bytes = uni_common::cypher_value_codec::encode(uni_val);
             builder.append_value(&cv_bytes);
+        }
+        Ok(Arc::new(builder.finish()))
+    }
+
+    fn build_bytes_column<F>(&self, len: usize, deleted: &[bool], get_props: F) -> Result<ArrayRef>
+    where
+        F: Fn(usize) -> Option<&'a Value>,
+    {
+        let mut builder = LargeBinaryBuilder::with_capacity(len, len * 64);
+        for (i, &is_deleted) in deleted.iter().enumerate().take(len) {
+            let val = get_props(i);
+            if let Some(Value::Bytes(b)) = val {
+                builder.append_value(b);
+            } else if is_deleted {
+                builder.append_value(&[][..]);
+            } else {
+                builder.append_null();
+            }
         }
         Ok(Arc::new(builder.finish()))
     }
@@ -1792,6 +1821,68 @@ mod tests {
         assert_eq!(int_arr.value(0), 25);
         assert_eq!(int_arr.value(1), 30);
         assert_eq!(int_arr.value(2), 0); // Deleted entries get default
+    }
+
+    #[test]
+    fn test_property_extractor_bytes_roundtrip() {
+        let blob = vec![0u8, 1, 2, 255];
+        let props: Vec<HashMap<String, Value>> = vec![
+            [("blob".to_string(), Value::Bytes(blob.clone()))]
+                .into_iter()
+                .collect(),
+            [("blob".to_string(), Value::Bytes(Vec::new()))]
+                .into_iter()
+                .collect(),
+            HashMap::new(),
+        ];
+        let deleted = vec![false, false, false];
+
+        let extractor = PropertyExtractor::new("blob", &DataType::Bytes);
+        let arr = extractor
+            .build_column(3, &deleted, |i| props[i].get("blob"))
+            .unwrap();
+
+        // Decode each row through arrow_to_value with Bytes hint.
+        assert_eq!(
+            arrow_to_value(arr.as_ref(), 0, Some(&DataType::Bytes)),
+            Value::Bytes(blob)
+        );
+        assert_eq!(
+            arrow_to_value(arr.as_ref(), 1, Some(&DataType::Bytes)),
+            Value::Bytes(Vec::new())
+        );
+        // Missing property → null in the Arrow array.
+        assert_eq!(
+            arrow_to_value(arr.as_ref(), 2, Some(&DataType::Bytes)),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn test_bytes_vs_cypher_value_disambiguation() {
+        // A LargeBinary column tagged as DataType::Bytes must NOT be decoded
+        // through the CypherValue MessagePack codec, even though both share
+        // the same Arrow physical type.
+        let raw = vec![0xDEu8, 0xAD, 0xBE, 0xEF];
+        let props: Vec<HashMap<String, Value>> = vec![
+            [("blob".to_string(), Value::Bytes(raw.clone()))]
+                .into_iter()
+                .collect(),
+        ];
+        let extractor = PropertyExtractor::new("blob", &DataType::Bytes);
+        let arr = extractor
+            .build_column(1, &[false], |i| props[i].get("blob"))
+            .unwrap();
+        // With schema hint: raw bytes returned.
+        assert_eq!(
+            arrow_to_value(arr.as_ref(), 0, Some(&DataType::Bytes)),
+            Value::Bytes(raw)
+        );
+    }
+
+    #[test]
+    fn test_data_type_bytes_to_arrow() {
+        assert_eq!(DataType::Bytes.to_arrow(), ArrowDataType::LargeBinary);
     }
 
     #[test]

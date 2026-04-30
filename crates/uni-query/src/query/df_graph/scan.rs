@@ -85,8 +85,29 @@ pub struct GraphScanExec {
     /// Properties to materialize as columns.
     projected_properties: Vec<String>,
 
-    /// Filter expression to push down.
+    /// Filter expression to push down (used for L0 short-circuit and
+    /// single-VID Lance pushdown). For multi-VID IN-list pushdown, use
+    /// `vid_list_filter` — see issue #55 PR #4.
     filter: Option<Arc<dyn PhysicalExpr>>,
+
+    /// Multi-VID IN-list filter to push to Lance as `_vid IN (v1, v2, ...)`.
+    /// Set when the planner has resolved a static set of vids from an
+    /// `Expr::In { Property(_, "_vid"), List }` predicate. Bypasses the
+    /// PhysicalExpr roundtrip used by `filter`. See issue #55 PR #4.
+    vid_list_filter: Option<Vec<u64>>,
+
+    /// Pre-rendered Lance filter string for indexed-property pushdown
+    /// (e.g. `name = 'foo'`). AND-combined with the VID filter at scan time.
+    /// Populated by the planner when an indexed-property equality / IN
+    /// predicate is detected — Lance turns it into a hash-index lookup.
+    /// See issue #57.
+    extra_lance_filter: Option<String>,
+
+    /// Arrow-side equivalent of `extra_lance_filter`, applied to the merged
+    /// (Lance + L0) batch in-process so the scan output reflects only
+    /// matching rows even when data is still in L0 (Lance pushdown alone
+    /// can't reach uncommitted/unflushed rows). See issue #57.
+    extra_runtime_filter: Option<Arc<dyn PhysicalExpr>>,
 
     /// Whether this is an edge scan (vs vertex scan).
     is_edge_scan: bool,
@@ -110,8 +131,89 @@ impl fmt::Debug for GraphScanExec {
             .field("label", &self.label)
             .field("variable", &self.variable)
             .field("projected_properties", &self.projected_properties)
+            .field(
+                "vid_list_filter_len",
+                &self.vid_list_filter.as_ref().map(Vec::len),
+            )
             .field("is_edge_scan", &self.is_edge_scan)
             .finish()
+    }
+}
+
+impl GraphScanExec {
+    /// Attach a multi-VID IN-list filter to this scan, pushing
+    /// `_vid IN (v1, v2, ...)` to Lance at execute time. Use this for
+    /// pre-resolved vid sets (e.g. from `UNWIND $list AS e WHERE id(x)=e.field`).
+    /// See issue #55 PR #4.
+    pub fn with_vid_list_filter(mut self, vids: Vec<u64>) -> Self {
+        self.vid_list_filter = Some(vids);
+        self
+    }
+
+    /// Attach a pre-rendered Lance filter string for indexed-property
+    /// pushdown. AND-combined with any VID filter at scan time. See
+    /// issue #57.
+    pub fn with_extra_lance_filter(mut self, filter: String) -> Self {
+        self.extra_lance_filter = Some(filter);
+        self
+    }
+
+    /// Attach the Arrow-side counterpart of `extra_lance_filter`. Applied to
+    /// the merged (Lance + L0) batch so the scan output is index-bound even
+    /// for not-yet-flushed L0 rows. See issue #57.
+    pub fn with_extra_runtime_filter(mut self, filter: Arc<dyn PhysicalExpr>) -> Self {
+        self.extra_runtime_filter = Some(filter);
+        self
+    }
+
+    /// Whether this scan has an extra Lance filter pushed in. Used by the
+    /// EXPLAIN/IndexUsage path to confirm the planner actually pushed.
+    pub fn has_extra_lance_filter(&self) -> bool {
+        self.extra_lance_filter.is_some()
+    }
+
+    /// Execute this scan once with a runtime-supplied list of VIDs as the
+    /// pushdown filter (`_vid IN (v1, v2, ...)`). Returns a single merged
+    /// `RecordBatch`. Used by `VidLookupJoinExec` (issue #55 PR #5) for
+    /// cross-MATCH dynamic pushdown — the build side materializes its keys at
+    /// runtime, then the probe scan runs once with those keys.
+    ///
+    /// Only supported for vertex and schemaless-vertex scans; edge scans
+    /// have a different shape and aren't currently a join target for this
+    /// optimization.
+    pub(crate) async fn execute_with_vid_filter(&self, vids: &[u64]) -> DFResult<RecordBatch> {
+        if self.is_edge_scan {
+            return Err(datafusion::error::DataFusionError::Plan(
+                "execute_with_vid_filter not supported for edge scans".into(),
+            ));
+        }
+        if self.is_schemaless {
+            columnar_scan_schemaless_vertex_batch_static(
+                &self.graph_ctx,
+                &self.label,
+                &self.variable,
+                &self.projected_properties,
+                &self.schema,
+                &self.filter,
+                Some(vids),
+                self.extra_lance_filter.as_deref(),
+                self.extra_runtime_filter.as_ref(),
+            )
+            .await
+        } else {
+            columnar_scan_vertex_batch_static(
+                &self.graph_ctx,
+                &self.label,
+                &self.variable,
+                &self.projected_properties,
+                &self.schema,
+                &self.filter,
+                Some(vids),
+                self.extra_lance_filter.as_deref(),
+                self.extra_runtime_filter.as_ref(),
+            )
+            .await
+        }
     }
 }
 
@@ -143,6 +245,9 @@ impl GraphScanExec {
             variable,
             projected_properties,
             filter,
+            vid_list_filter: None,
+            extra_lance_filter: None,
+            extra_runtime_filter: None,
             is_edge_scan: false,
             is_schemaless: false,
             schema,
@@ -186,6 +291,9 @@ impl GraphScanExec {
             variable,
             projected_properties,
             filter,
+            vid_list_filter: None,
+            extra_lance_filter: None,
+            extra_runtime_filter: None,
             is_edge_scan: false,
             is_schemaless: true,
             schema,
@@ -224,6 +332,9 @@ impl GraphScanExec {
             variable,
             projected_properties,
             filter,
+            vid_list_filter: None,
+            extra_lance_filter: None,
+            extra_runtime_filter: None,
             is_edge_scan: false,
             is_schemaless: true,
             schema,
@@ -260,6 +371,9 @@ impl GraphScanExec {
             variable,
             projected_properties,
             filter,
+            vid_list_filter: None,
+            extra_lance_filter: None,
+            extra_runtime_filter: None,
             is_edge_scan: false,
             is_schemaless: true,
             schema,
@@ -330,6 +444,9 @@ impl GraphScanExec {
             variable,
             projected_properties,
             filter,
+            vid_list_filter: None,
+            extra_lance_filter: None,
+            extra_runtime_filter: None,
             is_edge_scan: true,
             is_schemaless: false,
             schema,
@@ -444,6 +561,9 @@ impl ExecutionPlan for GraphScanExec {
             self.is_edge_scan,
             self.is_schemaless,
             self.filter.clone(),
+            self.vid_list_filter.clone(),
+            self.extra_lance_filter.clone(),
+            self.extra_runtime_filter.clone(),
             self.schema.clone(),
             metrics,
         )))
@@ -491,6 +611,16 @@ struct GraphScanStream {
     /// Pushed-down filter expression (used for VID short-circuit in L0 scans).
     filter: Option<Arc<dyn PhysicalExpr>>,
 
+    /// Multi-VID IN-list filter for Lance pushdown. See issue #55 PR #4.
+    vid_list_filter: Option<Vec<u64>>,
+
+    /// Extra Lance filter string (e.g. `name = 'foo'`) for indexed-property
+    /// pushdown. See issue #57.
+    extra_lance_filter: Option<String>,
+
+    /// Arrow-side equivalent of `extra_lance_filter`. See issue #57.
+    extra_runtime_filter: Option<Arc<dyn PhysicalExpr>>,
+
     /// Output schema.
     schema: SchemaRef,
 
@@ -512,6 +642,9 @@ impl GraphScanStream {
         is_edge_scan: bool,
         is_schemaless: bool,
         filter: Option<Arc<dyn PhysicalExpr>>,
+        vid_list_filter: Option<Vec<u64>>,
+        extra_lance_filter: Option<String>,
+        extra_runtime_filter: Option<Arc<dyn PhysicalExpr>>,
         schema: SchemaRef,
         metrics: BaselineMetrics,
     ) -> Self {
@@ -523,6 +656,9 @@ impl GraphScanStream {
             is_edge_scan,
             is_schemaless,
             filter,
+            vid_list_filter,
+            extra_lance_filter,
+            extra_runtime_filter,
             schema,
             state: GraphScanState::Init,
             metrics,
@@ -1076,6 +1212,34 @@ fn try_extract_vid_eq(
     }
 
     None
+}
+
+/// AND-combine an optional VID filter clause with an optional indexed-property
+/// filter clause. Either, both, or neither may be present. See issues #55, #57.
+fn combine_lance_filters(vid_filter: Option<&str>, extra: Option<&str>) -> Option<String> {
+    match (vid_filter, extra) {
+        (Some(a), Some(b)) => Some(format!("({a}) AND ({b})")),
+        (Some(a), None) => Some(a.to_string()),
+        (None, Some(b)) => Some(b.to_string()),
+        (None, None) => None,
+    }
+}
+
+/// Format a slice of VIDs as a Lance `_vid IN (v1, v2, ...)` filter clause.
+/// Used by the scan-side IN-list pushdown introduced in issue #55 PR #4.
+fn format_vid_in_list(vids: &[u64]) -> String {
+    use std::fmt::Write;
+    debug_assert!(!vids.is_empty());
+    let mut s = String::with_capacity(vids.len() * 8 + 12);
+    s.push_str("_vid IN (");
+    for (i, v) in vids.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        let _ = write!(s, "{v}");
+    }
+    s.push(')');
+    s
 }
 
 /// Convert a `ScalarValue` to `u64` if it is a non-negative integer type.
@@ -1688,6 +1852,7 @@ fn map_edge_to_output_schema(
 /// for known-label vertex scans. Reads all needed columns in a single Lance query,
 /// performs MVCC dedup via Arrow compute, merges L0 buffer data, filters tombstones,
 /// and maps to the output schema.
+#[expect(clippy::too_many_arguments)]
 async fn columnar_scan_vertex_batch_static(
     graph_ctx: &GraphExecutionContext,
     label: &str,
@@ -1695,13 +1860,19 @@ async fn columnar_scan_vertex_batch_static(
     projected_properties: &[String],
     output_schema: &SchemaRef,
     filter: &Option<Arc<dyn PhysicalExpr>>,
+    vid_list_filter: Option<&[u64]>,
+    extra_lance_filter: Option<&str>,
+    extra_runtime_filter: Option<&Arc<dyn PhysicalExpr>>,
 ) -> DFResult<RecordBatch> {
     let storage = graph_ctx.storage();
     let l0_ctx = graph_ctx.l0_context();
     let uni_schema = storage.schema_manager().schema();
     let label_props = uni_schema.properties.get(label);
 
-    // Extract target VID from filter for short-circuit lookup
+    // Extract target VID from filter for short-circuit lookup. Single-VID
+    // pushdown is from the WHERE-clause `id(x) = $literal` path; multi-VID
+    // pushdown is from the IN-list path (`UNWIND ... WHERE id(x) = e.field`,
+    // see issue #55 PR #4).
     let target_vid = filter.as_ref().and_then(extract_vid_from_physical_filter);
 
     // Build the list of columns to request from Lance
@@ -1729,12 +1900,19 @@ async fn columnar_scan_vertex_batch_static(
         push_column_if_absent(&mut lance_columns, "overflow_json");
     }
 
-    // Try to query Lance via StorageManager domain method.
     // Push _vid filter to Lance for O(log N) BTree index lookup instead of full scan.
-    let vid_filter = target_vid.map(|v| format!("_vid = {v}"));
+    // Prefer the multi-VID list (formats as `_vid IN (...)`); fall back to
+    // single-VID `_vid = N` from the WHERE-clause path. AND-combined with
+    // any indexed-property pushdown (issue #57).
+    let vid_part = match (vid_list_filter, target_vid) {
+        (Some(vs), _) if !vs.is_empty() => Some(format_vid_in_list(vs)),
+        (_, Some(v)) => Some(format!("_vid = {v}")),
+        _ => None,
+    };
+    let combined_filter = combine_lance_filters(vid_part.as_deref(), extra_lance_filter);
     let lance_columns_refs: Vec<&str> = lance_columns.iter().map(|s| s.as_str()).collect();
     let lance_batch = storage
-        .scan_vertex_table(label, &lance_columns_refs, vid_filter.as_deref())
+        .scan_vertex_table(label, &lance_columns_refs, combined_filter.as_deref())
         .await
         .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
 
@@ -1792,14 +1970,46 @@ async fn columnar_scan_vertex_batch_static(
     }
 
     // Map to output schema
-    map_to_output_schema(
+    let mapped = map_to_output_schema(
         &filtered,
         label,
         variable,
         projected_properties,
         output_schema,
         l0_ctx,
-    )
+    )?;
+
+    // Apply indexed-property runtime filter (issue #57). Lance has already
+    // filtered the on-disk side via `extra_lance_filter`; this catches any
+    // L0 rows that slipped through the merge.
+    apply_runtime_filter(mapped, extra_runtime_filter)
+}
+
+/// Apply the indexed-property runtime filter, if present, to a `RecordBatch`.
+/// Returns the filtered batch (or the original if no filter is set). Rows
+/// where the predicate evaluates to NULL are treated as non-matching, same
+/// as DataFusion `FilterExec`. See issue #57.
+fn apply_runtime_filter(
+    batch: RecordBatch,
+    runtime_filter: Option<&Arc<dyn PhysicalExpr>>,
+) -> DFResult<RecordBatch> {
+    let Some(filter) = runtime_filter else {
+        return Ok(batch);
+    };
+    if batch.num_rows() == 0 {
+        return Ok(batch);
+    }
+    let result = filter.evaluate(&batch)?;
+    let array = result.into_array(batch.num_rows())?;
+    let bools = array
+        .as_any()
+        .downcast_ref::<arrow_array::BooleanArray>()
+        .ok_or_else(|| {
+            datafusion::error::DataFusionError::Internal(
+                "indexed-property runtime filter did not produce a BooleanArray".to_string(),
+            )
+        })?;
+    arrow::compute::filter_record_batch(&batch, bools).map_err(arrow_err)
 }
 
 /// Columnar-first edge scan: single Lance query with MVCC dedup and L0 overlay.
@@ -1921,6 +2131,7 @@ async fn columnar_scan_edge_batch_static(
 /// for schemaless vertex scans. Reads `_vid`, `labels`, `props_json`, `_version` in a single
 /// Lance query on the main vertices table, performs MVCC dedup via Arrow compute, merges L0
 /// buffer data, filters tombstones, and maps to the output schema.
+#[expect(clippy::too_many_arguments)]
 async fn columnar_scan_schemaless_vertex_batch_static(
     graph_ctx: &GraphExecutionContext,
     label: &str,
@@ -1928,11 +2139,16 @@ async fn columnar_scan_schemaless_vertex_batch_static(
     projected_properties: &[String],
     output_schema: &SchemaRef,
     filter: &Option<Arc<dyn PhysicalExpr>>,
+    vid_list_filter: Option<&[u64]>,
+    extra_lance_filter: Option<&str>,
+    extra_runtime_filter: Option<&Arc<dyn PhysicalExpr>>,
 ) -> DFResult<RecordBatch> {
     let storage = graph_ctx.storage();
     let l0_ctx = graph_ctx.l0_context();
 
-    // Extract target VID from filter for short-circuit lookup
+    // Extract target VID from filter for short-circuit lookup. See the
+    // detailed comment on the per-label scan for the IN-list path
+    // (issue #55 PR #4).
     let target_vid = filter.as_ref().and_then(extract_vid_from_physical_filter);
 
     // Build the Lance filter expression — do NOT filter _deleted here;
@@ -1940,9 +2156,12 @@ async fn columnar_scan_schemaless_vertex_batch_static(
     let filter = {
         let mut parts = Vec::new();
 
-        // VID point-lookup filter — uses BTree index on _vid
-        if let Some(vid) = target_vid {
-            parts.push(format!("_vid = {vid}"));
+        // VID point-lookup filter — uses BTree index on _vid. Prefer the
+        // multi-VID list (formats as `_vid IN (...)`); fall back to single-VID.
+        match (vid_list_filter, target_vid) {
+            (Some(vs), _) if !vs.is_empty() => parts.push(format_vid_in_list(vs)),
+            (_, Some(vid)) => parts.push(format!("_vid = {vid}")),
+            _ => {}
         }
 
         // Label filter
@@ -1955,6 +2174,11 @@ async fn columnar_scan_schemaless_vertex_batch_static(
             } else {
                 parts.push(format!("array_contains(labels, '{}')", label));
             }
+        }
+
+        // Indexed-property pushdown — issue #57.
+        if let Some(extra) = extra_lance_filter {
+            parts.push(extra.to_string());
         }
 
         if parts.is_empty() {
@@ -2012,13 +2236,16 @@ async fn columnar_scan_schemaless_vertex_batch_static(
     }
 
     // Map to output schema
-    map_to_schemaless_output_schema(
+    let mapped = map_to_schemaless_output_schema(
         &filtered,
         variable,
         projected_properties,
         output_schema,
         l0_ctx,
-    )
+    )?;
+
+    // Apply indexed-property runtime filter — issue #57.
+    apply_runtime_filter(mapped, extra_runtime_filter)
 }
 
 /// Build a RecordBatch from L0 buffer data for schemaless vertices.
@@ -3230,6 +3457,9 @@ impl Stream for GraphScanStream {
                     let is_edge_scan = self.is_edge_scan;
                     let is_schemaless = self.is_schemaless;
                     let filter = self.filter.clone();
+                    let vid_list_filter = self.vid_list_filter.clone();
+                    let extra_lance_filter = self.extra_lance_filter.clone();
+                    let extra_runtime_filter = self.extra_runtime_filter.clone();
                     let schema = self.schema.clone();
 
                     let fut = async move {
@@ -3254,6 +3484,9 @@ impl Stream for GraphScanStream {
                                 &properties,
                                 &schema,
                                 &filter,
+                                vid_list_filter.as_deref(),
+                                extra_lance_filter.as_deref(),
+                                extra_runtime_filter.as_ref(),
                             )
                             .await?
                         } else {
@@ -3264,6 +3497,9 @@ impl Stream for GraphScanStream {
                                 &properties,
                                 &schema,
                                 &filter,
+                                vid_list_filter.as_deref(),
+                                extra_lance_filter.as_deref(),
+                                extra_runtime_filter.as_ref(),
                             )
                             .await?
                         };

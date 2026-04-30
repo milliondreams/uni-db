@@ -7,9 +7,9 @@
 // and MENTIONS edges, using the Nomic Embed Text v1.5 model (768d).
 //
 // Run with:
-//   cargo nextest run --features provider-fastembed --test issue43_repro --run-ignored all --no-capture
+//   cargo nextest run --features provider-onnx --test issue43_repro --run-ignored all --no-capture
 
-#[cfg(feature = "provider-fastembed")]
+#[cfg(feature = "provider-onnx")]
 mod tests {
     use anyhow::Result;
     use serde_json::json;
@@ -23,7 +23,7 @@ mod tests {
         ModelAliasSpec {
             alias: "embed/default".to_string(),
             task: ModelTask::Embed,
-            provider_id: "local/fastembed".to_string(),
+            provider_id: "local/onnx".to_string(),
             model_id: "NomicEmbedTextV15".to_string(),
             revision: None,
             warmup: WarmupPolicy::Lazy,

@@ -107,6 +107,7 @@ pub enum DataType {
     DateTime,
     Duration,
     CypherValue,
+    Bytes,
     Point(PointType),
     Vector { dimensions: usize },
     Btic,
@@ -138,6 +139,7 @@ impl DataType {
             DataType::DateTime => ArrowDataType::Struct(datetime_struct_fields()),
             DataType::Duration => ArrowDataType::LargeBinary, // Lance doesn't support Interval(MonthDayNano); use CypherValue codec
             DataType::CypherValue => ArrowDataType::LargeBinary, // MessagePack-tagged binary encoding
+            DataType::Bytes => ArrowDataType::LargeBinary, // raw byte buffer (no codec wrapping)
             DataType::Point(pt) => match pt {
                 PointType::Geographic => ArrowDataType::Struct(Fields::from(vec![
                     Field::new("latitude", ArrowDataType::Float64, false),

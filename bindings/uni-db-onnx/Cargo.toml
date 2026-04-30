@@ -17,10 +17,12 @@ path = "../uni-db/src/lib.rs"
 pyo3 = { version = "0.27", features = ["extension-module", "abi3-py310"] }
 pyo3-async-runtimes = { version = "0.27", features = ["tokio-runtime"] }
 # Slim variant: ONNX local provider (raw, rerank, embed tasks via the
-# unified xervo 0.9.0 local/onnx) plus all 8 remote API providers. Excludes
-# candle and mistralrs to keep wheel size down for users who only need
-# embedding/reranking + remote LLMs.
-uni-db = { workspace = true, features = [
+# unified xervo 0.9.0 local/onnx) plus all 8 remote API providers. Opts
+# out of uni-db's default-everything to exclude candle and mistralrs;
+# keeps wheel size down for users who only need embeddings/reranking +
+# remote LLMs.
+uni-db = { workspace = true, default-features = false, features = [
+    "lance-backend",
     "provider-onnx",
     "provider-openai",
     "provider-gemini",

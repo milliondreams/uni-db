@@ -72,7 +72,20 @@ name = "mutation_benchmarks"
 harness = false
 
 [features]
-default = ["lance-backend", "provider-gemini", "provider-openai"]
+default = [
+    "lance-backend",
+    "provider-candle",
+    "provider-mistralrs",
+    "provider-onnx",
+    "provider-openai",
+    "provider-gemini",
+    "provider-vertexai",
+    "provider-mistral",
+    "provider-anthropic",
+    "provider-voyageai",
+    "provider-cohere",
+    "provider-azure-openai",
+]
 lance-backend = ["uni-store/lance-backend"]
 snapshot-internals = []
 storage-internals = []

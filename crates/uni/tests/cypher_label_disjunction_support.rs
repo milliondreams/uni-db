@@ -192,8 +192,7 @@ async fn q2_node_label_disjunction_uses_label_scoped_scans() {
 #[tokio::test]
 async fn q3_predicate_form_uses_label_scoped_scans() {
     let db = setup().await;
-    let cypher =
-        "MATCH (n) WHERE n:Person OR n:Organization RETURN id(n) AS vid";
+    let cypher = "MATCH (n) WHERE n:Person OR n:Organization RETURN id(n) AS vid";
     let explain = db.session().query_with(cypher).explain().await.unwrap();
     eprintln!("Q3 plan-shape:\n{}", explain.plan_text);
 
@@ -254,8 +253,7 @@ async fn q4_edge_type_disjunction_via_where() {
 #[tokio::test]
 async fn q3_predicate_form_executes() {
     let db = setup().await;
-    let cypher =
-        "MATCH (n) WHERE n:Person OR n:Organization RETURN id(n) AS vid";
+    let cypher = "MATCH (n) WHERE n:Person OR n:Organization RETURN id(n) AS vid";
 
     let explain = db.session().query_with(cypher).explain().await;
     match &explain {

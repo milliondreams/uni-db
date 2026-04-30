@@ -357,10 +357,7 @@ fn build_set_item(pair: Pair<Rule>) -> Result<SetItem, ParseError> {
                     let labels = inner_pair
                         .into_inner()
                         .filter(|t| {
-                            matches!(
-                                t.as_rule(),
-                                Rule::identifier | Rule::identifier_or_keyword
-                            )
+                            matches!(t.as_rule(), Rule::identifier | Rule::identifier_or_keyword)
                         })
                         .map(|l| normalize_identifier(l.as_str()))
                         .collect();
@@ -419,12 +416,7 @@ fn build_remove_item(pair: Pair<Rule>) -> Result<RemoveItem, ParseError> {
                 .expect("node_labels always wraps disjunction or conjunction");
             let labels = labels_inner
                 .into_inner()
-                .filter(|t| {
-                    matches!(
-                        t.as_rule(),
-                        Rule::identifier | Rule::identifier_or_keyword
-                    )
-                })
+                .filter(|t| matches!(t.as_rule(), Rule::identifier | Rule::identifier_or_keyword))
                 .map(|l| l.as_str().to_string())
                 .collect();
             Ok(RemoveItem::Labels {
@@ -1623,26 +1615,22 @@ fn build_node_pattern(pair: Pair<Rule>) -> Result<NodePattern, ParseError> {
             Rule::node_labels => {
                 // `node_labels` wraps either node_label_disjunction or
                 // node_label_conjunction (see grammar/cypher.pest).
-                let inner = p.into_inner().next().expect(
-                    "node_labels always wraps disjunction or conjunction",
-                );
+                let inner = p
+                    .into_inner()
+                    .next()
+                    .expect("node_labels always wraps disjunction or conjunction");
                 let names: Vec<String> = inner
                     .clone()
                     .into_inner()
                     .filter(|t| {
-                        matches!(
-                            t.as_rule(),
-                            Rule::identifier | Rule::identifier_or_keyword
-                        )
+                        matches!(t.as_rule(), Rule::identifier | Rule::identifier_or_keyword)
                     })
                     .map(|t| normalize_identifier(t.as_str()))
                     .collect();
                 labels = match inner.as_rule() {
                     Rule::node_label_disjunction => LabelExpr::Disjunction(names),
                     Rule::node_label_conjunction => LabelExpr::Conjunction(names),
-                    other => unreachable!(
-                        "unexpected child of node_labels: {other:?}"
-                    ),
+                    other => unreachable!("unexpected child of node_labels: {other:?}"),
                 };
             }
             Rule::node_predicate => {

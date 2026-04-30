@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Dragonscale Team
 
-use crate::query::pushdown::{
-    PredicateAnalyzer, try_label_or_to_union, try_type_or_to_union,
-};
+use crate::query::pushdown::{PredicateAnalyzer, try_label_or_to_union, try_type_or_to_union};
 use anyhow::{Result, anyhow};
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, SchemaRef};
@@ -5281,8 +5279,7 @@ impl QueryPlanner {
         if node.labels.is_proper_disjunction() {
             let mut branches: Vec<LogicalPlan> = Vec::with_capacity(node.labels.len());
             for label_name in node.labels.names() {
-                let branch = if let Some(meta) =
-                    self.schema.get_label_case_insensitive(label_name)
+                let branch = if let Some(meta) = self.schema.get_label_case_insensitive(label_name)
                 {
                     LogicalPlan::Scan {
                         label_id: meta.id,
@@ -5306,9 +5303,9 @@ impl QueryPlanner {
             // Left-leaning Union: Union(Union(A, B), C). All inner
             // unions dedupe by row, so the outer one does too.
             let mut iter = branches.into_iter();
-            let mut union_plan = iter.next().expect(
-                "is_proper_disjunction implies at least 2 labels",
-            );
+            let mut union_plan = iter
+                .next()
+                .expect("is_proper_disjunction implies at least 2 labels");
             for next in iter {
                 union_plan = LogicalPlan::Union {
                     left: Box::new(union_plan),
@@ -5436,16 +5433,13 @@ impl QueryPlanner {
                 if Self::is_scan_all_for(&plan, &var.name)
                     && let Some(labels) = try_label_or_to_union(&conj, &var.name)
                 {
-                    plan = self.replace_scan_all_with_label_union(
-                        plan, &var.name, &labels, false,
-                    );
+                    plan = self.replace_scan_all_with_label_union(plan, &var.name, &labels, false);
                     consumed = true;
                     break;
                 }
                 // Edge type disjunction → merge into Traverse.edge_type_ids.
                 if let Some(types) = try_type_or_to_union(&conj, &var.name)
-                    && Self::merge_traverse_types_for(&plan, &var.name, &types)
-                        .is_some()
+                    && Self::merge_traverse_types_for(&plan, &var.name, &types).is_some()
                 {
                     let mut ids: Vec<u32> = Vec::with_capacity(types.len());
                     let mut all_known = true;
@@ -5469,8 +5463,7 @@ impl QueryPlanner {
                 keep.push(conj);
             }
         }
-        current_predicate =
-            Self::combine_predicates(keep).unwrap_or(Expr::TRUE);
+        current_predicate = Self::combine_predicates(keep).unwrap_or(Expr::TRUE);
 
         // 3. Push eligible predicates to Scan OR Traverse filters
         // Note: Do NOT push predicates on optional variables (from OPTIONAL MATCH) to
@@ -5816,9 +5809,7 @@ impl QueryPlanner {
             } if var == variable => {
                 let mut branches: Vec<LogicalPlan> = Vec::with_capacity(labels.len());
                 for label in labels {
-                    let branch = if let Some(meta) =
-                        self.schema.get_label_case_insensitive(label)
-                    {
+                    let branch = if let Some(meta) = self.schema.get_label_case_insensitive(label) {
                         LogicalPlan::Scan {
                             label_id: meta.id,
                             labels: vec![label.clone()],
@@ -5852,32 +5843,36 @@ impl QueryPlanner {
                 predicate,
                 optional_variables,
             } => LogicalPlan::Filter {
-                input: Box::new(self.replace_scan_all_with_label_union(
-                    *input, variable, labels, optional,
-                )),
+                input: Box::new(
+                    self.replace_scan_all_with_label_union(*input, variable, labels, optional),
+                ),
                 predicate,
                 optional_variables,
             },
             LogicalPlan::Project { input, projections } => LogicalPlan::Project {
-                input: Box::new(self.replace_scan_all_with_label_union(
-                    *input, variable, labels, optional,
-                )),
+                input: Box::new(
+                    self.replace_scan_all_with_label_union(*input, variable, labels, optional),
+                ),
                 projections,
             },
             LogicalPlan::CrossJoin { left, right } => {
                 if Self::is_scan_all_for(&left, variable) {
                     LogicalPlan::CrossJoin {
-                        left: Box::new(self.replace_scan_all_with_label_union(
-                            *left, variable, labels, optional,
-                        )),
+                        left: Box::new(
+                            self.replace_scan_all_with_label_union(
+                                *left, variable, labels, optional,
+                            ),
+                        ),
                         right,
                     }
                 } else {
                     LogicalPlan::CrossJoin {
                         left,
-                        right: Box::new(self.replace_scan_all_with_label_union(
-                            *right, variable, labels, optional,
-                        )),
+                        right: Box::new(
+                            self.replace_scan_all_with_label_union(
+                                *right, variable, labels, optional,
+                            ),
+                        ),
                     }
                 }
             }
@@ -5902,9 +5897,9 @@ impl QueryPlanner {
                 path_mode,
                 qpp_steps,
             } => LogicalPlan::Traverse {
-                input: Box::new(self.replace_scan_all_with_label_union(
-                    *input, variable, labels, optional,
-                )),
+                input: Box::new(
+                    self.replace_scan_all_with_label_union(*input, variable, labels, optional),
+                ),
                 edge_type_ids,
                 direction,
                 source_variable,
@@ -5957,8 +5952,7 @@ impl QueryPlanner {
             | LogicalPlan::Apply { input, .. } => {
                 Self::merge_traverse_types_for(input, edge_var, _types)
             }
-            LogicalPlan::CrossJoin { left, right }
-            | LogicalPlan::Union { left, right, .. } => {
+            LogicalPlan::CrossJoin { left, right } | LogicalPlan::Union { left, right, .. } => {
                 Self::merge_traverse_types_for(left, edge_var, _types)
                     .or_else(|| Self::merge_traverse_types_for(right, edge_var, _types))
             }
@@ -6000,7 +5994,9 @@ impl QueryPlanner {
                     input
                 } else {
                     Box::new(Self::set_traverse_edge_type_ids(
-                        *input, edge_var, new_ids.clone(),
+                        *input,
+                        edge_var,
+                        new_ids.clone(),
                     ))
                 };
                 LogicalPlan::Traverse {
@@ -6030,16 +6026,12 @@ impl QueryPlanner {
                 predicate,
                 optional_variables,
             } => LogicalPlan::Filter {
-                input: Box::new(Self::set_traverse_edge_type_ids(
-                    *input, edge_var, new_ids,
-                )),
+                input: Box::new(Self::set_traverse_edge_type_ids(*input, edge_var, new_ids)),
                 predicate,
                 optional_variables,
             },
             LogicalPlan::Project { input, projections } => LogicalPlan::Project {
-                input: Box::new(Self::set_traverse_edge_type_ids(
-                    *input, edge_var, new_ids,
-                )),
+                input: Box::new(Self::set_traverse_edge_type_ids(*input, edge_var, new_ids)),
                 projections,
             },
             LogicalPlan::CrossJoin { left, right } => LogicalPlan::CrossJoin {
@@ -6048,9 +6040,7 @@ impl QueryPlanner {
                     edge_var,
                     new_ids.clone(),
                 )),
-                right: Box::new(Self::set_traverse_edge_type_ids(
-                    *right, edge_var, new_ids,
-                )),
+                right: Box::new(Self::set_traverse_edge_type_ids(*right, edge_var, new_ids)),
             },
             other => other,
         }

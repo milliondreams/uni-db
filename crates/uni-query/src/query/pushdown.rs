@@ -479,11 +479,7 @@ pub(crate) fn try_label_or_to_union(expr: &Expr, variable: &str) -> Option<Vec<S
     }
 }
 
-fn collect_label_or_branches(
-    expr: &Expr,
-    variable: &str,
-    out: &mut Vec<String>,
-) -> bool {
+fn collect_label_or_branches(expr: &Expr, variable: &str, out: &mut Vec<String>) -> bool {
     match expr {
         Expr::BinaryOp {
             left,
@@ -493,7 +489,10 @@ fn collect_label_or_branches(
             collect_label_or_branches(left, variable, out)
                 && collect_label_or_branches(right, variable, out)
         }
-        Expr::LabelCheck { expr: target, labels } => {
+        Expr::LabelCheck {
+            expr: target,
+            labels,
+        } => {
             if labels.len() != 1 {
                 // Conjunction-of-multiple is not pushable as a single
                 // label scan branch — fall back to residual filter.
@@ -525,11 +524,7 @@ pub(crate) fn try_type_or_to_union(expr: &Expr, variable: &str) -> Option<Vec<St
     }
 }
 
-fn collect_type_or_branches(
-    expr: &Expr,
-    variable: &str,
-    out: &mut Vec<String>,
-) -> bool {
+fn collect_type_or_branches(expr: &Expr, variable: &str, out: &mut Vec<String>) -> bool {
     match expr {
         Expr::BinaryOp {
             left,
@@ -543,8 +538,10 @@ fn collect_type_or_branches(
             left,
             op: BinaryOp::Eq,
             right,
-        } => is_type_eq_string(left, right, variable, out)
-            || is_type_eq_string(right, left, variable, out),
+        } => {
+            is_type_eq_string(left, right, variable, out)
+                || is_type_eq_string(right, left, variable, out)
+        }
         _ => false,
     }
 }

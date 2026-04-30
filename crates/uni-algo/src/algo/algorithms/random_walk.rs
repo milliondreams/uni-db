@@ -62,7 +62,7 @@ impl Algorithm for RandomWalk {
         // Chunking to avoid massive mutex contention or single result vector resizing
         start_slots.par_iter().for_each(|&start_node| {
             let mut local_walks = Vec::with_capacity(config.walks_per_node);
-            let mut rng = rand::thread_rng();
+            let mut rng = rand::rng();
 
             for _ in 0..config.walks_per_node {
                 let mut walk = Vec::with_capacity(config.walk_length + 1);

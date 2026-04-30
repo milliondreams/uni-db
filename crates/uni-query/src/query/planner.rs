@@ -1236,8 +1236,8 @@ fn eval_const_numeric_expr(
             match lower.as_str() {
                 "rand" if args.is_empty() => {
                     use rand::Rng;
-                    let mut rng = rand::thread_rng();
-                    Ok(ConstNumber::Float(rng.r#gen::<f64>()))
+                    let mut rng = rand::rng();
+                    Ok(ConstNumber::Float(rng.random::<f64>()))
                 }
                 "tointeger" | "toint" if args.len() == 1 => {
                     match eval_const_numeric_expr(&args[0], params)? {

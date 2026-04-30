@@ -9,9 +9,9 @@ use std::collections::HashMap;
 
 use uni_common::Value;
 use uni_cypher::ast::{
-    BinaryOp, Clause, CreateClause, CypherLiteral, Direction, Expr, MatchClause, MergeClause,
-    NodePattern, PathPattern, Pattern, PatternElement, Query, RelationshipPattern, ReturnClause,
-    ReturnItem, Statement,
+    BinaryOp, Clause, CreateClause, CypherLiteral, Direction, Expr, LabelExpr, MatchClause,
+    MergeClause, NodePattern, PathPattern, Pattern, PatternElement, Query, RelationshipPattern,
+    ReturnClause, ReturnItem, Statement,
 };
 use uni_cypher::locy_ast::{DeriveClause, DeriveNodeSpec, DerivePattern};
 use uni_locy::{FactRow, LocyError};
@@ -113,7 +113,7 @@ fn build_create_from_derive_pattern(
     let source_create = if source_is_existing {
         NodePattern {
             variable: Some(source.variable.clone()),
-            labels: vec![],
+            labels: LabelExpr::Empty,
             properties: None,
             where_clause: None,
         }
@@ -124,7 +124,7 @@ fn build_create_from_derive_pattern(
     let target_create = if target_is_existing {
         NodePattern {
             variable: Some(target.variable.clone()),
-            labels: vec![],
+            labels: LabelExpr::Empty,
             properties: None,
             where_clause: None,
         }
@@ -134,7 +134,7 @@ fn build_create_from_derive_pattern(
 
     let rel = PatternElement::Relationship(RelationshipPattern {
         variable: None,
-        types: vec![edge.edge_type.clone()],
+        types: LabelExpr::Disjunction(vec![edge.edge_type.clone()]),
         direction,
         range: None,
         properties: edge.properties.clone(),
@@ -184,7 +184,7 @@ fn match_node_from_binding(var_name: &str, bindings: &FactRow) -> (NodePattern, 
         (
             NodePattern {
                 variable: Some(var_name.to_string()),
-                labels: node.labels.clone(),
+                labels: LabelExpr::from_conjunction(node.labels.iter().cloned()),
                 properties: None,
                 where_clause: None,
             },
@@ -194,7 +194,7 @@ fn match_node_from_binding(var_name: &str, bindings: &FactRow) -> (NodePattern, 
         (
             NodePattern {
                 variable: Some(var_name.to_string()),
-                labels: vec![],
+                labels: LabelExpr::Empty,
                 properties: None,
                 where_clause: None,
             },
@@ -207,14 +207,14 @@ fn match_node_from_binding(var_name: &str, bindings: &FactRow) -> (NodePattern, 
 pub fn build_merge_query(a: &str, b: &str, _bindings: &FactRow) -> Result<Query, LocyError> {
     let source = PatternElement::Node(NodePattern {
         variable: Some(a.to_string()),
-        labels: vec![],
+        labels: LabelExpr::Empty,
         properties: None,
         where_clause: None,
     });
 
     let rel = PatternElement::Relationship(RelationshipPattern {
         variable: None,
-        types: vec!["MERGED_WITH".to_string()],
+        types: LabelExpr::Disjunction(vec!["MERGED_WITH".to_string()]),
         direction: Direction::Outgoing,
         range: None,
         properties: None,
@@ -223,7 +223,7 @@ pub fn build_merge_query(a: &str, b: &str, _bindings: &FactRow) -> Result<Query,
 
     let target = PatternElement::Node(NodePattern {
         variable: Some(b.to_string()),
-        labels: vec![],
+        labels: LabelExpr::Empty,
         properties: None,
         where_clause: None,
     });
@@ -245,7 +245,7 @@ pub fn build_merge_query(a: &str, b: &str, _bindings: &FactRow) -> Result<Query,
 
 fn node_spec_to_pattern(spec: &DeriveNodeSpec, bindings: &FactRow) -> NodePattern {
     let variable = Some(spec.variable.clone());
-    let labels = spec.labels.clone();
+    let labels = LabelExpr::from_conjunction(spec.labels.iter().cloned());
 
     let properties = if spec.is_new {
         let skolem_id = generate_skolem_id(&spec.variable, bindings);

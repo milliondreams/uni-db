@@ -75,7 +75,7 @@ impl Algorithm for LabelPropagation {
         let mut converged = false;
         let mut iterations = 0;
         let mut node_indices: Vec<u32> = (0..num_nodes as u32).collect();
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
 
         while iterations < config.max_iterations {
             let mut changes = 0;

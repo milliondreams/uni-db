@@ -1262,7 +1262,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    use uni_cypher::ast::{NodePattern, PathPattern, Pattern, PatternElement, UnaryOp};
+    use uni_cypher::ast::{LabelExpr, NodePattern, PathPattern, Pattern, PatternElement, UnaryOp};
     use uni_cypher::locy_ast::{
         AlongBinding, BestByClause, BestByItem, FoldBinding, IsReference, LocyBinaryOp, LocyExpr,
         LocyYieldItem, QualifiedName, RuleCondition, RuleOutput, YieldClause,
@@ -1310,7 +1310,7 @@ mod tests {
                 variable: None,
                 elements: vec![PatternElement::Node(NodePattern {
                     variable: Some(var.to_string()),
-                    labels: vec![],
+                    labels: LabelExpr::Empty,
                     properties: None,
                     where_clause: None,
                 })],
@@ -1328,13 +1328,13 @@ mod tests {
                 elements: vec![
                     PatternElement::Node(NodePattern {
                         variable: Some(a.to_string()),
-                        labels: vec![],
+                        labels: LabelExpr::Empty,
                         properties: None,
                         where_clause: None,
                     }),
                     PatternElement::Relationship(RelationshipPattern {
                         variable: Some(e.to_string()),
-                        types: vec![],
+                        types: LabelExpr::Empty,
                         direction: Direction::Outgoing,
                         range: None,
                         properties: None,
@@ -1342,7 +1342,7 @@ mod tests {
                     }),
                     PatternElement::Node(NodePattern {
                         variable: Some(b.to_string()),
-                        labels: vec![],
+                        labels: LabelExpr::Empty,
                         properties: None,
                         where_clause: None,
                     }),

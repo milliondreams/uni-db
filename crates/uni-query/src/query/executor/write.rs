@@ -2601,7 +2601,7 @@ impl Executor {
                                 planner.properties_to_expr(&variable, &resolved_props);
                             let scan = Self::make_scan_plan(
                                 label_id,
-                                n.labels.clone(),
+                                n.labels.names().to_vec(),
                                 variable.clone(),
                                 prop_filter,
                             );

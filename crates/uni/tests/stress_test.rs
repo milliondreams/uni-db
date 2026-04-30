@@ -71,8 +71,8 @@ async fn test_stress_concurrent_read_write() -> anyhow::Result<()> {
                     if i > 1 {
                         let prev = {
                             use rand::Rng;
-                            let mut rng = rand::thread_rng();
-                            rng.gen_range(1..i)
+                            let mut rng = rand::rng();
+                            rng.random_range(1..i)
                         };
                         let vid_prev = Vid::new(prev);
                         let eid = Eid::new(i); // Simplistic EID
@@ -106,8 +106,8 @@ async fn test_stress_concurrent_read_write() -> anyhow::Result<()> {
                 if max > 10 {
                     let start_node = {
                         use rand::Rng;
-                        let mut rng = rand::thread_rng();
-                        rng.gen_range(1..max)
+                        let mut rng = rand::rng();
+                        rng.random_range(1..max)
                     };
                     let vid = Vid::new(start_node);
 

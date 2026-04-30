@@ -16,11 +16,14 @@ path = "../uni-db/src/lib.rs"
 [dependencies]
 pyo3 = { version = "0.27", features = ["extension-module", "abi3-py310"] }
 pyo3-async-runtimes = { version = "0.27", features = ["tokio-runtime"] }
-# Slim variant + Apple acceleration. xervo 0.9.0's gpu-metal activates
-# ort?/coreml so the ORT CoreML EP reaches Apple GPU/ANE; provider-onnx is
-# listed explicitly because gpu-metal alone does not enable the optional ort
-# crate (the `?` in `ort?/coreml` requires another feature to flip ort on).
-uni-db = { workspace = true, features = [
+# Slim variant + Apple acceleration. Opts out of uni-db's
+# default-everything to exclude candle and mistralrs. xervo 0.9.0's
+# gpu-metal activates ort?/coreml so the ORT CoreML EP reaches Apple
+# GPU/ANE; provider-onnx is listed explicitly because gpu-metal alone
+# does not enable the optional ort crate (the `?` in `ort?/coreml`
+# requires another feature to flip ort on).
+uni-db = { workspace = true, default-features = false, features = [
+    "lance-backend",
     "provider-onnx",
     "gpu-metal",
     "provider-openai",

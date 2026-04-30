@@ -348,8 +348,17 @@ fn build_set_item(pair: Pair<Rule>) -> Result<SetItem, ParseError> {
                     })
                 }
                 Rule::node_labels => {
-                    let labels = next
+                    // `node_labels` now wraps `node_label_disjunction |
+                    // node_label_conjunction`; drill one level deeper.
+                    let inner_pair = next
                         .into_inner()
+                        .next()
+                        .expect("node_labels always wraps a child rule");
+                    let labels = inner_pair
+                        .into_inner()
+                        .filter(|t| {
+                            matches!(t.as_rule(), Rule::identifier | Rule::identifier_or_keyword)
+                        })
                         .map(|l| normalize_identifier(l.as_str()))
                         .collect();
                     Ok(SetItem::Labels {
@@ -394,8 +403,20 @@ fn build_remove_item(pair: Pair<Rule>) -> Result<RemoveItem, ParseError> {
         Rule::identifier => {
             let id = first.as_str().to_string();
             let labels_pair = inner.next().unwrap();
-            let labels = labels_pair
+            // `node_labels` now wraps `node_label_disjunction |
+            // node_label_conjunction`; drill one level deeper to reach
+            // the actual identifier list. REMOVE n:A only ever appears
+            // as conjunction (no `|` separator allowed semantically),
+            // but accept either child rule for parser robustness — the
+            // semantics here is "remove these labels", regardless of
+            // operator.
+            let labels_inner = labels_pair
                 .into_inner()
+                .next()
+                .expect("node_labels always wraps disjunction or conjunction");
+            let labels = labels_inner
+                .into_inner()
+                .filter(|t| matches!(t.as_rule(), Rule::identifier | Rule::identifier_or_keyword))
                 .map(|l| l.as_str().to_string())
                 .collect();
             Ok(RemoveItem::Labels {
@@ -1584,7 +1605,7 @@ fn parse_predicate(pair: Pair<Rule>) -> Result<(Option<Expr>, Option<Expr>), Par
 
 fn build_node_pattern(pair: Pair<Rule>) -> Result<NodePattern, ParseError> {
     let mut variable = None;
-    let mut labels = vec![];
+    let mut labels = LabelExpr::Empty;
     let mut properties = None;
     let mut where_clause = None;
 
@@ -1592,10 +1613,25 @@ fn build_node_pattern(pair: Pair<Rule>) -> Result<NodePattern, ParseError> {
         match p.as_rule() {
             Rule::identifier => variable = Some(p.as_str().to_string()),
             Rule::node_labels => {
-                labels = p
+                // `node_labels` wraps either node_label_disjunction or
+                // node_label_conjunction (see grammar/cypher.pest).
+                let inner = p
                     .into_inner()
-                    .map(|l| normalize_identifier(l.as_str()))
+                    .next()
+                    .expect("node_labels always wraps disjunction or conjunction");
+                let names: Vec<String> = inner
+                    .clone()
+                    .into_inner()
+                    .filter(|t| {
+                        matches!(t.as_rule(), Rule::identifier | Rule::identifier_or_keyword)
+                    })
+                    .map(|t| normalize_identifier(t.as_str()))
                     .collect();
+                labels = match inner.as_rule() {
+                    Rule::node_label_disjunction => LabelExpr::Disjunction(names),
+                    Rule::node_label_conjunction => LabelExpr::Conjunction(names),
+                    other => unreachable!("unexpected child of node_labels: {other:?}"),
+                };
             }
             Rule::node_predicate => {
                 let (props, wc) = parse_predicate(p)?;
@@ -1618,7 +1654,7 @@ fn build_relationship_pattern(pair: Pair<Rule>) -> Result<RelationshipPattern, P
     let mut has_left = false;
     let mut has_right = false;
     let mut variable = None;
-    let mut types = vec![];
+    let mut types = LabelExpr::Empty;
     let mut range = None;
     let mut properties = None;
     let mut where_clause = None;
@@ -1636,7 +1672,12 @@ fn build_relationship_pattern(pair: Pair<Rule>) -> Result<RelationshipPattern, P
                     match detail.as_rule() {
                         Rule::identifier => variable = Some(detail.as_str().to_string()),
                         Rule::relationship_types => {
-                            types = detail
+                            // Relationship types are always disjunction
+                            // semantically — `[r:A|B]` matches edges of
+                            // either type. Even the single-type form
+                            // `[r:A]` is encoded the same way; reduction
+                            // to the singleton case is a planner concern.
+                            let names: Vec<String> = detail
                                 .into_inner()
                                 .filter(|p| {
                                     matches!(
@@ -1646,6 +1687,7 @@ fn build_relationship_pattern(pair: Pair<Rule>) -> Result<RelationshipPattern, P
                                 })
                                 .map(|t| normalize_identifier(t.as_str()))
                                 .collect();
+                            types = LabelExpr::Disjunction(names);
                         }
                         Rule::range_literal => range = Some(build_range(detail)?),
                         Rule::rel_predicate => {

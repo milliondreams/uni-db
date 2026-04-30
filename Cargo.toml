@@ -57,7 +57,7 @@ uni-store = { path = "crates/uni-store", version = "1.3.0" }
 uni-algo = { path = "crates/uni-algo", version = "1.3.0" }
 uni-query = { path = "crates/uni-query", version = "1.3.0" }
 uni-cli = { path = "crates/uni-cli", version = "1.3.0" }
-uni-db = { path = "crates/uni", version = "1.3.0" }
+uni-db = { path = "crates/uni", version = "1.3.0", default-features = false }
 uni-crdt = { path = "crates/uni-crdt", version = "1.3.0" }
 uni-cypher = { path = "crates/uni-cypher", version = "1.3.0" }
 uni-locy = { path = "crates/uni-locy", version = "1.3.0" }
@@ -88,7 +88,7 @@ chrono-tz = "0.10"
 fxhash = "0.2"
 bytes = "1.6"
 parking_lot = "0.12"
-rand = "0.8"
+rand = "0.9"
 ordered-float = "4.2"
 rayon = "1.10"
 csv = "1.3"

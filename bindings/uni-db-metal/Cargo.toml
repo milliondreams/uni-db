@@ -16,25 +16,13 @@ path = "../uni-db/src/lib.rs"
 [dependencies]
 pyo3 = { version = "0.27", features = ["extension-module", "abi3-py310"] }
 pyo3-async-runtimes = { version = "0.27", features = ["tokio-runtime"] }
-# Default-everything + Apple acceleration. xervo 0.9.0's gpu-metal activates
-# candle?/metal and mistralrs?/metal kernels for the local providers, and
-# ort?/coreml so the ORT CoreML EP reaches Apple GPU/ANE. provider-onnx is
-# listed explicitly because gpu-metal alone does not enable the optional
-# ort crate (the `?` in `ort?/coreml` requires another feature to flip it on).
-uni-db = { workspace = true, features = [
-    "provider-candle",
-    "provider-mistralrs",
-    "provider-onnx",
-    "gpu-metal",
-    "provider-openai",
-    "provider-gemini",
-    "provider-vertexai",
-    "provider-mistral",
-    "provider-anthropic",
-    "provider-voyageai",
-    "provider-cohere",
-    "provider-azure-openai",
-] }
+# Default-everything (inherited from uni-db's default — all 11 providers
+# CPU including provider-onnx) plus Apple acceleration. xervo 0.9.0's
+# gpu-metal activates candle?/metal + mistralrs?/metal kernels for the
+# local providers, and ort?/coreml so the ORT CoreML EP reaches Apple
+# GPU/ANE. provider-onnx (in default) is what enables the optional ort
+# crate that gpu-metal's `ort?/coreml` then activates.
+uni-db = { workspace = true, default-features = true, features = ["gpu-metal"] }
 uni-locy = { workspace = true }
 uni-common = { workspace = true }
 uni-store = { workspace = true }

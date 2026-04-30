@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Dragonscale Team
 
-use crate::query::pushdown::PredicateAnalyzer;
+use crate::query::pushdown::{PredicateAnalyzer, try_label_or_to_union, try_type_or_to_union};
 use anyhow::{Result, anyhow};
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, SchemaRef};
@@ -1236,8 +1236,8 @@ fn eval_const_numeric_expr(
             match lower.as_str() {
                 "rand" if args.is_empty() => {
                     use rand::Rng;
-                    let mut rng = rand::thread_rng();
-                    Ok(ConstNumber::Float(rng.r#gen::<f64>()))
+                    let mut rng = rand::rng();
+                    Ok(ConstNumber::Float(rng.random::<f64>()))
                 }
                 "tointeger" | "toint" if args.len() == 1 => {
                     match eval_const_numeric_expr(&args[0], params)? {
@@ -3818,7 +3818,7 @@ impl QueryPlanner {
 
             let target_scan = LogicalPlan::Scan {
                 label_id: target_label_meta.id,
-                labels: target_node.labels.clone(),
+                labels: target_node.labels.names().to_vec(),
                 variable: target_var.clone(),
                 filter: self.properties_to_expr(&target_var, &target_node.properties),
                 optional: false,
@@ -5265,6 +5265,58 @@ impl QueryPlanner {
             return Ok(apply_residual_filter(joined, node_residual_filter));
         }
 
+        // Label disjunction `(n:A|B|C)` — emit Union of label-scoped Scans.
+        //
+        // Storage fact: a multi-labeled vertex is fanned out into every
+        // per-label table it carries (uni-store/src/runtime/writer.rs's
+        // `push_vertex_to_labels`), so the same vid can appear in both the
+        // `A` scan and the `B` scan of a disjunctive query. Use
+        // `Union { all: false }` so the combined result deduplicates by row
+        // contents (which include the vid) rather than emitting the same
+        // vertex twice. The single-label-disjunction case (`Disjunction(["A"])`)
+        // is encoded the same way the parser already encodes single edge
+        // types, and reduces to one Scan with no Union wrapping.
+        if node.labels.is_proper_disjunction() {
+            let mut branches: Vec<LogicalPlan> = Vec::with_capacity(node.labels.len());
+            for label_name in node.labels.names() {
+                let branch = if let Some(meta) = self.schema.get_label_case_insensitive(label_name)
+                {
+                    LogicalPlan::Scan {
+                        label_id: meta.id,
+                        labels: vec![label_name.clone()],
+                        variable: variable.to_string(),
+                        filter: node_scan_filter.clone(),
+                        optional,
+                    }
+                } else {
+                    // Schemaless branch — fall back to main-table label
+                    // filter so unknown labels still match.
+                    LogicalPlan::ScanMainByLabels {
+                        labels: vec![label_name.clone()],
+                        variable: variable.to_string(),
+                        filter: node_scan_filter.clone(),
+                        optional,
+                    }
+                };
+                branches.push(branch);
+            }
+            // Left-leaning Union: Union(Union(A, B), C). All inner
+            // unions dedupe by row, so the outer one does too.
+            let mut iter = branches.into_iter();
+            let mut union_plan = iter
+                .next()
+                .expect("is_proper_disjunction implies at least 2 labels");
+            for next in iter {
+                union_plan = LogicalPlan::Union {
+                    left: Box::new(union_plan),
+                    right: Box::new(next),
+                    all: false,
+                };
+            }
+            let joined = Self::join_with_plan(plan, union_plan);
+            return Ok(apply_residual_filter(joined, node_residual_filter));
+        }
+
         // Use first label for label_id (primary label for dataset selection)
         let label_name = &node.labels[0];
 
@@ -5273,7 +5325,7 @@ impl QueryPlanner {
             // Known label: use standard Scan
             let scan = LogicalPlan::Scan {
                 label_id: label_meta.id,
-                labels: node.labels.clone(),
+                labels: node.labels.names().to_vec(),
                 variable: variable.to_string(),
                 filter: node_scan_filter,
                 optional,
@@ -5284,7 +5336,7 @@ impl QueryPlanner {
         } else {
             // Unknown label: use ScanMainByLabels for schemaless support
             let scan_main = LogicalPlan::ScanMainByLabels {
-                labels: node.labels.clone(),
+                labels: node.labels.names().to_vec(),
                 variable: variable.to_string(),
                 filter: node_scan_filter,
                 optional,
@@ -5358,6 +5410,60 @@ impl QueryPlanner {
                 }
             }
         }
+
+        // 2. Label/type disjunction → narrow-scan rewrite.
+        //
+        // `WHERE n:A OR n:B` and `WHERE type(r) = 'A' OR type(r) = 'B'`
+        // are functionally identical to the inline forms `(n:A|B)` and
+        // `[r:A|B]`, but a literal pattern lowering would route them
+        // through `Filter(LabelCheck OR LabelCheck)` over `ScanAll` —
+        // a full vertex/edge scan plus residual filter, missing the
+        // narrow-scan fast-path that the inline forms get for free.
+        // Detect those OR-chains here and rewrite the upstream
+        // `ScanAll` / `Traverse` accordingly.
+        let conjuncts = Self::split_and_conjuncts(&current_predicate);
+        let mut keep: Vec<Expr> = Vec::with_capacity(conjuncts.len());
+        for conj in conjuncts {
+            let mut consumed = false;
+            for var in vars_in_scope {
+                if optional_vars.contains(&var.name) {
+                    continue;
+                }
+                // Node label disjunction → Union of label-scoped Scans.
+                if Self::is_scan_all_for(&plan, &var.name)
+                    && let Some(labels) = try_label_or_to_union(&conj, &var.name)
+                {
+                    plan = self.replace_scan_all_with_label_union(plan, &var.name, &labels, false);
+                    consumed = true;
+                    break;
+                }
+                // Edge type disjunction → merge into Traverse.edge_type_ids.
+                if let Some(types) = try_type_or_to_union(&conj, &var.name)
+                    && Self::merge_traverse_types_for(&plan, &var.name, &types).is_some()
+                {
+                    let mut ids: Vec<u32> = Vec::with_capacity(types.len());
+                    let mut all_known = true;
+                    for t in &types {
+                        match self.schema.edge_types.get(t) {
+                            Some(meta) => ids.push(meta.id),
+                            None => {
+                                all_known = false;
+                                break;
+                            }
+                        }
+                    }
+                    if all_known {
+                        plan = Self::set_traverse_edge_type_ids(plan, &var.name, ids);
+                        consumed = true;
+                        break;
+                    }
+                }
+            }
+            if !consumed {
+                keep.push(conj);
+            }
+        }
+        current_predicate = Self::combine_predicates(keep).unwrap_or(Expr::TRUE);
 
         // 3. Push eligible predicates to Scan OR Traverse filters
         // Note: Do NOT push predicates on optional variables (from OPTIONAL MATCH) to
@@ -5656,6 +5762,287 @@ impl QueryPlanner {
 
             // Leaf nodes (Identifier, Literal, Parameter, etc.) need no recursion
             _ => expr,
+        }
+    }
+
+    /// Returns `true` iff `variable` is bound to a `ScanAll` operator
+    /// (somewhere under `plan`). Used to gate the
+    /// `WHERE n:A OR n:B` → `Union(Scan{A}, Scan{B})` rewrite — we only
+    /// fire it when the variable is currently doing a full vertex scan,
+    /// not when it's already bound to a labeled `Scan`.
+    fn is_scan_all_for(plan: &LogicalPlan, variable: &str) -> bool {
+        match plan {
+            LogicalPlan::ScanAll { variable: var, .. } => var == variable,
+            LogicalPlan::Filter { input, .. }
+            | LogicalPlan::Project { input, .. }
+            | LogicalPlan::Sort { input, .. }
+            | LogicalPlan::Limit { input, .. }
+            | LogicalPlan::Aggregate { input, .. }
+            | LogicalPlan::Apply { input, .. }
+            | LogicalPlan::Traverse { input, .. } => Self::is_scan_all_for(input, variable),
+            LogicalPlan::CrossJoin { left, right } => {
+                Self::is_scan_all_for(left, variable) || Self::is_scan_all_for(right, variable)
+            }
+            LogicalPlan::Union { left, right, .. } => {
+                Self::is_scan_all_for(left, variable) || Self::is_scan_all_for(right, variable)
+            }
+            _ => false,
+        }
+    }
+
+    /// Replace the `ScanAll` for `variable` in `plan` with a left-leaning
+    /// `Union` of label-scoped `Scan` (or `ScanMainByLabels` for unknown
+    /// labels) operators built from `labels`. Used by the
+    /// `WHERE n:A OR n:B` rewrite.
+    fn replace_scan_all_with_label_union(
+        &self,
+        plan: LogicalPlan,
+        variable: &str,
+        labels: &[String],
+        optional: bool,
+    ) -> LogicalPlan {
+        match plan {
+            LogicalPlan::ScanAll {
+                variable: var,
+                filter,
+                optional: scan_optional,
+            } if var == variable => {
+                let mut branches: Vec<LogicalPlan> = Vec::with_capacity(labels.len());
+                for label in labels {
+                    let branch = if let Some(meta) = self.schema.get_label_case_insensitive(label) {
+                        LogicalPlan::Scan {
+                            label_id: meta.id,
+                            labels: vec![label.clone()],
+                            variable: variable.to_string(),
+                            filter: filter.clone(),
+                            optional: scan_optional || optional,
+                        }
+                    } else {
+                        LogicalPlan::ScanMainByLabels {
+                            labels: vec![label.clone()],
+                            variable: variable.to_string(),
+                            filter: filter.clone(),
+                            optional: scan_optional || optional,
+                        }
+                    };
+                    branches.push(branch);
+                }
+                let mut iter = branches.into_iter();
+                let mut union_plan = iter.next().expect("at least one label");
+                for next in iter {
+                    union_plan = LogicalPlan::Union {
+                        left: Box::new(union_plan),
+                        right: Box::new(next),
+                        all: false,
+                    };
+                }
+                union_plan
+            }
+            LogicalPlan::Filter {
+                input,
+                predicate,
+                optional_variables,
+            } => LogicalPlan::Filter {
+                input: Box::new(
+                    self.replace_scan_all_with_label_union(*input, variable, labels, optional),
+                ),
+                predicate,
+                optional_variables,
+            },
+            LogicalPlan::Project { input, projections } => LogicalPlan::Project {
+                input: Box::new(
+                    self.replace_scan_all_with_label_union(*input, variable, labels, optional),
+                ),
+                projections,
+            },
+            LogicalPlan::CrossJoin { left, right } => {
+                if Self::is_scan_all_for(&left, variable) {
+                    LogicalPlan::CrossJoin {
+                        left: Box::new(
+                            self.replace_scan_all_with_label_union(
+                                *left, variable, labels, optional,
+                            ),
+                        ),
+                        right,
+                    }
+                } else {
+                    LogicalPlan::CrossJoin {
+                        left,
+                        right: Box::new(
+                            self.replace_scan_all_with_label_union(
+                                *right, variable, labels, optional,
+                            ),
+                        ),
+                    }
+                }
+            }
+            LogicalPlan::Traverse {
+                input,
+                edge_type_ids,
+                direction,
+                source_variable,
+                target_variable,
+                target_label_id,
+                step_variable,
+                min_hops,
+                max_hops,
+                optional: trav_optional,
+                target_filter,
+                path_variable,
+                edge_properties,
+                is_variable_length,
+                optional_pattern_vars,
+                scope_match_variables,
+                edge_filter_expr,
+                path_mode,
+                qpp_steps,
+            } => LogicalPlan::Traverse {
+                input: Box::new(
+                    self.replace_scan_all_with_label_union(*input, variable, labels, optional),
+                ),
+                edge_type_ids,
+                direction,
+                source_variable,
+                target_variable,
+                target_label_id,
+                step_variable,
+                min_hops,
+                max_hops,
+                optional: trav_optional,
+                target_filter,
+                path_variable,
+                edge_properties,
+                is_variable_length,
+                optional_pattern_vars,
+                scope_match_variables,
+                edge_filter_expr,
+                path_mode,
+                qpp_steps,
+            },
+            other => other,
+        }
+    }
+
+    /// Returns `Some(())` iff `variable` is the `step_variable` (i.e. the
+    /// edge variable) of some `Traverse` operator in `plan`. Used to gate
+    /// the `WHERE type(r) = 'A' OR type(r) = 'B'` rewrite — we need a
+    /// Traverse whose types we can merge into.
+    fn merge_traverse_types_for(
+        plan: &LogicalPlan,
+        edge_var: &str,
+        _types: &[String],
+    ) -> Option<()> {
+        match plan {
+            LogicalPlan::Traverse {
+                step_variable,
+                input,
+                ..
+            } => {
+                if step_variable.as_deref() == Some(edge_var) {
+                    Some(())
+                } else {
+                    Self::merge_traverse_types_for(input, edge_var, _types)
+                }
+            }
+            LogicalPlan::Filter { input, .. }
+            | LogicalPlan::Project { input, .. }
+            | LogicalPlan::Sort { input, .. }
+            | LogicalPlan::Limit { input, .. }
+            | LogicalPlan::Aggregate { input, .. }
+            | LogicalPlan::Apply { input, .. } => {
+                Self::merge_traverse_types_for(input, edge_var, _types)
+            }
+            LogicalPlan::CrossJoin { left, right } | LogicalPlan::Union { left, right, .. } => {
+                Self::merge_traverse_types_for(left, edge_var, _types)
+                    .or_else(|| Self::merge_traverse_types_for(right, edge_var, _types))
+            }
+            _ => None,
+        }
+    }
+
+    /// Replace `edge_type_ids` on the Traverse whose `step_variable`
+    /// equals `edge_var`. Used by the type-OR rewrite.
+    fn set_traverse_edge_type_ids(
+        plan: LogicalPlan,
+        edge_var: &str,
+        new_ids: Vec<u32>,
+    ) -> LogicalPlan {
+        match plan {
+            LogicalPlan::Traverse {
+                input,
+                edge_type_ids,
+                direction,
+                source_variable,
+                target_variable,
+                target_label_id,
+                step_variable,
+                min_hops,
+                max_hops,
+                optional,
+                target_filter,
+                path_variable,
+                edge_properties,
+                is_variable_length,
+                optional_pattern_vars,
+                scope_match_variables,
+                edge_filter_expr,
+                path_mode,
+                qpp_steps,
+            } => {
+                let matches_var = step_variable.as_deref() == Some(edge_var);
+                let recursed_input = if matches_var {
+                    input
+                } else {
+                    Box::new(Self::set_traverse_edge_type_ids(
+                        *input,
+                        edge_var,
+                        new_ids.clone(),
+                    ))
+                };
+                LogicalPlan::Traverse {
+                    input: recursed_input,
+                    edge_type_ids: if matches_var { new_ids } else { edge_type_ids },
+                    direction,
+                    source_variable,
+                    target_variable,
+                    target_label_id,
+                    step_variable,
+                    min_hops,
+                    max_hops,
+                    optional,
+                    target_filter,
+                    path_variable,
+                    edge_properties,
+                    is_variable_length,
+                    optional_pattern_vars,
+                    scope_match_variables,
+                    edge_filter_expr,
+                    path_mode,
+                    qpp_steps,
+                }
+            }
+            LogicalPlan::Filter {
+                input,
+                predicate,
+                optional_variables,
+            } => LogicalPlan::Filter {
+                input: Box::new(Self::set_traverse_edge_type_ids(*input, edge_var, new_ids)),
+                predicate,
+                optional_variables,
+            },
+            LogicalPlan::Project { input, projections } => LogicalPlan::Project {
+                input: Box::new(Self::set_traverse_edge_type_ids(*input, edge_var, new_ids)),
+                projections,
+            },
+            LogicalPlan::CrossJoin { left, right } => LogicalPlan::CrossJoin {
+                left: Box::new(Self::set_traverse_edge_type_ids(
+                    *left,
+                    edge_var,
+                    new_ids.clone(),
+                )),
+                right: Box::new(Self::set_traverse_edge_type_ids(*right, edge_var, new_ids)),
+            },
+            other => other,
         }
     }
 

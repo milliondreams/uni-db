@@ -127,11 +127,11 @@ impl AlgoBenchContext {
         }
 
         // Create random edges
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for i in 0..nodes {
             let src = Vid::new(i as u64);
             for _ in 0..edges_per_node {
-                let target_idx = rng.gen_range(0..nodes);
+                let target_idx = rng.random_range(0..nodes);
                 if target_idx != i {
                     let dst = Vid::new(target_idx as u64);
                     let eid = w.next_eid(link_type).await.unwrap();

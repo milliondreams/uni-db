@@ -178,7 +178,10 @@ mod tests {
             && let ast::PatternElement::Relationship(rel) =
                 &match_clause.pattern.paths[0].elements[1]
         {
-            assert_eq!(rel.types, vec!["KNOWS", "HATES"]);
+            assert_eq!(
+                rel.types,
+                ast::LabelExpr::Disjunction(vec!["KNOWS".to_string(), "HATES".to_string()])
+            );
             println!("Parsed types: {:?}", rel.types);
             return;
         }

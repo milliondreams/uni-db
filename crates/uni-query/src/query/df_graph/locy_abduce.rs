@@ -13,8 +13,9 @@ use std::collections::HashMap;
 
 use uni_common::Value;
 use uni_cypher::ast::{
-    BinaryOp, Clause, DeleteClause, Direction, Expr, MatchClause, NodePattern, PathPattern,
-    Pattern, PatternElement, Query, RelationshipPattern, SetClause, SetItem, Statement,
+    BinaryOp, Clause, DeleteClause, Direction, Expr, LabelExpr, MatchClause, NodePattern,
+    PathPattern, Pattern, PatternElement, Query, RelationshipPattern, SetClause, SetItem,
+    Statement,
 };
 use uni_cypher::locy_ast::AbduceQuery;
 use uni_locy::result::{AbductionResult, Modification, ValidatedModification};
@@ -415,13 +416,13 @@ fn modification_to_cypher(modification: &Modification) -> Query {
                 elements: vec![
                     PatternElement::Node(NodePattern {
                         variable: Some(src_var),
-                        labels: vec![],
+                        labels: LabelExpr::Empty,
                         properties: None,
                         where_clause: None,
                     }),
                     PatternElement::Relationship(RelationshipPattern {
                         variable: Some(edge_var_name.clone()),
-                        types: vec![edge_type.clone()],
+                        types: LabelExpr::Disjunction(vec![edge_type.clone()]),
                         direction: Direction::Outgoing,
                         range: None,
                         properties: None,
@@ -429,7 +430,7 @@ fn modification_to_cypher(modification: &Modification) -> Query {
                     }),
                     PatternElement::Node(NodePattern {
                         variable: Some(tgt_var),
-                        labels: vec![],
+                        labels: LabelExpr::Empty,
                         properties: None,
                         where_clause: None,
                     }),
@@ -462,7 +463,7 @@ fn modification_to_cypher(modification: &Modification) -> Query {
                 variable: None,
                 elements: vec![PatternElement::Node(NodePattern {
                     variable: Some(element_var.clone()),
-                    labels: vec![],
+                    labels: LabelExpr::Empty,
                     properties: None,
                     where_clause: None,
                 })],
@@ -511,13 +512,13 @@ fn modification_to_cypher(modification: &Modification) -> Query {
                 elements: vec![
                     PatternElement::Node(NodePattern {
                         variable: Some(src_var.clone()),
-                        labels: vec![],
+                        labels: LabelExpr::Empty,
                         properties: None,
                         where_clause: None,
                     }),
                     PatternElement::Node(NodePattern {
                         variable: Some(tgt_var.clone()),
-                        labels: vec![],
+                        labels: LabelExpr::Empty,
                         properties: None,
                         where_clause: None,
                     }),
@@ -541,13 +542,13 @@ fn modification_to_cypher(modification: &Modification) -> Query {
                 elements: vec![
                     PatternElement::Node(NodePattern {
                         variable: Some(src_var),
-                        labels: vec![],
+                        labels: LabelExpr::Empty,
                         properties: None,
                         where_clause: None,
                     }),
                     PatternElement::Relationship(RelationshipPattern {
                         variable: None,
-                        types: vec![edge_type.clone()],
+                        types: LabelExpr::Disjunction(vec![edge_type.clone()]),
                         direction: Direction::Outgoing,
                         range: None,
                         properties: edge_props,
@@ -555,7 +556,7 @@ fn modification_to_cypher(modification: &Modification) -> Query {
                     }),
                     PatternElement::Node(NodePattern {
                         variable: Some(tgt_var),
-                        labels: vec![],
+                        labels: LabelExpr::Empty,
                         properties: None,
                         where_clause: None,
                     }),

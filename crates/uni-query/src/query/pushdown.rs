@@ -459,6 +459,115 @@ impl PredicateAnalyzer {
     }
 }
 
+/// Detect a chain of single-label `LabelCheck`s combined with `OR` over
+/// the same variable, collecting the labels into a flat list.
+///
+/// Example: `n:Person OR n:Organization` → `Some(["Person", "Organization"])`.
+///
+/// Returns `None` if the predicate isn't a pure OR-tree of single-label
+/// label checks on `variable` (mixed predicates, multi-label conjunctions,
+/// or different variables abort the rewrite). The `LabelCheck` AST node
+/// uses `labels: Vec<String>` with conjunction semantics (`n:A:B`); we
+/// only accept single-element lists since a conjunctive leaf can't be
+/// expressed as a label-scoped scan without an additional residual filter.
+pub(crate) fn try_label_or_to_union(expr: &Expr, variable: &str) -> Option<Vec<String>> {
+    let mut labels: Vec<String> = Vec::new();
+    if collect_label_or_branches(expr, variable, &mut labels) && labels.len() >= 2 {
+        Some(labels)
+    } else {
+        None
+    }
+}
+
+fn collect_label_or_branches(
+    expr: &Expr,
+    variable: &str,
+    out: &mut Vec<String>,
+) -> bool {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOp::Or,
+            right,
+        } => {
+            collect_label_or_branches(left, variable, out)
+                && collect_label_or_branches(right, variable, out)
+        }
+        Expr::LabelCheck { expr: target, labels } => {
+            if labels.len() != 1 {
+                // Conjunction-of-multiple is not pushable as a single
+                // label scan branch — fall back to residual filter.
+                return false;
+            }
+            if let Expr::Variable(v) = target.as_ref()
+                && v == variable
+            {
+                out.push(labels[0].clone());
+                return true;
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+/// Detect a chain of `type(r) = 'A'` equality checks combined with `OR`
+/// over the same relationship variable, collecting the type names.
+///
+/// Example: `type(r) = 'KNOWS' OR type(r) = 'FOLLOWS'` →
+/// `Some(["KNOWS", "FOLLOWS"])`.
+pub(crate) fn try_type_or_to_union(expr: &Expr, variable: &str) -> Option<Vec<String>> {
+    let mut types: Vec<String> = Vec::new();
+    if collect_type_or_branches(expr, variable, &mut types) && types.len() >= 2 {
+        Some(types)
+    } else {
+        None
+    }
+}
+
+fn collect_type_or_branches(
+    expr: &Expr,
+    variable: &str,
+    out: &mut Vec<String>,
+) -> bool {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOp::Or,
+            right,
+        } => {
+            collect_type_or_branches(left, variable, out)
+                && collect_type_or_branches(right, variable, out)
+        }
+        Expr::BinaryOp {
+            left,
+            op: BinaryOp::Eq,
+            right,
+        } => is_type_eq_string(left, right, variable, out)
+            || is_type_eq_string(right, left, variable, out),
+        _ => false,
+    }
+}
+
+fn is_type_eq_string(
+    fn_side: &Expr,
+    str_side: &Expr,
+    variable: &str,
+    out: &mut Vec<String>,
+) -> bool {
+    if let Expr::FunctionCall { name, args, .. } = fn_side
+        && name.eq_ignore_ascii_case("type")
+        && args.len() == 1
+        && let Expr::Variable(v) = &args[0]
+        && v == variable
+        && let Expr::Literal(CypherLiteral::String(s)) = str_side
+    {
+        out.push(s.clone());
+        return true;
+    }
+    false
+}
+
 /// Attempt to convert OR disjunctions to IN predicates
 fn try_or_to_in(expr: &Expr, variable: &str) -> Option<Expr> {
     match expr {

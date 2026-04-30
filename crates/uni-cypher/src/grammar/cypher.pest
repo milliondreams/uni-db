@@ -445,7 +445,9 @@ node_predicate = {
     | properties
 }
 
-node_labels = { (":" ~ identifier_or_keyword)+ }
+node_labels = { node_label_disjunction | node_label_conjunction }
+node_label_disjunction = { ":" ~ identifier_or_keyword ~ (pipe ~ ":"? ~ identifier_or_keyword)+ }
+node_label_conjunction = { (":" ~ identifier_or_keyword)+ }
 
 relationship_pattern = {
     arrow_left ~ "[" ~ relationship_detail ~ "]" ~ arrow_right // <-[]->, bidirectional with detail

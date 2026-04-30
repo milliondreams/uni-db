@@ -3,9 +3,9 @@ requires = ["maturin>=1.0,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "uni-db-fastembed-metal"
-version = "1.2.0"
-description = "Python bindings for Uni Graph Database (fastembed + ONNX + CoreML variant for Apple Silicon)"
+name = "uni-db-cuda"
+version = "1.3.0"
+description = "Python bindings for Uni Graph Database (all 11 providers + NVIDIA CUDA)"
 authors = [
     { name = "Dragonscale Industries Inc.", email = "dev@dragonscale.ai" }
 ]
@@ -20,7 +20,7 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
-    "Operating System :: MacOS :: MacOS X",
+    "Environment :: GPU :: NVIDIA CUDA",
     "Topic :: Database",
     "Topic :: Database :: Database Engines/Servers",
 ]

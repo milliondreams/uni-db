@@ -4,13 +4,13 @@
 // Diagnostic test for issue #43: Auto-embed insert latency jumps 25x after ~150 rows.
 //
 // This test instruments the insert path to isolate whether the latency jump is caused by:
-// 1. ONNX/FastEmbed runtime degradation after ~150 calls
+// 1. ONNX runtime degradation after ~150 calls
 // 2. Auto-flush (5-second interval) triggering flush_to_l1
 // 3. Some interaction between the two
 //
-// Run with: cargo nextest run --features provider-fastembed --test issue43_insert_latency_diagnostic --run-ignored all --no-capture
+// Run with: cargo nextest run --features provider-onnx --test issue43_insert_latency_diagnostic --run-ignored all --no-capture
 
-#[cfg(feature = "provider-fastembed")]
+#[cfg(feature = "provider-onnx")]
 mod tests {
     use anyhow::Result;
     use std::time::Instant;
@@ -25,7 +25,7 @@ mod tests {
         ModelAliasSpec {
             alias: "embed/default".to_string(),
             task: ModelTask::Embed,
-            provider_id: "local/fastembed".to_string(),
+            provider_id: "local/onnx".to_string(),
             model_id: "AllMiniLML6V2".to_string(),
             revision: None,
             warmup: WarmupPolicy::Lazy,
@@ -490,7 +490,7 @@ async fn issue43_control_no_embed() -> anyhow::Result<()> {
 }
 
 /// Test 5: Embedding-only — call embed() 200 times without any DB operations.
-#[cfg(feature = "provider-fastembed")]
+#[cfg(feature = "provider-onnx")]
 #[tokio::test]
 #[ignore]
 async fn issue43_embed_only_no_db() -> anyhow::Result<()> {
@@ -505,7 +505,7 @@ async fn issue43_embed_only_no_db() -> anyhow::Result<()> {
         .xervo_catalog(vec![ModelAliasSpec {
             alias: "embed/test".to_string(),
             task: ModelTask::Embed,
-            provider_id: "local/fastembed".to_string(),
+            provider_id: "local/onnx".to_string(),
             model_id: "AllMiniLML6V2".to_string(),
             revision: None,
             warmup: WarmupPolicy::Lazy,

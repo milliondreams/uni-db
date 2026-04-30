@@ -2,7 +2,7 @@
 
 ## 1. Overview
 
-Xervo is uni-db's built-in ML runtime for embeddings and text generation. It supports local inference (Candle, FastEmbed, mistral.rs) and remote APIs (OpenAI, Anthropic, Gemini, Mistral, Cohere, Voyage AI, Vertex AI, Azure OpenAI). Models are configured via a **catalog** of alias specs, and accessed through the `db.xervo()` facade.
+Xervo is uni-db's built-in ML runtime for embeddings and text generation. It supports local inference (Candle, ONNX Runtime — embed, rerank, raw — and mistral.rs) and remote APIs (OpenAI, Anthropic, Gemini, Mistral, Cohere, Voyage AI, Vertex AI, Azure OpenAI). Models are configured via a **catalog** of alias specs, and accessed through the `db.xervo()` facade.
 
 **Key concepts:**
 - **Alias**: human-readable model identifier in `task/name` format (e.g., `embed/default`, `llm/gpt4`)
@@ -21,14 +21,13 @@ Run inference on the host machine. No API keys needed.
 | Provider ID | Engine | Tasks | Best For |
 |---|---|---|---|
 | `local/candle` | HuggingFace Candle | Embed | Lightweight CPU embeddings (Bert, JinaBert, Gemma) |
-| `local/fastembed` | ONNX Runtime | Embed | Fastest CPU embeddings, smallest footprint |
+| `local/onnx` | ONNX Runtime | Embed, Rerank, Raw | Fast CPU embeddings (FastEmbed alias strings supported), cross-encoder reranking (BERT-style), and raw tensor execution |
 | `local/mistralrs` | mistral.rs | Embed, Generate | GPU inference, quantized models, multi-modal |
-| `local/onnx-reranker` | ONNX Runtime | Rerank | Local cross-encoder reranking (BERT-style models) |
 
 **Local provider options:**
 
 ```json
-// candle / fastembed
+// candle / onnx
 { "cache_dir": "/path/to/model/cache" }
 
 // mistralrs
@@ -100,7 +99,7 @@ The catalog is a JSON array of model alias specs:
   {
     "alias": "embed/default",
     "task": "Embed",
-    "provider_id": "local/fastembed",
+    "provider_id": "local/onnx",
     "model_id": "sentence-transformers/all-MiniLM-L6-v2",
     "revision": null,
     "warmup": "Lazy",
@@ -155,6 +154,21 @@ Multiple aliases pointing to the same `(provider_id, model_id, revision, options
 ---
 
 ## 4. Configuration
+
+### Wheels and feature flags
+
+The Python wheels (since `uni-db 1.2.0`) bundle providers per the wheel matrix — pick the wheel whose providers/accelerator match your deployment:
+
+| Wheel | Local providers | Accelerator |
+|---|---|---|
+| `uni-db` *(default)* | `local/candle` + `local/mistralrs` + `local/onnx` | CPU |
+| `uni-db-onnx` *(slim)* | `local/onnx` only | CPU |
+| `uni-db-cuda` | `local/candle` + `local/mistralrs` + `local/onnx` | NVIDIA CUDA |
+| `uni-db-metal` | `local/candle` + `local/mistralrs` + `local/onnx` | Apple GPU/ANE |
+| `uni-db-onnx-cuda` | `local/onnx` only | NVIDIA CUDA |
+| `uni-db-onnx-metal` | `local/onnx` only | Apple GPU/ANE |
+
+All 8 remote providers (`remote/openai`, `remote/gemini`, etc.) are bundled in every wheel. The Python API is identical across all six. For Rust consumers, the `uni-db` crate's defaults are minimal — opt in via `--features "provider-X,..."`. Acceleration: `gpu-cuda` (NVIDIA), `gpu-metal` (Apple). Other ORT execution providers (TensorRT, ROCm, DirectML, OpenVINO, QNN) are reachable via `provider-onnx-dynamic` + `ORT_DYLIB_PATH`.
 
 ### Python
 
@@ -422,7 +436,7 @@ Automatic instrumentation (when metrics enabled):
 
 | Use Case | Provider | Model ID | Dimensions | Notes |
 |---|---|---|---|---|
-| **General purpose (local)** | `local/fastembed` | `sentence-transformers/all-MiniLM-L6-v2` | 384 | Fast, small, good quality. Best default for local. |
+| **General purpose (local)** | `local/onnx` | `sentence-transformers/all-MiniLM-L6-v2` | 384 | Fast, small, good quality. Best default for local. |
 | **Higher quality (local)** | `local/candle` | `BAAI/bge-base-en-v1.5` | 768 | Better quality, larger model |
 | **Best quality (local)** | `local/mistralrs` | `nomic-ai/nomic-embed-text-v1.5` | 768 | Top-tier open-source embeddings |
 | **Production (remote)** | `remote/openai` | `text-embedding-3-small` | 1536 | Best cost/quality ratio for OpenAI |
@@ -445,11 +459,11 @@ Automatic instrumentation (when metrics enabled):
 
 | Use Case | Provider | Model ID | Notes |
 |---|---|---|---|
-| **Local (CPU)** | `local/onnx-reranker` | `cross-encoder/ms-marco-MiniLM-L6-v2` | ~80MB, no API key, `provider-onnx` feature |
+| **Local (CPU)** | `local/onnx` | `cross-encoder/ms-marco-MiniLM-L6-v2` | ~80MB, no API key, `provider-onnx` feature |
 | **Best quality** | `remote/voyageai` | `rerank-2` | Top-tier reranking accuracy |
 | **Cost-effective** | `remote/cohere` | `rerank-english-v3.0` | Good quality, lower cost |
 
-The `local/onnx-reranker` provider handles tokenization (WordPiece) and batched ONNX inference internally. Any BERT-style cross-encoder from HuggingFace that accepts `input_ids`, `attention_mask`, `token_type_ids` and outputs a single logit per pair should work.
+The `local/onnx` provider handles tokenization (WordPiece) and batched ONNX inference internally. Any BERT-style cross-encoder from HuggingFace that accepts `input_ids`, `attention_mask`, `token_type_ids` and outputs a single logit per pair should work.
 
 ### Reranker API
 
@@ -474,7 +488,7 @@ let scored = db.xervo().rerank("rerank/minilm", "query text", &["doc1", "doc2"])
   {
     "alias": "embed/default",
     "task": "Embed",
-    "provider_id": "local/fastembed",
+    "provider_id": "local/onnx",
     "model_id": "sentence-transformers/all-MiniLM-L6-v2"
   }
 ]
@@ -519,7 +533,7 @@ let scored = db.xervo().rerank("rerank/minilm", "query text", &["doc1", "doc2"])
   {
     "alias": "embed/local",
     "task": "Embed",
-    "provider_id": "local/fastembed",
+    "provider_id": "local/onnx",
     "model_id": "sentence-transformers/all-MiniLM-L6-v2",
     "warmup": "Eager",
     "required": true
@@ -653,7 +667,7 @@ results = db.session().query("""
 
 4. **Anthropic is generate-only** -- `remote/anthropic` does not support embeddings. Use a different provider for `Embed` tasks.
 
-5. **Local models download on first use** -- `local/candle` and `local/fastembed` download models from HuggingFace on first load. Use `warmup: "Eager"` with `required: true` to catch download failures at startup, or call `xervo.prefetch(["alias"])` after startup to pre-load specific models before first inference.
+5. **Local models download on first use** -- `local/candle` and `local/onnx` download models from HuggingFace on first load. Use `warmup: "Eager"` with `required: true` to catch download failures at startup, or call `xervo.prefetch(["alias"])` after startup to pre-load specific models before first inference.
 
 6. **API keys are read at model load time** -- Environment variables are resolved when the model is first loaded (or at startup for eager warmup), not when the database is opened.
 

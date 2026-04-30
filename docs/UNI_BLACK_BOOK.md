@@ -2523,7 +2523,7 @@ When reranking is active, `score` reflects the reranker score and `rerank_score`
 
 | Provider | Provider ID | Model Example | Type |
 |---|---|---|---|
-| ONNX (local) | `local/onnx-reranker` | `cross-encoder/ms-marco-MiniLM-L6-v2` | Local CPU inference, `provider-onnx` feature |
+| ONNX (local) | `local/onnx` | `cross-encoder/ms-marco-MiniLM-L6-v2` | Local CPU inference, `provider-onnx` feature |
 | Cohere | `remote/cohere` | `rerank-english-v3.0` | Remote API |
 | Voyage AI | `remote/voyageai` | `rerank-2` | Remote API |
 
@@ -2533,7 +2533,7 @@ When reranking is active, `score` reflects the reranker score and `rerank_score`
 {
   "alias": "rerank/minilm",
   "task": "Rerank",
-  "provider_id": "local/onnx-reranker",
+  "provider_id": "local/onnx",
   "model_id": "cross-encoder/ms-marco-MiniLM-L6-v2"
 }
 ```

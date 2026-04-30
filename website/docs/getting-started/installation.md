@@ -31,7 +31,7 @@ uni-db = "*"
 
 ## Python Package
 
-Install from [PyPI](https://pypi.org/project/uni-db/):
+Install from [PyPI](https://pypi.org/project/uni-db/). The default wheel bundles all 11 providers (candle, mistralrs, ONNX, plus 8 remote APIs) and runs on CPU:
 
 ```bash
 pip install uni-db
@@ -42,6 +42,36 @@ For the Pydantic OGM layer:
 ```bash
 pip install uni-pydantic
 ```
+
+### Wheel variants
+
+`uni-db 1.2.0` ships **6 wheels** modeled on uni-xervo 0.9.0's three-axis capability matrix (provider × linking × acceleration). Pick by hardware first, then by whether you need local LLM inference:
+
+| Wheel | Local providers | Accelerator |
+|---|---|---|
+| `uni-db` *(default)* | candle + mistralrs + ONNX | CPU |
+| `uni-db-onnx` *(slim)* | ONNX only | CPU |
+| `uni-db-cuda` | candle + mistralrs + ONNX | NVIDIA CUDA |
+| `uni-db-metal` | candle + mistralrs + ONNX | Apple GPU/ANE (Apple Silicon) |
+| `uni-db-onnx-cuda` | ONNX only | NVIDIA CUDA |
+| `uni-db-onnx-metal` | ONNX only | Apple GPU/ANE |
+
+```bash
+pip install uni-db-cuda          # Linux/Windows + NVIDIA GPU
+pip install uni-db-metal         # Apple Silicon Mac
+pip install uni-db-onnx          # smaller wheel — drops candle/mistralrs
+```
+
+The Python API is identical across all six. Programmatic recommendation:
+
+```python
+from uni_db import recommend
+print(recommend())   # e.g. "uni-db-cuda" on a Linux NVIDIA host
+```
+
+CUDA wheels require an NVIDIA driver supporting the bundled CUDA toolkit version, plus cuDNN ≥ 9 on the host loader path (not bundled — typically `/usr/local/cuda-X.X/...`). Metal wheels need a supported macOS arm64 host; CoreML/Metal frameworks ship with the OS.
+
+For the full migration mapping (if upgrading from 1.1.x), see [`docs/migrations/0.9.0-wheel-matrix-collapse.md`](https://github.com/rustic-ai/uni-db/blob/main/docs/migrations/0.9.0-wheel-matrix-collapse.md).
 
 ---
 
@@ -224,27 +254,69 @@ cargo build --release
 
 ## Feature Flags
 
-Uni supports optional features that can be enabled during compilation:
+`uni-db` follows uni-xervo 0.9.0's three-axis capability model: **provider** × **ONNX linking** × **acceleration**.
+
+### Provider features (all opt-in for the Rust crate; default in the Python wheels)
+
+| Feature | Backend | Tasks |
+|---|---|---|
+| `provider-candle` | HuggingFace Candle | Local embeddings |
+| `provider-mistralrs` | mistral.rs | Local generation, multimodal, embeddings |
+| `provider-onnx` | ONNX Runtime (bundled, statically linked) | Local embed, rerank, raw tensor |
+| `provider-onnx-dynamic` | ONNX Runtime (BYO, `dlopen` at runtime via `ORT_DYLIB_PATH`) | Same as `provider-onnx`, mutually exclusive |
+| `provider-openai` | OpenAI | Remote embed + generation |
+| `provider-gemini` | Google Gemini | Remote embed + generation |
+| `provider-vertexai` | Google Vertex AI | Remote embed + generation |
+| `provider-mistral` | Mistral API | Remote embed + generation |
+| `provider-anthropic` | Anthropic | Remote generation |
+| `provider-voyageai` | Voyage AI | Remote embed + rerank |
+| `provider-cohere` | Cohere | Remote embed + rerank + generation |
+| `provider-azure-openai` | Azure OpenAI | Remote embed + generation |
+
+### Acceleration features
+
+| Feature | Hardware |
+|---|---|
+| `gpu-cuda` | NVIDIA CUDA (Linux + Windows). Activates ORT CUDA EP and the `candle?/cuda` and `mistralrs?/cuda` kernels for any local provider also enabled. |
+| `gpu-metal` | Apple GPU/ANE (macOS). Activates the ORT CoreML EP and the `candle?/metal` and `mistralrs?/metal` kernels. |
+
+The previous nine `gpu-*` features (`gpu-tensorrt`, `gpu-rocm`, `gpu-coreml`, `gpu-directml`, `gpu-openvino`, `gpu-qnn`, `gpu-wgpu`, plus the two above) collapsed to two in `uni-db 1.2.0`. The retired EPs remain reachable via `provider-onnx-dynamic` plus a vendor-supplied ORT shared library at runtime (`ORT_DYLIB_PATH`).
+
+### Backend features
 
 | Feature | Description | Default |
-|---------|-------------|---------|
-| `candle-text` | Native Rust embedding models (Candle) | Enabled |
-| `fastembed` | ONNX-based embedding models (legacy) | Disabled |
-| `s3` | Amazon S3 object store | Enabled |
-| `gcs` | Google Cloud Storage | Disabled |
-| `azure` | Azure Blob Storage | Disabled |
+|---|---|---|
+| `lance-backend` | Lance columnar storage backend | Enabled |
+| `snapshot-internals` | Expose snapshot internals (advanced) | Disabled |
+| `storage-internals` | Expose storage internals (advanced) | Disabled |
 
-### Custom Build Example
+### Custom build examples
 
 ```bash
-# Minimal build (local filesystem only)
-cargo build --release --no-default-features
+# Default — Lance + remote OpenAI/Gemini providers (current crate default)
+cargo build --release
 
-# Build with all cloud providers
-cargo build --release --features "s3,gcs,azure"
+# Slim — no providers at all
+cargo build --release --no-default-features --features lance-backend
 
-# Build without embedding support (smaller binary)
-cargo build --release --no-default-features --features "s3"
+# Everything-CPU (matches the default `uni-db` wheel)
+cargo build --release \
+  --features "provider-candle,provider-mistralrs,provider-onnx,\
+provider-openai,provider-gemini,provider-vertexai,provider-mistral,\
+provider-anthropic,provider-voyageai,provider-cohere,provider-azure-openai"
+
+# Everything + NVIDIA CUDA (matches the `uni-db-cuda` wheel)
+cargo build --release \
+  --features "provider-candle,provider-mistralrs,gpu-cuda,\
+provider-openai,provider-gemini,provider-vertexai,provider-mistral,\
+provider-anthropic,provider-voyageai,provider-cohere,provider-azure-openai"
+
+# BYO ORT (e.g. AMD ROCm, Intel OpenVINO, DirectML)
+cargo build --release \
+  --no-default-features \
+  --features "lance-backend,provider-onnx-dynamic,provider-openai"
+# Then at runtime:
+export ORT_DYLIB_PATH=/path/to/your/libonnxruntime.so
 ```
 
 ---

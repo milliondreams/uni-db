@@ -27,7 +27,7 @@
 //! (multi-MATCH, both-endpoint label hints, no RETURN).
 //!
 //! Run:
-//!   cargo nextest run -p uni-db --features "provider-fastembed,provider-onnx" \
+//!   cargo nextest run -p uni-db --features "provider-onnx" \
 //!       --test issue_55_observed_in_growth --release --no-capture --run-ignored all
 
 use std::collections::HashMap;
@@ -50,7 +50,7 @@ fn nomic_catalog() -> Vec<ModelAliasSpec> {
     vec![ModelAliasSpec {
         alias: "embed/default".to_string(),
         task: ModelTask::Embed,
-        provider_id: "local/fastembed".to_string(),
+        provider_id: "local/onnx".to_string(),
         model_id: "AllMiniLML6V2".to_string(),
         revision: None,
         warmup: WarmupPolicy::Lazy,
@@ -197,7 +197,7 @@ async fn batch_create_observed_in(db: &Uni, obs_ids: &[i64], msg_id: i64) -> u12
 }
 
 #[tokio::test]
-#[ignore] // Requires fastembed model cached locally; takes ~3 min.
+#[ignore] // Requires ONNX embed model cached locally; takes ~3 min.
 async fn repro_observed_in_query_time_grows() {
     let db = setup_db().await;
 

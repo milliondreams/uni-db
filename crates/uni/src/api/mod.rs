@@ -1301,11 +1301,6 @@ impl UniBuilder {
                 runtime_builder = runtime_builder
                     .register_provider(uni_xervo::provider::LocalCandleProvider::new());
             }
-            #[cfg(feature = "provider-fastembed")]
-            {
-                runtime_builder = runtime_builder
-                    .register_provider(uni_xervo::provider::LocalFastEmbedProvider::new());
-            }
             #[cfg(feature = "provider-openai")]
             {
                 runtime_builder = runtime_builder

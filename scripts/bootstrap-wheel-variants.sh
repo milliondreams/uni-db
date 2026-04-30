@@ -27,17 +27,10 @@ fi
 
 VARIANTS=(
     onnx
+    cuda
+    metal
     onnx-cuda
     onnx-metal
-    fastembed
-    fastembed-cuda
-    fastembed-metal
-    mistralrs
-    mistralrs-cuda
-    mistralrs-metal
-    all
-    all-cuda
-    all-metal
 )
 
 for variant in "${VARIANTS[@]}"; do

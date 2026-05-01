@@ -105,7 +105,7 @@ url = "2.5"
 proptest = "1.4"
 datafusion = "52.3.0"
 lancedb = { version = "=0.27.1", default-features = false, features = ["aws", "gcs", "azure"] }
-uni-xervo = { version = "0.9.0", default-features = false }
+uni-xervo = { version = "0.10.0", default-features = false }
 biodivine-lib-bdd = "0.5"
 candle-core = "0.9.2"
 candle-nn = "0.9.2"
@@ -113,3 +113,8 @@ candle-transformers = "0.9.2"
 tokio-util = { version = "0.7", features = ["rt"] }
 hf-hub = "0.4.3"
 tokenizers = "0.22.2"
+
+# Local sibling-clone override while uni-xervo 0.10.0 isn't on crates.io yet.
+# Remove this `[patch.crates-io]` block once 0.10.0 is published.
+[patch.crates-io]
+uni-xervo = { path = "../uni-xervo" }

@@ -5172,6 +5172,51 @@ impl QueryPlanner {
         )
     }
 
+    /// Decide whether per-label `Scan` branches for a label disjunction can
+    /// safely be combined under `LogicalPlan::Union`. Returns `true` iff every
+    /// label in `labels` is registered in the schema AND every pair shares an
+    /// identical property name+type set.
+    ///
+    /// When this returns `false`, the disjunction must fall back to a single
+    /// `ScanMainByLabels` over all labels — otherwise DataFusion's
+    /// `UnionExec::try_new` panics in `union_schema` because the per-label
+    /// `GraphScanExec` outputs (`_vid` + `_labels` + per-label projected
+    /// properties) have different field counts. Issue rustic-ai/uni-db#62.
+    ///
+    /// We deliberately compare full schema property sets rather than only the
+    /// properties referenced by the current query: at this logical-planning
+    /// stage we have not yet collected `all_properties`, and `*` wildcards
+    /// (e.g. from unknown function calls) would expand per-label downstream
+    /// in `df_planner::resolve_properties` even when the query text only
+    /// touches common columns.
+    fn label_branches_share_property_schema(&self, labels: &[String]) -> bool {
+        if labels.len() < 2 {
+            return true;
+        }
+        let mut iter = labels.iter();
+        let first = iter.next().expect("len >= 2");
+        let Some(first_props) = self.schema.properties.get(first) else {
+            return false;
+        };
+        for label in iter {
+            let Some(props) = self.schema.properties.get(label) else {
+                return false;
+            };
+            if props.len() != first_props.len() {
+                return false;
+            }
+            for (name, meta) in first_props {
+                let Some(other_meta) = props.get(name) else {
+                    return false;
+                };
+                if meta.r#type != other_meta.r#type {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     /// Plan an unbound node (creates a Scan, ScanAll, ScanMainByLabel, ExtIdLookup, or CrossJoin).
     fn plan_unbound_node(
         &self,
@@ -5277,21 +5322,43 @@ impl QueryPlanner {
         // is encoded the same way the parser already encodes single edge
         // types, and reduces to one Scan with no Union wrapping.
         if node.labels.is_proper_disjunction() {
-            let mut branches: Vec<LogicalPlan> = Vec::with_capacity(node.labels.len());
-            for label_name in node.labels.names() {
-                let branch = if let Some(meta) = self.schema.get_label_case_insensitive(label_name)
-                {
-                    LogicalPlan::Scan {
-                        label_id: meta.id,
+            let label_names: Vec<String> = node.labels.names().to_vec();
+
+            // Per-label branches under a `Union` only line up when every
+            // branch produces the same Arrow schema. The narrow-scan
+            // `Scan` path resolves columns *per label*, so heterogeneous
+            // property sets (or any schemaless label in the mix) yield
+            // mismatched widths and DataFusion's `UnionExec::try_new`
+            // panics inside `union_schema` (issue rustic-ai/uni-db#62).
+            //
+            // For those cases, lower every branch to a *single-label*
+            // `ScanMainByLabels` instead. The schemaless main-table scan
+            // resolves columns from `all_properties` directly (no per-label
+            // expansion), so all branches emit a uniform schema and the
+            // outer `Union { all: false }` deduplicates correctly. We
+            // keep the per-branch Union shape (rather than collapsing to
+            // a single multi-label scan) because multi-label
+            // `ScanMainByLabels` has AND/intersection semantics — wrong
+            // for a disjunction.
+            let use_main_table_branches =
+                !self.label_branches_share_property_schema(&label_names);
+
+            let mut branches: Vec<LogicalPlan> = Vec::with_capacity(label_names.len());
+            for label_name in &label_names {
+                let branch = if use_main_table_branches {
+                    LogicalPlan::ScanMainByLabels {
                         labels: vec![label_name.clone()],
                         variable: variable.to_string(),
                         filter: node_scan_filter.clone(),
                         optional,
                     }
                 } else {
-                    // Schemaless branch — fall back to main-table label
-                    // filter so unknown labels still match.
-                    LogicalPlan::ScanMainByLabels {
+                    let meta = self
+                        .schema
+                        .get_label_case_insensitive(label_name)
+                        .expect("share_property_schema true implies all labels in schema");
+                    LogicalPlan::Scan {
+                        label_id: meta.id,
                         labels: vec![label_name.clone()],
                         variable: variable.to_string(),
                         filter: node_scan_filter.clone(),
@@ -5807,18 +5874,30 @@ impl QueryPlanner {
                 filter,
                 optional: scan_optional,
             } if var == variable => {
+                // Heterogeneous (or any-schemaless) disjunction: route every
+                // branch through a single-label `ScanMainByLabels` so all
+                // branches emit a uniform schemaless schema. Avoids the
+                // DataFusion `union_schema` panic. See `plan_unbound_node`
+                // and issue rustic-ai/uni-db#62.
+                let use_main_table_branches =
+                    !self.label_branches_share_property_schema(labels);
+
                 let mut branches: Vec<LogicalPlan> = Vec::with_capacity(labels.len());
                 for label in labels {
-                    let branch = if let Some(meta) = self.schema.get_label_case_insensitive(label) {
-                        LogicalPlan::Scan {
-                            label_id: meta.id,
+                    let branch = if use_main_table_branches {
+                        LogicalPlan::ScanMainByLabels {
                             labels: vec![label.clone()],
                             variable: variable.to_string(),
                             filter: filter.clone(),
                             optional: scan_optional || optional,
                         }
                     } else {
-                        LogicalPlan::ScanMainByLabels {
+                        let meta = self
+                            .schema
+                            .get_label_case_insensitive(label)
+                            .expect("share_property_schema true implies all labels in schema");
+                        LogicalPlan::Scan {
+                            label_id: meta.id,
                             labels: vec![label.clone()],
                             variable: variable.to_string(),
                             filter: filter.clone(),

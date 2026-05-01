@@ -4319,6 +4319,38 @@ impl HybridPhysicalPlanner {
         let left_plan = self.plan_internal(left, all_properties)?;
         let right_plan = self.plan_internal(right, all_properties)?;
 
+        // Guard against schema mismatches reaching DataFusion's
+        // `union_schema`, which panics with `index out of bounds` rather
+        // than returning `Err` when branch widths differ (issue
+        // rustic-ai/uni-db#62). With the planner-level fallback in place
+        // for label disjunction this should be unreachable, but a typed
+        // error here protects any future logical-Union path against the
+        // same process-aborting panic.
+        let left_schema = left_plan.schema();
+        let right_schema = right_plan.schema();
+        if left_schema.fields().len() != right_schema.fields().len()
+            || left_schema
+                .fields()
+                .iter()
+                .zip(right_schema.fields().iter())
+                .any(|(l, r)| l.name() != r.name() || l.data_type() != r.data_type())
+        {
+            let fmt = |s: &Schema| {
+                s.fields()
+                    .iter()
+                    .map(|f| format!("{}: {:?}", f.name(), f.data_type()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            return Err(anyhow!(
+                "Plan: cannot UNION branches with mismatched schemas — \
+                 left=[{}], right=[{}]. This is a planner bug; please file \
+                 an issue.",
+                fmt(left_schema.as_ref()),
+                fmt(right_schema.as_ref()),
+            ));
+        }
+
         let union_plan = UnionExec::try_new(vec![left_plan, right_plan])?;
 
         // UNION (without ALL) requires deduplication

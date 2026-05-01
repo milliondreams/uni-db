@@ -273,3 +273,166 @@ async fn q3_predicate_form_executes() {
         "Q3 WHERE n:Person OR n:Organization: expected 3 nodes (2 Person + 1 Organization)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Heterogeneous-schema label disjunction (issue rustic-ai/uni-db#62)
+// ---------------------------------------------------------------------------
+//
+// The Q1–Q3 fixtures above all use labels with a single uniform `name:
+// String` property, so per-label `Scan` branches under a `Union` happen to
+// produce identical Arrow schemas. That hid a structural hazard: when the
+// labels in a disjunction carry *different* property sets, the per-label
+// branch schemas have different field counts, and DataFusion's
+// `UnionExec::try_new` panics inside `union_schema` (`index out of bounds:
+// the len is N but the index is N`). The panic escapes the await as a
+// process abort, since the underlying arrow-schema helper has no `Result`.
+//
+// The fix keeps the narrow-scan Union path for homogeneous label sets, and
+// for heterogeneous sets routes every branch through a *single-label*
+// `ScanMainByLabels` (which resolves columns schemaless-style, not
+// per-label) so the Union sees a uniform schema across branches.
+
+/// Build a graph with three labels of intentionally different property
+/// counts (matching the scenario described in issue #62: an `ABOUT` edge
+/// pointing at either a low-property `Entity` or a high-property
+/// `Participant`).
+async fn setup_heterogeneous() -> Uni {
+    let db = Uni::in_memory().build().await.unwrap();
+    db.schema()
+        .label("Source")
+        .property("name", DataType::String)
+        .done()
+        // 2 properties.
+        .label("DestA")
+        .property("name", DataType::String)
+        .property("category", DataType::String)
+        .done()
+        // 4 properties.
+        .label("DestB")
+        .property("name", DataType::String)
+        .property("kind", DataType::String)
+        .property("first_seen", DataType::String)
+        .property("last_seen", DataType::String)
+        .done()
+        .edge_type("LINK", &["Source"], &["DestA", "DestB"])
+        .done()
+        .apply()
+        .await
+        .unwrap();
+
+    let session = db.session();
+    let tx = session.tx().await.unwrap();
+    tx.execute(
+        r#"
+        CREATE (:Source {name: 'src'})
+        CREATE (:DestA {name: 'a1', category: 'cat'})
+        CREATE (:DestB {name: 'b1', kind: 'k', first_seen: 'fs', last_seen: 'ls'})
+        "#,
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    db
+}
+
+/// Q6: heterogeneous-schema inline disjunction, no property projection.
+///
+/// Direct repro of issue #62: `MATCH (b:DestA|DestB)` over labels with
+/// 2-vs-4 property sets used to panic in DataFusion before the fix.
+/// Asserts both correct row count *and* the new fallback plan shape
+/// (single `ScanMainByLabels`, no per-label `Union { Scan, Scan }`).
+#[tokio::test]
+async fn q6_node_label_disjunction_heterogeneous_no_panic() {
+    let db = setup_heterogeneous().await;
+    let cypher = "MATCH (b:DestA|DestB) RETURN id(b) AS vid";
+
+    let explain = db
+        .session()
+        .query_with(cypher)
+        .explain()
+        .await
+        .expect("Q6 EXPLAIN should succeed");
+    eprintln!("Q6 plan-shape:\n{}", explain.plan_text);
+
+    let result = db
+        .session()
+        .query(cypher)
+        .await
+        .expect("Q6 must not panic on heterogeneous label disjunction");
+    assert_eq!(result.rows().len(), 2, "Q6: expected 1 DestA + 1 DestB");
+
+    assert!(
+        explain.plan_text.contains("ScanMainByLabels"),
+        "Q6 heterogeneous disjunction must route branches through ScanMainByLabels, got:\n{}",
+        explain.plan_text
+    );
+    assert!(
+        explain.plan_text.contains("Union"),
+        "Q6 heterogeneous disjunction must keep the per-label Union shape (with main-table branches), got:\n{}",
+        explain.plan_text
+    );
+    // Each branch must be a *single-label* ScanMainByLabels — multi-label
+    // ScanMainByLabels has AND/intersection semantics, wrong for a
+    // disjunction. The plan-text format prints the labels list, so
+    // assert no `"DestA",\n                "DestB"` co-occurrence inside
+    // a single ScanMainByLabels (proxy: ensure each branch list has one
+    // element via per-label substring presence + branch count).
+    let main_count = explain.plan_text.matches("ScanMainByLabels").count();
+    assert_eq!(
+        main_count, 2,
+        "Q6 must produce exactly one ScanMainByLabels branch per label, got {} occurrences in:\n{}",
+        main_count, explain.plan_text
+    );
+}
+
+/// Q7: heterogeneous-schema disjunction with a *common* property
+/// projection. `name` exists on both DestA and DestB, but the labels'
+/// full schemas still differ — the planner must take the heterogeneous
+/// fallback rather than try to narrow-scan a property that happens to be
+/// shared. Validates that property access flows correctly through the
+/// `ScanMainByLabels` path (which extracts properties from `props_json`
+/// rather than per-label columns).
+#[tokio::test]
+async fn q7_node_label_disjunction_heterogeneous_with_common_property() {
+    let db = setup_heterogeneous().await;
+    let cypher = "MATCH (b:DestA|DestB) RETURN b.name AS name ORDER BY name";
+
+    let result = db.session().query(cypher).await.expect("Q7 must execute");
+    let rows = result.rows();
+    assert_eq!(rows.len(), 2, "Q7: expected 1 DestA + 1 DestB");
+    let names: Vec<String> = rows
+        .iter()
+        .map(|r| r.get::<String>("name").unwrap())
+        .collect();
+    assert_eq!(names, vec!["a1".to_string(), "b1".to_string()]);
+}
+
+/// Q8: heterogeneous-schema predicate form. `WHERE n:DestA OR n:DestB`
+/// goes through the *separate* `replace_scan_all_with_label_union`
+/// rewrite, so the heterogeneous fallback has to fire there too.
+#[tokio::test]
+async fn q8_where_label_disjunction_heterogeneous_no_panic() {
+    let db = setup_heterogeneous().await;
+    let cypher = "MATCH (b) WHERE b:DestA OR b:DestB RETURN id(b) AS vid";
+
+    let explain = db
+        .session()
+        .query_with(cypher)
+        .explain()
+        .await
+        .expect("Q8 EXPLAIN should succeed");
+    eprintln!("Q8 plan-shape:\n{}", explain.plan_text);
+
+    let result = db
+        .session()
+        .query(cypher)
+        .await
+        .expect("Q8 must not panic on heterogeneous WHERE-form disjunction");
+    assert_eq!(result.rows().len(), 2);
+
+    assert!(
+        explain.plan_text.contains("ScanMainByLabels"),
+        "Q8 must fall back to ScanMainByLabels, got:\n{}",
+        explain.plan_text
+    );
+}

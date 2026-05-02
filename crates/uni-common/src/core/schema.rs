@@ -1702,10 +1702,7 @@ mod tests {
         );
         // Last-writer-wins: the kept entry is the final push (Online, 123).
         assert_eq!(schema.indexes[0].metadata().status, IndexStatus::Online);
-        assert_eq!(
-            schema.indexes[0].metadata().row_count_at_build,
-            Some(123)
-        );
+        assert_eq!(schema.indexes[0].metadata().row_count_at_build, Some(123));
 
         Ok(())
     }

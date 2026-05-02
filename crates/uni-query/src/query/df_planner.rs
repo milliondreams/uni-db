@@ -4321,11 +4321,20 @@ impl HybridPhysicalPlanner {
 
         // Guard against schema mismatches reaching DataFusion's
         // `union_schema`, which panics with `index out of bounds` rather
-        // than returning `Err` when branch widths differ (issue
-        // rustic-ai/uni-db#62). With the planner-level fallback in place
-        // for label disjunction this should be unreachable, but a typed
-        // error here protects any future logical-Union path against the
-        // same process-aborting panic.
+        // than returning `Err` when branch widths or per-position types
+        // differ (issue rustic-ai/uni-db#62). With the planner-level
+        // fallback in place for label disjunction this should be
+        // unreachable, but a typed error here protects any future
+        // logical-Union path against the same process-aborting panic.
+        //
+        // We only compare field count and per-position **type**; the
+        // user-facing Cypher `UNION` clause routinely produces branches
+        // whose per-position field *names* differ (e.g. `MATCH (a:A)
+        // RETURN a AS a UNION MATCH (b:B) RETURN b AS a` — both branches
+        // alias their pattern variable to `a`, but internal namespaced
+        // columns like `a._vid` vs `b._vid` differ). DataFusion handles
+        // that case fine by adopting left names; only width/type
+        // mismatches are the panic source.
         let left_schema = left_plan.schema();
         let right_schema = right_plan.schema();
         if left_schema.fields().len() != right_schema.fields().len()
@@ -4333,7 +4342,7 @@ impl HybridPhysicalPlanner {
                 .fields()
                 .iter()
                 .zip(right_schema.fields().iter())
-                .any(|(l, r)| l.name() != r.name() || l.data_type() != r.data_type())
+                .any(|(l, r)| l.data_type() != r.data_type())
         {
             let fmt = |s: &Schema| {
                 s.fields()

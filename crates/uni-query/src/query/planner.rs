@@ -5340,8 +5340,7 @@ impl QueryPlanner {
             // a single multi-label scan) because multi-label
             // `ScanMainByLabels` has AND/intersection semantics — wrong
             // for a disjunction.
-            let use_main_table_branches =
-                !self.label_branches_share_property_schema(&label_names);
+            let use_main_table_branches = !self.label_branches_share_property_schema(&label_names);
 
             let mut branches: Vec<LogicalPlan> = Vec::with_capacity(label_names.len());
             for label_name in &label_names {
@@ -5879,8 +5878,7 @@ impl QueryPlanner {
                 // branches emit a uniform schemaless schema. Avoids the
                 // DataFusion `union_schema` panic. See `plan_unbound_node`
                 // and issue rustic-ai/uni-db#62.
-                let use_main_table_branches =
-                    !self.label_branches_share_property_schema(labels);
+                let use_main_table_branches = !self.label_branches_share_property_schema(labels);
 
                 let mut branches: Vec<LogicalPlan> = Vec::with_capacity(labels.len());
                 for label in labels {

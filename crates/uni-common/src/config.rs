@@ -466,6 +466,12 @@ pub struct UniConfig {
     /// in the schema. Default: false (schemaless mode — any label or edge type
     /// is accepted and dynamically registered).
     pub strict_schema: bool,
+
+    /// Per-fork L1 fragment-count threshold above which a `tracing::warn!`
+    /// fires once per crossing during fork flush. Long-lived heavy-write
+    /// forks accumulate fragments because fork compaction is deferred to
+    /// Phase 5; this surfaces the risk operationally. Default: 256.
+    pub fork_fragment_warn_threshold: usize,
 }
 
 impl Default for UniConfig {
@@ -495,6 +501,7 @@ impl Default for UniConfig {
             object_store: ObjectStoreConfig::default(),
             index_rebuild: IndexRebuildConfig::default(),
             strict_schema: false,
+            fork_fragment_warn_threshold: 256,
         }
     }
 }

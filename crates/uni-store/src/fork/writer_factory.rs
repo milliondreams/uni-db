@@ -59,7 +59,7 @@ pub async fn new_for_fork(
     // segments from prior sessions on the same fork.
     wal.initialize().await?;
 
-    Writer::new_with_config(
+    let mut writer = Writer::new_with_config(
         storage,
         schema_manager,
         // Fork's own version namespace; not interleaved with primary.
@@ -68,7 +68,11 @@ pub async fn new_for_fork(
         Some(wal),
         Some(allocator),
     )
-    .await
+    .await?;
+    // Tag the writer with its fork identity so flush-time observability
+    // (Phase 2 Day 12) can label metrics and fire the fragment guard rail.
+    writer.fork_id = Some(*fork_id);
+    Ok(writer)
 }
 
 #[cfg(test)]

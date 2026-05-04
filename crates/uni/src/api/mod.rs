@@ -2,10 +2,12 @@
 // Copyright 2024-2026 Dragonscale Team
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+use dashmap::DashMap;
 use tempfile::TempDir;
+use uni_common::core::fork::ForkId;
 
 pub mod appender;
 pub mod builder;
@@ -93,6 +95,16 @@ pub struct UniInner {
     /// the create/drop 2PC. Built once during `Uni::open` and shared
     /// by the primary `UniInner` and every forked-session inner.
     pub(crate) fork_registry: Arc<uni_store::fork::ForkRegistryHandle>,
+    /// Phase 2 Day 8 cache: same-fork-name `Session::fork(name)` calls
+    /// share the same `Arc<UniInner>` so sibling sessions on the same
+    /// fork see each other's commits without flushing through Lance
+    /// (which would otherwise be the only synchronization point at the
+    /// branch level). Held as `Weak` so the inner is reclaimed when
+    /// the last session drops; `ForkBuilder::build` rebuilds on the
+    /// next call. Initialized empty on the primary `UniInner`; each
+    /// forked inner clones the same `Arc<DashMap>` so siblings see
+    /// the registry from any direction.
+    pub(crate) fork_inners: Arc<DashMap<ForkId, Weak<UniInner>>>,
 
     // ── Cached metrics (updated on commit, read by sync `metrics()`) ─────
     /// Cached L0 mutation count (updated after every commit).
@@ -242,6 +254,7 @@ impl UniInner {
             total_commits: AtomicU64::new(0),
             custom_functions: self.custom_functions.clone(),
             fork_registry: self.fork_registry.clone(),
+            fork_inners: self.fork_inners.clone(),
             cached_l0_mutation_count: AtomicUsize::new(0),
             cached_l0_estimated_size: AtomicUsize::new(0),
             cached_wal_lsn: AtomicU64::new(0),
@@ -341,6 +354,7 @@ impl UniInner {
             total_commits: AtomicU64::new(0),
             custom_functions: self.custom_functions.clone(),
             fork_registry: self.fork_registry.clone(),
+            fork_inners: self.fork_inners.clone(),
             cached_l0_mutation_count: AtomicUsize::new(0),
             cached_l0_estimated_size: AtomicUsize::new(0),
             cached_wal_lsn: AtomicU64::new(0),
@@ -468,6 +482,13 @@ impl Uni {
     /// ```
     pub async fn drop_fork(&self, name: &str) -> Result<()> {
         let info = self.inner.fork_registry.begin_drop(name).await?;
+        // Phase 2 Day 8: evict the cached `Weak<UniInner>` (if any)
+        // before deleting branches. The registry has already
+        // transitioned the fork to Tombstoned, so concurrent
+        // `fork(name)` calls now error out before reaching the cache;
+        // this eviction is purely cleanup so the map doesn't accumulate
+        // dead Weak entries across the lifetime of the database.
+        self.inner.fork_inners.remove(&info.id);
         // Step 3: walk branches and force-delete each.
         let storage_uri = self.inner.storage.base_uri().to_string();
         for (dataset, branch) in &info.datasets {
@@ -1665,6 +1686,7 @@ impl UniBuilder {
                     uni_query::CustomFunctionRegistry::new(),
                 )),
                 fork_registry,
+                fork_inners: Arc::new(DashMap::new()),
                 cached_l0_mutation_count: AtomicUsize::new(0),
                 cached_l0_estimated_size: AtomicUsize::new(0),
                 cached_wal_lsn: AtomicU64::new(0),

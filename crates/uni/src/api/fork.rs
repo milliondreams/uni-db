@@ -117,17 +117,43 @@ impl<'a> ForkBuilder<'a> {
             Err(other) => return Err(other),
         };
 
-        // Build the scope and the forked session's UniInner.
+        // Build the scope (per-session — its ForkHolderGuard increments
+        // the registry's holder count, which `drop_fork` consults).
         let overlay = registry.load_schema_overlay(&info.id).await?;
         let scope = Arc::new(ForkScope::new(
             Arc::new(info.clone()),
             Arc::new(overlay),
             registry.clone(),
         ));
-        let forked_inner = parent.db.at_fork(scope.clone()).await?;
 
-        debug!(fork_id = %info.id, fork_name = %info.name, "forked session ready");
-        Ok(Session::new_forked(Arc::new(forked_inner), scope))
+        // Phase 2 Day 8: same-fork sessions share an `Arc<UniInner>`
+        // so commits from one session are immediately visible to
+        // sibling sessions (they share the same Writer + L0). The
+        // per-name `name_lock` held above serializes concurrent
+        // `fork(name)` calls on the same name, so the check-then-insert
+        // below is race-free.
+        let forked_inner_arc = match parent
+            .db
+            .fork_inners
+            .get(&info.id)
+            .and_then(|w| w.upgrade())
+        {
+            Some(existing) => {
+                debug!(fork_id = %info.id, fork_name = %info.name, "fork inner cache hit");
+                existing
+            }
+            None => {
+                let new_inner = Arc::new(parent.db.at_fork(scope.clone()).await?);
+                parent
+                    .db
+                    .fork_inners
+                    .insert(info.id, Arc::downgrade(&new_inner));
+                debug!(fork_id = %info.id, fork_name = %info.name, "fork inner cache miss; constructed");
+                new_inner
+            }
+        };
+
+        Ok(Session::new_forked(forked_inner_arc, scope))
     }
 }
 

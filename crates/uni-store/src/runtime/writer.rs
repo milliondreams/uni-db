@@ -22,6 +22,7 @@ use tracing::{debug, info, instrument};
 use uni_common::Properties;
 use uni_common::Value;
 use uni_common::config::UniConfig;
+use uni_common::core::fork::ForkId;
 use uni_common::core::id::{Eid, Vid};
 use uni_common::core::schema::{ConstraintTarget, ConstraintType, IndexDefinition};
 use uni_common::core::snapshot::{EdgeSnapshot, LabelSnapshot, SnapshotManifest};
@@ -61,6 +62,24 @@ pub struct Writer {
     /// Cached snapshot manifest from the last flush. Avoids re-reading from
     /// object store on every flush_to_l1 call.
     cached_manifest: Option<SnapshotManifest>,
+    /// Identifier of the fork this writer serves, if any. `None` for
+    /// primary's writer. Set by [`crate::fork::writer_factory::new_for_fork`]
+    /// and read in `flush_to_l1` to emit fork-tagged metrics and to fire
+    /// the fragment-count guard rail (Phase 2 Day 12).
+    pub fork_id: Option<ForkId>,
+    /// Number of `flush_to_l1` calls since this writer was constructed.
+    /// Used as a proxy for L1 fragment growth on the fork's branches:
+    /// each flush typically appends ~1 fragment per touched dataset, so
+    /// the count tracks the order of magnitude of fragment accumulation.
+    /// Reading the actual `Dataset::manifest().fragments.len()` per
+    /// flush would add a per-dataset object-store roundtrip on the hot
+    /// commit path; the proxy keeps the guard rail purely observational
+    /// (Phase 5 introduces fork compaction proper). Only meaningful when
+    /// `fork_id.is_some()`.
+    fork_flush_count: u64,
+    /// Whether the fork-fragment warning has already fired at the
+    /// configured threshold. One-shot per writer lifetime.
+    fork_fragment_warn_fired: bool,
 }
 
 impl Writer {
@@ -119,6 +138,9 @@ impl Writer {
             compaction_handle: Arc::new(RwLock::new(None)),
             index_rebuild_manager: None,
             cached_manifest: None,
+            fork_id: None,
+            fork_flush_count: 0,
+            fork_fragment_warn_fired: false,
         })
     }
 
@@ -2574,7 +2596,49 @@ impl Writer {
             self.schedule_index_rebuilds_if_needed(&manifest, rebuild_mgr.clone());
         }
 
+        // Phase 2 Day 12: emit fork-fragment observability after a
+        // successful forked flush.
+        self.tick_fork_fragment_observability();
+
         Ok(snapshot_id)
+    }
+
+    /// Increment fork-flush bookkeeping and fire the fragment warn
+    /// once if the threshold is crossed.
+    ///
+    /// Each flush typically appends ~1 fragment per touched dataset on
+    /// the fork's branches; without compaction (deferred to Phase 5)
+    /// long-lived heavy-write forks degrade. The flush count is a
+    /// proxy for actual fragment growth — reading
+    /// `Dataset::manifest().fragments.len()` per dataset would add a
+    /// per-flush object-store roundtrip on the hot commit path, which
+    /// is too costly for a purely observational guard rail.
+    ///
+    /// No-op for primary writers (`fork_id == None`).
+    pub(crate) fn tick_fork_fragment_observability(&mut self) {
+        let Some(fork_id) = self.fork_id else { return };
+        self.fork_flush_count = self.fork_flush_count.saturating_add(1);
+        let fork_label = fork_id.to_string();
+        metrics::gauge!(
+            "uni_fork_l1_flushes",
+            "fork" => fork_label.clone(),
+        )
+        .set(self.fork_flush_count as f64);
+        let threshold = self.config.fork_fragment_warn_threshold as u64;
+        if !self.fork_fragment_warn_fired
+            && threshold > 0
+            && self.fork_flush_count >= threshold
+        {
+            self.fork_fragment_warn_fired = true;
+            tracing::warn!(
+                fork = %fork_label,
+                flush_count = self.fork_flush_count,
+                threshold,
+                "fork has exceeded the L1 flush-count threshold; \
+                 fork compaction is deferred to Phase 5 — consider \
+                 drop+recreate or promotion to bound fragment growth"
+            );
+        }
     }
 
     /// Check rebuild thresholds and schedule background index rebuilds for
@@ -3127,6 +3191,67 @@ mod tests {
             !main_l0.read().vertex_properties.contains_key(&vid),
             "Main L0 should remain clean after dropped transaction"
         );
+
+        Ok(())
+    }
+
+    /// Phase 2 Day 12: the fork-fragment warn fires exactly once when
+    /// the flush count crosses the configured threshold and stays
+    /// silent on subsequent flushes for the lifetime of the writer.
+    /// Primary writers (`fork_id == None`) never fire it.
+    ///
+    /// Tested directly against `tick_fork_fragment_observability` so
+    /// the contract is locked in independently of the broader
+    /// `flush_to_l1` path (the end-to-end fork-flush path is blocked
+    /// on Day 10's on-the-fly schema overlay growth).
+    #[tokio::test]
+    async fn fork_fragment_warn_fires_once_then_silences() -> Result<()> {
+        use crate::storage::manager::StorageManager;
+        use object_store::local::LocalFileSystem;
+        use object_store::path::Path as ObjectStorePath;
+        use uni_common::core::fork::ForkId;
+        use uni_common::core::schema::SchemaManager;
+
+        let dir = tempdir()?;
+        let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path())?);
+        let schema_path = ObjectStorePath::from("schema.json");
+        let schema_manager =
+            Arc::new(SchemaManager::load_from_store(store.clone(), &schema_path).await?);
+        let storage = Arc::new(StorageManager::new(dir.path().to_str().unwrap(), schema_manager.clone()).await?);
+
+        let config = UniConfig {
+            fork_fragment_warn_threshold: 3,
+            ..Default::default()
+        };
+        let mut writer =
+            Writer::new_with_config(storage, schema_manager, 1, config, None, None).await?;
+
+        // Primary path: never fires.
+        for _ in 0..10 {
+            writer.tick_fork_fragment_observability();
+        }
+        assert!(!writer.fork_fragment_warn_fired);
+        assert_eq!(writer.fork_flush_count, 0);
+
+        // Fork path: tag and tick. Below threshold → no fire.
+        writer.fork_id = Some(ForkId::new());
+        writer.tick_fork_fragment_observability();
+        writer.tick_fork_fragment_observability();
+        assert!(!writer.fork_fragment_warn_fired);
+        assert_eq!(writer.fork_flush_count, 2);
+
+        // Crossing threshold → fires once.
+        writer.tick_fork_fragment_observability();
+        assert!(writer.fork_fragment_warn_fired);
+        assert_eq!(writer.fork_flush_count, 3);
+
+        // Subsequent ticks bump the gauge but do not re-fire.
+        let fired_after = writer.fork_fragment_warn_fired;
+        for _ in 0..5 {
+            writer.tick_fork_fragment_observability();
+        }
+        assert_eq!(writer.fork_flush_count, 8);
+        assert_eq!(writer.fork_fragment_warn_fired, fired_after);
 
         Ok(())
     }

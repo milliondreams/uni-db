@@ -208,6 +208,12 @@ impl Transaction {
         // write guard, so we disarm the scopeguard.
         std::mem::forget(write_guard_cleanup);
 
+        // Phase 2 Day 11: count this transaction as in-flight on its
+        // UniInner so `Uni::drop_fork` can surface the
+        // forgot-to-commit case as `ForkInflightTx` rather than
+        // proceeding silently. Decrement happens in `Transaction::drop`.
+        tx.db.inflight_tx_count.fetch_add(1, Ordering::SeqCst);
+
         Ok(tx)
     }
 
@@ -775,6 +781,9 @@ impl Drop for Transaction {
             // Release write guard
             self.session_write_guard.store(false, Ordering::SeqCst);
         }
+        // Phase 2 Day 11: pair with the increment in `new_with_options`.
+        // Always runs, regardless of commit/rollback/silent-drop.
+        self.db.inflight_tx_count.fetch_sub(1, Ordering::SeqCst);
     }
 }
 

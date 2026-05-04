@@ -215,33 +215,47 @@ async fn replace_table_atomic_replaces_branch_tip() {
 }
 
 #[tokio::test]
-async fn write_to_unbranched_table_errors_typed() {
-    let (_dir, _inner, branched, _branch) = fixture().await;
+async fn write_to_unbranched_table_creates_dataset_on_fly() {
+    // Phase 2 Day 10: writing to a label whose dataset doesn't exist
+    // on primary nor on the fork's branch materializes a brand-new
+    // dataset on the fork. Primary's view stays empty (no leak).
+    let (_dir, inner, branched, _branch) = fixture().await;
 
-    let err = branched
+    branched
         .write(
             "unknown_label",
             vec![batch(vec![1], vec![1])],
             WriteMode::Append,
         )
         .await
-        .unwrap_err();
-    let msg = err.to_string();
-    assert!(
-        msg.contains("no branch") || msg.contains("Day 10"),
-        "expected missing-branch error mentioning Day 10, got: {msg}"
-    );
+        .expect("on-the-fly dataset creation should succeed");
+
+    // Primary's view: dataset exists on disk (we created it), but
+    // main branch is empty — the fork's data lives only on its branch.
+    let primary_count = inner.count_rows("unknown_label", None).await.unwrap();
+    assert_eq!(primary_count, 0, "primary main branch must remain empty");
+
+    // Fork's view: sees its own write through the new dynamic branch.
+    let fork_count = count_via_scan(&branched, "unknown_label").await;
+    assert_eq!(fork_count, 1);
 }
 
 #[tokio::test]
-async fn create_table_without_branch_is_phase2_day10_work() {
-    let (_dir, _inner, branched, _branch) = fixture().await;
+async fn create_table_without_branch_materializes_on_fork() {
+    // Phase 2 Day 10: create_table on a brand-new label creates the
+    // dataset (with main branch empty) and a fork-local branch with
+    // the supplied batches.
+    let (_dir, inner, branched, _branch) = fixture().await;
 
-    let err = branched
+    branched
         .create_table("brand_new", vec![batch(vec![1], vec![1])])
         .await
-        .unwrap_err();
-    assert!(err.to_string().contains("Day 10"));
+        .expect("create_table should materialize dataset+branch");
+
+    let primary_count = inner.count_rows("brand_new", None).await.unwrap();
+    assert_eq!(primary_count, 0, "primary main branch must remain empty");
+    let fork_count = count_via_scan(&branched, "brand_new").await;
+    assert_eq!(fork_count, 1);
 }
 
 #[tokio::test]

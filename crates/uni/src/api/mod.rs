@@ -95,6 +95,14 @@ pub struct UniInner {
     /// the create/drop 2PC. Built once during `Uni::open` and shared
     /// by the primary `UniInner` and every forked-session inner.
     pub(crate) fork_registry: Arc<uni_store::fork::ForkRegistryHandle>,
+    /// Phase 2 Day 11 — number of `Transaction`s currently alive on
+    /// this `UniInner`. A transaction increments at construction and
+    /// decrements on `Drop` (whether committed, rolled back, or
+    /// silently dropped). `Uni::drop_fork` peeks this counter via the
+    /// `fork_inners` cache to surface uncommitted-tx state as a
+    /// typed `UniError::ForkInflightTx` instead of letting the drop
+    /// proceed and silently discard the work.
+    pub(crate) inflight_tx_count: Arc<AtomicUsize>,
     /// Phase 2 Day 8 cache: same-fork-name `Session::fork(name)` calls
     /// share the same `Arc<UniInner>` so sibling sessions on the same
     /// fork see each other's commits without flushing through Lance
@@ -255,6 +263,7 @@ impl UniInner {
             custom_functions: self.custom_functions.clone(),
             fork_registry: self.fork_registry.clone(),
             fork_inners: self.fork_inners.clone(),
+            inflight_tx_count: Arc::new(AtomicUsize::new(0)),
             cached_l0_mutation_count: AtomicUsize::new(0),
             cached_l0_estimated_size: AtomicUsize::new(0),
             cached_wal_lsn: AtomicU64::new(0),
@@ -355,6 +364,7 @@ impl UniInner {
             custom_functions: self.custom_functions.clone(),
             fork_registry: self.fork_registry.clone(),
             fork_inners: self.fork_inners.clone(),
+            inflight_tx_count: Arc::new(AtomicUsize::new(0)),
             cached_l0_mutation_count: AtomicUsize::new(0),
             cached_l0_estimated_size: AtomicUsize::new(0),
             cached_wal_lsn: AtomicU64::new(0),
@@ -481,6 +491,27 @@ impl Uni {
     /// # }
     /// ```
     pub async fn drop_fork(&self, name: &str) -> Result<()> {
+        // Phase 2 Day 11: surface in-flight transactions before the
+        // registry transitions to Tombstoned. The `ForkInUse` check in
+        // `begin_drop` catches *session* holders; this catches the
+        // case where a session is alive AND has at least one alive
+        // `Transaction` on the fork's UniInner. We track this via an
+        // `inflight_tx_count` AtomicUsize that `Transaction::new`
+        // increments and `Transaction::drop` decrements unconditionally
+        // (so commit/rollback/silent-drop all converge to zero).
+        let preview = self.inner.fork_registry.get(name).await?;
+        if let Some(weak) = self
+            .inner
+            .fork_inners
+            .get(&preview.id)
+            .map(|e| e.value().clone())
+            && let Some(inner) = weak.upgrade()
+            && inner.inflight_tx_count.load(Ordering::Acquire) > 0
+        {
+            return Err(UniError::ForkInflightTx {
+                name: name.to_string(),
+            });
+        }
         let info = self.inner.fork_registry.begin_drop(name).await?;
         // Phase 2 Day 8: evict the cached `Weak<UniInner>` (if any)
         // before deleting branches. The registry has already
@@ -1687,6 +1718,7 @@ impl UniBuilder {
                 )),
                 fork_registry,
                 fork_inners: Arc::new(DashMap::new()),
+                inflight_tx_count: Arc::new(AtomicUsize::new(0)),
                 cached_l0_mutation_count: AtomicUsize::new(0),
                 cached_l0_estimated_size: AtomicUsize::new(0),
                 cached_wal_lsn: AtomicU64::new(0),

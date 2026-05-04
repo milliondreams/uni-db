@@ -246,6 +246,20 @@ async fn create_fork_2pc(
 
 /// Walk the schema's labels and edge types, calling `lance_branch::create_branch`
 /// for each existing dataset. Returns the dataset → branch map.
+///
+/// Branches every dataset that exists on disk at fork-point, including:
+/// - the main `vertices` and `edges` tables (label-agnostic; written by
+///   `flush_to_l1`),
+/// - per-label `vertices_{label}` tables,
+/// - per-edge-type `deltas_{type}_{fwd,bwd}` tables,
+/// - per-edge-type `adjacency_{type}_{fwd,bwd}` tables (if compaction
+///   has produced them).
+///
+/// Datasets that don't exist on disk yet (e.g. a label declared in
+/// schema but never written, or compaction-only adjacency tables on a
+/// fresh DB) are skipped here. They get branched on-the-fly inside
+/// [`crate::api::fork::ensure_branch_for`] the first time the fork's
+/// writer touches them.
 async fn build_datasets_for_fork(
     parent: &Session,
     fork_id: ForkId,
@@ -254,13 +268,26 @@ async fn build_datasets_for_fork(
     let storage_uri = parent.db.storage.base_uri().to_string();
 
     let mut branches: BTreeMap<String, String> = BTreeMap::new();
+    let mut candidate_names: Vec<String> = Vec::new();
 
-    // For every vertex label we know about, branch the underlying
-    // Lance dataset *if it exists on disk*. New labels with no rows
-    // yet have no on-disk dataset — those branches will be created
-    // on-the-fly in Phase 2 when first written.
+    // Main label-agnostic tables. `flush_to_l1` always writes here.
+    candidate_names.push("vertices".to_string());
+    candidate_names.push("edges".to_string());
+
+    // Per-label vertex tables.
     for label in schema.labels.keys() {
-        let dataset_name = format!("vertices_{label}");
+        candidate_names.push(format!("vertices_{label}"));
+    }
+
+    // Per-edge-type delta + adjacency tables.
+    for edge_type in schema.edge_types.keys() {
+        candidate_names.push(format!("deltas_{edge_type}_fwd"));
+        candidate_names.push(format!("deltas_{edge_type}_bwd"));
+        candidate_names.push(format!("adjacency_{edge_type}_fwd"));
+        candidate_names.push(format!("adjacency_{edge_type}_bwd"));
+    }
+
+    for dataset_name in candidate_names {
         let dataset_uri = join_uri(&storage_uri, &dataset_name);
         if !path_exists(&dataset_uri) {
             continue;

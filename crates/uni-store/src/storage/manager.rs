@@ -1346,7 +1346,7 @@ impl StorageManager {
     fn fork_branch_for(&self, dataset_name: &str) -> Option<String> {
         self.fork_scope
             .as_ref()
-            .and_then(|s| s.branch_for(dataset_name).map(str::to_string))
+            .and_then(|s| s.branch_for(dataset_name))
     }
 
     /// Get the main vertex dataset for unified vertex storage.

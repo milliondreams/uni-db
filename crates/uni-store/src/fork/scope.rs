@@ -26,6 +26,7 @@
 
 use std::sync::Arc;
 
+use dashmap::DashMap;
 use uni_common::core::fork::{ForkId, ForkInfo, SchemaDelta};
 
 use super::registry::{ForkHolderGuard, ForkRegistryHandle};
@@ -40,6 +41,15 @@ pub struct ForkScope {
     fork_info: Arc<ForkInfo>,
     overlay: Arc<SchemaDelta>,
     registry: Arc<ForkRegistryHandle>,
+    /// Branches created after fork construction, e.g. by
+    /// [`crate::backend::BranchedBackend`] when the fork's writer
+    /// flushes to a label whose dataset wasn't branched at fork-point.
+    /// Consulted alongside `fork_info.datasets` by [`Self::branch_for`]
+    /// so reads on the same session see writes through the same
+    /// branch that produced them. Persisted out-of-band via
+    /// [`ForkRegistryHandle::register_dataset_branch`] so a restart
+    /// recovers the same mapping.
+    dynamic_branches: Arc<DashMap<String, String>>,
     /// RAII guard. Lifetime-tied to this `ForkScope`. Cloning the
     /// containing `Arc<ForkScope>` does *not* increment the holder
     /// count — only the constructor does, via `register_holder`.
@@ -74,6 +84,7 @@ impl ForkScope {
             fork_info,
             overlay,
             registry,
+            dynamic_branches: Arc::new(DashMap::new()),
             _holder: holder,
         }
     }
@@ -98,16 +109,33 @@ impl ForkScope {
 
     /// Branch name for a given Lance dataset, if this fork has one.
     ///
-    /// Used by `StorageManager` dataset factories to route reads. Returns
-    /// `None` when the fork doesn't own a branch on the named dataset
-    /// (e.g. the dataset was created on primary after the fork-point and
-    /// before any fork-local writes — Phase 2 territory).
+    /// Used by `StorageManager` dataset factories to route reads.
+    /// Consults both the immutable fork-point datasets map (set by
+    /// `finish_create`) and the dynamic-branches map (populated by
+    /// [`Self::register_dynamic_branch`] when a flush hits a dataset
+    /// that wasn't branched at fork-point). Returns `None` only if no
+    /// branch exists on either side — the BranchedBackend then either
+    /// creates one on the fly or surfaces an error.
     #[must_use]
-    pub fn branch_for(&self, dataset_name: &str) -> Option<&str> {
-        self.fork_info
-            .datasets
+    pub fn branch_for(&self, dataset_name: &str) -> Option<String> {
+        if let Some(b) = self.fork_info.datasets.get(dataset_name) {
+            return Some(b.clone());
+        }
+        self.dynamic_branches
             .get(dataset_name)
-            .map(String::as_str)
+            .map(|r| r.value().clone())
+    }
+
+    /// Record a branch created after fork-point (e.g. for a dataset
+    /// that didn't exist on primary at fork creation, or for
+    /// compaction-only adjacency tables).
+    ///
+    /// In-memory only; the caller is responsible for persisting via
+    /// [`ForkRegistryHandle::register_dataset_branch`] so a restart
+    /// recovers the same mapping. Idempotent — re-registering an
+    /// existing entry is a no-op.
+    pub fn register_dynamic_branch(&self, dataset: String, branch: String) {
+        self.dynamic_branches.insert(dataset, branch);
     }
 
     /// Registry handle (used by admin paths to e.g. compute holder counts).

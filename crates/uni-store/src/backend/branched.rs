@@ -65,7 +65,7 @@ impl BranchedBackend {
         if request.branch.is_none()
             && let Some(branch) = self.scope.branch_for(&request.table_name)
         {
-            request.branch = Some(branch.to_string());
+            request.branch = Some(branch);
         }
         request
     }
@@ -79,6 +79,129 @@ impl BranchedBackend {
         } else {
             format!("{base}/{table_name}.lance")
         }
+    }
+
+    /// Local-fs heuristic for "does this dataset URI exist on disk?"
+    /// Mirrors `path_exists` in `crate::api::fork`. For non-local stores
+    /// we conservatively return `true` so the caller falls back to
+    /// `lance_branch::current_version` (which surfaces the right error
+    /// if the dataset is actually missing).
+    fn dataset_path_exists(uri: &str) -> bool {
+        if uri.contains("://") {
+            return true;
+        }
+        std::path::Path::new(uri).exists()
+    }
+
+    /// Phase 2 Day 10: ensure a branch exists for `table_name` on the
+    /// fork, creating one on-the-fly when the dataset already lives on
+    /// primary but wasn't branched at fork-point. Returns the branch
+    /// name to write to.
+    ///
+    /// Errors when `table_name` doesn't exist on primary either —
+    /// the caller (typically a write or a delete) needs a
+    /// schema-bearing path (`create_table` / `create_empty_table`) to
+    /// materialize the dataset.
+    async fn ensure_branch_for_existing(&self, table_name: &str) -> Result<String> {
+        if let Some(b) = self.scope.branch_for(table_name) {
+            return Ok(b);
+        }
+        let dataset_uri = self.dataset_uri(table_name);
+        if !Self::dataset_path_exists(&dataset_uri) {
+            anyhow::bail!(
+                "ensure_branch_for_existing('{table_name}'): dataset not on \
+                 primary either; use create_table/create_empty_table"
+            );
+        }
+        let parent_v = super::lance_branch::current_version(&dataset_uri).await?;
+        let branch_name =
+            format!("fork_{}_{}", self.scope.fork_id(), table_name);
+        super::lance_branch::create_branch(&dataset_uri, &branch_name, parent_v).await?;
+        // Persist + record. Persistence first so a crash between the
+        // Lance commit and the in-memory register leaves the on-disk
+        // record consistent with what reads will resolve.
+        self.scope
+            .registry()
+            .register_dataset_branch(self.scope.fork_id(), table_name, &branch_name)
+            .await
+            .map_err(|e| anyhow::anyhow!("persist dynamic branch: {e}"))?;
+        self.scope
+            .register_dynamic_branch(table_name.to_string(), branch_name.clone());
+        Ok(branch_name)
+    }
+
+    /// Phase 2 Day 10: ensure a branch exists, creating both the
+    /// dataset *and* the branch on the fork when neither exists on
+    /// primary. Used by `create_table` / `create_empty_table` /
+    /// `open_or_create_table`. The dataset is created with `schema`
+    /// and (optionally) seeded with `initial_batches`.
+    async fn ensure_branch_for_new(
+        &self,
+        table_name: &str,
+        schema: Arc<ArrowSchema>,
+        initial_batches: Vec<RecordBatch>,
+    ) -> Result<String> {
+        if let Some(b) = self.scope.branch_for(table_name) {
+            return Ok(b);
+        }
+        let dataset_uri = self.dataset_uri(table_name);
+        let branch_name =
+            format!("fork_{}_{}", self.scope.fork_id(), table_name);
+        if Self::dataset_path_exists(&dataset_uri) {
+            // Dataset exists on primary but no branch yet — branch from
+            // the current parent version. Treat the supplied batches
+            // (if any) as the first writes on the new branch.
+            let parent_v = super::lance_branch::current_version(&dataset_uri).await?;
+            super::lance_branch::create_branch(&dataset_uri, &branch_name, parent_v).await?;
+            if !initial_batches.is_empty() {
+                let arrow_schema = initial_batches[0].schema();
+                let reader = arrow_array::RecordBatchIterator::new(
+                    initial_batches.into_iter().map(Ok),
+                    arrow_schema,
+                );
+                super::lance_branch::write_to_branch(&dataset_uri, &branch_name, reader)
+                    .await?;
+            }
+        } else {
+            // Brand-new dataset — materialize an *empty* parent on
+            // main first, branch from it, then write the real batches
+            // to the branch. The two-step is critical for fork
+            // isolation: writing the batches to main first (the
+            // shape `create_dataset_then_branch` does) would leak the
+            // fork's data into primary's view of the dataset, since
+            // primary's reads always resolve through main.
+            let empty_reader = arrow_array::RecordBatchIterator::new(
+                vec![Ok(RecordBatch::new_empty(schema.clone()))].into_iter(),
+                schema.clone(),
+            );
+            super::lance_branch::create_dataset_then_branch(
+                &dataset_uri,
+                &branch_name,
+                empty_reader,
+            )
+            .await?;
+            if !initial_batches.is_empty() {
+                let arrow_schema = initial_batches[0].schema();
+                let reader = arrow_array::RecordBatchIterator::new(
+                    initial_batches.into_iter().map(Ok),
+                    arrow_schema,
+                );
+                super::lance_branch::write_to_branch(
+                    &dataset_uri,
+                    &branch_name,
+                    reader,
+                )
+                .await?;
+            }
+        }
+        self.scope
+            .registry()
+            .register_dataset_branch(self.scope.fork_id(), table_name, &branch_name)
+            .await
+            .map_err(|e| anyhow::anyhow!("persist dynamic branch: {e}"))?;
+        self.scope
+            .register_dynamic_branch(table_name.to_string(), branch_name.clone());
+        Ok(branch_name)
     }
 }
 
@@ -165,39 +288,33 @@ impl StorageBackend for BranchedBackend {
     }
 
     async fn create_table(&self, name: &str, batches: Vec<RecordBatch>) -> Result<()> {
-        // On-the-fly branch creation for a fork-only label lands in
-        // Day 10. Day 2's surface: error with the named stage so the
-        // caller can see the gap and the test confirms we don't
-        // silently fall through to primary.
-        let _ = batches;
-        anyhow::bail!(
-            "create_table('{name}') on a forked backend requires on-the-fly \
-             schema overlay growth (Phase 2 Day 10); not implemented yet"
-        )
+        if batches.is_empty() {
+            anyhow::bail!(
+                "create_table('{name}') on a forked backend requires at least \
+                 one batch to derive the schema; use create_empty_table"
+            );
+        }
+        let schema = batches[0].schema();
+        self.ensure_branch_for_new(name, schema, batches).await?;
+        Ok(())
     }
 
     async fn create_empty_table(&self, name: &str, schema: Arc<ArrowSchema>) -> Result<()> {
-        let _ = schema;
-        anyhow::bail!(
-            "create_empty_table('{name}') on a forked backend requires on-the-fly \
-             schema overlay growth (Phase 2 Day 10); not implemented yet"
-        )
+        self.ensure_branch_for_new(name, schema, Vec::new()).await?;
+        Ok(())
     }
 
     async fn open_or_create_table(&self, name: &str, schema: Arc<ArrowSchema>) -> Result<()> {
         // Idempotent: if the fork has a branch for this table the
-        // dataset already exists on disk, so we're done. If not, we
-        // refuse rather than create the dataset on primary — which
-        // would leak schema into primary's namespace. Day 10 lifts the
-        // refuse path into on-the-fly creation.
+        // dataset already exists on disk, so we're done. Otherwise
+        // create dataset+branch (or branch from primary if the
+        // dataset already exists on primary) so subsequent writes
+        // through the fork's branched backend resolve correctly.
         if self.scope.branch_for(name).is_some() {
             return Ok(());
         }
-        let _ = schema;
-        anyhow::bail!(
-            "open_or_create_table('{name}') on a forked backend with no \
-             branch for the table; on-the-fly creation is Day 10 work"
-        )
+        self.ensure_branch_for_new(name, schema, Vec::new()).await?;
+        Ok(())
     }
 
     async fn drop_table(&self, name: &str) -> Result<()> {
@@ -219,37 +336,49 @@ impl StorageBackend for BranchedBackend {
         if batches.is_empty() {
             return Ok(());
         }
-        let branch = self.scope.branch_for(table_name).ok_or_else(|| {
-            anyhow::anyhow!(
-                "write('{table_name}') on a forked backend with no branch \
-                 for the table; on-the-fly creation is Day 10 work"
-            )
-        })?;
-        let uri = self.dataset_uri(table_name);
+        // Try to ensure a branch from an existing primary dataset; if
+        // primary doesn't have it either, materialize dataset+branch
+        // on the fork using the supplied batches as the seed.
         let arrow_schema = batches[0].schema();
+        let branch = match self.ensure_branch_for_existing(table_name).await {
+            Ok(b) => b,
+            Err(_) => {
+                // Dataset doesn't exist on primary either — create it
+                // on the fork via `ensure_branch_for_new`, seeded with
+                // the batches. The branch returned then receives any
+                // remaining append/overwrite semantics below.
+                let _b = self
+                    .ensure_branch_for_new(
+                        table_name,
+                        arrow_schema.clone(),
+                        batches.clone(),
+                    )
+                    .await?;
+                // create_dataset_then_branch already wrote the batches;
+                // nothing more to do for Append. For Overwrite, the
+                // batches *are* the only content, which matches.
+                return Ok(());
+            }
+        };
+        let uri = self.dataset_uri(table_name);
         let reader = arrow_array::RecordBatchIterator::new(
             batches.into_iter().map(Ok),
             arrow_schema,
         );
         match mode {
             WriteMode::Append => {
-                super::lance_branch::write_to_branch(&uri, branch, reader).await
+                super::lance_branch::write_to_branch(&uri, &branch, reader).await
             }
             WriteMode::Overwrite => {
-                super::lance_branch::replace_branch_tip(&uri, branch, reader).await
+                super::lance_branch::replace_branch_tip(&uri, &branch, reader).await
             }
         }
     }
 
     async fn delete_rows(&self, table_name: &str, filter: &str) -> Result<()> {
-        let branch = self.scope.branch_for(table_name).ok_or_else(|| {
-            anyhow::anyhow!(
-                "delete_rows('{table_name}') on a forked backend with no \
-                 branch for the table; on-the-fly creation is Day 10 work"
-            )
-        })?;
+        let branch = self.ensure_branch_for_existing(table_name).await?;
         let uri = self.dataset_uri(table_name);
-        super::lance_branch::delete_from_branch(&uri, branch, filter).await
+        super::lance_branch::delete_from_branch(&uri, &branch, filter).await
     }
 
     async fn replace_table_atomic(
@@ -263,12 +392,16 @@ impl StorageBackend for BranchedBackend {
         // Two manifest commits, not one; primary's main branch is
         // untouched. Spec contract differs from primary semantics, so
         // callers should be aware (commented at Phase 2 Decision D3).
-        let branch = self.scope.branch_for(name).ok_or_else(|| {
-            anyhow::anyhow!(
-                "replace_table_atomic('{name}') on a forked backend with no \
-                 branch for the table; on-the-fly creation is Day 10 work"
-            )
-        })?;
+        // If no branch exists, ensure one — branch from primary when
+        // possible, otherwise create dataset+branch with the supplied
+        // schema.
+        let branch = match self.ensure_branch_for_existing(name).await {
+            Ok(b) => b,
+            Err(_) => {
+                self.ensure_branch_for_new(name, schema.clone(), Vec::new())
+                    .await?
+            }
+        };
         let uri = self.dataset_uri(name);
         // Homogenize the iterator type by always going through a Vec.
         let (rows, arrow_schema) = if batches.is_empty() {
@@ -282,7 +415,7 @@ impl StorageBackend for BranchedBackend {
         };
         let reader =
             arrow_array::RecordBatchIterator::new(rows.into_iter(), arrow_schema);
-        super::lance_branch::replace_branch_tip(&uri, branch, reader).await
+        super::lance_branch::replace_branch_tip(&uri, &branch, reader).await
     }
 
     // ── MVCC ─────────────────────────────────────────────────────────

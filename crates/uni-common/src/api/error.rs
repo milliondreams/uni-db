@@ -159,6 +159,11 @@ pub enum UniError {
     #[error("Fork '{name}' is held by {holder_count} live session(s); drop refused")]
     ForkInUse { name: String, holder_count: usize },
 
+    /// Drop refused because a transaction has uncommitted mutations on the
+    /// fork. Commit or roll back the transaction first, then retry drop.
+    #[error("Fork '{name}' has uncommitted transaction state; commit or rollback first")]
+    ForkInflightTx { name: String },
+
     /// Registry on disk is malformed (corrupt JSON, missing required field, etc.).
     #[error("Fork registry is corrupt: {message}")]
     ForkCorruptRegistry { message: String },

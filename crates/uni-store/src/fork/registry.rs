@@ -308,6 +308,48 @@ impl ForkRegistryHandle {
         .await;
     }
 
+    /// Phase 2 Day 10: register a branch created after fork-point on
+    /// the named dataset. Mutates the in-memory `ForkInfo.datasets`
+    /// map and PUTs the updated registry file so a restart recovers
+    /// the same dataset → branch mapping.
+    ///
+    /// Idempotent — re-registering an existing entry with the same
+    /// branch name is a no-op; mismatched branch names error so a
+    /// double-create bug doesn't silently lose data.
+    pub async fn register_dataset_branch(
+        &self,
+        fork_id: ForkId,
+        dataset: &str,
+        branch: &str,
+    ) -> Result<(), UniError> {
+        let mut cache = self.inner.cache.lock().await;
+        // Find by id (BTreeMap is keyed by name, so iterate).
+        let entry = cache
+            .forks
+            .values_mut()
+            .find(|f| f.id == fork_id)
+            .ok_or_else(|| UniError::ForkNotFound {
+                name: format!("<fork:{fork_id}>"),
+            })?;
+        match entry.datasets.get(dataset) {
+            Some(existing) if existing == branch => return Ok(()),
+            Some(existing) => {
+                return Err(UniError::ForkCorruptRegistry {
+                    message: format!(
+                        "register_dataset_branch: dataset '{dataset}' already \
+                         maps to '{existing}', refusing to overwrite with \
+                         '{branch}'"
+                    ),
+                });
+            }
+            None => {}
+        }
+        entry.datasets.insert(dataset.to_string(), branch.to_string());
+        let name = entry.name.clone();
+        self.put_registry(&cache, &name, "registry_dynamic_branch").await?;
+        Ok(())
+    }
+
     /// Read the schema overlay for `id`. Returns empty if absent.
     pub async fn load_schema_overlay(&self, id: &ForkId) -> Result<SchemaDelta, UniError> {
         match get_with_timeout(&self.inner.store, &schema_overlay_path(id), DEFAULT_TIMEOUT).await {

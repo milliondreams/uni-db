@@ -17,6 +17,7 @@ use lancedb::Table;
 use lancedb::connection::Connection;
 use lancedb::query::{ExecutableQuery, QueryBase, Select};
 
+use super::lance_branch;
 use super::traits::{RecordBatchStream, StorageBackend};
 use super::types::*;
 
@@ -27,8 +28,22 @@ use super::types::*;
 pub struct LanceDbBackend {
     connection: Connection,
     base_uri: String,
-    /// Internal table cache keyed by full table name.
+    /// Internal table cache keyed by `(table_name, branch_or_main)`.
+    ///
+    /// Branch reads are served by routing through the lower-level `lance`
+    /// crate (see [`super::lance_branch`]) since lancedb 0.27.1 does not
+    /// expose branches. The cache key is the table name on its own for
+    /// primary reads and `format!("{table}@@{branch}")` for branch reads,
+    /// so primary call sites are unchanged.
     table_cache: DashMap<String, Table>,
+}
+
+/// Build the cache key for a `(table, branch)` pair.
+fn cache_key(table: &str, branch: Option<&str>) -> String {
+    match branch {
+        None => table.to_string(),
+        Some(b) => format!("{table}@@{b}"),
+    }
 }
 
 impl LanceDbBackend {
@@ -53,9 +68,15 @@ impl LanceDbBackend {
         })
     }
 
-    /// Get or open a cached table by full table name.
+    /// Get or open a cached `lancedb::Table` by name (primary branch only).
+    ///
+    /// Branch reads bypass this cache and route through
+    /// [`super::lance_branch`] because lancedb 0.27.1 cannot open a
+    /// `Table` on a non-main branch. Any future fork-aware writes will
+    /// need to descend to `lance::Dataset` similarly.
     async fn get_or_open_table(&self, name: &str) -> Result<Table> {
-        if let Some(table) = self.table_cache.get(name) {
+        let key = cache_key(name, None);
+        if let Some(table) = self.table_cache.get(&key) {
             return Ok(table.clone());
         }
         let table = self
@@ -64,12 +85,22 @@ impl LanceDbBackend {
             .execute()
             .await
             .map_err(|e| anyhow!("Failed to open table '{}': {}", name, e))?;
-        self.table_cache.insert(name.to_string(), table.clone());
+        self.table_cache.insert(key, table.clone());
         Ok(table)
     }
 
-    /// Execute a scan query, returning a stream of record batches.
-    async fn execute_scan_stream(
+    /// Build the on-disk URI for `name` (used for branch reads via lance).
+    fn dataset_uri(&self, name: &str) -> String {
+        // lancedb stores tables as `<base_uri>/<name>.lance`.
+        if self.base_uri.ends_with('/') {
+            format!("{}{}.lance", self.base_uri, name)
+        } else {
+            format!("{}/{}.lance", self.base_uri, name)
+        }
+    }
+
+    /// Execute a scan query on the primary branch, returning a lancedb stream.
+    async fn execute_primary_scan(
         &self,
         request: &ScanRequest,
     ) -> Result<lancedb::arrow::SendableRecordBatchStream> {
@@ -98,6 +129,72 @@ impl LanceDbBackend {
             .execute()
             .await
             .map_err(|e| anyhow!("Scan failed on '{}': {}", request.table_name, e))
+    }
+
+    /// Execute a scan query on a Lance branch via the lower-level lance crate.
+    async fn execute_branch_scan(
+        &self,
+        request: &ScanRequest,
+        branch: &str,
+    ) -> Result<RecordBatchStream> {
+        let uri = self.dataset_uri(&request.table_name);
+        let dataset = lance_branch::open_branch(&uri, branch).await?;
+
+        let mut scanner = dataset.scan();
+
+        if let ColumnProjection::Columns(cols) = &request.columns {
+            scanner.project(cols).map_err(|e| {
+                anyhow!(
+                    "Project columns {:?} on '{}@{}': {}",
+                    cols,
+                    request.table_name,
+                    branch,
+                    e
+                )
+            })?;
+        }
+
+        if let FilterExpr::Sql(sql) = &request.filter {
+            scanner.filter(sql).map_err(|e| {
+                anyhow!(
+                    "Filter '{}' on '{}@{}': {}",
+                    sql,
+                    request.table_name,
+                    branch,
+                    e
+                )
+            })?;
+        }
+
+        if let Some(limit) = request.limit {
+            scanner
+                .limit(Some(limit as i64), None)
+                .map_err(|e| anyhow!("Limit on branched scan failed: {}", e))?;
+        }
+
+        let stream = scanner.try_into_stream().await.map_err(|e| {
+            anyhow!(
+                "Branched scan stream on '{}@{}': {}",
+                request.table_name,
+                branch,
+                e
+            )
+        })?;
+
+        let mapped: Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>> =
+            Box::pin(stream.map(|r| r.map_err(|e| anyhow!("{}", e))));
+        Ok(mapped)
+    }
+
+    /// Run a scan, dispatching to the primary or branch path based on `request.branch`.
+    async fn execute_scan_stream(&self, request: &ScanRequest) -> Result<RecordBatchStream> {
+        if let Some(branch) = request.branch.clone() {
+            return self.execute_branch_scan(request, &branch).await;
+        }
+        let stream = self.execute_primary_scan(request).await?;
+        let mapped: Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>> =
+            Box::pin(stream.map(|r| r.map_err(|e| anyhow!("{}", e))));
+        Ok(mapped)
     }
 }
 
@@ -179,11 +276,7 @@ impl StorageBackend for LanceDbBackend {
     }
 
     async fn scan_stream(&self, request: ScanRequest) -> Result<RecordBatchStream> {
-        let stream = self.execute_scan_stream(&request).await?;
-
-        let mapped: Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>> =
-            Box::pin(stream.map(|r| r.map_err(|e| anyhow!("{}", e))));
-        Ok(mapped)
+        self.execute_scan_stream(&request).await
     }
 
     async fn get_table_schema(&self, name: &str) -> Result<Option<Arc<ArrowSchema>>> {

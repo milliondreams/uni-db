@@ -139,6 +139,43 @@ pub enum UniError {
     /// A session hook rejected the operation.
     #[error("Hook rejected: {message}")]
     HookRejected { message: String },
+
+    /// Fork with the given name does not exist in the registry.
+    #[error("Fork '{name}' not found")]
+    ForkNotFound { name: String },
+
+    /// `session.fork(name).new_()` was called against an existing fork.
+    #[error("Fork '{name}' already exists")]
+    ForkAlreadyExists { name: String },
+
+    /// Phase-1 gate: writes through `forked_session.tx()` are blocked
+    /// until Phase 2 lands. Reads, `locy()`, and admin paths work.
+    #[error(
+        "Writes on a forked session are not yet supported (Phase 2); reads, locy, and admin paths work"
+    )]
+    ForkWritesNotYetSupported,
+
+    /// Drop refused because forked sessions are still alive on the fork.
+    #[error("Fork '{name}' is held by {holder_count} live session(s); drop refused")]
+    ForkInUse { name: String, holder_count: usize },
+
+    /// Registry on disk is malformed (corrupt JSON, missing required field, etc.).
+    #[error("Fork registry is corrupt: {message}")]
+    ForkCorruptRegistry { message: String },
+
+    /// 2PC step on a fork lifecycle operation failed.
+    ///
+    /// `stage` names the step (`registry_pending`, `create_branch`,
+    /// `registry_active`, `tombstone`, `delete_branch`, `registry_clear`,
+    /// `backend_unsupported`, `recovery`) so recovery and humans can
+    /// triage without parsing prose.
+    #[error("Fork '{name}' lifecycle failed at stage '{stage}': {source}")]
+    ForkLifecycle {
+        name: String,
+        stage: &'static str,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, UniError>;

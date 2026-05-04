@@ -162,6 +162,49 @@ impl IdAllocator {
         self.state.lock().await.current_eid
     }
 
+    /// Snapshot the current high-water-marks for VID and EID.
+    ///
+    /// Returns `(next_vid, next_eid)` — the values the next
+    /// allocations would produce if not constrained by batch
+    /// reservation. Used by Phase 2 fork-creation to bootstrap a
+    /// fork's allocator above primary's range without going through
+    /// disk (the primary and fork allocators may live on different
+    /// `ObjectStore` instances, making file-copy bootstrap fragile).
+    pub async fn current_hwm(&self) -> (u64, u64) {
+        let state = self.state.lock().await;
+        (state.current_vid, state.current_eid)
+    }
+
+    /// Force a checkpoint of the in-memory state to the underlying
+    /// object store.
+    ///
+    /// Used by Phase 2 fork creation to bootstrap a fork's allocator
+    /// from primary's *current* HWM. Without this, primary's allocator
+    /// has an in-memory state that the on-disk manifest doesn't yet
+    /// reflect (the disk file is only updated on batch-boundary
+    /// crossings), and the fork would start at VID 0 — colliding with
+    /// primary rows visible through the `base_paths` chain.
+    ///
+    /// Idempotent and safe to call frequently; the persisted manifest
+    /// reflects the same state if nothing has changed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying [`anyhow::Error`] from `persist_manifest`
+    /// (object-store put failure).
+    pub async fn checkpoint(&self) -> Result<()> {
+        let mut state = self.state.lock().await;
+        // Advance the persisted batch HWM to at least the current
+        // allocation cursor so reloads start above any allocated VIDs.
+        if state.manifest.next_vid_batch < state.current_vid {
+            state.manifest.next_vid_batch = state.current_vid;
+        }
+        if state.manifest.next_eid_batch < state.current_eid {
+            state.manifest.next_eid_batch = state.current_eid;
+        }
+        self.persist_manifest(&mut state).await
+    }
+
     /// Persists the counter manifest to object store with optimistic locking.
     async fn persist_manifest(&self, state: &mut AllocatorState) -> Result<()> {
         let json = serde_json::to_vec_pretty(&state.manifest)?;

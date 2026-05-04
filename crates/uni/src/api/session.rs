@@ -129,8 +129,8 @@ pub struct SessionMetrics {
 /// ```no_run
 /// # use uni_db::Uni;
 /// # async fn example(db: &Uni) -> uni_db::Result<()> {
-/// let mut session = db.session();
-/// session.set("tenant", 42);
+/// let session = db.session();
+/// session.params().set("tenant", 42);
 ///
 /// let rows = session.query("MATCH (n) WHERE n.tenant = $tenant RETURN n").await?;
 ///
@@ -146,6 +146,11 @@ pub struct Session {
     /// When pinned via `pin_to_version`/`pin_to_timestamp`, holds the original
     /// (live) db reference so `refresh()` can restore it.
     original_db: Option<Arc<UniInner>>,
+    /// Fork scope when this session is forked. `None` for primary
+    /// sessions. Threaded through to `StorageManager` via the swapped
+    /// `UniInner`; reads route through the fork's branches automatically.
+    /// `tx()` is gated when this is `Some`.
+    pub(crate) fork_scope: Option<Arc<uni_store::fork::ForkScope>>,
     id: String,
     params: Arc<std::sync::RwLock<HashMap<String, Value>>>,
     rule_registry: Arc<std::sync::RwLock<LocyRuleRegistry>>,
@@ -184,6 +189,7 @@ impl Session {
         Self {
             db,
             original_db: None,
+            fork_scope: None,
             id: Uuid::new_v4().to_string(),
             params: Arc::new(std::sync::RwLock::new(HashMap::new())),
             rule_registry: Arc::new(std::sync::RwLock::new(session_registry)),
@@ -202,6 +208,84 @@ impl Session {
         }
     }
 
+    /// Create a forked session from a fork-scoped `UniInner`.
+    ///
+    /// Built by [`crate::api::fork::ForkBuilder::build`]. `db` is the
+    /// new inner returned by `UniInner::at_fork`, which already wraps
+    /// the fork-scoped storage and merged schema. `scope` is stored on
+    /// the session so [`Session::is_forked`] can answer cheaply and
+    /// `tx()` can gate writes.
+    ///
+    /// Per the spec §4 contract for forked sessions:
+    /// - params: empty (independent from parent)
+    /// - hooks: empty (no propagation)
+    /// - rule_registry: deep-cloned from the new inner's registry
+    ///   (which `UniInner::at_fork` already deep-cloned from primary)
+    /// - plan_cache: fresh empty (storage layout differs from primary)
+    /// - metrics: fresh
+    /// - cancellation_token: fresh; cross-session linkage to the
+    ///   parent's token is a Phase 4 concern (spec §4.6).
+    pub(crate) fn new_forked(
+        db: Arc<UniInner>,
+        scope: Arc<uni_store::fork::ForkScope>,
+    ) -> Self {
+        let session_registry = db
+            .locy_rule_registry
+            .read()
+            .unwrap()
+            .clone();
+        db.active_session_count.fetch_add(1, Ordering::Relaxed);
+
+        Self {
+            db,
+            original_db: None,
+            fork_scope: Some(scope),
+            id: Uuid::new_v4().to_string(),
+            params: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            rule_registry: Arc::new(std::sync::RwLock::new(session_registry)),
+            active_write_guard: Arc::new(AtomicBool::new(false)),
+            metrics_inner: Arc::new(SessionMetricsInner::new()),
+            created_at: Instant::now(),
+            cancellation_token: Arc::new(std::sync::RwLock::new(CancellationToken::new())),
+            plan_cache: Arc::new(std::sync::Mutex::new(PlanCache::new(1000))),
+            plan_cache_metrics: Arc::new(PlanCacheMetrics {
+                hits: AtomicU64::new(0),
+                misses: AtomicU64::new(0),
+            }),
+            hooks: HashMap::new(),
+            query_timeout: None,
+            transaction_timeout: None,
+        }
+    }
+
+    /// Open or create a fork by name.
+    ///
+    /// `session.fork("scenario_1").await` opens the fork if it
+    /// exists or creates it at the current primary snapshot if not.
+    /// `session.fork("scenario_1").new_().await` requires creation
+    /// and errors with [`uni_common::api::error::UniError::ForkAlreadyExists`] otherwise.
+    ///
+    /// As of Phase 2, the returned `Session` is **writable**: its
+    /// `.tx().execute(...).commit()` lands mutations on the fork's
+    /// Lance branches. Primary is unaffected.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use uni_db::Uni;
+    /// # async fn example() -> uni_db::Result<()> {
+    /// let db = Uni::in_memory().build().await?;
+    /// let session = db.session();
+    /// let forked = session.fork("scenario_1").await?;
+    /// assert!(forked.is_forked());
+    /// # db.shutdown().await
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn fork(&self, name: impl Into<String>) -> super::fork::ForkBuilder<'_> {
+        super::fork::ForkBuilder::new(self, name.into())
+    }
+
     /// Create a new session from a template's pre-compiled state.
     pub(crate) fn new_from_template(
         db: Arc<UniInner>,
@@ -216,6 +300,7 @@ impl Session {
         Self {
             db,
             original_db: None,
+            fork_scope: None,
             id: Uuid::new_v4().to_string(),
             params: Arc::new(std::sync::RwLock::new(params)),
             rule_registry: Arc::new(std::sync::RwLock::new(rule_registry)),
@@ -346,12 +431,22 @@ impl Session {
     /// per session at a time. Returns `ReadOnly` if the session is pinned.
     #[instrument(skip(self), fields(session_id = %self.id))]
     pub async fn tx(&self) -> Result<Transaction> {
+        // Phase 2 Day 7: writes through a forked session are no longer
+        // gated. The fork's `UniInner` carries its own Writer (Day 4)
+        // with a per-fork L0/WAL/IdAllocator. Commits land on the
+        // fork's Lance branches via the BranchedBackend (Day 2). The
+        // Phase 1 `ForkWritesNotYetSupported` gate has been removed.
         if self.is_pinned() {
             return Err(UniError::ReadOnly {
                 operation: "start_transaction".to_string(),
             });
         }
         Transaction::new(self).await
+    }
+
+    /// `true` when this session was returned by `Session::fork(...)`.
+    pub fn is_forked(&self) -> bool {
+        self.fork_scope.is_some()
     }
 
     /// Create a transaction with builder options (timeout, isolation level).
@@ -914,6 +1009,7 @@ impl Clone for Session {
         Self {
             db: self.db.clone(),
             original_db: self.original_db.clone(),
+            fork_scope: self.fork_scope.clone(),
             id: Uuid::new_v4().to_string(),
             params: Arc::new(std::sync::RwLock::new(self.params.read().unwrap().clone())),
             rule_registry: Arc::new(std::sync::RwLock::new(

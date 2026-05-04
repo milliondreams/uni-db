@@ -50,6 +50,11 @@ pub struct ScanRequest {
     pub filter: FilterExpr,
     /// Maximum number of rows to return.
     pub limit: Option<usize>,
+    /// Optional Lance branch to read from. `None` = primary (main) branch.
+    ///
+    /// Set by the storage manager when a session has fork scope active;
+    /// see `crate::backend::lance_branch` for the underlying primitives.
+    pub branch: Option<String>,
 }
 
 impl ScanRequest {
@@ -60,6 +65,7 @@ impl ScanRequest {
             columns: ColumnProjection::All,
             filter: FilterExpr::None,
             limit: None,
+            branch: None,
         }
     }
 
@@ -84,6 +90,18 @@ impl ScanRequest {
     /// Builder: set limit.
     pub fn with_limit(mut self, limit: usize) -> Self {
         self.limit = Some(limit);
+        self
+    }
+
+    /// Builder: set the Lance branch to read from.
+    pub fn with_branch(mut self, branch: impl Into<String>) -> Self {
+        self.branch = Some(branch.into());
+        self
+    }
+
+    /// Builder: set the Lance branch from an `Option`.
+    pub fn with_optional_branch(mut self, branch: Option<String>) -> Self {
+        self.branch = branch;
         self
     }
 }

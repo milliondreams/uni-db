@@ -913,6 +913,58 @@ impl SchemaManager {
         *schema = Arc::new(new_schema);
     }
 
+    /// Build a fork-scoped manager whose schema is `primary ⊕ overlay`.
+    ///
+    /// Used by `UniInner::at_fork` to give a forked session a schema view
+    /// that includes any labels/edge-types/properties the fork has
+    /// introduced on top of primary. The returned manager owns its own
+    /// in-memory `Arc<Schema>` — mutations to it never reach primary's
+    /// schema file. The returned manager is *not* intended for `.save()`;
+    /// fork-overlay persistence is owned by the registry layer
+    /// (`catalog/fork_schemas/{fork_id}.json`).
+    ///
+    /// In Phase 1 the delta is always empty, so the merge is a clone.
+    /// Phase 2 starts populating it when on-the-fly label creation lands.
+    #[must_use]
+    pub fn with_overlay(&self, overlay: &crate::core::fork::SchemaDelta) -> Arc<Self> {
+        let primary = self.schema();
+        let merged = if overlay.is_empty() {
+            (*primary).clone()
+        } else {
+            let mut merged = (*primary).clone();
+            for (name, label) in &overlay.added_labels {
+                merged.labels.insert(name.clone(), label.clone());
+            }
+            for (name, edge_type) in &overlay.added_edge_types {
+                merged.edge_types.insert(name.clone(), edge_type.clone());
+            }
+            for addition in &overlay.added_properties {
+                let props = merged
+                    .properties
+                    .entry(addition.owner.clone())
+                    .or_default();
+                props.insert(
+                    addition.property.clone(),
+                    PropertyMeta {
+                        r#type: addition.data_type.clone(),
+                        nullable: addition.nullable,
+                        added_in: merged.schema_version,
+                        state: SchemaElementState::Active,
+                        generation_expression: None,
+                        description: None,
+                    },
+                );
+            }
+            merged
+        };
+
+        Arc::new(Self {
+            store: self.store.clone(),
+            path: self.path.clone(),
+            schema: RwLock::new(Arc::new(merged)),
+        })
+    }
+
     pub fn next_label_id(&self) -> u16 {
         self.schema()
             .labels
@@ -1586,5 +1638,68 @@ mod tests {
         let result = schema.vector_index_for_property("Document", "embedding");
         assert!(result.is_some());
         assert_eq!(result.unwrap().metric, DistanceMetric::Cosine);
+    }
+
+    #[tokio::test]
+    async fn with_overlay_empty_clones_primary_in_isolation() -> Result<()> {
+        use crate::core::fork::SchemaDelta;
+
+        let dir = tempdir()?;
+        let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path())?);
+        let path = ObjectStorePath::from("schema.json");
+        let primary = SchemaManager::load_from_store(store, &path).await?;
+        primary.add_label("Person")?;
+
+        let overlay = primary.with_overlay(&SchemaDelta::empty());
+        assert_eq!(overlay.schema().labels.len(), 1);
+
+        // Phase 1 invariant: mutating the overlay manager must not bleed
+        // into primary's schema.
+        overlay.add_label("Forked")?;
+        assert!(overlay.schema().labels.contains_key("Forked"));
+        assert!(!primary.schema().labels.contains_key("Forked"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn with_overlay_merges_added_labels_and_edge_types() -> Result<()> {
+        use crate::core::fork::SchemaDelta;
+        use chrono::Utc;
+
+        let dir = tempdir()?;
+        let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path())?);
+        let path = ObjectStorePath::from("schema.json");
+        let primary = SchemaManager::load_from_store(store, &path).await?;
+        primary.add_label("Existing")?;
+
+        let label_meta = LabelMeta {
+            id: 99,
+            created_at: Utc::now(),
+            state: SchemaElementState::Active,
+            description: None,
+        };
+        let edge_meta = EdgeTypeMeta {
+            id: 99,
+            src_labels: vec!["NewLabel".into()],
+            dst_labels: vec!["NewLabel".into()],
+            state: SchemaElementState::Active,
+            description: None,
+        };
+        let delta = SchemaDelta {
+            added_labels: vec![("NewLabel".to_string(), label_meta)],
+            added_edge_types: vec![("NewEdge".to_string(), edge_meta)],
+            added_properties: vec![],
+        };
+
+        let overlay = primary.with_overlay(&delta);
+        let merged = overlay.schema();
+        assert!(merged.labels.contains_key("Existing"));
+        assert!(merged.labels.contains_key("NewLabel"));
+        assert!(merged.edge_types.contains_key("NewEdge"));
+
+        // Primary unchanged.
+        assert!(!primary.schema().labels.contains_key("NewLabel"));
+        Ok(())
     }
 }

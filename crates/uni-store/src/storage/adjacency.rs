@@ -123,6 +123,9 @@ pub struct AdjacencyDataset {
     uri: String,
     edge_type: String,
     direction: String,
+    /// Lance branch for branched reads. `None` = primary.
+    #[cfg_attr(not(feature = "lance-backend"), allow(dead_code))]
+    branch: Option<String>,
 }
 
 impl AdjacencyDataset {
@@ -135,7 +138,21 @@ impl AdjacencyDataset {
             uri,
             edge_type: edge_type.to_string(),
             direction: direction.to_string(),
+            branch: None,
         }
+    }
+
+    /// Construct an adjacency dataset that reads from a Lance branch.
+    pub fn new_branched(
+        base_uri: &str,
+        edge_type: &str,
+        label: &str,
+        direction: &str,
+        branch: impl Into<String>,
+    ) -> Self {
+        let mut ds = Self::new(base_uri, edge_type, label, direction);
+        ds.branch = Some(branch.into());
+        ds
     }
 
     #[cfg(feature = "lance-backend")]
@@ -145,7 +162,10 @@ impl AdjacencyDataset {
 
     #[cfg(feature = "lance-backend")]
     pub async fn open_at(&self, version: Option<u64>) -> Result<Arc<Dataset>> {
-        let mut ds = Dataset::open(&self.uri).await?;
+        let mut ds = match &self.branch {
+            Some(branch) => crate::backend::lance_branch::open_branch(&self.uri, branch).await?,
+            None => Dataset::open(&self.uri).await?,
+        };
         if let Some(v) = version {
             ds = ds.checkout_version(v).await?;
         }

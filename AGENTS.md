@@ -41,3 +41,10 @@
 ## Agent Git Safety Rule
 - Do not perform any git action unless the user has explicitly instructed it in the current conversation turn.
 - This includes all git commands and git-related workflows (for example: `status`, `diff`, `add`, `commit`, `push`, `pull`, `checkout`, `reset`, `merge`, `rebase`, `tag`, `stash`, `cherry-pick`).
+
+## Fork invariants (Phase 1)
+- **Registry edits go through `ForkRegistryHandle`.** Never write `catalog/fork_registry.json`, `catalog/fork_schemas/*`, or `catalog/fork_tombstones/*` directly — the 2PC state machine assumes single-writer access through the handle.
+- **Fork creation must not hold any global lock during `lance_branch::create_branch`.** The registry mutex covers metadata PUTs only. Spec §10 requires fork creation not to block primary.
+- **`lance::Dataset::create_branch` is not idempotent** at the same `parent_version`. Recovery must call `lance_branch::delete_branch` (force-delete wrapper) before re-attempting. Day 1 spike confirmed this contract.
+- **Lance compaction retention must not be tightened below the longest live fork chain.** Silent fork-data corruption otherwise. Verified by `crates/uni-store/tests/lance_branch_retention.rs`.
+- **Phase 1 forks are read-only.** `Session::tx()` returns `UniError::ForkWritesNotYetSupported` on a forked session. The `BranchedBackend` decorator rejects every write method; if you find a code path that writes to a forked storage, that's an invariant violation, not a feature gap.

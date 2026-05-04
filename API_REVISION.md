@@ -192,4 +192,43 @@ After each phase:
 2. `cargo test -p uni-db` — all uni-db crate tests pass
 3. `cargo test --workspace` — full workspace tests pass
 4. `cd bindings/uni-db && poetry run pytest -n auto` — Python tests pass
+
+---
+
+## Forks (Phase 1, read-only)
+
+Adds the `Session::fork(name)` API and admin paths on `Uni` for working with named, durable, isolated graph branches. Phase 1 is **read-only**: writes through a forked session return `UniError::ForkWritesNotYetSupported` (Phase 2 lifts this gate).
+
+### New public API
+
+- **`Session::fork(name) -> ForkBuilder`** — open or create a fork. `.await` runs the open-or-create path; `.new_().await` requires the fork to be newly created (errors with `ForkAlreadyExists` otherwise).
+- **`Session::is_forked() -> bool`** — true when this session was returned by `fork`.
+- **`Uni::list_forks() -> Vec<ForkInfo>`** — every active fork.
+- **`Uni::fork_info(name) -> Result<ForkInfo>`** — metadata for a single fork.
+- **`Uni::drop_fork(name) -> Result<()>`** — full 2PC drop (tombstone → branch deletes → registry clear → file cleanup); refuses with `ForkInUse` while sessions are alive.
+- **New types** (re-exported from `uni_db`): `ForkId`, `ForkInfo`, `ForkStatus`, `SchemaDelta`, `ForkRegistryFile`.
+- **New `UniError` variants**: `ForkNotFound`, `ForkAlreadyExists`, `ForkWritesNotYetSupported`, `ForkInUse { name, holder_count }`, `ForkCorruptRegistry`, `ForkLifecycle { name, stage, source }`.
+
+### What the storage substrate looks like
+
+- **Lance branches**: each fork is one Lance branch per dataset (vertex, edge-delta, adjacency). Reads chain to parent via `base_paths`.
+- **Catalog files**: `catalog/fork_registry.json` (single JSON, all forks), `catalog/fork_schemas/{fork_id}.json` (per-fork schema overlay; empty in Phase 1), `catalog/fork_tombstones/{fork_id}.json` (durable drop intent).
+- **Backend wrapper**: a fork-scoped `StorageManager` swaps in a `BranchedBackend` that auto-fills `ScanRequest.branch` for every read, so existing read paths work transparently.
+- **Recovery**: runs in `Uni::open` before any session is returned; resumes any partial create or drop left by a crash.
+
+### Phase 1 limits (lifted in later phases)
+
+- No writes through a forked session (Phase 2).
+- No nested forks (Phase 3).
+- No TTL, watch filtering on forks, hooks/params propagation (Phase 4).
+- Vector / FTS searches on a forked session use the parent's index (Phase 5 adds fusion).
+
+### Verification
+
+- 7 integration tests in `crates/uni/tests/fork_read_only.rs` cover snapshot isolation, restart preservation, typed-error gating, `.new_()` semantics, ForkInUse, list/info round-trip.
+- `crates/uni/tests/fork_creation_concurrency.rs` (E4 verification): 16 concurrent creates within 2× serial.
+- `crates/uni/tests/fork_no_primary_blocking.rs` (spec §10): primary reads stay <250ms during fork creation.
+- `crates/uni-store/tests/lance_branch_retention.rs` (E1 kill-switch): Lance compaction honors branch references.
+- `crates/uni-store/tests/recovery_fork_create_fault.rs` (env-var-gated fault injection): partial-create rollback.
+- Cypher TCK: 3969/3969. Locy TCK: 434/434. Zero regressions.
 5. `cargo doc -p uni-db --no-deps` — docs generate without warnings

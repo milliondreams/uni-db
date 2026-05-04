@@ -21,6 +21,7 @@ tx.commit().await?;
 |---|---|
 | `Session::fork(name)` | Open or create a fork. `.await` opens-or-creates; `.new_().await` errors with `ForkAlreadyExists` if the name is taken. |
 | `Session::is_forked()` | `true` when this session was returned by `fork`. |
+| `Session::fork_schema()` | Fork-local schema mutation builder. Mirrors `db.schema()`. Adds labels and edge types to the fork's overlay only — primary is unaffected. Required under `strict_schema: true` to introduce fork-only labels. Errors with `InvalidArgument` on a non-forked session. |
 | `Uni::list_forks()` | All Active forks. |
 | `Uni::fork_info(name)` | Metadata for a single fork. |
 | `Uni::drop_fork(name)` | Full 2PC drop. Errors with `ForkInUse` while sessions are alive, `ForkInflightTx` while a transaction is open on the fork. |
@@ -46,10 +47,30 @@ Two `session.fork("x")` calls on the same name resolve to the same `UniInner`. A
 - `uni_fork_l1_flushes{fork=...}` gauge — per-fork flush count.
 - `tracing::warn!` once per writer when the count crosses `UniConfig::fork_fragment_warn_threshold` (default 256). Fork compaction is Phase 5; until then, drop-and-recreate to bound fragment growth.
 
+## Strict-schema mode
+
+When the database is built with `UniConfig { strict_schema: true, .. }`,
+unknown labels and edge types are rejected upfront. To introduce a
+fork-only label or edge type, declare it through `Session::fork_schema()`:
+
+```rust
+forked
+    .fork_schema()
+    .label("OnlyOnFork")
+    .edge_type("ONLY_ON_FORK", &["Item"], &["Item"])
+    .apply()
+    .await?;
+```
+
+Subsequent writes from any session sharing the fork (Day 8 cache)
+see the addition immediately; primary's strict-schema view is
+unchanged. The overlay is persisted to
+`catalog/fork_schemas/{fork_id}.json` so a restart preserves it.
+
 ## What's not in Phase 2
 
 - Nested forks (`forked.fork(name)`) — Phase 3.
 - TTL, tags, watch filtering, hooks/params propagation — Phase 4.
 - Fork-local index fusion — Phase 5.
 - Diff and promotion — Phase 6.
-- Strict-schema deployments creating new fork-only labels (the `SchemaDelta` overlay growth path is reserved for that).
+- Property additions through `fork_schema()` (label/edge-type only for now; `SchemaDelta::added_properties` is reserved for a follow-up).

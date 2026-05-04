@@ -325,6 +325,21 @@ impl StorageManager {
     /// the fork's branch for tables the fork has branched. Untracked
     /// tables fall back to primary, matching Phase 1 read semantics.
     pub fn at_fork(&self, scope: Arc<crate::fork::ForkScope>) -> Self {
+        self.at_fork_with_schema(scope, self.schema_manager.clone())
+    }
+
+    /// Variant of [`Self::at_fork`] that uses an explicit
+    /// `merged_schema` for the fork's storage rather than primary's
+    /// schema_manager. Used by `UniInner::at_fork` so that the
+    /// fork-side strict-schema checks (in `uni-query` / `uni-store`'s
+    /// writer) see fork-local labels and edge types added through
+    /// `Session::fork_schema()`. Without this, those checks would
+    /// route through primary's schema and reject fork-local labels.
+    pub fn at_fork_with_schema(
+        &self,
+        scope: Arc<crate::fork::ForkScope>,
+        merged_schema: Arc<SchemaManager>,
+    ) -> Self {
         debug_assert!(
             self.pinned_snapshot.is_none(),
             "forking a pinned StorageManager is unsupported in Phase 1"
@@ -335,7 +350,7 @@ impl StorageManager {
         Self {
             base_uri: self.base_uri.clone(),
             store: self.store.clone(),
-            schema_manager: self.schema_manager.clone(),
+            schema_manager: merged_schema,
             snapshot_manager: self.snapshot_manager.clone(),
             adjacency_manager: Arc::new(AdjacencyManager::new(self.adjacency_manager.max_bytes())),
             config: self.config.clone(),

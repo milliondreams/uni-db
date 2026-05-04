@@ -74,6 +74,29 @@ assert_eq!(
 | `Uni::fork_info(name)` | Metadata for a single fork. |
 | `Uni::drop_fork(name)` | Full 2PC drop. |
 
+### Fork-local schema additions
+
+`Session::fork_schema()` mirrors `db.schema()` but lands new labels and edge types in the fork's persisted overlay (`catalog/fork_schemas/{fork_id}.json`) and the fork's in-memory `SchemaManager`. Primary's `catalog/schema.json` is **never** touched.
+
+```rust
+let forked = session.fork("scenario_1").await?;
+forked
+    .fork_schema()
+    .label("OnlyOnFork")
+    .edge_type("ONLY_ON_FORK", &["Item"], &["Item"])
+    .apply()
+    .await?;
+
+// Strict-schema mode now lets the fork CREATE new fork-only entities:
+let tx = forked.tx().await?;
+tx.execute("CREATE (:OnlyOnFork)").await?;
+tx.commit().await?;
+```
+
+Required only under `UniConfig { strict_schema: true, .. }`. In schemaless mode (the default) `BranchedBackend` materializes the dataset+branch on the fly without a schema entry; calling `fork_schema()` is harmless but unnecessary.
+
+`apply()` errors with `UniError::InvalidArgument` on a non-forked session.
+
 ### Errors
 
 All fork-related errors are `UniError::Fork*` variants — `ForkNotFound`, `ForkAlreadyExists`, `ForkInUse { name, holder_count }`, `ForkInflightTx { name }`, `ForkCorruptRegistry`, `ForkLifecycle { name, stage, source }`.

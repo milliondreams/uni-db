@@ -82,6 +82,7 @@ futures = "0.3"
 async-trait = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+arc-swap = "1"
 log = "0.4"
 env_logger = "0.11"
 clap = { version = "4.4", features = ["derive"] }

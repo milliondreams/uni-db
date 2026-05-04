@@ -122,7 +122,7 @@ impl<'a> ForkBuilder<'a> {
         let overlay = registry.load_schema_overlay(&info.id).await?;
         let scope = Arc::new(ForkScope::new(
             Arc::new(info.clone()),
-            Arc::new(overlay),
+            overlay,
             registry.clone(),
         ));
 

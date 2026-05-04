@@ -83,7 +83,7 @@ async fn at_fork_routes_vertex_reads_through_branch() {
     // 5. Build a ForkScope and a fork-scoped StorageManager.
     let scope = Arc::new(ForkScope::new(
         Arc::new(active),
-        Arc::new(SchemaDelta::empty()),
+        SchemaDelta::empty(),
         registry.clone(),
     ));
     let forked_storage = storage.at_fork(scope.clone());
@@ -158,7 +158,7 @@ async fn at_fork_falls_back_to_primary_for_unrecorded_dataset() {
 
     let scope = Arc::new(ForkScope::new(
         Arc::new(active),
-        Arc::new(SchemaDelta::empty()),
+        SchemaDelta::empty(),
         registry,
     ));
     let forked_storage = storage.at_fork(scope);

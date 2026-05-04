@@ -350,6 +350,40 @@ impl ForkRegistryHandle {
         Ok(())
     }
 
+    /// Replace the persisted schema overlay for `id` with `delta`.
+    ///
+    /// Used by [`crate::fork::ForkScope::add_label_to_overlay`] and
+    /// [`crate::fork::ForkScope::add_edge_type_to_overlay`] to durably
+    /// record fork-local schema additions. The caller is expected to
+    /// hold the per-scope `overlay_lock` so two concurrent updates on
+    /// the same fork don't clobber each other; cross-fork updates
+    /// remain parallel because each scope has its own lock.
+    ///
+    /// The overlay is a single full-replace JSON file under
+    /// `catalog/fork_schemas/{id}.json` — the same shape as the empty
+    /// delta written at fork creation time. There is no in-memory
+    /// registry cache to keep coherent (the registry doesn't cache
+    /// overlays); the caller's `ArcSwap` is the in-memory source of
+    /// truth.
+    pub async fn update_schema_overlay(
+        &self,
+        id: &ForkId,
+        delta: &SchemaDelta,
+    ) -> Result<(), UniError> {
+        // Resolve the fork name for diagnostic purposes only; the PUT
+        // itself doesn't need the cache lock.
+        let name = {
+            let cache = self.inner.cache.lock().await;
+            cache
+                .forks
+                .values()
+                .find(|f| f.id == *id)
+                .map(|f| f.name.clone())
+                .unwrap_or_else(|| format!("<fork:{id}>"))
+        };
+        self.put_schema_overlay(id, delta, &name).await
+    }
+
     /// Read the schema overlay for `id`. Returns empty if absent.
     pub async fn load_schema_overlay(&self, id: &ForkId) -> Result<SchemaDelta, UniError> {
         match get_with_timeout(&self.inner.store, &schema_overlay_path(id), DEFAULT_TIMEOUT).await {

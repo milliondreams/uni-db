@@ -449,6 +449,34 @@ impl Session {
         self.fork_scope.is_some()
     }
 
+    /// Borrow the fork scope, if any. Used by
+    /// [`crate::api::fork_schema::ForkSchemaBuilder`] to route
+    /// fork-local schema additions to the right overlay; not part of
+    /// the public surface.
+    pub(crate) fn fork_scope(&self) -> Option<Arc<uni_store::fork::ForkScope>> {
+        self.fork_scope.clone()
+    }
+
+    /// Begin a fork-local schema mutation.
+    ///
+    /// Only valid on a forked session. The returned builder mirrors
+    /// `Uni::schema()`'s shape but routes both to the fork's
+    /// in-memory `SchemaManager` and to the fork's persisted
+    /// overlay file (`catalog/fork_schemas/{fork_id}.json`). Primary's
+    /// schema is unaffected.
+    ///
+    /// Use this in strict-schema mode (`UniConfig.strict_schema =
+    /// true`) to introduce labels or edge types that exist only on
+    /// the fork. In schemaless mode the schema check is bypassed and
+    /// `BranchedBackend` materializes the dataset on the fly without
+    /// a schema entry — `fork_schema()` is harmless but unnecessary.
+    ///
+    /// `apply()` returns `UniError::InvalidArgument` if called on a
+    /// non-forked session.
+    pub fn fork_schema(&self) -> super::fork_schema::ForkSchemaBuilder<'_> {
+        super::fork_schema::ForkSchemaBuilder::new(self)
+    }
+
     /// Create a transaction with builder options (timeout, isolation level).
     pub fn tx_with(&self) -> TransactionBuilder<'_> {
         TransactionBuilder {

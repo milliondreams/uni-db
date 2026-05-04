@@ -85,7 +85,7 @@ async fn fixture()
 
     let scope = Arc::new(ForkScope::new(
         Arc::new(active),
-        Arc::new(SchemaDelta::empty()),
+        SchemaDelta::empty(),
         registry,
     ));
     let branched = BranchedBackend::new(inner.clone(), scope);

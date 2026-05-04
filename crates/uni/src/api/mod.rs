@@ -14,6 +14,7 @@ pub mod builder;
 pub mod bulk;
 pub mod compaction;
 pub mod fork;
+pub mod fork_schema;
 pub mod functions;
 pub mod hooks;
 pub mod impl_locy;
@@ -289,8 +290,11 @@ impl UniInner {
         &self,
         scope: Arc<uni_store::fork::ForkScope>,
     ) -> Result<UniInner> {
-        let forked_storage = Arc::new(self.storage.at_fork(scope.clone()));
         let merged_schema = self.schema.with_overlay(&scope.overlay());
+        let forked_storage = Arc::new(
+            self.storage
+                .at_fork_with_schema(scope.clone(), merged_schema.clone()),
+        );
 
         let prop_manager = Arc::new(PropertyManager::new(
             forked_storage.clone(),
@@ -1842,7 +1846,7 @@ mod fork_inner_tests {
 
         let scope = Arc::new(ForkScope::new(
             Arc::new(active),
-            Arc::new(SchemaDelta::empty()),
+            SchemaDelta::empty(),
             registry,
         ));
 

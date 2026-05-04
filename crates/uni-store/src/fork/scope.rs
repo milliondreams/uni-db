@@ -17,17 +17,22 @@
 //! - `_holder` — RAII guard that decrements the holder count when the
 //!   scope is dropped.
 //!
-//! `ForkScope` is intentionally a `Phase 1` read-only snapshot: both
-//! `fork_info` and `overlay` are wrapped in `Arc` rather than `ArcSwap`.
-//! Phase 2 will swap to `ArcSwap` when fork-local writes start mutating
-//! the overlay; Phase 1 has nothing to mutate.
+//! `fork_info` is wrapped in plain `Arc` (no fork-side mutation today
+//! — datasets only grow through `register_dynamic_branch` which goes
+//! through the registry, not through `fork_info`). `overlay` is wrapped
+//! in `ArcSwap` so fork-local strict-schema additions can be applied
+//! atomically without rebuilding the scope.
 
 // Rust guideline compliant
 
 use std::sync::Arc;
 
+use anyhow::Context;
+use arc_swap::ArcSwap;
 use dashmap::DashMap;
+use tokio::sync::Mutex as AsyncMutex;
 use uni_common::core::fork::{ForkId, ForkInfo, SchemaDelta};
+use uni_common::core::schema::{EdgeTypeMeta, LabelMeta};
 
 use super::registry::{ForkHolderGuard, ForkRegistryHandle};
 
@@ -39,7 +44,17 @@ use super::registry::{ForkHolderGuard, ForkRegistryHandle};
 pub struct ForkScope {
     fork_id: ForkId,
     fork_info: Arc<ForkInfo>,
-    overlay: Arc<SchemaDelta>,
+    /// Schema additions on top of primary's schema. Mutable so that
+    /// `Session::fork_schema()` can introduce fork-local labels and
+    /// edge types without touching primary's `catalog/schema.json`.
+    /// `ArcSwap` makes reads cheap and atomic; the `overlay_lock`
+    /// below serializes the read-modify-write on the persistence side.
+    overlay: Arc<ArcSwap<SchemaDelta>>,
+    /// Serializes overlay updates *within a single fork* so two
+    /// concurrent `add_label_to_overlay` calls don't clobber each
+    /// other's persisted state. Held across the registry PUT and the
+    /// `ArcSwap::store`. Cross-fork updates remain parallel.
+    overlay_lock: Arc<AsyncMutex<()>>,
     registry: Arc<ForkRegistryHandle>,
     /// Branches created after fork construction, e.g. by
     /// [`crate::backend::BranchedBackend`] when the fork's writer
@@ -75,14 +90,15 @@ impl ForkScope {
     #[must_use]
     pub fn new(
         fork_info: Arc<ForkInfo>,
-        overlay: Arc<SchemaDelta>,
+        overlay: SchemaDelta,
         registry: Arc<ForkRegistryHandle>,
     ) -> Self {
         let holder = registry.register_holder(fork_info.id);
         Self {
             fork_id: fork_info.id,
             fork_info,
-            overlay,
+            overlay: Arc::new(ArcSwap::from_pointee(overlay)),
+            overlay_lock: Arc::new(AsyncMutex::new(())),
             registry,
             dynamic_branches: Arc::new(DashMap::new()),
             _holder: holder,
@@ -101,10 +117,13 @@ impl ForkScope {
         self.fork_info.clone()
     }
 
-    /// Schema delta to merge on top of primary's schema.
+    /// Schema delta to merge on top of primary's schema. Returns a
+    /// snapshot of the current overlay; subsequent
+    /// [`Self::add_label_to_overlay`] calls will not affect the
+    /// returned `Arc`.
     #[must_use]
     pub fn overlay(&self) -> Arc<SchemaDelta> {
-        self.overlay.clone()
+        self.overlay.load_full()
     }
 
     /// Branch name for a given Lance dataset, if this fork has one.
@@ -136,6 +155,54 @@ impl ForkScope {
     /// existing entry is a no-op.
     pub fn register_dynamic_branch(&self, dataset: String, branch: String) {
         self.dynamic_branches.insert(dataset, branch);
+    }
+
+    /// Append a label to the fork-local schema overlay and persist
+    /// the new overlay to disk.
+    ///
+    /// Idempotent: if a label with the same name is already in the
+    /// overlay (or in primary's schema, accessible to the caller via
+    /// the merged `SchemaManager` not consulted here), the append
+    /// still records this entry — callers should check for duplicates
+    /// before invoking. The persistence-then-swap order means a
+    /// failed PUT leaves the in-memory `ArcSwap` untouched and the
+    /// returned error surfaces to the caller.
+    ///
+    /// Concurrency: serialized within a single fork by `overlay_lock`
+    /// so two concurrent appends don't clobber each other's
+    /// persisted state.
+    pub async fn add_label_to_overlay(
+        &self,
+        name: String,
+        meta: LabelMeta,
+    ) -> anyhow::Result<()> {
+        let _guard = self.overlay_lock.lock().await;
+        let mut next = (**self.overlay.load()).clone();
+        next.added_labels.push((name, meta));
+        self.registry
+            .update_schema_overlay(&self.fork_id, &next)
+            .await
+            .with_context(|| format!("persist schema overlay for fork {}", self.fork_id))?;
+        self.overlay.store(Arc::new(next));
+        Ok(())
+    }
+
+    /// Append an edge type to the fork-local schema overlay and
+    /// persist. Same semantics as [`Self::add_label_to_overlay`].
+    pub async fn add_edge_type_to_overlay(
+        &self,
+        name: String,
+        meta: EdgeTypeMeta,
+    ) -> anyhow::Result<()> {
+        let _guard = self.overlay_lock.lock().await;
+        let mut next = (**self.overlay.load()).clone();
+        next.added_edge_types.push((name, meta));
+        self.registry
+            .update_schema_overlay(&self.fork_id, &next)
+            .await
+            .with_context(|| format!("persist schema overlay for fork {}", self.fork_id))?;
+        self.overlay.store(Arc::new(next));
+        Ok(())
     }
 
     /// Registry handle (used by admin paths to e.g. compute holder counts).

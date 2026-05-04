@@ -11474,6 +11474,7 @@ name = "uni-store"
 version = "1.2.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "arrow",
  "arrow-array",
  "arrow-schema",

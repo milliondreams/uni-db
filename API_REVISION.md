@@ -202,9 +202,11 @@ Builds on Phase 1's read-only substrate. `forked.tx().execute(...).commit()` now
 ### New public API (Phase 2)
 
 - **`forked.tx()` is writable.** The Phase 1 gate is removed; `UniError::ForkWritesNotYetSupported` is no longer surfaced.
+- **`Session::fork_schema()`** — fork-local schema mutation builder. Mirrors `db.schema()`'s shape (`.label(...).description(...).apply().await`, `.edge_type(name, &[from], &[to]).apply().await`). Entries land in the fork's in-memory `SchemaManager` and in the persisted overlay file (`catalog/fork_schemas/{fork_id}.json`); primary is unaffected. Errors with `UniError::InvalidArgument` on a non-forked session.
+- **`ForkRegistryHandle::update_schema_overlay(fork_id, &delta)`** — public registry method that PUTs the new overlay; mirrors `register_dataset_branch` semantics. Used by `Session::fork_schema()` under a per-scope `overlay_lock` so concurrent updates on the same fork serialize while cross-fork updates remain parallel.
 - **`UniConfig::fork_fragment_warn_threshold: usize`** (default 256). Per-fork L1 flush count above which a `tracing::warn!` fires once per writer; surfaces fork-fragment growth ahead of Phase 5 fork compaction.
 - **`UniError::ForkInflightTx { name }`** — `Uni::drop_fork` now refuses with this typed error when a `Transaction` is alive on the fork. Commit or roll back first, then retry.
-- **Sibling-session L0 visibility.** Two `session.fork(name)` calls on the same name share a single `Arc<UniInner>` (cached as `Weak<UniInner>` so the cache never extends a session's lifetime). A commit on one session is immediately visible to the other's reads — no flush required.
+- **Sibling-session L0 visibility.** Two `session.fork(name)` calls on the same name share a single `Arc<UniInner>` (cached as `Weak<UniInner>` so the cache never extends a session's lifetime). A commit on one session is immediately visible to the other's reads — no flush required. Schema additions through `fork_schema()` from one session are also immediately visible to the other through the shared `SchemaManager` and the `ArcSwap`'d overlay.
 
 ### Inherited from Phase 1
 
@@ -228,7 +230,7 @@ Builds on Phase 1's read-only substrate. `forked.tx().execute(...).commit()` now
 - No fork compaction — long-lived heavy-write forks accumulate L1 fragments. Mitigation: drop-and-recreate, or watch the `fork_fragment_warn_threshold` signal. Phase 5 lands compaction proper.
 - No TTL, watch filtering on forks, hooks/params propagation (Phase 4).
 - Vector / FTS searches on a forked session use the parent's index (Phase 5 adds fusion).
-- `BranchedBackend` runs in schemaless-by-default mode (uni's `strict_schema: false`). Strict-schema deployments need the `SchemaDelta` overlay growth path before fork-only labels work; the overlay file is reserved for that and currently always empty.
+- (Resolved.) Strict-schema deployments now have a fork-local schema mutation path: `Session::fork_schema().label(...).apply()` and `.edge_type(...)` add entries to the fork's persisted `SchemaDelta` overlay and to the fork's in-memory `SchemaManager` without touching primary. See "Fork-local schema additions" below.
 
 ### Verification
 

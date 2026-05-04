@@ -42,9 +42,14 @@
 - Do not perform any git action unless the user has explicitly instructed it in the current conversation turn.
 - This includes all git commands and git-related workflows (for example: `status`, `diff`, `add`, `commit`, `push`, `pull`, `checkout`, `reset`, `merge`, `rebase`, `tag`, `stash`, `cherry-pick`).
 
-## Fork invariants (Phase 1)
-- **Registry edits go through `ForkRegistryHandle`.** Never write `catalog/fork_registry.json`, `catalog/fork_schemas/*`, or `catalog/fork_tombstones/*` directly — the 2PC state machine assumes single-writer access through the handle.
+## Fork invariants (Phase 2)
+- **Registry edits go through `ForkRegistryHandle`.** Never write `catalog/fork_registry.json`, `catalog/fork_schemas/*`, `catalog/fork_tombstones/*`, or `catalog/forks/{fork_id}/id_allocator.json` directly — the 2PC state machine assumes single-writer access through the handle.
 - **Fork creation must not hold any global lock during `lance_branch::create_branch`.** The registry mutex covers metadata PUTs only. Spec §10 requires fork creation not to block primary.
 - **`lance::Dataset::create_branch` is not idempotent** at the same `parent_version`. Recovery must call `lance_branch::delete_branch` (force-delete wrapper) before re-attempting. Day 1 spike confirmed this contract.
 - **Lance compaction retention must not be tightened below the longest live fork chain.** Silent fork-data corruption otherwise. Verified by `crates/uni-store/tests/lance_branch_retention.rs`.
-- **Phase 1 forks are read-only.** `Session::tx()` returns `UniError::ForkWritesNotYetSupported` on a forked session. The `BranchedBackend` decorator rejects every write method; if you find a code path that writes to a forked storage, that's an invariant violation, not a feature gap.
+- **Per-fork allocator** lives at `catalog/forks/{fork_id}/id_allocator.json` and is bootstrapped from primary's in-memory HWM at fork creation. Never let it start at 0 against a non-empty primary — Lance read-merge would shadow the fork's writes.
+- **Per-fork WAL** lives at `wal_forks/{fork_id}/`, NOT under `wal/` — that prefix collides with primary's listing under recursive `ObjectStore::list`. See `crates/uni-store/src/fork/wal.rs` rustdoc.
+- **Same-fork sessions share an `Arc<UniInner>`** via `UniInner.fork_inners` (cached as `Weak`). A commit on one session is immediately visible to siblings — preserve this when refactoring `ForkBuilder::build` or `Uni::drop_fork`.
+- **`Uni::drop_fork` must check `inflight_tx_count` before `begin_drop`.** The registry transition to Tombstoned cannot be cleanly rolled back; surfacing `ForkInflightTx` early is the contract. The counter is on `UniInner` and paired with `Transaction::new` / `Transaction::drop` (incremented and decremented unconditionally).
+- **On-the-fly fork dataset creation must keep main empty.** `BranchedBackend::ensure_branch_for_new` materializes an empty parent on `main`, branches from it, then writes the actual batches to the branch. Calling `create_dataset_then_branch` directly with the batches would leak fork data into primary's view.
+- **Fork compaction is deferred to Phase 5.** Long-lived heavy-write forks should be `drop_fork`-and-recreate. The `uni_fork_l1_flushes` gauge plus `fork_fragment_warn_threshold` warn surface the risk operationally.

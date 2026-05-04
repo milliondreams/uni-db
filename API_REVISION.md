@@ -195,40 +195,52 @@ After each phase:
 
 ---
 
-## Forks (Phase 1, read-only)
+## Forks (Phase 2, writable)
 
-Adds the `Session::fork(name)` API and admin paths on `Uni` for working with named, durable, isolated graph branches. Phase 1 is **read-only**: writes through a forked session return `UniError::ForkWritesNotYetSupported` (Phase 2 lifts this gate).
+Builds on Phase 1's read-only substrate. `forked.tx().execute(...).commit()` now lands writes on the fork's Lance branches. Same Cypher / Locy as primary; primary remains untouched.
 
-### New public API
+### New public API (Phase 2)
 
-- **`Session::fork(name) -> ForkBuilder`** — open or create a fork. `.await` runs the open-or-create path; `.new_().await` requires the fork to be newly created (errors with `ForkAlreadyExists` otherwise).
-- **`Session::is_forked() -> bool`** — true when this session was returned by `fork`.
-- **`Uni::list_forks() -> Vec<ForkInfo>`** — every active fork.
-- **`Uni::fork_info(name) -> Result<ForkInfo>`** — metadata for a single fork.
-- **`Uni::drop_fork(name) -> Result<()>`** — full 2PC drop (tombstone → branch deletes → registry clear → file cleanup); refuses with `ForkInUse` while sessions are alive.
-- **New types** (re-exported from `uni_db`): `ForkId`, `ForkInfo`, `ForkStatus`, `SchemaDelta`, `ForkRegistryFile`.
-- **New `UniError` variants**: `ForkNotFound`, `ForkAlreadyExists`, `ForkWritesNotYetSupported`, `ForkInUse { name, holder_count }`, `ForkCorruptRegistry`, `ForkLifecycle { name, stage, source }`.
+- **`forked.tx()` is writable.** The Phase 1 gate is removed; `UniError::ForkWritesNotYetSupported` is no longer surfaced.
+- **`UniConfig::fork_fragment_warn_threshold: usize`** (default 256). Per-fork L1 flush count above which a `tracing::warn!` fires once per writer; surfaces fork-fragment growth ahead of Phase 5 fork compaction.
+- **`UniError::ForkInflightTx { name }`** — `Uni::drop_fork` now refuses with this typed error when a `Transaction` is alive on the fork. Commit or roll back first, then retry.
+- **Sibling-session L0 visibility.** Two `session.fork(name)` calls on the same name share a single `Arc<UniInner>` (cached as `Weak<UniInner>` so the cache never extends a session's lifetime). A commit on one session is immediately visible to the other's reads — no flush required.
 
-### What the storage substrate looks like
+### Inherited from Phase 1
 
-- **Lance branches**: each fork is one Lance branch per dataset (vertex, edge-delta, adjacency). Reads chain to parent via `base_paths`.
-- **Catalog files**: `catalog/fork_registry.json` (single JSON, all forks), `catalog/fork_schemas/{fork_id}.json` (per-fork schema overlay; empty in Phase 1), `catalog/fork_tombstones/{fork_id}.json` (durable drop intent).
-- **Backend wrapper**: a fork-scoped `StorageManager` swaps in a `BranchedBackend` that auto-fills `ScanRequest.branch` for every read, so existing read paths work transparently.
-- **Recovery**: runs in `Uni::open` before any session is returned; resumes any partial create or drop left by a crash.
+- **`Session::fork(name) -> ForkBuilder`** — open-or-create; `.new_().await` errors with `ForkAlreadyExists` when the name is taken.
+- **`Session::is_forked() -> bool`**.
+- **`Uni::list_forks() -> Vec<ForkInfo>`**, **`Uni::fork_info(name)`**, **`Uni::drop_fork(name)`** (drop is the full 2PC: tombstone → branch deletes → registry clear → file cleanup).
+- **Types**: `ForkId`, `ForkInfo`, `ForkStatus`, `SchemaDelta`, `ForkRegistryFile`.
+- **Errors**: `ForkNotFound`, `ForkAlreadyExists`, `ForkInUse { name, holder_count }`, `ForkCorruptRegistry`, `ForkLifecycle { name, stage, source }`.
 
-### Phase 1 limits (lifted in later phases)
+### What the storage substrate looks like (updated for Phase 2)
 
-- No writes through a forked session (Phase 2).
+- **Lance branches**: each fork has one Lance branch per dataset. The main label-agnostic `vertices` and `edges` tables, every `vertices_{label}`, and every `deltas_{type}_{fwd,bwd}` / `adjacency_{type}_{fwd,bwd}` are branched at fork creation if they exist. Datasets that don't exist yet (a label declared but never written, or a brand-new fork-only label) are materialized on-the-fly with the parent commit on `main` left empty so primary's view stays untouched.
+- **Per-fork allocator**: `catalog/forks/{fork_id}/id_allocator.json`, bootstrapped from primary's HWM at fork creation so VID/EID streams don't collide.
+- **Per-fork WAL**: `wal_forks/{fork_id}/`, replayed in `at_fork`. Primary's recovery never reads it.
+- **Dynamic dataset → branch entries**: persisted into the fork's `ForkInfo.datasets` so a restart recovers the same view.
+- **Backend wrapper**: a fork-scoped `StorageManager` swaps in a `BranchedBackend` that auto-fills `ScanRequest.branch` for every read and routes writes through `lance_branch::write_to_branch` (creating dataset+branch on the fly when needed).
+
+### Phase 2 limits (lifted in later phases)
+
 - No nested forks (Phase 3).
+- No fork compaction — long-lived heavy-write forks accumulate L1 fragments. Mitigation: drop-and-recreate, or watch the `fork_fragment_warn_threshold` signal. Phase 5 lands compaction proper.
 - No TTL, watch filtering on forks, hooks/params propagation (Phase 4).
 - Vector / FTS searches on a forked session use the parent's index (Phase 5 adds fusion).
+- `BranchedBackend` runs in schemaless-by-default mode (uni's `strict_schema: false`). Strict-schema deployments need the `SchemaDelta` overlay growth path before fork-only labels work; the overlay file is reserved for that and currently always empty.
 
 ### Verification
 
-- 7 integration tests in `crates/uni/tests/fork_read_only.rs` cover snapshot isolation, restart preservation, typed-error gating, `.new_()` semantics, ForkInUse, list/info round-trip.
-- `crates/uni/tests/fork_creation_concurrency.rs` (E4 verification): 16 concurrent creates within 2× serial.
-- `crates/uni/tests/fork_no_primary_blocking.rs` (spec §10): primary reads stay <250ms during fork creation.
-- `crates/uni-store/tests/lance_branch_retention.rs` (E1 kill-switch): Lance compaction honors branch references.
-- `crates/uni-store/tests/recovery_fork_create_fault.rs` (env-var-gated fault injection): partial-create rollback.
-- Cypher TCK: 3969/3969. Locy TCK: 434/434. Zero regressions.
+- Phase 1 tests carried forward: `fork_read_only`, `fork_creation_concurrency`, `fork_no_primary_blocking`, `lance_branch_retention`, `recovery_fork_*`.
+- Phase 2 substrate: `fork_writes`, `fork_branch_writes`, `branched_backend_writes`, `recovery_fork_wal`.
+- Phase 2 Days 8–14 added:
+  - `fork_concurrent_writers` — same-fork-name sessions share a writer; cross-fork writes proceed in parallel.
+  - `fork_locy_rules` — registry isolation is correct by construction (Phase 1's deep clone in `at_fork`).
+  - `fork_flush_known_labels` — fork flushes succeed end-to-end for primary-known labels.
+  - `fork_new_label` — fork-only labels materialize a dataset+branch on the fly; primary stays empty; restart preserves the dynamic branch mapping.
+  - `fork_drop_inflight` — open `Transaction` on a fork surfaces `ForkInflightTx`; commit clears it.
+  - `fork_fragment_warn` — observability gauge + one-shot warn fire on the fork writer; primary writers never emit.
+  - `fork_writes_soak` (`#[ignore]`) — N forks × M mutations × R restarts; opt in with `--run-ignored ignored-only`.
+- Cypher TCK: 3969/3969. Locy TCK: 434/434. Zero regressions in Phase 2.
 5. `cargo doc -p uni-db --no-deps` — docs generate without warnings

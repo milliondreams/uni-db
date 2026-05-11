@@ -224,9 +224,39 @@ Builds on Phase 1's read-only substrate. `forked.tx().execute(...).commit()` now
 - **Dynamic dataset → branch entries**: persisted into the fork's `ForkInfo.datasets` so a restart recovers the same view.
 - **Backend wrapper**: a fork-scoped `StorageManager` swaps in a `BranchedBackend` that auto-fills `ScanRequest.branch` for every read and routes writes through `lance_branch::write_to_branch` (creating dataset+branch on the fly when needed).
 
-### Phase 2 limits (lifted in later phases)
+## Forks (Phase 3 — nested)
 
-- No nested forks (Phase 3).
+Builds on Phase 2. `forked.fork(name)` now succeeds, producing a child whose reads chain through Lance `base_paths` to the parent fork's branch and whose writes/drops/schema additions remain isolated at every level.
+
+### New public API (Phase 3)
+
+- **`forked.fork(name)` is enabled.** The Phase 1 `InvalidArgument` gate is removed. The child's `ForkInfo.parent_fork_id` is set to the parent fork's id; primary-rooted forks keep `parent_fork_id == None`.
+- **`Uni::drop_fork(name)`** now refuses with `UniError::ForkHasChildren { name, children }` when the fork has nested children. Drop the children first or use `drop_fork_cascade`.
+- **`Uni::drop_fork_cascade(name)`** drops the named fork and every descendant. Pre-validates the entire subtree for live sessions / open transactions before tombstoning anything; surfaces `UniError::ForkSubtreeInUse { blockers }` on any blocker. On success it drops deepest-first via the single-fork path, so a crash mid-cascade resumes through existing tombstone recovery.
+- **`Session::flush()`** flushes the session's writer to L1 (forked or primary). Phase 3 also auto-flushes the parent fork's L0 inside `create_fork_2pc` so a nested child sees the parent's committed writes via the Lance chain without the caller needing to remember.
+- **New error variants:** `ForkHasChildren { name, children: Vec<String> }`, `ForkSubtreeInUse { blockers: Vec<String> }`.
+- **New registry surface:** `ForkRegistryHandle::list_children(ForkId)`, `ForkRegistryHandle::get_by_id(ForkId)`, `ForkRegistryHandle::holder_count_for(ForkId)`.
+- **New Lance branch helpers** in `uni-store::backend::lance_branch`: `current_version_on_branch(uri, branch)` and `create_branch_from(uri, new_branch, parent_branch, version)`. Both preserve the existing fault-injection contract.
+- **`SchemaDelta::merge_atop(&self, base)`** — associative overlay composition (self wins on collision). Useful as a primitive for diagnostics and promotion logic. The fork's at-session-open overlay merge still happens implicitly via chained `SchemaManager::with_overlay`.
+
+### Storage layout (Phase 3 additions)
+
+- A nested fork's Lance branch has `base_paths = child_branch → parent_branch → main`. Datasets that the parent didn't have a branch for at child-creation time fall through to the existing on-the-fly creation path (`BranchedBackend::ensure_branch_for_new`) — the empty-parent commit still lands on main, which is safe because no ancestor's schema references a fork-only label.
+- `ForkInfo.parent_fork_id` is serialized into `catalog/fork_registry.json`. Field has lived in the schema since Phase 1 with serde round-trip tests; no migration needed.
+
+### Phase 3 limits (lifted in later phases)
+
+- Cross-fork diff at depth > 1 is Phase 6.
+- No re-parenting; a fork's parent is fixed at create-time.
+- Property additions to existing primary labels through `fork_schema()` remain out of scope (Lance branches share parent Arrow schema).
+- TTL, tags, watch filtering, hooks/params on fork sessions remain Phase 4.
+
+### Verification
+
+- `cargo nextest run -p uni-db --test fork_nested` — 7 tests covering 3-level chain, snapshot isolation at each level, sibling-fork isolation, `drop_fork` child guard, cascade subtree removal, cascade subtree-in-use refusal, and nested strict-schema overlay composition.
+- Full Phase 1 + 2 fork suite (`fork_read_only`, `fork_writes`, `fork_concurrent_writers`, `fork_locy_rules`, `fork_new_label`, `fork_drop_inflight`, `fork_creation_concurrency`, `fork_no_primary_blocking`, `fork_fragment_warn`, `fork_flush_known_labels`, `fork_strict_schema`, `strict_schema_test`) — 41 tests, all pass.
+- `cargo nextest run -p uni-store -p uni-common` — 543 tests pass (full uni-store + uni-common suite).
+
 - No fork compaction — long-lived heavy-write forks accumulate L1 fragments. Mitigation: drop-and-recreate, or watch the `fork_fragment_warn_threshold` signal. Phase 5 lands compaction proper.
 - No TTL, watch filtering on forks, hooks/params propagation (Phase 4).
 - Vector / FTS searches on a forked session use the parent's index (Phase 5 adds fusion).

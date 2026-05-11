@@ -170,6 +170,19 @@ impl BranchedBackend {
             // shape `create_dataset_then_branch` does) would leak the
             // fork's data into primary's view of the dataset, since
             // primary's reads always resolve through main.
+            //
+            // Phase 3 (nested forks): branching off main here is
+            // correct even when this scope is a nested fork. By
+            // construction `ensure_branch_for_new` only runs when
+            // `scope.branch_for(table_name)` returned None, which for
+            // a nested child means no ancestor in the chain had a
+            // branch for this dataset at the child's creation time.
+            // An ancestor's state for a never-touched dataset is empty,
+            // so chaining through main vs. through an ancestor's
+            // (nonexistent) branch produces the same reads. Primary
+            // still cannot see the data because its schema doesn't
+            // list the fork-only label — its reads never open this
+            // dataset.
             let empty_reader = arrow_array::RecordBatchIterator::new(
                 vec![Ok(RecordBatch::new_empty(schema.clone()))].into_iter(),
                 schema.clone(),

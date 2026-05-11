@@ -63,13 +63,6 @@ impl<'a> ForkBuilder<'a> {
             .db
             .fork_registry
             .clone();
-        // Phase 1 forbids forks-of-forks: nested forks land in Phase 3.
-        if parent.is_forked() {
-            return Err(UniError::InvalidArgument {
-                arg: "self".into(),
-                message: "nested forks are not supported in Phase 1".into(),
-            });
-        }
 
         // Acquire per-name lock for the entire open-or-create flow.
         // This prevents two concurrent callers from both running create
@@ -172,6 +165,25 @@ async fn create_fork_2pc(
     registry: &Arc<ForkRegistryHandle>,
     name: String,
 ) -> Result<ForkInfo> {
+    // Phase 3: when the parent is a forked session, flush its L0 to
+    // the fork's Lance branches before branching. Without this the
+    // child branches off a stale Lance tip and never sees the
+    // parent's L0-buffered writes through `base_paths`. Primary's
+    // case is handled by user convention (`db.flush()` before
+    // forking) — we apply the convention automatically for nested
+    // forks because there is no caller-friendly way to flush a fork
+    // (`Session::flush()` exists, but expecting every nested-fork
+    // call site to invoke it would surprise users).
+    if parent.is_forked()
+        && let Some(writer_lock) = &parent.db.writer
+    {
+        let mut writer = writer_lock.write().await;
+        writer
+            .flush_to_l1(None)
+            .await
+            .map_err(UniError::Internal)?;
+    }
+
     // Capture parent state at fork-point: snapshot id and schema version.
     let snapshot_manager = parent.db.storage.snapshot_manager();
     let parent_snapshot_id = snapshot_manager
@@ -183,12 +195,15 @@ async fn create_fork_2pc(
     let schema_version = parent.db.schema.schema().schema_version;
 
     let fork_id = ForkId::new();
-    let info = ForkInfo::new_pending(
+    let mut info = ForkInfo::new_pending(
         fork_id,
         name.clone(),
         parent_snapshot_id.clone(),
         schema_version,
     );
+    // Phase 3: record the parent fork id when this is a nested fork.
+    // `parent_fork_id == None` ⇒ parent is primary.
+    info.parent_fork_id = parent.fork_scope().map(|s| s.fork_id());
 
     // Step 2: persist the Pending entry.
     registry.begin_create(info).await?;
@@ -287,26 +302,84 @@ async fn build_datasets_for_fork(
         candidate_names.push(format!("adjacency_{edge_type}_bwd"));
     }
 
+    // Phase 3: when the parent is a forked session, route every Lance
+    // `create_branch` call through the parent's branch so the child's
+    // `base_paths` chain is `child_branch → parent_branch → main`.
+    // When the parent is primary, the parent branch is implicitly main
+    // and the legacy `current_version` / `create_branch` helpers apply.
+    let parent_scope = parent.fork_scope();
+
     for dataset_name in candidate_names {
         let dataset_uri = join_uri(&storage_uri, &dataset_name);
         if !path_exists(&dataset_uri) {
             continue;
         }
-        let parent_v = lance_branch::current_version(&dataset_uri)
-            .await
-            .map_err(|e| UniError::ForkLifecycle {
-                name: format!("<fork:{fork_id}>"),
-                stage: "current_version",
-                source: e.into(),
-            })?;
+
         let branch_name = format!("fork_{fork_id}_{dataset_name}");
-        lance_branch::create_branch(&dataset_uri, &branch_name, parent_v)
-            .await
-            .map_err(|e| UniError::ForkLifecycle {
-                name: format!("<fork:{fork_id}>"),
-                stage: "create_branch",
-                source: e.into(),
-            })?;
+        match parent_scope
+            .as_ref()
+            .and_then(|s| s.branch_for(&dataset_name))
+        {
+            Some(parent_branch) => {
+                // Nested fork: branch off the parent fork's branch tip.
+                let parent_v = lance_branch::current_version_on_branch(
+                    &dataset_uri,
+                    &parent_branch,
+                )
+                .await
+                .map_err(|e| UniError::ForkLifecycle {
+                    name: format!("<fork:{fork_id}>"),
+                    stage: "current_version_on_branch",
+                    source: e.into(),
+                })?;
+                lance_branch::create_branch_from(
+                    &dataset_uri,
+                    &branch_name,
+                    &parent_branch,
+                    parent_v,
+                )
+                .await
+                .map_err(|e| UniError::ForkLifecycle {
+                    name: format!("<fork:{fork_id}>"),
+                    stage: "create_branch_from",
+                    source: e.into(),
+                })?;
+            }
+            None => {
+                // Either parent is primary (no scope), or parent is a
+                // fork that has no branch for this dataset yet. In both
+                // cases the legacy "branch off main" path is correct:
+                // - primary case: we want main as the child's ancestor.
+                // - nested-but-unbranched case: we'd otherwise need to
+                //   branch off "main with no parent fork branch", which
+                //   means the parent fork never wrote this dataset, so
+                //   main *is* the correct ancestor for the child as
+                //   well. (The child can write through on-the-fly
+                //   creation later; the registry record we build here
+                //   reflects only the primary-known dataset.)
+                if parent_scope.is_some() {
+                    // No parent branch for this dataset — defer to
+                    // on-the-fly creation when the child first writes,
+                    // exactly like a primary-parent fork would for a
+                    // brand-new label. Skip eager branching here.
+                    continue;
+                }
+                let parent_v = lance_branch::current_version(&dataset_uri)
+                    .await
+                    .map_err(|e| UniError::ForkLifecycle {
+                        name: format!("<fork:{fork_id}>"),
+                        stage: "current_version",
+                        source: e.into(),
+                    })?;
+                lance_branch::create_branch(&dataset_uri, &branch_name, parent_v)
+                    .await
+                    .map_err(|e| UniError::ForkLifecycle {
+                        name: format!("<fork:{fork_id}>"),
+                        stage: "create_branch",
+                        source: e.into(),
+                    })?;
+            }
+        }
         branches.insert(dataset_name, branch_name);
     }
 

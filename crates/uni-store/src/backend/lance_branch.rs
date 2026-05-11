@@ -97,6 +97,55 @@ pub async fn create_branch(uri: &str, branch: &str, parent_version: u64) -> Resu
     Ok(())
 }
 
+/// Return the current version number of the named branch (Phase 3).
+///
+/// Lance versions are per-branch — a branch's tip advances independently
+/// of main once writes land on it. Nested-fork creation must read the
+/// parent branch's tip, not main's, before calling
+/// [`create_branch_from`].
+///
+/// # Errors
+///
+/// Returns an error if the dataset or branch cannot be opened.
+pub async fn current_version_on_branch(uri: &str, branch: &str) -> Result<u64> {
+    let dataset = open_branch(uri, branch).await?;
+    Ok(dataset.version().version)
+}
+
+/// Create a new branch off another branch (Phase 3, nested forks).
+///
+/// `parent_branch` must already exist on the dataset. The new branch's
+/// `base_paths` resolves: `new_branch → parent_branch → main`, so reads
+/// against the new branch chain through both ancestors.
+///
+/// Same non-idempotence contract as [`create_branch`]: a crash between
+/// the shallow-clone and `BranchContents` phases leaves a zombie; the
+/// recovery driver must [`delete_branch`] (force-mode) before retry.
+///
+/// # Errors
+///
+/// - The dataset or parent branch cannot be opened.
+/// - `new_branch` already exists.
+/// - The underlying object store call fails.
+pub async fn create_branch_from(
+    uri: &str,
+    new_branch: &str,
+    parent_branch: &str,
+    parent_version: u64,
+) -> Result<()> {
+    inject_fault_create_branch()?;
+    let mut on_parent = open_branch(uri, parent_branch).await?;
+    on_parent
+        .create_branch(new_branch, parent_version, None)
+        .await
+        .with_context(|| {
+            format!(
+                "create branch {new_branch} off {parent_branch} on {uri} at v{parent_version}"
+            )
+        })?;
+    Ok(())
+}
+
 /// Per-process counter for fault injection in `create_branch`. The
 /// recovery test crate reads / writes via the helpers below.
 #[doc(hidden)]
@@ -104,16 +153,29 @@ pub mod fault_injection {
     use std::sync::atomic::{AtomicI64, Ordering};
 
     pub(super) static CALL_COUNT: AtomicI64 = AtomicI64::new(0);
+    pub(super) static DELETE_CALL_COUNT: AtomicI64 = AtomicI64::new(0);
 
-    /// Reset the call counter. Tests that exercise injection should
-    /// call this at the start to make assertions deterministic.
+    /// Reset the create-branch call counter. Tests that exercise
+    /// `UNI_FORK_INJECT_FAIL_AFTER` should call this at the start to
+    /// make assertions deterministic.
     pub fn reset() {
         CALL_COUNT.store(0, Ordering::SeqCst);
     }
 
-    /// Read the current call count.
+    /// Read the current create-branch call count.
     pub fn calls_so_far() -> i64 {
         CALL_COUNT.load(Ordering::SeqCst)
+    }
+
+    /// Reset the delete-branch call counter (Phase 3 cascade-recovery
+    /// test harness). Pairs with `UNI_FORK_INJECT_FAIL_DELETE_AFTER`.
+    pub fn reset_delete() {
+        DELETE_CALL_COUNT.store(0, Ordering::SeqCst);
+    }
+
+    /// Read the current delete-branch call count.
+    pub fn delete_calls_so_far() -> i64 {
+        DELETE_CALL_COUNT.load(Ordering::SeqCst)
     }
 }
 
@@ -137,6 +199,31 @@ fn inject_fault_create_branch() -> Result<()> {
     Ok(())
 }
 
+/// Phase 3 cascade-recovery fault hook for `delete_branch`. Reads
+/// `UNI_FORK_INJECT_FAIL_DELETE_AFTER`; the Nth and subsequent calls
+/// (in-process counter `DELETE_CALL_COUNT`) bail before the actual
+/// delete runs. Independent from the create-side counter so the two
+/// can be armed in the same test.
+fn inject_fault_delete_branch() -> Result<()> {
+    let cur = fault_injection::DELETE_CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let Some(threshold_str) = std::env::var_os("UNI_FORK_INJECT_FAIL_DELETE_AFTER") else {
+        return Ok(());
+    };
+    let Ok(threshold) = threshold_str
+        .into_string()
+        .map_err(|_| ())
+        .and_then(|s| s.parse::<i64>().map_err(|_| ()))
+    else {
+        return Ok(());
+    };
+    if cur >= threshold {
+        anyhow::bail!(
+            "UNI_FORK_INJECT_FAIL_DELETE_AFTER triggered at call #{cur} (threshold {threshold})"
+        );
+    }
+    Ok(())
+}
+
 /// Delete a branch (idempotent under the recovery driver — uses force).
 ///
 /// Phase 1 fork-drop and recovery both call this. Force-delete handles
@@ -150,6 +237,7 @@ fn inject_fault_create_branch() -> Result<()> {
 /// Returns an error only on object-store failures unrelated to the
 /// missing-branch case.
 pub async fn delete_branch(uri: &str, branch: &str) -> Result<()> {
+    inject_fault_delete_branch()?;
     let mut dataset = open_dataset(uri).await?;
 
     // Cheap pre-check: skip the force-delete if neither BranchContents
@@ -411,6 +499,76 @@ mod tests {
         // recovery relies on this to clean up partial state idempotently.
         let (_dir, uri) = seed_dataset().await;
         delete_branch(&uri, "never-existed").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn current_version_on_branch_tracks_branch_tip() {
+        // Phase 3: branch versions advance independently of main.
+        let (_dir, uri) = seed_dataset().await;
+        let v_main = current_version(&uri).await.unwrap();
+        create_branch(&uri, "child", v_main).await.unwrap();
+
+        // Initially the branch tip matches the parent version it was
+        // forked from (Lance stamps a BranchContents commit on creation).
+        let v_branch_initial = current_version_on_branch(&uri, "child").await.unwrap();
+        assert!(v_branch_initial >= v_main);
+
+        // Append on the branch — branch tip advances, main does not.
+        let batch = test_batch(vec![10, 11], vec![1000, 1100]);
+        let reader = arrow_array::RecordBatchIterator::new(
+            vec![Ok(batch)].into_iter(),
+            test_schema(),
+        );
+        write_to_branch(&uri, "child", reader).await.unwrap();
+
+        let v_branch_after = current_version_on_branch(&uri, "child").await.unwrap();
+        let v_main_after = current_version(&uri).await.unwrap();
+        assert!(
+            v_branch_after > v_branch_initial,
+            "branch tip should advance after append"
+        );
+        assert_eq!(
+            v_main_after, v_main,
+            "main version must not move when branch is written"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_branch_from_chains_through_parent() {
+        // Phase 3: nested branch reads chain through parent branch and main.
+        let (_dir, uri) = seed_dataset().await;
+        let v_main = current_version(&uri).await.unwrap();
+        create_branch(&uri, "level1", v_main).await.unwrap();
+
+        // Append on level1 so we can verify level2 reads see those rows.
+        let batch = test_batch(vec![10, 11], vec![1000, 1100]);
+        let reader = arrow_array::RecordBatchIterator::new(
+            vec![Ok(batch)].into_iter(),
+            test_schema(),
+        );
+        write_to_branch(&uri, "level1", reader).await.unwrap();
+
+        let v_l1 = current_version_on_branch(&uri, "level1").await.unwrap();
+        create_branch_from(&uri, "level2", "level1", v_l1).await.unwrap();
+
+        // level2 should see all 5 rows: 3 from main + 2 from level1.
+        let on_l2 = open_branch(&uri, "level2").await.unwrap();
+        assert_eq!(on_l2.count_rows(None).await.unwrap(), 5);
+
+        // Writes on level1 *after* level2 was created must not appear on level2.
+        let batch2 = test_batch(vec![20], vec![2000]);
+        let reader2 = arrow_array::RecordBatchIterator::new(
+            vec![Ok(batch2)].into_iter(),
+            test_schema(),
+        );
+        write_to_branch(&uri, "level1", reader2).await.unwrap();
+
+        let on_l2_again = open_branch(&uri, "level2").await.unwrap();
+        assert_eq!(
+            on_l2_again.count_rows(None).await.unwrap(),
+            5,
+            "level2 must not see writes to level1 that happened after its creation"
+        );
     }
 
     #[tokio::test]

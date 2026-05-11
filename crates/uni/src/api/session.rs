@@ -477,6 +477,33 @@ impl Session {
         super::fork_schema::ForkSchemaBuilder::new(self)
     }
 
+    /// Flush this session's writer to L1.
+    ///
+    /// On a forked session this flushes the fork's L0 buffer to the
+    /// fork's Lance branches — required before forking a nested child
+    /// if the child should see the parent fork's already-committed
+    /// writes through the Lance chain. On a primary session this is
+    /// equivalent to `Uni::flush()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UniError::ReadOnly`] when the session has no writer
+    /// (e.g. snapshot-pinned sessions).
+    pub async fn flush(&self) -> Result<()> {
+        if let Some(writer_lock) = &self.db.writer {
+            let mut writer = writer_lock.write().await;
+            writer
+                .flush_to_l1(None)
+                .await
+                .map(|_| ())
+                .map_err(UniError::Internal)
+        } else {
+            Err(UniError::ReadOnly {
+                operation: "flush".to_string(),
+            })
+        }
+    }
+
     /// Create a transaction with builder options (timeout, isolation level).
     pub fn tx_with(&self) -> TransactionBuilder<'_> {
         TransactionBuilder {

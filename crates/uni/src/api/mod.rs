@@ -290,6 +290,17 @@ impl UniInner {
         &self,
         scope: Arc<uni_store::fork::ForkScope>,
     ) -> Result<UniInner> {
+        // Phase 3 (nested forks): `self` may itself be a fork-scoped
+        // UniInner, in which case `self.schema` already encodes
+        // `primary ⊕ parent_overlay`. Layering the child's overlay on
+        // top here gives `primary ⊕ parent_overlay ⊕ child_overlay`
+        // without any explicit chain walk — `with_overlay` clones the
+        // current manager's view into a fresh merged snapshot
+        // (`schema.rs:929-966`), so each level produces its own frozen
+        // snapshot at session-open time. Additions made on the parent
+        // *after* the child was created stay isolated from the child by
+        // construction, which matches the spec's fork-point snapshot
+        // isolation.
         let merged_schema = self.schema.with_overlay(&scope.overlay());
         let forked_storage = Arc::new(
             self.storage
@@ -504,6 +515,17 @@ impl Uni {
         // increments and `Transaction::drop` decrements unconditionally
         // (so commit/rollback/silent-drop all converge to zero).
         let preview = self.inner.fork_registry.get(name).await?;
+
+        // Phase 3: refuse to drop a parent that still has children.
+        // Callers should use `drop_fork_cascade` to remove the subtree.
+        let children = self.inner.fork_registry.list_children(preview.id).await;
+        if !children.is_empty() {
+            return Err(UniError::ForkHasChildren {
+                name: name.to_string(),
+                children: children.into_iter().map(|c| c.name).collect(),
+            });
+        }
+
         if let Some(weak) = self
             .inner
             .fork_inners
@@ -545,6 +567,76 @@ impl Uni {
         // Step 4 + 5: clear the registry entry, delete tombstone +
         // schema overlay files.
         self.inner.fork_registry.finish_drop(&info).await?;
+        Ok(())
+    }
+
+    /// Drop a fork and every descendant in its subtree (Phase 3).
+    ///
+    /// Pre-validates the entire subtree before tombstoning anything:
+    /// every node must pass the same `ForkInUse` + `ForkInflightTx`
+    /// checks `drop_fork` applies for a single node. On any blocker
+    /// the call errors with [`UniError::ForkSubtreeInUse`] and no
+    /// branch is deleted. Once validation passes, the cascade drops
+    /// each node deepest-first via the single-fork `drop_fork` path,
+    /// so a crash mid-cascade resumes cleanly through existing
+    /// tombstone recovery.
+    ///
+    /// # Errors
+    ///
+    /// - [`UniError::ForkNotFound`] if `name` is unknown.
+    /// - [`UniError::ForkSubtreeInUse`] if any node in the subtree has
+    ///   live sessions or open transactions.
+    pub async fn drop_fork_cascade(&self, name: &str) -> Result<()> {
+        // 1. Resolve the root and walk descendants depth-first.
+        let root = self.inner.fork_registry.get(name).await?;
+        let mut order: Vec<uni_common::core::fork::ForkInfo> = Vec::new();
+        let mut stack = vec![root.clone()];
+        while let Some(node) = stack.pop() {
+            let kids = self.inner.fork_registry.list_children(node.id).await;
+            for k in &kids {
+                stack.push(k.clone());
+            }
+            order.push(node);
+        }
+        // `order` is roots-first by construction. Reversing it yields
+        // deepest-first, which is the order we drop in.
+        order.reverse();
+
+        // 2. Pre-validate every node. Aggregate blockers; refuse before
+        // tombstoning if any node is held or has in-flight tx.
+        let mut blockers: Vec<String> = Vec::new();
+        for node in &order {
+            if let Some(weak) = self
+                .inner
+                .fork_inners
+                .get(&node.id)
+                .map(|e| e.value().clone())
+                && let Some(inner) = weak.upgrade()
+                && inner.inflight_tx_count.load(Ordering::Acquire) > 0
+            {
+                blockers.push(format!("{}: in-flight tx", node.name));
+                continue;
+            }
+            let holders = self
+                .inner
+                .fork_registry
+                .holder_count_for(node.id)
+                .await;
+            if holders > 0 {
+                blockers.push(format!("{}: {} live session(s)", node.name, holders));
+            }
+        }
+        if !blockers.is_empty() {
+            return Err(UniError::ForkSubtreeInUse { blockers });
+        }
+
+        // 3. Drop deepest-first using the single-fork path. Each call
+        // re-checks holders/inflight inside `drop_fork`, which is
+        // belt-and-braces against a session opening between validation
+        // and drop; that race surfaces as a normal ForkInUse error.
+        for node in order {
+            self.drop_fork(&node.name).await?;
+        }
         Ok(())
     }
 

@@ -117,6 +117,16 @@ impl ForkScope {
         self.fork_info.clone()
     }
 
+    /// Parent fork id (Phase 3). `None` ⇒ parent is primary.
+    ///
+    /// Used by `UniInner::at_fork` to walk the ancestor chain for
+    /// overlay composition, and by `BranchedBackend` to route
+    /// on-the-fly dataset creation through the parent's branch.
+    #[must_use]
+    pub fn parent_fork_id(&self) -> Option<ForkId> {
+        self.fork_info.parent_fork_id
+    }
+
     /// Schema delta to merge on top of primary's schema. Returns a
     /// snapshot of the current overlay; subsequent
     /// [`Self::add_label_to_overlay`] calls will not affect the

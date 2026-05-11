@@ -1,6 +1,6 @@
 ---
 title: Forks
-status: phase-2
+status: phase-3
 ---
 
 # Forks
@@ -11,13 +11,12 @@ Forks are a sibling of [snapshots](snapshots-time-travel.md). Where a snapshot i
 
 ## Status
 
-Phase 2: **writable forks**. `forked.tx().execute(...).commit()` lands mutations on the fork's Lance branches without touching primary. New labels and edge types created on a fork stay fork-local; primary's schema is unchanged.
+Phase 3: **writable + nested forks**. `forked.tx().execute(...).commit()` lands mutations on the fork's Lance branches without touching primary. New labels and edge types created on a fork stay fork-local. `forked.fork(name)` is now a first-class operation — the child branches off the parent fork's tip, and reads chain through Lance `base_paths` to every ancestor up to primary.
 
 Later phases land:
 
-- **Phase 3** — nested forks (`forked.fork(name)`).
 - **Phase 4** — TTL, tags, watch filtering, hooks, params, version pinning on a forked session.
-- **Phase 5** — fork-local index fusion.
+- **Phase 5** — fork-local index fusion + fork compaction.
 - **Phase 6** — diff and promotion.
 
 ## Quick start
@@ -72,7 +71,9 @@ assert_eq!(
 |---|---|
 | `Uni::list_forks()` | All Active forks. |
 | `Uni::fork_info(name)` | Metadata for a single fork. |
-| `Uni::drop_fork(name)` | Full 2PC drop. |
+| `Uni::drop_fork(name)` | Full 2PC drop. Errors with `ForkHasChildren` while nested children exist. |
+| `Uni::drop_fork_cascade(name)` | Drop the fork and every descendant; pre-validates the subtree for live sessions / open transactions and surfaces `ForkSubtreeInUse` on any blocker before tombstoning anything. |
+| `Session::flush()` | Flush the session's writer to L1. On a forked session this flushes the fork's L0 to its Lance branches. Phase 3 auto-flushes a parent fork during nested-fork creation, so most users never call this directly. |
 
 ### Fork-local schema additions
 
@@ -104,6 +105,41 @@ All fork-related errors are `UniError::Fork*` variants — `ForkNotFound`, `Fork
 `ForkInflightTx` fires when `drop_fork` is called while at least one `Transaction` is alive on the fork. Commit or roll back the transaction first, then retry the drop.
 
 `ForkWritesNotYetSupported` is retired in Phase 2 — `forked.tx()` is now writable.
+
+Phase 3 adds:
+
+- `ForkHasChildren { name, children }` — `drop_fork` refused because nested children exist. Drop them first or use `drop_fork_cascade`.
+- `ForkSubtreeInUse { blockers }` — `drop_fork_cascade` refused because at least one node in the subtree has live sessions or in-flight transactions. No branch is deleted; resolve the blockers and retry.
+
+## Nested forks (Phase 3)
+
+`session.fork(name)` always parents the new fork on the *receiver* session — primary if the receiver is a primary session, the receiver's fork otherwise.
+
+```rust
+let primary = db.session();
+let a = primary.fork("scenario_a").await?;
+let tx = a.tx().await?;
+tx.execute("CREATE (:Person {name: 'A-only'})").await?;
+tx.commit().await?;
+
+// Fork the fork. b's parent is a.
+let b = a.fork("scenario_b").await?;
+let tx = b.tx().await?;
+tx.execute("CREATE (:Person {name: 'B-only'})").await?;
+tx.commit().await?;
+
+// b sees primary's rows + a's writes (snapshot at b's creation) + its own.
+// a sees primary's rows + its own — not b's writes.
+// primary sees only its own rows.
+```
+
+**Read resolution.** A leaf-fork read chains through Lance `base_paths` from the leaf's branch up through every ancestor branch to main. Lance handles this transparently — the depth cost is one extra commit lookup per level. The Phase 3 perf-sanity test asserts depth-5 latency within 5× depth-1 latency on the same query.
+
+**Snapshot isolation at every level.** Writes on an ancestor *after* a descendant was created stay invisible to the descendant. Writes on a descendant never leak up. Sibling forks under the same parent are mutually isolated.
+
+**Drop semantics.** `drop_fork(name)` errors with `ForkHasChildren` while any descendant exists, listing the immediate children. `drop_fork_cascade(name)` walks the subtree, pre-validates every node for live sessions and open transactions, and only then drops deepest-first via the single-fork path. A crash mid-cascade resumes through the existing tombstone recovery — partial cascade state is safe.
+
+**Non-goals in Phase 3.** Hypothesis persistence (ASSUME-style snapshots) is *not* part of this. Re-parenting a fork is not supported and not planned. Cross-fork diff at depth > 1 lands in Phase 6.
 
 ## Snapshot vs Fork
 

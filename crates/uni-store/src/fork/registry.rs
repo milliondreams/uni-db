@@ -185,6 +185,39 @@ impl ForkRegistryHandle {
             .collect()
     }
 
+    /// Direct children of `parent_id` (Phase 3, nested forks).
+    ///
+    /// Returns every registry entry whose `parent_fork_id == Some(parent_id)`
+    /// regardless of status — `Uni::drop_fork` and `drop_fork_cascade` need
+    /// to see `Pending` and `Tombstoned` entries too so they don't let a
+    /// half-created or half-dropped child slip through the guard.
+    pub async fn list_children(&self, parent_id: ForkId) -> Vec<ForkInfo> {
+        let cache = self.inner.cache.lock().await;
+        cache
+            .forks
+            .values()
+            .filter(|f| f.parent_fork_id == Some(parent_id))
+            .cloned()
+            .collect()
+    }
+
+    /// Look up a fork by id.
+    ///
+    /// # Errors
+    ///
+    /// [`UniError::ForkNotFound`] if no fork has this id.
+    pub async fn get_by_id(&self, id: ForkId) -> Result<ForkInfo, UniError> {
+        let cache = self.inner.cache.lock().await;
+        cache
+            .forks
+            .values()
+            .find(|f| f.id == id)
+            .cloned()
+            .ok_or_else(|| UniError::ForkNotFound {
+                name: id.to_string(),
+            })
+    }
+
     /// Look up a fork by name.
     ///
     /// # Errors
@@ -224,6 +257,11 @@ impl ForkRegistryHandle {
             .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
             .clone();
         ForkHolderGuard::new(counter)
+    }
+
+    /// Public holder count for `fork_id` (Phase 3 — cascade pre-validation).
+    pub async fn holder_count_for(&self, fork_id: ForkId) -> usize {
+        self.holder_count(fork_id)
     }
 
     fn holder_count(&self, fork_id: ForkId) -> usize {

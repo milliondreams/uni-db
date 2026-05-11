@@ -168,6 +168,19 @@ pub enum UniError {
     #[error("Fork registry is corrupt: {message}")]
     ForkCorruptRegistry { message: String },
 
+    /// Drop refused because this fork has nested children. Use
+    /// `drop_fork_cascade` to remove the whole subtree, or drop the
+    /// children individually first.
+    #[error("Fork '{name}' has nested children {children:?}; use drop_fork_cascade or drop them first")]
+    ForkHasChildren { name: String, children: Vec<String> },
+
+    /// `drop_fork_cascade` refused because at least one fork in the
+    /// subtree has live sessions or in-flight transactions. No branch
+    /// has been deleted yet — the cascade is atomic at the validation
+    /// step. Resolve the blockers and retry.
+    #[error("Fork subtree cannot be dropped: {blockers:?}")]
+    ForkSubtreeInUse { blockers: Vec<String> },
+
     /// 2PC step on a fork lifecycle operation failed.
     ///
     /// `stage` names the step (`registry_pending`, `create_branch`,

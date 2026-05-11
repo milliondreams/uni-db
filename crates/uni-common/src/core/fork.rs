@@ -207,6 +207,54 @@ impl SchemaDelta {
             && self.added_edge_types.is_empty()
             && self.added_properties.is_empty()
     }
+
+    /// Compose `self` atop `base`: returns `base ⊕ self`.
+    ///
+    /// Phase 3 (nested forks): the effective schema for a child fork is
+    /// `primary ⊕ parent_overlay ⊕ child_overlay`. This helper folds the
+    /// chain bottom-up so the final result can be merged into primary
+    /// in a single [`crate::core::schema::SchemaManager::with_overlay`]
+    /// call.
+    ///
+    /// Collision policy: `self` wins. A child fork that re-declares the
+    /// same label or edge type as its parent overrides the parent's
+    /// entry. Property additions are deduplicated by `(owner, property)`,
+    /// with `self`'s entry winning.
+    #[must_use]
+    pub fn merge_atop(&self, base: &SchemaDelta) -> SchemaDelta {
+        use std::collections::BTreeMap;
+
+        // Labels: base first, then self overrides.
+        let mut labels: BTreeMap<String, LabelMeta> = BTreeMap::new();
+        for (name, meta) in &base.added_labels {
+            labels.insert(name.clone(), meta.clone());
+        }
+        for (name, meta) in &self.added_labels {
+            labels.insert(name.clone(), meta.clone());
+        }
+
+        let mut edge_types: BTreeMap<String, EdgeTypeMeta> = BTreeMap::new();
+        for (name, meta) in &base.added_edge_types {
+            edge_types.insert(name.clone(), meta.clone());
+        }
+        for (name, meta) in &self.added_edge_types {
+            edge_types.insert(name.clone(), meta.clone());
+        }
+
+        let mut properties: BTreeMap<(String, String), PropertyAddition> = BTreeMap::new();
+        for add in &base.added_properties {
+            properties.insert((add.owner.clone(), add.property.clone()), add.clone());
+        }
+        for add in &self.added_properties {
+            properties.insert((add.owner.clone(), add.property.clone()), add.clone());
+        }
+
+        SchemaDelta {
+            added_labels: labels.into_iter().collect(),
+            added_edge_types: edge_types.into_iter().collect(),
+            added_properties: properties.into_values().collect(),
+        }
+    }
 }
 
 /// Top-level on-disk shape of `catalog/fork_registry.json`.
@@ -259,5 +307,120 @@ mod tests {
     fn schema_delta_default_is_empty() {
         let d = SchemaDelta::default();
         assert!(d.is_empty());
+    }
+
+    fn label_meta(id: u16) -> LabelMeta {
+        use crate::core::schema::SchemaElementState;
+        LabelMeta {
+            id,
+            created_at: chrono::Utc::now(),
+            state: SchemaElementState::Active,
+            description: None,
+        }
+    }
+
+    fn edge_type_meta(id: u32) -> EdgeTypeMeta {
+        use crate::core::schema::SchemaElementState;
+        EdgeTypeMeta {
+            id,
+            src_labels: vec!["A".into()],
+            dst_labels: vec!["A".into()],
+            state: SchemaElementState::Active,
+            description: None,
+        }
+    }
+
+    #[test]
+    fn merge_atop_unions_disjoint_labels_and_edge_types() {
+        let base = SchemaDelta {
+            added_labels: vec![("A".into(), label_meta(1))],
+            added_edge_types: vec![("E1".into(), edge_type_meta(10))],
+            ..Default::default()
+        };
+        let top = SchemaDelta {
+            added_labels: vec![("B".into(), label_meta(2))],
+            added_edge_types: vec![("E2".into(), edge_type_meta(20))],
+            ..Default::default()
+        };
+        let merged = top.merge_atop(&base);
+        let label_names: Vec<&str> =
+            merged.added_labels.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(label_names.contains(&"A") && label_names.contains(&"B"));
+        let edge_names: Vec<&str> = merged
+            .added_edge_types
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect();
+        assert!(edge_names.contains(&"E1") && edge_names.contains(&"E2"));
+    }
+
+    #[test]
+    fn merge_atop_self_wins_on_collision() {
+        let base = SchemaDelta {
+            added_labels: vec![("A".into(), label_meta(100))],
+            ..Default::default()
+        };
+        let top = SchemaDelta {
+            added_labels: vec![("A".into(), label_meta(200))],
+            ..Default::default()
+        };
+        let merged = top.merge_atop(&base);
+        assert_eq!(merged.added_labels.len(), 1);
+        assert_eq!(merged.added_labels[0].1.id, 200, "self must win");
+    }
+
+    #[test]
+    fn merge_atop_empty_base_is_self() {
+        let top = SchemaDelta {
+            added_labels: vec![("A".into(), label_meta(1))],
+            ..Default::default()
+        };
+        let merged = top.merge_atop(&SchemaDelta::empty());
+        assert_eq!(merged.added_labels.len(), 1);
+        assert_eq!(merged.added_labels[0].0, "A");
+    }
+
+    #[test]
+    fn merge_atop_empty_self_is_base() {
+        let base = SchemaDelta {
+            added_labels: vec![("A".into(), label_meta(1))],
+            ..Default::default()
+        };
+        let merged = SchemaDelta::empty().merge_atop(&base);
+        assert_eq!(merged.added_labels.len(), 1);
+        assert_eq!(merged.added_labels[0].0, "A");
+    }
+
+    #[test]
+    fn merge_atop_dedupes_properties_by_owner_and_name() {
+        let base_add = PropertyAddition {
+            owner: "Person".into(),
+            owner_kind: PropertyOwnerKind::Label,
+            property: "age".into(),
+            data_type: DataType::Int64,
+            nullable: true,
+        };
+        let top_add = PropertyAddition {
+            owner: "Person".into(),
+            owner_kind: PropertyOwnerKind::Label,
+            property: "age".into(),
+            data_type: DataType::String, // self wins; type differs.
+            nullable: false,
+        };
+        let base = SchemaDelta {
+            added_properties: vec![base_add],
+            ..Default::default()
+        };
+        let top = SchemaDelta {
+            added_properties: vec![top_add],
+            ..Default::default()
+        };
+        let merged = top.merge_atop(&base);
+        assert_eq!(merged.added_properties.len(), 1);
+        assert!(matches!(
+            merged.added_properties[0].data_type,
+            DataType::String
+        ));
+        assert!(!merged.added_properties[0].nullable);
     }
 }

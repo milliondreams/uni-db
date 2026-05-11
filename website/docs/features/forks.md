@@ -1,6 +1,6 @@
 ---
 title: Forks
-status: phase-3
+status: phase-4a
 ---
 
 # Forks
@@ -11,11 +11,11 @@ Forks are a sibling of [snapshots](snapshots-time-travel.md). Where a snapshot i
 
 ## Status
 
-Phase 3: **writable + nested forks**. `forked.tx().execute(...).commit()` lands mutations on the fork's Lance branches without touching primary. New labels and edge types created on a fork stay fork-local. `forked.fork(name)` is now a first-class operation — the child branches off the parent fork's tip, and reads chain through Lance `base_paths` to every ancestor up to primary.
+Phase 4a: **writable + nested + lifecycle**. Forks are writable (Phase 2), nestable (Phase 3), and now carry TTL, budget, Lance tags, parent→child cancellation, and pin/refresh on forked sessions (Phase 4a). Python bindings are pending (Phase 4b).
 
 Later phases land:
 
-- **Phase 4** — TTL, tags, watch filtering, hooks, params, version pinning on a forked session.
+- **Phase 4b** — Python bindings for the full fork surface.
 - **Phase 5** — fork-local index fusion + fork compaction.
 - **Phase 6** — diff and promotion.
 
@@ -172,6 +172,53 @@ On disk:
 - **Same-name fork sessions share a writer.** Two `session.fork("x")` calls on the same name resolve to the same `UniInner` (cached as `Weak<UniInner>` so the cache never extends a session's lifetime). A commit on session A is immediately visible to session B's reads — no flush required.
 - **Multiple sessions can hold the same fork.** A holder count is tracked and `drop_fork` refuses with `ForkInUse` while sessions are alive, or with `ForkInflightTx` when an open transaction has yet to commit or roll back.
 - **Lance compaction honors branch references.** Primary GC will not reclaim fragments that a live fork still references.
+
+## Lifecycle admin (Phase 4a)
+
+**TTL.** Stamp a wall-clock expiry on the fork; a background sweeper reaps expired forks via `drop_fork_cascade`.
+
+```rust
+let fork = session
+    .fork("ephemeral")
+    .ttl(std::time::Duration::from_secs(3600))
+    .await?;
+```
+
+`UniConfig::fork_default_ttl` is the fallback when the builder doesn't specify a TTL. The sweeper polls every `UniConfig::fork_sweeper_interval` (default 60s); set `UniConfig::disable_fork_sweeper = true` in tests that race against TTL.
+
+**Budget.** Cap total fork count to bound operational footprint:
+
+```rust
+let cfg = UniConfig { max_forks: Some(100), ..UniConfig::default() };
+```
+
+Hitting the cap surfaces `ForkBudgetExceeded { current, max }`. Counts include `Active + Pending + Tombstoned` so create/drop churn cannot slip past while tombstones await recovery.
+
+**Tags.** Pin a Lance tag to the fork's current branch tip per dataset. Tagged versions are GC-exempt — they survive Lance compaction *and* fork drops, which makes a tag-then-drop sequence safe for audit retention:
+
+```rust
+db.tag_fork("audit-fork", "2026-q1-close").await?;
+let tags = db.list_fork_tags("audit-fork").await?;
+db.drop_fork("audit-fork").await?;   // branches go; tagged versions remain
+db.untag_fork("audit-fork", "2026-q1-close").await?;  // idempotent
+```
+
+The on-disk tag is `fork_{tag}_{dataset}`. `list_fork_tags` returns the deduplicated user-visible tag names.
+
+**Cancellation.** Forked sessions inherit a child cancellation token from their parent. Cancelling a parent cascades to every descendant; cancelling a child does not affect the parent. Each level is independent of its siblings:
+
+```rust
+let primary = db.session();
+let a = primary.fork("a").await?;
+let b = a.fork("b").await?;
+let b_token = b.cancellation_token();  // capture BEFORE cancelling
+primary.cancel();
+assert!(b_token.is_cancelled());        // cascade reached the grandchild
+```
+
+`Session::cancel()` cancels the currently-held token and replaces it with a fresh one — capture token clones before calling cancel if you want to observe propagation in tests.
+
+**Pin on forked sessions.** Pin a forked session to a snapshot the same way as a primary session. Reads route through the fork's branches at the pinned version; writes return `UniError::ReadOnly` while pinned. `refresh()` unpins.
 
 ## Operational signals
 

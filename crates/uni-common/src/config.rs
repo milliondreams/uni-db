@@ -472,6 +472,28 @@ pub struct UniConfig {
     /// forks accumulate fragments because fork compaction is deferred to
     /// Phase 5; this surfaces the risk operationally. Default: 256.
     pub fork_fragment_warn_threshold: usize,
+
+    /// Phase 4a: cap on total fork count (Active + Pending + Tombstoned).
+    /// `None` = unbounded. When set, `Session::fork(name).await` errors
+    /// with `UniError::ForkBudgetExceeded` once the cap is reached.
+    /// Tombstoned forks count because they still hold branch state on
+    /// disk until recovery completes; counting them prevents churn-thrash.
+    pub max_forks: Option<usize>,
+
+    /// Phase 4a: default TTL applied to forks when the user does not
+    /// supply one via `session.fork(name).ttl(...)`. `None` = no TTL.
+    /// The background sweeper drops forks whose `ttl_expires_at` is in
+    /// the past via `drop_fork_cascade`.
+    pub fork_default_ttl: Option<Duration>,
+
+    /// Phase 4a: how often the background TTL sweeper polls the
+    /// registry for expired forks. Default: 60 seconds.
+    pub fork_sweeper_interval: Duration,
+
+    /// Phase 4a: skip spawning the TTL sweeper. Tests should set this
+    /// to `true` when they want deterministic control over fork
+    /// lifetimes; production should leave it `false`.
+    pub disable_fork_sweeper: bool,
 }
 
 impl Default for UniConfig {
@@ -502,6 +524,10 @@ impl Default for UniConfig {
             index_rebuild: IndexRebuildConfig::default(),
             strict_schema: false,
             fork_fragment_warn_threshold: 256,
+            max_forks: None,
+            fork_default_ttl: None,
+            fork_sweeper_interval: Duration::from_secs(60),
+            disable_fork_sweeper: false,
         }
     }
 }

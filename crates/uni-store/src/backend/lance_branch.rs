@@ -224,6 +224,75 @@ fn inject_fault_delete_branch() -> Result<()> {
     Ok(())
 }
 
+/// Create a Lance tag pinning `branch`'s current tip (Phase 4a).
+///
+/// Tags are GC-exempt references — Lance's compaction retention sweep
+/// preserves any version referenced by an active tag. This is what
+/// lets `Uni::tag_fork` keep a fork's state on disk after the fork
+/// itself is dropped (e.g. for audit / regulatory hold).
+///
+/// The reference resolved at creation time is the branch's current
+/// version: subsequent writes on the branch do not "follow" the tag.
+///
+/// # Errors
+///
+/// - The dataset or `branch` cannot be opened.
+/// - A tag named `tag` already exists (Lance returns `RefConflict`).
+/// - Object-store IO fails.
+pub async fn create_tag(uri: &str, tag: &str, branch: &str) -> Result<()> {
+    let on_branch = open_branch(uri, branch).await?;
+    let version = on_branch.version().version;
+    let dataset = open_dataset(uri).await?;
+    dataset
+        .tags()
+        .create(tag, (branch, version))
+        .await
+        .with_context(|| format!("create tag {tag} on {uri} -> {branch}@v{version}"))?;
+    Ok(())
+}
+
+/// Delete a Lance tag (Phase 4a). Idempotent: a missing tag is treated
+/// as success so callers don't have to special-case re-runs.
+///
+/// # Errors
+///
+/// Object-store IO failures unrelated to the missing-tag case.
+pub async fn delete_tag(uri: &str, tag: &str) -> Result<()> {
+    let dataset = open_dataset(uri).await?;
+    let existing = dataset
+        .tags()
+        .list()
+        .await
+        .with_context(|| format!("list tags on {uri}"))?;
+    if !existing.contains_key(tag) {
+        return Ok(());
+    }
+    dataset
+        .tags()
+        .delete(tag)
+        .await
+        .with_context(|| format!("delete tag {tag} on {uri}"))
+}
+
+/// List all tags on the dataset, returning `(name, pinned_version)`
+/// pairs (Phase 4a).
+///
+/// # Errors
+///
+/// Object-store IO failures.
+pub async fn list_tags(uri: &str) -> Result<Vec<(String, u64)>> {
+    let dataset = open_dataset(uri).await?;
+    let map = dataset
+        .tags()
+        .list()
+        .await
+        .with_context(|| format!("list tags on {uri}"))?;
+    Ok(map
+        .into_iter()
+        .map(|(name, contents)| (name, contents.version))
+        .collect())
+}
+
 /// Delete a branch (idempotent under the recovery driver — uses force).
 ///
 /// Phase 1 fork-drop and recovery both call this. Force-delete handles
@@ -568,6 +637,65 @@ mod tests {
             on_l2_again.count_rows(None).await.unwrap(),
             5,
             "level2 must not see writes to level1 that happened after its creation"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_list_delete_tag_roundtrip() {
+        let (_dir, uri) = seed_dataset().await;
+        let v = current_version(&uri).await.unwrap();
+        create_branch(&uri, "to-tag", v).await.unwrap();
+
+        // Create
+        create_tag(&uri, "audit-2026", "to-tag").await.unwrap();
+
+        // List
+        let tags = list_tags(&uri).await.unwrap();
+        assert!(tags.iter().any(|(n, _)| n == "audit-2026"), "tags = {tags:?}");
+
+        // Delete idempotent
+        delete_tag(&uri, "audit-2026").await.unwrap();
+        let tags2 = list_tags(&uri).await.unwrap();
+        assert!(!tags2.iter().any(|(n, _)| n == "audit-2026"));
+
+        // Re-deleting a missing tag is a no-op.
+        delete_tag(&uri, "audit-2026").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_tag_pins_version_at_call_time() {
+        // Phase 4a contract: tag captures the branch's tip at create
+        // time and does not "follow" subsequent writes. This is what
+        // makes a tagged-then-dropped fork safe to retain on disk.
+        let (_dir, uri) = seed_dataset().await;
+        let v = current_version(&uri).await.unwrap();
+        create_branch(&uri, "snap-branch", v).await.unwrap();
+
+        // Append a row before tagging.
+        let batch = test_batch(vec![10], vec![1000]);
+        let reader = arrow_array::RecordBatchIterator::new(
+            vec![Ok(batch)].into_iter(),
+            test_schema(),
+        );
+        write_to_branch(&uri, "snap-branch", reader).await.unwrap();
+
+        create_tag(&uri, "v1", "snap-branch").await.unwrap();
+        let tags = list_tags(&uri).await.unwrap();
+        let (_, pinned_v) = tags.iter().find(|(n, _)| n == "v1").unwrap();
+
+        // Append more after tagging; the tag's pinned version must not move.
+        let batch2 = test_batch(vec![11], vec![1100]);
+        let reader2 = arrow_array::RecordBatchIterator::new(
+            vec![Ok(batch2)].into_iter(),
+            test_schema(),
+        );
+        write_to_branch(&uri, "snap-branch", reader2).await.unwrap();
+
+        let tags_after = list_tags(&uri).await.unwrap();
+        let (_, pinned_after) = tags_after.iter().find(|(n, _)| n == "v1").unwrap();
+        assert_eq!(
+            pinned_v, pinned_after,
+            "tag must pin to fork-time version, not follow branch tip"
         );
     }
 

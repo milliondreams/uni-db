@@ -1,6 +1,6 @@
 # Forks
 
-Named, durable, isolated branches of the graph. Phase 3: writable + nested.
+Named, durable, isolated branches of the graph. Phase 4a: writable + nested + lifecycle (TTL, tags, budget, cancellation, pin).
 
 ## Quick start
 
@@ -27,10 +27,15 @@ tx.commit().await?;
 | `Uni::drop_fork(name)` | Full 2PC drop. Errors with `ForkInUse` while sessions are alive, `ForkInflightTx` while a transaction is open on the fork, `ForkHasChildren` while nested children exist. |
 | `Uni::drop_fork_cascade(name)` | Drop the fork and every descendant. Pre-validates the whole subtree (every node must satisfy the `ForkInUse`/`ForkInflightTx` checks); errors with `ForkSubtreeInUse` before tombstoning anything. Drops deepest-first; crash mid-cascade resumes via tombstone recovery. |
 | `Session::flush()` | Flush the session's writer to L1. On a forked session this flushes the fork's L0 to its Lance branches. Phase 3 auto-flushes a parent fork during nested-fork creation, but `Session::flush()` is the explicit knob when you need it. |
+| `Session::fork(name).ttl(Duration)` | Phase 4a. Set a wall-clock TTL on the fork; the background sweeper drops it via cascade once expired. Has no effect when the fork already exists. |
+| `Uni::tag_fork(name, tag)` | Phase 4a. Tag a fork's branches with a Lance tag pinned to the current version. Tagged refs are GC-exempt — they survive Lance compaction *and* fork drops, which makes a tag-then-drop sequence safe for audit retention. |
+| `Uni::untag_fork(name, tag)` | Phase 4a. Idempotent — missing tags are no-ops. |
+| `Uni::list_fork_tags(name)` | Phase 4a. Returns the unique tag names applied to this fork. |
+| `Session::pin_to_version(snapshot_id)` / `pin_to_timestamp(ts)` / `refresh()` | Phase 4a now works on forked sessions. Pinned forked sessions read through the fork's branches at the pinned version; writes return `ReadOnly`. |
 
 ## Errors
 
-`UniError::Fork*`: `ForkNotFound`, `ForkAlreadyExists`, `ForkInUse { name, holder_count }`, `ForkInflightTx { name }`, `ForkHasChildren { name, children }`, `ForkSubtreeInUse { blockers }`, `ForkCorruptRegistry`, `ForkLifecycle { name, stage, source }`.
+`UniError::Fork*`: `ForkNotFound`, `ForkAlreadyExists`, `ForkInUse { name, holder_count }`, `ForkInflightTx { name }`, `ForkHasChildren { name, children }`, `ForkSubtreeInUse { blockers }`, `ForkBudgetExceeded { current, max }`, `ForkCorruptRegistry`, `ForkLifecycle { name, stage, source }`.
 
 ## What sibling sessions on the same fork see
 
@@ -97,9 +102,21 @@ Drop semantics:
 - `drop_fork(parent)` errors with `ForkHasChildren` while any descendant exists.
 - `drop_fork_cascade(root)` removes the whole subtree. Pre-validates every node for `ForkInUse`/`ForkInflightTx` before tombstoning; on any blocker errors with `ForkSubtreeInUse` *and no branch is deleted*.
 
-## What's not in Phase 3
+## Lifecycle admin (Phase 4a)
 
-- TTL, tags, watch filtering, hooks/params propagation — Phase 4.
+**TTL.** `session.fork("ephemeral").ttl(Duration::from_secs(3600)).await?` stamps a wall-clock expiry on the fork. The background sweeper polls every `UniConfig::fork_sweeper_interval` (default 60s) and drops expired forks via `drop_fork_cascade`. `UniConfig::fork_default_ttl` is the fallback when the builder doesn't specify one. Set `UniConfig::disable_fork_sweeper = true` in tests that race against TTL.
+
+**Budget.** `UniConfig::max_forks: Option<usize>` caps total fork count (Active + Pending + Tombstoned). Hitting the cap surfaces `ForkBudgetExceeded { current, max }`. Tombstoned forks count because they still hold branch state on disk until recovery completes.
+
+**Tags.** `db.tag_fork(name, "audit-2026-q1").await?` creates one Lance tag per dataset, namespaced `fork_{tag}_{dataset}`, pinned to the branch's current version. Tags are GC-exempt — a tagged-then-dropped fork's state remains on disk for audit retention. `db.list_fork_tags(name)` returns the deduplicated user-visible tag names; `db.untag_fork(name, tag)` is idempotent.
+
+**Cancellation.** Forked sessions hold `parent_token.child_token()`. Cancelling a parent session cascades to every descendant; cancelling a child does not affect the parent. `Session::cancel()` cancels the currently-held token and replaces it with a fresh one — tests asserting propagation must capture token clones BEFORE calling cancel.
+
+**Pin on forked sessions.** `Session::pin_to_version`, `pin_to_timestamp`, `refresh`, `is_pinned` all work on forked sessions in Phase 4a. The pinned manager preserves `fork_scope` so reads still route through the fork's branches at the pinned version; writes return `UniError::ReadOnly` while pinned.
+
+## What's not in Phase 4a
+
+- Python bindings — Phase 4b.
 - Fork-local index fusion — Phase 5.
 - Diff and promotion — Phase 6.
 - Property additions through `fork_schema()` (label/edge-type only for now; `SchemaDelta::added_properties` is reserved for a follow-up).

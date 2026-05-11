@@ -15,6 +15,7 @@ pub mod bulk;
 pub mod compaction;
 pub mod fork;
 pub mod fork_schema;
+pub(crate) mod fork_sweeper;
 pub mod functions;
 pub mod hooks;
 pub mod impl_locy;
@@ -638,6 +639,114 @@ impl Uni {
             self.drop_fork(&node.name).await?;
         }
         Ok(())
+    }
+
+    /// Tag a fork with a Lance tag (Phase 4a).
+    ///
+    /// Creates one tag per dataset the fork has branched, named
+    /// `fork_{tag}_{dataset}`. Lance tags are GC-exempt — the tagged
+    /// versions survive compaction's retention sweep — so a tagged
+    /// fork's state is preserved on disk even after the fork itself
+    /// is dropped (cascade or otherwise). Useful for audit hold,
+    /// regulatory snapshots, or named pre-publish checkpoints.
+    ///
+    /// The tag pins the branch's *current* version: subsequent fork
+    /// writes do not "follow" the tag.
+    ///
+    /// # Errors
+    ///
+    /// - [`UniError::ForkNotFound`] if the fork is unknown.
+    /// - [`UniError::ForkLifecycle`] (stage = `tag`) on Lance failures
+    ///   (tag-name conflict, IO).
+    pub async fn tag_fork(&self, fork_name: &str, tag: &str) -> Result<()> {
+        let info = self.inner.fork_registry.get(fork_name).await?;
+        let storage_uri = self.inner.storage.base_uri().to_string();
+        for (dataset, branch) in &info.datasets {
+            let dataset_uri = if storage_uri.ends_with('/') {
+                format!("{storage_uri}{dataset}.lance")
+            } else {
+                format!("{storage_uri}/{dataset}.lance")
+            };
+            let lance_tag = format!("fork_{tag}_{dataset}");
+            uni_store::backend::lance_branch::create_tag(&dataset_uri, &lance_tag, branch)
+                .await
+                .map_err(|e| UniError::ForkLifecycle {
+                    name: fork_name.to_string(),
+                    stage: "tag",
+                    source: e.into(),
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Remove a tag previously applied via [`Self::tag_fork`] (Phase 4a).
+    /// Idempotent per dataset — missing tags are treated as success so
+    /// partial cleanup retries are safe.
+    ///
+    /// # Errors
+    ///
+    /// - [`UniError::ForkNotFound`] if the fork is unknown.
+    /// - [`UniError::ForkLifecycle`] (stage = `untag`) on Lance failures.
+    pub async fn untag_fork(&self, fork_name: &str, tag: &str) -> Result<()> {
+        let info = self.inner.fork_registry.get(fork_name).await?;
+        let storage_uri = self.inner.storage.base_uri().to_string();
+        for dataset in info.datasets.keys() {
+            let dataset_uri = if storage_uri.ends_with('/') {
+                format!("{storage_uri}{dataset}.lance")
+            } else {
+                format!("{storage_uri}/{dataset}.lance")
+            };
+            let lance_tag = format!("fork_{tag}_{dataset}");
+            uni_store::backend::lance_branch::delete_tag(&dataset_uri, &lance_tag)
+                .await
+                .map_err(|e| UniError::ForkLifecycle {
+                    name: fork_name.to_string(),
+                    stage: "untag",
+                    source: e.into(),
+                })?;
+        }
+        Ok(())
+    }
+
+    /// List the unique tag names applied to this fork (Phase 4a).
+    ///
+    /// A fork's tag is stored as one Lance tag per dataset under the
+    /// namespace `fork_{tag}_{dataset}`. This method enumerates the
+    /// distinct `tag` values present on at least one of the fork's
+    /// branched datasets.
+    ///
+    /// # Errors
+    ///
+    /// - [`UniError::ForkNotFound`] if the fork is unknown.
+    /// - [`UniError::ForkLifecycle`] (stage = `list_tags`) on Lance failures.
+    pub async fn list_fork_tags(&self, fork_name: &str) -> Result<Vec<String>> {
+        let info = self.inner.fork_registry.get(fork_name).await?;
+        let storage_uri = self.inner.storage.base_uri().to_string();
+        let mut tags: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for dataset in info.datasets.keys() {
+            let dataset_uri = if storage_uri.ends_with('/') {
+                format!("{storage_uri}{dataset}.lance")
+            } else {
+                format!("{storage_uri}/{dataset}.lance")
+            };
+            let suffix = format!("_{dataset}");
+            let prefix = "fork_";
+            let on_disk = uni_store::backend::lance_branch::list_tags(&dataset_uri)
+                .await
+                .map_err(|e| UniError::ForkLifecycle {
+                    name: fork_name.to_string(),
+                    stage: "list_tags",
+                    source: e.into(),
+                })?;
+            for (name, _) in on_disk {
+                if let Some(rest) = name.strip_prefix(prefix)
+                    && let Some(tag) = rest.strip_suffix(&suffix)
+                {
+                    tags.insert(tag.to_string());
+                }
+            }
+        }
+        Ok(tags.into_iter().collect())
     }
 
     /// Create a session template builder for pre-configured session factories.
@@ -1776,6 +1885,8 @@ impl UniBuilder {
                     other => UniError::Internal(anyhow::anyhow!(other.to_string())),
                 })?,
         );
+        // Phase 4a: apply the configured fork budget cap.
+        fork_registry.set_max_forks(self.config.max_forks).await;
         let storage_uri_for_recovery = storage_uri.clone();
         let recovered = uni_store::fork::recovery::recover_forks(
             &fork_registry,
@@ -1790,7 +1901,13 @@ impl UniBuilder {
             tracing::info!(reconciled = recovered, "fork registry recovery completed");
         }
 
-        Ok(Uni {
+        // Phase 4a: capture sweeper config + a shutdown subscription
+        // before the config is consumed into UniInner.
+        let sweeper_interval = self.config.fork_sweeper_interval;
+        let sweeper_disabled = self.config.disable_fork_sweeper;
+        let sweeper_shutdown_rx = shutdown_handle.subscribe();
+
+        let db = Uni {
             inner: Arc::new(UniInner {
                 storage,
                 schema: schema_manager,
@@ -1820,7 +1937,19 @@ impl UniBuilder {
                 cached_wal_lsn: AtomicU64::new(0),
                 _temp_dir: self.temp_dir,
             }),
-        })
+        };
+
+        // Phase 4a: spawn the TTL sweeper (no-op when disabled).
+        if let Some(handle) = fork_sweeper::spawn(
+            db.inner.clone(),
+            sweeper_interval,
+            sweeper_disabled,
+            sweeper_shutdown_rx,
+        ) {
+            db.inner.shutdown_handle.track_task(handle);
+        }
+
+        Ok(db)
     }
 
     /// Open the database (blocking)

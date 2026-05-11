@@ -330,6 +330,21 @@ impl Uni {
     /// recovery.
     pub async fn drop_fork_cascade(&self, name: &str) -> Result<()>;
 
+    /// Phase 4a: tag a fork with a Lance tag. The tag pins each of the
+    /// fork's branches at their current version and is GC-exempt, so a
+    /// tag-then-drop sequence safely retains the fork's state on disk
+    /// for audit or regulatory hold. Tag names are namespaced on disk
+    /// as `fork_{tag}_{dataset}`.
+    pub async fn tag_fork(&self, fork_name: &str, tag: &str) -> Result<()>;
+
+    /// Phase 4a: remove a tag previously applied via `tag_fork`.
+    /// Idempotent per dataset — missing tags are treated as success.
+    pub async fn untag_fork(&self, fork_name: &str, tag: &str) -> Result<()>;
+
+    /// Phase 4a: list the unique user-visible tag names applied to
+    /// this fork (with the `fork_*_{dataset}` namespace stripped).
+    pub async fn list_fork_tags(&self, fork_name: &str) -> Result<Vec<String>>;
+
     // ── Metrics & Config ──
 
     /// Get database-level metrics snapshot.
@@ -433,6 +448,11 @@ impl Session {
     /// The new fork's parent is inferred from `self`: forked session →
     /// nested child, primary session → child of primary.
     pub fn fork(&self, name: impl Into<String>) -> ForkBuilder<'_>;
+    // ForkBuilder is awaitable; chain `.new_()` to require fresh
+    // creation (errors with `ForkAlreadyExists` if the name is taken),
+    // or `.ttl(Duration)` to set a wall-clock TTL on the fork. The
+    // background sweeper drops expired forks via cascade. TTL applies
+    // only at create time; opening an existing fork ignores the value.
 
     /// `true` when this session was returned by `fork`.
     pub fn is_forked(&self) -> bool;
@@ -2594,6 +2614,11 @@ pub enum UniError {
     /// has been deleted yet; the cascade is atomic at the validation
     /// step. Resolve the blockers and retry.
     ForkSubtreeInUse { blockers: Vec<String> },
+    /// `Session::fork(name)` refused because `UniConfig::max_forks` is
+    /// at capacity. Counts include Active + Pending + Tombstoned. Drop
+    /// existing forks (or wait for the sweeper to reap expired ones)
+    /// and retry.
+    ForkBudgetExceeded { current: usize, max: usize },
     /// Registry on disk is malformed (corrupt JSON, missing field, etc.).
     ForkCorruptRegistry { message: String },
     /// 2PC step on a fork lifecycle operation failed; `stage` names the

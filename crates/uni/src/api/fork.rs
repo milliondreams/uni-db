@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use std::future::IntoFuture;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tracing::{debug, instrument};
 use uni_common::api::error::{Result, UniError};
@@ -33,6 +34,7 @@ pub struct ForkBuilder<'a> {
     parent: &'a Session,
     name: String,
     must_create: bool,
+    ttl: Option<Duration>,
 }
 
 impl<'a> ForkBuilder<'a> {
@@ -41,6 +43,7 @@ impl<'a> ForkBuilder<'a> {
             parent,
             name,
             must_create: false,
+            ttl: None,
         }
     }
 
@@ -51,6 +54,19 @@ impl<'a> ForkBuilder<'a> {
     #[must_use]
     pub fn new_(mut self) -> Self {
         self.must_create = true;
+        self
+    }
+
+    /// Phase 4a: set a wall-clock TTL on the fork. The background
+    /// sweeper drops the fork (cascade) once `Utc::now()` passes
+    /// `created_at + ttl`. Override of `UniConfig::fork_default_ttl`
+    /// for this fork only.
+    ///
+    /// Has no effect when the fork already exists (open-or-create
+    /// returns the existing entry, whose TTL was set at create time).
+    #[must_use]
+    pub fn ttl(mut self, ttl: Duration) -> Self {
+        self.ttl = Some(ttl);
         self
     }
 
@@ -105,7 +121,9 @@ impl<'a> ForkBuilder<'a> {
                 }
             }
             Err(UniError::ForkNotFound { .. }) => {
-                create_fork_2pc(parent, &registry, self.name.clone()).await?
+                // Resolve effective TTL: builder override > config default > None.
+                let effective_ttl = self.ttl.or(parent.db.config.fork_default_ttl);
+                create_fork_2pc(parent, &registry, self.name.clone(), effective_ttl).await?
             }
             Err(other) => return Err(other),
         };
@@ -146,7 +164,10 @@ impl<'a> ForkBuilder<'a> {
             }
         };
 
-        Ok(Session::new_forked(forked_inner_arc, scope))
+        // Phase 4a: link the new forked session's cancellation to the
+        // parent's so a parent cancel cascades to the child (spec §4.6).
+        let parent_token = parent.cancellation_token();
+        Ok(Session::new_forked(forked_inner_arc, scope, parent_token))
     }
 }
 
@@ -164,6 +185,7 @@ async fn create_fork_2pc(
     parent: &Session,
     registry: &Arc<ForkRegistryHandle>,
     name: String,
+    ttl: Option<Duration>,
 ) -> Result<ForkInfo> {
     // Phase 3: when the parent is a forked session, flush its L0 to
     // the fork's Lance branches before branching. Without this the
@@ -204,6 +226,13 @@ async fn create_fork_2pc(
     // Phase 3: record the parent fork id when this is a nested fork.
     // `parent_fork_id == None` ⇒ parent is primary.
     info.parent_fork_id = parent.fork_scope().map(|s| s.fork_id());
+    // Phase 4a: stamp TTL expiry at create time. The sweeper reads
+    // `ttl_expires_at` and drops once `Utc::now()` is past it.
+    if let Some(d) = ttl
+        && let Ok(chrono_d) = chrono::Duration::from_std(d)
+    {
+        info.ttl_expires_at = Some(chrono::Utc::now() + chrono_d);
+    }
 
     // Step 2: persist the Pending entry.
     registry.begin_create(info).await?;

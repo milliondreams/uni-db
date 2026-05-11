@@ -223,11 +223,13 @@ impl Session {
     ///   (which `UniInner::at_fork` already deep-cloned from primary)
     /// - plan_cache: fresh empty (storage layout differs from primary)
     /// - metrics: fresh
-    /// - cancellation_token: fresh; cross-session linkage to the
-    ///   parent's token is a Phase 4 concern (spec §4.6).
+    /// - cancellation_token: child of the parent's token (Phase 4a,
+    ///   spec §4.6). Cancelling the parent cascades to this fork;
+    ///   cancelling this fork does not affect the parent.
     pub(crate) fn new_forked(
         db: Arc<UniInner>,
         scope: Arc<uni_store::fork::ForkScope>,
+        parent_token: CancellationToken,
     ) -> Self {
         let session_registry = db
             .locy_rule_registry
@@ -235,6 +237,12 @@ impl Session {
             .unwrap()
             .clone();
         db.active_session_count.fetch_add(1, Ordering::Relaxed);
+
+        // Phase 4a: link cancellation to the parent via
+        // `CancellationToken::child_token()`. The child fires when the
+        // parent fires AND can be cancelled independently without
+        // affecting the parent — exactly the spec §4.6 contract.
+        let child_token = parent_token.child_token();
 
         Self {
             db,
@@ -246,7 +254,7 @@ impl Session {
             active_write_guard: Arc::new(AtomicBool::new(false)),
             metrics_inner: Arc::new(SessionMetricsInner::new()),
             created_at: Instant::now(),
-            cancellation_token: Arc::new(std::sync::RwLock::new(CancellationToken::new())),
+            cancellation_token: Arc::new(std::sync::RwLock::new(child_token)),
             plan_cache: Arc::new(std::sync::Mutex::new(PlanCache::new(1000))),
             plan_cache_metrics: Arc::new(PlanCacheMetrics {
                 hits: AtomicU64::new(0),

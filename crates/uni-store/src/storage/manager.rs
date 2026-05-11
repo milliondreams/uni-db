@@ -286,11 +286,13 @@ impl StorageManager {
     }
 
     pub fn pinned(&self, snapshot: SnapshotManifest) -> Self {
-        debug_assert!(
-            self.fork_scope.is_none(),
-            "pinning a forked StorageManager is unsupported in Phase 1; \
-             see Phase 4's pin_to_version on a forked session"
-        );
+        // Phase 4a: pinning a forked session is now supported. The
+        // resulting StorageManager keeps `fork_scope` so reads continue
+        // to route through the fork's Lance branches via `base_paths`,
+        // and adds `pinned_snapshot` so writers / writers' read views
+        // resolve at the snapshot's HWM. Writes are gated separately by
+        // the session-level `is_pinned` check (`Session::tx` rejects
+        // them via `UniError::ReadOnly`).
         Self {
             base_uri: self.base_uri.clone(),
             store: self.store.clone(),
@@ -304,7 +306,7 @@ impl StorageManager {
             compaction_status: Arc::new(Mutex::new(CompactionStatus::default())),
             flush_in_progress: std::sync::atomic::AtomicBool::new(false),
             pinned_snapshot: Some(snapshot),
-            fork_scope: None,
+            fork_scope: self.fork_scope.clone(),
             backend: self.backend.clone(),
             vid_labels_index: self.vid_labels_index.clone(),
         }

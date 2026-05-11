@@ -68,6 +68,11 @@ struct ForkRegistryInner {
     /// Number of live `ForkScope` handles per fork. Drop refuses while
     /// any holder is alive (Phase 1; Phase 2 replaces with drain).
     holders: DashMap<ForkId, Arc<AtomicUsize>>,
+    /// Phase 4a: cap on total fork count enforced at `begin_create`.
+    /// `None` ⇒ unbounded. Counts include Active + Pending + Tombstoned
+    /// — tombstoned forks still hold branch state on disk until
+    /// recovery completes, so counting them prevents churn-thrash.
+    max_forks: AsyncMutex<Option<usize>>,
 }
 
 /// RAII guard that decrements a fork's holder count on drop.
@@ -165,8 +170,15 @@ impl ForkRegistryHandle {
                 cache: AsyncMutex::new(cache),
                 name_locks: DashMap::new(),
                 holders: DashMap::new(),
+                max_forks: AsyncMutex::new(None),
             }),
         })
+    }
+
+    /// Phase 4a: configure the budget cap on total fork count. Set
+    /// from `Uni::open` after registry load. `None` means unbounded.
+    pub async fn set_max_forks(&self, cap: Option<usize>) {
+        *self.inner.max_forks.lock().await = cap;
     }
 
     /// Snapshot of the current registry (cheap clone of the file struct).
@@ -181,6 +193,22 @@ impl ForkRegistryHandle {
             .forks
             .values()
             .filter(|f| f.status == ForkStatus::Active)
+            .cloned()
+            .collect()
+    }
+
+    /// Active forks whose `ttl_expires_at` is at or before `now`
+    /// (Phase 4a, sweeper input). Pending and Tombstoned forks are
+    /// skipped — they're handled by recovery, not the sweeper.
+    pub async fn list_expired(&self, now: chrono::DateTime<chrono::Utc>) -> Vec<ForkInfo> {
+        let cache = self.inner.cache.lock().await;
+        cache
+            .forks
+            .values()
+            .filter(|f| {
+                f.status == ForkStatus::Active
+                    && f.ttl_expires_at.map(|t| t <= now).unwrap_or(false)
+            })
             .cloned()
             .collect()
     }
@@ -453,6 +481,18 @@ impl ForkRegistryHandle {
             return Err(UniError::ForkAlreadyExists {
                 name: info.name.clone(),
             });
+        }
+        // Phase 4a: enforce the budget cap. Counts include all
+        // statuses so a churn loop of create/drop doesn't slip past
+        // the cap while tombstones await recovery.
+        if let Some(cap) = *self.inner.max_forks.lock().await {
+            let current = cache.forks.len();
+            if current >= cap {
+                return Err(UniError::ForkBudgetExceeded {
+                    current,
+                    max: cap,
+                });
+            }
         }
         let name = info.name.clone();
         cache.forks.insert(name.clone(), info);

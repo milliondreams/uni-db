@@ -244,6 +244,51 @@ Builds on Phase 2. `forked.fork(name)` now succeeds, producing a child whose rea
 - A nested fork's Lance branch has `base_paths = child_branch → parent_branch → main`. Datasets that the parent didn't have a branch for at child-creation time fall through to the existing on-the-fly creation path (`BranchedBackend::ensure_branch_for_new`) — the empty-parent commit still lands on main, which is safe because no ancestor's schema references a fork-only label.
 - `ForkInfo.parent_fork_id` is serialized into `catalog/fork_registry.json`. Field has lived in the schema since Phase 1 with serde round-trip tests; no migration needed.
 
+## Forks (Phase 4a — lifecycle & admin, Rust)
+
+Builds on Phase 3. Adds TTL, budget, tags, parent→child cancellation linkage, and lifts the Phase 1 pin+fork restriction. Python bindings remain pending (Phase 4b).
+
+### New public API (Phase 4a)
+
+- **`session.fork(name).ttl(Duration).await`** — set a wall-clock TTL on the fork. The background sweeper drops the fork (cascade) once `Utc::now()` is past `created_at + ttl`. Stamped into `ForkInfo.ttl_expires_at`. Open-or-create returns an existing fork unchanged — TTL only applies at create time.
+- **`UniConfig::fork_default_ttl: Option<Duration>`** — applied when the builder doesn't supply a TTL. Default `None`.
+- **`UniConfig::fork_sweeper_interval: Duration`** — polling cadence. Default `60s`.
+- **`UniConfig::disable_fork_sweeper: bool`** — opt out (tests). Default `false`.
+- **`UniConfig::max_forks: Option<usize>`** — cap on total fork count (Active + Pending + Tombstoned). Enforced at `begin_create`. Default `None` (unbounded).
+- **`Uni::tag_fork(name, tag)` / `Uni::untag_fork(name, tag)` / `Uni::list_fork_tags(name)`** — Lance tags namespaced as `fork_{tag}_{dataset}`. Tags pin the branch's current version GC-exempt; tagged state survives Lance compaction *and* fork drops, which makes a `tag_fork` then `drop_fork` sequence safe for audit retention.
+- **Cancellation parent→child linkage** — `Session::new_forked` now stores `parent_token.child_token()`. Cancelling a parent session cancels every forked descendant; cancelling a child does not affect the parent. Note: `Session::cancel()` cancels the *currently-held* token and replaces it with a fresh one; tests asserting propagation must capture token clones before calling cancel.
+- **Pin/refresh on forked sessions** — `Session::pin_to_version`, `pin_to_timestamp`, `refresh`, `is_pinned` all work on forked sessions. The Phase 1 `debug_assert` in `StorageManager::pinned()` that forbade fork+pin is lifted; the pinned manager preserves `fork_scope` so reads still route through the fork's branches at the pinned version.
+
+### New error variants
+
+- `UniError::ForkBudgetExceeded { current: usize, max: usize }` — `Session::fork(name)` refused because `max_forks` is full.
+
+### Substrate additions
+
+- **Lance tags wrapper** in `uni-store::backend::lance_branch`: `create_tag(uri, tag, branch)`, `delete_tag(uri, tag)` (idempotent on missing), `list_tags(uri) -> Vec<(String, u64)>`.
+- **`ForkRegistryHandle::list_expired(now) -> Vec<ForkInfo>`** — sweeper input. Returns Active forks only; Pending/Tombstoned recovery handles.
+- **`ForkRegistryHandle::set_max_forks(Option<usize>)`** — set after load; `Uni::open` wires from `UniConfig`.
+- **TTL sweeper** in `uni-db`'s `api::fork_sweeper` module — interval-driven loop with `ShutdownHandle` integration. Holds a `Weak<UniInner>` so the sweeper does not extend database lifetime; uses `MissedTickBehavior::Skip` to avoid catch-up bursts after a slow cascade.
+
+### Tests (16 new in Phase 4a)
+
+- `fork_watch.rs` (2) — fork watch isolated from primary; sibling forks isolated.
+- `fork_hooks.rs` (1) — hooks do not propagate.
+- `fork_params.rs` (1) — params do not propagate.
+- `fork_pin.rs` (1) — pin + refresh on forked session, writes rejected while pinned.
+- `fork_cancel.rs` (4) — parent cascades to child; child does not affect parent; sibling isolation; nested cascade through all levels.
+- `fork_tag.rs` (2) — tag/list/untag round-trip + idempotent untag; unknown-fork errors with `ForkNotFound`.
+- `fork_budget.rs` (3) — cap blocks creation; slot reused after drop; default unbounded.
+- `fork_ttl.rs` (4) — TTL expires + sweeper drops; no-TTL survives; disabled sweeper keeps expired forks; `fork_default_ttl` applies.
+
+Full fork suite: 66 tests, all green.
+
+### Phase 4a limits (deferred)
+
+- Python bindings for forks (Phase 4b).
+- `fork_external_sandbox.rs` example (spec §3.7) and `fork_audit.rs` example (spec §3.6) — ship in Phase 4b alongside Python equivalents so the spec scenarios stay binding-symmetric.
+- Cucumber TCK for fork lifecycle — see `crates/uni-tck/tck/features/fork/README.md` for the standing rationale (typed payloads don't translate to Gherkin).
+
 ### Phase 3 limits (lifted in later phases)
 
 - Cross-fork diff at depth > 1 is Phase 6.
@@ -258,8 +303,9 @@ Builds on Phase 2. `forked.fork(name)` now succeeds, producing a child whose rea
 - `cargo nextest run -p uni-store -p uni-common` — 543 tests pass (full uni-store + uni-common suite).
 
 - No fork compaction — long-lived heavy-write forks accumulate L1 fragments. Mitigation: drop-and-recreate, or watch the `fork_fragment_warn_threshold` signal. Phase 5 lands compaction proper.
-- No TTL, watch filtering on forks, hooks/params propagation (Phase 4).
+- (Resolved in Phase 4a — see below.) TTL, budget, tag, parent→child cancellation, and the watch/hooks/params/pin contract on forked sessions.
 - Vector / FTS searches on a forked session use the parent's index (Phase 5 adds fusion).
+- Python bindings for forks remain pending (Phase 4b).
 - (Resolved.) Strict-schema deployments now have a fork-local schema mutation path: `Session::fork_schema().label(...).apply()` and `.edge_type(...)` add entries to the fork's persisted `SchemaDelta` overlay and to the fork's in-memory `SchemaManager` without touching primary. See "Fork-local schema additions" below.
 
 ### Verification

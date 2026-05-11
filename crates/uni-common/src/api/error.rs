@@ -181,6 +181,13 @@ pub enum UniError {
     #[error("Fork subtree cannot be dropped: {blockers:?}")]
     ForkSubtreeInUse { blockers: Vec<String> },
 
+    /// `Session::fork(name)` refused because the configured `max_forks`
+    /// budget is at capacity. Drop existing forks (or wait for the
+    /// sweeper to reap expired ones) and retry. Counts include Active,
+    /// Pending, and Tombstoned entries.
+    #[error("Fork budget exceeded: {current}/{max} forks; drop one or raise UniConfig::max_forks")]
+    ForkBudgetExceeded { current: usize, max: usize },
+
     /// 2PC step on a fork lifecycle operation failed.
     ///
     /// `stage` names the step (`registry_pending`, `create_branch`,

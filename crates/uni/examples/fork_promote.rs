@@ -59,7 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         diff.vertices.changed.len()
     );
     for v in &diff.vertices.added {
-        println!("  + ({}:{}) {:?}", v.label, v.vid, v.properties);
+        println!("  + ({} uid={}) {:?}", v.label, v.uid, v.properties);
     }
 
     // === 4. publish ====================================================

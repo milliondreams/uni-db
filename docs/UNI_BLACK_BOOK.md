@@ -4814,24 +4814,20 @@ Phase 5b extends Phase 5a-impl to the two *lossy* fusion types: vector ANN and B
 
 **Recall scaffold.** `crates/uni/tests/fork_index_recall_bench.rs` (`#[ignore]`'d) is the on-ramp for spec §8.2's 95% recall@K target on N=100k+ items. Run with `cargo nextest run -p uni-db --test fork_index_recall_bench --run-ignored ignored-only --no-capture`. For full compliance reporting, write a Criterion bench at `crates/uni/benches/fork_index.rs` and capture results in `compliance_reports/fork_index_<date>.md`.
 
-## Promotion and Diff (Phase 6)
+## Promotion and Diff (Phase 6b)
 
 Phase 6 closes the write-audit-publish loop. Two complementary
-surfaces:
+surfaces, both with content-addressed identity:
 
 **Diff** — `Uni::diff_fork_primary(name)` and `Uni::diff_forks(a, b)`
 return a `ForkDiff { vertices, edges }` describing the structural
-delta from the first view to the second: `added` rows appear in the
-second view only, `deleted` in the first only, `changed` carries
-per-property before/after pairs on rows with matching VID. The diff
-identity is **VID, not UID** — a deliberate simplification that
-works for fork-vs-ancestor comparisons because the fork's
-`IdAllocator` is bootstrapped above primary's HWM (so inherited VIDs
-stay stable across the boundary while fork-only writes get fresh
-VIDs that primary will never re-use). Two unrelated forks with
-overlapping fork-only writes would not pair correctly under VID;
-that case is out of scope for Phase 6 and is the natural extension
-point for a future UID-keyed diff variant.
+delta from the first view to the second: `added` rows appear in
+the second view only, `deleted` in the first only, `changed`
+carries per-property before/after pairs on rows with matching UID.
+Identity is `compute_vertex_uid(label, None, properties)` for
+vertices and `(src_uid, dst_uid)` (scoped to the edge type) for
+edges, so two unrelated forks with overlapping VID allocation still
+pair correctly. `DiffVertex.vid` survives as informational metadata.
 
 `ForkDiff::invert()` is provided so the algebraic relation
 `diff(a, b).invert() == diff(b, a)` is enforced by construction; it
@@ -4839,35 +4835,48 @@ swaps `added` ↔ `deleted` and `before` ↔ `after` in every
 `PropertyChange`.
 
 **Promote** — `Uni::promote_from_fork(name, &[PromotePattern])`
-scans the named fork per pattern, derives a content-addressed UID
-for each match via `VertexDataset::compute_vertex_uid(label, None,
-properties)`, checks the primary `UidIndex` for that UID, and
-either skips (UID already on primary) or stages an insert. All
-inserts run inside a single primary-targeted transaction that
-commits at the end — partial-failure semantics are atomic. `Phase 6`
-ships the simplest useful pattern shape:
-`PromotePattern::label("Person").where_clause("n.age > 30")`, where
-the `where_clause` is interpolated verbatim into a Cypher `WHERE`
-on the fork-side scan. The caller is responsible for quoting and
-parameter safety.
+scans the named fork per pattern and bulk-inserts matches on
+primary inside a single transaction. Two pattern shapes:
 
-**What promote does *not* do.** Edges are not promoted in Phase 6,
-matching the spec §16 deferral. The implementation counts edges on
-the fork (`MATCH ()-[r:TYPE]->() RETURN count(r)` per edge type) and
-returns the total in `PromoteReport.edges_skipped` plus a
-`tracing::warn!` on the `uni::promote` target. The textual warning
-makes the deferral visible in operational logs; the counter makes it
-visible programmatically. When edge promotion lands, it will need
-its own `PromotePattern::edge_type(...)` constructor and a
-`(src_uid, dst_uid, type)`-keyed identity scheme.
+- `PromotePattern::label("Person").where_clause(...)` — vertex
+  promotion. UID dedup via the same `compute_vertex_uid` used by
+  the writer.
+- `PromotePattern::edge_type("KNOWS").where_clause(...)` — edge
+  promotion. Endpoints are resolved by their content UID; if
+  either endpoint isn't on primary, the edge is counted in
+  `edges_skipped_no_endpoint` and skipped. Within a single
+  `promote_from_fork` call, vertices inserted by an earlier
+  pattern are visible to a later edge pattern via an in-memory
+  `(label, uid) -> vid` cache — so mixing vertex and edge
+  patterns in one call promotes endpoints together with their
+  edges, atomically.
+
+**`UidIndex` is not branch-isolated** — that's the subtle pitfall
+worth knowing. The shared
+`indexes/uni_id_to_vid/{label}/index.lance` dataset accumulates
+entries from both primary and fork branches. `UidIndex::get_vid`
+returns *any* registered VID for a UID, even one that belongs to
+a fork-only vertex. The promote engine corrects for this with
+`resolve_primary_vid`, which takes the candidate VID and verifies
+via `MATCH (n:Label) WHERE id(n) = $vid` on a primary session;
+primary's branched backend naturally excludes fork-only rows.
+Don't roll your own UID→primary-VID lookup without this round-trip.
 
 **Schema growth interaction.** A fork-only label promoted to primary
 must already have its dataset registered on primary's schema —
 promote does *not* auto-create labels. The intended path is:
 `db.schema().label("NewLabel").apply().await` on primary, then
 `promote_from_fork(fork_name, &[PromotePattern::label("NewLabel")])`.
-Calling promote against a label that exists only on the fork errors
-with `UniError::LabelNotFound` *before* the primary tx opens.
+Same for fork-only edge types: register on primary first or the
+call errors with `UniError::EdgeTypeNotFound` *before* opening
+the primary transaction.
+
+**Fork flush.** `promote_from_fork` opens a fresh fork session and
+calls `fork.flush().await?` before scanning. Without this, edges
+committed via an earlier (now-dropped) fork session can be
+invisible to the new session — vertices happen to be visible
+without flush but the asymmetry is fragile, so promote always
+flushes.
 
 ## Operational Signals
 
@@ -4881,8 +4890,8 @@ Carve-outs that have surfaced in user questions and are explicitly out of scope 
 
 - **Hypothesis persistence (ASSUME snapshots).** Forks are durable database branches; they are not a hypothesis store for Locy reasoning. Use ASSUME at the Locy layer for that.
 - **Re-parenting.** A fork's parent is fixed at creation. Moving a subtree under a different parent is not planned.
-- **Cross-fork diff between unrelated forks (no shared ancestor in the fork tree).** Phase 6 ships VID-keyed diff, which is correct for fork-vs-its-ancestor comparisons; UID-keyed cross-fork diff is the natural Phase 6+ extension.
-- **Edge promotion.** Phase 6 promotes vertices only and emits a warning (with counter) for any edges on the fork. Edge promotion needs a `(src_uid, dst_uid, type)`-keyed identity scheme — deferred per fork plan §16.
+- **Parallel-edge promotion.** Phase 6b's edge identity is `(src_uid, dst_uid, type)`, so two parallel edges of the same type between the same endpoints with different property bags collapse to one. Multi-edge promotion would require an edge-content hash — deferred to a future phase.
+- **Cypher TCK and Python bindings for diff/promote.** The Rust integration tests cover the contract; the Cypher Gherkin features and `bindings/uni-db` pyo3 wrappers are follow-on work.
 - **Property additions to existing primary labels via `fork_schema()`.** A Lance branch shares its parent dataset's Arrow schema, so adding a typed column on a fork-only basis would either leak to primary or break branch read-merge. The path stays closed until Phase 6 promotion semantics define the migration.
 - **Fork compaction.** Phase 5. Long-lived heavy-write forks accumulate L1 fragments; bound the cost by drop-and-recreate until then.
 - **TTL, tags, watch filtering, hooks/params propagation on forked sessions.** Phase 4.

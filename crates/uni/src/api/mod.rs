@@ -702,19 +702,35 @@ impl Uni {
     ) -> Result<fork_diff::PromoteReport> {
         let primary = self.session();
         let fork = primary.fork(fork_name).await?;
-        // Ensure every pattern's label exists on primary; if a fork-only
-        // label appears, surface a clear error rather than letting
-        // bulk_insert_vertices fail mid-flight.
+        // Persist any pending tx commits on the fork to Lance so the
+        // promote engine's reads see them. Without this, edges
+        // committed via a now-dropped fork session may not be visible
+        // to the fresh fork session we just opened.
+        fork.flush().await?;
+        // Ensure every pattern's target (label or edge type) exists on
+        // primary; surfacing a clear error is preferable to letting
+        // bulk_insert_* fail mid-flight.
         let primary_schema = self.inner.schema.schema();
         for pat in patterns {
-            if !primary_schema.labels.contains_key(pat.label_name()) {
-                return Err(UniError::LabelNotFound {
-                    label: pat.label_name().to_string(),
-                });
+            match pat {
+                fork_diff::PromotePattern::Vertex { label, .. } => {
+                    if !primary_schema.labels.contains_key(label) {
+                        return Err(UniError::LabelNotFound {
+                            label: label.clone(),
+                        });
+                    }
+                }
+                fork_diff::PromotePattern::Edge { edge_type, .. } => {
+                    if !primary_schema.edge_types.contains_key(edge_type) {
+                        return Err(UniError::EdgeTypeNotFound {
+                            edge_type: edge_type.clone(),
+                        });
+                    }
+                }
             }
         }
         let primary_tx = primary.tx().await?;
-        let report = fork_diff::run_promote(&fork, &primary_tx, patterns).await?;
+        let report = fork_diff::run_promote(&fork, &primary, &primary_tx, patterns).await?;
         primary_tx.commit().await?;
         Ok(report)
     }

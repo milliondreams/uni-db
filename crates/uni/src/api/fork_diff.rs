@@ -9,13 +9,17 @@
 //! `added` rows exist in `b` only, `deleted` exist in `a` only, and
 //! `changed` is a per-row before/after on rows with matching identity.
 //!
-//! **Identity** is VID for vertices and `(src_vid, dst_vid, type)` for
-//! edges. This is sufficient for the spec §3.3 / §3.4 use cases where
-//! both sides share a fork ancestor: the fork's `IdAllocator` is
-//! bootstrapped above primary's HWM, so VIDs inherited from the fork
-//! point stay stable across the boundary while fork-only writes get
-//! fresh VIDs (which surface as adds/deletes naturally). UID-based
-//! cross-fork-without-shared-ancestor diff is out of scope for Phase 6.
+//! **Identity** is `UniId` for vertices and `(src_uid, dst_uid, type)`
+//! for edges. Both are content-addressed (vertex UID = SHA3-256 of
+//! `(label, ext_id, properties)`; edge UID is the tuple of endpoint
+//! UIDs plus the edge type), so the diff is correct across two
+//! unrelated forks that happen to have rolled the same VIDs. The
+//! per-side VID is preserved on `DiffVertex` as informational; pairing
+//! never depends on it.
+//!
+//! Phase 6a (the initial MVP) keyed diffs by VID. Phase 6b lifted
+//! identity to UID so siblings-off-a-shared-parent and totally
+//! unrelated forks compare correctly.
 //!
 //! `PromotePattern` is the spec for what to scan on a fork during
 //! `Uni::promote_from_fork`. Phase 6 supports the most common shape
@@ -26,7 +30,7 @@ use std::fmt;
 
 use uni_common::Properties;
 use uni_common::Value;
-use uni_common::core::id::Vid;
+use uni_common::core::id::{UniId, Vid};
 
 /// The full delta from one fork view to another.
 #[derive(Debug, Clone, Default)]
@@ -131,11 +135,15 @@ impl EdgeDiff {
 /// A vertex row from one side of a diff.
 #[derive(Debug, Clone)]
 pub struct DiffVertex {
-    /// The vertex's label (first label in `labels()` when the node is
-    /// multi-labelled — Phase 6 diff buckets by first label).
+    /// The vertex's label.
     pub label: String,
-    /// Stable cross-fork identity (VID).
-    pub vid: Vid,
+    /// Content-addressed identity (`compute_vertex_uid(label, None,
+    /// properties)`). This is the bucketing key during diff.
+    pub uid: UniId,
+    /// Informational: which VID this row carried on the side it was
+    /// scanned from. `None` if the per-side scan returned a node
+    /// without a VID, which should not happen in practice.
+    pub vid: Option<Vid>,
     /// Property bag for the vertex (user properties only).
     pub properties: Properties,
 }
@@ -145,8 +153,8 @@ pub struct DiffVertex {
 pub struct VertexPropertyChange {
     /// The vertex's label.
     pub label: String,
-    /// VID of the vertex (same on both sides — that's the pairing key).
-    pub vid: Vid,
+    /// UID of the vertex — the pairing key across sides.
+    pub uid: UniId,
     /// One entry per property whose value differs between sides.
     pub changes: Vec<PropertyChange>,
 }
@@ -155,7 +163,7 @@ impl VertexPropertyChange {
     fn invert(self) -> Self {
         Self {
             label: self.label,
-            vid: self.vid,
+            uid: self.uid,
             changes: self.changes.into_iter().map(PropertyChange::invert).collect(),
         }
     }
@@ -166,10 +174,10 @@ impl VertexPropertyChange {
 pub struct DiffEdge {
     /// The edge type.
     pub edge_type: String,
-    /// Source vertex VID.
-    pub src_vid: Vid,
-    /// Destination vertex VID.
-    pub dst_vid: Vid,
+    /// Source vertex UID (content-addressed).
+    pub src_uid: UniId,
+    /// Destination vertex UID (content-addressed).
+    pub dst_uid: UniId,
     /// Property bag for the edge.
     pub properties: Properties,
 }
@@ -179,10 +187,10 @@ pub struct DiffEdge {
 pub struct EdgePropertyChange {
     /// The edge type.
     pub edge_type: String,
-    /// Source vertex VID.
-    pub src_vid: Vid,
-    /// Destination vertex VID.
-    pub dst_vid: Vid,
+    /// Source vertex UID.
+    pub src_uid: UniId,
+    /// Destination vertex UID.
+    pub dst_uid: UniId,
     /// One entry per property whose value differs between sides.
     pub changes: Vec<PropertyChange>,
 }
@@ -191,8 +199,8 @@ impl EdgePropertyChange {
     fn invert(self) -> Self {
         Self {
             edge_type: self.edge_type,
-            src_vid: self.src_vid,
-            dst_vid: self.dst_vid,
+            src_uid: self.src_uid,
+            dst_uid: self.dst_uid,
             changes: self.changes.into_iter().map(PropertyChange::invert).collect(),
         }
     }
@@ -221,49 +229,120 @@ impl PropertyChange {
 
 /// Selector for [`crate::api::Uni::promote_from_fork`].
 ///
-/// Phase 6 ships the simplest useful shape: a label plus an optional
-/// Cypher `WHERE` clause. The fork is scanned with
-/// `MATCH (n:{label}) WHERE {where_clause} RETURN n` and every match
-/// is bulk-inserted on primary, deduplicated by UID.
+/// Two shapes:
+/// - [`PromotePattern::label`] — match every vertex with this label;
+///   bulk-inserted on primary, deduplicated by content-derived UID.
+/// - [`PromotePattern::edge_type`] — match every edge of this type
+///   whose endpoints already exist on primary; the edge is inserted
+///   between the resolved primary endpoints, deduplicated by
+///   `(src_uid, dst_uid, edge_type)`.
+///
+/// Both variants accept an optional Cypher `WHERE` clause, interpolated
+/// verbatim into the fork-side scan. Callers are responsible for
+/// quoting and parameter safety.
 #[derive(Debug, Clone)]
-pub struct PromotePattern {
-    label: String,
-    where_clause: Option<String>,
+#[non_exhaustive]
+pub enum PromotePattern {
+    /// Promote vertices.
+    Vertex {
+        /// Vertex label.
+        label: String,
+        /// Optional `WHERE` predicate on the fork-side scan.
+        where_clause: Option<String>,
+    },
+    /// Promote edges. Endpoints must already exist on primary (by UID);
+    /// fork-only endpoints are skipped and counted in
+    /// [`PromoteReport::edges_skipped_no_endpoint`].
+    Edge {
+        /// Edge type.
+        edge_type: String,
+        /// Optional `WHERE` predicate on the fork-side scan. The bound
+        /// names are `a` (source), `r` (edge), `b` (destination).
+        where_clause: Option<String>,
+    },
 }
 
 impl PromotePattern {
     /// Match every vertex with this label.
     pub fn label(label: impl Into<String>) -> Self {
-        Self {
+        Self::Vertex {
             label: label.into(),
             where_clause: None,
         }
     }
 
-    /// Restrict the scan to vertices matching this Cypher predicate.
-    /// The string is dropped verbatim into a `WHERE …` clause, so
-    /// callers are responsible for quoting and parameter safety.
+    /// Match every edge with this type. Endpoints must already exist
+    /// on primary (resolved by UID); fork-only endpoints are counted
+    /// and skipped — they need to be promoted first via a vertex
+    /// pattern.
+    pub fn edge_type(edge_type: impl Into<String>) -> Self {
+        Self::Edge {
+            edge_type: edge_type.into(),
+            where_clause: None,
+        }
+    }
+
+    /// Restrict the scan to rows matching this Cypher predicate.
+    /// Verbatim interpolation — caller owns quoting.
     pub fn where_clause(mut self, expr: impl Into<String>) -> Self {
-        self.where_clause = Some(expr.into());
+        let expr = expr.into();
+        match &mut self {
+            Self::Vertex { where_clause, .. } => *where_clause = Some(expr),
+            Self::Edge { where_clause, .. } => *where_clause = Some(expr),
+        }
         self
     }
 
-    /// The label this pattern targets.
+    /// Vertex label for vertex patterns. Empty string for edge patterns.
     pub fn label_name(&self) -> &str {
-        &self.label
+        match self {
+            Self::Vertex { label, .. } => label,
+            Self::Edge { .. } => "",
+        }
+    }
+
+    /// Edge type for edge patterns. Empty string for vertex patterns.
+    pub fn edge_type_name(&self) -> &str {
+        match self {
+            Self::Edge { edge_type, .. } => edge_type,
+            Self::Vertex { .. } => "",
+        }
     }
 
     /// The optional `WHERE` predicate.
     pub fn where_expr(&self) -> Option<&str> {
-        self.where_clause.as_deref()
+        match self {
+            Self::Vertex { where_clause, .. } | Self::Edge { where_clause, .. } => {
+                where_clause.as_deref()
+            }
+        }
+    }
+
+    /// `true` if this pattern targets edges.
+    pub fn is_edge(&self) -> bool {
+        matches!(self, Self::Edge { .. })
     }
 }
 
 impl fmt::Display for PromotePattern {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.where_clause {
-            Some(w) => write!(f, "(:{} WHERE {})", self.label, w),
-            None => write!(f, "(:{})", self.label),
+        match self {
+            Self::Vertex {
+                label,
+                where_clause: Some(w),
+            } => write!(f, "(:{} WHERE {})", label, w),
+            Self::Vertex {
+                label,
+                where_clause: None,
+            } => write!(f, "(:{})", label),
+            Self::Edge {
+                edge_type,
+                where_clause: Some(w),
+            } => write!(f, "[:{} WHERE {}]", edge_type, w),
+            Self::Edge {
+                edge_type,
+                where_clause: None,
+            } => write!(f, "[:{}]", edge_type),
         }
     }
 }
@@ -275,15 +354,22 @@ pub struct PromoteReport {
     pub vertices_inserted: usize,
     /// Number of fork rows skipped because primary already has the same UID.
     pub vertices_skipped_uid_conflict: usize,
-    /// Number of fork rows skipped because they had no UID column
-    /// (Phase 6 requires UID-based dedup; rows without UIDs are
-    /// silently skipped with a counter so callers can react).
+    /// Reserved for future use — currently always 0.
     pub vertices_skipped_no_uid: usize,
+    /// Number of edges inserted into primary.
+    pub edges_inserted: usize,
+    /// Number of fork edges skipped because primary already has an
+    /// edge of the same type between the resolved endpoints.
+    pub edges_skipped_duplicate: usize,
+    /// Number of fork edges skipped because at least one endpoint had
+    /// no UID match on primary. To insert these edges, promote the
+    /// missing vertices first via a vertex pattern, then re-run.
+    pub edges_skipped_no_endpoint: usize,
     /// Number of edges that touched a promoted vertex but were not
-    /// themselves promoted. Edge promotion is deferred per the
-    /// graph-fork plan §16; the current behaviour is "silently skip
-    /// touching edges with a warning". The counter exposes the warning
-    /// programmatically; the textual warning is also `tracing::warn!`-ed.
+    /// themselves promoted (no edge pattern in the call). Phase 6
+    /// MVP's behaviour: silently skip + warn. Phase 6b adds explicit
+    /// edge patterns; when no edge pattern is given, this counter
+    /// still surfaces incidental edges for visibility.
     pub edges_skipped: usize,
     /// Per-pattern row counts so callers can see which pattern matched
     /// what. Indexed by pattern position in the input slice.
@@ -295,9 +381,9 @@ pub struct PromoteReport {
 // ============================================================================
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use tracing::warn;
 use uni_common::Result;
-use uni_common::core::id::Eid;
 
 use super::session::Session;
 use super::transaction::Transaction;
@@ -308,9 +394,9 @@ use super::transaction::Transaction;
 /// *forward*: returned `ForkDiff.vertices.added` is rows present in `b`
 /// but not `a`; `deleted` is rows in `a` but not `b`.
 ///
-/// Identity is VID for vertices and `(src_vid, dst_vid, type)` for
-/// edges. Both sides must share an ancestor for `changed` to be
-/// meaningful — see module docs.
+/// Identity is content-addressed UID for vertices and `(src_uid,
+/// dst_uid)` for edges, scoped by edge type — so two unrelated forks
+/// with overlapping VIDs but distinct content pair correctly.
 pub(crate) async fn compute_diff(a: &Session, b: &Session) -> Result<ForkDiff> {
     let mut diff = ForkDiff::default();
 
@@ -351,21 +437,26 @@ pub(crate) async fn compute_diff(a: &Session, b: &Session) -> Result<ForkDiff> {
     Ok(diff)
 }
 
-/// One bucketed row from the scan: VID → (label, props).
-type VertexBucket = HashMap<Vid, (String, Properties)>;
-/// One bucketed edge row keyed by (src_vid, dst_vid, eid): we track
-/// edges by EID since `(src, dst, type)` can legitimately have
-/// multiple parallel edges.
-type EdgeBucket = HashMap<Eid, EdgeRow>;
+/// One bucketed vertex row keyed by content UID.
+type VertexBucket = HashMap<UniId, VertexRow>;
+/// One bucketed edge row keyed by `(src_uid, dst_uid)` (the type is
+/// fixed per scan).
+type EdgeBucket = HashMap<(UniId, UniId), EdgeRow>;
+
+#[derive(Debug, Clone)]
+struct VertexRow {
+    label: String,
+    vid: Vid,
+    properties: Properties,
+}
 
 #[derive(Debug, Clone)]
 struct EdgeRow {
-    src_vid: Vid,
-    dst_vid: Vid,
     properties: Properties,
 }
 
 async fn scan_label_nodes(s: &Session, label: &str) -> Result<VertexBucket> {
+    use uni_store::storage::vertex::VertexDataset;
     let cypher = format!("MATCH (n:`{}`) RETURN n", escape_backticks(label));
     let result = s.query(&cypher).await?;
     let mut bucket = VertexBucket::new();
@@ -379,27 +470,40 @@ async fn scan_label_nodes(s: &Session, label: &str) -> Result<VertexBucket> {
             .find(|l| l.as_str() == label)
             .cloned()
             .unwrap_or_else(|| label.to_string());
-        bucket.insert(node.vid, (row_label, node.properties.clone()));
+        let uid = VertexDataset::compute_vertex_uid(&row_label, None, &node.properties);
+        bucket.insert(
+            uid,
+            VertexRow {
+                label: row_label,
+                vid: node.vid,
+                properties: node.properties.clone(),
+            },
+        );
     }
     Ok(bucket)
 }
 
 async fn scan_edge_type(s: &Session, edge_type: &str) -> Result<EdgeBucket> {
+    use uni_store::storage::vertex::VertexDataset;
     let cypher = format!(
-        "MATCH (a)-[r:`{}`]->(b) RETURN r",
+        "MATCH (a)-[r:`{}`]->(b) RETURN a, r, b",
         escape_backticks(edge_type)
     );
     let result = s.query(&cypher).await?;
     let mut bucket = EdgeBucket::new();
     for row in result.rows() {
-        let Some(Value::Edge(edge)) = row.value("r") else {
+        let (Some(Value::Edge(edge)), Some(Value::Node(a)), Some(Value::Node(b))) =
+            (row.value("r"), row.value("a"), row.value("b"))
+        else {
             continue;
         };
+        let a_label = a.labels.first().cloned().unwrap_or_default();
+        let b_label = b.labels.first().cloned().unwrap_or_default();
+        let src_uid = VertexDataset::compute_vertex_uid(&a_label, None, &a.properties);
+        let dst_uid = VertexDataset::compute_vertex_uid(&b_label, None, &b.properties);
         bucket.insert(
-            edge.eid,
+            (src_uid, dst_uid),
             EdgeRow {
-                src_vid: edge.src,
-                dst_vid: edge.dst,
                 properties: edge.properties.clone(),
             },
         );
@@ -408,33 +512,35 @@ async fn scan_edge_type(s: &Session, edge_type: &str) -> Result<EdgeBucket> {
 }
 
 fn diff_label(label: &str, a: VertexBucket, b: VertexBucket, out: &mut VertexDiff) {
-    let keys_a: HashSet<Vid> = a.keys().copied().collect();
-    let keys_b: HashSet<Vid> = b.keys().copied().collect();
+    let keys_a: HashSet<UniId> = a.keys().copied().collect();
+    let keys_b: HashSet<UniId> = b.keys().copied().collect();
 
-    for vid in keys_b.difference(&keys_a) {
-        let (l, props) = b[vid].clone();
+    for uid in keys_b.difference(&keys_a) {
+        let row = b[uid].clone();
         out.added.push(DiffVertex {
-            label: l,
-            vid: *vid,
-            properties: props,
+            label: row.label,
+            uid: *uid,
+            vid: Some(row.vid),
+            properties: row.properties,
         });
     }
-    for vid in keys_a.difference(&keys_b) {
-        let (l, props) = a[vid].clone();
+    for uid in keys_a.difference(&keys_b) {
+        let row = a[uid].clone();
         out.deleted.push(DiffVertex {
-            label: l,
-            vid: *vid,
-            properties: props,
+            label: row.label,
+            uid: *uid,
+            vid: Some(row.vid),
+            properties: row.properties,
         });
     }
-    for vid in keys_a.intersection(&keys_b) {
-        let (_, props_a) = &a[vid];
-        let (_, props_b) = &b[vid];
-        let changes = property_changes(props_a, props_b);
+    for uid in keys_a.intersection(&keys_b) {
+        let row_a = &a[uid];
+        let row_b = &b[uid];
+        let changes = property_changes(&row_a.properties, &row_b.properties);
         if !changes.is_empty() {
             out.changed.push(VertexPropertyChange {
                 label: label.to_string(),
-                vid: *vid,
+                uid: *uid,
                 changes,
             });
         }
@@ -442,36 +548,36 @@ fn diff_label(label: &str, a: VertexBucket, b: VertexBucket, out: &mut VertexDif
 }
 
 fn diff_edge_type(edge_type: &str, a: EdgeBucket, b: EdgeBucket, out: &mut EdgeDiff) {
-    let keys_a: HashSet<Eid> = a.keys().copied().collect();
-    let keys_b: HashSet<Eid> = b.keys().copied().collect();
+    let keys_a: HashSet<(UniId, UniId)> = a.keys().copied().collect();
+    let keys_b: HashSet<(UniId, UniId)> = b.keys().copied().collect();
 
-    for eid in keys_b.difference(&keys_a) {
-        let row = b[eid].clone();
+    for key in keys_b.difference(&keys_a) {
+        let row = b[key].clone();
         out.added.push(DiffEdge {
             edge_type: edge_type.to_string(),
-            src_vid: row.src_vid,
-            dst_vid: row.dst_vid,
+            src_uid: key.0,
+            dst_uid: key.1,
             properties: row.properties,
         });
     }
-    for eid in keys_a.difference(&keys_b) {
-        let row = a[eid].clone();
+    for key in keys_a.difference(&keys_b) {
+        let row = a[key].clone();
         out.deleted.push(DiffEdge {
             edge_type: edge_type.to_string(),
-            src_vid: row.src_vid,
-            dst_vid: row.dst_vid,
+            src_uid: key.0,
+            dst_uid: key.1,
             properties: row.properties,
         });
     }
-    for eid in keys_a.intersection(&keys_b) {
-        let row_a = &a[eid];
-        let row_b = &b[eid];
+    for key in keys_a.intersection(&keys_b) {
+        let row_a = &a[key];
+        let row_b = &b[key];
         let changes = property_changes(&row_a.properties, &row_b.properties);
         if !changes.is_empty() {
             out.changed.push(EdgePropertyChange {
                 edge_type: edge_type.to_string(),
-                src_vid: row_a.src_vid,
-                dst_vid: row_a.dst_vid,
+                src_uid: key.0,
+                dst_uid: key.1,
                 changes,
             });
         }
@@ -501,18 +607,55 @@ fn escape_backticks(s: &str) -> String {
     s.replace('`', "``")
 }
 
+/// Resolve a content-derived UID to the VID it has on `primary` (if
+/// any). The shared `UidIndex` isn't fork-isolated — it returns a
+/// candidate VID for any UID that has *ever* been registered, fork or
+/// otherwise. This helper verifies the candidate by a primary Cypher
+/// MATCH-by-VID; if the vertex isn't in primary's view, returns None.
+async fn resolve_primary_vid(
+    primary: &Session,
+    primary_storage: &Arc<uni_store::storage::manager::StorageManager>,
+    label: &str,
+    uid: &uni_common::core::id::UniId,
+) -> Option<Vid> {
+    let candidate = primary_storage
+        .uid_index(label)
+        .ok()?
+        .get_vid(uid)
+        .await
+        .ok()
+        .flatten()?;
+    // Cross-check: primary actually has a vertex with this VID.
+    let cypher = format!(
+        "MATCH (n:`{}`) WHERE id(n) = {} RETURN id(n) LIMIT 1",
+        escape_backticks(label),
+        candidate.as_u64()
+    );
+    let rs = primary.query(&cypher).await.ok()?;
+    if rs.rows().is_empty() {
+        None
+    } else {
+        Some(candidate)
+    }
+}
+
 // ============================================================================
 // Promote engine
 // ============================================================================
 
 /// Scan a fork session for matches per pattern, then bulk-insert the
-/// matched vertices on primary, deduplicated by content-derived UID.
+/// matched vertices on primary (deduplicated by content-derived UID)
+/// and edges (deduplicated by `(src_uid, dst_uid, edge_type)`).
 ///
-/// Edges are not promoted in Phase 6 — they are counted and a tracing
-/// warning is logged per fork's edge count. Callers see the same count
-/// in [`PromoteReport::edges_skipped`].
+/// Edges whose endpoints don't exist on primary by UID are skipped and
+/// counted in `edges_skipped_no_endpoint` — promote the missing
+/// vertices first via a vertex pattern, then re-run.
+///
+/// If the call contains no edge patterns, incidental edges on the fork
+/// are counted in `edges_skipped` and a tracing warning is emitted.
 pub(crate) async fn run_promote(
     fork: &Session,
+    primary: &Session,
     primary_tx: &Transaction,
     patterns: &[PromotePattern],
 ) -> Result<PromoteReport> {
@@ -524,88 +667,205 @@ pub(crate) async fn run_promote(
     };
 
     let primary_storage = primary_tx.db.storage.clone();
+    let mut any_edge_pattern = false;
+    // Cache of vertices just promoted inside this call. Edge patterns
+    // check this before falling back to primary's UidIndex + Cypher
+    // verify — pending tx_l0 writes aren't visible to a primary
+    // Cypher round-trip until commit, so without this cache an edge
+    // pattern in the same call wouldn't see endpoints we just added.
+    let mut just_inserted: HashMap<(String, UniId), Vid> = HashMap::new();
 
     for (idx, pattern) in patterns.iter().enumerate() {
-        let label = pattern.label_name();
-        let cypher = match pattern.where_expr() {
-            Some(w) => format!(
-                "MATCH (n:`{}`) WHERE {} RETURN n",
-                escape_backticks(label),
-                w
-            ),
-            None => format!("MATCH (n:`{}`) RETURN n", escape_backticks(label)),
-        };
+        match pattern {
+            PromotePattern::Vertex { label, where_clause } => {
+                let cypher = match where_clause {
+                    Some(w) => format!(
+                        "MATCH (n:`{}`) WHERE {} RETURN n",
+                        escape_backticks(label),
+                        w
+                    ),
+                    None => format!("MATCH (n:`{}`) RETURN n", escape_backticks(label)),
+                };
 
-        let result = fork.query(&cypher).await?;
-        if result.rows().is_empty() {
-            continue;
-        }
+                let result = fork.query(&cypher).await?;
+                if result.rows().is_empty() {
+                    continue;
+                }
 
-        let mut to_insert: Vec<Properties> = Vec::with_capacity(result.rows().len());
-        let primary_uid_index = primary_storage.uid_index(label).ok();
-        for row in result.rows() {
-            let Some(Value::Node(node)) = row.value("n") else {
-                continue;
-            };
-            let uid =
-                VertexDataset::compute_vertex_uid(label, None, &node.properties);
-            let conflict = match &primary_uid_index {
-                Some(idx) => match idx.get_vid(&uid).await {
-                    Ok(Some(_)) => true,
-                    Ok(None) => false,
-                    Err(_) => {
-                        warn!(
-                            target: "uni::promote",
-                            label = %label,
-                            "primary UID index unreadable; inserting without dedup",
-                        );
-                        false
+                let mut to_insert: Vec<Properties> = Vec::with_capacity(result.rows().len());
+                let mut insert_uids: Vec<UniId> = Vec::with_capacity(result.rows().len());
+                for row in result.rows() {
+                    let Some(Value::Node(node)) = row.value("n") else {
+                        continue;
+                    };
+                    let uid = VertexDataset::compute_vertex_uid(label, None, &node.properties);
+                    // Skip if already promoted earlier in this call.
+                    if just_inserted.contains_key(&(label.clone(), uid)) {
+                        report.vertices_skipped_uid_conflict += 1;
+                        continue;
                     }
-                },
-                None => false,
-            };
-            if conflict {
-                report.vertices_skipped_uid_conflict += 1;
-            } else {
-                to_insert.push(node.properties.clone());
+                    let conflict =
+                        resolve_primary_vid(primary, &primary_storage, label, &uid)
+                            .await
+                            .is_some();
+                    if conflict {
+                        report.vertices_skipped_uid_conflict += 1;
+                    } else {
+                        to_insert.push(node.properties.clone());
+                        insert_uids.push(uid);
+                    }
+                }
+
+                if !to_insert.is_empty() {
+                    let n = to_insert.len();
+                    let vids = primary_tx.bulk_insert_vertices(label, to_insert).await?;
+                    for (uid, vid) in insert_uids.into_iter().zip(vids) {
+                        just_inserted.insert((label.clone(), uid), vid);
+                    }
+                    report.vertices_inserted += n;
+                    report.per_pattern_inserted[idx] = n;
+                }
+            }
+            PromotePattern::Edge { edge_type, where_clause } => {
+                any_edge_pattern = true;
+                let cypher = match where_clause {
+                    Some(w) => format!(
+                        "MATCH (a)-[r:`{}`]->(b) WHERE {} RETURN a, r, b",
+                        escape_backticks(edge_type),
+                        w
+                    ),
+                    None => format!(
+                        "MATCH (a)-[r:`{}`]->(b) RETURN a, r, b",
+                        escape_backticks(edge_type)
+                    ),
+                };
+
+                let result = fork.query(&cypher).await?;
+                if result.rows().is_empty() {
+                    continue;
+                }
+
+                let mut pattern_inserted = 0usize;
+                for row in result.rows() {
+                    let (
+                        Some(Value::Edge(edge)),
+                        Some(Value::Node(a)),
+                        Some(Value::Node(b)),
+                    ) = (row.value("r"), row.value("a"), row.value("b")) else {
+                        continue;
+                    };
+                    let a_label = match a.labels.first() {
+                        Some(l) => l.clone(),
+                        None => continue,
+                    };
+                    let b_label = match b.labels.first() {
+                        Some(l) => l.clone(),
+                        None => continue,
+                    };
+                    let src_uid =
+                        VertexDataset::compute_vertex_uid(&a_label, None, &a.properties);
+                    let dst_uid =
+                        VertexDataset::compute_vertex_uid(&b_label, None, &b.properties);
+
+                    // Check the just-inserted cache first (vertex
+                    // pattern in this same call). Otherwise fall back
+                    // to UidIndex + Cypher verify on primary; the
+                    // verify step keeps fork-only registered UIDs
+                    // from leaking through the shared UidIndex.
+                    let src_vid = match just_inserted.get(&(a_label.clone(), src_uid)) {
+                        Some(v) => Some(*v),
+                        None => resolve_primary_vid(
+                            primary,
+                            &primary_storage,
+                            &a_label,
+                            &src_uid,
+                        )
+                        .await,
+                    };
+                    let dst_vid = match just_inserted.get(&(b_label.clone(), dst_uid)) {
+                        Some(v) => Some(*v),
+                        None => resolve_primary_vid(
+                            primary,
+                            &primary_storage,
+                            &b_label,
+                            &dst_uid,
+                        )
+                        .await,
+                    };
+                    let (src_vid, dst_vid) = match (src_vid, dst_vid) {
+                        (Some(s), Some(d)) => (s, d),
+                        _ => {
+                            report.edges_skipped_no_endpoint += 1;
+                            continue;
+                        }
+                    };
+
+                    // Dedup against primary via Cypher: count existing
+                    // edges of this type between these two VIDs. Within
+                    // the same promote call our fork-side bucketing
+                    // already collapses parallel edges to one per
+                    // (src_uid, dst_uid) so we don't need to dedup
+                    // against ourselves.
+                    let dedup_cypher = format!(
+                        "MATCH (a)-[r:`{}`]->(b) WHERE id(a) = {} AND id(b) = {} RETURN count(r) AS c",
+                        escape_backticks(edge_type),
+                        src_vid.as_u64(),
+                        dst_vid.as_u64()
+                    );
+                    let exists = match primary.query(&dedup_cypher).await {
+                        Ok(rs) => rs
+                            .rows()
+                            .first()
+                            .and_then(|row| row.get::<i64>("c").ok())
+                            .map(|c| c > 0)
+                            .unwrap_or(false),
+                        Err(_) => false,
+                    };
+                    if exists {
+                        report.edges_skipped_duplicate += 1;
+                        continue;
+                    }
+
+                    primary_tx
+                        .bulk_insert_edges(
+                            edge_type,
+                            vec![(src_vid, dst_vid, edge.properties.clone())],
+                        )
+                        .await?;
+                    report.edges_inserted += 1;
+                    pattern_inserted += 1;
+                }
+                report.per_pattern_inserted[idx] = pattern_inserted;
             }
         }
-
-        if !to_insert.is_empty() {
-            let n = to_insert.len();
-            primary_tx.bulk_insert_vertices(label, to_insert).await?;
-            report.vertices_inserted += n;
-            report.per_pattern_inserted[idx] = n;
-        }
     }
 
-    // Edge count for the warning surface — we currently know fork has
-    // *some* edges if any edge_type table on fork is non-empty; for
-    // Phase 6 we conservatively count edges touched by *promoted*
-    // vertex labels via a single query per fork. This is best-effort;
-    // a precise count requires a join we don't run here.
-    let mut edge_seen = 0usize;
-    for et in fork.db().schema.schema().edge_types.keys() {
-        let cypher = format!(
-            "MATCH ()-[r:`{}`]->() RETURN count(r) AS c",
-            escape_backticks(et)
-        );
-        if let Ok(rs) = fork.query(&cypher).await
-            && let Some(row) = rs.rows().first()
-            && let Ok(c) = row.get::<i64>("c")
-        {
-            edge_seen += c as usize;
+    // When the call contains no edge patterns, surface incidental edges
+    // on the fork so callers see they exist (and weren't promoted).
+    if !any_edge_pattern {
+        let mut edge_seen = 0usize;
+        for et in fork.db().schema.schema().edge_types.keys() {
+            let cypher = format!(
+                "MATCH ()-[r:`{}`]->() RETURN count(r) AS c",
+                escape_backticks(et)
+            );
+            if let Ok(rs) = fork.query(&cypher).await
+                && let Some(row) = rs.rows().first()
+                && let Ok(c) = row.get::<i64>("c")
+            {
+                edge_seen += c as usize;
+            }
         }
-    }
-    if edge_seen > 0 {
-        report.edges_skipped = edge_seen;
-        warn!(
-            target: "uni::promote",
-            edges_skipped = edge_seen,
-            "promote_from_fork: edge promotion is deferred per fork plan §16 \
-             — fork contains {} edges that were not promoted",
-            edge_seen
-        );
+        if edge_seen > 0 {
+            report.edges_skipped = edge_seen;
+            warn!(
+                target: "uni::promote",
+                edges_skipped = edge_seen,
+                "promote_from_fork: fork contains {} edges; pass \
+                 PromotePattern::edge_type(...) to promote them",
+                edge_seen
+            );
+        }
     }
 
     Ok(report)
@@ -631,12 +891,14 @@ mod tests {
     fn vertex_diff_invert_swaps_added_deleted() {
         let v_a = DiffVertex {
             label: "Person".into(),
-            vid: Vid::new(1),
+            uid: UniId::from_bytes([1; 32]),
+            vid: Some(Vid::new(1)),
             properties: Default::default(),
         };
         let v_b = DiffVertex {
             label: "Person".into(),
-            vid: Vid::new(2),
+            uid: UniId::from_bytes([2; 32]),
+            vid: Some(Vid::new(2)),
             properties: Default::default(),
         };
         let d = VertexDiff {

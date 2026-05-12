@@ -244,31 +244,38 @@ Builds on Phase 2. `forked.fork(name)` now succeeds, producing a child whose rea
 - A nested fork's Lance branch has `base_paths = child_branch → parent_branch → main`. Datasets that the parent didn't have a branch for at child-creation time fall through to the existing on-the-fly creation path (`BranchedBackend::ensure_branch_for_new`) — the empty-parent commit still lands on main, which is safe because no ancestor's schema references a fork-only label.
 - `ForkInfo.parent_fork_id` is serialized into `catalog/fork_registry.json`. Field has lived in the schema since Phase 1 with serde round-trip tests; no migration needed.
 
-## Forks (Phase 6 — diff & promote)
+## Forks (Phase 6b — diff & promote, UID-keyed + edge promotion)
 
-Adds the structural-diff and write-audit-publish APIs called out by spec §3.3 and §3.4. Both are surfaced as methods on the top-level `Uni` (database) rather than on `Session`, matching `drop_fork` / `tag_fork`.
+Phase 6a (initial MVP) shipped VID-keyed diff and vertex-only promote. Phase 6b closes both correctness gaps: identity for diff is now content-addressed UID, and `PromotePattern::edge_type(...)` adds edge promotion with `(src_uid, dst_uid, type)` dedup.
 
-### New public API (Phase 6)
+### Public API surface (carried + extended)
 
-- **`Uni::diff_fork_primary(name) -> Result<ForkDiff>`** — opens the fork by name (read-only is sufficient) and returns the delta `diff(primary, fork)`: `added` is rows the fork has that primary doesn't, `deleted` is rows the fork has dropped, `changed` is per-vertex/edge property diffs on rows with matching VID.
-- **`Uni::diff_forks(a, b) -> Result<ForkDiff>`** — same but between two named forks. Returns an empty diff when `a == b`. `diff(a, b).invert() == diff(b, a)` by construction (`ForkDiff::invert` is provided).
-- **`Uni::promote_from_fork(name, &[PromotePattern]) -> Result<PromoteReport>`** — scans the named fork via Cypher per pattern, derives a content-addressed UID for each match via `VertexDataset::compute_vertex_uid`, and bulk-inserts new vertices into primary inside a single transaction (committed at the end). Rows whose UID already exists on primary are skipped. Edges are not promoted in Phase 6; they are counted in `PromoteReport.edges_skipped` and a `tracing::warn!` is emitted.
+- **`Uni::diff_fork_primary(name)`**, **`Uni::diff_forks(a, b)`** — unchanged signatures; internals re-keyed to UID so cross-fork-without-shared-ancestor comparisons return correct results.
+- **`Uni::promote_from_fork(name, &[PromotePattern])`** — now accepts both vertex (`label`) and edge (`edge_type`) patterns in the same call. Internally calls `fork.flush().await?` after opening the fresh fork session so edge commits from a prior session are visible. Rejects fork-only edge types early with `UniError::EdgeTypeNotFound`.
 
-### New types (`uni_db::api::fork_diff`)
+### Type changes (`uni_db::api::fork_diff`)
 
-- **`ForkDiff { vertices: VertexDiff, edges: EdgeDiff }`** — the structural-diff payload. `is_empty()`, `total_rows()`, `invert()`.
-- **`VertexDiff { added: Vec<DiffVertex>, deleted: Vec<DiffVertex>, changed: Vec<VertexPropertyChange> }`** and the equivalent `EdgeDiff`.
-- **`DiffVertex { label, vid, properties }` / `DiffEdge { edge_type, src_vid, dst_vid, properties }`** — full row content from one side.
-- **`VertexPropertyChange { label, vid, changes }` / `EdgePropertyChange { edge_type, src_vid, dst_vid, changes }`** — per-row diffs, populated only when the row exists on both sides with the same VID and at least one differing property.
-- **`PropertyChange { key, before: Option<Value>, after: Option<Value> }`** — single-property before/after pair.
-- **`PromotePattern::label("Person").where_clause("n.age > 30")`** — Phase 6 supports the simplest useful selector: a label plus an optional Cypher predicate that is interpolated verbatim into the `WHERE` clause of the fork-side scan. Caller is responsible for quoting / parameter safety; future shapes (relationship-aware patterns, multi-label, parameter binding) are planned.
-- **`PromoteReport { vertices_inserted, vertices_skipped_uid_conflict, vertices_skipped_no_uid, edges_skipped, per_pattern_inserted }`** — counters callers use to confirm what landed.
+Breaking changes to types added in Phase 6a (one week prior — fresh enough that no external code can have stabilized against them):
+
+- **`DiffVertex { label, uid: UniId, vid: Option<Vid>, properties }`** — `vid` becomes optional + informational. `uid` is the new pairing key.
+- **`VertexPropertyChange { label, uid: UniId, changes }`** — `vid` field replaced by `uid`.
+- **`DiffEdge { edge_type, src_uid: UniId, dst_uid: UniId, properties }`** — `src_vid` / `dst_vid` replaced by content-addressed UIDs.
+- **`EdgePropertyChange { edge_type, src_uid, dst_uid, changes }`** — same.
+
+Additive:
+
+- **`PromotePattern`** becomes a `#[non_exhaustive]` enum with two variants:
+  - `PromotePattern::Vertex { label, where_clause }` — built by the existing `PromotePattern::label(...)` constructor (kept for source compat).
+  - `PromotePattern::Edge { edge_type, where_clause }` — built by the new `PromotePattern::edge_type(...)`. Fork is scanned with `MATCH (a)-[r:TYPE]->(b) RETURN a, r, b`; bound names `a` / `r` / `b` are available in `where_clause`.
+- **`PromoteReport`** gains three counters: `edges_inserted`, `edges_skipped_duplicate`, `edges_skipped_no_endpoint`. The legacy `edges_skipped` survives but now only fires when no `Edge` pattern is in the call (incidental warning surface).
+- **`PromotePattern::is_edge()`**, **`PromotePattern::edge_type_name()`** — discriminators for callers iterating heterogeneous pattern slices.
 
 ### Behaviour and limits
 
-- **Diff bucket key is VID, not UID.** Sufficient for the spec §3.3 / §3.4 fork-vs-parent use cases because the fork inherits primary's VIDs above its HWM. Cross-fork-without-shared-ancestor diff under VID is unreliable and is out of scope for Phase 6; the limit is documented on `ForkDiff`'s rustdoc.
-- **Promote does derive UIDs**, via the same `compute_vertex_uid(label, ext_id=None, properties)` hash that the writer uses on insert, so dedup is correct under content-addressed identity regardless of which side allocated the VID.
-- **Promote requires labels to pre-exist on primary.** Fork-only labels created via fork-local schema overlay must be `db.schema().label(...).apply().await` on primary before promote; otherwise the call errors with `UniError::LabelNotFound` *before* opening the primary transaction.
+- **Content-addressed identity.** Vertex UID is `compute_vertex_uid(label, None, properties)` (SHA3-256). Edge UID is the tuple `(src_uid, dst_uid)` keyed by edge type. Parallel edges of the same type between the same endpoints are not distinguishable — Phase 6b's MVP collapses them. Multi-edge support would require an edge-content hash and is out of scope.
+- **`UidIndex` leakage.** The shared `indexes/uni_id_to_vid/{label}/index.lance` dataset is *not* branch-isolated. The fork's writes register their fork-only VIDs in primary's view of the index. The `resolve_primary_vid` helper in `fork_diff.rs` corrects for this by verifying the candidate VID via `MATCH (n:Label) WHERE id(n) = $vid` on a primary session — primary's branched backend naturally excludes fork rows. Use this helper for every primary UID→VID lookup.
+- **Same-call edge endpoint visibility.** When a `Vertex` pattern and an `Edge` pattern both appear in one `promote_from_fork` call, the just-inserted vertices' VIDs aren't visible to a primary Cypher round-trip (tx_l0 isn't reflected until commit). The engine threads a `HashMap<(label, uid), vid>` cache through `run_promote` so edge endpoint resolution checks the cache before falling back to `resolve_primary_vid`. Single-tx atomicity is preserved.
+- **Fork flush on promote.** `Uni::promote_from_fork` always calls `fork.flush().await?` immediately after opening the fresh fork session. Vertices happen to be visible without flush in practice, but edge data from a now-dropped earlier fork session may not be — relying on the asymmetry would silently miss promotion targets.
 
 ## Forks (Phase 5b — vector + FTS fork-local fusion)
 

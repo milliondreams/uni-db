@@ -158,6 +158,22 @@ except uni_db.UniForkBudgetExceededError as e:
 See `bindings/uni-db/examples/fork_quickstart.py` and
 `bindings/uni-db/examples/fork_audit.py` for runnable demos. Full
 reference at `docs/complete_python_api.md` § "24. Forks (Phase 4b)".
-- Fork-local index fusion — Phase 5.
+
+## Fork-local index fusion (Phase 5a-impl)
+
+Once a fork accumulates ~10k rows on a label whose column primary has
+indexed, the background builder schedules a fork-local `ScalarBtree`
+build automatically. After the build registers, the planner rewrites
+`MATCH (n:L {col: $x})` queries on the fork from `Scan` to
+`FusedIndexScan { kind: BtreeUnion }` — visible in
+`session.query_with(...).explain().await?.plan_text`.
+
+For deterministic builds (tests, power users) call
+`Session::build_fork_local_index(label, column, kind)` with
+`ForkLocalIndexKind::ScalarBtree`, `Sorted`, or `VidUid`. Lossless
+types only in 5a-impl; vector ANN + BM25 RRF land in Phase 5b.
+
+What's left after 5a-impl:
+- Vector ANN + BM25 RRF fusion — Phase 5b alongside recall benchmarks.
 - Diff and promotion — Phase 6.
 - Property additions through `fork_schema()` (label/edge-type only for now; `SchemaDelta::added_properties` is reserved for a follow-up).

@@ -502,6 +502,17 @@ pub struct UniConfig {
     /// switches to `FusedIndexScan` once the build completes. Default
     /// 10,000 rows per spec §8.
     pub fork_index_build_threshold: u64,
+
+    /// Phase 5a-impl Step 7: how often the background fork index
+    /// builder polls active forks for build candidates. Default
+    /// 30 seconds.
+    pub fork_index_builder_interval: Duration,
+
+    /// Phase 5a-impl Step 7: skip spawning the background fork index
+    /// builder. Tests that exercise the manual `Session::build_fork_local_index`
+    /// trigger should set this to `true` so timing isn't dependent on
+    /// the polling cadence.
+    pub disable_fork_index_builder: bool,
 }
 
 impl Default for UniConfig {
@@ -537,6 +548,8 @@ impl Default for UniConfig {
             fork_sweeper_interval: Duration::from_secs(60),
             disable_fork_sweeper: false,
             fork_index_build_threshold: 10_000,
+            fork_index_builder_interval: Duration::from_secs(30),
+            disable_fork_index_builder: false,
         }
     }
 }

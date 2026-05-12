@@ -193,8 +193,13 @@ impl crate::api::UniInner {
         let ast = uni_cypher::parse(cypher).map_err(into_parse_error)?;
 
         let planner = uni_query::QueryPlanner::new(self.schema.schema().clone());
+        let logical_plan = planner.plan(ast).map_err(|e| into_query_error(e, cypher))?;
+        // Phase 5a-impl: apply fork-aware fusion rewrite so explain
+        // output reflects the operators the executor will actually
+        // pick on a forked session.
+        let logical_plan = uni_query::rewrite_for_fork_fusion(logical_plan, &*self.storage);
         planner
-            .explain_plan(ast)
+            .explain_logical_plan(&logical_plan)
             .map_err(|e| into_query_error(e, cypher))
     }
 
@@ -208,6 +213,7 @@ impl crate::api::UniInner {
 
         let planner = uni_query::QueryPlanner::new(self.schema.schema().clone());
         let logical_plan = planner.plan(ast).map_err(|e| into_query_error(e, cypher))?;
+        let logical_plan = uni_query::rewrite_for_fork_fusion(logical_plan, &*self.storage);
 
         let mut executor = uni_query::Executor::new(self.storage.clone());
         executor.set_config(self.config.clone());
@@ -273,6 +279,7 @@ impl crate::api::UniInner {
         let planner =
             uni_query::QueryPlanner::new(self.schema.schema().clone()).with_params(params.clone());
         let logical_plan = planner.plan(ast).map_err(|e| into_query_error(e, cypher))?;
+        let logical_plan = uni_query::rewrite_for_fork_fusion(logical_plan, &*self.storage);
 
         let mut executor = uni_query::Executor::new(self.storage.clone());
         executor.set_config(config.clone());
@@ -403,6 +410,7 @@ impl crate::api::UniInner {
         let planner =
             uni_query::QueryPlanner::new(self.schema.schema().clone()).with_params(params.clone());
         let logical_plan = planner.plan(ast).map_err(|e| into_query_error(e, cypher))?;
+        let logical_plan = uni_query::rewrite_for_fork_fusion(logical_plan, &*self.storage);
         let plan_time = plan_start.elapsed();
 
         let mut executor = uni_query::Executor::new(self.storage.clone());
@@ -496,6 +504,7 @@ impl crate::api::UniInner {
         let planner =
             uni_query::QueryPlanner::new(self.schema.schema().clone()).with_params(params.clone());
         let logical_plan = planner.plan(ast).map_err(|e| into_query_error(e, cypher))?;
+        let logical_plan = uni_query::rewrite_for_fork_fusion(logical_plan, &*self.storage);
 
         let mut executor = uni_query::Executor::new(self.storage.clone());
         executor.set_config(self.config.clone());
@@ -649,6 +658,7 @@ impl crate::api::UniInner {
         let planner =
             uni_query::QueryPlanner::new(self.schema.schema().clone()).with_params(params.clone());
         let logical_plan = planner.plan(ast).map_err(|e| into_query_error(e, cypher))?;
+        let logical_plan = uni_query::rewrite_for_fork_fusion(logical_plan, &*self.storage);
 
         let mut result = self
             .execute_plan_internal(logical_plan, cypher, params, config, cancellation_token)
@@ -672,6 +682,7 @@ impl crate::api::UniInner {
         let planner =
             uni_query::QueryPlanner::new(self.schema.schema().clone()).with_params(params.clone());
         let logical_plan = planner.plan(ast).map_err(|e| into_query_error(e, cypher))?;
+        let logical_plan = uni_query::rewrite_for_fork_fusion(logical_plan, &*self.storage);
         let plan_time = plan_start.elapsed();
 
         let mut executor = uni_query::Executor::new(self.storage.clone());
@@ -756,6 +767,7 @@ impl crate::api::UniInner {
         let planner =
             uni_query::QueryPlanner::new(self.schema.schema().clone()).with_params(params.clone());
         let logical_plan = planner.plan(ast).map_err(|e| into_query_error(e, cypher))?;
+        let logical_plan = uni_query::rewrite_for_fork_fusion(logical_plan, &*self.storage);
         let plan_time = plan_start.elapsed();
 
         let mut executor = uni_query::Executor::new(self.storage.clone());

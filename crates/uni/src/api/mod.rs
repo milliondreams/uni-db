@@ -15,6 +15,7 @@ pub mod bulk;
 pub mod compaction;
 pub mod fork;
 pub mod fork_schema;
+pub(crate) mod fork_index_builder;
 pub(crate) mod fork_sweeper;
 pub mod functions;
 pub mod hooks;
@@ -1906,6 +1907,11 @@ impl UniBuilder {
         let sweeper_interval = self.config.fork_sweeper_interval;
         let sweeper_disabled = self.config.disable_fork_sweeper;
         let sweeper_shutdown_rx = shutdown_handle.subscribe();
+        // Phase 5a-impl Step 7: same for the fork index builder.
+        let index_builder_interval = self.config.fork_index_builder_interval;
+        let index_builder_threshold = self.config.fork_index_build_threshold;
+        let index_builder_disabled = self.config.disable_fork_index_builder;
+        let index_builder_shutdown_rx = shutdown_handle.subscribe();
 
         let db = Uni {
             inner: Arc::new(UniInner {
@@ -1945,6 +1951,18 @@ impl UniBuilder {
             sweeper_interval,
             sweeper_disabled,
             sweeper_shutdown_rx,
+        ) {
+            db.inner.shutdown_handle.track_task(handle);
+        }
+
+        // Phase 5a-impl Step 7: spawn the fork index builder (no-op
+        // when disabled).
+        if let Some(handle) = fork_index_builder::spawn(
+            db.inner.clone(),
+            index_builder_interval,
+            index_builder_threshold,
+            index_builder_disabled,
+            index_builder_shutdown_rx,
         ) {
             db.inner.shutdown_handle.track_task(handle);
         }

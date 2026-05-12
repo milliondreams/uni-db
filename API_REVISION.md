@@ -244,6 +244,48 @@ Builds on Phase 2. `forked.fork(name)` now succeeds, producing a child whose rea
 - A nested fork's Lance branch has `base_paths = child_branch → parent_branch → main`. Datasets that the parent didn't have a branch for at child-creation time fall through to the existing on-the-fly creation path (`BranchedBackend::ensure_branch_for_new`) — the empty-parent commit still lands on main, which is safe because no ancestor's schema references a fork-only label.
 - `ForkInfo.parent_fork_id` is serialized into `catalog/fork_registry.json`. Field has lived in the schema since Phase 1 with serde round-trip tests; no migration needed.
 
+## Forks (Phase 5a-impl — fork-local index fusion)
+
+Builds on Phase 5a substrate (commit `90b62131`). Adds the build pipeline, planner integration, and `FusedIndexScan` operator for the three lossless fusion types (BTree union, sorted k-way merge, fork-first VID/UID lookup). Lossy types (vector ANN, BM25 RRF) are Phase 5b.
+
+### New public API (Phase 5a-impl)
+
+- **`Session::build_fork_local_index(label, column, kind)`** — manual trigger that builds (or registers, for VidUid) a fork-local index. Bypasses the per-fork fragment-count threshold the background builder honors. Errors with `UniError::InvalidArgument` on a non-forked session.
+- **`UniConfig::fork_index_builder_interval: Duration`** — background builder polling cadence. Default 30 seconds.
+- **`UniConfig::disable_fork_index_builder: bool`** — skip spawning the background builder. Default `false`.
+- **`uni_query::FusionKind` enum** (re-exported from the query crate): `BtreeUnion`, `SortedKWayMerge`, `VidUidForkFirst`. `#[non_exhaustive]` so Phase 5b's `AnnRerank` and `Bm25Rrf` are additive.
+- **`uni_query::LogicalPlan::FusedIndexScan` variant** with the same fields as `Scan` plus `kind: FusionKind`. Visible in `Session::query_with(...).explain()` output as `FusedIndexScan` for testability.
+- **`uni_query::rewrite_for_fork_fusion(plan, lookup)`** — pure-function logical-plan post-pass. Walks the tree, rewrites `Scan`s whose `(label, column)` has a registered fork-local index. Called once after every `planner.plan(ast)` site in `crates/uni/src/api/impl_query.rs`.
+- **`uni_query::ForkIndexLookup` trait** — bridge that lets `StorageManager::fork_index_exists` participate in the rewrite without circular crate dependencies. Implemented for `StorageManager`; tests can mock by implementing on a `HashMap`.
+
+### Substrate additions
+
+- **Lance per-branch index spike** (`crates/uni-store/src/backend/lance_branch.rs::tests::phase5a_spike_per_branch_index`) — confirmed (outcome 1 from the plan): `Dataset::create_index_builder` against a branch-checked-out dataset writes the index file branch-locally and does not leak to main. Run with `cargo nextest run -p uni-store --lib backend::lance_branch::tests::phase5a_spike_per_branch_index --run-ignored ignored-only --no-capture`.
+- **`uni_store::backend::lance_branch::create_scalar_index_on_branch(uri, branch, column, index_name)`** — thin wrapper exposing Lance's per-branch index build.
+- **`uni_store::fork::index_builder::build_fork_local_index(scope, base_uri, label, column, kind)`** — entry point for both the manual and automatic build paths. VidUid is a no-op (no Lance file written; only the `ForkScope` registry entry); ScalarBtree and Sorted call through to `create_scalar_index_on_branch` and register on success.
+- **`crates/uni/src/api/fork_index_builder.rs`** — background scheduler mirroring `fork_sweeper`. Polls `ForkRegistryHandle::list_active`, walks each fork's `fragment_counts`, builds `ScalarBtree` for any column primary has indexed (where the fork hasn't already registered).
+
+### Behavior
+
+- **Read correctness on forked sessions is preserved end-to-end through Lance `base_paths` — with or without fork-local indexes registered.** The Phase 5a-impl decay (`FusedIndexScan` → `Scan` at the physical layer) is intentional; the lossless fusion semantics fall out of Lance's chained reads. The planner emission carries observable signal for explain output.
+- **Error path:** index build failures are logged-and-continued by the background builder; they propagate to the caller via `Result<()>` from the manual trigger.
+
+### Tests
+
+- `crates/uni/tests/fork_index_vid_uid.rs` (2) — VidUid registration triggers planner rewrite; non-forked session errors with `InvalidArgument`.
+- `crates/uni/tests/fork_index_btree.rs` (1) — ScalarBtree registration triggers `BtreeUnion` rewrite; queries return correct results across primary + fork rows.
+- `crates/uni/tests/fork_index_sorted.rs` (1) — Sorted registration triggers `SortedKWayMerge` rewrite; ORDER BY produces a globally sorted interleave of primary + fork rows.
+- `crates/uni/tests/fork_index_auto_build.rs` (1) — auto-builder fires within 5s when fork crosses `fork_index_build_threshold` and primary has an indexed column.
+- `bindings/uni-db/tests/test_fork_index_smoke.py` (1) — Python smoke confirming fork query results are correct end-to-end.
+
+### Phase 5a-impl limits (Phase 5b will lift)
+
+- `FusedIndexScan` decays to `Scan` at the physical planner — no bespoke `Fused*Exec` operators yet. Lossless types don't need them; lossy types in Phase 5b will.
+- Vector ANN and BM25 RRF fusion (lossy types) — Phase 5b alongside recall benchmarks.
+- Inverted-index fusion folds into BM25 RRF (Phase 5b).
+- Auto-builder builds ScalarBtree only; Sorted and VidUid are explicit-only.
+- Index fusion across nested-fork chains deeper than `parent → child` is not implemented.
+
 ## Forks (Phase 4a — lifecycle & admin, Rust)
 
 Builds on Phase 3. Adds TTL, budget, tags, parent→child cancellation linkage, and lifts the Phase 1 pin+fork restriction. Python bindings remain pending (Phase 4b).

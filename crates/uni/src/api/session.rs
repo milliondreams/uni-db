@@ -512,6 +512,54 @@ impl Session {
         }
     }
 
+    /// Phase 5a-impl: build a fork-local index immediately on this
+    /// session's fork branch. The build registers the index on the
+    /// session's `ForkScope`; subsequent reads through the planner
+    /// will pick `FusedIndexScan` against `(label, column)`.
+    ///
+    /// Bypasses the per-fork fragment-count threshold that the
+    /// background scheduler honors — useful for tests and for power
+    /// users who want immediate index materialization.
+    ///
+    /// # Errors
+    ///
+    /// - [`UniError::InvalidArgument`] when called on a non-forked
+    ///   session.
+    /// - Underlying Lance build failure (`UniError::Internal`).
+    pub async fn build_fork_local_index(
+        &self,
+        label: &str,
+        column: &str,
+        kind: uni_store::fork::ForkLocalIndexKind,
+    ) -> Result<()> {
+        let Some(scope) = self.fork_scope() else {
+            return Err(UniError::InvalidArgument {
+                arg: "self".into(),
+                message: "build_fork_local_index requires a forked session".into(),
+            });
+        };
+        // Flush any pending L0 first so the build sees the current
+        // tip. For VidUid this is belt-and-braces — the builder is a
+        // no-op there — but for BTree/Sorted it ensures the Lance
+        // index covers all rows the user has committed.
+        if let Some(writer_lock) = &self.db.writer {
+            let mut writer = writer_lock.write().await;
+            writer
+                .flush_to_l1(None)
+                .await
+                .map_err(UniError::Internal)?;
+        }
+        uni_store::fork::index_builder::build_fork_local_index(
+            &scope,
+            self.db.storage.base_uri(),
+            label,
+            column,
+            kind,
+        )
+        .await
+        .map_err(UniError::Internal)
+    }
+
     /// Create a transaction with builder options (timeout, isolation level).
     pub fn tx_with(&self) -> TransactionBuilder<'_> {
         TransactionBuilder {

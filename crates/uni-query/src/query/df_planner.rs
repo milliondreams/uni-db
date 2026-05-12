@@ -582,6 +582,20 @@ impl HybridPhysicalPlanner {
                 variable,
                 filter,
                 optional,
+            }
+            // Phase 5a-impl Step 3: decay `FusedIndexScan` to a plain
+            // `Scan` for now — preserves correctness because Lance's
+            // `base_paths` chain already covers parent-inherited
+            // indexes for forked sessions. Step 4 (VidUid) and
+            // beyond replace this fallback with type-specific fused
+            // physical operators.
+            | LogicalPlan::FusedIndexScan {
+                label_id,
+                labels,
+                variable,
+                filter,
+                optional,
+                kind: _,
             } => {
                 if labels.len() > 1 {
                     // Multi-label: use main table with intersection semantics
@@ -5051,6 +5065,7 @@ fn resolve_fold_bindings(
 fn collect_variable_kinds(plan: &LogicalPlan, kinds: &mut HashMap<String, VariableKind>) {
     match plan {
         LogicalPlan::Scan { variable, .. }
+        | LogicalPlan::FusedIndexScan { variable, .. }
         | LogicalPlan::ExtIdLookup { variable, .. }
         | LogicalPlan::ScanAll { variable, .. }
         | LogicalPlan::ScanMainByLabels { variable, .. }

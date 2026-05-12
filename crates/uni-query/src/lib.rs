@@ -30,7 +30,10 @@ pub use query::executor::procedure::{
     ProcedureOutput, ProcedureParam, ProcedureRegistry, ProcedureValueType, RegisteredProcedure,
 };
 pub use query::executor::{CustomFunctionRegistry, CustomScalarFn, Executor, ResultNormalizer};
-pub use query::planner::{CostEstimates, ExplainOutput, IndexUsage, LogicalPlan, QueryPlanner};
+pub use query::planner::{
+    CostEstimates, ExplainOutput, ForkIndexLookup, FusionKind, IndexUsage, LogicalPlan,
+    QueryPlanner, rewrite_for_fork_fusion,
+};
 pub use types::{
     Edge, ExecuteResult, FromValue, Node, Path, QueryCursor, QueryMetrics, QueryResult,
     QueryWarning, Row, Value,

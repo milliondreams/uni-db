@@ -14,6 +14,7 @@
 // Rust guideline compliant
 
 pub mod id_alloc;
+pub mod index_builder;
 pub mod recovery;
 pub mod registry;
 pub mod scope;

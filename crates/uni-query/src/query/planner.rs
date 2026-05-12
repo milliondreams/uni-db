@@ -1701,6 +1701,23 @@ pub struct QppStepInfo {
     pub target_label: Option<String>,
 }
 
+/// Phase 5a-impl: per-type fusion strategy for `LogicalPlan::FusedIndexScan`.
+///
+/// `#[non_exhaustive]` so Phase 5b can add `AnnRerank` and `Bm25Rrf`
+/// without breaking downstream pattern-match exhaustiveness.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum FusionKind {
+    /// Union of parent + fork-local BTree hits, deduped by VID.
+    BtreeUnion,
+    /// k-way merge of pre-sorted parent + fork streams (ORDER BY).
+    SortedKWayMerge,
+    /// Fork-first UID lookup; falls back to parent on miss. Used
+    /// when a fork rebinds an external UID and queries must see the
+    /// fork's binding before the parent's.
+    VidUidForkFirst,
+}
+
 /// Logical query plan produced by [`QueryPlanner`].
 ///
 /// Each variant represents one step in the Cypher execution pipeline.
@@ -1722,6 +1739,26 @@ pub enum LogicalPlan {
         variable: String,
         filter: Option<Expr>,
         optional: bool,
+    },
+    /// Phase 5a-impl: fused scan over both primary's index and the
+    /// forked session's fork-local index. Emitted by the planner only
+    /// when (a) the session is forked AND (b) `StorageManager::fork_index_exists`
+    /// returns `Some(_)` for the target column. Otherwise the planner
+    /// keeps emitting `Scan` and Lance's `base_paths` chain transparently
+    /// covers parent-inherited indexes.
+    ///
+    /// `kind` selects the per-type fusion strategy:
+    /// - `BtreeUnion` — union of parent + fork hits, dedup by VID.
+    /// - `SortedKWayMerge` — k-way merge of two pre-sorted streams.
+    /// - `VidUidForkFirst` — probe fork's branch first, fall back to
+    ///   parent's UID index on miss.
+    FusedIndexScan {
+        label_id: u16,
+        labels: Vec<String>,
+        variable: String,
+        filter: Option<Expr>,
+        optional: bool,
+        kind: FusionKind,
     },
     /// Lookup vertices by ext_id using the main vertices table.
     /// Used when a query references ext_id without specifying a label.
@@ -8178,6 +8215,218 @@ fn analyze_function_property_requirements(
             }
         }
     }
+}
+
+// ============================================================================
+// Phase 5a-impl — fork-aware fusion rewrite
+// ============================================================================
+
+/// Trait that exposes the per-fork "is there a fork-local index for
+/// `(label, column)`?" lookup. Implemented for `StorageManager` so
+/// callers don't need to depend on the fork module directly; tests
+/// can mock by implementing it on a `HashMap`.
+pub trait ForkIndexLookup {
+    fn fork_index_for(
+        &self,
+        label: &str,
+        column: &str,
+    ) -> Option<uni_store::fork::ForkLocalIndexKind>;
+}
+
+impl ForkIndexLookup for uni_store::storage::StorageManager {
+    fn fork_index_for(
+        &self,
+        label: &str,
+        column: &str,
+    ) -> Option<uni_store::fork::ForkLocalIndexKind> {
+        self.fork_index_exists(label, column)
+    }
+}
+
+/// Walk a [`LogicalPlan`] tree and rewrite each `Scan` whose target
+/// `(label, column)` has a registered fork-local index into the
+/// matching `FusedIndexScan` variant.
+///
+/// Phase 5a-impl Step 4 covers `VidUidForkFirst`; Steps 5 and 6 add
+/// `BtreeUnion` and `SortedKWayMerge` by extending `kind_for_filter`.
+///
+/// Idempotent: a tree that already contains `FusedIndexScan` nodes
+/// passes through unchanged.
+#[must_use]
+pub fn rewrite_for_fork_fusion<L: ForkIndexLookup>(
+    plan: LogicalPlan,
+    lookup: &L,
+) -> LogicalPlan {
+    rewrite_node(plan, lookup)
+}
+
+fn rewrite_node<L: ForkIndexLookup>(plan: LogicalPlan, lookup: &L) -> LogicalPlan {
+    match plan {
+        LogicalPlan::Scan {
+            label_id,
+            labels,
+            variable,
+            filter,
+            optional,
+        } => {
+            // VidUid fusion only fires on a single-label scan with an
+            // equality filter on a registered UID column. BTree and
+            // Sorted will extend this match in Steps 5 and 6.
+            let kind = if labels.len() == 1
+                && let Some(col) = filter
+                    .as_ref()
+                    .and_then(|f| equality_target_column(f, &variable))
+                && let Some(idx_kind) = lookup.fork_index_for(&labels[0], &col)
+            {
+                Some(into_fusion_kind(idx_kind))
+            } else {
+                None
+            };
+            match kind {
+                Some(kind) => LogicalPlan::FusedIndexScan {
+                    label_id,
+                    labels,
+                    variable,
+                    filter,
+                    optional,
+                    kind,
+                },
+                None => LogicalPlan::Scan {
+                    label_id,
+                    labels,
+                    variable,
+                    filter,
+                    optional,
+                },
+            }
+        }
+        // Tree-recursive variants — only the ones that can carry a
+        // Scan in their subtree need to recurse here. Adding more is
+        // safe (a missing recursion just means fusion doesn't fire
+        // for that nested context, not incorrect results).
+        LogicalPlan::Filter {
+            input,
+            predicate,
+            optional_variables,
+        } => LogicalPlan::Filter {
+            input: Box::new(rewrite_node(*input, lookup)),
+            predicate,
+            optional_variables,
+        },
+        LogicalPlan::Project { input, projections } => LogicalPlan::Project {
+            input: Box::new(rewrite_node(*input, lookup)),
+            projections,
+        },
+        LogicalPlan::Limit {
+            input,
+            skip,
+            fetch,
+        } => LogicalPlan::Limit {
+            input: Box::new(rewrite_node(*input, lookup)),
+            skip,
+            fetch,
+        },
+        LogicalPlan::Sort { input, order_by } => {
+            // Phase 5a-impl Sorted fusion: when the immediate child
+            // is a single-label Scan AND the sole sort key is a
+            // single-column property reference on that scan's
+            // variable AND the column has a fork-local Sorted index
+            // registered, rewrite to FusedIndexScan { SortedKWayMerge }.
+            // Otherwise recurse normally.
+            let new_input = match (*input, &order_by[..]) {
+                (
+                    LogicalPlan::Scan {
+                        label_id,
+                        labels,
+                        variable,
+                        filter,
+                        optional,
+                    },
+                    [single_sort],
+                ) if labels.len() == 1
+                    && let Some(col) =
+                        column_of_scan_variable(&single_sort.expr, &variable)
+                    && let Some(uni_store::fork::ForkLocalIndexKind::Sorted) =
+                        lookup.fork_index_for(&labels[0], &col) =>
+                {
+                    LogicalPlan::FusedIndexScan {
+                        label_id,
+                        labels,
+                        variable,
+                        filter,
+                        optional,
+                        kind: FusionKind::SortedKWayMerge,
+                    }
+                }
+                (other_input, _) => rewrite_node(other_input, lookup),
+            };
+            LogicalPlan::Sort {
+                input: Box::new(new_input),
+                order_by,
+            }
+        }
+        LogicalPlan::Union { left, right, all } => LogicalPlan::Union {
+            left: Box::new(rewrite_node(*left, lookup)),
+            right: Box::new(rewrite_node(*right, lookup)),
+            all,
+        },
+        // Everything else passes through unchanged. Adding more
+        // arms is purely additive — fusion just doesn't fire inside
+        // un-recursed-into subtrees.
+        other => other,
+    }
+}
+
+/// Map a fork-local index kind to its planner-side fusion variant.
+fn into_fusion_kind(kind: uni_store::fork::ForkLocalIndexKind) -> FusionKind {
+    use uni_store::fork::ForkLocalIndexKind as K;
+    match kind {
+        K::VidUid => FusionKind::VidUidForkFirst,
+        K::ScalarBtree => FusionKind::BtreeUnion,
+        K::Sorted => FusionKind::SortedKWayMerge,
+    }
+}
+
+/// Inspect a Scan filter `Expr` for a single-column equality predicate
+/// against the scan's variable. Returns the column name if the
+/// predicate matches the shape `variable.column = <literal_or_param>`
+/// (or its commuted form). Returns `None` for any other shape — fusion
+/// only fires on the simple case in Phase 5a-impl.
+fn equality_target_column(filter: &Expr, scan_variable: &str) -> Option<String> {
+    let (lhs, rhs) = match filter {
+        Expr::BinaryOp {
+            left,
+            op: uni_cypher::ast::BinaryOp::Eq,
+            right,
+        } => (left.as_ref(), right.as_ref()),
+        _ => return None,
+    };
+    // Try lhs = column-of-scan-var, rhs = literal/param; or commuted.
+    if let Some(col) = column_of_scan_variable(lhs, scan_variable)
+        && is_constant_or_param(rhs)
+    {
+        return Some(col);
+    }
+    if let Some(col) = column_of_scan_variable(rhs, scan_variable)
+        && is_constant_or_param(lhs)
+    {
+        return Some(col);
+    }
+    None
+}
+
+fn column_of_scan_variable(expr: &Expr, scan_variable: &str) -> Option<String> {
+    if let Expr::Property(base, prop) = expr
+        && let Expr::Variable(v) = base.as_ref()
+        && v == scan_variable
+    {
+        return Some(prop.clone());
+    }
+    None
+}
+
+fn is_constant_or_param(expr: &Expr) -> bool {
+    matches!(expr, Expr::Literal(_) | Expr::Parameter(_))
 }
 
 #[cfg(test)]

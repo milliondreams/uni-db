@@ -466,6 +466,33 @@ impl Session {
     /// on a non-forked session.
     pub fn fork_schema(&self) -> ForkSchemaBuilder<'_>;
 
+    /// Phase 5a-impl: build (or register) a fork-local index
+    /// immediately on this session's fork branch. Bypasses the
+    /// per-fork fragment-count threshold the background builder
+    /// honors. After the build, `Session::query_with(...).explain()`
+    /// shows `FusedIndexScan` for matching `(label, column)` queries.
+    ///
+    /// `kind` selects:
+    /// - `ForkLocalIndexKind::ScalarBtree` — Lance native scalar
+    ///   index on the fork's branch (BTree union fusion).
+    /// - `ForkLocalIndexKind::Sorted` — same Lance scalar index,
+    ///   exposed for ORDER BY k-way merge fusion.
+    /// - `ForkLocalIndexKind::VidUid` — planner-marker only; no
+    ///   Lance file is written. Lance's `base_paths` chain on the
+    ///   fork's branch already provides fork-first lookup
+    ///   semantics — the registry entry alone tells the planner to
+    ///   emit `FusedIndexScan { kind: VidUidForkFirst }`.
+    ///
+    /// Errors with `UniError::InvalidArgument` on a non-forked
+    /// session. Errors with `UniError::Internal` on a Lance build
+    /// failure (e.g. unsupported column type for BTree).
+    pub async fn build_fork_local_index(
+        &self,
+        label: &str,
+        column: &str,
+        kind: uni_store::fork::ForkLocalIndexKind,
+    ) -> Result<()>;
+
     // ── Version Pinning ──
 
     /// Pin this session to a specific snapshot version.

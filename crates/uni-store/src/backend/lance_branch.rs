@@ -224,6 +224,39 @@ fn inject_fault_delete_branch() -> Result<()> {
     Ok(())
 }
 
+/// Create a scalar BTree index on a branch-checked-out dataset
+/// (Phase 5a-impl). The Phase 5a spike confirmed Lance writes the
+/// index file branch-locally — main sees zero indexes after this
+/// call; only the branch sees the new one.
+///
+/// Used by `fork_index_builder::build_fork_local_index` to land
+/// fork-local BTree / Sorted indexes without touching primary's
+/// index set.
+///
+/// # Errors
+///
+/// - The dataset or branch cannot be opened.
+/// - Lance rejects the column (e.g. unsupported type).
+/// - Object-store IO failures.
+pub async fn create_scalar_index_on_branch(
+    uri: &str,
+    branch: &str,
+    column: &str,
+    index_name: &str,
+) -> Result<()> {
+    use lance_index::{DatasetIndexExt, IndexType, scalar::ScalarIndexParams};
+    let mut on_branch = open_branch(uri, branch).await?;
+    on_branch
+        .create_index_builder(&[column], IndexType::Scalar, &ScalarIndexParams::default())
+        .name(index_name.to_string())
+        .replace(true)
+        .await
+        .with_context(|| {
+            format!("create_scalar_index_on_branch({uri}@{branch}, column={column})")
+        })?;
+    Ok(())
+}
+
 /// Create a Lance tag pinning `branch`'s current tip (Phase 4a).
 ///
 /// Tags are GC-exempt references — Lance's compaction retention sweep
@@ -723,5 +756,84 @@ mod tests {
         // Primary saw the new rows
         let primary = Dataset::open(&uri).await.unwrap();
         assert_eq!(primary.count_rows(None).await.unwrap(), 5);
+    }
+
+    /// Phase 5a spike: probe whether `Dataset::create_index_builder`
+    /// against a branch-checked-out dataset produces a branch-local
+    /// index, leaks to main, or is rejected.
+    ///
+    /// This test isn't a behavior gate — it documents the observed
+    /// Lance per-branch index semantics so the `fork_index_builder`
+    /// implementation knows which path is real.
+    #[tokio::test]
+    #[ignore = "phase-5a spike: documents Lance per-branch index semantics; run with --run-ignored ignored-only"]
+    async fn phase5a_spike_per_branch_index() {
+        use lance_index::{DatasetIndexExt, IndexType, scalar::ScalarIndexParams};
+
+        let (_dir, uri) = seed_dataset().await;
+        let v_main = current_version(&uri).await.unwrap();
+        create_branch(&uri, "fork-spike", v_main).await.unwrap();
+
+        // Append fork-only rows on the branch.
+        let batch = test_batch(vec![100, 101, 102], vec![1000, 1100, 1200]);
+        let reader = arrow_array::RecordBatchIterator::new(
+            vec![Ok(batch)].into_iter(),
+            test_schema(),
+        );
+        write_to_branch(&uri, "fork-spike", reader).await.unwrap();
+
+        // Probe 1: try to build a scalar BTree on `id` against the branch.
+        let mut on_branch = open_branch(&uri, "fork-spike").await.unwrap();
+        let scalar_params = ScalarIndexParams::default();
+        let result = on_branch
+            .create_index_builder(&["id"], IndexType::Scalar, &scalar_params)
+            .name("phase5a_spike".to_string())
+            .replace(true)
+            .await;
+
+        match result {
+            Ok(metadata) => {
+                eprintln!(
+                    "SPIKE OUTCOME 1 OR 2: index created. name={} uuid={} dataset_version={}",
+                    metadata.name, metadata.uuid, metadata.dataset_version
+                );
+                // Probe whether the index is visible from main vs only from the branch.
+                let main_after = Dataset::open(&uri).await.unwrap();
+                let main_indices = main_after.load_indices().await.unwrap();
+                let branch_after = open_branch(&uri, "fork-spike").await.unwrap();
+                let branch_indices = branch_after.load_indices().await.unwrap();
+                eprintln!(
+                    "main has {} index(es) after branch build; branch has {}",
+                    main_indices.len(),
+                    branch_indices.len()
+                );
+                for idx in main_indices.iter() {
+                    eprintln!(
+                        "  main index: name={} uuid={}",
+                        idx.name, idx.uuid
+                    );
+                }
+                for idx in branch_indices.iter() {
+                    eprintln!(
+                        "  branch index: name={} uuid={}",
+                        idx.name, idx.uuid
+                    );
+                }
+                let leaked_to_main = main_indices
+                    .iter()
+                    .any(|i: &lance::table::format::IndexMetadata| i.name == "phase5a_spike");
+                let on_branch_only = branch_indices
+                    .iter()
+                    .any(|i: &lance::table::format::IndexMetadata| i.name == "phase5a_spike");
+                eprintln!(
+                    "SPIKE VERDICT: branch-local={} leaked-to-main={}",
+                    on_branch_only && !leaked_to_main,
+                    leaked_to_main
+                );
+            }
+            Err(e) => {
+                eprintln!("SPIKE OUTCOME 3: Lance refused per-branch index: {e}");
+            }
+        }
     }
 }

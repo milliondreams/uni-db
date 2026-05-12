@@ -547,6 +547,55 @@ impl AsyncDatabase {
         })
     }
 
+    /// Structural diff between primary and a named fork.
+    fn diff_fork_primary<'py>(
+        &self,
+        py: Python<'py>,
+        fork_name: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let db = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            db.diff_fork_primary(&fork_name)
+                .await
+                .map(crate::types::PyForkDiff::from_rust)
+                .map_err(crate::exceptions::uni_error_to_pyerr)
+        })
+    }
+
+    /// Structural diff between two named forks.
+    fn diff_forks<'py>(
+        &self,
+        py: Python<'py>,
+        a: String,
+        b: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let db = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            db.diff_forks(&a, &b)
+                .await
+                .map(crate::types::PyForkDiff::from_rust)
+                .map_err(crate::exceptions::uni_error_to_pyerr)
+        })
+    }
+
+    /// Promote matched fork rows onto primary in one transaction.
+    fn promote_from_fork<'py>(
+        &self,
+        py: Python<'py>,
+        fork_name: String,
+        patterns: Vec<crate::types::PyPromotePattern>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let db = self.inner.clone();
+        let rust_patterns: Vec<uni_db::PromotePattern> =
+            patterns.into_iter().map(|p| p.inner).collect();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            db.promote_from_fork(&fork_name, &rust_patterns)
+                .await
+                .map(crate::types::PyPromoteReport::from_rust)
+                .map_err(crate::exceptions::uni_error_to_pyerr)
+        })
+    }
+
     /// Access compaction operations.
     fn compaction(&self) -> AsyncCompaction {
         AsyncCompaction {

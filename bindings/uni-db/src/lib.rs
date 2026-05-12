@@ -124,6 +124,18 @@ fn _uni_db(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<async_api::AsyncForkBuilder>()?;
     m.add_class::<async_api::AsyncForkSchemaBuilder>()?;
 
+    // Fork diff & promote types (Phase 7)
+    m.add_class::<types::PyPropertyChange>()?;
+    m.add_class::<types::PyDiffVertex>()?;
+    m.add_class::<types::PyDiffEdge>()?;
+    m.add_class::<types::PyVertexPropertyChange>()?;
+    m.add_class::<types::PyEdgePropertyChange>()?;
+    m.add_class::<types::PyVertexDiff>()?;
+    m.add_class::<types::PyEdgeDiff>()?;
+    m.add_class::<types::PyForkDiff>()?;
+    m.add_class::<types::PyPromotePattern>()?;
+    m.add_class::<types::PyPromoteReport>()?;
+
     // Snapshot & index types
     m.add_class::<types::SnapshotInfo>()?;
     m.add_class::<types::IndexRebuildTaskInfo>()?;

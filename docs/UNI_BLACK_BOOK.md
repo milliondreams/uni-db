@@ -4682,7 +4682,7 @@ Forks unlock four broad use-cases the existing snapshot mechanism cannot cover, 
 - **Scenario exploration.** Run regulatory or compliance simulations on isolated copies of production data without coordinating maintenance windows.
 - **Long-lived sandboxes.** A pinned snapshot expires when its retention window passes; a fork persists until explicitly dropped, with its own session lifecycle.
 
-Phase 1 shipped read-only forks. Phase 2 made forks writable. Phase 3 enabled nested forks (`forked.fork(name)`). Phase 4 will add TTL, tags, watch filtering, hooks/params propagation. Phase 5 lands fork-local index fusion and fork compaction. Phase 6 lands diff + promotion.
+Phase 1 shipped read-only forks. Phase 2 made forks writable. Phase 3 enabled nested forks (`forked.fork(name)`). Phase 4 added TTL, tags, watch filtering, hooks/params propagation, and the full Python binding surface. Phase 5 landed fork-local index fusion (lossless types in 5a, vector + FTS in 5b). Phase 6 / 6b shipped structural diff and write-audit-publish promote with content-addressed UID identity. Phase 7 closed out the user-facing surface — Python bindings for diff/promote, end-to-end use-case suite, schema-evolution × forks test, and the Fork* error-variant audit.
 
 ## Anatomy of a Fork
 
@@ -4877,6 +4877,35 @@ committed via an earlier (now-dropped) fork session can be
 invisible to the new session — vertices happen to be visible
 without flush but the asymmetry is fragile, so promote always
 flushes.
+
+## Schema Evolution × Forks (Phase 7)
+
+A common question: "if I open a fork, then evolve primary's schema,
+does the fork break?" The short answer is **no for label/edge-type
+additions, yes for column-altering changes**. The Phase 7 test
+`crates/uni/tests/fork_schema_evolution.rs` pins the supported
+shape:
+
+- **Adding a new label on primary** while a fork is open or has
+  been previously committed: fully safe. The fork keeps reading
+  its v1 columns through its branch and can be reopened cleanly
+  after the primary evolution. The new label simply doesn't
+  exist on the fork's branch path until the fork is dropped and
+  recreated.
+- **Adding a new edge type on primary**: same — safe and
+  non-disruptive.
+- **Adding a property column to an existing primary label**:
+  not supported on a per-fork basis. A Lance branch shares its
+  parent dataset's Arrow schema, so a fork-local property
+  addition would either leak to primary or break branch
+  read-merge. Phase 3 documented this as the standing limit;
+  the workaround is to drop and recreate the fork after
+  evolving primary.
+
+Tagged historical primary states (via `Uni::tag_fork`) are also
+unaffected by primary schema evolution — the tagged Lance commit
+holds the schema-at-tag-time on disk regardless of what primary's
+HEAD now looks like.
 
 ## Operational Signals
 

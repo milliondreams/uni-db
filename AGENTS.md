@@ -42,6 +42,59 @@
 - Do not perform any git action unless the user has explicitly instructed it in the current conversation turn.
 - This includes all git commands and git-related workflows (for example: `status`, `diff`, `add`, `commit`, `push`, `pull`, `checkout`, `reset`, `merge`, `rebase`, `tag`, `stash`, `cherry-pick`).
 
+## Fork system — current invariants (post Phase 7)
+
+The fork track shipped phases 0 through 7. This block captures the
+*current* contract an agent needs to honor when touching fork code.
+The phase-specific blocks below preserve the rationale and gotchas
+from each phase for deeper context.
+
+- **Registry single-writer rule.** Every mutation to
+  `catalog/fork_registry.json`, `catalog/fork_schemas/*`,
+  `catalog/fork_tombstones/*`, and `catalog/forks/{id}/id_allocator.json`
+  goes through `ForkRegistryHandle`. The 2PC state machine in
+  `crates/uni-store/src/fork/registry.rs` is the only writer; never
+  patch the JSON files directly.
+- **Reads are routed through `BranchedBackend`.** A forked session's
+  `Session::query` and `Session::tx` go through the fork's branched
+  backend, which chains Lance `base_paths` from the fork's branch
+  up to main. Never bypass it to read fork data — the branch
+  resolution is what gives the fork its isolated view.
+- **`UidIndex` is NOT branch-isolated.** The shared
+  `indexes/uni_id_to_vid/{label}/index.lance` dataset accumulates
+  entries from both primary and fork branches. Anything that
+  resolves UID → primary VID must verify the candidate via
+  `MATCH (n:Label) WHERE id(n) = $vid` on a primary session. The
+  `resolve_primary_vid` helper in `crates/uni/src/api/fork_diff.rs`
+  is the canonical implementation.
+- **Diff identity is content UID, not VID.** Vertex pairing is by
+  `compute_vertex_uid(label, ext_id, properties)`; edge pairing is
+  by `(src_uid, dst_uid)` scoped to edge type. VIDs on `DiffVertex`
+  are informational. Two unrelated forks with overlapping VIDs
+  still pair correctly.
+- **Promote is atomic across patterns.** `Uni::promote_from_fork`
+  opens one primary transaction, runs every pattern (vertex first,
+  then edge — within-call vertex inserts feed the edge endpoint
+  cache), and commits once. Don't split into per-pattern
+  transactions.
+- **Promote flushes the fork.** `Uni::promote_from_fork` calls
+  `fork.flush().await?` on the fresh fork session it opens.
+  Vertices happen to be visible without flush in practice but
+  edges may not be from a now-dropped earlier session — relying on
+  the asymmetry would silently miss promotion targets.
+- **Schema growth on primary is safe; per-fork property additions
+  are not.** Adding a new label or edge type on primary does not
+  break existing forks. Adding a property column to an existing
+  primary label *would* either leak to primary or break branch
+  read-merge — not supported. Drop and recreate the fork after
+  evolving primary if you need the new column.
+- **Fork-local index files live under the fork's branch.** Drop
+  and `drop_fork_cascade` clean them up automatically — never
+  special-case index file deletion in the fork drop path.
+- **`UidIndex` registers UIDs from forks too,** which is why every
+  Phase 5 fusion type and every Phase 6/6b promote dedup uses
+  `resolve_primary_vid` rather than raw `UidIndex::get_vid`.
+
 ## Fork invariants (Phase 2)
 - **Registry edits go through `ForkRegistryHandle`.** Never write `catalog/fork_registry.json`, `catalog/fork_schemas/*`, `catalog/fork_tombstones/*`, or `catalog/forks/{fork_id}/id_allocator.json` directly — the 2PC state machine assumes single-writer access through the handle.
 - **Fork creation must not hold any global lock during `lance_branch::create_branch`.** The registry mutex covers metadata PUTs only. Spec §10 requires fork creation not to block primary.

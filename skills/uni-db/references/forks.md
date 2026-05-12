@@ -183,6 +183,55 @@ across primary-inherited and fork-local rows via Lance's
 `base_paths` chain. Recall scaffold lives at
 `crates/uni/tests/fork_index_recall_bench.rs` (`#[ignore]`'d).
 
-What's left after Phase 5b:
-- Diff and promotion — Phase 6.
-- Property additions through `fork_schema()` (label/edge-type only for now; `SchemaDelta::added_properties` is reserved for a follow-up).
+## Phase 6 / 6b — Diff & promote
+
+`db.diff_fork_primary(name)` and `db.diff_forks(a, b)` return a
+`ForkDiff { vertices, edges }` describing the structural delta
+between two views. Identity is **content UID**, not VID — two
+unrelated forks that happened to roll the same VIDs still pair
+correctly. `diff(a, b).invert() == diff(b, a)` by construction.
+
+`db.promote_from_fork(name, &[PromotePattern])` scans the fork per
+pattern, dedups by `(label, uid)` for vertices and
+`(src_uid, dst_uid, edge_type)` for edges, and bulk-inserts on
+primary inside one transaction. Mix vertex and edge patterns in
+one call — endpoints inserted by an earlier vertex pattern become
+visible to a subsequent edge pattern via an in-memory cache.
+
+```rust
+use uni_db::PromotePattern;
+
+let report = db.promote_from_fork(
+    "staging",
+    &[
+        PromotePattern::label("Person"),
+        PromotePattern::edge_type("KNOWS").where_clause("r.since > 2020"),
+    ],
+).await?;
+```
+
+Python:
+
+```python
+report = db.promote_from_fork(
+    "staging",
+    [
+        uni_db.PromotePattern.label("Person"),
+        uni_db.PromotePattern.edge_type("KNOWS", where_clause="r.since > 2020"),
+    ],
+)
+```
+
+Edge endpoints must already exist on primary by UID (or be
+promoted in the same call); otherwise the edge surfaces in
+`PromoteReport.edges_skipped_no_endpoint`.
+
+What's still out of scope after Phase 7:
+- Multi-edge promotion (parallel edges of the same type between
+  the same endpoints with different property bags). Needs an
+  edge-content UID column.
+- Property additions through `fork_schema()` (label/edge-type
+  only for now; `SchemaDelta::added_properties` is reserved for
+  a follow-up).
+- Locy `FORK { … }` syntax — explicitly excluded by the spec.
+- Hypothesis persistence (ASSUME snapshots).

@@ -73,6 +73,9 @@ assert_eq!(
 | `Uni::fork_info(name)` | Metadata for a single fork. |
 | `Uni::drop_fork(name)` | Full 2PC drop. Errors with `ForkHasChildren` while nested children exist. |
 | `Uni::drop_fork_cascade(name)` | Drop the fork and every descendant; pre-validates the subtree for live sessions / open transactions and surfaces `ForkSubtreeInUse` on any blocker before tombstoning anything. |
+| `Uni::diff_fork_primary(name)` | Structural diff `diff(primary, fork)` returning a `ForkDiff` of added / deleted / changed vertices and edges, paired by content UID. |
+| `Uni::diff_forks(a, b)` | Structural diff between two named forks. `diff(a, b).invert() == diff(b, a)`. |
+| `Uni::promote_from_fork(name, &[PromotePattern])` | Scan the fork per pattern, dedup by content UID, insert matches on primary in one transaction. Mix vertex and edge patterns in one call. |
 | `Session::flush()` | Flush the session's writer to L1. On a forked session this flushes the fork's L0 to its Lance branches. Phase 3 auto-flushes a parent fork during nested-fork creation, so most users never call this directly. |
 
 ### Fork-local schema additions
@@ -140,6 +143,81 @@ tx.commit().await?;
 **Drop semantics.** `drop_fork(name)` errors with `ForkHasChildren` while any descendant exists, listing the immediate children. `drop_fork_cascade(name)` walks the subtree, pre-validates every node for live sessions and open transactions, and only then drops deepest-first via the single-fork path. A crash mid-cascade resumes through the existing tombstone recovery — partial cascade state is safe.
 
 **Non-goals in Phase 3.** Hypothesis persistence (ASSUME-style snapshots) is *not* part of this. Re-parenting a fork is not supported and not planned. Cross-fork diff at depth > 1 lands in Phase 6.
+
+## Promotion and diff (Phase 6 / 6b)
+
+Phase 6 closes the write-audit-publish loop. Identity is **content-addressed UID** for vertices (`SHA3-256(label, ext_id, properties)`) and `(src_uid, dst_uid)` scoped to the edge type for edges — so siblings off a shared parent, or two unrelated forks that happened to roll the same VIDs, compare correctly.
+
+### Diff
+
+```rust
+let diff = db.diff_fork_primary("audit").await?;
+println!(
+    "{} added, {} deleted, {} changed",
+    diff.vertices.added.len(),
+    diff.vertices.deleted.len(),
+    diff.vertices.changed.len(),
+);
+for v in &diff.vertices.added {
+    println!("+ ({} uid={}) {:?}", v.label, v.uid, v.properties);
+}
+```
+
+`ForkDiff::invert()` swaps `added` ↔ `deleted` and `before` ↔ `after` so `diff(a, b).invert() == diff(b, a)` by construction.
+
+### Promote
+
+```rust
+use uni_db::PromotePattern;
+
+let report = db.promote_from_fork(
+    "publish_q2",
+    &[
+        PromotePattern::label("Person"),
+        PromotePattern::label("Document").where_clause("n.status = 'final'"),
+        PromotePattern::edge_type("AUTHORED_BY"),
+    ],
+).await?;
+
+println!(
+    "inserted: {} vertices, {} edges; skipped {} UID conflicts, {} dup edges, {} orphan edges",
+    report.vertices_inserted,
+    report.edges_inserted,
+    report.vertices_skipped_uid_conflict,
+    report.edges_skipped_duplicate,
+    report.edges_skipped_no_endpoint,
+);
+```
+
+All inserts run inside a single primary transaction that commits at the end — partial-failure semantics are atomic across patterns. Edge endpoints must already exist on primary (or be promoted earlier in the same call by a vertex pattern); otherwise the edge is counted in `edges_skipped_no_endpoint` and skipped.
+
+### Python
+
+The same surface is available via `uni_db` in Python:
+
+```python
+import uni_db
+
+diff = db.diff_fork_primary("audit")
+print(diff)  # ForkDiff(vertices=added=2/deleted=0/changed=0, edges=...)
+
+for v in diff.vertices.added:
+    print(v.label, v.uid, v.properties)
+
+report = db.promote_from_fork(
+    "publish_q2",
+    [
+        uni_db.PromotePattern.label("Person"),
+        uni_db.PromotePattern.edge_type("KNOWS", where_clause="r.since > 2020"),
+    ],
+)
+print(report)
+```
+
+### Non-goals
+
+- Multi-edge promotion (parallel edges of the same type between the same endpoints with different property bags) — requires an edge-content UID; deferred.
+- Schema migration during promote — fork-only labels / edge types must be registered on primary before promote, or the call errors with `LabelNotFound` / `EdgeTypeNotFound`.
 
 ## Snapshot vs Fork
 

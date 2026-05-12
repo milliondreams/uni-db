@@ -1,0 +1,186 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2024-2026 Dragonscale Team
+
+"""Phase 7 — sync Python bindings for fork diff & promote.
+
+Covers ``Uni.diff_fork_primary``, ``Uni.diff_forks``, and
+``Uni.promote_from_fork`` plus the ``PromotePattern`` builder and the
+``ForkDiff`` / ``PromoteReport`` types.
+
+Mirrors the Rust integration tests in
+``crates/uni/tests/fork_diff.rs``, ``fork_promote.rs``, and
+``fork_promote_edges.rs``.
+"""
+
+from __future__ import annotations
+
+import uni_db
+
+
+def _make_db():
+    return uni_db.Uni.builder().disable_fork_sweeper(True).build()
+
+
+def _seed_person_schema(db):
+    db.schema().label("Person").property("name", "string").apply()
+    s = db.session()
+    tx = s.tx()
+    tx.execute("CREATE (:Person {name: 'Alice'})")
+    tx.commit()
+    db.flush()
+    return s
+
+
+# ---------------------------------------------------------------------------
+# Diff
+# ---------------------------------------------------------------------------
+
+
+def test_diff_fork_primary_empty_on_fresh_fork():
+    db = _make_db()
+    primary = _seed_person_schema(db)
+    fork = primary.fork("audit").build()
+    del fork  # release the session
+    diff = db.diff_fork_primary("audit")
+    assert diff.is_empty()
+    assert diff.total_rows() == 0
+
+
+def test_diff_fork_primary_reports_added_rows():
+    db = _make_db()
+    primary = _seed_person_schema(db)
+    fork = primary.fork("staging").build()
+    tx = fork.tx()
+    tx.execute("CREATE (:Person {name: 'Bob'})")
+    tx.execute("CREATE (:Person {name: 'Carol'})")
+    tx.commit()
+    del fork
+
+    diff = db.diff_fork_primary("staging")
+    assert len(diff.vertices.added) == 2, (
+        f"expected 2 fork-only adds, got {[v.properties for v in diff.vertices.added]}"
+    )
+    assert len(diff.vertices.deleted) == 0
+    assert len(diff.vertices.changed) == 0
+
+    # UID is exposed as a string; VID is an int (or None).
+    for v in diff.vertices.added:
+        assert isinstance(v.uid, str) and len(v.uid) > 0
+        assert v.vid is None or isinstance(v.vid, int)
+        assert "name" in v.properties
+
+    # Inversion swaps added/deleted.
+    inverted = diff.invert()
+    assert len(inverted.vertices.added) == 0
+    assert len(inverted.vertices.deleted) == 2
+
+
+def test_diff_forks_between_two_siblings():
+    db = _make_db()
+    primary = _seed_person_schema(db)
+
+    a = primary.fork("left").build()
+    tx = a.tx()
+    tx.execute("CREATE (:Person {name: 'L-only'})")
+    tx.commit()
+    del a
+
+    b = primary.fork("right").build()
+    tx = b.tx()
+    tx.execute("CREATE (:Person {name: 'R-only'})")
+    tx.commit()
+    del b
+
+    diff = db.diff_forks("left", "right")
+    assert len(diff.vertices.added) == 1, "R-only should be added in diff(left, right)"
+    assert len(diff.vertices.deleted) == 1, "L-only should be deleted"
+
+
+# ---------------------------------------------------------------------------
+# Promote
+# ---------------------------------------------------------------------------
+
+
+def test_promote_inserts_fork_only_vertices():
+    db = _make_db()
+    primary = _seed_person_schema(db)
+
+    fork = primary.fork("publish").build()
+    tx = fork.tx()
+    tx.execute("CREATE (:Person {name: 'NewKid-1'})")
+    tx.execute("CREATE (:Person {name: 'NewKid-2'})")
+    tx.commit()
+    del fork
+
+    report = db.promote_from_fork(
+        "publish",
+        [uni_db.PromotePattern.label("Person")],
+    )
+    assert report.vertices_inserted >= 2, repr(report)
+    assert report.edges_inserted == 0
+
+    # Primary now has Alice + the two new kids.
+    names = sorted(
+        r.get("name")
+        for r in primary.query("MATCH (p:Person) RETURN p.name AS name").rows
+    )
+    assert "Alice" in names
+    assert "NewKid-1" in names
+    assert "NewKid-2" in names
+
+
+def test_promote_pattern_constructors():
+    """Both PromotePattern.label and PromotePattern.edge_type build, and
+    the where_clause kwarg attaches a Cypher predicate."""
+    v = uni_db.PromotePattern.label("Person")
+    assert v.kind == "vertex"
+    v_with_where = uni_db.PromotePattern.label("Person", where_clause="n.age > 18")
+    assert v_with_where.kind == "vertex"
+    e = uni_db.PromotePattern.edge_type("KNOWS")
+    assert e.kind == "edge"
+    e_with_where = uni_db.PromotePattern.edge_type(
+        "KNOWS", where_clause="r.since > 2020"
+    )
+    assert e_with_where.kind == "edge"
+
+
+def test_promote_edges_lands_both_endpoints_and_edge():
+    db = _make_db()
+    db.schema().label("Person").property("name", "string").apply()
+    db.schema().edge_type("KNOWS", ["Person"], ["Person"]).property(
+        "since", "int64"
+    ).apply()
+
+    primary = db.session()
+    tx = primary.tx()
+    tx.execute("CREATE (:Person {name: 'Anchor'})")
+    tx.commit()
+    db.flush()
+
+    fork = primary.fork("rel").build()
+    tx = fork.tx()
+    tx.execute(
+        "CREATE (:Person {name: 'A'})-[:KNOWS {since: 2020}]->(:Person {name: 'B'})"
+    )
+    tx.commit()
+    del fork
+
+    report = db.promote_from_fork(
+        "rel",
+        [
+            uni_db.PromotePattern.label("Person"),
+            uni_db.PromotePattern.edge_type("KNOWS"),
+        ],
+    )
+    assert report.vertices_inserted >= 2, repr(report)
+    assert report.edges_inserted == 1, repr(report)
+    assert report.edges_skipped_no_endpoint == 0
+    assert report.edges_skipped_duplicate == 0
+
+    # Primary sees the promoted edge.
+    rows = primary.query(
+        "MATCH (a:Person {name: 'A'})-[r:KNOWS]->(b:Person {name: 'B'}) "
+        "RETURN r.since AS since"
+    ).rows
+    assert len(rows) == 1
+    assert rows[0].get("since") == 2020

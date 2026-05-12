@@ -15,6 +15,7 @@ Part of [The Rustic Initiative](https://www.rustic.ai) by [Dragonscale Industrie
 - **Vector Search:** K-NN similarity search (L2, cosine) with pre-filter and threshold support.
 - **Columnar Storage:** Lance-backed persistence on local disk or object storage (S3/GCS).
 - **Graph Algorithms:** PageRank, Louvain, shortest path, and more via the built-in algorithm library.
+- **Forks:** Named, durable, writable graph branches with nesting, TTL, structural diff, and content-UID-keyed write-audit-publish promotion to primary. See [`website/docs/features/forks.md`](website/docs/features/forks.md).
 - **Rust & Python:** Native Rust crate and Python bindings (PyO3).
 
 ## Getting Started

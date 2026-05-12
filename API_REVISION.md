@@ -449,3 +449,24 @@ Full fork suite: 66 tests, all green.
   - `fork_writes_soak` (`#[ignore]`) — N forks × M mutations × R restarts; opt in with `--run-ignored ignored-only`.
 - Cypher TCK: 3969/3969. Locy TCK: 434/434. Zero regressions in Phase 2.
 5. `cargo doc -p uni-db --no-deps` — docs generate without warnings
+
+## Migration note: snapshots vs forks
+
+Users sometimes reach for `Uni::create_snapshot` / `pin_to_version`
+when they actually want a fork, or vice-versa. The distinction:
+
+| | Snapshot | Fork |
+|---|---|---|
+| Identity | Content-derived snapshot id | User-chosen name |
+| Mutable? | No — read-only pin | Yes — full writes via `forked.tx()` |
+| Inherits primary HEAD? | Frozen at snapshot time | Frozen at fork time, but independently writable above that |
+| Survives restart | Yes (named snapshots) | Yes (registry entry) |
+| Typical use | Time-travel reads, regulatory hold | What-if scenarios, audit, sandbox, write-audit-publish |
+| Lifecycle API | `create_snapshot`, `restore_snapshot`, `pin_to_version`, `pin_to_timestamp` | `Session::fork`, `Uni::drop_fork`, `tag_fork`, `diff_fork_primary`, `promote_from_fork` |
+| Storage | Lance commit + manifest | Lance branches (one per dataset) chained via `base_paths` |
+
+If you need to read primary at a past moment without mutating
+anything, use a snapshot. If you need to *do something* to a graph
+view that will then maybe be published back to primary, use a fork.
+Phase 6's `promote_from_fork` is the canonical write-audit-publish
+endpoint and is not available on snapshots.

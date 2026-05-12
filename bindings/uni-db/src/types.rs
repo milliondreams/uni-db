@@ -3379,3 +3379,507 @@ impl PyForkInfo {
         }
     }
 }
+
+// ============================================================================
+// Phase 7 — Diff & promote pyclasses (Phase 6/6b feature surface)
+// ============================================================================
+
+/// A single property's before/after pair within a diff.
+#[pyclass(name = "PropertyChange")]
+#[derive(Debug, Clone)]
+pub struct PyPropertyChange {
+    inner: uni_db::PropertyChange,
+}
+
+#[pymethods]
+impl PyPropertyChange {
+    #[getter]
+    fn key(&self) -> &str {
+        &self.inner.key
+    }
+
+    /// Value on the *before* side, or `None` if absent.
+    #[getter]
+    fn before(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        match &self.inner.before {
+            Some(v) => Ok(Some(crate::convert::value_to_py(py, v)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Value on the *after* side, or `None` if absent.
+    #[getter]
+    fn after(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        match &self.inner.after {
+            Some(v) => Ok(Some(crate::convert::value_to_py(py, v)?)),
+            None => Ok(None),
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "PropertyChange(key={:?}, before={:?}, after={:?})",
+            self.inner.key, self.inner.before, self.inner.after
+        )
+    }
+}
+
+impl PyPropertyChange {
+    pub(crate) fn from_rust(p: uni_db::PropertyChange) -> Self {
+        Self { inner: p }
+    }
+}
+
+/// A vertex row from one side of a diff.
+#[pyclass(name = "DiffVertex")]
+#[derive(Debug, Clone)]
+pub struct PyDiffVertex {
+    inner: uni_db::DiffVertex,
+}
+
+#[pymethods]
+impl PyDiffVertex {
+    #[getter]
+    fn label(&self) -> &str {
+        &self.inner.label
+    }
+
+    /// Content-addressed UID as a base32-multibase string.
+    #[getter]
+    fn uid(&self) -> String {
+        self.inner.uid.to_string()
+    }
+
+    /// Informational VID this row carried on the side it was scanned
+    /// from. `None` when the underlying node lacked a VID, which
+    /// shouldn't happen in practice.
+    #[getter]
+    fn vid(&self) -> Option<u64> {
+        self.inner.vid.map(|v| v.as_u64())
+    }
+
+    /// User properties as a Python dict.
+    #[getter]
+    fn properties<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let dict = PyDict::new(py);
+        for (k, v) in &self.inner.properties {
+            dict.set_item(k, crate::convert::value_to_py(py, v)?)?;
+        }
+        Ok(dict)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "DiffVertex(label={:?}, uid={}, vid={:?})",
+            self.inner.label, self.inner.uid, self.inner.vid
+        )
+    }
+}
+
+/// A vertex property change (paired across both sides by UID).
+#[pyclass(name = "VertexPropertyChange")]
+#[derive(Debug, Clone)]
+pub struct PyVertexPropertyChange {
+    inner: uni_db::VertexPropertyChange,
+}
+
+#[pymethods]
+impl PyVertexPropertyChange {
+    #[getter]
+    fn label(&self) -> &str {
+        &self.inner.label
+    }
+
+    #[getter]
+    fn uid(&self) -> String {
+        self.inner.uid.to_string()
+    }
+
+    #[getter]
+    fn changes(&self) -> Vec<PyPropertyChange> {
+        self.inner
+            .changes
+            .iter()
+            .cloned()
+            .map(PyPropertyChange::from_rust)
+            .collect()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "VertexPropertyChange(label={:?}, uid={}, changes={})",
+            self.inner.label,
+            self.inner.uid,
+            self.inner.changes.len()
+        )
+    }
+}
+
+/// An edge row from one side of a diff.
+#[pyclass(name = "DiffEdge")]
+#[derive(Debug, Clone)]
+pub struct PyDiffEdge {
+    inner: uni_db::DiffEdge,
+}
+
+#[pymethods]
+impl PyDiffEdge {
+    #[getter]
+    fn edge_type(&self) -> &str {
+        &self.inner.edge_type
+    }
+
+    #[getter]
+    fn src_uid(&self) -> String {
+        self.inner.src_uid.to_string()
+    }
+
+    #[getter]
+    fn dst_uid(&self) -> String {
+        self.inner.dst_uid.to_string()
+    }
+
+    #[getter]
+    fn properties<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let dict = PyDict::new(py);
+        for (k, v) in &self.inner.properties {
+            dict.set_item(k, crate::convert::value_to_py(py, v)?)?;
+        }
+        Ok(dict)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "DiffEdge(type={:?}, src_uid={}, dst_uid={})",
+            self.inner.edge_type, self.inner.src_uid, self.inner.dst_uid
+        )
+    }
+}
+
+/// An edge property change (paired across both sides by `(src_uid,
+/// dst_uid, edge_type)`).
+#[pyclass(name = "EdgePropertyChange")]
+#[derive(Debug, Clone)]
+pub struct PyEdgePropertyChange {
+    inner: uni_db::EdgePropertyChange,
+}
+
+#[pymethods]
+impl PyEdgePropertyChange {
+    #[getter]
+    fn edge_type(&self) -> &str {
+        &self.inner.edge_type
+    }
+
+    #[getter]
+    fn src_uid(&self) -> String {
+        self.inner.src_uid.to_string()
+    }
+
+    #[getter]
+    fn dst_uid(&self) -> String {
+        self.inner.dst_uid.to_string()
+    }
+
+    #[getter]
+    fn changes(&self) -> Vec<PyPropertyChange> {
+        self.inner
+            .changes
+            .iter()
+            .cloned()
+            .map(PyPropertyChange::from_rust)
+            .collect()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "EdgePropertyChange(type={:?}, src_uid={}, dst_uid={})",
+            self.inner.edge_type, self.inner.src_uid, self.inner.dst_uid
+        )
+    }
+}
+
+/// Vertex-side of [`PyForkDiff`].
+#[pyclass(name = "VertexDiff")]
+#[derive(Debug, Clone)]
+pub struct PyVertexDiff {
+    inner: uni_db::VertexDiff,
+}
+
+#[pymethods]
+impl PyVertexDiff {
+    /// Rows present in `b` but not `a`.
+    #[getter]
+    fn added(&self) -> Vec<PyDiffVertex> {
+        self.inner
+            .added
+            .iter()
+            .cloned()
+            .map(|v| PyDiffVertex { inner: v })
+            .collect()
+    }
+
+    /// Rows present in `a` but not `b`.
+    #[getter]
+    fn deleted(&self) -> Vec<PyDiffVertex> {
+        self.inner
+            .deleted
+            .iter()
+            .cloned()
+            .map(|v| PyDiffVertex { inner: v })
+            .collect()
+    }
+
+    /// Rows with matching UID and differing properties.
+    #[getter]
+    fn changed(&self) -> Vec<PyVertexPropertyChange> {
+        self.inner
+            .changed
+            .iter()
+            .cloned()
+            .map(|c| PyVertexPropertyChange { inner: c })
+            .collect()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    fn total_rows(&self) -> usize {
+        self.inner.total_rows()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "VertexDiff(added={}, deleted={}, changed={})",
+            self.inner.added.len(),
+            self.inner.deleted.len(),
+            self.inner.changed.len()
+        )
+    }
+}
+
+/// Edge-side of [`PyForkDiff`].
+#[pyclass(name = "EdgeDiff")]
+#[derive(Debug, Clone)]
+pub struct PyEdgeDiff {
+    inner: uni_db::EdgeDiff,
+}
+
+#[pymethods]
+impl PyEdgeDiff {
+    #[getter]
+    fn added(&self) -> Vec<PyDiffEdge> {
+        self.inner
+            .added
+            .iter()
+            .cloned()
+            .map(|e| PyDiffEdge { inner: e })
+            .collect()
+    }
+
+    #[getter]
+    fn deleted(&self) -> Vec<PyDiffEdge> {
+        self.inner
+            .deleted
+            .iter()
+            .cloned()
+            .map(|e| PyDiffEdge { inner: e })
+            .collect()
+    }
+
+    #[getter]
+    fn changed(&self) -> Vec<PyEdgePropertyChange> {
+        self.inner
+            .changed
+            .iter()
+            .cloned()
+            .map(|c| PyEdgePropertyChange { inner: c })
+            .collect()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    fn total_rows(&self) -> usize {
+        self.inner.total_rows()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "EdgeDiff(added={}, deleted={}, changed={})",
+            self.inner.added.len(),
+            self.inner.deleted.len(),
+            self.inner.changed.len()
+        )
+    }
+}
+
+/// Structural delta between two fork views (or a fork and primary).
+///
+/// Build via [`PyUni.diff_fork_primary`] or [`PyUni.diff_forks`].
+#[pyclass(name = "ForkDiff")]
+#[derive(Debug, Clone)]
+pub struct PyForkDiff {
+    inner: uni_db::ForkDiff,
+}
+
+#[pymethods]
+impl PyForkDiff {
+    #[getter]
+    fn vertices(&self) -> PyVertexDiff {
+        PyVertexDiff {
+            inner: self.inner.vertices.clone(),
+        }
+    }
+
+    #[getter]
+    fn edges(&self) -> PyEdgeDiff {
+        PyEdgeDiff {
+            inner: self.inner.edges.clone(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    fn total_rows(&self) -> usize {
+        self.inner.total_rows()
+    }
+
+    /// Returns the inverse: `diff(a, b).invert() == diff(b, a)`.
+    fn invert(&self) -> Self {
+        Self {
+            inner: self.inner.clone().invert(),
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "ForkDiff(vertices=added={}/deleted={}/changed={}, edges=added={}/deleted={}/changed={})",
+            self.inner.vertices.added.len(),
+            self.inner.vertices.deleted.len(),
+            self.inner.vertices.changed.len(),
+            self.inner.edges.added.len(),
+            self.inner.edges.deleted.len(),
+            self.inner.edges.changed.len(),
+        )
+    }
+}
+
+impl PyForkDiff {
+    pub(crate) fn from_rust(d: uni_db::ForkDiff) -> Self {
+        Self { inner: d }
+    }
+}
+
+/// Selector for [`PyUni.promote_from_fork`].
+///
+/// Construct via the class methods:
+///   - `PromotePattern.label("Person", where_clause="n.age > 30")`
+///   - `PromotePattern.edge_type("KNOWS", where_clause="r.since > 2020")`
+#[pyclass(name = "PromotePattern")]
+#[derive(Debug, Clone)]
+pub struct PyPromotePattern {
+    pub(crate) inner: uni_db::PromotePattern,
+}
+
+#[pymethods]
+impl PyPromotePattern {
+    /// Match every vertex with this label. `where_clause`, if given,
+    /// is interpolated verbatim into a Cypher `WHERE` on the
+    /// fork-side scan.
+    #[classmethod]
+    #[pyo3(signature = (label, where_clause=None))]
+    fn label(
+        _cls: &Bound<'_, pyo3::types::PyType>,
+        label: &str,
+        where_clause: Option<&str>,
+    ) -> Self {
+        let mut p = uni_db::PromotePattern::label(label);
+        if let Some(w) = where_clause {
+            p = p.where_clause(w);
+        }
+        Self { inner: p }
+    }
+
+    /// Match every edge of this type. Endpoints must already exist on
+    /// primary (or be promoted earlier in the same call by a vertex
+    /// pattern); otherwise the edge is counted in
+    /// `PromoteReport.edges_skipped_no_endpoint`. Bound names are
+    /// `a` (source), `r` (edge), `b` (destination) inside
+    /// `where_clause`.
+    #[classmethod]
+    #[pyo3(signature = (edge_type, where_clause=None))]
+    fn edge_type(
+        _cls: &Bound<'_, pyo3::types::PyType>,
+        edge_type: &str,
+        where_clause: Option<&str>,
+    ) -> Self {
+        let mut p = uni_db::PromotePattern::edge_type(edge_type);
+        if let Some(w) = where_clause {
+            p = p.where_clause(w);
+        }
+        Self { inner: p }
+    }
+
+    /// `"vertex"` or `"edge"`.
+    #[getter]
+    fn kind(&self) -> &'static str {
+        if self.inner.is_edge() {
+            "edge"
+        } else {
+            "vertex"
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!("PromotePattern({})", self.inner)
+    }
+}
+
+/// Outcome of [`PyUni.promote_from_fork`].
+#[pyclass(get_all, name = "PromoteReport")]
+#[derive(Debug, Clone)]
+pub struct PyPromoteReport {
+    pub vertices_inserted: usize,
+    pub vertices_skipped_uid_conflict: usize,
+    pub vertices_skipped_no_uid: usize,
+    pub edges_inserted: usize,
+    pub edges_skipped_duplicate: usize,
+    pub edges_skipped_no_endpoint: usize,
+    pub edges_skipped: usize,
+    pub per_pattern_inserted: Vec<usize>,
+}
+
+#[pymethods]
+impl PyPromoteReport {
+    fn __repr__(&self) -> String {
+        format!(
+            "PromoteReport(vertices_inserted={}, vertices_skipped_uid_conflict={}, \
+             edges_inserted={}, edges_skipped_duplicate={}, edges_skipped_no_endpoint={})",
+            self.vertices_inserted,
+            self.vertices_skipped_uid_conflict,
+            self.edges_inserted,
+            self.edges_skipped_duplicate,
+            self.edges_skipped_no_endpoint,
+        )
+    }
+}
+
+impl PyPromoteReport {
+    pub(crate) fn from_rust(r: uni_db::PromoteReport) -> Self {
+        Self {
+            vertices_inserted: r.vertices_inserted,
+            vertices_skipped_uid_conflict: r.vertices_skipped_uid_conflict,
+            vertices_skipped_no_uid: r.vertices_skipped_no_uid,
+            edges_inserted: r.edges_inserted,
+            edges_skipped_duplicate: r.edges_skipped_duplicate,
+            edges_skipped_no_endpoint: r.edges_skipped_no_endpoint,
+            edges_skipped: r.edges_skipped,
+            per_pattern_inserted: r.per_pattern_inserted,
+        }
+    }
+}

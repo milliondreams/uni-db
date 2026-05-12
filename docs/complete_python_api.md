@@ -2107,6 +2107,9 @@ asyncio.run(main())
 | `tag_fork(name, tag)` | Pin Lance tags on every dataset the fork branched. GC-exempt; survives drop. |
 | `untag_fork(name, tag)` | Remove tag. Idempotent per dataset. |
 | `list_fork_tags(name) -> list[str]` | Unique user-visible tag names on this fork. |
+| `diff_fork_primary(name) -> ForkDiff` | Structural diff `diff(primary, fork)`. Identity is content UID. |
+| `diff_forks(a, b) -> ForkDiff` | Structural diff between two named forks. `diff(a, b).invert() == diff(b, a)`. |
+| `promote_from_fork(name, patterns) -> PromoteReport` | Scan fork per pattern, dedup by UID, insert on primary in one transaction. |
 
 ## Session-level (`Session` / `AsyncSession`)
 
@@ -2189,6 +2192,103 @@ class ForkInfo:
     schema_version_at_creation: int
     datasets: dict[str, str]          # dataset name → branch name
     status: ForkStatus
+
+# Phase 7 — diff & promote types
+
+class PropertyChange:
+    key: str
+    before: object | None     # Python representation of the source Value
+    after: object | None
+
+class DiffVertex:
+    label: str
+    uid: str                  # content-addressed UID, base32-multibase
+    vid: int | None           # informational; pairing key is uid
+    properties: dict
+
+class DiffEdge:
+    edge_type: str
+    src_uid: str
+    dst_uid: str
+    properties: dict
+
+class VertexPropertyChange:
+    label: str
+    uid: str
+    changes: list[PropertyChange]
+
+class EdgePropertyChange:
+    edge_type: str
+    src_uid: str
+    dst_uid: str
+    changes: list[PropertyChange]
+
+class VertexDiff:
+    added: list[DiffVertex]
+    deleted: list[DiffVertex]
+    changed: list[VertexPropertyChange]
+    def is_empty(self) -> bool: ...
+    def total_rows(self) -> int: ...
+
+class EdgeDiff:
+    added: list[DiffEdge]
+    deleted: list[DiffEdge]
+    changed: list[EdgePropertyChange]
+    def is_empty(self) -> bool: ...
+    def total_rows(self) -> int: ...
+
+class ForkDiff:
+    vertices: VertexDiff
+    edges: EdgeDiff
+    def is_empty(self) -> bool: ...
+    def total_rows(self) -> int: ...
+    def invert(self) -> ForkDiff: ...
+
+class PromotePattern:
+    kind: str                            # "vertex" or "edge"
+    @classmethod
+    def label(cls, label: str, where_clause: str | None = None) -> PromotePattern: ...
+    @classmethod
+    def edge_type(cls, edge_type: str, where_clause: str | None = None) -> PromotePattern: ...
+
+class PromoteReport:
+    vertices_inserted: int
+    vertices_skipped_uid_conflict: int
+    vertices_skipped_no_uid: int
+    edges_inserted: int
+    edges_skipped_duplicate: int
+    edges_skipped_no_endpoint: int
+    edges_skipped: int                   # only set when no edge pattern is in the call
+    per_pattern_inserted: list[int]
+```
+
+### Diff & promote — usage
+
+```python
+import uni_db
+
+# Audit what the fork has changed vs primary.
+diff = db.diff_fork_primary("staging")
+print(diff)  # ForkDiff(vertices=added=2/deleted=0/changed=0, edges=added=0/deleted=0/changed=0)
+for v in diff.vertices.added:
+    print(v.label, v.uid, v.properties)
+
+# Compare two scenarios.
+delta = db.diff_forks("scenario_a", "scenario_b")
+inverted = delta.invert()  # diff(scenario_b, scenario_a)
+
+# Publish to primary in one transaction.
+report = db.promote_from_fork(
+    "staging",
+    [
+        uni_db.PromotePattern.label("Person"),
+        uni_db.PromotePattern.label(
+            "Document", where_clause="n.status = 'final'"
+        ),
+        uni_db.PromotePattern.edge_type("AUTHORED_BY"),
+    ],
+)
+assert report.vertices_inserted >= 1
 ```
 
 ## Error variants

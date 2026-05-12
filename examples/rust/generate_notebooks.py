@@ -1080,6 +1080,236 @@ for row in &results.rows {
 )
 
 
+# =============================================================================
+# 6. Forks — write-audit-publish loop
+# =============================================================================
+forks_nb = create_notebook(
+    "forks",
+    [
+        md_cell(
+            [
+                "# Forks: write-audit-publish (Rust)",
+                "",
+                "Named, durable, isolated graph branches with structural diff and",
+                "promote-back semantics. This notebook walks the",
+                "**write-audit-publish** loop end to end:",
+                "",
+                "1. Seed primary with a small social graph.",
+                "2. Open a fork; derive new edges from a candidate rule.",
+                "3. Audit the result via `db.diff_fork_primary` before deciding.",
+                "4. Publish via `db.promote_from_fork` with mixed vertex + edge patterns.",
+                "5. Drop the fork; primary now has the new state.",
+                "",
+                "Identity is content-addressed UID for vertices and content-derived",
+                "edge UID for edges — unrelated forks with overlapping VIDs still",
+                "pair correctly, and parallel edges with different property bags",
+                "promote independently.",
+            ]
+        ),
+        code_cell(common_deps),
+        code_cell(
+            """use uni_db::{DataType, PromotePattern, Uni};
+
+// Helper macro to run async code in evcxr cells.
+macro_rules! run {
+    ($e:expr) => {
+        tokio::runtime::Runtime::new().unwrap().block_on($e)
+    };
+}
+"""
+        ),
+        md_cell(
+            [
+                "## 1. Open an in-memory database, define schema",
+                "",
+                "Person label plus two edge types: `KNOWS` (the input social graph)",
+                "and `FRIEND_OF_FRIEND` (what the hypothesis derives).",
+            ]
+        ),
+        code_cell(
+            """let db = run!(Uni::in_memory().build()).unwrap();
+
+run!(async {
+    db.schema()
+        .label("Person")
+            .property("name", DataType::String)
+        .edge_type("KNOWS", &["Person"], &["Person"])
+        .edge_type("FRIEND_OF_FRIEND", &["Person"], &["Person"])
+        .apply()
+        .await
+}).unwrap();
+
+println!("schema applied");
+"""
+        ),
+        md_cell(
+            [
+                "## 2. Seed primary with a small social graph",
+                "",
+                "Four people, three KNOWS edges in a chain:",
+                "`alice → bob → carol → dave`.",
+            ]
+        ),
+        code_cell(
+            """let primary = db.session();
+
+run!(async {
+    let tx = primary.tx().await?;
+    tx.execute(
+        "CREATE (alice:Person {name: 'alice'}),\\
+                (bob:Person {name: 'bob'}),\\
+                (carol:Person {name: 'carol'}),\\
+                (dave:Person {name: 'dave'}),\\
+                (alice)-[:KNOWS]->(bob),\\
+                (bob)-[:KNOWS]->(carol),\\
+                (carol)-[:KNOWS]->(dave)",
+    )
+    .await?;
+    tx.commit().await?;
+    db.flush().await
+}).unwrap();
+
+println!("seeded primary with 4 vertices + 3 KNOWS edges");
+"""
+        ),
+        md_cell(
+            [
+                "## 3. Stage a hypothesis on a fork",
+                "",
+                "Fork `hypothesis_a` and run a candidate rule: derive",
+                "`FRIEND_OF_FRIEND` edges where two people share a common KNOWS",
+                "neighbor (2-hop closure). The fork is fully writable — same",
+                "Cypher API as primary.",
+            ]
+        ),
+        code_cell(
+            """run!(async {
+    let fork = primary.fork("hypothesis_a").await?;
+    let tx = fork.tx().await?;
+    tx.execute(
+        "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) \\
+         WHERE id(a) <> id(c) \\
+         CREATE (a)-[:FRIEND_OF_FRIEND]->(c)",
+    )
+    .await?;
+    tx.commit().await?;
+    fork.flush().await?;
+    Ok::<(), uni_db::UniError>(())
+}).unwrap();
+
+println!("hypothesis_a: staged 2-hop FRIEND_OF_FRIEND derivation");
+"""
+        ),
+        md_cell(
+            [
+                "## 4. Audit via `diff_fork_primary`",
+                "",
+                "`db.diff_fork_primary(name)` returns a `ForkDiff` describing the",
+                "delta between primary and the named fork: what the fork has",
+                "added, deleted, and (under non-content-addressed identity",
+                "models) changed. Identity is content-addressed UID, so vertex /",
+                "edge property mutations surface as added+deleted pairs of",
+                "distinct UIDs.",
+            ]
+        ),
+        code_cell(
+            """let diff = run!(db.diff_fork_primary("hypothesis_a")).unwrap();
+
+println!(
+    "diff: +{} vertices, +{} edges, ~{} changed",
+    diff.vertices.added.len(),
+    diff.edges.added.len(),
+    diff.vertices.changed.len(),
+);
+
+for e in &diff.edges.added {
+    let uid = e.edge_uid.to_string();
+    let tail: String = uid.chars().rev().take(8).collect::<String>().chars().rev().collect();
+    println!("  + (…{}) [:{}] (between two Persons)", tail, e.edge_type);
+}
+"""
+        ),
+        md_cell(
+            [
+                "## 5. Publish: `promote_from_fork`",
+                "",
+                "The audit looks right — two new FRIEND_OF_FRIEND edges",
+                "(alice→carol, bob→dave). Promote them onto primary.",
+                "",
+                "Pass both a vertex and an edge pattern in one call: all inserts",
+                "run inside a single primary transaction; vertices promoted by",
+                "the first pattern are visible as endpoint candidates to the",
+                "second pattern via an in-memory cache. The vertex pattern is",
+                "a no-op here (no new Persons added) but it's good practice to",
+                "include it.",
+            ]
+        ),
+        code_cell(
+            """let report = run!(db.promote_from_fork(
+    "hypothesis_a",
+    &[
+        PromotePattern::label("Person"),
+        PromotePattern::edge_type("FRIEND_OF_FRIEND"),
+    ],
+)).unwrap();
+
+println!(
+    "inserted: {} vertices, {} edges (skipped: {} UID conflicts, {} dup edges, {} orphans)",
+    report.vertices_inserted,
+    report.edges_inserted,
+    report.vertices_skipped_uid_conflict,
+    report.edges_skipped_duplicate,
+    report.edges_skipped_no_endpoint,
+);
+"""
+        ),
+        md_cell(
+            [
+                "## 6. Drop the fork; primary now has the new edges",
+            ]
+        ),
+        code_cell(
+            """run!(db.drop_fork("hypothesis_a")).unwrap();
+
+let rows = run!(primary.query(
+    "MATCH (a:Person)-[r]->(b:Person) \\
+     RETURN a.name AS src, type(r) AS rel, b.name AS dst \\
+     ORDER BY rel, src, dst"
+)).unwrap();
+
+for row in rows.rows() {
+    let s: String = row.get("src").unwrap();
+    let t: String = row.get("rel").unwrap();
+    let d: String = row.get("dst").unwrap();
+    println!("  ({})-[:{}]->({})", s, t, d);
+}
+"""
+        ),
+        md_cell(
+            [
+                "## Wrap-up",
+                "",
+                "What you saw:",
+                "",
+                "- **Isolation** — the fork's writes never touched primary until",
+                "  `promote_from_fork` was called.",
+                "- **Audit before publish** — `diff_fork_primary` lets you see",
+                "  exactly what the rule produced before deciding to keep it.",
+                "- **Atomic publish** — every pattern in `promote_from_fork`",
+                "  runs in one primary transaction.",
+                "- **Content-addressed identity** — a fork with the same",
+                "  content as primary deduplicates via UID; parallel edges with",
+                "  different property bags are distinct.",
+                "",
+                "The same surface exists in Python via `uni_db.Uni` (sync) and",
+                "`uni_db.AsyncUni` (async) — see the companion notebooks under",
+                "`bindings/uni-db/examples/`.",
+            ]
+        ),
+    ]
+)
+
+
 if __name__ == "__main__":
     # Write notebooks
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -1090,6 +1320,7 @@ if __name__ == "__main__":
         ("rag.ipynb", rag_nb),
         ("fraud_detection.ipynb", fraud_nb),
         ("sales_analytics.ipynb", sales_nb),
+        ("forks.ipynb", forks_nb),
     ]
 
     for filename, nb in notebooks:

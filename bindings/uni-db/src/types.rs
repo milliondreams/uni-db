@@ -3529,6 +3529,15 @@ impl PyDiffEdge {
         &self.inner.edge_type
     }
 
+    /// Content-addressed edge UID (Phase 7d) — computed over
+    /// `(src_uid, dst_uid, edge_type, sorted_properties)`. Two
+    /// parallel edges between the same endpoints with different
+    /// property bags have different `edge_uid`s.
+    #[getter]
+    fn edge_uid(&self) -> String {
+        self.inner.edge_uid.to_string()
+    }
+
     #[getter]
     fn src_uid(&self) -> String {
         self.inner.src_uid.to_string()

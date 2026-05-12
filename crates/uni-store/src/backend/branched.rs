@@ -308,7 +308,10 @@ impl StorageBackend for BranchedBackend {
             );
         }
         let schema = batches[0].schema();
+        // Phase 5a: tally rows for the fork's fragment counter.
+        let rows_added: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
         self.ensure_branch_for_new(name, schema, batches).await?;
+        self.scope.record_fork_fragment(name, rows_added);
         Ok(())
     }
 
@@ -349,6 +352,11 @@ impl StorageBackend for BranchedBackend {
         if batches.is_empty() {
             return Ok(());
         }
+        // Phase 5a: tally rows up-front so we can bump the fork's
+        // fragment counter after a successful write. Computed here
+        // (not after the write) because batches are consumed by the
+        // RecordBatchIterator below.
+        let rows_added: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
         // Try to ensure a branch from an existing primary dataset; if
         // primary doesn't have it either, materialize dataset+branch
         // on the fork using the supplied batches as the seed.
@@ -370,6 +378,7 @@ impl StorageBackend for BranchedBackend {
                 // create_dataset_then_branch already wrote the batches;
                 // nothing more to do for Append. For Overwrite, the
                 // batches *are* the only content, which matches.
+                self.scope.record_fork_fragment(table_name, rows_added);
                 return Ok(());
             }
         };
@@ -380,12 +389,14 @@ impl StorageBackend for BranchedBackend {
         );
         match mode {
             WriteMode::Append => {
-                super::lance_branch::write_to_branch(&uri, &branch, reader).await
+                super::lance_branch::write_to_branch(&uri, &branch, reader).await?;
             }
             WriteMode::Overwrite => {
-                super::lance_branch::replace_branch_tip(&uri, &branch, reader).await
+                super::lance_branch::replace_branch_tip(&uri, &branch, reader).await?;
             }
         }
+        self.scope.record_fork_fragment(table_name, rows_added);
+        Ok(())
     }
 
     async fn delete_rows(&self, table_name: &str, filter: &str) -> Result<()> {

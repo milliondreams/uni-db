@@ -370,6 +370,27 @@ impl StorageManager {
         self.fork_scope.as_ref()
     }
 
+    /// Phase 5a: query whether a fork-local index exists for the
+    /// `(label, column)` pair on the active fork scope. Returns
+    /// `None` outside a fork or when no fork-local build has
+    /// completed for that pair.
+    ///
+    /// The planner consults this to decide whether to emit
+    /// `FusedIndexScan` (returns `Some`) or fall back to the
+    /// inherited primary index via `base_paths` (returns `None`).
+    /// The lookup is a `DashMap::get` on `ForkScope` — O(1) and
+    /// safe to call per query without caching above this layer.
+    #[must_use]
+    pub fn fork_index_exists(
+        &self,
+        label: &str,
+        column: &str,
+    ) -> Option<crate::fork::ForkLocalIndexKind> {
+        self.fork_scope
+            .as_ref()
+            .and_then(|s| s.fork_local_index(label, column))
+    }
+
     /// Base URI for this storage manager (the directory or remote
     /// prefix under which dataset directories live).
     pub fn base_uri(&self) -> &str {

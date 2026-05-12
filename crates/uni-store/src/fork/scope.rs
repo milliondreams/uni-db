@@ -36,6 +36,20 @@ use uni_common::core::schema::{EdgeTypeMeta, LabelMeta};
 
 use super::registry::{ForkHolderGuard, ForkRegistryHandle};
 
+/// Phase 5a: tag for the fork-local index registry on `ForkScope`.
+///
+/// Mirrors the lossless slice of `IndexDefinition` that Phase 5a
+/// fuses; lossy types (Vector, FullText) ship with Phase 5b.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum ForkLocalIndexKind {
+    /// Scalar BTree on a property — union fusion.
+    ScalarBtree,
+    /// Sorted on a property (range / ORDER BY) — k-way merge fusion.
+    Sorted,
+    /// VID/UID lookup index — fork-first fusion.
+    VidUid,
+}
+
 /// Read-only scope identifying a forked session.
 ///
 /// Constructed by `Session::fork(name).build()` (Day 7) via
@@ -65,6 +79,24 @@ pub struct ForkScope {
     /// [`ForkRegistryHandle::register_dataset_branch`] so a restart
     /// recovers the same mapping.
     dynamic_branches: Arc<DashMap<String, String>>,
+    /// Phase 5a: per-table row count contributed by this fork's
+    /// writes. Bumped by `BranchedBackend` after each successful
+    /// flush. Read by `IndexRebuildManager` to decide whether to
+    /// schedule a fork-local index build for the table. In-memory
+    /// only — a process restart resets the counter, so the trigger
+    /// re-fires on the next flush. The on-disk row count is the
+    /// ground truth; this counter is only a flush-time accumulator.
+    fragment_counts: Arc<DashMap<String, u64>>,
+    /// Phase 5a: registry of completed fork-local index builds.
+    /// Keyed on `(label, column)`; value is the index kind that was
+    /// built. Read by the planner's `fork_index_exists` check to
+    /// decide whether to emit `FusedIndexScan`. Written by the
+    /// `IndexRebuildManager` after a fork-local build completes.
+    /// In-memory only — a restart re-detects existing fork-local
+    /// indexes by listing the fork's branch directory once at
+    /// `Uni::open` time (Phase 5a uses lazy first-touch detection;
+    /// see `repopulate_indexes_from_disk`).
+    fork_local_indexes: Arc<DashMap<(String, String), ForkLocalIndexKind>>,
     /// RAII guard. Lifetime-tied to this `ForkScope`. Cloning the
     /// containing `Arc<ForkScope>` does *not* increment the holder
     /// count — only the constructor does, via `register_holder`.
@@ -101,8 +133,81 @@ impl ForkScope {
             overlay_lock: Arc::new(AsyncMutex::new(())),
             registry,
             dynamic_branches: Arc::new(DashMap::new()),
+            fragment_counts: Arc::new(DashMap::new()),
+            fork_local_indexes: Arc::new(DashMap::new()),
             _holder: holder,
         }
+    }
+
+    /// Phase 5a: record `rows_added` rows newly written through this
+    /// fork to `table_name`. Idempotent under repeated calls — the
+    /// counter is monotonically increasing within a process lifetime.
+    pub fn record_fork_fragment(&self, table_name: &str, rows_added: u64) {
+        if rows_added == 0 {
+            return;
+        }
+        self.fragment_counts
+            .entry(table_name.to_string())
+            .and_modify(|c| *c += rows_added)
+            .or_insert(rows_added);
+    }
+
+    /// Phase 5a: current accumulated row count for `table_name` on
+    /// this fork. Returns 0 if the fork has never written to it.
+    #[must_use]
+    pub fn fragment_count(&self, table_name: &str) -> u64 {
+        self.fragment_counts
+            .get(table_name)
+            .map(|r| *r.value())
+            .unwrap_or(0)
+    }
+
+    /// Phase 5a: snapshot of every (table, count) pair recorded on
+    /// this fork. Used by `IndexRebuildManager` to enumerate build
+    /// candidates each polling tick.
+    #[must_use]
+    pub fn all_fragment_counts(&self) -> Vec<(String, u64)> {
+        self.fragment_counts
+            .iter()
+            .map(|r| (r.key().clone(), *r.value()))
+            .collect()
+    }
+
+    /// Phase 5a: register a completed fork-local index build.
+    /// Called by `IndexRebuildManager` after the build lands on
+    /// the fork's branch.
+    pub fn register_fork_local_index(
+        &self,
+        label: &str,
+        column: &str,
+        kind: ForkLocalIndexKind,
+    ) {
+        self.fork_local_indexes
+            .insert((label.to_string(), column.to_string()), kind);
+    }
+
+    /// Phase 5a: lookup the fork-local index kind for a `(label,
+    /// column)` pair, if one has been built. Returns `None` when
+    /// the planner should fall back to the inherited primary index
+    /// (or to a plain scan).
+    #[must_use]
+    pub fn fork_local_index(
+        &self,
+        label: &str,
+        column: &str,
+    ) -> Option<ForkLocalIndexKind> {
+        self.fork_local_indexes
+            .get(&(label.to_string(), column.to_string()))
+            .map(|r| *r.value())
+    }
+
+    /// Phase 5a: snapshot of every registered fork-local index.
+    #[must_use]
+    pub fn all_fork_local_indexes(&self) -> Vec<((String, String), ForkLocalIndexKind)> {
+        self.fork_local_indexes
+            .iter()
+            .map(|r| (r.key().clone(), *r.value()))
+            .collect()
     }
 
     /// Stable fork identifier.

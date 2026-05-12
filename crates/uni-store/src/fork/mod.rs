@@ -21,4 +21,4 @@ pub mod wal;
 pub mod writer_factory;
 
 pub use registry::{ForkHolderGuard, ForkRegistryHandle};
-pub use scope::ForkScope;
+pub use scope::{ForkLocalIndexKind, ForkScope};

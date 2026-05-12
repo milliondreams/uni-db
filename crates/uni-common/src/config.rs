@@ -494,6 +494,14 @@ pub struct UniConfig {
     /// to `true` when they want deterministic control over fork
     /// lifetimes; production should leave it `false`.
     pub disable_fork_sweeper: bool,
+
+    /// Phase 5a: minimum per-fork row count (per label) before the
+    /// background `IndexRebuildManager` schedules a fork-local index
+    /// build. Below this threshold, fork reads inherit primary's
+    /// indexes through Lance `base_paths`; above it, the planner
+    /// switches to `FusedIndexScan` once the build completes. Default
+    /// 10,000 rows per spec §8.
+    pub fork_index_build_threshold: u64,
 }
 
 impl Default for UniConfig {
@@ -528,6 +536,7 @@ impl Default for UniConfig {
             fork_default_ttl: None,
             fork_sweeper_interval: Duration::from_secs(60),
             disable_fork_sweeper: false,
+            fork_index_build_threshold: 10_000,
         }
     }
 }

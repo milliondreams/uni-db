@@ -24,6 +24,16 @@ pub struct CompactionConfig {
 
     /// Number of compaction worker threads (default: 1)
     pub worker_threads: usize,
+
+    /// Number of frozen L0-csr overlay segments that must accumulate before
+    /// `AdjacencyManager::compact` is spawned post-flush (default: 2).
+    ///
+    /// Each frozen segment adds per-read overhead until merged back into the
+    /// Main CSR. Lowering this triggers compaction sooner; higher values
+    /// batch more segments per compaction at the cost of slower reads while
+    /// they accumulate. The default of 2 keeps the read-side overhead
+    /// bounded across a wide range of write rates. See issue #55.
+    pub frozen_segments_compact_threshold: usize,
 }
 
 impl Default for CompactionConfig {
@@ -35,6 +45,7 @@ impl Default for CompactionConfig {
             max_l1_age: Duration::from_secs(3600),
             check_interval: Duration::from_secs(10),
             worker_threads: 1,
+            frozen_segments_compact_threshold: 2,
         }
     }
 }
@@ -418,8 +429,16 @@ pub struct UniConfig {
     /// Set to None to disable time-based flush.
     pub auto_flush_interval: Option<Duration>,
 
-    /// Minimum mutations required before time-based flush triggers (default: 1).
-    /// Prevents unnecessary flushes when there's minimal activity.
+    /// Minimum mutations required before the time-based flush triggers
+    /// (default: 1).
+    ///
+    /// Prevents unnecessary flushes when activity is minimal. Raising this
+    /// (e.g., to 1000) lets small bursts coalesce into one flush — useful
+    /// for benchmark workloads — but for active databases with high write
+    /// rates, raising it reduces flush frequency and lets the active overlay
+    /// grow larger between flushes, which can hurt read latency. Tune with
+    /// `compaction.frozen_segments_compact_threshold` together. See issue
+    /// #55 for the trade-off discussion.
     pub auto_flush_min_mutations: usize,
 
     /// Enable write-ahead logging (default: true)

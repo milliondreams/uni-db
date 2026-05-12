@@ -176,6 +176,14 @@ pub struct FrozenCsrSegment {
 }
 
 impl FrozenCsrSegment {
+    /// Checks whether this segment has any insert entries for the given type and direction.
+    ///
+    /// Used by [`super::adjacency_manager::AdjacencyManager`] read paths to skip segments
+    /// that contributed no edges of the queried `(edge_type, direction)` shape.
+    pub fn has_entries_for(&self, edge_type: u32, direction: Direction) -> bool {
+        self.inserts.contains_key(&(edge_type, direction))
+    }
+
     /// Returns neighbors for a vertex, applying tombstones.
     pub fn get_neighbors(&self, vid: Vid, edge_type: u32, direction: Direction) -> Vec<(Vid, Eid)> {
         let mut result = Vec::new();

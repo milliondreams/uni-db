@@ -84,17 +84,10 @@ jobs:
           for pyproject in \
             bindings/uni-db/pyproject.toml \
             bindings/uni-db-onnx/pyproject.toml \
+            bindings/uni-db-cuda/pyproject.toml \
+            bindings/uni-db-metal/pyproject.toml \
             bindings/uni-db-onnx-cuda/pyproject.toml \
             bindings/uni-db-onnx-metal/pyproject.toml \
-            bindings/uni-db-fastembed/pyproject.toml \
-            bindings/uni-db-fastembed-cuda/pyproject.toml \
-            bindings/uni-db-fastembed-metal/pyproject.toml \
-            bindings/uni-db-mistralrs/pyproject.toml \
-            bindings/uni-db-mistralrs-cuda/pyproject.toml \
-            bindings/uni-db-mistralrs-metal/pyproject.toml \
-            bindings/uni-db-all/pyproject.toml \
-            bindings/uni-db-all-cuda/pyproject.toml \
-            bindings/uni-db-all-metal/pyproject.toml \
             bindings/uni-pydantic/pyproject.toml; do
             PYPI_VERSION=$(grep '^version' "$pyproject" | head -1 | sed 's/.*"\(.*\)".*/\1/')
             if [ "$VERSION" != "$PYPI_VERSION" ]; then

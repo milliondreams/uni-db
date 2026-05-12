@@ -177,13 +177,24 @@ impl<'a> SchemaBuilder<'a> {
                     }
                 }
                 SchemaChange::AddIndex(idx) => {
+                    // Skip the synchronous Lance rebuild when the index is
+                    // already registered with the same config — re-applying
+                    // the same schema is the documented "register on every
+                    // KB-open" pattern, and rebuilding all indexes per
+                    // re-apply is what made KB-open take minutes (issue
+                    // rustic-ai/uni-db#63). The `add_index` call below is
+                    // upsert-by-name, so it stays cheap regardless.
+                    let already_present = manager
+                        .get_index(idx.name())
+                        .is_some_and(|existing| existing == idx);
                     manager
                         .add_index(idx.clone())
                         .map_err(|e| UniError::Schema {
                             message: e.to_string(),
                         })?;
-                    // Track index to trigger build after saving schema
-                    indexes_to_build.push(idx.label().to_string());
+                    if !already_present {
+                        indexes_to_build.push(idx.label().to_string());
+                    }
                 }
                 SchemaChange::AddEdgeType {
                     name,

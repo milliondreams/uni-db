@@ -57,8 +57,7 @@ def _detect_nvidia_driver() -> dict[str, Any]:
             "status": "missing",
             "detail": (
                 "nvidia-smi not found or not runnable. Install the NVIDIA driver "
-                "or pick a non-CUDA wheel (e.g. uni-db-fastembed instead of "
-                "uni-db-fastembed-cuda)."
+                "or pick a non-CUDA wheel (e.g. uni-db instead of uni-db-cuda)."
             ),
         }
 
@@ -132,7 +131,7 @@ def probe() -> dict[str, Any]:
     """Return a host-environment report for the installed wheel variant.
 
     Always reports:
-      - variant   the wheel package name (e.g. "uni-db-fastembed-cuda")
+      - variant   the wheel package name (e.g. "uni-db-cuda")
       - platform  e.g. "Linux x86_64"
       - python_version
       - checks    list of dicts with "name", "status", optional "detail"
@@ -169,14 +168,14 @@ def recommend() -> str:
     has_nvidia = _detect_nvidia_driver()["status"] == "ok"
 
     if sys_name == "Darwin" and machine in ("arm64", "aarch64"):
-        return "uni-db-all-metal"
+        return "uni-db-metal"
     if sys_name == "Darwin":
         # Intel Macs are not a wheel-matrix target for the GPU variants.
-        return "uni-db-all"
+        return "uni-db"
     if sys_name in ("Linux", "Windows") and has_nvidia:
-        return "uni-db-all-cuda"
+        return "uni-db-cuda"
     if sys_name in ("Linux", "Windows"):
-        return "uni-db-all"
+        return "uni-db"
     return "uni-db"
 
 

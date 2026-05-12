@@ -1008,6 +1008,7 @@ impl Executor {
             "duration" => Ok(DataType::Duration),
             "btic" => Ok(DataType::Btic),
             "json" | "jsonb" => Ok(DataType::CypherValue),
+            "bytes" | "blob" | "binary" => Ok(DataType::Bytes),
             "point" => Ok(DataType::Point(PointType::Cartesian2D)),
             "point3d" => Ok(DataType::Point(PointType::Cartesian3D)),
             "geopoint" | "geographic" => Ok(DataType::Point(PointType::Geographic)),
@@ -2600,7 +2601,7 @@ impl Executor {
                                 planner.properties_to_expr(&variable, &resolved_props);
                             let scan = Self::make_scan_plan(
                                 label_id,
-                                n.labels.clone(),
+                                n.labels.names().to_vec(),
                                 variable.clone(),
                                 prop_filter,
                             );

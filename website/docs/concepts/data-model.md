@@ -243,6 +243,7 @@ Uni supports a rich set of data types for properties:
 | `List<T>` | Variable-length array | `["a", "b", "c"]` |
 | `Map(K, V)` | Key-value map | `{key1: "value1", key2: "value2"}` |
 | `CypherValue` | Dynamic Cypher value | Any Cypher-compatible value |
+| `Bytes` | Raw byte buffer (images, audio, blobs) | `b"\xde\xad\xbe\xef"` |
 | `Point(PointType)` | Spatial point | `point({x: 1.0, y: 2.0})` |
 | `Crdt(CrdtType)` | Conflict-free replicated data type | CRDT-specific values |
 

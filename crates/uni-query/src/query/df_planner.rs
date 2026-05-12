@@ -1314,11 +1314,17 @@ impl HybridPhysicalPlanner {
     /// optimization. Looks for `_vid = <int>` patterns (produced by the
     /// `id()` → `_vid` rewrite). Returns the VID if found, enabling L0
     /// short-circuit and Lance _vid pushdown inside the scan.
+    /// Extract VID(s) from a Cypher WHERE filter for scan-level pushdown.
+    ///
+    /// Returns the list of VIDs the filter constrains for `variable`, or
+    /// `None` if the filter doesn't contain a recognised `_vid = lit` /
+    /// `_vid IN (lit, ...)` predicate. A single-element vec means single-VID
+    /// pushdown; multi-element vec means IN-list pushdown. See issue #55 PR #4.
     fn extract_vid_from_cypher_filter(
         filter: Option<&Expr>,
         variable: &str,
         params: &HashMap<String, uni_common::Value>,
-    ) -> Option<u64> {
+    ) -> Option<Vec<u64>> {
         use uni_cypher::ast::BinaryOp;
         let filter = filter?;
         match filter {
@@ -1333,7 +1339,7 @@ impl HybridPhysicalPlanner {
                     && v == variable
                     && prop == "_vid"
                 {
-                    return Self::resolve_vid_value(right, params);
+                    return Self::resolve_vid_value(right, params).map(|v| vec![v]);
                 }
                 // Check: literal/param = variable._vid
                 if let Expr::Property(var_expr, prop) = right.as_ref()
@@ -1341,9 +1347,29 @@ impl HybridPhysicalPlanner {
                     && v == variable
                     && prop == "_vid"
                 {
-                    return Self::resolve_vid_value(left, params);
+                    return Self::resolve_vid_value(left, params).map(|v| vec![v]);
                 }
                 None
+            }
+            Expr::In { expr, list } => {
+                // Check: variable._vid IN (literals)
+                let Expr::Property(var_expr, prop) = expr.as_ref() else {
+                    return None;
+                };
+                let Expr::Variable(v) = var_expr.as_ref() else {
+                    return None;
+                };
+                if v != variable || prop != "_vid" {
+                    return None;
+                }
+                let Expr::List(items) = list.as_ref() else {
+                    return None;
+                };
+                let mut out = Vec::with_capacity(items.len());
+                for item in items {
+                    out.push(Self::resolve_vid_value(item, params)?);
+                }
+                if out.is_empty() { None } else { Some(out) }
             }
             Expr::BinaryOp {
                 left,
@@ -1355,7 +1381,10 @@ impl HybridPhysicalPlanner {
         }
     }
 
-    /// Build a physical `_vid = literal` filter expression for scan-level optimization.
+    /// Build a physical `_vid = literal` filter expression for scan-level
+    /// optimization (single-VID case). For multi-VID IN-list, use
+    /// `GraphScanExec::vid_list_filter` directly — it bypasses the
+    /// PhysicalExpr roundtrip.
     fn build_vid_physical_filter(
         col_name: &str,
         vid: u64,
@@ -1379,6 +1408,100 @@ impl HybridPhysicalPlanner {
             },
             _ => None,
         }
+    }
+
+    /// AND-combine a non-empty list of predicates into a single `Expr`.
+    /// Trivial for length 0/1 (returns true / the single expr); folds left
+    /// for length >= 2.
+    fn and_join_predicates(mut preds: Vec<Expr>) -> Expr {
+        if preds.is_empty() {
+            return uni_cypher::ast::Expr::TRUE;
+        }
+        let mut acc = preds.remove(0);
+        for p in preds {
+            acc = Expr::BinaryOp {
+                left: Box::new(acc),
+                op: uni_cypher::ast::BinaryOp::And,
+                right: Box::new(p),
+            };
+        }
+        acc
+    }
+
+    /// Build the indexed-property pushdown for a vertex scan: a Lance SQL
+    /// filter string AND an Arrow-side `PhysicalExpr`, both derived from the
+    /// same set of indexed-property conjuncts.
+    ///
+    /// - The Lance string drives an O(1) hash-index lookup against on-disk data.
+    /// - The Arrow filter applies to the merged (Lance + L0) batch in-process,
+    ///   so L0 rows that haven't been flushed yet are still index-bounded.
+    ///
+    /// Returns `None` when no indexed predicate exists or any parameter
+    /// resolution fails — in that case the planner falls back to the regular
+    /// post-scan `FilterExec`. See issue #57.
+    fn build_indexed_property_pushdown(
+        &self,
+        filter: Option<&Expr>,
+        variable: &str,
+        label_id: u16,
+        scan_schema: &SchemaRef,
+    ) -> Option<(String, Arc<dyn datafusion::physical_expr::PhysicalExpr>)> {
+        let filter = filter?;
+        let analyzer = crate::query::pushdown::IndexAwareAnalyzer::new(&self.schema);
+        let strategy = analyzer.analyze(filter, variable, label_id);
+        if strategy.hash_index_columns.is_empty() {
+            return None;
+        }
+
+        // Collect lance_predicates that touch a hash-indexed column. Other
+        // lance_predicates (e.g. range on non-indexed props) are deliberately
+        // left for the outer FilterExec: pushing them inside the scan
+        // would also filter L0 rows that match the indexed conjunct but not
+        // the residual conjunct on the SAME row — which is fine — but the
+        // outer FilterExec already handles them, so keeping the boundary
+        // simple keeps the merge behaviour obvious.
+        let label_name = self.schema.label_name_by_id(label_id)?;
+        let label_props = self.schema.properties.get(label_name);
+        let mut indexed_preds: Vec<Expr> = Vec::new();
+        for pred in &strategy.lance_predicates {
+            if let Some(col) = crate::query::pushdown::predicate_target_column(pred, variable)
+                && strategy.hash_index_columns.iter().any(|c| c == &col)
+            {
+                let resolved = crate::query::pushdown::substitute_params(pred, &self.params)?;
+                indexed_preds.push(resolved);
+            }
+        }
+        if indexed_preds.is_empty() {
+            return None;
+        }
+
+        // Render the Lance SQL filter string for storage-side pushdown.
+        let lance_str = crate::query::pushdown::LanceFilterGenerator::generate(
+            &indexed_preds,
+            variable,
+            label_props,
+        )?;
+
+        // Build the Arrow-side PhysicalExpr from the same predicates. The
+        // GraphScanExec applies it to the merged (Lance+L0) batch so the
+        // scan output is index-bounded regardless of where the data lives.
+        let combined = Self::and_join_predicates(indexed_preds.clone());
+        let mut variable_kinds = HashMap::new();
+        variable_kinds.insert(variable.to_string(), VariableKind::Node);
+        let mut variable_labels = HashMap::new();
+        variable_labels.insert(variable.to_string(), label_name.to_string());
+        let ctx = TranslationContext {
+            parameters: self.params.clone(),
+            variable_labels,
+            variable_kinds,
+            ..Default::default()
+        };
+        let df_filter = cypher_expr_to_df(&combined, Some(&ctx)).ok()?;
+        let session = self.session_ctx.read();
+        let physical = self
+            .create_physical_filter_expr(&df_filter, scan_schema, &session)
+            .ok()?;
+        Some((lance_str, physical))
     }
 
     fn apply_scan_filter(
@@ -1719,18 +1842,47 @@ impl HybridPhysicalPlanner {
             }
         }
 
-        // Extract VID from filter for scan-level optimization (L0 short-circuit +
-        // Lance _vid pushdown). Build a physical _vid = literal expression that
-        // the scan can use internally. FilterExec is still added on top.
-        let scan_filter = Self::extract_vid_from_cypher_filter(filter, variable, &self.params)
-            .map(|vid| Self::build_vid_physical_filter(&format!("{variable}._vid"), vid));
-        let mut scan_plan: Arc<dyn ExecutionPlan> = Arc::new(GraphScanExec::new_vertex_scan(
+        // Extract VID(s) from filter for scan-level optimization (L0
+        // short-circuit + Lance pushdown). Single-VID becomes a `_vid = N`
+        // physical filter that GraphScanExec uses both in L0 short-circuit and
+        // in the Lance pushdown string. Multi-VID (from
+        // `_vid IN (literals)`) bypasses the PhysicalExpr roundtrip and goes
+        // direct to GraphScanExec via `with_vid_list_filter` — at runtime
+        // it becomes `_vid IN (v1, v2, ...)` for Lance pushdown. See issue #55 PR #4.
+        let extracted_vids = Self::extract_vid_from_cypher_filter(filter, variable, &self.params);
+        let scan_filter = extracted_vids
+            .as_deref()
+            .filter(|v| v.len() == 1)
+            .map(|v| Self::build_vid_physical_filter(&format!("{variable}._vid"), v[0]));
+        let mut scan_exec = GraphScanExec::new_vertex_scan(
             self.graph_ctx.clone(),
             label_name.to_string(),
             variable.to_string(),
             properties.clone(),
             scan_filter,
-        ));
+        );
+        if let Some(vids) = extracted_vids
+            && vids.len() > 1
+        {
+            scan_exec = scan_exec.with_vid_list_filter(vids);
+        }
+
+        // Indexed-property pushdown — issue #57. Detect equality / IN
+        // predicates against hash-indexed properties on (label, prop), resolve
+        // any parameters at plan time, render BOTH a Lance SQL filter (for
+        // on-disk index lookup) and an Arrow PhysicalExpr (for in-process
+        // L0 filtering). The redundant FilterExec on top (added by
+        // `apply_scan_filter` below) is harmless and keeps residual conjuncts
+        // (e.g. non-indexed multi-property AND) correct.
+        let scan_schema_for_idx = scan_exec.schema();
+        if let Some((lance_str, runtime_filter)) =
+            self.build_indexed_property_pushdown(filter, variable, label_id, &scan_schema_for_idx)
+        {
+            scan_exec = scan_exec
+                .with_extra_lance_filter(lance_str)
+                .with_extra_runtime_filter(runtime_filter);
+        }
+        let mut scan_plan: Arc<dyn ExecutionPlan> = Arc::new(scan_exec);
 
         // Apply filter BEFORE structural projection so that the schema is
         // unambiguous (no duplicate `variable._vid` from both flat column and
@@ -2006,15 +2158,25 @@ impl HybridPhysicalPlanner {
         all_properties: &HashMap<String, HashSet<String>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let (properties, need_full) = Self::resolve_schemaless_properties(variable, all_properties);
-        // Extract VID from filter for scan-level optimization.
-        let scan_filter = Self::extract_vid_from_cypher_filter(filter, variable, &self.params)
-            .map(|vid| Self::build_vid_physical_filter(&format!("{variable}._vid"), vid));
-        let scan_plan: Arc<dyn ExecutionPlan> = Arc::new(GraphScanExec::new_schemaless_all_scan(
+        // Extract VID(s) from filter for scan-level optimization. See the
+        // detailed comment at the per-label scan site (issue #55 PR #4).
+        let extracted_vids = Self::extract_vid_from_cypher_filter(filter, variable, &self.params);
+        let scan_filter = extracted_vids
+            .as_deref()
+            .filter(|v| v.len() == 1)
+            .map(|v| Self::build_vid_physical_filter(&format!("{variable}._vid"), v[0]));
+        let mut scan_exec = GraphScanExec::new_schemaless_all_scan(
             self.graph_ctx.clone(),
             variable.to_string(),
             properties.clone(),
             scan_filter,
-        ));
+        );
+        if let Some(vids) = extracted_vids
+            && vids.len() > 1
+        {
+            scan_exec = scan_exec.with_vid_list_filter(vids);
+        }
+        let scan_plan: Arc<dyn ExecutionPlan> = Arc::new(scan_exec);
         self.finalize_schemaless_scan(
             scan_plan,
             variable,
@@ -2873,15 +3035,34 @@ impl HybridPhysicalPlanner {
         //
         // We detect the unwind variable on the LEFT or RIGHT subtree (whichever
         // contains it) and inject the IN filter on the OPPOSITE subtree.
+        //
+        // The equi-pair order `(l_expr, r_expr)` is independent of which side
+        // of the CrossJoin each expression's variable comes from — for any
+        // pair we must try BOTH `l → unwind, r → scan` AND
+        // `r → unwind, l → scan`, against BOTH subtrees, to cover all
+        // four (pair-order × subtree) combinations. `build_in_pushdown`
+        // returns None for any combination where the unwind variable isn't
+        // actually defined by an UNWIND in the requested subtree.
+        // See issue #55 PR #4.
         let mut left_extra_in: Vec<Expr> = Vec::new();
         let mut right_extra_in: Vec<Expr> = Vec::new();
         for (l_expr, r_expr) in &cls.equi_pairs {
-            // Left side is unwind property → push IN onto right side (scan).
+            // l_expr's variable unwound in left subtree → push IN onto right.
             if let Some(in_filter) = build_in_pushdown(l_expr, r_expr, left, &self.params) {
                 right_extra_in.push(in_filter);
                 continue;
             }
-            // Right side is unwind property → push IN onto left side (scan).
+            // r_expr's variable unwound in left subtree → push IN onto right.
+            if let Some(in_filter) = build_in_pushdown(r_expr, l_expr, left, &self.params) {
+                right_extra_in.push(in_filter);
+                continue;
+            }
+            // l_expr's variable unwound in right subtree → push IN onto left.
+            if let Some(in_filter) = build_in_pushdown(l_expr, r_expr, right, &self.params) {
+                left_extra_in.push(in_filter);
+                continue;
+            }
+            // r_expr's variable unwound in right subtree → push IN onto left.
             if let Some(in_filter) = build_in_pushdown(r_expr, l_expr, right, &self.params) {
                 left_extra_in.push(in_filter);
             }
@@ -2964,6 +3145,27 @@ impl HybridPhysicalPlanner {
             pairs
         };
 
+        // Issue #55 PR #5+#6: cross-MATCH dynamic VID-filter pushdown.
+        // When the equi-pairs include exactly one anchor pair on the
+        // probe-side `_vid`, and the probe-side planned subtree is a
+        // fresh `GraphScanExec`, replace `HashJoinExec{build, full_scan}`
+        // with `VidLookupJoinExec`. Supports INNER and LEFT outer; falls
+        // through to HashJoinExec for RIGHT outer, non-Scan probes, or
+        // computed (non-Column) join keys.
+        if matches!(join_type, JoinType::Inner | JoinType::Left)
+            && cls.residual.is_none()
+            && let Some(plan) = self.try_emit_vid_lookup_join(
+                &cls.equi_pairs,
+                join_type,
+                &left_plan,
+                &right_plan,
+                &left_with_filter,
+                &right_with_filter,
+            )?
+        {
+            return Ok(Some(plan));
+        }
+
         let join: Arc<dyn ExecutionPlan> = Arc::new(HashJoinExec::try_new(
             left_plan,
             right_plan,
@@ -3006,6 +3208,175 @@ impl HybridPhysicalPlanner {
         }
 
         Ok(Some(join))
+    }
+
+    /// Issue #55 PR #5+#6: detect the cross-MATCH dynamic VID-filter pushdown
+    /// pattern and emit `VidLookupJoinExec` instead of `HashJoinExec`.
+    /// Returns `Ok(None)` for any pattern that doesn't match — the caller
+    /// falls through to the standard HashJoin emission.
+    ///
+    /// Pattern recognised:
+    ///   * One equi-pair (the *anchor*) has the probe side equal to
+    ///     `Property(Variable(scan_var), "_vid")`. Its values drive the
+    ///     IN-list pushdown.
+    ///   * Other equi-pairs (if any) compile to `Column` references on
+    ///     both sides; they're applied in-memory as post-match filters.
+    ///   * The probe-side planned subtree is a top-level `GraphScanExec`.
+    ///   * The anchor build column is UInt64 (a VID).
+    ///   * Join is INNER or LEFT outer (RIGHT outer rejected — we can't
+    ///     produce probe rows that don't match any build VID).
+    fn try_emit_vid_lookup_join(
+        &self,
+        equi_pairs: &[(Expr, Expr)],
+        join_type: JoinType,
+        left_plan: &Arc<dyn ExecutionPlan>,
+        right_plan: &Arc<dyn ExecutionPlan>,
+        left_logical: &LogicalPlan,
+        right_logical: &LogicalPlan,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        use crate::query::df_graph::scan::GraphScanExec;
+        use crate::query::df_graph::vid_lookup_join::{
+            EquiPair, ProbeSide, VidJoinKind, VidLookupJoinExec,
+        };
+        use datafusion::physical_expr::expressions::Column;
+
+        if equi_pairs.is_empty() {
+            return Ok(None);
+        }
+
+        // 1. Find the anchor pair: the one where the probe side is
+        // `Property(Variable(_), "_vid")`. The classifier's invariant is
+        // that `l_expr` references LEFT subtree variables and `r_expr`
+        // references RIGHT subtree variables, so detecting `_vid` on
+        // `l_expr` means the probe is on the left.
+        let mut anchor_idx: Option<(usize, ProbeSide)> = None;
+        for (i, (l_expr, r_expr)) in equi_pairs.iter().enumerate() {
+            if expr_is_vid_property(l_expr) {
+                anchor_idx = Some((i, ProbeSide::Left));
+                break;
+            }
+            if expr_is_vid_property(r_expr) {
+                anchor_idx = Some((i, ProbeSide::Right));
+                break;
+            }
+        }
+        let Some((anchor_pair_idx, probe_side)) = anchor_idx else {
+            return Ok(None);
+        };
+
+        let probe_plan = match probe_side {
+            ProbeSide::Left => left_plan,
+            ProbeSide::Right => right_plan,
+        };
+        let build_plan = match probe_side {
+            ProbeSide::Left => right_plan,
+            ProbeSide::Right => left_plan,
+        };
+        let build_logical = match probe_side {
+            ProbeSide::Left => right_logical,
+            ProbeSide::Right => left_logical,
+        };
+
+        // 2. Probe-side plan must be a top-level GraphScanExec.
+        if probe_plan
+            .as_any()
+            .downcast_ref::<GraphScanExec>()
+            .is_none()
+        {
+            return Ok(None);
+        }
+
+        // 3. Compile every equi-pair's expressions against their respective
+        // schemas, requiring each side to resolve to a Column. The anchor
+        // pair additionally requires the build side to be UInt64.
+        let left_schema = left_plan.schema();
+        let right_schema = right_plan.schema();
+        let left_ctx = self.translation_context_for_plan(left_logical);
+        let right_ctx = self.translation_context_for_plan(right_logical);
+        let _ = build_logical; // contexts already covered by left/right_ctx
+
+        let session = self.session_ctx.read();
+        let state = session.state();
+        let left_compiler = crate::query::df_graph::expr_compiler::CypherPhysicalExprCompiler::new(
+            &state,
+            Some(&left_ctx),
+        )
+        .with_subquery_ctx(
+            self.graph_ctx.clone(),
+            self.schema.clone(),
+            self.session_ctx.clone(),
+            self.storage.clone(),
+            self.params.clone(),
+            self.outer_entity_vars.clone(),
+        );
+        let right_compiler =
+            crate::query::df_graph::expr_compiler::CypherPhysicalExprCompiler::new(
+                &state,
+                Some(&right_ctx),
+            )
+            .with_subquery_ctx(
+                self.graph_ctx.clone(),
+                self.schema.clone(),
+                self.session_ctx.clone(),
+                self.storage.clone(),
+                self.params.clone(),
+                self.outer_entity_vars.clone(),
+            );
+
+        let mut compiled: Vec<EquiPair> = Vec::with_capacity(equi_pairs.len());
+        for (l_expr, r_expr) in equi_pairs {
+            let l_phys = left_compiler.compile(l_expr, &left_schema)?;
+            let r_phys = right_compiler.compile(r_expr, &right_schema)?;
+            let (Some(l_col), Some(r_col)) = (
+                l_phys.as_any().downcast_ref::<Column>(),
+                r_phys.as_any().downcast_ref::<Column>(),
+            ) else {
+                // Computed expression on either side → bail to HashJoinExec.
+                return Ok(None);
+            };
+            compiled.push(EquiPair {
+                left_col_idx: l_col.index(),
+                right_col_idx: r_col.index(),
+            });
+        }
+
+        // 4. Anchor build column must be UInt64.
+        let anchor = compiled[anchor_pair_idx];
+        let anchor_build_idx = match probe_side {
+            ProbeSide::Left => anchor.right_col_idx,
+            ProbeSide::Right => anchor.left_col_idx,
+        };
+        let build_schema = build_plan.schema();
+        if !matches!(
+            build_schema.field(anchor_build_idx).data_type(),
+            datafusion::arrow::datatypes::DataType::UInt64
+        ) {
+            return Ok(None);
+        }
+
+        // 5. Reorder so the anchor pair is at index 0 (operator's invariant).
+        if anchor_pair_idx != 0 {
+            compiled.swap(0, anchor_pair_idx);
+        }
+
+        // 6. Translate join_type. RIGHT outer is rejected — we can't
+        // produce probe rows that don't match any build VID, since our
+        // probe scan only fetches rows whose `_vid` is in the build set.
+        let join_kind = match join_type {
+            JoinType::Inner => VidJoinKind::Inner,
+            JoinType::Left => VidJoinKind::Left,
+            _ => return Ok(None),
+        };
+
+        drop(session);
+
+        Ok(Some(Arc::new(VidLookupJoinExec::try_new(
+            left_plan.clone(),
+            right_plan.clone(),
+            probe_side,
+            compiled,
+            join_kind,
+        )?)))
     }
 
     /// Plan a projection, passing alias map through to Sort nodes in the input chain.
@@ -3970,6 +4341,47 @@ impl HybridPhysicalPlanner {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let left_plan = self.plan_internal(left, all_properties)?;
         let right_plan = self.plan_internal(right, all_properties)?;
+
+        // Guard against schema mismatches reaching DataFusion's
+        // `union_schema`, which panics with `index out of bounds` rather
+        // than returning `Err` when branch widths or per-position types
+        // differ (issue rustic-ai/uni-db#62). With the planner-level
+        // fallback in place for label disjunction this should be
+        // unreachable, but a typed error here protects any future
+        // logical-Union path against the same process-aborting panic.
+        //
+        // We only compare field count and per-position **type**; the
+        // user-facing Cypher `UNION` clause routinely produces branches
+        // whose per-position field *names* differ (e.g. `MATCH (a:A)
+        // RETURN a AS a UNION MATCH (b:B) RETURN b AS a` — both branches
+        // alias their pattern variable to `a`, but internal namespaced
+        // columns like `a._vid` vs `b._vid` differ). DataFusion handles
+        // that case fine by adopting left names; only width/type
+        // mismatches are the panic source.
+        let left_schema = left_plan.schema();
+        let right_schema = right_plan.schema();
+        if left_schema.fields().len() != right_schema.fields().len()
+            || left_schema
+                .fields()
+                .iter()
+                .zip(right_schema.fields().iter())
+                .any(|(l, r)| l.data_type() != r.data_type())
+        {
+            let fmt = |s: &Schema| {
+                s.fields()
+                    .iter()
+                    .map(|f| format!("{}: {:?}", f.name(), f.data_type()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            return Err(anyhow!(
+                "Plan: cannot UNION branches with mismatched schemas — \
+                 left=[{}], right=[{}]. This is a planner bug; please file \
+                 an issue.",
+                fmt(left_schema.as_ref()),
+                fmt(right_schema.as_ref()),
+            ));
+        }
 
         let union_plan = UnionExec::try_new(vec![left_plan, right_plan])?;
 
@@ -5816,10 +6228,49 @@ fn extract_static_unwind_values(
             LogicalPlan::Filter { input, .. }
             | LogicalPlan::Project { input, .. }
             | LogicalPlan::Unwind { input, .. } => walk(input, target_var, params),
+            // CrossJoin: search both subtrees. The UNWIND of `target_var`
+            // lives in exactly one side; the other returns None.
+            LogicalPlan::CrossJoin { left, right } => {
+                walk(left, target_var, params).or_else(|| walk(right, target_var, params))
+            }
             _ => None,
         }
     }
     walk(plan, target_var, params)
+}
+
+/// Variant of [`extract_static_unwind_values`] that projects a named `field`
+/// out of each map element in the UNWIND source. See issue #55 (PR #4).
+fn extract_static_unwind_field_values(
+    plan: &LogicalPlan,
+    target_var: &str,
+    field: &str,
+    params: &HashMap<String, uni_common::Value>,
+) -> Option<Vec<Expr>> {
+    fn walk(
+        plan: &LogicalPlan,
+        target_var: &str,
+        field: &str,
+        params: &HashMap<String, uni_common::Value>,
+    ) -> Option<Vec<Expr>> {
+        match plan {
+            LogicalPlan::Unwind {
+                input,
+                expr,
+                variable,
+            } if variable == target_var => materialize_unwind_source_field(expr, params, field)
+                .or_else(|| walk(input, target_var, field, params)),
+            LogicalPlan::Filter { input, .. }
+            | LogicalPlan::Project { input, .. }
+            | LogicalPlan::Unwind { input, .. } => walk(input, target_var, field, params),
+            // CrossJoin: search both subtrees. The UNWIND of `target_var`
+            // lives in exactly one side; the other returns None.
+            LogicalPlan::CrossJoin { left, right } => walk(left, target_var, field, params)
+                .or_else(|| walk(right, target_var, field, params)),
+            _ => None,
+        }
+    }
+    walk(plan, target_var, field, params)
 }
 
 /// Materialize a UNWIND source `Expr` into a vec of literal `Expr`s if possible.
@@ -5858,6 +6309,55 @@ fn materialize_unwind_source(
     }
 }
 
+/// Materialize a UNWIND source `Expr` into a vec of literal `Expr`s, projecting
+/// `field` out of each map element. Handles the common case where the UNWIND
+/// source is a list of maps and we want to push down on a specific field —
+/// e.g. `UNWIND $edges AS e ... WHERE id(a) = e.src` with `$edges` bound to
+/// `List<Map<src, dst>>` returns the list of `src` values as literals.
+///
+/// Returns `None` if the source isn't a statically-resolvable list of maps
+/// or any element lacks `field` or has a non-primitive value at `field`.
+/// See issue #55 (PR #4).
+fn materialize_unwind_source_field(
+    expr: &Expr,
+    params: &HashMap<String, uni_common::Value>,
+    field: &str,
+) -> Option<Vec<Expr>> {
+    match expr {
+        Expr::List(items) => {
+            if items.len() > MAX_UNWIND_IN_PUSHDOWN_VALUES {
+                return None;
+            }
+            // Map literal at plan time: each item must be a Map literal whose
+            // `field` entry is itself a literal. We don't currently lower
+            // map-literal Cypher AST into Expr::Literal(CypherLiteral::Map),
+            // so this branch is conservative and bails. The Parameter branch
+            // below covers the workloads that actually trigger this code.
+            let _ = items;
+            None
+        }
+        Expr::Parameter(name) => match params.get(name)? {
+            uni_common::Value::List(values) => {
+                if values.len() > MAX_UNWIND_IN_PUSHDOWN_VALUES {
+                    return None;
+                }
+                let mut out = Vec::with_capacity(values.len());
+                for v in values {
+                    let map = match v {
+                        uni_common::Value::Map(m) => m,
+                        _ => return None,
+                    };
+                    let inner = map.get(field)?;
+                    out.push(Expr::Literal(value_to_cypher_literal(inner)?));
+                }
+                Some(out)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// If `unwind_side_expr` is bound to a variable produced by a static UNWIND
 /// in `unwind_subplan`, and `scan_side_expr` is a property of a scan variable,
 /// build an `Expr::In { expr: scan_side_expr, list: [literals...] }` to inject
@@ -5875,11 +6375,11 @@ fn build_in_pushdown(
     unwind_subplan: &LogicalPlan,
     params: &HashMap<String, uni_common::Value>,
 ) -> Option<Expr> {
-    // Identify the UNWIND variable on the unwind side.
-    let unwind_var = match unwind_side_expr {
-        Expr::Variable(v) => v,
-        Expr::Property(box_var, _) => match box_var.as_ref() {
-            Expr::Variable(v) => v,
+    // Identify the UNWIND variable (and optional field) on the unwind side.
+    let (unwind_var, field) = match unwind_side_expr {
+        Expr::Variable(v) => (v.as_str(), None),
+        Expr::Property(box_var, f) => match box_var.as_ref() {
+            Expr::Variable(v) => (v.as_str(), Some(f.as_str())),
             _ => return None,
         },
         _ => return None,
@@ -5895,16 +6395,15 @@ fn build_in_pushdown(
         return None;
     }
 
-    let values = extract_static_unwind_values(unwind_subplan, unwind_var, params)?;
+    // Resolve the IN-list values from the UNWIND source. The two cases are:
+    //   * `UNWIND $list AS e ... = e`           → primitive list at $list
+    //   * `UNWIND $list AS e ... = e.field`     → list of maps at $list,
+    //                                              project `field` per element
+    let values = match field {
+        None => extract_static_unwind_values(unwind_subplan, unwind_var, params)?,
+        Some(f) => extract_static_unwind_field_values(unwind_subplan, unwind_var, f, params)?,
+    };
     if values.is_empty() {
-        return None;
-    }
-
-    // For the `Variable(v)` direct case, values are the IN list as-is.
-    // For `Property(Variable(v), field)` case, extract_static_unwind_values
-    // would only succeed on primitive lists — so skip the property case for
-    // now (would need per-element field projection).
-    if matches!(unwind_side_expr, Expr::Property(..)) {
         return None;
     }
 
@@ -5915,15 +6414,81 @@ fn build_in_pushdown(
 }
 
 /// Wrap `plan` with a `LogicalPlan::Filter` AND-combining `filters` if any.
+/// Returns true if `expr` is `Property(Variable(_), "_vid")`. Used by
+/// [`try_emit_vid_lookup_join`] (issue #55 PR #5) to identify the probe side
+/// of an inner-equi-join. `id(x)` is lowered to this shape during AST→
+/// logical-plan translation, so we don't need a separate `FunctionCall`
+/// arm here.
+fn expr_is_vid_property(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Property(inner, prop)
+            if prop == "_vid" && matches!(inner.as_ref(), Expr::Variable(_))
+    )
+}
+
 fn wrap_with_filter(plan: LogicalPlan, filters: &[Expr]) -> LogicalPlan {
     if filters.is_empty() {
         return plan;
     }
     let predicate = and_combine(filters.to_vec()).expect("non-empty filters");
-    LogicalPlan::Filter {
-        input: Box::new(plan),
-        predicate,
-        optional_variables: HashSet::new(),
+    // Critical for issue #55: when `plan` is a Scan node, we MUST merge the
+    // predicate into the Scan's own `filter` field. Wrapping the Scan in a
+    // Filter LogicalPlan node would route through `plan_filter`, which builds
+    // a FilterExec on top of GraphScanExec — that runs Lance's full-table
+    // scan first and only filters in DataFusion afterwards, defeating the
+    // pushdown. Merging into Scan.filter lets `plan_scan` /
+    // `plan_schemaless_scan` extract the IN-list and push it to Lance.
+    match plan {
+        LogicalPlan::Scan {
+            label_id,
+            labels,
+            variable,
+            filter: existing,
+            optional,
+        } => LogicalPlan::Scan {
+            label_id,
+            labels,
+            variable,
+            filter: merge_filter(existing, predicate),
+            optional,
+        },
+        LogicalPlan::ScanMainByLabels {
+            labels,
+            variable,
+            filter: existing,
+            optional,
+        } => LogicalPlan::ScanMainByLabels {
+            labels,
+            variable,
+            filter: merge_filter(existing, predicate),
+            optional,
+        },
+        LogicalPlan::ScanAll {
+            variable,
+            filter: existing,
+            optional,
+        } => LogicalPlan::ScanAll {
+            variable,
+            filter: merge_filter(existing, predicate),
+            optional,
+        },
+        // For any other shape (CrossJoin, nested Filter, etc.) keep the
+        // historical wrap-in-Filter behavior. plan_internal will recurse and
+        // any inner Scan-wrapped subtree will benefit from the merge above.
+        other => LogicalPlan::Filter {
+            input: Box::new(other),
+            predicate,
+            optional_variables: HashSet::new(),
+        },
+    }
+}
+
+/// AND-merge an optional existing filter with a new predicate.
+fn merge_filter(existing: Option<Expr>, predicate: Expr) -> Option<Expr> {
+    match existing {
+        Some(prev) => and_combine(vec![prev, predicate]),
+        None => Some(predicate),
     }
 }
 

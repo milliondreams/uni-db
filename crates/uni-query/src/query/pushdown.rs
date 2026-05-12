@@ -10,6 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use uni_cypher::ast::{BinaryOp, CypherLiteral, Expr, UnaryOp};
 
+use uni_common::Value;
 use uni_common::core::id::UniId;
 use uni_common::core::schema::{
     IndexDefinition, IndexStatus, PropertyMeta, ScalarIndexType, Schema,
@@ -37,6 +38,16 @@ pub struct PushdownStrategy {
 
     /// Predicates pushable to Lance scan filter.
     pub lance_predicates: Vec<Expr>,
+
+    /// Property columns that have an Online Hash scalar index AND a pushable
+    /// equality / IN predicate in this scan. Recorded for two reasons:
+    ///   1. Telemetry — EXPLAIN reports these as `IndexUsage { used: true }`.
+    ///   2. Routing — the planner pushes the matching `lance_predicates` into
+    ///      `GraphScanExec`'s scan-time filter (rather than a `FilterExec` on
+    ///      top), so Lance's scalar-hash index turns the lookup into O(1).
+    ///
+    /// See issue #57.
+    pub hash_index_columns: Vec<String>,
 
     /// Residual predicates (not pushable to storage).
     pub residual: Vec<Expr>,
@@ -100,6 +111,16 @@ impl<'a> IndexAwareAnalyzer<'a> {
 
             // 4. Check if pushable to Lance
             if lance_analyzer.is_pushable(&conj, variable) {
+                // 4a. Hash-index point lookup: equality / IN against an
+                // Online hash-indexed property. Record the column so the
+                // planner can push this predicate into the scan filter
+                // (Lance turns it into an O(1) hash-index lookup) and
+                // EXPLAIN can report `used: true`.
+                if let Some(col) = self.hash_index_column(&conj, variable, label_id)
+                    && !strategy.hash_index_columns.contains(&col)
+                {
+                    strategy.hash_index_columns.push(col);
+                }
                 strategy.lance_predicates.push(conj);
             } else {
                 strategy.residual.push(conj);
@@ -107,6 +128,46 @@ impl<'a> IndexAwareAnalyzer<'a> {
         }
 
         strategy
+    }
+
+    /// If `expr` is an equality or IN predicate of the form
+    /// `variable.prop = ...` / `variable.prop IN ...` where `(label, prop)`
+    /// has an Online `ScalarIndexType::Hash` index, return the column name.
+    fn hash_index_column(&self, expr: &Expr, variable: &str, label_id: u16) -> Option<String> {
+        let prop = match expr {
+            Expr::BinaryOp {
+                left,
+                op: BinaryOp::Eq,
+                ..
+            } => match left.as_ref() {
+                Expr::Property(var_expr, prop) => match var_expr.as_ref() {
+                    Expr::Variable(v) if v == variable => prop.clone(),
+                    _ => return None,
+                },
+                _ => return None,
+            },
+            Expr::In { expr: left, .. } => match left.as_ref() {
+                Expr::Property(var_expr, prop) => match var_expr.as_ref() {
+                    Expr::Variable(v) if v == variable => prop.clone(),
+                    _ => return None,
+                },
+                _ => return None,
+            },
+            _ => return None,
+        };
+
+        let label_name = self.schema.label_name_by_id(label_id)?;
+        for idx in &self.schema.indexes {
+            if let IndexDefinition::Scalar(cfg) = idx
+                && cfg.label == *label_name
+                && cfg.properties.contains(&prop)
+                && cfg.index_type == ScalarIndexType::Hash
+                && cfg.metadata.status == IndexStatus::Online
+            {
+                return Some(prop);
+            }
+        }
+        None
     }
 
     /// Extract UniId from `_uid = 'xxx'` predicate.
@@ -396,6 +457,112 @@ impl PredicateAnalyzer {
         }
         props.into_iter().collect()
     }
+}
+
+/// Detect a chain of single-label `LabelCheck`s combined with `OR` over
+/// the same variable, collecting the labels into a flat list.
+///
+/// Example: `n:Person OR n:Organization` → `Some(["Person", "Organization"])`.
+///
+/// Returns `None` if the predicate isn't a pure OR-tree of single-label
+/// label checks on `variable` (mixed predicates, multi-label conjunctions,
+/// or different variables abort the rewrite). The `LabelCheck` AST node
+/// uses `labels: Vec<String>` with conjunction semantics (`n:A:B`); we
+/// only accept single-element lists since a conjunctive leaf can't be
+/// expressed as a label-scoped scan without an additional residual filter.
+pub(crate) fn try_label_or_to_union(expr: &Expr, variable: &str) -> Option<Vec<String>> {
+    let mut labels: Vec<String> = Vec::new();
+    if collect_label_or_branches(expr, variable, &mut labels) && labels.len() >= 2 {
+        Some(labels)
+    } else {
+        None
+    }
+}
+
+fn collect_label_or_branches(expr: &Expr, variable: &str, out: &mut Vec<String>) -> bool {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOp::Or,
+            right,
+        } => {
+            collect_label_or_branches(left, variable, out)
+                && collect_label_or_branches(right, variable, out)
+        }
+        Expr::LabelCheck {
+            expr: target,
+            labels,
+        } => {
+            if labels.len() != 1 {
+                // Conjunction-of-multiple is not pushable as a single
+                // label scan branch — fall back to residual filter.
+                return false;
+            }
+            if let Expr::Variable(v) = target.as_ref()
+                && v == variable
+            {
+                out.push(labels[0].clone());
+                return true;
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+/// Detect a chain of `type(r) = 'A'` equality checks combined with `OR`
+/// over the same relationship variable, collecting the type names.
+///
+/// Example: `type(r) = 'KNOWS' OR type(r) = 'FOLLOWS'` →
+/// `Some(["KNOWS", "FOLLOWS"])`.
+pub(crate) fn try_type_or_to_union(expr: &Expr, variable: &str) -> Option<Vec<String>> {
+    let mut types: Vec<String> = Vec::new();
+    if collect_type_or_branches(expr, variable, &mut types) && types.len() >= 2 {
+        Some(types)
+    } else {
+        None
+    }
+}
+
+fn collect_type_or_branches(expr: &Expr, variable: &str, out: &mut Vec<String>) -> bool {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOp::Or,
+            right,
+        } => {
+            collect_type_or_branches(left, variable, out)
+                && collect_type_or_branches(right, variable, out)
+        }
+        Expr::BinaryOp {
+            left,
+            op: BinaryOp::Eq,
+            right,
+        } => {
+            is_type_eq_string(left, right, variable, out)
+                || is_type_eq_string(right, left, variable, out)
+        }
+        _ => false,
+    }
+}
+
+fn is_type_eq_string(
+    fn_side: &Expr,
+    str_side: &Expr,
+    variable: &str,
+    out: &mut Vec<String>,
+) -> bool {
+    if let Expr::FunctionCall { name, args, .. } = fn_side
+        && name.eq_ignore_ascii_case("type")
+        && args.len() == 1
+        && let Expr::Variable(v) = &args[0]
+        && v == variable
+        && let Expr::Literal(CypherLiteral::String(s)) = str_side
+    {
+        out.push(s.clone());
+        return true;
+    }
+    false
 }
 
 /// Attempt to convert OR disjunctions to IN predicates
@@ -856,6 +1023,86 @@ impl LanceFilterGenerator {
             _ => None,
         }
     }
+}
+
+/// If `expr` is a property predicate (`Property(var, p) <op> _` or
+/// `Property(var, p) IN _`) on `variable`, return the property name.
+/// Used by the planner to match analyzer-detected hash-index columns back
+/// to the originating predicate.
+pub fn predicate_target_column(expr: &Expr, variable: &str) -> Option<String> {
+    let prop_side = match expr {
+        Expr::BinaryOp { left, .. } => left.as_ref(),
+        Expr::In { expr: left, .. } => left.as_ref(),
+        Expr::IsNull(inner) | Expr::IsNotNull(inner) => inner.as_ref(),
+        _ => return None,
+    };
+    if let Expr::Property(var_expr, prop) = prop_side
+        && let Expr::Variable(v) = var_expr.as_ref()
+        && v == variable
+    {
+        return Some(prop.clone());
+    }
+    None
+}
+
+/// Convert a runtime `Value` to a Cypher AST `Expr` literal.
+///
+/// Returns `None` for variants we cannot represent inline in a pushed-down
+/// Lance filter (e.g. nodes/edges/paths). Maps and lists nest.
+fn value_to_expr(v: &Value) -> Option<Expr> {
+    Some(match v {
+        Value::Null => Expr::Literal(CypherLiteral::Null),
+        Value::Bool(b) => Expr::Literal(CypherLiteral::Bool(*b)),
+        Value::Int(i) => Expr::Literal(CypherLiteral::Integer(*i)),
+        Value::Float(f) => Expr::Literal(CypherLiteral::Float(*f)),
+        Value::String(s) => Expr::Literal(CypherLiteral::String(s.clone())),
+        Value::List(items) => {
+            let items: Option<Vec<Expr>> = items.iter().map(value_to_expr).collect();
+            Expr::List(items?)
+        }
+        // Bytes / Map / Node / Edge / Path / Vector / Temporal can't be
+        // represented as a Lance literal here. Bail out and let the caller
+        // fall back to FilterExec.
+        _ => return None,
+    })
+}
+
+/// Recursively replace `Expr::Parameter(name)` with a literal `Expr` resolved
+/// from `params`. Returns `None` if any parameter is missing or its `Value`
+/// cannot be represented as a Cypher literal (so the predicate cannot be
+/// safely pushed to storage and the caller should fall back).
+///
+/// `LanceFilterGenerator::value_to_lance` deliberately rejects
+/// `Expr::Parameter` to prevent SQL injection (CWE-89). Substituting at plan
+/// time with the resolved value sidesteps that — values come from already-
+/// authenticated query params and are emitted via the same string-escaping
+/// path as inline literals.
+pub fn substitute_params(expr: &Expr, params: &HashMap<String, Value>) -> Option<Expr> {
+    Some(match expr {
+        Expr::Parameter(name) => value_to_expr(params.get(name)?)?,
+        Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
+            left: Box::new(substitute_params(left, params)?),
+            op: *op,
+            right: Box::new(substitute_params(right, params)?),
+        },
+        Expr::UnaryOp { op, expr: inner } => Expr::UnaryOp {
+            op: *op,
+            expr: Box::new(substitute_params(inner, params)?),
+        },
+        Expr::In { expr: left, list } => Expr::In {
+            expr: Box::new(substitute_params(left, params)?),
+            list: Box::new(substitute_params(list, params)?),
+        },
+        Expr::IsNull(inner) => Expr::IsNull(Box::new(substitute_params(inner, params)?)),
+        Expr::IsNotNull(inner) => Expr::IsNotNull(Box::new(substitute_params(inner, params)?)),
+        Expr::List(items) => {
+            let items: Option<Vec<Expr>> =
+                items.iter().map(|i| substitute_params(i, params)).collect();
+            Expr::List(items?)
+        }
+        // Leaves with no parameter references — passthrough.
+        _ => expr.clone(),
+    })
 }
 
 #[cfg(test)]

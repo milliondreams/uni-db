@@ -82,6 +82,7 @@ pub(crate) mod similar_to_expr;
 pub mod traverse;
 pub mod unwind;
 pub mod vector_knn;
+pub mod vid_lookup_join;
 
 use crate::query::executor::procedure::ProcedureRegistry;
 use parking_lot::RwLock;

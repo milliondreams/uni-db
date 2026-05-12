@@ -214,6 +214,12 @@ impl BranchedBackend {
             .map_err(|e| anyhow::anyhow!("persist dynamic branch: {e}"))?;
         self.scope
             .register_dynamic_branch(table_name.to_string(), branch_name.clone());
+        // The dataset for `table_name` now exists on disk (either we
+        // just materialized it on main + branched off, or it already
+        // existed). The inner backend's existence_cache (issue #55)
+        // may be holding a stale `false` from a pre-creation read;
+        // notify it so subsequent table_exists calls return true.
+        self.inner.notify_table_created(table_name).await;
         Ok(branch_name)
     }
 }

@@ -139,6 +139,20 @@ fn value_from_column_inner(
             // Convert uni_common::Value to serde_json::Value
             Ok(uni_val.into())
         }
+        DataType::Bytes => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .ok_or_else(|| anyhow!("Invalid large binary col for Bytes"))?;
+            if arr.is_null(row) {
+                return Ok(Value::Null);
+            }
+            // serde_json::Value has no native bytes variant; encode as JSON array of u8.
+            let bytes = arr.value(row);
+            Ok(Value::Array(
+                bytes.iter().map(|b| serde_json::json!(*b)).collect(),
+            ))
+        }
         DataType::Crdt(_) => {
             let bytes = col
                 .as_any()
@@ -375,7 +389,8 @@ pub fn decode_column_value(
         | DataType::Timestamp
         | DataType::Date
         | DataType::Time
-        | DataType::Btic => Ok(super::arrow_convert::arrow_to_value(
+        | DataType::Btic
+        | DataType::Bytes => Ok(super::arrow_convert::arrow_to_value(
             col,
             row,
             Some(data_type),

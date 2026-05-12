@@ -252,7 +252,7 @@ When reranking is active, `score` reflects the reranker score. Original retrieva
 
 | Provider | Provider ID | Model | Type |
 |----------|-------------|-------|------|
-| ONNX (local) | `local/onnx-reranker` | `cross-encoder/ms-marco-MiniLM-L6-v2` | Local CPU, `provider-onnx` feature |
+| ONNX (local) | `local/onnx` | `cross-encoder/ms-marco-MiniLM-L6-v2` | Local CPU, `provider-onnx` feature |
 | Cohere | `remote/cohere` | `rerank-english-v3.0` | Remote API |
 | Voyage AI | `remote/voyageai` | `rerank-2` | Remote API |
 

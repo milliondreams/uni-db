@@ -1914,16 +1914,14 @@ impl UniBuilder {
                 }
             }
 
+            // `mut` is conditional on at least one provider-* feature being
+            // enabled; a slim build with no providers leaves it unused.
+            #[allow(unused_mut)]
             let mut runtime_builder = ModelRuntime::builder().catalog(catalog);
             #[cfg(feature = "provider-candle")]
             {
                 runtime_builder = runtime_builder
                     .register_provider(uni_xervo::provider::LocalCandleProvider::new());
-            }
-            #[cfg(feature = "provider-fastembed")]
-            {
-                runtime_builder = runtime_builder
-                    .register_provider(uni_xervo::provider::LocalFastEmbedProvider::new());
             }
             #[cfg(feature = "provider-openai")]
             {

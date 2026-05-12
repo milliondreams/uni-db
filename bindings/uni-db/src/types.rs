@@ -2457,6 +2457,13 @@ impl PyDataType {
             inner: uni_common::DataType::Btic,
         }
     }
+    #[staticmethod]
+    #[pyo3(name = "BYTES")]
+    fn bytes() -> Self {
+        Self {
+            inner: uni_common::DataType::Bytes,
+        }
+    }
 
     // Parameterized variants
     #[staticmethod]
@@ -2521,6 +2528,7 @@ impl PyDataType {
                 format!("crdt({})", py_ct.__repr__())
             }
             uni_common::DataType::Btic => "BTIC".to_string(),
+            uni_common::DataType::Bytes => "BYTES".to_string(),
             uni_common::DataType::Point(_) => "POINT".to_string(),
             _ => "UNKNOWN".to_string(),
         };

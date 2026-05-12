@@ -1018,10 +1018,21 @@ fn build_derive_node_spec(pair: Pair<LocyRule>) -> Result<DeriveNodeSpec, ParseE
                 variable = Some(normalize_locy_identifier(child.as_str()));
             }
             LocyRule::node_labels => {
-                // node_labels contains : identifier_or_keyword pairs
-                for label_child in child.into_inner() {
-                    if label_child.as_rule() == LocyRule::identifier_or_keyword {
-                        labels.push(label_child.as_str().to_string());
+                // `node_labels` wraps either `node_label_disjunction` or
+                // `node_label_conjunction` (parser change for issue #56).
+                // Drill one level to reach the identifier list. DERIVE
+                // (NEW x:A:B) is conjunction; (NEW x:A|B) would be
+                // disjunction (currently meaningless on the create side
+                // — DERIVE creates a single node — but accept both for
+                // parser robustness).
+                for variant in child.into_inner() {
+                    for label_child in variant.into_inner() {
+                        if matches!(
+                            label_child.as_rule(),
+                            LocyRule::identifier_or_keyword | LocyRule::identifier
+                        ) {
+                            labels.push(label_child.as_str().to_string());
+                        }
                     }
                 }
             }

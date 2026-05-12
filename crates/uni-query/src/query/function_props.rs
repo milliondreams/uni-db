@@ -63,6 +63,15 @@ static FUNCTION_SPECS: LazyLock<std::collections::HashMap<&'static str, Function
             ("LABELS", full_entity),
             ("NODES", full_entity),
             ("RELATIONSHIPS", full_entity),
+            // Identity / structural functions: take an entity arg but only
+            // need its vid / type metadata, not its property bag. Without
+            // these entries the unknown-function fallback marks the entity
+            // as "*" (full materialization), which makes per-label `Scan`
+            // branches under a label-disjunction Union resolve to *different*
+            // property sets and crash `UnionExec::try_new`. See issue #62.
+            ("ID", entity_arg_only),
+            ("ELEMENTID", entity_arg_only),
+            ("TYPE", entity_arg_only),
             // Functions that take entity arg but don't need full entity
             ("COUNT", entity_arg_only),
             // Functions where properties are extracted from PropertyAccess

@@ -4,9 +4,9 @@
 // Regression test for issue #49: Auto-embed insert latency grows O(n) when
 // label has a DateTime property.
 //
-// Run with: cargo nextest run --features provider-fastembed --test issue49_datetime_autoembed_latency --run-ignored all --no-capture
+// Run with: cargo nextest run --features provider-onnx --test issue49_datetime_autoembed_latency --run-ignored all --no-capture
 
-#[cfg(feature = "provider-fastembed")]
+#[cfg(feature = "provider-onnx")]
 mod tests {
     use std::time::Instant;
     use uni_db::api::schema::EmbeddingCfg;
@@ -26,7 +26,7 @@ mod tests {
             .xervo_catalog(vec![ModelAliasSpec {
                 alias: "embed/default".into(),
                 task: ModelTask::Embed,
-                provider_id: "local/fastembed".into(),
+                provider_id: "local/onnx".into(),
                 model_id: "NomicEmbedTextV15".into(),
                 revision: None,
                 warmup: WarmupPolicy::Lazy,

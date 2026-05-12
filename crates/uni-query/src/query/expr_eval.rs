@@ -1427,8 +1427,8 @@ fn eval_math_function(name: &str, args: &[Value]) -> Result<Value> {
                 return Err(anyhow!("RAND takes no arguments"));
             }
             use rand::Rng;
-            let mut rng = rand::thread_rng();
-            Ok(Value::Float(rng.gen_range(0.0..1.0)))
+            let mut rng = rand::rng();
+            Ok(Value::Float(rng.random_range(0.0..1.0)))
         }
         _ => Err(anyhow!("Unknown math function: {}", name)),
     }

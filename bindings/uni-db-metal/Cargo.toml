@@ -1,6 +1,6 @@
 [package]
-name = "uni-python-mistralrs-metal"
-description = "Python bindings for Uni graph database (mistralrs + candle + Metal variant)"
+name = "uni-python-metal"
+description = "Python bindings for Uni graph database (all providers + Apple GPU/ANE)"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -16,8 +16,13 @@ path = "../uni-db/src/lib.rs"
 [dependencies]
 pyo3 = { version = "0.27", features = ["extension-module", "abi3-py310"] }
 pyo3-async-runtimes = { version = "0.27", features = ["tokio-runtime"] }
-# gpu-metal enables candle's Metal kernel path. ORT is not in this variant.
-uni-db = { workspace = true, features = ["provider-mistralrs", "provider-candle", "gpu-metal"] }
+# Default-everything (inherited from uni-db's default — all 11 providers
+# CPU including provider-onnx) plus Apple acceleration. xervo 0.9.0's
+# gpu-metal activates candle?/metal + mistralrs?/metal kernels for the
+# local providers, and ort?/coreml so the ORT CoreML EP reaches Apple
+# GPU/ANE. provider-onnx (in default) is what enables the optional ort
+# crate that gpu-metal's `ort?/coreml` then activates.
+uni-db = { workspace = true, default-features = true, features = ["gpu-metal"] }
 uni-locy = { workspace = true }
 uni-common = { workspace = true }
 uni-store = { workspace = true }

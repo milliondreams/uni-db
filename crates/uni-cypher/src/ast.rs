@@ -407,10 +407,104 @@ pub enum PatternElement {
     },
 }
 
+/// Boolean expression over node labels or relationship types.
+///
+/// Captures whether a multi-label/type pattern combines its members
+/// with AND (conjunction, node `:A:B` form — node has *both* labels)
+/// or with OR (disjunction, `:A|B` form — at least one label/type
+/// matches). The single-element case `(n:A)` and `[r:T]` is encoded
+/// as `Conjunction(vec!["A"])` since both reductions are equivalent.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LabelExpr {
+    /// No label or type constraint.
+    #[default]
+    Empty,
+    /// Node must have *all* listed labels (`:A:B:C` syntax).
+    Conjunction(Vec<String>),
+    /// Node has at least one listed label, or relationship is one of
+    /// the listed types (`:A|B|C` syntax).
+    Disjunction(Vec<String>),
+}
+
+impl LabelExpr {
+    /// Returns the names regardless of operator. Empty for [`Self::Empty`].
+    pub fn names(&self) -> &[String] {
+        match self {
+            Self::Empty => &[],
+            Self::Conjunction(v) | Self::Disjunction(v) => v,
+        }
+    }
+
+    pub fn is_disjunction(&self) -> bool {
+        matches!(self, Self::Disjunction(_))
+    }
+
+    pub fn is_conjunction(&self) -> bool {
+        matches!(self, Self::Conjunction(_))
+    }
+
+    /// True iff there are at least two members combined with OR.
+    /// Single-label `Disjunction(["A"])` still reports `false` — the
+    /// distinction only matters for plan-shape decisions and a single
+    /// label is conjunction == disjunction.
+    pub fn is_proper_disjunction(&self) -> bool {
+        matches!(self, Self::Disjunction(v) if v.len() >= 2)
+    }
+
+    /// Build from a flat list, defaulting to conjunction (the
+    /// historical implicit semantics for nodes). Use only when callers
+    /// genuinely don't know — the parser knows and uses the explicit
+    /// constructors.
+    pub fn from_conjunction<I, S>(iter: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let v: Vec<String> = iter.into_iter().map(Into::into).collect();
+        if v.is_empty() {
+            Self::Empty
+        } else {
+            Self::Conjunction(v)
+        }
+    }
+
+    pub fn from_disjunction<I, S>(iter: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let v: Vec<String> = iter.into_iter().map(Into::into).collect();
+        if v.is_empty() {
+            Self::Empty
+        } else {
+            Self::Disjunction(v)
+        }
+    }
+}
+
+/// Deref to the underlying name slice so all the read-only `Vec<String>`
+/// operations the codebase used before still compile: indexing, `.iter()`,
+/// `for x in &expr`, `.first()`, `.is_empty()`, `.len()`, `.contains(&s)`.
+/// The conjunction/disjunction operator is only relevant in the planner.
+impl std::ops::Deref for LabelExpr {
+    type Target = [String];
+    fn deref(&self) -> &[String] {
+        self.names()
+    }
+}
+
+impl<'a> IntoIterator for &'a LabelExpr {
+    type Item = &'a String;
+    type IntoIter = std::slice::Iter<'a, String>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.names().iter()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NodePattern {
     pub variable: Option<String>,
-    pub labels: Vec<String>,
+    pub labels: LabelExpr,
     pub properties: Option<Expr>,   // Map literal
     pub where_clause: Option<Expr>, // Inline WHERE clause
 }
@@ -418,7 +512,7 @@ pub struct NodePattern {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RelationshipPattern {
     pub variable: Option<String>,
-    pub types: Vec<String>,
+    pub types: LabelExpr,
     pub direction: Direction,
     pub range: Option<Range>,
     pub properties: Option<Expr>,   // Map literal

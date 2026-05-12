@@ -31,20 +31,18 @@ from uni_db._probe import (
 
 
 def test_variant_classifier_cuda():
-    assert _variant_needs_cuda("uni-db-fastembed-cuda")
-    assert _variant_needs_cuda("uni-db-all-cuda")
-    assert _variant_needs_cuda("uni-db-mistralrs-cuda")
+    assert _variant_needs_cuda("uni-db-cuda")
+    assert _variant_needs_cuda("uni-db-onnx-cuda")
     assert not _variant_needs_cuda("uni-db")
-    assert not _variant_needs_cuda("uni-db-fastembed")
-    assert not _variant_needs_cuda("uni-db-all-metal")
+    assert not _variant_needs_cuda("uni-db-onnx")
+    assert not _variant_needs_cuda("uni-db-metal")
 
 
 def test_variant_classifier_metal():
-    assert _variant_needs_metal("uni-db-fastembed-metal")
-    assert _variant_needs_metal("uni-db-all-metal")
-    assert _variant_needs_metal("uni-db-mistralrs-metal")
+    assert _variant_needs_metal("uni-db-metal")
+    assert _variant_needs_metal("uni-db-onnx-metal")
     assert not _variant_needs_metal("uni-db")
-    assert not _variant_needs_metal("uni-db-fastembed-cuda")
+    assert not _variant_needs_metal("uni-db-cuda")
 
 
 def test_probe_returns_required_keys():
@@ -97,14 +95,14 @@ def test_detect_metal_off_macos_returns_na():
 @pytest.mark.parametrize(
     "system, machine, has_nvidia, expected",
     [
-        ("Darwin", "arm64", False, "uni-db-all-metal"),
-        ("Darwin", "aarch64", False, "uni-db-all-metal"),
-        ("Darwin", "x86_64", False, "uni-db-all"),
-        ("Linux", "x86_64", True, "uni-db-all-cuda"),
-        ("Linux", "x86_64", False, "uni-db-all"),
-        ("Linux", "aarch64", False, "uni-db-all"),
-        ("Windows", "x86_64", True, "uni-db-all-cuda"),
-        ("Windows", "x86_64", False, "uni-db-all"),
+        ("Darwin", "arm64", False, "uni-db-metal"),
+        ("Darwin", "aarch64", False, "uni-db-metal"),
+        ("Darwin", "x86_64", False, "uni-db"),
+        ("Linux", "x86_64", True, "uni-db-cuda"),
+        ("Linux", "x86_64", False, "uni-db"),
+        ("Linux", "aarch64", False, "uni-db"),
+        ("Windows", "x86_64", True, "uni-db-cuda"),
+        ("Windows", "x86_64", False, "uni-db"),
     ],
 )
 def test_recommend_per_host_profile(system, machine, has_nvidia, expected):

@@ -50,7 +50,7 @@ impl Algorithm for Betweenness {
             && size < n
         {
             use rand::seq::SliceRandom;
-            let mut rng = rand::thread_rng();
+            let mut rng = rand::rng();
             sources.shuffle(&mut rng);
             sources.truncate(size);
         }

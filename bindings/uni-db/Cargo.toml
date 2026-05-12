@@ -15,7 +15,7 @@ crate-type = ["cdylib"]
 [dependencies]
 pyo3 = { version = "0.27", features = ["extension-module", "abi3-py310"] }
 pyo3-async-runtimes = { version = "0.27", features = ["tokio-runtime"] }
-uni-db = { workspace = true }
+uni-db = { workspace = true, default-features = true }
 uni-locy = { workspace = true }
 uni-common = { workspace = true }
 uni-store = { workspace = true }

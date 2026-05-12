@@ -3,7 +3,7 @@
 //
 // Tests for embedding service implementations.
 // Candle-based embeddings are the default (no stack overflow issues).
-// FastEmbed tests require the 'fastembed' feature flag.
+// ONNX-based embed tests require the 'provider-onnx' feature flag.
 
 use anyhow::Result;
 use uni_db::Uni;
@@ -276,7 +276,7 @@ mod mistralrs_tests {
 }
 
 // FastEmbed tests (only compiled when fastembed feature is enabled)
-#[cfg(feature = "provider-fastembed")]
+#[cfg(feature = "provider-onnx")]
 mod fastembed_tests {
     use super::*;
     use serde_json::json;
@@ -291,7 +291,7 @@ mod fastembed_tests {
         ModelAliasSpec {
             alias: alias.to_string(),
             task: ModelTask::Embed,
-            provider_id: "local/fastembed".to_string(),
+            provider_id: "local/onnx".to_string(),
             model_id: model_id.to_string(),
             revision: None,
             warmup: WarmupPolicy::Lazy,

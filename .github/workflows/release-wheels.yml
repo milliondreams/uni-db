@@ -2,12 +2,17 @@ name: Build and Publish Wheels
 
 # Owns the uni-db Python wheel matrix.
 #
-# Currently builds and publishes the base `uni-db` wheel only. Future steps
-# extend the matrix (per `docs/proposals/python-wheel-matrix.md`) to include
-# 12 sibling variants with different cargo-feature combinations:
-#   - CPU:    uni-db-{onnx,fastembed,mistralrs,all}
-#   - CUDA:   uni-db-{onnx,fastembed,mistralrs,all}-cuda
-#   - Metal:  uni-db-{onnx,fastembed,mistralrs,all}-metal
+# Builds and publishes 6 wheels mirroring uni-xervo 0.9.0's three-axis
+# capability model (provider × linking × acceleration). See
+# `docs/migrations/0.9.0-wheel-matrix-collapse.md` for the design.
+#
+#   - CPU (default):  uni-db, uni-db-onnx
+#   - CUDA:           uni-db-cuda, uni-db-onnx-cuda
+#   - Apple GPU/ANE:  uni-db-metal, uni-db-onnx-metal
+#
+# `uni-db` and `uni-db-{cuda,metal}` bundle all 11 providers (candle,
+# mistralrs, ONNX local + 8 remote APIs). The `*-onnx*` variants are slim:
+# ONNX local + 8 remote APIs only, no candle/mistralrs.
 #
 # Runs in parallel with `release.yml`. That file owns validate-for-non-wheel,
 # tag, GitHub release, crates.io publish, and the uni-pydantic chain.
@@ -80,17 +85,10 @@ jobs:
           for pyproject in \
             bindings/uni-db/pyproject.toml \
             bindings/uni-db-onnx/pyproject.toml \
+            bindings/uni-db-cuda/pyproject.toml \
+            bindings/uni-db-metal/pyproject.toml \
             bindings/uni-db-onnx-cuda/pyproject.toml \
-            bindings/uni-db-onnx-metal/pyproject.toml \
-            bindings/uni-db-fastembed/pyproject.toml \
-            bindings/uni-db-fastembed-cuda/pyproject.toml \
-            bindings/uni-db-fastembed-metal/pyproject.toml \
-            bindings/uni-db-mistralrs/pyproject.toml \
-            bindings/uni-db-mistralrs-cuda/pyproject.toml \
-            bindings/uni-db-mistralrs-metal/pyproject.toml \
-            bindings/uni-db-all/pyproject.toml \
-            bindings/uni-db-all-cuda/pyproject.toml \
-            bindings/uni-db-all-metal/pyproject.toml; do
+            bindings/uni-db-onnx-metal/pyproject.toml; do
             PYPI_VERSION=$(grep '^version' "$pyproject" | head -1 | sed 's/.*"\(.*\)".*/\1/')
             if [ "$VERSION" != "$PYPI_VERSION" ]; then
               echo "Error: Input version ($VERSION) does not match $pyproject ($PYPI_VERSION)"
@@ -99,10 +97,9 @@ jobs:
             echo "OK: $pyproject = $PYPI_VERSION"
           done
 
-  # Build matrix: at Step 2 we ship only the base `uni-db` wheel. Subsequent
-  # steps extend the matrix by adding new entries to a `variant` axis, each
-  # pointing at a different `bindings/uni-db-<variant>/Cargo.toml`.
-
+  # CPU-only Linux wheels: the default-everything `uni-db` and the slim
+  # ONNX-only `uni-db-onnx`. CUDA-equipped variants live in dedicated jobs
+  # below to isolate the CUDA toolchain dependency.
   build-linux:
     name: Build ${{ matrix.variant }} Linux wheels (${{ matrix.target }})
     needs: [validate]
@@ -110,7 +107,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [uni-db, uni-db-onnx, uni-db-fastembed, uni-db-mistralrs, uni-db-all]
+        variant: [uni-db, uni-db-onnx]
         target: [x86_64, aarch64]
         include:
           - target: x86_64
@@ -165,7 +162,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [uni-db, uni-db-onnx, uni-db-fastembed, uni-db-mistralrs, uni-db-all]
+        variant: [uni-db, uni-db-onnx]
         target: [x86_64, aarch64]
     steps:
       - uses: actions/checkout@v4
@@ -195,12 +192,12 @@ jobs:
           name: wheels-${{ matrix.variant }}-macos-${{ matrix.target }}
           path: dist
 
-  # macOS arm64 builds with Apple-platform GPU acceleration. ORT-using
-  # variants (`*-metal`) get `gpu-coreml` for the CoreML execution provider;
-  # the CoreML EP is statically linked into pyke's macOS bundle, so no
-  # separate sidecar `.dylib` ships in the wheel. candle/mistralrs-using
-  # variants (Step 6+) get `gpu-metal` for candle's Metal kernels (compiled
-  # to `.metallib` and baked into the binary at build time).
+  # macOS arm64 builds with Apple-platform GPU acceleration. xervo 0.9.0's
+  # `gpu-metal` activates candle/mistralrs Metal kernels (compiled to
+  # `.metallib` and baked into the binary) AND `ort?/coreml` so ORT models
+  # accelerate via the CoreML execution provider. The CoreML EP is
+  # statically linked into pyke's macOS bundle — no sidecar `.dylib` ships
+  # in the wheel.
   #
   # Apple Silicon only — macOS x86_64 isn't a target because the
   # Metal/CoreML stacks aren't worth supporting separately for retired
@@ -212,7 +209,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [uni-db-onnx-metal, uni-db-fastembed-metal, uni-db-mistralrs-metal, uni-db-all-metal]
+        variant: [uni-db-metal, uni-db-onnx-metal]
     steps:
       - uses: actions/checkout@v4
 
@@ -247,7 +244,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [uni-db, uni-db-onnx, uni-db-fastembed, uni-db-mistralrs, uni-db-all]
+        variant: [uni-db, uni-db-onnx]
     steps:
       - uses: actions/checkout@v4
 
@@ -276,16 +273,15 @@ jobs:
           name: wheels-${{ matrix.variant }}-windows-x86_64
           path: dist
 
-  # CUDA-equipped Linux builds. Currently uses the same manylinux_2_28
-  # container as `build-linux` because `uni-db-fastembed-cuda` doesn't need
-  # nvcc — pyke's `ort/download-binaries` fetches a prebuilt CUDA EP sidecar
-  # (`libonnxruntime_providers_cuda.so` ~180 MB) at Rust build time.
+  # CUDA-equipped Linux builds for the slim variant. `uni-db-onnx-cuda`
+  # doesn't need nvcc — pyke's `ort/download-binaries` fetches a prebuilt
+  # CUDA EP sidecar (`libonnxruntime_providers_cuda.so` ~180 MB) at Rust
+  # build time, and the slim variant has no candle/mistralrs CUDA kernels.
+  # Uses the same manylinux_2_28 container as `build-linux`.
   #
-  # When `uni-db-mistralrs-cuda` lands in Step 6, candle's CUDA kernels need
-  # `nvcc` for per-SM PTX compilation — switch the container at that point
-  # to one with the CUDA toolkit installed (e.g.
-  # `nvidia/cuda:13.0.0-devel-rockylinux9` for manylinux_2_34 compatibility).
-  # See `docs/proposals/python-wheel-matrix.md` open question #1.
+  # The default-everything `uni-db-cuda` variant pulls candle/mistralrs in
+  # too — its kernels need nvcc, so it builds in `build-cuda-toolkit-linux`
+  # (manylinux_2_34 + CUDA toolkit) below.
   build-cuda-linux:
     name: Build ${{ matrix.variant }} Linux wheels (x86_64, CUDA)
     needs: [validate]
@@ -293,7 +289,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [uni-db-onnx-cuda, uni-db-fastembed-cuda]
+        variant: [uni-db-onnx-cuda]
     steps:
       - uses: actions/checkout@v4
 
@@ -364,8 +360,9 @@ jobs:
           name: wheels-${{ matrix.variant }}-linux-x86_64
           path: dist
 
-  # CUDA Linux builds that need `nvcc` (candle's per-SM PTX compilation).
-  # Currently `uni-db-mistralrs-cuda`; Step 7 adds `uni-db-all-cuda`.
+  # CUDA Linux builds that need `nvcc` (candle/mistralrs per-SM PTX
+  # compilation). Used by `uni-db-cuda` (default-everything + CUDA), which
+  # bundles candle/mistralrs alongside the ORT CUDA path.
   #
   # Uses manylinux_2_34 (AlmaLinux 9 base) instead of manylinux_2_28
   # because the CUDA 13.0 toolkit is published as RHEL/AlmaLinux 9 RPMs
@@ -384,9 +381,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # uni-db-all-cuda also needs nvcc because it bundles candle/mistralrs
-        # alongside the ORT CUDA path.
-        variant: [uni-db-mistralrs-cuda, uni-db-all-cuda]
+        variant: [uni-db-cuda]
     steps:
       - uses: actions/checkout@v4
 
@@ -460,7 +455,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [uni-db, uni-db-onnx, uni-db-fastembed, uni-db-mistralrs, uni-db-all]
+        variant: [uni-db, uni-db-onnx, uni-db-cuda, uni-db-metal, uni-db-onnx-cuda, uni-db-onnx-metal]
     steps:
       - uses: actions/checkout@v4
 

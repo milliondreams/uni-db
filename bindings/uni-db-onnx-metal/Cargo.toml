@@ -1,6 +1,6 @@
 [package]
 name = "uni-python-onnx-metal"
-description = "Python bindings for Uni graph database (ONNX + CoreML variant)"
+description = "Python bindings for Uni graph database (ONNX + remote-API + Apple GPU/ANE variant; no candle/mistralrs)"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -16,9 +16,25 @@ path = "../uni-db/src/lib.rs"
 [dependencies]
 pyo3 = { version = "0.27", features = ["extension-module", "abi3-py310"] }
 pyo3-async-runtimes = { version = "0.27", features = ["tokio-runtime"] }
-# ORT on macOS accelerates via CoreML, not Metal directly. Static ORT (CPU)
-# stays in via provider-onnx; gpu-coreml adds the CoreML EP.
-uni-db = { workspace = true, features = ["provider-onnx", "gpu-coreml"] }
+# Slim variant + Apple acceleration. Opts out of uni-db's
+# default-everything to exclude candle and mistralrs. xervo 0.9.0's
+# gpu-metal activates ort?/coreml so the ORT CoreML EP reaches Apple
+# GPU/ANE; provider-onnx is listed explicitly because gpu-metal alone
+# does not enable the optional ort crate (the `?` in `ort?/coreml`
+# requires another feature to flip ort on).
+uni-db = { workspace = true, default-features = false, features = [
+    "lance-backend",
+    "provider-onnx",
+    "gpu-metal",
+    "provider-openai",
+    "provider-gemini",
+    "provider-vertexai",
+    "provider-mistral",
+    "provider-anthropic",
+    "provider-voyageai",
+    "provider-cohere",
+    "provider-azure-openai",
+] }
 uni-locy = { workspace = true }
 uni-common = { workspace = true }
 uni-store = { workspace = true }

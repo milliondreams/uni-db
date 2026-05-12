@@ -78,12 +78,25 @@ name = "fork_diff_promote"
 harness = false
 
 [features]
-default = ["lance-backend", "provider-gemini", "provider-openai"]
+default = [
+    "lance-backend",
+    "provider-candle",
+    "provider-mistralrs",
+    "provider-onnx",
+    "provider-openai",
+    "provider-gemini",
+    "provider-vertexai",
+    "provider-mistral",
+    "provider-anthropic",
+    "provider-voyageai",
+    "provider-cohere",
+    "provider-azure-openai",
+]
 lance-backend = ["uni-store/lance-backend"]
 snapshot-internals = []
 storage-internals = []
 provider-candle = ["uni-xervo/provider-candle"]
-provider-fastembed = ["uni-xervo/provider-fastembed"]
+provider-mistralrs = ["uni-xervo/provider-mistralrs"]
 provider-openai = ["uni-xervo/provider-openai"]
 provider-gemini = ["uni-xervo/provider-gemini"]
 provider-vertexai = ["uni-xervo/provider-vertexai"]
@@ -92,21 +105,15 @@ provider-anthropic = ["uni-xervo/provider-anthropic"]
 provider-voyageai = ["uni-xervo/provider-voyageai"]
 provider-cohere = ["uni-xervo/provider-cohere"]
 provider-azure-openai = ["uni-xervo/provider-azure-openai"]
-provider-mistralrs = ["uni-xervo/provider-mistralrs"]
-# ONNX/GPU provider features — mirrors uni-xervo's 0.6.0 surface.
-# See `../../../uni-xervo/docs/migrations/0.6.0-final-feature-surface.md` for
-# the full migration story; in short, every gpu-* feature now bundles its
-# ONNX Runtime automatically at build time (via pyke or via uni-xervo's
-# build.rs MS fetcher) — no ORT_DYLIB_PATH setup at runtime for the vendors
-# that have a prebuilt distribution.
+# ONNX + GPU surface — mirrors uni-xervo's 0.9.0 three-axis model
+# (provider × linking × acceleration). See
+# `../../../uni-xervo/docs/migrations/0.9.0-feature-surface.md`. The
+# previous 9-feature gpu-* surface (gpu-tensorrt, gpu-coreml, gpu-rocm,
+# gpu-directml, gpu-openvino, gpu-qnn, gpu-wgpu) is retired — those EPs
+# remain reachable via `provider-onnx-dynamic` + `ORT_DYLIB_PATH`. The
+# native ONNX Embed task on local/onnx (xervo 0.8.0) replaces the retired
+# provider-fastembed; FastEmbed alias strings still work unchanged.
 provider-onnx = ["uni-xervo/provider-onnx"]
 provider-onnx-dynamic = ["uni-xervo/provider-onnx-dynamic"]
 gpu-cuda = ["uni-xervo/gpu-cuda"]
-gpu-tensorrt = ["uni-xervo/gpu-tensorrt"]
-gpu-rocm = ["uni-xervo/gpu-rocm"]
-gpu-coreml = ["uni-xervo/gpu-coreml"]
-gpu-directml = ["uni-xervo/gpu-directml"]
-gpu-openvino = ["uni-xervo/gpu-openvino"]
-gpu-qnn = ["uni-xervo/gpu-qnn"]
-gpu-wgpu = ["uni-xervo/gpu-wgpu"]
 gpu-metal = ["uni-xervo/gpu-metal"]

@@ -1048,7 +1048,7 @@ async fn test_similar_to_weights_sum_not_one() -> Result<()> {
 
 /// Tests requiring a real embedding model. Feature-gated and `#[ignore]`d
 /// because they require model downloads from HuggingFace Hub.
-#[cfg(feature = "provider-fastembed")]
+#[cfg(feature = "provider-onnx")]
 mod auto_embed_tests {
     use super::*;
     use serde_json::json;
@@ -1059,7 +1059,7 @@ mod auto_embed_tests {
         ModelAliasSpec {
             alias: alias.to_string(),
             task: ModelTask::Embed,
-            provider_id: "local/fastembed".to_string(),
+            provider_id: "local/onnx".to_string(),
             model_id: "NomicEmbedTextV15".to_string(),
             revision: None,
             warmup: WarmupPolicy::Lazy,

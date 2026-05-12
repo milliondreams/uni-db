@@ -163,7 +163,7 @@ Beyond auto-embedding, the `Uni::xervo()` facade gives direct access to embeddin
     xervo.prefetch_all().await?;
     ```
 
-Uni-Xervo supports local providers (MistralRS, Candle, FastEmbed) and remote providers (OpenAI, Gemini, Anthropic, Cohere, Vertex AI, Mistral, Voyage AI, Azure OpenAI). See the [Vector Search Guide](../guides/vector-search.md) for the full provider table and configuration details.
+Uni-Xervo supports local providers (Candle, mistral.rs, ONNX Runtime — embed/rerank/raw) and remote providers (OpenAI, Gemini, Anthropic, Cohere, Vertex AI, Mistral, Voyage AI, Azure OpenAI). See the [Vector Search Guide](../guides/vector-search.md) for the full provider table and configuration details.
 
 ## Use Cases
 
@@ -185,7 +185,7 @@ YIELD node, score, rerank_score
 RETURN node.title, score
 ```
 
-Supports local ONNX models (`local/onnx-reranker`) and remote APIs (Cohere, Voyage AI). See [Hybrid Search — Reranking](hybrid-search.md#cross-encoder-reranking) for full details.
+Supports local ONNX models (`local/onnx`) and remote APIs (Cohere, Voyage AI). See [Hybrid Search — Reranking](hybrid-search.md#cross-encoder-reranking) for full details.
 
 ## When To Use
 

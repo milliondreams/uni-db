@@ -13,7 +13,7 @@ name = "uni"
 path = "src/main.rs"
 
 [dependencies]
-uni-db = { workspace = true }
+uni-db = { workspace = true, default-features = true }
 uni-common = { workspace = true }
 uni-store = { workspace = true }
 tokio = { workspace = true }
@@ -27,9 +27,11 @@ tracing-subscriber = { workspace = true }
 serde_json = { workspace = true }
 
 [features]
-default = ["provider-gemini", "provider-openai"]
+default = []
 provider-candle = ["uni-db/provider-candle"]
-provider-fastembed = ["uni-db/provider-fastembed"]
+provider-mistralrs = ["uni-db/provider-mistralrs"]
+provider-onnx = ["uni-db/provider-onnx"]
+provider-onnx-dynamic = ["uni-db/provider-onnx-dynamic"]
 provider-openai = ["uni-db/provider-openai"]
 provider-gemini = ["uni-db/provider-gemini"]
 provider-vertexai = ["uni-db/provider-vertexai"]
@@ -38,5 +40,5 @@ provider-anthropic = ["uni-db/provider-anthropic"]
 provider-voyageai = ["uni-db/provider-voyageai"]
 provider-cohere = ["uni-db/provider-cohere"]
 provider-azure-openai = ["uni-db/provider-azure-openai"]
-provider-mistralrs = ["uni-db/provider-mistralrs"]
 gpu-cuda = ["uni-db/gpu-cuda"]
+gpu-metal = ["uni-db/gpu-metal"]

@@ -56,6 +56,21 @@ pub trait StorageBackend: Send + Sync + 'static {
     /// Drop a table by name.
     async fn drop_table(&self, name: &str) -> Result<()>;
 
+    /// Notify the backend that a table now exists, even though no
+    /// `create_table` / `create_empty_table` / `open_or_create_table`
+    /// went through this trait. The default implementation is a
+    /// no-op; backends that cache existence (e.g. `LanceDbBackend`'s
+    /// `existence_cache` from issue #55) override to invalidate the
+    /// stale negative entry. Used by `BranchedBackend` after it
+    /// creates a fork-side dataset directly through the Lance branch
+    /// primitives — that path does not call `create_table` on the
+    /// inner backend, so without this hook the inner backend's
+    /// existence cache silently keeps reporting `false` for the
+    /// just-created table.
+    async fn notify_table_created(&self, name: &str) {
+        let _ = name;
+    }
+
     // ========================
     // Read Operations
     // ========================

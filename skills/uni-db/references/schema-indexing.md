@@ -85,6 +85,7 @@ Same packed `u64` auto-increment as VID. Sentinel: `Eid::INVALID = u64::MAX`.
 | `List(T)` | `List(T)` | `LIST(T)` | `DataType::List(Box<DataType>)` |
 | `Map(K, V)` | `List(Struct(key, value))` | `MAP(K, V)` | `DataType::Map(Box<DataType>, Box<DataType>)` |
 | `CypherValue` | `LargeBinary` | -- | `DataType::CypherValue` |
+| `Bytes` | `LargeBinary` | `BYTES` (also `BLOB`, `BINARY`) | `DataType::Bytes` |
 
 ### Spatial Types
 

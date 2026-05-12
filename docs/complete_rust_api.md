@@ -1829,6 +1829,7 @@ pub enum DataType {
     String, Int32, Int64, Float32, Float64, Bool,
     Timestamp, Date, Time, DateTime, Duration,
     CypherValue,
+    Bytes,
     Point(PointType),
     Vector { dimensions: usize },
     Crdt(CrdtType),

@@ -84,7 +84,7 @@ A Cypher command prefix that shows the query plan without executing the query. U
 ## F
 
 ### FastEmbed
-A Rust library for generating text embeddings locally. Uni integrates FastEmbed for on-device embedding generation without external API calls. See [Vector Search](../guides/vector-search.md).
+A Rust library for generating text embeddings locally via ONNX Runtime. Uni integrated `fastembed-rs` directly through `uni-xervo 0.7.x`'s `provider-fastembed`. As of `uni-xervo 0.8.0`, the FastEmbed wrapper was retired and replaced with a native ONNX `Embed` task on the unified `local/onnx` provider; all 25 FastEmbed alias strings (e.g. `BGESmallENV15`, `AllMiniLML6V2`, `NomicEmbedTextV15`) still work unchanged. See [Vector Search](../guides/vector-search.md).
 
 ### Flush
 The process of writing in-memory data (L0) to persistent storage (L1). Triggered by size thresholds or explicit calls.

@@ -12,7 +12,7 @@
 //!
 //! This is the strict-schema-mode counterpart to the schemaless
 //! on-the-fly dataset/branch creation in
-//! [`crate::backend::BranchedBackend`]: under
+//! `uni_store::backend::BranchedBackend`: under
 //! `UniConfig.strict_schema = true`, an unknown label is rejected
 //! before reaching the backend, so the only way for a fork to
 //! introduce its own labels without leaking into primary is to grow

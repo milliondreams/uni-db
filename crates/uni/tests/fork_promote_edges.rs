@@ -127,6 +127,65 @@ async fn promote_edges_skips_when_endpoint_absent_on_primary() -> Result<()> {
 }
 
 #[tokio::test]
+async fn promote_multi_edges_with_different_props() -> Result<()> {
+    // Phase 7d: parallel KNOWS edges between Alice and Bob with
+    // *different* property bags must both land on primary. Under
+    // Phase 6b's (src_uid, dst_uid, type) identity they'd collapse
+    // to one; under Phase 7d's content-addressed edge UID they're
+    // distinct and both promote.
+    let db = build_test_db().await?;
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE (:Person {name: 'Anchor'})").await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    {
+        let fork = session.fork("parallel").await?;
+        let tx = fork.tx().await?;
+        // Two parallel edges with different `since` values.
+        tx.execute(
+            "CREATE (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}), \
+                    (a)-[:KNOWS {since: 2020}]->(b), \
+                    (a)-[:KNOWS {since: 2024}]->(b)",
+        )
+        .await?;
+        tx.commit().await?;
+    }
+
+    let report = db
+        .promote_from_fork(
+            "parallel",
+            &[
+                PromotePattern::label("Person"),
+                PromotePattern::edge_type("KNOWS"),
+            ],
+        )
+        .await?;
+    assert_eq!(
+        report.edges_inserted, 2,
+        "both parallel edges should promote, got {:?}",
+        report
+    );
+
+    let rs = session
+        .query(
+            "MATCH (a:Person {name: 'Alice'})-[r:KNOWS]->(b:Person {name: 'Bob'}) \
+             RETURN r.since AS since ORDER BY r.since",
+        )
+        .await?;
+    let years: Vec<i64> = rs
+        .rows()
+        .iter()
+        .filter_map(|r| r.get::<i64>("since").ok())
+        .collect();
+    assert_eq!(years, vec![2020, 2024], "primary holds both parallel edges");
+
+    db.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn promote_edges_dedupes_existing_edge() -> Result<()> {
     let db = build_test_db().await?;
     let session = db.session();

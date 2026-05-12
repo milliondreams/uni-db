@@ -73,6 +73,10 @@ harness = false
 name = "mutation_benchmarks"
 harness = false
 
+[[bench]]
+name = "fork_diff_promote"
+harness = false
+
 [features]
 default = ["lance-backend", "provider-gemini", "provider-openai"]
 lance-backend = ["uni-store/lance-backend"]

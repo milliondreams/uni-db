@@ -174,6 +174,13 @@ impl VertexPropertyChange {
 pub struct DiffEdge {
     /// The edge type.
     pub edge_type: String,
+    /// Content-addressed edge UID (computed via
+    /// `MainEdgeDataset::compute_edge_uid` over
+    /// `(src_uid, dst_uid, edge_type, sorted_properties)`). Two
+    /// parallel edges between the same endpoints with different
+    /// property bags have different `edge_uid`s — that's how the
+    /// diff distinguishes them.
+    pub edge_uid: UniId,
     /// Source vertex UID (content-addressed).
     pub src_uid: UniId,
     /// Destination vertex UID (content-addressed).
@@ -439,9 +446,12 @@ pub(crate) async fn compute_diff(a: &Session, b: &Session) -> Result<ForkDiff> {
 
 /// One bucketed vertex row keyed by content UID.
 type VertexBucket = HashMap<UniId, VertexRow>;
-/// One bucketed edge row keyed by `(src_uid, dst_uid)` (the type is
-/// fixed per scan).
-type EdgeBucket = HashMap<(UniId, UniId), EdgeRow>;
+/// One bucketed edge row keyed by content-addressed edge UID
+/// (`compute_edge_uid(src_uid, dst_uid, type, properties)`). Two
+/// parallel edges between the same endpoints with different property
+/// bags hash to different keys and therefore appear as distinct
+/// entries — that's the Phase 7d multi-edge semantics.
+type EdgeBucket = HashMap<UniId, EdgeRow>;
 
 #[derive(Debug, Clone)]
 struct VertexRow {
@@ -452,6 +462,8 @@ struct VertexRow {
 
 #[derive(Debug, Clone)]
 struct EdgeRow {
+    src_uid: UniId,
+    dst_uid: UniId,
     properties: Properties,
 }
 
@@ -484,6 +496,7 @@ async fn scan_label_nodes(s: &Session, label: &str) -> Result<VertexBucket> {
 }
 
 async fn scan_edge_type(s: &Session, edge_type: &str) -> Result<EdgeBucket> {
+    use uni_store::storage::main_edge::MainEdgeDataset;
     use uni_store::storage::vertex::VertexDataset;
     let cypher = format!(
         "MATCH (a)-[r:`{}`]->(b) RETURN a, r, b",
@@ -501,9 +514,17 @@ async fn scan_edge_type(s: &Session, edge_type: &str) -> Result<EdgeBucket> {
         let b_label = b.labels.first().cloned().unwrap_or_default();
         let src_uid = VertexDataset::compute_vertex_uid(&a_label, None, &a.properties);
         let dst_uid = VertexDataset::compute_vertex_uid(&b_label, None, &b.properties);
+        let edge_uid = MainEdgeDataset::compute_edge_uid(
+            &src_uid,
+            &dst_uid,
+            edge_type,
+            &edge.properties,
+        );
         bucket.insert(
-            (src_uid, dst_uid),
+            edge_uid,
             EdgeRow {
+                src_uid,
+                dst_uid,
                 properties: edge.properties.clone(),
             },
         );
@@ -548,40 +569,38 @@ fn diff_label(label: &str, a: VertexBucket, b: VertexBucket, out: &mut VertexDif
 }
 
 fn diff_edge_type(edge_type: &str, a: EdgeBucket, b: EdgeBucket, out: &mut EdgeDiff) {
-    let keys_a: HashSet<(UniId, UniId)> = a.keys().copied().collect();
-    let keys_b: HashSet<(UniId, UniId)> = b.keys().copied().collect();
+    let keys_a: HashSet<UniId> = a.keys().copied().collect();
+    let keys_b: HashSet<UniId> = b.keys().copied().collect();
 
-    for key in keys_b.difference(&keys_a) {
-        let row = b[key].clone();
+    for edge_uid in keys_b.difference(&keys_a) {
+        let row = b[edge_uid].clone();
         out.added.push(DiffEdge {
             edge_type: edge_type.to_string(),
-            src_uid: key.0,
-            dst_uid: key.1,
+            edge_uid: *edge_uid,
+            src_uid: row.src_uid,
+            dst_uid: row.dst_uid,
             properties: row.properties,
         });
     }
-    for key in keys_a.difference(&keys_b) {
-        let row = a[key].clone();
+    for edge_uid in keys_a.difference(&keys_b) {
+        let row = a[edge_uid].clone();
         out.deleted.push(DiffEdge {
             edge_type: edge_type.to_string(),
-            src_uid: key.0,
-            dst_uid: key.1,
+            edge_uid: *edge_uid,
+            src_uid: row.src_uid,
+            dst_uid: row.dst_uid,
             properties: row.properties,
         });
     }
-    for key in keys_a.intersection(&keys_b) {
-        let row_a = &a[key];
-        let row_b = &b[key];
-        let changes = property_changes(&row_a.properties, &row_b.properties);
-        if !changes.is_empty() {
-            out.changed.push(EdgePropertyChange {
-                edge_type: edge_type.to_string(),
-                src_uid: key.0,
-                dst_uid: key.1,
-                changes,
-            });
-        }
-    }
+    // Note: under content-addressed identity, two edges with the same
+    // edge_uid have, by construction, identical (src, dst, type,
+    // properties) — so the intersection cannot contain a property
+    // difference. The `changed` branch is intentionally unreachable
+    // under multi-edge semantics; property mutations surface as
+    // added+deleted of distinct edge UIDs. `EdgePropertyChange`
+    // remains in the public API for forward compatibility with a
+    // future identity model that anchors on a stable edge id.
+    let _ = (keys_a.intersection(&keys_b), out as &mut EdgeDiff);
 }
 
 fn property_changes(a: &Properties, b: &Properties) -> Vec<PropertyChange> {
@@ -800,25 +819,40 @@ pub(crate) async fn run_promote(
                         }
                     };
 
-                    // Dedup against primary via Cypher: count existing
-                    // edges of this type between these two VIDs. Within
-                    // the same promote call our fork-side bucketing
-                    // already collapses parallel edges to one per
-                    // (src_uid, dst_uid) so we don't need to dedup
-                    // against ourselves.
+                    // Multi-edge-aware dedup (Phase 7d): the fork-side
+                    // bucket is keyed by content edge UID, so within
+                    // this call we never insert the same content
+                    // twice. Against primary we have to enumerate all
+                    // parallel edges between the resolved endpoints
+                    // and compare each one's content UID — primary
+                    // doesn't store edge UIDs (Phase 7d kept the
+                    // edges-table schema unchanged), so we recompute.
+                    use uni_store::storage::main_edge::MainEdgeDataset;
+                    let fork_edge_uid = MainEdgeDataset::compute_edge_uid(
+                        &src_uid,
+                        &dst_uid,
+                        edge_type,
+                        &edge.properties,
+                    );
                     let dedup_cypher = format!(
-                        "MATCH (a)-[r:`{}`]->(b) WHERE id(a) = {} AND id(b) = {} RETURN count(r) AS c",
+                        "MATCH (a)-[r:`{}`]->(b) WHERE id(a) = {} AND id(b) = {} RETURN r",
                         escape_backticks(edge_type),
                         src_vid.as_u64(),
                         dst_vid.as_u64()
                     );
                     let exists = match primary.query(&dedup_cypher).await {
-                        Ok(rs) => rs
-                            .rows()
-                            .first()
-                            .and_then(|row| row.get::<i64>("c").ok())
-                            .map(|c| c > 0)
-                            .unwrap_or(false),
+                        Ok(rs) => rs.rows().iter().any(|row| {
+                            let Some(Value::Edge(existing)) = row.value("r") else {
+                                return false;
+                            };
+                            let existing_uid = MainEdgeDataset::compute_edge_uid(
+                                &src_uid,
+                                &dst_uid,
+                                edge_type,
+                                &existing.properties,
+                            );
+                            existing_uid == fork_edge_uid
+                        }),
                         Err(_) => false,
                     };
                     if exists {

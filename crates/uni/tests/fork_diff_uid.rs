@@ -76,6 +76,81 @@ async fn diff_pairs_by_uid_across_unrelated_forks() -> Result<()> {
 }
 
 #[tokio::test]
+async fn diff_distinguishes_parallel_edges() -> Result<()> {
+    // Phase 7d: two forks with parallel KNOWS edges differing only
+    // in the `since` property must show up as one added + one
+    // deleted in the diff, not collapsed to "no change". Under
+    // Phase 6b's identity (src_uid, dst_uid, type) they would have
+    // collapsed to one bucket per side; under Phase 7d the
+    // content-addressed edge UID separates them.
+    use uni_db::DataType;
+    let db = uni_db::Uni::in_memory().build().await?;
+    db.schema()
+        .label("Person")
+        .property("name", DataType::String)
+        .apply()
+        .await?;
+    db.schema()
+        .edge_type("KNOWS", &["Person"], &["Person"])
+        .property("since", DataType::Int64)
+        .apply()
+        .await?;
+
+    let primary = db.session();
+    let tx = primary.tx().await?;
+    tx.execute("CREATE (:Person {name: 'Anchor'})").await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    {
+        let a = primary.fork("year_a").await?;
+        let tx = a.tx().await?;
+        tx.execute(
+            "CREATE (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}), \
+                    (a)-[:KNOWS {since: 2020}]->(b)",
+        )
+        .await?;
+        tx.commit().await?;
+        a.flush().await?;
+    }
+    {
+        let b = primary.fork("year_b").await?;
+        let tx = b.tx().await?;
+        tx.execute(
+            "CREATE (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}), \
+                    (a)-[:KNOWS {since: 2024}]->(b)",
+        )
+        .await?;
+        tx.commit().await?;
+        b.flush().await?;
+    }
+
+    let diff = db.diff_forks("year_a", "year_b").await?;
+    assert_eq!(
+        diff.edges.added.len(),
+        1,
+        "year_b-only edge expected, got {:?}",
+        diff.edges.added
+    );
+    assert_eq!(
+        diff.edges.deleted.len(),
+        1,
+        "year_a-only edge expected, got {:?}",
+        diff.edges.deleted
+    );
+    // The two edges share the same endpoints + type but differ in
+    // properties — under content-addressed identity they have
+    // distinct edge_uids.
+    assert_ne!(
+        diff.edges.added[0].edge_uid, diff.edges.deleted[0].edge_uid,
+        "added and deleted edges must have different edge_uids"
+    );
+
+    db.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn diff_inversion_holds_under_uid_identity() -> Result<()> {
     let db = Uni::in_memory().build().await?;
     db.schema()

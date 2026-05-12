@@ -23,10 +23,11 @@ use anyhow::{Result, anyhow};
 use arrow_array::builder::{LargeBinaryBuilder, StringBuilder};
 use arrow_array::{Array, ArrayRef, BooleanArray, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema, TimeUnit};
+use sha3::{Digest, Sha3_256};
 use std::collections::HashMap;
 use std::sync::Arc;
 use uni_common::Properties;
-use uni_common::core::id::{Eid, Vid};
+use uni_common::core::id::{Eid, UniId, Vid};
 
 /// Main edge dataset for the unified `edges` table.
 ///
@@ -44,6 +45,56 @@ impl MainEdgeDataset {
         Self {
             _base_uri: base_uri.to_string(),
         }
+    }
+
+    /// Compute the content-addressed UID for an edge.
+    ///
+    /// Edge identity is the SHA3-256 of
+    /// `(src_uid, dst_uid, edge_type, sorted_properties)` — the same
+    /// content-addressed pattern as
+    /// [`MainVertexDataset::compute_vertex_uid`] but extended with
+    /// edge endpoint UIDs and the edge type. This lets fork diff and
+    /// promote distinguish parallel edges between the same endpoints
+    /// when their property bags differ (multi-edge support).
+    ///
+    /// Property iteration is sorted by key for deterministic hashing
+    /// across machines and runs.
+    pub fn compute_edge_uid(
+        src_uid: &UniId,
+        dst_uid: &UniId,
+        edge_type: &str,
+        props: &Properties,
+    ) -> UniId {
+        let mut hasher = Sha3_256::new();
+
+        // Endpoint UIDs first — direction is significant
+        // (src→dst ≠ dst→src for the same property bag).
+        hasher.update(b"src:");
+        hasher.update(src_uid.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(b"dst:");
+        hasher.update(dst_uid.as_bytes());
+        hasher.update(b"\0");
+
+        // Edge type.
+        hasher.update(b"type:");
+        hasher.update(edge_type.as_bytes());
+        hasher.update(b"\0");
+
+        // Properties sorted by key (matches compute_vertex_uid).
+        let mut sorted_keys: Vec<_> = props.keys().collect();
+        sorted_keys.sort();
+        for key in sorted_keys {
+            if let Some(val) = props.get(key) {
+                hasher.update(key.as_bytes());
+                hasher.update(b":");
+                hasher.update(val.to_string().as_bytes());
+                hasher.update(b"\0");
+            }
+        }
+
+        let result = hasher.finalize();
+        UniId::from_bytes(result.into())
     }
 
     /// Get the Arrow schema for the main edges table.

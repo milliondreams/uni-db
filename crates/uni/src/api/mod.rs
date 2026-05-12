@@ -643,17 +643,50 @@ impl Uni {
         Ok(())
     }
 
-    /// Phase 6 — Structural diff between two forks.
+    /// Structural diff between two forks.
     ///
-    /// Returns the delta that would turn `a` into `b`: `added` rows are
-    /// present in `b` only, `deleted` in `a` only, `changed` on rows
-    /// with matching VID and differing properties. See
-    /// [`fork_diff::ForkDiff`] for the data model and identity caveats.
+    /// Returns the delta that would turn `a` into `b`: `added` rows
+    /// are present in `b` only, `deleted` in `a` only. Identity is
+    /// content-addressed UID (Phase 6b) for vertices and an
+    /// edge-content UID (Phase 7d) for edges, so the diff is correct
+    /// even between two unrelated forks that happen to have rolled
+    /// the same VIDs.
+    ///
+    /// `diff(a, b).invert() == diff(b, a)` by construction — see
+    /// [`fork_diff::ForkDiff::invert`].
     ///
     /// # Errors
     ///
     /// - [`UniError::ForkNotFound`] when either name is unknown.
     /// - Any error from opening a fork session on either side.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use uni_db::{DataType, Uni};
+    /// # async fn example() -> uni_db::Result<()> {
+    /// let db = Uni::in_memory().build().await?;
+    /// db.schema().label("Person").property("name", DataType::String).apply().await?;
+    /// let primary = db.session();
+    /// {
+    ///     let a = primary.fork("scenario_a").await?;
+    ///     let tx = a.tx().await?;
+    ///     tx.execute("CREATE (:Person {name: 'A-only'})").await?;
+    ///     tx.commit().await?;
+    /// }
+    /// {
+    ///     let b = primary.fork("scenario_b").await?;
+    ///     let tx = b.tx().await?;
+    ///     tx.execute("CREATE (:Person {name: 'B-only'})").await?;
+    ///     tx.commit().await?;
+    /// }
+    /// let diff = db.diff_forks("scenario_a", "scenario_b").await?;
+    /// assert_eq!(diff.vertices.added.len(), 1);   // B-only
+    /// assert_eq!(diff.vertices.deleted.len(), 1); // A-only
+    /// # db.shutdown().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn diff_forks(&self, a: &str, b: &str) -> Result<fork_diff::ForkDiff> {
         let primary = self.session();
         let sess_a = primary.fork(a).await?;
@@ -661,40 +694,98 @@ impl Uni {
         fork_diff::compute_diff(&sess_a, &sess_b).await
     }
 
-    /// Phase 6 — Structural diff between a fork and primary.
+    /// Structural diff between a fork and primary.
     ///
     /// Equivalent to `diff(primary, fork)`: rows the fork has added
     /// since the fork point appear in `added`; rows it has dropped
-    /// appear in `deleted`; rows whose properties have changed appear
-    /// in `changed`.
+    /// appear in `deleted`. Identity is content-addressed UID
+    /// (vertices) / edge-content UID (edges), so unrelated forks
+    /// pair correctly. See [`fork_diff::ForkDiff`] for the data
+    /// model.
     ///
     /// # Errors
     ///
     /// - [`UniError::ForkNotFound`] when the fork name is unknown.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use uni_db::{DataType, Uni};
+    /// # async fn example() -> uni_db::Result<()> {
+    /// let db = Uni::in_memory().build().await?;
+    /// db.schema().label("Person").property("name", DataType::String).apply().await?;
+    /// let primary = db.session();
+    /// {
+    ///     let fork = primary.fork("audit").await?;
+    ///     let tx = fork.tx().await?;
+    ///     tx.execute("CREATE (:Person {name: 'Bob'})").await?;
+    ///     tx.commit().await?;
+    /// }
+    /// let diff = db.diff_fork_primary("audit").await?;
+    /// assert_eq!(diff.vertices.added.len(), 1); // Bob
+    /// # db.shutdown().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn diff_fork_primary(&self, fork_name: &str) -> Result<fork_diff::ForkDiff> {
         let primary = self.session();
         let sess_fork = primary.fork(fork_name).await?;
         fork_diff::compute_diff(&primary, &sess_fork).await
     }
 
-    /// Phase 6 — Promote matched fork rows onto primary.
+    /// Promote matched fork rows onto primary.
     ///
-    /// For each [`fork_diff::PromotePattern`] in `patterns`, scans the
-    /// fork via Cypher, computes a content-derived UID for every
-    /// match, and bulk-inserts new vertices into primary in a single
-    /// transaction. Rows whose UID already exists on primary are
-    /// skipped. Edges are not promoted — see
-    /// [`fork_diff::PromoteReport::edges_skipped`].
+    /// For each [`fork_diff::PromotePattern`] in `patterns`:
+    ///
+    /// - **`PromotePattern::Vertex`** — scan the fork for vertices
+    ///   with the given label, compute a content-derived UID for
+    ///   each match, skip rows that already exist on primary by UID,
+    ///   bulk-insert the rest.
+    /// - **`PromotePattern::Edge`** — scan the fork for edges of the
+    ///   given type, resolve endpoint UIDs against primary, skip
+    ///   rows whose endpoints aren't on primary (counted in
+    ///   [`fork_diff::PromoteReport::edges_skipped_no_endpoint`]),
+    ///   dedup against existing parallel edges by content UID
+    ///   (Phase 7d multi-edge identity), and bulk-insert the rest.
     ///
     /// All inserts run inside one primary-targeted transaction that
-    /// commits on success.
+    /// commits on success. Mixing vertex and edge patterns in one
+    /// call is supported — endpoints inserted by an earlier vertex
+    /// pattern are visible to a subsequent edge pattern via an
+    /// in-memory cache.
     ///
     /// # Errors
     ///
     /// - [`UniError::ForkNotFound`] when the fork name is unknown.
-    /// - [`UniError::LabelNotFound`] when a pattern targets a label
-    ///   that does not exist on the fork or on primary.
+    /// - [`UniError::LabelNotFound`] when a vertex pattern targets a
+    ///   label that does not exist on primary.
+    /// - [`UniError::EdgeTypeNotFound`] when an edge pattern targets
+    ///   an edge type that does not exist on primary.
     /// - Any error from the primary write path.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use uni_db::{DataType, PromotePattern, Uni};
+    /// # async fn example() -> uni_db::Result<()> {
+    /// let db = Uni::in_memory().build().await?;
+    /// db.schema().label("Person").property("name", DataType::String).apply().await?;
+    /// let primary = db.session();
+    /// {
+    ///     let fork = primary.fork("publish").await?;
+    ///     let tx = fork.tx().await?;
+    ///     tx.execute("CREATE (:Person {name: 'NewKid'})").await?;
+    ///     tx.commit().await?;
+    /// }
+    /// let report = db.promote_from_fork(
+    ///     "publish",
+    ///     &[PromotePattern::label("Person")],
+    /// ).await?;
+    /// assert!(report.vertices_inserted >= 1);
+    /// # db.shutdown().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn promote_from_fork(
         &self,
         fork_name: &str,

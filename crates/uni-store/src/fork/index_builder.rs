@@ -54,6 +54,25 @@ pub async fn build_fork_local_index(
     column: &str,
     kind: ForkLocalIndexKind,
 ) -> Result<()> {
+    // For every kind that needs an actual Lance index file, resolve
+    // the fork's branch URI for the per-label dataset.
+    let dataset_name = format!("vertices_{label}");
+    let lookup_branch = || -> Result<String> {
+        scope.branch_for(&dataset_name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "fork-local index build for ({label}, {column}, {kind:?}): \
+                 fork has no branch for {dataset_name}; write some rows to the fork first"
+            )
+        })
+    };
+    let dataset_uri = || {
+        if base_uri.ends_with('/') {
+            format!("{base_uri}{dataset_name}.lance")
+        } else {
+            format!("{base_uri}/{dataset_name}.lance")
+        }
+    };
+
     match kind {
         ForkLocalIndexKind::VidUid => {
             // No index file to build — Lance's `base_paths` chain
@@ -66,30 +85,18 @@ pub async fn build_fork_local_index(
             );
         }
         ForkLocalIndexKind::ScalarBtree | ForkLocalIndexKind::Sorted => {
-            let dataset_name = format!("vertices_{label}");
-            let branch = scope.branch_for(&dataset_name).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "fork-local index build for ({label}, {column}, {kind:?}): \
-                     fork has no branch for {dataset_name}; write some rows to the fork first"
-                )
-            })?;
-            let dataset_uri = if base_uri.ends_with('/') {
-                format!("{base_uri}{dataset_name}.lance")
-            } else {
-                format!("{base_uri}/{dataset_name}.lance")
-            };
+            let branch = lookup_branch()?;
+            let uri = dataset_uri();
             let index_name = format!("fork_{}_{column}_btree", scope.fork_id());
             crate::backend::lance_branch::create_scalar_index_on_branch(
-                &dataset_uri,
+                &uri,
                 &branch,
                 column,
                 &index_name,
             )
             .await
             .with_context(|| {
-                format!(
-                    "build fork-local scalar index on {dataset_uri}@{branch} column={column}"
-                )
+                format!("build fork-local scalar index on {uri}@{branch} column={column}")
             })?;
             info!(
                 fork_id = %scope.fork_id(),
@@ -97,6 +104,50 @@ pub async fn build_fork_local_index(
                 branch = %branch,
                 column = %column,
                 "fork-local scalar/sorted index built"
+            );
+        }
+        ForkLocalIndexKind::Vector => {
+            let branch = lookup_branch()?;
+            let uri = dataset_uri();
+            let index_name = format!("fork_{}_{column}_vec", scope.fork_id());
+            crate::backend::lance_branch::create_vector_index_on_branch(
+                &uri,
+                &branch,
+                column,
+                &index_name,
+            )
+            .await
+            .with_context(|| {
+                format!("build fork-local vector index on {uri}@{branch} column={column}")
+            })?;
+            info!(
+                fork_id = %scope.fork_id(),
+                dataset = %dataset_name,
+                branch = %branch,
+                column = %column,
+                "fork-local vector index built (Phase 5b)"
+            );
+        }
+        ForkLocalIndexKind::FullText => {
+            let branch = lookup_branch()?;
+            let uri = dataset_uri();
+            let index_name = format!("fork_{}_{column}_fts", scope.fork_id());
+            crate::backend::lance_branch::create_fts_index_on_branch(
+                &uri,
+                &branch,
+                column,
+                &index_name,
+            )
+            .await
+            .with_context(|| {
+                format!("build fork-local FTS index on {uri}@{branch} column={column}")
+            })?;
+            info!(
+                fork_id = %scope.fork_id(),
+                dataset = %dataset_name,
+                branch = %branch,
+                column = %column,
+                "fork-local FTS index built (Phase 5b)"
             );
         }
     }

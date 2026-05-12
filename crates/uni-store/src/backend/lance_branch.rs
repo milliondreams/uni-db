@@ -257,6 +257,168 @@ pub async fn create_scalar_index_on_branch(
     Ok(())
 }
 
+/// Phase 5b: vector kNN search against a branch-checked-out dataset.
+/// Lance's `base_paths` chain on the branch surfaces both the
+/// fork-local rows and the parent-inherited rows in one scan, so a
+/// single nearest-K call returns the fused result set.
+///
+/// Used by `BranchedBackend::vector_search` when the fork has a
+/// branch for the target dataset. When the fork has no branch
+/// (label never written through the fork), the BranchedBackend
+/// delegates to primary's vector_search directly.
+///
+/// # Errors
+///
+/// - The dataset or branch cannot be opened.
+/// - Lance rejects the query (column type mismatch, dimension mismatch).
+pub async fn vector_search_on_branch(
+    uri: &str,
+    branch: &str,
+    column: &str,
+    query: &[f32],
+    k: usize,
+) -> Result<Vec<arrow_array::RecordBatch>> {
+    use arrow_array::Float32Array;
+    use futures::TryStreamExt;
+
+    let on_branch = open_branch(uri, branch).await?;
+    let key = Float32Array::from(query.to_vec());
+    let mut scanner = on_branch.scan();
+    scanner
+        .nearest(column, &key, k)
+        .map_err(|e| anyhow::anyhow!("vector_search_on_branch nearest({column}, k={k}): {e}"))?;
+    let stream = scanner
+        .try_into_stream()
+        .await
+        .map_err(|e| anyhow::anyhow!("vector_search_on_branch stream: {e}"))?;
+    stream
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(|e| anyhow::anyhow!("vector_search_on_branch collect: {e}"))
+}
+
+/// Phase 5b: BM25 full-text search against a branch-checked-out
+/// dataset. Same `base_paths` semantics as `vector_search_on_branch`
+/// — the chain gives a fused result set.
+///
+/// # Errors
+///
+/// - The dataset or branch cannot be opened.
+/// - Lance rejects the query.
+pub async fn full_text_search_on_branch(
+    uri: &str,
+    branch: &str,
+    column: &str,
+    query: &str,
+    k: usize,
+) -> Result<Vec<arrow_array::RecordBatch>> {
+    use futures::TryStreamExt;
+    use lance_index::scalar::FullTextSearchQuery;
+    use lance_index::scalar::inverted::query::MatchQuery;
+
+    let on_branch = open_branch(uri, branch).await?;
+    let match_query = MatchQuery::new(query.to_string()).with_column(Some(column.to_string()));
+    let fts_query = FullTextSearchQuery {
+        query: match_query.into(),
+        limit: Some(k as i64),
+        wand_factor: None,
+    };
+    let mut scanner = on_branch.scan();
+    scanner
+        .full_text_search(fts_query)
+        .map_err(|e| anyhow::anyhow!("full_text_search_on_branch({column}, k={k}): {e}"))?;
+    let stream = scanner
+        .try_into_stream()
+        .await
+        .map_err(|e| anyhow::anyhow!("full_text_search_on_branch stream: {e}"))?;
+    stream
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(|e| anyhow::anyhow!("full_text_search_on_branch collect: {e}"))
+}
+
+/// Create a Lance vector index on a branch-checked-out dataset (Phase 5b).
+/// The Phase 5b spike confirmed Lance writes the vector index file
+/// branch-locally — main sees zero indexes after; only the branch
+/// sees the new one. The fork's branch reads via `base_paths` then
+/// produce results that include parent-inherited rows when relevant.
+///
+/// Defaults to a 1-partition IVF-Flat with L2 distance — the
+/// simplest configuration that always builds. Phase 5b's MVP doesn't
+/// expose the IVF/PQ knobs because the auto-build path is opt-in via
+/// `Session::build_fork_local_index` and matches whatever the user
+/// explicitly asked for.
+///
+/// # Errors
+///
+/// - The dataset or branch cannot be opened.
+/// - Lance rejects the column (e.g. wrong type for vector index —
+///   must be `FixedSizeList<Float32, dim>`).
+/// - Object-store IO failures.
+pub async fn create_vector_index_on_branch(
+    uri: &str,
+    branch: &str,
+    column: &str,
+    index_name: &str,
+) -> Result<()> {
+    use lance::index::vector::VectorIndexParams;
+    use lance_index::{DatasetIndexExt, IndexType};
+    use lance_linalg::distance::MetricType;
+
+    let mut on_branch = open_branch(uri, branch).await?;
+    let params = VectorIndexParams::ivf_flat(1, MetricType::L2);
+    on_branch
+        .create_index(
+            &[column],
+            IndexType::Vector,
+            Some(index_name.to_string()),
+            &params,
+            true,
+        )
+        .await
+        .with_context(|| {
+            format!("create_vector_index_on_branch({uri}@{branch}, column={column})")
+        })?;
+    Ok(())
+}
+
+/// Create a Lance native FTS / inverted index on a branch-checked-out
+/// dataset (Phase 5b).
+///
+/// Same per-branch semantics as `create_vector_index_on_branch`.
+/// Used by `fork_index_builder::build_fork_local_index` for the
+/// `FullText` kind.
+///
+/// # Errors
+///
+/// - The dataset or branch cannot be opened.
+/// - The column type is not text.
+/// - Object-store IO failures.
+pub async fn create_fts_index_on_branch(
+    uri: &str,
+    branch: &str,
+    column: &str,
+    index_name: &str,
+) -> Result<()> {
+    use lance_index::{DatasetIndexExt, IndexType, scalar::InvertedIndexParams};
+
+    let mut on_branch = open_branch(uri, branch).await?;
+    // Mirrors `IndexManager::create_fts_index`: uses
+    // `IndexType::Inverted` (not Scalar) and `InvertedIndexParams`
+    // which carries the required `base_tokenizer` config that
+    // ScalarIndexParams::for_builtin(Inverted) doesn't set.
+    let fts_params = InvertedIndexParams::default();
+    on_branch
+        .create_index_builder(&[column], IndexType::Inverted, &fts_params)
+        .name(index_name.to_string())
+        .replace(true)
+        .await
+        .with_context(|| {
+            format!("create_fts_index_on_branch({uri}@{branch}, column={column})")
+        })?;
+    Ok(())
+}
+
 /// Create a Lance tag pinning `branch`'s current tip (Phase 4a).
 ///
 /// Tags are GC-exempt references — Lance's compaction retention sweep
@@ -756,6 +918,154 @@ mod tests {
         // Primary saw the new rows
         let primary = Dataset::open(&uri).await.unwrap();
         assert_eq!(primary.count_rows(None).await.unwrap(), 5);
+    }
+
+    /// Phase 5b spike: probe whether Lance's vector_search via
+    /// `Scanner::nearest` traverses `base_paths` for indexes the same
+    /// way scalar BTree reads do. If yes, fork-local vector indexes
+    /// fuse with parent's automatically (no bespoke fusion needed).
+    /// If no, Phase 5b needs a real `FusedVectorSearchExec`.
+    #[tokio::test]
+    #[ignore = "phase-5b spike: documents Lance per-branch vector index behavior; run with --run-ignored ignored-only"]
+    async fn phase5b_spike_per_branch_vector() {
+        use arrow_array::{Float32Array, RecordBatch as Batch, UInt64Array};
+        use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+        use lance::index::vector::VectorIndexParams;
+        use lance_index::{DatasetIndexExt, IndexType};
+        use lance_linalg::distance::MetricType;
+
+        let dir = TempDir::new().unwrap();
+        let uri = format!("{}/vec_ds.lance", dir.path().display());
+
+        // Schema: id u64 + vector FixedSizeList<Float32, 4>.
+        let vec_field = Field::new("item", DataType::Float32, false);
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::UInt64, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(vec_field.clone()), 4),
+                false,
+            ),
+        ]));
+
+        // Helper to build a batch with 4-d vectors.
+        let make_batch = |ids: Vec<u64>, vecs: Vec<[f32; 4]>| -> Batch {
+            let flat: Vec<f32> = vecs.into_iter().flatten().collect();
+            let values = Float32Array::from(flat);
+            let list = arrow_array::FixedSizeListArray::new(
+                Arc::new(vec_field.clone()),
+                4,
+                Arc::new(values),
+                None,
+            );
+            Batch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(UInt64Array::from(ids)),
+                    Arc::new(list),
+                ],
+            )
+            .unwrap()
+        };
+
+        // Seed primary with 100 rows, all near origin.
+        let primary_batch = {
+            let ids: Vec<u64> = (0..100).collect();
+            let vecs: Vec<[f32; 4]> = (0..100)
+                .map(|i| [(i as f32) * 0.001, 0.0, 0.0, 0.0])
+                .collect();
+            make_batch(ids, vecs)
+        };
+        let reader =
+            arrow_array::RecordBatchIterator::new(vec![Ok(primary_batch)].into_iter(), schema.clone());
+        Dataset::write(reader, &uri, None).await.unwrap();
+
+        // Build a vector index on primary's main branch.
+        let mut main_ds = Dataset::open(&uri).await.unwrap();
+        let params = VectorIndexParams::ivf_flat(1, MetricType::L2);
+        main_ds
+            .create_index(&["vector"], IndexType::Vector, Some("primary_vec".into()), &params, true)
+            .await
+            .unwrap();
+
+        // Branch off main and append 5 fork-only rows clustered far
+        // away (so they're easy to distinguish in nearest-N results).
+        let v_main = current_version(&uri).await.unwrap();
+        create_branch(&uri, "fork-vec", v_main).await.unwrap();
+        let fork_batch = {
+            let ids: Vec<u64> = (1000..1005).collect();
+            let vecs: Vec<[f32; 4]> = (0..5)
+                .map(|i| [100.0 + (i as f32), 0.0, 0.0, 0.0])
+                .collect();
+            make_batch(ids, vecs)
+        };
+        let reader2 =
+            arrow_array::RecordBatchIterator::new(vec![Ok(fork_batch)].into_iter(), schema.clone());
+        write_to_branch(&uri, "fork-vec", reader2).await.unwrap();
+
+        // Probe 1: query near 100.0 on the FORK branch — does the
+        // result include the fork-only rows?
+        let on_branch = open_branch(&uri, "fork-vec").await.unwrap();
+        let query = Float32Array::from(vec![100.5_f32, 0.0, 0.0, 0.0]);
+        let mut scanner = on_branch.scan();
+        scanner.nearest("vector", &query, 5).unwrap();
+        let stream = scanner.try_into_stream().await.unwrap();
+        let batches = futures::TryStreamExt::try_collect::<Vec<_>>(stream).await.unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        let mut ids: Vec<u64> = Vec::new();
+        for b in &batches {
+            let id_col = b
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap();
+            for i in 0..b.num_rows() {
+                ids.push(id_col.value(i));
+            }
+        }
+        eprintln!(
+            "SPIKE: branch nearest-5 to [100.5,0,0,0]: {total} rows, ids={ids:?}"
+        );
+        let saw_fork_id = ids.iter().any(|i| *i >= 1000);
+        let saw_primary_id = ids.iter().any(|i| *i < 1000);
+        eprintln!(
+            "SPIKE VERDICT: branch sees fork rows={saw_fork_id} parent rows={saw_primary_id}"
+        );
+
+        // Probe 2: try to build a vector index on the fork branch.
+        let mut on_branch_mut = open_branch(&uri, "fork-vec").await.unwrap();
+        let result = on_branch_mut
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("fork_vec".into()),
+                &params,
+                true,
+            )
+            .await;
+        match result {
+            Ok(_) => {
+                let main_after = Dataset::open(&uri).await.unwrap();
+                let main_indices = main_after.load_indices().await.unwrap();
+                let branch_after = open_branch(&uri, "fork-vec").await.unwrap();
+                let branch_indices = branch_after.load_indices().await.unwrap();
+                let main_has_fork = main_indices
+                    .iter()
+                    .any(|i: &lance::table::format::IndexMetadata| i.name == "fork_vec");
+                let branch_has_fork = branch_indices
+                    .iter()
+                    .any(|i: &lance::table::format::IndexMetadata| i.name == "fork_vec");
+                eprintln!(
+                    "SPIKE: vector index branch-local? {} leaked-to-main? {}",
+                    branch_has_fork && !main_has_fork,
+                    main_has_fork
+                );
+            }
+            Err(e) => {
+                eprintln!("SPIKE: vector index build on branch refused: {e}");
+            }
+        }
     }
 
     /// Phase 5a spike: probe whether `Dataset::create_index_builder`

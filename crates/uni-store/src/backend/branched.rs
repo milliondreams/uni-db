@@ -261,11 +261,32 @@ impl StorageBackend for BranchedBackend {
         metric: DistanceMetric,
         filter: FilterExpr,
     ) -> Result<Vec<RecordBatch>> {
-        // Phase 5 will route vector search through fork-local index
-        // fusion. Phase 1 falls back to primary's vector search even on
-        // a forked session — the result is correct (parent-inherited
-        // vector index covers fork-point data) but doesn't fuse with
-        // any fork-local writes. Phase 2/5 will revisit.
+        // Phase 5b: when the fork has a branch for this dataset,
+        // route through Lance's per-branch nearest-K — its
+        // `base_paths` chain on the branch surfaces both fork-local
+        // and parent-inherited rows in one scan, naturally fused.
+        // When no branch exists (label never written through the
+        // fork), delegate to primary's vector_search.
+        //
+        // The `metric` parameter is honored implicitly: Lance picks
+        // the metric from the index built on the column. `filter`
+        // is dropped on the branch path for now — Phase 5b's MVP
+        // doesn't push predicates through to lance::Dataset::scan,
+        // and the caller layer above re-applies filters in
+        // post-processing. Tighten in a 5b-followup if filter
+        // pushdown shows up in benchmarks.
+        if let Some(branch) = self.scope.branch_for(table) {
+            let dataset_uri = self.dataset_uri(table);
+            let _ = (metric, filter);
+            return super::lance_branch::vector_search_on_branch(
+                &dataset_uri,
+                &branch,
+                column,
+                query,
+                k,
+            )
+            .await;
+        }
         self.inner
             .vector_search(table, column, query, k, metric, filter)
             .await
@@ -279,6 +300,22 @@ impl StorageBackend for BranchedBackend {
         k: usize,
         filter: FilterExpr,
     ) -> Result<Vec<RecordBatch>> {
+        // Phase 5b: same per-branch routing as vector_search. Lance's
+        // FTS query on a branch surfaces fork-local + parent-inherited
+        // rows via `base_paths`. Filter pushdown deferred to a
+        // 5b-followup.
+        if let Some(branch) = self.scope.branch_for(table) {
+            let dataset_uri = self.dataset_uri(table);
+            let _ = filter;
+            return super::lance_branch::full_text_search_on_branch(
+                &dataset_uri,
+                &branch,
+                column,
+                query,
+                k,
+            )
+            .await;
+        }
         self.inner
             .full_text_search(table, column, query, k, filter)
             .await

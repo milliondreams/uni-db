@@ -244,6 +244,46 @@ Builds on Phase 2. `forked.fork(name)` now succeeds, producing a child whose rea
 - A nested fork's Lance branch has `base_paths = child_branch → parent_branch → main`. Datasets that the parent didn't have a branch for at child-creation time fall through to the existing on-the-fly creation path (`BranchedBackend::ensure_branch_for_new`) — the empty-parent commit still lands on main, which is safe because no ancestor's schema references a fork-only label.
 - `ForkInfo.parent_fork_id` is serialized into `catalog/fork_registry.json`. Field has lived in the schema since Phase 1 with serde round-trip tests; no migration needed.
 
+## Forks (Phase 5b — vector + FTS fork-local fusion)
+
+Builds on Phase 5a-impl. Adds the build path and BranchedBackend routing for the two lossy fusion types — vector ANN and BM25 — closing out Phase 5 of the original spec.
+
+### New public API (Phase 5b)
+
+- **`Session::build_fork_local_index(label, column, ForkLocalIndexKind::Vector)`** — builds a Lance native vector index (default IVF-Flat 1-partition L2) on the fork's branch. Subsequent `CALL uni.vector.query(...)` queries on the forked session return fused results from primary + fork-local vectors via Lance's `base_paths` chain.
+- **`Session::build_fork_local_index(label, column, ForkLocalIndexKind::FullText)`** — same shape for FTS using Lance's `IndexType::Inverted` + `InvertedIndexParams::default`. Subsequent `CALL uni.fts.query(...)` queries return fused results.
+- **`ForkLocalIndexKind::Vector` and `ForkLocalIndexKind::FullText` variants** — add to the `#[non_exhaustive]` enum in `uni-store::fork`.
+- **`FusionKind::AnnRerank` and `FusionKind::Bm25Rrf` variants** — add to the `#[non_exhaustive]` planner enum in `uni-query`. Reserved for a future planner-emission rewrite; today the runtime fusion happens at the `BranchedBackend` layer, not through a `FusedIndexScan` plan node.
+
+### Substrate additions
+
+- **Phase 5b spike** at `crates/uni-store/src/backend/lance_branch.rs::tests::phase5b_spike_per_branch_vector` — confirmed `Dataset::create_index` against a branch-checked-out dataset writes a branch-local vector index (main sees 0, branch sees 1).
+- **`uni_store::backend::lance_branch::create_vector_index_on_branch(uri, branch, column, name)`** — Lance native vector index build on a branch (IVF-Flat, L2). Default config; tighten via `Session::build_fork_local_index` when the user wants it.
+- **`uni_store::backend::lance_branch::create_fts_index_on_branch(uri, branch, column, name)`** — Lance native FTS via `IndexType::Inverted` + `InvertedIndexParams::default`.
+- **`uni_store::backend::lance_branch::vector_search_on_branch(uri, branch, column, query, k)`** — `Scanner::nearest`-based search routed through the fork's branch.
+- **`uni_store::backend::lance_branch::full_text_search_on_branch(uri, branch, column, query, k)`** — `Scanner::full_text_search` routed through the fork's branch.
+- **`BranchedBackend::vector_search` and `full_text_search`** — Phase 1 stubs lifted. When the fork has a branch for the target table, route through the new branch helpers; otherwise delegate to primary.
+
+### Behavior
+
+- **Read correctness on forked sessions:** vector and FTS queries now return fused results across primary-inherited and fork-local rows. Lance's `base_paths` chain on the fork's branch handles the fusion natively — Phase 5b doesn't need bespoke `FusedVectorSearchExec` / `FusedFullTextSearchExec` operators for the MVP.
+- **Filter pushdown:** dropped on the branch path for now; caller above re-applies. A 5b-followup can add this if benchmarks justify.
+- **Recall:** MVP recall@10 = 1.000 on the bundled scaffold (n=1000+100, q=20, K=10) because Lance falls back to brute-force on small datasets. For spec §8.2's 95% recall@K target on N=100k+ items, the recall scaffold at `crates/uni/tests/fork_index_recall_bench.rs` is the on-ramp.
+
+### Tests (3 new in Phase 5b)
+
+- `crates/uni/tests/fork_index_vector.rs` (1) — vector fusion: top-K results include both fork-local and primary-inherited vectors; primary's vector_search unaffected.
+- `crates/uni/tests/fork_index_bm25.rs` (1) — FTS fusion: top-K results include both fork-local and primary-inherited matching docs.
+- `crates/uni/tests/fork_index_recall_bench.rs` (1, `#[ignore]`) — recall@10 measurement scaffold.
+
+### Phase 5b limits (5b-followup)
+
+- No bespoke `FusedVectorSearchExec` / `FusedFullTextSearchExec` physical operators — the planner-emission path stays at the BranchedBackend layer. If recall benchmarks on N=100k+ datasets show Lance's per-branch ANN missing primary-inherited candidates, a follow-up adds an explicit two-side merge with exact rerank.
+- `FilterExpr` pushdown is dropped on the branch path. Tighten in a 5b-followup.
+- Cucumber TCK for fork lossy fusion — same standing rationale as earlier phases (planner shape doesn't fit Gherkin).
+- Python smoke for vector/FTS fork queries — same pattern as 5a-impl's smoke; small follow-up.
+- Compliance report at `compliance_reports/fork_index_<date>.md` — needs a real Criterion bench on N=100k items first.
+
 ## Forks (Phase 5a-impl — fork-local index fusion)
 
 Builds on Phase 5a substrate (commit `90b62131`). Adds the build pipeline, planner integration, and `FusedIndexScan` operator for the three lossless fusion types (BTree union, sorted k-way merge, fork-first VID/UID lookup). Lossy types (vector ANN, BM25 RRF) are Phase 5b.

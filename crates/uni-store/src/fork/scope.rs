@@ -37,17 +37,23 @@ use uni_common::core::schema::{EdgeTypeMeta, LabelMeta};
 use super::registry::{ForkHolderGuard, ForkRegistryHandle};
 
 /// Phase 5a: tag for the fork-local index registry on `ForkScope`.
+/// Phase 5b extends with `Vector` and `FullText` for lossy fusion.
 ///
-/// Mirrors the lossless slice of `IndexDefinition` that Phase 5a
-/// fuses; lossy types (Vector, FullText) ship with Phase 5b.
+/// `#[non_exhaustive]` so additional kinds (e.g. inverted-set,
+/// JSON path) can land additively without breaking match sites.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[non_exhaustive]
 pub enum ForkLocalIndexKind {
-    /// Scalar BTree on a property — union fusion.
+    /// Scalar BTree on a property — union fusion (Phase 5a-impl).
     ScalarBtree,
-    /// Sorted on a property (range / ORDER BY) — k-way merge fusion.
+    /// Sorted on a property (range / ORDER BY) — k-way merge fusion (Phase 5a-impl).
     Sorted,
-    /// VID/UID lookup index — fork-first fusion.
+    /// VID/UID lookup index — fork-first fusion (Phase 5a-impl).
     VidUid,
+    /// Vector (IVF/HNSW) index — top-k merge + rerank fusion (Phase 5b).
+    Vector,
+    /// Lance native FTS / inverted index — RRF fusion (Phase 5b).
+    FullText,
 }
 
 /// Read-only scope identifying a forked session.

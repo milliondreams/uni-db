@@ -170,10 +170,19 @@ build automatically. After the build registers, the planner rewrites
 
 For deterministic builds (tests, power users) call
 `Session::build_fork_local_index(label, column, kind)` with
-`ForkLocalIndexKind::ScalarBtree`, `Sorted`, or `VidUid`. Lossless
-types only in 5a-impl; vector ANN + BM25 RRF land in Phase 5b.
+`ForkLocalIndexKind::ScalarBtree`, `Sorted`, `VidUid` (Phase 5a-impl)
+or `Vector`, `FullText` (Phase 5b).
 
-What's left after 5a-impl:
-- Vector ANN + BM25 RRF fusion — Phase 5b alongside recall benchmarks.
+## Phase 5b — vector + FTS lossy fork-local fusion
+
+`Vector` and `FullText` kinds build per-fork Lance native indexes
+that `BranchedBackend::vector_search` and `full_text_search` route
+through automatically. `CALL uni.vector.query(...)` and
+`CALL uni.fts.query(...)` on a forked session return fused results
+across primary-inherited and fork-local rows via Lance's
+`base_paths` chain. Recall scaffold lives at
+`crates/uni/tests/fork_index_recall_bench.rs` (`#[ignore]`'d).
+
+What's left after Phase 5b:
 - Diff and promotion — Phase 6.
 - Property additions through `fork_schema()` (label/edge-type only for now; `SchemaDelta::added_properties` is reserved for a follow-up).

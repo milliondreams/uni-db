@@ -1716,6 +1716,14 @@ pub enum FusionKind {
     /// when a fork rebinds an external UID and queries must see the
     /// fork's binding before the parent's.
     VidUidForkFirst,
+    /// Phase 5b — vector ANN rerank: top-k from primary's index +
+    /// top-k from fork-local index, merged and reranked by exact
+    /// distance. Recall ≥ 95% per spec §8.2.
+    AnnRerank,
+    /// Phase 5b — BM25 reciprocal rank fusion: ranked lists from
+    /// primary's and fork-local FTS indexes combined via standard
+    /// RRF (`score = sum 1 / (k_rrf + rank_i)`, k_rrf = 60).
+    Bm25Rrf,
 }
 
 /// Logical query plan produced by [`QueryPlanner`].
@@ -8278,7 +8286,7 @@ fn rewrite_node<L: ForkIndexLookup>(plan: LogicalPlan, lookup: &L) -> LogicalPla
                     .and_then(|f| equality_target_column(f, &variable))
                 && let Some(idx_kind) = lookup.fork_index_for(&labels[0], &col)
             {
-                Some(into_fusion_kind(idx_kind))
+                into_fusion_kind(idx_kind)
             } else {
                 None
             };
@@ -8378,12 +8386,21 @@ fn rewrite_node<L: ForkIndexLookup>(plan: LogicalPlan, lookup: &L) -> LogicalPla
 }
 
 /// Map a fork-local index kind to its planner-side fusion variant.
-fn into_fusion_kind(kind: uni_store::fork::ForkLocalIndexKind) -> FusionKind {
+/// Returns `None` for any future `ForkLocalIndexKind` we don't yet
+/// know how to fuse — the caller falls back to a regular Scan.
+fn into_fusion_kind(kind: uni_store::fork::ForkLocalIndexKind) -> Option<FusionKind> {
     use uni_store::fork::ForkLocalIndexKind as K;
     match kind {
-        K::VidUid => FusionKind::VidUidForkFirst,
-        K::ScalarBtree => FusionKind::BtreeUnion,
-        K::Sorted => FusionKind::SortedKWayMerge,
+        K::VidUid => Some(FusionKind::VidUidForkFirst),
+        K::ScalarBtree => Some(FusionKind::BtreeUnion),
+        K::Sorted => Some(FusionKind::SortedKWayMerge),
+        K::Vector => Some(FusionKind::AnnRerank),
+        K::FullText => Some(FusionKind::Bm25Rrf),
+        // `ForkLocalIndexKind` is `#[non_exhaustive]`; future kinds
+        // we don't yet handle are silently passed through as a
+        // regular Scan so a forward-incompatible binary doesn't
+        // panic — just misses the fusion opportunity.
+        _ => None,
     }
 }
 

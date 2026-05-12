@@ -1209,11 +1209,11 @@ pub fn extract_uni_config(
         if v.bind(py).is_none() {
             uni_config.fork_default_ttl = None;
         } else {
-            uni_config.fork_default_ttl = Some(py_timedelta_to_duration(&v.bind(py))?);
+            uni_config.fork_default_ttl = Some(py_timedelta_to_duration(v.bind(py))?);
         }
     }
     if let Some(v) = config.get("fork_sweeper_interval") {
-        uni_config.fork_sweeper_interval = py_timedelta_to_duration(&v.bind(py))?;
+        uni_config.fork_sweeper_interval = py_timedelta_to_duration(v.bind(py))?;
     }
     if let Some(v) = config.get("disable_fork_sweeper") {
         uni_config.disable_fork_sweeper = v.extract::<bool>(py)?;

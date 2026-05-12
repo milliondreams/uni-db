@@ -626,36 +626,158 @@ fn escape_backticks(s: &str) -> String {
     s.replace('`', "``")
 }
 
-/// Resolve a content-derived UID to the VID it has on `primary` (if
-/// any). The shared `UidIndex` isn't fork-isolated — it returns a
-/// candidate VID for any UID that has *ever* been registered, fork or
-/// otherwise. This helper verifies the candidate by a primary Cypher
-/// MATCH-by-VID; if the vertex isn't in primary's view, returns None.
-async fn resolve_primary_vid(
+/// Resolve a set of UIDs to their primary VIDs in two queries
+/// regardless of the input size.
+///
+/// Returns a `HashMap<UniId, Vid>` containing only those UIDs that
+/// successfully resolve to a *primary* VID (i.e., a candidate VID
+/// from the shared `UidIndex` is actually present in primary's view
+/// of the label's vertex table). UIDs absent from the result map
+/// either had no candidate registered or all candidates pointed at
+/// fork-only rows.
+///
+/// Two queries per call regardless of `uids.len()`: one IN-filter
+/// scan of `UidIndex`'s dataset (collecting **all** registered VIDs
+/// per UID — `UidIndex::resolve_uids` collapses to one VID per UID
+/// which loses fork/primary disambiguation), and one primary Cypher
+/// MATCH with an `id(n) IN [...]` predicate to confirm which
+/// candidates live on primary.
+async fn batch_resolve_primary_vids(
     primary: &Session,
     primary_storage: &Arc<uni_store::storage::manager::StorageManager>,
     label: &str,
-    uid: &uni_common::core::id::UniId,
-) -> Option<Vid> {
-    let candidate = primary_storage
-        .uid_index(label)
-        .ok()?
-        .get_vid(uid)
-        .await
-        .ok()
-        .flatten()?;
-    // Cross-check: primary actually has a vertex with this VID.
-    let cypher = format!(
-        "MATCH (n:`{}`) WHERE id(n) = {} RETURN id(n) LIMIT 1",
-        escape_backticks(label),
-        candidate.as_u64()
-    );
-    let rs = primary.query(&cypher).await.ok()?;
-    if rs.rows().is_empty() {
-        None
-    } else {
-        Some(candidate)
+    uids: &[UniId],
+) -> HashMap<UniId, Vid> {
+    use uni_common::core::id::UniId as UniIdT;
+
+    let mut out: HashMap<UniIdT, Vid> = HashMap::new();
+    if uids.is_empty() {
+        return out;
     }
+    // Collect *all* candidate VIDs per UID by scanning the shared
+    // UidIndex with an IN filter. The shared index is not
+    // branch-isolated, so a single UID may have a fork-only VID and
+    // a primary VID both registered — we keep both and let the
+    // primary Cypher MATCH below decide which is real.
+    let candidates_per_uid: HashMap<UniIdT, Vec<Vid>> = match primary_storage
+        .uid_index(label)
+        .ok()
+    {
+        Some(uix) => match resolve_all_candidate_vids(&uix, uids).await {
+            Ok(m) => m,
+            Err(_) => return out,
+        },
+        None => return out,
+    };
+    if candidates_per_uid.is_empty() {
+        return out;
+    }
+    // Single Cypher with IN clause over every candidate VID across
+    // every UID. Primary's branched backend filters out fork-only
+    // VIDs naturally — they have no row in the primary view.
+    let vid_set: HashSet<u64> = candidates_per_uid
+        .values()
+        .flat_map(|vs| vs.iter().map(|v| v.as_u64()))
+        .collect();
+    let vid_list: Vec<String> = vid_set.iter().map(|v| v.to_string()).collect();
+    let cypher = format!(
+        "MATCH (n:`{}`) WHERE id(n) IN [{}] RETURN id(n) AS vid",
+        escape_backticks(label),
+        vid_list.join(", ")
+    );
+    let rs = match primary.query(&cypher).await {
+        Ok(rs) => rs,
+        Err(_) => return out,
+    };
+    let primary_vids: HashSet<u64> = rs
+        .rows()
+        .iter()
+        .filter_map(|row| row.get::<i64>("vid").ok())
+        .map(|v| v as u64)
+        .collect();
+    for (uid, vids) in candidates_per_uid {
+        // If *any* candidate VID for this UID lives on primary, the
+        // UID exists on primary. Pick the first such VID.
+        if let Some(vid) = vids
+            .into_iter()
+            .find(|v| primary_vids.contains(&v.as_u64()))
+        {
+            out.insert(uid, vid);
+        }
+    }
+    out
+}
+
+/// Scan `UidIndex`'s underlying dataset with an `_uid_hex IN (...)`
+/// filter and collect **every** VID registered for each UID — unlike
+/// `UidIndex::resolve_uids`, which collapses to one VID per UID via
+/// HashMap overwrite (losing fork-vs-primary disambiguation).
+async fn resolve_all_candidate_vids(
+    uix: &uni_store::storage::index::UidIndex,
+    uids: &[UniId],
+) -> uni_common::Result<HashMap<UniId, Vec<Vid>>> {
+    use arrow_array::Array;
+    use futures::TryStreamExt;
+
+    let ds = uix.open().await.map_err(uni_common::UniError::Internal)?;
+    let hex_values: Vec<String> = uids.iter().map(uid_to_hex).collect();
+    let filter = format!(
+        "_uid_hex IN ({})",
+        hex_values
+            .iter()
+            .map(|h| format!("'{}'", h))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let mut stream = ds
+        .scan()
+        .filter(&filter)
+        .map_err(|e| uni_common::UniError::Internal(anyhow::anyhow!(e)))?
+        .project(&["_uid_hex", "_vid"])
+        .map_err(|e| uni_common::UniError::Internal(anyhow::anyhow!(e)))?
+        .try_into_stream()
+        .await
+        .map_err(|e| uni_common::UniError::Internal(anyhow::anyhow!(e)))?;
+
+    let hex_to_uid: HashMap<String, UniId> =
+        uids.iter().map(|uid| (uid_to_hex(uid), *uid)).collect();
+    let mut out: HashMap<UniId, Vec<Vid>> = HashMap::new();
+    while let Some(batch) = stream
+        .try_next()
+        .await
+        .map_err(|e| uni_common::UniError::Internal(anyhow::anyhow!(e)))?
+    {
+        let uid_hex_col = batch
+            .column_by_name("_uid_hex")
+            .and_then(|c| c.as_any().downcast_ref::<arrow_array::StringArray>())
+            .ok_or_else(|| {
+                uni_common::UniError::Internal(anyhow::anyhow!(
+                    "Missing _uid_hex column"
+                ))
+            })?;
+        let vid_col = batch
+            .column_by_name("_vid")
+            .and_then(|c| c.as_any().downcast_ref::<arrow_array::UInt64Array>())
+            .ok_or_else(|| {
+                uni_common::UniError::Internal(anyhow::anyhow!(
+                    "Missing _vid column"
+                ))
+            })?;
+        for i in 0..batch.num_rows() {
+            if uid_hex_col.is_null(i) {
+                continue;
+            }
+            let hex = uid_hex_col.value(i);
+            if let Some(&uid) = hex_to_uid.get(hex) {
+                out.entry(uid).or_default().push(Vid::from(vid_col.value(i)));
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn uid_to_hex(uid: &UniId) -> String {
+    uid.as_bytes().iter().map(|b| format!("{:02x}", b)).collect()
 }
 
 // ============================================================================
@@ -711,26 +833,42 @@ pub(crate) async fn run_promote(
                     continue;
                 }
 
-                let mut to_insert: Vec<Properties> = Vec::with_capacity(result.rows().len());
-                let mut insert_uids: Vec<UniId> = Vec::with_capacity(result.rows().len());
+                // First pass: extract (uid, props) for every fork row,
+                // skipping rows already in the within-call cache.
+                let mut candidates: Vec<(UniId, Properties)> =
+                    Vec::with_capacity(result.rows().len());
                 for row in result.rows() {
                     let Some(Value::Node(node)) = row.value("n") else {
                         continue;
                     };
                     let uid = VertexDataset::compute_vertex_uid(label, None, &node.properties);
-                    // Skip if already promoted earlier in this call.
                     if just_inserted.contains_key(&(label.clone(), uid)) {
                         report.vertices_skipped_uid_conflict += 1;
                         continue;
                     }
-                    let conflict =
-                        resolve_primary_vid(primary, &primary_storage, label, &uid)
-                            .await
-                            .is_some();
-                    if conflict {
+                    candidates.push((uid, node.properties.clone()));
+                }
+
+                // Batch-resolve every candidate UID against primary.
+                // Two queries total per pattern (UidIndex.resolve_uids
+                // + Cypher IN-clause verify) instead of 2N.
+                let uids_to_check: Vec<UniId> =
+                    candidates.iter().map(|(u, _)| *u).collect();
+                let on_primary = batch_resolve_primary_vids(
+                    primary,
+                    &primary_storage,
+                    label,
+                    &uids_to_check,
+                )
+                .await;
+
+                let mut to_insert: Vec<Properties> = Vec::with_capacity(candidates.len());
+                let mut insert_uids: Vec<UniId> = Vec::with_capacity(candidates.len());
+                for (uid, props) in candidates {
+                    if on_primary.contains_key(&uid) {
                         report.vertices_skipped_uid_conflict += 1;
                     } else {
-                        to_insert.push(node.properties.clone());
+                        to_insert.push(props);
                         insert_uids.push(uid);
                     }
                 }
@@ -764,7 +902,21 @@ pub(crate) async fn run_promote(
                     continue;
                 }
 
-                let mut pattern_inserted = 0usize;
+                use uni_store::storage::main_edge::MainEdgeDataset;
+
+                // First pass: extract every fork edge into a typed
+                // record so we can batch-resolve endpoints and
+                // pre-fetch primary parallel edges in one shot each.
+                struct ForkEdgeRow {
+                    a_label: String,
+                    b_label: String,
+                    src_uid: UniId,
+                    dst_uid: UniId,
+                    edge_uid: UniId,
+                    edge_props: Properties,
+                }
+                let mut fork_edges: Vec<ForkEdgeRow> =
+                    Vec::with_capacity(result.rows().len());
                 for row in result.rows() {
                     let (
                         Some(Value::Edge(edge)),
@@ -785,32 +937,127 @@ pub(crate) async fn run_promote(
                         VertexDataset::compute_vertex_uid(&a_label, None, &a.properties);
                     let dst_uid =
                         VertexDataset::compute_vertex_uid(&b_label, None, &b.properties);
+                    let edge_uid = MainEdgeDataset::compute_edge_uid(
+                        &src_uid,
+                        &dst_uid,
+                        edge_type,
+                        &edge.properties,
+                    );
+                    fork_edges.push(ForkEdgeRow {
+                        a_label,
+                        b_label,
+                        src_uid,
+                        dst_uid,
+                        edge_uid,
+                        edge_props: edge.properties.clone(),
+                    });
+                }
 
-                    // Check the just-inserted cache first (vertex
-                    // pattern in this same call). Otherwise fall back
-                    // to UidIndex + Cypher verify on primary; the
-                    // verify step keeps fork-only registered UIDs
-                    // from leaking through the shared UidIndex.
-                    let src_vid = match just_inserted.get(&(a_label.clone(), src_uid)) {
-                        Some(v) => Some(*v),
-                        None => resolve_primary_vid(
-                            primary,
-                            &primary_storage,
-                            &a_label,
-                            &src_uid,
-                        )
-                        .await,
-                    };
-                    let dst_vid = match just_inserted.get(&(b_label.clone(), dst_uid)) {
-                        Some(v) => Some(*v),
-                        None => resolve_primary_vid(
-                            primary,
-                            &primary_storage,
-                            &b_label,
-                            &dst_uid,
-                        )
-                        .await,
-                    };
+                // Group endpoints by label so we can batch-resolve
+                // each label's UIDs in a single round-trip.
+                let mut to_resolve: HashMap<String, HashSet<UniId>> = HashMap::new();
+                for fe in &fork_edges {
+                    if !just_inserted.contains_key(&(fe.a_label.clone(), fe.src_uid)) {
+                        to_resolve.entry(fe.a_label.clone()).or_default().insert(fe.src_uid);
+                    }
+                    if !just_inserted.contains_key(&(fe.b_label.clone(), fe.dst_uid)) {
+                        to_resolve.entry(fe.b_label.clone()).or_default().insert(fe.dst_uid);
+                    }
+                }
+                let mut endpoint_resolved: HashMap<(String, UniId), Vid> = HashMap::new();
+                for (lbl, uid_set) in to_resolve {
+                    let uid_vec: Vec<UniId> = uid_set.into_iter().collect();
+                    let resolved = batch_resolve_primary_vids(
+                        primary,
+                        &primary_storage,
+                        &lbl,
+                        &uid_vec,
+                    )
+                    .await;
+                    for (uid, vid) in resolved {
+                        endpoint_resolved.insert((lbl.clone(), uid), vid);
+                    }
+                }
+                // Seed with just_inserted cache hits.
+                for ((lbl, uid), vid) in just_inserted.iter() {
+                    endpoint_resolved.insert((lbl.clone(), *uid), *vid);
+                }
+
+                // Pre-fetch primary's parallel edges for dedup: one
+                // query covering every (src_vid, dst_vid) pair across
+                // all resolved fork edges. Hash by computed edge UID.
+                let mut resolved_pairs: HashSet<(Vid, Vid)> = HashSet::new();
+                for fe in &fork_edges {
+                    let s = endpoint_resolved.get(&(fe.a_label.clone(), fe.src_uid));
+                    let d = endpoint_resolved.get(&(fe.b_label.clone(), fe.dst_uid));
+                    if let (Some(s), Some(d)) = (s, d) {
+                        resolved_pairs.insert((*s, *d));
+                    }
+                }
+                let mut primary_edge_uids: HashSet<UniId> = HashSet::new();
+                if !resolved_pairs.is_empty() {
+                    let src_vids: HashSet<u64> =
+                        resolved_pairs.iter().map(|(s, _)| s.as_u64()).collect();
+                    let dst_vids: HashSet<u64> =
+                        resolved_pairs.iter().map(|(_, d)| d.as_u64()).collect();
+                    let src_list: Vec<String> =
+                        src_vids.iter().map(|v| v.to_string()).collect();
+                    let dst_list: Vec<String> =
+                        dst_vids.iter().map(|v| v.to_string()).collect();
+                    let dedup_cypher = format!(
+                        "MATCH (a)-[r:`{}`]->(b) \
+                         WHERE id(a) IN [{}] AND id(b) IN [{}] \
+                         RETURN a, r, b",
+                        escape_backticks(edge_type),
+                        src_list.join(", "),
+                        dst_list.join(", "),
+                    );
+                    if let Ok(rs) = primary.query(&dedup_cypher).await {
+                        for row in rs.rows() {
+                            let (
+                                Some(Value::Edge(existing)),
+                                Some(Value::Node(ea)),
+                                Some(Value::Node(eb)),
+                            ) = (row.value("r"), row.value("a"), row.value("b"))
+                            else {
+                                continue;
+                            };
+                            let ea_label = ea.labels.first().cloned().unwrap_or_default();
+                            let eb_label = eb.labels.first().cloned().unwrap_or_default();
+                            let esrc = VertexDataset::compute_vertex_uid(
+                                &ea_label,
+                                None,
+                                &ea.properties,
+                            );
+                            let edst = VertexDataset::compute_vertex_uid(
+                                &eb_label,
+                                None,
+                                &eb.properties,
+                            );
+                            let euid = MainEdgeDataset::compute_edge_uid(
+                                &esrc,
+                                &edst,
+                                edge_type,
+                                &existing.properties,
+                            );
+                            primary_edge_uids.insert(euid);
+                        }
+                    }
+                }
+
+                // Second pass: classify each fork edge against the
+                // resolved endpoints and primary edge-UID set. Edges
+                // are accumulated and bulk-inserted in one call.
+                let mut edges_to_insert: Vec<(Vid, Vid, Properties)> =
+                    Vec::with_capacity(fork_edges.len());
+                let mut pattern_inserted = 0usize;
+                for fe in fork_edges {
+                    let src_vid = endpoint_resolved
+                        .get(&(fe.a_label.clone(), fe.src_uid))
+                        .copied();
+                    let dst_vid = endpoint_resolved
+                        .get(&(fe.b_label.clone(), fe.dst_uid))
+                        .copied();
                     let (src_vid, dst_vid) = match (src_vid, dst_vid) {
                         (Some(s), Some(d)) => (s, d),
                         _ => {
@@ -818,56 +1065,17 @@ pub(crate) async fn run_promote(
                             continue;
                         }
                     };
-
-                    // Multi-edge-aware dedup (Phase 7d): the fork-side
-                    // bucket is keyed by content edge UID, so within
-                    // this call we never insert the same content
-                    // twice. Against primary we have to enumerate all
-                    // parallel edges between the resolved endpoints
-                    // and compare each one's content UID — primary
-                    // doesn't store edge UIDs (Phase 7d kept the
-                    // edges-table schema unchanged), so we recompute.
-                    use uni_store::storage::main_edge::MainEdgeDataset;
-                    let fork_edge_uid = MainEdgeDataset::compute_edge_uid(
-                        &src_uid,
-                        &dst_uid,
-                        edge_type,
-                        &edge.properties,
-                    );
-                    let dedup_cypher = format!(
-                        "MATCH (a)-[r:`{}`]->(b) WHERE id(a) = {} AND id(b) = {} RETURN r",
-                        escape_backticks(edge_type),
-                        src_vid.as_u64(),
-                        dst_vid.as_u64()
-                    );
-                    let exists = match primary.query(&dedup_cypher).await {
-                        Ok(rs) => rs.rows().iter().any(|row| {
-                            let Some(Value::Edge(existing)) = row.value("r") else {
-                                return false;
-                            };
-                            let existing_uid = MainEdgeDataset::compute_edge_uid(
-                                &src_uid,
-                                &dst_uid,
-                                edge_type,
-                                &existing.properties,
-                            );
-                            existing_uid == fork_edge_uid
-                        }),
-                        Err(_) => false,
-                    };
-                    if exists {
+                    if primary_edge_uids.contains(&fe.edge_uid) {
                         report.edges_skipped_duplicate += 1;
                         continue;
                     }
-
-                    primary_tx
-                        .bulk_insert_edges(
-                            edge_type,
-                            vec![(src_vid, dst_vid, edge.properties.clone())],
-                        )
-                        .await?;
-                    report.edges_inserted += 1;
+                    edges_to_insert.push((src_vid, dst_vid, fe.edge_props));
                     pattern_inserted += 1;
+                }
+                if !edges_to_insert.is_empty() {
+                    let n = edges_to_insert.len();
+                    primary_tx.bulk_insert_edges(edge_type, edges_to_insert).await?;
+                    report.edges_inserted += n;
                 }
                 report.per_pattern_inserted[idx] = pattern_inserted;
             }

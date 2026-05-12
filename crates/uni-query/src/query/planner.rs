@@ -1768,6 +1768,21 @@ pub enum LogicalPlan {
         optional: bool,
         kind: FusionKind,
     },
+    /// Phase 5b followup: planner-side observability marker for the
+    /// lossy fusion types. Wraps the original `VectorKnn` or
+    /// `InvertedIndexLookup` (or any future leaf operator whose
+    /// shape differs from `Scan`) without changing its fields, so
+    /// the physical planner can decay it to `inner` unchanged.
+    ///
+    /// Runtime behavior is identical to running `inner` directly;
+    /// the wrap is purely for explain-plan and runtime-stats
+    /// observability. The actual fusion happens at the
+    /// `BranchedBackend` layer (per-branch Lance reads via
+    /// `base_paths`), exactly as in Phase 5b's core ship.
+    FusedIndexScanWrapped {
+        inner: Box<LogicalPlan>,
+        kind: FusionKind,
+    },
     /// Lookup vertices by ext_id using the main vertices table.
     /// Used when a query references ext_id without specifying a label.
     ExtIdLookup {
@@ -8239,6 +8254,20 @@ pub trait ForkIndexLookup {
         label: &str,
         column: &str,
     ) -> Option<uni_store::fork::ForkLocalIndexKind>;
+
+    /// Phase 5b followup: resolve a label id, then dispatch to
+    /// `fork_index_for`. Used by the rewrite when wrapping
+    /// `VectorKnn` and `InvertedIndexLookup` nodes which carry
+    /// `label_id: u16` rather than the label name. Default returns
+    /// `None`; the `StorageManager` impl resolves via its
+    /// `schema_manager`.
+    fn fork_index_for_label_id(
+        &self,
+        _label_id: u16,
+        _column: &str,
+    ) -> Option<uni_store::fork::ForkLocalIndexKind> {
+        None
+    }
 }
 
 impl ForkIndexLookup for uni_store::storage::StorageManager {
@@ -8248,6 +8277,16 @@ impl ForkIndexLookup for uni_store::storage::StorageManager {
         column: &str,
     ) -> Option<uni_store::fork::ForkLocalIndexKind> {
         self.fork_index_exists(label, column)
+    }
+
+    fn fork_index_for_label_id(
+        &self,
+        label_id: u16,
+        column: &str,
+    ) -> Option<uni_store::fork::ForkLocalIndexKind> {
+        let schema = self.schema_manager().schema();
+        let label_name = schema.label_name_by_id(label_id)?;
+        self.fork_index_exists(label_name, column)
     }
 }
 
@@ -8306,6 +8345,99 @@ fn rewrite_node<L: ForkIndexLookup>(plan: LogicalPlan, lookup: &L) -> LogicalPla
                     filter,
                     optional,
                 },
+            }
+        }
+        // Phase 5b followup: wrap lossy leaf operators when a
+        // matching fork-local index has been registered. The wrap
+        // preserves the original node's fields (the physical
+        // planner unwraps and recurses); only the explain-plan
+        // surface and runtime-stats operator name change. The
+        // actual fusion still happens at the `BranchedBackend`
+        // layer via Lance's per-branch reads.
+        //
+        // The CALL-style vector/FTS queries land as `ProcedureCall`
+        // (not the dedicated `VectorKnn`/`InvertedIndexLookup`
+        // operators); recognize those by procedure name and the
+        // shape of their first two arguments (`label, column, ...`).
+        LogicalPlan::ProcedureCall {
+            procedure_name,
+            arguments,
+            yield_items,
+        } => {
+            let kind = procedure_call_fusion_kind(&procedure_name, &arguments, lookup);
+            let inner = LogicalPlan::ProcedureCall {
+                procedure_name,
+                arguments,
+                yield_items,
+            };
+            match kind {
+                Some(kind) => LogicalPlan::FusedIndexScanWrapped {
+                    inner: Box::new(inner),
+                    kind,
+                },
+                None => inner,
+            }
+        }
+        LogicalPlan::VectorKnn {
+            label_id,
+            variable,
+            property,
+            query,
+            k,
+            threshold,
+        } => {
+            if let Some(idx_kind) =
+                lookup.fork_index_for_label_id(label_id, &property)
+                && let Some(kind) = into_fusion_kind(idx_kind)
+            {
+                LogicalPlan::FusedIndexScanWrapped {
+                    inner: Box::new(LogicalPlan::VectorKnn {
+                        label_id,
+                        variable,
+                        property,
+                        query,
+                        k,
+                        threshold,
+                    }),
+                    kind,
+                }
+            } else {
+                LogicalPlan::VectorKnn {
+                    label_id,
+                    variable,
+                    property,
+                    query,
+                    k,
+                    threshold,
+                }
+            }
+        }
+        LogicalPlan::InvertedIndexLookup {
+            label_id,
+            variable,
+            property,
+            terms,
+        } => {
+            if let Some(idx_kind) =
+                lookup.fork_index_for_label_id(label_id, &property)
+                && let Some(kind) = into_fusion_kind(idx_kind)
+            {
+                LogicalPlan::FusedIndexScanWrapped {
+                    inner: Box::new(LogicalPlan::InvertedIndexLookup {
+                        label_id,
+                        variable,
+                        property,
+                        terms,
+                    }),
+                    kind,
+                }
+            } else {
+                LogicalPlan::InvertedIndexLookup {
+                    label_id,
+                    variable,
+                    property,
+                    terms,
+                }
             }
         }
         // Tree-recursive variants — only the ones that can carry a
@@ -8383,6 +8515,46 @@ fn rewrite_node<L: ForkIndexLookup>(plan: LogicalPlan, lookup: &L) -> LogicalPla
         // un-recursed-into subtrees.
         other => other,
     }
+}
+
+/// Phase 5b followup: inspect a CALL-style procedure invocation
+/// for a `(label, column)` pair and check whether a fork-local
+/// index has been registered for it.
+///
+/// Recognizes:
+/// - `uni.vector.query(label, column, query_vec, k)` → `AnnRerank`
+///   when a `Vector` fork-local index exists.
+/// - `uni.fts.query(label, column, query, k)` → `Bm25Rrf` when a
+///   `FullText` fork-local index exists.
+///
+/// Returns `None` for any other procedure (no rewrite) or when the
+/// registry has no matching entry.
+fn procedure_call_fusion_kind<L: ForkIndexLookup>(
+    procedure_name: &str,
+    arguments: &[Expr],
+    lookup: &L,
+) -> Option<FusionKind> {
+    if arguments.len() < 2 {
+        return None;
+    }
+    let label = match &arguments[0] {
+        Expr::Literal(uni_cypher::ast::CypherLiteral::String(s)) => s.as_str(),
+        _ => return None,
+    };
+    let column = match &arguments[1] {
+        Expr::Literal(uni_cypher::ast::CypherLiteral::String(s)) => s.as_str(),
+        _ => return None,
+    };
+    let expected = match procedure_name {
+        "uni.vector.query" => uni_store::fork::ForkLocalIndexKind::Vector,
+        "uni.fts.query" => uni_store::fork::ForkLocalIndexKind::FullText,
+        _ => return None,
+    };
+    let registered = lookup.fork_index_for(label, column)?;
+    if registered != expected {
+        return None;
+    }
+    into_fusion_kind(registered)
 }
 
 /// Map a fork-local index kind to its planner-side fusion variant.

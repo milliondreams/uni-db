@@ -576,6 +576,15 @@ impl HybridPhysicalPlanner {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         match logical {
             // === Graph Operations ===
+            // Phase 5b followup: `FusedIndexScanWrapped` is a
+            // planner-side observability wrapper around lossy
+            // operators (VectorKnn, InvertedIndexLookup). The
+            // runtime fusion happens at the `BranchedBackend`
+            // layer via Lance per-branch reads; the physical
+            // planner just unwraps and recurses on the inner node.
+            LogicalPlan::FusedIndexScanWrapped { inner, kind: _ } => {
+                self.plan_internal(inner, all_properties)
+            }
             LogicalPlan::Scan {
                 label_id,
                 labels,
@@ -5064,6 +5073,11 @@ fn resolve_fold_bindings(
 /// references to their identity columns (e.g., `n` → `n._vid` for nodes).
 fn collect_variable_kinds(plan: &LogicalPlan, kinds: &mut HashMap<String, VariableKind>) {
     match plan {
+        // Phase 5b followup: recurse into the wrapped node so the
+        // wrapped operator's variable still gets collected.
+        LogicalPlan::FusedIndexScanWrapped { inner, .. } => {
+            collect_variable_kinds(inner, kinds);
+        }
         LogicalPlan::Scan { variable, .. }
         | LogicalPlan::FusedIndexScan { variable, .. }
         | LogicalPlan::ExtIdLookup { variable, .. }

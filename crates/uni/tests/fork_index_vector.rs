@@ -68,6 +68,28 @@ async fn fork_local_vector_index_returns_fused_results() -> Result<()> {
         .build_fork_local_index("Doc", "embedding", ForkLocalIndexKind::Vector)
         .await?;
 
+    // Phase 5b followup: planner emission for vector. Explain
+    // should now show FusedIndexScanWrapped { kind: AnnRerank }
+    // wrapping the original VectorKnn node.
+    let plan = forked
+        .query_with(
+            "CALL uni.vector.query('Doc', 'embedding', [0.0, 1.0, 0.0], 5)
+             YIELD node, score
+             RETURN node.name AS name",
+        )
+        .explain()
+        .await?;
+    assert!(
+        plan.plan_text.contains("FusedIndexScanWrapped"),
+        "expected FusedIndexScanWrapped after Vector registration; got {}",
+        plan.plan_text
+    );
+    assert!(
+        plan.plan_text.contains("AnnRerank"),
+        "expected AnnRerank fusion kind; got {}",
+        plan.plan_text
+    );
+
     // Query near the Y axis on the fork — fork-local vectors should
     // dominate the top of the ranking, primary-inherited Z/X should
     // appear lower with worse scores. The exact recall depends on

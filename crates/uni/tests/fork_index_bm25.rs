@@ -58,6 +58,28 @@ async fn fork_local_fts_index_returns_fused_results() -> Result<()> {
         .build_fork_local_index("Doc", "body", ForkLocalIndexKind::FullText)
         .await?;
 
+    // Phase 5b followup: planner emission for FTS. Explain should
+    // show FusedIndexScanWrapped { kind: Bm25Rrf } wrapping the
+    // original InvertedIndexLookup node.
+    let plan = forked
+        .query_with(
+            "CALL uni.fts.query('Doc', 'body', 'zebra', 10)
+             YIELD node, score
+             RETURN node.title AS title",
+        )
+        .explain()
+        .await?;
+    assert!(
+        plan.plan_text.contains("FusedIndexScanWrapped"),
+        "expected FusedIndexScanWrapped after FullText registration; got {}",
+        plan.plan_text
+    );
+    assert!(
+        plan.plan_text.contains("Bm25Rrf"),
+        "expected Bm25Rrf fusion kind; got {}",
+        plan.plan_text
+    );
+
     // Use the existing CALL-style FTS surface. For Phase 5b the
     // fusion comes from BranchedBackend routing through the fork's
     // branch — the surface is unchanged.

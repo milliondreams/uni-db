@@ -825,6 +825,7 @@ impl Executor {
         match plan {
             LogicalPlan::Scan { .. } => "read_scan",
             LogicalPlan::FusedIndexScan { .. } => "read_fused_index_scan",
+            LogicalPlan::FusedIndexScanWrapped { .. } => "read_fused_index_scan_wrapped",
             LogicalPlan::ExtIdLookup { .. } => "read_extid_lookup",
             LogicalPlan::Traverse { .. } => "read_traverse",
             LogicalPlan::TraverseMainByType { .. } => "read_traverse_main",
@@ -2436,6 +2437,7 @@ impl Executor {
                 // then convert results to HashMaps for the fallback executor.
                 LogicalPlan::Scan { .. }
                 | LogicalPlan::FusedIndexScan { .. }
+                | LogicalPlan::FusedIndexScanWrapped { .. }
                 | LogicalPlan::ExtIdLookup { .. }
                 | LogicalPlan::ScanAll { .. }
                 | LogicalPlan::ScanMainByLabels { .. }

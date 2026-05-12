@@ -276,7 +276,19 @@ Builds on Phase 5a-impl. Adds the build path and BranchedBackend routing for the
 - `crates/uni/tests/fork_index_bm25.rs` (1) — FTS fusion: top-K results include both fork-local and primary-inherited matching docs.
 - `crates/uni/tests/fork_index_recall_bench.rs` (1, `#[ignore]`) — recall@10 measurement scaffold.
 
-### Phase 5b limits (5b-followup)
+### Phase 5b followup (planner emission for vector/FTS)
+
+A follow-up commit closes the planner-emission asymmetry between Phase 5a-impl and Phase 5b. New surface:
+
+- **`LogicalPlan::FusedIndexScanWrapped { inner: Box<LogicalPlan>, kind: FusionKind }`** — thin wrapper variant covering lossy operators whose shape doesn't match `Scan`. The physical planner unwraps and recurses on `inner`; runtime behavior is identical. Wrap is for explain-plan / runtime-stats observability.
+- **`ForkIndexLookup::fork_index_for_label_id(label_id, column)`** — default-impl trait method that resolves a numeric `label_id` (carried by `VectorKnn` / `InvertedIndexLookup`) before dispatching to `fork_index_for`. The `StorageManager` impl resolves via `schema_manager`.
+- **Rewrite extension in `rewrite_for_fork_fusion`:**
+  - `VectorKnn` / `InvertedIndexLookup` nodes — wrap when `fork_index_for_label_id` matches.
+  - `ProcedureCall { procedure_name, arguments, .. }` — wrap when `procedure_name` is `uni.vector.query` or `uni.fts.query` and the first two arguments are string literals matching a registered fork-local index. This is the canonical CALL-style surface for vector/FTS in Cypher today; planner emission targets it directly.
+
+Tests: `fork_index_vector.rs` and `fork_index_bm25.rs` extended with `explain()` assertions confirming `FusedIndexScanWrapped` + `AnnRerank` / `Bm25Rrf` appear in the plan after fork-local index registration.
+
+### Phase 5b limits (still followup)
 
 - No bespoke `FusedVectorSearchExec` / `FusedFullTextSearchExec` physical operators — the planner-emission path stays at the BranchedBackend layer. If recall benchmarks on N=100k+ datasets show Lance's per-branch ANN missing primary-inherited candidates, a follow-up adds an explicit two-side merge with exact rerank.
 - `FilterExpr` pushdown is dropped on the branch path. Tighten in a 5b-followup.

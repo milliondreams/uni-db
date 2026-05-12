@@ -936,6 +936,71 @@ impl Database {
             .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
+    // -----------------------------------------------------------------------
+    // Fork management (Phase 4b)
+    // -----------------------------------------------------------------------
+
+    /// List all currently-Active forks across the database.
+    fn list_forks(&self) -> Vec<crate::types::PyForkInfo> {
+        pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(self.inner.list_forks())
+            .into_iter()
+            .map(crate::types::PyForkInfo::from_rust)
+            .collect()
+    }
+
+    /// Look up a single fork by name. Returns `None` if the fork
+    /// doesn't exist (rather than raising `UniForkNotFoundError` —
+    /// matches the typical Python `dict.get`-style ergonomics).
+    fn fork_info(&self, name: &str) -> PyResult<Option<crate::types::PyForkInfo>> {
+        match pyo3_async_runtimes::tokio::get_runtime().block_on(self.inner.fork_info(name)) {
+            Ok(info) => Ok(Some(crate::types::PyForkInfo::from_rust(info))),
+            Err(uni_common::UniError::ForkNotFound { .. }) => Ok(None),
+            Err(e) => Err(crate::exceptions::uni_error_to_pyerr(e)),
+        }
+    }
+
+    /// Drop a fork.
+    ///
+    /// Errors with `UniForkInUseError`, `UniForkInflightTxError`, or
+    /// `UniForkHasChildrenError` (use `drop_fork_cascade` for the last).
+    fn drop_fork(&self, name: &str) -> PyResult<()> {
+        pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(self.inner.drop_fork(name))
+            .map_err(crate::exceptions::uni_error_to_pyerr)
+    }
+
+    /// Drop a fork and every descendant in its subtree.
+    ///
+    /// Pre-validates the whole subtree for live sessions / open
+    /// transactions before tombstoning anything.
+    fn drop_fork_cascade(&self, name: &str) -> PyResult<()> {
+        pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(self.inner.drop_fork_cascade(name))
+            .map_err(crate::exceptions::uni_error_to_pyerr)
+    }
+
+    /// Tag a fork with a Lance tag (GC-exempt; survives drop).
+    fn tag_fork(&self, fork_name: &str, tag: &str) -> PyResult<()> {
+        pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(self.inner.tag_fork(fork_name, tag))
+            .map_err(crate::exceptions::uni_error_to_pyerr)
+    }
+
+    /// Remove a previously-applied tag from a fork. Idempotent per dataset.
+    fn untag_fork(&self, fork_name: &str, tag: &str) -> PyResult<()> {
+        pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(self.inner.untag_fork(fork_name, tag))
+            .map_err(crate::exceptions::uni_error_to_pyerr)
+    }
+
+    /// List the unique user-visible tag names applied to this fork.
+    fn list_fork_tags(&self, fork_name: &str) -> PyResult<Vec<String>> {
+        pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(self.inner.list_fork_tags(fork_name))
+            .map_err(crate::exceptions::uni_error_to_pyerr)
+    }
+
     /// Access compaction operations.
     fn compaction(&self) -> PyCompaction {
         PyCompaction {

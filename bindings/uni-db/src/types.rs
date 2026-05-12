@@ -3234,3 +3234,148 @@ impl PyQueryType {
         "execute".to_string()
     }
 }
+
+// ============================================================================
+// Fork types (Phase 4b)
+// ============================================================================
+
+/// Stable identifier for a fork (ULID-backed).
+#[pyclass(name = "ForkId", frozen)]
+#[derive(Debug, Clone)]
+pub struct PyForkId {
+    pub(crate) inner: uni_common::core::fork::ForkId,
+}
+
+#[pymethods]
+impl PyForkId {
+    /// Parse a `ForkId` from its canonical 26-character base32 ULID string.
+    #[staticmethod]
+    fn parse(s: &str) -> PyResult<Self> {
+        uni_common::core::fork::ForkId::parse(s)
+            .map(|id| Self { inner: id })
+            .map_err(|e| crate::exceptions::UniInvalidArgumentError::new_err(e.to_string()))
+    }
+
+    fn __str__(&self) -> String {
+        self.inner.to_string()
+    }
+    fn __repr__(&self) -> String {
+        format!("ForkId({})", self.inner)
+    }
+    fn __eq__(&self, other: &Bound<'_, PyAny>) -> PyResult<bool> {
+        if let Ok(v) = other.extract::<PyForkId>() {
+            Ok(self.inner == v.inner)
+        } else if let Ok(s) = other.extract::<String>() {
+            Ok(self.inner.to_string() == s)
+        } else {
+            Ok(false)
+        }
+    }
+    fn __hash__(&self) -> isize {
+        // ULIDs are 128-bit; fold to isize for Python's hash protocol.
+        let raw = self.inner.0.0;
+        (raw as i64 ^ ((raw >> 64) as i64)) as isize
+    }
+}
+
+/// Lifecycle status of a fork in the registry.
+#[pyclass(eq, eq_int, name = "ForkStatus")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PyForkStatus {
+    Pending,
+    Active,
+    Tombstoned,
+}
+
+impl PyForkStatus {
+    pub(crate) fn from_rust(status: uni_common::core::fork::ForkStatus) -> Self {
+        use uni_common::core::fork::ForkStatus;
+        match status {
+            ForkStatus::Pending => Self::Pending,
+            ForkStatus::Active => Self::Active,
+            ForkStatus::Tombstoned => Self::Tombstoned,
+            _ => Self::Active, // future variants surface as Active for now
+        }
+    }
+}
+
+/// Registry record for a single fork.
+///
+/// All fields are exposed as Python attributes via `#[pyo3(get)]`.
+#[pyclass(name = "ForkInfo")]
+#[derive(Debug, Clone)]
+pub struct PyForkInfo {
+    #[pyo3(get)]
+    pub id: PyForkId,
+    #[pyo3(get)]
+    pub name: String,
+    #[pyo3(get)]
+    pub parent_fork_id: Option<PyForkId>,
+    #[pyo3(get)]
+    pub parent_snapshot_id: String,
+    /// `datetime.datetime` (UTC) — fork creation time.
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    /// `Optional[datetime.datetime]` — wall-clock TTL expiry. `None` ⇒ no TTL.
+    pub ttl_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[pyo3(get)]
+    pub schema_version_at_creation: u32,
+    /// Map of dataset name → branch name.
+    pub datasets: std::collections::BTreeMap<String, String>,
+    #[pyo3(get)]
+    pub status: PyForkStatus,
+}
+
+#[pymethods]
+impl PyForkInfo {
+    /// Fork creation time as a UTC `datetime.datetime`.
+    #[getter]
+    fn created_at<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        crate::convert::utc_datetime_to_py(py, self.created_at)
+    }
+
+    /// Wall-clock TTL expiry, or `None` if the fork has no TTL.
+    #[getter]
+    fn ttl_expires_at<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyAny>>> {
+        match self.ttl_expires_at {
+            Some(t) => Ok(Some(crate::convert::utc_datetime_to_py(py, t)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Map of `dataset_name` → `branch_name` for every Lance dataset
+    /// this fork owns.
+    #[getter]
+    fn datasets<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let dict = PyDict::new(py);
+        for (k, v) in &self.datasets {
+            dict.set_item(k, v)?;
+        }
+        Ok(dict)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "ForkInfo(id={}, name={:?}, status={:?}, datasets={})",
+            self.id.inner,
+            self.name,
+            self.status,
+            self.datasets.len(),
+        )
+    }
+}
+
+impl PyForkInfo {
+    pub(crate) fn from_rust(info: uni_common::core::fork::ForkInfo) -> Self {
+        Self {
+            id: PyForkId { inner: info.id },
+            name: info.name,
+            parent_fork_id: info.parent_fork_id.map(|id| PyForkId { inner: id }),
+            parent_snapshot_id: info.parent_snapshot_id,
+            created_at: info.created_at,
+            ttl_expires_at: info.ttl_expires_at,
+            schema_version_at_creation: info.schema_version_at_creation,
+            datasets: info.datasets,
+            status: PyForkStatus::from_rust(info.status),
+        }
+    }
+}

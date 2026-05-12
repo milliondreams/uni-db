@@ -114,9 +114,50 @@ Drop semantics:
 
 **Pin on forked sessions.** `Session::pin_to_version`, `pin_to_timestamp`, `refresh`, `is_pinned` all work on forked sessions in Phase 4a. The pinned manager preserves `fork_scope` so reads still route through the fork's branches at the pinned version; writes return `UniError::ReadOnly` while pinned.
 
-## What's not in Phase 4a
+## Python (Phase 4b)
 
-- Python bindings — Phase 4b.
+The full fork surface is bound to Python through both sync (`Uni` /
+`Session`) and async (`AsyncUni` / `AsyncSession`) facades. Builders
+chain synchronously; only the terminal `.build()` / `.apply()` is
+awaitable on the async side.
+
+```python
+import uni_db
+from datetime import timedelta
+
+db = uni_db.Uni.builder().max_forks(100).build()
+db.schema().label("Person").property("name", "string").apply()
+
+primary = db.session()
+fork = primary.fork("scenario").ttl(timedelta(hours=1)).build()
+tx = fork.tx()
+tx.execute("CREATE (:Person {name: 'fork-only'})")
+tx.commit()
+
+db.tag_fork("scenario", "audit-2026-q1")    # GC-exempt; survives drop
+del fork
+db.drop_fork("scenario")
+
+# Async equivalent:
+# fork = await primary.fork("scenario").ttl(timedelta(hours=1)).build()
+```
+
+Typed exceptions carry payload attributes:
+
+```python
+try:
+    db.drop_fork("a")
+except uni_db.UniForkHasChildrenError as e:
+    print(e.children)             # ['b', 'c']
+except uni_db.UniForkInUseError as e:
+    print(e.holder_count)         # 1
+except uni_db.UniForkBudgetExceededError as e:
+    print(e.current, e.max)       # 100 100
+```
+
+See `bindings/uni-db/examples/fork_quickstart.py` and
+`bindings/uni-db/examples/fork_audit.py` for runnable demos. Full
+reference at `docs/complete_python_api.md` § "24. Forks (Phase 4b)".
 - Fork-local index fusion — Phase 5.
 - Diff and promotion — Phase 6.
 - Property additions through `fork_schema()` (label/edge-type only for now; `SchemaDelta::added_properties` is reserved for a follow-up).

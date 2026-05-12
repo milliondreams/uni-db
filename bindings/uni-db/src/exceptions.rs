@@ -207,6 +207,65 @@ create_exception!(
     UniError,
     "Locy program compilation error."
 );
+// Fork lifecycle (Phase 4b)
+create_exception!(
+    _uni_db,
+    UniForkNotFoundError,
+    UniError,
+    "Fork with the given name does not exist."
+);
+create_exception!(
+    _uni_db,
+    UniForkAlreadyExistsError,
+    UniError,
+    "Session::fork(name).new_() called against an existing fork."
+);
+create_exception!(
+    _uni_db,
+    UniForkInUseError,
+    UniError,
+    "Drop refused because forked sessions are still alive on the fork. \
+     Carries `holder_count: int` attribute."
+);
+create_exception!(
+    _uni_db,
+    UniForkInflightTxError,
+    UniError,
+    "Drop refused because a transaction has uncommitted mutations on the fork."
+);
+create_exception!(
+    _uni_db,
+    UniForkHasChildrenError,
+    UniError,
+    "drop_fork refused because nested children exist. Use drop_fork_cascade. \
+     Carries `children: list[str]` attribute."
+);
+create_exception!(
+    _uni_db,
+    UniForkSubtreeInUseError,
+    UniError,
+    "drop_fork_cascade refused because the subtree has live sessions / open txes. \
+     Carries `blockers: list[str]` attribute."
+);
+create_exception!(
+    _uni_db,
+    UniForkBudgetExceededError,
+    UniError,
+    "Fork budget cap reached. Carries `current: int` and `max: int` attributes."
+);
+create_exception!(
+    _uni_db,
+    UniForkCorruptRegistryError,
+    UniError,
+    "Fork registry on disk is malformed."
+);
+create_exception!(
+    _uni_db,
+    UniForkLifecycleError,
+    UniError,
+    "A 2PC step on a fork lifecycle operation failed. Carries `stage: str` attribute."
+);
+
 create_exception!(
     _uni_db,
     UniLocyRuntimeError,
@@ -256,9 +315,85 @@ pub fn uni_error_to_pyerr(e: uni_common::UniError) -> PyErr {
         StaleDerivedFacts { .. } => UniStaleDerivedFactsError::new_err(msg),
         RuleConflict { .. } => UniRuleConflictError::new_err(msg),
         HookRejected { .. } => UniHookRejectedError::new_err(msg),
+
+        // Fork lifecycle (Phase 4b). The four payload-bearing variants
+        // get their fields attached as Python attributes so callers can
+        // write `e.holder_count`, `e.children`, etc.
+        ForkNotFound { name } => fork_err_with_attrs::<UniForkNotFoundError>(msg, &[("name", name)]),
+        ForkAlreadyExists { name } => {
+            fork_err_with_attrs::<UniForkAlreadyExistsError>(msg, &[("name", name)])
+        }
+        ForkInUse { name, holder_count } => {
+            fork_err_with(UniForkInUseError::new_err(msg), |_py, val| {
+                val.setattr("name", name)?;
+                val.setattr("holder_count", holder_count)?;
+                Ok(())
+            })
+        }
+        ForkInflightTx { name } => {
+            fork_err_with_attrs::<UniForkInflightTxError>(msg, &[("name", name)])
+        }
+        ForkHasChildren { name, children } => {
+            fork_err_with(UniForkHasChildrenError::new_err(msg), |py, val| {
+                val.setattr("name", name)?;
+                val.setattr("children", pyo3::types::PyList::new(py, &children)?)?;
+                Ok(())
+            })
+        }
+        ForkSubtreeInUse { blockers } => {
+            fork_err_with(UniForkSubtreeInUseError::new_err(msg), |py, val| {
+                val.setattr("blockers", pyo3::types::PyList::new(py, &blockers)?)?;
+                Ok(())
+            })
+        }
+        ForkBudgetExceeded { current, max } => {
+            fork_err_with(UniForkBudgetExceededError::new_err(msg), |_py, val| {
+                val.setattr("current", current)?;
+                val.setattr("max", max)?;
+                Ok(())
+            })
+        }
+        ForkCorruptRegistry { .. } => UniForkCorruptRegistryError::new_err(msg),
+        ForkLifecycle { name, stage, .. } => {
+            fork_err_with(UniForkLifecycleError::new_err(msg), |_py, val| {
+                val.setattr("name", name)?;
+                val.setattr("stage", stage)?;
+                Ok(())
+            })
+        }
+        ForkWritesNotYetSupported => UniError::new_err(msg),
         // Catch-all for future variants (non_exhaustive)
         _ => UniError::new_err(msg),
     }
+}
+
+/// Helper: attach a single `name` attribute to a fork exception that
+/// has no other payload. Reduces boilerplate for the simple variants.
+fn fork_err_with_attrs<E: pyo3::PyTypeInfo>(msg: String, attrs: &[(&str, String)]) -> PyErr {
+    let err = PyErr::new::<E, _>(msg);
+    Python::attach(|py| {
+        let val = err.value(py);
+        for (name, v) in attrs {
+            let _ = val.setattr(*name, v.clone());
+        }
+    });
+    err
+}
+
+/// Helper: build a fork exception, then mutate its Python value to
+/// attach typed payload attributes. Errors during setattr are
+/// suppressed — they're impossible in practice (all attrs are simple
+/// owned types) and panicking inside the conversion would be worse
+/// than carrying a missing attribute.
+fn fork_err_with<F>(err: PyErr, mutator: F) -> PyErr
+where
+    F: for<'py> FnOnce(Python<'py>, &Bound<'py, pyo3::exceptions::PyBaseException>) -> PyResult<()>,
+{
+    Python::attach(|py| {
+        let val = err.value(py);
+        let _ = mutator(py, val);
+    });
+    err
 }
 
 /// Convert an [`anyhow::Error`] into a Python exception.
@@ -405,6 +540,38 @@ pub fn register_exceptions(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> 
     )?;
     m.add("UniLocyCompileError", py.get_type::<UniLocyCompileError>())?;
     m.add("UniLocyRuntimeError", py.get_type::<UniLocyRuntimeError>())?;
+
+    // Fork lifecycle (Phase 4b)
+    m.add("UniForkNotFoundError", py.get_type::<UniForkNotFoundError>())?;
+    m.add(
+        "UniForkAlreadyExistsError",
+        py.get_type::<UniForkAlreadyExistsError>(),
+    )?;
+    m.add("UniForkInUseError", py.get_type::<UniForkInUseError>())?;
+    m.add(
+        "UniForkInflightTxError",
+        py.get_type::<UniForkInflightTxError>(),
+    )?;
+    m.add(
+        "UniForkHasChildrenError",
+        py.get_type::<UniForkHasChildrenError>(),
+    )?;
+    m.add(
+        "UniForkSubtreeInUseError",
+        py.get_type::<UniForkSubtreeInUseError>(),
+    )?;
+    m.add(
+        "UniForkBudgetExceededError",
+        py.get_type::<UniForkBudgetExceededError>(),
+    )?;
+    m.add(
+        "UniForkCorruptRegistryError",
+        py.get_type::<UniForkCorruptRegistryError>(),
+    )?;
+    m.add(
+        "UniForkLifecycleError",
+        py.get_type::<UniForkLifecycleError>(),
+    )?;
 
     Ok(())
 }

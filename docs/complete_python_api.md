@@ -2031,7 +2031,183 @@ class UniRuleConflictError(UniError): ...
 class UniHookRejectedError(UniError): ...
 class UniLocyCompileError(UniError): ...
 class UniLocyRuntimeError(UniError): ...
+
+# Forks (Phase 4b) — payload-bearing variants expose attributes
+class UniForkNotFoundError(UniError): ...
+class UniForkAlreadyExistsError(UniError): ...
+class UniForkInUseError(UniError):  # .holder_count: int
+    ...
+class UniForkInflightTxError(UniError): ...
+class UniForkHasChildrenError(UniError):  # .children: list[str]
+    ...
+class UniForkSubtreeInUseError(UniError):  # .blockers: list[str]
+    ...
+class UniForkBudgetExceededError(UniError):  # .current: int, .max: int
+    ...
+class UniForkCorruptRegistryError(UniError): ...
+class UniForkLifecycleError(UniError):  # .name: str, .stage: str
+    ...
 ```
+
+# 24. Forks (Phase 4b)
+
+Named, durable, isolated branches of the graph. Phase 4b binds the
+full Phase 1–4a fork surface to Python through both the sync
+(`Uni`/`Session`) and async (`AsyncUni`/`AsyncSession`) facades.
+
+## Quick start (sync)
+
+```python
+import uni_db
+from datetime import timedelta
+
+db = uni_db.Uni.builder().disable_fork_sweeper(True).build()
+db.schema().label("Person").property("name", "string").apply()
+
+primary = db.session()
+fork = primary.fork("scenario_1").ttl(timedelta(hours=1)).build()
+tx = fork.tx()
+tx.execute("CREATE (:Person {name: 'fork-only'})")
+tx.commit()
+# fork sees primary + its own writes; primary sees only its own.
+del fork
+db.drop_fork("scenario_1")
+```
+
+## Quick start (async)
+
+```python
+import asyncio
+import uni_db
+from datetime import timedelta
+
+async def main():
+    db = await uni_db.AsyncUni.builder().disable_fork_sweeper(True).build()
+    await db.schema().label("Person").property("name", "string").apply()
+
+    primary = db.session()
+    fork = await primary.fork("scenario_1").ttl(timedelta(hours=1)).build()
+    tx = await fork.tx()
+    await tx.execute("CREATE (:Person {name: 'fork-only'})")
+    await tx.commit()
+    del fork
+    await db.drop_fork("scenario_1")
+
+asyncio.run(main())
+```
+
+## Database-level admin (`Uni` / `AsyncUni`)
+
+| Method | Description |
+|---|---|
+| `list_forks() -> list[ForkInfo]` | All Active forks. |
+| `fork_info(name) -> ForkInfo \| None` | Lookup by name; `None` if absent (no `UniForkNotFoundError` for routine `dict.get`-style use). |
+| `drop_fork(name)` | Single-fork drop. Errors with `UniForkInUseError`, `UniForkInflightTxError`, or `UniForkHasChildrenError`. |
+| `drop_fork_cascade(name)` | Drop fork + descendants. Pre-validates the subtree; surfaces `UniForkSubtreeInUseError` with no branch deletes if any node is held. |
+| `tag_fork(name, tag)` | Pin Lance tags on every dataset the fork branched. GC-exempt; survives drop. |
+| `untag_fork(name, tag)` | Remove tag. Idempotent per dataset. |
+| `list_fork_tags(name) -> list[str]` | Unique user-visible tag names on this fork. |
+
+## Session-level (`Session` / `AsyncSession`)
+
+| Method | Description |
+|---|---|
+| `fork(name) -> ForkBuilder` | Open or create a fork. Parent is the receiver session (forking a forked session creates a nested child). |
+| `fork_schema() -> ForkSchemaBuilder` | Fork-local schema mutation (required under `strict_schema=True` for fork-only labels). Errors with `UniInvalidArgumentError` on a primary session. |
+| `flush()` | Flush the session's writer. On a forked session this flushes the fork's L0 to its Lance branches. |
+| `is_forked() -> bool` | `True` when this session was returned by `fork()`. |
+
+Existing methods (`pin_to_version`, `pin_to_timestamp`, `refresh`,
+`is_pinned`, `cancel`, `cancellation_token`) work on forked sessions
+in Phase 4a. Cancelling a parent cascades to forked children.
+
+## Builders
+
+```python
+class ForkBuilder:
+    def new_(self) -> ForkBuilder: ...      # require fresh creation
+    def ttl(self, ttl: timedelta) -> ForkBuilder: ...
+    def build(self) -> Session: ...
+
+class ForkSchemaBuilder:
+    def label(self, name: str, description: str | None = None) -> ForkSchemaBuilder: ...
+    def edge_type(self, name: str, from_labels: list[str], to_labels: list[str],
+                  description: str | None = None) -> ForkSchemaBuilder: ...
+    def apply(self) -> None: ...
+
+# Async equivalents:
+class AsyncForkBuilder:
+    def new_(self) -> AsyncForkBuilder: ...
+    def ttl(self, ttl: timedelta) -> AsyncForkBuilder: ...
+    async def build(self) -> AsyncSession: ...
+
+class AsyncForkSchemaBuilder:
+    def label(self, name: str, description: str | None = None) -> AsyncForkSchemaBuilder: ...
+    def edge_type(self, name: str, from_labels: list[str], to_labels: list[str],
+                  description: str | None = None) -> AsyncForkSchemaBuilder: ...
+    async def apply(self) -> None: ...
+```
+
+The async builders return synchronously from `fork()` / `fork_schema()`
+and only the terminal `.build()` / `.apply()` is awaitable —
+`await session.fork(name).ttl(td).build()` is a single chain.
+
+## Configuration
+
+`UniBuilder` / `AsyncUniBuilder` chainable methods (also accepted via
+`config({...})`):
+
+| Method | Type | Default | Meaning |
+|---|---|---|---|
+| `max_forks(cap)` | `int \| None` | `None` (unbounded) | Cap Active+Pending+Tombstoned fork count. Hitting the cap raises `UniForkBudgetExceededError`. |
+| `fork_default_ttl(td)` | `timedelta \| None` | `None` | Default TTL applied when `ForkBuilder.ttl()` is not used. |
+| `fork_sweeper_interval(td)` | `timedelta` | `60s` | TTL sweeper polling cadence. |
+| `disable_fork_sweeper(b)` | `bool` | `False` | Skip spawning the sweeper. Tests that race against TTL should set `True`. |
+
+## Types
+
+```python
+class ForkId:
+    @staticmethod
+    def parse(s: str) -> ForkId: ...
+    def __str__(self) -> str: ...
+    def __eq__(self, other: object) -> bool: ...
+    def __hash__(self) -> int: ...
+
+class ForkStatus(Enum):
+    Pending = ...
+    Active = ...
+    Tombstoned = ...
+
+class ForkInfo:
+    id: ForkId
+    name: str
+    parent_fork_id: ForkId | None    # None ⇒ rooted at primary
+    parent_snapshot_id: str
+    created_at: datetime              # UTC
+    ttl_expires_at: datetime | None
+    schema_version_at_creation: int
+    datasets: dict[str, str]          # dataset name → branch name
+    status: ForkStatus
+```
+
+## Error variants
+
+`UniError` subclasses (all importable from the top-level `uni_db`
+module). Variants marked **with attributes** carry typed payload data
+beyond the error message.
+
+| Exception | Attributes |
+|---|---|
+| `UniForkNotFoundError` | `name: str` |
+| `UniForkAlreadyExistsError` | `name: str` |
+| `UniForkInUseError` | `name: str`, `holder_count: int` |
+| `UniForkInflightTxError` | `name: str` |
+| `UniForkHasChildrenError` | `name: str`, `children: list[str]` |
+| `UniForkSubtreeInUseError` | `blockers: list[str]` |
+| `UniForkBudgetExceededError` | `current: int`, `max: int` |
+| `UniForkCorruptRegistryError` | — |
+| `UniForkLifecycleError` | `name: str`, `stage: str` |
 
 ## Hook Context Types
 

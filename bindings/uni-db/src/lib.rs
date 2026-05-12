@@ -115,6 +115,15 @@ fn _uni_db(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<types::PyTokenUsage>()?;
     m.add_class::<types::PyGenerationResult>()?;
 
+    // Fork types (Phase 4b)
+    m.add_class::<types::PyForkId>()?;
+    m.add_class::<types::PyForkStatus>()?;
+    m.add_class::<types::PyForkInfo>()?;
+    m.add_class::<builders::PyForkBuilder>()?;
+    m.add_class::<builders::PyForkSchemaBuilder>()?;
+    m.add_class::<async_api::AsyncForkBuilder>()?;
+    m.add_class::<async_api::AsyncForkSchemaBuilder>()?;
+
     // Snapshot & index types
     m.add_class::<types::SnapshotInfo>()?;
     m.add_class::<types::IndexRebuildTaskInfo>()?;

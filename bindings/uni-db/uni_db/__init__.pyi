@@ -2160,3 +2160,135 @@ class AsyncXervo:
         temperature: float | None = None,
         top_p: float | None = None,
     ) -> GenerationResult: ...
+
+# =============================================================================
+# Forks (Phase 4b)
+# =============================================================================
+
+from datetime import datetime, timedelta
+from enum import Enum
+
+class ForkId:
+    """Stable ULID-backed identifier for a fork."""
+
+    @staticmethod
+    def parse(s: str) -> "ForkId": ...
+    def __str__(self) -> str: ...
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object) -> bool: ...
+    def __hash__(self) -> int: ...
+
+class ForkStatus(Enum):
+    """Lifecycle status of a fork in the registry."""
+
+    Pending = ...
+    Active = ...
+    Tombstoned = ...
+
+class ForkInfo:
+    """Registry record for a single fork."""
+
+    id: ForkId
+    name: str
+    parent_fork_id: ForkId | None
+    parent_snapshot_id: str
+    created_at: datetime
+    ttl_expires_at: datetime | None
+    schema_version_at_creation: int
+    datasets: dict[str, str]
+    status: ForkStatus
+
+class ForkBuilder:
+    """Sync builder returned by `Session.fork(name)`. Drive via `.build()`."""
+
+    def new_(self) -> "ForkBuilder":
+        """Require fresh creation; errors with `UniForkAlreadyExistsError`."""
+        ...
+    def ttl(self, ttl: timedelta) -> "ForkBuilder":
+        """Stamp a wall-clock TTL on the fork."""
+        ...
+    def build(self) -> "Session":
+        """Drive the open-or-create flow and return a forked Session."""
+        ...
+
+class ForkSchemaBuilder:
+    """Sync builder returned by `Session.fork_schema()`. Drive via `.apply()`."""
+
+    def label(self, name: str, description: str | None = None) -> "ForkSchemaBuilder": ...
+    def edge_type(
+        self,
+        name: str,
+        from_labels: list[str],
+        to_labels: list[str],
+        description: str | None = None,
+    ) -> "ForkSchemaBuilder": ...
+    def apply(self) -> None: ...
+
+class AsyncForkBuilder:
+    """Async builder returned by `AsyncSession.fork(name)`. Drive via `await .build()`."""
+
+    def new_(self) -> "AsyncForkBuilder": ...
+    def ttl(self, ttl: timedelta) -> "AsyncForkBuilder": ...
+    async def build(self) -> "AsyncSession": ...
+
+class AsyncForkSchemaBuilder:
+    """Async builder returned by `AsyncSession.fork_schema()`. Drive via `await .apply()`."""
+
+    def label(self, name: str, description: str | None = None) -> "AsyncForkSchemaBuilder": ...
+    def edge_type(
+        self,
+        name: str,
+        from_labels: list[str],
+        to_labels: list[str],
+        description: str | None = None,
+    ) -> "AsyncForkSchemaBuilder": ...
+    async def apply(self) -> None: ...
+
+# Phase 4b — fork-related typed exceptions
+
+class UniForkNotFoundError(UniError):
+    """Fork with the given name does not exist."""
+
+    name: str
+
+class UniForkAlreadyExistsError(UniError):
+    """`Session.fork(name).new_()` called against an existing fork."""
+
+    name: str
+
+class UniForkInUseError(UniError):
+    """Drop refused because forked sessions are still alive."""
+
+    name: str
+    holder_count: int
+
+class UniForkInflightTxError(UniError):
+    """Drop refused because a transaction has uncommitted mutations."""
+
+    name: str
+
+class UniForkHasChildrenError(UniError):
+    """`drop_fork` refused because nested children exist."""
+
+    name: str
+    children: list[str]
+
+class UniForkSubtreeInUseError(UniError):
+    """`drop_fork_cascade` refused because the subtree has live sessions / open tx."""
+
+    blockers: list[str]
+
+class UniForkBudgetExceededError(UniError):
+    """`Session.fork(name)` refused because `max_forks` is at capacity."""
+
+    current: int
+    max: int
+
+class UniForkCorruptRegistryError(UniError):
+    """Fork registry on disk is malformed."""
+
+class UniForkLifecycleError(UniError):
+    """A 2PC step on a fork lifecycle operation failed."""
+
+    name: str
+    stage: str

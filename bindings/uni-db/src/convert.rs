@@ -1196,6 +1196,28 @@ pub fn extract_uni_config(
     if let Some(v) = config.get("strict_schema") {
         uni_config.strict_schema = v.extract::<bool>(py)?;
     }
+    // Phase 4b — fork lifecycle config
+    if let Some(v) = config.get("max_forks") {
+        // Allow None to mean unbounded; otherwise extract as usize.
+        if v.bind(py).is_none() {
+            uni_config.max_forks = None;
+        } else {
+            uni_config.max_forks = Some(v.extract::<usize>(py)?);
+        }
+    }
+    if let Some(v) = config.get("fork_default_ttl") {
+        if v.bind(py).is_none() {
+            uni_config.fork_default_ttl = None;
+        } else {
+            uni_config.fork_default_ttl = Some(py_timedelta_to_duration(&v.bind(py))?);
+        }
+    }
+    if let Some(v) = config.get("fork_sweeper_interval") {
+        uni_config.fork_sweeper_interval = py_timedelta_to_duration(&v.bind(py))?;
+    }
+    if let Some(v) = config.get("disable_fork_sweeper") {
+        uni_config.disable_fork_sweeper = v.extract::<bool>(py)?;
+    }
     Ok(uni_config)
 }
 
@@ -1393,5 +1415,58 @@ pub fn uni_config_to_py(py: Python, config: &uni_common::UniConfig) -> PyResult<
         "max_recursive_cte_iterations",
         config.max_recursive_cte_iterations,
     )?;
+    // Phase 4b — fork lifecycle config
+    dict.set_item("max_forks", config.max_forks)?;
+    dict.set_item(
+        "fork_default_ttl",
+        config.fork_default_ttl.map(|d| d.as_secs_f64()),
+    )?;
+    dict.set_item(
+        "fork_sweeper_interval",
+        config.fork_sweeper_interval.as_secs_f64(),
+    )?;
+    dict.set_item("disable_fork_sweeper", config.disable_fork_sweeper)?;
     Ok(dict.into())
+}
+
+// ============================================================================
+// Phase 4b — fork helpers
+// ============================================================================
+
+/// Convert a `chrono::DateTime<Utc>` to a Python `datetime.datetime`
+/// in the UTC timezone. Mirrors the existing `TemporalValue::DateTime`
+/// converter above but takes a `chrono` value directly so non-Value
+/// call sites (like `ForkInfo.created_at`) stay readable.
+pub fn utc_datetime_to_py<'py>(
+    py: Python<'py>,
+    dt: chrono::DateTime<chrono::Utc>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let datetime_module = py.import("datetime")?;
+    let tz_class = datetime_module.getattr("timezone")?;
+    let utc = tz_class.getattr("utc")?;
+    let dt_class = datetime_module.getattr("datetime")?;
+    let secs = dt.timestamp();
+    let micros = dt.timestamp_subsec_micros() as f64 / 1_000_000.0;
+    let result = dt_class.call_method1("fromtimestamp", (secs as f64 + micros, utc))?;
+    Ok(result)
+}
+
+/// Convert a Python `datetime.timedelta` to a `std::time::Duration`.
+/// Used by `ForkBuilder.ttl(...)` and the fork-related `UniConfig` fields.
+/// Negative timedeltas error.
+pub fn py_timedelta_to_duration(obj: &Bound<'_, PyAny>) -> PyResult<std::time::Duration> {
+    let total_secs: f64 = obj
+        .call_method0("total_seconds")?
+        .extract()
+        .map_err(|e| {
+            crate::exceptions::UniInvalidArgumentError::new_err(format!(
+                "expected datetime.timedelta or compatible duration: {e}"
+            ))
+        })?;
+    if total_secs < 0.0 {
+        return Err(crate::exceptions::UniInvalidArgumentError::new_err(
+            "timedelta must be non-negative",
+        ));
+    }
+    Ok(std::time::Duration::from_secs_f64(total_secs))
 }

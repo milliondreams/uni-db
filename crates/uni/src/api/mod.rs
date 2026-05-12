@@ -14,6 +14,7 @@ pub mod builder;
 pub mod bulk;
 pub mod compaction;
 pub mod fork;
+pub mod fork_diff;
 pub mod fork_schema;
 pub(crate) mod fork_index_builder;
 pub(crate) mod fork_sweeper;
@@ -640,6 +641,82 @@ impl Uni {
             self.drop_fork(&node.name).await?;
         }
         Ok(())
+    }
+
+    /// Phase 6 — Structural diff between two forks.
+    ///
+    /// Returns the delta that would turn `a` into `b`: `added` rows are
+    /// present in `b` only, `deleted` in `a` only, `changed` on rows
+    /// with matching VID and differing properties. See
+    /// [`fork_diff::ForkDiff`] for the data model and identity caveats.
+    ///
+    /// # Errors
+    ///
+    /// - [`UniError::ForkNotFound`] when either name is unknown.
+    /// - Any error from opening a fork session on either side.
+    pub async fn diff_forks(&self, a: &str, b: &str) -> Result<fork_diff::ForkDiff> {
+        let primary = self.session();
+        let sess_a = primary.fork(a).await?;
+        let sess_b = primary.fork(b).await?;
+        fork_diff::compute_diff(&sess_a, &sess_b).await
+    }
+
+    /// Phase 6 — Structural diff between a fork and primary.
+    ///
+    /// Equivalent to `diff(primary, fork)`: rows the fork has added
+    /// since the fork point appear in `added`; rows it has dropped
+    /// appear in `deleted`; rows whose properties have changed appear
+    /// in `changed`.
+    ///
+    /// # Errors
+    ///
+    /// - [`UniError::ForkNotFound`] when the fork name is unknown.
+    pub async fn diff_fork_primary(&self, fork_name: &str) -> Result<fork_diff::ForkDiff> {
+        let primary = self.session();
+        let sess_fork = primary.fork(fork_name).await?;
+        fork_diff::compute_diff(&primary, &sess_fork).await
+    }
+
+    /// Phase 6 — Promote matched fork rows onto primary.
+    ///
+    /// For each [`fork_diff::PromotePattern`] in `patterns`, scans the
+    /// fork via Cypher, computes a content-derived UID for every
+    /// match, and bulk-inserts new vertices into primary in a single
+    /// transaction. Rows whose UID already exists on primary are
+    /// skipped. Edges are not promoted — see
+    /// [`fork_diff::PromoteReport::edges_skipped`].
+    ///
+    /// All inserts run inside one primary-targeted transaction that
+    /// commits on success.
+    ///
+    /// # Errors
+    ///
+    /// - [`UniError::ForkNotFound`] when the fork name is unknown.
+    /// - [`UniError::LabelNotFound`] when a pattern targets a label
+    ///   that does not exist on the fork or on primary.
+    /// - Any error from the primary write path.
+    pub async fn promote_from_fork(
+        &self,
+        fork_name: &str,
+        patterns: &[fork_diff::PromotePattern],
+    ) -> Result<fork_diff::PromoteReport> {
+        let primary = self.session();
+        let fork = primary.fork(fork_name).await?;
+        // Ensure every pattern's label exists on primary; if a fork-only
+        // label appears, surface a clear error rather than letting
+        // bulk_insert_vertices fail mid-flight.
+        let primary_schema = self.inner.schema.schema();
+        for pat in patterns {
+            if !primary_schema.labels.contains_key(pat.label_name()) {
+                return Err(UniError::LabelNotFound {
+                    label: pat.label_name().to_string(),
+                });
+            }
+        }
+        let primary_tx = primary.tx().await?;
+        let report = fork_diff::run_promote(&fork, &primary_tx, patterns).await?;
+        primary_tx.commit().await?;
+        Ok(report)
     }
 
     /// Tag a fork with a Lance tag (Phase 4a).

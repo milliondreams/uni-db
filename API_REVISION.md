@@ -244,6 +244,32 @@ Builds on Phase 2. `forked.fork(name)` now succeeds, producing a child whose rea
 - A nested fork's Lance branch has `base_paths = child_branch → parent_branch → main`. Datasets that the parent didn't have a branch for at child-creation time fall through to the existing on-the-fly creation path (`BranchedBackend::ensure_branch_for_new`) — the empty-parent commit still lands on main, which is safe because no ancestor's schema references a fork-only label.
 - `ForkInfo.parent_fork_id` is serialized into `catalog/fork_registry.json`. Field has lived in the schema since Phase 1 with serde round-trip tests; no migration needed.
 
+## Forks (Phase 6 — diff & promote)
+
+Adds the structural-diff and write-audit-publish APIs called out by spec §3.3 and §3.4. Both are surfaced as methods on the top-level `Uni` (database) rather than on `Session`, matching `drop_fork` / `tag_fork`.
+
+### New public API (Phase 6)
+
+- **`Uni::diff_fork_primary(name) -> Result<ForkDiff>`** — opens the fork by name (read-only is sufficient) and returns the delta `diff(primary, fork)`: `added` is rows the fork has that primary doesn't, `deleted` is rows the fork has dropped, `changed` is per-vertex/edge property diffs on rows with matching VID.
+- **`Uni::diff_forks(a, b) -> Result<ForkDiff>`** — same but between two named forks. Returns an empty diff when `a == b`. `diff(a, b).invert() == diff(b, a)` by construction (`ForkDiff::invert` is provided).
+- **`Uni::promote_from_fork(name, &[PromotePattern]) -> Result<PromoteReport>`** — scans the named fork via Cypher per pattern, derives a content-addressed UID for each match via `VertexDataset::compute_vertex_uid`, and bulk-inserts new vertices into primary inside a single transaction (committed at the end). Rows whose UID already exists on primary are skipped. Edges are not promoted in Phase 6; they are counted in `PromoteReport.edges_skipped` and a `tracing::warn!` is emitted.
+
+### New types (`uni_db::api::fork_diff`)
+
+- **`ForkDiff { vertices: VertexDiff, edges: EdgeDiff }`** — the structural-diff payload. `is_empty()`, `total_rows()`, `invert()`.
+- **`VertexDiff { added: Vec<DiffVertex>, deleted: Vec<DiffVertex>, changed: Vec<VertexPropertyChange> }`** and the equivalent `EdgeDiff`.
+- **`DiffVertex { label, vid, properties }` / `DiffEdge { edge_type, src_vid, dst_vid, properties }`** — full row content from one side.
+- **`VertexPropertyChange { label, vid, changes }` / `EdgePropertyChange { edge_type, src_vid, dst_vid, changes }`** — per-row diffs, populated only when the row exists on both sides with the same VID and at least one differing property.
+- **`PropertyChange { key, before: Option<Value>, after: Option<Value> }`** — single-property before/after pair.
+- **`PromotePattern::label("Person").where_clause("n.age > 30")`** — Phase 6 supports the simplest useful selector: a label plus an optional Cypher predicate that is interpolated verbatim into the `WHERE` clause of the fork-side scan. Caller is responsible for quoting / parameter safety; future shapes (relationship-aware patterns, multi-label, parameter binding) are planned.
+- **`PromoteReport { vertices_inserted, vertices_skipped_uid_conflict, vertices_skipped_no_uid, edges_skipped, per_pattern_inserted }`** — counters callers use to confirm what landed.
+
+### Behaviour and limits
+
+- **Diff bucket key is VID, not UID.** Sufficient for the spec §3.3 / §3.4 fork-vs-parent use cases because the fork inherits primary's VIDs above its HWM. Cross-fork-without-shared-ancestor diff under VID is unreliable and is out of scope for Phase 6; the limit is documented on `ForkDiff`'s rustdoc.
+- **Promote does derive UIDs**, via the same `compute_vertex_uid(label, ext_id=None, properties)` hash that the writer uses on insert, so dedup is correct under content-addressed identity regardless of which side allocated the VID.
+- **Promote requires labels to pre-exist on primary.** Fork-only labels created via fork-local schema overlay must be `db.schema().label(...).apply().await` on primary before promote; otherwise the call errors with `UniError::LabelNotFound` *before* opening the primary transaction.
+
 ## Forks (Phase 5b — vector + FTS fork-local fusion)
 
 Builds on Phase 5a-impl. Adds the build path and BranchedBackend routing for the two lossy fusion types — vector ANN and BM25 — closing out Phase 5 of the original spec.

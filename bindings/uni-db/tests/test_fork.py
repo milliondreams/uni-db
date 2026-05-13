@@ -154,11 +154,17 @@ def test_nested_fork_chain():
 
 
 def test_drop_fork_refuses_with_children():
+    import gc
+
     db = _make_db(disable_fork_sweeper=True)
     primary = _seed_person_schema(db)
     a = primary.fork("a").build()
     _b = a.fork("b").build()
     del a, _b
+    # Force pyclass refcount drops to fire on slower runners (CI under
+    # pytest-xdist sometimes leaves the Py<T> wrappers reachable past
+    # `del` until the next GC pass).
+    gc.collect()
 
     with pytest.raises(uni_db.UniForkHasChildrenError) as excinfo:
         db.drop_fork("a")
@@ -189,6 +195,9 @@ def test_cascade_subtree_in_use():
 
 
 def test_fork_ttl_sweeper_drops_expired():
+    import gc
+    import time
+
     db = _make_db(
         disable_fork_sweeper=False,
         fork_sweeper_interval=timedelta(milliseconds=100),
@@ -197,14 +206,26 @@ def test_fork_ttl_sweeper_drops_expired():
 
     fork = primary.fork("ephemeral").ttl(timedelta(milliseconds=200)).build()
     del fork
+    # Force pyclass refcount drops so the underlying session releases
+    # and the sweeper can drop the fork.
+    gc.collect()
 
-    # Wait long enough for the sweeper to fire after expiry.
-    import time
-
-    time.sleep(0.8)
-
+    # Poll instead of relying on a fixed sleep so slower runners don't
+    # flake. TTL is 200ms; sweeper interval is 100ms; we wait up to
+    # 5s, polling every 100ms.
+    deadline = 5.0
+    elapsed = 0.0
+    poll_interval = 0.1
     remaining = [f.name for f in db.list_forks()]
-    assert "ephemeral" not in remaining
+    while "ephemeral" in remaining and elapsed < deadline:
+        time.sleep(poll_interval)
+        elapsed += poll_interval
+        remaining = [f.name for f in db.list_forks()]
+
+    assert "ephemeral" not in remaining, (
+        f"fork 'ephemeral' was not dropped by the TTL sweeper within {deadline}s "
+        f"(remaining = {remaining!r})"
+    )
 
 
 def test_fork_without_ttl_survives_sweeper():

@@ -11329,6 +11329,8 @@ dependencies = [
 [[package]]
 name = "uni-xervo"
 version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05333a9a0f084d2cce739f27352bf69afbbbca34f89c42d80459c4f19eea3bff"
 dependencies = [
  "anyhow",
  "async-trait",

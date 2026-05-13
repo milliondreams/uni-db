@@ -51,8 +51,7 @@ fn batch(ids: Vec<u64>, vs: Vec<i64>) -> RecordBatch {
 /// return everything needed for write tests: the temp dir, the
 /// `BranchedBackend`, the fork's branch name, the inner backend (to
 /// inspect primary).
-async fn fixture()
--> (TempDir, Arc<dyn StorageBackend>, BranchedBackend, String) {
+async fn fixture() -> (TempDir, Arc<dyn StorageBackend>, BranchedBackend, String) {
     let dir = TempDir::new().unwrap();
     let inner: Arc<dyn StorageBackend> = Arc::new(
         LanceDbBackend::connect(dir.path().to_str().unwrap(), None)
@@ -123,7 +122,10 @@ async fn write_append_routes_to_fork_branch() {
     // Primary scans (through the inner backend, no branch routing) see three.
     let primary_batches = inner.scan(ScanRequest::all("rows")).await.unwrap();
     let primary_total: usize = primary_batches.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(primary_total, 3, "primary must be unaffected by fork append");
+    assert_eq!(
+        primary_total, 3,
+        "primary must be unaffected by fork append"
+    );
 }
 
 #[tokio::test]
@@ -305,11 +307,7 @@ async fn fork_writes_isolated_from_post_fork_primary_writes() {
 
     // Now the fork writes a row.
     branched
-        .write(
-            "rows",
-            vec![batch(vec![42], vec![420])],
-            WriteMode::Append,
-        )
+        .write("rows", vec![batch(vec![42], vec![420])], WriteMode::Append)
         .await
         .unwrap();
 
@@ -358,11 +356,7 @@ async fn fork_writes_survive_backend_reopen() {
     let (dir, _inner, branched, branch_name) = fixture().await;
 
     branched
-        .write(
-            "rows",
-            vec![batch(vec![55], vec![555])],
-            WriteMode::Append,
-        )
+        .write("rows", vec![batch(vec![55], vec![555])], WriteMode::Append)
         .await
         .unwrap();
     drop(branched);

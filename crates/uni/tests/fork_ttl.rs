@@ -38,18 +38,16 @@ async fn fork_ttl_expires_and_sweeper_drops() -> Result<()> {
     tx.commit().await?;
     db.flush().await?;
 
-    let fork = primary.fork("ephemeral").ttl(Duration::from_millis(200)).await?;
+    let fork = primary
+        .fork("ephemeral")
+        .ttl(Duration::from_millis(200))
+        .await?;
     drop(fork); // release the session so the sweeper isn't blocked by ForkInUse
 
     // Wait long enough for the sweeper to fire at least once after TTL.
     tokio::time::sleep(Duration::from_millis(800)).await;
 
-    let remaining: Vec<String> = db
-        .list_forks()
-        .await
-        .into_iter()
-        .map(|f| f.name)
-        .collect();
+    let remaining: Vec<String> = db.list_forks().await.into_iter().map(|f| f.name).collect();
     assert!(
         !remaining.iter().any(|n| n == "ephemeral"),
         "sweeper should have dropped 'ephemeral' after TTL; remaining = {remaining:?}"
@@ -83,12 +81,7 @@ async fn fork_without_ttl_survives_sweeper() -> Result<()> {
 
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let remaining: Vec<String> = db
-        .list_forks()
-        .await
-        .into_iter()
-        .map(|f| f.name)
-        .collect();
+    let remaining: Vec<String> = db.list_forks().await.into_iter().map(|f| f.name).collect();
     assert!(
         remaining.iter().any(|n| n == "permanent"),
         "fork without TTL must survive; remaining = {remaining:?}"
@@ -117,18 +110,16 @@ async fn disabled_sweeper_keeps_expired_forks() -> Result<()> {
     tx.commit().await?;
     db.flush().await?;
 
-    let fork = primary.fork("ephemeral").ttl(Duration::from_millis(50)).await?;
+    let fork = primary
+        .fork("ephemeral")
+        .ttl(Duration::from_millis(50))
+        .await?;
     drop(fork);
 
     tokio::time::sleep(Duration::from_millis(400)).await;
 
     // Sweeper disabled — expired fork should still appear in the list.
-    let remaining: Vec<String> = db
-        .list_forks()
-        .await
-        .into_iter()
-        .map(|f| f.name)
-        .collect();
+    let remaining: Vec<String> = db.list_forks().await.into_iter().map(|f| f.name).collect();
     assert!(
         remaining.iter().any(|n| n == "ephemeral"),
         "disabled sweeper must leave expired forks intact; remaining = {remaining:?}"
@@ -163,12 +154,7 @@ async fn default_ttl_applies_when_builder_has_no_override() -> Result<()> {
 
     tokio::time::sleep(Duration::from_millis(800)).await;
 
-    let remaining: Vec<String> = db
-        .list_forks()
-        .await
-        .into_iter()
-        .map(|f| f.name)
-        .collect();
+    let remaining: Vec<String> = db.list_forks().await.into_iter().map(|f| f.name).collect();
     assert!(
         !remaining.iter().any(|n| n == "uses_default"),
         "fork should expire via fork_default_ttl; remaining = {remaining:?}"

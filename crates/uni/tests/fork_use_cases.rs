@@ -14,15 +14,15 @@
 //! cases the plan calls out):
 //!
 //!   - 3.1 Rule-developer iterative loop
-//!         (fork → write → query → diff → drop)
+//!     (fork → write → query → diff → drop)
 //!   - 3.3 Write-audit-publish
-//!         (fork → write → diff → promote → drop)
+//!     (fork → write → diff → promote → drop)
 //!   - 3.4 Side-by-side scenario diff
-//!         (two forks → independent writes → diff → drop)
+//!     (two forks → independent writes → diff → drop)
 //!   - 3.5 Nested forks
-//!         (parent fork → child fork → cascade drop)
+//!     (parent fork → child fork → cascade drop)
 //!   - 3.6 Fork-local schema overlay
-//!         (fork → CREATE new label → primary schema unchanged)
+//!     (fork → CREATE new label → primary schema unchanged)
 
 use anyhow::Result;
 use uni_db::api::fork_diff::PromotePattern;
@@ -45,13 +45,12 @@ async fn use_case_3_1_rule_developer_loop() -> Result<()> {
     {
         let fork = primary.fork("rule_dev").await?;
         let tx = fork.tx().await?;
-        tx.execute("CREATE (:Person {name: 'Hypothesis-A'})").await?;
+        tx.execute("CREATE (:Person {name: 'Hypothesis-A'})")
+            .await?;
         tx.commit().await?;
 
         // The rule developer queries their hypothesis without touching primary.
-        let result = fork
-            .query("MATCH (p:Person) RETURN p.name AS name")
-            .await?;
+        let result = fork.query("MATCH (p:Person) RETURN p.name AS name").await?;
         let names: Vec<String> = result
             .rows()
             .iter()
@@ -130,7 +129,8 @@ async fn use_case_3_4_side_by_side_scenarios() -> Result<()> {
         .await?;
     let primary = db.session();
     let tx = primary.tx().await?;
-    tx.execute("CREATE (:Item {name: 'baseline', price: 100})").await?;
+    tx.execute("CREATE (:Item {name: 'baseline', price: 100})")
+        .await?;
     tx.commit().await?;
     db.flush().await?;
 
@@ -181,12 +181,14 @@ async fn use_case_3_5_nested_forks() -> Result<()> {
     {
         let parent_fork = primary.fork("parent").await?;
         let tx = parent_fork.tx().await?;
-        tx.execute("CREATE (:Person {name: 'P-Child-Anchor'})").await?;
+        tx.execute("CREATE (:Person {name: 'P-Child-Anchor'})")
+            .await?;
         tx.commit().await?;
 
         let child_fork = parent_fork.fork("child").await?;
         let tx = child_fork.tx().await?;
-        tx.execute("CREATE (:Person {name: 'P-Grandchild'})").await?;
+        tx.execute("CREATE (:Person {name: 'P-Grandchild'})")
+            .await?;
         tx.commit().await?;
 
         // Child sees its own writes + parent's + primary's.

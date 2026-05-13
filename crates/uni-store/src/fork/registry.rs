@@ -31,9 +31,7 @@ use object_store::path::Path as ObjectStorePath;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::{debug, instrument, warn};
 use uni_common::api::error::UniError;
-use uni_common::core::fork::{
-    ForkId, ForkInfo, ForkRegistryFile, ForkStatus, SchemaDelta,
-};
+use uni_common::core::fork::{ForkId, ForkInfo, ForkRegistryFile, ForkStatus, SchemaDelta};
 
 use crate::store_utils::{
     DEFAULT_TIMEOUT, delete_with_timeout, get_with_timeout, list_with_timeout, put_with_timeout,
@@ -307,9 +305,12 @@ impl ForkRegistryHandle {
     /// Replace the registry file on disk with `cache`.
     ///
     /// Caller must hold the cache lock; this function only does IO.
-    async fn put_registry(&self, cache: &ForkRegistryFile, name: &str, stage: &'static str)
-        -> Result<(), UniError>
-    {
+    async fn put_registry(
+        &self,
+        cache: &ForkRegistryFile,
+        name: &str,
+        stage: &'static str,
+    ) -> Result<(), UniError> {
         let json = serde_json::to_vec_pretty(cache).map_err(|e| lifecycle(name, stage, e))?;
         put_with_timeout(
             &self.inner.store,
@@ -328,8 +329,8 @@ impl ForkRegistryHandle {
         delta: &SchemaDelta,
         name: &str,
     ) -> Result<(), UniError> {
-        let json = serde_json::to_vec_pretty(delta)
-            .map_err(|e| lifecycle(name, "schema_overlay", e))?;
+        let json =
+            serde_json::to_vec_pretty(delta).map_err(|e| lifecycle(name, "schema_overlay", e))?;
         put_with_timeout(
             &self.inner.store,
             &schema_overlay_path(id),
@@ -342,8 +343,8 @@ impl ForkRegistryHandle {
     }
 
     async fn put_tombstone(&self, info: &ForkInfo) -> Result<(), UniError> {
-        let json = serde_json::to_vec_pretty(info)
-            .map_err(|e| lifecycle(&info.name, "tombstone", e))?;
+        let json =
+            serde_json::to_vec_pretty(info).map_err(|e| lifecycle(&info.name, "tombstone", e))?;
         put_with_timeout(
             &self.inner.store,
             &tombstone_path(&info.id),
@@ -359,19 +360,17 @@ impl ForkRegistryHandle {
         // Treat missing tombstone as success — recovery may have already
         // cleaned it. Schema overlay deletion is paired with this in the
         // caller (`finish_drop`).
-        if let Err(e) = delete_with_timeout(&self.inner.store, &tombstone_path(id), DEFAULT_TIMEOUT).await {
+        if let Err(e) =
+            delete_with_timeout(&self.inner.store, &tombstone_path(id), DEFAULT_TIMEOUT).await
+        {
             warn!(fork_id = %id, "delete tombstone returned {e}");
         }
         Ok(())
     }
 
     async fn delete_schema_overlay(&self, id: &ForkId) {
-        let _ = delete_with_timeout(
-            &self.inner.store,
-            &schema_overlay_path(id),
-            DEFAULT_TIMEOUT,
-        )
-        .await;
+        let _ =
+            delete_with_timeout(&self.inner.store, &schema_overlay_path(id), DEFAULT_TIMEOUT).await;
     }
 
     /// Phase 2 Day 10: register a branch created after fork-point on
@@ -410,9 +409,12 @@ impl ForkRegistryHandle {
             }
             None => {}
         }
-        entry.datasets.insert(dataset.to_string(), branch.to_string());
+        entry
+            .datasets
+            .insert(dataset.to_string(), branch.to_string());
         let name = entry.name.clone();
-        self.put_registry(&cache, &name, "registry_dynamic_branch").await?;
+        self.put_registry(&cache, &name, "registry_dynamic_branch")
+            .await?;
         Ok(())
     }
 
@@ -488,10 +490,7 @@ impl ForkRegistryHandle {
         if let Some(cap) = *self.inner.max_forks.lock().await {
             let current = cache.forks.len();
             if current >= cap {
-                return Err(UniError::ForkBudgetExceeded {
-                    current,
-                    max: cap,
-                });
+                return Err(UniError::ForkBudgetExceeded { current, max: cap });
             }
         }
         let name = info.name.clone();
@@ -509,9 +508,12 @@ impl ForkRegistryHandle {
     ) -> Result<ForkInfo, UniError> {
         let id = {
             let mut cache = self.inner.cache.lock().await;
-            let entry = cache.forks.get_mut(name).ok_or_else(|| UniError::ForkNotFound {
-                name: name.to_string(),
-            })?;
+            let entry = cache
+                .forks
+                .get_mut(name)
+                .ok_or_else(|| UniError::ForkNotFound {
+                    name: name.to_string(),
+                })?;
             entry.datasets = datasets;
             entry.status = ForkStatus::Active;
             let id = entry.id;
@@ -598,7 +600,8 @@ impl ForkRegistryHandle {
         {
             let mut cache = self.inner.cache.lock().await;
             cache.forks.remove(&info.name);
-            self.put_registry(&cache, &info.name, "registry_clear").await?;
+            self.put_registry(&cache, &info.name, "registry_clear")
+                .await?;
         }
         self.delete_tombstone(&info.id, &info.name).await?;
         self.delete_schema_overlay(&info.id).await;
@@ -745,22 +748,12 @@ mod tests {
         let h1 = h.clone();
         let h2 = h.clone();
         let t1 = tokio::spawn(async move {
-            h1.begin_create(ForkInfo::new_pending(
-                ForkId::new(),
-                "fork-a",
-                "snap-1",
-                1,
-            ))
-            .await
+            h1.begin_create(ForkInfo::new_pending(ForkId::new(), "fork-a", "snap-1", 1))
+                .await
         });
         let t2 = tokio::spawn(async move {
-            h2.begin_create(ForkInfo::new_pending(
-                ForkId::new(),
-                "fork-b",
-                "snap-1",
-                1,
-            ))
-            .await
+            h2.begin_create(ForkInfo::new_pending(ForkId::new(), "fork-b", "snap-1", 1))
+                .await
         });
         t1.await.unwrap().unwrap();
         t2.await.unwrap().unwrap();
@@ -854,7 +847,9 @@ mod tests {
             let h = ForkRegistryHandle::load(store.clone()).await.unwrap();
             let info = ForkInfo::new_pending(ForkId::new(), "persist_me", "snap-1", 1);
             h.begin_create(info).await.unwrap();
-            h.finish_create("persist_me", BTreeMap::new()).await.unwrap();
+            h.finish_create("persist_me", BTreeMap::new())
+                .await
+                .unwrap();
             // Drop the handle; in-memory state goes away.
         }
 

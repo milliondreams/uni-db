@@ -16,7 +16,6 @@ import pytest
 
 import uni_db
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -134,11 +133,15 @@ def test_nested_fork_chain():
     tx.commit()
 
     # B sees seed + A-only + B-only via Lance base_paths chain.
-    b_names = sorted(r["name"] for r in b.query("MATCH (p:Person) RETURN p.name AS name"))
+    b_names = sorted(
+        r["name"] for r in b.query("MATCH (p:Person) RETURN p.name AS name")
+    )
     assert b_names == ["A-only", "B-only", "seed"]
 
     # A does NOT see B-only.
-    a_names = sorted(r["name"] for r in a.query("MATCH (p:Person) RETURN p.name AS name"))
+    a_names = sorted(
+        r["name"] for r in a.query("MATCH (p:Person) RETURN p.name AS name")
+    )
     assert "B-only" not in a_names
 
     # parent_fork_id round-trips.
@@ -197,6 +200,7 @@ def test_fork_ttl_sweeper_drops_expired():
 
     # Wait long enough for the sweeper to fire after expiry.
     import time
+
     time.sleep(0.8)
 
     remaining = [f.name for f in db.list_forks()]
@@ -214,6 +218,7 @@ def test_fork_without_ttl_survives_sweeper():
     del fork
 
     import time
+
     time.sleep(0.4)
 
     remaining = [f.name for f in db.list_forks()]

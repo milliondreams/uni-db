@@ -10,6 +10,8 @@ Locy datalog evaluation, and columnar analytics.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
+from datetime import datetime, timedelta
+from enum import Enum
 from typing import Any
 
 # =============================================================================
@@ -2165,14 +2167,11 @@ class AsyncXervo:
 # Forks (Phase 4b)
 # =============================================================================
 
-from datetime import datetime, timedelta
-from enum import Enum
-
 class ForkId:
     """Stable ULID-backed identifier for a fork."""
 
     @staticmethod
-    def parse(s: str) -> "ForkId": ...
+    def parse(s: str) -> ForkId: ...
     def __str__(self) -> str: ...
     def __repr__(self) -> str: ...
     def __eq__(self, other: object) -> bool: ...
@@ -2201,47 +2200,49 @@ class ForkInfo:
 class ForkBuilder:
     """Sync builder returned by `Session.fork(name)`. Drive via `.build()`."""
 
-    def new_(self) -> "ForkBuilder":
+    def new_(self) -> ForkBuilder:
         """Require fresh creation; errors with `UniForkAlreadyExistsError`."""
         ...
-    def ttl(self, ttl: timedelta) -> "ForkBuilder":
+    def ttl(self, ttl: timedelta) -> ForkBuilder:
         """Stamp a wall-clock TTL on the fork."""
         ...
-    def build(self) -> "Session":
+    def build(self) -> Session:
         """Drive the open-or-create flow and return a forked Session."""
         ...
 
 class ForkSchemaBuilder:
     """Sync builder returned by `Session.fork_schema()`. Drive via `.apply()`."""
 
-    def label(self, name: str, description: str | None = None) -> "ForkSchemaBuilder": ...
+    def label(self, name: str, description: str | None = None) -> ForkSchemaBuilder: ...
     def edge_type(
         self,
         name: str,
         from_labels: list[str],
         to_labels: list[str],
         description: str | None = None,
-    ) -> "ForkSchemaBuilder": ...
+    ) -> ForkSchemaBuilder: ...
     def apply(self) -> None: ...
 
 class AsyncForkBuilder:
     """Async builder returned by `AsyncSession.fork(name)`. Drive via `await .build()`."""
 
-    def new_(self) -> "AsyncForkBuilder": ...
-    def ttl(self, ttl: timedelta) -> "AsyncForkBuilder": ...
-    async def build(self) -> "AsyncSession": ...
+    def new_(self) -> AsyncForkBuilder: ...
+    def ttl(self, ttl: timedelta) -> AsyncForkBuilder: ...
+    async def build(self) -> AsyncSession: ...
 
 class AsyncForkSchemaBuilder:
     """Async builder returned by `AsyncSession.fork_schema()`. Drive via `await .apply()`."""
 
-    def label(self, name: str, description: str | None = None) -> "AsyncForkSchemaBuilder": ...
+    def label(
+        self, name: str, description: str | None = None
+    ) -> AsyncForkSchemaBuilder: ...
     def edge_type(
         self,
         name: str,
         from_labels: list[str],
         to_labels: list[str],
         description: str | None = None,
-    ) -> "AsyncForkSchemaBuilder": ...
+    ) -> AsyncForkSchemaBuilder: ...
     async def apply(self) -> None: ...
 
 # Phase 4b — fork-related typed exceptions

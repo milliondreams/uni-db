@@ -319,7 +319,9 @@ pub fn uni_error_to_pyerr(e: uni_common::UniError) -> PyErr {
         // Fork lifecycle (Phase 4b). The four payload-bearing variants
         // get their fields attached as Python attributes so callers can
         // write `e.holder_count`, `e.children`, etc.
-        ForkNotFound { name } => fork_err_with_attrs::<UniForkNotFoundError>(msg, &[("name", name)]),
+        ForkNotFound { name } => {
+            fork_err_with_attrs::<UniForkNotFoundError>(msg, &[("name", name)])
+        }
         ForkAlreadyExists { name } => {
             fork_err_with_attrs::<UniForkAlreadyExistsError>(msg, &[("name", name)])
         }
@@ -542,7 +544,10 @@ pub fn register_exceptions(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> 
     m.add("UniLocyRuntimeError", py.get_type::<UniLocyRuntimeError>())?;
 
     // Fork lifecycle (Phase 4b)
-    m.add("UniForkNotFoundError", py.get_type::<UniForkNotFoundError>())?;
+    m.add(
+        "UniForkNotFoundError",
+        py.get_type::<UniForkNotFoundError>(),
+    )?;
     m.add(
         "UniForkAlreadyExistsError",
         py.get_type::<UniForkAlreadyExistsError>(),

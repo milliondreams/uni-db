@@ -61,7 +61,9 @@ async fn cleanup_old_versions_does_not_delete_branch_referenced_fragments() {
 
     // Branch off V1.
     let v1 = lance_branch::current_version(&uri).await.unwrap();
-    lance_branch::create_branch(&uri, "snap_v1", v1).await.unwrap();
+    lance_branch::create_branch(&uri, "snap_v1", v1)
+        .await
+        .unwrap();
 
     // V2: append 1000 more rows on primary (post-fork writes).
     let mut ids = Vec::with_capacity(1000);
@@ -125,7 +127,9 @@ async fn cleanup_then_branch_drop_recovers_disk() {
     Dataset::write(reader, &uri, None).await.unwrap();
 
     let v1 = lance_branch::current_version(&uri).await.unwrap();
-    lance_branch::create_branch(&uri, "ephemeral", v1).await.unwrap();
+    lance_branch::create_branch(&uri, "ephemeral", v1)
+        .await
+        .unwrap();
 
     let reader = RecordBatchIterator::new(
         vec![Ok(batch(vec![4, 5], vec![40, 50]))].into_iter(),
@@ -135,7 +139,9 @@ async fn cleanup_then_branch_drop_recovers_disk() {
     primary.append(reader, None).await.unwrap();
 
     // Drop the branch.
-    lance_branch::delete_branch(&uri, "ephemeral").await.unwrap();
+    lance_branch::delete_branch(&uri, "ephemeral")
+        .await
+        .unwrap();
 
     // Cleanup; primary still readable.
     let primary = Dataset::open(&uri).await.unwrap();

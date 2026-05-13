@@ -64,16 +64,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // === 4. publish ====================================================
     let report = db
-        .promote_from_fork(
-            "publish_2026Q2",
-            &[PromotePattern::label("Person")],
-        )
+        .promote_from_fork("publish_2026Q2", &[PromotePattern::label("Person")])
         .await?;
     println!(
         "\n=== publish ===\ninserted: {}\nskipped (UID conflict): {}\nedges skipped (Phase 6): {}",
-        report.vertices_inserted,
-        report.vertices_skipped_uid_conflict,
-        report.edges_skipped,
+        report.vertices_inserted, report.vertices_skipped_uid_conflict, report.edges_skipped,
     );
 
     // === 5. drop staging fork ==========================================

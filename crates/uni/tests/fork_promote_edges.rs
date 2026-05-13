@@ -110,10 +110,7 @@ async fn promote_edges_skips_when_endpoint_absent_on_primary() -> Result<()> {
 
     // Promote ONLY the edge — endpoints stay fork-local.
     let report = db
-        .promote_from_fork(
-            "orphan_edge",
-            &[PromotePattern::edge_type("KNOWS")],
-        )
+        .promote_from_fork("orphan_edge", &[PromotePattern::edge_type("KNOWS")])
         .await?;
     assert_eq!(report.edges_inserted, 0);
     assert_eq!(
@@ -190,10 +187,8 @@ async fn promote_edges_dedupes_existing_edge() -> Result<()> {
     let db = build_test_db().await?;
     let session = db.session();
     let tx = session.tx().await?;
-    tx.execute(
-        "CREATE (:Person {name: 'Alice'})-[:KNOWS {since: 1}]->(:Person {name: 'Bob'})",
-    )
-    .await?;
+    tx.execute("CREATE (:Person {name: 'Alice'})-[:KNOWS {since: 1}]->(:Person {name: 'Bob'})")
+        .await?;
     tx.commit().await?;
     db.flush().await?;
 
@@ -202,10 +197,8 @@ async fn promote_edges_dedupes_existing_edge() -> Result<()> {
         // (same content), and the edge already exists on primary.
         let fork = session.fork("dup_edge").await?;
         let tx = fork.tx().await?;
-        tx.execute(
-            "CREATE (:Person {name: 'Alice'})-[:KNOWS {since: 1}]->(:Person {name: 'Bob'})",
-        )
-        .await?;
+        tx.execute("CREATE (:Person {name: 'Alice'})-[:KNOWS {since: 1}]->(:Person {name: 'Bob'})")
+            .await?;
         tx.execute("CREATE (:Person {name: 'NewKid'})").await?;
         tx.commit().await?;
     }

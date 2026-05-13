@@ -57,13 +57,21 @@ async fn diff_pairs_by_uid_across_unrelated_forks() -> Result<()> {
         diff.vertices.added.len(),
         1,
         "expected exactly one fork-b-only row (B-Only), got {:?}",
-        diff.vertices.added.iter().map(|v| v.properties.clone()).collect::<Vec<_>>()
+        diff.vertices
+            .added
+            .iter()
+            .map(|v| v.properties.clone())
+            .collect::<Vec<_>>()
     );
     assert_eq!(
         diff.vertices.deleted.len(),
         1,
         "expected exactly one fork-a-only row (A-Only), got {:?}",
-        diff.vertices.deleted.iter().map(|v| v.properties.clone()).collect::<Vec<_>>()
+        diff.vertices
+            .deleted
+            .iter()
+            .map(|v| v.properties.clone())
+            .collect::<Vec<_>>()
     );
     assert!(
         diff.vertices.changed.is_empty(),

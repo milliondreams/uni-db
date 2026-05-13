@@ -52,7 +52,7 @@ impl MainEdgeDataset {
     /// Edge identity is the SHA3-256 of
     /// `(src_uid, dst_uid, edge_type, sorted_properties)` — the same
     /// content-addressed pattern as
-    /// [`MainVertexDataset::compute_vertex_uid`] but extended with
+    /// `MainVertexDataset::compute_vertex_uid` but extended with
     /// edge endpoint UIDs and the edge type. This lets fork diff and
     /// promote distinguish parallel edges between the same endpoints
     /// when their property bags differ (multi-edge support).

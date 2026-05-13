@@ -490,11 +490,7 @@ impl AsyncDatabase {
     }
 
     /// Drop a fork and every descendant in its subtree.
-    fn drop_fork_cascade<'py>(
-        &self,
-        py: Python<'py>,
-        name: String,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    fn drop_fork_cascade<'py>(&self, py: Python<'py>, name: String) -> PyResult<Bound<'py, PyAny>> {
         let db = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             db.drop_fork_cascade(&name)
@@ -1062,10 +1058,7 @@ impl AsyncDatabaseBuilder {
 
     /// Phase 4b — disable the TTL sweeper. Tests should set `True`
     /// when they want deterministic control over fork lifetimes.
-    fn disable_fork_sweeper(
-        mut slf: PyRefMut<'_, Self>,
-        disabled: bool,
-    ) -> PyRefMut<'_, Self> {
+    fn disable_fork_sweeper(mut slf: PyRefMut<'_, Self>, disabled: bool) -> PyRefMut<'_, Self> {
         slf.uni_config
             .get_or_insert_with(uni_common::UniConfig::default)
             .disable_fork_sweeper = disabled;
@@ -3929,10 +3922,7 @@ impl AsyncForkBuilder {
     }
 
     /// Stamp a wall-clock TTL on the fork.
-    fn ttl<'py>(
-        mut slf: PyRefMut<'py, Self>,
-        ttl: Py<PyAny>,
-    ) -> PyResult<PyRefMut<'py, Self>> {
+    fn ttl<'py>(mut slf: PyRefMut<'py, Self>, ttl: Py<PyAny>) -> PyResult<PyRefMut<'py, Self>> {
         let py = slf.py();
         slf.ttl = Some(crate::convert::py_timedelta_to_duration(ttl.bind(py))?);
         Ok(slf)

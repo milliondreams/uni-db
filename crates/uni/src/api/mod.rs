@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Dragonscale Team
 
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Weak};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
 use dashmap::DashMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use uni_common::core::fork::ForkId;
 
@@ -15,8 +15,8 @@ pub mod bulk;
 pub mod compaction;
 pub mod fork;
 pub mod fork_diff;
-pub mod fork_schema;
 pub(crate) mod fork_index_builder;
+pub mod fork_schema;
 pub(crate) mod fork_sweeper;
 pub mod functions;
 pub mod hooks;
@@ -289,10 +289,7 @@ impl UniInner {
     /// per-fork notifications, hooks, params, and metrics. The Locy
     /// rule registry is a deep clone of primary's so rule registration
     /// on a forked session does not leak to primary.
-    pub(crate) async fn at_fork(
-        &self,
-        scope: Arc<uni_store::fork::ForkScope>,
-    ) -> Result<UniInner> {
+    pub(crate) async fn at_fork(&self, scope: Arc<uni_store::fork::ForkScope>) -> Result<UniInner> {
         // Phase 3 (nested forks): `self` may itself be a fork-scoped
         // UniInner, in which case `self.schema` already encodes
         // `primary ⊕ parent_overlay`. Layering the child's overlay on
@@ -476,10 +473,7 @@ impl Uni {
     /// # Errors
     ///
     /// Returns [`UniError::ForkNotFound`] when no fork has this name.
-    pub async fn fork_info(
-        &self,
-        name: &str,
-    ) -> Result<uni_common::core::fork::ForkInfo> {
+    pub async fn fork_info(&self, name: &str) -> Result<uni_common::core::fork::ForkInfo> {
         self.inner.fork_registry.get(name).await
     }
 
@@ -620,11 +614,7 @@ impl Uni {
                 blockers.push(format!("{}: in-flight tx", node.name));
                 continue;
             }
-            let holders = self
-                .inner
-                .fork_registry
-                .holder_count_for(node.id)
-                .await;
+            let holders = self.inner.fork_registry.holder_count_for(node.id).await;
             if holders > 0 {
                 blockers.push(format!("{}: {} live session(s)", node.name, holders));
             }
@@ -2253,9 +2243,8 @@ mod fork_inner_tests {
         // structural test of UniInner construction; the registry only
         // needs to provide an Active ForkInfo to wrap into a ForkScope.
         let dir = tempfile::TempDir::new().unwrap();
-        let store: Arc<dyn object_store::ObjectStore> = Arc::new(
-            object_store::local::LocalFileSystem::new_with_prefix(dir.path()).unwrap(),
-        );
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::local::LocalFileSystem::new_with_prefix(dir.path()).unwrap());
         let registry = Arc::new(ForkRegistryHandle::load(store).await.unwrap());
 
         let info = ForkInfo::new_pending(ForkId::new(), "smoke", "snap-1", 1);

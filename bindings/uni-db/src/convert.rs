@@ -1455,14 +1455,11 @@ pub fn utc_datetime_to_py<'py>(
 /// Used by `ForkBuilder.ttl(...)` and the fork-related `UniConfig` fields.
 /// Negative timedeltas error.
 pub fn py_timedelta_to_duration(obj: &Bound<'_, PyAny>) -> PyResult<std::time::Duration> {
-    let total_secs: f64 = obj
-        .call_method0("total_seconds")?
-        .extract()
-        .map_err(|e| {
-            crate::exceptions::UniInvalidArgumentError::new_err(format!(
-                "expected datetime.timedelta or compatible duration: {e}"
-            ))
-        })?;
+    let total_secs: f64 = obj.call_method0("total_seconds")?.extract().map_err(|e| {
+        crate::exceptions::UniInvalidArgumentError::new_err(format!(
+            "expected datetime.timedelta or compatible duration: {e}"
+        ))
+    })?;
     if total_secs < 0.0 {
         return Err(crate::exceptions::UniInvalidArgumentError::new_err(
             "timedelta must be non-negative",

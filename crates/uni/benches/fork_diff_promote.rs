@@ -58,7 +58,10 @@ async fn seed_persons(db: &Uni, count: usize) {
     let props: Vec<uni_common::Properties> = (0..count)
         .map(|i| {
             let mut p = uni_common::Properties::new();
-            p.insert("name".into(), uni_common::Value::String(format!("seed-{i}")));
+            p.insert(
+                "name".into(),
+                uni_common::Value::String(format!("seed-{i}")),
+            );
             p
         })
         .collect();
@@ -141,10 +144,7 @@ fn bench_promote_vertices(c: &mut Criterion) {
             |db| {
                 rt.block_on(async {
                     let report = db
-                        .promote_from_fork(
-                            "promote_bench",
-                            &[PromotePattern::label("Person")],
-                        )
+                        .promote_from_fork("promote_bench", &[PromotePattern::label("Person")])
                         .await
                         .unwrap();
                     assert!(report.vertices_inserted >= FORK_N);

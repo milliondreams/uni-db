@@ -95,12 +95,7 @@ async fn nested_fork_create_crash_rolls_back_leaf_only() -> Result<()> {
     // untouched.
     fault_injection::reset();
     let db2 = Uni::open(&uri).build().await?;
-    let active: Vec<String> = db2
-        .list_forks()
-        .await
-        .into_iter()
-        .map(|f| f.name)
-        .collect();
+    let active: Vec<String> = db2.list_forks().await.into_iter().map(|f| f.name).collect();
     assert!(
         active.contains(&"a".to_string()),
         "parent fork 'a' must survive child-creation crash; got active={active:?}"

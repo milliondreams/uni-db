@@ -33,7 +33,8 @@ async fn nested_fork_chain_resolves_through_both_ancestors() -> Result<()> {
     // Primary seed.
     let primary = db.session();
     let tx = primary.tx().await?;
-    tx.execute("CREATE (:Person {name: 'Primary-Alice'})").await?;
+    tx.execute("CREATE (:Person {name: 'Primary-Alice'})")
+        .await?;
     tx.commit().await?;
     db.flush().await?;
 
@@ -68,8 +69,17 @@ async fn nested_fork_chain_resolves_through_both_ancestors() -> Result<()> {
     assert!(!names.iter().any(|n| n == "B-Carol"));
 
     // Primary sees only its own row.
-    let names = count_names(primary.query("MATCH (p:Person) RETURN p.name").await?.rows());
-    assert_eq!(names.len(), 1, "primary must see only its own row; got {names:?}");
+    let names = count_names(
+        primary
+            .query("MATCH (p:Person) RETURN p.name")
+            .await?
+            .rows(),
+    );
+    assert_eq!(
+        names.len(),
+        1,
+        "primary must see only its own row; got {names:?}"
+    );
 
     db.shutdown().await?;
     Ok(())
@@ -281,7 +291,10 @@ async fn drop_fork_cascade_refuses_when_subtree_in_use() -> Result<()> {
 }
 
 fn strict_config() -> UniConfig {
-    UniConfig { strict_schema: true, ..UniConfig::default() }
+    UniConfig {
+        strict_schema: true,
+        ..UniConfig::default()
+    }
 }
 
 #[tokio::test]

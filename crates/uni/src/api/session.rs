@@ -231,11 +231,7 @@ impl Session {
         scope: Arc<uni_store::fork::ForkScope>,
         parent_token: CancellationToken,
     ) -> Self {
-        let session_registry = db
-            .locy_rule_registry
-            .read()
-            .unwrap()
-            .clone();
+        let session_registry = db.locy_rule_registry.read().unwrap().clone();
         db.active_session_count.fetch_add(1, Ordering::Relaxed);
 
         // Phase 4a: link cancellation to the parent via
@@ -544,10 +540,7 @@ impl Session {
         // index covers all rows the user has committed.
         if let Some(writer_lock) = &self.db.writer {
             let mut writer = writer_lock.write().await;
-            writer
-                .flush_to_l1(None)
-                .await
-                .map_err(UniError::Internal)?;
+            writer.flush_to_l1(None).await.map_err(UniError::Internal)?;
         }
         uni_store::fork::index_builder::build_fork_local_index(
             &scope,

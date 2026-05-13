@@ -20,7 +20,10 @@ use uni_common::core::schema::DataType;
 use uni_db::Uni;
 
 fn strict_config() -> UniConfig {
-    UniConfig { strict_schema: true, ..UniConfig::default() }
+    UniConfig {
+        strict_schema: true,
+        ..UniConfig::default()
+    }
 }
 
 #[tokio::test]
@@ -146,11 +149,7 @@ async fn fork_local_label_survives_restart() -> Result<()> {
         db.flush().await?;
 
         let forked = session.fork("persist").await?;
-        forked
-            .fork_schema()
-            .label("OnlyOnFork")
-            .apply()
-            .await?;
+        forked.fork_schema().label("OnlyOnFork").apply().await?;
         let tx = forked.tx().await?;
         tx.execute("CREATE (:OnlyOnFork)").await?;
         tx.commit().await?;
@@ -205,11 +204,7 @@ async fn sibling_sessions_see_overlay_growth_immediately() -> Result<()> {
     let session_b = session.fork("sibling").await?;
 
     // A declares a new label.
-    session_a
-        .fork_schema()
-        .label("OnlyOnFork")
-        .apply()
-        .await?;
+    session_a.fork_schema().label("OnlyOnFork").apply().await?;
 
     // B (which shares the same UniInner via the Day 8 cache) can
     // write to OnlyOnFork without re-declaring it: the in-memory

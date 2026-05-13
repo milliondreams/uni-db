@@ -148,12 +148,16 @@ async fn recover_forks_is_idempotent() {
     info.datasets
         .insert("vertices_Person".into(), branch_name.clone());
     h.begin_create(info.clone()).await.unwrap();
-    h.finish_create("idem", info.datasets.clone()).await.unwrap();
+    h.finish_create("idem", info.datasets.clone())
+        .await
+        .unwrap();
     h.begin_drop("idem").await.unwrap();
 
     let base = format!("{}/", dir.path().display());
     let h2 = ForkRegistryHandle::load(store.clone()).await.unwrap();
-    let first = recover_forks(&h2, join_uri_with(base.clone())).await.unwrap();
+    let first = recover_forks(&h2, join_uri_with(base.clone()))
+        .await
+        .unwrap();
     assert_eq!(first, 1);
 
     // Second invocation should be a no-op.
@@ -211,7 +215,6 @@ async fn seed_lance_dataset(uri: &str) {
         ],
     )
     .unwrap();
-    let reader =
-        arrow_array::RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema);
+    let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema);
     lance::Dataset::write(reader, uri, None).await.unwrap();
 }

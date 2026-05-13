@@ -969,10 +969,7 @@ impl SchemaManager {
                 merged.edge_types.insert(name.clone(), edge_type.clone());
             }
             for addition in &overlay.added_properties {
-                let props = merged
-                    .properties
-                    .entry(addition.owner.clone())
-                    .or_default();
+                let props = merged.properties.entry(addition.owner.clone()).or_default();
                 props.insert(
                     addition.property.clone(),
                     PropertyMeta {

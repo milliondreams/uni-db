@@ -1011,10 +1011,7 @@ impl Database {
     /// primary doesn't (`added`), the rows primary has that the fork
     /// has dropped (`deleted`), and the rows with matching UID and
     /// differing properties (`changed`).
-    fn diff_fork_primary(
-        &self,
-        fork_name: &str,
-    ) -> PyResult<crate::types::PyForkDiff> {
+    fn diff_fork_primary(&self, fork_name: &str) -> PyResult<crate::types::PyForkDiff> {
         pyo3_async_runtimes::tokio::get_runtime()
             .block_on(self.inner.diff_fork_primary(fork_name))
             .map(crate::types::PyForkDiff::from_rust)
@@ -1023,11 +1020,7 @@ impl Database {
 
     /// Structural diff between two named forks. `diff(a, b)` is the
     /// delta that, if applied to `a`, produces `b`.
-    fn diff_forks(
-        &self,
-        a: &str,
-        b: &str,
-    ) -> PyResult<crate::types::PyForkDiff> {
+    fn diff_forks(&self, a: &str, b: &str) -> PyResult<crate::types::PyForkDiff> {
         pyo3_async_runtimes::tokio::get_runtime()
             .block_on(self.inner.diff_forks(a, b))
             .map(crate::types::PyForkDiff::from_rust)

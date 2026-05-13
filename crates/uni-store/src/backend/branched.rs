@@ -114,8 +114,7 @@ impl BranchedBackend {
             );
         }
         let parent_v = super::lance_branch::current_version(&dataset_uri).await?;
-        let branch_name =
-            format!("fork_{}_{}", self.scope.fork_id(), table_name);
+        let branch_name = format!("fork_{}_{}", self.scope.fork_id(), table_name);
         super::lance_branch::create_branch(&dataset_uri, &branch_name, parent_v).await?;
         // Persist + record. Persistence first so a crash between the
         // Lance commit and the in-memory register leaves the on-disk
@@ -145,8 +144,7 @@ impl BranchedBackend {
             return Ok(b);
         }
         let dataset_uri = self.dataset_uri(table_name);
-        let branch_name =
-            format!("fork_{}_{}", self.scope.fork_id(), table_name);
+        let branch_name = format!("fork_{}_{}", self.scope.fork_id(), table_name);
         if Self::dataset_path_exists(&dataset_uri) {
             // Dataset exists on primary but no branch yet — branch from
             // the current parent version. Treat the supplied batches
@@ -159,8 +157,7 @@ impl BranchedBackend {
                     initial_batches.into_iter().map(Ok),
                     arrow_schema,
                 );
-                super::lance_branch::write_to_branch(&dataset_uri, &branch_name, reader)
-                    .await?;
+                super::lance_branch::write_to_branch(&dataset_uri, &branch_name, reader).await?;
             }
         } else {
             // Brand-new dataset — materialize an *empty* parent on
@@ -199,12 +196,7 @@ impl BranchedBackend {
                     initial_batches.into_iter().map(Ok),
                     arrow_schema,
                 );
-                super::lance_branch::write_to_branch(
-                    &dataset_uri,
-                    &branch_name,
-                    reader,
-                )
-                .await?;
+                super::lance_branch::write_to_branch(&dataset_uri, &branch_name, reader).await?;
             }
         }
         self.scope
@@ -412,11 +404,7 @@ impl StorageBackend for BranchedBackend {
                 // the batches. The branch returned then receives any
                 // remaining append/overwrite semantics below.
                 let _b = self
-                    .ensure_branch_for_new(
-                        table_name,
-                        arrow_schema.clone(),
-                        batches.clone(),
-                    )
+                    .ensure_branch_for_new(table_name, arrow_schema.clone(), batches.clone())
                     .await?;
                 // create_dataset_then_branch already wrote the batches;
                 // nothing more to do for Append. For Overwrite, the
@@ -426,10 +414,8 @@ impl StorageBackend for BranchedBackend {
             }
         };
         let uri = self.dataset_uri(table_name);
-        let reader = arrow_array::RecordBatchIterator::new(
-            batches.into_iter().map(Ok),
-            arrow_schema,
-        );
+        let reader =
+            arrow_array::RecordBatchIterator::new(batches.into_iter().map(Ok), arrow_schema);
         match mode {
             WriteMode::Append => {
                 super::lance_branch::write_to_branch(&uri, &branch, reader).await?;
@@ -472,16 +458,12 @@ impl StorageBackend for BranchedBackend {
         let uri = self.dataset_uri(name);
         // Homogenize the iterator type by always going through a Vec.
         let (rows, arrow_schema) = if batches.is_empty() {
-            (
-                vec![Ok(RecordBatch::new_empty(schema.clone()))],
-                schema,
-            )
+            (vec![Ok(RecordBatch::new_empty(schema.clone()))], schema)
         } else {
             let s = batches[0].schema();
             (batches.into_iter().map(Ok).collect::<Vec<_>>(), s)
         };
-        let reader =
-            arrow_array::RecordBatchIterator::new(rows.into_iter(), arrow_schema);
+        let reader = arrow_array::RecordBatchIterator::new(rows.into_iter(), arrow_schema);
         super::lance_branch::replace_branch_tip(&uri, &branch, reader).await
     }
 
@@ -492,9 +474,7 @@ impl StorageBackend for BranchedBackend {
     }
 
     async fn rollback_table(&self, _table_name: &str, _target_version: u64) -> Result<()> {
-        anyhow::bail!(
-            "rollback_table on a forked backend is not supported in Phase 1"
-        )
+        anyhow::bail!("rollback_table on a forked backend is not supported in Phase 1")
     }
 
     // ── Maintenance ──────────────────────────────────────────────────
@@ -546,9 +526,7 @@ impl StorageBackend for BranchedBackend {
         _column: &str,
         _config: VectorIndexConfig,
     ) -> Result<()> {
-        anyhow::bail!(
-            "create_vector_index on a forked backend is not supported in Phase 1"
-        )
+        anyhow::bail!("create_vector_index on a forked backend is not supported in Phase 1")
     }
 
     async fn create_fts_index(&self, _table: &str, _column: &str) -> Result<()> {
@@ -561,9 +539,7 @@ impl StorageBackend for BranchedBackend {
         _column: &str,
         _index_type: ScalarIndexType,
     ) -> Result<()> {
-        anyhow::bail!(
-            "create_scalar_index on a forked backend is not supported in Phase 1"
-        )
+        anyhow::bail!("create_scalar_index on a forked backend is not supported in Phase 1")
     }
 
     async fn drop_index(&self, _table: &str, _index_name: &str) -> Result<()> {

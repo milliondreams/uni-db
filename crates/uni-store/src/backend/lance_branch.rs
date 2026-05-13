@@ -15,7 +15,7 @@
 //! clone of the dataset, then `BranchContents` write) and is **not
 //! atomic**. A crash between the two phases leaves a "zombie" branch
 //! dataset that prevents re-creating the same branch name. The recovery
-//! driver must call [`force_delete_branch`] before retrying. See
+//! driver must call `force_delete_branch` before retrying. See
 //! `crates/uni-store/src/fork/recovery.rs` for the recovery logic.
 
 // Rust guideline compliant
@@ -73,7 +73,7 @@ pub async fn current_version(uri: &str) -> Result<u64> {
 ///
 /// **Not atomic.** A crash between the shallow-clone and BranchContents
 /// phases leaves a zombie branch dataset. Recovery must use
-/// [`force_delete_branch`] to clean up before retry.
+/// `force_delete_branch` to clean up before retry.
 ///
 /// # Errors
 ///
@@ -139,9 +139,7 @@ pub async fn create_branch_from(
         .create_branch(new_branch, parent_version, None)
         .await
         .with_context(|| {
-            format!(
-                "create branch {new_branch} off {parent_branch} on {uri} at v{parent_version}"
-            )
+            format!("create branch {new_branch} off {parent_branch} on {uri} at v{parent_version}")
         })?;
     Ok(())
 }
@@ -413,9 +411,7 @@ pub async fn create_fts_index_on_branch(
         .name(index_name.to_string())
         .replace(true)
         .await
-        .with_context(|| {
-            format!("create_fts_index_on_branch({uri}@{branch}, column={column})")
-        })?;
+        .with_context(|| format!("create_fts_index_on_branch({uri}@{branch}, column={column})"))?;
     Ok(())
 }
 
@@ -592,10 +588,9 @@ pub async fn delete_from_branch(uri: &str, branch: &str, predicate: &str) -> Res
     let mut on_branch = open_branch(uri, branch)
         .await
         .with_context(|| format!("open branch {branch} on {uri} for delete"))?;
-    on_branch
-        .delete(predicate)
-        .await
-        .with_context(|| format!("delete on branch {branch} on {uri} with predicate `{predicate}`"))?;
+    on_branch.delete(predicate).await.with_context(|| {
+        format!("delete on branch {branch} on {uri} with predicate `{predicate}`")
+    })?;
     Ok(())
 }
 
@@ -700,10 +695,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let uri = format!("{}/ds.lance", dir.path().display());
         let batch = test_batch(vec![1, 2, 3], vec![100, 200, 300]);
-        let reader = arrow_array::RecordBatchIterator::new(
-            vec![Ok(batch)].into_iter(),
-            test_schema(),
-        );
+        let reader =
+            arrow_array::RecordBatchIterator::new(vec![Ok(batch)].into_iter(), test_schema());
         Dataset::write(reader, &uri, None).await.unwrap();
         (dir, uri)
     }
@@ -779,10 +772,8 @@ mod tests {
 
         // Append on the branch — branch tip advances, main does not.
         let batch = test_batch(vec![10, 11], vec![1000, 1100]);
-        let reader = arrow_array::RecordBatchIterator::new(
-            vec![Ok(batch)].into_iter(),
-            test_schema(),
-        );
+        let reader =
+            arrow_array::RecordBatchIterator::new(vec![Ok(batch)].into_iter(), test_schema());
         write_to_branch(&uri, "child", reader).await.unwrap();
 
         let v_branch_after = current_version_on_branch(&uri, "child").await.unwrap();
@@ -806,14 +797,14 @@ mod tests {
 
         // Append on level1 so we can verify level2 reads see those rows.
         let batch = test_batch(vec![10, 11], vec![1000, 1100]);
-        let reader = arrow_array::RecordBatchIterator::new(
-            vec![Ok(batch)].into_iter(),
-            test_schema(),
-        );
+        let reader =
+            arrow_array::RecordBatchIterator::new(vec![Ok(batch)].into_iter(), test_schema());
         write_to_branch(&uri, "level1", reader).await.unwrap();
 
         let v_l1 = current_version_on_branch(&uri, "level1").await.unwrap();
-        create_branch_from(&uri, "level2", "level1", v_l1).await.unwrap();
+        create_branch_from(&uri, "level2", "level1", v_l1)
+            .await
+            .unwrap();
 
         // level2 should see all 5 rows: 3 from main + 2 from level1.
         let on_l2 = open_branch(&uri, "level2").await.unwrap();
@@ -821,10 +812,8 @@ mod tests {
 
         // Writes on level1 *after* level2 was created must not appear on level2.
         let batch2 = test_batch(vec![20], vec![2000]);
-        let reader2 = arrow_array::RecordBatchIterator::new(
-            vec![Ok(batch2)].into_iter(),
-            test_schema(),
-        );
+        let reader2 =
+            arrow_array::RecordBatchIterator::new(vec![Ok(batch2)].into_iter(), test_schema());
         write_to_branch(&uri, "level1", reader2).await.unwrap();
 
         let on_l2_again = open_branch(&uri, "level2").await.unwrap();
@@ -846,7 +835,10 @@ mod tests {
 
         // List
         let tags = list_tags(&uri).await.unwrap();
-        assert!(tags.iter().any(|(n, _)| n == "audit-2026"), "tags = {tags:?}");
+        assert!(
+            tags.iter().any(|(n, _)| n == "audit-2026"),
+            "tags = {tags:?}"
+        );
 
         // Delete idempotent
         delete_tag(&uri, "audit-2026").await.unwrap();
@@ -868,10 +860,8 @@ mod tests {
 
         // Append a row before tagging.
         let batch = test_batch(vec![10], vec![1000]);
-        let reader = arrow_array::RecordBatchIterator::new(
-            vec![Ok(batch)].into_iter(),
-            test_schema(),
-        );
+        let reader =
+            arrow_array::RecordBatchIterator::new(vec![Ok(batch)].into_iter(), test_schema());
         write_to_branch(&uri, "snap-branch", reader).await.unwrap();
 
         create_tag(&uri, "v1", "snap-branch").await.unwrap();
@@ -880,10 +870,8 @@ mod tests {
 
         // Append more after tagging; the tag's pinned version must not move.
         let batch2 = test_batch(vec![11], vec![1100]);
-        let reader2 = arrow_array::RecordBatchIterator::new(
-            vec![Ok(batch2)].into_iter(),
-            test_schema(),
-        );
+        let reader2 =
+            arrow_array::RecordBatchIterator::new(vec![Ok(batch2)].into_iter(), test_schema());
         write_to_branch(&uri, "snap-branch", reader2).await.unwrap();
 
         let tags_after = list_tags(&uri).await.unwrap();
@@ -903,10 +891,8 @@ mod tests {
 
         // Append on primary
         let batch = test_batch(vec![4, 5], vec![400, 500]);
-        let reader = arrow_array::RecordBatchIterator::new(
-            vec![Ok(batch)].into_iter(),
-            test_schema(),
-        );
+        let reader =
+            arrow_array::RecordBatchIterator::new(vec![Ok(batch)].into_iter(), test_schema());
         let mut primary = Dataset::open(&uri).await.unwrap();
         primary.append(reader, None).await.unwrap();
 
@@ -960,10 +946,7 @@ mod tests {
             );
             Batch::try_new(
                 schema.clone(),
-                vec![
-                    Arc::new(UInt64Array::from(ids)),
-                    Arc::new(list),
-                ],
+                vec![Arc::new(UInt64Array::from(ids)), Arc::new(list)],
             )
             .unwrap()
         };
@@ -976,15 +959,23 @@ mod tests {
                 .collect();
             make_batch(ids, vecs)
         };
-        let reader =
-            arrow_array::RecordBatchIterator::new(vec![Ok(primary_batch)].into_iter(), schema.clone());
+        let reader = arrow_array::RecordBatchIterator::new(
+            vec![Ok(primary_batch)].into_iter(),
+            schema.clone(),
+        );
         Dataset::write(reader, &uri, None).await.unwrap();
 
         // Build a vector index on primary's main branch.
         let mut main_ds = Dataset::open(&uri).await.unwrap();
         let params = VectorIndexParams::ivf_flat(1, MetricType::L2);
         main_ds
-            .create_index(&["vector"], IndexType::Vector, Some("primary_vec".into()), &params, true)
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("primary_vec".into()),
+                &params,
+                true,
+            )
             .await
             .unwrap();
 
@@ -1010,7 +1001,9 @@ mod tests {
         let mut scanner = on_branch.scan();
         scanner.nearest("vector", &query, 5).unwrap();
         let stream = scanner.try_into_stream().await.unwrap();
-        let batches = futures::TryStreamExt::try_collect::<Vec<_>>(stream).await.unwrap();
+        let batches = futures::TryStreamExt::try_collect::<Vec<_>>(stream)
+            .await
+            .unwrap();
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         let mut ids: Vec<u64> = Vec::new();
         for b in &batches {
@@ -1024,9 +1017,7 @@ mod tests {
                 ids.push(id_col.value(i));
             }
         }
-        eprintln!(
-            "SPIKE: branch nearest-5 to [100.5,0,0,0]: {total} rows, ids={ids:?}"
-        );
+        eprintln!("SPIKE: branch nearest-5 to [100.5,0,0,0]: {total} rows, ids={ids:?}");
         let saw_fork_id = ids.iter().any(|i| *i >= 1000);
         let saw_primary_id = ids.iter().any(|i| *i < 1000);
         eprintln!(
@@ -1086,10 +1077,8 @@ mod tests {
 
         // Append fork-only rows on the branch.
         let batch = test_batch(vec![100, 101, 102], vec![1000, 1100, 1200]);
-        let reader = arrow_array::RecordBatchIterator::new(
-            vec![Ok(batch)].into_iter(),
-            test_schema(),
-        );
+        let reader =
+            arrow_array::RecordBatchIterator::new(vec![Ok(batch)].into_iter(), test_schema());
         write_to_branch(&uri, "fork-spike", reader).await.unwrap();
 
         // Probe 1: try to build a scalar BTree on `id` against the branch.
@@ -1118,16 +1107,10 @@ mod tests {
                     branch_indices.len()
                 );
                 for idx in main_indices.iter() {
-                    eprintln!(
-                        "  main index: name={} uuid={}",
-                        idx.name, idx.uuid
-                    );
+                    eprintln!("  main index: name={} uuid={}", idx.name, idx.uuid);
                 }
                 for idx in branch_indices.iter() {
-                    eprintln!(
-                        "  branch index: name={} uuid={}",
-                        idx.name, idx.uuid
-                    );
+                    eprintln!("  branch index: name={} uuid={}", idx.name, idx.uuid);
                 }
                 let leaked_to_main = main_indices
                     .iter()

@@ -107,7 +107,6 @@ async fn seed_lance_dataset(uri: &str) {
         ],
     )
     .unwrap();
-    let reader =
-        arrow_array::RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema);
+    let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema);
     lance::Dataset::write(reader, uri, None).await.unwrap();
 }

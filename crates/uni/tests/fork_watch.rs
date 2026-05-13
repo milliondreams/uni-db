@@ -19,7 +19,10 @@ use uni_common::core::schema::DataType;
 use uni_db::{CommitNotification, CommitStream, Uni};
 
 async fn next_within(stream: &mut CommitStream, timeout: Duration) -> Option<CommitNotification> {
-    tokio::time::timeout(timeout, stream.next()).await.ok().flatten()
+    tokio::time::timeout(timeout, stream.next())
+        .await
+        .ok()
+        .flatten()
 }
 
 #[tokio::test]
@@ -46,7 +49,10 @@ async fn fork_watch_isolated_from_primary() -> Result<()> {
     tx.commit().await?;
 
     let fork_notif = next_within(&mut fork_watch, Duration::from_millis(500)).await;
-    assert!(fork_notif.is_some(), "fork watch should fire on fork commit");
+    assert!(
+        fork_notif.is_some(),
+        "fork watch should fire on fork commit"
+    );
 
     let primary_notif = next_within(&mut primary_watch, Duration::from_millis(200)).await;
     assert!(
@@ -56,11 +62,15 @@ async fn fork_watch_isolated_from_primary() -> Result<()> {
 
     // Commit on primary — only primary's stream should fire.
     let tx = primary.tx().await?;
-    tx.execute("CREATE (:Person {name: 'primary-only'})").await?;
+    tx.execute("CREATE (:Person {name: 'primary-only'})")
+        .await?;
     tx.commit().await?;
 
     let primary_notif = next_within(&mut primary_watch, Duration::from_millis(500)).await;
-    assert!(primary_notif.is_some(), "primary watch should fire on primary commit");
+    assert!(
+        primary_notif.is_some(),
+        "primary watch should fire on primary commit"
+    );
 
     let fork_notif = next_within(&mut fork_watch, Duration::from_millis(200)).await;
     assert!(
@@ -98,7 +108,10 @@ async fn sibling_forks_have_isolated_watches() -> Result<()> {
     let a_notif = next_within(&mut a_watch, Duration::from_millis(500)).await;
     assert!(a_notif.is_some());
     let b_notif = next_within(&mut b_watch, Duration::from_millis(200)).await;
-    assert!(b_notif.is_none(), "sibling fork b must not see fork a commits");
+    assert!(
+        b_notif.is_none(),
+        "sibling fork b must not see fork a commits"
+    );
 
     db.shutdown().await?;
     Ok(())

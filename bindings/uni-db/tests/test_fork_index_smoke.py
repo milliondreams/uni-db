@@ -13,8 +13,6 @@ way the result set must match what Lance's `base_paths` chain returns.
 
 from __future__ import annotations
 
-import pytest
-
 import uni_db
 
 
@@ -48,9 +46,7 @@ def test_forked_session_query_results_match_primary_plus_fork_writes():
     assert primary_names == ["Alice", "Bob"]
 
     # Equality lookup that would benefit from fusion: still correct.
-    fork_only = fork.query(
-        "MATCH (p:Person {email: 'c@x.com'}) RETURN p.name AS name"
-    )
+    fork_only = fork.query("MATCH (p:Person {email: 'c@x.com'}) RETURN p.name AS name")
     assert [r["name"] for r in fork_only] == ["Carol-on-fork"]
 
     primary_only = fork.query(

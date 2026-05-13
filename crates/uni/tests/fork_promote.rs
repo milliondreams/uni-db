@@ -105,8 +105,7 @@ async fn promote_dedupes_uid_conflict() -> Result<()> {
     );
 
     // Counters should sum to the count of fork-only nodes considered.
-    let total_seen =
-        report.vertices_inserted + report.vertices_skipped_uid_conflict;
+    let total_seen = report.vertices_inserted + report.vertices_skipped_uid_conflict;
     assert!(
         total_seen >= 1,
         "promote should have considered at least 1 fork row: {:?}",
@@ -128,16 +127,20 @@ async fn promote_respects_where_clause() -> Result<()> {
         .await?;
     let session = db.session();
     let tx = session.tx().await?;
-    tx.execute("CREATE (:Item {name: 'seed', price: 1})").await?;
+    tx.execute("CREATE (:Item {name: 'seed', price: 1})")
+        .await?;
     tx.commit().await?;
     db.flush().await?;
 
     {
         let fork = session.fork("filter").await?;
         let tx = fork.tx().await?;
-        tx.execute("CREATE (:Item {name: 'cheap', price: 5})").await?;
-        tx.execute("CREATE (:Item {name: 'mid', price: 50})").await?;
-        tx.execute("CREATE (:Item {name: 'pricey', price: 500})").await?;
+        tx.execute("CREATE (:Item {name: 'cheap', price: 5})")
+            .await?;
+        tx.execute("CREATE (:Item {name: 'mid', price: 50})")
+            .await?;
+        tx.execute("CREATE (:Item {name: 'pricey', price: 500})")
+            .await?;
         tx.commit().await?;
     }
 

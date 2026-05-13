@@ -12,10 +12,8 @@ import asyncio
 from datetime import timedelta
 
 import pytest
-import pytest_asyncio
 
 import uni_db
-
 
 pytestmark = pytest.mark.asyncio
 
@@ -108,10 +106,14 @@ async def test_nested_fork_chain():
     await tx.execute("CREATE (:Person {name: 'B-only'})")
     await tx.commit()
 
-    b_names = sorted(r["name"] for r in await b.query("MATCH (p:Person) RETURN p.name AS name"))
+    b_names = sorted(
+        r["name"] for r in await b.query("MATCH (p:Person) RETURN p.name AS name")
+    )
     assert b_names == ["A-only", "B-only", "seed"]
 
-    a_names = sorted(r["name"] for r in await a.query("MATCH (p:Person) RETURN p.name AS name"))
+    a_names = sorted(
+        r["name"] for r in await a.query("MATCH (p:Person) RETURN p.name AS name")
+    )
     assert "B-only" not in a_names
 
     del a, b

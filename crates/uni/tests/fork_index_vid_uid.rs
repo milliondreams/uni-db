@@ -126,7 +126,10 @@ async fn build_fork_local_index_on_primary_session_errors() -> Result<()> {
         .build_fork_local_index("Person", "uid", ForkLocalIndexKind::VidUid)
         .await;
     assert!(
-        matches!(result, Err(uni_common::api::error::UniError::InvalidArgument { .. })),
+        matches!(
+            result,
+            Err(uni_common::api::error::UniError::InvalidArgument { .. })
+        ),
         "expected InvalidArgument on primary session; got {result:?}"
     );
     db.shutdown().await?;

@@ -1137,13 +1137,13 @@ if __name__ == "__main__":
             ),
             code_cell(
                 [
-                    'db = uni_db.Uni.builder().disable_fork_sweeper(True).build()',
+                    "db = uni_db.Uni.builder().disable_fork_sweeper(True).build()",
                     "",
                     'db.schema().label("Person").property("name", "string").apply()',
                     'db.schema().edge_type("KNOWS", ["Person"], ["Person"]).apply()',
-                    'db.schema().edge_type(',
+                    "db.schema().edge_type(",
                     '    "FRIEND_OF_FRIEND", ["Person"], ["Person"]',
-                    ').apply()',
+                    ").apply()",
                     "",
                     'print("schema applied")',
                 ]
@@ -1274,9 +1274,9 @@ if __name__ == "__main__":
                     "",
                     "for row in rows:",
                     "    print(",
-                    '        f"  ({row.get(\'src\')})-'
+                    "        f\"  ({row.get('src')})-"
                     "[:{row.get('rel')}]"
-                    '->({row.get(\'dst\')})"',
+                    "->({row.get('dst')})\"",
                     "    )",
                 ]
             ),
@@ -1452,9 +1452,9 @@ if __name__ == "__main__":
                     "",
                     "for row in result.rows:",
                     "    print(",
-                    '        f"  ({row.get(\'src\')})-'
+                    "        f\"  ({row.get('src')})-"
                     "[:{row.get('rel')}]"
-                    '->({row.get(\'dst\')})"',
+                    "->({row.get('dst')})\"",
                     "    )",
                 ]
             ),

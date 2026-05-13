@@ -34,23 +34,17 @@ async fn fork_local_fts_index_returns_fused_results() -> Result<()> {
 
     let primary = db.session();
     let tx = primary.tx().await?;
-    tx.execute(
-        "CREATE (:Doc {title: 'P-zebra', body: 'a primary article about zebras'})",
-    )
-    .await?;
-    tx.execute(
-        "CREATE (:Doc {title: 'P-other', body: 'a primary article about something else'})",
-    )
-    .await?;
+    tx.execute("CREATE (:Doc {title: 'P-zebra', body: 'a primary article about zebras'})")
+        .await?;
+    tx.execute("CREATE (:Doc {title: 'P-other', body: 'a primary article about something else'})")
+        .await?;
     tx.commit().await?;
     db.flush().await?;
 
     let forked = primary.fork("scenario").await?;
     let tx = forked.tx().await?;
-    tx.execute(
-        "CREATE (:Doc {title: 'F-zebra', body: 'a fork-only zebra story'})",
-    )
-    .await?;
+    tx.execute("CREATE (:Doc {title: 'F-zebra', body: 'a fork-only zebra story'})")
+        .await?;
     tx.commit().await?;
     forked.flush().await?;
 

@@ -59,10 +59,7 @@ async fn fork_sees_fork_point_state_after_primary_writes() -> Result<()> {
         .await?
         .rows()
         .len();
-    assert_eq!(
-        fork_rows, 2,
-        "fork must not see post-fork primary writes"
-    );
+    assert_eq!(fork_rows, 2, "fork must not see post-fork primary writes");
 
     db.shutdown().await?;
     Ok(())
@@ -152,12 +149,7 @@ async fn list_and_info_round_trip() -> Result<()> {
     let _b = session.fork("beta").await?;
     let _c = session.fork("gamma").await?;
 
-    let mut names: Vec<String> = db
-        .list_forks()
-        .await
-        .into_iter()
-        .map(|f| f.name)
-        .collect();
+    let mut names: Vec<String> = db.list_forks().await.into_iter().map(|f| f.name).collect();
     names.sort();
     assert_eq!(names, vec!["alpha", "beta", "gamma"]);
 
@@ -232,20 +224,10 @@ async fn forks_remain_independent_when_primary_label_grows() -> Result<()> {
     db.flush().await?;
 
     // Both forks see the original 1 item; primary sees 2.
+    assert_eq!(f1.query("MATCH (i:Item) RETURN i").await?.rows().len(), 1);
+    assert_eq!(f2.query("MATCH (i:Item) RETURN i").await?.rows().len(), 1);
     assert_eq!(
-        f1.query("MATCH (i:Item) RETURN i").await?.rows().len(),
-        1
-    );
-    assert_eq!(
-        f2.query("MATCH (i:Item) RETURN i").await?.rows().len(),
-        1
-    );
-    assert_eq!(
-        session
-            .query("MATCH (i:Item) RETURN i")
-            .await?
-            .rows()
-            .len(),
+        session.query("MATCH (i:Item) RETURN i").await?.rows().len(),
         2
     );
 

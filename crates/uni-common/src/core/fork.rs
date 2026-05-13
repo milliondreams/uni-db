@@ -343,8 +343,11 @@ mod tests {
             ..Default::default()
         };
         let merged = top.merge_atop(&base);
-        let label_names: Vec<&str> =
-            merged.added_labels.iter().map(|(n, _)| n.as_str()).collect();
+        let label_names: Vec<&str> = merged
+            .added_labels
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect();
         assert!(label_names.contains(&"A") && label_names.contains(&"B"));
         let edge_names: Vec<&str> = merged
             .added_edge_types

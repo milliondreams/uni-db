@@ -28,8 +28,12 @@ use uni_store::fork::writer_factory;
 use uni_store::runtime::wal::Mutation;
 use uni_store::storage::manager::StorageManager;
 
-async fn fixture()
--> (TempDir, Arc<dyn ObjectStore>, Arc<StorageManager>, Arc<SchemaManager>) {
+async fn fixture() -> (
+    TempDir,
+    Arc<dyn ObjectStore>,
+    Arc<StorageManager>,
+    Arc<SchemaManager>,
+) {
     let dir = TempDir::new().unwrap();
     // Schema lives under the temp root; storage lives under
     // `<temp>/storage`. The fork WAL prefix is relative to the
@@ -89,14 +93,9 @@ async fn fork_wal_replay_restores_persisted_mutations() {
     // 2. Build a new Writer via the factory — the same flow that
     //    `UniInner::at_fork` uses. Then call `replay_wal(0)` to load
     //    persisted mutations into the freshly-built L0 buffer.
-    let writer = writer_factory::new_for_fork(
-        storage,
-        schema,
-        &fork_id,
-        UniConfig::default(),
-    )
-    .await
-    .unwrap();
+    let writer = writer_factory::new_for_fork(storage, schema, &fork_id, UniConfig::default())
+        .await
+        .unwrap();
     let replayed = writer.replay_wal(0).await.unwrap();
     assert_eq!(
         replayed, 2,
@@ -123,10 +122,8 @@ async fn primary_wal_unaffected_by_fork_wal_segments() {
     fork.flush().await.unwrap();
 
     // Primary WAL prefix is just "wal".
-    let primary = uni_store::runtime::wal::WriteAheadLog::new(
-        store,
-        object_store::path::Path::from("wal"),
-    );
+    let primary =
+        uni_store::runtime::wal::WriteAheadLog::new(store, object_store::path::Path::from("wal"));
     let max = primary.initialize().await.unwrap();
     assert_eq!(max, 0, "primary WAL must not see fork-tagged segments");
 }
@@ -136,14 +133,9 @@ async fn replay_with_no_persisted_mutations_is_noop() {
     let (_dir, _store, storage, schema) = fixture().await;
     let fork_id = ForkId::new();
 
-    let writer = writer_factory::new_for_fork(
-        storage,
-        schema,
-        &fork_id,
-        UniConfig::default(),
-    )
-    .await
-    .unwrap();
+    let writer = writer_factory::new_for_fork(storage, schema, &fork_id, UniConfig::default())
+        .await
+        .unwrap();
     let replayed = writer.replay_wal(0).await.unwrap();
     assert_eq!(replayed, 0);
 }

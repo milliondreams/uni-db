@@ -164,7 +164,11 @@ impl VertexPropertyChange {
         Self {
             label: self.label,
             uid: self.uid,
-            changes: self.changes.into_iter().map(PropertyChange::invert).collect(),
+            changes: self
+                .changes
+                .into_iter()
+                .map(PropertyChange::invert)
+                .collect(),
         }
     }
 }
@@ -208,7 +212,11 @@ impl EdgePropertyChange {
             edge_type: self.edge_type,
             src_uid: self.src_uid,
             dst_uid: self.dst_uid,
-            changes: self.changes.into_iter().map(PropertyChange::invert).collect(),
+            changes: self
+                .changes
+                .into_iter()
+                .map(PropertyChange::invert)
+                .collect(),
         }
     }
 }
@@ -417,22 +425,8 @@ pub(crate) async fn compute_diff(a: &Session, b: &Session) -> Result<ForkDiff> {
         diff_label(label, rows_a, rows_b, &mut diff.vertices);
     }
 
-    let edges_a: HashSet<String> = a
-        .db()
-        .schema
-        .schema()
-        .edge_types
-        .keys()
-        .cloned()
-        .collect();
-    let edges_b: HashSet<String> = b
-        .db()
-        .schema
-        .schema()
-        .edge_types
-        .keys()
-        .cloned()
-        .collect();
+    let edges_a: HashSet<String> = a.db().schema.schema().edge_types.keys().cloned().collect();
+    let edges_b: HashSet<String> = b.db().schema.schema().edge_types.keys().cloned().collect();
     let edges_union: Vec<&String> = edges_a.union(&edges_b).collect();
 
     for edge_type in edges_union {
@@ -514,12 +508,8 @@ async fn scan_edge_type(s: &Session, edge_type: &str) -> Result<EdgeBucket> {
         let b_label = b.labels.first().cloned().unwrap_or_default();
         let src_uid = VertexDataset::compute_vertex_uid(&a_label, None, &a.properties);
         let dst_uid = VertexDataset::compute_vertex_uid(&b_label, None, &b.properties);
-        let edge_uid = MainEdgeDataset::compute_edge_uid(
-            &src_uid,
-            &dst_uid,
-            edge_type,
-            &edge.properties,
-        );
+        let edge_uid =
+            MainEdgeDataset::compute_edge_uid(&src_uid, &dst_uid, edge_type, &edge.properties);
         bucket.insert(
             edge_uid,
             EdgeRow {
@@ -659,9 +649,7 @@ async fn batch_resolve_primary_vids(
     // branch-isolated, so a single UID may have a fork-only VID and
     // a primary VID both registered — we keep both and let the
     // primary Cypher MATCH below decide which is real.
-    let candidates_per_uid: HashMap<UniIdT, Vec<Vid>> = match primary_storage
-        .uid_index(label)
-        .ok()
+    let candidates_per_uid: HashMap<UniIdT, Vec<Vid>> = match primary_storage.uid_index(label).ok()
     {
         Some(uix) => match resolve_all_candidate_vids(&uix, uids).await {
             Ok(m) => m,
@@ -751,17 +739,13 @@ async fn resolve_all_candidate_vids(
             .column_by_name("_uid_hex")
             .and_then(|c| c.as_any().downcast_ref::<arrow_array::StringArray>())
             .ok_or_else(|| {
-                uni_common::UniError::Internal(anyhow::anyhow!(
-                    "Missing _uid_hex column"
-                ))
+                uni_common::UniError::Internal(anyhow::anyhow!("Missing _uid_hex column"))
             })?;
         let vid_col = batch
             .column_by_name("_vid")
             .and_then(|c| c.as_any().downcast_ref::<arrow_array::UInt64Array>())
             .ok_or_else(|| {
-                uni_common::UniError::Internal(anyhow::anyhow!(
-                    "Missing _vid column"
-                ))
+                uni_common::UniError::Internal(anyhow::anyhow!("Missing _vid column"))
             })?;
         for i in 0..batch.num_rows() {
             if uid_hex_col.is_null(i) {
@@ -769,7 +753,9 @@ async fn resolve_all_candidate_vids(
             }
             let hex = uid_hex_col.value(i);
             if let Some(&uid) = hex_to_uid.get(hex) {
-                out.entry(uid).or_default().push(Vid::from(vid_col.value(i)));
+                out.entry(uid)
+                    .or_default()
+                    .push(Vid::from(vid_col.value(i)));
             }
         }
     }
@@ -777,7 +763,10 @@ async fn resolve_all_candidate_vids(
 }
 
 fn uid_to_hex(uid: &UniId) -> String {
-    uid.as_bytes().iter().map(|b| format!("{:02x}", b)).collect()
+    uid.as_bytes()
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect()
 }
 
 // ============================================================================
@@ -818,7 +807,10 @@ pub(crate) async fn run_promote(
 
     for (idx, pattern) in patterns.iter().enumerate() {
         match pattern {
-            PromotePattern::Vertex { label, where_clause } => {
+            PromotePattern::Vertex {
+                label,
+                where_clause,
+            } => {
                 let cypher = match where_clause {
                     Some(w) => format!(
                         "MATCH (n:`{}`) WHERE {} RETURN n",
@@ -852,15 +844,10 @@ pub(crate) async fn run_promote(
                 // Batch-resolve every candidate UID against primary.
                 // Two queries total per pattern (UidIndex.resolve_uids
                 // + Cypher IN-clause verify) instead of 2N.
-                let uids_to_check: Vec<UniId> =
-                    candidates.iter().map(|(u, _)| *u).collect();
-                let on_primary = batch_resolve_primary_vids(
-                    primary,
-                    &primary_storage,
-                    label,
-                    &uids_to_check,
-                )
-                .await;
+                let uids_to_check: Vec<UniId> = candidates.iter().map(|(u, _)| *u).collect();
+                let on_primary =
+                    batch_resolve_primary_vids(primary, &primary_storage, label, &uids_to_check)
+                        .await;
 
                 let mut to_insert: Vec<Properties> = Vec::with_capacity(candidates.len());
                 let mut insert_uids: Vec<UniId> = Vec::with_capacity(candidates.len());
@@ -883,7 +870,10 @@ pub(crate) async fn run_promote(
                     report.per_pattern_inserted[idx] = n;
                 }
             }
-            PromotePattern::Edge { edge_type, where_clause } => {
+            PromotePattern::Edge {
+                edge_type,
+                where_clause,
+            } => {
                 any_edge_pattern = true;
                 let cypher = match where_clause {
                     Some(w) => format!(
@@ -915,14 +905,11 @@ pub(crate) async fn run_promote(
                     edge_uid: UniId,
                     edge_props: Properties,
                 }
-                let mut fork_edges: Vec<ForkEdgeRow> =
-                    Vec::with_capacity(result.rows().len());
+                let mut fork_edges: Vec<ForkEdgeRow> = Vec::with_capacity(result.rows().len());
                 for row in result.rows() {
-                    let (
-                        Some(Value::Edge(edge)),
-                        Some(Value::Node(a)),
-                        Some(Value::Node(b)),
-                    ) = (row.value("r"), row.value("a"), row.value("b")) else {
+                    let (Some(Value::Edge(edge)), Some(Value::Node(a)), Some(Value::Node(b))) =
+                        (row.value("r"), row.value("a"), row.value("b"))
+                    else {
                         continue;
                     };
                     let a_label = match a.labels.first() {
@@ -933,10 +920,8 @@ pub(crate) async fn run_promote(
                         Some(l) => l.clone(),
                         None => continue,
                     };
-                    let src_uid =
-                        VertexDataset::compute_vertex_uid(&a_label, None, &a.properties);
-                    let dst_uid =
-                        VertexDataset::compute_vertex_uid(&b_label, None, &b.properties);
+                    let src_uid = VertexDataset::compute_vertex_uid(&a_label, None, &a.properties);
+                    let dst_uid = VertexDataset::compute_vertex_uid(&b_label, None, &b.properties);
                     let edge_uid = MainEdgeDataset::compute_edge_uid(
                         &src_uid,
                         &dst_uid,
@@ -958,22 +943,23 @@ pub(crate) async fn run_promote(
                 let mut to_resolve: HashMap<String, HashSet<UniId>> = HashMap::new();
                 for fe in &fork_edges {
                     if !just_inserted.contains_key(&(fe.a_label.clone(), fe.src_uid)) {
-                        to_resolve.entry(fe.a_label.clone()).or_default().insert(fe.src_uid);
+                        to_resolve
+                            .entry(fe.a_label.clone())
+                            .or_default()
+                            .insert(fe.src_uid);
                     }
                     if !just_inserted.contains_key(&(fe.b_label.clone(), fe.dst_uid)) {
-                        to_resolve.entry(fe.b_label.clone()).or_default().insert(fe.dst_uid);
+                        to_resolve
+                            .entry(fe.b_label.clone())
+                            .or_default()
+                            .insert(fe.dst_uid);
                     }
                 }
                 let mut endpoint_resolved: HashMap<(String, UniId), Vid> = HashMap::new();
                 for (lbl, uid_set) in to_resolve {
                     let uid_vec: Vec<UniId> = uid_set.into_iter().collect();
-                    let resolved = batch_resolve_primary_vids(
-                        primary,
-                        &primary_storage,
-                        &lbl,
-                        &uid_vec,
-                    )
-                    .await;
+                    let resolved =
+                        batch_resolve_primary_vids(primary, &primary_storage, &lbl, &uid_vec).await;
                     for (uid, vid) in resolved {
                         endpoint_resolved.insert((lbl.clone(), uid), vid);
                     }
@@ -1000,10 +986,8 @@ pub(crate) async fn run_promote(
                         resolved_pairs.iter().map(|(s, _)| s.as_u64()).collect();
                     let dst_vids: HashSet<u64> =
                         resolved_pairs.iter().map(|(_, d)| d.as_u64()).collect();
-                    let src_list: Vec<String> =
-                        src_vids.iter().map(|v| v.to_string()).collect();
-                    let dst_list: Vec<String> =
-                        dst_vids.iter().map(|v| v.to_string()).collect();
+                    let src_list: Vec<String> = src_vids.iter().map(|v| v.to_string()).collect();
+                    let dst_list: Vec<String> = dst_vids.iter().map(|v| v.to_string()).collect();
                     let dedup_cypher = format!(
                         "MATCH (a)-[r:`{}`]->(b) \
                          WHERE id(a) IN [{}] AND id(b) IN [{}] \
@@ -1024,16 +1008,10 @@ pub(crate) async fn run_promote(
                             };
                             let ea_label = ea.labels.first().cloned().unwrap_or_default();
                             let eb_label = eb.labels.first().cloned().unwrap_or_default();
-                            let esrc = VertexDataset::compute_vertex_uid(
-                                &ea_label,
-                                None,
-                                &ea.properties,
-                            );
-                            let edst = VertexDataset::compute_vertex_uid(
-                                &eb_label,
-                                None,
-                                &eb.properties,
-                            );
+                            let esrc =
+                                VertexDataset::compute_vertex_uid(&ea_label, None, &ea.properties);
+                            let edst =
+                                VertexDataset::compute_vertex_uid(&eb_label, None, &eb.properties);
                             let euid = MainEdgeDataset::compute_edge_uid(
                                 &esrc,
                                 &edst,
@@ -1074,7 +1052,9 @@ pub(crate) async fn run_promote(
                 }
                 if !edges_to_insert.is_empty() {
                     let n = edges_to_insert.len();
-                    primary_tx.bulk_insert_edges(edge_type, edges_to_insert).await?;
+                    primary_tx
+                        .bulk_insert_edges(edge_type, edges_to_insert)
+                        .await?;
                     report.edges_inserted += n;
                 }
                 report.per_pattern_inserted[idx] = pattern_inserted;

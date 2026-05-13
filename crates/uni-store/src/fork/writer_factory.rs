@@ -32,9 +32,9 @@ use super::{id_alloc, wal as fork_wal};
 ///
 /// The supplied `storage` must already be fork-scoped — typically
 /// `primary.at_fork(scope)` from Day 5 wiring. The returned Writer
-/// uses a per-fork [`IdAllocator`] (Day 3) persisted under
+/// uses a per-fork `IdAllocator` (Day 3) persisted under
 /// `catalog/forks/{fork_id}/id_allocator.json`, a per-fork
-/// [`WriteAheadLog`] (Day 5) rooted at `wal/forks/{fork_id}/`, and
+/// `WriteAheadLog` (Day 5) rooted at `wal/forks/{fork_id}/`, and
 /// a fresh L0 buffer at `start_version=0`.
 ///
 /// # Errors
@@ -48,12 +48,9 @@ pub async fn new_for_fork(
     config: UniConfig,
 ) -> Result<Writer> {
     let store = storage.store();
-    let allocator = id_alloc::new_for_fork_arc(
-        store.clone(),
-        fork_id,
-        id_alloc::DEFAULT_FORK_BATCH_SIZE,
-    )
-    .await?;
+    let allocator =
+        id_alloc::new_for_fork_arc(store.clone(), fork_id, id_alloc::DEFAULT_FORK_BATCH_SIZE)
+            .await?;
     let wal = fork_wal::new_for_fork_arc(store, fork_id);
     // Initialize the WAL so its LSN counter picks up any persisted
     // segments from prior sessions on the same fork.
@@ -87,15 +84,12 @@ mod tests {
     async fn primary_storage() -> (TempDir, Arc<StorageManager>, Arc<SchemaManager>) {
         let dir = TempDir::new().unwrap();
         let schema_path = dir.path().join("schema.json");
-        let schema_store: Arc<dyn ObjectStore> = Arc::new(
-            LocalFileSystem::new_with_prefix(dir.path()).unwrap(),
-        );
-        let schema = SchemaManager::load_from_store(
-            schema_store,
-            &ObjectStorePath::from("schema.json"),
-        )
-        .await
-        .unwrap();
+        let schema_store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+        let schema =
+            SchemaManager::load_from_store(schema_store, &ObjectStorePath::from("schema.json"))
+                .await
+                .unwrap();
         let _ = schema_path; // path read by load_from_store
         let schema = Arc::new(schema);
 
@@ -136,22 +130,12 @@ mod tests {
         let id_a = ForkId::new();
         let id_b = ForkId::new();
 
-        let writer_a = new_for_fork(
-            storage.clone(),
-            schema.clone(),
-            &id_a,
-            UniConfig::default(),
-        )
-        .await
-        .unwrap();
-        let writer_b = new_for_fork(
-            storage.clone(),
-            schema.clone(),
-            &id_b,
-            UniConfig::default(),
-        )
-        .await
-        .unwrap();
+        let writer_a = new_for_fork(storage.clone(), schema.clone(), &id_a, UniConfig::default())
+            .await
+            .unwrap();
+        let writer_b = new_for_fork(storage.clone(), schema.clone(), &id_b, UniConfig::default())
+            .await
+            .unwrap();
 
         // Each starts at VID 0, independently — promotion later
         // resolves any collisions via UniId dedup.

@@ -41,7 +41,9 @@ fn synth_vec(seed: u64) -> [f32; 8] {
     // Cheap PRN in [0.0, 1.0). Avoids negative literals because the
     // procedure-call argument parser doesn't accept `UnaryOp(Neg)`
     // wrapping a Literal in a CALL ... [...]  array.
-    let mut s = seed.wrapping_mul(2862933555777941757).wrapping_add(3037000493);
+    let mut s = seed
+        .wrapping_mul(2862933555777941757)
+        .wrapping_add(3037000493);
     let mut out = [0f32; 8];
     for v in out.iter_mut() {
         s = s.wrapping_mul(2862933555777941757).wrapping_add(3037000493);

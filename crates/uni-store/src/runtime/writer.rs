@@ -2626,10 +2626,7 @@ impl Writer {
         )
         .set(self.fork_flush_count as f64);
         let threshold = self.config.fork_fragment_warn_threshold as u64;
-        if !self.fork_fragment_warn_fired
-            && threshold > 0
-            && self.fork_flush_count >= threshold
-        {
+        if !self.fork_fragment_warn_fired && threshold > 0 && self.fork_flush_count >= threshold {
             self.fork_fragment_warn_fired = true;
             tracing::warn!(
                 fork = %fork_label,
@@ -3218,7 +3215,9 @@ mod tests {
         let schema_path = ObjectStorePath::from("schema.json");
         let schema_manager =
             Arc::new(SchemaManager::load_from_store(store.clone(), &schema_path).await?);
-        let storage = Arc::new(StorageManager::new(dir.path().to_str().unwrap(), schema_manager.clone()).await?);
+        let storage = Arc::new(
+            StorageManager::new(dir.path().to_str().unwrap(), schema_manager.clone()).await?,
+        );
 
         let config = UniConfig {
             fork_fragment_warn_threshold: 3,

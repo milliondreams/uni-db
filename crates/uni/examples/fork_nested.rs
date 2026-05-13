@@ -24,7 +24,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // === primary seed ==================================================
     let tx = primary.tx().await?;
-    tx.execute("CREATE (:Person {name: 'Primary-Alice'})").await?;
+    tx.execute("CREATE (:Person {name: 'Primary-Alice'})")
+        .await?;
     tx.commit().await?;
     db.flush().await?;
 

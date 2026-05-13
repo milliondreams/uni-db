@@ -91,7 +91,10 @@ mod tests {
         assert!(s.starts_with("wal_forks/"), "got {s}");
         assert!(s.contains(&id.to_string()));
         // Critically NOT under `wal/` — primary list would see it.
-        assert!(!s.starts_with("wal/"), "fork WAL must not nest under primary WAL");
+        assert!(
+            !s.starts_with("wal/"),
+            "fork WAL must not nest under primary WAL"
+        );
     }
 
     #[tokio::test]
@@ -113,10 +116,16 @@ mod tests {
         // Append two mutations and flush. The exact Mutation shape
         // depends on the WAL crate's enum; we use a vertex-insert
         // mutation matching the smallest reasonable variant.
-        wal.append(&Mutation::DeleteVertex { vid: Vid::new(7), labels: vec![] })
-            .unwrap();
-        wal.append(&Mutation::DeleteVertex { vid: Vid::new(8), labels: vec![] })
-            .unwrap();
+        wal.append(&Mutation::DeleteVertex {
+            vid: Vid::new(7),
+            labels: vec![],
+        })
+        .unwrap();
+        wal.append(&Mutation::DeleteVertex {
+            vid: Vid::new(8),
+            labels: vec![],
+        })
+        .unwrap();
         let lsn = wal.flush().await.unwrap();
         assert!(lsn >= 1, "flush returned LSN {lsn}");
 
@@ -143,18 +152,17 @@ mod tests {
         let fork_wal = new_for_fork(store.clone(), &id);
         fork_wal.initialize().await.unwrap();
         fork_wal
-            .append(&Mutation::DeleteVertex { vid: Vid::new(99), labels: vec![] })
+            .append(&Mutation::DeleteVertex {
+                vid: Vid::new(99),
+                labels: vec![],
+            })
             .unwrap();
         fork_wal.flush().await.unwrap();
 
         // Primary WAL prefix is just "wal".
-        let primary_wal =
-            WriteAheadLog::new(store, ObjectStorePath::from("wal"));
+        let primary_wal = WriteAheadLog::new(store, ObjectStorePath::from("wal"));
         let max = primary_wal.initialize().await.unwrap();
-        assert_eq!(
-            max, 0,
-            "primary WAL must not see fork-side segments"
-        );
+        assert_eq!(max, 0, "primary WAL must not see fork-side segments");
     }
 
     #[tokio::test]
@@ -168,7 +176,10 @@ mod tests {
         wal_a.initialize().await.unwrap();
         wal_b.initialize().await.unwrap();
         wal_a
-            .append(&Mutation::DeleteVertex { vid: Vid::new(1), labels: vec![] })
+            .append(&Mutation::DeleteVertex {
+                vid: Vid::new(1),
+                labels: vec![],
+            })
             .unwrap();
         wal_a.flush().await.unwrap();
 

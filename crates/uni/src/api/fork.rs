@@ -75,10 +75,7 @@ impl<'a> ForkBuilder<'a> {
     #[instrument(skip(self), fields(fork_name = %self.name, must_create = self.must_create))]
     pub(crate) async fn build(self) -> Result<Session> {
         let parent = self.parent;
-        let registry = parent
-            .db
-            .fork_registry
-            .clone();
+        let registry = parent.db.fork_registry.clone();
 
         // Acquire per-name lock for the entire open-or-create flow.
         // This prevents two concurrent callers from both running create
@@ -200,10 +197,7 @@ async fn create_fork_2pc(
         && let Some(writer_lock) = &parent.db.writer
     {
         let mut writer = writer_lock.write().await;
-        writer
-            .flush_to_l1(None)
-            .await
-            .map_err(UniError::Internal)?;
+        writer.flush_to_l1(None).await.map_err(UniError::Internal)?;
     }
 
     // Capture parent state at fork-point: snapshot id and schema version.
@@ -351,16 +345,14 @@ async fn build_datasets_for_fork(
         {
             Some(parent_branch) => {
                 // Nested fork: branch off the parent fork's branch tip.
-                let parent_v = lance_branch::current_version_on_branch(
-                    &dataset_uri,
-                    &parent_branch,
-                )
-                .await
-                .map_err(|e| UniError::ForkLifecycle {
-                    name: format!("<fork:{fork_id}>"),
-                    stage: "current_version_on_branch",
-                    source: e.into(),
-                })?;
+                let parent_v =
+                    lance_branch::current_version_on_branch(&dataset_uri, &parent_branch)
+                        .await
+                        .map_err(|e| UniError::ForkLifecycle {
+                            name: format!("<fork:{fork_id}>"),
+                            stage: "current_version_on_branch",
+                            source: e.into(),
+                        })?;
                 lance_branch::create_branch_from(
                     &dataset_uri,
                     &branch_name,

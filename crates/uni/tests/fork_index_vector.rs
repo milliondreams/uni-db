@@ -125,7 +125,10 @@ async fn fork_local_vector_index_returns_fused_results() -> Result<()> {
         .collect();
     let saw_fork = names.iter().any(|n| n.starts_with("F-"));
     let saw_primary = names.iter().any(|n| n.starts_with("P-"));
-    assert!(saw_fork, "result set should include fork-local docs; got {names:?}");
+    assert!(
+        saw_fork,
+        "result set should include fork-local docs; got {names:?}"
+    );
     assert!(
         saw_primary,
         "result set should include primary-inherited docs (top-K=5 vs 5 total); got {names:?}"

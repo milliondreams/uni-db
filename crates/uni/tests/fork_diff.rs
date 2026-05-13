@@ -143,11 +143,7 @@ async fn diff_idempotent_when_both_sides_are_same_fork() -> Result<()> {
     }
 
     let diff = db.diff_forks("self", "self").await?;
-    assert!(
-        diff.is_empty(),
-        "diff(a, a) must be empty, got {:?}",
-        diff
-    );
+    assert!(diff.is_empty(), "diff(a, a) must be empty, got {:?}", diff);
 
     db.shutdown().await?;
     Ok(())

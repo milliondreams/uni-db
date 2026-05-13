@@ -29,7 +29,10 @@ use super::session::Session;
 
 /// Pending change accumulated by [`ForkSchemaBuilder`].
 enum ForkSchemaChange {
-    AddLabel { name: String, description: Option<String> },
+    AddLabel {
+        name: String,
+        description: Option<String>,
+    },
     AddEdgeType {
         name: String,
         from_labels: Vec<String>,
@@ -62,12 +65,19 @@ pub struct ForkSchemaBuilder<'a> {
 
 impl<'a> ForkSchemaBuilder<'a> {
     pub(crate) fn new(session: &'a Session) -> Self {
-        Self { session, pending: Vec::new() }
+        Self {
+            session,
+            pending: Vec::new(),
+        }
     }
 
     /// Begin a label addition.
     pub fn label(self, name: &str) -> ForkLabelBuilder<'a> {
-        ForkLabelBuilder { builder: self, name: name.to_string(), description: None }
+        ForkLabelBuilder {
+            builder: self,
+            name: name.to_string(),
+            description: None,
+        }
     }
 
     /// Begin an edge-type addition.
@@ -108,19 +118,21 @@ impl<'a> ForkSchemaBuilder<'a> {
                     // contract.
                     manager
                         .add_label_with_desc(&name, description.clone())
-                        .map_err(|e| UniError::Schema { message: e.to_string() })?;
-                    let meta = manager
-                        .schema()
-                        .labels
-                        .get(&name)
-                        .cloned()
-                        .ok_or_else(|| UniError::Internal(anyhow::anyhow!(
+                        .map_err(|e| UniError::Schema {
+                            message: e.to_string(),
+                        })?;
+                    let meta = manager.schema().labels.get(&name).cloned().ok_or_else(|| {
+                        UniError::Internal(anyhow::anyhow!(
                             "fork_schema: label {name} not visible in fork SchemaManager after add"
-                        )))?;
+                        ))
+                    })?;
                     persist_label(&scope, name.clone(), meta).await?;
                 }
                 ForkSchemaChange::AddEdgeType {
-                    name, from_labels, to_labels, description,
+                    name,
+                    from_labels,
+                    to_labels,
+                    description,
                 } => {
                     manager
                         .add_edge_type_with_desc(
@@ -129,7 +141,9 @@ impl<'a> ForkSchemaBuilder<'a> {
                             to_labels.clone(),
                             description.clone(),
                         )
-                        .map_err(|e| UniError::Schema { message: e.to_string() })?;
+                        .map_err(|e| UniError::Schema {
+                            message: e.to_string(),
+                        })?;
                     let meta = manager
                         .schema()
                         .edge_types
@@ -151,13 +165,14 @@ async fn persist_label(
     name: String,
     meta: LabelMeta,
 ) -> Result<()> {
-    scope.add_label_to_overlay(name, meta).await.map_err(|e| {
-        UniError::ForkLifecycle {
+    scope
+        .add_label_to_overlay(name, meta)
+        .await
+        .map_err(|e| UniError::ForkLifecycle {
             name: format!("<fork:{}>", scope.fork_id()),
             stage: "overlay_persist",
             source: e.into(),
-        }
-    })
+        })
 }
 
 async fn persist_edge_type(
@@ -165,13 +180,14 @@ async fn persist_edge_type(
     name: String,
     meta: EdgeTypeMeta,
 ) -> Result<()> {
-    scope.add_edge_type_to_overlay(name, meta).await.map_err(|e| {
-        UniError::ForkLifecycle {
+    scope
+        .add_edge_type_to_overlay(name, meta)
+        .await
+        .map_err(|e| UniError::ForkLifecycle {
             name: format!("<fork:{}>", scope.fork_id()),
             stage: "overlay_persist",
             source: e.into(),
-        }
-    })
+        })
 }
 
 #[must_use = "builders do nothing until .done() or .apply() is awaited"]
@@ -188,9 +204,10 @@ impl<'a> ForkLabelBuilder<'a> {
     }
 
     fn finish(mut self) -> ForkSchemaBuilder<'a> {
-        self.builder
-            .pending
-            .push(ForkSchemaChange::AddLabel { name: self.name, description: self.description });
+        self.builder.pending.push(ForkSchemaChange::AddLabel {
+            name: self.name,
+            description: self.description,
+        });
         self.builder
     }
 

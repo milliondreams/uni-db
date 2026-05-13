@@ -66,13 +66,9 @@ async fn write_to_branch_appends_only_to_branch() {
         .unwrap();
 
     // Append two rows on the branch.
-    lance_branch::write_to_branch(
-        &uri,
-        "scenario",
-        reader(batch(vec![4, 5], vec![40, 50])),
-    )
-    .await
-    .unwrap();
+    lance_branch::write_to_branch(&uri, "scenario", reader(batch(vec![4, 5], vec![40, 50])))
+        .await
+        .unwrap();
 
     // Branch sees five rows.
     let on_branch = lance_branch::open_branch(&uri, "scenario").await.unwrap();
@@ -88,7 +84,9 @@ async fn delete_from_branch_removes_only_on_branch() {
     let (_dir, uri) = seed_dataset().await;
 
     let parent_v = lance_branch::current_version(&uri).await.unwrap();
-    lance_branch::create_branch(&uri, "del", parent_v).await.unwrap();
+    lance_branch::create_branch(&uri, "del", parent_v)
+        .await
+        .unwrap();
 
     lance_branch::delete_from_branch(&uri, "del", "id = 2")
         .await
@@ -113,24 +111,16 @@ async fn replace_branch_tip_overwrites_branch_only() {
         .unwrap();
 
     // Append something we'll replace.
-    lance_branch::write_to_branch(
-        &uri,
-        "replace",
-        reader(batch(vec![100], vec![1000])),
-    )
-    .await
-    .unwrap();
+    lance_branch::write_to_branch(&uri, "replace", reader(batch(vec![100], vec![1000])))
+        .await
+        .unwrap();
     let on_branch = lance_branch::open_branch(&uri, "replace").await.unwrap();
     assert_eq!(on_branch.count_rows(None).await.unwrap(), 4);
 
     // Replace the tip with a single row.
-    lance_branch::replace_branch_tip(
-        &uri,
-        "replace",
-        reader(batch(vec![999], vec![9999])),
-    )
-    .await
-    .unwrap();
+    lance_branch::replace_branch_tip(&uri, "replace", reader(batch(vec![999], vec![9999])))
+        .await
+        .unwrap();
     let on_branch = lance_branch::open_branch(&uri, "replace").await.unwrap();
     assert_eq!(on_branch.count_rows(None).await.unwrap(), 1);
 
@@ -162,16 +152,10 @@ async fn create_dataset_then_branch_yields_writable_fork() {
     assert_eq!(primary.count_rows(None).await.unwrap(), 0);
 
     // Append data to the branch and confirm primary stays at zero.
-    lance_branch::write_to_branch(
-        &uri,
-        "fork_only",
-        reader(batch(vec![7, 8], vec![70, 80])),
-    )
-    .await
-    .unwrap();
-    let on_branch = lance_branch::open_branch(&uri, "fork_only")
+    lance_branch::write_to_branch(&uri, "fork_only", reader(batch(vec![7, 8], vec![70, 80])))
         .await
         .unwrap();
+    let on_branch = lance_branch::open_branch(&uri, "fork_only").await.unwrap();
     assert_eq!(on_branch.count_rows(None).await.unwrap(), 2);
     let primary = Dataset::open(&uri).await.unwrap();
     assert_eq!(primary.count_rows(None).await.unwrap(), 0);
@@ -181,16 +165,16 @@ async fn create_dataset_then_branch_yields_writable_fork() {
 async fn writes_on_one_branch_invisible_to_sibling_branches() {
     let (_dir, uri) = seed_dataset().await;
     let parent_v = lance_branch::current_version(&uri).await.unwrap();
-    lance_branch::create_branch(&uri, "alpha", parent_v).await.unwrap();
-    lance_branch::create_branch(&uri, "beta", parent_v).await.unwrap();
+    lance_branch::create_branch(&uri, "alpha", parent_v)
+        .await
+        .unwrap();
+    lance_branch::create_branch(&uri, "beta", parent_v)
+        .await
+        .unwrap();
 
-    lance_branch::write_to_branch(
-        &uri,
-        "alpha",
-        reader(batch(vec![100], vec![1])),
-    )
-    .await
-    .unwrap();
+    lance_branch::write_to_branch(&uri, "alpha", reader(batch(vec![100], vec![1])))
+        .await
+        .unwrap();
 
     // alpha sees 4; beta still sees 3; primary sees 3.
     assert_eq!(
@@ -212,7 +196,12 @@ async fn writes_on_one_branch_invisible_to_sibling_branches() {
         3
     );
     assert_eq!(
-        Dataset::open(&uri).await.unwrap().count_rows(None).await.unwrap(),
+        Dataset::open(&uri)
+            .await
+            .unwrap()
+            .count_rows(None)
+            .await
+            .unwrap(),
         3
     );
 }

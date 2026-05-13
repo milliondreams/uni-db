@@ -109,9 +109,12 @@ async def test_async_promote_inserts_fork_only_vertices():
 async def test_async_promote_edges_lands_both_endpoints_and_edge():
     db = await _make_db(disable_fork_sweeper=True)
     await db.schema().label("Person").property("name", "string").apply()
-    await db.schema().edge_type("KNOWS", ["Person"], ["Person"]).property(
-        "since", "int64"
-    ).apply()
+    await (
+        db.schema()
+        .edge_type("KNOWS", ["Person"], ["Person"])
+        .property("since", "int64")
+        .apply()
+    )
 
     primary = db.session()
     tx = await primary.tx()

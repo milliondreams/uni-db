@@ -79,9 +79,11 @@ async fn partial_create_branch_rolls_back_on_recovery() {
 
     // Second call hits the fault.
     let parent_v_b = lance_branch::current_version(&uri_b).await.unwrap();
-    let err =
-        lance_branch::create_branch(&uri_b, "fork_partial_B", parent_v_b).await;
-    assert!(err.is_err(), "second create_branch must fail under fault hook");
+    let err = lance_branch::create_branch(&uri_b, "fork_partial_B", parent_v_b).await;
+    assert!(
+        err.is_err(),
+        "second create_branch must fail under fault hook"
+    );
 
     // Disarm the hook and reset the counter so recovery's calls don't trip.
     unsafe { std::env::remove_var("UNI_FORK_INJECT_FAIL_AFTER") };

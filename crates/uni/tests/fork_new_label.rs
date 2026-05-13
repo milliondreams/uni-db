@@ -28,7 +28,7 @@ use uni_db::{DataType, Uni};
 async fn fork_writes_to_label_without_fork_point_dataset() -> Result<()> {
     let config = uni_db::UniConfig {
         auto_flush_threshold: 1, // force per-commit flush so the
-                                 // branched-write path is exercised
+        // branched-write path is exercised
         ..Default::default()
     };
     let db = Uni::in_memory().config(config).build().await?;

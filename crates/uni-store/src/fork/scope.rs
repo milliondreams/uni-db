@@ -182,12 +182,7 @@ impl ForkScope {
     /// Phase 5a: register a completed fork-local index build.
     /// Called by `IndexRebuildManager` after the build lands on
     /// the fork's branch.
-    pub fn register_fork_local_index(
-        &self,
-        label: &str,
-        column: &str,
-        kind: ForkLocalIndexKind,
-    ) {
+    pub fn register_fork_local_index(&self, label: &str, column: &str, kind: ForkLocalIndexKind) {
         self.fork_local_indexes
             .insert((label.to_string(), column.to_string()), kind);
     }
@@ -197,11 +192,7 @@ impl ForkScope {
     /// the planner should fall back to the inherited primary index
     /// (or to a plain scan).
     #[must_use]
-    pub fn fork_local_index(
-        &self,
-        label: &str,
-        column: &str,
-    ) -> Option<ForkLocalIndexKind> {
+    pub fn fork_local_index(&self, label: &str, column: &str) -> Option<ForkLocalIndexKind> {
         self.fork_local_indexes
             .get(&(label.to_string(), column.to_string()))
             .map(|r| *r.value())
@@ -292,11 +283,7 @@ impl ForkScope {
     /// Concurrency: serialized within a single fork by `overlay_lock`
     /// so two concurrent appends don't clobber each other's
     /// persisted state.
-    pub async fn add_label_to_overlay(
-        &self,
-        name: String,
-        meta: LabelMeta,
-    ) -> anyhow::Result<()> {
+    pub async fn add_label_to_overlay(&self, name: String, meta: LabelMeta) -> anyhow::Result<()> {
         let _guard = self.overlay_lock.lock().await;
         let mut next = (**self.overlay.load()).clone();
         next.added_labels.push((name, meta));

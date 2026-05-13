@@ -30,7 +30,8 @@ async fn forked_tx_commit_lands_on_fork_branch() -> Result<()> {
     // when the fork is created — schema overlay growth lands on Day 10.
     let session = db.session();
     let tx = session.tx().await?;
-    tx.execute("CREATE (:Person {name: 'Primary-Alice'})").await?;
+    tx.execute("CREATE (:Person {name: 'Primary-Alice'})")
+        .await?;
     tx.commit().await?;
     db.flush().await?;
 
@@ -64,10 +65,7 @@ async fn forked_tx_commit_lands_on_fork_branch() -> Result<()> {
         .await?
         .rows()
         .len();
-    assert_eq!(
-        primary_rows, 1,
-        "primary must not see fork's writes"
-    );
+    assert_eq!(primary_rows, 1, "primary must not see fork's writes");
 
     db.shutdown().await?;
     Ok(())
@@ -106,20 +104,12 @@ async fn fork_and_primary_writes_remain_isolated_under_interleaving() -> Result<
     tx.commit().await?;
 
     // Primary sees: seed + primary-2 = 2 rows.
-    let primary_count = session
-        .query("MATCH (i:Item) RETURN i")
-        .await?
-        .rows()
-        .len();
+    let primary_count = session.query("MATCH (i:Item) RETURN i").await?.rows().len();
     assert_eq!(primary_count, 2);
 
     // Fork sees: seed (fork-point) + fork-1 + fork-3 = 3 rows.
     // It does NOT see primary-2 (post-fork primary write).
-    let fork_count = forked
-        .query("MATCH (i:Item) RETURN i")
-        .await?
-        .rows()
-        .len();
+    let fork_count = forked.query("MATCH (i:Item) RETURN i").await?.rows().len();
     assert_eq!(fork_count, 3);
 
     db.shutdown().await?;

@@ -22,10 +22,7 @@ async fn db_with_schema() -> Result<Uni> {
         .property("name", DataType::String)
         .apply()
         .await?;
-    db.schema()
-        .edge_type("E", &["N"], &["N"])
-        .apply()
-        .await?;
+    db.schema().edge_type("E", &["N"], &["N"]).apply().await?;
     Ok(db)
 }
 

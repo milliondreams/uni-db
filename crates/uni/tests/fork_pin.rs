@@ -37,7 +37,8 @@ async fn forked_session_pin_and_refresh() -> Result<()> {
 
     // Write more after snapshot.
     let tx = primary.tx().await?;
-    tx.execute("CREATE (:Person {name: 'after-snapshot'})").await?;
+    tx.execute("CREATE (:Person {name: 'after-snapshot'})")
+        .await?;
     tx.commit().await?;
     db.flush().await?;
 
@@ -58,7 +59,8 @@ async fn forked_session_pin_and_refresh() -> Result<()> {
 
     // After refresh, writes succeed again.
     let tx = fork.tx().await?;
-    tx.execute("CREATE (:Person {name: 'after-refresh'})").await?;
+    tx.execute("CREATE (:Person {name: 'after-refresh'})")
+        .await?;
     tx.commit().await?;
 
     db.shutdown().await?;

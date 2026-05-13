@@ -262,10 +262,7 @@ impl DatabaseBuilder {
 
     /// Phase 4b — skip spawning the TTL sweeper. Tests that race against
     /// TTL should set this to `True`.
-    fn disable_fork_sweeper(
-        mut slf: PyRefMut<'_, Self>,
-        disabled: bool,
-    ) -> PyRefMut<'_, Self> {
+    fn disable_fork_sweeper(mut slf: PyRefMut<'_, Self>, disabled: bool) -> PyRefMut<'_, Self> {
         slf.uni_config
             .get_or_insert_with(uni_common::UniConfig::default)
             .disable_fork_sweeper = disabled;
@@ -2158,10 +2155,7 @@ impl PyForkBuilder {
 
     /// Stamp a wall-clock TTL on the fork. Has no effect when the
     /// fork already exists (open-or-create returns it unchanged).
-    fn ttl<'py>(
-        mut slf: PyRefMut<'py, Self>,
-        ttl: Py<PyAny>,
-    ) -> PyResult<PyRefMut<'py, Self>> {
+    fn ttl<'py>(mut slf: PyRefMut<'py, Self>, ttl: Py<PyAny>) -> PyResult<PyRefMut<'py, Self>> {
         let py = slf.py();
         slf.ttl = Some(convert::py_timedelta_to_duration(ttl.bind(py))?);
         Ok(slf)
@@ -2271,9 +2265,7 @@ pub(crate) async fn apply_fork_schema_pending(
     parent: ::uni_db::Session,
     pending: Vec<ForkSchemaPending>,
 ) -> ::uni_common::api::error::Result<()> {
-    use ::uni_db::api::fork_schema::{
-        ForkEdgeTypeBuilder, ForkLabelBuilder, ForkSchemaBuilder,
-    };
+    use ::uni_db::api::fork_schema::{ForkEdgeTypeBuilder, ForkLabelBuilder, ForkSchemaBuilder};
 
     enum Cursor<'a> {
         Schema(ForkSchemaBuilder<'a>),

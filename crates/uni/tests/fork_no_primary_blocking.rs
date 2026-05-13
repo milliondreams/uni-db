@@ -64,9 +64,7 @@ async fn long_fork_creation_does_not_block_primary_reads() {
     }
     fork_handle.await.unwrap();
 
-    eprintln!(
-        "iterations={iterations} max_read_latency={max_read_latency:?}"
-    );
+    eprintln!("iterations={iterations} max_read_latency={max_read_latency:?}");
 
     // Threshold: a single primary read must not take more than 250 ms
     // during the fork creation window. CI variance can be wide; keep

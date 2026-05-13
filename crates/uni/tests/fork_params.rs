@@ -34,7 +34,10 @@ async fn fork_params_do_not_inherit_from_parent() -> Result<()> {
     // Mutation on fork does not bleed back to primary.
     fork.params().set("region", "eu-west");
     assert_eq!(
-        primary.params().get("region").and_then(|v| v.as_str().map(String::from)),
+        primary
+            .params()
+            .get("region")
+            .and_then(|v| v.as_str().map(String::from)),
         Some("us-east".to_string()),
         "primary's param unchanged after fork set"
     );

@@ -171,7 +171,9 @@ pub enum UniError {
     /// Drop refused because this fork has nested children. Use
     /// `drop_fork_cascade` to remove the whole subtree, or drop the
     /// children individually first.
-    #[error("Fork '{name}' has nested children {children:?}; use drop_fork_cascade or drop them first")]
+    #[error(
+        "Fork '{name}' has nested children {children:?}; use drop_fork_cascade or drop them first"
+    )]
     ForkHasChildren { name: String, children: Vec<String> },
 
     /// `drop_fork_cascade` refused because at least one fork in the

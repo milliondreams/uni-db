@@ -58,7 +58,7 @@ pub const DEFAULT_FORK_BATCH_SIZE: u64 = 1000;
 ///
 /// Used by both the factory below and the recovery driver in Day 6,
 /// which needs to know where to look for fork-local allocator state
-/// when reconstructing a fork's [`Writer`] on `Uni::open`.
+/// when reconstructing a fork's `Writer` on `Uni::open`.
 #[must_use]
 pub fn id_allocator_path(fork_id: &ForkId) -> ObjectStorePath {
     ObjectStorePath::from(format!("catalog/forks/{fork_id}/id_allocator.json"))

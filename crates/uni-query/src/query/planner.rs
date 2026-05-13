@@ -8788,10 +8788,7 @@ impl ForkIndexLookup for uni_store::storage::StorageManager {
 /// Idempotent: a tree that already contains `FusedIndexScan` nodes
 /// passes through unchanged.
 #[must_use]
-pub fn rewrite_for_fork_fusion<L: ForkIndexLookup>(
-    plan: LogicalPlan,
-    lookup: &L,
-) -> LogicalPlan {
+pub fn rewrite_for_fork_fusion<L: ForkIndexLookup>(plan: LogicalPlan, lookup: &L) -> LogicalPlan {
     rewrite_node(plan, lookup)
 }
 
@@ -8874,8 +8871,7 @@ fn rewrite_node<L: ForkIndexLookup>(plan: LogicalPlan, lookup: &L) -> LogicalPla
             k,
             threshold,
         } => {
-            if let Some(idx_kind) =
-                lookup.fork_index_for_label_id(label_id, &property)
+            if let Some(idx_kind) = lookup.fork_index_for_label_id(label_id, &property)
                 && let Some(kind) = into_fusion_kind(idx_kind)
             {
                 LogicalPlan::FusedIndexScanWrapped {
@@ -8906,8 +8902,7 @@ fn rewrite_node<L: ForkIndexLookup>(plan: LogicalPlan, lookup: &L) -> LogicalPla
             property,
             terms,
         } => {
-            if let Some(idx_kind) =
-                lookup.fork_index_for_label_id(label_id, &property)
+            if let Some(idx_kind) = lookup.fork_index_for_label_id(label_id, &property)
                 && let Some(kind) = into_fusion_kind(idx_kind)
             {
                 LogicalPlan::FusedIndexScanWrapped {
@@ -8945,11 +8940,7 @@ fn rewrite_node<L: ForkIndexLookup>(plan: LogicalPlan, lookup: &L) -> LogicalPla
             input: Box::new(rewrite_node(*input, lookup)),
             projections,
         },
-        LogicalPlan::Limit {
-            input,
-            skip,
-            fetch,
-        } => LogicalPlan::Limit {
+        LogicalPlan::Limit { input, skip, fetch } => LogicalPlan::Limit {
             input: Box::new(rewrite_node(*input, lookup)),
             skip,
             fetch,
@@ -8972,8 +8963,7 @@ fn rewrite_node<L: ForkIndexLookup>(plan: LogicalPlan, lookup: &L) -> LogicalPla
                     },
                     [single_sort],
                 ) if labels.len() == 1
-                    && let Some(col) =
-                        column_of_scan_variable(&single_sort.expr, &variable)
+                    && let Some(col) = column_of_scan_variable(&single_sort.expr, &variable)
                     && let Some(uni_store::fork::ForkLocalIndexKind::Sorted) =
                         lookup.fork_index_for(&labels[0], &col) =>
                 {

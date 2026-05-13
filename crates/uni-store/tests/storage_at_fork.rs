@@ -45,13 +45,10 @@ async fn at_fork_routes_vertex_reads_through_branch() {
     let schema_manager = Arc::new(schema_manager);
 
     // 2. Bootstrap StorageManager (uses default lance-backend).
-    let storage = StorageManager::new_with_config(
-        storage_str,
-        schema_manager.clone(),
-        UniConfig::default(),
-    )
-    .await
-    .unwrap();
+    let storage =
+        StorageManager::new_with_config(storage_str, schema_manager.clone(), UniConfig::default())
+            .await
+            .unwrap();
 
     // 3. Seed primary's vertices_Person dataset by writing one row through
     //    the standard backend trait. We bypass writer/L0 by using the lance
@@ -136,13 +133,10 @@ async fn at_fork_falls_back_to_primary_for_unrecorded_dataset() {
     schema_manager.add_label("Person").unwrap();
     let schema_manager = Arc::new(schema_manager);
 
-    let storage = StorageManager::new_with_config(
-        storage_str,
-        schema_manager.clone(),
-        UniConfig::default(),
-    )
-    .await
-    .unwrap();
+    let storage =
+        StorageManager::new_with_config(storage_str, schema_manager.clone(), UniConfig::default())
+            .await
+            .unwrap();
 
     let store: Arc<dyn ObjectStore> =
         Arc::new(LocalFileSystem::new_with_prefix(storage_path.clone()).unwrap());

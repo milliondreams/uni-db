@@ -1,0 +1,347 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2024-2026 Dragonscale Team
+
+"""Phase 4b — sync fork API tests.
+
+Mirrored by `test_async_fork.py` for the async surface. Both files set
+`disable_fork_sweeper=True` unless the test specifically exercises the
+sweeper, so timing-sensitive assertions stay deterministic.
+"""
+
+from __future__ import annotations
+
+from datetime import timedelta
+
+import pytest
+
+import uni_db
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+def _make_db(**config_kwargs):
+    """Build a temporary in-memory Uni with the given UniConfig overrides.
+
+    `Uni.builder()` returns a temporary-mode `DatabaseBuilder`; chain
+    setters then `.build()`. Direct `Uni.in_memory()` would skip the
+    config plumbing entirely.
+    """
+    builder = uni_db.Uni.builder()
+    for k, v in config_kwargs.items():
+        builder = getattr(builder, k)(v)
+    return builder.build()
+
+
+def _seed_person_schema(db):
+    db.schema().label("Person").property("name", "string").apply()
+    s = db.session()
+    tx = s.tx()
+    tx.execute("CREATE (:Person {name: 'seed'})")
+    tx.commit()
+    db.flush()
+    return s
+
+
+# ---------------------------------------------------------------------------
+# Basic lifecycle
+# ---------------------------------------------------------------------------
+
+
+def test_fork_basic_create_drop():
+    db = _make_db(disable_fork_sweeper=True)
+    primary = _seed_person_schema(db)
+
+    fork = primary.fork("scenario_1").build()
+    assert fork.is_forked()
+    assert not primary.is_forked()
+
+    info = db.fork_info("scenario_1")
+    assert info is not None
+    assert info.name == "scenario_1"
+    assert info.status == uni_db.ForkStatus.Active
+    assert info.parent_fork_id is None
+
+    # Drop with the fork session still alive should error.
+    with pytest.raises(uni_db.UniForkInUseError) as excinfo:
+        db.drop_fork("scenario_1")
+    assert excinfo.value.holder_count >= 1
+
+    # Release and retry.
+    del fork
+    db.drop_fork("scenario_1")
+    assert db.fork_info("scenario_1") is None
+
+
+def test_fork_isolation_from_primary():
+    db = _make_db(disable_fork_sweeper=True)
+    primary = _seed_person_schema(db)
+
+    fork = primary.fork("iso").build()
+    tx = fork.tx()
+    tx.execute("CREATE (:Person {name: 'fork-only'})")
+    tx.commit()
+
+    # Fork sees primary seed + its own write.
+    fork_rows = fork.query("MATCH (p:Person) RETURN p.name AS name")
+    fork_names = sorted(r["name"] for r in fork_rows)
+    assert fork_names == ["fork-only", "seed"]
+
+    # Primary unchanged.
+    primary_rows = primary.query("MATCH (p:Person) RETURN p.name AS name")
+    primary_names = sorted(r["name"] for r in primary_rows)
+    assert primary_names == ["seed"]
+
+    del fork
+    db.drop_fork("iso")
+
+
+def test_fork_open_or_create():
+    db = _make_db(disable_fork_sweeper=True)
+    primary = _seed_person_schema(db)
+
+    a = primary.fork("dup").build()
+    b = primary.fork("dup").build()  # open-or-create returns the same fork
+    assert a.is_forked() and b.is_forked()
+    del a
+    del b
+
+    # `.new_()` requires fresh creation.
+    primary.fork("uniq").new_().build()
+    with pytest.raises(uni_db.UniForkAlreadyExistsError):
+        primary.fork("uniq").new_().build()
+
+
+# ---------------------------------------------------------------------------
+# Nested forks
+# ---------------------------------------------------------------------------
+
+
+def test_nested_fork_chain():
+    db = _make_db(disable_fork_sweeper=True)
+    primary = _seed_person_schema(db)
+
+    a = primary.fork("a").build()
+    tx = a.tx()
+    tx.execute("CREATE (:Person {name: 'A-only'})")
+    tx.commit()
+
+    b = a.fork("b").build()
+    tx = b.tx()
+    tx.execute("CREATE (:Person {name: 'B-only'})")
+    tx.commit()
+
+    # B sees seed + A-only + B-only via Lance base_paths chain.
+    b_names = sorted(
+        r["name"] for r in b.query("MATCH (p:Person) RETURN p.name AS name")
+    )
+    assert b_names == ["A-only", "B-only", "seed"]
+
+    # A does NOT see B-only.
+    a_names = sorted(
+        r["name"] for r in a.query("MATCH (p:Person) RETURN p.name AS name")
+    )
+    assert "B-only" not in a_names
+
+    # parent_fork_id round-trips.
+    b_info = db.fork_info("b")
+    a_info = db.fork_info("a")
+    assert b_info.parent_fork_id == a_info.id
+
+    del a, b
+    db.drop_fork_cascade("a")
+
+
+def test_drop_fork_refuses_with_children():
+    import gc
+
+    db = _make_db(disable_fork_sweeper=True)
+    primary = _seed_person_schema(db)
+    a = primary.fork("a").build()
+    _b = a.fork("b").build()
+    del a, _b
+    # Force pyclass refcount drops to fire on slower runners (CI under
+    # pytest-xdist sometimes leaves the Py<T> wrappers reachable past
+    # `del` until the next GC pass).
+    gc.collect()
+
+    with pytest.raises(uni_db.UniForkHasChildrenError) as excinfo:
+        db.drop_fork("a")
+    assert "b" in excinfo.value.children
+
+    db.drop_fork_cascade("a")
+
+
+def test_cascade_subtree_in_use():
+    db = _make_db(disable_fork_sweeper=True)
+    primary = _seed_person_schema(db)
+    a = primary.fork("a").build()
+    b = a.fork("b").build()  # keep alive
+    del a
+
+    with pytest.raises(uni_db.UniForkSubtreeInUseError) as excinfo:
+        db.drop_fork_cascade("a")
+    blockers = excinfo.value.blockers
+    assert any("b" in entry for entry in blockers)
+
+    del b
+    db.drop_fork_cascade("a")
+
+
+# ---------------------------------------------------------------------------
+# TTL + sweeper
+# ---------------------------------------------------------------------------
+
+
+def test_fork_ttl_sweeper_drops_expired():
+    import gc
+    import time
+
+    db = _make_db(
+        disable_fork_sweeper=False,
+        fork_sweeper_interval=timedelta(milliseconds=100),
+    )
+    primary = _seed_person_schema(db)
+
+    fork = primary.fork("ephemeral").ttl(timedelta(milliseconds=200)).build()
+    del fork
+    # Force pyclass refcount drops so the underlying session releases
+    # and the sweeper can drop the fork.
+    gc.collect()
+
+    # Poll instead of relying on a fixed sleep so slower runners don't
+    # flake. TTL is 200ms; sweeper interval is 100ms; we wait up to
+    # 5s, polling every 100ms.
+    deadline = 5.0
+    elapsed = 0.0
+    poll_interval = 0.1
+    remaining = [f.name for f in db.list_forks()]
+    while "ephemeral" in remaining and elapsed < deadline:
+        time.sleep(poll_interval)
+        elapsed += poll_interval
+        remaining = [f.name for f in db.list_forks()]
+
+    assert "ephemeral" not in remaining, (
+        f"fork 'ephemeral' was not dropped by the TTL sweeper within {deadline}s "
+        f"(remaining = {remaining!r})"
+    )
+
+
+def test_fork_without_ttl_survives_sweeper():
+    db = _make_db(
+        disable_fork_sweeper=False,
+        fork_sweeper_interval=timedelta(milliseconds=100),
+    )
+    primary = _seed_person_schema(db)
+
+    fork = primary.fork("permanent").build()
+    del fork
+
+    import time
+
+    time.sleep(0.4)
+
+    remaining = [f.name for f in db.list_forks()]
+    assert "permanent" in remaining
+    db.drop_fork("permanent")
+
+
+# ---------------------------------------------------------------------------
+# Budget
+# ---------------------------------------------------------------------------
+
+
+def test_fork_budget_blocks_at_cap():
+    db = _make_db(disable_fork_sweeper=True, max_forks=2)
+    primary = _seed_person_schema(db)
+
+    _a = primary.fork("a").build()
+    _b = primary.fork("b").build()
+
+    with pytest.raises(uni_db.UniForkBudgetExceededError) as excinfo:
+        primary.fork("c").build()
+    assert excinfo.value.max == 2
+    assert excinfo.value.current == 2
+
+
+# ---------------------------------------------------------------------------
+# Tags
+# ---------------------------------------------------------------------------
+
+
+def test_fork_tag_roundtrip():
+    db = _make_db(disable_fork_sweeper=True)
+    primary = _seed_person_schema(db)
+
+    fork = primary.fork("audit").build()
+    tx = fork.tx()
+    tx.execute("CREATE (:Person {name: 'in-fork'})")
+    tx.commit()
+    fork.flush()
+    del fork
+
+    db.tag_fork("audit", "2026-q1")
+    tags = db.list_fork_tags("audit")
+    assert "2026-q1" in tags
+
+    db.untag_fork("audit", "2026-q1")
+    tags = db.list_fork_tags("audit")
+    assert "2026-q1" not in tags
+
+    # Idempotent on re-untag.
+    db.untag_fork("audit", "2026-q1")
+
+    db.drop_fork("audit")
+
+
+def test_tag_unknown_fork_raises_not_found():
+    db = _make_db(disable_fork_sweeper=True)
+    with pytest.raises(uni_db.UniForkNotFoundError):
+        db.tag_fork("missing", "v1")
+
+
+# ---------------------------------------------------------------------------
+# Schema
+# ---------------------------------------------------------------------------
+
+
+def test_fork_schema_label_strict():
+    cfg_db = _make_db(disable_fork_sweeper=True, strict_schema=True)
+    cfg_db.schema().label("Item").property("kind", "string").apply()
+    primary = cfg_db.session()
+    tx = primary.tx()
+    tx.execute("CREATE (:Item {kind: 'seed'})")
+    tx.commit()
+    cfg_db.flush()
+
+    forked = primary.fork("scenario").build()
+    forked.fork_schema().label("OnlyOnFork", description="fork-local").apply()
+
+    tx = forked.tx()
+    tx.execute("CREATE (:OnlyOnFork)")
+    tx.commit()
+
+    rows = forked.query("MATCH (n:OnlyOnFork) RETURN count(n) AS c")
+    assert rows[0]["c"] == 1
+
+    del forked
+    cfg_db.drop_fork("scenario")
+
+
+def test_fork_schema_on_primary_session_errors():
+    db = _make_db(disable_fork_sweeper=True)
+    db.schema().label("X").apply()
+    primary = db.session()
+    with pytest.raises(uni_db.UniInvalidArgumentError):
+        primary.fork_schema().label("Bad").apply()
+
+
+# ---------------------------------------------------------------------------
+# fork_info ergonomics
+# ---------------------------------------------------------------------------
+
+
+def test_fork_info_returns_none_for_missing():
+    db = _make_db(disable_fork_sweeper=True)
+    assert db.fork_info("does-not-exist") is None

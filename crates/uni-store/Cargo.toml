@@ -38,6 +38,7 @@ lance-index = { version = "3.0.1", optional = true }
 lance-linalg = { version = "3.0.1", optional = true }
 lancedb = { workspace = true, optional = true }
 dashmap = "6.0"
+arc-swap = { workspace = true }
 uni-xervo = { workspace = true }
 
 object_store = { workspace = true }

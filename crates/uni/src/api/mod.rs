@@ -1,16 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Dragonscale Team
 
+use dashmap::DashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
+use uni_common::core::fork::ForkId;
 
 pub mod appender;
 pub mod builder;
 pub mod bulk;
 pub mod compaction;
+pub mod fork;
+pub mod fork_diff;
+pub(crate) mod fork_index_builder;
+pub mod fork_schema;
+pub(crate) mod fork_sweeper;
 pub mod functions;
 pub mod hooks;
 pub mod impl_locy;
@@ -88,6 +95,28 @@ pub struct UniInner {
     pub(crate) total_commits: AtomicU64,
     /// Database-level registry of custom scalar functions.
     pub(crate) custom_functions: Arc<std::sync::RwLock<uni_query::CustomFunctionRegistry>>,
+    /// Fork registry — persists `catalog/fork_registry.json` and runs
+    /// the create/drop 2PC. Built once during `Uni::open` and shared
+    /// by the primary `UniInner` and every forked-session inner.
+    pub(crate) fork_registry: Arc<uni_store::fork::ForkRegistryHandle>,
+    /// Phase 2 Day 11 — number of `Transaction`s currently alive on
+    /// this `UniInner`. A transaction increments at construction and
+    /// decrements on `Drop` (whether committed, rolled back, or
+    /// silently dropped). `Uni::drop_fork` peeks this counter via the
+    /// `fork_inners` cache to surface uncommitted-tx state as a
+    /// typed `UniError::ForkInflightTx` instead of letting the drop
+    /// proceed and silently discard the work.
+    pub(crate) inflight_tx_count: Arc<AtomicUsize>,
+    /// Phase 2 Day 8 cache: same-fork-name `Session::fork(name)` calls
+    /// share the same `Arc<UniInner>` so sibling sessions on the same
+    /// fork see each other's commits without flushing through Lance
+    /// (which would otherwise be the only synchronization point at the
+    /// branch level). Held as `Weak` so the inner is reclaimed when
+    /// the last session drops; `ForkBuilder::build` rebuilds on the
+    /// next call. Initialized empty on the primary `UniInner`; each
+    /// forked inner clones the same `Arc<DashMap>` so siblings see
+    /// the registry from any direction.
+    pub(crate) fork_inners: Arc<DashMap<ForkId, Weak<UniInner>>>,
 
     // ── Cached metrics (updated on commit, read by sync `metrics()`) ─────
     /// Cached L0 mutation count (updated after every commit).
@@ -236,6 +265,121 @@ impl UniInner {
             total_queries: AtomicU64::new(0),
             total_commits: AtomicU64::new(0),
             custom_functions: self.custom_functions.clone(),
+            fork_registry: self.fork_registry.clone(),
+            fork_inners: self.fork_inners.clone(),
+            inflight_tx_count: Arc::new(AtomicUsize::new(0)),
+            cached_l0_mutation_count: AtomicUsize::new(0),
+            cached_l0_estimated_size: AtomicUsize::new(0),
+            cached_wal_lsn: AtomicU64::new(0),
+            _temp_dir: None,
+        })
+    }
+
+    /// Construct a fork-scoped clone of this `UniInner`.
+    ///
+    /// Mirror of [`Self::at_snapshot`] for forks: the returned inner
+    /// reads through the fork's Lance branches via `base_paths`, and
+    /// its schema is `primary_schema ⊕ overlay`. In Phase 1 the writer
+    /// is `None` — fork-scoped writes are gated at the API layer in
+    /// `Session::tx`. Phase 2 will populate `writer` once L0 routing
+    /// lands.
+    ///
+    /// The cancellation token, broadcast channel, and metrics are all
+    /// fresh per the spec §4.3–4.6 contract: a forked session has
+    /// per-fork notifications, hooks, params, and metrics. The Locy
+    /// rule registry is a deep clone of primary's so rule registration
+    /// on a forked session does not leak to primary.
+    pub(crate) async fn at_fork(&self, scope: Arc<uni_store::fork::ForkScope>) -> Result<UniInner> {
+        // Phase 3 (nested forks): `self` may itself be a fork-scoped
+        // UniInner, in which case `self.schema` already encodes
+        // `primary ⊕ parent_overlay`. Layering the child's overlay on
+        // top here gives `primary ⊕ parent_overlay ⊕ child_overlay`
+        // without any explicit chain walk — `with_overlay` clones the
+        // current manager's view into a fresh merged snapshot
+        // (`schema.rs:929-966`), so each level produces its own frozen
+        // snapshot at session-open time. Additions made on the parent
+        // *after* the child was created stay isolated from the child by
+        // construction, which matches the spec's fork-point snapshot
+        // isolation.
+        let merged_schema = self.schema.with_overlay(&scope.overlay());
+        let forked_storage = Arc::new(
+            self.storage
+                .at_fork_with_schema(scope.clone(), merged_schema.clone()),
+        );
+
+        let prop_manager = Arc::new(PropertyManager::new(
+            forked_storage.clone(),
+            merged_schema.clone(),
+            self.properties.cache_size(),
+        ));
+
+        let shutdown_handle = Arc::new(ShutdownHandle::new(Duration::from_secs(30)));
+        let (commit_tx, _) = tokio::sync::broadcast::channel(256);
+
+        // Deep-copy the rule registry so fork-local rule registrations
+        // do not bleed into primary. Mirrors today's `Session::clone`
+        // semantics for `rule_registry` (`session.rs:189`).
+        let rule_registry = {
+            let primary = self
+                .locy_rule_registry
+                .read()
+                .map_err(|e| UniError::Internal(anyhow::anyhow!("rule_registry poisoned: {e}")))?;
+            Arc::new(std::sync::RwLock::new(primary.clone()))
+        };
+
+        // Phase 2 Day 4: build a fork-scoped Writer so that
+        // `forked.tx().commit()` can land mutations on the fork's
+        // branches. The Writer uses a per-fork IdAllocator (Day 3),
+        // a per-fork WAL stream (Day 5), and the fork-scoped storage's
+        // BranchedBackend (Day 2). User writes are still gated at
+        // `Session::tx()` until Day 7.
+        let forked_writer = uni_store::fork::writer_factory::new_for_fork(
+            forked_storage.clone(),
+            merged_schema.clone(),
+            &scope.fork_id(),
+            self.config.clone(),
+        )
+        .await
+        .map_err(UniError::Internal)?;
+
+        // Phase 2 Day 6: replay any persisted WAL entries for this
+        // fork into the freshly-built L0. Without this, a process
+        // restart would silently drop committed-but-not-yet-flushed
+        // fork mutations. `replay_wal(0)` replays from the beginning;
+        // the WAL's own LSN tracking (initialized inside the writer
+        // factory) advances correctly past durable segments.
+        let replayed = forked_writer
+            .replay_wal(0)
+            .await
+            .map_err(UniError::Internal)?;
+        if replayed > 0 {
+            tracing::info!(
+                fork_id = %scope.fork_id(),
+                replayed,
+                "fork WAL replay restored persisted mutations into L0"
+            );
+        }
+
+        Ok(UniInner {
+            storage: forked_storage,
+            schema: merged_schema,
+            properties: prop_manager,
+            writer: Some(Arc::new(tokio::sync::RwLock::new(forked_writer))),
+            xervo_runtime: self.xervo_runtime.clone(),
+            config: self.config.clone(),
+            procedure_registry: self.procedure_registry.clone(),
+            shutdown_handle,
+            locy_rule_registry: rule_registry,
+            start_time: Instant::now(),
+            commit_tx,
+            write_lease: None,
+            active_session_count: AtomicUsize::new(0),
+            total_queries: AtomicU64::new(0),
+            total_commits: AtomicU64::new(0),
+            custom_functions: self.custom_functions.clone(),
+            fork_registry: self.fork_registry.clone(),
+            fork_inners: self.fork_inners.clone(),
+            inflight_tx_count: Arc::new(AtomicUsize::new(0)),
             cached_l0_mutation_count: AtomicUsize::new(0),
             cached_l0_estimated_size: AtomicUsize::new(0),
             cached_wal_lsn: AtomicU64::new(0),
@@ -313,6 +457,471 @@ impl Uni {
     /// ```
     pub fn session(&self) -> session::Session {
         session::Session::new(self.inner.clone())
+    }
+
+    /// List every active fork on this database.
+    ///
+    /// Returns metadata snapshots — see [`uni_common::core::fork::ForkInfo`].
+    /// Pending or Tombstoned entries are omitted; recovery resumes them
+    /// on the next [`Uni::open`].
+    pub async fn list_forks(&self) -> Vec<uni_common::core::fork::ForkInfo> {
+        self.inner.fork_registry.list_active().await
+    }
+
+    /// Look up a fork by name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UniError::ForkNotFound`] when no fork has this name.
+    pub async fn fork_info(&self, name: &str) -> Result<uni_common::core::fork::ForkInfo> {
+        self.inner.fork_registry.get(name).await
+    }
+
+    /// Drop a fork by name (Phase 1: read-only forks only).
+    ///
+    /// Runs the full drop 2PC: tombstone → delete branches → clear
+    /// registry → delete tombstone + schema overlay. Recovery resumes
+    /// from any in-progress state if the process dies mid-drop.
+    ///
+    /// # Errors
+    ///
+    /// - [`UniError::ForkNotFound`] when the name is unknown.
+    /// - [`UniError::ForkInUse`] when forked sessions are still live
+    ///   on this fork. Drop again after they're released.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use uni_db::Uni;
+    /// # async fn example() -> uni_db::Result<()> {
+    /// let db = Uni::in_memory().build().await?;
+    /// let session = db.session();
+    /// let forked = session.fork("ephemeral").await?;
+    /// drop(forked);
+    /// db.drop_fork("ephemeral").await?;
+    /// # db.shutdown().await
+    /// # }
+    /// ```
+    pub async fn drop_fork(&self, name: &str) -> Result<()> {
+        // Phase 2 Day 11: surface in-flight transactions before the
+        // registry transitions to Tombstoned. The `ForkInUse` check in
+        // `begin_drop` catches *session* holders; this catches the
+        // case where a session is alive AND has at least one alive
+        // `Transaction` on the fork's UniInner. We track this via an
+        // `inflight_tx_count` AtomicUsize that `Transaction::new`
+        // increments and `Transaction::drop` decrements unconditionally
+        // (so commit/rollback/silent-drop all converge to zero).
+        let preview = self.inner.fork_registry.get(name).await?;
+
+        // Phase 3: refuse to drop a parent that still has children.
+        // Callers should use `drop_fork_cascade` to remove the subtree.
+        let children = self.inner.fork_registry.list_children(preview.id).await;
+        if !children.is_empty() {
+            return Err(UniError::ForkHasChildren {
+                name: name.to_string(),
+                children: children.into_iter().map(|c| c.name).collect(),
+            });
+        }
+
+        if let Some(weak) = self
+            .inner
+            .fork_inners
+            .get(&preview.id)
+            .map(|e| e.value().clone())
+            && let Some(inner) = weak.upgrade()
+            && inner.inflight_tx_count.load(Ordering::Acquire) > 0
+        {
+            return Err(UniError::ForkInflightTx {
+                name: name.to_string(),
+            });
+        }
+        let info = self.inner.fork_registry.begin_drop(name).await?;
+        // Phase 2 Day 8: evict the cached `Weak<UniInner>` (if any)
+        // before deleting branches. The registry has already
+        // transitioned the fork to Tombstoned, so concurrent
+        // `fork(name)` calls now error out before reaching the cache;
+        // this eviction is purely cleanup so the map doesn't accumulate
+        // dead Weak entries across the lifetime of the database.
+        self.inner.fork_inners.remove(&info.id);
+        // Step 3: walk branches and force-delete each.
+        let storage_uri = self.inner.storage.base_uri().to_string();
+        for (dataset, branch) in &info.datasets {
+            let dataset_uri = if storage_uri.ends_with('/') {
+                format!("{storage_uri}{dataset}.lance")
+            } else {
+                format!("{storage_uri}/{dataset}.lance")
+            };
+            if let Err(e) =
+                uni_store::backend::lance_branch::delete_branch(&dataset_uri, branch).await
+            {
+                tracing::warn!(
+                    dataset = %dataset,
+                    branch = %branch,
+                    "delete_branch during drop_fork failed: {e}"
+                );
+            }
+        }
+        // Step 4 + 5: clear the registry entry, delete tombstone +
+        // schema overlay files.
+        self.inner.fork_registry.finish_drop(&info).await?;
+        Ok(())
+    }
+
+    /// Drop a fork and every descendant in its subtree (Phase 3).
+    ///
+    /// Pre-validates the entire subtree before tombstoning anything:
+    /// every node must pass the same `ForkInUse` + `ForkInflightTx`
+    /// checks `drop_fork` applies for a single node. On any blocker
+    /// the call errors with [`UniError::ForkSubtreeInUse`] and no
+    /// branch is deleted. Once validation passes, the cascade drops
+    /// each node deepest-first via the single-fork `drop_fork` path,
+    /// so a crash mid-cascade resumes cleanly through existing
+    /// tombstone recovery.
+    ///
+    /// # Errors
+    ///
+    /// - [`UniError::ForkNotFound`] if `name` is unknown.
+    /// - [`UniError::ForkSubtreeInUse`] if any node in the subtree has
+    ///   live sessions or open transactions.
+    pub async fn drop_fork_cascade(&self, name: &str) -> Result<()> {
+        // 1. Resolve the root and walk descendants depth-first.
+        let root = self.inner.fork_registry.get(name).await?;
+        let mut order: Vec<uni_common::core::fork::ForkInfo> = Vec::new();
+        let mut stack = vec![root.clone()];
+        while let Some(node) = stack.pop() {
+            let kids = self.inner.fork_registry.list_children(node.id).await;
+            for k in &kids {
+                stack.push(k.clone());
+            }
+            order.push(node);
+        }
+        // `order` is roots-first by construction. Reversing it yields
+        // deepest-first, which is the order we drop in.
+        order.reverse();
+
+        // 2. Pre-validate every node. Aggregate blockers; refuse before
+        // tombstoning if any node is held or has in-flight tx.
+        let mut blockers: Vec<String> = Vec::new();
+        for node in &order {
+            if let Some(weak) = self
+                .inner
+                .fork_inners
+                .get(&node.id)
+                .map(|e| e.value().clone())
+                && let Some(inner) = weak.upgrade()
+                && inner.inflight_tx_count.load(Ordering::Acquire) > 0
+            {
+                blockers.push(format!("{}: in-flight tx", node.name));
+                continue;
+            }
+            let holders = self.inner.fork_registry.holder_count_for(node.id).await;
+            if holders > 0 {
+                blockers.push(format!("{}: {} live session(s)", node.name, holders));
+            }
+        }
+        if !blockers.is_empty() {
+            return Err(UniError::ForkSubtreeInUse { blockers });
+        }
+
+        // 3. Drop deepest-first using the single-fork path. Each call
+        // re-checks holders/inflight inside `drop_fork`, which is
+        // belt-and-braces against a session opening between validation
+        // and drop; that race surfaces as a normal ForkInUse error.
+        for node in order {
+            self.drop_fork(&node.name).await?;
+        }
+        Ok(())
+    }
+
+    /// Structural diff between two forks.
+    ///
+    /// Returns the delta that would turn `a` into `b`: `added` rows
+    /// are present in `b` only, `deleted` in `a` only. Identity is
+    /// content-addressed UID (Phase 6b) for vertices and an
+    /// edge-content UID (Phase 7d) for edges, so the diff is correct
+    /// even between two unrelated forks that happen to have rolled
+    /// the same VIDs.
+    ///
+    /// `diff(a, b).invert() == diff(b, a)` by construction — see
+    /// [`fork_diff::ForkDiff::invert`].
+    ///
+    /// # Errors
+    ///
+    /// - [`UniError::ForkNotFound`] when either name is unknown.
+    /// - Any error from opening a fork session on either side.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use uni_db::{DataType, Uni};
+    /// # async fn example() -> uni_db::Result<()> {
+    /// let db = Uni::in_memory().build().await?;
+    /// db.schema().label("Person").property("name", DataType::String).apply().await?;
+    /// let primary = db.session();
+    /// {
+    ///     let a = primary.fork("scenario_a").await?;
+    ///     let tx = a.tx().await?;
+    ///     tx.execute("CREATE (:Person {name: 'A-only'})").await?;
+    ///     tx.commit().await?;
+    /// }
+    /// {
+    ///     let b = primary.fork("scenario_b").await?;
+    ///     let tx = b.tx().await?;
+    ///     tx.execute("CREATE (:Person {name: 'B-only'})").await?;
+    ///     tx.commit().await?;
+    /// }
+    /// let diff = db.diff_forks("scenario_a", "scenario_b").await?;
+    /// assert_eq!(diff.vertices.added.len(), 1);   // B-only
+    /// assert_eq!(diff.vertices.deleted.len(), 1); // A-only
+    /// # db.shutdown().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn diff_forks(&self, a: &str, b: &str) -> Result<fork_diff::ForkDiff> {
+        let primary = self.session();
+        let sess_a = primary.fork(a).await?;
+        let sess_b = primary.fork(b).await?;
+        fork_diff::compute_diff(&sess_a, &sess_b).await
+    }
+
+    /// Structural diff between a fork and primary.
+    ///
+    /// Equivalent to `diff(primary, fork)`: rows the fork has added
+    /// since the fork point appear in `added`; rows it has dropped
+    /// appear in `deleted`. Identity is content-addressed UID
+    /// (vertices) / edge-content UID (edges), so unrelated forks
+    /// pair correctly. See [`fork_diff::ForkDiff`] for the data
+    /// model.
+    ///
+    /// # Errors
+    ///
+    /// - [`UniError::ForkNotFound`] when the fork name is unknown.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use uni_db::{DataType, Uni};
+    /// # async fn example() -> uni_db::Result<()> {
+    /// let db = Uni::in_memory().build().await?;
+    /// db.schema().label("Person").property("name", DataType::String).apply().await?;
+    /// let primary = db.session();
+    /// {
+    ///     let fork = primary.fork("audit").await?;
+    ///     let tx = fork.tx().await?;
+    ///     tx.execute("CREATE (:Person {name: 'Bob'})").await?;
+    ///     tx.commit().await?;
+    /// }
+    /// let diff = db.diff_fork_primary("audit").await?;
+    /// assert_eq!(diff.vertices.added.len(), 1); // Bob
+    /// # db.shutdown().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn diff_fork_primary(&self, fork_name: &str) -> Result<fork_diff::ForkDiff> {
+        let primary = self.session();
+        let sess_fork = primary.fork(fork_name).await?;
+        fork_diff::compute_diff(&primary, &sess_fork).await
+    }
+
+    /// Promote matched fork rows onto primary.
+    ///
+    /// For each [`fork_diff::PromotePattern`] in `patterns`:
+    ///
+    /// - **`PromotePattern::Vertex`** — scan the fork for vertices
+    ///   with the given label, compute a content-derived UID for
+    ///   each match, skip rows that already exist on primary by UID,
+    ///   bulk-insert the rest.
+    /// - **`PromotePattern::Edge`** — scan the fork for edges of the
+    ///   given type, resolve endpoint UIDs against primary, skip
+    ///   rows whose endpoints aren't on primary (counted in
+    ///   [`fork_diff::PromoteReport::edges_skipped_no_endpoint`]),
+    ///   dedup against existing parallel edges by content UID
+    ///   (Phase 7d multi-edge identity), and bulk-insert the rest.
+    ///
+    /// All inserts run inside one primary-targeted transaction that
+    /// commits on success. Mixing vertex and edge patterns in one
+    /// call is supported — endpoints inserted by an earlier vertex
+    /// pattern are visible to a subsequent edge pattern via an
+    /// in-memory cache.
+    ///
+    /// # Errors
+    ///
+    /// - [`UniError::ForkNotFound`] when the fork name is unknown.
+    /// - [`UniError::LabelNotFound`] when a vertex pattern targets a
+    ///   label that does not exist on primary.
+    /// - [`UniError::EdgeTypeNotFound`] when an edge pattern targets
+    ///   an edge type that does not exist on primary.
+    /// - Any error from the primary write path.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use uni_db::{DataType, PromotePattern, Uni};
+    /// # async fn example() -> uni_db::Result<()> {
+    /// let db = Uni::in_memory().build().await?;
+    /// db.schema().label("Person").property("name", DataType::String).apply().await?;
+    /// let primary = db.session();
+    /// {
+    ///     let fork = primary.fork("publish").await?;
+    ///     let tx = fork.tx().await?;
+    ///     tx.execute("CREATE (:Person {name: 'NewKid'})").await?;
+    ///     tx.commit().await?;
+    /// }
+    /// let report = db.promote_from_fork(
+    ///     "publish",
+    ///     &[PromotePattern::label("Person")],
+    /// ).await?;
+    /// assert!(report.vertices_inserted >= 1);
+    /// # db.shutdown().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn promote_from_fork(
+        &self,
+        fork_name: &str,
+        patterns: &[fork_diff::PromotePattern],
+    ) -> Result<fork_diff::PromoteReport> {
+        let primary = self.session();
+        let fork = primary.fork(fork_name).await?;
+        // Persist any pending tx commits on the fork to Lance so the
+        // promote engine's reads see them. Without this, edges
+        // committed via a now-dropped fork session may not be visible
+        // to the fresh fork session we just opened.
+        fork.flush().await?;
+        // Ensure every pattern's target (label or edge type) exists on
+        // primary; surfacing a clear error is preferable to letting
+        // bulk_insert_* fail mid-flight.
+        let primary_schema = self.inner.schema.schema();
+        for pat in patterns {
+            match pat {
+                fork_diff::PromotePattern::Vertex { label, .. } => {
+                    if !primary_schema.labels.contains_key(label) {
+                        return Err(UniError::LabelNotFound {
+                            label: label.clone(),
+                        });
+                    }
+                }
+                fork_diff::PromotePattern::Edge { edge_type, .. } => {
+                    if !primary_schema.edge_types.contains_key(edge_type) {
+                        return Err(UniError::EdgeTypeNotFound {
+                            edge_type: edge_type.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        let primary_tx = primary.tx().await?;
+        let report = fork_diff::run_promote(&fork, &primary, &primary_tx, patterns).await?;
+        primary_tx.commit().await?;
+        Ok(report)
+    }
+
+    /// Tag a fork with a Lance tag (Phase 4a).
+    ///
+    /// Creates one tag per dataset the fork has branched, named
+    /// `fork_{tag}_{dataset}`. Lance tags are GC-exempt — the tagged
+    /// versions survive compaction's retention sweep — so a tagged
+    /// fork's state is preserved on disk even after the fork itself
+    /// is dropped (cascade or otherwise). Useful for audit hold,
+    /// regulatory snapshots, or named pre-publish checkpoints.
+    ///
+    /// The tag pins the branch's *current* version: subsequent fork
+    /// writes do not "follow" the tag.
+    ///
+    /// # Errors
+    ///
+    /// - [`UniError::ForkNotFound`] if the fork is unknown.
+    /// - [`UniError::ForkLifecycle`] (stage = `tag`) on Lance failures
+    ///   (tag-name conflict, IO).
+    pub async fn tag_fork(&self, fork_name: &str, tag: &str) -> Result<()> {
+        let info = self.inner.fork_registry.get(fork_name).await?;
+        let storage_uri = self.inner.storage.base_uri().to_string();
+        for (dataset, branch) in &info.datasets {
+            let dataset_uri = if storage_uri.ends_with('/') {
+                format!("{storage_uri}{dataset}.lance")
+            } else {
+                format!("{storage_uri}/{dataset}.lance")
+            };
+            let lance_tag = format!("fork_{tag}_{dataset}");
+            uni_store::backend::lance_branch::create_tag(&dataset_uri, &lance_tag, branch)
+                .await
+                .map_err(|e| UniError::ForkLifecycle {
+                    name: fork_name.to_string(),
+                    stage: "tag",
+                    source: e.into(),
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Remove a tag previously applied via [`Self::tag_fork`] (Phase 4a).
+    /// Idempotent per dataset — missing tags are treated as success so
+    /// partial cleanup retries are safe.
+    ///
+    /// # Errors
+    ///
+    /// - [`UniError::ForkNotFound`] if the fork is unknown.
+    /// - [`UniError::ForkLifecycle`] (stage = `untag`) on Lance failures.
+    pub async fn untag_fork(&self, fork_name: &str, tag: &str) -> Result<()> {
+        let info = self.inner.fork_registry.get(fork_name).await?;
+        let storage_uri = self.inner.storage.base_uri().to_string();
+        for dataset in info.datasets.keys() {
+            let dataset_uri = if storage_uri.ends_with('/') {
+                format!("{storage_uri}{dataset}.lance")
+            } else {
+                format!("{storage_uri}/{dataset}.lance")
+            };
+            let lance_tag = format!("fork_{tag}_{dataset}");
+            uni_store::backend::lance_branch::delete_tag(&dataset_uri, &lance_tag)
+                .await
+                .map_err(|e| UniError::ForkLifecycle {
+                    name: fork_name.to_string(),
+                    stage: "untag",
+                    source: e.into(),
+                })?;
+        }
+        Ok(())
+    }
+
+    /// List the unique tag names applied to this fork (Phase 4a).
+    ///
+    /// A fork's tag is stored as one Lance tag per dataset under the
+    /// namespace `fork_{tag}_{dataset}`. This method enumerates the
+    /// distinct `tag` values present on at least one of the fork's
+    /// branched datasets.
+    ///
+    /// # Errors
+    ///
+    /// - [`UniError::ForkNotFound`] if the fork is unknown.
+    /// - [`UniError::ForkLifecycle`] (stage = `list_tags`) on Lance failures.
+    pub async fn list_fork_tags(&self, fork_name: &str) -> Result<Vec<String>> {
+        let info = self.inner.fork_registry.get(fork_name).await?;
+        let storage_uri = self.inner.storage.base_uri().to_string();
+        let mut tags: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for dataset in info.datasets.keys() {
+            let dataset_uri = if storage_uri.ends_with('/') {
+                format!("{storage_uri}{dataset}.lance")
+            } else {
+                format!("{storage_uri}/{dataset}.lance")
+            };
+            let suffix = format!("_{dataset}");
+            let prefix = "fork_";
+            let on_disk = uni_store::backend::lance_branch::list_tags(&dataset_uri)
+                .await
+                .map_err(|e| UniError::ForkLifecycle {
+                    name: fork_name.to_string(),
+                    stage: "list_tags",
+                    source: e.into(),
+                })?;
+            for (name, _) in on_disk {
+                if let Some(rest) = name.strip_prefix(prefix)
+                    && let Some(tag) = rest.strip_suffix(&suffix)
+                {
+                    tags.insert(tag.to_string());
+                }
+            }
+        }
+        Ok(tags.into_iter().collect())
     }
 
     /// Create a session template builder for pre-configured session factories.
@@ -1437,7 +2046,46 @@ impl UniBuilder {
         let (commit_tx, _) = tokio::sync::broadcast::channel(256);
         let writer_field = if self.read_only { None } else { Some(writer) };
 
-        Ok(Uni {
+        // Build the fork registry from the metadata store (the same
+        // store the snapshot manager uses), then run recovery before
+        // any session is exposed. Recovery resumes any partial fork
+        // create or drop left behind by an earlier crash.
+        let fork_registry = Arc::new(
+            uni_store::fork::ForkRegistryHandle::load(data_store.clone())
+                .await
+                .map_err(|e| match e {
+                    UniError::Internal(inner) => UniError::Internal(inner),
+                    other => UniError::Internal(anyhow::anyhow!(other.to_string())),
+                })?,
+        );
+        // Phase 4a: apply the configured fork budget cap.
+        fork_registry.set_max_forks(self.config.max_forks).await;
+        let storage_uri_for_recovery = storage_uri.clone();
+        let recovered = uni_store::fork::recovery::recover_forks(
+            &fork_registry,
+            uni_store::fork::recovery::join_uri_with(storage_uri_for_recovery),
+        )
+        .await
+        .map_err(|e| match e {
+            UniError::Internal(inner) => UniError::Internal(inner),
+            other => UniError::Internal(anyhow::anyhow!(other.to_string())),
+        })?;
+        if recovered > 0 {
+            tracing::info!(reconciled = recovered, "fork registry recovery completed");
+        }
+
+        // Phase 4a: capture sweeper config + a shutdown subscription
+        // before the config is consumed into UniInner.
+        let sweeper_interval = self.config.fork_sweeper_interval;
+        let sweeper_disabled = self.config.disable_fork_sweeper;
+        let sweeper_shutdown_rx = shutdown_handle.subscribe();
+        // Phase 5a-impl Step 7: same for the fork index builder.
+        let index_builder_interval = self.config.fork_index_builder_interval;
+        let index_builder_threshold = self.config.fork_index_build_threshold;
+        let index_builder_disabled = self.config.disable_fork_index_builder;
+        let index_builder_shutdown_rx = shutdown_handle.subscribe();
+
+        let db = Uni {
             inner: Arc::new(UniInner {
                 storage,
                 schema: schema_manager,
@@ -1459,12 +2107,39 @@ impl UniBuilder {
                 custom_functions: Arc::new(std::sync::RwLock::new(
                     uni_query::CustomFunctionRegistry::new(),
                 )),
+                fork_registry,
+                fork_inners: Arc::new(DashMap::new()),
+                inflight_tx_count: Arc::new(AtomicUsize::new(0)),
                 cached_l0_mutation_count: AtomicUsize::new(0),
                 cached_l0_estimated_size: AtomicUsize::new(0),
                 cached_wal_lsn: AtomicU64::new(0),
                 _temp_dir: self.temp_dir,
             }),
-        })
+        };
+
+        // Phase 4a: spawn the TTL sweeper (no-op when disabled).
+        if let Some(handle) = fork_sweeper::spawn(
+            db.inner.clone(),
+            sweeper_interval,
+            sweeper_disabled,
+            sweeper_shutdown_rx,
+        ) {
+            db.inner.shutdown_handle.track_task(handle);
+        }
+
+        // Phase 5a-impl Step 7: spawn the fork index builder (no-op
+        // when disabled).
+        if let Some(handle) = fork_index_builder::spawn(
+            db.inner.clone(),
+            index_builder_interval,
+            index_builder_threshold,
+            index_builder_disabled,
+            index_builder_shutdown_rx,
+        ) {
+            db.inner.shutdown_handle.track_task(handle);
+        }
+
+        Ok(db)
     }
 
     /// Open the database (blocking)
@@ -1545,5 +2220,63 @@ impl UniBuilder {
         }
 
         opts
+    }
+}
+
+#[cfg(test)]
+mod fork_inner_tests {
+    use super::*;
+    use uni_common::core::fork::{ForkId, ForkInfo, SchemaDelta};
+    use uni_store::fork::{ForkRegistryHandle, ForkScope};
+
+    /// Smoke test for `UniInner::at_fork`: a fork-scoped inner reads
+    /// through the fork's branches and writes through it are gated.
+    /// Phase 1 wiring; Day 7's `Session::fork` will exercise it via
+    /// the public API end-to-end.
+    #[tokio::test]
+    async fn at_fork_returns_inner_with_fork_scoped_storage() {
+        let db = Uni::in_memory().build().await.unwrap();
+        let primary_inner = db.inner.as_ref();
+
+        // Build a registry on a fresh local store. We don't share the
+        // primary's object store here — Phase 1's at_fork is a
+        // structural test of UniInner construction; the registry only
+        // needs to provide an Active ForkInfo to wrap into a ForkScope.
+        let dir = tempfile::TempDir::new().unwrap();
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::local::LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+        let registry = Arc::new(ForkRegistryHandle::load(store).await.unwrap());
+
+        let info = ForkInfo::new_pending(ForkId::new(), "smoke", "snap-1", 1);
+        registry.begin_create(info).await.unwrap();
+        let active = registry
+            .finish_create("smoke", Default::default())
+            .await
+            .unwrap();
+
+        let scope = Arc::new(ForkScope::new(
+            Arc::new(active),
+            SchemaDelta::empty(),
+            registry,
+        ));
+
+        let forked_inner = primary_inner.at_fork(scope.clone()).await.unwrap();
+        assert!(forked_inner.storage.fork_scope().is_some());
+        // Phase 2 Day 4: a forked UniInner now carries its own Writer.
+        // The Writer's storage is the fork-scoped clone; its allocator
+        // is fork-local.
+        let writer_arc = forked_inner
+            .writer
+            .as_ref()
+            .expect("Phase 2 fork must carry its own Writer");
+        let writer = writer_arc.read().await;
+        assert!(
+            std::sync::Arc::ptr_eq(&writer.storage, &forked_inner.storage),
+            "fork Writer's storage should be the fork-scoped storage"
+        );
+        // Schema is a *fresh* Arc (overlay-merged), not pointer-equal to primary's.
+        assert!(!Arc::ptr_eq(&forked_inner.schema, &primary_inner.schema));
+
+        db.shutdown().await.unwrap();
     }
 }

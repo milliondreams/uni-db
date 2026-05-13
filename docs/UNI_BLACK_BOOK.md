@@ -21,6 +21,7 @@
 - [Part XIII: Auto-Compaction](#part-xiii-auto-compaction)
 - [Part XIV: Python Bindings](#part-xiv-python-bindings)
 - [Part XV: Configuration Reference](#part-xv-configuration-reference)
+- [Part XVI: Forks](#part-xvi-forks)
 - [Appendices](#appendices)
 
 ---
@@ -4694,6 +4695,264 @@ let db = Uni::open("./local-wal")
     .build()
     .await?;
 ```
+
+---
+
+# Part XVI: Forks
+
+Forks are **named, durable, isolated branches** of the graph. Where a snapshot is a read-only point-in-time view (Part XII), a fork is a *named*, *durable*, *writable* parallel timeline. A session that holds a fork sees its own version of the database — committed mutations land on the fork's Lance branches without touching primary; new labels and edge types can live fork-locally; the fork survives process restarts.
+
+## Why Forks Exist
+
+Forks unlock four broad use-cases the existing snapshot mechanism cannot cover, because snapshots are read-only:
+
+- **What-if analysis.** Materialize a counterfactual ("what if this loan defaults? what if this supplier fails?") in a writable sandbox that can be queried with the full Cypher/Locy surface and inspected after the fact.
+- **Write–audit–publish workflows.** Stage a bulk write into a fork, run validation queries and Locy rules against it, then either drop the fork (reject) or — in a future phase — promote it to primary (accept).
+- **Scenario exploration.** Run regulatory or compliance simulations on isolated copies of production data without coordinating maintenance windows.
+- **Long-lived sandboxes.** A pinned snapshot expires when its retention window passes; a fork persists until explicitly dropped, with its own session lifecycle.
+
+Phase 1 shipped read-only forks. Phase 2 made forks writable. Phase 3 enabled nested forks (`forked.fork(name)`). Phase 4 added TTL, tags, watch filtering, hooks/params propagation, and the full Python binding surface. Phase 5 landed fork-local index fusion (lossless types in 5a, vector + FTS in 5b). Phase 6 / 6b shipped structural diff and write-audit-publish promote with content-addressed UID identity. Phase 7 closed out the user-facing surface — Python bindings for diff/promote, end-to-end use-case suite, schema-evolution × forks test, and the Fork* error-variant audit.
+
+## Anatomy of a Fork
+
+A fork's on-disk presence spans several artifacts:
+
+- **Lance branch tree.** Each fork has one Lance branch per Lance dataset it owns. The branches sit under `<dataset>.lance/_refs/branches/{branch_name}.json` and chain to their parent via Lance's `base_paths`. A primary-rooted fork's branches chain to `main`; a nested fork's branches chain to *the parent fork's branch* (see "Fork Trees and Read Resolution" below).
+- **Per-fork allocator** at `catalog/forks/{fork_id}/id_allocator.json`. Bootstrapped from primary's VID/EID high-water-mark at fork creation so the fork's ID streams don't collide with primary's pre-existing rows that the fork reads through `base_paths`.
+- **Per-fork WAL stream** at `wal_forks/{fork_id}/`. Each commit on the fork appends WAL entries here; replay runs at `at_fork` time on session open. The flat `wal_forks/` prefix (not `wal/forks/`) avoids collision with primary's WAL listing under recursive `ObjectStore::list`.
+- **Per-fork schema overlay** at `catalog/fork_schemas/{fork_id}.json`. A `SchemaDelta` storing added labels, added edge types, and added properties; merged onto primary's schema at session open time to produce the fork's merged `SchemaManager`. Empty by default; populated through `Session::fork_schema()` under strict-schema mode (or implicitly through `BranchedBackend` dynamic-branch materialization under schemaless mode).
+- **Registry entry** in `catalog/fork_registry.json`. A `BTreeMap<String, ForkInfo>` keyed by name, holding `(id, name, parent_fork_id, parent_snapshot_id, schema_version_at_creation, datasets: BTreeMap<dataset → branch>, status, ttl_expires_at)`.
+- **Tombstone files** at `catalog/fork_tombstones/{fork_id}.json` during drop. Written before branches are deleted; the recovery driver finishes any tombstoned fork on next open.
+
+## The 2PC Lifecycle
+
+Both create and drop run as durable two-phase commits so a crash anywhere in the middle resolves to a consistent state on the next process boot.
+
+**Create (4 steps).**
+
+1. Capture parent state: snapshot id at fork-point, schema version at fork-point. Per-fork `IdAllocator` is bootstrapped from primary's HWM.
+2. `ForkRegistryHandle::begin_create(info)` writes the entry to `catalog/fork_registry.json` with `status: Pending`.
+3. For every Lance dataset that exists on disk at fork-point — `vertices`, `edges`, every `vertices_{label}`, every `deltas_{type}_{fwd,bwd}` and `adjacency_{type}_{fwd,bwd}` — call `lance_branch::create_branch(uri, fork_branch_name, parent_v)`. For nested forks, route through `create_branch_from` against the parent fork's branch (see below).
+4. `ForkRegistryHandle::finish_create(name, datasets)` flips status to `Active` and persists the dataset→branch map.
+
+If step 3 fails part-way, the registry entry stays in `Pending` and a best-effort `rollback_create` runs. On next process boot, `recover_forks` (`crates/uni-store/src/fork/recovery.rs`) walks all `Pending` entries and rolls them back idempotently.
+
+**Drop (5 steps).**
+
+1. Refuse if `holder_count > 0` (live forked sessions), `inflight_tx_count > 0` (open transactions), or `list_children(id)` is non-empty (Phase 3 nested-fork guard; surfaces `ForkHasChildren`).
+2. `ForkRegistryHandle::begin_drop(name)` writes `catalog/fork_tombstones/{id}.json` and flips the registry entry to `Tombstoned`.
+3. Walk the dataset→branch map and call `lance_branch::delete_branch(uri, branch)` for each. Delete errors are logged-and-swallowed — the registry transition is what's load-bearing; recovery handles any residue.
+4. `ForkRegistryHandle::finish_drop(&info)` removes the registry entry, deletes the tombstone, deletes the schema overlay.
+5. If a crash occurs between steps 2 and 4, `recover_forks` walks all `Tombstoned` entries on next open and finishes the drop.
+
+The recovery driver is idempotent — running it twice is a no-op the second time. Tests at `crates/uni-store/tests/recovery_fork_create_fault.rs` and `crates/uni/tests/fork_nested_recovery.rs` exercise both crash windows.
+
+## Reads and Writes
+
+Reads on a forked session route through `BranchedBackend`, a decorator over `StorageBackend` that:
+
+- Looks up the fork's branch for the target dataset via `ForkScope::branch_for(name)`. The scope merges the immutable `ForkInfo.datasets` map (eagerly-branched at fork-point) with `ForkScope.dynamic_branches` (added on-the-fly when a flush hits a dataset without a fork-point branch).
+- Issues the Lance scan against that branch. Lance resolves `base_paths` transparently — `child_branch → main` for a primary-rooted fork, `child_branch → parent_branch → main` for nested forks, and so on at arbitrary depth.
+- Falls back to primary's scan when no branch exists (e.g. a label that hasn't been touched on the fork).
+
+Writes go through the same backend. For a brand-new dataset (fork-only label, or a label that had no pre-fork rows on primary), `BranchedBackend::ensure_branch_for_new` materializes an *empty parent commit* on main first, branches from it, then writes the real batches to the branch. The empty parent on main is critical: writing the actual batches to main would leak the fork's data into primary's view of the dataset.
+
+The `BranchedBackend` decorator does not stack across nesting levels. A nested child's UniInner contains a single `BranchedBackend` whose scope is the child's; the chain to ancestors lives in the Lance dataset's `base_paths`, not in additional decorator layers.
+
+## Fork Trees and Read Resolution (Phase 3)
+
+`Session::fork(name)` always parents the new fork on the *receiver* session — there is no API to override the parent. A primary session creates a child of primary; a forked session creates a nested child of that fork. The parent linkage is recorded in `ForkInfo.parent_fork_id: Option<ForkId>` (None ⇒ parent is primary).
+
+**Branch lineage in Lance.** At fork-creation time, `build_datasets_for_fork` consults the parent's `ForkScope.branch_for(dataset)` for every candidate dataset. If the parent has a branch, the child branches off it via `create_branch_from(uri, child_branch, parent_branch, parent_version)`. If the parent doesn't have a branch (e.g. a dataset the parent never wrote to), the child either skips branching at create-time (for nested-but-unbranched datasets — the parent's state for that dataset is empty by definition, so branching off main is semantically identical) or falls through to `BranchedBackend::ensure_branch_for_new` on its first write. Lance handles arbitrary-depth chains transparently — the cost is one extra commit lookup per level, which the Phase 3 perf-sanity test (`crates/uni/tests/fork_nested_perf.rs`) asserts stays within 5× the depth-1 baseline.
+
+**Auto-flush on nested create.** Inside `create_fork_2pc`, when the parent is itself a forked session, the parent's L0 buffer is flushed to its Lance branches *before* reading the parent branch's current version. Without this, the child would branch off a stale Lance tip and never see the parent's committed-but-unflushed writes through the chain. Primary-rooted forks rely on the user calling `db.flush()` explicitly, by long-standing convention; for nested forks the convention is automated because there is no symmetric caller-friendly knob.
+
+**Snapshot isolation per level.** A descendant sees its ancestor's state *as of the descendant's creation time*. Writes on an ancestor after the descendant was created are invisible to that descendant. Sibling forks under the same parent are mutually isolated by construction — each carries its own branch from the parent's tip. Phase 3 integration tests (`crates/uni/tests/fork_nested.rs`) cover all three isolation contracts.
+
+**Schema composition.** A nested child's effective schema is `primary ⊕ parent_overlay ⊕ child_overlay`. Composition is implicit through chained `SchemaManager::with_overlay`: each `at_fork` call clones the current manager (which for a nested child *is* the parent's already-merged manager) and merges its own overlay on top. The result is one frozen merged snapshot per level, computed at session open time only. Additions made to the parent's overlay after the child was created stay isolated from the child, matching the same fork-point snapshot semantics that apply to data.
+
+## Lifecycle Admin
+
+`Uni::list_forks()` returns all `Active` entries; `Uni::fork_info(name)` looks up one by name; both are cheap reads against the in-memory cache.
+
+`Uni::drop_fork(name)` runs the single-fork 5-step drop and surfaces typed errors for every refusal:
+- `ForkInUse { name, holder_count }` — forked sessions are still alive.
+- `ForkInflightTx { name }` — a `Transaction` is open on the fork's UniInner.
+- `ForkHasChildren { name, children }` — Phase 3 guard; refuses to orphan descendants.
+
+`Uni::drop_fork_cascade(name)` removes a fork and every descendant. It walks the subtree depth-first via `ForkRegistryHandle::list_children`, then pre-validates every node in one pass — every node must satisfy the `ForkInUse` and `ForkInflightTx` checks. Any blocker surfaces an aggregate `ForkSubtreeInUse { blockers: Vec<String> }` *before* tombstoning anything, so a partial cascade never leaves orphans. On a clean pre-validation pass, the cascade drops deepest-first via the single-fork `drop_fork` path; a crash mid-cascade resumes through existing tombstone recovery on the next process boot.
+
+`Session::flush()` (Phase 3) flushes the session's writer to L1. On a forked session this flushes the fork's L0 to its Lance branches — equivalent to `Uni::flush()` on a primary session. Most users won't call this directly because nested-fork creation already auto-flushes the parent.
+
+`Session::fork_schema()` returns a builder for fork-local schema additions. Required under `UniConfig { strict_schema: true }` to introduce fork-only labels and edge types. Entries land in the fork's in-memory `SchemaManager` and in the persisted overlay file (`catalog/fork_schemas/{fork_id}.json`); primary's `catalog/schema.json` is never touched.
+
+## Lifecycle & Admin (Phase 4a)
+
+Phase 4a bolts a small operational layer onto the substrate so forks can be used safely in long-running deployments without manual reaping or unbounded growth.
+
+**TTL state machine.** A fork's `ttl_expires_at` is set at create time from `ForkBuilder::ttl(Duration)` (override) or `UniConfig::fork_default_ttl` (fallback). The background sweeper task spawned in `Uni::open` polls `ForkRegistryHandle::list_expired(now)` every `UniConfig::fork_sweeper_interval` (default 60s) and drives `Uni::drop_fork_cascade(name)` for each expired fork. Errors are logged-and-continued — the next tick retries. `UniConfig::disable_fork_sweeper = true` opts out entirely; tests that race against TTL must set this so deterministic timing is possible. The sweeper holds a `Weak<UniInner>`, so it never extends database lifetime; it uses `MissedTickBehavior::Skip` so a slow cascade doesn't trigger a thundering catch-up burst on the next tick.
+
+**Budget.** `UniConfig::max_forks: Option<usize>` caps total fork count enforced at `ForkRegistryHandle::begin_create`. Counts include `Active + Pending + Tombstoned` — tombstoned forks still hold branch state on disk until recovery completes, so counting them prevents create/drop churn from slipping past the cap. Hitting the cap surfaces `UniError::ForkBudgetExceeded { current, max }` at the API layer.
+
+**Tags.** `Uni::tag_fork(name, tag)` walks the fork's `(dataset → branch)` map and creates one Lance tag per dataset, namespaced as `fork_{tag}_{dataset}`. Each tag pins the branch's *current* version — subsequent fork writes do not move the tag. This is the load-bearing property: Lance's compaction retention sweep preserves any version referenced by an active tag, so tagged-then-dropped forks safely retain their state on disk for audit hold or regulatory snapshots. `Uni::untag_fork` is idempotent per-dataset (missing tags are no-ops). `Uni::list_fork_tags` deduplicates the user-visible tag names by stripping the namespace prefix.
+
+**Cancellation parent → child.** `Session::new_forked` stores `parent_token.child_token()` instead of a fresh `CancellationToken`. Cancelling a parent session fires every descendant's token; cancelling a child does not affect the parent. Sibling forks under the same parent are independent. This matches spec §4.6.
+
+A subtle interaction: `Session::cancel()` cancels the currently-held token *and replaces it with a fresh one* so the session remains usable. The fresh token is independent of the parent's old token. Tests asserting cascade propagation must capture token clones BEFORE calling cancel — the snapshot captured beforehand observes the cancellation, while the session's currently-held token (post-cancel) is fresh and not cancelled.
+
+**Pin/refresh on forked sessions.** Phase 1 forbade `pin_to_version` on a forked session via a `debug_assert!` in `StorageManager::pinned()`. Phase 4a lifted the assertion: `pinned()` now preserves `fork_scope` so the resulting `StorageManager` reads through both the fork's branches (via `fork_scope`) and at the snapshot's HWM (via `pinned_snapshot`). Writes are gated separately at the session layer — `Session::tx()` rejects on a pinned session with `UniError::ReadOnly`.
+
+**Watch / hooks / params on forked sessions.** Each `UniInner` (primary or fork-scoped) owns its own `commit_tx: broadcast::Sender`, so `Session::watch` is fork-isolated by construction — a forked session's watch only sees that fork's commits, primary's watch never sees fork commits, and sibling forks don't bleed into each other. Hooks and params are per-session and start empty on a fork (no propagation in either direction). These contracts existed before Phase 4a; the phase added regression tests (`fork_watch.rs`, `fork_hooks.rs`, `fork_params.rs`) so the design is locked in.
+
+## Fork-Local Index Fusion (Phase 5a-impl)
+
+Phase 5a-impl adds the build pipeline and planner integration that turn fork-local indexes into observable signal in the query plan. It covers the three *lossless* fusion types: `BtreeUnion` (equality-filter scans), `SortedKWayMerge` (ORDER BY scans), and `VidUidForkFirst` (UID rebinding lookups). Lossy types — vector ANN rerank and BM25 RRF — land in Phase 5b alongside their recall benchmarks.
+
+**Build trigger.** Two paths fire a fork-local index build:
+
+- **Automatic.** A background task spawned in `Uni::open` (`crates/uni/src/api/fork_index_builder.rs`) polls the fork registry every `UniConfig::fork_index_builder_interval` (default 30s). For each active fork whose `(label, column)` fragment count crosses `UniConfig::fork_index_build_threshold` (default 10k rows), if primary has a scalar index on that column, the auto-builder schedules a `ScalarBtree` build on the fork's branch.
+- **Manual.** `Session::build_fork_local_index(label, column, kind)` triggers the build immediately and bypasses the threshold. Tests use this for deterministic timing; power users use it to opt into `Sorted` or `VidUid` kinds the auto-builder doesn't dispatch.
+
+**Build path.** Confirmed by the Phase 5a spike at `crates/uni-store/src/backend/lance_branch.rs::tests::phase5a_spike_per_branch_index`: Lance writes per-branch indexes correctly. `create_index_builder` against a branch-checked-out dataset produces an index file scoped to that branch — main sees zero indexes after the build, the branch sees one. The fork's `drop_fork`/`drop_fork_cascade` cleans up the index files automatically because they live under the branch directory.
+
+The build entry point is `uni_store::fork::index_builder::build_fork_local_index`. For `VidUid` it's a no-op write (Lance's `base_paths` chain on the fork's branch already gives us fork-first lookup semantics — only the `ForkScope` registry entry is created); for `ScalarBtree` and `Sorted` it calls through to `lance_branch::create_scalar_index_on_branch` and registers on success.
+
+**Planner emission.** A logical-plan post-pass (`uni_query::rewrite_for_fork_fusion`) walks the tree once after the planner produces it, rewriting:
+- `Scan { labels, filter: column = literal, .. }` → `FusedIndexScan { kind: BtreeUnion | VidUidForkFirst, .. }` when `(label, column)` is registered in the fork's `ForkLocalIndexKind` registry.
+- `Sort { input: Scan, order_by: [column], .. }` → `Sort { FusedIndexScan { kind: SortedKWayMerge, .. } }` when the column has a `Sorted` registry entry.
+
+The rewrite is wired at every `planner.plan(ast)` site in `crates/uni/src/api/impl_query.rs` so all query paths (read, profile, explain) observe the same fusion-aware plan tree. The rewrite is a no-op on primary sessions and on forked sessions without registered indexes — fall-through correctness is preserved.
+
+**Physical operators (Phase 5a-impl decay).** `FusedIndexScan` decays to a regular `Scan` at the physical planner. This is intentional: Lance's per-branch index reads via `base_paths` produce correct fused results without bespoke physical operators for the lossless types. The planner-side variant carries observable signal (visible in `Session::query_with(...).explain().await?.plan_text`) without any runtime cost. Phase 5b will replace the decay with `FusedVectorSearchExec` (top-k merge + exact rerank) and `FusedFullTextSearchExec` (RRF) for the lossy types that genuinely need bespoke fusion.
+
+**Read correctness.** End-to-end results on a forked session are correct *with or without* fork-local index registration — Lance's `base_paths` chain reads through both branches and the existing scan path produces the union. Phase 5a-impl's contribution is observability and the substrate for Phase 5b's lossy-type operators, not runtime behavior change for the lossless types.
+
+## Lossy Fork-Local Fusion (Phase 5b)
+
+Phase 5b extends Phase 5a-impl to the two *lossy* fusion types: vector ANN and BM25 FTS. The build path mirrors 5a-impl (per-branch Lance index files; spike-confirmed at `crates/uni-store/src/backend/lance_branch.rs::tests::phase5b_spike_per_branch_vector`); the read path lifts the Phase 1 stubs in `BranchedBackend::vector_search` and `full_text_search` so they route through the fork's branch when one exists, exposing fused results from primary-inherited and fork-local rows in a single Lance call.
+
+**Build path.** `Session::build_fork_local_index(label, column, ForkLocalIndexKind::Vector)` builds a Lance native vector index (default IVF-Flat 1-partition L2) on the fork's branch via `lance_branch::create_vector_index_on_branch`. `ForkLocalIndexKind::FullText` builds via `IndexType::Inverted` + `InvertedIndexParams::default` (matching primary's `IndexManager::create_fts_index` — `ScalarIndexParams::for_builtin(Inverted)` is missing the required `base_tokenizer` and rejects the build). Both register in `ForkScope.fork_local_indexes` on success; the registry now covers all five Phase 5 kinds.
+
+**Read path.** `BranchedBackend::vector_search` and `full_text_search` check whether the fork has a branch for the target dataset (`scope.branch_for(table)`); if yes, they call `lance_branch::vector_search_on_branch` / `full_text_search_on_branch`, which open the dataset on the branch and call `Scanner::nearest` / `Scanner::full_text_search`. Lance's `base_paths` chain on the branch surfaces both fork-local and parent-inherited rows in one scan. When the fork has no branch (label never written through the fork), the BranchedBackend delegates to primary's path.
+
+**No bespoke physical operators in Phase 5b.** Lance's per-branch reads via `base_paths` are sufficient for the MVP. If recall benchmarks on N=100k+ datasets show Lance's per-branch ANN missing primary-inherited candidates, a follow-up adds an explicit two-side merge with exact rerank. For Phase 5b's MVP-scale tests (n=1100, q=20, K=10) recall@10 = 1.000 because Lance falls back to brute-force.
+
+**Planner emission for vector/FTS uses a thin wrapper variant.** A follow-up to the initial Phase 5b ship added `LogicalPlan::FusedIndexScanWrapped { inner: Box<LogicalPlan>, kind: FusionKind }` plus a rewrite arm in `rewrite_for_fork_fusion` that recognizes `ProcedureCall { procedure_name: "uni.vector.query" | "uni.fts.query", arguments: [label, column, ...] }` and wraps it when a matching fork-local index has been registered. The physical planner unwraps and recurses on `inner`; runtime behavior is identical to the unwrapped node. This closes the observability asymmetry between Phase 5a-impl (which emitted `FusedIndexScan` for lossless types) and Phase 5b's CALL-style vector/FTS queries — `session.query_with(...).explain().await?.plan_text` now shows `FusedIndexScanWrapped { kind: AnnRerank }` or `Bm25Rrf` for forked sessions with the relevant index registered, matching the `FusedIndexScan { kind: BtreeUnion | SortedKWayMerge | VidUidForkFirst }` story 5a-impl established.
+
+**Filter pushdown is dropped on the branch path.** Phase 5b's MVP doesn't push predicates through to `lance::Dataset::scan`; the caller above re-applies. Document and tighten in a 5b-followup.
+
+**Recall scaffold.** `crates/uni/tests/fork_index_recall_bench.rs` (`#[ignore]`'d) is the on-ramp for spec §8.2's 95% recall@K target on N=100k+ items. Run with `cargo nextest run -p uni-db --test fork_index_recall_bench --run-ignored ignored-only --no-capture`. For full compliance reporting, write a Criterion bench at `crates/uni/benches/fork_index.rs` and capture results in `compliance_reports/fork_index_<date>.md`.
+
+## Promotion and Diff (Phase 6b)
+
+Phase 6 closes the write-audit-publish loop. Two complementary
+surfaces, both with content-addressed identity:
+
+**Diff** — `Uni::diff_fork_primary(name)` and `Uni::diff_forks(a, b)`
+return a `ForkDiff { vertices, edges }` describing the structural
+delta from the first view to the second: `added` rows appear in
+the second view only, `deleted` in the first only, `changed`
+carries per-property before/after pairs on rows with matching UID.
+Identity is `compute_vertex_uid(label, None, properties)` for
+vertices and `(src_uid, dst_uid)` (scoped to the edge type) for
+edges, so two unrelated forks with overlapping VID allocation still
+pair correctly. `DiffVertex.vid` survives as informational metadata.
+
+`ForkDiff::invert()` is provided so the algebraic relation
+`diff(a, b).invert() == diff(b, a)` is enforced by construction; it
+swaps `added` ↔ `deleted` and `before` ↔ `after` in every
+`PropertyChange`.
+
+**Promote** — `Uni::promote_from_fork(name, &[PromotePattern])`
+scans the named fork per pattern and bulk-inserts matches on
+primary inside a single transaction. Two pattern shapes:
+
+- `PromotePattern::label("Person").where_clause(...)` — vertex
+  promotion. UID dedup via the same `compute_vertex_uid` used by
+  the writer.
+- `PromotePattern::edge_type("KNOWS").where_clause(...)` — edge
+  promotion. Endpoints are resolved by their content UID; if
+  either endpoint isn't on primary, the edge is counted in
+  `edges_skipped_no_endpoint` and skipped. Within a single
+  `promote_from_fork` call, vertices inserted by an earlier
+  pattern are visible to a later edge pattern via an in-memory
+  `(label, uid) -> vid` cache — so mixing vertex and edge
+  patterns in one call promotes endpoints together with their
+  edges, atomically.
+
+**`UidIndex` is not branch-isolated** — that's the subtle pitfall
+worth knowing. The shared
+`indexes/uni_id_to_vid/{label}/index.lance` dataset accumulates
+entries from both primary and fork branches. `UidIndex::get_vid`
+returns *any* registered VID for a UID, even one that belongs to
+a fork-only vertex. The promote engine corrects for this with
+`resolve_primary_vid`, which takes the candidate VID and verifies
+via `MATCH (n:Label) WHERE id(n) = $vid` on a primary session;
+primary's branched backend naturally excludes fork-only rows.
+Don't roll your own UID→primary-VID lookup without this round-trip.
+
+**Schema growth interaction.** A fork-only label promoted to primary
+must already have its dataset registered on primary's schema —
+promote does *not* auto-create labels. The intended path is:
+`db.schema().label("NewLabel").apply().await` on primary, then
+`promote_from_fork(fork_name, &[PromotePattern::label("NewLabel")])`.
+Same for fork-only edge types: register on primary first or the
+call errors with `UniError::EdgeTypeNotFound` *before* opening
+the primary transaction.
+
+**Fork flush.** `promote_from_fork` opens a fresh fork session and
+calls `fork.flush().await?` before scanning. Without this, edges
+committed via an earlier (now-dropped) fork session can be
+invisible to the new session — vertices happen to be visible
+without flush but the asymmetry is fragile, so promote always
+flushes.
+
+## Schema Evolution × Forks (Phase 7)
+
+A common question: "if I open a fork, then evolve primary's schema,
+does the fork break?" The short answer is **no for label/edge-type
+additions, yes for column-altering changes**. The Phase 7 test
+`crates/uni/tests/fork_schema_evolution.rs` pins the supported
+shape:
+
+- **Adding a new label on primary** while a fork is open or has
+  been previously committed: fully safe. The fork keeps reading
+  its v1 columns through its branch and can be reopened cleanly
+  after the primary evolution. The new label simply doesn't
+  exist on the fork's branch path until the fork is dropped and
+  recreated.
+- **Adding a new edge type on primary**: same — safe and
+  non-disruptive.
+- **Adding a property column to an existing primary label**:
+  not supported on a per-fork basis. A Lance branch shares its
+  parent dataset's Arrow schema, so a fork-local property
+  addition would either leak to primary or break branch
+  read-merge. Phase 3 documented this as the standing limit;
+  the workaround is to drop and recreate the fork after
+  evolving primary.
+
+Tagged historical primary states (via `Uni::tag_fork`) are also
+unaffected by primary schema evolution — the tagged Lance commit
+holds the schema-at-tag-time on disk regardless of what primary's
+HEAD now looks like.
+
+## Operational Signals
+
+- `uni_fork_l1_flushes{fork=...}` — gauge incremented on every successful fork flush. A proxy for fragment growth on the fork's branches; Phase 5 will add proper fork compaction.
+- `tracing::warn!` once per writer when the per-fork flush count crosses `UniConfig::fork_fragment_warn_threshold` (default 256). Mitigation today is drop-and-recreate.
+- `tracing::warn!` from the TTL sweeper when a `drop_fork_cascade` call fails on an expired fork — the next tick retries.
+
+## What's Not in Forks (Current Scope)
+
+Carve-outs that have surfaced in user questions and are explicitly out of scope until later phases:
+
+- **Hypothesis persistence (ASSUME snapshots).** Forks are durable database branches; they are not a hypothesis store for Locy reasoning. Use ASSUME at the Locy layer for that.
+- **Re-parenting.** A fork's parent is fixed at creation. Moving a subtree under a different parent is not planned.
+- **Parallel-edge promotion.** Phase 6b's edge identity is `(src_uid, dst_uid, type)`, so two parallel edges of the same type between the same endpoints with different property bags collapse to one. Multi-edge promotion would require an edge-content hash — deferred to a future phase.
+- **Cypher TCK and Python bindings for diff/promote.** The Rust integration tests cover the contract; the Cypher Gherkin features and `bindings/uni-db` pyo3 wrappers are follow-on work.
+- **Property additions to existing primary labels via `fork_schema()`.** A Lance branch shares its parent dataset's Arrow schema, so adding a typed column on a fork-only basis would either leak to primary or break branch read-merge. The path stays closed until Phase 6 promotion semantics define the migration.
+- **Fork compaction.** Phase 5. Long-lived heavy-write forks accumulate L1 fragments; bound the cost by drop-and-recreate until then.
+- **TTL, tags, watch filtering, hooks/params propagation on forked sessions.** Phase 4.
 
 ---
 

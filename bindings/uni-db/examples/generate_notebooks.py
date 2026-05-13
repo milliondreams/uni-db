@@ -1099,6 +1099,382 @@ if __name__ == "__main__":
         ],
     )
 
+    # =========================================================================
+    # 6. Forks — write-audit-publish loop (sync API)
+    # =========================================================================
+    fork_scenario_intro = [
+        "# Forks: write-audit-publish (Python sync)",
+        "",
+        "Named, durable, isolated graph branches with structural diff and",
+        "promote-back semantics. This notebook walks the",
+        "**write-audit-publish** loop end to end:",
+        "",
+        "1. Seed primary with a small social graph.",
+        "2. Open a fork; derive new edges from a candidate rule.",
+        "3. Audit the result via `db.diff_fork_primary` before deciding.",
+        "4. Publish via `db.promote_from_fork` with mixed vertex + edge patterns.",
+        "5. Drop the fork; primary now has the new state.",
+        "",
+        "Identity is content-addressed UID for vertices and content-derived",
+        "edge UID for edges — unrelated forks with overlapping VIDs still",
+        "pair correctly, and parallel edges with different property bags",
+        "promote independently.",
+    ]
+
+    forks_nb = create_notebook(
+        "forks",
+        [
+            md_cell(fork_scenario_intro),
+            code_cell(["import uni_db"]),
+            md_cell(
+                [
+                    "## 1. Open a database, define schema",
+                    "",
+                    "In-memory database with a `Person` label and two edge types:",
+                    "`KNOWS` (the input social graph) and `FRIEND_OF_FRIEND`",
+                    "(what our hypothesis will derive).",
+                ]
+            ),
+            code_cell(
+                [
+                    "db = uni_db.Uni.builder().disable_fork_sweeper(True).build()",
+                    "",
+                    'db.schema().label("Person").property("name", "string").apply()',
+                    'db.schema().edge_type("KNOWS", ["Person"], ["Person"]).apply()',
+                    "db.schema().edge_type(",
+                    '    "FRIEND_OF_FRIEND", ["Person"], ["Person"]',
+                    ").apply()",
+                    "",
+                    'print("schema applied")',
+                ]
+            ),
+            md_cell(
+                [
+                    "## 2. Seed primary with a small social graph",
+                    "",
+                    "Four people, three KNOWS edges in a chain:",
+                    "`alice → bob → carol → dave`.",
+                ]
+            ),
+            code_cell(
+                [
+                    "primary = db.session()",
+                    "tx = primary.tx()",
+                    "tx.execute(",
+                    "    \"CREATE (alice:Person {name: 'alice'}),\"",
+                    "    \"       (bob:Person {name: 'bob'}),\"",
+                    "    \"       (carol:Person {name: 'carol'}),\"",
+                    "    \"       (dave:Person {name: 'dave'}),\"",
+                    '    "       (alice)-[:KNOWS]->(bob),"',
+                    '    "       (bob)-[:KNOWS]->(carol),"',
+                    '    "       (carol)-[:KNOWS]->(dave)"',
+                    ")",
+                    "tx.commit()",
+                    "db.flush()",
+                    "",
+                    'print("seeded primary with 4 vertices + 3 KNOWS edges")',
+                ]
+            ),
+            md_cell(
+                [
+                    "## 3. Stage a hypothesis on a fork",
+                    "",
+                    "Fork `hypothesis_a` and run a candidate rule: derive",
+                    "`FRIEND_OF_FRIEND` edges where two people share a common",
+                    "KNOWS neighbor (2-hop closure). The fork is fully",
+                    "writable — same `tx.execute` API as primary.",
+                ]
+            ),
+            code_cell(
+                [
+                    'fork = primary.fork("hypothesis_a").build()',
+                    "tx = fork.tx()",
+                    "tx.execute(",
+                    '    "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) "',
+                    '    "WHERE id(a) <> id(c) "',
+                    '    "CREATE (a)-[:FRIEND_OF_FRIEND]->(c)"',
+                    ")",
+                    "tx.commit()",
+                    "fork.flush()",
+                    "del fork  # release the session before promote opens a fresh one",
+                    "",
+                    'print("hypothesis_a: staged 2-hop FRIEND_OF_FRIEND derivation")',
+                ]
+            ),
+            md_cell(
+                [
+                    "## 4. Audit via `diff_fork_primary`",
+                    "",
+                    "Returns a `ForkDiff` describing what the fork added,",
+                    "deleted, and changed. Identity is content-addressed UID",
+                    "for vertices and content-derived edge UID for edges, so",
+                    "property mutations surface as added+deleted pairs of",
+                    "distinct UIDs.",
+                ]
+            ),
+            code_cell(
+                [
+                    'diff = db.diff_fork_primary("hypothesis_a")',
+                    "",
+                    "print(",
+                    '    f"diff: +{len(diff.vertices.added)} vertices, "',
+                    '    f"+{len(diff.edges.added)} edges, "',
+                    '    f"~{len(diff.vertices.changed)} changed"',
+                    ")",
+                    "",
+                    "for e in diff.edges.added:",
+                    "    short = e.edge_uid[-8:]",
+                    '    print(f"  + (…{short}) [:{e.edge_type}] (between two Persons)")',
+                ]
+            ),
+            md_cell(
+                [
+                    "## 5. Publish: `promote_from_fork`",
+                    "",
+                    "Pass both a vertex pattern and an edge pattern in one",
+                    "call. All inserts run inside a single primary",
+                    "transaction; vertices promoted by the first pattern are",
+                    "visible as endpoint candidates to the second pattern via",
+                    "an in-memory cache.",
+                ]
+            ),
+            code_cell(
+                [
+                    "report = db.promote_from_fork(",
+                    '    "hypothesis_a",',
+                    "    [",
+                    '        uni_db.PromotePattern.label("Person"),',
+                    '        uni_db.PromotePattern.edge_type("FRIEND_OF_FRIEND"),',
+                    "    ],",
+                    ")",
+                    "",
+                    "print(",
+                    '    f"inserted: {report.vertices_inserted} vertices, "',
+                    '    f"{report.edges_inserted} edges "',
+                    '    f"(skipped: {report.vertices_skipped_uid_conflict} UID conflicts, "',
+                    '    f"{report.edges_skipped_duplicate} dup edges, "',
+                    '    f"{report.edges_skipped_no_endpoint} orphans)"',
+                    ")",
+                ]
+            ),
+            md_cell(
+                [
+                    "## 6. Drop the fork; primary now has the new edges",
+                ]
+            ),
+            code_cell(
+                [
+                    'db.drop_fork("hypothesis_a")',
+                    "",
+                    "rows = primary.query(",
+                    '    "MATCH (a:Person)-[r]->(b:Person) "',
+                    '    "RETURN a.name AS src, type(r) AS rel, b.name AS dst "',
+                    '    "ORDER BY rel, src, dst"',
+                    ").rows",
+                    "",
+                    "for row in rows:",
+                    "    print(",
+                    "        f\"  ({row.get('src')})-"
+                    "[:{row.get('rel')}]"
+                    "->({row.get('dst')})\"",
+                    "    )",
+                ]
+            ),
+            md_cell(
+                [
+                    "## Wrap-up",
+                    "",
+                    "- **Isolation** — the fork's writes never touched primary",
+                    "  until `promote_from_fork` was called.",
+                    "- **Audit before publish** — `diff_fork_primary` lets",
+                    "  you see exactly what the rule produced.",
+                    "- **Atomic publish** — every pattern in",
+                    "  `promote_from_fork` runs in one primary transaction.",
+                    "- **Content-addressed identity** — UID dedup; parallel",
+                    "  edges with different property bags are distinct.",
+                    "",
+                    "The same surface exists in Rust (`examples/rust/forks.ipynb`)",
+                    "and against `uni_db.AsyncUni` (`forks_async.ipynb`).",
+                ]
+            ),
+        ],
+    )
+
+    # =========================================================================
+    # 7. Forks — same scenario via the async API
+    # =========================================================================
+    forks_async_nb = create_notebook(
+        "forks_async",
+        [
+            md_cell(
+                [
+                    "# Forks: write-audit-publish (Python async)",
+                    "",
+                    "Same scenario as `forks.ipynb` but built against",
+                    "`uni_db.AsyncUni` so every database call is awaitable.",
+                    "Useful for callers that already live in an asyncio event",
+                    "loop (web servers, async agents).",
+                    "",
+                    "Jupyter's IPython kernel runs cells inside an event loop,",
+                    "so we can `await` directly — no `asyncio.run(...)` needed",
+                    "at the cell level. The companion `run_notebooks.py` test",
+                    "harness uses `PyCF_ALLOW_TOP_LEVEL_AWAIT` to execute the",
+                    "same code outside Jupyter.",
+                ]
+            ),
+            code_cell(["import uni_db"]),
+            md_cell(
+                [
+                    "## 1. Open a database, define schema",
+                    "",
+                    "`uni_db.AsyncUni.builder()` is the async-API entry point",
+                    "— every subsequent call returns a coroutine. Builders",
+                    "are constructed synchronously and only their terminal",
+                    "`.build()` / `.apply()` are awaitable.",
+                ]
+            ),
+            code_cell(
+                [
+                    "db = await uni_db.AsyncUni.builder().disable_fork_sweeper(True).build()",
+                    "",
+                    'await db.schema().label("Person").property("name", "string").apply()',
+                    'await db.schema().edge_type("KNOWS", ["Person"], ["Person"]).apply()',
+                    "await db.schema().edge_type(",
+                    '    "FRIEND_OF_FRIEND", ["Person"], ["Person"]',
+                    ").apply()",
+                    "",
+                    'print("schema applied")',
+                ]
+            ),
+            md_cell(
+                [
+                    "## 2. Seed primary with a small social graph",
+                ]
+            ),
+            code_cell(
+                [
+                    "primary = db.session()",
+                    "tx = await primary.tx()",
+                    "await tx.execute(",
+                    "    \"CREATE (alice:Person {name: 'alice'}),\"",
+                    "    \"       (bob:Person {name: 'bob'}),\"",
+                    "    \"       (carol:Person {name: 'carol'}),\"",
+                    "    \"       (dave:Person {name: 'dave'}),\"",
+                    '    "       (alice)-[:KNOWS]->(bob),"',
+                    '    "       (bob)-[:KNOWS]->(carol),"',
+                    '    "       (carol)-[:KNOWS]->(dave)"',
+                    ")",
+                    "await tx.commit()",
+                    "await db.flush()",
+                    "",
+                    'print("seeded primary with 4 vertices + 3 KNOWS edges")',
+                ]
+            ),
+            md_cell(
+                [
+                    "## 3. Stage a hypothesis on a fork",
+                ]
+            ),
+            code_cell(
+                [
+                    'fork = await primary.fork("hypothesis_a").build()',
+                    "tx = await fork.tx()",
+                    "await tx.execute(",
+                    '    "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) "',
+                    '    "WHERE id(a) <> id(c) "',
+                    '    "CREATE (a)-[:FRIEND_OF_FRIEND]->(c)"',
+                    ")",
+                    "await tx.commit()",
+                    "await fork.flush()",
+                    "del fork  # release the session before promote opens a fresh one",
+                    "",
+                    'print("hypothesis_a: staged 2-hop FRIEND_OF_FRIEND derivation")',
+                ]
+            ),
+            md_cell(
+                [
+                    "## 4. Audit via `diff_fork_primary`",
+                ]
+            ),
+            code_cell(
+                [
+                    'diff = await db.diff_fork_primary("hypothesis_a")',
+                    "",
+                    "print(",
+                    '    f"diff: +{len(diff.vertices.added)} vertices, "',
+                    '    f"+{len(diff.edges.added)} edges, "',
+                    '    f"~{len(diff.vertices.changed)} changed"',
+                    ")",
+                    "",
+                    "for e in diff.edges.added:",
+                    "    short = e.edge_uid[-8:]",
+                    '    print(f"  + (…{short}) [:{e.edge_type}] (between two Persons)")',
+                ]
+            ),
+            md_cell(
+                [
+                    "## 5. Publish: `promote_from_fork`",
+                ]
+            ),
+            code_cell(
+                [
+                    "report = await db.promote_from_fork(",
+                    '    "hypothesis_a",',
+                    "    [",
+                    '        uni_db.PromotePattern.label("Person"),',
+                    '        uni_db.PromotePattern.edge_type("FRIEND_OF_FRIEND"),',
+                    "    ],",
+                    ")",
+                    "",
+                    "print(",
+                    '    f"inserted: {report.vertices_inserted} vertices, "',
+                    '    f"{report.edges_inserted} edges "',
+                    '    f"(skipped: {report.vertices_skipped_uid_conflict} UID conflicts, "',
+                    '    f"{report.edges_skipped_duplicate} dup edges, "',
+                    '    f"{report.edges_skipped_no_endpoint} orphans)"',
+                    ")",
+                ]
+            ),
+            md_cell(
+                [
+                    "## 6. Drop the fork; primary now has the new edges",
+                ]
+            ),
+            code_cell(
+                [
+                    'await db.drop_fork("hypothesis_a")',
+                    "",
+                    "result = await primary.query(",
+                    '    "MATCH (a:Person)-[r]->(b:Person) "',
+                    '    "RETURN a.name AS src, type(r) AS rel, b.name AS dst "',
+                    '    "ORDER BY rel, src, dst"',
+                    ")",
+                    "",
+                    "for row in result.rows:",
+                    "    print(",
+                    "        f\"  ({row.get('src')})-"
+                    "[:{row.get('rel')}]"
+                    "->({row.get('dst')})\"",
+                    "    )",
+                ]
+            ),
+            md_cell(
+                [
+                    "## Wrap-up",
+                    "",
+                    "The async API mirrors the sync surface 1:1 — every",
+                    "method returns a coroutine, builders construct",
+                    "synchronously and await their terminal step. From an",
+                    "async caller you get the full fork track without the",
+                    "sync runtime blocking your event loop.",
+                    "",
+                    "Companions: `forks.ipynb` (Python sync) and",
+                    "`examples/rust/forks.ipynb` (Rust via evcxr).",
+                ]
+            ),
+        ],
+    )
+
     # Write notebooks to the same directory as this script
     script_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -1116,5 +1492,11 @@ if __name__ == "__main__":
 
     with open(os.path.join(script_dir, "sales_analytics.ipynb"), "w") as f:
         json.dump(sales_nb, f, indent=2)
+
+    with open(os.path.join(script_dir, "forks.ipynb"), "w") as f:
+        json.dump(forks_nb, f, indent=2)
+
+    with open(os.path.join(script_dir, "forks_async.ipynb"), "w") as f:
+        json.dump(forks_async_nb, f, indent=2)
 
     print("Notebooks created successfully.")

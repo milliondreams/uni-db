@@ -1012,3 +1012,273 @@ async fn test_real_onnx_cross_encoder_via_facade() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// BGE + Qwen3 reranker family coverage (uni-xervo 0.11.0)
+// ---------------------------------------------------------------------------
+//
+// uni-xervo 0.11.0 (commit `d08411c`) made the cross-encoder loader
+// auto-detect `token_type_ids` from `session.inputs()`, which is what
+// makes `BAAI/bge-reranker-base` work — its ONNX export omits that input,
+// and the pre-0.11.0 hardcoded feed errored at ORT load. The same release
+// (commit `21642b5`) added a generative-style dispatch in
+// `rerank_generative.rs` for Qwen3-Reranker, which is a `Qwen3ForCausalLM`
+// that scores via constrained `yes`/`no` token logits rather than a
+// regression head. Both families resolve through the same alias-based
+// pipeline in `procedure_call.rs:1284-1410`, so these two tests are the
+// only end-to-end signal that the family-specific paths work through
+// uni-db's `runtime.reranker(...).rerank(...)` call.
+//
+// Run manually with:
+//
+//   cargo nextest run -p uni-db --features provider-onnx \
+//     --test reranker_integration --run-ignored all
+
+/// Cross-encoder reranker — `BAAI/bge-reranker-base`. Validates the
+/// 0.11.0 `token_type_ids` auto-detection: pre-0.11.0 this would have
+/// failed at model load with an ORT "Invalid input name" error because
+/// the loader hardcoded a `token_type_ids` feed.
+///
+/// Downloads the model from HuggingFace on first run (~280 MB).
+#[cfg(feature = "provider-onnx")]
+#[tokio::test]
+#[ignore]
+async fn test_real_onnx_bge_reranker_reranks_by_relevance() -> anyhow::Result<()> {
+    use uni_xervo::provider::LocalOnnxProvider;
+
+    let runtime = ModelRuntime::builder()
+        .register_provider(LocalOnnxProvider::new())
+        .catalog(vec![ModelAliasSpec {
+            alias: "rerank/bge".to_string(),
+            task: ModelTask::Rerank,
+            provider_id: "local/onnx".to_string(),
+            model_id: "BAAI/bge-reranker-base".to_string(),
+            revision: None,
+            warmup: WarmupPolicy::Lazy,
+            required: false,
+            timeout: None,
+            load_timeout: None,
+            retry: None,
+            // No `style` option — defaults to "cross-encoder", which is
+            // what BGE rerankers want. Explicitly empty to document that
+            // BGE rerankers need no extra config under 0.11.0+.
+            options: serde_json::json!({}),
+        }])
+        .build()
+        .await
+        .expect("Failed to build runtime with BGE reranker");
+
+    let db = Uni::temporary().xervo_runtime(runtime).build().await?;
+
+    db.schema()
+        .label("Article")
+        .property("title", DataType::String)
+        .property("body", DataType::String)
+        .property("embedding", DataType::Vector { dimensions: 3 })
+        .apply()
+        .await?;
+
+    // Same fixture as the MiniLM test for direct cross-family comparison.
+    let tx = db.session().tx().await?;
+    tx.execute(
+        "CREATE (:Article {title: 'Rust Ownership', \
+         body: 'The Rust programming language uses ownership and borrowing to guarantee memory safety without a garbage collector.', \
+         embedding: [1.0, 0.0, 0.0]})",
+    ).await?;
+    tx.execute(
+        "CREATE (:Article {title: 'Chocolate Cake', \
+         body: 'To make a rich chocolate cake, combine cocoa powder, flour, sugar, eggs, and butter.', \
+         embedding: [0.0, 1.0, 0.0]})",
+    ).await?;
+    tx.execute(
+        "CREATE (:Article {title: 'Rust Concurrency', \
+         body: 'Rust provides fearless concurrency through its type system, using Send and Sync traits to prevent data races at compile time.', \
+         embedding: [0.9, 0.1, 0.0]})",
+    ).await?;
+    tx.execute(
+        "CREATE (:Article {title: 'Garden Tips', \
+         body: 'Plant tomatoes in full sun with well-drained soil. Water deeply but infrequently for best results.', \
+         embedding: [0.0, 0.0, 1.0]})",
+    ).await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    // First-run path downloads ~280 MB and warms tokenizer + ONNX session;
+    // bump the query timeout above the 30 s default to absorb that.
+    let result = db
+        .session()
+        .query_with(
+            "CALL uni.vector.query('Article', 'embedding', [1.0, 0.0, 0.0], 4, null, null, \
+         {reranker: 'rerank/bge', reranker_property: 'body', \
+          reranker_query: 'How does Rust handle memory safety?'}) \
+         YIELD node, score, rerank_score \
+         RETURN node.title AS title, score, rerank_score \
+         ORDER BY rerank_score DESC",
+        )
+        .timeout(std::time::Duration::from_secs(600))
+        .fetch_all()
+        .await?;
+
+    assert_eq!(result.len(), 4, "Should return all 4 articles");
+
+    let order = titles(&result);
+    eprintln!("BGE reranked order: {:?}", order);
+    for (i, title) in order.iter().enumerate() {
+        let rs = get_f64(&result, i, "rerank_score").unwrap();
+        eprintln!("  {}: rerank_score={:.4}", title, rs);
+    }
+
+    // Top result must be a Rust article (memory-safety query).
+    assert!(
+        order[0] == "Rust Ownership" || order[0] == "Rust Concurrency",
+        "Top result should be a Rust article, got: {}",
+        order[0]
+    );
+    let top_2: Vec<&str> = order[..2].iter().map(|s| s.as_str()).collect();
+    assert!(
+        top_2.contains(&"Rust Ownership") && top_2.contains(&"Rust Concurrency"),
+        "Top 2 should be both Rust articles, got: {:?}",
+        top_2
+    );
+
+    // Cross-encoder returns raw logits (unbounded). Just assert that the
+    // worst Rust article still scored higher than the best non-Rust.
+    let rust_min = get_f64(&result, 1, "rerank_score").unwrap();
+    let non_rust_max = get_f64(&result, 2, "rerank_score").unwrap();
+    assert!(
+        rust_min > non_rust_max,
+        "Rust articles should score higher than non-Rust: Rust min={rust_min:.4}, non-Rust max={non_rust_max:.4}"
+    );
+
+    Ok(())
+}
+
+/// Generative-style reranker — `onnx-community/Qwen3-Reranker-0.6B-ONNX`.
+/// Validates the 0.11.0 generative dispatch path
+/// (`rerank_generative.rs`): Qwen3-Reranker is a `Qwen3ForCausalLM`,
+/// scored via softmax over the `yes`/`no` token logits at the last
+/// non-pad position. Selected by `options.style = "generative"` in the
+/// `ModelAliasSpec`; default `"cross-encoder"` would fail at load.
+///
+/// Downloads the quantized variant `onnx/model_q4.onnx` (~500 MB) on
+/// first run. Test runs slower than the cross-encoder paths because
+/// of the larger model and longer-context tokenization.
+#[cfg(feature = "provider-onnx")]
+#[tokio::test]
+#[ignore]
+async fn test_real_onnx_qwen3_reranker_reranks_by_relevance() -> anyhow::Result<()> {
+    use uni_xervo::provider::LocalOnnxProvider;
+
+    let runtime = ModelRuntime::builder()
+        .register_provider(LocalOnnxProvider::new())
+        .catalog(vec![ModelAliasSpec {
+            alias: "rerank/qwen3".to_string(),
+            task: ModelTask::Rerank,
+            provider_id: "local/onnx".to_string(),
+            model_id: "onnx-community/Qwen3-Reranker-0.6B-ONNX".to_string(),
+            revision: None,
+            warmup: WarmupPolicy::Lazy,
+            required: false,
+            // Qwen3 forward pass is heavier than a cross-encoder, but the
+            // default `load_timeout` (600 s) and unbounded per-call
+            // `timeout` are still appropriate; left as None.
+            timeout: None,
+            load_timeout: None,
+            retry: None,
+            // `style: "generative"` routes to `rerank_generative.rs`
+            // instead of the default `rerank.rs` cross-encoder path.
+            options: serde_json::json!({ "style": "generative" }),
+        }])
+        .build()
+        .await
+        .expect("Failed to build runtime with Qwen3 generative reranker");
+
+    let db = Uni::temporary().xervo_runtime(runtime).build().await?;
+
+    db.schema()
+        .label("Article")
+        .property("title", DataType::String)
+        .property("body", DataType::String)
+        .property("embedding", DataType::Vector { dimensions: 3 })
+        .apply()
+        .await?;
+
+    // Same fixture as the BGE / MiniLM tests for direct cross-family
+    // score-shape comparison.
+    let tx = db.session().tx().await?;
+    tx.execute(
+        "CREATE (:Article {title: 'Rust Ownership', \
+         body: 'The Rust programming language uses ownership and borrowing to guarantee memory safety without a garbage collector.', \
+         embedding: [1.0, 0.0, 0.0]})",
+    ).await?;
+    tx.execute(
+        "CREATE (:Article {title: 'Chocolate Cake', \
+         body: 'To make a rich chocolate cake, combine cocoa powder, flour, sugar, eggs, and butter.', \
+         embedding: [0.0, 1.0, 0.0]})",
+    ).await?;
+    tx.execute(
+        "CREATE (:Article {title: 'Rust Concurrency', \
+         body: 'Rust provides fearless concurrency through its type system, using Send and Sync traits to prevent data races at compile time.', \
+         embedding: [0.9, 0.1, 0.0]})",
+    ).await?;
+    tx.execute(
+        "CREATE (:Article {title: 'Garden Tips', \
+         body: 'Plant tomatoes in full sun with well-drained soil. Water deeply but infrequently for best results.', \
+         embedding: [0.0, 0.0, 1.0]})",
+    ).await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    // First-run path downloads ~500 MB (quantized variant), then warms a
+    // generative-style decoder forward pass per (query, doc) pair; this is
+    // the slowest of the three reranker tests. Allow up to 15 minutes.
+    let result = db
+        .session()
+        .query_with(
+            "CALL uni.vector.query('Article', 'embedding', [1.0, 0.0, 0.0], 4, null, null, \
+         {reranker: 'rerank/qwen3', reranker_property: 'body', \
+          reranker_query: 'How does Rust handle memory safety?'}) \
+         YIELD node, score, rerank_score \
+         RETURN node.title AS title, score, rerank_score \
+         ORDER BY rerank_score DESC",
+        )
+        .timeout(std::time::Duration::from_secs(900))
+        .fetch_all()
+        .await?;
+
+    assert_eq!(result.len(), 4, "Should return all 4 articles");
+
+    let order = titles(&result);
+    eprintln!("Qwen3 reranked order: {:?}", order);
+    for (i, title) in order.iter().enumerate() {
+        let rs = get_f64(&result, i, "rerank_score").unwrap();
+        eprintln!("  {}: rerank_score={:.4}", title, rs);
+    }
+
+    // Generative path returns softmax probabilities — every score must
+    // lie in [0.0, 1.0]. Pin this to make the cross-encoder vs
+    // generative score-scale asymmetry auditable: any future regression
+    // that returns raw logits here would fail this assertion.
+    for i in 0..result.len() {
+        let rs = get_f64(&result, i, "rerank_score").unwrap();
+        assert!(
+            rs >= 0.0 && rs <= 1.0,
+            "Qwen3 rerank_score must be a probability in [0, 1], got {rs} at row {i}"
+        );
+    }
+
+    // Top result must be a Rust article (memory-safety query).
+    assert!(
+        order[0] == "Rust Ownership" || order[0] == "Rust Concurrency",
+        "Top result should be a Rust article, got: {}",
+        order[0]
+    );
+    let top_2: Vec<&str> = order[..2].iter().map(|s| s.as_str()).collect();
+    assert!(
+        top_2.contains(&"Rust Ownership") && top_2.contains(&"Rust Concurrency"),
+        "Top 2 should be both Rust articles, got: {:?}",
+        top_2
+    );
+
+    Ok(())
+}

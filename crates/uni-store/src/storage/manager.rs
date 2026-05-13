@@ -71,6 +71,14 @@ pub struct StorageManager {
     pub flush_in_progress: std::sync::atomic::AtomicBool,
     /// Optional pinned snapshot for time-travel
     pinned_snapshot: Option<SnapshotManifest>,
+    /// Optional fork scope for branch-aware reads (Phase 1 read-only).
+    ///
+    /// Mutually exclusive with `pinned_snapshot`: a single
+    /// `StorageManager` is either pinned to a snapshot or scoped to a
+    /// fork, never both. Phase 4's `pin_to_version` on a forked session
+    /// builds a separate combined manager out of band; Phase 1 forbids
+    /// mixing.
+    fork_scope: Option<Arc<crate::fork::ForkScope>>,
     /// Pluggable storage backend.
     backend: Arc<dyn StorageBackend>,
     /// In-memory VID-to-labels index for O(1) lookups (optional, configurable)
@@ -147,6 +155,7 @@ impl StorageManager {
             compaction_status: Arc::new(Mutex::new(CompactionStatus::default())),
             flush_in_progress: std::sync::atomic::AtomicBool::new(false),
             pinned_snapshot: None,
+            fork_scope: None,
             backend,
             vid_labels_index: None,
         };
@@ -277,6 +286,13 @@ impl StorageManager {
     }
 
     pub fn pinned(&self, snapshot: SnapshotManifest) -> Self {
+        // Phase 4a: pinning a forked session is now supported. The
+        // resulting StorageManager keeps `fork_scope` so reads continue
+        // to route through the fork's Lance branches via `base_paths`,
+        // and adds `pinned_snapshot` so writers / writers' read views
+        // resolve at the snapshot's HWM. Writes are gated separately by
+        // the session-level `is_pinned` check (`Session::tx` rejects
+        // them via `UniError::ReadOnly`).
         Self {
             base_uri: self.base_uri.clone(),
             store: self.store.clone(),
@@ -290,9 +306,95 @@ impl StorageManager {
             compaction_status: Arc::new(Mutex::new(CompactionStatus::default())),
             flush_in_progress: std::sync::atomic::AtomicBool::new(false),
             pinned_snapshot: Some(snapshot),
+            fork_scope: self.fork_scope.clone(),
             backend: self.backend.clone(),
             vid_labels_index: self.vid_labels_index.clone(),
         }
+    }
+
+    /// Construct a fork-scoped clone of this `StorageManager`.
+    ///
+    /// All reads through dataset factories *and* through `backend()`
+    /// on the returned manager route through the fork's Lance branches
+    /// via `base_paths`. The `AdjacencyManager` is fresh (per Issue
+    /// #73 reasoning — same as `pinned`) to prevent primary's CSR from
+    /// leaking into the fork. `fork_scope` and `pinned_snapshot` are
+    /// mutually exclusive.
+    ///
+    /// The backend is wrapped in [`crate::backend::branched::BranchedBackend`]
+    /// so that every `ScanRequest` constructed *anywhere* (PropertyManager,
+    /// MainVertexDataset static methods, etc.) automatically picks up
+    /// the fork's branch for tables the fork has branched. Untracked
+    /// tables fall back to primary, matching Phase 1 read semantics.
+    pub fn at_fork(&self, scope: Arc<crate::fork::ForkScope>) -> Self {
+        self.at_fork_with_schema(scope, self.schema_manager.clone())
+    }
+
+    /// Variant of [`Self::at_fork`] that uses an explicit
+    /// `merged_schema` for the fork's storage rather than primary's
+    /// schema_manager. Used by `UniInner::at_fork` so that the
+    /// fork-side strict-schema checks (in `uni-query` / `uni-store`'s
+    /// writer) see fork-local labels and edge types added through
+    /// `Session::fork_schema()`. Without this, those checks would
+    /// route through primary's schema and reject fork-local labels.
+    pub fn at_fork_with_schema(
+        &self,
+        scope: Arc<crate::fork::ForkScope>,
+        merged_schema: Arc<SchemaManager>,
+    ) -> Self {
+        debug_assert!(
+            self.pinned_snapshot.is_none(),
+            "forking a pinned StorageManager is unsupported in Phase 1"
+        );
+        let branched_backend: Arc<dyn StorageBackend> = Arc::new(
+            crate::backend::branched::BranchedBackend::new(self.backend.clone(), scope.clone()),
+        );
+        Self {
+            base_uri: self.base_uri.clone(),
+            store: self.store.clone(),
+            schema_manager: merged_schema,
+            snapshot_manager: self.snapshot_manager.clone(),
+            adjacency_manager: Arc::new(AdjacencyManager::new(self.adjacency_manager.max_bytes())),
+            config: self.config.clone(),
+            compaction_status: Arc::new(Mutex::new(CompactionStatus::default())),
+            flush_in_progress: std::sync::atomic::AtomicBool::new(false),
+            pinned_snapshot: None,
+            fork_scope: Some(scope),
+            backend: branched_backend,
+            vid_labels_index: self.vid_labels_index.clone(),
+        }
+    }
+
+    /// Borrow the active fork scope, if any.
+    pub fn fork_scope(&self) -> Option<&Arc<crate::fork::ForkScope>> {
+        self.fork_scope.as_ref()
+    }
+
+    /// Phase 5a: query whether a fork-local index exists for the
+    /// `(label, column)` pair on the active fork scope. Returns
+    /// `None` outside a fork or when no fork-local build has
+    /// completed for that pair.
+    ///
+    /// The planner consults this to decide whether to emit
+    /// `FusedIndexScan` (returns `Some`) or fall back to the
+    /// inherited primary index via `base_paths` (returns `None`).
+    /// The lookup is a `DashMap::get` on `ForkScope` — O(1) and
+    /// safe to call per query without caching above this layer.
+    #[must_use]
+    pub fn fork_index_exists(
+        &self,
+        label: &str,
+        column: &str,
+    ) -> Option<crate::fork::ForkLocalIndexKind> {
+        self.fork_scope
+            .as_ref()
+            .and_then(|s| s.fork_local_index(label, column))
+    }
+
+    /// Base URI for this storage manager (the directory or remote
+    /// prefix under which dataset directories live).
+    pub fn base_uri(&self) -> &str {
+        &self.base_uri
     }
 
     pub fn get_edge_version_by_id(&self, edge_type_id: u32) -> Option<u64> {
@@ -1202,7 +1304,16 @@ impl StorageManager {
             .labels
             .get(label)
             .ok_or_else(|| anyhow!("Label '{}' not found", label))?;
-        Ok(VertexDataset::new(&self.base_uri, label, label_meta.id))
+        let key = format!("vertices_{label}");
+        match self.fork_branch_for(&key) {
+            Some(branch) => Ok(VertexDataset::new_branched(
+                &self.base_uri,
+                label,
+                label_meta.id,
+                branch,
+            )),
+            None => Ok(VertexDataset::new(&self.base_uri, label, label_meta.id)),
+        }
     }
 
     #[cfg(feature = "lance-backend")]
@@ -1212,16 +1323,35 @@ impl StorageManager {
         src_label: &str,
         dst_label: &str,
     ) -> Result<EdgeDataset> {
-        Ok(EdgeDataset::new(
-            &self.base_uri,
-            edge_type,
-            src_label,
-            dst_label,
-        ))
+        let key = format!("edges_{edge_type}");
+        match self.fork_branch_for(&key) {
+            Some(branch) => Ok(EdgeDataset::new_branched(
+                &self.base_uri,
+                edge_type,
+                src_label,
+                dst_label,
+                branch,
+            )),
+            None => Ok(EdgeDataset::new(
+                &self.base_uri,
+                edge_type,
+                src_label,
+                dst_label,
+            )),
+        }
     }
 
     pub fn delta_dataset(&self, edge_type: &str, direction: &str) -> Result<DeltaDataset> {
-        Ok(DeltaDataset::new(&self.base_uri, edge_type, direction))
+        let key = format!("deltas_{edge_type}_{direction}");
+        match self.fork_branch_for(&key) {
+            Some(branch) => Ok(DeltaDataset::new_branched(
+                &self.base_uri,
+                edge_type,
+                direction,
+                branch,
+            )),
+            None => Ok(DeltaDataset::new(&self.base_uri, edge_type, direction)),
+        }
     }
 
     pub fn adjacency_dataset(
@@ -1230,12 +1360,31 @@ impl StorageManager {
         label: &str,
         direction: &str,
     ) -> Result<AdjacencyDataset> {
-        Ok(AdjacencyDataset::new(
-            &self.base_uri,
-            edge_type,
-            label,
-            direction,
-        ))
+        let key = format!("adjacency_{direction}_{edge_type}_{label}");
+        match self.fork_branch_for(&key) {
+            Some(branch) => Ok(AdjacencyDataset::new_branched(
+                &self.base_uri,
+                edge_type,
+                label,
+                direction,
+                branch,
+            )),
+            None => Ok(AdjacencyDataset::new(
+                &self.base_uri,
+                edge_type,
+                label,
+                direction,
+            )),
+        }
+    }
+
+    /// Look up the branch name for a dataset under the active fork
+    /// scope, if any. Returns `None` when not forked, or when the fork
+    /// hasn't recorded a branch on this dataset yet (Phase 2 territory).
+    fn fork_branch_for(&self, dataset_name: &str) -> Option<String> {
+        self.fork_scope
+            .as_ref()
+            .and_then(|s| s.branch_for(dataset_name))
     }
 
     /// Get the main vertex dataset for unified vertex storage.

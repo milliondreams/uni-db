@@ -7,9 +7,12 @@
 //! must implement, along with supporting types for queries, writes, and
 //! index management.
 
+pub mod branched;
 pub mod capabilities;
 #[cfg(feature = "lance-backend")]
 pub mod lance;
+#[cfg(feature = "lance-backend")]
+pub mod lance_branch;
 pub mod table_names;
 pub mod traits;
 pub mod types;

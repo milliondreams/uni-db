@@ -12,6 +12,7 @@ pub mod value;
 
 pub mod core {
     pub mod edge_type;
+    pub mod fork;
     pub mod id;
     pub mod schema;
     pub mod snapshot;
@@ -25,6 +26,7 @@ pub mod graph {
 pub use api::error::{Result, UniError};
 pub use config::{CloudStorageConfig, UniConfig};
 pub use core::edge_type::EdgeTypeId;
+pub use core::fork::{ForkId, ForkInfo, ForkRegistryFile, ForkStatus, SchemaDelta};
 pub use core::id::{Eid, UniId, Vid};
 pub use core::schema::{CrdtType, DataType, Schema};
 pub use graph::simple_graph::SimpleGraph;

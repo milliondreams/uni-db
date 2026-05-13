@@ -37,6 +37,10 @@ pub use api::xervo::{RawTensorModel, TensorBatch, TensorSpec, TensorValue};
 pub use api::xervo::{RerankerModel, ScoredDoc, UniXervo};
 
 // Re-exports from xervo for catalog parsing
+pub use api::fork_diff::{
+    DiffEdge, DiffVertex, EdgeDiff, EdgePropertyChange, ForkDiff, PromotePattern, PromoteReport,
+    PropertyChange, VertexDiff, VertexPropertyChange,
+};
 pub use api::{DatabaseMetrics, ThrottlePressure, Uni, UniBuilder};
 pub use uni_xervo::api::{
     ModelAliasSpec, ModelTask, WarmupPolicy, catalog_from_file as xervo_catalog_from_file,

@@ -1701,6 +1701,31 @@ pub struct QppStepInfo {
     pub target_label: Option<String>,
 }
 
+/// Phase 5a-impl: per-type fusion strategy for `LogicalPlan::FusedIndexScan`.
+///
+/// `#[non_exhaustive]` so Phase 5b can add `AnnRerank` and `Bm25Rrf`
+/// without breaking downstream pattern-match exhaustiveness.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum FusionKind {
+    /// Union of parent + fork-local BTree hits, deduped by VID.
+    BtreeUnion,
+    /// k-way merge of pre-sorted parent + fork streams (ORDER BY).
+    SortedKWayMerge,
+    /// Fork-first UID lookup; falls back to parent on miss. Used
+    /// when a fork rebinds an external UID and queries must see the
+    /// fork's binding before the parent's.
+    VidUidForkFirst,
+    /// Phase 5b — vector ANN rerank: top-k from primary's index +
+    /// top-k from fork-local index, merged and reranked by exact
+    /// distance. Recall ≥ 95% per spec §8.2.
+    AnnRerank,
+    /// Phase 5b — BM25 reciprocal rank fusion: ranked lists from
+    /// primary's and fork-local FTS indexes combined via standard
+    /// RRF (`score = sum 1 / (k_rrf + rank_i)`, k_rrf = 60).
+    Bm25Rrf,
+}
+
 /// Logical query plan produced by [`QueryPlanner`].
 ///
 /// Each variant represents one step in the Cypher execution pipeline.
@@ -1722,6 +1747,41 @@ pub enum LogicalPlan {
         variable: String,
         filter: Option<Expr>,
         optional: bool,
+    },
+    /// Phase 5a-impl: fused scan over both primary's index and the
+    /// forked session's fork-local index. Emitted by the planner only
+    /// when (a) the session is forked AND (b) `StorageManager::fork_index_exists`
+    /// returns `Some(_)` for the target column. Otherwise the planner
+    /// keeps emitting `Scan` and Lance's `base_paths` chain transparently
+    /// covers parent-inherited indexes.
+    ///
+    /// `kind` selects the per-type fusion strategy:
+    /// - `BtreeUnion` — union of parent + fork hits, dedup by VID.
+    /// - `SortedKWayMerge` — k-way merge of two pre-sorted streams.
+    /// - `VidUidForkFirst` — probe fork's branch first, fall back to
+    ///   parent's UID index on miss.
+    FusedIndexScan {
+        label_id: u16,
+        labels: Vec<String>,
+        variable: String,
+        filter: Option<Expr>,
+        optional: bool,
+        kind: FusionKind,
+    },
+    /// Phase 5b followup: planner-side observability marker for the
+    /// lossy fusion types. Wraps the original `VectorKnn` or
+    /// `InvertedIndexLookup` (or any future leaf operator whose
+    /// shape differs from `Scan`) without changing its fields, so
+    /// the physical planner can decay it to `inner` unchanged.
+    ///
+    /// Runtime behavior is identical to running `inner` directly;
+    /// the wrap is purely for explain-plan and runtime-stats
+    /// observability. The actual fusion happens at the
+    /// `BranchedBackend` layer (per-branch Lance reads via
+    /// `base_paths`), exactly as in Phase 5b's core ship.
+    FusedIndexScanWrapped {
+        inner: Box<LogicalPlan>,
+        kind: FusionKind,
     },
     /// Lookup vertices by ext_id using the main vertices table.
     /// Used when a query references ext_id without specifying a label.
@@ -5172,6 +5232,51 @@ impl QueryPlanner {
         )
     }
 
+    /// Decide whether per-label `Scan` branches for a label disjunction can
+    /// safely be combined under `LogicalPlan::Union`. Returns `true` iff every
+    /// label in `labels` is registered in the schema AND every pair shares an
+    /// identical property name+type set.
+    ///
+    /// When this returns `false`, the disjunction must fall back to a single
+    /// `ScanMainByLabels` over all labels — otherwise DataFusion's
+    /// `UnionExec::try_new` panics in `union_schema` because the per-label
+    /// `GraphScanExec` outputs (`_vid` + `_labels` + per-label projected
+    /// properties) have different field counts. Issue rustic-ai/uni-db#62.
+    ///
+    /// We deliberately compare full schema property sets rather than only the
+    /// properties referenced by the current query: at this logical-planning
+    /// stage we have not yet collected `all_properties`, and `*` wildcards
+    /// (e.g. from unknown function calls) would expand per-label downstream
+    /// in `df_planner::resolve_properties` even when the query text only
+    /// touches common columns.
+    fn label_branches_share_property_schema(&self, labels: &[String]) -> bool {
+        if labels.len() < 2 {
+            return true;
+        }
+        let mut iter = labels.iter();
+        let first = iter.next().expect("len >= 2");
+        let Some(first_props) = self.schema.properties.get(first) else {
+            return false;
+        };
+        for label in iter {
+            let Some(props) = self.schema.properties.get(label) else {
+                return false;
+            };
+            if props.len() != first_props.len() {
+                return false;
+            }
+            for (name, meta) in first_props {
+                let Some(other_meta) = props.get(name) else {
+                    return false;
+                };
+                if meta.r#type != other_meta.r#type {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     /// Plan an unbound node (creates a Scan, ScanAll, ScanMainByLabel, ExtIdLookup, or CrossJoin).
     fn plan_unbound_node(
         &self,
@@ -5277,21 +5382,42 @@ impl QueryPlanner {
         // is encoded the same way the parser already encodes single edge
         // types, and reduces to one Scan with no Union wrapping.
         if node.labels.is_proper_disjunction() {
-            let mut branches: Vec<LogicalPlan> = Vec::with_capacity(node.labels.len());
-            for label_name in node.labels.names() {
-                let branch = if let Some(meta) = self.schema.get_label_case_insensitive(label_name)
-                {
-                    LogicalPlan::Scan {
-                        label_id: meta.id,
+            let label_names: Vec<String> = node.labels.names().to_vec();
+
+            // Per-label branches under a `Union` only line up when every
+            // branch produces the same Arrow schema. The narrow-scan
+            // `Scan` path resolves columns *per label*, so heterogeneous
+            // property sets (or any schemaless label in the mix) yield
+            // mismatched widths and DataFusion's `UnionExec::try_new`
+            // panics inside `union_schema` (issue rustic-ai/uni-db#62).
+            //
+            // For those cases, lower every branch to a *single-label*
+            // `ScanMainByLabels` instead. The schemaless main-table scan
+            // resolves columns from `all_properties` directly (no per-label
+            // expansion), so all branches emit a uniform schema and the
+            // outer `Union { all: false }` deduplicates correctly. We
+            // keep the per-branch Union shape (rather than collapsing to
+            // a single multi-label scan) because multi-label
+            // `ScanMainByLabels` has AND/intersection semantics — wrong
+            // for a disjunction.
+            let use_main_table_branches = !self.label_branches_share_property_schema(&label_names);
+
+            let mut branches: Vec<LogicalPlan> = Vec::with_capacity(label_names.len());
+            for label_name in &label_names {
+                let branch = if use_main_table_branches {
+                    LogicalPlan::ScanMainByLabels {
                         labels: vec![label_name.clone()],
                         variable: variable.to_string(),
                         filter: node_scan_filter.clone(),
                         optional,
                     }
                 } else {
-                    // Schemaless branch — fall back to main-table label
-                    // filter so unknown labels still match.
-                    LogicalPlan::ScanMainByLabels {
+                    let meta = self
+                        .schema
+                        .get_label_case_insensitive(label_name)
+                        .expect("share_property_schema true implies all labels in schema");
+                    LogicalPlan::Scan {
+                        label_id: meta.id,
                         labels: vec![label_name.clone()],
                         variable: variable.to_string(),
                         filter: node_scan_filter.clone(),
@@ -5807,18 +5933,29 @@ impl QueryPlanner {
                 filter,
                 optional: scan_optional,
             } if var == variable => {
+                // Heterogeneous (or any-schemaless) disjunction: route every
+                // branch through a single-label `ScanMainByLabels` so all
+                // branches emit a uniform schemaless schema. Avoids the
+                // DataFusion `union_schema` panic. See `plan_unbound_node`
+                // and issue rustic-ai/uni-db#62.
+                let use_main_table_branches = !self.label_branches_share_property_schema(labels);
+
                 let mut branches: Vec<LogicalPlan> = Vec::with_capacity(labels.len());
                 for label in labels {
-                    let branch = if let Some(meta) = self.schema.get_label_case_insensitive(label) {
-                        LogicalPlan::Scan {
-                            label_id: meta.id,
+                    let branch = if use_main_table_branches {
+                        LogicalPlan::ScanMainByLabels {
                             labels: vec![label.clone()],
                             variable: variable.to_string(),
                             filter: filter.clone(),
                             optional: scan_optional || optional,
                         }
                     } else {
-                        LogicalPlan::ScanMainByLabels {
+                        let meta = self
+                            .schema
+                            .get_label_case_insensitive(label)
+                            .expect("share_property_schema true implies all labels in schema");
+                        LogicalPlan::Scan {
+                            label_id: meta.id,
                             labels: vec![label.clone()],
                             variable: variable.to_string(),
                             filter: filter.clone(),
@@ -8589,6 +8726,374 @@ fn analyze_function_property_requirements(
             }
         }
     }
+}
+
+// ============================================================================
+// Phase 5a-impl — fork-aware fusion rewrite
+// ============================================================================
+
+/// Trait that exposes the per-fork "is there a fork-local index for
+/// `(label, column)`?" lookup. Implemented for `StorageManager` so
+/// callers don't need to depend on the fork module directly; tests
+/// can mock by implementing it on a `HashMap`.
+pub trait ForkIndexLookup {
+    fn fork_index_for(
+        &self,
+        label: &str,
+        column: &str,
+    ) -> Option<uni_store::fork::ForkLocalIndexKind>;
+
+    /// Phase 5b followup: resolve a label id, then dispatch to
+    /// `fork_index_for`. Used by the rewrite when wrapping
+    /// `VectorKnn` and `InvertedIndexLookup` nodes which carry
+    /// `label_id: u16` rather than the label name. Default returns
+    /// `None`; the `StorageManager` impl resolves via its
+    /// `schema_manager`.
+    fn fork_index_for_label_id(
+        &self,
+        _label_id: u16,
+        _column: &str,
+    ) -> Option<uni_store::fork::ForkLocalIndexKind> {
+        None
+    }
+}
+
+impl ForkIndexLookup for uni_store::storage::StorageManager {
+    fn fork_index_for(
+        &self,
+        label: &str,
+        column: &str,
+    ) -> Option<uni_store::fork::ForkLocalIndexKind> {
+        self.fork_index_exists(label, column)
+    }
+
+    fn fork_index_for_label_id(
+        &self,
+        label_id: u16,
+        column: &str,
+    ) -> Option<uni_store::fork::ForkLocalIndexKind> {
+        let schema = self.schema_manager().schema();
+        let label_name = schema.label_name_by_id(label_id)?;
+        self.fork_index_exists(label_name, column)
+    }
+}
+
+/// Walk a [`LogicalPlan`] tree and rewrite each `Scan` whose target
+/// `(label, column)` has a registered fork-local index into the
+/// matching `FusedIndexScan` variant.
+///
+/// Phase 5a-impl Step 4 covers `VidUidForkFirst`; Steps 5 and 6 add
+/// `BtreeUnion` and `SortedKWayMerge` by extending `kind_for_filter`.
+///
+/// Idempotent: a tree that already contains `FusedIndexScan` nodes
+/// passes through unchanged.
+#[must_use]
+pub fn rewrite_for_fork_fusion<L: ForkIndexLookup>(plan: LogicalPlan, lookup: &L) -> LogicalPlan {
+    rewrite_node(plan, lookup)
+}
+
+fn rewrite_node<L: ForkIndexLookup>(plan: LogicalPlan, lookup: &L) -> LogicalPlan {
+    match plan {
+        LogicalPlan::Scan {
+            label_id,
+            labels,
+            variable,
+            filter,
+            optional,
+        } => {
+            // VidUid fusion only fires on a single-label scan with an
+            // equality filter on a registered UID column. BTree and
+            // Sorted will extend this match in Steps 5 and 6.
+            let kind = if labels.len() == 1
+                && let Some(col) = filter
+                    .as_ref()
+                    .and_then(|f| equality_target_column(f, &variable))
+                && let Some(idx_kind) = lookup.fork_index_for(&labels[0], &col)
+            {
+                into_fusion_kind(idx_kind)
+            } else {
+                None
+            };
+            match kind {
+                Some(kind) => LogicalPlan::FusedIndexScan {
+                    label_id,
+                    labels,
+                    variable,
+                    filter,
+                    optional,
+                    kind,
+                },
+                None => LogicalPlan::Scan {
+                    label_id,
+                    labels,
+                    variable,
+                    filter,
+                    optional,
+                },
+            }
+        }
+        // Phase 5b followup: wrap lossy leaf operators when a
+        // matching fork-local index has been registered. The wrap
+        // preserves the original node's fields (the physical
+        // planner unwraps and recurses); only the explain-plan
+        // surface and runtime-stats operator name change. The
+        // actual fusion still happens at the `BranchedBackend`
+        // layer via Lance's per-branch reads.
+        //
+        // The CALL-style vector/FTS queries land as `ProcedureCall`
+        // (not the dedicated `VectorKnn`/`InvertedIndexLookup`
+        // operators); recognize those by procedure name and the
+        // shape of their first two arguments (`label, column, ...`).
+        LogicalPlan::ProcedureCall {
+            procedure_name,
+            arguments,
+            yield_items,
+        } => {
+            let kind = procedure_call_fusion_kind(&procedure_name, &arguments, lookup);
+            let inner = LogicalPlan::ProcedureCall {
+                procedure_name,
+                arguments,
+                yield_items,
+            };
+            match kind {
+                Some(kind) => LogicalPlan::FusedIndexScanWrapped {
+                    inner: Box::new(inner),
+                    kind,
+                },
+                None => inner,
+            }
+        }
+        LogicalPlan::VectorKnn {
+            label_id,
+            variable,
+            property,
+            query,
+            k,
+            threshold,
+        } => {
+            if let Some(idx_kind) = lookup.fork_index_for_label_id(label_id, &property)
+                && let Some(kind) = into_fusion_kind(idx_kind)
+            {
+                LogicalPlan::FusedIndexScanWrapped {
+                    inner: Box::new(LogicalPlan::VectorKnn {
+                        label_id,
+                        variable,
+                        property,
+                        query,
+                        k,
+                        threshold,
+                    }),
+                    kind,
+                }
+            } else {
+                LogicalPlan::VectorKnn {
+                    label_id,
+                    variable,
+                    property,
+                    query,
+                    k,
+                    threshold,
+                }
+            }
+        }
+        LogicalPlan::InvertedIndexLookup {
+            label_id,
+            variable,
+            property,
+            terms,
+        } => {
+            if let Some(idx_kind) = lookup.fork_index_for_label_id(label_id, &property)
+                && let Some(kind) = into_fusion_kind(idx_kind)
+            {
+                LogicalPlan::FusedIndexScanWrapped {
+                    inner: Box::new(LogicalPlan::InvertedIndexLookup {
+                        label_id,
+                        variable,
+                        property,
+                        terms,
+                    }),
+                    kind,
+                }
+            } else {
+                LogicalPlan::InvertedIndexLookup {
+                    label_id,
+                    variable,
+                    property,
+                    terms,
+                }
+            }
+        }
+        // Tree-recursive variants — only the ones that can carry a
+        // Scan in their subtree need to recurse here. Adding more is
+        // safe (a missing recursion just means fusion doesn't fire
+        // for that nested context, not incorrect results).
+        LogicalPlan::Filter {
+            input,
+            predicate,
+            optional_variables,
+        } => LogicalPlan::Filter {
+            input: Box::new(rewrite_node(*input, lookup)),
+            predicate,
+            optional_variables,
+        },
+        LogicalPlan::Project { input, projections } => LogicalPlan::Project {
+            input: Box::new(rewrite_node(*input, lookup)),
+            projections,
+        },
+        LogicalPlan::Limit { input, skip, fetch } => LogicalPlan::Limit {
+            input: Box::new(rewrite_node(*input, lookup)),
+            skip,
+            fetch,
+        },
+        LogicalPlan::Sort { input, order_by } => {
+            // Phase 5a-impl Sorted fusion: when the immediate child
+            // is a single-label Scan AND the sole sort key is a
+            // single-column property reference on that scan's
+            // variable AND the column has a fork-local Sorted index
+            // registered, rewrite to FusedIndexScan { SortedKWayMerge }.
+            // Otherwise recurse normally.
+            let new_input = match (*input, &order_by[..]) {
+                (
+                    LogicalPlan::Scan {
+                        label_id,
+                        labels,
+                        variable,
+                        filter,
+                        optional,
+                    },
+                    [single_sort],
+                ) if labels.len() == 1
+                    && let Some(col) = column_of_scan_variable(&single_sort.expr, &variable)
+                    && let Some(uni_store::fork::ForkLocalIndexKind::Sorted) =
+                        lookup.fork_index_for(&labels[0], &col) =>
+                {
+                    LogicalPlan::FusedIndexScan {
+                        label_id,
+                        labels,
+                        variable,
+                        filter,
+                        optional,
+                        kind: FusionKind::SortedKWayMerge,
+                    }
+                }
+                (other_input, _) => rewrite_node(other_input, lookup),
+            };
+            LogicalPlan::Sort {
+                input: Box::new(new_input),
+                order_by,
+            }
+        }
+        LogicalPlan::Union { left, right, all } => LogicalPlan::Union {
+            left: Box::new(rewrite_node(*left, lookup)),
+            right: Box::new(rewrite_node(*right, lookup)),
+            all,
+        },
+        // Everything else passes through unchanged. Adding more
+        // arms is purely additive — fusion just doesn't fire inside
+        // un-recursed-into subtrees.
+        other => other,
+    }
+}
+
+/// Phase 5b followup: inspect a CALL-style procedure invocation
+/// for a `(label, column)` pair and check whether a fork-local
+/// index has been registered for it.
+///
+/// Recognizes:
+/// - `uni.vector.query(label, column, query_vec, k)` → `AnnRerank`
+///   when a `Vector` fork-local index exists.
+/// - `uni.fts.query(label, column, query, k)` → `Bm25Rrf` when a
+///   `FullText` fork-local index exists.
+///
+/// Returns `None` for any other procedure (no rewrite) or when the
+/// registry has no matching entry.
+fn procedure_call_fusion_kind<L: ForkIndexLookup>(
+    procedure_name: &str,
+    arguments: &[Expr],
+    lookup: &L,
+) -> Option<FusionKind> {
+    if arguments.len() < 2 {
+        return None;
+    }
+    let label = match &arguments[0] {
+        Expr::Literal(uni_cypher::ast::CypherLiteral::String(s)) => s.as_str(),
+        _ => return None,
+    };
+    let column = match &arguments[1] {
+        Expr::Literal(uni_cypher::ast::CypherLiteral::String(s)) => s.as_str(),
+        _ => return None,
+    };
+    let expected = match procedure_name {
+        "uni.vector.query" => uni_store::fork::ForkLocalIndexKind::Vector,
+        "uni.fts.query" => uni_store::fork::ForkLocalIndexKind::FullText,
+        _ => return None,
+    };
+    let registered = lookup.fork_index_for(label, column)?;
+    if registered != expected {
+        return None;
+    }
+    into_fusion_kind(registered)
+}
+
+/// Map a fork-local index kind to its planner-side fusion variant.
+/// Returns `None` for any future `ForkLocalIndexKind` we don't yet
+/// know how to fuse — the caller falls back to a regular Scan.
+fn into_fusion_kind(kind: uni_store::fork::ForkLocalIndexKind) -> Option<FusionKind> {
+    use uni_store::fork::ForkLocalIndexKind as K;
+    match kind {
+        K::VidUid => Some(FusionKind::VidUidForkFirst),
+        K::ScalarBtree => Some(FusionKind::BtreeUnion),
+        K::Sorted => Some(FusionKind::SortedKWayMerge),
+        K::Vector => Some(FusionKind::AnnRerank),
+        K::FullText => Some(FusionKind::Bm25Rrf),
+        // `ForkLocalIndexKind` is `#[non_exhaustive]`; future kinds
+        // we don't yet handle are silently passed through as a
+        // regular Scan so a forward-incompatible binary doesn't
+        // panic — just misses the fusion opportunity.
+        _ => None,
+    }
+}
+
+/// Inspect a Scan filter `Expr` for a single-column equality predicate
+/// against the scan's variable. Returns the column name if the
+/// predicate matches the shape `variable.column = <literal_or_param>`
+/// (or its commuted form). Returns `None` for any other shape — fusion
+/// only fires on the simple case in Phase 5a-impl.
+fn equality_target_column(filter: &Expr, scan_variable: &str) -> Option<String> {
+    let (lhs, rhs) = match filter {
+        Expr::BinaryOp {
+            left,
+            op: uni_cypher::ast::BinaryOp::Eq,
+            right,
+        } => (left.as_ref(), right.as_ref()),
+        _ => return None,
+    };
+    // Try lhs = column-of-scan-var, rhs = literal/param; or commuted.
+    if let Some(col) = column_of_scan_variable(lhs, scan_variable)
+        && is_constant_or_param(rhs)
+    {
+        return Some(col);
+    }
+    if let Some(col) = column_of_scan_variable(rhs, scan_variable)
+        && is_constant_or_param(lhs)
+    {
+        return Some(col);
+    }
+    None
+}
+
+fn column_of_scan_variable(expr: &Expr, scan_variable: &str) -> Option<String> {
+    if let Expr::Property(base, prop) = expr
+        && let Expr::Variable(v) = base.as_ref()
+        && v == scan_variable
+    {
+        return Some(prop.clone());
+    }
+    None
+}
+
+fn is_constant_or_param(expr: &Expr) -> bool {
+    matches!(expr, Expr::Literal(_) | Expr::Parameter(_))
 }
 
 #[cfg(test)]

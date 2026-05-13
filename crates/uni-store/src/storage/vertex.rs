@@ -24,6 +24,15 @@ pub struct VertexDataset {
     uri: String,
     label: String,
     _label_id: u16,
+    /// Lance branch to read from. `None` = primary (main).
+    ///
+    /// Set by `StorageManager::vertex_dataset` when the manager has a
+    /// fork scope active. Branched opens go through
+    /// `crate::backend::lance_branch::open_branch`; primary opens use
+    /// the default `Dataset::open` path. Writes are gated at the API
+    /// layer in Phase 1, so a forked dataset never reaches a write path.
+    #[cfg_attr(not(feature = "lance-backend"), allow(dead_code))]
+    branch: Option<String>,
 }
 
 impl VertexDataset {
@@ -33,7 +42,20 @@ impl VertexDataset {
             uri,
             label: label.to_string(),
             _label_id: label_id,
+            branch: None,
         }
+    }
+
+    /// Construct a vertex dataset that reads from a Lance branch.
+    pub fn new_branched(
+        base_uri: &str,
+        label: &str,
+        label_id: u16,
+        branch: impl Into<String>,
+    ) -> Self {
+        let mut ds = Self::new(base_uri, label, label_id);
+        ds.branch = Some(branch.into());
+        ds
     }
 
     /// Compute UniId from vertex content.
@@ -72,7 +94,7 @@ impl VertexDataset {
 
     #[cfg(feature = "lance-backend")]
     pub async fn open_at(&self, version: Option<u64>) -> Result<Arc<Dataset>> {
-        let mut ds = Dataset::open(&self.uri).await?;
+        let mut ds = self.open_raw_inner().await?;
         if let Some(v) = version {
             ds = ds.checkout_version(v).await?;
         }
@@ -81,8 +103,20 @@ impl VertexDataset {
 
     #[cfg(feature = "lance-backend")]
     pub async fn open_raw(&self) -> Result<Dataset> {
-        let ds = Dataset::open(&self.uri).await?;
-        Ok(ds)
+        self.open_raw_inner().await
+    }
+
+    /// Open the underlying Lance dataset, routing through a branch
+    /// when this `VertexDataset` was constructed with one.
+    #[cfg(feature = "lance-backend")]
+    async fn open_raw_inner(&self) -> Result<Dataset> {
+        match &self.branch {
+            Some(branch) => crate::backend::lance_branch::open_branch(&self.uri, branch).await,
+            None => {
+                let ds = Dataset::open(&self.uri).await?;
+                Ok(ds)
+            }
+        }
     }
 
     /// Build a record batch from vertices with optional timestamp metadata.

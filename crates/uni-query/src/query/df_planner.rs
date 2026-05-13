@@ -576,12 +576,35 @@ impl HybridPhysicalPlanner {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         match logical {
             // === Graph Operations ===
+            // Phase 5b followup: `FusedIndexScanWrapped` is a
+            // planner-side observability wrapper around lossy
+            // operators (VectorKnn, InvertedIndexLookup). The
+            // runtime fusion happens at the `BranchedBackend`
+            // layer via Lance per-branch reads; the physical
+            // planner just unwraps and recurses on the inner node.
+            LogicalPlan::FusedIndexScanWrapped { inner, kind: _ } => {
+                self.plan_internal(inner, all_properties)
+            }
             LogicalPlan::Scan {
                 label_id,
                 labels,
                 variable,
                 filter,
                 optional,
+            }
+            // Phase 5a-impl Step 3: decay `FusedIndexScan` to a plain
+            // `Scan` for now — preserves correctness because Lance's
+            // `base_paths` chain already covers parent-inherited
+            // indexes for forked sessions. Step 4 (VidUid) and
+            // beyond replace this fallback with type-specific fused
+            // physical operators.
+            | LogicalPlan::FusedIndexScan {
+                label_id,
+                labels,
+                variable,
+                filter,
+                optional,
+                kind: _,
             } => {
                 if labels.len() > 1 {
                     // Multi-label: use main table with intersection semantics
@@ -4319,6 +4342,47 @@ impl HybridPhysicalPlanner {
         let left_plan = self.plan_internal(left, all_properties)?;
         let right_plan = self.plan_internal(right, all_properties)?;
 
+        // Guard against schema mismatches reaching DataFusion's
+        // `union_schema`, which panics with `index out of bounds` rather
+        // than returning `Err` when branch widths or per-position types
+        // differ (issue rustic-ai/uni-db#62). With the planner-level
+        // fallback in place for label disjunction this should be
+        // unreachable, but a typed error here protects any future
+        // logical-Union path against the same process-aborting panic.
+        //
+        // We only compare field count and per-position **type**; the
+        // user-facing Cypher `UNION` clause routinely produces branches
+        // whose per-position field *names* differ (e.g. `MATCH (a:A)
+        // RETURN a AS a UNION MATCH (b:B) RETURN b AS a` — both branches
+        // alias their pattern variable to `a`, but internal namespaced
+        // columns like `a._vid` vs `b._vid` differ). DataFusion handles
+        // that case fine by adopting left names; only width/type
+        // mismatches are the panic source.
+        let left_schema = left_plan.schema();
+        let right_schema = right_plan.schema();
+        if left_schema.fields().len() != right_schema.fields().len()
+            || left_schema
+                .fields()
+                .iter()
+                .zip(right_schema.fields().iter())
+                .any(|(l, r)| l.data_type() != r.data_type())
+        {
+            let fmt = |s: &Schema| {
+                s.fields()
+                    .iter()
+                    .map(|f| format!("{}: {:?}", f.name(), f.data_type()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            return Err(anyhow!(
+                "Plan: cannot UNION branches with mismatched schemas — \
+                 left=[{}], right=[{}]. This is a planner bug; please file \
+                 an issue.",
+                fmt(left_schema.as_ref()),
+                fmt(right_schema.as_ref()),
+            ));
+        }
+
         let union_plan = UnionExec::try_new(vec![left_plan, right_plan])?;
 
         // UNION (without ALL) requires deduplication
@@ -5421,7 +5485,13 @@ fn resolve_fold_bindings(
 /// references to their identity columns (e.g., `n` → `n._vid` for nodes).
 fn collect_variable_kinds(plan: &LogicalPlan, kinds: &mut HashMap<String, VariableKind>) {
     match plan {
+        // Phase 5b followup: recurse into the wrapped node so the
+        // wrapped operator's variable still gets collected.
+        LogicalPlan::FusedIndexScanWrapped { inner, .. } => {
+            collect_variable_kinds(inner, kinds);
+        }
         LogicalPlan::Scan { variable, .. }
+        | LogicalPlan::FusedIndexScan { variable, .. }
         | LogicalPlan::ExtIdLookup { variable, .. }
         | LogicalPlan::ScanAll { variable, .. }
         | LogicalPlan::ScanMainByLabels { variable, .. }

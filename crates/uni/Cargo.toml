@@ -41,6 +41,7 @@ datafusion = { workspace = true }
 tokio-util = { workspace = true }
 scopeguard = "1"
 tempfile = { workspace = true }
+dashmap = "6.0"
 # Note: uni-db has no direct ort / tokenizers / hf-hub / ndarray consumers
 # after the LocalOnnxRerankerProvider hoist into uni-xervo (0.5.2). All ONNX
 # access flows through uni-xervo's provider facades.
@@ -54,6 +55,7 @@ lancedb = { workspace = true }
 parquet = { workspace = true }
 csv = { workspace = true }
 env_logger = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [[bench]]
 name = "algo_benchmarks"
@@ -69,6 +71,10 @@ harness = false
 
 [[bench]]
 name = "mutation_benchmarks"
+harness = false
+
+[[bench]]
+name = "fork_diff_promote"
 harness = false
 
 [features]

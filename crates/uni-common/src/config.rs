@@ -485,6 +485,53 @@ pub struct UniConfig {
     /// in the schema. Default: false (schemaless mode — any label or edge type
     /// is accepted and dynamically registered).
     pub strict_schema: bool,
+
+    /// Per-fork L1 fragment-count threshold above which a `tracing::warn!`
+    /// fires once per crossing during fork flush. Long-lived heavy-write
+    /// forks accumulate fragments because fork compaction is deferred to
+    /// Phase 5; this surfaces the risk operationally. Default: 256.
+    pub fork_fragment_warn_threshold: usize,
+
+    /// Phase 4a: cap on total fork count (Active + Pending + Tombstoned).
+    /// `None` = unbounded. When set, `Session::fork(name).await` errors
+    /// with `UniError::ForkBudgetExceeded` once the cap is reached.
+    /// Tombstoned forks count because they still hold branch state on
+    /// disk until recovery completes; counting them prevents churn-thrash.
+    pub max_forks: Option<usize>,
+
+    /// Phase 4a: default TTL applied to forks when the user does not
+    /// supply one via `session.fork(name).ttl(...)`. `None` = no TTL.
+    /// The background sweeper drops forks whose `ttl_expires_at` is in
+    /// the past via `drop_fork_cascade`.
+    pub fork_default_ttl: Option<Duration>,
+
+    /// Phase 4a: how often the background TTL sweeper polls the
+    /// registry for expired forks. Default: 60 seconds.
+    pub fork_sweeper_interval: Duration,
+
+    /// Phase 4a: skip spawning the TTL sweeper. Tests should set this
+    /// to `true` when they want deterministic control over fork
+    /// lifetimes; production should leave it `false`.
+    pub disable_fork_sweeper: bool,
+
+    /// Phase 5a: minimum per-fork row count (per label) before the
+    /// background `IndexRebuildManager` schedules a fork-local index
+    /// build. Below this threshold, fork reads inherit primary's
+    /// indexes through Lance `base_paths`; above it, the planner
+    /// switches to `FusedIndexScan` once the build completes. Default
+    /// 10,000 rows per spec §8.
+    pub fork_index_build_threshold: u64,
+
+    /// Phase 5a-impl Step 7: how often the background fork index
+    /// builder polls active forks for build candidates. Default
+    /// 30 seconds.
+    pub fork_index_builder_interval: Duration,
+
+    /// Phase 5a-impl Step 7: skip spawning the background fork index
+    /// builder. Tests that exercise the manual `Session::build_fork_local_index`
+    /// trigger should set this to `true` so timing isn't dependent on
+    /// the polling cadence.
+    pub disable_fork_index_builder: bool,
 }
 
 impl Default for UniConfig {
@@ -514,6 +561,14 @@ impl Default for UniConfig {
             object_store: ObjectStoreConfig::default(),
             index_rebuild: IndexRebuildConfig::default(),
             strict_schema: false,
+            fork_fragment_warn_threshold: 256,
+            max_forks: None,
+            fork_default_ttl: None,
+            fork_sweeper_interval: Duration::from_secs(60),
+            disable_fork_sweeper: false,
+            fork_index_build_threshold: 10_000,
+            fork_index_builder_interval: Duration::from_secs(30),
+            disable_fork_index_builder: false,
         }
     }
 }

@@ -936,6 +936,116 @@ impl Database {
             .map_err(crate::exceptions::uni_error_to_pyerr)
     }
 
+    // -----------------------------------------------------------------------
+    // Fork management (Phase 4b)
+    // -----------------------------------------------------------------------
+
+    /// List all currently-Active forks across the database.
+    fn list_forks(&self) -> Vec<crate::types::PyForkInfo> {
+        pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(self.inner.list_forks())
+            .into_iter()
+            .map(crate::types::PyForkInfo::from_rust)
+            .collect()
+    }
+
+    /// Look up a single fork by name. Returns `None` if the fork
+    /// doesn't exist (rather than raising `UniForkNotFoundError` —
+    /// matches the typical Python `dict.get`-style ergonomics).
+    fn fork_info(&self, name: &str) -> PyResult<Option<crate::types::PyForkInfo>> {
+        match pyo3_async_runtimes::tokio::get_runtime().block_on(self.inner.fork_info(name)) {
+            Ok(info) => Ok(Some(crate::types::PyForkInfo::from_rust(info))),
+            Err(uni_common::UniError::ForkNotFound { .. }) => Ok(None),
+            Err(e) => Err(crate::exceptions::uni_error_to_pyerr(e)),
+        }
+    }
+
+    /// Drop a fork.
+    ///
+    /// Errors with `UniForkInUseError`, `UniForkInflightTxError`, or
+    /// `UniForkHasChildrenError` (use `drop_fork_cascade` for the last).
+    fn drop_fork(&self, name: &str) -> PyResult<()> {
+        pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(self.inner.drop_fork(name))
+            .map_err(crate::exceptions::uni_error_to_pyerr)
+    }
+
+    /// Drop a fork and every descendant in its subtree.
+    ///
+    /// Pre-validates the whole subtree for live sessions / open
+    /// transactions before tombstoning anything.
+    fn drop_fork_cascade(&self, name: &str) -> PyResult<()> {
+        pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(self.inner.drop_fork_cascade(name))
+            .map_err(crate::exceptions::uni_error_to_pyerr)
+    }
+
+    /// Tag a fork with a Lance tag (GC-exempt; survives drop).
+    fn tag_fork(&self, fork_name: &str, tag: &str) -> PyResult<()> {
+        pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(self.inner.tag_fork(fork_name, tag))
+            .map_err(crate::exceptions::uni_error_to_pyerr)
+    }
+
+    /// Remove a previously-applied tag from a fork. Idempotent per dataset.
+    fn untag_fork(&self, fork_name: &str, tag: &str) -> PyResult<()> {
+        pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(self.inner.untag_fork(fork_name, tag))
+            .map_err(crate::exceptions::uni_error_to_pyerr)
+    }
+
+    /// List the unique user-visible tag names applied to this fork.
+    fn list_fork_tags(&self, fork_name: &str) -> PyResult<Vec<String>> {
+        pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(self.inner.list_fork_tags(fork_name))
+            .map_err(crate::exceptions::uni_error_to_pyerr)
+    }
+
+    // -----------------------------------------------------------------------
+    // Fork diff & promote (Phase 7 — Phase 6/6b feature surface)
+    // -----------------------------------------------------------------------
+
+    /// Structural diff between primary and a named fork.
+    ///
+    /// Returns a `ForkDiff` describing the rows the fork has that
+    /// primary doesn't (`added`), the rows primary has that the fork
+    /// has dropped (`deleted`), and the rows with matching UID and
+    /// differing properties (`changed`).
+    fn diff_fork_primary(&self, fork_name: &str) -> PyResult<crate::types::PyForkDiff> {
+        pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(self.inner.diff_fork_primary(fork_name))
+            .map(crate::types::PyForkDiff::from_rust)
+            .map_err(crate::exceptions::uni_error_to_pyerr)
+    }
+
+    /// Structural diff between two named forks. `diff(a, b)` is the
+    /// delta that, if applied to `a`, produces `b`.
+    fn diff_forks(&self, a: &str, b: &str) -> PyResult<crate::types::PyForkDiff> {
+        pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(self.inner.diff_forks(a, b))
+            .map(crate::types::PyForkDiff::from_rust)
+            .map_err(crate::exceptions::uni_error_to_pyerr)
+    }
+
+    /// Promote matched fork rows onto primary.
+    ///
+    /// `patterns` is a list of `PromotePattern` objects built via
+    /// `PromotePattern.label(...)` or `PromotePattern.edge_type(...)`.
+    /// All inserts run in a single primary transaction that commits
+    /// at the end.
+    fn promote_from_fork(
+        &self,
+        fork_name: &str,
+        patterns: Vec<crate::types::PyPromotePattern>,
+    ) -> PyResult<crate::types::PyPromoteReport> {
+        let rust_patterns: Vec<uni_db::PromotePattern> =
+            patterns.into_iter().map(|p| p.inner).collect();
+        pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(self.inner.promote_from_fork(fork_name, &rust_patterns))
+            .map(crate::types::PyPromoteReport::from_rust)
+            .map_err(crate::exceptions::uni_error_to_pyerr)
+    }
+
     /// Access compaction operations.
     fn compaction(&self) -> PyCompaction {
         PyCompaction {

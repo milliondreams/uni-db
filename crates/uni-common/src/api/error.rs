@@ -139,6 +139,70 @@ pub enum UniError {
     /// A session hook rejected the operation.
     #[error("Hook rejected: {message}")]
     HookRejected { message: String },
+
+    /// Fork with the given name does not exist in the registry.
+    #[error("Fork '{name}' not found")]
+    ForkNotFound { name: String },
+
+    /// `session.fork(name).new_()` was called against an existing fork.
+    #[error("Fork '{name}' already exists")]
+    ForkAlreadyExists { name: String },
+
+    /// Phase-1 gate: writes through `forked_session.tx()` are blocked
+    /// until Phase 2 lands. Reads, `locy()`, and admin paths work.
+    #[error(
+        "Writes on a forked session are not yet supported (Phase 2); reads, locy, and admin paths work"
+    )]
+    ForkWritesNotYetSupported,
+
+    /// Drop refused because forked sessions are still alive on the fork.
+    #[error("Fork '{name}' is held by {holder_count} live session(s); drop refused")]
+    ForkInUse { name: String, holder_count: usize },
+
+    /// Drop refused because a transaction has uncommitted mutations on the
+    /// fork. Commit or roll back the transaction first, then retry drop.
+    #[error("Fork '{name}' has uncommitted transaction state; commit or rollback first")]
+    ForkInflightTx { name: String },
+
+    /// Registry on disk is malformed (corrupt JSON, missing required field, etc.).
+    #[error("Fork registry is corrupt: {message}")]
+    ForkCorruptRegistry { message: String },
+
+    /// Drop refused because this fork has nested children. Use
+    /// `drop_fork_cascade` to remove the whole subtree, or drop the
+    /// children individually first.
+    #[error(
+        "Fork '{name}' has nested children {children:?}; use drop_fork_cascade or drop them first"
+    )]
+    ForkHasChildren { name: String, children: Vec<String> },
+
+    /// `drop_fork_cascade` refused because at least one fork in the
+    /// subtree has live sessions or in-flight transactions. No branch
+    /// has been deleted yet — the cascade is atomic at the validation
+    /// step. Resolve the blockers and retry.
+    #[error("Fork subtree cannot be dropped: {blockers:?}")]
+    ForkSubtreeInUse { blockers: Vec<String> },
+
+    /// `Session::fork(name)` refused because the configured `max_forks`
+    /// budget is at capacity. Drop existing forks (or wait for the
+    /// sweeper to reap expired ones) and retry. Counts include Active,
+    /// Pending, and Tombstoned entries.
+    #[error("Fork budget exceeded: {current}/{max} forks; drop one or raise UniConfig::max_forks")]
+    ForkBudgetExceeded { current: usize, max: usize },
+
+    /// 2PC step on a fork lifecycle operation failed.
+    ///
+    /// `stage` names the step (`registry_pending`, `create_branch`,
+    /// `registry_active`, `tombstone`, `delete_branch`, `registry_clear`,
+    /// `backend_unsupported`, `recovery`) so recovery and humans can
+    /// triage without parsing prose.
+    #[error("Fork '{name}' lifecycle failed at stage '{stage}': {source}")]
+    ForkLifecycle {
+        name: String,
+        stage: &'static str,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, UniError>;

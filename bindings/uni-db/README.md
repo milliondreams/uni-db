@@ -133,6 +133,44 @@ results = await db.query("MATCH (p:Person) RETURN p.name")
 await db.flush()
 ```
 
+## Forks
+
+Named, durable, isolated branches of the graph. A fork lets a session
+reason about an alternate version of the database — what-if analysis,
+audit hold, scenario sandboxing — that survives across restarts.
+
+```python
+import uni_db
+from datetime import timedelta
+
+db = uni_db.Uni.builder().build()
+db.schema().label("Person").property("name", "string").apply()
+
+primary = db.session()
+
+# Open or create a fork (Phase 2: writable; Phase 3: nestable;
+# Phase 4a: TTL + tags + budget).
+fork = primary.fork("scenario_1").ttl(timedelta(hours=1)).build()
+tx = fork.tx()
+tx.execute("CREATE (:Person {name: 'fork-only'})")
+tx.commit()
+
+# Fork sees primary state + its own writes; primary unchanged.
+print(fork.query("MATCH (p:Person) RETURN count(p) AS n"))
+
+# Pin a Lance tag for audit retention; the tag survives the drop.
+db.tag_fork("scenario_1", "audit-2026-q1")
+del fork
+db.drop_fork("scenario_1")
+print(db.list_fork_tags("scenario_1"))  # tag still resolvable
+```
+
+The async surface mirrors this exactly through `AsyncUni` /
+`AsyncSession`. See `examples/fork_quickstart.py` and
+`examples/fork_audit.py` for runnable demos, and the full
+[Python API reference](../../docs/complete_python_api.md#24-forks-phase-4b)
+for every method, type, and error variant.
+
 ## Query Utilities
 
 ```python

@@ -805,7 +805,35 @@ impl SchemaManager {
             Ok(result) => {
                 let bytes = result.bytes().await?;
                 let content = String::from_utf8(bytes.to_vec())?;
-                let schema: Schema = serde_json::from_str(&content)?;
+                let mut schema: Schema = serde_json::from_str(&content)?;
+                // Self-heal catalogs that grew super-linearly under the
+                // pre-fix `add_index` (issue rustic-ai/uni-db#63). Collapse
+                // duplicate index entries by name, keeping the *last*
+                // occurrence — matches the upsert semantics in `add_index`
+                // and preserves whatever metadata the most recent rebuild
+                // wrote. The dedup persists on the next mutation that
+                // calls `save()`.
+                let original_len = schema.indexes.len();
+                if original_len > 0 {
+                    let mut seen: std::collections::HashSet<String> =
+                        std::collections::HashSet::with_capacity(original_len);
+                    let mut dedup: Vec<IndexDefinition> = schema
+                        .indexes
+                        .iter()
+                        .rev()
+                        .filter(|idx| seen.insert(idx.name().to_string()))
+                        .cloned()
+                        .collect();
+                    dedup.reverse();
+                    if dedup.len() != original_len {
+                        tracing::warn!(
+                            collapsed = original_len - dedup.len(),
+                            kept = dedup.len(),
+                            "schema.indexes: collapsed duplicate entries on load (issue #63)"
+                        );
+                        schema.indexes = dedup;
+                    }
+                }
                 Ok(Self {
                     store,
                     path: path.clone(),
@@ -913,6 +941,55 @@ impl SchemaManager {
             .write()
             .expect("Schema lock poisoned - a thread panicked while holding it");
         *schema = Arc::new(new_schema);
+    }
+
+    /// Build a fork-scoped manager whose schema is `primary ⊕ overlay`.
+    ///
+    /// Used by `UniInner::at_fork` to give a forked session a schema view
+    /// that includes any labels/edge-types/properties the fork has
+    /// introduced on top of primary. The returned manager owns its own
+    /// in-memory `Arc<Schema>` — mutations to it never reach primary's
+    /// schema file. The returned manager is *not* intended for `.save()`;
+    /// fork-overlay persistence is owned by the registry layer
+    /// (`catalog/fork_schemas/{fork_id}.json`).
+    ///
+    /// In Phase 1 the delta is always empty, so the merge is a clone.
+    /// Phase 2 starts populating it when on-the-fly label creation lands.
+    #[must_use]
+    pub fn with_overlay(&self, overlay: &crate::core::fork::SchemaDelta) -> Arc<Self> {
+        let primary = self.schema();
+        let merged = if overlay.is_empty() {
+            (*primary).clone()
+        } else {
+            let mut merged = (*primary).clone();
+            for (name, label) in &overlay.added_labels {
+                merged.labels.insert(name.clone(), label.clone());
+            }
+            for (name, edge_type) in &overlay.added_edge_types {
+                merged.edge_types.insert(name.clone(), edge_type.clone());
+            }
+            for addition in &overlay.added_properties {
+                let props = merged.properties.entry(addition.owner.clone()).or_default();
+                props.insert(
+                    addition.property.clone(),
+                    PropertyMeta {
+                        r#type: addition.data_type.clone(),
+                        nullable: addition.nullable,
+                        added_in: merged.schema_version,
+                        state: SchemaElementState::Active,
+                        generation_expression: None,
+                        description: None,
+                    },
+                );
+            }
+            merged
+        };
+
+        Arc::new(Self {
+            store: self.store.clone(),
+            path: self.path.clone(),
+            schema: RwLock::new(Arc::new(merged)),
+        })
     }
 
     pub fn next_label_id(&self) -> u16 {
@@ -1210,10 +1287,26 @@ impl SchemaManager {
         Ok(())
     }
 
+    /// Register an index definition on the schema, **upsert by name**.
+    ///
+    /// If an index with the same `IndexDefinition::name()` already exists, it
+    /// is replaced in place; otherwise the def is appended. Idempotent under
+    /// repeat invocation, which makes `SchemaBuilder::apply()` re-applicable
+    /// without bloating `schema.indexes` and lets the rebuild epilogue inside
+    /// every `IndexManager::create_*_index` re-record metadata updates without
+    /// duplicating entries (issue rustic-ai/uni-db#63).
     pub fn add_index(&self, index_def: IndexDefinition) -> Result<()> {
         let mut guard = acquire_write(&self.schema, "schema")?;
         let schema = Arc::make_mut(&mut *guard);
-        schema.indexes.push(index_def);
+        if let Some(existing) = schema
+            .indexes
+            .iter_mut()
+            .find(|i| i.name() == index_def.name())
+        {
+            *existing = index_def;
+        } else {
+            schema.indexes.push(index_def);
+        }
         Ok(())
     }
 
@@ -1545,6 +1638,124 @@ mod tests {
         Ok(())
     }
 
+    /// `add_index` is upsert-by-name (issue rustic-ai/uni-db#63). Repeat
+    /// invocations with the same `IndexDefinition::name()` must replace
+    /// the entry in place rather than appending. Subsequent `add_index`
+    /// calls also reflect metadata updates from the new definition.
+    #[tokio::test]
+    async fn test_add_index_is_upsert_by_name() -> Result<()> {
+        let dir = tempdir()?;
+        let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path())?);
+        let path = ObjectStorePath::from("schema.json");
+        let manager = SchemaManager::load_from_store(store, &path).await?;
+        manager.add_label("Person")?;
+
+        let initial = IndexDefinition::Scalar(ScalarIndexConfig {
+            name: "idx_test".to_string(),
+            label: "Person".to_string(),
+            properties: vec!["name".to_string()],
+            index_type: ScalarIndexType::BTree,
+            where_clause: None,
+            metadata: IndexMetadata {
+                status: IndexStatus::Building,
+                ..Default::default()
+            },
+        });
+        manager.add_index(initial.clone())?;
+        assert_eq!(manager.schema().indexes.len(), 1);
+
+        // Re-add the identical def — must remain a single entry.
+        manager.add_index(initial.clone())?;
+        assert_eq!(
+            manager.schema().indexes.len(),
+            1,
+            "duplicate add_index by name must not append"
+        );
+
+        // Re-add with updated metadata — must replace in place, len unchanged.
+        let mut updated_cfg = match initial {
+            IndexDefinition::Scalar(c) => c,
+            _ => unreachable!(),
+        };
+        updated_cfg.metadata.status = IndexStatus::Online;
+        updated_cfg.metadata.row_count_at_build = Some(42);
+        manager.add_index(IndexDefinition::Scalar(updated_cfg))?;
+        assert_eq!(manager.schema().indexes.len(), 1);
+        let stored = manager.get_index("idx_test").unwrap();
+        assert_eq!(stored.metadata().status, IndexStatus::Online);
+        assert_eq!(stored.metadata().row_count_at_build, Some(42));
+
+        // A *different* name appends as a new entry.
+        let other = IndexDefinition::Scalar(ScalarIndexConfig {
+            name: "idx_other".to_string(),
+            label: "Person".to_string(),
+            properties: vec!["age".to_string()],
+            index_type: ScalarIndexType::BTree,
+            where_clause: None,
+            metadata: IndexMetadata::default(),
+        });
+        manager.add_index(other)?;
+        assert_eq!(manager.schema().indexes.len(), 2);
+
+        Ok(())
+    }
+
+    /// `load_from_store` self-heals catalogs that were bloated by the
+    /// pre-fix `add_index` (kept the *last* def per name).
+    #[tokio::test]
+    async fn test_load_dedups_bloated_indexes() -> Result<()> {
+        let dir = tempdir()?;
+        let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path())?);
+        let path = ObjectStorePath::from("schema.json");
+
+        // Seed disk with a hand-crafted bloated schema: 50 entries, all
+        // sharing the same name. The last entry has distinct metadata so
+        // we can assert "last writer wins" semantics.
+        let mut schema = Schema::default();
+        schema.labels.insert(
+            "Person".to_string(),
+            LabelMeta {
+                id: 1,
+                created_at: chrono::Utc::now(),
+                state: SchemaElementState::Active,
+                description: None,
+            },
+        );
+        let make = |status: IndexStatus, count: Option<u64>| {
+            IndexDefinition::Scalar(ScalarIndexConfig {
+                name: "idx_dup".to_string(),
+                label: "Person".to_string(),
+                properties: vec!["name".to_string()],
+                index_type: ScalarIndexType::BTree,
+                where_clause: None,
+                metadata: IndexMetadata {
+                    status,
+                    row_count_at_build: count,
+                    ..Default::default()
+                },
+            })
+        };
+        for _ in 0..49 {
+            schema.indexes.push(make(IndexStatus::Building, None));
+        }
+        schema.indexes.push(make(IndexStatus::Online, Some(123)));
+        let json = serde_json::to_string_pretty(&schema)?;
+        store.put(&path, json.into()).await?;
+
+        let manager = SchemaManager::load_from_store(store, &path).await?;
+        let schema = manager.schema();
+        assert_eq!(
+            schema.indexes.len(),
+            1,
+            "load() must collapse 50 duplicates by name to 1"
+        );
+        // Last-writer-wins: the kept entry is the final push (Online, 123).
+        assert_eq!(schema.indexes[0].metadata().status, IndexStatus::Online);
+        assert_eq!(schema.indexes[0].metadata().row_count_at_build, Some(123));
+
+        Ok(())
+    }
+
     #[test]
     fn test_vector_index_for_property_skips_non_online() {
         let mut schema = Schema::default();
@@ -1588,5 +1799,68 @@ mod tests {
         let result = schema.vector_index_for_property("Document", "embedding");
         assert!(result.is_some());
         assert_eq!(result.unwrap().metric, DistanceMetric::Cosine);
+    }
+
+    #[tokio::test]
+    async fn with_overlay_empty_clones_primary_in_isolation() -> Result<()> {
+        use crate::core::fork::SchemaDelta;
+
+        let dir = tempdir()?;
+        let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path())?);
+        let path = ObjectStorePath::from("schema.json");
+        let primary = SchemaManager::load_from_store(store, &path).await?;
+        primary.add_label("Person")?;
+
+        let overlay = primary.with_overlay(&SchemaDelta::empty());
+        assert_eq!(overlay.schema().labels.len(), 1);
+
+        // Phase 1 invariant: mutating the overlay manager must not bleed
+        // into primary's schema.
+        overlay.add_label("Forked")?;
+        assert!(overlay.schema().labels.contains_key("Forked"));
+        assert!(!primary.schema().labels.contains_key("Forked"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn with_overlay_merges_added_labels_and_edge_types() -> Result<()> {
+        use crate::core::fork::SchemaDelta;
+        use chrono::Utc;
+
+        let dir = tempdir()?;
+        let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path())?);
+        let path = ObjectStorePath::from("schema.json");
+        let primary = SchemaManager::load_from_store(store, &path).await?;
+        primary.add_label("Existing")?;
+
+        let label_meta = LabelMeta {
+            id: 99,
+            created_at: Utc::now(),
+            state: SchemaElementState::Active,
+            description: None,
+        };
+        let edge_meta = EdgeTypeMeta {
+            id: 99,
+            src_labels: vec!["NewLabel".into()],
+            dst_labels: vec!["NewLabel".into()],
+            state: SchemaElementState::Active,
+            description: None,
+        };
+        let delta = SchemaDelta {
+            added_labels: vec![("NewLabel".to_string(), label_meta)],
+            added_edge_types: vec![("NewEdge".to_string(), edge_meta)],
+            added_properties: vec![],
+        };
+
+        let overlay = primary.with_overlay(&delta);
+        let merged = overlay.schema();
+        assert!(merged.labels.contains_key("Existing"));
+        assert!(merged.labels.contains_key("NewLabel"));
+        assert!(merged.edge_types.contains_key("NewEdge"));
+
+        // Primary unchanged.
+        assert!(!primary.schema().labels.contains_key("NewLabel"));
+        Ok(())
     }
 }

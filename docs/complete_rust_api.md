@@ -299,6 +299,52 @@ impl Uni {
     /// Restore the database to a snapshot.
     pub async fn restore_snapshot(&self, snapshot_id: &str) -> Result<()>;
 
+    // ── Fork Management ──
+    //
+    // See `Session::fork(name)` for the creation entry-point — forks
+    // are created from sessions, not from `Uni`. The methods below are
+    // database-level admin: enumeration, metadata lookup, and drops.
+
+    /// List all currently-Active forks across the database.
+    pub async fn list_forks(&self) -> Vec<ForkInfo>;
+
+    /// Look up a single fork's metadata by name.
+    pub async fn fork_info(&self, name: &str) -> Result<Option<ForkInfo>>;
+
+    /// Drop a fork.
+    ///
+    /// Runs the full drop 2PC: tombstone, branch deletes (best-effort
+    /// on individual branches), registry clear, overlay + WAL cleanup.
+    /// Errors with `ForkInUse` while sessions hold the fork,
+    /// `ForkInflightTx` while a transaction is open on it, and
+    /// `ForkHasChildren` while nested children exist.
+    pub async fn drop_fork(&self, name: &str) -> Result<()>;
+
+    /// Drop a fork and every descendant in its subtree.
+    ///
+    /// Pre-validates the whole subtree for live sessions / open
+    /// transactions before tombstoning anything; surfaces
+    /// `ForkSubtreeInUse { blockers }` on any blocker and no branch is
+    /// deleted. On success, drops deepest-first via the single-fork
+    /// path so a crash mid-cascade resumes through existing tombstone
+    /// recovery.
+    pub async fn drop_fork_cascade(&self, name: &str) -> Result<()>;
+
+    /// Phase 4a: tag a fork with a Lance tag. The tag pins each of the
+    /// fork's branches at their current version and is GC-exempt, so a
+    /// tag-then-drop sequence safely retains the fork's state on disk
+    /// for audit or regulatory hold. Tag names are namespaced on disk
+    /// as `fork_{tag}_{dataset}`.
+    pub async fn tag_fork(&self, fork_name: &str, tag: &str) -> Result<()>;
+
+    /// Phase 4a: remove a tag previously applied via `tag_fork`.
+    /// Idempotent per dataset — missing tags are treated as success.
+    pub async fn untag_fork(&self, fork_name: &str, tag: &str) -> Result<()>;
+
+    /// Phase 4a: list the unique user-visible tag names applied to
+    /// this fork (with the `fork_*_{dataset}` namespace stripped).
+    pub async fn list_fork_tags(&self, fork_name: &str) -> Result<Vec<String>>;
+
     // ── Metrics & Config ──
 
     /// Get database-level metrics snapshot.
@@ -377,6 +423,75 @@ impl Session {
 
     /// Start a configured Transaction via builder.
     pub fn tx_with(&self) -> TransactionBuilder<'_>;
+
+    /// Flush this session's writer to L1.
+    ///
+    /// On a forked session this flushes the fork's L0 buffer to its
+    /// Lance branches. Equivalent to `Uni::flush` on a primary session.
+    /// Phase 3 auto-flushes a parent fork inside `create_fork_2pc`, so
+    /// most users never call this directly.
+    pub async fn flush(&self) -> Result<()>;
+
+    // ── Forks ──
+    //
+    // Forks branch the current session into a named, durable, isolated
+    // timeline. The parent is *inferred from the receiver session*: a
+    // forked session's `.fork(name)` produces a nested child; a primary
+    // session's `.fork(name)` produces a child of primary. Database-
+    // level admin (`list_forks`, `drop_fork`, `drop_fork_cascade`) is
+    // on `Uni`, not here.
+
+    /// Open or create a fork. `.await` opens-or-creates; chain
+    /// `.new_().await` to require fresh creation (errors with
+    /// `ForkAlreadyExists` if the name is taken).
+    ///
+    /// The new fork's parent is inferred from `self`: forked session →
+    /// nested child, primary session → child of primary.
+    pub fn fork(&self, name: impl Into<String>) -> ForkBuilder<'_>;
+    // ForkBuilder is awaitable; chain `.new_()` to require fresh
+    // creation (errors with `ForkAlreadyExists` if the name is taken),
+    // or `.ttl(Duration)` to set a wall-clock TTL on the fork. The
+    // background sweeper drops expired forks via cascade. TTL applies
+    // only at create time; opening an existing fork ignores the value.
+
+    /// `true` when this session was returned by `fork`.
+    pub fn is_forked(&self) -> bool;
+
+    /// Fork-local schema mutation builder. Mirrors `db.schema()`'s
+    /// shape (`.label(name).description(...).apply().await`,
+    /// `.edge_type(name, &[from], &[to]).apply().await`). Adds labels
+    /// and edge types to the fork's overlay only — primary is
+    /// unaffected. Required under `UniConfig { strict_schema: true }`
+    /// to introduce fork-only labels. Errors with `InvalidArgument`
+    /// on a non-forked session.
+    pub fn fork_schema(&self) -> ForkSchemaBuilder<'_>;
+
+    /// Phase 5a-impl: build (or register) a fork-local index
+    /// immediately on this session's fork branch. Bypasses the
+    /// per-fork fragment-count threshold the background builder
+    /// honors. After the build, `Session::query_with(...).explain()`
+    /// shows `FusedIndexScan` for matching `(label, column)` queries.
+    ///
+    /// `kind` selects:
+    /// - `ForkLocalIndexKind::ScalarBtree` — Lance native scalar
+    ///   index on the fork's branch (BTree union fusion).
+    /// - `ForkLocalIndexKind::Sorted` — same Lance scalar index,
+    ///   exposed for ORDER BY k-way merge fusion.
+    /// - `ForkLocalIndexKind::VidUid` — planner-marker only; no
+    ///   Lance file is written. Lance's `base_paths` chain on the
+    ///   fork's branch already provides fork-first lookup
+    ///   semantics — the registry entry alone tells the planner to
+    ///   emit `FusedIndexScan { kind: VidUidForkFirst }`.
+    ///
+    /// Errors with `UniError::InvalidArgument` on a non-forked
+    /// session. Errors with `UniError::Internal` on a Lance build
+    /// failure (e.g. unsupported column type for BTree).
+    pub async fn build_fork_local_index(
+        &self,
+        label: &str,
+        column: &str,
+        kind: uni_store::fork::ForkLocalIndexKind,
+    ) -> Result<()>;
 
     // ── Version Pinning ──
 
@@ -2510,6 +2625,40 @@ pub enum UniError {
 
     // ── Hooks ──
     HookRejected { message: String },
+
+    // ── Fork Lifecycle ──
+    ForkNotFound { name: String },
+    ForkAlreadyExists { name: String },
+    /// Drop refused because forked sessions are still alive on the fork.
+    ForkInUse { name: String, holder_count: usize },
+    /// Drop refused because a transaction has uncommitted mutations on
+    /// the fork. Commit or roll back the transaction first.
+    ForkInflightTx { name: String },
+    /// `drop_fork` refused because this fork has nested children. Use
+    /// `drop_fork_cascade` or drop the children first.
+    ForkHasChildren { name: String, children: Vec<String> },
+    /// `drop_fork_cascade` refused because at least one fork in the
+    /// subtree has live sessions or in-flight transactions. No branch
+    /// has been deleted yet; the cascade is atomic at the validation
+    /// step. Resolve the blockers and retry.
+    ForkSubtreeInUse { blockers: Vec<String> },
+    /// `Session::fork(name)` refused because `UniConfig::max_forks` is
+    /// at capacity. Counts include Active + Pending + Tombstoned. Drop
+    /// existing forks (or wait for the sweeper to reap expired ones)
+    /// and retry.
+    ForkBudgetExceeded { current: usize, max: usize },
+    /// Registry on disk is malformed (corrupt JSON, missing field, etc.).
+    ForkCorruptRegistry { message: String },
+    /// 2PC step on a fork lifecycle operation failed; `stage` names the
+    /// step (`registry_pending`, `create_branch`, `create_branch_from`,
+    /// `current_version_on_branch`, `registry_active`, `tombstone`,
+    /// `delete_branch`, `registry_clear`, `backend_unsupported`,
+    /// `recovery`, `schema_overlay`).
+    ForkLifecycle {
+        name: String,
+        stage: &'static str,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 
     // ── Constraint Violations ──
     Constraint { message: String },

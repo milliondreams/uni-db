@@ -451,6 +451,147 @@ impl AsyncDatabase {
         })
     }
 
+    // -----------------------------------------------------------------------
+    // Fork management (Phase 4b)
+    // -----------------------------------------------------------------------
+
+    /// List all currently-Active forks across the database.
+    fn list_forks<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let db = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let forks = db.list_forks().await;
+            Ok(forks
+                .into_iter()
+                .map(crate::types::PyForkInfo::from_rust)
+                .collect::<Vec<_>>())
+        })
+    }
+
+    /// Look up a single fork by name. Returns `None` if absent.
+    fn fork_info<'py>(&self, py: Python<'py>, name: String) -> PyResult<Bound<'py, PyAny>> {
+        let db = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            match db.fork_info(&name).await {
+                Ok(info) => Ok(Some(crate::types::PyForkInfo::from_rust(info))),
+                Err(uni_common::UniError::ForkNotFound { .. }) => Ok(None),
+                Err(e) => Err(crate::exceptions::uni_error_to_pyerr(e)),
+            }
+        })
+    }
+
+    /// Drop a fork.
+    fn drop_fork<'py>(&self, py: Python<'py>, name: String) -> PyResult<Bound<'py, PyAny>> {
+        let db = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            db.drop_fork(&name)
+                .await
+                .map_err(crate::exceptions::uni_error_to_pyerr)
+        })
+    }
+
+    /// Drop a fork and every descendant in its subtree.
+    fn drop_fork_cascade<'py>(&self, py: Python<'py>, name: String) -> PyResult<Bound<'py, PyAny>> {
+        let db = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            db.drop_fork_cascade(&name)
+                .await
+                .map_err(crate::exceptions::uni_error_to_pyerr)
+        })
+    }
+
+    /// Tag a fork with a Lance tag (GC-exempt; survives drop).
+    fn tag_fork<'py>(
+        &self,
+        py: Python<'py>,
+        fork_name: String,
+        tag: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let db = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            db.tag_fork(&fork_name, &tag)
+                .await
+                .map_err(crate::exceptions::uni_error_to_pyerr)
+        })
+    }
+
+    /// Remove a previously-applied tag from a fork. Idempotent per dataset.
+    fn untag_fork<'py>(
+        &self,
+        py: Python<'py>,
+        fork_name: String,
+        tag: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let db = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            db.untag_fork(&fork_name, &tag)
+                .await
+                .map_err(crate::exceptions::uni_error_to_pyerr)
+        })
+    }
+
+    /// List the unique user-visible tag names applied to this fork.
+    fn list_fork_tags<'py>(
+        &self,
+        py: Python<'py>,
+        fork_name: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let db = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            db.list_fork_tags(&fork_name)
+                .await
+                .map_err(crate::exceptions::uni_error_to_pyerr)
+        })
+    }
+
+    /// Structural diff between primary and a named fork.
+    fn diff_fork_primary<'py>(
+        &self,
+        py: Python<'py>,
+        fork_name: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let db = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            db.diff_fork_primary(&fork_name)
+                .await
+                .map(crate::types::PyForkDiff::from_rust)
+                .map_err(crate::exceptions::uni_error_to_pyerr)
+        })
+    }
+
+    /// Structural diff between two named forks.
+    fn diff_forks<'py>(
+        &self,
+        py: Python<'py>,
+        a: String,
+        b: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let db = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            db.diff_forks(&a, &b)
+                .await
+                .map(crate::types::PyForkDiff::from_rust)
+                .map_err(crate::exceptions::uni_error_to_pyerr)
+        })
+    }
+
+    /// Promote matched fork rows onto primary in one transaction.
+    fn promote_from_fork<'py>(
+        &self,
+        py: Python<'py>,
+        fork_name: String,
+        patterns: Vec<crate::types::PyPromotePattern>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let db = self.inner.clone();
+        let rust_patterns: Vec<uni_db::PromotePattern> =
+            patterns.into_iter().map(|p| p.inner).collect();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            db.promote_from_fork(&fork_name, &rust_patterns)
+                .await
+                .map(crate::types::PyPromoteReport::from_rust)
+                .map_err(crate::exceptions::uni_error_to_pyerr)
+        })
+    }
+
     /// Access compaction operations.
     fn compaction(&self) -> AsyncCompaction {
         AsyncCompaction {
@@ -873,6 +1014,62 @@ impl AsyncDatabaseBuilder {
         lease: crate::types::PyWriteLease,
     ) -> PyRefMut<'_, Self> {
         slf.write_lease = Some(lease);
+        slf
+    }
+
+    /// Phase 4b — cap on total fork count (Active + Pending + Tombstoned).
+    fn max_forks(mut slf: PyRefMut<'_, Self>, cap: Option<usize>) -> PyRefMut<'_, Self> {
+        slf.uni_config
+            .get_or_insert_with(uni_common::UniConfig::default)
+            .max_forks = cap;
+        slf
+    }
+
+    /// Phase 4b — default TTL applied to forks created without one.
+    fn fork_default_ttl<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        ttl: Py<PyAny>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let py = slf.py();
+        let bound = ttl.bind(py);
+        let dur = if bound.is_none() {
+            None
+        } else {
+            Some(crate::convert::py_timedelta_to_duration(bound)?)
+        };
+        slf.uni_config
+            .get_or_insert_with(uni_common::UniConfig::default)
+            .fork_default_ttl = dur;
+        Ok(slf)
+    }
+
+    /// Phase 4b — TTL sweeper polling interval.
+    fn fork_sweeper_interval<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        interval: Py<PyAny>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let py = slf.py();
+        let dur = crate::convert::py_timedelta_to_duration(interval.bind(py))?;
+        slf.uni_config
+            .get_or_insert_with(uni_common::UniConfig::default)
+            .fork_sweeper_interval = dur;
+        Ok(slf)
+    }
+
+    /// Phase 4b — disable the TTL sweeper. Tests should set `True`
+    /// when they want deterministic control over fork lifetimes.
+    fn disable_fork_sweeper(mut slf: PyRefMut<'_, Self>, disabled: bool) -> PyRefMut<'_, Self> {
+        slf.uni_config
+            .get_or_insert_with(uni_common::UniConfig::default)
+            .disable_fork_sweeper = disabled;
+        slf
+    }
+
+    /// Phase 4b — strict-schema mode (also exposed via `config(dict)`).
+    fn strict_schema(mut slf: PyRefMut<'_, Self>, enabled: bool) -> PyRefMut<'_, Self> {
+        slf.uni_config
+            .get_or_insert_with(uni_common::UniConfig::default)
+            .strict_schema = enabled;
         slf
     }
 
@@ -1622,6 +1819,70 @@ impl AsyncSession {
             timeout_secs: None,
             isolation_level: None,
         }
+    }
+
+    // ── Forks (Phase 4b) ────────────────────────────────────────────────
+
+    /// Open or create a fork. Returns a builder synchronously; chain
+    /// `.new_()` / `.ttl(timedelta)`, then `await .build()`.
+    ///
+    /// Returning the builder synchronously (rather than as an
+    /// awaitable wrapping it) keeps the chain ergonomic: users write
+    /// `await session.fork(name).ttl(td).build()` instead of
+    /// `await (await session.fork(name)).build()`.
+    fn fork(&self, name: String) -> PyResult<AsyncForkBuilder> {
+        // Take a synchronous read of the wrapped session. `try_lock`
+        // is the right call here: `AsyncSession.fork()` is invoked
+        // outside any await, so the mutex is always immediately
+        // available unless another task is currently holding the
+        // session for a long-running op (e.g. an in-flight tx) — in
+        // which case the user has a wider concurrency bug to fix.
+        let guard = self.inner.try_lock().map_err(|_| {
+            crate::exceptions::UniInvalidArgumentError::new_err(
+                "session is busy; await any in-flight operation before forking",
+            )
+        })?;
+        Ok(AsyncForkBuilder {
+            parent: guard.clone(),
+            name,
+            must_create: false,
+            ttl: None,
+        })
+    }
+
+    /// Fork-local schema mutation builder. Returns synchronously;
+    /// chain `.label(...)` / `.edge_type(...)`, then `await .apply()`.
+    fn fork_schema(&self) -> PyResult<AsyncForkSchemaBuilder> {
+        let guard = self.inner.try_lock().map_err(|_| {
+            crate::exceptions::UniInvalidArgumentError::new_err(
+                "session is busy; await any in-flight operation before fork_schema",
+            )
+        })?;
+        Ok(AsyncForkSchemaBuilder {
+            parent: guard.clone(),
+            pending: Vec::new(),
+        })
+    }
+
+    /// Flush this session's writer to L1.
+    fn flush<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let guard = inner.lock().await;
+            guard
+                .flush()
+                .await
+                .map_err(crate::exceptions::uni_error_to_pyerr)
+        })
+    }
+
+    /// `True` when this session was returned by a `fork()` call.
+    fn is_forked<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let guard = inner.lock().await;
+            Ok(guard.is_forked())
+        })
     }
 
     /// Get the session ID.
@@ -3634,5 +3895,119 @@ impl AsyncEdgeTypeBuilder {
     /// Apply schema changes immediately (returns awaitable).
     fn apply<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         self.done()?.apply(py)
+    }
+}
+
+// ============================================================================
+// Phase 4b — Async ForkBuilder + Async ForkSchemaBuilder
+// ============================================================================
+
+/// Async builder returned by `AsyncSession.fork(name)`. Drive it via
+/// `await .build()` after chaining configuration methods.
+#[pyclass(name = "AsyncForkBuilder")]
+pub struct AsyncForkBuilder {
+    pub(crate) parent: ::uni_db::Session,
+    pub(crate) name: String,
+    pub(crate) must_create: bool,
+    pub(crate) ttl: Option<std::time::Duration>,
+}
+
+#[pymethods]
+impl AsyncForkBuilder {
+    /// Require fresh creation; errors with `UniForkAlreadyExistsError`
+    /// if the fork name is already taken.
+    fn new_(mut slf: PyRefMut<'_, Self>) -> PyRefMut<'_, Self> {
+        slf.must_create = true;
+        slf
+    }
+
+    /// Stamp a wall-clock TTL on the fork.
+    fn ttl<'py>(mut slf: PyRefMut<'py, Self>, ttl: Py<PyAny>) -> PyResult<PyRefMut<'py, Self>> {
+        let py = slf.py();
+        slf.ttl = Some(crate::convert::py_timedelta_to_duration(ttl.bind(py))?);
+        Ok(slf)
+    }
+
+    /// Drive the open-or-create flow and return an `AsyncSession`
+    /// wrapping the forked session.
+    fn build<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let parent = self.parent.clone();
+        let name = self.name.clone();
+        let must_create = self.must_create;
+        let ttl = self.ttl;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let mut b = parent.fork(name);
+            if must_create {
+                b = b.new_();
+            }
+            if let Some(d) = ttl {
+                b = b.ttl(d);
+            }
+            let forked = b.await.map_err(crate::exceptions::uni_error_to_pyerr)?;
+            let rule_reg = forked.rules().clone_registry_arc();
+            let params_arc = forked.params().clone_store_arc();
+            Ok(AsyncSession {
+                inner: Arc::new(tokio::sync::Mutex::new(forked)),
+                rule_registry_arc: rule_reg,
+                params_arc,
+            })
+        })
+    }
+}
+
+/// Async builder returned by `AsyncSession.fork_schema()`. Chain
+/// `.label(...)` and `.edge_type(...)` calls, then `await .apply()`.
+#[pyclass(name = "AsyncForkSchemaBuilder")]
+pub struct AsyncForkSchemaBuilder {
+    pub(crate) parent: ::uni_db::Session,
+    pub(crate) pending: Vec<crate::builders::ForkSchemaPending>,
+}
+
+#[pymethods]
+impl AsyncForkSchemaBuilder {
+    /// Add a fork-local label.
+    #[pyo3(signature = (name, description=None))]
+    fn label(
+        mut slf: PyRefMut<'_, Self>,
+        name: String,
+        description: Option<String>,
+    ) -> PyRefMut<'_, Self> {
+        slf.pending
+            .push(crate::builders::ForkSchemaPending::Label { name, description });
+        slf
+    }
+
+    /// Add a fork-local edge type.
+    #[pyo3(signature = (name, from_labels, to_labels, description=None))]
+    fn edge_type(
+        mut slf: PyRefMut<'_, Self>,
+        name: String,
+        from_labels: Vec<String>,
+        to_labels: Vec<String>,
+        description: Option<String>,
+    ) -> PyRefMut<'_, Self> {
+        slf.pending
+            .push(crate::builders::ForkSchemaPending::EdgeType {
+                name,
+                from_labels,
+                to_labels,
+                description,
+            });
+        slf
+    }
+
+    /// Persist the pending entries to the fork's overlay file and the
+    /// fork's in-memory `SchemaManager`.
+    fn apply<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let parent = self.parent.clone();
+        let pending = self.pending.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            if pending.is_empty() {
+                return Ok(());
+            }
+            crate::builders::apply_fork_schema_pending(parent, pending)
+                .await
+                .map_err(crate::exceptions::uni_error_to_pyerr)
+        })
     }
 }

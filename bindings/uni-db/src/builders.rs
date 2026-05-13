@@ -219,6 +219,56 @@ impl DatabaseBuilder {
         slf
     }
 
+    /// Phase 4b — cap on total fork count (Active + Pending + Tombstoned).
+    /// `None` means unbounded.
+    fn max_forks(mut slf: PyRefMut<'_, Self>, cap: Option<usize>) -> PyRefMut<'_, Self> {
+        slf.uni_config
+            .get_or_insert_with(uni_common::UniConfig::default)
+            .max_forks = cap;
+        slf
+    }
+
+    /// Phase 4b — default TTL applied to forks when the user does not
+    /// supply one via `session.fork(name).ttl(...)`.
+    fn fork_default_ttl<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        ttl: Py<PyAny>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let py = slf.py();
+        let bound = ttl.bind(py);
+        let dur = if bound.is_none() {
+            None
+        } else {
+            Some(convert::py_timedelta_to_duration(bound)?)
+        };
+        slf.uni_config
+            .get_or_insert_with(uni_common::UniConfig::default)
+            .fork_default_ttl = dur;
+        Ok(slf)
+    }
+
+    /// Phase 4b — how often the background TTL sweeper polls the registry.
+    fn fork_sweeper_interval<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        interval: Py<PyAny>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let py = slf.py();
+        let dur = convert::py_timedelta_to_duration(interval.bind(py))?;
+        slf.uni_config
+            .get_or_insert_with(uni_common::UniConfig::default)
+            .fork_sweeper_interval = dur;
+        Ok(slf)
+    }
+
+    /// Phase 4b — skip spawning the TTL sweeper. Tests that race against
+    /// TTL should set this to `True`.
+    fn disable_fork_sweeper(mut slf: PyRefMut<'_, Self>, disabled: bool) -> PyRefMut<'_, Self> {
+        slf.uni_config
+            .get_or_insert_with(uni_common::UniConfig::default)
+            .disable_fork_sweeper = disabled;
+        slf
+    }
+
     /// Configure write lease for multi-agent coordination.
     fn write_lease(
         mut slf: PyRefMut<'_, Self>,
@@ -669,6 +719,48 @@ impl Session {
             .block_on(self.inner.tx())
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
         Ok(super::sync_api::Transaction { inner: Some(tx) })
+    }
+
+    // ── Forks (Phase 4b) ────────────────────────────────────────────────
+
+    /// Open or create a fork. Returns a builder; chain `.new_()` to
+    /// require fresh creation, `.ttl(timedelta)` to set a wall-clock
+    /// TTL, then `.build()` to drive open-or-create.
+    ///
+    /// Parent inference: forking a primary session creates a child of
+    /// primary; forking a forked session creates a nested child.
+    fn fork(&self, name: String) -> PyForkBuilder {
+        PyForkBuilder {
+            parent: self.inner.clone(),
+            name,
+            must_create: false,
+            ttl: None,
+        }
+    }
+
+    /// Fork-local schema mutation builder. Adds labels and edge types
+    /// to the fork's overlay only — primary is unaffected. Required
+    /// under `strict_schema=True` to introduce fork-only entities.
+    fn fork_schema(&self) -> PyForkSchemaBuilder {
+        PyForkSchemaBuilder {
+            parent: self.inner.clone(),
+            pending: Vec::new(),
+        }
+    }
+
+    /// Flush this session's writer to L1.
+    ///
+    /// On a forked session this flushes the fork's L0 buffer to its
+    /// Lance branches.
+    fn flush(&self) -> PyResult<()> {
+        pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(self.inner.flush())
+            .map_err(crate::exceptions::uni_error_to_pyerr)
+    }
+
+    /// `True` when this session was returned by a `fork()` call.
+    fn is_forked(&self) -> bool {
+        self.inner.is_forked()
     }
 
     /// Get the session ID.
@@ -2030,5 +2122,209 @@ impl BulkWriter {
             self.abort()?;
         }
         Ok(false)
+    }
+}
+
+// ============================================================================
+// Phase 4b — Fork builder + Fork-schema builder
+// ============================================================================
+
+/// Builder returned by `Session.fork(name)`. Drive it via `.build()`
+/// after chaining configuration methods.
+///
+/// Example:
+/// ```python
+/// fork = session.fork("scenario_1").ttl(timedelta(hours=1)).build()
+/// ```
+#[pyclass(name = "ForkBuilder")]
+pub struct PyForkBuilder {
+    pub(crate) parent: ::uni_db::Session,
+    pub(crate) name: String,
+    pub(crate) must_create: bool,
+    pub(crate) ttl: Option<std::time::Duration>,
+}
+
+#[pymethods]
+impl PyForkBuilder {
+    /// Require fresh creation; errors with `UniForkAlreadyExistsError`
+    /// if the fork name is already taken.
+    fn new_(mut slf: PyRefMut<'_, Self>) -> PyRefMut<'_, Self> {
+        slf.must_create = true;
+        slf
+    }
+
+    /// Stamp a wall-clock TTL on the fork. Has no effect when the
+    /// fork already exists (open-or-create returns it unchanged).
+    fn ttl<'py>(mut slf: PyRefMut<'py, Self>, ttl: Py<PyAny>) -> PyResult<PyRefMut<'py, Self>> {
+        let py = slf.py();
+        slf.ttl = Some(convert::py_timedelta_to_duration(ttl.bind(py))?);
+        Ok(slf)
+    }
+
+    /// Drive the open-or-create flow and return a forked `Session`.
+    fn build(&self) -> PyResult<Session> {
+        let parent = self.parent.clone();
+        let name = self.name.clone();
+        let must_create = self.must_create;
+        let ttl = self.ttl;
+        let forked = pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(async move {
+                let mut b = parent.fork(name);
+                if must_create {
+                    b = b.new_();
+                }
+                if let Some(d) = ttl {
+                    b = b.ttl(d);
+                }
+                b.await
+            })
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
+        Ok(Session { inner: forked })
+    }
+}
+
+/// Builder returned by `Session.fork_schema()`. Chain `.label(...)`
+/// and `.edge_type(...)` calls, then `.apply()` to persist the
+/// fork-local overlay.
+#[pyclass(name = "ForkSchemaBuilder")]
+pub struct PyForkSchemaBuilder {
+    pub(crate) parent: ::uni_db::Session,
+    pub(crate) pending: Vec<ForkSchemaPending>,
+}
+
+#[derive(Clone)]
+pub enum ForkSchemaPending {
+    Label {
+        name: String,
+        description: Option<String>,
+    },
+    EdgeType {
+        name: String,
+        from_labels: Vec<String>,
+        to_labels: Vec<String>,
+        description: Option<String>,
+    },
+}
+
+#[pymethods]
+impl PyForkSchemaBuilder {
+    /// Add a fork-local label.
+    #[pyo3(signature = (name, description=None))]
+    fn label(
+        mut slf: PyRefMut<'_, Self>,
+        name: String,
+        description: Option<String>,
+    ) -> PyRefMut<'_, Self> {
+        slf.pending
+            .push(ForkSchemaPending::Label { name, description });
+        slf
+    }
+
+    /// Add a fork-local edge type.
+    #[pyo3(signature = (name, from_labels, to_labels, description=None))]
+    fn edge_type(
+        mut slf: PyRefMut<'_, Self>,
+        name: String,
+        from_labels: Vec<String>,
+        to_labels: Vec<String>,
+        description: Option<String>,
+    ) -> PyRefMut<'_, Self> {
+        slf.pending.push(ForkSchemaPending::EdgeType {
+            name,
+            from_labels,
+            to_labels,
+            description,
+        });
+        slf
+    }
+
+    /// Persist the pending entries to the fork's overlay file and the
+    /// fork's in-memory `SchemaManager`. Errors with
+    /// `UniInvalidArgumentError` on a non-forked session.
+    fn apply(&self) -> PyResult<()> {
+        let parent = self.parent.clone();
+        let pending = self.pending.clone();
+        if pending.is_empty() {
+            return Ok(());
+        }
+        pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(apply_fork_schema_pending(parent, pending))
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
+        Ok(())
+    }
+}
+
+/// Drive the Rust `ForkSchemaBuilder` from a buffered list of pending
+/// changes. The Rust builder consumes by-value at each chain step;
+/// only the final cursor's `.apply()` lands every entry in one
+/// persisted overlay update. We model the cursor as an enum because
+/// `ForkSchemaBuilder`, `ForkLabelBuilder`, and `ForkEdgeTypeBuilder`
+/// all share the same `.label()` / `.edge_type()` continuation
+/// methods but have distinct types.
+pub(crate) async fn apply_fork_schema_pending(
+    parent: ::uni_db::Session,
+    pending: Vec<ForkSchemaPending>,
+) -> ::uni_common::api::error::Result<()> {
+    use ::uni_db::api::fork_schema::{ForkEdgeTypeBuilder, ForkLabelBuilder, ForkSchemaBuilder};
+
+    enum Cursor<'a> {
+        Schema(ForkSchemaBuilder<'a>),
+        Label(ForkLabelBuilder<'a>),
+        EdgeType(ForkEdgeTypeBuilder<'a>),
+    }
+
+    fn step_label<'a>(cursor: Cursor<'a>, name: &str, desc: Option<&str>) -> Cursor<'a> {
+        let mut lb = match cursor {
+            Cursor::Schema(b) => b.label(name),
+            Cursor::Label(b) => b.label(name),
+            Cursor::EdgeType(b) => b.label(name),
+        };
+        if let Some(d) = desc {
+            lb = lb.description(d);
+        }
+        Cursor::Label(lb)
+    }
+
+    fn step_edge<'a>(
+        cursor: Cursor<'a>,
+        name: &str,
+        from: &[&str],
+        to: &[&str],
+        desc: Option<&str>,
+    ) -> Cursor<'a> {
+        let mut eb = match cursor {
+            Cursor::Schema(b) => b.edge_type(name, from, to),
+            Cursor::Label(b) => b.edge_type(name, from, to),
+            Cursor::EdgeType(b) => b.edge_type(name, from, to),
+        };
+        if let Some(d) = desc {
+            eb = eb.description(d);
+        }
+        Cursor::EdgeType(eb)
+    }
+
+    let mut cursor = Cursor::Schema(parent.fork_schema());
+    for change in &pending {
+        cursor = match change {
+            ForkSchemaPending::Label { name, description } => {
+                step_label(cursor, name, description.as_deref())
+            }
+            ForkSchemaPending::EdgeType {
+                name,
+                from_labels,
+                to_labels,
+                description,
+            } => {
+                let from_refs: Vec<&str> = from_labels.iter().map(String::as_str).collect();
+                let to_refs: Vec<&str> = to_labels.iter().map(String::as_str).collect();
+                step_edge(cursor, name, &from_refs, &to_refs, description.as_deref())
+            }
+        };
+    }
+
+    match cursor {
+        Cursor::Schema(b) => b.apply().await,
+        Cursor::Label(b) => b.apply().await,
+        Cursor::EdgeType(b) => b.apply().await,
     }
 }

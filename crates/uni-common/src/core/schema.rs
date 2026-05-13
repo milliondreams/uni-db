@@ -1145,6 +1145,7 @@ impl SchemaManager {
         data_type: DataType,
         nullable: bool,
     ) -> Result<()> {
+        validate_property_name(prop_name)?;
         let mut guard = acquire_write(&self.schema, "schema")?;
         let schema = Arc::make_mut(&mut *guard);
         let version = schema.schema_version;
@@ -1183,6 +1184,7 @@ impl SchemaManager {
         nullable: bool,
         description: Option<String>,
     ) -> Result<()> {
+        validate_property_name(prop_name)?;
         let mut guard = acquire_write(&self.schema, "schema")?;
         let schema = Arc::make_mut(&mut *guard);
         let version = schema.schema_version;
@@ -1220,6 +1222,7 @@ impl SchemaManager {
         data_type: DataType,
         expr: String,
     ) -> Result<()> {
+        validate_property_name(prop_name)?;
         let mut guard = acquire_write(&self.schema, "schema")?;
         let schema = Arc::make_mut(&mut *guard);
         let version = schema.schema_version;
@@ -1481,6 +1484,44 @@ pub fn validate_identifier(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Reject user-declared property names that collide with internal Arrow column
+/// names used by the storage layer.
+///
+/// Without this, declaring a property named e.g. `ext_id` produces an Arrow
+/// schema with two `ext_id` fields at flush time, which Lance rejects with
+/// "Duplicate field name" — silently losing all in-session writes on shutdown.
+pub fn validate_property_name(name: &str) -> Result<()> {
+    if name.starts_with('_') {
+        return Err(anyhow!(
+            "Property name '{}' is reserved: names starting with '_' are reserved by the storage layer",
+            name
+        ));
+    }
+    // Unprefixed names that get appended alongside user properties in the
+    // per-label vertex (`storage/vertex.rs`), per-edge-type edge
+    // (`storage/edge.rs`), or per-edge-type delta (`storage/delta.rs`)
+    // Arrow schemas — declaring one of these as a user property produces a
+    // duplicate Arrow field and a Lance "Duplicate field name" error at
+    // flush time. Fixed-schema-only columns (`type`, `props_json`,
+    // `labels` in the main tables) are NOT listed: those tables don't
+    // append user properties, so no collision can occur.
+    const RESERVED_PROPS: &[&str] = &[
+        "ext_id",
+        "overflow_json",
+        "eid",
+        "src_vid",
+        "dst_vid",
+        "op",
+    ];
+    if RESERVED_PROPS.contains(&name) {
+        return Err(anyhow!(
+            "Property name '{}' is reserved by the storage layer; please choose a different name",
+            name
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1524,6 +1565,74 @@ mod tests {
                 .get("Person")
                 .unwrap()
                 .contains_key("name")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_reserved_property_names_rejected() -> Result<()> {
+        let dir = tempdir()?;
+        let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path())?);
+        let path = ObjectStorePath::from("schema.json");
+        let manager = SchemaManager::load_from_store(store, &path).await?;
+
+        manager.add_label("Tiny")?;
+
+        // Unprefixed reserved names — these collide with internal Arrow
+        // columns in storage tables and previously caused Lance
+        // "Duplicate field name" errors at flush time.
+        for reserved in &[
+            "ext_id",
+            "overflow_json",
+            "eid",
+            "src_vid",
+            "dst_vid",
+            "op",
+        ] {
+            let err = manager
+                .add_property("Tiny", reserved, DataType::String, true)
+                .expect_err(&format!("expected '{reserved}' to be rejected"));
+            assert!(
+                err.to_string().contains("reserved"),
+                "error for '{reserved}' should mention 'reserved', got: {err}"
+            );
+        }
+
+        // Leading-underscore pattern rule.
+        for reserved in &["_vid", "_uid", "_eid", "_version", "_created_at"] {
+            assert!(
+                manager
+                    .add_property("Tiny", reserved, DataType::String, true)
+                    .is_err(),
+                "expected '{reserved}' to be rejected"
+            );
+        }
+
+        // Names that merely contain a reserved substring should still be
+        // accepted.
+        manager.add_property("Tiny", "ext_id_foo", DataType::String, true)?;
+        manager.add_property("Tiny", "user_op", DataType::String, true)?;
+        manager.add_property("Tiny", "type_name", DataType::String, true)?;
+
+        // Same check applies to edge-type properties (single dispatch).
+        manager.add_edge_type("knows", vec!["Tiny".into()], vec!["Tiny".into()])?;
+        assert!(
+            manager
+                .add_property("knows", "src_vid", DataType::Int64, true)
+                .is_err()
+        );
+
+        // And to generated properties.
+        assert!(
+            manager
+                .add_generated_property(
+                    "Tiny",
+                    "ext_id",
+                    DataType::String,
+                    "concat('x', name)".into()
+                )
+                .is_err()
         );
 
         Ok(())

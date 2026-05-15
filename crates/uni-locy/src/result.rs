@@ -94,11 +94,62 @@ pub struct ConfidenceBand {
 
 /// Phase C C1a: provenance tag for a [`ConfidenceBand`] — identifies
 /// which uncertainty-quantification machinery produced the bounds.
-/// Only `Conformal` ships in C1a; ensemble / credal variants are
-/// extensibility hooks documented in the implementation plan §3.1.
+/// `Conformal` shipped in C1a; ensemble and credal variants follow in
+/// D-C1e as extensibility hooks for future calibrators.
 #[derive(Debug, Clone, Copy)]
 pub enum ConfidenceSource {
+    /// Split-conformal predictor: `alpha` is the miscoverage rate
+    /// (e.g. `0.1` → 90% coverage). Band is centered on the point
+    /// estimate, ± the `(1 - alpha)`-quantile of holdout
+    /// nonconformity scores. Shipped in C1a.
     Conformal { alpha: f64 },
+    /// Phase D D-C1e: bootstrap or N-of-K ensemble calibrator. The
+    /// band is derived from cross-estimator variance: `[p - σ, p + σ]`
+    /// (clipped to `[0, 1]`) where `σ` is the standard deviation of
+    /// per-estimator predictions on the holdout. `n_estimators` is the
+    /// number of base learners that voted, surfaced so consumers can
+    /// reason about the noise floor of the band.
+    EnsembleVariance { n_estimators: usize },
+    /// Phase D D-C1e: credal (imprecise-probability) calibrator. The
+    /// band is an explicit interval `[lower, upper]` derived from a
+    /// credal prior rather than a point estimate ± halo. The two
+    /// `_prior` fields surface the calibrator's lower / upper prior
+    /// hyperparameters so consumers can map the band back to its
+    /// belief-revision shape.
+    Credal { lower_prior: f64, upper_prior: f64 },
+}
+
+#[cfg(test)]
+mod confidence_source_tests {
+    use super::ConfidenceSource;
+
+    #[test]
+    fn conformal_debug_format() {
+        let s = ConfidenceSource::Conformal { alpha: 0.1 };
+        let dbg = format!("{:?}", s);
+        assert!(dbg.contains("Conformal"));
+        assert!(dbg.contains("0.1"));
+    }
+
+    #[test]
+    fn ensemble_variance_debug_format() {
+        let s = ConfidenceSource::EnsembleVariance { n_estimators: 50 };
+        let dbg = format!("{:?}", s);
+        assert!(dbg.contains("EnsembleVariance"));
+        assert!(dbg.contains("50"));
+    }
+
+    #[test]
+    fn credal_debug_format() {
+        let s = ConfidenceSource::Credal {
+            lower_prior: 0.1,
+            upper_prior: 0.9,
+        };
+        let dbg = format!("{:?}", s);
+        assert!(dbg.contains("Credal"));
+        assert!(dbg.contains("0.1"));
+        assert!(dbg.contains("0.9"));
+    }
 }
 
 /// Outcome of a single `CALIBRATE` invocation. Phase C C2.

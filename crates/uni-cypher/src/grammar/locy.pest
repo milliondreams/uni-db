@@ -49,6 +49,7 @@ PROB     = @{ ^"prob" ~ !ident_char }
 MODEL          = @{ ^"model" ~ !ident_char }
 INPUT_KW       = @{ ^"input" ~ !ident_char }
 FEATURES       = @{ ^"features" ~ !ident_char }
+FROM_KW        = @{ ^"from" ~ !ident_char }
 OUTPUT         = @{ ^"output" ~ !ident_char }
 USING          = @{ ^"using" ~ !ident_char }
 XERVO          = @{ ^"xervo" ~ !ident_char }
@@ -478,7 +479,15 @@ model_input_binding = {
 }
 
 model_features_clause = {
-    FEATURES ~ expression ~ ("," ~ expression)*
+    FEATURES ~ (
+        model_features_path_context |
+        (expression ~ ("," ~ expression)*)
+    )
+}
+// Phase D D3: `FEATURES (s, col) FROM rule_name` pulls `col` from
+// the prior derivation of `rule_name` (keyed by `s`) at runtime.
+model_features_path_context = {
+    "(" ~ locy_identifier ~ "," ~ locy_identifier ~ ")" ~ FROM_KW ~ rule_name
 }
 
 model_output_clause = {

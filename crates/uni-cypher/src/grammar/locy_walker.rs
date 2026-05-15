@@ -351,6 +351,7 @@ fn build_model_definition(pair: Pair<LocyRule>) -> Result<ModelDefinition, Parse
     let mut name = None;
     let mut inputs: Vec<InputBinding> = Vec::new();
     let mut features: Vec<ast::Expr> = Vec::new();
+    let mut path_context: Option<PathContextFeature> = None;
     let mut output: Option<OutputBinding> = None;
     let mut xervo_alias: Option<String> = None;
     let mut calibration: Option<CalibrationMethod> = None;
@@ -383,7 +384,9 @@ fn build_model_definition(pair: Pair<LocyRule>) -> Result<ModelDefinition, Parse
                 inputs = build_model_input_clause(child)?;
             }
             LocyRule::model_features_clause => {
-                features = build_model_features_clause(child)?;
+                let (exprs, ctx) = build_model_features_clause(child)?;
+                features = exprs;
+                path_context = ctx;
             }
             LocyRule::model_output_clause => {
                 output = Some(build_model_output_clause(child)?);
@@ -405,6 +408,7 @@ fn build_model_definition(pair: Pair<LocyRule>) -> Result<ModelDefinition, Parse
         name: name.ok_or_else(|| ParseError::new("CREATE MODEL missing name".to_string()))?,
         inputs,
         features,
+        path_context,
         output: output
             .ok_or_else(|| ParseError::new("CREATE MODEL missing OUTPUT clause".to_string()))?,
         xervo_alias: xervo_alias.ok_or_else(|| {
@@ -438,14 +442,56 @@ fn build_model_input_clause(pair: Pair<LocyRule>) -> Result<Vec<InputBinding>, P
     Ok(bindings)
 }
 
-fn build_model_features_clause(pair: Pair<LocyRule>) -> Result<Vec<ast::Expr>, ParseError> {
+fn build_model_features_clause(
+    pair: Pair<LocyRule>,
+) -> Result<(Vec<ast::Expr>, Option<PathContextFeature>), ParseError> {
     let mut features = Vec::new();
+    let mut path_context = None;
     for child in pair.into_inner() {
-        if child.as_rule() == LocyRule::expression {
-            features.push(reparse_as_cypher_expression(child.as_str())?);
+        match child.as_rule() {
+            LocyRule::expression => {
+                features.push(reparse_as_cypher_expression(child.as_str())?);
+            }
+            LocyRule::model_features_path_context => {
+                path_context = Some(build_model_features_path_context(child)?);
+            }
+            _ => {}
         }
     }
-    Ok(features)
+    Ok((features, path_context))
+}
+
+fn build_model_features_path_context(
+    pair: Pair<LocyRule>,
+) -> Result<PathContextFeature, ParseError> {
+    let mut idents: Vec<String> = Vec::new();
+    let mut source_rule: Option<String> = None;
+    for child in pair.into_inner() {
+        match child.as_rule() {
+            LocyRule::locy_identifier => {
+                idents.push(normalize_locy_identifier(child.as_str()));
+            }
+            LocyRule::rule_name => {
+                let qn = child.into_inner().next().ok_or_else(|| {
+                    ParseError::new("FEATURES FROM rule_name missing identifier".to_string())
+                })?;
+                source_rule = Some(build_qualified_name(qn)?.to_string());
+            }
+            _ => {}
+        }
+    }
+    if idents.len() != 2 {
+        return Err(ParseError::new(
+            "FEATURES (subject, column) FROM rule_name requires exactly 2 identifiers".to_string(),
+        ));
+    }
+    Ok(PathContextFeature {
+        subject_var: idents[0].clone(),
+        column: idents[1].clone(),
+        source_rule: source_rule.ok_or_else(|| {
+            ParseError::new("FEATURES (subject, column) FROM rule_name missing rule".to_string())
+        })?,
+    })
 }
 
 fn build_model_output_clause(pair: Pair<LocyRule>) -> Result<OutputBinding, ParseError> {

@@ -29,6 +29,8 @@ pub struct CompiledModel {
     pub name: String,
     pub inputs: Vec<CompiledInputBinding>,
     pub features: Vec<uni_cypher::ast::Expr>,
+    /// Phase D D3: optional path-context feature `FEATURES (subject, col) FROM rule_name`.
+    pub path_context: Option<uni_cypher::locy_ast::PathContextFeature>,
     pub output_type: uni_cypher::locy_ast::OutputType,
     pub output_name: String,
     pub xervo_alias: String,
@@ -187,6 +189,11 @@ pub struct ModelInvocation {
     /// fact_row). Same length and ordering as `feature_exprs` and
     /// `feature_names`.
     pub original_feature_exprs: Vec<Expr>,
+    /// Phase D D3: snapshot of the model's `path_context` declaration
+    /// (if any) carried onto the invocation so the runtime can pull
+    /// the named column from the source rule's derived facts at
+    /// classify time without re-consulting the model catalog.
+    pub path_context: Option<uni_cypher::locy_ast::PathContextFeature>,
 }
 
 /// A column in a rule's YIELD schema.

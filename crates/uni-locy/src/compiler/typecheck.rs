@@ -981,6 +981,7 @@ impl<'a> InvocationLifter<'a> {
                     // (alias-bearing) or ALONG/FOLD (no alias).
                     yield_alias: None,
                     original_feature_exprs,
+                    path_context: model.path_context.clone(),
                 });
                 let _ = (distinct, window_spec);
                 Ok(Expr::Variable(synthetic))

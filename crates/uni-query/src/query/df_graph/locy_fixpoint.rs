@@ -2770,6 +2770,20 @@ enum FeatureResolverKind {
     SemanticMatch {
         model_name: String,
     },
+    /// Phase D D3 (MVP): path-context features pull a column from a
+    /// prior-derived rule's facts at runtime. The compiler ensures the
+    /// model's stratum follows the source rule (`build_dependency_graph_with_models`),
+    /// so the source rule's facts are materialized by the time this
+    /// resolver runs. Threading the `DerivedScanRegistry` into
+    /// `apply_model_invocations` is a separate plumbing step
+    /// (the registry today lives on the `LocyProgram` plan node, not
+    /// on `LocyModelInvokeExec`); pending that, the resolver errors
+    /// at row time with a clear message.
+    PathContext {
+        model_name: String,
+        source_rule: String,
+        column: String,
+    },
 }
 
 /// One side of a `similar_to` feature: either a column index in the
@@ -2815,6 +2829,20 @@ impl FeatureResolver {
                     model_name
                 )))
             }
+            FeatureResolverKind::PathContext {
+                model_name,
+                source_rule,
+                column,
+            } => Err(datafusion::error::DataFusionError::Execution(format!(
+                "model '{model_name}': `FEATURES (..., {column}) FROM {source_rule}` \
+                 requires `DerivedScanRegistry` threading into \
+                 `apply_model_invocations`, which is a separate plumbing step from \
+                 the D3 MVP. The compiler accepts the syntax and stratifies the \
+                 invoking rule after `{source_rule}`; the runtime join is pending \
+                 follow-up. Emulate by writing an intermediate rule that joins \
+                 `{source_rule}` and YIELDs `{column}` as a direct property, then \
+                 feed that as a plain feature."
+            ))),
         }
     }
 }
@@ -2879,6 +2907,22 @@ fn build_feature_resolvers(
             ))),
         }
     };
+
+    // Phase D D3: when the model declares a path-context feature,
+    // emit a single `PathContext` resolver keyed on the path-context
+    // column name (the model's `INPUT` bindings are unused under this
+    // form for MVP). The resolver errors at row time pending the
+    // runtime-join follow-up.
+    if let Some(pc) = &invocation.path_context {
+        return Ok(vec![FeatureResolver {
+            binding_name: pc.column.clone(),
+            kind: FeatureResolverKind::PathContext {
+                model_name: invocation.model_name.clone(),
+                source_rule: pc.source_rule.clone(),
+                column: pc.column.clone(),
+            },
+        }]);
+    }
 
     let mut out = Vec::with_capacity(invocation.feature_exprs.len());
     for (i, fexpr) in invocation.feature_exprs.iter().enumerate() {

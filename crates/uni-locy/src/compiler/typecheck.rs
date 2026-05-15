@@ -846,6 +846,49 @@ fn check_shared_neural_inputs(
             });
         }
     }
+    // ── F2c (F3 case 4): group by retrieval-feature property path ──
+    // Catches `similar_to(prop, _)` / `semantic_match(prop, _)` calls
+    // that share the same `Property(Variable(v), prop)` operand across
+    // ≥ 2 distinct model invocations. Suppressed by `@independent`.
+    let mut by_retrieval_prop: HashMap<(String, String), Vec<&str>> = HashMap::new();
+    for (model, args) in &invocations {
+        for a in args.iter() {
+            if let Expr::FunctionCall {
+                name: fname,
+                args: inner,
+                ..
+            } = a
+                && matches!(fname.as_str(), "similar_to" | "semantic_match")
+                && let Some(first) = inner.first()
+                && let Expr::Property(boxed, prop) = first
+                && let Expr::Variable(v) = boxed.as_ref()
+            {
+                by_retrieval_prop
+                    .entry((v.clone(), prop.clone()))
+                    .or_default()
+                    .push(model);
+            }
+        }
+    }
+    for ((v, prop), models) in &by_retrieval_prop {
+        let mut unique: Vec<&str> = models.to_vec();
+        unique.sort();
+        unique.dedup();
+        if unique.len() >= 2 && !all_independent(&unique) {
+            warnings.push(CompilerWarning {
+                code: WarningCode::SharedRetrievalContext,
+                message: format!(
+                    "rule '{rule_name}' invokes multiple neural models ({}) \
+                     whose features retrieve from the same property '{v}.{prop}'; \
+                     independence between models is unlikely when both condition \
+                     on the same retrieval evidence. Annotate `@independent` or \
+                     use TopKProofs for honest composition.",
+                    unique.join(", ")
+                ),
+                rule_name: rule_name.to_string(),
+            });
+        }
+    }
 }
 
 fn walk_function_calls<F>(expr: &Expr, f: &mut F) -> Result<(), LocyCompileError>

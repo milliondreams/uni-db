@@ -1178,6 +1178,51 @@ async fn result_contains_positive_complement_correlation(world: &mut LocyWorld) 
     );
 }
 
+#[then(regex = r#"^the result should contain a SharedRetrievalContext warning$"#)]
+async fn result_contains_shared_retrieval_context(world: &mut LocyWorld) {
+    let locy_result = world
+        .locy_result()
+        .expect("no evaluation result")
+        .as_ref()
+        .expect("evaluation failed");
+    let found = locy_result
+        .compile_warnings()
+        .iter()
+        .any(|w| matches!(w.code, uni_locy::types::WarningCode::SharedRetrievalContext));
+    assert!(
+        found,
+        "expected SharedRetrievalContext compile warning, got: {:?}",
+        locy_result
+            .compile_warnings()
+            .iter()
+            .map(|w| format!("{:?}", w.code))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[then(regex = r#"^the result should not contain a SharedRetrievalContext warning$"#)]
+async fn result_does_not_contain_shared_retrieval_context(world: &mut LocyWorld) {
+    let locy_result = world
+        .locy_result()
+        .expect("no evaluation result")
+        .as_ref()
+        .expect("evaluation failed");
+    let found = locy_result
+        .compile_warnings()
+        .iter()
+        .any(|w| matches!(w.code, uni_locy::types::WarningCode::SharedRetrievalContext));
+    assert!(
+        !found,
+        "expected no SharedRetrievalContext warning, got: {:?}",
+        locy_result
+            .compile_warnings()
+            .iter()
+            .filter(|w| matches!(w.code, uni_locy::types::WarningCode::SharedRetrievalContext))
+            .map(|w| w.message.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
 #[then(regex = r#"^the result should contain a CrossPredicateCorrelation warning$"#)]
 async fn result_contains_cross_predicate_correlation(world: &mut LocyWorld) {
     let locy_result = world

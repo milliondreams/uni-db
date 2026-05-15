@@ -91,17 +91,35 @@ jobs:
         # `provider-onnx` statically links pyke's CPU libonnxruntime.a — no
         # ORT_DYLIB_PATH needed; the E2E `#[ignore]` real-ONNX tests run
         # because the lib is in the binary.
-        run: cargo nextest run -p uni-db --features provider-onnx --test reranker_integration --run-ignored all
+        #
+        # `test_real_onnx_cross_encoder_reranks_by_relevance` is filtered out:
+        # `cross-encoder/ms-marco-MiniLM-L6-v2/onnx/model.onnx` is served only
+        # via a 302 to `cas-bridge.xethub.hf.co` (xet-bridge LFS). `hf-hub
+        # 0.5.0`'s `relative_redirect_client` (api/tokio.rs:368-388) refuses
+        # absolute redirects, so the download 404s. `hf-hub 1.0.0-rc.1` is
+        # a full API rewrite; we'll re-enable this test once `uni-xervo` /
+        # `hf-hub` ship a compatible fix. The other 3 real-ONNX tests
+        # (Qwen3, BGE, cross-encoder facade) still run.
+        run: |
+          cargo nextest run -p uni-db --features provider-onnx --test reranker_integration --run-ignored all \
+            -E 'not test(=test_real_onnx_cross_encoder_reranks_by_relevance)'
 
       - name: Run reranker integration tests (load-dynamic ONNX)
         # `provider-onnx-dynamic` requires an ONNX Runtime tarball at
         # runtime. We download Microsoft's CPU build for CI; mock tests pass
         # without it but we set ORT_DYLIB_PATH to keep the dep symmetrical.
+        #
+        # `--no-default-features` is required: `uni-db`'s defaults include
+        # `provider-onnx` (bundled, statically linked). `provider-onnx` and
+        # `provider-onnx-dynamic` are mutually exclusive at the `ort` crate
+        # level, and `uni-xervo`'s `build.rs` hard-panics when both are
+        # active. We re-enable only the providers the reranker test path
+        # touches.
         run: |
           curl -sSL -o /tmp/ort.tgz https://github.com/microsoft/onnxruntime/releases/download/v1.20.1/onnxruntime-linux-x64-1.20.1.tgz
           tar xzf /tmp/ort.tgz -C /tmp
           export ORT_DYLIB_PATH=/tmp/onnxruntime-linux-x64-1.20.1/lib/libonnxruntime.so
-          cargo nextest run -p uni-db --features provider-onnx-dynamic --test reranker_integration
+          cargo nextest run -p uni-db --no-default-features --features provider-onnx-dynamic --test reranker_integration
 
       - name: Run TCK (schemaless + schema)
         run: |

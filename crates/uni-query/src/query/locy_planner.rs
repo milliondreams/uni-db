@@ -1037,12 +1037,48 @@ impl<'a> LocyPlanBuilder<'a> {
         // input schema of `LocyProject`. Downstream FOLD aggregates
         // also see those columns (FoldExec reads projected columns).
         if !clause.model_invocations.is_empty() {
+            // Phase D D3 runtime: for every distinct source rule
+            // referenced by a path-context invocation on this clause,
+            // mint a `DerivedScanHandle` (non-self-ref → full cross-stratum
+            // facts) and surface it as a `PathContextHandle` on the
+            // logical plan node. The `data` Arc is shared with
+            // `DerivedScanRegistry`, so the fixpoint loop's writes flow
+            // through here without further plumbing.
+            let mut path_context_handles: HashMap<
+                String,
+                super::df_graph::locy_model_invoke::PathContextHandle,
+            > = HashMap::new();
+            for inv in &clause.model_invocations {
+                if let Some(pc) = &inv.path_context {
+                    if path_context_handles.contains_key(&pc.source_rule) {
+                        continue;
+                    }
+                    let target_rule = rule_catalog.get(&pc.source_rule).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "model '{}' path_context references undefined rule '{}'",
+                            inv.model_name,
+                            pc.source_rule
+                        )
+                    })?;
+                    let handle =
+                        self.get_or_create_derived_scan_handle(&pc.source_rule, target_rule, false);
+                    path_context_handles.insert(
+                        pc.source_rule.clone(),
+                        super::df_graph::locy_model_invoke::PathContextHandle {
+                            source_rule: pc.source_rule.clone(),
+                            data: handle.data,
+                            schema: handle.schema,
+                        },
+                    );
+                }
+            }
             plan = LogicalPlan::LocyModelInvoke {
                 input: Box::new(plan),
                 invocations: clause.model_invocations.clone(),
                 classifier_registry: Arc::clone(&classifier_registry),
                 classifier_cache: classifier_cache.as_ref().map(Arc::clone),
                 classifier_provenance_store: classifier_provenance_store.as_ref().map(Arc::clone),
+                path_context_handles,
             };
         }
 

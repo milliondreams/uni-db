@@ -1202,6 +1202,25 @@ impl HybridPhysicalPlanner {
                 target_types,
             } => self.plan_locy_project(input, projections, target_types, all_properties),
 
+            LogicalPlan::LocyModelInvoke {
+                input,
+                invocations,
+                classifier_registry,
+                classifier_cache,
+                classifier_provenance_store,
+            } => {
+                let input_plan = self.plan_internal(input, all_properties)?;
+                Ok(Arc::new(
+                    super::df_graph::locy_model_invoke::LocyModelInvokeExec::new(
+                        input_plan,
+                        invocations.clone(),
+                        Arc::clone(classifier_registry),
+                        classifier_cache.as_ref().map(Arc::clone),
+                        classifier_provenance_store.as_ref().map(Arc::clone),
+                    ),
+                ))
+            }
+
             LogicalPlan::LocyProgram {
                 strata,
                 commands,
@@ -1215,11 +1234,15 @@ impl HybridPhysicalPlanner {
                 exact_probability,
                 max_bdd_variables,
                 top_k_proofs,
+                semiring_kind,
+                classifier_registry,
+                classifier_cache,
+                classifier_provenance_store,
             } => {
                 let output_schema = super::df_graph::locy_program::stats_schema();
 
                 Ok(Arc::new(
-                    super::df_graph::locy_program::LocyProgramExec::new(
+                    super::df_graph::locy_program::LocyProgramExec::new_with_semiring_classifiers_and_cache(
                         strata.clone(),
                         commands.clone(),
                         Arc::clone(derived_scan_registry),
@@ -1238,6 +1261,10 @@ impl HybridPhysicalPlanner {
                         *exact_probability,
                         *max_bdd_variables,
                         *top_k_proofs,
+                        *semiring_kind,
+                        Arc::clone(classifier_registry),
+                        classifier_cache.as_ref().map(Arc::clone),
+                        classifier_provenance_store.as_ref().map(Arc::clone),
                     ),
                 ))
             }
@@ -5651,7 +5678,8 @@ fn collect_variable_kinds(plan: &LogicalPlan, kinds: &mut HashMap<String, Variab
         | LogicalPlan::LocyBestBy { .. }
         | LogicalPlan::LocyPriority { .. }
         | LogicalPlan::LocyDerivedScan { .. }
-        | LogicalPlan::LocyProject { .. } => {}
+        | LogicalPlan::LocyProject { .. }
+        | LogicalPlan::LocyModelInvoke { .. } => {}
         // Leaf nodes with no variables or not applicable
         LogicalPlan::Empty
         | LogicalPlan::CreateVectorIndex { .. }

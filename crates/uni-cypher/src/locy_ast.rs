@@ -53,6 +53,17 @@ pub enum LocyStatement {
     AbduceQuery(AbduceQuery),
     /// `EXPLAIN RULE ruleName WHERE expr RETURN ...`
     ExplainRule(ExplainRule),
+    /// `CREATE MODEL name AS INPUT (...) FEATURES ... OUTPUT type name USING xervo('...')`
+    /// Phase B neural-predicate preview. The grammar always parses this;
+    /// the compiler rejects it unless `LocyConfig::neural_predicates_preview`
+    /// is set.
+    Model(ModelDefinition),
+    /// `CALIBRATE name ON MATCH pattern [WHERE ...] TARGET expr METHOD method [HOLDOUT 0.2]`
+    /// Phase C C2 calibration statement.
+    Calibrate(CalibrateCommand),
+    /// `VALIDATE name ON MATCH pattern [WHERE ...] TARGET expr METRICS m1, m2, ...`
+    /// Phase C C3 validation statement.
+    Validate(ValidateCommand),
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -279,4 +290,129 @@ pub struct ExplainRule {
     pub rule_name: QualifiedName,
     pub where_expr: Option<Expr>,
     pub return_clause: Option<ReturnClause>,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CREATE MODEL (neural predicate, Phase B preview)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// `CREATE MODEL` declaration. Parses the full surface from impl plan §2.1;
+/// `Conformal` / `Dirichlet` calibration methods are deferred to Phase C.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelDefinition {
+    pub name: QualifiedName,
+    pub inputs: Vec<InputBinding>,
+    /// Feature expressions evaluated against input bindings. Empty when
+    /// the `FEATURES` clause is omitted (model receives all bound node
+    /// properties — interpretation deferred to the runtime adapter).
+    pub features: Vec<Expr>,
+    pub output: OutputBinding,
+    pub xervo_alias: String,
+    pub calibration: Option<CalibrationMethod>,
+    pub version: Option<String>,
+    pub annotations: ModelAnnotations,
+}
+
+/// One INPUT binding, e.g. `(s:Supplier)`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InputBinding {
+    pub variable: String,
+    pub label: Option<String>,
+}
+
+/// The OUTPUT declaration, e.g. `OUTPUT PROB risk`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OutputBinding {
+    pub output_type: OutputType,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OutputType {
+    Prob,
+    Score,
+    Label,
+    Vector,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum CalibrationMethod {
+    PlattScaling,
+    IsotonicRegression,
+    TemperatureScaling,
+    BetaCalibration,
+    None,
+    /// Phase C C1a: split-conformal predictor. The point prediction
+    /// passes through unchanged; the calibrator carries a
+    /// `(1 - alpha)`-quantile of holdout nonconformity scores which
+    /// gates a per-prediction `ConfidenceBand` at inference. `alpha`
+    /// defaults to 0.1 (90% bands) when omitted.
+    Conformal {
+        alpha: f64,
+    },
+    // Dirichlet — Phase C M2; deferred.
+}
+
+/// Statement-level annotations. Currently only `@independent`, which
+/// suppresses Phase-C F2 shared-neural-input warnings. Parsed in Slice
+/// 1+2; semantically meaningful when F2 lands.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelAnnotations {
+    pub independent: bool,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CALIBRATE COMMAND  (Phase C C2)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// `CALIBRATE` statement. The runtime collects
+/// `(prediction, ground_truth)` pairs by invoking the registered
+/// classifier for `model_name` over the MATCH pattern, fits the
+/// chosen calibrator on a holdout-split, and returns the fitted
+/// transform + holdout metrics.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CalibrateCommand {
+    pub model_name: QualifiedName,
+    pub pattern: Pattern,
+    pub where_expr: Option<Expr>,
+    pub target_expr: Expr,
+    pub method: CalibrationMethod,
+    /// Holdout fraction (must be in `(0, 1)`). `None` → compiler
+    /// resolves to default 0.2.
+    pub holdout: Option<f64>,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// VALIDATE COMMAND  (Phase C C3)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// `VALIDATE` statement. Runs the named rule, joins its PROB column
+/// output against the TARGET expression (ground truth), and computes
+/// the requested metrics. Unlike CALIBRATE, this never fits anything
+/// — it just measures.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ValidateCommand {
+    pub rule_name: QualifiedName,
+    pub pattern: Pattern,
+    pub where_expr: Option<Expr>,
+    pub target_expr: Expr,
+    pub metrics: Vec<ValidationMetric>,
+}
+
+/// Supported metrics in `VALIDATE METRICS ...`. Each metric is a
+/// proper scoring rule or a calibration-quality summary; see
+/// `crates/uni-locy/src/calibration.rs` for definitions and
+/// numerical references.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ValidationMetric {
+    BrierScore,
+    LogLoss,
+    /// Naive equal-width-binning ECE. Triggers
+    /// `WarningCode::EceBinningBias` (impl plan §3.4) suggesting
+    /// `DebiasedEce` instead.
+    Ece,
+    /// Debiased ECE per Kumar et al. NeurIPS 2019 — recommended.
+    DebiasedEce,
+    Accuracy,
+    Auc,
 }

@@ -2122,6 +2122,23 @@ pub enum LogicalPlan {
         exact_probability: bool,
         max_bdd_variables: usize,
         top_k_proofs: usize,
+        /// Active probability semiring (rollout D-7). Defaults to
+        /// `AddMultProb` (Phase 1/2 byte-identical behavior). `BddExact`
+        /// is selected by `LocyConfig::resolve()` when `exact_probability`
+        /// is true.
+        semiring_kind: uni_locy::SemiringKind,
+        /// Phase B Slice 3: per-evaluation registry of neural classifiers
+        /// keyed by model name. Empty for programs without `CREATE MODEL`.
+        classifier_registry: Arc<uni_locy::ClassifierRegistry>,
+        /// Phase B follow-up: optional memoization cache. `None` →
+        /// runtime creates a fresh per-query cache; `Some` → shared
+        /// across queries (caller-managed).
+        classifier_cache: Option<Arc<uni_locy::ModelInvocationCache>>,
+        /// Phase C B1-B3 follow-up: per-query side-channel store
+        /// for per-invocation (raw, calibrated, confidence_band)
+        /// records. Flows alongside `classifier_cache` into
+        /// `LocyProgramExec`.
+        classifier_provenance_store: Option<Arc<uni_locy::NeuralProvenanceStore>>,
     },
     /// FOLD operator: lattice-join non-key columns per KEY group.
     LocyFold {
@@ -2156,6 +2173,31 @@ pub enum LogicalPlan {
         projections: Vec<(Expr, Option<String>)>,
         /// Expected output Arrow type per projection (for CAST support).
         target_types: Vec<DataType>,
+    },
+    /// Phase B A4: invoke registered neural classifiers against the
+    /// input batches and overwrite the per-invocation placeholder
+    /// column with each row's predicted probability. Wraps a Locy
+    /// clause body plan when `CompiledClause.model_invocations` is
+    /// non-empty; transparent (passes batches through unchanged) when
+    /// the list is empty.
+    ///
+    /// Registry and cache are carried on the node so that
+    /// `execute_subplan` — which spins up a fresh
+    /// `HybridPhysicalPlanner` per call — can lower it to a physical
+    /// `LocyModelInvokeExec` without depending on planner-side
+    /// runtime state.
+    LocyModelInvoke {
+        input: Box<LogicalPlan>,
+        invocations: Vec<uni_locy::ModelInvocation>,
+        classifier_registry: Arc<uni_locy::ClassifierRegistry>,
+        classifier_cache: Option<Arc<uni_locy::ModelInvocationCache>>,
+        /// Phase C B1-B3 follow-up: per-query side-channel store
+        /// for per-invocation (raw, calibrated, confidence_band)
+        /// records. `LocyModelInvokeExec` writes here after each
+        /// classifier call; EXPLAIN reads via collect_neural_calls
+        /// to surface NeuralProvenance for ALONG/FOLD-position
+        /// invocations and Mode B re-execution paths.
+        classifier_provenance_store: Option<Arc<uni_locy::NeuralProvenanceStore>>,
     },
 }
 
@@ -8281,6 +8323,14 @@ fn collect_properties_recursive(
             collect_properties_recursive(input, properties);
         }
         LogicalPlan::LocyPriority { input, .. } => {
+            collect_properties_recursive(input, properties);
+        }
+        LogicalPlan::LocyModelInvoke { input, .. } => {
+            // Model invocations don't introduce new property accesses
+            // — feature expressions are lifted to hidden YIELD items
+            // by `extract_model_invocations` (uni-locy typecheck) and
+            // their property refs are already collected via the
+            // wrapped LocyProject's projection walk.
             collect_properties_recursive(input, properties);
         }
         // DDL and other plans don't reference properties

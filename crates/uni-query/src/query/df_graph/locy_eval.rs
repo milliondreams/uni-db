@@ -546,6 +546,13 @@ pub fn record_batches_to_locy_rows(batches: &[RecordBatch]) -> Vec<FactRow> {
         for row_idx in 0..batch.num_rows() {
             let mut row = HashMap::new();
             for (col_idx, field) in schema.fields().iter().enumerate() {
+                // Phase B Slice 3 (post-Slice-3 follow-up): strip
+                // synthetic property-feature columns (`__feat_*`)
+                // emitted by `extract_model_invocations` so they
+                // don't leak into user-visible FactRows.
+                if field.name().starts_with("__feat_") {
+                    continue;
+                }
                 let column = batch.column(col_idx);
                 let data_type = if uni_common::core::schema::is_datetime_struct(field.data_type()) {
                     Some(&uni_common::DataType::DateTime)

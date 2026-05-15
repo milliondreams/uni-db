@@ -302,6 +302,48 @@ async fn derived_relation_should_contain_fact_where(
     );
 }
 
+/// Phase B A3: probabilistic-output approximate-equality match.
+/// Used for real-classifier scenarios where the exact float depends
+/// on sigmoid/matmul precision — assert proximity within a tolerance
+/// rather than bit-equality.
+#[then(
+    regex = r#"^the derived relation ['"](.+)['"] should contain a fact where ([^ ]+) is approximately (-?\d+(?:\.\d+)?) within (-?\d+(?:\.\d+)?)$"#
+)]
+async fn derived_relation_should_contain_fact_approximately(
+    world: &mut LocyWorld,
+    relation: String,
+    field: String,
+    expected: f64,
+    tolerance: f64,
+) {
+    let locy_result = world.locy_result().expect("No evaluation result found");
+    let result = locy_result.as_ref().expect("Evaluation failed");
+    let facts = result
+        .derived
+        .get(&relation)
+        .unwrap_or_else(|| panic!("No derived relation '{}'", relation));
+    let found = facts.iter().any(|row| {
+        extract_field_value(row, field.trim())
+            .and_then(|v| match v {
+                uni_common::Value::Float(f) => Some(*f),
+                uni_common::Value::Int(i) => Some(*i as f64),
+                _ => None,
+            })
+            .map(|v: f64| (v - expected).abs() <= tolerance)
+            .unwrap_or(false)
+    });
+    assert!(
+        found,
+        "Expected derived relation '{}' to contain a fact where {} ≈ {} (±{}), but no match found in {} facts: {:?}",
+        relation,
+        field,
+        expected,
+        tolerance,
+        facts.len(),
+        facts.iter().take(5).collect::<Vec<_>>()
+    );
+}
+
 #[then(
     regex = r#"^the derived relation ['"](.+)['"] should not contain a fact where (.+) = (.+) and (.+) = (.+)$"#
 )]
@@ -928,6 +970,320 @@ async fn result_should_not_contain_shared_dep_warning(world: &mut LocyWorld) {
     );
 }
 
+#[then(
+    regex = r#"^the result should contain a FuzzyNotProbabilistic warning for rule ['"](.+)['"]$"#
+)]
+async fn result_should_contain_fuzzy_warning(world: &mut LocyWorld, rule_name: String) {
+    let locy_result = world
+        .locy_result()
+        .expect("no evaluation result")
+        .as_ref()
+        .expect("evaluation failed");
+
+    let found = locy_result.warnings().iter().any(|w| {
+        w.code == uni_locy::RuntimeWarningCode::FuzzyNotProbabilistic && w.rule_name == rule_name
+    });
+    assert!(
+        found,
+        "Expected FuzzyNotProbabilistic warning for rule '{}', but warnings were: {:?}",
+        rule_name,
+        locy_result
+            .warnings()
+            .iter()
+            .map(|w| format!("{:?} ({})", w.code, w.rule_name))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[then(
+    regex = r#"^the calibration result for ['"](.+)['"] should have calibrated_ece less than half the raw_ece$"#
+)]
+async fn calibration_result_ece_reduction(world: &mut LocyWorld, model_name: String) {
+    let locy_result = world
+        .locy_result()
+        .expect("no evaluation result")
+        .as_ref()
+        .expect("evaluation failed");
+    let mut found = None;
+    for cr in locy_result.command_results() {
+        if let uni_locy::CommandResult::Calibrate(c) = cr {
+            if c.model_name == model_name {
+                found = Some(c.clone());
+                break;
+            }
+        }
+    }
+    let result = found.unwrap_or_else(|| panic!("no CalibrationResult for model '{}'", model_name));
+    assert!(
+        result.calibrated_ece < result.raw_ece * 0.5,
+        "expected calibrated_ece (={}) < raw_ece (={}) * 0.5",
+        result.calibrated_ece,
+        result.raw_ece
+    );
+}
+
+/// Phase C C1a: assert the conformal quantile (half-width of every
+/// confidence band the calibrator will emit) on a CALIBRATE result.
+#[then(
+    regex = r#"^the calibration result for ['"](.+)['"] should have confidence_band_quantile approximately (-?\d+(?:\.\d+)?) within (-?\d+(?:\.\d+)?)$"#
+)]
+async fn calibration_confidence_band_quantile(
+    world: &mut LocyWorld,
+    model_name: String,
+    expected: f64,
+    tolerance: f64,
+) {
+    let locy_result = world
+        .locy_result()
+        .expect("no evaluation result")
+        .as_ref()
+        .expect("evaluation failed");
+    for cr in locy_result.command_results() {
+        if let uni_locy::CommandResult::Calibrate(c) = cr {
+            if c.model_name == model_name {
+                let q = c.confidence_band_quantile.unwrap_or_else(|| {
+                    panic!(
+                        "calibration result for '{}' has no confidence_band_quantile (method = {:?})",
+                        model_name, c.method
+                    )
+                });
+                assert!(
+                    (q - expected).abs() <= tolerance,
+                    "expected confidence_band_quantile ≈ {} (±{}), got {}",
+                    expected,
+                    tolerance,
+                    q
+                );
+                return;
+            }
+        }
+    }
+    panic!("no CalibrationResult for model '{}'", model_name);
+}
+
+#[then(regex = r#"^the calibration result for ['"](.+)['"] should report method ['"](.+)['"]$"#)]
+async fn calibration_result_method(world: &mut LocyWorld, model_name: String, method: String) {
+    let locy_result = world
+        .locy_result()
+        .expect("no evaluation result")
+        .as_ref()
+        .expect("evaluation failed");
+    for cr in locy_result.command_results() {
+        if let uni_locy::CommandResult::Calibrate(c) = cr {
+            if c.model_name == model_name {
+                let actual = format!("{:?}", c.method);
+                assert!(
+                    actual.eq_ignore_ascii_case(&method),
+                    "expected method {method}, got {actual}"
+                );
+                return;
+            }
+        }
+    }
+    panic!("no CalibrationResult for model '{}'", model_name);
+}
+
+#[then(
+    regex = r#"^the validation result for rule ['"](.+)['"] should report ['"](.+)['"] (greater|less) than ([0-9]*\.?[0-9]+)$"#
+)]
+async fn validation_metric_threshold(
+    world: &mut LocyWorld,
+    rule_name: String,
+    metric_name: String,
+    comparator: String,
+    threshold: f64,
+) {
+    let locy_result = world
+        .locy_result()
+        .expect("no evaluation result")
+        .as_ref()
+        .expect("evaluation failed");
+    let metric = match metric_name.to_ascii_lowercase().as_str() {
+        "brier_score" => uni_cypher::locy_ast::ValidationMetric::BrierScore,
+        "log_loss" => uni_cypher::locy_ast::ValidationMetric::LogLoss,
+        "ece" => uni_cypher::locy_ast::ValidationMetric::Ece,
+        "debiased_ece" => uni_cypher::locy_ast::ValidationMetric::DebiasedEce,
+        "accuracy" => uni_cypher::locy_ast::ValidationMetric::Accuracy,
+        "auc" => uni_cypher::locy_ast::ValidationMetric::Auc,
+        other => panic!("unknown VALIDATE metric '{other}'"),
+    };
+    for cr in locy_result.command_results() {
+        if let uni_locy::CommandResult::Validate(v) = cr {
+            if v.rule_name == rule_name {
+                let value = v.metric(metric).unwrap_or_else(|| {
+                    panic!(
+                        "rule '{}' validation did not report metric '{}'",
+                        rule_name, metric_name
+                    )
+                });
+                let pass = match comparator.as_str() {
+                    "greater" => value > threshold,
+                    "less" => value < threshold,
+                    other => panic!("unknown comparator '{other}'"),
+                };
+                assert!(
+                    pass,
+                    "expected {metric_name} {comparator} {threshold}, got {value}"
+                );
+                return;
+            }
+        }
+    }
+    panic!("no ValidationResult for rule '{}'", rule_name);
+}
+
+#[then(regex = r#"^the result should contain an EceBinningBias warning$"#)]
+async fn result_contains_ece_binning_bias(world: &mut LocyWorld) {
+    let locy_result = world
+        .locy_result()
+        .expect("no evaluation result")
+        .as_ref()
+        .expect("evaluation failed");
+    let found = locy_result
+        .compile_warnings()
+        .iter()
+        .any(|w| matches!(w.code, uni_locy::types::WarningCode::EceBinningBias));
+    assert!(
+        found,
+        "expected EceBinningBias compile warning, got: {:?}",
+        locy_result
+            .compile_warnings()
+            .iter()
+            .map(|w| format!("{:?}", w.code))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[then(regex = r#"^classifier ['"](.+)['"] should have been called at most (\d+) times$"#)]
+async fn classifier_call_count_at_most(world: &mut LocyWorld, name: String, max_calls: usize) {
+    let counter = world
+        .classifier_call_counts
+        .get(&name)
+        .unwrap_or_else(|| panic!("no counting classifier registered as '{name}'"));
+    let observed = counter.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        observed <= max_calls,
+        "expected classifier '{name}' ≤ {max_calls} classify() calls, got {observed}"
+    );
+}
+
+#[then(regex = r#"^the result should contain an UncalibratedNeuralPredicate warning$"#)]
+async fn result_contains_uncalibrated_warning(world: &mut LocyWorld) {
+    let locy_result = world
+        .locy_result()
+        .expect("no evaluation result")
+        .as_ref()
+        .expect("evaluation failed");
+    let found = locy_result.compile_warnings().iter().any(|w| {
+        matches!(
+            w.code,
+            uni_locy::types::WarningCode::UncalibratedNeuralPredicate
+        )
+    });
+    assert!(
+        found,
+        "expected UncalibratedNeuralPredicate compile warning, got: {:?}",
+        locy_result
+            .compile_warnings()
+            .iter()
+            .map(|w| format!("{:?}", w.code))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// Phase C F2: assert a `SharedNeuralInputArgument` (F2a) or
+/// `SharedNeuralFeatureValue` (F2b) compile warning fired for the
+/// named rule.
+#[then(
+    regex = r#"^the result should contain a (SharedNeuralInputArgument|SharedNeuralFeatureValue) warning for rule ['"](.+)['"]$"#
+)]
+async fn result_contains_shared_neural_warning(
+    world: &mut LocyWorld,
+    code: String,
+    rule_name: String,
+) {
+    let locy_result = world
+        .locy_result()
+        .expect("no evaluation result")
+        .as_ref()
+        .expect("evaluation failed");
+    let expected = match code.as_str() {
+        "SharedNeuralInputArgument" => uni_locy::types::WarningCode::SharedNeuralInputArgument,
+        "SharedNeuralFeatureValue" => uni_locy::types::WarningCode::SharedNeuralFeatureValue,
+        _ => unreachable!(),
+    };
+    let found = locy_result
+        .compile_warnings()
+        .iter()
+        .any(|w| w.code == expected && w.rule_name == rule_name);
+    assert!(
+        found,
+        "expected {} warning for rule '{}', got: {:?}",
+        code,
+        rule_name,
+        locy_result
+            .compile_warnings()
+            .iter()
+            .map(|w| (format!("{:?}", w.code), w.rule_name.clone()))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[then(
+    regex = r#"^the result should not contain a (SharedNeuralInputArgument|SharedNeuralFeatureValue) warning$"#
+)]
+async fn result_does_not_contain_shared_neural_warning(world: &mut LocyWorld, code: String) {
+    let locy_result = world
+        .locy_result()
+        .expect("no evaluation result")
+        .as_ref()
+        .expect("evaluation failed");
+    let expected = match code.as_str() {
+        "SharedNeuralInputArgument" => uni_locy::types::WarningCode::SharedNeuralInputArgument,
+        "SharedNeuralFeatureValue" => uni_locy::types::WarningCode::SharedNeuralFeatureValue,
+        _ => unreachable!(),
+    };
+    let found = locy_result
+        .compile_warnings()
+        .iter()
+        .any(|w| w.code == expected);
+    assert!(
+        !found,
+        "expected NO {} warning, but found: {:?}",
+        code,
+        locy_result
+            .compile_warnings()
+            .iter()
+            .filter(|w| w.code == expected)
+            .map(|w| w.rule_name.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[then("the result should not contain a FuzzyNotProbabilistic warning")]
+async fn result_should_not_contain_fuzzy_warning(world: &mut LocyWorld) {
+    let locy_result = world
+        .locy_result()
+        .expect("no evaluation result")
+        .as_ref()
+        .expect("evaluation failed");
+
+    let found = locy_result
+        .warnings()
+        .iter()
+        .any(|w| w.code == uni_locy::RuntimeWarningCode::FuzzyNotProbabilistic);
+    assert!(
+        !found,
+        "Expected no FuzzyNotProbabilistic warning, but found: {:?}",
+        locy_result
+            .warnings()
+            .iter()
+            .filter(|w| w.code == uni_locy::RuntimeWarningCode::FuzzyNotProbabilistic)
+            .map(|w| format!("rule={}", w.rule_name))
+            .collect::<Vec<_>>()
+    );
+}
+
 #[then(regex = r#"^the result should contain a BddLimitExceeded warning for rule ['"](.+)['"]$"#)]
 async fn result_should_contain_bdd_limit_warning(world: &mut LocyWorld, rule_name: String) {
     let locy_result = world
@@ -947,6 +1303,30 @@ async fn result_should_contain_bdd_limit_warning(world: &mut LocyWorld, rule_nam
             .warnings()
             .iter()
             .map(|w| format!("{:?} ({})", w.code, w.rule_name))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[then("the result should not contain a TopKPruningCrossedDependency warning")]
+async fn result_should_not_contain_topk_pruning_warning(world: &mut LocyWorld) {
+    let locy_result = world
+        .locy_result()
+        .expect("no evaluation result")
+        .as_ref()
+        .expect("evaluation failed");
+
+    let found = locy_result
+        .warnings()
+        .iter()
+        .any(|w| w.code == uni_locy::RuntimeWarningCode::TopKPruningCrossedDependency);
+    assert!(
+        !found,
+        "Expected no TopKPruningCrossedDependency warning, but found: {:?}",
+        locy_result
+            .warnings()
+            .iter()
+            .filter(|w| w.code == uni_locy::RuntimeWarningCode::TopKPruningCrossedDependency)
+            .map(|w| format!("rule={}", w.rule_name))
             .collect::<Vec<_>>()
     );
 }
@@ -1168,6 +1548,148 @@ async fn command_result_explain_child_proof_probability(
             "Expected command result {} to be an Explain, got {:?}",
             idx, other
         ),
+    }
+}
+
+/// Phase C B1–B3: assert that the EXPLAIN derivation tree's
+/// child at `child_idx` has a `NeuralProvenance` entry for the
+/// named model with raw_probability matching `expected` within
+/// 1e-6.
+#[then(
+    regex = r#"^the command result (\d+) should be an Explain where child (\d+) has a neural call for ['"](.+)['"] with raw_probability approximately (-?\d+(?:\.\d+)?)$"#
+)]
+async fn command_result_explain_child_neural_call(
+    world: &mut LocyWorld,
+    idx: usize,
+    child_idx: usize,
+    model_name: String,
+    expected: f64,
+) {
+    let locy_result = world.locy_result().expect("No evaluation result found");
+    let result = locy_result.as_ref().expect("Evaluation failed");
+    let cmd = result
+        .command_results
+        .get(idx)
+        .unwrap_or_else(|| panic!("No command result at index {}", idx));
+    match cmd {
+        CommandResult::Explain(node) => {
+            let child = node
+                .children
+                .get(child_idx)
+                .unwrap_or_else(|| panic!("No child at index {}", child_idx));
+            let call = child
+                .neural_calls
+                .iter()
+                .find(|c| c.model_name == model_name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "Child {} has no NeuralProvenance for model '{}' (got: {:?})",
+                        child_idx,
+                        model_name,
+                        child
+                            .neural_calls
+                            .iter()
+                            .map(|c| c.model_name.clone())
+                            .collect::<Vec<_>>()
+                    )
+                });
+            assert!(
+                (call.raw_probability - expected).abs() < 1e-6,
+                "model '{}' raw_probability: expected {}, got {}",
+                model_name,
+                expected,
+                call.raw_probability
+            );
+        }
+        other => panic!(
+            "Expected command result {} to be an Explain, got {:?}",
+            idx, other
+        ),
+    }
+}
+
+/// Phase C B1-B3 follow-up: assert the EXPLAIN child has a
+/// confidence band on the named model's neural call.
+#[then(
+    regex = r#"^the command result (\d+) should be an Explain where child (\d+) has a neural call for ['"](.+)['"] with confidence_band$"#
+)]
+async fn command_result_explain_child_neural_call_has_band(
+    world: &mut LocyWorld,
+    idx: usize,
+    child_idx: usize,
+    model_name: String,
+) {
+    let locy_result = world.locy_result().expect("No evaluation result found");
+    let result = locy_result.as_ref().expect("Evaluation failed");
+    let cmd = result
+        .command_results
+        .get(idx)
+        .unwrap_or_else(|| panic!("No command result at index {}", idx));
+    match cmd {
+        CommandResult::Explain(node) => {
+            let child = node
+                .children
+                .get(child_idx)
+                .unwrap_or_else(|| panic!("No child at index {}", child_idx));
+            let call = child
+                .neural_calls
+                .iter()
+                .find(|c| c.model_name == model_name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "Child {} has no NeuralProvenance for '{}'",
+                        child_idx, model_name
+                    )
+                });
+            assert!(
+                call.confidence_band.is_some(),
+                "model '{}' expected confidence_band, got None",
+                model_name
+            );
+        }
+        other => panic!("Expected Explain, got {:?}", other),
+    }
+}
+
+/// Phase C B1-B3 follow-up: assert calibrated_probability is set.
+#[then(
+    regex = r#"^the command result (\d+) should be an Explain where child (\d+) has a neural call for ['"](.+)['"] with calibrated_probability set$"#
+)]
+async fn command_result_explain_child_neural_call_has_calibrated(
+    world: &mut LocyWorld,
+    idx: usize,
+    child_idx: usize,
+    model_name: String,
+) {
+    let locy_result = world.locy_result().expect("No evaluation result found");
+    let result = locy_result.as_ref().expect("Evaluation failed");
+    let cmd = result
+        .command_results
+        .get(idx)
+        .unwrap_or_else(|| panic!("No command result at index {}", idx));
+    match cmd {
+        CommandResult::Explain(node) => {
+            let child = node
+                .children
+                .get(child_idx)
+                .unwrap_or_else(|| panic!("No child at index {}", child_idx));
+            let call = child
+                .neural_calls
+                .iter()
+                .find(|c| c.model_name == model_name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "Child {} has no NeuralProvenance for '{}'",
+                        child_idx, model_name
+                    )
+                });
+            assert!(
+                call.calibrated_probability.is_some(),
+                "model '{}' expected calibrated_probability=Some, got None",
+                model_name
+            );
+        }
+        other => panic!("Expected Explain, got {:?}", other),
     }
 }
 

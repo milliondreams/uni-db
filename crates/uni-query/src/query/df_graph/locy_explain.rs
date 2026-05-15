@@ -58,6 +58,12 @@ pub struct ProvenanceAnnotation {
     pub fact_row: FactRow,
     /// Probability of this specific proof path (populated by top-k filtering).
     pub proof_probability: Option<f64>,
+    /// Phase C B1–B3: per neural-model invocation that contributed
+    /// to this fact's derivation. Populated by
+    /// `LocyModelInvokeExec` when it runs a classifier; consumed
+    /// by Mode A EXPLAIN to surface model_name + raw + calibrated
+    /// + optional confidence band per call.
+    pub neural_calls: Vec<uni_locy::NeuralProvenance>,
 }
 
 /// Provenance store for derived facts (Green et al. 2007, §3).
@@ -280,6 +286,7 @@ fn explain_rule_mode_a(
         graph_fact: None,
         approximate: is_approximate,
         proof_probability: None,
+        neural_calls: Vec::new(),
     };
 
     for (_, entry) in matching_entries {
@@ -309,6 +316,10 @@ fn explain_rule_mode_a(
             graph_fact: Some(graph_fact),
             approximate: is_approximate,
             proof_probability: entry.proof_probability,
+            // Phase C B1–B3: surface the per-call neural metadata
+            // captured by `collect_neural_calls_for_row` during
+            // fixpoint into the EXPLAIN derivation tree.
+            neural_calls: entry.neural_calls.clone(),
         };
         root.children.push(node);
     }
@@ -394,6 +405,7 @@ async fn explain_rule_mode_b(
         graph_fact: None,
         approximate: is_approximate,
         proof_probability: None,
+        neural_calls: Vec::new(),
     };
 
     // For each matching fact, recursively build a derivation node
@@ -468,6 +480,7 @@ fn build_derivation_node<'a>(
                 graph_fact: Some("(cycle)".to_string()),
                 approximate: false,
                 proof_probability: None,
+                neural_calls: Vec::new(),
             });
         }
 
@@ -603,6 +616,7 @@ fn build_derivation_node<'a>(
                     graph_fact: Some(format_graph_fact(evidence_row)),
                     approximate: false,
                     proof_probability: None,
+                    neural_calls: Vec::new(),
                 });
             }
         }
@@ -619,6 +633,7 @@ fn build_derivation_node<'a>(
             graph_fact: Some(format_graph_fact(fact)),
             approximate: false,
             proof_probability: None,
+            neural_calls: Vec::new(),
         })
     })
 }
@@ -705,6 +720,7 @@ mod tests {
             iteration: 0,
             fact_row: HashMap::new(),
             proof_probability: prob,
+            neural_calls: Vec::new(),
         }
     }
 

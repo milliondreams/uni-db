@@ -88,6 +88,18 @@ fn build_locy_statement_block(pair: Pair<LocyRule>) -> Result<Vec<LocyStatement>
                 flush_cypher_clauses(&mut cypher_clause_texts, &mut statements)?;
                 statements.push(LocyStatement::Rule(build_rule_definition(inner)?));
             }
+            LocyRule::model_definition => {
+                flush_cypher_clauses(&mut cypher_clause_texts, &mut statements)?;
+                statements.push(LocyStatement::Model(build_model_definition(inner)?));
+            }
+            LocyRule::calibrate_command => {
+                flush_cypher_clauses(&mut cypher_clause_texts, &mut statements)?;
+                statements.push(LocyStatement::Calibrate(build_calibrate_command(inner)?));
+            }
+            LocyRule::validate_command => {
+                flush_cypher_clauses(&mut cypher_clause_texts, &mut statements)?;
+                statements.push(LocyStatement::Validate(build_validate_command(inner)?));
+            }
             LocyRule::goal_query => {
                 flush_cypher_clauses(&mut cypher_clause_texts, &mut statements)?;
                 statements.push(LocyStatement::GoalQuery(build_goal_query(inner)?));
@@ -328,6 +340,254 @@ fn build_rule_definition(pair: Pair<LocyRule>) -> Result<RuleDefinition, ParseEr
         best_by,
         output: output.unwrap(),
     })
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MODEL DEFINITION (Phase B neural-predicate preview)
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn build_model_definition(pair: Pair<LocyRule>) -> Result<ModelDefinition, ParseError> {
+    let mut annotations = ModelAnnotations::default();
+    let mut name = None;
+    let mut inputs: Vec<InputBinding> = Vec::new();
+    let mut features: Vec<ast::Expr> = Vec::new();
+    let mut output: Option<OutputBinding> = None;
+    let mut xervo_alias: Option<String> = None;
+    let mut calibration: Option<CalibrationMethod> = None;
+    let mut version: Option<String> = None;
+
+    for child in pair.into_inner() {
+        match child.as_rule() {
+            LocyRule::model_annotations => {
+                for ann in child.into_inner() {
+                    if ann.as_rule() == LocyRule::model_annotation {
+                        // The annotation is `@` followed by INDEPENDENT or
+                        // an identifier. We only act on `@independent` in
+                        // Slice 1+2; other annotations parse and are ignored.
+                        let raw = ann.as_str();
+                        if raw
+                            .trim_start_matches('@')
+                            .trim()
+                            .eq_ignore_ascii_case("independent")
+                        {
+                            annotations.independent = true;
+                        }
+                    }
+                }
+            }
+            LocyRule::rule_name => {
+                let qn_pair = child.into_inner().next().unwrap();
+                name = Some(build_qualified_name(qn_pair)?);
+            }
+            LocyRule::model_input_clause => {
+                inputs = build_model_input_clause(child)?;
+            }
+            LocyRule::model_features_clause => {
+                features = build_model_features_clause(child)?;
+            }
+            LocyRule::model_output_clause => {
+                output = Some(build_model_output_clause(child)?);
+            }
+            LocyRule::model_using_clause => {
+                xervo_alias = Some(build_model_using_clause(child)?);
+            }
+            LocyRule::model_calibration_clause => {
+                calibration = Some(build_model_calibration_clause(child)?);
+            }
+            LocyRule::model_version_clause => {
+                version = Some(build_model_version_clause(child)?);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(ModelDefinition {
+        name: name.ok_or_else(|| ParseError::new("CREATE MODEL missing name".to_string()))?,
+        inputs,
+        features,
+        output: output
+            .ok_or_else(|| ParseError::new("CREATE MODEL missing OUTPUT clause".to_string()))?,
+        xervo_alias: xervo_alias.ok_or_else(|| {
+            ParseError::new("CREATE MODEL missing USING xervo(...) clause".to_string())
+        })?,
+        calibration,
+        version,
+        annotations,
+    })
+}
+
+fn build_model_input_clause(pair: Pair<LocyRule>) -> Result<Vec<InputBinding>, ParseError> {
+    let mut bindings = Vec::new();
+    for child in pair.into_inner() {
+        if child.as_rule() == LocyRule::model_input_binding {
+            let idents: Vec<String> = child
+                .into_inner()
+                .filter(|p| p.as_rule() == LocyRule::locy_identifier)
+                .map(|p| normalize_locy_identifier(p.as_str()))
+                .collect();
+            // Grammar: `( var (: label)? )` — first identifier is variable,
+            // second (if present) is label.
+            let (variable, label) = match idents.len() {
+                0 => return Err(ParseError::new("empty INPUT binding".to_string())),
+                1 => (idents[0].clone(), None),
+                _ => (idents[0].clone(), Some(idents[1].clone())),
+            };
+            bindings.push(InputBinding { variable, label });
+        }
+    }
+    Ok(bindings)
+}
+
+fn build_model_features_clause(pair: Pair<LocyRule>) -> Result<Vec<ast::Expr>, ParseError> {
+    let mut features = Vec::new();
+    for child in pair.into_inner() {
+        if child.as_rule() == LocyRule::expression {
+            features.push(reparse_as_cypher_expression(child.as_str())?);
+        }
+    }
+    Ok(features)
+}
+
+fn build_model_output_clause(pair: Pair<LocyRule>) -> Result<OutputBinding, ParseError> {
+    let mut output_type: Option<OutputType> = None;
+    let mut name: Option<String> = None;
+    for child in pair.into_inner() {
+        match child.as_rule() {
+            LocyRule::model_output_type => {
+                output_type = Some(parse_output_type(child.as_str()));
+            }
+            LocyRule::locy_identifier => {
+                name = Some(normalize_locy_identifier(child.as_str()));
+            }
+            _ => {}
+        }
+    }
+    Ok(OutputBinding {
+        output_type: output_type
+            .ok_or_else(|| ParseError::new("OUTPUT missing type".to_string()))?,
+        name: name.ok_or_else(|| ParseError::new("OUTPUT missing name".to_string()))?,
+    })
+}
+
+fn parse_output_type(raw: &str) -> OutputType {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "prob" => OutputType::Prob,
+        "score" => OutputType::Score,
+        "label" => OutputType::Label,
+        "vector" => OutputType::Vector,
+        _ => OutputType::Prob, // grammar guarantees one of the four
+    }
+}
+
+fn build_model_using_clause(pair: Pair<LocyRule>) -> Result<String, ParseError> {
+    for child in pair.into_inner() {
+        if child.as_rule() == LocyRule::string {
+            return Ok(unquote_string_literal(child.as_str()));
+        }
+    }
+    Err(ParseError::new(
+        "USING xervo() missing alias literal".to_string(),
+    ))
+}
+
+fn build_model_calibration_clause(pair: Pair<LocyRule>) -> Result<CalibrationMethod, ParseError> {
+    for child in pair.into_inner() {
+        if child.as_rule() == LocyRule::model_calibration_method {
+            return parse_calibration_method(child);
+        }
+    }
+    Err(ParseError::new("CALIBRATION missing method".to_string()))
+}
+
+/// Phase C C1a: shared between CREATE MODEL's CALIBRATION clause
+/// and CALIBRATE's METHOD clause. Recognizes the `conformal(alpha)`
+/// shape (and bare `conformal` with default alpha = 0.1) in
+/// addition to the existing four methods + `none`.
+fn parse_calibration_method(pair: Pair<LocyRule>) -> Result<CalibrationMethod, ParseError> {
+    // Look for a `conformal_with_alpha` child first; if present, parse the
+    // alpha from its inner float.
+    for inner in pair.clone().into_inner() {
+        if inner.as_rule() == LocyRule::conformal_with_alpha {
+            let alpha_pair = inner
+                .into_inner()
+                .find(|p| p.as_rule() == LocyRule::float)
+                .ok_or_else(|| {
+                    ParseError::new("conformal calibration expects a float alpha".to_string())
+                })?;
+            let alpha: f64 = alpha_pair
+                .as_str()
+                .parse()
+                .map_err(|e| ParseError::new(format!("invalid conformal alpha: {e}")))?;
+            if !(0.0..1.0).contains(&alpha) {
+                return Err(ParseError::new(format!(
+                    "conformal alpha must be in (0, 1); got {alpha}"
+                )));
+            }
+            return Ok(CalibrationMethod::Conformal { alpha });
+        }
+    }
+    let raw = pair.as_str().trim().to_ascii_lowercase();
+    Ok(match raw.as_str() {
+        "platt_scaling" => CalibrationMethod::PlattScaling,
+        "isotonic_regression" => CalibrationMethod::IsotonicRegression,
+        "temperature_scaling" => CalibrationMethod::TemperatureScaling,
+        "beta_calibration" => CalibrationMethod::BetaCalibration,
+        "conformal" => CalibrationMethod::Conformal { alpha: 0.1 },
+        "none" => CalibrationMethod::None,
+        other => {
+            return Err(ParseError::new(format!(
+                "Unknown calibration method '{other}'"
+            )));
+        }
+    })
+}
+
+fn build_model_version_clause(pair: Pair<LocyRule>) -> Result<String, ParseError> {
+    for child in pair.into_inner() {
+        if child.as_rule() == LocyRule::string {
+            return Ok(unquote_string_literal(child.as_str()));
+        }
+    }
+    Err(ParseError::new("VERSION missing literal".to_string()))
+}
+
+/// Strip the surrounding quotes from a `string` rule's match text.
+/// Cypher `string` matches `'...'` or `"..."`. Escape handling is the
+/// minimal interpretation needed for model aliases / version strings —
+/// the same `\'` / `\"` / `\\` set the Cypher walker uses.
+fn unquote_string_literal(raw: &str) -> String {
+    let s = raw.trim();
+    if s.len() < 2 {
+        return s.to_string();
+    }
+    let bytes = s.as_bytes();
+    let first = bytes[0];
+    let last = bytes[s.len() - 1];
+    if (first == b'\'' && last == b'\'') || (first == b'"' && last == b'"') {
+        let inner = &s[1..s.len() - 1];
+        let mut out = String::with_capacity(inner.len());
+        let mut chars = inner.chars();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                if let Some(next) = chars.next() {
+                    match next {
+                        '\'' | '"' | '\\' => out.push(next),
+                        'n' => out.push('\n'),
+                        't' => out.push('\t'),
+                        other => {
+                            out.push('\\');
+                            out.push(other);
+                        }
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    } else {
+        s.to_string()
+    }
 }
 
 fn build_priority_clause(pair: Pair<LocyRule>) -> Result<i64, ParseError> {
@@ -1109,6 +1369,150 @@ fn build_goal_query(pair: Pair<LocyRule>) -> Result<GoalQuery, ParseError> {
 // ═══════════════════════════════════════════════════════════════════════════
 // DERIVE COMMAND (top-level)
 // ═══════════════════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CALIBRATE COMMAND (Phase C C2)
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn build_calibrate_command(pair: Pair<LocyRule>) -> Result<CalibrateCommand, ParseError> {
+    let mut model_name = None;
+    let mut pattern: Option<ast::Pattern> = None;
+    let mut where_expr: Option<ast::Expr> = None;
+    let mut target_expr: Option<ast::Expr> = None;
+    let mut method: Option<CalibrationMethod> = None;
+    let mut holdout: Option<f64> = None;
+    // CALIBRATE has two `expression` children (TARGET and the WHERE
+    // body), and they show up in source order; track which we've seen.
+    let mut seen_target_kw = false;
+
+    for child in pair.into_inner() {
+        match child.as_rule() {
+            LocyRule::rule_name => {
+                let qn = child.into_inner().next().unwrap();
+                model_name = Some(build_qualified_name(qn)?);
+            }
+            LocyRule::pattern => {
+                pattern = Some(reparse_as_cypher_pattern(child.as_str())?);
+            }
+            LocyRule::where_clause => {
+                let expr_pair = child
+                    .into_inner()
+                    .find(|p| p.as_rule() == LocyRule::expression)
+                    .unwrap();
+                where_expr = Some(reparse_as_cypher_expression(expr_pair.as_str())?);
+            }
+            LocyRule::TARGET => {
+                seen_target_kw = true;
+            }
+            LocyRule::expression => {
+                // The grammar puts `TARGET ~ expression` after the
+                // optional WHERE; by the time the standalone
+                // `expression` arrives here we've already consumed
+                // the where_clause's inner expression. So this is the
+                // TARGET expression.
+                let _ = seen_target_kw;
+                target_expr = Some(reparse_as_cypher_expression(child.as_str())?);
+            }
+            LocyRule::model_calibration_method => {
+                method = Some(parse_calibration_method(child)?);
+            }
+            LocyRule::holdout_clause => {
+                for n in child.into_inner() {
+                    match n.as_rule() {
+                        LocyRule::float | LocyRule::integer => {
+                            let parsed: f64 = n.as_str().parse().map_err(|_| {
+                                ParseError::new(format!("Invalid HOLDOUT value: '{}'", n.as_str()))
+                            })?;
+                            holdout = Some(parsed);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(CalibrateCommand {
+        model_name: model_name
+            .ok_or_else(|| ParseError::new("CALIBRATE missing model name".to_string()))?,
+        pattern: pattern
+            .ok_or_else(|| ParseError::new("CALIBRATE missing MATCH pattern".to_string()))?,
+        where_expr,
+        target_expr: target_expr
+            .ok_or_else(|| ParseError::new("CALIBRATE missing TARGET expression".to_string()))?,
+        method: method.ok_or_else(|| ParseError::new("CALIBRATE missing METHOD".to_string()))?,
+        holdout,
+    })
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// VALIDATE COMMAND (Phase C C3)
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn build_validate_command(pair: Pair<LocyRule>) -> Result<ValidateCommand, ParseError> {
+    let mut rule_name = None;
+    let mut pattern: Option<ast::Pattern> = None;
+    let mut where_expr: Option<ast::Expr> = None;
+    let mut target_expr: Option<ast::Expr> = None;
+    let mut metrics: Vec<ValidationMetric> = Vec::new();
+
+    for child in pair.into_inner() {
+        match child.as_rule() {
+            LocyRule::rule_name => {
+                let qn = child.into_inner().next().unwrap();
+                rule_name = Some(build_qualified_name(qn)?);
+            }
+            LocyRule::pattern => {
+                pattern = Some(reparse_as_cypher_pattern(child.as_str())?);
+            }
+            LocyRule::where_clause => {
+                let expr_pair = child
+                    .into_inner()
+                    .find(|p| p.as_rule() == LocyRule::expression)
+                    .unwrap();
+                where_expr = Some(reparse_as_cypher_expression(expr_pair.as_str())?);
+            }
+            LocyRule::expression => {
+                target_expr = Some(reparse_as_cypher_expression(child.as_str())?);
+            }
+            LocyRule::validate_metric => {
+                let raw = child.as_str().trim().to_ascii_lowercase();
+                metrics.push(match raw.as_str() {
+                    "brier_score" => ValidationMetric::BrierScore,
+                    "log_loss" => ValidationMetric::LogLoss,
+                    "debiased_ece" => ValidationMetric::DebiasedEce,
+                    "ece" => ValidationMetric::Ece,
+                    "accuracy" => ValidationMetric::Accuracy,
+                    "auc" => ValidationMetric::Auc,
+                    other => {
+                        return Err(ParseError::new(format!(
+                            "Unknown VALIDATE metric '{other}'"
+                        )));
+                    }
+                });
+            }
+            _ => {}
+        }
+    }
+
+    if metrics.is_empty() {
+        return Err(ParseError::new(
+            "VALIDATE requires at least one metric".to_string(),
+        ));
+    }
+
+    Ok(ValidateCommand {
+        rule_name: rule_name
+            .ok_or_else(|| ParseError::new("VALIDATE missing rule name".to_string()))?,
+        pattern: pattern
+            .ok_or_else(|| ParseError::new("VALIDATE missing MATCH pattern".to_string()))?,
+        where_expr,
+        target_expr: target_expr
+            .ok_or_else(|| ParseError::new("VALIDATE missing TARGET expression".to_string()))?,
+        metrics,
+    })
+}
 
 fn build_derive_command(pair: Pair<LocyRule>) -> Result<DeriveCommand, ParseError> {
     let mut rule_name = None;

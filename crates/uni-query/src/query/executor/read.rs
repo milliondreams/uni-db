@@ -2811,7 +2811,8 @@ impl Executor {
                 | LogicalPlan::LocyBestBy { .. }
                 | LogicalPlan::LocyPriority { .. }
                 | LogicalPlan::LocyDerivedScan { .. }
-                | LogicalPlan::LocyProject { .. } => {
+                | LogicalPlan::LocyProject { .. }
+                | LogicalPlan::LocyModelInvoke { .. } => {
                     unreachable!("Locy operators are handled by DataFusion engine")
                 }
             }

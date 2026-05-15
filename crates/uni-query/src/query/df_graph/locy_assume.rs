@@ -191,6 +191,28 @@ fn dispatch_body_command<'a>(
                 stats.queries_executed += 1;
                 Ok(CommandResult::Cypher(rows))
             }
+            CompiledCommand::Calibrate(_) => {
+                // CALIBRATE inside an ASSUME body is rejected for now:
+                // hypothetical calibration runs would need to roll back
+                // alongside the rest of the savepoint, which is more
+                // bookkeeping than this slice is signing up for. The
+                // top-level CALIBRATE path runs in `run_program`.
+                Err(LocyError::EvaluationError {
+                    message: "CALIBRATE statements are not yet supported inside ASSUME \
+                              blocks; declare CALIBRATE at the top level instead"
+                        .to_string(),
+                })
+            }
+            CompiledCommand::Validate(_) => {
+                // Same reasoning as CALIBRATE: VALIDATE inside an
+                // ASSUME body would measure the hypothetical state,
+                // which we may want eventually but defer for now.
+                Err(LocyError::EvaluationError {
+                    message: "VALIDATE statements are not yet supported inside ASSUME \
+                              blocks; declare VALIDATE at the top level instead"
+                        .to_string(),
+                })
+            }
         }
     })
 }

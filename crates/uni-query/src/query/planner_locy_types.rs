@@ -61,6 +61,10 @@ pub struct LocyClausePlan {
     pub along_bindings: Vec<String>,
     /// Optional priority value for this clause.
     pub priority: Option<i64>,
+    /// Phase B Slice 3: neural-model invocations lifted from YIELD items
+    /// by the compiler. Carried through planning to the fixpoint
+    /// executor where they're evaluated post-body-projection.
+    pub model_invocations: Vec<uni_locy::ModelInvocation>,
 }
 
 /// An IS-reference from a clause body to another derived relation.
@@ -111,4 +115,18 @@ pub enum LocyCommand {
     Abduce { abduce_query: AbduceQuery },
     /// Pass-through Cypher statement.
     Cypher { query: Query },
+    /// Phase C C2: `CALIBRATE` statement. Carries a snapshot of the
+    /// referenced model's input bindings so the runtime can build
+    /// `ClassifyInput`s without needing access to the full
+    /// `CompiledProgram.model_catalog`.
+    Calibrate {
+        calibrate: uni_locy::CompiledCalibrate,
+        model_inputs: Vec<uni_locy::CompiledInputBinding>,
+    },
+    /// Phase C C3: `VALIDATE` statement. The compiled form already
+    /// carries the rule's PROB column name; no auxiliary snapshot is
+    /// needed (the runtime queries derived facts by rule name).
+    Validate {
+        validate: uni_locy::CompiledValidate,
+    },
 }

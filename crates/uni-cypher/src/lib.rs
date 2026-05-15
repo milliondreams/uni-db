@@ -847,4 +847,107 @@ mod locy_tests {
             panic!("Expected DeriveCommand");
         }
     }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Phase B: CREATE MODEL (neural-predicate preview)
+    // ══════════════════════════════════════════════════════════════════════
+
+    fn expect_model(stmt: &locy_ast::LocyStatement) -> &locy_ast::ModelDefinition {
+        match stmt {
+            locy_ast::LocyStatement::Model(m) => m,
+            other => panic!("expected Model, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_create_model_minimal() {
+        // INPUT + OUTPUT + USING only.
+        let program = parse_locy(
+            "CREATE MODEL flag AS \
+             INPUT (s) \
+             OUTPUT PROB risk \
+             USING xervo('classify/flag-v1')",
+        )
+        .unwrap();
+        let m = expect_model(&program.statements[0]);
+        assert_eq!(m.name.parts, vec!["flag"]);
+        assert_eq!(m.inputs.len(), 1);
+        assert_eq!(m.inputs[0].variable, "s");
+        assert!(m.inputs[0].label.is_none());
+        assert!(m.features.is_empty());
+        assert_eq!(m.output.output_type, locy_ast::OutputType::Prob);
+        assert_eq!(m.output.name, "risk");
+        assert_eq!(m.xervo_alias, "classify/flag-v1");
+        assert!(m.calibration.is_none());
+        assert!(m.version.is_none());
+        assert!(!m.annotations.independent);
+    }
+
+    #[test]
+    fn test_create_model_full_with_calibration_version() {
+        let program = parse_locy(
+            "CREATE MODEL supplier_risk_scorer AS \
+             INPUT (s:Supplier) \
+             FEATURES s.country, s.annual_revenue \
+             OUTPUT PROB risk \
+             USING xervo('classify/supplier-risk-v3') \
+             CALIBRATION platt_scaling \
+             VERSION '3.1.0'",
+        )
+        .unwrap();
+        let m = expect_model(&program.statements[0]);
+        assert_eq!(m.inputs.len(), 1);
+        assert_eq!(m.inputs[0].variable, "s");
+        assert_eq!(m.inputs[0].label.as_deref(), Some("Supplier"));
+        assert_eq!(m.features.len(), 2);
+        assert_eq!(
+            m.calibration,
+            Some(locy_ast::CalibrationMethod::PlattScaling)
+        );
+        assert_eq!(m.version.as_deref(), Some("3.1.0"));
+    }
+
+    #[test]
+    fn test_create_model_independent_annotation() {
+        let program = parse_locy(
+            "@independent CREATE MODEL m AS \
+             INPUT (s) OUTPUT PROB risk USING xervo('classify/m')",
+        )
+        .unwrap();
+        let m = expect_model(&program.statements[0]);
+        assert!(m.annotations.independent);
+    }
+
+    #[test]
+    fn test_create_model_multi_input() {
+        let program = parse_locy(
+            "CREATE MODEL pair AS \
+             INPUT (a:User), (b:Item) \
+             OUTPUT SCORE relevance \
+             USING xervo('rerank/pair')",
+        )
+        .unwrap();
+        let m = expect_model(&program.statements[0]);
+        assert_eq!(m.inputs.len(), 2);
+        assert_eq!(m.inputs[0].variable, "a");
+        assert_eq!(m.inputs[0].label.as_deref(), Some("User"));
+        assert_eq!(m.inputs[1].variable, "b");
+        assert_eq!(m.inputs[1].label.as_deref(), Some("Item"));
+        assert_eq!(m.output.output_type, locy_ast::OutputType::Score);
+    }
+
+    #[test]
+    fn test_create_model_all_output_types() {
+        for (kw, expected) in [
+            ("PROB", locy_ast::OutputType::Prob),
+            ("SCORE", locy_ast::OutputType::Score),
+            ("LABEL", locy_ast::OutputType::Label),
+            ("VECTOR", locy_ast::OutputType::Vector),
+        ] {
+            let src = format!("CREATE MODEL m AS INPUT (s) OUTPUT {kw} out USING xervo('test/m')");
+            let p = parse_locy(&src).unwrap();
+            let m = expect_model(&p.statements[0]);
+            assert_eq!(m.output.output_type, expected, "kw {kw}");
+        }
+    }
 }

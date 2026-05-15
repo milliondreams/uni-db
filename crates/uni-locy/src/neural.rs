@@ -171,7 +171,7 @@ pub trait NeuralClassifier: Send + Sync + std::fmt::Debug {
     async fn classify(&self, inputs: &[ClassifyInput]) -> ClassifierResult<Vec<f64>>;
 
     /// Return pre-sigmoid logits. The default implementation calls
-    /// [`classify`] and applies inverse-sigmoid; bespoke providers
+    /// [`NeuralClassifier::classify`] and applies inverse-sigmoid; bespoke providers
     /// (Candle, MistralRS) override to expose raw logits cheaply.
     async fn classify_logits(&self, inputs: &[ClassifyInput]) -> ClassifierResult<Vec<f64>> {
         let probs = self.classify(inputs).await?;
@@ -264,7 +264,7 @@ impl NeuralClassifier for MockClassifier {
     }
 }
 
-/// Adapter wrapping a base classifier with a fitted [`Calibrator`]
+/// Adapter wrapping a base classifier with a fitted [`crate::calibration::Calibrator`]
 /// (Phase C C2). After running `CALIBRATE`, users construct one of
 /// these and re-register it under the same model name to make
 /// subsequent invocations produce calibrated probabilities.

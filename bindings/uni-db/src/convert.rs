@@ -547,6 +547,36 @@ fn command_result_to_py(py: Python, cmd: uni_locy::CommandResult) -> PyResult<Py
             let list = PyList::new(py, &rows_py)?;
             Ok(Py::new(py, PyCypherCommandResult { rows: list.into() })?.into_any())
         }
+        uni_locy::CommandResult::Calibrate(c) => {
+            let d = PyDict::new(py);
+            d.set_item("type", "calibrate")?;
+            d.set_item("model_name", &c.model_name)?;
+            d.set_item("method", format!("{:?}", c.method))?;
+            d.set_item("n_samples", c.n_samples)?;
+            d.set_item("holdout_size", c.holdout_size)?;
+            d.set_item("raw_brier", c.raw_brier)?;
+            d.set_item("raw_ece", c.raw_ece)?;
+            d.set_item("calibrated_brier", c.calibrated_brier)?;
+            d.set_item("calibrated_ece", c.calibrated_ece)?;
+            match c.confidence_band_quantile {
+                Some(q) => d.set_item("confidence_band_quantile", q)?,
+                None => d.set_item("confidence_band_quantile", py.None())?,
+            }
+            Ok(d.into_any().unbind())
+        }
+        uni_locy::CommandResult::Validate(v) => {
+            let d = PyDict::new(py);
+            d.set_item("type", "validate")?;
+            d.set_item("rule_name", &v.rule_name)?;
+            d.set_item("prob_column", &v.prob_column)?;
+            d.set_item("n_samples", v.n_samples)?;
+            let metrics = PyDict::new(py);
+            for (m, val) in &v.metrics {
+                metrics.set_item(format!("{:?}", m), *val)?;
+            }
+            d.set_item("metrics", metrics)?;
+            Ok(d.into_any().unbind())
+        }
     }
 }
 
@@ -649,6 +679,10 @@ pub fn locy_result_to_py(py: Python, result: uni_db::locy::LocyResult) -> PyResu
             uni_locy::RuntimeWarningCode::CrossGroupCorrelationNotExact => {
                 "cross_group_correlation_not_exact"
             }
+            uni_locy::RuntimeWarningCode::FuzzyNotProbabilistic => "fuzzy_not_probabilistic",
+            uni_locy::RuntimeWarningCode::TopKPruningCrossedDependency => {
+                "top_k_pruning_crossed_dependency"
+            }
         };
         wd.set_item("code", code_str)?;
         wd.set_item("message", &w.message)?;
@@ -749,6 +783,10 @@ pub fn locy_result_to_py_class(
             uni_locy::RuntimeWarningCode::BddLimitExceeded => "bdd_limit_exceeded",
             uni_locy::RuntimeWarningCode::CrossGroupCorrelationNotExact => {
                 "cross_group_correlation_not_exact"
+            }
+            uni_locy::RuntimeWarningCode::FuzzyNotProbabilistic => "fuzzy_not_probabilistic",
+            uni_locy::RuntimeWarningCode::TopKPruningCrossedDependency => {
+                "top_k_pruning_crossed_dependency"
             }
         };
         wd.set_item("code", code_str)?;

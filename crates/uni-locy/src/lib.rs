@@ -11,7 +11,8 @@ pub mod types;
 
 pub use calibration::{
     BetaCalibration, BetaFitter, CalibrationError, CalibrationMethodKind, Calibrator,
-    CalibratorFitter, IdentityCalibrator, IsotonicFitter, IsotonicRegression, PlattFitter,
+    CalibratorFitter, DirichletCalibrator, DirichletFitter, IdentityCalibrator, IsotonicFitter,
+    IsotonicRegression, MulticlassCalibrator, MulticlassCalibratorFitter, PlattFitter,
     PlattScaling, TemperatureFitter, TemperatureScaling, accuracy, auc, brier_score, debiased_ece,
     expected_calibration_error, log_loss,
 };

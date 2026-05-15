@@ -54,6 +54,11 @@ pub enum CalibrationMethodKind {
     /// per-prediction confidence band via
     /// [`Calibrator::confidence_band`].
     Conformal,
+    /// Phase D D-C1d: multi-class Dirichlet calibrator. Surfaces via
+    /// [`MulticlassCalibrator`] (separate trait from binary
+    /// [`Calibrator`]). The kind tag is here so EXPLAIN / telemetry
+    /// can label it uniformly.
+    Dirichlet,
 }
 
 /// Inference-time calibrator. `apply` is the hot path; implementors
@@ -73,14 +78,42 @@ pub trait Calibrator: Send + Sync + std::fmt::Debug {
 }
 
 /// Batch-time fitter — given `(preds, labels)`, produce a fitted
-/// `Calibrator`. The labels are `bool` (0/1) for now; multi-class
-/// (Dirichlet) lands in a future slice.
+/// `Calibrator`. The labels are `bool` (0/1); multi-class fitters
+/// implement [`MulticlassCalibratorFitter`] separately.
 pub trait CalibratorFitter: Send + Sync {
     fn fit(
         &self,
         predictions: &[f64],
         labels: &[bool],
     ) -> Result<Arc<dyn Calibrator>, CalibrationError>;
+}
+
+/// Phase D D-C1d: inference-time multi-class calibrator. The input
+/// is a class-probability vector `p ∈ Δ^K` (entries non-negative,
+/// sum ≈ 1); the output is a recalibrated vector of the same shape.
+/// Separate trait from binary [`Calibrator`] because the call
+/// signature is incompatible (scalar vs vector).
+pub trait MulticlassCalibrator: Send + Sync + std::fmt::Debug {
+    /// Apply the calibration to one prediction vector. Returns a
+    /// vector of the same length as `raw`.
+    fn apply(&self, raw: &[f64]) -> Vec<f64>;
+    /// Number of classes the calibrator was fit on. Callers must
+    /// supply `raw.len() == n_classes()` to `apply`.
+    fn n_classes(&self) -> usize;
+    /// Method tag for EXPLAIN / telemetry.
+    fn method(&self) -> CalibrationMethodKind;
+}
+
+/// Phase D D-C1d: batch-time fitter for multi-class calibrators.
+/// Each prediction is a `K`-length vector; each label is a
+/// class index in `[0, K)`. Class index outside the range is
+/// rejected as `CalibrationError::NumericIssue`.
+pub trait MulticlassCalibratorFitter: Send + Sync {
+    fn fit(
+        &self,
+        predictions: &[Vec<f64>],
+        labels: &[usize],
+    ) -> Result<Arc<dyn MulticlassCalibrator>, CalibrationError>;
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -552,6 +585,218 @@ impl CalibratorFitter for ConformalFitter {
             alpha: self.alpha,
             quantile,
         }))
+    }
+}
+
+// ─── Dirichlet multi-class calibration (Phase D D-C1d) ─────────────────
+
+/// Phase D D-C1d: Dirichlet calibrator. Maintains per-class
+/// concentration parameters `alpha = (α_1, ..., α_K)` fit by
+/// method-of-moments on observed `(prediction_vector, class_label)`
+/// pairs. `apply(raw)` returns a posterior-weighted recalibrated
+/// vector — see [`DirichletCalibrator::apply`] for the formula.
+///
+/// **Method-of-moments fit** (Minka 2000):
+/// Given N observations `p_1, ..., p_N` (each `p_i ∈ Δ^K`):
+/// - empirical mean `μ_k = (1/N) Σ p_ik`
+/// - empirical variance `σ²_k = (1/N) Σ (p_ik − μ_k)²`
+/// - concentration sum `α₀ = (μ_k* · (1 − μ_k*)) / σ²_k* − 1` for the
+///   class `k*` with maximum variance (most stable estimator).
+/// - per-class `α_k = μ_k · α₀`.
+///
+/// **Apply** treats the input `raw` as evidence (pseudo-counts) and
+/// returns the posterior Dirichlet mean: `p_cal_k = (α_k + raw_k · N_eff)
+/// / (Σ α + N_eff)` where `N_eff = max(α₀, 1)` keeps the prior weight
+/// non-degenerate when α₀ is very small. For MVP this is a smoothed
+/// passthrough biased toward the empirical class frequencies seen at
+/// fit time — the dominant correction Dirichlet calibration provides
+/// for miscalibrated multi-class classifiers.
+#[derive(Debug, Clone)]
+pub struct DirichletCalibrator {
+    pub alpha: Vec<f64>,
+    /// Effective sample size for the prior — derived as `max(α₀, 1)`
+    /// during fitting and stored so `apply` doesn't recompute.
+    pub n_eff: f64,
+}
+
+impl MulticlassCalibrator for DirichletCalibrator {
+    fn apply(&self, raw: &[f64]) -> Vec<f64> {
+        assert_eq!(
+            raw.len(),
+            self.alpha.len(),
+            "DirichletCalibrator: input length {} != n_classes {}",
+            raw.len(),
+            self.alpha.len()
+        );
+        // Posterior under Dirichlet prior + multinomial likelihood with
+        // pseudo-counts `raw * n_eff`. Returns the posterior mean.
+        let alpha_sum: f64 = self.alpha.iter().sum();
+        let denom = alpha_sum + self.n_eff;
+        let mut out = Vec::with_capacity(raw.len());
+        for (a, r) in self.alpha.iter().zip(raw.iter()) {
+            out.push((a + r * self.n_eff) / denom);
+        }
+        out
+    }
+
+    fn n_classes(&self) -> usize {
+        self.alpha.len()
+    }
+
+    fn method(&self) -> CalibrationMethodKind {
+        CalibrationMethodKind::Dirichlet
+    }
+}
+
+/// Phase D D-C1d: method-of-moments fitter for [`DirichletCalibrator`].
+/// No optimizer dependency; closed-form in O(N · K).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DirichletFitter;
+
+impl MulticlassCalibratorFitter for DirichletFitter {
+    fn fit(
+        &self,
+        predictions: &[Vec<f64>],
+        labels: &[usize],
+    ) -> Result<Arc<dyn MulticlassCalibrator>, CalibrationError> {
+        if predictions.is_empty() {
+            return Err(CalibrationError::EmptyDataset);
+        }
+        if predictions.len() != labels.len() {
+            return Err(CalibrationError::ArityMismatch {
+                preds: predictions.len(),
+                labels: labels.len(),
+            });
+        }
+        let k = predictions[0].len();
+        if k == 0 {
+            return Err(CalibrationError::NumericIssue(
+                "Dirichlet fit: prediction vectors must be non-empty",
+            ));
+        }
+        for (i, p) in predictions.iter().enumerate() {
+            if p.len() != k {
+                return Err(CalibrationError::NumericIssue(
+                    "Dirichlet fit: prediction vectors must all have the same length",
+                ));
+            }
+            if labels[i] >= k {
+                return Err(CalibrationError::NumericIssue(
+                    "Dirichlet fit: label index out of range for K classes",
+                ));
+            }
+        }
+        let n = predictions.len() as f64;
+        // Empirical mean per class.
+        let mut mu = vec![0.0f64; k];
+        for p in predictions {
+            for (mu_k, p_k) in mu.iter_mut().zip(p.iter()) {
+                *mu_k += p_k / n;
+            }
+        }
+        // Empirical variance per class.
+        let mut var = vec![0.0f64; k];
+        for p in predictions {
+            for (var_k, (p_k, mu_k)) in var.iter_mut().zip(p.iter().zip(mu.iter())) {
+                let d = p_k - mu_k;
+                *var_k += (d * d) / n;
+            }
+        }
+        // Pick the class with max variance to estimate α₀; classes with
+        // zero variance give a degenerate estimator.
+        let (k_star, &var_star) = var
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .unwrap();
+        let mu_star = mu[k_star];
+        if var_star <= 0.0 || mu_star <= 0.0 || mu_star >= 1.0 {
+            // Pathological: no variance or degenerate mean → uniform Dirichlet prior.
+            return Ok(Arc::new(DirichletCalibrator {
+                alpha: vec![1.0; k],
+                n_eff: k as f64,
+            }));
+        }
+        let alpha_0 = (mu_star * (1.0 - mu_star) / var_star - 1.0).max(1e-9);
+        let alpha: Vec<f64> = mu.iter().map(|m| m * alpha_0).collect();
+        let n_eff = alpha_0.max(1.0);
+        Ok(Arc::new(DirichletCalibrator { alpha, n_eff }))
+    }
+}
+
+#[cfg(test)]
+mod dirichlet_tests {
+    use super::*;
+
+    #[test]
+    fn fits_uniform_when_no_variance() {
+        let preds = vec![vec![0.5, 0.3, 0.2]; 10];
+        let labels = vec![0usize; 10];
+        let cal = DirichletFitter.fit(&preds, &labels).unwrap();
+        assert_eq!(cal.n_classes(), 3);
+        // Degenerate fit → uniform prior; apply returns a blend of prior and input.
+        let out = cal.apply(&[1.0, 0.0, 0.0]);
+        assert_eq!(out.len(), 3);
+        // Output should sum to ~1.
+        let sum: f64 = out.iter().sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-9,
+            "output should sum to 1, got {sum}"
+        );
+    }
+
+    #[test]
+    fn three_class_method_of_moments() {
+        // Synthetic 3-class data with class-0 dominant.
+        let mut preds = Vec::new();
+        let mut labels = Vec::new();
+        for i in 0..30 {
+            // Class 0 dominant when i < 20, class 1 when 20..25, class 2 otherwise.
+            if i < 20 {
+                preds.push(vec![
+                    0.7 + (i as f64) * 0.005,
+                    0.2,
+                    0.1 - (i as f64) * 0.005,
+                ]);
+                labels.push(0);
+            } else if i < 25 {
+                preds.push(vec![0.2, 0.6, 0.2]);
+                labels.push(1);
+            } else {
+                preds.push(vec![0.2, 0.2, 0.6]);
+                labels.push(2);
+            }
+        }
+        let cal = DirichletFitter.fit(&preds, &labels).unwrap();
+        let out = cal.apply(&[0.5, 0.3, 0.2]);
+        assert_eq!(out.len(), 3);
+        // Sums to ~1.
+        let sum: f64 = out.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-9);
+        // Class 0 mean is highest in training; calibrated output should
+        // still prefer class 0 for this input.
+        assert!(out[0] > out[1]);
+        assert!(out[0] > out[2]);
+    }
+
+    #[test]
+    fn rejects_arity_mismatch() {
+        let err = DirichletFitter.fit(&[vec![0.5, 0.5]], &[0, 0]).unwrap_err();
+        assert!(matches!(err, CalibrationError::ArityMismatch { .. }));
+    }
+
+    #[test]
+    fn rejects_empty() {
+        let err = DirichletFitter.fit(&[], &[]).unwrap_err();
+        assert!(matches!(err, CalibrationError::EmptyDataset));
+    }
+
+    #[test]
+    fn rejects_label_out_of_range() {
+        let preds = vec![vec![0.5, 0.5]];
+        let labels = vec![5usize];
+        let err = DirichletFitter.fit(&preds, &labels).unwrap_err();
+        assert!(matches!(err, CalibrationError::NumericIssue(_)));
     }
 }
 

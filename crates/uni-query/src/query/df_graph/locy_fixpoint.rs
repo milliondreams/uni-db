@@ -2558,15 +2558,6 @@ pub fn apply_anti_join(
     Ok(result)
 }
 
-/// Probabilistic complement for negated IS-refs targeting PROB rules.
-///
-/// Instead of filtering out matching VIDs (anti-join), this adds a complement column
-/// `__prob_complement_{rule_name}` with value `1 - p` for each matching VID, and `1.0`
-/// for VIDs not present in the negated rule's facts.
-///
-/// This implements the probabilistic complement semantics: `IS NOT risk` on a PROB rule
-/// yields the probability that the entity is NOT risky.
-
 // ─── Phase B Slice 3: neural-model invocation pass ───────────────────────
 //
 // `apply_model_invocations` runs every `ModelInvocation` lifted from a
@@ -3116,7 +3107,7 @@ async fn pre_embed_semantic_match_queries(
         )));
     }
     let mut out = HashMap::with_capacity(needed.len());
-    for (text, vec) in needed.into_iter().zip(embeddings.into_iter()) {
+    for (text, vec) in needed.into_iter().zip(embeddings) {
         out.insert(text, vec);
     }
     Ok(out)
@@ -3256,6 +3247,12 @@ fn extract_feature_value(col: &dyn arrow_array::Array, row_idx: usize) -> uni_lo
     uni_locy::FeatureValue::Null
 }
 
+/// Probabilistic complement for negated IS-refs targeting PROB rules.
+///
+/// Instead of filtering out matching VIDs (anti-join), this adds a complement
+/// column `__prob_complement_{rule_name}` with value `1 - p` for each matching
+/// VID, and `1.0` for VIDs not present in the negated rule's facts. Implements
+/// `IS NOT risk` on a PROB rule: the probability that the entity is NOT risky.
 pub fn apply_prob_complement(
     batches: Vec<RecordBatch>,
     neg_facts: &[RecordBatch],

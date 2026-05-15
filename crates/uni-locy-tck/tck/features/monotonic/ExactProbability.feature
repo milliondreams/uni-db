@@ -346,6 +346,10 @@ Feature: Exact BDD-based Probability Computation
       """
     Then evaluation should succeed
     And the result should contain a CrossGroupCorrelationNotExact warning for rule 'derived'
+    # Phase D F3 case 1 BDD-time deepening: the cross-group warning carries
+    # the count of shared base facts (= BDD variables that overlap across
+    # KEY groups) as structured metadata, mirroring BddLimitExceeded.
+    And the CrossGroupCorrelationNotExact warning for rule 'derived' should have variable_count >= 1
 
   # ── Scenario 5A: BddLimitExceeded warning has structured metadata ────────
   # Same diamond graph + max_bdd_variables=1. The shared group requires >= 2

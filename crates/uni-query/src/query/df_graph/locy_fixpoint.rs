@@ -1405,7 +1405,7 @@ async fn run_fixpoint_loop(
         let shared_info = if semiring_kind == SemiringKind::MaxMinProb {
             None
         } else if let Some(ref tracker) = derivation_tracker {
-            detect_shared_lineage(rule, &facts, tracker, &warnings_slot)
+            detect_shared_lineage(rule, &facts, tracker, &warnings_slot, semiring_kind)
         } else {
             None
         };
@@ -1966,6 +1966,7 @@ fn detect_shared_lineage(
     pre_fold_facts: &[RecordBatch],
     tracker: &Arc<ProvenanceStore>,
     warnings_slot: &Arc<StdRwLock<Vec<RuntimeWarning>>>,
+    semiring_kind: SemiringKind,
 ) -> Option<SharedLineageInfo> {
     use crate::query::df_graph::locy_fold::FoldAggKind;
     use uni_locy::{RuntimeWarning, RuntimeWarningCode};
@@ -2125,7 +2126,17 @@ fn detect_shared_lineage(
     }
 
     if any_shared {
-        if let Ok(mut warnings) = warnings_slot.write() {
+        // Phase D D-C0b: under `SemiringKind::TopKProofs`, the FOLD-time
+        // DNF inclusion-exclusion math (shipped in D-C0) auto-corrects
+        // for within-group base-fact sharing — the "Results may
+        // overestimate" premise of `SharedProbabilisticDependency`
+        // is no longer true. Suppress the warning under TopK; users
+        // who chose TopKProofs explicitly opted into the
+        // correctness-preserving path. Cross-group correlation
+        // (`CrossGroupCorrelationNotExact`) still fires above because
+        // D-C0 doesn't span KEY-group boundaries.
+        let suppress_under_topk = matches!(semiring_kind, SemiringKind::TopKProofs { .. });
+        if !suppress_under_topk && let Ok(mut warnings) = warnings_slot.write() {
             let already_warned = warnings.iter().any(|w| {
                 w.code == RuntimeWarningCode::SharedProbabilisticDependency
                     && w.rule_name == rule.name
@@ -2158,6 +2169,10 @@ fn detect_shared_lineage(
 /// This function bridges that gap by recording a `ProvenanceAnnotation` for every
 /// fact produced by each clause and then running the same two-tier detection
 /// logic used by the recursive path.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "context bundle would be over-engineering for one call site"
+)]
 pub(crate) async fn record_and_detect_lineage_nonrecursive(
     rule: &FixpointRulePlan,
     tagged_clause_facts: &[(usize, Vec<RecordBatch>)],
@@ -2166,6 +2181,7 @@ pub(crate) async fn record_and_detect_lineage_nonrecursive(
     registry: &Arc<DerivedScanRegistry>,
     top_k_proofs: usize,
     classifiers: ClassifierRefs<'_>,
+    semiring_kind: SemiringKind,
 ) -> Option<SharedLineageInfo> {
     let classifier_registry = classifiers.registry;
     let classifier_cache = classifiers.cache;
@@ -2241,7 +2257,7 @@ pub(crate) async fn record_and_detect_lineage_nonrecursive(
         .iter()
         .flat_map(|(_, batches)| batches.iter().cloned())
         .collect();
-    detect_shared_lineage(rule, &all_facts, tracker, warnings_slot)
+    detect_shared_lineage(rule, &all_facts, tracker, warnings_slot, semiring_kind)
 }
 
 /// Apply exact weighted model counting (WMC) for shared-lineage groups.

@@ -2198,6 +2198,17 @@ pub enum LogicalPlan {
         /// to surface NeuralProvenance for ALONG/FOLD-position
         /// invocations and Mode B re-execution paths.
         classifier_provenance_store: Option<Arc<uni_locy::NeuralProvenanceStore>>,
+        /// Phase D D3 runtime: one handle per `path_context.source_rule`
+        /// referenced by any invocation on this node. The handle's
+        /// `data: Arc<RwLock<Vec<RecordBatch>>>` is shared with the
+        /// `DerivedScanRegistry`; the source rule's derived facts are
+        /// already converged by the time this node executes (the
+        /// dependency-graph builder ensures source rules sit in
+        /// earlier strata).
+        path_context_handles: std::collections::HashMap<
+            String,
+            super::df_graph::locy_model_invoke::PathContextHandle,
+        >,
     },
 }
 

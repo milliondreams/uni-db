@@ -1208,6 +1208,7 @@ impl HybridPhysicalPlanner {
                 classifier_registry,
                 classifier_cache,
                 classifier_provenance_store,
+                path_context_handles,
             } => {
                 let input_plan = self.plan_internal(input, all_properties)?;
                 Ok(Arc::new(
@@ -1217,6 +1218,7 @@ impl HybridPhysicalPlanner {
                         Arc::clone(classifier_registry),
                         classifier_cache.as_ref().map(Arc::clone),
                         classifier_provenance_store.as_ref().map(Arc::clone),
+                        path_context_handles.clone(),
                     ),
                 ))
             }

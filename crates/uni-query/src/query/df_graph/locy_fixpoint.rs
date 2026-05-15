@@ -2601,6 +2601,11 @@ pub(crate) fn wrap_with_model_invoke(
         classifier_registry: Arc::clone(classifier_registry),
         classifier_cache: classifier_cache.map(Arc::clone),
         classifier_provenance_store: classifier_provenance_store.map(Arc::clone),
+        // This wrap helper is used by paths that don't have a rule_catalog
+        // to look up path_context source rules. Callers that need
+        // path-context support (`build_clause`) populate the handle map
+        // directly when constructing the LocyModelInvoke variant.
+        path_context_handles: HashMap::new(),
     }
 }
 
@@ -2610,6 +2615,10 @@ pub(crate) async fn apply_model_invocations(
     registry: &Arc<ClassifierRegistry>,
     cache: Option<&Arc<uni_locy::ModelInvocationCache>>,
     provenance_store: Option<&Arc<uni_locy::NeuralProvenanceStore>>,
+    path_context_handles: &HashMap<
+        String,
+        crate::query::df_graph::locy_model_invoke::PathContextHandle,
+    >,
 ) -> DFResult<Vec<RecordBatch>> {
     use uni_locy::ClassifyInput;
     if batches.is_empty() || invocations.is_empty() {
@@ -2638,7 +2647,7 @@ pub(crate) async fn apply_model_invocations(
             //     — Phase D D1/D2 retrieval-backed feature; both args
             //     resolved to columns; UDF evaluated per row against
             //     the row's `uni_common::Value` payloads.
-            let resolvers = build_feature_resolvers(&current, invocation)?;
+            let resolvers = build_feature_resolvers(&current, invocation, path_context_handles)?;
 
             // Build one ClassifyInput per row.
             let n_rows = current.num_rows();
@@ -2792,19 +2801,13 @@ enum FeatureResolverKind {
     SemanticMatch {
         model_name: String,
     },
-    /// Phase D D3 (MVP): path-context features pull a column from a
-    /// prior-derived rule's facts at runtime. The compiler ensures the
-    /// model's stratum follows the source rule (`build_dependency_graph_with_models`),
-    /// so the source rule's facts are materialized by the time this
-    /// resolver runs. Threading the `DerivedScanRegistry` into
-    /// `apply_model_invocations` is a separate plumbing step
-    /// (the registry today lives on the `LocyProgram` plan node, not
-    /// on `LocyModelInvokeExec`); pending that, the resolver errors
-    /// at row time with a clear message.
+    /// Phase D D3 runtime: pull `column` from the source rule's
+    /// derived facts via a pre-built `vid → FeatureValue` lookup. The
+    /// `subject_col` is the index of `<subject_var>._vid` in the body
+    /// batch; the lookup runs once per row.
     PathContext {
-        model_name: String,
-        source_rule: String,
-        column: String,
+        subject_col: usize,
+        vid_to_value: Arc<HashMap<u64, uni_locy::FeatureValue>>,
     },
 }
 
@@ -2852,19 +2855,29 @@ impl FeatureResolver {
                 )))
             }
             FeatureResolverKind::PathContext {
-                model_name,
-                source_rule,
-                column,
-            } => Err(datafusion::error::DataFusionError::Execution(format!(
-                "model '{model_name}': `FEATURES (..., {column}) FROM {source_rule}` \
-                 requires `DerivedScanRegistry` threading into \
-                 `apply_model_invocations`, which is a separate plumbing step from \
-                 the D3 MVP. The compiler accepts the syntax and stratifies the \
-                 invoking rule after `{source_rule}`; the runtime join is pending \
-                 follow-up. Emulate by writing an intermediate rule that joins \
-                 `{source_rule}` and YIELDs `{column}` as a direct property, then \
-                 feed that as a plain feature."
-            ))),
+                subject_col,
+                vid_to_value,
+            } => {
+                let col = batch.column(*subject_col);
+                if col.is_null(row_idx) {
+                    return Ok(uni_locy::FeatureValue::Null);
+                }
+                if let Some(arr) = col.as_any().downcast_ref::<arrow_array::UInt64Array>() {
+                    let vid = arr.value(row_idx);
+                    Ok(vid_to_value
+                        .get(&vid)
+                        .cloned()
+                        .unwrap_or(uni_locy::FeatureValue::Null))
+                } else if let Some(arr) = col.as_any().downcast_ref::<arrow_array::Int64Array>() {
+                    let vid = arr.value(row_idx) as u64;
+                    Ok(vid_to_value
+                        .get(&vid)
+                        .cloned()
+                        .unwrap_or(uni_locy::FeatureValue::Null))
+                } else {
+                    Ok(uni_locy::FeatureValue::Null)
+                }
+            }
         }
     }
 }
@@ -2872,6 +2885,10 @@ impl FeatureResolver {
 fn build_feature_resolvers(
     batch: &RecordBatch,
     invocation: &uni_locy::ModelInvocation,
+    path_context_handles: &HashMap<
+        String,
+        crate::query::df_graph::locy_model_invoke::PathContextHandle,
+    >,
 ) -> DFResult<Vec<FeatureResolver>> {
     use uni_cypher::ast::Expr;
     let schema = batch.schema();
@@ -2930,18 +2947,39 @@ fn build_feature_resolvers(
         }
     };
 
-    // Phase D D3: when the model declares a path-context feature,
-    // emit a single `PathContext` resolver keyed on the path-context
-    // column name (the model's `INPUT` bindings are unused under this
-    // form for MVP). The resolver errors at row time pending the
-    // runtime-join follow-up.
+    // Phase D D3 runtime: when the model declares a path-context
+    // feature, build a `vid → FeatureValue` lookup once from the
+    // source rule's converged facts and wrap it in an Arc so the
+    // per-row resolver does a single hash lookup. The model's
+    // `INPUT` bindings are unused under this form for MVP — the
+    // resolver's binding name is the column name (matches how the
+    // mock-classifier feature-driver pattern in TCK consumes it).
     if let Some(pc) = &invocation.path_context {
+        let handle = path_context_handles.get(&pc.source_rule).ok_or_else(|| {
+            datafusion::error::DataFusionError::Execution(format!(
+                "model '{}' path_context references rule '{}' but no DerivedScanHandle \
+                 was registered; this should never happen — the build_clause path \
+                 mints a handle for every distinct source_rule in the invocation set",
+                invocation.model_name, pc.source_rule
+            ))
+        })?;
+        let subject_col = schema
+            .index_of(&format!("{}._vid", pc.subject_var))
+            .or_else(|_| schema.index_of(&pc.subject_var))
+            .map_err(|_| {
+                datafusion::error::DataFusionError::Execution(format!(
+                    "model '{}' path_context: subject column '{}' (or '{0}._vid') not \
+                     in body batch schema",
+                    invocation.model_name, pc.subject_var
+                ))
+            })?;
+        let vid_to_value =
+            build_path_context_lookup(handle, &pc.subject_var, &pc.column, &invocation.model_name)?;
         return Ok(vec![FeatureResolver {
             binding_name: pc.column.clone(),
             kind: FeatureResolverKind::PathContext {
-                model_name: invocation.model_name.clone(),
-                source_rule: pc.source_rule.clone(),
-                column: pc.column.clone(),
+                subject_col,
+                vid_to_value: Arc::new(vid_to_value),
             },
         }]);
     }
@@ -2978,6 +3016,65 @@ fn build_feature_resolvers(
             },
         };
         out.push(FeatureResolver { binding_name, kind });
+    }
+    Ok(out)
+}
+
+/// Phase D D3: walk the source rule's converged batches and build
+/// a `vid → FeatureValue` lookup for the named column. The subject
+/// column in the derived rule's schema holds VIDs (UInt64) for node
+/// variables; the value column type follows the rule's yield-schema
+/// inference (typically Float64 / Int64 / Bool / String).
+fn build_path_context_lookup(
+    handle: &crate::query::df_graph::locy_model_invoke::PathContextHandle,
+    _subject_var: &str,
+    column: &str,
+    model_name: &str,
+) -> DFResult<HashMap<u64, uni_locy::FeatureValue>> {
+    // The source rule's KEY column is its first yield column by
+    // convention (`infer_yield_schema` orders KEYs first). The model's
+    // local `subject_var` is just a binding alias — the actual join
+    // matches the body row's VID against this canonical column.
+    if handle.schema.fields().is_empty() {
+        return Err(datafusion::error::DataFusionError::Execution(format!(
+            "model '{model_name}' path_context: source rule has empty yield schema"
+        )));
+    }
+    let subj_idx = 0_usize;
+    let col_idx = handle.schema.index_of(column).map_err(|_| {
+        datafusion::error::DataFusionError::Execution(format!(
+            "model '{model_name}' path_context: column '{column}' not in \
+             source rule's yield schema (have: {:?})",
+            handle
+                .schema
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect::<Vec<_>>()
+        ))
+    })?;
+    let batches = handle.data.read();
+    let mut out: HashMap<u64, uni_locy::FeatureValue> = HashMap::new();
+    for batch in batches.iter() {
+        let subj_col = batch.column(subj_idx);
+        let value_col = batch.column(col_idx);
+        for row in 0..batch.num_rows() {
+            if subj_col.is_null(row) {
+                continue;
+            }
+            let vid = if let Some(a) = subj_col.as_any().downcast_ref::<arrow_array::UInt64Array>()
+            {
+                a.value(row)
+            } else if let Some(a) = subj_col.as_any().downcast_ref::<arrow_array::Int64Array>() {
+                a.value(row) as u64
+            } else {
+                continue;
+            };
+            let v = extract_feature_value(value_col.as_ref(), row);
+            // Last write wins on duplicates; derived rules typically have
+            // unique KEY values, so this is a defensive guard.
+            out.insert(vid, v);
+        }
     }
     Ok(out)
 }

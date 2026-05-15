@@ -18,6 +18,7 @@
 //! machinery in the codebase.
 
 use std::any::Any;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
@@ -29,9 +30,23 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
 use futures::TryStreamExt;
+use parking_lot::RwLock;
 use uni_locy::{ClassifierRegistry, ModelInvocation, ModelInvocationCache};
 
 use super::locy_fixpoint::apply_model_invocations;
+
+/// Phase D D3 runtime: a shared handle into a source rule's derived
+/// facts. The plan builder mints these for every `path_context.source_rule`
+/// referenced by any invocation in the same `LocyModelInvoke`, so the
+/// runtime can read the rule's `Vec<RecordBatch>` (already populated by
+/// the fixpoint loop in an earlier stratum) and join by VID without
+/// consulting the registry at exec time.
+#[derive(Debug, Clone)]
+pub struct PathContextHandle {
+    pub source_rule: String,
+    pub data: Arc<RwLock<Vec<RecordBatch>>>,
+    pub schema: SchemaRef,
+}
 
 /// `ExecutionPlan` wrapper that runs `apply_model_invocations` over
 /// the batches produced by `input`.
@@ -41,6 +56,9 @@ pub struct LocyModelInvokeExec {
     invocations: Vec<ModelInvocation>,
     registry: Arc<ClassifierRegistry>,
     cache: Option<Arc<ModelInvocationCache>>,
+    /// Phase D D3: one handle per distinct `path_context.source_rule`
+    /// referenced by the invocations on this node, indexed by rule name.
+    path_context_handles: HashMap<String, PathContextHandle>,
     /// Phase C B1-B3 follow-up: per-query side-channel store for
     /// (raw, calibrated, confidence_band) tuples. Written per row
     /// per invocation by `apply_model_invocations`; consumed by
@@ -64,6 +82,7 @@ impl LocyModelInvokeExec {
         registry: Arc<ClassifierRegistry>,
         cache: Option<Arc<ModelInvocationCache>>,
         provenance_store: Option<Arc<uni_locy::NeuralProvenanceStore>>,
+        path_context_handles: HashMap<String, PathContextHandle>,
     ) -> Self {
         let schema = compute_output_schema(input.schema(), &invocations);
         let plan_properties = compute_plan_properties(&input, schema.clone());
@@ -73,6 +92,7 @@ impl LocyModelInvokeExec {
             registry,
             cache,
             provenance_store,
+            path_context_handles,
             schema,
             plan_properties,
         }
@@ -168,6 +188,7 @@ impl ExecutionPlan for LocyModelInvokeExec {
             Arc::clone(&self.registry),
             self.cache.as_ref().map(Arc::clone),
             self.provenance_store.as_ref().map(Arc::clone),
+            self.path_context_handles.clone(),
         )))
     }
 
@@ -181,6 +202,7 @@ impl ExecutionPlan for LocyModelInvokeExec {
         let registry = Arc::clone(&self.registry);
         let cache = self.cache.as_ref().map(Arc::clone);
         let provenance_store = self.provenance_store.as_ref().map(Arc::clone);
+        let path_context_handles = self.path_context_handles.clone();
         let schema = self.schema.clone();
 
         let fut = async move {
@@ -191,6 +213,7 @@ impl ExecutionPlan for LocyModelInvokeExec {
                 &registry,
                 cache.as_ref(),
                 provenance_store.as_ref(),
+                &path_context_handles,
             )
             .await?;
             // Wrap the Vec<RecordBatch> as a stream so try_flatten

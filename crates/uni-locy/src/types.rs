@@ -278,6 +278,18 @@ pub enum WarningCode {
     /// runtime); a future refinement will gate on runtime
     /// support-set intersection.
     CrossPredicateCorrelation,
+    /// Phase D F3 case 4 (F2c): two or more neural-model
+    /// invocations in the same rule receive retrieval-backed
+    /// features (`similar_to(prop, _)` / `semantic_match(prop,
+    /// _)`) over the *same* node property. The two models
+    /// condition on the same retrieval evidence, so the implicit
+    /// independence assumption that underlies composition via
+    /// MNOR/MPROD/etc. is suspect. Suppressed when all involved
+    /// models carry `@independent`. Structural over-detection;
+    /// a future refinement could gate on cosine similarity of
+    /// the pre-embedded query vectors (queries are constants per
+    /// `apply_model_invocations` call).
+    SharedRetrievalContext,
 }
 
 /// Probability semiring used to evaluate MNOR/MPROD aggregates, PROB

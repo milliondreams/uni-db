@@ -78,6 +78,7 @@ pub fn compile_models(
                     name: model_name,
                     inputs,
                     features: model_def.features.clone(),
+                    path_context: model_def.path_context.clone(),
                     output_type: model_def.output.output_type,
                     output_name: model_def.output.name.clone(),
                     xervo_alias: model_def.xervo_alias.clone(),

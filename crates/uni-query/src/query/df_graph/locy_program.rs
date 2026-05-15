@@ -1263,6 +1263,7 @@ async fn run_program(
                     name: calibrate.model_name.clone(),
                     inputs: model_inputs.clone(),
                     features: vec![],
+                    path_context: None,
                     output_type: uni_cypher::locy_ast::OutputType::Prob,
                     output_name: String::new(),
                     xervo_alias: String::new(),

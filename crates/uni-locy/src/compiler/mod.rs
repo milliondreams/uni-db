@@ -119,10 +119,11 @@ fn compile_with_context(
         });
     }
 
-    let dep_graph = dependency::build_dependency_graph_with_external(
+    let dep_graph = dependency::build_dependency_graph_with_models(
         &rule_groups,
         &module_ctx,
         external_rules,
+        &model_catalog,
     )?;
     let strat = stratify::stratify(&dep_graph)?;
     warded::check_wardedness(&rule_groups)?;

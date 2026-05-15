@@ -306,6 +306,12 @@ pub struct ModelDefinition {
     /// the `FEATURES` clause is omitted (model receives all bound node
     /// properties — interpretation deferred to the runtime adapter).
     pub features: Vec<Expr>,
+    /// Phase D D3: `FEATURES (subject, column) FROM rule_name` pulls
+    /// `column` from a prior-derived relation `rule_name` (keyed by
+    /// `subject`) at runtime, and feeds it as a feature alongside any
+    /// `INPUT` bindings. MVP: at most one path-context feature per
+    /// model, mutually exclusive with the expression-`features` form.
+    pub path_context: Option<PathContextFeature>,
     pub output: OutputBinding,
     pub xervo_alias: String,
     pub calibration: Option<CalibrationMethod>,
@@ -318,6 +324,14 @@ pub struct ModelDefinition {
 pub struct InputBinding {
     pub variable: String,
     pub label: Option<String>,
+}
+
+/// Phase D D3: `FEATURES (subject_var, column) FROM source_rule`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PathContextFeature {
+    pub subject_var: String,
+    pub column: String,
+    pub source_rule: String,
 }
 
 /// The OUTPUT declaration, e.g. `OUTPUT PROB risk`.

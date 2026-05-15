@@ -366,6 +366,7 @@ mod tests {
                 label: Some("Supplier".into()),
             }],
             features: vec![],
+            path_context: None,
             output_type: OutputType::Prob,
             output_name: "risk".into(),
             xervo_alias: "classify/test".into(),

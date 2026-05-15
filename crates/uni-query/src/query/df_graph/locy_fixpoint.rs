@@ -1320,16 +1320,20 @@ async fn run_fixpoint_loop(
                 // Record provenance for newly derived facts when tracker is present.
                 if let Some(ref tracker) = derivation_tracker {
                     record_provenance(
-                        tracker,
+                        ProvenanceCtx {
+                            tracker,
+                            registry: &registry,
+                            warnings_slot: &warnings_slot,
+                        },
                         rule,
                         &states[rule_idx],
                         &clause_candidates,
                         iteration,
-                        &registry,
                         top_k_proofs,
-                        &classifier_registry,
-                        classifier_cache.as_ref(),
-                        &warnings_slot,
+                        ClassifierRefs {
+                            registry: &classifier_registry,
+                            cache: classifier_cache.as_ref(),
+                        },
                     )
                     .await;
                 }
@@ -1450,18 +1454,39 @@ async fn run_fixpoint_loop(
 ///
 /// Called after `merge_delta` returns `true`. Attributes each new fact to the
 /// clause most likely to have produced it, using first-derivation-wins semantics.
+/// Borrowed bundle of classifier-side runtime state used by
+/// provenance / EXPLAIN-reconstruction code paths. Keeps function
+/// signatures under the too-many-arguments threshold.
+pub(crate) struct ClassifierRefs<'a> {
+    pub registry: &'a Arc<ClassifierRegistry>,
+    pub cache: Option<&'a Arc<uni_locy::ModelInvocationCache>>,
+}
+
+/// Borrowed bundle of provenance-recording state: the in-flight
+/// tracker, the derived-scan registry (used to resolve IS-ref inputs),
+/// and the shared warnings slot. Bundled to keep
+/// `record_provenance` / `record_and_detect_lineage_nonrecursive`
+/// under the too-many-arguments threshold.
+pub(crate) struct ProvenanceCtx<'a> {
+    pub tracker: &'a Arc<ProvenanceStore>,
+    pub registry: &'a Arc<DerivedScanRegistry>,
+    pub warnings_slot: &'a Arc<StdRwLock<Vec<RuntimeWarning>>>,
+}
+
 async fn record_provenance(
-    tracker: &Arc<ProvenanceStore>,
+    prov: ProvenanceCtx<'_>,
     rule: &FixpointRulePlan,
     state: &FixpointState,
     clause_candidates: &[Vec<RecordBatch>],
     iteration: usize,
-    registry: &Arc<DerivedScanRegistry>,
     top_k_proofs: usize,
-    classifier_registry: &Arc<ClassifierRegistry>,
-    classifier_cache: Option<&Arc<uni_locy::ModelInvocationCache>>,
-    warnings_slot: &Arc<StdRwLock<Vec<RuntimeWarning>>>,
+    classifiers: ClassifierRefs<'_>,
 ) {
+    let tracker = prov.tracker;
+    let registry = prov.registry;
+    let warnings_slot = prov.warnings_slot;
+    let classifier_registry = classifiers.registry;
+    let classifier_cache = classifiers.cache;
     let all_indices: Vec<usize> = (0..rule.yield_schema.fields().len()).collect();
 
     // Pre-compute base fact probabilities for top-k mode.
@@ -2138,9 +2163,10 @@ pub(crate) async fn record_and_detect_lineage_nonrecursive(
     warnings_slot: &Arc<StdRwLock<Vec<RuntimeWarning>>>,
     registry: &Arc<DerivedScanRegistry>,
     top_k_proofs: usize,
-    classifier_registry: &Arc<ClassifierRegistry>,
-    classifier_cache: Option<&Arc<uni_locy::ModelInvocationCache>>,
+    classifiers: ClassifierRefs<'_>,
 ) -> Option<SharedLineageInfo> {
+    let classifier_registry = classifiers.registry;
+    let classifier_cache = classifiers.cache;
     let all_indices: Vec<usize> = (0..rule.yield_schema.fields().len()).collect();
 
     // Pre-compute base fact probabilities for top-k mode.
@@ -2577,35 +2603,6 @@ pub fn apply_anti_join(
 //   * `UnknownNeuralModel`: the model name isn't in the registry.
 //   * Mismatched feature-expr / column: returned as a DataFusion
 //     Execution error.
-
-/// Phase B A4: wrap a Locy clause body plan in a
-/// `LogicalPlan::LocyModelInvoke` node when the clause has any
-/// neural-model invocations. When the list is empty, returns the
-/// input plan unchanged — keeping the plan tree compact for the
-/// (common) symbolic-only path.
-pub(crate) fn wrap_with_model_invoke(
-    body: crate::query::planner::LogicalPlan,
-    invocations: &[uni_locy::ModelInvocation],
-    classifier_registry: &Arc<ClassifierRegistry>,
-    classifier_cache: Option<&Arc<uni_locy::ModelInvocationCache>>,
-    classifier_provenance_store: Option<&Arc<uni_locy::NeuralProvenanceStore>>,
-) -> crate::query::planner::LogicalPlan {
-    if invocations.is_empty() {
-        return body;
-    }
-    crate::query::planner::LogicalPlan::LocyModelInvoke {
-        input: Box::new(body),
-        invocations: invocations.to_vec(),
-        classifier_registry: Arc::clone(classifier_registry),
-        classifier_cache: classifier_cache.map(Arc::clone),
-        classifier_provenance_store: classifier_provenance_store.map(Arc::clone),
-        // This wrap helper is used by paths that don't have a rule_catalog
-        // to look up path_context source rules. Callers that need
-        // path-context support (`build_clause`) populate the handle map
-        // directly when constructing the LocyModelInvoke variant.
-        path_context_handles: HashMap::new(),
-    }
-}
 
 pub(crate) async fn apply_model_invocations(
     batches: Vec<RecordBatch>,
@@ -4146,6 +4143,10 @@ pub struct FixpointExec {
     /// (LocyModelInvokeExec writes; this struct just carries
     /// the Arc to keep the type wiring consistent across the
     /// LocyProgramExec/FixpointExec boundary).
+    #[allow(
+        dead_code,
+        reason = "boundary plumbing; read by EXPLAIN via LocyModelInvokeExec"
+    )]
     classifier_provenance_store: Option<Arc<uni_locy::NeuralProvenanceStore>>,
 }
 

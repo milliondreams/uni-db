@@ -1107,8 +1107,10 @@ async fn run_program(
                         &warnings_slot,
                         &registry,
                         top_k_proofs,
-                        &classifier_registry,
-                        classifier_cache.as_ref(),
+                        super::locy_fixpoint::ClassifierRefs {
+                            registry: &classifier_registry,
+                            cache: classifier_cache.as_ref(),
+                        },
                     )
                     .await
                 } else {

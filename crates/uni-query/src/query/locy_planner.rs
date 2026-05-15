@@ -237,6 +237,42 @@ pub struct LocyPlanBuilder<'a> {
     derived_scan_handles: RefCell<Vec<DerivedScanHandle>>,
 }
 
+/// Neural-classifier-related plumbing threaded through `build_stratum` →
+/// `build_rule` → `build_clause`. Bundled to avoid the
+/// too-many-arguments smell on those builders.
+#[derive(Clone)]
+struct ClassifierContext {
+    registry: Arc<uni_locy::ClassifierRegistry>,
+    cache: Option<Arc<uni_locy::ModelInvocationCache>>,
+    provenance_store: Option<Arc<uni_locy::NeuralProvenanceStore>>,
+}
+
+/// Probabilistic-evaluation knobs threaded through the same builders.
+/// Fields are not yet read by the clause-level builders (the actual
+/// strict-domain / epsilon enforcement happens later in the fixpoint
+/// hot path); they ride along here so the planner surface stays
+/// consistent with the runtime config and is forward-compatible with
+/// plan-time enforcement.
+#[derive(Clone, Copy)]
+#[allow(
+    dead_code,
+    reason = "reserved for plan-time probabilistic-config rollout"
+)]
+struct ProbabilityConfig {
+    strict_domain: bool,
+    epsilon: f64,
+}
+
+/// Lookup state shared by the clause builder: target rule catalog,
+/// the in-progress stratum's rule names, and the clause's bound node
+/// variables. Bundled to keep `build_clause` under the
+/// too-many-arguments threshold.
+struct ClauseCtx<'a> {
+    stratum_rule_names: &'a HashSet<String>,
+    rule_catalog: &'a HashMap<String, CompiledRule>,
+    node_vars: &'a HashSet<String>,
+}
+
 impl<'a> LocyPlanBuilder<'a> {
     /// Create a new plan builder backed by the given `QueryPlanner`.
     pub fn new(planner: &'a QueryPlanner) -> Self {
@@ -371,6 +407,15 @@ impl<'a> LocyPlanBuilder<'a> {
     ) -> Result<LogicalPlan> {
         let mut strata = Vec::with_capacity(compiled.strata.len());
 
+        let prob_config = ProbabilityConfig {
+            strict_domain: strict_probability_domain,
+            epsilon: probability_epsilon,
+        };
+        let classifiers = ClassifierContext {
+            registry: Arc::clone(&classifier_registry),
+            cache: classifier_cache.as_ref().map(Arc::clone),
+            provenance_store: classifier_provenance_store.as_ref().map(Arc::clone),
+        };
         for stratum in &compiled.strata {
             let rule_names: HashSet<String> =
                 stratum.rules.iter().map(|r| r.name.clone()).collect();
@@ -378,11 +423,8 @@ impl<'a> LocyPlanBuilder<'a> {
                 stratum,
                 &compiled.rule_catalog,
                 &rule_names,
-                strict_probability_domain,
-                probability_epsilon,
-                Arc::clone(&classifier_registry),
-                classifier_cache.as_ref().map(Arc::clone),
-                classifier_provenance_store.as_ref().map(Arc::clone),
+                prob_config,
+                &classifiers,
             )?;
             strata.push(locy_stratum);
         }
@@ -455,10 +497,6 @@ impl<'a> LocyPlanBuilder<'a> {
             .collect()
     }
 
-    fn build_commands(&self, commands: &[CompiledCommand]) -> Vec<LocyCommand> {
-        self.build_commands_with_models(commands, &HashMap::new())
-    }
-
     // -- Stratum --------------------------------------------------------
 
     fn build_stratum(
@@ -466,11 +504,8 @@ impl<'a> LocyPlanBuilder<'a> {
         stratum: &Stratum,
         rule_catalog: &HashMap<String, CompiledRule>,
         stratum_rule_names: &HashSet<String>,
-        strict_probability_domain: bool,
-        probability_epsilon: f64,
-        classifier_registry: Arc<uni_locy::ClassifierRegistry>,
-        classifier_cache: Option<Arc<uni_locy::ModelInvocationCache>>,
-        classifier_provenance_store: Option<Arc<uni_locy::NeuralProvenanceStore>>,
+        prob_config: ProbabilityConfig,
+        classifiers: &ClassifierContext,
     ) -> Result<LocyStratum> {
         let mut rules = Vec::with_capacity(stratum.rules.len());
         for rule in &stratum.rules {
@@ -479,11 +514,8 @@ impl<'a> LocyPlanBuilder<'a> {
                 stratum.is_recursive,
                 stratum_rule_names,
                 rule_catalog,
-                strict_probability_domain,
-                probability_epsilon,
-                Arc::clone(&classifier_registry),
-                classifier_cache.as_ref().map(Arc::clone),
-                classifier_provenance_store.as_ref().map(Arc::clone),
+                prob_config,
+                classifiers,
             )?);
         }
 
@@ -503,11 +535,8 @@ impl<'a> LocyPlanBuilder<'a> {
         is_recursive: bool,
         stratum_rule_names: &HashSet<String>,
         rule_catalog: &HashMap<String, CompiledRule>,
-        strict_probability_domain: bool,
-        probability_epsilon: f64,
-        classifier_registry: Arc<uni_locy::ClassifierRegistry>,
-        classifier_cache: Option<Arc<uni_locy::ModelInvocationCache>>,
-        classifier_provenance_store: Option<Arc<uni_locy::NeuralProvenanceStore>>,
+        prob_config: ProbabilityConfig,
+        classifiers: &ClassifierContext,
     ) -> Result<LocyRulePlan> {
         // Collect node variable names from match patterns for VID-based joins
         let node_vars = collect_node_vars(&rule.clauses);
@@ -518,14 +547,13 @@ impl<'a> LocyPlanBuilder<'a> {
                 clause,
                 &rule.yield_schema,
                 is_recursive,
-                stratum_rule_names,
-                rule_catalog,
-                &node_vars,
-                strict_probability_domain,
-                probability_epsilon,
-                Arc::clone(&classifier_registry),
-                classifier_cache.as_ref().map(Arc::clone),
-                classifier_provenance_store.as_ref().map(Arc::clone),
+                ClauseCtx {
+                    stratum_rule_names,
+                    rule_catalog,
+                    node_vars: &node_vars,
+                },
+                prob_config,
+                classifiers,
             )?);
         }
 
@@ -641,24 +669,21 @@ impl<'a> LocyPlanBuilder<'a> {
 
     // -- Clause ---------------------------------------------------------
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "clause builder requires full planner context"
-    )]
     fn build_clause(
         &self,
         clause: &CompiledClause,
         yield_cols: &[YieldColumn],
         _is_recursive: bool,
-        stratum_rule_names: &HashSet<String>,
-        rule_catalog: &HashMap<String, CompiledRule>,
-        node_vars: &HashSet<String>,
-        _strict_probability_domain: bool,
-        _probability_epsilon: f64,
-        classifier_registry: Arc<uni_locy::ClassifierRegistry>,
-        classifier_cache: Option<Arc<uni_locy::ModelInvocationCache>>,
-        classifier_provenance_store: Option<Arc<uni_locy::NeuralProvenanceStore>>,
+        ctx: ClauseCtx<'_>,
+        _prob_config: ProbabilityConfig,
+        classifiers: &ClassifierContext,
     ) -> Result<LocyClausePlan> {
+        let stratum_rule_names = ctx.stratum_rule_names;
+        let rule_catalog = ctx.rule_catalog;
+        let node_vars = ctx.node_vars;
+        let classifier_registry = Arc::clone(&classifiers.registry);
+        let classifier_cache = classifiers.cache.as_ref().map(Arc::clone);
+        let classifier_provenance_store = classifiers.provenance_store.as_ref().map(Arc::clone);
         // Collect node variables from THIS clause's MATCH pattern only.
         // Used for IS-ref predicates: only variables in the current MATCH
         // have expanded {var}._vid columns in the graph scan output.
@@ -1520,6 +1545,14 @@ mod tests {
         QueryPlanner::new(test_schema())
     }
 
+    fn test_classifier_ctx() -> ClassifierContext {
+        ClassifierContext {
+            registry: Arc::new(uni_locy::ClassifierRegistry::new()),
+            cache: None,
+            provenance_store: None,
+        }
+    }
+
     fn yield_col(name: &str, is_key: bool) -> YieldColumn {
         YieldColumn {
             name: name.to_string(),
@@ -1866,11 +1899,11 @@ mod tests {
                 &stratum,
                 &catalog,
                 &names,
-                false,
-                1e-15,
-                Arc::new(uni_locy::ClassifierRegistry::new()),
-                None,
-                None,
+                ProbabilityConfig {
+                    strict_domain: false,
+                    epsilon: 1e-15,
+                },
+                &test_classifier_ctx(),
             )
             .unwrap();
 
@@ -1905,11 +1938,11 @@ mod tests {
                 &stratum,
                 &catalog,
                 &names,
-                false,
-                1e-15,
-                Arc::new(uni_locy::ClassifierRegistry::new()),
-                None,
-                None,
+                ProbabilityConfig {
+                    strict_domain: false,
+                    epsilon: 1e-15,
+                },
+                &test_classifier_ctx(),
             )
             .unwrap();
 
@@ -1942,11 +1975,11 @@ mod tests {
                 &stratum,
                 &catalog,
                 &names,
-                false,
-                1e-15,
-                Arc::new(uni_locy::ClassifierRegistry::new()),
-                None,
-                None,
+                ProbabilityConfig {
+                    strict_domain: false,
+                    epsilon: 1e-15,
+                },
+                &test_classifier_ctx(),
             )
             .unwrap();
 
@@ -1985,11 +2018,11 @@ mod tests {
                 &stratum,
                 &catalog,
                 &names,
-                false,
-                1e-15,
-                Arc::new(uni_locy::ClassifierRegistry::new()),
-                None,
-                None,
+                ProbabilityConfig {
+                    strict_domain: false,
+                    epsilon: 1e-15,
+                },
+                &test_classifier_ctx(),
             )
             .unwrap();
 
@@ -2023,11 +2056,11 @@ mod tests {
                 false,
                 &names,
                 &catalog,
-                false,
-                1e-15,
-                Arc::new(uni_locy::ClassifierRegistry::new()),
-                None,
-                None,
+                ProbabilityConfig {
+                    strict_domain: false,
+                    epsilon: 1e-15,
+                },
+                &test_classifier_ctx(),
             )
             .unwrap();
         assert_eq!(result.name, "reachable");
@@ -2058,11 +2091,11 @@ mod tests {
                 false,
                 &names,
                 &catalog,
-                false,
-                1e-15,
-                Arc::new(uni_locy::ClassifierRegistry::new()),
-                None,
-                None,
+                ProbabilityConfig {
+                    strict_domain: false,
+                    epsilon: 1e-15,
+                },
+                &test_classifier_ctx(),
             )
             .unwrap();
         assert_eq!(result.priority, Some(5));
@@ -2087,11 +2120,11 @@ mod tests {
                 false,
                 &names,
                 &catalog,
-                false,
-                1e-15,
-                Arc::new(uni_locy::ClassifierRegistry::new()),
-                None,
-                None,
+                ProbabilityConfig {
+                    strict_domain: false,
+                    epsilon: 1e-15,
+                },
+                &test_classifier_ctx(),
             )
             .unwrap();
         assert_eq!(result.priority, None);
@@ -2120,11 +2153,11 @@ mod tests {
                 false,
                 &names,
                 &catalog,
-                false,
-                1e-15,
-                Arc::new(uni_locy::ClassifierRegistry::new()),
-                None,
-                None,
+                ProbabilityConfig {
+                    strict_domain: false,
+                    epsilon: 1e-15,
+                },
+                &test_classifier_ctx(),
             )
             .unwrap();
         assert_eq!(result.clauses.len(), 3);
@@ -2153,11 +2186,11 @@ mod tests {
                 false,
                 &names,
                 &catalog,
-                false,
-                1e-15,
-                Arc::new(uni_locy::ClassifierRegistry::new()),
-                None,
-                None,
+                ProbabilityConfig {
+                    strict_domain: false,
+                    epsilon: 1e-15,
+                },
+                &test_classifier_ctx(),
             )
             .unwrap();
         assert!(result.yield_schema[0].is_key);
@@ -2184,14 +2217,16 @@ mod tests {
                 &clause,
                 &yield_cols,
                 false,
-                &names,
-                &catalog,
-                &HashSet::new(),
-                false,
-                1e-15,
-                Arc::new(uni_locy::ClassifierRegistry::new()),
-                None,
-                None,
+                ClauseCtx {
+                    stratum_rule_names: &names,
+                    rule_catalog: &catalog,
+                    node_vars: &HashSet::new(),
+                },
+                ProbabilityConfig {
+                    strict_domain: false,
+                    epsilon: 1e-15,
+                },
+                &test_classifier_ctx(),
             )
             .unwrap();
 
@@ -2230,14 +2265,16 @@ mod tests {
                 &clause,
                 &yield_cols,
                 false,
-                &names,
-                &catalog,
-                &HashSet::new(),
-                false,
-                1e-15,
-                Arc::new(uni_locy::ClassifierRegistry::new()),
-                None,
-                None,
+                ClauseCtx {
+                    stratum_rule_names: &names,
+                    rule_catalog: &catalog,
+                    node_vars: &HashSet::new(),
+                },
+                ProbabilityConfig {
+                    strict_domain: false,
+                    epsilon: 1e-15,
+                },
+                &test_classifier_ctx(),
             )
             .unwrap();
 
@@ -2287,14 +2324,16 @@ mod tests {
                 &clause,
                 &yield_cols,
                 false,
-                &names,
-                &catalog,
-                &HashSet::new(),
-                false,
-                1e-15,
-                Arc::new(uni_locy::ClassifierRegistry::new()),
-                None,
-                None,
+                ClauseCtx {
+                    stratum_rule_names: &names,
+                    rule_catalog: &catalog,
+                    node_vars: &HashSet::new(),
+                },
+                ProbabilityConfig {
+                    strict_domain: false,
+                    epsilon: 1e-15,
+                },
+                &test_classifier_ctx(),
             )
             .unwrap();
 
@@ -2354,14 +2393,16 @@ mod tests {
                 &clause,
                 &yield_cols,
                 false,
-                &names,
-                &catalog,
-                &HashSet::new(),
-                false,
-                1e-15,
-                Arc::new(uni_locy::ClassifierRegistry::new()),
-                None,
-                None,
+                ClauseCtx {
+                    stratum_rule_names: &names,
+                    rule_catalog: &catalog,
+                    node_vars: &HashSet::new(),
+                },
+                ProbabilityConfig {
+                    strict_domain: false,
+                    epsilon: 1e-15,
+                },
+                &test_classifier_ctx(),
             )
             .unwrap();
 
@@ -2409,14 +2450,16 @@ mod tests {
                 &clause,
                 &yield_cols,
                 false,
-                &names,
-                &catalog,
-                &HashSet::new(),
-                false,
-                1e-15,
-                Arc::new(uni_locy::ClassifierRegistry::new()),
-                None,
-                None,
+                ClauseCtx {
+                    stratum_rule_names: &names,
+                    rule_catalog: &catalog,
+                    node_vars: &HashSet::new(),
+                },
+                ProbabilityConfig {
+                    strict_domain: false,
+                    epsilon: 1e-15,
+                },
+                &test_classifier_ctx(),
             )
             .unwrap();
 
@@ -2486,14 +2529,16 @@ mod tests {
                 &clause,
                 &yield_cols,
                 false,
-                &names,
-                &catalog,
-                &HashSet::new(),
-                false,
-                1e-15,
-                Arc::new(uni_locy::ClassifierRegistry::new()),
-                None,
-                None,
+                ClauseCtx {
+                    stratum_rule_names: &names,
+                    rule_catalog: &catalog,
+                    node_vars: &HashSet::new(),
+                },
+                ProbabilityConfig {
+                    strict_domain: false,
+                    epsilon: 1e-15,
+                },
+                &test_classifier_ctx(),
             )
             .unwrap();
 
@@ -2550,14 +2595,16 @@ mod tests {
                 &clause,
                 &yield_cols,
                 false,
-                &names,
-                &catalog,
-                &HashSet::new(),
-                false,
-                1e-15,
-                Arc::new(uni_locy::ClassifierRegistry::new()),
-                None,
-                None,
+                ClauseCtx {
+                    stratum_rule_names: &names,
+                    rule_catalog: &catalog,
+                    node_vars: &HashSet::new(),
+                },
+                ProbabilityConfig {
+                    strict_domain: false,
+                    epsilon: 1e-15,
+                },
+                &test_classifier_ctx(),
             )
             .unwrap();
 
@@ -2607,14 +2654,16 @@ mod tests {
                 &clause,
                 &yield_cols,
                 false,
-                &names,
-                &catalog,
-                &HashSet::new(),
-                false,
-                1e-15,
-                Arc::new(uni_locy::ClassifierRegistry::new()),
-                None,
-                None,
+                ClauseCtx {
+                    stratum_rule_names: &names,
+                    rule_catalog: &catalog,
+                    node_vars: &HashSet::new(),
+                },
+                ProbabilityConfig {
+                    strict_domain: false,
+                    epsilon: 1e-15,
+                },
+                &test_classifier_ctx(),
             )
             .unwrap();
 
@@ -2657,14 +2706,16 @@ mod tests {
                 &clause,
                 &yield_cols,
                 true,
-                &names,
-                &catalog,
-                &HashSet::new(),
-                false,
-                1e-15,
-                Arc::new(uni_locy::ClassifierRegistry::new()),
-                None,
-                None,
+                ClauseCtx {
+                    stratum_rule_names: &names,
+                    rule_catalog: &catalog,
+                    node_vars: &HashSet::new(),
+                },
+                ProbabilityConfig {
+                    strict_domain: false,
+                    epsilon: 1e-15,
+                },
+                &test_classifier_ctx(),
             )
             .unwrap();
 
@@ -2704,14 +2755,16 @@ mod tests {
                 &clause,
                 &yield_cols,
                 false,
-                &names,
-                &catalog,
-                &HashSet::new(),
-                false,
-                1e-15,
-                Arc::new(uni_locy::ClassifierRegistry::new()),
-                None,
-                None,
+                ClauseCtx {
+                    stratum_rule_names: &names,
+                    rule_catalog: &catalog,
+                    node_vars: &HashSet::new(),
+                },
+                ProbabilityConfig {
+                    strict_domain: false,
+                    epsilon: 1e-15,
+                },
+                &test_classifier_ctx(),
             )
             .unwrap();
 
@@ -2744,14 +2797,16 @@ mod tests {
                 &clause,
                 &yield_cols,
                 false,
-                &names,
-                &catalog,
-                &HashSet::new(),
-                false,
-                1e-15,
-                Arc::new(uni_locy::ClassifierRegistry::new()),
-                None,
-                None,
+                ClauseCtx {
+                    stratum_rule_names: &names,
+                    rule_catalog: &catalog,
+                    node_vars: &HashSet::new(),
+                },
+                ProbabilityConfig {
+                    strict_domain: false,
+                    epsilon: 1e-15,
+                },
+                &test_classifier_ctx(),
             )
             .unwrap();
 
@@ -2824,14 +2879,16 @@ mod tests {
                 &clause,
                 &yield_cols,
                 false,
-                &names,
-                &catalog,
-                &HashSet::new(),
-                false,
-                1e-15,
-                Arc::new(uni_locy::ClassifierRegistry::new()),
-                None,
-                None,
+                ClauseCtx {
+                    stratum_rule_names: &names,
+                    rule_catalog: &catalog,
+                    node_vars: &HashSet::new(),
+                },
+                ProbabilityConfig {
+                    strict_domain: false,
+                    epsilon: 1e-15,
+                },
+                &test_classifier_ctx(),
             )
             .unwrap();
 
@@ -3558,14 +3615,16 @@ mod tests {
             &clause,
             &yield_cols,
             false,
-            &names,
-            &catalog,
-            &HashSet::new(),
-            false,
-            1e-15,
-            Arc::new(uni_locy::ClassifierRegistry::new()),
-            None,
-            None,
+            ClauseCtx {
+                stratum_rule_names: &names,
+                rule_catalog: &catalog,
+                node_vars: &HashSet::new(),
+            },
+            ProbabilityConfig {
+                strict_domain: false,
+                epsilon: 1e-15,
+            },
+            &test_classifier_ctx(),
         );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -3608,14 +3667,16 @@ mod tests {
             &clause,
             &yield_cols,
             false,
-            &names,
-            &catalog,
-            &HashSet::new(),
-            false,
-            1e-15,
-            Arc::new(uni_locy::ClassifierRegistry::new()),
-            None,
-            None,
+            ClauseCtx {
+                stratum_rule_names: &names,
+                rule_catalog: &catalog,
+                node_vars: &HashSet::new(),
+            },
+            ProbabilityConfig {
+                strict_domain: false,
+                epsilon: 1e-15,
+            },
+            &test_classifier_ctx(),
         );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -3661,14 +3722,16 @@ mod tests {
             &clause,
             &yield_cols,
             false,
-            &names,
-            &catalog,
-            &HashSet::new(),
-            false,
-            1e-15,
-            Arc::new(uni_locy::ClassifierRegistry::new()),
-            None,
-            None,
+            ClauseCtx {
+                stratum_rule_names: &names,
+                rule_catalog: &catalog,
+                node_vars: &HashSet::new(),
+            },
+            ProbabilityConfig {
+                strict_domain: false,
+                epsilon: 1e-15,
+            },
+            &test_classifier_ctx(),
         );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -3709,14 +3772,16 @@ mod tests {
             &clause,
             &yield_cols,
             true,
-            &names,
-            &catalog,
-            &HashSet::new(),
-            false,
-            1e-15,
-            Arc::new(uni_locy::ClassifierRegistry::new()),
-            None,
-            None,
+            ClauseCtx {
+                stratum_rule_names: &names,
+                rule_catalog: &catalog,
+                node_vars: &HashSet::new(),
+            },
+            ProbabilityConfig {
+                strict_domain: false,
+                epsilon: 1e-15,
+            },
+            &test_classifier_ctx(),
         );
         assert!(result.is_ok());
     }

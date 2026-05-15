@@ -1150,6 +1150,7 @@ async fn run_program(
                     semiring_kind,
                     derivation_tracker.as_ref().map(Arc::clone),
                     top_k_proofs,
+                    Some(Arc::clone(&registry)),
                 )
                 .await?;
 

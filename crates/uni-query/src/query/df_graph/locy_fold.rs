@@ -25,6 +25,8 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use uni_locy::SemiringKind;
 
+use super::locy_explain::ProofTerm;
+
 /// Direction of monotonicity for a fold aggregate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MonotonicDirection {
@@ -124,6 +126,14 @@ pub struct FoldExec {
     /// fixpoint-loop config; passed through so per-group `TopKTag`
     /// merges respect the same K as the in-loop accumulator.
     top_k_proofs_k: usize,
+    /// Pre-computed map of body-row content hash → IS-ref support
+    /// (`Vec<ProofTerm>`) for use by `topk_dnf_disjunction`. Populated
+    /// in `apply_post_fixpoint_chain` *before* this `FoldExec` is
+    /// built, because at FOLD time the current rule's own facts are
+    /// not yet recorded in the `ProvenanceStore` (which is keyed by
+    /// post-YIELD hashes anyway). `None` for non-TopK semirings and
+    /// for legacy callers.
+    body_support_map: Option<Arc<HashMap<Vec<u8>, Vec<ProofTerm>>>>,
     schema: SchemaRef,
     properties: PlanProperties,
     metrics: ExecutionPlanMetricsSet,
@@ -174,6 +184,7 @@ impl FoldExec {
             semiring_kind,
             None,
             0,
+            None,
         )
     }
 
@@ -181,6 +192,13 @@ impl FoldExec {
     /// `top_k_proofs` config so MNOR under `SemiringKind::TopKProofs`
     /// can resolve each row's IS-ref support chain into a `Proof` and
     /// aggregate via DNF inclusion-exclusion.
+    ///
+    /// `body_support_map` (Phase D D-C0 follow-up) is a pre-computed
+    /// `body_row_hash → Vec<ProofTerm>` map, populated by
+    /// `apply_post_fixpoint_chain` for TopKProofs rules. The tracker
+    /// alone is insufficient — its entries are keyed by post-YIELD
+    /// row hashes and are only populated after FOLD runs; the pre-fold
+    /// body rows seen here would never hit. The map closes that gap.
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_topk(
         input: Arc<dyn ExecutionPlan>,
@@ -191,6 +209,7 @@ impl FoldExec {
         semiring_kind: SemiringKind,
         provenance_tracker: Option<Arc<super::locy_explain::ProvenanceStore>>,
         top_k_proofs_k: usize,
+        body_support_map: Option<Arc<HashMap<Vec<u8>, Vec<ProofTerm>>>>,
     ) -> Self {
         let input_schema = input.schema();
         let schema = Self::build_output_schema(&input_schema, &key_indices, &fold_bindings);
@@ -205,6 +224,7 @@ impl FoldExec {
             semiring_kind,
             provenance_tracker,
             top_k_proofs_k,
+            body_support_map,
             schema,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -304,6 +324,7 @@ impl ExecutionPlan for FoldExec {
             self.semiring_kind,
             self.provenance_tracker.as_ref().map(Arc::clone),
             self.top_k_proofs_k,
+            self.body_support_map.as_ref().map(Arc::clone),
         )))
     }
 
@@ -319,8 +340,9 @@ impl ExecutionPlan for FoldExec {
         let strict = self.strict_probability_domain;
         let epsilon = self.probability_epsilon;
         let semiring_kind = self.semiring_kind;
-        let provenance_tracker = self.provenance_tracker.as_ref().map(Arc::clone);
+        let _provenance_tracker = self.provenance_tracker.as_ref().map(Arc::clone);
         let top_k_proofs_k = self.top_k_proofs_k;
+        let body_support_map = self.body_support_map.as_ref().map(Arc::clone);
         let output_schema = Arc::clone(&self.schema);
         let input_schema = self.input.schema();
 
@@ -398,13 +420,11 @@ impl ExecutionPlan for FoldExec {
                         ]))
                     }
                 };
-                let topk_ctx = if matches!(semiring_kind, SemiringKind::TopKProofs { .. })
-                    && let Some(tracker) = provenance_tracker.as_ref()
-                {
+                let topk_ctx = if matches!(semiring_kind, SemiringKind::TopKProofs { .. }) {
                     Some(TopKFoldCtx {
-                        tracker,
                         k: top_k_proofs_k,
                         batch: &batch,
+                        body_support_map: body_support_map.as_deref(),
                     })
                 } else {
                     None
@@ -454,13 +474,17 @@ struct FoldGroups<'a> {
 }
 
 /// Phase D D-C0: per-call context for TopKProofs-aware aggregation.
-/// Carries the provenance tracker and the K config so MNOR / MPROD
-/// can resolve each row's support chain into a `Proof` and aggregate
-/// via DNF inclusion-exclusion.
+/// Carries the K config and a pre-computed body-row → IS-ref support
+/// map so MNOR / MPROD can build per-row `Proof`s and aggregate via
+/// DNF inclusion-exclusion. The map is built in
+/// `apply_post_fixpoint_chain` before `FoldExec` is constructed; the
+/// provenance tracker is *not* sufficient at this stage because its
+/// entries are keyed by post-YIELD row hashes and the current rule's
+/// facts have not been recorded yet.
 struct TopKFoldCtx<'a> {
-    tracker: &'a Arc<super::locy_explain::ProvenanceStore>,
     k: usize,
     batch: &'a RecordBatch,
+    body_support_map: Option<&'a HashMap<Vec<u8>, Vec<ProofTerm>>>,
 }
 
 fn compute_fold_aggregate(
@@ -581,19 +605,24 @@ fn sum_f64(col: &dyn Array, indices: &[usize]) -> Option<f64> {
 /// Phase D D-C0: TopKProofs MNOR via DNF inclusion-exclusion over the
 /// rows' support chains. Each row contributes one `Proof` whose
 /// weight is the row's MNOR-input value and whose `base_rvs` are
-/// interned from the row's IS-ref support (looked up via
-/// `ctx.tracker`). Proofs are merged via `merge_top_k_runtime` (so
+/// interned from the row's IS-ref support, resolved via
+/// `ctx.body_support_map` — a precomputed map of body-row content
+/// hash → `Vec<ProofTerm>`. The map is built in
+/// `apply_post_fixpoint_chain` before FOLD; the `ProvenanceStore`
+/// tracker cannot be used here because its entries are keyed by
+/// post-YIELD hashes and the rule's own facts haven't been recorded
+/// yet at FOLD time. Proofs are merged via `merge_top_k_runtime` (so
 /// the K config is respected and `CrossedDependency` notices ride
 /// the side-channel). The per-group output is
 /// `TopKTag.to_dnf().weight(&base_weights)` — exact when no
 /// dependency overlap exists, exact under inclusion-exclusion when
 /// shared base facts appear across proofs.
 ///
-/// Rows without tracker entries (e.g. base facts that haven't been
-/// recorded yet, or a fresh first-iteration run before
-/// `record_provenance`) fall back to an empty-support Proof — the
-/// math degrades to plain f64 noisy-OR (independence-mode) for
-/// those rows.
+/// Rows whose body-hash isn't in the support map (e.g. rules whose
+/// MNOR runs over plain columns with no IS-ref bindings) contribute
+/// empty-support Proofs — the math degrades to plain f64 noisy-OR
+/// (independence-mode), preserving the pre-D-C0 byte-identical
+/// AddMultProb behavior.
 fn topk_dnf_disjunction(
     col: &dyn Array,
     indices: &[usize],
@@ -628,11 +657,12 @@ fn topk_dnf_disjunction(
         }
         let weight = val.clamp(0.0, 1.0);
 
-        // Resolve row's IS-ref support via tracker; intern base facts into BaseRvs.
+        // Resolve row's IS-ref support via the precomputed body-row map;
+        // intern base facts into BaseRvs.
         let fact_hash = super::locy_fixpoint::fact_hash_key(batch, &all_indices, i);
         let mut base_rvs = BaseRvSet::empty();
-        if let Some(entry) = ctx.tracker.lookup(&fact_hash) {
-            for term in &entry.support {
+        if let Some(support) = ctx.body_support_map.and_then(|m| m.get(&fact_hash)) {
+            for term in support {
                 let rv = *interner
                     .entry(term.base_fact_id.clone())
                     .or_insert_with(|| {

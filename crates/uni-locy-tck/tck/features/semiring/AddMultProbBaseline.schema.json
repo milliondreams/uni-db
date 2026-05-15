@@ -1,0 +1,30 @@
+{
+  "edge_types": {
+    "CAUSE": {
+      "dst_labels": [],
+      "id": 1,
+      "src_labels": []
+    }
+  },
+  "indexes": [],
+  "labels": {
+    "Node": {
+      "id": 1
+    }
+  },
+  "properties": {
+    "CAUSE": {
+      "prob": {
+        "nullable": true,
+        "type": "Float64"
+      }
+    },
+    "Node": {
+      "name": {
+        "nullable": true,
+        "type": "String"
+      }
+    }
+  },
+  "schema_version": 1
+}

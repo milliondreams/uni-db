@@ -1,0 +1,35 @@
+{
+  "edge_types": {},
+  "indexes": [],
+  "labels": {
+    "Customer": {
+      "id": 1
+    },
+    "Item": {
+      "id": 2
+    }
+  },
+  "properties": {
+    "Customer": {
+      "name": {
+        "nullable": true,
+        "type": "String"
+      },
+      "tier": {
+        "nullable": true,
+        "type": "String"
+      }
+    },
+    "Item": {
+      "idx": {
+        "nullable": true,
+        "type": "Int64"
+      },
+      "label": {
+        "nullable": true,
+        "type": "Bool"
+      }
+    }
+  },
+  "schema_version": 1
+}

@@ -1,0 +1,31 @@
+{
+  "edge_types": {},
+  "indexes": [],
+  "labels": {
+    "Sample": {
+      "id": 1
+    },
+    "Supplier": {
+      "id": 2
+    }
+  },
+  "properties": {
+    "Sample": {
+      "idx": {
+        "nullable": true,
+        "type": "Int64"
+      },
+      "label": {
+        "nullable": true,
+        "type": "Bool"
+      }
+    },
+    "Supplier": {
+      "name": {
+        "nullable": true,
+        "type": "String"
+      }
+    }
+  },
+  "schema_version": 1
+}

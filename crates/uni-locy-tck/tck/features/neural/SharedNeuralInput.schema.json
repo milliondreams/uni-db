@@ -1,0 +1,37 @@
+{
+  "edge_types": {
+    "ASSESSED": {
+      "dst_labels": [],
+      "id": 1,
+      "src_labels": []
+    }
+  },
+  "indexes": [],
+  "labels": {
+    "Item": {
+      "id": 1
+    },
+    "Part": {
+      "id": 2
+    }
+  },
+  "properties": {
+    "Item": {
+      "name": {
+        "nullable": true,
+        "type": "String"
+      },
+      "tier": {
+        "nullable": true,
+        "type": "Int64"
+      }
+    },
+    "Part": {
+      "name": {
+        "nullable": true,
+        "type": "String"
+      }
+    }
+  },
+  "schema_version": 1
+}

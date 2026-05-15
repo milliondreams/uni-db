@@ -11,10 +11,11 @@ pub mod types;
 
 pub use calibration::{
     BetaCalibration, BetaFitter, CalibrationError, CalibrationMethodKind, Calibrator,
-    CalibratorFitter, DirichletCalibrator, DirichletFitter, IdentityCalibrator, IsotonicFitter,
-    IsotonicRegression, MulticlassCalibrator, MulticlassCalibratorFitter, PlattFitter,
-    PlattScaling, TemperatureFitter, TemperatureScaling, accuracy, auc, brier_score, debiased_ece,
-    expected_calibration_error, log_loss,
+    CalibratorFitter, CredalCalibrator, DirichletCalibrator, DirichletFitter,
+    EnsembleVarianceCalibrator, IdentityCalibrator, IsotonicFitter, IsotonicRegression,
+    MulticlassCalibrator, MulticlassCalibratorFitter, PlattFitter, PlattScaling, TemperatureFitter,
+    TemperatureScaling, accuracy, auc, brier_score, debiased_ece, expected_calibration_error,
+    log_loss,
 };
 pub use compiler::compile;
 pub use compiler::compile_with_config;

@@ -78,6 +78,7 @@ ISOTONIC_REGRESSION_KW = @{ ^"isotonic_regression" ~ !ident_char }
 TEMPERATURE_SCALING_KW = @{ ^"temperature_scaling" ~ !ident_char }
 BETA_CALIBRATION_KW    = @{ ^"beta_calibration" ~ !ident_char }
 CONFORMAL_KW           = @{ ^"conformal" ~ !ident_char }
+DIRICHLET_KW           = @{ ^"dirichlet" ~ !ident_char }
 CALIBRATION_NONE       = @{ ^"none" ~ !ident_char }
 
 // Locy reserved words — added to the reserved keyword set so that
@@ -498,8 +499,14 @@ model_output_type = {
 }
 
 model_using_clause = {
-    USING ~ XERVO ~ "(" ~ string ~ ")"
+    USING ~ XERVO ~ "(" ~ string ~ ("," ~ model_using_embedder)? ~ ")"
 }
+
+// Phase D D2 follow-up: optional `embedder='alias'` named argument to
+// pick which Xervo embedder embeds `semantic_match` query literals.
+// Without it, the runtime falls back to embedder alias "default".
+model_using_embedder = { EMBEDDER_KW ~ "=" ~ string }
+EMBEDDER_KW = @{ ^"embedder" ~ !ident_char }
 
 model_calibration_clause = {
     CALIBRATION ~ model_calibration_method
@@ -511,6 +518,7 @@ model_calibration_method = {
     | TEMPERATURE_SCALING_KW
     | BETA_CALIBRATION_KW
     | CONFORMAL_KW
+    | DIRICHLET_KW
     | CALIBRATION_NONE
 }
 // `conformal(0.1)` — optional alpha parameter for split-conformal

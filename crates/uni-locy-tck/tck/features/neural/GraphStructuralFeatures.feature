@@ -291,3 +291,208 @@ Feature: Graph-structural features (Phase D D1)
       """
     Then evaluation should fail
     And the evaluation error should mention "avg_neighbor"
+
+  # ── Additional centralities (betweenness/eigenvector/harmonic/katz) ──
+
+  Scenario: betweenness_centrality(n) accepted (smoke)
+    Given a registered node label "Node"
+    And a registered edge type "LINKS" from "Node" to "Node"
+    And having executed:
+      """
+      CREATE (:Node {name: 'A'}), (:Node {name: 'B'}), (:Node {name: 'C'})
+      """
+    And having executed:
+      """
+      MATCH (a:Node {name: 'A'}), (b:Node {name: 'B'})
+      CREATE (a)-[:LINKS]->(b)
+      """
+    And having executed:
+      """
+      MATCH (b:Node {name: 'B'}), (c:Node {name: 'C'})
+      CREATE (b)-[:LINKS]->(c)
+      """
+    And a registered mock classifier "echo" driven by Float feature "score"
+    When evaluating the following Locy program with neural_predicates_preview:
+      """
+      CREATE MODEL echo AS
+        INPUT (score)
+        OUTPUT PROB risk
+        USING xervo('classify/echo')
+
+      CREATE RULE risky AS
+        MATCH (n:Node)
+        YIELD KEY n, echo(betweenness_centrality(n)) AS risk
+      """
+    Then evaluation should succeed
+
+  Scenario: harmonic_centrality(n) accepted (smoke)
+    Given a registered node label "Node"
+    And a registered edge type "LINKS" from "Node" to "Node"
+    And having executed:
+      """
+      CREATE (:Node {name: 'A'}), (:Node {name: 'B'})
+      """
+    And having executed:
+      """
+      MATCH (a:Node {name: 'A'}), (b:Node {name: 'B'})
+      CREATE (a)-[:LINKS]->(b)
+      """
+    And a registered mock classifier "echo" driven by Float feature "score"
+    When evaluating the following Locy program with neural_predicates_preview:
+      """
+      CREATE MODEL echo AS
+        INPUT (score)
+        OUTPUT PROB risk
+        USING xervo('classify/echo')
+
+      CREATE RULE risky AS
+        MATCH (n:Node)
+        YIELD KEY n, echo(harmonic_centrality(n)) AS risk
+      """
+    Then evaluation should succeed
+
+  Scenario: eigenvector_centrality(n) accepted (smoke)
+    Given a registered node label "Node"
+    And a registered edge type "LINKS" from "Node" to "Node"
+    And having executed:
+      """
+      CREATE (:Node {name: 'A'}), (:Node {name: 'B'})
+      """
+    And having executed:
+      """
+      MATCH (a:Node {name: 'A'}), (b:Node {name: 'B'})
+      CREATE (a)-[:LINKS]->(b), (b)-[:LINKS]->(a)
+      """
+    And a registered mock classifier "echo" driven by Float feature "score"
+    When evaluating the following Locy program with neural_predicates_preview:
+      """
+      CREATE MODEL echo AS
+        INPUT (score)
+        OUTPUT PROB risk
+        USING xervo('classify/echo')
+
+      CREATE RULE risky AS
+        MATCH (n:Node)
+        YIELD KEY n, echo(eigenvector_centrality(n)) AS risk
+      """
+    Then evaluation should succeed
+
+  Scenario: katz_centrality(n) accepted (smoke)
+    Given a registered node label "Node"
+    And a registered edge type "LINKS" from "Node" to "Node"
+    And having executed:
+      """
+      CREATE (:Node {name: 'A'}), (:Node {name: 'B'})
+      """
+    And having executed:
+      """
+      MATCH (a:Node {name: 'A'}), (b:Node {name: 'B'})
+      CREATE (a)-[:LINKS]->(b)
+      """
+    And a registered mock classifier "echo" driven by Float feature "score"
+    When evaluating the following Locy program with neural_predicates_preview:
+      """
+      CREATE MODEL echo AS
+        INPUT (score)
+        OUTPUT PROB risk
+        USING xervo('classify/echo')
+
+      CREATE RULE risky AS
+        MATCH (n:Node)
+        YIELD KEY n, echo(katz_centrality(n)) AS risk
+      """
+    Then evaluation should succeed
+
+  # ── Neighbor-aggregator direction arg ────────────────────────────────
+
+  Scenario: avg_neighbor with INCOMING direction
+    Given a registered node label "Supplier"
+    And a registered edge type "TRUSTS" from "Supplier" to "Supplier"
+    And having executed:
+      """
+      CREATE (:Supplier {name: 'A', score: 0.2}),
+             (:Supplier {name: 'B', score: 0.6}),
+             (:Supplier {name: 'C'})
+      """
+    And having executed:
+      """
+      MATCH (a:Supplier {name: 'A'}), (c:Supplier {name: 'C'})
+      CREATE (a)-[:TRUSTS]->(c)
+      """
+    And having executed:
+      """
+      MATCH (b:Supplier {name: 'B'}), (c:Supplier {name: 'C'})
+      CREATE (b)-[:TRUSTS]->(c)
+      """
+    And a registered mock classifier "echo" driven by Float feature "score"
+    When evaluating the following Locy program with neural_predicates_preview:
+      """
+      CREATE MODEL echo AS
+        INPUT (score)
+        OUTPUT PROB risk
+        USING xervo('classify/echo')
+
+      CREATE RULE risky AS
+        MATCH (s:Supplier {name: 'C'})
+        YIELD KEY s, echo(avg_neighbor(s, 'TRUSTS', 'score', 'INCOMING')) AS risk
+      """
+    Then evaluation should succeed
+    # C's INCOMING TRUSTS neighbors: A (0.2) and B (0.6); avg = 0.4.
+    And the derived relation 'risky' should contain a fact where risk = 0.4
+
+  Scenario: sum_neighbor with BOTH direction totals over both directions
+    Given a registered node label "Supplier"
+    And a registered edge type "TRUSTS" from "Supplier" to "Supplier"
+    And having executed:
+      """
+      CREATE (:Supplier {name: 'A'}),
+             (:Supplier {name: 'B', score: 0.3}),
+             (:Supplier {name: 'C', score: 0.4})
+      """
+    And having executed:
+      """
+      MATCH (a:Supplier {name: 'A'}), (b:Supplier {name: 'B'})
+      CREATE (a)-[:TRUSTS]->(b)
+      """
+    And having executed:
+      """
+      MATCH (c:Supplier {name: 'C'}), (a:Supplier {name: 'A'})
+      CREATE (c)-[:TRUSTS]->(a)
+      """
+    And a registered mock classifier "echo" driven by Float feature "score"
+    When evaluating the following Locy program with neural_predicates_preview:
+      """
+      CREATE MODEL echo AS
+        INPUT (score)
+        OUTPUT PROB risk
+        USING xervo('classify/echo')
+
+      CREATE RULE risky AS
+        MATCH (s:Supplier {name: 'A'})
+        YIELD KEY s, echo(sum_neighbor(s, 'TRUSTS', 'score', 'BOTH')) AS risk
+      """
+    Then evaluation should succeed
+    # A's outgoing neighbor: B (0.3). Incoming neighbor: C (0.4). Sum = 0.7.
+    And the derived relation 'risky' should contain a fact where risk = 0.7
+
+  Scenario: avg_neighbor rejects invalid direction string
+    Given a registered node label "Supplier"
+    And a registered edge type "TRUSTS" from "Supplier" to "Supplier"
+    And having executed:
+      """
+      CREATE (:Supplier {name: 'A'})
+      """
+    And a registered mock classifier "echo" returning 0.5
+    When evaluating the following Locy program with neural_predicates_preview:
+      """
+      CREATE MODEL echo AS
+        INPUT (score)
+        OUTPUT PROB risk
+        USING xervo('classify/echo')
+
+      CREATE RULE risky AS
+        MATCH (s:Supplier)
+        YIELD KEY s, echo(avg_neighbor(s, 'TRUSTS', 'score', 'SIDEWAYS')) AS risk
+      """
+    Then evaluation should fail
+    And the evaluation error should mention "OUTGOING"

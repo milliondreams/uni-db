@@ -314,6 +314,11 @@ pub struct ModelDefinition {
     pub path_context: Option<PathContextFeature>,
     pub output: OutputBinding,
     pub xervo_alias: String,
+    /// Phase D D2 follow-up: optional embedder alias surfaced by the
+    /// `USING xervo('classify/X', embedder='alias')` form. When
+    /// `None`, the runtime falls back to the alias `"default"` for
+    /// `semantic_match` query-text embedding.
+    pub embedder_alias: Option<String>,
     pub calibration: Option<CalibrationMethod>,
     pub version: Option<String>,
     pub annotations: ModelAnnotations,
@@ -364,7 +369,12 @@ pub enum CalibrationMethod {
     Conformal {
         alpha: f64,
     },
-    // Dirichlet — Phase C M2; deferred.
+    /// Phase D D-C1d: multi-class Dirichlet calibration. The CALIBRATE
+    /// statement collects per-row `(class_index, score_vector)` pairs
+    /// instead of `(prediction, ground_truth)`. Compiler routes this
+    /// through `MulticlassCalibratorFitter` rather than the binary
+    /// `CalibratorFitter` trait. Method-of-moments fit by default.
+    Dirichlet,
 }
 
 /// Statement-level annotations. Currently only `@independent`, which

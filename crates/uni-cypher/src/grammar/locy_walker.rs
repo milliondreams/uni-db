@@ -354,6 +354,7 @@ fn build_model_definition(pair: Pair<LocyRule>) -> Result<ModelDefinition, Parse
     let mut path_context: Option<PathContextFeature> = None;
     let mut output: Option<OutputBinding> = None;
     let mut xervo_alias: Option<String> = None;
+    let mut embedder_alias: Option<String> = None;
     let mut calibration: Option<CalibrationMethod> = None;
     let mut version: Option<String> = None;
 
@@ -392,7 +393,9 @@ fn build_model_definition(pair: Pair<LocyRule>) -> Result<ModelDefinition, Parse
                 output = Some(build_model_output_clause(child)?);
             }
             LocyRule::model_using_clause => {
-                xervo_alias = Some(build_model_using_clause(child)?);
+                let (xa, ea) = build_model_using_clause(child)?;
+                xervo_alias = Some(xa);
+                embedder_alias = ea;
             }
             LocyRule::model_calibration_clause => {
                 calibration = Some(build_model_calibration_clause(child)?);
@@ -414,6 +417,7 @@ fn build_model_definition(pair: Pair<LocyRule>) -> Result<ModelDefinition, Parse
         xervo_alias: xervo_alias.ok_or_else(|| {
             ParseError::new("CREATE MODEL missing USING xervo(...) clause".to_string())
         })?,
+        embedder_alias,
         calibration,
         version,
         annotations,
@@ -525,15 +529,31 @@ fn parse_output_type(raw: &str) -> OutputType {
     }
 }
 
-fn build_model_using_clause(pair: Pair<LocyRule>) -> Result<String, ParseError> {
+/// Returns `(xervo_alias, embedder_alias_opt)`. The grammar accepts an
+/// optional `embedder='alias'` named argument; when present we lift it
+/// into the second tuple slot, otherwise `None` lets the runtime use
+/// its `"default"` fallback.
+fn build_model_using_clause(pair: Pair<LocyRule>) -> Result<(String, Option<String>), ParseError> {
+    let mut xervo_alias: Option<String> = None;
+    let mut embedder_alias: Option<String> = None;
     for child in pair.into_inner() {
-        if child.as_rule() == LocyRule::string {
-            return Ok(unquote_string_literal(child.as_str()));
+        match child.as_rule() {
+            LocyRule::string if xervo_alias.is_none() => {
+                xervo_alias = Some(unquote_string_literal(child.as_str()));
+            }
+            LocyRule::model_using_embedder => {
+                for inner in child.into_inner() {
+                    if inner.as_rule() == LocyRule::string {
+                        embedder_alias = Some(unquote_string_literal(inner.as_str()));
+                    }
+                }
+            }
+            _ => {}
         }
     }
-    Err(ParseError::new(
-        "USING xervo() missing alias literal".to_string(),
-    ))
+    let xervo_alias = xervo_alias
+        .ok_or_else(|| ParseError::new("USING xervo() missing alias literal".to_string()))?;
+    Ok((xervo_alias, embedder_alias))
 }
 
 fn build_model_calibration_clause(pair: Pair<LocyRule>) -> Result<CalibrationMethod, ParseError> {
@@ -579,6 +599,7 @@ fn parse_calibration_method(pair: Pair<LocyRule>) -> Result<CalibrationMethod, P
         "temperature_scaling" => CalibrationMethod::TemperatureScaling,
         "beta_calibration" => CalibrationMethod::BetaCalibration,
         "conformal" => CalibrationMethod::Conformal { alpha: 0.1 },
+        "dirichlet" => CalibrationMethod::Dirichlet,
         "none" => CalibrationMethod::None,
         other => {
             return Err(ParseError::new(format!(

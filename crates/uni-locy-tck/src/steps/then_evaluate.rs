@@ -1154,6 +1154,28 @@ async fn result_contains_ece_binning_bias(world: &mut LocyWorld) {
     );
 }
 
+#[then(regex = r#"^the result should contain a FoldInRecursivePath warning$"#)]
+async fn result_contains_fold_in_recursive_path(world: &mut LocyWorld) {
+    let locy_result = world
+        .locy_result()
+        .expect("no evaluation result")
+        .as_ref()
+        .expect("evaluation failed");
+    let found = locy_result
+        .compile_warnings()
+        .iter()
+        .any(|w| matches!(w.code, uni_locy::types::WarningCode::FoldInRecursivePath));
+    assert!(
+        found,
+        "expected FoldInRecursivePath compile warning, got: {:?}",
+        locy_result
+            .compile_warnings()
+            .iter()
+            .map(|w| format!("{:?}", w.code))
+            .collect::<Vec<_>>()
+    );
+}
+
 #[then(regex = r#"^the result should contain a PositiveComplementCorrelation warning$"#)]
 async fn result_contains_positive_complement_correlation(world: &mut LocyWorld) {
     let locy_result = world

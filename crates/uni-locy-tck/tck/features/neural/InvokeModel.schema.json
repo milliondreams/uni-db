@@ -1,0 +1,27 @@
+{
+  "edge_types": {},
+  "indexes": [],
+  "labels": {
+    "Item": {
+      "id": 1
+    },
+    "Supplier": {
+      "id": 2
+    }
+  },
+  "properties": {
+    "Item": {
+      "name": {
+        "nullable": true,
+        "type": "String"
+      }
+    },
+    "Supplier": {
+      "name": {
+        "nullable": true,
+        "type": "String"
+      }
+    }
+  },
+  "schema_version": 1
+}

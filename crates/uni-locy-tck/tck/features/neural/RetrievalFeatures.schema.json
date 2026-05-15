@@ -1,0 +1,22 @@
+{
+  "edge_types": {},
+  "indexes": [],
+  "labels": {
+    "Doc": {
+      "id": 1
+    }
+  },
+  "properties": {
+    "Doc": {
+      "embedding": {
+        "nullable": true,
+        "type": "CypherValue"
+      },
+      "name": {
+        "nullable": true,
+        "type": "String"
+      }
+    }
+  },
+  "schema_version": 1
+}

@@ -1,0 +1,39 @@
+{
+  "edge_types": {
+    "ASSESSED": {
+      "dst_labels": [],
+      "id": 1,
+      "src_labels": []
+    }
+  },
+  "indexes": [],
+  "labels": {
+    "Part": {
+      "id": 1
+    },
+    "Supplier": {
+      "id": 2
+    }
+  },
+  "properties": {
+    "ASSESSED": {
+      "path": {
+        "nullable": true,
+        "type": "Int64"
+      }
+    },
+    "Part": {
+      "name": {
+        "nullable": true,
+        "type": "String"
+      }
+    },
+    "Supplier": {
+      "name": {
+        "nullable": true,
+        "type": "String"
+      }
+    }
+  },
+  "schema_version": 1
+}

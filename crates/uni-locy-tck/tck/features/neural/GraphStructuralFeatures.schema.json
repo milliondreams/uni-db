@@ -1,0 +1,47 @@
+{
+  "edge_types": {
+    "LINKS": {
+      "dst_labels": [],
+      "id": 1,
+      "src_labels": []
+    },
+    "SUPPLIES": {
+      "dst_labels": [],
+      "id": 2,
+      "src_labels": []
+    },
+    "TRUSTS": {
+      "dst_labels": [],
+      "id": 3,
+      "src_labels": []
+    }
+  },
+  "indexes": [],
+  "labels": {
+    "Node": {
+      "id": 1
+    },
+    "Supplier": {
+      "id": 2
+    }
+  },
+  "properties": {
+    "Node": {
+      "name": {
+        "nullable": true,
+        "type": "String"
+      }
+    },
+    "Supplier": {
+      "name": {
+        "nullable": true,
+        "type": "String"
+      },
+      "score": {
+        "nullable": true,
+        "type": "Float64"
+      }
+    }
+  },
+  "schema_version": 1
+}

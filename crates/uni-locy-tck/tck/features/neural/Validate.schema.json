@@ -1,0 +1,26 @@
+{
+  "edge_types": {},
+  "indexes": [],
+  "labels": {
+    "Item": {
+      "id": 1
+    }
+  },
+  "properties": {
+    "Item": {
+      "idx": {
+        "nullable": true,
+        "type": "Int64"
+      },
+      "label": {
+        "nullable": true,
+        "type": "Bool"
+      },
+      "prob": {
+        "nullable": true,
+        "type": "Float64"
+      }
+    }
+  },
+  "schema_version": 1
+}

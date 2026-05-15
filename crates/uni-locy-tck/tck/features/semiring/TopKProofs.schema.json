@@ -1,0 +1,48 @@
+{
+  "edge_types": {
+    "CAUSE": {
+      "dst_labels": [],
+      "id": 1,
+      "src_labels": []
+    }
+  },
+  "indexes": [],
+  "labels": {
+    "Hub": {
+      "id": 1
+    },
+    "Item": {
+      "id": 2
+    },
+    "Node": {
+      "id": 3
+    }
+  },
+  "properties": {
+    "CAUSE": {
+      "prob": {
+        "nullable": true,
+        "type": "Float64"
+      }
+    },
+    "Hub": {
+      "name": {
+        "nullable": true,
+        "type": "String"
+      }
+    },
+    "Item": {
+      "name": {
+        "nullable": true,
+        "type": "String"
+      }
+    },
+    "Node": {
+      "name": {
+        "nullable": true,
+        "type": "String"
+      }
+    }
+  },
+  "schema_version": 1
+}

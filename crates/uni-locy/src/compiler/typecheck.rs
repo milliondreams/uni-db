@@ -522,23 +522,22 @@ fn check_cross_predicate_correlation(
                 .push(is_ref.rule_name.to_string());
         }
     }
-    for (subj, targets) in by_subject {
+    for (subj, mut targets) in by_subject {
         // Dedupe and keep only distinct targets.
-        let mut distinct: Vec<&String> = targets.iter().collect();
-        distinct.sort();
-        distinct.dedup();
-        if distinct.len() < 2 {
+        targets.sort();
+        targets.dedup();
+        if targets.len() < 2 {
             continue;
         }
         // Count PROB-bearing targets.
-        let prob_targets: Vec<&str> = distinct
+        let prob_targets: Vec<&str> = targets
             .iter()
-            .filter_map(|t| {
+            .filter(|t| {
                 compiled_rules
                     .get(t.as_str())
-                    .filter(|r| r.yield_schema.iter().any(|c| c.is_prob))
-                    .map(|_| t.as_str())
+                    .is_some_and(|r| r.yield_schema.iter().any(|c| c.is_prob))
             })
+            .map(String::as_str)
             .collect();
         if prob_targets.len() < 2 {
             continue;
@@ -763,7 +762,6 @@ fn check_shared_neural_inputs(
             && args.len() == model.inputs.len()
         {
             invocations.push((name.as_str(), args));
-            let _ = model;
         }
     }
     if invocations.len() < 2 {
@@ -776,6 +774,14 @@ fn check_shared_neural_inputs(
                 .is_some_and(|cm| cm.annotations.independent)
         })
     };
+    // Returns Some(sorted-deduped models) when ≥ 2 distinct non-independent
+    // models share a group; None otherwise (no warning to emit).
+    fn dedup_sorted<'a>(models: &[&'a str]) -> Vec<&'a str> {
+        let mut unique: Vec<&'a str> = models.to_vec();
+        unique.sort();
+        unique.dedup();
+        unique
+    }
     // ── F2a: group by shared input-variable name ────────────────
     let mut by_var: HashMap<String, Vec<&str>> = HashMap::new();
     for (model, args) in &invocations {
@@ -787,9 +793,7 @@ fn check_shared_neural_inputs(
     }
     let mut warned_a: HashSet<String> = HashSet::new();
     for (var, models) in &by_var {
-        let mut unique: Vec<&str> = models.to_vec();
-        unique.sort();
-        unique.dedup();
+        let unique = dedup_sorted(models);
         if unique.len() >= 2 && !all_independent(&unique) && warned_a.insert(var.clone()) {
             warnings.push(CompilerWarning {
                 code: WarningCode::SharedNeuralInputArgument,
@@ -825,9 +829,7 @@ fn check_shared_neural_inputs(
         }
     }
     for models in by_expr.values() {
-        let mut unique: Vec<&str> = models.to_vec();
-        unique.sort();
-        unique.dedup();
+        let unique = dedup_sorted(models);
         if unique.len() >= 2 && !all_independent(&unique) {
             warnings.push(CompilerWarning {
                 code: WarningCode::SharedNeuralFeatureValue,
@@ -871,9 +873,7 @@ fn check_shared_neural_inputs(
         }
     }
     for ((v, prop), models) in &by_retrieval_prop {
-        let mut unique: Vec<&str> = models.to_vec();
-        unique.sort();
-        unique.dedup();
+        let unique = dedup_sorted(models);
         if unique.len() >= 2 && !all_independent(&unique) {
             warnings.push(CompilerWarning {
                 code: WarningCode::SharedRetrievalContext,

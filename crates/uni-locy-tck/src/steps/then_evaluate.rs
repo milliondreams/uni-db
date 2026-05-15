@@ -1154,6 +1154,58 @@ async fn result_contains_ece_binning_bias(world: &mut LocyWorld) {
     );
 }
 
+#[then(regex = r#"^the result should contain a PositiveComplementCorrelation warning$"#)]
+async fn result_contains_positive_complement_correlation(world: &mut LocyWorld) {
+    let locy_result = world
+        .locy_result()
+        .expect("no evaluation result")
+        .as_ref()
+        .expect("evaluation failed");
+    let found = locy_result.compile_warnings().iter().any(|w| {
+        matches!(
+            w.code,
+            uni_locy::types::WarningCode::PositiveComplementCorrelation
+        )
+    });
+    assert!(
+        found,
+        "expected PositiveComplementCorrelation compile warning, got: {:?}",
+        locy_result
+            .compile_warnings()
+            .iter()
+            .map(|w| format!("{:?}", w.code))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[then(regex = r#"^the result should not contain a PositiveComplementCorrelation warning$"#)]
+async fn result_does_not_contain_positive_complement_correlation(world: &mut LocyWorld) {
+    let locy_result = world
+        .locy_result()
+        .expect("no evaluation result")
+        .as_ref()
+        .expect("evaluation failed");
+    let found = locy_result.compile_warnings().iter().any(|w| {
+        matches!(
+            w.code,
+            uni_locy::types::WarningCode::PositiveComplementCorrelation
+        )
+    });
+    assert!(
+        !found,
+        "expected no PositiveComplementCorrelation warning, got: {:?}",
+        locy_result
+            .compile_warnings()
+            .iter()
+            .filter(|w| matches!(
+                w.code,
+                uni_locy::types::WarningCode::PositiveComplementCorrelation
+            ))
+            .map(|w| w.message.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
 #[then(regex = r#"^classifier ['"](.+)['"] should have been called at most (\d+) times$"#)]
 async fn classifier_call_count_at_most(world: &mut LocyWorld, name: String, max_calls: usize) {
     let counter = world

@@ -126,6 +126,9 @@ pub fn check(
             // composes under independence-by-default — fires F2a /
             // F2b unless all involved models carry `@independent`.
             check_shared_neural_inputs(rule_name, def, model_catalog, &mut warnings);
+            // Phase D F3 case 3: rule body has both `IS p` and `IS NOT q`
+            // on the same subject — emits PositiveComplementCorrelation.
+            check_positive_complement_pair(rule_name, def, &mut warnings);
 
             // HAVING (post-FOLD WHERE) requires a FOLD clause.
             if !def.having.is_empty() && def.fold.is_empty() {
@@ -441,6 +444,51 @@ fn check_probability_domain_warning(
                          ensure values are valid probabilities for convergence",
                         func_name.to_uppercase(),
                         fold.name
+                    ),
+                    rule_name: rule_name.to_string(),
+                });
+            }
+        }
+    }
+}
+
+// ─── Phase D F3 case 3: positive + complement on same subject ──────────────
+
+fn check_positive_complement_pair(
+    rule_name: &str,
+    def: &RuleDefinition,
+    warnings: &mut Vec<CompilerWarning>,
+) {
+    // Index IS-refs by their first subject variable. The first subject
+    // is the canonical "head" — e.g. `s IS p` or `(s, t) IS p`.
+    let mut by_subject: HashMap<String, (Vec<String>, Vec<String>)> = HashMap::new();
+    for cond in &def.where_conditions {
+        if let RuleCondition::IsReference(is_ref) = cond
+            && let Some(subj) = is_ref.subjects.first()
+        {
+            let entry = by_subject.entry(subj.clone()).or_default();
+            let target = is_ref.rule_name.to_string();
+            if is_ref.negated {
+                entry.1.push(target);
+            } else {
+                entry.0.push(target);
+            }
+        }
+    }
+    for (subj, (positives, negateds)) in by_subject {
+        for p in &positives {
+            for q in &negateds {
+                if p == q {
+                    continue;
+                }
+                warnings.push(CompilerWarning {
+                    code: WarningCode::PositiveComplementCorrelation,
+                    message: format!(
+                        "rule '{rule_name}': WHERE {subj} IS {p}, {subj} IS NOT {q} — \
+                         positive and complement on the same subject correlate when \
+                         their support sets overlap (CrossGroupCorrelationNotExact). \
+                         Use BDD/TopKProofs for exact composition, or accept the \
+                         independence approximation.",
                     ),
                     rule_name: rule_name.to_string(),
                 });

@@ -268,6 +268,16 @@ pub enum WarningCode {
     /// overlap exists at runtime); a future refinement will gate
     /// on runtime support-set intersection.
     PositiveComplementCorrelation,
+    /// Phase D F3 case 2: a rule body has two or more positive
+    /// IS-refs to *different* PROB-bearing rules on the *same*
+    /// subject variable. The implicit `p AND q` conjunction
+    /// assumes independence between `p` and `q`, which is wrong
+    /// when the two rules share base facts. Structural
+    /// over-detection (the MVP fires whenever the pattern
+    /// matches, even if no actual support overlap exists at
+    /// runtime); a future refinement will gate on runtime
+    /// support-set intersection.
+    CrossPredicateCorrelation,
 }
 
 /// Probability semiring used to evaluate MNOR/MPROD aggregates, PROB

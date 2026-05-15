@@ -114,6 +114,16 @@ pub struct FoldExec {
     /// (Viterbi) is opt-in and produces fuzzy-truth values; callers up the
     /// stack also emit `FuzzyNotProbabilistic` on PROB-bearing rules.
     semiring_kind: SemiringKind,
+    /// Phase D D-C0: under `SemiringKind::TopKProofs`, MNOR aggregates use
+    /// DNF inclusion-exclusion over the row's support chain (lifted from
+    /// the provenance tracker) rather than independence-mode noisy-OR.
+    /// `None` for non-TopK semirings — keeps the byte-identical `f64`
+    /// path for AddMultProb / MaxMinProb.
+    provenance_tracker: Option<Arc<super::locy_explain::ProvenanceStore>>,
+    /// Phase D D-C0: top-k retention used for proof pruning. Mirrors the
+    /// fixpoint-loop config; passed through so per-group `TopKTag`
+    /// merges respect the same K as the in-loop accumulator.
+    top_k_proofs_k: usize,
     schema: SchemaRef,
     properties: PlanProperties,
     metrics: ExecutionPlanMetricsSet,
@@ -155,6 +165,32 @@ impl FoldExec {
         probability_epsilon: f64,
         semiring_kind: SemiringKind,
     ) -> Self {
+        Self::new_with_topk(
+            input,
+            key_indices,
+            fold_bindings,
+            strict_probability_domain,
+            probability_epsilon,
+            semiring_kind,
+            None,
+            0,
+        )
+    }
+
+    /// Phase D D-C0: variant that threads the provenance tracker and
+    /// `top_k_proofs` config so MNOR under `SemiringKind::TopKProofs`
+    /// can resolve each row's IS-ref support chain into a `Proof` and
+    /// aggregate via DNF inclusion-exclusion.
+    pub fn new_with_topk(
+        input: Arc<dyn ExecutionPlan>,
+        key_indices: Vec<usize>,
+        fold_bindings: Vec<FoldBinding>,
+        strict_probability_domain: bool,
+        probability_epsilon: f64,
+        semiring_kind: SemiringKind,
+        provenance_tracker: Option<Arc<super::locy_explain::ProvenanceStore>>,
+        top_k_proofs_k: usize,
+    ) -> Self {
         let input_schema = input.schema();
         let schema = Self::build_output_schema(&input_schema, &key_indices, &fold_bindings);
         let properties = compute_plan_properties(Arc::clone(&schema));
@@ -166,6 +202,8 @@ impl FoldExec {
             strict_probability_domain,
             probability_epsilon,
             semiring_kind,
+            provenance_tracker,
+            top_k_proofs_k,
             schema,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -256,13 +294,15 @@ impl ExecutionPlan for FoldExec {
                 "FoldExec requires exactly one child".to_string(),
             ));
         }
-        Ok(Arc::new(Self::new_with_semiring(
+        Ok(Arc::new(Self::new_with_topk(
             Arc::clone(&children[0]),
             self.key_indices.clone(),
             self.fold_bindings.clone(),
             self.strict_probability_domain,
             self.probability_epsilon,
             self.semiring_kind,
+            self.provenance_tracker.as_ref().map(Arc::clone),
+            self.top_k_proofs_k,
         )))
     }
 
@@ -278,6 +318,8 @@ impl ExecutionPlan for FoldExec {
         let strict = self.strict_probability_domain;
         let epsilon = self.probability_epsilon;
         let semiring_kind = self.semiring_kind;
+        let provenance_tracker = self.provenance_tracker.as_ref().map(Arc::clone);
+        let top_k_proofs_k = self.top_k_proofs_k;
         let output_schema = Arc::clone(&self.schema);
         let input_schema = self.input.schema();
 
@@ -355,6 +397,17 @@ impl ExecutionPlan for FoldExec {
                         ]))
                     }
                 };
+                let topk_ctx = if matches!(semiring_kind, SemiringKind::TopKProofs { .. })
+                    && let Some(tracker) = provenance_tracker.as_ref()
+                {
+                    Some(TopKFoldCtx {
+                        tracker,
+                        k: top_k_proofs_k,
+                        batch: &batch,
+                    })
+                } else {
+                    None
+                };
                 let agg_col = compute_fold_aggregate(
                     col.as_ref(),
                     &binding.kind,
@@ -366,6 +419,7 @@ impl ExecutionPlan for FoldExec {
                     strict,
                     epsilon,
                     semiring_kind,
+                    topk_ctx.as_ref(),
                 )?;
                 output_columns.push(agg_col);
             }
@@ -398,6 +452,16 @@ struct FoldGroups<'a> {
     num_groups: usize,
 }
 
+/// Phase D D-C0: per-call context for TopKProofs-aware aggregation.
+/// Carries the provenance tracker and the K config so MNOR / MPROD
+/// can resolve each row's support chain into a `Proof` and aggregate
+/// via DNF inclusion-exclusion.
+struct TopKFoldCtx<'a> {
+    tracker: &'a Arc<super::locy_explain::ProvenanceStore>,
+    k: usize,
+    batch: &'a RecordBatch,
+}
+
 fn compute_fold_aggregate(
     col: &dyn Array,
     kind: &FoldAggKind,
@@ -405,6 +469,7 @@ fn compute_fold_aggregate(
     strict: bool,
     probability_epsilon: f64,
     semiring_kind: SemiringKind,
+    topk_ctx: Option<&TopKFoldCtx<'_>>,
 ) -> DFResult<arrow_array::ArrayRef> {
     let ordered_keys = groups_ctx.ordered_keys;
     let groups = groups_ctx.groups;
@@ -466,8 +531,15 @@ fn compute_fold_aggregate(
             let mut builder = Float64Builder::with_capacity(num_groups);
             for key in ordered_keys {
                 let indices = &groups[key];
-                let v = match semiring_kind {
-                    SemiringKind::MaxMinProb => maxmin_disjunction_f64(col, indices, strict)?,
+                let v = match (semiring_kind, topk_ctx) {
+                    (SemiringKind::MaxMinProb, _) => maxmin_disjunction_f64(col, indices, strict)?,
+                    // Phase D D-C0: TopKProofs MNOR uses DNF inclusion-exclusion
+                    // over the rows' support chains when the tracker is
+                    // available. Falls through to independence-OR for
+                    // legacy / test paths that don't thread a tracker.
+                    (SemiringKind::TopKProofs { .. }, Some(ctx)) => {
+                        topk_dnf_disjunction(col, indices, strict, ctx)?
+                    }
                     _ => noisy_or_f64(col, indices, strict)?,
                 };
                 builder.append_option(v);
@@ -503,6 +575,113 @@ fn sum_f64(col: &dyn Array, indices: &[usize]) -> Option<f64> {
         }
     }
     if has_value { Some(sum) } else { None }
+}
+
+/// Phase D D-C0: TopKProofs MNOR via DNF inclusion-exclusion over the
+/// rows' support chains. Each row contributes one `Proof` whose
+/// weight is the row's MNOR-input value and whose `base_rvs` are
+/// interned from the row's IS-ref support (looked up via
+/// `ctx.tracker`). Proofs are merged via `merge_top_k_runtime` (so
+/// the K config is respected and `CrossedDependency` notices ride
+/// the side-channel). The per-group output is
+/// `TopKTag.to_dnf().weight(&base_weights)` — exact when no
+/// dependency overlap exists, exact under inclusion-exclusion when
+/// shared base facts appear across proofs.
+///
+/// Rows without tracker entries (e.g. base facts that haven't been
+/// recorded yet, or a fresh first-iteration run before
+/// `record_provenance`) fall back to an empty-support Proof — the
+/// math degrades to plain f64 noisy-OR (independence-mode) for
+/// those rows.
+fn topk_dnf_disjunction(
+    col: &dyn Array,
+    indices: &[usize],
+    strict: bool,
+    ctx: &TopKFoldCtx<'_>,
+) -> DFResult<Option<f64>> {
+    use uni_locy::{BaseRv, BaseRvSet, Proof};
+
+    let batch = ctx.batch;
+    let all_indices: Vec<usize> = (0..batch.num_columns()).collect();
+    let mut interner: HashMap<Vec<u8>, BaseRv> = HashMap::new();
+    let mut next_rv: u32 = 0;
+    let mut base_weights: HashMap<BaseRv, f64> = HashMap::new();
+    let mut proofs: Vec<Proof> = Vec::with_capacity(indices.len());
+
+    for &i in indices {
+        if col.is_null(i) {
+            continue;
+        }
+        // Row's MNOR-input value (e.g. an IS-ref edge probability).
+        let val = match col.as_any().downcast_ref::<arrow_array::Float64Array>() {
+            Some(arr) => arr.value(i),
+            None => match col.as_any().downcast_ref::<arrow_array::Int64Array>() {
+                Some(arr) => arr.value(i) as f64,
+                None => continue,
+            },
+        };
+        if strict && !(0.0..=1.0).contains(&val) {
+            return Err(datafusion::error::DataFusionError::Execution(format!(
+                "strict_probability_domain: MNOR input {val} outside [0,1] under TopKProofs"
+            )));
+        }
+        let weight = val.clamp(0.0, 1.0);
+
+        // Resolve row's IS-ref support via tracker; intern base facts into BaseRvs.
+        let fact_hash = super::locy_fixpoint::fact_hash_key(batch, &all_indices, i);
+        let mut base_rvs = BaseRvSet::empty();
+        if let Some(entry) = ctx.tracker.lookup(&fact_hash) {
+            for term in &entry.support {
+                let rv = *interner
+                    .entry(term.base_fact_id.clone())
+                    .or_insert_with(|| {
+                        let r = BaseRv(next_rv);
+                        next_rv += 1;
+                        r
+                    });
+                base_rvs.insert(rv);
+            }
+        }
+        // Single-row Proof. Base weights for the DNF: assign the row's
+        // weight to each base RV under it (when no support exists,
+        // base_rvs is empty and the proof's weight stands alone).
+        if base_rvs.iter().count() > 0 {
+            for rv in base_rvs.iter() {
+                base_weights.entry(rv).or_insert(weight);
+            }
+        }
+        proofs.push(Proof {
+            weight,
+            base_rvs,
+            neural_calls: Vec::new(),
+        });
+    }
+    if proofs.is_empty() {
+        return Ok(None);
+    }
+    // When NO proof carries base_rvs (no IS-ref support visible —
+    // the rule's MNOR runs over plain columns, not derived facts),
+    // fall back to independence-mode noisy-OR. Going through
+    // `merge_top_k` here is wrong: it dedupes by dependency_key,
+    // collapsing all empty-base_rvs proofs into one max-weight
+    // proof. Plain noisy-OR over each row's weight preserves the
+    // pre-D-C0 AddMultProb behavior byte-identically.
+    if base_weights.is_empty() {
+        let mut complement = 1.0;
+        for p in &proofs {
+            complement *= 1.0 - p.weight;
+        }
+        return Ok(Some((1.0 - complement).clamp(0.0, 1.0)));
+    }
+    // At least one proof carries base_rvs — DNF inclusion-exclusion
+    // is meaningful. Merge top-K (which dedupes by dependency_key
+    // intentionally — shared bases ARE the same dependency) and
+    // compute exact (or top-K-approximated) probability via the
+    // DNF.
+    let k = if ctx.k == 0 { proofs.len() } else { ctx.k };
+    let (kept, _notice) = uni_locy::merge_top_k_runtime(Vec::new(), proofs, k);
+    let tag = uni_locy::TopKTag { proofs: kept };
+    Ok(Some(tag.to_dnf().weight(&base_weights)))
 }
 
 /// Noisy-OR: P = 1 − ∏(1 − pᵢ). Inputs clamped to [0, 1] unless strict.

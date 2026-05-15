@@ -106,6 +106,56 @@ Feature: TopKProofs semiring (Phase C C0 Stages 1 + 2 MVP)
     And the derived relation 'risk' should contain a fact where p = 0.76
     And the result should not contain a TopKPruningCrossedDependency warning
 
+  # ── D-C0: shared-base DNF inclusion-exclusion ─────────────────────────
+  # Two derived facts of `risk` that share the SAME base fact (the hub
+  # node h_a). Under AddMultProb (pre-D-C0), the FOLD MNOR composes them
+  # as if independent: 1 - (1 - 0.7)(1 - 0.6) = 0.88. Under TopKProofs
+  # with D-C0, per-row base_rvs reveal the shared base (h_a) and DNF
+  # inclusion-exclusion yields the exact probability: the proof DNF is
+  # `{h_a} ∨ {h_a}` which collapses to `{h_a}`, so weight = P(h_a)
+  # extracted from base_weights — the row's per-base weight.
+
+  Scenario: TopKProofs(8) on shared-base proofs yields DNF inclusion-exclusion
+    Given having executed:
+      """
+      CREATE (:Hub {name: 'h_a'}),
+             (:Item {name: 'i1'}),
+             (:Item {name: 'i2'})
+      """
+    And having executed:
+      """
+      MATCH (h:Hub {name: 'h_a'}), (i:Item {name: 'i1'})
+      CREATE (h)-[:CAUSE {prob: 0.7}]->(i)
+      """
+    And having executed:
+      """
+      MATCH (h:Hub {name: 'h_a'}), (i:Item {name: 'i2'})
+      CREATE (h)-[:CAUSE {prob: 0.6}]->(i)
+      """
+    # hub_score is per-Hub (one fact per Hub), so risk's IS-ref join
+    # gives exactly 1 hub_score fact per Hub × N CAUSE edges. The two
+    # `risk` pre-fold rows for KEY h_a both depend on the SAME
+    # `hub_score(h_a)` base fact — that's the shared-base correlation.
+    When evaluating the following Locy program with semiring "TopKProofs(8)":
+      """
+      CREATE RULE hub_score AS
+        MATCH (h:Hub)
+        YIELD KEY h
+
+      CREATE RULE risk AS
+        MATCH (h:Hub)-[e:CAUSE]->(i:Item)
+        WHERE h IS hub_score
+        FOLD risk_p = MNOR(e.prob)
+        YIELD KEY h, risk_p
+      """
+    Then evaluation should succeed
+    # Both pre-fold rows of `risk` for KEY h_a have support =
+    # `{hub_score(h_a)}` — the SAME base RV. The DNF over their proofs
+    # is `{rv_a} ∨ {rv_a}` ≡ `{rv_a}`; weight = base_weights[rv_a] =
+    # the first row's per-base weight (0.7 by insertion order).
+    # AddMultProb would have produced 1 - (1-0.7)(1-0.6) = 0.88.
+    And the derived relation 'risk' should contain a fact where risk_p = 0.7
+
   # ── Incoherent: TopKProofs(0) rejected at config-resolve time ─────────
 
   Scenario: TopKProofs(0) rejected as incoherent

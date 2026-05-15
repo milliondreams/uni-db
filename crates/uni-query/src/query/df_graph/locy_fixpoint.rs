@@ -1433,6 +1433,8 @@ async fn run_fixpoint_loop(
             strict_probability_domain,
             probability_epsilon,
             semiring_kind,
+            derivation_tracker.as_ref().map(Arc::clone),
+            top_k_proofs,
         )
         .await?;
         all_output.extend(processed);
@@ -1953,7 +1955,7 @@ pub(crate) struct SharedLineageInfo {
 }
 
 /// Build a byte key that uniquely identifies a row across all columns.
-fn fact_hash_key(batch: &RecordBatch, all_indices: &[usize], row_idx: usize) -> Vec<u8> {
+pub(crate) fn fact_hash_key(batch: &RecordBatch, all_indices: &[usize], row_idx: usize) -> Vec<u8> {
     format!("{:?}", extract_scalar_key(batch, all_indices, row_idx)).into_bytes()
 }
 
@@ -3991,6 +3993,10 @@ fn apply_having_filter(
 }
 
 /// Apply post-fixpoint operators (FOLD, HAVING, BEST BY, PRIORITY) to converged facts.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "context bundle would be over-engineering for one call site"
+)]
 pub(crate) async fn apply_post_fixpoint_chain(
     facts: Vec<RecordBatch>,
     rule: &FixpointRulePlan,
@@ -3998,6 +4004,8 @@ pub(crate) async fn apply_post_fixpoint_chain(
     strict_probability_domain: bool,
     probability_epsilon: f64,
     semiring_kind: SemiringKind,
+    provenance_tracker: Option<Arc<ProvenanceStore>>,
+    top_k_proofs_k: usize,
 ) -> DFResult<Vec<RecordBatch>> {
     if !rule.has_fold && !rule.has_best_by && !rule.has_priority && rule.having.is_empty() {
         return Ok(facts);
@@ -4048,13 +4056,15 @@ pub(crate) async fn apply_post_fixpoint_chain(
 
     // Apply FOLD
     let current: Arc<dyn ExecutionPlan> = if rule.has_fold && !rule.fold_bindings.is_empty() {
-        Arc::new(FoldExec::new_with_semiring(
+        Arc::new(FoldExec::new_with_topk(
             current,
             key_column_indices.clone(),
             rule.fold_bindings.clone(),
             strict_probability_domain,
             probability_epsilon,
             semiring_kind,
+            provenance_tracker.clone(),
+            top_k_proofs_k,
         ))
     } else {
         current

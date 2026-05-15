@@ -1147,6 +1147,8 @@ async fn run_program(
                     strict_probability_domain,
                     probability_epsilon,
                     semiring_kind,
+                    derivation_tracker.as_ref().map(Arc::clone),
+                    top_k_proofs,
                 )
                 .await?;
 

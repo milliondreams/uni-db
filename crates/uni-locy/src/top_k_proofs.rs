@@ -241,17 +241,29 @@ impl<const K: usize> LocySemiring for TopKProofs<K> {
         TopKTag { proofs }
     }
 
-    fn negate(&self, _a: &TopKTag) -> Result<TopKTag, SemiringError> {
-        // Complement under TopKProofs requires inverting the DNF, which
-        // doesn't fit in the top-K tag form: 1 − (A ∨ B ∨ C) is
-        // ¬A ∧ ¬B ∧ ¬C — a single conjunction over base RV
-        // *complements*, not over base RVs directly. Library users who
-        // need PROB complement under `TopKProofs` should compute
-        // `1 − weight(tag)` at the f64 layer instead. Stage 2 (runtime
-        // tag flow) will document this as a tag-layer non-operation.
-        Err(SemiringError::NotSupported {
-            op: "negate",
-            kind: SemiringKind::TopKProofs { k: K as u32 },
+    fn negate(&self, a: &TopKTag) -> Result<TopKTag, SemiringError> {
+        // Phase D D-C0c: complement under TopKProofs would naturally
+        // invert the DNF — `¬(A ∨ B ∨ C) = ¬A ∧ ¬B ∧ ¬C` — which is a
+        // single conjunction over base-RV *complements*, not a
+        // disjunction-of-conjunctions. That doesn't fit the
+        // row-at-a-time `Vec<Proof>` shape.
+        //
+        // The pragmatic resolution: collapse to a **degenerate tag** —
+        // a singleton proof with weight `1 − weight(a)` and no base
+        // RVs / neural calls. Downstream operations on the negated
+        // tag fall back to independence-mode math (no dependency
+        // structure to preserve). Library callers that need exact
+        // dependency-aware complement should compute at the f64
+        // layer; this trait impl keeps the surface uniform with
+        // AddMultProb / MaxMinProb's `negate` returning a valid Tag.
+        let w = self.weight(a);
+        let complement = (1.0 - w).clamp(0.0, 1.0);
+        Ok(TopKTag {
+            proofs: vec![Proof {
+                weight: complement,
+                base_rvs: BaseRvSet::empty(),
+                neural_calls: Vec::new(),
+            }],
         })
     }
 
@@ -430,14 +442,30 @@ mod tests {
     }
 
     #[test]
-    fn negate_returns_not_supported() {
+    fn negate_collapses_to_degenerate_tag() {
+        // Phase D D-C0c: negate(tag) returns a degenerate tag with a
+        // singleton proof whose weight is `1 - weight(tag)`. Loses
+        // dependency structure — that's documented and intentional.
         let sr = TopKProofs::<4>;
         let t = TopKTag::from_proofs(vec![proof(0.5, &[1])]);
-        let err = sr.negate(&t).unwrap_err();
-        assert!(matches!(
-            err,
-            SemiringError::NotSupported { op: "negate", .. }
-        ));
+        // weight(t) under independence-mode noisy-OR over the proofs
+        // is 1 - (1 - 0.5) = 0.5; complement should be 0.5.
+        let neg = sr.negate(&t).unwrap();
+        assert_eq!(neg.proofs.len(), 1);
+        assert!((neg.proofs[0].weight - 0.5).abs() < 1e-12);
+        assert_eq!(neg.proofs[0].base_rvs.iter().count(), 0);
+        assert!(neg.proofs[0].neural_calls.is_empty());
+    }
+
+    #[test]
+    fn negate_of_two_independent_proofs() {
+        // weight(tag) = 1 - (1-0.7)*(1-0.5) = 1 - 0.15 = 0.85
+        // complement = 0.15
+        let sr = TopKProofs::<4>;
+        let t = TopKTag::from_proofs(vec![proof(0.7, &[1]), proof(0.5, &[2])]);
+        let neg = sr.negate(&t).unwrap();
+        assert_eq!(neg.proofs.len(), 1);
+        assert!((neg.proofs[0].weight - 0.15).abs() < 1e-12);
     }
 
     #[test]

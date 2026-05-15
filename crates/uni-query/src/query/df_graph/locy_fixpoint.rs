@@ -1435,6 +1435,7 @@ async fn run_fixpoint_loop(
             semiring_kind,
             derivation_tracker.as_ref().map(Arc::clone),
             top_k_proofs,
+            Some(Arc::clone(&registry)),
         )
         .await?;
         all_output.extend(processed);
@@ -1947,6 +1948,41 @@ fn collect_is_ref_inputs(
     }
 
     inputs
+}
+
+/// Phase D D-C0: per-body-row variant of [`collect_is_ref_inputs`] used
+/// to pre-populate `FoldExec`'s `body_support_map` for TopKProofs MNOR.
+///
+/// At FOLD time, the rule's own facts haven't been recorded in the
+/// `ProvenanceStore` yet (`record_provenance` runs after fact
+/// materialization, and is keyed by post-YIELD hashes anyway), so the
+/// support set for each pre-fold body row must be reconstructed
+/// directly from the rule's IS-ref bindings + the source rules'
+/// registry data.
+///
+/// We don't know which clause produced each body row at this point —
+/// the iteration-local `clause_candidates` are gone — so we iterate
+/// **every** clause's `is_ref_bindings`. The `provenance_join_cols`
+/// schema check inside `collect_is_ref_inputs` already skips bindings
+/// whose body columns aren't in the row's schema, so cross-clause
+/// contamination is bounded (a binding only matches if its body cols
+/// are present and the values join). For the single-clause TopKProofs
+/// scenarios in TCK this is exact; for multi-clause TopKProofs rules
+/// it is a conservative over-approximation that may inflate base-RV
+/// counts (treated as the same RV under interning) — acceptable
+/// because the DNF math collapses duplicates by inclusion-exclusion.
+fn collect_is_ref_inputs_for_body_row(
+    rule: &FixpointRulePlan,
+    delta_batch: &RecordBatch,
+    row_idx: usize,
+    registry: &Arc<DerivedScanRegistry>,
+) -> Vec<ProofTerm> {
+    let mut combined: Vec<ProofTerm> = Vec::new();
+    for clause_index in 0..rule.clauses.len() {
+        let part = collect_is_ref_inputs(rule, clause_index, delta_batch, row_idx, registry);
+        combined.extend(part);
+    }
+    combined
 }
 
 // ---------------------------------------------------------------------------
@@ -4740,6 +4776,7 @@ pub(crate) async fn apply_post_fixpoint_chain(
     semiring_kind: SemiringKind,
     provenance_tracker: Option<Arc<ProvenanceStore>>,
     top_k_proofs_k: usize,
+    registry: Option<Arc<DerivedScanRegistry>>,
 ) -> DFResult<Vec<RecordBatch>> {
     if !rule.has_fold && !rule.has_best_by && !rule.has_priority && rule.having.is_empty() {
         return Ok(facts);
@@ -4754,6 +4791,49 @@ pub(crate) async fn apply_post_fixpoint_chain(
         .find(|b| b.num_rows() > 0)
         .map(|b| b.schema())
         .unwrap_or_else(|| Arc::clone(&rule.yield_schema));
+
+    // Phase D D-C0: pre-compute body-row → IS-ref support map for
+    // TopKProofs MNOR's DNF inclusion-exclusion math. Must be built
+    // here because `facts` is moved into `InMemoryExec` on the next
+    // line. The map is keyed by a full-column row hash — only
+    // meaningful when no downstream plan node strips/adds columns
+    // between this batch view and the FoldExec input. PRIORITY drops
+    // the `__priority` column, which would change row hashes; until
+    // we plumb the map past PRIORITY, skip map construction for
+    // PRIORITY rules (the failing TCK test doesn't use PRIORITY).
+    // Read the active K from `semiring_kind` rather than the separate
+    // `top_k_proofs_k` parameter — the latter is not always threaded
+    // from the LocyProgram config (the semiring's `k` is the source of
+    // truth).
+    let topk_k: Option<usize> = match semiring_kind {
+        SemiringKind::TopKProofs { k } if k > 0 => Some(k as usize),
+        _ => None,
+    };
+    let body_support_map: Option<Arc<HashMap<Vec<u8>, Vec<ProofTerm>>>> = if topk_k.is_some()
+        && !rule.has_priority
+        && let Some(registry) = registry.as_ref()
+    {
+        let mut map: HashMap<Vec<u8>, Vec<ProofTerm>> = HashMap::new();
+        for batch in &facts {
+            let all_indices: Vec<usize> = (0..batch.num_columns()).collect();
+            for row_idx in 0..batch.num_rows() {
+                let support = collect_is_ref_inputs_for_body_row(rule, batch, row_idx, registry);
+                if support.is_empty() {
+                    continue;
+                }
+                let hash = fact_hash_key(batch, &all_indices, row_idx);
+                map.insert(hash, support);
+            }
+        }
+        if map.is_empty() {
+            None
+        } else {
+            Some(Arc::new(map))
+        }
+    } else {
+        None
+    };
+
     let input: Arc<dyn ExecutionPlan> = Arc::new(InMemoryExec::new(facts, schema.clone()));
 
     // Reconcile key indices: rule's indices are yield-schema positions but
@@ -4798,7 +4878,8 @@ pub(crate) async fn apply_post_fixpoint_chain(
             probability_epsilon,
             semiring_kind,
             provenance_tracker.clone(),
-            top_k_proofs_k,
+            topk_k.unwrap_or(top_k_proofs_k),
+            body_support_map.clone(),
         ))
     } else {
         current
@@ -4971,7 +5052,7 @@ impl FixpointExec {
 
     /// Variant accepting an explicit [`SemiringKind`]. Empty classifier
     /// registry; for the full variant call
-    /// [`new_with_semiring_and_classifiers`].
+    /// [`FixpointExec::new_with_semiring_and_classifiers`].
     #[expect(
         clippy::too_many_arguments,
         reason = "FixpointExec configuration needs all context"

@@ -82,6 +82,7 @@ pub fn compile_models(
                     output_type: model_def.output.output_type,
                     output_name: model_def.output.name.clone(),
                     xervo_alias: model_def.xervo_alias.clone(),
+                    embedder_alias: model_def.embedder_alias.clone(),
                     calibration: model_def.calibration,
                     version: model_def.version.clone(),
                     annotations: model_def.annotations.clone(),

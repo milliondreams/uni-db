@@ -34,6 +34,10 @@ pub struct CompiledModel {
     pub output_type: uni_cypher::locy_ast::OutputType,
     pub output_name: String,
     pub xervo_alias: String,
+    /// Phase D D2 follow-up: optional embedder alias surfaced via
+    /// `USING xervo('classify/X', embedder='alias')`. When `None`,
+    /// `semantic_match` query-text embedding falls back to `"default"`.
+    pub embedder_alias: Option<String>,
     pub calibration: Option<uni_cypher::locy_ast::CalibrationMethod>,
     pub version: Option<String>,
     pub annotations: uni_cypher::locy_ast::ModelAnnotations,
@@ -194,6 +198,11 @@ pub struct ModelInvocation {
     /// the named column from the source rule's derived facts at
     /// classify time without re-consulting the model catalog.
     pub path_context: Option<uni_cypher::locy_ast::PathContextFeature>,
+    /// Phase D D2 follow-up: optional embedder alias from the model's
+    /// `USING xervo('classify/X', embedder='alias')` clause. When
+    /// `None`, the runtime falls back to alias `"default"` for
+    /// `semantic_match` query-text embedding.
+    pub embedder_alias: Option<String>,
 }
 
 /// A column in a rule's YIELD schema.

@@ -1272,6 +1272,7 @@ async fn run_program(
                     output_type: uni_cypher::locy_ast::OutputType::Prob,
                     output_name: String::new(),
                     xervo_alias: String::new(),
+                    embedder_alias: None,
                     calibration: None,
                     version: None,
                     annotations: Default::default(),

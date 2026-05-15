@@ -751,18 +751,54 @@ fn check_shared_neural_inputs(
         return;
     }
     // Collect (model_name, feature_expr) pairs from every model
-    // invocation in this rule's YIELD items.
-    let RuleOutput::Yield(yc) = &def.output else {
-        return;
-    };
+    // invocation in this rule. F3-AlongFoldExtract: walk YIELD, ALONG,
+    // and FOLD positions. ALONG carries a `LocyExpr` (Cypher + prev
+    // refs); FOLD carries an `Expr` (the aggregate, e.g. `MNOR(scorer(s))`).
     let mut invocations: Vec<(&str, &Vec<Expr>)> = Vec::new();
-    for item in &yc.items {
-        if let Expr::FunctionCall { name, args, .. } = &item.expr
-            && let Some(model) = model_catalog.get(name)
-            && args.len() == model.inputs.len()
-        {
-            invocations.push((name.as_str(), args));
+    fn collect_from_cypher_expr<'a>(
+        expr: &'a Expr,
+        model_catalog: &HashMap<String, CompiledModel>,
+        out: &mut Vec<(&'a str, &'a Vec<Expr>)>,
+    ) {
+        if let Expr::FunctionCall { name, args, .. } = expr {
+            if let Some(model) = model_catalog.get(name)
+                && args.len() == model.inputs.len()
+            {
+                out.push((name.as_str(), args));
+            }
+            // Recurse into args (composed model calls inside
+            // aggregates like `MNOR(scorer(s))`).
+            for a in args {
+                collect_from_cypher_expr(a, model_catalog, out);
+            }
         }
+    }
+    fn collect_from_locy_expr<'a>(
+        lexpr: &'a uni_cypher::locy_ast::LocyExpr,
+        model_catalog: &HashMap<String, CompiledModel>,
+        out: &mut Vec<(&'a str, &'a Vec<Expr>)>,
+    ) {
+        use uni_cypher::locy_ast::LocyExpr;
+        match lexpr {
+            LocyExpr::Cypher(e) => collect_from_cypher_expr(e, model_catalog, out),
+            LocyExpr::BinaryOp { left, right, .. } => {
+                collect_from_locy_expr(left, model_catalog, out);
+                collect_from_locy_expr(right, model_catalog, out);
+            }
+            LocyExpr::UnaryOp(_, inner) => collect_from_locy_expr(inner, model_catalog, out),
+            LocyExpr::PrevRef(_) => {}
+        }
+    }
+    if let RuleOutput::Yield(yc) = &def.output {
+        for item in &yc.items {
+            collect_from_cypher_expr(&item.expr, model_catalog, &mut invocations);
+        }
+    }
+    for along in &def.along {
+        collect_from_locy_expr(&along.expr, model_catalog, &mut invocations);
+    }
+    for fold in &def.fold {
+        collect_from_cypher_expr(&fold.aggregate, model_catalog, &mut invocations);
     }
     if invocations.len() < 2 {
         return;
@@ -1031,15 +1067,17 @@ impl<'a> InvocationLifter<'a> {
                 ) =>
                 {
                     // Phase D D1 graph-structural: one-hop neighborhood
-                    // aggregators. Three args: subject Variable, then
-                    // string literals for rel-type and property name.
-                    // Direction defaults to OUTGOING for MVP.
-                    if fargs.len() != 3 {
+                    // aggregators. Args: subject Variable, rel-type
+                    // string literal, property string literal, and an
+                    // optional 4th direction string literal
+                    // ('OUTGOING' | 'INCOMING' | 'BOTH'; default
+                    // 'OUTGOING').
+                    if fargs.len() != 3 && fargs.len() != 4 {
                         return Err(LocyCompileError::UnsupportedFeatureExpression {
                             rule: self.rule_name.to_string(),
                             model: model_name.to_string(),
                             expr: format!(
-                                "{}(...) requires exactly 3 arguments (subject, 'REL_TYPE', 'property'), got {}",
+                                "{}(...) requires 3 or 4 arguments (subject, 'REL_TYPE', 'property' [, 'OUTGOING' | 'INCOMING' | 'BOTH']), got {}",
                                 name,
                                 fargs.len()
                             ),
@@ -1075,13 +1113,35 @@ impl<'a> InvocationLifter<'a> {
                             });
                         }
                     }
+                    // If a direction was supplied, validate its value.
+                    if let Some(Expr::Literal(uni_cypher::ast::CypherLiteral::String(dir))) =
+                        fargs.get(3)
+                    {
+                        let upper = dir.to_uppercase();
+                        if !matches!(upper.as_str(), "OUTGOING" | "INCOMING" | "BOTH") {
+                            return Err(LocyCompileError::UnsupportedFeatureExpression {
+                                rule: self.rule_name.to_string(),
+                                model: model_name.to_string(),
+                                expr: format!(
+                                    "{}(...) 4th argument (direction) must be 'OUTGOING', 'INCOMING', or 'BOTH'; got '{dir}'",
+                                    name
+                                ),
+                            });
+                        }
+                    }
                     rewritten.push(fexpr.clone());
                 }
                 Expr::FunctionCall {
                     name, args: fargs, ..
                 } if matches!(
                     name.as_str(),
-                    "degree_centrality" | "pagerank_score" | "closeness_centrality"
+                    "degree_centrality"
+                        | "pagerank_score"
+                        | "closeness_centrality"
+                        | "betweenness_centrality"
+                        | "eigenvector_centrality"
+                        | "harmonic_centrality"
+                        | "katz_centrality"
                 ) =>
                 {
                     // Phase D D1 graph-structural: single-arg topology
@@ -1226,6 +1286,7 @@ impl<'a> InvocationLifter<'a> {
                     yield_alias: None,
                     original_feature_exprs,
                     path_context: model.path_context.clone(),
+                    embedder_alias: model.embedder_alias.clone(),
                 });
                 let _ = (distinct, window_spec);
                 Ok(Expr::Variable(synthetic))

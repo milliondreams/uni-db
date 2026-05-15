@@ -1848,6 +1848,10 @@ fn eval_feature_expr_against_fact_row(
                 "degree_centrality"
                     | "pagerank_score"
                     | "closeness_centrality"
+                    | "betweenness_centrality"
+                    | "eigenvector_centrality"
+                    | "harmonic_centrality"
+                    | "katz_centrality"
                     | "avg_neighbor"
                     | "max_neighbor"
                     | "sum_neighbor"
@@ -2744,8 +2748,33 @@ pub(crate) async fn apply_model_invocations(
                 miss_inputs = inputs.clone();
             }
 
-            let miss_probs = if miss_inputs.is_empty() {
-                Vec::new()
+            // Phase C C-RawCalibratedSeparation: when a calibrator is
+            // present, route through `raw_and_calibrated` so the
+            // provenance store records both the base classifier's raw
+            // output AND the post-calibrator value. Bare classifiers
+            // (no calibrator) keep using `classify`. The downstream
+            // `probs[row]` is always the *calibrated* value when
+            // available — that's what the rule's PROB output column
+            // and the memoization cache carry.
+            let calibrator = classifier.get_calibrator();
+            let (miss_raws, miss_calibrated) = if miss_inputs.is_empty() {
+                (Vec::new(), Vec::new())
+            } else if calibrator.is_some() {
+                let pairs = classifier
+                    .raw_and_calibrated(&miss_inputs)
+                    .await
+                    .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+                if pairs.len() != miss_inputs.len() {
+                    return Err(datafusion::error::DataFusionError::Execution(format!(
+                        "classifier '{}' raw_and_calibrated returned {} outputs for {} inputs",
+                        invocation.model_name,
+                        pairs.len(),
+                        miss_inputs.len()
+                    )));
+                }
+                let raws: Vec<f64> = pairs.iter().map(|(r, _)| *r).collect();
+                let cals: Vec<f64> = pairs.iter().map(|(r, c)| c.unwrap_or(*r)).collect();
+                (raws, cals)
             } else {
                 let r = classifier
                     .classify(&miss_inputs)
@@ -2759,38 +2788,71 @@ pub(crate) async fn apply_model_invocations(
                         miss_inputs.len()
                     )));
                 }
-                r
+                // No calibrator → raw == final.
+                (r.clone(), r)
             };
+            // The memoization cache stores the *final* (calibrated when
+            // available) value, matching what downstream rules consume.
+            // Track per-miss raws alongside so the provenance store
+            // sees both. For cache hits, we don't have raws — the
+            // provenance record for that row gets None for `raw` and
+            // the cached value as `calibrated` (the only thing we
+            // remembered). Future slice can extend the cache to carry
+            // both; current behavior matches pre-fix correctness for
+            // EXPLAIN of cache hits.
+            let mut row_raw: Vec<Option<f64>> = vec![None; n_rows];
             for (i, &row_idx) in miss_row_indices.iter().enumerate() {
-                probs[row_idx] = miss_probs[i];
+                probs[row_idx] = miss_calibrated[i];
+                row_raw[row_idx] = Some(miss_raws[i]);
                 if let Some(c) = cache {
-                    c.insert(&invocation.model_name, input_hashes[row_idx], miss_probs[i]);
+                    c.insert(
+                        &invocation.model_name,
+                        input_hashes[row_idx],
+                        miss_calibrated[i],
+                    );
                 }
             }
 
             // Phase C B1-B3 follow-up: when a provenance store is
             // configured, record (raw, calibrated, confidence_band)
-            // per row. For a wrapped `CalibratedClassifier`, `probs`
-            // are already calibrated (since `classify()` returns
-            // post-calibration values); the raw view is surfaced as
-            // the same value with `calibrated_probability` set to
-            // signal "post-calibrator". The full raw/calibrated
-            // separation requires `NeuralClassifier::raw_and_calibrated`
-            // which is a follow-up. The confidence_band comes from
-            // the active Calibrator's `confidence_band(p)`.
+            // per row. With C-RawCalibratedSeparation (above),
+            // `row_raw[i]` carries the *pre-calibrator* value when we
+            // computed it on this call; `probs[i]` is the
+            // post-calibrator value. `confidence_band` comes from the
+            // active Calibrator's `confidence_band(p)`.
             if let Some(store) = provenance_store {
-                let cal = classifier.get_calibrator();
                 for row_idx in 0..n_rows {
-                    let value = probs[row_idx];
-                    let calibrated = cal.as_ref().map(|_| value);
-                    let band = cal.as_ref().and_then(|c| c.confidence_band(value));
+                    let calibrated_value = probs[row_idx];
+                    let (raw_value, calibrated) = match (row_raw[row_idx], &calibrator) {
+                        (Some(raw), Some(_)) => (raw, Some(calibrated_value)),
+                        (Some(raw), None) => (raw, None),
+                        // Cache hit: we only have the calibrated value.
+                        // Report it as raw with `calibrated == raw` to
+                        // preserve telemetry shape; document this in
+                        // the field doc.
+                        (None, _) => (
+                            calibrated_value,
+                            calibrator.as_ref().map(|_| calibrated_value),
+                        ),
+                    };
+                    let band = calibrator
+                        .as_ref()
+                        .and_then(|c| c.confidence_band(calibrated_value));
                     store.record(
                         &invocation.model_name,
                         input_hashes[row_idx],
                         uni_locy::NeuralProvenanceRecord {
-                            raw_probability: value,
+                            raw_probability: raw_value,
                             calibrated_probability: calibrated,
                             confidence_band: band,
+                            // Phase 12 EXPLAIN follow-up: stash the
+                            // per-binding `FeatureValue` map that fed
+                            // the classifier so Mode B re-evaluation
+                            // can surface graph-structural feature
+                            // values without re-precomputing topology
+                            // or neighbor maps (the hot-path data is
+                            // authoritative).
+                            feature_inputs: inputs[row_idx].features.clone(),
                         },
                     );
                 }
@@ -2886,6 +2948,27 @@ enum NeighborAgg {
     Avg,
     Max,
     Sum,
+}
+
+/// Direction for one-hop neighborhood traversal. Mirrors
+/// `uni_store::storage::direction::Direction` but is independent so
+/// the typecheck / planner layer doesn't depend on uni-store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum NeighborDirection {
+    Outgoing,
+    Incoming,
+    Both,
+}
+
+impl NeighborDirection {
+    fn store_directions(self) -> &'static [uni_store::storage::direction::Direction] {
+        use uni_store::storage::direction::Direction;
+        match self {
+            NeighborDirection::Outgoing => &[Direction::Outgoing],
+            NeighborDirection::Incoming => &[Direction::Incoming],
+            NeighborDirection::Both => &[Direction::Outgoing, Direction::Incoming],
+        }
+    }
 }
 
 impl NeighborAgg {
@@ -3194,7 +3277,13 @@ fn build_feature_resolvers(
             Expr::FunctionCall { name, args, .. }
                 if matches!(
                     name.as_str(),
-                    "degree_centrality" | "pagerank_score" | "closeness_centrality"
+                    "degree_centrality"
+                        | "pagerank_score"
+                        | "closeness_centrality"
+                        | "betweenness_centrality"
+                        | "eigenvector_centrality"
+                        | "harmonic_centrality"
+                        | "katz_centrality"
                 ) =>
             {
                 if args.len() != 1 {
@@ -3239,9 +3328,9 @@ fn build_feature_resolvers(
                     "avg_neighbor" | "max_neighbor" | "sum_neighbor"
                 ) =>
             {
-                if args.len() != 3 {
+                if args.len() != 3 && args.len() != 4 {
                     return Err(datafusion::error::DataFusionError::Execution(format!(
-                        "{name} expects 3 args, got {}",
+                        "{name} expects 3 or 4 args, got {}",
                         args.len()
                     )));
                 }
@@ -3267,6 +3356,28 @@ fn build_feature_resolvers(
                         )));
                     }
                 };
+                let direction_arg = match args.get(3) {
+                    None => NeighborDirection::Outgoing,
+                    Some(Expr::Literal(uni_cypher::ast::CypherLiteral::String(d))) => {
+                        match d.to_uppercase().as_str() {
+                            "OUTGOING" => NeighborDirection::Outgoing,
+                            "INCOMING" => NeighborDirection::Incoming,
+                            "BOTH" => NeighborDirection::Both,
+                            other => {
+                                return Err(datafusion::error::DataFusionError::Execution(
+                                    format!(
+                                        "{name}: direction must be OUTGOING|INCOMING|BOTH, got '{other}'"
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                    Some(other) => {
+                        return Err(datafusion::error::DataFusionError::Execution(format!(
+                            "{name}: 4th arg must be a string literal (direction), got {other:?}"
+                        )));
+                    }
+                };
                 let subject_col = {
                     let direct = schema.index_of(v).ok();
                     let vid_name = format!("{}._vid", v);
@@ -3278,11 +3389,11 @@ fn build_feature_resolvers(
                     })?
                 };
                 let vid_to_values = neighbor_feature_maps
-                    .get(&(rel_type.clone(), prop_name.clone()))
+                    .get(&(rel_type.clone(), prop_name.clone(), direction_arg))
                     .cloned()
                     .ok_or_else(|| {
                         datafusion::error::DataFusionError::Execution(format!(
-                            "{name}: pre-computed neighbor map missing for ({rel_type}, {prop_name}). \
+                            "{name}: pre-computed neighbor map missing for ({rel_type}, {prop_name}, {direction_arg:?}). \
                              This is a bug — `apply_model_invocations` should have called \
                              `precompute_neighbor_feature_maps` for every neighbor-aggregator \
                              feature before building resolvers."
@@ -3321,16 +3432,31 @@ async fn pre_embed_semantic_match_queries(
     xervo_runtime: &crate::query::df_graph::locy_model_invoke::XervoRuntimeHandle,
 ) -> DFResult<HashMap<String, Vec<f32>>> {
     use uni_cypher::ast::{CypherLiteral, Expr};
-    let mut needed: Vec<String> = Vec::new();
+    // Collect (text, embedder_alias) pairs. The alias is per-model
+    // (Phase D D2 follow-up): each invocation's `embedder_alias` overrides
+    // the runtime-wide `"default"`. Two invocations sharing the same
+    // (text, alias) reuse one embed call; same text under different
+    // aliases is embedded twice. The cache key remains plain `text` —
+    // a model's resolver fetches embeddings via the text it knows, and
+    // mixed-alias re-embed of identical text under a different alias is
+    // a rare-enough edge case that the "last writer wins" cache shape
+    // is acceptable (documented).
+    let mut needed: Vec<(String, String)> = Vec::new();
     for inv in invocations {
+        let alias = inv
+            .embedder_alias
+            .clone()
+            .unwrap_or_else(|| "default".to_string());
         for fexpr in &inv.feature_exprs {
             if let Expr::FunctionCall { name, args, .. } = fexpr
                 && name == "semantic_match"
                 && args.len() == 2
                 && let Expr::Literal(CypherLiteral::String(s)) = &args[1]
-                && !needed.contains(s)
             {
-                needed.push(s.clone());
+                let tuple = (s.clone(), alias.clone());
+                if !needed.contains(&tuple) {
+                    needed.push(tuple);
+                }
             }
         }
     }
@@ -3346,37 +3472,40 @@ async fn pre_embed_semantic_match_queries(
                 .to_string(),
         )
     })?;
-    // For MVP, use the first vector index with an embedding config as the
-    // default alias — mirrors `auto_embed_query` in similar_to_expr.rs.
-    // The model declaration does not yet carry an explicit embedder
-    // alias; a future slice may surface it on `USING xervo(...)`.
-    // Without storage schema access here, we ask the runtime for a
-    // default-named embedder; runtimes that don't have one error
-    // cleanly.
-    let default_alias = "default";
-    let embedder = runtime.embedding(default_alias).await.map_err(|e| {
-        datafusion::error::DataFusionError::Execution(format!(
-            "semantic_match: failed to obtain embedder for alias '{default_alias}': {e}. \
-             Register an embedder under that alias in your Uni-Xervo runtime, or \
-             pre-compute the query embedding and pass via similar_to."
-        ))
-    })?;
-    let texts: Vec<&str> = needed.iter().map(|s| s.as_str()).collect();
-    let embeddings = embedder.embed(texts).await.map_err(|e| {
-        datafusion::error::DataFusionError::Execution(format!(
-            "semantic_match: embedder call failed: {e}"
-        ))
-    })?;
-    if embeddings.len() != needed.len() {
-        return Err(datafusion::error::DataFusionError::Execution(format!(
-            "semantic_match: embedder returned {} vectors for {} queries",
-            embeddings.len(),
-            needed.len()
-        )));
+    // Group needed (text, alias) by alias so each embedder is consulted
+    // exactly once.
+    let mut by_alias: HashMap<String, Vec<String>> = HashMap::new();
+    for (text, alias) in &needed {
+        by_alias
+            .entry(alias.clone())
+            .or_default()
+            .push(text.clone());
     }
-    let mut out = HashMap::with_capacity(needed.len());
-    for (text, vec) in needed.into_iter().zip(embeddings) {
-        out.insert(text, vec);
+    let mut out: HashMap<String, Vec<f32>> = HashMap::new();
+    for (alias, texts) in by_alias {
+        let embedder = runtime.embedding(&alias).await.map_err(|e| {
+            datafusion::error::DataFusionError::Execution(format!(
+                "semantic_match: failed to obtain embedder for alias '{alias}': {e}. \
+                 Register an embedder under that alias in your Uni-Xervo runtime, or \
+                 pre-compute the query embedding and pass via similar_to."
+            ))
+        })?;
+        let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+        let embeddings = embedder.embed(text_refs).await.map_err(|e| {
+            datafusion::error::DataFusionError::Execution(format!(
+                "semantic_match: embedder '{alias}' call failed: {e}"
+            ))
+        })?;
+        if embeddings.len() != texts.len() {
+            return Err(datafusion::error::DataFusionError::Execution(format!(
+                "semantic_match: embedder '{alias}' returned {} vectors for {} queries",
+                embeddings.len(),
+                texts.len()
+            )));
+        }
+        for (text, vec) in texts.into_iter().zip(embeddings) {
+            out.insert(text, vec);
+        }
     }
     Ok(out)
 }
@@ -3408,6 +3537,10 @@ async fn precompute_graph_feature_maps(
             "degree_centrality" => Some("uni.algo.degreeCentrality"),
             "pagerank_score" => Some("uni.algo.pageRank"),
             "closeness_centrality" => Some("uni.algo.closeness"),
+            "betweenness_centrality" => Some("uni.algo.betweenness"),
+            "eigenvector_centrality" => Some("uni.algo.eigenvectorCentrality"),
+            "harmonic_centrality" => Some("uni.algo.harmonicCentrality"),
+            "katz_centrality" => Some("uni.algo.katzCentrality"),
             _ => None,
         }
     }
@@ -3478,13 +3611,18 @@ async fn precompute_graph_feature_maps(
                     "procedure '{proc_name}' yield schema missing 'nodeId'"
                 ))
             })?;
+        // Most `uni.algo.*` centrality procedures yield `score`; the
+        // `harmonicCentrality` family yields `centrality` instead. Accept
+        // either to keep this dispatch independent of procedure-internal
+        // naming choices.
         let score_idx = sig
             .yields
             .iter()
-            .position(|(n, _)| *n == "score")
+            .position(|(n, _)| *n == "score" || *n == "centrality")
             .ok_or_else(|| {
                 datafusion::error::DataFusionError::Execution(format!(
-                    "procedure '{proc_name}' yield schema missing 'score'"
+                    "procedure '{proc_name}' yield schema missing a numeric score column \
+                     (expected 'score' or 'centrality')"
                 ))
             })?;
         while let Some(row_res) = stream.next().await {
@@ -3532,10 +3670,12 @@ async fn precompute_graph_feature_maps(
 /// the map with an empty `Vec` so the resolver's `Null` semantics
 /// remain crisp (empty → `Null` → classifier interprets per its
 /// feature contract).
-/// Per-`(rel_type, prop_name)` cache of neighbor property values
-/// keyed by subject vid, produced by `precompute_neighbor_feature_maps`
-/// and consumed by `FeatureResolverKind::NeighborAggregate` resolvers.
-type NeighborFeatureMaps = HashMap<(String, String), Arc<HashMap<u64, Vec<f64>>>>;
+/// Per-`(rel_type, prop_name, direction)` cache of neighbor property
+/// values keyed by subject vid, produced by
+/// `precompute_neighbor_feature_maps` and consumed by
+/// `FeatureResolverKind::NeighborAggregate` resolvers.
+type NeighborFeatureMaps =
+    HashMap<(String, String, NeighborDirection), Arc<HashMap<u64, Vec<f64>>>>;
 
 async fn precompute_neighbor_feature_maps(
     invocations: &[uni_locy::ModelInvocation],
@@ -3543,22 +3683,35 @@ async fn precompute_neighbor_feature_maps(
     graph_algo: &crate::query::df_graph::locy_model_invoke::GraphAlgoHandle,
 ) -> DFResult<NeighborFeatureMaps> {
     use uni_cypher::ast::{CypherLiteral, Expr};
-    use uni_store::storage::direction::Direction;
 
-    // Collect distinct (subject_var, rel_type, prop_name) tuples needed
-    // across all invocations. The subject_var tells us which body batch
-    // column to scan for subject vids.
-    let mut needed: Vec<(String, String, String)> = Vec::new();
+    // Collect distinct (subject_var, rel_type, prop_name, direction)
+    // tuples needed across all invocations. The subject_var tells us
+    // which body batch column to scan for subject vids; the direction
+    // is optional in the AST (defaults to OUTGOING).
+    let parse_direction = |arg: Option<&Expr>| -> Option<NeighborDirection> {
+        match arg {
+            None => Some(NeighborDirection::Outgoing),
+            Some(Expr::Literal(CypherLiteral::String(d))) => match d.to_uppercase().as_str() {
+                "OUTGOING" => Some(NeighborDirection::Outgoing),
+                "INCOMING" => Some(NeighborDirection::Incoming),
+                "BOTH" => Some(NeighborDirection::Both),
+                _ => None,
+            },
+            _ => None,
+        }
+    };
+    let mut needed: Vec<(String, String, String, NeighborDirection)> = Vec::new();
     for inv in invocations {
         for fexpr in &inv.feature_exprs {
             if let Expr::FunctionCall { name, args, .. } = fexpr
                 && NeighborAgg::from_fn_name(name).is_some()
-                && args.len() == 3
+                && (args.len() == 3 || args.len() == 4)
                 && let Expr::Variable(v) = &args[0]
                 && let Expr::Literal(CypherLiteral::String(rel)) = &args[1]
                 && let Expr::Literal(CypherLiteral::String(prop)) = &args[2]
+                && let Some(direction) = parse_direction(args.get(3))
             {
-                let tuple = (v.clone(), rel.clone(), prop.clone());
+                let tuple = (v.clone(), rel.clone(), prop.clone(), direction);
                 if !needed.contains(&tuple) {
                     needed.push(tuple);
                 }
@@ -3596,37 +3749,42 @@ async fn precompute_neighbor_feature_maps(
         )
     });
 
-    // Group needed tuples by (rel_type, prop_name) — we want one map
-    // per (rel, prop) pair regardless of which subject_var binding
+    // Group needed tuples by (rel_type, prop_name, direction) — one
+    // precomputed map per key, regardless of which subject_var binding
     // points at it (the subject vids are unioned).
-    let mut by_pair: HashMap<(String, String), Vec<String>> = HashMap::new();
-    for (subject_var, rel, prop) in needed {
-        by_pair.entry((rel, prop)).or_default().push(subject_var);
+    let mut by_key: HashMap<(String, String, NeighborDirection), Vec<String>> = HashMap::new();
+    for (subject_var, rel, prop, direction) in needed {
+        by_key
+            .entry((rel, prop, direction))
+            .or_default()
+            .push(subject_var);
     }
 
     let mut out: NeighborFeatureMaps = HashMap::new();
-    for ((rel_type, prop_name), subject_vars) in by_pair {
+    for ((rel_type, prop_name, direction), subject_vars) in by_key {
         // Resolve edge_type_id from schema.
         let schema = storage.schema_manager().schema();
         let Some(edge_meta) = schema.edge_types.get(&rel_type) else {
             // Unregistered rel-type → empty map. The resolver surfaces
             // Null at row time, consistent with the no-neighbor case.
-            out.insert((rel_type, prop_name), Arc::new(HashMap::new()));
+            out.insert((rel_type, prop_name, direction), Arc::new(HashMap::new()));
             continue;
         };
         let edge_type_id = edge_meta.id;
 
-        // Warm outgoing adjacency for this edge type. Mirrors the
-        // pattern in projection.rs / procedure_template.rs.
+        // Warm adjacency for every direction we'll traverse. Mirrors
+        // the pattern in projection.rs / procedure_template.rs.
         let edge_ver = storage.get_edge_version_by_id(edge_type_id);
-        storage
-            .warm_adjacency(edge_type_id, Direction::Outgoing, edge_ver)
-            .await
-            .map_err(|e| {
-                datafusion::error::DataFusionError::Execution(format!(
-                    "neighbor-aggregator warm_adjacency for '{rel_type}' failed: {e}"
-                ))
-            })?;
+        for dir in direction.store_directions() {
+            storage
+                .warm_adjacency(edge_type_id, *dir, edge_ver)
+                .await
+                .map_err(|e| {
+                    datafusion::error::DataFusionError::Execution(format!(
+                        "neighbor-aggregator warm_adjacency for '{rel_type}' / {dir:?} failed: {e}"
+                    ))
+                })?;
+        }
 
         // Collect distinct subject vids from body batches across every
         // subject_var binding that this (rel, prop) pair uses.
@@ -3648,17 +3806,22 @@ async fn precompute_neighbor_feature_maps(
             }
         }
 
-        // For each subject, walk outgoing edges, fetch neighbor
-        // property, coerce to f64, accumulate. Subjects with no
-        // numeric neighbors retain an empty Vec (→ Null at row time).
+        // For each subject, walk edges in the configured direction(s),
+        // fetch neighbor property, coerce to f64, accumulate. Subjects
+        // with no numeric neighbors retain an empty Vec (→ Null at
+        // row time).
         let mut vid_to_values: HashMap<u64, Vec<f64>> = HashMap::new();
         let adj = storage.adjacency_manager();
         for subject_vid in subject_vids {
-            let neighbors = adj.get_neighbors(
-                uni_common::core::id::Vid::from(subject_vid),
-                edge_type_id,
-                Direction::Outgoing,
-            );
+            let mut neighbors: Vec<(uni_common::core::id::Vid, uni_common::core::id::Eid)> =
+                Vec::new();
+            for dir in direction.store_directions() {
+                neighbors.extend(adj.get_neighbors(
+                    uni_common::core::id::Vid::from(subject_vid),
+                    edge_type_id,
+                    *dir,
+                ));
+            }
             let mut values: Vec<f64> = Vec::with_capacity(neighbors.len());
             for (neighbor_vid, _eid) in neighbors {
                 let val = property_manager
@@ -3678,7 +3841,7 @@ async fn precompute_neighbor_feature_maps(
             }
             vid_to_values.insert(subject_vid, values);
         }
-        out.insert((rel_type, prop_name), Arc::new(vid_to_values));
+        out.insert((rel_type, prop_name, direction), Arc::new(vid_to_values));
     }
     Ok(out)
 }

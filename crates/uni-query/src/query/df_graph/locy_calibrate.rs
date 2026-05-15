@@ -191,6 +191,21 @@ fn fit_method(
             // exercising the CALIBRATE plumbing without modeling.
             Ok(Arc::new(IdentityCalibrator) as Arc<dyn uni_locy::Calibrator>)
         }
+        CalibrationMethod::Dirichlet => {
+            // Phase D D-C1d surface: the grammar accepts the keyword,
+            // but the binary CALIBRATE pipeline can't drive a
+            // multi-class fit — the trait expects `labels: &[bool]`
+            // and `preds: &[f64]`, whereas Dirichlet needs
+            // `labels: &[u32]` + `preds: &[Vec<f64>]`. Pending a
+            // surface form for multi-class CALIBRATE, callers should
+            // instantiate `DirichletFitter` directly via the Rust
+            // library API.
+            Err(uni_locy::calibration::CalibrationError::NumericIssue(
+                "Dirichlet is multi-class; the binary CALIBRATE statement \
+                 cannot fit it. Use `uni_locy::calibration::DirichletFitter` \
+                 directly until the multi-class CALIBRATE surface form ships.",
+            ))
+        }
     };
     result.map_err(|e| CalibrateRuntimeError::FitFailure {
         model_name: model_name.to_string(),
@@ -207,6 +222,7 @@ fn method_kind(method: CalibrationMethod) -> CalibrationMethodKind {
         CalibrationMethod::TemperatureScaling => CalibrationMethodKind::Temperature,
         CalibrationMethod::BetaCalibration => CalibrationMethodKind::Beta,
         CalibrationMethod::Conformal { .. } => CalibrationMethodKind::Conformal,
+        CalibrationMethod::Dirichlet => CalibrationMethodKind::Dirichlet,
         CalibrationMethod::None => CalibrationMethodKind::Identity,
     }
 }
@@ -365,6 +381,7 @@ mod tests {
                 variable: "s".into(),
                 label: Some("Supplier".into()),
             }],
+            embedder_alias: None,
             features: vec![],
             path_context: None,
             output_type: OutputType::Prob,

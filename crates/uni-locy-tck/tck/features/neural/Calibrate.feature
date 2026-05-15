@@ -121,3 +121,30 @@ Feature: CALIBRATE statement (Phase C C2)
       """
     Then evaluation should fail
     And the evaluation error should mention "not registered"
+
+  # ── Phase D D-C1d: Dirichlet surface accepted, runtime errors honestly ─
+
+  Scenario: CALIBRATE with METHOD dirichlet parses but errors at fit time
+    Given having executed:
+      """
+      CREATE (:Sample {idx: 0, label: true}), (:Sample {idx: 1, label: false})
+      """
+    And a registered mock classifier "scorer" returning 0.5
+    When evaluating the following Locy program with neural_predicates_preview:
+      """
+      CREATE MODEL scorer AS
+        INPUT (s)
+        OUTPUT PROB risk
+        USING xervo('classify/scorer')
+
+      CALIBRATE scorer
+        ON MATCH (s:Sample)
+        TARGET s.label
+        METHOD dirichlet
+      """
+    # Grammar accepts the keyword (D-C1d-Surface acceptance); the
+    # binary CALIBRATE pipeline rejects multi-class at fit time
+    # with a clear pointer to the Rust API. Future slice surfaces a
+    # multi-class form (TARGET class_idx METRICS class_probs).
+    Then evaluation should fail
+    And the evaluation error should mention "Dirichlet"

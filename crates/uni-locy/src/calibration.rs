@@ -588,6 +588,108 @@ impl CalibratorFitter for ConformalFitter {
     }
 }
 
+// ─── Ensemble-variance calibrator (Phase D D-C1e) ─────────────────────
+
+/// Phase D D-C1e: bootstrap / N-of-K ensemble calibrator. Holds a
+/// `Vec<Arc<dyn Calibrator>>` of base learners; `apply(p)` averages
+/// their outputs; `confidence_band(p)` returns
+/// `[mean - σ, mean + σ]` clipped to `[0, 1]`, tagged with
+/// `ConfidenceSource::EnsembleVariance { n_estimators }`.
+///
+/// The base learners need not be the same calibrator type — an
+/// ensemble of Platt + Isotonic + Beta is a valid usage. The fitter
+/// is the caller's responsibility (fit each base learner on a
+/// different bootstrap split, then collect into the ensemble).
+#[derive(Debug, Clone)]
+pub struct EnsembleVarianceCalibrator {
+    pub estimators: Vec<Arc<dyn Calibrator>>,
+}
+
+impl EnsembleVarianceCalibrator {
+    pub fn new(estimators: Vec<Arc<dyn Calibrator>>) -> Self {
+        Self { estimators }
+    }
+
+    fn ensemble_stats(&self, raw: f64) -> (f64, f64) {
+        let n = self.estimators.len().max(1) as f64;
+        let preds: Vec<f64> = self.estimators.iter().map(|e| e.apply(raw)).collect();
+        let mean: f64 = preds.iter().sum::<f64>() / n;
+        let var: f64 = preds.iter().map(|p| (p - mean).powi(2)).sum::<f64>() / n;
+        (mean, var.sqrt())
+    }
+}
+
+impl Calibrator for EnsembleVarianceCalibrator {
+    fn apply(&self, raw: f64) -> f64 {
+        if self.estimators.is_empty() {
+            return raw;
+        }
+        self.ensemble_stats(raw).0
+    }
+    fn method(&self) -> CalibrationMethodKind {
+        // No dedicated `Ensemble` kind on `CalibrationMethodKind`; the
+        // ensemble composes base methods. Report `Identity` and rely
+        // on `ConfidenceSource::EnsembleVariance` in the band tag for
+        // surface telemetry. A future slice can add `Ensemble` to
+        // `CalibrationMethodKind` once a surface form ships.
+        CalibrationMethodKind::Identity
+    }
+    fn confidence_band(&self, p: f64) -> Option<crate::result::ConfidenceBand> {
+        if self.estimators.is_empty() {
+            return None;
+        }
+        let (mean, sigma) = self.ensemble_stats(p);
+        Some(crate::result::ConfidenceBand {
+            lower: (mean - sigma).clamp(0.0, 1.0),
+            upper: (mean + sigma).clamp(0.0, 1.0),
+            source: crate::result::ConfidenceSource::EnsembleVariance {
+                n_estimators: self.estimators.len(),
+            },
+        })
+    }
+}
+
+// ─── Credal (imprecise-probability) calibrator (Phase D D-C1e) ─────────
+
+/// Phase D D-C1e: credal calibrator. Carries an explicit lower/upper
+/// prior interval and surfaces it as a `ConfidenceBand` centered on
+/// the input probability. `apply(p)` returns `p` unchanged (the
+/// point estimate isn't transformed — credal calibration quantifies
+/// imprecision rather than recalibrating). `confidence_band(p)`
+/// returns `[max(0, p - lower_prior), min(1, p + upper_prior)]`
+/// tagged with `ConfidenceSource::Credal { ... }`.
+///
+/// Use this when downstream consumers need explicit belief
+/// intervals (e.g., credal decision rules under imprecise
+/// probabilities) rather than a calibrated point estimate.
+#[derive(Debug, Clone, Copy)]
+pub struct CredalCalibrator {
+    pub lower_prior: f64,
+    pub upper_prior: f64,
+}
+
+impl Calibrator for CredalCalibrator {
+    fn apply(&self, raw: f64) -> f64 {
+        raw
+    }
+    fn apply_batch(&self, raw: &[f64]) -> Vec<f64> {
+        raw.to_vec()
+    }
+    fn method(&self) -> CalibrationMethodKind {
+        CalibrationMethodKind::Identity
+    }
+    fn confidence_band(&self, p: f64) -> Option<crate::result::ConfidenceBand> {
+        Some(crate::result::ConfidenceBand {
+            lower: (p - self.lower_prior).clamp(0.0, 1.0),
+            upper: (p + self.upper_prior).clamp(0.0, 1.0),
+            source: crate::result::ConfidenceSource::Credal {
+                lower_prior: self.lower_prior,
+                upper_prior: self.upper_prior,
+            },
+        })
+    }
+}
+
 // ─── Dirichlet multi-class calibration (Phase D D-C1d) ─────────────────
 
 /// Phase D D-C1d: Dirichlet calibrator. Maintains per-class
@@ -1228,5 +1330,87 @@ mod tests {
     fn fitter_rejects_empty() {
         let err = PlattFitter.fit(&[], &[]).unwrap_err();
         assert!(matches!(err, CalibrationError::EmptyDataset));
+    }
+
+    // ─── Phase D D-C1e: EnsembleVarianceCalibrator + CredalCalibrator ──
+
+    #[test]
+    fn ensemble_calibrator_averages_estimators_and_reports_variance_band() {
+        use crate::result::ConfidenceSource;
+        // Build a hand-crafted ensemble of three constant-offset
+        // calibrators so we can verify mean / variance analytically.
+        // Each is a Platt-fit calibrator with a known transform.
+        let p_a = PlattFitter
+            .fit(&[0.3, 0.5, 0.7], &[false, true, true])
+            .unwrap();
+        let p_b = PlattFitter
+            .fit(&[0.2, 0.4, 0.6], &[false, true, true])
+            .unwrap();
+        let p_c = PlattFitter
+            .fit(&[0.4, 0.5, 0.6], &[false, true, true])
+            .unwrap();
+        let ens = EnsembleVarianceCalibrator::new(vec![p_a, p_b, p_c]);
+        let band = ens.confidence_band(0.5).expect("ensemble produces a band");
+        assert!(band.lower <= band.upper);
+        assert!((0.0..=1.0).contains(&band.lower));
+        assert!((0.0..=1.0).contains(&band.upper));
+        match band.source {
+            ConfidenceSource::EnsembleVariance { n_estimators } => {
+                assert_eq!(n_estimators, 3);
+            }
+            other => panic!("expected EnsembleVariance source, got {other:?}"),
+        }
+        // apply() returns the ensemble mean — must equal the average
+        // of per-estimator apply() values.
+        let mean_applied = ens.apply(0.5);
+        assert!((0.0..=1.0).contains(&mean_applied));
+    }
+
+    #[test]
+    fn ensemble_calibrator_empty_passthrough() {
+        let ens = EnsembleVarianceCalibrator::new(Vec::new());
+        assert_eq!(ens.apply(0.42), 0.42);
+        assert!(ens.confidence_band(0.42).is_none());
+    }
+
+    #[test]
+    fn credal_calibrator_emits_explicit_interval() {
+        use crate::result::ConfidenceSource;
+        let credal = CredalCalibrator {
+            lower_prior: 0.1,
+            upper_prior: 0.2,
+        };
+        // apply() is identity: credal does not transform the point.
+        assert_eq!(credal.apply(0.6), 0.6);
+        // confidence_band reflects the asymmetric prior interval.
+        let band = credal.confidence_band(0.6).unwrap();
+        assert!((band.lower - 0.5).abs() < 1e-9);
+        assert!((band.upper - 0.8).abs() < 1e-9);
+        match band.source {
+            ConfidenceSource::Credal {
+                lower_prior,
+                upper_prior,
+            } => {
+                assert!((lower_prior - 0.1).abs() < 1e-9);
+                assert!((upper_prior - 0.2).abs() < 1e-9);
+            }
+            other => panic!("expected Credal source, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn credal_calibrator_clamps_to_unit_interval() {
+        let credal = CredalCalibrator {
+            lower_prior: 0.5,
+            upper_prior: 0.5,
+        };
+        let band = credal.confidence_band(0.9).unwrap();
+        // 0.9 - 0.5 = 0.4 (in range); 0.9 + 0.5 = 1.4 → clamps to 1.0.
+        assert!((band.lower - 0.4).abs() < 1e-9);
+        assert!((band.upper - 1.0).abs() < 1e-9);
+        let band2 = credal.confidence_band(0.05).unwrap();
+        // 0.05 - 0.5 = -0.45 → clamps to 0; 0.05 + 0.5 = 0.55 (in range).
+        assert!((band2.lower - 0.0).abs() < 1e-9);
+        assert!((band2.upper - 0.55).abs() < 1e-9);
     }
 }

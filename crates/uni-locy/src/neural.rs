@@ -359,11 +359,21 @@ pub struct NeuralProvenanceStore {
 /// A single stored record. Matches the user-visible
 /// [`crate::NeuralProvenance`] shape so EXPLAIN can construct
 /// derivation entries without further transformation.
-#[derive(Debug, Clone, Copy)]
+///
+/// `feature_inputs` (Phase 12 EXPLAIN follow-up) carries the
+/// per-binding `FeatureValue` map that fed the classifier on the
+/// hot path. EXPLAIN Mode B reads from this map (when available)
+/// instead of re-evaluating feature expressions against the
+/// fact_row — which is the only way to surface authoritative values
+/// for graph-structural FEATURE functions (`degree_centrality`,
+/// `avg_neighbor`, etc.) whose evaluation requires the
+/// `GraphAlgoHandle` that isn't threaded into the EXPLAIN path.
+#[derive(Debug, Clone)]
 pub struct NeuralProvenanceRecord {
     pub raw_probability: f64,
     pub calibrated_probability: Option<f64>,
     pub confidence_band: Option<crate::result::ConfidenceBand>,
+    pub feature_inputs: HashMap<String, FeatureValue>,
 }
 
 impl NeuralProvenanceStore {
@@ -383,7 +393,7 @@ impl NeuralProvenanceStore {
         self.inner
             .read()
             .ok()
-            .and_then(|g| g.get(&(model.to_string(), input_hash)).copied())
+            .and_then(|g| g.get(&(model.to_string(), input_hash)).cloned())
     }
 
     pub fn clear(&self) {

@@ -977,6 +977,11 @@ struct InvocationLifter<'a> {
     counter: usize,
 }
 
+/// Return type of `InvocationLifter::validate_features`: rewritten feature
+/// argument list plus the `(var, property)` pairs accumulated for hidden-YIELD
+/// materialization.
+type ValidatedFeatures = Result<(Vec<Expr>, Vec<(String, String)>), LocyCompileError>;
+
 impl<'a> InvocationLifter<'a> {
     fn new(rule_name: &'a str, model_catalog: &'a HashMap<String, CompiledModel>) -> Self {
         Self {
@@ -995,11 +1000,7 @@ impl<'a> InvocationLifter<'a> {
     /// `semantic_match(...)` for retrieval-backed features). Returns
     /// the possibly-rewritten feature_exprs and the per-invocation
     /// `feature_property_refs` for record-keeping.
-    fn validate_features(
-        &mut self,
-        model_name: &str,
-        args: &[Expr],
-    ) -> Result<(Vec<Expr>, Vec<(String, String)>), LocyCompileError> {
+    fn validate_features(&mut self, model_name: &str, args: &[Expr]) -> ValidatedFeatures {
         let mut feature_property_refs = Vec::new();
         let mut rewritten = Vec::with_capacity(args.len());
         for fexpr in args {

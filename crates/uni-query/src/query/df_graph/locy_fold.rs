@@ -358,9 +358,11 @@ impl ExecutionPlan for FoldExec {
                 let agg_col = compute_fold_aggregate(
                     col.as_ref(),
                     &binding.kind,
-                    &ordered_keys,
-                    &groups,
-                    num_groups,
+                    FoldGroups {
+                        ordered_keys: &ordered_keys,
+                        groups: &groups,
+                        num_groups,
+                    },
                     strict,
                     epsilon,
                     semiring_kind,
@@ -387,16 +389,26 @@ impl ExecutionPlan for FoldExec {
 // Aggregate computation
 // ---------------------------------------------------------------------------
 
+/// Per-key-group data threaded into `compute_fold_aggregate` —
+/// bundled to keep the aggregator's signature under the
+/// too-many-arguments threshold.
+struct FoldGroups<'a> {
+    ordered_keys: &'a [Vec<ScalarKey>],
+    groups: &'a HashMap<Vec<ScalarKey>, Vec<usize>>,
+    num_groups: usize,
+}
+
 fn compute_fold_aggregate(
     col: &dyn Array,
     kind: &FoldAggKind,
-    ordered_keys: &[Vec<ScalarKey>],
-    groups: &HashMap<Vec<ScalarKey>, Vec<usize>>,
-    num_groups: usize,
+    groups_ctx: FoldGroups<'_>,
     strict: bool,
     probability_epsilon: f64,
     semiring_kind: SemiringKind,
 ) -> DFResult<arrow_array::ArrayRef> {
+    let ordered_keys = groups_ctx.ordered_keys;
+    let groups = groups_ctx.groups;
+    let num_groups = groups_ctx.num_groups;
     match kind {
         FoldAggKind::Sum => {
             let mut builder = Float64Builder::with_capacity(num_groups);

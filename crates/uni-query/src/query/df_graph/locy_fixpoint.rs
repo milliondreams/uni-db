@@ -2074,16 +2074,23 @@ fn detect_shared_lineage(
                                 group_strs.join(", ")
                             )
                         });
+                // Phase D F3 case 1 BDD-time deepening: count distinct
+                // base facts (= BDD variables) that cross groups, so the
+                // warning carries structured metadata mirroring
+                // `BddLimitExceeded`. Users can correlate
+                // `variable_count` with EXPLAIN's BDD output.
+                let shared_variable_count =
+                    input_to_groups.values().filter(|g| g.len() > 1).count();
                 warnings.push(RuntimeWarning {
                     code: RuntimeWarningCode::CrossGroupCorrelationNotExact,
                     message: format!(
-                        "Rule '{}': IS-ref base facts are shared across different KEY \
-                         groups. BDD corrects per-group probabilities but cannot account \
-                         for cross-group correlations.",
-                        rule.name
+                        "Rule '{}': {} IS-ref base fact(s) are shared across different \
+                         KEY groups. BDD corrects per-group probabilities but cannot \
+                         account for cross-group correlations.",
+                        rule.name, shared_variable_count
                     ),
                     rule_name: rule.name.clone(),
-                    variable_count: None,
+                    variable_count: Some(shared_variable_count),
                     key_group: example,
                 });
             }

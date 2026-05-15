@@ -1596,6 +1596,44 @@ async fn bdd_warning_should_have_variable_count(
     );
 }
 
+#[then(
+    regex = r#"^the CrossGroupCorrelationNotExact warning for rule ['"](.+)['"] should have variable_count >= (\d+)$"#
+)]
+async fn crossgroup_warning_should_have_variable_count(
+    world: &mut LocyWorld,
+    rule_name: String,
+    min_count: usize,
+) {
+    let locy_result = world
+        .locy_result()
+        .expect("no evaluation result")
+        .as_ref()
+        .expect("evaluation failed");
+    let warning = locy_result.warnings().iter().find(|w| {
+        w.code == uni_locy::RuntimeWarningCode::CrossGroupCorrelationNotExact
+            && w.rule_name == rule_name
+    });
+    let warning = warning.unwrap_or_else(|| {
+        panic!(
+            "Expected CrossGroupCorrelationNotExact warning for rule '{}', but none found",
+            rule_name
+        )
+    });
+    let vc = warning.variable_count.unwrap_or_else(|| {
+        panic!(
+            "CrossGroupCorrelationNotExact warning for rule '{}' has no variable_count",
+            rule_name
+        )
+    });
+    assert!(
+        vc >= min_count,
+        "Expected variable_count >= {} for rule '{}', but got {}",
+        min_count,
+        rule_name,
+        vc
+    );
+}
+
 #[then(regex = r#"^the BddLimitExceeded warning for rule ['"](.+)['"] should have a key_group$"#)]
 async fn bdd_warning_should_have_key_group(world: &mut LocyWorld, rule_name: String) {
     let locy_result = world

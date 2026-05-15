@@ -31,10 +31,59 @@ use datafusion::physical_plan::{
 };
 use futures::TryStreamExt;
 use parking_lot::RwLock;
+use uni_algo::algo::AlgorithmRegistry;
 use uni_locy::{ClassifierRegistry, ModelInvocation, ModelInvocationCache};
+use uni_store::runtime::L0Manager;
+use uni_store::runtime::property_manager::PropertyManager;
+use uni_store::storage::manager::StorageManager;
 use uni_xervo::runtime::ModelRuntime;
 
 use super::locy_fixpoint::apply_model_invocations;
+
+/// Phase D D1 graph-structural runtime: a Clone+Debug bundle of the
+/// pieces needed to invoke `uni.algo.*` procedures directly from the
+/// FEATURE pipeline (no Cypher CALL roundtrip) and to traverse
+/// one-hop neighborhoods for `avg_neighbor` / `max_neighbor` /
+/// `sum_neighbor`.
+///
+/// Built fresh at physical-plan lowering (`df_planner.rs`) from
+/// `GraphExecutionContext`; mirrors the `XervoRuntimeHandle` pattern
+/// (logical plan is graph_ctx-agnostic).
+#[derive(Clone, Default)]
+pub struct GraphAlgoHandle {
+    pub(crate) registry: Option<Arc<AlgorithmRegistry>>,
+    pub(crate) storage: Option<Arc<StorageManager>>,
+    pub(crate) l0_manager: Option<Arc<L0Manager>>,
+    pub(crate) property_manager: Option<Arc<PropertyManager>>,
+    /// Raw L0 buffers for building a fresh `QueryContext` when the
+    /// neighbor-aggregator path calls `PropertyManager::get_vertex_prop_with_ctx`.
+    /// L0-resident vertex properties are invisible to property reads
+    /// without a `QueryContext`; topology procedures don't need this
+    /// because they consume `L0Manager` directly via `AlgoContext`.
+    pub(crate) l0_buffers: Option<L0Buffers>,
+}
+
+#[derive(Clone)]
+pub(crate) struct L0Buffers {
+    pub(crate) current: Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>,
+    pub(crate) transaction: Option<Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
+    pub(crate) pending_flush: Vec<Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
+}
+
+impl std::fmt::Debug for GraphAlgoHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (&self.registry, &self.storage) {
+            (Some(_), Some(_)) => write!(f, "GraphAlgoHandle(<configured>)"),
+            _ => write!(f, "GraphAlgoHandle(<none>)"),
+        }
+    }
+}
+
+impl GraphAlgoHandle {
+    pub fn is_configured(&self) -> bool {
+        self.registry.is_some() && self.storage.is_some()
+    }
+}
 
 /// Phase D D2 runtime: a Clone+Debug wrapper around the optional
 /// Uni-Xervo runtime. `ModelRuntime` doesn't derive Debug (its
@@ -89,6 +138,11 @@ pub struct LocyModelInvokeExec {
     /// is configured — `semantic_match` calls then error with a
     /// clear message at row time.
     xervo_runtime: XervoRuntimeHandle,
+    /// Phase D D1 graph-structural runtime: registry + storage handle
+    /// for invoking topology algorithms (degree/pagerank/closeness)
+    /// and walking one-hop neighborhoods. Built from `GraphExecutionContext`
+    /// at physical lowering.
+    graph_algo: GraphAlgoHandle,
     /// Phase C B1-B3 follow-up: per-query side-channel store for
     /// (raw, calibrated, confidence_band) tuples. Written per row
     /// per invocation by `apply_model_invocations`; consumed by
@@ -106,6 +160,7 @@ pub struct LocyModelInvokeExec {
 }
 
 impl LocyModelInvokeExec {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         input: Arc<dyn ExecutionPlan>,
         invocations: Vec<ModelInvocation>,
@@ -114,6 +169,7 @@ impl LocyModelInvokeExec {
         provenance_store: Option<Arc<uni_locy::NeuralProvenanceStore>>,
         path_context_handles: HashMap<String, PathContextHandle>,
         xervo_runtime: XervoRuntimeHandle,
+        graph_algo: GraphAlgoHandle,
     ) -> Self {
         let schema = compute_output_schema(input.schema(), &invocations);
         let plan_properties = compute_plan_properties(&input, schema.clone());
@@ -125,6 +181,7 @@ impl LocyModelInvokeExec {
             provenance_store,
             path_context_handles,
             xervo_runtime,
+            graph_algo,
             schema,
             plan_properties,
         }
@@ -222,6 +279,7 @@ impl ExecutionPlan for LocyModelInvokeExec {
             self.provenance_store.as_ref().map(Arc::clone),
             self.path_context_handles.clone(),
             self.xervo_runtime.clone(),
+            self.graph_algo.clone(),
         )))
     }
 
@@ -237,6 +295,7 @@ impl ExecutionPlan for LocyModelInvokeExec {
         let provenance_store = self.provenance_store.as_ref().map(Arc::clone);
         let path_context_handles = self.path_context_handles.clone();
         let xervo_runtime = self.xervo_runtime.clone();
+        let graph_algo = self.graph_algo.clone();
         let schema = self.schema.clone();
 
         let fut = async move {
@@ -249,6 +308,7 @@ impl ExecutionPlan for LocyModelInvokeExec {
                 provenance_store.as_ref(),
                 &path_context_handles,
                 &xervo_runtime,
+                &graph_algo,
             )
             .await?;
             // Wrap the Vec<RecordBatch> as a stream so try_flatten

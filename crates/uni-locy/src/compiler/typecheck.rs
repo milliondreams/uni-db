@@ -1025,6 +1025,97 @@ impl<'a> InvocationLifter<'a> {
                 }
                 Expr::FunctionCall {
                     name, args: fargs, ..
+                } if matches!(
+                    name.as_str(),
+                    "avg_neighbor" | "max_neighbor" | "sum_neighbor"
+                ) =>
+                {
+                    // Phase D D1 graph-structural: one-hop neighborhood
+                    // aggregators. Three args: subject Variable, then
+                    // string literals for rel-type and property name.
+                    // Direction defaults to OUTGOING for MVP.
+                    if fargs.len() != 3 {
+                        return Err(LocyCompileError::UnsupportedFeatureExpression {
+                            rule: self.rule_name.to_string(),
+                            model: model_name.to_string(),
+                            expr: format!(
+                                "{}(...) requires exactly 3 arguments (subject, 'REL_TYPE', 'property'), got {}",
+                                name,
+                                fargs.len()
+                            ),
+                        });
+                    }
+                    match &fargs[0] {
+                        Expr::Variable(_) => {}
+                        other => {
+                            return Err(LocyCompileError::UnsupportedFeatureExpression {
+                                rule: self.rule_name.to_string(),
+                                model: model_name.to_string(),
+                                expr: format!(
+                                    "{}(...) first argument must be a node variable, got {other:?}",
+                                    name
+                                ),
+                            });
+                        }
+                    }
+                    for (i, inner) in fargs.iter().enumerate().skip(1) {
+                        let is_string_literal = matches!(
+                            inner,
+                            Expr::Literal(uni_cypher::ast::CypherLiteral::String(_))
+                        );
+                        if !is_string_literal {
+                            return Err(LocyCompileError::UnsupportedFeatureExpression {
+                                rule: self.rule_name.to_string(),
+                                model: model_name.to_string(),
+                                expr: format!(
+                                    "{}(...) argument {} must be a string literal, got {inner:?}",
+                                    name,
+                                    i + 1
+                                ),
+                            });
+                        }
+                    }
+                    rewritten.push(fexpr.clone());
+                }
+                Expr::FunctionCall {
+                    name, args: fargs, ..
+                } if matches!(
+                    name.as_str(),
+                    "degree_centrality" | "pagerank_score" | "closeness_centrality"
+                ) =>
+                {
+                    // Phase D D1 graph-structural: single-arg topology
+                    // features. Arg must be `Expr::Variable(_)` — the
+                    // subject binding whose `_vid` is materialized into
+                    // the per-row fact_row via the hidden YIELD pipeline.
+                    if fargs.len() != 1 {
+                        return Err(LocyCompileError::UnsupportedFeatureExpression {
+                            rule: self.rule_name.to_string(),
+                            model: model_name.to_string(),
+                            expr: format!(
+                                "{}(...) requires exactly 1 argument, got {}",
+                                name,
+                                fargs.len()
+                            ),
+                        });
+                    }
+                    match &fargs[0] {
+                        Expr::Variable(_) => {}
+                        other => {
+                            return Err(LocyCompileError::UnsupportedFeatureExpression {
+                                rule: self.rule_name.to_string(),
+                                model: model_name.to_string(),
+                                expr: format!(
+                                    "{}(...) argument must be a node variable, got {other:?}",
+                                    name
+                                ),
+                            });
+                        }
+                    }
+                    rewritten.push(fexpr.clone());
+                }
+                Expr::FunctionCall {
+                    name, args: fargs, ..
                 } if matches!(name.as_str(), "similar_to" | "semantic_match") => {
                     // Phase D D1/D2: retrieval-backed feature expressions.
                     // Both functions take exactly 2 args. Property-access

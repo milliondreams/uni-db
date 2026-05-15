@@ -55,6 +55,49 @@ async fn having_executed(world: &mut LocyWorld, step: &cucumber::gherkin::Step) 
     }
 }
 
+/// Register a node label imperatively in the schema manager. Required
+/// for tests that exercise `uni.algo.*` procedures (degree_centrality,
+/// pagerank, etc.) which validate labels against the registered schema
+/// before running. The TCK harness defaults to schema-less; this step
+/// declares the label so the algorithm sees the corresponding nodes.
+#[given(regex = r#"^a registered node label ['"](.+)['"]$"#)]
+async fn register_node_label(world: &mut LocyWorld, name: String) {
+    world
+        .init_db()
+        .await
+        .expect("Failed to initialize database");
+    let schema = world.db().schema_manager();
+    match schema.add_label(&name) {
+        Ok(_) => {}
+        Err(e) if e.to_string().contains("already exists") => {}
+        Err(e) => panic!("Failed to register node label '{}': {}", name, e),
+    }
+}
+
+/// Register an edge type imperatively in the schema manager. The
+/// `from`/`to` label lists must already be registered (use the
+/// `a registered node label ...` step first). Required for
+/// neighbor-aggregator FEATURE expressions and topology procedures
+/// that scope by edge type.
+#[given(regex = r#"^a registered edge type ['"](.+)['"] from ['"](.+)['"] to ['"](.+)['"]$"#)]
+async fn register_edge_type(
+    world: &mut LocyWorld,
+    name: String,
+    from_label: String,
+    to_label: String,
+) {
+    world
+        .init_db()
+        .await
+        .expect("Failed to initialize database");
+    let schema = world.db().schema_manager();
+    match schema.add_edge_type(&name, vec![from_label], vec![to_label]) {
+        Ok(_) => {}
+        Err(e) if e.to_string().contains("already exists") => {}
+        Err(e) => panic!("Failed to register edge type '{}': {}", name, e),
+    }
+}
+
 #[given(regex = r#"^the parameter (\w+) = (.+)$"#)]
 fn set_parameter(world: &mut LocyWorld, name: String, value_str: String) {
     let t = value_str.trim();

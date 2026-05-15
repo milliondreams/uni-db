@@ -1111,6 +1111,7 @@ async fn run_program(
                             registry: &classifier_registry,
                             cache: classifier_cache.as_ref(),
                         },
+                        semiring_kind,
                     )
                     .await
                 } else {

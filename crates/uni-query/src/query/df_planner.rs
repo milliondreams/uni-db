@@ -1211,6 +1211,15 @@ impl HybridPhysicalPlanner {
                 path_context_handles,
             } => {
                 let input_plan = self.plan_internal(input, all_properties)?;
+                // Phase D D2 runtime: inject the Xervo embedder runtime
+                // from graph_ctx at physical lowering. The logical plan
+                // is graph_ctx-agnostic; the physical exec carries the
+                // shared `Arc<ModelRuntime>` needed to embed
+                // `semantic_match` query literals.
+                let xervo_runtime =
+                    super::df_graph::locy_model_invoke::XervoRuntimeHandle(
+                        self.graph_ctx.xervo_runtime().cloned(),
+                    );
                 Ok(Arc::new(
                     super::df_graph::locy_model_invoke::LocyModelInvokeExec::new(
                         input_plan,
@@ -1219,6 +1228,7 @@ impl HybridPhysicalPlanner {
                         classifier_cache.as_ref().map(Arc::clone),
                         classifier_provenance_store.as_ref().map(Arc::clone),
                         path_context_handles.clone(),
+                        xervo_runtime,
                     ),
                 ))
             }

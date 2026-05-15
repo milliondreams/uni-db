@@ -32,8 +32,32 @@ use datafusion::physical_plan::{
 use futures::TryStreamExt;
 use parking_lot::RwLock;
 use uni_locy::{ClassifierRegistry, ModelInvocation, ModelInvocationCache};
+use uni_xervo::runtime::ModelRuntime;
 
 use super::locy_fixpoint::apply_model_invocations;
+
+/// Phase D D2 runtime: a Clone+Debug wrapper around the optional
+/// Uni-Xervo runtime. `ModelRuntime` doesn't derive Debug (its
+/// `providers: HashMap<String, Box<dyn ModelProvider>>` field
+/// contains trait objects that aren't Debug), so we need this
+/// shim to keep `LogicalPlan` derivable.
+#[derive(Clone, Default)]
+pub struct XervoRuntimeHandle(pub Option<Arc<ModelRuntime>>);
+
+impl std::fmt::Debug for XervoRuntimeHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            Some(_) => write!(f, "XervoRuntimeHandle(<configured>)"),
+            None => write!(f, "XervoRuntimeHandle(<none>)"),
+        }
+    }
+}
+
+impl XervoRuntimeHandle {
+    pub fn as_ref(&self) -> Option<&Arc<ModelRuntime>> {
+        self.0.as_ref()
+    }
+}
 
 /// Phase D D3 runtime: a shared handle into a source rule's derived
 /// facts. The plan builder mints these for every `path_context.source_rule`
@@ -59,6 +83,12 @@ pub struct LocyModelInvokeExec {
     /// Phase D D3: one handle per distinct `path_context.source_rule`
     /// referenced by the invocations on this node, indexed by rule name.
     path_context_handles: HashMap<String, PathContextHandle>,
+    /// Phase D D2 runtime: Uni-Xervo runtime for auto-embedding
+    /// `semantic_match(prop, 'text')` query literals once per
+    /// `apply_model_invocations` call. `None` when no xervo runtime
+    /// is configured — `semantic_match` calls then error with a
+    /// clear message at row time.
+    xervo_runtime: XervoRuntimeHandle,
     /// Phase C B1-B3 follow-up: per-query side-channel store for
     /// (raw, calibrated, confidence_band) tuples. Written per row
     /// per invocation by `apply_model_invocations`; consumed by
@@ -83,6 +113,7 @@ impl LocyModelInvokeExec {
         cache: Option<Arc<ModelInvocationCache>>,
         provenance_store: Option<Arc<uni_locy::NeuralProvenanceStore>>,
         path_context_handles: HashMap<String, PathContextHandle>,
+        xervo_runtime: XervoRuntimeHandle,
     ) -> Self {
         let schema = compute_output_schema(input.schema(), &invocations);
         let plan_properties = compute_plan_properties(&input, schema.clone());
@@ -93,6 +124,7 @@ impl LocyModelInvokeExec {
             cache,
             provenance_store,
             path_context_handles,
+            xervo_runtime,
             schema,
             plan_properties,
         }
@@ -189,6 +221,7 @@ impl ExecutionPlan for LocyModelInvokeExec {
             self.cache.as_ref().map(Arc::clone),
             self.provenance_store.as_ref().map(Arc::clone),
             self.path_context_handles.clone(),
+            self.xervo_runtime.clone(),
         )))
     }
 
@@ -203,6 +236,7 @@ impl ExecutionPlan for LocyModelInvokeExec {
         let cache = self.cache.as_ref().map(Arc::clone);
         let provenance_store = self.provenance_store.as_ref().map(Arc::clone);
         let path_context_handles = self.path_context_handles.clone();
+        let xervo_runtime = self.xervo_runtime.clone();
         let schema = self.schema.clone();
 
         let fut = async move {
@@ -214,6 +248,7 @@ impl ExecutionPlan for LocyModelInvokeExec {
                 cache.as_ref(),
                 provenance_store.as_ref(),
                 &path_context_handles,
+                &xervo_runtime,
             )
             .await?;
             // Wrap the Vec<RecordBatch> as a stream so try_flatten

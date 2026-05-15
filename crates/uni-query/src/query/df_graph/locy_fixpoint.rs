@@ -2619,11 +2619,17 @@ pub(crate) async fn apply_model_invocations(
         String,
         crate::query::df_graph::locy_model_invoke::PathContextHandle,
     >,
+    xervo_runtime: &crate::query::df_graph::locy_model_invoke::XervoRuntimeHandle,
 ) -> DFResult<Vec<RecordBatch>> {
     use uni_locy::ClassifyInput;
     if batches.is_empty() || invocations.is_empty() {
         return Ok(batches);
     }
+    // Phase D D2: pre-embed all unique `semantic_match` query literals
+    // once per call. Resolvers below lower each `semantic_match(prop,
+    // 'text')` into a `SimilarTo { left: prop_col, right: Const(Vector) }`.
+    let semantic_match_embeddings =
+        pre_embed_semantic_match_queries(invocations, xervo_runtime).await?;
     let mut out_batches = Vec::with_capacity(batches.len());
     for batch in batches {
         let mut current = batch;
@@ -2647,7 +2653,12 @@ pub(crate) async fn apply_model_invocations(
             //     — Phase D D1/D2 retrieval-backed feature; both args
             //     resolved to columns; UDF evaluated per row against
             //     the row's `uni_common::Value` payloads.
-            let resolvers = build_feature_resolvers(&current, invocation, path_context_handles)?;
+            let resolvers = build_feature_resolvers(
+                &current,
+                invocation,
+                path_context_handles,
+                &semantic_match_embeddings,
+            )?;
 
             // Build one ClassifyInput per row.
             let n_rows = current.num_rows();
@@ -2794,13 +2805,6 @@ enum FeatureResolverKind {
         left: FeatureValueSrc,
         right: FeatureValueSrc,
     },
-    /// `semantic_match(prop, 'text')` — runtime auto-embed of `text` via
-    /// the Xervo runtime is not yet threaded into `apply_model_invocations`;
-    /// the resolver carries enough metadata to error clearly at row time
-    /// rather than panic.
-    SemanticMatch {
-        model_name: String,
-    },
     /// Phase D D3 runtime: pull `column` from the source rule's
     /// derived facts via a pre-built `vid → FeatureValue` lookup. The
     /// `subject_col` is the index of `<subject_var>._vid` in the body
@@ -2844,16 +2848,6 @@ impl FeatureResolver {
                     ))),
                 }
             }
-            FeatureResolverKind::SemanticMatch { model_name } => {
-                Err(datafusion::error::DataFusionError::Execution(format!(
-                    "model '{}': `semantic_match(prop, 'text')` requires the Xervo \
-                     embedding runtime, which is not yet threaded into \
-                     `apply_model_invocations` (Phase D D2 follow-up). Emulate by \
-                     pre-computing the query embedding and passing it via \
-                     `similar_to(prop, <literal_vector>)`.",
-                    model_name
-                )))
-            }
             FeatureResolverKind::PathContext {
                 subject_col,
                 vid_to_value,
@@ -2889,6 +2883,7 @@ fn build_feature_resolvers(
         String,
         crate::query::df_graph::locy_model_invoke::PathContextHandle,
     >,
+    semantic_match_embeddings: &HashMap<String, Vec<f32>>,
 ) -> DFResult<Vec<FeatureResolver>> {
     use uni_cypher::ast::Expr;
     let schema = batch.schema();
@@ -3000,9 +2995,38 @@ fn build_feature_resolvers(
                     right: resolve_src(&args[1])?,
                 }
             }
-            Expr::FunctionCall { name, .. } if name == "semantic_match" => {
-                FeatureResolverKind::SemanticMatch {
-                    model_name: invocation.model_name.clone(),
+            Expr::FunctionCall { name, args, .. } if name == "semantic_match" => {
+                // Phase D D2: lower `semantic_match(prop, 'text')` to a
+                // `SimilarTo` resolver with the pre-embedded query
+                // vector as the right side. The literal text was embedded
+                // once via the Xervo runtime in `pre_embed_semantic_match_queries`.
+                if args.len() != 2 {
+                    return Err(datafusion::error::DataFusionError::Execution(format!(
+                        "semantic_match expects 2 args, got {}",
+                        args.len()
+                    )));
+                }
+                let text = match &args[1] {
+                    Expr::Literal(uni_cypher::ast::CypherLiteral::String(s)) => s.clone(),
+                    other => {
+                        return Err(datafusion::error::DataFusionError::Execution(format!(
+                            "semantic_match: 2nd arg must be a string literal, got {other:?}"
+                        )));
+                    }
+                };
+                let embedded = semantic_match_embeddings.get(&text).ok_or_else(|| {
+                    datafusion::error::DataFusionError::Execution(format!(
+                        "semantic_match: query text '{text}' was not pre-embedded. \
+                         This is a bug — `apply_model_invocations` should have \
+                         embedded all unique semantic_match texts up front. Most \
+                         likely the Xervo runtime is not configured (configure \
+                         via `LocyConfig::xervo_runtime` or its equivalent)."
+                    ))
+                })?;
+                let right_vec: Vec<f32> = embedded.clone();
+                FeatureResolverKind::SimilarTo {
+                    left: resolve_src(&args[0])?,
+                    right: FeatureValueSrc::Const(uni_common::Value::Vector(right_vec)),
                 }
             }
             other => match resolve_src(other)? {
@@ -3016,6 +3040,77 @@ fn build_feature_resolvers(
             },
         };
         out.push(FeatureResolver { binding_name, kind });
+    }
+    Ok(out)
+}
+
+/// Phase D D2: scan invocations' feature expressions for
+/// `semantic_match(prop, 'text')` calls and embed each distinct
+/// query string once via the Xervo runtime. Returns a
+/// `text → Vec<f32>` map consumed at resolver-build time. Errors
+/// cleanly when `semantic_match` is used without a configured
+/// Xervo runtime.
+async fn pre_embed_semantic_match_queries(
+    invocations: &[uni_locy::ModelInvocation],
+    xervo_runtime: &crate::query::df_graph::locy_model_invoke::XervoRuntimeHandle,
+) -> DFResult<HashMap<String, Vec<f32>>> {
+    use uni_cypher::ast::{CypherLiteral, Expr};
+    let mut needed: Vec<String> = Vec::new();
+    for inv in invocations {
+        for fexpr in &inv.feature_exprs {
+            if let Expr::FunctionCall { name, args, .. } = fexpr
+                && name == "semantic_match"
+                && args.len() == 2
+                && let Expr::Literal(CypherLiteral::String(s)) = &args[1]
+                && !needed.contains(s)
+            {
+                needed.push(s.clone());
+            }
+        }
+    }
+    if needed.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let runtime = xervo_runtime.as_ref().ok_or_else(|| {
+        datafusion::error::DataFusionError::Execution(
+            "semantic_match: Uni-Xervo runtime not configured. Either provide \
+             one via `LocyConfig::xervo_runtime` (or its equivalent setup \
+             path) or pre-compute the query embedding and pass it via \
+             `similar_to(prop, <literal_vector>)`."
+                .to_string(),
+        )
+    })?;
+    // For MVP, use the first vector index with an embedding config as the
+    // default alias — mirrors `auto_embed_query` in similar_to_expr.rs.
+    // The model declaration does not yet carry an explicit embedder
+    // alias; a future slice may surface it on `USING xervo(...)`.
+    // Without storage schema access here, we ask the runtime for a
+    // default-named embedder; runtimes that don't have one error
+    // cleanly.
+    let default_alias = "default";
+    let embedder = runtime.embedding(default_alias).await.map_err(|e| {
+        datafusion::error::DataFusionError::Execution(format!(
+            "semantic_match: failed to obtain embedder for alias '{default_alias}': {e}. \
+             Register an embedder under that alias in your Uni-Xervo runtime, or \
+             pre-compute the query embedding and pass via similar_to."
+        ))
+    })?;
+    let texts: Vec<&str> = needed.iter().map(|s| s.as_str()).collect();
+    let embeddings = embedder.embed(texts).await.map_err(|e| {
+        datafusion::error::DataFusionError::Execution(format!(
+            "semantic_match: embedder call failed: {e}"
+        ))
+    })?;
+    if embeddings.len() != needed.len() {
+        return Err(datafusion::error::DataFusionError::Execution(format!(
+            "semantic_match: embedder returned {} vectors for {} queries",
+            embeddings.len(),
+            needed.len()
+        )));
+    }
+    let mut out = HashMap::with_capacity(needed.len());
+    for (text, vec) in needed.into_iter().zip(embeddings.into_iter()) {
+        out.insert(text, vec);
     }
     Ok(out)
 }

@@ -176,8 +176,11 @@ pub fn check(
     }
 
     // Second pass: validate IS reference arity and prev field names (all yield schemas are inferred by now)
+    // Also runs Phase D F3 case 2 detection — needs all rules'
+    // yield_schemas in place to identify PROB-bearing targets.
     for (rule_name, rule) in &compiled_rules {
         for clause in &rule.clauses {
+            check_cross_predicate_correlation(rule_name, clause, &compiled_rules, &mut warnings);
             // Collect IS references that are within the same SCC (self-IS-refs)
             let scc_idx = strat.scc_map[rule_name.as_str()];
             let scc_rules = &strat.sccs[scc_idx];
@@ -494,6 +497,64 @@ fn check_positive_complement_pair(
                 });
             }
         }
+    }
+}
+
+// ─── Phase D F3 case 2: cross-predicate correlation ────────────────────────
+
+fn check_cross_predicate_correlation(
+    rule_name: &str,
+    clause: &CompiledClause,
+    compiled_rules: &HashMap<String, CompiledRule>,
+    warnings: &mut Vec<CompilerWarning>,
+) {
+    // Index positive IS-refs by their first subject variable, recording
+    // target rule names. Negated refs are case 3's concern, not this one.
+    let mut by_subject: HashMap<String, Vec<String>> = HashMap::new();
+    for cond in &clause.where_conditions {
+        if let RuleCondition::IsReference(is_ref) = cond
+            && !is_ref.negated
+            && let Some(subj) = is_ref.subjects.first()
+        {
+            by_subject
+                .entry(subj.clone())
+                .or_default()
+                .push(is_ref.rule_name.to_string());
+        }
+    }
+    for (subj, targets) in by_subject {
+        // Dedupe and keep only distinct targets.
+        let mut distinct: Vec<&String> = targets.iter().collect();
+        distinct.sort();
+        distinct.dedup();
+        if distinct.len() < 2 {
+            continue;
+        }
+        // Count PROB-bearing targets.
+        let prob_targets: Vec<&str> = distinct
+            .iter()
+            .filter_map(|t| {
+                compiled_rules
+                    .get(t.as_str())
+                    .filter(|r| r.yield_schema.iter().any(|c| c.is_prob))
+                    .map(|_| t.as_str())
+            })
+            .collect();
+        if prob_targets.len() < 2 {
+            continue;
+        }
+        warnings.push(CompilerWarning {
+            code: WarningCode::CrossPredicateCorrelation,
+            message: format!(
+                "rule '{rule_name}': WHERE {subj} IS {} (multiple PROB-bearing IS-refs \
+                 on the same subject) — the implicit conjunction assumes \
+                 independence between predicates, which is wrong when their \
+                 support sets overlap. Use BDD/TopKProofs for exact composition, \
+                 or accept the independence approximation.",
+                prob_targets.join(", ")
+            ),
+            rule_name: rule_name.to_string(),
+        });
     }
 }
 

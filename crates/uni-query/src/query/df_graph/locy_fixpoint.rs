@@ -1736,6 +1736,47 @@ fn eval_feature_expr_against_fact_row(
             _ => FeatureValue::Null,
         }
     };
+    // Phase D D1: resolve a sub-expression to its raw `uni_common::Value`
+    // for the `similar_to` UDF input. Falls back to the node's property
+    // when the materialized column key isn't directly present.
+    let resolve_value = |sub: &Expr| -> uni_common::Value {
+        match sub {
+            Expr::Variable(name) => fact_row
+                .get(name)
+                .cloned()
+                .unwrap_or(uni_common::Value::Null),
+            Expr::Property(boxed, prop) if matches!(boxed.as_ref(), Expr::Variable(_)) => {
+                let Expr::Variable(v) = boxed.as_ref() else {
+                    unreachable!()
+                };
+                let key = format!("{}.{}", v, prop);
+                if let Some(val) = fact_row.get(&key) {
+                    return val.clone();
+                }
+                if let Some(uni_common::Value::Node(n)) = fact_row.get(v) {
+                    return n
+                        .properties
+                        .get(prop)
+                        .cloned()
+                        .unwrap_or(uni_common::Value::Null);
+                }
+                uni_common::Value::Null
+            }
+            Expr::Literal(lit) => lit.to_value(),
+            Expr::List(items) => {
+                let mut out = Vec::with_capacity(items.len());
+                for it in items {
+                    out.push(match it {
+                        Expr::Literal(lit) => lit.to_value(),
+                        _ => uni_common::Value::Null,
+                    });
+                }
+                uni_common::Value::List(out)
+            }
+            _ => uni_common::Value::Null,
+        }
+    };
+
     match expr {
         Expr::Variable(name) => value_to_feature(fact_row.get(name)),
         Expr::Property(boxed, prop) => {
@@ -1752,6 +1793,17 @@ fn eval_feature_expr_against_fact_row(
             }
             FeatureValue::Null
         }
+        Expr::FunctionCall { name, args, .. } if name == "similar_to" && args.len() == 2 => {
+            let lv = resolve_value(&args[0]);
+            let rv = resolve_value(&args[1]);
+            match crate::query::similar_to::eval_similar_to_pure(&lv, &rv) {
+                Ok(uni_common::Value::Float(f)) => FeatureValue::Float(f),
+                _ => FeatureValue::Null,
+            }
+        }
+        // `semantic_match` requires the Xervo embedder at this scope, which
+        // is not threaded into the EXPLAIN re-evaluation path. Surface as
+        // Null so neural-provenance still renders for the rest of the row.
         _ => FeatureValue::Null,
     }
 }
@@ -2553,81 +2605,18 @@ pub(crate) async fn apply_model_invocations(
                 ))
             })?;
 
-            // Resolve each feature_expr to a column in the current batch.
+            // Resolve each feature_expr to a per-row evaluator.
             // Supported shapes (validated at compile time by
-            // `extract_model_invocations`):
+            // `extract_model_invocations` / `validate_features`):
             //   * `Expr::Variable("name")` — direct column reference.
             //   * `Expr::Property(Variable(v), prop)` — looked up by the
             //     conventional `"v.prop"` column name materialized by
-            //     the planner's `translate_property_access` pipeline
-            //     (the compiler appended a hidden YIELD item that
-            //     produces this column for every property feature ref).
-            let mut feature_cols: Vec<(String, usize)> =
-                Vec::with_capacity(invocation.feature_exprs.len());
-            for (i, fexpr) in invocation.feature_exprs.iter().enumerate() {
-                let schema = current.schema();
-                let col_name = match fexpr {
-                    uni_cypher::ast::Expr::Variable(name) => {
-                        // After A4's "invoke below LocyProject"
-                        // restructure, the batch we see is the
-                        // pre-projection body — node variables are
-                        // present as `<name>._vid` helper columns
-                        // (graph scan output), NOT as the flat
-                        // `<name>` column that LocyProject later
-                        // emits. Resolve to `<name>._vid` when the
-                        // flat column is absent.
-                        if schema.index_of(name).is_ok() {
-                            name.clone()
-                        } else {
-                            let vid_name = format!("{}._vid", name);
-                            if schema.index_of(&vid_name).is_ok() {
-                                vid_name
-                            } else {
-                                name.clone()
-                            }
-                        }
-                    }
-                    uni_cypher::ast::Expr::Property(boxed_inner, prop)
-                        if matches!(boxed_inner.as_ref(), uni_cypher::ast::Expr::Variable(_)) =>
-                    {
-                        let var = match boxed_inner.as_ref() {
-                            uni_cypher::ast::Expr::Variable(v) => v.clone(),
-                            _ => unreachable!(),
-                        };
-                        // After the A4 "invoke below LocyProject"
-                        // restructure, we read from the pre-projection
-                        // body batch — properties arrive from the
-                        // graph scan as `<var>.<prop>` flat columns
-                        // (collect_properties_from_plan ensures the
-                        // scan materializes them because the hidden
-                        // YIELD item references the property).
-                        let direct = format!("{}.{}", var, prop);
-                        if schema.index_of(&direct).is_ok() {
-                            direct
-                        } else {
-                            // Fallback to the hidden-YIELD alias for
-                            // the legacy path. Should not be reached
-                            // in the unified structure.
-                            format!("__feat_{}_{}", var, prop)
-                        }
-                    }
-                    other => {
-                        return Err(datafusion::error::DataFusionError::Execution(format!(
-                            "model '{}' supports plain variable / synthesized \
-                             property feature expressions; got {other:?}",
-                            invocation.model_name
-                        )));
-                    }
-                };
-                let idx = current.schema().index_of(&col_name).map_err(|_| {
-                    datafusion::error::DataFusionError::Execution(format!(
-                        "feature column '{col_name}' not found in clause body \
-                         output schema for model '{}'",
-                        invocation.model_name
-                    ))
-                })?;
-                feature_cols.push((invocation.feature_names[i].clone(), idx));
-            }
+            //     the planner's `translate_property_access` pipeline.
+            //   * `Expr::FunctionCall { name: "similar_to"|"semantic_match", ... }`
+            //     — Phase D D1/D2 retrieval-backed feature; both args
+            //     resolved to columns; UDF evaluated per row against
+            //     the row's `uni_common::Value` payloads.
+            let resolvers = build_feature_resolvers(&current, invocation)?;
 
             // Build one ClassifyInput per row.
             let n_rows = current.num_rows();
@@ -2635,12 +2624,9 @@ pub(crate) async fn apply_model_invocations(
             let mut input_hashes: Vec<u64> = Vec::with_capacity(n_rows);
             for row_idx in 0..n_rows {
                 let mut features = std::collections::HashMap::new();
-                for (binding_name, col_idx) in &feature_cols {
-                    let col = current.column(*col_idx);
-                    features.insert(
-                        binding_name.clone(),
-                        extract_feature_value(col.as_ref(), row_idx),
-                    );
+                for resolver in &resolvers {
+                    let value = resolver.eval_row(&current, row_idx)?;
+                    features.insert(resolver.binding_name.clone(), value);
                 }
                 let input = ClassifyInput { features };
                 input_hashes.push(input.stable_hash());
@@ -2762,6 +2748,208 @@ pub(crate) async fn apply_model_invocations(
 /// Extract a [`uni_locy::FeatureValue`] from a column at a given row.
 /// Conservative cast set matching the property-graph value types Locy
 /// currently exposes; unsupported types fall back to `Null`.
+/// Per-feature evaluator built once from a clause's `feature_exprs`
+/// and reused for every row in the batch. Supports plain column
+/// reads (`Direct`) and the Phase D D1/D2 retrieval-backed UDFs
+/// (`SimilarTo`, `SemanticMatch`).
+struct FeatureResolver {
+    binding_name: String,
+    kind: FeatureResolverKind,
+}
+
+enum FeatureResolverKind {
+    Direct(usize),
+    SimilarTo {
+        left: FeatureValueSrc,
+        right: FeatureValueSrc,
+    },
+    /// `semantic_match(prop, 'text')` — runtime auto-embed of `text` via
+    /// the Xervo runtime is not yet threaded into `apply_model_invocations`;
+    /// the resolver carries enough metadata to error clearly at row time
+    /// rather than panic.
+    SemanticMatch {
+        model_name: String,
+    },
+}
+
+/// One side of a `similar_to` feature: either a column index in the
+/// per-row batch or a constant value lifted from a literal expression.
+enum FeatureValueSrc {
+    Col(usize),
+    Const(uni_common::Value),
+}
+
+impl FeatureValueSrc {
+    fn resolve(&self, batch: &RecordBatch, row_idx: usize) -> uni_common::Value {
+        match self {
+            FeatureValueSrc::Col(idx) => extract_common_value(batch.column(*idx).as_ref(), row_idx),
+            FeatureValueSrc::Const(v) => v.clone(),
+        }
+    }
+}
+
+impl FeatureResolver {
+    fn eval_row(&self, batch: &RecordBatch, row_idx: usize) -> DFResult<uni_locy::FeatureValue> {
+        match &self.kind {
+            FeatureResolverKind::Direct(idx) => {
+                Ok(extract_feature_value(batch.column(*idx).as_ref(), row_idx))
+            }
+            FeatureResolverKind::SimilarTo { left, right } => {
+                let lv = left.resolve(batch, row_idx);
+                let rv = right.resolve(batch, row_idx);
+                match crate::query::similar_to::eval_similar_to_pure(&lv, &rv) {
+                    Ok(uni_common::Value::Float(f)) => Ok(uni_locy::FeatureValue::Float(f)),
+                    Ok(_) => Ok(uni_locy::FeatureValue::Null),
+                    Err(e) => Err(datafusion::error::DataFusionError::Execution(format!(
+                        "similar_to UDF failed: {e}"
+                    ))),
+                }
+            }
+            FeatureResolverKind::SemanticMatch { model_name } => {
+                Err(datafusion::error::DataFusionError::Execution(format!(
+                    "model '{}': `semantic_match(prop, 'text')` requires the Xervo \
+                     embedding runtime, which is not yet threaded into \
+                     `apply_model_invocations` (Phase D D2 follow-up). Emulate by \
+                     pre-computing the query embedding and passing it via \
+                     `similar_to(prop, <literal_vector>)`.",
+                    model_name
+                )))
+            }
+        }
+    }
+}
+
+fn build_feature_resolvers(
+    batch: &RecordBatch,
+    invocation: &uni_locy::ModelInvocation,
+) -> DFResult<Vec<FeatureResolver>> {
+    use uni_cypher::ast::Expr;
+    let schema = batch.schema();
+    let lookup_col = |name_or_property: String| -> DFResult<usize> {
+        schema.index_of(&name_or_property).map_err(|_| {
+            datafusion::error::DataFusionError::Execution(format!(
+                "feature column '{name_or_property}' not found in clause body output schema"
+            ))
+        })
+    };
+    // Resolve a feature sub-expression to a per-row value source. Variables
+    // and property accesses map to batch columns; list/scalar literals
+    // become inline constants — required so `similar_to(s.embedding, [1,0,0])`
+    // works without a hidden column for the literal vector.
+    let resolve_src = |expr: &Expr| -> DFResult<FeatureValueSrc> {
+        match expr {
+            Expr::Variable(name) => {
+                let col = if schema.index_of(name).is_ok() {
+                    name.clone()
+                } else {
+                    let vid_name = format!("{}._vid", name);
+                    if schema.index_of(&vid_name).is_ok() {
+                        vid_name
+                    } else {
+                        name.clone()
+                    }
+                };
+                Ok(FeatureValueSrc::Col(lookup_col(col)?))
+            }
+            Expr::Property(boxed, prop) if matches!(boxed.as_ref(), Expr::Variable(_)) => {
+                let Expr::Variable(v) = boxed.as_ref() else {
+                    unreachable!()
+                };
+                let direct = format!("{}.{}", v, prop);
+                let col = if schema.index_of(&direct).is_ok() {
+                    direct
+                } else {
+                    format!("__feat_{}_{}", v, prop)
+                };
+                Ok(FeatureValueSrc::Col(lookup_col(col)?))
+            }
+            Expr::Literal(lit) => Ok(FeatureValueSrc::Const(lit.to_value())),
+            Expr::List(items) => {
+                let mut out = Vec::with_capacity(items.len());
+                for it in items {
+                    out.push(match it {
+                        Expr::Literal(lit) => lit.to_value(),
+                        _ => uni_common::Value::Null,
+                    });
+                }
+                Ok(FeatureValueSrc::Const(uni_common::Value::List(out)))
+            }
+            other => Err(datafusion::error::DataFusionError::Execution(format!(
+                "unsupported feature sub-expression: {other:?}"
+            ))),
+        }
+    };
+
+    let mut out = Vec::with_capacity(invocation.feature_exprs.len());
+    for (i, fexpr) in invocation.feature_exprs.iter().enumerate() {
+        let binding_name = invocation.feature_names[i].clone();
+        let kind = match fexpr {
+            Expr::FunctionCall { name, args, .. } if name == "similar_to" => {
+                if args.len() != 2 {
+                    return Err(datafusion::error::DataFusionError::Execution(format!(
+                        "similar_to expects 2 args, got {}",
+                        args.len()
+                    )));
+                }
+                FeatureResolverKind::SimilarTo {
+                    left: resolve_src(&args[0])?,
+                    right: resolve_src(&args[1])?,
+                }
+            }
+            Expr::FunctionCall { name, .. } if name == "semantic_match" => {
+                FeatureResolverKind::SemanticMatch {
+                    model_name: invocation.model_name.clone(),
+                }
+            }
+            other => match resolve_src(other)? {
+                FeatureValueSrc::Col(idx) => FeatureResolverKind::Direct(idx),
+                FeatureValueSrc::Const(_) => {
+                    return Err(datafusion::error::DataFusionError::Execution(format!(
+                        "model '{}' feature must reference a variable or property — got a literal",
+                        invocation.model_name
+                    )));
+                }
+            },
+        };
+        out.push(FeatureResolver { binding_name, kind });
+    }
+    Ok(out)
+}
+
+/// Extract a `uni_common::Value` from one row of an Arrow column.
+/// Used by the Phase D `similar_to` feature resolver, which needs
+/// the raw `Value` (especially `Value::Vector(Vec<f32>)`) to feed
+/// `eval_similar_to_pure`.
+fn extract_common_value(col: &dyn arrow_array::Array, row_idx: usize) -> uni_common::Value {
+    use arrow_array::{BooleanArray, Float64Array, Int64Array, LargeStringArray, StringArray};
+    if col.is_null(row_idx) {
+        return uni_common::Value::Null;
+    }
+    if let Some(a) = col.as_any().downcast_ref::<Float64Array>() {
+        return uni_common::Value::Float(a.value(row_idx));
+    }
+    if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
+        return uni_common::Value::Int(a.value(row_idx));
+    }
+    if let Some(a) = col.as_any().downcast_ref::<BooleanArray>() {
+        return uni_common::Value::Bool(a.value(row_idx));
+    }
+    if let Some(a) = col.as_any().downcast_ref::<StringArray>() {
+        return uni_common::Value::String(a.value(row_idx).to_string());
+    }
+    if let Some(a) = col.as_any().downcast_ref::<LargeStringArray>() {
+        return uni_common::Value::String(a.value(row_idx).to_string());
+    }
+    if let Some(b) = col.as_any().downcast_ref::<arrow_array::LargeBinaryArray>() {
+        let bytes = b.value(row_idx);
+        if bytes.is_empty() {
+            return uni_common::Value::Null;
+        }
+        return uni_common::cypher_value_codec::decode(bytes).unwrap_or(uni_common::Value::Null);
+    }
+    uni_common::Value::Null
+}
+
 fn extract_feature_value(col: &dyn arrow_array::Array, row_idx: usize) -> uni_locy::FeatureValue {
     use arrow_array::{BooleanArray, Float64Array, Int64Array, LargeStringArray, StringArray};
     if col.is_null(row_idx) {

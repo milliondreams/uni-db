@@ -870,33 +870,60 @@ impl<'a> InvocationLifter<'a> {
                     }
                     rewritten.push(fexpr.clone());
                 }
-                Expr::FunctionCall { name, .. }
-                    if matches!(name.as_str(), "similar_to" | "semantic_match") =>
-                {
-                    // `semantic_match` / `similar_to` feature
-                    // expressions are deferred to a follow-up:
-                    // the current "LocyModelInvoke below LocyProject"
-                    // structure requires a pre-invoke projection step
-                    // that materializes the UDF output, which is a
-                    // separate planner change. The `similar_to` UDF
-                    // itself is fully implemented (see
-                    // df_udfs.rs:create_similar_to_udf); only the
-                    // wiring into FEATURES is pending. Users can
-                    // emulate via an intermediate rule that YIELDs a
-                    // `similar_to(...)` column and feeds it into the
-                    // model as a plain Variable feature.
-                    return Err(LocyCompileError::UnsupportedFeatureExpression {
-                        rule: self.rule_name.to_string(),
-                        model: model_name.to_string(),
-                        expr: format!(
-                            "{}(...) — retrieval-backed feature expressions \
-                             are deferred to Phase D D2; emulate via an \
-                             intermediate rule that YIELDs `similar_to(...)` \
-                             and feeds the resulting Float column as a plain \
-                             variable feature",
-                            name
-                        ),
-                    });
+                Expr::FunctionCall {
+                    name, args: fargs, ..
+                } if matches!(name.as_str(), "similar_to" | "semantic_match") => {
+                    // Phase D D1/D2: retrieval-backed feature expressions.
+                    // Both functions take exactly 2 args. Property-access
+                    // args register the (var, prop) pair so the standard
+                    // hidden-YIELD pipeline materializes them into the
+                    // per-row fact_row; the FunctionCall itself flows
+                    // through `original_feature_exprs` and is evaluated
+                    // per-row in `apply_model_invocations` /
+                    // `eval_feature_expr_against_fact_row`.
+                    if fargs.len() != 2 {
+                        return Err(LocyCompileError::UnsupportedFeatureExpression {
+                            rule: self.rule_name.to_string(),
+                            model: model_name.to_string(),
+                            expr: format!(
+                                "{}(...) requires exactly 2 arguments, got {}",
+                                name,
+                                fargs.len()
+                            ),
+                        });
+                    }
+                    for inner in fargs {
+                        match inner {
+                            Expr::Variable(_) | Expr::Literal(_) | Expr::List(_) => {}
+                            Expr::Property(boxed_inner, prop)
+                                if matches!(boxed_inner.as_ref(), Expr::Variable(_)) =>
+                            {
+                                if let Expr::Variable(v) = boxed_inner.as_ref() {
+                                    feature_property_refs.push((v.clone(), prop.clone()));
+                                    let col_name = format!("__feat_{}_{}", v, prop);
+                                    if !self.seen_hidden.contains(&col_name) {
+                                        self.seen_hidden.insert(col_name.clone());
+                                        let hidden_expr = Expr::Property(
+                                            Box::new(Expr::Variable(v.clone())),
+                                            prop.clone(),
+                                        );
+                                        self.hidden_items.push((col_name, hidden_expr));
+                                    }
+                                }
+                            }
+                            other => {
+                                return Err(LocyCompileError::UnsupportedFeatureExpression {
+                                    rule: self.rule_name.to_string(),
+                                    model: model_name.to_string(),
+                                    expr: format!(
+                                        "{}(...) argument must be Variable, Property, or Literal — got {other:?}",
+                                        name
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                    rewritten.push(fexpr.clone());
                 }
                 other => {
                     return Err(LocyCompileError::UnsupportedFeatureExpression {

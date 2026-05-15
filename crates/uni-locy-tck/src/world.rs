@@ -61,6 +61,17 @@ pub struct LocyWorld {
     last_locy_result: Option<Result<uni_locy::LocyResult, UniError>>,
     side_effects: SideEffects,
     params: HashMap<String, Value>,
+    /// Phase B Slice 3: per-scenario registry of mock neural classifiers
+    /// injected by Given/When steps. Threaded into `LocyConfig` whenever
+    /// a step builds one (see `steps/when_evaluate.rs`).
+    pub classifier_registry: uni_locy::ClassifierRegistry,
+    /// Phase B follow-up: per-model counters for the
+    /// `counting mock classifier` Given step. Each call to
+    /// `classify` on a registered counting mock increments the
+    /// matching entry. Used by `Then ... classifier "<name>"
+    /// should have been called N times` assertions.
+    pub classifier_call_counts:
+        std::collections::HashMap<String, std::sync::Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 impl std::fmt::Debug for LocyWorld {
@@ -150,6 +161,8 @@ impl LocyWorld {
             last_locy_result: None,
             side_effects: SideEffects::default(),
             params: HashMap::new(),
+            classifier_registry: uni_locy::ClassifierRegistry::new(),
+            classifier_call_counts: std::collections::HashMap::new(),
         }
     }
 

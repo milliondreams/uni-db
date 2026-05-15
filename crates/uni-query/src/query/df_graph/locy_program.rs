@@ -41,7 +41,9 @@ use uni_common::Value;
 use uni_common::core::schema::Schema as UniSchema;
 use uni_cypher::ast::Expr;
 use uni_cypher::locy_ast::GoalQuery;
-use uni_locy::{CommandResult, FactRow, RuntimeWarning};
+use uni_locy::{
+    ClassifierRegistry, CommandResult, FactRow, ModelInvocationCache, RuntimeWarning, SemiringKind,
+};
 use uni_store::storage::manager::StorageManager;
 
 // ---------------------------------------------------------------------------
@@ -118,6 +120,20 @@ pub struct LocyProgramExec {
     probability_epsilon: f64,
     exact_probability: bool,
     max_bdd_variables: usize,
+    /// Active probability semiring (rollout D-7). Defaults to `AddMultProb`
+    /// — the Phase 1/2 byte-identical behavior.
+    semiring_kind: SemiringKind,
+    /// Phase B Slice 3: runtime registry of `NeuralClassifier` impls
+    /// keyed by model name. Held by `Arc` so executor clones share the
+    /// same map.
+    classifier_registry: Arc<ClassifierRegistry>,
+    /// Phase B follow-up: optional memoization cache for classifier
+    /// outputs. `None` → no caching.
+    classifier_cache: Option<Arc<ModelInvocationCache>>,
+    /// Phase C B1-B3 follow-up: per-query side-channel store for
+    /// (raw, calibrated, confidence_band) records. Threaded to
+    /// `FixpointExec` so EXPLAIN can read from it.
+    classifier_provenance_store: Option<Arc<uni_locy::NeuralProvenanceStore>>,
     /// Shared slot for extracting the DerivedStore after execution completes.
     derived_store_slot: Arc<StdRwLock<Option<DerivedStore>>>,
     /// Shared slot for groups where BDD fell back to independence mode.
@@ -157,6 +173,12 @@ impl LocyProgramExec {
         clippy::too_many_arguments,
         reason = "execution plan node requires full graph and session context"
     )]
+    #[deprecated(
+        note = "use `new_with_semiring_classifiers_and_cache` (or the lighter \
+                `new_with_semiring_and_classifiers` / `new_with_semiring`) — \
+                this legacy ctor defaults the semiring to AddMultProb and \
+                ships no classifier registry. To be removed after C0 Stage 2."
+    )]
     pub fn new(
         strata: Vec<LocyStratum>,
         commands: Vec<LocyCommand>,
@@ -176,6 +198,168 @@ impl LocyProgramExec {
         exact_probability: bool,
         max_bdd_variables: usize,
         top_k_proofs: usize,
+    ) -> Self {
+        Self::new_with_semiring_and_classifiers(
+            strata,
+            commands,
+            derived_scan_registry,
+            graph_ctx,
+            session_ctx,
+            storage,
+            schema_info,
+            params,
+            output_schema,
+            max_iterations,
+            timeout,
+            max_derived_bytes,
+            deterministic_best_by,
+            strict_probability_domain,
+            probability_epsilon,
+            exact_probability,
+            max_bdd_variables,
+            top_k_proofs,
+            SemiringKind::AddMultProb,
+            Arc::new(ClassifierRegistry::new()),
+        )
+    }
+
+    /// Constructor accepting an explicit semiring. Empty classifier
+    /// registry; for the full Slice 3 variant call
+    /// [`Self::new_with_semiring_and_classifiers`].
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "execution plan node requires full graph and session context"
+    )]
+    pub fn new_with_semiring(
+        strata: Vec<LocyStratum>,
+        commands: Vec<LocyCommand>,
+        derived_scan_registry: Arc<DerivedScanRegistry>,
+        graph_ctx: Arc<GraphExecutionContext>,
+        session_ctx: Arc<RwLock<datafusion::prelude::SessionContext>>,
+        storage: Arc<StorageManager>,
+        schema_info: Arc<UniSchema>,
+        params: HashMap<String, Value>,
+        output_schema: SchemaRef,
+        max_iterations: usize,
+        timeout: Duration,
+        max_derived_bytes: usize,
+        deterministic_best_by: bool,
+        strict_probability_domain: bool,
+        probability_epsilon: f64,
+        exact_probability: bool,
+        max_bdd_variables: usize,
+        top_k_proofs: usize,
+        semiring_kind: SemiringKind,
+    ) -> Self {
+        Self::new_with_semiring_and_classifiers(
+            strata,
+            commands,
+            derived_scan_registry,
+            graph_ctx,
+            session_ctx,
+            storage,
+            schema_info,
+            params,
+            output_schema,
+            max_iterations,
+            timeout,
+            max_derived_bytes,
+            deterministic_best_by,
+            strict_probability_domain,
+            probability_epsilon,
+            exact_probability,
+            max_bdd_variables,
+            top_k_proofs,
+            semiring_kind,
+            Arc::new(ClassifierRegistry::new()),
+        )
+    }
+
+    /// Phase B Slice 3 entry: accepts both the semiring kind and the
+    /// runtime classifier registry.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "execution plan node requires full graph and session context"
+    )]
+    pub fn new_with_semiring_and_classifiers(
+        strata: Vec<LocyStratum>,
+        commands: Vec<LocyCommand>,
+        derived_scan_registry: Arc<DerivedScanRegistry>,
+        graph_ctx: Arc<GraphExecutionContext>,
+        session_ctx: Arc<RwLock<datafusion::prelude::SessionContext>>,
+        storage: Arc<StorageManager>,
+        schema_info: Arc<UniSchema>,
+        params: HashMap<String, Value>,
+        output_schema: SchemaRef,
+        max_iterations: usize,
+        timeout: Duration,
+        max_derived_bytes: usize,
+        deterministic_best_by: bool,
+        strict_probability_domain: bool,
+        probability_epsilon: f64,
+        exact_probability: bool,
+        max_bdd_variables: usize,
+        top_k_proofs: usize,
+        semiring_kind: SemiringKind,
+        classifier_registry: Arc<ClassifierRegistry>,
+    ) -> Self {
+        Self::new_with_semiring_classifiers_and_cache(
+            strata,
+            commands,
+            derived_scan_registry,
+            graph_ctx,
+            session_ctx,
+            storage,
+            schema_info,
+            params,
+            output_schema,
+            max_iterations,
+            timeout,
+            max_derived_bytes,
+            deterministic_best_by,
+            strict_probability_domain,
+            probability_epsilon,
+            exact_probability,
+            max_bdd_variables,
+            top_k_proofs,
+            semiring_kind,
+            classifier_registry,
+            None,
+            None,
+        )
+    }
+
+    /// Phase B follow-up: full constructor accepting the optional
+    /// memoization cache. Existing callers default to `None` (no
+    /// cache); `impl_locy.rs` threads `LocyConfig.classifier_cache`
+    /// here.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "execution plan node requires full graph and session context"
+    )]
+    pub fn new_with_semiring_classifiers_and_cache(
+        strata: Vec<LocyStratum>,
+        commands: Vec<LocyCommand>,
+        derived_scan_registry: Arc<DerivedScanRegistry>,
+        graph_ctx: Arc<GraphExecutionContext>,
+        session_ctx: Arc<RwLock<datafusion::prelude::SessionContext>>,
+        storage: Arc<StorageManager>,
+        schema_info: Arc<UniSchema>,
+        params: HashMap<String, Value>,
+        output_schema: SchemaRef,
+        max_iterations: usize,
+        timeout: Duration,
+        max_derived_bytes: usize,
+        deterministic_best_by: bool,
+        strict_probability_domain: bool,
+        probability_epsilon: f64,
+        exact_probability: bool,
+        max_bdd_variables: usize,
+        top_k_proofs: usize,
+        semiring_kind: SemiringKind,
+        classifier_registry: Arc<ClassifierRegistry>,
+        classifier_cache: Option<Arc<ModelInvocationCache>>,
+        classifier_provenance_store: Option<Arc<uni_locy::NeuralProvenanceStore>>,
     ) -> Self {
         let properties = compute_plan_properties(Arc::clone(&output_schema));
         Self {
@@ -198,6 +382,10 @@ impl LocyProgramExec {
             probability_epsilon,
             exact_probability,
             max_bdd_variables,
+            semiring_kind,
+            classifier_registry,
+            classifier_cache,
+            classifier_provenance_store,
             derived_store_slot: Arc::new(StdRwLock::new(None)),
             approximate_slot: Arc::new(StdRwLock::new(HashMap::new())),
             derivation_tracker: Arc::new(StdRwLock::new(None)),
@@ -356,6 +544,10 @@ impl ExecutionPlan for LocyProgramExec {
         let command_results_slot = Arc::clone(&self.command_results_slot);
         let top_k_proofs = self.top_k_proofs;
         let timeout_flag = Arc::clone(&self.timeout_flag);
+        let semiring_kind = self.semiring_kind;
+        let classifier_registry = Arc::clone(&self.classifier_registry);
+        let classifier_cache = self.classifier_cache.as_ref().map(Arc::clone);
+        let classifier_provenance_store = self.classifier_provenance_store.as_ref().map(Arc::clone);
 
         let fut = async move {
             run_program(
@@ -385,6 +577,10 @@ impl ExecutionPlan for LocyProgramExec {
                 command_results_slot,
                 top_k_proofs,
                 timeout_flag,
+                semiring_kind,
+                classifier_registry,
+                classifier_cache,
+                classifier_provenance_store,
             )
             .await
         };
@@ -491,8 +687,7 @@ fn execute_query_inline(
             .filter(|row| {
                 let merged = super::locy_query::merge_params(row, params);
                 super::locy_eval::eval_expr(where_expr, &merged)
-                    .map(|v| v.as_bool().unwrap_or(false))
-                    .unwrap_or(false)
+                    .is_ok_and(|v| v.as_bool().unwrap_or(false))
             })
             .collect()
     } else {
@@ -662,9 +857,46 @@ async fn run_program(
     command_results_slot: Arc<StdRwLock<Vec<(usize, CommandResult)>>>,
     top_k_proofs: usize,
     timeout_flag: Arc<std::sync::atomic::AtomicBool>,
+    semiring_kind: SemiringKind,
+    classifier_registry: Arc<ClassifierRegistry>,
+    classifier_cache: Option<Arc<ModelInvocationCache>>,
+    classifier_provenance_store: Option<Arc<uni_locy::NeuralProvenanceStore>>,
 ) -> DFResult<Vec<RecordBatch>> {
     let start = Instant::now();
     let mut derived_store = DerivedStore::new();
+
+    // IMPORTANT: per rollout D-9 the FuzzyNotProbabilistic warning is
+    // unsuppressible. Emit one warning per PROB-bearing rule at program
+    // start under MaxMinProb. The recursive path in `run_fixpoint_loop`
+    // dedups against this set.
+    if semiring_kind == SemiringKind::MaxMinProb {
+        let mut warnings = warnings_slot.write().unwrap_or_else(|e| e.into_inner());
+        let mut already: std::collections::HashSet<String> = warnings
+            .iter()
+            .filter(|w| w.code == uni_locy::RuntimeWarningCode::FuzzyNotProbabilistic)
+            .map(|w| w.rule_name.clone())
+            .collect();
+        for stratum in &strata {
+            for rule in &stratum.rules {
+                let has_prob = rule.yield_schema.iter().any(|c| c.is_prob);
+                if has_prob && !already.contains(&rule.name) {
+                    warnings.push(RuntimeWarning {
+                        code: uni_locy::RuntimeWarningCode::FuzzyNotProbabilistic,
+                        message: format!(
+                            "rule '{}' carries a PROB column but is being evaluated under \
+                             the MaxMinProb (fuzzy / Viterbi) semiring; outputs are fuzzy \
+                             truth values, not probabilities",
+                            rule.name
+                        ),
+                        rule_name: rule.name.clone(),
+                        variable_count: None,
+                        key_group: None,
+                    });
+                    already.insert(rule.name.clone());
+                }
+            }
+        }
+    }
 
     // Evaluate each stratum in topological order
     for stratum in &strata {
@@ -684,7 +916,7 @@ async fn run_program(
                 convert_to_fixpoint_plans(&stratum.rules, &registry, deterministic_best_by)?;
             let fixpoint_schema = build_fixpoint_output_schema(&stratum.rules);
 
-            let exec = FixpointExec::new(
+            let exec = FixpointExec::new_with_semiring_classifiers_and_cache(
                 fixpoint_rules,
                 max_iterations,
                 remaining_timeout,
@@ -706,6 +938,10 @@ async fn run_program(
                 Arc::clone(&approximate_slot),
                 top_k_proofs,
                 Arc::clone(&timeout_flag),
+                semiring_kind,
+                Arc::clone(&classifier_registry),
+                classifier_cache.as_ref().map(Arc::clone),
+                classifier_provenance_store.as_ref().map(Arc::clone),
             );
 
             let task_ctx = session_ctx.read().task_ctx();
@@ -773,6 +1009,9 @@ async fn run_program(
                 for (clause_idx, (clause, fp_clause)) in
                     rule.clauses.iter().zip(fp_rule.clauses.iter()).enumerate()
                 {
+                    // Phase B A4 follow-up: the planner inserts
+                    // `LocyModelInvoke` between body and `LocyProject`
+                    // when the clause has neural invocations.
                     let mut batches = execute_subplan(
                         &clause.body,
                         &params,
@@ -847,7 +1086,20 @@ async fn run_program(
                 }
 
                 // Record provenance and detect shared proofs for non-recursive rules.
-                let shared_info = if let Some(ref tracker) = derivation_tracker {
+                //
+                // TODO(C0-stage2): swap `record_and_detect_lineage_nonrecursive`
+                // for `TopKTag` DNF inspection when
+                // `semiring_kind == TopKProofs { k }`. Library-layer
+                // tag math landed in
+                // `crates/uni-locy/src/top_k_proofs.rs` (Phase C C0
+                // Stage 1); Stage 2 wires per-row tags through the
+                // runtime so dependencies are visible here.
+                //
+                // Under MaxMinProb, `plus = max` is idempotent so shared
+                // proofs don't double-count — skip the (misleading) warning.
+                let shared_info = if semiring_kind == SemiringKind::MaxMinProb {
+                    None
+                } else if let Some(ref tracker) = derivation_tracker {
                     super::locy_fixpoint::record_and_detect_lineage_nonrecursive(
                         fp_rule,
                         &tagged_clause_facts,
@@ -855,7 +1107,10 @@ async fn run_program(
                         &warnings_slot,
                         &registry,
                         top_k_proofs,
+                        &classifier_registry,
+                        classifier_cache.as_ref(),
                     )
+                    .await
                 } else {
                     None
                 };
@@ -889,6 +1144,7 @@ async fn run_program(
                     &task_ctx,
                     strict_probability_domain,
                     probability_epsilon,
+                    semiring_kind,
                 )
                 .await?;
 
@@ -927,22 +1183,119 @@ async fn run_program(
         .position(|c| matches!(c, LocyCommand::Derive { .. }));
     let mut inline_results: Vec<(usize, CommandResult)> = Vec::new();
     for (cmd_idx, cmd) in commands.iter().enumerate() {
-        if let LocyCommand::Cypher { query } = cmd {
-            // Defer Cypher commands that follow a DERIVE to the dispatch loop
-            // so they can read from the ephemeral L0 overlay.
-            if first_derive_idx.is_some_and(|di| cmd_idx > di) {
-                continue;
+        match cmd {
+            LocyCommand::Cypher { query } => {
+                // Defer Cypher commands that follow a DERIVE to the dispatch loop
+                // so they can read from the ephemeral L0 overlay.
+                if first_derive_idx.is_some_and(|di| cmd_idx > di) {
+                    continue;
+                }
+                let rows = execute_cypher_inline(
+                    query,
+                    &schema_info,
+                    &params,
+                    &graph_ctx,
+                    &session_ctx,
+                    &storage,
+                )
+                .await?;
+                inline_results.push((cmd_idx, CommandResult::Cypher(rows)));
             }
-            let rows = execute_cypher_inline(
-                query,
-                &schema_info,
-                &params,
-                &graph_ctx,
-                &session_ctx,
-                &storage,
-            )
-            .await?;
-            inline_results.push((cmd_idx, CommandResult::Cypher(rows)));
+            LocyCommand::Validate { validate } => {
+                // Phase C C3: collect ground-truth pairs via a
+                // MATCH+TARGET query, join with the rule's derived
+                // facts on KEY columns, compute metrics.
+                let rule_key_cols: Vec<String> = strata
+                    .iter()
+                    .flat_map(|s| s.rules.iter())
+                    .find(|r| r.name == validate.rule_name)
+                    .map(|r| {
+                        r.yield_schema
+                            .iter()
+                            .filter(|c| c.is_key)
+                            .map(|c| c.name.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let query =
+                    super::locy_validate::validate_collection_query(validate, &rule_key_cols);
+                let target_rows = execute_cypher_inline(
+                    &query,
+                    &schema_info,
+                    &params,
+                    &graph_ctx,
+                    &session_ctx,
+                    &storage,
+                )
+                .await?;
+                let rule_facts: Vec<uni_locy::FactRow> = derived_store
+                    .get(&validate.rule_name)
+                    .map(|batches| super::locy_eval::record_batches_to_locy_rows(batches))
+                    .unwrap_or_default();
+                let result = super::locy_validate::run_validate(
+                    validate,
+                    &rule_key_cols,
+                    &rule_facts,
+                    target_rows,
+                )
+                .map_err(|e| {
+                    datafusion::error::DataFusionError::Execution(format!("VALIDATE error: {e}"))
+                })?;
+                inline_results.push((cmd_idx, CommandResult::Validate(result)));
+            }
+            LocyCommand::Calibrate {
+                calibrate,
+                model_inputs,
+            } => {
+                // Phase C C2: dispatch a CALIBRATE command. Build a
+                // Cypher MATCH+RETURN query that projects the model's
+                // input variables + the TARGET expression, execute
+                // it, then drive `run_calibrate` over the collected
+                // rows. The fitted calibrator + holdout metrics
+                // surface as `CommandResult::Calibrate(...)`.
+                //
+                // Synthesize a CompiledModel snapshot from the carried
+                // model_inputs so we can build the collection query
+                // without lugging the full catalog through this call
+                // site. Other fields the runtime doesn't read are
+                // filled with defaults.
+                let model_snapshot = uni_locy::CompiledModel {
+                    name: calibrate.model_name.clone(),
+                    inputs: model_inputs.clone(),
+                    features: vec![],
+                    output_type: uni_cypher::locy_ast::OutputType::Prob,
+                    output_name: String::new(),
+                    xervo_alias: String::new(),
+                    calibration: None,
+                    version: None,
+                    annotations: Default::default(),
+                };
+                let query =
+                    super::locy_calibrate::calibrate_collection_query(calibrate, &model_snapshot);
+                let rows = execute_cypher_inline(
+                    &query,
+                    &schema_info,
+                    &params,
+                    &graph_ctx,
+                    &session_ctx,
+                    &storage,
+                )
+                .await?;
+                let mut catalog = std::collections::HashMap::new();
+                catalog.insert(calibrate.model_name.clone(), model_snapshot);
+                let result = super::locy_calibrate::run_calibrate(
+                    calibrate,
+                    &catalog,
+                    &classifier_registry,
+                    rows,
+                )
+                .await
+                .map_err(|e| {
+                    datafusion::error::DataFusionError::Execution(format!("CALIBRATE error: {e}"))
+                })?;
+                inline_results.push((cmd_idx, CommandResult::Calibrate(result)));
+            }
+            _ => {}
         }
     }
     *command_results_slot.write().unwrap() = inline_results;
@@ -1034,6 +1387,7 @@ fn convert_to_fixpoint_plans(
                         is_ref_bindings,
                         priority: clause.priority,
                         along_bindings: clause.along_bindings.clone(),
+                        model_invocations: clause.model_invocations.clone(),
                     })
                 })
                 .collect::<DFResult<Vec<_>>>()?;

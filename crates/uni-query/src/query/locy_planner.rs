@@ -261,6 +261,114 @@ impl<'a> LocyPlanBuilder<'a> {
         max_bdd_variables: usize,
         top_k_proofs: usize,
     ) -> Result<LogicalPlan> {
+        // Legacy entry point — defaults to AddMultProb. New code paths
+        // should call `build_program_plan_with_semiring_and_classifiers`.
+        self.build_program_plan_with_semiring_and_classifiers(
+            compiled,
+            max_iterations,
+            timeout,
+            max_derived_bytes,
+            deterministic_best_by,
+            strict_probability_domain,
+            probability_epsilon,
+            exact_probability,
+            max_bdd_variables,
+            top_k_proofs,
+            uni_locy::SemiringKind::AddMultProb,
+            Arc::new(uni_locy::ClassifierRegistry::new()),
+        )
+    }
+
+    /// Build a `LocyProgram` plan threading an explicit semiring through.
+    /// Compatibility wrapper; for full Slice 3 wiring use
+    /// `build_program_plan_with_semiring_and_classifiers`.
+    #[expect(clippy::too_many_arguments, reason = "mirrors LocyConfig fields")]
+    pub fn build_program_plan_with_semiring(
+        &self,
+        compiled: &CompiledProgram,
+        max_iterations: usize,
+        timeout: std::time::Duration,
+        max_derived_bytes: usize,
+        deterministic_best_by: bool,
+        strict_probability_domain: bool,
+        probability_epsilon: f64,
+        exact_probability: bool,
+        max_bdd_variables: usize,
+        top_k_proofs: usize,
+        semiring_kind: uni_locy::SemiringKind,
+    ) -> Result<LogicalPlan> {
+        self.build_program_plan_with_semiring_and_classifiers(
+            compiled,
+            max_iterations,
+            timeout,
+            max_derived_bytes,
+            deterministic_best_by,
+            strict_probability_domain,
+            probability_epsilon,
+            exact_probability,
+            max_bdd_variables,
+            top_k_proofs,
+            semiring_kind,
+            Arc::new(uni_locy::ClassifierRegistry::new()),
+        )
+    }
+
+    /// Phase B Slice 3 entry: threads both the active semiring and the
+    /// runtime classifier registry through the plan.
+    #[expect(clippy::too_many_arguments, reason = "mirrors LocyConfig fields")]
+    pub fn build_program_plan_with_semiring_and_classifiers(
+        &self,
+        compiled: &CompiledProgram,
+        max_iterations: usize,
+        timeout: std::time::Duration,
+        max_derived_bytes: usize,
+        deterministic_best_by: bool,
+        strict_probability_domain: bool,
+        probability_epsilon: f64,
+        exact_probability: bool,
+        max_bdd_variables: usize,
+        top_k_proofs: usize,
+        semiring_kind: uni_locy::SemiringKind,
+        classifier_registry: Arc<uni_locy::ClassifierRegistry>,
+    ) -> Result<LogicalPlan> {
+        self.build_program_plan_with_full_neural(
+            compiled,
+            max_iterations,
+            timeout,
+            max_derived_bytes,
+            deterministic_best_by,
+            strict_probability_domain,
+            probability_epsilon,
+            exact_probability,
+            max_bdd_variables,
+            top_k_proofs,
+            semiring_kind,
+            classifier_registry,
+            None,
+            None,
+        )
+    }
+
+    /// Phase B follow-up: full entry threading both the classifier
+    /// registry and the optional memoization cache.
+    #[expect(clippy::too_many_arguments, reason = "mirrors LocyConfig fields")]
+    pub fn build_program_plan_with_full_neural(
+        &self,
+        compiled: &CompiledProgram,
+        max_iterations: usize,
+        timeout: std::time::Duration,
+        max_derived_bytes: usize,
+        deterministic_best_by: bool,
+        strict_probability_domain: bool,
+        probability_epsilon: f64,
+        exact_probability: bool,
+        max_bdd_variables: usize,
+        top_k_proofs: usize,
+        semiring_kind: uni_locy::SemiringKind,
+        classifier_registry: Arc<uni_locy::ClassifierRegistry>,
+        classifier_cache: Option<Arc<uni_locy::ModelInvocationCache>>,
+        classifier_provenance_store: Option<Arc<uni_locy::NeuralProvenanceStore>>,
+    ) -> Result<LogicalPlan> {
         let mut strata = Vec::with_capacity(compiled.strata.len());
 
         for stratum in &compiled.strata {
@@ -272,6 +380,9 @@ impl<'a> LocyPlanBuilder<'a> {
                 &rule_names,
                 strict_probability_domain,
                 probability_epsilon,
+                Arc::clone(&classifier_registry),
+                classifier_cache.as_ref().map(Arc::clone),
+                classifier_provenance_store.as_ref().map(Arc::clone),
             )?;
             strata.push(locy_stratum);
         }
@@ -279,7 +390,7 @@ impl<'a> LocyPlanBuilder<'a> {
         let registry = self.build_registry();
         let plan = LogicalPlan::LocyProgram {
             strata,
-            commands: self.build_commands(&compiled.commands),
+            commands: self.build_commands_with_models(&compiled.commands, &compiled.model_catalog),
             derived_scan_registry: Arc::new(registry),
             max_iterations,
             timeout,
@@ -290,6 +401,10 @@ impl<'a> LocyPlanBuilder<'a> {
             exact_probability,
             max_bdd_variables,
             top_k_proofs,
+            semiring_kind,
+            classifier_registry,
+            classifier_cache,
+            classifier_provenance_store,
         };
 
         Ok(plan)
@@ -299,7 +414,11 @@ impl<'a> LocyPlanBuilder<'a> {
     ///
     /// Commands carry AST data for dispatch by the caller (e.g., `evaluate_native`)
     /// via the orchestrator after strata evaluation completes.
-    fn build_commands(&self, commands: &[CompiledCommand]) -> Vec<LocyCommand> {
+    fn build_commands_with_models(
+        &self,
+        commands: &[CompiledCommand],
+        model_catalog: &HashMap<String, uni_locy::CompiledModel>,
+    ) -> Vec<LocyCommand> {
         commands
             .iter()
             .map(|cmd| match cmd {
@@ -319,8 +438,25 @@ impl<'a> LocyPlanBuilder<'a> {
                     derive_command: dc.clone(),
                 },
                 CompiledCommand::Cypher(q) => LocyCommand::Cypher { query: q.clone() },
+                CompiledCommand::Calibrate(cc) => {
+                    let inputs = model_catalog
+                        .get(&cc.model_name)
+                        .map(|m| m.inputs.clone())
+                        .unwrap_or_default();
+                    LocyCommand::Calibrate {
+                        calibrate: cc.clone(),
+                        model_inputs: inputs,
+                    }
+                }
+                CompiledCommand::Validate(cv) => LocyCommand::Validate {
+                    validate: cv.clone(),
+                },
             })
             .collect()
+    }
+
+    fn build_commands(&self, commands: &[CompiledCommand]) -> Vec<LocyCommand> {
+        self.build_commands_with_models(commands, &HashMap::new())
     }
 
     // -- Stratum --------------------------------------------------------
@@ -332,6 +468,9 @@ impl<'a> LocyPlanBuilder<'a> {
         stratum_rule_names: &HashSet<String>,
         strict_probability_domain: bool,
         probability_epsilon: f64,
+        classifier_registry: Arc<uni_locy::ClassifierRegistry>,
+        classifier_cache: Option<Arc<uni_locy::ModelInvocationCache>>,
+        classifier_provenance_store: Option<Arc<uni_locy::NeuralProvenanceStore>>,
     ) -> Result<LocyStratum> {
         let mut rules = Vec::with_capacity(stratum.rules.len());
         for rule in &stratum.rules {
@@ -342,6 +481,9 @@ impl<'a> LocyPlanBuilder<'a> {
                 rule_catalog,
                 strict_probability_domain,
                 probability_epsilon,
+                Arc::clone(&classifier_registry),
+                classifier_cache.as_ref().map(Arc::clone),
+                classifier_provenance_store.as_ref().map(Arc::clone),
             )?);
         }
 
@@ -363,6 +505,9 @@ impl<'a> LocyPlanBuilder<'a> {
         rule_catalog: &HashMap<String, CompiledRule>,
         strict_probability_domain: bool,
         probability_epsilon: f64,
+        classifier_registry: Arc<uni_locy::ClassifierRegistry>,
+        classifier_cache: Option<Arc<uni_locy::ModelInvocationCache>>,
+        classifier_provenance_store: Option<Arc<uni_locy::NeuralProvenanceStore>>,
     ) -> Result<LocyRulePlan> {
         // Collect node variable names from match patterns for VID-based joins
         let node_vars = collect_node_vars(&rule.clauses);
@@ -378,6 +523,9 @@ impl<'a> LocyPlanBuilder<'a> {
                 &node_vars,
                 strict_probability_domain,
                 probability_epsilon,
+                Arc::clone(&classifier_registry),
+                classifier_cache.as_ref().map(Arc::clone),
+                classifier_provenance_store.as_ref().map(Arc::clone),
             )?);
         }
 
@@ -507,6 +655,9 @@ impl<'a> LocyPlanBuilder<'a> {
         node_vars: &HashSet<String>,
         _strict_probability_domain: bool,
         _probability_epsilon: f64,
+        classifier_registry: Arc<uni_locy::ClassifierRegistry>,
+        classifier_cache: Option<Arc<uni_locy::ModelInvocationCache>>,
+        classifier_provenance_store: Option<Arc<uni_locy::NeuralProvenanceStore>>,
     ) -> Result<LocyClausePlan> {
         // Collect node variables from THIS clause's MATCH pattern only.
         // Used for IS-ref predicates: only variables in the current MATCH
@@ -816,7 +967,11 @@ impl<'a> LocyPlanBuilder<'a> {
             let expr = if let Some(locy_expr) = along_map.get(yc.name.as_str()) {
                 rewrite_locy_expr(locy_expr)?
             } else if let Some(fold_input) = fold_input_map.get(yc.name.as_str()) {
-                (*fold_input).clone()
+                // Substitute ALONG names so a FOLD input like
+                // `MNOR(link)` where `link` is an ALONG binding
+                // unfolds to the underlying ALONG expression
+                // (e.g., `e.base * Variable("__model_scorer_0")`).
+                substitute_along_vars((*fold_input).clone(), &rewritten_along)
             } else if fold_output_names.contains(yc.name.as_str()) {
                 continue;
             } else if let Some(orig_expr) = yield_expr_map.get(&yc.name) {
@@ -850,6 +1005,45 @@ impl<'a> LocyPlanBuilder<'a> {
                 Some("__priority".to_string()),
             ));
             target_types.push(DataType::Int64);
+        }
+
+        // Hidden YIELD items emitted by `extract_model_invocations` for
+        // property feature exprs (e.g. `scorer(s.tier)`). These columns
+        // (named `__feat_<var>_<prop>`) flow through the body batch so
+        // `apply_model_invocations` can read property values per row;
+        // `record_batches_to_locy_rows` strips them by prefix before
+        // returning the user-visible rows.
+        //
+        // We deliberately push to `projections` AFTER `target_types` is
+        // already populated for the user-visible columns + priority.
+        // `plan_locy_project` reads `target_types.get(i)` and skips
+        // coercion when the entry is absent (returns `None`); leaving
+        // these out preserves the property's native storage type
+        // (Utf8 / LargeBinary / Int64 / Float64 / etc.) end-to-end
+        // into `apply_model_invocations`.
+        for hidden in &clause.hidden_yield_cols {
+            if let Some(orig_expr) = yield_expr_map.get(hidden) {
+                let e = (*orig_expr).clone();
+                let e = substitute_along_vars(e, &rewritten_along);
+                projections.push((e, Some(hidden.clone())));
+            }
+        }
+
+        // Phase B A4 follow-up: when the clause has neural-model
+        // invocations (extracted from YIELD / ALONG / FOLD positions
+        // and replaced with `Variable("__model_<n>_<idx>")`
+        // references), wrap the pre-projection plan with
+        // `LocyModelInvoke` so the synthesized columns exist in the
+        // input schema of `LocyProject`. Downstream FOLD aggregates
+        // also see those columns (FoldExec reads projected columns).
+        if !clause.model_invocations.is_empty() {
+            plan = LogicalPlan::LocyModelInvoke {
+                input: Box::new(plan),
+                invocations: clause.model_invocations.clone(),
+                classifier_registry: Arc::clone(&classifier_registry),
+                classifier_cache: classifier_cache.as_ref().map(Arc::clone),
+                classifier_provenance_store: classifier_provenance_store.as_ref().map(Arc::clone),
+            };
         }
 
         plan = LogicalPlan::LocyProject {
@@ -890,6 +1084,7 @@ impl<'a> LocyPlanBuilder<'a> {
             is_refs,
             along_bindings,
             priority: clause.priority,
+            model_invocations: clause.model_invocations.clone(),
         })
     }
 
@@ -1376,6 +1571,8 @@ mod tests {
             best_by: None,
             output: simple_yield_output(yield_names),
             priority: None,
+            model_invocations: vec![],
+            hidden_yield_cols: vec![],
         }
     }
 
@@ -1396,6 +1593,7 @@ mod tests {
         CompiledProgram {
             strata,
             rule_catalog,
+            model_catalog: HashMap::new(),
             warnings: vec![],
             commands: vec![],
         }
@@ -1628,7 +1826,16 @@ mod tests {
         };
         let names: HashSet<String> = ["base".to_string()].into();
         let result = builder
-            .build_stratum(&stratum, &catalog, &names, false, 1e-15)
+            .build_stratum(
+                &stratum,
+                &catalog,
+                &names,
+                false,
+                1e-15,
+                Arc::new(uni_locy::ClassifierRegistry::new()),
+                None,
+                None,
+            )
             .unwrap();
 
         assert_eq!(result.id, 0);
@@ -1658,7 +1865,16 @@ mod tests {
         };
         let names: HashSet<String> = ["reach".to_string()].into();
         let result = builder
-            .build_stratum(&stratum, &catalog, &names, false, 1e-15)
+            .build_stratum(
+                &stratum,
+                &catalog,
+                &names,
+                false,
+                1e-15,
+                Arc::new(uni_locy::ClassifierRegistry::new()),
+                None,
+                None,
+            )
             .unwrap();
 
         assert!(result.is_recursive);
@@ -1686,7 +1902,16 @@ mod tests {
         };
         let names: HashSet<String> = ["derived".to_string()].into();
         let result = builder
-            .build_stratum(&stratum, &catalog, &names, false, 1e-15)
+            .build_stratum(
+                &stratum,
+                &catalog,
+                &names,
+                false,
+                1e-15,
+                Arc::new(uni_locy::ClassifierRegistry::new()),
+                None,
+                None,
+            )
             .unwrap();
 
         assert_eq!(result.depends_on, vec![0, 1]);
@@ -1720,7 +1945,16 @@ mod tests {
         };
         let names: HashSet<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
         let result = builder
-            .build_stratum(&stratum, &catalog, &names, false, 1e-15)
+            .build_stratum(
+                &stratum,
+                &catalog,
+                &names,
+                false,
+                1e-15,
+                Arc::new(uni_locy::ClassifierRegistry::new()),
+                None,
+                None,
+            )
             .unwrap();
 
         assert_eq!(result.rules.len(), 3);
@@ -1748,7 +1982,17 @@ mod tests {
         let names: HashSet<String> = ["reachable".to_string()].into();
 
         let result = builder
-            .build_rule(&rule, false, &names, &catalog, false, 1e-15)
+            .build_rule(
+                &rule,
+                false,
+                &names,
+                &catalog,
+                false,
+                1e-15,
+                Arc::new(uni_locy::ClassifierRegistry::new()),
+                None,
+                None,
+            )
             .unwrap();
         assert_eq!(result.name, "reachable");
         assert_eq!(result.yield_schema.len(), 2);
@@ -1773,7 +2017,17 @@ mod tests {
         let names: HashSet<String> = ["prio".to_string()].into();
 
         let result = builder
-            .build_rule(&rule, false, &names, &catalog, false, 1e-15)
+            .build_rule(
+                &rule,
+                false,
+                &names,
+                &catalog,
+                false,
+                1e-15,
+                Arc::new(uni_locy::ClassifierRegistry::new()),
+                None,
+                None,
+            )
             .unwrap();
         assert_eq!(result.priority, Some(5));
     }
@@ -1792,7 +2046,17 @@ mod tests {
         let names: HashSet<String> = ["noprio".to_string()].into();
 
         let result = builder
-            .build_rule(&rule, false, &names, &catalog, false, 1e-15)
+            .build_rule(
+                &rule,
+                false,
+                &names,
+                &catalog,
+                false,
+                1e-15,
+                Arc::new(uni_locy::ClassifierRegistry::new()),
+                None,
+                None,
+            )
             .unwrap();
         assert_eq!(result.priority, None);
     }
@@ -1815,7 +2079,17 @@ mod tests {
         let names: HashSet<String> = ["multi".to_string()].into();
 
         let result = builder
-            .build_rule(&rule, false, &names, &catalog, false, 1e-15)
+            .build_rule(
+                &rule,
+                false,
+                &names,
+                &catalog,
+                false,
+                1e-15,
+                Arc::new(uni_locy::ClassifierRegistry::new()),
+                None,
+                None,
+            )
             .unwrap();
         assert_eq!(result.clauses.len(), 3);
     }
@@ -1838,7 +2112,17 @@ mod tests {
         let names: HashSet<String> = ["keyed".to_string()].into();
 
         let result = builder
-            .build_rule(&rule, false, &names, &catalog, false, 1e-15)
+            .build_rule(
+                &rule,
+                false,
+                &names,
+                &catalog,
+                false,
+                1e-15,
+                Arc::new(uni_locy::ClassifierRegistry::new()),
+                None,
+                None,
+            )
             .unwrap();
         assert!(result.yield_schema[0].is_key);
         assert!(!result.yield_schema[1].is_key);
@@ -1869,6 +2153,9 @@ mod tests {
                 &HashSet::new(),
                 false,
                 1e-15,
+                Arc::new(uni_locy::ClassifierRegistry::new()),
+                None,
+                None,
             )
             .unwrap();
 
@@ -1895,6 +2182,8 @@ mod tests {
             best_by: None,
             output: simple_yield_output(&["n"]),
             priority: None,
+            model_invocations: vec![],
+            hidden_yield_cols: vec![],
         };
         let yield_cols = [yield_col("n", true)];
         let catalog = HashMap::new();
@@ -1910,6 +2199,9 @@ mod tests {
                 &HashSet::new(),
                 false,
                 1e-15,
+                Arc::new(uni_locy::ClassifierRegistry::new()),
+                None,
+                None,
             )
             .unwrap();
 
@@ -1948,6 +2240,8 @@ mod tests {
             best_by: None,
             output: simple_yield_output(&["x"]),
             priority: None,
+            model_invocations: vec![],
+            hidden_yield_cols: vec![],
         };
         let yield_cols = [yield_col("x", true)];
         let names = HashSet::new();
@@ -1962,6 +2256,9 @@ mod tests {
                 &HashSet::new(),
                 false,
                 1e-15,
+                Arc::new(uni_locy::ClassifierRegistry::new()),
+                None,
+                None,
             )
             .unwrap();
 
@@ -2010,6 +2307,8 @@ mod tests {
             best_by: None,
             output: simple_yield_output(&["x", "y"]),
             priority: None,
+            model_invocations: vec![],
+            hidden_yield_cols: vec![],
         };
         let yield_cols = [yield_col("x", true), yield_col("y", false)];
         let names = HashSet::new();
@@ -2024,6 +2323,9 @@ mod tests {
                 &HashSet::new(),
                 false,
                 1e-15,
+                Arc::new(uni_locy::ClassifierRegistry::new()),
+                None,
+                None,
             )
             .unwrap();
 
@@ -2060,6 +2362,8 @@ mod tests {
             best_by: None,
             output: simple_yield_output(&["x"]),
             priority: None,
+            model_invocations: vec![],
+            hidden_yield_cols: vec![],
         };
         let yield_cols = [yield_col("x", true)];
         let names = HashSet::new();
@@ -2074,6 +2378,9 @@ mod tests {
                 &HashSet::new(),
                 false,
                 1e-15,
+                Arc::new(uni_locy::ClassifierRegistry::new()),
+                None,
+                None,
             )
             .unwrap();
 
@@ -2132,6 +2439,8 @@ mod tests {
             best_by: None,
             output: simple_yield_output(&["x"]),
             priority: None,
+            model_invocations: vec![],
+            hidden_yield_cols: vec![],
         };
         let yield_cols = [yield_col("x", true)];
         let names = HashSet::new();
@@ -2146,6 +2455,9 @@ mod tests {
                 &HashSet::new(),
                 false,
                 1e-15,
+                Arc::new(uni_locy::ClassifierRegistry::new()),
+                None,
+                None,
             )
             .unwrap();
 
@@ -2187,6 +2499,8 @@ mod tests {
             best_by: None,
             output: simple_yield_output(&["a", "b", "cost"]),
             priority: None,
+            model_invocations: vec![],
+            hidden_yield_cols: vec![],
         };
         let yield_cols = [
             yield_col("a", true),
@@ -2205,6 +2519,9 @@ mod tests {
                 &HashSet::new(),
                 false,
                 1e-15,
+                Arc::new(uni_locy::ClassifierRegistry::new()),
+                None,
+                None,
             )
             .unwrap();
 
@@ -2242,6 +2559,8 @@ mod tests {
             best_by: None,
             output: simple_yield_output(&["n", "total"]),
             priority: None,
+            model_invocations: vec![],
+            hidden_yield_cols: vec![],
         };
         let yield_cols = [yield_col("n", true), yield_col("total", false)];
         let catalog = HashMap::new();
@@ -2257,6 +2576,9 @@ mod tests {
                 &HashSet::new(),
                 false,
                 1e-15,
+                Arc::new(uni_locy::ClassifierRegistry::new()),
+                None,
+                None,
             )
             .unwrap();
 
@@ -2287,6 +2609,8 @@ mod tests {
             best_by: None,
             output: simple_yield_output(&["n", "total"]),
             priority: None,
+            model_invocations: vec![],
+            hidden_yield_cols: vec![],
         };
         let yield_cols = [yield_col("n", true), yield_col("total", false)];
         let catalog = HashMap::new();
@@ -2302,6 +2626,9 @@ mod tests {
                 &HashSet::new(),
                 false,
                 1e-15,
+                Arc::new(uni_locy::ClassifierRegistry::new()),
+                None,
+                None,
             )
             .unwrap();
 
@@ -2329,6 +2656,8 @@ mod tests {
             }),
             output: simple_yield_output(&["n", "cost"]),
             priority: None,
+            model_invocations: vec![],
+            hidden_yield_cols: vec![],
         };
         let yield_cols = [yield_col("n", true), yield_col("cost", false)];
         let catalog = HashMap::new();
@@ -2344,6 +2673,9 @@ mod tests {
                 &HashSet::new(),
                 false,
                 1e-15,
+                Arc::new(uni_locy::ClassifierRegistry::new()),
+                None,
+                None,
             )
             .unwrap();
 
@@ -2381,6 +2713,9 @@ mod tests {
                 &HashSet::new(),
                 false,
                 1e-15,
+                Arc::new(uni_locy::ClassifierRegistry::new()),
+                None,
+                None,
             )
             .unwrap();
 
@@ -2438,6 +2773,8 @@ mod tests {
             }),
             output: simple_yield_output(&["x", "cost", "total"]),
             priority: None,
+            model_invocations: vec![],
+            hidden_yield_cols: vec![],
         };
         let yield_cols = [
             yield_col("x", true),
@@ -2456,6 +2793,9 @@ mod tests {
                 &HashSet::new(),
                 false,
                 1e-15,
+                Arc::new(uni_locy::ClassifierRegistry::new()),
+                None,
+                None,
             )
             .unwrap();
 
@@ -2542,6 +2882,8 @@ mod tests {
                 best_by: None,
                 output: simple_yield_output(&["a", "b"]),
                 priority: None,
+                model_invocations: vec![],
+                hidden_yield_cols: vec![],
             }],
             vec![yield_col("a", true), yield_col("b", false)],
         );
@@ -2611,6 +2953,8 @@ mod tests {
                 best_by: None,
                 output: simple_yield_output(&["x"]),
                 priority: None,
+                model_invocations: vec![],
+                hidden_yield_cols: vec![],
             }],
             vec![yield_col("x", true)],
         );
@@ -2687,6 +3031,8 @@ mod tests {
                 best_by: None,
                 output: simple_yield_output(&["x"]),
                 priority: None,
+                model_invocations: vec![],
+                hidden_yield_cols: vec![],
             }],
             vec![yield_col("x", true)],
         );
@@ -2761,6 +3107,8 @@ mod tests {
                 best_by: None,
                 output: simple_yield_output(&["n"]),
                 priority: None,
+                model_invocations: vec![],
+                hidden_yield_cols: vec![],
             }],
             vec![yield_col("n", true)],
         );
@@ -2780,6 +3128,8 @@ mod tests {
                 best_by: None,
                 output: simple_yield_output(&["n"]),
                 priority: None,
+                model_invocations: vec![],
+                hidden_yield_cols: vec![],
             }],
             vec![yield_col("n", true)],
         );
@@ -2858,6 +3208,8 @@ mod tests {
                     best_by: None,
                     output: simple_yield_output(&["x"]),
                     priority: None,
+                    model_invocations: vec![],
+                    hidden_yield_cols: vec![],
                 },
                 CompiledClause {
                     match_pattern: node_pattern("y"),
@@ -2873,6 +3225,8 @@ mod tests {
                     best_by: None,
                     output: simple_yield_output(&["y"]),
                     priority: None,
+                    model_invocations: vec![],
+                    hidden_yield_cols: vec![],
                 },
             ],
             vec![yield_col("x", true)],
@@ -3026,6 +3380,8 @@ mod tests {
                 best_by: None,
                 output: simple_yield_output(&["x"]),
                 priority: None,
+                model_invocations: vec![],
+                hidden_yield_cols: vec![],
             }],
             vec![yield_col("x", true)],
         );
@@ -3053,6 +3409,8 @@ mod tests {
                 best_by: None,
                 output: simple_yield_output(&["y"]),
                 priority: None,
+                model_invocations: vec![],
+                hidden_yield_cols: vec![],
             }],
             vec![yield_col("y", true)],
         );
@@ -3153,6 +3511,8 @@ mod tests {
             best_by: None,
             output: simple_yield_output(&["x"]),
             priority: None,
+            model_invocations: vec![],
+            hidden_yield_cols: vec![],
         };
         let yield_cols = [yield_col("x", true)];
         let catalog = HashMap::new();
@@ -3167,6 +3527,9 @@ mod tests {
             &HashSet::new(),
             false,
             1e-15,
+            Arc::new(uni_locy::ClassifierRegistry::new()),
+            None,
+            None,
         );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -3199,6 +3562,8 @@ mod tests {
             best_by: None,
             output: simple_yield_output(&["x"]),
             priority: None,
+            model_invocations: vec![],
+            hidden_yield_cols: vec![],
         };
         let yield_cols = [yield_col("x", true)];
         let names = HashSet::new();
@@ -3212,6 +3577,9 @@ mod tests {
             &HashSet::new(),
             false,
             1e-15,
+            Arc::new(uni_locy::ClassifierRegistry::new()),
+            None,
+            None,
         );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -3247,6 +3615,8 @@ mod tests {
             best_by: None,
             output: simple_yield_output(&["x", "cost"]),
             priority: None,
+            model_invocations: vec![],
+            hidden_yield_cols: vec![],
         };
         let yield_cols = [yield_col("x", true), yield_col("cost", false)];
         let names = HashSet::new();
@@ -3260,6 +3630,9 @@ mod tests {
             &HashSet::new(),
             false,
             1e-15,
+            Arc::new(uni_locy::ClassifierRegistry::new()),
+            None,
+            None,
         );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -3288,6 +3661,8 @@ mod tests {
             best_by: None,
             output: simple_yield_output(&["n", "total"]),
             priority: None,
+            model_invocations: vec![],
+            hidden_yield_cols: vec![],
         };
         let yield_cols = [yield_col("n", true), yield_col("total", false)];
         let catalog = HashMap::new();
@@ -3303,6 +3678,9 @@ mod tests {
             &HashSet::new(),
             false,
             1e-15,
+            Arc::new(uni_locy::ClassifierRegistry::new()),
+            None,
+            None,
         );
         assert!(result.is_ok());
     }

@@ -19,6 +19,13 @@ pub struct LocyResult {
     pub command_results: Vec<CommandResult>,
     /// Runtime warnings collected during evaluation.
     pub warnings: Vec<RuntimeWarning>,
+    /// Compile-time warnings carried over from `CompiledProgram.warnings`.
+    /// Phase C C4: surfaces `UncalibratedNeuralPredicate` /
+    /// `FoldInRecursivePath` / `UncalibratedLLMLogprobs` /
+    /// `MsumNonNegativity` / `ProbabilityDomainViolation` so test
+    /// harnesses and downstream tooling can inspect them on the
+    /// returned `LocyResult` rather than re-running the compiler.
+    pub compile_warnings: Vec<crate::types::CompilerWarning>,
     /// Groups where BDD computation fell back to independence mode.
     /// Maps rule name → list of human-readable key group descriptions.
     pub approximate_groups: HashMap<String, Vec<String>>,
@@ -38,8 +45,99 @@ pub enum CommandResult {
     Assume(Vec<FactRow>),
     Explain(DerivationNode),
     Abduce(AbductionResult),
-    Derive { affected: usize },
+    Derive {
+        affected: usize,
+    },
     Cypher(Vec<FactRow>),
+    /// Phase C C2: result of a `CALIBRATE` statement — the fitted
+    /// calibrator plus pre- and post-calibration holdout metrics.
+    Calibrate(CalibrationResult),
+    /// Phase C C3: result of a `VALIDATE` statement — the metric
+    /// values computed over `(rule_output, ground_truth)` pairs.
+    Validate(ValidationResult),
+}
+
+/// Outcome of a single `VALIDATE` invocation. Phase C C3.
+///
+/// `metrics` maps each requested metric to its scalar value. The
+/// `n_samples` field reports how many `(prediction, label)` pairs
+/// were retained after joining the rule's PROB column with the
+/// TARGET expression. Bare `ECE` produces a `EceBinningBias`
+/// compile-time warning (surfaced via `LocyResult.compile_warnings`).
+#[derive(Debug, Clone)]
+pub struct ValidationResult {
+    pub rule_name: String,
+    pub prob_column: String,
+    pub n_samples: usize,
+    pub metrics: Vec<(uni_cypher::locy_ast::ValidationMetric, f64)>,
+}
+
+impl ValidationResult {
+    pub fn metric(&self, m: uni_cypher::locy_ast::ValidationMetric) -> Option<f64> {
+        self.metrics
+            .iter()
+            .find(|(name, _)| *name == m)
+            .map(|(_, v)| *v)
+    }
+}
+
+/// Phase C C1a: per-prediction confidence interval surfaced by
+/// uncertainty-aware calibrators. For split-conformal, the band is
+/// `[p - q, p + q]` clipped to `[0, 1]` where `q` is the
+/// `(1 - alpha)`-quantile of holdout nonconformity scores.
+#[derive(Debug, Clone, Copy)]
+pub struct ConfidenceBand {
+    pub lower: f64,
+    pub upper: f64,
+    pub source: ConfidenceSource,
+}
+
+/// Phase C C1a: provenance tag for a [`ConfidenceBand`] — identifies
+/// which uncertainty-quantification machinery produced the bounds.
+/// Only `Conformal` ships in C1a; ensemble / credal variants are
+/// extensibility hooks documented in the implementation plan §3.1.
+#[derive(Debug, Clone, Copy)]
+pub enum ConfidenceSource {
+    Conformal { alpha: f64 },
+}
+
+/// Outcome of a single `CALIBRATE` invocation. Phase C C2.
+///
+/// `calibrator` is the fitted transform; user code typically wraps it
+/// over the base classifier via `CalibratedClassifier` and re-registers
+/// the wrapped classifier in `LocyConfig::classifier_registry` for
+/// subsequent evaluations.
+#[derive(Debug, Clone)]
+pub struct CalibrationResult {
+    pub model_name: String,
+    pub method: crate::calibration::CalibrationMethodKind,
+    pub n_samples: usize,
+    pub holdout_size: usize,
+    pub calibrator: std::sync::Arc<dyn crate::calibration::Calibrator>,
+    pub raw_brier: f64,
+    pub raw_ece: f64,
+    pub calibrated_brier: f64,
+    pub calibrated_ece: f64,
+    /// Phase C C1a: for conformal calibrators, the
+    /// `(1 - alpha)`-quantile of holdout nonconformity scores —
+    /// the half-width of every confidence band the calibrator will
+    /// emit at inference. `None` for non-conformal methods.
+    pub confidence_band_quantile: Option<f64>,
+}
+
+/// Phase C B1–B3: per neural-model invocation provenance, attached
+/// to a [`DerivationNode`] when the derivation's body invoked one
+/// or more classifiers. `raw_probability` is the classifier's
+/// direct output; `calibrated_probability` is the post-Calibrator
+/// value (when any calibrator other than `Identity` is registered).
+/// `confidence_band` is populated when the active calibrator is
+/// conformal (or any future band-emitting calibrator).
+#[derive(Debug, Clone)]
+pub struct NeuralProvenance {
+    pub model_name: String,
+    pub raw_probability: f64,
+    pub calibrated_probability: Option<f64>,
+    pub confidence_band: Option<ConfidenceBand>,
 }
 
 /// A node in a derivation tree, produced by EXPLAIN RULE.
@@ -58,6 +156,10 @@ pub struct DerivationNode {
     /// Probability of this specific proof path, populated when top-k proof
     /// filtering is active (Scallop, Huang et al. 2021).
     pub proof_probability: Option<f64>,
+    /// Phase C B1–B3: neural-model invocations that contributed to
+    /// this fact's derivation. Empty for purely-symbolic
+    /// derivations.
+    pub neural_calls: Vec<NeuralProvenance>,
 }
 
 /// Result of an ABDUCE query.
@@ -184,6 +286,14 @@ impl LocyResult {
     }
 
     /// Get runtime warnings collected during evaluation.
+    pub fn compile_warnings(&self) -> &[crate::types::CompilerWarning] {
+        &self.compile_warnings
+    }
+
+    pub fn command_results(&self) -> &[CommandResult] {
+        &self.command_results
+    }
+
     pub fn warnings(&self) -> &[RuntimeWarning] {
         &self.warnings
     }

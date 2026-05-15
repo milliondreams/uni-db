@@ -23,6 +23,7 @@ use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use uni_locy::SemiringKind;
 
 /// Direction of monotonicity for a fold aggregate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,6 +109,11 @@ pub struct FoldExec {
     fold_bindings: Vec<FoldBinding>,
     strict_probability_domain: bool,
     probability_epsilon: f64,
+    /// Active probability semiring. `AddMultProb` (the default) preserves
+    /// byte-identical Phase 1/2 noisy-OR / product behavior. `MaxMinProb`
+    /// (Viterbi) is opt-in and produces fuzzy-truth values; callers up the
+    /// stack also emit `FuzzyNotProbabilistic` on PROB-bearing rules.
+    semiring_kind: SemiringKind,
     schema: SchemaRef,
     properties: PlanProperties,
     metrics: ExecutionPlanMetricsSet,
@@ -127,6 +133,28 @@ impl FoldExec {
         strict_probability_domain: bool,
         probability_epsilon: f64,
     ) -> Self {
+        Self::new_with_semiring(
+            input,
+            key_indices,
+            fold_bindings,
+            strict_probability_domain,
+            probability_epsilon,
+            SemiringKind::AddMultProb,
+        )
+    }
+
+    /// Variant taking an explicit [`SemiringKind`]. Existing callers can
+    /// keep using [`FoldExec::new`] (which defaults to `AddMultProb`); the
+    /// fixpoint planner uses this form to thread the configured semiring
+    /// from [`uni_locy::LocyConfig::resolve`].
+    pub fn new_with_semiring(
+        input: Arc<dyn ExecutionPlan>,
+        key_indices: Vec<usize>,
+        fold_bindings: Vec<FoldBinding>,
+        strict_probability_domain: bool,
+        probability_epsilon: f64,
+        semiring_kind: SemiringKind,
+    ) -> Self {
         let input_schema = input.schema();
         let schema = Self::build_output_schema(&input_schema, &key_indices, &fold_bindings);
         let properties = compute_plan_properties(Arc::clone(&schema));
@@ -137,6 +165,7 @@ impl FoldExec {
             fold_bindings,
             strict_probability_domain,
             probability_epsilon,
+            semiring_kind,
             schema,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -227,12 +256,13 @@ impl ExecutionPlan for FoldExec {
                 "FoldExec requires exactly one child".to_string(),
             ));
         }
-        Ok(Arc::new(Self::new(
+        Ok(Arc::new(Self::new_with_semiring(
             Arc::clone(&children[0]),
             self.key_indices.clone(),
             self.fold_bindings.clone(),
             self.strict_probability_domain,
             self.probability_epsilon,
+            self.semiring_kind,
         )))
     }
 
@@ -247,6 +277,7 @@ impl ExecutionPlan for FoldExec {
         let fold_bindings = self.fold_bindings.clone();
         let strict = self.strict_probability_domain;
         let epsilon = self.probability_epsilon;
+        let semiring_kind = self.semiring_kind;
         let output_schema = Arc::clone(&self.schema);
         let input_schema = self.input.schema();
 
@@ -332,6 +363,7 @@ impl ExecutionPlan for FoldExec {
                     num_groups,
                     strict,
                     epsilon,
+                    semiring_kind,
                 )?;
                 output_columns.push(agg_col);
             }
@@ -363,6 +395,7 @@ fn compute_fold_aggregate(
     num_groups: usize,
     strict: bool,
     probability_epsilon: f64,
+    semiring_kind: SemiringKind,
 ) -> DFResult<arrow_array::ArrayRef> {
     match kind {
         FoldAggKind::Sum => {
@@ -421,14 +454,22 @@ fn compute_fold_aggregate(
             let mut builder = Float64Builder::with_capacity(num_groups);
             for key in ordered_keys {
                 let indices = &groups[key];
-                builder.append_option(noisy_or_f64(col, indices, strict)?);
+                let v = match semiring_kind {
+                    SemiringKind::MaxMinProb => maxmin_disjunction_f64(col, indices, strict)?,
+                    _ => noisy_or_f64(col, indices, strict)?,
+                };
+                builder.append_option(v);
             }
             Ok(Arc::new(builder.finish()))
         }
         FoldAggKind::Prod => {
             let mut builder = Float64Builder::with_capacity(num_groups);
             for key in ordered_keys {
-                builder.append_option(product_f64(col, &groups[key], strict, probability_epsilon)?);
+                let v = match semiring_kind {
+                    SemiringKind::MaxMinProb => maxmin_conjunction_f64(col, &groups[key], strict)?,
+                    _ => product_f64(col, &groups[key], strict, probability_epsilon)?,
+                };
+                builder.append_option(v);
             }
             Ok(Arc::new(builder.finish()))
         }
@@ -549,6 +590,83 @@ fn product_f64(
     } else {
         Ok(Some(product))
     }
+}
+
+/// MaxMinProb disjunction over a group: `P = max(pᵢ)`. Per rollout D-9
+/// the caller emits `FuzzyNotProbabilistic` when this path runs on a
+/// PROB-bearing rule — fuzzy max is not a probability.
+fn maxmin_disjunction_f64(
+    col: &dyn Array,
+    indices: &[usize],
+    strict: bool,
+) -> DFResult<Option<f64>> {
+    let mut acc: f64 = 0.0;
+    let mut has_value = false;
+    for &i in indices {
+        if col.is_null(i) {
+            continue;
+        }
+        has_value = true;
+        let raw = if let Some(arr) = col.as_any().downcast_ref::<Float64Array>() {
+            arr.value(i)
+        } else if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
+            arr.value(i) as f64
+        } else {
+            continue;
+        };
+        if strict && !(0.0..=1.0).contains(&raw) {
+            return Err(datafusion::error::DataFusionError::Execution(format!(
+                "strict_probability_domain: MNOR input {raw} is outside [0, 1]"
+            )));
+        }
+        if !strict && !(0.0..=1.0).contains(&raw) {
+            tracing::warn!(
+                "MNOR input {raw} outside [0,1], clamped to {}",
+                raw.clamp(0.0, 1.0)
+            );
+        }
+        let p = raw.clamp(0.0, 1.0);
+        acc = acc.max(p);
+    }
+    if has_value { Ok(Some(acc)) } else { Ok(None) }
+}
+
+/// MaxMinProb conjunction over a group: `P = min(pᵢ)`. Same caveats as
+/// [`maxmin_disjunction_f64`].
+fn maxmin_conjunction_f64(
+    col: &dyn Array,
+    indices: &[usize],
+    strict: bool,
+) -> DFResult<Option<f64>> {
+    let mut acc: f64 = 1.0;
+    let mut has_value = false;
+    for &i in indices {
+        if col.is_null(i) {
+            continue;
+        }
+        has_value = true;
+        let raw = if let Some(arr) = col.as_any().downcast_ref::<Float64Array>() {
+            arr.value(i)
+        } else if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
+            arr.value(i) as f64
+        } else {
+            continue;
+        };
+        if strict && !(0.0..=1.0).contains(&raw) {
+            return Err(datafusion::error::DataFusionError::Execution(format!(
+                "strict_probability_domain: MPROD input {raw} is outside [0, 1]"
+            )));
+        }
+        if !strict && !(0.0..=1.0).contains(&raw) {
+            tracing::warn!(
+                "MPROD input {raw} outside [0,1], clamped to {}",
+                raw.clamp(0.0, 1.0)
+            );
+        }
+        let p = raw.clamp(0.0, 1.0);
+        acc = acc.min(p);
+    }
+    if has_value { Ok(Some(acc)) } else { Ok(None) }
 }
 
 fn compute_minmax(

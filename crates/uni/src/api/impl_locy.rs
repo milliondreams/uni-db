@@ -93,9 +93,10 @@ pub(crate) async fn evaluate_with_db_and_config(
         }
     };
     let mut compiled = if let Some(names) = external_names {
-        uni_locy::compile_with_external_rules(&ast, &names).map_err(map_compile_error)?
+        uni_locy::compile_with_external_rules_and_config(&ast, &names, config)
+            .map_err(map_compile_error)?
     } else {
-        compile(&ast).map_err(map_compile_error)?
+        uni_locy::compile_with_config(&ast, config).map_err(map_compile_error)?
     };
 
     // Merge registered rules
@@ -318,7 +319,7 @@ impl<'a> LocyEngine<'a> {
         let query_planner = uni_query::QueryPlanner::new(schema);
         let plan_builder = uni_query::query::locy_planner::LocyPlanBuilder::new(&query_planner);
         let logical = plan_builder
-            .build_program_plan(
+            .build_program_plan_with_full_neural(
                 &compiled,
                 config.max_iterations,
                 config.timeout,
@@ -329,6 +330,23 @@ impl<'a> LocyEngine<'a> {
                 config.exact_probability,
                 config.max_bdd_variables,
                 config.top_k_proofs,
+                config
+                    .resolve()
+                    .map_err(|e| UniError::Query {
+                        message: format!("LocyConfigError: {e}"),
+                        query: None,
+                    })?
+                    .kind,
+                std::sync::Arc::new(config.classifier_registry.clone()),
+                config.classifier_cache.clone().or_else(|| {
+                    Some(std::sync::Arc::new(uni_locy::ModelInvocationCache::new(
+                        config.classifier_cache_max,
+                    )))
+                }),
+                config
+                    .classifier_provenance_store
+                    .clone()
+                    .or_else(|| Some(std::sync::Arc::new(uni_locy::NeuralProvenanceStore::new()))),
             )
             .map_err(|e| UniError::Query {
                 message: format!("LocyPlanBuildError: {e}"),
@@ -607,7 +625,7 @@ impl<'a> LocyEngine<'a> {
         let query_planner = uni_query::QueryPlanner::new(schema);
         let plan_builder = uni_query::query::locy_planner::LocyPlanBuilder::new(&query_planner);
         let logical = plan_builder
-            .build_program_plan(
+            .build_program_plan_with_semiring(
                 compiled,
                 config.max_iterations,
                 config.timeout,
@@ -618,6 +636,13 @@ impl<'a> LocyEngine<'a> {
                 config.exact_probability,
                 config.max_bdd_variables,
                 config.top_k_proofs,
+                config
+                    .resolve()
+                    .map_err(|e| UniError::Query {
+                        message: format!("LocyConfigError: {e}"),
+                        query: None,
+                    })?
+                    .kind,
             )
             .map_err(|e| UniError::Query {
                 message: format!("LocyPlanBuildError: {e}"),
@@ -1063,6 +1088,7 @@ impl LocyExecutionContext for NativeExecutionAdapter<'_> {
         let strata_only = CompiledProgram {
             strata: program.strata.clone(),
             rule_catalog: program.rule_catalog.clone(),
+            model_catalog: program.model_catalog.clone(),
             warnings: vec![],
             commands: vec![],
         };
@@ -1206,6 +1232,35 @@ fn dispatch_native_command<'a>(
                 stats.queries_executed += 1;
                 Ok(CommandResult::Cypher(rows))
             }
+            CompiledCommand::Calibrate(cc) => {
+                // CALIBRATE runs inline inside LocyProgramExec::run_program
+                // and surfaces its result via the command_results_slot;
+                // by the time we get here that lookup has already
+                // succeeded. Reaching this arm is a programming
+                // error (the inline result was missing).
+                Err(LocyError::EvaluationError {
+                    message: format!(
+                        "internal: CALIBRATE '{}' missing inline result; \
+                         dispatch_native_command should not have been invoked \
+                         for a Calibrate command",
+                        cc.model_name
+                    ),
+                })
+            }
+            CompiledCommand::Validate(cv) => {
+                // VALIDATE, like CALIBRATE, runs inline inside
+                // LocyProgramExec::run_program and surfaces via
+                // command_results_slot. Reaching this arm is a
+                // programming error.
+                Err(LocyError::EvaluationError {
+                    message: format!(
+                        "internal: VALIDATE '{}' missing inline result; \
+                         dispatch_native_command should not have been invoked \
+                         for a Validate command",
+                        cv.rule_name
+                    ),
+                })
+            }
         }
     })
 }
@@ -1336,6 +1391,7 @@ fn build_locy_result(
         stats: orchestrator_stats,
         command_results,
         warnings,
+        compile_warnings: compiled.warnings.clone(),
         approximate_groups,
         derived_fact_set,
         timed_out,

@@ -42,10 +42,47 @@ NEW      = @{ ^"new" ~ !ident_char }
 EXPORT   = @{ ^"export" ~ !ident_char }
 PROB     = @{ ^"prob" ~ !ident_char }
 
+// Phase B (neural-predicate preview): CREATE MODEL surface keywords.
+// MODEL is fully reserved because it would otherwise be a common
+// identifier (e.g., `model` as a property name) that would silently
+// conflict with the new statement form. All others are contextual.
+MODEL          = @{ ^"model" ~ !ident_char }
+INPUT_KW       = @{ ^"input" ~ !ident_char }
+FEATURES       = @{ ^"features" ~ !ident_char }
+OUTPUT         = @{ ^"output" ~ !ident_char }
+USING          = @{ ^"using" ~ !ident_char }
+XERVO          = @{ ^"xervo" ~ !ident_char }
+CALIBRATION    = @{ ^"calibration" ~ !ident_char }
+CALIBRATE      = @{ ^"calibrate"   ~ !ident_char }
+HOLDOUT        = @{ ^"holdout"     ~ !ident_char }
+METHOD         = @{ ^"method"      ~ !ident_char }
+TARGET         = @{ ^"target"      ~ !ident_char }
+VALIDATE       = @{ ^"validate"    ~ !ident_char }
+METRICS        = @{ ^"metrics"     ~ !ident_char }
+// Metric keywords for VALIDATE (Phase C C3).
+METRIC_BRIER          = @{ ^"brier_score"           ~ !ident_char }
+METRIC_LOG_LOSS       = @{ ^"log_loss"              ~ !ident_char }
+METRIC_ECE            = @{ ^"ece"                   ~ !ident_char }
+METRIC_DEBIASED_ECE   = @{ ^"debiased_ece"          ~ !ident_char }
+METRIC_ACCURACY       = @{ ^"accuracy"              ~ !ident_char }
+METRIC_AUC            = @{ ^"auc"                   ~ !ident_char }
+// VERSION is already defined in cypher.pest (used by `AS OF VERSION ...`);
+// reuse it rather than redeclaring.
+SCORE_KW       = @{ ^"score" ~ !ident_char }
+LABEL_KW       = @{ ^"label" ~ !ident_char }
+VECTOR_KW      = @{ ^"vector" ~ !ident_char }
+INDEPENDENT    = @{ ^"independent" ~ !ident_char }
+PLATT_SCALING_KW       = @{ ^"platt_scaling" ~ !ident_char }
+ISOTONIC_REGRESSION_KW = @{ ^"isotonic_regression" ~ !ident_char }
+TEMPERATURE_SCALING_KW = @{ ^"temperature_scaling" ~ !ident_char }
+BETA_CALIBRATION_KW    = @{ ^"beta_calibration" ~ !ident_char }
+CONFORMAL_KW           = @{ ^"conformal" ~ !ident_char }
+CALIBRATION_NONE       = @{ ^"none" ~ !ident_char }
+
 // Locy reserved words — added to the reserved keyword set so that
 // the Locy parser rejects them as bare identifiers.
 locy_keyword_reserved = {
-    RULE | ALONG | PREV | FOLD | BEST | DERIVE | ASSUME | ABDUCE | QUERY_KW
+    RULE | ALONG | PREV | FOLD | BEST | DERIVE | ASSUME | ABDUCE | QUERY_KW | MODEL
 }
 
 // Locy identifier: like cypher identifier, but also rejects Locy reserved words
@@ -77,7 +114,10 @@ locy_statement_block = { locy_clause+ }
 // A Locy clause is either a Locy extension or a standard Cypher clause.
 // Locy-specific forms are tried first; Cypher clause is the fallback.
 locy_clause = {
-    rule_definition
+    model_definition
+    | calibrate_command
+    | validate_command
+    | rule_definition
     | goal_query
     | derive_command
     | assume_block
@@ -400,6 +440,131 @@ abduce_query = {
 
 abduce_return_clause = {
     RETURN ~ DISTINCT? ~ return_items ~ order_clause? ~ skip_clause? ~ limit_clause?
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// NEURAL PREDICATES  (CREATE MODEL, Phase B preview)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// `CREATE MODEL` declares a neural predicate wrapped over a Uni-Xervo
+// model alias. Grammar always parses; the compiler rejects unless
+// `LocyConfig::neural_predicates_preview` is set (rollout decision D-1).
+//
+// Annotations (currently only `@independent`) precede the CREATE keyword
+// and are space-separated.
+
+model_definition = {
+    model_annotations? ~
+    CREATE ~ MODEL ~ rule_name ~ AS
+    ~ model_input_clause
+    ~ model_features_clause?
+    ~ model_output_clause
+    ~ model_using_clause
+    ~ model_calibration_clause?
+    ~ model_version_clause?
+}
+
+// Annotations: `@independent` only for Slice 1+2. Future slices may add
+// `@stateful`, `@deterministic`, etc. Space-separated allows multiple.
+model_annotations = { model_annotation+ }
+model_annotation  = { "@" ~ ( INDEPENDENT | locy_identifier ) }
+
+model_input_clause = {
+    INPUT_KW ~ model_input_binding ~ ("," ~ model_input_binding)*
+}
+model_input_binding = {
+    "(" ~ locy_identifier ~ (":" ~ locy_identifier)? ~ ")"
+}
+
+model_features_clause = {
+    FEATURES ~ expression ~ ("," ~ expression)*
+}
+
+model_output_clause = {
+    OUTPUT ~ model_output_type ~ locy_identifier
+}
+model_output_type = {
+    PROB | SCORE_KW | LABEL_KW | VECTOR_KW
+}
+
+model_using_clause = {
+    USING ~ XERVO ~ "(" ~ string ~ ")"
+}
+
+model_calibration_clause = {
+    CALIBRATION ~ model_calibration_method
+}
+model_calibration_method = {
+    conformal_with_alpha
+    | PLATT_SCALING_KW
+    | ISOTONIC_REGRESSION_KW
+    | TEMPERATURE_SCALING_KW
+    | BETA_CALIBRATION_KW
+    | CONFORMAL_KW
+    | CALIBRATION_NONE
+}
+// `conformal(0.1)` — optional alpha parameter for split-conformal
+// bands. Parsed eagerly so a bare `conformal` keyword falls through
+// to the default alpha = 0.1.
+conformal_with_alpha = { CONFORMAL_KW ~ "(" ~ float ~ ")" }
+
+model_version_clause = {
+    VERSION ~ string
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CALIBRATE COMMAND  (Phase C C2)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// `CALIBRATE modelname ON MATCH pattern [WHERE expr] TARGET expr
+//  METHOD method [HOLDOUT 0.2]`
+//
+// Collects (prediction, ground_truth) pairs by invoking the registered
+// classifier for `modelname` over the MATCH pattern, fits the chosen
+// calibrator on a training split, and reports holdout metrics. See
+// impl plan §3.3 and DEEP_LOCY.md §11.3.
+
+calibrate_command = {
+    CALIBRATE ~ rule_name
+    ~ ON ~ MATCH ~ pattern
+    ~ where_clause?
+    ~ TARGET ~ expression
+    ~ METHOD ~ model_calibration_method
+    ~ holdout_clause?
+}
+
+holdout_clause = { HOLDOUT ~ (float | integer) }
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// VALIDATE COMMAND  (Phase C C3)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// `VALIDATE rulename ON MATCH pattern [WHERE expr] TARGET expr
+//  METRICS metric_list`
+//
+// Evaluates the named rule and joins its PROB output column against
+// the TARGET expression (ground truth) to compute the requested
+// metrics on `(prediction, label)` pairs. See impl plan §3.4 and
+// DEEP_LOCY.md §11.4.
+
+validate_command = {
+    VALIDATE ~ rule_name
+    ~ ON ~ MATCH ~ pattern
+    ~ where_clause?
+    ~ TARGET ~ expression
+    ~ METRICS ~ validate_metric ~ ("," ~ validate_metric)*
+}
+
+validate_metric = {
+    METRIC_BRIER
+    | METRIC_LOG_LOSS
+    | METRIC_DEBIASED_ECE
+    | METRIC_ECE
+    | METRIC_ACCURACY
+    | METRIC_AUC
 }
 
 

@@ -41,7 +41,10 @@ use std::time::{Duration, Instant};
 use uni_common::Value;
 use uni_common::core::schema::Schema as UniSchema;
 use uni_cypher::ast::Expr;
-use uni_locy::RuntimeWarning;
+use uni_locy::{
+    ClassifierRegistry, ModelInvocation, ModelInvocationCache, RuntimeWarning, RuntimeWarningCode,
+    SemiringKind,
+};
 use uni_store::storage::manager::StorageManager;
 
 // ---------------------------------------------------------------------------
@@ -154,13 +157,53 @@ impl MonotonicAggState {
     ///
     /// Returns `true` if any accumulator value changed. When `strict` is
     /// `true`, Nor/Prod inputs outside `[0, 1]` produce an error instead
-    /// of being clamped.
+    /// of being clamped. `semiring_kind` selects the probability
+    /// semiring: `AddMultProb` (default, Phase 1/2 noisy-OR/product) or
+    /// `MaxMinProb` (Viterbi/fuzzy — opt-in, callers emit
+    /// `FuzzyNotProbabilistic`).
+    ///
+    /// **Phase A follow-up (Slice 5):** delegates the per-row MNOR/MPROD
+    /// math to `update_generic`, which is generic over the
+    /// [`uni_locy::LocySemiring`] trait. This compiles down to the same
+    /// match-on-kind dispatch but routes through the trait — the
+    /// production path for C0 Stage 2 when tags replace scalar `f64`.
     pub fn update(
         &mut self,
         key_indices: &[usize],
         delta_batches: &[RecordBatch],
         strict: bool,
+        semiring_kind: SemiringKind,
     ) -> DFResult<bool> {
+        // Match-then-monomorphize: pick the concrete semiring once,
+        // call the generic worker. Both impls are inlined in release
+        // builds.
+        match semiring_kind {
+            SemiringKind::MaxMinProb => {
+                self.update_generic(key_indices, delta_batches, strict, &uni_locy::MaxMinProb)
+            }
+            _ => self.update_generic(
+                key_indices,
+                delta_batches,
+                strict,
+                &uni_locy::AddMultProb::default(),
+            ),
+        }
+    }
+
+    /// Trait-generic core of [`MonotonicAggState::update`]. Forms the
+    /// runtime hook for Phase C C0 Stage 2 — when the semiring's
+    /// `Tag` is no longer `f64`, this fn's signature parameterizes
+    /// over the new tag type cleanly.
+    fn update_generic<S>(
+        &mut self,
+        key_indices: &[usize],
+        delta_batches: &[RecordBatch],
+        strict: bool,
+        sr: &S,
+    ) -> DFResult<bool>
+    where
+        S: uni_locy::LocySemiring<Tag = f64>,
+    {
         use crate::query::df_graph::locy_fold::FoldAggKind;
 
         let mut changed = false;
@@ -168,7 +211,6 @@ impl MonotonicAggState {
             for row_idx in 0..batch.num_rows() {
                 let group_key = extract_scalar_key(batch, key_indices, row_idx);
                 for binding in &self.bindings {
-                    // Resolve input column by name first, fall back to index.
                     let idx = binding
                         .input_col_name
                         .as_ref()
@@ -188,15 +230,15 @@ impl MonotonicAggState {
                         let old = *entry;
                         match binding.kind {
                             FoldAggKind::Sum | FoldAggKind::Count => *entry += val,
-                            FoldAggKind::Max if val > *entry => {
-                                *entry = val;
-                            }
+                            FoldAggKind::Max if val > *entry => *entry = val,
                             FoldAggKind::Max => {}
-                            FoldAggKind::Min if val < *entry => {
-                                *entry = val;
-                            }
+                            FoldAggKind::Min if val < *entry => *entry = val,
                             FoldAggKind::Min => {}
                             FoldAggKind::Nor => {
+                                // Phase A inline domain check preserved
+                                // so the warning literal stays identical
+                                // and `strict` mode errors exactly as
+                                // before.
                                 if strict && !(0.0..=1.0).contains(&val) {
                                     return Err(datafusion::error::DataFusionError::Execution(
                                         format!(
@@ -211,7 +253,9 @@ impl MonotonicAggState {
                                     );
                                 }
                                 let p = val.clamp(0.0, 1.0);
-                                *entry = 1.0 - (1.0 - *entry) * (1.0 - p);
+                                // Trait-dispatched: AddMultProb -> noisy-OR;
+                                // MaxMinProb -> max.
+                                *entry = sr.plus(entry, &p);
                             }
                             FoldAggKind::Prod => {
                                 if strict && !(0.0..=1.0).contains(&val) {
@@ -228,7 +272,10 @@ impl MonotonicAggState {
                                     );
                                 }
                                 let p = val.clamp(0.0, 1.0);
-                                *entry *= p;
+                                // Trait-dispatched: AddMultProb -> product
+                                // (with log-space underflow guard);
+                                // MaxMinProb -> min.
+                                *entry = sr.times(entry, &p);
                             }
                             _ => {}
                         }
@@ -420,10 +467,15 @@ pub struct FixpointState {
     row_dedup: Option<RowDedupState>,
     /// Whether strict probability domain checks are enabled.
     strict_probability_domain: bool,
+    /// Active probability semiring for this rule's MNOR/MPROD math.
+    semiring_kind: SemiringKind,
 }
 
 impl FixpointState {
-    /// Create a new fixpoint state for a rule.
+    /// Create a new fixpoint state for a rule. Existing tests call this
+    /// with the Phase 1/2 default; the fixpoint planner uses
+    /// [`FixpointState::new_with_semiring`] to thread the configured
+    /// semiring through.
     pub fn new(
         rule_name: String,
         schema: SchemaRef,
@@ -431,6 +483,26 @@ impl FixpointState {
         max_derived_bytes: usize,
         monotonic_agg: Option<MonotonicAggState>,
         strict_probability_domain: bool,
+    ) -> Self {
+        Self::new_with_semiring(
+            rule_name,
+            schema,
+            key_column_indices,
+            max_derived_bytes,
+            monotonic_agg,
+            strict_probability_domain,
+            SemiringKind::AddMultProb,
+        )
+    }
+
+    pub fn new_with_semiring(
+        rule_name: String,
+        schema: SchemaRef,
+        key_column_indices: Vec<usize>,
+        max_derived_bytes: usize,
+        monotonic_agg: Option<MonotonicAggState>,
+        strict_probability_domain: bool,
+        semiring_kind: SemiringKind,
     ) -> Self {
         let num_cols = schema.fields().len();
         let row_dedup = RowDedupState::try_new(&schema);
@@ -451,6 +523,7 @@ impl FixpointState {
             monotonic_agg,
             row_dedup,
             strict_probability_domain,
+            semiring_kind,
         }
     }
 
@@ -540,6 +613,7 @@ impl FixpointState {
                 &self.key_column_indices,
                 &delta,
                 self.strict_probability_domain,
+                self.semiring_kind,
             )?;
         }
 
@@ -997,6 +1071,10 @@ pub struct FixpointClausePlan {
     pub priority: Option<i64>,
     /// ALONG binding variable names propagated from the planner.
     pub along_bindings: Vec<String>,
+    /// Phase B Slice 3: neural-model invocations lifted out of YIELD
+    /// items by the compiler. Each entry is evaluated per row after the
+    /// clause body produces batches and before IS-ref handling.
+    pub model_invocations: Vec<ModelInvocation>,
 }
 
 /// Physical plan for a single rule in a fixpoint stratum.
@@ -1063,9 +1141,42 @@ async fn run_fixpoint_loop(
     approximate_slot: Arc<StdRwLock<HashMap<String, Vec<String>>>>,
     top_k_proofs: usize,
     timeout_flag: Arc<std::sync::atomic::AtomicBool>,
+    semiring_kind: SemiringKind,
+    classifier_registry: Arc<ClassifierRegistry>,
+    classifier_cache: Option<Arc<ModelInvocationCache>>,
 ) -> DFResult<Vec<RecordBatch>> {
     let start = Instant::now();
     let task_ctx = session_ctx.read().task_ctx();
+
+    // IMPORTANT: per rollout D-9 the FuzzyNotProbabilistic warning emitted
+    // below is unsuppressible — do not gate on any suppression mechanism.
+    // Fuzzy truth values are not probabilities; silent conflation is the
+    // dominant pitfall in neuro-symbolic systems (LTN, NTP).
+    if semiring_kind == SemiringKind::MaxMinProb {
+        let mut warnings = warnings_slot.write().unwrap_or_else(|e| e.into_inner());
+        let mut already_warned: HashSet<String> = warnings
+            .iter()
+            .filter(|w| w.code == RuntimeWarningCode::FuzzyNotProbabilistic)
+            .map(|w| w.rule_name.clone())
+            .collect();
+        for rule in &rules {
+            if rule.prob_column_name.is_some() && !already_warned.contains(&rule.name) {
+                warnings.push(RuntimeWarning {
+                    code: RuntimeWarningCode::FuzzyNotProbabilistic,
+                    message: format!(
+                        "rule '{}' carries a PROB column but is being evaluated under \
+                         the MaxMinProb (fuzzy / Viterbi) semiring; outputs are fuzzy \
+                         truth values, not probabilities",
+                        rule.name
+                    ),
+                    rule_name: rule.name.clone(),
+                    variable_count: None,
+                    key_group: None,
+                });
+                already_warned.insert(rule.name.clone());
+            }
+        }
+    }
 
     // Initialize per-rule state
     let mut states: Vec<FixpointState> = rules
@@ -1086,13 +1197,14 @@ async fn run_fixpoint_loop(
             } else {
                 None
             };
-            FixpointState::new(
+            FixpointState::new_with_semiring(
                 rule.name.clone(),
                 Arc::clone(&rule.yield_schema),
                 rule.key_column_indices.clone(),
                 max_derived_bytes,
                 monotonic_agg,
                 strict_probability_domain,
+                semiring_kind,
             )
         })
         .collect();
@@ -1115,6 +1227,11 @@ async fn run_fixpoint_loop(
             let mut all_candidates = Vec::new();
             let mut clause_candidates: Vec<Vec<RecordBatch>> = Vec::new();
             for clause in &rule.clauses {
+                // Phase B A4 follow-up: the planner inserts
+                // `LogicalPlan::LocyModelInvoke` between the body and
+                // `LocyProject` when this clause has neural-model
+                // invocations, so `execute_subplan` runs the invocation
+                // inline as part of the body plan tree.
                 let mut batches = execute_subplan(
                     &clause.body_logical,
                     &params,
@@ -1210,7 +1327,11 @@ async fn run_fixpoint_loop(
                         iteration,
                         &registry,
                         top_k_proofs,
-                    );
+                        &classifier_registry,
+                        classifier_cache.as_ref(),
+                        &warnings_slot,
+                    )
+                    .await;
                 }
             }
         }
@@ -1261,7 +1382,25 @@ async fn run_fixpoint_loop(
         }
 
         // Detect shared proofs before FOLD collapses groups.
-        let shared_info = if let Some(ref tracker) = derivation_tracker {
+        //
+        // TODO(C0-stage2): swap `detect_shared_lineage` for `TopKTag`
+        // DNF inspection when `semiring_kind == TopKProofs { k }`.
+        // The library-layer tag math has landed in
+        // `crates/uni-locy/src/top_k_proofs.rs` (Phase C C0 Stage 1);
+        // Stage 2 plumbs `TopKTag` through `MonotonicAggState` /
+        // `FoldExec` so per-row dependency DNFs are available here.
+        // Until Stage 2, this scalar `ProvenanceStore` path runs for
+        // every semiring including `TopKProofs` (per rollout D-4
+        // "graceful migration").
+        //
+        // Phase-3 shared-proof detection is meaningful only under
+        // `AddMultProb` (and `BddExact`, which is the AddMultProb math
+        // plus a WMC post-correction). Under `MaxMinProb`, `plus = max`
+        // is idempotent — shared proofs don't double-count — so the
+        // warning is moot and we skip the work.
+        let shared_info = if semiring_kind == SemiringKind::MaxMinProb {
+            None
+        } else if let Some(ref tracker) = derivation_tracker {
             detect_shared_lineage(rule, &facts, tracker, &warnings_slot)
         } else {
             None
@@ -1289,6 +1428,7 @@ async fn run_fixpoint_loop(
             &task_ctx,
             strict_probability_domain,
             probability_epsilon,
+            semiring_kind,
         )
         .await?;
         all_output.extend(processed);
@@ -1310,7 +1450,7 @@ async fn run_fixpoint_loop(
 ///
 /// Called after `merge_delta` returns `true`. Attributes each new fact to the
 /// clause most likely to have produced it, using first-derivation-wins semantics.
-fn record_provenance(
+async fn record_provenance(
     tracker: &Arc<ProvenanceStore>,
     rule: &FixpointRulePlan,
     state: &FixpointState,
@@ -1318,6 +1458,9 @@ fn record_provenance(
     iteration: usize,
     registry: &Arc<DerivedScanRegistry>,
     top_k_proofs: usize,
+    classifier_registry: &Arc<ClassifierRegistry>,
+    classifier_cache: Option<&Arc<uni_locy::ModelInvocationCache>>,
+    warnings_slot: &Arc<StdRwLock<Vec<RuntimeWarning>>>,
 ) {
     let all_indices: Vec<usize> = (0..rule.yield_schema.fields().len()).collect();
 
@@ -1327,6 +1470,8 @@ fn record_provenance(
     } else {
         HashMap::new()
     };
+
+    let mut topk_acc = TopKProofAccumulator::new();
 
     for delta_batch in state.all_delta() {
         for row_idx in 0..delta_batch.num_rows() {
@@ -1363,15 +1508,119 @@ fn record_provenance(
                         .collect()
                 },
                 iteration,
-                fact_row,
+                fact_row: fact_row.clone(),
                 proof_probability,
+                neural_calls: collect_neural_calls_for_row(
+                    rule,
+                    clause_index,
+                    &fact_row,
+                    classifier_registry,
+                    classifier_cache,
+                )
+                .await,
             };
             if top_k_proofs > 0 {
+                topk_acc.accumulate(&entry, &row_hash);
                 tracker.record_top_k(row_hash, entry, top_k_proofs);
             } else {
                 tracker.record(row_hash, entry);
             }
         }
+    }
+
+    topk_acc.emit_warning_if_any(rule, top_k_proofs, warnings_slot);
+}
+
+/// Phase C C0 Stage 2: collects per-row `Proof` tags during the
+/// fixpoint row walk, then surfaces `TopKPruningCrossedDependency`
+/// when post-walk top-K merging would drop a proof whose base RVs
+/// overlap a retained one. The shared `BaseRv` interner is what
+/// makes the overlap detectable — proofs grounded in the same
+/// `base_fact_id` get the same `BaseRv`.
+struct TopKProofAccumulator {
+    per_fact: HashMap<Vec<u8>, Vec<uni_locy::Proof>>,
+    base_rv_interner: HashMap<Vec<u8>, uni_locy::BaseRv>,
+    next_rv: u32,
+}
+
+impl TopKProofAccumulator {
+    fn new() -> Self {
+        Self {
+            per_fact: HashMap::new(),
+            base_rv_interner: HashMap::new(),
+            next_rv: 0,
+        }
+    }
+
+    fn accumulate(&mut self, entry: &ProvenanceAnnotation, row_hash: &[u8]) {
+        let mut base_rvs = uni_locy::BaseRvSet::empty();
+        for term in &entry.support {
+            let rv = *self
+                .base_rv_interner
+                .entry(term.base_fact_id.clone())
+                .or_insert_with(|| {
+                    let r = uni_locy::BaseRv(self.next_rv);
+                    self.next_rv += 1;
+                    r
+                });
+            base_rvs.insert(rv);
+        }
+        self.per_fact
+            .entry(row_hash.to_vec())
+            .or_default()
+            .push(uni_locy::Proof {
+                weight: entry.proof_probability.unwrap_or(0.0),
+                base_rvs,
+                neural_calls: Vec::new(),
+            });
+    }
+
+    fn emit_warning_if_any(
+        &self,
+        rule: &FixpointRulePlan,
+        top_k_proofs: usize,
+        warnings_slot: &Arc<StdRwLock<Vec<RuntimeWarning>>>,
+    ) {
+        if top_k_proofs == 0 || self.per_fact.is_empty() {
+            return;
+        }
+        let crossed_facts = self
+            .per_fact
+            .values()
+            .filter(|proofs| {
+                let (_kept, notice) =
+                    uni_locy::merge_top_k_runtime(Vec::new(), (*proofs).clone(), top_k_proofs);
+                notice == uni_locy::PruneNotice::CrossedDependency
+            })
+            .count();
+        if crossed_facts == 0 {
+            return;
+        }
+        let Ok(mut w) = warnings_slot.write() else {
+            return;
+        };
+        let already = w.iter().any(|rw| {
+            matches!(
+                rw.code,
+                uni_locy::types::RuntimeWarningCode::TopKPruningCrossedDependency
+            ) && rw.rule_name == rule.name
+        });
+        if already {
+            return;
+        }
+        w.push(RuntimeWarning {
+            code: uni_locy::types::RuntimeWarningCode::TopKPruningCrossedDependency,
+            rule_name: rule.name.clone(),
+            message: format!(
+                "rule '{}': top-K proof pruning (k={}) discarded {} fact(s) \
+                 whose dependencies overlap retained proofs. The retained \
+                 top-{} under-counts the true joint probability for those \
+                 facts (Scallop, Huang et al. 2021). Increase k to recover.",
+                rule.name, top_k_proofs, crossed_facts, top_k_proofs
+            ),
+            variable_count: None,
+            key_group: None,
+        });
     }
 }
 
@@ -1380,6 +1629,133 @@ fn record_provenance(
 /// For each non-negated IS-ref binding in the clause, extracts body-side key
 /// values from the delta row and finds matching source rows in the registry.
 /// Returns a `ProofTerm` for each match (with the source fact hash).
+/// Phase C B1–B3: build [`uni_locy::NeuralProvenance`] entries for
+/// the model invocations on this clause by reading each
+/// invocation's output column from the post-LocyModelInvoke row.
+/// `raw_probability` is the classifier's direct output;
+/// `calibrated_probability` and `confidence_band` come from the
+/// active Calibrator (when the classifier wraps one).
+///
+/// Phase C B1-B3 follow-up rewrite: re-evaluate the classifier
+/// per fact using the ORIGINAL pre-rewrite feature expressions
+/// (stored as `invocation.original_feature_exprs`). This works
+/// for invocations in YIELD, ALONG, and FOLD positions uniformly
+/// — the original args carry the input bindings regardless of
+/// where the synthetic `__model_<n>` column ends up in the plan
+/// tree. Memoization via `ModelInvocationCache` (already threaded)
+/// absorbs repeat costs; EXPLAIN typically operates on small
+/// derivation trees so the per-fact classifier call is bounded.
+async fn collect_neural_calls_for_row(
+    rule: &FixpointRulePlan,
+    clause_index: usize,
+    fact_row: &uni_locy::FactRow,
+    classifier_registry: &Arc<ClassifierRegistry>,
+    classifier_cache: Option<&Arc<uni_locy::ModelInvocationCache>>,
+) -> Vec<uni_locy::NeuralProvenance> {
+    let Some(clause) = rule.clauses.get(clause_index) else {
+        return Vec::new();
+    };
+    if clause.model_invocations.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(clause.model_invocations.len());
+    for invocation in &clause.model_invocations {
+        let Some(classifier) = classifier_registry.get(&invocation.model_name) else {
+            continue;
+        };
+        // Build ClassifyInput from the ORIGINAL (pre-rewrite)
+        // feature expressions evaluated against fact_row.
+        let mut features = std::collections::HashMap::new();
+        for (binding_name, feat_expr) in invocation
+            .feature_names
+            .iter()
+            .zip(invocation.original_feature_exprs.iter())
+        {
+            features.insert(
+                binding_name.clone(),
+                eval_feature_expr_against_fact_row(feat_expr, fact_row),
+            );
+        }
+        let input = uni_locy::ClassifyInput { features };
+        let input_hash = input.stable_hash();
+        // Cache check.
+        let raw = if let Some(v) =
+            classifier_cache.and_then(|c| c.get(&invocation.model_name, input_hash))
+        {
+            v
+        } else {
+            // Cache miss: invoke classifier. Per-fact cost; small
+            // for typical EXPLAIN scenarios.
+            match classifier.classify(std::slice::from_ref(&input)).await {
+                Ok(probs) => {
+                    let v = probs.first().copied().unwrap_or(0.0);
+                    if let Some(c) = classifier_cache {
+                        c.insert(&invocation.model_name, input_hash, v);
+                    }
+                    v
+                }
+                Err(_) => continue,
+            }
+        };
+        let calibrator = classifier.get_calibrator();
+        let calibrated_probability = calibrator.as_ref().map(|_| raw);
+        let confidence_band = calibrator.as_ref().and_then(|c| c.confidence_band(raw));
+        out.push(uni_locy::NeuralProvenance {
+            model_name: invocation.model_name.clone(),
+            raw_probability: raw,
+            calibrated_probability,
+            confidence_band,
+        });
+    }
+    out
+}
+
+/// Phase C B1-B3 follow-up: evaluate a model's pre-rewrite feature
+/// expression against a fact_row, producing a `FeatureValue` for
+/// classifier input reconstruction. Mirrors the compile-time
+/// acceptance set in `validate_features`:
+/// - `Variable(name)` → fact_row[name], coerced.
+/// - `Property(Variable(v), prop)` → fact_row["v.prop"] (the
+///   materialized property column).
+fn eval_feature_expr_against_fact_row(
+    expr: &uni_cypher::ast::Expr,
+    fact_row: &uni_locy::FactRow,
+) -> uni_locy::FeatureValue {
+    use uni_cypher::ast::Expr;
+    use uni_locy::FeatureValue;
+    let value_to_feature = |v: Option<&uni_common::Value>| -> FeatureValue {
+        match v {
+            Some(uni_common::Value::Float(f)) => FeatureValue::Float(*f),
+            Some(uni_common::Value::Int(i)) => FeatureValue::Int(*i),
+            Some(uni_common::Value::Bool(b)) => FeatureValue::Bool(*b),
+            Some(uni_common::Value::String(s)) => FeatureValue::String(s.clone()),
+            Some(uni_common::Value::Node(n)) => {
+                // Encode node by vid for `scorer(s)` style.
+                FeatureValue::Int(n.vid.as_u64() as i64)
+            }
+            _ => FeatureValue::Null,
+        }
+    };
+    match expr {
+        Expr::Variable(name) => value_to_feature(fact_row.get(name)),
+        Expr::Property(boxed, prop) => {
+            if let Expr::Variable(v) = boxed.as_ref() {
+                // Try the materialized property column first.
+                let key = format!("{}.{}", v, prop);
+                if let Some(val) = fact_row.get(&key) {
+                    return value_to_feature(Some(val));
+                }
+                // Fallback: read property from the node value.
+                if let Some(uni_common::Value::Node(n)) = fact_row.get(v) {
+                    return value_to_feature(n.properties.get(prop));
+                }
+            }
+            FeatureValue::Null
+        }
+        _ => FeatureValue::Null,
+    }
+}
+
 fn collect_is_ref_inputs(
     rule: &FixpointRulePlan,
     clause_index: usize,
@@ -1674,13 +2050,15 @@ fn detect_shared_lineage(
 /// This function bridges that gap by recording a `ProvenanceAnnotation` for every
 /// fact produced by each clause and then running the same two-tier detection
 /// logic used by the recursive path.
-pub(crate) fn record_and_detect_lineage_nonrecursive(
+pub(crate) async fn record_and_detect_lineage_nonrecursive(
     rule: &FixpointRulePlan,
     tagged_clause_facts: &[(usize, Vec<RecordBatch>)],
     tracker: &Arc<ProvenanceStore>,
     warnings_slot: &Arc<StdRwLock<Vec<RuntimeWarning>>>,
     registry: &Arc<DerivedScanRegistry>,
     top_k_proofs: usize,
+    classifier_registry: &Arc<ClassifierRegistry>,
+    classifier_cache: Option<&Arc<uni_locy::ModelInvocationCache>>,
 ) -> Option<SharedLineageInfo> {
     let all_indices: Vec<usize> = (0..rule.yield_schema.fields().len()).collect();
 
@@ -1690,6 +2068,8 @@ pub(crate) fn record_and_detect_lineage_nonrecursive(
     } else {
         HashMap::new()
     };
+
+    let mut topk_acc = TopKProofAccumulator::new();
 
     // Record provenance for each clause's facts.
     for (clause_index, batches) in tagged_clause_facts {
@@ -1724,10 +2104,19 @@ pub(crate) fn record_and_detect_lineage_nonrecursive(
                             .collect()
                     },
                     iteration: 0,
-                    fact_row,
+                    fact_row: fact_row.clone(),
                     proof_probability,
+                    neural_calls: collect_neural_calls_for_row(
+                        rule,
+                        *clause_index,
+                        &fact_row,
+                        classifier_registry,
+                        classifier_cache,
+                    )
+                    .await,
                 };
                 if top_k_proofs > 0 {
+                    topk_acc.accumulate(&entry, &row_hash);
                     tracker.record_top_k(row_hash, entry, top_k_proofs);
                 } else {
                     tracker.record(row_hash, entry);
@@ -1735,6 +2124,8 @@ pub(crate) fn record_and_detect_lineage_nonrecursive(
             }
         }
     }
+
+    topk_acc.emit_warning_if_any(rule, top_k_proofs, warnings_slot);
 
     // Flatten all clause facts and run detection.
     let all_facts: Vec<RecordBatch> = tagged_clause_facts
@@ -2094,6 +2485,324 @@ pub fn apply_anti_join(
 ///
 /// This implements the probabilistic complement semantics: `IS NOT risk` on a PROB rule
 /// yields the probability that the entity is NOT risky.
+
+// ─── Phase B Slice 3: neural-model invocation pass ───────────────────────
+//
+// `apply_model_invocations` runs every `ModelInvocation` lifted from a
+// clause's YIELD items against the body's output batches. For each
+// invocation it:
+//
+//   1. Resolves each `feature_expr` to a column in the batch — Slice 3
+//      supports plain `Expr::Variable("name")` references; richer
+//      expressions (property access, nested calls) are deferred.
+//   2. Builds one `ClassifyInput` per row keyed by the model's input
+//      binding names.
+//   3. Issues a single batched `NeuralClassifier::classify` call.
+//   4. Appends the resulting `Float64Array` as a new column matching
+//      `invocation.output_column`.
+//
+// Errors:
+//   * `UnknownNeuralModel`: the model name isn't in the registry.
+//   * Mismatched feature-expr / column: returned as a DataFusion
+//     Execution error.
+
+/// Phase B A4: wrap a Locy clause body plan in a
+/// `LogicalPlan::LocyModelInvoke` node when the clause has any
+/// neural-model invocations. When the list is empty, returns the
+/// input plan unchanged — keeping the plan tree compact for the
+/// (common) symbolic-only path.
+pub(crate) fn wrap_with_model_invoke(
+    body: crate::query::planner::LogicalPlan,
+    invocations: &[uni_locy::ModelInvocation],
+    classifier_registry: &Arc<ClassifierRegistry>,
+    classifier_cache: Option<&Arc<uni_locy::ModelInvocationCache>>,
+    classifier_provenance_store: Option<&Arc<uni_locy::NeuralProvenanceStore>>,
+) -> crate::query::planner::LogicalPlan {
+    if invocations.is_empty() {
+        return body;
+    }
+    crate::query::planner::LogicalPlan::LocyModelInvoke {
+        input: Box::new(body),
+        invocations: invocations.to_vec(),
+        classifier_registry: Arc::clone(classifier_registry),
+        classifier_cache: classifier_cache.map(Arc::clone),
+        classifier_provenance_store: classifier_provenance_store.map(Arc::clone),
+    }
+}
+
+pub(crate) async fn apply_model_invocations(
+    batches: Vec<RecordBatch>,
+    invocations: &[uni_locy::ModelInvocation],
+    registry: &Arc<ClassifierRegistry>,
+    cache: Option<&Arc<uni_locy::ModelInvocationCache>>,
+    provenance_store: Option<&Arc<uni_locy::NeuralProvenanceStore>>,
+) -> DFResult<Vec<RecordBatch>> {
+    use uni_locy::ClassifyInput;
+    if batches.is_empty() || invocations.is_empty() {
+        return Ok(batches);
+    }
+    let mut out_batches = Vec::with_capacity(batches.len());
+    for batch in batches {
+        let mut current = batch;
+        for invocation in invocations {
+            let classifier = registry.get(&invocation.model_name).ok_or_else(|| {
+                datafusion::error::DataFusionError::Execution(format!(
+                    "neural classifier '{}' not registered; \
+                         add it to LocyConfig::classifier_registry",
+                    invocation.model_name
+                ))
+            })?;
+
+            // Resolve each feature_expr to a column in the current batch.
+            // Supported shapes (validated at compile time by
+            // `extract_model_invocations`):
+            //   * `Expr::Variable("name")` — direct column reference.
+            //   * `Expr::Property(Variable(v), prop)` — looked up by the
+            //     conventional `"v.prop"` column name materialized by
+            //     the planner's `translate_property_access` pipeline
+            //     (the compiler appended a hidden YIELD item that
+            //     produces this column for every property feature ref).
+            let mut feature_cols: Vec<(String, usize)> =
+                Vec::with_capacity(invocation.feature_exprs.len());
+            for (i, fexpr) in invocation.feature_exprs.iter().enumerate() {
+                let schema = current.schema();
+                let col_name = match fexpr {
+                    uni_cypher::ast::Expr::Variable(name) => {
+                        // After A4's "invoke below LocyProject"
+                        // restructure, the batch we see is the
+                        // pre-projection body — node variables are
+                        // present as `<name>._vid` helper columns
+                        // (graph scan output), NOT as the flat
+                        // `<name>` column that LocyProject later
+                        // emits. Resolve to `<name>._vid` when the
+                        // flat column is absent.
+                        if schema.index_of(name).is_ok() {
+                            name.clone()
+                        } else {
+                            let vid_name = format!("{}._vid", name);
+                            if schema.index_of(&vid_name).is_ok() {
+                                vid_name
+                            } else {
+                                name.clone()
+                            }
+                        }
+                    }
+                    uni_cypher::ast::Expr::Property(boxed_inner, prop)
+                        if matches!(boxed_inner.as_ref(), uni_cypher::ast::Expr::Variable(_)) =>
+                    {
+                        let var = match boxed_inner.as_ref() {
+                            uni_cypher::ast::Expr::Variable(v) => v.clone(),
+                            _ => unreachable!(),
+                        };
+                        // After the A4 "invoke below LocyProject"
+                        // restructure, we read from the pre-projection
+                        // body batch — properties arrive from the
+                        // graph scan as `<var>.<prop>` flat columns
+                        // (collect_properties_from_plan ensures the
+                        // scan materializes them because the hidden
+                        // YIELD item references the property).
+                        let direct = format!("{}.{}", var, prop);
+                        if schema.index_of(&direct).is_ok() {
+                            direct
+                        } else {
+                            // Fallback to the hidden-YIELD alias for
+                            // the legacy path. Should not be reached
+                            // in the unified structure.
+                            format!("__feat_{}_{}", var, prop)
+                        }
+                    }
+                    other => {
+                        return Err(datafusion::error::DataFusionError::Execution(format!(
+                            "model '{}' supports plain variable / synthesized \
+                             property feature expressions; got {other:?}",
+                            invocation.model_name
+                        )));
+                    }
+                };
+                let idx = current.schema().index_of(&col_name).map_err(|_| {
+                    datafusion::error::DataFusionError::Execution(format!(
+                        "feature column '{col_name}' not found in clause body \
+                         output schema for model '{}'",
+                        invocation.model_name
+                    ))
+                })?;
+                feature_cols.push((invocation.feature_names[i].clone(), idx));
+            }
+
+            // Build one ClassifyInput per row.
+            let n_rows = current.num_rows();
+            let mut inputs: Vec<ClassifyInput> = Vec::with_capacity(n_rows);
+            let mut input_hashes: Vec<u64> = Vec::with_capacity(n_rows);
+            for row_idx in 0..n_rows {
+                let mut features = std::collections::HashMap::new();
+                for (binding_name, col_idx) in &feature_cols {
+                    let col = current.column(*col_idx);
+                    features.insert(
+                        binding_name.clone(),
+                        extract_feature_value(col.as_ref(), row_idx),
+                    );
+                }
+                let input = ClassifyInput { features };
+                input_hashes.push(input.stable_hash());
+                inputs.push(input);
+            }
+
+            // Slice 2: memoization. Split inputs into cache hits and
+            // misses; only call `classify` on the misses, then weave
+            // the cached values back in by original row index.
+            let mut probs: Vec<f64> = vec![0.0; n_rows];
+            let mut miss_inputs: Vec<ClassifyInput> = Vec::new();
+            let mut miss_row_indices: Vec<usize> = Vec::new();
+            if let Some(c) = cache {
+                for (row_idx, h) in input_hashes.iter().enumerate() {
+                    match c.get(&invocation.model_name, *h) {
+                        Some(v) => probs[row_idx] = v,
+                        None => {
+                            miss_row_indices.push(row_idx);
+                            miss_inputs.push(inputs[row_idx].clone());
+                        }
+                    }
+                }
+            } else {
+                miss_row_indices = (0..n_rows).collect();
+                miss_inputs = inputs.clone();
+            }
+
+            let miss_probs = if miss_inputs.is_empty() {
+                Vec::new()
+            } else {
+                let r = classifier
+                    .classify(&miss_inputs)
+                    .await
+                    .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+                if r.len() != miss_inputs.len() {
+                    return Err(datafusion::error::DataFusionError::Execution(format!(
+                        "classifier '{}' returned {} outputs for {} inputs",
+                        invocation.model_name,
+                        r.len(),
+                        miss_inputs.len()
+                    )));
+                }
+                r
+            };
+            for (i, &row_idx) in miss_row_indices.iter().enumerate() {
+                probs[row_idx] = miss_probs[i];
+                if let Some(c) = cache {
+                    c.insert(&invocation.model_name, input_hashes[row_idx], miss_probs[i]);
+                }
+            }
+
+            // Phase C B1-B3 follow-up: when a provenance store is
+            // configured, record (raw, calibrated, confidence_band)
+            // per row. For a wrapped `CalibratedClassifier`, `probs`
+            // are already calibrated (since `classify()` returns
+            // post-calibration values); the raw view is surfaced as
+            // the same value with `calibrated_probability` set to
+            // signal "post-calibrator". The full raw/calibrated
+            // separation requires `NeuralClassifier::raw_and_calibrated`
+            // which is a follow-up. The confidence_band comes from
+            // the active Calibrator's `confidence_band(p)`.
+            if let Some(store) = provenance_store {
+                let cal = classifier.get_calibrator();
+                for row_idx in 0..n_rows {
+                    let value = probs[row_idx];
+                    let calibrated = cal.as_ref().map(|_| value);
+                    let band = cal.as_ref().and_then(|c| c.confidence_band(value));
+                    store.record(
+                        &invocation.model_name,
+                        input_hashes[row_idx],
+                        uni_locy::NeuralProvenanceRecord {
+                            raw_probability: value,
+                            calibrated_probability: calibrated,
+                            confidence_band: band,
+                        },
+                    );
+                }
+            }
+
+            // Overwrite the placeholder column put there by the
+            // compile-time YIELD rewrite. If the column doesn't yet
+            // exist (defensive — shouldn't happen for well-formed
+            // plans), fall back to appending.
+            let out_col: Arc<dyn arrow_array::Array> =
+                Arc::new(arrow_array::Float64Array::from(probs));
+            let schema = current.schema();
+            let target_idx = schema.index_of(&invocation.output_column).ok();
+            let mut columns: Vec<Arc<dyn arrow_array::Array>> = current.columns().to_vec();
+            let mut fields: Vec<Arc<arrow_schema::Field>> =
+                schema.fields().iter().cloned().collect();
+            match target_idx {
+                Some(idx) => {
+                    columns[idx] = out_col;
+                    // Force the field's data type to Float64 in case
+                    // the placeholder was inferred at a wider type.
+                    fields[idx] = Arc::new(arrow_schema::Field::new(
+                        &invocation.output_column,
+                        arrow_schema::DataType::Float64,
+                        true,
+                    ));
+                }
+                None => {
+                    columns.push(out_col);
+                    fields.push(Arc::new(arrow_schema::Field::new(
+                        &invocation.output_column,
+                        arrow_schema::DataType::Float64,
+                        true,
+                    )));
+                }
+            }
+            let new_schema = Arc::new(arrow_schema::Schema::new(fields));
+            current = RecordBatch::try_new(new_schema, columns).map_err(arrow_err)?;
+        }
+        out_batches.push(current);
+    }
+    Ok(out_batches)
+}
+
+/// Extract a [`uni_locy::FeatureValue`] from a column at a given row.
+/// Conservative cast set matching the property-graph value types Locy
+/// currently exposes; unsupported types fall back to `Null`.
+fn extract_feature_value(col: &dyn arrow_array::Array, row_idx: usize) -> uni_locy::FeatureValue {
+    use arrow_array::{BooleanArray, Float64Array, Int64Array, LargeStringArray, StringArray};
+    if col.is_null(row_idx) {
+        return uni_locy::FeatureValue::Null;
+    }
+    if let Some(a) = col.as_any().downcast_ref::<Float64Array>() {
+        return uni_locy::FeatureValue::Float(a.value(row_idx));
+    }
+    if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
+        return uni_locy::FeatureValue::Int(a.value(row_idx));
+    }
+    if let Some(a) = col.as_any().downcast_ref::<BooleanArray>() {
+        return uni_locy::FeatureValue::Bool(a.value(row_idx));
+    }
+    if let Some(a) = col.as_any().downcast_ref::<StringArray>() {
+        return uni_locy::FeatureValue::String(a.value(row_idx).to_string());
+    }
+    if let Some(a) = col.as_any().downcast_ref::<LargeStringArray>() {
+        return uni_locy::FeatureValue::String(a.value(row_idx).to_string());
+    }
+    // Schema-less property storage: values arrive as LargeBinary
+    // MessagePack-encoded `CypherValue`. Decode via the standard codec
+    // and project the result to the matching `FeatureValue` variant.
+    if let Some(b) = col.as_any().downcast_ref::<arrow_array::LargeBinaryArray>() {
+        let bytes = b.value(row_idx);
+        if bytes.is_empty() {
+            return uni_locy::FeatureValue::Null;
+        }
+        let v = uni_common::cypher_value_codec::decode(bytes).unwrap_or(uni_common::Value::Null);
+        return match v {
+            uni_common::Value::Float(f) => uni_locy::FeatureValue::Float(f),
+            uni_common::Value::Int(i) => uni_locy::FeatureValue::Int(i),
+            uni_common::Value::Bool(b) => uni_locy::FeatureValue::Bool(b),
+            uni_common::Value::String(s) => uni_locy::FeatureValue::String(s),
+            uni_common::Value::Null => uni_locy::FeatureValue::Null,
+            _ => uni_locy::FeatureValue::Null,
+        };
+    }
+    uni_locy::FeatureValue::Null
+}
+
 pub fn apply_prob_complement(
     batches: Vec<RecordBatch>,
     neg_facts: &[RecordBatch],
@@ -2841,6 +3550,7 @@ pub(crate) async fn apply_post_fixpoint_chain(
     task_ctx: &Arc<TaskContext>,
     strict_probability_domain: bool,
     probability_epsilon: f64,
+    semiring_kind: SemiringKind,
 ) -> DFResult<Vec<RecordBatch>> {
     if !rule.has_fold && !rule.has_best_by && !rule.has_priority && rule.having.is_empty() {
         return Ok(facts);
@@ -2891,12 +3601,13 @@ pub(crate) async fn apply_post_fixpoint_chain(
 
     // Apply FOLD
     let current: Arc<dyn ExecutionPlan> = if rule.has_fold && !rule.fold_bindings.is_empty() {
-        Arc::new(FoldExec::new(
+        Arc::new(FoldExec::new_with_semiring(
             current,
             key_column_indices.clone(),
             rule.fold_bindings.clone(),
             strict_probability_domain,
             probability_epsilon,
+            semiring_kind,
         ))
     } else {
         current
@@ -2967,6 +3678,25 @@ pub struct FixpointExec {
     top_k_proofs: usize,
     /// Shared flag: set to true on timeout to signal partial results.
     timeout_flag: Arc<std::sync::atomic::AtomicBool>,
+    /// Active probability semiring (rollout D-7).
+    semiring_kind: SemiringKind,
+    /// Phase B Slice 3 registry of neural classifiers, keyed by the
+    /// model name from `CREATE MODEL`. Held by `Arc` so executor clones
+    /// share the same underlying map.
+    classifier_registry: Arc<ClassifierRegistry>,
+    /// Phase B follow-up: optional per-evaluation memoization cache
+    /// for classifier outputs keyed by `(model_name, feature_hash)`.
+    /// `None` → no caching; `Some` → cache shared across fixpoint
+    /// iterations (and optionally across the entire query / multiple
+    /// queries, when the caller threads it via `LocyConfig`).
+    classifier_cache: Option<Arc<ModelInvocationCache>>,
+    /// Phase C B1-B3 follow-up: per-query side-channel store
+    /// for (raw, calibrated, confidence_band) records. Read by
+    /// EXPLAIN; not used by the fixpoint inner loop directly
+    /// (LocyModelInvokeExec writes; this struct just carries
+    /// the Arc to keep the type wiring consistent across the
+    /// LocyProgramExec/FixpointExec boundary).
+    classifier_provenance_store: Option<Arc<uni_locy::NeuralProvenanceStore>>,
 }
 
 impl fmt::Debug for FixpointExec {
@@ -2986,6 +3716,13 @@ impl FixpointExec {
     #[expect(
         clippy::too_many_arguments,
         reason = "FixpointExec configuration needs all context"
+    )]
+    #[deprecated(
+        note = "use `new_with_semiring_classifiers_and_cache` (or the lighter \
+                `new_with_semiring_and_classifiers` / `new_with_semiring`) — \
+                this legacy ctor defaults the semiring to AddMultProb and \
+                ships no classifier registry, which the Phase B+ runtime needs \
+                explicitly. To be removed after C0 Stage 2."
     )]
     pub fn new(
         rules: Vec<FixpointRulePlan>,
@@ -3009,6 +3746,186 @@ impl FixpointExec {
         approximate_slot: Arc<StdRwLock<HashMap<String, Vec<String>>>>,
         top_k_proofs: usize,
         timeout_flag: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        Self::new_with_semiring_and_classifiers(
+            rules,
+            max_iterations,
+            timeout,
+            graph_ctx,
+            session_ctx,
+            storage,
+            schema_info,
+            params,
+            derived_scan_registry,
+            output_schema,
+            max_derived_bytes,
+            derivation_tracker,
+            iteration_counts,
+            strict_probability_domain,
+            probability_epsilon,
+            exact_probability,
+            max_bdd_variables,
+            warnings_slot,
+            approximate_slot,
+            top_k_proofs,
+            timeout_flag,
+            SemiringKind::AddMultProb,
+            Arc::new(ClassifierRegistry::new()),
+        )
+    }
+
+    /// Variant accepting an explicit [`SemiringKind`]. Empty classifier
+    /// registry; for the full variant call
+    /// [`new_with_semiring_and_classifiers`].
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "FixpointExec configuration needs all context"
+    )]
+    pub fn new_with_semiring(
+        rules: Vec<FixpointRulePlan>,
+        max_iterations: usize,
+        timeout: Duration,
+        graph_ctx: Arc<GraphExecutionContext>,
+        session_ctx: Arc<RwLock<datafusion::prelude::SessionContext>>,
+        storage: Arc<StorageManager>,
+        schema_info: Arc<UniSchema>,
+        params: HashMap<String, Value>,
+        derived_scan_registry: Arc<DerivedScanRegistry>,
+        output_schema: SchemaRef,
+        max_derived_bytes: usize,
+        derivation_tracker: Option<Arc<ProvenanceStore>>,
+        iteration_counts: Arc<StdRwLock<HashMap<String, usize>>>,
+        strict_probability_domain: bool,
+        probability_epsilon: f64,
+        exact_probability: bool,
+        max_bdd_variables: usize,
+        warnings_slot: Arc<StdRwLock<Vec<RuntimeWarning>>>,
+        approximate_slot: Arc<StdRwLock<HashMap<String, Vec<String>>>>,
+        top_k_proofs: usize,
+        timeout_flag: Arc<std::sync::atomic::AtomicBool>,
+        semiring_kind: SemiringKind,
+    ) -> Self {
+        Self::new_with_semiring_and_classifiers(
+            rules,
+            max_iterations,
+            timeout,
+            graph_ctx,
+            session_ctx,
+            storage,
+            schema_info,
+            params,
+            derived_scan_registry,
+            output_schema,
+            max_derived_bytes,
+            derivation_tracker,
+            iteration_counts,
+            strict_probability_domain,
+            probability_epsilon,
+            exact_probability,
+            max_bdd_variables,
+            warnings_slot,
+            approximate_slot,
+            top_k_proofs,
+            timeout_flag,
+            semiring_kind,
+            Arc::new(ClassifierRegistry::new()),
+        )
+    }
+
+    /// Phase B Slice 3 entry: accepts both the semiring kind and the
+    /// runtime classifier registry. The planner uses this when the
+    /// program contains `CREATE MODEL` declarations.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "FixpointExec configuration needs all context"
+    )]
+    pub fn new_with_semiring_and_classifiers(
+        rules: Vec<FixpointRulePlan>,
+        max_iterations: usize,
+        timeout: Duration,
+        graph_ctx: Arc<GraphExecutionContext>,
+        session_ctx: Arc<RwLock<datafusion::prelude::SessionContext>>,
+        storage: Arc<StorageManager>,
+        schema_info: Arc<UniSchema>,
+        params: HashMap<String, Value>,
+        derived_scan_registry: Arc<DerivedScanRegistry>,
+        output_schema: SchemaRef,
+        max_derived_bytes: usize,
+        derivation_tracker: Option<Arc<ProvenanceStore>>,
+        iteration_counts: Arc<StdRwLock<HashMap<String, usize>>>,
+        strict_probability_domain: bool,
+        probability_epsilon: f64,
+        exact_probability: bool,
+        max_bdd_variables: usize,
+        warnings_slot: Arc<StdRwLock<Vec<RuntimeWarning>>>,
+        approximate_slot: Arc<StdRwLock<HashMap<String, Vec<String>>>>,
+        top_k_proofs: usize,
+        timeout_flag: Arc<std::sync::atomic::AtomicBool>,
+        semiring_kind: SemiringKind,
+        classifier_registry: Arc<ClassifierRegistry>,
+    ) -> Self {
+        Self::new_with_semiring_classifiers_and_cache(
+            rules,
+            max_iterations,
+            timeout,
+            graph_ctx,
+            session_ctx,
+            storage,
+            schema_info,
+            params,
+            derived_scan_registry,
+            output_schema,
+            max_derived_bytes,
+            derivation_tracker,
+            iteration_counts,
+            strict_probability_domain,
+            probability_epsilon,
+            exact_probability,
+            max_bdd_variables,
+            warnings_slot,
+            approximate_slot,
+            top_k_proofs,
+            timeout_flag,
+            semiring_kind,
+            classifier_registry,
+            None,
+            None,
+        )
+    }
+
+    /// Phase B follow-up: full constructor accepting an optional
+    /// memoization cache. Existing callers default to `None` (no cache);
+    /// the impl_locy.rs entry passes the user's `config.classifier_cache`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "FixpointExec configuration needs all context"
+    )]
+    pub fn new_with_semiring_classifiers_and_cache(
+        rules: Vec<FixpointRulePlan>,
+        max_iterations: usize,
+        timeout: Duration,
+        graph_ctx: Arc<GraphExecutionContext>,
+        session_ctx: Arc<RwLock<datafusion::prelude::SessionContext>>,
+        storage: Arc<StorageManager>,
+        schema_info: Arc<UniSchema>,
+        params: HashMap<String, Value>,
+        derived_scan_registry: Arc<DerivedScanRegistry>,
+        output_schema: SchemaRef,
+        max_derived_bytes: usize,
+        derivation_tracker: Option<Arc<ProvenanceStore>>,
+        iteration_counts: Arc<StdRwLock<HashMap<String, usize>>>,
+        strict_probability_domain: bool,
+        probability_epsilon: f64,
+        exact_probability: bool,
+        max_bdd_variables: usize,
+        warnings_slot: Arc<StdRwLock<Vec<RuntimeWarning>>>,
+        approximate_slot: Arc<StdRwLock<HashMap<String, Vec<String>>>>,
+        top_k_proofs: usize,
+        timeout_flag: Arc<std::sync::atomic::AtomicBool>,
+        semiring_kind: SemiringKind,
+        classifier_registry: Arc<ClassifierRegistry>,
+        classifier_cache: Option<Arc<ModelInvocationCache>>,
+        classifier_provenance_store: Option<Arc<uni_locy::NeuralProvenanceStore>>,
     ) -> Self {
         let properties = compute_plan_properties(Arc::clone(&output_schema));
         Self {
@@ -3035,6 +3952,10 @@ impl FixpointExec {
             approximate_slot,
             top_k_proofs,
             timeout_flag,
+            semiring_kind,
+            classifier_registry,
+            classifier_cache,
+            classifier_provenance_store,
         }
     }
 
@@ -3119,6 +4040,7 @@ impl ExecutionPlan for FixpointExec {
                             is_ref_bindings: c.is_ref_bindings.clone(),
                             priority: c.priority,
                             along_bindings: c.along_bindings.clone(),
+                            model_invocations: c.model_invocations.clone(),
                         })
                         .collect(),
                     yield_schema: Arc::clone(&r.yield_schema),
@@ -3156,6 +4078,9 @@ impl ExecutionPlan for FixpointExec {
         let approximate_slot = Arc::clone(&self.approximate_slot);
         let top_k_proofs = self.top_k_proofs;
         let timeout_flag = Arc::clone(&self.timeout_flag);
+        let semiring_kind = self.semiring_kind;
+        let classifier_registry = Arc::clone(&self.classifier_registry);
+        let classifier_cache = self.classifier_cache.as_ref().map(Arc::clone);
 
         let fut = async move {
             run_fixpoint_loop(
@@ -3180,6 +4105,9 @@ impl ExecutionPlan for FixpointExec {
                 approximate_slot,
                 top_k_proofs,
                 timeout_flag,
+                semiring_kind,
+                classifier_registry,
+                classifier_cache,
             )
             .await
         };
@@ -3538,13 +4466,17 @@ mod tests {
         // First update
         let batch = make_batch(&["a"], &[10]);
         agg.snapshot();
-        let changed = agg.update(&[0], &[batch], false).unwrap();
+        let changed = agg
+            .update(&[0], &[batch], false, SemiringKind::AddMultProb)
+            .unwrap();
         assert!(changed);
         assert!(!agg.is_stable()); // changed since snapshot
 
         // Snapshot and check stability with no new data
         agg.snapshot();
-        let changed = agg.update(&[0], &[], false).unwrap();
+        let changed = agg
+            .update(&[0], &[], false, SemiringKind::AddMultProb)
+            .unwrap();
         assert!(!changed);
         assert!(agg.is_stable());
     }
@@ -3638,7 +4570,9 @@ mod tests {
     fn test_monotonic_nor_first_update() {
         let mut agg = MonotonicAggState::new(make_nor_binding());
         let batch = make_f64_batch(&["a"], &[0.3]);
-        let changed = agg.update(&[0], &[batch], false).unwrap();
+        let changed = agg
+            .update(&[0], &[batch], false, SemiringKind::AddMultProb)
+            .unwrap();
         assert!(changed);
         let val = agg.get_accumulator(&acc_key("a")).unwrap();
         assert!((val - 0.3).abs() < 1e-10, "expected 0.3, got {}", val);
@@ -3649,9 +4583,11 @@ mod tests {
         // Incremental NOR: acc = 1-(1-0.3)(1-0.5) = 0.65
         let mut agg = MonotonicAggState::new(make_nor_binding());
         let batch1 = make_f64_batch(&["a"], &[0.3]);
-        agg.update(&[0], &[batch1], false).unwrap();
+        agg.update(&[0], &[batch1], false, SemiringKind::AddMultProb)
+            .unwrap();
         let batch2 = make_f64_batch(&["a"], &[0.5]);
-        agg.update(&[0], &[batch2], false).unwrap();
+        agg.update(&[0], &[batch2], false, SemiringKind::AddMultProb)
+            .unwrap();
         let val = agg.get_accumulator(&acc_key("a")).unwrap();
         assert!((val - 0.65).abs() < 1e-10, "expected 0.65, got {}", val);
     }
@@ -3660,7 +4596,9 @@ mod tests {
     fn test_monotonic_prod_first_update() {
         let mut agg = MonotonicAggState::new(make_prod_binding());
         let batch = make_f64_batch(&["a"], &[0.6]);
-        let changed = agg.update(&[0], &[batch], false).unwrap();
+        let changed = agg
+            .update(&[0], &[batch], false, SemiringKind::AddMultProb)
+            .unwrap();
         assert!(changed);
         let val = agg.get_accumulator(&acc_key("a")).unwrap();
         assert!((val - 0.6).abs() < 1e-10, "expected 0.6, got {}", val);
@@ -3671,9 +4609,11 @@ mod tests {
         // Incremental PROD: acc = 0.6 * 0.8 = 0.48
         let mut agg = MonotonicAggState::new(make_prod_binding());
         let batch1 = make_f64_batch(&["a"], &[0.6]);
-        agg.update(&[0], &[batch1], false).unwrap();
+        agg.update(&[0], &[batch1], false, SemiringKind::AddMultProb)
+            .unwrap();
         let batch2 = make_f64_batch(&["a"], &[0.8]);
-        agg.update(&[0], &[batch2], false).unwrap();
+        agg.update(&[0], &[batch2], false, SemiringKind::AddMultProb)
+            .unwrap();
         let val = agg.get_accumulator(&acc_key("a")).unwrap();
         assert!((val - 0.48).abs() < 1e-10, "expected 0.48, got {}", val);
     }
@@ -3682,9 +4622,12 @@ mod tests {
     fn test_monotonic_nor_stability() {
         let mut agg = MonotonicAggState::new(make_nor_binding());
         let batch = make_f64_batch(&["a"], &[0.3]);
-        agg.update(&[0], &[batch], false).unwrap();
+        agg.update(&[0], &[batch], false, SemiringKind::AddMultProb)
+            .unwrap();
         agg.snapshot();
-        let changed = agg.update(&[0], &[], false).unwrap();
+        let changed = agg
+            .update(&[0], &[], false, SemiringKind::AddMultProb)
+            .unwrap();
         assert!(!changed);
         assert!(agg.is_stable());
     }
@@ -3693,9 +4636,12 @@ mod tests {
     fn test_monotonic_prod_stability() {
         let mut agg = MonotonicAggState::new(make_prod_binding());
         let batch = make_f64_batch(&["a"], &[0.6]);
-        agg.update(&[0], &[batch], false).unwrap();
+        agg.update(&[0], &[batch], false, SemiringKind::AddMultProb)
+            .unwrap();
         agg.snapshot();
-        let changed = agg.update(&[0], &[], false).unwrap();
+        let changed = agg
+            .update(&[0], &[], false, SemiringKind::AddMultProb)
+            .unwrap();
         assert!(!changed);
         assert!(agg.is_stable());
     }
@@ -3705,9 +4651,11 @@ mod tests {
         // (a,0.3),(b,0.5) then (a,0.5),(b,0.2) → a=0.65, b=0.6
         let mut agg = MonotonicAggState::new(make_nor_binding());
         let batch1 = make_f64_batch(&["a", "b"], &[0.3, 0.5]);
-        agg.update(&[0], &[batch1], false).unwrap();
+        agg.update(&[0], &[batch1], false, SemiringKind::AddMultProb)
+            .unwrap();
         let batch2 = make_f64_batch(&["a", "b"], &[0.5, 0.2]);
-        agg.update(&[0], &[batch2], false).unwrap();
+        agg.update(&[0], &[batch2], false, SemiringKind::AddMultProb)
+            .unwrap();
 
         let val_a = agg.get_accumulator(&acc_key("a")).unwrap();
         let val_b = agg.get_accumulator(&acc_key("b")).unwrap();
@@ -3724,9 +4672,11 @@ mod tests {
         // Zero absorbs: once 0.0, all further updates stay 0.0
         let mut agg = MonotonicAggState::new(make_prod_binding());
         let batch1 = make_f64_batch(&["a"], &[0.5]);
-        agg.update(&[0], &[batch1], false).unwrap();
+        agg.update(&[0], &[batch1], false, SemiringKind::AddMultProb)
+            .unwrap();
         let batch2 = make_f64_batch(&["a"], &[0.0]);
-        agg.update(&[0], &[batch2], false).unwrap();
+        agg.update(&[0], &[batch2], false, SemiringKind::AddMultProb)
+            .unwrap();
 
         let val = agg.get_accumulator(&acc_key("a")).unwrap();
         assert!((val - 0.0).abs() < 1e-10, "expected 0.0, got {}", val);
@@ -3734,7 +4684,9 @@ mod tests {
         // Further updates don't change the absorbing zero
         agg.snapshot();
         let batch3 = make_f64_batch(&["a"], &[0.5]);
-        let changed = agg.update(&[0], &[batch3], false).unwrap();
+        let changed = agg
+            .update(&[0], &[batch3], false, SemiringKind::AddMultProb)
+            .unwrap();
         assert!(!changed);
         assert!(agg.is_stable());
     }
@@ -3744,7 +4696,8 @@ mod tests {
         // 1.5 clamped to 1.0: acc = 1-(1-0)(1-1) = 1.0
         let mut agg = MonotonicAggState::new(make_nor_binding());
         let batch = make_f64_batch(&["a"], &[1.5]);
-        agg.update(&[0], &[batch], false).unwrap();
+        agg.update(&[0], &[batch], false, SemiringKind::AddMultProb)
+            .unwrap();
         let val = agg.get_accumulator(&acc_key("a")).unwrap();
         assert!((val - 1.0).abs() < 1e-10, "expected 1.0, got {}", val);
     }
@@ -3754,9 +4707,11 @@ mod tests {
         // p=1.0 absorbs: 0.3 then 1.0 → 1.0
         let mut agg = MonotonicAggState::new(make_nor_binding());
         let batch1 = make_f64_batch(&["a"], &[0.3]);
-        agg.update(&[0], &[batch1], false).unwrap();
+        agg.update(&[0], &[batch1], false, SemiringKind::AddMultProb)
+            .unwrap();
         let batch2 = make_f64_batch(&["a"], &[1.0]);
-        agg.update(&[0], &[batch2], false).unwrap();
+        agg.update(&[0], &[batch2], false, SemiringKind::AddMultProb)
+            .unwrap();
         let val = agg.get_accumulator(&acc_key("a")).unwrap();
         assert!((val - 1.0).abs() < 1e-10, "expected 1.0, got {}", val);
     }
@@ -3767,7 +4722,7 @@ mod tests {
     fn test_monotonic_agg_strict_nor_rejects() {
         let mut agg = MonotonicAggState::new(make_nor_binding());
         let batch = make_f64_batch(&["a"], &[1.5]);
-        let result = agg.update(&[0], &[batch], true);
+        let result = agg.update(&[0], &[batch], true, SemiringKind::AddMultProb);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -3781,7 +4736,7 @@ mod tests {
     fn test_monotonic_agg_strict_prod_rejects() {
         let mut agg = MonotonicAggState::new(make_prod_binding());
         let batch = make_f64_batch(&["a"], &[2.0]);
-        let result = agg.update(&[0], &[batch], true);
+        let result = agg.update(&[0], &[batch], true, SemiringKind::AddMultProb);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -3795,7 +4750,7 @@ mod tests {
     fn test_monotonic_agg_strict_accepts_valid() {
         let mut agg = MonotonicAggState::new(make_nor_binding());
         let batch = make_f64_batch(&["a"], &[0.5]);
-        let result = agg.update(&[0], &[batch], true);
+        let result = agg.update(&[0], &[batch], true, SemiringKind::AddMultProb);
         assert!(result.is_ok());
         let val = agg.get_accumulator(&acc_key("a")).unwrap();
         assert!((val - 0.5).abs() < 1e-10, "expected 0.5, got {}", val);

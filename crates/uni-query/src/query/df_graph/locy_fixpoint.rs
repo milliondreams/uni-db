@@ -2052,6 +2052,28 @@ fn detect_shared_lineage(
                     && w.rule_name == rule.name
             });
             if !already_warned {
+                // Phase D F3: pick one canonical example of a shared
+                // input fact and the KEY groups it bridges, so users
+                // can correlate the warning with EXPLAIN output.
+                let example =
+                    input_to_groups
+                        .iter()
+                        .find(|(_, g)| g.len() > 1)
+                        .map(|(input, groups)| {
+                            let short = input
+                                .iter()
+                                .take(8)
+                                .map(|b| format!("{:02x}", b))
+                                .collect::<String>();
+                            let mut group_strs: Vec<String> =
+                                groups.iter().map(|k| format!("{:?}", k)).collect();
+                            group_strs.sort();
+                            format!(
+                                "input {} shared by groups [{}]",
+                                short,
+                                group_strs.join(", ")
+                            )
+                        });
                 warnings.push(RuntimeWarning {
                     code: RuntimeWarningCode::CrossGroupCorrelationNotExact,
                     message: format!(
@@ -2062,7 +2084,7 @@ fn detect_shared_lineage(
                     ),
                     rule_name: rule.name.clone(),
                     variable_count: None,
-                    key_group: None,
+                    key_group: example,
                 });
             }
         }

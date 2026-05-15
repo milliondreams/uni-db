@@ -258,6 +258,16 @@ pub enum WarningCode {
     /// input is structurally identical so the same correlation
     /// concern applies. Suppression by `@independent` annotation.
     SharedNeuralFeatureValue,
+    /// Phase D F3 case 3: a rule body has both a positive IS-ref
+    /// and an IS NOT (complement) to *different* rules on the
+    /// *same* subject variable. When the positive and negated
+    /// rules share base facts, the independence assumption that
+    /// underlies the probabilistic complement / aggregation is
+    /// violated. This is a structural over-detection (the MVP
+    /// fires whenever the pattern matches, even if no actual base
+    /// overlap exists at runtime); a future refinement will gate
+    /// on runtime support-set intersection.
+    PositiveComplementCorrelation,
 }
 
 /// Probability semiring used to evaluate MNOR/MPROD aggregates, PROB

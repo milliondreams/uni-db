@@ -1220,6 +1220,36 @@ impl HybridPhysicalPlanner {
                     super::df_graph::locy_model_invoke::XervoRuntimeHandle(
                         self.graph_ctx.xervo_runtime().cloned(),
                     );
+                // Phase D D1 graph-structural runtime: lift registry +
+                // storage + L0 snapshot from graph_ctx. Construction
+                // mirrors `execute_algo_procedure` in procedure_call.rs.
+                let graph_algo = {
+                    let l0_ctx = self.graph_ctx.l0_context();
+                    let l0_mgr = l0_ctx.current_l0.as_ref().map(|current| {
+                        let mut pending = l0_ctx.pending_flush_l0s.clone();
+                        if let Some(tx_l0) = &l0_ctx.transaction_l0 {
+                            pending.push(tx_l0.clone());
+                        }
+                        Arc::new(uni_store::runtime::l0_manager::L0Manager::from_snapshot(
+                            current.clone(),
+                            pending,
+                        ))
+                    });
+                    let l0_buffers = self.graph_ctx.l0_context().current_l0.as_ref().map(
+                        |current| super::df_graph::locy_model_invoke::L0Buffers {
+                            current: current.clone(),
+                            transaction: self.graph_ctx.l0_context().transaction_l0.clone(),
+                            pending_flush: self.graph_ctx.l0_context().pending_flush_l0s.clone(),
+                        },
+                    );
+                    super::df_graph::locy_model_invoke::GraphAlgoHandle {
+                        registry: self.graph_ctx.algo_registry().cloned(),
+                        storage: Some(self.graph_ctx.storage().clone()),
+                        l0_manager: l0_mgr,
+                        property_manager: Some(self.graph_ctx.property_manager().clone()),
+                        l0_buffers,
+                    }
+                };
                 Ok(Arc::new(
                     super::df_graph::locy_model_invoke::LocyModelInvokeExec::new(
                         input_plan,
@@ -1229,6 +1259,7 @@ impl HybridPhysicalPlanner {
                         classifier_provenance_store.as_ref().map(Arc::clone),
                         path_context_handles.clone(),
                         xervo_runtime,
+                        graph_algo,
                     ),
                 ))
             }

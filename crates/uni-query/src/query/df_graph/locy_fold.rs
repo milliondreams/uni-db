@@ -181,6 +181,7 @@ impl FoldExec {
     /// `top_k_proofs` config so MNOR under `SemiringKind::TopKProofs`
     /// can resolve each row's IS-ref support chain into a `Proof` and
     /// aggregate via DNF inclusion-exclusion.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_topk(
         input: Arc<dyn ExecutionPlan>,
         key_indices: Vec<usize>,

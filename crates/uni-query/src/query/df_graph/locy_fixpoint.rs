@@ -1831,6 +1831,30 @@ fn eval_feature_expr_against_fact_row(
         // `semantic_match` requires the Xervo embedder at this scope, which
         // is not threaded into the EXPLAIN re-evaluation path. Surface as
         // Null so neural-provenance still renders for the rest of the row.
+        //
+        // Phase D D1 graph-structural FunctionCalls (`degree_centrality`,
+        // `pagerank_score`, `closeness_centrality`, `avg_neighbor`,
+        // `max_neighbor`, `sum_neighbor`) require the `GraphAlgoHandle`
+        // (algorithm registry + storage + PropertyManager) and an async
+        // re-precompute pass — none of which are reachable from this
+        // synchronous fact-row evaluator. Mode B re-evaluation surfaces
+        // them as Null; the authoritative hot-path values are recorded
+        // in `NeuralProvenanceStore` per fact (the EXPLAIN renderer
+        // consults the store first when configured, falling back to
+        // Mode B re-evaluation only as a backup).
+        Expr::FunctionCall { name, .. }
+            if matches!(
+                name.as_str(),
+                "degree_centrality"
+                    | "pagerank_score"
+                    | "closeness_centrality"
+                    | "avg_neighbor"
+                    | "max_neighbor"
+                    | "sum_neighbor"
+            ) =>
+        {
+            FeatureValue::Null
+        }
         _ => FeatureValue::Null,
     }
 }
@@ -2622,6 +2646,7 @@ pub fn apply_anti_join(
 //   * Mismatched feature-expr / column: returned as a DataFusion
 //     Execution error.
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn apply_model_invocations(
     batches: Vec<RecordBatch>,
     invocations: &[uni_locy::ModelInvocation],
@@ -2633,6 +2658,7 @@ pub(crate) async fn apply_model_invocations(
         crate::query::df_graph::locy_model_invoke::PathContextHandle,
     >,
     xervo_runtime: &crate::query::df_graph::locy_model_invoke::XervoRuntimeHandle,
+    graph_algo: &crate::query::df_graph::locy_model_invoke::GraphAlgoHandle,
 ) -> DFResult<Vec<RecordBatch>> {
     use uni_locy::ClassifyInput;
     if batches.is_empty() || invocations.is_empty() {
@@ -2643,6 +2669,13 @@ pub(crate) async fn apply_model_invocations(
     // 'text')` into a `SimilarTo { left: prop_col, right: Const(Vector) }`.
     let semantic_match_embeddings =
         pre_embed_semantic_match_queries(invocations, xervo_runtime).await?;
+    // Phase D D1 graph-structural: pre-compute topology scores and
+    // neighbor-property maps for every distinct (fn_name, args) tuple
+    // appearing in any FEATURE FunctionCall. One pass per call; reused
+    // across every row of every batch.
+    let graph_feature_maps = precompute_graph_feature_maps(invocations, graph_algo).await?;
+    let neighbor_feature_maps =
+        precompute_neighbor_feature_maps(invocations, &batches, graph_algo).await?;
     let mut out_batches = Vec::with_capacity(batches.len());
     for batch in batches {
         let mut current = batch;
@@ -2671,6 +2704,8 @@ pub(crate) async fn apply_model_invocations(
                 invocation,
                 path_context_handles,
                 &semantic_match_embeddings,
+                &graph_feature_maps,
+                &neighbor_feature_maps,
             )?;
 
             // Build one ClassifyInput per row.
@@ -2826,6 +2861,53 @@ enum FeatureResolverKind {
         subject_col: usize,
         vid_to_value: Arc<HashMap<u64, uni_locy::FeatureValue>>,
     },
+    /// Phase D D1 graph-structural: look up the subject's pre-computed
+    /// topology score (degree/pagerank/closeness). `subject_col` indexes
+    /// the row's `<var>._vid`; `vid_to_score` is the whole-graph
+    /// procedure output built once per `apply_model_invocations` call.
+    GraphAlgoScore {
+        subject_col: usize,
+        vid_to_score: Arc<HashMap<u64, f64>>,
+    },
+    /// Phase D D1 graph-structural: aggregate a numeric property over
+    /// each subject's one-hop outgoing neighborhood along a named edge
+    /// type. `vid_to_values` maps subject vid → the list of numeric
+    /// neighbor property values collected at precompute time; the
+    /// per-row resolver applies the configured `op` (avg/max/sum).
+    NeighborAggregate {
+        subject_col: usize,
+        op: NeighborAgg,
+        vid_to_values: Arc<HashMap<u64, Vec<f64>>>,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum NeighborAgg {
+    Avg,
+    Max,
+    Sum,
+}
+
+impl NeighborAgg {
+    fn from_fn_name(name: &str) -> Option<Self> {
+        match name {
+            "avg_neighbor" => Some(NeighborAgg::Avg),
+            "max_neighbor" => Some(NeighborAgg::Max),
+            "sum_neighbor" => Some(NeighborAgg::Sum),
+            _ => None,
+        }
+    }
+
+    fn apply(self, values: &[f64]) -> Option<f64> {
+        if values.is_empty() {
+            return None;
+        }
+        match self {
+            NeighborAgg::Avg => Some(values.iter().sum::<f64>() / values.len() as f64),
+            NeighborAgg::Max => values.iter().copied().reduce(f64::max),
+            NeighborAgg::Sum => Some(values.iter().sum()),
+        }
+    }
 }
 
 /// One side of a `similar_to` feature: either a column index in the
@@ -2885,10 +2967,75 @@ impl FeatureResolver {
                     Ok(uni_locy::FeatureValue::Null)
                 }
             }
+            FeatureResolverKind::GraphAlgoScore {
+                subject_col,
+                vid_to_score,
+            } => {
+                let col = batch.column(*subject_col);
+                if col.is_null(row_idx) {
+                    return Ok(uni_locy::FeatureValue::Null);
+                }
+                let vid_opt: Option<u64> = if let Some(arr) =
+                    col.as_any().downcast_ref::<arrow_array::UInt64Array>()
+                {
+                    Some(arr.value(row_idx))
+                } else if let Some(arr) = col.as_any().downcast_ref::<arrow_array::Int64Array>() {
+                    Some(arr.value(row_idx) as u64)
+                } else {
+                    // Fallback: subject column carries a Node-encoded
+                    // `uni_common::Value` (LargeBinary via codec). Decode
+                    // and pull the VID. This is the common case for
+                    // bare-variable subjects where no `_vid` hidden
+                    // column was materialized.
+                    match extract_common_value(col.as_ref(), row_idx) {
+                        uni_common::Value::Node(n) => Some(n.vid.as_u64()),
+                        uni_common::Value::Int(i) => Some(i as u64),
+                        _ => None,
+                    }
+                };
+                Ok(vid_opt
+                    .and_then(|v| vid_to_score.get(&v).copied())
+                    .map(uni_locy::FeatureValue::Float)
+                    .unwrap_or(uni_locy::FeatureValue::Null))
+            }
+            FeatureResolverKind::NeighborAggregate {
+                subject_col,
+                op,
+                vid_to_values,
+            } => {
+                let vid_opt = extract_vid_from_column(batch.column(*subject_col).as_ref(), row_idx);
+                Ok(vid_opt
+                    .and_then(|v| vid_to_values.get(&v))
+                    .and_then(|values| op.apply(values))
+                    .map(uni_locy::FeatureValue::Float)
+                    .unwrap_or(uni_locy::FeatureValue::Null))
+            }
         }
     }
 }
 
+/// Extract a node VID from a per-row batch column. Handles the three
+/// common shapes: `_vid` UInt64 columns, Int64 columns, and Node-encoded
+/// LargeBinary columns (the standard `uni_common::Value::Node` codec
+/// representation for a bare variable column).
+fn extract_vid_from_column(col: &dyn arrow_array::Array, row_idx: usize) -> Option<u64> {
+    if col.is_null(row_idx) {
+        return None;
+    }
+    if let Some(arr) = col.as_any().downcast_ref::<arrow_array::UInt64Array>() {
+        return Some(arr.value(row_idx));
+    }
+    if let Some(arr) = col.as_any().downcast_ref::<arrow_array::Int64Array>() {
+        return Some(arr.value(row_idx) as u64);
+    }
+    match extract_common_value(col, row_idx) {
+        uni_common::Value::Node(n) => Some(n.vid.as_u64()),
+        uni_common::Value::Int(i) => Some(i as u64),
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_feature_resolvers(
     batch: &RecordBatch,
     invocation: &uni_locy::ModelInvocation,
@@ -2897,6 +3044,8 @@ fn build_feature_resolvers(
         crate::query::df_graph::locy_model_invoke::PathContextHandle,
     >,
     semantic_match_embeddings: &HashMap<String, Vec<f32>>,
+    graph_feature_maps: &HashMap<String, Arc<HashMap<u64, f64>>>,
+    neighbor_feature_maps: &NeighborFeatureMaps,
 ) -> DFResult<Vec<FeatureResolver>> {
     use uni_cypher::ast::Expr;
     let schema = batch.schema();
@@ -3042,6 +3191,110 @@ fn build_feature_resolvers(
                     right: FeatureValueSrc::Const(uni_common::Value::Vector(right_vec)),
                 }
             }
+            Expr::FunctionCall { name, args, .. }
+                if matches!(
+                    name.as_str(),
+                    "degree_centrality" | "pagerank_score" | "closeness_centrality"
+                ) =>
+            {
+                if args.len() != 1 {
+                    return Err(datafusion::error::DataFusionError::Execution(format!(
+                        "{name} expects 1 arg, got {}",
+                        args.len()
+                    )));
+                }
+                let Expr::Variable(v) = &args[0] else {
+                    return Err(datafusion::error::DataFusionError::Execution(format!(
+                        "{name}(...) argument must be a node variable, got {:?}",
+                        args[0]
+                    )));
+                };
+                let subject_col = {
+                    let direct = schema.index_of(v).ok();
+                    let vid_name = format!("{}._vid", v);
+                    let vid_col = schema.index_of(&vid_name).ok();
+                    vid_col.or(direct).ok_or_else(|| {
+                        datafusion::error::DataFusionError::Execution(format!(
+                            "{name}: subject column '{v}' (or '{v}._vid') not in body batch schema"
+                        ))
+                    })?
+                };
+                let vid_to_score = graph_feature_maps.get(name).cloned().ok_or_else(|| {
+                    datafusion::error::DataFusionError::Execution(format!(
+                        "{name}: pre-computed score map missing. This is a bug — \
+                         `apply_model_invocations` should have called \
+                         `precompute_graph_feature_maps` for every graph-structural \
+                         feature before building resolvers. Most likely the graph \
+                         algorithm registry is not configured."
+                    ))
+                })?;
+                FeatureResolverKind::GraphAlgoScore {
+                    subject_col,
+                    vid_to_score,
+                }
+            }
+            Expr::FunctionCall { name, args, .. }
+                if matches!(
+                    name.as_str(),
+                    "avg_neighbor" | "max_neighbor" | "sum_neighbor"
+                ) =>
+            {
+                if args.len() != 3 {
+                    return Err(datafusion::error::DataFusionError::Execution(format!(
+                        "{name} expects 3 args, got {}",
+                        args.len()
+                    )));
+                }
+                let Expr::Variable(v) = &args[0] else {
+                    return Err(datafusion::error::DataFusionError::Execution(format!(
+                        "{name}(...) first argument must be a node variable, got {:?}",
+                        args[0]
+                    )));
+                };
+                let rel_type = match &args[1] {
+                    Expr::Literal(uni_cypher::ast::CypherLiteral::String(s)) => s.clone(),
+                    other => {
+                        return Err(datafusion::error::DataFusionError::Execution(format!(
+                            "{name}: 2nd arg must be a string literal (rel-type), got {other:?}"
+                        )));
+                    }
+                };
+                let prop_name = match &args[2] {
+                    Expr::Literal(uni_cypher::ast::CypherLiteral::String(s)) => s.clone(),
+                    other => {
+                        return Err(datafusion::error::DataFusionError::Execution(format!(
+                            "{name}: 3rd arg must be a string literal (property), got {other:?}"
+                        )));
+                    }
+                };
+                let subject_col = {
+                    let direct = schema.index_of(v).ok();
+                    let vid_name = format!("{}._vid", v);
+                    let vid_col = schema.index_of(&vid_name).ok();
+                    vid_col.or(direct).ok_or_else(|| {
+                        datafusion::error::DataFusionError::Execution(format!(
+                            "{name}: subject column '{v}' (or '{v}._vid') not in body batch schema"
+                        ))
+                    })?
+                };
+                let vid_to_values = neighbor_feature_maps
+                    .get(&(rel_type.clone(), prop_name.clone()))
+                    .cloned()
+                    .ok_or_else(|| {
+                        datafusion::error::DataFusionError::Execution(format!(
+                            "{name}: pre-computed neighbor map missing for ({rel_type}, {prop_name}). \
+                             This is a bug — `apply_model_invocations` should have called \
+                             `precompute_neighbor_feature_maps` for every neighbor-aggregator \
+                             feature before building resolvers."
+                        ))
+                    })?;
+                let op = NeighborAgg::from_fn_name(name).unwrap();
+                FeatureResolverKind::NeighborAggregate {
+                    subject_col,
+                    op,
+                    vid_to_values,
+                }
+            }
             other => match resolve_src(other)? {
                 FeatureValueSrc::Col(idx) => FeatureResolverKind::Direct(idx),
                 FeatureValueSrc::Const(_) => {
@@ -3124,6 +3377,308 @@ async fn pre_embed_semantic_match_queries(
     let mut out = HashMap::with_capacity(needed.len());
     for (text, vec) in needed.into_iter().zip(embeddings) {
         out.insert(text, vec);
+    }
+    Ok(out)
+}
+
+/// Phase D D1 graph-structural: scan invocations' feature expressions
+/// for `degree_centrality(n)` / `pagerank_score(n)` / `closeness_centrality(n)`
+/// calls and invoke the corresponding `uni.algo.*` procedure on the
+/// configured `AlgorithmRegistry` once per distinct call. Returns a
+/// `fn_name → Arc<HashMap<vid, score>>` map consumed at resolver-build
+/// time. Errors cleanly when a graph-structural FEATURE is used
+/// without a configured registry or storage handle.
+///
+/// Pre-computation is `O(graph)` per call. Across fixpoint iterations
+/// the graph state can change, so the cache lives for the lifetime of
+/// one `apply_model_invocations` call only — same lifetime as the
+/// D2 query-embedding cache (`pre_embed_semantic_match_queries`).
+async fn precompute_graph_feature_maps(
+    invocations: &[uni_locy::ModelInvocation],
+    graph_algo: &crate::query::df_graph::locy_model_invoke::GraphAlgoHandle,
+) -> DFResult<HashMap<String, Arc<HashMap<u64, f64>>>> {
+    use futures::StreamExt;
+    use uni_algo::algo::procedures::AlgoContext;
+    use uni_cypher::ast::Expr;
+
+    // Map our user-facing FEATURE function names to the canonical
+    // `uni.algo.*` procedure names registered in `AlgorithmRegistry`.
+    fn procedure_for(fn_name: &str) -> Option<&'static str> {
+        match fn_name {
+            "degree_centrality" => Some("uni.algo.degreeCentrality"),
+            "pagerank_score" => Some("uni.algo.pageRank"),
+            "closeness_centrality" => Some("uni.algo.closeness"),
+            _ => None,
+        }
+    }
+
+    // Collect the set of distinct topology-FEATURE names referenced
+    // across all invocations. Args are always a single Variable, so
+    // the precomputation key is just the function name.
+    let mut needed: Vec<String> = Vec::new();
+    for inv in invocations {
+        for fexpr in &inv.feature_exprs {
+            if let Expr::FunctionCall { name, .. } = fexpr
+                && procedure_for(name).is_some()
+                && !needed.contains(name)
+            {
+                needed.push(name.clone());
+            }
+        }
+    }
+    if needed.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let registry = graph_algo.registry.as_ref().ok_or_else(|| {
+        datafusion::error::DataFusionError::Execution(
+            "graph-structural FEATURE invoked but no `AlgorithmRegistry` is \
+             configured. Configure one on `GraphExecutionContext::with_algo_registry`."
+                .to_string(),
+        )
+    })?;
+    let storage = graph_algo.storage.as_ref().ok_or_else(|| {
+        datafusion::error::DataFusionError::Execution(
+            "graph-structural FEATURE invoked but no storage handle was \
+             threaded into the FEATURE runtime. This is a bug in df_planner."
+                .to_string(),
+        )
+    })?;
+
+    let mut out: HashMap<String, Arc<HashMap<u64, f64>>> = HashMap::new();
+    for fn_name in needed {
+        let proc_name = procedure_for(&fn_name).unwrap();
+        let procedure = registry.get(proc_name).ok_or_else(|| {
+            datafusion::error::DataFusionError::Execution(format!(
+                "graph-structural FEATURE '{fn_name}' resolves to procedure \
+                 '{proc_name}' which is not in the algorithm registry"
+            ))
+        })?;
+        // Topology procedures take (nodeLabels[], relationshipTypes[],
+        // [direction], [...]) — pass empty arrays for nodeLabels and
+        // relationshipTypes to mean "all". The procedure fills the
+        // remaining optional args from its signature defaults.
+        let args: Vec<serde_json::Value> = vec![
+            serde_json::Value::Array(Vec::new()),
+            serde_json::Value::Array(Vec::new()),
+        ];
+        let algo_ctx = AlgoContext::new(
+            storage.clone(),
+            graph_algo.l0_manager.as_ref().map(Arc::clone),
+        );
+        let mut stream = procedure.execute(algo_ctx, args);
+        let mut score_map: HashMap<u64, f64> = HashMap::new();
+        let sig = procedure.signature();
+        let node_idx = sig
+            .yields
+            .iter()
+            .position(|(n, _)| *n == "nodeId")
+            .ok_or_else(|| {
+                datafusion::error::DataFusionError::Execution(format!(
+                    "procedure '{proc_name}' yield schema missing 'nodeId'"
+                ))
+            })?;
+        let score_idx = sig
+            .yields
+            .iter()
+            .position(|(n, _)| *n == "score")
+            .ok_or_else(|| {
+                datafusion::error::DataFusionError::Execution(format!(
+                    "procedure '{proc_name}' yield schema missing 'score'"
+                ))
+            })?;
+        while let Some(row_res) = stream.next().await {
+            let row = row_res.map_err(|e| {
+                datafusion::error::DataFusionError::Execution(format!(
+                    "graph-structural FEATURE '{fn_name}': procedure '{proc_name}' failed: {e}"
+                ))
+            })?;
+            let vid_v = row.values.get(node_idx);
+            let score_v = row.values.get(score_idx);
+            let (Some(vid_v), Some(score_v)) = (vid_v, score_v) else {
+                continue;
+            };
+            let vid = vid_v.as_u64().or_else(|| vid_v.as_i64().map(|i| i as u64));
+            let score = score_v
+                .as_f64()
+                .or_else(|| score_v.as_i64().map(|i| i as f64));
+            if let (Some(vid), Some(score)) = (vid, score) {
+                score_map.insert(vid, score);
+            }
+        }
+        out.insert(fn_name, Arc::new(score_map));
+    }
+    Ok(out)
+}
+
+/// Phase D D1 graph-structural: one-hop neighborhood aggregator
+/// precompute. Scans invocations' feature expressions for
+/// `avg_neighbor` / `max_neighbor` / `sum_neighbor` FunctionCalls,
+/// collects the distinct `(rel_type, prop_name)` pairs they need,
+/// resolves each rel-type to a schema edge-type id, warms the
+/// outgoing-adjacency CSR, and for every subject vid present in the
+/// body batches walks the one-hop neighborhood and fetches the
+/// requested property from each neighbor via `PropertyManager`.
+/// Non-numeric neighbor property values are filtered out via
+/// `Value::as_f64`.
+///
+/// Returns `Arc<HashMap<u64, Vec<f64>>>` keyed by `(rel_type, prop_name)`.
+/// The resolver's runtime cost per row is then a single hash lookup
+/// plus an `avg`/`max`/`sum` over the cached `Vec<f64>`.
+///
+/// Scope: **subject-set-only** — we only collect for vids that appear
+/// in the body batches' subject columns (avoids pre-walking the entire
+/// graph). Subjects with no outgoing edges of the named type land in
+/// the map with an empty `Vec` so the resolver's `Null` semantics
+/// remain crisp (empty → `Null` → classifier interprets per its
+/// feature contract).
+/// Per-`(rel_type, prop_name)` cache of neighbor property values
+/// keyed by subject vid, produced by `precompute_neighbor_feature_maps`
+/// and consumed by `FeatureResolverKind::NeighborAggregate` resolvers.
+type NeighborFeatureMaps = HashMap<(String, String), Arc<HashMap<u64, Vec<f64>>>>;
+
+async fn precompute_neighbor_feature_maps(
+    invocations: &[uni_locy::ModelInvocation],
+    batches: &[RecordBatch],
+    graph_algo: &crate::query::df_graph::locy_model_invoke::GraphAlgoHandle,
+) -> DFResult<NeighborFeatureMaps> {
+    use uni_cypher::ast::{CypherLiteral, Expr};
+    use uni_store::storage::direction::Direction;
+
+    // Collect distinct (subject_var, rel_type, prop_name) tuples needed
+    // across all invocations. The subject_var tells us which body batch
+    // column to scan for subject vids.
+    let mut needed: Vec<(String, String, String)> = Vec::new();
+    for inv in invocations {
+        for fexpr in &inv.feature_exprs {
+            if let Expr::FunctionCall { name, args, .. } = fexpr
+                && NeighborAgg::from_fn_name(name).is_some()
+                && args.len() == 3
+                && let Expr::Variable(v) = &args[0]
+                && let Expr::Literal(CypherLiteral::String(rel)) = &args[1]
+                && let Expr::Literal(CypherLiteral::String(prop)) = &args[2]
+            {
+                let tuple = (v.clone(), rel.clone(), prop.clone());
+                if !needed.contains(&tuple) {
+                    needed.push(tuple);
+                }
+            }
+        }
+    }
+    if needed.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let storage = graph_algo.storage.as_ref().ok_or_else(|| {
+        datafusion::error::DataFusionError::Execution(
+            "neighbor-aggregator FEATURE invoked but no storage handle was \
+             threaded into the FEATURE runtime. This is a bug in df_planner."
+                .to_string(),
+        )
+    })?;
+    let property_manager = graph_algo.property_manager.as_ref().ok_or_else(|| {
+        datafusion::error::DataFusionError::Execution(
+            "neighbor-aggregator FEATURE invoked but no PropertyManager was \
+             threaded into the FEATURE runtime. This is a bug in df_planner."
+                .to_string(),
+        )
+    })?;
+    // Build a QueryContext snapshot so L0-resident vertex properties
+    // are visible to `get_vertex_prop_with_ctx`. Without a ctx, L0
+    // property data is silently invisible (returns Null), which is
+    // why the topology trio's `AlgoContext` consumes L0 via
+    // `L0Manager` whereas property reads need this separate path.
+    let query_ctx = graph_algo.l0_buffers.as_ref().map(|bufs| {
+        uni_store::runtime::context::QueryContext::new_with_pending(
+            bufs.current.clone(),
+            bufs.transaction.clone(),
+            bufs.pending_flush.clone(),
+        )
+    });
+
+    // Group needed tuples by (rel_type, prop_name) — we want one map
+    // per (rel, prop) pair regardless of which subject_var binding
+    // points at it (the subject vids are unioned).
+    let mut by_pair: HashMap<(String, String), Vec<String>> = HashMap::new();
+    for (subject_var, rel, prop) in needed {
+        by_pair.entry((rel, prop)).or_default().push(subject_var);
+    }
+
+    let mut out: NeighborFeatureMaps = HashMap::new();
+    for ((rel_type, prop_name), subject_vars) in by_pair {
+        // Resolve edge_type_id from schema.
+        let schema = storage.schema_manager().schema();
+        let Some(edge_meta) = schema.edge_types.get(&rel_type) else {
+            // Unregistered rel-type → empty map. The resolver surfaces
+            // Null at row time, consistent with the no-neighbor case.
+            out.insert((rel_type, prop_name), Arc::new(HashMap::new()));
+            continue;
+        };
+        let edge_type_id = edge_meta.id;
+
+        // Warm outgoing adjacency for this edge type. Mirrors the
+        // pattern in projection.rs / procedure_template.rs.
+        let edge_ver = storage.get_edge_version_by_id(edge_type_id);
+        storage
+            .warm_adjacency(edge_type_id, Direction::Outgoing, edge_ver)
+            .await
+            .map_err(|e| {
+                datafusion::error::DataFusionError::Execution(format!(
+                    "neighbor-aggregator warm_adjacency for '{rel_type}' failed: {e}"
+                ))
+            })?;
+
+        // Collect distinct subject vids from body batches across every
+        // subject_var binding that this (rel, prop) pair uses.
+        let mut subject_vids: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for subject_var in &subject_vars {
+            for batch in batches {
+                let schema = batch.schema();
+                let col_idx = schema
+                    .index_of(&format!("{}._vid", subject_var))
+                    .ok()
+                    .or_else(|| schema.index_of(subject_var).ok());
+                let Some(col_idx) = col_idx else { continue };
+                let col = batch.column(col_idx);
+                for row in 0..batch.num_rows() {
+                    if let Some(v) = extract_vid_from_column(col.as_ref(), row) {
+                        subject_vids.insert(v);
+                    }
+                }
+            }
+        }
+
+        // For each subject, walk outgoing edges, fetch neighbor
+        // property, coerce to f64, accumulate. Subjects with no
+        // numeric neighbors retain an empty Vec (→ Null at row time).
+        let mut vid_to_values: HashMap<u64, Vec<f64>> = HashMap::new();
+        let adj = storage.adjacency_manager();
+        for subject_vid in subject_vids {
+            let neighbors = adj.get_neighbors(
+                uni_common::core::id::Vid::from(subject_vid),
+                edge_type_id,
+                Direction::Outgoing,
+            );
+            let mut values: Vec<f64> = Vec::with_capacity(neighbors.len());
+            for (neighbor_vid, _eid) in neighbors {
+                let val = property_manager
+                    .get_vertex_prop_with_ctx(neighbor_vid, &prop_name, query_ctx.as_ref())
+                    .await
+                    .map_err(|e| {
+                        datafusion::error::DataFusionError::Execution(format!(
+                            "neighbor-aggregator: failed to read property \
+                             '{prop_name}' on neighbor vid {neighbor_vid:?}: {e}"
+                        ))
+                    })?;
+                if let Some(f) = val.as_f64()
+                    && !f.is_nan()
+                {
+                    values.push(f);
+                }
+            }
+            vid_to_values.insert(subject_vid, values);
+        }
+        out.insert((rel_type, prop_name), Arc::new(vid_to_values));
     }
     Ok(out)
 }

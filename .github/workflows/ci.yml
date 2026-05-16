@@ -239,6 +239,9 @@ jobs:
       - name: Execute flagship Locy notebook (cyber exposure twin)
         run: uv run --project bindings/uni-db python website/scripts/verify_cyber_flagship_notebook.py
 
+      - name: Execute flagship Locy notebook (predictive maintenance)
+        run: uv run --project bindings/uni-db python website/scripts/verify_predictive_maintenance_flagship_notebook.py
+
       - name: Check Python formatting (uni-db)
         working-directory: bindings/uni-db
         run: uv run ruff format --check .

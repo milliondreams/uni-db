@@ -137,6 +137,14 @@ Set `exact_probability = true` in `LocyConfig` to enable BDD-backed exact probab
 
 Rows from approximate groups are marked with `_approximate = true`, and Rust `LocyResult` values also expose `approximate_groups`.
 
+### TopKProofs Semiring (DNF Inclusion-Exclusion)
+
+`LocyConfig.semiring = TopKProofs(k)` is an alternative to the BDD path. The runtime keeps the top `k` proofs per derived fact (ranked by proof probability) and, for `MNOR` aggregates whose proofs share base facts, computes the exact joint via DNF inclusion-exclusion instead of the independence approximation. Cheaper than BDD for moderate `k`; emits `TopKPruningCrossedDependency` when pruning drops a proof that shares a base fact with a retained one, so you can decide whether to bump `k`.
+
+### MaxMinProb Semiring (Viterbi / Fuzzy)
+
+`LocyConfig.semiring = MaxMinProb` changes the aggregate math: `MNOR` becomes `max(pᵢ)` and `MPROD` becomes `min(pᵢ)`. Useful when the values aren't probabilities (e.g. fuzzy-set memberships) and you want monotone composition without the independence assumption. Locy emits `FuzzyNotProbabilistic` on any rule that also declares `PROB` under this semiring, since you've opted out of probability semantics.
+
 ## Relevant Config Knobs
 
 | Field | Default | Effect |
@@ -169,3 +177,4 @@ YIELD KEY job, KEY candidate, fit
 - [ALONG / FOLD / BEST BY](along-fold-bestby.md) — full FOLD documentation
 - [Rule Semantics](../rule-semantics.md) — monotonicity and stratification
 - [Vector Search guide](../../guides/vector-search.md#similar_to-expression-function) — `similar_to()` documentation
+- [Neural Predicates](neural-predicates.md) — `CREATE MODEL` / `CALIBRATE` / `VALIDATE` and the `NeuralProvenance` audit trail

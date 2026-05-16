@@ -46,6 +46,33 @@ Uni includes a built-in graph algorithm library exposed through Cypher procedure
 - Detect communities and clusters.
 - Compute routing or similarity metrics.
 
+## Use from Locy `FEATURES`
+
+Ten of these algorithms are also callable as Locy feature expressions inside `CREATE MODEL`, so a classifier can consume topology directly without a separate feature pipeline:
+
+| Function | Returns |
+|---|---|
+| `degree_centrality(n)` | Float64 |
+| `pagerank_score(n)` | Float64 |
+| `closeness_centrality(n)` | Float64 |
+| `betweenness_centrality(n)` | Float64 |
+| `eigenvector_centrality(n)` | Float64 |
+| `harmonic_centrality(n)` | Float64 |
+| `katz_centrality(n)` | Float64 |
+| `avg_neighbor(n, 'prop')` | Float64 — mean of `prop` over neighbors |
+| `max_neighbor(n, 'prop')` | Float64 |
+| `sum_neighbor(n, 'prop')` | Float64 |
+
+```cypher
+CREATE MODEL risk_scorer AS
+  INPUT (n)
+  FEATURES degree_centrality(n), pagerank_score(n), avg_neighbor(n, 'risk')
+  OUTPUT PROB risk
+  USING xervo('classify/risk-v1')
+```
+
+See [Neural Predicates](../locy/advanced/neural-predicates.md) for the full reference.
+
 ## When To Use
 
 Use built-in algorithms when you need graph analytics without exporting data or building your own pipeline.

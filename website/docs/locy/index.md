@@ -16,6 +16,8 @@ Locy is Uni's logic programming layer: **Logic + Cypher**. It extends OpenCypher
 - Remediation search (`ABDUCE`).
 - Derivation/proof explainability (`EXPLAIN RULE`).
 - Graph materialization (`DERIVE`).
+- Probabilistic composition (`MNOR`, `MPROD`, `PROB`).
+- Inline neural predicates (`CREATE MODEL`, `CALIBRATE`, `VALIDATE`).
 
 ## Start Here
 
@@ -23,6 +25,7 @@ Locy is Uni's logic programming layer: **Logic + Cypher**. It extends OpenCypher
 2. Run the [Quickstart](quickstart.md).
 3. Learn syntax in [Language Guide](language-guide.md).
 4. Move to [Advanced Features](advanced/along-fold-bestby.md).
+5. For probabilistic and neural composition, see [Probabilistic Logic](advanced/probabilistic-logic.md) and [Neural Predicates](advanced/neural-predicates.md).
 
 ## Locy vs Plain Cypher
 

@@ -15,7 +15,7 @@ description: >-
 
 ## What is uni-db?
 
-uni-db is an **embedded, serverless multi-model graph database** (graph + vector + document + columnar) that runs inside your process with no server required. It supports **OpenCypher** queries with extensions for vector search, full-text search, DDL, and time travel. **Locy** is its Datalog-inspired logic programming language for recursive rules, probabilistic reasoning, and abductive inference. APIs are available in **Python** (sync/async via PyO3) and **Rust** (async/blocking), with a **Pydantic OGM** layer. Built-in capabilities include 8 vector index algorithms (Flat, IVF-Flat/SQ/PQ/RQ, HNSW-Flat/SQ/PQ) with scalar, product, and RaBitQ quantization, 4 scalar index types (BTree, Hash, Bitmap, LabelList), BM25 full-text search, hybrid search with RRF fusion, and 36+ graph algorithms.
+uni-db is an **embedded, serverless multi-model graph database** (graph + vector + document + columnar) that runs inside your process with no server required. It supports **OpenCypher** queries with extensions for vector search, full-text search, DDL, and time travel. **Locy** is its Datalog-inspired logic programming language for recursive rules, probabilistic reasoning, abductive inference, and inline neural predicates with calibration (`CREATE MODEL` / `CALIBRATE` / `VALIDATE` / `NeuralProvenance` in `EXPLAIN`). APIs are available in **Python** (sync/async via PyO3) and **Rust** (async/blocking), with a **Pydantic OGM** layer. Built-in capabilities include 8 vector index algorithms (Flat, IVF-Flat/SQ/PQ/RQ, HNSW-Flat/SQ/PQ) with scalar, product, and RaBitQ quantization, 4 scalar index types (BTree, Hash, Bitmap, LabelList), BM25 full-text search, hybrid search with RRF fusion, and 36+ graph algorithms.
 
 ---
 
@@ -482,6 +482,7 @@ When the SKILL.md overview is insufficient for the user's task, load the appropr
 | Pydantic models, OGM, QueryBuilder, relationships | `references/pydantic-ogm.md` |
 | Vector search, FTS, hybrid search, similar_to, embeddings | `references/vector-hybrid-search.md` |
 | Locy rules, recursive logic, ALONG/FOLD/DERIVE/ASSUME/ABDUCE | `references/locy.md` |
+| Locy neural predicates: CREATE MODEL/FEATURES/CALIBRATE/VALIDATE/NeuralProvenance EXPLAIN | `references/neural-predicates.md` |
 | Schema design, data types, indexes, identity (ext_id/VID) | `references/schema-indexing.md` |
 | BTIC temporal intervals, Allen algebra, certainty/granularity | `references/btic.md` |
 | Xervo ML runtime, providers, model catalog, auto-embedding | `references/xervo.md` |

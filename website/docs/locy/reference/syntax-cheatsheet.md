@@ -66,6 +66,24 @@ ASSUME { <cypher mutations> } THEN { <locy/cypher body> }
 ABDUCE [NOT] name [WHERE ...] [RETURN ...]
 ```
 
+## Neural Predicates
+
+```cypher
+CREATE MODEL name AS
+  INPUT (binding [: Label])
+  [FEATURES feature_expr (, feature_expr)*]
+  [FEATURES (subject, column) FROM source_rule]
+  OUTPUT (PROB | SCORE | LABEL | VECTOR) result_name
+  USING xervo('provider_alias' [, embedder = 'embed_alias'])
+  [CALIBRATION (platt_scaling | isotonic_regression | temperature_scaling | beta_calibration | dirichlet_calibration)]
+  [VERSION 'string']
+
+CALIBRATE model_name USING calibration_method
+VALIDATE  model_name USING metric (, metric)*
+```
+
+`metric` ∈ `brier | ece | accuracy | log_loss | auroc`. The classifier-registry key is the `CREATE MODEL <name>`, not the `USING xervo('alias')` provider hint. The feature dict the callable receives is keyed by the `INPUT` binding name; values are the evaluated argument expressions at the call site. See [Neural Predicates](../advanced/neural-predicates.md).
+
 ## Modules
 
 ```cypher

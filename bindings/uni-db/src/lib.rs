@@ -12,6 +12,7 @@
 pub mod async_api;
 pub mod btic;
 pub mod builders;
+pub mod classifier;
 pub mod convert;
 pub mod core;
 pub mod exceptions;

@@ -233,18 +233,19 @@ impl Transaction {
         params: Option<HashMap<String, Py<PyAny>>>,
     ) -> PyResult<PyLocyResult> {
         let tx = self.check_active()?;
+        // Release the GIL across `block_on`: the Locy executor may call
+        // back into Python (e.g. a registered neural classifier). Holding
+        // the GIL through tokio would deadlock the callback's reacquire.
         let result = if let Some(p) = params {
             let mut builder = tx.locy_with(program);
             for (k, v) in p {
                 let val = convert::py_object_to_value(py, &v)?;
                 builder = builder.param(&k, val);
             }
-            pyo3_async_runtimes::tokio::get_runtime()
-                .block_on(builder.run())
+            py.detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(builder.run()))
                 .map_err(crate::exceptions::uni_error_to_pyerr)?
         } else {
-            pyo3_async_runtimes::tokio::get_runtime()
-                .block_on(tx.locy(program))
+            py.detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(tx.locy(program)))
                 .map_err(crate::exceptions::uni_error_to_pyerr)?
         };
         convert::locy_result_to_py_class(py, result)

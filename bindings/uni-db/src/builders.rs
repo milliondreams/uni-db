@@ -809,19 +809,24 @@ impl Session {
         program: &str,
         params: Option<HashMap<String, Py<PyAny>>>,
     ) -> PyResult<crate::types::PyLocyResult> {
+        // Release the GIL across `block_on`: the Locy executor may call
+        // back into Python (e.g. a registered neural classifier from
+        // `LocyConfig::classifier_registry`). Holding the GIL while
+        // blocking on tokio would deadlock the callback's GIL acquisition
+        // on a worker thread.
         let result = if let Some(p) = params {
             let mut builder = self.inner.locy_with(program);
             for (k, v) in p {
                 let val = convert::py_object_to_value(py, &v)?;
                 builder = builder.param(&k, val);
             }
-            pyo3_async_runtimes::tokio::get_runtime()
-                .block_on(builder.run())
+            py.detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(builder.run()))
                 .map_err(crate::exceptions::uni_error_to_pyerr)?
         } else {
-            pyo3_async_runtimes::tokio::get_runtime()
-                .block_on(self.inner.locy(program))
-                .map_err(crate::exceptions::uni_error_to_pyerr)?
+            py.detach(|| {
+                pyo3_async_runtimes::tokio::get_runtime().block_on(self.inner.locy(program))
+            })
+            .map_err(crate::exceptions::uni_error_to_pyerr)?
         };
         convert::locy_result_to_py_class(py, result)
     }
@@ -1222,8 +1227,11 @@ impl SessionLocyBuilder {
         if let Some(ref ct) = self.cancellation_token {
             builder = builder.cancellation_token(ct.inner.clone());
         }
-        let result = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(builder.run())
+        // Release the GIL across `block_on`: the Locy executor may call
+        // back into Python (e.g. a registered neural classifier). Holding
+        // the GIL through tokio would deadlock the callback's reacquire.
+        let result = py
+            .detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(builder.run()))
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
         convert::locy_result_to_py_class(py, result)
     }
@@ -1507,8 +1515,11 @@ impl PyTxLocyBuilder {
         if let Some(ref ct) = self.cancellation_token {
             builder = builder.cancellation_token(ct.inner.clone());
         }
-        let result = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(builder.run())
+        // Release the GIL across `block_on`: the Locy executor may call
+        // back into Python (e.g. a registered neural classifier). Holding
+        // the GIL through tokio would deadlock the callback's reacquire.
+        let result = py
+            .detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(builder.run()))
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
         convert::locy_result_to_py_class(py, result)
     }

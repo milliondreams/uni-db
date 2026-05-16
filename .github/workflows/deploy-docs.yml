@@ -80,6 +80,12 @@ jobs:
       - name: Execute flagship Locy notebook (predictive maintenance)
         run: python website/scripts/verify_predictive_maintenance_flagship_notebook.py
 
+      - name: Execute flagship Locy notebook (adverse drug reaction)
+        run: python website/scripts/verify_adverse_drug_reaction_flagship_notebook.py
+
+      - name: Execute flagship Locy notebook (drug-drug interaction)
+        run: python website/scripts/verify_drug_drug_interaction_flagship_notebook.py
+
       # Clean up release artifacts to free disk space (keep wheels)
       - name: Clean up build artifacts
         run: |

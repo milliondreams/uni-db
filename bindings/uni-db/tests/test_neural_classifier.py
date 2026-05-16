@@ -27,7 +27,6 @@ import pytest
 
 import uni_db
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -65,9 +64,7 @@ def _populated_asset_db():
         ("a4", 0.9),
         ("a5", 0.2),
     ]:
-        tx.execute(
-            f"CREATE (:Asset {{name: '{name}', score: {score}}})"
-        )
+        tx.execute(f"CREATE (:Asset {{name: '{name}', score: {score}}})")
     tx.commit()
     return db
 
@@ -113,9 +110,7 @@ def test_register_classifier_via_method_then_run_locy():
     # site (here, n.score) -- a Float64 in [0, 1].
     for d in flat_inputs:
         assert "n" in d, f"feature dict missing 'n' key: {d}"
-        assert isinstance(d["n"], (int, float)), (
-            f"feature value should be numeric: {d}"
-        )
+        assert isinstance(d["n"], (int, float)), f"feature value should be numeric: {d}"
 
 
 def test_register_classifier_via_dict_config():

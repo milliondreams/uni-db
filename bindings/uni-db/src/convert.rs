@@ -632,6 +632,11 @@ pub fn extract_locy_config(
         let params_map = v.extract::<HashMap<String, Py<PyAny>>>(py)?;
         locy_config.params = prepare_params(py, Some(params_map))?;
     }
+    if let Some(v) = config.get("classifier_registry") {
+        let raw = v.extract::<HashMap<String, Py<PyAny>>>(py)?;
+        let registry = crate::classifier::build_classifier_registry(py, raw)?;
+        locy_config.classifier_registry = registry;
+    }
     Ok(locy_config)
 }
 

@@ -2915,12 +2915,58 @@ impl PyLocyConfig {
         self.inner.top_k_proofs_training
     }
 
+    /// Register a Python callable as the neural classifier for `alias`.
+    ///
+    /// The callable receives `list[dict[str, Any]]` (one dict per row,
+    /// keyed by the `FEATURES (...)` identifiers) and must return
+    /// `list[float]` of the same length, with values in `[0, 1]`. Any
+    /// Python exception, length mismatch, NaN, or out-of-range value
+    /// surfaces as a Locy runtime error at the first invocation of the
+    /// associated `CREATE MODEL`.
+    ///
+    /// Calling this method multiple times with the same alias replaces
+    /// the previous registration. The registry is keyed by alias, not
+    /// by callable identity, so re-registering is the supported way to
+    /// swap classifiers between runs.
+    #[pyo3(text_signature = "($self, alias, callable)")]
+    fn register_classifier(
+        &mut self,
+        py: Python<'_>,
+        alias: &str,
+        callable: Py<PyAny>,
+    ) -> PyResult<()> {
+        let bound = callable.bind(py);
+        if !bound.is_callable() {
+            return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+                "register_classifier('{alias}'): expected a callable, got {ty}",
+                ty = bound
+                    .get_type()
+                    .name()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|_| "<unknown>".to_string()),
+            )));
+        }
+        self.inner.classifier_registry.insert(
+            alias.to_string(),
+            std::sync::Arc::new(crate::classifier::PyClassifier::new(alias, callable)),
+        );
+        Ok(())
+    }
+
+    /// Names of currently-registered classifiers, sorted alphabetically.
+    fn classifier_aliases(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.inner.classifier_registry.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
     fn __repr__(&self) -> String {
         format!(
-            "LocyConfig(max_iterations={}, timeout={:.1}s, strict_prob={})",
+            "LocyConfig(max_iterations={}, timeout={:.1}s, strict_prob={}, classifiers={})",
             self.inner.max_iterations,
             self.inner.timeout.as_secs_f64(),
             self.inner.strict_probability_domain,
+            self.inner.classifier_registry.len(),
         )
     }
 }

@@ -27,6 +27,7 @@ uni-store = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 anyhow = { workspace = true }
+async-trait = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 chrono = { workspace = true }

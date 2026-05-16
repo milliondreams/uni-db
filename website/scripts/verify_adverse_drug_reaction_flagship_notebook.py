@@ -50,12 +50,27 @@ def main() -> int:
     env = execute_notebook(args.notebook)
 
     scored_count = env.get("SCORED_COUNT")
+    mechanistic_path_count = env.get("MECHANISTIC_PATH_COUNT")
+    mechanism_plausibility_count = env.get("MECHANISM_PLAUSIBILITY_COUNT")
+    investigation_queue_len = env.get("INVESTIGATION_QUEUE_LEN")
     validate_metrics = env.get("VALIDATE_METRICS")
     explain_produced = env.get("EXPLAIN_PRODUCED")
 
     assert isinstance(scored_count, int) and scored_count >= 80, (
         f"SCORED_COUNT={scored_count!r}"
     )
+    # Counts come from the real Hetionet subgraph extract — the
+    # mechanistic-path traversal sees the full 6-hop product across
+    # 30 compounds × 60 genes × 40 pathways.
+    assert (
+        isinstance(mechanistic_path_count, int) and mechanistic_path_count >= 100
+    ), f"MECHANISTIC_PATH_COUNT={mechanistic_path_count!r}"
+    assert (
+        isinstance(mechanism_plausibility_count, int) and mechanism_plausibility_count >= 20
+    ), f"MECHANISM_PLAUSIBILITY_COUNT={mechanism_plausibility_count!r}"
+    assert (
+        isinstance(investigation_queue_len, int) and investigation_queue_len >= 5
+    ), f"INVESTIGATION_QUEUE_LEN={investigation_queue_len!r}"
     assert isinstance(validate_metrics, dict) and any(
         "Brier" in k or "brier" in k for k in validate_metrics
     ), f"VALIDATE_METRICS missing Brier: {validate_metrics!r}"
@@ -66,6 +81,9 @@ def main() -> int:
     print(
         "ADR signal-detection flagship notebook validation passed.\n"
         f"Summary: scored_reports={scored_count}, "
+        f"mechanistic_path={mechanistic_path_count}, "
+        f"mechanism_plausibility={mechanism_plausibility_count}, "
+        f"investigation_queue={investigation_queue_len}, "
         f"validate_metrics={validate_metrics}"
     )
     return 0

@@ -27,7 +27,7 @@ The notebook ingests a drug-target-side-effect subgraph drawn from Hetionet dire
 
 A single missed safety signal that surfaces later as a regulatory action costs tens to hundreds of millions in remediation, recalls, and reputational damage. Calibrated scoring plus audit-ready provenance is the difference between defensible pharmacovigilance and pharmacovigilance theater.
 
-**Data**: [Hetionet v1.0](https://het.io/) (CC BY 4.0) -- 47k biomedical entities, 2.2M relationships, 11 node types, 24 edge types. The narrative report stream is synthesized for the notebook and clearly marked as such; the drug → side-effect signal graph and mechanistic paths come from Hetionet's curated edges. Sentence embeddings use [`sentence-transformers/all-MiniLM-L6-v2`](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2) (Apache-2.0). Citation: Himmelstein DS et al., *eLife* 2017.
+**Data**: [Hetionet v1.0](https://het.io/) (CC0 1.0 Universal) -- 47k biomedical entities, 2.2M relationships, 11 node types, 24 edge types. The narrative report stream is synthesized for the notebook and clearly marked as such; the drug → side-effect signal graph and mechanistic paths come from Hetionet's curated edges. Sentence embeddings use [`sentence-transformers/all-MiniLM-L6-v2`](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2) (Apache-2.0). Citation: Himmelstein DS et al., *eLife* 2017.
 
 ---
 

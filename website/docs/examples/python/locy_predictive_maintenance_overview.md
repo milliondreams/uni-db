@@ -12,20 +12,20 @@ Reliability engineers run vibration analysis, temperature trending, and oil samp
 
 ## With Uni
 
-The notebook ingests AI4I 2020 sensor data plus a process-line topology directly into Uni's graph. A failure-likelihood classifier runs as a Locy neural predicate, with features that combine raw sensor statistics, component-level sub-predictions pulled from an upstream rule, and graph-structural signals (betweenness centrality on the line, neighborhood-average temperature). The classifier output is calibrated in-language using `CALIBRATE ... USING platt_scaling` against held-out historical failures, then validated with Brier and ECE. Asset-level risk composes through `MNOR` over failure modes; line-level reliability composes through `MPROD` across required assets. Every recommendation includes a derivation trace showing which sensor reading, which downstream impact, and which calibration step produced it.
+The notebook ingests AI4I 2020 sensor data plus a synthesized process-line topology directly into Uni's graph. A failure-likelihood classifier runs as a Locy neural predicate registered via `LocyConfig.register_classifier`. The classifier output is calibrated in-language using `CALIBRATE ... METHOD platt_scaling` against held-out historical failures, then validated with Brier and accuracy. Component-level risk composes through `FOLD MNOR(unhealth)` over a `HAS_PART` child set; line-level reliability composes through `FOLD MPROD(1 - asset_risk)` across `UPSTREAM_OF` chains using inline classifier invocation. The `EXPLAIN` trace surfaces every classifier call's `NeuralProvenance` for audit, with the rule chain that composed the per-asset score into the line-level rollup.
 
 ## What You'll See
 
-- Calibrated per-asset failure probabilities with confidence bands, not raw classifier outputs
-- Line-level joint reliability rollups computed by composing per-asset probabilities
+- Calibrated per-asset failure probabilities from a registered Python classifier (in production, an ONNX-exported XGBoost or similar)
+- Line-level joint reliability rollups computed by composing per-asset probabilities through `FOLD MPROD(1 - asset_risk)` across `UPSTREAM_OF` chains
+- Component-level risk aggregation via `FOLD MNOR(unhealth)` over a `HAS_PART` child set
 - Calibration delta: raw Brier vs Platt-calibrated Brier on held-out outcomes
-- Topology-aware service ranking that accounts for cascading downstream impact, not just per-asset risk
-- ABDUCE-generated service schedule: minimum set of assets to service this week to keep line reliability above target
-- Audit trail for every recommendation: sensor evidence, similar historical pattern, calibrated probability, downstream impact
+- Validation report with Brier and accuracy
+- Audit trail (`EXPLAIN` with `NeuralProvenance`) for every recommendation: sensor evidence, the classifier's calibrated probability, the rule chain that produced the score
 
 ## Why It Matters
 
-Unplanned outages at a typical continuous-process plant cost $50k-200k per hour. Reducing false-positive maintenance alerts and false-negative missed failures directly protects throughput. Calibrated probabilities plus topology-aware scheduling change which ten assets get serviced this week.
+Unplanned outages at a typical continuous-process plant cost $50k-200k per hour. Reducing false-positive maintenance alerts and false-negative missed failures directly protects throughput. Calibrated probabilities plus topology-aware composition (line-level reliability built from per-asset risks) change which ten assets get serviced this week.
 
 **Data**: [AI4I 2020 Predictive Maintenance Dataset](https://archive.ics.uci.edu/dataset/601/) (UCI #601, CC BY 4.0) -- 10k machine instances, 14 sensor features, 5 failure modes. Process-line topology is synthesized for the notebook and clearly marked as such.
 

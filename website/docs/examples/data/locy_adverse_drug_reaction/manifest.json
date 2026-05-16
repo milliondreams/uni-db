@@ -1,0 +1,39 @@
+{
+  "generated_at": "2026-05-16T10:44:08.196823+00:00",
+  "source": {
+    "name": "Hetionet v1.0",
+    "doi": "10.7554/eLife.26726",
+    "license": "CC0 1.0 Universal",
+    "nodes_url": "https://raw.githubusercontent.com/hetio/hetionet/master/hetnet/tsv/hetionet-v1.0-nodes.tsv",
+    "edges_url": "https://media.githubusercontent.com/media/hetio/hetionet/master/hetnet/tsv/hetionet-v1.0-edges.sif.gz",
+    "citation": "Himmelstein DS, et al. Systematic integration of biomedical knowledge prioritizes drugs for repurposing. eLife. 2017. DOI: 10.7554/eLife.26726"
+  },
+  "extract_params": {
+    "n_compounds": 30,
+    "n_genes": 60,
+    "n_pathways": 40,
+    "n_side_effects": 60,
+    "n_reports": 120,
+    "n_signals": 8,
+    "seed": 20260516
+  },
+  "shape": {
+    "compounds": 30,
+    "genes": 60,
+    "pathways": 40,
+    "side_effects": 60,
+    "cbg_edges": 298,
+    "gppw_edges": 474,
+    "ccse_edges": 90,
+    "reports": 120,
+    "reports_flagged_as_signals": 24
+  },
+  "notes": [
+    "Compounds, genes, pathways, side effects, and the three edge",
+    "sets are an EXACT slice of Hetionet v1.0 (no synthetic edges).",
+    "adr_reports.csv is SYNTHETIC: drawn from CcSE pairs in the",
+    "  extract, with deterministic count/similarity/signal labels",
+    "  seeded by the prep-script --seed parameter. Use this as a",
+    "  reproducible FAERS-shaped stream, not as real reports."
+  ]
+}

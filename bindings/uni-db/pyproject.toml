@@ -35,6 +35,25 @@ Issues = "https://github.com/rustic-ai/uni-db/issues"
 docs = [
     "pdoc>=14.0.0",
 ]
+# Runtime deps for the flagship neural-predicate notebooks. CI's flagship
+# verifier job installs these. They're opt-in so the default uni-db wheel
+# stays lean.
+notebook-runtime = [
+    "onnxruntime>=1.18",
+    "pyarrow>=16",
+    "numpy>=1.26",
+]
+# Prep-time-only deps for the flagship neural-predicate notebook data
+# pipeline. Used by scripts under website/scripts/prepare_*.py to train
+# embeddings + export ONNX. NEVER imported from notebook or library code.
+notebook-data-prep = [
+    "torch>=2.2",
+    "onnx>=1.16",
+    "onnxscript>=0.1",
+    "scikit-learn>=1.4",
+    "pyarrow>=16",
+    "numpy>=1.26",
+]
 
 [dependency-groups]
 dev = [

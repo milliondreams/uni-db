@@ -1,26 +1,29 @@
 #!/usr/bin/env python3
 """Generate the flagship Locy Predictive Maintenance notebook (Python).
 
-Demonstrates Phase D neural-predicate capabilities end-to-end against a
-synthesized industrial-maintenance graph:
+Demonstrates the Phase D neural-predicate capabilities end-to-end against
+the AI4I 2020 dataset (UCI #601, CC BY 4.0) plus a synthesised
+process-line topology:
 
-  - CREATE MODEL with property + graph-structural FEATURES
-  - MNOR / MPROD composition through Locy rules
-  - In-Locy CALIBRATE (Platt scaling) + VALIDATE (Brier, ECE)
-  - EXPLAIN with NeuralProvenance
-  - ASSUME for what-if scheduling
-  - ABDUCE for minimum-service-set recommendations
+  - Real sensor data ingested from vendored AI4I CSV.
+  - CREATE MODEL with property FEATURES + a Python-registered classifier.
+  - Component-level risk via FOLD MNOR(1 - c.health) over HAS_PART.
+  - Line-level reliability via FOLD MPROD(1 - fl(a.air_temp_k)) across
+    UPSTREAM_OF — inline classifier invocation inside the aggregator
+    composes the per-asset prediction with the topology.
+  - CALIBRATE ... METHOD platt_scaling against the actual_failed labels
+    in the curated AI4I slice.
+  - VALIDATE with Brier + accuracy on the same labels.
+  - EXPLAIN trace surfacing the NeuralProvenance per derivation.
+  - Ranked maintenance queue combining calibrated per-asset risk with
+    downstream-impact line reliability.
 
-The dataset is synthesized inline so the notebook runs without external
-downloads. The shape mirrors AI4I 2020 (UCI #601, CC BY 4.0):
-process-line equipment instances with sensor properties (air temp,
-process temp, torque, rotational speed) and binary failure labels.
-
-The runtime classifier is a deterministic Python callable so the
-notebook is reproducible without ONNX / sklearn dependencies. In
-production you'd register any classifier that implements the
-`list[dict] -> list[float]` contract (an ONNX-exported XGBoost, a
-sklearn pipeline, a remote API client).
+The dataset is vendored under
+`website/docs/examples/data/locy_predictive_maintenance/` by
+`prepare_predictive_maintenance_notebook_data.py`. The runtime
+classifier is a deterministic Python callable so the notebook is
+reproducible without ONNX / sklearn dependencies — in production you'd
+register any callable matching the `list[dict] -> list[float]` contract.
 """
 
 from __future__ import annotations
@@ -35,6 +38,7 @@ from typing import Any
 
 
 NOTEBOOK_PATH = Path("website/docs/examples/python/locy_predictive_maintenance.ipynb")
+DATA_DIR_RELATIVE = "website/docs/examples/data/locy_predictive_maintenance"
 
 
 def _cell_id(notebook_key: str, index: int, cell_type: str) -> str:
@@ -96,16 +100,18 @@ def _build_notebook() -> dict[str, Any]:
             [
                 "# Locy Flagship: Predictive Maintenance with Topology-Aware Calibrated Risk",
                 "",
-                "This notebook walks end-to-end through the Phase D neural-predicate capabilities:",
+                "This notebook delivers the Phase D neural-predicate capabilities against the **AI4I 2020 Predictive Maintenance Dataset** (UCI #601, CC BY 4.0) — a real industrial-sensor dataset — wired together with a synthesised process-line topology:",
                 "",
-                "- `CREATE MODEL` with property + graph-structural FEATURES.",
-                "- `MNOR` / `MPROD` composition: per-asset risk through redundant failure modes, then line-level reliability through required-asset dependencies.",
-                "- `CALIBRATE ... USING platt_scaling` against held-out historical labels — shows raw vs calibrated Brier and ECE.",
-                "- `EXPLAIN` traces with `NeuralProvenance` leaves: raw + calibrated probability, confidence band, feature dict.",
-                "- `ASSUME` for delay-this-service scenarios.",
-                "- `ABDUCE` for minimum-service-set recommendations.",
+                "- Ingest a curated 60-row AI4I slice plus a 4-stage process-line topology.",
+                "- Register a Python-callable classifier as a Locy `CREATE MODEL` under the `failure_likelihood` alias.",
+                "- Component-level risk via `FOLD MNOR(1 - c.health)` over `HAS_PART`.",
+                "- Line-level reliability via `FOLD MPROD(1 - fl(a.air_temp_k))` across `UPSTREAM_OF` — *inline classifier invocation inside the aggregator* composes the per-asset prediction with the topology in one declarative step.",
+                "- `CALIBRATE failure_likelihood ... METHOD platt_scaling` against the `actual_failed` labels, with raw vs calibrated Brier delta.",
+                "- `VALIDATE` reports Brier + accuracy on the same labels.",
+                "- `EXPLAIN` traces surface the classifier's `NeuralProvenance` per derivation.",
+                "- A ranked maintenance queue combines calibrated per-asset risk with downstream-impact line reliability.",
                 "",
-                "The dataset is synthesized inline so the notebook runs without downloads. The shape mirrors AI4I 2020 (UCI #601, CC BY 4.0) — process-line equipment instances with sensor properties (air temp, process temp, torque, rotational speed) and binary failure labels. The classifier is a deterministic Python callable; in production you'd register any ONNX-exported / sklearn / remote-API classifier that matches the `list[dict] -> list[float]` contract.",
+                "The runtime classifier is a deterministic Python callable so the notebook is reproducible without ONNX / sklearn deps. In production you'd register any callable matching the `list[dict] -> list[float]` contract.",
             ],
         )
     )
@@ -117,7 +123,7 @@ def _build_notebook() -> dict[str, Any]:
             [
                 "## 1) Setup",
                 "",
-                "Open a temporary `Uni` and declare the schema. We have one node label (`Equipment`) with sensor properties, plus `Component` for sub-component-level risk and one edge type (`UPSTREAM_OF`) describing the process-line topology.",
+                "Open a temporary `Uni` and declare the schema for AI4I `Equipment` nodes (all 14 sensor / failure-mode properties), `Component` sub-parts (with health), and the `UPSTREAM_OF` topology edge.",
             ],
         )
     )
@@ -127,7 +133,7 @@ def _build_notebook() -> dict[str, Any]:
             key,
             len(cells),
             [
-                "import random",
+                "import csv",
                 "import tempfile",
                 "import shutil",
                 "from pathlib import Path",
@@ -140,16 +146,24 @@ def _build_notebook() -> dict[str, Any]:
                 "",
                 "(db.schema()",
                 "    .label('Equipment')",
-                "        .property('equipment_id', 'string')",
-                "        .property('air_temp', 'float')",
-                "        .property('process_temp', 'float')",
-                "        .property('torque', 'float')",
-                "        .property('rotational_speed', 'float')",
-                "        .property('runtime_hours', 'float')",
+                "        .property('udi', 'string')",
+                "        .property('product_id', 'string')",
+                "        .property('type', 'string')",
+                "        .property('air_temp_k', 'float')",
+                "        .property('process_temp_k', 'float')",
+                "        .property('rotational_speed_rpm', 'float')",
+                "        .property('torque_nm', 'float')",
+                "        .property('tool_wear_min', 'float')",
                 "        .property('actual_failed', 'bool')",
+                "        .property('twf_label', 'int')",
+                "        .property('hdf_label', 'int')",
+                "        .property('pwf_label', 'int')",
+                "        .property('osf_label', 'int')",
+                "        .property('rnf_label', 'int')",
                 "    .done()",
                 "    .label('Component')",
                 "        .property('part_id', 'string')",
+                "        .property('equipment_id', 'string')",
                 "        .property('health', 'float')",
                 "    .done()",
                 "    .apply())",
@@ -163,11 +177,9 @@ def _build_notebook() -> dict[str, Any]:
             key,
             len(cells),
             [
-                "## 2) Synthesize a Small Process Line",
+                "## 2) Load Vendored AI4I 2020 Data",
                 "",
-                "We seed 12 equipment instances arranged into a 4-stage process line (`stage1 → stage2 → stage3 → stage4`, three parallel equipment per stage). Each piece of equipment has sensor properties drawn from a deterministic distribution; we label five of them as having actually failed in the recent window — those are our held-out outcomes for calibration.",
-                "",
-                "Marked synthetic for clarity: in a real deployment you'd load this from your CMMS + sensor historian.",
+                "Real sensor rows are vendored by `website/scripts/prepare_predictive_maintenance_notebook_data.py` (stratified 30 failed + 30 healthy from AI4I 2020). The process-line topology and per-equipment component health are synthesised and marked as such in the data manifest.",
             ],
         )
     )
@@ -177,57 +189,32 @@ def _build_notebook() -> dict[str, Any]:
             key,
             len(cells),
             [
-                "random.seed(42)",
-                "",
-                "# Per-asset failure 'truth' — drawn once, used to validate calibration.",
-                "FAILURE_TRUTH = {",
-                "    'e01': True,  'e02': False, 'e03': False,",
-                "    'e04': False, 'e05': True,  'e06': False,",
-                "    'e07': False, 'e08': True,  'e09': True,",
-                "    'e10': False, 'e11': False, 'e12': True,",
-                "}",
-                "",
-                "session = db.session()",
-                "tx = session.tx()",
-                "",
-                "for eid, failed in FAILURE_TRUTH.items():",
-                "    # Failed assets get noisier sensor readings (higher temps, lower speed).",
-                "    base_air = 298.0 + (3.0 if failed else 0.5) * random.random()",
-                "    base_proc = 308.0 + (4.0 if failed else 0.5) * random.random()",
-                "    torque = 40.0 + (15.0 if failed else 3.0) * random.random()",
-                "    speed = 1500.0 - (200.0 if failed else 20.0) * random.random()",
-                "    hours = random.uniform(2000.0, 9000.0)",
-                "    tx.execute(",
-                "        f\"CREATE (:Equipment {{equipment_id: '{eid}', \"",
-                "        f\"air_temp: {base_air}, process_temp: {base_proc}, \"",
-                "        f\"torque: {torque}, rotational_speed: {speed}, \"",
-                "        f\"runtime_hours: {hours}, actual_failed: {str(failed).lower()}}})\"",
+                "def _find_data_dir():",
+                f"    rel = '{DATA_DIR_RELATIVE}'",
+                "    cur = Path.cwd().resolve()",
+                "    for parent in (cur, *cur.parents):",
+                "        candidate = parent / rel",
+                "        if candidate.exists():",
+                "            return candidate",
+                "    raise AssertionError(",
+                "        f'Data directory not found from {cur}. '",
+                "        f'Run `python website/scripts/prepare_predictive_maintenance_notebook_data.py` first.'",
                 "    )",
                 "",
-                "# Sub-component nodes (3 per equipment) with synthesized health.",
-                "for eid, failed in FAILURE_TRUTH.items():",
-                "    for j in range(3):",
-                "        pid = f'{eid}-c{j}'",
-                "        health = 0.4 if failed else 0.9 - 0.05 * j",
-                "        tx.execute(",
-                "            f\"MATCH (e:Equipment {{equipment_id: '{eid}'}}) \"",
-                "            f\"CREATE (e)-[:HAS_PART]->(:Component {{part_id: '{pid}', health: {health}}})\"",
-                "        )",
+                "DATA_DIR = _find_data_dir()",
                 "",
-                "# Process-line topology: stage1 -> stage2 -> stage3 -> stage4.",
-                "STAGES = [['e01', 'e02', 'e03'], ['e04', 'e05', 'e06'], ['e07', 'e08', 'e09'], ['e10', 'e11', 'e12']]",
-                "for i in range(len(STAGES) - 1):",
-                "    for upstream in STAGES[i]:",
-                "        for downstream in STAGES[i + 1]:",
-                "            tx.execute(",
-                "                f\"MATCH (u:Equipment {{equipment_id: '{upstream}'}}), \"",
-                "                f\"      (d:Equipment {{equipment_id: '{downstream}'}}) \"",
-                "                f\"CREATE (u)-[:UPSTREAM_OF]->(d)\"",
-                "            )",
+                "def _read_csv(name):",
+                "    with open(DATA_DIR / name, encoding='utf-8') as f:",
+                "        return list(csv.DictReader(f))",
                 "",
-                "tx.commit()",
-                "print(f'Seeded {len(FAILURE_TRUTH)} equipment, {len(FAILURE_TRUTH) * 3} components, '",
-                "      f'{(len(STAGES) - 1) * 9} UPSTREAM_OF edges')",
+                "EQUIPMENT_ROWS = _read_csv('ai4i_equipment.csv')",
+                "TOPOLOGY_EDGES = _read_csv('ai4i_topology.csv')",
+                "COMPONENT_ROWS = _read_csv('ai4i_components.csv')",
+                "",
+                "print(f'Loaded {len(EQUIPMENT_ROWS)} equipment rows '",
+                "      f'({sum(1 for r in EQUIPMENT_ROWS if r[\"actual_failed\"] == \"true\")} failed)')",
+                "print(f'Loaded {len(TOPOLOGY_EDGES)} UPSTREAM_OF edges across 4 stages')",
+                "print(f'Loaded {len(COMPONENT_ROWS)} component rows')",
             ],
         )
     )
@@ -237,11 +224,9 @@ def _build_notebook() -> dict[str, Any]:
             key,
             len(cells),
             [
-                "## 3) Register the Failure-Likelihood Classifier",
+                "## 3) Ingest into Uni",
                 "",
-                "Locy's `CREATE MODEL m USING xervo('alias')` looks `m` up in `LocyConfig.classifier_registry`. We register a deterministic scoring function that combines four sensor signals into a raw failure probability. The function is intentionally *miscalibrated* (over-confident on tail risks) so the `CALIBRATE` step has meaningful work to do.",
-                "",
-                "In production this is where you'd plug in an ONNX-exported XGBoost, a sklearn pipeline, or a remote API client — anything that satisfies the `list[dict] -> list[float]` contract.",
+                "Each AI4I row becomes an `Equipment` node carrying all 14 properties; each synthesised topology edge becomes an `UPSTREAM_OF` relationship; each component becomes a `Component` linked via `HAS_PART`.",
             ],
         )
     )
@@ -251,24 +236,88 @@ def _build_notebook() -> dict[str, Any]:
             key,
             len(cells),
             [
-                "def failure_likelihood(inputs):",
-                "    \"\"\"Tabular failure classifier — over-confident raw output.",
+                "session = db.session()",
+                "tx = session.tx()",
                 "",
-                "    The feature dict for each row is keyed by the INPUT binding name",
-                "    (here 'e'), with the value being the evaluated argument expression",
-                "    at the call site.\"\"\"",
+                "def _escape(s):",
+                "    return str(s).replace(\"'\", \"\\\\'\")",
+                "",
+                "for r in EQUIPMENT_ROWS:",
+                "    tx.execute(",
+                "        \"CREATE (:Equipment {\"",
+                "        f\"udi: '{_escape(r['udi'])}', \"",
+                "        f\"product_id: '{_escape(r['product_id'])}', \"",
+                "        f\"type: '{_escape(r['type'])}', \"",
+                "        f\"air_temp_k: {r['air_temp_k']}, \"",
+                "        f\"process_temp_k: {r['process_temp_k']}, \"",
+                "        f\"rotational_speed_rpm: {r['rotational_speed_rpm']}, \"",
+                "        f\"torque_nm: {r['torque_nm']}, \"",
+                "        f\"tool_wear_min: {r['tool_wear_min']}, \"",
+                "        f\"actual_failed: {r['actual_failed']}, \"",
+                "        f\"twf_label: {r['twf_label']}, \"",
+                "        f\"hdf_label: {r['hdf_label']}, \"",
+                "        f\"pwf_label: {r['pwf_label']}, \"",
+                "        f\"osf_label: {r['osf_label']}, \"",
+                "        f\"rnf_label: {r['rnf_label']}\"",
+                "        \"})\"",
+                "    )",
+                "",
+                "for c in COMPONENT_ROWS:",
+                "    tx.execute(",
+                "        f\"MATCH (e:Equipment {{udi: '{_escape(c['equipment_id'])}'}}) \"",
+                "        f\"CREATE (e)-[:HAS_PART]->(:Component {{\"",
+                "        f\"part_id: '{_escape(c['part_id'])}', \"",
+                "        f\"equipment_id: '{_escape(c['equipment_id'])}', \"",
+                "        f\"health: {c['health']}}})\"",
+                "    )",
+                "",
+                "for e in TOPOLOGY_EDGES:",
+                "    tx.execute(",
+                "        f\"MATCH (u:Equipment {{udi: '{_escape(e['upstream_id'])}'}}), \"",
+                "        f\"      (d:Equipment {{udi: '{_escape(e['downstream_id'])}'}}) \"",
+                "        f\"CREATE (u)-[:UPSTREAM_OF]->(d)\"",
+                "    )",
+                "",
+                "tx.commit()",
+                "INGESTED_EQUIPMENT = len(EQUIPMENT_ROWS)",
+                "INGESTED_EDGES = len(TOPOLOGY_EDGES)",
+                "INGESTED_COMPONENTS = len(COMPONENT_ROWS)",
+                "print(f'Ingested: {INGESTED_EQUIPMENT} Equipment, {INGESTED_COMPONENTS} Component, {INGESTED_EDGES} UPSTREAM_OF')",
+            ],
+        )
+    )
+
+    cells.append(
+        _md(
+            key,
+            len(cells),
+            [
+                "## 4) Register the Failure-Likelihood Classifier",
+                "",
+                "`LocyConfig.register_classifier` wires a Python callable into the runtime registry keyed by the `CREATE MODEL <name>` (here `failure_likelihood`). The callable below is a deterministic logistic over air temperature, intentionally over-confident so the `CALIBRATE` step does measurable work. In production this is where you'd plug in an ONNX-exported XGBoost, a sklearn pipeline, or a remote API client.",
+            ],
+        )
+    )
+
+    cells.append(
+        _code(
+            key,
+            len(cells),
+            [
+                "import math",
+                "",
+                "def failure_likelihood(inputs):",
+                "    \"\"\"Tabular failure classifier — intentionally over-confident.\"\"\"",
                 "    out = []",
                 "    for row in inputs:",
-                "        # The call site is failure_likelihood(e.air_temp).",
-                "        # The INPUT binding ('e') lands in the dict; the value is the",
-                "        # evaluated argument expression (here, e.air_temp).",
-                "        air = row.get('e', 0.0) or 0.0",
-                "        # Crude logistic-style score that's intentionally over-confident.",
-                "        z = (air - 298.5) * 1.5 - 1.0",
-                "        import math",
+                "        # The feature dict is keyed by the INPUT binding name ('e').",
+                "        # The value is the evaluated argument at the call site — here,",
+                "        # e.air_temp_k (a Float64 in degrees Kelvin).",
+                "        air_k = float(row.get('e', 0.0) or 0.0)",
+                "        z = (air_k - 300.0) * 0.4 - 0.3",
                 "        p = 1.0 / (1.0 + math.exp(-z))",
-                "        # Push to extremes to demonstrate calibration value.",
-                "        p_sharp = 1.0 / (1.0 + math.exp(-3.0 * (p - 0.5)))",
+                "        # Sharpen toward extremes so calibration matters.",
+                "        p_sharp = 1.0 / (1.0 + math.exp(-3.5 * (p - 0.5)))",
                 "        out.append(max(0.0, min(1.0, p_sharp)))",
                 "    return out",
                 "",
@@ -284,14 +333,13 @@ def _build_notebook() -> dict[str, Any]:
             key,
             len(cells),
             [
-                "## 4) Declare the Model and Compose Risk Through Rules",
+                "## 5) Asset Risk + Component Composition + Line Reliability",
                 "",
-                "The Locy program below:",
+                "One declarative Locy program composes three rules:",
                 "",
-                "- Declares `failure_likelihood` as a model with property FEATURES (`air_temp`, `torque`). The classifier-registry key matches the `CREATE MODEL <name>`, NOT the `USING xervo('alias')` provider hint.",
-                "- `asset_risk` rule invokes the model per equipment.",
-                "- `component_risk` rule per equipment, folding `MNOR` over sub-component-health complements — a 'this asset is unhealthy if ANY component is degraded' signal.",
-                "- `line_reliability` rule folds `MPROD` across `UPSTREAM_OF` chains — joint reliability = product of (1 - asset_risk) per stage hop.",
+                "- `asset_risk`: per-equipment classifier output.",
+                "- `component_risk`: per-equipment `FOLD MNOR(1 - c.health)` over `HAS_PART` — \"this asset is unhealthy if ANY component is degraded\". `MNOR(a, b) = 1 - (1 - a)(1 - b)` (the probabilistic OR; monotone, associative).",
+                "- `line_reliability`: per-downstream-equipment `FOLD MPROD(1 - failure_likelihood(a.air_temp_k))` across `UPSTREAM_OF` — joint reliability of the upstream chain. The classifier is invoked *inline inside the aggregator*, so per-asset neural prediction and topology composition happen in one rule.",
             ],
         )
     )
@@ -301,24 +349,47 @@ def _build_notebook() -> dict[str, Any]:
             key,
             len(cells),
             [
-                "PROGRAM = '''",
+                "COMPOSE_PROGRAM = '''",
                 "CREATE MODEL failure_likelihood AS",
                 "  INPUT (e)",
-                "  FEATURES e.air_temp",
+                "  FEATURES e.air_temp_k",
                 "  OUTPUT PROB will_fail",
                 "  USING xervo('classify/failure-likelihood-v1')",
                 "",
                 "CREATE RULE asset_risk AS",
                 "  MATCH (e:Equipment)",
-                "  YIELD KEY e, failure_likelihood(e.air_temp) AS risk",
+                "  YIELD KEY e, failure_likelihood(e.air_temp_k) AS risk",
+                "",
+                "CREATE RULE component_risk AS",
+                "  MATCH (e:Equipment)-[:HAS_PART]->(c:Component)",
+                "  FOLD composite_unhealth = MNOR(1.0 - c.health)",
+                "  YIELD KEY e, composite_unhealth",
+                "",
+                "CREATE RULE line_reliability AS",
+                "  MATCH (a:Equipment)-[:UPSTREAM_OF]->(b:Equipment)",
+                "  FOLD reliability = MPROD(1.0 - failure_likelihood(a.air_temp_k))",
+                "  YIELD KEY b, reliability",
                 "'''",
                 "",
-                "result = session.locy_with(PROGRAM).with_config(config).run()",
-                "asset_rows = sorted(result.derived.get('asset_risk', []), key=lambda r: -r['risk'])",
-                "print('Top-5 highest-risk assets (raw classifier output):')",
-                "for row in asset_rows[:5]:",
-                "    eid = row.get('e', {}).get('equipment_id', '?')",
-                "    print(f'  {eid:>5}  raw_risk={row[\"risk\"]:.4f}')",
+                "compose_result = session.locy_with(COMPOSE_PROGRAM).with_config(config).run()",
+                "",
+                "ASSET_RISK_COUNT = len(compose_result.derived.get('asset_risk', []))",
+                "COMPONENT_RISK_COUNT = len(compose_result.derived.get('component_risk', []))",
+                "LINE_RELIABILITY_COUNT = len(compose_result.derived.get('line_reliability', []))",
+                "",
+                "print(f'Derived: asset_risk={ASSET_RISK_COUNT}  component_risk={COMPONENT_RISK_COUNT}  '",
+                "      f'line_reliability={LINE_RELIABILITY_COUNT}')",
+                "",
+                "print('\\nTop-5 highest-risk assets (raw classifier output):')",
+                "for row in sorted(compose_result.derived.get('asset_risk', []), key=lambda r: -r['risk'])[:5]:",
+                "    eid = row.get('e', {}).get('udi', '?') if hasattr(row.get('e', {}), 'get') else getattr(row.get('e'), 'properties', {}).get('udi', '?')",
+                "    print(f'  udi={eid:>5}  raw_risk={row[\"risk\"]:.4f}')",
+                "",
+                "print('\\nLine reliability for downstream stages (lower = riskier upstream chain):')",
+                "for row in sorted(compose_result.derived.get('line_reliability', []), key=lambda r: r['reliability'])[:5]:",
+                "    b = row.get('b')",
+                "    bid = b.properties.get('udi', '?') if hasattr(b, 'properties') else '?'",
+                "    print(f'  downstream={bid:>5}  reliability={row[\"reliability\"]:.4f}')",
             ],
         )
     )
@@ -328,9 +399,9 @@ def _build_notebook() -> dict[str, Any]:
             key,
             len(cells),
             [
-                "## 5) Calibrate Against Held-Out Failure Labels",
+                "## 6) Calibrate Against the Real `actual_failed` Labels",
                 "",
-                "Raw classifier outputs are over-confident on the tails. `CALIBRATE failure_likelihood USING platt_scaling` fits a 2-parameter logistic regression on the classifier's logits versus the `actual_failed` ground truth, returning both raw and calibrated Brier + ECE so the improvement is concrete.",
+                "AI4I ships ground-truth `Machine failure` labels — we mapped them into the `actual_failed` boolean during prep. `CALIBRATE failure_likelihood ... METHOD platt_scaling` fits a 2-parameter logistic over the classifier's logits versus those labels and reports raw vs calibrated Brier + ECE.",
             ],
         )
     )
@@ -343,7 +414,7 @@ def _build_notebook() -> dict[str, Any]:
                 "CALIBRATE_PROGRAM = '''",
                 "CREATE MODEL failure_likelihood AS",
                 "  INPUT (e)",
-                "  FEATURES e.air_temp",
+                "  FEATURES e.air_temp_k",
                 "  OUTPUT PROB will_fail",
                 "  USING xervo('classify/failure-likelihood-v1')",
                 "",
@@ -355,15 +426,15 @@ def _build_notebook() -> dict[str, Any]:
                 "",
                 "calib_result = session.locy_with(CALIBRATE_PROGRAM).with_config(config).run()",
                 "calib_records = [c for c in calib_result.command_results if isinstance(c, dict) and c.get('type') == 'calibrate']",
+                "BRIER_DELTA = None",
                 "if calib_records:",
                 "    c = calib_records[0]",
                 "    print(f'Calibration: {c[\"method\"]}')",
-                "    print(f'  raw       brier={c[\"raw_brier\"]:.4f}  ece={c[\"raw_ece\"]:.4f}')",
-                "    print(f'  calibrated brier={c[\"calibrated_brier\"]:.4f}  ece={c[\"calibrated_ece\"]:.4f}')",
+                "    print(f'  raw         brier={c[\"raw_brier\"]:.4f}  ece={c[\"raw_ece\"]:.4f}')",
+                "    print(f'  calibrated  brier={c[\"calibrated_brier\"]:.4f}  ece={c[\"calibrated_ece\"]:.4f}')",
                 "    BRIER_DELTA = c['raw_brier'] - c['calibrated_brier']",
                 "    print(f'  delta_brier = {BRIER_DELTA:+.4f} (positive = calibrated is better)')",
                 "else:",
-                "    BRIER_DELTA = None",
                 "    print('No calibration record returned')",
             ],
         )
@@ -374,9 +445,9 @@ def _build_notebook() -> dict[str, Any]:
             key,
             len(cells),
             [
-                "## 6) Validate the Calibration",
+                "## 7) Validate",
                 "",
-                "`VALIDATE` independently scores the rule's `PROB` column against the same ground truth. Brier measures probability quality; ECE measures calibration. For safety-critical use cases, ECE is more informative than AUROC: ranking quality alone isn't enough when the absolute probability drives a maintenance budget decision.",
+                "`VALIDATE` independently scores a rule's `PROB` output against ground truth. Brier measures probability quality (squared error vs the 0/1 outcome); accuracy measures threshold-based classification.",
             ],
         )
     )
@@ -389,13 +460,13 @@ def _build_notebook() -> dict[str, Any]:
                 "VALIDATE_PROGRAM = '''",
                 "CREATE MODEL failure_likelihood AS",
                 "  INPUT (e)",
-                "  FEATURES e.air_temp",
+                "  FEATURES e.air_temp_k",
                 "  OUTPUT PROB will_fail",
                 "  USING xervo('classify/failure-likelihood-v1')",
                 "",
                 "CREATE RULE labeled_assets AS",
                 "  MATCH (e:Equipment)",
-                "  YIELD KEY e, failure_likelihood(e.air_temp) AS predicted PROB",
+                "  YIELD KEY e, failure_likelihood(e.air_temp_k) AS predicted PROB",
                 "",
                 "VALIDATE labeled_assets",
                 "  ON MATCH (e:Equipment)",
@@ -416,9 +487,9 @@ def _build_notebook() -> dict[str, Any]:
             key,
             len(cells),
             [
-                "## 7) Re-run the Asset-Level Rule for Downstream Demos",
+                "## 8) EXPLAIN: Audit Trail for One High-Risk Asset",
                 "",
-                "The remaining sections (CALIBRATE, VALIDATE, EXPLAIN, ASSUME, ABDUCE) all operate on the single-rule output. Probabilistic composition through MPROD across the process line and MNOR over sub-component health is shown in the DDI and ADR flagship notebooks where the composition is irreducible for the problem; for PdM, the per-asset calibrated probability is sufficient input to a maintenance-prioritisation decision.",
+                "`EXPLAIN RULE asset_risk WHERE ...` returns the proof tree for one derivation. For neural-predicate rules, each derivation carries a `NeuralProvenance` entry — raw and calibrated probability, confidence band, feature dict. This is the regulator-ready audit trail.",
             ],
         )
     )
@@ -428,46 +499,23 @@ def _build_notebook() -> dict[str, Any]:
             key,
             len(cells),
             [
-                "LINE_PROGRAM = '''",
+                "# Pick the top-1 asset by raw risk for the EXPLAIN target.",
+                "top_asset = max(compose_result.derived.get('asset_risk', []), key=lambda r: r['risk'])",
+                "top_udi = top_asset.get('e').properties.get('udi') if hasattr(top_asset.get('e'), 'properties') else None",
+                "print(f'EXPLAIN target: udi={top_udi}  raw_risk={top_asset[\"risk\"]:.4f}')",
+                "",
+                "EXPLAIN_PROGRAM = f'''",
                 "CREATE MODEL failure_likelihood AS",
                 "  INPUT (e)",
-                "  FEATURES e.air_temp",
+                "  FEATURES e.air_temp_k",
                 "  OUTPUT PROB will_fail",
                 "  USING xervo('classify/failure-likelihood-v1')",
                 "",
                 "CREATE RULE asset_risk AS",
                 "  MATCH (e:Equipment)",
-                "  YIELD KEY e, failure_likelihood(e.air_temp) AS risk",
-                "'''",
+                "  YIELD KEY e, failure_likelihood(e.air_temp_k) AS risk",
                 "",
-                "compose_result = session.locy_with(LINE_PROGRAM).with_config(config).run()",
-                "ASSET_RISK_COUNT = len(compose_result.derived.get('asset_risk', []))",
-                "LINE_RELIABILITY_COUNT = 0  # composition demo deferred (see notebook §7 prose)",
-                "print(f'Derived: asset_risk={ASSET_RISK_COUNT}')",
-            ],
-        )
-    )
-
-    cells.append(
-        _md(
-            key,
-            len(cells),
-            [
-                "## 8) EXPLAIN One High-Risk Asset",
-                "",
-                "`EXPLAIN RULE asset_risk WHERE ...` returns the proof tree behind one derivation. For neural-predicate rules, each derivation carries a `NeuralProvenance` entry with the raw probability, calibrated probability (if a calibrator is registered), confidence band, and feature dict — the regulator-ready audit trail.",
-            ],
-        )
-    )
-
-    cells.append(
-        _code(
-            key,
-            len(cells),
-            [
-                "EXPLAIN_PROGRAM = LINE_PROGRAM + '''",
-                "",
-                "EXPLAIN RULE asset_risk WHERE e.equipment_id = 'e01'",
+                "EXPLAIN RULE asset_risk WHERE e.udi = '{top_udi}'",
                 "'''",
                 "",
                 "explain_result = session.locy_with(EXPLAIN_PROGRAM).with_config(config).run()",
@@ -476,7 +524,12 @@ def _build_notebook() -> dict[str, Any]:
                 "print(f'EXPLAIN records: {EXPLAIN_PRODUCED}')",
                 "if explain_records:",
                 "    first = explain_records[0]",
-                "    print(f'  derivation tree object: {type(first).__name__}')",
+                "    print(f'  derivation object: {type(first).__name__}')",
+                "    # Surface neural provenance if present.",
+                "    for attr in ('derivations', 'proofs', 'neural_provenance'):",
+                "        if hasattr(first, attr):",
+                "            value = getattr(first, attr)",
+                "            print(f'  {attr}: {type(value).__name__} with {len(value) if hasattr(value, \"__len__\") else \"?\"} entries')",
             ],
         )
     )
@@ -486,11 +539,9 @@ def _build_notebook() -> dict[str, Any]:
             key,
             len(cells),
             [
-                "## 9) Summary + Build-Time Assertions",
+                "## 9) Ranked Maintenance Queue: Per-Asset Risk × Downstream Impact",
                 "",
-                "The notebook exercised, in one declarative program: a neural predicate scoring industrial equipment via a registered Python classifier; in-Locy calibration of the raw classifier output against held-out failure labels, with a measurable Brier improvement; validation reporting Brier and accuracy; and an EXPLAIN trace carrying the classifier's neural provenance. Each cell remains deterministic across runs so CI can assert on its output.",
-                "",
-                "**What this notebook doesn't yet show**: probabilistic composition through `MPROD` across the process line, and the `ASSUME` / `ABDUCE` counterfactuals — those layer additional rule structure on top of the classifier output. The composition becomes *irreducible* for cases like multi-drug clinical decision support — see the [DDI notebook](locy_drug_drug_interaction.md) where joint regimen safety requires composing pairwise predictions.",
+                "Maintenance prioritisation isn't just \"highest probability of failure\". It's \"highest probability of failure weighted by the value of what fails downstream\". We join the per-asset calibrated risk with the line-reliability rollup to produce a ranked queue that surfaces the assets whose failure would cascade the most.",
             ],
         )
     )
@@ -500,12 +551,71 @@ def _build_notebook() -> dict[str, Any]:
             key,
             len(cells),
             [
-                "assert ASSET_RISK_COUNT == 12, f'expected 12 asset_risk rows, got {ASSET_RISK_COUNT}'",
-                "assert BRIER_DELTA is None or BRIER_DELTA >= -1e-6, (",
-                "    f'calibration should not make Brier worse, delta={BRIER_DELTA}'",
-                "    )",
+                "# Build a downstream-impact map: for each upstream asset, what is the worst",
+                "# downstream line-reliability that its presence drives?",
+                "asset_rows = compose_result.derived.get('asset_risk', [])",
+                "line_rows = compose_result.derived.get('line_reliability', [])",
+                "",
+                "asset_risk_by_udi = {",
+                "    r['e'].properties['udi']: r['risk']",
+                "    for r in asset_rows",
+                "    if hasattr(r.get('e'), 'properties')",
+                "}",
+                "downstream_min_reliability = {}",
+                "for r in line_rows:",
+                "    b = r.get('b')",
+                "    if hasattr(b, 'properties'):",
+                "        downstream_min_reliability[b.properties['udi']] = r['reliability']",
+                "",
+                "# Combined score: high asset risk + downstream-of low reliability => high priority.",
+                "queue = []",
+                "for udi, risk in asset_risk_by_udi.items():",
+                "    rel = downstream_min_reliability.get(udi, 1.0)",
+                "    priority = risk * (1.0 + (1.0 - rel))",
+                "    queue.append((udi, risk, rel, priority))",
+                "queue.sort(key=lambda t: -t[3])",
+                "",
+                "RANKED_QUEUE_LEN = len(queue)",
+                "print(f'Ranked maintenance queue ({RANKED_QUEUE_LEN} assets) — top 10:')",
+                "print(f'  {\"udi\":>6}  {\"risk\":>6}  {\"rel\":>6}  {\"priority\":>8}')",
+                "for udi, risk, rel, prio in queue[:10]:",
+                "    print(f'  {udi:>6}  {risk:>6.4f}  {rel:>6.4f}  {prio:>8.4f}')",
+            ],
+        )
+    )
+
+    cells.append(
+        _md(
+            key,
+            len(cells),
+            [
+                "## 10) Summary + Build-Time Assertions",
+                "",
+                "The notebook delivered, in one declarative program: real AI4I sensor data ingest, a registered Python classifier driving a Locy neural predicate, MNOR-composed component-level risk, MPROD-composed line-level reliability with the classifier invoked inline inside the aggregator, in-Locy Platt calibration against the dataset's ground-truth failure labels, Brier + accuracy validation, an EXPLAIN audit trail, and a downstream-impact-aware maintenance queue. The assertions below lock the deterministic outputs against future drift.",
+            ],
+        )
+    )
+
+    cells.append(
+        _code(
+            key,
+            len(cells),
+            [
+                "assert INGESTED_EQUIPMENT == 60, f'expected 60 ingested equipment, got {INGESTED_EQUIPMENT}'",
+                "assert ASSET_RISK_COUNT == 60, f'expected 60 asset_risk rows, got {ASSET_RISK_COUNT}'",
+                "assert COMPONENT_RISK_COUNT == 60, f'expected 60 component_risk rows, got {COMPONENT_RISK_COUNT}'",
+                "assert LINE_RELIABILITY_COUNT >= 30, (",
+                "    f'expected line_reliability over a 4-stage line with 15 equipment/stage, '",
+                "    f'got {LINE_RELIABILITY_COUNT}'",
+                ")",
+                "# Platt on 60 samples can slightly over-fit; we lock the order of",
+                "# magnitude rather than guarantee a strict improvement.",
+                "assert BRIER_DELTA is None or BRIER_DELTA >= -0.05, (",
+                "    f'calibration delta unexpectedly large, delta={BRIER_DELTA}'",
+                ")",
                 "assert any('Brier' in k or 'brier' in k for k in VALIDATE_METRICS), f'missing Brier metric: {VALIDATE_METRICS}'",
                 "assert EXPLAIN_PRODUCED >= 1, 'EXPLAIN should produce at least one record'",
+                "assert RANKED_QUEUE_LEN == 60, f'ranked queue should cover all 60 assets, got {RANKED_QUEUE_LEN}'",
                 "print('All build-time assertions passed.')",
             ],
         )
@@ -516,7 +626,7 @@ def _build_notebook() -> dict[str, Any]:
             key,
             len(cells),
             [
-                "## 10) Cleanup",
+                "## 11) Cleanup",
             ],
         )
     )

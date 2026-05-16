@@ -67,10 +67,16 @@ def main() -> int:
     # outputs against future drift.
 
     asset_risk_count = env.get("ASSET_RISK_COUNT")
+    component_risk_count = env.get("COMPONENT_RISK_COUNT")
+    line_reliability_count = env.get("LINE_RELIABILITY_COUNT")
     validate_metrics = env.get("VALIDATE_METRICS")
     explain_produced = env.get("EXPLAIN_PRODUCED")
+    ranked_queue_len = env.get("RANKED_QUEUE_LEN")
 
-    assert asset_risk_count == 12, f"ASSET_RISK_COUNT={asset_risk_count!r}"
+    assert asset_risk_count == 60, f"ASSET_RISK_COUNT={asset_risk_count!r}"
+    assert component_risk_count == 60, f"COMPONENT_RISK_COUNT={component_risk_count!r}"
+    assert line_reliability_count >= 30, f"LINE_RELIABILITY_COUNT={line_reliability_count!r}"
+    assert ranked_queue_len == 60, f"RANKED_QUEUE_LEN={ranked_queue_len!r}"
     assert isinstance(validate_metrics, dict) and any(
         "Brier" in k or "brier" in k for k in validate_metrics
     ), f"VALIDATE_METRICS missing Brier: {validate_metrics!r}"
@@ -81,6 +87,8 @@ def main() -> int:
     print(
         "Predictive Maintenance flagship notebook validation passed.\n"
         f"Summary: asset_risk={asset_risk_count}, "
+        f"component_risk={component_risk_count}, "
+        f"line_reliability={line_reliability_count}, "
         f"validate_metrics={validate_metrics}"
     )
     return 0

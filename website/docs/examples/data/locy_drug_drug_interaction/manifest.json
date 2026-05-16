@@ -1,0 +1,54 @@
+{
+  "generated_at": "2026-05-16T10:51:34.763035+00:00",
+  "source": {
+    "name": "Hetionet v1.0",
+    "doi": "10.7554/eLife.26726",
+    "license": "CC0 1.0 Universal",
+    "nodes_url": "https://raw.githubusercontent.com/hetio/hetionet/master/hetnet/tsv/hetionet-v1.0-nodes.tsv",
+    "edges_url": "https://media.githubusercontent.com/media/hetio/hetionet/master/hetnet/tsv/hetionet-v1.0-edges.sif.gz",
+    "citation": "Himmelstein DS, et al. Systematic integration of biomedical knowledge prioritizes drugs for repurposing. eLife. 2017. DOI: 10.7554/eLife.26726"
+  },
+  "embedding": {
+    "algorithm": "scikit-learn TruncatedSVD",
+    "dim": 64,
+    "input_adjacency_shape": [
+      40,
+      80
+    ],
+    "explained_variance_ratio_sum": 1.0000004768371582
+  },
+  "mlp_head": {
+    "framework": "torch -> ONNX (opset 14)",
+    "architecture": "Linear(2*emb,32) -> ReLU -> Linear(32,1) -> Sigmoid",
+    "training_epochs": 150,
+    "loss": "BCE"
+  },
+  "ddi_labels": {
+    "method": "Vilar-style shared-target heuristic",
+    "is_dangerous_rule": "shared_targets >= 2",
+    "n_pairs": 568,
+    "n_dangerous": 451
+  },
+  "shape": {
+    "compounds": 40,
+    "genes": 80,
+    "pairs": 568,
+    "patients": 8,
+    "regimen_edges": 36
+  },
+  "extract_params": {
+    "n_compounds": 40,
+    "n_genes": 80,
+    "embedding_dim": 64,
+    "n_patients": 8,
+    "min_regimen": 3,
+    "max_regimen": 5,
+    "seed": 20260516
+  },
+  "notes": [
+    "drug_embeddings.parquet is offline-trained at prep time; the",
+    "  notebook only loads it via pyarrow.",
+    "ddi_mlp_head.onnx is loaded at notebook runtime via onnxruntime.",
+    "ddi_patients.csv + ddi_patient_regimens.csv are SYNTHETIC."
+  ]
+}

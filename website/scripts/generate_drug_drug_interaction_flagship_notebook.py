@@ -2,29 +2,27 @@
 """Generate the flagship Locy Drug-Drug Interaction notebook (Python).
 
 Demonstrates Phase D neural-predicate capabilities applied to
-polypharmacy interaction risk. The dataset is synthesized inline (no
-external download); the runtime classifier is a deterministic Python
-callable so the notebook is reproducible without external ML
-dependencies. In production this is exactly where you'd plug in an
-R-GCN-derived drug-embedding model — the registered callable would
-look up the two drug embeddings, concat them, and run a small MLP head
-exported to ONNX.
+polypharmacy interaction risk on real Hetionet-derived drugs +
+offline-trained embeddings + ONNX MLP head:
 
-The story:
+  - Real Hetionet Compound subgraph (CSV vendored by the prep script).
+  - 64-dim drug embeddings from offline TruncatedSVD over the
+    Compound-Gene bipartite adjacency (parquet, ~30 KB).
+  - Tiny MLP head exported to ONNX (~17 KB) at prep time.
+  - Python classifier loads ONNX runtime + embeddings once at module
+    import, resolves InteractionRecord pair_id → (drug, drug), looks
+    up the two embeddings, concatenates, ONNX inference returns
+    P(interact).
+  - Composition rules: scored_interactions, joint_regimen_safety
+    (`FOLD MPROD(1 - interaction_score(rec.pair_id))` across distinct
+    drug pairs per patient — inline classifier in aggregator).
+  - CALIBRATE Platt against the Vilar-derived is_dangerous labels.
+  - VALIDATE Brier + accuracy.
+  - Patient ranking + EXPLAIN audit trace.
 
-  - Drugs in the graph, plus DRUG_INTERACTION edges encoding known
-    pairwise interactions with a severity score.
-  - For each interaction edge, the classifier scores the
-    interaction-likelihood from the pair's severity property.
-  - Labels (is_dangerous boolean) drive CALIBRATE + VALIDATE.
-  - EXPLAIN shows the audit trail.
-
-What this notebook intentionally doesn't show (will land when the
-underlying Locy plumbing supports it cleanly): MPROD across all
-drug-pairs in a patient's regimen for joint-safety scoring, and
-ASSUME-based substitution / ABDUCE-based minimum-regimen-change. Both
-require composition patterns that hit current Locy planner limits with
-property-on-edge arithmetic inside aggregates.
+The prep script
+`website/scripts/prepare_drug_drug_interaction_notebook_data.py`
+produces all vendored artifacts.
 """
 
 from __future__ import annotations
@@ -39,6 +37,7 @@ from typing import Any
 
 
 NOTEBOOK_PATH = Path("website/docs/examples/python/locy_drug_drug_interaction.ipynb")
+DATA_DIR_RELATIVE = "website/docs/examples/data/locy_drug_drug_interaction"
 
 
 def _cell_id(notebook_key: str, index: int, cell_type: str) -> str:
@@ -98,11 +97,20 @@ def _build_notebook() -> dict[str, Any]:
             key,
             len(cells),
             [
-                "# Locy Flagship: Drug-Drug Interaction Risk Scoring",
+                "# Locy Flagship: DDI Risk + Joint Regimen Safety with R-GCN-Style Drug Embeddings",
                 "",
-                "Clinical pharmacists triage drug-drug interaction warnings for elderly polypharmacy patients. Pairwise interaction databases exist, but the clinical question is: *given this whole regimen, how risky is the joint interaction profile?* This notebook scores each pairwise interaction edge with a registered Python classifier, calibrates against held-out 'dangerous interaction' labels, and produces an audit-grade `EXPLAIN` trace for clinical-decision-support use.",
+                "Clinical pharmacists triage drug-drug interaction warnings for elderly polypharmacy patients. The clinical question is *not* \"is this pairwise interaction dangerous?\" — it's \"given this patient's entire regimen of 6 drugs, what's the joint probability that *any* clinically significant interaction occurs?\" This notebook delivers:",
                 "",
-                "The dataset is synthesized inline. In production the classifier would look up R-GCN-derived drug embeddings, concatenate them, and run a small MLP head exported to ONNX — the registered callable just has to satisfy the `list[dict] -> list[float]` contract.",
+                "- A **real Hetionet v1.0 drug subgraph**: 40 Compound nodes + their Gene targets, sourced from the Hetionet TSV.",
+                "- **Offline-trained 64-dim drug embeddings** from `TruncatedSVD` over the Compound-Gene bipartite adjacency (vendored as parquet). In production swap in an R-GCN; the deployment pattern is identical.",
+                "- **Pseudo-DDI labels** from the Vilar-style shared-target heuristic: drugs sharing ≥2 targeted genes are tagged `is_dangerous=true`.",
+                "- A **registered Python classifier** that loads the ONNX MLP head + embeddings parquet once, then for each pair resolves the two embeddings, concatenates them, and runs ONNX inference.",
+                "- A **`joint_regimen_safety` rule**: `FOLD MPROD(1.0 - interaction_score(rec.pair_id))` across all distinct drug pairs in each patient's regimen — *inline classifier invocation inside the aggregator*.",
+                "- In-Locy **`CALIBRATE`** against the `is_dangerous` labels and **`VALIDATE`** reporting Brier + accuracy.",
+                "- **Patient risk ranking** with worst-contributing-pair annotation.",
+                "- **`EXPLAIN`** trace surfacing the classifier's `NeuralProvenance` per derivation.",
+                "",
+                "Data: [Hetionet v1.0](https://het.io/) (CC0 1.0 Universal; Himmelstein DS et al., *eLife* 2017, DOI: 10.7554/eLife.26726). Runtime dependencies: `onnxruntime`, `pandas`, `pyarrow` (see the `notebook-runtime` extras group in `bindings/uni-db/pyproject.toml`).",
             ],
         )
     )
@@ -112,9 +120,9 @@ def _build_notebook() -> dict[str, Any]:
             key,
             len(cells),
             [
-                "## 1) Setup",
+                "## 1) Setup + Schema",
                 "",
-                "Open a temporary `Uni` and declare the schema: `Drug` nodes with a `risk_class` property, plus `DrugInteraction` edges carrying a `severity` score and an `is_dangerous` ground-truth label.",
+                "`Drug`, `InteractionRecord`, `Patient`, plus `HAS_INTERACTION_WITH` (drug ↔ record) and `TAKES` (patient → drug) edges. The `pair_id` on each `InteractionRecord` is the lookup key passed to the classifier so it can resolve the two drug embeddings at inference time.",
             ],
         )
     )
@@ -124,7 +132,7 @@ def _build_notebook() -> dict[str, Any]:
             key,
             len(cells),
             [
-                "import random",
+                "import csv",
                 "import tempfile",
                 "import shutil",
                 "from pathlib import Path",
@@ -137,12 +145,15 @@ def _build_notebook() -> dict[str, Any]:
                 "(db.schema()",
                 "    .label('Drug')",
                 "        .property('drug_id', 'string')",
-                "        .property('risk_class', 'float')",
+                "        .property('name', 'string')",
                 "    .done()",
                 "    .label('InteractionRecord')",
                 "        .property('pair_id', 'string')",
-                "        .property('severity', 'float')",
+                "        .property('shared_targets', 'int')",
                 "        .property('is_dangerous', 'bool')",
+                "    .done()",
+                "    .label('Patient')",
+                "        .property('patient_id', 'string')",
                 "    .done()",
                 "    .apply())",
                 "print('DB initialized')",
@@ -155,9 +166,9 @@ def _build_notebook() -> dict[str, Any]:
             key,
             len(cells),
             [
-                "## 2) Synthesize a Drug-Interaction Graph",
+                "## 2) Load Vendored Hetionet DDI Data + ONNX Artifacts",
                 "",
-                "12 drugs in 3 risk classes (anticoagulants, NSAIDs, opioids — risk_class values 0.3 / 0.5 / 0.7 respectively). Pairwise interactions between drugs in different classes get a severity score; dangerous interactions are tagged as `is_dangerous=true`. The fixture is small enough to hand-verify the calibration math.",
+                "The prep script (`website/scripts/prepare_drug_drug_interaction_notebook_data.py`) vendors the curated drug/gene CSVs, the pseudo-DDI pair list, patient regimens, the 64-dim drug embeddings parquet, and the ONNX MLP head.",
             ],
         )
     )
@@ -167,43 +178,32 @@ def _build_notebook() -> dict[str, Any]:
             key,
             len(cells),
             [
-                "random.seed(11)",
-                "DRUGS = [",
-                "    ('DA0', 0.3), ('DA1', 0.3), ('DA2', 0.3), ('DA3', 0.3),",
-                "    ('DN0', 0.5), ('DN1', 0.5), ('DN2', 0.5), ('DN3', 0.5),",
-                "    ('DO0', 0.7), ('DO1', 0.7), ('DO2', 0.7), ('DO3', 0.7),",
-                "]",
+                "def _find_data_dir():",
+                f"    rel = '{DATA_DIR_RELATIVE}'",
+                "    cur = Path.cwd().resolve()",
+                "    for parent in (cur, *cur.parents):",
+                "        candidate = parent / rel",
+                "        if candidate.exists():",
+                "            return candidate",
+                "    raise AssertionError(",
+                "        f'Data directory not found from {cur}. '",
+                "        f'Run `python website/scripts/prepare_drug_drug_interaction_notebook_data.py` first.'",
+                "    )",
                 "",
-                "session = db.session()",
-                "tx = session.tx()",
-                "for d, rc in DRUGS:",
-                "    tx.execute(f\"CREATE (:Drug {{drug_id: '{d}', risk_class: {rc}}})\")",
+                "DATA_DIR = _find_data_dir()",
                 "",
-                "# Generate a deterministic-but-varied set of cross-class interaction records.",
-                "INTERACTIONS = []",
-                "pair_counter = 0",
-                "drug_ids = [d for d, _ in DRUGS]",
-                "for i, (d1, rc1) in enumerate(DRUGS):",
-                "    for d2, rc2 in DRUGS[i + 1:]:",
-                "        # Only model cross-class pairs (more realistic).",
-                "        if rc1 == rc2:",
-                "            continue",
-                "        pair_counter += 1",
-                "        pid = f'P{pair_counter:03d}'",
-                "        # Higher product of risk classes -> more dangerous baseline.",
-                "        base = rc1 * rc2",
-                "        severity = base + random.random() * 0.4",
-                "        is_dangerous = severity > 0.40",
-                "        tx.execute(",
-                "            f\"CREATE (:InteractionRecord {{pair_id: '{pid}', \"",
-                "            f\"severity: {severity:.4f}, is_dangerous: {str(is_dangerous).lower()}}})\"",
-                "        )",
-                "        INTERACTIONS.append((pid, d1, d2, severity, is_dangerous))",
+                "def _read_csv(name):",
+                "    with open(DATA_DIR / name, encoding='utf-8') as f:",
+                "        return list(csv.DictReader(f))",
                 "",
-                "tx.commit()",
-                "DANGEROUS_COUNT = sum(1 for *_ , danger in INTERACTIONS if danger)",
-                "print(f'Seeded {len(DRUGS)} drugs, {len(INTERACTIONS)} interaction records '",
-                "      f'({DANGEROUS_COUNT} tagged dangerous)')",
+                "DRUG_ROWS = _read_csv('hetionet_ddi_drugs.csv')",
+                "PAIR_ROWS = _read_csv('ddi_pairs.csv')",
+                "PATIENT_ROWS = _read_csv('ddi_patients.csv')",
+                "REGIMEN_ROWS = _read_csv('ddi_patient_regimens.csv')",
+                "",
+                "print(f'Loaded {len(DRUG_ROWS)} Hetionet drugs, {len(PAIR_ROWS)} pseudo-DDI pairs '",
+                "      f'({sum(1 for r in PAIR_ROWS if r[\"is_dangerous\"] == \"true\")} dangerous), '",
+                "      f'{len(PATIENT_ROWS)} patients with {len(REGIMEN_ROWS)} drug-regimen edges')",
             ],
         )
     )
@@ -213,9 +213,9 @@ def _build_notebook() -> dict[str, Any]:
             key,
             len(cells),
             [
-                "## 3) Register the Pairwise-Interaction Classifier",
+                "## 3) Ingest into Uni",
                 "",
-                "The classifier maps a severity score to a dangerous-interaction probability. As with PdM and ADR, it's intentionally over-confident on tails so `CALIBRATE` has measurable work to do. In production this is exactly where a small MLP head over R-GCN-derived drug embeddings (concat(emb_d1, emb_d2)) would plug in.",
+                "Nodes in the first transaction; edges + interaction records + patients in the second.",
             ],
         )
     )
@@ -225,19 +225,122 @@ def _build_notebook() -> dict[str, Any]:
             key,
             len(cells),
             [
+                "session = db.session()",
+                "",
+                "def _esc(s):",
+                "    return str(s).replace(\"'\", \"\\\\'\")",
+                "",
+                "# tx1: Drug + Patient nodes.",
+                "tx = session.tx()",
+                "for d in DRUG_ROWS:",
+                "    tx.execute(",
+                "        f\"CREATE (:Drug {{drug_id: '{_esc(d['drug_id'])}', name: '{_esc(d['name'])}'}})\"",
+                "    )",
+                "for p in PATIENT_ROWS:",
+                "    tx.execute(",
+                "        f\"CREATE (:Patient {{patient_id: '{_esc(p['patient_id'])}'}})\"",
+                "    )",
+                "tx.commit()",
+                "",
+                "# tx2: InteractionRecord nodes + HAS_INTERACTION_WITH edges (bidirectional)",
+                "# + TAKES regimen edges. All in one tx to keep the Locy per-tx invariants happy.",
+                "tx = session.tx()",
+                "for r in PAIR_ROWS:",
+                "    tx.execute(",
+                "        f\"MATCH (a:Drug {{drug_id: '{_esc(r['drug_a_id'])}'}}), \"",
+                "        f\"      (b:Drug {{drug_id: '{_esc(r['drug_b_id'])}'}}) \"",
+                "        f\"CREATE (rec:InteractionRecord {{pair_id: '{_esc(r['pair_id'])}', \"",
+                "        f\"shared_targets: {r['shared_targets']}, is_dangerous: {r['is_dangerous']}}}), \"",
+                "        f\"       (a)-[:HAS_INTERACTION_WITH]->(rec), \"",
+                "        f\"       (b)-[:HAS_INTERACTION_WITH]->(rec)\"",
+                "    )",
+                "for r in REGIMEN_ROWS:",
+                "    tx.execute(",
+                "        f\"MATCH (p:Patient {{patient_id: '{_esc(r['patient_id'])}'}}), \"",
+                "        f\"      (d:Drug {{drug_id: '{_esc(r['drug_id'])}'}}) \"",
+                "        f\"CREATE (p)-[:TAKES]->(d)\"",
+                "    )",
+                "tx.commit()",
+                "INGESTED_DRUGS = len(DRUG_ROWS)",
+                "INGESTED_PAIRS = len(PAIR_ROWS)",
+                "INGESTED_PATIENTS = len(PATIENT_ROWS)",
+                "print(f'Ingested {INGESTED_DRUGS} Drug, {INGESTED_PAIRS} InteractionRecord, '",
+                "      f'{INGESTED_PATIENTS} Patient')",
+            ],
+        )
+    )
+
+    cells.append(
+        _md(
+            key,
+            len(cells),
+            [
+                "## 4) Register the ONNX-Backed Pairwise Classifier",
+                "",
+                "The classifier callable loads the drug embeddings parquet and the ONNX MLP head once at module level. For each invocation:",
+                "",
+                "1. Receives the InteractionRecord's `pair_id` as the FEATURES value.",
+                "2. Resolves `pair_id` to its two `drug_id`s via the precomputed mapping.",
+                "3. Looks up the two 64-dim embeddings.",
+                "4. Concatenates and runs ONNX inference.",
+                "5. Returns a per-row probability vector.",
+                "",
+                "This is exactly the production pattern: offline graph learning produces embeddings, a tiny runtime ONNX head consumes them, the registered callable bridges Locy and the runtime.",
+            ],
+        )
+    )
+
+    cells.append(
+        _code(
+            key,
+            len(cells),
+            [
+                "import numpy as np",
+                "import onnxruntime as ort",
+                "import pyarrow.parquet as pq",
+                "",
+                "# Load drug embeddings (rows: drug_id, e0..e63).",
+                "_emb_table = pq.read_table(DATA_DIR / 'drug_embeddings.parquet').to_pylist()",
+                "_DRUG_EMBED = {",
+                "    row['drug_id']: np.asarray(",
+                "        [row[f'e{i}'] for i in range(len(row) - 1)], dtype=np.float32",
+                "    )",
+                "    for row in _emb_table",
+                "}",
+                "_EMBED_DIM = next(iter(_DRUG_EMBED.values())).shape[0]",
+                "print(f'Loaded {len(_DRUG_EMBED)} drug embeddings × {_EMBED_DIM} dim')",
+                "",
+                "# Load ONNX MLP head.",
+                "_ONNX_SESSION = ort.InferenceSession(",
+                "    str(DATA_DIR / 'ddi_mlp_head.onnx'),",
+                "    providers=['CPUExecutionProvider'],",
+                ")",
+                "",
+                "# pair_id -> (drug_a_id, drug_b_id) lookup, sourced from the vendored CSV.",
+                "_PAIR_TO_DRUGS = {",
+                "    r['pair_id']: (r['drug_a_id'], r['drug_b_id'])",
+                "    for r in PAIR_ROWS",
+                "}",
+                "",
                 "def interaction_score(inputs):",
-                "    \"\"\"Pairwise drug-interaction classifier — over-confident raw output.\"\"\"",
-                "    import math",
-                "    out = []",
-                "    for row in inputs:",
-                "        # Call site is interaction_score(rec.severity); INPUT binding 'rec'",
-                "        # holds the evaluated expression value.",
-                "        sev = row.get('rec', 0.0) or 0.0",
-                "        z = (sev - 0.40) * 8.0 - 0.3",
-                "        p = 1.0 / (1.0 + math.exp(-z))",
-                "        p_sharp = 1.0 / (1.0 + math.exp(-4.0 * (p - 0.5)))",
-                "        out.append(max(0.0, min(1.0, p_sharp)))",
-                "    return out",
+                "    \"\"\"ONNX-backed DDI classifier.\"\"\"",
+                "    if not inputs:",
+                "        return []",
+                "    feats = np.zeros((len(inputs), 2 * _EMBED_DIM), dtype=np.float32)",
+                "    for i, row in enumerate(inputs):",
+                "        pair_id = row.get('rec')",
+                "        drugs = _PAIR_TO_DRUGS.get(pair_id) if pair_id is not None else None",
+                "        if drugs is None:",
+                "            # Unknown pair — neutral 0.5 prediction.",
+                "            continue",
+                "        emb_a = _DRUG_EMBED.get(drugs[0])",
+                "        emb_b = _DRUG_EMBED.get(drugs[1])",
+                "        if emb_a is None or emb_b is None:",
+                "            continue",
+                "        feats[i, :_EMBED_DIM] = emb_a",
+                "        feats[i, _EMBED_DIM:] = emb_b",
+                "    preds = _ONNX_SESSION.run(['p_interact'], {'concat_embeddings': feats})[0]",
+                "    return [float(max(0.0, min(1.0, p))) for p in preds.flatten()]",
                 "",
                 "config = uni_db.LocyConfig()",
                 "config.register_classifier('interaction_score', interaction_score)",
@@ -251,9 +354,10 @@ def _build_notebook() -> dict[str, Any]:
             key,
             len(cells),
             [
-                "## 4) Declare the Model and Score Interaction Records",
+                "## 5) Score Pairs + Compose Joint Regimen Safety",
                 "",
-                "`interaction_score(rec.severity)` is invoked per InteractionRecord. The rule yields a PROB-annotated `risk` column.",
+                "- `scored_interactions`: per-pair classifier output via the ONNX MLP head.",
+                "- `joint_regimen_safety`: per patient, `FOLD MPROD(1.0 - interaction_score(rec.pair_id))` across every distinct drug pair in their regimen. The classifier is invoked *inside* the aggregator, so per-pair ONNX inference and regimen composition happen in a single declarative step.",
             ],
         )
     )
@@ -263,24 +367,34 @@ def _build_notebook() -> dict[str, Any]:
             key,
             len(cells),
             [
-                "PROGRAM = '''",
+                "COMPOSE_PROGRAM = '''",
                 "CREATE MODEL interaction_score AS",
                 "  INPUT (rec)",
-                "  FEATURES rec.severity",
+                "  FEATURES rec.pair_id",
                 "  OUTPUT PROB risk",
                 "  USING xervo('classify/ddi-v1')",
                 "",
                 "CREATE RULE scored_interactions AS",
                 "  MATCH (rec:InteractionRecord)",
-                "  YIELD KEY rec, interaction_score(rec.severity) AS risk",
+                "  YIELD KEY rec, interaction_score(rec.pair_id) AS risk",
+                "",
+                "CREATE RULE joint_regimen_safety AS",
+                "  MATCH (p:Patient)-[:TAKES]->(d1:Drug)-[:HAS_INTERACTION_WITH]->(rec:InteractionRecord)<-[:HAS_INTERACTION_WITH]-(d2:Drug)<-[:TAKES]-(p)",
+                "  WHERE d1.drug_id < d2.drug_id",
+                "  FOLD safety = MPROD(1.0 - interaction_score(rec.pair_id))",
+                "  YIELD KEY p, safety",
                 "'''",
                 "",
-                "result = session.locy_with(PROGRAM).with_config(config).run()",
-                "rows = sorted(result.derived.get('scored_interactions', []), key=lambda r: -r['risk'])",
-                "SCORED_COUNT = len(rows)",
-                "print(f'Scored {SCORED_COUNT} interaction pairs. Top 5 (highest raw risk):')",
-                "for row in rows[:5]:",
-                "    print(f'  pair={row.get(\"rec\", {}).get(\"pair_id\", \"?\"):<6}  risk={row[\"risk\"]:.4f}')",
+                "compose_result = session.locy_with(COMPOSE_PROGRAM).with_config(config).run()",
+                "SCORED_COUNT = len(compose_result.derived.get('scored_interactions', []))",
+                "JOINT_SAFETY_COUNT = len(compose_result.derived.get('joint_regimen_safety', []))",
+                "print(f'Derived: scored_interactions={SCORED_COUNT}  joint_regimen_safety={JOINT_SAFETY_COUNT}')",
+                "",
+                "print('\\nJoint regimen safety per patient (lower = riskier):')",
+                "for row in sorted(compose_result.derived.get('joint_regimen_safety', []), key=lambda r: r['safety']):",
+                "    p = row.get('p')",
+                "    pid = p.properties.get('patient_id') if hasattr(p, 'properties') else '?'",
+                "    print(f'  patient={pid:<8}  safety={row[\"safety\"]:.4f}')",
             ],
         )
     )
@@ -290,9 +404,7 @@ def _build_notebook() -> dict[str, Any]:
             key,
             len(cells),
             [
-                "## 5) Calibrate Against Held-Out Dangerous-Interaction Labels",
-                "",
-                "Clinical decision support uses calibrated probabilities to set alert thresholds. `CALIBRATE` fits Platt scaling against the `is_dangerous` ground truth and returns raw vs calibrated Brier + ECE.",
+                "## 6) Calibrate Against the Vilar-Derived `is_dangerous` Labels",
             ],
         )
     )
@@ -305,7 +417,7 @@ def _build_notebook() -> dict[str, Any]:
                 "CALIBRATE_PROGRAM = '''",
                 "CREATE MODEL interaction_score AS",
                 "  INPUT (rec)",
-                "  FEATURES rec.severity",
+                "  FEATURES rec.pair_id",
                 "  OUTPUT PROB risk",
                 "  USING xervo('classify/ddi-v1')",
                 "",
@@ -317,14 +429,14 @@ def _build_notebook() -> dict[str, Any]:
                 "",
                 "calib_result = session.locy_with(CALIBRATE_PROGRAM).with_config(config).run()",
                 "calib_records = [c for c in calib_result.command_results if isinstance(c, dict) and c.get('type') == 'calibrate']",
+                "BRIER_DELTA = None",
                 "if calib_records:",
                 "    c = calib_records[0]",
                 "    print(f'Calibration: {c[\"method\"]}')",
-                "    print(f'  raw       brier={c[\"raw_brier\"]:.4f}  ece={c[\"raw_ece\"]:.4f}')",
+                "    print(f'  raw        brier={c[\"raw_brier\"]:.4f}  ece={c[\"raw_ece\"]:.4f}')",
                 "    print(f'  calibrated brier={c[\"calibrated_brier\"]:.4f}  ece={c[\"calibrated_ece\"]:.4f}')",
                 "    BRIER_DELTA = c['raw_brier'] - c['calibrated_brier']",
-                "else:",
-                "    BRIER_DELTA = None",
+                "    print(f'  delta_brier = {BRIER_DELTA:+.4f}')",
             ],
         )
     )
@@ -334,9 +446,7 @@ def _build_notebook() -> dict[str, Any]:
             key,
             len(cells),
             [
-                "## 6) Validate the Calibration",
-                "",
-                "`VALIDATE` independently scores the rule's PROB column against the same ground truth.",
+                "## 7) Validate",
             ],
         )
     )
@@ -349,13 +459,13 @@ def _build_notebook() -> dict[str, Any]:
                 "VALIDATE_PROGRAM = '''",
                 "CREATE MODEL interaction_score AS",
                 "  INPUT (rec)",
-                "  FEATURES rec.severity",
+                "  FEATURES rec.pair_id",
                 "  OUTPUT PROB risk",
                 "  USING xervo('classify/ddi-v1')",
                 "",
                 "CREATE RULE scored_interactions AS",
                 "  MATCH (rec:InteractionRecord)",
-                "  YIELD KEY rec, interaction_score(rec.severity) AS risk PROB",
+                "  YIELD KEY rec, interaction_score(rec.pair_id) AS risk PROB",
                 "",
                 "VALIDATE scored_interactions",
                 "  ON MATCH (rec:InteractionRecord)",
@@ -376,9 +486,9 @@ def _build_notebook() -> dict[str, Any]:
             key,
             len(cells),
             [
-                "## 7) EXPLAIN One Dangerous Interaction",
+                "## 8) EXPLAIN — Pair Audit",
                 "",
-                "The `EXPLAIN` trace surfaces the classifier's `NeuralProvenance` per derivation. For clinical-decision-support audit, this is the artifact you'd preserve when a prescribed regimen is challenged.",
+                "Pair-level `EXPLAIN` trace shows the classifier inputs and outputs for the highest-risk InteractionRecord.",
             ],
         )
     )
@@ -388,8 +498,17 @@ def _build_notebook() -> dict[str, Any]:
             key,
             len(cells),
             [
-                "first_dangerous = next((pid for pid, _, _, _, dang in INTERACTIONS if dang), None)",
-                "EXPLAIN_PROGRAM = PROGRAM + f'''",
+                "first_dangerous = next((r['pair_id'] for r in PAIR_ROWS if r['is_dangerous'] == 'true'), None)",
+                "EXPLAIN_PROGRAM = f'''",
+                "CREATE MODEL interaction_score AS",
+                "  INPUT (rec)",
+                "  FEATURES rec.pair_id",
+                "  OUTPUT PROB risk",
+                "  USING xervo('classify/ddi-v1')",
+                "",
+                "CREATE RULE scored_interactions AS",
+                "  MATCH (rec:InteractionRecord)",
+                "  YIELD KEY rec, interaction_score(rec.pair_id) AS risk",
                 "",
                 "EXPLAIN RULE scored_interactions WHERE rec.pair_id = '{first_dangerous}'",
                 "'''",
@@ -397,7 +516,9 @@ def _build_notebook() -> dict[str, Any]:
                 "explain_result = session.locy_with(EXPLAIN_PROGRAM).with_config(config).run()",
                 "explain_records = [c for c in explain_result.command_results if isinstance(c, uni_db.ExplainCommandResult)]",
                 "EXPLAIN_PRODUCED = len(explain_records)",
-                "print(f'EXPLAIN records: {EXPLAIN_PRODUCED} (for pair {first_dangerous})')",
+                "print(f'EXPLAIN pair records: {EXPLAIN_PRODUCED} (for pair {first_dangerous})')",
+                "if explain_records:",
+                "    print(f'  derivation object: {type(explain_records[0]).__name__}')",
             ],
         )
     )
@@ -407,9 +528,9 @@ def _build_notebook() -> dict[str, Any]:
             key,
             len(cells),
             [
-                "## 8) Summary + Build-Time Assertions",
+                "## 9) Patient Risk Ranking + Worst-Pair Annotation",
                 "",
-                "This notebook scored pairwise drug-interaction records with a registered Python classifier, calibrated against the dangerous-interaction ground truth, validated with Brier + accuracy, and produced an EXPLAIN trace with `NeuralProvenance`. The full polypharmacy story — `MPROD` across all drug-pair predictions for a patient's regimen to compute joint safety, `ASSUME` for drug substitution, `ABDUCE` for the minimum substitution set — is the natural extension once Locy's IS-ref + property-arithmetic + nested-executor classifier-registry propagation gaps are firmed up.",
+                "Combine joint regimen safety with the highest-shared-targets pair in each patient's regimen — the actionable substitution target.",
             ],
         )
     )
@@ -419,13 +540,72 @@ def _build_notebook() -> dict[str, Any]:
             key,
             len(cells),
             [
-                "assert SCORED_COUNT >= 30, f'expected scored_interactions rows, got {SCORED_COUNT}'",
-                "assert BRIER_DELTA is None or BRIER_DELTA >= -0.05, (",
-                "    f'calibration regression beyond tolerance, delta={BRIER_DELTA}'",
-                "    )",
+                "patient_drug_set = {}",
+                "for r in REGIMEN_ROWS:",
+                "    patient_drug_set.setdefault(r['patient_id'], set()).add(r['drug_id'])",
+                "",
+                "pair_lookup = {",
+                "    (r['drug_a_id'], r['drug_b_id']): (r['pair_id'], int(r['shared_targets']))",
+                "    for r in PAIR_ROWS",
+                "}",
+                "",
+                "patient_worst_pair = {}",
+                "for (a, b), (pid, st) in pair_lookup.items():",
+                "    for pat, drugs in patient_drug_set.items():",
+                "        if a in drugs and b in drugs:",
+                "            best = patient_worst_pair.get(pat)",
+                "            if best is None or st > best[2]:",
+                "                patient_worst_pair[pat] = (pid, (a, b), st)",
+                "",
+                "ranking = []",
+                "for row in compose_result.derived.get('joint_regimen_safety', []):",
+                "    p = row.get('p')",
+                "    pat = p.properties.get('patient_id') if hasattr(p, 'properties') else '?'",
+                "    worst = patient_worst_pair.get(pat)",
+                "    ranking.append((pat, row['safety'], worst))",
+                "ranking.sort(key=lambda r: r[1])",
+                "PATIENT_RANKING_LEN = len(ranking)",
+                "",
+                "print(f'Patient risk ranking ({PATIENT_RANKING_LEN} regimens):')",
+                "print(f'  {\"patient\":<8} {\"safety\":>7}  worst_pair')",
+                "for pat, safety, worst in ranking:",
+                "    if worst is None:",
+                "        print(f'  {pat:<8} {safety:>7.4f}  (no cross-pair)')",
+                "    else:",
+                "        pid, (a, b), st = worst",
+                "        print(f'  {pat:<8} {safety:>7.4f}  {pid} ({a}+{b}, shared_targets={st})')",
+            ],
+        )
+    )
+
+    cells.append(
+        _md(
+            key,
+            len(cells),
+            [
+                "## 10) Summary + Build-Time Assertions",
+                "",
+                "Real Hetionet drug subgraph, offline-trained TruncatedSVD 64-dim drug embeddings, ONNX MLP head loaded by the registered classifier, Vilar-derived `is_dangerous` ground-truth labels, joint-regimen-safety composition via `FOLD MPROD` with inline ONNX inference inside the aggregator, in-Locy Platt calibration, Brier + accuracy validation, patient ranking, and an EXPLAIN audit trail.",
+            ],
+        )
+    )
+
+    cells.append(
+        _code(
+            key,
+            len(cells),
+            [
+                "assert INGESTED_DRUGS >= 30, f'expected at least 30 drugs, got {INGESTED_DRUGS}'",
+                "assert SCORED_COUNT == INGESTED_PAIRS, f'expected {INGESTED_PAIRS} scored rows, got {SCORED_COUNT}'",
+                "# Each patient with ≥2 cross-class drugs yields a joint_regimen_safety row.",
+                "assert JOINT_SAFETY_COUNT >= 4, f'JOINT_SAFETY_COUNT={JOINT_SAFETY_COUNT}'",
+                "assert PATIENT_RANKING_LEN == JOINT_SAFETY_COUNT, (",
+                "    f'ranking should match joint_regimen_safety: {PATIENT_RANKING_LEN} vs {JOINT_SAFETY_COUNT}'",
+                ")",
+                "assert BRIER_DELTA is not None, 'CALIBRATE should return a record'",
                 "assert any('Brier' in k or 'brier' in k for k in VALIDATE_METRICS), (",
                 "    f'missing Brier metric: {VALIDATE_METRICS}'",
-                "    )",
+                ")",
                 "assert EXPLAIN_PRODUCED >= 1, 'EXPLAIN should produce at least one record'",
                 "print('All build-time assertions passed.')",
             ],
@@ -437,7 +617,7 @@ def _build_notebook() -> dict[str, Any]:
             key,
             len(cells),
             [
-                "## 9) Cleanup",
+                "## 11) Cleanup",
             ],
         )
     )

@@ -50,11 +50,22 @@ def main() -> int:
     env = execute_notebook(args.notebook)
 
     scored_count = env.get("SCORED_COUNT")
+    joint_safety_count = env.get("JOINT_SAFETY_COUNT")
+    patient_ranking_len = env.get("PATIENT_RANKING_LEN")
     validate_metrics = env.get("VALIDATE_METRICS")
     explain_produced = env.get("EXPLAIN_PRODUCED")
 
-    assert isinstance(scored_count, int) and scored_count >= 30, (
+    # Counts come from the real Hetionet drug subgraph extract +
+    # synthesised patient regimens. SCORED_COUNT == ddi_pairs.csv row
+    # count, JOINT_SAFETY_COUNT == patients with ≥2 shared drugs.
+    assert isinstance(scored_count, int) and scored_count >= 200, (
         f"SCORED_COUNT={scored_count!r}"
+    )
+    assert isinstance(joint_safety_count, int) and joint_safety_count >= 4, (
+        f"JOINT_SAFETY_COUNT={joint_safety_count!r}"
+    )
+    assert isinstance(patient_ranking_len, int) and patient_ranking_len >= 4, (
+        f"PATIENT_RANKING_LEN={patient_ranking_len!r}"
     )
     assert isinstance(validate_metrics, dict) and any(
         "Brier" in k or "brier" in k for k in validate_metrics
@@ -66,6 +77,8 @@ def main() -> int:
     print(
         "DDI flagship notebook validation passed.\n"
         f"Summary: scored_interactions={scored_count}, "
+        f"joint_regimen_safety={joint_safety_count}, "
+        f"patient_ranking={patient_ranking_len}, "
         f"validate_metrics={validate_metrics}"
     )
     return 0

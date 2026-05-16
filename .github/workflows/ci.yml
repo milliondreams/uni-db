@@ -242,6 +242,12 @@ jobs:
       - name: Execute flagship Locy notebook (predictive maintenance)
         run: uv run --project bindings/uni-db python website/scripts/verify_predictive_maintenance_flagship_notebook.py
 
+      - name: Execute flagship Locy notebook (adverse drug reaction)
+        run: uv run --project bindings/uni-db python website/scripts/verify_adverse_drug_reaction_flagship_notebook.py
+
+      - name: Execute flagship Locy notebook (drug-drug interaction)
+        run: uv run --project bindings/uni-db python website/scripts/verify_drug_drug_interaction_flagship_notebook.py
+
       - name: Check Python formatting (uni-db)
         working-directory: bindings/uni-db
         run: uv run ruff format --check .

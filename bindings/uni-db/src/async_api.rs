@@ -3409,6 +3409,46 @@ impl AsyncTxExecuteBuilder {
             })
         })
     }
+
+    /// Profile the mutation. Returns an awaitable resolving to
+    /// `(ExecuteResult, ProfileOutput)`. Mirrors the sync
+    /// `TxExecuteBuilder.profile()` and the read-path
+    /// `AsyncSessionQueryBuilder.profile()`.
+    fn profile<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let mut rust_params = HashMap::new();
+        for (k, v) in &self.params {
+            let val = convert::py_object_to_value(py, v)?;
+            rust_params.insert(k.clone(), val);
+        }
+        let inner = self.inner.clone();
+        let cypher = self.cypher.clone();
+        let timeout_secs = self.timeout_secs;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let guard = inner.lock().await;
+            let tx = guard.as_ref().ok_or_else(|| {
+                crate::exceptions::UniTransactionAlreadyCompletedError::new_err(
+                    "Transaction already completed",
+                )
+            })?;
+            let mut builder = tx.execute_with(&cypher);
+            for (k, v) in rust_params {
+                builder = builder.param(k, v);
+            }
+            if let Some(t) = timeout_secs {
+                builder = builder.timeout(std::time::Duration::from_secs_f64(t));
+            }
+            let (result, profile) = builder
+                .profile()
+                .await
+                .map_err(crate::exceptions::uni_error_to_pyerr)?;
+            Python::attach(|py| {
+                let exec_result = convert::execute_result_to_py(py, result)?;
+                let profile_output = convert::profile_output_to_py_class(py, profile)?;
+                let tuple = (exec_result, profile_output);
+                Ok(tuple.into_pyobject(py)?.into_any().unbind())
+            })
+        })
+    }
 }
 
 /// Async builder for Locy evaluation on a Transaction.

@@ -82,3 +82,74 @@ async fn test_profile_basic() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// Profile a transaction WRITE via `tx.execute_with(cypher).profile()`.
+/// Asserts that the returned `(ExecuteResult, ProfileOutput)` carries both
+/// (a) mutation counters from the tx's private L0 and (b) profile stats.
+#[tokio::test]
+async fn test_tx_profile_create_returns_execute_result_and_profile_output() -> anyhow::Result<()> {
+    let temp_dir = tempdir()?;
+    let db = UniBuilder::new(temp_dir.path().to_str().unwrap().to_string())
+        .build()
+        .await?;
+
+    // Schema
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL Person (name STRING, age INT)")
+        .await?;
+    tx.commit().await?;
+
+    // Profile a CREATE inside a transaction.
+    let tx = db.session().tx().await?;
+    let (res, prof) = tx
+        .execute_with("CREATE (p:Person {name: 'Alice', age: 30}) RETURN p")
+        .profile()
+        .await?;
+    tx.commit().await?;
+
+    assert_eq!(
+        res.nodes_created(),
+        1,
+        "expected 1 node created, got {}",
+        res.nodes_created()
+    );
+    assert_eq!(res.properties_set(), 2);
+    assert!(
+        !prof.runtime_stats.is_empty(),
+        "expected runtime_stats to be populated, got empty"
+    );
+    let _ = prof.total_time_ms;
+
+    Ok(())
+}
+
+/// Profile a parametrised transaction write via `.param(...).profile()`.
+#[tokio::test]
+async fn test_tx_profile_with_params() -> anyhow::Result<()> {
+    let temp_dir = tempdir()?;
+    let db = UniBuilder::new(temp_dir.path().to_str().unwrap().to_string())
+        .build()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL Item (sku STRING, qty INT)").await?;
+    tx.execute("CREATE (:Item {sku: 'A', qty: 1})").await?;
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    let (res, prof) = tx
+        .execute_with("MATCH (i:Item {sku: $sku}) SET i.qty = $qty RETURN i")
+        .param("sku", "A")
+        .param("qty", 42i64)
+        .profile()
+        .await?;
+    tx.commit().await?;
+
+    assert!(res.properties_set() >= 1, "expected at least 1 property set");
+    assert!(
+        !prof.runtime_stats.is_empty(),
+        "expected runtime_stats to be populated, got empty"
+    );
+
+    Ok(())
+}

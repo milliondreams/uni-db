@@ -23,7 +23,7 @@ use uni_common::{Result, UniError};
 use uni_locy::DerivedFactSet;
 
 use crate::api::locy_result::LocyResult;
-use uni_query::{ExecuteResult, QueryCursor, QueryResult, Row, Value};
+use uni_query::{ExecuteResult, ProfileOutput, QueryCursor, QueryResult, Row, Value};
 
 /// Snapshot of L0 mutation state, used for before/after comparison in execute operations.
 struct L0Snapshot {
@@ -840,6 +840,40 @@ impl<'a> ExecuteBuilder<'a> {
         let after = self.tx.snapshot_l0();
         Ok(Transaction::compute_execute_result(
             &before, &after, &result,
+        ))
+    }
+
+    /// Execute the mutation with profiling, returning the [`ExecuteResult`]
+    /// (mutation counters from the tx's private L0) together with the
+    /// [`ProfileOutput`] (per-operator timings and memory).
+    ///
+    /// Mirrors `Session::query(cypher).profile()` for the write path:
+    /// the mutation is routed through the transaction's private L0
+    /// (commit-time serialization), so writes are only visible after
+    /// `tx.commit().await?`. The captured profile includes both the
+    /// DataFusion runtime stats and the DDL/admin aggregate stat where
+    /// applicable.
+    pub async fn profile(self) -> Result<(ExecuteResult, ProfileOutput)> {
+        self.tx.check_completed()?;
+        let before = self.tx.snapshot_l0();
+        let fut = self.tx.db.profile_internal_with_tx_l0(
+            &self.cypher,
+            self.params,
+            self.tx.tx_l0.clone(),
+        );
+        let (result, profile) = if let Some(t) = self.timeout {
+            tokio::time::timeout(t, fut)
+                .await
+                .map_err(|_| UniError::Timeout {
+                    timeout_ms: t.as_millis() as u64,
+                })??
+        } else {
+            fut.await?
+        };
+        let after = self.tx.snapshot_l0();
+        Ok((
+            Transaction::compute_execute_result(&before, &after, &result),
+            profile,
         ))
     }
 }

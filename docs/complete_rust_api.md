@@ -116,7 +116,7 @@ Fluent builders are created by `*_with()` methods. Each builder ends with a doma
 | `QueryBuilder` | `session.query_with()` | `.fetch_all()`, `.fetch_one()`, `.cursor()`, `.explain()`, `.profile()` |
 | `LocyBuilder` | `session.locy_with()` | `.run()`, `.explain()` |
 | `TxQueryBuilder` | `tx.query_with()` | `.fetch_all()`, `.fetch_one()`, `.cursor()`, `.execute()` |
-| `ExecuteBuilder` | `tx.execute_with()` | `.run()` |
+| `ExecuteBuilder` | `tx.execute_with()` | `.run()`, `.profile()` |
 | `ApplyBuilder` | `tx.apply_with()` | `.run()` |
 | `TxLocyBuilder` | `tx.locy_with()` | `.run()` |
 | `TransactionBuilder` | `session.tx_with()` | `.start()` |
@@ -833,6 +833,10 @@ impl<'a> ExecuteBuilder<'a> {
 
     /// Execute the mutation.
     pub async fn run(self) -> Result<ExecuteResult>;
+
+    /// Execute the mutation with profiling.
+    /// Returns mutation counters + per-operator timings/memory.
+    pub async fn profile(self) -> Result<(ExecuteResult, ProfileOutput)>;
 }
 ```
 
@@ -2562,7 +2566,7 @@ All sync builders have the same methods as their async counterparts with `async 
 - `QueryBuilderSync<'s, 'a>` — `.param()`, `.params()`, `.timeout()`, `.max_memory()`, `.fetch_all()`, `.fetch_one()`
 - `LocyBuilderSync<'s, 'a>` — `.param()`, `.params()`, `.timeout()`, `.max_iterations()`, `.with_config()`, `.run()`
 - `TransactionBuilderSync<'s, 'a>` — `.timeout()`, `.isolation()`, `.start()`
-- `ExecuteBuilderSync<'t, 'a>` — `.param()`, `.params()`, `.timeout()`, `.run()`
+- `ExecuteBuilderSync<'t, 'a>` — `.param()`, `.params()`, `.timeout()`, `.run()`, `.profile()`
 - `TxQueryBuilderSync<'t, 'a>` — `.param()`, `.execute()`, `.fetch_all()`, `.fetch_one()`
 - `ApplyBuilderSync<'t, 'a>` — `.require_fresh()`, `.max_version_gap()`, `.run()`
 - `TxLocyBuilderSync<'t, 'a>` — `.param()`, `.params()`, `.timeout()`, `.max_iterations()`, `.with_config()`, `.run()`

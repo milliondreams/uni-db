@@ -182,3 +182,44 @@ async def test_operations_after_rollback_raise_error(async_social_db):
 
     with pytest.raises(uni_db.UniTransactionAlreadyCompletedError):
         await tx.query("CREATE (p:Person {name: 'Mia', age: 75})")
+
+
+@pytest.mark.asyncio
+async def test_tx_execute_builder_profile_returns_execute_result_and_profile(
+    async_social_db,
+):
+    """Async `tx.execute_with(cypher).profile()` returns (ExecuteResult, ProfileOutput)."""
+    session = async_social_db.session()
+
+    tx = await session.tx()
+    res, prof = await tx.execute_with(
+        "CREATE (p:Person {name: 'AsyncProfileAlice', age: 31}) RETURN p"
+    ).profile()
+    await tx.commit()
+
+    assert res.nodes_created == 1
+    assert res.properties_set == 2
+    assert prof.total_time_ms is not None
+    assert len(prof.operators) > 0
+
+
+@pytest.mark.asyncio
+async def test_tx_execute_builder_profile_with_params(async_social_db):
+    """Async parametrised `.param().profile()` returns full profile + counters."""
+    session = async_social_db.session()
+
+    tx = await session.tx()
+    await tx.execute("CREATE (p:Person {name: 'AsyncProfileBob', age: 40})")
+    await tx.commit()
+
+    tx = await session.tx()
+    res, prof = await (
+        tx.execute_with("MATCH (p:Person {name: $name}) SET p.age = $age RETURN p")
+        .param("name", "AsyncProfileBob")
+        .param("age", 41)
+        .profile()
+    )
+    await tx.commit()
+
+    assert res.properties_set >= 1
+    assert len(prof.operators) > 0

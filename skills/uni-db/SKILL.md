@@ -63,7 +63,7 @@ Transaction / AsyncTransaction (write scope)
 |---|---|---|
 | `SessionQueryBuilder` | `session.query_with(cypher)` | `.fetch_all()`, `.fetch_one()`, `.cursor()` |
 | `SessionLocyBuilder` | `session.locy_with(program)` | `.run()` |
-| `TxExecuteBuilder` | `tx.execute_with(cypher)` | `.run()` |
+| `TxExecuteBuilder` | `tx.execute_with(cypher)` | `.run()`, `.profile()` |
 | `TxQueryBuilder` | `tx.query_with(cypher)` | `.fetch_all()`, `.fetch_one()`, `.execute()` |
 | `SchemaBuilder` | `db.schema()` | `.apply()` |
 | `BulkWriterBuilder` | `tx.bulk_writer()` | `.build()` |

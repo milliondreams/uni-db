@@ -252,3 +252,40 @@ def test_rollback_after_partial_writes(social_db):
         "MATCH (p:Person {name: 'Alice'}) RETURN p.name AS name"
     )
     assert len(alice_results) == 1
+
+
+def test_tx_execute_builder_profile_returns_execute_result_and_profile(social_db):
+    """`tx.execute_with(cypher).profile()` returns (ExecuteResult, ProfileOutput)."""
+    session = social_db.session()
+
+    tx = session.tx()
+    res, prof = tx.execute_with(
+        "CREATE (p:Person {name: 'ProfileAlice', age: 31}) RETURN p"
+    ).profile()
+    tx.commit()
+
+    assert res.nodes_created == 1
+    assert res.properties_set == 2
+    assert prof.total_time_ms is not None
+    assert len(prof.operators) > 0
+
+
+def test_tx_execute_builder_profile_with_params(social_db):
+    """Parametrised `.param().profile()` returns full profile + correct counters."""
+    session = social_db.session()
+
+    tx = session.tx()
+    tx.execute("CREATE (p:Person {name: 'ProfileBob', age: 40})")
+    tx.commit()
+
+    tx = session.tx()
+    res, prof = (
+        tx.execute_with("MATCH (p:Person {name: $name}) SET p.age = $age RETURN p")
+        .param("name", "ProfileBob")
+        .param("age", 41)
+        .profile()
+    )
+    tx.commit()
+
+    assert res.properties_set >= 1
+    assert len(prof.operators) > 0

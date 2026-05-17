@@ -1434,6 +1434,35 @@ impl PyTxExecuteBuilder {
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
         convert::execute_result_to_py(py, result)
     }
+
+    /// Execute the mutation with profiling. Returns
+    /// `(ExecuteResult, ProfileOutput)`: the first carries mutation
+    /// counters from the transaction's private L0, the second carries
+    /// per-operator timings/memory. Mirrors `SessionQueryBuilder.profile`
+    /// for the write path.
+    fn profile(
+        &self,
+        py: Python,
+    ) -> PyResult<(crate::types::PyExecuteResult, crate::types::PyProfileOutput)> {
+        let tx_ref = self.tx.borrow(py);
+        let tx = tx_ref.inner.as_ref().ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Transaction already completed")
+        })?;
+        let mut builder = tx.execute_with(&self.cypher);
+        for (k, v) in &self.params {
+            let val = convert::py_object_to_value(py, v)?;
+            builder = builder.param(k, val);
+        }
+        if let Some(t) = self.timeout_secs {
+            builder = builder.timeout(std::time::Duration::from_secs_f64(t));
+        }
+        let (result, profile) = pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(builder.profile())
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
+        let exec_result = convert::execute_result_to_py(py, result)?;
+        let profile_output = convert::profile_output_to_py_class(py, profile)?;
+        Ok((exec_result, profile_output))
+    }
 }
 
 /// Builder for Locy evaluation on a Transaction.

@@ -3446,7 +3446,8 @@ Session (read scope)
 
 Transaction (write scope)
   ├─ Reads: query() (sees uncommitted writes)
-  ├─ Writes: execute(), bulk_insert_*(), bulk_writer()
+  ├─ Writes: execute(), execute_with() → ExecuteBuilder, bulk_insert_*(), bulk_writer()
+  ├─ Analysis: execute_with().profile() → (ExecuteResult, ProfileOutput)
   ├─ Locy: locy() (DERIVE auto-applies to tx L0)
   ├─ Apply: apply(derived_fact_set)
   └─ Lifecycle: commit(), rollback(), drop (auto-rollback)
@@ -3532,6 +3533,17 @@ let result = session.query_with("MATCH (n:Person) WHERE n.age > $min_age RETURN 
 // Explain and profile are builder terminals
 let plan = session.query_with("MATCH (n:Person) RETURN n").explain().await?;
 let (result, profile) = session.query_with("MATCH (n) RETURN n").profile().await?;
+
+// Profile also works on tx writes — `tx.execute_with(cypher).profile()`
+// returns (ExecuteResult, ProfileOutput): the mutation counters from the
+// tx's private L0 plus per-operator timings.
+let tx = session.tx().await?;
+let (exec_res, write_profile) = tx
+    .execute_with("CREATE (p:Person {name: $name})")
+    .param("name", "Alice")
+    .profile()
+    .await?;
+tx.commit().await?;
 
 // Get a parameter value
 let user_id = session.params().get("user_id");
@@ -3933,6 +3945,17 @@ print(plan.index_usage)
 
 # PROFILE (execute + timing)
 result, stats = session.query_with("MATCH (n:Person) RETURN n").profile()
+
+# PROFILE a transaction write — returns (ExecuteResult, ProfileOutput).
+# The async equivalent on AsyncTxExecuteBuilder returns an awaitable.
+with session.tx() as tx:
+    exec_res, write_stats = (
+        tx.execute_with("CREATE (p:Person {name: $name})")
+        .param("name", "Alice")
+        .profile()
+    )
+    tx.commit()
+    print(exec_res.nodes_created, write_stats.total_time_ms)
 ```
 
 ### Schema Management

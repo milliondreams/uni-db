@@ -377,6 +377,19 @@ println!("Version: {}, Mutations: {}", result.version, result.mutations_committe
 | `params(iter)` | `Self` | Bind multiple parameters. |
 | `timeout(duration)` | `Self` | Set maximum execution time. |
 | `run()` | `Result<ExecuteResult>` | Execute the mutation. |
+| `profile()` | `Result<(ExecuteResult, ProfileOutput)>` | Execute the mutation with profiling. |
+
+```rust
+// Profile a transaction write end-to-end
+let tx = session.tx().await?;
+let (res, prof) = tx
+    .execute_with("CREATE (p:Person {name: $name}) RETURN p")
+    .param("name", "Alice")
+    .profile()
+    .await?;
+tx.commit().await?;
+println!("nodes_created = {}, total_time_ms = {}", res.nodes_created(), prof.total_time_ms);
+```
 
 ### DerivedFactSet Application
 
@@ -1139,7 +1152,7 @@ Mirrors the `Session` API, with all async methods wrapped in `block_on()`.
 | `query(cypher)` | `Result<QueryResult>` | |
 | `query_with(cypher)` | `TxQueryBuilderSync` | |
 | `execute(cypher)` | `Result<ExecuteResult>` | |
-| `execute_with(cypher)` | `ExecuteBuilderSync` | `.param().run()` |
+| `execute_with(cypher)` | `ExecuteBuilderSync` | `.param().run()`, `.param().profile()` |
 | `locy(program)` | `Result<LocyResult>` | |
 | `locy_with(program)` | `TxLocyBuilderSync` | `.param().run()` |
 | `apply(derived)` | `Result<ApplyResult>` | |

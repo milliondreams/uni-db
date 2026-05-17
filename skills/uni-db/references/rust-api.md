@@ -50,7 +50,7 @@ async fn main() -> uni_db::Result<()> {
 | `QueryBuilder` | `session.query_with()` | `.fetch_all()`, `.fetch_one()`, `.cursor()`, `.explain()`, `.profile()` |
 | `LocyBuilder` | `session.locy_with()` | `.run()`, `.explain()` |
 | `TxQueryBuilder` | `tx.query_with()` | `.fetch_all()`, `.fetch_one()`, `.cursor()`, `.execute()` |
-| `ExecuteBuilder` | `tx.execute_with()` | `.run()` |
+| `ExecuteBuilder` | `tx.execute_with()` | `.run()`, `.profile()` |
 | `ApplyBuilder` | `tx.apply_with()` | `.run()` |
 | `TxLocyBuilder` | `tx.locy_with()` | `.run()` |
 | `TransactionBuilder` | `session.tx_with()` | `.start()` |
@@ -254,7 +254,7 @@ impl<'a> LocyBuilder<'a> {
 
 ### Other builders (tx-level)
 
-- **`ExecuteBuilder`** (`tx.execute_with()`): `.param()`, `.params()`, `.timeout()` -> `.run()` -> `ExecuteResult`
+- **`ExecuteBuilder`** (`tx.execute_with()`): `.param()`, `.params()`, `.timeout()` -> `.run()` -> `ExecuteResult` | `.profile()` -> `(ExecuteResult, ProfileOutput)`
 - **`TxQueryBuilder`** (`tx.query_with()`): `.param()`, `.timeout()`, `.cancellation_token()` -> `.execute()` / `.fetch_all()` / `.fetch_one()` / `.cursor()`
 - **`ApplyBuilder`** (`tx.apply_with()`): `.require_fresh()`, `.max_version_gap(n)` -> `.run()` -> `ApplyResult`
 - **`TxLocyBuilder`** (`tx.locy_with()`): same as `LocyBuilder`; `.run()` auto-applies DERIVE to tx's L0

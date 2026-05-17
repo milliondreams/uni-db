@@ -477,6 +477,90 @@ impl crate::api::UniInner {
         ))
     }
 
+    /// Profile a Cypher query within a transaction's private L0 buffer.
+    ///
+    /// Parallel to [`Self::execute_internal_with_tx_l0`] but invokes
+    /// `Executor::profile`, returning per-operator timing/memory stats
+    /// alongside the result rows. The tx_l0 is installed on the executor
+    /// so mutations land in the caller's private L0 (commit-time
+    /// serialization) — this is what lets `ExecuteBuilder::profile()`
+    /// profile a transaction write end-to-end.
+    pub(crate) async fn profile_internal_with_tx_l0(
+        &self,
+        cypher: &str,
+        params: HashMap<String, ApiValue>,
+        tx_l0: std::sync::Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>,
+    ) -> Result<(QueryResult, ProfileOutput)> {
+        let ast = uni_cypher::parse(cypher).map_err(into_parse_error)?;
+
+        let (ast, tt_spec) = match ast {
+            uni_cypher::ast::Query::TimeTravel { query, spec } => (*query, Some(spec)),
+            other => (other, None),
+        };
+
+        if tt_spec.is_some() {
+            return Err(UniError::Query {
+                message: "Time-travel queries are not supported within transactions".to_string(),
+                query: Some(cypher.to_string()),
+            });
+        }
+
+        let planner =
+            uni_query::QueryPlanner::new(self.schema.schema().clone()).with_params(params.clone());
+        let logical_plan = planner.plan(ast).map_err(|e| into_query_error(e, cypher))?;
+        let logical_plan = uni_query::rewrite_for_fork_fusion(logical_plan, &*self.storage);
+
+        let mut executor = uni_query::Executor::new(self.storage.clone());
+        executor.set_config(self.config.clone());
+        executor.set_xervo_runtime(self.xervo_runtime.clone());
+        executor.set_procedure_registry(self.procedure_registry.clone());
+        if let Ok(reg) = self.custom_functions.read()
+            && !reg.is_empty()
+        {
+            executor.set_custom_functions(Arc::new(reg.clone()));
+        }
+        if let Some(w) = &self.writer {
+            executor.set_writer(w.clone());
+        }
+        executor.set_transaction_l0(tx_l0);
+
+        let projection_order = extract_projection_order(&logical_plan);
+
+        let (results, profile_output) = executor
+            .profile(logical_plan, &params)
+            .await
+            .map_err(|e| into_execution_error(e, cypher))?;
+
+        let columns = if results.is_empty() {
+            Arc::new(vec![])
+        } else if let Some(order) = projection_order {
+            Arc::new(order)
+        } else {
+            let mut cols: Vec<String> = results[0].keys().cloned().collect();
+            cols.sort();
+            Arc::new(cols)
+        };
+
+        let rows: Vec<Row> = results
+            .into_iter()
+            .map(|map| {
+                let mut values = Vec::with_capacity(columns.len());
+                for col in columns.iter() {
+                    let value = map.get(col).cloned().unwrap_or(ApiValue::Null);
+                    let normalized =
+                        ResultNormalizer::normalize_value(value).unwrap_or(ApiValue::Null);
+                    values.push(normalized);
+                }
+                Row::new(columns.clone(), values)
+            })
+            .collect();
+
+        Ok((
+            QueryResult::new(columns, rows, executor.take_warnings(), Default::default()),
+            profile_output,
+        ))
+    }
+
     /// Execute a cursor query with a private transaction L0 buffer.
     ///
     /// Mirrors `execute_cursor_internal_with_config` but installs the

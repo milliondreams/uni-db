@@ -1729,16 +1729,16 @@ async fn collect_neural_calls_for_row(
         // there, surface it directly — this is the only path that
         // populates calibrated_probability + confidence_band for
         // Python-registered classifiers.
-        if let Some(store) = provenance_store {
-            if let Some(record) = store.get(&invocation.model_name, input_hash) {
-                out.push(uni_locy::NeuralProvenance {
-                    model_name: invocation.model_name.clone(),
-                    raw_probability: record.raw_probability,
-                    calibrated_probability: record.calibrated_probability,
-                    confidence_band: record.confidence_band,
-                });
-                continue;
-            }
+        if let Some(store) = provenance_store
+            && let Some(record) = store.get(&invocation.model_name, input_hash)
+        {
+            out.push(uni_locy::NeuralProvenance {
+                model_name: invocation.model_name.clone(),
+                raw_probability: record.raw_probability,
+                calibrated_probability: record.calibrated_probability,
+                confidence_band: record.confidence_band,
+            });
+            continue;
         }
 
         // Fallback: re-invoke the classifier. Only reached when the

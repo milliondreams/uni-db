@@ -676,9 +676,19 @@ fn topk_dnf_disjunction(
         // Single-row Proof. Base weights for the DNF: assign the row's
         // weight to each base RV under it (when no support exists,
         // base_rvs is empty and the proof's weight stands alone).
+        // When multiple rows share the same base RV (shared-proof case),
+        // take max — deterministic regardless of row visit order, and
+        // a conservative upper bound for the noisy-OR DNF.
         if base_rvs.iter().count() > 0 {
             for rv in base_rvs.iter() {
-                base_weights.entry(rv).or_insert(weight);
+                base_weights
+                    .entry(rv)
+                    .and_modify(|w| {
+                        if weight > *w {
+                            *w = weight;
+                        }
+                    })
+                    .or_insert(weight);
             }
         }
         proofs.push(Proof {

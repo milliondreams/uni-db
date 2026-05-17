@@ -1222,7 +1222,9 @@ impl SchemaManager {
         data_type: DataType,
         expr: String,
     ) -> Result<()> {
-        validate_property_name(prop_name)?;
+        // System-generated `_gen_*` columns bypass the underscore-prefix rule
+        // but must still avoid storage-layer column-name collisions.
+        validate_reserved_property_name(prop_name)?;
         let mut guard = acquire_write(&self.schema, "schema")?;
         let schema = Arc::make_mut(&mut *guard);
         let version = schema.schema_version;
@@ -1497,6 +1499,16 @@ pub fn validate_property_name(name: &str) -> Result<()> {
             name
         ));
     }
+    validate_reserved_property_name(name)
+}
+
+/// Reject names that collide with storage-layer Arrow column names.
+///
+/// Used both by `validate_property_name` (user-facing path) and directly by
+/// `add_generated_property` (system-generated `_gen_*` path) — the latter
+/// needs to bypass the underscore-prefix rule but must still reject the
+/// fixed-name collisions below.
+fn validate_reserved_property_name(name: &str) -> Result<()> {
     // Unprefixed names that get appended alongside user properties in the
     // per-label vertex (`storage/vertex.rs`), per-edge-type edge
     // (`storage/edge.rs`), or per-edge-type delta (`storage/delta.rs`)
@@ -1505,14 +1517,7 @@ pub fn validate_property_name(name: &str) -> Result<()> {
     // flush time. Fixed-schema-only columns (`type`, `props_json`,
     // `labels` in the main tables) are NOT listed: those tables don't
     // append user properties, so no collision can occur.
-    const RESERVED_PROPS: &[&str] = &[
-        "ext_id",
-        "overflow_json",
-        "eid",
-        "src_vid",
-        "dst_vid",
-        "op",
-    ];
+    const RESERVED_PROPS: &[&str] = &["ext_id", "overflow_json", "eid", "src_vid", "dst_vid", "op"];
     if RESERVED_PROPS.contains(&name) {
         return Err(anyhow!(
             "Property name '{}' is reserved by the storage layer; please choose a different name",
@@ -1582,14 +1587,7 @@ mod tests {
         // Unprefixed reserved names — these collide with internal Arrow
         // columns in storage tables and previously caused Lance
         // "Duplicate field name" errors at flush time.
-        for reserved in &[
-            "ext_id",
-            "overflow_json",
-            "eid",
-            "src_vid",
-            "dst_vid",
-            "op",
-        ] {
+        for reserved in &["ext_id", "overflow_json", "eid", "src_vid", "dst_vid", "op"] {
             let err = manager
                 .add_property("Tiny", reserved, DataType::String, true)
                 .expect_err(&format!("expected '{reserved}' to be rejected"));

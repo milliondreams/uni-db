@@ -873,10 +873,10 @@ impl DerivedFactSource for NativeExecutionAdapter<'_> {
             && let Ok(batches) = self.execute_query_ast(ast).await
         {
             for row in record_batches_to_locy_rows(&batches) {
-                if let (Some(Value::Int(vid)), Some(node)) = (row.get("_vid"), row.get("n")) {
-                    if *vid >= 0 {
-                        out.insert(*vid as u64, node.clone());
-                    }
+                if let (Some(Value::Int(vid)), Some(node)) = (row.get("_vid"), row.get("n"))
+                    && *vid >= 0
+                {
+                    out.insert(*vid as u64, node.clone());
                 }
             }
         }

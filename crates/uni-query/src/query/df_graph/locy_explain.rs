@@ -21,7 +21,9 @@ use super::locy_delta::{
     KeyTuple, RowStore, extract_cypher_conditions, extract_key, resolve_clause_with_is_refs,
 };
 
-use super::locy_eval::{eval_expr, normalize_graph_row, record_batches_to_locy_rows, values_equal_for_join};
+use super::locy_eval::{
+    eval_expr, normalize_graph_row, record_batches_to_locy_rows, values_equal_for_join,
+};
 use super::locy_slg::SLGResolver;
 use super::locy_traits::DerivedFactSource;
 
@@ -209,9 +211,15 @@ pub async fn explain_rule(
     // Mode A: provenance-based (no re-execution required).
     // Falls through to Mode B when tracker is absent or has no matching entries.
     if let Some(t) = tracker
-        && let Ok(node) =
-            explain_rule_mode_a(query, program, t, fact_source, derived_store, approximate_groups)
-                .await
+        && let Ok(node) = explain_rule_mode_a(
+            query,
+            program,
+            t,
+            fact_source,
+            derived_store,
+            approximate_groups,
+        )
+        .await
     {
         return Ok(node);
     }

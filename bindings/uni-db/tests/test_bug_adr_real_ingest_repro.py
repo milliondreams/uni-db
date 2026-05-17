@@ -25,8 +25,8 @@ import os
 from pathlib import Path
 
 import pytest
-import uni_db
 
+import uni_db
 
 # Override via env var to point at a larger / uncapped data directory
 # without modifying the vendored CSVs. Example:
@@ -134,17 +134,13 @@ def _count(db, query: str) -> int:
 def _edge_counts(db) -> dict:
     return {
         "TARGETS": _count(db, "MATCH ()-[r:TARGETS]->() RETURN count(r) AS cnt"),
-        "IN_PATHWAY": _count(
-            db, "MATCH ()-[r:IN_PATHWAY]->() RETURN count(r) AS cnt"
-        ),
+        "IN_PATHWAY": _count(db, "MATCH ()-[r:IN_PATHWAY]->() RETURN count(r) AS cnt"),
         "CAUSES": _count(db, "MATCH ()-[r:CAUSES]->() RETURN count(r) AS cnt"),
         "OF_DRUG": _count(db, "MATCH ()-[r:OF_DRUG]->() RETURN count(r) AS cnt"),
         "REPORTS_EVENT": _count(
             db, "MATCH ()-[r:REPORTS_EVENT]->() RETURN count(r) AS cnt"
         ),
-        "Report_NODES": _count(
-            db, "MATCH (r:Report) RETURN count(r) AS cnt"
-        ),
+        "Report_NODES": _count(db, "MATCH (r:Report) RETURN count(r) AS cnt"),
     }
 
 
@@ -180,8 +176,12 @@ def test_bug_adr_multi_tx_real_data_preserves_all_edges(capsys):
     counts = _edge_counts(db)
     log_lines.append(f"  after tx1 (nodes only):  {counts}")
     expected_after_each = {
-        "TARGETS": 0, "IN_PATHWAY": 0, "CAUSES": 0,
-        "OF_DRUG": 0, "REPORTS_EVENT": 0, "Report_NODES": 0,
+        "TARGETS": 0,
+        "IN_PATHWAY": 0,
+        "CAUSES": 0,
+        "OF_DRUG": 0,
+        "REPORTS_EVENT": 0,
+        "Report_NODES": 0,
     }
     assert counts == expected_after_each
 
@@ -233,8 +233,7 @@ def test_bug_adr_multi_tx_real_data_preserves_all_edges(capsys):
         f"tx4 corrupted tx2 TARGETS: was {len(cbg)}, now {counts['TARGETS']}"
     )
     assert counts["IN_PATHWAY"] == len(gppw), (
-        f"tx4 corrupted tx3 IN_PATHWAY: was {len(gppw)}, now "
-        f"{counts['IN_PATHWAY']}"
+        f"tx4 corrupted tx3 IN_PATHWAY: was {len(gppw)}, now {counts['IN_PATHWAY']}"
     )
     assert counts["CAUSES"] == len(ccse), (
         f"tx4 lost CAUSES: got {counts['CAUSES']}/{len(ccse)}"
@@ -259,8 +258,7 @@ def test_bug_adr_multi_tx_real_data_preserves_all_edges(capsys):
         f"tx5 corrupted tx2 TARGETS: was {len(cbg)}, now {counts['TARGETS']}"
     )
     assert counts["IN_PATHWAY"] == len(gppw), (
-        f"tx5 corrupted tx3 IN_PATHWAY: was {len(gppw)}, now "
-        f"{counts['IN_PATHWAY']}"
+        f"tx5 corrupted tx3 IN_PATHWAY: was {len(gppw)}, now {counts['IN_PATHWAY']}"
     )
     assert counts["CAUSES"] == len(ccse), (
         f"tx5 corrupted tx4 CAUSES: was {len(ccse)}, now {counts['CAUSES']}"
@@ -272,8 +270,7 @@ def test_bug_adr_multi_tx_real_data_preserves_all_edges(capsys):
         f"tx5 lost OF_DRUG: got {counts['OF_DRUG']}/{len(reports)}"
     )
     assert counts["REPORTS_EVENT"] == len(reports), (
-        f"tx5 lost REPORTS_EVENT: got "
-        f"{counts['REPORTS_EVENT']}/{len(reports)}"
+        f"tx5 lost REPORTS_EVENT: got {counts['REPORTS_EVENT']}/{len(reports)}"
     )
 
     # Print the per-step probe report BEFORE the expensive query, so we
@@ -297,9 +294,7 @@ def test_bug_adr_multi_tx_real_data_preserves_all_edges(capsys):
         "RETURN count(*) AS cnt",
     )
     with capsys.disabled():
-        print(
-            f"  mechanistic_path bounded-to-{sample_drug}: {mech_count} rows"
-        )
+        print(f"  mechanistic_path bounded-to-{sample_drug}: {mech_count} rows")
     assert mech_count > 0, (
         f"mechanistic_path returned 0 rows for drug {sample_drug} — this "
         f"is the original symptom"

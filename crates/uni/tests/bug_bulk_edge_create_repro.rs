@@ -116,13 +116,13 @@ async fn bug_a_match_create_above_suspected_ceiling() -> Result<()> {
 #[tokio::test]
 async fn bug_a_locate_ceiling_diagnostic() -> Result<()> {
     let targets: [(i64, i64); 7] = [
-        (20, 20),   // 400
-        (30, 30),   // 900
-        (40, 40),   // 1600
-        (45, 45),   // 2025
-        (50, 50),   // 2500
-        (60, 60),   // 3600
-        (80, 80),   // 6400
+        (20, 20), // 400
+        (30, 30), // 900
+        (40, 40), // 1600
+        (45, 45), // 2025
+        (50, 50), // 2500
+        (60, 60), // 3600
+        (80, 80), // 6400
     ];
     let mut report = String::from("\nbug_a ceiling diagnostic\n");
     for (ns, nd) in targets {

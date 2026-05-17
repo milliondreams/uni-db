@@ -22,7 +22,6 @@
 #           explicitly documents this failure mode: "the second edge-tx
 #           commit wipes the first tx's edges."
 
-import pytest
 import uni_db
 
 
@@ -75,22 +74,17 @@ def _seed_nodes_sync(
     for i in range(n_genes):
         tx.execute(f"CREATE (:Gene {{gene_id: 'g{i}', name: 'gene-{i}'}})")
     for i in range(n_pathways):
-        tx.execute(
-            f"CREATE (:Pathway {{pathway_id: 'p{i}', name: 'path-{i}'}})"
-        )
+        tx.execute(f"CREATE (:Pathway {{pathway_id: 'p{i}', name: 'path-{i}'}})")
     for i in range(n_aes):
         tx.execute(
-            f"CREATE (:AdverseEvent "
-            f"{{event_id: 'a{i}', meddra_term: 'term-{i}'}})"
+            f"CREATE (:AdverseEvent {{event_id: 'a{i}', meddra_term: 'term-{i}'}})"
         )
     tx.commit()
 
 
 def _edge_count_sync(db, rel: str | None = None) -> int:
     pattern = f"[r:{rel}]" if rel else "[r]"
-    rows = db.session().query(
-        f"MATCH ()-{pattern}->() RETURN count(r) AS cnt"
-    )
+    rows = db.session().query(f"MATCH ()-{pattern}->() RETURN count(r) AS cnt")
     return rows[0]["cnt"]
 
 
@@ -152,14 +146,10 @@ def test_bug_d_heterogeneous_single_tx_ingest_no_drop():
     causes = _edge_count_sync(db, "CAUSES")
     of_drug = _edge_count_sync(db, "OF_DRUG")
     reports_event = _edge_count_sync(db, "REPORTS_EVENT")
-    reports = db.session().query(
-        "MATCH (r:Report) RETURN count(r) AS cnt"
-    )[0]["cnt"]
+    reports = db.session().query("MATCH (r:Report) RETURN count(r) AS cnt")[0]["cnt"]
 
     assert targets == n_targets, f"TARGETS lost: {targets}/{n_targets}"
-    assert in_pathway == n_in_pathway, (
-        f"IN_PATHWAY lost: {in_pathway}/{n_in_pathway}"
-    )
+    assert in_pathway == n_in_pathway, f"IN_PATHWAY lost: {in_pathway}/{n_in_pathway}"
     assert causes == n_causes, f"CAUSES lost: {causes}/{n_causes}"
     assert reports == n_reports, f"Report nodes lost: {reports}/{n_reports}"
     assert of_drug == n_reports, f"OF_DRUG lost: {of_drug}/{n_reports}"
@@ -206,8 +196,7 @@ def test_bug_e_multi_edge_tx_first_batch_preserved():
     targets_after_tx3 = _edge_count_sync(db, "TARGETS")
     in_pathway_after_tx3 = _edge_count_sync(db, "IN_PATHWAY")
     assert targets_after_tx3 == 600, (
-        f"tx3 commit corrupted tx2 TARGETS edges: was 600, now "
-        f"{targets_after_tx3}"
+        f"tx3 commit corrupted tx2 TARGETS edges: was 600, now {targets_after_tx3}"
     )
     assert in_pathway_after_tx3 == 800, (
         f"tx3 didn't land its own edges: {in_pathway_after_tx3}/800"
@@ -227,13 +216,9 @@ def test_bug_e_multi_edge_tx_first_batch_preserved():
     in_pathway_final = _edge_count_sync(db, "IN_PATHWAY")
     causes_final = _edge_count_sync(db, "CAUSES")
     assert targets_final == 600, (
-        f"tx4 commit corrupted tx2 TARGETS edges: was 600, now "
-        f"{targets_final}"
+        f"tx4 commit corrupted tx2 TARGETS edges: was 600, now {targets_final}"
     )
     assert in_pathway_final == 800, (
-        f"tx4 commit corrupted tx3 IN_PATHWAY edges: was 800, now "
-        f"{in_pathway_final}"
+        f"tx4 commit corrupted tx3 IN_PATHWAY edges: was 800, now {in_pathway_final}"
     )
-    assert causes_final == 1200, (
-        f"tx4 didn't land its own edges: {causes_final}/1200"
-    )
+    assert causes_final == 1200, f"tx4 didn't land its own edges: {causes_final}/1200"

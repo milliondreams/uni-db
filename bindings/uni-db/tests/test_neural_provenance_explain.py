@@ -6,7 +6,6 @@
 
 import uni_db
 
-
 PROGRAM = """
 CREATE MODEL risk_scorer AS
   INPUT (n)
@@ -144,9 +143,7 @@ def test_scalar_int_yield_column_is_not_enriched_to_node():
         ("a2", 0.4, 1),
         ("a3", 0.7, 2),
     ]:
-        tx.execute(
-            f"CREATE (:Asset {{name: '{name}', score: {score}, code: {code}}})"
-        )
+        tx.execute(f"CREATE (:Asset {{name: '{name}', score: {score}, code: {code}}})")
     tx.commit()
 
     PROG = """
@@ -209,9 +206,15 @@ def test_edge_binding_where_filter_works_via_mode_a():
     )
     session = db.session()
     tx = session.tx()
-    tx.execute("CREATE (a:Person {name: 'Alice'})-[:KNOWS {since: 2019}]->(b:Person {name: 'Bob'})")
-    tx.execute("CREATE (a:Person {name: 'Carol'})-[:KNOWS {since: 2020}]->(b:Person {name: 'Dan'})")
-    tx.execute("CREATE (a:Person {name: 'Eve'})-[:KNOWS {since: 2021}]->(b:Person {name: 'Frank'})")
+    tx.execute(
+        "CREATE (a:Person {name: 'Alice'})-[:KNOWS {since: 2019}]->(b:Person {name: 'Bob'})"
+    )
+    tx.execute(
+        "CREATE (a:Person {name: 'Carol'})-[:KNOWS {since: 2020}]->(b:Person {name: 'Dan'})"
+    )
+    tx.execute(
+        "CREATE (a:Person {name: 'Eve'})-[:KNOWS {since: 2021}]->(b:Person {name: 'Frank'})"
+    )
     tx.commit()
 
     # Use a neural-predicate rule so the tracker is populated (the

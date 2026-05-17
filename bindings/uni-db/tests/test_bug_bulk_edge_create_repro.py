@@ -8,6 +8,7 @@
 # not in the storage/planner core.
 
 import pytest
+
 import uni_db
 
 
@@ -38,9 +39,7 @@ async def _seed_nodes(db, n_src: int, n_dst: int) -> None:
 
 
 async def _edge_count(db) -> int:
-    rows = await db.session().query(
-        "MATCH ()-[r:REL]->() RETURN count(r) AS cnt"
-    )
+    rows = await db.session().query("MATCH ()-[r:REL]->() RETURN count(r) AS cnt")
     return rows[0]["cnt"]
 
 
@@ -70,17 +69,14 @@ async def test_bug_a_match_create_above_suspected_ceiling():
     tx = await session.tx()
     await tx.execute("MATCH (s:Src), (d:Dst) CREATE (s)-[:REL]->(d)")
 
-    in_tx_rows = await tx.query(
-        "MATCH ()-[r:REL]->() RETURN count(r) AS cnt"
-    )
+    in_tx_rows = await tx.query("MATCH ()-[r:REL]->() RETURN count(r) AS cnt")
     in_tx_cnt = in_tx_rows[0]["cnt"]
     await tx.commit()
 
     after_cnt = await _edge_count(db)
 
     assert in_tx_cnt == 6000, (
-        f"PLANNER/BINDING-LEVEL DROP: in-tx read saw {in_tx_cnt} edges, "
-        f"expected 6000"
+        f"PLANNER/BINDING-LEVEL DROP: in-tx read saw {in_tx_cnt} edges, expected 6000"
     )
     assert after_cnt == 6000, (
         f"WRITER/BINDING-LEVEL DROP: post-commit read saw {after_cnt} "
@@ -107,8 +103,7 @@ async def test_bug_a_locate_ceiling_diagnostic(capsys):
         got = await _edge_count(db)
         marker = "ok" if got == expected else "LOSS"
         report_lines.append(
-            f"  {ns:>3} x {nd:>3} = {expected:>5} expected, "
-            f"{got:>5} actual  [{marker}]"
+            f"  {ns:>3} x {nd:>3} = {expected:>5} expected, {got:>5} actual  [{marker}]"
         )
 
     # Use capsys-bypassing print so the report shows even on pass.
@@ -133,21 +128,17 @@ async def test_bug_b_sequential_edge_txs_preserve_each_other():
     running_total = 0
     for idx, pred in enumerate(predicates):
         tx = await db.session().tx()
-        await tx.execute(
-            f"MATCH (s:Src), (d:Dst) WHERE {pred} CREATE (s)-[:REL]->(d)"
-        )
+        await tx.execute(f"MATCH (s:Src), (d:Dst) WHERE {pred} CREATE (s)-[:REL]->(d)")
         await tx.commit()
 
         cnt = await _edge_count(db)
         assert cnt > running_total, (
-            f"tx{idx + 1} reduced total edge count: was {running_total}, "
-            f"now {cnt}"
+            f"tx{idx + 1} reduced total edge count: was {running_total}, now {cnt}"
         )
         running_total = cnt
 
     assert running_total == 3600, (
-        f"multi-tx edge accumulation lost edges: final={running_total}, "
-        f"expected 3600"
+        f"multi-tx edge accumulation lost edges: final={running_total}, expected 3600"
     )
 
 
@@ -207,9 +198,7 @@ async def test_bug_c_per_row_match_create_above_suspected_ceiling():
             issued += 1
 
     # Read inside the tx first to localise the layer of the drop.
-    in_tx_rows = await tx.query(
-        "MATCH ()-[r:REL]->() RETURN count(r) AS cnt"
-    )
+    in_tx_rows = await tx.query("MATCH ()-[r:REL]->() RETURN count(r) AS cnt")
     in_tx_cnt = in_tx_rows[0]["cnt"]
     await tx.commit()
 
@@ -259,8 +248,7 @@ async def test_bug_c_locate_per_row_ceiling_diagnostic(capsys):
         got = await _edge_count(db)
         marker = "ok" if got == issued else "LOSS"
         report_lines.append(
-            f"  issued {issued:>5} per-row executes, "
-            f"{got:>5} edges visible  [{marker}]"
+            f"  issued {issued:>5} per-row executes, {got:>5} edges visible  [{marker}]"
         )
 
     with capsys.disabled():
@@ -291,6 +279,5 @@ async def test_bug_b_many_small_edge_txs_preserve_each_other():
         running_total = cnt
 
     assert running_total == 3600, (
-        f"10-tx edge accumulation lost edges: final={running_total}, "
-        f"expected 3600"
+        f"10-tx edge accumulation lost edges: final={running_total}, expected 3600"
     )

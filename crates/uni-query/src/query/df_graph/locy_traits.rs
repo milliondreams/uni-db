@@ -61,10 +61,7 @@ pub trait DerivedFactSource: Send + Sync {
     /// Default impl returns an empty map. Callers must handle missing
     /// vids gracefully — typically by leaving the original
     /// `Value::Int(vid)` in place. Native adapters override this.
-    async fn lookup_nodes_by_vids(
-        &self,
-        _vids: &[u64],
-    ) -> Result<HashMap<u64, Value>, LocyError> {
+    async fn lookup_nodes_by_vids(&self, _vids: &[u64]) -> Result<HashMap<u64, Value>, LocyError> {
         Ok(HashMap::new())
     }
 }

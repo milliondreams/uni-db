@@ -695,9 +695,8 @@ pub fn extract_locy_config(
     // populates entries when the planner's pre-rewrite model_invocations
     // survive into the executed clause; the store side-channel is what
     // apply_model_invocations actually writes into).
-    locy_config.classifier_provenance_store = Some(std::sync::Arc::new(
-        ::uni_locy::NeuralProvenanceStore::new(),
-    ));
+    locy_config.classifier_provenance_store =
+        Some(std::sync::Arc::new(::uni_locy::NeuralProvenanceStore::new()));
     Ok(locy_config)
 }
 

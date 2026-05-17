@@ -1144,6 +1144,7 @@ async fn run_fixpoint_loop(
     semiring_kind: SemiringKind,
     classifier_registry: Arc<ClassifierRegistry>,
     classifier_cache: Option<Arc<ModelInvocationCache>>,
+    classifier_provenance_store: Option<Arc<uni_locy::NeuralProvenanceStore>>,
 ) -> DFResult<Vec<RecordBatch>> {
     let start = Instant::now();
     let task_ctx = session_ctx.read().task_ctx();
@@ -1333,6 +1334,7 @@ async fn run_fixpoint_loop(
                         ClassifierRefs {
                             registry: &classifier_registry,
                             cache: classifier_cache.as_ref(),
+                            provenance_store: classifier_provenance_store.as_ref(),
                         },
                     )
                     .await;
@@ -1463,6 +1465,13 @@ async fn run_fixpoint_loop(
 pub(crate) struct ClassifierRefs<'a> {
     pub registry: &'a Arc<ClassifierRegistry>,
     pub cache: Option<&'a Arc<uni_locy::ModelInvocationCache>>,
+    /// Phase C B1-B3 follow-up: when `Some`, EXPLAIN's neural_calls
+    /// collection consults the side-channel provenance store first
+    /// (populated by `apply_model_invocations`). This is the only way
+    /// to surface NeuralProvenance for Python-registered classifiers,
+    /// whose model_invocations may be rewritten away by the planner
+    /// and so wouldn't trigger the re-invocation fallback.
+    pub provenance_store: Option<&'a Arc<uni_locy::NeuralProvenanceStore>>,
 }
 
 /// Borrowed bundle of provenance-recording state: the in-flight
@@ -1544,6 +1553,7 @@ async fn record_provenance(
                     &fact_row,
                     classifier_registry,
                     classifier_cache,
+                    classifiers.provenance_store,
                 )
                 .await,
             };
@@ -1679,6 +1689,7 @@ async fn collect_neural_calls_for_row(
     fact_row: &uni_locy::FactRow,
     classifier_registry: &Arc<ClassifierRegistry>,
     classifier_cache: Option<&Arc<uni_locy::ModelInvocationCache>>,
+    provenance_store: Option<&Arc<uni_locy::NeuralProvenanceStore>>,
 ) -> Vec<uni_locy::NeuralProvenance> {
     let Some(clause) = rule.clauses.get(clause_index) else {
         return Vec::new();
@@ -1688,16 +1699,21 @@ async fn collect_neural_calls_for_row(
     }
     let mut out = Vec::with_capacity(clause.model_invocations.len());
     for invocation in &clause.model_invocations {
-        let Some(classifier) = classifier_registry.get(&invocation.model_name) else {
-            continue;
-        };
-        // Build ClassifyInput from the ORIGINAL (pre-rewrite)
-        // feature expressions evaluated against fact_row.
+        // Build ClassifyInput from the REWRITTEN feature expressions
+        // (referencing the synthetic `__feat_*` hidden columns that the
+        // planner lifts model-call args into). This matches the writer's
+        // path in `apply_model_invocations`, which iterates
+        // `invocation.feature_exprs` to compute the same `input_hash`
+        // that gets stored. Using the pre-rewrite `original_feature_exprs`
+        // here would compute a different hash for YIELD-position
+        // invocations (where the pre-rewrite expr references properties
+        // not materialised into fact_row), causing the store lookup
+        // below to miss and `neural_calls` to come back empty.
         let mut features = std::collections::HashMap::new();
         for (binding_name, feat_expr) in invocation
             .feature_names
             .iter()
-            .zip(invocation.original_feature_exprs.iter())
+            .zip(invocation.feature_exprs.iter())
         {
             features.insert(
                 binding_name.clone(),
@@ -1706,14 +1722,37 @@ async fn collect_neural_calls_for_row(
         }
         let input = uni_locy::ClassifyInput { features };
         let input_hash = input.stable_hash();
-        // Cache check.
+
+        // Store-first read path. `apply_model_invocations` writes a
+        // NeuralProvenanceRecord per (model, input_hash) into the
+        // side-channel store during fixpoint. If we find a record
+        // there, surface it directly — this is the only path that
+        // populates calibrated_probability + confidence_band for
+        // Python-registered classifiers.
+        if let Some(store) = provenance_store {
+            if let Some(record) = store.get(&invocation.model_name, input_hash) {
+                out.push(uni_locy::NeuralProvenance {
+                    model_name: invocation.model_name.clone(),
+                    raw_probability: record.raw_probability,
+                    calibrated_probability: record.calibrated_probability,
+                    confidence_band: record.confidence_band,
+                });
+                continue;
+            }
+        }
+
+        // Fallback: re-invoke the classifier. Only reached when the
+        // store wasn't populated for this (model, input) — e.g. older
+        // sessions where the store wasn't threaded, or when EXPLAIN
+        // runs against a row that fixpoint never touched.
+        let Some(classifier) = classifier_registry.get(&invocation.model_name) else {
+            continue;
+        };
         let raw = if let Some(v) =
             classifier_cache.and_then(|c| c.get(&invocation.model_name, input_hash))
         {
             v
         } else {
-            // Cache miss: invoke classifier. Per-fact cost; small
-            // for typical EXPLAIN scenarios.
             match classifier.classify(std::slice::from_ref(&input)).await {
                 Ok(probs) => {
                     let v = probs.first().copied().unwrap_or(0.0);
@@ -1814,7 +1853,22 @@ fn eval_feature_expr_against_fact_row(
                 if let Some(val) = fact_row.get(&key) {
                     return value_to_feature(Some(val));
                 }
-                // Fallback: read property from the node value.
+                // Fallback: try the synthetic hidden column that the
+                // planner injects for property-access feature args
+                // (`__feat_<var>_<prop>`). The writer side
+                // (`apply_model_invocations`) already uses this
+                // fallback (see `resolve_src` in the same file), so
+                // mirroring it here keeps reader/writer input_hash
+                // symmetric — without it, the YIELD-position case
+                // (where `fact_row[v]` is a vid Int, not a Node)
+                // returns Null and the store-lookup misses.
+                let hidden_key = format!("__feat_{}_{}", v, prop);
+                if let Some(val) = fact_row.get(&hidden_key) {
+                    return value_to_feature(Some(val));
+                }
+                // Final fallback: read property directly from the
+                // node value (works when fact_row carries the Node
+                // rather than a vid Int).
                 if let Some(uni_common::Value::Node(n)) = fact_row.get(v) {
                     return value_to_feature(n.properties.get(prop));
                 }
@@ -2301,6 +2355,7 @@ pub(crate) async fn record_and_detect_lineage_nonrecursive(
                         &fact_row,
                         classifier_registry,
                         classifier_cache,
+                        classifiers.provenance_store,
                     )
                     .await,
                 };
@@ -5357,6 +5412,7 @@ impl ExecutionPlan for FixpointExec {
         let semiring_kind = self.semiring_kind;
         let classifier_registry = Arc::clone(&self.classifier_registry);
         let classifier_cache = self.classifier_cache.as_ref().map(Arc::clone);
+        let classifier_provenance_store = self.classifier_provenance_store.as_ref().map(Arc::clone);
 
         let fut = async move {
             run_fixpoint_loop(
@@ -5384,6 +5440,7 @@ impl ExecutionPlan for FixpointExec {
                 semiring_kind,
                 classifier_registry,
                 classifier_cache,
+                classifier_provenance_store,
             )
             .await
         };

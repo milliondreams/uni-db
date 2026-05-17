@@ -216,6 +216,7 @@ fn _uni_db(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<types::PyAbduceCommandResult>()?;
     m.add_class::<types::PyDeriveCommandResult>()?;
     m.add_class::<types::PyCypherCommandResult>()?;
+    m.add_class::<types::PyCalibrator>()?;
 
     // Hook context types
     m.add_class::<types::PyHookContext>()?;

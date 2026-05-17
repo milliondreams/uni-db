@@ -4,11 +4,11 @@
 
 ## The Problem
 
-The average patient over 65 takes six prescription medications simultaneously. Pairwise drug-interaction databases exist, but they answer the wrong question. The clinical question is: given this patient's entire regimen, is the joint risk of any clinically significant interaction acceptable? And if not, what is the smallest substitution that brings it back into range? Manual review of one patient's polypharmacy risk takes a clinical pharmacist 20-30 minutes. Tens of millions of patients are on five or more daily medications.
+The average patient over 65 takes six prescription medications simultaneously. Pairwise drug-interaction databases exist, but they answer the wrong question. The clinical question is: given this patient's entire regimen, is the joint risk of any clinically significant interaction acceptable, and which pair contributes most to that joint risk? Manual review of one patient's polypharmacy risk takes a clinical pharmacist 20-30 minutes. Tens of millions of patients are on five or more daily medications.
 
 ## The Traditional Approach
 
-EHR systems flag pairwise interactions from curated databases. The interface shows a list of pairwise warnings, often dozens for elderly patients, which clinicians learn to dismiss. Joint regimen risk is not computed; clinicians compose pairwise risks mentally. Substitution recommendations require manual lookup of therapeutic equivalents and re-running the pairwise check against the patient's remaining drugs. Calibration of the underlying interaction-likelihood scores against real-world adverse-event rates is not part of the workflow.
+EHR systems flag pairwise interactions from curated databases. The interface shows a list of pairwise warnings, often dozens for elderly patients, which clinicians learn to dismiss. Joint regimen risk is not computed; clinicians compose pairwise risks mentally. Calibration of the underlying interaction-likelihood scores against real-world adverse-event rates is not part of the workflow.
 
 ## With Uni
 
@@ -17,8 +17,8 @@ The notebook ingests a drug + interaction subgraph extracted from Hetionet direc
 ## What You'll See
 
 - Patient-level joint regimen risk computed from per-pair model predictions composed through Locy rules (`FOLD MPROD(1 - p_interact)` across all drug pairs in the regimen)
-- Ranked pairwise interactions within the regimen — which two drugs contribute most to joint risk
-- Calibrated severity-tier probabilities against held-out real-world outcomes (raw vs Platt-calibrated Brier delta)
+- Ranked pairwise interactions within the regimen — which two drugs contribute the highest calibrated interaction probability to joint risk
+- Calibrated binary danger probabilities against held-out shared-target labels (raw vs Platt-calibrated Brier delta)
 - Validation report with Brier and accuracy on held-out dangerous-interaction labels
 - Audit-grade `EXPLAIN` trace combining per-pair predictions with rule provenance, surfacing the classifier's `NeuralProvenance` per derivation
 

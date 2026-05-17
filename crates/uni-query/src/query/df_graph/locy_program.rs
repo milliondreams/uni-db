@@ -1110,6 +1110,7 @@ async fn run_program(
                         super::locy_fixpoint::ClassifierRefs {
                             registry: &classifier_registry,
                             cache: classifier_cache.as_ref(),
+                            provenance_store: classifier_provenance_store.as_ref(),
                         },
                         semiring_kind,
                     )

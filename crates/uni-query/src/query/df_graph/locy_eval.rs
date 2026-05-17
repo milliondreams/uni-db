@@ -583,7 +583,7 @@ pub fn record_batches_to_locy_rows(batches: &[RecordBatch]) -> Vec<FactRow> {
 /// column is `Value::Map({_vid, _labels, _all_props})` after `arrow_to_value`.
 /// This function detects these maps and converts them to proper `Value::Node` or
 /// `Value::Edge`, then strips the helpers.
-fn normalize_graph_row(row: &mut FactRow) {
+pub(crate) fn normalize_graph_row(row: &mut FactRow) {
     // Detect bare graph-entity variables: keys without '.' that are Map values
     // containing the internal `_vid` or `_eid` field.
     let entity_vars: Vec<String> = row

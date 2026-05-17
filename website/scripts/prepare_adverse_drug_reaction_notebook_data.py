@@ -62,9 +62,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--cache-dir", type=Path, default=Path("website/.cache/hetionet")
     )
-    # Extract sizes are kept small so the notebook's single edge-creation
-    # transaction stays well under the Locy per-tx ingest ceiling that
-    # silently drops edges above ~2k MATCH+CREATE rows.
+    # Extract sizes are kept moderate to keep the notebook's 6-hop
+    # mechanism-plausibility join (Drug → Gene → Pathway ← Gene ← Drug →
+    # AdverseEvent) tractable. The join is combinatorial in CcSE × CbG
+    # so uncapped Hetionet scale (50 drugs × 5.5k CcSE) explodes into
+    # hundreds of millions of intermediate rows. The cap is a query-
+    # tractability choice, not an ingest constraint.
     p.add_argument("--n-compounds", type=int, default=30)
     p.add_argument("--n-genes", type=int, default=60)
     p.add_argument("--n-pathways", type=int, default=40)
@@ -189,9 +192,10 @@ def main() -> int:
         (g, p) for g in chosen_genes for p in gppw_by_gene[g]
         if p in chosen_pathways_set
     ]
-    # Cap per-compound to keep total CCSE volume well below the per-tx
-    # ingest ceiling. Ranking by side-effect frequency in the extract so
-    # we keep the most-shared (highest mechanism-plausibility) edges.
+    # Cap per-compound CcSE volume to keep the downstream mechanism-
+    # plausibility 6-hop join tractable (it's combinatorial in CcSE × CbG).
+    # Rank by side-effect frequency in the extract so we keep the most-
+    # shared (highest mechanism-plausibility) edges.
     ccse_edges: list[tuple[str, str]] = []
     for c in chosen_compounds:
         in_extract = [s for s in ccse_by_compound[c] if s in chosen_ses_set]
@@ -207,6 +211,29 @@ def main() -> int:
     signal_pairs = rng.sample(ccse_edges, k=min(args.n_signals, len(ccse_edges)))
     signal_pair_set = set(signal_pairs)
 
+    # Synthetic 16-dim narrative embedding setup. The notebook uses
+    # `similar_to(r.narrative_vec, [centroid])` to score each report
+    # against the historical-confirmed-signal centroid; we generate the
+    # centroid first, then bias signal-report vectors toward it and
+    # non-signal vectors away. Deterministic from --seed; no real
+    # sentence-transformer dependency at notebook runtime.
+    embed_dim = 16
+    historical_signal_centroid = [
+        rng.gauss(0.0, 1.0) for _ in range(embed_dim)
+    ]
+    # Normalise centroid to unit L2 for stable cosine-style behavior.
+    norm = (sum(x * x for x in historical_signal_centroid) ** 0.5) or 1.0
+    historical_signal_centroid = [x / norm for x in historical_signal_centroid]
+
+    def _narrative_vec(is_signal: bool) -> list[float]:
+        """Deterministic per-call 16-dim vector biased toward (signal=True)
+        or away from (signal=False) the historical signal centroid."""
+        base = [rng.gauss(0.0, 1.0) for _ in range(embed_dim)]
+        bias = 1.5 if is_signal else -0.8
+        v = [b + bias * c for b, c in zip(base, historical_signal_centroid)]
+        bnorm = (sum(x * x for x in v) ** 0.5) or 1.0
+        return [x / bnorm for x in v]
+
     reports = []
     # Seed at least 3 reports per signal pair so the held-out label has signal
     # to learn from. Fill the remainder with random non-signal pairs.
@@ -216,6 +243,7 @@ def main() -> int:
             comp, se = pair
             count = 8.0 + rng.random() * 2.0
             similarity = 0.78 + rng.random() * 0.18
+            nv = _narrative_vec(True)
             reports.append({
                 "report_id": f"R{len(reports)+1:04d}",
                 "compound_id": _local_id(comp),
@@ -224,6 +252,7 @@ def main() -> int:
                 "precomputed_similarity": f"{similarity:.3f}",
                 "combined_evidence": f"{count * similarity:.3f}",
                 "is_signal": "true",
+                "narrative_vec": ",".join(f"{x:.4f}" for x in nv),
             })
     non_signal_edges = [e for e in ccse_edges if e not in signal_pair_set]
     while len(reports) < args.n_reports:
@@ -231,6 +260,7 @@ def main() -> int:
         is_signal = False
         count = 2.0 + rng.random() * 2.0
         similarity = 0.22 + rng.random() * 0.18
+        nv = _narrative_vec(False)
         reports.append({
             "report_id": f"R{len(reports)+1:04d}",
             "compound_id": _local_id(comp),
@@ -239,6 +269,7 @@ def main() -> int:
             "precomputed_similarity": f"{similarity:.3f}",
             "combined_evidence": f"{count * similarity:.3f}",
             "is_signal": "false",
+            "narrative_vec": ",".join(f"{x:.4f}" for x in nv),
         })
 
     # Write outputs.
@@ -311,7 +342,7 @@ def main() -> int:
         [
             "report_id", "compound_id", "side_effect_id",
             "report_count", "precomputed_similarity", "combined_evidence",
-            "is_signal",
+            "is_signal", "narrative_vec",
         ],
     )
 
@@ -333,6 +364,17 @@ def main() -> int:
             "n_reports": args.n_reports,
             "n_signals": args.n_signals,
             "seed": args.seed,
+        },
+        "narrative_embedding": {
+            "dim": embed_dim,
+            "historical_signal_centroid": historical_signal_centroid,
+            "note": (
+                "16-dim narrative embeddings are SYNTHETIC: per-report "
+                "deterministic vectors biased toward (signal) or away from "
+                "(non-signal) the historical_signal_centroid. The notebook "
+                "uses similar_to(r.narrative_vec, [centroid]) to score "
+                "each report's narrative against the centroid."
+            ),
         },
         "shape": {
             "compounds": len(chosen_compounds),

@@ -21,7 +21,7 @@ use super::locy_delta::{
     KeyTuple, RowStore, extract_cypher_conditions, extract_key, resolve_clause_with_is_refs,
 };
 
-use super::locy_eval::{eval_expr, record_batches_to_locy_rows, values_equal_for_join};
+use super::locy_eval::{eval_expr, normalize_graph_row, record_batches_to_locy_rows, values_equal_for_join};
 use super::locy_slg::SLGResolver;
 use super::locy_traits::DerivedFactSource;
 
@@ -208,8 +208,10 @@ pub async fn explain_rule(
 ) -> Result<DerivationNode, LocyError> {
     // Mode A: provenance-based (no re-execution required).
     // Falls through to Mode B when tracker is absent or has no matching entries.
-    if let Some(Ok(node)) =
-        tracker.map(|t| explain_rule_mode_a(query, program, t, derived_store, approximate_groups))
+    if let Some(t) = tracker
+        && let Ok(node) =
+            explain_rule_mode_a(query, program, t, fact_source, derived_store, approximate_groups)
+                .await
     {
         return Ok(node);
     }
@@ -230,10 +232,11 @@ pub async fn explain_rule(
 /// Mode A: build derivation tree using recorded provenance from the fixpoint loop.
 ///
 /// Returns `Err` when no tracker entries exist for the rule (signals Mode B fallback).
-fn explain_rule_mode_a(
+async fn explain_rule_mode_a(
     query: &ExplainRule,
     program: &CompiledProgram,
     tracker: &ProvenanceStore,
+    fact_source: &dyn DerivedFactSource,
     _derived_store: &RowStore,
     approximate_groups: Option<&HashMap<String, Vec<String>>>,
 ) -> Result<DerivationNode, LocyError> {
@@ -250,6 +253,70 @@ fn explain_rule_mode_a(
         return Err(LocyError::EvaluationError {
             message: format!("no tracker entries for rule '{rule_name}' (falling back to Mode B)"),
         });
+    }
+
+    // Enrich each tracker entry's fact_row so WHERE predicates like
+    // `n.prop = X` or `e.prop = X` resolve against full Node / Edge
+    // values. Two encodings to handle:
+    //   - Node bindings: tracker stores `Value::Int(vid)` (Arrow UInt64).
+    //     Resolved via the side-channel `lookup_nodes_by_vids` Cypher.
+    //   - Edge bindings: tracker stores `Value::Map({_eid,_type,...})`
+    //     (Arrow struct). Resolved by `normalize_graph_row`, the same
+    //     helper Mode B uses, which converts Map → Value::Edge.
+    //
+    // Enrichment is scoped to KEY columns from the rule's yield_schema
+    // (`is_key && !is_prob`) so non-KEY scalar Ints (e.g. count columns)
+    // never get coerced into Nodes.
+    let key_cols: HashSet<String> = rule
+        .yield_schema
+        .iter()
+        .filter(|c| c.is_key && !c.is_prob)
+        .map(|c| c.name.clone())
+        .collect();
+
+    let mut tracker_entries: Vec<(Vec<u8>, ProvenanceAnnotation)> = tracker_entries
+        .into_iter()
+        .map(|(h, mut ann)| {
+            // Map → Edge / Node conversion for bare graph-entity vars.
+            normalize_graph_row(&mut ann.fact_row);
+            (h, ann)
+        })
+        .collect();
+
+    // Collect residual Int-vid candidates from KEY columns only.
+    let mut candidate_vids: Vec<u64> = Vec::new();
+    for (_, entry) in &tracker_entries {
+        for (k, v) in &entry.fact_row {
+            if key_cols.contains(k)
+                && let Value::Int(i) = v
+                && *i >= 0
+            {
+                candidate_vids.push(*i as u64);
+            }
+        }
+    }
+    candidate_vids.sort_unstable();
+    candidate_vids.dedup();
+    let vid_to_node: HashMap<u64, Value> = if candidate_vids.is_empty() {
+        HashMap::new()
+    } else {
+        fact_source
+            .lookup_nodes_by_vids(&candidate_vids)
+            .await
+            .unwrap_or_default()
+    };
+    if !vid_to_node.is_empty() {
+        for (_, ann) in &mut tracker_entries {
+            for (k, v) in ann.fact_row.iter_mut() {
+                if key_cols.contains(k)
+                    && let Value::Int(i) = v
+                    && *i >= 0
+                    && let Some(node) = vid_to_node.get(&(*i as u64))
+                {
+                    *v = node.clone();
+                }
+            }
+        }
     }
 
     // Filter tracker entries by WHERE expression

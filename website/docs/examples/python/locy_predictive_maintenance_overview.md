@@ -21,7 +21,7 @@ The notebook ingests AI4I 2020 sensor data plus a synthesized process-line topol
 - Component-level risk aggregation via `FOLD MNOR(unhealth)` over a `HAS_PART` child set
 - Calibration delta: raw Brier vs Platt-calibrated Brier on held-out outcomes
 - Validation report with Brier and accuracy
-- Audit trail (`EXPLAIN` with `NeuralProvenance`) for every recommendation: sensor evidence, the classifier's calibrated probability, the rule chain that produced the score
+- Audit trail (`EXPLAIN` with `NeuralProvenance`) on demand for any recommendation: sensor evidence, the classifier's calibrated probability, the rule chain that produced the score
 
 ## Why It Matters
 

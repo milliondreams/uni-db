@@ -3224,6 +3224,46 @@ impl PyCypherCommandResult {
 }
 
 // ============================================================================
+// Calibrator wrapper
+// ============================================================================
+
+/// A fitted calibrator returned by a CALIBRATE Locy command. Wraps the
+/// Rust `Arc<dyn Calibrator>` so Python callers can apply it to raw
+/// classifier outputs (e.g. to rescore a maintenance queue with the
+/// calibrated probability rather than the raw classifier value).
+#[pyclass(name = "Calibrator", frozen)]
+pub struct PyCalibrator {
+    pub inner: std::sync::Arc<dyn ::uni_locy::calibration::Calibrator>,
+}
+
+#[pymethods]
+impl PyCalibrator {
+    /// The calibration method name (e.g. "PlattScaling").
+    #[getter]
+    fn method(&self) -> String {
+        format!("{:?}", self.inner.method())
+    }
+
+    /// Apply the calibrator to a single raw probability.
+    fn apply(&self, raw: f64) -> f64 {
+        self.inner.apply(raw)
+    }
+
+    /// Apply the calibrator to a batch of raw probabilities.
+    fn apply_batch(&self, raws: Vec<f64>) -> Vec<f64> {
+        self.inner.apply_batch(&raws)
+    }
+
+    fn __repr__(&self) -> String {
+        format!("Calibrator(method={:?})", self.inner.method())
+    }
+
+    fn __call__(&self, raw: f64) -> f64 {
+        self.inner.apply(raw)
+    }
+}
+
+// ============================================================================
 // Hook Context types
 // ============================================================================
 

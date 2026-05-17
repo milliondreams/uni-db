@@ -53,6 +53,8 @@ def main() -> int:
     mechanistic_path_count = env.get("MECHANISTIC_PATH_COUNT")
     mechanism_plausibility_count = env.get("MECHANISM_PLAUSIBILITY_COUNT")
     investigation_queue_len = env.get("INVESTIGATION_QUEUE_LEN")
+    narrative_match_count = env.get("NARRATIVE_MATCH_COUNT")
+    top_report_per_ae_count = env.get("TOP_REPORT_PER_AE_COUNT")
     validate_metrics = env.get("VALIDATE_METRICS")
     explain_produced = env.get("EXPLAIN_PRODUCED")
 
@@ -77,12 +79,36 @@ def main() -> int:
     assert (
         isinstance(explain_produced, int) and explain_produced >= 1
     ), f"EXPLAIN_PRODUCED={explain_produced!r}"
+    # similar_to retrieval feature must produce one row per report.
+    assert (
+        isinstance(narrative_match_count, int) and narrative_match_count == scored_count
+    ), f"NARRATIVE_MATCH_COUNT={narrative_match_count!r} (expected ==scored)"
+    # BEST BY top_report_per_ae: one row per distinct AE that has a report.
+    assert (
+        isinstance(top_report_per_ae_count, int) and top_report_per_ae_count >= 5
+    ), f"TOP_REPORT_PER_AE_COUNT={top_report_per_ae_count!r}"
+    # Per-pair value assertion: mechanism_confidence in [0.2, 0.9] aggregated
+    # via MNOR across many bridging paths should saturate to (0.8, 1.0]
+    # for at least one well-covered pair. Catches future classifier or
+    # MNOR-fold drift.
+    plausibility_rows = (
+        env.get("compose_result").derived.get("mechanism_plausibility", [])
+    )
+    max_plausibility = max(
+        (float(r["plausibility"]) for r in plausibility_rows), default=0.0
+    )
+    assert (
+        0.8 < max_plausibility <= 1.0
+    ), f"max mechanism_plausibility out of band: {max_plausibility}"
 
     print(
         "ADR signal-detection flagship notebook validation passed.\n"
         f"Summary: scored_reports={scored_count}, "
         f"mechanistic_path={mechanistic_path_count}, "
-        f"mechanism_plausibility={mechanism_plausibility_count}, "
+        f"mechanism_plausibility={mechanism_plausibility_count} "
+        f"(max={max_plausibility:.4f}), "
+        f"narrative_match={narrative_match_count}, "
+        f"top_report_per_ae={top_report_per_ae_count}, "
         f"investigation_queue={investigation_queue_len}, "
         f"validate_metrics={validate_metrics}"
     )

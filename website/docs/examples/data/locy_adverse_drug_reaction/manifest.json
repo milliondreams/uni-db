@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-05-16T10:44:08.196823+00:00",
+  "generated_at": "2026-05-17T02:16:57.553966+00:00",
   "source": {
     "name": "Hetionet v1.0",
     "doi": "10.7554/eLife.26726",
@@ -16,6 +16,28 @@
     "n_reports": 120,
     "n_signals": 8,
     "seed": 20260516
+  },
+  "narrative_embedding": {
+    "dim": 16,
+    "historical_signal_centroid": [
+      -0.2813047315014192,
+      0.08692289284274533,
+      0.17455566888029125,
+      0.4838032613629532,
+      -0.33942881767381616,
+      0.057654288633077234,
+      -0.06033707808161169,
+      -0.11459899893939195,
+      0.5409864567752019,
+      0.15283252473719683,
+      0.2595745292694053,
+      -0.018600631444950944,
+      -0.24173383279144597,
+      -0.05347553270030098,
+      -0.15734305896454812,
+      -0.2089655119661051
+    ],
+    "note": "16-dim narrative embeddings are SYNTHETIC: per-report deterministic vectors biased toward (signal) or away from (non-signal) the historical_signal_centroid. The notebook uses similar_to(r.narrative_vec, [centroid]) to score each report's narrative against the centroid."
   },
   "shape": {
     "compounds": 30,

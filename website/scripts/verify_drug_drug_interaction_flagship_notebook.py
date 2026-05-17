@@ -52,6 +52,7 @@ def main() -> int:
     scored_count = env.get("SCORED_COUNT")
     joint_safety_count = env.get("JOINT_SAFETY_COUNT")
     patient_ranking_len = env.get("PATIENT_RANKING_LEN")
+    worst_pair_per_patient_count = env.get("WORST_PAIR_PER_PATIENT_COUNT")
     validate_metrics = env.get("VALIDATE_METRICS")
     explain_produced = env.get("EXPLAIN_PRODUCED")
 
@@ -73,11 +74,21 @@ def main() -> int:
     assert (
         isinstance(explain_produced, int) and explain_produced >= 1
     ), f"EXPLAIN_PRODUCED={explain_produced!r}"
+    # BEST BY: one worst-pair row per Patient that has at least one
+    # interaction (joint_safety_count is the same set).
+    assert (
+        isinstance(worst_pair_per_patient_count, int)
+        and worst_pair_per_patient_count == joint_safety_count
+    ), (
+        f"WORST_PAIR_PER_PATIENT_COUNT={worst_pair_per_patient_count!r} "
+        f"(expected == JOINT_SAFETY_COUNT={joint_safety_count!r})"
+    )
 
     print(
         "DDI flagship notebook validation passed.\n"
         f"Summary: scored_interactions={scored_count}, "
         f"joint_regimen_safety={joint_safety_count}, "
+        f"worst_pair_per_patient={worst_pair_per_patient_count}, "
         f"patient_ranking={patient_ranking_len}, "
         f"validate_metrics={validate_metrics}"
     )

@@ -65,8 +65,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--cache-dir", type=Path, default=Path("website/.cache/hetionet")
     )
-    # Smaller than ADR because DDI also has InteractionRecord nodes + edges
-    # that count toward the per-tx ingest limit.
+    # Smaller than ADR because the MLP scoring step iterates pairwise and
+    # we want the notebook to demo cleanly in a few seconds.
     p.add_argument("--n-compounds", type=int, default=40)
     p.add_argument("--n-genes", type=int, default=80)
     p.add_argument("--embedding-dim", type=int, default=64)

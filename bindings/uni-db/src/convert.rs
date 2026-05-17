@@ -447,6 +447,48 @@ fn derivation_node_to_py(py: Python, node: uni_locy::DerivationNode) -> PyResult
     dict.set_item("children", children)?;
     dict.set_item("graph_fact", node.graph_fact)?;
     dict.set_item("proof_probability", node.proof_probability)?;
+
+    let neural_calls = PyList::empty(py);
+    for call in node.neural_calls {
+        let call_dict = PyDict::new(py);
+        call_dict.set_item("model_name", &call.model_name)?;
+        call_dict.set_item("raw_probability", call.raw_probability)?;
+        call_dict.set_item("calibrated_probability", call.calibrated_probability)?;
+        if let Some(band) = call.confidence_band {
+            let band_dict = PyDict::new(py);
+            band_dict.set_item("lower", band.lower)?;
+            band_dict.set_item("upper", band.upper)?;
+            let (source_name, source_params) = match band.source {
+                uni_locy::ConfidenceSource::Conformal { alpha } => {
+                    let p = PyDict::new(py);
+                    p.set_item("alpha", alpha)?;
+                    ("conformal", p)
+                }
+                uni_locy::ConfidenceSource::EnsembleVariance { n_estimators } => {
+                    let p = PyDict::new(py);
+                    p.set_item("n_estimators", n_estimators)?;
+                    ("ensemble_variance", p)
+                }
+                uni_locy::ConfidenceSource::Credal {
+                    lower_prior,
+                    upper_prior,
+                } => {
+                    let p = PyDict::new(py);
+                    p.set_item("lower_prior", lower_prior)?;
+                    p.set_item("upper_prior", upper_prior)?;
+                    ("credal", p)
+                }
+            };
+            band_dict.set_item("source", source_name)?;
+            band_dict.set_item("source_params", source_params)?;
+            call_dict.set_item("confidence_band", band_dict)?;
+        } else {
+            call_dict.set_item("confidence_band", py.None())?;
+        }
+        neural_calls.append(call_dict)?;
+    }
+    dict.set_item("neural_calls", neural_calls)?;
+
     Ok(dict.into())
 }
 
@@ -562,6 +604,16 @@ fn command_result_to_py(py: Python, cmd: uni_locy::CommandResult) -> PyResult<Py
                 Some(q) => d.set_item("confidence_band_quantile", q)?,
                 None => d.set_item("confidence_band_quantile", py.None())?,
             }
+            // Surface the fitted calibrator so Python callers can apply
+            // it to raw classifier outputs (e.g. to rescore a ranked
+            // queue with calibrated probabilities).
+            let py_cal = Py::new(
+                py,
+                crate::types::PyCalibrator {
+                    inner: c.calibrator.clone(),
+                },
+            )?;
+            d.set_item("calibrator", py_cal)?;
             Ok(d.into_any().unbind())
         }
         uni_locy::CommandResult::Validate(v) => {
@@ -637,6 +689,15 @@ pub fn extract_locy_config(
         let registry = crate::classifier::build_classifier_registry(py, raw)?;
         locy_config.classifier_registry = registry;
     }
+    // Always-on NeuralProvenance side-channel store. Without it, EXPLAIN's
+    // neural_calls list comes back empty for Python-registered classifiers
+    // (the fallback re-invocation path in collect_neural_calls_for_row only
+    // populates entries when the planner's pre-rewrite model_invocations
+    // survive into the executed clause; the store side-channel is what
+    // apply_model_invocations actually writes into).
+    locy_config.classifier_provenance_store = Some(std::sync::Arc::new(
+        ::uni_locy::NeuralProvenanceStore::new(),
+    ));
     Ok(locy_config)
 }
 

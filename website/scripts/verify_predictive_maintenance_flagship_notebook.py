@@ -69,6 +69,9 @@ def main() -> int:
     asset_risk_count = env.get("ASSET_RISK_COUNT")
     component_risk_count = env.get("COMPONENT_RISK_COUNT")
     line_reliability_count = env.get("LINE_RELIABILITY_COUNT")
+    failure_prone_count = env.get("FAILURE_PRONE_COUNT")
+    healthy_assets_count = env.get("HEALTHY_ASSETS_COUNT")
+    upstream_reaches_count = env.get("UPSTREAM_REACHES_COUNT")
     validate_metrics = env.get("VALIDATE_METRICS")
     explain_produced = env.get("EXPLAIN_PRODUCED")
     ranked_queue_len = env.get("RANKED_QUEUE_LEN")
@@ -77,6 +80,26 @@ def main() -> int:
     assert component_risk_count == 60, f"COMPONENT_RISK_COUNT={component_risk_count!r}"
     assert line_reliability_count >= 30, f"LINE_RELIABILITY_COUNT={line_reliability_count!r}"
     assert ranked_queue_len == 60, f"RANKED_QUEUE_LEN={ranked_queue_len!r}"
+    # IS NOT complement: healthy + failure_prone partition the 60 equipment rows.
+    assert (
+        isinstance(failure_prone_count, int) and failure_prone_count >= 1
+    ), f"FAILURE_PRONE_COUNT={failure_prone_count!r}"
+    assert (
+        isinstance(healthy_assets_count, int)
+        and failure_prone_count + healthy_assets_count == 60
+    ), (
+        f"healthy + failure_prone should partition 60 equipment: got "
+        f"healthy={healthy_assets_count!r}, prone={failure_prone_count!r}"
+    )
+    # Recursive transitive closure should produce strictly more rows than
+    # the base UPSTREAM_OF edge count (else recursion did nothing).
+    assert (
+        isinstance(upstream_reaches_count, int)
+        and upstream_reaches_count >= line_reliability_count
+    ), (
+        f"upstream_reaches transitive closure should be >= base edges: "
+        f"got {upstream_reaches_count!r} vs base {line_reliability_count!r}"
+    )
     assert isinstance(validate_metrics, dict) and any(
         "Brier" in k or "brier" in k for k in validate_metrics
     ), f"VALIDATE_METRICS missing Brier: {validate_metrics!r}"
@@ -89,6 +112,9 @@ def main() -> int:
         f"Summary: asset_risk={asset_risk_count}, "
         f"component_risk={component_risk_count}, "
         f"line_reliability={line_reliability_count}, "
+        f"failure_prone={failure_prone_count}, "
+        f"healthy_assets={healthy_assets_count}, "
+        f"upstream_reaches={upstream_reaches_count}, "
         f"validate_metrics={validate_metrics}"
     )
     return 0

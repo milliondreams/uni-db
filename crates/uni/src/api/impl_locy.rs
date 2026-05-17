@@ -850,6 +850,38 @@ impl DerivedFactSource for NativeExecutionAdapter<'_> {
             message: e.to_string(),
         })
     }
+
+    async fn lookup_nodes_by_vids(
+        &self,
+        vids: &[u64],
+    ) -> std::result::Result<HashMap<u64, Value>, LocyError> {
+        if vids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        // Mirror the existing `lookup_derived_enriched` pattern: build a
+        // `MATCH (n) WHERE id(n) IN [...]` Cypher AST and run it through
+        // execute_query_ast, then index the returned rows by their vid.
+        let vids_literal = vids
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let query_str =
+            format!("MATCH (n) WHERE id(n) IN [{vids_literal}] RETURN id(n) AS _vid, n");
+        let mut out: HashMap<u64, Value> = HashMap::new();
+        if let Ok(ast) = uni_cypher::parse(&query_str)
+            && let Ok(batches) = self.execute_query_ast(ast).await
+        {
+            for row in record_batches_to_locy_rows(&batches) {
+                if let (Some(Value::Int(vid)), Some(node)) = (row.get("_vid"), row.get("n")) {
+                    if *vid >= 0 {
+                        out.insert(*vid as u64, node.clone());
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[async_trait]

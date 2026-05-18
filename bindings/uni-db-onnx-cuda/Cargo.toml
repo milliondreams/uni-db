@@ -23,6 +23,7 @@ pyo3-async-runtimes = { version = "0.27", features = ["tokio-runtime"] }
 # enabled; here only the ORT CUDA EP fires.
 uni-db = { workspace = true, default-features = false, features = [
     "lance-backend",
+    "mimalloc",
     "gpu-cuda",
     "provider-openai",
     "provider-gemini",

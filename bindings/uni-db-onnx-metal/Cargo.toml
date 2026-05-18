@@ -24,6 +24,7 @@ pyo3-async-runtimes = { version = "0.27", features = ["tokio-runtime"] }
 # requires another feature to flip ort on).
 uni-db = { workspace = true, default-features = false, features = [
     "lance-backend",
+    "mimalloc",
     "provider-onnx",
     "gpu-metal",
     "provider-openai",

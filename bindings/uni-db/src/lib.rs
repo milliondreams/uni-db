@@ -21,6 +21,14 @@ pub mod types;
 
 use pyo3::prelude::*;
 
+// Use mimalloc as the Rust-side global allocator. CPython keeps its own
+// allocator for Python objects; this only affects Rust allocations (AST,
+// plan, DataFusion, executor state -- the hot path for `tx.execute()`).
+// Measured ~3x throughput at sess=24 on the concurrent_mutations bench;
+// see crates/uni/benches/concurrent_mutations.rs and crates/uni/README.md.
+#[global_allocator]
+static GLOBAL: uni_db::MiMalloc = uni_db::MiMalloc;
+
 /// Python module for the Uni embedded graph database.
 #[pymodule]
 fn _uni_db(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {

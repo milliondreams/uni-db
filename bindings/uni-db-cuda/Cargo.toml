@@ -20,7 +20,7 @@ pyo3-async-runtimes = { version = "0.27", features = ["tokio-runtime"] }
 # CPU) plus NVIDIA acceleration. xervo 0.9.0's gpu-cuda activates ort/cuda
 # directly and the candle?/cuda + mistralrs?/cuda kernels for the local
 # providers already in the default.
-uni-db = { workspace = true, default-features = true, features = ["gpu-cuda"] }
+uni-db = { workspace = true, default-features = true, features = ["gpu-cuda", "mimalloc"] }
 uni-locy = { workspace = true }
 uni-common = { workspace = true }
 uni-store = { workspace = true }

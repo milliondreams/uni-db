@@ -303,7 +303,18 @@ impl Writer {
     /// Writes mutations to WAL, flushes, merges into main L0, and replays
     /// edges into the AdjacencyManager. Returns the WAL LSN of the commit
     /// (0 when no WAL is configured).
-    pub async fn commit_transaction_l0(&self, tx_l0_arc: Arc<RwLock<L0Buffer>>) -> Result<u64> {
+    /// Commit a transaction's private L0 buffer into main L0.
+    ///
+    /// Returns `(wal_lsn, flush_pending)`. When `flush_pending == true`, the
+    /// post-commit `should_flush()` predicate fired but no flush ran — the
+    /// caller is expected to spawn a background `flush_to_l1`. This is the
+    /// shape used by `docs/proposals/async_l0_to_l1_flush.md` when
+    /// `UniConfig::async_flush_enabled` is set, so commits don't block on
+    /// L1-streaming I/O.
+    pub async fn commit_transaction_l0(
+        &self,
+        tx_l0_arc: Arc<RwLock<L0Buffer>>,
+    ) -> Result<(u64, bool)> {
         // Hold `flush_lock` across WAL append + flush + main-L0 merge.
         // Two concurrent commits serialize here; in Phase 3 the outer
         // `Arc<RwLock<Writer>>` already provides this exclusion, so the
@@ -437,13 +448,24 @@ impl Writer {
         // 4. Best-effort compaction. We already hold `flush_lock`, so dispatch
         //    to `flush_to_l1_inner` directly to avoid re-acquiring the
         //    non-reentrant `tokio::sync::Mutex` (concurrent_writer.md §5.5).
+        //
+        //    The async-flush proposal (docs/proposals/async_l0_to_l1_flush.md)
+        //    would have us return `flush_pending = true` here and let the
+        //    caller spawn the streaming work. The MVP shape of that —
+        //    "just spawn the full flush_to_l1" — was measured pathological
+        //    (3-40x slower at high mutation rates because spawned flushes
+        //    convoy in front of subsequent commits on the same `flush_lock`).
+        //    Until the proper rotate/stream/finalize split lands, this stays
+        //    synchronous regardless of `config.async_flush_enabled`. The
+        //    second tuple element is kept for forward compatibility.
         if self.should_flush()
             && let Err(e) = self.flush_to_l1_inner(None).await
         {
             tracing::warn!("Post-commit flush check failed (non-critical): {}", e);
         }
+        let flush_pending = false;
 
-        Ok(wal_lsn)
+        Ok((wal_lsn, flush_pending))
     }
 
     /// Flush the WAL buffer to durable storage.

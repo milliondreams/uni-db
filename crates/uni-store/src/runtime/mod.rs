@@ -2,6 +2,7 @@
 // Copyright 2024-2026 Dragonscale Team
 
 pub mod context;
+pub mod flush_coordinator;
 pub mod id_allocator;
 pub mod id_reservoir;
 pub mod l0;

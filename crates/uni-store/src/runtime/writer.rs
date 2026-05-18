@@ -2815,21 +2815,38 @@ impl Writer {
     ///
     /// No-op for primary writers (`fork_id == None`).
     pub(crate) fn tick_fork_fragment_observability(&self) {
-        let Some(fork_id) = self.fork_id else { return };
+        Self::tick_fork_fragment_observability_static(
+            self.fork_id,
+            self.fork_flush_count.clone(),
+            self.fork_fragment_warn_fired.clone(),
+            self.config.fork_fragment_warn_threshold,
+        );
+    }
+
+    /// Static variant of [`Writer::tick_fork_fragment_observability`].
+    /// Used by the async-flush finalize path, where we hold a
+    /// [`SharedFlushCtx`] bundle of Arcs rather than `&Writer`.
+    pub(crate) fn tick_fork_fragment_observability_static(
+        fork_id: Option<ForkId>,
+        fork_flush_count: Arc<AtomicU64>,
+        fork_fragment_warn_fired: Arc<AtomicBool>,
+        warn_threshold: usize,
+    ) {
+        let Some(fork_id) = fork_id else { return };
         // `Relaxed` is sufficient: observational counter, no synchronizes-with.
-        let new_count = self.fork_flush_count.fetch_add(1, Ordering::Relaxed) + 1;
+        let new_count = fork_flush_count.fetch_add(1, Ordering::Relaxed) + 1;
         let fork_label = fork_id.to_string();
         metrics::gauge!(
             "uni_fork_l1_flushes",
             "fork" => fork_label.clone(),
         )
         .set(new_count as f64);
-        let threshold = self.config.fork_fragment_warn_threshold as u64;
-        if !self.fork_fragment_warn_fired.load(Ordering::Relaxed)
+        let threshold = warn_threshold as u64;
+        if !fork_fragment_warn_fired.load(Ordering::Relaxed)
             && threshold > 0
             && new_count >= threshold
         {
-            self.fork_fragment_warn_fired.store(true, Ordering::Relaxed);
+            fork_fragment_warn_fired.store(true, Ordering::Relaxed);
             tracing::warn!(
                 fork = %fork_label,
                 flush_count = new_count,
@@ -2849,10 +2866,26 @@ impl Writer {
         manifest: &SnapshotManifest,
         rebuild_mgr: Arc<crate::storage::index_rebuild::IndexRebuildManager>,
     ) {
-        let checker = crate::storage::index_rebuild::RebuildTriggerChecker::new(
+        Self::schedule_index_rebuilds_if_needed_static(
+            manifest,
+            rebuild_mgr,
+            self.schema_manager.clone(),
             self.config.index_rebuild.clone(),
         );
-        let schema = self.schema_manager.schema();
+    }
+
+    /// Static variant of [`Writer::schedule_index_rebuilds_if_needed`].
+    /// Used by the async-flush finalize path, where we hold the
+    /// [`SchemaManager`] via `SharedFlushCtx` rather than `&Writer`.
+    pub(crate) fn schedule_index_rebuilds_if_needed_static(
+        manifest: &SnapshotManifest,
+        rebuild_mgr: Arc<crate::storage::index_rebuild::IndexRebuildManager>,
+        schema_manager: Arc<uni_common::core::schema::SchemaManager>,
+        index_rebuild_config: uni_common::config::IndexRebuildConfig,
+    ) {
+        let checker =
+            crate::storage::index_rebuild::RebuildTriggerChecker::new(index_rebuild_config);
+        let schema = schema_manager.schema();
         let labels = checker.labels_needing_rebuild(manifest, &schema.indexes);
 
         if labels.is_empty() {
@@ -2863,7 +2896,7 @@ impl Writer {
         for label in &labels {
             for idx in &schema.indexes {
                 if idx.label() == label {
-                    let _ = self.schema_manager.update_index_metadata(idx.name(), |m| {
+                    let _ = schema_manager.update_index_metadata(idx.name(), |m| {
                         m.status = uni_common::core::schema::IndexStatus::Stale;
                     });
                 }

@@ -87,6 +87,38 @@ pub struct StorageManager {
     vid_labels_index: Option<Arc<parking_lot::RwLock<crate::storage::vid_labels::VidLabelsIndex>>>,
 }
 
+/// RAII counter increment for `StorageManager.flush_in_progress`.
+///
+/// Acquired during the rotate phase of a flush (see
+/// `runtime::writer::flush_l0_rotate`) and dropped when the full
+/// rotate/stream/finalize pipeline completes. Compaction's delta-clear
+/// gate skips while this counter is non-zero, so the counter must
+/// reflect "flush has started, has not completed" — including any
+/// async stream phase running on a spawned task.
+pub struct FlushInProgressGuard {
+    storage: Arc<StorageManager>,
+}
+
+impl FlushInProgressGuard {
+    pub fn new(storage: &Arc<StorageManager>) -> Self {
+        storage
+            .flush_in_progress
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Self {
+            storage: storage.clone(),
+        }
+    }
+}
+
+impl Drop for FlushInProgressGuard {
+    fn drop(&mut self) {
+        // M-PANIC-IS-STOP: must not panic in Drop. Atomic op cannot fail.
+        self.storage
+            .flush_in_progress
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 /// Helper to manage compaction_in_progress flag
 struct CompactionGuard {
     status: Arc<Mutex<CompactionStatus>>,

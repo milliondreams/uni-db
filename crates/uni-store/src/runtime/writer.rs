@@ -54,34 +54,9 @@ impl Default for WriterConfig {
 /// stuck. Returns `None` if a flush is already in progress, providing
 /// forward-compatible exclusion once the outer writer-RwLock is removed in
 /// Phase 4 of the concurrent-writer refactor.
-pub(crate) struct FlushInProgressGuard {
-    storage: Arc<StorageManager>,
-}
-
-impl FlushInProgressGuard {
-    /// Increments the in-progress flush counter and returns a guard that
-    /// decrements on drop. With the move to `AtomicUsize` (preparing for
-    /// async-flush), this is now a counter, not a single-holder latch —
-    /// multiple flushes may be in flight concurrently. The counter is
-    /// consumed only by compaction's delta-clear gate (`> 0` skips).
-    pub(crate) fn new(storage: &Arc<StorageManager>) -> Self {
-        storage
-            .flush_in_progress
-            .fetch_add(1, Ordering::AcqRel);
-        Self {
-            storage: storage.clone(),
-        }
-    }
-}
-
-impl Drop for FlushInProgressGuard {
-    fn drop(&mut self) {
-        // M-PANIC-IS-STOP: must not panic in Drop. Atomic op cannot fail.
-        self.storage
-            .flush_in_progress
-            .fetch_sub(1, Ordering::AcqRel);
-    }
-}
+// FlushInProgressGuard moved to storage/manager.rs so flush_coordinator.rs
+// can hold it on RotatedFlush without a writer.rs back-import cycle.
+pub use crate::storage::manager::FlushInProgressGuard;
 
 /// Output of [`Writer::flush_l0_rotate`]: the to-be-flushed L0 buffer,
 /// captured WAL LSN, current_version, and the in-progress guard whose
@@ -2220,6 +2195,65 @@ impl Writer {
     pub async fn flush_to_l1(&self, name: Option<String>) -> Result<String> {
         let _flush_lock_guard = self.flush_lock.lock().await;
         self.flush_inline_under_lock(name).await
+    }
+
+    /// Async-flush entry point: rotate under `flush_lock`, release the
+    /// lock, then submit the stream phase to the [`FlushCoordinator`].
+    /// Returns a [`FlushTicket`] that resolves when finalize completes.
+    ///
+    /// Errors if `config.async_flush_enabled = false` (the coordinator
+    /// is `None` in that case — see `flush_coordinator` field doc).
+    pub async fn flush_to_l1_async(
+        self: &Arc<Self>,
+        name: Option<String>,
+    ) -> Result<crate::runtime::flush_coordinator::FlushTicket> {
+        let coord = self
+            .flush_coordinator
+            .as_ref()
+            .ok_or_else(|| anyhow!("async flush not enabled (config.async_flush_enabled=false)"))?
+            .clone();
+        // 1. Acquire permit FIRST (outside flush_lock) so we don't
+        //    introduce a permit-while-holding-flush-lock convoy.
+        let permit = coord.acquire_permit().await?;
+        let seq = coord.next_rotate_seq();
+        coord.note_pending();
+        // 2. Rotate under flush_lock (µs work).
+        let RotateOutput {
+            old_l0_arc,
+            wal_lsn,
+            current_version,
+            flush_in_progress_guard,
+        } = {
+            let _flush_lock_guard = self.flush_lock.lock().await;
+            self.flush_l0_rotate().await?
+        };
+        // 3. Build the coordinator's RotatedFlush. parent_manifest is the
+        //    cached_manifest snapshot at this moment.
+        let parent_manifest = self.cached_manifest.lock().clone();
+        let rotated = RotatedFlush {
+            seq,
+            old_l0_arc: old_l0_arc.clone(),
+            wal_lsn,
+            current_version,
+            name: name.clone(),
+            parent_manifest,
+            permit,
+            flush_in_progress_guard,
+        };
+        // 4. Spawn the stream phase via the coordinator. The closure
+        //    captures Arc<Writer> transiently — drops when stream
+        //    completes (bounded, ~50-500 ms).
+        let writer = self.clone();
+        let ticket = coord.submit_for_stream(rotated, move |old_l0, wal, ver, n| async move {
+            let outcome = writer
+                .flush_stream_l1(old_l0, wal, ver, n)
+                .await?;
+            Ok(crate::runtime::flush_coordinator::FlushOutcome {
+                new_manifest: outcome.manifest,
+                snapshot_id: outcome.snapshot_id,
+            })
+        });
+        Ok(ticket)
     }
 
     /// Phase A+B+C of the flush: flush the WAL, rotate L0 (so the

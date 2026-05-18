@@ -22,7 +22,7 @@
 //! ```
 
 use crate::runtime::wal::WriteAheadLog;
-use crate::storage::manager::StorageManager;
+use crate::storage::manager::{FlushInProgressGuard, StorageManager};
 use parking_lot::RwLock as PlRwLock;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -37,6 +37,7 @@ pub struct RotatedFlush {
     pub seq: u64,
     pub old_l0_arc: Arc<PlRwLock<crate::runtime::l0::L0Buffer>>,
     pub wal_lsn: u64,
+    pub current_version: u64,
     pub name: Option<String>,
     /// Snapshot of `cached_manifest` taken at rotate time. Stream uses this
     /// as a tentative parent; finalize may rewrite it if predecessors
@@ -44,6 +45,10 @@ pub struct RotatedFlush {
     pub parent_manifest: Option<SnapshotManifest>,
     /// Permit holding the back-pressure slot. Released on finalize drop.
     pub permit: tokio::sync::OwnedSemaphorePermit,
+    /// Acquired during rotate; dropped when this `RotatedFlush` is consumed
+    /// by finalize (success or failure). Keeps `flush_in_progress` accurate
+    /// for the full async pipeline duration.
+    pub flush_in_progress_guard: FlushInProgressGuard,
 }
 
 /// Result of a stream phase: the manifest to publish.
@@ -216,6 +221,53 @@ impl FlushCoordinator {
             result,
             ack,
         });
+    }
+
+    /// Spawn the stream phase on a tokio task and return a [`FlushTicket`].
+    ///
+    /// `run_stream` is the closure that actually performs the L1 stream
+    /// work — it takes the rotate snapshot (`old_l0_arc`, `wal_lsn`,
+    /// `current_version`, `name`) and returns the built (but not yet
+    /// published) manifest as a `FlushOutcome`. The closure typically
+    /// captures `Arc<Writer>` so it can call `writer.flush_stream_l1`.
+    ///
+    /// On stream completion, the result and the consumed `RotatedFlush`
+    /// are sent through the coordinator's mpsc to the single-task
+    /// finalizer, which preserves rotate-order via a BinaryHeap.
+    ///
+    /// The returned `FlushTicket` resolves when finalize completes
+    /// (or fails). Dropping the ticket does NOT cancel the flush — the
+    /// pipeline runs to completion either way.
+    pub fn submit_for_stream<F, Fut>(
+        self: &Arc<Self>,
+        rotated: RotatedFlush,
+        run_stream: F,
+    ) -> FlushTicket
+    where
+        F: FnOnce(
+                Arc<PlRwLock<crate::runtime::l0::L0Buffer>>,
+                u64,
+                u64,
+                Option<String>,
+            ) -> Fut
+            + Send
+            + 'static,
+        Fut: std::future::Future<Output = anyhow::Result<FlushOutcome>> + Send + 'static,
+    {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        let coord = self.clone();
+        let seq = rotated.seq;
+        let old_l0 = rotated.old_l0_arc.clone();
+        let wal_lsn = rotated.wal_lsn;
+        let current_version = rotated.current_version;
+        let name = rotated.name.clone();
+        tokio::spawn(async move {
+            let result = run_stream(old_l0, wal_lsn, current_version, name).await;
+            coord.submit(seq, rotated, result, Some(ack_tx));
+            // `coord` Arc clone drops here, but the strong refcount stays
+            // > 0 because the original is still held on Writer.
+        });
+        FlushTicket::pending(ack_rx)
     }
 
     /// Wait until pending_count drops to zero. Used by `drop_fork`.

@@ -1946,6 +1946,8 @@ RETURN n.name, n.salary, n.department,
 | Function | Returns | Description |
 |---|---|---|
 | `id(node)` | UInt64 | Internal VID or EID |
+| `created_at(node_or_rel)` | DateTime (UTC, ns) | Wall-clock time when the row was first inserted. Read-only, system-managed. |
+| `updated_at(node_or_rel)` | DateTime (UTC, ns) | Most-recent write-touch time. Advances on any CREATE/SET/MERGE that targets the row, including same-value writes. |
 | `type(rel)` | String | Edge type name |
 | `labels(node)` | List | Node labels |
 | `keys(map)` | List | Map keys or node property names |
@@ -1954,6 +1956,26 @@ RETURN n.name, n.salary, n.department,
 | `relationships(path)` | List | Edges in a path |
 | `startNode(rel)` | Node | Source vertex of edge |
 | `endNode(rel)` | Node | Destination vertex of edge |
+
+#### System-managed timestamps
+
+`created_at(n)` and `updated_at(n)` (and the edge-equivalent `created_at(r)` / `updated_at(r)`) surface storage-layer timestamps that uni-db automatically maintains on every vertex and edge — no schema declaration needed. They return `DateTime` in UTC at nanosecond precision.
+
+**Semantics:**
+
+- `created_at` is set when the row is first inserted and never changes afterward.
+- `updated_at` is set at creation and bumped on every subsequent write that touches the row — including label changes, property updates, and same-value `SET`s. Idempotent `MERGE ... ON MATCH SET` will keep advancing it.
+- Both columns are visible inside the writing transaction (uncommitted writes see their own timestamps).
+- Read-only: there is no Cypher syntax to overwrite these values. The bulk loader can supply explicit per-row values via its API.
+
+```cypher
+// Filter by recency
+MATCH (n:Person) WHERE created_at(n) > datetime("2026-05-01") RETURN n
+
+// Compare to a known cutoff
+MATCH (a)-[r:KNOWS]->(b) RETURN r, updated_at(r) AS last_touched
+ORDER BY last_touched DESC LIMIT 10
+```
 
 ### String Functions
 

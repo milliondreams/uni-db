@@ -157,6 +157,11 @@ fn resolve_edge_property_type(
 ) -> DataType {
     if prop == "overflow_json" {
         DataType::LargeBinary
+    } else if prop == "_created_at" || prop == "_updated_at" {
+        // System-managed timestamps surfaced via `created_at(r)` /
+        // `updated_at(r)`. Stored on every edge by the L0 buffer and
+        // the on-disk Arrow tables as Timestamp(Nanosecond, UTC).
+        DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, Some("UTC".into()))
     } else {
         schema_props
             .and_then(|props| props.get(prop))
@@ -903,6 +908,40 @@ async fn build_edge_columns(
         let vid_keys: Vec<Vid> = eids.iter().map(|e| Vid::from(e.as_u64())).collect();
 
         for prop_name in edge_properties {
+            // System-managed edge timestamps live outside the property bag.
+            // Read them directly from L0 (earliest creation, latest update).
+            // Disk-only edges will surface as null — acceptable for the
+            // common case where the queried edges are L0-resident in the
+            // same session.
+            if prop_name == "_created_at" || prop_name == "_updated_at" {
+                let mut builder = arrow_array::builder::TimestampNanosecondBuilder::new()
+                    .with_timezone("UTC");
+                let l0_ctx = graph_ctx.l0_context();
+                for eid in &eids {
+                    let mut value: Option<i64> = None;
+                    for l0 in l0_ctx.iter_l0_buffers() {
+                        let guard = l0.read();
+                        let opt = if prop_name == "_created_at" {
+                            guard.edge_created_at.get(eid).copied()
+                        } else {
+                            guard.edge_updated_at.get(eid).copied()
+                        };
+                        if let Some(ts) = opt {
+                            value = Some(match value {
+                                None => ts,
+                                Some(cur) if prop_name == "_created_at" => cur.min(ts),
+                                Some(cur) => cur.max(ts),
+                            });
+                        }
+                    }
+                    match value {
+                        Some(ts) => builder.append_value(ts),
+                        None => builder.append_null(),
+                    }
+                }
+                columns.push(Arc::new(builder.finish()) as ArrayRef);
+                continue;
+            }
             let data_type = resolve_edge_property_type(prop_name, edge_type_props);
             let column =
                 build_property_column_static(&vid_keys, &props_map, prop_name, &data_type)?;

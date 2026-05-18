@@ -395,6 +395,16 @@ ORDER BY p.age DESC
 SKIP 10 LIMIT 20
 ```
 
+**11. System-managed timestamps (`created_at` / `updated_at`):**
+Every vertex and edge automatically carries a creation and modification timestamp. Access via Cypher functions, returns `DateTime` (UTC, ns). Read-only, no schema declaration needed.
+```cypher
+MATCH (n:Person) WHERE created_at(n) > datetime("2026-05-01")
+RETURN n, updated_at(n) AS last_modified
+
+MATCH (a)-[r:KNOWS]->(b) RETURN r, created_at(r), updated_at(r)
+```
+`updated_at` bumps on any write that touches the row — including idempotent MERGE / same-value SET.
+
 ---
 
 ## Critical Gotchas

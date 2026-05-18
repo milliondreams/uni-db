@@ -273,6 +273,8 @@ Non-aggregated columns in RETURN become implicit GROUP BY keys.
 | Function | Returns | Description |
 |---|---|---|
 | `id(node_or_rel)` | UInt64 | Internal VID or EID |
+| `created_at(node_or_rel)` | DateTime (UTC, ns) | First-insert timestamp. Read-only, system-managed; never changes after creation. |
+| `updated_at(node_or_rel)` | DateTime (UTC, ns) | Most-recent write-touch timestamp. Bumps on any CREATE/SET/MERGE that targets the row, including same-value writes. |
 | `type(rel)` | String | Edge type name |
 | `labels(node)` | List | Node labels |
 | `keys(map)` | List | Map keys / property names |

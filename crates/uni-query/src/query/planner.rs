@@ -3768,9 +3768,14 @@ impl QueryPlanner {
         }
     }
 
-    /// Rewrite `id(variable)` function calls to `variable._vid` property access.
-    /// `id()` is a pass-through for `_vid` — this normalization enables predicate
-    /// pushdown since Property patterns are recognized by PredicateAnalyzer.
+    /// Rewrite system-metadata function calls (`id(v)`, `created_at(v)`,
+    /// `updated_at(v)`) to direct property access on the corresponding
+    /// internal column (`v._vid`, `v._created_at`, `v._updated_at`). This
+    /// normalization enables predicate pushdown via the Property pattern
+    /// recognized by `PredicateAnalyzer`.
+    ///
+    /// All three functions share the same shape: single-arg, argument
+    /// must be a node/edge variable, returns the column value directly.
     fn rewrite_id_to_vid(expr: Expr) -> Expr {
         match expr {
             Expr::FunctionCall {
@@ -3778,9 +3783,10 @@ impl QueryPlanner {
                 args,
                 distinct,
                 window_spec,
-            } if name.eq_ignore_ascii_case("id") && args.len() == 1 => {
+            } if args.len() == 1 && Self::metadata_function_column(&name).is_some() => {
                 if let Expr::Variable(ref var) = args[0] {
-                    Expr::Property(Box::new(Expr::Variable(var.clone())), "_vid".to_string())
+                    let column = Self::metadata_function_column(&name).unwrap().to_string();
+                    Expr::Property(Box::new(Expr::Variable(var.clone())), column)
                 } else {
                     Expr::FunctionCall {
                         name,
@@ -3800,6 +3806,20 @@ impl QueryPlanner {
                 expr: Box::new(Self::rewrite_id_to_vid(*inner)),
             },
             other => other,
+        }
+    }
+
+    /// Return the internal column name for a system-metadata function, or
+    /// `None` if the name is not one of the recognised metadata functions.
+    fn metadata_function_column(name: &str) -> Option<&'static str> {
+        if name.eq_ignore_ascii_case("id") {
+            Some("_vid")
+        } else if name.eq_ignore_ascii_case("created_at") {
+            Some("_created_at")
+        } else if name.eq_ignore_ascii_case("updated_at") {
+            Some("_updated_at")
+        } else {
+            None
         }
     }
 
@@ -8747,6 +8767,23 @@ fn analyze_function_property_requirements(
             .entry(var.to_string())
             .or_default()
             .insert("*".to_string());
+    }
+
+    // System-managed timestamp functions: require only the corresponding
+    // `_created_at` / `_updated_at` column, not full entity materialization.
+    if name.eq_ignore_ascii_case("created_at") || name.eq_ignore_ascii_case("updated_at") {
+        if let Some(Expr::Variable(var)) = args.first() {
+            let col = if name.eq_ignore_ascii_case("created_at") {
+                "_created_at"
+            } else {
+                "_updated_at"
+            };
+            properties
+                .entry(var.clone())
+                .or_default()
+                .insert(col.to_string());
+        }
+        return;
     }
 
     let Some(spec) = get_function_spec(name) else {

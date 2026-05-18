@@ -78,6 +78,8 @@ macro_rules! impl_udf_eq_hash {
 /// Returns an error if UDF registration fails.
 pub fn register_cypher_udfs(ctx: &SessionContext) -> DFResult<()> {
     ctx.register_udf(create_id_udf());
+    ctx.register_udf(create_created_at_udf());
+    ctx.register_udf(create_updated_at_udf());
     ctx.register_udf(create_type_udf());
     ctx.register_udf(create_keys_udf());
     ctx.register_udf(create_properties_udf());
@@ -368,6 +370,90 @@ impl ScalarUDFImpl for IdUdf {
             return Err(datafusion::error::DataFusionError::Execution(
                 "id(): requires 1 argument".to_string(),
             ));
+        }
+        Ok(args.args[0].clone())
+    }
+}
+
+// ============================================================================
+// created_at(node_or_rel) / updated_at(node_or_rel) -> Timestamp(ns, UTC)
+// ============================================================================
+
+/// Create the `created_at` UDF for getting the creation timestamp of a
+/// node or relationship.
+///
+/// Returns the wall-clock time at which the row was first inserted, as a
+/// UTC `Timestamp(Nanosecond)`. Passthrough fallback — the planner
+/// normally rewrites `created_at(n)` to `n._created_at` before reaching
+/// DataFusion, but the UDF is registered so any code path that skips the
+/// rewrite yields a clean error rather than "unknown function".
+pub fn create_created_at_udf() -> ScalarUDF {
+    ScalarUDF::new_from_impl(SystemTimestampUdf::new("created_at"))
+}
+
+/// Create the `updated_at` UDF for getting the most-recent write-touch
+/// timestamp of a node or relationship.
+///
+/// Bumps on any successful CREATE/SET/MERGE that targets the row,
+/// including same-value writes. Passthrough fallback (see
+/// [`create_created_at_udf`]).
+pub fn create_updated_at_udf() -> ScalarUDF {
+    ScalarUDF::new_from_impl(SystemTimestampUdf::new("updated_at"))
+}
+
+#[derive(Debug)]
+struct SystemTimestampUdf {
+    name: &'static str,
+    signature: Signature,
+}
+
+impl SystemTimestampUdf {
+    fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            signature: Signature::new(
+                TypeSignature::Exact(vec![DataType::Timestamp(
+                    arrow_schema::TimeUnit::Nanosecond,
+                    Some("UTC".into()),
+                )]),
+                Volatility::Immutable,
+            ),
+        }
+    }
+}
+
+impl_udf_eq_hash!(SystemTimestampUdf);
+
+impl ScalarUDFImpl for SystemTimestampUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Timestamp(
+            arrow_schema::TimeUnit::Nanosecond,
+            Some("UTC".into()),
+        ))
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        // Passthrough: the planner rewrites `created_at(n)` /
+        // `updated_at(n)` to `n._created_at` / `n._updated_at` before
+        // DataFusion sees the call. If we get here, the column is
+        // already a Timestamp(ns, UTC).
+        if args.args.is_empty() {
+            return Err(datafusion::error::DataFusionError::Execution(format!(
+                "{}(): requires 1 argument",
+                self.name
+            )));
         }
         Ok(args.args[0].clone())
     }

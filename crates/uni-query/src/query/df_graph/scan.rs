@@ -678,6 +678,11 @@ pub(crate) fn resolve_property_type(
 ) -> DataType {
     if prop == "overflow_json" {
         DataType::LargeBinary
+    } else if prop == "_created_at" || prop == "_updated_at" {
+        // System-managed timestamps surfaced via `created_at(n)` /
+        // `updated_at(n)`. Stored on every vertex/edge by the L0 buffer
+        // and the on-disk Arrow tables as Timestamp(Nanosecond, UTC).
+        DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()))
     } else {
         schema_props
             .and_then(|props| props.get(prop))
@@ -1272,6 +1277,13 @@ fn build_l0_vertex_batch(
     // Collect all L0 vertex data, merging in visibility order
     let mut vid_data: HashMap<u64, (Properties, u64)> = HashMap::new(); // vid -> (props, version)
     let mut tombstones: HashSet<u64> = HashSet::new();
+    // System-managed timestamps: created_at takes the earliest seen
+    // timestamp across L0 buffers (preserving the original creation
+    // moment when a row has been touched in multiple buffers); updated_at
+    // takes the latest (most recent write). Used by `created_at(n)` /
+    // `updated_at(n)` Cypher functions.
+    let mut vid_created_at: HashMap<u64, i64> = HashMap::new();
+    let mut vid_updated_at: HashMap<u64, i64> = HashMap::new();
 
     for l0 in l0_ctx.iter_l0_buffers() {
         let guard = l0.read();
@@ -1316,6 +1328,27 @@ fn build_l0_vertex_batch(
             if version > entry.1 {
                 entry.1 = version;
             }
+            // Merge system timestamps: earliest creation, latest update
+            if let Some(&ts) = guard.vertex_created_at.get(&vid) {
+                vid_created_at
+                    .entry(vid_u64)
+                    .and_modify(|cur| {
+                        if ts < *cur {
+                            *cur = ts;
+                        }
+                    })
+                    .or_insert(ts);
+            }
+            if let Some(&ts) = guard.vertex_updated_at.get(&vid) {
+                vid_updated_at
+                    .entry(vid_u64)
+                    .and_modify(|cur| {
+                        if ts > *cur {
+                            *cur = ts;
+                        }
+                    })
+                    .or_insert(ts);
+            }
         }
     }
 
@@ -1354,6 +1387,28 @@ fn build_l0_vertex_batch(
             "_version" => {
                 let vals: Vec<u64> = vids.iter().map(|v| vid_data[v].1).collect();
                 columns.push(Arc::new(UInt64Array::from(vals)));
+            }
+            "_created_at" => {
+                let mut builder = arrow_array::builder::TimestampNanosecondBuilder::new()
+                    .with_timezone("UTC");
+                for v in &vids {
+                    match vid_created_at.get(v) {
+                        Some(&ts) => builder.append_value(ts),
+                        None => builder.append_null(),
+                    }
+                }
+                columns.push(Arc::new(builder.finish()));
+            }
+            "_updated_at" => {
+                let mut builder = arrow_array::builder::TimestampNanosecondBuilder::new()
+                    .with_timezone("UTC");
+                for v in &vids {
+                    match vid_updated_at.get(v) {
+                        Some(&ts) => builder.append_value(ts),
+                        None => builder.append_null(),
+                    }
+                }
+                columns.push(Arc::new(builder.finish()));
             }
             "overflow_json" => {
                 // Collect non-schema properties as CypherValue
@@ -1427,6 +1482,10 @@ fn build_l0_edge_batch(
     // eid -> (src_vid, dst_vid, properties, version)
     let mut eid_data: HashMap<u64, (u64, u64, Properties, u64)> = HashMap::new();
     let mut tombstones: HashSet<u64> = HashSet::new();
+    // System-managed timestamps: earliest creation, latest update.
+    // See `build_l0_vertex_batch` for the rationale.
+    let mut eid_created_at: HashMap<u64, i64> = HashMap::new();
+    let mut eid_updated_at: HashMap<u64, i64> = HashMap::new();
 
     for l0 in l0_ctx.iter_l0_buffers() {
         let guard = l0.read();
@@ -1460,6 +1519,27 @@ fn build_l0_edge_batch(
             // Take the highest version
             if version > entry.3 {
                 entry.3 = version;
+            }
+            // Merge system timestamps
+            if let Some(&ts) = guard.edge_created_at.get(&eid) {
+                eid_created_at
+                    .entry(eid_u64)
+                    .and_modify(|cur| {
+                        if ts < *cur {
+                            *cur = ts;
+                        }
+                    })
+                    .or_insert(ts);
+            }
+            if let Some(&ts) = guard.edge_updated_at.get(&eid) {
+                eid_updated_at
+                    .entry(eid_u64)
+                    .and_modify(|cur| {
+                        if ts > *cur {
+                            *cur = ts;
+                        }
+                    })
+                    .or_insert(ts);
             }
         }
     }
@@ -1507,6 +1587,28 @@ fn build_l0_edge_batch(
             "_version" => {
                 let vals: Vec<u64> = eids.iter().map(|e| eid_data[e].3).collect();
                 columns.push(Arc::new(UInt64Array::from(vals)));
+            }
+            "_created_at" => {
+                let mut builder = arrow_array::builder::TimestampNanosecondBuilder::new()
+                    .with_timezone("UTC");
+                for e in &eids {
+                    match eid_created_at.get(e) {
+                        Some(&ts) => builder.append_value(ts),
+                        None => builder.append_null(),
+                    }
+                }
+                columns.push(Arc::new(builder.finish()));
+            }
+            "_updated_at" => {
+                let mut builder = arrow_array::builder::TimestampNanosecondBuilder::new()
+                    .with_timezone("UTC");
+                for e in &eids {
+                    match eid_updated_at.get(e) {
+                        Some(&ts) => builder.append_value(ts),
+                        None => builder.append_null(),
+                    }
+                }
+                columns.push(Arc::new(builder.finish()));
             }
             "overflow_json" => {
                 // Collect non-schema properties as CypherValue
@@ -1884,6 +1986,10 @@ async fn columnar_scan_vertex_batch_static(
     for prop in projected_properties {
         if prop == "overflow_json" {
             push_column_if_absent(&mut lance_columns, "overflow_json");
+        } else if prop == "_created_at" || prop == "_updated_at" {
+            // System-managed timestamps live on every vertex table regardless
+            // of label schema. Request them directly from Lance.
+            push_column_if_absent(&mut lance_columns, prop);
         } else {
             let exists_in_schema = label_props.is_some_and(|lp| lp.contains_key(prop));
             if exists_in_schema {
@@ -1893,9 +1999,12 @@ async fn columnar_scan_vertex_batch_static(
     }
 
     // Ensure overflow_json is present when any projected property is not in the schema
-    let needs_overflow = projected_properties
-        .iter()
-        .any(|p| p == "overflow_json" || !label_props.is_some_and(|lp| lp.contains_key(p)));
+    // (excluding system-managed columns like `_created_at` / `_updated_at`).
+    let needs_overflow = projected_properties.iter().any(|p| {
+        p == "overflow_json"
+            || (!matches!(p.as_str(), "_created_at" | "_updated_at")
+                && !label_props.is_some_and(|lp| lp.contains_key(p)))
+    });
     if needs_overflow {
         push_column_if_absent(&mut lance_columns, "overflow_json");
     }
@@ -1935,6 +2044,12 @@ async fn columnar_scan_vertex_batch_static(
                 }
                 if col == "overflow_json" {
                     fields.push(Field::new("overflow_json", DataType::LargeBinary, true));
+                } else if col == "_created_at" || col == "_updated_at" {
+                    fields.push(Field::new(
+                        col,
+                        DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                        true,
+                    ));
                 } else {
                     let arrow_type = label_props
                         .and_then(|lp| lp.get(col.as_str()))
@@ -2041,6 +2156,9 @@ async fn columnar_scan_edge_batch_static(
     for prop in projected_properties {
         if prop == "overflow_json" {
             push_column_if_absent(&mut lance_columns, "overflow_json");
+        } else if prop == "_created_at" || prop == "_updated_at" {
+            // System-managed timestamps live on every edge table.
+            push_column_if_absent(&mut lance_columns, prop);
         } else {
             let exists_in_schema = type_props.is_some_and(|tp| tp.contains_key(prop));
             if exists_in_schema {
@@ -2050,9 +2168,12 @@ async fn columnar_scan_edge_batch_static(
     }
 
     // Ensure overflow_json is present when any projected property is not in the schema
-    let needs_overflow = projected_properties
-        .iter()
-        .any(|p| p == "overflow_json" || !type_props.is_some_and(|tp| tp.contains_key(p)));
+    // (excluding system-managed columns like `_created_at` / `_updated_at`).
+    let needs_overflow = projected_properties.iter().any(|p| {
+        p == "overflow_json"
+            || (!matches!(p.as_str(), "_created_at" | "_updated_at")
+                && !type_props.is_some_and(|tp| tp.contains_key(p)))
+    });
     if needs_overflow {
         push_column_if_absent(&mut lance_columns, "overflow_json");
     }
@@ -2088,6 +2209,12 @@ async fn columnar_scan_edge_batch_static(
                 }
                 if col == "overflow_json" {
                     fields.push(Field::new("overflow_json", DataType::LargeBinary, true));
+                } else if col == "_created_at" || col == "_updated_at" {
+                    fields.push(Field::new(
+                        col,
+                        DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                        true,
+                    ));
                 } else {
                     let arrow_type = type_props
                         .and_then(|tp| tp.get(col.as_str()))

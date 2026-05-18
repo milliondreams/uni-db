@@ -217,10 +217,18 @@ impl HybridPhysicalPlanner {
                         .map(|p| p.keys().cloned().collect())
                         .unwrap_or_default();
 
-                    // Collect explicit property names (non-wildcard, non-internal)
+                    // Collect explicit property names (non-wildcard, non-internal).
+                    // System-managed columns surfaced through Cypher functions
+                    // (e.g. `_created_at`/`_updated_at` via `created_at(n)`/
+                    // `updated_at(n)`) are kept — they are intentionally
+                    // requested even when the wildcard is also set.
                     let explicit: Vec<String> = props
                         .iter()
-                        .filter(|p| *p != "*" && !p.starts_with('_'))
+                        .filter(|p| {
+                            *p != "*"
+                                && (!p.starts_with('_')
+                                    || matches!(p.as_str(), "_created_at" | "_updated_at"))
+                        })
                         .cloned()
                         .collect();
 
@@ -2310,10 +2318,14 @@ impl HybridPhysicalPlanner {
                         .collect();
 
                     // Also include explicitly referenced properties (non-wildcard, non-internal)
-                    // that may be overflow properties not in the schema
+                    // that may be overflow properties not in the schema. System-managed
+                    // timestamp columns (`_created_at`, `_updated_at`) requested via
+                    // `created_at(r)` / `updated_at(r)` are kept too.
                     if let Some(props) = all_properties.get(edge_var) {
                         for p in props {
-                            if p != "*" && !p.starts_with('_') && !schema_props.contains(p) {
+                            let passthrough = !p.starts_with('_')
+                                || matches!(p.as_str(), "_created_at" | "_updated_at");
+                            if p != "*" && passthrough && !schema_props.contains(p) {
                                 schema_props.push(p.clone());
                             }
                         }

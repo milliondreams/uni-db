@@ -457,6 +457,25 @@ Uni provides a comprehensive set of scalar functions for data transformation.
 | `nodes(path)` | List of nodes in path | `RETURN nodes(path)` |
 | `relationships(path)` | List of relationships in path | `RETURN relationships(path)` |
 
+### System-Managed Timestamps
+
+Every vertex and edge automatically carries creation and modification timestamps maintained by the storage layer. They are exposed as Cypher functions and return `DateTime` (UTC, nanosecond precision). Read-only, no schema declaration required.
+
+| Function | Description | Example |
+|----------|-------------|---------|
+| `created_at(n)` / `created_at(r)` | Wall-clock time when the row was first inserted. Never changes after creation. | `WHERE created_at(n) > datetime("2026-05-01")` |
+| `updated_at(n)` / `updated_at(r)` | Most-recent write-touch timestamp. Bumps on any CREATE/SET/MERGE that targets the row, including same-value writes. | `RETURN n ORDER BY updated_at(n) DESC` |
+
+```cypher
+-- Find recently created people
+MATCH (n:Person) WHERE created_at(n) > datetime("2026-05-01") RETURN n
+
+-- Edges work the same way
+MATCH (a)-[r:KNOWS]->(b) RETURN r, created_at(r), updated_at(r)
+```
+
+The bulk loader can supply explicit per-row values; otherwise the engine assigns timestamps at insertion time.
+
 ### Type Conversion Functions
 
 | Function | Description | Example |

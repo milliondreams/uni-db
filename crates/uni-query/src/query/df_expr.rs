@@ -1995,6 +1995,24 @@ fn translate_graph_function(
                 Some(Ok(dummy_udf_expr("id", df_args.to_vec())))
             }
         }
+        "CREATED_AT" | "UPDATED_AT" => {
+            // Rewrite `created_at(n)` / `updated_at(n)` to the underlying
+            // `n._created_at` / `n._updated_at` column reference. Same column
+            // name on vertex and edge tables, so no node/edge dispatch needed.
+            if let Some(Expr::Variable(var)) = args.first() {
+                let suffix = if name_upper == "CREATED_AT" {
+                    "_created_at"
+                } else {
+                    "_updated_at"
+                };
+                Some(Ok(DfExpr::Column(Column::from_name(format!(
+                    "{}.{}",
+                    var, suffix
+                )))))
+            } else {
+                Some(Ok(dummy_udf_expr(name, df_args.to_vec())))
+            }
+        }
         "LABELS" | "KEYS" => {
             // labels(n)/keys(n) expect the struct column representing the whole entity.
             // The struct is built by add_structural_projection() and exposed as Column("n").

@@ -77,6 +77,10 @@ harness = false
 name = "fork_diff_promote"
 harness = false
 
+[[bench]]
+name = "concurrent_mutations"
+harness = false
+
 [features]
 default = [
     "lance-backend",

@@ -121,10 +121,10 @@ pub struct Writer {
     /// configured threshold. One-shot per writer lifetime. `Relaxed` is
     /// sufficient — observational only.
     fork_fragment_warn_fired: AtomicBool,
-    /// Dedicated lock for the genuinely-exclusive flush path. Declared in
-    /// Phase 1 of the concurrent-writer refactor but **not yet acquired**;
-    /// Phase 3 wires it into `flush_to_l1` and `commit_transaction_l0`.
-    #[allow(dead_code)]
+    /// Dedicated lock for the genuinely-exclusive flush path. Acquired by
+    /// the [`Writer::flush_to_l1`] entry and by `commit_transaction_l0`
+    /// across its WAL-append + L0-merge window. Replaces the outer
+    /// `Arc<RwLock<Writer>>` for flush exclusion once Phase 4 drops it.
     flush_lock: tokio::sync::Mutex<()>,
 }
 
@@ -282,6 +282,13 @@ impl Writer {
     /// edges into the AdjacencyManager. Returns the WAL LSN of the commit
     /// (0 when no WAL is configured).
     pub async fn commit_transaction_l0(&self, tx_l0_arc: Arc<RwLock<L0Buffer>>) -> Result<u64> {
+        // Hold `flush_lock` across WAL append + flush + main-L0 merge.
+        // Two concurrent commits serialize here; in Phase 3 the outer
+        // `Arc<RwLock<Writer>>` already provides this exclusion, so the
+        // acquisition is uncontended. Phase 4 drops the outer lock and
+        // this becomes the load-bearing serialization point.
+        let _flush_lock_guard = self.flush_lock.lock().await;
+
         // 1. Write transaction mutations to WAL BEFORE merging into main L0
         // This ensures durability before visibility.
         {
@@ -405,8 +412,12 @@ impl Writer {
 
         self.update_metrics();
 
-        // 4. Best-effort compaction
-        if let Err(e) = self.check_flush().await {
+        // 4. Best-effort compaction. We already hold `flush_lock`, so dispatch
+        //    to `flush_to_l1_inner` directly to avoid re-acquiring the
+        //    non-reentrant `tokio::sync::Mutex` (concurrent_writer.md §5.5).
+        if self.should_flush()
+            && let Err(e) = self.flush_to_l1_inner(None).await
+        {
             tracing::warn!("Post-commit flush check failed (non-critical): {}", e);
         }
 
@@ -1831,31 +1842,36 @@ impl Writer {
         Ok(())
     }
 
-    /// Check if flush should be triggered based on mutation count or time elapsed.
-    /// This method is called after each write operation and can also be called
-    /// by a background task for time-based flushing.
-    pub async fn check_flush(&self) -> Result<()> {
+    /// Decide whether a flush should be triggered based on mutation count
+    /// or elapsed time since the last flush.
+    ///
+    /// Extracted from [`Writer::check_flush`] so `commit_transaction_l0` can
+    /// reuse the decision while bypassing the lock-acquiring entry point
+    /// (it already holds `flush_lock`).
+    fn should_flush(&self) -> bool {
         let count = self.l0_manager.get_current().read().mutation_count;
-
-        // Skip if no mutations
         if count == 0 {
-            return Ok(());
+            return false;
         }
-
-        // Flush on mutation count threshold (10,000 default)
         if count >= self.config.auto_flush_threshold {
-            self.flush_to_l1(None).await?;
-            return Ok(());
+            return true;
         }
-
-        // Flush on time interval IF minimum mutations met
         if let Some(interval) = self.config.auto_flush_interval
             && self.last_flush_time.lock().elapsed() >= interval
             && count >= self.config.auto_flush_min_mutations
         {
+            return true;
+        }
+        false
+    }
+
+    /// Check if flush should be triggered based on mutation count or time elapsed.
+    /// This method is called after each write operation and can also be called
+    /// by a background task for time-based flushing.
+    pub async fn check_flush(&self) -> Result<()> {
+        if self.should_flush() {
             self.flush_to_l1(None).await?;
         }
-
         Ok(())
     }
 
@@ -2033,16 +2049,29 @@ impl Writer {
     /// # Lock Ordering
     ///
     /// To prevent deadlocks, locks must be acquired in the following order:
-    /// 1. `Writer` lock (held by caller)
-    /// 2. `L0Manager` lock (via `begin_flush` / `get_current`)
-    /// 3. `L0Buffer` lock (individual buffer RWLocks)
-    /// 4. `Index` / `Storage` locks (during actual flush)
+    /// 1. `Writer` lock (held by caller via outer `Arc<RwLock<Writer>>`; removed in Phase 4)
+    /// 2. `flush_lock` (acquired by this entry point; held across the whole flush)
+    /// 3. `L0Manager` lock (via `begin_flush` / `get_current`)
+    /// 4. `L0Buffer` lock (individual buffer RWLocks)
+    /// 5. `Index` / `Storage` locks (during actual flush)
+    ///
+    /// Callers that already hold `flush_lock` (today only `commit_transaction_l0`)
+    /// must call [`Writer::flush_to_l1_inner`] directly to avoid a re-entrant
+    /// `tokio::sync::Mutex` deadlock — see concurrent_writer.md §5.5.
+    pub async fn flush_to_l1(&self, name: Option<String>) -> Result<String> {
+        let _flush_lock_guard = self.flush_lock.lock().await;
+        self.flush_to_l1_inner(name).await
+    }
+
+    /// Body of [`Writer::flush_to_l1`]; assumes the caller has already acquired
+    /// `flush_lock`. The `FlushInProgressGuard` inside is a complementary CAS
+    /// safety net against any future caller that bypasses `flush_lock`.
     #[instrument(
         skip(self),
         fields(snapshot_id, mutations_count, size_bytes),
         level = "info"
     )]
-    pub async fn flush_to_l1(&self, name: Option<String>) -> Result<String> {
+    async fn flush_to_l1_inner(&self, name: Option<String>) -> Result<String> {
         let start = std::time::Instant::now();
         let schema = self.schema_manager.schema();
 

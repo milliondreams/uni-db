@@ -407,10 +407,14 @@ impl Transaction {
             operation: "bulk_insert_edges".to_string(),
         })?;
         let writer: &uni_store::Writer = writer_lock.as_ref();
+        // Pre-allocate all EIDs in one IdAllocator mutex acquisition.
+        let eids = writer
+            .allocate_eids(edges.len())
+            .await
+            .map_err(UniError::Internal)?;
         // Route mutations through the transaction's private L0.
         let result: Result<()> = async {
-            for (src_vid, dst_vid, props) in edges {
-                let eid = writer.next_eid(type_id).await.map_err(UniError::Internal)?;
+            for ((src_vid, dst_vid, props), eid) in edges.into_iter().zip(eids) {
                 writer
                     .insert_edge(
                         src_vid,

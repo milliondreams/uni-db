@@ -904,23 +904,23 @@ impl BulkWriter {
         edges: Vec<EdgeData>,
     ) -> Result<Vec<Eid>> {
         let schema = self.db.schema.schema();
-        let edge_meta =
-            schema
-                .edge_types
-                .get(edge_type)
-                .ok_or_else(|| UniError::EdgeTypeNotFound {
-                    edge_type: edge_type.to_string(),
-                })?;
-        let type_id = edge_meta.id;
+        // Validate the edge type exists, but its id is no longer needed:
+        // `allocate_eids` does not partition by type.
+        schema
+            .edge_types
+            .get(edge_type)
+            .ok_or_else(|| UniError::EdgeTypeNotFound {
+                edge_type: edge_type.to_string(),
+            })?;
 
-        // Allocate EIDs
-        let mut eids = Vec::with_capacity(edges.len());
-        {
+        // Allocate EIDs in one IdAllocator mutex acquisition.
+        let eids = {
             let writer = self.db.writer.as_ref().unwrap();
-            for _ in 0..edges.len() {
-                eids.push(writer.next_eid(type_id).await.map_err(UniError::Internal)?);
-            }
-        }
+            writer
+                .allocate_eids(edges.len())
+                .await
+                .map_err(UniError::Internal)?
+        };
 
         // Convert to L1Entry format and track buffer size
         let now = self.get_current_timestamp_micros();

@@ -252,6 +252,12 @@ impl Writer {
         self.allocator.allocate_eid().await
     }
 
+    /// Allocates multiple EIDs at once for bulk operations.
+    /// This is more efficient than calling next_eid() in a loop.
+    pub async fn allocate_eids(&self, count: usize) -> Result<Vec<Eid>> {
+        self.allocator.allocate_eids(count).await
+    }
+
     /// Install the embedding runtime exactly once. Receiver is `&self` so it
     /// can be called after the `Writer` has been wrapped in `Arc<Writer>`.
     pub fn set_xervo_runtime(&self, runtime: Arc<ModelRuntime>) -> Result<()> {

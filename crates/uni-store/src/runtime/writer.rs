@@ -469,21 +469,17 @@ impl Writer {
 
         self.update_metrics();
 
-        // 4. Best-effort compaction. We already hold `flush_lock`, so dispatch
-        //    to `flush_to_l1_inner` directly to avoid re-acquiring the
-        //    non-reentrant `tokio::sync::Mutex` (concurrent_writer.md §5.5).
+        // 4. Best-effort post-commit auto-flush. We already hold `flush_lock`,
+        //    so dispatch directly to the lock-assuming composition helper to
+        //    avoid re-acquiring the non-reentrant `tokio::sync::Mutex`.
         //
         //    The async-flush proposal (docs/proposals/async_l0_to_l1_flush.md)
-        //    would have us return `flush_pending = true` here and let the
-        //    caller spawn the streaming work. The MVP shape of that —
-        //    "just spawn the full flush_to_l1" — was measured pathological
-        //    (3-40x slower at high mutation rates because spawned flushes
-        //    convoy in front of subsequent commits on the same `flush_lock`).
-        //    Until the proper rotate/stream/finalize split lands, this stays
-        //    synchronous regardless of `config.async_flush_enabled`. The
-        //    second tuple element is kept for forward compatibility.
+        //    will route this path through the FlushCoordinator when
+        //    `async_flush_enabled` is true. Until that wiring lands (Commit 7),
+        //    this stays synchronous regardless of the flag. The tuple's
+        //    second element is kept for forward compatibility.
         if self.should_flush()
-            && let Err(e) = self.flush_to_l1_inner(None).await
+            && let Err(e) = self.flush_inline_under_lock(None).await
         {
             tracing::warn!("Post-commit flush check failed (non-critical): {}", e);
         }
@@ -2124,11 +2120,11 @@ impl Writer {
     /// 5. `Index` / `Storage` locks (during actual flush)
     ///
     /// Callers that already hold `flush_lock` (today only `commit_transaction_l0`)
-    /// must call [`Writer::flush_to_l1_inner`] directly to avoid a re-entrant
+    /// must call [`Writer::flush_inline_under_lock`] directly to avoid a re-entrant
     /// `tokio::sync::Mutex` deadlock — see concurrent_writer.md §5.5.
     pub async fn flush_to_l1(&self, name: Option<String>) -> Result<String> {
         let _flush_lock_guard = self.flush_lock.lock().await;
-        self.flush_to_l1_inner(name).await
+        self.flush_inline_under_lock(name).await
     }
 
     /// Phase A+B+C of the flush: flush the WAL, rotate L0 (so the
@@ -2661,15 +2657,17 @@ impl Writer {
         Ok(FlushOutcome { manifest, snapshot_id })
     }
 
-    /// Body of [`Writer::flush_to_l1`]; assumes the caller has already acquired
-    /// `flush_lock`. The `FlushInProgressGuard` inside is a complementary CAS
-    /// safety net against any future caller that bypasses `flush_lock`.
+    /// Composition entry that assumes the caller already holds `flush_lock`.
+    /// Runs rotate + stream + finalize_locked in sequence. Used by
+    /// [`Writer::flush_to_l1`] (acquires the lock first) and by
+    /// `commit_transaction_l0`'s post-merge auto-flush branch (which already
+    /// holds the lock from the commit critical section).
     #[instrument(
         skip(self),
         fields(snapshot_id, mutations_count, size_bytes),
         level = "info"
     )]
-    async fn flush_to_l1_inner(&self, name: Option<String>) -> Result<String> {
+    async fn flush_inline_under_lock(&self, name: Option<String>) -> Result<String> {
         let start = std::time::Instant::now();
 
         let (initial_size, initial_count) = {
@@ -2682,11 +2680,9 @@ impl Writer {
 
         debug!("Starting L0 flush to L1");
 
-        // Phases A (WAL pre-flush), B (rotate), C (WAL handoff) live in
-        // flush_l0_rotate. The FlushInProgressGuard travels with the
-        // RotateOutput so the counter stays accurate for the full flush
-        // lifetime (preparation for async path where the guard will live
-        // on RotatedFlush all the way through finalize).
+        // Phases A (WAL pre-flush), B (rotate), C (WAL handoff).
+        // FlushInProgressGuard lives on RotateOutput and stays alive for
+        // the full flush — including the finalize_locked call below.
         let RotateOutput {
             old_l0_arc,
             wal_lsn,
@@ -2695,15 +2691,46 @@ impl Writer {
         } = self.flush_l0_rotate().await?;
 
         // Phases D (L1 collect), E (orphan resolve), F (manifest seed),
-        // G (Lance writes) live in flush_stream_l1. Today it takes &self
-        // and runs inline; in Commit 5 it becomes a static `Send + 'static`
-        // function that can run on a spawned task with SharedFlushCtx.
-        let FlushOutcome { manifest, snapshot_id } = self
+        // G (Lance writes). Builds the manifest but does NOT publish it.
+        let FlushOutcome {
+            manifest,
+            snapshot_id,
+        } = self
             .flush_stream_l1(old_l0_arc.clone(), wal_lsn, current_version, name)
             .await?;
 
+        // Phases H..S: publish manifest, complete_flush, WAL truncate,
+        // property cache clear, last_flush_time, metrics, l1_runs++,
+        // compaction trigger, index-rebuild scheduling, fork tick.
+        self.flush_finalize_locked(
+            old_l0_arc,
+            wal_lsn,
+            manifest,
+            snapshot_id,
+            initial_size,
+            initial_count,
+            start,
+        )
+        .await
+    }
 
-        // 5. Save Snapshot
+    /// Phases H..S of the flush: publish the manifest and run all
+    /// post-publish bookkeeping. Assumes the caller already holds
+    /// `flush_lock` — see [`Writer::flush_finalize_now`] for the
+    /// lock-acquiring variant used by the async finalize path.
+    #[allow(clippy::too_many_arguments)]
+    async fn flush_finalize_locked(
+        &self,
+        old_l0_arc: Arc<RwLock<L0Buffer>>,
+        wal_lsn: u64,
+        manifest: SnapshotManifest,
+        snapshot_id: String,
+        initial_size: usize,
+        initial_count: usize,
+        start: std::time::Instant,
+    ) -> Result<String> {
+        // H. Publish manifest (body first, then pointer — recovery is
+        // idempotent if we crash between the two).
         self.storage
             .snapshot_manager()
             .save_snapshot(&manifest)
@@ -2713,20 +2740,16 @@ impl Writer {
             .set_latest_snapshot(&manifest.snapshot_id)
             .await?;
 
-        // Cache manifest for next flush to avoid re-reading from object store
+        // I. Cache manifest for next flush to avoid re-reading from object store.
         *self.cached_manifest.lock() = Some(manifest.clone());
 
-        // Complete flush: remove old L0 from pending list now that L1 writes succeeded.
-        // This must happen BEFORE WAL truncation so min_pending_wal_lsn is accurate.
+        // J. Complete flush: remove old L0 from pending_flush. MUST happen
+        // BEFORE WAL truncation so min_pending_wal_lsn is accurate.
         self.l0_manager.complete_flush(&old_l0_arc);
 
-        // Truncate WAL segments, but only up to the minimum LSN of any remaining pending L0s.
-        // This prevents data loss if earlier flushes failed and left L0s in pending_flush.
-        // The WAL Arc was transferred from old→new L0 during rotate (Phase C),
-        // so the current L0 holds the same WAL handle and we re-fetch it here.
+        // K. Truncate WAL up to the safe LSN.
         let wal_handle = self.l0_manager.get_current().read().wal.clone();
         if let Some(w) = wal_handle {
-            // Determine safe truncation point: the minimum of our LSN and any pending L0s
             let safe_lsn = self
                 .l0_manager
                 .min_pending_wal_lsn()
@@ -2735,13 +2758,12 @@ impl Writer {
             w.truncate_before(safe_lsn).await?;
         }
 
-        // Invalidate property cache after flush to prevent stale reads.
-        // Once L0 data moves to storage, cached values from storage may be outdated.
+        // L. Invalidate property cache after flush to prevent stale reads.
         if let Some(ref pm) = self.property_manager {
             pm.clear_cache().await;
         }
 
-        // Reset last flush time for time-based auto-flush
+        // M. Reset last flush time for time-based auto-flush.
         *self.last_flush_time.lock() = std::time::Instant::now();
 
         info!(
@@ -2754,11 +2776,7 @@ impl Writer {
         metrics::counter!("uni_flush_bytes_total").increment(initial_size as u64);
         metrics::counter!("uni_flush_rows_total").increment(initial_count as u64);
 
-        // `_flush_guard` drops at end-of-scope (or any `?` early-exit above),
-        // clearing `flush_in_progress` and unblocking compaction's delta clears.
-
-        // Increment flush generation counter for write throttling.
-        // l1_runs counts uncompacted flush generations (reset by compaction).
+        // P. Increment flush generation counter for write throttling.
         {
             let mut status = uni_common::sync::acquire_mutex(
                 &self.storage.compaction_status,
@@ -2767,17 +2785,13 @@ impl Writer {
             status.l1_runs += 1;
         }
 
-        // Trigger CSR compaction if enough frozen segments have accumulated.
-        // After flush, the old L0 data is now in L1; the overlay segments can be merged
-        // into the Main CSR to reduce lookup overhead. Threshold is configurable
-        // via `CompactionConfig::frozen_segments_compact_threshold` (default 4).
+        // Q. Trigger CSR compaction if enough frozen segments have accumulated.
         let am = self.adjacency_manager.clone();
         if am.should_compact(self.config.compaction.frozen_segments_compact_threshold) {
             let previous_still_running = {
                 let guard = self.compaction_handle.read();
                 guard.as_ref().is_some_and(|h| !h.is_finished())
             };
-
             if previous_still_running {
                 info!("Skipping compaction: previous compaction still in progress");
             } else {
@@ -2788,15 +2802,14 @@ impl Writer {
             }
         }
 
-        // Post-flush: check if any indexes need rebuilding based on thresholds
+        // R. Post-flush: check if any indexes need rebuilding based on thresholds.
         if let Some(rebuild_mgr) = self.index_rebuild_manager.get()
             && self.config.index_rebuild.auto_rebuild_enabled
         {
             self.schedule_index_rebuilds_if_needed(&manifest, rebuild_mgr.clone());
         }
 
-        // Phase 2 Day 12: emit fork-fragment observability after a
-        // successful forked flush.
+        // S. Emit fork-fragment observability after a successful forked flush.
         self.tick_fork_fragment_observability();
 
         Ok(snapshot_id)

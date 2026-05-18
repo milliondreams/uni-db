@@ -15,9 +15,10 @@ use crate::storage::manager::StorageManager;
 use anyhow::{Result, anyhow};
 use chrono::Utc;
 use metrics;
-use parking_lot::RwLock;
+use parking_lot::{Mutex as PlMutex, RwLock};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tracing::{debug, info, instrument};
 use uni_common::Properties;
 use uni_common::Value;
@@ -42,6 +43,41 @@ impl Default for WriterConfig {
     }
 }
 
+/// RAII latch on [`StorageManager::flush_in_progress`].
+///
+/// Sets the flag to `true` on construction (via CAS) and back to `false` on
+/// drop, so any `?` early-exit inside `flush_to_l1` cannot leave the flag
+/// stuck. Returns `None` if a flush is already in progress, providing
+/// forward-compatible exclusion once the outer writer-RwLock is removed in
+/// Phase 4 of the concurrent-writer refactor.
+struct FlushInProgressGuard {
+    storage: Arc<StorageManager>,
+}
+
+impl FlushInProgressGuard {
+    /// Attempts to acquire the flush latch via CAS.
+    ///
+    /// Returns `None` when another flush is already in progress.
+    fn new(storage: &Arc<StorageManager>) -> Option<Self> {
+        storage
+            .flush_in_progress
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()?;
+        Some(Self {
+            storage: storage.clone(),
+        })
+    }
+}
+
+impl Drop for FlushInProgressGuard {
+    fn drop(&mut self) {
+        // M-PANIC-IS-STOP: must not panic in Drop. Plain atomic store cannot fail.
+        self.storage
+            .flush_in_progress
+            .store(false, Ordering::Release);
+    }
+}
+
 pub struct Writer {
     pub l0_manager: Arc<L0Manager>,
     pub storage: Arc<StorageManager>,
@@ -53,15 +89,19 @@ pub struct Writer {
     pub property_manager: Option<Arc<PropertyManager>>,
     /// Adjacency manager for dual-write (edges survive flush).
     adjacency_manager: Arc<AdjacencyManager>,
-    /// Timestamp of last flush or creation
-    last_flush_time: std::time::Instant,
+    /// Timestamp of last flush or creation. Interior-mutable so that
+    /// `&self` callers can update it; uncontended in practice because all
+    /// writes happen inside the single-flusher critical section.
+    last_flush_time: PlMutex<std::time::Instant>,
     /// Background compaction task handle (prevents concurrent compaction races)
     compaction_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
     /// Optional index rebuild manager for post-flush automatic rebuild scheduling
     index_rebuild_manager: Option<Arc<crate::storage::index_rebuild::IndexRebuildManager>>,
     /// Cached snapshot manifest from the last flush. Avoids re-reading from
-    /// object store on every flush_to_l1 call.
-    cached_manifest: Option<SnapshotManifest>,
+    /// object store on every flush_to_l1 call. Wrapped in a `Mutex` for
+    /// `&self` access; uncontended because all access is inside the
+    /// single-flusher critical section.
+    cached_manifest: PlMutex<Option<SnapshotManifest>>,
     /// Identifier of the fork this writer serves, if any. `None` for
     /// primary's writer. Set by [`crate::fork::writer_factory::new_for_fork`]
     /// and read in `flush_to_l1` to emit fork-tagged metrics and to fire
@@ -75,11 +115,17 @@ pub struct Writer {
     /// flush would add a per-dataset object-store roundtrip on the hot
     /// commit path; the proxy keeps the guard rail purely observational
     /// (Phase 5 introduces fork compaction proper). Only meaningful when
-    /// `fork_id.is_some()`.
-    fork_flush_count: u64,
+    /// `fork_id.is_some()`. `Relaxed` is sufficient — observational only.
+    fork_flush_count: AtomicU64,
     /// Whether the fork-fragment warning has already fired at the
-    /// configured threshold. One-shot per writer lifetime.
-    fork_fragment_warn_fired: bool,
+    /// configured threshold. One-shot per writer lifetime. `Relaxed` is
+    /// sufficient — observational only.
+    fork_fragment_warn_fired: AtomicBool,
+    /// Dedicated lock for the genuinely-exclusive flush path. Declared in
+    /// Phase 1 of the concurrent-writer refactor but **not yet acquired**;
+    /// Phase 3 wires it into `flush_to_l1` and `commit_transaction_l0`.
+    #[allow(dead_code)]
+    flush_lock: tokio::sync::Mutex<()>,
 }
 
 impl Writer {
@@ -134,13 +180,14 @@ impl Writer {
             xervo_runtime: None,
             property_manager,
             adjacency_manager,
-            last_flush_time: std::time::Instant::now(),
+            last_flush_time: PlMutex::new(std::time::Instant::now()),
             compaction_handle: Arc::new(RwLock::new(None)),
             index_rebuild_manager: None,
-            cached_manifest: None,
+            cached_manifest: PlMutex::new(None),
             fork_id: None,
-            fork_flush_count: 0,
-            fork_fragment_warn_fired: false,
+            fork_flush_count: AtomicU64::new(0),
+            fork_fragment_warn_fired: AtomicBool::new(false),
+            flush_lock: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -1803,7 +1850,7 @@ impl Writer {
 
         // Flush on time interval IF minimum mutations met
         if let Some(interval) = self.config.auto_flush_interval
-            && self.last_flush_time.elapsed() >= interval
+            && self.last_flush_time.lock().elapsed() >= interval
             && count >= self.config.auto_flush_min_mutations
         {
             self.flush_to_l1(None).await?;
@@ -2000,9 +2047,13 @@ impl Writer {
         let schema = self.schema_manager.schema();
 
         // Signal that a flush is in progress so compaction skips delta clears.
-        self.storage
-            .flush_in_progress
-            .store(true, std::sync::atomic::Ordering::Release);
+        // The RAII guard clears the flag on every exit path — manual drops
+        // earlier left the flag stuck on any `?` early-return inside this
+        // method (concurrent_writer.md §6.6). The CAS also rejects nested
+        // re-entry; today the outer writer-RwLock makes that impossible,
+        // but the check is forward-compatible with Phase 4 of the refactor.
+        let _flush_guard = FlushInProgressGuard::new(&self.storage)
+            .ok_or_else(|| anyhow!("flush_to_l1: another flush is already in progress"))?;
 
         let (initial_size, initial_count) = {
             let l0_arc = self.l0_manager.get_current();
@@ -2212,7 +2263,7 @@ impl Writer {
         }
 
         // 1. Load previous snapshot from cache, or fall back to storage
-        let mut manifest = if let Some(cached) = self.cached_manifest.take() {
+        let mut manifest = if let Some(cached) = self.cached_manifest.lock().take() {
             cached
         } else {
             self.storage
@@ -2517,7 +2568,7 @@ impl Writer {
             .await?;
 
         // Cache manifest for next flush to avoid re-reading from object store
-        self.cached_manifest = Some(manifest.clone());
+        *self.cached_manifest.lock() = Some(manifest.clone());
 
         // Complete flush: remove old L0 from pending list now that L1 writes succeeded.
         // This must happen BEFORE WAL truncation so min_pending_wal_lsn is accurate.
@@ -2542,7 +2593,7 @@ impl Writer {
         }
 
         // Reset last flush time for time-based auto-flush
-        self.last_flush_time = std::time::Instant::now();
+        *self.last_flush_time.lock() = std::time::Instant::now();
 
         info!(
             snapshot_id,
@@ -2554,10 +2605,8 @@ impl Writer {
         metrics::counter!("uni_flush_bytes_total").increment(initial_size as u64);
         metrics::counter!("uni_flush_rows_total").increment(initial_count as u64);
 
-        // Clear flush-in-progress flag so compaction can proceed with delta clears.
-        self.storage
-            .flush_in_progress
-            .store(false, std::sync::atomic::Ordering::Release);
+        // `_flush_guard` drops at end-of-scope (or any `?` early-exit above),
+        // clearing `flush_in_progress` and unblocking compaction's delta clears.
 
         // Increment flush generation counter for write throttling.
         // l1_runs counts uncompacted flush generations (reset by compaction).
@@ -2618,19 +2667,23 @@ impl Writer {
     /// No-op for primary writers (`fork_id == None`).
     pub(crate) fn tick_fork_fragment_observability(&mut self) {
         let Some(fork_id) = self.fork_id else { return };
-        self.fork_flush_count = self.fork_flush_count.saturating_add(1);
+        // `Relaxed` is sufficient: observational counter, no synchronizes-with.
+        let new_count = self.fork_flush_count.fetch_add(1, Ordering::Relaxed) + 1;
         let fork_label = fork_id.to_string();
         metrics::gauge!(
             "uni_fork_l1_flushes",
             "fork" => fork_label.clone(),
         )
-        .set(self.fork_flush_count as f64);
+        .set(new_count as f64);
         let threshold = self.config.fork_fragment_warn_threshold as u64;
-        if !self.fork_fragment_warn_fired && threshold > 0 && self.fork_flush_count >= threshold {
-            self.fork_fragment_warn_fired = true;
+        if !self.fork_fragment_warn_fired.load(Ordering::Relaxed)
+            && threshold > 0
+            && new_count >= threshold
+        {
+            self.fork_fragment_warn_fired.store(true, Ordering::Relaxed);
             tracing::warn!(
                 fork = %fork_label,
-                flush_count = self.fork_flush_count,
+                flush_count = new_count,
                 threshold,
                 "fork has exceeded the L1 flush-count threshold; \
                  fork compaction is deferred to Phase 5 — consider \
@@ -3230,28 +3283,31 @@ mod tests {
         for _ in 0..10 {
             writer.tick_fork_fragment_observability();
         }
-        assert!(!writer.fork_fragment_warn_fired);
-        assert_eq!(writer.fork_flush_count, 0);
+        assert!(!writer.fork_fragment_warn_fired.load(Ordering::Relaxed));
+        assert_eq!(writer.fork_flush_count.load(Ordering::Relaxed), 0);
 
         // Fork path: tag and tick. Below threshold → no fire.
         writer.fork_id = Some(ForkId::new());
         writer.tick_fork_fragment_observability();
         writer.tick_fork_fragment_observability();
-        assert!(!writer.fork_fragment_warn_fired);
-        assert_eq!(writer.fork_flush_count, 2);
+        assert!(!writer.fork_fragment_warn_fired.load(Ordering::Relaxed));
+        assert_eq!(writer.fork_flush_count.load(Ordering::Relaxed), 2);
 
         // Crossing threshold → fires once.
         writer.tick_fork_fragment_observability();
-        assert!(writer.fork_fragment_warn_fired);
-        assert_eq!(writer.fork_flush_count, 3);
+        assert!(writer.fork_fragment_warn_fired.load(Ordering::Relaxed));
+        assert_eq!(writer.fork_flush_count.load(Ordering::Relaxed), 3);
 
         // Subsequent ticks bump the gauge but do not re-fire.
-        let fired_after = writer.fork_fragment_warn_fired;
+        let fired_after = writer.fork_fragment_warn_fired.load(Ordering::Relaxed);
         for _ in 0..5 {
             writer.tick_fork_fragment_observability();
         }
-        assert_eq!(writer.fork_flush_count, 8);
-        assert_eq!(writer.fork_fragment_warn_fired, fired_after);
+        assert_eq!(writer.fork_flush_count.load(Ordering::Relaxed), 8);
+        assert_eq!(
+            writer.fork_fragment_warn_fired.load(Ordering::Relaxed),
+            fired_after
+        );
 
         Ok(())
     }

@@ -680,6 +680,8 @@ impl Executor {
             let mut total_rows = 0;
             for batch in batches {
                 let num_rows = batch.num_rows();
+                // Pre-allocate one EID per row in one IdAllocator mutex acquisition.
+                let eids = writer.allocate_eids(num_rows).await?;
 
                 for row_idx in 0..num_rows {
                     let mut properties = HashMap::new();
@@ -712,14 +714,12 @@ impl Executor {
                     let dst = dst_vid
                         .ok_or_else(|| anyhow!("Missing destination VID column '{}'", dst_col))?;
 
-                    // Generate EID and insert edge
-                    let eid = writer.next_eid(edge_type_id).await?;
                     writer
                         .insert_edge(
                             src,
                             dst,
                             edge_type_id,
-                            eid,
+                            eids[row_idx],
                             properties,
                             Some(label.to_string()),
                             None,
@@ -756,6 +756,8 @@ impl Executor {
             let mut total_rows = 0;
             for batch in batches {
                 let num_rows = batch.num_rows();
+                // Pre-allocate one VID per row in one IdAllocator mutex acquisition.
+                let vids = writer.allocate_vids(num_rows).await?;
 
                 // Convert Arrow batch to rows
                 for row_idx in 0..num_rows {
@@ -778,10 +780,13 @@ impl Executor {
                         }
                     }
 
-                    // Generate VID and insert
-                    let vid = writer.next_vid().await?;
                     let _ = writer
-                        .insert_vertex_with_labels(vid, properties, &[label.to_string()], None)
+                        .insert_vertex_with_labels(
+                            vids[row_idx],
+                            properties,
+                            &[label.to_string()],
+                            None,
+                        )
                         .await?;
 
                     total_rows += 1;

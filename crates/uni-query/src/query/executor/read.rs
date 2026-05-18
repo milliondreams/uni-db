@@ -4076,12 +4076,19 @@ impl Executor {
 
         let writer: &uni_store::Writer = writer_lock.as_ref();
 
+        // Chunked VID/EID refill for streaming CSV: amortizes the IdAllocator
+        // mutex over `CSV_ID_CHUNK` rows. End-of-iteration may waste up to
+        // CSV_ID_CHUNK-1 IDs — harmless in the u64 space.
+        const CSV_ID_CHUNK: usize = 256;
+
         if label_meta.is_some() {
             let target_props = schema
                 .properties
                 .get(target)
                 .ok_or_else(|| anyhow!("Properties for label '{}' not found", target))?;
 
+            let mut vid_chunk: std::collections::VecDeque<Vid> =
+                std::collections::VecDeque::with_capacity(CSV_ID_CHUNK);
             for result in rdr.records() {
                 let record = result?;
                 let mut props = HashMap::new();
@@ -4095,7 +4102,10 @@ impl Executor {
                     }
                 }
 
-                let vid = writer.next_vid().await?;
+                if vid_chunk.is_empty() {
+                    vid_chunk.extend(writer.allocate_vids(CSV_ID_CHUNK).await?);
+                }
+                let vid = vid_chunk.pop_front().unwrap();
                 writer
                     .insert_vertex_with_labels(vid, props, &[target.to_string()], None)
                     .await?;
@@ -4119,6 +4129,8 @@ impl Executor {
                 .and_then(|v| v.as_str())
                 .unwrap_or("_dst");
 
+            let mut eid_chunk: std::collections::VecDeque<Eid> =
+                std::collections::VecDeque::with_capacity(CSV_ID_CHUNK);
             for result in rdr.records() {
                 let record = result?;
                 let mut props = HashMap::new();
@@ -4145,7 +4157,10 @@ impl Executor {
                 let dst = dst_vid
                     .ok_or_else(|| anyhow!("Missing destination VID in column '{}'", dst_col))?;
 
-                let eid = writer.next_eid(type_id).await?;
+                if eid_chunk.is_empty() {
+                    eid_chunk.extend(writer.allocate_eids(CSV_ID_CHUNK).await?);
+                }
+                let eid = eid_chunk.pop_front().unwrap();
                 writer
                     .insert_edge(
                         src,
@@ -4215,7 +4230,10 @@ impl Executor {
 
             for batch in reader.by_ref() {
                 let batch = batch?;
-                for row in 0..batch.num_rows() {
+                let num_rows = batch.num_rows();
+                // Pre-allocate one VID per row in one IdAllocator mutex acquisition.
+                let vids = writer.allocate_vids(num_rows).await?;
+                for row in 0..num_rows {
                     let mut props = HashMap::new();
                     for field in batch.schema().fields() {
                         let name = field.name();
@@ -4230,9 +4248,8 @@ impl Executor {
                             }
                         }
                     }
-                    let vid = writer.next_vid().await?;
                     writer
-                        .insert_vertex_with_labels(vid, props, &[target.to_string()], None)
+                        .insert_vertex_with_labels(vids[row], props, &[target.to_string()], None)
                         .await?;
                     count += 1;
                 }
@@ -4255,7 +4272,10 @@ impl Executor {
 
             for batch in reader {
                 let batch = batch?;
-                for row in 0..batch.num_rows() {
+                let num_rows = batch.num_rows();
+                // Pre-allocate one EID per row in one IdAllocator mutex acquisition.
+                let eids = writer.allocate_eids(num_rows).await?;
+                for row in 0..num_rows {
                     let mut props = HashMap::new();
                     let mut src_vid = None;
                     let mut dst_vid = None;
@@ -4287,13 +4307,12 @@ impl Executor {
                         anyhow!("Missing destination VID in column '{}'", dst_col)
                     })?;
 
-                    let eid = writer.next_eid(type_id).await?;
                     writer
                         .insert_edge(
                             src,
                             dst,
                             type_id,
-                            eid,
+                            eids[row],
                             props,
                             Some(target.to_string()),
                             None,

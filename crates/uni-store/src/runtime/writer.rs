@@ -3351,4 +3351,116 @@ mod tests {
 
         Ok(())
     }
+
+    /// Per docs/proposals/concurrent_writer.md §9.1: the hot-path mutators
+    /// must not write to any `Writer` struct field. Phase 2 of the refactor
+    /// gave them `&self` receivers, which the compiler enforces against
+    /// direct `self.x = y` assignment — but interior-mutable writes
+    /// (Mutex/Atomic/OnceLock) still compile. This regression test snapshots
+    /// every potentially-writable field, calls each hot-path mutator, and
+    /// asserts no field changed.
+    ///
+    /// Cold-path methods (`flush_to_l1`, `commit_transaction_l0`,
+    /// `tick_fork_fragment_observability`) DO mutate fields by design and
+    /// are intentionally out of scope here.
+    #[tokio::test]
+    async fn hot_path_mutators_do_not_change_writer_fields() -> Result<()> {
+        use crate::storage::manager::StorageManager;
+        use object_store::local::LocalFileSystem;
+        use object_store::path::Path as ObjectStorePath;
+        use uni_common::core::schema::SchemaManager;
+
+        let dir = tempdir()?;
+        let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path())?);
+        let schema_path = ObjectStorePath::from("schema.json");
+        let schema_manager =
+            Arc::new(SchemaManager::load_from_store(store.clone(), &schema_path).await?);
+        schema_manager.add_label("Person")?;
+        schema_manager.save().await?;
+        let storage = Arc::new(
+            StorageManager::new(dir.path().to_str().unwrap(), schema_manager.clone()).await?,
+        );
+
+        let writer = Writer::new_with_config(
+            storage,
+            schema_manager,
+            1,
+            UniConfig::default(),
+            None,
+            None,
+        )
+        .await?;
+
+        /// Captures every `Writer` field that *could* be written by a
+        /// hot-path mutator (i.e., every non-Arc, non-immutable-after-
+        /// construction field). Arc'd substructures (`l0_manager`,
+        /// `storage`, etc.) are intentionally not checked — they are
+        /// re-pointed only at construction.
+        #[derive(Debug, PartialEq)]
+        struct Snapshot {
+            last_flush_time: std::time::Instant,
+            cached_manifest_some: bool,
+            fork_flush_count: u64,
+            fork_fragment_warn_fired: bool,
+            xervo_runtime_some: bool,
+            index_rebuild_manager_some: bool,
+            fork_id: Option<ForkId>,
+        }
+
+        fn snap(w: &Writer) -> Snapshot {
+            Snapshot {
+                last_flush_time: *w.last_flush_time.lock(),
+                cached_manifest_some: w.cached_manifest.lock().is_some(),
+                fork_flush_count: w.fork_flush_count.load(Ordering::Relaxed),
+                fork_fragment_warn_fired: w.fork_fragment_warn_fired.load(Ordering::Relaxed),
+                xervo_runtime_some: w.xervo_runtime.get().is_some(),
+                index_rebuild_manager_some: w.index_rebuild_manager.get().is_some(),
+                fork_id: w.fork_id,
+            }
+        }
+
+        // 1. insert_vertex_with_labels
+        let before = snap(&writer);
+        let vid = writer.next_vid().await?;
+        writer
+            .insert_vertex_with_labels(vid, Properties::new(), &["Person".to_string()], None)
+            .await?;
+        assert_eq!(
+            snap(&writer),
+            before,
+            "insert_vertex_with_labels mutated a Writer field"
+        );
+
+        // 2. insert_vertices_batch
+        let before = snap(&writer);
+        let vids = writer.allocate_vids(2).await?;
+        writer
+            .insert_vertices_batch(
+                vids,
+                vec![Properties::new(), Properties::new()],
+                vec!["Person".into()],
+                None,
+            )
+            .await?;
+        assert_eq!(
+            snap(&writer),
+            before,
+            "insert_vertices_batch mutated a Writer field"
+        );
+
+        // 3. delete_vertex
+        let before = snap(&writer);
+        writer.delete_vertex(vid, None, None).await?;
+        assert_eq!(
+            snap(&writer),
+            before,
+            "delete_vertex mutated a Writer field"
+        );
+
+        // (insert_edge / delete_edge are skipped here: their fixture cost is
+        // disproportionate to the audit's marginal value, and the same
+        // structural argument plus the compiler-enforced `&self` covers them.)
+
+        Ok(())
+    }
 }

@@ -98,7 +98,9 @@ pub struct Writer {
     /// Timestamp of last flush or creation. Interior-mutable so that
     /// `&self` callers can update it; uncontended in practice because all
     /// writes happen inside the single-flusher critical section.
-    last_flush_time: PlMutex<std::time::Instant>,
+    /// Arc-wrapped so it can travel into the SharedFlushCtx that the
+    /// async-flush coordinator passes to spawned stream/finalize tasks.
+    last_flush_time: Arc<PlMutex<std::time::Instant>>,
     /// Background compaction task handle (prevents concurrent compaction races)
     compaction_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
     /// Optional index rebuild manager for post-flush automatic rebuild scheduling.
@@ -108,7 +110,7 @@ pub struct Writer {
     /// object store on every flush_to_l1 call. Wrapped in a `Mutex` for
     /// `&self` access; uncontended because all access is inside the
     /// single-flusher critical section.
-    cached_manifest: PlMutex<Option<SnapshotManifest>>,
+    cached_manifest: Arc<PlMutex<Option<SnapshotManifest>>>,
     /// Identifier of the fork this writer serves, if any. `None` for
     /// primary's writer. Set by [`crate::fork::writer_factory::new_for_fork`]
     /// and read in `flush_to_l1` to emit fork-tagged metrics and to fire
@@ -123,16 +125,18 @@ pub struct Writer {
     /// commit path; the proxy keeps the guard rail purely observational
     /// (Phase 5 introduces fork compaction proper). Only meaningful when
     /// `fork_id.is_some()`. `Relaxed` is sufficient — observational only.
-    fork_flush_count: AtomicU64,
+    fork_flush_count: Arc<AtomicU64>,
     /// Whether the fork-fragment warning has already fired at the
     /// configured threshold. One-shot per writer lifetime. `Relaxed` is
     /// sufficient — observational only.
-    fork_fragment_warn_fired: AtomicBool,
+    fork_fragment_warn_fired: Arc<AtomicBool>,
     /// Dedicated lock for the genuinely-exclusive flush path. Acquired by
     /// the [`Writer::flush_to_l1`] entry and by `commit_transaction_l0`
     /// across its WAL-append + L0-merge window. Replaces the outer
     /// `Arc<RwLock<Writer>>` for flush exclusion once Phase 4 drops it.
-    flush_lock: tokio::sync::Mutex<()>,
+    /// Arc-wrapped so async-flush coordinator's finalize path can
+    /// re-acquire it from a spawned task via SharedFlushCtx.
+    flush_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Writer {
@@ -187,14 +191,14 @@ impl Writer {
             xervo_runtime: OnceLock::new(),
             property_manager,
             adjacency_manager,
-            last_flush_time: PlMutex::new(std::time::Instant::now()),
+            last_flush_time: Arc::new(PlMutex::new(std::time::Instant::now())),
             compaction_handle: Arc::new(RwLock::new(None)),
             index_rebuild_manager: OnceLock::new(),
-            cached_manifest: PlMutex::new(None),
+            cached_manifest: Arc::new(PlMutex::new(None)),
             fork_id: None,
-            fork_flush_count: AtomicU64::new(0),
-            fork_fragment_warn_fired: AtomicBool::new(false),
-            flush_lock: tokio::sync::Mutex::new(()),
+            fork_flush_count: Arc::new(AtomicU64::new(0)),
+            fork_fragment_warn_fired: Arc::new(AtomicBool::new(false)),
+            flush_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 

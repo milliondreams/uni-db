@@ -528,11 +528,30 @@ impl Uni {
             .get(&preview.id)
             .map(|e| e.value().clone())
             && let Some(inner) = weak.upgrade()
-            && inner.inflight_tx_count.load(Ordering::Acquire) > 0
         {
-            return Err(UniError::ForkInflightTx {
-                name: name.to_string(),
-            });
+            if inner.inflight_tx_count.load(Ordering::Acquire) > 0 {
+                return Err(UniError::ForkInflightTx {
+                    name: name.to_string(),
+                });
+            }
+            // Drain any pending async flushes on this fork's writer
+            // before tombstoning. The coordinator's spawned stream task
+            // captures Arc<Writer> + Arc<StorageManager>; storage holds
+            // Arc<ForkScope>, which holds the ForkHolderGuard. So we
+            // must wait for in-flight streams to finalize so those
+            // Arc clones drop and the holder count can fall to 0 — see
+            // the async-flush plan §3.9 / L8.
+            if let Some(writer) = inner.writer.as_ref()
+                && let Some(coord) = writer.flush_coordinator()
+                && coord
+                    .drain(self.inner.config.drop_fork_drain_timeout)
+                    .await
+                    .is_err()
+            {
+                return Err(UniError::PendingFlushTimeout {
+                    name: name.to_string(),
+                });
+            }
         }
         let info = self.inner.fork_registry.begin_drop(name).await?;
         // Phase 2 Day 8: evict the cached `Weak<UniInner>` (if any)

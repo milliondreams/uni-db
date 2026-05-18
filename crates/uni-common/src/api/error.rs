@@ -164,6 +164,12 @@ pub enum UniError {
     #[error("Fork '{name}' has uncommitted transaction state; commit or rollback first")]
     ForkInflightTx { name: String },
 
+    /// Drop refused because the fork has pending async flushes that did
+    /// not drain within `UniConfig::drop_fork_drain_timeout`. Either retry
+    /// later (the streams will eventually complete) or raise the timeout.
+    #[error("Fork '{name}' has pending flushes that did not drain within timeout")]
+    PendingFlushTimeout { name: String },
+
     /// Registry on disk is malformed (corrupt JSON, missing required field, etc.).
     #[error("Fork registry is corrupt: {message}")]
     ForkCorruptRegistry { message: String },

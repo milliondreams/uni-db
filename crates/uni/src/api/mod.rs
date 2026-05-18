@@ -2055,6 +2055,19 @@ impl UniBuilder {
             shutdown_handle.track_task(handle);
         }
 
+        // Track the FlushCoordinator's single-task finalizer (if async
+        // flush is enabled) so Uni::shutdown_blocking awaits its exit.
+        // Without this, a graceful shutdown may proceed before the
+        // finalizer drains its in-heap submissions — losing some
+        // recently-streamed flushes (data is still recoverable via
+        // WAL replay on next start, but we'd rather not leak fragments
+        // unnecessarily).
+        if let Some(coord) = writer.flush_coordinator()
+            && let Some(handle) = coord.take_finalizer_handle()
+        {
+            shutdown_handle.track_task(handle);
+        }
+
         let (commit_tx, _) = tokio::sync::broadcast::channel(256);
         let writer_field = if self.read_only { None } else { Some(writer) };
 

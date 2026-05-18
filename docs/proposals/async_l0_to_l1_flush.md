@@ -1,81 +1,125 @@
 # Async L0→L1 Flush — Design Document
 
-**Status:** Draft (Proposal)
-**Date:** 2026-05-17
+**Status:** Revised (Draft, post-concurrent_writer baseline)
+**Date:** 2026-05-17 (original), 2026-05-18 (revision)
 **Author:** rohit@dragonscale.ai
 **Crates touched:** `uni-store`, `uni-common`, `uni`
-**Related:** `docs/proposals/graph_fork_plan.md`, `docs/proposals/fork_pending.md`
+**Related:** `docs/proposals/concurrent_writer.md` (landed; this proposal composes on top of its `flush_lock` seam), `docs/proposals/graph_fork_plan.md`, `docs/proposals/fork_pending.md`
+
+---
+
+## 0. Revision history
+
+This proposal was originally drafted before the concurrent_writer refactor landed. That refactor:
+
+- Removed `Arc<tokio::sync::RwLock<Writer>>` entirely (Phase 4) — there is no longer a "writer write-lock" to amortize against.
+- Promoted `last_flush_time`, `cached_manifest`, `fork_flush_count`, `fork_fragment_warn_fired` to interior mutability (Phase 1).
+- Installed `FlushInProgressGuard` RAII fixing the §2.4-#1 leak bug.
+- Introduced `flush_lock: tokio::sync::Mutex<()>` and split `flush_to_l1` into a thin entry + `flush_to_l1_inner` body (Phase 3).
+- Made `flush_to_l1` and `commit_transaction_l0` `&self` (Phase 2).
+
+So the prep work in §11 Phase 1 of this proposal is **largely done**. The proposal's design still applies — but the "writer-write-lock" framing in the summary and §2.1 / §2.2 must be replaced with `flush_lock`, and method signatures updated to `&self`.
+
+The headline empirical claim ("3–9 s wall reduction at sess=24") was also calibrated against the pre-refactor baseline. Post-refactor measurement (`crates/uni/examples/flush_pressure.rs`) shows the actual win is **regime-dependent**:
+
+| Workload regime | Flushes per round | Wall time | Async-flush win |
+|---|---|---|---|
+| `auto_flush_threshold=1000`, sess=24 | 120 | 51 s | very high (~10×) |
+| `auto_flush_threshold=2500`, sess=24 | 48 | 21.5 s | high (~5×) |
+| `auto_flush_threshold=5000`, sess=24 | 24 | 10.9 s | high (~3×) |
+| **`auto_flush_threshold=10000` (default), sess=24** | **12** | **1.7 s** | **modest (~30–40%)** |
+| Cloud-storage backend (extrapolated) | any | proportional | high regardless of threshold |
+
+The proposal still has runway, especially for cloud-storage workloads and high-mutation-rate ingestion. But it is no longer the "obvious next phase" of the concurrent_writer refactor — the U-shaped cost curve in `flush_pressure.rs` shows default-config workloads land in the sweet spot where flushes amortize well today.
 
 ---
 
 ## 1. Summary
 
-Today, `Writer::flush_to_l1` runs end-to-end (~608 lines, line 1998–2605 of `crates/uni-store/src/runtime/writer.rs`) while the caller holds the **writer write-lock** (`Arc<tokio::sync::RwLock<Writer>>` at `crates/uni/src/api/mod.rs:74`). Because `Writer::flush_to_l1` is `&mut self` and is invoked from `check_flush` at the tail of every `commit_transaction_l0`, a single flush stalls every concurrent committer for the duration of the L1 streaming I/O — typically 50–100 ms, occasionally seconds for large L0s.
+`Writer::flush_to_l1` is invoked from `check_flush` at the tail of every `commit_transaction_l0` whose `should_flush()` predicate fires (default: every 10,000 mutations). When fired, the entire flush runs under `flush_lock` — including the long L1-streaming I/O step (~50–100 ms on local disk, potentially seconds on cloud storage). With N concurrent committers, all subsequent commits that also need to flush serialize through this lock.
 
-The L1 streaming step does not logically need exclusivity. The rotation (`L0Manager::begin_flush`) and finalization (`L0Manager::complete_flush` + WAL truncate + manifest cache update) need brief exclusivity (~µs). Everything in between is I/O against immutable, Arc-clonable state. This document proposes splitting `flush_to_l1` into **rotate / stream / finalize**, running `stream` on a background tokio task outside the writer lock, with bounded concurrency, ordered finalization, and explicit back-pressure.
+The L1 streaming step does not logically need exclusivity. The rotation (`L0Manager::begin_flush`) and finalization (`L0Manager::complete_flush` + WAL truncate + manifest cache update) need brief exclusivity (~µs). Everything in between is I/O against immutable, Arc-clonable state. This document proposes splitting `flush_to_l1_inner` into **rotate / stream / finalize**, running `stream` on a background tokio task **outside `flush_lock`**, with bounded concurrency, ordered finalization, and explicit back-pressure.
 
-Expected outcome: writer-write-lock-held time per flush drops from O(50–100 ms) to O(100 µs) for the rotate + finalize critical sections combined. At sess=24 with ~1500–2000 commits/question, this removes 3–9 s of irreducible wall floor without changing on-disk format or read semantics.
+Expected outcome: `flush_lock`-held time per flush drops from O(50–100 ms) to O(100 µs) for the rotate + finalize critical sections combined. The wall-time win at the application layer depends on workload:
+
+- **Default-threshold, local-disk ingestion**: 30–40% wall reduction at sess=24 (flushes are infrequent but each one stalls others).
+- **Low-threshold or cloud-storage ingestion**: 3–10× wall reduction (the original headline claim).
+
+No on-disk format change.
 
 `★ Insight ─────────────────────────────────────`
 - The infrastructure for this is already half-built. `L0Manager.pending_flush` is `Vec<Arc<RwLock<L0Buffer>>>` (`l0_manager.rs:17`) — a *list*, not a single slot — and `min_pending_wal_lsn` (`l0_manager.rs:102-114`) already correctly handles N pending entries. `complete_flush` (`l0_manager.rs:94-97`) uses pointer-equality eviction, supporting out-of-order completion. Someone planned for this.
 - The non-trivial constraint isn't the L0 data structures; it's the **manifest chain**: each manifest's `parent_snapshot` links to the previous one (`snapshot.rs:9-20`), so finalize-order must equal rotate-order even if stream-order doesn't.
+- Phase 3 of `concurrent_writer.md` deliberately introduced `flush_to_l1_inner` as the seam this proposal composes against. The split was prep work for exactly this refactor.
 `─────────────────────────────────────────────────`
 
 ---
 
 ## 2. Background
 
-### 2.1 Today's commit path
+### 2.1 Today's commit path (post-concurrent_writer)
 
-`crates/uni/src/api/transaction.rs:558-581`:
+`crates/uni/src/api/transaction.rs:~558`:
 
 ```rust
-let mut writer = tokio::time::timeout(
+let writer: &uni_store::Writer = writer_lock.as_ref();
+let wal_lsn = tokio::time::timeout(
     Duration::from_secs(5),
-    writer_lock.write(),
-).await.map_err(|_| UniError::CommitTimeout { ... })?;
-let wal_lsn = writer.commit_transaction_l0(self.tx_l0.clone()).await?;
-// ... metrics ...
-drop(writer);
+    writer.commit_transaction_l0(self.tx_l0.clone()),
+)
+.await
+.map_err(|_| UniError::CommitTimeout { ... })??;
 ```
 
-`Writer::commit_transaction_l0` (`writer.rs:237-366`) does, all under the same writer write-lock:
+`Writer::commit_transaction_l0` (`writer.rs:~284`) takes `flush_lock` and does:
 
-1. WAL append per mutation (lines 250-310) — synchronous, buffered into `WalState.buffer`.
-2. `flush_wal().await` — line 314 — group-commit one segment to object store. This is the durability point. ~5–10 ms.
-3. Merge tx_l0 into main L0 — lines 317-357. In-memory, ~µs.
-4. `update_metrics()` — line 359.
-5. `check_flush().await` — line 362, **inside the same lock**. If triggered, this calls `flush_to_l1(None).await` (writer.rs:1800, 1809) which holds the lock for the full 608-line flush.
+1. Acquires `flush_lock: tokio::sync::Mutex<()>` (single-writer serialization for the merge + flush window).
+2. WAL append per mutation — synchronous, buffered into `WalState.buffer`.
+3. `flush_wal().await` — group-commit one segment to object store. Durability point. ~5–10 ms.
+4. Merge tx_l0 into main L0 — in-memory, ~µs.
+5. Replay edges through `adjacency_manager` — per-edge, ~21 µs each (measured).
+6. `update_metrics()`.
+7. `if should_flush() { flush_to_l1_inner(None).await }` — the keystone: if mutation count hit the threshold, the **same flush_lock** is held across the full `flush_to_l1_inner` body (which is itself the long L1-streaming work).
+8. Release `flush_lock`.
 
-### 2.2 Today's `flush_to_l1` body
+The key cost: **when `should_flush()` fires, every concurrent committer that also wants to commit will queue on `flush_lock`** for the full duration of the flush. With default `auto_flush_threshold=10_000`, one in ~10k mutations triggers this. At sess=24 doing 24 small concurrent commits per round, this is a few times per workload — modest impact (~30–40% wall on the measured pattern). At low thresholds or with slow object-store I/O, the impact compounds dramatically.
 
-`flush_to_l1` signature: `pub async fn flush_to_l1(&mut self, name: Option<String>) -> Result<String>` (writer.rs:1998).
+### 2.2 Today's `flush_to_l1_inner` body
 
-Critical phases (line numbers refer to current code):
+Post-concurrent_writer signature:
+```rust
+pub async fn flush_to_l1(&self, name: Option<String>) -> Result<String> {
+    let _flush_lock_guard = self.flush_lock.lock().await;
+    self.flush_to_l1_inner(name).await
+}
+async fn flush_to_l1_inner(&self, name: Option<String>) -> Result<String> { ... }
+```
 
-| Phase | Lines | What it does | Lock truly required? |
-|-------|-------|--------------|----------------------|
-| **A. WAL pre-flush** | 2027 | `wal.flush().await` captures LSN of current segment before rotation | No (WAL has its own internal `Mutex<WalState>`) |
-| **B. L0 rotate** | 2036 | `l0_manager.begin_flush(0, None)` — atomic Arc-swap of current L0, push old onto `pending_flush` | Yes, but `L0Manager` does its own short write lock internally |
-| **C. WAL handoff** | 2042-2056 | Write lock on old L0 to record `wal_lsn_at_flush`, take WAL, give to new L0 | Yes, but localized to `L0Buffer` |
-| **D. L1 collect** | 2069-2187 | Read-lock old L0; gather edges, tombstones, vertices-by-label, timestamps | No (read on Arc'd old L0) |
-| **E. Orphan resolve** | 2189-2212 | `find_vertex_labels_in_storage` fallback for orphaned tombstones | No (read against StorageBackend) |
-| **F. Manifest seed** | 2215-2236 | Load `cached_manifest` (or storage), set `parent_snapshot`, new `snapshot_id`, HWMs | No (in-memory, but currently `&mut self`) |
-| **G. Lance writes** | 2247-2507 | `MainEdgeDataset::write_batch`, `MainVertexDataset::write_batch`, `DeltaDataset::write_run` per (edge_type, dir), `VertexDataset::write_batch` per label, `VidLabelsIndex` updates, inverted-index updates, UID mapping. **All eager Lance commits.** ~50–100 ms typical. | No (StorageManager methods are `&self`; backend is `Arc<dyn StorageBackend>`) |
-| **H. Manifest publish** | 2510-2517 | `snapshot_manager().save_snapshot(&manifest).await`, then `set_latest_snapshot(&snapshot_id)` | No (own internal sync) |
-| **I. cached_manifest** | 2520 | `self.cached_manifest = Some(manifest.clone())` | Yes (Writer field, &mut self) |
-| **J. complete_flush** | 2524 | `l0_manager.complete_flush(&old_l0_arc)` — remove from `pending_flush` | Yes, but `L0Manager` &self |
-| **K. WAL truncate** | 2528-2536 | `wal.truncate_before(min(min_pending_wal_lsn, wal_lsn)).await` | No (WAL &self) |
-| **L. Cache clear** | 2540-2542 | `property_manager.clear_cache().await` | No |
-| **M. last_flush_time** | 2545 | `self.last_flush_time = Instant::now()` | Yes (Writer field) |
-| **N. Metrics** | 2553-2555 | Histogram + counters | No |
-| **O. flush_in_progress=false** | 2558-2560 | `self.storage.flush_in_progress.store(false, Release)` | No |
-| **P. Compaction status** | 2564-2570 | `compaction_status.lock(); status.l1_runs += 1` | No |
-| **Q. Adjacency compact** | 2576-2591 | Optionally **spawn background** `am.compact()` — already async! | No |
-| **R. Index rebuild** | 2594-2598 | Schedule index rebuilds if auto-rebuild enabled | No |
-| **S. Fork observability** | 2602 | `tick_fork_fragment_observability()` increments `fork_flush_count` | Yes (Writer field) |
+The `flush_to_l1_inner` body still runs as one ~600-line unit. Line numbers below refer to the current post-refactor code (offsets shifted by ~30 from the pre-refactor numbers in the original draft).
 
-Of these 19 phases, only **B, C, I, J, M, S** *logically require* the writer write-lock (mostly because they mutate Writer-owned plain fields). Phases A, D–H, K, L, N–R are I/O or operate on Arc'd substructures and do not need the outer lock; today they are serialized only because Rust insists on `&mut self`.
+| Phase | What it does | Lock truly required? |
+|-------|--------------|----------------------|
+| **A. WAL pre-flush** | `wal.flush().await` captures LSN before rotation | No (WAL has its own internal `Mutex<WalState>`) |
+| **B. L0 rotate** | `l0_manager.begin_flush(0, None)` — atomic Arc-swap of current L0, push old onto `pending_flush` | Brief (`L0Manager` &self with its own internal lock) |
+| **C. WAL handoff** | Write lock on old L0 to record `wal_lsn_at_flush`, take WAL, give to new L0 | Brief (`L0Buffer` lock) |
+| **D. L1 collect** | Read-lock old L0; gather edges, tombstones, vertices-by-label, timestamps | No (read on Arc'd old L0) |
+| **E. Orphan resolve** | `find_vertex_labels_in_storage` fallback for orphaned tombstones | No (read against StorageBackend) |
+| **F. Manifest seed** | Load `cached_manifest` (now `parking_lot::Mutex<Option<…>>`, Phase 1), set `parent_snapshot`, new `snapshot_id`, HWMs | Brief (Mutex<Manifest>) |
+| **G. Lance writes** | `MainEdgeDataset::write_batch`, `MainVertexDataset::write_batch`, `DeltaDataset::write_run` per (edge_type, dir), `VertexDataset::write_batch` per label, `VidLabelsIndex` updates, inverted-index updates, UID mapping. **All eager Lance commits.** ~50–100 ms typical local, 100s of ms cloud. | No (StorageManager methods are `&self`; backend is `Arc<dyn StorageBackend>`) |
+| **H. Manifest publish** | `snapshot_manager().save_snapshot(&manifest).await`, then `set_latest_snapshot(&snapshot_id)` | No (own internal sync) |
+| **I. cached_manifest** | `*self.cached_manifest.lock() = Some(manifest.clone())` | Brief Mutex (interior-mut since Phase 1) |
+| **J. complete_flush** | `l0_manager.complete_flush(&old_l0_arc)` | Brief (L0Manager &self) |
+| **K. WAL truncate** | `wal.truncate_before(min(min_pending_wal_lsn, wal_lsn)).await` | No (WAL &self) |
+| **L. Cache clear** | `property_manager.clear_cache().await` | No |
+| **M. last_flush_time** | `*self.last_flush_time.lock() = Instant::now()` | Brief Mutex (interior-mut since Phase 1) |
+| **N. Metrics** | Histogram + counters | No |
+| **O. FlushInProgressGuard drop** | Releases `flush_in_progress` flag (Phase 1 RAII guard) | No |
+| **P. Compaction status** | `compaction_status.lock(); status.l1_runs += 1` | No |
+| **Q. Adjacency compact** | Optionally **spawn background** `am.compact()` — already async | No |
+| **R. Index rebuild** | Schedule index rebuilds if auto-rebuild enabled | No |
+| **S. Fork observability** | `tick_fork_fragment_observability()` increments `fork_flush_count` (AtomicU64 since Phase 1) | No |
+
+Post-concurrent_writer, **only B, C, I, J, M need brief-but-not-`flush_lock`-level exclusion** — they each have their own fine-grained locks. The outer `flush_lock` held for the entire body is what serializes peer commits. Phases A, D–H, K, L, N–S are all `&self`-safe and could run on a spawned task.
 
 ### 2.3 Today's other coupling
 
@@ -205,16 +249,23 @@ pub struct Writer {
 impl Writer {
     /// Sync (legacy) flush: rotate + stream + finalize, all awaited.
     /// Used by explicit `db.flush()`, nested-fork branching, and tests.
-    pub async fn flush_to_l1(&mut self, name: Option<String>) -> Result<String> {
+    /// Post-Phase-2 (concurrent_writer), all flush methods are `&self`.
+    pub async fn flush_to_l1(&self, name: Option<String>) -> Result<String> {
+        let _flush_lock_guard = self.flush_lock.lock().await;
         let rotated = self.flush_l0_rotate(name).await?;
+        // Release flush_lock here (drop _flush_lock_guard) before stream:
+        drop(_flush_lock_guard);
         let outcome = Self::flush_stream_l1(rotated.clone(), self.shared_for_stream()).await?;
         self.flush_finalize_now(rotated, outcome).await
     }
 
-    /// Async (new) flush: rotate under writer lock, then spawn stream+finalize.
+    /// Async (new) flush: rotate under flush_lock, then spawn stream+finalize.
     /// Used by `check_flush` on the commit path. Returns immediately after rotate.
-    pub async fn flush_to_l1_async(&mut self, name: Option<String>) -> Result<FlushTicket> {
-        let rotated = self.flush_l0_rotate(name).await?;
+    pub async fn flush_to_l1_async(&self, name: Option<String>) -> Result<FlushTicket> {
+        let rotated = {
+            let _flush_lock_guard = self.flush_lock.lock().await;
+            self.flush_l0_rotate(name).await?
+        };
         let shared = self.shared_for_stream();
         let coordinator = self.flush_coordinator.clone();
         let ticket = rotated.ticket();
@@ -224,7 +275,7 @@ impl Writer {
         Ok(ticket)
     }
 
-    async fn flush_l0_rotate(&mut self, name: Option<String>) -> Result<RotatedFlush> {
+    async fn flush_l0_rotate(&self, name: Option<String>) -> Result<RotatedFlush> {
         // Phase A,B,C from §2.2. Plus acquire back-pressure permit and seq number.
         let permit = self.flush_coordinator.acquire_permit().await?;
         let seq = self.flush_coordinator.next_rotate_seq();
@@ -402,8 +453,8 @@ Pre-existing bug fix: the current `AtomicBool` leaks on every `?` error path in 
 Two public methods on `Writer`:
 
 ```rust
-pub async fn flush_to_l1(&mut self, name: Option<String>) -> Result<String>     // sync: awaits finalize
-pub async fn flush_to_l1_async(&mut self, name: Option<String>) -> Result<FlushTicket>  // async: returns after rotate
+pub async fn flush_to_l1(&self, name: Option<String>) -> Result<String>     // sync: awaits finalize
+pub async fn flush_to_l1_async(&self, name: Option<String>) -> Result<FlushTicket>  // async: returns after rotate
 ```
 
 `FlushTicket` has `.await_finalize().await -> Result<String>` if a caller wants to wait. Implemented as a oneshot completion future signaled by the finalizer.
@@ -574,24 +625,26 @@ Add a new structured log line at each transition with `seq`, `wal_lsn`, `fork_id
 
 ## 11. Phased Rollout
 
-### Phase 1: Prep (no behavior change)
+### Phase 1: Prep (no behavior change) — **mostly already done by concurrent_writer.md**
 
-- Promote `last_flush_time`, `cached_manifest`, `fork_flush_count`, `fork_fragment_warn_fired` to interior mutability.
-- Add RAII guard around `flush_in_progress` to fix the pre-existing leak (#1 in §2.4).
-- Add new metrics scaffolding (emit only `rotate=full, stream=0, finalize=0` for now).
-- Add `UniConfig.async_flush_enabled = false` (default off).
+- ✅ Promote `last_flush_time`, `cached_manifest`, `fork_flush_count`, `fork_fragment_warn_fired` to interior mutability (commit `89f1c263`).
+- ✅ Add RAII guard around `flush_in_progress` to fix the pre-existing leak (`FlushInProgressGuard`, commit `89f1c263`).
+- ⏳ Convert `flush_in_progress` from `AtomicBool` → `AtomicUsize` to support N concurrent pending flushes (this proposal only). About 30 lines including updating the `FlushInProgressGuard` to use `fetch_add`/`fetch_sub`.
+- ⏳ Add new metrics scaffolding (emit only `rotate=full, stream=0, finalize=0` for now).
+- ⏳ Add `UniConfig.async_flush_enabled = false` (default off).
 - Tests: existing test suite must pass unchanged.
 
 ### Phase 2: Internal split (no behavior change)
 
-- Split `flush_to_l1` into private `flush_l0_rotate` + `flush_stream_l1` + `flush_finalize_now`.
-- `flush_to_l1` calls them sequentially under the existing `&mut self` lock.
+- Split `flush_to_l1_inner` into private `flush_l0_rotate` + `flush_stream_l1` + `flush_finalize_now`.
+- `flush_to_l1` (entry) acquires `flush_lock`, calls them sequentially, releases `flush_lock`.
 - Verify byte-for-byte identical Lance output via dataset-diff in tests.
 
 ### Phase 3: Spawn behind feature flag
 
 - Add `flush_to_l1_async` and `FlushCoordinator` with finalizer task.
 - `check_flush` routes through `flush_to_l1_async` IFF `config.async_flush_enabled = true`.
+- Crucially: `commit_transaction_l0`'s post-merge `should_flush` branch must call `flush_to_l1_async_inner` (since `flush_lock` is already held) and NOT block on stream completion. The current `flush_to_l1_inner` call in commit (writer.rs:~445) is replaced with a rotate-then-spawn pattern that drops `flush_lock` before the spawned task picks up the work.
 - Add `drop_fork` drain step (gated on same flag).
 - Tests: concurrent commits during flush, back-pressure, crash mid-stream, fork drop with pending, nested fork.
 

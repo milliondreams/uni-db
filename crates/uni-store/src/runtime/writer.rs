@@ -281,7 +281,7 @@ impl Writer {
     /// Writes mutations to WAL, flushes, merges into main L0, and replays
     /// edges into the AdjacencyManager. Returns the WAL LSN of the commit
     /// (0 when no WAL is configured).
-    pub async fn commit_transaction_l0(&mut self, tx_l0_arc: Arc<RwLock<L0Buffer>>) -> Result<u64> {
+    pub async fn commit_transaction_l0(&self, tx_l0_arc: Arc<RwLock<L0Buffer>>) -> Result<u64> {
         // 1. Write transaction mutations to WAL BEFORE merging into main L0
         // This ensures durability before visibility.
         {
@@ -1373,7 +1373,7 @@ impl Writer {
 
     #[instrument(skip(self, properties, labels), level = "trace")]
     pub async fn insert_vertex_with_labels(
-        &mut self,
+        &self,
         vid: Vid,
         mut properties: Properties,
         labels: &[String],
@@ -1492,7 +1492,7 @@ impl Writer {
     /// # Atomicity
     /// If this method fails, all changes are rolled back (if transaction was started here).
     pub async fn insert_vertices_batch(
-        &mut self,
+        &self,
         vids: Vec<Vid>,
         mut properties_batch: Vec<Properties>,
         labels: Vec<String>,
@@ -1626,7 +1626,7 @@ impl Writer {
     /// the L0 delete operation fails.
     #[instrument(skip(self, labels), level = "trace")]
     pub async fn delete_vertex(
-        &mut self,
+        &self,
         vid: Vid,
         labels: Option<Vec<String>>,
         tx_l0: Option<&Arc<RwLock<L0Buffer>>>,
@@ -1758,7 +1758,7 @@ impl Writer {
     #[expect(clippy::too_many_arguments)]
     #[instrument(skip(self, properties), level = "trace")]
     pub async fn insert_edge(
-        &mut self,
+        &self,
         src_vid: Vid,
         dst_vid: Vid,
         edge_type: u32,
@@ -1799,7 +1799,7 @@ impl Writer {
 
     #[instrument(skip(self), level = "trace")]
     pub async fn delete_edge(
-        &mut self,
+        &self,
         eid: Eid,
         src_vid: Vid,
         dst_vid: Vid,
@@ -1834,7 +1834,7 @@ impl Writer {
     /// Check if flush should be triggered based on mutation count or time elapsed.
     /// This method is called after each write operation and can also be called
     /// by a background task for time-based flushing.
-    pub async fn check_flush(&mut self) -> Result<()> {
+    pub async fn check_flush(&self) -> Result<()> {
         let count = self.l0_manager.get_current().read().mutation_count;
 
         // Skip if no mutations
@@ -2042,7 +2042,7 @@ impl Writer {
         fields(snapshot_id, mutations_count, size_bytes),
         level = "info"
     )]
-    pub async fn flush_to_l1(&mut self, name: Option<String>) -> Result<String> {
+    pub async fn flush_to_l1(&self, name: Option<String>) -> Result<String> {
         let start = std::time::Instant::now();
         let schema = self.schema_manager.schema();
 
@@ -2665,7 +2665,7 @@ impl Writer {
     /// is too costly for a purely observational guard rail.
     ///
     /// No-op for primary writers (`fork_id == None`).
-    pub(crate) fn tick_fork_fragment_observability(&mut self) {
+    pub(crate) fn tick_fork_fragment_observability(&self) {
         let Some(fork_id) = self.fork_id else { return };
         // `Relaxed` is sufficient: observational counter, no synchronizes-with.
         let new_count = self.fork_flush_count.fetch_add(1, Ordering::Relaxed) + 1;

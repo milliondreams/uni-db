@@ -90,6 +90,15 @@ struct RotateOutput {
     flush_in_progress_guard: FlushInProgressGuard,
 }
 
+/// Output of [`Writer::flush_stream_l1`]: the built (but not yet
+/// published) snapshot manifest and its id. Finalize is responsible
+/// for `save_snapshot` + `set_latest_snapshot` + `cached_manifest`
+/// update.
+struct FlushOutcome {
+    manifest: SnapshotManifest,
+    snapshot_id: String,
+}
+
 pub struct Writer {
     pub l0_manager: Arc<L0Manager>,
     pub storage: Arc<StorageManager>,
@@ -2180,40 +2189,25 @@ impl Writer {
         })
     }
 
-    /// Body of [`Writer::flush_to_l1`]; assumes the caller has already acquired
-    /// `flush_lock`. The `FlushInProgressGuard` inside is a complementary CAS
-    /// safety net against any future caller that bypasses `flush_lock`.
-    #[instrument(
-        skip(self),
-        fields(snapshot_id, mutations_count, size_bytes),
-        level = "info"
-    )]
-    async fn flush_to_l1_inner(&self, name: Option<String>) -> Result<String> {
-        let start = std::time::Instant::now();
+    /// Phases D, E, F, G of the flush: L1 collect, orphan resolve,
+    /// manifest seed, Lance writes. Reads from `old_l0_arc` (kept in
+    /// pending_flush by Phase B); writes append-only Lance datasets; does
+    /// NOT call save_snapshot / set_latest_snapshot — those are
+    /// finalize's job, so the manifest doesn't get published until the
+    /// next phase.
+    ///
+    /// Today takes `&self`; in a follow-up commit (per
+    /// docs/proposals/async_l0_to_l1_flush.md §6.1(3)) this becomes a
+    /// static `Send + 'static` function over `SharedFlushCtx` so it can
+    /// run on a spawned task while concurrent commits proceed.
+    async fn flush_stream_l1(
+        &self,
+        old_l0_arc: Arc<RwLock<L0Buffer>>,
+        wal_lsn: u64,
+        current_version: u64,
+        name: Option<String>,
+    ) -> Result<FlushOutcome> {
         let schema = self.schema_manager.schema();
-
-        let (initial_size, initial_count) = {
-            let l0_arc = self.l0_manager.get_current();
-            let l0 = l0_arc.read();
-            (l0.estimated_size, l0.mutation_count)
-        };
-        tracing::Span::current().record("size_bytes", initial_size);
-        tracing::Span::current().record("mutations_count", initial_count);
-
-        debug!("Starting L0 flush to L1");
-
-        // Phases A (WAL pre-flush), B (rotate), C (WAL handoff) live in
-        // flush_l0_rotate. The FlushInProgressGuard travels with the
-        // RotateOutput so the counter stays accurate for the full flush
-        // lifetime (preparation for async path where the guard will live
-        // on RotatedFlush all the way through finalize).
-        let RotateOutput {
-            old_l0_arc,
-            wal_lsn,
-            current_version,
-            flush_in_progress_guard: _flush_guard,
-        } = self.flush_l0_rotate().await?;
-
         // 2. Acquire Read lock on Old L0 for flushing
         let mut entries_by_type: HashMap<u32, Vec<L1Entry>> = HashMap::new();
         // (Vid, labels, properties, deleted, version)
@@ -2664,6 +2658,50 @@ impl Writer {
                 }
             }
         }
+        Ok(FlushOutcome { manifest, snapshot_id })
+    }
+
+    /// Body of [`Writer::flush_to_l1`]; assumes the caller has already acquired
+    /// `flush_lock`. The `FlushInProgressGuard` inside is a complementary CAS
+    /// safety net against any future caller that bypasses `flush_lock`.
+    #[instrument(
+        skip(self),
+        fields(snapshot_id, mutations_count, size_bytes),
+        level = "info"
+    )]
+    async fn flush_to_l1_inner(&self, name: Option<String>) -> Result<String> {
+        let start = std::time::Instant::now();
+
+        let (initial_size, initial_count) = {
+            let l0_arc = self.l0_manager.get_current();
+            let l0 = l0_arc.read();
+            (l0.estimated_size, l0.mutation_count)
+        };
+        tracing::Span::current().record("size_bytes", initial_size);
+        tracing::Span::current().record("mutations_count", initial_count);
+
+        debug!("Starting L0 flush to L1");
+
+        // Phases A (WAL pre-flush), B (rotate), C (WAL handoff) live in
+        // flush_l0_rotate. The FlushInProgressGuard travels with the
+        // RotateOutput so the counter stays accurate for the full flush
+        // lifetime (preparation for async path where the guard will live
+        // on RotatedFlush all the way through finalize).
+        let RotateOutput {
+            old_l0_arc,
+            wal_lsn,
+            current_version,
+            flush_in_progress_guard: _flush_guard,
+        } = self.flush_l0_rotate().await?;
+
+        // Phases D (L1 collect), E (orphan resolve), F (manifest seed),
+        // G (Lance writes) live in flush_stream_l1. Today it takes &self
+        // and runs inline; in Commit 5 it becomes a static `Send + 'static`
+        // function that can run on a spawned task with SharedFlushCtx.
+        let FlushOutcome { manifest, snapshot_id } = self
+            .flush_stream_l1(old_l0_arc.clone(), wal_lsn, current_version, name)
+            .await?;
+
 
         // 5. Save Snapshot
         self.storage

@@ -575,36 +575,23 @@ impl Transaction {
         // Wrap the commit (which acquires `flush_lock` internally) in the
         // same timeout that used to wrap the outer writer-RwLock acquisition.
         // `flush_lock` is now the actual serialization point.
-        let writer: &uni_store::Writer = writer_lock;
-        let (wal_lsn, flush_pending) = tokio::time::timeout(
+        //
+        // commit_transaction_l0 takes `self: &Arc<Self>` so the async branch
+        // can pass `Arc<Writer>` into the spawned stream task. We pass the
+        // Arc directly (no deref to &Writer).
+        let (wal_lsn, _flush_pending) = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            writer.commit_transaction_l0(self.tx_l0.clone()),
+            writer_lock.commit_transaction_l0(self.tx_l0.clone()),
         )
         .await
         .map_err(|_| UniError::CommitTimeout {
             tx_id: self.id.clone(),
             hint: "Another commit is in progress and taking longer than expected. Your transaction is still active \u{2014} you can retry commit().",
         })??;
-        // NOTE: `flush_pending` is currently always false because
-        // `async_flush_enabled` defaults to false in UniConfig.
-        //
-        // A naive "spawn the full flush_to_l1" MVP was prototyped and
-        // measured to be 3-40x SLOWER than sync — the spawned flush
-        // acquires `flush_lock` and runs the full streaming work, but
-        // does so while subsequent commits and inserts are competing
-        // for the same lock AND the L0Manager's internal locks, creating
-        // priority-inversion / convoy behavior.
-        //
-        // The proposal's actual design (docs/proposals/async_l0_to_l1_flush.md
-        // §5.2) requires releasing `flush_lock` between rotate and stream
-        // so concurrent commits can run while a stream is in flight. That
-        // rotate/stream/finalize split is the load-bearing piece; just
-        // spawning the unsplit body is worse than serialization.
-        //
-        // Until that proper split lands, `commit_transaction_l0` always
-        // returns flush_pending=false (the `async_flush_enabled` path
-        // inside it stays disabled), and nothing is spawned here.
-        let _ = flush_pending;
+        // _flush_pending is true when async_flush_enabled and the coordinator
+        // accepted a flush submission. Nothing to do here — the spawned stream
+        // task drives the pipeline to completion independently.
+        let writer: &uni_store::Writer = writer_lock.as_ref();
         // Update cached metrics atomics while we still hold the writer lock
         {
             let l0 = writer.l0_manager.get_current();

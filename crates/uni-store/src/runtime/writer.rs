@@ -292,6 +292,15 @@ impl Writer {
         }
     }
 
+    /// Borrow the flush coordinator if async flush is enabled.
+    /// Returns `None` when `config.async_flush_enabled = false`.
+    /// External callers (`drop_fork`) use this to drain pending streams.
+    pub fn flush_coordinator(
+        &self,
+    ) -> Option<&Arc<crate::runtime::flush_coordinator::FlushCoordinator>> {
+        self.flush_coordinator.as_ref()
+    }
+
     /// Set the index rebuild manager for post-flush automatic rebuild scheduling.
     ///
     /// One-shot: returns `Err` if already set. The receiver is `&self` so this
@@ -406,7 +415,7 @@ impl Writer {
     /// `UniConfig::async_flush_enabled` is set, so commits don't block on
     /// L1-streaming I/O.
     pub async fn commit_transaction_l0(
-        &self,
+        self: &Arc<Self>,
         tx_l0_arc: Arc<RwLock<L0Buffer>>,
     ) -> Result<(u64, bool)> {
         // Hold `flush_lock` across WAL append + flush + main-L0 merge.
@@ -539,21 +548,81 @@ impl Writer {
 
         self.update_metrics();
 
-        // 4. Best-effort post-commit auto-flush. We already hold `flush_lock`,
-        //    so dispatch directly to the lock-assuming composition helper to
-        //    avoid re-acquiring the non-reentrant `tokio::sync::Mutex`.
+        // 4. Best-effort post-commit auto-flush.
         //
-        //    The async-flush proposal (docs/proposals/async_l0_to_l1_flush.md)
-        //    will route this path through the FlushCoordinator when
-        //    `async_flush_enabled` is true. Until that wiring lands (Commit 7),
-        //    this stays synchronous regardless of the flag. The tuple's
-        //    second element is kept for forward compatibility.
-        if self.should_flush()
-            && let Err(e) = self.flush_inline_under_lock(None).await
-        {
-            tracing::warn!("Post-commit flush check failed (non-critical): {}", e);
+        // Two paths:
+        // - async_flush_enabled = false (default): inline under our
+        //   existing flush_lock guard via flush_inline_under_lock.
+        // - async_flush_enabled = true: rotate inline, drop flush_lock,
+        //   then submit the stream phase to the coordinator. Gated on
+        //   `pending_flush_count() < max_pending_flushes` so we don't
+        //   stack up rotations beyond the configured pipeline depth.
+        //   `try_acquire_permit` is non-blocking: if we lose the race
+        //   for the last permit, we just skip this trigger (the next
+        //   commit retries).
+        let mut flush_pending = false;
+        if self.should_flush() {
+            if self.config.async_flush_enabled
+                && let Some(coord) = self.flush_coordinator.as_ref()
+                && coord.pending_flush_count() < self.config.max_pending_flushes
+            {
+                match coord.try_acquire_permit() {
+                    Some(permit) => {
+                        let seq = coord.next_rotate_seq();
+                        coord.note_pending();
+                        match self.flush_l0_rotate().await {
+                            Ok(rotate_out) => {
+                                // Release flush_lock BEFORE the spawn so concurrent
+                                // commits can proceed while the stream runs.
+                                drop(_flush_lock_guard);
+                                let parent_manifest = self.cached_manifest.lock().clone();
+                                let rotated =
+                                    crate::runtime::flush_coordinator::RotatedFlush {
+                                        seq,
+                                        old_l0_arc: rotate_out.old_l0_arc.clone(),
+                                        wal_lsn: rotate_out.wal_lsn,
+                                        current_version: rotate_out.current_version,
+                                        name: None,
+                                        parent_manifest,
+                                        permit,
+                                        flush_in_progress_guard: rotate_out
+                                            .flush_in_progress_guard,
+                                    };
+                                let writer = self.clone();
+                                let _ticket = coord.submit_for_stream(
+                                    rotated,
+                                    move |old_l0, wal, ver, n| async move {
+                                        let outcome = writer
+                                            .flush_stream_l1(old_l0, wal, ver, n)
+                                            .await?;
+                                        Ok(
+                                            crate::runtime::flush_coordinator::FlushOutcome {
+                                                new_manifest: outcome.manifest,
+                                                snapshot_id: outcome.snapshot_id,
+                                            },
+                                        )
+                                    },
+                                );
+                                flush_pending = true;
+                                // Early return — flush_lock already dropped.
+                                return Ok((wal_lsn, flush_pending));
+                            }
+                            Err(e) => {
+                                tracing::warn!("Async rotate failed (non-critical): {}", e);
+                                // permit drops here, freeing the slot
+                            }
+                        }
+                    }
+                    None => {
+                        // Race: someone else grabbed the last permit. Skip;
+                        // next commit will retry should_flush().
+                        metrics::counter!("uni_flush_trigger_skipped_total").increment(1);
+                    }
+                }
+            } else if let Err(e) = self.flush_inline_under_lock(None).await {
+                tracing::warn!("Post-commit flush check failed (non-critical): {}", e);
+            }
         }
-        let flush_pending = false;
 
         Ok((wal_lsn, flush_pending))
     }
@@ -3275,6 +3344,7 @@ mod tests {
         let count_before = mutations_before.len();
 
         // Commit transaction - this should write to WAL first
+        let writer = Arc::new(writer);
         writer.commit_transaction_l0(tx_l0).await?;
 
         // Verify WAL has the new mutations

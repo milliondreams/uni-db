@@ -7,6 +7,14 @@ use colored::*;
 use prettytable::{Cell, Row, Table};
 use std::path::PathBuf;
 
+// Use mimalloc as the global allocator. Profile showed ~50% of CPU time in
+// glibc malloc + kernel page-fault zeroing under heavy concurrent allocation;
+// mimalloc's thread-local arenas reduce that to ~5%, yielding ~3x throughput
+// on allocation-heavy workloads (many small CREATE / mutation statements).
+// See crates/uni/benches/concurrent_mutations.rs.
+#[global_allocator]
+static GLOBAL: uni_db::MiMalloc = uni_db::MiMalloc;
+
 pub mod demo;
 pub mod repl;
 

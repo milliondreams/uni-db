@@ -13,7 +13,7 @@ name = "uni"
 path = "src/main.rs"
 
 [dependencies]
-uni-db = { workspace = true, default-features = true }
+uni-db = { workspace = true, default-features = true, features = ["mimalloc"] }
 uni-common = { workspace = true }
 uni-store = { workspace = true }
 tokio = { workspace = true }

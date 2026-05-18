@@ -60,12 +60,22 @@ pub struct SharedFlushCtx {
     pub l0_manager: Arc<crate::runtime::l0_manager::L0Manager>,
     pub adjacency_manager: Arc<crate::storage::adjacency_manager::AdjacencyManager>,
     pub property_manager: Option<Arc<crate::runtime::property_manager::PropertyManager>>,
+    pub schema_manager: Arc<uni_common::core::schema::SchemaManager>,
     pub cached_manifest: Arc<parking_lot::Mutex<Option<SnapshotManifest>>>,
     pub last_flush_time: Arc<parking_lot::Mutex<std::time::Instant>>,
     pub fork_id: Option<uni_common::core::fork::ForkId>,
     pub fork_flush_count: Arc<std::sync::atomic::AtomicU64>,
     pub fork_fragment_warn_fired: Arc<std::sync::atomic::AtomicBool>,
     pub fork_fragment_warn_threshold: usize,
+    /// Re-acquired by the static `flush_finalize_now` running on the
+    /// finalizer task. NOT held during stream — that's the whole point.
+    pub flush_lock: Arc<tokio::sync::Mutex<()>>,
+    pub index_rebuild_manager:
+        Arc<std::sync::OnceLock<Arc<crate::storage::index_rebuild::IndexRebuildManager>>>,
+    pub compaction_handle: Arc<parking_lot::RwLock<Option<tokio::task::JoinHandle<()>>>>,
+    pub compaction_config: uni_common::config::CompactionConfig,
+    pub index_rebuild_config: uni_common::config::IndexRebuildConfig,
+    pub auto_rebuild_enabled: bool,
 }
 
 /// A submission to the ordered finalizer.
@@ -117,6 +127,9 @@ pub struct FlushCoordinator {
     pending_count: Arc<std::sync::atomic::AtomicUsize>,
     drain_notify: Arc<tokio::sync::Notify>,
     max_pending_flushes: usize,
+    /// Tracked for `ShutdownHandle::track_task` registration. Set to None
+    /// after `take_finalizer_handle` is called.
+    finalizer_handle: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl FlushCoordinator {
@@ -133,7 +146,7 @@ impl FlushCoordinator {
 
         let pending_count_for_task = pending_count.clone();
         let drain_notify_for_task = drain_notify.clone();
-        tokio::spawn(finalizer_loop(
+        let handle = tokio::spawn(finalizer_loop(
             submit_rx,
             shared,
             finalize_fn,
@@ -148,7 +161,14 @@ impl FlushCoordinator {
             pending_count,
             drain_notify,
             max_pending_flushes,
+            finalizer_handle: parking_lot::Mutex::new(Some(handle)),
         }
+    }
+
+    /// Hand off the finalizer task's JoinHandle for tracking by
+    /// `ShutdownHandle`. Returns `None` if already taken.
+    pub fn take_finalizer_handle(&self) -> Option<tokio::task::JoinHandle<()>> {
+        self.finalizer_handle.lock().take()
     }
 
     pub fn max_pending_flushes(&self) -> usize {
@@ -161,6 +181,13 @@ impl FlushCoordinator {
             .acquire_owned()
             .await
             .map_err(|_| anyhow::anyhow!("flush coordinator permit semaphore closed"))
+    }
+
+    /// Non-blocking variant of [`Self::acquire_permit`]. Returns `None`
+    /// if the permit pool is at capacity. Used on the commit hot path
+    /// to avoid awaiting under `flush_lock`.
+    pub fn try_acquire_permit(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.permits.clone().try_acquire_owned().ok()
     }
 
     pub fn next_rotate_seq(&self) -> u64 {

@@ -2,6 +2,10 @@
 // Copyright 2024-2026 Dragonscale Team
 
 use crate::runtime::context::QueryContext;
+use crate::runtime::flush_coordinator::{
+    FinalizeFn, FlushCoordinator, FlushOutcome as AsyncFlushOutcome, RotatedFlush,
+    SharedFlushCtx,
+};
 use crate::runtime::id_allocator::IdAllocator;
 use crate::runtime::l0::{L0Buffer, serialize_constraint_key};
 use crate::runtime::l0_manager::L0Manager;
@@ -50,7 +54,7 @@ impl Default for WriterConfig {
 /// stuck. Returns `None` if a flush is already in progress, providing
 /// forward-compatible exclusion once the outer writer-RwLock is removed in
 /// Phase 4 of the concurrent-writer refactor.
-struct FlushInProgressGuard {
+pub(crate) struct FlushInProgressGuard {
     storage: Arc<StorageManager>,
 }
 
@@ -60,7 +64,7 @@ impl FlushInProgressGuard {
     /// async-flush), this is now a counter, not a single-holder latch —
     /// multiple flushes may be in flight concurrently. The counter is
     /// consumed only by compaction's delta-clear gate (`> 0` skips).
-    fn new(storage: &Arc<StorageManager>) -> Self {
+    pub(crate) fn new(storage: &Arc<StorageManager>) -> Self {
         storage
             .flush_in_progress
             .fetch_add(1, Ordering::AcqRel);
@@ -125,7 +129,9 @@ pub struct Writer {
     compaction_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
     /// Optional index rebuild manager for post-flush automatic rebuild scheduling.
     /// `OnceLock` for the same reason as `xervo_runtime`.
-    index_rebuild_manager: OnceLock<Arc<crate::storage::index_rebuild::IndexRebuildManager>>,
+    /// Wrapped in `Arc` so the async-flush finalize path can read it
+    /// from a spawned task via `SharedFlushCtx`.
+    index_rebuild_manager: Arc<OnceLock<Arc<crate::storage::index_rebuild::IndexRebuildManager>>>,
     /// Cached snapshot manifest from the last flush. Avoids re-reading from
     /// object store on every flush_to_l1 call. Wrapped in a `Mutex` for
     /// `&self` access; uncontended because all access is inside the
@@ -157,6 +163,24 @@ pub struct Writer {
     /// Arc-wrapped so async-flush coordinator's finalize path can
     /// re-acquire it from a spawned task via SharedFlushCtx.
     flush_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Coordinator for async-flush pipeline. Owns the back-pressure
+    /// semaphore, rotate-order sequence, single-finalizer task, and
+    /// pending-flush counter. Always present even when async flush is
+    /// disabled — the sync `flush_to_l1` path uses it for the future
+    /// `FlushInProgressGuard`/permit ownership model. See
+    /// `docs/proposals/async_l0_to_l1_flush.md` §3.3.
+    /// Coordinator is `None` when `async_flush_enabled = false`. The
+    /// coordinator's finalizer task captures `SharedFlushCtx` which
+    /// includes `Arc<StorageManager>`; on a fork-scoped Writer that
+    /// also pins the fork's `ForkScope` via `storage.fork_scope`, so
+    /// the holder count never drops. Constructing it only when the
+    /// feature is actually on avoids that side-effect for all
+    /// existing sync-flush paths. When async-flush graduates from
+    /// opt-in to default (Commit 12), `drop_fork` (Commit 8) handles
+    /// the drain explicitly.
+    #[allow(dead_code)] // first production use lands in Commit 6/7
+    pub(crate) flush_coordinator:
+        Option<Arc<crate::runtime::flush_coordinator::FlushCoordinator>>,
 }
 
 impl Writer {
@@ -202,6 +226,50 @@ impl Writer {
 
         let adjacency_manager = storage.adjacency_manager();
 
+        // Hoist the Arc'd fields so we can both stash them on Writer and
+        // hand the same Arcs to the SharedFlushCtx that FlushCoordinator
+        // captures. Single-source-of-truth for each piece of mutable
+        // shared state.
+        let last_flush_time = Arc::new(PlMutex::new(std::time::Instant::now()));
+        let cached_manifest = Arc::new(PlMutex::new(None));
+        let fork_flush_count = Arc::new(AtomicU64::new(0));
+        let fork_fragment_warn_fired = Arc::new(AtomicBool::new(false));
+        let flush_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let compaction_handle = Arc::new(RwLock::new(None));
+        let index_rebuild_manager: Arc<
+            OnceLock<Arc<crate::storage::index_rebuild::IndexRebuildManager>>,
+        > = Arc::new(OnceLock::new());
+
+        let flush_coordinator = if config.async_flush_enabled {
+            let shared = SharedFlushCtx {
+                storage: storage.clone(),
+                l0_manager: l0_manager.clone(),
+                adjacency_manager: adjacency_manager.clone(),
+                property_manager: property_manager.clone(),
+                schema_manager: schema_manager.clone(),
+                cached_manifest: cached_manifest.clone(),
+                last_flush_time: last_flush_time.clone(),
+                fork_id: None,
+                fork_flush_count: fork_flush_count.clone(),
+                fork_fragment_warn_fired: fork_fragment_warn_fired.clone(),
+                fork_fragment_warn_threshold: config.fork_fragment_warn_threshold,
+                flush_lock: flush_lock.clone(),
+                index_rebuild_manager: index_rebuild_manager.clone(),
+                compaction_handle: compaction_handle.clone(),
+                compaction_config: config.compaction.clone(),
+                index_rebuild_config: config.index_rebuild.clone(),
+                auto_rebuild_enabled: config.index_rebuild.auto_rebuild_enabled,
+            };
+            let finalize_fn: Arc<dyn FinalizeFn> = Arc::new(WriterFinalizer);
+            Some(Arc::new(FlushCoordinator::new(
+                config.max_pending_flushes,
+                shared,
+                finalize_fn,
+            )))
+        } else {
+            None
+        };
+
         Ok(Self {
             l0_manager,
             storage,
@@ -211,15 +279,42 @@ impl Writer {
             xervo_runtime: OnceLock::new(),
             property_manager,
             adjacency_manager,
-            last_flush_time: Arc::new(PlMutex::new(std::time::Instant::now())),
-            compaction_handle: Arc::new(RwLock::new(None)),
-            index_rebuild_manager: OnceLock::new(),
-            cached_manifest: Arc::new(PlMutex::new(None)),
+            last_flush_time,
+            compaction_handle,
+            index_rebuild_manager,
+            cached_manifest,
             fork_id: None,
-            fork_flush_count: Arc::new(AtomicU64::new(0)),
-            fork_fragment_warn_fired: Arc::new(AtomicBool::new(false)),
-            flush_lock: Arc::new(tokio::sync::Mutex::new(())),
+            fork_flush_count,
+            fork_fragment_warn_fired,
+            flush_lock,
+            flush_coordinator,
         })
+    }
+
+    /// Build a fresh `SharedFlushCtx` from this Writer's current state.
+    /// Used by the async-flush stream/finalize paths to pass into spawned
+    /// tasks without smuggling `Arc<Writer>` (which would create a cycle
+    /// with `flush_coordinator -> FinalizeFn -> Writer`).
+    pub(crate) fn shared_ctx(&self) -> SharedFlushCtx {
+        SharedFlushCtx {
+            storage: self.storage.clone(),
+            l0_manager: self.l0_manager.clone(),
+            adjacency_manager: self.adjacency_manager.clone(),
+            property_manager: self.property_manager.clone(),
+            schema_manager: self.schema_manager.clone(),
+            cached_manifest: self.cached_manifest.clone(),
+            last_flush_time: self.last_flush_time.clone(),
+            fork_id: self.fork_id,
+            fork_flush_count: self.fork_flush_count.clone(),
+            fork_fragment_warn_fired: self.fork_fragment_warn_fired.clone(),
+            fork_fragment_warn_threshold: self.config.fork_fragment_warn_threshold,
+            flush_lock: self.flush_lock.clone(),
+            index_rebuild_manager: self.index_rebuild_manager.clone(),
+            compaction_handle: self.compaction_handle.clone(),
+            compaction_config: self.config.compaction.clone(),
+            index_rebuild_config: self.config.index_rebuild.clone(),
+            auto_rebuild_enabled: self.config.index_rebuild.auto_rebuild_enabled,
+        }
     }
 
     /// Set the index rebuild manager for post-flush automatic rebuild scheduling.
@@ -2729,28 +2824,87 @@ impl Writer {
         initial_count: usize,
         start: std::time::Instant,
     ) -> Result<String> {
+        Self::flush_finalize_body(
+            &self.shared_ctx(),
+            old_l0_arc,
+            wal_lsn,
+            manifest,
+            snapshot_id,
+            initial_size,
+            initial_count,
+            start,
+        )
+        .await
+    }
+
+    /// Phases H..S of the flush, lock-acquiring variant. Used by the
+    /// async-flush finalizer task (running on a spawned tokio task),
+    /// which holds neither `&self` nor `flush_lock`. Briefly re-acquires
+    /// `flush_lock` to serialize the publish boundary, then runs the
+    /// same body as `flush_finalize_locked` but over a SharedFlushCtx.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn flush_finalize_now(
+        shared: SharedFlushCtx,
+        old_l0_arc: Arc<RwLock<L0Buffer>>,
+        wal_lsn: u64,
+        manifest: SnapshotManifest,
+        snapshot_id: String,
+        initial_size: usize,
+        initial_count: usize,
+        start: std::time::Instant,
+    ) -> Result<String> {
+        let _flush_lock_guard = shared.flush_lock.clone().lock_owned().await;
+        Self::flush_finalize_body(
+            &shared,
+            old_l0_arc,
+            wal_lsn,
+            manifest,
+            snapshot_id,
+            initial_size,
+            initial_count,
+            start,
+        )
+        .await
+    }
+
+    /// Shared body of `flush_finalize_locked` and `flush_finalize_now`.
+    /// Static over `SharedFlushCtx`; the caller is responsible for
+    /// holding `flush_lock`.
+    #[allow(clippy::too_many_arguments)]
+    async fn flush_finalize_body(
+        shared: &SharedFlushCtx,
+        old_l0_arc: Arc<RwLock<L0Buffer>>,
+        wal_lsn: u64,
+        manifest: SnapshotManifest,
+        snapshot_id: String,
+        initial_size: usize,
+        initial_count: usize,
+        start: std::time::Instant,
+    ) -> Result<String> {
         // H. Publish manifest (body first, then pointer — recovery is
         // idempotent if we crash between the two).
-        self.storage
+        shared
+            .storage
             .snapshot_manager()
             .save_snapshot(&manifest)
             .await?;
-        self.storage
+        shared
+            .storage
             .snapshot_manager()
             .set_latest_snapshot(&manifest.snapshot_id)
             .await?;
 
         // I. Cache manifest for next flush to avoid re-reading from object store.
-        *self.cached_manifest.lock() = Some(manifest.clone());
+        *shared.cached_manifest.lock() = Some(manifest.clone());
 
         // J. Complete flush: remove old L0 from pending_flush. MUST happen
         // BEFORE WAL truncation so min_pending_wal_lsn is accurate.
-        self.l0_manager.complete_flush(&old_l0_arc);
+        shared.l0_manager.complete_flush(&old_l0_arc);
 
         // K. Truncate WAL up to the safe LSN.
-        let wal_handle = self.l0_manager.get_current().read().wal.clone();
+        let wal_handle = shared.l0_manager.get_current().read().wal.clone();
         if let Some(w) = wal_handle {
-            let safe_lsn = self
+            let safe_lsn = shared
                 .l0_manager
                 .min_pending_wal_lsn()
                 .map(|min_pending| min_pending.min(wal_lsn))
@@ -2759,12 +2913,12 @@ impl Writer {
         }
 
         // L. Invalidate property cache after flush to prevent stale reads.
-        if let Some(ref pm) = self.property_manager {
+        if let Some(ref pm) = shared.property_manager {
             pm.clear_cache().await;
         }
 
         // M. Reset last flush time for time-based auto-flush.
-        *self.last_flush_time.lock() = std::time::Instant::now();
+        *shared.last_flush_time.lock() = std::time::Instant::now();
 
         info!(
             snapshot_id,
@@ -2779,17 +2933,17 @@ impl Writer {
         // P. Increment flush generation counter for write throttling.
         {
             let mut status = uni_common::sync::acquire_mutex(
-                &self.storage.compaction_status,
+                &shared.storage.compaction_status,
                 "compaction_status",
             )?;
             status.l1_runs += 1;
         }
 
         // Q. Trigger CSR compaction if enough frozen segments have accumulated.
-        let am = self.adjacency_manager.clone();
-        if am.should_compact(self.config.compaction.frozen_segments_compact_threshold) {
+        let am = shared.adjacency_manager.clone();
+        if am.should_compact(shared.compaction_config.frozen_segments_compact_threshold) {
             let previous_still_running = {
-                let guard = self.compaction_handle.read();
+                let guard = shared.compaction_handle.read();
                 guard.as_ref().is_some_and(|h| !h.is_finished())
             };
             if previous_still_running {
@@ -2798,19 +2952,29 @@ impl Writer {
                 let handle = tokio::spawn(async move {
                     am.compact();
                 });
-                *self.compaction_handle.write() = Some(handle);
+                *shared.compaction_handle.write() = Some(handle);
             }
         }
 
         // R. Post-flush: check if any indexes need rebuilding based on thresholds.
-        if let Some(rebuild_mgr) = self.index_rebuild_manager.get()
-            && self.config.index_rebuild.auto_rebuild_enabled
+        if shared.auto_rebuild_enabled
+            && let Some(rebuild_mgr) = shared.index_rebuild_manager.get()
         {
-            self.schedule_index_rebuilds_if_needed(&manifest, rebuild_mgr.clone());
+            Self::schedule_index_rebuilds_if_needed_static(
+                &manifest,
+                rebuild_mgr.clone(),
+                shared.schema_manager.clone(),
+                shared.index_rebuild_config.clone(),
+            );
         }
 
         // S. Emit fork-fragment observability after a successful forked flush.
-        self.tick_fork_fragment_observability();
+        Self::tick_fork_fragment_observability_static(
+            shared.fork_id,
+            shared.fork_flush_count.clone(),
+            shared.fork_fragment_warn_fired.clone(),
+            shared.fork_fragment_warn_threshold,
+        );
 
         Ok(snapshot_id)
     }
@@ -2827,6 +2991,7 @@ impl Writer {
     /// is too costly for a purely observational guard rail.
     ///
     /// No-op for primary writers (`fork_id == None`).
+    #[allow(dead_code)] // called by tests; production path uses _static
     pub(crate) fn tick_fork_fragment_observability(&self) {
         Self::tick_fork_fragment_observability_static(
             self.fork_id,
@@ -2874,6 +3039,8 @@ impl Writer {
     /// Check rebuild thresholds and schedule background index rebuilds for
     /// labels that exceed growth or age limits. Marks affected indexes as
     /// `Stale` and spawns an async task to schedule the rebuild.
+    #[allow(dead_code)] // production path uses _static; kept as the
+                       // documented instance entry point.
     fn schedule_index_rebuilds_if_needed(
         &self,
         manifest: &SnapshotManifest,
@@ -2923,6 +3090,72 @@ impl Writer {
         });
     }
 
+}
+
+/// `FinalizeFn` implementation that the `FlushCoordinator` invokes from
+/// its single-task finalizer loop. Unit struct on purpose: it must NOT
+/// hold `Arc<Writer>` (that would create a reference cycle Writer ->
+/// FlushCoordinator -> Arc<dyn FinalizeFn> -> Writer). All state needed
+/// for finalize travels in via `SharedFlushCtx`.
+pub(crate) struct WriterFinalizer;
+
+impl FinalizeFn for WriterFinalizer {
+    fn finalize<'a>(
+        &'a self,
+        rotated: RotatedFlush,
+        outcome: AsyncFlushOutcome,
+        shared: SharedFlushCtx,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            // Read initial_size / initial_count from the rotated L0 so
+            // we don't have to plumb them through the coordinator
+            // submission. The buffer is still alive in pending_flush
+            // until `complete_flush` (J) below pops it.
+            let (initial_size, initial_count) = {
+                let l0 = rotated.old_l0_arc.read();
+                (l0.estimated_size, l0.mutation_count)
+            };
+            let result = Writer::flush_finalize_now(
+                shared,
+                rotated.old_l0_arc.clone(),
+                rotated.wal_lsn,
+                outcome.new_manifest,
+                outcome.snapshot_id,
+                initial_size,
+                initial_count,
+                std::time::Instant::now(),
+            )
+            .await;
+            // `rotated` (permit + flush_in_progress_guard) drops here.
+            drop(rotated.permit);
+            result
+        })
+    }
+
+    fn finalize_failure<'a>(
+        &'a self,
+        rotated: RotatedFlush,
+        err: anyhow::Error,
+        _shared: SharedFlushCtx,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = anyhow::Error> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            tracing::warn!(
+                error = %err,
+                seq = rotated.seq,
+                "async flush stream failed; old L0 remains in pending_flush, \
+                 WAL retains its data, recovery via WAL replay on restart"
+            );
+            metrics::counter!("uni_flush_failures_total").increment(1);
+            // Permit + guard drop here so back-pressure releases even on
+            // failure.
+            drop(rotated.permit);
+            err
+        })
+    }
 }
 
 #[cfg(test)]

@@ -1515,8 +1515,14 @@ impl Executor {
                                 }
                             }
 
-                            // VID generation is label-independent
-                            let new_vid = writer.next_vid().await?;
+                            // VID generation is label-independent. Pull from the
+                            // per-tx reservoir if set (amortizes the global
+                            // IdAllocator mutex), else fall back to the direct
+                            // per-VID path.
+                            let new_vid = match &self.id_reservoir {
+                                Some(r) => r.next_vid().await?,
+                                None => writer.next_vid().await?,
+                            };
 
                             // Enrich with generated columns only for known labels
                             for label_name in &n.labels {
@@ -1571,7 +1577,10 @@ impl Executor {
                                         rel_props.extend(map);
                                     }
                                 }
-                                let eid = writer.next_eid(type_id).await?;
+                                let eid = match &self.id_reservoir {
+                                    Some(r) => r.next_eid().await?,
+                                    None => writer.next_eid(type_id).await?,
+                                };
 
                                 // For incoming edges like (a)<-[:R]-(b), swap so the edge points b -> a
                                 let (edge_src, edge_dst) = match dir {

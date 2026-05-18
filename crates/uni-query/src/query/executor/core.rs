@@ -242,6 +242,10 @@ pub struct Executor {
     /// without requiring the writer lock at transaction-creation time.
     pub(crate) transaction_l0_override:
         Option<Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
+    /// Per-transaction VID/EID reservoir. When set, CREATE/MERGE paths pull
+    /// IDs from this batched cache instead of `Writer::next_vid()` /
+    /// `Writer::next_eid()`, amortizing the `IdAllocator`'s global mutex.
+    pub(crate) id_reservoir: Option<Arc<uni_store::runtime::TxIdReservoir>>,
     /// User-defined custom scalar function registry.
     pub(crate) custom_function_registry:
         Option<Arc<super::custom_functions::CustomFunctionRegistry>>,
@@ -277,6 +281,7 @@ impl Executor {
             xervo_runtime: None,
             warnings: Arc::new(std::sync::Mutex::new(Vec::new())),
             transaction_l0_override: None,
+            id_reservoir: None,
             custom_function_registry: None,
             cancellation_token: None,
         }
@@ -342,6 +347,13 @@ impl Executor {
         l0: Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>,
     ) {
         self.transaction_l0_override = Some(l0);
+    }
+
+    /// Attach a per-transaction VID/EID reservoir. When set, CREATE/MERGE
+    /// paths in `execute_create_pattern` pull IDs from the reservoir's
+    /// pre-reserved cache, amortizing the global `IdAllocator` mutex.
+    pub fn set_id_reservoir(&mut self, r: Arc<uni_store::runtime::TxIdReservoir>) {
+        self.id_reservoir = Some(r);
     }
 
     /// Attach a custom scalar function registry for user-defined functions.

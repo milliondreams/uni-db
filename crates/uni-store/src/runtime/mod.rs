@@ -3,6 +3,7 @@
 
 pub mod context;
 pub mod id_allocator;
+pub mod id_reservoir;
 pub mod l0;
 pub mod l0_manager;
 pub mod l0_visibility;
@@ -21,6 +22,7 @@ pub use context::QueryContext;
 pub use uni_common::graph::simple_graph::{Direction, SimpleGraph};
 pub use wal::WriteAheadLog;
 pub use working_graph::WorkingGraph;
+pub use id_reservoir::{DEFAULT_RESERVOIR_BATCH, TxIdReservoir};
 pub use writer::Writer;
 
 use uni_common::core::id::{Eid, Vid};

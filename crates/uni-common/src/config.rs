@@ -492,6 +492,14 @@ pub struct UniConfig {
     /// Phase 5; this surfaces the risk operationally. Default: 256.
     pub fork_fragment_warn_threshold: usize,
 
+    /// Per-transaction VID/EID reservoir refill size. Each `Transaction`
+    /// pre-reserves this many IDs at a time from the global `IdAllocator`,
+    /// amortizing its `tokio::Mutex` over `N` allocations. Tradeoff:
+    /// larger = fewer global-mutex acquisitions but more wasted IDs on
+    /// short transactions (capped at `batch_size - 1` per tx). u64 ID space
+    /// makes the waste negligible. Default: 16.
+    pub tx_id_reservoir_batch: usize,
+
     /// Phase 4a: cap on total fork count (Active + Pending + Tombstoned).
     /// `None` = unbounded. When set, `Session::fork(name).await` errors
     /// with `UniError::ForkBudgetExceeded` once the cap is reached.
@@ -562,6 +570,7 @@ impl Default for UniConfig {
             index_rebuild: IndexRebuildConfig::default(),
             strict_schema: false,
             fork_fragment_warn_threshold: 256,
+            tx_id_reservoir_batch: 16,
             max_forks: None,
             fork_default_ttl: None,
             fork_sweeper_interval: Duration::from_secs(60),

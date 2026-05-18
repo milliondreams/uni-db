@@ -381,6 +381,7 @@ impl crate::api::UniInner {
         cypher: &str,
         params: HashMap<String, ApiValue>,
         tx_l0: std::sync::Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>,
+        id_reservoir: Option<Arc<uni_store::runtime::TxIdReservoir>>,
     ) -> Result<QueryResult> {
         let total_start = Instant::now();
 
@@ -484,6 +485,7 @@ impl crate::api::UniInner {
         cypher: &str,
         params: HashMap<String, ApiValue>,
         tx_l0: std::sync::Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>,
+        id_reservoir: Option<Arc<uni_store::runtime::TxIdReservoir>>,
     ) -> Result<(QueryResult, ProfileOutput)> {
         let ast = uni_cypher::parse(cypher).map_err(into_parse_error)?;
 
@@ -517,6 +519,9 @@ impl crate::api::UniInner {
             executor.set_writer(w.clone());
         }
         executor.set_transaction_l0(tx_l0);
+        if let Some(r) = id_reservoir {
+            executor.set_id_reservoir(r);
+        }
 
         let projection_order = extract_projection_order(&logical_plan);
 

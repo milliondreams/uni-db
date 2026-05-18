@@ -106,6 +106,10 @@ pub struct Transaction {
     pub(crate) db: Arc<UniInner>,
     /// Private L0 buffer — mutations within this transaction are routed here.
     pub(crate) tx_l0: Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>,
+    /// Per-transaction VID/EID reservoir. Bulk-reserves from the global
+    /// `IdAllocator` and hands out IDs without re-locking — amortizes the
+    /// allocator's `tokio::Mutex` across the tx's mutations.
+    pub(crate) id_reservoir: Arc<uni_store::runtime::TxIdReservoir>,
     /// Session-level write guard (set false on complete)
     session_write_guard: Arc<std::sync::atomic::AtomicBool>,
     /// Session's rule registry (for rule promotion on commit)
@@ -170,11 +174,15 @@ impl Transaction {
         // READ lock only — create a private L0 buffer without blocking other writers.
         // This is the key commit-time serialization change: no writer WRITE lock
         // is taken at transaction begin; it's deferred to commit().
-        let (started_at_version, tx_l0) = {
+        let (started_at_version, tx_l0, id_reservoir) = {
             let writer: &uni_store::Writer = writer_lock.as_ref();
             let l0 = writer.create_transaction_l0();
             let version = l0.read().current_version;
-            (version, l0)
+            let reservoir = Arc::new(uni_store::runtime::TxIdReservoir::new(
+                writer.allocator.clone(),
+                db.config.tx_id_reservoir_batch,
+            ));
+            (version, l0, reservoir)
         };
 
         let id = Uuid::new_v4().to_string();
@@ -190,6 +198,7 @@ impl Transaction {
         let tx = Self {
             db,
             tx_l0,
+            id_reservoir,
             session_write_guard: session.active_write_guard().clone(),
             session_rule_registry: session.rule_registry().clone(),
             rule_registry: Arc::new(std::sync::RwLock::new(session_registry)),
@@ -225,7 +234,12 @@ impl Transaction {
     pub async fn query(&self, cypher: &str) -> Result<QueryResult> {
         self.check_completed()?;
         self.db
-            .execute_internal_with_tx_l0(cypher, HashMap::new(), self.tx_l0.clone())
+            .execute_internal_with_tx_l0(
+                cypher,
+                HashMap::new(),
+                self.tx_l0.clone(),
+                Some(self.id_reservoir.clone()),
+            )
             .await
     }
 
@@ -832,6 +846,7 @@ impl<'a> ExecuteBuilder<'a> {
             &self.cypher,
             self.params,
             self.tx.tx_l0.clone(),
+            Some(self.tx.id_reservoir.clone()),
         );
         let result = if let Some(t) = self.timeout {
             tokio::time::timeout(t, fut)
@@ -865,6 +880,7 @@ impl<'a> ExecuteBuilder<'a> {
             &self.cypher,
             self.params,
             self.tx.tx_l0.clone(),
+            Some(self.tx.id_reservoir.clone()),
         );
         let (result, profile) = if let Some(t) = self.timeout {
             tokio::time::timeout(t, fut)
@@ -919,6 +935,7 @@ impl<'a> TxQueryBuilder<'a> {
             &self.cypher,
             self.params,
             self.tx.tx_l0.clone(),
+            Some(self.tx.id_reservoir.clone()),
         );
         let result = if let Some(t) = self.timeout {
             tokio::time::timeout(t, fut)
@@ -942,6 +959,7 @@ impl<'a> TxQueryBuilder<'a> {
             &self.cypher,
             self.params,
             self.tx.tx_l0.clone(),
+            Some(self.tx.id_reservoir.clone()),
         );
         if let Some(t) = self.timeout {
             tokio::time::timeout(t, fut)

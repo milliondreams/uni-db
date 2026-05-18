@@ -421,6 +421,9 @@ impl crate::api::UniInner {
             executor.set_writer(w.clone());
         }
         executor.set_transaction_l0(tx_l0);
+        if let Some(r) = id_reservoir {
+            executor.set_id_reservoir(r);
+        }
 
         let projection_order = extract_projection_order(&logical_plan);
 

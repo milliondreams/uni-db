@@ -27,6 +27,22 @@ Or add it to your `Cargo.toml` directly:
 uni-db = "*"
 ```
 
+!!! tip "Enable mimalloc for ~3× throughput on mutation-heavy workloads"
+    Allocation-heavy workloads (many small Cypher `CREATE`/`MERGE` statements, concurrent writers) bottleneck on the default glibc allocator. Opt in to mimalloc:
+
+    ```toml
+    [dependencies]
+    uni-db = { version = "*", features = ["mimalloc"] }
+    ```
+
+    ```rust
+    // in your binary's main.rs:
+    #[global_allocator]
+    static GLOBAL: uni_db::MiMalloc = uni_db::MiMalloc;
+    ```
+
+    Measured: `concurrent_mutations` bench wall time at sess=24 drops from **1012 ms → 394 ms** (2.5×). See the [Performance Tuning Guide](../guides/performance-tuning.md#use-mimalloc-as-global-allocator) for the full breakdown.
+
 ---
 
 ## Python Package
@@ -36,6 +52,9 @@ Install from [PyPI](https://pypi.org/project/uni-db/). The default wheel bundles
 ```bash
 pip install uni-db
 ```
+
+!!! info "mimalloc included by default"
+    Every wheel ships with mimalloc as the Rust-side global allocator — no configuration needed. Python's own `PyMem_*` allocator is untouched; only Rust allocations (the entire Cypher pipeline) route through mimalloc. Mutation-heavy workloads see ~3× throughput vs. glibc.
 
 For the Pydantic OGM layer:
 
@@ -287,6 +306,7 @@ The previous nine `gpu-*` features (`gpu-tensorrt`, `gpu-rocm`, `gpu-coreml`, `g
 | Feature | Description | Default |
 |---|---|---|
 | `lance-backend` | Lance columnar storage backend | Enabled |
+| `mimalloc` | Re-export `mimalloc::MiMalloc` as `uni_db::MiMalloc` so consumers can install it as the global allocator (~3× throughput on mutation-heavy workloads). Setting `#[global_allocator]` is still the binary's job. | Disabled |
 | `snapshot-internals` | Expose snapshot internals (advanced) | Disabled |
 | `storage-internals` | Expose storage internals (advanced) | Disabled |
 

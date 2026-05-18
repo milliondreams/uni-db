@@ -478,6 +478,38 @@ let config = UniConfig {
 
 Diagnostic: if `MATCH (a)-[r:LINK]->(b) WHERE id(a)=$nid` for a small constant out-degree gets noticeably slower over a long write-heavy run, this is the regime.
 
+### Allocator: use mimalloc for mutation-heavy workloads
+
+For workloads that run many small mutations (per-statement Cypher `CREATE`/`MERGE`, concurrent writers, mutation streams), the **default glibc allocator becomes the dominant bottleneck**. At 24-session concurrency, profile showed ~50% of CPU time in `__memset` (zeroing fresh heap pages), kernel `clear_page_erms`, and glibc arena locks.
+
+**Python users:** every PyO3 wheel (`uni-db`, `uni-db-cuda`, `uni-db-metal`, `uni-db-onnx`, etc.) **ships with mimalloc built in** as the Rust-side global allocator. No configuration needed.
+
+**Rust library consumers:** opt in via the `mimalloc` feature flag:
+
+```toml
+[dependencies]
+uni-db = { version = "...", features = ["mimalloc"] }
+```
+
+```rust
+// in your binary's main.rs:
+#[global_allocator]
+static GLOBAL: uni_db::MiMalloc = uni_db::MiMalloc;
+```
+
+**CLI users:** the `uni` binary already uses mimalloc by default.
+
+Measured win on `concurrent_mutations` benchmark (24 sessions × 100 `CREATE` each):
+
+| N sessions | glibc | mimalloc | speedup |
+|---|---|---|---|
+| 1 | 139 ms | 45 ms | 3.08× |
+| 24 | 984 ms | 394 ms | 2.50× |
+
+The 3× win at sess=1 reveals glibc was bloated even single-threaded for the per-statement parse + plan + DataFusion churn. mimalloc's thread-local arenas avoid the page-fault traffic. CPython's `PyMem_*` allocator is untouched in Python wheels — only Rust allocations route through mimalloc.
+
+**When to recommend it:** any code that runs `tx.execute("CREATE ...")` in a loop, multi-session writers, ingest pipelines, or benchmarks. Skip if the consumer has a strong reason to pick a different allocator (custom allocators for embedded use, etc.).
+
 ---
 
 ## When to Load References

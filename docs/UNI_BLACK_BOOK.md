@@ -4487,6 +4487,43 @@ async def main():
 | **Use async for I/O-bound workloads** | Non-blocking for web servers |
 | **Register all models before sync_schema** | Schema generated from model definitions |
 
+## Allocator: mimalloc (built into every wheel)
+
+Every PyO3 wheel (CPU, CUDA, Metal, ONNX, ONNX-CUDA, ONNX-Metal) ships with
+**mimalloc as the Rust-side global allocator**. Python's own allocator
+(`PyMem_*`) is untouched — Python objects still go through CPython's heap.
+Only Rust allocations route through mimalloc, which is what matters because
+the entire Cypher pipeline (AST, logical plan, DataFusion physical plan,
+executor state, per-statement closures) is Rust-side.
+
+**Why it ships built-in**: profiling at 24-session concurrency showed ~50%
+of CPU time in `glibc malloc` and kernel page-fault zeroing under heavy
+concurrent allocation. mimalloc's thread-local arenas + heap recycling
+sidestep both. Measured ~3× throughput on the `concurrent_mutations`
+benchmark; the win applies directly to Python users running mutation-heavy
+workloads (`tx.execute("CREATE ...")` loops, multi-session writers).
+
+**Coexistence with CPython**:
+
+```text
++---------------------+  +------------------------+
+| Python objects      |  | Rust Vec/HashMap/Arc   |
+| (PyList, PyDict,..) |  | (AST, plan, executor)  |
++----------+----------+  +-----------+------------+
+           |                         |
+       PyMem_*                   mimalloc
+           |                         |
+           +------- same process ----+
+```
+
+Separate arenas; no sharing, no conflict. Slight RSS overhead (~10 MB)
+because each allocator maintains its own bookkeeping; negligible at
+production scale.
+
+**No configuration required.** Wheels work as-is. To override (e.g., to
+benchmark against jemalloc), build from source with a different allocator
+choice in `bindings/uni-db/src/lib.rs`.
+
 ---
 
 # Part XV: Configuration Reference
@@ -4691,6 +4728,45 @@ Prevents CWE-22 (path traversal) attacks in server mode.
 ### Stack Size
 
 The `.cargo/config.toml` sets `RUST_MIN_STACK=8388608` (8 MB) to prevent stack overflows in debug builds. The algorithm execution path creates deeply nested async state machines that exceed the default 2 MB stack.
+
+### Global Allocator (mimalloc)
+
+Allocation-heavy workloads (many small mutations, concurrent Cypher
+`CREATE`/`MERGE`, per-statement parse + plan churn) bottleneck on the
+default glibc allocator long before they bottleneck on any uni-db lock.
+Profile at sess=24 showed ~50% of CPU time in `__memset_avx2_unaligned_erms`
+(zeroing fresh heap pages) and kernel `clear_page_erms` (zeroing anonymous
+pages on first touch). glibc's per-arena locks and the kernel's per-CPU
+page allocator both serialize under concurrent churn.
+
+uni-db ships an optional `mimalloc` feature that re-exports `MiMalloc`:
+
+```toml
+[dependencies]
+uni-db = { version = "...", features = ["mimalloc"] }
+```
+
+```rust
+// in your binary's main.rs:
+#[global_allocator]
+static GLOBAL: uni_db::MiMalloc = uni_db::MiMalloc;
+```
+
+Measured: `concurrent_mutations` benchmark wall time at sess=24 drops
+from **1012 ms → 394 ms** (2.57× speedup). The win is roughly constant
+across N ∈ {1, 4, 12, 24} — glibc was bloated even single-threaded for
+this workload, and mimalloc's thread-local arenas avoid the serialization
+under concurrency.
+
+**Defaults**:
+
+- `uni-cli` binary (`cargo install uni-cli` or shipped binaries) uses
+  mimalloc by default.
+- All PyO3 wheels (uni-db, -cuda, -metal, -onnx, etc.) bundle mimalloc.
+- Rust library consumers opt in via the feature flag above.
+
+This is a library; we don't force an allocator on consumers — but if you
+don't have a strong reason to use a different one, turn it on.
 
 ## Deployment Scenarios
 

@@ -79,6 +79,17 @@ impl Drop for FlushInProgressGuard {
     }
 }
 
+/// Output of [`Writer::flush_l0_rotate`]: the to-be-flushed L0 buffer,
+/// captured WAL LSN, current_version, and the in-progress guard whose
+/// lifetime spans the full flush (including the future async stream
+/// phase that runs on a spawned task).
+struct RotateOutput {
+    old_l0_arc: Arc<RwLock<L0Buffer>>,
+    wal_lsn: u64,
+    current_version: u64,
+    flush_in_progress_guard: FlushInProgressGuard,
+}
+
 pub struct Writer {
     pub l0_manager: Arc<L0Manager>,
     pub storage: Arc<StorageManager>,
@@ -2111,6 +2122,64 @@ impl Writer {
         self.flush_to_l1_inner(name).await
     }
 
+    /// Phase A+B+C of the flush: flush the WAL, rotate L0 (so the
+    /// to-be-flushed buffer moves to `pending_flush` and a fresh L0 takes
+    /// its place), and hand off the WAL to the new L0.
+    ///
+    /// Runs in microseconds. Must be called under `flush_lock` (the caller
+    /// is responsible). The returned [`RotateOutput`] carries everything
+    /// the subsequent stream + finalize phases need; in particular the
+    /// [`FlushInProgressGuard`] is bound to the return value so it stays
+    /// alive for the full flush lifetime — including any future async
+    /// path where stream runs on a spawned task.
+    async fn flush_l0_rotate(&self) -> Result<RotateOutput> {
+        // Acquire the in-progress counter BEFORE any heavy work. The
+        // guard lives on RotateOutput; dropping RotateOutput drops the
+        // guard, so the counter goes back to zero exactly when the flush
+        // is fully done.
+        let flush_in_progress_guard = FlushInProgressGuard::new(&self.storage);
+
+        // A. Flush WAL BEFORE rotating L0. If WAL flush fails, the
+        // current L0 is still active and mutations are retained in
+        // memory until restart/retry.
+        let wal_for_truncate = {
+            let current_l0 = self.l0_manager.get_current();
+            let l0_guard = current_l0.read();
+            l0_guard.wal.clone()
+        };
+        let wal_lsn = if let Some(ref w) = wal_for_truncate {
+            w.flush().await?
+        } else {
+            0
+        };
+
+        // B. Begin flush: rotate L0 and keep old L0 visible to reads via
+        // pending_flush until complete_flush is called by finalize.
+        let old_l0_arc = self.l0_manager.begin_flush(0, None);
+        metrics::counter!("uni_l0_buffer_rotations_total").increment(1);
+
+        // C. WAL handoff: record wal_lsn on old L0, transfer WAL handle
+        // and current_version to the new L0.
+        let current_version;
+        {
+            let mut old_l0_guard = old_l0_arc.write();
+            current_version = old_l0_guard.current_version;
+            old_l0_guard.wal_lsn_at_flush = wal_lsn;
+            let wal = old_l0_guard.wal.take();
+            let new_l0_arc = self.l0_manager.get_current();
+            let mut new_l0_guard = new_l0_arc.write();
+            new_l0_guard.wal = wal;
+            new_l0_guard.current_version = current_version;
+        }
+
+        Ok(RotateOutput {
+            old_l0_arc,
+            wal_lsn,
+            current_version,
+            flush_in_progress_guard,
+        })
+    }
+
     /// Body of [`Writer::flush_to_l1`]; assumes the caller has already acquired
     /// `flush_lock`. The `FlushInProgressGuard` inside is a complementary CAS
     /// safety net against any future caller that bypasses `flush_lock`.
@@ -2123,15 +2192,6 @@ impl Writer {
         let start = std::time::Instant::now();
         let schema = self.schema_manager.schema();
 
-        // Signal that a flush is in progress so compaction skips delta clears.
-        // The RAII guard clears the flag on every exit path — manual drops
-        // earlier left the flag stuck on any `?` early-return inside this
-        // method (concurrent_writer.md §6.6). With the move to a counter
-        // (preparing for async_l0_to_l1_flush.md), multiple flushes may
-        // be concurrently in flight; the RAII semantics still hold per
-        // flush.
-        let _flush_guard = FlushInProgressGuard::new(&self.storage);
-
         let (initial_size, initial_count) = {
             let l0_arc = self.l0_manager.get_current();
             let l0 = l0_arc.read();
@@ -2142,46 +2202,17 @@ impl Writer {
 
         debug!("Starting L0 flush to L1");
 
-        // 1. Flush WAL BEFORE rotating L0
-        // This ensures that if WAL flush fails, the current L0 is still active
-        // and mutations are retained in memory until restart/retry.
-        // Capture the LSN of the flushed segment for the snapshot's wal_high_water_mark.
-        let wal_for_truncate = {
-            let current_l0 = self.l0_manager.get_current();
-            let l0_guard = current_l0.read();
-            l0_guard.wal.clone()
-        };
-
-        let wal_lsn = if let Some(ref w) = wal_for_truncate {
-            w.flush().await?
-        } else {
-            0
-        };
-
-        // 2. Begin flush: rotate L0 and keep old L0 visible to reads
-        // The old L0 stays in pending_flush list until complete_flush is called,
-        // ensuring data remains visible even if L1 writes fail.
-        let old_l0_arc = self.l0_manager.begin_flush(0, None);
-        metrics::counter!("uni_l0_buffer_rotations_total").increment(1);
-
-        let current_version;
-        {
-            // Acquire Write lock to take WAL and version
-            let mut old_l0_guard = old_l0_arc.write();
-            current_version = old_l0_guard.current_version;
-
-            // Record the WAL LSN for this L0 so we don't truncate past it
-            // if this flush fails and a subsequent flush succeeds.
-            old_l0_guard.wal_lsn_at_flush = wal_lsn;
-
-            let wal = old_l0_guard.wal.take();
-
-            // Give WAL to new L0
-            let new_l0_arc = self.l0_manager.get_current();
-            let mut new_l0_guard = new_l0_arc.write();
-            new_l0_guard.wal = wal;
-            new_l0_guard.current_version = current_version;
-        } // Drop locks
+        // Phases A (WAL pre-flush), B (rotate), C (WAL handoff) live in
+        // flush_l0_rotate. The FlushInProgressGuard travels with the
+        // RotateOutput so the counter stays accurate for the full flush
+        // lifetime (preparation for async path where the guard will live
+        // on RotatedFlush all the way through finalize).
+        let RotateOutput {
+            old_l0_arc,
+            wal_lsn,
+            current_version,
+            flush_in_progress_guard: _flush_guard,
+        } = self.flush_l0_rotate().await?;
 
         // 2. Acquire Read lock on Old L0 for flushing
         let mut entries_by_type: HashMap<u32, Vec<L1Entry>> = HashMap::new();
@@ -2653,7 +2684,10 @@ impl Writer {
 
         // Truncate WAL segments, but only up to the minimum LSN of any remaining pending L0s.
         // This prevents data loss if earlier flushes failed and left L0s in pending_flush.
-        if let Some(w) = wal_for_truncate {
+        // The WAL Arc was transferred from old→new L0 during rotate (Phase C),
+        // so the current L0 holds the same WAL handle and we re-fetch it here.
+        let wal_handle = self.l0_manager.get_current().read().wal.clone();
+        if let Some(w) = wal_handle {
             // Determine safe truncation point: the minimum of our LSN and any pending L0s
             let safe_lsn = self
                 .l0_manager

@@ -18,6 +18,7 @@ uni-store = { workspace = true }
 uni-algo = { workspace = true }
 uni-query = { workspace = true }
 uni-crdt = { workspace = true }
+mimalloc = { version = "0.1", default-features = false, optional = true }
 tokio = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
@@ -122,3 +123,17 @@ provider-onnx = ["uni-xervo/provider-onnx"]
 provider-onnx-dynamic = ["uni-xervo/provider-onnx-dynamic"]
 gpu-cuda = ["uni-xervo/gpu-cuda"]
 gpu-metal = ["uni-xervo/gpu-metal"]
+
+# Re-export mimalloc so consumers can opt in to the fast allocator without
+# adding a separate dep:
+#
+#   [dependencies]
+#   uni-db = { version = "...", features = ["mimalloc"] }
+#
+#   // in main.rs:
+#   #[global_allocator]
+#   static GLOBAL: uni_db::MiMalloc = uni_db::MiMalloc;
+#
+# Measured ~3x throughput on heavily-allocating workloads (e.g. many small
+# CREATE statements). See benches/concurrent_mutations.rs for the gate.
+mimalloc = ["dep:mimalloc"]

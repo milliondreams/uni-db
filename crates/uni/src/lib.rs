@@ -42,6 +42,21 @@ pub use api::fork_diff::{
     PropertyChange, VertexDiff, VertexPropertyChange,
 };
 pub use api::{DatabaseMetrics, ThrottlePressure, Uni, UniBuilder};
+
+/// `mimalloc` allocator, re-exported under the `mimalloc` feature.
+///
+/// Wire it as your global allocator in the consuming binary for ~3x
+/// throughput on allocation-heavy workloads (per-statement Cypher CREATE,
+/// many small mutations):
+///
+/// ```ignore
+/// #[global_allocator]
+/// static GLOBAL: uni_db::MiMalloc = uni_db::MiMalloc;
+/// ```
+///
+/// See `crates/uni/benches/concurrent_mutations.rs` for the measurement.
+#[cfg(feature = "mimalloc")]
+pub use mimalloc::MiMalloc;
 pub use uni_xervo::api::{
     ModelAliasSpec, ModelTask, WarmupPolicy, catalog_from_file as xervo_catalog_from_file,
     catalog_from_str as xervo_catalog_from_str,

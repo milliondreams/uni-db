@@ -18,8 +18,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use mimalloc::MiMalloc;
 use tokio::runtime::Runtime;
 use uni_db::Uni;
+
+// Profile (perf-recorded, 131k samples at sess=24) showed ~50% of CPU time
+// in glibc malloc / kernel page-fault zeroing under heavy concurrent
+// allocation. mimalloc's per-thread arenas + thread-local free lists avoid
+// most of that traffic.
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 const STATEMENTS_PER_TASK: usize = 100;
 const SESSIONS_SWEEP: &[usize] = &[1, 4, 12, 24];

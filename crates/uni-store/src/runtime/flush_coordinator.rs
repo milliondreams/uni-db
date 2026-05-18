@@ -126,14 +126,18 @@ impl FlushTicket {
 pub struct FlushCoordinator {
     permits: Arc<Semaphore>,
     next_seq: AtomicU64,
-    submit_tx: mpsc::UnboundedSender<FlushSubmit>,
+    /// Wrapped in Mutex<Option<...>> so `shutdown()` can take and drop
+    /// it explicitly, which closes the mpsc and lets the finalizer task
+    /// exit. `submit()` reads through the option; if absent, the
+    /// submission is silently dropped (coordinator is shutting down).
+    submit_tx: parking_lot::Mutex<Option<mpsc::UnboundedSender<FlushSubmit>>>,
     /// Counter exposed for `drop_fork` to wait on. Incremented at rotate,
     /// decremented after finalize.
     pending_count: Arc<std::sync::atomic::AtomicUsize>,
     drain_notify: Arc<tokio::sync::Notify>,
     max_pending_flushes: usize,
-    /// Tracked for `ShutdownHandle::track_task` registration. Set to None
-    /// after `take_finalizer_handle` is called.
+    /// Tracked for `ShutdownHandle::track_task` registration AND for
+    /// `shutdown()`'s await. Set to None after either takes it.
     finalizer_handle: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
@@ -162,11 +166,32 @@ impl FlushCoordinator {
         Self {
             permits,
             next_seq,
-            submit_tx,
+            submit_tx: parking_lot::Mutex::new(Some(submit_tx)),
             pending_count,
             drain_notify,
             max_pending_flushes,
             finalizer_handle: parking_lot::Mutex::new(Some(handle)),
+        }
+    }
+
+    /// Drop the submit channel and await the finalizer task to exit.
+    /// After this returns, the coordinator's spawned task is gone and
+    /// any Arcs it held (including the writer's Arc<StorageManager>
+    /// inside SharedFlushCtx, which on a fork-scoped writer pins
+    /// Arc<ForkScope>) are released. Used by `drop_fork` so the
+    /// ForkHolderGuard can finally drop. Idempotent: safe to call
+    /// repeatedly.
+    pub async fn shutdown(&self) {
+        // 1. Drop submit_tx — closes the mpsc; the finalizer task will
+        //    receive None and exit its loop.
+        drop(self.submit_tx.lock().take());
+        // 2. Await the finalizer task. If already taken (e.g. by
+        //    ShutdownHandle::track_task), the JoinHandle is None and we
+        //    have no way to await — accept that and return; the task
+        //    is still on its way to exit because submit_tx is closed.
+        let handle = self.finalizer_handle.lock().take();
+        if let Some(h) = handle {
+            let _ = h.await;
         }
     }
 
@@ -208,6 +233,8 @@ impl FlushCoordinator {
     }
 
     /// Submit a completed-stream flush for ordered finalization.
+    /// Silently drops the submission if the coordinator has been shut
+    /// down (submit_tx taken).
     pub fn submit(
         &self,
         seq: u64,
@@ -215,12 +242,25 @@ impl FlushCoordinator {
         result: anyhow::Result<FlushOutcome>,
         ack: Option<oneshot::Sender<anyhow::Result<String>>>,
     ) {
-        let _ = self.submit_tx.send(FlushSubmit {
+        let submit_msg = FlushSubmit {
             seq,
             rotated,
             result,
             ack,
-        });
+        };
+        if let Some(tx) = self.submit_tx.lock().as_ref() {
+            let _ = tx.send(submit_msg);
+        }
+        // else: coordinator is shutting down; pending_count will be
+        // decremented by the matching drop of submit_msg (RotatedFlush
+        // contains the FlushInProgressGuard which already adjusts
+        // flush_in_progress on drop). We must also decrement
+        // pending_count manually because the finalizer won't see this.
+        else {
+            self.pending_count
+                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            self.drain_notify.notify_waiters();
+        }
     }
 
     /// Spawn the stream phase on a tokio task and return a [`FlushTicket`].

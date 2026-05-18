@@ -2558,8 +2558,15 @@ impl Writer {
             }
         }
 
-        // 1. Load previous snapshot from cache, or fall back to storage
-        let mut manifest = if let Some(cached) = self.cached_manifest.lock().take() {
+        // 1. Load previous snapshot from cache, or fall back to storage.
+        //
+        // Use clone() not take(): for the async path, multiple
+        // concurrent streams may run; if we take() here, a sibling
+        // stream sees cached_manifest = None and seeds from
+        // load_latest_snapshot (stale), losing the chain. clone()
+        // preserves the parent. Finalize writes back the new manifest
+        // unconditionally.
+        let mut manifest = if let Some(cached) = self.cached_manifest.lock().clone() {
             cached
         } else {
             self.storage
@@ -2978,12 +2985,28 @@ impl Writer {
         shared: &SharedFlushCtx,
         old_l0_arc: Arc<RwLock<L0Buffer>>,
         wal_lsn: u64,
-        manifest: SnapshotManifest,
+        mut manifest: SnapshotManifest,
         snapshot_id: String,
         initial_size: usize,
         initial_count: usize,
         start: std::time::Instant,
     ) -> Result<String> {
+        // Parent-snapshot fixup. The stream phase built `manifest` with
+        // parent_snapshot set from cached_manifest at stream time. If
+        // OTHER flushes (sync or async) have finalized since then,
+        // cached_manifest has advanced. Re-link this manifest to the
+        // current cached chain so we don't orphan their data when we
+        // overwrite cached_manifest below.
+        let current_parent_id = shared
+            .cached_manifest
+            .lock()
+            .as_ref()
+            .map(|m| m.snapshot_id.clone());
+        if current_parent_id.is_some() && manifest.parent_snapshot != current_parent_id {
+            manifest.parent_snapshot = current_parent_id;
+            metrics::counter!("uni_flush_parent_chain_fixups_total").increment(1);
+        }
+
         // H. Publish manifest (body first, then pointer — recovery is
         // idempotent if we crash between the two).
         shared

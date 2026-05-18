@@ -534,24 +534,36 @@ impl Uni {
                     name: name.to_string(),
                 });
             }
-            // Drain any pending async flushes on this fork's writer
-            // before tombstoning. The coordinator's spawned stream task
-            // captures Arc<Writer> + Arc<StorageManager>; storage holds
-            // Arc<ForkScope>, which holds the ForkHolderGuard. So we
-            // must wait for in-flight streams to finalize so those
-            // Arc clones drop and the holder count can fall to 0 — see
-            // the async-flush plan §3.9 / L8.
+            // Drain any pending async flushes, THEN shut down the
+            // coordinator so its finalizer task exits. Both steps are
+            // required: drain waits for in-flight streams to finalize
+            // (pending_count → 0), but the finalizer task itself stays
+            // parked at submit_rx.recv() holding Arc<StorageManager>.
+            // Storage pins Arc<ForkScope> (manager.rs:364), which holds
+            // the ForkHolderGuard. Without the explicit shutdown, the
+            // task lives until Writer/Coordinator drop transitively,
+            // which never happens before drop_fork's holder-count check.
+            // See async-flush plan §3.9 / L8.
             if let Some(writer) = inner.writer.as_ref()
                 && let Some(coord) = writer.flush_coordinator()
-                && coord
+            {
+                if coord
                     .drain(self.inner.config.drop_fork_drain_timeout)
                     .await
                     .is_err()
-            {
-                return Err(UniError::PendingFlushTimeout {
-                    name: name.to_string(),
-                });
+                {
+                    return Err(UniError::PendingFlushTimeout {
+                        name: name.to_string(),
+                    });
+                }
+                // Drop submit_tx + await finalizer task exit so
+                // Arc<storage> (+ Arc<ForkScope>) drops on this writer.
+                coord.shutdown().await;
             }
+            // Drop our local Arc clone of `inner` so the only strong
+            // ref to fork's UniInner is gone. ForkHolderGuard drops
+            // when ForkScope drops, which happens once storage Arc → 0.
+            drop(inner);
         }
         let info = self.inner.fork_registry.begin_drop(name).await?;
         // Phase 2 Day 8: evict the cached `Weak<UniInner>` (if any)

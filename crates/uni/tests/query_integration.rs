@@ -39,11 +39,11 @@ async fn test_query_integration() -> anyhow::Result<()> {
 
     let storage = Arc::new(StorageManager::new(storage_str, schema_manager.clone()).await?);
 
-    let writer = Arc::new(RwLock::new(
+    let writer = Arc::new(
         Writer::new(storage.clone(), schema_manager.clone(), 0)
             .await
             .unwrap(),
-    ));
+    );
 
     // VIDs
     // A (0)

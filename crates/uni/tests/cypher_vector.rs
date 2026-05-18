@@ -39,11 +39,11 @@ async fn test_cypher_vector_search() -> anyhow::Result<()> {
     let schema_manager = Arc::new(schema_manager);
     let storage = Arc::new(StorageManager::new(&storage_str, schema_manager.clone()).await?);
 
-    let writer = Arc::new(RwLock::new(
+    let writer = Arc::new(
         Writer::new(storage.clone(), schema_manager.clone(), 0)
             .await
             .unwrap(),
-    ));
+    );
 
     let ds = storage.vertex_dataset("Item")?;
     let arrow_schema = ds.get_arrow_schema(&schema_manager.schema())?;

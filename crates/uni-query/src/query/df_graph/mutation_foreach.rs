@@ -201,7 +201,7 @@ async fn execute_foreach_inner(
     let ctx = mutation_ctx.query_ctx.as_ref();
 
     let writer_lock = &mutation_ctx.writer;
-    let mut writer = writer_lock.write().await;
+    let writer: &uni_store::Writer = writer_lock.as_ref();
 
     for row in &rows {
         // Evaluate the list expression
@@ -229,7 +229,7 @@ async fn execute_foreach_inner(
                 exec.execute_foreach_body_plan(
                     plan.clone(),
                     &mut scope,
-                    &mut writer,
+                    writer,
                     pm,
                     params,
                     ctx,

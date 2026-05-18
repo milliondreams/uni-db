@@ -42,11 +42,11 @@ async fn test_cypher_filtering() -> anyhow::Result<()> {
         .await?,
     );
 
-    let writer = Arc::new(RwLock::new(
+    let writer = Arc::new(
         Writer::new(storage.clone(), schema_manager.clone(), 0)
             .await
             .unwrap(),
-    ));
+    );
 
     // Insert Persons:
     // 0: Alice, 25, true

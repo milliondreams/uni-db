@@ -39,11 +39,11 @@ async fn test_pagerank_procedure() -> anyhow::Result<()> {
         )
         .await?,
     );
-    let writer = Arc::new(RwLock::new(
+    let writer = Arc::new(
         Writer::new(storage.clone(), schema_manager.clone(), 0)
             .await
             .unwrap(),
-    ));
+    );
 
     // 2. Insert Data (Triangle: A -> B, B -> C, C -> A)
     let vid_a = Vid::new(0);
@@ -51,7 +51,7 @@ async fn test_pagerank_procedure() -> anyhow::Result<()> {
     let vid_c = Vid::new(2);
 
     {
-        let mut w = writer.write().await;
+        let w: &uni_store::Writer = writer.as_ref();
         w.insert_vertex_with_labels(vid_a, HashMap::new(), &["Person".to_string()], None)
             .await?;
         w.insert_vertex_with_labels(vid_b, HashMap::new(), &["Person".to_string()], None)
@@ -117,11 +117,11 @@ async fn test_wcc_procedure() -> anyhow::Result<()> {
         )
         .await?,
     );
-    let writer = Arc::new(RwLock::new(
+    let writer = Arc::new(
         Writer::new(storage.clone(), schema_manager.clone(), 0)
             .await
             .unwrap(),
-    ));
+    );
 
     // 2. Insert Data (Two components: {A, B} and {C})
     let vid_a = Vid::new(0);
@@ -129,7 +129,7 @@ async fn test_wcc_procedure() -> anyhow::Result<()> {
     let vid_c = Vid::new(2);
 
     {
-        let mut w = writer.write().await;
+        let w: &uni_store::Writer = writer.as_ref();
         w.insert_vertex_with_labels(vid_a, HashMap::new(), &["Node".to_string()], None)
             .await?;
         w.insert_vertex_with_labels(vid_b, HashMap::new(), &["Node".to_string()], None)
@@ -199,11 +199,11 @@ async fn test_shortest_path_procedure() -> anyhow::Result<()> {
         )
         .await?,
     );
-    let writer = Arc::new(RwLock::new(
+    let writer = Arc::new(
         Writer::new(storage.clone(), schema_manager.clone(), 0)
             .await
             .unwrap(),
-    ));
+    );
 
     // 2. Insert Data (Chain: A -> B -> C)
     let vid_a = Vid::new(0);
@@ -211,7 +211,7 @@ async fn test_shortest_path_procedure() -> anyhow::Result<()> {
     let vid_c = Vid::new(2);
 
     {
-        let mut w = writer.write().await;
+        let w: &uni_store::Writer = writer.as_ref();
         w.insert_vertex_with_labels(vid_a, HashMap::new(), &["Node".to_string()], None)
             .await?;
         w.insert_vertex_with_labels(vid_b, HashMap::new(), &["Node".to_string()], None)
@@ -272,11 +272,11 @@ async fn test_louvain_procedure() -> anyhow::Result<()> {
         )
         .await?,
     );
-    let writer = Arc::new(RwLock::new(
+    let writer = Arc::new(
         Writer::new(storage.clone(), schema_manager.clone(), 0)
             .await
             .unwrap(),
-    ));
+    );
 
     // 2. Insert Data (Two cliques connected by one edge)
     // Clique 1: 0, 1, 2
@@ -285,7 +285,7 @@ async fn test_louvain_procedure() -> anyhow::Result<()> {
     let vids: Vec<Vid> = (0..6).map(Vid::new).collect();
 
     {
-        let mut w = writer.write().await;
+        let w: &uni_store::Writer = writer.as_ref();
         for &vid in &vids {
             w.insert_vertex_with_labels(vid, HashMap::new(), &["Node".to_string()], None)
                 .await?;
@@ -433,11 +433,11 @@ async fn test_scc_procedure() -> anyhow::Result<()> {
         )
         .await?,
     );
-    let writer = Arc::new(RwLock::new(
+    let writer = Arc::new(
         Writer::new(storage.clone(), schema_manager.clone(), 0)
             .await
             .unwrap(),
-    ));
+    );
 
     // 2. Insert Data (Cycle: A -> B, B -> C, C -> A, and D -> A)
     let vid_a = Vid::new(0);
@@ -446,7 +446,7 @@ async fn test_scc_procedure() -> anyhow::Result<()> {
     let vid_d = Vid::new(3);
 
     {
-        let mut w = writer.write().await;
+        let w: &uni_store::Writer = writer.as_ref();
         for &vid in &[vid_a, vid_b, vid_c, vid_d] {
             w.insert_vertex_with_labels(vid, HashMap::new(), &["Node".to_string()], None)
                 .await?;
@@ -533,11 +533,11 @@ async fn test_label_propagation_procedure() -> anyhow::Result<()> {
         )
         .await?,
     );
-    let writer = Arc::new(RwLock::new(
+    let writer = Arc::new(
         Writer::new(storage.clone(), schema_manager.clone(), 0)
             .await
             .unwrap(),
-    ));
+    );
 
     // 2. Insert Data (Two cliques connected by one edge)
     // Clique 1: 0, 1, 2
@@ -546,7 +546,7 @@ async fn test_label_propagation_procedure() -> anyhow::Result<()> {
     let vids: Vec<Vid> = (0..6).map(Vid::new).collect();
 
     {
-        let mut w = writer.write().await;
+        let w: &uni_store::Writer = writer.as_ref();
         for &vid in &vids {
             w.insert_vertex_with_labels(vid, HashMap::new(), &["Node".to_string()], None)
                 .await?;
@@ -693,18 +693,18 @@ async fn test_betweenness_procedure() -> anyhow::Result<()> {
         )
         .await?,
     );
-    let writer = Arc::new(RwLock::new(
+    let writer = Arc::new(
         Writer::new(storage.clone(), schema_manager.clone(), 0)
             .await
             .unwrap(),
-    ));
+    );
 
     // Star Graph: Center 0 connected to 1, 2, 3, 4
     let center = Vid::new(0);
     let leaves: Vec<Vid> = (1..5).map(Vid::new).collect();
 
     {
-        let mut w = writer.write().await;
+        let w: &uni_store::Writer = writer.as_ref();
         w.insert_vertex_with_labels(center, HashMap::new(), &["Node".to_string()], None)
             .await?;
         for &leaf in &leaves {
@@ -759,11 +759,11 @@ async fn test_node_similarity_procedure() -> anyhow::Result<()> {
         )
         .await?,
     );
-    let writer = Arc::new(RwLock::new(
+    let writer = Arc::new(
         Writer::new(storage.clone(), schema_manager.clone(), 0)
             .await
             .unwrap(),
-    ));
+    );
 
     // Nodes 0 and 1 share neighbor 2.
     // 0 -> 2, 1 -> 2.
@@ -773,7 +773,7 @@ async fn test_node_similarity_procedure() -> anyhow::Result<()> {
     let v2 = Vid::new(2);
 
     {
-        let mut w = writer.write().await;
+        let w: &uni_store::Writer = writer.as_ref();
         w.insert_vertex_with_labels(v0, HashMap::new(), &["Node".to_string()], None)
             .await?;
         w.insert_vertex_with_labels(v1, HashMap::new(), &["Node".to_string()], None)
@@ -832,11 +832,11 @@ async fn test_closeness_procedure() -> anyhow::Result<()> {
         )
         .await?,
     );
-    let writer = Arc::new(RwLock::new(
+    let writer = Arc::new(
         Writer::new(storage.clone(), schema_manager.clone(), 0)
             .await
             .unwrap(),
-    ));
+    );
 
     // Line: 0 -> 1 -> 2
     let v0 = Vid::new(0);
@@ -844,7 +844,7 @@ async fn test_closeness_procedure() -> anyhow::Result<()> {
     let v2 = Vid::new(2);
 
     {
-        let mut w = writer.write().await;
+        let w: &uni_store::Writer = writer.as_ref();
         w.insert_vertex_with_labels(v0, HashMap::new(), &["Node".to_string()], None)
             .await?;
         w.insert_vertex_with_labels(v1, HashMap::new(), &["Node".to_string()], None)
@@ -910,11 +910,11 @@ async fn test_triangle_count_procedure() -> anyhow::Result<()> {
         )
         .await?,
     );
-    let writer = Arc::new(RwLock::new(
+    let writer = Arc::new(
         Writer::new(storage.clone(), schema_manager.clone(), 0)
             .await
             .unwrap(),
-    ));
+    );
 
     // Triangle: 0-1, 1-2, 2-0
     let v0 = Vid::new(0);
@@ -922,7 +922,7 @@ async fn test_triangle_count_procedure() -> anyhow::Result<()> {
     let v2 = Vid::new(2);
 
     {
-        let mut w = writer.write().await;
+        let w: &uni_store::Writer = writer.as_ref();
         w.insert_vertex_with_labels(v0, HashMap::new(), &["Node".to_string()], None)
             .await?;
         w.insert_vertex_with_labels(v1, HashMap::new(), &["Node".to_string()], None)
@@ -983,11 +983,11 @@ async fn test_kcore_procedure() -> anyhow::Result<()> {
         )
         .await?,
     );
-    let writer = Arc::new(RwLock::new(
+    let writer = Arc::new(
         Writer::new(storage.clone(), schema_manager.clone(), 0)
             .await
             .unwrap(),
-    ));
+    );
 
     // Graph: 0-1, 1-2, 2-0 (Triangle, k-core 2), and 3 connected to 0 (k-core 1)
     let v0 = Vid::new(0);
@@ -996,7 +996,7 @@ async fn test_kcore_procedure() -> anyhow::Result<()> {
     let v3 = Vid::new(3);
 
     {
-        let mut w = writer.write().await;
+        let w: &uni_store::Writer = writer.as_ref();
         for &v in &[v0, v1, v2, v3] {
             w.insert_vertex_with_labels(v, HashMap::new(), &["Node".to_string()], None)
                 .await?;
@@ -1065,11 +1065,11 @@ async fn test_random_walk_procedure() -> anyhow::Result<()> {
         )
         .await?,
     );
-    let writer = Arc::new(RwLock::new(
+    let writer = Arc::new(
         Writer::new(storage.clone(), schema_manager.clone(), 0)
             .await
             .unwrap(),
-    ));
+    );
 
     // 0 -> 1 -> 2
     let v0 = Vid::new(0);
@@ -1077,7 +1077,7 @@ async fn test_random_walk_procedure() -> anyhow::Result<()> {
     let v2 = Vid::new(2);
 
     {
-        let mut w = writer.write().await;
+        let w: &uni_store::Writer = writer.as_ref();
         for &v in &[v0, v1, v2] {
             w.insert_vertex_with_labels(v, HashMap::new(), &["Node".to_string()], None)
                 .await?;
@@ -1134,11 +1134,11 @@ async fn test_apsp_procedure() -> anyhow::Result<()> {
         )
         .await?,
     );
-    let writer = Arc::new(RwLock::new(
+    let writer = Arc::new(
         Writer::new(storage.clone(), schema_manager.clone(), 0)
             .await
             .unwrap(),
-    ));
+    );
 
     // 0 -> 1 -> 2
     let v0 = Vid::new(0);
@@ -1146,7 +1146,7 @@ async fn test_apsp_procedure() -> anyhow::Result<()> {
     let v2 = Vid::new(2);
 
     {
-        let mut w = writer.write().await;
+        let w: &uni_store::Writer = writer.as_ref();
         for &v in &[v0, v1, v2] {
             w.insert_vertex_with_labels(v, HashMap::new(), &["Node".to_string()], None)
                 .await?;

@@ -447,7 +447,7 @@ impl BulkWriter {
 
         // Allocate VIDs (batched for performance)
         let vids = {
-            let writer = self.db.writer.as_ref().unwrap().read().await;
+            let writer = self.db.writer.as_ref().unwrap();
             writer
                 .allocate_vids(vertices.len())
                 .await
@@ -916,7 +916,7 @@ impl BulkWriter {
         // Allocate EIDs
         let mut eids = Vec::with_capacity(edges.len());
         {
-            let writer = self.db.writer.as_ref().unwrap().read().await;
+            let writer = self.db.writer.as_ref().unwrap();
             for _ in 0..edges.len() {
                 eids.push(writer.next_eid(type_id).await.map_err(UniError::Internal)?);
             }

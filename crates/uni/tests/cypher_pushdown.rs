@@ -122,18 +122,18 @@ async fn test_pushdown_execution() -> anyhow::Result<()> {
         .await?,
     );
 
-    let writer = Arc::new(RwLock::new(
+    let writer = Arc::new(
         Writer::new(storage.clone(), schema_manager.clone(), 0)
             .await
             .unwrap(),
-    ));
+    );
     let executor = Executor::new_with_writer(storage.clone(), writer.clone());
     let planner = QueryPlanner::new(schema_manager.schema());
     let prop_mgr = PropertyManager::new(storage.clone(), schema_manager.clone(), 100);
 
     // Seed data
     {
-        let mut w = writer.write().await;
+        let w: &uni_store::Writer = writer.as_ref();
         let v1 = w.next_vid().await?;
         let mut p1 = std::collections::HashMap::new();
         p1.insert("name".to_string(), unival!("Alice"));
@@ -181,18 +181,18 @@ async fn test_or_pushdown_execution() -> anyhow::Result<()> {
         .await?,
     );
 
-    let writer = Arc::new(RwLock::new(
+    let writer = Arc::new(
         Writer::new(storage.clone(), schema_manager.clone(), 0)
             .await
             .unwrap(),
-    ));
+    );
     let executor = Executor::new_with_writer(storage.clone(), writer.clone());
     let planner = QueryPlanner::new(schema_manager.schema());
     let prop_mgr = PropertyManager::new(storage.clone(), schema_manager.clone(), 100);
 
     // Seed data
     {
-        let mut w = writer.write().await;
+        let w: &uni_store::Writer = writer.as_ref();
         let v1 = w.next_vid().await?;
         let mut p1 = std::collections::HashMap::new();
         p1.insert("status".to_string(), unival!("active"));
@@ -249,18 +249,18 @@ async fn test_is_null_execution() -> anyhow::Result<()> {
         .await?,
     );
 
-    let writer = Arc::new(RwLock::new(
+    let writer = Arc::new(
         Writer::new(storage.clone(), schema_manager.clone(), 0)
             .await
             .unwrap(),
-    ));
+    );
     let executor = Executor::new_with_writer(storage.clone(), writer.clone());
     let planner = QueryPlanner::new(schema_manager.schema());
     let prop_mgr = PropertyManager::new(storage.clone(), schema_manager.clone(), 100);
 
     // Seed data
     {
-        let mut w = writer.write().await;
+        let w: &uni_store::Writer = writer.as_ref();
         // v1: has email
         let v1 = w.next_vid().await?;
         let mut p1 = std::collections::HashMap::new();
@@ -330,18 +330,18 @@ async fn test_traverse_target_pushdown() -> anyhow::Result<()> {
         .await?,
     );
 
-    let writer = Arc::new(RwLock::new(
+    let writer = Arc::new(
         Writer::new(storage.clone(), schema_manager.clone(), 0)
             .await
             .unwrap(),
-    ));
+    );
     let executor = Executor::new_with_writer(storage.clone(), writer.clone());
     let planner = QueryPlanner::new(schema_manager.schema());
     let prop_mgr = PropertyManager::new(storage.clone(), schema_manager.clone(), 100);
 
     // Seed data: v1 (source) -> v2 (age 25), v1 -> v3 (age 35)
     {
-        let mut w = writer.write().await;
+        let w: &uni_store::Writer = writer.as_ref();
         let v1 = w.next_vid().await?; // Source
         let v2 = w.next_vid().await?; // Target 1 (age 25)
         let v3 = w.next_vid().await?; // Target 2 (age 35)
@@ -463,18 +463,18 @@ async fn test_apply_input_filter_pushdown() -> anyhow::Result<()> {
         .await?,
     );
 
-    let writer = Arc::new(RwLock::new(
+    let writer = Arc::new(
         Writer::new(storage.clone(), schema_manager.clone(), 0)
             .await
             .unwrap(),
-    ));
+    );
     let executor = Executor::new_with_writer(storage.clone(), writer.clone());
     let planner = QueryPlanner::new(schema_manager.schema());
     let prop_mgr = PropertyManager::new(storage.clone(), schema_manager.clone(), 100);
 
     // Seed data: active and inactive people with scores
     {
-        let mut w = writer.write().await;
+        let w: &uni_store::Writer = writer.as_ref();
         let alice = w.next_vid().await?;
         let bob = w.next_vid().await?;
         let charlie = w.next_vid().await?;
@@ -587,18 +587,18 @@ async fn test_call_subquery_input_filter_pushdown() -> anyhow::Result<()> {
         .await?,
     );
 
-    let writer = Arc::new(RwLock::new(
+    let writer = Arc::new(
         Writer::new(storage.clone(), schema_manager.clone(), 0)
             .await
             .unwrap(),
-    ));
+    );
     let executor = Executor::new_with_writer(storage.clone(), writer.clone());
     let planner = QueryPlanner::new(schema_manager.schema());
     let prop_mgr = PropertyManager::new(storage.clone(), schema_manager.clone(), 100);
 
     // Seed data
     {
-        let mut w = writer.write().await;
+        let w: &uni_store::Writer = writer.as_ref();
         let alice = w.next_vid().await?;
         let bob = w.next_vid().await?;
         let charlie = w.next_vid().await?;

@@ -196,7 +196,7 @@ async fn create_fork_2pc(
     if parent.is_forked()
         && let Some(writer_lock) = &parent.db.writer
     {
-        let mut writer = writer_lock.write().await;
+        let writer: &uni_store::Writer = writer_lock.as_ref();
         writer.flush_to_l1(None).await.map_err(UniError::Internal)?;
     }
 
@@ -240,7 +240,7 @@ async fn create_fork_2pc(
     // primary's allocator file may live on a different `ObjectStore`
     // than the fork's path resolves through.
     let (vid_hwm, eid_hwm) = if let Some(writer_lock) = &parent.db.writer {
-        let writer = writer_lock.read().await;
+        let writer: &uni_store::Writer = writer_lock.as_ref();
         writer.allocator.current_hwm().await
     } else {
         (0, 0)

@@ -121,7 +121,7 @@ async fn tick_once(weak: &Weak<UniInner>, threshold: u64) -> anyhow::Result<()> 
         // Errors here are non-fatal — the build will use whatever's
         // already on the branch and the next tick can retry.
         if let Some(writer_lock) = &fork_inner.writer {
-            let mut writer = writer_lock.write().await;
+            let writer: &uni_store::Writer = writer_lock.as_ref();
             if let Err(e) = writer.flush_to_l1(None).await {
                 warn!(
                     fork = %fork_info.name,

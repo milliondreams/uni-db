@@ -125,9 +125,8 @@ pub(crate) async fn evaluate_with_db_and_config(
     // Always create an ephemeral locy_l0 for the evaluation scope — this provides:
     // - DERIVE visibility: trailing Cypher sees DERIVE mutations
     // - ASSUME/ABDUCE isolation: fork/restore from this buffer
-    let locy_l0 = if let Some(ref writer) = db.writer {
-        let w = writer.read().await;
-        Some(w.create_transaction_l0())
+    let locy_l0 = if let Some(writer) = db.writer.as_ref() {
+        Some(writer.create_transaction_l0())
     } else {
         None // Read-only DB: degrade gracefully
     };
@@ -300,13 +299,8 @@ impl<'a> LocyEngine<'a> {
 
         // Capture current version for staleness detection in DerivedFactSet
         let evaluated_at_version = if self.collect_derive {
-            if let Some(ref w) = self.db.writer {
-                w.read()
-                    .await
-                    .l0_manager
-                    .get_current()
-                    .read()
-                    .current_version
+            if let Some(writer) = self.db.writer.as_ref() {
+                writer.l0_manager.get_current().read().current_version
             } else {
                 0
             }
@@ -809,23 +803,19 @@ impl DerivedFactSource for NativeExecutionAdapter<'_> {
             .or_else(|| self.tx_l0_override.clone());
         let transaction_ctx: Option<Arc<uni_query::query::df_graph::GraphExecutionContext>> =
             if let Some(tx_l0) = tx_l0_for_ctx {
-                if let Some(writer_arc) = &self.db.writer {
-                    if let Ok(writer) = writer_arc.try_read() {
-                        let l0_ctx = uni_query::query::df_graph::L0Context {
-                            current_l0: Some(writer.l0_manager.get_current()),
-                            transaction_l0: Some(tx_l0),
-                            pending_flush_l0s: writer.l0_manager.get_pending_flush(),
-                        };
-                        Some(Arc::new(
-                            uni_query::query::df_graph::GraphExecutionContext::with_l0_context(
-                                self.db.storage.clone(),
-                                l0_ctx,
-                                self.graph_ctx.property_manager().clone(),
-                            ),
-                        ))
-                    } else {
-                        None
-                    }
+                if let Some(writer) = self.db.writer.as_ref() {
+                    let l0_ctx = uni_query::query::df_graph::L0Context {
+                        current_l0: Some(writer.l0_manager.get_current()),
+                        transaction_l0: Some(tx_l0),
+                        pending_flush_l0s: writer.l0_manager.get_pending_flush(),
+                    };
+                    Some(Arc::new(
+                        uni_query::query::df_graph::GraphExecutionContext::with_l0_context(
+                            self.db.storage.clone(),
+                            l0_ctx,
+                            self.graph_ctx.property_manager().clone(),
+                        ),
+                    ))
                 } else {
                     None
                 }

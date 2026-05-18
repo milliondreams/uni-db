@@ -58,11 +58,11 @@ async fn setup_graph_executor(
         .unwrap(),
     );
 
-    let writer = Arc::new(RwLock::new(
+    let writer = Arc::new(
         Writer::new(storage.clone(), schema_manager.clone(), 0)
             .await
             .unwrap(),
-    ));
+    );
 
     let prop_manager = Arc::new(PropertyManager::new(
         storage.clone(),

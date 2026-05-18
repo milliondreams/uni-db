@@ -41,11 +41,11 @@ async fn test_cypher_remove() -> anyhow::Result<()> {
         .await?,
     );
 
-    let writer = Arc::new(RwLock::new(
+    let writer = Arc::new(
         Writer::new(storage.clone(), schema_manager.clone(), 0)
             .await
             .unwrap(),
-    ));
+    );
 
     let prop_manager = PropertyManager::new(storage.clone(), storage.schema_manager_arc(), 1024);
     let executor = Executor::new_with_writer(storage.clone(), writer.clone());

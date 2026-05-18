@@ -64,7 +64,7 @@ mod multi_actor_convergence {
             let val = serde_json::to_value(Crdt::GCounter(gc))?;
 
             {
-                let mut writer = writer_lock.write().await;
+                let writer: &uni_store::Writer = writer_lock.as_ref();
                 writer
                     .insert_vertex_with_labels(
                         vid,
@@ -78,7 +78,7 @@ mod multi_actor_convergence {
 
         // Flush once at the end
         {
-            let mut writer = writer_lock.write().await;
+            let writer: &uni_store::Writer = writer_lock.as_ref();
             writer.flush_to_l1(None).await?;
         }
 
@@ -132,7 +132,7 @@ mod multi_actor_convergence {
         let val1 = serde_json::to_value(Crdt::ORSet(os1.clone()))?;
 
         {
-            let mut writer = writer_lock.write().await;
+            let writer: &uni_store::Writer = writer_lock.as_ref();
             writer
                 .insert_vertex_with_labels(
                     vid,
@@ -152,7 +152,7 @@ mod multi_actor_convergence {
         let val2 = serde_json::to_value(Crdt::ORSet(os2))?;
 
         {
-            let mut writer = writer_lock.write().await;
+            let writer: &uni_store::Writer = writer_lock.as_ref();
             writer
                 .insert_vertex_with_labels(
                     vid,
@@ -170,7 +170,7 @@ mod multi_actor_convergence {
         let val3 = serde_json::to_value(Crdt::ORSet(os3))?;
 
         {
-            let mut writer = writer_lock.write().await;
+            let writer: &uni_store::Writer = writer_lock.as_ref();
             writer
                 .insert_vertex_with_labels(
                     vid,

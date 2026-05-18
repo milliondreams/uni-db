@@ -41,11 +41,11 @@ async fn test_cypher_limit_order() -> anyhow::Result<()> {
         .await?,
     );
 
-    let writer = Arc::new(RwLock::new(
+    let writer = Arc::new(
         Writer::new(storage.clone(), schema_manager.clone(), 0)
             .await
             .unwrap(),
-    ));
+    );
 
     // david, 40
     let vertex_ds = storage.vertex_dataset("Person")?;

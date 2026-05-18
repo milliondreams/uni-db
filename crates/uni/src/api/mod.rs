@@ -71,7 +71,7 @@ pub struct UniInner {
     pub(crate) storage: Arc<StorageManager>,
     pub(crate) schema: Arc<SchemaManager>,
     pub(crate) properties: Arc<PropertyManager>,
-    pub(crate) writer: Option<Arc<RwLock<Writer>>>,
+    pub(crate) writer: Option<Arc<Writer>>,
     pub(crate) xervo_runtime: Option<Arc<ModelRuntime>>,
     pub(crate) config: UniConfig,
     pub(crate) procedure_registry: Arc<uni_query::ProcedureRegistry>,
@@ -364,7 +364,7 @@ impl UniInner {
             storage: forked_storage,
             schema: merged_schema,
             properties: prop_manager,
-            writer: Some(Arc::new(tokio::sync::RwLock::new(forked_writer))),
+            writer: Some(Arc::new(forked_writer)),
             xervo_runtime: self.xervo_runtime.clone(),
             config: self.config.clone(),
             procedure_registry: self.procedure_registry.clone(),
@@ -993,7 +993,7 @@ impl Uni {
     }
 
     #[doc(hidden)]
-    pub fn writer(&self) -> Option<Arc<RwLock<Writer>>> {
+    pub fn writer(&self) -> Option<Arc<Writer>> {
         self.inner.writer.clone()
     }
 
@@ -1007,8 +1007,7 @@ impl Uni {
     /// This forces a write of the current in-memory buffer (L0) to columnar files.
     /// It also creates a new snapshot.
     pub async fn flush(&self) -> Result<()> {
-        if let Some(writer_lock) = &self.inner.writer {
-            let mut writer = writer_lock.write().await;
+        if let Some(writer) = &self.inner.writer {
             writer
                 .flush_to_l1(None)
                 .await
@@ -1033,8 +1032,7 @@ impl Uni {
             )));
         }
 
-        let snapshot_id = if let Some(writer_lock) = &self.inner.writer {
-            let mut writer = writer_lock.write().await;
+        let snapshot_id = if let Some(writer) = &self.inner.writer {
             writer
                 .flush_to_l1(Some(name.to_string()))
                 .await
@@ -1411,11 +1409,10 @@ impl Uni {
     /// (with a timeout). After calling this method, the database instance should not be used.
     pub async fn shutdown(self) -> Result<()> {
         // Flush pending data
-        if let Some(ref writer) = self.inner.writer {
-            let mut w = writer.write().await;
-            if let Err(e) = w.flush_to_l1(None).await {
-                tracing::error!("Error flushing during shutdown: {}", e);
-            }
+        if let Some(writer) = &self.inner.writer
+            && let Err(e) = writer.flush_to_l1(None).await
+        {
+            tracing::error!("Error flushing during shutdown: {}", e);
         }
 
         self.inner
@@ -1854,7 +1851,7 @@ impl UniBuilder {
             None
         };
 
-        let writer = Arc::new(RwLock::new(
+        let writer = Arc::new(
             Writer::new_with_config(
                 storage.clone(),
                 schema_manager.clone(),
@@ -1865,7 +1862,7 @@ impl UniBuilder {
             )
             .await
             .map_err(UniError::Internal)?,
-        ));
+        );
 
         let required_embed_aliases: std::collections::BTreeSet<String> = schema_manager
             .schema()
@@ -1975,15 +1972,15 @@ impl UniBuilder {
         };
 
         if let Some(ref runtime) = xervo_runtime {
-            let mut writer_guard = writer.write().await;
-            writer_guard.set_xervo_runtime(runtime.clone());
+            writer
+                .set_xervo_runtime(runtime.clone())
+                .map_err(UniError::Internal)?;
         }
 
         // Replay WAL to restore any uncommitted mutations from previous session
         // Only replay mutations with LSN > wal_high_water_mark to avoid double-applying
         {
-            let w = writer.read().await;
-            let replayed = w
+            let replayed = writer
                 .replay_wal(wal_high_water_mark)
                 .await
                 .map_err(UniError::Internal)?;
@@ -2009,10 +2006,9 @@ impl UniBuilder {
                 .start_background_worker(shutdown_handle.subscribe());
             shutdown_handle.track_task(handle);
 
-            {
-                let mut writer_guard = writer.write().await;
-                writer_guard.set_index_rebuild_manager(rebuild_manager);
-            }
+            writer
+                .set_index_rebuild_manager(rebuild_manager)
+                .map_err(UniError::Internal)?;
         }
 
         // Start background flush checker for time-based auto-flush
@@ -2025,15 +2021,13 @@ impl UniBuilder {
                 loop {
                     tokio::select! {
                         _ = ticker.tick() => {
-                            let mut w = writer_clone.write().await;
-                            if let Err(e) = w.check_flush().await {
+                            if let Err(e) = writer_clone.check_flush().await {
                                 tracing::warn!("Background flush check failed: {}", e);
                             }
                         }
                         _ = shutdown_rx.recv() => {
                             tracing::info!("Auto-flush shutting down, performing final flush");
-                            let mut w = writer_clone.write().await;
-                            let _ = w.flush_to_l1(None).await;
+                            let _ = writer_clone.flush_to_l1(None).await;
                             break;
                         }
                     }
@@ -2265,11 +2259,10 @@ mod fork_inner_tests {
         // Phase 2 Day 4: a forked UniInner now carries its own Writer.
         // The Writer's storage is the fork-scoped clone; its allocator
         // is fork-local.
-        let writer_arc = forked_inner
+        let writer = forked_inner
             .writer
             .as_ref()
             .expect("Phase 2 fork must carry its own Writer");
-        let writer = writer_arc.read().await;
         assert!(
             std::sync::Arc::ptr_eq(&writer.storage, &forked_inner.storage),
             "fork Writer's storage should be the fork-scoped storage"

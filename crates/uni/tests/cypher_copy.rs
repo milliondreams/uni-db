@@ -45,11 +45,11 @@ async fn test_csv_import() -> anyhow::Result<()> {
         .await?,
     );
 
-    let writer = Arc::new(RwLock::new(
+    let writer = Arc::new(
         Writer::new(storage.clone(), schema_manager.clone(), 0)
             .await
             .unwrap(),
-    ));
+    );
 
     let executor = Executor::new_with_writer(storage.clone(), writer.clone());
     let prop_manager = PropertyManager::new(storage.clone(), schema_manager.clone(), 100);
@@ -226,11 +226,11 @@ async fn test_parquet_import() -> anyhow::Result<()> {
         .await?,
     );
 
-    let writer = Arc::new(RwLock::new(
+    let writer = Arc::new(
         Writer::new(storage.clone(), schema_manager.clone(), 0)
             .await
             .unwrap(),
-    ));
+    );
 
     let executor = Executor::new_with_writer(storage.clone(), writer.clone());
     let prop_manager = PropertyManager::new(storage.clone(), schema_manager.clone(), 100);

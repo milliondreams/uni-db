@@ -46,7 +46,7 @@ async fn test_crdt_merge_on_write() -> anyhow::Result<()> {
     // Note: Uni::execute uses writer internally
     let writer_lock = db.writer().unwrap();
     {
-        let mut writer = writer_lock.write().await;
+        let writer: &uni_store::Writer = writer_lock.as_ref();
         writer
             .insert_vertex_with_labels(vid, props1, &["CounterNode".to_string()], None)
             .await?;
@@ -63,7 +63,7 @@ async fn test_crdt_merge_on_write() -> anyhow::Result<()> {
     props2.insert("counter".to_string(), val2.into());
 
     {
-        let mut writer = writer_lock.write().await;
+        let writer: &uni_store::Writer = writer_lock.as_ref();
         writer
             .insert_vertex_with_labels(vid, props2, &["CounterNode".to_string()], None)
             .await?;

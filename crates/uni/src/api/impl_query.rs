@@ -162,10 +162,7 @@ impl crate::api::UniInner {
     /// Used to compute affected_rows for mutation queries that return no result rows.
     pub(crate) async fn get_mutation_count(&self) -> usize {
         match self.writer.as_ref() {
-            Some(w) => {
-                let writer = w.read().await;
-                writer.l0_manager.get_current().read().mutation_count
-            }
+            Some(writer) => writer.l0_manager.get_current().read().mutation_count,
             None => 0,
         }
     }
@@ -175,15 +172,12 @@ impl crate::api::UniInner {
     #[allow(dead_code)] // Reserved for future per-type affected_rows reporting
     pub(crate) async fn get_mutation_stats(&self) -> uni_store::runtime::l0::MutationStats {
         match self.writer.as_ref() {
-            Some(w) => {
-                let writer = w.read().await;
-                writer
-                    .l0_manager
-                    .get_current()
-                    .read()
-                    .mutation_stats
-                    .clone()
-            }
+            Some(writer) => writer
+                .l0_manager
+                .get_current()
+                .read()
+                .mutation_stats
+                .clone(),
             None => uni_store::runtime::l0::MutationStats::default(),
         }
     }

@@ -244,11 +244,11 @@ async fn test_compaction_procedures() -> anyhow::Result<()> {
     let schema_manager = Arc::new(schema_manager);
 
     let storage = Arc::new(StorageManager::new(storage_str, schema_manager.clone()).await?);
-    let writer = Arc::new(tokio::sync::RwLock::new(
+    let writer = Arc::new(
         Writer::new(storage.clone(), schema_manager.clone(), 0)
             .await
             .unwrap(),
-    ));
+    );
     let executor = Executor::new_with_writer(storage.clone(), writer.clone());
     let prop_manager = PropertyManager::new(storage.clone(), schema_manager.clone(), 100);
     let planner = QueryPlanner::new(schema_manager.schema());

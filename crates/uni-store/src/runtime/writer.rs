@@ -17,7 +17,7 @@ use chrono::Utc;
 use metrics;
 use parking_lot::{Mutex as PlMutex, RwLock};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tracing::{debug, info, instrument};
 use uni_common::Properties;
@@ -84,7 +84,12 @@ pub struct Writer {
     pub schema_manager: Arc<uni_common::core::schema::SchemaManager>,
     pub allocator: Arc<IdAllocator>,
     pub config: UniConfig,
-    pub xervo_runtime: Option<Arc<ModelRuntime>>,
+    /// Optional embedding runtime. `OnceLock` so the initializer can run
+    /// on `&self` after the `Writer` has been wrapped in `Arc<Writer>`
+    /// (Phase 4 of concurrent_writer.md). Read through
+    /// [`Writer::xervo_runtime`] — the field itself is private to keep
+    /// callers oblivious to the OnceLock representation.
+    xervo_runtime: OnceLock<Arc<ModelRuntime>>,
     /// Property manager for cache invalidation after flush
     pub property_manager: Option<Arc<PropertyManager>>,
     /// Adjacency manager for dual-write (edges survive flush).
@@ -95,8 +100,9 @@ pub struct Writer {
     last_flush_time: PlMutex<std::time::Instant>,
     /// Background compaction task handle (prevents concurrent compaction races)
     compaction_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
-    /// Optional index rebuild manager for post-flush automatic rebuild scheduling
-    index_rebuild_manager: Option<Arc<crate::storage::index_rebuild::IndexRebuildManager>>,
+    /// Optional index rebuild manager for post-flush automatic rebuild scheduling.
+    /// `OnceLock` for the same reason as `xervo_runtime`.
+    index_rebuild_manager: OnceLock<Arc<crate::storage::index_rebuild::IndexRebuildManager>>,
     /// Cached snapshot manifest from the last flush. Avoids re-reading from
     /// object store on every flush_to_l1 call. Wrapped in a `Mutex` for
     /// `&self` access; uncontended because all access is inside the
@@ -177,12 +183,12 @@ impl Writer {
             schema_manager,
             allocator,
             config,
-            xervo_runtime: None,
+            xervo_runtime: OnceLock::new(),
             property_manager,
             adjacency_manager,
             last_flush_time: PlMutex::new(std::time::Instant::now()),
             compaction_handle: Arc::new(RwLock::new(None)),
-            index_rebuild_manager: None,
+            index_rebuild_manager: OnceLock::new(),
             cached_manifest: PlMutex::new(None),
             fork_id: None,
             fork_flush_count: AtomicU64::new(0),
@@ -192,11 +198,16 @@ impl Writer {
     }
 
     /// Set the index rebuild manager for post-flush automatic rebuild scheduling.
+    ///
+    /// One-shot: returns `Err` if already set. The receiver is `&self` so this
+    /// can be called after the `Writer` has been wrapped in `Arc<Writer>`.
     pub fn set_index_rebuild_manager(
-        &mut self,
+        &self,
         manager: Arc<crate::storage::index_rebuild::IndexRebuildManager>,
-    ) {
-        self.index_rebuild_manager = Some(manager);
+    ) -> Result<()> {
+        self.index_rebuild_manager
+            .set(manager)
+            .map_err(|_| anyhow!("index_rebuild_manager already set"))
     }
 
     /// Replay WAL mutations into the current L0 buffer.
@@ -241,12 +252,16 @@ impl Writer {
         self.allocator.allocate_eid().await
     }
 
-    pub fn set_xervo_runtime(&mut self, runtime: Arc<ModelRuntime>) {
-        self.xervo_runtime = Some(runtime);
+    /// Install the embedding runtime exactly once. Receiver is `&self` so it
+    /// can be called after the `Writer` has been wrapped in `Arc<Writer>`.
+    pub fn set_xervo_runtime(&self, runtime: Arc<ModelRuntime>) -> Result<()> {
+        self.xervo_runtime
+            .set(runtime)
+            .map_err(|_| anyhow!("xervo_runtime already set"))
     }
 
     pub fn xervo_runtime(&self) -> Option<Arc<ModelRuntime>> {
-        self.xervo_runtime.clone()
+        self.xervo_runtime.get().cloned()
     }
 
     /// Create a new empty L0 buffer for transaction-scoped mutations.
@@ -1955,7 +1970,7 @@ impl Writer {
                     continue;
                 }
 
-                let runtime = self.xervo_runtime.as_ref().ok_or_else(|| {
+                let runtime = self.xervo_runtime.get().ok_or_else(|| {
                     anyhow!("Uni-Xervo runtime not configured for auto-embedding")
                 })?;
                 let embedder = runtime.embedding(&emb_config.alias).await?;
@@ -2027,7 +2042,7 @@ impl Writer {
                     None => input_text,
                 };
 
-                let runtime = self.xervo_runtime.as_ref().ok_or_else(|| {
+                let runtime = self.xervo_runtime.get().ok_or_else(|| {
                     anyhow!("Uni-Xervo runtime not configured for auto-embedding")
                 })?;
                 let embedder = runtime.embedding(&emb_config.alias).await?;
@@ -2669,7 +2684,7 @@ impl Writer {
         }
 
         // Post-flush: check if any indexes need rebuilding based on thresholds
-        if let Some(ref rebuild_mgr) = self.index_rebuild_manager
+        if let Some(rebuild_mgr) = self.index_rebuild_manager.get()
             && self.config.index_rebuild.auto_rebuild_enabled
         {
             self.schedule_index_rebuilds_if_needed(&manifest, rebuild_mgr.clone());
@@ -2757,10 +2772,6 @@ impl Writer {
         });
     }
 
-    /// Set the property manager for cache invalidation.
-    pub fn set_property_manager(&mut self, pm: Arc<PropertyManager>) {
-        self.property_manager = Some(pm);
-    }
 }
 
 #[cfg(test)]

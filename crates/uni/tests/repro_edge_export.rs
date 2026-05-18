@@ -40,11 +40,11 @@ async fn test_edge_export_failure() -> anyhow::Result<()> {
         .await?,
     );
 
-    let writer = Arc::new(RwLock::new(
+    let writer = Arc::new(
         Writer::new(storage.clone(), schema_manager.clone(), 0)
             .await
             .unwrap(),
-    ));
+    );
 
     let executor = Executor::new_with_writer(storage.clone(), writer.clone());
     let prop_manager = PropertyManager::new(storage.clone(), schema_manager.clone(), 100);
@@ -52,7 +52,7 @@ async fn test_edge_export_failure() -> anyhow::Result<()> {
 
     // 2. Insert Data
     {
-        let mut w = writer.write().await;
+        let w: &uni_store::Writer = writer.as_ref();
         // Alice (VID 0), Bob (VID 1)
         w.insert_vertex_with_labels(
             uni_db::common::core::id::Vid::new(0),

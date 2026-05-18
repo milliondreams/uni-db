@@ -219,7 +219,7 @@ impl Executor {
                     .writer
                     .as_ref()
                     .ok_or_else(|| anyhow!("Database is in read-only mode"))?;
-                let mut writer = writer_arc.write().await;
+                let writer: &uni_store::Writer = writer_arc.as_ref();
                 let snapshot_id = writer.flush_to_l1(name).await?;
 
                 Ok(vec![HashMap::from([(

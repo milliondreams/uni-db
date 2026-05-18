@@ -47,7 +47,7 @@ pub struct MutationContext {
     pub executor: Executor,
 
     /// Writer for graph mutations (vertices, edges, properties).
-    pub writer: Arc<RwLock<Writer>>,
+    pub writer: Arc<Writer>,
 
     /// Property manager for lazy-loading vertex/edge properties.
     pub prop_manager: Arc<PropertyManager>,
@@ -539,12 +539,15 @@ async fn execute_mutation_inner(
         return Ok(futures::stream::iter(results));
     }
 
-    let mut writer = mutation_ctx.writer.write().await;
     let tx_l0 = mutation_ctx.tx_l0_override.as_ref();
-    let result =
-        apply_mutations(&mutation_ctx, &mutation_kind, &mut rows, &mut writer, tx_l0).await;
-    drop(writer);
-    result?;
+    apply_mutations(
+        &mutation_ctx,
+        &mutation_kind,
+        &mut rows,
+        &mutation_ctx.writer,
+        tx_l0,
+    )
+    .await?;
 
     tracing::debug!(
         mutation = mutation_label,
@@ -642,7 +645,7 @@ async fn apply_mutations(
     mutation_ctx: &MutationContext,
     mutation_kind: &MutationKind,
     rows: &mut [HashMap<String, Value>],
-    writer: &mut Writer,
+    writer: &Writer,
     tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
 ) -> DFResult<()> {
     tracing::trace!(

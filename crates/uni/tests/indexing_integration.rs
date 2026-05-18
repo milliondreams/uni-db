@@ -45,11 +45,11 @@ async fn test_auto_embedding_and_vector_search() -> Result<()> {
     let schema_manager = Arc::new(schema_manager);
 
     let storage = Arc::new(StorageManager::new(base_path, schema_manager.clone()).await?);
-    let writer = Arc::new(RwLock::new(
+    let writer = Arc::new(
         Writer::new(storage.clone(), schema_manager.clone(), 0)
             .await
             .unwrap(),
-    ));
+    );
 
     // 2. Create Vector Index with Embedding Config via DDL
     // We use Planner and Executor to run DDL
@@ -111,7 +111,7 @@ async fn test_auto_embedding_and_vector_search() -> Result<()> {
 
     // 4. Flush to persist
     {
-        let mut w = writer.write().await;
+        let w: &uni_store::Writer = writer.as_ref();
         w.flush_to_l1(None).await?;
     }
 

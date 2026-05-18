@@ -39,11 +39,11 @@ async fn test_stress_concurrent_read_write() -> anyhow::Result<()> {
     );
 
     // Writer is protected by RwLock (simulating single writer actor)
-    let writer = Arc::new(RwLock::new(
+    let writer = Arc::new(
         Writer::new(storage.clone(), schema_manager.clone(), 0)
             .await
             .unwrap(),
-    ));
+    );
 
     let start = Instant::now();
     let duration = std::time::Duration::from_secs(5);
@@ -62,7 +62,7 @@ async fn test_stress_concurrent_read_write() -> anyhow::Result<()> {
 
         while start.elapsed() < duration {
             {
-                let mut w = writer_clone.write().await;
+                let w: &uni_store::Writer = writer_clone.as_ref();
                 // Insert a batch
                 for _ in 0..100 {
                     i += 1;

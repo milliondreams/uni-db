@@ -31,11 +31,11 @@ async fn test_fts_query() -> Result<()> {
     let schema_manager = Arc::new(schema_manager);
 
     let storage = Arc::new(StorageManager::new(base_path, schema_manager.clone()).await?);
-    let writer = Arc::new(RwLock::new(
+    let writer = Arc::new(
         Writer::new(storage.clone(), schema_manager.clone(), 0)
             .await
             .unwrap(),
-    ));
+    );
 
     // 2. Insert Data
     let prop_manager = PropertyManager::new(storage.clone(), schema_manager.clone(), 100);
@@ -71,7 +71,7 @@ async fn test_fts_query() -> Result<()> {
 
     // 4. Flush to persist (FTS index usually built on flushed data)
     {
-        let mut w = writer.write().await;
+        let w: &uni_store::Writer = writer.as_ref();
         w.flush_to_l1(None).await?;
     }
 

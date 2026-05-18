@@ -34,11 +34,11 @@ async fn test_cypher_optional_match() -> anyhow::Result<()> {
     let storage_str = storage_path.to_str().unwrap();
 
     let storage = Arc::new(StorageManager::new(storage_str, schema_manager.clone()).await?);
-    let writer = Arc::new(tokio::sync::RwLock::new(
+    let writer = Arc::new(
         Writer::new(storage.clone(), schema_manager.clone(), 0)
             .await
             .unwrap(),
-    ));
+    );
 
     let prop_manager = PropertyManager::new(storage.clone(), storage.schema_manager_arc(), 1024);
     let executor = Executor::new_with_writer(storage.clone(), writer.clone());

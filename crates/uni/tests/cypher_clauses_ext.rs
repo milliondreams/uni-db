@@ -18,7 +18,7 @@ struct PersonTestHarness {
     executor: Executor,
     planner: QueryPlanner,
     prop_mgr: PropertyManager,
-    writer: Arc<RwLock<Writer>>,
+    writer: Arc<Writer>,
 }
 
 impl PersonTestHarness {
@@ -38,11 +38,11 @@ impl PersonTestHarness {
             .await?,
         );
 
-        let writer = Arc::new(RwLock::new(
+        let writer = Arc::new(
             Writer::new(storage.clone(), schema_manager.clone(), 0)
                 .await
                 .unwrap(),
-        ));
+        );
         let executor = Executor::new_with_writer(storage.clone(), writer.clone());
         let planner = QueryPlanner::new(schema_manager.schema());
         let prop_mgr = PropertyManager::new(storage.clone(), schema_manager.clone(), 100);
@@ -57,7 +57,7 @@ impl PersonTestHarness {
 
     /// Insert Person vertices from (name, age) pairs and flush to L1.
     async fn insert_people(&self, people: &[(&str, i32)]) -> anyhow::Result<()> {
-        let mut w = self.writer.write().await;
+        let w: &uni_store::Writer = self.writer.as_ref();
         for (name, age) in people {
             let vid = w.next_vid().await?;
             let mut props = HashMap::new();
@@ -122,7 +122,7 @@ async fn test_cypher_set_remove() -> anyhow::Result<()> {
 
     let vid;
     {
-        let w = h.writer.read().await;
+        let w: &uni_store::Writer = h.writer.as_ref();
         let l0 = w.l0_manager.get_current();
         let l0 = l0.read();
         assert_eq!(l0.vertex_properties.len(), 1);
@@ -134,14 +134,14 @@ async fn test_cypher_set_remove() -> anyhow::Result<()> {
 
     // 2. SET property — flush first so MATCH can find it
     {
-        let mut w = h.writer.write().await;
+        let w: &uni_store::Writer = h.writer.as_ref();
         w.flush_to_l1(None).await?;
     }
 
     h.run_query("MATCH (n:Person) SET n.age = 31").await?;
 
     {
-        let w = h.writer.read().await;
+        let w: &uni_store::Writer = h.writer.as_ref();
         let l0 = w.l0_manager.get_current();
         let l0 = l0.read();
         let props = &l0.vertex_properties[&vid];
@@ -157,7 +157,7 @@ async fn test_cypher_set_remove() -> anyhow::Result<()> {
     h.run_query("MATCH (n:Person) REMOVE n.age").await?;
 
     {
-        let w = h.writer.read().await;
+        let w: &uni_store::Writer = h.writer.as_ref();
         let l0 = w.l0_manager.get_current();
         let l0 = l0.read();
         let props = &l0.vertex_properties[&vid];
@@ -185,18 +185,18 @@ async fn test_cypher_with() -> anyhow::Result<()> {
         .await?,
     );
 
-    let writer = Arc::new(RwLock::new(
+    let writer = Arc::new(
         Writer::new(storage.clone(), schema_manager.clone(), 0)
             .await
             .unwrap(),
-    ));
+    );
     let executor = Executor::new_with_writer(storage.clone(), writer.clone());
     let planner = QueryPlanner::new(schema_manager.schema());
     let prop_mgr = PropertyManager::new(storage.clone(), schema_manager.clone(), 100);
 
     // Create a node (name-only schema, no age property)
     {
-        let mut w = writer.write().await;
+        let w: &uni_store::Writer = writer.as_ref();
         let vid = w.next_vid().await?;
         let mut props = HashMap::new();
         props.insert("name".to_string(), unival!("Alice"));

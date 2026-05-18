@@ -35,18 +35,18 @@ async fn test_pagerank_dangling_nodes() -> anyhow::Result<()> {
         )
         .await?,
     );
-    let writer = Arc::new(RwLock::new(
+    let writer = Arc::new(
         Writer::new(storage.clone(), schema_manager.clone(), 0)
             .await
             .unwrap(),
-    ));
+    );
 
     // Graph: A -> B. B is a sink (no outgoing edges).
     let vid_a = Vid::new(0);
     let vid_b = Vid::new(1);
 
     {
-        let mut w = writer.write().await;
+        let w: &uni_store::Writer = writer.as_ref();
         w.insert_vertex_with_labels(vid_a, HashMap::new(), &["Node".to_string()], None)
             .await?;
         w.insert_vertex_with_labels(vid_b, HashMap::new(), &["Node".to_string()], None)
@@ -122,11 +122,11 @@ async fn test_shortest_path_unreachable() -> anyhow::Result<()> {
         )
         .await?,
     );
-    let writer = Arc::new(RwLock::new(
+    let writer = Arc::new(
         Writer::new(storage.clone(), schema_manager.clone(), 0)
             .await
             .unwrap(),
-    ));
+    );
 
     // Graph: A -> B, C -> D. Disconnected components.
     let vid_a = Vid::new(0);
@@ -135,7 +135,7 @@ async fn test_shortest_path_unreachable() -> anyhow::Result<()> {
     let vid_d = Vid::new(3);
 
     {
-        let mut w = writer.write().await;
+        let w: &uni_store::Writer = writer.as_ref();
         for &v in &[vid_a, vid_b, vid_c, vid_d] {
             w.insert_vertex_with_labels(v, HashMap::new(), &["Node".to_string()], None)
                 .await?;
@@ -205,11 +205,11 @@ async fn test_wcc_singletons() -> anyhow::Result<()> {
         )
         .await?,
     );
-    let writer = Arc::new(RwLock::new(
+    let writer = Arc::new(
         Writer::new(storage.clone(), schema_manager.clone(), 0)
             .await
             .unwrap(),
-    ));
+    );
 
     // Graph: A, B, C. No edges.
     let vid_a = Vid::new(0);
@@ -217,7 +217,7 @@ async fn test_wcc_singletons() -> anyhow::Result<()> {
     let vid_c = Vid::new(2);
 
     {
-        let mut w = writer.write().await;
+        let w: &uni_store::Writer = writer.as_ref();
         for &v in &[vid_a, vid_b, vid_c] {
             w.insert_vertex_with_labels(v, HashMap::new(), &["Node".to_string()], None)
                 .await?;
@@ -270,17 +270,17 @@ async fn test_louvain_disconnected() -> anyhow::Result<()> {
         )
         .await?,
     );
-    let writer = Arc::new(RwLock::new(
+    let writer = Arc::new(
         Writer::new(storage.clone(), schema_manager.clone(), 0)
             .await
             .unwrap(),
-    ));
+    );
 
     // Graph: Clique A-B and Clique C-D. Disconnected.
     let vids: Vec<Vid> = (0..4).map(Vid::new).collect();
 
     {
-        let mut w = writer.write().await;
+        let w: &uni_store::Writer = writer.as_ref();
         for &v in &vids {
             w.insert_vertex_with_labels(v, HashMap::new(), &["Node".to_string()], None)
                 .await?;
@@ -381,11 +381,11 @@ async fn test_algo_grid_graph() -> anyhow::Result<()> {
         )
         .await?,
     );
-    let writer = Arc::new(RwLock::new(
+    let writer = Arc::new(
         Writer::new(storage.clone(), schema_manager.clone(), 0)
             .await
             .unwrap(),
-    ));
+    );
 
     // 10x10 Grid
     let width = 10;
@@ -393,7 +393,7 @@ async fn test_algo_grid_graph() -> anyhow::Result<()> {
     let n = width * height;
 
     {
-        let mut w = writer.write().await;
+        let w: &uni_store::Writer = writer.as_ref();
         for i in 0..n {
             w.insert_vertex_with_labels(
                 Vid::new(i as u64),
@@ -514,15 +514,15 @@ async fn test_shortest_path_self() -> anyhow::Result<()> {
         )
         .await?,
     );
-    let writer = Arc::new(RwLock::new(
+    let writer = Arc::new(
         Writer::new(storage.clone(), schema_manager.clone(), 0)
             .await
             .unwrap(),
-    ));
+    );
 
     let vid_a = Vid::new(0);
     {
-        let mut w = writer.write().await;
+        let w: &uni_store::Writer = writer.as_ref();
         w.insert_vertex_with_labels(vid_a, HashMap::new(), &["Node".to_string()], None)
             .await?;
         w.flush_to_l1(None).await?;

@@ -171,7 +171,7 @@ impl Transaction {
         // This is the key commit-time serialization change: no writer WRITE lock
         // is taken at transaction begin; it's deferred to commit().
         let (started_at_version, tx_l0) = {
-            let writer = writer_lock.read().await;
+            let writer: &uni_store::Writer = writer_lock.as_ref();
             let l0 = writer.create_transaction_l0();
             let version = l0.read().current_version;
             (version, l0)
@@ -357,7 +357,7 @@ impl Transaction {
         let writer_lock = self.db.writer.as_ref().ok_or_else(|| UniError::ReadOnly {
             operation: "bulk_insert_vertices".to_string(),
         })?;
-        let mut writer = writer_lock.write().await;
+        let writer: &uni_store::Writer = writer_lock.as_ref();
         if properties_list.is_empty() {
             return Ok(Vec::new());
         }
@@ -406,7 +406,7 @@ impl Transaction {
         let writer_lock = self.db.writer.as_ref().ok_or_else(|| UniError::ReadOnly {
             operation: "bulk_insert_edges".to_string(),
         })?;
-        let mut writer = writer_lock.write().await;
+        let writer: &uni_store::Writer = writer_lock.as_ref();
         // Route mutations through the transaction's private L0.
         let result: Result<()> = async {
             for (src_vid, dst_vid, props) in edges {
@@ -554,17 +554,19 @@ impl Transaction {
             (labels, edge_types)
         };
 
-        // Acquire writer WRITE lock for WAL + merge
-        let mut writer = tokio::time::timeout(
+        // Wrap the commit (which acquires `flush_lock` internally) in the
+        // same timeout that used to wrap the outer writer-RwLock acquisition.
+        // `flush_lock` is now the actual serialization point.
+        let writer: &uni_store::Writer = writer_lock;
+        let wal_lsn = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            writer_lock.write(),
+            writer.commit_transaction_l0(self.tx_l0.clone()),
         )
         .await
         .map_err(|_| UniError::CommitTimeout {
             tx_id: self.id.clone(),
             hint: "Another commit is in progress and taking longer than expected. Your transaction is still active \u{2014} you can retry commit().",
-        })?;
-        let wal_lsn = writer.commit_transaction_l0(self.tx_l0.clone()).await?;
+        })??;
         // Update cached metrics atomics while we still hold the writer lock
         {
             let l0 = writer.l0_manager.get_current();

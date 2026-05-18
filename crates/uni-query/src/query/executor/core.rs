@@ -222,7 +222,7 @@ pub(crate) type GenExprCacheKey = (String, String);
 #[derive(Clone)]
 pub struct Executor {
     pub(crate) storage: Arc<StorageManager>,
-    pub(crate) writer: Option<Arc<RwLock<Writer>>>,
+    pub(crate) writer: Option<Arc<Writer>>,
     pub(crate) l0_manager: Option<Arc<L0Manager>>,
     pub(crate) algo_registry: Arc<AlgorithmRegistry>,
     pub(crate) use_transaction: bool,
@@ -283,7 +283,7 @@ impl Executor {
     }
 
     /// Create a write-enabled executor with an attached `Writer`.
-    pub fn new_with_writer(storage: Arc<StorageManager>, writer: Arc<RwLock<Writer>>) -> Self {
+    pub fn new_with_writer(storage: Arc<StorageManager>, writer: Arc<Writer>) -> Self {
         let mut executor = Self::new(storage);
         executor.writer = Some(writer);
         executor
@@ -318,7 +318,7 @@ impl Executor {
     }
 
     /// Attach a `Writer` after construction, enabling write operations.
-    pub fn set_writer(&mut self, writer: Arc<RwLock<Writer>>) {
+    pub fn set_writer(&mut self, writer: Arc<Writer>) {
         self.writer = Some(writer);
     }
 
@@ -362,8 +362,7 @@ impl Executor {
     /// this is how private-per-transaction L0 buffers become visible to reads
     /// without requiring the writer lock at tx creation.
     pub(crate) async fn get_context(&self) -> Option<QueryContext> {
-        if let Some(writer_lock) = &self.writer {
-            let writer = writer_lock.read().await;
+        if let Some(writer) = &self.writer {
             // Prefer the override (private tx L0) over the writer's slot
             let tx_l0 = self.transaction_l0_override.clone();
             let mut ctx = QueryContext::new_with_pending(

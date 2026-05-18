@@ -53,7 +53,7 @@ impl AlgoBenchConfig {
 
 struct AlgoBenchContext {
     _dir: tempfile::TempDir,
-    writer: Arc<RwLock<Writer>>,
+    writer: Arc<Writer>,
     executor: Executor,
     prop_manager: PropertyManager,
     planner: QueryPlanner,
@@ -86,7 +86,7 @@ impl AlgoBenchContext {
             auto_flush_threshold: 100_000,
             ..Default::default()
         };
-        let writer = Arc::new(RwLock::new(
+        let writer = Arc::new(
             Writer::new_with_config(
                 storage.clone(),
                 schema_manager.clone(),
@@ -97,7 +97,7 @@ impl AlgoBenchContext {
             )
             .await
             .unwrap(),
-        ));
+        );
 
         let executor = Executor::new_with_writer(storage.clone(), writer.clone());
         let prop_manager = PropertyManager::new(storage.clone(), schema_manager.clone(), 10000);

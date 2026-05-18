@@ -33,15 +33,15 @@ async fn test_backup_and_restore() -> anyhow::Result<()> {
     );
 
     // Use Writer to ensure snapshot is created on flush
-    let writer = Arc::new(RwLock::new(
+    let writer = Arc::new(
         Writer::new(storage.clone(), schema_manager.clone(), 0)
             .await
             .unwrap(),
-    ));
+    );
 
     // Insert data directly via Writer to simulate real usage
     {
-        let mut w = writer.write().await;
+        let w: &uni_store::Writer = writer.as_ref();
         let vid = Vid::new(1);
         let mut props = std::collections::HashMap::new();
         props.insert("name".to_string(), serde_json::json!("Alice").into());

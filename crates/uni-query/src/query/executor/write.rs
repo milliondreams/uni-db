@@ -124,7 +124,7 @@ impl Executor {
         new_props: HashMap<String, Value>,
         replace: bool,
         row: &mut HashMap<String, Value>,
-        writer: &mut Writer,
+        writer: &Writer,
         prop_manager: &PropertyManager,
         params: &HashMap<String, Value>,
         ctx: Option<&QueryContext>,
@@ -386,7 +386,7 @@ impl Executor {
         if let Some(writer_arc) = &self.writer {
             // Flush first while holding the lock
             {
-                let mut writer = writer_arc.write().await;
+                let writer: &uni_store::Writer = writer_arc.as_ref();
                 writer.flush_to_l1(None).await?;
             } // Drop lock before compacting to avoid blocking reads/writes
 
@@ -419,7 +419,7 @@ impl Executor {
 
     pub(crate) async fn execute_checkpoint(&self) -> Result<()> {
         if let Some(writer_arc) = &self.writer {
-            let mut writer = writer_arc.write().await;
+            let writer: &uni_store::Writer = writer_arc.as_ref();
             writer.flush_to_l1(Some("checkpoint".to_string())).await?;
         }
         Ok(())
@@ -710,7 +710,7 @@ impl Executor {
                         .ok_or_else(|| anyhow!("Missing destination VID column '{}'", dst_col))?;
 
                     // Generate EID and insert edge
-                    let mut writer = writer_arc.write().await;
+                    let writer: &uni_store::Writer = writer_arc.as_ref();
                     let eid = writer.next_eid(edge_type_id).await?;
                     writer
                         .insert_edge(
@@ -737,7 +737,7 @@ impl Executor {
 
             // Flush to persist edges
             if total_rows > 0 {
-                let mut writer = writer_arc.write().await;
+                let writer: &uni_store::Writer = writer_arc.as_ref();
                 writer.flush_to_l1(None).await?;
             }
 
@@ -775,7 +775,7 @@ impl Executor {
                     }
 
                     // Generate VID and insert
-                    let mut writer = writer_arc.write().await;
+                    let writer: &uni_store::Writer = writer_arc.as_ref();
                     let vid = writer.next_vid().await?;
                     let _ = writer
                         .insert_vertex_with_labels(vid, properties, &[label.to_string()], None)
@@ -794,7 +794,7 @@ impl Executor {
 
             // Flush to persist vertices
             if total_rows > 0 {
-                let mut writer = writer_arc.write().await;
+                let writer: &uni_store::Writer = writer_arc.as_ref();
                 writer.flush_to_l1(None).await?;
             }
 
@@ -1356,7 +1356,7 @@ impl Executor {
 
             if let Some((vid, _pattern_props)) = optimized_vid {
                 // Optimized Path: Node found via index
-                let mut writer = writer_lock.write().await;
+                let writer: &uni_store::Writer = writer_lock.as_ref();
 
                 let mut match_row = row.clone();
                 if let PatternElement::Node(n) = &pattern.paths[0].elements[0]
@@ -1369,7 +1369,7 @@ impl Executor {
                     self.execute_set_items_locked(
                         &set.items,
                         &mut match_row,
-                        &mut writer,
+                        writer,
                         prop_manager,
                         params,
                         ctx,
@@ -1390,7 +1390,7 @@ impl Executor {
                 let matches = self
                     .execute_merge_match(pattern, &row, prop_manager, params, ctx)
                     .await?;
-                let mut writer = writer_lock.write().await;
+                let writer: &uni_store::Writer = writer_lock.as_ref();
 
                 let result: Result<Vec<HashMap<String, Value>>> = async {
                     let mut batch = Vec::new();
@@ -1400,7 +1400,7 @@ impl Executor {
                                 self.execute_set_items_locked(
                                     &set.items,
                                     &mut m,
-                                    &mut writer,
+                                    writer,
                                     prop_manager,
                                     params,
                                     ctx,
@@ -1415,7 +1415,7 @@ impl Executor {
                         self.execute_create_pattern(
                             &path_pattern,
                             &mut row,
-                            &mut writer,
+                            writer,
                             prop_manager,
                             params,
                             ctx,
@@ -1426,7 +1426,7 @@ impl Executor {
                             self.execute_set_items_locked(
                                 &set.items,
                                 &mut row,
-                                &mut writer,
+                                writer,
                                 prop_manager,
                                 params,
                                 ctx,
@@ -1454,7 +1454,7 @@ impl Executor {
         &self,
         pattern: &Pattern,
         row: &mut HashMap<String, Value>,
-        writer: &mut Writer,
+        writer: &Writer,
         prop_manager: &PropertyManager,
         params: &HashMap<String, Value>,
         ctx: Option<&QueryContext>,
@@ -1718,7 +1718,7 @@ impl Executor {
         &self,
         items: &[SetItem],
         row: &mut HashMap<String, Value>,
-        writer: &mut Writer,
+        writer: &Writer,
         prop_manager: &PropertyManager,
         params: &HashMap<String, Value>,
         ctx: Option<&QueryContext>,
@@ -1942,7 +1942,7 @@ impl Executor {
         &self,
         items: &[RemoveItem],
         row: &mut HashMap<String, Value>,
-        writer: &mut Writer,
+        writer: &Writer,
         prop_manager: &PropertyManager,
         ctx: Option<&QueryContext>,
         tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
@@ -2194,7 +2194,7 @@ impl Executor {
         &self,
         val: &Value,
         detach: bool,
-        writer: &mut Writer,
+        writer: &Writer,
         tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
     ) -> Result<()> {
         match val {
@@ -2263,7 +2263,7 @@ impl Executor {
         vid: Vid,
         detach: bool,
         labels: Option<Vec<String>>,
-        writer: &mut Writer,
+        writer: &Writer,
         tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
     ) -> Result<()> {
         if detach {
@@ -2342,7 +2342,7 @@ impl Executor {
     pub(crate) async fn execute_delete_edge_from_map(
         &self,
         map: &HashMap<String, Value>,
-        writer: &mut Writer,
+        writer: &Writer,
         tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
     ) -> Result<()> {
         // Check for non-null _eid to skip OPTIONAL MATCH null edges

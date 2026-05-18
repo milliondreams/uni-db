@@ -495,7 +495,7 @@ impl Session {
     /// (e.g. snapshot-pinned sessions).
     pub async fn flush(&self) -> Result<()> {
         if let Some(writer_lock) = &self.db.writer {
-            let mut writer = writer_lock.write().await;
+            let writer: &uni_store::Writer = writer_lock.as_ref();
             writer
                 .flush_to_l1(None)
                 .await
@@ -539,7 +539,7 @@ impl Session {
         // no-op there — but for BTree/Sorted it ensures the Lance
         // index covers all rows the user has committed.
         if let Some(writer_lock) = &self.db.writer {
-            let mut writer = writer_lock.write().await;
+            let writer: &uni_store::Writer = writer_lock.as_ref();
             writer.flush_to_l1(None).await.map_err(UniError::Internal)?;
         }
         uni_store::fork::index_builder::build_fork_local_index(

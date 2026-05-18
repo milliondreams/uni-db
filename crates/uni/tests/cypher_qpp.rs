@@ -16,7 +16,7 @@ use uni_db::storage::manager::StorageManager;
 /// Helper: create a test environment with Person+Company labels and KNOWS+WORKS_AT edge types.
 async fn setup_qpp_graph() -> anyhow::Result<(
     Arc<StorageManager>,
-    Arc<RwLock<Writer>>,
+    Arc<Writer>,
     Executor,
     PropertyManager,
     QueryPlanner,
@@ -65,11 +65,11 @@ async fn setup_qpp_graph() -> anyhow::Result<(
         )
         .await?,
     );
-    let writer = Arc::new(RwLock::new(
+    let writer = Arc::new(
         Writer::new(storage.clone(), storage.schema_manager_arc(), 0)
             .await
             .unwrap(),
-    ));
+    );
     let prop_manager = PropertyManager::new(storage.clone(), storage.schema_manager_arc(), 1024);
     let executor = Executor::new_with_writer(storage.clone(), writer.clone());
     let planner = QueryPlanner::new(schema);

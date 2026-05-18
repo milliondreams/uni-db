@@ -38,11 +38,11 @@ async fn test_shortest_path_match() -> anyhow::Result<()> {
         )
         .await?,
     );
-    let writer = Arc::new(RwLock::new(
+    let writer = Arc::new(
         Writer::new(storage.clone(), schema_manager.clone(), 0)
             .await
             .unwrap(),
-    ));
+    );
 
     // 2. Insert Data (Chain: A -> B -> C -> D)
     let vid_a = Vid::new(0);
@@ -51,7 +51,7 @@ async fn test_shortest_path_match() -> anyhow::Result<()> {
     let vid_d = Vid::new(3);
 
     {
-        let mut w = writer.write().await;
+        let w: &uni_store::Writer = writer.as_ref();
         for (vid, name) in [(vid_a, "A"), (vid_b, "B"), (vid_c, "C"), (vid_d, "D")] {
             let mut props = HashMap::new();
             props.insert("name".to_string(), Value::String(name.to_string()));
@@ -144,11 +144,11 @@ async fn test_all_shortest_paths_diamond() -> anyhow::Result<()> {
         )
         .await?,
     );
-    let writer = Arc::new(RwLock::new(
+    let writer = Arc::new(
         Writer::new(storage.clone(), schema_manager.clone(), 0)
             .await
             .unwrap(),
-    ));
+    );
 
     // Diamond: A -> B -> D, A -> C -> D
     let vid_a = Vid::new(0);
@@ -157,7 +157,7 @@ async fn test_all_shortest_paths_diamond() -> anyhow::Result<()> {
     let vid_d = Vid::new(3);
 
     {
-        let mut w = writer.write().await;
+        let w: &uni_store::Writer = writer.as_ref();
         for (vid, name) in [(vid_a, "A"), (vid_b, "B"), (vid_c, "C"), (vid_d, "D")] {
             let mut props = HashMap::new();
             props.insert("name".to_string(), Value::String(name.to_string()));
@@ -264,18 +264,18 @@ async fn test_all_shortest_paths_only_shortest() -> anyhow::Result<()> {
         )
         .await?,
     );
-    let writer = Arc::new(RwLock::new(
+    let writer = Arc::new(
         Writer::new(storage.clone(), schema_manager.clone(), 0)
             .await
             .unwrap(),
-    ));
+    );
 
     let vid_a = Vid::new(0);
     let vid_b = Vid::new(1);
     let vid_c = Vid::new(2);
 
     {
-        let mut w = writer.write().await;
+        let w: &uni_store::Writer = writer.as_ref();
         for (vid, name) in [(vid_a, "A"), (vid_b, "B"), (vid_c, "C")] {
             let mut props = HashMap::new();
             props.insert("name".to_string(), Value::String(name.to_string()));
@@ -360,17 +360,17 @@ async fn test_all_shortest_paths_no_path() -> anyhow::Result<()> {
         )
         .await?,
     );
-    let writer = Arc::new(RwLock::new(
+    let writer = Arc::new(
         Writer::new(storage.clone(), schema_manager.clone(), 0)
             .await
             .unwrap(),
-    ));
+    );
 
     let vid_a = Vid::new(0);
     let vid_b = Vid::new(1);
 
     {
-        let mut w = writer.write().await;
+        let w: &uni_store::Writer = writer.as_ref();
         for (vid, name) in [(vid_a, "A"), (vid_b, "B")] {
             let mut props = HashMap::new();
             props.insert("name".to_string(), Value::String(name.to_string()));
@@ -424,16 +424,16 @@ async fn test_all_shortest_paths_same_node() -> anyhow::Result<()> {
         )
         .await?,
     );
-    let writer = Arc::new(RwLock::new(
+    let writer = Arc::new(
         Writer::new(storage.clone(), schema_manager.clone(), 0)
             .await
             .unwrap(),
-    ));
+    );
 
     let vid_a = Vid::new(0);
 
     {
-        let mut w = writer.write().await;
+        let w: &uni_store::Writer = writer.as_ref();
         let mut props = HashMap::new();
         props.insert("name".to_string(), Value::String("A".to_string()));
         w.insert_vertex_with_labels(vid_a, props, &["Node".to_string()], None)

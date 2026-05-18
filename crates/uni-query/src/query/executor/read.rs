@@ -2828,7 +2828,7 @@ impl Executor {
         &self,
         plan: LogicalPlan,
         scope: &mut HashMap<String, Value>,
-        writer: &mut uni_store::runtime::writer::Writer,
+        writer: &uni_store::runtime::writer::Writer,
         prop_manager: &PropertyManager,
         params: &HashMap<String, Value>,
         ctx: Option<&QueryContext>,
@@ -3813,7 +3813,7 @@ impl Executor {
     ) -> Result<Vec<HashMap<String, Value>>> {
         // 1. Flush L0
         if let Some(writer_arc) = &self.writer {
-            let mut writer = writer_arc.write().await;
+            let writer: &uni_store::Writer = writer_arc.as_ref();
             writer.flush_to_l1(None).await?;
         }
 
@@ -4074,7 +4074,7 @@ impl Executor {
         let headers = rdr.headers()?.clone();
         let mut count = 0;
 
-        let mut writer = writer_lock.write().await;
+        let writer: &uni_store::Writer = writer_lock.as_ref();
 
         if label_meta.is_some() {
             let target_props = schema
@@ -4205,7 +4205,7 @@ impl Executor {
         let mut reader = reader;
 
         let mut count = 0;
-        let mut writer = writer_lock.write().await;
+        let writer: &uni_store::Writer = writer_lock.as_ref();
 
         if label_meta.is_some() {
             let target_props = schema
@@ -5212,7 +5212,7 @@ impl Executor {
     pub(crate) async fn detach_delete_vertex(
         &self,
         vid: Vid,
-        writer: &mut Writer,
+        writer: &Writer,
         tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
     ) -> Result<()> {
         let schema = self.storage.schema_manager().schema();
@@ -5262,7 +5262,7 @@ impl Executor {
         &self,
         vids: &[Vid],
         labels_per_vid: Vec<Option<Vec<String>>>,
-        writer: &mut Writer,
+        writer: &Writer,
         tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
     ) -> Result<()> {
         let schema = self.storage.schema_manager().schema();

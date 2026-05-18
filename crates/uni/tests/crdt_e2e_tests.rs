@@ -60,7 +60,7 @@ mod gcounter_lifecycle {
 
         let writer_lock = db.writer().unwrap();
         {
-            let mut writer = writer_lock.write().await;
+            let writer: &uni_store::Writer = writer_lock.as_ref();
             writer
                 .insert_vertex_with_labels(
                     vid,
@@ -78,7 +78,7 @@ mod gcounter_lifecycle {
         let val2 = serde_json::to_value(Crdt::GCounter(gc2))?;
 
         {
-            let mut writer = writer_lock.write().await;
+            let writer: &uni_store::Writer = writer_lock.as_ref();
             writer
                 .insert_vertex_with_labels(
                     vid,
@@ -138,7 +138,7 @@ mod gcounter_lifecycle {
             let val = serde_json::to_value(Crdt::GCounter(gc))?;
 
             {
-                let mut writer = writer_lock.write().await;
+                let writer: &uni_store::Writer = writer_lock.as_ref();
                 writer
                     .insert_vertex_with_labels(
                         vid,
@@ -200,7 +200,7 @@ mod gset_lifecycle {
         let val1 = serde_json::to_value(Crdt::GSet(gs1))?;
 
         {
-            let mut writer = writer_lock.write().await;
+            let writer: &uni_store::Writer = writer_lock.as_ref();
             writer
                 .insert_vertex_with_labels(
                     vid,
@@ -219,7 +219,7 @@ mod gset_lifecycle {
         let val2 = serde_json::to_value(Crdt::GSet(gs2))?;
 
         {
-            let mut writer = writer_lock.write().await;
+            let writer: &uni_store::Writer = writer_lock.as_ref();
             writer
                 .insert_vertex_with_labels(
                     vid,
@@ -284,7 +284,7 @@ mod orset_lifecycle {
         let val1 = serde_json::to_value(Crdt::ORSet(os.clone()))?;
 
         {
-            let mut writer = writer_lock.write().await;
+            let writer: &uni_store::Writer = writer_lock.as_ref();
             writer
                 .insert_vertex_with_labels(
                     vid,
@@ -302,7 +302,7 @@ mod orset_lifecycle {
         let val2 = serde_json::to_value(Crdt::ORSet(os))?;
 
         {
-            let mut writer = writer_lock.write().await;
+            let writer: &uni_store::Writer = writer_lock.as_ref();
             writer
                 .insert_vertex_with_labels(
                     vid,
@@ -369,7 +369,7 @@ mod lww_register_lifecycle {
         let val1 = serde_json::to_value(Crdt::LWWRegister(reg1))?;
 
         {
-            let mut writer = writer_lock.write().await;
+            let writer: &uni_store::Writer = writer_lock.as_ref();
             writer
                 .insert_vertex_with_labels(
                     vid,
@@ -386,7 +386,7 @@ mod lww_register_lifecycle {
         let val2 = serde_json::to_value(Crdt::LWWRegister(reg2))?;
 
         {
-            let mut writer = writer_lock.write().await;
+            let writer: &uni_store::Writer = writer_lock.as_ref();
             writer
                 .insert_vertex_with_labels(
                     vid,
@@ -447,7 +447,7 @@ mod lww_map_lifecycle {
         let val1 = serde_json::to_value(Crdt::LWWMap(map1))?;
 
         {
-            let mut writer = writer_lock.write().await;
+            let writer: &uni_store::Writer = writer_lock.as_ref();
             writer
                 .insert_vertex_with_labels(
                     vid,
@@ -465,7 +465,7 @@ mod lww_map_lifecycle {
         let val2 = serde_json::to_value(Crdt::LWWMap(map2))?;
 
         {
-            let mut writer = writer_lock.write().await;
+            let writer: &uni_store::Writer = writer_lock.as_ref();
             writer
                 .insert_vertex_with_labels(
                     vid,
@@ -533,7 +533,7 @@ mod rga_lifecycle {
         let val1 = serde_json::to_value(Crdt::Rga(rga1.clone()))?;
 
         {
-            let mut writer = writer_lock.write().await;
+            let writer: &uni_store::Writer = writer_lock.as_ref();
             writer
                 .insert_vertex_with_labels(
                     vid,
@@ -551,7 +551,7 @@ mod rga_lifecycle {
         let val2 = serde_json::to_value(Crdt::Rga(rga2))?;
 
         {
-            let mut writer = writer_lock.write().await;
+            let writer: &uni_store::Writer = writer_lock.as_ref();
             writer
                 .insert_vertex_with_labels(
                     vid,
@@ -618,7 +618,7 @@ mod vector_clock_lifecycle {
         let val1 = serde_json::to_value(Crdt::VectorClock(vc1))?;
 
         {
-            let mut writer = writer_lock.write().await;
+            let writer: &uni_store::Writer = writer_lock.as_ref();
             writer
                 .insert_vertex_with_labels(
                     vid,
@@ -639,7 +639,7 @@ mod vector_clock_lifecycle {
         let val2 = serde_json::to_value(Crdt::VectorClock(vc2))?;
 
         {
-            let mut writer = writer_lock.write().await;
+            let writer: &uni_store::Writer = writer_lock.as_ref();
             writer
                 .insert_vertex_with_labels(
                     vid,
@@ -699,7 +699,7 @@ mod vc_register_lifecycle {
         let val1 = serde_json::to_value(Crdt::VCRegister(reg1.clone()))?;
 
         {
-            let mut writer = writer_lock.write().await;
+            let writer: &uni_store::Writer = writer_lock.as_ref();
             writer
                 .insert_vertex_with_labels(
                     vid,
@@ -717,7 +717,7 @@ mod vc_register_lifecycle {
         let val2 = serde_json::to_value(Crdt::VCRegister(reg2))?;
 
         {
-            let mut writer = writer_lock.write().await;
+            let writer: &uni_store::Writer = writer_lock.as_ref();
             writer
                 .insert_vertex_with_labels(
                     vid,
@@ -787,7 +787,7 @@ mod multi_crdt {
         gs1.add("x".to_string());
 
         {
-            let mut writer = writer_lock.write().await;
+            let writer: &uni_store::Writer = writer_lock.as_ref();
             writer
                 .insert_vertex_with_labels(
                     vid,
@@ -819,7 +819,7 @@ mod multi_crdt {
         vc.increment("node1");
 
         {
-            let mut writer = writer_lock.write().await;
+            let writer: &uni_store::Writer = writer_lock.as_ref();
             writer
                 .insert_vertex_with_labels(
                     vid,
@@ -913,7 +913,7 @@ mod edge_crdt {
 
         // Create vertices
         {
-            let mut writer = writer_lock.write().await;
+            let writer: &uni_store::Writer = writer_lock.as_ref();
             writer
                 .insert_vertex_with_labels(vid_a, HashMap::new(), &["Node".to_string()], None)
                 .await?;

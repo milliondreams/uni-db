@@ -78,7 +78,7 @@ mod basic_compaction {
         schema_manager.save().await?;
 
         let storage = Arc::new(StorageManager::new(path, schema_manager.clone()).await?);
-        let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 1)
+        let writer = Writer::new(storage.clone(), schema_manager.clone(), 1)
             .await
             .unwrap();
         let prop_manager = PropertyManager::new(storage.clone(), schema_manager.clone(), 100);
@@ -134,7 +134,7 @@ mod basic_compaction {
         schema_manager.save().await?;
 
         let storage = Arc::new(StorageManager::new(path, schema_manager.clone()).await?);
-        let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 1)
+        let writer = Writer::new(storage.clone(), schema_manager.clone(), 1)
             .await
             .unwrap();
         let prop_manager = PropertyManager::new(storage.clone(), schema_manager.clone(), 100);
@@ -196,7 +196,7 @@ mod tombstone_handling {
         schema_manager.save().await?;
 
         let storage = Arc::new(StorageManager::new(path, schema_manager.clone()).await?);
-        let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 1)
+        let writer = Writer::new(storage.clone(), schema_manager.clone(), 1)
             .await
             .unwrap();
 
@@ -256,7 +256,7 @@ mod multiple_crdt_types {
         schema_manager.save().await?;
 
         let storage = Arc::new(StorageManager::new(path, schema_manager.clone()).await?);
-        let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 1)
+        let writer = Writer::new(storage.clone(), schema_manager.clone(), 1)
             .await
             .unwrap();
         let prop_manager = PropertyManager::new(storage.clone(), schema_manager.clone(), 100);
@@ -342,7 +342,7 @@ mod mixed_properties {
         schema_manager.save().await?;
 
         let storage = Arc::new(StorageManager::new(path, schema_manager.clone()).await?);
-        let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 1)
+        let writer = Writer::new(storage.clone(), schema_manager.clone(), 1)
             .await
             .unwrap();
         let prop_manager = PropertyManager::new(storage.clone(), schema_manager.clone(), 100);
@@ -418,7 +418,7 @@ mod large_scale {
         schema_manager.save().await?;
 
         let storage = Arc::new(StorageManager::new(path, schema_manager.clone()).await?);
-        let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 1)
+        let writer = Writer::new(storage.clone(), schema_manager.clone(), 1)
             .await
             .unwrap();
         let prop_manager = PropertyManager::new(storage.clone(), schema_manager.clone(), 100);
@@ -493,7 +493,7 @@ mod edge_compaction {
         schema_manager.save().await?;
 
         let storage = Arc::new(StorageManager::new(path, schema_manager.clone()).await?);
-        let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 1)
+        let writer = Writer::new(storage.clone(), schema_manager.clone(), 1)
             .await
             .unwrap();
         let prop_manager = PropertyManager::new(storage.clone(), schema_manager.clone(), 100);

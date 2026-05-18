@@ -30,7 +30,7 @@ async fn test_l0_auto_flush_threshold() -> anyhow::Result<()> {
         auto_flush_threshold: 3,
         ..Default::default()
     };
-    let mut writer = Writer::new_with_config(
+    let writer = Writer::new_with_config(
         storage.clone(),
         schema_manager.clone(),
         0,

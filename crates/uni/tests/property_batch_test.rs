@@ -34,7 +34,7 @@ async fn test_property_batch_loading() -> anyhow::Result<()> {
         )
         .await?,
     );
-    let mut writer = Writer::new_with_config(
+    let writer = Writer::new_with_config(
         storage.clone(),
         schema_manager.clone(),
         0,

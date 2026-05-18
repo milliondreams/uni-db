@@ -59,7 +59,7 @@ async fn test_transaction_memory_limit_rejects_mutation() -> Result<()> {
         ..Default::default()
     };
 
-    let mut writer = create_test_writer(config).await?;
+    let writer = create_test_writer(config).await?;
 
     // Begin transaction
     let tx_l0 = writer.create_transaction_l0();
@@ -119,7 +119,7 @@ async fn test_transaction_memory_limit_allows_rollback() -> Result<()> {
         ..Default::default()
     };
 
-    let mut writer = create_test_writer(config).await?;
+    let writer = create_test_writer(config).await?;
 
     let tx_l0 = writer.create_transaction_l0();
 
@@ -149,7 +149,7 @@ async fn test_no_limit_check_without_transaction() -> Result<()> {
         ..Default::default()
     };
 
-    let mut writer = create_test_writer(config).await?;
+    let writer = create_test_writer(config).await?;
 
     // Insert vertices WITHOUT beginning a transaction
     // Should NOT check transaction memory limit

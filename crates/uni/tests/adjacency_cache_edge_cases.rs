@@ -78,7 +78,7 @@ async fn test_overlay_neighbors_via_writer() -> anyhow::Result<()> {
     );
 
     use uni_db::UniConfig;
-    let mut writer = Writer::new_with_config(
+    let writer = Writer::new_with_config(
         storage.clone(),
         schema_manager.clone(),
         0,

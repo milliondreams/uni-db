@@ -2805,7 +2805,7 @@ mod tests {
         let wal_path = ObjectStorePath::from("wal");
         let wal = Arc::new(WriteAheadLog::new(store.clone(), wal_path));
 
-        let mut writer = Writer::new_with_config(
+        let writer = Writer::new_with_config(
             storage.clone(),
             schema_manager.clone(),
             1,
@@ -2948,7 +2948,7 @@ mod tests {
         let wal_path = ObjectStorePath::from("wal");
         let wal = Arc::new(WriteAheadLog::new(store.clone(), wal_path));
 
-        let mut writer = Writer::new_with_config(
+        let writer = Writer::new_with_config(
             storage.clone(),
             schema_manager.clone(),
             1,
@@ -3037,7 +3037,7 @@ mod tests {
 
         let storage = Arc::new(StorageManager::new(path, schema_manager.clone()).await?);
 
-        let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 1).await?;
+        let writer = Writer::new(storage.clone(), schema_manager.clone(), 1).await?;
 
         // Shared labels - should not be cloned per vertex
         let labels = &["Person".to_string()];
@@ -3091,7 +3091,7 @@ mod tests {
 
         let storage = Arc::new(StorageManager::new(path, schema_manager.clone()).await?);
 
-        let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 1).await?;
+        let writer = Writer::new(storage.clone(), schema_manager.clone(), 1).await?;
 
         let l0 = writer.l0_manager.get_current();
 
@@ -3235,7 +3235,7 @@ mod tests {
         let wal_path = ObjectStorePath::from("wal");
         let wal = Arc::new(WriteAheadLog::new(store.clone(), wal_path));
 
-        let mut writer = Writer::new_with_config(
+        let writer = Writer::new_with_config(
             storage.clone(),
             schema_manager.clone(),
             1,

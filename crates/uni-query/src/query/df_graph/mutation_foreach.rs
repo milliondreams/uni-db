@@ -241,8 +241,6 @@ async fn execute_foreach_inner(
         }
     }
 
-    drop(writer);
-
     tracing::debug!(
         variable = variable.as_str(),
         rows = input_row_count,

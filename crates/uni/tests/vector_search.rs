@@ -215,7 +215,7 @@ async fn write_vectors_to_lancedb(
 #[tokio::test]
 async fn test_l0_vertex_appears_in_vector_search() -> anyhow::Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
-    let (_tmp, storage, schema_manager, mut writer) = setup_vector_env().await?;
+    let (_tmp, storage, schema_manager, writer) = setup_vector_env().await?;
 
     // Write one vertex to LanceDB (flushed).
     write_vectors_to_lancedb(&storage, &schema_manager, &[(1, [10.0, 10.0])]).await?;
@@ -261,7 +261,7 @@ async fn test_l0_vertex_appears_in_vector_search() -> anyhow::Result<()> {
 #[tokio::test]
 async fn test_l0_tombstone_hides_flushed_vertex() -> anyhow::Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
-    let (_tmp, storage, schema_manager, mut writer) = setup_vector_env().await?;
+    let (_tmp, storage, schema_manager, writer) = setup_vector_env().await?;
 
     // Write two vertices to LanceDB.
     write_vectors_to_lancedb(

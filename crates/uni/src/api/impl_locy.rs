@@ -125,11 +125,8 @@ pub(crate) async fn evaluate_with_db_and_config(
     // Always create an ephemeral locy_l0 for the evaluation scope — this provides:
     // - DERIVE visibility: trailing Cypher sees DERIVE mutations
     // - ASSUME/ABDUCE isolation: fork/restore from this buffer
-    let locy_l0 = if let Some(writer) = db.writer.as_ref() {
-        Some(writer.create_transaction_l0())
-    } else {
-        None // Read-only DB: degrade gracefully
-    };
+    // Read-only DB returns None and degrades gracefully.
+    let locy_l0 = db.writer.as_ref().map(|writer| writer.create_transaction_l0());
     let engine = LocyEngine {
         db,
         tx_l0_override: locy_l0.clone(),

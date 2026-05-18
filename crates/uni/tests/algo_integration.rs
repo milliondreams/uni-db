@@ -4,7 +4,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use tempfile::tempdir;
-use tokio::sync::RwLock;
 use uni_db::core::id::Vid;
 use uni_db::core::schema::SchemaManager;
 use uni_db::query::executor::Executor;

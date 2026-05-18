@@ -53,7 +53,6 @@ use uni_store::runtime::property_manager::PropertyManager;
 use uni_store::runtime::wal::WriteAheadLog;
 use uni_store::storage::manager::StorageManager;
 
-use tokio::sync::RwLock;
 use uni_store::runtime::writer::Writer;
 
 use crate::shutdown::ShutdownHandle;

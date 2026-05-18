@@ -580,7 +580,6 @@ impl Transaction {
         }
         self.db.cached_wal_lsn.store(wal_lsn, Ordering::Relaxed);
         let version = writer.l0_manager.get_current().read().current_version;
-        drop(writer);
 
         self.completed = true;
 

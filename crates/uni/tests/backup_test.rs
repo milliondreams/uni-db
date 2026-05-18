@@ -3,7 +3,6 @@
 
 use std::sync::Arc;
 use tempfile::tempdir;
-use tokio::sync::RwLock;
 use uni_db::core::id::Vid;
 use uni_db::core::schema::{DataType, SchemaManager};
 use uni_db::query::executor::Executor;

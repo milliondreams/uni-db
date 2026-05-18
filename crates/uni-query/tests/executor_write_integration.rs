@@ -6,7 +6,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use tempfile::tempdir;
-use tokio::sync::RwLock;
 use uni_common::Value;
 use uni_common::core::schema::{DataType, SchemaManager};
 use uni_query::query::executor::Executor;

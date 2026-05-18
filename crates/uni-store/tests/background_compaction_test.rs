@@ -142,7 +142,7 @@ async fn write_and_flush(
     edge_type_id: u32,
     config: UniConfig,
 ) {
-    let mut writer = Writer::new_with_config(
+    let writer = Writer::new_with_config(
         storage.clone(),
         schema_manager.clone(),
         0,

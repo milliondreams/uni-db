@@ -674,6 +674,9 @@ impl Executor {
                 .and_then(|v| v.as_str())
                 .unwrap_or("dst");
 
+            // §5.7 of concurrent_writer.md: writer is hoisted above the row
+            // loop now that there is no per-row lock acquisition cost.
+            let writer: &uni_store::Writer = writer_arc.as_ref();
             let mut total_rows = 0;
             for batch in batches {
                 let num_rows = batch.num_rows();
@@ -710,7 +713,6 @@ impl Executor {
                         .ok_or_else(|| anyhow!("Missing destination VID column '{}'", dst_col))?;
 
                     // Generate EID and insert edge
-                    let writer: &uni_store::Writer = writer_arc.as_ref();
                     let eid = writer.next_eid(edge_type_id).await?;
                     writer
                         .insert_edge(
@@ -737,7 +739,6 @@ impl Executor {
 
             // Flush to persist edges
             if total_rows > 0 {
-                let writer: &uni_store::Writer = writer_arc.as_ref();
                 writer.flush_to_l1(None).await?;
             }
 
@@ -749,6 +750,9 @@ impl Executor {
                 .label_id_by_name_case_insensitive(label)
                 .ok_or_else(|| anyhow!("Label '{}' not found in schema", label))?;
 
+            // §5.7 of concurrent_writer.md: writer is hoisted above the row
+            // loop now that there is no per-row lock acquisition cost.
+            let writer: &uni_store::Writer = writer_arc.as_ref();
             let mut total_rows = 0;
             for batch in batches {
                 let num_rows = batch.num_rows();
@@ -775,7 +779,6 @@ impl Executor {
                     }
 
                     // Generate VID and insert
-                    let writer: &uni_store::Writer = writer_arc.as_ref();
                     let vid = writer.next_vid().await?;
                     let _ = writer
                         .insert_vertex_with_labels(vid, properties, &[label.to_string()], None)
@@ -794,7 +797,6 @@ impl Executor {
 
             // Flush to persist vertices
             if total_rows > 0 {
-                let writer: &uni_store::Writer = writer_arc.as_ref();
                 writer.flush_to_l1(None).await?;
             }
 
@@ -1379,8 +1381,6 @@ impl Executor {
                 } else {
                     Ok(())
                 };
-
-                drop(writer);
                 result?;
 
                 Self::bind_path_variables(&path_pattern, &mut match_row, &temp_vars);
@@ -1441,7 +1441,6 @@ impl Executor {
                 }
                 .await;
 
-                drop(writer);
                 results.extend(result?);
             }
         }

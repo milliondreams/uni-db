@@ -30,7 +30,7 @@ async fn test_wal_preservation_after_flush() -> anyhow::Result<()> {
     let storage = Arc::new(StorageManager::new(storage_str, schema_manager.clone()).await?);
 
     // 2. Initialize Writer and attach WAL
-    let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 0)
+    let writer = Writer::new(storage.clone(), schema_manager.clone(), 0)
         .await
         .unwrap();
 

@@ -54,7 +54,7 @@ async fn setup_test_db() -> Result<(TempDir, Arc<StorageManager>, Writer, Proper
 
 #[tokio::test]
 async fn test_edge_properties_readable_after_compaction() -> Result<()> {
-    let (_temp_dir, storage, mut writer, property_manager, edge_type_id) = setup_test_db().await?;
+    let (_temp_dir, storage, writer, property_manager, edge_type_id) = setup_test_db().await?;
 
     // Create two vertices
     let v1 = writer.next_vid().await?;
@@ -139,7 +139,7 @@ async fn test_edge_properties_readable_after_compaction() -> Result<()> {
 
 #[tokio::test]
 async fn test_main_edges_fallback_when_delta_cleared() -> Result<()> {
-    let (_temp_dir, storage, mut writer, property_manager, edge_type_id) = setup_test_db().await?;
+    let (_temp_dir, storage, writer, property_manager, edge_type_id) = setup_test_db().await?;
 
     // Create vertices and edge with properties
     let v1 = writer.next_vid().await?;
@@ -197,7 +197,7 @@ async fn test_main_edges_fallback_when_delta_cleared() -> Result<()> {
 
 #[tokio::test]
 async fn test_multiple_edges_properties_after_compaction() -> Result<()> {
-    let (_temp_dir, storage, mut writer, property_manager, edge_type_id) = setup_test_db().await?;
+    let (_temp_dir, storage, writer, property_manager, edge_type_id) = setup_test_db().await?;
 
     // Create vertices
     let v1 = writer.next_vid().await?;
@@ -280,7 +280,7 @@ async fn test_multiple_edges_properties_after_compaction() -> Result<()> {
 
 #[tokio::test]
 async fn test_edge_with_no_properties_after_compaction() -> Result<()> {
-    let (_temp_dir, storage, mut writer, property_manager, edge_type_id) = setup_test_db().await?;
+    let (_temp_dir, storage, writer, property_manager, edge_type_id) = setup_test_db().await?;
 
     // Create vertices and edge WITHOUT properties
     let v1 = writer.next_vid().await?;
@@ -323,7 +323,7 @@ async fn test_edge_with_no_properties_after_compaction() -> Result<()> {
 
 #[tokio::test]
 async fn test_deleted_edge_compaction_does_not_assert() -> Result<()> {
-    let (_temp_dir, storage, mut writer, _property_manager, edge_type_id) = setup_test_db().await?;
+    let (_temp_dir, storage, writer, _property_manager, edge_type_id) = setup_test_db().await?;
 
     // Create two vertices
     let v1 = writer.next_vid().await?;

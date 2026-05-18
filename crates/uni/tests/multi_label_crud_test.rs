@@ -158,7 +158,7 @@ mod create_tests {
             StorageManager::new(storage_path.to_str().unwrap(), schema_manager.clone()).await?,
         );
 
-        let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
+        let writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
 
         // Insert vertex with two labels: Person and Employee
         let vid = Vid::new(1);
@@ -197,7 +197,7 @@ mod create_tests {
             StorageManager::new(storage_path.to_str().unwrap(), schema_manager.clone()).await?,
         );
 
-        let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
+        let writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
 
         // Insert vertex with three labels: Person, Employee, Manager
         let vid = Vid::new(1);
@@ -241,7 +241,7 @@ mod create_tests {
             StorageManager::new(storage_path.to_str().unwrap(), schema_manager.clone()).await?,
         );
 
-        let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
+        let writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
 
         // Create vertex A with ["Person", "Employee"]
         let vid_a = Vid::new(1);
@@ -298,7 +298,7 @@ mod create_tests {
             StorageManager::new(storage_path.to_str().unwrap(), schema_manager.clone()).await?,
         );
 
-        let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
+        let writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
 
         // Insert 10 vertices with varying label combinations
         for i in 0..10 {
@@ -351,7 +351,7 @@ mod create_tests {
             StorageManager::new(storage_path.to_str().unwrap(), schema_manager.clone()).await?,
         );
 
-        let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
+        let writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
 
         // Test 1: Single label (standard case)
         let vid1 = Vid::new(1);
@@ -425,7 +425,7 @@ mod l0_flush_tests {
             StorageManager::new(storage_path.to_str().unwrap(), schema_manager.clone()).await?,
         );
 
-        let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
+        let writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
 
         // Insert multiple vertices with various label combinations
         let vid1 = Vid::new(1);
@@ -531,7 +531,7 @@ mod l0_flush_tests {
 
         // First writer: Insert and flush
         {
-            let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
+            let writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
 
             let vid = Vid::new(1);
             let mut props = HashMap::new();
@@ -604,7 +604,7 @@ mod read_tests {
             StorageManager::new(storage_path.to_str().unwrap(), schema_manager.clone()).await?,
         );
 
-        let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
+        let writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
 
         // Create: A(Person:Employee), B(Person), C(Employee:Manager)
         let vid_a = Vid::new(1);
@@ -668,7 +668,7 @@ mod read_tests {
             StorageManager::new(storage_path.to_str().unwrap(), schema_manager.clone()).await?,
         );
 
-        let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
+        let writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
 
         // Create: A(Person:Employee), B(Person:Manager), C(Person:Employee:Manager)
         let vid_a = Vid::new(1);
@@ -741,7 +741,7 @@ mod read_tests {
             StorageManager::new(storage_path.to_str().unwrap(), schema_manager.clone()).await?,
         );
 
-        let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
+        let writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
 
         // Create a vertex
         let vid = Vid::new(1);
@@ -774,7 +774,7 @@ mod read_tests {
             StorageManager::new(storage_path.to_str().unwrap(), schema_manager.clone()).await?,
         );
 
-        let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
+        let writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
 
         // Create vertices with known labels
         let vid = Vid::new(1);
@@ -809,7 +809,7 @@ mod read_tests {
             StorageManager::new(storage_path.to_str().unwrap(), schema_manager.clone()).await?,
         );
 
-        let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
+        let writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
 
         // Create vertex with Person:Employee labels
         let vid = Vid::new(1);
@@ -871,7 +871,7 @@ mod update_tests {
             StorageManager::new(storage_path.to_str().unwrap(), schema_manager.clone()).await?,
         );
 
-        let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
+        let writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
 
         // Create vertex with Person label
         let vid = Vid::new(1);
@@ -919,7 +919,7 @@ mod update_tests {
             StorageManager::new(storage_path.to_str().unwrap(), schema_manager.clone()).await?,
         );
 
-        let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
+        let writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
 
         // Create vertex with Person:Employee labels
         let vid = Vid::new(1);
@@ -967,7 +967,7 @@ mod update_tests {
             StorageManager::new(storage_path.to_str().unwrap(), schema_manager.clone()).await?,
         );
 
-        let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
+        let writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
 
         // Create vertex with Person:Employee labels
         let vid = Vid::new(1);
@@ -1021,7 +1021,7 @@ mod update_tests {
             StorageManager::new(storage_path.to_str().unwrap(), schema_manager.clone()).await?,
         );
 
-        let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
+        let writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
 
         // Create vertex with Person:Employee labels
         let vid = Vid::new(1);
@@ -1075,7 +1075,7 @@ mod update_tests {
             StorageManager::new(storage_path.to_str().unwrap(), schema_manager.clone()).await?,
         );
 
-        let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
+        let writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
 
         // Create vertex with Person label only
         let vid = Vid::new(1);
@@ -1125,7 +1125,7 @@ mod delete_tests {
             StorageManager::new(storage_path.to_str().unwrap(), schema_manager.clone()).await?,
         );
 
-        let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
+        let writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
 
         // Create vertex with Person:Employee:Manager labels
         let vid = Vid::new(1);
@@ -1175,7 +1175,7 @@ mod delete_tests {
             StorageManager::new(storage_path.to_str().unwrap(), schema_manager.clone()).await?,
         );
 
-        let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
+        let writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
 
         // Create vertex with Person:Employee
         let vid = Vid::new(1);
@@ -1235,7 +1235,7 @@ mod delete_tests {
             StorageManager::new(storage_path.to_str().unwrap(), schema_manager.clone()).await?,
         );
 
-        let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
+        let writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
 
         // Create multiple vertices with overlapping labels
         let vid1 = Vid::new(1);
@@ -1293,7 +1293,7 @@ mod delete_tests {
             StorageManager::new(storage_path.to_str().unwrap(), schema_manager.clone()).await?,
         );
 
-        let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
+        let writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
 
         // Create multi-label vertex with an edge
         let vid_person = Vid::new(1);
@@ -1364,7 +1364,7 @@ mod index_tests {
             StorageManager::new(storage_path.to_str().unwrap(), schema_manager.clone()).await?,
         );
 
-        let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
+        let writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
 
         // Create multiple vertices with overlapping labels
         let vids = vec![Vid::new(1), Vid::new(2), Vid::new(3)];
@@ -1425,7 +1425,7 @@ mod index_tests {
             StorageManager::new(storage_path.to_str().unwrap(), schema_manager.clone()).await?,
         );
 
-        let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
+        let writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
 
         // Create vertices with multi-labels
         let vid1 = Vid::new(1);
@@ -1476,7 +1476,7 @@ mod index_tests {
             StorageManager::new(storage_path.to_str().unwrap(), schema_manager.clone()).await?,
         );
 
-        let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
+        let writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
 
         // Create 100 vertices with varying label counts
         for i in 0..100 {
@@ -1536,7 +1536,7 @@ mod uniid_tests {
             StorageManager::new(storage_path.to_str().unwrap(), schema_manager.clone()).await?,
         );
 
-        let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
+        let writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
 
         // Create vertex A: ["Person", "Employee"], {name: "Alice"}
         let vid_a = Vid::new(1);
@@ -1590,7 +1590,7 @@ mod uniid_tests {
             StorageManager::new(storage_path.to_str().unwrap(), schema_manager.clone()).await?,
         );
 
-        let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
+        let writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
 
         // Create vertex with ["Person"]
         let vid1 = Vid::new(1);
@@ -1638,7 +1638,7 @@ mod uniid_tests {
             StorageManager::new(storage_path.to_str().unwrap(), schema_manager.clone()).await?,
         );
 
-        let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
+        let writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
 
         // Test ["Person", "Employee", "Manager"] == ["Manager", "Person", "Employee"] == ["Employee", "Manager", "Person"]
         let label_orders = [

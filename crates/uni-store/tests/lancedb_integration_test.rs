@@ -35,7 +35,7 @@ async fn test_lancedb_flush_vertices() -> anyhow::Result<()> {
     let storage = Arc::new(storage);
 
     // 3. Create Writer and insert vertices
-    let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
+    let writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
 
     let vid1 = writer.next_vid().await?;
     let vid2 = writer.next_vid().await?;
@@ -101,7 +101,7 @@ async fn test_lancedb_flush_edges() -> anyhow::Result<()> {
     let storage = Arc::new(storage);
 
     // 3. Create Writer and insert edges
-    let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
+    let writer = Writer::new(storage.clone(), schema_manager.clone(), 0).await?;
 
     let vid1 = writer.next_vid().await?;
     let vid2 = writer.next_vid().await?;

@@ -7,7 +7,6 @@ use arrow_array::{
 };
 use std::sync::Arc;
 use tempfile::tempdir;
-use tokio::sync::RwLock;
 use uni_db::Value;
 use uni_db::core::id::{Eid, Vid};
 use uni_db::core::schema::{DataType, SchemaManager};

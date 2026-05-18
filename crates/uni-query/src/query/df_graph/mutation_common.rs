@@ -25,7 +25,6 @@ use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use uni_common::core::id::Vid;
 use uni_common::{Path, Value};
 use uni_cypher::ast::{Expr, Pattern, PatternElement, RemoveItem, SetClause, SetItem};

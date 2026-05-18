@@ -25,7 +25,7 @@ async fn test_vector_clock_integration() -> anyhow::Result<()> {
     schema_manager.save().await?;
 
     let storage = Arc::new(StorageManager::new(path, schema_manager.clone()).await?);
-    let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 1)
+    let writer = Writer::new(storage.clone(), schema_manager.clone(), 1)
         .await
         .unwrap();
     let prop_manager = PropertyManager::new(storage.clone(), schema_manager.clone(), 100);

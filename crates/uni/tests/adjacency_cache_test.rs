@@ -34,7 +34,7 @@ async fn test_adjacency_manager_lifecycle() -> anyhow::Result<()> {
     // 2. Insert edges via Writer (dual-writes to L0 data + AM overlay)
     use uni_db::UniConfig;
 
-    let mut writer = Writer::new_with_config(
+    let writer = Writer::new_with_config(
         storage.clone(),
         schema_manager.clone(),
         0,

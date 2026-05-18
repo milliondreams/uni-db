@@ -5,7 +5,6 @@ use arrow_array::{RecordBatch, StringArray, TimestampNanosecondArray};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tempfile::tempdir;
-use tokio::sync::RwLock;
 use uni_common::core::id::Vid;
 use uni_common::core::schema::{DataType, SchemaManager};
 use uni_common::{Value, unival};

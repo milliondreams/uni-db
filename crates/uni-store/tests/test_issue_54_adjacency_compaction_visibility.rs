@@ -39,7 +39,7 @@ async fn test_no_visibility_gap_during_compaction() -> Result<()> {
     schema_manager.save().await?;
 
     let storage = Arc::new(StorageManager::new(path, schema_manager.clone()).await?);
-    let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 1).await?;
+    let writer = Writer::new(storage.clone(), schema_manager.clone(), 1).await?;
 
     // Insert edges to build up frozen segments
     let vid_a = writer.next_vid().await?;
@@ -134,7 +134,7 @@ async fn test_rewarm_after_storage_compaction() -> Result<()> {
     schema_manager.save().await?;
 
     let storage = Arc::new(StorageManager::new(path, schema_manager.clone()).await?);
-    let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 1).await?;
+    let writer = Writer::new(storage.clone(), schema_manager.clone(), 1).await?;
 
     // Insert data and flush to L1
     let vid_a = writer.next_vid().await?;
@@ -222,7 +222,7 @@ async fn test_no_concurrent_compaction() -> Result<()> {
     schema_manager.save().await?;
 
     let storage = Arc::new(StorageManager::new(path, schema_manager.clone()).await?);
-    let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 1).await?;
+    let writer = Writer::new(storage.clone(), schema_manager.clone(), 1).await?;
 
     // Insert enough data to trigger compaction multiple times
     for i in 0..10 {
@@ -276,7 +276,7 @@ async fn test_frozen_segments_readable_until_csr_installed() -> Result<()> {
     schema_manager.save().await?;
 
     let storage = Arc::new(StorageManager::new(path, schema_manager.clone()).await?);
-    let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 1).await?;
+    let writer = Writer::new(storage.clone(), schema_manager.clone(), 1).await?;
 
     // Insert and flush to create frozen segments
     let vid_a = writer.next_vid().await?;

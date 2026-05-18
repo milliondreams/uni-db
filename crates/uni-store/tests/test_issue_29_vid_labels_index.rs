@@ -34,7 +34,7 @@ async fn test_vid_labels_index_basic_functionality() -> Result<()> {
     let storage = Arc::new(StorageManager::new(path, schema_manager.clone()).await?);
 
     // Create a writer and insert some vertices
-    let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 1).await?;
+    let writer = Writer::new(storage.clone(), schema_manager.clone(), 1).await?;
 
     // Allocate VIDs and insert 3 vertices with labels
     let vid1 = writer.next_vid().await?;
@@ -87,7 +87,7 @@ async fn test_vid_labels_index_delete_removes_from_index() -> Result<()> {
     schema_manager.save().await?;
 
     let storage = Arc::new(StorageManager::new(path, schema_manager.clone()).await?);
-    let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 1).await?;
+    let writer = Writer::new(storage.clone(), schema_manager.clone(), 1).await?;
 
     // Insert a vertex
     let vid = writer.next_vid().await?;
@@ -132,7 +132,7 @@ async fn test_vid_labels_index_disabled_fallback() -> Result<()> {
     let storage =
         Arc::new(StorageManager::new_with_config(path, schema_manager.clone(), config).await?);
 
-    let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 1).await?;
+    let writer = Writer::new(storage.clone(), schema_manager.clone(), 1).await?;
 
     // Insert a vertex
     let vid = writer.next_vid().await?;
@@ -172,7 +172,7 @@ async fn test_vid_labels_index_rebuild_on_open() -> Result<()> {
     // Create storage and insert vertices
     {
         let storage = Arc::new(StorageManager::new(path, schema_manager.clone()).await?);
-        let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 1).await?;
+        let writer = Writer::new(storage.clone(), schema_manager.clone(), 1).await?;
 
         vid1 = writer.next_vid().await?;
         let mut props1 = HashMap::new();

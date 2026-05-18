@@ -30,7 +30,7 @@ async fn test_compaction_l1_to_l2() -> anyhow::Result<()> {
 
     // 2. Write to L1 via Writer (simulating flush)
     // We need to initialize ID allocator for writer
-    let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 0)
+    let writer = Writer::new(storage.clone(), schema_manager.clone(), 0)
         .await
         .unwrap();
 
@@ -149,7 +149,7 @@ async fn test_compaction_vertices_crdt() -> anyhow::Result<()> {
 
     let storage = Arc::new(StorageManager::new(storage_str, schema_manager.clone()).await?);
     let compactor = Compactor::new(storage.clone());
-    let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 0)
+    let writer = Writer::new(storage.clone(), schema_manager.clone(), 0)
         .await
         .unwrap();
 

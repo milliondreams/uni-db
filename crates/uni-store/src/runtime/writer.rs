@@ -55,26 +55,27 @@ struct FlushInProgressGuard {
 }
 
 impl FlushInProgressGuard {
-    /// Attempts to acquire the flush latch via CAS.
-    ///
-    /// Returns `None` when another flush is already in progress.
-    fn new(storage: &Arc<StorageManager>) -> Option<Self> {
+    /// Increments the in-progress flush counter and returns a guard that
+    /// decrements on drop. With the move to `AtomicUsize` (preparing for
+    /// async-flush), this is now a counter, not a single-holder latch —
+    /// multiple flushes may be in flight concurrently. The counter is
+    /// consumed only by compaction's delta-clear gate (`> 0` skips).
+    fn new(storage: &Arc<StorageManager>) -> Self {
         storage
             .flush_in_progress
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .ok()?;
-        Some(Self {
+            .fetch_add(1, Ordering::AcqRel);
+        Self {
             storage: storage.clone(),
-        })
+        }
     }
 }
 
 impl Drop for FlushInProgressGuard {
     fn drop(&mut self) {
-        // M-PANIC-IS-STOP: must not panic in Drop. Plain atomic store cannot fail.
+        // M-PANIC-IS-STOP: must not panic in Drop. Atomic op cannot fail.
         self.storage
             .flush_in_progress
-            .store(false, Ordering::Release);
+            .fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -2099,11 +2100,11 @@ impl Writer {
         // Signal that a flush is in progress so compaction skips delta clears.
         // The RAII guard clears the flag on every exit path — manual drops
         // earlier left the flag stuck on any `?` early-return inside this
-        // method (concurrent_writer.md §6.6). The CAS also rejects nested
-        // re-entry; today the outer writer-RwLock makes that impossible,
-        // but the check is forward-compatible with Phase 4 of the refactor.
-        let _flush_guard = FlushInProgressGuard::new(&self.storage)
-            .ok_or_else(|| anyhow!("flush_to_l1: another flush is already in progress"))?;
+        // method (concurrent_writer.md §6.6). With the move to a counter
+        // (preparing for async_l0_to_l1_flush.md), multiple flushes may
+        // be concurrently in flight; the RAII semantics still hold per
+        // flush.
+        let _flush_guard = FlushInProgressGuard::new(&self.storage);
 
         let (initial_size, initial_count) = {
             let l0_arc = self.l0_manager.get_current();

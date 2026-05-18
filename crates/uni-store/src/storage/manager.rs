@@ -66,9 +66,11 @@ pub struct StorageManager {
     adjacency_manager: Arc<AdjacencyManager>,
     pub config: UniConfig,
     pub compaction_status: Arc<Mutex<CompactionStatus>>,
-    /// Flag set during flush_to_l1 to prevent compaction from clearing delta
-    /// tables while new data is being appended.
-    pub flush_in_progress: std::sync::atomic::AtomicBool,
+    /// Counter of in-flight `flush_to_l1` operations. Compaction skips
+    /// delta-clear when this is non-zero to avoid wiping rows a flush is
+    /// about to append. Counter (not bool) so multiple async flushes can
+    /// be in flight concurrently (see docs/proposals/async_l0_to_l1_flush.md).
+    pub flush_in_progress: std::sync::atomic::AtomicUsize,
     /// Optional pinned snapshot for time-travel
     pinned_snapshot: Option<SnapshotManifest>,
     /// Optional fork scope for branch-aware reads (Phase 1 read-only).
@@ -153,7 +155,7 @@ impl StorageManager {
             adjacency_manager: Arc::new(AdjacencyManager::new(config.cache_size)),
             config,
             compaction_status: Arc::new(Mutex::new(CompactionStatus::default())),
-            flush_in_progress: std::sync::atomic::AtomicBool::new(false),
+            flush_in_progress: std::sync::atomic::AtomicUsize::new(0),
             pinned_snapshot: None,
             fork_scope: None,
             backend,
@@ -304,7 +306,7 @@ impl StorageManager {
             adjacency_manager: Arc::new(AdjacencyManager::new(self.adjacency_manager.max_bytes())),
             config: self.config.clone(),
             compaction_status: Arc::new(Mutex::new(CompactionStatus::default())),
-            flush_in_progress: std::sync::atomic::AtomicBool::new(false),
+            flush_in_progress: std::sync::atomic::AtomicUsize::new(0),
             pinned_snapshot: Some(snapshot),
             fork_scope: self.fork_scope.clone(),
             backend: self.backend.clone(),
@@ -357,7 +359,7 @@ impl StorageManager {
             adjacency_manager: Arc::new(AdjacencyManager::new(self.adjacency_manager.max_bytes())),
             config: self.config.clone(),
             compaction_status: Arc::new(Mutex::new(CompactionStatus::default())),
-            flush_in_progress: std::sync::atomic::AtomicBool::new(false),
+            flush_in_progress: std::sync::atomic::AtomicUsize::new(0),
             pinned_snapshot: None,
             fork_scope: Some(scope),
             backend: branched_backend,

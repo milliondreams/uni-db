@@ -500,6 +500,29 @@ pub struct UniConfig {
     /// makes the waste negligible. Default: 16.
     pub tx_id_reservoir_batch: usize,
 
+    /// When `true`, `check_flush` on the commit path dispatches via the
+    /// async path (`flush_to_l1_async`): rotate L0 under `flush_lock`,
+    /// then spawn the streaming + finalize work on a background task.
+    /// Concurrent committers no longer queue on the flush's long I/O.
+    ///
+    /// When `false` (default for now), `check_flush` calls the original
+    /// synchronous `flush_to_l1` and holds `flush_lock` across the full
+    /// L1-streaming write. This is the kill-switch.
+    ///
+    /// See `docs/proposals/async_l0_to_l1_flush.md`.
+    pub async_flush_enabled: bool,
+
+    /// Maximum number of L0→L1 flushes that may be in-flight simultaneously
+    /// when `async_flush_enabled` is true. The (N+1)th rotate blocks until
+    /// one of the in-flight flushes finalizes. Bounds WAL retention and
+    /// memory growth. Default: 2.
+    pub max_pending_flushes: usize,
+
+    /// Maximum time `drop_fork` will wait for pending async flushes on
+    /// that fork before failing with `PendingFlushTimeout`. Only meaningful
+    /// when `async_flush_enabled` is true. Default: 10s.
+    pub drop_fork_drain_timeout: Duration,
+
     /// Phase 4a: cap on total fork count (Active + Pending + Tombstoned).
     /// `None` = unbounded. When set, `Session::fork(name).await` errors
     /// with `UniError::ForkBudgetExceeded` once the cap is reached.
@@ -571,6 +594,9 @@ impl Default for UniConfig {
             strict_schema: false,
             fork_fragment_warn_threshold: 256,
             tx_id_reservoir_batch: 16,
+            async_flush_enabled: false,
+            max_pending_flushes: 2,
+            drop_fork_drain_timeout: Duration::from_secs(10),
             max_forks: None,
             fork_default_ttl: None,
             fork_sweeper_interval: Duration::from_secs(60),

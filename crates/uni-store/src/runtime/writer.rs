@@ -2262,6 +2262,18 @@ impl Writer {
     /// must call [`Writer::flush_inline_under_lock`] directly to avoid a re-entrant
     /// `tokio::sync::Mutex` deadlock — see concurrent_writer.md §5.5.
     pub async fn flush_to_l1(&self, name: Option<String>) -> Result<String> {
+        // Drain any in-flight async flushes first. `flush_to_l1` is a
+        // SYNCHRONIZATION BARRIER — callers (test fixtures, fork
+        // setup, shutdown paths) rely on it as "all writes are now
+        // durably in Lance". Without the drain, an async stream from
+        // a recent commit might still be writing to Lance when
+        // `flush_to_l1` returns, leaving a window where forks branch
+        // off pre-write Lance state and lose data.
+        if let Some(coord) = self.flush_coordinator.as_ref() {
+            let _ = coord
+                .drain(self.config.drop_fork_drain_timeout)
+                .await;
+        }
         let _flush_lock_guard = self.flush_lock.lock().await;
         self.flush_inline_under_lock(name).await
     }

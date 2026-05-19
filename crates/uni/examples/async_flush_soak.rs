@@ -89,11 +89,13 @@ async fn main() -> anyhow::Result<()> {
         sessions, THRESHOLD, duration_secs, mutations_total
     );
 
-    let mut config = UniConfig::default();
-    config.auto_flush_threshold = THRESHOLD;
-    config.auto_flush_interval = None;
-    config.async_flush_enabled = true;
-    config.max_pending_flushes = 4;
+    let config = UniConfig {
+        auto_flush_threshold: THRESHOLD,
+        auto_flush_interval: None,
+        async_flush_enabled: true,
+        max_pending_flushes: 4,
+        ..Default::default()
+    };
     // Native Lance backend (tempdir) so stream durations are realistic.
     // Without this, in-memory streams are too fast to exercise the
     // pipeline depth (Plan L5).
@@ -189,7 +191,11 @@ async fn main() -> anyhow::Result<()> {
     // Assert: RSS growth bounded. Allow generous slack (5x start) since
     // mimalloc retains some pages. The signal we're after is unbounded
     // monotonic growth across hours.
-    let max_rss = samples.iter().map(|(_, r)| *r).max().unwrap_or(final_rss_kb);
+    let max_rss = samples
+        .iter()
+        .map(|(_, r)| *r)
+        .max()
+        .unwrap_or(final_rss_kb);
     let rss_ratio = max_rss as f64 / (start_rss_kb.max(1)) as f64;
     println!(
         "max_rss_kb={} start_rss_kb={} ratio={:.2}x",

@@ -20,10 +20,10 @@ pub use property_manager::PropertyManager;
 pub use vid_remapper::{EidRemapper, VidRemapper};
 // Re-export SimpleGraph from uni-common
 pub use context::QueryContext;
+pub use id_reservoir::{DEFAULT_RESERVOIR_BATCH, TxIdReservoir};
 pub use uni_common::graph::simple_graph::{Direction, SimpleGraph};
 pub use wal::WriteAheadLog;
 pub use working_graph::WorkingGraph;
-pub use id_reservoir::{DEFAULT_RESERVOIR_BATCH, TxIdReservoir};
 pub use writer::Writer;
 
 use uni_common::core::id::{Eid, Vid};

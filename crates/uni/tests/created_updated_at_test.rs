@@ -99,7 +99,10 @@ async fn test_updated_at_advances_after_set() -> Result<()> {
         u2 > u1,
         "updated_at must advance after SET (was {u1}, now {u2})"
     );
-    assert!(u2 > c2, "updated_at should be later than created_at after a SET");
+    assert!(
+        u2 > c2,
+        "updated_at should be later than created_at after a SET"
+    );
     Ok(())
 }
 
@@ -132,8 +135,10 @@ async fn test_edge_created_updated_at() -> Result<()> {
     assert_eq!(res.len(), 1);
     let c_val = res.rows()[0].value("c").unwrap();
     let u_val = res.rows()[0].value("u").unwrap();
-    let c = extract_nanos(c_val).unwrap_or_else(|| panic!("edge created_at not DateTime: {c_val:?}"));
-    let u = extract_nanos(u_val).unwrap_or_else(|| panic!("edge updated_at not DateTime: {u_val:?}"));
+    let c =
+        extract_nanos(c_val).unwrap_or_else(|| panic!("edge created_at not DateTime: {c_val:?}"));
+    let u =
+        extract_nanos(u_val).unwrap_or_else(|| panic!("edge updated_at not DateTime: {u_val:?}"));
     assert!(c > 0);
     let delta_ns = (u - c).abs();
     assert!(

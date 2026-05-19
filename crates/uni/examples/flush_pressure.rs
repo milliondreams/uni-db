@@ -42,14 +42,13 @@ async fn build_db_with_threshold(threshold: usize) -> anyhow::Result<Arc<Uni>> {
     build_db_with_settings(threshold, false).await
 }
 
-async fn build_db_with_settings(
-    threshold: usize,
-    async_flush: bool,
-) -> anyhow::Result<Arc<Uni>> {
-    let mut config = UniConfig::default();
-    config.auto_flush_threshold = threshold;
-    config.auto_flush_interval = None; // disable time-based; isolate count-based
-    config.async_flush_enabled = async_flush;
+async fn build_db_with_settings(threshold: usize, async_flush: bool) -> anyhow::Result<Arc<Uni>> {
+    let config = UniConfig {
+        auto_flush_threshold: threshold,
+        auto_flush_interval: None, // disable time-based; isolate count-based
+        async_flush_enabled: async_flush,
+        ..Default::default()
+    };
     let db = Arc::new(Uni::in_memory().config(config).build().await?);
     let s = db.session();
     let t = s.tx().await?;
@@ -213,7 +212,16 @@ async fn main() -> anyhow::Result<()> {
         "------------", "--------", "------------", "--------------"
     );
     let total_muts = SESSIONS * TXS_PER_SESSION * VERTICES_PER_TX;
-    for &thr in &[1_000usize, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000, usize::MAX] {
+    for &thr in &[
+        1_000usize,
+        2_500,
+        5_000,
+        10_000,
+        25_000,
+        50_000,
+        100_000,
+        usize::MAX,
+    ] {
         let mut walls = Vec::new();
         for _ in 0..REPS {
             let (w, _, _) = one_rep_with_threshold(thr).await?;
@@ -223,7 +231,7 @@ async fn main() -> anyhow::Result<()> {
         let expected_flushes = if thr == usize::MAX {
             1 // just the explicit end-of-rep drain
         } else {
-            (total_muts + thr - 1) / thr
+            total_muts.div_ceil(thr)
         };
         let ns_per_mut = wall.as_nanos() / (total_muts as u128);
         let thr_display = if thr == usize::MAX {
@@ -264,10 +272,7 @@ async fn main() -> anyhow::Result<()> {
         let s = mean(&sync_walls);
         let a = mean(&async_walls);
         let speedup = s.as_secs_f64() / a.as_secs_f64();
-        println!(
-            " {:>10}  {:>14?}  {:>14?}  {:>9.2}x",
-            thr, s, a, speedup
-        );
+        println!(" {:>10}  {:>14?}  {:>14?}  {:>9.2}x", thr, s, a, speedup);
     }
 
     Ok(())

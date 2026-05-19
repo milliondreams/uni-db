@@ -42,11 +42,9 @@ async fn run_concurrent_creates(db: Arc<Uni>, n_sessions: usize) {
             let session = db.session();
             let tx = session.tx().await.unwrap();
             for i in 0..STATEMENTS_PER_TASK {
-                tx.execute(&format!(
-                    "CREATE (n:BenchNode {{idx: {i}, sess: {s}}})"
-                ))
-                .await
-                .unwrap();
+                tx.execute(&format!("CREATE (n:BenchNode {{idx: {i}, sess: {s}}})"))
+                    .await
+                    .unwrap();
             }
             tx.commit().await.unwrap();
         }));

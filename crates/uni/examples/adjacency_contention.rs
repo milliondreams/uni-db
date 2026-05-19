@@ -37,11 +37,7 @@ enum Pattern {
     ColdShard, // task i uses edge_type i+1
 }
 
-async fn run_one_task(
-    am: Arc<AdjacencyManager>,
-    task_id: usize,
-    pattern: Pattern,
-) -> Duration {
+async fn run_one_task(am: Arc<AdjacencyManager>, task_id: usize, pattern: Pattern) -> Duration {
     let edge_type = match pattern {
         Pattern::HotShard => 1u32,
         Pattern::ColdShard => (task_id as u32) + 1,
@@ -69,9 +65,9 @@ async fn one_rep(n_sessions: usize, pattern: Pattern) -> (Duration, Vec<Duration
     let mut handles = Vec::with_capacity(n_sessions);
     for s in 0..n_sessions {
         let am = am.clone();
-        handles.push(tokio::spawn(async move {
-            run_one_task(am, s, pattern).await
-        }));
+        handles.push(tokio::spawn(
+            async move { run_one_task(am, s, pattern).await },
+        ));
     }
     let mut per_task = Vec::with_capacity(n_sessions);
     for h in handles {
@@ -135,7 +131,11 @@ async fn main() -> anyhow::Result<()> {
     println!("  COLD-SHARD: wall time roughly constant with N (full parallelism)");
 
     run_pattern("HOT-SHARD (all tasks → edge_type 1)", Pattern::HotShard).await;
-    run_pattern("COLD-SHARD (each task → distinct edge_type)", Pattern::ColdShard).await;
+    run_pattern(
+        "COLD-SHARD (each task → distinct edge_type)",
+        Pattern::ColdShard,
+    )
+    .await;
 
     Ok(())
 }

@@ -437,10 +437,8 @@ impl DeltaDataset {
     /// `crate::storage::manager::write_batch_with_lance_conflict_retry`.
     pub async fn write_run(&self, backend: &dyn StorageBackend, batch: RecordBatch) -> Result<()> {
         let table_name = table_names::delta_table_name(&self.edge_type, &self.direction);
-        crate::storage::manager::write_batch_with_lance_conflict_retry(
-            backend, &table_name, batch,
-        )
-        .await
+        crate::storage::manager::write_batch_with_lance_conflict_retry(backend, &table_name, batch)
+            .await
     }
 
     /// Ensure a BTree index exists on the 'eid' column.

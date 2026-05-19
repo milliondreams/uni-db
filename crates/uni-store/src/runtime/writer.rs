@@ -3,8 +3,7 @@
 
 use crate::runtime::context::QueryContext;
 use crate::runtime::flush_coordinator::{
-    FinalizeFn, FlushCoordinator, FlushOutcome as AsyncFlushOutcome, RotatedFlush,
-    SharedFlushCtx,
+    FinalizeFn, FlushCoordinator, FlushOutcome as AsyncFlushOutcome, RotatedFlush, SharedFlushCtx,
 };
 use crate::runtime::id_allocator::IdAllocator;
 use crate::runtime::l0::{L0Buffer, serialize_constraint_key};
@@ -21,8 +20,8 @@ use chrono::Utc;
 use metrics;
 use parking_lot::{Mutex as PlMutex, RwLock};
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use tracing::{debug, info, instrument};
 use uni_common::Properties;
 use uni_common::Value;
@@ -154,8 +153,7 @@ pub struct Writer {
     /// opt-in to default (Commit 12), `drop_fork` (Commit 8) handles
     /// the drain explicitly.
     #[allow(dead_code)] // first production use lands in Commit 6/7
-    pub(crate) flush_coordinator:
-        Option<Arc<crate::runtime::flush_coordinator::FlushCoordinator>>,
+    pub(crate) flush_coordinator: Option<Arc<crate::runtime::flush_coordinator::FlushCoordinator>>,
 }
 
 impl Writer {
@@ -576,31 +574,26 @@ impl Writer {
                                 // commits can proceed while the stream runs.
                                 drop(_flush_lock_guard);
                                 let parent_manifest = self.cached_manifest.lock().clone();
-                                let rotated =
-                                    crate::runtime::flush_coordinator::RotatedFlush {
-                                        seq,
-                                        old_l0_arc: rotate_out.old_l0_arc.clone(),
-                                        wal_lsn: rotate_out.wal_lsn,
-                                        current_version: rotate_out.current_version,
-                                        name: None,
-                                        parent_manifest,
-                                        permit,
-                                        flush_in_progress_guard: rotate_out
-                                            .flush_in_progress_guard,
-                                    };
+                                let rotated = crate::runtime::flush_coordinator::RotatedFlush {
+                                    seq,
+                                    old_l0_arc: rotate_out.old_l0_arc.clone(),
+                                    wal_lsn: rotate_out.wal_lsn,
+                                    current_version: rotate_out.current_version,
+                                    name: None,
+                                    parent_manifest,
+                                    permit,
+                                    flush_in_progress_guard: rotate_out.flush_in_progress_guard,
+                                };
                                 let writer = self.clone();
                                 let _ticket = coord.submit_for_stream(
                                     rotated,
                                     move |old_l0, wal, ver, n| async move {
-                                        let outcome = writer
-                                            .flush_stream_l1(old_l0, wal, ver, n)
-                                            .await?;
-                                        Ok(
-                                            crate::runtime::flush_coordinator::FlushOutcome {
-                                                new_manifest: outcome.manifest,
-                                                snapshot_id: outcome.snapshot_id,
-                                            },
-                                        )
+                                        let outcome =
+                                            writer.flush_stream_l1(old_l0, wal, ver, n).await?;
+                                        Ok(crate::runtime::flush_coordinator::FlushOutcome {
+                                            new_manifest: outcome.manifest,
+                                            snapshot_id: outcome.snapshot_id,
+                                        })
                                     },
                                 );
                                 flush_pending = true;
@@ -2270,9 +2263,7 @@ impl Writer {
         // `flush_to_l1` returns, leaving a window where forks branch
         // off pre-write Lance state and lose data.
         if let Some(coord) = self.flush_coordinator.as_ref() {
-            let _ = coord
-                .drain(self.config.drop_fork_drain_timeout)
-                .await;
+            let _ = coord.drain(self.config.drop_fork_drain_timeout).await;
         }
         let _flush_lock_guard = self.flush_lock.lock().await;
         self.flush_inline_under_lock(name).await
@@ -2326,9 +2317,7 @@ impl Writer {
         //    completes (bounded, ~50-500 ms).
         let writer = self.clone();
         let ticket = coord.submit_for_stream(rotated, move |old_l0, wal, ver, n| async move {
-            let outcome = writer
-                .flush_stream_l1(old_l0, wal, ver, n)
-                .await?;
+            let outcome = writer.flush_stream_l1(old_l0, wal, ver, n).await?;
             Ok(crate::runtime::flush_coordinator::FlushOutcome {
                 new_manifest: outcome.manifest,
                 snapshot_id: outcome.snapshot_id,
@@ -2871,7 +2860,10 @@ impl Writer {
                 }
             }
         }
-        Ok(FlushOutcome { manifest, snapshot_id })
+        Ok(FlushOutcome {
+            manifest,
+            snapshot_id,
+        })
     }
 
     /// Composition entry that assumes the caller already holds `flush_lock`.
@@ -3178,7 +3170,7 @@ impl Writer {
     /// labels that exceed growth or age limits. Marks affected indexes as
     /// `Stale` and spawns an async task to schedule the rebuild.
     #[allow(dead_code)] // production path uses _static; kept as the
-                       // documented instance entry point.
+    // documented instance entry point.
     fn schedule_index_rebuilds_if_needed(
         &self,
         manifest: &SnapshotManifest,
@@ -3227,7 +3219,6 @@ impl Writer {
             }
         });
     }
-
 }
 
 /// `FinalizeFn` implementation that the `FlushCoordinator` invokes from
@@ -3243,9 +3234,7 @@ impl FinalizeFn for WriterFinalizer {
         rotated: RotatedFlush,
         outcome: AsyncFlushOutcome,
         shared: SharedFlushCtx,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>> {
         Box::pin(async move {
             // Read initial_size / initial_count from the rotated L0 so
             // we don't have to plumb them through the coordinator
@@ -3277,9 +3266,7 @@ impl FinalizeFn for WriterFinalizer {
         rotated: RotatedFlush,
         err: anyhow::Error,
         _shared: SharedFlushCtx,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = anyhow::Error> + Send + 'a>,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Error> + Send + 'a>> {
         Box::pin(async move {
             tracing::warn!(
                 error = %err,
@@ -3904,15 +3891,9 @@ mod tests {
             StorageManager::new(dir.path().to_str().unwrap(), schema_manager.clone()).await?,
         );
 
-        let writer = Writer::new_with_config(
-            storage,
-            schema_manager,
-            1,
-            UniConfig::default(),
-            None,
-            None,
-        )
-        .await?;
+        let writer =
+            Writer::new_with_config(storage, schema_manager, 1, UniConfig::default(), None, None)
+                .await?;
 
         /// Captures every `Writer` field that *could* be written by a
         /// hot-path mutator (i.e., every non-Arc, non-immutable-after-

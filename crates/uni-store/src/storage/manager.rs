@@ -150,8 +150,8 @@ pub async fn write_batch_with_lance_conflict_retry(
             Ok(()) => return Ok(()),
             Err(e) => {
                 let msg = e.to_string();
-                let is_conflict = msg.contains("Incompatible transaction")
-                    || msg.contains("conflict");
+                let is_conflict =
+                    msg.contains("Incompatible transaction") || msg.contains("conflict");
                 if !is_conflict || attempt == 9 {
                     return Err(e);
                 }

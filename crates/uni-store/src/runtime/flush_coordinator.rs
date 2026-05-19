@@ -113,11 +113,9 @@ impl FlushTicket {
     /// Wait for the flush to finalize. Returns the snapshot id on success.
     pub async fn await_finalize(self) -> anyhow::Result<String> {
         match self.rx {
-            Some(rx) => rx.await.unwrap_or_else(|_| {
-                Err(anyhow::anyhow!(
-                    "flush ticket dropped before completion"
-                ))
-            }),
+            Some(rx) => rx
+                .await
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("flush ticket dropped before completion"))),
             None => Err(anyhow::anyhow!("flush ticket has no completion channel")),
         }
     }
@@ -303,12 +301,7 @@ impl FlushCoordinator {
         run_stream: F,
     ) -> FlushTicket
     where
-        F: FnOnce(
-                Arc<PlRwLock<crate::runtime::l0::L0Buffer>>,
-                u64,
-                u64,
-                Option<String>,
-            ) -> Fut
+        F: FnOnce(Arc<PlRwLock<crate::runtime::l0::L0Buffer>>, u64, u64, Option<String>) -> Fut
             + Send
             + 'static,
         Fut: std::future::Future<Output = anyhow::Result<FlushOutcome>> + Send + 'static,
@@ -366,18 +359,14 @@ pub trait FinalizeFn: Send + Sync {
         rotated: RotatedFlush,
         outcome: FlushOutcome,
         shared: SharedFlushCtx,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send + 'a>,
-    >;
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send + 'a>>;
 
     fn finalize_failure<'a>(
         &'a self,
         rotated: RotatedFlush,
         err: anyhow::Error,
         shared: SharedFlushCtx,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = anyhow::Error> + Send + 'a>,
-    >;
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Error> + Send + 'a>>;
 }
 
 async fn finalizer_loop(

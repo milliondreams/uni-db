@@ -1389,8 +1389,8 @@ fn build_l0_vertex_batch(
                 columns.push(Arc::new(UInt64Array::from(vals)));
             }
             "_created_at" => {
-                let mut builder = arrow_array::builder::TimestampNanosecondBuilder::new()
-                    .with_timezone("UTC");
+                let mut builder =
+                    arrow_array::builder::TimestampNanosecondBuilder::new().with_timezone("UTC");
                 for v in &vids {
                     match vid_created_at.get(v) {
                         Some(&ts) => builder.append_value(ts),
@@ -1400,8 +1400,8 @@ fn build_l0_vertex_batch(
                 columns.push(Arc::new(builder.finish()));
             }
             "_updated_at" => {
-                let mut builder = arrow_array::builder::TimestampNanosecondBuilder::new()
-                    .with_timezone("UTC");
+                let mut builder =
+                    arrow_array::builder::TimestampNanosecondBuilder::new().with_timezone("UTC");
                 for v in &vids {
                     match vid_updated_at.get(v) {
                         Some(&ts) => builder.append_value(ts),
@@ -1589,8 +1589,8 @@ fn build_l0_edge_batch(
                 columns.push(Arc::new(UInt64Array::from(vals)));
             }
             "_created_at" => {
-                let mut builder = arrow_array::builder::TimestampNanosecondBuilder::new()
-                    .with_timezone("UTC");
+                let mut builder =
+                    arrow_array::builder::TimestampNanosecondBuilder::new().with_timezone("UTC");
                 for e in &eids {
                     match eid_created_at.get(e) {
                         Some(&ts) => builder.append_value(ts),
@@ -1600,8 +1600,8 @@ fn build_l0_edge_batch(
                 columns.push(Arc::new(builder.finish()));
             }
             "_updated_at" => {
-                let mut builder = arrow_array::builder::TimestampNanosecondBuilder::new()
-                    .with_timezone("UTC");
+                let mut builder =
+                    arrow_array::builder::TimestampNanosecondBuilder::new().with_timezone("UTC");
                 for e in &eids {
                     match eid_updated_at.get(e) {
                         Some(&ts) => builder.append_value(ts),

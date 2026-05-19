@@ -132,7 +132,8 @@ async fn test_tx_profile_with_params() -> anyhow::Result<()> {
         .await?;
 
     let tx = db.session().tx().await?;
-    tx.execute("CREATE LABEL Item (sku STRING, qty INT)").await?;
+    tx.execute("CREATE LABEL Item (sku STRING, qty INT)")
+        .await?;
     tx.execute("CREATE (:Item {sku: 'A', qty: 1})").await?;
     tx.commit().await?;
 
@@ -145,7 +146,10 @@ async fn test_tx_profile_with_params() -> anyhow::Result<()> {
         .await?;
     tx.commit().await?;
 
-    assert!(res.properties_set() >= 1, "expected at least 1 property set");
+    assert!(
+        res.properties_set() >= 1,
+        "expected at least 1 property set"
+    );
     assert!(
         !prof.runtime_stats.is_empty(),
         "expected runtime_stats to be populated, got empty"

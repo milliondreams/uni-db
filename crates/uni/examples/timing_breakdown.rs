@@ -40,10 +40,8 @@ async fn run_one_task(
     let exec_start = Instant::now();
     for i in 0..STATEMENTS_PER_TASK {
         let s = Instant::now();
-        tx.execute(&format!(
-            "CREATE (n:Person {{idx: {i}, sess: {task_id}}})"
-        ))
-        .await?;
+        tx.execute(&format!("CREATE (n:Person {{idx: {i}, sess: {task_id}}})"))
+            .await?;
         if per_stmt {
             stmt_times.push(s.elapsed());
         }
@@ -73,9 +71,9 @@ async fn one_rep(
     let mut handles = Vec::with_capacity(n_sessions);
     for s in 0..n_sessions {
         let db = db.clone();
-        handles.push(tokio::spawn(async move {
-            run_one_task(db, s, per_stmt).await
-        }));
+        handles.push(tokio::spawn(
+            async move { run_one_task(db, s, per_stmt).await },
+        ));
     }
     let mut per_task = Vec::with_capacity(n_sessions);
     let mut all_stmts = Vec::new();
@@ -110,9 +108,9 @@ async fn main() -> anyhow::Result<()> {
         "\n {:>4}  {:>10}  {:>14}  {:>14}  {:>14}  {:>14}",
         "N", "wall", "exec_mean", "exec_max", "commit_mean", "commit_max"
     );
-    println!(" {:>4}  {:>10}  {:>14}  {:>14}  {:>14}  {:>14}",
-        "-", "----------", "--------------", "--------------",
-        "--------------", "--------------"
+    println!(
+        " {:>4}  {:>10}  {:>14}  {:>14}  {:>14}  {:>14}",
+        "-", "----------", "--------------", "--------------", "--------------", "--------------"
     );
 
     let mut per_stmt_by_n: Vec<(usize, Vec<Duration>)> = Vec::new();

@@ -39,7 +39,8 @@ async fn test_transaction_edge_versions_preserved_in_adjacency() -> Result<()> {
     let storage = Arc::new(
         uni_store::storage::manager::StorageManager::new(path, schema_manager.clone()).await?,
     );
-    let writer = std::sync::Arc::new(Writer::new(storage.clone(), schema_manager.clone(), 1).await?);
+    let writer =
+        std::sync::Arc::new(Writer::new(storage.clone(), schema_manager.clone(), 1).await?);
 
     // Create vertices (outside transaction)
     let vid_src = writer.next_vid().await?;
@@ -170,7 +171,8 @@ async fn test_multiple_transactions_preserve_edge_versions() -> Result<()> {
     let storage = Arc::new(
         uni_store::storage::manager::StorageManager::new(path, schema_manager.clone()).await?,
     );
-    let writer = std::sync::Arc::new(Writer::new(storage.clone(), schema_manager.clone(), 1).await?);
+    let writer =
+        std::sync::Arc::new(Writer::new(storage.clone(), schema_manager.clone(), 1).await?);
 
     // Create vertices (outside transaction)
     let vid_src = writer.next_vid().await?;

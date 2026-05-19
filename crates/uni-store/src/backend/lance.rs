@@ -293,17 +293,13 @@ impl StorageBackend for LanceDbBackend {
         // the per-table write lock).
         if self.table_exists(name).await? {
             let table = self.get_or_open_table(name).await?;
-            table
-                .add(batches)
-                .execute()
-                .await
-                .map_err(|e| {
-                    anyhow!(
-                        "Failed to append (fallback from create) to '{}': {}",
-                        name,
-                        e
-                    )
-                })?;
+            table.add(batches).execute().await.map_err(|e| {
+                anyhow!(
+                    "Failed to append (fallback from create) to '{}': {}",
+                    name,
+                    e
+                )
+            })?;
             return Ok(());
         }
         self.connection

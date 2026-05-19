@@ -106,7 +106,10 @@ async fn main() -> anyhow::Result<()> {
                 }
                 Ok(Err(e)) => println!("  rep {}: ERROR: {}", rep, e),
                 Err(_) => {
-                    println!("  rep {}: TIMEOUT after 60s — async-flush MVP is pathological", rep);
+                    println!(
+                        "  rep {}: TIMEOUT after 60s — async-flush MVP is pathological",
+                        rep
+                    );
                     break;
                 }
             }

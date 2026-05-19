@@ -303,10 +303,8 @@ impl VertexDataset {
         _schema: &Schema,
     ) -> Result<()> {
         let table_name = table_names::vertex_table_name(&self.label);
-        crate::storage::manager::write_batch_with_lance_conflict_retry(
-            backend, &table_name, batch,
-        )
-        .await
+        crate::storage::manager::write_batch_with_lance_conflict_retry(backend, &table_name, batch)
+            .await
     }
 
     /// Ensure default scalar indexes exist on system columns (_vid, _uid, ext_id).

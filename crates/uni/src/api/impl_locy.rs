@@ -126,7 +126,10 @@ pub(crate) async fn evaluate_with_db_and_config(
     // - DERIVE visibility: trailing Cypher sees DERIVE mutations
     // - ASSUME/ABDUCE isolation: fork/restore from this buffer
     // Read-only DB returns None and degrades gracefully.
-    let locy_l0 = db.writer.as_ref().map(|writer| writer.create_transaction_l0());
+    let locy_l0 = db
+        .writer
+        .as_ref()
+        .map(|writer| writer.create_transaction_l0());
     let engine = LocyEngine {
         db,
         tx_l0_override: locy_l0.clone(),

@@ -26,15 +26,14 @@ use anyhow::Result;
 use uni_common::config::UniConfig;
 use uni_db::{DataType, Uni};
 
-async fn build_async_db(
-    threshold: usize,
-    max_pending: usize,
-) -> Result<Arc<Uni>> {
-    let mut config = UniConfig::default();
-    config.auto_flush_threshold = threshold;
-    config.auto_flush_interval = None;
-    config.async_flush_enabled = true;
-    config.max_pending_flushes = max_pending;
+async fn build_async_db(threshold: usize, max_pending: usize) -> Result<Arc<Uni>> {
+    let config = UniConfig {
+        auto_flush_threshold: threshold,
+        auto_flush_interval: None,
+        async_flush_enabled: true,
+        max_pending_flushes: max_pending,
+        ..Default::default()
+    };
     let db = Arc::new(Uni::in_memory().config(config).build().await?);
     db.schema()
         .label("Person")
@@ -92,9 +91,16 @@ async fn async_flush_visibility_after_drain() -> Result<()> {
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    let result = db.session().query("MATCH (p:Person) RETURN count(p) AS c").await?;
+    let result = db
+        .session()
+        .query("MATCH (p:Person) RETURN count(p) AS c")
+        .await?;
     let c: i64 = result.rows()[0].get("c")?;
-    assert_eq!(c as usize, total * per_tx, "all vertices visible after drain");
+    assert_eq!(
+        c as usize,
+        total * per_tx,
+        "all vertices visible after drain"
+    );
     Ok(())
 }
 
@@ -117,14 +123,20 @@ async fn async_flush_backpressure_max_pending_one() -> Result<()> {
     }
     for _ in 0..20 {
         db.flush().await?;
-        let result = db.session().query("MATCH (p:Person) RETURN count(p) AS c").await?;
+        let result = db
+            .session()
+            .query("MATCH (p:Person) RETURN count(p) AS c")
+            .await?;
         let c: i64 = result.rows()[0].get("c")?;
         if c == 50 {
             return Ok(());
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    let result = db.session().query("MATCH (p:Person) RETURN count(p) AS c").await?;
+    let result = db
+        .session()
+        .query("MATCH (p:Person) RETURN count(p) AS c")
+        .await?;
     let c: i64 = result.rows()[0].get("c")?;
     assert_eq!(c, 50);
     Ok(())

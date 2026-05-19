@@ -914,8 +914,8 @@ async fn build_edge_columns(
             // common case where the queried edges are L0-resident in the
             // same session.
             if prop_name == "_created_at" || prop_name == "_updated_at" {
-                let mut builder = arrow_array::builder::TimestampNanosecondBuilder::new()
-                    .with_timezone("UTC");
+                let mut builder =
+                    arrow_array::builder::TimestampNanosecondBuilder::new().with_timezone("UTC");
                 let l0_ctx = graph_ctx.l0_context();
                 for eid in &eids {
                     let mut value: Option<i64> = None;

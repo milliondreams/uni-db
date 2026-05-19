@@ -205,10 +205,8 @@ impl MainEdgeDataset {
     /// `crate::storage::manager::write_batch_with_lance_conflict_retry`.
     pub async fn write_batch(backend: &dyn StorageBackend, batch: RecordBatch) -> Result<()> {
         let table_name = table_names::main_edge_table_name();
-        crate::storage::manager::write_batch_with_lance_conflict_retry(
-            backend, table_name, batch,
-        )
-        .await
+        crate::storage::manager::write_batch_with_lance_conflict_retry(backend, table_name, batch)
+            .await
     }
 
     /// Ensure default indexes exist on the main edges table.

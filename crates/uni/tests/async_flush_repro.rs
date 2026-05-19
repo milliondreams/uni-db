@@ -40,7 +40,7 @@ async fn build_db_with_async(
     let db = Arc::new(Uni::in_memory().config(config).build().await?);
     for label in labels {
         db.schema()
-            .label(*label)
+            .label(label)
             .property("name", DataType::String)
             .apply()
             .await?;
@@ -108,7 +108,11 @@ async fn r1_single_stream_async_serialized() -> Result<()> {
     let db = build_db_with_async(1000, 1, &["Person"]).await?;
     write_vertices(&db, "Person", 10_000, 50, "p").await?;
     let observed = drain_and_count(&db, "Person", 10_000).await?;
-    assert_eq!(observed, 10_000, "R1 expected 10000 vertices, observed {}", observed);
+    assert_eq!(
+        observed, 10_000,
+        "R1 expected 10000 vertices, observed {}",
+        observed
+    );
     Ok(())
 }
 
@@ -124,7 +128,10 @@ async fn r1_no_query_during_drain() -> Result<()> {
         db.flush().await?;
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    let result = db.session().query("MATCH (n:Person) RETURN count(n) AS c").await?;
+    let result = db
+        .session()
+        .query("MATCH (n:Person) RETURN count(n) AS c")
+        .await?;
     let c: i64 = result.rows()[0].get("c")?;
     assert_eq!(c, 10_000, "R1_no_query expected 10000, observed {}", c);
     Ok(())
@@ -142,7 +149,10 @@ async fn r1_diag_which_batch_missing() -> Result<()> {
         db.flush().await?;
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    let total_r = db.session().query("MATCH (n:Person) RETURN count(n) AS c").await?;
+    let total_r = db
+        .session()
+        .query("MATCH (n:Person) RETURN count(n) AS c")
+        .await?;
     let total: i64 = total_r.rows()[0].get("c")?;
     eprintln!("REPRO-DIAG total={}", total);
     // 10000 / 50 = 200 transactions
@@ -179,7 +189,11 @@ async fn r0_baseline_sync_flush() -> Result<()> {
         .await?;
     write_vertices(&db, "Person", 10_000, 50, "p").await?;
     let observed = drain_and_count(&db, "Person", 10_000).await?;
-    assert_eq!(observed, 10_000, "R0 expected 10000 vertices, observed {}", observed);
+    assert_eq!(
+        observed, 10_000,
+        "R0 expected 10000 vertices, observed {}",
+        observed
+    );
     Ok(())
 }
 
@@ -191,7 +205,11 @@ async fn r2_concurrent_streams_single_table() -> Result<()> {
     let db = build_db_with_async(1000, 4, &["Person"]).await?;
     write_vertices(&db, "Person", 10_000, 50, "p").await?;
     let observed = drain_and_count(&db, "Person", 10_000).await?;
-    assert_eq!(observed, 10_000, "R2 expected 10000 vertices, observed {}", observed);
+    assert_eq!(
+        observed, 10_000,
+        "R2 expected 10000 vertices, observed {}",
+        observed
+    );
     Ok(())
 }
 
@@ -210,7 +228,8 @@ async fn r3_concurrent_streams_multiple_tables() -> Result<()> {
         let observed = drain_and_count(&db, label, per_label).await?;
         assert_eq!(
             observed, per_label as i64,
-            "R3[{}] expected {}, observed {}", label, per_label, observed
+            "R3[{}] expected {}, observed {}",
+            label, per_label, observed
         );
     }
     Ok(())

@@ -139,6 +139,15 @@ pub struct FlushCoordinator {
     /// Tracked for `ShutdownHandle::track_task` registration AND for
     /// `shutdown()`'s await. Set to None after either takes it.
     finalizer_handle: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Every spawned stream-phase task. `shutdown()` awaits each so
+    /// the closure-captured `Arc<Writer>` (and through it
+    /// `Arc<StorageManager>` + `Arc<ForkScope>` on a fork-scoped
+    /// writer) actually drops before `shutdown` returns. Without this,
+    /// `drop_fork` sees a transient `ForkInUse` because the stream
+    /// task's destructor is still on tokio's scheduler queue after
+    /// `drain()` returned. Opportunistically pruned in
+    /// `submit_for_stream` to keep the vec bounded.
+    stream_handles: parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 impl FlushCoordinator {
@@ -171,6 +180,7 @@ impl FlushCoordinator {
             drain_notify,
             max_pending_flushes,
             finalizer_handle: parking_lot::Mutex::new(Some(handle)),
+            stream_handles: parking_lot::Mutex::new(Vec::new()),
         }
     }
 
@@ -182,10 +192,19 @@ impl FlushCoordinator {
     /// ForkHolderGuard can finally drop. Idempotent: safe to call
     /// repeatedly.
     pub async fn shutdown(&self) {
-        // 1. Drop submit_tx — closes the mpsc; the finalizer task will
+        // 1. Drain every spawned stream task. Each task's destructor
+        //    drops the closure-captured `Arc<Writer>` (and through it
+        //    `Arc<StorageManager>` / `Arc<ForkScope>`). Awaiting forces
+        //    those drops to happen before we return — closing the L8
+        //    fork-drop race documented in the plan.
+        let stream_handles: Vec<_> = self.stream_handles.lock().drain(..).collect();
+        for h in stream_handles {
+            let _ = h.await;
+        }
+        // 2. Drop submit_tx — closes the mpsc; the finalizer task will
         //    receive None and exit its loop.
         drop(self.submit_tx.lock().take());
-        // 2. Await the finalizer task. If already taken (e.g. by
+        // 3. Await the finalizer task. If already taken (e.g. by
         //    ShutdownHandle::track_task), the JoinHandle is None and we
         //    have no way to await — accept that and return; the task
         //    is still on its way to exit because submit_tx is closed.
@@ -301,12 +320,18 @@ impl FlushCoordinator {
         let wal_lsn = rotated.wal_lsn;
         let current_version = rotated.current_version;
         let name = rotated.name.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let result = run_stream(old_l0, wal_lsn, current_version, name).await;
             coord.submit(seq, rotated, result, Some(ack_tx));
             // `coord` Arc clone drops here, but the strong refcount stays
             // > 0 because the original is still held on Writer.
         });
+        // Track the handle so `shutdown()` can await all stream tasks'
+        // destructors. Opportunistically prune finished handles to keep
+        // the vec bounded under high flush rates.
+        let mut handles = self.stream_handles.lock();
+        handles.retain(|h| !h.is_finished());
+        handles.push(handle);
         FlushTicket::pending(ack_rx)
     }
 

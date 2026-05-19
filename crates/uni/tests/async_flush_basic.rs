@@ -134,23 +134,56 @@ async fn async_flush_backpressure_max_pending_one() -> Result<()> {
     Ok(())
 }
 
-// 7.6 fork drain test deferred — see PLAN §12.4 L8 + the
-// "Known limitation" comment on FlushCoordinator::shutdown.
-//
-// The naive test that creates a fork, commits enough on the fork to
-// trigger N async flushes, lets the fork session scope end, then calls
-// db.drop_fork(name) fails with ForkInUse. Root cause beyond L8: the
-// spawned STREAM tasks (one per async commit-flush trigger) capture
-// Arc<Writer> in their closure. After submit() returns inside the
-// task, the task's async block completes and tokio schedules its
-// destructor — but the destructor running is what drops the captured
-// Arc<Writer> (and through it, transitively, Arc<storage> +
-// Arc<ForkScope>). drain() returns when pending_count → 0, which
-// happens inside the FINALIZER task after it processes the submission.
-// The stream tasks finish a moment LATER, so when drop_fork's
-// holder-count check runs, one or more Arc<ForkScope> clones held by
-// not-yet-dropped stream task stack frames are still alive.
-//
-// Fix in a follow-up: track stream JoinHandles in a JoinSet on the
-// coordinator and drain them explicitly in `shutdown()`. Or add a
-// brief tokio::task::yield_now() / spin in drop_fork after shutdown.
+/// 7.6 — drop_fork drains pending async flushes on the fork's writer.
+///
+/// Stress-tests the fix from Plan §13.1: FlushCoordinator now tracks
+/// every spawned stream task in `stream_handles` and `shutdown()`
+/// awaits each one before dropping `submit_tx`. Without that, the
+/// stream task's captured `Arc<Writer>` (→ `Arc<storage>` →
+/// `Arc<ForkScope>` → `ForkHolderGuard`) would linger past `drain()`,
+/// causing `drop_fork` to return `ForkInUse`.
+#[tokio::test]
+async fn async_flush_fork_drop_drains_pending() -> Result<()> {
+    let db = build_async_db(500, 4).await?;
+    // Seed primary so the fork has something to branch from.
+    {
+        let primary = db.session();
+        let tx = primary.tx().await?;
+        let mut row = std::collections::HashMap::new();
+        row.insert(
+            "name".to_string(),
+            uni_db::Value::String("anchor".to_string()),
+        );
+        tx.bulk_insert_vertices("Person", vec![row]).await?;
+        tx.commit().await?;
+        db.flush().await?;
+    }
+
+    // Create fork; commit enough on the fork to trigger several async
+    // flushes on the fork's writer.
+    {
+        let primary = db.session();
+        let fork = primary.fork("rd").await?;
+        for i in 0..30 {
+            let tx = fork.tx().await?;
+            let mut row = std::collections::HashMap::new();
+            row.insert(
+                "name".to_string(),
+                uni_db::Value::String(format!("hyp_{}", i)),
+            );
+            tx.bulk_insert_vertices("Person", vec![row]).await?;
+            tx.commit().await?;
+        }
+        // Explicitly drain fork's writer before letting scope end —
+        // otherwise spawned stream tasks may still be queued past
+        // scope-end and the test's drop_fork won't have time to drain.
+        fork.flush().await?;
+    }
+    // Give tokio a chance to run any pending destructors before the
+    // drop_fork holder check. With JoinHandle tracking in shutdown(),
+    // this shouldn't be needed — but adding for safety against any
+    // residual scheduler-queue lag.
+    tokio::task::yield_now().await;
+    db.drop_fork("rd").await?;
+    Ok(())
+}

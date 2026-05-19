@@ -40,7 +40,7 @@ async fn test_batch_insert_and_flush() {
         .unwrap(),
     );
 
-    let mut writer = Writer::new(storage.clone(), schema_manager.clone(), 0)
+    let writer = Writer::new(storage.clone(), schema_manager.clone(), 0)
         .await
         .unwrap();
 

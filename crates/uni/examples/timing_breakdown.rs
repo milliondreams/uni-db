@@ -24,6 +24,9 @@ const SESSIONS_SWEEP: &[usize] = &[1, 4, 12, 24];
 struct TaskTiming {
     execute: Duration,
     commit: Duration,
+    /// Wall-time of the whole task. Populated for inspection / future
+    /// aggregation; currently unused at print time.
+    #[allow(dead_code)]
     total: Duration,
 }
 

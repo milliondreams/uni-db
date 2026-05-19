@@ -683,7 +683,7 @@ impl Executor {
                 // Pre-allocate one EID per row in one IdAllocator mutex acquisition.
                 let eids = writer.allocate_eids(num_rows).await?;
 
-                for row_idx in 0..num_rows {
+                for (row_idx, &eid) in eids.iter().enumerate().take(num_rows) {
                     let mut properties = HashMap::new();
                     let mut src_vid: Option<Vid> = None;
                     let mut dst_vid: Option<Vid> = None;
@@ -719,7 +719,7 @@ impl Executor {
                             src,
                             dst,
                             edge_type_id,
-                            eids[row_idx],
+                            eid,
                             properties,
                             Some(label.to_string()),
                             None,
@@ -760,7 +760,7 @@ impl Executor {
                 let vids = writer.allocate_vids(num_rows).await?;
 
                 // Convert Arrow batch to rows
-                for row_idx in 0..num_rows {
+                for (row_idx, &vid) in vids.iter().enumerate().take(num_rows) {
                     let mut properties = HashMap::new();
 
                     // Extract properties from each column
@@ -781,12 +781,7 @@ impl Executor {
                     }
 
                     let _ = writer
-                        .insert_vertex_with_labels(
-                            vids[row_idx],
-                            properties,
-                            &[label.to_string()],
-                            None,
-                        )
+                        .insert_vertex_with_labels(vid, properties, &[label.to_string()], None)
                         .await?;
 
                     total_rows += 1;

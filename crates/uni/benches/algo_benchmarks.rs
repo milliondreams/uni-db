@@ -13,7 +13,6 @@ use std::env;
 use std::sync::Arc;
 use tempfile::tempdir;
 use tokio::runtime::Runtime;
-use tokio::sync::RwLock;
 use uni_cypher::parse;
 use uni_db::UniConfig;
 use uni_db::core::id::Vid;
@@ -114,7 +113,9 @@ impl AlgoBenchContext {
     }
 
     async fn populate_random_graph(&self, nodes: usize, edges_per_node: usize) {
-        let mut w = self.writer.write().await;
+        // Writer is no longer wrapped in RwLock since the concurrent_writer
+        // Phase 4 refactor — methods take `&self` and synchronize internally.
+        let w = &self.writer;
         let _node_lbl = self.schema_manager.schema().labels["Node"].id;
         let link_type = self.schema_manager.schema().edge_types["LINK"].id;
 

@@ -44,8 +44,8 @@ async fn test_created_at_on_node_after_create() -> Result<()> {
     assert_eq!(res.len(), 1);
     let c = res.rows()[0].value("c").unwrap();
     let u = res.rows()[0].value("u").unwrap();
-    let c_ns = extract_nanos(&c).expect("created_at should be a DateTime");
-    let u_ns = extract_nanos(&u).expect("updated_at should be a DateTime");
+    let c_ns = extract_nanos(c).expect("created_at should be a DateTime");
+    let u_ns = extract_nanos(u).expect("updated_at should be a DateTime");
     assert!(c_ns > 0);
     // For a fresh node, created_at and updated_at are set within the same
     // tx — same wall-clock millisecond in practice, but a CREATE may
@@ -76,8 +76,8 @@ async fn test_updated_at_advances_after_set() -> Result<()> {
         .session()
         .query("MATCH (n:Person {name: 'Bob'}) RETURN created_at(n) AS c, updated_at(n) AS u")
         .await?;
-    let c1 = extract_nanos(&res.rows()[0].value("c").unwrap()).unwrap();
-    let u1 = extract_nanos(&res.rows()[0].value("u").unwrap()).unwrap();
+    let c1 = extract_nanos(res.rows()[0].value("c").unwrap()).unwrap();
+    let u1 = extract_nanos(res.rows()[0].value("u").unwrap()).unwrap();
 
     // Sleep to make sure the wall clock advances enough to observe.
     tokio::time::sleep(Duration::from_millis(5)).await;
@@ -91,8 +91,8 @@ async fn test_updated_at_advances_after_set() -> Result<()> {
         .session()
         .query("MATCH (n:Person {name: 'Bob'}) RETURN created_at(n) AS c, updated_at(n) AS u")
         .await?;
-    let c2 = extract_nanos(&res.rows()[0].value("c").unwrap()).unwrap();
-    let u2 = extract_nanos(&res.rows()[0].value("u").unwrap()).unwrap();
+    let c2 = extract_nanos(res.rows()[0].value("c").unwrap()).unwrap();
+    let u2 = extract_nanos(res.rows()[0].value("u").unwrap()).unwrap();
 
     assert_eq!(c1, c2, "created_at must not change after SET");
     assert!(
@@ -160,8 +160,8 @@ async fn test_edge_created_updated_at() -> Result<()> {
              RETURN created_at(r) AS c, updated_at(r) AS u",
         )
         .await?;
-    let c2 = extract_nanos(&res.rows()[0].value("c").unwrap()).unwrap();
-    let u2 = extract_nanos(&res.rows()[0].value("u").unwrap()).unwrap();
+    let c2 = extract_nanos(res.rows()[0].value("c").unwrap()).unwrap();
+    let u2 = extract_nanos(res.rows()[0].value("u").unwrap()).unwrap();
     assert_eq!(c, c2);
     assert!(u2 > u);
     Ok(())
@@ -221,7 +221,7 @@ async fn test_tx_local_created_at_visible() -> Result<()> {
     let res = tx
         .query("MATCH (n:Person {name: 'Eve'}) RETURN created_at(n) AS c")
         .await?;
-    let c = extract_nanos(&res.rows()[0].value("c").unwrap())
+    let c = extract_nanos(res.rows()[0].value("c").unwrap())
         .expect("tx-local created_at must be visible");
     assert!(c > 0);
     tx.commit().await?;

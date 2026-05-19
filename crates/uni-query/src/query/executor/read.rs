@@ -4233,7 +4233,7 @@ impl Executor {
                 let num_rows = batch.num_rows();
                 // Pre-allocate one VID per row in one IdAllocator mutex acquisition.
                 let vids = writer.allocate_vids(num_rows).await?;
-                for row in 0..num_rows {
+                for (row, &vid) in vids.iter().enumerate().take(num_rows) {
                     let mut props = HashMap::new();
                     for field in batch.schema().fields() {
                         let name = field.name();
@@ -4249,7 +4249,7 @@ impl Executor {
                         }
                     }
                     writer
-                        .insert_vertex_with_labels(vids[row], props, &[target.to_string()], None)
+                        .insert_vertex_with_labels(vid, props, &[target.to_string()], None)
                         .await?;
                     count += 1;
                 }
@@ -4275,7 +4275,7 @@ impl Executor {
                 let num_rows = batch.num_rows();
                 // Pre-allocate one EID per row in one IdAllocator mutex acquisition.
                 let eids = writer.allocate_eids(num_rows).await?;
-                for row in 0..num_rows {
+                for (row, &eid) in eids.iter().enumerate().take(num_rows) {
                     let mut props = HashMap::new();
                     let mut src_vid = None;
                     let mut dst_vid = None;
@@ -4312,7 +4312,7 @@ impl Executor {
                             src,
                             dst,
                             type_id,
-                            eids[row],
+                            eid,
                             props,
                             Some(target.to_string()),
                             None,

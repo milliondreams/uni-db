@@ -1568,7 +1568,7 @@ impl Writer {
 
     #[instrument(skip(self, properties), level = "trace")]
     pub async fn insert_vertex(
-        &mut self,
+        &self,
         vid: Vid,
         properties: Properties,
         tx_l0: Option<&Arc<RwLock<L0Buffer>>>,

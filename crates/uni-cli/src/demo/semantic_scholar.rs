@@ -84,7 +84,7 @@ pub async fn import_semantic_scholar(
     let mut count = 0;
 
     {
-        let mut w = writer.write().await;
+        let w = writer.write().await;
 
         while let Some(line) = lines.next_line().await? {
             let json: Value = serde_json::from_str(&line)?;
@@ -123,7 +123,7 @@ pub async fn import_semantic_scholar(
     }
     println!("\nFlushing papers...");
     {
-        let mut w = writer.write().await;
+        let w = writer.write().await;
         w.flush_to_l1(None).await?;
     }
 
@@ -135,7 +135,7 @@ pub async fn import_semantic_scholar(
 
     let mut count = 0;
     {
-        let mut w = writer.write().await;
+        let w = writer.write().await;
 
         while let Some(line) = lines.next_line().await? {
             let json: Value = serde_json::from_str(&line)?;
@@ -174,7 +174,7 @@ pub async fn import_semantic_scholar(
     }
     println!("\nFlushing citations...");
     {
-        let mut w = writer.write().await;
+        let w = writer.write().await;
         w.flush_to_l1(None).await?;
     }
 

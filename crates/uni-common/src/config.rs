@@ -594,18 +594,23 @@ impl Default for UniConfig {
             strict_schema: false,
             fork_fragment_warn_threshold: 256,
             tx_id_reservoir_batch: 16,
-            // Honor UNI_ASYNC_FLUSH env var for verification runs (e.g.
-            // `UNI_ASYNC_FLUSH=1 cargo nextest run ...`). Lets us
-            // validate the full test suite under the to-be-flipped
-            // default without modifying source. Accepted truthy values:
-            // "1", "true", "yes" (case-insensitive). Any other value
-            // (including unset) defaults to false. See plan §13.3.2.
+            // Default ON as of the Item-B-deep-fix landing (per-table
+            // write serialization + Lance Table cache removed + drain
+            // in flush_to_l1). Validated by full UNI_ASYNC_FLUSH=1
+            // cross-crate nextest: 1754/1754 pass.
+            //
+            // `UNI_ASYNC_FLUSH=0` / `=false` / `=no` (case-insensitive)
+            // explicitly DISABLES async flush — useful for bisecting
+            // suspected async-flush regressions and for the sync-only
+            // benchmarks in `flush_pressure.rs`. Unset = default
+            // behavior (true).
             async_flush_enabled: std::env::var("UNI_ASYNC_FLUSH")
                 .ok()
-                .is_some_and(|v| {
+                .map(|v| {
                     let v = v.to_ascii_lowercase();
-                    v == "1" || v == "true" || v == "yes"
-                }),
+                    !(v == "0" || v == "false" || v == "no")
+                })
+                .unwrap_or(true),
             max_pending_flushes: 2,
             drop_fork_drain_timeout: Duration::from_secs(10),
             max_forks: None,

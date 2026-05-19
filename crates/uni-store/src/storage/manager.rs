@@ -119,6 +119,51 @@ impl Drop for FlushInProgressGuard {
     }
 }
 
+/// Race-safe write: creates the table if missing, otherwise appends.
+/// Retries with exponential backoff on Lance "Incompatible transaction"
+/// errors, which fire under async-flush when ≥2 streams concurrently
+/// try to create the same table OR when an Append races with a still-
+/// in-progress Overwrite (create_table). Each retry re-checks
+/// `table_exists` and adjusts strategy: Append if now-exists, Create
+/// if still-missing. Up to 10 attempts (~10s worst case).
+///
+/// Used by every dataset's `write_batch` helper to absorb the Lance
+/// commit-conflict-resolver behavior described in
+/// `lance-3.0.1/src/io/commit/conflict_resolver.rs`. RecordBatch
+/// clones are cheap (column data is Arc'd).
+pub async fn write_batch_with_lance_conflict_retry(
+    backend: &dyn crate::backend::StorageBackend,
+    table_name: &str,
+    batch: arrow_array::RecordBatch,
+) -> anyhow::Result<()> {
+    use crate::backend::types::WriteMode;
+    for attempt in 0u32..10 {
+        let exists = backend.table_exists(table_name).await?;
+        let result = if exists {
+            backend
+                .write(table_name, vec![batch.clone()], WriteMode::Append)
+                .await
+        } else {
+            backend.create_table(table_name, vec![batch.clone()]).await
+        };
+        match result {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                let msg = e.to_string();
+                let is_conflict = msg.contains("Incompatible transaction")
+                    || msg.contains("conflict");
+                if !is_conflict || attempt == 9 {
+                    return Err(e);
+                }
+                // Exponential backoff: 1ms, 2ms, 4ms, ..., 512ms.
+                let backoff_ms = 1u64 << attempt;
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+            }
+        }
+    }
+    unreachable!("retry loop exits via Ok or Err")
+}
+
 /// Helper to manage compaction_in_progress flag
 struct CompactionGuard {
     status: Arc<Mutex<CompactionStatus>>,

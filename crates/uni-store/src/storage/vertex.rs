@@ -3,7 +3,7 @@
 
 use crate::backend::StorageBackend;
 use crate::backend::table_names;
-use crate::backend::types::{ScalarIndexType, WriteMode};
+use crate::backend::types::ScalarIndexType;
 use crate::storage::arrow_convert::build_timestamp_column_from_vid_map;
 use crate::storage::property_builder::PropertyColumnBuilder;
 use anyhow::{Result, anyhow};
@@ -294,6 +294,8 @@ impl VertexDataset {
     /// Write a batch to a vertex table.
     ///
     /// Creates the table if it doesn't exist, otherwise appends to it.
+    /// Race-safe under async-flush — see
+    /// `crate::storage::manager::write_batch_with_lance_conflict_retry`.
     pub async fn write_batch(
         &self,
         backend: &dyn StorageBackend,
@@ -301,13 +303,10 @@ impl VertexDataset {
         _schema: &Schema,
     ) -> Result<()> {
         let table_name = table_names::vertex_table_name(&self.label);
-        if backend.table_exists(&table_name).await? {
-            backend
-                .write(&table_name, vec![batch], WriteMode::Append)
-                .await
-        } else {
-            backend.create_table(&table_name, vec![batch]).await
-        }
+        crate::storage::manager::write_batch_with_lance_conflict_retry(
+            backend, &table_name, batch,
+        )
+        .await
     }
 
     /// Ensure default scalar indexes exist on system columns (_vid, _uid, ext_id).

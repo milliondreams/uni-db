@@ -323,8 +323,6 @@ impl FlushCoordinator {
         let handle = tokio::spawn(async move {
             let result = run_stream(old_l0, wal_lsn, current_version, name).await;
             coord.submit(seq, rotated, result, Some(ack_tx));
-            // `coord` Arc clone drops here, but the strong refcount stays
-            // > 0 because the original is still held on Writer.
         });
         // Track the handle so `shutdown()` can await all stream tasks'
         // destructors. Opportunistically prune finished handles to keep

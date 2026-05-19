@@ -44,21 +44,24 @@ async fn build_async_db(
     Ok(db)
 }
 
-// NOTE — visibility under concurrent async flushes is currently
-// flaky. The parent-snapshot fixup landed in Commit 10 closes the
-// race between sync `db.flush()` and async coordinator-finalizes
-// when the orderings are well-spaced, but rapid-fire concurrent
-// flushes (10+ in flight) can still produce a manifest chain where
-// a Lance dataset version was claimed by an earlier flush whose
-// finalize lost the cached_manifest race with a later flush. The
-// deferred fix is to also coordinate Lance dataset version
-// allocation through the FlushCoordinator (so each stream gets a
-// reserved version slice before writing). Until then, this test
-// asserts "at least 90% visible after drain" — enough to catch a
-// regression in the happy-path while letting us land the rest of
-// the wiring.
+// NOTE — visibility under concurrent async flushes is still flaky
+// after Item B's retry fix landed. The Lance write race
+// ("Incompatible transaction" on concurrent create_table / append
+// from multiple streams) is now handled by
+// `write_batch_with_lance_conflict_retry` — every stream returns
+// ok=true. But ~1 batch (1000 rows) is still consistently missing
+// from the query result. This indicates the residual bug is on the
+// READ side, not the WRITE side: data is in Lance but the reader's
+// view (driven by cached_manifest + LabelSnapshot.lance_version,
+// which is hardcoded to 0 today) doesn't see the latest version.
+//
+// Likely fix path: have flush_stream_l1 record the actual Lance
+// dataset.version() after the write (instead of the hardcoded 0
+// sentinel) and have the read path open the dataset at that exact
+// version. Requires Lance API exposure check + read-path changes.
+// Deferred to a follow-up commit.
 #[tokio::test]
-#[ignore = "flaky pending Lance-version coordination — see comment above"]
+#[ignore = "flaky pending Lance dataset-version coordination — see comment above"]
 async fn async_flush_visibility_after_drain() -> Result<()> {
     // 200 commits × 50 vertices = 10_000 mutations; threshold=1000 should
     // trigger ~10 async flushes.

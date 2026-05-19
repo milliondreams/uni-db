@@ -17,7 +17,7 @@
 
 use crate::backend::StorageBackend;
 use crate::backend::table_names;
-use crate::backend::types::{ScalarIndexType, ScanRequest, WriteMode};
+use crate::backend::types::{ScalarIndexType, ScanRequest};
 use crate::storage::arrow_convert::build_timestamp_column_from_vid_map;
 use anyhow::{Result, anyhow};
 use arrow_array::builder::{
@@ -203,16 +203,14 @@ impl MainVertexDataset {
     /// Write a batch to the main vertices table.
     ///
     /// Creates the table if it doesn't exist, otherwise appends to it.
+    /// Race-safe under async-flush concurrent writes — see
+    /// `crate::storage::manager::write_batch_with_lance_conflict_retry`.
     pub async fn write_batch(backend: &dyn StorageBackend, batch: RecordBatch) -> Result<()> {
         let table_name = table_names::main_vertex_table_name();
-
-        if backend.table_exists(table_name).await? {
-            backend
-                .write(table_name, vec![batch], WriteMode::Append)
-                .await
-        } else {
-            backend.create_table(table_name, vec![batch]).await
-        }
+        crate::storage::manager::write_batch_with_lance_conflict_retry(
+            backend, table_name, batch,
+        )
+        .await
     }
 
     /// Ensure default indexes exist on the main vertices table.

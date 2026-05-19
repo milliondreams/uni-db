@@ -565,6 +565,33 @@ impl Uni {
             // when ForkScope drops, which happens once storage Arc → 0.
             drop(inner);
         }
+        // Wait for the fork's holder_count to drop to zero. Under async-
+        // flush, the fork's FlushCoordinator's finalizer task is an
+        // orphan tokio task that holds Arc<StorageManager> via
+        // SharedFlushCtx. Storage pins Arc<ForkScope> which holds the
+        // ForkHolderGuard. When the fork's Session drops at scope-end,
+        // UniInner drops (so the `weak.upgrade()` above returns None
+        // and we never enter the drain/shutdown branch), but the orphan
+        // finalizer task is STILL alive in tokio's queue holding the
+        // chain that ultimately pins the holder counter at 1.
+        //
+        // The fix is to wait: the orphan task exits the moment its
+        // mpsc receiver sees a closed channel, which happens when
+        // FlushCoordinator drops submit_tx in its own Drop. That Drop
+        // ran transitively when UniInner dropped, but the spawned
+        // task's destructor may still be pending in the scheduler
+        // queue. yield_now repeatedly lets the runtime work through
+        // those destructors before we check holder_count.
+        for i in 0..100 {
+            if self.inner.fork_registry.holder_count_for(preview.id).await == 0 {
+                break;
+            }
+            if i < 20 {
+                tokio::task::yield_now().await;
+            } else {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
         let info = self.inner.fork_registry.begin_drop(name).await?;
         // Phase 2 Day 8: evict the cached `Weak<UniInner>` (if any)
         // before deleting branches. The registry has already
@@ -631,6 +658,12 @@ impl Uni {
 
         // 2. Pre-validate every node. Aggregate blockers; refuse before
         // tombstoning if any node is held or has in-flight tx.
+        //
+        // Under async-flush, holder_count may transiently sit at 1 for a
+        // brief window after the last session drops, while orphan
+        // FlushCoordinator finalizer tasks finish exiting (they hold
+        // Arc<storage> → Arc<ForkScope> → ForkHolderGuard). Apply the
+        // same bounded wait we use in `drop_fork`.
         let mut blockers: Vec<String> = Vec::new();
         for node in &order {
             if let Some(weak) = self
@@ -644,7 +677,21 @@ impl Uni {
                 blockers.push(format!("{}: in-flight tx", node.name));
                 continue;
             }
-            let holders = self.inner.fork_registry.holder_count_for(node.id).await;
+            // Wait briefly for orphan finalizer tasks to exit.
+            let mut holders = self.inner.fork_registry.holder_count_for(node.id).await;
+            if holders > 0 {
+                for i in 0..100 {
+                    if i < 20 {
+                        tokio::task::yield_now().await;
+                    } else {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    holders = self.inner.fork_registry.holder_count_for(node.id).await;
+                    if holders == 0 {
+                        break;
+                    }
+                }
+            }
             if holders > 0 {
                 blockers.push(format!("{}: {} live session(s)", node.name, holders));
             }

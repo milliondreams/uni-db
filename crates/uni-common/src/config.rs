@@ -594,7 +594,18 @@ impl Default for UniConfig {
             strict_schema: false,
             fork_fragment_warn_threshold: 256,
             tx_id_reservoir_batch: 16,
-            async_flush_enabled: false,
+            // Honor UNI_ASYNC_FLUSH env var for verification runs (e.g.
+            // `UNI_ASYNC_FLUSH=1 cargo nextest run ...`). Lets us
+            // validate the full test suite under the to-be-flipped
+            // default without modifying source. Accepted truthy values:
+            // "1", "true", "yes" (case-insensitive). Any other value
+            // (including unset) defaults to false. See plan §13.3.2.
+            async_flush_enabled: std::env::var("UNI_ASYNC_FLUSH")
+                .ok()
+                .is_some_and(|v| {
+                    let v = v.to_ascii_lowercase();
+                    v == "1" || v == "true" || v == "yes"
+                }),
             max_pending_flushes: 2,
             drop_fork_drain_timeout: Duration::from_secs(10),
             max_forks: None,

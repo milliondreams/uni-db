@@ -65,13 +65,10 @@ pub struct LanceDbBackend {
     schema_cache: DashMap<String, Arc<ArrowSchema>>,
 }
 
-/// Build the cache key for a `(table, branch)` pair.
-fn cache_key(table: &str, branch: Option<&str>) -> String {
-    match branch {
-        None => table.to_string(),
-        Some(b) => format!("{table}@@{b}"),
-    }
-}
+// `cache_key` removed alongside the `lancedb::Table` cache (see
+// `get_or_open_table` doc comment). The branch cache key form is no
+// longer needed because branch reads route through `lance_branch`
+// rather than via lancedb's `Table` type.
 
 impl LanceDbBackend {
     /// Connect to a LanceDB database at the given URI.

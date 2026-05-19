@@ -44,24 +44,17 @@ async fn build_async_db(
     Ok(db)
 }
 
-// NOTE — visibility under concurrent async flushes is still flaky
-// after Item B's retry fix landed. The Lance write race
-// ("Incompatible transaction" on concurrent create_table / append
-// from multiple streams) is now handled by
-// `write_batch_with_lance_conflict_retry` — every stream returns
-// ok=true. But ~1 batch (1000 rows) is still consistently missing
-// from the query result. This indicates the residual bug is on the
-// READ side, not the WRITE side: data is in Lance but the reader's
-// view (driven by cached_manifest + LabelSnapshot.lance_version,
-// which is hardcoded to 0 today) doesn't see the latest version.
-//
-// Likely fix path: have flush_stream_l1 record the actual Lance
-// dataset.version() after the write (instead of the hardcoded 0
-// sentinel) and have the read path open the dataset at that exact
-// version. Requires Lance API exposure check + read-path changes.
-// Deferred to a follow-up commit.
+/// Visibility under concurrent async flushes — the bug Item B-deep
+/// fixed. Root cause: `LanceDbBackend::get_or_open_table` cached
+/// `lancedb::Table` handles, but a cached handle is pinned to the
+/// dataset version it was opened at (per `Table::checkout_latest`
+/// docs in lancedb 0.27.1). Multiple stream phases commit new
+/// dataset versions, but readers via cached handles saw only the
+/// pinned version — silently dropping recent rows. Fix:
+/// `get_or_open_table` now calls `table.checkout_latest()` on cache
+/// hit before returning, so every caller (read or write) sees the
+/// current dataset state.
 #[tokio::test]
-#[ignore = "flaky pending Lance dataset-version coordination — see comment above"]
 async fn async_flush_visibility_after_drain() -> Result<()> {
     // 200 commits × 50 vertices = 10_000 mutations; threshold=1000 should
     // trigger ~10 async flushes.

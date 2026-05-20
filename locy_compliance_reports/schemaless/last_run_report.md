@@ -1,19 +1,17 @@
 # TCK Compliance Report
 
-**Generated:** 2026-05-15 02:26:47
-**Results:** `results_20260515_022647.json`
-**Compared to:** `results_20260515_022326.json`
+**Generated:** 2026-05-20 11:11:41
+**Results:** `results_20260520_111141.json`
+**Compared to:** `results_20260520_085606.json`
 
 ## Summary
 
 | Metric | Current | Previous | Delta |
 |--------|---------|----------|-------|
-| Scenarios | 479 | 479 |  |
-| Passed | 479 | 478 | +1 |
-| Failed | 0 | 1 | -1 |
-| Pass Rate | 100.0% | 99.8% | 📈 +0.2pp |
-
-**🟢 Fixed:** 1 scenarios now passing
+| Scenarios | 490 | 490 |  |
+| Passed | 490 | 490 |  |
+| Failed | 0 | 0 |  |
+| Pass Rate | 100.0% | 100.0% | ➡️ +0.0pp |
 
 ## Feature Breakdown
 
@@ -28,7 +26,7 @@
 | ✅ AssumeAbduceExtended | 20 | 20 | 0 | 100% |  |
 | ✅ AssumeNestedAbduce | 4 | 4 | 0 | 100% |  |
 | ✅ BasicRules | 6 | 6 | 0 | 100% |  |
-| ✅ Calibrate | 4 | 4 | 0 | 100% |  |
+| ✅ Calibrate | 5 | 5 | 0 | 100% |  |
 | ✅ CandleClassifier | 4 | 4 | 0 | 100% |  |
 | ✅ CompositePatterns | 27 | 27 | 0 | 100% |  |
 | ✅ ConformalCalibration | 2 | 2 | 0 | 100% |  |
@@ -42,9 +40,10 @@
 | ✅ ExplainCombinations | 6 | 6 | 0 | 100% |  |
 | ✅ FeatureCombinationMatrix | 6 | 6 | 0 | 100% |  |
 | ✅ FoldExecutionPaths | 32 | 32 | 0 | 100% |  |
+| ✅ FoldInRecursivePath | 3 | 3 | 0 | 100% |  |
 | ✅ FoldQueryProjection | 4 | 4 | 0 | 100% |  |
 | ✅ GoalDirected | 9 | 9 | 0 | 100% |  |
-| ✅ GraphStructuralFeatures | 9 | 9 | 0 | 100% |  |
+| ✅ GraphStructuralFeatures | 16 | 16 | 0 | 100% |  |
 | ✅ Hypothetical | 6 | 6 | 0 | 100% |  |
 | ✅ IntegratedExample | 1 | 1 | 0 | 100% |  |
 | ✅ InvokeModel | 4 | 4 | 0 | 100% |  |
@@ -79,18 +78,12 @@
 | ✅ SimilarToProbability | 6 | 6 | 0 | 100% |  |
 | ✅ Stratification | 6 | 6 | 0 | 100% |  |
 | ✅ StratifiedNegation | 5 | 5 | 0 | 100% |  |
-| ✅ TopKProofs | 4 | 4 | 0 | 100% | +11pp |
-| ✅ TopKProofs | 5 | 5 | 0 | 100% | +11pp |
+| ✅ TopKProofs | 4 | 4 | 0 | 100% |  |
+| ✅ TopKProofs | 5 | 5 | 0 | 100% |  |
 | ✅ TransitiveClosure | 2 | 2 | 0 | 100% |  |
 | ✅ TripleCombinations | 5 | 5 | 0 | 100% |  |
 | ✅ Validate | 4 | 4 | 0 | 100% |  |
 | ✅ YieldValueColumns | 6 | 6 | 0 | 100% |  |
-
-## 🟢 Newly Passing
-
-Scenarios that were failing but are now passing:
-
-- **TopKProofs** — TopKProofs(8) on shared-base proofs yields DNF inclusion-exclusion (line 118)
 
 ## Failed Scenarios
 

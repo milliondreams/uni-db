@@ -147,10 +147,8 @@ impl WriteAheadLog {
     /// Flush buffered mutations to a WAL segment. Returns the LSN of the flushed segment.
     #[instrument(skip(self), fields(lsn, mutations_count, size_bytes))]
     pub async fn flush(&self) -> Result<u64> {
-        let _g = crate::profile::stage("wal::flush/total");
         let start = std::time::Instant::now();
         let (batch, lsn) = {
-            let _g = crate::profile::stage("wal::flush/take_buffer");
             let mut state = acquire_mutex(&self.state, "wal_state")?;
             if state.buffer.is_empty() {
                 return Ok(state.flushed_lsn);
@@ -169,7 +167,6 @@ impl WriteAheadLog {
             mutations: batch.clone(),
         };
 
-        let _g_ser = crate::profile::stage("wal::flush/serde_json_to_vec");
         // Serialize segment; restore buffer on failure
         let json = match serde_json::to_vec(&segment) {
             Ok(j) => j,
@@ -191,8 +188,6 @@ impl WriteAheadLog {
         let filename = format!("{:020}_{}.wal", lsn, Uuid::new_v4());
         let path = self.prefix.child(filename);
 
-        drop(_g_ser);
-        let _g_put = crate::profile::stage("wal::flush/put_with_timeout");
         // Attempt to write; restore buffer on failure to prevent data loss
         if let Err(e) = put_with_timeout(&self.store, &path, json.into(), DEFAULT_TIMEOUT).await {
             warn!(

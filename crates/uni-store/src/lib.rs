@@ -7,7 +7,6 @@ pub mod compaction;
 pub mod fork;
 #[cfg(feature = "lance-backend")]
 pub mod lancedb;
-pub mod profile;
 pub mod runtime;
 pub mod storage;
 pub mod store_utils;

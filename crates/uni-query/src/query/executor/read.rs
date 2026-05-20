@@ -302,34 +302,25 @@ impl Executor {
         HybridPhysicalPlanner,
         Arc<PropertyManager>,
     )> {
-        let query_ctx = {
-            let _g = uni_store::profile::stage("df_planner/get_context");
-            self.get_context().await
-        };
-        let l0_context = {
-            let _g = uni_store::profile::stage("df_planner/L0Context_build");
-            match query_ctx {
-                Some(ref ctx) => L0Context::from_query_context(ctx),
-                None => L0Context::empty(),
-            }
+        let query_ctx = self.get_context().await;
+        let l0_context = match query_ctx {
+            Some(ref ctx) => L0Context::from_query_context(ctx),
+            None => L0Context::empty(),
         };
 
-        let prop_manager_arc = {
-            let _g = uni_store::profile::stage("df_planner/PropertyManager::new");
-            // Prefer the shared `Arc<PropertyManager>` installed via
-            // `Executor::set_prop_manager` — skips the LRU/Mutex allocation cost
-            // (~80 µs/query) of constructing a fresh, immediately-abandoned
-            // PropertyManager. Falls back to the legacy fresh-construction path
-            // for callers that have not installed one.
-            if let Some(shared) = self.prop_manager_arc.as_ref() {
-                shared.clone()
-            } else {
-                Arc::new(PropertyManager::new(
-                    self.storage.clone(),
-                    self.storage.schema_manager_arc(),
-                    prop_manager.cache_size(),
-                ))
-            }
+        // Prefer the shared `Arc<PropertyManager>` installed via
+        // `Executor::set_prop_manager` — skips the LRU/Mutex allocation cost
+        // (~80 µs/query) of constructing a fresh, immediately-abandoned
+        // PropertyManager. Falls back to the legacy fresh-construction path
+        // for callers that have not installed one.
+        let prop_manager_arc = if let Some(shared) = self.prop_manager_arc.as_ref() {
+            shared.clone()
+        } else {
+            Arc::new(PropertyManager::new(
+                self.storage.clone(),
+                self.storage.schema_manager_arc(),
+                prop_manager.cache_size(),
+            ))
         };
 
         // Two-mode session construction:
@@ -349,15 +340,10 @@ impl Executor {
             .is_some_and(|r| !r.is_empty());
         let session =
             if let (Some(tmpl), false) = (self.df_session_template.as_ref(), has_custom_udfs) {
-                let _g = uni_store::profile::stage("df_planner/SessionContext::clone_template");
                 (**tmpl).clone()
             } else {
-                let _g = uni_store::profile::stage("df_planner/SessionContext::new");
                 let s = SessionContext::new();
-                {
-                    let _g = uni_store::profile::stage("df_planner/register_cypher_udfs");
-                    crate::query::df_udfs::register_cypher_udfs(&s)?;
-                }
+                crate::query::df_udfs::register_cypher_udfs(&s)?;
                 if let Some(ref registry) = self.custom_function_registry {
                     crate::query::df_udfs::register_custom_udfs(&s, registry)?;
                 }
@@ -365,7 +351,6 @@ impl Executor {
             };
         let session_ctx = Arc::new(SyncRwLock::new(session));
 
-        let _g_hpp = uni_store::profile::stage("df_planner/HybridPhysicalPlanner::new");
         let mut planner = HybridPhysicalPlanner::with_l0_context(
             session_ctx.clone(),
             self.storage.clone(),
@@ -395,18 +380,11 @@ impl Executor {
         Box::pin(async move {
             use futures::TryStreamExt;
 
-            let task_ctx = {
-                let _g = uni_store::profile::stage("collect/task_ctx");
-                session_ctx.read().task_ctx()
-            };
+            let task_ctx = session_ctx.read().task_ctx();
             let partition_count = execution_plan.output_partitioning().partition_count();
             let mut all_batches = Vec::new();
             for partition in 0..partition_count {
-                let stream = {
-                    let _g = uni_store::profile::stage("collect/exec_plan.execute");
-                    execution_plan.execute(partition, task_ctx.clone())?
-                };
-                let _g = uni_store::profile::stage("collect/stream.try_collect");
+                let stream = execution_plan.execute(partition, task_ctx.clone())?;
                 let batches: Vec<RecordBatch> = stream.try_collect().await?;
                 all_batches.extend(batches);
             }
@@ -445,18 +423,11 @@ impl Executor {
         Vec<RecordBatch>,
         Arc<dyn datafusion::physical_plan::ExecutionPlan>,
     )> {
-        let (session_ctx, mut planner, prop_manager_arc) = {
-            let _g = uni_store::profile::stage("df/create_datafusion_planner");
-            self.create_datafusion_planner(prop_manager, params).await?
-        };
+        let (session_ctx, mut planner, prop_manager_arc) =
+            self.create_datafusion_planner(prop_manager, params).await?;
 
         // Build MutationContext when the plan contains write operations
-        let _has_writes = {
-            let _g = uni_store::profile::stage("df/contains_write_operations");
-            Self::contains_write_operations(&plan)
-        };
-        if _has_writes {
-            let _g = uni_store::profile::stage("df/build_mutation_context");
+        if Self::contains_write_operations(&plan) {
             let writer = self
                 .writer
                 .as_ref()
@@ -484,17 +455,10 @@ impl Executor {
             );
         }
 
-        let execution_plan = {
-            let _g = uni_store::profile::stage("df/planner.plan(physical)");
-            planner.plan(&plan)?
-        };
+        let execution_plan = planner.plan(&plan)?;
         let plan_clone = Arc::clone(&execution_plan);
-        let result = {
-            let _g = uni_store::profile::stage("df/collect_batches");
-            Self::collect_batches(&session_ctx, execution_plan).await
-        };
+        let result = Self::collect_batches(&session_ctx, execution_plan).await;
 
-        let _g = uni_store::profile::stage("df/harvest_warnings");
         // Harvest warnings from the graph execution context after query completion.
         let graph_warnings = planner.graph_ctx().take_warnings();
         if !graph_warnings.is_empty()
@@ -502,7 +466,6 @@ impl Executor {
         {
             w.extend(graph_warnings);
         }
-        drop(_g);
 
         result.map(|batches| (batches, plan_clone))
     }
@@ -846,24 +809,16 @@ impl Executor {
     ) -> BoxFuture<'a, Result<Vec<HashMap<String, Value>>>> {
         Box::pin(async move {
             let query_type = Self::get_plan_type(&plan);
-            let ctx = {
-                let _g = uni_store::profile::stage("exec/get_context");
-                self.get_context().await
-            };
+            let ctx = self.get_context().await;
             let start = Instant::now();
 
             // Route DDL/Admin queries to the fallback executor.
             // All other queries (including similar_to) flow through DataFusion.
             let res = if Self::is_ddl_or_admin(&plan) {
-                let _g = uni_store::profile::stage("exec/execute_subplan");
                 self.execute_subplan(plan, prop_manager, params, ctx.as_ref())
                     .await
             } else {
-                let batches = {
-                    let _g = uni_store::profile::stage("exec/execute_datafusion");
-                    self.execute_datafusion(plan, prop_manager, params).await?
-                };
-                let _g = uni_store::profile::stage("exec/record_batches_to_rows");
+                let batches = self.execute_datafusion(plan, prop_manager, params).await?;
                 self.record_batches_to_rows(batches)
             };
 

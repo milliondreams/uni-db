@@ -2437,7 +2437,6 @@ impl QueryPlanner {
     /// `vars` lists variable names already in scope before this query executes
     /// (e.g., from an enclosing Locy rule body).
     pub fn plan_with_scope(&self, query: Query, vars: Vec<String>) -> Result<LogicalPlan> {
-        let _g = uni_store::profile::stage("planner::plan_with_scope");
         // Apply query rewrites before planning
         let rewritten_query = crate::query::rewrite::rewrite_query(query)?;
         if Self::has_mixed_union_modes(&rewritten_query) {

@@ -260,7 +260,6 @@ impl Transaction {
     /// Mutation count is read from the private L0 (not the global writer).
     #[instrument(skip(self), fields(transaction_id = %self.id))]
     pub async fn execute(&self, cypher: &str) -> Result<ExecuteResult> {
-        let _g = uni_store::profile::stage("tx::execute/total");
         self.check_completed()?;
         let before = self.snapshot_l0();
         let result = self.query(cypher).await?;

@@ -83,7 +83,6 @@ pub async fn put_with_timeout(
     bytes: Bytes,
     timeout: Duration,
 ) -> Result<PutResult> {
-    let _g = crate::profile::stage("put_with_timeout");
     let msg = format!(
         "Object store put timed out after {:?} for path: {}",
         timeout, path

@@ -383,14 +383,10 @@ impl crate::api::UniInner {
         tx_l0: std::sync::Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>,
         id_reservoir: Option<Arc<uni_store::runtime::TxIdReservoir>>,
     ) -> Result<QueryResult> {
-        let _g_total = uni_store::profile::stage("execute_internal_with_tx_l0/total");
         let total_start = Instant::now();
 
         let parse_start = Instant::now();
-        let ast = {
-            let _g = uni_store::profile::stage("parse");
-            uni_cypher::parse(cypher).map_err(into_parse_error)?
-        };
+        let ast = uni_cypher::parse(cypher).map_err(into_parse_error)?;
         let parse_time = parse_start.elapsed();
 
         let (ast, tt_spec) = match ast {
@@ -407,7 +403,6 @@ impl crate::api::UniInner {
 
         let plan_start = Instant::now();
         let logical_plan = {
-            let _g = uni_store::profile::stage("planner/total");
             let planner = uni_query::QueryPlanner::new(self.schema.schema().clone())
                 .with_params(params.clone());
             let lp = planner.plan(ast).map_err(|e| into_query_error(e, cypher))?;
@@ -415,36 +410,29 @@ impl crate::api::UniInner {
         };
         let plan_time = plan_start.elapsed();
 
-        let executor = {
-            let _g = uni_store::profile::stage("executor_setup");
-            // Clone the cached executor template instead of running
-            // `Executor::new` + six session-constant setters every query.
-            // The manual `Clone` impl installs a fresh `warnings` Mutex so
-            // each query gets its own warnings accumulator.
-            let mut executor = (*self.executor_template).clone();
-            // Per-query state.
-            if let Ok(reg) = self.custom_functions.read()
-                && !reg.is_empty()
-            {
-                executor.set_custom_functions(Arc::new(reg.clone()));
-            }
-            executor.set_transaction_l0(tx_l0);
-            if let Some(r) = id_reservoir {
-                executor.set_id_reservoir(r);
-            }
-            executor
-        };
+        // Clone the cached executor template instead of running
+        // `Executor::new` + six session-constant setters every query.
+        // The manual `Clone` impl installs a fresh `warnings` Mutex so
+        // each query gets its own warnings accumulator.
+        let mut executor = (*self.executor_template).clone();
+        // Per-query state.
+        if let Ok(reg) = self.custom_functions.read()
+            && !reg.is_empty()
+        {
+            executor.set_custom_functions(Arc::new(reg.clone()));
+        }
+        executor.set_transaction_l0(tx_l0);
+        if let Some(r) = id_reservoir {
+            executor.set_id_reservoir(r);
+        }
 
         let projection_order = extract_projection_order(&logical_plan);
 
         let exec_start = Instant::now();
-        let results = {
-            let _g = uni_store::profile::stage("executor::execute");
-            executor
-                .execute(logical_plan, &self.properties, &params)
-                .await
-                .map_err(|e| into_execution_error(e, cypher))?
-        };
+        let results = executor
+            .execute(logical_plan, &self.properties, &params)
+            .await
+            .map_err(|e| into_execution_error(e, cypher))?;
         let exec_time = exec_start.elapsed();
 
         let columns = if results.is_empty() {
@@ -458,7 +446,6 @@ impl crate::api::UniInner {
         };
 
         let rows: Vec<Row> = {
-            let _g = uni_store::profile::stage("result_materialization");
             results
                 .into_iter()
                 .map(|map| {

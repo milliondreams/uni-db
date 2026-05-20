@@ -4729,15 +4729,16 @@ fn apply_having_filter(
     batches: Vec<RecordBatch>,
     having_exprs: &[Expr],
     schema: &SchemaRef,
+    task_ctx: &Arc<TaskContext>,
 ) -> DFResult<Vec<RecordBatch>> {
     use arrow::compute::{and, filter_record_batch};
     use arrow_array::BooleanArray;
     use datafusion::common::DFSchema;
     use datafusion::logical_expr::LogicalPlanBuilder;
+    use datafusion::logical_expr::execution_props::ExecutionProps;
     use datafusion::optimizer::AnalyzerRule;
     use datafusion::optimizer::analyzer::type_coercion::TypeCoercion;
     use datafusion::physical_expr::create_physical_expr;
-    use datafusion::prelude::SessionContext;
 
     if batches.is_empty() {
         return Ok(batches);
@@ -4748,10 +4749,12 @@ fn apply_having_filter(
         datafusion::common::DataFusionError::Internal(format!("HAVING schema conversion: {e}"))
     })?;
 
-    let ctx = SessionContext::new();
-    let state = ctx.state();
-    let config = state.config_options().clone();
-    let props = state.execution_props();
+    // Use the active TaskContext's config rather than allocating a fresh
+    // `SessionContext` per HAVING evaluation (~130 µs/call). HAVING uses only
+    // built-in DataFusion arithmetic — no Cypher UDFs — so a default
+    // `ExecutionProps` is sufficient (it's documented as cheap to construct).
+    let config = (**task_ctx.session_config().options()).clone();
+    let props = ExecutionProps::new();
 
     // Cypher Expr → DataFusion DfExpr → type-coerced DfExpr → PhysicalExpr.
     //
@@ -4784,7 +4787,7 @@ fn apply_having_filter(
                 _ => df_expr,
             };
 
-            create_physical_expr(&coerced_expr, &df_schema, props)
+            create_physical_expr(&coerced_expr, &df_schema, &props)
         })
         .collect::<DFResult<Vec<_>>>()?;
 
@@ -4943,7 +4946,7 @@ pub(crate) async fn apply_post_fixpoint_chain(
     // Apply HAVING (post-FOLD WHERE filter)
     let current: Arc<dyn ExecutionPlan> = if !rule.having.is_empty() {
         let batches = collect_all_partitions(&current, Arc::clone(task_ctx)).await?;
-        let filtered = apply_having_filter(batches, &rule.having, &current.schema())?;
+        let filtered = apply_having_filter(batches, &rule.having, &current.schema(), task_ctx)?;
         if filtered.is_empty() {
             return Ok(filtered);
         }

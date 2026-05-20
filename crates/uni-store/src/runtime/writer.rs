@@ -346,6 +346,7 @@ impl Writer {
     /// Allocates multiple VIDs at once for bulk operations.
     /// This is more efficient than calling next_vid() in a loop.
     pub async fn allocate_vids(&self, count: usize) -> Result<Vec<Vid>> {
+        let _g = crate::profile::stage("allocate_vids");
         self.allocator.allocate_vids(count).await
     }
 
@@ -416,16 +417,21 @@ impl Writer {
         self: &Arc<Self>,
         tx_l0_arc: Arc<RwLock<L0Buffer>>,
     ) -> Result<(u64, bool)> {
+        let _g_commit = crate::profile::stage("commit_transaction_l0/total");
         // Hold `flush_lock` across WAL append + flush + main-L0 merge.
         // Two concurrent commits serialize here; in Phase 3 the outer
         // `Arc<RwLock<Writer>>` already provides this exclusion, so the
         // acquisition is uncontended. Phase 4 drops the outer lock and
         // this becomes the load-bearing serialization point.
-        let _flush_lock_guard = self.flush_lock.lock().await;
+        let _flush_lock_guard = {
+            let _g = crate::profile::stage("commit/flush_lock_acquire");
+            self.flush_lock.lock().await
+        };
 
         // 1. Write transaction mutations to WAL BEFORE merging into main L0
         // This ensures durability before visibility.
         {
+            let _g = crate::profile::stage("commit/wal_append");
             let tx_l0 = tx_l0_arc.read();
             let main_l0_arc = self.l0_manager.get_current();
             let main_l0 = main_l0_arc.read();
@@ -499,10 +505,14 @@ impl Writer {
         }
 
         // 2. Flush WAL to durable storage - THIS IS THE COMMIT POINT
-        let wal_lsn = self.flush_wal().await?;
+        let wal_lsn = {
+            let _g = crate::profile::stage("commit/flush_wal");
+            self.flush_wal().await?
+        };
 
         // 3. Merge into main L0 and make visible
         {
+            let _g = crate::profile::stage("commit/l0_merge_and_adjacency");
             let tx_l0 = tx_l0_arc.read();
             let main_l0_arc = self.l0_manager.get_current();
             let mut main_l0 = main_l0_arc.write();
@@ -544,7 +554,10 @@ impl Writer {
             }
         }
 
-        self.update_metrics();
+        {
+            let _g = crate::profile::stage("commit/update_metrics");
+            self.update_metrics();
+        }
 
         // 4. Best-effort post-commit auto-flush.
         //
@@ -558,6 +571,7 @@ impl Writer {
         //   `try_acquire_permit` is non-blocking: if we lose the race
         //   for the last permit, we just skip this trigger (the next
         //   commit retries).
+        let _g_post = crate::profile::stage("commit/post_commit_flush_check");
         let mut flush_pending = false;
         if self.should_flush() {
             if self.config.async_flush_enabled
@@ -624,6 +638,7 @@ impl Writer {
     ///
     /// Returns the LSN of the flushed segment, or `0` when no WAL is configured.
     pub async fn flush_wal(&self) -> Result<u64> {
+        let _g = crate::profile::stage("flush_wal/total");
         let l0 = self.l0_manager.get_current();
         let wal = l0.read().wal.clone();
 
@@ -749,6 +764,7 @@ impl Writer {
         labels: &[String],
         tx_l0: Option<&Arc<RwLock<L0Buffer>>>,
     ) -> Result<()> {
+        let _g = crate::profile::stage("validate_vertex_constraints");
         let schema = self.schema_manager.schema();
 
         // Validate constraints only for known labels
@@ -1474,6 +1490,7 @@ impl Writer {
         label: Option<&str>,
         tx_l0: Option<&Arc<RwLock<L0Buffer>>>,
     ) -> Result<()> {
+        let _g = crate::profile::stage("prepare_vertex_upsert");
         let Some(pm) = &self.property_manager else {
             return Ok(());
         };
@@ -1586,9 +1603,16 @@ impl Writer {
         labels: &[String],
         tx_l0: Option<&Arc<RwLock<L0Buffer>>>,
     ) -> Result<Properties> {
+        let _g = crate::profile::stage("insert_vertex_with_labels/total");
         let start = std::time::Instant::now();
-        self.check_write_pressure().await?;
-        self.check_transaction_memory(tx_l0)?;
+        {
+            let _g = crate::profile::stage("insert_vertex/check_write_pressure");
+            self.check_write_pressure().await?;
+        }
+        {
+            let _g = crate::profile::stage("insert_vertex/check_tx_memory");
+            self.check_transaction_memory(tx_l0)?;
+        }
         self.process_embeddings_for_labels(labels, &mut properties)
             .await?;
         self.validate_vertex_constraints(vid, &properties, labels, tx_l0)
@@ -1606,6 +1630,7 @@ impl Writer {
         let labels_copy = labels.to_vec();
 
         {
+            let _g = crate::profile::stage("insert_vertex/l0_write_and_constraint_idx");
             let l0 = self.resolve_l0(tx_l0);
             let mut l0_guard = l0.write();
             l0_guard.insert_vertex_with_labels(vid, properties, labels);
@@ -2078,6 +2103,7 @@ impl Writer {
         labels: &[String],
         properties: &mut Properties,
     ) -> Result<()> {
+        let _g = crate::profile::stage("process_embeddings_for_labels");
         let label_name = labels.first().map(|s| s.as_str());
         self.process_embeddings_impl(label_name, properties).await
     }

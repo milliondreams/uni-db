@@ -94,6 +94,26 @@ pub struct UniInner {
     pub(crate) total_commits: AtomicU64,
     /// Database-level registry of custom scalar functions.
     pub(crate) custom_functions: Arc<std::sync::RwLock<uni_query::CustomFunctionRegistry>>,
+    /// DataFusion `SessionContext` template with all Cypher UDFs
+    /// pre-registered. Cloned per query (O(1) Arc bump) when the executor
+    /// has no custom UDFs installed, skipping the ~140 µs cost of building
+    /// a fresh `SessionContext` and re-registering UDFs every call.
+    ///
+    /// **Safe to share** because: (a) no code path mutates the session via
+    /// `.write()` outside of the cold-path custom-UDF branch in
+    /// `create_datafusion_planner` (verified by grep); (b) custom UDFs are
+    /// registered on a fresh, isolated `SessionContext` to avoid leaking
+    /// into this template.
+    pub(crate) df_session_template: Arc<datafusion::execution::context::SessionContext>,
+    /// Pre-configured `Executor` template with all session-constant fields
+    /// already populated (storage, config, xervo_runtime, procedure_registry,
+    /// writer, df_session_template, prop_manager). Cloned per query
+    /// (cheap Arc bumps + a fresh `warnings` Mutex via manual `Clone` impl),
+    /// after which only per-query fields (transaction_l0, id_reservoir,
+    /// custom_functions, cancellation_token) need to be set.
+    ///
+    /// Skips ~25 µs/query of `Executor::new` + repeated setter dispatches.
+    pub(crate) executor_template: Arc<uni_query::Executor>,
     /// Fork registry — persists `catalog/fork_registry.json` and runs
     /// the create/drop 2PC. Built once during `Uni::open` and shared
     /// by the primary `UniInner` and every forked-session inner.
@@ -221,6 +241,33 @@ pub struct Uni {
 // No Deref<Target = UniInner> — Uni is an opaque handle.
 // All field access goes through `self.inner.field` explicitly.
 
+/// Build the cached `Arc<Executor>` template held on `UniInner`.
+///
+/// Populates every session-constant field on `Executor` so each query can
+/// clone this template (cheap Arc bumps + a fresh `warnings` Mutex via the
+/// manual `Clone` impl) instead of running `Executor::new` + six setters.
+#[allow(clippy::too_many_arguments)]
+fn build_executor_template(
+    storage: Arc<StorageManager>,
+    config: UniConfig,
+    writer: Option<Arc<uni_store::runtime::writer::Writer>>,
+    xervo_runtime: Option<Arc<ModelRuntime>>,
+    procedure_registry: Arc<uni_query::ProcedureRegistry>,
+    properties: Arc<PropertyManager>,
+    df_session_template: Arc<datafusion::execution::context::SessionContext>,
+) -> Arc<uni_query::Executor> {
+    let mut e = uni_query::Executor::new(storage);
+    e.set_config(config);
+    e.set_xervo_runtime(xervo_runtime);
+    e.set_procedure_registry(procedure_registry);
+    if let Some(w) = writer {
+        e.set_writer(w);
+    }
+    e.set_prop_manager(properties);
+    e.set_df_session_template(df_session_template);
+    Arc::new(e)
+}
+
 impl UniInner {
     /// Open a point-in-time view of the database at the given snapshot.
     ///
@@ -245,6 +292,15 @@ impl UniInner {
         let shutdown_handle = Arc::new(ShutdownHandle::new(Duration::from_secs(30)));
 
         let (commit_tx, _) = tokio::sync::broadcast::channel(256);
+        let executor_template = build_executor_template(
+            pinned_storage.clone(),
+            self.config.clone(),
+            None,
+            self.xervo_runtime.clone(),
+            self.procedure_registry.clone(),
+            prop_manager.clone(),
+            self.df_session_template.clone(),
+        );
         Ok(UniInner {
             storage: pinned_storage,
             schema: self.schema.clone(),
@@ -264,6 +320,8 @@ impl UniInner {
             total_queries: AtomicU64::new(0),
             total_commits: AtomicU64::new(0),
             custom_functions: self.custom_functions.clone(),
+            df_session_template: self.df_session_template.clone(),
+            executor_template,
             fork_registry: self.fork_registry.clone(),
             fork_inners: self.fork_inners.clone(),
             inflight_tx_count: Arc::new(AtomicUsize::new(0)),
@@ -359,11 +417,21 @@ impl UniInner {
             );
         }
 
+        let forked_writer_arc = Arc::new(forked_writer);
+        let executor_template = build_executor_template(
+            forked_storage.clone(),
+            self.config.clone(),
+            Some(forked_writer_arc.clone()),
+            self.xervo_runtime.clone(),
+            self.procedure_registry.clone(),
+            prop_manager.clone(),
+            self.df_session_template.clone(),
+        );
         Ok(UniInner {
             storage: forked_storage,
             schema: merged_schema,
             properties: prop_manager,
-            writer: Some(Arc::new(forked_writer)),
+            writer: Some(forked_writer_arc),
             xervo_runtime: self.xervo_runtime.clone(),
             config: self.config.clone(),
             procedure_registry: self.procedure_registry.clone(),
@@ -376,6 +444,8 @@ impl UniInner {
             total_queries: AtomicU64::new(0),
             total_commits: AtomicU64::new(0),
             custom_functions: self.custom_functions.clone(),
+            df_session_template: self.df_session_template.clone(),
+            executor_template,
             fork_registry: self.fork_registry.clone(),
             fork_inners: self.fork_inners.clone(),
             inflight_tx_count: Arc::new(AtomicUsize::new(0)),
@@ -2169,6 +2239,28 @@ impl UniBuilder {
         let index_builder_disabled = self.config.disable_fork_index_builder;
         let index_builder_shutdown_rx = shutdown_handle.subscribe();
 
+        // Build the cached DataFusion SessionContext template once with all
+        // Cypher UDFs pre-registered. Subsequent queries clone this Arc
+        // instead of paying ~140 µs to construct a fresh SessionContext and
+        // re-register the UDFs every call.
+        let df_session_template = {
+            let ctx = datafusion::execution::context::SessionContext::new();
+            uni_query_functions::df_udfs::register_cypher_udfs(&ctx)
+                .map_err(|e| UniError::Internal(anyhow::anyhow!(e)))?;
+            Arc::new(ctx)
+        };
+
+        let procedure_registry = Arc::new(uni_query::ProcedureRegistry::new());
+        let executor_template = build_executor_template(
+            storage.clone(),
+            self.config.clone(),
+            writer_field.clone(),
+            xervo_runtime.clone(),
+            procedure_registry.clone(),
+            prop_manager.clone(),
+            df_session_template.clone(),
+        );
+
         let db = Uni {
             inner: Arc::new(UniInner {
                 storage,
@@ -2177,7 +2269,7 @@ impl UniBuilder {
                 writer: writer_field,
                 xervo_runtime,
                 config: self.config,
-                procedure_registry: Arc::new(uni_query::ProcedureRegistry::new()),
+                procedure_registry,
                 shutdown_handle,
                 locy_rule_registry: Arc::new(std::sync::RwLock::new(
                     impl_locy::LocyRuleRegistry::default(),
@@ -2191,6 +2283,8 @@ impl UniBuilder {
                 custom_functions: Arc::new(std::sync::RwLock::new(
                     uni_query::CustomFunctionRegistry::new(),
                 )),
+                df_session_template,
+                executor_template,
                 fork_registry,
                 fork_inners: Arc::new(DashMap::new()),
                 inflight_tx_count: Arc::new(AtomicUsize::new(0)),

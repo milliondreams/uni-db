@@ -1459,6 +1459,7 @@ impl Executor {
         ctx: Option<&QueryContext>,
         tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
     ) -> Result<()> {
+        let _g = uni_store::profile::stage("execute_create_pattern");
         for path in &pattern.paths {
             let mut prev_vid: Option<Vid> = None;
             // (rel_var, type_id, type_name, props_expr, direction)

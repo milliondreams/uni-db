@@ -11169,6 +11169,7 @@ dependencies = [
  "uni-cypher",
  "uni-locy",
  "uni-query",
+ "uni-query-functions",
  "uni-store",
  "uni-xervo",
  "url",

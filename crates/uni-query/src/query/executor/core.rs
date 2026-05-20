@@ -9,6 +9,7 @@ use tokio::sync::RwLock;
 use uni_algo::algo::AlgorithmRegistry;
 use uni_common::{TemporalValue, Value};
 use uni_cypher::ast::{BinaryOp, Expr};
+use uni_store::PropertyManager;
 use uni_store::QueryContext;
 use uni_store::runtime::l0_manager::L0Manager;
 use uni_store::runtime::writer::Writer;
@@ -218,8 +219,14 @@ pub(crate) type GenExprCacheKey = (String, String);
 ///
 /// `Executor` is cheaply cloneable — all expensive state is held behind `Arc`s.
 /// Clone it freely to share across tasks.
+///
+/// **Note on `Clone` semantics**: the derived `Clone` would alias the
+/// `warnings` `Arc<Mutex<…>>`, making warnings collected on the clone
+/// bleed into the original. A clone is intended to be a "fresh executor
+/// borrowing shared state," so the manual impl below installs a fresh
+/// `warnings` accumulator. All other Arc-shared state is intentionally
+/// shared (caches, registries, runtimes).
 // M-PUBLIC-DEBUG: Manual impl because Writer/ModelRuntime do not implement Debug.
-#[derive(Clone)]
 pub struct Executor {
     pub(crate) storage: Arc<StorageManager>,
     pub(crate) writer: Option<Arc<Writer>>,
@@ -252,6 +259,18 @@ pub struct Executor {
     /// Cooperative cancellation token. Passed to `QueryContext` and
     /// `GraphExecutionContext` so in-flight operators can detect cancellation.
     pub(crate) cancellation_token: Option<tokio_util::sync::CancellationToken>,
+    /// Shared `PropertyManager` to reuse inside `create_datafusion_planner`
+    /// instead of allocating a fresh one (with empty LRU caches) per query.
+    /// When `None`, the planner falls back to constructing from the
+    /// `&PropertyManager` parameter — preserving existing behavior for any
+    /// caller that does not set this.
+    pub(crate) prop_manager_arc: Option<Arc<PropertyManager>>,
+    /// Pre-built DataFusion `SessionContext` template with all Cypher UDFs
+    /// already registered. When set AND no custom UDFs are installed,
+    /// `create_datafusion_planner` clones this Arc (O(1)) instead of building
+    /// a fresh `SessionContext` and re-registering UDFs every query
+    /// (~140 µs/query saved on the InMemory backend).
+    pub(crate) df_session_template: Option<Arc<datafusion::execution::context::SessionContext>>,
 }
 
 impl std::fmt::Debug for Executor {
@@ -262,6 +281,35 @@ impl std::fmt::Debug for Executor {
             .field("has_l0_manager", &self.l0_manager.is_some())
             .field("has_xervo_runtime", &self.xervo_runtime.is_some())
             .finish_non_exhaustive()
+    }
+}
+
+impl Clone for Executor {
+    /// Clone an `Executor`, sharing all Arc-backed state but installing a
+    /// fresh `warnings` accumulator. Warnings are query-scoped; aliasing
+    /// the Mutex across clones would let one query's warnings spill into
+    /// another.
+    fn clone(&self) -> Self {
+        Self {
+            storage: self.storage.clone(),
+            writer: self.writer.clone(),
+            l0_manager: self.l0_manager.clone(),
+            algo_registry: self.algo_registry.clone(),
+            use_transaction: self.use_transaction,
+            file_sandbox: self.file_sandbox.clone(),
+            config: self.config.clone(),
+            gen_expr_cache: self.gen_expr_cache.clone(),
+            procedure_registry: self.procedure_registry.clone(),
+            xervo_runtime: self.xervo_runtime.clone(),
+            // Fresh warnings per clone — see struct doc.
+            warnings: Arc::new(std::sync::Mutex::new(Vec::new())),
+            transaction_l0_override: self.transaction_l0_override.clone(),
+            id_reservoir: self.id_reservoir.clone(),
+            custom_function_registry: self.custom_function_registry.clone(),
+            cancellation_token: self.cancellation_token.clone(),
+            prop_manager_arc: self.prop_manager_arc.clone(),
+            df_session_template: self.df_session_template.clone(),
+        }
     }
 }
 
@@ -284,7 +332,31 @@ impl Executor {
             id_reservoir: None,
             custom_function_registry: None,
             cancellation_token: None,
+            prop_manager_arc: None,
+            df_session_template: None,
         }
+    }
+
+    /// Install a shared `PropertyManager` so the planner can reuse it
+    /// instead of constructing a fresh one per query.
+    ///
+    /// Reusing the caller's `Arc<PropertyManager>` skips the LRU cache
+    /// allocation cost (~80 µs/query in the InMemory backend).
+    pub fn set_prop_manager(&mut self, pm: Arc<PropertyManager>) {
+        self.prop_manager_arc = Some(pm);
+    }
+
+    /// Install a pre-built `SessionContext` template with Cypher UDFs already
+    /// registered, so the planner can clone it (O(1)) instead of rebuilding.
+    ///
+    /// When custom UDFs are also installed, the template is bypassed and a
+    /// fresh `SessionContext` is built for that query (preserves UDF
+    /// isolation across executors).
+    pub fn set_df_session_template(
+        &mut self,
+        tmpl: Arc<datafusion::execution::context::SessionContext>,
+    ) {
+        self.df_session_template = Some(tmpl);
     }
 
     /// Create a write-enabled executor with an attached `Writer`.

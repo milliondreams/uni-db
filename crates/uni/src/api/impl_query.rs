@@ -383,10 +383,14 @@ impl crate::api::UniInner {
         tx_l0: std::sync::Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>,
         id_reservoir: Option<Arc<uni_store::runtime::TxIdReservoir>>,
     ) -> Result<QueryResult> {
+        let _g_total = uni_store::profile::stage("execute_internal_with_tx_l0/total");
         let total_start = Instant::now();
 
         let parse_start = Instant::now();
-        let ast = uni_cypher::parse(cypher).map_err(into_parse_error)?;
+        let ast = {
+            let _g = uni_store::profile::stage("parse");
+            uni_cypher::parse(cypher).map_err(into_parse_error)?
+        };
         let parse_time = parse_start.elapsed();
 
         let (ast, tt_spec) = match ast {
@@ -402,36 +406,45 @@ impl crate::api::UniInner {
         }
 
         let plan_start = Instant::now();
-        let planner =
-            uni_query::QueryPlanner::new(self.schema.schema().clone()).with_params(params.clone());
-        let logical_plan = planner.plan(ast).map_err(|e| into_query_error(e, cypher))?;
-        let logical_plan = uni_query::rewrite_for_fork_fusion(logical_plan, &*self.storage);
+        let logical_plan = {
+            let _g = uni_store::profile::stage("planner/total");
+            let planner = uni_query::QueryPlanner::new(self.schema.schema().clone())
+                .with_params(params.clone());
+            let lp = planner.plan(ast).map_err(|e| into_query_error(e, cypher))?;
+            uni_query::rewrite_for_fork_fusion(lp, &*self.storage)
+        };
         let plan_time = plan_start.elapsed();
 
-        let mut executor = uni_query::Executor::new(self.storage.clone());
-        executor.set_config(self.config.clone());
-        executor.set_xervo_runtime(self.xervo_runtime.clone());
-        executor.set_procedure_registry(self.procedure_registry.clone());
-        if let Ok(reg) = self.custom_functions.read()
-            && !reg.is_empty()
-        {
-            executor.set_custom_functions(Arc::new(reg.clone()));
-        }
-        if let Some(w) = &self.writer {
-            executor.set_writer(w.clone());
-        }
-        executor.set_transaction_l0(tx_l0);
-        if let Some(r) = id_reservoir {
-            executor.set_id_reservoir(r);
-        }
+        let executor = {
+            let _g = uni_store::profile::stage("executor_setup");
+            // Clone the cached executor template instead of running
+            // `Executor::new` + six session-constant setters every query.
+            // The manual `Clone` impl installs a fresh `warnings` Mutex so
+            // each query gets its own warnings accumulator.
+            let mut executor = (*self.executor_template).clone();
+            // Per-query state.
+            if let Ok(reg) = self.custom_functions.read()
+                && !reg.is_empty()
+            {
+                executor.set_custom_functions(Arc::new(reg.clone()));
+            }
+            executor.set_transaction_l0(tx_l0);
+            if let Some(r) = id_reservoir {
+                executor.set_id_reservoir(r);
+            }
+            executor
+        };
 
         let projection_order = extract_projection_order(&logical_plan);
 
         let exec_start = Instant::now();
-        let results = executor
-            .execute(logical_plan, &self.properties, &params)
-            .await
-            .map_err(|e| into_execution_error(e, cypher))?;
+        let results = {
+            let _g = uni_store::profile::stage("executor::execute");
+            executor
+                .execute(logical_plan, &self.properties, &params)
+                .await
+                .map_err(|e| into_execution_error(e, cypher))?
+        };
         let exec_time = exec_start.elapsed();
 
         let columns = if results.is_empty() {
@@ -444,19 +457,22 @@ impl crate::api::UniInner {
             Arc::new(cols)
         };
 
-        let rows: Vec<Row> = results
-            .into_iter()
-            .map(|map| {
-                let mut values = Vec::with_capacity(columns.len());
-                for col in columns.iter() {
-                    let value = map.get(col).cloned().unwrap_or(ApiValue::Null);
-                    let normalized =
-                        ResultNormalizer::normalize_value(value).unwrap_or(ApiValue::Null);
-                    values.push(normalized);
-                }
-                Row::new(columns.clone(), values)
-            })
-            .collect();
+        let rows: Vec<Row> = {
+            let _g = uni_store::profile::stage("result_materialization");
+            results
+                .into_iter()
+                .map(|map| {
+                    let mut values = Vec::with_capacity(columns.len());
+                    for col in columns.iter() {
+                        let value = map.get(col).cloned().unwrap_or(ApiValue::Null);
+                        let normalized =
+                            ResultNormalizer::normalize_value(value).unwrap_or(ApiValue::Null);
+                        values.push(normalized);
+                    }
+                    Row::new(columns.clone(), values)
+                })
+                .collect()
+        };
 
         let metrics = QueryMetrics {
             parse_time,

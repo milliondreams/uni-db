@@ -17,6 +17,7 @@ uni-common = { workspace = true }
 uni-store = { workspace = true }
 uni-algo = { workspace = true }
 uni-query = { workspace = true }
+uni-query-functions = { workspace = true }
 uni-crdt = { workspace = true }
 mimalloc = { version = "0.1", default-features = false, optional = true }
 tokio = { workspace = true }

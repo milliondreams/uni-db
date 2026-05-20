@@ -2,9 +2,9 @@
 ///
 /// Decomposes opaque BTIC function calls into range predicates that
 /// the existing pushdown infrastructure can evaluate.
-use crate::query::rewrite::context::RewriteContext;
-use crate::query::rewrite::error::RewriteError;
-use crate::query::rewrite::rule::{Arity, RewriteRule};
+use crate::rewrite::context::RewriteContext;
+use crate::rewrite::error::RewriteError;
+use crate::rewrite::rule::{Arity, RewriteRule};
 use uni_cypher::ast::{BinaryOp, Expr};
 
 /// Rewrite rule for `btic_contains_point`
@@ -66,7 +66,7 @@ impl RewriteRule for BticContainsPointRule {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::query::rewrite::context::RewriteContext;
+    use crate::rewrite::context::RewriteContext;
     use uni_cypher::ast::CypherLiteral;
 
     #[test]

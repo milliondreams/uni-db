@@ -240,11 +240,11 @@ pub fn register_cypher_udfs(ctx: &SessionContext) -> DFResult<()> {
     Ok(())
 }
 
-/// Register user-defined custom scalar functions from a [`super::executor::custom_functions::CustomFunctionRegistry`]
+/// Register user-defined custom scalar functions from a [`crate::custom_functions::CustomFunctionRegistry`]
 /// as DataFusion UDFs on the given session context.
 pub fn register_custom_udfs(
     ctx: &SessionContext,
-    registry: &super::executor::custom_functions::CustomFunctionRegistry,
+    registry: &crate::custom_functions::CustomFunctionRegistry,
 ) -> DFResult<()> {
     for (name, func) in registry.iter() {
         // Register with both lowercase and uppercase so that resolve_udfs
@@ -269,12 +269,12 @@ pub fn register_custom_udfs(
 /// the convention used by other Cypher UDFs in this module.
 struct CustomScalarUdf {
     name: String,
-    func: super::executor::custom_functions::CustomScalarFn,
+    func: crate::custom_functions::CustomScalarFn,
     signature: Signature,
 }
 
 impl CustomScalarUdf {
-    fn new(name: String, func: super::executor::custom_functions::CustomScalarFn) -> Self {
+    fn new(name: String, func: crate::custom_functions::CustomScalarFn) -> Self {
         Self {
             signature: Signature::new(TypeSignature::VariadicAny, Volatility::Volatile),
             name,
@@ -1792,7 +1792,7 @@ impl ScalarUDFImpl for TemporalUdf {
         let func_name = self.name.to_uppercase();
         let output_type = self.return_type(&[])?;
         invoke_cypher_udf(args, &output_type, |val_args| {
-            crate::query::datetime::eval_datetime_function(&func_name, val_args).map_err(|e| {
+            crate::datetime::eval_datetime_function(&func_name, val_args).map_err(|e| {
                 datafusion::error::DataFusionError::Execution(format!("{}(): {}", self.name, e))
             })
         })
@@ -1876,7 +1876,7 @@ impl ScalarUDFImpl for DurationPropertyUdf {
                 }
             };
 
-            crate::query::datetime::eval_duration_accessor(dur_str, component).map_err(|e| {
+            crate::datetime::eval_duration_accessor(dur_str, component).map_err(|e| {
                 datafusion::error::DataFusionError::Execution(format!(
                     "_duration_property(): {}",
                     e
@@ -2019,14 +2019,12 @@ impl ScalarUDFImpl for TemporalPropertyUdf {
                 }
             };
 
-            crate::query::datetime::eval_temporal_accessor_value(&val_args[0], &component).map_err(
-                |e| {
-                    datafusion::error::DataFusionError::Execution(format!(
-                        "_temporal_property(): {}",
-                        e
-                    ))
-                },
-            )
+            crate::datetime::eval_temporal_accessor_value(&val_args[0], &component).map_err(|e| {
+                datafusion::error::DataFusionError::Execution(format!(
+                    "_temporal_property(): {}",
+                    e
+                ))
+            })
         })
     }
 }
@@ -2211,7 +2209,7 @@ fn resolve_timezone_offset(tz_name: &str, nanos_utc: i64) -> i32 {
 
 /// Convert a duration in microseconds to a Value::Temporal(Duration).
 fn duration_micros_to_value(micros: i64) -> Value {
-    let dur = crate::query::datetime::CypherDuration::from_micros(micros);
+    let dur = crate::datetime::CypherDuration::from_micros(micros);
     Value::Temporal(uni_common::TemporalValue::Duration {
         months: dur.months,
         days: dur.days,
@@ -2241,7 +2239,7 @@ fn timestamp_nanos_to_value(nanos: i64, tz: Option<&Arc<str>>) -> DFResult<Value
 }
 
 /// Convert a single `ScalarValue` to `uni_common::Value`.
-pub(crate) fn scalar_to_value(scalar: &ScalarValue) -> DFResult<Value> {
+pub fn scalar_to_value(scalar: &ScalarValue) -> DFResult<Value> {
     match scalar {
         ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => {
             // Try to parse as JSON ONLY if it looks like a JSON object, array or quoted string.
@@ -2898,7 +2896,7 @@ fn encode_sort_key_to_buf(value: &Value, buf: &mut Vec<u8>) {
         }
         // Wide temporal: out-of-range dates that eval_datetime_function couldn't fit in i64 nanos.
         // Parse directly with chrono and encode with i128 nanos for correct ordering.
-        if let Some(temporal_type) = crate::query::datetime::classify_temporal(s) {
+        if let Some(temporal_type) = crate::datetime::classify_temporal(s) {
             buf.push(0x07); // Temporal rank
             if encode_wide_temporal_sort_key(s, temporal_type, buf) {
                 return;
@@ -3411,7 +3409,7 @@ impl ScalarUDFImpl for BticScalarUdf {
         let fname = self.name.to_uppercase();
         let rt = self.return_type.clone();
         invoke_cypher_udf(args, &rt, |val_args| {
-            crate::query::expr_eval::eval_btic_function(&fname, val_args)
+            crate::expr_eval::eval_btic_function(&fname, val_args)
                 .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))
         })
     }
@@ -3822,19 +3820,19 @@ fn decode_btic_from_array(arr: &ArrayRef, row: usize) -> DFResult<Option<uni_bti
     Ok(None)
 }
 
-pub(crate) fn create_btic_min_udaf() -> AggregateUDF {
+pub fn create_btic_min_udaf() -> AggregateUDF {
     AggregateUDF::from(BticMinMaxUdaf::new(false))
 }
 
-pub(crate) fn create_btic_max_udaf() -> AggregateUDF {
+pub fn create_btic_max_udaf() -> AggregateUDF {
     AggregateUDF::from(BticMinMaxUdaf::new(true))
 }
 
-pub(crate) fn create_btic_span_agg_udaf() -> AggregateUDF {
+pub fn create_btic_span_agg_udaf() -> AggregateUDF {
     AggregateUDF::from(BticSpanAggUdaf::new())
 }
 
-pub(crate) fn create_btic_count_at_udaf() -> AggregateUDF {
+pub fn create_btic_count_at_udaf() -> AggregateUDF {
     AggregateUDF::from(BticCountAtUdaf::new())
 }
 
@@ -4371,7 +4369,7 @@ impl ScalarUDFImpl for CypherCompareUdf {
         // Fallback to slow path
         let output_type = DataType::Boolean;
         invoke_cypher_udf(args, &output_type, |val_args| {
-            crate::query::expr_eval::eval_binary_op(&val_args[0], &self.op, &val_args[1])
+            crate::expr_eval::eval_binary_op(&val_args[0], &self.op, &val_args[1])
                 .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))
         })
     }
@@ -4404,9 +4402,7 @@ pub fn create_cypher_abs_udf() -> ScalarUDF {
 }
 
 /// Wrap a DataFusion expression with `_cypher_abs()` UDF.
-pub(crate) fn cypher_abs_expr(
-    arg: datafusion::logical_expr::Expr,
-) -> datafusion::logical_expr::Expr {
+pub fn cypher_abs_expr(arg: datafusion::logical_expr::Expr) -> datafusion::logical_expr::Expr {
     datafusion::logical_expr::Expr::ScalarFunction(
         datafusion::logical_expr::expr::ScalarFunction::new_udf(
             Arc::new(create_cypher_abs_udf()),
@@ -4662,7 +4658,7 @@ impl ScalarUDFImpl for CypherArithmeticUdf {
         // Fallback to slow path
         let output_type = DataType::LargeBinary;
         invoke_cypher_udf(args, &output_type, |val_args| {
-            crate::query::expr_eval::eval_binary_op(&val_args[0], &self.op, &val_args[1])
+            crate::expr_eval::eval_binary_op(&val_args[0], &self.op, &val_args[1])
                 .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))
         })
     }
@@ -4723,7 +4719,7 @@ impl ScalarUDFImpl for CypherXorUdf {
             };
             let left = coerce_bool(&val_args[0]);
             let right = coerce_bool(&val_args[1]);
-            crate::query::expr_eval::eval_binary_op(&left, &BinaryOp::Xor, &right)
+            crate::expr_eval::eval_binary_op(&left, &BinaryOp::Xor, &right)
                 .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))
         })
     }
@@ -5414,7 +5410,7 @@ impl ScalarUDFImpl for CypherListConcatUdf {
                 _ => {
                     // Neither is a list — fall back to regular addition
                     // (dispatch routes all CypherValue Plus here because LargeBinary matches)
-                    crate::query::expr_eval::eval_binary_op(
+                    crate::expr_eval::eval_binary_op(
                         &vals[0],
                         &uni_cypher::ast::BinaryOp::Add,
                         &vals[1],
@@ -6323,7 +6319,7 @@ fn create_cypher_to_float64_udf() -> ScalarUDF {
 }
 
 /// Helper: wrap a DataFusion expression with `_cypher_to_float64()` UDF.
-pub(crate) fn cypher_to_float64_expr(
+pub fn cypher_to_float64_expr(
     arg: datafusion::logical_expr::Expr,
 ) -> datafusion::logical_expr::Expr {
     datafusion::logical_expr::Expr::ScalarFunction(
@@ -6335,7 +6331,7 @@ pub(crate) fn cypher_to_float64_expr(
 }
 
 /// Create the `_cypher_to_float64` ScalarUDF for use in physical planning.
-pub(crate) fn cypher_to_float64_udf() -> datafusion::logical_expr::ScalarUDF {
+pub fn cypher_to_float64_udf() -> datafusion::logical_expr::ScalarUDF {
     create_cypher_to_float64_udf()
 }
 
@@ -6587,11 +6583,11 @@ impl DfAccumulator for CypherMinMaxAccumulator {
     }
 }
 
-pub(crate) fn create_cypher_min_udaf() -> AggregateUDF {
+pub fn create_cypher_min_udaf() -> AggregateUDF {
     AggregateUDF::from(CypherMinMaxUdaf::new(false))
 }
 
-pub(crate) fn create_cypher_max_udaf() -> AggregateUDF {
+pub fn create_cypher_max_udaf() -> AggregateUDF {
     AggregateUDF::from(CypherMinMaxUdaf::new(true))
 }
 
@@ -6782,7 +6778,7 @@ impl DfAccumulator for CypherSumAccumulator {
     }
 }
 
-pub(crate) fn create_cypher_sum_udaf() -> AggregateUDF {
+pub fn create_cypher_sum_udaf() -> AggregateUDF {
     AggregateUDF::from(CypherSumUdaf::new())
 }
 
@@ -6932,12 +6928,12 @@ impl DfAccumulator for CypherCollectAccumulator {
     }
 }
 
-pub(crate) fn create_cypher_collect_udaf() -> AggregateUDF {
+pub fn create_cypher_collect_udaf() -> AggregateUDF {
     AggregateUDF::from(CypherCollectUdaf::new())
 }
 
 /// Create a Cypher collect() UDAF expression with optional distinct.
-pub(crate) fn create_cypher_collect_expr(
+pub fn create_cypher_collect_expr(
     arg: datafusion::logical_expr::Expr,
     distinct: bool,
 ) -> datafusion::logical_expr::Expr {
@@ -7371,11 +7367,11 @@ impl DfAccumulator for CypherPercentileContAccumulator {
     }
 }
 
-pub(crate) fn create_cypher_percentile_disc_udaf() -> AggregateUDF {
+pub fn create_cypher_percentile_disc_udaf() -> AggregateUDF {
     AggregateUDF::from(CypherPercentileDiscUdaf::new())
 }
 
-pub(crate) fn create_cypher_percentile_cont_udaf() -> AggregateUDF {
+pub fn create_cypher_percentile_cont_udaf() -> AggregateUDF {
     AggregateUDF::from(CypherPercentileContUdaf::new())
 }
 
@@ -7401,7 +7397,7 @@ fn invoke_similarity_udf(
                 func_name, min_args
             )));
         }
-        crate::query::similar_to::eval_similar_to_pure(&val_args[0], &val_args[1])
+        crate::similar_to::eval_similar_to_pure(&val_args[0], &val_args[1])
             .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))
     })
 }

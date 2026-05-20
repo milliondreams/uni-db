@@ -14,7 +14,7 @@ use chrono::{
 use chrono_tz::Tz;
 use std::collections::HashMap;
 // Re-export TemporalType so downstream modules (expr_eval, etc.) that import from
-// `crate::query::datetime::TemporalType` continue to work.
+// `crate::datetime::TemporalType` continue to work.
 pub use uni_common::TemporalType;
 use uni_common::{TemporalValue, Value};
 

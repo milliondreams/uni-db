@@ -10,13 +10,13 @@ use anyhow::{Result, anyhow};
 use std::cmp::Ordering;
 use uni_common::{TemporalValue, Value};
 
-use crate::query::datetime::{
+use crate::datetime::{
     CypherDuration, TemporalType, add_cypher_duration_to_date, add_cypher_duration_to_datetime,
     add_cypher_duration_to_localdatetime, add_cypher_duration_to_localtime,
     add_cypher_duration_to_time, classify_temporal, eval_datetime_function, is_duration_value,
     parse_datetime_utc, parse_duration_from_value, parse_duration_to_cypher,
 };
-use crate::query::spatial::eval_spatial_function;
+use crate::spatial::eval_spatial_function;
 use uni_cypher::ast::BinaryOp;
 
 /// Evaluate a binary operation on two already-evaluated values.
@@ -531,7 +531,7 @@ fn eval_sub(left: &Value, right: &Value) -> Result<Value> {
         && l.temporal_type() != TemporalType::Duration
     {
         let args = [left.clone(), right.clone()];
-        return crate::query::datetime::eval_datetime_function("DURATION.BETWEEN", &args);
+        return crate::datetime::eval_datetime_function("DURATION.BETWEEN", &args);
     }
 
     // String temporal - duration (backward compat)
@@ -553,7 +553,7 @@ fn eval_sub(left: &Value, right: &Value) -> Result<Value> {
                 if lt != TemporalType::Duration && rt != TemporalType::Duration && lt == rt =>
             {
                 let args = [left.clone(), right.clone()];
-                return crate::query::datetime::eval_datetime_function("DURATION.BETWEEN", &args);
+                return crate::datetime::eval_datetime_function("DURATION.BETWEEN", &args);
             }
             _ => {}
         }
@@ -845,7 +845,7 @@ fn temporal_partial_cmp(left: &TemporalValue, right: &TemporalValue) -> Option<O
 /// and `Value::String` — first tries JSON wrapper format
 /// (`{"Date":{"days_since_epoch":0}}`), then falls back to human-readable
 /// ISO 8601 strings like `"2024-01-15"` or `"12:35:15+05:00"`.
-pub(crate) fn temporal_from_value(v: &Value) -> Option<TemporalValue> {
+pub fn temporal_from_value(v: &Value) -> Option<TemporalValue> {
     match v {
         Value::Temporal(tv) => Some(tv.clone()),
         Value::Map(map) => temporal_from_map_wrapper(map),
@@ -858,7 +858,7 @@ pub(crate) fn temporal_from_value(v: &Value) -> Option<TemporalValue> {
 
 /// Parse a human-readable ISO 8601 temporal string (e.g. `"12:35:15+05:00"`,
 /// `"2024-01-15"`) into a `TemporalValue` by classifying and evaluating it.
-pub(crate) fn temporal_from_human_readable_str(s: &str) -> Option<TemporalValue> {
+pub fn temporal_from_human_readable_str(s: &str) -> Option<TemporalValue> {
     let fn_name = match classify_temporal(s)? {
         TemporalType::Date => "DATE",
         TemporalType::LocalTime => "LOCALTIME",
@@ -879,7 +879,7 @@ pub(crate) fn temporal_from_human_readable_str(s: &str) -> Option<TemporalValue>
 /// Recognizes single-entry maps with a temporal type key (`Date`, `Time`, etc.)
 /// whose value is a map of the appropriate fields. Returns `None` if the map
 /// does not match any temporal pattern.
-pub(crate) fn temporal_from_map_wrapper(
+pub fn temporal_from_map_wrapper(
     map: &std::collections::HashMap<String, Value>,
 ) -> Option<TemporalValue> {
     if map.len() != 1 {
@@ -1055,7 +1055,7 @@ const NANOS_PER_SECOND_CMP: i64 = 1_000_000_000;
 /// Normalize a time-with-timezone string to UTC nanoseconds for comparison.
 fn time_with_tz_to_utc_nanos(s: &str) -> Result<i64> {
     use chrono::Timelike;
-    let (_, time, tz_info) = crate::query::datetime::parse_datetime_with_tz(s)?;
+    let (_, time, tz_info) = crate::datetime::parse_datetime_with_tz(s)?;
     let local_nanos = time.hour() as i64 * 3_600 * NANOS_PER_SECOND_CMP
         + time.minute() as i64 * 60 * NANOS_PER_SECOND_CMP
         + time.second() as i64 * NANOS_PER_SECOND_CMP
@@ -1498,7 +1498,7 @@ fn eval_replace(args: &[Value]) -> Result<Value> {
     }
 }
 
-pub(crate) fn eval_split(args: &[Value]) -> Result<Value> {
+pub fn eval_split(args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
         return Err(anyhow!("split() requires 2 arguments"));
     }
@@ -1720,7 +1720,7 @@ fn eval_range_function(args: &[Value]) -> Result<Value> {
 pub fn eval_scalar_function(
     name: &str,
     args: &[Value],
-    custom_fns: Option<&super::executor::custom_functions::CustomFunctionRegistry>,
+    custom_fns: Option<&crate::custom_functions::CustomFunctionRegistry>,
 ) -> Result<Value> {
     let name_upper = name.to_uppercase();
 
@@ -1842,7 +1842,7 @@ pub fn eval_scalar_function(
             if args.len() < 2 {
                 return Err(anyhow!("similar_to requires at least 2 arguments"));
             }
-            crate::query::similar_to::eval_similar_to_pure(&args[0], &args[1])
+            crate::similar_to::eval_similar_to_pure(&args[0], &args[1])
         }
 
         "VECTOR_SIMILARITY" => {

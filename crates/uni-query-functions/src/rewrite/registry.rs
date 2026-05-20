@@ -1,5 +1,5 @@
 /// Global registry for rewrite rules
-use crate::query::rewrite::rule::RewriteRule;
+use crate::rewrite::rule::RewriteRule;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -24,7 +24,7 @@ impl RewriteRegistry {
     /// Create a registry with all built-in rules registered
     pub fn with_builtin_rules() -> Self {
         let mut registry = Self::new();
-        crate::query::rewrite::rules::register_builtin_rules(&mut registry);
+        crate::rewrite::rules::register_builtin_rules(&mut registry);
         registry
     }
 
@@ -72,8 +72,8 @@ impl Default for RewriteRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::query::rewrite::context::RewriteContext;
-    use crate::query::rewrite::error::RewriteError;
+    use crate::rewrite::context::RewriteContext;
+    use crate::rewrite::error::RewriteError;
     use uni_cypher::ast::{CypherLiteral, Expr};
 
     /// Dummy rule for testing

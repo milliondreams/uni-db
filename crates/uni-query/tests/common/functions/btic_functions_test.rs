@@ -1,4 +1,3 @@
-
 use uni_common::value::{TemporalValue, Value};
 use uni_query::query::expr_eval::{eval_scalar_function, is_scalar_function};
 

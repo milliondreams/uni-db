@@ -1,6 +1,6 @@
 /// Rewrite rule trait and supporting types
-use crate::query::rewrite::context::RewriteContext;
-use crate::query::rewrite::error::RewriteError;
+use crate::rewrite::context::RewriteContext;
+use crate::rewrite::error::RewriteError;
 use uni_cypher::ast::Expr;
 
 /// Trait for implementing query rewrite rules

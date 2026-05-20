@@ -2,7 +2,7 @@
 pub mod btic;
 pub mod temporal;
 
-use crate::query::rewrite::registry::RewriteRegistry;
+use crate::rewrite::registry::RewriteRegistry;
 use std::sync::Arc;
 
 /// Register all built-in rewrite rules

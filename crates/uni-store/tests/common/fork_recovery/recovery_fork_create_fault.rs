@@ -11,7 +11,6 @@
 
 // Rust guideline compliant
 
-
 use std::sync::Arc;
 
 use object_store::ObjectStore;

@@ -1,7 +1,7 @@
 /// Expression tree walker for applying rewrite rules
-use crate::query::rewrite::context::RewriteContext;
-use crate::query::rewrite::error::RewriteError;
-use crate::query::rewrite::registry::RewriteRegistry;
+use crate::rewrite::context::RewriteContext;
+use crate::rewrite::error::RewriteError;
+use crate::rewrite::registry::RewriteRegistry;
 use uni_cypher::ast::{Expr, MapProjectionItem, Query, Statement};
 
 /// Walks expression trees and applies rewrite rules
@@ -547,7 +547,7 @@ impl<'a> ExpressionWalker<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::query::rewrite::context::RewriteConfig;
+    use crate::rewrite::context::RewriteConfig;
     use uni_cypher::ast::CypherLiteral;
 
     #[test]

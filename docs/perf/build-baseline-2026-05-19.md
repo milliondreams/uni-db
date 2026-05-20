@@ -113,13 +113,51 @@ cannot quantify it absolutely without a pre-Phase-1 run.
 
 Future phases should re-measure against this baseline:
 
-| Phase | Expected to move |
-|---|---|
-| **Phase 2** (tokio feature pruning, after profile changes) | Cold-build wall time ↓ ~5–10 % |
-| **Phase 3** (cargo-hakari workspace-hack) | Cold-build wall time ↓ 15–25 %; deps artifact count ↓ significantly (fewer feature-set hash duplicates) |
-| **Phase 4** (uni-query split) | Incremental edit on `df_graph/*` ↓ from 1m22s toward the 27s `check` time; cold build of test binaries should also drop because uni-query can now parallel-compile with `uni-db` |
-| `cargo clean` + next full rebuild | One-time disk reclaim from ~650 G `deps/` down to whatever 29 binaries + warm deps actually need (estimated 80–150 G) |
+| Phase | Expected to move | Observed |
+|---|---|---|
+| Phase 2 (tokio feature pruning, after profile changes) | Cold-build wall time ↓ ~5–10 % | Tokio pruning deferred; profile additions only |
+| Phase 3 (cargo-hakari workspace-hack) | Cold-build wall time ↓ 15–25 %; deps artifact count ↓ significantly | **Reverted** — wheel-matrix design (`provider-onnx` vs `provider-onnx-dynamic`, `gpu-cuda` vs `gpu-metal`) is fundamentally incompatible with hakari's feature-union model |
+| Phase 4 (uni-query split) | Incremental edit on `df_graph/*` ↓ from 1m22s toward the 27s `check` time | **Partial** — see below |
 
-The most actionable single-number target: **drive the incremental
-`nextest --no-run` after a `df_graph/*` edit from 1m22s down to under
-30 s** — that's the inner-loop pain Phase 4 is designed to fix.
+## Phase 4 results (scaled-down split)
+
+The plan's original "extract df_graph as its own crate" was structurally
+infeasible — df_graph, planner, df_planner, executor, similar_to, and
+locy_planner form a strongly-connected component (~79k LOC) with
+bidirectional type references (`LogicalPlan`, `QueryPlanner`,
+`ProcedureValueType`, physical execs). Splitting df_graph cleanly would
+take 1–2 weeks of architectural refactoring (move shared types to a
+common crate, introduce trait abstractions).
+
+The scaled-down split extracted the **leaves** instead — 12 modules
+(~25k LOC) into a new `uni-query-functions` crate:
+
+- `df_udfs`, `datetime`, `df_expr`, `expr_eval` — Cypher UDFs + expressions
+- `cypher_type_coerce`, `function_props`, `fusion`, `pushdown`, `rewrite/`
+- `similar_to` (with `calculate_score` moved here from `df_graph/common`)
+- `spatial`, `custom_functions` (moved from `executor/`)
+
+19 functions promoted from `pub(crate)` to `pub` for cross-crate access.
+`uni-query` re-exports the leaves so downstream callers are unchanged.
+
+### Measured impact
+
+| Scenario | Pre-Phase-4 | Post-Phase-4 |
+|---|---|---|
+| `cargo nextest run --no-run` after touch `df_udfs.rs` (leaf) | 1m22s* | **46.3s** |
+| `cargo nextest run --no-run` after touch `df_graph/locy_fixpoint.rs` (SCC) | 1m22s | **48.1s** |
+| `cargo nextest run` total tests | 3154 passed | **3154 passed** ✓ |
+
+*pre-edit baseline for both was the same 1m22s number (locy_fixpoint
+touch); df_udfs wasn't separately measured pre-split.
+
+**The leaf-vs-SCC distinction barely shows up.** Both edits land in
+~47s because the link phase across 17 test binaries dominates, not the
+compile of the touched module. Phase 1 already cut binary count 14×;
+Phase 4 sits on top of that and squeezes another ~40% out of inner-loop
+test rebuild time.
+
+Where Phase 4 would help more (not directly measured here): cold
+workspace builds with parallelism (uni-query-functions and uni-query
+compile in parallel) and edits that touch multiple files (which would
+have triggered a full uni-query rebuild before).

@@ -13,7 +13,6 @@
 
 // Rust guideline compliant
 
-
 use std::sync::Arc;
 
 use arrow_array::{Int64Array, RecordBatch, RecordBatchIterator, UInt64Array};

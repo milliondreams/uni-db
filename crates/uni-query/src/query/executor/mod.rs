@@ -8,7 +8,6 @@
 //! dispatch, and result normalization.
 
 pub mod core;
-pub mod custom_functions;
 pub mod ddl_procedures;
 pub mod path_builder;
 pub mod procedure;
@@ -17,6 +16,9 @@ pub mod result_normalizer;
 pub mod write;
 
 pub use self::core::Executor;
-pub use custom_functions::{CustomFunctionRegistry, CustomScalarFn};
+// `custom_functions` was extracted to `uni-query-functions` (leaf module).
+// Re-export for back-compat so existing `uni_query::query::executor::*`
+// paths keep working.
 pub use path_builder::PathBuilder;
 pub use result_normalizer::ResultNormalizer;
+pub use uni_query_functions::custom_functions::{CustomFunctionRegistry, CustomScalarFn};

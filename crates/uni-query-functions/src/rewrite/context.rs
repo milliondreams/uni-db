@@ -1,5 +1,5 @@
 /// Rewrite context and configuration
-use crate::query::rewrite::error::RewriteError;
+use crate::rewrite::error::RewriteError;
 use std::collections::HashMap;
 
 /// Contextual information available during query rewriting

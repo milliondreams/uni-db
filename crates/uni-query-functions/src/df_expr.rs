@@ -63,7 +63,7 @@ fn is_primitive_type(dt: &datafusion::arrow::datatypes::DataType) -> bool {
 }
 
 /// Extract a named field from a struct expression using DataFusion's `get_field` function.
-pub(crate) fn struct_getfield(expr: DfExpr, field_name: &str) -> DfExpr {
+pub fn struct_getfield(expr: DfExpr, field_name: &str) -> DfExpr {
     use datafusion::logical_expr::ScalarUDF;
     DfExpr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(
         Arc::new(ScalarUDF::from(
@@ -74,7 +74,7 @@ pub(crate) fn struct_getfield(expr: DfExpr, field_name: &str) -> DfExpr {
 }
 
 /// Extract the `nanos_since_epoch` field from a DateTime struct expression.
-pub(crate) fn extract_datetime_nanos(expr: DfExpr) -> DfExpr {
+pub fn extract_datetime_nanos(expr: DfExpr) -> DfExpr {
     struct_getfield(expr, "nanos_since_epoch")
 }
 
@@ -85,7 +85,7 @@ pub(crate) fn extract_datetime_nanos(expr: DfExpr) -> DfExpr {
 /// `nanos_since_midnight - (offset_seconds * 1_000_000_000)`
 ///
 /// This ensures that `12:00+01:00` and `11:00Z` (same UTC instant) are equal.
-pub(crate) fn extract_time_nanos(expr: DfExpr) -> DfExpr {
+pub fn extract_time_nanos(expr: DfExpr) -> DfExpr {
     use datafusion::logical_expr::Operator;
 
     let nanos_local = struct_getfield(expr.clone(), "nanos_since_midnight");
@@ -128,7 +128,7 @@ fn normalize_datetime_literal(expr: DfExpr) -> DfExpr {
 
 /// Insert `:00` seconds into a datetime string like `2021-06-01T00:00Z` that has
 /// only `HH:MM` after the `T` separator (no seconds component).
-pub(crate) fn normalize_datetime_str(s: &str) -> Option<String> {
+pub fn normalize_datetime_str(s: &str) -> Option<String> {
     // Must be at least YYYY-MM-DDTHH:MM (16 chars) with T at position 10
     if s.len() < 16 || s.as_bytes().get(10) != Some(&b'T') {
         return None;
@@ -215,7 +215,7 @@ fn is_list_expr(e: &DfExpr) -> bool {
 /// Used to determine the identity column when a bare variable is referenced
 /// (e.g., `n` in `RETURN n` should resolve to `n._vid` for nodes).
 ///
-/// This is the physical-layer counterpart to [`crate::query::planner::VariableType`],
+/// This is the physical-layer counterpart to [`crate::planner::VariableType`],
 /// which includes additional variants (`Scalar`, `ScalarLiteral`, `Imported`)
 /// for logical planning. `VariableKind` only tracks graph-entity types needed
 /// for physical expression compilation.
@@ -700,12 +700,12 @@ fn translate_null_check(
 /// Returns `Some(expr)` if `prop` is a duration or temporal accessor,
 /// `None` otherwise.
 fn try_temporal_accessor(base_expr: DfExpr, prop: &str) -> Option<DfExpr> {
-    if crate::query::datetime::is_duration_accessor(prop) {
+    if crate::datetime::is_duration_accessor(prop) {
         Some(dummy_udf_expr(
             "_duration_property",
             vec![base_expr, lit(prop.to_string())],
         ))
-    } else if crate::query::datetime::is_temporal_accessor(prop) {
+    } else if crate::datetime::is_temporal_accessor(prop) {
         Some(dummy_udf_expr(
             "_temporal_property",
             vec![base_expr, lit(prop.to_string())],
@@ -1408,7 +1408,7 @@ fn first_arg(df_args: &[DfExpr]) -> DfExpr {
 }
 
 /// Create a cast expression to the specified data type.
-pub(crate) fn cast_expr(expr: DfExpr, data_type: datafusion::arrow::datatypes::DataType) -> DfExpr {
+pub fn cast_expr(expr: DfExpr, data_type: datafusion::arrow::datatypes::DataType) -> DfExpr {
     DfExpr::Cast(datafusion::logical_expr::Cast {
         expr: Box::new(expr),
         data_type,
@@ -1420,9 +1420,9 @@ pub(crate) fn cast_expr(expr: DfExpr, data_type: datafusion::arrow::datatypes::D
 /// Arrow cannot cast `List<T>` → `LargeBinary` natively, so we route through
 /// the `_cypher_list_to_cv` UDF. Used by `coerce_branch_to` when CASE branches
 /// have mixed `LargeList<T>` and `LargeBinary` types.
-pub(crate) fn list_to_large_binary_expr(expr: DfExpr) -> DfExpr {
+pub fn list_to_large_binary_expr(expr: DfExpr) -> DfExpr {
     DfExpr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(
-        Arc::new(crate::query::df_udfs::create_cypher_list_to_cv_udf()),
+        Arc::new(crate::df_udfs::create_cypher_list_to_cv_udf()),
         vec![expr],
     ))
 }
@@ -1430,9 +1430,9 @@ pub(crate) fn list_to_large_binary_expr(expr: DfExpr) -> DfExpr {
 /// Wrap a native scalar expression (Int64, Float64, Utf8, Boolean, etc.) in the
 /// `_cypher_scalar_to_cv` UDF so it becomes CypherValue-encoded LargeBinary.
 /// Used to normalize mixed-type coalesce arguments.
-pub(crate) fn scalar_to_large_binary_expr(expr: DfExpr) -> DfExpr {
+pub fn scalar_to_large_binary_expr(expr: DfExpr) -> DfExpr {
     DfExpr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(
-        Arc::new(crate::query::df_udfs::create_cypher_scalar_to_cv_udf()),
+        Arc::new(crate::df_udfs::create_cypher_scalar_to_cv_udf()),
         vec![expr],
     ))
 }
@@ -1450,7 +1450,7 @@ fn binary_expr(left: DfExpr, op: datafusion::logical_expr::Operator, right: DfEx
 ///
 /// Returns `None` for non-comparison operators, allowing callers to decide
 /// whether to `unreachable!()` or fall through.
-pub(crate) fn comparison_udf_name(op: datafusion::logical_expr::Operator) -> Option<&'static str> {
+pub fn comparison_udf_name(op: datafusion::logical_expr::Operator) -> Option<&'static str> {
     use datafusion::logical_expr::Operator;
     match op {
         Operator::Eq => Some("_cypher_equal"),
@@ -1519,7 +1519,7 @@ fn translate_aggregate_function(
         }
         "SUM" => {
             check_args!(1, df_args, "SUM");
-            let udaf = Arc::new(crate::query::df_udfs::create_cypher_sum_udaf());
+            let udaf = Arc::new(crate::df_udfs::create_cypher_sum_udaf());
             Some(maybe_distinct(
                 udaf.call(vec![first_arg(df_args)]),
                 distinct,
@@ -1528,18 +1528,18 @@ fn translate_aggregate_function(
         }
         "AVG" => {
             check_args!(1, df_args, "AVG");
-            let coerced = crate::query::df_udfs::cypher_to_float64_expr(first_arg(df_args));
+            let coerced = crate::df_udfs::cypher_to_float64_expr(first_arg(df_args));
             let expr = datafusion::functions_aggregate::average::avg(coerced);
             Some(maybe_distinct(expr, distinct, "AVG"))
         }
         "MIN" => {
             check_args!(1, df_args, "MIN");
-            let udaf = Arc::new(crate::query::df_udfs::create_cypher_min_udaf());
+            let udaf = Arc::new(crate::df_udfs::create_cypher_min_udaf());
             Some(Ok(udaf.call(vec![first_arg(df_args)])))
         }
         "MAX" => {
             check_args!(1, df_args, "MAX");
-            let udaf = Arc::new(crate::query::df_udfs::create_cypher_max_udaf());
+            let udaf = Arc::new(crate::df_udfs::create_cypher_max_udaf());
             Some(Ok(udaf.call(vec![first_arg(df_args)])))
         }
         "PERCENTILEDISC" => {
@@ -1548,8 +1548,8 @@ fn translate_aggregate_function(
                     "percentileDisc() requires exactly 2 arguments"
                 )));
             }
-            let coerced = crate::query::df_udfs::cypher_to_float64_expr(df_args[0].clone());
-            let udaf = Arc::new(crate::query::df_udfs::create_cypher_percentile_disc_udaf());
+            let coerced = crate::df_udfs::cypher_to_float64_expr(df_args[0].clone());
+            let udaf = Arc::new(crate::df_udfs::create_cypher_percentile_disc_udaf());
             Some(Ok(udaf.call(vec![coerced, df_args[1].clone()])))
         }
         "PERCENTILECONT" => {
@@ -1558,13 +1558,13 @@ fn translate_aggregate_function(
                     "percentileCont() requires exactly 2 arguments"
                 )));
             }
-            let coerced = crate::query::df_udfs::cypher_to_float64_expr(df_args[0].clone());
-            let udaf = Arc::new(crate::query::df_udfs::create_cypher_percentile_cont_udaf());
+            let coerced = crate::df_udfs::cypher_to_float64_expr(df_args[0].clone());
+            let udaf = Arc::new(crate::df_udfs::create_cypher_percentile_cont_udaf());
             Some(Ok(udaf.call(vec![coerced, df_args[1].clone()])))
         }
         "COLLECT" => {
             check_args!(1, df_args, "COLLECT");
-            Some(Ok(crate::query::df_udfs::create_cypher_collect_expr(
+            Some(Ok(crate::df_udfs::create_cypher_collect_expr(
                 first_arg(df_args),
                 distinct,
             )))
@@ -1572,24 +1572,24 @@ fn translate_aggregate_function(
         // BTIC aggregates
         "BTIC_MIN" => {
             check_args!(1, df_args, "btic_min");
-            let udaf = Arc::new(crate::query::df_udfs::create_btic_min_udaf());
+            let udaf = Arc::new(crate::df_udfs::create_btic_min_udaf());
             Some(Ok(udaf.call(vec![first_arg(df_args)])))
         }
         "BTIC_MAX" => {
             check_args!(1, df_args, "btic_max");
-            let udaf = Arc::new(crate::query::df_udfs::create_btic_max_udaf());
+            let udaf = Arc::new(crate::df_udfs::create_btic_max_udaf());
             Some(Ok(udaf.call(vec![first_arg(df_args)])))
         }
         "BTIC_SPAN_AGG" => {
             check_args!(1, df_args, "btic_span_agg");
-            let udaf = Arc::new(crate::query::df_udfs::create_btic_span_agg_udaf());
+            let udaf = Arc::new(crate::df_udfs::create_btic_span_agg_udaf());
             Some(Ok(udaf.call(vec![first_arg(df_args)])))
         }
         "BTIC_COUNT_AT" => {
             if df_args.len() != 2 {
                 return Some(Err(anyhow!("btic_count_at requires 2 arguments")));
             }
-            let udaf = Arc::new(crate::query::df_udfs::create_btic_count_at_udaf());
+            let udaf = Arc::new(crate::df_udfs::create_btic_count_at_udaf());
             Some(Ok(udaf.call(df_args.to_vec())))
         }
         _ => None,
@@ -1703,9 +1703,7 @@ fn translate_math_function(name_upper: &str, df_args: &[DfExpr]) -> Option<Resul
             // Use Cypher-aware abs to handle cv_encoded (LargeBinary)
             // arguments from schemaless property arithmetic while
             // preserving integer/float type semantics.
-            Some(Ok(crate::query::df_udfs::cypher_abs_expr(first_arg(
-                df_args,
-            ))))
+            Some(Ok(crate::df_udfs::cypher_abs_expr(first_arg(df_args))))
         }
         "CEIL" | "CEILING" => {
             check_args!(1, df_args, "ceil");
@@ -1726,7 +1724,7 @@ fn translate_math_function(name_upper: &str, df_args: &[DfExpr]) -> Option<Resul
         }
         "SIGN" => {
             check_args!(1, df_args, "sign");
-            let coerced = crate::query::df_udfs::cypher_to_float64_expr(first_arg(df_args));
+            let coerced = crate::df_udfs::cypher_to_float64_expr(first_arg(df_args));
             Some(Ok(expr_fn::signum(coerced)))
         }
         "SQRT" => unary_f64("sqrt", expr_fn::sqrt),
@@ -1885,12 +1883,12 @@ fn try_constant_fold_temporal(
     // For zero-arg temporal constructors, use the frozen statement clock
     let result = if val_args.is_empty() {
         if let Some(frozen) = stmt_time {
-            crate::query::datetime::eval_datetime_function_with_clock(name, &val_args, frozen)?
+            crate::datetime::eval_datetime_function_with_clock(name, &val_args, frozen)?
         } else {
-            crate::query::datetime::eval_datetime_function(name, &val_args)?
+            crate::datetime::eval_datetime_function(name, &val_args)?
         }
     } else {
-        crate::query::datetime::eval_datetime_function(name, &val_args)?
+        crate::datetime::eval_datetime_function(name, &val_args)?
     };
 
     // Convert Value::Temporal → ScalarValue
@@ -1900,7 +1898,7 @@ fn try_constant_fold_temporal(
 
 /// Extract a constant Value from a DfExpr that is known to be constant.
 fn extract_constant_value(expr: &DfExpr) -> Result<Value> {
-    use crate::query::df_udfs::scalar_to_value;
+    use crate::df_udfs::scalar_to_value;
     match expr {
         DfExpr::Literal(sv, _) => scalar_to_value(sv).map_err(|e| anyhow::anyhow!("{}", e)),
         DfExpr::ScalarFunction(func) => {
@@ -1937,7 +1935,7 @@ fn translate_btic_function(
     name: &str,
     df_args: &[DfExpr],
 ) -> Option<Result<DfExpr>> {
-    if crate::query::expr_eval::is_btic_function(name_upper) {
+    if crate::expr_eval::is_btic_function(name_upper) {
         Some(Ok(dummy_udf_expr(name, df_args.to_vec())))
     } else {
         None
@@ -2310,7 +2308,7 @@ impl Hash for DummyUdf {
 }
 
 /// Helper to create a DummyUdf wrapped in a ScalarFunction expression.
-pub(crate) fn dummy_udf_expr(name: &str, args: Vec<DfExpr>) -> DfExpr {
+pub fn dummy_udf_expr(name: &str, args: Vec<DfExpr>) -> DfExpr {
     DfExpr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction {
         func: Arc::new(datafusion::logical_expr::ScalarUDF::new_from_impl(
             DummyUdf::new(name.to_lowercase()),
@@ -2587,7 +2585,7 @@ pub fn apply_type_coercion(expr: &DfExpr, schema: &datafusion::common::DFSchema)
             let expr_type = coerced_expr
                 .get_type(schema)
                 .map_err(|e| anyhow!("Failed to get IN expr type: {}", e))?;
-            crate::query::cypher_type_coerce::build_cypher_in_list(
+            crate::cypher_type_coerce::build_cypher_in_list(
                 coerced_expr,
                 &expr_type,
                 coerced_list,
@@ -2968,16 +2966,14 @@ fn coerce_mismatched_types(
     // Unified primitive type coercion
     if is_primitive_type(left_type) && is_primitive_type(right_type) {
         if op == Operator::Plus {
-            return Some(crate::query::cypher_type_coerce::build_cypher_plus(
+            return Some(crate::cypher_type_coerce::build_cypher_plus(
                 left, left_type, right, right_type,
             ));
         }
         if is_comparison {
-            return Some(Ok(
-                crate::query::cypher_type_coerce::build_cypher_comparison(
-                    left, left_type, right, right_type, op,
-                ),
-            ));
+            return Some(Ok(crate::cypher_type_coerce::build_cypher_comparison(
+                left, left_type, right, right_type, op,
+            )));
         }
     }
 
@@ -3177,12 +3173,12 @@ fn coerce_binary_expr(
 
         // String concatenation via Plus
         if binary.op == Operator::Plus
-            && (crate::query::cypher_type_coerce::is_string_type(&left_type)
-                || crate::query::cypher_type_coerce::is_string_type(&right_type))
+            && (crate::cypher_type_coerce::is_string_type(&left_type)
+                || crate::cypher_type_coerce::is_string_type(&right_type))
             && is_primitive_type(&left_type)
             && is_primitive_type(&right_type)
         {
-            return crate::query::cypher_type_coerce::build_cypher_plus(
+            return crate::cypher_type_coerce::build_cypher_plus(
                 left,
                 &left_type,
                 right,
@@ -3315,7 +3311,7 @@ fn coerce_case_expr(
         .transpose()?;
 
     let mut result_case = if let Some(operand) = coerced_operand {
-        crate::query::cypher_type_coerce::rewrite_simple_case_to_generic(
+        crate::cypher_type_coerce::rewrite_simple_case_to_generic(
             *operand,
             coerced_when_then,
             coerced_else,
@@ -3329,7 +3325,7 @@ fn coerce_case_expr(
         }
     };
 
-    crate::query::cypher_type_coerce::coerce_case_results(&mut result_case, schema)?;
+    crate::cypher_type_coerce::coerce_case_results(&mut result_case, schema)?;
 
     Ok(DfExpr::Case(result_case))
 }

@@ -15,8 +15,7 @@ use anyhow::Result;
 use uni_common::Value;
 use uni_common::core::schema::{DistanceMetric, Schema};
 
-use crate::query::df_graph::common::calculate_score;
-use crate::query::fusion;
+use crate::fusion;
 
 /// Named error types for `similar_to()` validation failures.
 #[derive(Debug, thiserror::Error)]
@@ -265,6 +264,20 @@ pub fn score_vectors(a: &[f32], b: &[f32], metric: &DistanceMetric) -> Result<f3
         DistanceMetric::Dot => Ok(-distance),
         // L2 and all other metrics (#[non_exhaustive]): normalise via calculate_score.
         _ => Ok(calculate_score(distance, metric)),
+    }
+}
+
+/// Convert a raw distance value into a normalised similarity score.
+///
+/// The conversion depends on the distance metric:
+/// - **Cosine**: `(2 - d) / 2` (LanceDB cosine distance ranges 0..2)
+/// - **Dot**: pass-through (already a similarity measure)
+/// - **L2** and others: `1 / (1 + d)`
+pub fn calculate_score(distance: f32, metric: &DistanceMetric) -> f32 {
+    match metric {
+        DistanceMetric::Cosine => (2.0 - distance) / 2.0,
+        DistanceMetric::Dot => distance,
+        _ => 1.0 / (1.0 + distance),
     }
 }
 

@@ -470,7 +470,7 @@ impl PredicateAnalyzer {
 /// uses `labels: Vec<String>` with conjunction semantics (`n:A:B`); we
 /// only accept single-element lists since a conjunctive leaf can't be
 /// expressed as a label-scoped scan without an additional residual filter.
-pub(crate) fn try_label_or_to_union(expr: &Expr, variable: &str) -> Option<Vec<String>> {
+pub fn try_label_or_to_union(expr: &Expr, variable: &str) -> Option<Vec<String>> {
     let mut labels: Vec<String> = Vec::new();
     if collect_label_or_branches(expr, variable, &mut labels) && labels.len() >= 2 {
         Some(labels)
@@ -515,7 +515,7 @@ fn collect_label_or_branches(expr: &Expr, variable: &str, out: &mut Vec<String>)
 ///
 /// Example: `type(r) = 'KNOWS' OR type(r) = 'FOLLOWS'` →
 /// `Some(["KNOWS", "FOLLOWS"])`.
-pub(crate) fn try_type_or_to_union(expr: &Expr, variable: &str) -> Option<Vec<String>> {
+pub fn try_type_or_to_union(expr: &Expr, variable: &str) -> Option<Vec<String>> {
     let mut types: Vec<String> = Vec::new();
     if collect_type_or_branches(expr, variable, &mut types) && types.len() >= 2 {
         Some(types)

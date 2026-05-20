@@ -2,9 +2,9 @@
 ///
 /// This module implements rewrite rules for temporal functions, transforming
 /// them into equivalent predicate expressions that can be pushed down to storage.
-use crate::query::rewrite::context::RewriteContext;
-use crate::query::rewrite::error::RewriteError;
-use crate::query::rewrite::rule::{ArgConstraints, Arity, RewriteRule};
+use crate::rewrite::context::RewriteContext;
+use crate::rewrite::error::RewriteError;
+use crate::rewrite::rule::{ArgConstraints, Arity, RewriteRule};
 use uni_cypher::ast::{BinaryOp, CypherLiteral, Expr};
 
 /// Helper function to extract a string literal from an expression

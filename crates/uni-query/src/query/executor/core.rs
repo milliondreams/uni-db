@@ -248,7 +248,7 @@ pub struct Executor {
     pub(crate) id_reservoir: Option<Arc<uni_store::runtime::TxIdReservoir>>,
     /// User-defined custom scalar function registry.
     pub(crate) custom_function_registry:
-        Option<Arc<super::custom_functions::CustomFunctionRegistry>>,
+        Option<Arc<uni_query_functions::custom_functions::CustomFunctionRegistry>>,
     /// Cooperative cancellation token. Passed to `QueryContext` and
     /// `GraphExecutionContext` so in-flight operators can detect cancellation.
     pub(crate) cancellation_token: Option<tokio_util::sync::CancellationToken>,
@@ -359,7 +359,7 @@ impl Executor {
     /// Attach a custom scalar function registry for user-defined functions.
     pub fn set_custom_functions(
         &mut self,
-        registry: Arc<super::custom_functions::CustomFunctionRegistry>,
+        registry: Arc<uni_query_functions::custom_functions::CustomFunctionRegistry>,
     ) {
         self.custom_function_registry = Some(registry);
     }

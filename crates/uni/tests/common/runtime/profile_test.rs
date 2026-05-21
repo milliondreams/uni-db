@@ -466,6 +466,7 @@ async fn diag_72_set_scales_with_property_count() -> anyhow::Result<()> {
                 })
                 .collect();
 
+            let batch_vids: Vec<i64> = vids[base..base + BATCH].to_vec();
             let tx = db.session().tx().await?;
             let (_res, prof) = tx
                 .execute_with(&cypher)
@@ -490,6 +491,54 @@ async fn diag_72_set_scales_with_property_count() -> anyhow::Result<()> {
             totals.push(prof.total_time_ms);
             last_scan_rows = scan.actual_rows;
             last_mut_rows = mutation.actual_rows;
+
+            // Read-back assertion: SET must actually apply. Catches
+            // silent-no-op regressions (e.g. structural projection missing
+            // → row.get(var) returns None → SET writes nothing while still
+            // reporting rows>0 / time_ms>0). See Fix-3 regression notes
+            // in /home/rohit/.claude/plans/plan-and-implement-a-valiant-flame.md.
+            let verify = db
+                .session()
+                .query_with(
+                    "UNWIND $vids AS v MATCH (n:Entity) WHERE id(n) = v \
+                     RETURN id(n) AS nid, n.p1 AS p1, n.p2 AS p2, n.p3 AS p3, n.p4 AS p4, n.p5 AS p5 \
+                     ORDER BY nid",
+                )
+                .param(
+                    "vids",
+                    uni_db::Value::List(
+                        batch_vids.iter().map(|v| uni_db::Value::Int(*v)).collect(),
+                    ),
+                )
+                .fetch_all()
+                .await?;
+            assert_eq!(
+                verify.len(),
+                BATCH,
+                "read-back row count mismatch for k={k} iter={iter}"
+            );
+            // Build a vid-keyed lookup so we don't depend on result ordering.
+            let by_vid: std::collections::HashMap<i64, &uni_db::Row> = verify
+                .rows()
+                .iter()
+                .map(|r| (r.get::<i64>("nid").unwrap(), r))
+                .collect();
+            for (j, &vid) in batch_vids.iter().enumerate() {
+                let row = by_vid
+                    .get(&vid)
+                    .unwrap_or_else(|| panic!("vid {vid} missing from read-back"));
+                for prop_idx in 1..=k {
+                    let col = format!("p{prop_idx}");
+                    let got: i64 = row
+                        .get(&col)
+                        .unwrap_or_else(|_| panic!("col {col} not in read-back row"));
+                    let want = (iter as i64) * 100 + j as i64 + prop_idx as i64;
+                    assert_eq!(
+                        got, want,
+                        "k={k} iter={iter} j={j} vid={vid} {col}: SET did not apply (got {got}, want {want})"
+                    );
+                }
+            }
         }
 
         let median = |mut v: Vec<f64>| {
@@ -750,7 +799,8 @@ async fn diag_72_set_data_scale_with_hnsw() -> anyhow::Result<()> {
 
     for iter in 0..MEASURE_ITERS {
         let base = (iter * BATCH) % (vids.len().saturating_sub(BATCH).max(1));
-        let updates: Vec<uni_db::Value> = vids[base..base + BATCH]
+        let batch_vids: Vec<i64> = vids[base..base + BATCH].to_vec();
+        let updates: Vec<uni_db::Value> = batch_vids
             .iter()
             .enumerate()
             .map(|(j, &v)| {
@@ -797,6 +847,46 @@ async fn diag_72_set_data_scale_with_hnsw() -> anyhow::Result<()> {
         mutation_samples.push(mutation.time_ms);
         scan_samples.push(scan.time_ms);
         totals.push(prof.total_time_ms);
+
+        // Read-back assertion. Catches silent-no-op regressions (e.g.
+        // structural projection missing → `row.get(var)` returns None →
+        // SET writes nothing while still reporting rows>0 / time_ms>0).
+        let verify = db
+            .session()
+            .query_with(
+                "UNWIND $vids AS v MATCH (n:Entity) WHERE id(n) = v \
+                 RETURN id(n) AS nid, n.frequency AS freq, n.confidence AS conf \
+                 ORDER BY nid",
+            )
+            .param(
+                "vids",
+                uni_db::Value::List(batch_vids.iter().map(|v| uni_db::Value::Int(*v)).collect()),
+            )
+            .fetch_all()
+            .await?;
+        assert_eq!(verify.len(), BATCH, "read-back row count mismatch iter={iter}");
+        let by_vid: std::collections::HashMap<i64, &uni_db::Row> = verify
+            .rows()
+            .iter()
+            .map(|r| (r.get::<i64>("nid").unwrap(), r))
+            .collect();
+        for (j, &vid) in batch_vids.iter().enumerate() {
+            let row = by_vid
+                .get(&vid)
+                .unwrap_or_else(|| panic!("vid {vid} missing from read-back"));
+            let freq: i64 = row.get("freq").expect("freq column missing");
+            let conf: f64 = row.get("conf").expect("conf column missing");
+            let want_freq = (iter as i64) * 1000 + j as i64;
+            let want_conf = 0.5 + (iter as f64) * 0.001;
+            assert_eq!(
+                freq, want_freq,
+                "iter={iter} j={j} vid={vid}: SET n.frequency did not apply (got {freq}, want {want_freq})"
+            );
+            assert!(
+                (conf - want_conf).abs() < 1e-9,
+                "iter={iter} j={j} vid={vid}: SET n.confidence did not apply (got {conf}, want {want_conf})"
+            );
+        }
     }
 
     let median = |mut v: Vec<f64>| {

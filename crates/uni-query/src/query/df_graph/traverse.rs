@@ -1214,6 +1214,8 @@ impl Stream for GraphTraverseStream {
     type Item = DFResult<RecordBatch>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let metrics = self.metrics.clone();
+        let _timer = metrics.elapsed_compute().timer();
         loop {
             let state = std::mem::replace(&mut self.state, TraverseStreamState::Done);
 
@@ -2322,6 +2324,8 @@ impl Stream for GraphTraverseMainStream {
     type Item = DFResult<RecordBatch>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let metrics = self.metrics.clone();
+        let _timer = metrics.elapsed_compute().timer();
         loop {
             let state = std::mem::replace(&mut self.state, GraphTraverseMainState::Done);
 
@@ -3076,6 +3080,8 @@ impl Stream for GraphVariableLengthTraverseStream {
     type Item = DFResult<RecordBatch>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let metrics = self.metrics.clone();
+        let _timer = metrics.elapsed_compute().timer();
         loop {
             let state = std::mem::replace(&mut self.state, VarLengthStreamState::Done);
 
@@ -4442,6 +4448,8 @@ impl Stream for GraphVariableLengthTraverseMainStream {
     type Item = DFResult<RecordBatch>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let metrics = self.metrics.clone();
+        let _timer = metrics.elapsed_compute().timer();
         loop {
             let state = std::mem::replace(&mut self.state, VarLengthMainStreamState::Done);
 

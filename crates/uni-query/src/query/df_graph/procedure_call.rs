@@ -491,6 +491,8 @@ impl Stream for ProcedureCallStream {
     type Item = DFResult<RecordBatch>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let metrics = self.metrics.clone();
+        let _timer = metrics.elapsed_compute().timer();
         loop {
             let state = std::mem::replace(&mut self.state, ProcedureCallState::Done);
 

@@ -3570,6 +3570,8 @@ impl Stream for GraphScanStream {
     type Item = DFResult<RecordBatch>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let metrics = self.metrics.clone();
+        let _timer = metrics.elapsed_compute().timer();
         loop {
             // Use a temporary to avoid borrow issues
             let state = std::mem::replace(&mut self.state, GraphScanState::Done);

@@ -15,7 +15,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::{DataType, SchemaRef};
 use datafusion::common::Result as DFResult;
 use datafusion::execution::TaskContext;
-use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
+use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
@@ -426,6 +426,7 @@ pub fn execute_mutation_stream(
     mutation_kind: MutationKind,
     partition: usize,
     task_ctx: Arc<datafusion::execution::TaskContext>,
+    baseline: BaselineMetrics,
 ) -> DFResult<SendableRecordBatchStream> {
     if mutation_ctx.query_ctx.is_none() {
         tracing::warn!(
@@ -440,6 +441,7 @@ pub fn execute_mutation_stream(
         mutation_kind,
         partition,
         task_ctx,
+        baseline,
     ))
     .try_flatten();
 
@@ -465,7 +467,11 @@ async fn execute_mutation_inner(
     mutation_kind: MutationKind,
     partition: usize,
     task_ctx: Arc<datafusion::execution::TaskContext>,
+    baseline: BaselineMetrics,
 ) -> DFResult<futures::stream::Iter<std::vec::IntoIter<DFResult<RecordBatch>>>> {
+    // Time the whole eager-barrier body: input collection, mutation writes,
+    // and output batch reconstruction. Timer records on Drop.
+    let _timer = baseline.elapsed_compute().timer();
     let mutation_label = mutation_kind_label(&mutation_kind);
 
     // 1. Collect all input batches (eager barrier)
@@ -534,6 +540,8 @@ async fn execute_mutation_inner(
                 "Failed to reconstruct MERGE batches: {e}"
             ))
         })?;
+        let output_rows: usize = result_batches.iter().map(|b| b.num_rows()).sum();
+        baseline.record_output(output_rows);
         let results: Vec<DFResult<RecordBatch>> = result_batches.into_iter().map(Ok).collect();
         return Ok(futures::stream::iter(results));
     }
@@ -563,6 +571,8 @@ async fn execute_mutation_inner(
     let result_batches = rows_to_batches(&rows, &output_schema).map_err(|e| {
         datafusion::error::DataFusionError::Execution(format!("Failed to reconstruct batches: {e}"))
     })?;
+    let output_rows: usize = result_batches.iter().map(|b| b.num_rows()).sum();
+    baseline.record_output(output_rows);
     let results: Vec<DFResult<RecordBatch>> = result_batches.into_iter().map(Ok).collect();
     Ok(futures::stream::iter(results))
 }
@@ -1079,6 +1089,7 @@ impl ExecutionPlan for MutationExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
+        let baseline = BaselineMetrics::new(&self.metrics, partition);
         execute_mutation_stream(
             self.input.clone(),
             self.schema.clone(),
@@ -1086,6 +1097,7 @@ impl ExecutionPlan for MutationExec {
             self.kind.clone(),
             partition,
             context,
+            baseline,
         )
     }
 

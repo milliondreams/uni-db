@@ -635,6 +635,8 @@ impl Stream for GraphUnwindStream {
     type Item = DFResult<RecordBatch>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let metrics = self.metrics.clone();
+        let _timer = metrics.elapsed_compute().timer();
         match self.input.poll_next_unpin(cx) {
             Poll::Ready(Some(Ok(batch))) => {
                 let result = self.process_batch(batch);

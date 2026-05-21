@@ -157,3 +157,116 @@ async fn test_tx_profile_with_params() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// Regression for GitHub issue #72 (item 3): `MutationSetExec` and other
+/// custom DataFusion operators must report non-zero `actual_rows` and
+/// `time_ms` in `ProfileOutput`. Before the fix, `MutationSetExec` reported
+/// `rows=0 time=0 ms` (no metrics wiring); `GraphScanExec` and `UnwindExec`
+/// reported rows but `time=0` (Timer never started).
+#[tokio::test]
+async fn test_profile_metrics_populated_for_mutation_scan_unwind() -> anyhow::Result<()> {
+    let temp_dir = tempdir()?;
+    let db = UniBuilder::new(temp_dir.path().to_str().unwrap().to_string())
+        .build()
+        .await?;
+
+    // Schema and seed data
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL Entity (entity_id STRING NOT NULL, frequency INT)")
+        .await?;
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    for i in 0..10 {
+        tx.execute_with("CREATE (:Entity {entity_id: $id, frequency: 1})")
+            .param("id", format!("e:{i}"))
+            .run()
+            .await?;
+    }
+    tx.commit().await?;
+
+    // Collect node ids
+    let res = db
+        .session()
+        .query("MATCH (n:Entity) RETURN id(n) AS nid ORDER BY n.entity_id")
+        .await?;
+    let vids: Vec<i64> = res
+        .into_iter()
+        .map(|row| row.get::<i64>("nid").unwrap())
+        .collect();
+    assert_eq!(vids.len(), 10);
+
+    // Build the issue's UNWIND ... MATCH WHERE id(n)=u.nid SET ... shape.
+    let updates: Vec<uni_db::Value> = vids
+        .iter()
+        .enumerate()
+        .map(|(i, &vid)| {
+            let mut m = std::collections::HashMap::new();
+            m.insert("nid".to_string(), uni_db::Value::Int(vid));
+            m.insert("new_frequency".to_string(), uni_db::Value::Int((i as i64) + 2));
+            uni_db::Value::Map(m)
+        })
+        .collect();
+
+    let tx = db.session().tx().await?;
+    let (_res, prof) = tx
+        .execute_with(
+            "UNWIND $updates AS u \
+             MATCH (n:Entity) WHERE id(n) = u.nid \
+             SET n.frequency = u.new_frequency",
+        )
+        .param("updates", uni_db::Value::List(updates))
+        .profile()
+        .await?;
+    tx.commit().await?;
+
+    let stats = &prof.runtime_stats;
+    let op_names: Vec<String> = stats.iter().map(|s| s.operator.clone()).collect();
+    println!("Operators: {op_names:?}");
+    for s in stats {
+        println!(
+            "  {:<24} rows={:>4} time={:>8.3} ms",
+            s.operator, s.actual_rows, s.time_ms
+        );
+    }
+
+    // MutationSetExec must now report rows AND time.
+    let mutation = stats
+        .iter()
+        .find(|s| s.operator.contains("MutationSetExec"))
+        .unwrap_or_else(|| panic!("MutationSetExec not found in: {op_names:?}"));
+    assert!(
+        mutation.actual_rows > 0,
+        "MutationSetExec.actual_rows should be > 0, got {}",
+        mutation.actual_rows
+    );
+    assert!(
+        mutation.time_ms > 0.0,
+        "MutationSetExec.time_ms should be > 0 (was {}); metrics wiring regressed",
+        mutation.time_ms
+    );
+
+    // GraphScanExec previously had time=0 (rows-only wiring).
+    let scan = stats
+        .iter()
+        .find(|s| s.operator.contains("GraphScanExec"))
+        .unwrap_or_else(|| panic!("GraphScanExec not found in: {op_names:?}"));
+    assert!(
+        scan.time_ms > 0.0,
+        "GraphScanExec.time_ms should be > 0 (was {}); Timer wiring regressed",
+        scan.time_ms
+    );
+
+    // GraphUnwindExec previously had time=0.
+    let unwind = stats
+        .iter()
+        .find(|s| s.operator.contains("UnwindExec"))
+        .unwrap_or_else(|| panic!("UnwindExec not found in: {op_names:?}"));
+    assert!(
+        unwind.time_ms > 0.0,
+        "UnwindExec.time_ms should be > 0 (was {}); Timer wiring regressed",
+        unwind.time_ms
+    );
+
+    Ok(())
+}

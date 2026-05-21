@@ -268,6 +268,8 @@ impl Stream for BestByStream {
     type Item = DFResult<RecordBatch>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let metrics = self.metrics.clone();
+        let _timer = metrics.elapsed_compute().timer();
         match &mut self.state {
             BestByStreamState::Running(fut) => match fut.as_mut().poll(cx) {
                 Poll::Ready(Ok(batch)) => {

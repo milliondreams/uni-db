@@ -253,6 +253,9 @@ impl Stream for BindZeroLengthPathStream {
             Poll::Ready(Some(Ok(batch))) => {
                 let _timer = self.metrics.elapsed_compute().timer();
                 let result = self.process_batch(batch);
+                if let Ok(ref b) = result {
+                    self.metrics.record_output(b.num_rows());
+                }
                 Poll::Ready(Some(result))
             }
             other => other,

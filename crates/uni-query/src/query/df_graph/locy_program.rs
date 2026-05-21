@@ -618,6 +618,8 @@ impl Stream for ProgramStream {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
+        let metrics = this.metrics.clone();
+        let _timer = metrics.elapsed_compute().timer();
         loop {
             match &mut this.state {
                 ProgramStreamState::Running(fut) => match fut.as_mut().poll(cx) {

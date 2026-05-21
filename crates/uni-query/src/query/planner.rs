@@ -8377,6 +8377,16 @@ fn mark_set_item_variables(items: &[SetItem], properties: &mut HashMap<String, H
                 // SET n.prop = val — mark n via the property expr, collect from value.
                 // Also mark the variable with "*" for full structural projection so
                 // edge identity fields (_src/_dst) are available for write operations.
+                //
+                // Note: dropping "*" here was attempted as an optimization but breaks
+                // the SET pipeline — `need_full` (checked at multiple sites in
+                // df_planner.rs) gates `add_structural_projection`, which builds the
+                // bare `n` Map column the executor reads via `row.get(var_name)`.
+                // Without that Map, the SET silently no-ops. The right narrow-
+                // projection path is to add a distinct "structural-needed" sentinel
+                // separate from "*" and update every `need_full` check accordingly —
+                // a wider planner refactor reserved for follow-up. See the diag
+                // tests in profile_test.rs for the measured opportunity.
                 collect_properties_from_expr_into(expr, properties);
                 collect_properties_from_expr_into(value, properties);
                 if let Expr::Property(base, _) = expr

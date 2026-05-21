@@ -227,20 +227,31 @@ impl L0Buffer {
         }
 
         for (k, v) in properties {
-            // Attempt merge if CRDT — convert to serde_json::Value for CRDT deserialization
-            let json_v: serde_json::Value = v.clone().into();
-            if let Ok(mut new_crdt) = serde_json::from_value::<Crdt>(json_v)
-                && let Some(existing_v) = entry.get(&k)
-                && let Ok(existing_crdt) = serde_json::from_value::<Crdt>(existing_v.clone().into())
-            {
-                // Use try_merge to avoid panic on type mismatch
-                if new_crdt.try_merge(&existing_crdt).is_ok()
-                    && let Ok(merged_json) = serde_json::to_value(new_crdt)
+            // Crdt is `#[serde(tag = "t", content = "d")]` (see uni-crdt/src/lib.rs:42-61):
+            // it can only deserialize from a JSON Object. Only `Value::Map(_)` converts
+            // to a JSON Object — every other Value variant fails `from_value::<Crdt>`
+            // deterministically, but only after allocating the full JSON tree.
+            //
+            // Gating the probe on Map saves the allocation/deser for large non-Map
+            // values (notably embedding columns: `Value::List(...)` with thousands of
+            // floats), which dominate per-property cost on wide-row schemas. See the
+            // diag tests in profile_test.rs for the measurement.
+            if matches!(&v, uni_common::Value::Map(_)) {
+                let json_v: serde_json::Value = v.clone().into();
+                if let Ok(mut new_crdt) = serde_json::from_value::<Crdt>(json_v)
+                    && let Some(existing_v) = entry.get(&k)
+                    && let Ok(existing_crdt) =
+                        serde_json::from_value::<Crdt>(existing_v.clone().into())
                 {
-                    entry.insert(k, uni_common::Value::from(merged_json));
-                    continue;
+                    // Use try_merge to avoid panic on type mismatch
+                    if new_crdt.try_merge(&existing_crdt).is_ok()
+                        && let Ok(merged_json) = serde_json::to_value(new_crdt)
+                    {
+                        entry.insert(k, uni_common::Value::from(merged_json));
+                        continue;
+                    }
+                    // try_merge failed (type mismatch) — fall through to overwrite.
                 }
-                // try_merge failed (type mismatch) - fall through to overwrite
             }
             // Fallback: Overwrite
             entry.insert(k, v);

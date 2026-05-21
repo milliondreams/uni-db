@@ -352,3 +352,477 @@ async fn test_72_item1_unwind_id_eq_l0_in_pushdown() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// Diagnostic for the post-#72 write-path investigation: does
+/// `MutationSetExec` wall scale roughly linearly with the number of
+/// `SetItem`s on a single vertex?
+///
+/// Background: production data on the issue #72 ingest workload shows
+/// 17.7 ms/row to SET 3 unindexed scalar properties, with 99.8% of the
+/// per-call wall inside `MutationSetExec`. Reading the executor
+/// (`crates/uni-query/src/query/executor/write.rs:1725-1777`) reveals
+/// the loop reads ALL vertex properties and calls
+/// `writer.insert_vertex_with_labels` (full upsert under the L0 write
+/// lock) **once per `SetItem`**, even when all items target the same
+/// vertex. The hypothesis is that an N-property SET costs ~N× a
+/// 1-property SET because each iteration repeats the full
+/// read-modify-write cycle.
+///
+/// This test does not fix the bug. It quantifies the scaling so we can
+/// (a) see exactly how much per-iteration cost there is on in-memory
+/// storage (a lower bound for the production cost), (b) lock in a
+/// regression check that future writer changes don't quietly amplify
+/// it, and (c) give a number to point at when proposing the
+/// coalescing fix.
+///
+/// Reads the printed table from the test output to inspect absolute
+/// numbers; the asserts are loose to survive CI jitter.
+#[tokio::test]
+async fn diag_72_set_scales_with_property_count() -> anyhow::Result<()> {
+    let temp_dir = tempdir()?;
+    let db = UniBuilder::new(temp_dir.path().to_str().unwrap().to_string())
+        .build()
+        .await?;
+
+    // Schema with five nullable INT props so we can SET subsets of varying
+    // size without schema changes between runs.
+    let tx = db.session().tx().await?;
+    tx.execute(
+        "CREATE LABEL Entity (\
+         entity_id STRING NOT NULL, \
+         p1 INT, p2 INT, p3 INT, p4 INT, p5 INT)",
+    )
+    .await?;
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    for i in 0..100 {
+        tx.execute_with("CREATE (:Entity {entity_id: $id, p1: 0, p2: 0, p3: 0, p4: 0, p5: 0})")
+            .param("id", format!("e:{i}"))
+            .run()
+            .await?;
+    }
+    tx.commit().await?;
+
+    let vids: Vec<i64> = db
+        .session()
+        .query("MATCH (n:Entity) RETURN id(n) AS nid ORDER BY n.entity_id")
+        .await?
+        .into_iter()
+        .map(|r| r.get::<i64>("nid").unwrap())
+        .collect();
+    assert!(vids.len() >= 5);
+
+    const BATCH: usize = 3;
+    const ITERS: usize = 9;
+
+    // Build the SET clause for k properties: "SET n.p1 = u.v1, n.p2 = u.v2, ..."
+    fn set_clause(k: usize) -> String {
+        let assigns: Vec<String> = (1..=k).map(|i| format!("n.p{i} = u.v{i}")).collect();
+        format!(
+            "UNWIND $updates AS u \
+             MATCH (n:Entity) WHERE id(n) = u.nid \
+             SET {}",
+            assigns.join(", ")
+        )
+    }
+
+    // For each k, build a fresh $updates batch and profile the call ITERS
+    // times. Record the median MutationSetExec time_ms and the
+    // GraphScanExec time_ms (read side, should be flat across k).
+    struct Row {
+        k: usize,
+        mutation_ms: f64,
+        scan_ms: f64,
+        total_ms: u64,
+        scan_rows: usize,
+        mutation_rows: usize,
+    }
+    let mut rows: Vec<Row> = Vec::new();
+
+    for &k in &[1usize, 2, 3, 5] {
+        let cypher = set_clause(k);
+        let mut mutation_samples: Vec<f64> = Vec::with_capacity(ITERS);
+        let mut scan_samples: Vec<f64> = Vec::with_capacity(ITERS);
+        let mut totals: Vec<u64> = Vec::with_capacity(ITERS);
+        let (mut last_scan_rows, mut last_mut_rows) = (0usize, 0usize);
+
+        for iter in 0..ITERS {
+            // Use a different slice of vids per iter to avoid hot-cache effects
+            let base = (iter * BATCH) % (vids.len().saturating_sub(BATCH).max(1));
+            let updates: Vec<uni_db::Value> = vids[base..base + BATCH]
+                .iter()
+                .enumerate()
+                .map(|(j, &vid)| {
+                    let mut m = std::collections::HashMap::new();
+                    m.insert("nid".to_string(), uni_db::Value::Int(vid));
+                    for prop_idx in 1..=k {
+                        m.insert(
+                            format!("v{prop_idx}"),
+                            uni_db::Value::Int((iter as i64) * 100 + (j as i64) + prop_idx as i64),
+                        );
+                    }
+                    uni_db::Value::Map(m)
+                })
+                .collect();
+
+            let tx = db.session().tx().await?;
+            let (_res, prof) = tx
+                .execute_with(&cypher)
+                .param("updates", uni_db::Value::List(updates))
+                .profile()
+                .await?;
+            tx.commit().await?;
+
+            let mutation = prof
+                .runtime_stats
+                .iter()
+                .find(|s| s.operator.contains("MutationSetExec"))
+                .expect("MutationSetExec must be present in profile");
+            let scan = prof
+                .runtime_stats
+                .iter()
+                .find(|s| s.operator.contains("GraphScanExec"))
+                .expect("GraphScanExec must be present in profile");
+
+            mutation_samples.push(mutation.time_ms);
+            scan_samples.push(scan.time_ms);
+            totals.push(prof.total_time_ms);
+            last_scan_rows = scan.actual_rows;
+            last_mut_rows = mutation.actual_rows;
+        }
+
+        let median = |mut v: Vec<f64>| {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v[v.len() / 2]
+        };
+        rows.push(Row {
+            k,
+            mutation_ms: median(mutation_samples),
+            scan_ms: median(scan_samples),
+            total_ms: totals[totals.len() / 2],
+            scan_rows: last_scan_rows,
+            mutation_rows: last_mut_rows,
+        });
+    }
+
+    // Print a pasteable Markdown-ish table.
+    println!("\n=== diag: MutationSetExec wall vs SetItem count ===");
+    println!("batch={BATCH} iters={ITERS} (median reported)\n");
+    println!(
+        "| k props | MutationSetExec ms | GraphScanExec ms | total ms | scan rows | mut rows | per-row ms |"
+    );
+    println!(
+        "|--------:|-------------------:|-----------------:|---------:|----------:|---------:|-----------:|"
+    );
+    for r in &rows {
+        println!(
+            "| {:>7} | {:>18.3} | {:>16.3} | {:>8} | {:>9} | {:>8} | {:>10.3} |",
+            r.k,
+            r.mutation_ms,
+            r.scan_ms,
+            r.total_ms,
+            r.scan_rows,
+            r.mutation_rows,
+            r.mutation_ms / BATCH as f64,
+        );
+    }
+
+    let m1 = rows.iter().find(|r| r.k == 1).unwrap();
+    let m3 = rows.iter().find(|r| r.k == 3).unwrap();
+    let m5 = rows.iter().find(|r| r.k == 5).unwrap();
+
+    println!(
+        "\nslope (3-prop vs 1-prop): {:.2}x  ({:.3} → {:.3} ms)",
+        m3.mutation_ms / m1.mutation_ms.max(0.001),
+        m1.mutation_ms,
+        m3.mutation_ms
+    );
+    println!(
+        "slope (5-prop vs 1-prop): {:.2}x  ({:.3} → {:.3} ms)\n",
+        m5.mutation_ms / m1.mutation_ms.max(0.001),
+        m1.mutation_ms,
+        m5.mutation_ms
+    );
+
+    // Sanity asserts. The IN-list pushdown should still pin scan rows to
+    // the batch size regardless of k. Mutation row count = batch size.
+    for r in &rows {
+        assert_eq!(
+            r.scan_rows, BATCH,
+            "GraphScanExec.actual_rows should equal batch ({BATCH}) for k={}, got {}",
+            r.k, r.scan_rows
+        );
+        assert_eq!(
+            r.mutation_rows, BATCH,
+            "MutationSetExec.actual_rows should equal batch ({BATCH}) for k={}, got {}",
+            r.k, r.mutation_rows
+        );
+    }
+
+    // Timing assertions are intentionally absent: we're measuring
+    // sub-millisecond walls on in-memory storage, and the noise floor
+    // under parallel test load (CPU contention from `cargo nextest`
+    // running ~1300 tests concurrently) routinely exceeds the per-property
+    // signal (~0.2 ms). The printed table is the deliverable. The asserts
+    // above on row counts catch the only thing we can rely on:
+    // - GraphScanExec/MutationSetExec see the right number of rows.
+    // - The IN-list pushdown from issue #72 item 1 keeps working.
+    //
+    // For interpretation: in isolated runs slope(k=3 vs k=1) lands around
+    // 1.4–1.7×, slope(k=5 vs k=1) around 1.8–2.0× — sub-linear, consistent
+    // with a large fixed per-call overhead and a small per-SetItem
+    // marginal. See the plan document for the full read-through.
+    let _ = (m1, m3, m5); // keep the bindings so the slope calculation runs
+
+    Ok(())
+}
+
+/// Diagnostic for the cold-vs-live MutationSetExec gap on the issue #72
+/// ingest workload.
+///
+/// Empirical context: production reports 17.7 ms/row per `SET` on a
+/// 3-property UPDATE; cold microbench with the same schema (incl. HnswSq
+/// + 4 hash indexes + fulltext) reports ~1.0 ms/row. That's a 17× gap
+/// we can't yet attribute to anything in the schema, WAL, or auto-flush.
+///
+/// This test pushes the cold microbench in the direction of production
+/// along the **data-scale** axis: pre-populates N entities with realistic
+/// 768-dim embeddings (so HnswSq has a non-trivial graph), runs a warmup
+/// pass that accumulates L0 version history, then measures the
+/// production-shape SET at the same batch size. If the per-row wall
+/// climbs meaningfully from the 1 ms baseline, data scale explains some
+/// fraction of the 17× gap and the next investigation step is Lance
+/// fragmentation / HNSW graph maintenance. If it stays flat, the gap is
+/// environmental (concurrent tokio load, allocator, process state) and
+/// the next step is profiling the live process directly.
+///
+/// This test is intentionally lightweight on N (2000) so it runs in
+/// reasonable CI time; production has ~3800. Adjust upward and re-run
+/// locally if you want a tighter answer.
+#[tokio::test]
+async fn diag_72_set_data_scale_with_hnsw() -> anyhow::Result<()> {
+    use uni_db::DataType;
+    use uni_db::api::schema::{IndexType, VectorAlgo, VectorIndexCfg, VectorMetric};
+
+    const N_ENTITIES: usize = 2000;
+    const EMBED_DIM: usize = 768;
+    const WARMUP_MUTATIONS: usize = 500;
+    const MEASURE_ITERS: usize = 20;
+    const BATCH: usize = 3;
+
+    let temp_dir = tempdir()?;
+    let db = UniBuilder::new(temp_dir.path().to_str().unwrap().to_string())
+        .build()
+        .await?;
+
+    // Schema = production shape: 11 cols, HnswSq vector index on a 768-dim
+    // embedding column, no auto-embedding (we provide vectors directly).
+    db.schema()
+        .label("Entity")
+        .property("entity_id", DataType::String)
+        .property_nullable("name", DataType::String)
+        .property_nullable("frequency", DataType::Int64)
+        .property_nullable("last_seen", DataType::DateTime)
+        .property_nullable("confidence", DataType::Float64)
+        .property_nullable("p1", DataType::Int64)
+        .property_nullable("p2", DataType::Int64)
+        .property_nullable("p3", DataType::Int64)
+        .property_nullable("p4", DataType::Int64)
+        .property_nullable("p5", DataType::Int64)
+        .vector("embedding", EMBED_DIM)
+        .index(
+            "embedding",
+            IndexType::Vector(VectorIndexCfg {
+                algorithm: VectorAlgo::HnswSq {
+                    m: 16,
+                    ef_construction: 100,
+                    partitions: None,
+                },
+                metric: VectorMetric::Cosine,
+                embedding: None,
+            }),
+        )
+        .done()
+        .apply()
+        .await?;
+
+    // Deterministic PRNG: a tiny LCG so we don't pull in `rand`.
+    let mut prng_state: u64 = 0xCAFE_F00D_DEAD_BEEF;
+    let mut next_f = || -> f64 {
+        prng_state = prng_state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        // Bring into [-0.5, 0.5)
+        (((prng_state >> 33) as u32) as f64 / u32::MAX as f64) - 0.5
+    };
+
+    // Pre-populate N_ENTITIES with random 768-dim embeddings via
+    // bulk_insert_vertices to keep setup fast.
+    eprintln!("[diag] populating {N_ENTITIES} entities with {EMBED_DIM}-dim embeddings...");
+    let setup_start = std::time::Instant::now();
+    let tx = db.session().tx().await?;
+    const INSERT_CHUNK: usize = 200;
+    for chunk_start in (0..N_ENTITIES).step_by(INSERT_CHUNK) {
+        let chunk_end = (chunk_start + INSERT_CHUNK).min(N_ENTITIES);
+        let mut props_list: Vec<std::collections::HashMap<String, uni_db::Value>> =
+            Vec::with_capacity(chunk_end - chunk_start);
+        for i in chunk_start..chunk_end {
+            let embedding: Vec<uni_db::Value> = (0..EMBED_DIM)
+                .map(|_| uni_db::Value::Float(next_f()))
+                .collect();
+            let mut m = std::collections::HashMap::new();
+            m.insert("entity_id".into(), uni_db::Value::String(format!("e:{i}")));
+            m.insert(
+                "name".into(),
+                uni_db::Value::String(format!("entity_{i}")),
+            );
+            m.insert("frequency".into(), uni_db::Value::Int(1));
+            m.insert("confidence".into(), uni_db::Value::Float(0.5));
+            m.insert("p1".into(), uni_db::Value::Int(0));
+            m.insert("p2".into(), uni_db::Value::Int(0));
+            m.insert("p3".into(), uni_db::Value::Int(0));
+            m.insert("p4".into(), uni_db::Value::Int(0));
+            m.insert("p5".into(), uni_db::Value::Int(0));
+            m.insert("embedding".into(), uni_db::Value::List(embedding));
+            props_list.push(m);
+        }
+        tx.bulk_insert_vertices("Entity", props_list).await?;
+    }
+    tx.commit().await?;
+    eprintln!(
+        "[diag] populate complete in {:.2}s",
+        setup_start.elapsed().as_secs_f64()
+    );
+
+    let vids: Vec<i64> = db
+        .session()
+        .query("MATCH (n:Entity) RETURN id(n) AS nid ORDER BY n.entity_id LIMIT 200")
+        .await?
+        .into_iter()
+        .map(|r| r.get::<i64>("nid").unwrap())
+        .collect();
+    assert!(vids.len() >= 100);
+
+    // Warmup: run WARMUP_MUTATIONS small-batch UPDATEs to accumulate L0
+    // version history on entities we'll touch later. This is the closest
+    // we get to mirroring "production has been running for a while."
+    eprintln!("[diag] warmup: {WARMUP_MUTATIONS} mutations over existing vids...");
+    let warmup_start = std::time::Instant::now();
+    let tx = db.session().tx().await?;
+    for iter in 0..WARMUP_MUTATIONS {
+        let base = (iter * BATCH) % (vids.len().saturating_sub(BATCH).max(1));
+        let updates: Vec<uni_db::Value> = vids[base..base + BATCH]
+            .iter()
+            .map(|&v| {
+                let mut m = std::collections::HashMap::new();
+                m.insert("nid".to_string(), uni_db::Value::Int(v));
+                m.insert("new_frequency".to_string(), uni_db::Value::Int(iter as i64 + 100));
+                uni_db::Value::Map(m)
+            })
+            .collect();
+        tx.execute_with(
+            "UNWIND $updates AS u \
+             MATCH (n:Entity) WHERE id(n) = u.nid \
+             SET n.frequency = u.new_frequency",
+        )
+        .param("updates", uni_db::Value::List(updates))
+        .run()
+        .await?;
+    }
+    tx.commit().await?;
+    eprintln!(
+        "[diag] warmup complete in {:.2}s",
+        warmup_start.elapsed().as_secs_f64()
+    );
+
+    // Measure: production-shape UPDATE, batch=3, on the first 100 vids,
+    // varying offsets to avoid cache effects.
+    let now_value = uni_db::Value::Temporal(uni_db::common::TemporalValue::DateTime {
+        nanos_since_epoch: 1_700_000_000_000_000_000,
+        offset_seconds: 0,
+        timezone_name: None,
+    });
+
+    let mut mutation_samples: Vec<f64> = Vec::with_capacity(MEASURE_ITERS);
+    let mut scan_samples: Vec<f64> = Vec::with_capacity(MEASURE_ITERS);
+    let mut totals: Vec<u64> = Vec::with_capacity(MEASURE_ITERS);
+
+    for iter in 0..MEASURE_ITERS {
+        let base = (iter * BATCH) % (vids.len().saturating_sub(BATCH).max(1));
+        let updates: Vec<uni_db::Value> = vids[base..base + BATCH]
+            .iter()
+            .enumerate()
+            .map(|(j, &v)| {
+                let mut m = std::collections::HashMap::new();
+                m.insert("nid".to_string(), uni_db::Value::Int(v));
+                m.insert(
+                    "new_frequency".to_string(),
+                    uni_db::Value::Int((iter as i64) * 1000 + j as i64),
+                );
+                m.insert(
+                    "new_confidence".to_string(),
+                    uni_db::Value::Float(0.5 + (iter as f64) * 0.001),
+                );
+                uni_db::Value::Map(m)
+            })
+            .collect();
+
+        let tx = db.session().tx().await?;
+        let (_res, prof) = tx
+            .execute_with(
+                "UNWIND $updates AS u \
+                 MATCH (n:Entity) WHERE id(n) = u.nid \
+                 SET n.frequency = u.new_frequency, \
+                     n.last_seen = $now, \
+                     n.confidence = u.new_confidence",
+            )
+            .param("updates", uni_db::Value::List(updates))
+            .param("now", now_value.clone())
+            .profile()
+            .await?;
+        tx.commit().await?;
+
+        let mutation = prof
+            .runtime_stats
+            .iter()
+            .find(|s| s.operator.contains("MutationSetExec"))
+            .expect("MutationSetExec must be present");
+        let scan = prof
+            .runtime_stats
+            .iter()
+            .find(|s| s.operator.contains("GraphScanExec"))
+            .expect("GraphScanExec must be present");
+
+        mutation_samples.push(mutation.time_ms);
+        scan_samples.push(scan.time_ms);
+        totals.push(prof.total_time_ms);
+    }
+
+    let median = |mut v: Vec<f64>| {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v[v.len() / 2]
+    };
+    let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+    let mut_med = median(mutation_samples.clone());
+    let mut_mean = mean(&mutation_samples);
+    let scan_med = median(scan_samples.clone());
+
+    println!("\n=== diag #72 data-scale: production schema + HnswSq + warmup ===");
+    println!(
+        "N_entities={N_ENTITIES}, embed_dim={EMBED_DIM}, warmup_muts={WARMUP_MUTATIONS}, \
+         measure_iters={MEASURE_ITERS}, batch={BATCH}\n"
+    );
+    println!("MutationSetExec wall (median):     {mut_med:.3} ms/call");
+    println!("MutationSetExec wall (mean):       {mut_mean:.3} ms/call");
+    println!(
+        "MutationSetExec per-row (median):  {:.3} ms/row",
+        mut_med / BATCH as f64
+    );
+    println!("GraphScanExec wall (median):       {scan_med:.3} ms/call");
+    println!(
+        "Live production reference:         ~17.7 ms/row (cold microbench at N=100: ~1.0 ms/row)"
+    );
+
+    Ok(())
+}

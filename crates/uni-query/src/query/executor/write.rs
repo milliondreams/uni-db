@@ -27,6 +27,27 @@ struct EdgeIdentity {
     edge_type_id: u32,
 }
 
+/// Per-variable accumulator for SetItem::Property items targeting a vertex.
+///
+/// Built lazily on the first SetItem touching each variable, then mutated
+/// in place across subsequent items. Flushed once at end of the SET
+/// clause (or earlier if a non-Property SetItem on the same var lands).
+struct PendingVertexSet {
+    vid: Vid,
+    labels: Vec<String>,
+    props: HashMap<String, Value>,
+}
+
+/// Per-variable accumulator for SetItem::Property items targeting an edge.
+struct PendingEdgeSet {
+    src: Vid,
+    dst: Vid,
+    edge_type_id: u32,
+    eid: Eid,
+    edge_type_name: String,
+    props: HashMap<String, Value>,
+}
+
 impl Executor {
     /// Extracts labels from a node value.
     ///
@@ -1732,6 +1753,28 @@ impl Executor {
         ctx: Option<&QueryContext>,
         tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
     ) -> Result<()> {
+        // Coalesce SetItem::Property items by target so we do ONE read + ONE
+        // write per (variable, target) instead of one read-modify-write cycle
+        // per item. For an UPDATE that sets N properties on the same vertex
+        // (e.g. the ingest hotpath `SET n.frequency = ..., n.last_seen = ...,
+        // n.confidence = ...`), this collapses N redundant
+        // `get_all_vertex_props_with_ctx` + `insert_vertex_with_labels` cycles
+        // into one. See profile_test.rs `diag_72_set_data_scale_with_hnsw` for
+        // the measurement, and the plan in
+        // /home/rohit/.claude/plans/plan-and-implement-a-valiant-flame.md
+        // for the rationale.
+        //
+        // RHS evaluation order is preserved: we evaluate each RHS inline and
+        // update the row binding immediately, so a later SetItem on the same
+        // variable that reads `n.<earlier-prop>` sees the new value.
+        //
+        // Non-Property variants (Labels, Variable, VariablePlus) are less
+        // common and have lower payoff; before processing one, we flush any
+        // pending updates for the same variable so it sees the latest L0
+        // state and ordering semantics are preserved.
+        let mut pending_v: HashMap<String, PendingVertexSet> = HashMap::new();
+        let mut pending_e: HashMap<String, PendingEdgeSet> = HashMap::new();
+
         for item in items {
             match item {
                 SetItem::Property { expr, value } => {
@@ -1743,33 +1786,34 @@ impl Executor {
                             let labels =
                                 Self::extract_labels_from_node(node_val).unwrap_or_default();
                             let schema = self.storage.schema_manager().schema().clone();
-                            let mut props = prop_manager
-                                .get_all_vertex_props_with_ctx(vid, ctx)
-                                .await?
-                                .unwrap_or_default();
+
+                            // Lazy one-time read for this variable.
+                            if !pending_v.contains_key(var_name) {
+                                let initial = prop_manager
+                                    .get_all_vertex_props_with_ctx(vid, ctx)
+                                    .await?
+                                    .unwrap_or_default();
+                                pending_v.insert(
+                                    var_name.clone(),
+                                    PendingVertexSet {
+                                        vid,
+                                        labels: labels.clone(),
+                                        props: initial,
+                                    },
+                                );
+                            }
+
                             let val = self
                                 .evaluate_expr(value, row, prop_manager, params, ctx)
                                 .await?;
                             Self::validate_property_value(prop_name, &val, &schema, &labels)?;
-                            props.insert(prop_name.clone(), val.clone());
 
-                            // Enrich with generated columns
-                            for label_name in &labels {
-                                self.enrich_properties_with_generated_columns(
-                                    label_name,
-                                    &mut props,
-                                    prop_manager,
-                                    params,
-                                    ctx,
-                                )
-                                .await?;
-                            }
+                            let pv = pending_v
+                                .get_mut(var_name)
+                                .expect("inserted above when absent");
+                            pv.props.insert(prop_name.clone(), val.clone());
 
-                            let _ = writer
-                                .insert_vertex_with_labels(vid, props, &labels, tx_l0)
-                                .await?;
-
-                            // Update the row object so subsequent RETURN sees the new value
+                            // Update the row binding so subsequent RHS sees the new value.
                             if let Some(Value::Map(node_map)) = row.get_mut(var_name) {
                                 node_map.insert(prop_name.clone(), val);
                             } else if let Some(Value::Node(node)) = row.get_mut(var_name) {
@@ -1792,10 +1836,24 @@ impl Executor {
                                 _ => String::new(),
                             };
 
-                            let mut props = prop_manager
-                                .get_all_edge_props_with_ctx(ei.eid, ctx)
-                                .await?
-                                .unwrap_or_default();
+                            if !pending_e.contains_key(var_name) {
+                                let initial = prop_manager
+                                    .get_all_edge_props_with_ctx(ei.eid, ctx)
+                                    .await?
+                                    .unwrap_or_default();
+                                pending_e.insert(
+                                    var_name.clone(),
+                                    PendingEdgeSet {
+                                        src: ei.src,
+                                        dst: ei.dst,
+                                        edge_type_id: ei.edge_type_id,
+                                        eid: ei.eid,
+                                        edge_type_name: edge_type_name.clone(),
+                                        props: initial,
+                                    },
+                                );
+                            }
+
                             let val = self
                                 .evaluate_expr(value, row, prop_manager, params, ctx)
                                 .await?;
@@ -1805,27 +1863,20 @@ impl Executor {
                                 &schema,
                                 std::slice::from_ref(&edge_type_name),
                             )?;
-                            props.insert(prop_name.clone(), val.clone());
-                            writer
-                                .insert_edge(
-                                    ei.src,
-                                    ei.dst,
-                                    ei.edge_type_id,
-                                    ei.eid,
-                                    props,
-                                    Some(edge_type_name.clone()),
-                                    tx_l0,
-                                )
-                                .await?;
 
-                            // Update the row object so subsequent RETURN sees the new value
+                            let pe = pending_e
+                                .get_mut(var_name)
+                                .expect("inserted above when absent");
+                            pe.props.insert(prop_name.clone(), val.clone());
+
+                            // Update the row object so subsequent RHS sees the new value.
                             if let Some(Value::Map(edge_map)) = row.get_mut(var_name) {
                                 edge_map.insert(prop_name.clone(), val);
                             } else if let Some(Value::Edge(edge)) = row.get_mut(var_name) {
                                 edge.properties.insert(prop_name.clone(), val);
                             }
                         } else if let Value::Edge(edge) = node_val {
-                            // Handle Value::Edge directly (when traverse returns Edge objects)
+                            // Handle Value::Edge directly (when traverse returns Edge objects).
                             let eid = edge.eid;
                             let src = edge.src;
                             let dst = edge.dst;
@@ -1834,10 +1885,24 @@ impl Executor {
                                 self.resolve_edge_type_id(&Value::String(edge_type_name.clone()))?;
                             let schema = self.storage.schema_manager().schema().clone();
 
-                            let mut props = prop_manager
-                                .get_all_edge_props_with_ctx(eid, ctx)
-                                .await?
-                                .unwrap_or_default();
+                            if !pending_e.contains_key(var_name) {
+                                let initial = prop_manager
+                                    .get_all_edge_props_with_ctx(eid, ctx)
+                                    .await?
+                                    .unwrap_or_default();
+                                pending_e.insert(
+                                    var_name.clone(),
+                                    PendingEdgeSet {
+                                        src,
+                                        dst,
+                                        edge_type_id: etype,
+                                        eid,
+                                        edge_type_name: edge_type_name.clone(),
+                                        props: initial,
+                                    },
+                                );
+                            }
+
                             let val = self
                                 .evaluate_expr(value, row, prop_manager, params, ctx)
                                 .await?;
@@ -1847,20 +1912,13 @@ impl Executor {
                                 &schema,
                                 std::slice::from_ref(&edge_type_name),
                             )?;
-                            props.insert(prop_name.clone(), val.clone());
-                            writer
-                                .insert_edge(
-                                    src,
-                                    dst,
-                                    etype,
-                                    eid,
-                                    props,
-                                    Some(edge_type_name.clone()),
-                                    tx_l0,
-                                )
-                                .await?;
 
-                            // Update the row object so subsequent RETURN sees the new value
+                            let pe = pending_e
+                                .get_mut(var_name)
+                                .expect("inserted above when absent");
+                            pe.props.insert(prop_name.clone(), val.clone());
+
+                            // Update the row object so subsequent RHS sees the new value.
                             if let Some(Value::Edge(edge)) = row.get_mut(var_name) {
                                 edge.properties.insert(prop_name.clone(), val);
                             }
@@ -1868,6 +1926,21 @@ impl Executor {
                     }
                 }
                 SetItem::Labels { variable, labels } => {
+                    // Flush any pending writes for this var so the Labels op
+                    // sees latest L0 state. Other variables' pending writes
+                    // can keep waiting (they're independent).
+                    self.flush_pending_var(
+                        variable,
+                        &mut pending_v,
+                        &mut pending_e,
+                        writer,
+                        prop_manager,
+                        params,
+                        ctx,
+                        tx_l0,
+                    )
+                    .await?;
+
                     if let Some(node_val) = row.get(variable)
                         && let Ok(vid) = Self::vid_from_value(node_val)
                     {
@@ -1902,6 +1975,20 @@ impl Executor {
                 }
                 SetItem::Variable { variable, value }
                 | SetItem::VariablePlus { variable, value } => {
+                    // Flush this var's pending writes first so the
+                    // replace/merge op sees them as latest L0 state.
+                    self.flush_pending_var(
+                        variable,
+                        &mut pending_v,
+                        &mut pending_e,
+                        writer,
+                        prop_manager,
+                        params,
+                        ctx,
+                        tx_l0,
+                    )
+                    .await?;
+
                     let replace = matches!(item, SetItem::Variable { .. });
                     let op_str = if replace { "=" } else { "+=" };
 
@@ -1935,6 +2022,85 @@ impl Executor {
                     .await?;
                 }
             }
+        }
+
+        // Flush all remaining coalesced writes — one writer call per target.
+        for (_var_name, mut pv) in pending_v {
+            for label_name in &pv.labels {
+                self.enrich_properties_with_generated_columns(
+                    label_name,
+                    &mut pv.props,
+                    prop_manager,
+                    params,
+                    ctx,
+                )
+                .await?;
+            }
+            let _ = writer
+                .insert_vertex_with_labels(pv.vid, pv.props, &pv.labels, tx_l0)
+                .await?;
+        }
+        for (_var_name, pe) in pending_e {
+            writer
+                .insert_edge(
+                    pe.src,
+                    pe.dst,
+                    pe.edge_type_id,
+                    pe.eid,
+                    pe.props,
+                    Some(pe.edge_type_name),
+                    tx_l0,
+                )
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    /// Flush pending SET state for a single variable to the writer.
+    ///
+    /// Called from the SET loop when about to process a Labels /
+    /// Variable / VariablePlus item on `var`, so the subsequent op
+    /// sees latest L0 state and ordering is preserved.
+    #[expect(clippy::too_many_arguments)]
+    async fn flush_pending_var(
+        &self,
+        var: &str,
+        pending_v: &mut HashMap<String, PendingVertexSet>,
+        pending_e: &mut HashMap<String, PendingEdgeSet>,
+        writer: &Writer,
+        prop_manager: &PropertyManager,
+        _params: &HashMap<String, Value>,
+        ctx: Option<&QueryContext>,
+        tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
+    ) -> Result<()> {
+        if let Some(mut pv) = pending_v.remove(var) {
+            for label_name in &pv.labels {
+                self.enrich_properties_with_generated_columns(
+                    label_name,
+                    &mut pv.props,
+                    prop_manager,
+                    _params,
+                    ctx,
+                )
+                .await?;
+            }
+            let _ = writer
+                .insert_vertex_with_labels(pv.vid, pv.props, &pv.labels, tx_l0)
+                .await?;
+        }
+        if let Some(pe) = pending_e.remove(var) {
+            writer
+                .insert_edge(
+                    pe.src,
+                    pe.dst,
+                    pe.edge_type_id,
+                    pe.eid,
+                    pe.props,
+                    Some(pe.edge_type_name),
+                    tx_l0,
+                )
+                .await?;
         }
         Ok(())
     }

@@ -1265,14 +1265,16 @@ fn scalar_to_u64(sv: &datafusion::common::ScalarValue) -> Option<u64> {
 /// Merges L0 buffers in visibility order (pending_flush → current → transaction),
 /// with later buffers overwriting earlier ones for the same VID.
 ///
-/// When `target_vid` is `Some`, only that single VID is collected (direct HashMap
-/// lookup instead of iterating all VIDs for the label).
+/// When `target_vids` is `Some`, only those VIDs are collected (direct HashMap
+/// lookups instead of iterating all VIDs for the label). This must mirror the
+/// Lance-side VID pushdown — otherwise L0-only (unflushed) rows bypass the
+/// filter and the scan emits the full label table. See issue #72 item 1.
 fn build_l0_vertex_batch(
     l0_ctx: &crate::query::df_graph::L0Context,
     label: &str,
     lance_schema: &SchemaRef,
     label_props: Option<&HashMap<String, uni_common::core::schema::PropertyMeta>>,
-    target_vid: Option<u64>,
+    target_vids: Option<&[u64]>,
 ) -> DFResult<RecordBatch> {
     // Collect all L0 vertex data, merging in visibility order
     let mut vid_data: HashMap<u64, (Properties, u64)> = HashMap::new(); // vid -> (props, version)
@@ -1291,21 +1293,26 @@ fn build_l0_vertex_batch(
         for vid in guard.vertex_tombstones.iter() {
             tombstones.insert(vid.as_u64());
         }
-        // Collect vertices — either a single target or all for the label
-        let candidate_vids: Vec<Vid> = if let Some(tv) = target_vid {
-            let vid = Vid::from(tv);
-            // Only include if this VID exists in this L0 buffer and has the right label
-            if guard.vertex_properties.contains_key(&vid)
-                && (label.is_empty()
-                    || guard
-                        .label_to_vids
-                        .get(label)
-                        .is_some_and(|s| s.contains(&vid)))
-            {
-                vec![vid]
-            } else {
-                vec![]
+        // Collect vertices — restrict to target_vids (single- or multi-VID
+        // pushdown from id(x) = ? / id(x) IN [...]) when set, else all
+        // vertices for the label. See issue #72 item 1: without this filter,
+        // freshly-inserted L0 rows bypass the IN-list pushdown that Lance
+        // already honors, defeating the optimization.
+        let candidate_vids: Vec<Vid> = if let Some(tvs) = target_vids {
+            let mut out = Vec::with_capacity(tvs.len());
+            for &tv in tvs {
+                let vid = Vid::from(tv);
+                if guard.vertex_properties.contains_key(&vid)
+                    && (label.is_empty()
+                        || guard
+                            .label_to_vids
+                            .get(label)
+                            .is_some_and(|s| s.contains(&vid)))
+                {
+                    out.push(vid);
+                }
             }
+            out
         } else {
             guard.vids_for_label(label)
         };
@@ -2062,8 +2069,21 @@ async fn columnar_scan_vertex_batch_static(
         }
     };
 
-    // Build L0 batch
-    let l0_batch = build_l0_vertex_batch(l0_ctx, label, &internal_schema, label_props, target_vid)?;
+    // Build L0 batch. Prefer the multi-VID list when present (IN-list pushdown
+    // from issue #55 PR #4 — must restrict L0 to the same VID set Lance was
+    // filtered against, see issue #72 item 1). Fall back to single-VID
+    // (`id(x) = $literal` short-circuit). One-element buffer keeps the
+    // borrowed slice alive for the single-VID case.
+    let single_vid_buf: [u64; 1];
+    let l0_target_vids: Option<&[u64]> = match (vid_list_filter, target_vid) {
+        (Some(vs), _) if !vs.is_empty() => Some(vs),
+        (_, Some(v)) => {
+            single_vid_buf = [v];
+            Some(&single_vid_buf)
+        }
+        _ => None,
+    };
+    let l0_batch = build_l0_vertex_batch(l0_ctx, label, &internal_schema, label_props, l0_target_vids)?;
 
     // Merge Lance + L0
     let Some(merged) = merge_lance_and_l0(lance_deduped, l0_batch, &internal_schema, "_vid")?
@@ -2340,8 +2360,19 @@ async fn columnar_scan_schemaless_vertex_batch_static(
         ])),
     };
 
-    // Build L0 batch
-    let l0_batch = build_l0_schemaless_vertex_batch(l0_ctx, label, &internal_schema, target_vid)?;
+    // Build L0 batch. Prefer the multi-VID list when present (IN-list pushdown
+    // from issue #55 PR #4 — must restrict L0 to match Lance filtering, see
+    // issue #72 item 1). Fall back to single-VID.
+    let single_vid_buf: [u64; 1];
+    let l0_target_vids: Option<&[u64]> = match (vid_list_filter, target_vid) {
+        (Some(vs), _) if !vs.is_empty() => Some(vs),
+        (_, Some(v)) => {
+            single_vid_buf = [v];
+            Some(&single_vid_buf)
+        }
+        _ => None,
+    };
+    let l0_batch = build_l0_schemaless_vertex_batch(l0_ctx, label, &internal_schema, l0_target_vids)?;
 
     // Merge Lance + L0
     let Some(merged) = merge_lance_and_l0(lance_deduped, l0_batch, &internal_schema, "_vid")?
@@ -2384,7 +2415,7 @@ fn build_l0_schemaless_vertex_batch(
     l0_ctx: &crate::query::df_graph::L0Context,
     label: &str,
     internal_schema: &SchemaRef,
-    target_vid: Option<u64>,
+    target_vids: Option<&[u64]>,
 ) -> DFResult<RecordBatch> {
     // Collect all L0 vertex data, merging in visibility order
     // vid -> (merged_props, highest_version, labels)
@@ -2408,12 +2439,15 @@ fn build_l0_schemaless_vertex_batch(
             tombstones.insert(vid.as_u64());
         }
 
-        // Collect VIDs matching the label filter — short-circuit when target_vid is set
-        let vids: Vec<Vid> = if let Some(tv) = target_vid {
-            let vid = Vid::from(tv);
-            // Only include if this VID exists in this L0 buffer
-            if guard.vertex_properties.contains_key(&vid) {
-                // Check label filter if applicable
+        // Collect VIDs matching the label filter — short-circuit when target_vids is set
+        // (see issue #72 item 1; multi-VID IN-list must filter L0 too).
+        let vids: Vec<Vid> = if let Some(tvs) = target_vids {
+            let mut out = Vec::with_capacity(tvs.len());
+            for &tv in tvs {
+                let vid = Vid::from(tv);
+                if !guard.vertex_properties.contains_key(&vid) {
+                    continue;
+                }
                 let label_ok = if label_filter.is_empty() {
                     true
                 } else if let Some(labels) = guard.vertex_labels.get(&vid) {
@@ -2423,10 +2457,11 @@ fn build_l0_schemaless_vertex_batch(
                 } else {
                     false
                 };
-                if label_ok { vec![vid] } else { vec![] }
-            } else {
-                vec![]
+                if label_ok {
+                    out.push(vid);
+                }
             }
+            out
         } else if label_filter.is_empty() {
             guard.all_vertex_vids()
         } else if label_filter.len() == 1 {

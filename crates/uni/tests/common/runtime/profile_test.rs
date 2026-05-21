@@ -270,3 +270,85 @@ async fn test_profile_metrics_populated_for_mutation_scan_unwind() -> anyhow::Re
 
     Ok(())
 }
+
+/// Regression for issue #72 item 1: the multi-VID IN-list pushdown for
+/// `UNWIND $maps AS u MATCH (n:Label) WHERE id(n) = u.field` must restrict
+/// the L0 buffer scan to the target VIDs — not just the Lance scan. Before
+/// the fix, freshly-inserted (L0-only) vertices bypassed the IN filter and
+/// GraphScan emitted the full label table.
+///
+/// Also regresses issue #72 item 2 (the batch=1→3 step function): at
+/// batch=1 the single-VID code path filtered L0; at batch≥2 the multi-VID
+/// path didn't — that asymmetry IS the 45x exec jump.
+#[tokio::test]
+async fn test_72_item1_unwind_id_eq_l0_in_pushdown() -> anyhow::Result<()> {
+    let temp_dir = tempdir()?;
+    let db = UniBuilder::new(temp_dir.path().to_str().unwrap().to_string())
+        .build()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL Entity (entity_id STRING NOT NULL, frequency INT)")
+        .await?;
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    for i in 0..100 {
+        tx.execute_with("CREATE (:Entity {entity_id: $id, frequency: 1})")
+            .param("id", format!("e:{i}"))
+            .run()
+            .await?;
+    }
+    tx.commit().await?;
+
+    let vids: Vec<i64> = db
+        .session()
+        .query("MATCH (n:Entity) RETURN id(n) AS nid ORDER BY n.entity_id")
+        .await?
+        .into_iter()
+        .map(|r| r.get::<i64>("nid").unwrap())
+        .collect();
+
+    let updates: Vec<uni_db::Value> = vids[..3]
+        .iter()
+        .map(|&v| {
+            let mut m = std::collections::HashMap::new();
+            m.insert("nid".to_string(), uni_db::Value::Int(v));
+            m.insert("new_frequency".to_string(), uni_db::Value::Int(99));
+            uni_db::Value::Map(m)
+        })
+        .collect();
+
+    let tx = db.session().tx().await?;
+    let (_res, prof) = tx
+        .execute_with(
+            "UNWIND $updates AS u \
+             MATCH (n:Entity) WHERE id(n) = u.nid \
+             SET n.frequency = u.new_frequency",
+        )
+        .param("updates", uni_db::Value::List(updates))
+        .profile()
+        .await?;
+    tx.commit().await?;
+
+    println!("=== diag #72 item 1 (3 of 100 entities) ===");
+    for s in &prof.runtime_stats {
+        println!(
+            "  {:<25} rows={:>5} time={:>8.3} ms",
+            s.operator, s.actual_rows, s.time_ms
+        );
+    }
+    let scan = prof
+        .runtime_stats
+        .iter()
+        .find(|s| s.operator.contains("GraphScanExec"))
+        .unwrap();
+    assert_eq!(
+        scan.actual_rows, 3,
+        "GraphScanExec should emit only the 3 target vertices, got {} \
+         (means IN-list pushdown isn't reaching the L0 path — issue #72 item 1 regressed)",
+        scan.actual_rows
+    );
+
+    Ok(())
+}

@@ -1,0 +1,1772 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Dragonscale Team
+//
+// Regression tests for SET-target scan projection — the bisect-net for the
+// Part B narrow-projection sentinel refactor (see plan
+// /home/rohit/.claude/plans/plan-and-implement-a-valiant-flame.md).
+//
+// Every test here:
+//   1. Performs a SET (potentially with extra clauses around it).
+//   2. Reads back the affected entity.
+//   3. Asserts the SET values landed AND any untouched columns survived.
+//
+// The Round 4 Fix-3 attempt reported a 7× speedup that was partly a silent
+// no-op — `MutationSetExec` reported rows>0 / time_ms>0 while writing
+// nothing. These tests catch that class of regression in ~3 seconds each.
+// Rust guideline compliant
+
+use anyhow::Result;
+use uni_db::api::schema::{IndexType, VectorAlgo, VectorIndexCfg, VectorMetric};
+use uni_db::{DataType, ScalarType, Uni, Value};
+
+/// F1a — single property SET on a simple schema round-trips correctly.
+#[tokio::test]
+async fn f1a_set_single_property_round_trips() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("Entity")
+        .property("entity_id", DataType::String)
+        .property_nullable("x", DataType::Int64)
+        .property_nullable("y", DataType::Int64)
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Entity {entity_id: 'e1', x: 1, y: 2})")
+        .await?;
+    tx.commit().await?;
+
+    let vid: i64 = db
+        .session()
+        .query("MATCH (n:Entity) RETURN id(n) AS nid")
+        .await?
+        .rows()[0]
+        .get("nid")
+        .unwrap();
+
+    let tx = db.session().tx().await?;
+    tx.execute_with("MATCH (n:Entity) WHERE id(n) = $v SET n.x = 42")
+        .param("v", Value::Int(vid))
+        .run()
+        .await?;
+    tx.commit().await?;
+
+    let row = db
+        .session()
+        .query("MATCH (n:Entity) RETURN n.x AS x, n.y AS y")
+        .await?;
+    assert_eq!(row.rows()[0].get::<i64>("x").unwrap(), 42, "SET n.x did not apply");
+    assert_eq!(row.rows()[0].get::<i64>("y").unwrap(), 2, "untouched n.y was clobbered");
+    Ok(())
+}
+
+/// F1b — multi-property SET on a wide schema. Verifies set columns updated
+/// AND untouched columns preserved.
+#[tokio::test]
+async fn f1b_set_multi_property_wide_schema_round_trips() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("Entity")
+        .property("entity_id", DataType::String)
+        .property_nullable("a", DataType::Int64)
+        .property_nullable("b", DataType::Int64)
+        .property_nullable("c", DataType::Int64)
+        .property_nullable("d", DataType::Int64)
+        .property_nullable("e", DataType::Int64)
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Entity {entity_id: 'e1', a: 10, b: 20, c: 30, d: 40, e: 50})")
+        .await?;
+    tx.commit().await?;
+
+    let vid: i64 = db
+        .session()
+        .query("MATCH (n:Entity) RETURN id(n) AS nid")
+        .await?
+        .rows()[0]
+        .get("nid")
+        .unwrap();
+
+    let tx = db.session().tx().await?;
+    tx.execute_with("MATCH (n:Entity) WHERE id(n) = $v SET n.a = 100, n.c = 300")
+        .param("v", Value::Int(vid))
+        .run()
+        .await?;
+    tx.commit().await?;
+
+    let r = db
+        .session()
+        .query("MATCH (n:Entity) RETURN n.a AS a, n.b AS b, n.c AS c, n.d AS d, n.e AS e")
+        .await?;
+    let row = &r.rows()[0];
+    assert_eq!(row.get::<i64>("a").unwrap(), 100);
+    assert_eq!(row.get::<i64>("b").unwrap(), 20, "n.b clobbered");
+    assert_eq!(row.get::<i64>("c").unwrap(), 300);
+    assert_eq!(row.get::<i64>("d").unwrap(), 40, "n.d clobbered");
+    assert_eq!(row.get::<i64>("e").unwrap(), 50, "n.e clobbered");
+    Ok(())
+}
+
+/// F1c — production-shape SET (vector embedding + HnswSq index in schema).
+/// Partial SET on scalar columns must preserve the embedding column.
+/// This is the test most analogous to the issue #72 production workload.
+#[tokio::test]
+async fn f1c_set_preserves_embedding_under_partial_update() -> Result<()> {
+    const EMBED_DIM: usize = 8;
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("Entity")
+        .property("entity_id", DataType::String)
+        .property_nullable("frequency", DataType::Int64)
+        .property_nullable("confidence", DataType::Float64)
+        .vector("embedding", EMBED_DIM)
+        .index(
+            "embedding",
+            IndexType::Vector(VectorIndexCfg {
+                algorithm: VectorAlgo::HnswSq {
+                    m: 8,
+                    ef_construction: 32,
+                    partitions: None,
+                },
+                metric: VectorMetric::Cosine,
+                embedding: None,
+            }),
+        )
+        .done()
+        .apply()
+        .await?;
+
+    let embedding_vec: Vec<Value> = (0..EMBED_DIM)
+        .map(|i| Value::Float((i as f64) * 0.1 + 0.05))
+        .collect();
+    let tx = db.session().tx().await?;
+    tx.execute_with(
+        "CREATE (:Entity {entity_id: 'e1', frequency: 1, confidence: 0.5, embedding: $emb})",
+    )
+    .param("emb", Value::List(embedding_vec.clone()))
+    .run()
+    .await?;
+    tx.commit().await?;
+
+    let vid: i64 = db
+        .session()
+        .query("MATCH (n:Entity) RETURN id(n) AS nid")
+        .await?
+        .rows()[0]
+        .get("nid")
+        .unwrap();
+
+    let tx = db.session().tx().await?;
+    tx.execute_with(
+        "MATCH (n:Entity) WHERE id(n) = $v SET n.frequency = 99, n.confidence = 0.95",
+    )
+    .param("v", Value::Int(vid))
+    .run()
+    .await?;
+    tx.commit().await?;
+
+    let r = db
+        .session()
+        .query("MATCH (n:Entity) RETURN n.frequency AS f, n.confidence AS c, n.embedding AS emb")
+        .await?;
+    let row = &r.rows()[0];
+    assert_eq!(row.get::<i64>("f").unwrap(), 99);
+    assert!((row.get::<f64>("c").unwrap() - 0.95).abs() < 1e-9);
+
+    // Verify embedding survived. Accept either Vector or List representation.
+    let emb = row.value("emb").expect("emb missing");
+    let len = match emb {
+        Value::List(v) => v.len(),
+        Value::Vector(v) => v.len(),
+        other => panic!("unexpected embedding shape: {other:?}"),
+    };
+    assert_eq!(len, EMBED_DIM, "embedding clobbered by partial SET");
+
+    // Verify element-wise that the embedding values weren't replaced
+    // with defaults (e.g., all-zeros from a null-coalesce path).
+    let preserved: Vec<f64> = match emb {
+        Value::List(v) => v
+            .iter()
+            .filter_map(|x| match x {
+                Value::Float(f) => Some(*f),
+                Value::Int(i) => Some(*i as f64),
+                _ => None,
+            })
+            .collect(),
+        Value::Vector(v) => v.iter().map(|f| *f as f64).collect(),
+        _ => unreachable!(),
+    };
+    assert_eq!(preserved.len(), EMBED_DIM);
+    for (i, got) in preserved.iter().enumerate() {
+        let want = (i as f64) * 0.1 + 0.05;
+        assert!(
+            (got - want).abs() < 1e-4,
+            "embedding[{i}] changed by partial SET (got {got}, want {want})"
+        );
+    }
+    // Drop vid to silence unused-binding warning.
+    let _ = vid;
+    Ok(())
+}
+
+/// F1d — SET on an edge round-trips. The Round 4 Fix-3 regression manifested
+/// on edges first (`test_edge_created_updated_at`). This test would catch it.
+#[tokio::test]
+async fn f1d_set_edge_property_round_trips() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("Node")
+        .property("nid", DataType::String)
+        .done()
+        .edge_type("REL", &["Node"], &["Node"])
+        .property_nullable("since", DataType::Int64)
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute(
+        "CREATE (a:Node {nid: 'a'})-[:REL {since: 2020}]->(b:Node {nid: 'b'})",
+    )
+    .await?;
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (a:Node {nid: 'a'})-[r:REL]->(b:Node {nid: 'b'}) SET r.since = 2025")
+        .await?;
+    tx.commit().await?;
+
+    let r = db
+        .session()
+        .query("MATCH ()-[r:REL]->() RETURN r.since AS s")
+        .await?;
+    assert_eq!(r.rows()[0].get::<i64>("s").unwrap(), 2025, "edge SET did not apply");
+    Ok(())
+}
+
+/// F1e — SET on a TRAVERSE-bound target (audit item B.7). The variable being
+/// SET comes through `plan_traverse`, not a direct scan. This is the highest-
+/// risk path for the sentinel refactor because target structural projection
+/// is conditional.
+#[tokio::test]
+async fn f1e_set_traverse_bound_target_round_trips() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("Node")
+        .property("nid", DataType::String)
+        .property_nullable("score", DataType::Int64)
+        .done()
+        .edge_type("REL", &["Node"], &["Node"])
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (a:Node {nid: 'a', score: 1})-[:REL]->(b:Node {nid: 'b', score: 2})")
+        .await?;
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (a:Node {nid: 'a'})-[:REL]->(b:Node) SET b.score = 99")
+        .await?;
+    tx.commit().await?;
+
+    let r = db
+        .session()
+        .query("MATCH (n:Node {nid: 'b'}) RETURN n.score AS s")
+        .await?;
+    assert_eq!(r.rows()[0].get::<i64>("s").unwrap(), 99, "SET on traverse-bound b did not apply");
+
+    let r2 = db
+        .session()
+        .query("MATCH (n:Node {nid: 'a'}) RETURN n.score AS s")
+        .await?;
+    assert_eq!(r2.rows()[0].get::<i64>("s").unwrap(), 1, "untouched source a was clobbered");
+    Ok(())
+}
+
+/// F3 — mixed Property + Labels in a single SET. Variable's HashSet will be
+/// `{sentinel, "*"}`; "*" must dominate so labels variant gets full record.
+#[tokio::test]
+async fn f3_set_mixed_property_and_label() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("Entity")
+        .property("entity_id", DataType::String)
+        .property_nullable("x", DataType::Int64)
+        .done()
+        .label("Extra")
+        .property_nullable("y", DataType::Int64)
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Entity {entity_id: 'e1', x: 1})").await?;
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (n:Entity) SET n.x = 99, n:Extra").await?;
+    tx.commit().await?;
+
+    let r = db
+        .session()
+        .query("MATCH (n:Entity) RETURN n.x AS x, labels(n) AS lbls")
+        .await?;
+    assert_eq!(r.rows()[0].get::<i64>("x").unwrap(), 99);
+    let lbls = r.rows()[0].value("lbls").expect("labels missing");
+    match lbls {
+        Value::List(l) => {
+            let names: Vec<String> = l
+                .iter()
+                .filter_map(|v| match v {
+                    Value::String(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert!(names.contains(&"Entity".to_string()), "Entity label missing");
+            assert!(names.contains(&"Extra".to_string()), "Extra label not added");
+        }
+        other => panic!("unexpected labels shape: {other:?}"),
+    }
+    Ok(())
+}
+
+/// F4a — `SET n.x = 1, n = {y: 2}`. Property + Variable-replace. "*" must
+/// dominate the sentinel; the final result is the map (n.x absent).
+#[tokio::test]
+async fn f4a_set_property_then_variable_replace() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("Entity")
+        .property("entity_id", DataType::String)
+        .property_nullable("x", DataType::Int64)
+        .property_nullable("y", DataType::Int64)
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Entity {entity_id: 'e1', x: 0, y: 0})").await?;
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (n:Entity) SET n.x = 7, n = {entity_id: 'e1', y: 99}")
+        .await?;
+    tx.commit().await?;
+
+    let r = db
+        .session()
+        .query("MATCH (n:Entity) RETURN n.x AS x, n.y AS y")
+        .await?;
+    // n = {...} REPLACES properties; n.x must now be null/absent.
+    assert!(r.rows()[0].value("x").is_none_or(|v| matches!(v, Value::Null)));
+    assert_eq!(r.rows()[0].get::<i64>("y").unwrap(), 99);
+    Ok(())
+}
+
+/// F4b — `SET n.x = 1, n += {y: 2}`. Property + Variable-merge. "*" dominates;
+/// both keys end up present.
+#[tokio::test]
+async fn f4b_set_property_then_variable_merge() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("Entity")
+        .property("entity_id", DataType::String)
+        .property_nullable("x", DataType::Int64)
+        .property_nullable("y", DataType::Int64)
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Entity {entity_id: 'e1', x: 0, y: 0})").await?;
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (n:Entity) SET n.x = 7, n += {y: 99}").await?;
+    tx.commit().await?;
+
+    let r = db
+        .session()
+        .query("MATCH (n:Entity) RETURN n.x AS x, n.y AS y")
+        .await?;
+    assert_eq!(r.rows()[0].get::<i64>("x").unwrap(), 7);
+    assert_eq!(r.rows()[0].get::<i64>("y").unwrap(), 99);
+    Ok(())
+}
+
+/// F5a — `SET n.x = 1 RETURN n`. RETURN's bare-variable "*" must dominate
+/// the SET's sentinel and pull the full record so the returned `n` is
+/// complete.
+#[tokio::test]
+async fn f5a_set_then_return_bare_node() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("Entity")
+        .property("entity_id", DataType::String)
+        .property_nullable("x", DataType::Int64)
+        .property_nullable("y", DataType::Int64)
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Entity {entity_id: 'e1', x: 1, y: 2})").await?;
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    let res = tx
+        .query("MATCH (n:Entity) SET n.x = 99 RETURN n")
+        .await?;
+    tx.commit().await?;
+    assert_eq!(res.rows().len(), 1);
+    // The returned `n` should be a Map/Node containing both x (updated)
+    // and y (preserved).
+    let n = res.rows()[0].value("n").expect("n missing");
+    // Returned value may be Node (preferred) or Map (legacy). Both must
+    // contain the full property set including the SET'd x and the
+    // untouched y.
+    let props: &std::collections::HashMap<String, Value> = match n {
+        Value::Map(m) => m,
+        Value::Node(node) => &node.properties,
+        other => panic!("expected node, got {other:?}"),
+    };
+    assert_eq!(props.get("x"), Some(&Value::Int(99)));
+    assert_eq!(props.get("y"), Some(&Value::Int(2)));
+    Ok(())
+}
+
+/// F5b — `SET n.x = 1 RETURN n.x, n.y`. Explicit dotted-prop RETURN does not
+/// trigger "*"; the sentinel-only path runs. Both props must still be
+/// available.
+#[tokio::test]
+async fn f5b_set_then_return_explicit_props() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("Entity")
+        .property("entity_id", DataType::String)
+        .property_nullable("x", DataType::Int64)
+        .property_nullable("y", DataType::Int64)
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Entity {entity_id: 'e1', x: 1, y: 2})").await?;
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    let res = tx
+        .query("MATCH (n:Entity) SET n.x = 99 RETURN n.x AS x, n.y AS y")
+        .await?;
+    tx.commit().await?;
+    assert_eq!(res.rows()[0].get::<i64>("x").unwrap(), 99);
+    assert_eq!(res.rows()[0].get::<i64>("y").unwrap(), 2);
+    Ok(())
+}
+
+/// F6a — `MERGE ... ON MATCH SET`. SetItem propagation through
+/// `LogicalPlan::Merge`'s on_match branch.
+#[tokio::test]
+async fn f6a_merge_on_match_set_round_trips() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("Entity")
+        .property("key", DataType::String)
+        .property_nullable("x", DataType::Int64)
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Entity {key: 'k1', x: 1})").await?;
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute_with(
+        "MERGE (n:Entity {key: $k}) ON MATCH SET n.x = 99",
+    )
+    .param("k", Value::String("k1".to_string()))
+    .run()
+    .await?;
+    tx.commit().await?;
+
+    let r = db
+        .session()
+        .query("MATCH (n:Entity {key: 'k1'}) RETURN n.x AS x")
+        .await?;
+    assert_eq!(r.rows()[0].get::<i64>("x").unwrap(), 99);
+    Ok(())
+}
+
+/// F6b — `MERGE ... ON CREATE SET`. SetItem propagation through on_create.
+#[tokio::test]
+async fn f6b_merge_on_create_set_round_trips() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("Entity")
+        .property("key", DataType::String)
+        .property_nullable("x", DataType::Int64)
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute_with(
+        "MERGE (n:Entity {key: $k}) ON CREATE SET n.x = 77",
+    )
+    .param("k", Value::String("new_k".to_string()))
+    .run()
+    .await?;
+    tx.commit().await?;
+
+    let r = db
+        .session()
+        .query("MATCH (n:Entity {key: 'new_k'}) RETURN n.x AS x")
+        .await?;
+    assert_eq!(r.rows()[0].get::<i64>("x").unwrap(), 77);
+    Ok(())
+}
+
+/// F9 — SET on a multi-label vertex `(n:A:B)`. Goes through
+/// `plan_multi_label_scan` → `resolve_schemaless_properties`.
+#[tokio::test]
+async fn f9_set_multi_label_round_trips() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("A")
+        .property("aid", DataType::String)
+        .property_nullable("a_prop", DataType::Int64)
+        .done()
+        .label("B")
+        .property_nullable("b_prop", DataType::Int64)
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:A:B {aid: 'x', a_prop: 0, b_prop: 0})").await?;
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (n:A:B) SET n.a_prop = 11, n.b_prop = 22").await?;
+    tx.commit().await?;
+
+    let r = db
+        .session()
+        .query("MATCH (n:A:B) RETURN n.a_prop AS a, n.b_prop AS b")
+        .await?;
+    assert_eq!(r.rows()[0].get::<i64>("a").unwrap(), 11);
+    assert_eq!(r.rows()[0].get::<i64>("b").unwrap(), 22);
+    Ok(())
+}
+
+/// F11 — SET against an empty match. No rows, no panic, no corruption.
+#[tokio::test]
+async fn f11_set_empty_match_no_panic() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("Entity")
+        .property("entity_id", DataType::String)
+        .property_nullable("x", DataType::Int64)
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Entity {entity_id: 'e1', x: 1})").await?;
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    let res = tx
+        .execute_with("MATCH (n:Entity) WHERE id(n) = $v SET n.x = 999")
+        .param("v", Value::Int(99_999_999))
+        .run()
+        .await?;
+    tx.commit().await?;
+    assert_eq!(
+        res.affected_rows(),
+        0,
+        "expected zero rows for non-matching id()"
+    );
+
+    // Sanity: original entity untouched.
+    let r = db
+        .session()
+        .query("MATCH (n:Entity) RETURN n.x AS x")
+        .await?;
+    assert_eq!(r.rows()[0].get::<i64>("x").unwrap(), 1);
+    Ok(())
+}
+
+/// F2 — SET RHS reads input row state, NOT intra-statement modifications.
+///
+/// This documents standard openCypher semantics: every SetItem in a single
+/// SET clause is evaluated against the row as it entered the SET, not
+/// against the post-write state of preceding SetItems. The Round 3 Fix 2
+/// coalescing did NOT change this — earlier writes are accumulated and
+/// flushed together, but RHS evaluation continues to read input values.
+///
+/// Catches regressions in either direction: if a future refactor made
+/// intra-statement reads "see" earlier writes, this test would fail. If a
+/// regression broke RHS evaluation of cross-property references entirely
+/// (`n.y + 1` returning null), this would also fail.
+#[tokio::test]
+async fn f2_set_rhs_reads_input_row_not_intra_statement_writes() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("Entity")
+        .property("entity_id", DataType::String)
+        .property_nullable("x", DataType::Int64)
+        .property_nullable("y", DataType::Int64)
+        .property_nullable("z", DataType::Int64)
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Entity {entity_id: 'e1', x: 10, y: 5, z: 0})")
+        .await?;
+    tx.commit().await?;
+
+    // Input: x=10, y=5, z=0.
+    // SET: x = 100, y = n.x + 1, z = n.y * 2
+    // RHS of y reads input x (10) → y becomes 11.
+    // RHS of z reads input y (5)  → z becomes 10.
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (n:Entity) SET n.x = 100, n.y = n.x + 1, n.z = n.y * 2")
+        .await?;
+    tx.commit().await?;
+
+    let r = db
+        .session()
+        .query("MATCH (n:Entity) RETURN n.x AS x, n.y AS y, n.z AS z")
+        .await?;
+    let row = &r.rows()[0];
+    assert_eq!(row.get::<i64>("x").unwrap(), 100, "SET n.x did not apply");
+    assert_eq!(
+        row.get::<i64>("y").unwrap(),
+        11,
+        "SET n.y RHS should evaluate against input n.x (10), got {}",
+        row.get::<i64>("y").unwrap()
+    );
+    assert_eq!(
+        row.get::<i64>("z").unwrap(),
+        10,
+        "SET n.z RHS should evaluate against input n.y (5), got {}",
+        row.get::<i64>("z").unwrap()
+    );
+    Ok(())
+}
+
+/// F-overflow — SET an overflow property (not declared in schema).
+/// Schema is partially declared: `entity_id` is in schema, `extra_prop` is
+/// not. The L0/Lance path stores overflow properties in a JSON blob.
+/// Sentinel skips `_all_props`/`overflow_json` injection on the scan, but
+/// the executor's `get_all_vertex_props_with_ctx` should still route the
+/// write correctly through property_manager.
+#[tokio::test]
+async fn f_overflow_set_undeclared_property_round_trips() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("Entity")
+        .property("entity_id", DataType::String)
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Entity {entity_id: 'e1', initial_overflow: 1})")
+        .await?;
+    tx.commit().await?;
+
+    // SET a NEW overflow property (not in schema, not previously set).
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (n:Entity) SET n.new_overflow = 42").await?;
+    tx.commit().await?;
+
+    let r = db
+        .session()
+        .query("MATCH (n:Entity) RETURN n.new_overflow AS no, n.initial_overflow AS io")
+        .await?;
+    assert_eq!(
+        r.rows()[0].get::<i64>("no").unwrap(),
+        42,
+        "SET on undeclared overflow property did not apply"
+    );
+    assert_eq!(
+        r.rows()[0].get::<i64>("io").unwrap(),
+        1,
+        "initial overflow property was clobbered"
+    );
+    Ok(())
+}
+
+/// F10 — SET on a fully schemaless label (no properties declared in schema).
+/// Exercises `resolve_schemaless_properties` which we changed in Part B.
+#[tokio::test]
+async fn f10_set_schemaless_label_round_trips() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema().label("Person").apply().await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Person {name: 'Alice', age: 30, city: 'NYC'})")
+        .await?;
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (p:Person) SET p.age = 31, p.city = 'SF'")
+        .await?;
+    tx.commit().await?;
+
+    let r = db
+        .session()
+        .query("MATCH (p:Person) RETURN p.name AS name, p.age AS age, p.city AS city")
+        .await?;
+    let row = &r.rows()[0];
+    assert_eq!(row.get::<String>("name").unwrap(), "Alice", "name clobbered");
+    assert_eq!(row.get::<i64>("age").unwrap(), 31);
+    assert_eq!(row.get::<String>("city").unwrap(), "SF");
+    Ok(())
+}
+
+/// F-id-rhs — `SET n.tracker = id(n)`. The `id()` function lowers to a
+/// reference to `_vid`. With the sentinel narrowing scan projection, _vid
+/// must still flow through so the RHS evaluates correctly.
+#[tokio::test]
+async fn f_id_in_rhs_round_trips() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("Entity")
+        .property("entity_id", DataType::String)
+        .property_nullable("tracker", DataType::Int64)
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Entity {entity_id: 'e1'})").await?;
+    tx.commit().await?;
+
+    let vid: i64 = db
+        .session()
+        .query("MATCH (n:Entity) RETURN id(n) AS nid")
+        .await?
+        .rows()[0]
+        .get("nid")
+        .unwrap();
+
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (n:Entity) SET n.tracker = id(n)").await?;
+    tx.commit().await?;
+
+    let r = db
+        .session()
+        .query("MATCH (n:Entity) RETURN n.tracker AS t")
+        .await?;
+    assert_eq!(
+        r.rows()[0].get::<i64>("t").unwrap(),
+        vid,
+        "SET n.tracker = id(n) did not capture the vid"
+    );
+    Ok(())
+}
+
+/// F-computed-rhs — `SET n.x = n.y + 1` where `y` is a schema property the
+/// SET clause does not write to. The explicit `n.y` reference must be
+/// collected into the scan projection alongside the sentinel, so the RHS
+/// sees the actual stored value.
+#[tokio::test]
+async fn f_computed_rhs_reads_unrelated_property() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("Entity")
+        .property("entity_id", DataType::String)
+        .property_nullable("x", DataType::Int64)
+        .property_nullable("y", DataType::Int64)
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Entity {entity_id: 'e1', x: 0, y: 41})").await?;
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (n:Entity) SET n.x = n.y + 1").await?;
+    tx.commit().await?;
+
+    let r = db
+        .session()
+        .query("MATCH (n:Entity) RETURN n.x AS x, n.y AS y")
+        .await?;
+    assert_eq!(
+        r.rows()[0].get::<i64>("x").unwrap(),
+        42,
+        "RHS `n.y + 1` did not evaluate against the stored y"
+    );
+    assert_eq!(r.rows()[0].get::<i64>("y").unwrap(), 41, "n.y was clobbered");
+    Ok(())
+}
+
+/// F13 — combined property-existence filter and SET. WHERE collects an
+/// explicit property; SET adds the sentinel. Union of both must work.
+#[tokio::test]
+async fn f13_set_with_property_existence_filter() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("Entity")
+        .property("entity_id", DataType::String)
+        .property_nullable("optional_prop", DataType::Int64)
+        .property_nullable("x", DataType::Int64)
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Entity {entity_id: 'has', optional_prop: 1, x: 0})").await?;
+    tx.execute("CREATE (:Entity {entity_id: 'lacks', x: 0})").await?;
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (n:Entity) WHERE n.optional_prop IS NOT NULL SET n.x = 42")
+        .await?;
+    tx.commit().await?;
+
+    let r = db
+        .session()
+        .query("MATCH (n:Entity) RETURN n.entity_id AS id, n.x AS x ORDER BY id")
+        .await?;
+    let by_id: std::collections::HashMap<String, i64> = r
+        .rows()
+        .iter()
+        .map(|row| {
+            (
+                row.get::<String>("id").unwrap(),
+                row.get::<i64>("x").unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(by_id["has"], 42, "SET on filtered-in row did not apply");
+    assert_eq!(by_id["lacks"], 0, "SET applied to filtered-out row");
+    Ok(())
+}
+
+// =============================================================================
+// Round 6 — HIGH tier
+// =============================================================================
+
+/// H1a — SET → commit → flush → re-query (same session, persistent db).
+/// Confirms L0 → Lance flush preserves a sentinel-narrowed write.
+#[tokio::test]
+async fn h1a_set_then_flush_round_trips() -> Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let db = Uni::open(temp_dir.path().to_str().unwrap())
+        .build()
+        .await?;
+    db.schema()
+        .label("Entity")
+        .property("entity_id", DataType::String)
+        .property_nullable("x", DataType::Int64)
+        .property_nullable("y", DataType::Int64)
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Entity {entity_id: 'e1', x: 1, y: 2})").await?;
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (n:Entity) SET n.x = 99").await?;
+    tx.commit().await?;
+
+    db.flush().await?;
+
+    let r = db
+        .session()
+        .query("MATCH (n:Entity) RETURN n.x AS x, n.y AS y")
+        .await?;
+    assert_eq!(r.rows()[0].get::<i64>("x").unwrap(), 99, "SET lost across flush");
+    assert_eq!(r.rows()[0].get::<i64>("y").unwrap(), 2, "untouched y lost across flush");
+    Ok(())
+}
+
+/// H1b — SET → commit → flush → close → reopen → query.
+/// Confirms the write survives full persistence cycle (Lance MVCC + L1 read).
+#[tokio::test]
+async fn h1b_set_then_flush_then_reopen_round_trips() -> Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let path = temp_dir.path().to_str().unwrap().to_string();
+
+    {
+        let db = Uni::open(&path).build().await?;
+        db.schema()
+            .label("Entity")
+            .property("entity_id", DataType::String)
+            .property_nullable("x", DataType::Int64)
+            .property_nullable("y", DataType::Int64)
+            .done()
+            .apply()
+            .await?;
+
+        let tx = db.session().tx().await?;
+        tx.execute("CREATE (:Entity {entity_id: 'e1', x: 1, y: 2})").await?;
+        tx.commit().await?;
+
+        let tx = db.session().tx().await?;
+        tx.execute("MATCH (n:Entity) SET n.x = 99").await?;
+        tx.commit().await?;
+        db.flush().await?;
+    } // db dropped, ensures persistence
+
+    let db = Uni::open(&path).build().await?;
+    let r = db
+        .session()
+        .query("MATCH (n:Entity) RETURN n.x AS x, n.y AS y")
+        .await?;
+    assert_eq!(r.len(), 1, "vertex lost across reopen");
+    assert_eq!(r.rows()[0].get::<i64>("x").unwrap(), 99, "SET lost across reopen");
+    assert_eq!(r.rows()[0].get::<i64>("y").unwrap(), 2, "untouched y lost across reopen");
+    Ok(())
+}
+
+/// H2 — SET combined with hash-indexed-property pushdown predicate.
+/// Pushdown injects extra physical filters BEFORE structural projection;
+/// must not break sentinel-narrowed scan.
+#[tokio::test]
+async fn h2_set_with_indexed_property_pushdown_round_trips() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("Entity")
+        .property("entity_id", DataType::String)
+        .property("email", DataType::String)
+        .index("email", IndexType::Scalar(ScalarType::Hash))
+        .property_nullable("x", DataType::Int64)
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    for i in 0..50 {
+        tx.execute_with("CREATE (:Entity {entity_id: $id, email: $em, x: 0})")
+            .param("id", format!("e:{i}"))
+            .param("em", format!("u{i}@example.com"))
+            .run()
+            .await?;
+    }
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute_with("MATCH (n:Entity) WHERE n.email = $em SET n.x = 42")
+        .param("em", "u17@example.com")
+        .run()
+        .await?;
+    tx.commit().await?;
+
+    let target = db
+        .session()
+        .query_with("MATCH (n:Entity) WHERE n.email = $em RETURN n.x AS x")
+        .param("em", "u17@example.com")
+        .fetch_all()
+        .await?;
+    assert_eq!(target.len(), 1);
+    assert_eq!(target.rows()[0].get::<i64>("x").unwrap(), 42, "indexed-pushdown SET did not apply");
+
+    let untouched = db
+        .session()
+        .query("MATCH (n:Entity) WHERE n.x = 0 RETURN count(n) AS c")
+        .await?;
+    assert_eq!(
+        untouched.rows()[0].get::<i64>("c").unwrap(),
+        49,
+        "indexed-pushdown SET leaked to other rows"
+    );
+    Ok(())
+}
+
+/// H3a — SET a CypherValue (JSON-blob) property.
+#[tokio::test]
+async fn h3a_set_cypher_value_property_round_trips() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("Item")
+        .property("name", DataType::String)
+        .property_nullable("metadata", DataType::CypherValue)
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (i:Item {name: 'A', metadata: {valid: true, count: 1}})")
+        .await?;
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (i:Item) SET i.metadata = {valid: false, count: 99}")
+        .await?;
+    tx.commit().await?;
+
+    let r = db
+        .session()
+        .query("MATCH (i:Item) RETURN i.metadata AS meta, i.name AS name")
+        .await?;
+    assert_eq!(r.rows()[0].get::<String>("name").unwrap(), "A", "name clobbered");
+    let meta = r.rows()[0].value("meta").expect("metadata missing");
+    if let Value::Map(m) = meta {
+        assert_eq!(m.get("valid"), Some(&Value::Bool(false)));
+        assert_eq!(m.get("count"), Some(&Value::Int(99)));
+    } else {
+        panic!("expected CypherValue Map, got {meta:?}");
+    }
+    Ok(())
+}
+
+/// H3b — SET a Vector property directly (the vector is the SET target).
+#[tokio::test]
+async fn h3b_set_vector_property_directly_round_trips() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("Item")
+        .property("name", DataType::String)
+        .property_nullable("embedding", DataType::Vector { dimensions: 3 })
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (i:Item {name: 'A', embedding: [0.1, 0.2, 0.3]})")
+        .await?;
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (i:Item) SET i.embedding = [0.7, 0.8, 0.9]").await?;
+    tx.commit().await?;
+
+    let r = db
+        .session()
+        .query("MATCH (i:Item) RETURN i.embedding AS emb, i.name AS name")
+        .await?;
+    assert_eq!(r.rows()[0].get::<String>("name").unwrap(), "A");
+    let emb = r.rows()[0].value("emb").expect("embedding missing");
+    let v: Vec<f64> = match emb {
+        Value::List(l) => l
+            .iter()
+            .filter_map(|x| match x {
+                Value::Float(f) => Some(*f),
+                _ => None,
+            })
+            .collect(),
+        Value::Vector(v) => v.iter().map(|f| *f as f64).collect(),
+        other => panic!("unexpected vector shape: {other:?}"),
+    };
+    assert_eq!(v.len(), 3);
+    let expected = [0.7, 0.8, 0.9];
+    for (i, (got, want)) in v.iter().zip(expected.iter()).enumerate() {
+        assert!(
+            (got - want).abs() < 1e-4,
+            "vector[{i}] not updated: got {got}, want {want}"
+        );
+    }
+    Ok(())
+}
+
+/// H4a — SET violates NOT NULL constraint. Expect error; no partial writes.
+#[tokio::test]
+async fn h4a_set_violates_not_null_rolls_back() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL Entity (entity_id STRING NOT NULL, x INT NOT NULL, y INT)")
+        .await?;
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Entity {entity_id: 'e1', x: 1, y: 2})").await?;
+    tx.commit().await?;
+
+    // Attempt: set y to 99 AND x to null — should fail; y should remain 2.
+    let tx = db.session().tx().await?;
+    let res = tx
+        .execute("MATCH (n:Entity) SET n.y = 99, n.x = null")
+        .await;
+    // Either the execute errors, or the commit errors.
+    let final_err = if res.is_err() {
+        true
+    } else {
+        tx.commit().await.is_err()
+    };
+    assert!(final_err, "SET to null on NOT NULL column must error");
+
+    let r = db
+        .session()
+        .query("MATCH (n:Entity) RETURN n.x AS x, n.y AS y")
+        .await?;
+    assert_eq!(r.rows()[0].get::<i64>("x").unwrap(), 1, "x corrupted on rollback");
+    assert_eq!(
+        r.rows()[0].get::<i64>("y").unwrap(),
+        2,
+        "y partially-written despite NOT NULL violation"
+    );
+    Ok(())
+}
+
+/// H4b — SET violates UNIQUE constraint. Expect error; rows unchanged.
+#[tokio::test]
+async fn h4b_set_violates_unique_rolls_back() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL Entity (key STRING NOT NULL UNIQUE, x INT)")
+        .await?;
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Entity {key: 'k1', x: 1})").await?;
+    tx.execute("CREATE (:Entity {key: 'k2', x: 2})").await?;
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    let res = tx
+        .execute("MATCH (n:Entity {key: 'k1'}) SET n.x = 99, n.key = 'k2'")
+        .await;
+    let final_err = if res.is_err() {
+        true
+    } else {
+        tx.commit().await.is_err()
+    };
+    assert!(final_err, "SET duplicate UNIQUE key must error");
+
+    let r = db
+        .session()
+        .query("MATCH (n:Entity {key: 'k1'}) RETURN n.x AS x")
+        .await?;
+    assert_eq!(
+        r.rows()[0].get::<i64>("x").unwrap(),
+        1,
+        "x partially-written despite UNIQUE violation"
+    );
+    Ok(())
+}
+
+/// H4c — SET violates `validate_property_value` (complex value into scalar
+/// column). Expect error; rows unchanged.
+///
+/// Note: primitive coercion (e.g. String → Int) is NOT validated at SET
+/// time — Cypher is dynamically typed, and uni defers primitive coercion
+/// errors to Lance-flush time. What IS validated at SET time is the
+/// shape check in `validate_property_value` (write.rs:1700): Map / Node /
+/// Edge / Path values (or nested-List shapes) into a scalar column.
+#[tokio::test]
+async fn h4c_set_violates_complex_value_into_scalar_rolls_back() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL Entity (entity_id STRING NOT NULL, count INT, name STRING)")
+        .await?;
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Entity {entity_id: 'e1', count: 10, name: 'before'})")
+        .await?;
+    tx.commit().await?;
+
+    // Assigning a Map to a scalar INT column trips validate_property_value.
+    let tx = db.session().tx().await?;
+    let res = tx
+        .execute("MATCH (n:Entity) SET n.name = 'after', n.count = {nested: 1}")
+        .await;
+    let final_err = if res.is_err() {
+        true
+    } else {
+        tx.commit().await.is_err()
+    };
+    assert!(final_err, "SET Map into scalar column must error");
+
+    let r = db
+        .session()
+        .query("MATCH (n:Entity) RETURN n.count AS c, n.name AS n")
+        .await?;
+    assert_eq!(r.rows()[0].get::<i64>("c").unwrap(), 10, "count corrupted");
+    assert_eq!(
+        r.rows()[0].get::<String>("n").unwrap(),
+        "before",
+        "name partially-written despite complex-value violation"
+    );
+    Ok(())
+}
+
+// =============================================================================
+// Round 6 — MEDIUM tier
+// =============================================================================
+
+/// M1 — Same SET query executed twice in the same session should be a
+/// plan-cache hit on the second call and still apply correctly.
+#[tokio::test]
+async fn m1_set_plan_cache_reuse_round_trips() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("Entity")
+        .property("entity_id", DataType::String)
+        .property_nullable("x", DataType::Int64)
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Entity {entity_id: 'a', x: 0})").await?;
+    tx.execute("CREATE (:Entity {entity_id: 'b', x: 0})").await?;
+    tx.commit().await?;
+
+    let session = db.session();
+    // First call — plan compiled cold.
+    let tx = session.tx().await?;
+    tx.execute_with("MATCH (n:Entity {entity_id: $id}) SET n.x = $v")
+        .param("id", "a")
+        .param("v", 11i64)
+        .run()
+        .await?;
+    tx.commit().await?;
+
+    // Second call — same query string, different params. Should hit cache.
+    let tx = session.tx().await?;
+    tx.execute_with("MATCH (n:Entity {entity_id: $id}) SET n.x = $v")
+        .param("id", "b")
+        .param("v", 22i64)
+        .run()
+        .await?;
+    tx.commit().await?;
+
+    let r = db
+        .session()
+        .query("MATCH (n:Entity) RETURN n.entity_id AS id, n.x AS x ORDER BY id")
+        .await?;
+    let by_id: std::collections::HashMap<String, i64> = r
+        .rows()
+        .iter()
+        .map(|row| (row.get::<String>("id").unwrap(), row.get::<i64>("x").unwrap()))
+        .collect();
+    assert_eq!(by_id["a"], 11, "first SET (cold plan) did not apply");
+    assert_eq!(by_id["b"], 22, "second SET (cache hit) did not apply");
+    Ok(())
+}
+
+/// M2 — `SET n.x = 1 REMOVE n.y` in same statement. REMOVE inserts "*" so
+/// the SET's sentinel is dominated; full schema flows. Both writes apply.
+#[tokio::test]
+async fn m2_set_and_remove_same_statement_round_trips() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("Entity")
+        .property("entity_id", DataType::String)
+        .property_nullable("x", DataType::Int64)
+        .property_nullable("y", DataType::Int64)
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Entity {entity_id: 'e1', x: 1, y: 2})").await?;
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (n:Entity) SET n.x = 42 REMOVE n.y").await?;
+    tx.commit().await?;
+
+    let r = db
+        .session()
+        .query("MATCH (n:Entity) RETURN n.x AS x, n.y AS y")
+        .await?;
+    assert_eq!(r.rows()[0].get::<i64>("x").unwrap(), 42, "SET did not apply");
+    assert!(
+        r.rows()[0].value("y").is_none_or(|v| matches!(v, Value::Null)),
+        "REMOVE did not clear y"
+    );
+    Ok(())
+}
+
+/// M3 — OPTIONAL MATCH with no rows feeding SET — must not panic, must
+/// not write anything.
+#[tokio::test]
+async fn m3_optional_match_null_target_set_no_panic() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("E")
+        .property("id", DataType::String)
+        .property_nullable("x", DataType::Int64)
+        .done()
+        .label("Missing")
+        .property("id", DataType::String)
+        .property_nullable("x", DataType::Int64)
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:E {id: 'e1', x: 0})").await?;
+    tx.commit().await?;
+
+    // OPTIONAL MATCH on a label with zero rows; SET on the null binding
+    // should no-op gracefully.
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (e:E) OPTIONAL MATCH (m:Missing) SET m.x = 99")
+        .await?;
+    tx.commit().await?;
+
+    let r = db.session().query("MATCH (e:E) RETURN e.x AS x").await?;
+    assert_eq!(r.rows()[0].get::<i64>("x").unwrap(), 0, "OPTIONAL SET clobbered e");
+
+    let r2 = db
+        .session()
+        .query("MATCH (m:Missing) RETURN count(m) AS c")
+        .await?;
+    assert_eq!(
+        r2.rows()[0].get::<i64>("c").unwrap(),
+        0,
+        "OPTIONAL SET phantom-created a Missing"
+    );
+    Ok(())
+}
+
+/// M4 — `MATCH (n:E) WITH n AS m SET m.x = 1`. Variable rebound through
+/// WITH; SET-target name `m` differs from original `n`. The structural
+/// projection must follow the rebinding.
+#[tokio::test]
+async fn m4_with_rebinding_set_round_trips() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("Entity")
+        .property("entity_id", DataType::String)
+        .property_nullable("x", DataType::Int64)
+        .property_nullable("y", DataType::Int64)
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Entity {entity_id: 'e1', x: 1, y: 2})").await?;
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (n:Entity) WITH n AS m SET m.x = 99").await?;
+    tx.commit().await?;
+
+    let r = db
+        .session()
+        .query("MATCH (n:Entity) RETURN n.x AS x, n.y AS y")
+        .await?;
+    assert_eq!(r.rows()[0].get::<i64>("x").unwrap(), 99, "rebound SET did not apply");
+    assert_eq!(r.rows()[0].get::<i64>("y").unwrap(), 2, "untouched y clobbered");
+    Ok(())
+}
+
+/// M5 — Aggregation followed by SET: `MATCH (n) WITH n, count(n) AS c SET n.cnt = c`.
+/// After aggregation, `n` survives as a node-bound variable; SET must
+/// still find the structural Map.
+#[tokio::test]
+async fn m5_aggregation_then_set_round_trips() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("Entity")
+        .property("entity_id", DataType::String)
+        .property_nullable("cnt", DataType::Int64)
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Entity {entity_id: 'a'})").await?;
+    tx.execute("CREATE (:Entity {entity_id: 'b'})").await?;
+    tx.commit().await?;
+
+    // count(n) per-row over a 1-row GROUP BY (each n is unique) → c=1 per vid.
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (n:Entity) WITH n, count(n) AS c SET n.cnt = c")
+        .await?;
+    tx.commit().await?;
+
+    let r = db
+        .session()
+        .query("MATCH (n:Entity) RETURN n.cnt AS cnt ORDER BY n.entity_id")
+        .await?;
+    assert_eq!(r.len(), 2);
+    for row in r.rows() {
+        assert_eq!(
+            row.get::<i64>("cnt").unwrap(),
+            1,
+            "aggregation-then-SET did not apply"
+        );
+    }
+    Ok(())
+}
+
+// =============================================================================
+// Round 6 — LOW tier
+// =============================================================================
+
+/// L1 — UNWIND a list of vid params, then SET. The iterator variable `u`
+/// is row-bound by UNWIND, not by scan; the actual SET target is bound
+/// by MATCH inside the loop. This is the supported analogue of the
+/// (unimplemented in uni) Cypher FOREACH clause. Same shape used by the
+/// production issue #72 workload, so we know it works — this test locks
+/// it in explicitly.
+#[tokio::test]
+async fn l1_unwind_then_set_round_trips() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("E")
+        .property("id", DataType::String)
+        .property_nullable("p", DataType::Int64)
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:E {id: 'a', p: 0})").await?;
+    tx.execute("CREATE (:E {id: 'b', p: 0})").await?;
+    tx.execute("CREATE (:E {id: 'c', p: 0})").await?;
+    tx.commit().await?;
+
+    let vids: Vec<i64> = db
+        .session()
+        .query("MATCH (n:E) RETURN id(n) AS nid ORDER BY n.id")
+        .await?
+        .into_iter()
+        .map(|r| r.get::<i64>("nid").unwrap())
+        .collect();
+
+    let tx = db.session().tx().await?;
+    tx.execute_with(
+        "UNWIND $vids AS v MATCH (n:E) WHERE id(n) = v SET n.p = 99",
+    )
+    .param(
+        "vids",
+        Value::List(vids.iter().map(|v| Value::Int(*v)).collect()),
+    )
+    .run()
+    .await?;
+    tx.commit().await?;
+
+    let r = db.session().query("MATCH (n:E) RETURN n.p AS p").await?;
+    assert_eq!(r.len(), 3);
+    for row in r.rows() {
+        assert_eq!(row.get::<i64>("p").unwrap(), 99, "UNWIND-driven SET did not apply");
+    }
+    Ok(())
+}
+
+/// L2 — SET inside a CALL { ... } subquery documents a current limitation.
+///
+/// CALL subquery writes (SET, CREATE, MERGE inside the sub-block) are NOT
+/// currently supported in uni: the sub-plan executes without a
+/// MutationContext attached, and the planner errors with "Mutation
+/// context not set." This is a pre-existing gap, NOT a Part B regression.
+///
+/// The test asserts that the limitation is surfaced as a clear error (not
+/// a silent no-op). When CALL subquery writes are implemented, flip the
+/// assertion from `is_err()` to a positive round-trip.
+#[tokio::test]
+async fn l2_call_subquery_set_currently_errors() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("E")
+        .property("id", DataType::String)
+        .property_nullable("x", DataType::Int64)
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:E {id: 'e1', x: 0})").await?;
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    let res = tx
+        .execute("MATCH (n:E) CALL { WITH n SET n.x = 77 } RETURN n.x")
+        .await;
+    let err_msg = match res {
+        Ok(_) => match tx.commit().await {
+            Ok(_) => String::new(),
+            Err(e) => format!("{e}"),
+        },
+        Err(e) => format!("{e}"),
+    };
+    assert!(
+        !err_msg.is_empty() && err_msg.contains("Mutation context"),
+        "expected 'Mutation context' error, got: {err_msg:?}"
+    );
+
+    // Underlying row must remain unchanged (failure left no partial write).
+    let r = db.session().query("MATCH (n:E) RETURN n.x AS x").await?;
+    assert_eq!(
+        r.rows()[0].get::<i64>("x").unwrap(),
+        0,
+        "subquery SET error left a partial write"
+    );
+    Ok(())
+}
+
+/// L4 — Vector KNN feeding SET. Use `CALL uni.vector.query` to bind the
+/// target, then SET on it.
+#[tokio::test]
+async fn l4_vector_knn_then_set_round_trips() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("Doc")
+        .property("title", DataType::String)
+        .property_nullable("matched", DataType::Bool)
+        .vector("embedding", 3)
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Doc {title: 'A', embedding: [1.0, 0.0, 0.0]})").await?;
+    tx.execute("CREATE (:Doc {title: 'B', embedding: [0.0, 1.0, 0.0]})").await?;
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute(
+        "CALL uni.vector.query('Doc', 'embedding', [1.0, 0.0, 0.0], 1) YIELD node AS d \
+         SET d.matched = true",
+    )
+    .await?;
+    tx.commit().await?;
+
+    let r = db
+        .session()
+        .query("MATCH (d:Doc) RETURN d.title AS t, d.matched AS m ORDER BY t")
+        .await?;
+    let matched: std::collections::HashMap<String, bool> = r
+        .rows()
+        .iter()
+        .map(|row| {
+            let t = row.get::<String>("t").unwrap();
+            let m = row.value("m").map(|v| matches!(v, Value::Bool(true))).unwrap_or(false);
+            (t, m)
+        })
+        .collect();
+    assert!(matched["A"], "KNN-matched doc did not get SET");
+    assert!(!matched["B"], "non-KNN-matched doc was clobbered by SET");
+    Ok(())
+}
+
+/// L6 — bidirectional pattern: `MATCH (a)-[r]-(b) SET r.x = 1`.
+#[tokio::test]
+async fn l6_bidirectional_pattern_set_round_trips() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("N")
+        .property("id", DataType::String)
+        .done()
+        .edge_type("E", &["N"], &["N"])
+        .property_nullable("x", DataType::Int64)
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (a:N {id: 'a'})-[:E {x: 0}]->(b:N {id: 'b'})").await?;
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (a:N {id: 'a'})-[r:E]-(b:N {id: 'b'}) SET r.x = 99")
+        .await?;
+    tx.commit().await?;
+
+    let r = db
+        .session()
+        .query("MATCH ()-[r:E]->() RETURN r.x AS x")
+        .await?;
+    assert_eq!(r.rows()[0].get::<i64>("x").unwrap(), 99, "undirected SET did not apply");
+    Ok(())
+}
+
+/// L7 — `CREATE (n:E {a:1}) SET n.b = 2` in same statement. Variable bound
+/// by CREATE, not scan.
+#[tokio::test]
+async fn l7_create_then_set_same_statement_round_trips() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("E")
+        .property("entity_id", DataType::String)
+        .property_nullable("a", DataType::Int64)
+        .property_nullable("b", DataType::Int64)
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (n:E {entity_id: 'e1', a: 1}) SET n.b = 2").await?;
+    tx.commit().await?;
+
+    let r = db
+        .session()
+        .query("MATCH (n:E) RETURN n.a AS a, n.b AS b")
+        .await?;
+    assert_eq!(r.rows()[0].get::<i64>("a").unwrap(), 1, "CREATE prop lost");
+    assert_eq!(r.rows()[0].get::<i64>("b").unwrap(), 2, "CREATE-then-SET did not apply");
+    Ok(())
+}
+
+/// L8 — Traverse with multiple edge types feeding SET.
+#[tokio::test]
+async fn l8_multi_edge_type_traverse_set_round_trips() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("Person")
+        .property("name", DataType::String)
+        .done()
+        .edge_type("KNOWS", &["Person"], &["Person"])
+        .property_nullable("since", DataType::Int64)
+        .done()
+        .edge_type("FOLLOWS", &["Person"], &["Person"])
+        .property_nullable("since", DataType::Int64)
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (a:Person {name: 'a'})-[:KNOWS {since: 2010}]->(b:Person {name: 'b'})")
+        .await?;
+    tx.execute("CREATE (c:Person {name: 'c'})-[:FOLLOWS {since: 2015}]->(d:Person {name: 'd'})")
+        .await?;
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (x:Person)-[r:KNOWS|FOLLOWS]->(y:Person) SET r.since = 2025")
+        .await?;
+    tx.commit().await?;
+
+    let r = db
+        .session()
+        .query("MATCH ()-[r:KNOWS|FOLLOWS]->() RETURN r.since AS s")
+        .await?;
+    assert_eq!(r.len(), 2);
+    for row in r.rows() {
+        assert_eq!(
+            row.get::<i64>("s").unwrap(),
+            2025,
+            "multi-edge-type SET did not apply"
+        );
+    }
+    Ok(())
+}
+
+/// L9 — Two SET clauses across a WITH boundary on the same variable.
+#[tokio::test]
+async fn l9_cross_with_two_sets_round_trips() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("E")
+        .property("id", DataType::String)
+        .property_nullable("x", DataType::Int64)
+        .property_nullable("y", DataType::Int64)
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:E {id: 'e1', x: 0, y: 0})").await?;
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (n:E) SET n.x = 42 WITH n SET n.y = 99").await?;
+    tx.commit().await?;
+
+    let r = db
+        .session()
+        .query("MATCH (n:E) RETURN n.x AS x, n.y AS y")
+        .await?;
+    assert_eq!(r.rows()[0].get::<i64>("x").unwrap(), 42, "first SET did not apply");
+    assert_eq!(
+        r.rows()[0].get::<i64>("y").unwrap(),
+        99,
+        "second SET across WITH did not apply"
+    );
+    Ok(())
+}
+
+/// L3 — `MATCH (a)-[r*1..2]->(b) SET b.x = 1`. Variable-length-path target
+/// feeding SET. Original Round 5 plan declared VLP target SET out of scope;
+/// under Round 6's "everything" scope we add the test and either:
+///   - pass (great, incidentally works), or
+///   - fail (test asserts the silent no-op IS surfaced, locking in the
+///     known limitation so future work can flip the assertion).
+///
+/// This test documents whichever behavior the codebase exhibits today.
+/// If it fails with a parser/runtime error, that's also informative —
+/// we'd then know VLP+SET is rejected at parse time, which is fine.
+#[tokio::test]
+async fn l3_vlp_target_set_documents_behavior() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("N")
+        .property("id", DataType::String)
+        .property_nullable("x", DataType::Int64)
+        .done()
+        .edge_type("LINK", &["N"], &["N"])
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute(
+        "CREATE (a:N {id: 'a', x: 0})-[:LINK]->(b:N {id: 'b', x: 0})-[:LINK]->(c:N {id: 'c', x: 0})",
+    )
+    .await?;
+    tx.commit().await?;
+
+    // Try VLP target SET. Three plausible outcomes:
+    //   1. Pass + reach all VLP targets → ideal.
+    //   2. Pass + silent no-op → catch via read-back below.
+    //   3. Hard error → documented, no rollback test needed.
+    let tx = db.session().tx().await?;
+    let res = tx
+        .execute("MATCH (a:N {id: 'a'})-[:LINK*1..2]->(b:N) SET b.x = 99")
+        .await;
+    let exec_ok = res.is_ok();
+    let commit_ok = if exec_ok {
+        tx.commit().await.is_ok()
+    } else {
+        // tx is consumed-by-error or still alive depending on path; let
+        // it drop without explicit rollback. Either way we move on.
+        drop(tx);
+        false
+    };
+
+    // Read back regardless of outcome.
+    let r = db
+        .session()
+        .query("MATCH (n:N) RETURN n.id AS id, n.x AS x ORDER BY id")
+        .await?;
+    let xs: std::collections::HashMap<String, i64> = r
+        .rows()
+        .iter()
+        .map(|row| (row.get::<String>("id").unwrap(), row.get::<i64>("x").unwrap()))
+        .collect();
+    let a_x = xs["a"];
+    let b_x = xs["b"];
+    let c_x = xs["c"];
+
+    println!(
+        "[diag L3] exec_ok={exec_ok} commit_ok={commit_ok} a.x={a_x} b.x={b_x} c.x={c_x}"
+    );
+
+    if exec_ok && commit_ok {
+        // VLP+SET passed. Verify both b and c (reachable in 1 and 2 hops
+        // from a) got SET.
+        assert_eq!(a_x, 0, "a (source) should not be modified");
+        assert_eq!(b_x, 99, "b (1-hop VLP target) should be set to 99");
+        assert_eq!(c_x, 99, "c (2-hop VLP target) should be set to 99");
+    } else {
+        // VLP+SET errored. Verify rollback semantics: nothing changed.
+        assert_eq!(a_x, 0, "rollback leaked: a.x changed");
+        assert_eq!(b_x, 0, "rollback leaked: b.x changed");
+        assert_eq!(c_x, 0, "rollback leaked: c.x changed");
+        eprintln!("[diag L3] VLP+SET errored; rollback verified.");
+    }
+    Ok(())
+}

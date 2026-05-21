@@ -1517,7 +1517,22 @@ fn validate_reserved_property_name(name: &str) -> Result<()> {
     // flush time. Fixed-schema-only columns (`type`, `props_json`,
     // `labels` in the main tables) are NOT listed: those tables don't
     // append user properties, so no collision can occur.
-    const RESERVED_PROPS: &[&str] = &["ext_id", "overflow_json", "eid", "src_vid", "dst_vid", "op"];
+    const RESERVED_PROPS: &[&str] = &[
+        "ext_id",
+        "overflow_json",
+        "eid",
+        "src_vid",
+        "dst_vid",
+        "op",
+        // Internal planner sentinel: a column-name marker used by
+        // `mark_set_item_variables` (uni-query::query::planner) to request
+        // narrow structural projection without full-schema expansion.
+        // Reserved here defensively so an internal `add_generated_property`
+        // path can't accidentally create a colliding user-facing column.
+        // The user-facing `validate_property_name` already rejects this
+        // via the underscore-prefix rule, so this is belt-and-suspenders.
+        "__set_struct__",
+    ];
     if RESERVED_PROPS.contains(&name) {
         return Err(anyhow!(
             "Property name '{}' is reserved by the storage layer; please choose a different name",
@@ -1596,6 +1611,18 @@ mod tests {
                 "error for '{reserved}' should mention 'reserved', got: {err}"
             );
         }
+
+        // Planner sentinel — reserved in RESERVED_PROPS (belt-and-suspenders
+        // alongside the underscore-prefix rule). Confirms an internal
+        // `add_generated_property` path cannot accidentally create a column
+        // that collides with the SET-target structural-projection marker.
+        let err = manager
+            .add_property("Tiny", "__set_struct__", DataType::String, true)
+            .expect_err("expected '__set_struct__' to be rejected");
+        assert!(
+            err.to_string().contains("reserved"),
+            "__set_struct__ rejection should mention 'reserved', got: {err}"
+        );
 
         // Leading-underscore pattern rule.
         for reserved in &["_vid", "_uid", "_eid", "_version", "_created_at"] {

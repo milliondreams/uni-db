@@ -51,7 +51,9 @@ use crate::query::df_graph::{
     GraphUnwindExec, GraphVectorKnnExec, L0Context, MutationContext, MutationExec,
     OptionalFilterExec,
 };
-use crate::query::planner::{LogicalPlan, aggregate_column_name, collect_properties_from_plan};
+use crate::query::planner::{
+    LogicalPlan, STRUCT_ONLY_SENTINEL, aggregate_column_name, collect_properties_from_plan,
+};
 use anyhow::{Result, anyhow};
 use arrow_schema::{DataType, Schema, SchemaRef};
 use datafusion::common::JoinType;
@@ -226,6 +228,7 @@ impl HybridPhysicalPlanner {
                         .iter()
                         .filter(|p| {
                             *p != "*"
+                                && *p != STRUCT_ONLY_SENTINEL
                                 && (!p.starts_with('_')
                                     || matches!(p.as_str(), "_created_at" | "_updated_at"))
                         })
@@ -248,9 +251,18 @@ impl HybridPhysicalPlanner {
                     combined.sort();
                     combined
                 } else {
+                    // Sentinel-only or no structural marker: return the explicit
+                    // properties without schema expansion. The sentinel itself
+                    // is filtered. Structural projection is still applied
+                    // downstream via the `need_full` gate (which accepts the
+                    // sentinel) — it just builds a smaller struct.
                     let mut explicit_props: Vec<String> = props
                         .iter()
-                        .filter(|p| *p != "*" && !SYSTEM_COLUMNS.contains(&p.as_str()))
+                        .filter(|p| {
+                            *p != "*"
+                                && *p != STRUCT_ONLY_SENTINEL
+                                && !SYSTEM_COLUMNS.contains(&p.as_str())
+                        })
                         .cloned()
                         .collect();
                     explicit_props.sort();
@@ -1907,11 +1919,19 @@ impl HybridPhysicalPlanner {
             }
         }
 
-        // If we need the full object (structural access), ensure _all_props and
-        // overflow_json are projected BEFORE creating the scan.
+        // Structural projection is needed if EITHER:
+        //   - "*"            (full record requested — bare variable, REMOVE,
+        //                    Labels/Variable/VariablePlus SET, etc.), or
+        //   - STRUCT_ONLY_SENTINEL  (Property SET only — needs the bare struct
+        //                    column for `row.get(var)` but not the full schema).
+        // Only "*" pushes `_all_props` / `overflow_json` into the scan; the
+        // sentinel deliberately skips these so wide columns (e.g. embeddings)
+        // are NOT materialized.
         let var_props = all_properties.get(variable);
-        let need_full = var_props.is_some_and(|p| p.contains("*"));
-        if need_full {
+        let need_full = var_props
+            .is_some_and(|p| p.contains("*") || p.contains(STRUCT_ONLY_SENTINEL));
+        let need_full_record = var_props.is_some_and(|p| p.contains("*"));
+        if need_full_record {
             if !properties.contains(&"_all_props".to_string()) {
                 properties.push("_all_props".to_string());
             }
@@ -1969,11 +1989,13 @@ impl HybridPhysicalPlanner {
         scan_plan = self.apply_scan_filter(scan_plan, variable, filter, Some(label_name))?;
 
         if need_full {
-            // Filter "*" (wildcard marker) and overflow_json from the structural
+            // Filter sentinel markers and overflow_json from the structural
             // projection. Keep _all_props so properties()/keys() UDFs can use it.
             let struct_props: Vec<String> = properties
                 .iter()
-                .filter(|p| *p != "overflow_json" && *p != "*")
+                .filter(|p| {
+                    *p != "overflow_json" && *p != "*" && *p != STRUCT_ONLY_SENTINEL
+                })
                 .cloned()
                 .collect();
             scan_plan = self.add_structural_projection(scan_plan, variable, &struct_props)?;
@@ -1998,7 +2020,7 @@ impl HybridPhysicalPlanner {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if !all_properties
             .get(variable)
-            .is_some_and(|p| p.contains("*"))
+            .is_some_and(|p| p.contains("*") || p.contains(STRUCT_ONLY_SENTINEL))
         {
             return Ok(plan);
         }
@@ -2045,19 +2067,26 @@ impl HybridPhysicalPlanner {
 
     /// Resolve the property list and wildcard flag for a schemaless vertex scan.
     ///
-    /// Filters out the `"*"` marker, ensures `_all_props` is present, and returns
-    /// `(properties, need_full)` where `need_full` indicates structural access.
+    /// Filters out `"*"` and the structural-only sentinel, ensures `_all_props`
+    /// is present (schemaless backend requirement — properties live in a JSON
+    /// blob), and returns `(properties, need_full)` where `need_full`
+    /// indicates structural access (either marker triggers it).
     fn resolve_schemaless_properties(
         variable: &str,
         all_properties: &HashMap<String, HashSet<String>>,
     ) -> (Vec<String>, bool) {
         let mut properties: Vec<String> = all_properties
             .get(variable)
-            .map(|s| s.iter().filter(|p| *p != "*").cloned().collect())
+            .map(|s| {
+                s.iter()
+                    .filter(|p| *p != "*" && *p != STRUCT_ONLY_SENTINEL)
+                    .cloned()
+                    .collect()
+            })
             .unwrap_or_default();
         let need_full = all_properties
             .get(variable)
-            .is_some_and(|p| p.contains("*"));
+            .is_some_and(|p| p.contains("*") || p.contains(STRUCT_ONLY_SENTINEL));
         if !properties.iter().any(|p| p == "_all_props") {
             properties.push("_all_props".to_string());
         }
@@ -2114,7 +2143,7 @@ impl HybridPhysicalPlanner {
         };
         if !all_properties
             .get(edge_var)
-            .is_some_and(|p| p.contains("*"))
+            .is_some_and(|p| p.contains("*") || p.contains(STRUCT_ONLY_SENTINEL))
         {
             return Ok(plan);
         }
@@ -2157,11 +2186,15 @@ impl HybridPhysicalPlanner {
         // If we need the full object (structural access), build a struct with _labels + properties.
         // This enables labels(n)/keys(n) UDFs which expect a Struct column with a _labels field.
         if need_full {
-            // Filter out "*" (wildcard marker) from struct_props.
-            // Keep "_all_props" so that keys()/properties() UDFs can extract
-            // property names at runtime from the CypherValue blob.
-            let struct_props: Vec<String> =
-                properties.iter().filter(|p| *p != "*").cloned().collect();
+            // Filter out "*" (wildcard marker) and the structural-only sentinel
+            // from struct_props. Keep "_all_props" so that keys()/properties()
+            // UDFs can extract property names at runtime from the CypherValue
+            // blob.
+            let struct_props: Vec<String> = properties
+                .iter()
+                .filter(|p| *p != "*" && *p != STRUCT_ONLY_SENTINEL)
+                .cloned()
+                .collect();
             plan = self.add_structural_projection(plan, variable, &struct_props)?;
         }
 
@@ -2374,10 +2407,12 @@ impl HybridPhysicalPlanner {
             let mut target_properties =
                 self.resolve_properties(target_variable, target_label_name_str, all_properties);
 
-            // Filter out "*" from target_properties — it is used for structural
-            // projection (bare variable access like `RETURN t`) but must not be
-            // passed to GraphTraverseExec as an actual property column name.
-            target_properties.retain(|p| p != "*");
+            // Filter out "*" and the structural-only sentinel from
+            // target_properties — they are used for structural projection
+            // (bare variable access like `RETURN t`, or SET t.prop) but must
+            // not be passed to GraphTraverseExec as actual property column
+            // names.
+            target_properties.retain(|p| p != "*" && p != STRUCT_ONLY_SENTINEL);
 
             // When wildcard access was requested but no specific properties resolved,
             // add _all_props to ensure properties are loaded (mirrors plan_scan_all behavior).

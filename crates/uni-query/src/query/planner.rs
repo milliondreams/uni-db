@@ -23,6 +23,24 @@ use uni_cypher::ast::{
     WithRecursiveClause,
 };
 
+/// Sentinel column name inserted into a variable's property set to request
+/// that the planner build the bare struct column (`add_structural_projection`)
+/// WITHOUT pulling the full schema.
+///
+/// Emitted by `mark_set_item_variables` for `SetItem::Property` targets only.
+/// Other SET variants (`Labels`, `Variable`, `VariablePlus`) and REMOVE still
+/// emit `"*"` because they replace/merge the whole node.
+///
+/// **Union semantics:** When both `"*"` and the sentinel appear in the same
+/// variable's HashSet (e.g. `SET n.x = 1 RETURN n` collects both), `"*"`
+/// dominates — schema expansion still happens. The sentinel only changes
+/// behavior when it's the sole structural marker present.
+///
+/// Reserved-name convention: the double-underscore prefix marks this as
+/// internal. Schema validation should reject user-declared properties with
+/// this name (deferred follow-up).
+pub(crate) const STRUCT_ONLY_SENTINEL: &str = "__set_struct__";
+
 /// Type of variable in scope for semantic validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VariableType {
@@ -8374,19 +8392,17 @@ fn mark_set_item_variables(items: &[SetItem], properties: &mut HashMap<String, H
     for item in items {
         match item {
             SetItem::Property { expr, value } => {
-                // SET n.prop = val — mark n via the property expr, collect from value.
-                // Also mark the variable with "*" for full structural projection so
-                // edge identity fields (_src/_dst) are available for write operations.
+                // SET n.prop = val — mark n with STRUCT_ONLY_SENTINEL so the
+                // scan builds the bare `n` struct column (needed for executor
+                // `row.get(var_name)`) WITHOUT pulling the full schema. The
+                // explicit `prop` is collected via `collect_properties_from_expr_into`
+                // below and joins the variable's HashSet alongside the sentinel.
                 //
-                // Note: dropping "*" here was attempted as an optimization but breaks
-                // the SET pipeline — `need_full` (checked at multiple sites in
-                // df_planner.rs) gates `add_structural_projection`, which builds the
-                // bare `n` Map column the executor reads via `row.get(var_name)`.
-                // Without that Map, the SET silently no-ops. The right narrow-
-                // projection path is to add a distinct "structural-needed" sentinel
-                // separate from "*" and update every `need_full` check accordingly —
-                // a wider planner refactor reserved for follow-up. See the diag
-                // tests in profile_test.rs for the measured opportunity.
+                // If the same variable is also referenced bare elsewhere
+                // (e.g. `SET n.x = 1 RETURN n`), `collect_properties_from_expr_into`
+                // inserts "*" through the bare-Variable path; "*" dominates
+                // the sentinel in `resolve_properties`, so the full schema
+                // is still pulled when actually required.
                 collect_properties_from_expr_into(expr, properties);
                 collect_properties_from_expr_into(value, properties);
                 if let Expr::Property(base, _) = expr
@@ -8395,7 +8411,7 @@ fn mark_set_item_variables(items: &[SetItem], properties: &mut HashMap<String, H
                     properties
                         .entry(var.clone())
                         .or_default()
-                        .insert("*".to_string());
+                        .insert(STRUCT_ONLY_SENTINEL.to_string());
                 }
             }
             SetItem::Labels { variable, .. } => {

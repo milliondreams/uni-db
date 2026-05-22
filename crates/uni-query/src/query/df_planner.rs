@@ -1748,6 +1748,7 @@ impl HybridPhysicalPlanner {
             self.storage.clone(),
             self.schema.clone(),
             self.params.clone(),
+            self.mutation_ctx.clone(),
         )))
     }
 
@@ -1792,6 +1793,7 @@ impl HybridPhysicalPlanner {
             self.schema.clone(),
             self.params.clone(),
             output_schema,
+            self.mutation_ctx.clone(),
         )))
     }
 

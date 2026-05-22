@@ -748,6 +748,7 @@ impl<'a> NativeExecutionAdapter<'a> {
             &self.session_ctx,
             &self.db.storage,
             &self.db.schema.schema(),
+            None, // Locy fact-extraction path is read-only
         )
         .await
         .map_err(|e| LocyError::ExecutorError {
@@ -834,6 +835,7 @@ impl DerivedFactSource for NativeExecutionAdapter<'_> {
             &self.session_ctx,
             &self.db.storage,
             &self.db.schema.schema(),
+            None, // Locy fixpoint path is read-only
         )
         .await
         .map_err(|e| LocyError::ExecutorError {
@@ -1358,6 +1360,7 @@ async fn enrich_vids_with_nodes(
                     session_ctx,
                     &db.storage,
                     &db.schema.schema(),
+                    None, // Locy inline Cypher path is read-only
                 )
                 .await
             {

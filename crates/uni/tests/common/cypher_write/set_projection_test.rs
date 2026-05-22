@@ -1457,18 +1457,11 @@ async fn l1_unwind_then_set_round_trips() -> Result<()> {
     Ok(())
 }
 
-/// L2 — SET inside a CALL { ... } subquery documents a current limitation.
-///
-/// CALL subquery writes (SET, CREATE, MERGE inside the sub-block) are NOT
-/// currently supported in uni: the sub-plan executes without a
-/// MutationContext attached, and the planner errors with "Mutation
-/// context not set." This is a pre-existing gap, NOT a Part B regression.
-///
-/// The test asserts that the limitation is surfaced as a clear error (not
-/// a silent no-op). When CALL subquery writes are implemented, flip the
-/// assertion from `is_err()` to a positive round-trip.
+/// L2 — `SET` inside `CALL { ... }` subquery round-trips. Threading the
+/// outer MutationContext into the per-row sub-planner enables writes
+/// inside `Apply` / `SubqueryCall` plan nodes.
 #[tokio::test]
-async fn l2_call_subquery_set_currently_errors() -> Result<()> {
+async fn l2_call_subquery_set_round_trips() -> Result<()> {
     let db = Uni::in_memory().build().await?;
     db.schema()
         .label("E")
@@ -1483,27 +1476,439 @@ async fn l2_call_subquery_set_currently_errors() -> Result<()> {
     tx.commit().await?;
 
     let tx = db.session().tx().await?;
-    let res = tx
-        .execute("MATCH (n:E) CALL { WITH n SET n.x = 77 } RETURN n.x")
-        .await;
-    let err_msg = match res {
-        Ok(_) => match tx.commit().await {
-            Ok(_) => String::new(),
-            Err(e) => format!("{e}"),
-        },
-        Err(e) => format!("{e}"),
-    };
-    assert!(
-        !err_msg.is_empty() && err_msg.contains("Mutation context"),
-        "expected 'Mutation context' error, got: {err_msg:?}"
-    );
+    tx.execute("MATCH (n:E) CALL { WITH n SET n.x = 77 } RETURN n.x")
+        .await?;
+    tx.commit().await?;
 
-    // Underlying row must remain unchanged (failure left no partial write).
+    let r = db.session().query("MATCH (n:E) RETURN n.x AS x").await?;
+    assert_eq!(r.rows()[0].get::<i64>("x").unwrap(), 77, "CALL subquery SET did not apply");
+    Ok(())
+}
+
+/// L2b — `CREATE` inside CALL subquery creates the new vertex.
+#[tokio::test]
+async fn l2b_call_subquery_create_round_trips() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("E")
+        .property("id", DataType::String)
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:E {id: 'seed'})").await?;
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (n:E {id: 'seed'}) CALL { CREATE (:E {id: 'fresh'}) } RETURN n.id")
+        .await?;
+    tx.commit().await?;
+
+    let r = db
+        .session()
+        .query("MATCH (n:E) RETURN n.id AS id ORDER BY id")
+        .await?;
+    let ids: Vec<String> = r
+        .rows()
+        .iter()
+        .map(|row| row.get::<String>("id").unwrap())
+        .collect();
+    assert_eq!(ids, vec!["fresh".to_string(), "seed".to_string()]);
+    Ok(())
+}
+
+/// L2c — `MERGE ... ON CREATE SET` inside CALL subquery on a non-existing key.
+#[tokio::test]
+async fn l2c_call_subquery_merge_on_create_round_trips() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("E")
+        .property("id", DataType::String)
+        .property_nullable("fresh", DataType::Bool)
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:E {id: 'anchor'})").await?;
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute(
+        "MATCH (n:E {id: 'anchor'}) \
+         CALL { MERGE (m:E {id: 'new_via_merge'}) ON CREATE SET m.fresh = true } \
+         RETURN n.id",
+    )
+    .await?;
+    tx.commit().await?;
+
+    let r = db
+        .session()
+        .query("MATCH (m:E {id: 'new_via_merge'}) RETURN m.fresh AS fresh")
+        .await?;
+    assert_eq!(r.len(), 1);
+    let fresh = r.rows()[0].value("fresh").expect("fresh missing");
+    assert!(matches!(fresh, Value::Bool(true)), "ON CREATE SET did not fire");
+    Ok(())
+}
+
+/// L2c2 — `MERGE ... ON MATCH SET` inside CALL subquery on an EXISTING key.
+#[tokio::test]
+async fn l2c2_call_subquery_merge_on_match_round_trips() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("E")
+        .property("id", DataType::String)
+        .property_nullable("hits", DataType::Int64)
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:E {id: 'anchor'})").await?;
+    tx.execute("CREATE (:E {id: 'existing', hits: 1})").await?;
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute(
+        "MATCH (n:E {id: 'anchor'}) \
+         CALL { MERGE (m:E {id: 'existing'}) ON MATCH SET m.hits = 99 } \
+         RETURN n.id",
+    )
+    .await?;
+    tx.commit().await?;
+
+    let r = db
+        .session()
+        .query("MATCH (m:E {id: 'existing'}) RETURN m.hits AS hits")
+        .await?;
+    assert_eq!(r.rows()[0].get::<i64>("hits").unwrap(), 99, "ON MATCH SET did not fire");
+    Ok(())
+}
+
+/// L2d — `DELETE` inside CALL subquery removes the vertex.
+#[tokio::test]
+async fn l2d_call_subquery_delete_round_trips() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("E")
+        .property("id", DataType::String)
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:E {id: 'keep'})").await?;
+    tx.execute("CREATE (:E {id: 'doomed'})").await?;
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (n:E {id: 'doomed'}) CALL { WITH n DELETE n } RETURN 1 AS dummy")
+        .await?;
+    tx.commit().await?;
+
+    let r = db.session().query("MATCH (n:E) RETURN count(n) AS c").await?;
+    assert_eq!(r.rows()[0].get::<i64>("c").unwrap(), 1, "DELETE in subquery did not remove vertex");
+    let r2 = db.session().query("MATCH (n:E) RETURN n.id AS id").await?;
+    assert_eq!(r2.rows()[0].get::<String>("id").unwrap(), "keep");
+    Ok(())
+}
+
+/// L2e — nested `CALL { CALL { ... SET ... } }` — verifies mutation_ctx
+/// propagates through nested GraphApplyExec instances.
+#[tokio::test]
+async fn l2e_call_subquery_nested_set_round_trips() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("E")
+        .property("id", DataType::String)
+        .property_nullable("x", DataType::Int64)
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:E {id: 'e1', x: 0})").await?;
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (n:E) CALL { WITH n CALL { WITH n SET n.x = 42 } } RETURN n.x")
+        .await?;
+    tx.commit().await?;
+
+    let r = db.session().query("MATCH (n:E) RETURN n.x AS x").await?;
+    assert_eq!(r.rows()[0].get::<i64>("x").unwrap(), 42, "nested CALL SET did not apply");
+    Ok(())
+}
+
+/// L2f — edge SET inside CALL subquery.
+#[tokio::test]
+async fn l2f_call_subquery_edge_set_round_trips() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("N")
+        .property("id", DataType::String)
+        .done()
+        .edge_type("R", &["N"], &["N"])
+        .property_nullable("flag", DataType::Bool)
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (a:N {id: 'a'})-[:R]->(b:N {id: 'b'})").await?;
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (a:N)-[r:R]->(b:N) CALL { WITH r SET r.flag = true } RETURN a.id")
+        .await?;
+    tx.commit().await?;
+
+    let r = db
+        .session()
+        .query("MATCH ()-[r:R]->() RETURN r.flag AS f")
+        .await?;
+    let f = r.rows()[0].value("f").expect("flag missing");
+    assert!(matches!(f, Value::Bool(true)), "edge SET in subquery did not apply");
+    Ok(())
+}
+
+/// L2g — RHS in subquery reads a correlated outer variable's property.
+#[tokio::test]
+async fn l2g_call_subquery_correlated_set_round_trips() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("E")
+        .property("id", DataType::String)
+        .property_nullable("source", DataType::Int64)
+        .property_nullable("copy", DataType::Int64)
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:E {id: 'e1', source: 42, copy: 0})").await?;
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (n:E) CALL { WITH n SET n.copy = n.source } RETURN n.id")
+        .await?;
+    tx.commit().await?;
+
+    let r = db
+        .session()
+        .query("MATCH (n:E) RETURN n.source AS s, n.copy AS c")
+        .await?;
+    assert_eq!(r.rows()[0].get::<i64>("s").unwrap(), 42);
+    assert_eq!(
+        r.rows()[0].get::<i64>("c").unwrap(),
+        42,
+        "correlated subquery RHS did not read outer-bound n.source"
+    );
+    Ok(())
+}
+
+/// L2h — multi-input CALL subquery: outer MATCH yields N rows; subquery
+/// fires N times; all writes land.
+#[tokio::test]
+async fn l2h_call_subquery_multi_input_writes_round_trips() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("E")
+        .property("id", DataType::String)
+        .property_nullable("touched", DataType::Bool)
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    for i in 0..5 {
+        tx.execute_with("CREATE (:E {id: $id, touched: false})")
+            .param("id", format!("e{i}"))
+            .run()
+            .await?;
+    }
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (n:E) CALL { WITH n SET n.touched = true } RETURN n.id")
+        .await?;
+    tx.commit().await?;
+
+    let r = db
+        .session()
+        .query("MATCH (n:E) WHERE n.touched = true RETURN count(n) AS c")
+        .await?;
+    assert_eq!(
+        r.rows()[0].get::<i64>("c").unwrap(),
+        5,
+        "expected 5 touched rows from multi-input subquery"
+    );
+    Ok(())
+}
+
+/// L2i — subquery contains BOTH read (MATCH traverse) and write (SET).
+#[tokio::test]
+async fn l2i_call_subquery_mixed_read_write_round_trips() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("N")
+        .property("id", DataType::String)
+        .property_nullable("touched", DataType::Bool)
+        .done()
+        .edge_type("LINK", &["N"], &["N"])
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (a:N {id: 'a'})-[:LINK]->(b:N {id: 'b'})").await?;
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute(
+        "MATCH (n:N {id: 'a'}) \
+         CALL { WITH n MATCH (n)-[:LINK]->(m) SET m.touched = true } \
+         RETURN n.id",
+    )
+    .await?;
+    tx.commit().await?;
+
+    let r = db
+        .session()
+        .query("MATCH (m:N {id: 'b'}) RETURN m.touched AS t")
+        .await?;
+    let t = r.rows()[0].value("t").expect("touched missing");
+    assert!(matches!(t, Value::Bool(true)), "mixed read+write subquery did not apply");
+
+    let r2 = db
+        .session()
+        .query("MATCH (a:N {id: 'a'}) RETURN a.touched AS t")
+        .await?;
+    let t2 = r2.rows()[0].value("t");
+    assert!(
+        t2.is_none() || matches!(t2.unwrap(), Value::Null | Value::Bool(false)),
+        "outer-only n was touched by mistake"
+    );
+    Ok(())
+}
+
+/// L2j — empty input on a correlated CALL subquery: no phantom writes.
+///
+/// uni's `run_apply` invokes the empty-input branch even for correlated
+/// subqueries; the `WITH n` then errors because `n` is unbound. Either
+/// outcome is acceptable for this test: the assertion is that no
+/// phantom write lands on the seed row.
+#[tokio::test]
+async fn l2j_call_subquery_empty_input_no_phantom_writes() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("E")
+        .property("id", DataType::String)
+        .property_nullable("x", DataType::Int64)
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:E {id: 'kept', x: 0})").await?;
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    // Outer WHERE excludes all rows; subquery should not run successfully.
+    // Whether this errors or no-ops, the kept vertex must remain at x=0.
+    let res = tx
+        .execute_with(
+            "MATCH (n:E) WHERE id(n) = $v CALL { WITH n SET n.x = 999 } RETURN n.id",
+        )
+        .param("v", Value::Int(99_999_999))
+        .run()
+        .await;
+    if res.is_ok() {
+        // If exec succeeded, commit; otherwise drop the tx.
+        let _ = tx.commit().await;
+    } else {
+        drop(tx);
+    }
+
     let r = db.session().query("MATCH (n:E) RETURN n.x AS x").await?;
     assert_eq!(
         r.rows()[0].get::<i64>("x").unwrap(),
         0,
-        "subquery SET error left a partial write"
+        "phantom write from empty-input CALL subquery"
+    );
+    Ok(())
+}
+
+/// L2k — constraint violation inside the subquery errors; outer state is
+/// unchanged.
+#[tokio::test]
+async fn l2k_call_subquery_constraint_violation_rolls_back() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL E (key STRING NOT NULL UNIQUE, marker INT)")
+        .await?;
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:E {key: 'a', marker: 1})").await?;
+    tx.execute("CREATE (:E {key: 'b', marker: 2})").await?;
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    let res = tx
+        .execute("MATCH (n:E {key: 'a'}) CALL { WITH n SET n.marker = 99, n.key = 'b' } RETURN n.key")
+        .await;
+    let err = if res.is_err() {
+        true
+    } else {
+        tx.commit().await.is_err()
+    };
+    assert!(err, "expected UNIQUE constraint violation inside CALL subquery to error");
+
+    let r = db
+        .session()
+        .query("MATCH (n:E {key: 'a'}) RETURN n.marker AS m")
+        .await?;
+    assert_eq!(
+        r.rows()[0].get::<i64>("m").unwrap(),
+        1,
+        "outer row partially-written despite UNIQUE violation in subquery"
+    );
+    Ok(())
+}
+
+/// L2m — write inside CALL subquery is visible to a subsequent read in
+/// the same transaction (cross-statement visibility within tx).
+#[tokio::test]
+async fn l2m_call_subquery_write_visible_to_later_read_in_tx() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("E")
+        .property("id", DataType::String)
+        .property_nullable("x", DataType::Int64)
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:E {id: 'e1', x: 0})").await?;
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (n:E) CALL { WITH n SET n.x = 88 } RETURN n.id")
+        .await?;
+    // Same transaction: read back via tx.query.
+    let r = tx
+        .query("MATCH (n:E) RETURN n.x AS x")
+        .await?;
+    tx.commit().await?;
+
+    assert_eq!(
+        r.rows()[0].get::<i64>("x").unwrap(),
+        88,
+        "later read in same tx did not see inner subquery SET"
     );
     Ok(())
 }

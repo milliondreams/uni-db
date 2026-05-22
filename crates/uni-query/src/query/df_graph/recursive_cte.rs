@@ -17,7 +17,7 @@
 //!    e. Accumulate new rows and repeat
 //! 3. Output all accumulated rows as a single-column list
 
-use crate::query::df_graph::GraphExecutionContext;
+use crate::query::df_graph::{GraphExecutionContext, MutationContext};
 use crate::query::df_graph::common::{arrow_err, compute_plan_properties, execute_subplan};
 use crate::query::df_graph::unwind::arrow_to_json_value;
 use crate::query::planner::LogicalPlan;
@@ -80,6 +80,11 @@ pub struct RecursiveCTEExec {
     /// Cached plan properties.
     properties: PlanProperties,
 
+    /// Outer mutation context, threaded into each iteration's sub-planner
+    /// so that writes inside the recursive body (rare but supported by the
+    /// general API) route through the same transaction's L0 buffer.
+    mutation_ctx: Option<Arc<MutationContext>>,
+
     /// Execution metrics.
     metrics: ExecutionPlanMetricsSet,
 }
@@ -104,6 +109,7 @@ impl RecursiveCTEExec {
         storage: Arc<StorageManager>,
         schema_info: Arc<UniSchema>,
         params: HashMap<String, Value>,
+        mutation_ctx: Option<Arc<MutationContext>>,
     ) -> Self {
         // Output schema: single column named after CTE, containing a LargeList<Int64>.
         // Each element is a VID (cast to Int64) from the CTE results. The `n IN hierarchy`
@@ -125,6 +131,7 @@ impl RecursiveCTEExec {
             params,
             output_schema,
             properties,
+            mutation_ctx,
             metrics: ExecutionPlanMetricsSet::new(),
         }
     }
@@ -187,6 +194,7 @@ impl ExecutionPlan for RecursiveCTEExec {
         let schema_info = self.schema_info.clone();
         let params = self.params.clone();
         let output_schema = self.output_schema.clone();
+        let mutation_ctx = self.mutation_ctx.clone();
 
         let fut = async move {
             run_cte_loop(
@@ -199,6 +207,7 @@ impl ExecutionPlan for RecursiveCTEExec {
                 &schema_info,
                 &params,
                 &output_schema,
+                mutation_ctx.as_ref(),
             )
             .await
         };
@@ -285,6 +294,7 @@ async fn run_cte_loop(
     schema_info: &Arc<UniSchema>,
     params: &HashMap<String, Value>,
     output_schema: &SchemaRef,
+    mutation_ctx: Option<&Arc<MutationContext>>,
 ) -> DFResult<RecordBatch> {
     // 1. Execute anchor
     let anchor_batches = execute_subplan(
@@ -295,6 +305,7 @@ async fn run_cte_loop(
         session_ctx,
         storage,
         schema_info,
+        mutation_ctx,
     )
     .await?;
     let mut working_values = batches_to_values(&anchor_batches);
@@ -330,6 +341,7 @@ async fn run_cte_loop(
             session_ctx,
             storage,
             schema_info,
+            mutation_ctx,
         )
         .await?;
         let next_values = batches_to_values(&recursive_batches);

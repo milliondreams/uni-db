@@ -2327,6 +2327,7 @@ impl PhysicalExpr for ExistsExecExpr {
                         &storage,
                         &uni_schema,
                         &combined_entity_vars,
+                        None, // EXISTS compile-time rejects mutations (expr_compiler:693)
                     ))?;
 
                     let has_rows = batches.iter().any(|b| b.num_rows() > 0);

@@ -1241,6 +1241,7 @@ async fn run_fixpoint_loop(
                     &session_ctx,
                     &storage,
                     &schema_info,
+                    None, // Locy fixpoint clause body is read-only
                 )
                 .await?;
                 // Apply negated IS-ref semantics: probabilistic complement or anti-join.

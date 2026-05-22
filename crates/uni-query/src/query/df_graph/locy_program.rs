@@ -722,6 +722,7 @@ async fn execute_cypher_inline(
         session_ctx,
         storage,
         schema_info,
+        None, // Locy paths are read-only (queries + fact extraction)
     )
     .await?;
     Ok(super::locy_eval::record_batches_to_locy_rows(&batches))
@@ -1022,6 +1023,7 @@ async fn run_program(
                         &session_ctx,
                         &storage,
                         &schema_info,
+                        None, // Locy clause body is read-only
                     )
                     .await?;
 

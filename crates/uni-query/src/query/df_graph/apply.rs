@@ -18,7 +18,7 @@
 //! If input produces zero rows (after filtering), execute the subquery once
 //! with the base parameters (standalone CALL support).
 
-use crate::query::df_graph::GraphExecutionContext;
+use crate::query::df_graph::{GraphExecutionContext, MutationContext};
 use crate::query::df_graph::common::{
     arrow_err, collect_all_partitions, compute_plan_properties, execute_subplan, extract_row_params,
 };
@@ -86,6 +86,11 @@ pub struct GraphApplyExec {
     /// Cached plan properties.
     properties: PlanProperties,
 
+    /// Outer mutation context, threaded into the per-row sub-planner so that
+    /// `CALL { ... SET/CREATE/MERGE/DELETE ... }` writes route through the
+    /// same transaction's L0 buffer. `None` for read-only outer plans.
+    mutation_ctx: Option<Arc<MutationContext>>,
+
     /// Execution metrics.
     metrics: ExecutionPlanMetricsSet,
 }
@@ -111,6 +116,7 @@ impl GraphApplyExec {
         schema_info: Arc<UniSchema>,
         params: HashMap<String, Value>,
         output_schema: SchemaRef,
+        mutation_ctx: Option<Arc<MutationContext>>,
     ) -> Self {
         let properties = compute_plan_properties(output_schema.clone());
 
@@ -125,6 +131,7 @@ impl GraphApplyExec {
             params,
             output_schema,
             properties,
+            mutation_ctx,
             metrics: ExecutionPlanMetricsSet::new(),
         }
     }
@@ -194,6 +201,7 @@ impl ExecutionPlan for GraphApplyExec {
         let schema_info = self.schema_info.clone();
         let params = self.params.clone();
         let output_schema = self.output_schema.clone();
+        let mutation_ctx = self.mutation_ctx.clone();
 
         let fut = async move {
             run_apply(
@@ -206,6 +214,7 @@ impl ExecutionPlan for GraphApplyExec {
                 &schema_info,
                 &params,
                 &output_schema,
+                mutation_ctx.as_ref(),
             )
             .await
         };
@@ -539,6 +548,7 @@ async fn run_apply(
     schema_info: &Arc<UniSchema>,
     params: &HashMap<String, Value>,
     output_schema: &SchemaRef,
+    mutation_ctx: Option<&Arc<MutationContext>>,
 ) -> DFResult<RecordBatch> {
     let apply_start = std::time::Instant::now();
     let is_proc_call = is_procedure_call(subquery_plan);
@@ -578,6 +588,7 @@ async fn run_apply(
             session_ctx,
             storage,
             schema_info,
+            mutation_ctx,
         )
         .await?;
         let sub_rows = batches_to_row_maps(&sub_batches);
@@ -636,6 +647,7 @@ async fn run_apply(
             session_ctx,
             storage,
             schema_info,
+            mutation_ctx,
         )
         .await?;
         let subplan_elapsed = subplan_start.elapsed();
@@ -750,6 +762,7 @@ async fn run_apply(
                 session_ctx,
                 storage,
                 schema_info,
+                mutation_ctx,
             )
             .await?;
             let subplan_elapsed = subplan_start.elapsed();

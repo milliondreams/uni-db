@@ -25,6 +25,7 @@ use uni_store::storage::manager::StorageManager;
 use super::GraphExecutionContext;
 use super::procedure_call::map_yield_to_canonical;
 use super::unwind::arrow_to_json_value;
+use crate::query::df_graph::MutationContext;
 use crate::query::df_planner::HybridPhysicalPlanner;
 use crate::query::planner::LogicalPlan;
 
@@ -892,6 +893,13 @@ pub async fn collect_all_partitions(
 /// Execute a logical plan using a fresh HybridPhysicalPlanner with the given params.
 ///
 /// Shared by `RecursiveCTEExec`, `GraphApplyExec`, and `ExistsExecExpr`.
+/// Pass `mutation_ctx = Some(...)` to enable writes inside the sub-plan
+/// (`CALL { ... SET/CREATE/MERGE/DELETE }`). `None` is appropriate for
+/// read-only sub-plans (Locy rule evaluation, EXISTS predicate).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Threading mutation_ctx for CALL subquery writes"
+)]
 pub async fn execute_subplan(
     plan: &LogicalPlan,
     params: &HashMap<String, Value>,
@@ -900,6 +908,7 @@ pub async fn execute_subplan(
     session_ctx: &Arc<RwLock<SessionContext>>,
     storage: &Arc<StorageManager>,
     schema_info: &Arc<UniSchema>,
+    mutation_ctx: Option<&Arc<MutationContext>>,
 ) -> DFResult<Vec<RecordBatch>> {
     execute_subplan_with_outer_vars(
         plan,
@@ -910,13 +919,14 @@ pub async fn execute_subplan(
         storage,
         schema_info,
         &std::collections::HashSet::new(),
+        mutation_ctx,
     )
     .await
 }
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "Threading outer_entity_vars for nested EXISTS"
+    reason = "Threading outer_entity_vars for nested EXISTS and mutation_ctx for CALL writes"
 )]
 /// Like `execute_subplan`, but with outer entity variable names for nested EXISTS.
 ///
@@ -932,6 +942,7 @@ pub async fn execute_subplan_with_outer_vars(
     storage: &Arc<StorageManager>,
     schema_info: &Arc<UniSchema>,
     outer_entity_vars: &std::collections::HashSet<String>,
+    mutation_ctx: Option<&Arc<MutationContext>>,
 ) -> DFResult<Vec<RecordBatch>> {
     let mut planner = HybridPhysicalPlanner::with_l0_context(
         session_ctx.clone(),
@@ -954,6 +965,13 @@ pub async fn execute_subplan_with_outer_vars(
     }
     if let Some(runtime) = graph_ctx.xervo_runtime() {
         planner = planner.with_xervo_runtime(runtime.clone());
+    }
+
+    // Propagate the outer MutationContext so writes inside CALL { ... }
+    // subqueries (SET, CREATE, MERGE, DELETE) and RecursiveCTE bodies can
+    // route through the same transaction's L0 buffer.
+    if let Some(mc) = mutation_ctx {
+        planner = planner.with_mutation_context(mc.clone());
     }
 
     let execution_plan = planner.plan(plan).map_err(|e| {

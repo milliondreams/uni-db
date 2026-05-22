@@ -2708,3 +2708,174 @@ async fn l3e_vlp_path_edges_set() -> Result<()> {
     assert_eq!(flagged, 2, "both VLP edges should have flag=true");
     Ok(())
 }
+
+/// L2n — RecursiveCTE write path: SET inside the anchor of a
+/// `WITH RECURSIVE ...` clause must execute and the recursive
+/// expansion must see post-SET values. Round-7 follow-up for the
+/// MutationContext propagation through RecursiveCTE.
+#[tokio::test]
+async fn l2n_recursive_cte_anchor_set_round_trips() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("Item")
+        .property("id", DataType::Int32)
+        .property_nullable("visited", DataType::Bool)
+        .done()
+        .edge_type("CHILD", &["Item"], &["Item"])
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    for i in 0..3 {
+        tx.execute_with("CREATE (:Item {id: $id})")
+            .param("id", Value::Int(i))
+            .run()
+            .await?;
+    }
+    tx.execute("MATCH (a:Item {id: 0}), (b:Item {id: 1}) CREATE (a)-[:CHILD]->(b)")
+        .await?;
+    tx.execute("MATCH (a:Item {id: 1}), (b:Item {id: 2}) CREATE (a)-[:CHILD]->(b)")
+        .await?;
+    tx.commit().await?;
+
+    // Anchor mutates root.visited; recursive walks the chain.
+    let tx = db.session().tx().await?;
+    tx.execute(
+        "WITH RECURSIVE hierarchy AS (
+             MATCH (root:Item {id: 0}) SET root.visited = true RETURN root
+             UNION
+             MATCH (parent:Item)-[:CHILD]->(child:Item) WHERE parent IN hierarchy RETURN child
+         )
+         MATCH (n:Item) WHERE n IN hierarchy RETURN n.id AS id ORDER BY id",
+    )
+    .await?;
+    tx.commit().await?;
+
+    let r = db
+        .session()
+        .query("MATCH (n:Item {id: 0}) RETURN n.visited AS v")
+        .await?;
+    let val = r.rows()[0].value("v").unwrap();
+    assert!(
+        matches!(val, Value::Bool(true)),
+        "anchor SET inside RecursiveCTE did not persist: {val:?}"
+    );
+    Ok(())
+}
+
+/// L2n2 — RecursiveCTE recursive-side write: SET inside the recursive
+/// arm should fire for each new child the recursion discovers, and the
+/// writes must persist.
+#[tokio::test]
+async fn l2n2_recursive_cte_recursive_set_round_trips() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("Item")
+        .property("id", DataType::Int32)
+        .property_nullable("touched", DataType::Bool)
+        .done()
+        .edge_type("CHILD", &["Item"], &["Item"])
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    for i in 0..4 {
+        tx.execute_with("CREATE (:Item {id: $id})")
+            .param("id", Value::Int(i))
+            .run()
+            .await?;
+    }
+    // chain 0 → 1 → 2 → 3
+    for (a, b) in [(0, 1), (1, 2), (2, 3)] {
+        tx.execute_with("MATCH (a:Item {id: $a}), (b:Item {id: $b}) CREATE (a)-[:CHILD]->(b)")
+            .param("a", Value::Int(a))
+            .param("b", Value::Int(b))
+            .run()
+            .await?;
+    }
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute(
+        "WITH RECURSIVE hierarchy AS (
+             MATCH (root:Item {id: 0}) RETURN root
+             UNION
+             MATCH (parent:Item)-[:CHILD]->(child:Item) WHERE parent IN hierarchy
+             SET child.touched = true RETURN child
+         )
+         MATCH (n:Item) WHERE n IN hierarchy RETURN n.id AS id ORDER BY id",
+    )
+    .await?;
+    tx.commit().await?;
+
+    // All descendants (ids 1, 2, 3) should be touched; root (id 0) should not.
+    let r = db
+        .session()
+        .query("MATCH (n:Item) RETURN n.id AS id, n.touched AS t ORDER BY id")
+        .await?;
+    let rows = r.rows();
+    assert_eq!(rows.len(), 4);
+    assert!(
+        matches!(rows[0].value("t").unwrap(), Value::Null | Value::Bool(false)),
+        "root should not be touched: {:?}",
+        rows[0].value("t")
+    );
+    for row in &rows[1..] {
+        let v = row.value("t").unwrap();
+        assert!(
+            matches!(v, Value::Bool(true)),
+            "descendant id={} should be touched: {v:?}",
+            row.get::<i32>("id").unwrap()
+        );
+    }
+    Ok(())
+}
+
+/// L2n3 — read-only RecursiveCTE should not regress when MutationContext
+/// is None. Regression guard for the Round-7 propagation work.
+#[tokio::test]
+async fn l2n3_recursive_cte_read_only_unaffected() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("Item")
+        .property("id", DataType::Int32)
+        .done()
+        .edge_type("CHILD", &["Item"], &["Item"])
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    for i in 0..3 {
+        tx.execute_with("CREATE (:Item {id: $id})")
+            .param("id", Value::Int(i))
+            .run()
+            .await?;
+    }
+    tx.execute("MATCH (a:Item {id: 0}), (b:Item {id: 1}) CREATE (a)-[:CHILD]->(b)")
+        .await?;
+    tx.execute("MATCH (a:Item {id: 1}), (b:Item {id: 2}) CREATE (a)-[:CHILD]->(b)")
+        .await?;
+    tx.commit().await?;
+
+    let r = db
+        .session()
+        .query(
+            "WITH RECURSIVE chain AS (
+                 MATCH (root:Item {id: 0}) RETURN root
+                 UNION
+                 MATCH (parent:Item)-[:CHILD]->(child:Item) WHERE parent IN chain RETURN child
+             )
+             MATCH (n:Item) WHERE n IN chain RETURN n.id AS id ORDER BY id",
+        )
+        .await?;
+    let ids: Vec<i32> = r
+        .rows()
+        .iter()
+        .map(|row| row.get::<i32>("id").unwrap())
+        .collect();
+    assert_eq!(ids, vec![0, 1, 2], "read-only RecursiveCTE expansion broken");
+    Ok(())
+}

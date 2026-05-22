@@ -792,17 +792,24 @@ pub fn pattern_variable_names(pattern: &Pattern) -> Vec<String> {
 fn normalize_mutation_schema(schema: &SchemaRef) -> SchemaRef {
     use arrow_schema::{Field, Schema};
 
-    // Detect any field whose type is Struct or List<Struct> (e.g., the bound
-    // VLP edge-list `r` from `MATCH (a)-[r*1..2]->(b)`). Both round-trip
-    // through `rows_to_batches` as CV-encoded LargeBinary, so the declared
-    // schema must match or `RecordBatch::try_new` rejects the batch with
-    // "column types must match schema types".
+    // Detect any field whose type round-trips through `rows_to_batches` as
+    // CV-encoded LargeBinary, so the declared schema must match or
+    // `RecordBatch::try_new` rejects the batch with "column types must
+    // match schema types".
+    //   * `Struct(_)` — bare graph entities (Node/Edge).
+    //   * `List<Struct>` / `LargeList<Struct>` — the VLP-bound edge-list
+    //     `r` from `MATCH (a)-[r*1..2]->(b)`.
+    //   * `List<T>` for any T that `arrow_convert::values_to_array` doesn't
+    //     know how to construct from `Value::List` (today: everything
+    //     except `List<Utf8>`). RecursiveCTE-side WHERE-IN aggregations
+    //     emit `List<Int64>` here, for example.
     fn needs_norm(dt: &DataType) -> bool {
         match dt {
             DataType::Struct(_) => true,
-            DataType::List(inner) | DataType::LargeList(inner) => {
-                matches!(inner.data_type(), DataType::Struct(_))
-            }
+            DataType::List(inner) | DataType::LargeList(inner) => match inner.data_type() {
+                DataType::Utf8 => false,
+                _ => true,
+            },
             _ => false,
         }
     }

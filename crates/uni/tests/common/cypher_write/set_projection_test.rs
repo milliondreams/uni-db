@@ -2080,16 +2080,65 @@ async fn l2s_call_subquery_set_edge_then_return() -> Result<()> {
 }
 
 /// L2t — `CALL { WITH n SET n.x = 5 }` with NO inner RETURN, then outer
-/// `RETURN n.x`. Cypher's "unit subquery" semantics say input rows should
-/// pass through unchanged when a CALL subquery omits RETURN. Today the
-/// Apply boundary applies inner-join semantics against the zero-row
-/// subquery output and drops the input row entirely, so outer projections
-/// produce nothing. This is a distinct bug from the Round-9 stale-binding
-/// fix (which targets the SET→RETURN refresh path) and lives outside its
-/// scope. Marked ignored until that follow-up lands.
-#[ignore = "Round 9 follow-up: CALL { ... } without inner RETURN should pass input rows through (unit subquery semantics); currently drops them via Apply inner-join"]
+/// `RETURN n.x`. Per openCypher "unit subquery" semantics, a CALL without
+/// RETURN passes input rows through unchanged. The Round-10 fix detects
+/// the zero-field subquery output schema in `GraphApplyExec` and emits
+/// the input row regardless of subquery row count, while side effects
+/// (the SET) flush to L0.
+///
+/// **Two assertions:** (1) writes land (verified via a separate session
+/// query post-commit) and (2) the input row passes through (the inline
+/// query returns one row). The inline `n.x` value is unspecified by this
+/// test — the unit-subquery passthrough emits the pre-SET row binding
+/// since there is no inner RETURN to re-emit `n`; refreshing the dotted
+/// column would require re-reading from L0 inside `GraphApplyExec`,
+/// which is a larger follow-up (see l2t_inline_stale_binding).
 #[tokio::test]
 async fn l2t_call_subquery_set_no_inner_return_outer_sees_writes() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("E")
+        .property("id", DataType::String)
+        .property_nullable("x", DataType::Int64)
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:E {id: 'e1', x: 0})").await?;
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    let res = tx
+        .query(
+            "MATCH (n:E {id: 'e1'}) \
+             CALL { WITH n SET n.x = 5 } \
+             RETURN n.id AS id",
+        )
+        .await?;
+    tx.commit().await?;
+
+    assert_eq!(res.rows().len(), 1, "unit subquery dropped the outer row");
+    assert_eq!(res.rows()[0].get::<String>("id").unwrap(), "e1");
+
+    // Writes must land regardless: a fresh session query sees the SET.
+    let r = db
+        .session()
+        .query("MATCH (n:E {id: 'e1'}) RETURN n.x AS x")
+        .await?;
+    assert_eq!(
+        r.rows()[0].get::<i64>("x").unwrap(),
+        5,
+        "SET in unit subquery did not flush to L0"
+    );
+    Ok(())
+}
+
+/// L2t2 — inline RETURN after unit-subquery SET must surface post-SET
+/// values via the per-row sub_row refresh in `append_cross_join_row`
+/// (unit-subquery branch).
+#[tokio::test]
+async fn l2t2_call_subquery_unit_inline_return_post_set() -> Result<()> {
     let db = Uni::in_memory().build().await?;
     db.schema()
         .label("E")
@@ -2116,7 +2165,153 @@ async fn l2t_call_subquery_set_no_inner_return_outer_sees_writes() -> Result<()>
     assert_eq!(
         res.rows()[0].get::<i64>("x").unwrap(),
         5,
-        "outer RETURN n.x did not see write from CALL subquery without inner RETURN"
+        "inline RETURN after unit-subquery SET surfaced stale row binding"
+    );
+    Ok(())
+}
+
+/// L2u — multi-row unit-subquery: each input row should produce exactly one
+/// output row and the SET must apply to all of them. Exercises the batched
+/// hash-join code path (≥2 rows + correlated VID).
+#[tokio::test]
+async fn l2u_unit_subquery_multi_row_passthrough() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("E")
+        .property("id", DataType::String)
+        .property_nullable("x", DataType::Int64)
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    for i in 0..5 {
+        tx.execute_with("CREATE (:E {id: $id, x: 0})")
+            .param("id", Value::String(format!("e{i}")))
+            .run()
+            .await?;
+    }
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    let res = tx
+        .query(
+            "MATCH (n:E) \
+             CALL { WITH n SET n.x = 42 } \
+             RETURN n.id AS id ORDER BY id",
+        )
+        .await?;
+    tx.commit().await?;
+
+    assert_eq!(res.rows().len(), 5, "unit subquery dropped input rows");
+
+    // Verify ALL five writes landed via a fresh session query.
+    let r = db
+        .session()
+        .query("MATCH (n:E) RETURN n.id AS id, n.x AS x ORDER BY id")
+        .await?;
+    assert_eq!(r.rows().len(), 5);
+    for row in r.rows() {
+        assert_eq!(row.get::<i64>("x").unwrap(), 42, "SET on row did not land");
+    }
+    Ok(())
+}
+
+/// L2v — unit subquery containing a CREATE inside `CALL { CREATE (m:E) }`
+/// (no inner RETURN). The CREATE must run as a side effect, and the outer
+/// input row must still pass through.
+#[tokio::test]
+async fn l2v_unit_subquery_create_side_effect() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("E")
+        .property("id", DataType::String)
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:E {id: 'seed'})").await?;
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    let res = tx
+        .query(
+            "MATCH (n:E {id: 'seed'}) \
+             CALL { CREATE (:E {id: 'fresh'}) } \
+             RETURN n.id AS id",
+        )
+        .await?;
+    tx.commit().await?;
+    assert_eq!(res.rows().len(), 1, "unit subquery dropped the outer row");
+    assert_eq!(res.rows()[0].get::<String>("id").unwrap(), "seed");
+
+    let r = db
+        .session()
+        .query("MATCH (n:E) RETURN count(n) AS c")
+        .await?;
+    assert_eq!(r.rows()[0].get::<i64>("c").unwrap(), 2, "CREATE side effect did not land");
+    Ok(())
+}
+
+/// L2w — empty-input × unit subquery: outer MATCH returns 0 rows, so the
+/// subquery must not be invoked and no phantom output rows appear.
+#[tokio::test]
+async fn l2w_unit_subquery_empty_input() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("E")
+        .property("id", DataType::String)
+        .property_nullable("x", DataType::Int64)
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    let res = tx
+        .query(
+            "MATCH (n:E {id: 'never'}) \
+             CALL { WITH n SET n.x = 1 } \
+             RETURN n.id AS id",
+        )
+        .await?;
+    tx.commit().await?;
+
+    assert_eq!(res.rows().len(), 0, "unit subquery produced phantom rows on empty input");
+    Ok(())
+}
+
+/// L2x — non-unit subquery with no matches still drops the row (inner-join
+/// semantics preserved). Guard against the unit-subquery fix bleeding into
+/// the data-subquery path.
+#[tokio::test]
+async fn l2x_non_unit_subquery_no_match_drops_input() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("E")
+        .property("id", DataType::String)
+        .done()
+        .edge_type("LINKS", &["E"], &["E"])
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:E {id: 'lonely'})").await?;
+    tx.commit().await?;
+
+    let res = db
+        .session()
+        .query(
+            "MATCH (n:E {id: 'lonely'}) \
+             CALL { WITH n MATCH (n)-[:LINKS]->(m) RETURN m } \
+             RETURN n.id AS id",
+        )
+        .await?;
+    assert_eq!(
+        res.rows().len(),
+        0,
+        "data subquery with no matches should drop input row (inner-join semantics)"
     );
     Ok(())
 }

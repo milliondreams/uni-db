@@ -1766,7 +1766,26 @@ impl HybridPhysicalPlanner {
         let input_exec = self.plan_internal(input, all_properties)?;
         let input_schema = input_exec.schema();
 
-        // 2. Infer subquery output schema from logical plan + UniSchema metadata
+        // 1a. Unit-subquery unwrap: write-only `CALL { ... }` (no inner
+        // RETURN) is wrapped in `Limit { fetch: Some(0), input: Set/... }` by
+        // the planner so the subquery emits zero rows. At the physical layer,
+        // `GlobalLimitExec(fetch=0)` short-circuits and never polls its input
+        // — so the embedded write operator never runs. Strip that wrapper so
+        // the side effect executes per outer row; output emptiness is still
+        // signaled via the schema (sub_schema has no fields → unit detection
+        // in `GraphApplyExec`).
+        let subquery_effective = match subquery {
+            LogicalPlan::Limit {
+                input: inner,
+                skip: None,
+                fetch: Some(0),
+            } => inner.as_ref(),
+            _ => subquery,
+        };
+
+        // 2. Infer subquery output schema from logical plan + UniSchema metadata.
+        // Use the ORIGINAL (still-wrapped) subquery so a unit subquery resolves
+        // to an empty schema, which `GraphApplyExec` reads as the unit signal.
         let sub_schema = infer_logical_plan_schema(subquery, &self.schema);
 
         // 3. Merge schemas: subquery fields override input fields with the
@@ -1822,7 +1841,7 @@ impl HybridPhysicalPlanner {
 
         Ok(Arc::new(GraphApplyExec::new(
             input_exec,
-            subquery.clone(),
+            subquery_effective.clone(),
             input_filter.cloned(),
             self.graph_ctx.clone(),
             self.session_ctx.clone(),

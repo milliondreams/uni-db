@@ -526,6 +526,34 @@ fn is_procedure_call(plan: &LogicalPlan) -> bool {
     }
 }
 
+/// Recursively check whether a logical plan contains any write operation.
+///
+/// Subqueries that mutate state must execute once per correlated input row;
+/// the IN-list batching optimization is safe only for read-only subqueries.
+fn plan_contains_writes(plan: &LogicalPlan) -> bool {
+    use crate::query::planner::LogicalPlan as LP;
+    match plan {
+        LP::Create { .. }
+        | LP::CreateBatch { .. }
+        | LP::Merge { .. }
+        | LP::Delete { .. }
+        | LP::Set { .. }
+        | LP::Remove { .. }
+        | LP::Foreach { .. } => true,
+        LP::Project { input, .. }
+        | LP::Filter { input, .. }
+        | LP::Sort { input, .. }
+        | LP::Limit { input, .. }
+        | LP::Distinct { input }
+        | LP::Unwind { input, .. }
+        | LP::Aggregate { input, .. } => plan_contains_writes(input),
+        LP::Apply { input, subquery, .. } | LP::SubqueryCall { input, subquery } => {
+            plan_contains_writes(input) || plan_contains_writes(subquery)
+        }
+        _ => false,
+    }
+}
+
 /// Compute a hash for row parameters to enable deduplication.
 ///
 /// Sorts entries by key for deterministic hashing regardless of iteration order.
@@ -602,8 +630,21 @@ async fn run_apply(
         filtered_entries.len()
     );
 
-    // 3. Handle empty input: execute subquery once with base params
+    let subquery_has_writes = plan_contains_writes(subquery_plan);
+
+    // 3. Handle empty input: execute subquery once with base params.
+    //
+    // For unit subqueries (no RETURN, schema has no subquery fields) we skip
+    // the call entirely: with zero outer rows there's nothing to drive
+    // per-row side effects, and correlated parameter resolution would fail
+    // (`Unresolved parameter: $n`). The same logic applies to any
+    // write-bearing subquery — running it once with no outer correlation
+    // would either fail to resolve params or write phantom rows.
+    let is_unit_subquery = output_schema.fields().len() == kept_input_indices.len();
     if filtered_entries.is_empty() {
+        if is_unit_subquery || subquery_has_writes {
+            return Ok(RecordBatch::new_empty(output_schema.clone()));
+        }
         let sub_batches = execute_subplan(
             subquery_plan,
             params,
@@ -627,7 +668,7 @@ async fn run_apply(
     // - Target pattern: procedure call → Apply with filter → MATCH traversal
     let has_filter = input_filter.is_some();
 
-    if is_batch_eligible(&filtered_entries) && !is_proc_call && has_filter {
+    if is_batch_eligible(&filtered_entries) && !is_proc_call && has_filter && !subquery_has_writes {
         tracing::debug!("run_apply: batching eligible, attempting batch execution");
 
         // Collect unique VID values and build batched params
@@ -708,10 +749,10 @@ async fn run_apply(
                 continue; // Skip if VID is not present
             };
 
+            let input_row_arrays = slice_kept_row(batch, *row_idx, kept_input_indices);
+
             // Look up matching subquery rows by VID
             if let Some(matching_sub_rows) = sub_index.get(&input_vid) {
-                let input_row_arrays = slice_kept_row(batch, *row_idx, kept_input_indices);
-
                 for sub_row in matching_sub_rows {
                     append_cross_join_row(
                         &mut column_arrays,
@@ -720,7 +761,14 @@ async fn run_apply(
                         output_schema,
                         num_input_cols,
                         kept_input_overrides,
+                        is_unit_subquery,
                     )?;
+                }
+            } else if is_unit_subquery {
+                // Unit subquery: side effects (writes) have run as part of the
+                // bulk sub-plan execution above; pass the input row through.
+                for (col_idx, arr) in input_row_arrays.iter().enumerate() {
+                    column_arrays[col_idx].push(arr.clone());
                 }
             }
             // else: inner join — skip input row (no subquery matches)
@@ -811,7 +859,14 @@ async fn run_apply(
         let input_row_arrays = slice_kept_row(batch, *row_idx, kept_input_indices);
 
         if sub_rows.is_empty() {
-            // No subquery results — skip this input row (inner join semantics)
+            if is_unit_subquery {
+                // Unit subquery: side effects have executed; pass the input
+                // row through (no subquery columns to append).
+                for (col_idx, arr) in input_row_arrays.iter().enumerate() {
+                    column_arrays[col_idx].push(arr.clone());
+                }
+            }
+            // else: inner-join semantics — skip this input row.
             continue;
         }
 
@@ -823,6 +878,7 @@ async fn run_apply(
                 output_schema,
                 num_input_cols,
                 kept_input_overrides,
+                is_unit_subquery,
             )?;
         }
     }
@@ -909,6 +965,35 @@ fn value_to_single_row_array(val: &Value, data_type: &DataType) -> DFResult<Arra
             }
             Arc::new(b.finish()) as ArrayRef
         }
+        DataType::Struct(fields) => {
+            // Encode a graph entity (`Value::Map` / `Value::Node` / `Value::Edge`)
+            // into a single-row StructArray matching the declared field
+            // layout. Used by the unit-subquery refresh path so the bare
+            // entity column reflects post-SET state — `compile_property_access`
+            // (expr_compiler.rs) tries struct-field extraction before flat
+            // columns, so a stale Struct would shadow our refreshed dotted
+            // columns.
+            let map_view: Option<&HashMap<String, Value>> = match val {
+                Value::Map(m) => Some(m),
+                Value::Node(n) => Some(&n.properties),
+                Value::Edge(e) => Some(&e.properties),
+                _ => None,
+            };
+            let mut child_arrays: Vec<ArrayRef> = Vec::with_capacity(fields.len());
+            for child_field in fields.iter() {
+                let child_val = map_view
+                    .and_then(|m| m.get(child_field.name()))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                child_arrays.push(value_to_single_row_array(&child_val, child_field.data_type())?);
+            }
+            let pairs: Vec<(Arc<arrow_schema::Field>, ArrayRef)> = fields
+                .iter()
+                .cloned()
+                .zip(child_arrays.into_iter())
+                .collect();
+            Arc::new(arrow_array::StructArray::from(pairs)) as ArrayRef
+        }
         _ => {
             debug_assert!(
                 false,
@@ -929,11 +1014,18 @@ fn value_to_single_row_array(val: &Value, data_type: &DataType) -> DFResult<Arra
 /// Append one cross-joined row (input + subquery) to the per-column accumulator.
 ///
 /// Input columns use Arrow-native sliced arrays to preserve complex types,
-/// EXCEPT when `kept_input_overrides[i]` is `Some((var, prop))` — then the
-/// column `var.prop` is refreshed from the subquery's post-SET bare `var`
-/// Map in `sub_row`, ensuring downstream `RETURN v.prop` sees the updated
-/// value across the Apply boundary. Subquery columns convert `Value` to
-/// single-row Arrow arrays as before.
+/// EXCEPT:
+///   * `kept_input_overrides[i] = Some((var, prop))` — refresh `var.prop`
+///     from the subquery's post-SET bare `var` Map in `sub_row` so dotted
+///     columns surface fresh values across the Apply boundary.
+///   * When `is_unit_subquery` is true, ALSO refresh any kept input column
+///     whose name appears as a key in `sub_row`. Unit subqueries (no
+///     RETURN, write-only side effects) re-emit the modified outer row
+///     under the SAME column names; using the sub_row value gives outer
+///     `RETURN v.prop` the post-SET binding even though the unit subquery
+///     contributes no explicit RETURN fields.
+///
+/// Subquery columns convert `Value` to single-row Arrow arrays as before.
 fn append_cross_join_row(
     column_arrays: &mut [Vec<ArrayRef>],
     input_row_arrays: &[ArrayRef],
@@ -941,10 +1033,10 @@ fn append_cross_join_row(
     output_schema: &SchemaRef,
     num_input_cols: usize,
     kept_input_overrides: &[Option<(String, String)>],
+    is_unit_subquery: bool,
 ) -> DFResult<()> {
-    // Add input columns (Arrow-native), with per-column override from sub_row
-    // when the kept input column's base variable was re-emitted by the
-    // subquery.
+    // Add input columns (Arrow-native), with per-column refresh from sub_row
+    // when applicable (see fn-doc).
     for (col_idx, arr) in input_row_arrays.iter().enumerate() {
         if let Some(Some((var, prop))) = kept_input_overrides.get(col_idx) {
             let extracted = match sub_row.get(var) {
@@ -956,9 +1048,41 @@ fn append_cross_join_row(
             let field = &output_schema.fields()[col_idx];
             let new_arr = value_to_single_row_array(&extracted, field.data_type())?;
             column_arrays[col_idx].push(new_arr);
-        } else {
-            column_arrays[col_idx].push(arr.clone());
+            continue;
         }
+        if is_unit_subquery {
+            // Refresh the kept input column from the subquery's post-SET
+            // sub_row. Two cases:
+            //   * Dotted (`v.prop`): extract `prop` from `sub_row[v]` (the
+            //     subquery emits the modified bare Map under key `v`, not
+            //     as dotted columns).
+            //   * Bare (`v`): replace with `sub_row[v]` itself, encoded
+            //     into the field's declared type. This covers the Struct
+            //     case (`value_to_single_row_array` now has a Struct arm)
+            //     and is required because `compile_property_access` in
+            //     `expr_compiler.rs` tries Struct-field extraction BEFORE
+            //     the flat-column fallback — a stale Struct would shadow
+            //     refreshed dotted columns.
+            let field = &output_schema.fields()[col_idx];
+            let refreshed: Option<Value> = if let Some(dot) = field.name().find('.') {
+                let base = &field.name()[..dot];
+                let prop = &field.name()[dot + 1..];
+                match sub_row.get(base) {
+                    Some(Value::Map(m)) => m.get(prop).cloned(),
+                    Some(Value::Node(n)) => n.properties.get(prop).cloned(),
+                    Some(Value::Edge(e)) => e.properties.get(prop).cloned(),
+                    _ => None,
+                }
+            } else {
+                sub_row.get(field.name()).cloned()
+            };
+            if let Some(val) = refreshed {
+                let new_arr = value_to_single_row_array(&val, field.data_type())?;
+                column_arrays[col_idx].push(new_arr);
+                continue;
+            }
+        }
+        column_arrays[col_idx].push(arr.clone());
     }
 
     // Add subquery columns using Value -> Arrow conversion

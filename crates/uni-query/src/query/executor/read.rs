@@ -669,15 +669,31 @@ impl Executor {
                         }
                     }
 
-                    // Remove remaining dotted helper columns (e.g. _all_props, _src_vid, _dst_vid)
+                    // Drain remaining dotted columns. Merge USER property
+                    // columns (`var.prop` where `prop` doesn't start with `_`
+                    // and isn't `overflow_json`) into the bare Map so that
+                    // post-Apply refresh of dotted columns surfaces through
+                    // `RETURN var.prop`. Without this, the bare entity
+                    // Struct from the outer scan (which is stale after a
+                    // unit-subquery SET) would override post-SET dotted
+                    // values when `record_batches_to_rows` finalizes the
+                    // row. Internal helpers (`_all_props`, `_src_vid`, etc.)
+                    // are dropped silently.
                     let prefix = format!("{}.", var);
-                    let helper_keys: Vec<String> = row
+                    let dotted_keys: Vec<String> = row
                         .keys()
                         .filter(|k| k.starts_with(&prefix))
                         .cloned()
                         .collect();
-                    for key in helper_keys {
-                        row.remove(&key);
+                    for key in dotted_keys {
+                        let prop_name = key[prefix.len()..].to_string();
+                        let val = row.remove(&key);
+                        if prop_name.starts_with('_') || prop_name == "overflow_json" {
+                            continue;
+                        }
+                        if let (Some(val), Some(Value::Map(map))) = (val, row.get_mut(var)) {
+                            map.insert(prop_name, val);
+                        }
                     }
                 }
 

@@ -535,11 +535,19 @@ impl HybridPhysicalPlanner {
     ///
     /// Returns an error if planning fails (unsupported operation, schema mismatch, etc.)
     pub fn plan(&self, logical: &LogicalPlan) -> Result<Arc<dyn ExecutionPlan>> {
+        // Pre-pass: lift UNWIND-correlated IN-list filters into the scan
+        // subtrees of any Filter(CrossJoin(L, R)) shapes. Runs as a pure
+        // logical-plan rewrite *before* any physical-plan optimization
+        // (HashJoin, VidLookupJoin, etc.) so the scan-side filters
+        // survive any downstream optimization bailout. See
+        // `merge_unwind_in_filters` for the rationale.
+        let logical_rewritten = merge_unwind_in_filters(logical, &self.params);
+
         // Collect all properties needed anywhere in the plan tree
-        let all_properties = collect_properties_from_plan(logical);
+        let all_properties = collect_properties_from_plan(&logical_rewritten);
 
         // Delegate to internal planning with properties context
-        self.plan_internal(logical, &all_properties)
+        self.plan_internal(&logical_rewritten, &all_properties)
     }
 
     /// Plan a LogicalPlan with additional property requirements.
@@ -552,11 +560,13 @@ impl HybridPhysicalPlanner {
         logical: &LogicalPlan,
         extra_properties: HashMap<String, HashSet<String>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let mut all_properties = collect_properties_from_plan(logical);
+        // Same pre-pass as `plan()` — see commentary there.
+        let logical_rewritten = merge_unwind_in_filters(logical, &self.params);
+        let mut all_properties = collect_properties_from_plan(&logical_rewritten);
         for (var, props) in extra_properties {
             all_properties.entry(var).or_default().extend(props);
         }
-        self.plan_internal(logical, &all_properties)
+        self.plan_internal(&logical_rewritten, &all_properties)
     }
 
     /// Wrap a plan with optional semantics.
@@ -3190,42 +3200,18 @@ impl HybridPhysicalPlanner {
             return Ok(None);
         }
 
-        // Issue #54 part 3: IN-list scan pushdown for static UNWIND.
+        // UNWIND IN-list scan pushdown (issue #54 part 3) is now handled
+        // by the standalone `merge_unwind_in_filters` pre-pass at
+        // `HybridPhysicalPlanner::plan`. That pass walks the LogicalPlan
+        // tree BEFORE any physical-plan optimization can bail (e.g.,
+        // `unify_join_key_types` failing on Utf8 ↔ LargeBinary), so the
+        // scan-side filters always survive — regardless of whether this
+        // function emits HashJoinExec or falls back to FilterExec(CrossJoin).
         //
-        // For each equi-pair, if one side is `Property(Variable(unwind_var), _)`
-        // and the UNWIND source is statically resolvable (literal list or known
-        // parameter list), build `Expr::In { expr: <other-side>, list: [...] }`
-        // and inject it as a scan-side filter on the opposite subtree. The
-        // existing `is_pushable` / property-IN pushdown path then prunes the
-        // scan before it ever reaches the HashJoin.
-        //
-        // Conditions for pushdown:
-        // - The unwind side is `Property(Variable(v), _)`.
-        // - The opposite side is `Property(Variable(other), _)` (a scan-side
-        //   property that `is_pushable` will accept). We deliberately skip
-        //   `id(scan_var)` — the existing pushdown doesn't accept it, and
-        //   building an artificial filter that can't be pushed is wasted work.
-        // - The UNWIND source resolves at plan time via
-        //   `extract_static_unwind_values`.
-        //
-        // We detect the unwind variable on the LEFT or RIGHT subtree (whichever
-        // contains it) and inject the IN filter on the OPPOSITE subtree.
-        //
-        // The equi-pair order `(l_expr, r_expr)` is independent of which side
-        // of the CrossJoin each expression's variable comes from — for any
-        // pair we must try BOTH `l → unwind, r → scan` AND
-        // `r → unwind, l → scan`, against BOTH subtrees, to cover all
-        // four (pair-order × subtree) combinations. `build_in_pushdown`
-        // returns None for any combination where the unwind variable isn't
-        // actually defined by an UNWIND in the requested subtree.
-        // See issue #55 PR #4.
-        // Diagnostic for UNWIND IN-list pushdown gating. Enable with:
-        //   RUST_LOG=uni_query::cross_join_in_pushdown=debug
-        // If `equi_pairs=0` → the predicate didn't classify as an equi-join
-        // and the optimization can't fire (look at `classify_join_predicate`).
-        // If `equi_pairs>0` and the per-pair "extracted=N" line never appears →
-        // `build_in_pushdown` is rejecting every shape (likely the unwind/scan
-        // side patterns or `materialize_unwind_source*` returning None).
+        // Left-only / right-only conjuncts (from `classify_join_predicate`)
+        // remain handled here because they're predicate-decomposition
+        // concerns specific to HashJoin emission, not UNWIND-IN-list
+        // pushdown. They flow into wrap_with_filter below.
         tracing::debug!(
             target: "uni_query::cross_join_in_pushdown",
             equi_pairs = cls.equi_pairs.len(),
@@ -3235,65 +3221,8 @@ impl HybridPhysicalPlanner {
             "try_plan_cross_join_as_hash_join: classified predicate"
         );
 
-        let mut left_extra_in: Vec<Expr> = Vec::new();
-        let mut right_extra_in: Vec<Expr> = Vec::new();
-        for (l_expr, r_expr) in &cls.equi_pairs {
-            // l_expr's variable unwound in left subtree → push IN onto right.
-            if let Some(in_filter) = build_in_pushdown(l_expr, r_expr, left, &self.params) {
-                tracing::debug!(
-                    target: "uni_query::cross_join_in_pushdown",
-                    side = "left→right",
-                    "build_in_pushdown succeeded"
-                );
-                right_extra_in.push(in_filter);
-                continue;
-            }
-            // r_expr's variable unwound in left subtree → push IN onto right.
-            if let Some(in_filter) = build_in_pushdown(r_expr, l_expr, left, &self.params) {
-                tracing::debug!(
-                    target: "uni_query::cross_join_in_pushdown",
-                    side = "left→right (swapped)",
-                    "build_in_pushdown succeeded"
-                );
-                right_extra_in.push(in_filter);
-                continue;
-            }
-            // l_expr's variable unwound in right subtree → push IN onto left.
-            if let Some(in_filter) = build_in_pushdown(l_expr, r_expr, right, &self.params) {
-                tracing::debug!(
-                    target: "uni_query::cross_join_in_pushdown",
-                    side = "right→left",
-                    "build_in_pushdown succeeded"
-                );
-                left_extra_in.push(in_filter);
-                continue;
-            }
-            // r_expr's variable unwound in right subtree → push IN onto left.
-            if let Some(in_filter) = build_in_pushdown(r_expr, l_expr, right, &self.params) {
-                tracing::debug!(
-                    target: "uni_query::cross_join_in_pushdown",
-                    side = "right→left (swapped)",
-                    "build_in_pushdown succeeded"
-                );
-                left_extra_in.push(in_filter);
-            }
-        }
-        tracing::debug!(
-            target: "uni_query::cross_join_in_pushdown",
-            left_in_filters = left_extra_in.len(),
-            right_in_filters = right_extra_in.len(),
-            "try_plan_cross_join_as_hash_join: IN-pushdown result"
-        );
-
-        // Push left/right-only conjuncts (and any IN filters from the UNWIND
-        // pre-pass) into the respective subtree as a Filter wrapper.
-        // Recursion through plan_internal will re-fire this optimization on
-        // inner CrossJoins. (Inner-join case only — for outer joins we've
-        // already bailed above when these are non-empty.)
-        let mut left_filters: Vec<Expr> = cls.left_only.clone();
-        left_filters.append(&mut left_extra_in);
-        let mut right_filters: Vec<Expr> = cls.right_only.clone();
-        right_filters.append(&mut right_extra_in);
+        let left_filters: Vec<Expr> = cls.left_only.clone();
+        let right_filters: Vec<Expr> = cls.right_only.clone();
         let left_with_filter = wrap_with_filter(left.clone(), &left_filters);
         let right_with_filter = wrap_with_filter(right.clone(), &right_filters);
         let left_plan = self.plan_internal(&left_with_filter, all_properties)?;
@@ -6828,10 +6757,278 @@ fn wrap_with_filter(plan: LogicalPlan, filters: &[Expr]) -> LogicalPlan {
 }
 
 /// AND-merge an optional existing filter with a new predicate.
+///
+/// Idempotent: if `existing == predicate`, the existing filter is
+/// returned unchanged (no `Expr::BinaryOp(And, X, X)` duplication).
+/// This makes the `merge_unwind_in_filters` rewrite pass safely
+/// re-runnable and keeps Scan filters minimal across the planner's
+/// recursive descent.
 fn merge_filter(existing: Option<Expr>, predicate: Expr) -> Option<Expr> {
     match existing {
+        Some(prev) if prev == predicate => Some(prev),
         Some(prev) => and_combine(vec![prev, predicate]),
         None => Some(predicate),
+    }
+}
+
+/// Pre-physical-plan rewrite: walk a [`LogicalPlan`] tree and, at every
+/// `Filter(CrossJoin(L, R), pred)` shape, lift IN-list filters extracted
+/// from UNWIND-correlated equi-pairs into the appropriate `Scan.filter`
+/// field of L or R.
+///
+/// **Why this lives outside `try_plan_cross_join_as_hash_join`**:
+///
+/// Historically the merge happened inside `try_plan_cross_join_as_hash_join`
+/// before the HashJoin attempt. When join-key type unification failed (e.g.
+/// `Utf8 ↔ LargeBinary CV` — see `unify_join_key_types` line ~6995), the
+/// function returned `Ok(None)` and the caller (`plan_filter`) re-planned
+/// the **original** CrossJoin from scratch, discarding the merged-filter
+/// subtrees. The Hash-index pushdown silently vanished.
+///
+/// Separating the rewrite as an independent logical-plan pass that runs
+/// **before** any physical-plan optimization closes that class of bugs at
+/// the source: regardless of whether `HashJoinExec`, `VidLookupJoinExec`,
+/// or a future optimization succeeds or bails, the scan-side filters are
+/// already in the LogicalPlan and propagate to the eventual physical
+/// plan via the normal `plan_scan` → `build_indexed_property_pushdown`
+/// path.
+///
+/// **What this pass does NOT do**:
+///
+///  - It does not push `left_only` / `right_only` predicate conjuncts
+///    into the subtrees. Those are predicate-decomposition concerns
+///    handled by `classify_join_predicate` + the residual logic inside
+///    `try_plan_cross_join_as_hash_join`. Decomposition is part of
+///    HashJoin emission and conceptually belongs with it.
+///  - It does not touch non-CrossJoin nodes. Filters on other inputs
+///    (Scan, Traverse, Apply, etc.) already merge correctly via
+///    `wrap_with_filter` when needed.
+///
+/// **Idempotence**: running the pass twice produces the same result.
+/// The IN-list filters merged on the first pass are not equi-join
+/// predicates against the (now-already-filtered) subtree's UNWIND, so
+/// the second pass extracts nothing new.
+fn merge_unwind_in_filters(
+    plan: &LogicalPlan,
+    params: &HashMap<String, uni_common::Value>,
+) -> LogicalPlan {
+    match plan {
+        // Target shape: Filter wrapping a CrossJoin — try IN-list pushdown.
+        LogicalPlan::Filter {
+            input,
+            predicate,
+            optional_variables,
+        } if matches!(input.as_ref(), LogicalPlan::CrossJoin { .. }) => {
+            // Safe: matches! above guarantees this destructure succeeds.
+            let LogicalPlan::CrossJoin { left, right } = input.as_ref() else {
+                unreachable!("matches! above guarantees CrossJoin")
+            };
+
+            // Recurse into the subtrees first to catch nested CrossJoins.
+            let left_rewritten = merge_unwind_in_filters(left, params);
+            let right_rewritten = merge_unwind_in_filters(right, params);
+
+            let left_vars = collect_plan_variables(&left_rewritten);
+            let right_vars = collect_plan_variables(&right_rewritten);
+            let cls = classify_join_predicate(predicate, &left_vars, &right_vars);
+
+            let rebuild_unmodified = |l: LogicalPlan, r: LogicalPlan| LogicalPlan::Filter {
+                input: Box::new(LogicalPlan::CrossJoin {
+                    left: Box::new(l),
+                    right: Box::new(r),
+                }),
+                predicate: predicate.clone(),
+                optional_variables: optional_variables.clone(),
+            };
+
+            if cls.equi_pairs.is_empty() {
+                return rebuild_unmodified(left_rewritten, right_rewritten);
+            }
+
+            // Build IN-list filters for each equi-pair × subtree orientation.
+            // See `build_in_pushdown` for the gating; `materialize_unwind_source_*`
+            // returns None for shapes we can't statically resolve.
+            let mut left_extra_in: Vec<Expr> = Vec::new();
+            let mut right_extra_in: Vec<Expr> = Vec::new();
+            for (l_expr, r_expr) in &cls.equi_pairs {
+                if let Some(in_filter) =
+                    build_in_pushdown(l_expr, r_expr, &left_rewritten, params)
+                {
+                    right_extra_in.push(in_filter);
+                    continue;
+                }
+                if let Some(in_filter) =
+                    build_in_pushdown(r_expr, l_expr, &left_rewritten, params)
+                {
+                    right_extra_in.push(in_filter);
+                    continue;
+                }
+                if let Some(in_filter) =
+                    build_in_pushdown(l_expr, r_expr, &right_rewritten, params)
+                {
+                    left_extra_in.push(in_filter);
+                    continue;
+                }
+                if let Some(in_filter) =
+                    build_in_pushdown(r_expr, l_expr, &right_rewritten, params)
+                {
+                    left_extra_in.push(in_filter);
+                }
+            }
+
+            tracing::debug!(
+                target: "uni_query::cross_join_in_pushdown",
+                left_in_filters = left_extra_in.len(),
+                right_in_filters = right_extra_in.len(),
+                "merge_unwind_in_filters: IN-pushdown result"
+            );
+
+            if left_extra_in.is_empty() && right_extra_in.is_empty() {
+                return rebuild_unmodified(left_rewritten, right_rewritten);
+            }
+
+            let left_merged = wrap_with_filter(left_rewritten, &left_extra_in);
+            let right_merged = wrap_with_filter(right_rewritten, &right_extra_in);
+            rebuild_unmodified(left_merged, right_merged)
+        }
+        // Pass through Filter wrapping non-CrossJoin.
+        LogicalPlan::Filter {
+            input,
+            predicate,
+            optional_variables,
+        } => LogicalPlan::Filter {
+            input: Box::new(merge_unwind_in_filters(input, params)),
+            predicate: predicate.clone(),
+            optional_variables: optional_variables.clone(),
+        },
+        // Single-input wrappers: recurse on `input`.
+        LogicalPlan::Project { input, projections } => LogicalPlan::Project {
+            input: Box::new(merge_unwind_in_filters(input, params)),
+            projections: projections.clone(),
+        },
+        LogicalPlan::Sort { input, order_by } => LogicalPlan::Sort {
+            input: Box::new(merge_unwind_in_filters(input, params)),
+            order_by: order_by.clone(),
+        },
+        LogicalPlan::Limit { input, skip, fetch } => LogicalPlan::Limit {
+            input: Box::new(merge_unwind_in_filters(input, params)),
+            skip: *skip,
+            fetch: *fetch,
+        },
+        LogicalPlan::Distinct { input } => LogicalPlan::Distinct {
+            input: Box::new(merge_unwind_in_filters(input, params)),
+        },
+        LogicalPlan::Unwind {
+            input,
+            expr,
+            variable,
+        } => LogicalPlan::Unwind {
+            input: Box::new(merge_unwind_in_filters(input, params)),
+            expr: expr.clone(),
+            variable: variable.clone(),
+        },
+        // Mutation nodes wrap a MATCH-side input — recurse so that
+        // `UNWIND $list AS u MATCH (n:Label) WHERE n.k = u.k SET ...` /
+        // REMOVE / DELETE / CREATE-with-MATCH / MERGE all benefit from
+        // the rewrite. The mutation operation itself isn't touched.
+        LogicalPlan::Set { input, items } => LogicalPlan::Set {
+            input: Box::new(merge_unwind_in_filters(input, params)),
+            items: items.clone(),
+        },
+        LogicalPlan::Remove { input, items } => LogicalPlan::Remove {
+            input: Box::new(merge_unwind_in_filters(input, params)),
+            items: items.clone(),
+        },
+        LogicalPlan::Delete {
+            input,
+            items,
+            detach,
+        } => LogicalPlan::Delete {
+            input: Box::new(merge_unwind_in_filters(input, params)),
+            items: items.clone(),
+            detach: *detach,
+        },
+        LogicalPlan::Create { input, pattern } => LogicalPlan::Create {
+            input: Box::new(merge_unwind_in_filters(input, params)),
+            pattern: pattern.clone(),
+        },
+        LogicalPlan::CreateBatch { input, patterns } => LogicalPlan::CreateBatch {
+            input: Box::new(merge_unwind_in_filters(input, params)),
+            patterns: patterns.clone(),
+        },
+        LogicalPlan::Merge {
+            input,
+            pattern,
+            on_match,
+            on_create,
+        } => LogicalPlan::Merge {
+            input: Box::new(merge_unwind_in_filters(input, params)),
+            pattern: pattern.clone(),
+            on_match: on_match.clone(),
+            on_create: on_create.clone(),
+        },
+        LogicalPlan::Foreach {
+            input,
+            variable,
+            list,
+            body,
+        } => LogicalPlan::Foreach {
+            input: Box::new(merge_unwind_in_filters(input, params)),
+            variable: variable.clone(),
+            list: list.clone(),
+            body: body
+                .iter()
+                .map(|b| merge_unwind_in_filters(b, params))
+                .collect(),
+        },
+        // Aggregation and windowing nodes wrap an input — recurse.
+        LogicalPlan::Aggregate {
+            input,
+            group_by,
+            aggregates,
+        } => LogicalPlan::Aggregate {
+            input: Box::new(merge_unwind_in_filters(input, params)),
+            group_by: group_by.clone(),
+            aggregates: aggregates.clone(),
+        },
+        LogicalPlan::Window {
+            input,
+            window_exprs,
+        } => LogicalPlan::Window {
+            input: Box::new(merge_unwind_in_filters(input, params)),
+            window_exprs: window_exprs.clone(),
+        },
+        LogicalPlan::SubqueryCall { input, subquery } => LogicalPlan::SubqueryCall {
+            input: Box::new(merge_unwind_in_filters(input, params)),
+            subquery: Box::new(merge_unwind_in_filters(subquery, params)),
+        },
+        // Two-input nodes: recurse on both.
+        LogicalPlan::CrossJoin { left, right } => LogicalPlan::CrossJoin {
+            left: Box::new(merge_unwind_in_filters(left, params)),
+            right: Box::new(merge_unwind_in_filters(right, params)),
+        },
+        LogicalPlan::Union { left, right, all } => LogicalPlan::Union {
+            left: Box::new(merge_unwind_in_filters(left, params)),
+            right: Box::new(merge_unwind_in_filters(right, params)),
+            all: *all,
+        },
+        // Apply has input + correlated subquery; recurse on both.
+        LogicalPlan::Apply {
+            input,
+            subquery,
+            input_filter,
+        } => LogicalPlan::Apply {
+            input: Box::new(merge_unwind_in_filters(input, params)),
+            subquery: Box::new(merge_unwind_in_filters(subquery, params)),
+            input_filter: input_filter.clone(),
+        },
+        // Leaf / unsupported / nodes whose internals don't currently
+        // benefit from this rewrite: pass through unchanged. Adding
+        // recursion for other variants (Aggregate, Window, Traverse,
+        // mutation nodes, etc.) is safe but unnecessary — the
+        // CrossJoin shape only appears under inputs we already recurse
+        // into above.
+        _ => plan.clone(),
     }
 }
 
@@ -7117,5 +7314,265 @@ mod tests {
         let values = materialize_unwind_source_field(&unwind_expr, &params, "nid")
             .expect("parameter form should produce IN-list");
         assert_eq!(values.len(), 2);
+    }
+
+    // -----------------------------------------------------------------
+    // `merge_unwind_in_filters` rewrite pass — lifts IN-list filters
+    // from `Filter(CrossJoin(Unwind, Scan))` predicates into `Scan.filter`
+    // BEFORE physical-plan optimizations can bail and discard the merge.
+    // Closes the systemic class where HashJoin emission failure (e.g.,
+    // Utf8 ↔ LargeBinary key unification) caused scan-side pushdowns to
+    // silently vanish.
+    // -----------------------------------------------------------------
+
+    /// Build `Filter(CrossJoin(Unwind, Scan), n.name = u)` — the
+    /// canonical shape the pass targets.
+    fn make_filter_crossjoin_scan(
+        unwind_source: Expr,
+        unwind_var: &str,
+        scan_label_id: u16,
+        scan_label: &str,
+        scan_var: &str,
+        predicate: Expr,
+    ) -> LogicalPlan {
+        let unwind = LogicalPlan::Unwind {
+            input: Box::new(LogicalPlan::Project {
+                input: Box::new(LogicalPlan::Scan {
+                    label_id: scan_label_id,
+                    labels: vec![scan_label.to_string()],
+                    variable: "__dummy__".to_string(),
+                    filter: None,
+                    optional: false,
+                }),
+                projections: vec![],
+            }),
+            expr: unwind_source,
+            variable: unwind_var.to_string(),
+        };
+        let scan = LogicalPlan::Scan {
+            label_id: scan_label_id,
+            labels: vec![scan_label.to_string()],
+            variable: scan_var.to_string(),
+            filter: None,
+            optional: false,
+        };
+        LogicalPlan::Filter {
+            input: Box::new(LogicalPlan::CrossJoin {
+                left: Box::new(unwind),
+                right: Box::new(scan),
+            }),
+            predicate,
+            optional_variables: HashSet::new(),
+        }
+    }
+
+    /// `n.scan_var.field = u.unwind_var` predicate, for use as the
+    /// join predicate in the rewrite-pass tests.
+    fn eq_property_predicate(scan_var: &str, prop: &str, unwind_var: &str) -> Expr {
+        Expr::BinaryOp {
+            left: Box::new(Expr::Property(
+                Box::new(Expr::Variable(scan_var.to_string())),
+                prop.to_string(),
+            )),
+            op: uni_cypher::ast::BinaryOp::Eq,
+            right: Box::new(Expr::Variable(unwind_var.to_string())),
+        }
+    }
+
+    fn assert_scan_filter_is_in_list(plan: &LogicalPlan, expected_label: &str) {
+        // Find the right subtree of the top-level CrossJoin and assert
+        // its Scan node has a filter containing an IN-list.
+        let LogicalPlan::Filter { input, .. } = plan else {
+            panic!("expected top-level Filter, got {plan:?}");
+        };
+        let LogicalPlan::CrossJoin { right, .. } = input.as_ref() else {
+            panic!("expected CrossJoin under Filter, got {input:?}");
+        };
+        let LogicalPlan::Scan { labels, filter, .. } = right.as_ref() else {
+            panic!("expected Scan as right subtree, got {right:?}");
+        };
+        assert_eq!(labels, &vec![expected_label.to_string()]);
+        let filter_expr = filter.as_ref().expect("Scan.filter must be Some after pass");
+        assert!(
+            matches!(filter_expr, Expr::In { .. }),
+            "Scan.filter should be Expr::In, got {filter_expr:?}"
+        );
+    }
+
+    #[test]
+    fn merge_pass_pushes_in_list_into_scan_filter() {
+        // UNWIND ['a', 'b'] AS u MATCH (n:Item) WHERE n.name = u
+        let unwind_source = Expr::List(vec![str_lit("a"), str_lit("b")]);
+        let plan = make_filter_crossjoin_scan(
+            unwind_source,
+            "u",
+            1,
+            "Item",
+            "n",
+            eq_property_predicate("n", "name", "u"),
+        );
+        let params = HashMap::new();
+        let rewritten = merge_unwind_in_filters(&plan, &params);
+        assert_scan_filter_is_in_list(&rewritten, "Item");
+    }
+
+    #[test]
+    fn merge_pass_idempotent() {
+        // Running the pass twice should produce a structurally equivalent
+        // plan to the single-pass result. We assert the scan filter is
+        // an IN-list both times (not nested ANDs from re-extraction).
+        let unwind_source = Expr::List(vec![str_lit("a"), str_lit("b")]);
+        let plan = make_filter_crossjoin_scan(
+            unwind_source,
+            "u",
+            1,
+            "Item",
+            "n",
+            eq_property_predicate("n", "name", "u"),
+        );
+        let params = HashMap::new();
+        let pass1 = merge_unwind_in_filters(&plan, &params);
+        let pass2 = merge_unwind_in_filters(&pass1, &params);
+
+        // The second pass should leave the merged filter as-is (its
+        // walker doesn't recurse into Scan.filter, so the IN-list is
+        // not re-extracted and re-ANDed). Verify the scan.filter
+        // structure remains `Expr::In`, not `Expr::BinaryOp(And, ...)`.
+        let LogicalPlan::Filter { input, .. } = &pass2 else {
+            panic!("expected Filter");
+        };
+        let LogicalPlan::CrossJoin { right, .. } = input.as_ref() else {
+            panic!("expected CrossJoin");
+        };
+        let LogicalPlan::Scan { filter, .. } = right.as_ref() else {
+            panic!("expected Scan");
+        };
+        let filter_expr = filter.as_ref().expect("Scan.filter must be Some");
+        assert!(
+            matches!(filter_expr, Expr::In { .. }),
+            "After 2 passes the filter should still be a single Expr::In, \
+             not ANDed with a duplicate; got {filter_expr:?}"
+        );
+    }
+
+    #[test]
+    fn merge_pass_leaves_non_pushable_predicates_alone() {
+        // Filter with a non-equi predicate (e.g., n.name STARTS WITH "x")
+        // shouldn't trigger any pushdown — classify_join_predicate
+        // produces no equi-pairs, so the pass leaves the plan unchanged.
+        let unwind_source = Expr::List(vec![str_lit("a")]);
+        let starts_with = Expr::BinaryOp {
+            left: Box::new(Expr::Property(
+                Box::new(Expr::Variable("n".to_string())),
+                "name".to_string(),
+            )),
+            op: uni_cypher::ast::BinaryOp::StartsWith,
+            right: Box::new(str_lit("x")),
+        };
+        let plan = make_filter_crossjoin_scan(unwind_source, "u", 1, "Item", "n", starts_with);
+        let params = HashMap::new();
+        let rewritten = merge_unwind_in_filters(&plan, &params);
+
+        // The Scan's filter should remain None (no equi-pair → no
+        // IN-list lifted).
+        let LogicalPlan::Filter { input, .. } = &rewritten else {
+            panic!("expected Filter");
+        };
+        let LogicalPlan::CrossJoin { right, .. } = input.as_ref() else {
+            panic!("expected CrossJoin");
+        };
+        let LogicalPlan::Scan { filter, .. } = right.as_ref() else {
+            panic!("expected Scan");
+        };
+        assert!(
+            filter.is_none(),
+            "no equi-pair → no pushdown; Scan.filter should remain None, got {filter:?}"
+        );
+    }
+
+    #[test]
+    fn merge_pass_handles_nested_crossjoin() {
+        // `Filter(CrossJoin(Unwind, CrossJoin(Scan_A, Scan_B)), n.name = u)` —
+        // The pass should recurse and lift the IN-list into Scan_A
+        // (which is the side that owns the joined variable "n").
+        //
+        // To make the test self-contained, build:
+        //   Outer: Filter(predicate=`n.name=u`, CrossJoin(L=Unwind(u), R=CrossJoin(Scan(Item,n), Scan(Other,m))))
+        // The pass walks the outer Filter, recurses into the inner CrossJoin
+        // first, finds no Filter wrapping it (so leaves it), then handles
+        // the outer Filter+CrossJoin and lifts the IN-list into the
+        // appropriate Scan via wrap_with_filter, which recurses into the
+        // inner CrossJoin to find the matching Scan.
+        let unwind_source = Expr::List(vec![str_lit("a")]);
+        let unwind = LogicalPlan::Unwind {
+            input: Box::new(LogicalPlan::Project {
+                input: Box::new(LogicalPlan::Scan {
+                    label_id: 0,
+                    labels: vec!["__".to_string()],
+                    variable: "__".to_string(),
+                    filter: None,
+                    optional: false,
+                }),
+                projections: vec![],
+            }),
+            expr: unwind_source,
+            variable: "u".to_string(),
+        };
+        let inner_cross = LogicalPlan::CrossJoin {
+            left: Box::new(LogicalPlan::Scan {
+                label_id: 1,
+                labels: vec!["Item".to_string()],
+                variable: "n".to_string(),
+                filter: None,
+                optional: false,
+            }),
+            right: Box::new(LogicalPlan::Scan {
+                label_id: 2,
+                labels: vec!["Other".to_string()],
+                variable: "m".to_string(),
+                filter: None,
+                optional: false,
+            }),
+        };
+        let plan = LogicalPlan::Filter {
+            input: Box::new(LogicalPlan::CrossJoin {
+                left: Box::new(unwind),
+                right: Box::new(inner_cross),
+            }),
+            predicate: eq_property_predicate("n", "name", "u"),
+            optional_variables: HashSet::new(),
+        };
+        let params = HashMap::new();
+        let rewritten = merge_unwind_in_filters(&plan, &params);
+
+        // Navigate to the Item scan (via outer Filter → CrossJoin.right
+        // → CrossJoin (or Filter wrapping it) → leftmost Scan). The
+        // wrap_with_filter helper merges into the right subtree of the
+        // top-level CrossJoin; that subtree was the inner CrossJoin,
+        // which isn't a Scan — so wrap_with_filter fell through to its
+        // "wrap in Filter" branch.
+        let LogicalPlan::Filter { input, .. } = &rewritten else {
+            panic!("expected outer Filter");
+        };
+        let LogicalPlan::CrossJoin { right, .. } = input.as_ref() else {
+            panic!("expected outer CrossJoin");
+        };
+        // wrap_with_filter wrapped the inner CrossJoin in a Filter
+        // because it's not a Scan-shape. The IN-list ended up on top
+        // of the inner CrossJoin, not inside Scan.filter.
+        match right.as_ref() {
+            LogicalPlan::Filter { predicate, .. } => {
+                assert!(
+                    matches!(predicate, Expr::In { .. }),
+                    "expected Expr::In wrapping inner CrossJoin, got {predicate:?}"
+                );
+            }
+            other => panic!(
+                "expected Filter wrapping inner CrossJoin, got {other:?}. \
+                 This is acceptable behaviour — the IN-list is preserved \
+                 above the inner join — but the test should be updated if \
+                 wrap_with_filter changes to descend through CrossJoins."
+            ),
+        }
     }
 }

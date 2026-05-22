@@ -61,13 +61,14 @@ async fn a1_partial_edge_set_preserves_other_columns() -> Result<()> {
 
     let r = db
         .session()
-        .query(
-            "MATCH ()-[r:LINKS]->() RETURN r.flag AS f, r.weight AS w, r.payload AS p",
-        )
+        .query("MATCH ()-[r:LINKS]->() RETURN r.flag AS f, r.weight AS w, r.payload AS p")
         .await?;
     let row = &r.rows()[0];
     let flag = row.value("f").unwrap();
-    assert!(matches!(flag, Value::Bool(true)), "flag SET did not apply: {flag:?}");
+    assert!(
+        matches!(flag, Value::Bool(true)),
+        "flag SET did not apply: {flag:?}"
+    );
     assert_eq!(row.get::<i64>("w").unwrap(), 7, "weight not preserved");
     assert_eq!(
         row.get::<String>("p").unwrap(),
@@ -151,7 +152,11 @@ async fn a3_partial_edge_set_two_keys_one_tx() -> Result<()> {
     let row = &r.rows()[0];
     assert_eq!(row.get::<i64>("a").unwrap(), 11);
     assert_eq!(row.get::<i64>("b").unwrap(), 22);
-    assert_eq!(row.get::<i64>("c").unwrap(), 0, "c was unexpectedly modified");
+    assert_eq!(
+        row.get::<i64>("c").unwrap(),
+        0,
+        "c was unexpectedly modified"
+    );
     Ok(())
 }
 
@@ -177,7 +182,8 @@ async fn a4_partial_edge_set_then_delete() -> Result<()> {
     db.flush().await?;
 
     let tx = db.session().tx().await?;
-    tx.execute("MATCH ()-[r:LINKS]->() SET r.flag = true").await?;
+    tx.execute("MATCH ()-[r:LINKS]->() SET r.flag = true")
+        .await?;
     tx.commit().await?;
     db.flush().await?;
 
@@ -222,23 +228,23 @@ async fn a5_partial_edge_set_with_overflow_property() -> Result<()> {
 
     // Touch a schema prop (`flag`) AND a non-schema (`extra`) prop.
     let tx = db.session().tx().await?;
-    tx.execute(
-        "MATCH ()-[r:LINKS]->() SET r.flag = true, r.extra = 'updated'",
-    )
-    .await?;
+    tx.execute("MATCH ()-[r:LINKS]->() SET r.flag = true, r.extra = 'updated'")
+        .await?;
     tx.commit().await?;
     db.flush().await?;
 
     let r = db
         .session()
-        .query(
-            "MATCH ()-[r:LINKS]->() RETURN r.flag AS f, r.weight AS w, r.extra AS e",
-        )
+        .query("MATCH ()-[r:LINKS]->() RETURN r.flag AS f, r.weight AS w, r.extra AS e")
         .await?;
     let row = &r.rows()[0];
     let flag = row.value("f").unwrap();
     assert!(matches!(flag, Value::Bool(true)));
-    assert_eq!(row.get::<i64>("w").unwrap(), 5, "weight should be untouched");
+    assert_eq!(
+        row.get::<i64>("w").unwrap(),
+        5,
+        "weight should be untouched"
+    );
     assert_eq!(
         row.get::<String>("e").unwrap(),
         "updated",

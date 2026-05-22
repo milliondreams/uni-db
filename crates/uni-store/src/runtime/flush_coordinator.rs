@@ -184,9 +184,9 @@ impl FlushCoordinator {
 
     /// Drop the submit channel and await the finalizer task to exit.
     /// After this returns, the coordinator's spawned task is gone and
-    /// any Arcs it held (including the writer's Arc<StorageManager>
-    /// inside SharedFlushCtx, which on a fork-scoped writer pins
-    /// Arc<ForkScope>) are released. Used by `drop_fork` so the
+    /// any Arcs it held (including the writer's `Arc<StorageManager>`
+    /// inside `SharedFlushCtx`, which on a fork-scoped writer pins
+    /// `Arc<ForkScope>`) are released. Used by `drop_fork` so the
     /// ForkHolderGuard can finally drop. Idempotent: safe to call
     /// repeatedly.
     pub async fn shutdown(&self) {

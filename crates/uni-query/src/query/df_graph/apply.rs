@@ -18,10 +18,10 @@
 //! If input produces zero rows (after filtering), execute the subquery once
 //! with the base parameters (standalone CALL support).
 
-use crate::query::df_graph::{GraphExecutionContext, MutationContext};
 use crate::query::df_graph::common::{
     arrow_err, collect_all_partitions, compute_plan_properties, execute_subplan, extract_row_params,
 };
+use crate::query::df_graph::{GraphExecutionContext, MutationContext};
 use crate::query::planner::LogicalPlan;
 use arrow_array::builder::{
     BooleanBuilder, Float64Builder, Int32Builder, Int64Builder, StringBuilder, UInt64Builder,
@@ -547,7 +547,10 @@ fn plan_contains_writes(plan: &LogicalPlan) -> bool {
         | LP::Distinct { input }
         | LP::Unwind { input, .. }
         | LP::Aggregate { input, .. } => plan_contains_writes(input),
-        LP::Apply { input, subquery, .. } | LP::SubqueryCall { input, subquery } => {
+        LP::Apply {
+            input, subquery, ..
+        }
+        | LP::SubqueryCall { input, subquery } => {
             plan_contains_writes(input) || plan_contains_writes(subquery)
         }
         _ => false,
@@ -985,13 +988,13 @@ fn value_to_single_row_array(val: &Value, data_type: &DataType) -> DFResult<Arra
                     .and_then(|m| m.get(child_field.name()))
                     .cloned()
                     .unwrap_or(Value::Null);
-                child_arrays.push(value_to_single_row_array(&child_val, child_field.data_type())?);
+                child_arrays.push(value_to_single_row_array(
+                    &child_val,
+                    child_field.data_type(),
+                )?);
             }
-            let pairs: Vec<(Arc<arrow_schema::Field>, ArrayRef)> = fields
-                .iter()
-                .cloned()
-                .zip(child_arrays)
-                .collect();
+            let pairs: Vec<(Arc<arrow_schema::Field>, ArrayRef)> =
+                fields.iter().cloned().zip(child_arrays).collect();
             Arc::new(arrow_array::StructArray::from(pairs)) as ArrayRef
         }
         _ => {

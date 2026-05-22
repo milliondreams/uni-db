@@ -95,8 +95,7 @@ fn make_seed_batch() -> (RecordBatch, Vec<f32>) {
 
     let values = Arc::new(Float32Array::from(all_floats.clone()));
     let field = Arc::new(Field::new("item", DataType::Float32, true));
-    let embedding =
-        FixedSizeListArray::try_new(field, DIM as i32, values, None).unwrap();
+    let embedding = FixedSizeListArray::try_new(field, DIM as i32, values, None).unwrap();
     let batch = RecordBatch::try_new(
         schema(),
         vec![
@@ -157,14 +156,16 @@ async fn lance_merge_insert_partial_columns_preserves_hnsw_sq() {
     // 3. Baseline KNN: querying with row 7's embedding must return row 7.
     let q: Vec<f32> = original_floats[7 * DIM..8 * DIM].to_vec();
     let knn_pre = run_knn(&dataset, &q).await;
-    assert_eq!(knn_pre, 7, "pre-merge KNN must return seed row 7; got {knn_pre}");
+    assert_eq!(
+        knn_pre, 7,
+        "pre-merge KNN must return seed row 7; got {knn_pre}"
+    );
 
     // 4. MergeInsert with partial-column source (NO `embedding` column).
     let merge_count = 50;
     let source = make_merge_source(merge_count);
     let source_schema = source.schema();
-    let source_iter =
-        RecordBatchIterator::new(std::iter::once(Ok(source.clone())), source_schema);
+    let source_iter = RecordBatchIterator::new(std::iter::once(Ok(source.clone())), source_schema);
     let merge_job =
         MergeInsertBuilder::try_new(Arc::new(dataset.clone()), vec!["_vid".to_string()])
             .unwrap()
@@ -183,11 +184,7 @@ async fn lance_merge_insert_partial_columns_preserves_hnsw_sq() {
     );
 
     // 5. Row-by-row verification: embedding preserved, frequency/confidence updated.
-    let scanner = updated_dataset
-        .scan()
-        .try_into_stream()
-        .await
-        .unwrap();
+    let scanner = updated_dataset.scan().try_into_stream().await.unwrap();
     let batches: Vec<RecordBatch> = scanner.try_collect().await.unwrap();
     let mut rows: std::collections::HashMap<u64, (i64, f64, Vec<f32>)> =
         std::collections::HashMap::new();
@@ -222,7 +219,9 @@ async fn lance_merge_insert_partial_columns_preserves_hnsw_sq() {
     }
 
     for vid in 0..N_ROWS as u64 {
-        let (freq, conf, emb) = rows.get(&vid).unwrap_or_else(|| panic!("row {vid} missing"));
+        let (freq, conf, emb) = rows
+            .get(&vid)
+            .unwrap_or_else(|| panic!("row {vid} missing"));
         let expected_emb = &original_floats[vid as usize * DIM..(vid as usize + 1) * DIM];
         assert_eq!(
             emb.as_slice(),

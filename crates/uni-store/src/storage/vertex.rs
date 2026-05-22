@@ -335,13 +335,14 @@ impl VertexDataset {
         ];
 
         let label_props = schema.properties.get(&self.label);
-        let mut sorted_touched_props: Vec<(&String, &uni_common::core::schema::PropertyMeta)> = if let Some(lp) = label_props {
-            lp.iter()
-                .filter(|(name, _)| touched_keys.contains(*name))
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let mut sorted_touched_props: Vec<(&String, &uni_common::core::schema::PropertyMeta)> =
+            if let Some(lp) = label_props {
+                lp.iter()
+                    .filter(|(name, _)| touched_keys.contains(*name))
+                    .collect()
+            } else {
+                Vec::new()
+            };
         sorted_touched_props.sort_by_key(|(name, _)| *name);
 
         for (name, meta) in &sorted_touched_props {

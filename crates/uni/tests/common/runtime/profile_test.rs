@@ -203,7 +203,10 @@ async fn test_profile_metrics_populated_for_mutation_scan_unwind() -> anyhow::Re
         .map(|(i, &vid)| {
             let mut m = std::collections::HashMap::new();
             m.insert("nid".to_string(), uni_db::Value::Int(vid));
-            m.insert("new_frequency".to_string(), uni_db::Value::Int((i as i64) + 2));
+            m.insert(
+                "new_frequency".to_string(),
+                uni_db::Value::Int((i as i64) + 2),
+            );
             uni_db::Value::Map(m)
         })
         .collect();
@@ -751,10 +754,7 @@ async fn diag_72_set_data_scale_with_hnsw_impl(
                 .collect();
             let mut m = std::collections::HashMap::new();
             m.insert("entity_id".into(), uni_db::Value::String(format!("e:{i}")));
-            m.insert(
-                "name".into(),
-                uni_db::Value::String(format!("entity_{i}")),
-            );
+            m.insert("name".into(), uni_db::Value::String(format!("entity_{i}")));
             m.insert("frequency".into(), uni_db::Value::Int(1));
             m.insert("confidence".into(), uni_db::Value::Float(0.5));
             m.insert("p1".into(), uni_db::Value::Int(0));
@@ -795,7 +795,10 @@ async fn diag_72_set_data_scale_with_hnsw_impl(
             .map(|&v| {
                 let mut m = std::collections::HashMap::new();
                 m.insert("nid".to_string(), uni_db::Value::Int(v));
-                m.insert("new_frequency".to_string(), uni_db::Value::Int(iter as i64 + 100));
+                m.insert(
+                    "new_frequency".to_string(),
+                    uni_db::Value::Int(iter as i64 + 100),
+                );
                 uni_db::Value::Map(m)
             })
             .collect();
@@ -893,7 +896,11 @@ async fn diag_72_set_data_scale_with_hnsw_impl(
             )
             .fetch_all()
             .await?;
-        assert_eq!(verify.len(), BATCH, "read-back row count mismatch iter={iter}");
+        assert_eq!(
+            verify.len(),
+            BATCH,
+            "read-back row count mismatch iter={iter}"
+        );
         let by_vid: std::collections::HashMap<i64, &uni_db::Row> = verify
             .rows()
             .iter()

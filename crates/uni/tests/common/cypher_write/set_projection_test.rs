@@ -56,8 +56,16 @@ async fn f1a_set_single_property_round_trips() -> Result<()> {
         .session()
         .query("MATCH (n:Entity) RETURN n.x AS x, n.y AS y")
         .await?;
-    assert_eq!(row.rows()[0].get::<i64>("x").unwrap(), 42, "SET n.x did not apply");
-    assert_eq!(row.rows()[0].get::<i64>("y").unwrap(), 2, "untouched n.y was clobbered");
+    assert_eq!(
+        row.rows()[0].get::<i64>("x").unwrap(),
+        42,
+        "SET n.x did not apply"
+    );
+    assert_eq!(
+        row.rows()[0].get::<i64>("y").unwrap(),
+        2,
+        "untouched n.y was clobbered"
+    );
     Ok(())
 }
 
@@ -161,12 +169,10 @@ async fn f1c_set_preserves_embedding_under_partial_update() -> Result<()> {
         .unwrap();
 
     let tx = db.session().tx().await?;
-    tx.execute_with(
-        "MATCH (n:Entity) WHERE id(n) = $v SET n.frequency = 99, n.confidence = 0.95",
-    )
-    .param("v", Value::Int(vid))
-    .run()
-    .await?;
+    tx.execute_with("MATCH (n:Entity) WHERE id(n) = $v SET n.frequency = 99, n.confidence = 0.95")
+        .param("v", Value::Int(vid))
+        .run()
+        .await?;
     tx.commit().await?;
 
     let r = db
@@ -229,10 +235,8 @@ async fn f1d_set_edge_property_round_trips() -> Result<()> {
         .await?;
 
     let tx = db.session().tx().await?;
-    tx.execute(
-        "CREATE (a:Node {nid: 'a'})-[:REL {since: 2020}]->(b:Node {nid: 'b'})",
-    )
-    .await?;
+    tx.execute("CREATE (a:Node {nid: 'a'})-[:REL {since: 2020}]->(b:Node {nid: 'b'})")
+        .await?;
     tx.commit().await?;
 
     let tx = db.session().tx().await?;
@@ -244,7 +248,11 @@ async fn f1d_set_edge_property_round_trips() -> Result<()> {
         .session()
         .query("MATCH ()-[r:REL]->() RETURN r.since AS s")
         .await?;
-    assert_eq!(r.rows()[0].get::<i64>("s").unwrap(), 2025, "edge SET did not apply");
+    assert_eq!(
+        r.rows()[0].get::<i64>("s").unwrap(),
+        2025,
+        "edge SET did not apply"
+    );
     Ok(())
 }
 
@@ -279,13 +287,21 @@ async fn f1e_set_traverse_bound_target_round_trips() -> Result<()> {
         .session()
         .query("MATCH (n:Node {nid: 'b'}) RETURN n.score AS s")
         .await?;
-    assert_eq!(r.rows()[0].get::<i64>("s").unwrap(), 99, "SET on traverse-bound b did not apply");
+    assert_eq!(
+        r.rows()[0].get::<i64>("s").unwrap(),
+        99,
+        "SET on traverse-bound b did not apply"
+    );
 
     let r2 = db
         .session()
         .query("MATCH (n:Node {nid: 'a'}) RETURN n.score AS s")
         .await?;
-    assert_eq!(r2.rows()[0].get::<i64>("s").unwrap(), 1, "untouched source a was clobbered");
+    assert_eq!(
+        r2.rows()[0].get::<i64>("s").unwrap(),
+        1,
+        "untouched source a was clobbered"
+    );
     Ok(())
 }
 
@@ -306,7 +322,8 @@ async fn f3_set_mixed_property_and_label() -> Result<()> {
         .await?;
 
     let tx = db.session().tx().await?;
-    tx.execute("CREATE (:Entity {entity_id: 'e1', x: 1})").await?;
+    tx.execute("CREATE (:Entity {entity_id: 'e1', x: 1})")
+        .await?;
     tx.commit().await?;
 
     let tx = db.session().tx().await?;
@@ -328,8 +345,14 @@ async fn f3_set_mixed_property_and_label() -> Result<()> {
                     _ => None,
                 })
                 .collect();
-            assert!(names.contains(&"Entity".to_string()), "Entity label missing");
-            assert!(names.contains(&"Extra".to_string()), "Extra label not added");
+            assert!(
+                names.contains(&"Entity".to_string()),
+                "Entity label missing"
+            );
+            assert!(
+                names.contains(&"Extra".to_string()),
+                "Extra label not added"
+            );
         }
         other => panic!("unexpected labels shape: {other:?}"),
     }
@@ -351,7 +374,8 @@ async fn f4a_set_property_then_variable_replace() -> Result<()> {
         .await?;
 
     let tx = db.session().tx().await?;
-    tx.execute("CREATE (:Entity {entity_id: 'e1', x: 0, y: 0})").await?;
+    tx.execute("CREATE (:Entity {entity_id: 'e1', x: 0, y: 0})")
+        .await?;
     tx.commit().await?;
 
     let tx = db.session().tx().await?;
@@ -364,7 +388,11 @@ async fn f4a_set_property_then_variable_replace() -> Result<()> {
         .query("MATCH (n:Entity) RETURN n.x AS x, n.y AS y")
         .await?;
     // n = {...} REPLACES properties; n.x must now be null/absent.
-    assert!(r.rows()[0].value("x").is_none_or(|v| matches!(v, Value::Null)));
+    assert!(
+        r.rows()[0]
+            .value("x")
+            .is_none_or(|v| matches!(v, Value::Null))
+    );
     assert_eq!(r.rows()[0].get::<i64>("y").unwrap(), 99);
     Ok(())
 }
@@ -384,11 +412,13 @@ async fn f4b_set_property_then_variable_merge() -> Result<()> {
         .await?;
 
     let tx = db.session().tx().await?;
-    tx.execute("CREATE (:Entity {entity_id: 'e1', x: 0, y: 0})").await?;
+    tx.execute("CREATE (:Entity {entity_id: 'e1', x: 0, y: 0})")
+        .await?;
     tx.commit().await?;
 
     let tx = db.session().tx().await?;
-    tx.execute("MATCH (n:Entity) SET n.x = 7, n += {y: 99}").await?;
+    tx.execute("MATCH (n:Entity) SET n.x = 7, n += {y: 99}")
+        .await?;
     tx.commit().await?;
 
     let r = db
@@ -416,13 +446,12 @@ async fn f5a_set_then_return_bare_node() -> Result<()> {
         .await?;
 
     let tx = db.session().tx().await?;
-    tx.execute("CREATE (:Entity {entity_id: 'e1', x: 1, y: 2})").await?;
+    tx.execute("CREATE (:Entity {entity_id: 'e1', x: 1, y: 2})")
+        .await?;
     tx.commit().await?;
 
     let tx = db.session().tx().await?;
-    let res = tx
-        .query("MATCH (n:Entity) SET n.x = 99 RETURN n")
-        .await?;
+    let res = tx.query("MATCH (n:Entity) SET n.x = 99 RETURN n").await?;
     tx.commit().await?;
     assert_eq!(res.rows().len(), 1);
     // The returned `n` should be a Map/Node containing both x (updated)
@@ -457,7 +486,8 @@ async fn f5b_set_then_return_explicit_props() -> Result<()> {
         .await?;
 
     let tx = db.session().tx().await?;
-    tx.execute("CREATE (:Entity {entity_id: 'e1', x: 1, y: 2})").await?;
+    tx.execute("CREATE (:Entity {entity_id: 'e1', x: 1, y: 2})")
+        .await?;
     tx.commit().await?;
 
     let tx = db.session().tx().await?;
@@ -488,12 +518,10 @@ async fn f6a_merge_on_match_set_round_trips() -> Result<()> {
     tx.commit().await?;
 
     let tx = db.session().tx().await?;
-    tx.execute_with(
-        "MERGE (n:Entity {key: $k}) ON MATCH SET n.x = 99",
-    )
-    .param("k", Value::String("k1".to_string()))
-    .run()
-    .await?;
+    tx.execute_with("MERGE (n:Entity {key: $k}) ON MATCH SET n.x = 99")
+        .param("k", Value::String("k1".to_string()))
+        .run()
+        .await?;
     tx.commit().await?;
 
     let r = db
@@ -517,12 +545,10 @@ async fn f6b_merge_on_create_set_round_trips() -> Result<()> {
         .await?;
 
     let tx = db.session().tx().await?;
-    tx.execute_with(
-        "MERGE (n:Entity {key: $k}) ON CREATE SET n.x = 77",
-    )
-    .param("k", Value::String("new_k".to_string()))
-    .run()
-    .await?;
+    tx.execute_with("MERGE (n:Entity {key: $k}) ON CREATE SET n.x = 77")
+        .param("k", Value::String("new_k".to_string()))
+        .run()
+        .await?;
     tx.commit().await?;
 
     let r = db
@@ -550,11 +576,13 @@ async fn f9_set_multi_label_round_trips() -> Result<()> {
         .await?;
 
     let tx = db.session().tx().await?;
-    tx.execute("CREATE (:A:B {aid: 'x', a_prop: 0, b_prop: 0})").await?;
+    tx.execute("CREATE (:A:B {aid: 'x', a_prop: 0, b_prop: 0})")
+        .await?;
     tx.commit().await?;
 
     let tx = db.session().tx().await?;
-    tx.execute("MATCH (n:A:B) SET n.a_prop = 11, n.b_prop = 22").await?;
+    tx.execute("MATCH (n:A:B) SET n.a_prop = 11, n.b_prop = 22")
+        .await?;
     tx.commit().await?;
 
     let r = db
@@ -579,7 +607,8 @@ async fn f11_set_empty_match_no_panic() -> Result<()> {
         .await?;
 
     let tx = db.session().tx().await?;
-    tx.execute("CREATE (:Entity {entity_id: 'e1', x: 1})").await?;
+    tx.execute("CREATE (:Entity {entity_id: 'e1', x: 1})")
+        .await?;
     tx.commit().await?;
 
     let tx = db.session().tx().await?;
@@ -687,7 +716,8 @@ async fn f_overflow_set_undeclared_property_round_trips() -> Result<()> {
 
     // SET a NEW overflow property (not in schema, not previously set).
     let tx = db.session().tx().await?;
-    tx.execute("MATCH (n:Entity) SET n.new_overflow = 42").await?;
+    tx.execute("MATCH (n:Entity) SET n.new_overflow = 42")
+        .await?;
     tx.commit().await?;
 
     let r = db
@@ -729,7 +759,11 @@ async fn f10_set_schemaless_label_round_trips() -> Result<()> {
         .query("MATCH (p:Person) RETURN p.name AS name, p.age AS age, p.city AS city")
         .await?;
     let row = &r.rows()[0];
-    assert_eq!(row.get::<String>("name").unwrap(), "Alice", "name clobbered");
+    assert_eq!(
+        row.get::<String>("name").unwrap(),
+        "Alice",
+        "name clobbered"
+    );
     assert_eq!(row.get::<i64>("age").unwrap(), 31);
     assert_eq!(row.get::<String>("city").unwrap(), "SF");
     Ok(())
@@ -794,7 +828,8 @@ async fn f_computed_rhs_reads_unrelated_property() -> Result<()> {
         .await?;
 
     let tx = db.session().tx().await?;
-    tx.execute("CREATE (:Entity {entity_id: 'e1', x: 0, y: 41})").await?;
+    tx.execute("CREATE (:Entity {entity_id: 'e1', x: 0, y: 41})")
+        .await?;
     tx.commit().await?;
 
     let tx = db.session().tx().await?;
@@ -810,7 +845,11 @@ async fn f_computed_rhs_reads_unrelated_property() -> Result<()> {
         42,
         "RHS `n.y + 1` did not evaluate against the stored y"
     );
-    assert_eq!(r.rows()[0].get::<i64>("y").unwrap(), 41, "n.y was clobbered");
+    assert_eq!(
+        r.rows()[0].get::<i64>("y").unwrap(),
+        41,
+        "n.y was clobbered"
+    );
     Ok(())
 }
 
@@ -829,8 +868,10 @@ async fn f13_set_with_property_existence_filter() -> Result<()> {
         .await?;
 
     let tx = db.session().tx().await?;
-    tx.execute("CREATE (:Entity {entity_id: 'has', optional_prop: 1, x: 0})").await?;
-    tx.execute("CREATE (:Entity {entity_id: 'lacks', x: 0})").await?;
+    tx.execute("CREATE (:Entity {entity_id: 'has', optional_prop: 1, x: 0})")
+        .await?;
+    tx.execute("CREATE (:Entity {entity_id: 'lacks', x: 0})")
+        .await?;
     tx.commit().await?;
 
     let tx = db.session().tx().await?;
@@ -866,9 +907,7 @@ async fn f13_set_with_property_existence_filter() -> Result<()> {
 #[tokio::test]
 async fn h1a_set_then_flush_round_trips() -> Result<()> {
     let temp_dir = tempfile::tempdir()?;
-    let db = Uni::open(temp_dir.path().to_str().unwrap())
-        .build()
-        .await?;
+    let db = Uni::open(temp_dir.path().to_str().unwrap()).build().await?;
     db.schema()
         .label("Entity")
         .property("entity_id", DataType::String)
@@ -879,7 +918,8 @@ async fn h1a_set_then_flush_round_trips() -> Result<()> {
         .await?;
 
     let tx = db.session().tx().await?;
-    tx.execute("CREATE (:Entity {entity_id: 'e1', x: 1, y: 2})").await?;
+    tx.execute("CREATE (:Entity {entity_id: 'e1', x: 1, y: 2})")
+        .await?;
     tx.commit().await?;
 
     let tx = db.session().tx().await?;
@@ -892,8 +932,16 @@ async fn h1a_set_then_flush_round_trips() -> Result<()> {
         .session()
         .query("MATCH (n:Entity) RETURN n.x AS x, n.y AS y")
         .await?;
-    assert_eq!(r.rows()[0].get::<i64>("x").unwrap(), 99, "SET lost across flush");
-    assert_eq!(r.rows()[0].get::<i64>("y").unwrap(), 2, "untouched y lost across flush");
+    assert_eq!(
+        r.rows()[0].get::<i64>("x").unwrap(),
+        99,
+        "SET lost across flush"
+    );
+    assert_eq!(
+        r.rows()[0].get::<i64>("y").unwrap(),
+        2,
+        "untouched y lost across flush"
+    );
     Ok(())
 }
 
@@ -916,7 +964,8 @@ async fn h1b_set_then_flush_then_reopen_round_trips() -> Result<()> {
             .await?;
 
         let tx = db.session().tx().await?;
-        tx.execute("CREATE (:Entity {entity_id: 'e1', x: 1, y: 2})").await?;
+        tx.execute("CREATE (:Entity {entity_id: 'e1', x: 1, y: 2})")
+            .await?;
         tx.commit().await?;
 
         let tx = db.session().tx().await?;
@@ -931,8 +980,16 @@ async fn h1b_set_then_flush_then_reopen_round_trips() -> Result<()> {
         .query("MATCH (n:Entity) RETURN n.x AS x, n.y AS y")
         .await?;
     assert_eq!(r.len(), 1, "vertex lost across reopen");
-    assert_eq!(r.rows()[0].get::<i64>("x").unwrap(), 99, "SET lost across reopen");
-    assert_eq!(r.rows()[0].get::<i64>("y").unwrap(), 2, "untouched y lost across reopen");
+    assert_eq!(
+        r.rows()[0].get::<i64>("x").unwrap(),
+        99,
+        "SET lost across reopen"
+    );
+    assert_eq!(
+        r.rows()[0].get::<i64>("y").unwrap(),
+        2,
+        "untouched y lost across reopen"
+    );
     Ok(())
 }
 
@@ -976,7 +1033,11 @@ async fn h2_set_with_indexed_property_pushdown_round_trips() -> Result<()> {
         .fetch_all()
         .await?;
     assert_eq!(target.len(), 1);
-    assert_eq!(target.rows()[0].get::<i64>("x").unwrap(), 42, "indexed-pushdown SET did not apply");
+    assert_eq!(
+        target.rows()[0].get::<i64>("x").unwrap(),
+        42,
+        "indexed-pushdown SET did not apply"
+    );
 
     let untouched = db
         .session()
@@ -1016,7 +1077,11 @@ async fn h3a_set_cypher_value_property_round_trips() -> Result<()> {
         .session()
         .query("MATCH (i:Item) RETURN i.metadata AS meta, i.name AS name")
         .await?;
-    assert_eq!(r.rows()[0].get::<String>("name").unwrap(), "A", "name clobbered");
+    assert_eq!(
+        r.rows()[0].get::<String>("name").unwrap(),
+        "A",
+        "name clobbered"
+    );
     let meta = r.rows()[0].value("meta").expect("metadata missing");
     if let Value::Map(m) = meta {
         assert_eq!(m.get("valid"), Some(&Value::Bool(false)));
@@ -1045,7 +1110,8 @@ async fn h3b_set_vector_property_directly_round_trips() -> Result<()> {
     tx.commit().await?;
 
     let tx = db.session().tx().await?;
-    tx.execute("MATCH (i:Item) SET i.embedding = [0.7, 0.8, 0.9]").await?;
+    tx.execute("MATCH (i:Item) SET i.embedding = [0.7, 0.8, 0.9]")
+        .await?;
     tx.commit().await?;
 
     let r = db
@@ -1086,7 +1152,8 @@ async fn h4a_set_violates_not_null_rolls_back() -> Result<()> {
     tx.commit().await?;
 
     let tx = db.session().tx().await?;
-    tx.execute("CREATE (:Entity {entity_id: 'e1', x: 1, y: 2})").await?;
+    tx.execute("CREATE (:Entity {entity_id: 'e1', x: 1, y: 2})")
+        .await?;
     tx.commit().await?;
 
     // Attempt: set y to 99 AND x to null — should fail; y should remain 2.
@@ -1106,7 +1173,11 @@ async fn h4a_set_violates_not_null_rolls_back() -> Result<()> {
         .session()
         .query("MATCH (n:Entity) RETURN n.x AS x, n.y AS y")
         .await?;
-    assert_eq!(r.rows()[0].get::<i64>("x").unwrap(), 1, "x corrupted on rollback");
+    assert_eq!(
+        r.rows()[0].get::<i64>("x").unwrap(),
+        1,
+        "x corrupted on rollback"
+    );
     assert_eq!(
         r.rows()[0].get::<i64>("y").unwrap(),
         2,
@@ -1216,8 +1287,10 @@ async fn m1_set_plan_cache_reuse_round_trips() -> Result<()> {
         .await?;
 
     let tx = db.session().tx().await?;
-    tx.execute("CREATE (:Entity {entity_id: 'a', x: 0})").await?;
-    tx.execute("CREATE (:Entity {entity_id: 'b', x: 0})").await?;
+    tx.execute("CREATE (:Entity {entity_id: 'a', x: 0})")
+        .await?;
+    tx.execute("CREATE (:Entity {entity_id: 'b', x: 0})")
+        .await?;
     tx.commit().await?;
 
     let session = db.session();
@@ -1246,7 +1319,12 @@ async fn m1_set_plan_cache_reuse_round_trips() -> Result<()> {
     let by_id: std::collections::HashMap<String, i64> = r
         .rows()
         .iter()
-        .map(|row| (row.get::<String>("id").unwrap(), row.get::<i64>("x").unwrap()))
+        .map(|row| {
+            (
+                row.get::<String>("id").unwrap(),
+                row.get::<i64>("x").unwrap(),
+            )
+        })
         .collect();
     assert_eq!(by_id["a"], 11, "first SET (cold plan) did not apply");
     assert_eq!(by_id["b"], 22, "second SET (cache hit) did not apply");
@@ -1268,20 +1346,28 @@ async fn m2_set_and_remove_same_statement_round_trips() -> Result<()> {
         .await?;
 
     let tx = db.session().tx().await?;
-    tx.execute("CREATE (:Entity {entity_id: 'e1', x: 1, y: 2})").await?;
+    tx.execute("CREATE (:Entity {entity_id: 'e1', x: 1, y: 2})")
+        .await?;
     tx.commit().await?;
 
     let tx = db.session().tx().await?;
-    tx.execute("MATCH (n:Entity) SET n.x = 42 REMOVE n.y").await?;
+    tx.execute("MATCH (n:Entity) SET n.x = 42 REMOVE n.y")
+        .await?;
     tx.commit().await?;
 
     let r = db
         .session()
         .query("MATCH (n:Entity) RETURN n.x AS x, n.y AS y")
         .await?;
-    assert_eq!(r.rows()[0].get::<i64>("x").unwrap(), 42, "SET did not apply");
+    assert_eq!(
+        r.rows()[0].get::<i64>("x").unwrap(),
+        42,
+        "SET did not apply"
+    );
     assert!(
-        r.rows()[0].value("y").is_none_or(|v| matches!(v, Value::Null)),
+        r.rows()[0]
+            .value("y")
+            .is_none_or(|v| matches!(v, Value::Null)),
         "REMOVE did not clear y"
     );
     Ok(())
@@ -1316,7 +1402,11 @@ async fn m3_optional_match_null_target_set_no_panic() -> Result<()> {
     tx.commit().await?;
 
     let r = db.session().query("MATCH (e:E) RETURN e.x AS x").await?;
-    assert_eq!(r.rows()[0].get::<i64>("x").unwrap(), 0, "OPTIONAL SET clobbered e");
+    assert_eq!(
+        r.rows()[0].get::<i64>("x").unwrap(),
+        0,
+        "OPTIONAL SET clobbered e"
+    );
 
     let r2 = db
         .session()
@@ -1346,19 +1436,29 @@ async fn m4_with_rebinding_set_round_trips() -> Result<()> {
         .await?;
 
     let tx = db.session().tx().await?;
-    tx.execute("CREATE (:Entity {entity_id: 'e1', x: 1, y: 2})").await?;
+    tx.execute("CREATE (:Entity {entity_id: 'e1', x: 1, y: 2})")
+        .await?;
     tx.commit().await?;
 
     let tx = db.session().tx().await?;
-    tx.execute("MATCH (n:Entity) WITH n AS m SET m.x = 99").await?;
+    tx.execute("MATCH (n:Entity) WITH n AS m SET m.x = 99")
+        .await?;
     tx.commit().await?;
 
     let r = db
         .session()
         .query("MATCH (n:Entity) RETURN n.x AS x, n.y AS y")
         .await?;
-    assert_eq!(r.rows()[0].get::<i64>("x").unwrap(), 99, "rebound SET did not apply");
-    assert_eq!(r.rows()[0].get::<i64>("y").unwrap(), 2, "untouched y clobbered");
+    assert_eq!(
+        r.rows()[0].get::<i64>("x").unwrap(),
+        99,
+        "rebound SET did not apply"
+    );
+    assert_eq!(
+        r.rows()[0].get::<i64>("y").unwrap(),
+        2,
+        "untouched y clobbered"
+    );
     Ok(())
 }
 
@@ -1438,21 +1538,23 @@ async fn l1_unwind_then_set_round_trips() -> Result<()> {
         .collect();
 
     let tx = db.session().tx().await?;
-    tx.execute_with(
-        "UNWIND $vids AS v MATCH (n:E) WHERE id(n) = v SET n.p = 99",
-    )
-    .param(
-        "vids",
-        Value::List(vids.iter().map(|v| Value::Int(*v)).collect()),
-    )
-    .run()
-    .await?;
+    tx.execute_with("UNWIND $vids AS v MATCH (n:E) WHERE id(n) = v SET n.p = 99")
+        .param(
+            "vids",
+            Value::List(vids.iter().map(|v| Value::Int(*v)).collect()),
+        )
+        .run()
+        .await?;
     tx.commit().await?;
 
     let r = db.session().query("MATCH (n:E) RETURN n.p AS p").await?;
     assert_eq!(r.len(), 3);
     for row in r.rows() {
-        assert_eq!(row.get::<i64>("p").unwrap(), 99, "UNWIND-driven SET did not apply");
+        assert_eq!(
+            row.get::<i64>("p").unwrap(),
+            99,
+            "UNWIND-driven SET did not apply"
+        );
     }
     Ok(())
 }
@@ -1481,7 +1583,11 @@ async fn l2_call_subquery_set_round_trips() -> Result<()> {
     tx.commit().await?;
 
     let r = db.session().query("MATCH (n:E) RETURN n.x AS x").await?;
-    assert_eq!(r.rows()[0].get::<i64>("x").unwrap(), 77, "CALL subquery SET did not apply");
+    assert_eq!(
+        r.rows()[0].get::<i64>("x").unwrap(),
+        77,
+        "CALL subquery SET did not apply"
+    );
     Ok(())
 }
 
@@ -1561,7 +1667,10 @@ async fn l2c_call_subquery_merge_on_create_round_trips() -> Result<()> {
         .await?;
     assert_eq!(r.len(), 1);
     let fresh = r.rows()[0].value("fresh").expect("fresh missing");
-    assert!(matches!(fresh, Value::Bool(true)), "ON CREATE SET did not fire");
+    assert!(
+        matches!(fresh, Value::Bool(true)),
+        "ON CREATE SET did not fire"
+    );
     Ok(())
 }
 
@@ -1601,7 +1710,11 @@ async fn l2c2_call_subquery_merge_on_match_round_trips() -> Result<()> {
         .session()
         .query("MATCH (m:E {id: 'existing'}) RETURN m.hits AS hits")
         .await?;
-    assert_eq!(r.rows()[0].get::<i64>("hits").unwrap(), 99, "ON MATCH SET did not fire");
+    assert_eq!(
+        r.rows()[0].get::<i64>("hits").unwrap(),
+        99,
+        "ON MATCH SET did not fire"
+    );
     Ok(())
 }
 
@@ -1626,8 +1739,15 @@ async fn l2d_call_subquery_delete_round_trips() -> Result<()> {
         .await?;
     tx.commit().await?;
 
-    let r = db.session().query("MATCH (n:E) RETURN count(n) AS c").await?;
-    assert_eq!(r.rows()[0].get::<i64>("c").unwrap(), 1, "DELETE in subquery did not remove vertex");
+    let r = db
+        .session()
+        .query("MATCH (n:E) RETURN count(n) AS c")
+        .await?;
+    assert_eq!(
+        r.rows()[0].get::<i64>("c").unwrap(),
+        1,
+        "DELETE in subquery did not remove vertex"
+    );
     let r2 = db.session().query("MATCH (n:E) RETURN n.id AS id").await?;
     assert_eq!(r2.rows()[0].get::<String>("id").unwrap(), "keep");
     Ok(())
@@ -1656,7 +1776,11 @@ async fn l2e_call_subquery_nested_set_round_trips() -> Result<()> {
     tx.commit().await?;
 
     let r = db.session().query("MATCH (n:E) RETURN n.x AS x").await?;
-    assert_eq!(r.rows()[0].get::<i64>("x").unwrap(), 42, "nested CALL SET did not apply");
+    assert_eq!(
+        r.rows()[0].get::<i64>("x").unwrap(),
+        42,
+        "nested CALL SET did not apply"
+    );
     Ok(())
 }
 
@@ -1675,7 +1799,8 @@ async fn l2f_call_subquery_edge_set_round_trips() -> Result<()> {
         .await?;
 
     let tx = db.session().tx().await?;
-    tx.execute("CREATE (a:N {id: 'a'})-[:R]->(b:N {id: 'b'})").await?;
+    tx.execute("CREATE (a:N {id: 'a'})-[:R]->(b:N {id: 'b'})")
+        .await?;
     tx.commit().await?;
 
     let tx = db.session().tx().await?;
@@ -1688,7 +1813,10 @@ async fn l2f_call_subquery_edge_set_round_trips() -> Result<()> {
         .query("MATCH ()-[r:R]->() RETURN r.flag AS f")
         .await?;
     let f = r.rows()[0].value("f").expect("flag missing");
-    assert!(matches!(f, Value::Bool(true)), "edge SET in subquery did not apply");
+    assert!(
+        matches!(f, Value::Bool(true)),
+        "edge SET in subquery did not apply"
+    );
     Ok(())
 }
 
@@ -1706,7 +1834,8 @@ async fn l2g_call_subquery_correlated_set_round_trips() -> Result<()> {
         .await?;
 
     let tx = db.session().tx().await?;
-    tx.execute("CREATE (:E {id: 'e1', source: 42, copy: 0})").await?;
+    tx.execute("CREATE (:E {id: 'e1', source: 42, copy: 0})")
+        .await?;
     tx.commit().await?;
 
     let tx = db.session().tx().await?;
@@ -1781,7 +1910,8 @@ async fn l2i_call_subquery_mixed_read_write_round_trips() -> Result<()> {
         .await?;
 
     let tx = db.session().tx().await?;
-    tx.execute("CREATE (a:N {id: 'a'})-[:LINK]->(b:N {id: 'b'})").await?;
+    tx.execute("CREATE (a:N {id: 'a'})-[:LINK]->(b:N {id: 'b'})")
+        .await?;
     tx.commit().await?;
 
     let tx = db.session().tx().await?;
@@ -1798,7 +1928,10 @@ async fn l2i_call_subquery_mixed_read_write_round_trips() -> Result<()> {
         .query("MATCH (m:N {id: 'b'}) RETURN m.touched AS t")
         .await?;
     let t = r.rows()[0].value("t").expect("touched missing");
-    assert!(matches!(t, Value::Bool(true)), "mixed read+write subquery did not apply");
+    assert!(
+        matches!(t, Value::Bool(true)),
+        "mixed read+write subquery did not apply"
+    );
 
     let r2 = db
         .session()
@@ -1837,9 +1970,7 @@ async fn l2j_call_subquery_empty_input_no_phantom_writes() -> Result<()> {
     // Outer WHERE excludes all rows; subquery should not run successfully.
     // Whether this errors or no-ops, the kept vertex must remain at x=0.
     let res = tx
-        .execute_with(
-            "MATCH (n:E) WHERE id(n) = $v CALL { WITH n SET n.x = 999 } RETURN n.id",
-        )
+        .execute_with("MATCH (n:E) WHERE id(n) = $v CALL { WITH n SET n.x = 999 } RETURN n.id")
         .param("v", Value::Int(99_999_999))
         .run()
         .await;
@@ -1876,14 +2007,19 @@ async fn l2k_call_subquery_constraint_violation_rolls_back() -> Result<()> {
 
     let tx = db.session().tx().await?;
     let res = tx
-        .execute("MATCH (n:E {key: 'a'}) CALL { WITH n SET n.marker = 99, n.key = 'b' } RETURN n.key")
+        .execute(
+            "MATCH (n:E {key: 'a'}) CALL { WITH n SET n.marker = 99, n.key = 'b' } RETURN n.key",
+        )
         .await;
     let err = if res.is_err() {
         true
     } else {
         tx.commit().await.is_err()
     };
-    assert!(err, "expected UNIQUE constraint violation inside CALL subquery to error");
+    assert!(
+        err,
+        "expected UNIQUE constraint violation inside CALL subquery to error"
+    );
 
     let r = db
         .session()
@@ -1918,9 +2054,7 @@ async fn l2m_call_subquery_write_visible_to_later_read_in_tx() -> Result<()> {
     tx.execute("MATCH (n:E) CALL { WITH n SET n.x = 88 } RETURN n.id")
         .await?;
     // Same transaction: read back via tx.query.
-    let r = tx
-        .query("MATCH (n:E) RETURN n.x AS x")
-        .await?;
+    let r = tx.query("MATCH (n:E) RETURN n.x AS x").await?;
     tx.commit().await?;
 
     assert_eq!(
@@ -2250,7 +2384,11 @@ async fn l2v_unit_subquery_create_side_effect() -> Result<()> {
         .session()
         .query("MATCH (n:E) RETURN count(n) AS c")
         .await?;
-    assert_eq!(r.rows()[0].get::<i64>("c").unwrap(), 2, "CREATE side effect did not land");
+    assert_eq!(
+        r.rows()[0].get::<i64>("c").unwrap(),
+        2,
+        "CREATE side effect did not land"
+    );
     Ok(())
 }
 
@@ -2277,7 +2415,11 @@ async fn l2w_unit_subquery_empty_input() -> Result<()> {
         .await?;
     tx.commit().await?;
 
-    assert_eq!(res.rows().len(), 0, "unit subquery produced phantom rows on empty input");
+    assert_eq!(
+        res.rows().len(),
+        0,
+        "unit subquery produced phantom rows on empty input"
+    );
     Ok(())
 }
 
@@ -2331,8 +2473,10 @@ async fn l4_vector_knn_then_set_round_trips() -> Result<()> {
         .await?;
 
     let tx = db.session().tx().await?;
-    tx.execute("CREATE (:Doc {title: 'A', embedding: [1.0, 0.0, 0.0]})").await?;
-    tx.execute("CREATE (:Doc {title: 'B', embedding: [0.0, 1.0, 0.0]})").await?;
+    tx.execute("CREATE (:Doc {title: 'A', embedding: [1.0, 0.0, 0.0]})")
+        .await?;
+    tx.execute("CREATE (:Doc {title: 'B', embedding: [0.0, 1.0, 0.0]})")
+        .await?;
     tx.commit().await?;
 
     let tx = db.session().tx().await?;
@@ -2352,7 +2496,10 @@ async fn l4_vector_knn_then_set_round_trips() -> Result<()> {
         .iter()
         .map(|row| {
             let t = row.get::<String>("t").unwrap();
-            let m = row.value("m").map(|v| matches!(v, Value::Bool(true))).unwrap_or(false);
+            let m = row
+                .value("m")
+                .map(|v| matches!(v, Value::Bool(true)))
+                .unwrap_or(false);
             (t, m)
         })
         .collect();
@@ -2376,7 +2523,8 @@ async fn l6_bidirectional_pattern_set_round_trips() -> Result<()> {
         .await?;
 
     let tx = db.session().tx().await?;
-    tx.execute("CREATE (a:N {id: 'a'})-[:E {x: 0}]->(b:N {id: 'b'})").await?;
+    tx.execute("CREATE (a:N {id: 'a'})-[:E {x: 0}]->(b:N {id: 'b'})")
+        .await?;
     tx.commit().await?;
 
     let tx = db.session().tx().await?;
@@ -2388,7 +2536,11 @@ async fn l6_bidirectional_pattern_set_round_trips() -> Result<()> {
         .session()
         .query("MATCH ()-[r:E]->() RETURN r.x AS x")
         .await?;
-    assert_eq!(r.rows()[0].get::<i64>("x").unwrap(), 99, "undirected SET did not apply");
+    assert_eq!(
+        r.rows()[0].get::<i64>("x").unwrap(),
+        99,
+        "undirected SET did not apply"
+    );
     Ok(())
 }
 
@@ -2407,7 +2559,8 @@ async fn l7_create_then_set_same_statement_round_trips() -> Result<()> {
         .await?;
 
     let tx = db.session().tx().await?;
-    tx.execute("CREATE (n:E {entity_id: 'e1', a: 1}) SET n.b = 2").await?;
+    tx.execute("CREATE (n:E {entity_id: 'e1', a: 1}) SET n.b = 2")
+        .await?;
     tx.commit().await?;
 
     let r = db
@@ -2415,7 +2568,11 @@ async fn l7_create_then_set_same_statement_round_trips() -> Result<()> {
         .query("MATCH (n:E) RETURN n.a AS a, n.b AS b")
         .await?;
     assert_eq!(r.rows()[0].get::<i64>("a").unwrap(), 1, "CREATE prop lost");
-    assert_eq!(r.rows()[0].get::<i64>("b").unwrap(), 2, "CREATE-then-SET did not apply");
+    assert_eq!(
+        r.rows()[0].get::<i64>("b").unwrap(),
+        2,
+        "CREATE-then-SET did not apply"
+    );
     Ok(())
 }
 
@@ -2481,14 +2638,19 @@ async fn l9_cross_with_two_sets_round_trips() -> Result<()> {
     tx.commit().await?;
 
     let tx = db.session().tx().await?;
-    tx.execute("MATCH (n:E) SET n.x = 42 WITH n SET n.y = 99").await?;
+    tx.execute("MATCH (n:E) SET n.x = 42 WITH n SET n.y = 99")
+        .await?;
     tx.commit().await?;
 
     let r = db
         .session()
         .query("MATCH (n:E) RETURN n.x AS x, n.y AS y")
         .await?;
-    assert_eq!(r.rows()[0].get::<i64>("x").unwrap(), 42, "first SET did not apply");
+    assert_eq!(
+        r.rows()[0].get::<i64>("x").unwrap(),
+        42,
+        "first SET did not apply"
+    );
     assert_eq!(
         r.rows()[0].get::<i64>("y").unwrap(),
         99,
@@ -2532,7 +2694,12 @@ async fn l3_vlp_target_set_documents_behavior() -> Result<()> {
     let xs: std::collections::HashMap<String, i64> = r
         .rows()
         .iter()
-        .map(|row| (row.get::<String>("id").unwrap(), row.get::<i64>("x").unwrap()))
+        .map(|row| {
+            (
+                row.get::<String>("id").unwrap(),
+                row.get::<i64>("x").unwrap(),
+            )
+        })
         .collect();
 
     assert_eq!(xs["a"], 0, "a (source) should not be modified");
@@ -2574,10 +2741,21 @@ async fn l3b_vlp_target_set_inline_return() -> Result<()> {
     let xs: std::collections::HashMap<String, i64> = res
         .rows()
         .iter()
-        .map(|row| (row.get::<String>("id").unwrap(), row.get::<i64>("x").unwrap()))
+        .map(|row| {
+            (
+                row.get::<String>("id").unwrap(),
+                row.get::<i64>("x").unwrap(),
+            )
+        })
         .collect();
-    assert_eq!(xs["b"], 77, "inline RETURN b.x surfaced stale binding for 1-hop target");
-    assert_eq!(xs["c"], 77, "inline RETURN b.x surfaced stale binding for 2-hop target");
+    assert_eq!(
+        xs["b"], 77,
+        "inline RETURN b.x surfaced stale binding for 1-hop target"
+    );
+    assert_eq!(
+        xs["c"], 77,
+        "inline RETURN b.x surfaced stale binding for 2-hop target"
+    );
     Ok(())
 }
 
@@ -2598,17 +2776,13 @@ async fn l3c_vlp_target_set_multi_property() -> Result<()> {
         .await?;
 
     let tx = db.session().tx().await?;
-    tx.execute(
-        "CREATE (a:N {id: 'a'})-[:LINK]->(b:N {id: 'b'})-[:LINK]->(c:N {id: 'c'})",
-    )
-    .await?;
+    tx.execute("CREATE (a:N {id: 'a'})-[:LINK]->(b:N {id: 'b'})-[:LINK]->(c:N {id: 'c'})")
+        .await?;
     tx.commit().await?;
 
     let tx = db.session().tx().await?;
-    tx.execute(
-        "MATCH (a:N {id: 'a'})-[:LINK*1..2]->(b:N) SET b.x = 11, b.y = 'tagged'",
-    )
-    .await?;
+    tx.execute("MATCH (a:N {id: 'a'})-[:LINK*1..2]->(b:N) SET b.x = 11, b.y = 'tagged'")
+        .await?;
     tx.commit().await?;
 
     let r = db
@@ -2617,7 +2791,13 @@ async fn l3c_vlp_target_set_multi_property() -> Result<()> {
         .await?;
     let rows: Vec<_> = r.rows().iter().collect();
     // a is the source; b, c are targets.
-    assert!(rows[0].value("x").map(|v| matches!(v, Value::Null)).unwrap_or(true), "a.x should be unset");
+    assert!(
+        rows[0]
+            .value("x")
+            .map(|v| matches!(v, Value::Null))
+            .unwrap_or(true),
+        "a.x should be unset"
+    );
     for row in &rows[1..] {
         assert_eq!(row.get::<i64>("x").unwrap(), 11);
         assert_eq!(row.get::<String>("y").unwrap(), "tagged");
@@ -2649,11 +2829,12 @@ async fn l3d_vlp_target_set_no_matches() -> Result<()> {
         .await?;
     tx.commit().await?;
 
-    let r = db
-        .session()
-        .query("MATCH (n:N) RETURN n.x AS x")
-        .await?;
-    assert_eq!(r.rows()[0].get::<i64>("x").unwrap(), 0, "no-match VLP wrote phantom data");
+    let r = db.session().query("MATCH (n:N) RETURN n.x AS x").await?;
+    assert_eq!(
+        r.rows()[0].get::<i64>("x").unwrap(),
+        0,
+        "no-match VLP wrote phantom data"
+    );
     Ok(())
 }
 
@@ -2683,10 +2864,8 @@ async fn l3e_vlp_path_edges_set() -> Result<()> {
         .await?;
 
     let tx = db.session().tx().await?;
-    tx.execute(
-        "CREATE (a:N {id: 'a'})-[:LINK]->(b:N {id: 'b'})-[:LINK]->(c:N {id: 'c'})",
-    )
-    .await?;
+    tx.execute("CREATE (a:N {id: 'a'})-[:LINK]->(b:N {id: 'b'})-[:LINK]->(c:N {id: 'c'})")
+        .await?;
     tx.commit().await?;
 
     let tx = db.session().tx().await?;
@@ -2817,7 +2996,10 @@ async fn l2n2_recursive_cte_recursive_set_round_trips() -> Result<()> {
     let rows = r.rows();
     assert_eq!(rows.len(), 4);
     assert!(
-        matches!(rows[0].value("t").unwrap(), Value::Null | Value::Bool(false)),
+        matches!(
+            rows[0].value("t").unwrap(),
+            Value::Null | Value::Bool(false)
+        ),
         "root should not be touched: {:?}",
         rows[0].value("t")
     );
@@ -2875,6 +3057,10 @@ async fn l2n3_recursive_cte_read_only_unaffected() -> Result<()> {
         .iter()
         .map(|row| row.get::<i32>("id").unwrap())
         .collect();
-    assert_eq!(ids, vec![0, 1, 2], "read-only RecursiveCTE expansion broken");
+    assert_eq!(
+        ids,
+        vec![0, 1, 2],
+        "read-only RecursiveCTE expansion broken"
+    );
     Ok(())
 }

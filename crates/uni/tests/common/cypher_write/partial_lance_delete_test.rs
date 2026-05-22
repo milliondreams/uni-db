@@ -156,8 +156,10 @@ async fn b4_delete_with_index_lookup() -> Result<()> {
         .await?;
 
     let tx = db.session().tx().await?;
-    tx.execute("CREATE (:U {id: 'u1', email: 'a@example.com'})").await?;
-    tx.execute("CREATE (:U {id: 'u2', email: 'b@example.com'})").await?;
+    tx.execute("CREATE (:U {id: 'u1', email: 'a@example.com'})")
+        .await?;
+    tx.execute("CREATE (:U {id: 'u2', email: 'b@example.com'})")
+        .await?;
     tx.commit().await?;
     db.flush().await?;
 
@@ -226,9 +228,7 @@ async fn b5_delete_preserves_other_rows() -> Result<()> {
 
     let r = db
         .session()
-        .query(
-            "MATCH (n:Item) RETURN n.id AS id, n.payload AS p, n.rank AS r ORDER BY id",
-        )
+        .query("MATCH (n:Item) RETURN n.id AS id, n.payload AS p, n.rank AS r ORDER BY id")
         .await?;
     let rows = r.rows();
     assert_eq!(rows.len(), 25);

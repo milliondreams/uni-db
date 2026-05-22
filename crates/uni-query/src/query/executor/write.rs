@@ -2131,13 +2131,7 @@ impl Executor {
                     }
                 }
                 writer
-                    .insert_vertex_partial_full(
-                        pv.vid,
-                        pv.props,
-                        pv.touched,
-                        &pv.labels,
-                        tx_l0,
-                    )
+                    .insert_vertex_partial_full(pv.vid, pv.props, pv.touched, &pv.labels, tx_l0)
                     .await?;
             } else {
                 for label_name in &pv.labels {
@@ -2223,13 +2217,7 @@ impl Executor {
                     }
                 }
                 writer
-                    .insert_vertex_partial_full(
-                        pv.vid,
-                        pv.props,
-                        pv.touched,
-                        &pv.labels,
-                        tx_l0,
-                    )
+                    .insert_vertex_partial_full(pv.vid, pv.props, pv.touched, &pv.labels, tx_l0)
                     .await?;
             } else {
                 for label_name in &pv.labels {

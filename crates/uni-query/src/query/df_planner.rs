@@ -1988,8 +1988,8 @@ impl HybridPhysicalPlanner {
         // sentinel deliberately skips these so wide columns (e.g. embeddings)
         // are NOT materialized.
         let var_props = all_properties.get(variable);
-        let need_full = var_props
-            .is_some_and(|p| p.contains("*") || p.contains(STRUCT_ONLY_SENTINEL));
+        let need_full =
+            var_props.is_some_and(|p| p.contains("*") || p.contains(STRUCT_ONLY_SENTINEL));
         let need_full_record = var_props.is_some_and(|p| p.contains("*"));
         if need_full_record {
             if !properties.contains(&"_all_props".to_string()) {
@@ -2053,9 +2053,7 @@ impl HybridPhysicalPlanner {
             // projection. Keep _all_props so properties()/keys() UDFs can use it.
             let struct_props: Vec<String> = properties
                 .iter()
-                .filter(|p| {
-                    *p != "overflow_json" && *p != "*" && *p != STRUCT_ONLY_SENTINEL
-                })
+                .filter(|p| *p != "overflow_json" && *p != "*" && *p != STRUCT_ONLY_SENTINEL)
                 .cloned()
                 .collect();
             scan_plan = self.add_structural_projection(scan_plan, variable, &struct_props)?;

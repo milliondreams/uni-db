@@ -463,10 +463,7 @@ impl StorageBackend for LanceDbBackend {
         // schema describes the source subschema; Lance compares it against
         // the target via `allow_subschema=true` internally.
         let schema = batches[0].schema();
-        let reader = arrow_array::RecordBatchIterator::new(
-            batches.into_iter().map(Ok),
-            schema,
-        );
+        let reader = arrow_array::RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
 
         let mut mi = table.merge_insert(on);
         mi.when_matched_update_all(None);

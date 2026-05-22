@@ -1842,7 +1842,8 @@ impl Writer {
 
         self.check_write_pressure().await?;
         self.check_transaction_memory(tx_l0)?;
-        self.process_embeddings_for_labels(labels, &mut props).await?;
+        self.process_embeddings_for_labels(labels, &mut props)
+            .await?;
         // Full-row validation runs because we have the complete map;
         // no need for the partial-only validator.
         self.validate_vertex_constraints(vid, &props, labels, tx_l0)
@@ -1884,8 +1885,8 @@ impl Writer {
         labels: &[String],
         tx_l0: Option<&Arc<RwLock<L0Buffer>>>,
     ) -> Result<()> {
-        let needs_full_read = !self.config.partial_lance_writes
-            || self.touched_needs_full_read(&touched, labels);
+        let needs_full_read =
+            !self.config.partial_lance_writes || self.touched_needs_full_read(&touched, labels);
         if needs_full_read {
             // Flag-off fallback (or constraint-driven fallback): merge
             // `touched` with the current full property snapshot from
@@ -1918,7 +1919,8 @@ impl Writer {
         let mut touched = touched;
         self.check_write_pressure().await?;
         self.check_transaction_memory(tx_l0)?;
-        self.process_embeddings_for_labels(labels, &mut touched).await?;
+        self.process_embeddings_for_labels(labels, &mut touched)
+            .await?;
         self.validate_vertex_constraints_partial(vid, &touched, labels, tx_l0)
             .await?;
 
@@ -2241,7 +2243,15 @@ impl Writer {
     ) -> Result<()> {
         if !self.config.partial_lance_writes {
             return self
-                .insert_edge(src_vid, dst_vid, edge_type, eid, props, edge_type_name, tx_l0)
+                .insert_edge(
+                    src_vid,
+                    dst_vid,
+                    edge_type,
+                    eid,
+                    props,
+                    edge_type_name,
+                    tx_l0,
+                )
                 .await;
         }
 
@@ -3057,11 +3067,8 @@ impl Writer {
                 &main_vertex_tombstones,
                 Some(&vertex_updated_at),
             )?;
-            MainVertexDataset::merge_insert_tombstone_batch(
-                self.storage.backend(),
-                tomb_batch,
-            )
-            .await?;
+            MainVertexDataset::merge_insert_tombstone_batch(self.storage.backend(), tomb_batch)
+                .await?;
         }
         if !main_vertices.is_empty() || !main_vertex_tombstones.is_empty() {
             MainVertexDataset::ensure_default_indexes(self.storage.backend()).await?;
@@ -3100,12 +3107,7 @@ impl Writer {
                 let old_l0 = old_l0_arc.read();
                 partial_eids
                     .iter()
-                    .filter_map(|eid| {
-                        old_l0
-                            .edge_partial_keys
-                            .get(eid)
-                            .map(|s| (*eid, s.clone()))
-                    })
+                    .filter_map(|eid| old_l0.edge_partial_keys.get(eid).map(|s| (*eid, s.clone())))
                     .collect()
             };
             let (full_entries, partial_entries): (Vec<L1Entry>, Vec<L1Entry>) = entries
@@ -3138,7 +3140,9 @@ impl Writer {
                     .collect();
                 let fwd_partial_batch =
                     fwd_ds.build_partial_record_batch(&fwd_partial, &touched_union, &schema)?;
-                fwd_ds.merge_insert_partial_run(backend, fwd_partial_batch).await?;
+                fwd_ds
+                    .merge_insert_partial_run(backend, fwd_partial_batch)
+                    .await?;
             }
             fwd_ds.ensure_eid_index(backend).await?;
 
@@ -3165,7 +3169,9 @@ impl Writer {
                     .collect();
                 let bwd_partial_batch =
                     bwd_ds.build_partial_record_batch(&bwd_partial, &touched_union, &schema)?;
-                bwd_ds.merge_insert_partial_run(backend, bwd_partial_batch).await?;
+                bwd_ds
+                    .merge_insert_partial_run(backend, bwd_partial_batch)
+                    .await?;
             }
             bwd_ds.ensure_eid_index(backend).await?;
 
@@ -3289,8 +3295,7 @@ impl Writer {
                     .iter()
                     .map(|(vid, props, _, _)| (*vid, props.clone()))
                     .collect();
-                let versions: Vec<u64> =
-                    partial_rows.iter().map(|(_, _, v, _)| *v).collect();
+                let versions: Vec<u64> = partial_rows.iter().map(|(_, _, v, _)| *v).collect();
                 let partial_batch = ds.build_partial_record_batch(
                     &pairs,
                     &versions,
@@ -3308,14 +3313,10 @@ impl Writer {
             // No partial_lance_writes gating — tombstones never carry
             // useful property payload to write. Captured tombstone vids
             // also drive `remove_from_vid_labels_index` below.
-            let tombstone_rows = tombstones_by_label
-                .remove(&label_id)
-                .unwrap_or_default();
+            let tombstone_rows = tombstones_by_label.remove(&label_id).unwrap_or_default();
             if !tombstone_rows.is_empty() {
-                let tomb_batch = ds.build_tombstone_partial_batch(
-                    &tombstone_rows,
-                    Some(&vertex_updated_at),
-                )?;
+                let tomb_batch =
+                    ds.build_tombstone_partial_batch(&tombstone_rows, Some(&vertex_updated_at))?;
                 if tomb_batch.num_rows() > 0 {
                     ds.merge_insert_batch(backend, tomb_batch).await?;
                 }

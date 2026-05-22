@@ -462,12 +462,7 @@ impl L0Buffer {
     /// Legacy partial-only variant used by some uni-store paths. Kept
     /// for source-compatibility but new uni-query callers should use
     /// `insert_vertex_partial_full` to preserve scan-side L0 visibility.
-    pub fn insert_vertex_partial(
-        &mut self,
-        vid: Vid,
-        touched: Properties,
-        labels: &[String],
-    ) {
+    pub fn insert_vertex_partial(&mut self, vid: Vid, touched: Properties, labels: &[String]) {
         // Record dirty keys BEFORE the full-row impl runs (which would
         // clear them). The keys come from the touched set; the values
         // are merged into L0 by the shared CRDT path below.
@@ -483,8 +478,8 @@ impl L0Buffer {
         // current entry in vertex_partial_keys is non-empty OR the VID
         // is not in vertex_properties (fresh row, but caller asked
         // partial — let it through and the post-flush union covers it).
-        let already_full =
-            self.vertex_properties.contains_key(&vid) && !self.vertex_partial_keys.contains_key(&vid);
+        let already_full = self.vertex_properties.contains_key(&vid)
+            && !self.vertex_partial_keys.contains_key(&vid);
 
         // Stage the CRDT merge through the existing path. We bypass the
         // full-row `insert_vertex_with_labels_impl` clearing of

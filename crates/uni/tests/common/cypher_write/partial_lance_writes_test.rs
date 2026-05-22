@@ -61,14 +61,12 @@ async fn t1_partial_set_preserves_embedding_and_other_columns() -> Result<()> {
     // SET only frequency + confidence on rows e0..=e4 (5 rows).
     let tx = db.session().tx().await?;
     for i in 0..5 {
-        tx.execute_with(
-            "MATCH (n:Entity {id: $id}) SET n.frequency = $f, n.confidence = $c",
-        )
-        .param("id", Value::String(format!("e{i}")))
-        .param("f", Value::Int(100 + i as i64))
-        .param("c", Value::Float(0.9))
-        .run()
-        .await?;
+        tx.execute_with("MATCH (n:Entity {id: $id}) SET n.frequency = $f, n.confidence = $c")
+            .param("id", Value::String(format!("e{i}")))
+            .param("f", Value::Int(100 + i as i64))
+            .param("c", Value::Float(0.9))
+            .run()
+            .await?;
     }
     tx.commit().await?;
     db.flush().await?;
@@ -108,7 +106,11 @@ async fn t1_partial_set_preserves_embedding_and_other_columns() -> Result<()> {
             panic!("row {id}: embedding is not a list");
         }
         if i < 5 {
-            assert_eq!(row.get::<i64>("f").unwrap(), 100 + i as i64, "row {id} freq");
+            assert_eq!(
+                row.get::<i64>("f").unwrap(),
+                100 + i as i64,
+                "row {id} freq"
+            );
             let c = row.value("c").unwrap();
             if let Value::Float(f) = c {
                 assert!((f - 0.9).abs() < 1e-9);
@@ -136,12 +138,14 @@ async fn t2_partial_set_flag_off_equivalence() -> Result<()> {
         .apply()
         .await?;
     let tx = db.session().tx().await?;
-    tx.execute("CREATE (:Entity {id: 'k', frequency: 0, untouched: 'keep'})").await?;
+    tx.execute("CREATE (:Entity {id: 'k', frequency: 0, untouched: 'keep'})")
+        .await?;
     tx.commit().await?;
     db.flush().await?;
 
     let tx = db.session().tx().await?;
-    tx.execute("MATCH (n:Entity {id: 'k'}) SET n.frequency = 42").await?;
+    tx.execute("MATCH (n:Entity {id: 'k'}) SET n.frequency = 42")
+        .await?;
     tx.commit().await?;
     db.flush().await?;
 
@@ -220,7 +224,11 @@ async fn t4_partial_then_variable_replace() -> Result<()> {
         .session()
         .query("MATCH (n:E {id: 'k'}) RETURN n.a AS a, n.b AS b")
         .await?;
-    assert_eq!(r.rows()[0].get::<i64>("a").unwrap(), 99, "Variable replace lost");
+    assert_eq!(
+        r.rows()[0].get::<i64>("a").unwrap(),
+        99,
+        "Variable replace lost"
+    );
     assert_eq!(r.rows()[0].get::<i64>("b").unwrap(), 99);
     Ok(())
 }
@@ -242,7 +250,8 @@ async fn t6_partial_set_with_hash_index() -> Result<()> {
         .await?;
 
     let tx = db.session().tx().await?;
-    tx.execute("CREATE (:U {id: 'u1', email: 'old@example.com'})").await?;
+    tx.execute("CREATE (:U {id: 'u1', email: 'old@example.com'})")
+        .await?;
     tx.commit().await?;
     db.flush().await?;
 
@@ -291,7 +300,10 @@ async fn t8_partial_set_then_delete() -> Result<()> {
     tx.commit().await?;
     db.flush().await?;
 
-    let r = db.session().query("MATCH (n:E) RETURN count(n) AS c").await?;
+    let r = db
+        .session()
+        .query("MATCH (n:E) RETURN count(n) AS c")
+        .await?;
     assert_eq!(r.rows()[0].get::<i64>("c").unwrap(), 0);
     Ok(())
 }
@@ -312,7 +324,8 @@ async fn c1_partial_set_with_generated_column_recomputes() -> Result<()> {
     // Set up schema + expression index via DDL (creates the generated
     // column automatically).
     let tx = db.session().tx().await?;
-    tx.execute("CREATE LABEL User (id STRING, email STRING)").await?;
+    tx.execute("CREATE LABEL User (id STRING, email STRING)")
+        .await?;
     tx.execute("CREATE INDEX lower_email FOR (u:User) ON (lower(u.email))")
         .await?;
     tx.commit().await?;
@@ -320,7 +333,8 @@ async fn c1_partial_set_with_generated_column_recomputes() -> Result<()> {
     let gen_col = uni_db::core::schema::SchemaManager::generated_column_name("lower(email)");
 
     let tx = db.session().tx().await?;
-    tx.execute("CREATE (:User {id: 'u1', email: 'Alice@Example.com'})").await?;
+    tx.execute("CREATE (:User {id: 'u1', email: 'Alice@Example.com'})")
+        .await?;
     tx.commit().await?;
     db.flush().await?;
 
@@ -386,7 +400,8 @@ async fn c2_partial_set_untouched_generator_dependency() -> Result<()> {
 
     // SET an unrelated column (age).
     let tx = db.session().tx().await?;
-    tx.execute("MATCH (p:Person {id: 'p1'}) SET p.age = 31").await?;
+    tx.execute("MATCH (p:Person {id: 'p1'}) SET p.age = 31")
+        .await?;
     tx.commit().await?;
     db.flush().await?;
 
@@ -414,7 +429,8 @@ async fn c3_partial_set_with_multiple_generators() -> Result<()> {
     let db = Uni::in_memory().config(cfg).build().await?;
 
     let tx = db.session().tx().await?;
-    tx.execute("CREATE LABEL Note (id STRING, body STRING)").await?;
+    tx.execute("CREATE LABEL Note (id STRING, body STRING)")
+        .await?;
     tx.execute("CREATE INDEX lower_body FOR (n:Note) ON (lower(n.body))")
         .await?;
     tx.execute("CREATE INDEX upper_body FOR (n:Note) ON (upper(n.body))")
@@ -424,7 +440,8 @@ async fn c3_partial_set_with_multiple_generators() -> Result<()> {
     let gen_up = uni_db::core::schema::SchemaManager::generated_column_name("upper(body)");
 
     let tx = db.session().tx().await?;
-    tx.execute("CREATE (:Note {id: 'n1', body: 'Hello'})").await?;
+    tx.execute("CREATE (:Note {id: 'n1', body: 'Hello'})")
+        .await?;
     tx.commit().await?;
     db.flush().await?;
 
@@ -463,7 +480,8 @@ async fn t9_partial_set_cross_tx_dirty_key_union() -> Result<()> {
         .await?;
 
     let tx = db.session().tx().await?;
-    tx.execute("CREATE (:E {id: 'k', a: 0, b: 0, untouched: 'keep'})").await?;
+    tx.execute("CREATE (:E {id: 'k', a: 0, b: 0, untouched: 'keep'})")
+        .await?;
     tx.commit().await?;
     db.flush().await?;
 

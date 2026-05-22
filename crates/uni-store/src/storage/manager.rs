@@ -153,7 +153,10 @@ pub async fn merge_insert_batch_with_lance_conflict_retry(
                 table_name
             );
         }
-        match backend.merge_insert(table_name, on, vec![batch.clone()]).await {
+        match backend
+            .merge_insert(table_name, on, vec![batch.clone()])
+            .await
+        {
             Ok(()) => return Ok(()),
             Err(e) => {
                 let msg = e.to_string();

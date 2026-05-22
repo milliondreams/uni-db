@@ -2083,7 +2083,8 @@ async fn columnar_scan_vertex_batch_static(
         }
         _ => None,
     };
-    let l0_batch = build_l0_vertex_batch(l0_ctx, label, &internal_schema, label_props, l0_target_vids)?;
+    let l0_batch =
+        build_l0_vertex_batch(l0_ctx, label, &internal_schema, label_props, l0_target_vids)?;
 
     // Merge Lance + L0
     let Some(merged) = merge_lance_and_l0(lance_deduped, l0_batch, &internal_schema, "_vid")?
@@ -2372,7 +2373,8 @@ async fn columnar_scan_schemaless_vertex_batch_static(
         }
         _ => None,
     };
-    let l0_batch = build_l0_schemaless_vertex_batch(l0_ctx, label, &internal_schema, l0_target_vids)?;
+    let l0_batch =
+        build_l0_schemaless_vertex_batch(l0_ctx, label, &internal_schema, l0_target_vids)?;
 
     // Merge Lance + L0
     let Some(merged) = merge_lance_and_l0(lance_deduped, l0_batch, &internal_schema, "_vid")?

@@ -17,9 +17,9 @@
 //!    e. Accumulate new rows and repeat
 //! 3. Output all accumulated rows as a single-column list
 
-use crate::query::df_graph::{GraphExecutionContext, MutationContext};
 use crate::query::df_graph::common::{arrow_err, compute_plan_properties, execute_subplan};
 use crate::query::df_graph::unwind::arrow_to_json_value;
+use crate::query::df_graph::{GraphExecutionContext, MutationContext};
 use crate::query::planner::LogicalPlan;
 use arrow_array::RecordBatch;
 use arrow_array::builder::{Int64Builder, LargeListBuilder};

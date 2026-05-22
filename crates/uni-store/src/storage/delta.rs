@@ -494,12 +494,9 @@ impl DeltaDataset {
 
         // Determine if any touched key is a non-schema (overflow) prop —
         // if so, regenerate overflow_json.
-        let schema_prop_names: std::collections::HashSet<&String> = type_props
-            .map(|tp| tp.keys().collect())
-            .unwrap_or_default();
-        let any_overflow_touched = touched_keys
-            .iter()
-            .any(|k| !schema_prop_names.contains(k));
+        let schema_prop_names: std::collections::HashSet<&String> =
+            type_props.map(|tp| tp.keys().collect()).unwrap_or_default();
+        let any_overflow_touched = touched_keys.iter().any(|k| !schema_prop_names.contains(k));
         if any_overflow_touched {
             fields.push(Field::new(
                 "overflow_json",
@@ -535,14 +532,13 @@ impl DeltaDataset {
         }
 
         if any_overflow_touched {
-            let overflow_column =
-                crate::storage::property_builder::build_overflow_json_column(
-                    entries.len(),
-                    &self.edge_type,
-                    schema,
-                    |i| &entries[i].properties,
-                    &[],
-                )?;
+            let overflow_column = crate::storage::property_builder::build_overflow_json_column(
+                entries.len(),
+                &self.edge_type,
+                schema,
+                |i| &entries[i].properties,
+                &[],
+            )?;
             columns.push(overflow_column);
         }
 

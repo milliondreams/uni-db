@@ -6401,6 +6401,30 @@ const MAX_UNWIND_IN_PUSHDOWN_VALUES: usize = 10_000;
 /// Convert a `uni_common::Value` primitive into a `CypherLiteral` for use in
 /// AST `Expr::List` items. Returns `None` for non-primitive Values (lists,
 /// maps, nodes, etc.) — those don't make sense as `IN` list elements anyway.
+/// One-shot `tracing::warn!` when a literal-list UNWIND that *looks* like
+/// it should be pushable to a scan-side IN-list filter fails one of the
+/// content gates (missing field, non-literal value at field, oversized
+/// list). Surfaces the gap so diagnostic users and CI catch "I wrote an
+/// inlined UNWIND for a test and got silent full-scan" patterns; in
+/// production these would have pushed if rewritten as `UNWIND $param AS u`.
+///
+/// Deduped via a single `AtomicBool` to avoid log spam on long-running
+/// processes; one warning per process across all reasons.
+fn warn_unpushable_unwind_once(reason: &'static str) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if WARNED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    tracing::warn!(
+        target: "uni_query::cross_join_in_pushdown",
+        reason,
+        "Inlined UNWIND of map literals failed pushdown — falling back \
+         to FilterExec over a full scan. Rewrite as `UNWIND $param AS u` \
+         with the param bound as a List<Map<...>> to guarantee pushdown."
+    );
+}
+
 fn value_to_cypher_literal(v: &uni_common::Value) -> Option<CypherLiteral> {
     use uni_common::Value;
     match v {
@@ -6544,15 +6568,46 @@ fn materialize_unwind_source_field(
     match expr {
         Expr::List(items) => {
             if items.len() > MAX_UNWIND_IN_PUSHDOWN_VALUES {
+                warn_unpushable_unwind_once(
+                    "UNWIND list exceeds MAX_UNWIND_IN_PUSHDOWN_VALUES",
+                );
                 return None;
             }
-            // Map literal at plan time: each item must be a Map literal whose
-            // `field` entry is itself a literal. We don't currently lower
-            // map-literal Cypher AST into Expr::Literal(CypherLiteral::Map),
-            // so this branch is conservative and bails. The Parameter branch
-            // below covers the workloads that actually trigger this code.
-            let _ = items;
-            None
+            // Inlined map literals at plan time: each item must be an
+            // `Expr::Map(entries)` whose entry at `field` is itself an
+            // `Expr::Literal(_)`. Extract the literals directly — we
+            // already have them as Expr, no Value↔Literal conversion
+            // needed (unlike the Parameter branch below).
+            //
+            // Non-map items return None silently (they're a type
+            // mismatch the planner will flag elsewhere). Maps with a
+            // missing or non-literal value at `field` emit a one-shot
+            // warn — those shapes would have pushed if rewritten as
+            // `UNWIND $param AS u` (where parameter resolution makes
+            // every value a primitive Value).
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                let entries = match item {
+                    Expr::Map(entries) => entries,
+                    _ => return None,
+                };
+                let Some((_, value_expr)) = entries.iter().find(|(k, _)| k == field) else {
+                    warn_unpushable_unwind_once(
+                        "UNWIND map literal is missing the field referenced by the join predicate",
+                    );
+                    return None;
+                };
+                let Expr::Literal(_) = value_expr else {
+                    warn_unpushable_unwind_once(
+                        "UNWIND map literal has a non-literal value at the joined field \
+                         (e.g., a parameter or function call) — substitute with a literal \
+                         or rewrite as `UNWIND $param AS u` with the param bound at runtime",
+                    );
+                    return None;
+                };
+                out.push(value_expr.clone());
+            }
+            Some(out)
         }
         Expr::Parameter(name) => match params.get(name)? {
             uni_common::Value::List(values) => {
@@ -6935,5 +6990,132 @@ mod tests {
             sanitized,
             vec!["custom_prop".to_string(), "_all_props".to_string()]
         );
+    }
+
+    // -----------------------------------------------------------------
+    // UNWIND IN-list pushdown — `materialize_unwind_source_field`
+    //
+    // Background: an inlined `UNWIND [{nid: 64}, {nid: 65}] AS u
+    // MATCH (n:Entity) WHERE id(n) = u.nid` should be pushable to a
+    // `_vid IN (64, 65)` scan filter — identical observable result to
+    // the param-bound form `UNWIND $updates AS u`. The Parameter branch
+    // (df_planner.rs:6515-6532) handles parameter-bound lists of maps;
+    // the literal-list branch must handle the equivalent inlined form.
+    // -----------------------------------------------------------------
+
+    use uni_cypher::ast::CypherLiteral;
+
+    fn int_lit(n: i64) -> Expr {
+        Expr::Literal(CypherLiteral::Integer(n))
+    }
+
+    fn str_lit(s: &str) -> Expr {
+        Expr::Literal(CypherLiteral::String(s.to_string()))
+    }
+
+    fn map_entry(k: &str, v: Expr) -> (String, Expr) {
+        (k.to_string(), v)
+    }
+
+    #[test]
+    fn materialize_unwind_field_accepts_inlined_map_literals() {
+        // `UNWIND [{nid: 64, x: 1}, {nid: 65, x: 2}] AS u ... = u.nid`
+        let unwind_expr = Expr::List(vec![
+            Expr::Map(vec![map_entry("nid", int_lit(64)), map_entry("x", int_lit(1))]),
+            Expr::Map(vec![map_entry("nid", int_lit(65)), map_entry("x", int_lit(2))]),
+        ]);
+        let params = HashMap::new();
+        let result = materialize_unwind_source_field(&unwind_expr, &params, "nid");
+        let values = result.expect("literal-map UNWIND should produce an IN-list");
+        assert_eq!(values.len(), 2);
+        assert!(matches!(&values[0], Expr::Literal(CypherLiteral::Integer(64))));
+        assert!(matches!(&values[1], Expr::Literal(CypherLiteral::Integer(65))));
+    }
+
+    #[test]
+    fn materialize_unwind_field_handles_mixed_primitive_field_types() {
+        // String field — should also work since value_to_cypher_literal
+        // accepts strings.
+        let unwind_expr = Expr::List(vec![
+            Expr::Map(vec![map_entry("k", str_lit("a"))]),
+            Expr::Map(vec![map_entry("k", str_lit("b"))]),
+        ]);
+        let params = HashMap::new();
+        let values = materialize_unwind_source_field(&unwind_expr, &params, "k")
+            .expect("literal-map UNWIND should produce an IN-list");
+        assert_eq!(values.len(), 2);
+    }
+
+    #[test]
+    fn materialize_unwind_field_rejects_non_literal_value_at_target_field() {
+        // `UNWIND [{nid: $p}, ...]` — value is a Parameter, not a Literal.
+        // Should bail conservatively (we don't substitute parameters
+        // inside inlined map literals at plan time).
+        let unwind_expr = Expr::List(vec![
+            Expr::Map(vec![map_entry("nid", Expr::Parameter("p".to_string()))]),
+        ]);
+        let params = HashMap::new();
+        let result = materialize_unwind_source_field(&unwind_expr, &params, "nid");
+        assert!(result.is_none(), "non-literal value at field should bail");
+    }
+
+    #[test]
+    fn materialize_unwind_field_rejects_when_target_field_missing() {
+        // `UNWIND [{other: 64}, ...] ... = u.nid` — no `nid` entry.
+        let unwind_expr = Expr::List(vec![
+            Expr::Map(vec![map_entry("other", int_lit(64))]),
+        ]);
+        let params = HashMap::new();
+        let result = materialize_unwind_source_field(&unwind_expr, &params, "nid");
+        assert!(result.is_none(), "map missing the requested field should bail");
+    }
+
+    #[test]
+    fn materialize_unwind_field_rejects_non_map_list_item() {
+        // `UNWIND [64, 65] AS u ... = u.nid` — items are bare ints, not
+        // maps. We're projecting `.nid` from a non-map.
+        let unwind_expr = Expr::List(vec![int_lit(64), int_lit(65)]);
+        let params = HashMap::new();
+        let result = materialize_unwind_source_field(&unwind_expr, &params, "nid");
+        assert!(result.is_none(), "non-map list items can't be field-projected");
+    }
+
+    #[test]
+    fn materialize_unwind_field_rejects_oversized_list() {
+        // Guard against the `MAX_UNWIND_IN_PUSHDOWN_VALUES` ceiling.
+        let oversized = MAX_UNWIND_IN_PUSHDOWN_VALUES + 1;
+        let items: Vec<Expr> = (0..oversized)
+            .map(|i| Expr::Map(vec![map_entry("nid", int_lit(i as i64))]))
+            .collect();
+        let unwind_expr = Expr::List(items);
+        let params = HashMap::new();
+        let result = materialize_unwind_source_field(&unwind_expr, &params, "nid");
+        assert!(result.is_none(), "oversized list should bail");
+    }
+
+    #[test]
+    fn materialize_unwind_field_param_form_still_works() {
+        // Regression guard: the param branch must still work after the
+        // literal branch change.
+        let mut params = HashMap::new();
+        params.insert(
+            "updates".to_string(),
+            uni_common::Value::List(vec![
+                uni_common::Value::Map({
+                    let mut m = HashMap::new();
+                    m.insert("nid".to_string(), uni_common::Value::Int(64));
+                    m
+                }),
+                uni_common::Value::Map({
+                    let mut m = HashMap::new();
+                    m.insert("nid".to_string(), uni_common::Value::Int(65));
+                    m
+                }),
+            ]),
+        );
+        let unwind_expr = Expr::Parameter("updates".to_string());
+        let values = materialize_unwind_source_field(&unwind_expr, &params, "nid")
+            .expect("parameter form should produce IN-list");
+        assert_eq!(values.len(), 2);
     }
 }

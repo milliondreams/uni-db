@@ -10,6 +10,7 @@ pub mod cypher_set_advanced;
 pub mod defer_embeddings_test;
 pub mod delete_vertex_test;
 pub mod df_mutation_test;
+pub mod inlined_unwind_pushdown_test;
 pub mod mutation_stress_test;
 pub mod partial_lance_delete_test;
 pub mod partial_lance_edges_test;

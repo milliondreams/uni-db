@@ -131,6 +131,45 @@ impl Drop for FlushInProgressGuard {
 /// commit-conflict-resolver behavior described in
 /// `lance-3.0.1/src/io/commit/conflict_resolver.rs`. RecordBatch
 /// clones are cheap (column data is Arc'd).
+/// MergeInsert sibling of `write_batch_with_lance_conflict_retry`.
+///
+/// Source `batch` must contain the join columns in `on` plus any
+/// columns to update. Matched rows have `WhenMatched::UpdateAll`
+/// applied; unmatched source rows are dropped (partial writes never
+/// INSERT — see `docs/proposals/partial_lance_writes.md`). Returns
+/// an error if the target table does not exist.
+pub async fn merge_insert_batch_with_lance_conflict_retry(
+    backend: &dyn crate::backend::StorageBackend,
+    table_name: &str,
+    batch: arrow_array::RecordBatch,
+    on: &[&str],
+) -> anyhow::Result<()> {
+    for attempt in 0u32..10 {
+        let exists = backend.table_exists(table_name).await?;
+        if !exists {
+            anyhow::bail!(
+                "merge_insert target table '{}' does not exist (partial writes \
+                 require the row to already be present; CREATE goes through Append)",
+                table_name
+            );
+        }
+        match backend.merge_insert(table_name, on, vec![batch.clone()]).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                let msg = e.to_string();
+                let is_conflict =
+                    msg.contains("Incompatible transaction") || msg.contains("conflict");
+                if !is_conflict || attempt == 9 {
+                    return Err(e);
+                }
+                let backoff_ms = 1u64 << attempt;
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+            }
+        }
+    }
+    unreachable!("retry loop exits via Ok or Err")
+}
+
 pub async fn write_batch_with_lance_conflict_retry(
     backend: &dyn crate::backend::StorageBackend,
     table_name: &str,

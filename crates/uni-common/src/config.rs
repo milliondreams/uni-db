@@ -486,6 +486,17 @@ pub struct UniConfig {
     /// is accepted and dynamically registered).
     pub strict_schema: bool,
 
+    /// Enable Lance `MergeInsert` for SET-only flushes (default: false).
+    ///
+    /// When true, `Writer::insert_vertex_partial` records the touched
+    /// property keys into L0 and the flush emits a partial-column source
+    /// to Lance via `MergeInsertBuilder` — skipping the read of (and write
+    /// of) the unchanged columns. Wide-row schemas with vector indexes
+    /// benefit most (~17 ms/row → ~3 ms/row on the issue #72 ingest
+    /// workload). See `docs/proposals/partial_lance_writes.md` and the
+    /// Round-11 plan section in `plan-and-implement-a-valiant-flame.md`.
+    pub partial_lance_writes: bool,
+
     /// Per-fork L1 fragment-count threshold above which a `tracing::warn!`
     /// fires once per crossing during fork flush. Long-lived heavy-write
     /// forks accumulate fragments because fork compaction is deferred to
@@ -592,6 +603,7 @@ impl Default for UniConfig {
             object_store: ObjectStoreConfig::default(),
             index_rebuild: IndexRebuildConfig::default(),
             strict_schema: false,
+            partial_lance_writes: false,
             fork_fragment_warn_threshold: 256,
             tx_id_reservoir_batch: 16,
             // Default ON as of the Item-B-deep-fix landing (per-table

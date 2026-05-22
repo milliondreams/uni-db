@@ -443,6 +443,42 @@ impl StorageBackend for LanceDbBackend {
         Ok(())
     }
 
+    async fn merge_insert(
+        &self,
+        table_name: &str,
+        on: &[&str],
+        batches: Vec<RecordBatch>,
+    ) -> Result<()> {
+        if batches.is_empty() {
+            return Ok(());
+        }
+
+        // Serialize per-table writes (same as `write`).
+        let lock = self.write_lock_for(table_name);
+        let _guard = lock.lock().await;
+
+        let table = self.get_or_open_table(table_name).await?;
+
+        // Build a reader for the partial-column source. The first batch's
+        // schema describes the source subschema; Lance compares it against
+        // the target via `allow_subschema=true` internally.
+        let schema = batches[0].schema();
+        let reader = arrow_array::RecordBatchIterator::new(
+            batches.into_iter().map(Ok),
+            schema,
+        );
+
+        let mut mi = table.merge_insert(on);
+        mi.when_matched_update_all(None);
+        // Note: deliberately NOT calling `when_not_matched_insert_all`.
+        // Partial writes only update existing rows; CREATE goes through
+        // the full-row Append path. Unmatched source rows are dropped.
+        mi.execute(Box::new(reader))
+            .await
+            .map_err(|e| anyhow!("merge_insert on '{}': {}", table_name, e))?;
+        Ok(())
+    }
+
     async fn delete_rows(&self, table_name: &str, filter: &str) -> Result<()> {
         let table = self.get_or_open_table(table_name).await?;
         table

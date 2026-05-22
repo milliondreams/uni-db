@@ -35,7 +35,18 @@ struct EdgeIdentity {
 struct PendingVertexSet {
     vid: Vid,
     labels: Vec<String>,
+    /// Property staging map. When `partial` is `true` this holds ONLY
+    /// the touched keys; flush routes through
+    /// `Writer::insert_vertex_partial` (which itself decides whether the
+    /// flag-on fast path or the read-then-merge fallback applies). When
+    /// `partial` is `false`, this holds the full-row pre-read map merged
+    /// with the touched values; flush goes through the existing
+    /// `insert_vertex_with_labels`. See Round 11 in the plan file.
     props: HashMap<String, Value>,
+    /// `true` when no full-row pre-read happened. Set by the caller when
+    /// the schema has no generated columns on this label (since those
+    /// would need other-property values to evaluate).
+    partial: bool,
 }
 
 /// Per-variable accumulator for SetItem::Property items targeting an edge.
@@ -1788,18 +1799,46 @@ impl Executor {
                                 Self::extract_labels_from_node(node_val).unwrap_or_default();
                             let schema = self.storage.schema_manager().schema().clone();
 
-                            // Lazy one-time read for this variable.
+                            // Lazy one-time setup for this variable. Decide
+                            // partial-vs-full based on:
+                            //   * The `partial_lance_writes` config flag.
+                            //   * Whether any label on this vertex has
+                            //     generated columns — those need the
+                            //     full row to compute on flush.
+                            // When partial, we DO NOT pre-read; `pv.props`
+                            // accumulates only the SET-touched keys. When
+                            // full, the existing read-then-merge logic
+                            // runs.
                             if !pending_v.contains_key(var_name) {
-                                let initial = prop_manager
-                                    .get_all_vertex_props_with_ctx(vid, ctx)
-                                    .await?
-                                    .unwrap_or_default();
+                                let storage_cfg = &self.storage.config;
+                                let label_has_generated = labels.iter().any(|l| {
+                                    schema
+                                        .properties
+                                        .get(l)
+                                        .map(|p| {
+                                            p.values()
+                                                .any(|m| m.generation_expression.is_some())
+                                        })
+                                        .unwrap_or(false)
+                                });
+                                let go_partial =
+                                    storage_cfg.partial_lance_writes && !label_has_generated;
+                                let (initial, partial) = if go_partial {
+                                    (HashMap::new(), true)
+                                } else {
+                                    let read = prop_manager
+                                        .get_all_vertex_props_with_ctx(vid, ctx)
+                                        .await?
+                                        .unwrap_or_default();
+                                    (read, false)
+                                };
                                 pending_v.insert(
                                     var_name.clone(),
                                     PendingVertexSet {
                                         vid,
                                         labels: labels.clone(),
                                         props: initial,
+                                        partial,
                                     },
                                 );
                             }
@@ -2030,20 +2069,30 @@ impl Executor {
         }
 
         // Flush all remaining coalesced writes — one writer call per target.
+        // Partial entries (no full-row read, no generated-column enrich)
+        // route through `Writer::insert_vertex_partial`; full entries
+        // continue through the read-then-merge `insert_vertex_with_labels`
+        // path with `enrich_properties_with_generated_columns` applied.
         for (_var_name, mut pv) in pending_v {
-            for label_name in &pv.labels {
-                self.enrich_properties_with_generated_columns(
-                    label_name,
-                    &mut pv.props,
-                    prop_manager,
-                    params,
-                    ctx,
-                )
-                .await?;
+            if pv.partial {
+                writer
+                    .insert_vertex_partial(pv.vid, pv.props, &pv.labels, tx_l0)
+                    .await?;
+            } else {
+                for label_name in &pv.labels {
+                    self.enrich_properties_with_generated_columns(
+                        label_name,
+                        &mut pv.props,
+                        prop_manager,
+                        params,
+                        ctx,
+                    )
+                    .await?;
+                }
+                let _ = writer
+                    .insert_vertex_with_labels(pv.vid, pv.props, &pv.labels, tx_l0)
+                    .await?;
             }
-            let _ = writer
-                .insert_vertex_with_labels(pv.vid, pv.props, &pv.labels, tx_l0)
-                .await?;
         }
         for (_var_name, pe) in pending_e {
             writer
@@ -2080,19 +2129,25 @@ impl Executor {
         tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
     ) -> Result<()> {
         if let Some(mut pv) = pending_v.remove(var) {
-            for label_name in &pv.labels {
-                self.enrich_properties_with_generated_columns(
-                    label_name,
-                    &mut pv.props,
-                    prop_manager,
-                    _params,
-                    ctx,
-                )
-                .await?;
+            if pv.partial {
+                writer
+                    .insert_vertex_partial(pv.vid, pv.props, &pv.labels, tx_l0)
+                    .await?;
+            } else {
+                for label_name in &pv.labels {
+                    self.enrich_properties_with_generated_columns(
+                        label_name,
+                        &mut pv.props,
+                        prop_manager,
+                        _params,
+                        ctx,
+                    )
+                    .await?;
+                }
+                let _ = writer
+                    .insert_vertex_with_labels(pv.vid, pv.props, &pv.labels, tx_l0)
+                    .await?;
             }
-            let _ = writer
-                .insert_vertex_with_labels(pv.vid, pv.props, &pv.labels, tx_l0)
-                .await?;
         }
         if let Some(pe) = pending_e.remove(var) {
             writer

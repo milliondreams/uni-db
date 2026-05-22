@@ -36,12 +36,31 @@ use uuid::Uuid;
 #[derive(Clone, Debug)]
 pub struct WriterConfig {
     pub max_mutations: usize,
+    /// Enable the partial-column MergeInsert path for SET-only flushes.
+    ///
+    /// When `true`, `Writer::insert_vertex_partial` records the touched
+    /// property keys into `L0Buffer::vertex_partial_keys` and the flush
+    /// routes those VIDs through Lance `MergeInsertBuilder` with a
+    /// subset-of-schema source, skipping the read of (and write of)
+    /// the unchanged columns — including wide ones like embeddings.
+    ///
+    /// When `false`, `insert_vertex_partial` falls back to the
+    /// read-modify-write `insert_vertex_with_labels` path (preserving
+    /// bit-for-bit equivalence with prior releases). Default `false`
+    /// for the first release; flip to `true` after telemetry on the
+    /// issue #72 ingest workload confirms the win.
+    ///
+    /// See `docs/proposals/partial_lance_writes.md` and the soundness
+    /// probe at
+    /// `crates/uni-store/tests/common/storage/lance_merge_insert_probe.rs`.
+    pub partial_lance_writes: bool,
 }
 
 impl Default for WriterConfig {
     fn default() -> Self {
         Self {
             max_mutations: 10_000,
+            partial_lance_writes: false,
         }
     }
 }
@@ -653,22 +672,60 @@ impl Writer {
         label: &str,
         tx_l0: Option<&Arc<RwLock<L0Buffer>>>,
     ) -> Result<()> {
+        self.validate_vertex_constraints_for_label_impl(vid, properties, label, tx_l0, false)
+            .await
+    }
+
+    /// Partial-update sibling: validates only constraints touching keys
+    /// present in `properties` (the touched set). NOT NULL is checked
+    /// only for touched keys; multi-key UNIQUE / CHECK / EXISTS are
+    /// skipped when any referenced key is absent (the caller is
+    /// expected to have routed to the full-row path in that case via
+    /// `touched_needs_full_read`).
+    async fn validate_vertex_constraints_for_label_partial(
+        &self,
+        vid: Vid,
+        properties: &Properties,
+        label: &str,
+        tx_l0: Option<&Arc<RwLock<L0Buffer>>>,
+    ) -> Result<()> {
+        self.validate_vertex_constraints_for_label_impl(vid, properties, label, tx_l0, true)
+            .await
+    }
+
+    async fn validate_vertex_constraints_for_label_impl(
+        &self,
+        vid: Vid,
+        properties: &Properties,
+        label: &str,
+        tx_l0: Option<&Arc<RwLock<L0Buffer>>>,
+        partial: bool,
+    ) -> Result<()> {
         let schema = self.schema_manager.schema();
 
         {
-            // 1. Check NOT NULL constraints (from Property definitions)
+            // 1. Check NOT NULL constraints (from Property definitions).
+            //    Under partial-update mode, skip properties NOT in
+            //    `properties` — they retain their previous (already-
+            //    validated) value.
             if let Some(props_meta) = schema.properties.get(label) {
                 for (prop_name, meta) in props_meta {
-                    if !meta.nullable && properties.get(prop_name).is_none_or(|v| v.is_null()) {
-                        log::warn!(
-                            "Constraint violation: Property '{}' cannot be null for label '{}'",
-                            prop_name,
-                            label
-                        );
-                        return Err(anyhow!(
-                            "Constraint violation: Property '{}' cannot be null",
-                            prop_name
-                        ));
+                    if !meta.nullable {
+                        let present = properties.get(prop_name);
+                        if partial && present.is_none() {
+                            continue;
+                        }
+                        if present.is_none_or(|v| v.is_null()) {
+                            log::warn!(
+                                "Constraint violation: Property '{}' cannot be null for label '{}'",
+                                prop_name,
+                                label
+                            );
+                            return Err(anyhow!(
+                                "Constraint violation: Property '{}' cannot be null",
+                                prop_name
+                            ));
+                        }
                     }
                 }
             }
@@ -766,6 +823,31 @@ impl Writer {
             self.check_extid_globally_unique(ext_id, vid, tx_l0).await?;
         }
 
+        Ok(())
+    }
+
+    /// Partial sibling of `validate_vertex_constraints` — validates only
+    /// constraints touching keys present in `properties`. Used by
+    /// `insert_vertex_partial`'s fast path; the caller pre-screens for
+    /// multi-key UNIQUE constraints via `touched_needs_full_read`.
+    async fn validate_vertex_constraints_partial(
+        &self,
+        vid: Vid,
+        touched: &Properties,
+        labels: &[String],
+        tx_l0: Option<&Arc<RwLock<L0Buffer>>>,
+    ) -> Result<()> {
+        let schema = self.schema_manager.schema();
+        for label in labels {
+            if schema.get_label_case_insensitive(label).is_none() {
+                continue;
+            }
+            self.validate_vertex_constraints_for_label_partial(vid, touched, label, tx_l0)
+                .await?;
+        }
+        if let Some(ext_id) = touched.get("ext_id").and_then(|v| v.as_str()) {
+            self.check_extid_globally_unique(ext_id, vid, tx_l0).await?;
+        }
         Ok(())
     }
 
@@ -1673,6 +1755,125 @@ impl Writer {
         Ok(properties_copy)
     }
 
+    /// True iff routing this partial write through MergeInsert would
+    /// miss a constraint check. Specifically: a multi-key UNIQUE
+    /// constraint where the touched-set doesn't cover all member keys
+    /// requires the unchanged keys from the existing row to compute
+    /// the composite. Conservative: also returns true if any touched
+    /// key is `ext_id` (uniqueness checked globally — handled in the
+    /// full-row path).
+    fn touched_needs_full_read(&self, touched: &Properties, labels: &[String]) -> bool {
+        if touched.contains_key("ext_id") {
+            return true;
+        }
+        let schema = self.schema_manager.schema();
+        for label in labels {
+            if schema.get_label_case_insensitive(label).is_none() {
+                continue;
+            }
+            for constraint in &schema.constraints {
+                if !constraint.enabled {
+                    continue;
+                }
+                if let ConstraintTarget::Label(l) = &constraint.target {
+                    if !l.eq_ignore_ascii_case(label) {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+                if let ConstraintType::Unique {
+                    properties: unique_props,
+                } = &constraint.constraint_type
+                {
+                    if unique_props.len() < 2 {
+                        continue; // single-key UNIQUE — partial path sees the key
+                    }
+                    if unique_props.iter().any(|p| touched.contains_key(p)) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Insert a vertex's *partial* property set without first reading the
+    /// full row.
+    ///
+    /// When `WriterConfig::partial_lance_writes` is `true`, the touched
+    /// keys flow into `L0Buffer::vertex_partial_keys` so the next flush
+    /// emits them via Lance `MergeInsertBuilder` against a subset-of-
+    /// schema source — preserving untouched columns (e.g., embeddings)
+    /// byte-equal in Lance with no read at the caller and no write of
+    /// those columns. See `docs/proposals/partial_lance_writes.md`.
+    ///
+    /// When the flag is `false`, this falls back to the existing
+    /// `insert_vertex_with_labels` path after merging `touched` with
+    /// the current properties from L0/storage. The caller can therefore
+    /// use this entry point unconditionally; the optimization activates
+    /// only when the flag is on.
+    #[instrument(skip(self, touched, labels), level = "trace")]
+    pub async fn insert_vertex_partial(
+        &self,
+        vid: Vid,
+        touched: Properties,
+        labels: &[String],
+        tx_l0: Option<&Arc<RwLock<L0Buffer>>>,
+    ) -> Result<()> {
+        let needs_full_read = !self.config.partial_lance_writes
+            || self.touched_needs_full_read(&touched, labels);
+        if needs_full_read {
+            // Flag-off fallback (or constraint-driven fallback): merge
+            // `touched` with the current full property snapshot from
+            // L0/storage and route through the existing path. Preserves
+            // bit-for-bit equivalence with the pre-Round-11 release.
+            let existing = if let Some(pm) = &self.property_manager {
+                pm.get_all_vertex_props_with_ctx(vid, None)
+                    .await
+                    .unwrap_or_default()
+                    .unwrap_or_default()
+            } else {
+                Properties::new()
+            };
+            let mut merged = existing;
+            for (k, v) in touched {
+                merged.insert(k, v);
+            }
+            self.insert_vertex_with_labels(vid, merged, labels, tx_l0)
+                .await?;
+            return Ok(());
+        }
+
+        // Flag-on fast path: stage the partial update directly. Pressure
+        // checks, embedding generation, constraint validation all still
+        // run — but the validator is the partial-aware variant that
+        // skips NOT NULL / multi-key UNIQUE / CHECK / EXISTS for
+        // properties not present in `touched`. Multi-key UNIQUE that
+        // overlaps the touched set forces a fallback above via
+        // `touched_needs_full_read`.
+        let mut touched = touched;
+        self.check_write_pressure().await?;
+        self.check_transaction_memory(tx_l0)?;
+        self.process_embeddings_for_labels(labels, &mut touched).await?;
+        self.validate_vertex_constraints_partial(vid, &touched, labels, tx_l0)
+            .await?;
+
+        {
+            let l0 = self.resolve_l0(tx_l0);
+            let mut l0_guard = l0.write();
+            l0_guard.insert_vertex_partial(vid, touched, labels);
+        }
+
+        metrics::counter!("uni_l0_buffer_mutations_total").increment(1);
+        metrics::counter!("uni_partial_writes_total").increment(1);
+        self.update_metrics();
+        if tx_l0.is_none() {
+            self.check_flush().await?;
+        }
+        Ok(())
+    }
+
     /// Insert multiple vertices with batched operations.
     ///
     /// This method uses batched operations to achieve O(N) complexity instead of O(N²)
@@ -2408,6 +2609,13 @@ impl Writer {
         // (Vid, labels, properties, deleted, version)
         type VertexEntry = (Vid, Vec<String>, Properties, bool, u64);
         let mut vertices_by_label: HashMap<u16, Vec<VertexEntry>> = HashMap::new();
+        // Partial-column updates (Lance MergeInsert path). Per-VID tuple:
+        // (vid, full L0 properties map, version, set of keys to update).
+        // Only the keys in the HashSet are emitted to the partial source;
+        // the full props map is retained so the per-row column extractor
+        // can read each touched key's value.
+        type PartialEntry = (Vid, Properties, u64, std::collections::HashSet<String>);
+        let mut partial_by_label: HashMap<u16, Vec<PartialEntry>> = HashMap::new();
         // Collect vertex timestamps from L0 for flushing to storage
         let mut vertex_created_at: HashMap<Vid, i64> = HashMap::new();
         let mut vertex_updated_at: HashMap<Vid, i64> = HashMap::new();
@@ -2506,14 +2714,37 @@ impl Writer {
                     vertex_updated_at.insert(*vid, ts);
                 }
                 if let Some(labels) = old_l0.vertex_labels.get(vid) {
-                    push_vertex_to_labels(
-                        *vid,
-                        labels,
-                        props.clone(),
-                        false,
-                        version,
-                        &mut vertices_by_label,
-                    );
+                    // Partial-write routing: when this VID was last
+                    // touched via `insert_vertex_partial` AND the
+                    // partial_lance_writes flag is on, send only the
+                    // touched columns to a MergeInsert batch. Otherwise
+                    // (CREATE, MERGE-ON-CREATE, full-replace SET, DELETE
+                    // — or flag off) use the existing full-row Append.
+                    let is_partial = self.config.partial_lance_writes
+                        && old_l0.vertex_partial_keys.contains_key(vid);
+                    if is_partial {
+                        if let Some(touched) = old_l0.vertex_partial_keys.get(vid) {
+                            for label in labels {
+                                if let Some(label_id) = schema.label_id_by_name(label) {
+                                    partial_by_label.entry(label_id).or_default().push((
+                                        *vid,
+                                        props.clone(),
+                                        version,
+                                        touched.clone(),
+                                    ));
+                                }
+                            }
+                        }
+                    } else {
+                        push_vertex_to_labels(
+                            *vid,
+                            labels,
+                            props.clone(),
+                            false,
+                            version,
+                            &mut vertices_by_label,
+                        );
+                    }
                 }
             }
             for &vid in &old_l0.vertex_tombstones {
@@ -2734,7 +2965,16 @@ impl Writer {
         }
 
         // 4. Per-label vertex table writes
-        for (label_id, vertices) in vertices_by_label {
+        // Iterate all labels that have either full-row OR partial-write
+        // data pending. A label may appear in only one of the two maps
+        // (e.g., all updates on this label were partial-only).
+        let all_label_ids: std::collections::HashSet<u16> = vertices_by_label
+            .keys()
+            .chain(partial_by_label.keys())
+            .copied()
+            .collect();
+        for label_id in all_label_ids {
+            let vertices = vertices_by_label.remove(&label_id).unwrap_or_default();
             let label_name = schema
                 .label_name_by_id(label_id)
                 .ok_or_else(|| anyhow!("Label ID {} not found", label_id))?;
@@ -2785,18 +3025,51 @@ impl Writer {
                 ver_data.push(version);
             }
 
-            let batch = ds.build_record_batch_with_timestamps(
-                &v_data,
-                &d_data,
-                &ver_data,
-                &schema,
-                Some(&vertex_created_at),
-                Some(&vertex_updated_at),
-            )?;
-
-            // Write using backend
             let backend = self.storage.backend();
-            ds.write_batch(backend, batch, &schema).await?;
+
+            // Skip the full-row Append entirely if this label only has
+            // partial-write rows pending.
+            if !v_data.is_empty() {
+                let batch = ds.build_record_batch_with_timestamps(
+                    &v_data,
+                    &d_data,
+                    &ver_data,
+                    &schema,
+                    Some(&vertex_created_at),
+                    Some(&vertex_updated_at),
+                )?;
+                ds.write_batch(backend, batch, &schema).await?;
+            }
+
+            // Partial-column batch (Lance MergeInsert path). The flag
+            // gates whether the routing classified any VIDs as partial;
+            // outside the flag this collection is always empty so the
+            // call below is a cheap no-op.
+            if let Some(partial_rows) = partial_by_label.remove(&label_id)
+                && !partial_rows.is_empty()
+            {
+                let touched_union: std::collections::HashSet<String> = partial_rows
+                    .iter()
+                    .flat_map(|(_, _, _, keys)| keys.iter().cloned())
+                    .collect();
+                let pairs: Vec<(Vid, Properties)> = partial_rows
+                    .iter()
+                    .map(|(vid, props, _, _)| (*vid, props.clone()))
+                    .collect();
+                let versions: Vec<u64> =
+                    partial_rows.iter().map(|(_, _, v, _)| *v).collect();
+                let partial_batch = ds.build_partial_record_batch(
+                    &pairs,
+                    &versions,
+                    &touched_union,
+                    &schema,
+                    Some(&vertex_updated_at),
+                )?;
+                if partial_batch.num_rows() > 0 {
+                    ds.merge_insert_batch(backend, partial_batch).await?;
+                }
+            }
+
             ds.ensure_default_indexes(backend).await?;
 
             // Update VidLabelsIndex (if enabled)

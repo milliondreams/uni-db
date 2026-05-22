@@ -13,7 +13,7 @@ use arrow_schema::{Field, Schema as ArrowSchema, TimeUnit};
 #[cfg(feature = "lance-backend")]
 use lance::dataset::Dataset;
 use sha3::{Digest, Sha3_256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use uni_common::Properties;
 use uni_common::core::id::{UniId, Vid};
@@ -305,6 +305,105 @@ impl VertexDataset {
         let table_name = table_names::vertex_table_name(&self.label);
         crate::storage::manager::write_batch_with_lance_conflict_retry(backend, &table_name, batch)
             .await
+    }
+
+    /// Build a *partial-column* RecordBatch for Lance `MergeInsert`. The
+    /// batch includes `_vid` (join key), `_deleted`, `_version`,
+    /// `_updated_at`, and ONLY the schema-defined property columns whose
+    /// name appears in `touched_keys`. Untouched columns (including
+    /// vector embeddings, overflow JSON, ext_id, _labels, _uid,
+    /// _created_at) are omitted from the source — Lance leaves their
+    /// target values at the previous version. See
+    /// `docs/proposals/partial_lance_writes.md`.
+    pub fn build_partial_record_batch(
+        &self,
+        vertices: &[(Vid, Properties)],
+        versions: &[u64],
+        touched_keys: &HashSet<String>,
+        schema: &Schema,
+        updated_at: Option<&HashMap<Vid, i64>>,
+    ) -> Result<RecordBatch> {
+        let mut fields: Vec<arrow_schema::Field> = vec![
+            arrow_schema::Field::new("_vid", arrow_schema::DataType::UInt64, false),
+            arrow_schema::Field::new("_deleted", arrow_schema::DataType::Boolean, false),
+            arrow_schema::Field::new("_version", arrow_schema::DataType::UInt64, false),
+            arrow_schema::Field::new(
+                "_updated_at",
+                arrow_schema::DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                true,
+            ),
+        ];
+
+        let label_props = schema.properties.get(&self.label);
+        let mut sorted_touched_props: Vec<(&String, &uni_common::core::schema::PropertyMeta)> = if let Some(lp) = label_props {
+            lp.iter()
+                .filter(|(name, _)| touched_keys.contains(*name))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        sorted_touched_props.sort_by_key(|(name, _)| *name);
+
+        for (name, meta) in &sorted_touched_props {
+            fields.push(arrow_schema::Field::new(
+                *name,
+                meta.r#type.to_arrow(),
+                meta.nullable,
+            ));
+        }
+
+        let arrow_schema = Arc::new(ArrowSchema::new(fields));
+
+        let vids: Vec<u64> = vertices.iter().map(|(v, _)| v.as_u64()).collect();
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(arrow_schema.fields().len());
+        columns.push(Arc::new(UInt64Array::from(vids)));
+        columns.push(Arc::new(BooleanArray::from(vec![false; vertices.len()])));
+        columns.push(Arc::new(UInt64Array::from(versions.to_vec())));
+
+        let vids_iter = vertices.iter().map(|(v, _)| *v);
+        columns.push(build_timestamp_column_from_vid_map(vids_iter, updated_at));
+
+        // Property columns: for each touched, schema-known property,
+        // build the column from each row's Properties map. Rows whose
+        // map doesn't contain the key get a NULL — Lance treats that
+        // as "don't change this column on this row" only if the source
+        // schema OMITS the column. Since we're sending a uniform
+        // sub-schema across all rows, NULLs in the column do represent
+        // an intentional "set to null" assignment for that row.
+        //
+        // Caller responsibility: a row in the partial batch SHOULD
+        // contain all keys the SET touched on that row. If it doesn't,
+        // we still emit NULL (semantically a null assignment for that
+        // row, which is the SET-to-null Cypher semantic anyway).
+        let default_deleted = vec![false; vertices.len()];
+        for (name, meta) in &sorted_touched_props {
+            let extractor =
+                crate::storage::arrow_convert::PropertyExtractor::new(name, &meta.r#type);
+            let col = extractor.build_column(vertices.len(), &default_deleted, |i| {
+                vertices[i].1.get(*name)
+            })?;
+            columns.push(col);
+        }
+
+        RecordBatch::try_new(arrow_schema, columns).map_err(|e| anyhow!(e))
+    }
+
+    /// MergeInsert a partial-column batch via Lance. The source schema
+    /// must be a subset of the target's schema. Used by the flush path
+    /// when `UniConfig::partial_lance_writes` is on.
+    pub async fn merge_insert_batch(
+        &self,
+        backend: &dyn StorageBackend,
+        batch: RecordBatch,
+    ) -> Result<()> {
+        let table_name = table_names::vertex_table_name(&self.label);
+        crate::storage::manager::merge_insert_batch_with_lance_conflict_retry(
+            backend,
+            &table_name,
+            batch,
+            &["_vid"],
+        )
+        .await
     }
 
     /// Ensure default scalar indexes exist on system columns (_vid, _uid, ext_id).

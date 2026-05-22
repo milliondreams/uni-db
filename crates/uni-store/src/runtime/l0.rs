@@ -135,6 +135,13 @@ pub struct L0Buffer {
     /// Key: constraint composite key (label + sorted property values serialized).
     /// Value: Vid that owns this key.
     pub constraint_index: HashMap<Vec<u8>, Vid>,
+    /// Per-VID set of property keys that should land via Lance MergeInsert
+    /// (partial-column update) at flush time. Populated by
+    /// `insert_vertex_partial`; cleared by full-row inserts and deletes.
+    /// A VID present here at flush time is emitted to the partial batch;
+    /// absent VIDs flush via the existing full-row Append. See
+    /// `docs/proposals/partial_lance_writes.md`.
+    pub vertex_partial_keys: HashMap<Vid, HashSet<String>>,
 }
 
 impl std::fmt::Debug for L0Buffer {
@@ -179,6 +186,7 @@ impl Clone for L0Buffer {
             edge_updated_at: self.edge_updated_at.clone(),
             estimated_size: self.estimated_size,
             constraint_index: self.constraint_index.clone(),
+            vertex_partial_keys: self.vertex_partial_keys.clone(),
         }
     }
 }
@@ -335,6 +343,7 @@ impl L0Buffer {
             edge_updated_at: HashMap::new(),
             estimated_size: 0,
             constraint_index: HashMap::new(),
+            vertex_partial_keys: HashMap::new(),
         }
     }
 
@@ -375,6 +384,10 @@ impl L0Buffer {
 
         self.vertex_tombstones.remove(&vid);
 
+        // Full-row insert supersedes any pending partial-update state for
+        // this VID. See `docs/proposals/partial_lance_writes.md` Step 2.
+        self.vertex_partial_keys.remove(&vid);
+
         let entry = self.vertex_properties.entry(vid).or_default();
         Self::merge_crdt_properties(entry, properties.clone());
         self.vertex_versions.insert(vid, version);
@@ -393,6 +406,111 @@ impl L0Buffer {
         self.graph.add_vertex(vid);
         self.mutation_count += 1;
         self.mutation_stats.nodes_created += 1;
+        self.mutation_stats.properties_set += properties.len();
+        self.mutation_stats.labels_added += labels.len();
+
+        let props_size = Self::estimate_properties_size(&properties);
+        self.estimated_size += 8 + props_size + 16 + labels_size + 32;
+    }
+
+    /// Insert a vertex's *partial* property set: only the keys present in
+    /// `touched` will land via Lance MergeInsert at flush time.
+    ///
+    /// Behavior mirrors `insert_vertex_with_labels` for L0 internal state
+    /// (CRDT merge, version bump, timestamps, labels, mutation stats) so
+    /// in-flight reads see the updated row exactly as they do today. The
+    /// only difference is that we also record `touched.keys()` into
+    /// `vertex_partial_keys[vid]` so the flush knows to emit a partial
+    /// MergeInsert batch instead of a full-row Append for this VID.
+    ///
+    /// A subsequent full-row `insert_vertex_with_labels` or `delete_vertex`
+    /// on the same VID clears the partial-key set, so partial state never
+    /// outlives a stronger write.
+    pub fn insert_vertex_partial(
+        &mut self,
+        vid: Vid,
+        touched: Properties,
+        labels: &[String],
+    ) {
+        // Record dirty keys BEFORE the full-row impl runs (which would
+        // clear them). The keys come from the touched set; the values
+        // are merged into L0 by the shared CRDT path below.
+        let touched_keys: Vec<String> = touched.keys().cloned().collect();
+
+        // If the VID already has a full-row pending insert (e.g., CREATE
+        // earlier in the same tx), we must NOT downgrade it to partial.
+        // Detected by: VID is in vertex_properties WITH a version stamp
+        // AND not currently in vertex_partial_keys → it was written as
+        // a full row recently. The conservative rule: only enable the
+        // partial path when there's no full-row pending insert. We
+        // approximate "no full-row pending" by checking that the VID's
+        // current entry in vertex_partial_keys is non-empty OR the VID
+        // is not in vertex_properties (fresh row, but caller asked
+        // partial — let it through and the post-flush union covers it).
+        let already_full =
+            self.vertex_properties.contains_key(&vid) && !self.vertex_partial_keys.contains_key(&vid);
+
+        // Stage the CRDT merge through the existing path. We bypass the
+        // full-row `insert_vertex_with_labels_impl` clearing of
+        // partial_keys by inlining the work, then restoring/extending
+        // the partial-key set.
+        self.insert_vertex_with_labels_partial_impl(vid, touched, labels, false);
+
+        if !already_full {
+            self.vertex_partial_keys
+                .entry(vid)
+                .or_default()
+                .extend(touched_keys);
+        }
+    }
+
+    /// Core partial-insert: same as `insert_vertex_with_labels_impl` but
+    /// preserves any existing `vertex_partial_keys[vid]` entry so the
+    /// caller can extend it after the merge.
+    fn insert_vertex_with_labels_partial_impl(
+        &mut self,
+        vid: Vid,
+        properties: Properties,
+        labels: &[String],
+        skip_wal: bool,
+    ) {
+        self.current_version += 1;
+        let version = self.current_version;
+        let now = now_nanos();
+
+        if !skip_wal && let Some(wal) = &self.wal {
+            // WAL records the partial as a full-row InsertVertex; on replay
+            // the full-row path runs (which clears partial_keys). This is
+            // semantically correct — L0 in memory always holds the union of
+            // partial deltas via merge_crdt_properties; recovery doesn't
+            // need to preserve partial-vs-full distinction.
+            let _ = wal.append(&Mutation::InsertVertex {
+                vid,
+                properties: properties.clone(),
+                labels: labels.to_vec(),
+            });
+        }
+
+        self.vertex_tombstones.remove(&vid);
+        // NOTE: deliberately DOES NOT remove from vertex_partial_keys.
+        // The caller (`insert_vertex_partial`) extends that set after.
+
+        let entry = self.vertex_properties.entry(vid).or_default();
+        Self::merge_crdt_properties(entry, properties.clone());
+        self.vertex_versions.insert(vid, version);
+
+        self.vertex_created_at.entry(vid).or_insert(now);
+        self.vertex_updated_at.insert(vid, now);
+
+        let labels_size: usize = labels.iter().map(|l| l.len() + 24).sum();
+        let existing = self.vertex_labels.entry(vid).or_default();
+        Self::append_unique_labels(existing, labels);
+        self.index_labels_for_vid(vid, labels);
+
+        self.graph.add_vertex(vid);
+        self.mutation_count += 1;
+        // Partial writes don't create new nodes — they update existing ones.
+        // But counting under properties_set is correct.
         self.mutation_stats.properties_set += properties.len();
         self.mutation_stats.labels_added += labels.len();
 
@@ -490,6 +608,8 @@ impl L0Buffer {
         self.remove_vid_from_label_index(vid);
         self.vertex_tombstones.insert(vid);
         self.vertex_properties.remove(&vid);
+        // Deletion supersedes any pending partial-update state.
+        self.vertex_partial_keys.remove(&vid);
         self.vertex_versions.insert(vid, version);
         self.graph.remove_vertex(vid);
         self.mutation_count += 1;

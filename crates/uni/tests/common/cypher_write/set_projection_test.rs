@@ -1501,9 +1501,15 @@ async fn l2b_call_subquery_create_round_trips() -> Result<()> {
     tx.commit().await?;
 
     let tx = db.session().tx().await?;
-    tx.execute("MATCH (n:E {id: 'seed'}) CALL { CREATE (:E {id: 'fresh'}) } RETURN n.id")
+    let res = tx
+        .query("MATCH (n:E {id: 'seed'}) CALL { CREATE (m:E {id: 'fresh'}) RETURN m } RETURN m.id AS mid")
         .await?;
     tx.commit().await?;
+    assert_eq!(
+        res.rows()[0].get::<String>("mid").unwrap(),
+        "fresh",
+        "subquery RETURN m did not project the newly-created node"
+    );
 
     let r = db
         .session()
@@ -1535,13 +1541,19 @@ async fn l2c_call_subquery_merge_on_create_round_trips() -> Result<()> {
     tx.commit().await?;
 
     let tx = db.session().tx().await?;
-    tx.execute(
-        "MATCH (n:E {id: 'anchor'}) \
-         CALL { MERGE (m:E {id: 'new_via_merge'}) ON CREATE SET m.fresh = true } \
-         RETURN n.id",
-    )
-    .await?;
+    let res = tx
+        .query(
+            "MATCH (n:E {id: 'anchor'}) \
+             CALL { MERGE (m:E {id: 'new_via_merge'}) ON CREATE SET m.fresh = true RETURN m } \
+             RETURN m.fresh AS fresh",
+        )
+        .await?;
     tx.commit().await?;
+    let inner = res.rows()[0].value("fresh").expect("inner fresh missing");
+    assert!(
+        matches!(inner, Value::Bool(true)),
+        "subquery RETURN m did not surface ON CREATE SET in outer projection"
+    );
 
     let r = db
         .session()
@@ -1571,13 +1583,19 @@ async fn l2c2_call_subquery_merge_on_match_round_trips() -> Result<()> {
     tx.commit().await?;
 
     let tx = db.session().tx().await?;
-    tx.execute(
-        "MATCH (n:E {id: 'anchor'}) \
-         CALL { MERGE (m:E {id: 'existing'}) ON MATCH SET m.hits = 99 } \
-         RETURN n.id",
-    )
-    .await?;
+    let res = tx
+        .query(
+            "MATCH (n:E {id: 'anchor'}) \
+             CALL { MERGE (m:E {id: 'existing'}) ON MATCH SET m.hits = 99 RETURN m } \
+             RETURN m.hits AS hits",
+        )
+        .await?;
     tx.commit().await?;
+    assert_eq!(
+        res.rows()[0].get::<i64>("hits").unwrap(),
+        99,
+        "subquery RETURN m did not surface ON MATCH SET in outer projection"
+    );
 
     let r = db
         .session()
@@ -1909,6 +1927,51 @@ async fn l2m_call_subquery_write_visible_to_later_read_in_tx() -> Result<()> {
         r.rows()[0].get::<i64>("x").unwrap(),
         88,
         "later read in same tx did not see inner subquery SET"
+    );
+    Ok(())
+}
+
+/// L2o — `CALL { CREATE (m:E {x: 99}) RETURN m } RETURN m.x` projects a
+/// freshly-bound node through the subquery's RETURN. This exercises the
+/// per-row LargeBinary encoding path in `value_to_single_row_array` (the
+/// column carrying the bare-node Value through cross-join) end-to-end —
+/// the schema-merge bug used to fail this with "expected LargeBinary but
+/// found Utf8".
+///
+/// Note: a SET-then-RETURN-in-subquery variant (`WITH n SET n.x = 99
+/// RETURN n` then outer `RETURN n.x`) currently surfaces the stale
+/// pre-SET row binding, not the post-SET value. That is a separate
+/// stale-row-binding workstream (the writes DO land — see l2m); the
+/// schema-merge fix in this round does not address it.
+#[tokio::test]
+async fn l2o_call_subquery_return_created_node_round_trips() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("E")
+        .property("id", DataType::String)
+        .property_nullable("x", DataType::Int64)
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:E {id: 'seed'})").await?;
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    let res = tx
+        .query(
+            "MATCH (n:E {id: 'seed'}) \
+             CALL { CREATE (m:E {id: 'fresh', x: 99}) RETURN m } \
+             RETURN m.x AS x",
+        )
+        .await?;
+    tx.commit().await?;
+
+    assert_eq!(
+        res.rows()[0].get::<i64>("x").unwrap(),
+        99,
+        "outer projection over subquery's RETURN m did not surface created node's x"
     );
     Ok(())
 }

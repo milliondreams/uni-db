@@ -840,7 +840,31 @@ fn value_to_single_row_array(val: &Value, data_type: &DataType) -> DFResult<Arra
         DataType::Float64 => single_row_array(Float64Builder::with_capacity(1), val.as_f64()),
         DataType::Boolean => single_row_array(BooleanBuilder::with_capacity(1), val.as_bool()),
         DataType::Null => Arc::new(arrow_array::NullArray::new(1)) as ArrayRef,
+        DataType::LargeBinary => {
+            let mut b = arrow_array::builder::LargeBinaryBuilder::with_capacity(1, 64);
+            if val.is_null() {
+                b.append_null();
+            } else {
+                let cv_bytes = uni_common::cypher_value_codec::encode(val);
+                b.append_value(&cv_bytes);
+            }
+            Arc::new(b.finish()) as ArrayRef
+        }
+        DataType::Utf8 => {
+            let mut b = StringBuilder::with_capacity(1, 64);
+            match val {
+                Value::Null => b.append_null(),
+                Value::String(s) => b.append_value(s),
+                other => b.append_value(format!("{other}")),
+            }
+            Arc::new(b.finish()) as ArrayRef
+        }
         _ => {
+            debug_assert!(
+                false,
+                "value_to_single_row_array: unhandled DataType {:?} — mirror the arm in rows_to_batch",
+                data_type
+            );
             let mut b = StringBuilder::with_capacity(1, 64);
             match val {
                 Value::Null => b.append_null(),

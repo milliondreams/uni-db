@@ -7,6 +7,7 @@ pub mod cypher_merge_actions;
 pub mod cypher_merge_optional_regression;
 pub mod cypher_remove;
 pub mod cypher_set_advanced;
+pub mod defer_embeddings_test;
 pub mod delete_vertex_test;
 pub mod df_mutation_test;
 pub mod mutation_stress_test;

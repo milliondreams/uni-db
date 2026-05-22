@@ -2,6 +2,7 @@
 // Copyright 2024-2026 Dragonscale Team
 
 use super::core::*;
+use crate::query::df_graph::mutation_common::Prefetch;
 use crate::query::planner::LogicalPlan;
 use anyhow::{Result, anyhow};
 use std::collections::{HashMap, HashSet};
@@ -171,6 +172,7 @@ impl Executor {
         params: &HashMap<String, Value>,
         ctx: Option<&QueryContext>,
         tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
+        prefetched: &Prefetch,
     ) -> Result<()> {
         // Clone the target so we can hold &row references elsewhere.
         let target = row.get(variable).cloned();
@@ -179,10 +181,13 @@ impl Executor {
             Some(Value::Node(ref node)) => {
                 let vid = node.vid;
                 let labels = node.labels.clone();
-                let current = prop_manager
-                    .get_all_vertex_props_with_ctx(vid, ctx)
-                    .await?
-                    .unwrap_or_default();
+                let current = read_vertex_props_with_prefetch(
+                    vid,
+                    prefetched,
+                    prop_manager,
+                    ctx,
+                )
+                .await?;
                 let write_props = Self::merge_props(current, new_props, replace);
                 let mut enriched = write_props.clone();
                 for label_name in &labels {
@@ -206,10 +211,13 @@ impl Executor {
             Some(ref node_val) if Self::vid_from_value(node_val).is_ok() => {
                 let vid = Self::vid_from_value(node_val)?;
                 let labels = Self::extract_labels_from_node(node_val).unwrap_or_default();
-                let current = prop_manager
-                    .get_all_vertex_props_with_ctx(vid, ctx)
-                    .await?
-                    .unwrap_or_default();
+                let current = read_vertex_props_with_prefetch(
+                    vid,
+                    prefetched,
+                    prop_manager,
+                    ctx,
+                )
+                .await?;
                 let write_props = Self::merge_props(current, new_props, replace);
                 let mut enriched = write_props.clone();
                 for label_name in &labels {
@@ -244,10 +252,8 @@ impl Executor {
                 let src = edge.src;
                 let dst = edge.dst;
                 let etype = self.resolve_edge_type_id(&Value::String(edge.edge_type.clone()))?;
-                let current = prop_manager
-                    .get_all_edge_props_with_ctx(eid, ctx)
-                    .await?
-                    .unwrap_or_default();
+                let current =
+                    read_edge_props_with_prefetch(eid, prefetched, prop_manager, ctx).await?;
                 let write_props = Self::merge_props(current, new_props, replace);
                 writer
                     .insert_edge(
@@ -274,10 +280,8 @@ impl Executor {
                     && map.contains_key("_dst") =>
             {
                 let ei = self.extract_edge_identity(map)?;
-                let current = prop_manager
-                    .get_all_edge_props_with_ctx(ei.eid, ctx)
-                    .await?
-                    .unwrap_or_default();
+                let current =
+                    read_edge_props_with_prefetch(ei.eid, prefetched, prop_manager, ctx).await?;
                 let write_props = Self::merge_props(current, new_props, replace);
                 let edge_type_name = map
                     .get("_type")
@@ -1436,6 +1440,7 @@ impl Executor {
                         params,
                         ctx,
                         tx_l0_override,
+                        &Prefetch::default(),
                     )
                     .await
                 } else {
@@ -1465,6 +1470,7 @@ impl Executor {
                                     params,
                                     ctx,
                                     tx_l0_override,
+                                    &Prefetch::default(),
                                 )
                                 .await?;
                             }
@@ -1491,6 +1497,7 @@ impl Executor {
                                 params,
                                 ctx,
                                 tx_l0_override,
+                                &Prefetch::default(),
                             )
                             .await?;
                         }
@@ -1791,6 +1798,7 @@ impl Executor {
         params: &HashMap<String, Value>,
         ctx: Option<&QueryContext>,
         tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
+        prefetched: &Prefetch,
     ) -> Result<()> {
         // Coalesce SetItem::Property items by target so we do ONE read + ONE
         // write per (variable, target) instead of one read-modify-write cycle
@@ -1811,6 +1819,7 @@ impl Executor {
         // common and have lower payoff; before processing one, we flush any
         // pending updates for the same variable so it sees the latest L0
         // state and ordering semantics are preserved.
+        let outer_t = std::time::Instant::now();
         let mut pending_v: HashMap<String, PendingVertexSet> = HashMap::new();
         let mut pending_e: HashMap<String, PendingEdgeSet> = HashMap::new();
 
@@ -1844,10 +1853,17 @@ impl Executor {
                             if !pending_v.contains_key(var_name) {
                                 let storage_cfg = &self.storage.config;
                                 let partial = storage_cfg.partial_lance_writes;
-                                let read = prop_manager
-                                    .get_all_vertex_props_with_ctx(vid, ctx)
-                                    .await?
-                                    .unwrap_or_default();
+                                let t_read = std::time::Instant::now();
+                                let read = read_vertex_props_with_prefetch(
+                                    vid,
+                                    prefetched,
+                                    prop_manager,
+                                    ctx,
+                                )
+                                .await?;
+                                uni_store::runtime::writer::phase3_outer_add_read_ns(
+                                    t_read.elapsed().as_nanos() as u64,
+                                );
                                 pending_v.insert(
                                     var_name.clone(),
                                     PendingVertexSet {
@@ -1860,10 +1876,18 @@ impl Executor {
                                 );
                             }
 
+                            let t_eval = std::time::Instant::now();
                             let val = self
                                 .evaluate_expr(value, row, prop_manager, params, ctx)
                                 .await?;
+                            uni_store::runtime::writer::phase3_outer_add_eval_ns(
+                                t_eval.elapsed().as_nanos() as u64,
+                            );
+                            let t_val = std::time::Instant::now();
                             Self::validate_property_value(prop_name, &val, &schema, &labels)?;
+                            uni_store::runtime::writer::phase3_outer_add_val_ns(
+                                t_val.elapsed().as_nanos() as u64,
+                            );
 
                             let pv = pending_v
                                 .get_mut(var_name)
@@ -1901,10 +1925,13 @@ impl Executor {
                             };
 
                             if !pending_e.contains_key(var_name) {
-                                let initial = prop_manager
-                                    .get_all_edge_props_with_ctx(ei.eid, ctx)
-                                    .await?
-                                    .unwrap_or_default();
+                                let initial = read_edge_props_with_prefetch(
+                                    ei.eid,
+                                    prefetched,
+                                    prop_manager,
+                                    ctx,
+                                )
+                                .await?;
                                 let partial = self.storage.config.partial_lance_writes;
                                 pending_e.insert(
                                     var_name.clone(),
@@ -1956,10 +1983,13 @@ impl Executor {
                             let schema = self.storage.schema_manager().schema().clone();
 
                             if !pending_e.contains_key(var_name) {
-                                let initial = prop_manager
-                                    .get_all_edge_props_with_ctx(eid, ctx)
-                                    .await?
-                                    .unwrap_or_default();
+                                let initial = read_edge_props_with_prefetch(
+                                    eid,
+                                    prefetched,
+                                    prop_manager,
+                                    ctx,
+                                )
+                                .await?;
                                 let partial = self.storage.config.partial_lance_writes;
                                 pending_e.insert(
                                     var_name.clone(),
@@ -2014,6 +2044,7 @@ impl Executor {
                         params,
                         ctx,
                         tx_l0,
+                        prefetched,
                     )
                     .await?;
 
@@ -2062,6 +2093,7 @@ impl Executor {
                         params,
                         ctx,
                         tx_l0,
+                        prefetched,
                     )
                     .await?;
 
@@ -2094,6 +2126,7 @@ impl Executor {
                         params,
                         ctx,
                         tx_l0,
+                        prefetched,
                     )
                     .await?;
                 }
@@ -2115,6 +2148,7 @@ impl Executor {
                 // Idempotent — generators always recompute against the
                 // post-merge property map.
                 let pre_keys: HashSet<String> = pv.props.keys().cloned().collect();
+                let t_enrich = std::time::Instant::now();
                 for label_name in &pv.labels {
                     self.enrich_properties_with_generated_columns(
                         label_name,
@@ -2125,15 +2159,23 @@ impl Executor {
                     )
                     .await?;
                 }
+                uni_store::runtime::writer::phase3_outer_add_enrich_ns(
+                    t_enrich.elapsed().as_nanos() as u64,
+                );
                 for k in pv.props.keys() {
                     if !pre_keys.contains(k) || self.is_generated_key(&pv.labels, k) {
                         pv.touched.insert(k.clone());
                     }
                 }
+                let t_wc = std::time::Instant::now();
                 writer
                     .insert_vertex_partial_full(pv.vid, pv.props, pv.touched, &pv.labels, tx_l0)
                     .await?;
+                uni_store::runtime::writer::phase3_outer_add_writer_call_ns(
+                    t_wc.elapsed().as_nanos() as u64,
+                );
             } else {
+                let t_enrich = std::time::Instant::now();
                 for label_name in &pv.labels {
                     self.enrich_properties_with_generated_columns(
                         label_name,
@@ -2144,9 +2186,16 @@ impl Executor {
                     )
                     .await?;
                 }
+                uni_store::runtime::writer::phase3_outer_add_enrich_ns(
+                    t_enrich.elapsed().as_nanos() as u64,
+                );
+                let t_wc = std::time::Instant::now();
                 let _ = writer
                     .insert_vertex_with_labels(pv.vid, pv.props, &pv.labels, tx_l0)
                     .await?;
+                uni_store::runtime::writer::phase3_outer_add_writer_call_ns(
+                    t_wc.elapsed().as_nanos() as u64,
+                );
             }
         }
         for (_var_name, pe) in pending_e {
@@ -2178,6 +2227,9 @@ impl Executor {
             }
         }
 
+        uni_store::runtime::writer::phase3_outer_finish_row(
+            outer_t.elapsed().as_nanos() as u64,
+        );
         Ok(())
     }
 
@@ -2197,6 +2249,7 @@ impl Executor {
         _params: &HashMap<String, Value>,
         ctx: Option<&QueryContext>,
         tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
+        _prefetched: &Prefetch,
     ) -> Result<()> {
         if let Some(mut pv) = pending_v.remove(var) {
             if pv.partial {
@@ -2273,6 +2326,7 @@ impl Executor {
     /// we read from storage once, null all specified properties, and write back
     /// once. This prevents the second removal from reading stale data that
     /// doesn't reflect the first removal's L0 write.
+    #[expect(clippy::too_many_arguments)]
     pub(crate) async fn execute_remove_items_locked(
         &self,
         items: &[RemoveItem],
@@ -2281,6 +2335,7 @@ impl Executor {
         prop_manager: &PropertyManager,
         ctx: Option<&QueryContext>,
         tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
+        prefetched: &Prefetch,
     ) -> Result<()> {
         // Collect property names to remove, grouped by variable.
         // Use Vec<(String, Vec<String>)> to preserve insertion order.
@@ -2313,10 +2368,13 @@ impl Executor {
 
             if let Ok(vid) = Self::vid_from_value(node_val) {
                 // Vertex property removal
-                let mut props = prop_manager
-                    .get_all_vertex_props_with_ctx(vid, ctx)
-                    .await?
-                    .unwrap_or_default();
+                let mut props = read_vertex_props_with_prefetch(
+                    vid,
+                    prefetched,
+                    prop_manager,
+                    ctx,
+                )
+                .await?;
 
                 // Only write back if at least one property actually exists
                 let removed_count = prop_names
@@ -2357,10 +2415,9 @@ impl Executor {
                 let mut edge_effective: Option<HashMap<String, Value>> = None;
                 if map.get("_eid").is_some_and(|v| !v.is_null()) {
                     let ei = self.extract_edge_identity(map)?;
-                    let mut props = prop_manager
-                        .get_all_edge_props_with_ctx(ei.eid, ctx)
-                        .await?
-                        .unwrap_or_default();
+                    let mut props =
+                        read_edge_props_with_prefetch(ei.eid, prefetched, prop_manager, ctx)
+                            .await?;
 
                     let removed_count = prop_names
                         .iter()
@@ -2420,10 +2477,8 @@ impl Executor {
                 let dst = edge.dst;
                 let etype = self.resolve_edge_type_id(&Value::String(edge.edge_type.clone()))?;
 
-                let mut props = prop_manager
-                    .get_all_edge_props_with_ctx(eid, ctx)
-                    .await?
-                    .unwrap_or_default();
+                let mut props =
+                    read_edge_props_with_prefetch(eid, prefetched, prop_manager, ctx).await?;
 
                 let removed_count = prop_names
                     .iter()
@@ -3409,6 +3464,70 @@ impl Executor {
             }
             _ => None,
         }
+    }
+}
+
+/// Read a vertex's full property map, preferring `prefetched` over a fresh
+/// per-row `Backend::scan`.
+///
+/// `prefetched` is built once at the top of `apply_mutations` via
+/// `prefetch_set_targets` / `prefetch_remove_targets` (mutation_common.rs).
+/// On a hit, we layer in L0 from `ctx` so writes from earlier rows of the
+/// same `apply_mutations` invocation (counter increments, same-VID
+/// duplicates from UNWIND) take precedence — the prefetch only snapshots
+/// storage state at SET entry. On a miss, fall back to the existing
+/// per-row path; this preserves correctness for newly created VIDs,
+/// schemaless rows, multi-label corner cases, and non-Mutation callers
+/// that pass `&Prefetch::default()`.
+pub(crate) async fn read_vertex_props_with_prefetch(
+    vid: Vid,
+    prefetched: &Prefetch,
+    prop_manager: &PropertyManager,
+    ctx: Option<&QueryContext>,
+) -> Result<uni_common::Properties> {
+    match prefetched.vertex.get(&vid).cloned() {
+        Some(mut base) => {
+            if let Some(l0) =
+                uni_store::runtime::l0_visibility::accumulate_vertex_props(vid, ctx)
+            {
+                for (k, v) in l0 {
+                    base.insert(k, v);
+                }
+            }
+            Ok(base)
+        }
+        None => Ok(prop_manager
+            .get_all_vertex_props_with_ctx(vid, ctx)
+            .await?
+            .unwrap_or_default()),
+    }
+}
+
+/// Edge equivalent of [`read_vertex_props_with_prefetch`]. On a hit, layer
+/// in L0 edge props so writes from earlier rows of the same
+/// `apply_mutations` invocation take precedence. On a miss, fall back to
+/// the per-EID storage path.
+pub(crate) async fn read_edge_props_with_prefetch(
+    eid: Eid,
+    prefetched: &Prefetch,
+    prop_manager: &PropertyManager,
+    ctx: Option<&QueryContext>,
+) -> Result<uni_common::Properties> {
+    match prefetched.edge.get(&eid).cloned() {
+        Some(mut base) => {
+            if let Some(l0) =
+                uni_store::runtime::l0_visibility::accumulate_edge_props(eid, ctx)
+            {
+                for (k, v) in l0 {
+                    base.insert(k, v);
+                }
+            }
+            Ok(base)
+        }
+        None => Ok(prop_manager
+            .get_all_edge_props_with_ctx(eid, ctx)
+            .await?
+            .unwrap_or_default()),
     }
 }
 

@@ -149,6 +149,13 @@ pub struct L0Buffer {
     /// columns plus `eid`, `op`, `_version`, `_updated_at`, and
     /// `overflow_json` (when an overflow prop was touched).
     pub edge_partial_keys: HashMap<Eid, HashSet<String>>,
+    /// Phase B (UniConfig::defer_embeddings): VIDs whose auto-embedding
+    /// was skipped at insert time and is owed at flush. Value = primary
+    /// label name (the rest of the embedding config is looked up from the
+    /// schema at flush time). Drained by `flush_stream_l1` before column
+    /// extraction; entries are removed when the embedding lands in the
+    /// vertex's L0 property map.
+    pub pending_embeddings: HashMap<Vid, String>,
 }
 
 impl std::fmt::Debug for L0Buffer {
@@ -195,6 +202,7 @@ impl Clone for L0Buffer {
             constraint_index: self.constraint_index.clone(),
             vertex_partial_keys: self.vertex_partial_keys.clone(),
             edge_partial_keys: self.edge_partial_keys.clone(),
+            pending_embeddings: self.pending_embeddings.clone(),
         }
     }
 }
@@ -353,6 +361,7 @@ impl L0Buffer {
             constraint_index: HashMap::new(),
             vertex_partial_keys: HashMap::new(),
             edge_partial_keys: HashMap::new(),
+            pending_embeddings: HashMap::new(),
         }
     }
 

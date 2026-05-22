@@ -1120,6 +1120,183 @@ impl PropertyManager {
         Ok(result)
     }
 
+    /// Batch-fetch properties for multiple edges of a known type.
+    ///
+    /// Mirrors `get_batch_vertex_props_for_label` (above) for the edge path.
+    /// Issues one `eid IN (...)` scan against the delta table for the edge
+    /// type, replaying per-EID version history (op-replay + CRDT merge) the
+    /// same way `fetch_all_edge_props_from_storage_with_hint` does. Far
+    /// faster than per-edge `get_all_edge_props_with_ctx` when many edges
+    /// of the same type need loading (e.g., batched SET/REMOVE on edges
+    /// matched by a MATCH).
+    ///
+    /// EIDs of deleted edges or those with no rows in delta storage are
+    /// omitted from the returned map; callers can fall back to the per-EID
+    /// path for misses.
+    pub async fn get_batch_edge_props_for_type(
+        &self,
+        eids: &[Eid],
+        type_name: &str,
+        ctx: Option<&QueryContext>,
+    ) -> Result<HashMap<Eid, Properties>> {
+        use crate::backend::table_names;
+        use crate::backend::types::ScanRequest;
+
+        let mut result: HashMap<Eid, Properties> = HashMap::new();
+        if eids.is_empty() {
+            return Ok(result);
+        }
+
+        // Phase 1: L0 check per EID. Skip deleted; serve from L0 if it has
+        // an accumulated property set; otherwise note for storage scan.
+        let mut need_storage: Vec<Eid> = Vec::new();
+        for &eid in eids {
+            if l0_visibility::is_edge_deleted(eid, ctx) {
+                continue;
+            }
+            let l0_props = l0_visibility::accumulate_edge_props(eid, ctx);
+            // Edge L0 semantics: even an empty accumulator means "edge exists
+            // in L0 with no user props yet" — we still go to storage to pick
+            // up the persisted full row (mirrors get_all_edge_props_with_ctx).
+            if let Some(props) = l0_props {
+                result.insert(eid, props);
+            }
+            need_storage.push(eid);
+        }
+
+        if need_storage.is_empty() {
+            return Ok(result);
+        }
+
+        // Phase 2: One scan with `eid IN (...)` on the delta table.
+        let schema = self.schema_manager.schema();
+        let type_props = schema.properties.get(type_name);
+
+        if self.storage.delta_dataset(type_name, "fwd").is_err() {
+            return Ok(result);
+        }
+
+        let table_name = table_names::delta_table_name(type_name, "fwd");
+        let backend = self.storage.backend();
+        if !backend.table_exists(&table_name).await.unwrap_or(false) {
+            return Ok(result);
+        }
+
+        let eid_list: String = need_storage
+            .iter()
+            .map(|e| e.as_u64().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let base_filter = format!("eid IN ({})", eid_list);
+        let filter_expr = self.storage.apply_version_filter(base_filter);
+
+        let batches = match backend
+            .scan(ScanRequest::all(&table_name).with_filter(filter_expr))
+            .await
+        {
+            Ok(b) => b,
+            Err(_) => return Ok(result), // Storage error: per-row fallback handles correctness
+        };
+
+        // Collect (eid, version, op, props) tuples, then group + replay per EID.
+        let mut per_eid_rows: HashMap<Eid, Vec<(u64, u8, Properties)>> = HashMap::new();
+        for batch in batches {
+            let eid_col = match batch
+                .column_by_name("eid")
+                .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+            {
+                Some(c) => c,
+                None => continue,
+            };
+            let op_col = match batch
+                .column_by_name("op")
+                .and_then(|c| c.as_any().downcast_ref::<arrow_array::UInt8Array>())
+            {
+                Some(c) => c,
+                None => continue,
+            };
+            let ver_col = match batch
+                .column_by_name("_version")
+                .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+            {
+                Some(c) => c,
+                None => continue,
+            };
+
+            for row in 0..batch.num_rows() {
+                let eid = Eid::from(eid_col.value(row));
+                let ver = ver_col.value(row);
+                let op = op_col.value(row);
+                let mut props = Properties::new();
+
+                if op != 1
+                    && let Some(tp) = type_props
+                {
+                    for (p_name, p_meta) in tp {
+                        if let Some(col) = batch.column_by_name(p_name)
+                            && !col.is_null(row)
+                        {
+                            let val =
+                                Self::value_from_column(col.as_ref(), &p_meta.r#type, row)?;
+                            props.insert(p_name.clone(), val);
+                        }
+                    }
+                }
+                per_eid_rows.entry(eid).or_default().push((ver, op, props));
+            }
+        }
+
+        for (eid, mut rows) in per_eid_rows {
+            rows.sort_by_key(|(ver, _, _)| *ver);
+
+            let mut merged_props: Properties = Properties::new();
+            let mut is_deleted = false;
+
+            for (_, op, props) in rows {
+                if op == 1 {
+                    is_deleted = true;
+                    merged_props.clear();
+                } else {
+                    is_deleted = false;
+                    for (p_name, p_val) in props {
+                        let is_crdt = type_props
+                            .and_then(|tp| tp.get(&p_name))
+                            .map(|pm| matches!(pm.r#type, DataType::Crdt(_)))
+                            .unwrap_or(false);
+                        if is_crdt {
+                            if let Some(existing) = merged_props.get(&p_name) {
+                                if let Ok(merged) = self.merge_crdt_values(existing, &p_val) {
+                                    merged_props.insert(p_name, merged);
+                                }
+                            } else {
+                                merged_props.insert(p_name, p_val);
+                            }
+                        } else {
+                            merged_props.insert(p_name, p_val);
+                        }
+                    }
+                }
+            }
+
+            if is_deleted {
+                // Deleted in storage; remove any L0 accumulation that may
+                // have been recorded under this EID by Phase 1 (matches
+                // is_edge_deleted single-EID semantics).
+                result.remove(&eid);
+                continue;
+            }
+
+            // L0 takes precedence over storage for shared keys; insert
+            // storage values only where L0 did not already provide them.
+            let entry = result.entry(eid).or_default();
+            for (k, v) in merged_props {
+                entry.entry(k).or_insert(v);
+            }
+        }
+
+        Ok(result)
+    }
+
     /// Normalize CRDT properties by converting JSON strings to JSON objects.
     /// This handles the case where CRDT values come from Cypher CREATE statements
     /// as `Value::String("{\"t\": \"gc\", ...}")` and need to be parsed into objects.
@@ -1308,6 +1485,8 @@ impl PropertyManager {
     async fn fetch_all_props_from_storage(&self, vid: Vid) -> Result<Option<Properties>> {
         // In the new storage model, VID doesn't embed label info.
         // We need to scan all label datasets to find the vertex's properties.
+        let fetch_t = std::time::Instant::now();
+        let mut scan_ns_total: u64 = 0;
         let schema = self.schema_manager.schema();
         let mut merged_props: Option<Properties> = None;
         let mut global_best_version: Option<u64> = None;
@@ -1341,7 +1520,8 @@ impl PropertyManager {
             let filter_expr = self.storage.apply_version_filter(base_filter);
 
             let table_name = crate::backend::table_names::vertex_table_name(label_name);
-            let batches: Vec<RecordBatch> = match self
+            let scan_t = std::time::Instant::now();
+            let scan_result = self
                 .storage
                 .backend()
                 .scan(
@@ -1349,8 +1529,9 @@ impl PropertyManager {
                         .with_filter(&filter_expr)
                         .with_columns(columns.clone()),
                 )
-                .await
-            {
+                .await;
+            scan_ns_total += scan_t.elapsed().as_nanos() as u64;
+            let batches: Vec<RecordBatch> = match scan_result {
                 Ok(b) => b,
                 Err(_) => continue,
             };
@@ -1416,9 +1597,19 @@ impl PropertyManager {
             )
             .await?
         {
+            let total_ns = fetch_t.elapsed().as_nanos() as u64;
+            crate::runtime::writer::phase3_fetch_record(
+                scan_ns_total,
+                total_ns.saturating_sub(scan_ns_total),
+            );
             return Ok(Some(main_props));
         }
 
+        let total_ns = fetch_t.elapsed().as_nanos() as u64;
+        crate::runtime::writer::phase3_fetch_record(
+            scan_ns_total,
+            total_ns.saturating_sub(scan_ns_total),
+        );
         Ok(merged_props)
     }
 

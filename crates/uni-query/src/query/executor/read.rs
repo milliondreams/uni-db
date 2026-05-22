@@ -2888,12 +2888,21 @@ impl Executor {
                     params,
                     ctx,
                     tx_l0,
+                    &crate::query::df_graph::mutation_common::Prefetch::default(),
                 )
                 .await?;
             }
             LogicalPlan::Remove { items, .. } => {
-                self.execute_remove_items_locked(&items, scope, writer, prop_manager, ctx, tx_l0)
-                    .await?;
+                self.execute_remove_items_locked(
+                    &items,
+                    scope,
+                    writer,
+                    prop_manager,
+                    ctx,
+                    tx_l0,
+                    &crate::query::df_graph::mutation_common::Prefetch::default(),
+                )
+                .await?;
             }
             LogicalPlan::Delete { items, detach, .. } => {
                 for expr in &items {
@@ -2955,6 +2964,7 @@ impl Executor {
                         params,
                         ctx,
                         tx_l0,
+                        &crate::query::df_graph::mutation_common::Prefetch::default(),
                     )
                     .await?;
                 }
@@ -5320,6 +5330,51 @@ impl Executor {
         Ok(())
     }
 
+    /// Load outgoing + incoming subgraphs (1-hop) for a batch of vertices
+    /// in two scans — one per direction. Shared infrastructure for
+    /// `batch_detach_delete_vertices` (which deletes the loaded edges) and
+    /// `batch_check_vertices_have_no_edges` (which errors if any
+    /// non-tombstoned edges exist).
+    ///
+    /// Returns raw `WorkingGraph`s with **no tombstone filtering**;
+    /// callers that care about same-batch edge deletes (e.g., the
+    /// non-detach check that runs after edges have been individually
+    /// DELETEd) layer the filter on top.
+    async fn batch_load_incident_edges(
+        &self,
+        vids: &[Vid],
+        writer: &Writer,
+    ) -> Result<(
+        uni_store::runtime::working_graph::WorkingGraph,
+        uni_store::runtime::working_graph::WorkingGraph,
+    )> {
+        let schema = self.storage.schema_manager().schema();
+        let edge_type_ids: Vec<u32> = schema.all_edge_type_ids();
+        let l0 = Some(writer.l0_manager.get_current());
+
+        let out_graph = self
+            .storage
+            .load_subgraph_cached(
+                vids,
+                &edge_type_ids,
+                1,
+                uni_store::runtime::Direction::Outgoing,
+                l0.clone(),
+            )
+            .await?;
+        let in_graph = self
+            .storage
+            .load_subgraph_cached(
+                vids,
+                &edge_type_ids,
+                1,
+                uni_store::runtime::Direction::Incoming,
+                l0,
+            )
+            .await?;
+        Ok((out_graph, in_graph))
+    }
+
     /// Batch detach-delete: load subgraphs for all VIDs at once, then delete edges and vertices.
     pub(crate) async fn batch_detach_delete_vertices(
         &self,
@@ -5328,50 +5383,79 @@ impl Executor {
         writer: &Writer,
         tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
     ) -> Result<()> {
-        let schema = self.storage.schema_manager().schema();
-        let edge_type_ids: Vec<u32> = schema.all_edge_type_ids();
-
-        // Load outgoing subgraph for all VIDs in one call.
-        let out_graph = self
-            .storage
-            .load_subgraph_cached(
-                vids,
-                &edge_type_ids,
-                1,
-                uni_store::runtime::Direction::Outgoing,
-                Some(writer.l0_manager.get_current()),
-            )
-            .await?;
+        let (out_graph, in_graph) = self.batch_load_incident_edges(vids, writer).await?;
 
         for edge in out_graph.edges() {
             writer
                 .delete_edge(edge.eid, edge.src_vid, edge.dst_vid, edge.edge_type, tx_l0)
                 .await?;
         }
-
-        // Load incoming subgraph for all VIDs in one call.
-        let in_graph = self
-            .storage
-            .load_subgraph_cached(
-                vids,
-                &edge_type_ids,
-                1,
-                uni_store::runtime::Direction::Incoming,
-                Some(writer.l0_manager.get_current()),
-            )
-            .await?;
-
         for edge in in_graph.edges() {
             writer
                 .delete_edge(edge.eid, edge.src_vid, edge.dst_vid, edge.edge_type, tx_l0)
                 .await?;
         }
 
-        // Delete all vertices.
         for (vid, labels) in vids.iter().zip(labels_per_vid) {
             writer.delete_vertex(*vid, labels, tx_l0).await?;
         }
 
+        Ok(())
+    }
+
+    /// Batch non-detach DELETE check: verify NO incident edges exist for
+    /// any VID in `vids`, modulo tombstones from the writer's L0 and the
+    /// tx-local L0 (same set the per-VID `check_vertex_has_no_edges`
+    /// consults at write.rs:2650-2673).
+    ///
+    /// Why this exists: the per-VID `check_vertex_has_no_edges` does two
+    /// `load_subgraph_cached(&[vid], ...)` calls per vertex (outgoing +
+    /// incoming). At N vertices that's 2N subgraph loads. The batched
+    /// path collapses to 2 loads regardless of N.
+    ///
+    /// Tombstone visibility: detach (which deletes everything) doesn't
+    /// need the tombstone filter; non-detach does, because the caller
+    /// may have already DELETEd some incident edges in the same
+    /// statement (e.g. `MATCH (a)-[r]->(b) DELETE r, a` — edges are
+    /// deleted before nodes per mutation_common.rs:720-724, so by the
+    /// time this check runs, `r`'s eid is in `tx_l0.tombstones` and
+    /// must be excluded from the "still has edges" set).
+    pub(crate) async fn batch_check_vertices_have_no_edges(
+        &self,
+        vids: &[Vid],
+        writer: &Writer,
+        tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
+    ) -> Result<()> {
+        if vids.is_empty() {
+            return Ok(());
+        }
+
+        let mut tombstoned_eids: std::collections::HashSet<uni_common::core::id::Eid> =
+            std::collections::HashSet::new();
+        {
+            let writer_l0 = writer.l0_manager.get_current();
+            let guard = writer_l0.read();
+            for &eid in guard.tombstones.keys() {
+                tombstoned_eids.insert(eid);
+            }
+        }
+        if let Some(tx) = tx_l0 {
+            let guard = tx.read();
+            for &eid in guard.tombstones.keys() {
+                tombstoned_eids.insert(eid);
+            }
+        }
+
+        let (out_graph, in_graph) = self.batch_load_incident_edges(vids, writer).await?;
+
+        for edge in out_graph.edges().chain(in_graph.edges()) {
+            if !tombstoned_eids.contains(&edge.eid) {
+                return Err(anyhow!(
+                    "ConstraintVerificationFailed: DeleteConnectedNode - Cannot delete node {}, because it still has relationships. To delete the node and its relationships, use DETACH DELETE.",
+                    edge.src_vid
+                ));
+            }
+        }
         Ok(())
     }
 }

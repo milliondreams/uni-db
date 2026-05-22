@@ -25,9 +25,10 @@ use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
-use uni_common::core::id::Vid;
-use uni_common::{Path, Value};
+use uni_common::core::id::{Eid, Vid};
+use uni_common::{Path, Properties, Value};
 use uni_cypher::ast::{Expr, Pattern, PatternElement, RemoveItem, SetClause, SetItem};
+use uni_store::QueryContext;
 use uni_store::runtime::property_manager::PropertyManager;
 use uni_store::runtime::writer::Writer;
 use uni_store::storage::arrow_convert;
@@ -97,6 +98,222 @@ pub enum MutationKind {
         on_match: Option<SetClause>,
         on_create: Option<SetClause>,
     },
+}
+
+/// Pre-fetched property maps for SET/REMOVE mutation rows.
+///
+/// Built once at the top of `apply_mutations` for `MutationKind::Set` and
+/// `MutationKind::Remove` (see `prefetch_set_targets`, `prefetch_remove_targets`).
+/// Replaces N per-row `get_all_vertex_props_with_ctx` calls (each ~716 µs of
+/// DataFusion+Lance setup) with a single `_vid IN (...)` scan amortized
+/// across all rows.
+///
+/// Per-row read sites in `execute_set_items_locked`,
+/// `apply_properties_to_entity`, `flush_pending_var`, and
+/// `execute_remove_items_locked` look up the VID/EID here first and fall
+/// back to the per-row call if absent — preserving correctness for newly
+/// created VIDs, schemaless rows, and non-Mutation callers.
+#[derive(Default, Debug)]
+pub(crate) struct Prefetch {
+    pub vertex: HashMap<Vid, Properties>,
+    pub edge: HashMap<Eid, Properties>,
+}
+
+/// Extract `(label, vid)` pairs and `(type_name, eid)` pairs that a SET
+/// clause will touch, batch-fetch them, return a [`Prefetch`] map.
+///
+/// Walks `rows` once to dedupe by VID/EID per label/type. Issues one
+/// `get_batch_vertex_props_for_label` per distinct vertex label. Edge
+/// prefetch is a no-op for now (Phase A.1 only covers vertices; the
+/// fallback path in execute_set_items_locked keeps edge SET correct).
+pub(crate) async fn prefetch_set_targets(
+    items: &[SetItem],
+    rows: &[HashMap<String, Value>],
+    pm: &PropertyManager,
+    ctx: Option<&QueryContext>,
+) -> Result<Prefetch> {
+    // 1. Collect vertex-targeted variable names from SET items.
+    let touched_vars: HashSet<&str> = items
+        .iter()
+        .filter_map(|item| match item {
+            SetItem::Property { expr, .. } => extract_var_from_property_expr(expr),
+            SetItem::Variable { variable, .. } | SetItem::VariablePlus { variable, .. } => {
+                Some(variable.as_str())
+            }
+            SetItem::Labels { .. } => None,
+        })
+        .collect();
+    if touched_vars.is_empty() {
+        return Ok(Prefetch::default());
+    }
+
+    collect_and_fetch_vertex_prefetch(&touched_vars, rows, pm, ctx).await
+}
+
+/// Same shape as [`prefetch_set_targets`] for REMOVE clauses.
+pub(crate) async fn prefetch_remove_targets(
+    items: &[RemoveItem],
+    rows: &[HashMap<String, Value>],
+    pm: &PropertyManager,
+    ctx: Option<&QueryContext>,
+) -> Result<Prefetch> {
+    let touched_vars: HashSet<&str> = items
+        .iter()
+        .filter_map(|item| match item {
+            RemoveItem::Property(expr) => extract_var_from_property_expr(expr),
+            RemoveItem::Labels { .. } => None,
+        })
+        .collect();
+    if touched_vars.is_empty() {
+        return Ok(Prefetch::default());
+    }
+
+    collect_and_fetch_vertex_prefetch(&touched_vars, rows, pm, ctx).await
+}
+
+/// Inspect a property-access expr (e.g. `n.prop` or `n[expr]`) and return
+/// the root variable name if it's a plain `Variable("n").Property("prop")`.
+fn extract_var_from_property_expr(expr: &Expr) -> Option<&str> {
+    if let Expr::Property(inner, _) = expr
+        && let Expr::Variable(name) = inner.as_ref()
+    {
+        return Some(name.as_str());
+    }
+    None
+}
+
+/// Group VIDs/EIDs by their primary label / edge type across `rows`,
+/// issue one batched fetch per group, merge results into a [`Prefetch`].
+///
+/// Schemaless rows / rows without a label or type fall through to the
+/// per-row fallback at the fetch site. Per-row bindings are inspected
+/// once; a variable bound to a vertex in some rows and an edge in
+/// others (rare; e.g., from union) is grouped under each kind it
+/// appears as.
+async fn collect_and_fetch_vertex_prefetch(
+    touched_vars: &HashSet<&str>,
+    rows: &[HashMap<String, Value>],
+    pm: &PropertyManager,
+    ctx: Option<&QueryContext>,
+) -> Result<Prefetch> {
+    let mut by_label: HashMap<String, HashSet<Vid>> = HashMap::new();
+    let mut by_type: HashMap<String, HashSet<Eid>> = HashMap::new();
+
+    for row in rows {
+        for &var in touched_vars {
+            let Some(bound) = row.get(var) else { continue };
+            if let Some((vid, labels)) = vertex_vid_and_labels(bound) {
+                if let Some(label) = labels.first() {
+                    by_label.entry(label.clone()).or_default().insert(vid);
+                }
+            } else if let Some((eid, type_name)) = edge_eid_and_type(bound) {
+                if !type_name.is_empty() {
+                    by_type.entry(type_name).or_default().insert(eid);
+                }
+            }
+        }
+    }
+
+    let mut prefetch = Prefetch::default();
+    for (label, vid_set) in by_label {
+        let vids: Vec<Vid> = vid_set.into_iter().collect();
+        if vids.is_empty() {
+            continue;
+        }
+        if let Ok(label_results) = pm.get_batch_vertex_props_for_label(&vids, &label, ctx).await
+        {
+            for (vid, props) in label_results {
+                prefetch.vertex.entry(vid).or_insert(props);
+            }
+        }
+        // Batch errors fall through to per-row fallback (correctness preserved).
+    }
+    for (type_name, eid_set) in by_type {
+        let eids: Vec<Eid> = eid_set.into_iter().collect();
+        if eids.is_empty() {
+            continue;
+        }
+        if let Ok(type_results) = pm
+            .get_batch_edge_props_for_type(&eids, &type_name, ctx)
+            .await
+        {
+            for (eid, props) in type_results {
+                prefetch.edge.entry(eid).or_insert(props);
+            }
+        }
+    }
+    Ok(prefetch)
+}
+
+/// Extract (vid, labels) from a bound vertex value (`Value::Node` or a
+/// `Value::Map` that has the `_vid`/`_labels` shape produced by the
+/// planner). Returns `None` for edges, paths, scalars, or untyped maps.
+fn vertex_vid_and_labels(val: &Value) -> Option<(Vid, Vec<String>)> {
+    match val {
+        Value::Node(node) => Some((node.vid, node.labels.clone())),
+        Value::Map(map) => {
+            if map.contains_key("_eid") {
+                return None;
+            }
+            let vid_val = map.get("_vid")?;
+            let vid = match vid_val {
+                Value::Int(i) if *i >= 0 => Vid::from(*i as u64),
+                _ => return None,
+            };
+            let labels = map
+                .get("_labels")
+                .and_then(|v| match v {
+                    Value::List(items) => Some(
+                        items
+                            .iter()
+                            .filter_map(|x| {
+                                if let Value::String(s) = x {
+                                    Some(s.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            Some((vid, labels))
+        }
+        _ => None,
+    }
+}
+
+/// Extract (eid, type_name) from a bound edge value. Mirrors
+/// [`vertex_vid_and_labels`] for the edge case. The type name is
+/// resolved from `_type_name` (string) or `_type` (string) on map-encoded
+/// edges, and from `Value::Edge::edge_type` on typed edges.
+fn edge_eid_and_type(val: &Value) -> Option<(Eid, String)> {
+    match val {
+        Value::Edge(edge) => Some((edge.eid, edge.edge_type.clone())),
+        Value::Map(map) => {
+            // Must be edge-shaped: _eid, _src, _dst.
+            let eid_val = map.get("_eid")?;
+            if !map.contains_key("_src") || !map.contains_key("_dst") {
+                return None;
+            }
+            let eid = match eid_val {
+                Value::Int(i) if *i >= 0 => Eid::from(*i as u64),
+                Value::Null => return None,
+                _ => return None,
+            };
+            let type_name = map
+                .get("_type_name")
+                .or_else(|| map.get("_type"))
+                .and_then(|v| match v {
+                    Value::String(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            Some((eid, type_name))
+        }
+        _ => None,
+    }
 }
 
 /// Convert RecordBatches to row-based HashMaps for mutation processing.
@@ -690,17 +907,27 @@ async fn apply_mutations(
             }
         }
         MutationKind::Set { items } => {
+            let prefetch = prefetch_set_targets(items, rows, pm, ctx)
+                .await
+                .map_err(|e| df_err("SET prefetch failed", e))?;
             for row in rows.iter_mut() {
-                exec.execute_set_items_locked(items, row, writer, pm, params, ctx, tx_l0)
-                    .await
-                    .map_err(|e| df_err("SET failed", e))?;
+                exec.execute_set_items_locked(
+                    items, row, writer, pm, params, ctx, tx_l0, &prefetch,
+                )
+                .await
+                .map_err(|e| df_err("SET failed", e))?;
             }
         }
         MutationKind::Remove { items } => {
+            let prefetch = prefetch_remove_targets(items, rows, pm, ctx)
+                .await
+                .map_err(|e| df_err("REMOVE prefetch failed", e))?;
             for row in rows.iter_mut() {
-                exec.execute_remove_items_locked(items, row, writer, pm, ctx, tx_l0)
-                    .await
-                    .map_err(|e| df_err("REMOVE failed", e))?;
+                exec.execute_remove_items_locked(
+                    items, row, writer, pm, ctx, tx_l0, &prefetch,
+                )
+                .await
+                .map_err(|e| df_err("REMOVE failed", e))?;
             }
         }
         MutationKind::Delete { items, detach } => {
@@ -730,8 +957,21 @@ async fn apply_mutations(
                     .await
                     .map_err(|e| df_err("DETACH DELETE failed", e))?;
             } else {
+                // Non-detach: one batched edge-dependency check across all
+                // targets (Phase C — collapses N per-VID subgraph loads to
+                // one), then the per-VID writer.delete_vertex calls
+                // (cheap; no scan).
+                let vids: Vec<Vid> = collector
+                    .node_entries
+                    .iter()
+                    .map(|(v, _)| *v)
+                    .collect();
+                exec.batch_check_vertices_have_no_edges(&vids, writer, tx_l0)
+                    .await
+                    .map_err(|e| df_err("DELETE check failed", e))?;
                 for (vid, labels) in &collector.node_entries {
-                    exec.execute_delete_vertex(*vid, false, labels.clone(), writer, tx_l0)
+                    writer
+                        .delete_vertex(*vid, labels.clone(), tx_l0)
                         .await
                         .map_err(|e| df_err("DELETE node failed", e))?;
                 }

@@ -497,6 +497,23 @@ pub struct UniConfig {
     /// Round-11 plan section in `plan-and-implement-a-valiant-flame.md`.
     pub partial_lance_writes: bool,
 
+    /// When true, auto-embedding for vertex writes is deferred from the
+    /// per-row `insert_vertex_*` path to the next L1 flush, where the
+    /// existing `process_embeddings_for_batch` issues one model call for
+    /// the whole flush batch instead of N per-row calls.
+    ///
+    /// Trade-off: in-tx reads of the embedding column on a freshly
+    /// SET/inserted vertex see the OLD storage value (or no value, for
+    /// new vertices) until flush. Existing behavior is identical to
+    /// today's `process_embeddings_impl(target_prop present)` short-circuit
+    /// (writer.rs:2727) — updating only the source text never refreshes
+    /// the embedding mid-tx, deferred or not. Opt-in for workloads that
+    /// don't read embeddings between write and commit.
+    ///
+    /// Default: `false` (preserves bit-for-bit compatibility with
+    /// pre-Phase-B releases).
+    pub defer_embeddings: bool,
+
     /// Per-fork L1 fragment-count threshold above which a `tracing::warn!`
     /// fires once per crossing during fork flush. Long-lived heavy-write
     /// forks accumulate fragments because fork compaction is deferred to
@@ -604,6 +621,7 @@ impl Default for UniConfig {
             index_rebuild: IndexRebuildConfig::default(),
             strict_schema: false,
             partial_lance_writes: false,
+            defer_embeddings: false,
             fork_fragment_warn_threshold: 256,
             tx_id_reservoir_batch: 16,
             // Default ON as of the Item-B-deep-fix landing (per-table

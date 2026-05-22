@@ -3219,29 +3219,71 @@ impl HybridPhysicalPlanner {
         // returns None for any combination where the unwind variable isn't
         // actually defined by an UNWIND in the requested subtree.
         // See issue #55 PR #4.
+        // Diagnostic for UNWIND IN-list pushdown gating. Enable with:
+        //   RUST_LOG=uni_query::cross_join_in_pushdown=debug
+        // If `equi_pairs=0` → the predicate didn't classify as an equi-join
+        // and the optimization can't fire (look at `classify_join_predicate`).
+        // If `equi_pairs>0` and the per-pair "extracted=N" line never appears →
+        // `build_in_pushdown` is rejecting every shape (likely the unwind/scan
+        // side patterns or `materialize_unwind_source*` returning None).
+        tracing::debug!(
+            target: "uni_query::cross_join_in_pushdown",
+            equi_pairs = cls.equi_pairs.len(),
+            left_only = cls.left_only.len(),
+            right_only = cls.right_only.len(),
+            has_residual = cls.residual.is_some(),
+            "try_plan_cross_join_as_hash_join: classified predicate"
+        );
+
         let mut left_extra_in: Vec<Expr> = Vec::new();
         let mut right_extra_in: Vec<Expr> = Vec::new();
         for (l_expr, r_expr) in &cls.equi_pairs {
             // l_expr's variable unwound in left subtree → push IN onto right.
             if let Some(in_filter) = build_in_pushdown(l_expr, r_expr, left, &self.params) {
+                tracing::debug!(
+                    target: "uni_query::cross_join_in_pushdown",
+                    side = "left→right",
+                    "build_in_pushdown succeeded"
+                );
                 right_extra_in.push(in_filter);
                 continue;
             }
             // r_expr's variable unwound in left subtree → push IN onto right.
             if let Some(in_filter) = build_in_pushdown(r_expr, l_expr, left, &self.params) {
+                tracing::debug!(
+                    target: "uni_query::cross_join_in_pushdown",
+                    side = "left→right (swapped)",
+                    "build_in_pushdown succeeded"
+                );
                 right_extra_in.push(in_filter);
                 continue;
             }
             // l_expr's variable unwound in right subtree → push IN onto left.
             if let Some(in_filter) = build_in_pushdown(l_expr, r_expr, right, &self.params) {
+                tracing::debug!(
+                    target: "uni_query::cross_join_in_pushdown",
+                    side = "right→left",
+                    "build_in_pushdown succeeded"
+                );
                 left_extra_in.push(in_filter);
                 continue;
             }
             // r_expr's variable unwound in right subtree → push IN onto left.
             if let Some(in_filter) = build_in_pushdown(r_expr, l_expr, right, &self.params) {
+                tracing::debug!(
+                    target: "uni_query::cross_join_in_pushdown",
+                    side = "right→left (swapped)",
+                    "build_in_pushdown succeeded"
+                );
                 left_extra_in.push(in_filter);
             }
         }
+        tracing::debug!(
+            target: "uni_query::cross_join_in_pushdown",
+            left_in_filters = left_extra_in.len(),
+            right_in_filters = right_extra_in.len(),
+            "try_plan_cross_join_as_hash_join: IN-pushdown result"
+        );
 
         // Push left/right-only conjuncts (and any IN filters from the UNWIND
         // pre-pass) into the respective subtree as a Filter wrapper.
@@ -6556,18 +6598,43 @@ fn build_in_pushdown(
         Expr::Variable(v) => (v.as_str(), None),
         Expr::Property(box_var, f) => match box_var.as_ref() {
             Expr::Variable(v) => (v.as_str(), Some(f.as_str())),
-            _ => return None,
+            _ => {
+                tracing::debug!(
+                    target: "uni_query::cross_join_in_pushdown",
+                    reason = "unwind side Property inner is not Variable",
+                    "build_in_pushdown rejected"
+                );
+                return None;
+            }
         },
-        _ => return None,
+        _ => {
+            tracing::debug!(
+                target: "uni_query::cross_join_in_pushdown",
+                reason = "unwind side is not Variable or Property",
+                unwind_kind = std::any::type_name_of_val(&unwind_side_expr),
+                "build_in_pushdown rejected"
+            );
+            return None;
+        }
     };
 
     // Scan side must be `Property(Variable(_), _)` so that `is_pushable`
     // (which accepts `Property(Variable(scan_var), prop)` on the LHS of an IN)
     // will push the filter into the scan.
     let Expr::Property(scan_box_var, _scan_field) = scan_side_expr else {
+        tracing::debug!(
+            target: "uni_query::cross_join_in_pushdown",
+            reason = "scan side is not Property",
+            "build_in_pushdown rejected"
+        );
         return None;
     };
     if !matches!(scan_box_var.as_ref(), Expr::Variable(_)) {
+        tracing::debug!(
+            target: "uni_query::cross_join_in_pushdown",
+            reason = "scan side Property inner is not Variable",
+            "build_in_pushdown rejected"
+        );
         return None;
     }
 
@@ -6576,13 +6643,58 @@ fn build_in_pushdown(
     //   * `UNWIND $list AS e ... = e.field`     → list of maps at $list,
     //                                              project `field` per element
     let values = match field {
-        None => extract_static_unwind_values(unwind_subplan, unwind_var, params)?,
-        Some(f) => extract_static_unwind_field_values(unwind_subplan, unwind_var, f, params)?,
+        None => match extract_static_unwind_values(unwind_subplan, unwind_var, params) {
+            Some(v) => v,
+            None => {
+                tracing::debug!(
+                    target: "uni_query::cross_join_in_pushdown",
+                    reason = "extract_static_unwind_values returned None",
+                    unwind_var,
+                    "build_in_pushdown rejected"
+                );
+                return None;
+            }
+        },
+        Some(f) => match extract_static_unwind_field_values(
+            unwind_subplan,
+            unwind_var,
+            f,
+            params,
+        ) {
+            Some(v) => v,
+            None => {
+                tracing::debug!(
+                    target: "uni_query::cross_join_in_pushdown",
+                    reason = "extract_static_unwind_field_values returned None \
+                              (UNWIND source is not Expr::Parameter, or param is not \
+                              Value::List<Value::Map>, or a map element lacks field, \
+                              or list size exceeded MAX_UNWIND_IN_PUSHDOWN_VALUES)",
+                    unwind_var,
+                    field = f,
+                    "build_in_pushdown rejected"
+                );
+                return None;
+            }
+        },
     };
     if values.is_empty() {
+        tracing::debug!(
+            target: "uni_query::cross_join_in_pushdown",
+            reason = "extracted value list is empty",
+            unwind_var,
+            ?field,
+            "build_in_pushdown rejected"
+        );
         return None;
     }
 
+    tracing::debug!(
+        target: "uni_query::cross_join_in_pushdown",
+        unwind_var,
+        ?field,
+        values_count = values.len(),
+        "build_in_pushdown extracted IN-list"
+    );
     Some(Expr::In {
         expr: Box::new(scan_side_expr.clone()),
         list: Box::new(Expr::List(values)),

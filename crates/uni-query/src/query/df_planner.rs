@@ -1769,18 +1769,55 @@ impl HybridPhysicalPlanner {
         // 2. Infer subquery output schema from logical plan + UniSchema metadata
         let sub_schema = infer_logical_plan_schema(subquery, &self.schema);
 
-        // 3. Merge schemas: input fields + subquery fields (skip duplicates by name)
-        let mut fields: Vec<Arc<arrow_schema::Field>> = input_schema.fields().to_vec();
-        let input_field_names: HashSet<&str> = input_schema
+        // 3. Merge schemas: subquery fields override input fields with the
+        //    same name. The subquery's RETURN list is authoritative for the
+        //    names it lists, which is what `CALL { WITH n SET n.x = ...
+        //    RETURN n }` semantically requires — the outer plan must see the
+        //    post-SET `n`, not the pre-SET copy carried through from the
+        //    correlated input. For correlated subqueries that don't re-emit
+        //    an imported variable (EXISTS, COUNT, non-SET CALLs), there is no
+        //    name collision and behavior is unchanged.
+        let sub_field_names: HashSet<&str> = sub_schema
             .fields()
             .iter()
             .map(|f| f.name().as_str())
             .collect();
-        for field in sub_schema.fields() {
-            if !input_field_names.contains(field.name().as_str()) {
-                fields.push(field.clone());
-            }
-        }
+        // Input columns whose name collides with a subquery RETURN field are
+        // dropped (sub wins). Dotted columns (`v.prop`) whose base variable
+        // `v` is overridden by the subquery are kept in the schema (so the
+        // expr compiler resolves `v.prop` via the flat-column path) but at
+        // data-fill time they're refreshed from the post-SET bare `v` Map
+        // in the subquery output. See `append_cross_join_row` /
+        // `kept_input_overrides`.
+        let kept_input_indices: Vec<usize> = input_schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| !sub_field_names.contains(f.name().as_str()))
+            .map(|(i, _)| i)
+            .collect();
+        // For each kept input column, pre-compute whether it should be
+        // sourced from the subquery's bare entity Map instead of the input
+        // batch. Some((var, prop)) means refresh `var.prop` from
+        // `sub_row[var]`; None means slice from input as usual.
+        let kept_input_overrides: Vec<Option<(String, String)>> = kept_input_indices
+            .iter()
+            .map(|&i| {
+                let name = input_schema.field(i).name();
+                if let Some(dot) = name.find('.') {
+                    let base = &name[..dot];
+                    if sub_field_names.contains(base) {
+                        return Some((base.to_string(), name[dot + 1..].to_string()));
+                    }
+                }
+                None
+            })
+            .collect();
+        let mut fields: Vec<Arc<arrow_schema::Field>> = kept_input_indices
+            .iter()
+            .map(|&i| input_schema.fields()[i].clone())
+            .collect();
+        fields.extend(sub_schema.fields().iter().cloned());
         let output_schema: SchemaRef = Arc::new(Schema::new(fields));
 
         Ok(Arc::new(GraphApplyExec::new(
@@ -1793,6 +1830,8 @@ impl HybridPhysicalPlanner {
             self.schema.clone(),
             self.params.clone(),
             output_schema,
+            kept_input_indices,
+            kept_input_overrides,
             self.mutation_ctx.clone(),
         )))
     }

@@ -1937,12 +1937,6 @@ async fn l2m_call_subquery_write_visible_to_later_read_in_tx() -> Result<()> {
 /// column carrying the bare-node Value through cross-join) end-to-end —
 /// the schema-merge bug used to fail this with "expected LargeBinary but
 /// found Utf8".
-///
-/// Note: a SET-then-RETURN-in-subquery variant (`WITH n SET n.x = 99
-/// RETURN n` then outer `RETURN n.x`) currently surfaces the stale
-/// pre-SET row binding, not the post-SET value. That is a separate
-/// stale-row-binding workstream (the writes DO land — see l2m); the
-/// schema-merge fix in this round does not address it.
 #[tokio::test]
 async fn l2o_call_subquery_return_created_node_round_trips() -> Result<()> {
     let db = Uni::in_memory().build().await?;
@@ -1972,6 +1966,157 @@ async fn l2o_call_subquery_return_created_node_round_trips() -> Result<()> {
         res.rows()[0].get::<i64>("x").unwrap(),
         99,
         "outer projection over subquery's RETURN m did not surface created node's x"
+    );
+    Ok(())
+}
+
+/// L2q — `CALL { WITH n SET n.x = 99 RETURN n }` then outer `RETURN n.x`
+/// must surface the post-SET value. Round 9 regression: previously the
+/// Apply schema merge kept the outer (pre-SET) `n` column and dropped the
+/// subquery's RETURN `n`, so outer projections saw stale data.
+#[tokio::test]
+async fn l2q_call_subquery_set_then_return_round_trips() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("E")
+        .property("id", DataType::String)
+        .property_nullable("x", DataType::Int64)
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:E {id: 'e1', x: 0})").await?;
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    let res = tx
+        .query(
+            "MATCH (n:E {id: 'e1'}) \
+             CALL { WITH n SET n.x = 99 RETURN n } \
+             RETURN n.x AS x",
+        )
+        .await?;
+    tx.commit().await?;
+
+    assert_eq!(
+        res.rows()[0].get::<i64>("x").unwrap(),
+        99,
+        "outer RETURN n.x surfaced pre-SET row binding"
+    );
+    Ok(())
+}
+
+/// L2r — coalesced two-property SET inside a CALL subquery, surfaced via
+/// outer dotted projections. Exercises Round-3 coalescing + Round-9
+/// Apply-boundary override in concert.
+#[tokio::test]
+async fn l2r_call_subquery_set_two_props_then_return() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("E")
+        .property("id", DataType::String)
+        .property_nullable("x", DataType::Int64)
+        .property_nullable("y", DataType::String)
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:E {id: 'e1', x: 0, y: 'old'})").await?;
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    let res = tx
+        .query(
+            "MATCH (n:E {id: 'e1'}) \
+             CALL { WITH n SET n.x = 7, n.y = 'fresh' RETURN n } \
+             RETURN n.x AS x, n.y AS y",
+        )
+        .await?;
+    tx.commit().await?;
+
+    let row = &res.rows()[0];
+    assert_eq!(row.get::<i64>("x").unwrap(), 7);
+    assert_eq!(row.get::<String>("y").unwrap(), "fresh");
+    Ok(())
+}
+
+/// L2s — edge SET inside a CALL subquery, surfaced via outer projection.
+#[tokio::test]
+async fn l2s_call_subquery_set_edge_then_return() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("N")
+        .property("id", DataType::String)
+        .done()
+        .edge_type("LINKS", &["N"], &["N"])
+        .property_nullable("flag", DataType::Bool)
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (a:N {id: 'a'})-[:LINKS {flag: false}]->(b:N {id: 'b'})")
+        .await?;
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    let res = tx
+        .query(
+            "MATCH (a:N)-[r:LINKS]->(b:N) \
+             CALL { WITH r SET r.flag = true RETURN r } \
+             RETURN r.flag AS flag",
+        )
+        .await?;
+    tx.commit().await?;
+
+    let val = res.rows()[0].value("flag").unwrap();
+    assert!(
+        matches!(val, Value::Bool(true)),
+        "outer RETURN r.flag did not surface post-SET edge value: {val:?}"
+    );
+    Ok(())
+}
+
+/// L2t — `CALL { WITH n SET n.x = 5 }` with NO inner RETURN, then outer
+/// `RETURN n.x`. Cypher's "unit subquery" semantics say input rows should
+/// pass through unchanged when a CALL subquery omits RETURN. Today the
+/// Apply boundary applies inner-join semantics against the zero-row
+/// subquery output and drops the input row entirely, so outer projections
+/// produce nothing. This is a distinct bug from the Round-9 stale-binding
+/// fix (which targets the SET→RETURN refresh path) and lives outside its
+/// scope. Marked ignored until that follow-up lands.
+#[ignore = "Round 9 follow-up: CALL { ... } without inner RETURN should pass input rows through (unit subquery semantics); currently drops them via Apply inner-join"]
+#[tokio::test]
+async fn l2t_call_subquery_set_no_inner_return_outer_sees_writes() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("E")
+        .property("id", DataType::String)
+        .property_nullable("x", DataType::Int64)
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:E {id: 'e1', x: 0})").await?;
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    let res = tx
+        .query(
+            "MATCH (n:E {id: 'e1'}) \
+             CALL { WITH n SET n.x = 5 } \
+             RETURN n.x AS x",
+        )
+        .await?;
+    tx.commit().await?;
+
+    assert_eq!(
+        res.rows()[0].get::<i64>("x").unwrap(),
+        5,
+        "outer RETURN n.x did not see write from CALL subquery without inner RETURN"
     );
     Ok(())
 }

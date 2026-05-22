@@ -296,6 +296,156 @@ async fn t8_partial_set_then_delete() -> Result<()> {
     Ok(())
 }
 
+/// C1 — Generated column recomputes when a partial SET changes the
+/// underlying property. Schema has a generated `_gen_LOWER_email`
+/// derived from `lower(email)`; SET email under flag-on; read back:
+/// generated column reflects the new lower-cased value.
+#[tokio::test]
+async fn c1_partial_set_with_generated_column_recomputes() -> Result<()> {
+    use uni_common::UniConfig;
+    let cfg = UniConfig {
+        partial_lance_writes: true,
+        ..UniConfig::default()
+    };
+    let db = Uni::in_memory().config(cfg).build().await?;
+
+    // Set up schema + expression index via DDL (creates the generated
+    // column automatically).
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL User (id STRING, email STRING)").await?;
+    tx.execute("CREATE INDEX lower_email FOR (u:User) ON (lower(u.email))")
+        .await?;
+    tx.commit().await?;
+
+    let gen_col = uni_db::core::schema::SchemaManager::generated_column_name("lower(email)");
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:User {id: 'u1', email: 'Alice@Example.com'})").await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    // Sanity: generated column populated from CREATE.
+    let r0 = db
+        .session()
+        .query(&format!(
+            "MATCH (u:User {{id: 'u1'}}) RETURN u.email AS e, u.{gen_col} AS g"
+        ))
+        .await?;
+    assert_eq!(
+        r0.rows()[0].get::<String>("g").unwrap(),
+        "alice@example.com"
+    );
+
+    // Partial-flag SET on email: generator must recompute.
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (u:User {id: 'u1'}) SET u.email = 'BOB@example.com'")
+        .await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    let r1 = db
+        .session()
+        .query(&format!(
+            "MATCH (u:User {{id: 'u1'}}) RETURN u.email AS e, u.{gen_col} AS g"
+        ))
+        .await?;
+    assert_eq!(r1.rows()[0].get::<String>("e").unwrap(), "BOB@example.com");
+    assert_eq!(
+        r1.rows()[0].get::<String>("g").unwrap(),
+        "bob@example.com",
+        "generated column did not recompute under partial flush"
+    );
+    Ok(())
+}
+
+/// C2 — Generated column depends on `email`. SET an UNRELATED
+/// property; the generator harmlessly recomputes against the unchanged
+/// `email`, producing the same value (idempotency check).
+#[tokio::test]
+async fn c2_partial_set_untouched_generator_dependency() -> Result<()> {
+    use uni_common::UniConfig;
+    let cfg = UniConfig {
+        partial_lance_writes: true,
+        ..UniConfig::default()
+    };
+    let db = Uni::in_memory().config(cfg).build().await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL Person (id STRING, email STRING, age INT)")
+        .await?;
+    tx.execute("CREATE INDEX lower_email FOR (p:Person) ON (lower(p.email))")
+        .await?;
+    tx.commit().await?;
+    let gen_col = uni_db::core::schema::SchemaManager::generated_column_name("lower(email)");
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Person {id: 'p1', email: 'Carol@x.com', age: 30})")
+        .await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    // SET an unrelated column (age).
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (p:Person {id: 'p1'}) SET p.age = 31").await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    let r = db
+        .session()
+        .query(&format!(
+            "MATCH (p:Person {{id: 'p1'}}) RETURN p.age AS a, p.email AS e, p.{gen_col} AS g"
+        ))
+        .await?;
+    assert_eq!(r.rows()[0].get::<i64>("a").unwrap(), 31);
+    assert_eq!(r.rows()[0].get::<String>("e").unwrap(), "Carol@x.com");
+    assert_eq!(r.rows()[0].get::<String>("g").unwrap(), "carol@x.com");
+    Ok(())
+}
+
+/// C3 — Two generators on the same label both recompute when their
+/// shared input is updated via a partial SET.
+#[tokio::test]
+async fn c3_partial_set_with_multiple_generators() -> Result<()> {
+    use uni_common::UniConfig;
+    let cfg = UniConfig {
+        partial_lance_writes: true,
+        ..UniConfig::default()
+    };
+    let db = Uni::in_memory().config(cfg).build().await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL Note (id STRING, body STRING)").await?;
+    tx.execute("CREATE INDEX lower_body FOR (n:Note) ON (lower(n.body))")
+        .await?;
+    tx.execute("CREATE INDEX upper_body FOR (n:Note) ON (upper(n.body))")
+        .await?;
+    tx.commit().await?;
+    let gen_lo = uni_db::core::schema::SchemaManager::generated_column_name("lower(body)");
+    let gen_up = uni_db::core::schema::SchemaManager::generated_column_name("upper(body)");
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Note {id: 'n1', body: 'Hello'})").await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (n:Note {id: 'n1'}) SET n.body = 'World'")
+        .await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    let r = db
+        .session()
+        .query(&format!(
+            "MATCH (n:Note {{id: 'n1'}}) RETURN n.body AS b, n.{gen_lo} AS lo, n.{gen_up} AS up"
+        ))
+        .await?;
+    assert_eq!(r.rows()[0].get::<String>("b").unwrap(), "World");
+    assert_eq!(r.rows()[0].get::<String>("lo").unwrap(), "world");
+    assert_eq!(r.rows()[0].get::<String>("up").unwrap(), "WORLD");
+    Ok(())
+}
+
 /// T9 — Cross-tx partial SETs accumulate: after the first SET, a
 /// follow-up SET on a different column merges correctly (the per-VID
 /// dirty-key set unions across transactions before the flush).

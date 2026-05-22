@@ -1098,6 +1098,23 @@ impl Executor {
         Ok(())
     }
 
+    /// True if `key` is a generated property on any of the given labels.
+    /// Used by the partial-write flush path (Round 12 §C) to decide
+    /// whether the property should be added to `touched_keys` so that
+    /// Lance MergeInsert sends the recomputed value.
+    fn is_generated_key(&self, labels: &[String], key: &str) -> bool {
+        let schema = self.storage.schema_manager().schema();
+        for label in labels {
+            if let Some(props_meta) = schema.properties.get(label)
+                && let Some(meta) = props_meta.get(key)
+                && meta.generation_expression.is_some()
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     pub(crate) async fn enrich_properties_with_generated_columns(
         &self,
         label_name: &str,
@@ -1810,23 +1827,15 @@ impl Executor {
                             // L0 holds the full row, scans see the full
                             // row, and Lance only receives the touched
                             // columns. Generated-column-bearing labels
-                            // pre-screen here too: their flush must take
-                            // the full Append path so generated columns
-                            // recompute correctly (no MergeInsert).
+                            // ride the partial path too (Round 12 §C):
+                            // `enrich_properties_with_generated_columns`
+                            // runs at flush time over the merged-in-L0
+                            // full row, and the produced generator keys
+                            // are appended to `touched` so they land in
+                            // the MergeInsert source.
                             if !pending_v.contains_key(var_name) {
                                 let storage_cfg = &self.storage.config;
-                                let label_has_generated = labels.iter().any(|l| {
-                                    schema
-                                        .properties
-                                        .get(l)
-                                        .map(|p| {
-                                            p.values()
-                                                .any(|m| m.generation_expression.is_some())
-                                        })
-                                        .unwrap_or(false)
-                                });
-                                let partial =
-                                    storage_cfg.partial_lance_writes && !label_has_generated;
+                                let partial = storage_cfg.partial_lance_writes;
                                 let read = prop_manager
                                     .get_all_vertex_props_with_ctx(vid, ctx)
                                     .await?
@@ -2080,6 +2089,27 @@ impl Executor {
         // generated-column enrichment.
         for (_var_name, mut pv) in pending_v {
             if pv.partial {
+                // Round 12 §C: run the generator enrichment over the
+                // merged-in-L0 full row, then add the produced generator
+                // keys to `touched` so they ride the MergeInsert source.
+                // Idempotent — generators always recompute against the
+                // post-merge property map.
+                let pre_keys: HashSet<String> = pv.props.keys().cloned().collect();
+                for label_name in &pv.labels {
+                    self.enrich_properties_with_generated_columns(
+                        label_name,
+                        &mut pv.props,
+                        prop_manager,
+                        params,
+                        ctx,
+                    )
+                    .await?;
+                }
+                for k in pv.props.keys() {
+                    if !pre_keys.contains(k) || self.is_generated_key(&pv.labels, k) {
+                        pv.touched.insert(k.clone());
+                    }
+                }
                 writer
                     .insert_vertex_partial_full(
                         pv.vid,
@@ -2141,6 +2171,22 @@ impl Executor {
     ) -> Result<()> {
         if let Some(mut pv) = pending_v.remove(var) {
             if pv.partial {
+                let pre_keys: HashSet<String> = pv.props.keys().cloned().collect();
+                for label_name in &pv.labels {
+                    self.enrich_properties_with_generated_columns(
+                        label_name,
+                        &mut pv.props,
+                        prop_manager,
+                        _params,
+                        ctx,
+                    )
+                    .await?;
+                }
+                for k in pv.props.keys() {
+                    if !pre_keys.contains(k) || self.is_generated_key(&pv.labels, k) {
+                        pv.touched.insert(k.clone());
+                    }
+                }
                 writer
                     .insert_vertex_partial_full(
                         pv.vid,

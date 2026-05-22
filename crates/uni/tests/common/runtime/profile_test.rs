@@ -651,6 +651,29 @@ async fn diag_72_set_scales_with_property_count() -> anyhow::Result<()> {
 /// locally if you want a tighter answer.
 #[tokio::test]
 async fn diag_72_set_data_scale_with_hnsw() -> anyhow::Result<()> {
+    diag_72_set_data_scale_with_hnsw_impl(false, "flag-OFF baseline").await
+}
+
+/// Sibling of `diag_72_set_data_scale_with_hnsw` with
+/// `UniConfig::partial_lance_writes` flipped to `true`. Round-11
+/// correctness check on the production-shape workload (verifies the
+/// flag-on path produces matching per-row medians within noise; the
+/// actual Lance-write win does not show up here because the cold
+/// microbench's per-row cost at this scale (~2.7 ms/row) is dominated
+/// by L0 / scan / HNSW maintenance rather than the wide-column write
+/// the flag eliminates. The production gap at 17.7 ms/row is where
+/// the savings land — measure on the live workload, not in this
+/// test).
+#[tokio::test]
+async fn diag_72_set_data_scale_with_hnsw_partial_lance() -> anyhow::Result<()> {
+    diag_72_set_data_scale_with_hnsw_impl(true, "flag-ON (partial Lance)").await
+}
+
+async fn diag_72_set_data_scale_with_hnsw_impl(
+    partial_lance_writes: bool,
+    label: &str,
+) -> anyhow::Result<()> {
+    use uni_common::UniConfig;
     use uni_db::DataType;
     use uni_db::api::schema::{IndexType, VectorAlgo, VectorIndexCfg, VectorMetric};
 
@@ -661,9 +684,15 @@ async fn diag_72_set_data_scale_with_hnsw() -> anyhow::Result<()> {
     const BATCH: usize = 3;
 
     let temp_dir = tempdir()?;
+    let cfg = UniConfig {
+        partial_lance_writes,
+        ..UniConfig::default()
+    };
     let db = UniBuilder::new(temp_dir.path().to_str().unwrap().to_string())
+        .config(cfg)
         .build()
         .await?;
+    println!("\n=== diag #72 {label} ===");
 
     // Schema = production shape: 11 cols, HnswSq vector index on a 768-dim
     // embedding column, no auto-embedding (we provide vectors directly).

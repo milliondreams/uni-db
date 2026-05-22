@@ -211,6 +211,60 @@ impl MainVertexDataset {
             .await
     }
 
+    /// Build a partial-column RecordBatch marking VIDs as deleted. Used
+    /// by the DELETE flush path to skip the wide-row tombstone Append.
+    /// Schema: `_vid`, `_deleted=true`, `_version`, `_updated_at`. Lance
+    /// MergeInsert leaves all other target columns untouched. See
+    /// `docs/proposals/partial_lance_writes.md` Round-12 §B.
+    pub fn build_tombstone_partial_batch(
+        tombstones: &[(Vid, u64)],
+        updated_at: Option<&HashMap<Vid, i64>>,
+    ) -> Result<RecordBatch> {
+        let fields = vec![
+            Field::new("_vid", DataType::UInt64, false),
+            Field::new("_deleted", DataType::Boolean, false),
+            Field::new("_version", DataType::UInt64, false),
+            Field::new(
+                "_updated_at",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                true,
+            ),
+        ];
+        let arrow_schema = Arc::new(ArrowSchema::new(fields));
+
+        let vids: Vec<u64> = tombstones.iter().map(|(v, _)| v.as_u64()).collect();
+        let deleted: Vec<bool> = vec![true; tombstones.len()];
+        let versions: Vec<u64> = tombstones.iter().map(|(_, v)| *v).collect();
+        let vids_iter = tombstones.iter().map(|(v, _)| *v);
+
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(UInt64Array::from(vids)),
+            Arc::new(BooleanArray::from(deleted)),
+            Arc::new(UInt64Array::from(versions)),
+            build_timestamp_column_from_vid_map(vids_iter, updated_at),
+        ];
+
+        RecordBatch::try_new(arrow_schema, columns).map_err(|e| anyhow!(e))
+    }
+
+    /// MergeInsert a tombstone-partial batch into the main vertices
+    /// table. Join key is `_vid`. Matched rows have `_deleted` flipped
+    /// to true; unmatched source rows are dropped (deleting a non-
+    /// existent VID is a logical no-op).
+    pub async fn merge_insert_tombstone_batch(
+        backend: &dyn StorageBackend,
+        batch: RecordBatch,
+    ) -> Result<()> {
+        let table_name = table_names::main_vertex_table_name();
+        crate::storage::manager::merge_insert_batch_with_lance_conflict_retry(
+            backend,
+            table_name,
+            batch,
+            &["_vid"],
+        )
+        .await
+    }
+
     /// Ensure default indexes exist on the main vertices table.
     ///
     /// Checks for existing indexes before creating to avoid expensive

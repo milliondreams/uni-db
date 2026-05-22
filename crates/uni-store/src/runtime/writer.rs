@@ -2679,6 +2679,12 @@ impl Writer {
         // can read each touched key's value.
         type PartialEntry = (Vid, Properties, u64, std::collections::HashSet<String>);
         let mut partial_by_label: HashMap<u16, Vec<PartialEntry>> = HashMap::new();
+        // DELETE-via-MergeInsert (Round-12 §B): tombstones flush as a
+        // partial source with just `_vid`, `_deleted=true`, `_version`,
+        // `_updated_at`. Skips the wide-row Append payload that adds
+        // nothing on a soft-delete.
+        let mut tombstones_by_label: HashMap<u16, Vec<(Vid, u64)>> = HashMap::new();
+        let mut main_vertex_tombstones: Vec<(Vid, u64)> = Vec::new();
         // Collect vertex timestamps from L0 for flushing to storage
         let mut vertex_created_at: HashMap<Vid, i64> = HashMap::new();
         let mut vertex_updated_at: HashMap<Vid, i64> = HashMap::new();
@@ -2812,15 +2818,23 @@ impl Writer {
             }
             for &vid in &old_l0.vertex_tombstones {
                 let version = old_l0.vertex_versions.get(&vid).copied().unwrap_or(0);
+                if let Some(&ts) = old_l0.vertex_updated_at.get(&vid) {
+                    vertex_updated_at.insert(vid, ts);
+                }
                 if let Some(labels) = old_l0.vertex_labels.get(&vid) {
-                    push_vertex_to_labels(
-                        vid,
-                        labels,
-                        HashMap::new(),
-                        true,
-                        version,
-                        &mut vertices_by_label,
-                    );
+                    // Round-12 §B: tombstones flush via Lance MergeInsert
+                    // (just `_vid`, `_deleted=true`, `_version`,
+                    // `_updated_at`) — skipping the wide-row Append.
+                    // Unconditional (no `partial_lance_writes` gating);
+                    // tombstone Append carries no useful payload.
+                    for label in labels {
+                        if let Some(label_id) = schema.label_id_by_name(label) {
+                            tombstones_by_label
+                                .entry(label_id)
+                                .or_default()
+                                .push((vid, version));
+                        }
+                    }
                 } else {
                     // Tombstone missing labels (old WAL format) - collect for storage query fallback
                     orphaned_tombstones.push((vid, version));
@@ -2840,13 +2854,11 @@ impl Writer {
                 {
                     for label in &labels {
                         if let Some(label_id) = schema.label_id_by_name(label) {
-                            vertices_by_label.entry(label_id).or_default().push((
-                                vid,
-                                labels.clone(),
-                                HashMap::new(),
-                                true,
-                                version,
-                            ));
+                            // Round-12 §B: route through partial tombstone too.
+                            tombstones_by_label
+                                .entry(label_id)
+                                .or_default()
+                                .push((vid, version));
                         }
                     }
                 }
@@ -2953,16 +2965,23 @@ impl Writer {
             let old_l0 = old_l0_arc.read();
             let mut vertices = Vec::new();
 
+            // Live vertices: full-row Append on the main table (the
+            // props_json blob is required for global ID lookups). For
+            // partial-row VIDs (vertex_partial_keys non-empty), the
+            // main table still needs the full props for the
+            // ext_id-uniqueness path; we keep the Append here. The
+            // per-label Lance write IS partial via MergeInsert.
             for (vid, props) in &old_l0.vertex_properties {
                 let version = old_l0.vertex_versions.get(vid).copied().unwrap_or(0);
                 let labels = old_l0.vertex_labels.get(vid).cloned().unwrap_or_default();
                 vertices.push((*vid, labels, props.clone(), false, version));
             }
 
+            // Tombstones: collected into `main_vertex_tombstones` for
+            // the MergeInsert path below; skipping the wide-row Append.
             for &vid in &old_l0.vertex_tombstones {
                 let version = old_l0.vertex_versions.get(&vid).copied().unwrap_or(0);
-                let labels = old_l0.vertex_labels.get(&vid).cloned().unwrap_or_default();
-                vertices.push((vid, labels, HashMap::new(), true, version));
+                main_vertex_tombstones.push((vid, version));
             }
 
             vertices
@@ -2975,6 +2994,21 @@ impl Writer {
                 Some(&vertex_updated_at),
             )?;
             MainVertexDataset::write_batch(self.storage.backend(), main_vertex_batch).await?;
+        }
+        // Round-12 §B: tombstones via MergeInsert on the main vertices
+        // table. Independent of `vertex_properties` length.
+        if !main_vertex_tombstones.is_empty() {
+            let tomb_batch = MainVertexDataset::build_tombstone_partial_batch(
+                &main_vertex_tombstones,
+                Some(&vertex_updated_at),
+            )?;
+            MainVertexDataset::merge_insert_tombstone_batch(
+                self.storage.backend(),
+                tomb_batch,
+            )
+            .await?;
+        }
+        if !main_vertices.is_empty() || !main_vertex_tombstones.is_empty() {
             MainVertexDataset::ensure_default_indexes(self.storage.backend()).await?;
         }
 
@@ -3034,6 +3068,7 @@ impl Writer {
         let all_label_ids: std::collections::HashSet<u16> = vertices_by_label
             .keys()
             .chain(partial_by_label.keys())
+            .chain(tombstones_by_label.keys())
             .copied()
             .collect();
         for label_id in all_label_ids {
@@ -3070,6 +3105,14 @@ impl Writer {
                                     added.insert(*vid, terms);
                                 }
                             }
+                        }
+                    }
+                    // Round-12 §B: tombstones no longer in `vertices`;
+                    // pull them from `tombstones_by_label` for inverted
+                    // index removal.
+                    if let Some(tomb_rows) = tombstones_by_label.get(&label_id) {
+                        for (vid, _) in tomb_rows {
+                            removed.insert(*vid);
                         }
                     }
 
@@ -3133,15 +3176,38 @@ impl Writer {
                 }
             }
 
+            // Tombstone batch (Round-12 §B): always MergeInsert with
+            // just `_vid`, `_deleted=true`, `_version`, `_updated_at`.
+            // No partial_lance_writes gating — tombstones never carry
+            // useful property payload to write. Captured tombstone vids
+            // also drive `remove_from_vid_labels_index` below.
+            let tombstone_rows = tombstones_by_label
+                .remove(&label_id)
+                .unwrap_or_default();
+            if !tombstone_rows.is_empty() {
+                let tomb_batch = ds.build_tombstone_partial_batch(
+                    &tombstone_rows,
+                    Some(&vertex_updated_at),
+                )?;
+                if tomb_batch.num_rows() > 0 {
+                    ds.merge_insert_batch(backend, tomb_batch).await?;
+                }
+            }
+
             ds.ensure_default_indexes(backend).await?;
 
-            // Update VidLabelsIndex (if enabled)
+            // Update VidLabelsIndex (if enabled). v_data carries live
+            // vertices; tombstone removals come from the
+            // `tombstone_rows` captured above the MergeInsert call.
             for ((vid, labels, _props), &deleted) in v_data.iter().zip(d_data.iter()) {
                 if deleted {
                     self.storage.remove_from_vid_labels_index(*vid);
                 } else {
                     self.storage.update_vid_labels_index(*vid, labels.clone());
                 }
+            }
+            for (vid, _) in &tombstone_rows {
+                self.storage.remove_from_vid_labels_index(*vid);
             }
 
             // Update Manifest

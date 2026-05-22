@@ -406,6 +406,42 @@ impl VertexDataset {
         .await
     }
 
+    /// Build a partial-column RecordBatch marking VIDs as deleted. Used
+    /// by the per-label DELETE flush path to skip the wide-row tombstone
+    /// Append. Schema mirrors
+    /// `MainVertexDataset::build_tombstone_partial_batch`.
+    pub fn build_tombstone_partial_batch(
+        &self,
+        tombstones: &[(Vid, u64)],
+        updated_at: Option<&HashMap<Vid, i64>>,
+    ) -> Result<RecordBatch> {
+        let fields = vec![
+            arrow_schema::Field::new("_vid", arrow_schema::DataType::UInt64, false),
+            arrow_schema::Field::new("_deleted", arrow_schema::DataType::Boolean, false),
+            arrow_schema::Field::new("_version", arrow_schema::DataType::UInt64, false),
+            arrow_schema::Field::new(
+                "_updated_at",
+                arrow_schema::DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                true,
+            ),
+        ];
+        let arrow_schema = Arc::new(ArrowSchema::new(fields));
+
+        let vids: Vec<u64> = tombstones.iter().map(|(v, _)| v.as_u64()).collect();
+        let deleted: Vec<bool> = vec![true; tombstones.len()];
+        let versions: Vec<u64> = tombstones.iter().map(|(_, v)| *v).collect();
+        let vids_iter = tombstones.iter().map(|(v, _)| *v);
+
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(UInt64Array::from(vids)),
+            Arc::new(BooleanArray::from(deleted)),
+            Arc::new(UInt64Array::from(versions)),
+            build_timestamp_column_from_vid_map(vids_iter, updated_at),
+        ];
+
+        RecordBatch::try_new(arrow_schema, columns).map_err(|e| anyhow!(e))
+    }
+
     /// Ensure default scalar indexes exist on system columns (_vid, _uid, ext_id).
     pub async fn ensure_default_indexes(&self, backend: &dyn StorageBackend) -> Result<()> {
         let table_name = table_names::vertex_table_name(&self.label);

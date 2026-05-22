@@ -413,19 +413,46 @@ impl L0Buffer {
         self.estimated_size += 8 + props_size + 16 + labels_size + 32;
     }
 
-    /// Insert a vertex's *partial* property set: only the keys present in
-    /// `touched` will land via Lance MergeInsert at flush time.
+    /// Insert a vertex's FULL property row, tagging `touched_keys` so the
+    /// flush emits exactly those columns via Lance `MergeInsertBuilder`
+    /// instead of a full-row Append.
     ///
-    /// Behavior mirrors `insert_vertex_with_labels` for L0 internal state
-    /// (CRDT merge, version bump, timestamps, labels, mutation stats) so
-    /// in-flight reads see the updated row exactly as they do today. The
-    /// only difference is that we also record `touched.keys()` into
-    /// `vertex_partial_keys[vid]` so the flush knows to emit a partial
-    /// MergeInsert batch instead of a full-row Append for this VID.
+    /// `props` MUST be the fully-merged property map (storage union
+    /// in-flight L0 union the new touched values, per
+    /// `PropertyManager::get_all_vertex_props_with_ctx`). The caller is
+    /// responsible for the union; L0 here just stores it so scans see
+    /// the complete row without per-key reconciliation.
     ///
-    /// A subsequent full-row `insert_vertex_with_labels` or `delete_vertex`
-    /// on the same VID clears the partial-key set, so partial state never
-    /// outlives a stronger write.
+    /// `touched_keys` lists the property keys this SET statement
+    /// actually assigned — the union of those across all coalesced
+    /// SetItems on this VID. Lance MergeInsert sends a source batch
+    /// with `_vid`, `_deleted`, `_version`, `_updated_at`, and those
+    /// touched columns; non-touched columns retain their pre-merge
+    /// values on the Lance side, skipping the wide-row write.
+    ///
+    /// A subsequent full-row `insert_vertex_with_labels` or
+    /// `delete_vertex` on the same VID clears the partial-keys entry
+    /// so partial state never outlives a stronger write.
+    pub fn insert_vertex_partial_full(
+        &mut self,
+        vid: Vid,
+        props: Properties,
+        touched_keys: HashSet<String>,
+        labels: &[String],
+    ) {
+        // Stage the full row through the existing partial-impl (same
+        // CRDT merge / version bump / timestamps), preserving the
+        // partial-keys entry so we can extend it below.
+        self.insert_vertex_with_labels_partial_impl(vid, props, labels, false);
+        self.vertex_partial_keys
+            .entry(vid)
+            .or_default()
+            .extend(touched_keys);
+    }
+
+    /// Legacy partial-only variant used by some uni-store paths. Kept
+    /// for source-compatibility but new uni-query callers should use
+    /// `insert_vertex_partial_full` to preserve scan-side L0 visibility.
     pub fn insert_vertex_partial(
         &mut self,
         vid: Vid,

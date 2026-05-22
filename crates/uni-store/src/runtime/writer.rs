@@ -87,6 +87,19 @@ struct RotateOutput {
     flush_in_progress_guard: FlushInProgressGuard,
 }
 
+/// Project a property map to a subset selected by `keys`. Used to
+/// run `touched_needs_full_read` against just the SET-touched keys
+/// when the caller passes a fully-merged `props` map.
+fn props_subset(props: &Properties, keys: &HashSet<String>) -> Properties {
+    let mut out = Properties::new();
+    for k in keys {
+        if let Some(v) = props.get(k) {
+            out.insert(k.clone(), v.clone());
+        }
+    }
+    out
+}
+
 /// Output of [`Writer::flush_stream_l1`]: the built (but not yet
 /// published) snapshot manifest and its id. Finalize is responsible
 /// for `save_snapshot` + `set_latest_snapshot` + `cached_manifest`
@@ -1796,6 +1809,56 @@ impl Writer {
             }
         }
         false
+    }
+
+    /// Insert a vertex's FULL property row plus a touched-keys hint so
+    /// the flush emits ONLY those columns via Lance MergeInsert.
+    ///
+    /// Caller must have read the full row (via PropertyManager) and
+    /// applied SET-touched values on top before calling — same input
+    /// shape as `insert_vertex_with_labels`. The new arg `touched_keys`
+    /// is the set of property keys this SET statement actually
+    /// assigned; L0 records it in `vertex_partial_keys[vid]` and the
+    /// flush filters the MergeInsert source schema down to those keys.
+    /// When `UniConfig::partial_lance_writes == false`, falls through
+    /// to `insert_vertex_with_labels` (Append) — preserving bit-for-bit
+    /// equivalence with prior releases.
+    #[instrument(skip(self, props, touched_keys, labels), level = "trace")]
+    pub async fn insert_vertex_partial_full(
+        &self,
+        vid: Vid,
+        mut props: Properties,
+        touched_keys: HashSet<String>,
+        labels: &[String],
+        tx_l0: Option<&Arc<RwLock<L0Buffer>>>,
+    ) -> Result<()> {
+        if !self.config.partial_lance_writes
+            || self.touched_needs_full_read(&props_subset(&props, &touched_keys), labels)
+        {
+            self.insert_vertex_with_labels(vid, props, labels, tx_l0)
+                .await?;
+            return Ok(());
+        }
+
+        self.check_write_pressure().await?;
+        self.check_transaction_memory(tx_l0)?;
+        self.process_embeddings_for_labels(labels, &mut props).await?;
+        // Full-row validation runs because we have the complete map;
+        // no need for the partial-only validator.
+        self.validate_vertex_constraints(vid, &props, labels, tx_l0)
+            .await?;
+        {
+            let l0 = self.resolve_l0(tx_l0);
+            let mut l0_guard = l0.write();
+            l0_guard.insert_vertex_partial_full(vid, props, touched_keys, labels);
+        }
+        metrics::counter!("uni_l0_buffer_mutations_total").increment(1);
+        metrics::counter!("uni_partial_writes_total").increment(1);
+        self.update_metrics();
+        if tx_l0.is_none() {
+            self.check_flush().await?;
+        }
+        Ok(())
     }
 
     /// Insert a vertex's *partial* property set without first reading the

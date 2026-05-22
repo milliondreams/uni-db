@@ -27,7 +27,6 @@ fn flag_on_config() -> UniConfig {
 /// production hot-path shape: wide schema with a vector column, SET
 /// touches only scalar columns, embedding stays intact and KNN still
 /// returns the queried row post-flush.
-#[ignore = "Stage 1 ships partial-write plumbing default-OFF. Flag-on requires read-path integration so scans union partial L0 entries with storage — separate workstream."]
 #[tokio::test]
 async fn t1_partial_set_preserves_embedding_and_other_columns() -> Result<()> {
     let db = Uni::in_memory().config(flag_on_config()).build().await?;
@@ -95,7 +94,12 @@ async fn t1_partial_set_preserves_embedding_and_other_columns() -> Result<()> {
             for (j, v) in items.iter().enumerate() {
                 if let Value::Float(f) = v {
                     let want = i as f64 + j as f64 * 0.01;
-                    assert!((f - want).abs() < 1e-9, "row {id}: embedding[{j}] = {f}, want {want}");
+                    // Use f32 epsilon: embedding round-trips through
+                    // Lance's Float32 encoding.
+                    assert!(
+                        (f - want).abs() < 1e-5,
+                        "row {id}: embedding[{j}] = {f}, want {want}"
+                    );
                 } else {
                     panic!("row {id}: embedding[{j}] not Float");
                 }
@@ -152,7 +156,6 @@ async fn t2_partial_set_flag_off_equivalence() -> Result<()> {
 
 /// T3 — Two SETs on the same vertex in one tx (different keys) must
 /// both land via a single MergeInsert source row.
-#[ignore = "Stage 1 ships partial-write plumbing default-OFF. Flag-on requires read-path integration so scans union partial L0 entries with storage — separate workstream."]
 #[tokio::test]
 async fn t3_partial_set_two_keys_same_vertex_one_tx() -> Result<()> {
     let db = Uni::in_memory().config(flag_on_config()).build().await?;
@@ -189,7 +192,6 @@ async fn t3_partial_set_two_keys_same_vertex_one_tx() -> Result<()> {
 /// on the same vid in the same tx: the Variable replace forces a
 /// full-row Append, and the partial state is superseded (no partial
 /// batch emitted for this vid).
-#[ignore = "Stage 1 ships partial-write plumbing default-OFF. Flag-on requires read-path integration so scans union partial L0 entries with storage — separate workstream."]
 #[tokio::test]
 async fn t4_partial_then_variable_replace() -> Result<()> {
     let db = Uni::in_memory().config(flag_on_config()).build().await?;
@@ -226,7 +228,6 @@ async fn t4_partial_then_variable_replace() -> Result<()> {
 /// T6 — Partial SET on a HASH-indexed scalar column. After the merge,
 /// the property is queryable through the index (a simple read-back is
 /// sufficient — the index lookup path runs).
-#[ignore = "Stage 1 ships partial-write plumbing default-OFF. Flag-on requires read-path integration so scans union partial L0 entries with storage — separate workstream."]
 #[tokio::test]
 async fn t6_partial_set_with_hash_index() -> Result<()> {
     use uni_db::api::schema::{IndexType, ScalarType};
@@ -264,7 +265,6 @@ async fn t6_partial_set_with_hash_index() -> Result<()> {
 
 /// T8 — Partial SET, then DELETE in a later tx: deletion supersedes
 /// the partial state.
-#[ignore = "Stage 1 ships partial-write plumbing default-OFF. Flag-on requires read-path integration so scans union partial L0 entries with storage — separate workstream."]
 #[tokio::test]
 async fn t8_partial_set_then_delete() -> Result<()> {
     let db = Uni::in_memory().config(flag_on_config()).build().await?;
@@ -299,7 +299,6 @@ async fn t8_partial_set_then_delete() -> Result<()> {
 /// T9 — Cross-tx partial SETs accumulate: after the first SET, a
 /// follow-up SET on a different column merges correctly (the per-VID
 /// dirty-key set unions across transactions before the flush).
-#[ignore = "Stage 1 ships partial-write plumbing default-OFF. Flag-on requires read-path integration so scans union partial L0 entries with storage — separate workstream."]
 #[tokio::test]
 async fn t9_partial_set_cross_tx_dirty_key_union() -> Result<()> {
     let db = Uni::in_memory().config(flag_on_config()).build().await?;

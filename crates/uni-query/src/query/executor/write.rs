@@ -4,7 +4,7 @@
 use super::core::*;
 use crate::query::planner::LogicalPlan;
 use anyhow::{Result, anyhow};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use uni_common::DataType;
 use uni_common::core::id::{Eid, Vid};
@@ -35,18 +35,20 @@ struct EdgeIdentity {
 struct PendingVertexSet {
     vid: Vid,
     labels: Vec<String>,
-    /// Property staging map. When `partial` is `true` this holds ONLY
-    /// the touched keys; flush routes through
-    /// `Writer::insert_vertex_partial` (which itself decides whether the
-    /// flag-on fast path or the read-then-merge fallback applies). When
-    /// `partial` is `false`, this holds the full-row pre-read map merged
-    /// with the touched values; flush goes through the existing
-    /// `insert_vertex_with_labels`. See Round 11 in the plan file.
+    /// Full property map (storage union L0 from
+    /// `get_all_vertex_props_with_ctx` plus the touched values applied
+    /// in-order). Flushed to L0 whole; L0's `vertex_partial_keys` set
+    /// tells the flush which columns to send to Lance via MergeInsert.
     props: HashMap<String, Value>,
-    /// `true` when no full-row pre-read happened. Set by the caller when
-    /// the schema has no generated columns on this label (since those
-    /// would need other-property values to evaluate).
+    /// `true` when the SET should flush via the partial-column MergeInsert
+    /// path: set when `UniConfig::partial_lance_writes` is on AND the
+    /// label has no generated columns. Generated-column labels still need
+    /// the full-row Append so the regenerated values land.
     partial: bool,
+    /// Set of property keys touched by this statement. Threaded into L0
+    /// so the flush emits a `MergeInsertBuilder` source with exactly
+    /// these columns. Empty when `partial == false`.
+    touched: HashSet<String>,
 }
 
 /// Per-variable accumulator for SetItem::Property items targeting an edge.
@@ -1799,16 +1801,18 @@ impl Executor {
                                 Self::extract_labels_from_node(node_val).unwrap_or_default();
                             let schema = self.storage.schema_manager().schema().clone();
 
-                            // Lazy one-time setup for this variable. Decide
-                            // partial-vs-full based on:
-                            //   * The `partial_lance_writes` config flag.
-                            //   * Whether any label on this vertex has
-                            //     generated columns — those need the
-                            //     full row to compute on flush.
-                            // When partial, we DO NOT pre-read; `pv.props`
-                            // accumulates only the SET-touched keys. When
-                            // full, the existing read-then-merge logic
-                            // runs.
+                            // Lazy one-time read. Always read the full row
+                            // (preserves CRDT merge + constraint validation
+                            // + scan-side L0 visibility). The
+                            // partial-lance-writes optimization happens
+                            // PURELY AT FLUSH TIME via the per-VID
+                            // `vertex_partial_keys` set tracked in L0 — so
+                            // L0 holds the full row, scans see the full
+                            // row, and Lance only receives the touched
+                            // columns. Generated-column-bearing labels
+                            // pre-screen here too: their flush must take
+                            // the full Append path so generated columns
+                            // recompute correctly (no MergeInsert).
                             if !pending_v.contains_key(var_name) {
                                 let storage_cfg = &self.storage.config;
                                 let label_has_generated = labels.iter().any(|l| {
@@ -1821,24 +1825,20 @@ impl Executor {
                                         })
                                         .unwrap_or(false)
                                 });
-                                let go_partial =
+                                let partial =
                                     storage_cfg.partial_lance_writes && !label_has_generated;
-                                let (initial, partial) = if go_partial {
-                                    (HashMap::new(), true)
-                                } else {
-                                    let read = prop_manager
-                                        .get_all_vertex_props_with_ctx(vid, ctx)
-                                        .await?
-                                        .unwrap_or_default();
-                                    (read, false)
-                                };
+                                let read = prop_manager
+                                    .get_all_vertex_props_with_ctx(vid, ctx)
+                                    .await?
+                                    .unwrap_or_default();
                                 pending_v.insert(
                                     var_name.clone(),
                                     PendingVertexSet {
                                         vid,
                                         labels: labels.clone(),
-                                        props: initial,
+                                        props: read,
                                         partial,
+                                        touched: HashSet::new(),
                                     },
                                 );
                             }
@@ -1852,6 +1852,9 @@ impl Executor {
                                 .get_mut(var_name)
                                 .expect("inserted above when absent");
                             pv.props.insert(prop_name.clone(), val.clone());
+                            if pv.partial {
+                                pv.touched.insert(prop_name.clone());
+                            }
 
                             // Update the row binding so subsequent RHS sees the new value.
                             if let Some(Value::Map(node_map)) = row.get_mut(var_name) {
@@ -2069,14 +2072,22 @@ impl Executor {
         }
 
         // Flush all remaining coalesced writes — one writer call per target.
-        // Partial entries (no full-row read, no generated-column enrich)
-        // route through `Writer::insert_vertex_partial`; full entries
-        // continue through the read-then-merge `insert_vertex_with_labels`
-        // path with `enrich_properties_with_generated_columns` applied.
+        // Partial entries (no generated columns) call
+        // `Writer::insert_vertex_partial_full` so L0 holds the FULL row
+        // but the touched-keys hint drives a MergeInsert at flush. Full
+        // entries continue through the legacy
+        // `insert_vertex_with_labels` (Append) path with
+        // generated-column enrichment.
         for (_var_name, mut pv) in pending_v {
             if pv.partial {
                 writer
-                    .insert_vertex_partial(pv.vid, pv.props, &pv.labels, tx_l0)
+                    .insert_vertex_partial_full(
+                        pv.vid,
+                        pv.props,
+                        pv.touched,
+                        &pv.labels,
+                        tx_l0,
+                    )
                     .await?;
             } else {
                 for label_name in &pv.labels {
@@ -2131,7 +2142,13 @@ impl Executor {
         if let Some(mut pv) = pending_v.remove(var) {
             if pv.partial {
                 writer
-                    .insert_vertex_partial(pv.vid, pv.props, &pv.labels, tx_l0)
+                    .insert_vertex_partial_full(
+                        pv.vid,
+                        pv.props,
+                        pv.touched,
+                        &pv.labels,
+                        tx_l0,
+                    )
                     .await?;
             } else {
                 for label_name in &pv.labels {

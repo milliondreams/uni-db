@@ -58,6 +58,14 @@ struct PendingEdgeSet {
     edge_type_id: u32,
     eid: Eid,
     edge_type_name: String,
+    /// `true` when the SET should flush via the partial-column
+    /// MergeInsert path on the per-edge-type delta tables (Round 12
+    /// §A). Set when `UniConfig::partial_lance_writes` is on.
+    partial: bool,
+    /// Property keys touched by this statement. Threaded into L0 so
+    /// the flush emits a `MergeInsertBuilder` source with exactly
+    /// these columns. Empty when `partial == false`.
+    touched: HashSet<String>,
     props: HashMap<String, Value>,
 }
 
@@ -1897,6 +1905,7 @@ impl Executor {
                                     .get_all_edge_props_with_ctx(ei.eid, ctx)
                                     .await?
                                     .unwrap_or_default();
+                                let partial = self.storage.config.partial_lance_writes;
                                 pending_e.insert(
                                     var_name.clone(),
                                     PendingEdgeSet {
@@ -1906,6 +1915,8 @@ impl Executor {
                                         eid: ei.eid,
                                         edge_type_name: edge_type_name.clone(),
                                         props: initial,
+                                        partial,
+                                        touched: HashSet::new(),
                                     },
                                 );
                             }
@@ -1924,6 +1935,9 @@ impl Executor {
                                 .get_mut(var_name)
                                 .expect("inserted above when absent");
                             pe.props.insert(prop_name.clone(), val.clone());
+                            if pe.partial {
+                                pe.touched.insert(prop_name.clone());
+                            }
 
                             // Update the row object so subsequent RHS sees the new value.
                             if let Some(Value::Map(edge_map)) = row.get_mut(var_name) {
@@ -1946,6 +1960,7 @@ impl Executor {
                                     .get_all_edge_props_with_ctx(eid, ctx)
                                     .await?
                                     .unwrap_or_default();
+                                let partial = self.storage.config.partial_lance_writes;
                                 pending_e.insert(
                                     var_name.clone(),
                                     PendingEdgeSet {
@@ -1955,6 +1970,8 @@ impl Executor {
                                         eid,
                                         edge_type_name: edge_type_name.clone(),
                                         props: initial,
+                                        partial,
+                                        touched: HashSet::new(),
                                     },
                                 );
                             }
@@ -1973,6 +1990,9 @@ impl Executor {
                                 .get_mut(var_name)
                                 .expect("inserted above when absent");
                             pe.props.insert(prop_name.clone(), val.clone());
+                            if pe.partial {
+                                pe.touched.insert(prop_name.clone());
+                            }
 
                             // Update the row object so subsequent RHS sees the new value.
                             if let Some(Value::Edge(edge)) = row.get_mut(var_name) {
@@ -2136,17 +2156,32 @@ impl Executor {
             }
         }
         for (_var_name, pe) in pending_e {
-            writer
-                .insert_edge(
-                    pe.src,
-                    pe.dst,
-                    pe.edge_type_id,
-                    pe.eid,
-                    pe.props,
-                    Some(pe.edge_type_name),
-                    tx_l0,
-                )
-                .await?;
+            if pe.partial {
+                writer
+                    .insert_edge_partial_full(
+                        pe.src,
+                        pe.dst,
+                        pe.edge_type_id,
+                        pe.eid,
+                        pe.props,
+                        Some(pe.edge_type_name),
+                        pe.touched,
+                        tx_l0,
+                    )
+                    .await?;
+            } else {
+                writer
+                    .insert_edge(
+                        pe.src,
+                        pe.dst,
+                        pe.edge_type_id,
+                        pe.eid,
+                        pe.props,
+                        Some(pe.edge_type_name),
+                        tx_l0,
+                    )
+                    .await?;
+            }
         }
 
         Ok(())
@@ -2213,17 +2248,32 @@ impl Executor {
             }
         }
         if let Some(pe) = pending_e.remove(var) {
-            writer
-                .insert_edge(
-                    pe.src,
-                    pe.dst,
-                    pe.edge_type_id,
-                    pe.eid,
-                    pe.props,
-                    Some(pe.edge_type_name),
-                    tx_l0,
-                )
-                .await?;
+            if pe.partial {
+                writer
+                    .insert_edge_partial_full(
+                        pe.src,
+                        pe.dst,
+                        pe.edge_type_id,
+                        pe.eid,
+                        pe.props,
+                        Some(pe.edge_type_name),
+                        pe.touched,
+                        tx_l0,
+                    )
+                    .await?;
+            } else {
+                writer
+                    .insert_edge(
+                        pe.src,
+                        pe.dst,
+                        pe.edge_type_id,
+                        pe.eid,
+                        pe.props,
+                        Some(pe.edge_type_name),
+                        tx_l0,
+                    )
+                    .await?;
+            }
         }
         Ok(())
     }

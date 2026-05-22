@@ -142,6 +142,13 @@ pub struct L0Buffer {
     /// absent VIDs flush via the existing full-row Append. See
     /// `docs/proposals/partial_lance_writes.md`.
     pub vertex_partial_keys: HashMap<Vid, HashSet<String>>,
+    /// Edge analog of `vertex_partial_keys` (Round 12 §A). Populated by
+    /// `insert_edge_partial_full`; cleared by full-row inserts and edge
+    /// deletes. Per-edge-type delta-table flush honors these by emitting
+    /// a `MergeInsertBuilder` source with only the touched schema
+    /// columns plus `eid`, `op`, `_version`, `_updated_at`, and
+    /// `overflow_json` (when an overflow prop was touched).
+    pub edge_partial_keys: HashMap<Eid, HashSet<String>>,
 }
 
 impl std::fmt::Debug for L0Buffer {
@@ -187,6 +194,7 @@ impl Clone for L0Buffer {
             estimated_size: self.estimated_size,
             constraint_index: self.constraint_index.clone(),
             vertex_partial_keys: self.vertex_partial_keys.clone(),
+            edge_partial_keys: self.edge_partial_keys.clone(),
         }
     }
 }
@@ -344,6 +352,7 @@ impl L0Buffer {
             estimated_size: 0,
             constraint_index: HashMap::new(),
             vertex_partial_keys: HashMap::new(),
+            edge_partial_keys: HashMap::new(),
         }
     }
 
@@ -688,6 +697,66 @@ impl L0Buffer {
         self.edge_created_at.entry(eid).or_insert(now);
         self.edge_updated_at.insert(eid, now);
 
+        // A full-row insert supersedes any pending partial-update state
+        // for this EID (Round 12 §A).
+        self.edge_partial_keys.remove(&eid);
+
+        self.estimated_size += type_name_size;
+
+        Ok(())
+    }
+
+    /// Insert an edge's FULL property row plus a touched-keys hint so the
+    /// flush emits only those schema columns via Lance `MergeInsert` on
+    /// the per-edge-type delta tables. Edge analog of
+    /// `insert_vertex_partial_full` (Round 12 §A).
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_edge_partial_full(
+        &mut self,
+        src_vid: Vid,
+        dst_vid: Vid,
+        edge_type: u32,
+        eid: Eid,
+        properties: Properties,
+        edge_type_name: Option<String>,
+        touched_keys: HashSet<String>,
+    ) -> Result<()> {
+        self.current_version += 1;
+        let now = now_nanos();
+
+        if let Some(wal) = &mut self.wal {
+            wal.append(&Mutation::InsertEdge {
+                src_vid,
+                dst_vid,
+                edge_type,
+                eid,
+                version: self.current_version,
+                properties: properties.clone(),
+                edge_type_name: edge_type_name.clone(),
+            })?;
+        }
+
+        self.apply_edge_insertion(src_vid, dst_vid, edge_type, eid, properties)?;
+
+        // `apply_edge_insertion` cleared the partial-keys entry as a
+        // safety measure (full-row insert supersedes partial). Re-insert
+        // with the touched-keys hint so the flush emits a partial source.
+        self.edge_partial_keys
+            .entry(eid)
+            .or_default()
+            .extend(touched_keys);
+
+        let type_name_size = if let Some(ref name) = edge_type_name {
+            let size = name.len() + 24;
+            self.edge_types.insert(eid, name.clone());
+            size
+        } else {
+            0
+        };
+
+        self.edge_created_at.entry(eid).or_insert(now);
+        self.edge_updated_at.insert(eid, now);
+
         self.estimated_size += type_name_size;
 
         Ok(())
@@ -805,6 +874,9 @@ impl L0Buffer {
             },
         );
         self.edge_versions.insert(eid, version);
+        // Deletion supersedes any pending partial-update state for this
+        // EID (Round 12 §A).
+        self.edge_partial_keys.remove(&eid);
         self.graph.remove_edge(eid);
         self.mutation_count += 1;
         self.mutation_stats.relationships_deleted += 1;

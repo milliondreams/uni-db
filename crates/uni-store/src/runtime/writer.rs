@@ -2227,7 +2227,62 @@ impl Writer {
     }
 
     #[expect(clippy::too_many_arguments)]
-    #[instrument(skip(self, properties), level = "trace")]
+    #[instrument(skip(self, props, touched_keys), level = "trace")]
+    pub async fn insert_edge_partial_full(
+        &self,
+        src_vid: Vid,
+        dst_vid: Vid,
+        edge_type: u32,
+        eid: Eid,
+        props: Properties,
+        edge_type_name: Option<String>,
+        touched_keys: HashSet<String>,
+        tx_l0: Option<&Arc<RwLock<L0Buffer>>>,
+    ) -> Result<()> {
+        if !self.config.partial_lance_writes {
+            return self
+                .insert_edge(src_vid, dst_vid, edge_type, eid, props, edge_type_name, tx_l0)
+                .await;
+        }
+
+        let start = std::time::Instant::now();
+        self.check_write_pressure().await?;
+        self.check_transaction_memory(tx_l0)?;
+        let mut props = props;
+        self.prepare_edge_upsert(eid, &mut props, tx_l0).await?;
+
+        let l0 = self.resolve_l0(tx_l0);
+        l0.write().insert_edge_partial_full(
+            src_vid,
+            dst_vid,
+            edge_type,
+            eid,
+            props,
+            edge_type_name,
+            touched_keys,
+        )?;
+
+        if tx_l0.is_none() {
+            let version = l0.read().current_version;
+            self.adjacency_manager
+                .insert_edge(src_vid, dst_vid, eid, edge_type, version);
+        }
+
+        metrics::counter!("uni_l0_buffer_mutations_total").increment(1);
+        metrics::counter!("uni_partial_writes_total").increment(1);
+        self.update_metrics();
+        if tx_l0.is_none() {
+            self.check_flush().await?;
+        }
+        if start.elapsed().as_millis() > 100 {
+            log::warn!(
+                "Slow insert_edge_partial_full: {}ms",
+                start.elapsed().as_millis()
+            );
+        }
+        Ok(())
+    }
+
     pub async fn insert_edge(
         &self,
         src_vid: Vid,
@@ -3022,24 +3077,96 @@ impl Writer {
                 .ok_or_else(|| anyhow!("Edge type ID {} not found", edge_type_id))?;
 
             // FWD Run (sorted by src_vid)
-            let mut fwd_entries = entries.clone();
-            fwd_entries.sort_by_key(|e| e.src_vid);
-            let fwd_ds = self.storage.delta_dataset(&edge_type_name, "fwd")?;
-            let fwd_batch = fwd_ds.build_record_batch(&fwd_entries, &schema)?;
+            // Round-12 §A: split entries into full-row Append and
+            // partial MergeInsert routes based on `edge_partial_keys`.
+            // Edges in `edge_partial_keys` were last written via
+            // `insert_edge_partial_full`; the per-edge-type delta
+            // tables receive only the touched schema columns plus
+            // (when any overflow key was touched) the regenerated
+            // `overflow_json` blob. Untouched columns retain their
+            // previous-version value via Lance MergeInsert.
+            let partial_eids: std::collections::HashSet<Eid> = {
+                let old_l0 = old_l0_arc.read();
+                entries
+                    .iter()
+                    .filter(|e| {
+                        self.config.partial_lance_writes
+                            && old_l0.edge_partial_keys.contains_key(&e.eid)
+                    })
+                    .map(|e| e.eid)
+                    .collect()
+            };
+            let touched_union_by_eid: HashMap<Eid, std::collections::HashSet<String>> = {
+                let old_l0 = old_l0_arc.read();
+                partial_eids
+                    .iter()
+                    .filter_map(|eid| {
+                        old_l0
+                            .edge_partial_keys
+                            .get(eid)
+                            .map(|s| (*eid, s.clone()))
+                    })
+                    .collect()
+            };
+            let (full_entries, partial_entries): (Vec<L1Entry>, Vec<L1Entry>) = entries
+                .clone()
+                .into_iter()
+                .partition(|e| !partial_eids.contains(&e.eid));
 
-            // Write using backend
             let backend = self.storage.backend();
-            fwd_ds.write_run(backend, fwd_batch).await?;
+
+            // FWD run (sorted by src_vid)
+            let mut fwd_full = full_entries.clone();
+            fwd_full.sort_by_key(|e| e.src_vid);
+            let mut fwd_partial = partial_entries.clone();
+            fwd_partial.sort_by_key(|e| e.src_vid);
+            let fwd_ds = self.storage.delta_dataset(&edge_type_name, "fwd")?;
+            if !fwd_full.is_empty() {
+                let fwd_batch = fwd_ds.build_record_batch(&fwd_full, &schema)?;
+                fwd_ds.write_run(backend, fwd_batch).await?;
+            }
+            if !fwd_partial.is_empty() {
+                let touched_union: std::collections::HashSet<String> = fwd_partial
+                    .iter()
+                    .flat_map(|e| {
+                        touched_union_by_eid
+                            .get(&e.eid)
+                            .cloned()
+                            .unwrap_or_default()
+                            .into_iter()
+                    })
+                    .collect();
+                let fwd_partial_batch =
+                    fwd_ds.build_partial_record_batch(&fwd_partial, &touched_union, &schema)?;
+                fwd_ds.merge_insert_partial_run(backend, fwd_partial_batch).await?;
+            }
             fwd_ds.ensure_eid_index(backend).await?;
 
             // BWD Run (sorted by dst_vid)
-            let mut bwd_entries = entries.clone();
-            bwd_entries.sort_by_key(|e| e.dst_vid);
+            let mut bwd_full = full_entries.clone();
+            bwd_full.sort_by_key(|e| e.dst_vid);
+            let mut bwd_partial = partial_entries.clone();
+            bwd_partial.sort_by_key(|e| e.dst_vid);
             let bwd_ds = self.storage.delta_dataset(&edge_type_name, "bwd")?;
-            let bwd_batch = bwd_ds.build_record_batch(&bwd_entries, &schema)?;
-
-            let backend = self.storage.backend();
-            bwd_ds.write_run(backend, bwd_batch).await?;
+            if !bwd_full.is_empty() {
+                let bwd_batch = bwd_ds.build_record_batch(&bwd_full, &schema)?;
+                bwd_ds.write_run(backend, bwd_batch).await?;
+            }
+            if !bwd_partial.is_empty() {
+                let touched_union: std::collections::HashSet<String> = bwd_partial
+                    .iter()
+                    .flat_map(|e| {
+                        touched_union_by_eid
+                            .get(&e.eid)
+                            .cloned()
+                            .unwrap_or_default()
+                            .into_iter()
+                    })
+                    .collect();
+                let bwd_partial_batch =
+                    bwd_ds.build_partial_record_batch(&bwd_partial, &touched_union, &schema)?;
+                bwd_ds.merge_insert_partial_run(backend, bwd_partial_batch).await?;
+            }
             bwd_ds.ensure_eid_index(backend).await?;
 
             // Update Manifest

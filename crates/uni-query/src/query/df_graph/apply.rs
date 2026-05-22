@@ -990,7 +990,7 @@ fn value_to_single_row_array(val: &Value, data_type: &DataType) -> DFResult<Arra
             let pairs: Vec<(Arc<arrow_schema::Field>, ArrayRef)> = fields
                 .iter()
                 .cloned()
-                .zip(child_arrays.into_iter())
+                .zip(child_arrays)
                 .collect();
             Arc::new(arrow_array::StructArray::from(pairs)) as ArrayRef
         }

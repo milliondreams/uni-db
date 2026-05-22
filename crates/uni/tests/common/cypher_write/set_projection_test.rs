@@ -2497,16 +2497,9 @@ async fn l9_cross_with_two_sets_round_trips() -> Result<()> {
     Ok(())
 }
 
-/// L3 — `MATCH (a)-[r*1..2]->(b) SET b.x = 1`. Variable-length-path target
-/// feeding SET. Original Round 5 plan declared VLP target SET out of scope;
-/// under Round 6's "everything" scope we add the test and either:
-///   - pass (great, incidentally works), or
-///   - fail (test asserts the silent no-op IS surfaced, locking in the
-///     known limitation so future work can flip the assertion).
-///
-/// This test documents whichever behavior the codebase exhibits today.
-/// If it fails with a parser/runtime error, that's also informative —
-/// we'd then know VLP+SET is rejected at parse time, which is fine.
+/// L3 — `MATCH (a)-[r*1..2]->(b) SET b.x = 99`. Variable-length-path
+/// target feeding SET. Confirmed working: each path target receives the
+/// SET. The source `a` is unmodified.
 #[tokio::test]
 async fn l3_vlp_target_set_documents_behavior() -> Result<()> {
     let db = Uni::in_memory().build().await?;
@@ -2527,25 +2520,11 @@ async fn l3_vlp_target_set_documents_behavior() -> Result<()> {
     .await?;
     tx.commit().await?;
 
-    // Try VLP target SET. Three plausible outcomes:
-    //   1. Pass + reach all VLP targets → ideal.
-    //   2. Pass + silent no-op → catch via read-back below.
-    //   3. Hard error → documented, no rollback test needed.
     let tx = db.session().tx().await?;
-    let res = tx
-        .execute("MATCH (a:N {id: 'a'})-[:LINK*1..2]->(b:N) SET b.x = 99")
-        .await;
-    let exec_ok = res.is_ok();
-    let commit_ok = if exec_ok {
-        tx.commit().await.is_ok()
-    } else {
-        // tx is consumed-by-error or still alive depending on path; let
-        // it drop without explicit rollback. Either way we move on.
-        drop(tx);
-        false
-    };
+    tx.execute("MATCH (a:N {id: 'a'})-[:LINK*1..2]->(b:N) SET b.x = 99")
+        .await?;
+    tx.commit().await?;
 
-    // Read back regardless of outcome.
     let r = db
         .session()
         .query("MATCH (n:N) RETURN n.id AS id, n.x AS x ORDER BY id")
@@ -2555,26 +2534,177 @@ async fn l3_vlp_target_set_documents_behavior() -> Result<()> {
         .iter()
         .map(|row| (row.get::<String>("id").unwrap(), row.get::<i64>("x").unwrap()))
         .collect();
-    let a_x = xs["a"];
-    let b_x = xs["b"];
-    let c_x = xs["c"];
 
-    println!(
-        "[diag L3] exec_ok={exec_ok} commit_ok={commit_ok} a.x={a_x} b.x={b_x} c.x={c_x}"
-    );
+    assert_eq!(xs["a"], 0, "a (source) should not be modified");
+    assert_eq!(xs["b"], 99, "b (1-hop VLP target) was not SET");
+    assert_eq!(xs["c"], 99, "c (2-hop VLP target) was not SET");
+    Ok(())
+}
 
-    if exec_ok && commit_ok {
-        // VLP+SET passed. Verify both b and c (reachable in 1 and 2 hops
-        // from a) got SET.
-        assert_eq!(a_x, 0, "a (source) should not be modified");
-        assert_eq!(b_x, 99, "b (1-hop VLP target) should be set to 99");
-        assert_eq!(c_x, 99, "c (2-hop VLP target) should be set to 99");
-    } else {
-        // VLP+SET errored. Verify rollback semantics: nothing changed.
-        assert_eq!(a_x, 0, "rollback leaked: a.x changed");
-        assert_eq!(b_x, 0, "rollback leaked: b.x changed");
-        assert_eq!(c_x, 0, "rollback leaked: c.x changed");
-        eprintln!("[diag L3] VLP+SET errored; rollback verified.");
+/// L3b — VLP target SET with `RETURN b.x` to verify the inline binding
+/// surfaces the post-SET value (Round-9 dotted-refresh shape on a VLP
+/// target). Exercises the same code path as l3, plus the dotted-column
+/// refresh in `append_cross_join_row`.
+#[tokio::test]
+async fn l3b_vlp_target_set_inline_return() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("N")
+        .property("id", DataType::String)
+        .property_nullable("x", DataType::Int64)
+        .done()
+        .edge_type("LINK", &["N"], &["N"])
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute(
+        "CREATE (a:N {id: 'a', x: 0})-[:LINK]->(b:N {id: 'b', x: 0})-[:LINK]->(c:N {id: 'c', x: 0})",
+    )
+    .await?;
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    let res = tx
+        .query("MATCH (a:N {id: 'a'})-[:LINK*1..2]->(b:N) SET b.x = 77 RETURN b.id AS id, b.x AS x ORDER BY id")
+        .await?;
+    tx.commit().await?;
+
+    let xs: std::collections::HashMap<String, i64> = res
+        .rows()
+        .iter()
+        .map(|row| (row.get::<String>("id").unwrap(), row.get::<i64>("x").unwrap()))
+        .collect();
+    assert_eq!(xs["b"], 77, "inline RETURN b.x surfaced stale binding for 1-hop target");
+    assert_eq!(xs["c"], 77, "inline RETURN b.x surfaced stale binding for 2-hop target");
+    Ok(())
+}
+
+/// L3c — VLP target SET on multi-property: ensures Round-3 coalescing
+/// (one read+write per target) runs correctly for VLP-bound vertices.
+#[tokio::test]
+async fn l3c_vlp_target_set_multi_property() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("N")
+        .property("id", DataType::String)
+        .property_nullable("x", DataType::Int64)
+        .property_nullable("y", DataType::String)
+        .done()
+        .edge_type("LINK", &["N"], &["N"])
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute(
+        "CREATE (a:N {id: 'a'})-[:LINK]->(b:N {id: 'b'})-[:LINK]->(c:N {id: 'c'})",
+    )
+    .await?;
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute(
+        "MATCH (a:N {id: 'a'})-[:LINK*1..2]->(b:N) SET b.x = 11, b.y = 'tagged'",
+    )
+    .await?;
+    tx.commit().await?;
+
+    let r = db
+        .session()
+        .query("MATCH (n:N) RETURN n.id AS id, n.x AS x, n.y AS y ORDER BY id")
+        .await?;
+    let rows: Vec<_> = r.rows().iter().collect();
+    // a is the source; b, c are targets.
+    assert!(rows[0].value("x").map(|v| matches!(v, Value::Null)).unwrap_or(true), "a.x should be unset");
+    for row in &rows[1..] {
+        assert_eq!(row.get::<i64>("x").unwrap(), 11);
+        assert_eq!(row.get::<String>("y").unwrap(), "tagged");
     }
+    Ok(())
+}
+
+/// L3d — VLP target SET with a step that returns ZERO matches must not
+/// panic and must not mutate anything.
+#[tokio::test]
+async fn l3d_vlp_target_set_no_matches() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("N")
+        .property("id", DataType::String)
+        .property_nullable("x", DataType::Int64)
+        .done()
+        .edge_type("LINK", &["N"], &["N"])
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:N {id: 'lonely', x: 0})").await?;
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("MATCH (a:N {id: 'lonely'})-[:LINK*1..3]->(b:N) SET b.x = 999")
+        .await?;
+    tx.commit().await?;
+
+    let r = db
+        .session()
+        .query("MATCH (n:N) RETURN n.x AS x")
+        .await?;
+    assert_eq!(r.rows()[0].get::<i64>("x").unwrap(), 0, "no-match VLP wrote phantom data");
+    Ok(())
+}
+
+/// L3e — VLP edge SET via UNWIND on the bound path: `MATCH
+/// (a)-[r*1..2]->(b) UNWIND r AS e SET e.flag = true`. The Arrow
+/// schema-mismatch (`List<Struct>` vs `LargeBinary`) at the mutation
+/// boundary is fixed by Round 10's recursive normalization in
+/// `normalize_mutation_schema` — the query now runs without error.
+/// However, the SET still silently no-ops: the UNWIND-bound `e`
+/// arrives at the SET executor as a Map but its edge identity (`_eid`
+/// / `_src` / `_dst` / `_type` ordering, or Edge decoding path) doesn't
+/// route through `execute_set_items_locked`'s edge branch correctly.
+/// That is a separate UNWIND-on-edge-list workstream and is marked
+/// `#[ignore]` until investigated. (Direct VLP target SET — covered by
+/// l3/l3b/l3c/l3d — works.)
+#[ignore = "VLP edge list (r) → UNWIND e → SET silently no-ops; edge-identity routing in execute_set_items_locked needs investigation"]
+#[tokio::test]
+async fn l3e_vlp_path_edges_set() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("N")
+        .property("id", DataType::String)
+        .done()
+        .edge_type("LINK", &["N"], &["N"])
+        .property_nullable("flag", DataType::Bool)
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute(
+        "CREATE (a:N {id: 'a'})-[:LINK]->(b:N {id: 'b'})-[:LINK]->(c:N {id: 'c'})",
+    )
+    .await?;
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute(
+        "MATCH (a:N {id: 'a'})-[r:LINK*1..2]->(c:N {id: 'c'}) \
+         UNWIND r AS e SET e.flag = true",
+    )
+    .await?;
+    tx.commit().await?;
+
+    let r = db
+        .session()
+        .query("MATCH ()-[e:LINK]->() RETURN count(e) AS n, count(e.flag) AS flagged")
+        .await?;
+    let n = r.rows()[0].get::<i64>("n").unwrap();
+    let flagged = r.rows()[0].get::<i64>("flagged").unwrap();
+    assert_eq!(n, 2, "edge count");
+    assert_eq!(flagged, 2, "both VLP edges should have flag=true");
     Ok(())
 }

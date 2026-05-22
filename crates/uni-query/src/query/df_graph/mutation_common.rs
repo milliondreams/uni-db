@@ -792,12 +792,22 @@ pub fn pattern_variable_names(pattern: &Pattern) -> Vec<String> {
 fn normalize_mutation_schema(schema: &SchemaRef) -> SchemaRef {
     use arrow_schema::{Field, Schema};
 
-    let needs_normalization = schema
-        .fields()
-        .iter()
-        .any(|f| matches!(f.data_type(), DataType::Struct(_)));
+    // Detect any field whose type is Struct or List<Struct> (e.g., the bound
+    // VLP edge-list `r` from `MATCH (a)-[r*1..2]->(b)`). Both round-trip
+    // through `rows_to_batches` as CV-encoded LargeBinary, so the declared
+    // schema must match or `RecordBatch::try_new` rejects the batch with
+    // "column types must match schema types".
+    fn needs_norm(dt: &DataType) -> bool {
+        match dt {
+            DataType::Struct(_) => true,
+            DataType::List(inner) | DataType::LargeList(inner) => {
+                matches!(inner.data_type(), DataType::Struct(_))
+            }
+            _ => false,
+        }
+    }
 
-    if !needs_normalization {
+    if !schema.fields().iter().any(|f| needs_norm(f.data_type())) {
         return schema.clone();
     }
 
@@ -805,7 +815,7 @@ fn normalize_mutation_schema(schema: &SchemaRef) -> SchemaRef {
         .fields()
         .iter()
         .map(|field| {
-            if matches!(field.data_type(), DataType::Struct(_)) {
+            if needs_norm(field.data_type()) {
                 let mut metadata = field.metadata().clone();
                 metadata.insert("cv_encoded".to_string(), "true".to_string());
                 Arc::new(

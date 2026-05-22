@@ -806,10 +806,9 @@ fn normalize_mutation_schema(schema: &SchemaRef) -> SchemaRef {
     fn needs_norm(dt: &DataType) -> bool {
         match dt {
             DataType::Struct(_) => true,
-            DataType::List(inner) | DataType::LargeList(inner) => match inner.data_type() {
-                DataType::Utf8 => false,
-                _ => true,
-            },
+            DataType::List(inner) | DataType::LargeList(inner) => {
+                !matches!(inner.data_type(), DataType::Utf8)
+            }
             _ => false,
         }
     }

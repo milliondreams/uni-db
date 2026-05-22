@@ -2669,7 +2669,6 @@ async fn l3d_vlp_target_set_no_matches() -> Result<()> {
 /// That is a separate UNWIND-on-edge-list workstream and is marked
 /// `#[ignore]` until investigated. (Direct VLP target SET — covered by
 /// l3/l3b/l3c/l3d — works.)
-#[ignore = "VLP edge list (r) → UNWIND e → SET silently no-ops; edge-identity routing in execute_set_items_locked needs investigation"]
 #[tokio::test]
 async fn l3e_vlp_path_edges_set() -> Result<()> {
     let db = Uni::in_memory().build().await?;

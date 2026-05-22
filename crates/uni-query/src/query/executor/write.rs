@@ -356,7 +356,8 @@ impl Executor {
         );
         let edge_type_id = self.resolve_edge_type_id(
             map.get("_type")
-                .ok_or_else(|| anyhow!("Missing _type on edge map"))?,
+                .or_else(|| map.get("_type_name"))
+                .ok_or_else(|| anyhow!("Missing _type/_type_name on edge map"))?,
         )?;
         Ok(EdgeIdentity {
             eid,
@@ -1823,12 +1824,16 @@ impl Executor {
                             && map.get("_eid").is_some_and(|v| !v.is_null())
                             && map.get("_src").is_some_and(|v| !v.is_null())
                             && map.get("_dst").is_some_and(|v| !v.is_null())
-                            && map.get("_type").is_some_and(|v| !v.is_null())
+                            && (map.get("_type").is_some_and(|v| !v.is_null())
+                                || map.get("_type_name").is_some_and(|v| !v.is_null()))
                         {
                             let ei = self.extract_edge_identity(map)?;
                             let schema = self.storage.schema_manager().schema().clone();
-                            // Handle _type as either String or Int (Int from CREATE, String from queries)
-                            let edge_type_name = match map.get("_type") {
+                            // Handle _type as either String or Int (Int from CREATE, String
+                            // from queries). UNWIND on VLP edge lists emits `_type_name`
+                            // instead of `_type`; accept either.
+                            let type_val = map.get("_type").or_else(|| map.get("_type_name"));
+                            let edge_type_name = match type_val {
                                 Some(Value::String(s)) => s.clone(),
                                 Some(Value::Int(id)) => schema
                                     .edge_type_name_by_id_unified(*id as u32)

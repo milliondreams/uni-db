@@ -1485,8 +1485,6 @@ impl PropertyManager {
     async fn fetch_all_props_from_storage(&self, vid: Vid) -> Result<Option<Properties>> {
         // In the new storage model, VID doesn't embed label info.
         // We need to scan all label datasets to find the vertex's properties.
-        let fetch_t = std::time::Instant::now();
-        let mut scan_ns_total: u64 = 0;
         let schema = self.schema_manager.schema();
         let mut merged_props: Option<Properties> = None;
         let mut global_best_version: Option<u64> = None;
@@ -1520,8 +1518,7 @@ impl PropertyManager {
             let filter_expr = self.storage.apply_version_filter(base_filter);
 
             let table_name = crate::backend::table_names::vertex_table_name(label_name);
-            let scan_t = std::time::Instant::now();
-            let scan_result = self
+            let batches: Vec<RecordBatch> = match self
                 .storage
                 .backend()
                 .scan(
@@ -1529,9 +1526,8 @@ impl PropertyManager {
                         .with_filter(&filter_expr)
                         .with_columns(columns.clone()),
                 )
-                .await;
-            scan_ns_total += scan_t.elapsed().as_nanos() as u64;
-            let batches: Vec<RecordBatch> = match scan_result {
+                .await
+            {
                 Ok(b) => b,
                 Err(_) => continue,
             };
@@ -1597,19 +1593,9 @@ impl PropertyManager {
             )
             .await?
         {
-            let total_ns = fetch_t.elapsed().as_nanos() as u64;
-            crate::runtime::writer::phase3_fetch_record(
-                scan_ns_total,
-                total_ns.saturating_sub(scan_ns_total),
-            );
             return Ok(Some(main_props));
         }
 
-        let total_ns = fetch_t.elapsed().as_nanos() as u64;
-        crate::runtime::writer::phase3_fetch_record(
-            scan_ns_total,
-            total_ns.saturating_sub(scan_ns_total),
-        );
         Ok(merged_props)
     }
 

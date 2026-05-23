@@ -33,175 +33,6 @@ use uni_common::core::snapshot::{EdgeSnapshot, LabelSnapshot, SnapshotManifest};
 use uni_xervo::runtime::ModelRuntime;
 use uuid::Uuid;
 
-/// Per-stage timing accumulators for `insert_vertex_partial_full`.
-///
-/// Experimental — added for the Tier-2 phase3_update profiling
-/// experiment. Each call to `insert_vertex_partial_full` adds to these
-/// atomics; tests call `reset_phase3_breakdown` before the workload
-/// and `snapshot_phase3_breakdown` after to get an attribution.
-///
-/// Overhead per call: ~5 nanoseconds (4 relaxed atomic adds), well below
-/// the millisecond-scale costs being measured.
-static PHASE3_CALLS_LEGACY: AtomicU64 = AtomicU64::new(0);
-static PHASE3_CALLS_PARTIAL: AtomicU64 = AtomicU64::new(0);
-static PHASE3_PRESSURE_NS: AtomicU64 = AtomicU64::new(0);
-static PHASE3_EMBED_NS: AtomicU64 = AtomicU64::new(0);
-static PHASE3_VALIDATE_NS: AtomicU64 = AtomicU64::new(0);
-static PHASE3_PREP_UPSERT_NS: AtomicU64 = AtomicU64::new(0);
-static PHASE3_L0_WRITE_NS: AtomicU64 = AtomicU64::new(0);
-
-#[derive(Default, Clone, Copy, Debug)]
-pub struct Phase3Breakdown {
-    pub calls_legacy: u64,
-    pub calls_partial: u64,
-    pub pressure_ns: u64,
-    pub embed_ns: u64,
-    pub validate_ns: u64,
-    pub prep_upsert_ns: u64,
-    pub l0_write_ns: u64,
-}
-
-impl Phase3Breakdown {
-    pub fn total_calls(&self) -> u64 {
-        self.calls_legacy + self.calls_partial
-    }
-    pub fn total_ns(&self) -> u64 {
-        self.pressure_ns
-            + self.embed_ns
-            + self.validate_ns
-            + self.prep_upsert_ns
-            + self.l0_write_ns
-    }
-}
-
-pub fn reset_phase3_breakdown() {
-    PHASE3_CALLS_LEGACY.store(0, Ordering::Relaxed);
-    PHASE3_CALLS_PARTIAL.store(0, Ordering::Relaxed);
-    PHASE3_PRESSURE_NS.store(0, Ordering::Relaxed);
-    PHASE3_EMBED_NS.store(0, Ordering::Relaxed);
-    PHASE3_VALIDATE_NS.store(0, Ordering::Relaxed);
-    PHASE3_PREP_UPSERT_NS.store(0, Ordering::Relaxed);
-    PHASE3_L0_WRITE_NS.store(0, Ordering::Relaxed);
-}
-
-pub fn snapshot_phase3_breakdown() -> Phase3Breakdown {
-    Phase3Breakdown {
-        calls_legacy: PHASE3_CALLS_LEGACY.load(Ordering::Relaxed),
-        calls_partial: PHASE3_CALLS_PARTIAL.load(Ordering::Relaxed),
-        pressure_ns: PHASE3_PRESSURE_NS.load(Ordering::Relaxed),
-        embed_ns: PHASE3_EMBED_NS.load(Ordering::Relaxed),
-        validate_ns: PHASE3_VALIDATE_NS.load(Ordering::Relaxed),
-        prep_upsert_ns: PHASE3_PREP_UPSERT_NS.load(Ordering::Relaxed),
-        l0_write_ns: PHASE3_L0_WRITE_NS.load(Ordering::Relaxed),
-    }
-}
-
-/// Outer-layer accumulators — attribution of `execute_set_items_locked`
-/// in uni-query (which is where Stage B-write part 1 redirected the
-/// investigation). Reset/snapshot via the `Phase3Outer*` helpers below.
-static PHASE3_OUTER_ROWS: AtomicU64 = AtomicU64::new(0);
-static PHASE3_OUTER_READ_NS: AtomicU64 = AtomicU64::new(0);
-static PHASE3_OUTER_EVAL_NS: AtomicU64 = AtomicU64::new(0);
-static PHASE3_OUTER_VAL_NS: AtomicU64 = AtomicU64::new(0);
-static PHASE3_OUTER_ENRICH_NS: AtomicU64 = AtomicU64::new(0);
-static PHASE3_OUTER_WRITER_CALL_NS: AtomicU64 = AtomicU64::new(0);
-static PHASE3_OUTER_TOTAL_NS: AtomicU64 = AtomicU64::new(0);
-
-#[derive(Default, Clone, Copy, Debug)]
-pub struct Phase3OuterBreakdown {
-    pub rows: u64,
-    pub read_ns: u64,
-    pub eval_ns: u64,
-    pub val_ns: u64,
-    pub enrich_ns: u64,
-    pub writer_call_ns: u64,
-    pub total_ns: u64,
-}
-
-impl Phase3OuterBreakdown {
-    pub fn accounted_ns(&self) -> u64 {
-        self.read_ns + self.eval_ns + self.val_ns + self.enrich_ns + self.writer_call_ns
-    }
-    pub fn unaccounted_ns(&self) -> u64 {
-        self.total_ns.saturating_sub(self.accounted_ns())
-    }
-}
-
-pub fn reset_phase3_outer() {
-    PHASE3_OUTER_ROWS.store(0, Ordering::Relaxed);
-    PHASE3_OUTER_READ_NS.store(0, Ordering::Relaxed);
-    PHASE3_OUTER_EVAL_NS.store(0, Ordering::Relaxed);
-    PHASE3_OUTER_VAL_NS.store(0, Ordering::Relaxed);
-    PHASE3_OUTER_ENRICH_NS.store(0, Ordering::Relaxed);
-    PHASE3_OUTER_WRITER_CALL_NS.store(0, Ordering::Relaxed);
-    PHASE3_OUTER_TOTAL_NS.store(0, Ordering::Relaxed);
-}
-
-pub fn snapshot_phase3_outer() -> Phase3OuterBreakdown {
-    Phase3OuterBreakdown {
-        rows: PHASE3_OUTER_ROWS.load(Ordering::Relaxed),
-        read_ns: PHASE3_OUTER_READ_NS.load(Ordering::Relaxed),
-        eval_ns: PHASE3_OUTER_EVAL_NS.load(Ordering::Relaxed),
-        val_ns: PHASE3_OUTER_VAL_NS.load(Ordering::Relaxed),
-        enrich_ns: PHASE3_OUTER_ENRICH_NS.load(Ordering::Relaxed),
-        writer_call_ns: PHASE3_OUTER_WRITER_CALL_NS.load(Ordering::Relaxed),
-        total_ns: PHASE3_OUTER_TOTAL_NS.load(Ordering::Relaxed),
-    }
-}
-
-pub fn phase3_outer_add_read_ns(ns: u64) {
-    PHASE3_OUTER_READ_NS.fetch_add(ns, Ordering::Relaxed);
-}
-pub fn phase3_outer_add_eval_ns(ns: u64) {
-    PHASE3_OUTER_EVAL_NS.fetch_add(ns, Ordering::Relaxed);
-}
-pub fn phase3_outer_add_val_ns(ns: u64) {
-    PHASE3_OUTER_VAL_NS.fetch_add(ns, Ordering::Relaxed);
-}
-pub fn phase3_outer_add_enrich_ns(ns: u64) {
-    PHASE3_OUTER_ENRICH_NS.fetch_add(ns, Ordering::Relaxed);
-}
-pub fn phase3_outer_add_writer_call_ns(ns: u64) {
-    PHASE3_OUTER_WRITER_CALL_NS.fetch_add(ns, Ordering::Relaxed);
-}
-pub fn phase3_outer_finish_row(total_ns: u64) {
-    PHASE3_OUTER_TOTAL_NS.fetch_add(total_ns, Ordering::Relaxed);
-    PHASE3_OUTER_ROWS.fetch_add(1, Ordering::Relaxed);
-}
-
-/// Drill into `fetch_all_props_from_storage` to confirm the per-row
-/// Lance scan owns the read cost.
-static PHASE3_FETCH_CALLS: AtomicU64 = AtomicU64::new(0);
-static PHASE3_FETCH_SCAN_NS: AtomicU64 = AtomicU64::new(0);
-static PHASE3_FETCH_OTHER_NS: AtomicU64 = AtomicU64::new(0);
-
-pub fn phase3_fetch_record(scan_ns: u64, other_ns: u64) {
-    PHASE3_FETCH_SCAN_NS.fetch_add(scan_ns, Ordering::Relaxed);
-    PHASE3_FETCH_OTHER_NS.fetch_add(other_ns, Ordering::Relaxed);
-    PHASE3_FETCH_CALLS.fetch_add(1, Ordering::Relaxed);
-}
-
-#[derive(Default, Clone, Copy, Debug)]
-pub struct Phase3FetchBreakdown {
-    pub calls: u64,
-    pub scan_ns: u64,
-    pub other_ns: u64,
-}
-
-pub fn reset_phase3_fetch() {
-    PHASE3_FETCH_CALLS.store(0, Ordering::Relaxed);
-    PHASE3_FETCH_SCAN_NS.store(0, Ordering::Relaxed);
-    PHASE3_FETCH_OTHER_NS.store(0, Ordering::Relaxed);
-}
-
-pub fn snapshot_phase3_fetch() -> Phase3FetchBreakdown {
-    Phase3FetchBreakdown {
-        calls: PHASE3_FETCH_CALLS.load(Ordering::Relaxed),
-        scan_ns: PHASE3_FETCH_SCAN_NS.load(Ordering::Relaxed),
-        other_ns: PHASE3_FETCH_OTHER_NS.load(Ordering::Relaxed),
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct WriterConfig {
     pub max_mutations: usize,
@@ -1851,24 +1682,14 @@ impl Writer {
         tx_l0: Option<&Arc<RwLock<L0Buffer>>>,
     ) -> Result<Properties> {
         let start = std::time::Instant::now();
-        let tp = std::time::Instant::now();
         self.check_write_pressure().await?;
         self.check_transaction_memory(tx_l0)?;
-        PHASE3_PRESSURE_NS.fetch_add(tp.elapsed().as_nanos() as u64, Ordering::Relaxed);
-
-        let te = std::time::Instant::now();
         if !self.try_defer_embedding(labels, &properties, vid, tx_l0) {
             self.process_embeddings_for_labels(labels, &mut properties)
                 .await?;
         }
-        PHASE3_EMBED_NS.fetch_add(te.elapsed().as_nanos() as u64, Ordering::Relaxed);
-
-        let tv = std::time::Instant::now();
         self.validate_vertex_constraints(vid, &properties, labels, tx_l0)
             .await?;
-        PHASE3_VALIDATE_NS.fetch_add(tv.elapsed().as_nanos() as u64, Ordering::Relaxed);
-
-        let tu = std::time::Instant::now();
         self.prepare_vertex_upsert(
             vid,
             &mut properties,
@@ -1876,13 +1697,11 @@ impl Writer {
             tx_l0,
         )
         .await?;
-        PHASE3_PREP_UPSERT_NS.fetch_add(tu.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
         // Clone properties and labels before moving into L0 to return them and populate constraint index
         let properties_copy = properties.clone();
         let labels_copy = labels.to_vec();
 
-        let tl = std::time::Instant::now();
         {
             let l0 = self.resolve_l0(tx_l0);
             let mut l0_guard = l0.write();
@@ -1938,9 +1757,6 @@ impl Writer {
                 }
             }
         }
-
-        PHASE3_L0_WRITE_NS.fetch_add(tl.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        PHASE3_CALLS_LEGACY.fetch_add(1, Ordering::Relaxed);
 
         metrics::counter!("uni_l0_buffer_mutations_total").increment(1);
         self.update_metrics();
@@ -2026,33 +1842,21 @@ impl Writer {
             return Ok(());
         }
 
-        let t0 = std::time::Instant::now();
         self.check_write_pressure().await?;
         self.check_transaction_memory(tx_l0)?;
-        PHASE3_PRESSURE_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-
-        let t1 = std::time::Instant::now();
         if !self.try_defer_embedding(labels, &props, vid, tx_l0) {
             self.process_embeddings_for_labels(labels, &mut props)
                 .await?;
         }
-        PHASE3_EMBED_NS.fetch_add(t1.elapsed().as_nanos() as u64, Ordering::Relaxed);
-
         // Full-row validation runs because we have the complete map;
         // no need for the partial-only validator.
-        let t2 = std::time::Instant::now();
         self.validate_vertex_constraints(vid, &props, labels, tx_l0)
             .await?;
-        PHASE3_VALIDATE_NS.fetch_add(t2.elapsed().as_nanos() as u64, Ordering::Relaxed);
-
-        let t3 = std::time::Instant::now();
         {
             let l0 = self.resolve_l0(tx_l0);
             let mut l0_guard = l0.write();
             l0_guard.insert_vertex_partial_full(vid, props, touched_keys, labels);
         }
-        PHASE3_L0_WRITE_NS.fetch_add(t3.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        PHASE3_CALLS_PARTIAL.fetch_add(1, Ordering::Relaxed);
         metrics::counter!("uni_l0_buffer_mutations_total").increment(1);
         metrics::counter!("uni_partial_writes_total").increment(1);
         self.update_metrics();

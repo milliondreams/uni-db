@@ -1,28 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Dragonscale Team
 //
-// Stress repro for slow `UNWIND ... MATCH WHERE id(n)=u.nid SET ...`.
-//
-// Adapted from uniko2/crates/uniko-bench/src/update_microbench_main.rs so we
-// can profile the in-tx UPDATE path against the local uni-db checkout with
-// tracing spans enabled.
+// Stress / regression test for batched `UNWIND ... MATCH WHERE id(n)=u.nid SET ...`.
 //
 // Run with:
-//   RUST_LOG=uni_store=debug,uni_query=debug,uni=debug \
-//     cargo nextest run -p uni-db --test perf update_microbench_stress \
-//     --run-ignored all --no-capture
+//   cargo nextest run -p uni-db --test perf update_microbench_stress \
+//     --run-ignored all --no-capture --cargo-profile release
 //
-// What it does:
-//   1. In-memory uni-db, single Entity label + 25 sibling labels for planner
-//      noise, bulk-inserts N=4000 Entity nodes.
-//   2. Runs the UPDATE Cypher at batch sizes 1, 3, 10, 100, 1000.
-//   3. For each: reports wall, exec (QueryMetrics), per-operator .profile()
-//      stats. Tracing spans (if RUST_LOG enabled) reveal the operators
-//      that .profile() reports as time=0ms (MutationSetExec, GraphScanExec).
+// Reports wall + exec_time across batch sizes 1/3/10/100/1000 plus a
+// `.profile()` per-operator breakdown at batch=3 and batch=1000.
 //
-// Expected baseline (from the original bench, batch=1 ≈ 1.9 ms/row):
-//   - Per-row cost is non-monotonic: small at batch=1, regresses at batch=3,
-//     amortises by batch=1000.
+// Regression baseline (release build, post-Phase-A + post-systemic-pushdown):
+//   - batch=1000 wall: < 100 ms (was ~450 ms pre-fix)
+//   - GraphScanExec.actual_rows at batch=1000: <= batch size (was 4000)
+//   - MutationSetExec.time_ms / 1000 rows: ~1.3 ms/row
+//
+// If any of those numbers regress dramatically, the Phase A prefetch or
+// the IN-list pushdown pass has likely been broken.
 
 use std::collections::HashMap;
 use std::sync::Once;
@@ -129,19 +123,8 @@ async fn update_microbench_stress() -> anyhow::Result<()> {
     // ── Measure UPDATE wall + exec_time across batch sizes
     eprintln!("## Wall + exec_time vs batch size (median of 5 iters)");
     eprintln!(
-        "{:>6} {:>9} {:>9} {:>8}   {:>5}/{:>5}  {:>7} {:>7} {:>7} {:>7} {:>7}  {:>7}",
-        "batch",
-        "wall_ms",
-        "exec_ms",
-        "ms/row",
-        "calls",
-        "rows",
-        "pres_µs",
-        "emb_µs",
-        "val_µs",
-        "prep_µs",
-        "l0w_µs",
-        "sum_µs",
+        "{:>6} {:>10} {:>10} {:>10}",
+        "batch", "wall_ms", "exec_ms", "ms/row"
     );
     for &batch in &[1usize, 3, 10, 100, 1000] {
         let updates: Vec<Value> = all_vids[..batch]
@@ -158,9 +141,6 @@ async fn update_microbench_stress() -> anyhow::Result<()> {
 
         let mut walls = Vec::new();
         let mut execs = Vec::new();
-        uni_store::runtime::writer::reset_phase3_breakdown();
-        uni_store::runtime::writer::reset_phase3_outer();
-        uni_store::runtime::writer::reset_phase3_fetch();
         for _ in 0..5 {
             let tx = session.tx().await?;
             let t = Instant::now();
@@ -180,40 +160,12 @@ async fn update_microbench_stress() -> anyhow::Result<()> {
         };
         let w = med(walls);
         let e = med(execs);
-        let bd = uni_store::runtime::writer::snapshot_phase3_breakdown();
-        let ob = uni_store::runtime::writer::snapshot_phase3_outer();
-        let fb = uni_store::runtime::writer::snapshot_phase3_fetch();
-        let calls = bd.total_calls();
-        let rows = ob.rows.max(1);
-        let per_row_us = |ns: u64| -> f64 {
-            (ns as f64) / (rows as f64) / 1000.0
-        };
-        let per_fetch_us = |ns: u64| -> f64 {
-            if fb.calls == 0 {
-                0.0
-            } else {
-                (ns as f64) / (fb.calls as f64) / 1000.0
-            }
-        };
         eprintln!(
-            "{:>6} {:>9.2} {:>9.2} {:>8.3}  outer[rows={:>5} read={:>6.1} eval={:>6.1} val={:>6.1} enr={:>6.1} wc={:>6.1} tot={:>6.1} unacc={:>6.1}]  fetch[calls={:>5} scan={:>6.1} other={:>5.1}]  inner[calls={:>5} sum={:>5.1}]",
+            "{:>6} {:>10.2} {:>10.2} {:>10.3}",
             batch,
             w,
             e,
-            w / batch as f64,
-            ob.rows,
-            per_row_us(ob.read_ns),
-            per_row_us(ob.eval_ns),
-            per_row_us(ob.val_ns),
-            per_row_us(ob.enrich_ns),
-            per_row_us(ob.writer_call_ns),
-            per_row_us(ob.total_ns),
-            per_row_us(ob.unaccounted_ns()),
-            fb.calls,
-            per_fetch_us(fb.scan_ns),
-            per_fetch_us(fb.other_ns),
-            calls,
-            per_row_us(bd.total_ns()),
+            w / batch as f64
         );
     }
 

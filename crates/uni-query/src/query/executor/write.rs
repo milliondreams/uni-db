@@ -1819,7 +1819,6 @@ impl Executor {
         // common and have lower payoff; before processing one, we flush any
         // pending updates for the same variable so it sees the latest L0
         // state and ordering semantics are preserved.
-        let outer_t = std::time::Instant::now();
         let mut pending_v: HashMap<String, PendingVertexSet> = HashMap::new();
         let mut pending_e: HashMap<String, PendingEdgeSet> = HashMap::new();
 
@@ -1853,7 +1852,6 @@ impl Executor {
                             if !pending_v.contains_key(var_name) {
                                 let storage_cfg = &self.storage.config;
                                 let partial = storage_cfg.partial_lance_writes;
-                                let t_read = std::time::Instant::now();
                                 let read = read_vertex_props_with_prefetch(
                                     vid,
                                     prefetched,
@@ -1861,9 +1859,6 @@ impl Executor {
                                     ctx,
                                 )
                                 .await?;
-                                uni_store::runtime::writer::phase3_outer_add_read_ns(
-                                    t_read.elapsed().as_nanos() as u64,
-                                );
                                 pending_v.insert(
                                     var_name.clone(),
                                     PendingVertexSet {
@@ -1876,18 +1871,10 @@ impl Executor {
                                 );
                             }
 
-                            let t_eval = std::time::Instant::now();
                             let val = self
                                 .evaluate_expr(value, row, prop_manager, params, ctx)
                                 .await?;
-                            uni_store::runtime::writer::phase3_outer_add_eval_ns(
-                                t_eval.elapsed().as_nanos() as u64,
-                            );
-                            let t_val = std::time::Instant::now();
                             Self::validate_property_value(prop_name, &val, &schema, &labels)?;
-                            uni_store::runtime::writer::phase3_outer_add_val_ns(
-                                t_val.elapsed().as_nanos() as u64,
-                            );
 
                             let pv = pending_v
                                 .get_mut(var_name)
@@ -2148,7 +2135,6 @@ impl Executor {
                 // Idempotent — generators always recompute against the
                 // post-merge property map.
                 let pre_keys: HashSet<String> = pv.props.keys().cloned().collect();
-                let t_enrich = std::time::Instant::now();
                 for label_name in &pv.labels {
                     self.enrich_properties_with_generated_columns(
                         label_name,
@@ -2159,23 +2145,15 @@ impl Executor {
                     )
                     .await?;
                 }
-                uni_store::runtime::writer::phase3_outer_add_enrich_ns(
-                    t_enrich.elapsed().as_nanos() as u64,
-                );
                 for k in pv.props.keys() {
                     if !pre_keys.contains(k) || self.is_generated_key(&pv.labels, k) {
                         pv.touched.insert(k.clone());
                     }
                 }
-                let t_wc = std::time::Instant::now();
                 writer
                     .insert_vertex_partial_full(pv.vid, pv.props, pv.touched, &pv.labels, tx_l0)
                     .await?;
-                uni_store::runtime::writer::phase3_outer_add_writer_call_ns(
-                    t_wc.elapsed().as_nanos() as u64,
-                );
             } else {
-                let t_enrich = std::time::Instant::now();
                 for label_name in &pv.labels {
                     self.enrich_properties_with_generated_columns(
                         label_name,
@@ -2186,16 +2164,9 @@ impl Executor {
                     )
                     .await?;
                 }
-                uni_store::runtime::writer::phase3_outer_add_enrich_ns(
-                    t_enrich.elapsed().as_nanos() as u64,
-                );
-                let t_wc = std::time::Instant::now();
                 let _ = writer
                     .insert_vertex_with_labels(pv.vid, pv.props, &pv.labels, tx_l0)
                     .await?;
-                uni_store::runtime::writer::phase3_outer_add_writer_call_ns(
-                    t_wc.elapsed().as_nanos() as u64,
-                );
             }
         }
         for (_var_name, pe) in pending_e {
@@ -2227,9 +2198,6 @@ impl Executor {
             }
         }
 
-        uni_store::runtime::writer::phase3_outer_finish_row(
-            outer_t.elapsed().as_nanos() as u64,
-        );
         Ok(())
     }
 

@@ -6497,9 +6497,7 @@ fn materialize_unwind_source_field(
     match expr {
         Expr::List(items) => {
             if items.len() > MAX_UNWIND_IN_PUSHDOWN_VALUES {
-                warn_unpushable_unwind_once(
-                    "UNWIND list exceeds MAX_UNWIND_IN_PUSHDOWN_VALUES",
-                );
+                warn_unpushable_unwind_once("UNWIND list exceeds MAX_UNWIND_IN_PUSHDOWN_VALUES");
                 return None;
             }
             // Inlined map literals at plan time: each item must be an
@@ -6639,27 +6637,24 @@ fn build_in_pushdown(
                 return None;
             }
         },
-        Some(f) => match extract_static_unwind_field_values(
-            unwind_subplan,
-            unwind_var,
-            f,
-            params,
-        ) {
-            Some(v) => v,
-            None => {
-                tracing::debug!(
-                    target: "uni_query::cross_join_in_pushdown",
-                    reason = "extract_static_unwind_field_values returned None \
-                              (UNWIND source is not Expr::Parameter, or param is not \
-                              Value::List<Value::Map>, or a map element lacks field, \
-                              or list size exceeded MAX_UNWIND_IN_PUSHDOWN_VALUES)",
-                    unwind_var,
-                    field = f,
-                    "build_in_pushdown rejected"
-                );
-                return None;
+        Some(f) => {
+            match extract_static_unwind_field_values(unwind_subplan, unwind_var, f, params) {
+                Some(v) => v,
+                None => {
+                    tracing::debug!(
+                        target: "uni_query::cross_join_in_pushdown",
+                        reason = "extract_static_unwind_field_values returned None \
+                                  (UNWIND source is not Expr::Parameter, or param is not \
+                                  Value::List<Value::Map>, or a map element lacks field, \
+                                  or list size exceeded MAX_UNWIND_IN_PUSHDOWN_VALUES)",
+                        unwind_var,
+                        field = f,
+                        "build_in_pushdown rejected"
+                    );
+                    return None;
+                }
             }
-        },
+        }
     };
     if values.is_empty() {
         tracing::debug!(
@@ -6851,26 +6846,22 @@ fn merge_unwind_in_filters(
             let mut left_extra_in: Vec<Expr> = Vec::new();
             let mut right_extra_in: Vec<Expr> = Vec::new();
             for (l_expr, r_expr) in &cls.equi_pairs {
-                if let Some(in_filter) =
-                    build_in_pushdown(l_expr, r_expr, &left_rewritten, params)
+                if let Some(in_filter) = build_in_pushdown(l_expr, r_expr, &left_rewritten, params)
                 {
                     right_extra_in.push(in_filter);
                     continue;
                 }
-                if let Some(in_filter) =
-                    build_in_pushdown(r_expr, l_expr, &left_rewritten, params)
+                if let Some(in_filter) = build_in_pushdown(r_expr, l_expr, &left_rewritten, params)
                 {
                     right_extra_in.push(in_filter);
                     continue;
                 }
-                if let Some(in_filter) =
-                    build_in_pushdown(l_expr, r_expr, &right_rewritten, params)
+                if let Some(in_filter) = build_in_pushdown(l_expr, r_expr, &right_rewritten, params)
                 {
                     left_extra_in.push(in_filter);
                     continue;
                 }
-                if let Some(in_filter) =
-                    build_in_pushdown(r_expr, l_expr, &right_rewritten, params)
+                if let Some(in_filter) = build_in_pushdown(r_expr, l_expr, &right_rewritten, params)
                 {
                     left_extra_in.push(in_filter);
                 }
@@ -7218,15 +7209,27 @@ mod tests {
     fn materialize_unwind_field_accepts_inlined_map_literals() {
         // `UNWIND [{nid: 64, x: 1}, {nid: 65, x: 2}] AS u ... = u.nid`
         let unwind_expr = Expr::List(vec![
-            Expr::Map(vec![map_entry("nid", int_lit(64)), map_entry("x", int_lit(1))]),
-            Expr::Map(vec![map_entry("nid", int_lit(65)), map_entry("x", int_lit(2))]),
+            Expr::Map(vec![
+                map_entry("nid", int_lit(64)),
+                map_entry("x", int_lit(1)),
+            ]),
+            Expr::Map(vec![
+                map_entry("nid", int_lit(65)),
+                map_entry("x", int_lit(2)),
+            ]),
         ]);
         let params = HashMap::new();
         let result = materialize_unwind_source_field(&unwind_expr, &params, "nid");
         let values = result.expect("literal-map UNWIND should produce an IN-list");
         assert_eq!(values.len(), 2);
-        assert!(matches!(&values[0], Expr::Literal(CypherLiteral::Integer(64))));
-        assert!(matches!(&values[1], Expr::Literal(CypherLiteral::Integer(65))));
+        assert!(matches!(
+            &values[0],
+            Expr::Literal(CypherLiteral::Integer(64))
+        ));
+        assert!(matches!(
+            &values[1],
+            Expr::Literal(CypherLiteral::Integer(65))
+        ));
     }
 
     #[test]
@@ -7248,9 +7251,10 @@ mod tests {
         // `UNWIND [{nid: $p}, ...]` — value is a Parameter, not a Literal.
         // Should bail conservatively (we don't substitute parameters
         // inside inlined map literals at plan time).
-        let unwind_expr = Expr::List(vec![
-            Expr::Map(vec![map_entry("nid", Expr::Parameter("p".to_string()))]),
-        ]);
+        let unwind_expr = Expr::List(vec![Expr::Map(vec![map_entry(
+            "nid",
+            Expr::Parameter("p".to_string()),
+        )])]);
         let params = HashMap::new();
         let result = materialize_unwind_source_field(&unwind_expr, &params, "nid");
         assert!(result.is_none(), "non-literal value at field should bail");
@@ -7259,12 +7263,13 @@ mod tests {
     #[test]
     fn materialize_unwind_field_rejects_when_target_field_missing() {
         // `UNWIND [{other: 64}, ...] ... = u.nid` — no `nid` entry.
-        let unwind_expr = Expr::List(vec![
-            Expr::Map(vec![map_entry("other", int_lit(64))]),
-        ]);
+        let unwind_expr = Expr::List(vec![Expr::Map(vec![map_entry("other", int_lit(64))])]);
         let params = HashMap::new();
         let result = materialize_unwind_source_field(&unwind_expr, &params, "nid");
-        assert!(result.is_none(), "map missing the requested field should bail");
+        assert!(
+            result.is_none(),
+            "map missing the requested field should bail"
+        );
     }
 
     #[test]
@@ -7274,7 +7279,10 @@ mod tests {
         let unwind_expr = Expr::List(vec![int_lit(64), int_lit(65)]);
         let params = HashMap::new();
         let result = materialize_unwind_source_field(&unwind_expr, &params, "nid");
-        assert!(result.is_none(), "non-map list items can't be field-projected");
+        assert!(
+            result.is_none(),
+            "non-map list items can't be field-projected"
+        );
     }
 
     #[test]
@@ -7392,7 +7400,9 @@ mod tests {
             panic!("expected Scan as right subtree, got {right:?}");
         };
         assert_eq!(labels, &vec![expected_label.to_string()]);
-        let filter_expr = filter.as_ref().expect("Scan.filter must be Some after pass");
+        let filter_expr = filter
+            .as_ref()
+            .expect("Scan.filter must be Some after pass");
         assert!(
             matches!(filter_expr, Expr::In { .. }),
             "Scan.filter should be Expr::In, got {filter_expr:?}"

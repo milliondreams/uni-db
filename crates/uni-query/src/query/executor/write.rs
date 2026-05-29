@@ -181,13 +181,8 @@ impl Executor {
             Some(Value::Node(ref node)) => {
                 let vid = node.vid;
                 let labels = node.labels.clone();
-                let current = read_vertex_props_with_prefetch(
-                    vid,
-                    prefetched,
-                    prop_manager,
-                    ctx,
-                )
-                .await?;
+                let current =
+                    read_vertex_props_with_prefetch(vid, prefetched, prop_manager, ctx).await?;
                 let write_props = Self::merge_props(current, new_props, replace);
                 let mut enriched = write_props.clone();
                 for label_name in &labels {
@@ -211,13 +206,8 @@ impl Executor {
             Some(ref node_val) if Self::vid_from_value(node_val).is_ok() => {
                 let vid = Self::vid_from_value(node_val)?;
                 let labels = Self::extract_labels_from_node(node_val).unwrap_or_default();
-                let current = read_vertex_props_with_prefetch(
-                    vid,
-                    prefetched,
-                    prop_manager,
-                    ctx,
-                )
-                .await?;
+                let current =
+                    read_vertex_props_with_prefetch(vid, prefetched, prop_manager, ctx).await?;
                 let write_props = Self::merge_props(current, new_props, replace);
                 let mut enriched = write_props.clone();
                 for label_name in &labels {
@@ -2336,13 +2326,8 @@ impl Executor {
 
             if let Ok(vid) = Self::vid_from_value(node_val) {
                 // Vertex property removal
-                let mut props = read_vertex_props_with_prefetch(
-                    vid,
-                    prefetched,
-                    prop_manager,
-                    ctx,
-                )
-                .await?;
+                let mut props =
+                    read_vertex_props_with_prefetch(vid, prefetched, prop_manager, ctx).await?;
 
                 // Only write back if at least one property actually exists
                 let removed_count = prop_names
@@ -3455,9 +3440,7 @@ pub(crate) async fn read_vertex_props_with_prefetch(
 ) -> Result<uni_common::Properties> {
     match prefetched.vertex.get(&vid).cloned() {
         Some(mut base) => {
-            if let Some(l0) =
-                uni_store::runtime::l0_visibility::accumulate_vertex_props(vid, ctx)
-            {
+            if let Some(l0) = uni_store::runtime::l0_visibility::accumulate_vertex_props(vid, ctx) {
                 for (k, v) in l0 {
                     base.insert(k, v);
                 }
@@ -3483,9 +3466,7 @@ pub(crate) async fn read_edge_props_with_prefetch(
 ) -> Result<uni_common::Properties> {
     match prefetched.edge.get(&eid).cloned() {
         Some(mut base) => {
-            if let Some(l0) =
-                uni_store::runtime::l0_visibility::accumulate_edge_props(eid, ctx)
-            {
+            if let Some(l0) = uni_store::runtime::l0_visibility::accumulate_edge_props(eid, ctx) {
                 for (k, v) in l0 {
                     base.insert(k, v);
                 }

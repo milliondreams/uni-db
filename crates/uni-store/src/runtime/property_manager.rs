@@ -1236,8 +1236,7 @@ impl PropertyManager {
                         if let Some(col) = batch.column_by_name(p_name)
                             && !col.is_null(row)
                         {
-                            let val =
-                                Self::value_from_column(col.as_ref(), &p_meta.r#type, row)?;
+                            let val = Self::value_from_column(col.as_ref(), &p_meta.r#type, row)?;
                             props.insert(p_name.clone(), val);
                         }
                     }

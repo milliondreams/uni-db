@@ -206,10 +206,10 @@ async fn collect_and_fetch_vertex_prefetch(
                 if let Some(label) = labels.first() {
                     by_label.entry(label.clone()).or_default().insert(vid);
                 }
-            } else if let Some((eid, type_name)) = edge_eid_and_type(bound) {
-                if !type_name.is_empty() {
-                    by_type.entry(type_name).or_default().insert(eid);
-                }
+            } else if let Some((eid, type_name)) = edge_eid_and_type(bound)
+                && !type_name.is_empty()
+            {
+                by_type.entry(type_name).or_default().insert(eid);
             }
         }
     }
@@ -220,7 +220,9 @@ async fn collect_and_fetch_vertex_prefetch(
         if vids.is_empty() {
             continue;
         }
-        if let Ok(label_results) = pm.get_batch_vertex_props_for_label(&vids, &label, ctx).await
+        if let Ok(label_results) = pm
+            .get_batch_vertex_props_for_label(&vids, &label, ctx)
+            .await
         {
             for (vid, props) in label_results {
                 prefetch.vertex.entry(vid).or_insert(props);
@@ -923,11 +925,9 @@ async fn apply_mutations(
                 .await
                 .map_err(|e| df_err("REMOVE prefetch failed", e))?;
             for row in rows.iter_mut() {
-                exec.execute_remove_items_locked(
-                    items, row, writer, pm, ctx, tx_l0, &prefetch,
-                )
-                .await
-                .map_err(|e| df_err("REMOVE failed", e))?;
+                exec.execute_remove_items_locked(items, row, writer, pm, ctx, tx_l0, &prefetch)
+                    .await
+                    .map_err(|e| df_err("REMOVE failed", e))?;
             }
         }
         MutationKind::Delete { items, detach } => {
@@ -961,11 +961,7 @@ async fn apply_mutations(
                 // targets (Phase C — collapses N per-VID subgraph loads to
                 // one), then the per-VID writer.delete_vertex calls
                 // (cheap; no scan).
-                let vids: Vec<Vid> = collector
-                    .node_entries
-                    .iter()
-                    .map(|(v, _)| *v)
-                    .collect();
+                let vids: Vec<Vid> = collector.node_entries.iter().map(|(v, _)| *v).collect();
                 exec.batch_check_vertices_have_no_edges(&vids, writer, tx_l0)
                     .await
                     .map_err(|e| df_err("DELETE check failed", e))?;

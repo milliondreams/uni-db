@@ -125,7 +125,10 @@ jobs:
 
       - name: Install Python dependencies (uni-db)
         working-directory: bindings/uni-db
-        run: uv sync --group dev
+        # `notebook-runtime` extra (numpy/onnxruntime/pyarrow) is required by
+        # the flagship Locy notebooks executed below. They're opt-in so the
+        # default wheel stays lean; the verifier job installs them here.
+        run: uv sync --group dev --extra notebook-runtime
 
       - name: Build Python bindings (uni-db)
         working-directory: bindings/uni-db

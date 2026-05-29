@@ -132,6 +132,15 @@ create_exception!(
     "Query exceeded its memory limit."
 );
 create_exception!(_uni_db, UniTimeoutError, UniError, "Operation timed out.");
+create_exception!(
+    _uni_db,
+    UniLocyIncompleteError,
+    UniError,
+    "Locy evaluation stopped before completing (timeout or iteration limit). \
+     Carries `reason`, strata counts, and the `skipped_rules` / \
+     `complement_rules_affected` attributes; re-run with `allow_partial=True` \
+     to recover the partial result instead."
+);
 
 // Access control
 create_exception!(
@@ -298,6 +307,29 @@ pub fn uni_error_to_pyerr(e: uni_common::UniError) -> PyErr {
         MemoryLimitExceeded { .. } => UniMemoryLimitExceededError::new_err(msg),
         DatabaseLocked => UniDatabaseLockedError::new_err(msg),
         Timeout { .. } => UniTimeoutError::new_err(msg),
+        LocyIncomplete { detail } => {
+            fork_err_with(UniLocyIncompleteError::new_err(msg), |py, val| {
+                val.setattr("reason", detail.reason.as_str())?;
+                val.setattr("elapsed_ms", detail.elapsed_ms)?;
+                val.setattr("limit_ms", detail.limit_ms)?;
+                val.setattr("max_iterations", detail.max_iterations)?;
+                val.setattr("completed_strata", detail.completed_strata)?;
+                val.setattr("total_strata", detail.total_strata)?;
+                val.setattr(
+                    "incomplete_rules",
+                    pyo3::types::PyList::new(py, &detail.incomplete_rules)?,
+                )?;
+                val.setattr(
+                    "skipped_rules",
+                    pyo3::types::PyList::new(py, &detail.skipped_rules)?,
+                )?;
+                val.setattr(
+                    "complement_rules_affected",
+                    pyo3::types::PyList::new(py, &detail.complement_rules_affected)?,
+                )?;
+                Ok(())
+            })
+        }
         Type { .. } => UniTypeError::new_err(msg),
         Constraint { .. } => UniConstraintError::new_err(msg),
         Storage { .. } => UniStorageError::new_err(msg),
@@ -495,6 +527,10 @@ pub fn register_exceptions(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> 
         py.get_type::<UniMemoryLimitExceededError>(),
     )?;
     m.add("UniTimeoutError", py.get_type::<UniTimeoutError>())?;
+    m.add(
+        "UniLocyIncompleteError",
+        py.get_type::<UniLocyIncompleteError>(),
+    )?;
 
     // Access control
     m.add("UniReadOnlyError", py.get_type::<UniReadOnlyError>())?;

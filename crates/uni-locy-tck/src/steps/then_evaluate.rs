@@ -85,6 +85,30 @@ async fn evaluation_should_succeed_with_timed_out(world: &mut LocyWorld, expecte
     );
 }
 
+#[then(
+    regex = r#"^evaluation should be incomplete with reason ['"](timeout|iteration_limit)['"]$"#
+)]
+async fn evaluation_should_be_incomplete_with_reason(world: &mut LocyWorld, expected: String) {
+    let locy_result = world
+        .locy_result()
+        .expect("No evaluation result found - did you forget to evaluate a program?");
+
+    let reason = match locy_result {
+        // allow_partial path: the partial result carries the diagnostics.
+        Ok(result) => result.incomplete.as_ref().map(|d| d.reason),
+        // Default path: an over-budget evaluation is a hard error.
+        Err(uni_common::UniError::LocyIncomplete { detail }) => Some(detail.reason),
+        Err(e) => panic!("expected LocyIncomplete (or a partial result), got error: {e}"),
+    };
+    let reason = reason.expect("evaluation completed normally; expected an incomplete result");
+    assert_eq!(
+        reason.as_str(),
+        expected,
+        "incomplete reason mismatch: got {}, expected {expected}",
+        reason.as_str(),
+    );
+}
+
 #[then("evaluation should fail")]
 async fn evaluation_should_fail(world: &mut LocyWorld) {
     let locy_result = world

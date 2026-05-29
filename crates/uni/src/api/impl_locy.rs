@@ -402,6 +402,7 @@ impl<'a> LocyEngine<'a> {
             approximate_slot,
             command_results_slot,
             timeout_flag,
+            incomplete_slot,
         ) = if let Some(program_exec) = exec_plan
             .as_any()
             .downcast_ref::<uni_query::query::df_graph::LocyProgramExec>(
@@ -417,6 +418,7 @@ impl<'a> LocyEngine<'a> {
                 program_exec.approximate_slot(),
                 program_exec.command_results_slot(),
                 program_exec.timeout_flag(),
+                program_exec.incomplete_slot(),
             )
         } else {
             (
@@ -426,7 +428,8 @@ impl<'a> LocyEngine<'a> {
                 Arc::new(std::sync::RwLock::new(Vec::new())),
                 Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
                 Arc::new(std::sync::RwLock::new(Vec::new())),
-                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                Arc::new(std::sync::atomic::AtomicU8::new(0)),
+                Arc::new(std::sync::RwLock::new(None)),
             )
         };
 
@@ -498,9 +501,10 @@ impl<'a> LocyEngine<'a> {
 
         let mut command_results = Vec::new();
         let mut collected_derives: Vec<CollectedDeriveOutput> = Vec::new();
-        let timed_out_early = timeout_flag.load(std::sync::atomic::Ordering::Relaxed);
-        // Skip command dispatch when evaluation timed out — the partial derived
-        // store may be incomplete and SLG/QUERY would hit the expired timeout.
+        let timed_out_early = timeout_flag.load(std::sync::atomic::Ordering::Relaxed) != 0;
+        // Skip command dispatch when evaluation was cut short — the partial
+        // derived store may be incomplete and SLG/QUERY would hit the expired
+        // budget.
         if !timed_out_early {
             for (cmd_idx, cmd) in compiled.commands.iter().enumerate() {
                 if let Some(result) = inline_map.get(&cmd_idx) {
@@ -591,7 +595,18 @@ impl<'a> LocyEngine<'a> {
 
         // 11. Build final LocyResult
         let warnings = warnings_slot.read().map(|w| w.clone()).unwrap_or_default();
-        let timed_out = timeout_flag.load(std::sync::atomic::Ordering::Relaxed);
+        let incomplete = incomplete_slot.read().ok().and_then(|g| g.clone());
+        // An over-budget evaluation is a hard error by default: partial,
+        // possibly-unsound facts must not be returned silently. Callers that
+        // want anytime / best-effort semantics opt in via `allow_partial`, which
+        // returns the partial result with its `incomplete` diagnostics populated.
+        if let Some(detail) = &incomplete
+            && !config.allow_partial
+        {
+            return Err(UniError::LocyIncomplete {
+                detail: Box::new(detail.clone()),
+            });
+        }
         Ok(build_locy_result(
             enriched_derived,
             command_results,
@@ -601,7 +616,7 @@ impl<'a> LocyEngine<'a> {
             warnings,
             approximate_groups,
             derived_fact_set,
-            timed_out,
+            incomplete,
         ))
     }
 
@@ -1404,10 +1419,14 @@ fn build_locy_result(
     warnings: Vec<RuntimeWarning>,
     approximate_groups: HashMap<String, Vec<String>>,
     derived_fact_set: Option<DerivedFactSet>,
-    timed_out: bool,
+    incomplete: Option<uni_common::LocyIncomplete>,
 ) -> LocyResult {
     let total_facts: usize = derived.values().map(|v| v.len()).sum();
-    orchestrator_stats.strata_evaluated = compiled.strata.len();
+    // Reflect how far evaluation actually got: the full count for a complete
+    // run, or the recorded completed-strata count when it was cut short.
+    orchestrator_stats.strata_evaluated = incomplete
+        .as_ref()
+        .map_or(compiled.strata.len(), |d| d.completed_strata);
     orchestrator_stats.derived_nodes = total_facts;
     orchestrator_stats.evaluation_time = evaluation_time;
 
@@ -1419,7 +1438,8 @@ fn build_locy_result(
         compile_warnings: compiled.warnings.clone(),
         approximate_groups,
         derived_fact_set,
-        timed_out,
+        timed_out: incomplete.is_some(),
+        incomplete,
     };
     let metrics = QueryMetrics {
         total_time: evaluation_time,

@@ -117,6 +117,38 @@ async fn when_evaluating_with_max_iterations(
     apply_derived_and_store(world, result).await;
 }
 
+#[when(
+    regex = r#"^evaluating the following Locy program with max_iterations (\d+) allowing partial:$"#
+)]
+async fn when_evaluating_with_max_iterations_allow_partial(
+    world: &mut LocyWorld,
+    max_iter: usize,
+    step: &cucumber::gherkin::Step,
+) {
+    let program = step
+        .docstring()
+        .expect("Expected a docstring with the Locy program to evaluate");
+
+    world
+        .init_db()
+        .await
+        .expect("Failed to initialize database");
+
+    let config = uni_locy::LocyConfig {
+        max_iterations: max_iter,
+        allow_partial: true,
+        ..Default::default()
+    };
+    let result = world
+        .db()
+        .session()
+        .locy_with(program)
+        .with_config(config)
+        .run()
+        .await;
+    apply_derived_and_store(world, result).await;
+}
+
 #[when("evaluating the following Locy program with strict_probability_domain:")]
 async fn when_evaluating_with_strict_probability(
     world: &mut LocyWorld,

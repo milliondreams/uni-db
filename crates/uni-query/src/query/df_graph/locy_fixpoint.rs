@@ -18,6 +18,7 @@ use crate::query::df_graph::locy_explain::{
 };
 use crate::query::df_graph::locy_fold::{FoldBinding, FoldExec};
 use crate::query::df_graph::locy_priority::PriorityExec;
+use crate::query::df_graph::locy_program::interruption;
 use crate::query::planner::LogicalPlan;
 use arrow_array::RecordBatch;
 use arrow_row::{RowConverter, SortField};
@@ -1197,7 +1198,7 @@ async fn run_fixpoint_loop(
     warnings_slot: Arc<StdRwLock<Vec<RuntimeWarning>>>,
     approximate_slot: Arc<StdRwLock<HashMap<String, Vec<String>>>>,
     top_k_proofs: usize,
-    timeout_flag: Arc<std::sync::atomic::AtomicBool>,
+    timeout_flag: Arc<std::sync::atomic::AtomicU8>,
     semiring_kind: SemiringKind,
     classifier_registry: Arc<ClassifierRegistry>,
     classifier_cache: Option<Arc<ModelInvocationCache>>,
@@ -1413,7 +1414,7 @@ async fn run_fixpoint_loop(
                 "fixpoint timeout after {} iterations; returning partial results",
                 iteration + 1,
             );
-            timeout_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            interruption::set(&timeout_flag, interruption::TIMEOUT);
             break;
         }
     }
@@ -1425,13 +1426,15 @@ async fn run_fixpoint_loop(
         }
     }
 
-    // If we exhausted all iterations without converging, set timeout flag
-    // and proceed with partial results rather than discarding all work.
-    if !converged && !timeout_flag.load(std::sync::atomic::Ordering::Relaxed) {
+    // If we exhausted all iterations without converging, record the iteration
+    // limit (distinct from a wall-clock timeout) and proceed with partial
+    // results rather than discarding all work. `set` is first-wins, so a
+    // wall-clock timeout recorded above is not overwritten here.
+    if !converged && interruption::reason(&timeout_flag).is_none() {
         tracing::warn!(
             "fixpoint did not converge after {max_iterations} iterations; returning partial results",
         );
-        timeout_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        interruption::set(&timeout_flag, interruption::ITERATION_LIMIT);
     }
 
     // Post-fixpoint processing per rule and collect output
@@ -5065,7 +5068,7 @@ pub struct FixpointExec {
     /// When > 0, retain at most this many proofs per fact (top-k provenance).
     top_k_proofs: usize,
     /// Shared flag: set to true on timeout to signal partial results.
-    timeout_flag: Arc<std::sync::atomic::AtomicBool>,
+    timeout_flag: Arc<std::sync::atomic::AtomicU8>,
     /// Active probability semiring (rollout D-7).
     semiring_kind: SemiringKind,
     /// Phase B Slice 3 registry of neural classifiers, keyed by the
@@ -5137,7 +5140,7 @@ impl FixpointExec {
         warnings_slot: Arc<StdRwLock<Vec<RuntimeWarning>>>,
         approximate_slot: Arc<StdRwLock<HashMap<String, Vec<String>>>>,
         top_k_proofs: usize,
-        timeout_flag: Arc<std::sync::atomic::AtomicBool>,
+        timeout_flag: Arc<std::sync::atomic::AtomicU8>,
     ) -> Self {
         Self::new_with_semiring_and_classifiers(
             rules,
@@ -5194,7 +5197,7 @@ impl FixpointExec {
         warnings_slot: Arc<StdRwLock<Vec<RuntimeWarning>>>,
         approximate_slot: Arc<StdRwLock<HashMap<String, Vec<String>>>>,
         top_k_proofs: usize,
-        timeout_flag: Arc<std::sync::atomic::AtomicBool>,
+        timeout_flag: Arc<std::sync::atomic::AtomicU8>,
         semiring_kind: SemiringKind,
     ) -> Self {
         Self::new_with_semiring_and_classifiers(
@@ -5252,7 +5255,7 @@ impl FixpointExec {
         warnings_slot: Arc<StdRwLock<Vec<RuntimeWarning>>>,
         approximate_slot: Arc<StdRwLock<HashMap<String, Vec<String>>>>,
         top_k_proofs: usize,
-        timeout_flag: Arc<std::sync::atomic::AtomicBool>,
+        timeout_flag: Arc<std::sync::atomic::AtomicU8>,
         semiring_kind: SemiringKind,
         classifier_registry: Arc<ClassifierRegistry>,
     ) -> Self {
@@ -5313,7 +5316,7 @@ impl FixpointExec {
         warnings_slot: Arc<StdRwLock<Vec<RuntimeWarning>>>,
         approximate_slot: Arc<StdRwLock<HashMap<String, Vec<String>>>>,
         top_k_proofs: usize,
-        timeout_flag: Arc<std::sync::atomic::AtomicBool>,
+        timeout_flag: Arc<std::sync::atomic::AtomicU8>,
         semiring_kind: SemiringKind,
         classifier_registry: Arc<ClassifierRegistry>,
         classifier_cache: Option<Arc<ModelInvocationCache>>,

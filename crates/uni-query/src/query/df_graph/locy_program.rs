@@ -150,9 +150,49 @@ pub struct LocyProgramExec {
     command_results_slot: Arc<StdRwLock<Vec<(usize, CommandResult)>>>,
     /// Top-k proof filtering: 0 = unlimited (default), >0 = retain at most k proofs per fact.
     top_k_proofs: usize,
-    /// Shared flag set to true when the evaluation is cut short by a timeout.
-    /// Checked after execution to populate `LocyResult.timed_out`.
-    timeout_flag: Arc<std::sync::atomic::AtomicBool>,
+    /// Shared interruption signal (see [`interruption`]): `interruption::NONE`
+    /// while running, non-zero once the stratum loop or fixpoint is cut short.
+    /// Decoded after execution to populate `incomplete_slot`.
+    timeout_flag: Arc<std::sync::atomic::AtomicU8>,
+    /// Shared slot populated when evaluation stops before completing. Holds the
+    /// stop reason plus the skipped / unsound-complement rule lists; read after
+    /// execution to populate `LocyResult.incomplete`. `None` for a complete run.
+    incomplete_slot: Arc<StdRwLock<Option<uni_common::LocyIncomplete>>>,
+}
+
+/// Encoding for the shared interruption signal threaded through the stratum
+/// loop and the recursive fixpoint as an `Arc<AtomicU8>`.
+///
+/// A single atomic byte records *why* evaluation stopped so the two layers can
+/// agree on a reason without a second channel. `NONE` means "running or
+/// completed normally".
+pub(crate) mod interruption {
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    use uni_common::LocyIncompleteReason;
+
+    /// No interruption: evaluation is running or completed normally.
+    pub(crate) const NONE: u8 = 0;
+    /// The wall-clock `timeout` budget was exhausted.
+    pub(crate) const TIMEOUT: u8 = 1;
+    /// A recursive stratum hit `max_iterations` without converging.
+    pub(crate) const ITERATION_LIMIT: u8 = 2;
+
+    /// Decodes the current interruption reason, if any.
+    pub(crate) fn reason(flag: &AtomicU8) -> Option<LocyIncompleteReason> {
+        match flag.load(Ordering::Relaxed) {
+            TIMEOUT => Some(LocyIncompleteReason::Timeout),
+            ITERATION_LIMIT => Some(LocyIncompleteReason::IterationLimit),
+            _ => None,
+        }
+    }
+
+    /// Records an interruption reason. First reason wins: a later, lower-priority
+    /// signal (non-convergence) never overwrites an earlier wall-clock timeout,
+    /// preserving the original precedence.
+    pub(crate) fn set(flag: &AtomicU8, code: u8) {
+        let _ = flag.compare_exchange(NONE, code, Ordering::Relaxed, Ordering::Relaxed);
+    }
 }
 
 impl fmt::Debug for LocyProgramExec {
@@ -394,7 +434,8 @@ impl LocyProgramExec {
             warnings_slot: Arc::new(StdRwLock::new(Vec::new())),
             command_results_slot: Arc::new(StdRwLock::new(Vec::new())),
             top_k_proofs,
-            timeout_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            timeout_flag: Arc::new(std::sync::atomic::AtomicU8::new(interruption::NONE)),
+            incomplete_slot: Arc::new(StdRwLock::new(None)),
         }
     }
 
@@ -456,12 +497,22 @@ impl LocyProgramExec {
         Arc::clone(&self.command_results_slot)
     }
 
-    /// Returns the shared timeout flag.
+    /// Returns the shared interruption signal.
     ///
-    /// After execution, if this flag is true, the evaluation was cut short by
-    /// a timeout and the derived store contains partial results.
-    pub fn timeout_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+    /// After execution, a non-zero value means the evaluation was cut short
+    /// (timeout or iteration limit) and the derived store holds partial results.
+    /// Prefer [`LocyProgramExec::incomplete_slot`] for the decoded diagnostics.
+    pub fn timeout_flag(&self) -> Arc<std::sync::atomic::AtomicU8> {
         Arc::clone(&self.timeout_flag)
+    }
+
+    /// Returns the shared incomplete-evaluation diagnostics slot.
+    ///
+    /// After execution, `Some(detail)` means evaluation stopped before
+    /// completing; `detail` names the skipped / unsound-complement rules and the
+    /// stop reason. `None` for a complete run.
+    pub fn incomplete_slot(&self) -> Arc<StdRwLock<Option<uni_common::LocyIncomplete>>> {
+        Arc::clone(&self.incomplete_slot)
     }
 }
 
@@ -544,6 +595,7 @@ impl ExecutionPlan for LocyProgramExec {
         let command_results_slot = Arc::clone(&self.command_results_slot);
         let top_k_proofs = self.top_k_proofs;
         let timeout_flag = Arc::clone(&self.timeout_flag);
+        let incomplete_slot = Arc::clone(&self.incomplete_slot);
         let semiring_kind = self.semiring_kind;
         let classifier_registry = Arc::clone(&self.classifier_registry);
         let classifier_cache = self.classifier_cache.as_ref().map(Arc::clone);
@@ -577,6 +629,7 @@ impl ExecutionPlan for LocyProgramExec {
                 command_results_slot,
                 top_k_proofs,
                 timeout_flag,
+                incomplete_slot,
                 semiring_kind,
                 classifier_registry,
                 classifier_cache,
@@ -859,7 +912,8 @@ async fn run_program(
     warnings_slot: Arc<StdRwLock<Vec<RuntimeWarning>>>,
     command_results_slot: Arc<StdRwLock<Vec<(usize, CommandResult)>>>,
     top_k_proofs: usize,
-    timeout_flag: Arc<std::sync::atomic::AtomicBool>,
+    timeout_flag: Arc<std::sync::atomic::AtomicU8>,
+    incomplete_slot: Arc<StdRwLock<Option<uni_common::LocyIncomplete>>>,
     semiring_kind: SemiringKind,
     classifier_registry: Arc<ClassifierRegistry>,
     classifier_cache: Option<Arc<ModelInvocationCache>>,
@@ -901,15 +955,20 @@ async fn run_program(
         }
     }
 
-    // Evaluate each stratum in topological order
-    for stratum in &strata {
+    // Evaluate each stratum in topological order, tracking how far we get so an
+    // interruption can distinguish rules left incomplete (partial fixpoint) from
+    // rules never reached (skipped) — neither is "genuinely empty".
+    let total_strata = strata.len();
+    let mut completed_strata = 0usize;
+    let mut partial_stratum: Option<usize> = None;
+    for (stratum_idx, stratum) in strata.iter().enumerate() {
         // Write cross-stratum facts into registry handles for strata we depend on
         write_cross_stratum_facts(&registry, &derived_store, stratum);
 
         let remaining_timeout = timeout.saturating_sub(start.elapsed());
         if remaining_timeout.is_zero() {
             tracing::warn!("Locy program timeout exceeded during stratum evaluation");
-            timeout_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            interruption::set(&timeout_flag, interruption::TIMEOUT);
             break;
         }
 
@@ -1163,6 +1222,60 @@ async fn run_program(
                 write_facts_to_registry(&registry, &rule.name, &facts);
                 derived_store.insert(rule.name.clone(), facts);
             }
+        }
+
+        // The recursive fixpoint can set the interruption flag mid-stratum (the
+        // non-recursive branch cannot). Stop here either way so later strata are
+        // recorded as skipped rather than passed off as empty.
+        if interruption::reason(&timeout_flag).is_some() {
+            partial_stratum = Some(stratum_idx);
+            break;
+        }
+        completed_strata += 1;
+    }
+
+    // If evaluation was cut short, record which rules were left incomplete vs.
+    // never reached, flagging any complement (`IS NOT`) rules among them as
+    // unsound. Read by impl_locy to choose Err(LocyIncomplete) vs. Ok(partial).
+    if let Some(reason) = interruption::reason(&timeout_flag) {
+        let skipped_start = match partial_stratum {
+            Some(i) => i + 1,
+            None => completed_strata,
+        };
+        let incomplete_rules: Vec<String> = partial_stratum
+            .map(|i| strata[i].rules.iter().map(|r| r.name.clone()).collect())
+            .unwrap_or_default();
+        let skipped_rules: Vec<String> = strata[skipped_start..]
+            .iter()
+            .flat_map(|s| s.rules.iter().map(|r| r.name.clone()))
+            .collect();
+        let mut complement_rules_affected = Vec::new();
+        for idx in partial_stratum
+            .into_iter()
+            .chain(skipped_start..total_strata)
+        {
+            for rule in &strata[idx].rules {
+                if rule
+                    .clauses
+                    .iter()
+                    .any(|c| c.is_refs.iter().any(|r| r.negated))
+                {
+                    complement_rules_affected.push(rule.name.clone());
+                }
+            }
+        }
+        if let Ok(mut slot) = incomplete_slot.write() {
+            *slot = Some(uni_common::LocyIncomplete {
+                reason,
+                elapsed_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                limit_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+                max_iterations,
+                completed_strata,
+                total_strata,
+                incomplete_rules,
+                skipped_rules,
+                complement_rules_affected,
+            });
         }
     }
 

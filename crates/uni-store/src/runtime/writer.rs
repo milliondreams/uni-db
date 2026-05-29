@@ -2299,7 +2299,7 @@ impl Writer {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub async fn insert_edge(
         &self,
         src_vid: Vid,

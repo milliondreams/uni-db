@@ -23,7 +23,7 @@ pub mod graph {
 }
 
 // Re-exports for convenience
-pub use api::error::{Result, UniError};
+pub use api::error::{LocyIncomplete, LocyIncompleteReason, Result, UniError};
 pub use config::{CloudStorageConfig, UniConfig};
 pub use core::edge_type::EdgeTypeId;
 pub use core::fork::{ForkId, ForkInfo, ForkRegistryFile, ForkStatus, SchemaDelta};

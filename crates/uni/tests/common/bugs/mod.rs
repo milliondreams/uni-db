@@ -22,6 +22,7 @@ pub mod issue_55_observed_in_growth;
 pub mod issue_55_observed_in_growth_no_embed;
 pub mod issue_55_probe_layer;
 pub mod issue_57_match_label_hash_index;
+pub mod locy_is_not_complement_recursion;
 pub mod repro_edge_export;
 pub mod test_issue_72_version_recovery;
 pub mod test_overflow_fix;

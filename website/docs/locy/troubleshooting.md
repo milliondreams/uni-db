@@ -34,13 +34,33 @@ Fix: The compiler warning is informational — values are clamped at runtime unl
 
 ## Runtime Issues
 
-### Too Many Iterations
+### Incomplete Evaluation (timeout or iteration limit)
 
-Increase `max_iterations` only after verifying recursion converges.
+An evaluation that exceeds its wall-clock `timeout` or its `max_iterations` cap is
+a **hard error by default** — it does *not* return partial facts silently. The
+error (`UniError::LocyIncomplete` in Rust; `UniLocyIncompleteError` in Python)
+distinguishes the two causes via `reason` (`timeout` vs `iteration_limit`) and
+names which rules were left incomplete or skipped, so a zero-row count is never
+mistaken for a genuinely empty result.
 
-### Timeout
+- **`reason = iteration_limit`**: recursion did not converge. Increase
+  `max_iterations` only after verifying the rule actually converges (a
+  non-monotone rule may never reach a fixed point).
+- **`reason = timeout`**: narrow query goals or reduce branching; raise `timeout`
+  with caution.
 
-Narrow query goals or reduce branching; tune `timeout` with caution.
+**Negation caveat:** any `IS NOT` / complement rule touched by the cutoff is
+listed in `complement_rules_affected`. Stratified negation over an unfinished
+relation is **unsound**, so those results must not be trusted at all — not even
+the "looks empty" ones.
+
+**Best-effort / anytime semantics:** to inspect the partial result instead of
+erroring, set `allow_partial` (Rust: `.allow_partial(true)` on the builder;
+Python: `session.locy_with(prog).with_config({"allow_partial": True}).run()`, or
+`LocyConfig(allow_partial=True)`). The returned result then has `timed_out =
+True` and an `incomplete` diagnostics object carrying the same `reason`,
+strata counts, and `incomplete_rules` / `skipped_rules` /
+`complement_rules_affected` lists. You are responsible for checking them.
 
 ### Memory Pressure
 

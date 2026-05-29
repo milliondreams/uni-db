@@ -75,6 +75,18 @@ pub enum UniError {
     #[error("Operation timed out after {timeout_ms}ms")]
     Timeout { timeout_ms: u64 },
 
+    /// A Locy program stopped before reaching its least fixed point because it
+    /// exceeded its wall-clock `timeout` or its `max_iterations` cap.
+    ///
+    /// This is the default outcome of an over-budget evaluation: partial results
+    /// are *not* returned silently. The boxed [`LocyIncomplete`] carries the
+    /// diagnostics (which rules were skipped, which complement rules are now
+    /// unsound, how far evaluation got). The partial facts themselves are not
+    /// embedded here — to recover them, re-run with `allow_partial` set, which
+    /// returns `Ok` with the partial result instead of this error.
+    #[error("Locy evaluation incomplete: {detail}")]
+    LocyIncomplete { detail: Box<LocyIncomplete> },
+
     #[error("Type error: expected {expected}, got {actual}")]
     Type { expected: String, actual: String },
 
@@ -247,3 +259,117 @@ pub enum UniError {
 }
 
 pub type Result<T> = std::result::Result<T, UniError>;
+
+/// Why a Locy evaluation stopped before reaching its least fixed point.
+///
+/// A wall-clock timeout and a non-convergence failure are both *incomplete*
+/// outcomes, but they call for different remedies (raise the timeout / fix a
+/// slow rule vs. raise `max_iterations` / fix a non-monotone rule), so they are
+/// reported distinctly rather than collapsed into one flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocyIncompleteReason {
+    /// The wall-clock `timeout` budget was exhausted mid-evaluation.
+    Timeout,
+    /// A recursive stratum hit `max_iterations` without converging.
+    IterationLimit,
+}
+
+impl LocyIncompleteReason {
+    /// Returns a stable machine-readable tag (`"timeout"` / `"iteration_limit"`).
+    ///
+    /// Used as the discriminator surfaced to non-Rust callers (e.g. the Python
+    /// bindings), where matching on a Rust enum is not available.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LocyIncompleteReason::Timeout => "timeout",
+            LocyIncompleteReason::IterationLimit => "iteration_limit",
+        }
+    }
+}
+
+impl std::fmt::Display for LocyIncompleteReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Diagnostics describing a Locy evaluation that stopped before completing.
+///
+/// Returned (boxed) inside [`UniError::LocyIncomplete`] when a program exceeds
+/// its time or iteration budget, and also attached to a `LocyResult` when the
+/// caller opts into partial results. The rule lists exist so a caller can tell
+/// "not evaluated" apart from "genuinely empty": any rule named in
+/// `incomplete_rules` or `skipped_rules` may be missing facts purely because
+/// evaluation was cut short, so a zero-row count for it is not authoritative.
+///
+/// # Examples
+/// ```
+/// use uni_common::{LocyIncomplete, LocyIncompleteReason};
+///
+/// let detail = LocyIncomplete {
+///     reason: LocyIncompleteReason::Timeout,
+///     elapsed_ms: 305_000,
+///     limit_ms: 300_000,
+///     max_iterations: 1000,
+///     completed_strata: 2,
+///     total_strata: 4,
+///     incomplete_rules: vec!["upstream_reaches".into()],
+///     skipped_rules: vec!["healthy_assets".into()],
+///     complement_rules_affected: vec!["healthy_assets".into()],
+/// };
+/// assert!(detail.to_string().contains("timeout"));
+/// assert!(detail.to_string().contains("UNSOUND"));
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocyIncomplete {
+    /// Why evaluation stopped.
+    pub reason: LocyIncompleteReason,
+    /// Wall-clock time elapsed when evaluation was cut short, in milliseconds.
+    pub elapsed_ms: u64,
+    /// The configured wall-clock `timeout`, in milliseconds.
+    pub limit_ms: u64,
+    /// The configured `max_iterations` cap for recursive strata.
+    pub max_iterations: usize,
+    /// Number of strata fully evaluated before the cutoff.
+    pub completed_strata: usize,
+    /// Total number of strata in the program.
+    pub total_strata: usize,
+    /// Rules in the stratum that was interrupted mid-evaluation. Their facts may
+    /// be a partial fixpoint rather than the least fixed point.
+    pub incomplete_rules: Vec<String>,
+    /// Rules in strata that were never reached. They derived no facts solely
+    /// because evaluation stopped first, not because their result is empty.
+    pub skipped_rules: Vec<String>,
+    /// Subset of the incomplete/skipped rules that use an `IS NOT` complement.
+    /// Stratified negation over a partial relation is unsound, so these results
+    /// must not be trusted at all — surfaced separately for emphasis.
+    pub complement_rules_affected: Vec<String>,
+}
+
+impl std::fmt::Display for LocyIncomplete {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{reason} after {elapsed_ms}ms (limit {limit_ms}ms, max_iterations {max_iters}); \
+             evaluated {done}/{total} strata, {n_incomplete} rule(s) incomplete, \
+             {n_skipped} rule(s) skipped",
+            reason = self.reason,
+            elapsed_ms = self.elapsed_ms,
+            limit_ms = self.limit_ms,
+            max_iters = self.max_iterations,
+            done = self.completed_strata,
+            total = self.total_strata,
+            n_incomplete = self.incomplete_rules.len(),
+            n_skipped = self.skipped_rules.len(),
+        )?;
+        if !self.complement_rules_affected.is_empty() {
+            write!(
+                f,
+                "; UNSOUND complement rule(s) affected: {:?}",
+                self.complement_rules_affected
+            )?;
+        }
+        Ok(())
+    }
+}

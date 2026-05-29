@@ -46,6 +46,15 @@ pub struct LocyConfig {
     pub max_iterations: usize,
     /// Overall evaluation timeout.
     pub timeout: Duration,
+    /// When `false` (default), an evaluation that exceeds `timeout` or
+    /// `max_iterations` returns [`UniError::LocyIncomplete`] rather than
+    /// silently yielding partial facts. Set to `true` for anytime / best-effort
+    /// semantics: the partial `LocyResult` is returned (`Ok`) with its
+    /// `incomplete` diagnostics populated, and the caller is responsible for
+    /// checking them.
+    ///
+    /// [`UniError::LocyIncomplete`]: uni_common::UniError::LocyIncomplete
+    pub allow_partial: bool,
     /// Maximum recursion depth for EXPLAIN derivation trees.
     pub max_explain_depth: usize,
     /// Maximum recursion depth for SLG resolution.
@@ -201,6 +210,7 @@ impl Default for LocyConfig {
         Self {
             max_iterations: 1000,
             timeout: Duration::from_secs(300),
+            allow_partial: false,
             max_explain_depth: 100,
             max_slg_depth: 1000,
             max_abduce_candidates: 20,

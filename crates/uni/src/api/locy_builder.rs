@@ -57,6 +57,20 @@ impl<'a> InnerLocyBuilder<'a> {
         self
     }
 
+    /// Opt into best-effort semantics: return the partial [`LocyResult`] (with
+    /// its `incomplete` diagnostics) instead of erroring when the evaluation
+    /// exceeds its `timeout` or `max_iterations`.
+    ///
+    /// Off by default — an over-budget evaluation otherwise returns
+    /// [`UniError::LocyIncomplete`]. Partial results may be unsound for
+    /// complement (`IS NOT`) rules; inspect `LocyResult::incomplete`.
+    ///
+    /// [`UniError::LocyIncomplete`]: uni_common::UniError::LocyIncomplete
+    pub fn allow_partial(mut self, allow: bool) -> Self {
+        self.config.allow_partial = allow;
+        self
+    }
+
     /// Override the maximum fixpoint iteration count.
     pub fn max_iterations(mut self, n: usize) -> Self {
         self.config.max_iterations = n;
@@ -128,6 +142,20 @@ impl<'a> LocyBuilder<'a> {
     /// Override the evaluation timeout.
     pub fn timeout(mut self, duration: std::time::Duration) -> Self {
         self.config.timeout = duration;
+        self
+    }
+
+    /// Opt into best-effort semantics: return the partial [`LocyResult`] (with
+    /// its `incomplete` diagnostics) instead of erroring when the evaluation
+    /// exceeds its `timeout` or `max_iterations`.
+    ///
+    /// Off by default — an over-budget evaluation otherwise returns
+    /// [`UniError::LocyIncomplete`]. Partial results may be unsound for
+    /// complement (`IS NOT`) rules; inspect `LocyResult::incomplete`.
+    ///
+    /// [`UniError::LocyIncomplete`]: uni_common::UniError::LocyIncomplete
+    pub fn allow_partial(mut self, allow: bool) -> Self {
+        self.config.allow_partial = allow;
         self
     }
 
@@ -218,6 +246,20 @@ impl<'a> TxLocyBuilder<'a> {
     /// Override the evaluation timeout.
     pub fn timeout(mut self, duration: std::time::Duration) -> Self {
         self.config.timeout = duration;
+        self
+    }
+
+    /// Opt into best-effort semantics: return the partial [`LocyResult`] (with
+    /// its `incomplete` diagnostics) instead of erroring when the evaluation
+    /// exceeds its `timeout` or `max_iterations`.
+    ///
+    /// Off by default — an over-budget evaluation otherwise returns
+    /// [`UniError::LocyIncomplete`]. Partial results may be unsound for
+    /// complement (`IS NOT`) rules; inspect `LocyResult::incomplete`.
+    ///
+    /// [`UniError::LocyIncomplete`]: uni_common::UniError::LocyIncomplete
+    pub fn allow_partial(mut self, allow: bool) -> Self {
+        self.config.allow_partial = allow;
         self
     }
 

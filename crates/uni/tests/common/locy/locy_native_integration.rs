@@ -326,12 +326,19 @@ async fn test_native_error_max_iterations() -> Result<()> {
         )
         .with_config(tight_config(1))
         .run()
-        .await?;
+        .await;
 
-    assert!(
-        result.timed_out,
-        "expected timed_out=true when max_iterations=1 is exceeded"
-    );
+    // Hitting max_iterations is now a hard error by default (non-convergence),
+    // reported distinctly from a wall-clock timeout.
+    let err = result.expect_err("max_iterations=1 should error by default, not return partial");
+    match err {
+        uni_db::UniError::LocyIncomplete { detail } => assert_eq!(
+            detail.reason,
+            uni_db::LocyIncompleteReason::IterationLimit,
+            "max_iterations exhaustion should report IterationLimit"
+        ),
+        other => panic!("expected UniError::LocyIncomplete, got {other:?}"),
+    }
     Ok(())
 }
 
@@ -356,12 +363,18 @@ async fn test_native_error_timeout() -> Result<()> {
         )
         .with_config(timeout_config())
         .run()
-        .await?;
+        .await;
 
-    assert!(
-        result.timed_out,
-        "expected timed_out=true for expired timeout"
-    );
+    // An expired wall-clock timeout is now a hard error by default.
+    let err = result.expect_err("an expired timeout should error by default, not return partial");
+    match err {
+        uni_db::UniError::LocyIncomplete { detail } => assert_eq!(
+            detail.reason,
+            uni_db::LocyIncompleteReason::Timeout,
+            "an expired wall-clock timeout should report Timeout"
+        ),
+        other => panic!("expected UniError::LocyIncomplete, got {other:?}"),
+    }
     Ok(())
 }
 

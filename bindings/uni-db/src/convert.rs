@@ -644,6 +644,9 @@ pub fn extract_locy_config(
     if let Some(v) = config.get("timeout") {
         locy_config.timeout = std::time::Duration::from_secs_f64(v.extract::<f64>(py)?);
     }
+    if let Some(v) = config.get("allow_partial") {
+        locy_config.allow_partial = v.extract::<bool>(py)?;
+    }
     if let Some(v) = config.get("max_explain_depth") {
         locy_config.max_explain_depth = v.extract::<usize>(py)?;
     }
@@ -698,6 +701,32 @@ pub fn extract_locy_config(
     locy_config.classifier_provenance_store =
         Some(std::sync::Arc::new(::uni_locy::NeuralProvenanceStore::new()));
     Ok(locy_config)
+}
+
+/// Convert the optional incompleteness diagnostics to a Python dict (or `None`).
+///
+/// Present only on the `allow_partial` path; `None` for a complete evaluation.
+fn locy_incomplete_to_py(
+    py: Python,
+    incomplete: Option<&uni_db::LocyIncomplete>,
+) -> PyResult<Py<PyAny>> {
+    let Some(d) = incomplete else {
+        return Ok(py.None());
+    };
+    let dict = PyDict::new(py);
+    dict.set_item("reason", d.reason.as_str())?;
+    dict.set_item("elapsed_ms", d.elapsed_ms)?;
+    dict.set_item("limit_ms", d.limit_ms)?;
+    dict.set_item("max_iterations", d.max_iterations)?;
+    dict.set_item("completed_strata", d.completed_strata)?;
+    dict.set_item("total_strata", d.total_strata)?;
+    dict.set_item("incomplete_rules", PyList::new(py, &d.incomplete_rules)?)?;
+    dict.set_item("skipped_rules", PyList::new(py, &d.skipped_rules)?)?;
+    dict.set_item(
+        "complement_rules_affected",
+        PyList::new(py, &d.complement_rules_affected)?,
+    )?;
+    Ok(dict.into())
 }
 
 /// Convert a LocyResult to a Python dict.
@@ -771,6 +800,12 @@ pub fn locy_result_to_py(py: Python, result: uni_db::locy::LocyResult) -> PyResu
         approx_dict.set_item(&rule_name, group_list)?;
     }
     dict.set_item("approximate_groups", approx_dict)?;
+
+    dict.set_item("timed_out", result.timed_out)?;
+    dict.set_item(
+        "incomplete",
+        locy_incomplete_to_py(py, result.incomplete.as_ref())?,
+    )?;
 
     Ok(dict.into())
 }
@@ -883,6 +918,8 @@ pub fn locy_result_to_py_class(
         None => py.None(),
     };
 
+    let incomplete = locy_incomplete_to_py(py, result.incomplete.as_ref())?;
+
     Ok(crate::types::PyLocyResult {
         derived: derived_dict.into(),
         stats: stats.into_py_any(py)?,
@@ -890,6 +927,8 @@ pub fn locy_result_to_py_class(
         warnings: warn_list.into(),
         approximate_groups: approx_dict.into(),
         derived_fact_set,
+        timed_out: result.timed_out,
+        incomplete,
     })
 }
 

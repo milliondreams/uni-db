@@ -235,11 +235,17 @@ async fn test_runtime_error_max_iterations() -> Result<()> {
         )
         .with_config(config)
         .run()
-        .await?;
+        .await;
 
+    // max_iterations=1 is now a hard error by default (non-convergence).
+    let err = result.expect_err("max_iterations=1 should error by default, not return partial");
     assert!(
-        result.timed_out,
-        "expected timed_out=true when max_iterations=1 is exceeded"
+        matches!(
+            err,
+            uni_db::UniError::LocyIncomplete { ref detail }
+                if detail.reason == uni_db::LocyIncompleteReason::IterationLimit
+        ),
+        "expected LocyIncomplete(IterationLimit), got {err:?}"
     );
     Ok(())
 }

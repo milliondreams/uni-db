@@ -32,10 +32,24 @@ pub struct LocyResult {
     /// When present, contains the derived facts from a session-level DERIVE
     /// that have not yet been applied. Use `tx.apply(derived)` to materialize.
     pub derived_fact_set: Option<DerivedFactSet>,
-    /// True when the evaluation was cut short by a timeout. The `derived` map
-    /// contains whatever facts were accumulated before the timeout fired.
-    /// Partial results may not satisfy the fixpoint invariant.
+    /// True when the evaluation was cut short by a timeout or iteration limit.
+    /// The `derived` map contains whatever facts were accumulated before the
+    /// cutoff; partial results may not satisfy the fixpoint invariant.
+    ///
+    /// Retained for back-compat; it is exactly `self.incomplete.is_some()`.
+    /// Prefer [`LocyResult::incomplete`] for the reason and the skipped/unsound
+    /// rule lists. Note this field is only ever `true` on the opt-in
+    /// `allow_partial` path — by default an incomplete evaluation returns
+    /// [`UniError::LocyIncomplete`] instead of a result.
+    ///
+    /// [`UniError::LocyIncomplete`]: uni_common::UniError::LocyIncomplete
     pub timed_out: bool,
+    /// Diagnostics for an evaluation that stopped before completing, present
+    /// only on the `allow_partial` path. Names which rules were left
+    /// incomplete or skipped (so a zero-row count can be distinguished from a
+    /// genuinely empty rule) and which complement rules are consequently
+    /// unsound. `None` for a normal, complete evaluation.
+    pub incomplete: Option<uni_common::LocyIncomplete>,
 }
 
 /// Result of executing a single Phase 4 command.

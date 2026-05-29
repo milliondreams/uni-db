@@ -905,6 +905,15 @@ pub struct PyLocyResult {
     pub approximate_groups: Py<PyAny>,
     /// Opaque derived fact set, pass to `tx.apply()` to materialize.
     pub derived_fact_set: Py<PyAny>,
+    /// `True` when evaluation was cut short (timeout or iteration limit). Only
+    /// ever set on the `allow_partial=True` path — by default an over-budget
+    /// evaluation raises `UniLocyIncompleteError` instead of returning a result.
+    pub timed_out: bool,
+    /// Diagnostics dict for a partial evaluation, or `None` when complete. Keys:
+    /// `reason`, `elapsed_ms`, `limit_ms`, `max_iterations`, `completed_strata`,
+    /// `total_strata`, `incomplete_rules`, `skipped_rules`,
+    /// `complement_rules_affected`.
+    pub incomplete: Py<PyAny>,
 }
 
 #[pymethods]
@@ -2790,7 +2799,7 @@ pub struct PyLocyConfig {
 impl PyLocyConfig {
     #[new]
     #[pyo3(signature = (
-        max_iterations=None, timeout_secs=None, max_explain_depth=None,
+        max_iterations=None, timeout_secs=None, allow_partial=None, max_explain_depth=None,
         max_slg_depth=None, max_abduce_candidates=None, max_abduce_results=None,
         max_derived_bytes=None, deterministic_best_by=None,
         strict_probability_domain=None, probability_epsilon=None,
@@ -2801,6 +2810,7 @@ impl PyLocyConfig {
     fn new(
         max_iterations: Option<usize>,
         timeout_secs: Option<f64>,
+        allow_partial: Option<bool>,
         max_explain_depth: Option<usize>,
         max_slg_depth: Option<usize>,
         max_abduce_candidates: Option<usize>,
@@ -2820,6 +2830,9 @@ impl PyLocyConfig {
         }
         if let Some(v) = timeout_secs {
             cfg.timeout = std::time::Duration::from_secs_f64(v);
+        }
+        if let Some(v) = allow_partial {
+            cfg.allow_partial = v;
         }
         if let Some(v) = max_explain_depth {
             cfg.max_explain_depth = v;

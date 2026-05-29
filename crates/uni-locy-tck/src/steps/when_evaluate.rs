@@ -126,6 +126,21 @@ async fn when_evaluating_with_max_iterations(
     run_with_config(world, step, |c| c.max_iterations = max_iter).await;
 }
 
+#[when(
+    regex = r#"^evaluating the following Locy program with max_iterations (\d+) allowing partial:$"#
+)]
+async fn when_evaluating_with_max_iterations_allow_partial(
+    world: &mut LocyWorld,
+    max_iter: usize,
+    step: &cucumber::gherkin::Step,
+) {
+    run_with_config(world, step, |c| {
+        c.max_iterations = max_iter;
+        c.allow_partial = true;
+    })
+    .await;
+}
+
 #[when("evaluating the following Locy program with strict_probability_domain:")]
 async fn when_evaluating_with_strict_probability(
     world: &mut LocyWorld,

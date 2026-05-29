@@ -237,8 +237,14 @@ jobs:
 
       - name: Install Python dependencies (uni-db)
         working-directory: bindings/uni-db
+<<<<<<< HEAD
         # `notebook-runtime` extra (numpy / pyarrow / onnxruntime) is
         # required by the flagship Locy notebook verifier steps below.
+=======
+        # `notebook-runtime` extra (numpy/onnxruntime/pyarrow) is required by
+        # the flagship Locy notebooks executed below. They're opt-in so the
+        # default wheel stays lean; the verifier job installs them here.
+>>>>>>> feat/locy-timeout-hard-error
         run: uv sync --group dev --extra notebook-runtime
 
       - name: Build Python wheel (uni-db)

@@ -68,8 +68,7 @@ async fn test_pagerank_dangling_nodes() -> anyhow::Result<()> {
     let planner = QueryPlanner::new(schema_manager.schema());
 
     // Run PageRank
-    let cypher =
-        "CALL uni.algo.pageRank(['Node'], ['LINK']) YIELD nodeId, score RETURN nodeId, score";
+    let cypher = "CALL uni.algo.pageRank({nodeLabels: ['Node'], edgeTypes: ['LINK']}, {}) YIELD nodeId, score RETURN nodeId, score";
     let query_ast = uni_cypher::parse(cypher)?;
     let plan = planner.plan(query_ast)?;
     let results = executor
@@ -229,7 +228,7 @@ async fn test_wcc_singletons() -> anyhow::Result<()> {
     let planner = QueryPlanner::new(schema_manager.schema());
 
     // Run WCC
-    let cypher = "CALL uni.algo.wcc(['Node'], ['LINK']) YIELD nodeId, componentId RETURN nodeId, componentId";
+    let cypher = "CALL uni.algo.wcc({nodeLabels: ['Node'], edgeTypes: ['LINK']}, {}) YIELD nodeId, componentId RETURN nodeId, componentId";
     let query_ast = uni_cypher::parse(cypher)?;
     let plan = planner.plan(query_ast)?;
     let results = executor
@@ -335,7 +334,7 @@ async fn test_louvain_disconnected() -> anyhow::Result<()> {
     let planner = QueryPlanner::new(schema_manager.schema());
 
     // Run Louvain
-    let cypher = "CALL uni.algo.louvain(['Node'], ['LINK']) YIELD nodeId, communityId RETURN nodeId, communityId";
+    let cypher = "CALL uni.algo.louvain({nodeLabels: ['Node'], edgeTypes: ['LINK']}, {}) YIELD nodeId, communityId RETURN nodeId, communityId";
     let query_ast = uni_cypher::parse(cypher)?;
     let plan = planner.plan(query_ast)?;
     let results = executor

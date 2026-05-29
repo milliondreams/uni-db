@@ -1,0 +1,32 @@
+[package]
+name = "uni-plugin-custom"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+description = "Meta-plugin for uni-db — apoc.custom.declare* analogue"
+keywords = ["plugin", "graph", "database", "meta"]
+categories = ["database"]
+
+[dependencies]
+uni-plugin = { workspace = true }
+uni-cypher = { workspace = true }
+uni-common = { workspace = true }
+arrow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+datafusion = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+semver = "1.0"
+smol_str = { version = "0.3", features = ["serde"] }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile = { workspace = true }

@@ -13,16 +13,45 @@ use crate::types::{
 };
 use uni_cypher::locy_ast::OutputType;
 
+/// Predicate returning aggregate monotonicity by name.
+///
+/// `Some(true)` — registered as a monotone Locy aggregate, sound to use in
+/// recursive strata. `Some(false)` — registered but non-monotone, must be
+/// rejected in recursion. `None` — unknown to the oracle, treated as
+/// rejection in recursive strata.
+pub type MonotonicityOracle<'a> = &'a (dyn Fn(&str) -> Option<bool> + 'a);
+
+/// Default oracle for callers without a `PluginRegistry`.
+///
+/// Honors the `M`-prefix convention (`MMAX`/`MMIN`/`MCOUNT`/`MNOR`/`MPROD`/
+/// `MSUM`) as a user-asserted monotonicity contract. Returns `None` for
+/// everything else, which the recursive-stratum check rejects.
+///
+/// Hosts that load `uni-plugin-builtin` should supply a registry-backed
+/// oracle instead so user-registered aggregates participate in the check.
+#[must_use]
+pub fn default_monotonicity_oracle(name: &str) -> Option<bool> {
+    match name.to_uppercase().as_str() {
+        "MMAX" | "MMIN" | "MCOUNT" | "MNOR" | "MPROD" | "MSUM" => Some(true),
+        _ => None,
+    }
+}
+
 /// Validate all rules and produce `CompiledRule` entries plus warnings.
 ///
 /// `model_catalog` carries the Phase B `CREATE MODEL` declarations; rule
 /// bodies that reference a model name via function-call syntax are
 /// validated for arity here. An empty catalog (the legacy path) is
 /// equivalent to "no models registered".
+///
+/// `is_monotonic` resolves aggregate function names to a tri-state
+/// monotonicity verdict used for the recursive-stratum check (see
+/// [`MonotonicityOracle`]).
 pub fn check(
     rule_groups: &HashMap<String, Vec<&RuleDefinition>>,
     strat: &StratificationResult,
     model_catalog: &HashMap<String, CompiledModel>,
+    is_monotonic: MonotonicityOracle<'_>,
 ) -> Result<(HashMap<String, CompiledRule>, Vec<CompilerWarning>), LocyCompileError> {
     let mut compiled_rules = HashMap::new();
     let mut warnings = Vec::new();
@@ -42,14 +71,13 @@ pub fn check(
 
         // Implicit PROB: if a fold uses MNOR/MPROD, mark the matching yield column as PROB
         for def in definitions.iter() {
-            for fold in &def.fold {
-                if let Some(func_name) = extract_function_name(&fold.aggregate)
-                    && matches!(func_name.to_uppercase().as_str(), "MNOR" | "MPROD")
+            for_each_fold_call(&def.fold, |fold, name, _args| {
+                if matches!(name.to_uppercase().as_str(), "MNOR" | "MPROD")
                     && let Some(col) = yield_schema.iter_mut().find(|c| c.name == fold.name)
                 {
                     col.is_prob = true;
                 }
-            }
+            });
         }
 
         // Phase B A5: auto-flag PROB for YIELD items whose expression is
@@ -106,7 +134,7 @@ pub fn check(
             }
 
             if is_recursive {
-                check_non_monotonic_in_recursion(rule_name, def)?;
+                check_non_monotonic_in_recursion(rule_name, def, is_monotonic)?;
                 check_msum_warning(rule_name, def, &mut warnings);
                 check_probability_domain_warning(rule_name, def, &mut warnings);
                 // F1: clause has FOLD + recursive IS-ref (same SCC) + no ALONG
@@ -114,7 +142,7 @@ pub fn check(
                 check_fold_in_recursive_path(rule_name, def, scc_rules, &mut warnings);
             }
 
-            check_best_by_monotonic_fold(rule_name, def)?;
+            check_best_by_monotonic_fold(rule_name, def, is_monotonic)?;
 
             // Validate model invocations in this clause's body. Each call
             // `model_name(arg1, ..., argN)` must (1) refer to a declared
@@ -373,55 +401,45 @@ fn collect_prev_refs(expr: &LocyExpr) -> Vec<String> {
 
 // ─── Non-monotonic in recursion ──────────────────────────────────────────────
 
-/// Returns `true` if the fold function name is a monotonic variant (MSUM, MMAX, etc.).
-fn is_monotonic_fold_name(name: &str) -> bool {
-    matches!(
-        name.to_uppercase().as_str(),
-        "MSUM" | "MMAX" | "MMIN" | "MCOUNT" | "MNOR" | "MPROD"
-    )
-}
-
 fn check_non_monotonic_in_recursion(
     rule_name: &str,
     def: &RuleDefinition,
+    is_monotonic: MonotonicityOracle<'_>,
 ) -> Result<(), LocyCompileError> {
-    for fold in &def.fold {
-        if let Some(func_name) = extract_function_name(&fold.aggregate)
-            && !is_monotonic_fold_name(&func_name)
-        {
-            return Err(LocyCompileError::NonMonotonicInRecursion {
+    try_for_each_fold_call(&def.fold, |_fold, name, _args| {
+        if matches!(is_monotonic(name), Some(true)) {
+            Ok(())
+        } else {
+            Err(LocyCompileError::NonMonotonicInRecursion {
                 rule: rule_name.to_string(),
-                aggregate: func_name,
-            });
+                aggregate: name.to_string(),
+            })
         }
-    }
-    Ok(())
+    })
 }
 
 // ─── MSUM warning ────────────────────────────────────────────────────────────
 
 fn check_msum_warning(rule_name: &str, def: &RuleDefinition, warnings: &mut Vec<CompilerWarning>) {
-    for fold in &def.fold {
-        if let Some(func_name) = extract_function_name(&fold.aggregate)
-            && func_name.to_uppercase() == "MSUM"
-            && let Expr::FunctionCall { args, .. } = &fold.aggregate
-        {
-            let is_literal = args
-                .first()
-                .is_some_and(|arg| matches!(arg, Expr::Literal(_)));
-            if !is_literal {
-                warnings.push(CompilerWarning {
-                    code: WarningCode::MsumNonNegativity,
-                    message: format!(
-                        "MSUM argument in fold '{}' may be negative; \
-                         ensure non-negativity for convergence",
-                        fold.name
-                    ),
-                    rule_name: rule_name.to_string(),
-                });
-            }
+    for_each_fold_call(&def.fold, |fold, name, args| {
+        if name.to_uppercase() != "MSUM" {
+            return;
         }
-    }
+        let is_literal = args
+            .first()
+            .is_some_and(|arg| matches!(arg, Expr::Literal(_)));
+        if !is_literal {
+            warnings.push(CompilerWarning {
+                code: WarningCode::MsumNonNegativity,
+                message: format!(
+                    "MSUM argument in fold '{}' may be negative; \
+                     ensure non-negativity for convergence",
+                    fold.name
+                ),
+                rule_name: rule_name.to_string(),
+            });
+        }
+    });
 }
 
 // ─── MNOR/MPROD probability domain warning ───────────────────────────────────
@@ -431,28 +449,26 @@ fn check_probability_domain_warning(
     def: &RuleDefinition,
     warnings: &mut Vec<CompilerWarning>,
 ) {
-    for fold in &def.fold {
-        if let Some(func_name) = extract_function_name(&fold.aggregate)
-            && matches!(func_name.to_uppercase().as_str(), "MNOR" | "MPROD")
-            && let Expr::FunctionCall { args, .. } = &fold.aggregate
-        {
-            let is_literal = args
-                .first()
-                .is_some_and(|arg| matches!(arg, Expr::Literal(_)));
-            if !is_literal {
-                warnings.push(CompilerWarning {
-                    code: WarningCode::ProbabilityDomainViolation,
-                    message: format!(
-                        "{} argument in fold '{}' may be outside [0,1]; \
-                         ensure values are valid probabilities for convergence",
-                        func_name.to_uppercase(),
-                        fold.name
-                    ),
-                    rule_name: rule_name.to_string(),
-                });
-            }
+    for_each_fold_call(&def.fold, |fold, name, args| {
+        let upper = name.to_uppercase();
+        if !matches!(upper.as_str(), "MNOR" | "MPROD") {
+            return;
         }
-    }
+        let is_literal = args
+            .first()
+            .is_some_and(|arg| matches!(arg, Expr::Literal(_)));
+        if !is_literal {
+            warnings.push(CompilerWarning {
+                code: WarningCode::ProbabilityDomainViolation,
+                message: format!(
+                    "{upper} argument in fold '{}' may be outside [0,1]; \
+                     ensure values are valid probabilities for convergence",
+                    fold.name
+                ),
+                rule_name: rule_name.to_string(),
+            });
+        }
+    });
 }
 
 // ─── Phase D F3 case 3: positive + complement on same subject ──────────────
@@ -562,21 +578,21 @@ fn check_cross_predicate_correlation(
 fn check_best_by_monotonic_fold(
     rule_name: &str,
     def: &RuleDefinition,
+    is_monotonic: MonotonicityOracle<'_>,
 ) -> Result<(), LocyCompileError> {
     if def.best_by.is_none() {
         return Ok(());
     }
-    for fold in &def.fold {
-        if let Some(func_name) = extract_function_name(&fold.aggregate)
-            && is_monotonic_fold_name(&func_name)
-        {
-            return Err(LocyCompileError::BestByWithMonotonicFold {
+    try_for_each_fold_call(&def.fold, |_fold, name, _args| {
+        if matches!(is_monotonic(name), Some(true)) {
+            Err(LocyCompileError::BestByWithMonotonicFold {
                 rule: rule_name.to_string(),
-                fold: func_name,
-            });
+                fold: name.to_string(),
+            })
+        } else {
+            Ok(())
         }
-    }
-    Ok(())
+    })
 }
 
 // ─── F1: FOLD in recursive path without ALONG ───────────────────────────────
@@ -1435,9 +1451,31 @@ fn extract_model_invocations(
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-fn extract_function_name(expr: &Expr) -> Option<String> {
-    match expr {
-        Expr::FunctionCall { name, .. } => Some(name.clone()),
-        _ => None,
+/// Iterate folds whose aggregate is a `FunctionCall`, yielding the function
+/// name and argument slice. Folds whose aggregate is not a function call are
+/// skipped — every caller of this module's checks treats non-call aggregates
+/// as inert.
+fn for_each_fold_call<'a>(
+    folds: &'a [FoldBinding],
+    mut visit: impl FnMut(&'a FoldBinding, &str, &'a [Expr]),
+) {
+    for fold in folds {
+        if let Expr::FunctionCall { name, args, .. } = &fold.aggregate {
+            visit(fold, name, args);
+        }
     }
+}
+
+/// Error-returning variant of [`for_each_fold_call`] for checks that
+/// short-circuit with a `LocyCompileError`.
+fn try_for_each_fold_call<'a, E>(
+    folds: &'a [FoldBinding],
+    mut visit: impl FnMut(&'a FoldBinding, &str, &'a [Expr]) -> Result<(), E>,
+) -> Result<(), E> {
+    for fold in folds {
+        if let Expr::FunctionCall { name, args, .. } = &fold.aggregate {
+            visit(fold, name, args)?;
+        }
+    }
+    Ok(())
 }

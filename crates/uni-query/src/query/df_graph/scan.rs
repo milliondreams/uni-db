@@ -2027,10 +2027,57 @@ async fn columnar_scan_vertex_batch_static(
     };
     let combined_filter = combine_lance_filters(vid_part.as_deref(), extra_lance_filter);
     let lance_columns_refs: Vec<&str> = lance_columns.iter().map(|s| s.as_str()).collect();
-    let lance_batch = storage
-        .scan_vertex_table(label, &lance_columns_refs, combined_filter.as_deref())
-        .await
-        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+
+    // M5h.2: route through plugin Storage if one is registered for
+    // this label. v1 ships reads only — writes still go to native
+    // backend. v1 ignores `combined_filter` when delegating (the
+    // planner re-filters via the surrounding Filter node); per-plugin
+    // filter pushdown is a v1.1 follow-up (`TODO(M5h.2-filter)`).
+    let plugin_batch: Option<arrow::record_batch::RecordBatch> = match graph_ctx.plugin_registry() {
+        Some(reg) => match reg.lookup_label_storage(label) {
+            Some(plugin_storage) => {
+                let mut stream = plugin_storage.read_batch(label, None).await.map_err(|e| {
+                    datafusion::error::DataFusionError::Execution(format!(
+                        "plugin Storage::read_batch({label}) failed: {} (code 0x{:x})",
+                        e.message, e.code
+                    ))
+                })?;
+                use futures::StreamExt;
+                let mut batches: Vec<arrow::record_batch::RecordBatch> = Vec::new();
+                let mut schema_ref: Option<SchemaRef> = None;
+                while let Some(b) = stream.next().await {
+                    let b = b.map_err(|e| {
+                        datafusion::error::DataFusionError::Execution(format!(
+                            "plugin Storage stream({label}) errored: {e}"
+                        ))
+                    })?;
+                    if schema_ref.is_none() {
+                        schema_ref = Some(b.schema());
+                    }
+                    batches.push(b);
+                }
+                if let Some(s) = schema_ref {
+                    Some(arrow::compute::concat_batches(&s, &batches).map_err(|e| {
+                        datafusion::error::DataFusionError::Execution(format!(
+                            "plugin Storage concat({label}) failed: {e}"
+                        ))
+                    })?)
+                } else {
+                    None
+                }
+            }
+            None => None,
+        },
+        None => None,
+    };
+
+    let lance_batch = match plugin_batch {
+        Some(b) => Some(b),
+        None => storage
+            .scan_vertex_table(label, &lance_columns_refs, combined_filter.as_deref())
+            .await
+            .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?,
+    };
 
     // MVCC dedup the Lance batch
     let lance_deduped = mvcc_dedup_to_option(lance_batch, "_vid")?;

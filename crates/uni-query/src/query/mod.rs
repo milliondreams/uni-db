@@ -14,6 +14,8 @@
 
 pub mod df_graph;
 pub mod df_planner;
+pub mod df_udaf_plugin;
+pub mod df_udfs_plugin;
 pub mod executor;
 pub mod locy_planner;
 pub mod planner;

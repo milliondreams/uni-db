@@ -12,10 +12,8 @@ use uni_db::{ExplainOutput, ProfileOutput, QueryResult, Uni};
 pub async fn run_repl(db: Uni) -> Result<()> {
     let mut rl = DefaultEditor::new()?;
 
-    // Load history if exists
-    if rl.load_history("history.txt").is_err() {
-        // No history found
-    }
+    // Load history if it exists; absence is not an error.
+    let _ = rl.load_history("history.txt");
 
     println!("{}", "Welcome to UniDB CLI".green().bold());
     println!("Type 'help' for commands or enter a Cypher query.");
@@ -71,14 +69,30 @@ fn print_help() {
     println!();
 }
 
+/// Strip a case-insensitive leading keyword (e.g. `EXPLAIN`, `PROFILE`)
+/// from `query` and return the remainder, trimmed. Returns `None` if the
+/// keyword is not a prefix (after leading whitespace).
+fn strip_query_keyword<'a>(query: &'a str, keyword: &str) -> Option<&'a str> {
+    let trimmed = query.trim_start();
+    let head = trimmed.get(..keyword.len())?;
+    if !head.eq_ignore_ascii_case(keyword) {
+        return None;
+    }
+    // The next byte (if any) must be whitespace, so we don't match
+    // identifiers like `EXPLAINING` as `EXPLAIN`.
+    match trimmed.as_bytes().get(keyword.len()) {
+        Some(b) if !b.is_ascii_whitespace() => None,
+        _ => Some(trimmed[keyword.len()..].trim_start()),
+    }
+}
+
 pub async fn execute_query(db: &Uni, query: &str) {
     let start = Instant::now();
 
-    let query_upper = query.trim_start().to_uppercase();
-    if query_upper.starts_with("EXPLAIN") {
+    if let Some(clean_query) = strip_query_keyword(query, "EXPLAIN") {
         let result = {
             let s = db.session();
-            s.query_with(query).explain().await
+            s.query_with(clean_query).explain().await
         };
         match result {
             Ok(output) => print_explain(output, start.elapsed()),
@@ -87,8 +101,7 @@ pub async fn execute_query(db: &Uni, query: &str) {
         return;
     }
 
-    if query_upper.starts_with("PROFILE") {
-        let clean_query = query[7..].trim();
+    if let Some(clean_query) = strip_query_keyword(query, "PROFILE") {
         let result = {
             let s = db.session();
             s.query_with(clean_query).profile().await
@@ -159,9 +172,12 @@ fn print_results(results: QueryResult, duration: std::time::Duration) {
     }
 
     table.printstd();
+    // `table.len()` includes the header row added above, so subtract it for the data-row count.
+    let data_rows = table.len().saturating_sub(1);
+    let row_word = if data_rows == 1 { "row" } else { "rows" };
     println!(
         "{}",
-        format!("{} rows in {:?}", table.len(), duration).dimmed()
+        format!("{data_rows} {row_word} in {duration:?}").dimmed()
     );
 }
 
@@ -213,4 +229,57 @@ fn print_profile(output: ProfileOutput) {
         )
         .dimmed()
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_query_keyword;
+
+    #[test]
+    fn strips_uppercase_keyword() {
+        assert_eq!(
+            strip_query_keyword("EXPLAIN MATCH (n) RETURN n", "EXPLAIN"),
+            Some("MATCH (n) RETURN n")
+        );
+    }
+
+    #[test]
+    fn strips_lowercase_and_mixed_case_keyword() {
+        assert_eq!(
+            strip_query_keyword("profile MATCH (n) RETURN n", "PROFILE"),
+            Some("MATCH (n) RETURN n")
+        );
+        assert_eq!(
+            strip_query_keyword("Profile MATCH (n) RETURN n", "PROFILE"),
+            Some("MATCH (n) RETURN n")
+        );
+    }
+
+    #[test]
+    fn tolerates_leading_whitespace() {
+        assert_eq!(
+            strip_query_keyword("   EXPLAIN MATCH (n) RETURN n", "EXPLAIN"),
+            Some("MATCH (n) RETURN n")
+        );
+    }
+
+    #[test]
+    fn rejects_keyword_not_followed_by_whitespace() {
+        // `EXPLAINING` must not be stripped as `EXPLAIN`. This was the
+        // bug class the byte-slice `query[7..]` form could enable.
+        assert!(strip_query_keyword("EXPLAINING MATCH (n)", "EXPLAIN").is_none());
+        assert!(strip_query_keyword("PROFILER", "PROFILE").is_none());
+    }
+
+    #[test]
+    fn returns_none_when_keyword_absent() {
+        assert!(strip_query_keyword("MATCH (n) RETURN n", "EXPLAIN").is_none());
+    }
+
+    #[test]
+    fn handles_query_equal_to_bare_keyword() {
+        // `EXPLAIN` alone (no body) — function should return Some("")
+        // rather than panic or misparse.
+        assert_eq!(strip_query_keyword("EXPLAIN", "EXPLAIN"), Some(""));
+    }
 }

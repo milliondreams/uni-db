@@ -6,9 +6,6 @@ pub enum BticError {
     #[error("INV-1: lo ({lo}) must be less than hi ({hi})")]
     BoundOrdering { lo: i64, hi: i64 },
 
-    #[error("INV-2: sentinel value used as finite bound")]
-    SentinelExclusivity,
-
     #[error("INV-4: non-zero reserved/version/flags bits in meta word")]
     ReservedBits,
 

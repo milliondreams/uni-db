@@ -19,7 +19,46 @@ uni-algo = { workspace = true }
 uni-query = { workspace = true }
 uni-query-functions = { workspace = true }
 uni-crdt = { workspace = true }
-mimalloc = { version = "0.1", default-features = false, optional = true }
+uni-bulk = { workspace = true }
+uni-fork = { workspace = true }
+# `local_dynamic_tls`: mimalloc's C lib defaults to the initial-exec TLS
+# model, which requires static-TLS surplus reserved at program startup.
+# That surplus is tiny and unavailable when `uni-db` is built as a
+# `dlopen`-loaded cdylib (the `bindings/uni-db` Python extension sets
+# `MiMalloc` as its `#[global_allocator]`), so loading fails with
+# "cannot allocate memory in static TLS block". The local-dynamic model
+# resolves TLS at access time and loads cleanly under dlopen.
+mimalloc = { version = "0.1", default-features = false, features = ["local_dynamic_tls"], optional = true }
+uni-plugin = { workspace = true }
+uni-plugin-host = { workspace = true }
+uni-plugin-builtin = { workspace = true }
+uni-plugin-apoc-core = { workspace = true, optional = true }
+uni-plugin-custom = { workspace = true }
+# Optional Extism (bytes-in/bytes-out WASM) loader. Behind the
+# `extism-plugins` feature so the routine `Uni` build doesn't pay the
+# wasmtime+extism compile cost.
+uni-plugin-extism = { workspace = true, optional = true }
+# Optional Component Model (typed WIT contracts) loader. Behind
+# `wasm-plugins` so the routine build doesn't pay the wasmtime cost.
+uni-plugin-wasm = { workspace = true, optional = true }
+# Rhai (host-embedded scripting) loader. Pure Rust, no C toolchain or
+# WASM wrapper, so it's part of the default feature set — unlike the
+# WASM loaders which gate their wasmtime weight behind opt-in features.
+uni-plugin-rhai = { workspace = true, optional = true }
+# PyO3 (live Python callables) loader. Off by default — pulls in
+# libpython linkage on the host. Embedders building Python extensions
+# (e.g. `bindings/uni-db`) enable this via the `pyo3-plugins` feature.
+uni-plugin-pyo3 = { workspace = true, optional = true, features = ["pyo3"] }
+# We do NOT inherit the workspace `pyo3` features list — the workspace
+# enables `extension-module` (correct for `bindings/uni-db`, which is
+# loaded by Python and must not link libpython itself). For standalone
+# `cargo test -p uni-db --features pyo3-plugins` we want libpython
+# linked, which requires omitting `extension-module` and adding
+# `auto-initialize`. When `bindings/uni-db` builds this crate with
+# `pyo3-plugins` enabled, Cargo unifies features — bindings still
+# applies `extension-module` from its own pyo3 dep, and
+# `auto-initialize` becomes a no-op there.
+pyo3 = { version = "0.27", optional = true, features = ["abi3-py310", "auto-initialize"] }
 tokio = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
@@ -30,6 +69,9 @@ log = { workspace = true }
 metrics = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
+arrow-ipc = "57.2.0"
+serde_bytes = "0.11"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 uuid = { workspace = true }
 object_store = { workspace = true }
 url = { workspace = true }
@@ -44,6 +86,15 @@ tokio-util = { workspace = true }
 scopeguard = "1"
 tempfile = { workspace = true }
 dashmap = "6.0"
+smol_str = "0.3"
+# M11: OpenTelemetry layer for the `observability` module. Embedders
+# opt in via `crate::observability::init_otel_subscriber(...)`; nothing
+# is auto-installed (would conflict with embedders' own subscribers).
+tracing-subscriber = { workspace = true }
+tracing-opentelemetry = "0.28"
+opentelemetry = "0.27"
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"] }
 # Note: uni-db has no direct ort / tokenizers / hf-hub / ndarray consumers
 # after the LocalOnnxRerankerProvider hoist into uni-xervo (0.5.2). All ONNX
 # access flows through uni-xervo's provider facades.
@@ -59,6 +110,9 @@ parquet = { workspace = true }
 csv = { workspace = true }
 env_logger = { workspace = true }
 tracing-subscriber = { workspace = true }
+# Test-only: hooks_bridge_test.rs constructs `SmolStr` keys for the
+# phased `ParseContext::with_params` builder (M5e v1.1 ABI surface).
+smol_str = "0.3"
 
 [[bench]]
 name = "algo_benchmarks"
@@ -87,6 +141,8 @@ harness = false
 [features]
 default = [
     "lance-backend",
+    "apoc-core",
+    "rhai-plugins",
     "provider-candle",
     "provider-mistralrs",
     "provider-onnx",
@@ -100,6 +156,24 @@ default = [
     "provider-azure-openai",
 ]
 lance-backend = ["uni-store/lance-backend"]
+# APOC-equivalent built-in procedures and scalar functions implemented in
+# Rust (apoc.bitwise.*, future apoc.text/coll/math/refactor/schema/atomic).
+# Default-on. Library embedders who don't want APOC content disable it.
+apoc-core = ["dep:uni-plugin-apoc-core"]
+# Enables `Uni::load_wasm_extism` — load Extism-shaped WASM plugins at
+# runtime. Pulls in `wasmtime` + `extism-sdk`; off by default.
+extism-plugins = ["dep:uni-plugin-extism"]
+# Enables `Uni::load_wasm_component` — load Component Model WASM
+# plugins at runtime. Pulls in wasmtime 41 + cranelift; off by default.
+wasm-plugins = ["dep:uni-plugin-wasm"]
+# Enables `Uni::load_rhai_plugin` — load Rhai-script plugins at runtime.
+# Rhai is pure-Rust, no C toolchain or WASM wrapper; on by default.
+rhai-plugins = ["dep:uni-plugin-rhai"]
+# Enables `Uni::load_python_plugin` — load PyO3 live-callable plugins at
+# runtime. Off by default because it pulls in libpython. Embedders
+# building Python extensions enable this transitively; standalone Rust
+# embedders typically leave it off.
+pyo3-plugins = ["dep:uni-plugin-pyo3", "dep:pyo3"]
 snapshot-internals = []
 storage-internals = []
 provider-candle = ["uni-xervo/provider-candle"]

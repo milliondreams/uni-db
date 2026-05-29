@@ -23,8 +23,8 @@ impl GraphAlgoAdapter for TopologicalSortAdapter {
         vec![("nodeId", ValueType::Int), ("order", ValueType::Int)]
     }
 
-    fn to_config(_args: Vec<Value>) -> TopologicalSortConfig {
-        TopologicalSortConfig {}
+    fn to_config(_args: Vec<Value>) -> Result<TopologicalSortConfig> {
+        Ok(TopologicalSortConfig {})
     }
 
     fn map_result(result: <Self::Algo as Algorithm>::Result) -> Result<Vec<AlgoResultRow>> {

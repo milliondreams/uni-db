@@ -323,32 +323,130 @@ impl Executor {
             ))
         };
 
-        // Two-mode session construction:
+        // Two-mode session construction (hot/cold template path, main)
+        // fused with plugin-framework scalar/optimizer registration
+        // (plugin-fw).
         //
-        // Hot path (no custom UDFs): clone the pre-built template — an
-        // O(1) Arc bump on the inner `SessionState`. Skips the ~140 µs cost
-        // of `SessionContext::new()` + `register_cypher_udfs()`. Safe to
-        // share because no code mutates the session via `.write()` outside
-        // of this function's cold-path branch below.
+        // Hot path: clone the pre-built `df_session_template` — an O(1)
+        // Arc bump on the inner `SessionState`. Skips the ~140 µs cost of
+        // `SessionContext::new()` + `register_cypher_udfs()`. The template
+        // only has the built-in Cypher UDFs baked in (see
+        // `Uni::build` → `register_cypher_udfs`), so it is ONLY safe to
+        // reuse when this query needs no per-query dynamic registration:
+        //   - no legacy `CustomFunctionRegistry` scalars,
+        //   - no plugin-registered optimizer rules,
+        //   - no host-level plugin scalars (`Uni::load_*_plugin`),
+        //   - no session-scoped plugin scalars.
         //
-        // Cold path (custom UDFs present, or no template available):
-        // construct a fresh, isolated `SessionContext` so custom-UDF
-        // registration does not leak into the shared template.
+        // Cold path: construct a fresh, isolated `SessionContext` (folding
+        // in any plugin optimizer rules) and register the dynamic scalar
+        // sets so they do not leak into the shared template.
         let has_custom_udfs = self
             .custom_function_registry
             .as_ref()
             .is_some_and(|r| !r.is_empty());
-        let session =
-            if let (Some(tmpl), false) = (self.df_session_template.as_ref(), has_custom_udfs) {
-                (**tmpl).clone()
+        let host_plugin_registry = self
+            .procedure_registry
+            .as_ref()
+            .and_then(|pr| pr.plugin_registry());
+        // Optimizer rules come from the host plugin registry (the legacy
+        // `CustomFunctionRegistry` only ever carried scalar fns). When no
+        // host registry is attached, there are no plugin optimizer rules.
+        let optimizer_providers = host_plugin_registry
+            .as_ref()
+            .map(|pr| pr.optimizer_rules())
+            .unwrap_or_default();
+        let session_local_registry =
+            crate::query::df_udfs_plugin::current_session_plugin_registry();
+        let needs_dynamic_registration = has_custom_udfs
+            || !optimizer_providers.is_empty()
+            || host_plugin_registry.is_some()
+            || session_local_registry.is_some();
+
+        let session = if let (Some(tmpl), false) = (
+            self.df_session_template.as_ref(),
+            needs_dynamic_registration,
+        ) {
+            // Hot path: clone the template (Cypher UDFs already registered).
+            (**tmpl).clone()
+        } else {
+            // Cold path: build a fresh session, optionally with any
+            // plugin-registered optimizer rules folded in.
+            //
+            // M5h: build a `SessionContext` that includes any
+            // plugin-registered optimizer rules. The rule chain is
+            // snapshotted at session-construction time; reload discipline
+            // is M10's problem (see `docs/proposals/plugin_framework.md`).
+            let session = if optimizer_providers.is_empty() {
+                SessionContext::new()
             } else {
-                let s = SessionContext::new();
-                crate::query::df_udfs::register_cypher_udfs(&s)?;
-                if let Some(ref registry) = self.custom_function_registry {
-                    crate::query::df_udfs::register_custom_udfs(&s, registry)?;
+                use datafusion::execution::session_state::SessionStateBuilder;
+                use uni_plugin::traits::operator::OptimizerPhase;
+                let mut builder = SessionStateBuilder::new().with_default_features();
+                for provider in optimizer_providers.iter() {
+                    match provider.phase() {
+                        OptimizerPhase::Logical => {
+                            builder = builder.with_optimizer_rule(provider.rule());
+                        }
+                        OptimizerPhase::Physical => {
+                            if let Some(rule) = provider.physical_rule() {
+                                builder = builder.with_physical_optimizer_rule(rule);
+                            } else {
+                                tracing::debug!(
+                                    target: "uni.plugin.registry",
+                                    "physical-phase provider returned no physical_rule(); skipping"
+                                );
+                            }
+                        }
+                        OptimizerPhase::Both => {
+                            builder = builder.with_optimizer_rule(provider.rule());
+                            if let Some(rule) = provider.physical_rule() {
+                                builder = builder.with_physical_optimizer_rule(rule);
+                            }
+                        }
+                        _ => {
+                            tracing::debug!(
+                                target: "uni.plugin.registry",
+                                "skipping optimizer rule for unknown phase"
+                            );
+                        }
+                    }
                 }
-                s
+                let state = builder.build();
+                SessionContext::new_with_state(state)
             };
+            crate::query::df_udfs::register_cypher_udfs(&session)?;
+            // Instance-scope, legacy `CustomFunctionRegistry` shadow path
+            // (db.register_function() entries + apoc-core mirrors). Routed
+            // through the plugin-registry adapter (plugin-fw).
+            if let Some(ref registry) = self.custom_function_registry {
+                crate::query::df_udfs_plugin::register_custom_functions_as_plugin_scalars(
+                    &session, registry,
+                )?;
+            }
+            // Instance-scope, **host** plugin registry (M8.6 follow-up):
+            // `Uni::load_python_plugin` / `Uni::load_rhai_plugin` /
+            // `Uni::load_wasm_*` and other host-level plugin-load paths
+            // register into `UniInner.plugin_registry`. The executor
+            // reaches that registry via the procedure-registry's
+            // attached handle (set by `Uni::build` at construction time).
+            // Without this branch, scalars added through
+            // `Uni::load_*_plugin` were invisible to Cypher's UDF
+            // resolution despite being directly invokable via
+            // `db.plugin_registry().scalar_fn(...)`.
+            if let Some(ref host_pr) = host_plugin_registry {
+                crate::query::df_udfs_plugin::register_plugin_scalar_udfs(&session, host_pr)?;
+            }
+            // Session-scope (M8.6): when the call is inside a
+            // `scoped_with_session_plugin_registry` scope (set by a host
+            // crate's per-query execution path), register the session's
+            // local plugin scalars *last* so they shadow instance entries
+            // by name (DataFusion's `register_udf` is last-write-wins).
+            if let Some(ref session_local) = session_local_registry {
+                crate::query::df_udfs_plugin::register_plugin_scalar_udfs(&session, session_local)?;
+            }
+            session
+        };
         let session_ctx = Arc::new(SyncRwLock::new(session));
 
         let mut planner = HybridPhysicalPlanner::with_l0_context(
@@ -365,8 +463,30 @@ impl Executor {
         if let Some(ref registry) = self.procedure_registry {
             planner = planner.with_procedure_registry(registry.clone());
         }
+        // M5b follow-up #4: thread the host's plugin registry through to
+        // the physical planner so `plan_vector_knn` can consult
+        // `register_index_handle` for plugin-supplied vector index
+        // handles. The procedure registry's attached plugin registry is
+        // the host's actual instance (set by `Uni::build`, and what
+        // `db.plugin_registry()` returns to user code). The legacy
+        // `CustomFunctionRegistry` only ever carried scalar fns (no index
+        // handles / optimizer rules), so it is not a source here.
+        let host_plugin_registry = self
+            .procedure_registry
+            .as_ref()
+            .and_then(|r| r.plugin_registry());
+        if let Some(registry) = host_plugin_registry {
+            planner = planner.with_plugin_registry(registry);
+        }
         if let Some(ref xervo_runtime) = self.xervo_runtime {
             planner = planner.with_xervo_runtime(xervo_runtime.clone());
+        }
+        // FU-1 / M11 #6: thread the outer transaction's writer handle
+        // through so declared `WRITE`-mode procedures invoked from
+        // this query can run their Cypher bodies via the write-enabled
+        // inner-query host.
+        if let Some(writer) = &self.writer {
+            planner = planner.with_writer(Arc::clone(writer));
         }
 
         Ok((session_ctx, planner, prop_manager_arc))
@@ -1016,6 +1136,14 @@ impl Executor {
                 | "uni.vector.query"
                 | "uni.fts.query"
                 | "uni.search"
+                // M5g — `uni.create.vNode` produces a typed Node yield
+                // via the planner-level node-shape expansion in
+                // `GraphProcedureCallExec`; only the DataFusion path
+                // honours that, so route it there explicitly. (vEdge
+                // emits a self-contained Struct column and works on
+                // either path — list both for symmetry.)
+                | "uni.create.vNode"
+                | "uni.create.vEdge"
         ) || name.starts_with("uni.algo.")
     }
 

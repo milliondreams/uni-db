@@ -321,9 +321,19 @@ impl LocyResult {
     }
 
     /// Get column names from the first Query command result's first row.
+    ///
+    /// Column names are returned in deterministic (sorted) order. The
+    /// underlying [`FactRow`] is a `HashMap`, whose iteration order is
+    /// randomized per-run; callers (snapshot tests, golden outputs,
+    /// downstream display) rely on a stable ordering.
     pub fn columns(&self) -> Option<Vec<String>> {
-        self.rows()
-            .and_then(|rows| rows.first().map(|row| row.keys().cloned().collect()))
+        self.rows().and_then(|rows| {
+            rows.first().map(|row| {
+                let mut cols: Vec<String> = row.keys().cloned().collect();
+                cols.sort();
+                cols
+            })
+        })
     }
 
     /// Get execution statistics.
@@ -384,6 +394,39 @@ impl CommandResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: previously, `columns()` returned `HashMap::keys()` order,
+    /// which is randomized per-run. Snapshot tests and downstream consumers
+    /// rely on deterministic column ordering.
+    #[test]
+    fn columns_returned_in_sorted_order() {
+        let mut row = FactRow::new();
+        // Insert in deliberately non-alphabetic order. With a HashMap this
+        // is enough to surface nondeterminism on many runs; sorting makes
+        // the test deterministic regardless of hasher state.
+        row.insert("zeta".into(), Value::Int(1));
+        row.insert("alpha".into(), Value::Int(2));
+        row.insert("mu".into(), Value::Int(3));
+
+        let result = LocyResult {
+            derived: HashMap::new(),
+            stats: LocyStats::default(),
+            command_results: vec![CommandResult::Query(vec![row])],
+            warnings: Vec::new(),
+            compile_warnings: Vec::new(),
+            approximate_groups: HashMap::new(),
+            derived_fact_set: None,
+            timed_out: false,
+        };
+
+        let cols = result
+            .columns()
+            .expect("expected columns for non-empty result");
+        assert_eq!(
+            cols,
+            vec!["alpha".to_owned(), "mu".to_owned(), "zeta".to_owned()]
+        );
+    }
 
     #[test]
     fn abduce_result_serializes_to_json() {

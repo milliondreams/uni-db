@@ -28,7 +28,7 @@ impl GraphAlgoAdapter for RandomWalkAdapter {
         vec![("path", ValueType::List)]
     }
 
-    fn to_config(args: Vec<Value>) -> RandomWalkConfig {
+    fn to_config(args: Vec<Value>) -> Result<RandomWalkConfig> {
         let walk_length = args[0].as_u64().unwrap_or(5) as usize;
         let walks_per_node = args[1].as_u64().unwrap_or(1) as usize;
 
@@ -45,13 +45,13 @@ impl GraphAlgoAdapter for RandomWalkAdapter {
             vids
         };
 
-        RandomWalkConfig {
+        Ok(RandomWalkConfig {
             walk_length,
             walks_per_node,
             start_nodes,
             return_param: 1.0,
             in_out_param: 1.0,
-        }
+        })
     }
 
     fn map_result(result: <Self::Algo as Algorithm>::Result) -> Result<Vec<AlgoResultRow>> {

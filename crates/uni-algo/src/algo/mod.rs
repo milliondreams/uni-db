@@ -84,6 +84,7 @@ impl AlgorithmRegistry {
         registry.register(cypher::AStarProcedure);
         registry.register(cypher::BellmanFordProcedure::default());
         registry.register(cypher::BidirectionalDijkstraProcedure::default());
+        registry.register(cypher::DijkstraProcedure::default());
         registry.register(cypher::KShortestPathsProcedure::default());
         registry.register(cypher::MstProcedure::default());
         registry.register(cypher::MaxMatchingProcedure::default());
@@ -120,26 +121,5 @@ impl AlgorithmRegistry {
 impl Default for AlgorithmRegistry {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-/// Configuration for algorithm execution
-#[derive(Debug, Clone)]
-pub struct AlgorithmConfig {
-    /// Maximum memory for all projections (bytes)
-    pub max_projection_memory: usize,
-    /// Maximum vertices per projection
-    pub max_vertices: usize,
-    /// Warn if L0 exceeds this fraction of graph
-    pub l0_warning_threshold: f64,
-}
-
-impl Default for AlgorithmConfig {
-    fn default() -> Self {
-        Self {
-            max_projection_memory: 1 << 30, // 1 GB
-            max_vertices: 100_000_000,      // 100M
-            l0_warning_threshold: 0.1,      // 10%
-        }
     }
 }

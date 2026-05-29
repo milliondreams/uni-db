@@ -26,8 +26,8 @@ impl GraphAlgoAdapter for CycleDetectionAdapter {
         ]
     }
 
-    fn to_config(_args: Vec<Value>) -> CycleDetectionConfig {
-        CycleDetectionConfig {}
+    fn to_config(_args: Vec<Value>) -> Result<CycleDetectionConfig> {
+        Ok(CycleDetectionConfig {})
     }
 
     fn map_result(result: <Self::Algo as Algorithm>::Result) -> Result<Vec<AlgoResultRow>> {

@@ -1,0 +1,41 @@
+[package]
+name = "uni-plugin-extism"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+description = "Extism (bytes-in/bytes-out WASM) loader for the uni-db plugin framework"
+keywords = ["plugin", "wasm", "extism", "graph", "database"]
+categories = ["database", "wasm"]
+
+[dependencies]
+uni-plugin = { workspace = true }
+uni-plugin-wasm-rt = { workspace = true }
+arrow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+datafusion = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+futures = { workspace = true }
+
+# extism-sdk is the heaviest dep; gated behind the `extism-runtime` feature
+# so embedders that only want the trait surface (e.g., for compile-time
+# Rust-only plugins) can opt out.
+extism = { version = "1", optional = true }
+
+[features]
+default = ["extism-runtime"]
+extism-runtime = ["dep:extism"]
+
+[dev-dependencies]
+tokio = { workspace = true }
+# `wat` assembles minimal valid WASM from text for instantiation tests
+# without committing binary fixtures.
+wat = "1"

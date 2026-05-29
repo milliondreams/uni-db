@@ -15,10 +15,15 @@ crate-type = ["cdylib"]
 [dependencies]
 pyo3 = { version = "0.27", features = ["extension-module", "abi3-py310"] }
 pyo3-async-runtimes = { version = "0.27", features = ["tokio-runtime"] }
-uni-db = { workspace = true, default-features = true, features = ["mimalloc"] }
+uni-db = { workspace = true, default-features = true, features = ["mimalloc", "pyo3-plugins"] }
 uni-locy = { workspace = true }
 uni-common = { workspace = true }
 uni-store = { workspace = true }
+uni-plugin = { workspace = true }
+uni-plugin-rhai = { workspace = true }
+# M8 F2: enable the live PyO3 plugin loader (decorator surfaces on
+# Database / Session). Same workspace pin as uni-plugin-pyo3.
+uni-plugin-pyo3 = { workspace = true, features = ["pyo3"] }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 anyhow = { workspace = true }

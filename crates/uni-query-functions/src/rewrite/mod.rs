@@ -34,6 +34,7 @@
 /// See `rules/README.md` for a guide on implementing custom rewrite rules.
 pub mod context;
 pub mod error;
+pub mod function_rename;
 pub mod registry;
 pub mod rule;
 pub mod rules;

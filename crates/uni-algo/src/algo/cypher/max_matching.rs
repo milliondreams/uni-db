@@ -27,8 +27,8 @@ impl GraphAlgoAdapter for MaxMatchingAdapter {
         ]
     }
 
-    fn to_config(_args: Vec<Value>) -> MaximumMatchingConfig {
-        MaximumMatchingConfig {}
+    fn to_config(_args: Vec<Value>) -> Result<MaximumMatchingConfig> {
+        Ok(MaximumMatchingConfig {})
     }
 
     fn map_result(result: <Self::Algo as Algorithm>::Result) -> Result<Vec<AlgoResultRow>> {

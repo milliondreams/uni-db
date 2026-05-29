@@ -3,6 +3,9 @@
 //
 // Tests for SessionHook lifecycle: before/after query and commit hooks.
 
+// Tests cover the deprecated `Session::add_hook` API path; suppress the warning here.
+#![allow(deprecated)]
+
 use anyhow::Result;
 use std::sync::{Arc, Mutex};
 use uni_db::{CommitHookContext, DataType, HookContext, QueryMetrics, SessionHook, Uni};

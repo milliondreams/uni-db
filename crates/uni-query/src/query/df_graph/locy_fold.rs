@@ -17,86 +17,122 @@ use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskCo
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::{Stream, TryStreamExt};
+use smol_str::SmolStr;
 use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use uni_locy::SemiringKind;
+use uni_plugin::traits::locy::LocyAggregate;
 
 use super::locy_explain::ProofTerm;
 
-/// Direction of monotonicity for a fold aggregate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MonotonicDirection {
-    /// Value can only stay the same or increase across iterations.
-    NonDecreasing,
-    /// Value can only stay the same or decrease across iterations.
-    NonIncreasing,
+/// Plugin-aware resolution of an aggregate name to a [`uni_plugin::traits::locy::LocyAggregate`].
+///
+/// Looks up `name` (case-folded) against the supplied [`uni_plugin::PluginRegistry`]
+/// under the reserved built-in namespace. Returns `None` if no plugin claims
+/// the aggregate.
+///
+/// Accepts legacy grammar aliases: the bare (`SUM`/`MAX`/`MIN`/`COUNT`) and
+/// `M`-prefixed (`MSUM`/`MMAX`/`MMIN`/`MCOUNT`) forms, plus `NOR`→`MNOR`,
+/// `PROD`→`MPROD`, and `COUNTALL` (which has no arguments) collapses to `COUNT`.
+///
+/// # Examples
+///
+/// ```ignore
+/// use uni_query::query::df_graph::locy_fold::{default_locy_plugin_registry, resolve_locy_aggregate};
+/// let r = default_locy_plugin_registry();
+/// let agg = resolve_locy_aggregate(&r, "SUM");
+/// assert!(agg.is_some());
+/// ```
+/// Returns the monotonicity verdict for an aggregate name resolved through
+/// the supplied [`uni_plugin::PluginRegistry`].
+///
+/// `Some(true)` — registered monotone aggregate (`Semilattice.monotone_join`
+/// is `true`), sound in recursive Locy strata. `Some(false)` — registered
+/// but non-monotone, must be rejected in recursion. `None` — unregistered.
+///
+/// Aliases (`MSUM`/`MMAX`/`MMIN`/`MCOUNT`/`NOR`/`PROD`/`COUNTALL`) are
+/// canonicalized by [`resolve_locy_aggregate`] before lookup.
+#[must_use]
+pub fn is_monotonic_aggregate(registry: &uni_plugin::PluginRegistry, name: &str) -> Option<bool> {
+    resolve_locy_aggregate(registry, name).map(|e| e.aggregate.semilattice().monotone_join)
 }
 
-/// Aggregate function kind for FOLD bindings.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FoldAggKind {
-    Sum,
-    Max,
-    Min,
-    Count,
-    /// Count all rows in a group (like SQL `COUNT(*)`), ignoring nulls.
-    CountAll,
-    Avg,
-    Collect,
-    Nor,  // Noisy-OR: 1 − ∏(1 − pᵢ)
-    Prod, // Product:  ∏ pᵢ
+#[must_use]
+pub fn resolve_locy_aggregate(
+    registry: &uni_plugin::PluginRegistry,
+    name: &str,
+) -> Option<std::sync::Arc<uni_plugin::registry::LocyAggregateEntry>> {
+    let canonical = match name.to_uppercase().as_str() {
+        "MMAX" => "MAX".to_owned(),
+        "MMIN" => "MIN".to_owned(),
+        "MCOUNT" => "COUNT".to_owned(),
+        "NOR" => "MNOR".to_owned(),
+        "PROD" => "MPROD".to_owned(),
+        "COUNTALL" => "COUNT".to_owned(),
+        other => other.to_owned(),
+    };
+    let qname = uni_plugin::QName::builtin(canonical);
+    // M8.6 dual-consult: session-local first (if a Session has set the
+    // task-local via `scoped_with_session_plugin_registry`), then fall
+    // back to the caller-supplied (instance) registry. This makes
+    // session-scoped Locy aggregates visible without changing any
+    // caller of `resolve_locy_aggregate`.
+    if let Some(session_pr) = crate::current_session_plugin_registry()
+        && let Some(entry) = session_pr.locy_aggregate(&qname)
+    {
+        return Some(entry);
+    }
+    registry.locy_aggregate(&qname)
 }
 
-impl FoldAggKind {
-    /// Returns `true` if this aggregate is monotonic (safe for fixpoint iteration).
-    pub fn is_monotonic(&self) -> bool {
-        matches!(
-            self,
-            Self::Sum
-                | Self::Max
-                | Self::Min
-                | Self::Count
-                | Self::CountAll
-                | Self::Nor
-                | Self::Prod
-        )
-    }
-
-    /// Returns the monotonicity direction, or `None` for non-monotonic aggregates.
-    pub fn monotonicity_direction(&self) -> Option<MonotonicDirection> {
-        match self {
-            Self::Sum | Self::Max | Self::Count | Self::CountAll | Self::Nor => {
-                Some(MonotonicDirection::NonDecreasing)
-            }
-            Self::Min | Self::Prod => Some(MonotonicDirection::NonIncreasing),
-            Self::Avg | Self::Collect => None,
-        }
-    }
-
-    /// Returns the identity element for this aggregate, or `None` for non-monotonic aggregates.
-    pub fn identity(&self) -> Option<f64> {
-        match self {
-            Self::Sum | Self::Count | Self::CountAll | Self::Nor => Some(0.0),
-            Self::Max => Some(f64::NEG_INFINITY),
-            Self::Min => Some(f64::INFINITY),
-            Self::Prod => Some(1.0),
-            Self::Avg | Self::Collect => None,
-        }
-    }
+/// Returns a process-wide [`uni_plugin::PluginRegistry`] pre-populated with
+/// the built-in Locy aggregates from `uni-plugin-builtin`.
+///
+/// Used by [`crate::query::df_planner::HybridPhysicalPlanner`] as a default
+/// when the host has not supplied its own registry. Lazily initialized
+/// at first call and shared thereafter.
+///
+/// # Panics
+///
+/// Panics only on framework-internal invariants: capability gating, qname
+/// validation, or duplicate commit. The built-in registration set is fixed
+/// and cannot trigger any of these at runtime.
+#[must_use]
+pub fn default_locy_plugin_registry() -> Arc<uni_plugin::PluginRegistry> {
+    static REGISTRY: OnceLock<Arc<uni_plugin::PluginRegistry>> = OnceLock::new();
+    Arc::clone(REGISTRY.get_or_init(|| {
+        let registry = uni_plugin::PluginRegistry::new();
+        let plugin_id = uni_plugin::PluginId::new(uni_plugin::QName::BUILTIN_NS);
+        let caps = uni_plugin::CapabilitySet::from_iter_of([uni_plugin::Capability::LocyAggregate]);
+        let mut r = uni_plugin::PluginRegistrar::new(plugin_id, &caps, &registry);
+        uni_plugin_builtin::locy_aggregates::register_into(&mut r)
+            .expect("built-in locy aggregates register");
+        r.commit_to_registry().expect("commit built-in aggregates");
+        Arc::new(registry)
+    }))
 }
 
 /// A single FOLD binding: aggregate an input column into an output column.
+///
+/// Carries the canonical aggregate name (used as a sentinel for `COUNTALL`
+/// and for batch-path dispatch in [`FoldExec`]) alongside the resolved
+/// [`LocyAggregate`] trait object (used by the fixpoint runtime). The name
+/// is one of: `SUM`, `MIN`, `MAX`, `COUNT`, `COUNTALL`, `AVG`, `COLLECT`,
+/// `MNOR`, `MPROD`.
 #[derive(Debug, Clone)]
 pub struct FoldBinding {
     pub output_name: String,
-    pub kind: FoldAggKind,
+    /// Canonical uppercase aggregate name.
+    pub name: SmolStr,
+    /// Resolved aggregate trait object (registry-backed).
+    pub aggregate: Arc<dyn LocyAggregate>,
     pub input_col_index: usize,
     /// Column name for name-based resolution (more robust than positional index).
-    /// `None` for CountAll which has no input column.
+    /// `None` for `COUNTALL` which has no input column.
     pub input_col_name: Option<String>,
 }
 
@@ -245,12 +281,10 @@ impl FoldExec {
 
         // Fold output columns
         for binding in fold_bindings {
-            let output_type = match binding.kind {
-                FoldAggKind::Sum | FoldAggKind::Avg | FoldAggKind::Nor | FoldAggKind::Prod => {
-                    DataType::Float64
-                }
-                FoldAggKind::Count | FoldAggKind::CountAll => DataType::Int64,
-                FoldAggKind::Max | FoldAggKind::Min => {
+            let output_type = match binding.name.as_str() {
+                "SUM" | "AVG" | "MNOR" | "MPROD" => DataType::Float64,
+                "COUNT" | "COUNTALL" => DataType::Int64,
+                "MAX" | "MIN" => {
                     let idx = binding
                         .input_col_name
                         .as_ref()
@@ -262,7 +296,8 @@ impl FoldExec {
                         DataType::Float64
                     }
                 }
-                FoldAggKind::Collect => DataType::LargeBinary,
+                "COLLECT" => DataType::LargeBinary,
+                _ => DataType::Float64,
             };
             fields.push(Arc::new(Field::new(
                 &binding.output_name,
@@ -400,7 +435,7 @@ impl ExecutionPlan for FoldExec {
 
             // Fold binding columns: compute aggregates per group
             for binding in &fold_bindings {
-                let col: Arc<dyn Array> = if binding.kind == FoldAggKind::CountAll {
+                let col: Arc<dyn Array> = if binding.name.as_str() == "COUNTALL" {
                     // CountAll doesn't need an input column — use a dummy
                     Arc::new(arrow_array::Int64Array::from(vec![0i64; batch.num_rows()]))
                 } else {
@@ -431,7 +466,7 @@ impl ExecutionPlan for FoldExec {
                 };
                 let agg_col = compute_fold_aggregate(
                     col.as_ref(),
-                    &binding.kind,
+                    binding.name.as_str(),
                     FoldGroups {
                         ordered_keys: &ordered_keys,
                         groups: &groups,
@@ -489,7 +524,7 @@ struct TopKFoldCtx<'a> {
 
 fn compute_fold_aggregate(
     col: &dyn Array,
-    kind: &FoldAggKind,
+    name: &str,
     groups_ctx: FoldGroups<'_>,
     strict: bool,
     probability_epsilon: f64,
@@ -499,15 +534,15 @@ fn compute_fold_aggregate(
     let ordered_keys = groups_ctx.ordered_keys;
     let groups = groups_ctx.groups;
     let num_groups = groups_ctx.num_groups;
-    match kind {
-        FoldAggKind::Sum => {
+    match name {
+        "SUM" => {
             let mut builder = Float64Builder::with_capacity(num_groups);
             for key in ordered_keys {
                 builder.append_option(sum_f64(col, &groups[key]));
             }
             Ok(Arc::new(builder.finish()))
         }
-        FoldAggKind::Count => {
+        "COUNT" => {
             let mut builder = Int64Builder::with_capacity(num_groups);
             for key in ordered_keys {
                 let indices = &groups[key];
@@ -516,7 +551,7 @@ fn compute_fold_aggregate(
             }
             Ok(Arc::new(builder.finish()))
         }
-        FoldAggKind::CountAll => {
+        "COUNTALL" => {
             let mut builder = Int64Builder::with_capacity(num_groups);
             for key in ordered_keys {
                 let indices = &groups[key];
@@ -524,9 +559,9 @@ fn compute_fold_aggregate(
             }
             Ok(Arc::new(builder.finish()))
         }
-        FoldAggKind::Max => compute_minmax(col, ordered_keys, groups, num_groups, false),
-        FoldAggKind::Min => compute_minmax(col, ordered_keys, groups, num_groups, true),
-        FoldAggKind::Avg => {
+        "MAX" => compute_minmax(col, ordered_keys, groups, num_groups, false),
+        "MIN" => compute_minmax(col, ordered_keys, groups, num_groups, true),
+        "AVG" => {
             let mut builder = Float64Builder::with_capacity(num_groups);
             for key in ordered_keys {
                 let indices = &groups[key];
@@ -538,7 +573,7 @@ fn compute_fold_aggregate(
             }
             Ok(Arc::new(builder.finish()))
         }
-        FoldAggKind::Collect => {
+        "COLLECT" => {
             let mut builder = LargeBinaryBuilder::with_capacity(num_groups, num_groups * 32);
             for key in ordered_keys {
                 let values: Vec<uni_common::Value> = groups[key]
@@ -552,7 +587,7 @@ fn compute_fold_aggregate(
             }
             Ok(Arc::new(builder.finish()))
         }
-        FoldAggKind::Nor => {
+        "MNOR" => {
             let mut builder = Float64Builder::with_capacity(num_groups);
             for key in ordered_keys {
                 let indices = &groups[key];
@@ -571,7 +606,7 @@ fn compute_fold_aggregate(
             }
             Ok(Arc::new(builder.finish()))
         }
-        FoldAggKind::Prod => {
+        "MPROD" => {
             let mut builder = Float64Builder::with_capacity(num_groups);
             for key in ordered_keys {
                 let v = match semiring_kind {
@@ -582,6 +617,9 @@ fn compute_fold_aggregate(
             }
             Ok(Arc::new(builder.finish()))
         }
+        other => Err(datafusion::error::DataFusionError::Execution(format!(
+            "compute_fold_aggregate: unsupported aggregate `{other}`"
+        ))),
     }
 }
 
@@ -1099,6 +1137,24 @@ mod tests {
     use datafusion::physical_plan::memory::MemoryStream;
     use datafusion::prelude::SessionContext;
 
+    /// Direct construction of a built-in `LocyAggregate` trait object for use
+    /// in `FoldBinding` test fixtures. Avoids registry plumbing in tests that
+    /// only need a working aggregate.
+    fn builtin_agg(name: &str) -> Arc<dyn LocyAggregate> {
+        use uni_plugin_builtin::locy_aggregates::*;
+        match name {
+            "SUM" | "MSUM" => Arc::new(SumAgg),
+            "MAX" | "MMAX" => Arc::new(MaxAgg),
+            "MIN" | "MMIN" => Arc::new(MinAgg),
+            "COUNT" | "COUNTALL" | "MCOUNT" => Arc::new(CountAgg),
+            "AVG" => Arc::new(AvgAgg),
+            "COLLECT" => Arc::new(CollectAgg),
+            "MNOR" | "NOR" => Arc::new(MnorAgg),
+            "MPROD" | "PROD" => Arc::new(MprodAgg),
+            other => panic!("unknown test aggregate `{other}`"),
+        }
+    }
+
     fn make_test_batch(names: Vec<&str>, values: Vec<f64>) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("name", DataType::Utf8, true),
@@ -1201,7 +1257,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "total".to_string(),
-                kind: FoldAggKind::Sum,
+                name: SmolStr::new_static("SUM"),
+                aggregate: builtin_agg("SUM"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -1237,7 +1294,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "cnt".to_string(),
-                kind: FoldAggKind::Count,
+                name: SmolStr::new_static("COUNT"),
+                aggregate: builtin_agg("COUNT"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -1264,7 +1322,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "mx".to_string(),
-                kind: FoldAggKind::Max,
+                name: SmolStr::new_static("MAX"),
+                aggregate: builtin_agg("MAX"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -1275,7 +1334,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "mn".to_string(),
-                kind: FoldAggKind::Min,
+                name: SmolStr::new_static("MIN"),
+                aggregate: builtin_agg("MIN"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -1306,7 +1366,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "average".to_string(),
-                kind: FoldAggKind::Avg,
+                name: SmolStr::new_static("AVG"),
+                aggregate: builtin_agg("AVG"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -1334,7 +1395,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "total".to_string(),
-                kind: FoldAggKind::Sum,
+                name: SmolStr::new_static("SUM"),
+                aggregate: builtin_agg("SUM"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -1375,7 +1437,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "total".to_string(),
-                kind: FoldAggKind::Sum,
+                name: SmolStr::new_static("SUM"),
+                aggregate: builtin_agg("SUM"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -1395,19 +1458,22 @@ mod tests {
             vec![
                 FoldBinding {
                     output_name: "total".to_string(),
-                    kind: FoldAggKind::Sum,
+                    name: SmolStr::new_static("SUM"),
+                    aggregate: builtin_agg("SUM"),
                     input_col_index: 1,
                     input_col_name: None,
                 },
                 FoldBinding {
                     output_name: "cnt".to_string(),
-                    kind: FoldAggKind::Count,
+                    name: SmolStr::new_static("COUNT"),
+                    aggregate: builtin_agg("COUNT"),
                     input_col_index: 1,
                     input_col_name: None,
                 },
                 FoldBinding {
                     output_name: "mx".to_string(),
-                    kind: FoldAggKind::Max,
+                    name: SmolStr::new_static("MAX"),
+                    aggregate: builtin_agg("MAX"),
                     input_col_index: 1,
                     input_col_name: None,
                 },
@@ -1452,7 +1518,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Nor,
+                name: SmolStr::new_static("MNOR"),
+                aggregate: builtin_agg("MNOR"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -1478,7 +1545,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Nor,
+                name: SmolStr::new_static("MNOR"),
+                aggregate: builtin_agg("MNOR"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -1503,7 +1571,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Nor,
+                name: SmolStr::new_static("MNOR"),
+                aggregate: builtin_agg("MNOR"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -1528,7 +1597,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Nor,
+                name: SmolStr::new_static("MNOR"),
+                aggregate: builtin_agg("MNOR"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -1570,7 +1640,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Prod,
+                name: SmolStr::new_static("MPROD"),
+                aggregate: builtin_agg("MPROD"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -1596,7 +1667,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Prod,
+                name: SmolStr::new_static("MPROD"),
+                aggregate: builtin_agg("MPROD"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -1621,7 +1693,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Prod,
+                name: SmolStr::new_static("MPROD"),
+                aggregate: builtin_agg("MPROD"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -1648,7 +1721,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Prod,
+                name: SmolStr::new_static("MPROD"),
+                aggregate: builtin_agg("MPROD"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -1699,7 +1773,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Nor,
+                name: SmolStr::new_static("MNOR"),
+                aggregate: builtin_agg("MNOR"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -1723,7 +1798,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Prod,
+                name: SmolStr::new_static("MPROD"),
+                aggregate: builtin_agg("MPROD"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -1747,7 +1823,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Nor,
+                name: SmolStr::new_static("MNOR"),
+                aggregate: builtin_agg("MNOR"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -1771,7 +1848,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Nor,
+                name: SmolStr::new_static("MNOR"),
+                aggregate: builtin_agg("MNOR"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -1799,7 +1877,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Prod,
+                name: SmolStr::new_static("MPROD"),
+                aggregate: builtin_agg("MPROD"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -1823,7 +1902,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Nor,
+                name: SmolStr::new_static("MNOR"),
+                aggregate: builtin_agg("MNOR"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -1847,7 +1927,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Prod,
+                name: SmolStr::new_static("MPROD"),
+                aggregate: builtin_agg("MPROD"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -1871,7 +1952,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Prod,
+                name: SmolStr::new_static("MPROD"),
+                aggregate: builtin_agg("MPROD"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -1905,7 +1987,8 @@ mod tests {
         let rev = make_test_batch(vec!["a", "a", "a"], vec![0.8, 0.5, 0.2]);
         let binding = vec![FoldBinding {
             output_name: "prob".to_string(),
-            kind: FoldAggKind::Nor,
+            name: SmolStr::new_static("MNOR"),
+            aggregate: builtin_agg("MNOR"),
             input_col_index: 1,
             input_col_name: None,
         }];
@@ -1935,7 +2018,8 @@ mod tests {
         let rev = make_test_batch(vec!["a", "a"], vec![0.25, 0.5]);
         let binding = vec![FoldBinding {
             output_name: "prob".to_string(),
-            kind: FoldAggKind::Prod,
+            name: SmolStr::new_static("MPROD"),
+            aggregate: builtin_agg("MPROD"),
             input_col_index: 1,
             input_col_name: None,
         }];
@@ -1968,7 +2052,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Nor,
+                name: SmolStr::new_static("MNOR"),
+                aggregate: builtin_agg("MNOR"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -1998,7 +2083,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Nor,
+                name: SmolStr::new_static("MNOR"),
+                aggregate: builtin_agg("MNOR"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -2028,7 +2114,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Prod,
+                name: SmolStr::new_static("MPROD"),
+                aggregate: builtin_agg("MPROD"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -2060,7 +2147,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Nor,
+                name: SmolStr::new_static("MNOR"),
+                aggregate: builtin_agg("MNOR"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -2079,7 +2167,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Nor,
+                name: SmolStr::new_static("MNOR"),
+                aggregate: builtin_agg("MNOR"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -2103,7 +2192,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Prod,
+                name: SmolStr::new_static("MPROD"),
+                aggregate: builtin_agg("MPROD"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -2127,7 +2217,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Prod,
+                name: SmolStr::new_static("MPROD"),
+                aggregate: builtin_agg("MPROD"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -2151,7 +2242,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Nor,
+                name: SmolStr::new_static("MNOR"),
+                aggregate: builtin_agg("MNOR"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -2175,7 +2267,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Nor,
+                name: SmolStr::new_static("MNOR"),
+                aggregate: builtin_agg("MNOR"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -2200,7 +2293,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Prod,
+                name: SmolStr::new_static("MPROD"),
+                aggregate: builtin_agg("MPROD"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -2225,7 +2319,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Nor,
+                name: SmolStr::new_static("MNOR"),
+                aggregate: builtin_agg("MNOR"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -2249,7 +2344,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Prod,
+                name: SmolStr::new_static("MPROD"),
+                aggregate: builtin_agg("MPROD"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -2275,7 +2371,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "prob".to_string(),
-                kind: FoldAggKind::Nor,
+                name: SmolStr::new_static("MNOR"),
+                aggregate: builtin_agg("MNOR"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -2295,61 +2392,64 @@ mod tests {
         );
     }
 
-    // ── FoldAggKind classification tests (Phase 1) ────────────────────────
+    // ── Aggregate-trait classification tests ──────────────────────────────
 
     #[test]
-    fn test_is_monotonic() {
-        assert!(FoldAggKind::Sum.is_monotonic());
-        assert!(FoldAggKind::Max.is_monotonic());
-        assert!(FoldAggKind::Min.is_monotonic());
-        assert!(FoldAggKind::Count.is_monotonic());
-        assert!(FoldAggKind::Nor.is_monotonic());
-        assert!(FoldAggKind::Prod.is_monotonic());
-        assert!(!FoldAggKind::Avg.is_monotonic());
-        assert!(!FoldAggKind::Collect.is_monotonic());
+    fn trait_dispatch_monotonicity() {
+        for name in [
+            "SUM", "MAX", "MIN", "COUNT", "AVG", "COLLECT", "MNOR", "MPROD",
+        ] {
+            let agg = builtin_agg(name);
+            let sl = agg.semilattice();
+            // MIN/MAX/MNOR/MPROD/COLLECT/COUNT are monotone; SUM/AVG are not.
+            let expect_monotone =
+                matches!(name, "MIN" | "MAX" | "MNOR" | "MPROD" | "COLLECT" | "COUNT");
+            assert_eq!(
+                sl.monotone_join, expect_monotone,
+                "monotone_join mismatch for {name}"
+            );
+        }
     }
 
     #[test]
-    fn test_monotonicity_direction() {
-        use super::MonotonicDirection;
+    fn trait_dispatch_initial_accumulator() {
+        // The row-level fast path uses `initial_accum_f64()`.
+        assert_eq!(builtin_agg("SUM").initial_accum_f64(), Some(0.0));
+        assert_eq!(builtin_agg("COUNT").initial_accum_f64(), Some(0.0));
+        assert_eq!(builtin_agg("MNOR").initial_accum_f64(), Some(0.0));
         assert_eq!(
-            FoldAggKind::Sum.monotonicity_direction(),
-            Some(MonotonicDirection::NonDecreasing)
+            builtin_agg("MAX").initial_accum_f64(),
+            Some(f64::NEG_INFINITY)
         );
-        assert_eq!(
-            FoldAggKind::Max.monotonicity_direction(),
-            Some(MonotonicDirection::NonDecreasing)
-        );
-        assert_eq!(
-            FoldAggKind::Count.monotonicity_direction(),
-            Some(MonotonicDirection::NonDecreasing)
-        );
-        assert_eq!(
-            FoldAggKind::Nor.monotonicity_direction(),
-            Some(MonotonicDirection::NonDecreasing)
-        );
-        assert_eq!(
-            FoldAggKind::Min.monotonicity_direction(),
-            Some(MonotonicDirection::NonIncreasing)
-        );
-        assert_eq!(
-            FoldAggKind::Prod.monotonicity_direction(),
-            Some(MonotonicDirection::NonIncreasing)
-        );
-        assert_eq!(FoldAggKind::Avg.monotonicity_direction(), None);
-        assert_eq!(FoldAggKind::Collect.monotonicity_direction(), None);
+        assert_eq!(builtin_agg("MIN").initial_accum_f64(), Some(f64::INFINITY));
+        assert_eq!(builtin_agg("MPROD").initial_accum_f64(), Some(1.0));
+        // AVG and COLLECT have no row-level fast path — return None.
+        assert_eq!(builtin_agg("AVG").initial_accum_f64(), None);
+        assert_eq!(builtin_agg("COLLECT").initial_accum_f64(), None);
     }
 
     #[test]
-    fn test_identity_values() {
-        assert_eq!(FoldAggKind::Sum.identity(), Some(0.0));
-        assert_eq!(FoldAggKind::Count.identity(), Some(0.0));
-        assert_eq!(FoldAggKind::Nor.identity(), Some(0.0));
-        assert_eq!(FoldAggKind::Max.identity(), Some(f64::NEG_INFINITY));
-        assert_eq!(FoldAggKind::Min.identity(), Some(f64::INFINITY));
-        assert_eq!(FoldAggKind::Prod.identity(), Some(1.0));
-        assert_eq!(FoldAggKind::Avg.identity(), None);
-        assert_eq!(FoldAggKind::Collect.identity(), None);
+    fn trait_dispatch_probability_predicate() {
+        // is_probability_aggregate is the trait predicate for probability-domain aggregates.
+        for name in ["MNOR", "MPROD"] {
+            assert!(
+                builtin_agg(name).is_probability_aggregate(),
+                "expected {name} to be probability-domain"
+            );
+        }
+        for name in ["SUM", "MAX", "MIN", "COUNT", "AVG", "COLLECT"] {
+            assert!(
+                !builtin_agg(name).is_probability_aggregate(),
+                "{name} should NOT be probability-domain"
+            );
+        }
+    }
+
+    #[test]
+    fn trait_dispatch_noisy_or_predicate() {
+        // is_noisy_or distinguishes MNOR from MPROD for semiring-op selection.
+        assert!(builtin_agg("MNOR").is_noisy_or());
+        assert!(!builtin_agg("MPROD").is_noisy_or());
     }
 
     // ── Strict mode tests (Phase 5) ──────────────────────────────────────
@@ -2381,7 +2481,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "p".into(),
-                kind: FoldAggKind::Nor,
+                name: SmolStr::new_static("MNOR"),
+                aggregate: builtin_agg("MNOR"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -2406,7 +2507,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "p".into(),
-                kind: FoldAggKind::Nor,
+                name: SmolStr::new_static("MNOR"),
+                aggregate: builtin_agg("MNOR"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -2431,7 +2533,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "p".into(),
-                kind: FoldAggKind::Prod,
+                name: SmolStr::new_static("MPROD"),
+                aggregate: builtin_agg("MPROD"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -2456,7 +2559,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "p".into(),
-                kind: FoldAggKind::Prod,
+                name: SmolStr::new_static("MPROD"),
+                aggregate: builtin_agg("MPROD"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -2481,7 +2585,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "p".into(),
-                kind: FoldAggKind::Nor,
+                name: SmolStr::new_static("MNOR"),
+                aggregate: builtin_agg("MNOR"),
                 input_col_index: 1,
                 input_col_name: None,
             }],
@@ -2514,7 +2619,8 @@ mod tests {
             vec![0],
             vec![FoldBinding {
                 output_name: "cnt".to_string(),
-                kind: FoldAggKind::CountAll,
+                name: SmolStr::new_static("COUNTALL"),
+                aggregate: builtin_agg("COUNTALL"),
                 input_col_index: 0, // unused for CountAll
                 input_col_name: None,
             }],
@@ -2529,5 +2635,64 @@ mod tests {
             .unwrap();
         assert_eq!(counts.value(0), 2, "Group 'a' should have count 2");
         assert_eq!(counts.value(1), 1, "Group 'b' should have count 1");
+    }
+
+    // ── Registry-resolve sanity tests ────────────────────────────────────
+
+    /// A test-only `LocyAggregate` that's not in `uni-plugin-builtin`.
+    /// Used to prove `resolve_locy_aggregate` walks the registry rather
+    /// than dispatching from a hardcoded built-in table.
+    #[derive(Debug)]
+    struct IdentityAgg;
+
+    impl LocyAggregate for IdentityAgg {
+        fn semilattice(&self) -> uni_plugin::traits::locy::Semilattice {
+            uni_plugin::traits::locy::Semilattice::BOUNDED_MIN_MAX
+        }
+        fn output_type(&self) -> arrow_schema::DataType {
+            arrow_schema::DataType::Float64
+        }
+        fn create(&self) -> Box<dyn uni_plugin::traits::locy::LocyAggState> {
+            panic!("IdentityAgg::create not used in this sanity test")
+        }
+    }
+
+    #[test]
+    fn resolve_locy_aggregate_returns_registered_instance() {
+        let registry = uni_plugin::PluginRegistry::new();
+        let plugin_id = uni_plugin::PluginId::new(uni_plugin::QName::BUILTIN_NS);
+        let caps = uni_plugin::CapabilitySet::from_iter_of([uni_plugin::Capability::LocyAggregate]);
+
+        let registered: Arc<dyn LocyAggregate> = Arc::new(IdentityAgg);
+        let mut r = uni_plugin::PluginRegistrar::new(plugin_id, &caps, &registry);
+        r.locy_aggregate(
+            uni_plugin::QName::builtin("TEST_IDENTITY"),
+            Arc::clone(&registered),
+        )
+        .expect("register");
+        r.commit_to_registry().expect("commit");
+
+        let resolved = resolve_locy_aggregate(&registry, "TEST_IDENTITY")
+            .expect("registered aggregate should resolve");
+        assert!(
+            Arc::ptr_eq(&registered, &resolved.aggregate),
+            "registry must return the exact Arc that was registered"
+        );
+
+        // Unknown name still returns None — the resolver does not fall back.
+        assert!(resolve_locy_aggregate(&registry, "NOT_REGISTERED").is_none());
+    }
+
+    #[test]
+    fn default_locy_plugin_registry_contains_all_builtins() {
+        let r = default_locy_plugin_registry();
+        for name in [
+            "MIN", "MAX", "SUM", "MSUM", "COUNT", "AVG", "COLLECT", "MNOR", "MPROD",
+        ] {
+            assert!(
+                resolve_locy_aggregate(&r, name).is_some(),
+                "default registry should contain built-in `{name}`"
+            );
+        }
     }
 }

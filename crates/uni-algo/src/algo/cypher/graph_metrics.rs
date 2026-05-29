@@ -29,8 +29,8 @@ impl GraphAlgoAdapter for GraphMetricsAdapter {
         ]
     }
 
-    fn to_config(_args: Vec<Value>) -> GraphMetricsConfig {
-        GraphMetricsConfig {}
+    fn to_config(_args: Vec<Value>) -> Result<GraphMetricsConfig> {
+        Ok(GraphMetricsConfig {})
     }
 
     fn map_result(result: <Self::Algo as Algorithm>::Result) -> Result<Vec<AlgoResultRow>> {

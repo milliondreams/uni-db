@@ -235,6 +235,11 @@ struct DerivedScanHandle {
 pub struct LocyPlanBuilder<'a> {
     planner: &'a QueryPlanner,
     derived_scan_handles: RefCell<Vec<DerivedScanHandle>>,
+    /// Plugin registry used to resolve Locy aggregates for the recursive-stratum
+    /// monotonicity check. Defaults to the process-wide built-in registry; hosts
+    /// with user-registered aggregates should override via
+    /// [`Self::with_plugin_registry`].
+    plugin_registry: std::sync::Arc<uni_plugin::PluginRegistry>,
 }
 
 /// Neural-classifier-related plumbing threaded through `build_stratum` →
@@ -279,7 +284,18 @@ impl<'a> LocyPlanBuilder<'a> {
         Self {
             planner,
             derived_scan_handles: RefCell::new(Vec::new()),
+            plugin_registry: crate::query::df_graph::locy_fold::default_locy_plugin_registry(),
         }
+    }
+
+    /// Replace the plugin registry used for aggregate monotonicity resolution.
+    #[must_use]
+    pub fn with_plugin_registry(
+        mut self,
+        registry: std::sync::Arc<uni_plugin::PluginRegistry>,
+    ) -> Self {
+        self.plugin_registry = registry;
+        self
     }
 
     /// Build a full `LogicalPlan::LocyProgram` with embedded `DerivedScanRegistry`.
@@ -673,7 +689,7 @@ impl<'a> LocyPlanBuilder<'a> {
         &self,
         clause: &CompiledClause,
         yield_cols: &[YieldColumn],
-        _is_recursive: bool,
+        is_recursive: bool,
         ctx: ClauseCtx<'_>,
         _prob_config: ProbabilityConfig,
         classifiers: &ClassifierContext,
@@ -684,6 +700,39 @@ impl<'a> LocyPlanBuilder<'a> {
         let classifier_registry = Arc::clone(&classifiers.registry);
         let classifier_cache = classifiers.cache.as_ref().map(Arc::clone);
         let classifier_provenance_store = classifiers.provenance_store.as_ref().map(Arc::clone);
+
+        // Reject non-monotone FOLD aggregates in recursive strata using the
+        // plugin registry's Semilattice metadata. Defense in depth: the
+        // uni-locy typecheck pass usually rejects this upstream, but
+        // direct LocyPlanBuilder consumers (in-process tests, future API
+        // surfaces) might bypass that pass.
+        if is_recursive {
+            for fold in &clause.fold {
+                let fname = match &fold.aggregate {
+                    uni_cypher::ast::Expr::FunctionCall { name, .. } => name.clone(),
+                    _ => {
+                        anyhow::bail!(
+                            "FOLD '{}' aggregate must be a function call (e.g., SUM(x))",
+                            fold.name
+                        );
+                    }
+                };
+                match crate::query::df_graph::locy_fold::is_monotonic_aggregate(
+                    &self.plugin_registry,
+                    &fname,
+                ) {
+                    Some(true) => {}
+                    Some(false) | None => {
+                        anyhow::bail!(
+                            "non-monotonic aggregate '{}' in recursive rule clause (FOLD '{}')",
+                            fname,
+                            fold.name
+                        );
+                    }
+                }
+            }
+        }
+
         // Collect node variables from THIS clause's MATCH pattern only.
         // Used for IS-ref predicates: only variables in the current MATCH
         // have expanded {var}._vid columns in the graph scan output.
@@ -2674,6 +2723,11 @@ mod tests {
 
     #[test]
     fn test_clause_fold_skipped_recursive() {
+        // Probes that a monotone FOLD in a recursive clause is deferred
+        // from the body plan to the fixpoint engine (not whether the
+        // monotonicity check passes — that's covered by the dedicated
+        // validation tests above). Uses `MMAX` because non-monotone
+        // aggregates are now rejected outright in recursive strata.
         let planner = test_planner();
         let builder = LocyPlanBuilder::new(&planner);
 
@@ -2682,9 +2736,9 @@ mod tests {
             where_conditions: vec![],
             along: vec![],
             fold: vec![FoldBinding {
-                name: "total".to_string(),
+                name: "best".to_string(),
                 aggregate: Expr::FunctionCall {
-                    name: "SUM".to_string(),
+                    name: "MMAX".to_string(),
                     args: vec![Expr::Variable("cost".to_string())],
                     distinct: false,
                     window_spec: None,
@@ -2692,12 +2746,12 @@ mod tests {
             }],
             having: vec![],
             best_by: None,
-            output: simple_yield_output(&["n", "total"]),
+            output: simple_yield_output(&["n", "best"]),
             priority: None,
             model_invocations: vec![],
             hidden_yield_cols: vec![],
         };
-        let yield_cols = [yield_col("n", true), yield_col("total", false)];
+        let yield_cols = [yield_col("n", true), yield_col("best", false)];
         let catalog = HashMap::new();
         let names = HashSet::new();
 
@@ -3739,7 +3793,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validation_fold_on_recursive_stratum_skipped() {
+    fn test_validation_fold_non_monotonic_rejected_in_recursive_stratum() {
         let planner = test_planner();
         let builder = LocyPlanBuilder::new(&planner);
 
@@ -3767,7 +3821,6 @@ mod tests {
         let catalog = HashMap::new();
         let names = HashSet::new();
 
-        // No error — FOLD in recursive stratum is silently skipped
         let result = builder.build_clause(
             &clause,
             &yield_cols,
@@ -3783,6 +3836,113 @@ mod tests {
             },
             &test_classifier_ctx(),
         );
-        assert!(result.is_ok());
+        assert!(result.is_err(), "SUM in a recursive stratum must reject");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("non-monotonic aggregate 'SUM'"),
+            "error must name the aggregate; got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validation_fold_monotonic_accepted_in_recursive_stratum() {
+        let planner = test_planner();
+        let builder = LocyPlanBuilder::new(&planner);
+
+        for name in ["MMAX", "MMIN", "MNOR", "MPROD", "MSUM"] {
+            let clause = CompiledClause {
+                match_pattern: node_pattern("n"),
+                where_conditions: vec![],
+                along: vec![],
+                fold: vec![FoldBinding {
+                    name: "score".to_string(),
+                    aggregate: Expr::FunctionCall {
+                        name: name.to_string(),
+                        args: vec![Expr::Variable("cost".to_string())],
+                        distinct: false,
+                        window_spec: None,
+                    },
+                }],
+                having: vec![],
+                best_by: None,
+                output: simple_yield_output(&["n", "score"]),
+                priority: None,
+                model_invocations: vec![],
+                hidden_yield_cols: vec![],
+            };
+            let yield_cols = [yield_col("n", true), yield_col("score", false)];
+            let catalog = HashMap::new();
+            let names = HashSet::new();
+
+            let result = builder.build_clause(
+                &clause,
+                &yield_cols,
+                true,
+                ClauseCtx {
+                    stratum_rule_names: &names,
+                    rule_catalog: &catalog,
+                    node_vars: &HashSet::new(),
+                },
+                ProbabilityConfig {
+                    strict_domain: false,
+                    epsilon: 1e-15,
+                },
+                &test_classifier_ctx(),
+            );
+            assert!(
+                result.is_ok(),
+                "{name} should be accepted in recursive stratum; got: {:?}",
+                result.err()
+            );
+        }
+    }
+
+    #[test]
+    fn test_validation_fold_non_monotonic_accepted_in_non_recursive_stratum() {
+        // SUM is fine in a non-recursive rule — the check only triggers for
+        // is_recursive=true.
+        let planner = test_planner();
+        let builder = LocyPlanBuilder::new(&planner);
+
+        let clause = CompiledClause {
+            match_pattern: node_pattern("n"),
+            where_conditions: vec![],
+            along: vec![],
+            fold: vec![FoldBinding {
+                name: "total".to_string(),
+                aggregate: Expr::FunctionCall {
+                    name: "SUM".to_string(),
+                    args: vec![Expr::Variable("cost".to_string())],
+                    distinct: false,
+                    window_spec: None,
+                },
+            }],
+            having: vec![],
+            best_by: None,
+            output: simple_yield_output(&["n", "total"]),
+            priority: None,
+            model_invocations: vec![],
+            hidden_yield_cols: vec![],
+        };
+        let yield_cols = [yield_col("n", true), yield_col("total", false)];
+        let catalog = HashMap::new();
+        let names = HashSet::new();
+
+        let result = builder.build_clause(
+            &clause,
+            &yield_cols,
+            false,
+            ClauseCtx {
+                stratum_rule_names: &names,
+                rule_catalog: &catalog,
+                node_vars: &HashSet::new(),
+            },
+            ProbabilityConfig {
+                strict_domain: false,
+                epsilon: 1e-15,
+            },
+            &test_classifier_ctx(),
+        );
+        assert!(result.is_ok(), "SUM in non-recursive stratum is valid");
     }
 }

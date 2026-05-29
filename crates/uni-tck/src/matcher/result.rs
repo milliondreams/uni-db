@@ -92,7 +92,13 @@ pub fn match_result_unordered(
     Ok(())
 }
 
-/// Match query result against expected rows (order-sensitive), ignoring list element order.
+/// Match query result against expected rows (row-order-sensitive),
+/// ignoring the order of elements within each list value.
+///
+/// "List order" in the name refers to ordering of elements *within* list
+/// cells, not the order of rows. Row order is preserved (zip-and-compare
+/// against `expected_rows`); only equality of [`Value::List`] cells is
+/// relaxed via [`values_equal_ignoring_list_order`].
 pub fn match_result_ignoring_list_order(
     actual: &QueryResult,
     expected_rows: &[HashMap<String, Value>],

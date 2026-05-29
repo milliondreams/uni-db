@@ -10,6 +10,9 @@
 
 // Rust guideline compliant
 
+// Tests cover the deprecated `Session::add_hook` API path; suppress the warning here.
+#![allow(deprecated)]
+
 use anyhow::Result;
 use uni_common::api::error::Result as UniResult;
 use uni_common::core::schema::DataType;

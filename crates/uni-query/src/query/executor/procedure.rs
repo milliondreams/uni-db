@@ -4,6 +4,7 @@
 use super::core::*;
 use anyhow::{Result, anyhow};
 use std::collections::HashMap;
+use std::sync::Arc;
 use uni_common::Value;
 use uni_cypher::ast::Expr;
 use uni_store::QueryContext;
@@ -67,13 +68,18 @@ pub struct RegisteredProcedure {
     pub data: Vec<HashMap<String, Value>>,
 }
 
-/// Thread-safe registry of test procedures.
+/// Thread-safe registry of procedures.
 ///
-/// Procedures are registered before query execution (typically by TCK
-/// step definitions) and looked up by the executor at runtime.
+/// **M4 bridge:** The legacy `procedures` hashmap holds test-only
+/// `RegisteredProcedure` mock rows used by TCK step definitions. The new
+/// `plugin_registry` field holds an `Arc<uni_plugin::PluginRegistry>`
+/// that the M4 cutover commits route real procedure dispatch through.
+/// Both coexist during the M4 coexistence window; once every consumer
+/// switches to plugin-path dispatch, the legacy hashmap is removed.
 #[derive(Debug, Default)]
 pub struct ProcedureRegistry {
     procedures: std::sync::RwLock<HashMap<String, RegisteredProcedure>>,
+    plugin_registry: std::sync::RwLock<Option<Arc<uni_plugin::PluginRegistry>>>,
 }
 
 impl ProcedureRegistry {
@@ -90,7 +96,7 @@ impl ProcedureRegistry {
             .insert(proc_def.name.clone(), proc_def);
     }
 
-    /// Looks up a procedure by fully qualified name.
+    /// Looks up a procedure by fully qualified name (legacy path).
     pub fn get(&self, name: &str) -> Option<RegisteredProcedure> {
         self.procedures
             .read()
@@ -105,6 +111,178 @@ impl ProcedureRegistry {
             .write()
             .expect("ProcedureRegistry lock poisoned")
             .clear();
+    }
+
+    /// Attach an [`uni_plugin::PluginRegistry`] for plugin-path dispatch.
+    ///
+    /// M4 bridge: callers configure this once at executor construction,
+    /// and the procedure dispatch site consults the plugin registry for
+    /// any qname not present in the legacy `procedures` hashmap.
+    pub fn set_plugin_registry(&self, pr: Arc<uni_plugin::PluginRegistry>) {
+        *self
+            .plugin_registry
+            .write()
+            .expect("ProcedureRegistry plugin-registry lock poisoned") = Some(pr);
+    }
+
+    /// Snapshot of the currently attached plugin registry, if any.
+    ///
+    /// Used by the read executor to thread the host's `PluginRegistry`
+    /// into the physical planner so consultation sites like
+    /// `plan_vector_knn` can look up registered `IndexHandle`s. Returns
+    /// `None` if `set_plugin_registry` was never called (e.g., low-level
+    /// test setups that bypass `Uni::build`).
+    pub fn plugin_registry(&self) -> Option<Arc<uni_plugin::PluginRegistry>> {
+        self.plugin_registry
+            .read()
+            .expect("ProcedureRegistry plugin-registry lock poisoned")
+            .clone()
+    }
+
+    /// Look up a procedure through the attached `PluginRegistry`, if any.
+    ///
+    /// Dual-consult (M8.6): checks the per-task session-local plugin
+    /// registry first (set by host crates via
+    /// [`crate::scoped_with_session_plugin_registry`]) and falls back
+    /// to the executor's instance-attached plugin registry. Returns
+    /// `None` if neither has `qname`.
+    pub fn get_plugin(
+        &self,
+        qname: &uni_plugin::QName,
+    ) -> Option<std::sync::Arc<uni_plugin::registry::ProcedureEntry>> {
+        // Session-local first.
+        if let Some(session_pr) = crate::current_session_plugin_registry()
+            && let Some(entry) = session_pr.procedure(qname)
+        {
+            return Some(entry);
+        }
+        self.plugin_registry
+            .read()
+            .expect("ProcedureRegistry plugin-registry lock poisoned")
+            .as_ref()
+            .and_then(|pr| pr.procedure(qname))
+    }
+
+    /// Resolve a user-facing procedure name (as written in `CALL X.Y.Z(...)`)
+    /// to a registered plugin entry, applying the framework's namespace
+    /// resolution rules:
+    ///
+    /// 1. If `user_qname` parses as `<namespace>.<local>`, try that exact
+    ///    qname against the plugin registry.
+    /// 2. Strip a leading `uni.` prefix if present, then try each known
+    ///    built-in plugin namespace (`builtin`, `apoc-core`) with the
+    ///    stripped local name. This lets user-facing names like
+    ///    `uni.bitwise.and` route to plugins that registered under the
+    ///    `apoc-core` namespace as `apoc-core.bitwise.and`.
+    ///
+    /// Future user plugins that want their qnames reachable as `uni.*`
+    /// can declare their own namespace; the resolver will try the
+    /// declared namespace before falling through.
+    pub fn resolve_user_procedure(
+        &self,
+        user_qname: &str,
+    ) -> Option<std::sync::Arc<uni_plugin::registry::ProcedureEntry>> {
+        // Exact namespace.local match first.
+        if let Some((ns, local)) = user_qname.split_once('.')
+            && let Some(p) = self.get_plugin(&uni_plugin::QName::new(ns, local))
+        {
+            return Some(p);
+        }
+        // Strip `uni.` prefix and try each known built-in plugin namespace.
+        // The `uni` namespace itself is reserved for host-coupled procedures
+        // registered from `uni-query::procedures_plugin` (M4).
+        let stripped = user_qname.strip_prefix("uni.").unwrap_or(user_qname);
+        for plugin_id in ["uni", "builtin", "apoc-core", "custom"] {
+            if let Some(p) = self.get_plugin(&uni_plugin::QName::new(plugin_id, stripped)) {
+                return Some(p);
+            }
+        }
+        None
+    }
+}
+
+/// Convert a [`uni_common::Value`] into a DataFusion
+/// [`datafusion::logical_expr::ColumnarValue`] scalar, suitable for
+/// passing to a plugin procedure's `invoke()`.
+fn value_to_columnar(
+    v: &Value,
+) -> std::result::Result<datafusion::logical_expr::ColumnarValue, String> {
+    use datafusion::logical_expr::ColumnarValue;
+    use datafusion::scalar::ScalarValue;
+
+    let scalar = match v {
+        Value::Null => ScalarValue::Null,
+        Value::Bool(b) => ScalarValue::Boolean(Some(*b)),
+        Value::Int(i) => ScalarValue::Int64(Some(*i)),
+        Value::Float(f) => ScalarValue::Float64(Some(*f)),
+        Value::String(s) => ScalarValue::Utf8(Some(s.clone())),
+        Value::Bytes(b) => ScalarValue::Binary(Some(b.clone())),
+        // Complex types (Map / List / etc.) are JSON-encoded into
+        // `LargeBinary` to match the convention the DataFusion
+        // procedure dispatcher (`procedure_call::value_to_columnar`)
+        // uses. The adapter on the receiving end decodes via
+        // `serde_json::from_slice`.
+        Value::List(_) | Value::Map(_) => {
+            let json = serde_json::Value::from(v.clone());
+            let bytes = serde_json::to_vec(&json)
+                .map_err(|e| format!("plugin procedure arg JSON encode failure: {e}"))?;
+            ScalarValue::LargeBinary(Some(bytes))
+        }
+        other => {
+            return Err(format!(
+                "unsupported Value variant for plugin procedure argument: {other:?}"
+            ));
+        }
+    };
+    Ok(ColumnarValue::Scalar(scalar))
+}
+
+/// Convert one row of an Arrow array column into a [`uni_common::Value`].
+/// Used when draining a plugin's output `RecordBatch` back to the legacy
+/// row-shaped `Vec<HashMap<String, Value>>` the Executor returns.
+fn arrow_scalar_to_value(
+    arr: &dyn arrow_array::Array,
+    row_idx: usize,
+) -> std::result::Result<Value, String> {
+    use arrow_array::cast::AsArray;
+    use arrow_schema::DataType as Dt;
+
+    if arr.is_null(row_idx) {
+        return Ok(Value::Null);
+    }
+    match arr.data_type() {
+        Dt::Boolean => Ok(Value::Bool(arr.as_boolean().value(row_idx))),
+        Dt::Int64 => Ok(Value::Int(
+            arr.as_primitive::<arrow_array::types::Int64Type>()
+                .value(row_idx),
+        )),
+        Dt::Int32 => Ok(Value::Int(
+            arr.as_primitive::<arrow_array::types::Int32Type>()
+                .value(row_idx) as i64,
+        )),
+        Dt::UInt64 => Ok(Value::Int(
+            arr.as_primitive::<arrow_array::types::UInt64Type>()
+                .value(row_idx) as i64,
+        )),
+        Dt::Float64 => Ok(Value::Float(
+            arr.as_primitive::<arrow_array::types::Float64Type>()
+                .value(row_idx),
+        )),
+        Dt::Float32 => Ok(Value::Float(
+            arr.as_primitive::<arrow_array::types::Float32Type>()
+                .value(row_idx) as f64,
+        )),
+        Dt::Utf8 => Ok(Value::String(
+            arr.as_string::<i32>().value(row_idx).to_string(),
+        )),
+        Dt::LargeUtf8 => Ok(Value::String(
+            arr.as_string::<i64>().value(row_idx).to_string(),
+        )),
+        Dt::Binary => Ok(Value::Bytes(arr.as_binary::<i32>().value(row_idx).to_vec())),
+        Dt::LargeBinary => Ok(Value::Bytes(arr.as_binary::<i64>().value(row_idx).to_vec())),
+        other => Err(format!(
+            "unsupported Arrow type in plugin procedure output: {other:?}"
+        )),
     }
 }
 
@@ -405,7 +583,25 @@ impl Executor {
                 success_result(success)
             }
             _ => {
-                // Check external procedure registry
+                // M4: Plugin path — consult the framework PluginRegistry
+                // before falling back to the legacy TCK mock registry.
+                if let Some(registry) = &self.procedure_registry
+                    && let Some(entry) = registry.resolve_user_procedure(name)
+                {
+                    return self
+                        .execute_plugin_procedure(
+                            name,
+                            &entry,
+                            args,
+                            yield_items,
+                            prop_manager,
+                            params,
+                            ctx,
+                        )
+                        .await;
+                }
+
+                // Legacy TCK mock-procedure registry.
                 if let Some(registry) = &self.procedure_registry
                     && let Some(proc_def) = registry.get(name)
                 {
@@ -423,6 +619,93 @@ impl Executor {
                 Err(anyhow!("ProcedureNotFound: Unknown procedure '{}'", name))
             }
         }
+    }
+
+    /// Executes a procedure registered through the plugin framework.
+    ///
+    /// Evaluates argument `Expr`s to Values, converts them to
+    /// `ColumnarValue` scalars, calls the plugin's `invoke()` to obtain
+    /// a `SendableRecordBatchStream`, drains the stream, and converts the
+    /// resulting Arrow batches to the legacy `Vec<HashMap<String, Value>>`
+    /// shape the Executor expects.
+    #[allow(clippy::too_many_arguments)] // mirrors the legacy execute_procedure signature
+    async fn execute_plugin_procedure<'a>(
+        &'a self,
+        name: &str,
+        entry: &uni_plugin::registry::ProcedureEntry,
+        args: &[Expr],
+        yield_items: &[String],
+        prop_manager: &'a PropertyManager,
+        params: &'a HashMap<String, Value>,
+        ctx: Option<&'a QueryContext>,
+    ) -> Result<Vec<HashMap<String, Value>>> {
+        use datafusion::logical_expr::ColumnarValue;
+        use futures::StreamExt;
+
+        // Evaluate each arg expression to a Value, then map to a
+        // ColumnarValue scalar for the plugin's invoke signature.
+        let empty_row: HashMap<String, Value> = HashMap::new();
+        let mut columnar_args: Vec<ColumnarValue> = Vec::with_capacity(args.len());
+        for arg in args {
+            let v = self
+                .evaluate_expr(arg, &empty_row, prop_manager, params, ctx)
+                .await?;
+            columnar_args.push(
+                value_to_columnar(&v)
+                    .map_err(|e| anyhow!("Procedure '{name}': argument conversion failed: {e}"))?,
+            );
+        }
+
+        let mut host = crate::query::executor::procedure_host::QueryProcedureHost::from_components(
+            Arc::clone(&self.storage),
+            Some(Arc::clone(&self.algo_registry)),
+            self.procedure_registry.clone(),
+        );
+        // FU-1 / M11 #6: attach the outer executor's writer handle so
+        // declared `WRITE`-mode procedures synthesized by
+        // `CypherProcedureSynthesizer` can mutate via the write-enabled
+        // inner-query host. The simple-Executor path
+        // (`from_components`) is what the procedure_call -> stream
+        // pipeline lands on for top-level `CALL <declared.qname>()`
+        // invocations.
+        if let Some(writer) = &self.writer {
+            host = host.with_writer(Arc::clone(writer));
+        }
+        // FU-1: propagate the in-flight principal so capability gates
+        // (e.g., `Capability::ProcedureWrites` on
+        // `uni.plugin.declareProcedure WRITE`) see the session's
+        // authenticated user, not an anonymous default. The
+        // host + principal -> ProcedureContext construction is
+        // consolidated in `uni_plugin::host::build_procedure_context`.
+        let principal = crate::current_principal();
+        let pctx = uni_plugin::host::build_procedure_context(&host, principal.as_deref());
+        let mut stream = entry
+            .procedure
+            .invoke(pctx, &columnar_args)
+            .map_err(|e| anyhow!("Procedure '{name}': {e}"))?;
+
+        // Collect every batch the plugin yields and convert to row-shaped
+        // Value maps. Schema comes from the plugin signature's yields.
+        let mut rows: Vec<HashMap<String, Value>> = Vec::new();
+        while let Some(item) = stream.next().await {
+            let batch = item.map_err(|e| anyhow!("Procedure '{name}' stream error: {e}"))?;
+            for row_idx in 0..batch.num_rows() {
+                let mut row: HashMap<String, Value> = HashMap::new();
+                let schema = batch.schema();
+                for col_idx in 0..batch.num_columns() {
+                    let field = schema.field(col_idx);
+                    let arr = batch.column(col_idx);
+                    let v = arrow_scalar_to_value(arr.as_ref(), row_idx)
+                        .map_err(|e| anyhow!("Procedure '{name}': output decode: {e}"))?;
+                    row.insert(field.name().clone(), v);
+                }
+                if !yield_items.is_empty() {
+                    row.retain(|k, _| yield_items.iter().any(|y| y == k));
+                }
+                rows.push(row);
+            }
+        }
+        Ok(rows)
     }
 
     /// Executes a procedure from the external registry.

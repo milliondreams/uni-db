@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Dragonscale Team
 
-use crate::core::edge_type::{MAX_SCHEMA_TYPE_ID, is_schemaless_edge_type, make_schemaless_id};
+use crate::core::edge_type::{
+    MAX_SCHEMA_TYPE_ID, VIRTUAL_EDGE_TYPE_ID_SENTINEL, VIRTUAL_EDGE_TYPE_ID_START,
+    is_schemaless_edge_type, make_schemaless_id,
+};
 use crate::sync::{acquire_read, acquire_write};
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
@@ -321,6 +324,21 @@ impl Default for SchemalessEdgeTypeRegistry {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// First virtual (catalog-resolved) label ID. Label IDs in
+/// `VIRTUAL_LABEL_ID_START..VIRTUAL_LABEL_ID_SENTINEL` are owned by
+/// plugin-registered `CatalogProvider`s and allocated lazily by the
+/// planner via `PluginRegistry::register_virtual_label`. Native label
+/// allocation (`SchemaManager::add_label`) refuses IDs in this range.
+pub const VIRTUAL_LABEL_ID_START: u16 = 0xFF00;
+/// Sentinel "no label" marker, kept distinct from any allocatable ID.
+pub const VIRTUAL_LABEL_ID_SENTINEL: u16 = 0xFFFF;
+
+/// Returns `true` if `id` is in the virtual (catalog-resolved) range.
+#[inline]
+pub fn is_virtual_label_id(id: u16) -> bool {
+    (VIRTUAL_LABEL_ID_START..VIRTUAL_LABEL_ID_SENTINEL).contains(&id)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1027,6 +1045,13 @@ impl SchemaManager {
         }
 
         let id = schema.labels.values().map(|l| l.id).max().unwrap_or(0) + 1;
+        if id >= VIRTUAL_LABEL_ID_START {
+            return Err(anyhow!(
+                "Native label space exhausted (next id {id:#x} would enter the \
+                 virtual range {VIRTUAL_LABEL_ID_START:#x}..{VIRTUAL_LABEL_ID_SENTINEL:#x} \
+                 reserved for catalog-resolved labels)"
+            ));
+        }
         schema.labels.insert(
             name.to_string(),
             LabelMeta {
@@ -1047,6 +1072,13 @@ impl SchemaManager {
         }
 
         let id = schema.labels.values().map(|l| l.id).max().unwrap_or(0) + 1;
+        if id >= VIRTUAL_LABEL_ID_START {
+            return Err(anyhow!(
+                "Native label space exhausted (next id {id:#x} would enter the \
+                 virtual range {VIRTUAL_LABEL_ID_START:#x}..{VIRTUAL_LABEL_ID_SENTINEL:#x} \
+                 reserved for catalog-resolved labels)"
+            ));
+        }
         schema.labels.insert(
             name.to_string(),
             LabelMeta {
@@ -1073,9 +1105,14 @@ impl SchemaManager {
 
         let id = schema.edge_types.values().map(|t| t.id).max().unwrap_or(0) + 1;
 
-        // Ensure we stay in schema'd ID space (bit 31 = 0)
-        if id >= MAX_SCHEMA_TYPE_ID {
-            return Err(anyhow!("Schema edge type ID exhaustion"));
+        // Ensure we stay in the schema-defined sub-range (bit 31 = 0, and
+        // below the virtual reservation `VIRTUAL_EDGE_TYPE_ID_START`).
+        if id >= VIRTUAL_EDGE_TYPE_ID_START {
+            return Err(anyhow!(
+                "Native edge type space exhausted (next id {id:#x} would enter the \
+                 virtual range {VIRTUAL_EDGE_TYPE_ID_START:#x}..{VIRTUAL_EDGE_TYPE_ID_SENTINEL:#x} \
+                 reserved for catalog-resolved edge types)"
+            ));
         }
 
         schema.edge_types.insert(

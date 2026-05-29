@@ -28,8 +28,8 @@ impl GraphAlgoAdapter for MstAdapter {
         ]
     }
 
-    fn to_config(_args: Vec<Value>) -> MstConfig {
-        MstConfig {}
+    fn to_config(_args: Vec<Value>) -> Result<MstConfig> {
+        Ok(MstConfig {})
     }
 
     fn map_result(result: <Self::Algo as Algorithm>::Result) -> Result<Vec<AlgoResultRow>> {

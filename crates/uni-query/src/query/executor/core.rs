@@ -316,6 +316,12 @@ impl Clone for Executor {
 impl Executor {
     /// Create a read-only executor backed by the given storage manager.
     pub fn new(storage: Arc<StorageManager>) -> Self {
+        // M4: auto-wire the host plugin registry so low-level test
+        // setups that bypass `Uni::build` still see `uni.schema.*` and
+        // `uni.algo.*` procedures (which no longer have hardcoded
+        // dispatch arms in `procedure_call.rs`).
+        let proc_registry = Arc::new(ProcedureRegistry::new());
+        proc_registry.set_plugin_registry(crate::procedures_plugin::default_host_plugin_registry());
         Self {
             storage,
             writer: None,
@@ -325,7 +331,7 @@ impl Executor {
             file_sandbox: uni_common::config::FileSandboxConfig::default(),
             config: uni_common::config::UniConfig::default(),
             gen_expr_cache: Arc::new(RwLock::new(HashMap::new())),
-            procedure_registry: None,
+            procedure_registry: Some(proc_registry),
             xervo_runtime: None,
             warnings: Arc::new(std::sync::Mutex::new(Vec::new())),
             transaction_l0_override: None,

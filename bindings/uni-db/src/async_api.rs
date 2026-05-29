@@ -332,6 +332,7 @@ impl AsyncDatabase {
             inner: Arc::new(tokio::sync::Mutex::new(session)),
             rule_registry_arc: rule_reg,
             params_arc,
+            pending_plugin_builder: uni_plugin_pyo3::ManifestBuilder::new(),
         }
     }
 
@@ -1735,6 +1736,13 @@ pub struct AsyncSession {
     pub(crate) rule_registry_arc: std::sync::Arc<std::sync::RwLock<::uni_db::LocyRuleRegistry>>,
     pub(crate) params_arc:
         std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, ::uni_db::Value>>>,
+    /// M8 async-bindings follow-up: per-session decorator-accumulator.
+    /// Mirrors `crate::builders::Session::pending_plugin_builder`. Each
+    /// `@session.scalar_fn` / `@session.aggregate_fn` /
+    /// `@session.procedure` decoration pushes into this builder;
+    /// `await session.finalize_plugin(plugin_id)` drains it into the
+    /// session-local plugin registry (proposal §5.4.2 default scope).
+    pub(crate) pending_plugin_builder: std::sync::Arc<uni_plugin_pyo3::ManifestBuilder>,
 }
 
 #[pymethods]
@@ -1744,6 +1752,152 @@ impl AsyncSession {
         crate::sync_api::PyParams {
             inner: self.params_arc.clone(),
         }
+    }
+
+    // ── PyO3 plugin decorator surface (M8 async follow-up) ───────────
+    //
+    // Mirrors the sync `crate::builders::Session` decorator methods
+    // verbatim. The decorator methods themselves are sync because they
+    // only push into the `Arc<ManifestBuilder>` — no async work. The
+    // `finalize_plugin` and `load_python_plugin` methods are async,
+    // returning Python awaitables that lock the inner tokio mutex and
+    // dispatch to the (sync) Rust `Session::finalize_python_plugin` /
+    // `add_python_plugin` methods.
+
+    /// `@session.scalar_fn(name, args=[...], returns=..., vectorized=False, determinism="pure")`
+    #[pyo3(signature = (name, args, returns, vectorized=false, determinism="pure"))]
+    fn scalar_fn(
+        &self,
+        py: Python<'_>,
+        name: String,
+        args: Bound<'_, PyAny>,
+        returns: String,
+        vectorized: bool,
+        determinism: &str,
+    ) -> PyResult<Py<PyAny>> {
+        uni_plugin_pyo3::make_scalar_trampoline(
+            py,
+            Arc::clone(&self.pending_plugin_builder),
+            name,
+            args,
+            returns,
+            vectorized,
+            determinism,
+        )
+    }
+
+    /// `@session.aggregate_fn(name, args=[...], returns=..., determinism="pure")`
+    #[pyo3(signature = (name, args, returns, determinism="pure"))]
+    fn aggregate_fn(
+        &self,
+        py: Python<'_>,
+        name: String,
+        args: Bound<'_, PyAny>,
+        returns: String,
+        determinism: &str,
+    ) -> PyResult<Py<PyAny>> {
+        uni_plugin_pyo3::make_aggregate_trampoline(
+            py,
+            Arc::clone(&self.pending_plugin_builder),
+            name,
+            args,
+            returns,
+            determinism,
+        )
+    }
+
+    /// `@session.procedure(name, args=[...], yields=[...], mode="read")`
+    #[pyo3(signature = (name, args, yields, mode="read"))]
+    fn procedure(
+        &self,
+        py: Python<'_>,
+        name: String,
+        args: Bound<'_, PyAny>,
+        yields: Bound<'_, PyAny>,
+        mode: &str,
+    ) -> PyResult<Py<PyAny>> {
+        uni_plugin_pyo3::make_procedure_trampoline(
+            py,
+            Arc::clone(&self.pending_plugin_builder),
+            name,
+            args,
+            yields,
+            mode,
+        )
+    }
+
+    /// `session.set_plugin_id(id)` — sets the plugin id used by the
+    /// next `finalize_plugin()`.
+    fn set_plugin_id(&self, plugin_id: String) {
+        self.pending_plugin_builder.set_id(plugin_id);
+    }
+
+    /// `session.set_plugin_version(version)` — sets the version used
+    /// by the next `finalize_plugin()`.
+    fn set_plugin_version(&self, version: String) {
+        self.pending_plugin_builder.set_version(version);
+    }
+
+    /// `await session.finalize_plugin(plugin_id, version=None, grants=None)`
+    /// — drain accumulated decorator entries and register them into
+    /// this session's local plugin registry. Returns a metadata dict
+    /// (`plugin_id`, `version`, `scalars_registered`, etc.) — identical
+    /// shape to the sync `Session.finalize_plugin` return value.
+    #[pyo3(signature = (plugin_id, version=None, grants=None))]
+    fn finalize_plugin<'py>(
+        &self,
+        py: Python<'py>,
+        plugin_id: String,
+        version: Option<String>,
+        grants: Option<Vec<String>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = Arc::clone(&self.inner);
+        let builder = Arc::clone(&self.pending_plugin_builder);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            if builder.entry_count() == 0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "session.finalize_plugin: no pending decorators — call \
+                     @session.scalar_fn / aggregate_fn / procedure first",
+                ));
+            }
+            builder.set_id(&plugin_id);
+            if let Some(v) = version {
+                builder.set_version(v);
+            }
+            let caps = crate::builders::build_capability_set(grants);
+            let loader = uni_plugin_pyo3::PythonPluginLoader::with_default_plugin_id(&plugin_id);
+            let session = inner.lock().await;
+            let outcome = session
+                .finalize_python_plugin(&loader, &builder, &caps)
+                .map_err(crate::exceptions::uni_error_to_pyerr)?;
+            Python::attach(|py| crate::builders::load_outcome_to_pydict(py, &outcome))
+        })
+    }
+
+    /// `await session.load_python_plugin(module_src, module_name, grants=None)`
+    /// — load a Python plugin from a source string. The module body
+    /// uses `@db.scalar_fn(...)` etc. on the host-injected `db`
+    /// global. Registers session-scoped per proposal §5.4.2.
+    #[pyo3(signature = (module_src, module_name, grants=None))]
+    fn load_python_plugin<'py>(
+        &self,
+        py: Python<'py>,
+        module_src: String,
+        module_name: String,
+        grants: Option<Vec<String>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = Arc::clone(&self.inner);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let caps = crate::builders::build_capability_set(grants);
+            let loader = uni_plugin_pyo3::PythonPluginLoader::with_default_plugin_id(&module_name);
+            let session = inner.lock().await;
+            Python::attach(|py| {
+                let outcome = session
+                    .add_python_plugin(py, &loader, &module_src, &module_name, &caps)
+                    .map_err(crate::exceptions::uni_error_to_pyerr)?;
+                crate::builders::load_outcome_to_pydict(py, &outcome)
+            })
+        })
     }
 
     /// Execute a query with session variables.
@@ -2094,6 +2248,7 @@ impl AsyncSession {
     }
 
     /// Add a named session hook.
+    #[allow(deprecated)] // Python binding still uses per-session hooks; migration to BuiltinHookPlugin tracked alongside the v2.0 ABI break.
     fn add_hook<'py>(
         &self,
         py: Python<'py>,
@@ -2109,6 +2264,7 @@ impl AsyncSession {
     }
 
     /// Remove a hook by name.
+    #[allow(deprecated)]
     fn remove_hook<'py>(&self, py: Python<'py>, name: String) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -2118,6 +2274,7 @@ impl AsyncSession {
     }
 
     /// List names of all registered hooks.
+    #[allow(deprecated)]
     fn list_hooks<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -2127,6 +2284,7 @@ impl AsyncSession {
     }
 
     /// Remove all hooks.
+    #[allow(deprecated)]
     fn clear_hooks<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -3990,6 +4148,7 @@ impl AsyncForkBuilder {
                 inner: Arc::new(tokio::sync::Mutex::new(forked)),
                 rule_registry_arc: rule_reg,
                 params_arc,
+                pending_plugin_builder: uni_plugin_pyo3::ManifestBuilder::new(),
             })
         })
     }

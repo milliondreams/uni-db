@@ -140,6 +140,41 @@ pub enum UniError {
     #[error("Hook rejected: {message}")]
     HookRejected { message: String },
 
+    /// A synchronous trigger returned `TriggerOutcome::Reject` (or `Err`)
+    /// during a `BeforeMutation` / `BeforeCommit` phase, aborting commit.
+    #[error("Trigger '{trigger}' rejected commit: {reason}")]
+    TriggerRejected { trigger: String, reason: String },
+
+    /// Authentication failed (M5i). Raised when
+    /// `Uni::session_with_credentials` cannot find a matching
+    /// `AuthProvider` or the matched provider rejects the credentials.
+    #[error("Authentication failed: {reason}")]
+    AuthenticationFailed {
+        /// Human-readable failure reason.
+        reason: String,
+    },
+
+    /// An `AuthzPolicy::check` returned `Decision::Deny` for the
+    /// current principal (M5i).
+    #[error("Authorization denied: {reason}")]
+    AuthorizationDenied {
+        /// Reason from the deciding policy.
+        reason: String,
+    },
+
+    /// A write was attempted against an ephemeral (transient, in-query)
+    /// node or edge — i.e. one whose `Vid` / `Eid` has the
+    /// `EPHEMERAL_BIT` set. Ephemeral entities are return-only
+    /// projections; SET / DELETE / MERGE against them must fail before
+    /// they reach storage (M5g / proposal §4.13.1).
+    #[error("Cannot mutate ephemeral {kind} {id}: ephemeral entities are return-only")]
+    EphemeralWriteAttempt {
+        /// `"node"` or `"edge"`.
+        kind: &'static str,
+        /// Transient id (bottom 63 bits) for diagnostic output.
+        id: u64,
+    },
+
     /// Fork with the given name does not exist in the registry.
     #[error("Fork '{name}' not found")]
     ForkNotFound { name: String },

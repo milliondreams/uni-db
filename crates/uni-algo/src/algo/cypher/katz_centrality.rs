@@ -30,13 +30,13 @@ impl GraphAlgoAdapter for KatzCentralityAdapter {
         vec![("nodeId", ValueType::Int), ("score", ValueType::Float)]
     }
 
-    fn to_config(args: Vec<Value>) -> KatzCentralityConfig {
-        KatzCentralityConfig {
+    fn to_config(args: Vec<Value>) -> Result<KatzCentralityConfig> {
+        Ok(KatzCentralityConfig {
             alpha: args[0].as_f64().unwrap_or(0.1),
             beta: args[1].as_f64().unwrap_or(1.0),
             max_iterations: args[2].as_u64().unwrap_or(100) as usize,
             tolerance: args[3].as_f64().unwrap_or(1e-6),
-        }
+        })
     }
 
     fn map_result(result: <Self::Algo as Algorithm>::Result) -> Result<Vec<AlgoResultRow>> {

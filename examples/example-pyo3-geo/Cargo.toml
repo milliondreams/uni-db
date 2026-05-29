@@ -1,0 +1,33 @@
+# Example PyO3 plugin — opts out of the parent workspace.
+#
+# Run:
+#   cd examples/example-pyo3-geo
+#   cargo run --release
+#
+# Prints great-circle distances for a small fixture of city pairs,
+# exercising the full Uni::load_python_plugin → registry → invoke
+# path against an in-process Uni. Python source lives in geo.py.
+
+[workspace]
+
+[package]
+name = "example-pyo3-geo"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Example PyO3 plugin: geo.haversine via Uni::load_python_plugin"
+publish = false
+
+[[bin]]
+name = "example-pyo3-geo"
+path = "src/main.rs"
+
+[dependencies]
+uni-db = { path = "../../crates/uni", features = ["pyo3-plugins"] }
+uni-plugin = { path = "../../crates/uni-plugin" }
+uni-plugin-pyo3 = { path = "../../crates/uni-plugin-pyo3", features = ["pyo3"] }
+pyo3 = { version = "0.27", features = ["abi3-py310", "auto-initialize"] }
+arrow-array = "57"
+datafusion = "52"
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"

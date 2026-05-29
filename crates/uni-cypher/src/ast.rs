@@ -195,6 +195,11 @@ pub struct PropertyDefinition {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DropIndex {
     pub name: String,
+    /// `DROP INDEX ... IF EXISTS` — when true, executing the command
+    /// against a missing index succeeds silently. Without `IF EXISTS`
+    /// the executor must return an error for an unknown index.
+    #[serde(default)]
+    pub if_exists: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -209,6 +214,9 @@ pub struct CreateConstraint {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DropConstraint {
     pub name: String,
+    /// `DROP CONSTRAINT ... IF EXISTS` — see [`DropIndex::if_exists`].
+    #[serde(default)]
+    pub if_exists: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1061,82 +1069,22 @@ impl Expr {
         }
     }
 
-    /// Substitute all occurrences of a variable with a new variable name
+    /// Substitute all occurrences of a variable with a new variable name.
+    ///
+    /// Structural variants (no binders, no special-case items) delegate to
+    /// `map_children`, which is the canonical place where the full `Expr`
+    /// variant set is enumerated. Only the variants with non-mechanical
+    /// behavior — the matching `Variable`, variable-binders that introduce
+    /// shadowing (`Quantifier`, `Reduce`, `ListComprehension`,
+    /// `PatternComprehension`), and `MapProjection` whose `Variable`
+    /// projection items must be rewritten — get explicit arms.
     pub fn substitute_variable(&self, old_var: &str, new_var: &str) -> Expr {
         let sub = |e: &Expr| e.substitute_variable(old_var, new_var);
         let sub_box = |e: &Expr| Box::new(sub(e));
         let sub_opt = |o: &Option<Box<Expr>>| o.as_ref().map(|e| sub_box(e));
-        let sub_vec = |v: &[Expr]| v.iter().map(sub).collect();
 
         match self {
             Expr::Variable(v) if v == old_var => Expr::Variable(new_var.to_string()),
-            Expr::Variable(_) | Expr::Literal(_) | Expr::Parameter(_) | Expr::Wildcard => {
-                self.clone()
-            }
-
-            Expr::Property(base, prop) => Expr::Property(sub_box(base), prop.clone()),
-
-            Expr::List(exprs) => Expr::List(sub_vec(exprs)),
-
-            Expr::Map(entries) => {
-                Expr::Map(entries.iter().map(|(k, v)| (k.clone(), sub(v))).collect())
-            }
-
-            Expr::FunctionCall {
-                name,
-                args,
-                distinct,
-                window_spec,
-            } => Expr::FunctionCall {
-                name: name.clone(),
-                args: sub_vec(args),
-                distinct: *distinct,
-                window_spec: window_spec.clone(),
-            },
-
-            Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
-                left: sub_box(left),
-                op: *op,
-                right: sub_box(right),
-            },
-
-            Expr::UnaryOp { op, expr } => Expr::UnaryOp {
-                op: *op,
-                expr: sub_box(expr),
-            },
-
-            Expr::Case {
-                expr,
-                when_then,
-                else_expr,
-            } => Expr::Case {
-                expr: sub_opt(expr),
-                when_then: when_then.iter().map(|(w, t)| (sub(w), sub(t))).collect(),
-                else_expr: sub_opt(else_expr),
-            },
-
-            // Don't substitute inside subqueries
-            Expr::Exists { .. } | Expr::CountSubquery(_) | Expr::CollectSubquery(_) => self.clone(),
-
-            Expr::IsNull(e) => Expr::IsNull(sub_box(e)),
-            Expr::IsNotNull(e) => Expr::IsNotNull(sub_box(e)),
-            Expr::IsUnique(e) => Expr::IsUnique(sub_box(e)),
-
-            Expr::In { expr, list } => Expr::In {
-                expr: sub_box(expr),
-                list: sub_box(list),
-            },
-
-            Expr::ArrayIndex { array, index } => Expr::ArrayIndex {
-                array: sub_box(array),
-                index: sub_box(index),
-            },
-
-            Expr::ArraySlice { array, start, end } => Expr::ArraySlice {
-                array: sub_box(array),
-                start: sub_opt(start),
-                end: sub_opt(end),
-            },
 
             Expr::Quantifier {
                 quantifier,
@@ -1201,35 +1149,11 @@ impl Expr {
                 }
             }
 
-            Expr::PatternComprehension {
-                path_variable,
-                pattern,
-                where_clause,
-                map_expr,
-            } => {
-                if path_variable.as_deref() == Some(old_var) {
-                    self.clone()
-                } else {
-                    Expr::PatternComprehension {
-                        path_variable: path_variable.clone(),
-                        pattern: pattern.clone(),
-                        where_clause: sub_opt(where_clause),
-                        map_expr: sub_box(map_expr),
-                    }
-                }
+            Expr::PatternComprehension { path_variable, .. }
+                if path_variable.as_deref() == Some(old_var) =>
+            {
+                self.clone()
             }
-
-            Expr::ValidAt {
-                entity,
-                timestamp,
-                start_prop,
-                end_prop,
-            } => Expr::ValidAt {
-                entity: sub_box(entity),
-                timestamp: sub_box(timestamp),
-                start_prop: start_prop.clone(),
-                end_prop: end_prop.clone(),
-            },
 
             Expr::MapProjection { base, items } => Expr::MapProjection {
                 base: sub_box(base),
@@ -1247,10 +1171,12 @@ impl Expr {
                     .collect(),
             },
 
-            Expr::LabelCheck { expr, labels } => Expr::LabelCheck {
-                expr: sub_box(expr),
-                labels: labels.clone(),
-            },
+            // All other variants are pure structural recursion. `map_children`
+            // leaves `Exists` / `CountSubquery` / `CollectSubquery` untouched,
+            // preserving the original "don't substitute inside subqueries" rule.
+            _ => self
+                .clone()
+                .map_children(&mut |e| e.substitute_variable(old_var, new_var)),
         }
     }
 
@@ -1261,7 +1187,7 @@ impl Expr {
                 name, window_spec, ..
             } => {
                 window_spec.is_none()
-                    && matches!(
+                    && (matches!(
                         name.to_lowercase().as_str(),
                         "count"
                             | "sum"
@@ -1273,55 +1199,22 @@ impl Expr {
                             | "stdevp"
                             | "percentiledisc"
                             | "percentilecont"
-                    )
+                    ) || crate::plugin_aggregates::is_known_plugin_aggregate(name))
             }
             Expr::CountSubquery(_) | Expr::CollectSubquery(_) => true,
-            Expr::Property(base, _) => base.is_aggregate(),
-            Expr::List(exprs) => exprs.iter().any(|e| e.is_aggregate()),
-            Expr::Map(entries) => entries.iter().any(|(_, v)| v.is_aggregate()),
-            Expr::BinaryOp { left, right, .. } => left.is_aggregate() || right.is_aggregate(),
-            Expr::UnaryOp { expr, .. } => expr.is_aggregate(),
-            Expr::Case {
-                expr,
-                when_then,
-                else_expr,
-            } => {
-                expr.as_ref().is_some_and(|e| e.is_aggregate())
-                    || when_then
-                        .iter()
-                        .any(|(w, t)| w.is_aggregate() || t.is_aggregate())
-                    || else_expr.as_ref().is_some_and(|e| e.is_aggregate())
+            // All other variants: recurse into direct children. `for_each_child`
+            // already returns nothing for leaves (Literal/Parameter/Variable/Wildcard)
+            // and skips into `Exists` — both of which used to fall through the
+            // original wildcard `_ => false` arm with identical effect.
+            _ => {
+                let mut found = false;
+                self.for_each_child(&mut |c| {
+                    if !found && c.is_aggregate() {
+                        found = true;
+                    }
+                });
+                found
             }
-            Expr::In { expr, list } => expr.is_aggregate() || list.is_aggregate(),
-            Expr::IsNull(e) | Expr::IsNotNull(e) | Expr::IsUnique(e) => e.is_aggregate(),
-            Expr::ArrayIndex { array, index } => array.is_aggregate() || index.is_aggregate(),
-            Expr::ArraySlice { array, start, end } => {
-                array.is_aggregate()
-                    || start.as_ref().is_some_and(|e| e.is_aggregate())
-                    || end.as_ref().is_some_and(|e| e.is_aggregate())
-            }
-            Expr::Quantifier {
-                list, predicate, ..
-            } => list.is_aggregate() || predicate.is_aggregate(),
-            Expr::Reduce {
-                init, list, expr, ..
-            } => init.is_aggregate() || list.is_aggregate() || expr.is_aggregate(),
-            Expr::ListComprehension {
-                list,
-                where_clause,
-                map_expr,
-                ..
-            } => {
-                list.is_aggregate()
-                    || where_clause.as_ref().is_some_and(|e| e.is_aggregate())
-                    || map_expr.is_aggregate()
-            }
-            Expr::PatternComprehension {
-                where_clause,
-                map_expr,
-                ..
-            } => where_clause.as_ref().is_some_and(|e| e.is_aggregate()) || map_expr.is_aggregate(),
-            _ => false,
         }
     }
 

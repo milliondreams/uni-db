@@ -1,0 +1,153 @@
+//! Host function registration surface for Rhai plugins.
+//!
+//! The Rhai equivalent of `uni_plugin_extism::HostFnRegistry`. The host
+//! populates this once per uni-db instance with all gateable host fns
+//! (`uni.fs.read`, `uni.http.get`, `uni.query`, `uni.kms.sign`,
+//! `uni.secret.acquire`, …). At plugin load time,
+//! [`crate::engine::build_engine`] filters the registry through the
+//! plugin's granted capability set and registers only the matching fns
+//! onto the per-plugin `rhai::Engine`.
+//!
+//! Per proposal §10.2, Rhai uses **Engine-import absence** as its
+//! capability-enforcement layer 2 — ungranted host fns are simply not
+//! registered, so the script fails at parse-resolution with Rhai's
+//! `ErrorFunctionNotFound`. This is the in-host analogue of CM's
+//! linker-absence guarantee.
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use uni_plugin::Capability;
+
+/// Type-erased registrar closure invoked at engine-construction time.
+///
+/// Each closure receives a mutable `rhai::Engine` and registers one or
+/// more host functions on it via `Engine::register_fn`. The closure is
+/// only invoked when the host fn's required capability is in the plugin's
+/// effective grant set — ungranted fns are never registered, achieving
+/// Engine-import absence.
+#[cfg(feature = "rhai-runtime")]
+pub type RhaiHostFnRegister = Arc<dyn Fn(&mut rhai::Engine) + Send + Sync + 'static>;
+
+#[cfg(not(feature = "rhai-runtime"))]
+pub type RhaiHostFnRegister = Arc<dyn Fn() + Send + Sync + 'static>;
+
+/// Metadata + registrar describing a single host function exposed to
+/// Rhai plugins.
+#[derive(Clone)]
+pub struct RhaiHostFnSpec {
+    /// Symbolic name surfaced to scripts (e.g., `"uni.fs.read"`). Used
+    /// only for capability-gating decisions and for the `info` /
+    /// `denied_capabilities` reporting in `LoadOutcome`. The actual Rhai
+    /// function name registered on the Engine is determined by the
+    /// `register` closure — typically by calling
+    /// `engine.register_fn("uni_fs_read", ...)`.
+    pub name: String,
+
+    /// Capability required for this fn to be visible to a plugin. `None`
+    /// means always-available.
+    pub required_capability: Option<Capability>,
+
+    /// Human-readable description; surfaced via `uni plugin info`.
+    pub docs: String,
+
+    /// Closure that registers the fn(s) on a freshly-built Rhai engine
+    /// when the required capability is granted.
+    pub register: RhaiHostFnRegister,
+}
+
+impl std::fmt::Debug for RhaiHostFnSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RhaiHostFnSpec")
+            .field("name", &self.name)
+            .field("required_capability", &self.required_capability)
+            .field("docs", &self.docs)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Registry of host functions available to Rhai plugins.
+#[derive(Debug, Default, Clone)]
+pub struct RhaiHostFnRegistry {
+    specs: BTreeMap<String, RhaiHostFnSpec>,
+}
+
+impl RhaiHostFnRegistry {
+    /// Construct a fresh, empty registry.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a host fn spec.
+    pub fn register(&mut self, spec: RhaiHostFnSpec) {
+        self.specs.insert(spec.name.clone(), spec);
+    }
+
+    /// Look up a registered spec by name.
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<&RhaiHostFnSpec> {
+        self.specs.get(name)
+    }
+
+    /// Iterate all registered specs in insertion-name order.
+    pub fn iter(&self) -> impl Iterator<Item = &RhaiHostFnSpec> {
+        self.specs.values()
+    }
+
+    /// Number of registered host fns.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.specs.len()
+    }
+
+    /// Returns true if no host fns are registered.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.specs.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registry_starts_empty() {
+        let r = RhaiHostFnRegistry::new();
+        assert!(r.is_empty());
+        assert_eq!(r.len(), 0);
+    }
+
+    #[cfg(feature = "rhai-runtime")]
+    #[test]
+    fn register_and_lookup_round_trip() {
+        let mut r = RhaiHostFnRegistry::new();
+        r.register(RhaiHostFnSpec {
+            name: "uni.fs.read".to_owned(),
+            required_capability: Some(Capability::Filesystem {
+                read: vec!["/data/**".into()],
+                write: vec![],
+            }),
+            docs: "Read a file from the host filesystem.".to_owned(),
+            register: Arc::new(|_engine| { /* stub */ }),
+        });
+        let spec = r.get("uni.fs.read").expect("registered");
+        assert!(spec.required_capability.is_some());
+        assert_eq!(r.len(), 1);
+    }
+
+    #[cfg(feature = "rhai-runtime")]
+    #[test]
+    fn always_available_fns_have_no_required_capability() {
+        let mut r = RhaiHostFnRegistry::new();
+        r.register(RhaiHostFnSpec {
+            name: "uni.log".to_owned(),
+            required_capability: None,
+            docs: "Emit a tracing event.".to_owned(),
+            register: Arc::new(|_engine| {}),
+        });
+        let spec = r.get("uni.log").expect("registered");
+        assert!(spec.required_capability.is_none());
+    }
+}

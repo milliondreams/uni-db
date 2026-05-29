@@ -871,6 +871,117 @@ impl Database {
     }
 
     // ========================================================================
+    // Plugin Methods
+    // ========================================================================
+
+    /// Load a Rhai-script plugin from source text.
+    ///
+    /// `script` is the Rhai source; the script must export a
+    /// `uni_manifest()` function returning a map declaring its scalar /
+    /// aggregate / procedure entries (see proposal §5.6).
+    ///
+    /// `grants` is a list of capability variant names the host is
+    /// willing to give the plugin. Recognised values:
+    /// `"ScalarFn"`, `"AggregateFn"`, `"Procedure"`, `"Filesystem"`,
+    /// `"Network"`, `"HostQuery"`, `"Kms"`, `"Secret"`. Pattern-
+    /// narrowed grants (specific paths / URLs) are not yet exposed
+    /// from Python; the variant grant gives the script's host fns
+    /// permission to call out, and the host's runtime enforcement
+    /// (e.g., glob validation) is unchanged.
+    ///
+    /// Returns a dict with keys `plugin_id`, `version`,
+    /// `scalars_registered`, `aggregates_registered`,
+    /// `procedures_registered`, `denied_capabilities`.
+    #[pyo3(signature = (script, grants=None))]
+    fn load_rhai_plugin(
+        &self,
+        py: Python<'_>,
+        script: &str,
+        grants: Option<Vec<String>>,
+    ) -> PyResult<Py<PyAny>> {
+        use uni_plugin::{Capability, CapabilitySet};
+
+        let mut cap_set = CapabilitySet::new();
+        // Default: any grants list adds the corresponding capability
+        // with the broadest possible attenuation (e.g., Filesystem
+        // {read: ["**"]}). Tightening to specific patterns is host-
+        // side work after M7.
+        let grants = grants.unwrap_or_else(|| {
+            vec![
+                "ScalarFn".to_owned(),
+                "AggregateFn".to_owned(),
+                "Procedure".to_owned(),
+            ]
+        });
+        for g in &grants {
+            match g.as_str() {
+                "ScalarFn" => {
+                    cap_set.insert(Capability::ScalarFn);
+                }
+                "AggregateFn" => {
+                    cap_set.insert(Capability::AggregateFn);
+                }
+                "Procedure" => {
+                    cap_set.insert(Capability::Procedure);
+                }
+                "Filesystem" => {
+                    cap_set.insert(Capability::Filesystem {
+                        read: vec!["**".into()],
+                        write: vec!["**".into()],
+                    });
+                }
+                "Network" => {
+                    cap_set.insert(Capability::Network {
+                        allow: vec!["**".into()],
+                    });
+                }
+                "HostQuery" => {
+                    cap_set.insert(Capability::HostQuery {
+                        read_only: true,
+                        scopes: vec!["**".into()],
+                    });
+                }
+                "Kms" => {
+                    cap_set.insert(Capability::Kms {
+                        key_ids: vec!["*".into()],
+                    });
+                }
+                "Secret" => {
+                    cap_set.insert(Capability::Secret {
+                        ids: vec!["*".into()],
+                    });
+                }
+                other => {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "unknown grant `{other}`; supported: ScalarFn / AggregateFn / Procedure / Filesystem / Network / HostQuery / Kms / Secret"
+                    )));
+                }
+            }
+        }
+
+        let mut loader = uni_plugin_rhai::RhaiLoader::new();
+        uni_plugin_rhai::host_fn_impls::register_default_host_fns(&mut loader);
+        let outcome = self
+            .inner
+            .load_rhai_plugin(&loader, script, &cap_set)
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
+
+        let dict = pyo3::types::PyDict::new(py);
+        dict.set_item("plugin_id", outcome.plugin_id.as_str())?;
+        dict.set_item("version", outcome.version)?;
+        dict.set_item("scalars_registered", outcome.scalars_registered)?;
+        dict.set_item("aggregates_registered", outcome.aggregates_registered)?;
+        dict.set_item("procedures_registered", outcome.procedures_registered)?;
+        let denied: Vec<String> = outcome
+            .denied_capabilities
+            .iter()
+            .map(|c| format!("{c:?}"))
+            .collect();
+        dict.set_item("denied_capabilities", denied)?;
+        Ok(dict.into())
+    }
+
+    // ========================================================================
     // Index Methods
     // ========================================================================
 
@@ -884,6 +995,7 @@ impl Database {
     fn session(&self) -> crate::builders::Session {
         crate::builders::Session {
             inner: self.inner.session(),
+            pending_plugin_builder: uni_plugin_pyo3::ManifestBuilder::new(),
         }
     }
 

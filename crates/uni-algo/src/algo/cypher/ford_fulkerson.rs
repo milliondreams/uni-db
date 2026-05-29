@@ -5,11 +5,10 @@
 
 use crate::algo::ProjectionBuilder;
 use crate::algo::algorithms::{Algorithm, FordFulkerson, FordFulkersonConfig};
-use crate::algo::procedure_template::{GenericAlgoProcedure, GraphAlgoAdapter};
+use crate::algo::procedure_template::{GenericAlgoProcedure, GraphAlgoAdapter, parse_vid_arg};
 use crate::algo::procedures::{AlgoResultRow, ValueType};
 use anyhow::Result;
 use serde_json::{Value, json};
-use uni_common::core::id::Vid;
 
 pub struct FordFulkersonAdapter;
 
@@ -29,11 +28,11 @@ impl GraphAlgoAdapter for FordFulkersonAdapter {
         vec![("maxFlow", ValueType::Float)]
     }
 
-    fn to_config(args: Vec<Value>) -> FordFulkersonConfig {
-        FordFulkersonConfig {
-            source: Vid::from(args[0].as_u64().unwrap_or(0)),
-            sink: Vid::from(args[1].as_u64().unwrap_or(0)),
-        }
+    fn to_config(args: Vec<Value>) -> Result<FordFulkersonConfig> {
+        Ok(FordFulkersonConfig {
+            source: parse_vid_arg(&args[0], "sourceNode")?,
+            sink: parse_vid_arg(&args[1], "sinkNode")?,
+        })
     }
 
     fn map_result(result: <Self::Algo as Algorithm>::Result) -> Result<Vec<AlgoResultRow>> {

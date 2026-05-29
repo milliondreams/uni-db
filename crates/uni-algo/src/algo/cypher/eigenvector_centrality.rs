@@ -28,11 +28,11 @@ impl GraphAlgoAdapter for EigenvectorCentralityAdapter {
         vec![("nodeId", ValueType::Int), ("score", ValueType::Float)]
     }
 
-    fn to_config(args: Vec<Value>) -> EigenvectorCentralityConfig {
-        EigenvectorCentralityConfig {
+    fn to_config(args: Vec<Value>) -> Result<EigenvectorCentralityConfig> {
+        Ok(EigenvectorCentralityConfig {
             max_iterations: args[0].as_u64().unwrap_or(100) as usize,
             tolerance: args[1].as_f64().unwrap_or(1e-6),
-        }
+        })
     }
 
     fn map_result(result: <Self::Algo as Algorithm>::Result) -> Result<Vec<AlgoResultRow>> {

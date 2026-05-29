@@ -47,7 +47,11 @@ async fn setup_db() -> Uni {
             h.insert("name".into(), Value::String(format!("name-{i:04}")));
             h.insert(
                 "color".into(),
-                Value::String(if i % 2 == 0 { "red".into() } else { "blue".into() }),
+                Value::String(if i % 2 == 0 {
+                    "red".into()
+                } else {
+                    "blue".into()
+                }),
             );
             h
         })
@@ -147,7 +151,11 @@ async fn unwind_map_param_field_property_eq_uses_hash_index() {
         .unwrap();
     print_profile("UNWIND $rows AS u WHERE n.name = u.name_key", &profile);
 
-    assert_eq!(results.len(), 3, "should match the 3 name_keys in the UNWIND");
+    assert_eq!(
+        results.len(),
+        3,
+        "should match the 3 name_keys in the UNWIND"
+    );
     let rows = scan_rows(&profile);
     assert!(
         rows <= 10,

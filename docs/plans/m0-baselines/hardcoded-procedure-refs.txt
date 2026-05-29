@@ -1,0 +1,40 @@
+crates/uni-query/src/query/expr_eval.rs:871:    match eval_datetime_function(fn_name, &[Value::String(s.to_string())]).ok()? {
+crates/uni-query/src/query/expr_eval.rs:921:        let timezone_name = match inner.get("timezone_name") {
+crates/uni-query/src/query/expr_eval.rs:1197:    match name {
+crates/uni-query/src/query/expr_eval.rs:1281:    match name {
+crates/uni-query/src/query/expr_eval.rs:1383:    match name {
+crates/uni-query/src/query/expr_eval.rs:1661:    match name {
+crates/uni-query/src/query/expr_eval.rs:1727:    match name_upper.as_str() {
+crates/uni-query/src/query/expr_eval.rs:2178:    match name {
+crates/uni-query/src/query/expr_eval.rs:2332:            let result = match name {
+crates/uni-query/src/query/expr_eval.rs:2438:    match name {
+crates/uni-query/src/query/locy_planner.rs:91:            match fn_name.to_uppercase().as_str() {
+crates/uni-query/src/query/locy_planner.rs:169:            match name.to_uppercase().as_str() {
+crates/uni-query/src/query/locy_planner.rs:828:                if matches!(&e, Expr::Variable(v) if fold_output_names.contains(v.as_str())) {
+crates/uni-query/src/query/locy_planner.rs:1107:/// Recursively substitute `Variable(name)` nodes matching ALONG binding names
+crates/uni-query/src/query/df_graph/locy_priority.rs:402:            match names.value(i) {
+crates/uni-query/src/query/df_graph/common.rs:995:        match procedure_name {
+crates/uni-query/src/query/df_graph/common.rs:996:            "uni.schema.labels" => match name {
+crates/uni-query/src/query/df_graph/common.rs:1000:            "uni.schema.edgeTypes" | "uni.schema.relationshipTypes" => match name {
+crates/uni-query/src/query/df_graph/common.rs:1004:            "uni.schema.constraints" => match name {
+crates/uni-query/src/query/df_graph/common.rs:1008:            "uni.schema.labelInfo" => match name {
+crates/uni-query/src/query/df_graph/common.rs:1015:                match map_yield_to_canonical(name).as_str() {
+crates/uni-query/src/query/df_graph/common.rs:1119:        Expr::FunctionCall { name, args, .. } => match name.to_lowercase().as_str() {
+crates/uni-query/src/query/df_graph/common.rs:1242:                match merged.get_mut(prop_name) {
+crates/uni-query/src/query/df_graph/expr_compiler.rs:1391:        match name.to_uppercase().as_str() {
+crates/uni-query/src/query/df_graph/locy_fold.rs:1005:            match names.value(i) {
+crates/uni-query/src/query/df_graph/locy_fold.rs:1199:            match names.value(i) {
+crates/uni-query/src/query/df_graph/locy_fold.rs:1541:            match names.value(i) {
+crates/uni-query/src/query/spatial.rs:11:    match name {
+crates/uni-query/src/query/rewrite/walker.rs:598:        assert!(matches!(rewritten, Expr::FunctionCall { name, .. } if name == "unknown"));
+crates/uni-query/src/query/df_graph/locy_explain.rs:265:            message: format!("no tracker entries match WHERE clause for rule '{rule_name}'"),
+crates/uni-query/src/query/df_graph/apply.rs:339:        match row.get(col_name).and_then(&extract) {
+crates/uni-query/src/query/df_graph/apply.rs:426:                    match row.get(col_name) {
+crates/uni-query/src/query/df_graph/apply.rs:439:                    match row.get(col_name) {
+crates/uni-query/src/query/df_graph/apply.rs:460:                    match row.get(col_name) {
+crates/uni-query/src/query/df_planner.rs:1405:            Expr::Parameter(name) => match params.get(name) {
+crates/uni-query/src/query/df_planner.rs:3900:            let df_agg = match name_lower.as_str() {
+crates/uni-query/src/query/df_planner.rs:4480:            let (window_fn_def, is_aggregate) = match name_lower.as_str() {
+crates/uni-query/src/query/df_planner.rs:4542:                                let cast_type = match name_lower.as_str() {
+crates/uni-query/src/query/df_planner.rs:6295:        Expr::Parameter(name) => match params.get(name)? {
+crates/uni-query/src/query/df_planner.rs:6339:        Expr::Parameter(name) => match params.get(name)? {

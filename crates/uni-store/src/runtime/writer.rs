@@ -2299,6 +2299,7 @@ impl Writer {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn insert_edge(
         &self,
         src_vid: Vid,
@@ -2487,10 +2488,7 @@ impl Writer {
     /// detected via `properties.contains_key(target_prop)` inside
     /// `process_embeddings_for_batch` (writer.rs:~2650), so re-running
     /// the drain is safe.
-    async fn drain_pending_embeddings(
-        &self,
-        old_l0_arc: &Arc<RwLock<L0Buffer>>,
-    ) -> Result<()> {
+    async fn drain_pending_embeddings(&self, old_l0_arc: &Arc<RwLock<L0Buffer>>) -> Result<()> {
         let by_label: HashMap<String, Vec<Vid>> = {
             let guard = old_l0_arc.read();
             if guard.pending_embeddings.is_empty() {
@@ -2517,14 +2515,11 @@ impl Writer {
                     .collect()
             };
 
-            self.process_embeddings_for_batch(
-                std::slice::from_ref(&label),
-                &mut properties_batch,
-            )
-            .await?;
+            self.process_embeddings_for_batch(std::slice::from_ref(&label), &mut properties_batch)
+                .await?;
 
             let mut guard = old_l0_arc.write();
-            for (vid, props) in vids.iter().zip(properties_batch.into_iter()) {
+            for (vid, props) in vids.iter().zip(properties_batch) {
                 let target = guard.vertex_properties.entry(*vid).or_default();
                 for (k, v) in props {
                     target.insert(k, v);
@@ -2705,7 +2700,7 @@ impl Writer {
     /// 5. `Index` / `Storage` locks (during actual flush)
     ///
     /// Callers that already hold `flush_lock` (today only `commit_transaction_l0`)
-    /// must call [`Writer::flush_inline_under_lock`] directly to avoid a re-entrant
+    /// must call `flush_inline_under_lock` (private) directly to avoid a re-entrant
     /// `tokio::sync::Mutex` deadlock — see concurrent_writer.md §5.5.
     pub async fn flush_to_l1(&self, name: Option<String>) -> Result<String> {
         // Drain any in-flight async flushes first. `flush_to_l1` is a
@@ -2724,7 +2719,8 @@ impl Writer {
 
     /// Async-flush entry point: rotate under `flush_lock`, release the
     /// lock, then submit the stream phase to the [`FlushCoordinator`].
-    /// Returns a [`FlushTicket`] that resolves when finalize completes.
+    /// Returns a [`FlushTicket`](crate::runtime::flush_coordinator::FlushTicket)
+    /// that resolves when finalize completes.
     ///
     /// Errors if `config.async_flush_enabled = false` (the coordinator
     /// is `None` in that case — see `flush_coordinator` field doc).

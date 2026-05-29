@@ -462,4 +462,22 @@ impl LocyWorld {
     pub fn locy_result(&self) -> Option<&Result<uni_locy::LocyResult, UniError>> {
         self.last_locy_result.as_ref()
     }
+
+    /// Unwrap the last successful Locy evaluation, panicking with a clear
+    /// message if none was captured or evaluation failed.
+    pub fn expect_locy_ok(&self) -> &uni_locy::LocyResult {
+        self.locy_result()
+            .expect("No evaluation result found")
+            .as_ref()
+            .expect("Evaluation failed")
+    }
+
+    /// Borrow the command result at `idx`, panicking with a clear message if
+    /// no evaluation ran or the index is out of bounds.
+    pub fn expect_command_result(&self, idx: usize) -> &uni_locy::result::CommandResult {
+        self.expect_locy_ok()
+            .command_results
+            .get(idx)
+            .unwrap_or_else(|| panic!("No command result at index {}", idx))
+    }
 }

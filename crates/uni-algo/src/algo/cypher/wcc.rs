@@ -23,10 +23,10 @@ impl GraphAlgoAdapter for WccAdapter {
         vec![("nodeId", ValueType::Int), ("componentId", ValueType::Int)]
     }
 
-    fn to_config(args: Vec<Value>) -> WccConfig {
-        WccConfig {
+    fn to_config(args: Vec<Value>) -> Result<WccConfig> {
+        Ok(WccConfig {
             min_component_size: Some(args[0].as_u64().unwrap() as usize),
-        }
+        })
     }
 
     fn map_result(result: <Self::Algo as Algorithm>::Result) -> Result<Vec<AlgoResultRow>> {

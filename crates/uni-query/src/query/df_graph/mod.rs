@@ -39,6 +39,7 @@ pub mod apply;
 pub mod bind_fixed_path;
 pub mod bind_zero_length_path;
 pub mod bitmap;
+pub mod catalog_scan;
 pub mod common;
 pub mod comprehension;
 pub mod expr_compiler;
@@ -99,6 +100,8 @@ use uni_store::runtime::property_manager::PropertyManager;
 use uni_store::storage::adjacency_manager::AdjacencyManager;
 use uni_store::storage::direction::Direction;
 use uni_store::storage::manager::StorageManager;
+
+pub mod search_procedures;
 use uni_xervo::runtime::ModelRuntime;
 
 use crate::types::QueryWarning;
@@ -169,6 +172,10 @@ pub struct GraphExecutionContext {
 
     /// External procedure registry for test/user-defined procedures.
     procedure_registry: Option<Arc<ProcedureRegistry>>,
+    /// Plugin registry — used by the native-label scan dispatcher
+    /// (M5h.2) to route a label's reads through plugin `Storage` when
+    /// one is registered via `PluginRegistry::register_label_storage`.
+    plugin_registry: Option<Arc<uni_plugin::PluginRegistry>>,
     /// Uni-Xervo runtime used by vector auto-embedding paths.
     xervo_runtime: Option<Arc<ModelRuntime>>,
 
@@ -177,6 +184,15 @@ pub struct GraphExecutionContext {
 
     /// Cooperative cancellation token, threaded from `QueryContext`.
     cancellation_token: Option<tokio_util::sync::CancellationToken>,
+
+    /// Outer transaction's writer handle (FU-1 / M11 #6). Threaded
+    /// from the [`crate::Executor`] when the query is running inside a
+    /// write-mode transaction; consumed by
+    /// `QueryProcedureHost::with_writer` at procedure invocation time
+    /// so a declared `WRITE`-mode procedure's Cypher body can mutate
+    /// the outer transaction's L0. `Arc<Writer>` (interior-mutable,
+    /// no outer lock) matches the executor's writer handle type.
+    writer: Option<Arc<uni_store::Writer>>,
 }
 
 impl std::fmt::Debug for GraphExecutionContext {
@@ -272,9 +288,11 @@ impl GraphExecutionContext {
             deadline: None,
             algo_registry: None,
             procedure_registry: None,
+            plugin_registry: None,
             xervo_runtime: None,
             warnings: Arc::new(Mutex::new(Vec::new())),
             cancellation_token: None,
+            writer: None,
         }
     }
 
@@ -297,9 +315,11 @@ impl GraphExecutionContext {
             deadline: None,
             algo_registry: None,
             procedure_registry: None,
+            plugin_registry: None,
             xervo_runtime: None,
             warnings: Arc::new(Mutex::new(Vec::new())),
             cancellation_token: None,
+            writer: None,
         }
     }
 
@@ -316,9 +336,11 @@ impl GraphExecutionContext {
             deadline: query_ctx.deadline,
             algo_registry: None,
             procedure_registry: None,
+            plugin_registry: None,
             xervo_runtime: None,
             warnings: Arc::new(Mutex::new(Vec::new())),
             cancellation_token: query_ctx.cancellation_token.clone(),
+            writer: None,
         }
     }
 
@@ -326,6 +348,21 @@ impl GraphExecutionContext {
     pub fn with_deadline(mut self, deadline: Instant) -> Self {
         self.deadline = Some(deadline);
         self
+    }
+
+    /// Attach the outer transaction's writer handle so declared
+    /// `WRITE`-mode procedures invoked through this context can run
+    /// their Cypher bodies via the write-enabled inner-query host.
+    #[must_use]
+    pub fn with_writer(mut self, writer: Arc<uni_store::Writer>) -> Self {
+        self.writer = Some(writer);
+        self
+    }
+
+    /// Borrow the outer transaction's writer handle, if any.
+    #[must_use]
+    pub fn writer(&self) -> Option<&Arc<uni_store::Writer>> {
+        self.writer.as_ref()
     }
 
     /// Set the algorithm registry for `uni.algo.*` procedure dispatch.
@@ -354,6 +391,18 @@ impl GraphExecutionContext {
     /// Get a reference to the procedure registry, if set.
     pub fn procedure_registry(&self) -> Option<&Arc<ProcedureRegistry>> {
         self.procedure_registry.as_ref()
+    }
+
+    /// Attach the plugin registry. Required by the M5h.2 native-label
+    /// plugin-storage routing in `columnar_scan_vertex_batch_static`.
+    pub fn with_plugin_registry(mut self, registry: Arc<uni_plugin::PluginRegistry>) -> Self {
+        self.plugin_registry = Some(registry);
+        self
+    }
+
+    /// Reference to the plugin registry (if set).
+    pub fn plugin_registry(&self) -> Option<&Arc<uni_plugin::PluginRegistry>> {
+        self.plugin_registry.as_ref()
     }
 
     pub fn xervo_runtime(&self) -> Option<&Arc<ModelRuntime>> {
@@ -412,6 +461,25 @@ impl GraphExecutionContext {
     /// Get a reference to the L0 context.
     pub fn l0_context(&self) -> &L0Context {
         &self.l0_context
+    }
+
+    /// Wall-clock deadline for the surrounding query, if any.
+    ///
+    /// Internal accessor used by [`crate::query::executor::procedure_host::QueryProcedureHost`]
+    /// to snapshot the deadline so procedure plugins can implement
+    /// `check_timeout` without holding a borrow on this context.
+    #[must_use]
+    pub fn deadline_for_host(&self) -> Option<Instant> {
+        self.deadline
+    }
+
+    /// Cancellation token clone for the surrounding query, if any.
+    ///
+    /// Internal accessor for [`crate::query::executor::procedure_host::QueryProcedureHost`];
+    /// see [`Self::deadline_for_host`].
+    #[must_use]
+    pub fn cancellation_token_for_host(&self) -> Option<tokio_util::sync::CancellationToken> {
+        self.cancellation_token.clone()
     }
 
     /// Create a query context for property manager calls.

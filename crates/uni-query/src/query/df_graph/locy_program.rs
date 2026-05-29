@@ -17,7 +17,7 @@ use crate::query::df_graph::locy_explain::ProvenanceStore;
 use crate::query::df_graph::locy_fixpoint::{
     DerivedScanRegistry, FixpointClausePlan, FixpointExec, FixpointRulePlan, IsRefBinding,
 };
-use crate::query::df_graph::locy_fold::{FoldAggKind, FoldBinding};
+use crate::query::df_graph::locy_fold::{FoldBinding, resolve_locy_aggregate};
 use crate::query::planner_locy_types::{
     LocyCommand, LocyIsRef, LocyRulePlan, LocyStratum, LocyYieldColumn,
 };
@@ -44,6 +44,7 @@ use uni_cypher::locy_ast::GoalQuery;
 use uni_locy::{
     ClassifierRegistry, CommandResult, FactRow, ModelInvocationCache, RuntimeWarning, SemiringKind,
 };
+use uni_plugin::PluginRegistry;
 use uni_store::storage::manager::StorageManager;
 
 // ---------------------------------------------------------------------------
@@ -104,6 +105,7 @@ pub struct LocyProgramExec {
     strata: Vec<LocyStratum>,
     commands: Vec<LocyCommand>,
     derived_scan_registry: Arc<DerivedScanRegistry>,
+    plugin_registry: Arc<PluginRegistry>,
     graph_ctx: Arc<GraphExecutionContext>,
     session_ctx: Arc<RwLock<datafusion::prelude::SessionContext>>,
     storage: Arc<StorageManager>,
@@ -183,6 +185,7 @@ impl LocyProgramExec {
         strata: Vec<LocyStratum>,
         commands: Vec<LocyCommand>,
         derived_scan_registry: Arc<DerivedScanRegistry>,
+        plugin_registry: Arc<PluginRegistry>,
         graph_ctx: Arc<GraphExecutionContext>,
         session_ctx: Arc<RwLock<datafusion::prelude::SessionContext>>,
         storage: Arc<StorageManager>,
@@ -203,6 +206,7 @@ impl LocyProgramExec {
             strata,
             commands,
             derived_scan_registry,
+            plugin_registry,
             graph_ctx,
             session_ctx,
             storage,
@@ -234,6 +238,7 @@ impl LocyProgramExec {
         strata: Vec<LocyStratum>,
         commands: Vec<LocyCommand>,
         derived_scan_registry: Arc<DerivedScanRegistry>,
+        plugin_registry: Arc<PluginRegistry>,
         graph_ctx: Arc<GraphExecutionContext>,
         session_ctx: Arc<RwLock<datafusion::prelude::SessionContext>>,
         storage: Arc<StorageManager>,
@@ -255,6 +260,7 @@ impl LocyProgramExec {
             strata,
             commands,
             derived_scan_registry,
+            plugin_registry,
             graph_ctx,
             session_ctx,
             storage,
@@ -285,6 +291,7 @@ impl LocyProgramExec {
         strata: Vec<LocyStratum>,
         commands: Vec<LocyCommand>,
         derived_scan_registry: Arc<DerivedScanRegistry>,
+        plugin_registry: Arc<PluginRegistry>,
         graph_ctx: Arc<GraphExecutionContext>,
         session_ctx: Arc<RwLock<datafusion::prelude::SessionContext>>,
         storage: Arc<StorageManager>,
@@ -307,6 +314,7 @@ impl LocyProgramExec {
             strata,
             commands,
             derived_scan_registry,
+            plugin_registry,
             graph_ctx,
             session_ctx,
             storage,
@@ -341,6 +349,7 @@ impl LocyProgramExec {
         strata: Vec<LocyStratum>,
         commands: Vec<LocyCommand>,
         derived_scan_registry: Arc<DerivedScanRegistry>,
+        plugin_registry: Arc<PluginRegistry>,
         graph_ctx: Arc<GraphExecutionContext>,
         session_ctx: Arc<RwLock<datafusion::prelude::SessionContext>>,
         storage: Arc<StorageManager>,
@@ -366,6 +375,7 @@ impl LocyProgramExec {
             strata,
             commands,
             derived_scan_registry,
+            plugin_registry,
             graph_ctx,
             session_ctx,
             storage,
@@ -520,6 +530,7 @@ impl ExecutionPlan for LocyProgramExec {
 
         let strata = self.strata.clone();
         let registry = Arc::clone(&self.derived_scan_registry);
+        let plugin_registry = Arc::clone(&self.plugin_registry);
         let graph_ctx = Arc::clone(&self.graph_ctx);
         let session_ctx = Arc::clone(&self.session_ctx);
         let storage = Arc::clone(&self.storage);
@@ -554,6 +565,7 @@ impl ExecutionPlan for LocyProgramExec {
                 strata,
                 commands,
                 registry,
+                plugin_registry,
                 graph_ctx,
                 session_ctx,
                 storage,
@@ -837,6 +849,7 @@ async fn run_program(
     strata: Vec<LocyStratum>,
     commands: Vec<LocyCommand>,
     registry: Arc<DerivedScanRegistry>,
+    plugin_registry: Arc<PluginRegistry>,
     graph_ctx: Arc<GraphExecutionContext>,
     session_ctx: Arc<RwLock<datafusion::prelude::SessionContext>>,
     storage: Arc<StorageManager>,
@@ -915,8 +928,12 @@ async fn run_program(
 
         if stratum.is_recursive {
             // Convert LocyRulePlan → FixpointRulePlan and run fixpoint
-            let fixpoint_rules =
-                convert_to_fixpoint_plans(&stratum.rules, &registry, deterministic_best_by)?;
+            let fixpoint_rules = convert_to_fixpoint_plans(
+                &stratum.rules,
+                &registry,
+                &plugin_registry,
+                deterministic_best_by,
+            )?;
             let fixpoint_schema = build_fixpoint_output_schema(&stratum.rules);
 
             let exec = FixpointExec::new_with_semiring_classifiers_and_cache(
@@ -994,8 +1011,12 @@ async fn run_program(
             }
         } else {
             // Non-recursive: single-pass evaluation
-            let fixpoint_rules =
-                convert_to_fixpoint_plans(&stratum.rules, &registry, deterministic_best_by)?;
+            let fixpoint_rules = convert_to_fixpoint_plans(
+                &stratum.rules,
+                &registry,
+                &plugin_registry,
+                deterministic_best_by,
+            )?;
             let task_ctx = session_ctx.read().task_ctx();
 
             for (rule, fp_rule) in stratum.rules.iter().zip(fixpoint_rules.iter()) {
@@ -1376,6 +1397,7 @@ fn write_facts_to_registry(registry: &DerivedScanRegistry, rule_name: &str, fact
 fn convert_to_fixpoint_plans(
     rules: &[LocyRulePlan],
     registry: &DerivedScanRegistry,
+    plugin_registry: &PluginRegistry,
     deterministic_best_by: bool,
 ) -> DFResult<Vec<FixpointRulePlan>> {
     rules
@@ -1405,7 +1427,8 @@ fn convert_to_fixpoint_plans(
                 })
                 .collect::<DFResult<Vec<_>>>()?;
 
-            let fold_bindings = convert_fold_bindings(&rule.fold_bindings, &rule.yield_schema)?;
+            let fold_bindings =
+                convert_fold_bindings(&rule.fold_bindings, &rule.yield_schema, plugin_registry)?;
             let best_by_criteria =
                 convert_best_by_criteria(&rule.best_by_criteria, &rule.yield_schema)?;
 
@@ -1546,22 +1569,33 @@ fn convert_is_refs(
 ///
 /// The input column is looked up by the fold binding's output name (e.g., "total")
 /// in the yield schema, since the LocyProject aliases the aggregate input expression
-/// to the fold output name.
+/// to the fold output name. The aggregate name is resolved against
+/// `plugin_registry` to obtain the [`uni_plugin::traits::locy::LocyAggregate`]
+/// trait object at plan time.
 fn convert_fold_bindings(
     fold_bindings: &[(String, String, Expr)],
     yield_schema: &[LocyYieldColumn],
+    plugin_registry: &PluginRegistry,
 ) -> DFResult<Vec<FoldBinding>> {
     fold_bindings
         .iter()
         .map(|(name, yield_alias, expr)| {
-            let (kind, _input_col_name) = parse_fold_aggregate(expr)?;
+            let (agg_name, _input_col_name) = parse_fold_aggregate(expr)?;
+            let entry =
+                resolve_locy_aggregate(plugin_registry, agg_name.as_str()).ok_or_else(|| {
+                    datafusion::error::DataFusionError::Plan(format!(
+                        "Unknown Locy aggregate '{agg_name}' — not registered in plugin registry"
+                    ))
+                })?;
+            let aggregate = Arc::clone(&entry.aggregate);
 
             // CountAll has no input column — LocyProject skips the output column
             // entirely, so there is nothing to look up.
-            if kind == FoldAggKind::CountAll {
+            if agg_name.as_str() == "COUNTALL" {
                 return Ok(FoldBinding {
                     output_name: yield_alias.clone(),
-                    kind,
+                    name: agg_name,
+                    aggregate,
                     input_col_index: 0, // unused for CountAll
                     input_col_name: None,
                 });
@@ -1577,7 +1611,8 @@ fn convert_fold_bindings(
                 .unwrap_or(0);
             Ok(FoldBinding {
                 output_name: yield_alias.clone(),
-                kind,
+                name: agg_name,
+                aggregate,
                 input_col_index,
                 input_col_name: Some(name.clone()),
             })
@@ -1585,8 +1620,12 @@ fn convert_fold_bindings(
         .collect()
 }
 
-/// Parse a fold aggregate expression into (kind, input_column_name).
-fn parse_fold_aggregate(expr: &Expr) -> DFResult<(FoldAggKind, String)> {
+/// Parse a fold aggregate expression into (canonical_name, input_column_name).
+///
+/// Normalizes grammar aliases to canonical names: `MSUM`→`SUM`, `MMAX`→`MAX`,
+/// `MMIN`→`MIN`, `MCOUNT`→`COUNT`. The zero-arg `COUNT()`/`MCOUNT()` form
+/// returns the `COUNTALL` sentinel. `MNOR`/`MPROD` are already canonical.
+fn parse_fold_aggregate(expr: &Expr) -> DFResult<(smol_str::SmolStr, String)> {
     match expr {
         Expr::FunctionCall { name, args, .. } => {
             let upper = name.to_uppercase();
@@ -1594,18 +1633,18 @@ fn parse_fold_aggregate(expr: &Expr) -> DFResult<(FoldAggKind, String)> {
 
             // COUNT/MCOUNT with zero args → CountAll (like SQL COUNT(*))
             if is_count && args.is_empty() {
-                return Ok((FoldAggKind::CountAll, String::new()));
+                return Ok((smol_str::SmolStr::new_static("COUNTALL"), String::new()));
             }
 
-            let kind = match upper.as_str() {
-                "SUM" | "MSUM" => FoldAggKind::Sum,
-                "MAX" | "MMAX" => FoldAggKind::Max,
-                "MIN" | "MMIN" => FoldAggKind::Min,
-                "COUNT" | "MCOUNT" => FoldAggKind::Count,
-                "AVG" => FoldAggKind::Avg,
-                "COLLECT" => FoldAggKind::Collect,
-                "MNOR" => FoldAggKind::Nor,
-                "MPROD" => FoldAggKind::Prod,
+            let canonical = match upper.as_str() {
+                "SUM" | "MSUM" => smol_str::SmolStr::new_static("SUM"),
+                "MAX" | "MMAX" => smol_str::SmolStr::new_static("MAX"),
+                "MIN" | "MMIN" => smol_str::SmolStr::new_static("MIN"),
+                "COUNT" | "MCOUNT" => smol_str::SmolStr::new_static("COUNT"),
+                "AVG" => smol_str::SmolStr::new_static("AVG"),
+                "COLLECT" => smol_str::SmolStr::new_static("COLLECT"),
+                "MNOR" => smol_str::SmolStr::new_static("MNOR"),
+                "MPROD" => smol_str::SmolStr::new_static("MPROD"),
                 _ => {
                     return Err(datafusion::error::DataFusionError::Plan(format!(
                         "Unknown FOLD aggregate function: {}",
@@ -1623,7 +1662,7 @@ fn parse_fold_aggregate(expr: &Expr) -> DFResult<(FoldAggKind, String)> {
                     ));
                 }
             };
-            Ok((kind, col_name))
+            Ok((canonical, col_name))
         }
         _ => Err(datafusion::error::DataFusionError::Plan(
             "FOLD binding must be a function call (e.g., SUM(x))".to_string(),
@@ -1917,7 +1956,7 @@ mod tests {
             window_spec: None,
         };
         let (kind, col) = parse_fold_aggregate(&expr).unwrap();
-        assert!(matches!(kind, FoldAggKind::Sum));
+        assert_eq!(kind.as_str(), "SUM");
         assert_eq!(col, "cost");
     }
 
@@ -1930,7 +1969,7 @@ mod tests {
             window_spec: None,
         };
         let (kind, col) = parse_fold_aggregate(&expr).unwrap();
-        assert!(matches!(kind, FoldAggKind::Max));
+        assert_eq!(kind.as_str(), "MAX");
         assert_eq!(col, "score");
     }
 

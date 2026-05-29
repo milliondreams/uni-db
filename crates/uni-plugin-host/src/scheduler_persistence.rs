@@ -1,0 +1,431 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Dragonscale Team
+
+//! Durable [`SchedulerPersistence`] backend for `uni-db`.
+//!
+//! Mirrors the
+//! [`crate::persistence::SystemLabelPersistence`] pattern but scoped
+//! to scheduler job state. Writes are dual-routed:
+//!
+//! 1. **JSON sidecar** at `<data_path>/_system/background_jobs.json`
+//!    — atomic write-then-rename, source-of-truth at startup
+//!    (`load_all`). The sidecar lives next to
+//!    `declared_plugins.json` under the same `_system/` reservation.
+//! 2. **`_BackgroundJob` graph label** (best-effort) — issued via the
+//!    shared [`crate::persistence::LazyCypherSink`] once
+//!    `Uni::build` finishes wiring it. Gives operators
+//!    `MATCH (j:_BackgroundJob) RETURN j` visibility without needing
+//!    a separate introspection procedure.
+
+// Rust guideline compliant
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::SystemTime;
+
+use serde::{Deserialize, Serialize};
+use uni_plugin::qname::QName;
+use uni_plugin::scheduler::{
+    SchedulerJobRecord, SchedulerJobStatus, SchedulerPersistence, SchedulerPersistenceError,
+};
+use uni_plugin::traits::background::{CancellationToken, Schedule};
+
+use crate::persistence::LazyCypherSink;
+
+/// JSON-encoded shape of a scheduler job row in the sidecar / system
+/// label. Stable across restarts so the on-disk + on-graph forms are
+/// the same.
+///
+/// `schedule` and `next_fire_at` are `#[serde(default)]` so sidecars
+/// written by pre-M11-closure builds (which only carried
+/// `qname`/`status`/`consecutive_failures`) keep deserializing. The
+/// default for `schedule` is [`Schedule::Manual`], matching prior
+/// behavior.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PersistedJob {
+    qname: String,
+    status: String,
+    consecutive_failures: u32,
+    #[serde(default = "default_schedule")]
+    schedule: Schedule,
+    #[serde(default)]
+    next_fire_at: Option<SystemTime>,
+}
+
+fn default_schedule() -> Schedule {
+    Schedule::Manual
+}
+
+/// Durable [`SchedulerPersistence`] backed by a JSON sidecar.
+///
+/// The Cypher mirror is best-effort; failures are logged at debug.
+#[derive(Debug)]
+pub struct SystemLabelSchedulerPersistence {
+    sidecar_path: PathBuf,
+    write_guard: parking_lot::Mutex<()>,
+    cypher_sink: Arc<LazyCypherSink>,
+}
+
+impl SystemLabelSchedulerPersistence {
+    /// Construct rooted at `data_path/_system/background_jobs.json`.
+    #[must_use]
+    pub fn new(data_path: impl Into<PathBuf>) -> Self {
+        let mut sidecar_path = data_path.into();
+        sidecar_path.push("_system");
+        sidecar_path.push("background_jobs.json");
+        Self {
+            sidecar_path,
+            write_guard: parking_lot::Mutex::new(()),
+            cypher_sink: Arc::new(LazyCypherSink::new()),
+        }
+    }
+
+    /// Borrow the lazy Cypher sink so the host can wire it after
+    /// `Uni::build` completes.
+    #[must_use]
+    pub fn cypher_sink(&self) -> &Arc<LazyCypherSink> {
+        &self.cypher_sink
+    }
+
+    fn read_all(&self) -> Result<Vec<PersistedJob>, SchedulerPersistenceError> {
+        if !self.sidecar_path.exists() {
+            return Ok(Vec::new());
+        }
+        let bytes = std::fs::read(&self.sidecar_path)
+            .map_err(|e| SchedulerPersistenceError::Backend(format!("read: {e}")))?;
+        if bytes.is_empty() {
+            return Ok(Vec::new());
+        }
+        serde_json::from_slice(&bytes)
+            .map_err(|e| SchedulerPersistenceError::Backend(format!("parse: {e}")))
+    }
+
+    fn write_all(&self, rows: &[PersistedJob]) -> Result<(), SchedulerPersistenceError> {
+        if let Some(parent) = self.sidecar_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| SchedulerPersistenceError::Backend(format!("mkdir: {e}")))?;
+        }
+        let json = serde_json::to_vec_pretty(rows)
+            .map_err(|e| SchedulerPersistenceError::Backend(format!("encode: {e}")))?;
+        let tmp = self.sidecar_path.with_extension("tmp");
+        std::fs::write(&tmp, &json)
+            .map_err(|e| SchedulerPersistenceError::Backend(format!("tmp write: {e}")))?;
+        std::fs::rename(&tmp, &self.sidecar_path)
+            .map_err(|e| SchedulerPersistenceError::Backend(format!("rename: {e}")))?;
+        Ok(())
+    }
+
+    fn upsert(
+        &self,
+        id: &QName,
+        status: SchedulerJobStatus,
+    ) -> Result<(), SchedulerPersistenceError> {
+        let _guard = self.write_guard.lock();
+        let mut rows = self.read_all()?;
+        let qname_str = id.to_string();
+        let status_str = format!("{status:?}");
+        match rows.iter_mut().find(|r| r.qname == qname_str) {
+            Some(existing) => existing.status = status_str.clone(),
+            None => rows.push(PersistedJob {
+                qname: qname_str.clone(),
+                status: status_str.clone(),
+                consecutive_failures: 0,
+                schedule: Schedule::Manual,
+                next_fire_at: None,
+            }),
+        }
+        self.write_all(&rows)?;
+        // Best-effort Cypher mirror.
+        let cypher = format!(
+            "MERGE (j:_BackgroundJob {{qname: '{q}'}}) SET j.status = '{s}'",
+            q = qname_str.replace('\'', "''"),
+            s = status_str.replace('\'', "''"),
+        );
+        if let Err(e) = self.cypher_sink.try_write_cypher(&cypher) {
+            tracing::debug!(
+                qname = %qname_str,
+                error = %e,
+                "SystemLabelSchedulerPersistence: cypher mirror skipped",
+            );
+        }
+        Ok(())
+    }
+}
+
+impl SchedulerPersistence for SystemLabelSchedulerPersistence {
+    fn record_scheduled(
+        &self,
+        id: &QName,
+        schedule: &Schedule,
+    ) -> Result<(), SchedulerPersistenceError> {
+        let _guard = self.write_guard.lock();
+        let mut rows = self.read_all()?;
+        let qname_str = id.to_string();
+        let next_fire_at = schedule.next_after(std::time::SystemTime::now());
+        match rows.iter_mut().find(|r| r.qname == qname_str) {
+            Some(existing) => {
+                existing.schedule = schedule.clone();
+                existing.next_fire_at = next_fire_at;
+            }
+            None => rows.push(PersistedJob {
+                qname: qname_str.clone(),
+                status: format!("{:?}", SchedulerJobStatus::Pending),
+                consecutive_failures: 0,
+                schedule: schedule.clone(),
+                next_fire_at,
+            }),
+        }
+        self.write_all(&rows)?;
+        Ok(())
+    }
+
+    fn record_started(
+        &self,
+        id: &QName,
+        _started_at: std::time::SystemTime,
+    ) -> Result<(), SchedulerPersistenceError> {
+        self.upsert(id, SchedulerJobStatus::Running)
+    }
+
+    fn record_finished(
+        &self,
+        id: &QName,
+        _finished_at: std::time::SystemTime,
+        success: bool,
+    ) -> Result<(), SchedulerPersistenceError> {
+        let status = if success {
+            SchedulerJobStatus::Idle
+        } else {
+            SchedulerJobStatus::FailedRetrying
+        };
+        self.upsert(id, status)
+    }
+
+    fn cancel(&self, id: &QName) -> Result<(), SchedulerPersistenceError> {
+        let _guard = self.write_guard.lock();
+        let mut rows = self.read_all()?;
+        let qname_str = id.to_string();
+        rows.retain(|r| r.qname != qname_str);
+        self.write_all(&rows)?;
+        let cypher = format!(
+            "MATCH (j:_BackgroundJob {{qname: '{q}'}}) DETACH DELETE j",
+            q = qname_str.replace('\'', "''"),
+        );
+        if let Err(e) = self.cypher_sink.try_write_cypher(&cypher) {
+            tracing::debug!(
+                qname = %qname_str,
+                error = %e,
+                "SystemLabelSchedulerPersistence: cypher cancel mirror skipped",
+            );
+        }
+        Ok(())
+    }
+
+    fn load_all(&self) -> Result<Vec<SchedulerJobRecord>, SchedulerPersistenceError> {
+        let rows = self.read_all()?;
+        let records: Vec<SchedulerJobRecord> = rows
+            .into_iter()
+            .filter_map(|r| {
+                let parts: Vec<&str> = r.qname.rsplitn(2, '.').collect();
+                let qname = match parts.as_slice() {
+                    [local, ns] => QName::new(*ns, *local),
+                    _ => return None,
+                };
+                Some(SchedulerJobRecord {
+                    id: qname,
+                    status: SchedulerJobStatus::Pending,
+                    next_fire_at: r.next_fire_at,
+                    last_started_at: None,
+                    last_finished_at: None,
+                    consecutive_failures: r.consecutive_failures,
+                    schedule: r.schedule,
+                    cancel: CancellationToken::new(),
+                })
+            })
+            .collect();
+        Ok(records)
+    }
+}
+
+/// Choose the appropriate [`SchedulerPersistence`] for a `Uni`
+/// instance. Returns [`SystemLabelSchedulerPersistence`] for local-disk
+/// paths and `None` (caller falls back to `MemoryPersistence`) for
+/// remote / in-memory URIs.
+#[must_use]
+pub fn scheduler_persistence_for_data_path(
+    data_path: Option<&std::path::Path>,
+) -> (Arc<dyn SchedulerPersistence>, Option<Arc<LazyCypherSink>>) {
+    match data_path {
+        Some(path) => {
+            let p = Arc::new(SystemLabelSchedulerPersistence::new(path.to_owned()));
+            let sink = Arc::clone(p.cypher_sink());
+            (p as Arc<dyn SchedulerPersistence>, Some(sink))
+        }
+        None => (Arc::new(uni_plugin::scheduler::MemoryPersistence), None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn record_started_and_load_all_round_trip() {
+        let tmp = TempDir::new().unwrap();
+        let p = SystemLabelSchedulerPersistence::new(tmp.path().to_path_buf());
+        let id = QName::new("uni", "system.ttl_sweep");
+        p.record_started(&id, std::time::SystemTime::now())
+            .expect("record_started");
+        let loaded = p.load_all().expect("load_all");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id.to_string(), "uni.system.ttl_sweep");
+    }
+
+    #[test]
+    fn cancel_removes_the_record() {
+        let tmp = TempDir::new().unwrap();
+        let p = SystemLabelSchedulerPersistence::new(tmp.path().to_path_buf());
+        let id = QName::new("uni", "system.ttl_sweep");
+        p.record_started(&id, std::time::SystemTime::now())
+            .expect("record_started");
+        p.cancel(&id).expect("cancel");
+        assert!(p.load_all().expect("load_all").is_empty());
+    }
+
+    #[test]
+    fn close_reopen_survives() {
+        let tmp = TempDir::new().unwrap();
+        let id = QName::new("uni", "system.ttl_sweep");
+        {
+            let p = SystemLabelSchedulerPersistence::new(tmp.path().to_path_buf());
+            p.record_started(&id, std::time::SystemTime::now())
+                .expect("record_started");
+        }
+        let p = SystemLabelSchedulerPersistence::new(tmp.path().to_path_buf());
+        let loaded = p.load_all().expect("load_all");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id.to_string(), "uni.system.ttl_sweep");
+    }
+
+    #[test]
+    fn scheduler_persistence_for_in_memory_returns_no_sink() {
+        let (p, sink) = scheduler_persistence_for_data_path(None);
+        assert!(sink.is_none());
+        assert!(p.load_all().expect("load_all").is_empty());
+    }
+
+    #[test]
+    fn scheduler_persistence_for_local_path_returns_sink() {
+        let tmp = TempDir::new().unwrap();
+        let (_p, sink) = scheduler_persistence_for_data_path(Some(tmp.path()));
+        assert!(sink.is_some());
+    }
+
+    #[test]
+    fn periodic_schedule_survives_restart() {
+        let tmp = TempDir::new().unwrap();
+        let id = QName::new("myorg", "nightly");
+        let schedule = Schedule::Periodic(std::time::Duration::from_secs(60));
+        {
+            let p = SystemLabelSchedulerPersistence::new(tmp.path().to_path_buf());
+            p.record_scheduled(&id, &schedule)
+                .expect("record_scheduled");
+        }
+        let p = SystemLabelSchedulerPersistence::new(tmp.path().to_path_buf());
+        let loaded = p.load_all().expect("load_all");
+        assert_eq!(loaded.len(), 1);
+        match &loaded[0].schedule {
+            Schedule::Periodic(d) => assert_eq!(*d, std::time::Duration::from_secs(60)),
+            other => panic!("expected Periodic, got {other:?}"),
+        }
+        assert!(
+            loaded[0].next_fire_at.is_some(),
+            "next_fire_at should round-trip for Periodic"
+        );
+    }
+
+    #[test]
+    fn cron_schedule_survives_restart() {
+        let tmp = TempDir::new().unwrap();
+        let id = QName::new("myorg", "hourly");
+        let schedule = Schedule::Cron(smol_str::SmolStr::new("0 0 * * * *"));
+        {
+            let p = SystemLabelSchedulerPersistence::new(tmp.path().to_path_buf());
+            p.record_scheduled(&id, &schedule)
+                .expect("record_scheduled");
+        }
+        let p = SystemLabelSchedulerPersistence::new(tmp.path().to_path_buf());
+        let loaded = p.load_all().expect("load_all");
+        assert_eq!(loaded.len(), 1);
+        match &loaded[0].schedule {
+            Schedule::Cron(expr) => assert_eq!(expr.as_str(), "0 0 * * * *"),
+            other => panic!("expected Cron, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn once_schedule_survives_restart() {
+        let tmp = TempDir::new().unwrap();
+        let id = QName::new("myorg", "oneoff");
+        let fire_at = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        let schedule = Schedule::Once(fire_at);
+        {
+            let p = SystemLabelSchedulerPersistence::new(tmp.path().to_path_buf());
+            p.record_scheduled(&id, &schedule)
+                .expect("record_scheduled");
+        }
+        let p = SystemLabelSchedulerPersistence::new(tmp.path().to_path_buf());
+        let loaded = p.load_all().expect("load_all");
+        assert_eq!(loaded.len(), 1);
+        match &loaded[0].schedule {
+            Schedule::Once(at) => assert_eq!(*at, fire_at),
+            other => panic!("expected Once, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_sidecar_without_schedule_falls_back_to_manual() {
+        // Simulate a sidecar written by a pre-closure build that only
+        // carried `qname` / `status` / `consecutive_failures`. The
+        // `#[serde(default)]` annotations on the new fields should
+        // make this deserialize cleanly with `Schedule::Manual`.
+        let tmp = TempDir::new().unwrap();
+        let sidecar_dir = tmp.path().join("_system");
+        std::fs::create_dir_all(&sidecar_dir).unwrap();
+        std::fs::write(
+            sidecar_dir.join("background_jobs.json"),
+            r#"[{"qname":"uni.system.ttl_sweep","status":"Pending","consecutive_failures":0}]"#,
+        )
+        .unwrap();
+        let p = SystemLabelSchedulerPersistence::new(tmp.path().to_path_buf());
+        let loaded = p.load_all().expect("legacy sidecar loads");
+        assert_eq!(loaded.len(), 1);
+        assert!(matches!(loaded[0].schedule, Schedule::Manual));
+        assert!(loaded[0].next_fire_at.is_none());
+    }
+
+    #[test]
+    fn record_scheduled_updates_existing_row() {
+        let tmp = TempDir::new().unwrap();
+        let p = SystemLabelSchedulerPersistence::new(tmp.path().to_path_buf());
+        let id = QName::new("myorg", "nightly");
+        p.record_scheduled(&id, &Schedule::Periodic(std::time::Duration::from_secs(60)))
+            .unwrap();
+        // Re-register with a different schedule — should overwrite,
+        // not duplicate.
+        p.record_scheduled(
+            &id,
+            &Schedule::Periodic(std::time::Duration::from_secs(120)),
+        )
+        .unwrap();
+        let loaded = p.load_all().expect("load_all");
+        assert_eq!(loaded.len(), 1);
+        match &loaded[0].schedule {
+            Schedule::Periodic(d) => assert_eq!(*d, std::time::Duration::from_secs(120)),
+            other => panic!("expected Periodic(120s), got {other:?}"),
+        }
+    }
+}

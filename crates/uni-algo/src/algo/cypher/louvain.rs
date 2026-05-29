@@ -27,12 +27,12 @@ impl GraphAlgoAdapter for LouvainAdapter {
         vec![("nodeId", ValueType::Int), ("communityId", ValueType::Int)]
     }
 
-    fn to_config(args: Vec<Value>) -> LouvainConfig {
-        LouvainConfig {
+    fn to_config(args: Vec<Value>) -> Result<LouvainConfig> {
+        Ok(LouvainConfig {
             resolution: args[0].as_f64().unwrap(),
             max_iterations: args[1].as_u64().unwrap() as usize,
             min_modularity_gain: args[2].as_f64().unwrap(),
-        }
+        })
     }
 
     fn map_result(result: <Self::Algo as Algorithm>::Result) -> Result<Vec<AlgoResultRow>> {

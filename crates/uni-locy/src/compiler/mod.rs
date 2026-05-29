@@ -14,12 +14,14 @@ use uni_cypher::locy_ast::{LocyProgram, LocyStatement, RuleDefinition};
 use crate::config::LocyConfig;
 use crate::types::{CompiledAssume, CompiledCommand, CompiledProgram, Stratum};
 use errors::LocyCompileError;
+pub use typecheck::{MonotonicityOracle, default_monotonicity_oracle};
 
 /// Validate and stratify a parsed Locy program into a `CompiledProgram`.
 ///
 /// Pipeline: group_rules → dependency graph → stratify → wardedness → typecheck → assemble.
-/// Defaults to a config with `neural_predicates_preview = false`; use
-/// [`compile_with_config`] to opt into the Phase B preview surface.
+/// Defaults to a config with `neural_predicates_preview = false` (use
+/// [`compile_with_config`] to opt into the Phase B preview surface) and
+/// [`default_monotonicity_oracle`] for the recursive-stratum FOLD check.
 pub fn compile(program: &LocyProgram) -> Result<CompiledProgram, LocyCompileError> {
     compile_with_modules(program, &HashMap::new())
 }
@@ -34,7 +36,13 @@ pub fn compile_with_external_rules(
     program: &LocyProgram,
     external_rules: &[String],
 ) -> Result<CompiledProgram, LocyCompileError> {
-    compile_with_context(program, &HashMap::new(), external_rules, false)
+    compile_with_context(
+        program,
+        &HashMap::new(),
+        external_rules,
+        false,
+        &default_monotonicity_oracle,
+    )
 }
 
 /// Compile with pre-registered external rule names AND a [`LocyConfig`].
@@ -52,6 +60,7 @@ pub fn compile_with_external_rules_and_config(
         &HashMap::new(),
         external_rules,
         config.neural_predicates_preview,
+        &default_monotonicity_oracle,
     )
 }
 
@@ -64,7 +73,13 @@ pub fn compile_with_modules(
     program: &LocyProgram,
     available_modules: &HashMap<String, Vec<String>>,
 ) -> Result<CompiledProgram, LocyCompileError> {
-    compile_with_context(program, available_modules, &[], false)
+    compile_with_context(
+        program,
+        available_modules,
+        &[],
+        false,
+        &default_monotonicity_oracle,
+    )
 }
 
 /// Phase B entry: compile with a [`LocyConfig`] so neural-predicate preview
@@ -79,6 +94,28 @@ pub fn compile_with_config(
         &HashMap::new(),
         &[],
         config.neural_predicates_preview,
+        &default_monotonicity_oracle,
+    )
+}
+
+/// Compile a Locy program with a host-supplied monotonicity oracle.
+///
+/// Hosts that hold a `uni_plugin::PluginRegistry` should pass a closure
+/// that resolves aggregate names through the registry and reads
+/// `Semilattice.monotone_join`, so user-registered aggregates participate
+/// in the recursive-stratum FOLD check.
+pub fn compile_with_oracle(
+    program: &LocyProgram,
+    available_modules: &HashMap<String, Vec<String>>,
+    external_rules: &[String],
+    is_monotonic: MonotonicityOracle<'_>,
+) -> Result<CompiledProgram, LocyCompileError> {
+    compile_with_context(
+        program,
+        available_modules,
+        external_rules,
+        false,
+        is_monotonic,
     )
 }
 
@@ -88,6 +125,7 @@ fn compile_with_context(
     available_modules: &HashMap<String, Vec<String>>,
     external_rules: &[String],
     neural_predicates_preview: bool,
+    is_monotonic: MonotonicityOracle<'_>,
 ) -> Result<CompiledProgram, LocyCompileError> {
     let (model_catalog, mut model_warnings) =
         models::compile_models(program, neural_predicates_preview)?;
@@ -127,7 +165,8 @@ fn compile_with_context(
     )?;
     let strat = stratify::stratify(&dep_graph)?;
     warded::check_wardedness(&rule_groups)?;
-    let (compiled_rules, mut warnings) = typecheck::check(&rule_groups, &strat, &model_catalog)?;
+    let (compiled_rules, mut warnings) =
+        typecheck::check(&rule_groups, &strat, &model_catalog, is_monotonic)?;
     // Carry model-compilation warnings (e.g. G1-lite UncalibratedLLMLogprobs)
     // into the final program. Append after typecheck so source order is
     // preserved for `models -> rules` warning streams.

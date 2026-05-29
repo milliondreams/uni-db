@@ -76,8 +76,7 @@ async fn test_pagerank_procedure() -> anyhow::Result<()> {
     let planner = QueryPlanner::new(schema_manager.schema());
 
     // 3. Run PageRank
-    let cypher =
-        "CALL uni.algo.pageRank(['Person'], ['KNOWS']) YIELD nodeId, score RETURN nodeId, score";
+    let cypher = "CALL uni.algo.pageRank({nodeLabels: ['Person'], edgeTypes: ['KNOWS']}, {}) YIELD nodeId, score RETURN nodeId, score";
     let query_ast = uni_cypher::parse(cypher)?;
     let plan = planner.plan(query_ast)?;
 
@@ -148,7 +147,7 @@ async fn test_wcc_procedure() -> anyhow::Result<()> {
     let planner = QueryPlanner::new(schema_manager.schema());
 
     // 3. Run WCC
-    let cypher = "CALL uni.algo.wcc(['Node'], ['LINK']) YIELD nodeId, componentId RETURN nodeId, componentId";
+    let cypher = "CALL uni.algo.wcc({nodeLabels: ['Node'], edgeTypes: ['LINK']}, {}) YIELD nodeId, componentId RETURN nodeId, componentId";
     let query_ast = uni_cypher::parse(cypher)?;
     let plan = planner.plan(query_ast)?;
 
@@ -381,7 +380,7 @@ async fn test_louvain_procedure() -> anyhow::Result<()> {
     let planner = QueryPlanner::new(schema_manager.schema());
 
     // 3. Run Louvain
-    let cypher = "CALL uni.algo.louvain(['Node'], ['LINK']) YIELD nodeId, communityId RETURN nodeId, communityId";
+    let cypher = "CALL uni.algo.louvain({nodeLabels: ['Node'], edgeTypes: ['LINK']}, {}) YIELD nodeId, communityId RETURN nodeId, communityId";
     let query_ast = uni_cypher::parse(cypher)?;
     let plan = planner.plan(query_ast)?;
 
@@ -475,7 +474,7 @@ async fn test_scc_procedure() -> anyhow::Result<()> {
     let planner = QueryPlanner::new(schema_manager.schema());
 
     // 3. Run SCC
-    let cypher = "CALL uni.algo.scc(['Node'], ['LINK']) YIELD nodeId, componentId RETURN nodeId, componentId";
+    let cypher = "CALL uni.algo.scc({nodeLabels: ['Node'], edgeTypes: ['LINK']}, {}) YIELD nodeId, componentId RETURN nodeId, componentId";
     let query_ast = uni_cypher::parse(cypher)?;
     let plan = planner.plan(query_ast)?;
 
@@ -642,7 +641,7 @@ async fn test_label_propagation_procedure() -> anyhow::Result<()> {
     let planner = QueryPlanner::new(schema_manager.schema());
 
     // 3. Run Label Propagation
-    let cypher = "CALL uni.algo.labelPropagation(['Node'], ['LINK']) YIELD nodeId, communityId RETURN nodeId, communityId";
+    let cypher = "CALL uni.algo.labelPropagation({nodeLabels: ['Node'], edgeTypes: ['LINK']}, {}) YIELD nodeId, communityId RETURN nodeId, communityId";
     let query_ast = uni_cypher::parse(cypher)?;
     let plan = planner.plan(query_ast)?;
 
@@ -720,8 +719,7 @@ async fn test_betweenness_procedure() -> anyhow::Result<()> {
     let prop_manager = PropertyManager::new(storage.clone(), schema_manager.clone(), 100);
     let planner = QueryPlanner::new(schema_manager.schema());
 
-    let cypher =
-        "CALL uni.algo.betweenness(['Node'], ['LINK']) YIELD nodeId, score RETURN nodeId, score";
+    let cypher = "CALL uni.algo.betweenness({nodeLabels: ['Node'], edgeTypes: ['LINK']}, {}) YIELD nodeId, score RETURN nodeId, score";
     let query_ast = uni_cypher::parse(cypher)?;
     let plan = planner.plan(query_ast)?;
 
@@ -794,7 +792,7 @@ async fn test_node_similarity_procedure() -> anyhow::Result<()> {
     let prop_manager = PropertyManager::new(storage.clone(), schema_manager.clone(), 100);
     let planner = QueryPlanner::new(schema_manager.schema());
 
-    let cypher = "CALL uni.algo.nodeSimilarity(['Node'], ['LINK']) YIELD node1, node2, similarity RETURN node1, node2, similarity";
+    let cypher = "CALL uni.algo.nodeSimilarity({nodeLabels: ['Node'], edgeTypes: ['LINK']}, {}) YIELD node1, node2, similarity RETURN node1, node2, similarity";
     let query_ast = uni_cypher::parse(cypher)?;
     let plan = planner.plan(query_ast)?;
 
@@ -865,8 +863,7 @@ async fn test_closeness_procedure() -> anyhow::Result<()> {
     let prop_manager = PropertyManager::new(storage.clone(), schema_manager.clone(), 100);
     let planner = QueryPlanner::new(schema_manager.schema());
 
-    let cypher =
-        "CALL uni.algo.closeness(['Node'], ['LINK']) YIELD nodeId, score RETURN nodeId, score";
+    let cypher = "CALL uni.algo.closeness({nodeLabels: ['Node'], edgeTypes: ['LINK']}, {}) YIELD nodeId, score RETURN nodeId, score";
     let query_ast = uni_cypher::parse(cypher)?;
     let plan = planner.plan(query_ast)?;
 
@@ -946,7 +943,7 @@ async fn test_triangle_count_procedure() -> anyhow::Result<()> {
     let prop_manager = PropertyManager::new(storage.clone(), schema_manager.clone(), 100);
     let planner = QueryPlanner::new(schema_manager.schema());
 
-    let cypher = "CALL uni.algo.triangleCount(['Node'], ['LINK']) YIELD nodeId, triangleCount RETURN nodeId, triangleCount";
+    let cypher = "CALL uni.algo.triangleCount({nodeLabels: ['Node'], edgeTypes: ['LINK']}, {}) YIELD nodeId, triangleCount RETURN nodeId, triangleCount";
     let query_ast = uni_cypher::parse(cypher)?;
     let plan = planner.plan(query_ast)?;
 
@@ -1021,7 +1018,7 @@ async fn test_kcore_procedure() -> anyhow::Result<()> {
     let prop_manager = PropertyManager::new(storage.clone(), schema_manager.clone(), 100);
     let planner = QueryPlanner::new(schema_manager.schema());
 
-    let cypher = "CALL uni.algo.kCore(['Node'], ['LINK']) YIELD nodeId, coreNumber RETURN nodeId, coreNumber";
+    let cypher = "CALL uni.algo.kCore({nodeLabels: ['Node'], edgeTypes: ['LINK']}, {}) YIELD nodeId, coreNumber RETURN nodeId, coreNumber";
     let query_ast = uni_cypher::parse(cypher)?;
     let plan = planner.plan(query_ast)?;
 
@@ -1094,7 +1091,7 @@ async fn test_random_walk_procedure() -> anyhow::Result<()> {
     let prop_manager = PropertyManager::new(storage.clone(), schema_manager.clone(), 100);
     let planner = QueryPlanner::new(schema_manager.schema());
 
-    let cypher = "CALL uni.algo.randomWalk(['Node'], ['LINK'], 2, 1) YIELD path RETURN path";
+    let cypher = "CALL uni.algo.randomWalk({nodeLabels: ['Node'], edgeTypes: ['LINK']}, {walkLength: 2, walksPerNode: 1}) YIELD path RETURN path";
     let query_ast = uni_cypher::parse(cypher)?;
     let plan = planner.plan(query_ast)?;
 
@@ -1163,7 +1160,7 @@ async fn test_apsp_procedure() -> anyhow::Result<()> {
     let prop_manager = PropertyManager::new(storage.clone(), schema_manager.clone(), 100);
     let planner = QueryPlanner::new(schema_manager.schema());
 
-    let cypher = "CALL uni.algo.allPairsShortestPath(['Node'], ['LINK']) YIELD sourceNodeId, targetNodeId, distance RETURN sourceNodeId, targetNodeId, distance";
+    let cypher = "CALL uni.algo.allPairsShortestPath({nodeLabels: ['Node'], edgeTypes: ['LINK']}, {}) YIELD sourceNodeId, targetNodeId, distance RETURN sourceNodeId, targetNodeId, distance";
     let query_ast = uni_cypher::parse(cypher)?;
     let plan = planner.plan(query_ast)?;
 

@@ -35,6 +35,33 @@ impl Vid {
     pub fn is_invalid(&self) -> bool {
         self.0 == u64::MAX
     }
+
+    /// Top bit reserved for ephemeral (transient, in-query) identities
+    /// allocated by `host.allocate_transient_id()` (M5g / proposal §4.13.1).
+    /// Storage write paths must reject any VID with this bit set.
+    pub const EPHEMERAL_BIT: u64 = 1u64 << 63;
+
+    /// Construct an ephemeral VID from a `transient_id` (bottom 63 bits).
+    /// Returns `Vid::INVALID` if `transient_id` overflows the 63-bit range.
+    pub fn ephemeral(transient_id: u64) -> Self {
+        if transient_id >= Self::EPHEMERAL_BIT {
+            return Self::INVALID;
+        }
+        Self(Self::EPHEMERAL_BIT | transient_id)
+    }
+
+    /// True if this VID's high bit is set, i.e. it was minted by
+    /// `host.allocate_transient_id()` and is *not* backed by storage.
+    /// `INVALID` (all bits set) also satisfies this; callers that care
+    /// about the distinction should check `is_invalid()` first.
+    pub fn is_ephemeral(&self) -> bool {
+        self.0 & Self::EPHEMERAL_BIT != 0 && !self.is_invalid()
+    }
+
+    /// Bottom 63 bits when `self` is ephemeral, else `None`.
+    pub fn transient_id(&self) -> Option<u64> {
+        self.is_ephemeral().then_some(self.0 & !Self::EPHEMERAL_BIT)
+    }
 }
 
 impl From<u64> for Vid {
@@ -108,6 +135,33 @@ impl Eid {
     /// Check if this EID is the invalid sentinel.
     pub fn is_invalid(&self) -> bool {
         self.0 == u64::MAX
+    }
+
+    /// Top bit reserved for ephemeral (transient, in-query) identities
+    /// allocated by `host.allocate_transient_id()` (M5g / proposal §4.13.1).
+    /// Storage write paths must reject any EID with this bit set.
+    pub const EPHEMERAL_BIT: u64 = 1u64 << 63;
+
+    /// Construct an ephemeral EID from a `transient_id` (bottom 63 bits).
+    /// Returns `Eid::INVALID` if `transient_id` overflows the 63-bit range.
+    pub fn ephemeral(transient_id: u64) -> Self {
+        if transient_id >= Self::EPHEMERAL_BIT {
+            return Self::INVALID;
+        }
+        Self(Self::EPHEMERAL_BIT | transient_id)
+    }
+
+    /// True if this EID's high bit is set, i.e. it was minted by
+    /// `host.allocate_transient_id()` and is *not* backed by storage.
+    /// `INVALID` (all bits set) also satisfies this; callers that care
+    /// about the distinction should check `is_invalid()` first.
+    pub fn is_ephemeral(&self) -> bool {
+        self.0 & Self::EPHEMERAL_BIT != 0 && !self.is_invalid()
+    }
+
+    /// Bottom 63 bits when `self` is ephemeral, else `None`.
+    pub fn transient_id(&self) -> Option<u64> {
+        self.is_ephemeral().then_some(self.0 & !Self::EPHEMERAL_BIT)
     }
 }
 

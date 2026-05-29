@@ -53,6 +53,48 @@ fn values_match(actual: &Value, expected: &Value) -> bool {
     }
 }
 
+/// Assert that a warning with the given `code` and `rule_name` is present.
+fn assert_warning_present(
+    world: &LocyWorld,
+    code: uni_locy::RuntimeWarningCode,
+    rule_name: &str,
+    code_label: &str,
+) {
+    let result = world.expect_locy_ok();
+    let found = result
+        .warnings()
+        .iter()
+        .any(|w| w.code == code && w.rule_name == rule_name);
+    assert!(
+        found,
+        "Expected {} warning for rule '{}', but warnings were: {:?}",
+        code_label,
+        rule_name,
+        result
+            .warnings()
+            .iter()
+            .map(|w| format!("{:?} ({})", w.code, w.rule_name))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// Assert that no warning with the given `code` is present.
+fn assert_warning_absent(world: &LocyWorld, code: uni_locy::RuntimeWarningCode, code_label: &str) {
+    let result = world.expect_locy_ok();
+    let found = result.warnings().iter().any(|w| w.code == code);
+    assert!(
+        !found,
+        "Expected no {} warning, but found: {:?}",
+        code_label,
+        result
+            .warnings()
+            .iter()
+            .filter(|w| w.code == code)
+            .map(|w| format!("rule={}", w.rule_name))
+            .collect::<Vec<_>>()
+    );
+}
+
 #[then("evaluation should succeed")]
 async fn evaluation_should_succeed(world: &mut LocyWorld) {
     let locy_result = world
@@ -459,25 +501,15 @@ async fn stats_mutations_executed(world: &mut LocyWorld, expected: usize) {
 
 #[then(regex = r#"^the command result (\d+) should be a Query with (\d+) rows$"#)]
 async fn command_result_query_rows(world: &mut LocyWorld, idx: usize, expected: usize) {
-    let locy_result = world.locy_result().expect("No evaluation result found");
-
-    let result = locy_result.as_ref().expect("Evaluation failed");
-    let cmd = result
-        .command_results
-        .get(idx)
-        .unwrap_or_else(|| panic!("No command result at index {}", idx));
-
-    match cmd {
-        CommandResult::Query(rows) => {
-            assert_eq!(
-                rows.len(),
-                expected,
-                "Expected Query command result {} to have {} rows, got {}",
-                idx,
-                expected,
-                rows.len()
-            );
-        }
+    match world.expect_command_result(idx) {
+        CommandResult::Query(rows) => assert_eq!(
+            rows.len(),
+            expected,
+            "Expected Query command result {} to have {} rows, got {}",
+            idx,
+            expected,
+            rows.len()
+        ),
         other => panic!(
             "Expected command result {} to be a Query, got {:?}",
             idx, other
@@ -492,15 +524,7 @@ async fn command_result_query_containing_row(
     field: String,
     value_str: String,
 ) {
-    let locy_result = world.locy_result().expect("No evaluation result found");
-
-    let result = locy_result.as_ref().expect("Evaluation failed");
-    let cmd = result
-        .command_results
-        .get(idx)
-        .unwrap_or_else(|| panic!("No command result at index {}", idx));
-
-    match cmd {
+    match world.expect_command_result(idx) {
         CommandResult::Query(rows) => {
             let expected = parse_gherkin_value(&value_str);
             let found = rows.iter().any(|row| {
@@ -526,25 +550,15 @@ async fn command_result_query_containing_row(
 
 #[then(regex = r#"^the command result (\d+) should be an Assume with (\d+) rows$"#)]
 async fn command_result_assume_rows(world: &mut LocyWorld, idx: usize, expected: usize) {
-    let locy_result = world.locy_result().expect("No evaluation result found");
-
-    let result = locy_result.as_ref().expect("Evaluation failed");
-    let cmd = result
-        .command_results
-        .get(idx)
-        .unwrap_or_else(|| panic!("No command result at index {}", idx));
-
-    match cmd {
-        CommandResult::Assume(rows) => {
-            assert_eq!(
-                rows.len(),
-                expected,
-                "Expected Assume command result {} to have {} rows, got {}",
-                idx,
-                expected,
-                rows.len()
-            );
-        }
+    match world.expect_command_result(idx) {
+        CommandResult::Assume(rows) => assert_eq!(
+            rows.len(),
+            expected,
+            "Expected Assume command result {} to have {} rows, got {}",
+            idx,
+            expected,
+            rows.len()
+        ),
         other => panic!(
             "Expected command result {} to be an Assume, got {:?}",
             idx, other
@@ -561,15 +575,7 @@ async fn command_result_assume_containing_row(
     field: String,
     value_str: String,
 ) {
-    let locy_result = world.locy_result().expect("No evaluation result found");
-
-    let result = locy_result.as_ref().expect("Evaluation failed");
-    let cmd = result
-        .command_results
-        .get(idx)
-        .unwrap_or_else(|| panic!("No command result at index {}", idx));
-
-    match cmd {
+    match world.expect_command_result(idx) {
         CommandResult::Assume(rows) => {
             let expected = parse_gherkin_value(&value_str);
             let found = rows.iter().any(|row| {
@@ -595,22 +601,12 @@ async fn command_result_assume_containing_row(
 
 #[then(regex = r#"^the command result (\d+) should be an Explain with rule ['"](.+)['"]$"#)]
 async fn command_result_explain_rule(world: &mut LocyWorld, idx: usize, rule_name: String) {
-    let locy_result = world.locy_result().expect("No evaluation result found");
-
-    let result = locy_result.as_ref().expect("Evaluation failed");
-    let cmd = result
-        .command_results
-        .get(idx)
-        .unwrap_or_else(|| panic!("No command result at index {}", idx));
-
-    match cmd {
-        CommandResult::Explain(node) => {
-            assert_eq!(
-                node.rule, rule_name,
-                "Expected Explain root rule '{}', got '{}'",
-                rule_name, node.rule
-            );
-        }
+    match world.expect_command_result(idx) {
+        CommandResult::Explain(node) => assert_eq!(
+            node.rule, rule_name,
+            "Expected Explain root rule '{}', got '{}'",
+            rule_name, node.rule
+        ),
         other => panic!(
             "Expected command result {} to be an Explain, got {:?}",
             idx, other
@@ -620,24 +616,14 @@ async fn command_result_explain_rule(world: &mut LocyWorld, idx: usize, rule_nam
 
 #[then(regex = r#"^the command result (\d+) should be an Explain with (\d+) children$"#)]
 async fn command_result_explain_children(world: &mut LocyWorld, idx: usize, expected: usize) {
-    let locy_result = world.locy_result().expect("No evaluation result found");
-
-    let result = locy_result.as_ref().expect("Evaluation failed");
-    let cmd = result
-        .command_results
-        .get(idx)
-        .unwrap_or_else(|| panic!("No command result at index {}", idx));
-
-    match cmd {
-        CommandResult::Explain(node) => {
-            assert_eq!(
-                node.children.len(),
-                expected,
-                "Expected Explain with {} children, got {}",
-                expected,
-                node.children.len()
-            );
-        }
+    match world.expect_command_result(idx) {
+        CommandResult::Explain(node) => assert_eq!(
+            node.children.len(),
+            expected,
+            "Expected Explain with {} children, got {}",
+            expected,
+            node.children.len()
+        ),
         other => panic!(
             "Expected command result {} to be an Explain, got {:?}",
             idx, other
@@ -649,23 +635,13 @@ async fn command_result_explain_children(world: &mut LocyWorld, idx: usize, expe
     regex = r#"^the command result (\d+) should be an Abduce with at least (\d+) modifications$"#
 )]
 async fn command_result_abduce_modifications(world: &mut LocyWorld, idx: usize, min: usize) {
-    let locy_result = world.locy_result().expect("No evaluation result found");
-
-    let result = locy_result.as_ref().expect("Evaluation failed");
-    let cmd = result
-        .command_results
-        .get(idx)
-        .unwrap_or_else(|| panic!("No command result at index {}", idx));
-
-    match cmd {
-        CommandResult::Abduce(abduce_result) => {
-            assert!(
-                abduce_result.modifications.len() >= min,
-                "Expected Abduce with at least {} modifications, got {}",
-                min,
-                abduce_result.modifications.len()
-            );
-        }
+    match world.expect_command_result(idx) {
+        CommandResult::Abduce(abduce_result) => assert!(
+            abduce_result.modifications.len() >= min,
+            "Expected Abduce with at least {} modifications, got {}",
+            min,
+            abduce_result.modifications.len()
+        ),
         other => panic!(
             "Expected command result {} to be an Abduce, got {:?}",
             idx, other
@@ -675,22 +651,12 @@ async fn command_result_abduce_modifications(world: &mut LocyWorld, idx: usize, 
 
 #[then(regex = r#"^the command result (\d+) should be a Derive affecting (\d+) elements$"#)]
 async fn command_result_derive_affecting(world: &mut LocyWorld, idx: usize, expected: usize) {
-    let locy_result = world.locy_result().expect("No evaluation result found");
-
-    let result = locy_result.as_ref().expect("Evaluation failed");
-    let cmd = result
-        .command_results
-        .get(idx)
-        .unwrap_or_else(|| panic!("No command result at index {}", idx));
-
-    match cmd {
-        CommandResult::Derive { affected } => {
-            assert_eq!(
-                *affected, expected,
-                "Expected Derive affecting {} elements, got {}",
-                expected, affected
-            );
-        }
+    match world.expect_command_result(idx) {
+        CommandResult::Derive { affected } => assert_eq!(
+            *affected, expected,
+            "Expected Derive affecting {} elements, got {}",
+            expected, affected
+        ),
         other => panic!(
             "Expected command result {} to be a Derive, got {:?}",
             idx, other
@@ -702,24 +668,14 @@ async fn command_result_derive_affecting(world: &mut LocyWorld, idx: usize, expe
 
 #[then(regex = r#"^the command result (\d+) should be a Cypher with at least (\d+) rows$"#)]
 async fn command_result_cypher_at_least_rows(world: &mut LocyWorld, idx: usize, min: usize) {
-    let locy_result = world.locy_result().expect("No evaluation result found");
-
-    let result = locy_result.as_ref().expect("Evaluation failed");
-    let cmd = result
-        .command_results
-        .get(idx)
-        .unwrap_or_else(|| panic!("No command result at index {}", idx));
-
-    match cmd {
-        CommandResult::Cypher(rows) => {
-            assert!(
-                rows.len() >= min,
-                "Expected Cypher command result {} to have at least {} rows, got {}",
-                idx,
-                min,
-                rows.len()
-            );
-        }
+    match world.expect_command_result(idx) {
+        CommandResult::Cypher(rows) => assert!(
+            rows.len() >= min,
+            "Expected Cypher command result {} to have at least {} rows, got {}",
+            idx,
+            min,
+            rows.len()
+        ),
         other => panic!(
             "Expected command result {} to be a Cypher, got {:?}",
             idx, other
@@ -734,15 +690,7 @@ async fn command_result_cypher_containing_row(
     field: String,
     value_str: String,
 ) {
-    let locy_result = world.locy_result().expect("No evaluation result found");
-
-    let result = locy_result.as_ref().expect("Evaluation failed");
-    let cmd = result
-        .command_results
-        .get(idx)
-        .unwrap_or_else(|| panic!("No command result at index {}", idx));
-
-    match cmd {
+    match world.expect_command_result(idx) {
         CommandResult::Cypher(rows) => {
             let expected = parse_gherkin_value(&value_str);
             let found = rows.iter().any(|row| {
@@ -770,24 +718,14 @@ async fn command_result_cypher_containing_row(
 
 #[then(regex = r#"^the command result (\d+) should be a Query with at least (\d+) rows$"#)]
 async fn command_result_query_at_least_rows(world: &mut LocyWorld, idx: usize, min: usize) {
-    let locy_result = world.locy_result().expect("No evaluation result found");
-
-    let result = locy_result.as_ref().expect("Evaluation failed");
-    let cmd = result
-        .command_results
-        .get(idx)
-        .unwrap_or_else(|| panic!("No command result at index {}", idx));
-
-    match cmd {
-        CommandResult::Query(rows) => {
-            assert!(
-                rows.len() >= min,
-                "Expected Query command result {} to have at least {} rows, got {}",
-                idx,
-                min,
-                rows.len()
-            );
-        }
+    match world.expect_command_result(idx) {
+        CommandResult::Query(rows) => assert!(
+            rows.len() >= min,
+            "Expected Query command result {} to have at least {} rows, got {}",
+            idx,
+            min,
+            rows.len()
+        ),
         other => panic!(
             "Expected command result {} to be a Query, got {:?}",
             idx, other
@@ -797,24 +735,14 @@ async fn command_result_query_at_least_rows(world: &mut LocyWorld, idx: usize, m
 
 #[then(regex = r#"^the command result (\d+) should be a Derive with at least (\d+) affected$"#)]
 async fn command_result_derive_at_least_affected(world: &mut LocyWorld, idx: usize, min: usize) {
-    let locy_result = world.locy_result().expect("No evaluation result found");
-
-    let result = locy_result.as_ref().expect("Evaluation failed");
-    let cmd = result
-        .command_results
-        .get(idx)
-        .unwrap_or_else(|| panic!("No command result at index {}", idx));
-
-    match cmd {
-        CommandResult::Derive { affected } => {
-            assert!(
-                *affected >= min,
-                "Expected Derive command result {} to have at least {} affected, got {}",
-                idx,
-                min,
-                affected
-            );
-        }
+    match world.expect_command_result(idx) {
+        CommandResult::Derive { affected } => assert!(
+            *affected >= min,
+            "Expected Derive command result {} to have at least {} affected, got {}",
+            idx,
+            min,
+            affected
+        ),
         other => panic!(
             "Expected command result {} to be a Derive, got {:?}",
             idx, other
@@ -924,49 +852,20 @@ async fn graph_should_not_contain_edge_type(world: &mut LocyWorld, edge_type: St
     regex = r#"^the result should contain a SharedProbabilisticDependency warning for rule ['"](.+)['"]$"#
 )]
 async fn result_should_contain_shared_dep_warning(world: &mut LocyWorld, rule_name: String) {
-    let locy_result = world
-        .locy_result()
-        .expect("no evaluation result")
-        .as_ref()
-        .expect("evaluation failed");
-
-    let found = locy_result.warnings().iter().any(|w| {
-        w.code == uni_locy::RuntimeWarningCode::SharedProbabilisticDependency
-            && w.rule_name == rule_name
-    });
-    assert!(
-        found,
-        "Expected SharedProbabilisticDependency warning for rule '{}', but warnings were: {:?}",
-        rule_name,
-        locy_result
-            .warnings()
-            .iter()
-            .map(|w| format!("{:?} ({})", w.code, w.rule_name))
-            .collect::<Vec<_>>()
+    assert_warning_present(
+        world,
+        uni_locy::RuntimeWarningCode::SharedProbabilisticDependency,
+        &rule_name,
+        "SharedProbabilisticDependency",
     );
 }
 
 #[then("the result should not contain a SharedProbabilisticDependency warning")]
 async fn result_should_not_contain_shared_dep_warning(world: &mut LocyWorld) {
-    let locy_result = world
-        .locy_result()
-        .expect("no evaluation result")
-        .as_ref()
-        .expect("evaluation failed");
-
-    let found = locy_result
-        .warnings()
-        .iter()
-        .any(|w| w.code == uni_locy::RuntimeWarningCode::SharedProbabilisticDependency);
-    assert!(
-        !found,
-        "Expected no SharedProbabilisticDependency warning, but found: {:?}",
-        locy_result
-            .warnings()
-            .iter()
-            .filter(|w| w.code == uni_locy::RuntimeWarningCode::SharedProbabilisticDependency)
-            .map(|w| format!("rule={}", w.rule_name))
-            .collect::<Vec<_>>()
+    assert_warning_absent(
+        world,
+        uni_locy::RuntimeWarningCode::SharedProbabilisticDependency,
+        "SharedProbabilisticDependency",
     );
 }
 
@@ -1457,24 +1356,11 @@ async fn result_should_not_contain_fuzzy_warning(world: &mut LocyWorld) {
 
 #[then(regex = r#"^the result should contain a BddLimitExceeded warning for rule ['"](.+)['"]$"#)]
 async fn result_should_contain_bdd_limit_warning(world: &mut LocyWorld, rule_name: String) {
-    let locy_result = world
-        .locy_result()
-        .expect("no evaluation result")
-        .as_ref()
-        .expect("evaluation failed");
-
-    let found = locy_result.warnings().iter().any(|w| {
-        w.code == uni_locy::RuntimeWarningCode::BddLimitExceeded && w.rule_name == rule_name
-    });
-    assert!(
-        found,
-        "Expected BddLimitExceeded warning for rule '{}', but warnings were: {:?}",
-        rule_name,
-        locy_result
-            .warnings()
-            .iter()
-            .map(|w| format!("{:?} ({})", w.code, w.rule_name))
-            .collect::<Vec<_>>()
+    assert_warning_present(
+        world,
+        uni_locy::RuntimeWarningCode::BddLimitExceeded,
+        &rule_name,
+        "BddLimitExceeded",
     );
 }
 
@@ -1504,25 +1390,10 @@ async fn result_should_not_contain_topk_pruning_warning(world: &mut LocyWorld) {
 
 #[then("the result should not contain a BddLimitExceeded warning")]
 async fn result_should_not_contain_bdd_limit_warning(world: &mut LocyWorld) {
-    let locy_result = world
-        .locy_result()
-        .expect("no evaluation result")
-        .as_ref()
-        .expect("evaluation failed");
-
-    let found = locy_result
-        .warnings()
-        .iter()
-        .any(|w| w.code == uni_locy::RuntimeWarningCode::BddLimitExceeded);
-    assert!(
-        !found,
-        "Expected no BddLimitExceeded warning, but found: {:?}",
-        locy_result
-            .warnings()
-            .iter()
-            .filter(|w| w.code == uni_locy::RuntimeWarningCode::BddLimitExceeded)
-            .map(|w| format!("rule={}", w.rule_name))
-            .collect::<Vec<_>>()
+    assert_warning_absent(
+        world,
+        uni_locy::RuntimeWarningCode::BddLimitExceeded,
+        "BddLimitExceeded",
     );
 }
 
@@ -1532,49 +1403,20 @@ async fn result_should_not_contain_bdd_limit_warning(world: &mut LocyWorld) {
     regex = r#"^the result should contain a CrossGroupCorrelationNotExact warning for rule ['"](.+)['"]$"#
 )]
 async fn result_should_contain_cross_group_warning(world: &mut LocyWorld, rule_name: String) {
-    let locy_result = world
-        .locy_result()
-        .expect("no evaluation result")
-        .as_ref()
-        .expect("evaluation failed");
-
-    let found = locy_result.warnings().iter().any(|w| {
-        w.code == uni_locy::RuntimeWarningCode::CrossGroupCorrelationNotExact
-            && w.rule_name == rule_name
-    });
-    assert!(
-        found,
-        "Expected CrossGroupCorrelationNotExact warning for rule '{}', but warnings were: {:?}",
-        rule_name,
-        locy_result
-            .warnings()
-            .iter()
-            .map(|w| format!("{:?} ({})", w.code, w.rule_name))
-            .collect::<Vec<_>>()
+    assert_warning_present(
+        world,
+        uni_locy::RuntimeWarningCode::CrossGroupCorrelationNotExact,
+        &rule_name,
+        "CrossGroupCorrelationNotExact",
     );
 }
 
 #[then("the result should not contain a CrossGroupCorrelationNotExact warning")]
 async fn result_should_not_contain_cross_group_warning(world: &mut LocyWorld) {
-    let locy_result = world
-        .locy_result()
-        .expect("no evaluation result")
-        .as_ref()
-        .expect("evaluation failed");
-
-    let found = locy_result
-        .warnings()
-        .iter()
-        .any(|w| w.code == uni_locy::RuntimeWarningCode::CrossGroupCorrelationNotExact);
-    assert!(
-        !found,
-        "Expected no CrossGroupCorrelationNotExact warning, but found: {:?}",
-        locy_result
-            .warnings()
-            .iter()
-            .filter(|w| w.code == uni_locy::RuntimeWarningCode::CrossGroupCorrelationNotExact)
-            .map(|w| format!("rule={}", w.rule_name))
-            .collect::<Vec<_>>()
+    assert_warning_absent(
+        world,
+        uni_locy::RuntimeWarningCode::CrossGroupCorrelationNotExact,
+        "CrossGroupCorrelationNotExact",
     );
 }
 
@@ -1588,11 +1430,7 @@ async fn bdd_warning_should_have_variable_count(
     rule_name: String,
     min_count: usize,
 ) {
-    let locy_result = world
-        .locy_result()
-        .expect("no evaluation result")
-        .as_ref()
-        .expect("evaluation failed");
+    let locy_result = world.expect_locy_ok();
 
     let warning = locy_result.warnings().iter().find(|w| {
         w.code == uni_locy::RuntimeWarningCode::BddLimitExceeded && w.rule_name == rule_name
@@ -1658,11 +1496,7 @@ async fn crossgroup_warning_should_have_variable_count(
 
 #[then(regex = r#"^the BddLimitExceeded warning for rule ['"](.+)['"] should have a key_group$"#)]
 async fn bdd_warning_should_have_key_group(world: &mut LocyWorld, rule_name: String) {
-    let locy_result = world
-        .locy_result()
-        .expect("no evaluation result")
-        .as_ref()
-        .expect("evaluation failed");
+    let locy_result = world.expect_locy_ok();
 
     let warning = locy_result.warnings().iter().find(|w| {
         w.code == uni_locy::RuntimeWarningCode::BddLimitExceeded && w.rule_name == rule_name
@@ -1687,11 +1521,7 @@ async fn derived_relation_should_not_contain_approximate_facts(
     world: &mut LocyWorld,
     relation: String,
 ) {
-    let locy_result = world
-        .locy_result()
-        .expect("No evaluation result found")
-        .as_ref()
-        .expect("Evaluation failed");
+    let locy_result = world.expect_locy_ok();
 
     let facts = locy_result
         .derived
@@ -1724,15 +1554,7 @@ async fn command_result_explain_child_proof_probability(
     child_idx: usize,
     expected_str: String,
 ) {
-    let locy_result = world.locy_result().expect("No evaluation result found");
-
-    let result = locy_result.as_ref().expect("Evaluation failed");
-    let cmd = result
-        .command_results
-        .get(idx)
-        .unwrap_or_else(|| panic!("No command result at index {}", idx));
-
-    match cmd {
+    match world.expect_command_result(idx) {
         CommandResult::Explain(node) => {
             let child = node
                 .children
@@ -1909,15 +1731,7 @@ async fn command_result_explain_all_children_have_proof_probability(
     world: &mut LocyWorld,
     idx: usize,
 ) {
-    let locy_result = world.locy_result().expect("No evaluation result found");
-
-    let result = locy_result.as_ref().expect("Evaluation failed");
-    let cmd = result
-        .command_results
-        .get(idx)
-        .unwrap_or_else(|| panic!("No command result at index {}", idx));
-
-    match cmd {
+    match world.expect_command_result(idx) {
         CommandResult::Explain(node) => {
             for (i, child) in node.children.iter().enumerate() {
                 assert!(

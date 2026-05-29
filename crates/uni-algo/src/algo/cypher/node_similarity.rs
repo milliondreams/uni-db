@@ -31,7 +31,7 @@ impl GraphAlgoAdapter for NodeSimilarityAdapter {
         ]
     }
 
-    fn to_config(args: Vec<Value>) -> NodeSimilarityConfig {
+    fn to_config(args: Vec<Value>) -> Result<NodeSimilarityConfig> {
         let metric_str = args[0].as_str().unwrap_or("JACCARD");
         let metric = match metric_str.to_uppercase().as_str() {
             "OVERLAP" => SimilarityMetric::Overlap,
@@ -39,11 +39,11 @@ impl GraphAlgoAdapter for NodeSimilarityAdapter {
             _ => SimilarityMetric::Jaccard,
         };
 
-        NodeSimilarityConfig {
+        Ok(NodeSimilarityConfig {
             similarity_metric: metric,
             similarity_cutoff: args[1].as_f64().unwrap_or(0.1),
             top_k: args[2].as_u64().unwrap_or(10) as usize,
-        }
+        })
     }
 
     fn map_result(result: <Self::Algo as Algorithm>::Result) -> Result<Vec<AlgoResultRow>> {

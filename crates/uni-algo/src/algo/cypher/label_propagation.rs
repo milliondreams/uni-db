@@ -27,13 +27,13 @@ impl GraphAlgoAdapter for LabelPropagationAdapter {
         vec![("nodeId", ValueType::Int), ("communityId", ValueType::Int)]
     }
 
-    fn to_config(args: Vec<Value>) -> LabelPropagationConfig {
-        LabelPropagationConfig {
+    fn to_config(args: Vec<Value>) -> Result<LabelPropagationConfig> {
+        Ok(LabelPropagationConfig {
             max_iterations: args[0].as_u64().unwrap() as usize,
             write: args[1].as_bool().unwrap(),
             write_property: args[2].as_str().unwrap().to_string(),
             seed_property: None,
-        }
+        })
     }
 
     fn map_result(result: <Self::Algo as Algorithm>::Result) -> Result<Vec<AlgoResultRow>> {

@@ -25,6 +25,14 @@ use uni_crdt::Crdt;
 pub struct PropertyManager {
     storage: Arc<StorageManager>,
     schema_manager: Arc<SchemaManager>,
+    /// Plugin registry consulted by CRDT merges via
+    /// [`uni_crdt::Crdt::merge_via_registry`]. The legacy 3-arg
+    /// [`Self::new`] passes an empty registry so callers that don't
+    /// wire plugin dispatch keep getting bit-identical native
+    /// behavior (empty registry → `merge_via_registry`'s native
+    /// fallback). Production paths in `UniInner` use
+    /// [`Self::with_plugin_registry`] to share the host's registry.
+    plugin_registry: Arc<uni_plugin::PluginRegistry>,
     /// Cache is None when capacity=0 (caching disabled)
     vertex_cache: Option<Mutex<LruCache<(Vid, String), Value>>>,
     edge_cache: Option<Mutex<LruCache<(uni_common::core::id::Eid, String), Value>>>,
@@ -32,10 +40,36 @@ pub struct PropertyManager {
 }
 
 impl PropertyManager {
+    /// Construct a `PropertyManager` with an empty plugin registry.
+    ///
+    /// Back-compat shim for the ~17 algorithm and test call sites that
+    /// don't need registry-dispatched CRDT merges. Equivalent to
+    /// [`Self::with_plugin_registry`] with `Arc::new(PluginRegistry::new())`.
     pub fn new(
         storage: Arc<StorageManager>,
         schema_manager: Arc<SchemaManager>,
         capacity: usize,
+    ) -> Self {
+        Self::with_plugin_registry(
+            storage,
+            schema_manager,
+            capacity,
+            Arc::new(uni_plugin::PluginRegistry::new()),
+        )
+    }
+
+    /// Construct a `PropertyManager` wired to a shared `PluginRegistry`.
+    ///
+    /// CRDT merges in this `PropertyManager` consult `plugin_registry`
+    /// for `CrdtKindProvider`s matching each `Crdt::kind()`; matched
+    /// kinds dispatch through the provider (so hot-reloaded plugins
+    /// take effect immediately), unmatched kinds fall back to the
+    /// native `Crdt::try_merge`.
+    pub fn with_plugin_registry(
+        storage: Arc<StorageManager>,
+        schema_manager: Arc<SchemaManager>,
+        capacity: usize,
+        plugin_registry: Arc<uni_plugin::PluginRegistry>,
     ) -> Self {
         // Capacity of 0 disables caching
         let (vertex_cache, edge_cache) = if capacity == 0 {
@@ -51,6 +85,7 @@ impl PropertyManager {
         Self {
             storage,
             schema_manager,
+            plugin_registry,
             vertex_cache,
             edge_cache,
             cache_capacity: capacity,
@@ -749,76 +784,6 @@ impl PropertyManager {
         }
     }
 
-    pub async fn load_properties_columnar(
-        &self,
-        vids: &UInt64Array,
-        properties: &[&str],
-        ctx: Option<&QueryContext>,
-    ) -> Result<RecordBatch> {
-        // This is complex because vids can be mixed labels.
-        // Vectorized execution usually processes batches of same label (Phase 3).
-        // For Phase 2, let's assume `vids` contains mixed labels and we return a RecordBatch
-        // that aligns with `vids` (same length, same order).
-        // This likely requires gathering values and building new arrays.
-        // OR we return a batch where missing values are null.
-
-        // Strategy:
-        // 1. Convert UInt64Array to Vec<Vid>
-        // 2. Call `get_batch_vertex_props`
-        // 3. Reconstruct RecordBatch from HashMap results ensuring alignment.
-
-        // This is not "true" columnar zero-copy loading from disk to memory,
-        // but it satisfies the interface and prepares for better optimization later.
-        // True zero-copy requires filtered scans returning aligned batches, which is hard with random access.
-        // Lance `take` is better.
-
-        let mut vid_vec = Vec::with_capacity(vids.len());
-        for i in 0..vids.len() {
-            vid_vec.push(Vid::from(vids.value(i)));
-        }
-
-        let _props_map = self
-            .get_batch_vertex_props(&vid_vec, properties, ctx)
-            .await?;
-
-        // Build output columns
-        // We need to know the Arrow DataType for each property.
-        // Problem: Different labels might have same property name but different type?
-        // Uni schema enforces unique property name/type globally? No, per label/type.
-        // But usually properties with same name share semantic/type.
-        // If types differ, we can't put them in one column.
-        // For now, assume consistent types or pick one.
-
-        // Let's inspect schema for first label found for each property?
-        // Or expect caller to handle schema.
-        // The implementation here constructs arrays from JSON Values.
-
-        // Actually, we can use `value_to_json` logic reverse or specific builders.
-        // For simplicity in Phase 2, we can return Arrays of mixed types? No, Arrow is typed.
-        // We will infer type from Schema.
-
-        // Let's create builders for each property.
-        // For now, support basic types.
-
-        // TODO: This implementation is getting long.
-        // Let's stick to the interface contract.
-
-        // Simplified: just return empty batch for now if not fully implemented or stick to scalar loading if too complex.
-        // But I should implement it.
-
-        // ... Implementation via Builder ...
-        // Skipping detailed columnar builder for brevity in this specific file update
-        // unless explicitly requested, as `get_batch_vertex_props` is the main win for now.
-        // But the design doc requested it.
-
-        // Let's throw Unimplemented for columnar for now, and rely on batch scalar load.
-        // Or better, map to batch load and build batch.
-
-        Err(anyhow!(
-            "Columnar property load not fully implemented yet - use batch load"
-        ))
-    }
-
     /// Batch load labels for multiple vertices.
     pub async fn get_batch_labels(
         &self,
@@ -1236,8 +1201,7 @@ impl PropertyManager {
                         if let Some(col) = batch.column_by_name(p_name)
                             && !col.is_null(row)
                         {
-                            let val =
-                                Self::value_from_column(col.as_ref(), &p_meta.r#type, row)?;
+                            let val = Self::value_from_column(col.as_ref(), &p_meta.r#type, row)?;
                             props.insert(p_name.clone(), val);
                         }
                     }
@@ -1868,7 +1832,19 @@ impl PropertyManager {
         )
     }
 
-    pub(crate) fn merge_crdt_values(&self, a: &Value, b: &Value) -> Result<Value> {
+    /// Merge two `Value`-wrapped CRDT operands.
+    ///
+    /// Routes through [`uni_crdt::Crdt::merge_via_registry`] using the
+    /// `PropertyManager`'s `plugin_registry`. With an empty registry
+    /// (the legacy 3-arg [`Self::new`] default) `merge_via_registry`
+    /// falls back to `Crdt::try_merge`, preserving native semantics.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `anyhow::Error` when either operand is malformed
+    /// CRDT JSON, the variants disagree, or the registry-dispatched
+    /// merge surfaces a `CrdtError`.
+    pub fn merge_crdt_values(&self, a: &Value, b: &Value) -> Result<Value> {
         // Handle the case where values are JSON strings containing CRDT JSON
         // (this happens when values come from Cypher CREATE statements)
         // Parse before checking for null to ensure proper format conversion
@@ -1884,8 +1860,13 @@ impl PropertyManager {
 
         let mut crdt_a: Crdt = serde_json::from_value(a_parsed)?;
         let crdt_b: Crdt = serde_json::from_value(b_parsed)?;
+        // M10 follow-up: route through `merge_via_registry` so a
+        // hot-reloaded `CrdtKindProvider` plugin can intercept the
+        // merge. With an empty registry (the 3-arg `new()` default)
+        // this falls back to `Crdt::try_merge`, preserving prior
+        // behavior bit-for-bit.
         crdt_a
-            .try_merge(&crdt_b)
+            .merge_via_registry(&crdt_b, &self.plugin_registry)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         Ok(Value::from(serde_json::to_value(crdt_a)?))
     }

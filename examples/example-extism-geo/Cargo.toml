@@ -1,0 +1,48 @@
+# Standalone example Extism plugin — NOT a workspace member.
+#
+# Build:
+#   cd examples/example-extism-geo
+#   cargo build --target wasm32-unknown-unknown --release
+#
+# Produces target/wasm32-unknown-unknown/release/example_extism_geo.wasm.
+# Load via:
+#   let bytes = std::fs::read(".../example_extism_geo.wasm")?;
+#   uni.load_wasm_extism(&loader, &bytes, &grants, &caps)?;
+#
+# This plugin ships the full Arrow-IPC `invoke_geo.haversine` export
+# (M6 deferred-followup completion). Wasm size ~1MB after `lto=true +
+# opt-level=s + strip`.
+
+# Declaring its own [workspace] = {} opts this crate out of the outer
+# `uni` workspace — `cargo build --workspace` from the repo root won't
+# try to build this for the host target.
+[workspace]
+
+[package]
+name = "example-extism-geo"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Example Extism plugin: geo.haversine with full Arrow-IPC invoke"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+extism-pdk = "1"
+serde_json = "1"
+# Arrow IPC on wasm32-unknown-unknown. We deliberately disable
+# default features (which pull in chrono / csv / json — none of
+# which we need) and enable only `ipc` for the StreamReader /
+# StreamWriter we use.
+arrow = { version = "57", default-features = false, features = ["ipc"] }
+arrow-array = "57"
+arrow-schema = "57"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+codegen-units = 1
+debug = false

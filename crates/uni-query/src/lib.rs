@@ -22,6 +22,8 @@
 
 #![recursion_limit = "256"]
 
+pub mod procedures_plugin;
+pub mod projection_store;
 pub mod query;
 pub mod types;
 
@@ -30,6 +32,15 @@ pub use query::executor::procedure::{
     ProcedureOutput, ProcedureParam, ProcedureRegistry, ProcedureValueType, RegisteredProcedure,
 };
 pub use query::executor::{CustomFunctionRegistry, CustomScalarFn, Executor, ResultNormalizer};
+// M8.6: session-scoped plugin registry plumbing. Host crates wrap their
+// per-query execution paths with `scoped_with_session_plugin_registry`;
+// the executor consults `current_session_plugin_registry` at the UDF /
+// procedure / Locy-aggregate resolution sites.
+pub use query::df_udfs_plugin::{
+    CURRENT_PRINCIPAL, SESSION_PLUGIN_REGISTRY, current_principal, current_session_plugin_registry,
+    maybe_scope_with_principal, scoped_with_principal, scoped_with_session_context,
+    scoped_with_session_plugin_registry,
+};
 pub use query::planner::{
     CostEstimates, ExplainOutput, ForkIndexLookup, FusionKind, IndexUsage, LogicalPlan,
     QueryPlanner, rewrite_for_fork_fusion,

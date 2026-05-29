@@ -36,7 +36,11 @@ impl AlgoProcedure for ShortestPathProcedure {
         }
     }
 
-    fn execute(
+    fn wants_native_terminals(&self) -> bool {
+        true
+    }
+
+    fn execute_with_native_terminals(
         &self,
         ctx: AlgoContext,
         args: Vec<Value>,

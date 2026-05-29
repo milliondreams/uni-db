@@ -118,11 +118,16 @@ impl DerivedScanRegistry {
 // MonotonicAggState — tracking monotonic aggregates across iterations
 // ---------------------------------------------------------------------------
 
-/// Monotonic aggregate binding: maps a fold name to its aggregate kind and column.
+/// Monotonic aggregate binding: maps a fold name to its aggregate
+/// trait object and input column.
+///
+/// Dispatches purely through [`uni_plugin::traits::locy::LocyAggregate`]
+/// (`update_step` / `initial_accum_f64` / `is_probability_aggregate` /
+/// `is_noisy_or`).
 #[derive(Debug, Clone)]
 pub struct MonotonicFoldBinding {
     pub fold_name: String,
-    pub kind: crate::query::df_graph::locy_fold::FoldAggKind,
+    pub aggregate: std::sync::Arc<dyn uni_plugin::traits::locy::LocyAggregate>,
     pub input_col_index: usize,
     /// Column name for name-based resolution (more robust than positional index).
     pub input_col_name: Option<String>,
@@ -156,17 +161,28 @@ impl MonotonicAggState {
     /// Update accumulators with new delta batches.
     ///
     /// Returns `true` if any accumulator value changed. When `strict` is
-    /// `true`, Nor/Prod inputs outside `[0, 1]` produce an error instead
-    /// of being clamped. `semiring_kind` selects the probability
-    /// semiring: `AddMultProb` (default, Phase 1/2 noisy-OR/product) or
+    /// `true`, MNOR/MPROD inputs outside `[0, 1]` produce an error
+    /// instead of being clamped.
+    ///
+    /// `semiring_kind` selects the probability semiring for probability
+    /// aggregates: `AddMultProb` (default, Phase 1/2 noisy-OR/product) or
     /// `MaxMinProb` (Viterbi/fuzzy — opt-in, callers emit
     /// `FuzzyNotProbabilistic`).
     ///
-    /// **Phase A follow-up (Slice 5):** delegates the per-row MNOR/MPROD
-    /// math to `update_generic`, which is generic over the
-    /// [`uni_locy::LocySemiring`] trait. This compiles down to the same
-    /// match-on-kind dispatch but routes through the trait — the
-    /// production path for C0 Stage 2 when tags replace scalar `f64`.
+    /// Dispatch goes through each binding's `Arc<dyn LocyAggregate>` trait
+    /// object via [`uni_plugin::traits::locy::LocyAggregate::update_step`].
+    /// The trait object's `initial_accum_f64()` seeds the per-group
+    /// accumulator. Under `MaxMinProb`, probability aggregates (MNOR /
+    /// MPROD) bypass `update_step` and fold via the `MaxMinProb` semiring's
+    /// `plus` (max) / `times` (min) instead — preserving the opt-in
+    /// Viterbi/fuzzy semantics that `update_step`'s built-in noisy-OR /
+    /// product path does not implement.
+    ///
+    /// Aggregates whose `update_step` returns `Err(CODE_UNKNOWN_FUNCTION)`
+    /// (default impl — no row-level fast path; e.g., `AVG`, `COLLECT`)
+    /// are skipped silently here — those run through the batch-shape
+    /// [`uni_plugin::traits::locy::LocyAggState::ingest`] path in
+    /// `apply_post_fixpoint_chain` instead.
     pub fn update(
         &mut self,
         key_indices: &[usize],
@@ -174,38 +190,6 @@ impl MonotonicAggState {
         strict: bool,
         semiring_kind: SemiringKind,
     ) -> DFResult<bool> {
-        // Match-then-monomorphize: pick the concrete semiring once,
-        // call the generic worker. Both impls are inlined in release
-        // builds.
-        match semiring_kind {
-            SemiringKind::MaxMinProb => {
-                self.update_generic(key_indices, delta_batches, strict, &uni_locy::MaxMinProb)
-            }
-            _ => self.update_generic(
-                key_indices,
-                delta_batches,
-                strict,
-                &uni_locy::AddMultProb::default(),
-            ),
-        }
-    }
-
-    /// Trait-generic core of [`MonotonicAggState::update`]. Forms the
-    /// runtime hook for Phase C C0 Stage 2 — when the semiring's
-    /// `Tag` is no longer `f64`, this fn's signature parameterizes
-    /// over the new tag type cleanly.
-    fn update_generic<S>(
-        &mut self,
-        key_indices: &[usize],
-        delta_batches: &[RecordBatch],
-        strict: bool,
-        sr: &S,
-    ) -> DFResult<bool>
-    where
-        S: uni_locy::LocySemiring<Tag = f64>,
-    {
-        use crate::query::df_graph::locy_fold::FoldAggKind;
-
         let mut changed = false;
         for batch in delta_batches {
             for row_idx in 0..batch.num_rows() {
@@ -223,64 +207,70 @@ impl MonotonicAggState {
                     let val = extract_f64(col.as_ref(), row_idx);
                     if let Some(val) = val {
                         let map_key = (group_key.clone(), binding.fold_name.clone());
-                        let entry = self
-                            .accumulators
-                            .entry(map_key)
-                            .or_insert(binding.kind.identity().unwrap_or(0.0));
+                        let initial = binding.aggregate.initial_accum_f64().unwrap_or(0.0);
+                        let entry = self.accumulators.entry(map_key).or_insert(initial);
                         let old = *entry;
-                        match binding.kind {
-                            FoldAggKind::Sum | FoldAggKind::Count => *entry += val,
-                            FoldAggKind::Max if val > *entry => *entry = val,
-                            FoldAggKind::Max => {}
-                            FoldAggKind::Min if val < *entry => *entry = val,
-                            FoldAggKind::Min => {}
-                            FoldAggKind::Nor => {
-                                // Phase A inline domain check preserved
-                                // so the warning literal stays identical
-                                // and `strict` mode errors exactly as
-                                // before.
-                                if strict && !(0.0..=1.0).contains(&val) {
-                                    return Err(datafusion::error::DataFusionError::Execution(
-                                        format!(
-                                            "strict_probability_domain: MNOR input {val} is outside [0, 1]"
-                                        ),
-                                    ));
-                                }
-                                if !strict && !(0.0..=1.0).contains(&val) {
-                                    tracing::warn!(
-                                        "MNOR input {val} outside [0,1], clamped to {}",
-                                        val.clamp(0.0, 1.0)
-                                    );
-                                }
-                                let p = val.clamp(0.0, 1.0);
-                                // Trait-dispatched: AddMultProb -> noisy-OR;
-                                // MaxMinProb -> max.
-                                *entry = sr.plus(entry, &p);
+                        // Under `MaxMinProb`, probability aggregates (MNOR /
+                        // MPROD) fold via the Viterbi/fuzzy semiring (max /
+                        // min) rather than the trait object's built-in
+                        // noisy-OR / product `update_step`. The inline domain
+                        // checks below preserve the exact strict-mode error
+                        // and clamp-warning literals. `is_noisy_or()`
+                        // distinguishes MNOR (disjunction → max) from MPROD
+                        // (conjunction → min). All other aggregates — and the
+                        // default `AddMultProb` semiring — dispatch through
+                        // the trait object's `update_step`.
+                        if matches!(semiring_kind, SemiringKind::MaxMinProb)
+                            && binding.aggregate.is_probability_aggregate()
+                        {
+                            use uni_locy::LocySemiring;
+                            let sr = uni_locy::MaxMinProb;
+                            let is_nor = binding.aggregate.is_noisy_or();
+                            let label = if is_nor { "MNOR" } else { "MPROD" };
+                            if strict && !(0.0..=1.0).contains(&val) {
+                                return Err(datafusion::error::DataFusionError::Execution(
+                                    format!(
+                                        "strict_probability_domain: {label} input {val} is outside [0, 1]"
+                                    ),
+                                ));
                             }
-                            FoldAggKind::Prod => {
-                                if strict && !(0.0..=1.0).contains(&val) {
-                                    return Err(datafusion::error::DataFusionError::Execution(
-                                        format!(
-                                            "strict_probability_domain: MPROD input {val} is outside [0, 1]"
-                                        ),
-                                    ));
-                                }
-                                if !strict && !(0.0..=1.0).contains(&val) {
-                                    tracing::warn!(
-                                        "MPROD input {val} outside [0,1], clamped to {}",
-                                        val.clamp(0.0, 1.0)
-                                    );
-                                }
-                                let p = val.clamp(0.0, 1.0);
-                                // Trait-dispatched: AddMultProb -> product
-                                // (with log-space underflow guard);
-                                // MaxMinProb -> min.
-                                *entry = sr.times(entry, &p);
+                            if !strict && !(0.0..=1.0).contains(&val) {
+                                tracing::warn!(
+                                    "{label} input {val} outside [0,1], clamped to {}",
+                                    val.clamp(0.0, 1.0)
+                                );
                             }
-                            _ => {}
+                            let p = val.clamp(0.0, 1.0);
+                            // MaxMinProb: MNOR -> max (plus), MPROD -> min (times).
+                            *entry = if is_nor {
+                                sr.plus(entry, &p)
+                            } else {
+                                sr.times(entry, &p)
+                            };
+                            if (*entry - old).abs() > f64::EPSILON {
+                                changed = true;
+                            }
+                            continue;
                         }
-                        if (*entry - old).abs() > f64::EPSILON {
-                            changed = true;
+                        match binding.aggregate.update_step(*entry, val, strict) {
+                            Ok(new_val) => {
+                                *entry = new_val;
+                                if (*entry - old).abs() > f64::EPSILON {
+                                    changed = true;
+                                }
+                            }
+                            Err(e) if e.code == uni_plugin::FnError::CODE_UNKNOWN_FUNCTION => {
+                                // Aggregate has no row-level fast path (AVG,
+                                // COLLECT). Those run through the
+                                // batch-shape `ingest` path elsewhere; skip.
+                            }
+                            Err(e) => {
+                                // Strict-mode probability-domain violation,
+                                // or another aggregate-specific failure.
+                                return Err(datafusion::error::DataFusionError::Execution(
+                                    e.message,
+                                ));
+                            }
                         }
                     }
                 }
@@ -1189,7 +1179,7 @@ async fn run_fixpoint_loop(
                     .iter()
                     .map(|fb| MonotonicFoldBinding {
                         fold_name: fb.output_name.clone(),
-                        kind: fb.kind.clone(),
+                        aggregate: std::sync::Arc::clone(&fb.aggregate),
                         input_col_index: fb.input_col_index,
                         input_col_name: fb.input_col_name.clone(),
                     })
@@ -2087,14 +2077,16 @@ fn detect_shared_lineage(
     warnings_slot: &Arc<StdRwLock<Vec<RuntimeWarning>>>,
     semiring_kind: SemiringKind,
 ) -> Option<SharedLineageInfo> {
-    use crate::query::df_graph::locy_fold::FoldAggKind;
     use uni_locy::{RuntimeWarning, RuntimeWarningCode};
 
-    // Only check rules with MNOR/MPROD fold bindings.
+    // Only check rules with probability-domain fold bindings. M3:
+    // dispatches via the `LocyAggregate` trait so user-authored
+    // probability aggregates participate automatically — selected by the
+    // trait's `is_probability_aggregate()` flag, not by hardcoded name.
     let has_prob_fold = rule
         .fold_bindings
         .iter()
-        .any(|fb| matches!(fb.kind, FoldAggKind::Nor | FoldAggKind::Prod));
+        .any(|fb| fb.aggregate.is_probability_aggregate());
     if !has_prob_fold {
         return None;
     }
@@ -2397,19 +2389,20 @@ pub(crate) fn apply_exact_wmc(
     approximate_slot: &Arc<StdRwLock<HashMap<String, Vec<String>>>>,
 ) -> DFResult<Vec<RecordBatch>> {
     use crate::query::df_graph::locy_bdd::{SemiringOp, weighted_model_count};
-    use crate::query::df_graph::locy_fold::FoldAggKind;
     use uni_locy::{RuntimeWarning, RuntimeWarningCode};
 
-    // Find the MNOR/MPROD fold binding to know which column to overwrite.
+    // Find the probability-domain fold binding to know which column
+    // to overwrite. M3: dispatch through the `LocyAggregate` trait so
+    // user-authored probability aggregates participate.
     let prob_fold = rule
         .fold_bindings
         .iter()
-        .find(|fb| matches!(fb.kind, FoldAggKind::Nor | FoldAggKind::Prod));
+        .find(|fb| fb.aggregate.is_probability_aggregate());
     let prob_fold = match prob_fold {
         Some(f) => f,
         None => return Ok(pre_fold_facts),
     };
-    let semiring_op = if matches!(prob_fold.kind, FoldAggKind::Nor) {
+    let semiring_op = if prob_fold.aggregate.is_noisy_or() {
         SemiringOp::Disjunction
     } else {
         SemiringOp::Conjunction
@@ -3691,7 +3684,46 @@ async fn precompute_graph_feature_maps(
             storage.clone(),
             graph_algo.l0_manager.as_ref().map(Arc::clone),
         );
-        let mut stream = procedure.execute(algo_ctx, args);
+        // The AlgoProcedure trait routes direct (nodeLabels, edgeTypes)
+        // args through the V2 projection entry point: build a projection
+        // from the direct args, then execute against it.
+        //
+        // Fill optional algorithm-specific args (e.g. degree_centrality's
+        // `direction`, eigenvector/katz `weightProperty`) with their schema
+        // defaults for the projection build: `build_projection_from_direct_args`
+        // feeds the specific args (`args[2..]`) to the adapter's
+        // `customize_projection`, which indexes them positionally — the two
+        // empty placeholder arrays alone would leave that slice empty and
+        // panic. `validate_args` fills missing optionals WITHOUT type-checking
+        // the defaults (some are `Null`-typed sentinels), so this never errors
+        // for the placeholder shape.
+        //
+        // We pass the ORIGINAL `args` (not the filled ones) to
+        // `execute_with_projection`, which re-runs `validate_args` internally:
+        // re-feeding already-filled args would make those defaults look
+        // "provided" and trip the type-check (`weightProperty: Null` vs
+        // `String`). This mirrors the (now-removed) legacy
+        // `AlgoProcedure::execute`, which validated once then built + ran.
+        let filled_args = procedure
+            .signature()
+            .validate_args(args.clone())
+            .map_err(|e| {
+                datafusion::error::DataFusionError::Execution(format!(
+                    "graph-structural FEATURE '{fn_name}': argument validation failed: {e}"
+                ))
+            })?;
+        let projection = uni_algo::algo::procedure_template::build_projection_from_direct_args(
+            procedure.as_ref(),
+            &algo_ctx,
+            &filled_args,
+        )
+        .await
+        .map_err(|e| {
+            datafusion::error::DataFusionError::Execution(format!(
+                "graph-structural FEATURE '{fn_name}': projection build failed: {e}"
+            ))
+        })?;
+        let mut stream = procedure.execute_with_projection(algo_ctx, args, projection);
         let mut score_map: HashMap<u64, f64> = HashMap::new();
         let sig = procedure.signature();
         let node_idx = sig
@@ -5792,11 +5824,9 @@ mod tests {
 
     #[test]
     fn test_monotonic_agg_update_and_stability() {
-        use crate::query::df_graph::locy_fold::FoldAggKind;
-
         let bindings = vec![MonotonicFoldBinding {
             fold_name: "total".into(),
-            kind: FoldAggKind::Sum,
+            aggregate: std::sync::Arc::new(uni_plugin_builtin::locy_aggregates::SumAgg),
             input_col_index: 1,
             input_col_name: None,
         }];
@@ -5882,20 +5912,18 @@ mod tests {
     }
 
     fn make_nor_binding() -> Vec<MonotonicFoldBinding> {
-        use crate::query::df_graph::locy_fold::FoldAggKind;
         vec![MonotonicFoldBinding {
             fold_name: "prob".into(),
-            kind: FoldAggKind::Nor,
+            aggregate: std::sync::Arc::new(uni_plugin_builtin::locy_aggregates::MnorAgg),
             input_col_index: 1,
             input_col_name: None,
         }]
     }
 
     fn make_prod_binding() -> Vec<MonotonicFoldBinding> {
-        use crate::query::df_graph::locy_fold::FoldAggKind;
         vec![MonotonicFoldBinding {
             fold_name: "prob".into(),
-            kind: FoldAggKind::Prod,
+            aggregate: std::sync::Arc::new(uni_plugin_builtin::locy_aggregates::MprodAgg),
             input_col_index: 1,
             input_col_name: None,
         }]

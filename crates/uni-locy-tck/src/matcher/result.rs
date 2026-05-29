@@ -8,27 +8,7 @@ pub fn match_result(
     actual: &QueryResult,
     expected_rows: &[HashMap<String, Value>],
 ) -> Result<(), String> {
-    if actual.len() != expected_rows.len() {
-        return Err(format!(
-            "Row count mismatch: expected {}, got {}",
-            expected_rows.len(),
-            actual.len()
-        ));
-    }
-
-    if actual.is_empty() {
-        return Ok(());
-    }
-
-    let expected_cols = validate_columns(actual, expected_rows)?;
-
-    for (i, (actual_row, expected_row)) in
-        actual.rows().iter().zip(expected_rows.iter()).enumerate()
-    {
-        compare_row(actual_row, expected_row, &expected_cols, i)?;
-    }
-
-    Ok(())
+    match_result_inner(actual, expected_rows, true, false)
 }
 
 /// Match query result against expected rows (order-agnostic).
@@ -36,60 +16,7 @@ pub fn match_result_unordered(
     actual: &QueryResult,
     expected_rows: &[HashMap<String, Value>],
 ) -> Result<(), String> {
-    if actual.len() != expected_rows.len() {
-        return Err(format!(
-            "Row count mismatch: expected {}, got {}",
-            expected_rows.len(),
-            actual.len()
-        ));
-    }
-
-    if actual.is_empty() {
-        return Ok(());
-    }
-
-    let expected_cols = validate_columns(actual, expected_rows)?;
-
-    let mut unmatched: Vec<&HashMap<String, Value>> = expected_rows.iter().collect();
-
-    for (i, actual_row) in actual.rows().iter().enumerate() {
-        let match_idx = unmatched.iter().position(|expected_row| {
-            expected_cols.iter().all(|col| {
-                let Some(expected_val) = expected_row.get(col) else {
-                    return false;
-                };
-                let Some(actual_val) = actual_row.value(col) else {
-                    return false;
-                };
-                values_equal(actual_val, expected_val)
-            })
-        });
-
-        match match_idx {
-            Some(idx) => {
-                unmatched.remove(idx);
-            }
-            None => {
-                let actual_vals: Vec<_> = expected_cols
-                    .iter()
-                    .map(|col| (col.clone(), actual_row.value(col).cloned()))
-                    .collect();
-                return Err(format!(
-                    "No match found for actual row {}. Actual values: {:?}. Expected: {:?}",
-                    i, actual_vals, unmatched
-                ));
-            }
-        }
-    }
-
-    if !unmatched.is_empty() {
-        return Err(format!(
-            "{} expected rows were not matched",
-            unmatched.len()
-        ));
-    }
-
-    Ok(())
+    match_result_inner(actual, expected_rows, false, false)
 }
 
 /// Match query result against expected rows (order-sensitive), ignoring list element order.
@@ -97,46 +24,22 @@ pub fn match_result_ignoring_list_order(
     actual: &QueryResult,
     expected_rows: &[HashMap<String, Value>],
 ) -> Result<(), String> {
-    if actual.len() != expected_rows.len() {
-        return Err(format!(
-            "Row count mismatch: expected {}, got {}",
-            expected_rows.len(),
-            actual.len()
-        ));
-    }
-
-    if actual.is_empty() {
-        return Ok(());
-    }
-
-    let expected_cols = validate_columns(actual, expected_rows)?;
-
-    for (i, (actual_row, expected_row)) in
-        actual.rows().iter().zip(expected_rows.iter()).enumerate()
-    {
-        for col in &expected_cols {
-            let Some(expected_val) = expected_row.get(col) else {
-                return Err(format!("Expected row {} missing column {}", i, col));
-            };
-            let Some(actual_val) = actual_row.value(col) else {
-                return Err(format!("Actual row {} missing column {}", i, col));
-            };
-            if !values_equal_ignoring_list_order(actual_val, expected_val) {
-                return Err(format!(
-                    "Row {} column {} mismatch: expected {:?}, got {:?}",
-                    i, col, expected_val, actual_val
-                ));
-            }
-        }
-    }
-
-    Ok(())
+    match_result_inner(actual, expected_rows, true, true)
 }
 
 /// Match query result against expected rows (order-agnostic), ignoring list element order.
 pub fn match_result_unordered_ignoring_list_order(
     actual: &QueryResult,
     expected_rows: &[HashMap<String, Value>],
+) -> Result<(), String> {
+    match_result_inner(actual, expected_rows, false, true)
+}
+
+fn match_result_inner(
+    actual: &QueryResult,
+    expected_rows: &[HashMap<String, Value>],
+    ordered: bool,
+    ignore_list_order: bool,
 ) -> Result<(), String> {
     if actual.len() != expected_rows.len() {
         return Err(format!(
@@ -151,6 +54,33 @@ pub fn match_result_unordered_ignoring_list_order(
     }
 
     let expected_cols = validate_columns(actual, expected_rows)?;
+    let eq: fn(&Value, &Value) -> bool = if ignore_list_order {
+        values_equal_ignoring_list_order
+    } else {
+        values_equal
+    };
+
+    if ordered {
+        for (i, (actual_row, expected_row)) in
+            actual.rows().iter().zip(expected_rows.iter()).enumerate()
+        {
+            for col in &expected_cols {
+                let Some(expected_val) = expected_row.get(col) else {
+                    return Err(format!("Expected row {} missing column {}", i, col));
+                };
+                let Some(actual_val) = actual_row.value(col) else {
+                    return Err(format!("Actual row {} missing column {}", i, col));
+                };
+                if !eq(actual_val, expected_val) {
+                    return Err(format!(
+                        "Row {} column {} mismatch: expected {:?}, got {:?}",
+                        i, col, expected_val, actual_val
+                    ));
+                }
+            }
+        }
+        return Ok(());
+    }
 
     let mut unmatched: Vec<&HashMap<String, Value>> = expected_rows.iter().collect();
 
@@ -163,7 +93,7 @@ pub fn match_result_unordered_ignoring_list_order(
                 let Some(actual_val) = actual_row.value(col) else {
                     return false;
                 };
-                values_equal_ignoring_list_order(actual_val, expected_val)
+                eq(actual_val, expected_val)
             })
         });
 
@@ -214,34 +144,6 @@ fn validate_columns(
     }
 
     Ok(expected_cols)
-}
-
-/// Compare a single actual row against an expected row.
-fn compare_row(
-    actual_row: &uni_query::Row,
-    expected_row: &HashMap<String, Value>,
-    columns: &[String],
-    row_index: usize,
-) -> Result<(), String> {
-    for col in columns {
-        let expected_val = expected_row.get(col).ok_or_else(|| {
-            format!(
-                "Expected column '{}' not found in expected row {}",
-                col, row_index
-            )
-        })?;
-        let actual_val = actual_row
-            .value(col)
-            .ok_or_else(|| format!("Column '{}' not found in actual row {}", col, row_index))?;
-
-        if !values_equal(actual_val, expected_val) {
-            return Err(format!(
-                "Value mismatch at row {} column '{}': expected {:?}, got {:?}",
-                row_index, col, expected_val, actual_val
-            ));
-        }
-    }
-    Ok(())
 }
 
 /// Compare two values for equality with special handling for floats and graph types.

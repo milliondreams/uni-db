@@ -135,70 +135,187 @@ pub fn stratify(graph: &DependencyGraph) -> Result<StratificationResult, LocyCom
 
 // ─── Tarjan's SCC ────────────────────────────────────────────────────────────
 
+/// Iterative Tarjan SCC.
+///
+/// Uses an explicit work stack so the recursion depth is no longer bounded
+/// by the program's thread stack. Locy programs with thousands of mutually
+/// dependent rules (e.g. long linear dependency chains) would previously
+/// risk stack overflow in the recursive form; the iterative version is
+/// bounded only by heap.
 fn tarjan(nodes: &[&str], adj: &HashMap<&str, HashSet<&str>>) -> Vec<HashSet<String>> {
-    struct State<'a> {
-        index_counter: usize,
-        stack: Vec<&'a str>,
-        on_stack: HashSet<&'a str>,
-        index: HashMap<&'a str, usize>,
-        lowlink: HashMap<&'a str, usize>,
-        sccs: Vec<HashSet<String>>,
+    // Per-node bookkeeping.
+    let mut index_counter: usize = 0;
+    let mut scc_stack: Vec<&str> = Vec::new();
+    let mut on_stack: HashSet<&str> = HashSet::new();
+    let mut index: HashMap<&str, usize> = HashMap::new();
+    let mut lowlink: HashMap<&str, usize> = HashMap::new();
+    let mut sccs: Vec<HashSet<String>> = Vec::new();
+
+    /// One iterative call frame, encoding the state of an in-flight
+    /// `strongconnect(v)`: we are currently iterating `v`'s neighbours,
+    /// with `cursor` neighbours already processed.
+    struct Frame<'a> {
+        v: &'a str,
+        neighbours: Vec<&'a str>,
+        cursor: usize,
     }
 
-    fn strongconnect<'a>(v: &'a str, adj: &HashMap<&str, HashSet<&'a str>>, state: &mut State<'a>) {
-        state.index.insert(v, state.index_counter);
-        state.lowlink.insert(v, state.index_counter);
-        state.index_counter += 1;
-        state.stack.push(v);
-        state.on_stack.insert(v);
-
-        if let Some(neighbors) = adj.get(v) {
-            for &w in neighbors {
-                if !state.index.contains_key(w) {
-                    strongconnect(w, adj, state);
-                    let w_low = state.lowlink[w];
-                    let v_low = state.lowlink[v];
-                    if w_low < v_low {
-                        state.lowlink.insert(v, w_low);
-                    }
-                } else if state.on_stack.contains(w) {
-                    let w_idx = state.index[w];
-                    let v_low = state.lowlink[v];
-                    if w_idx < v_low {
-                        state.lowlink.insert(v, w_idx);
-                    }
-                }
-            }
-        }
-
-        if state.lowlink[v] == state.index[v] {
-            let mut scc = HashSet::new();
-            loop {
-                let w = state.stack.pop().unwrap();
-                state.on_stack.remove(w);
-                scc.insert(w.to_string());
-                if w == v {
-                    break;
-                }
-            }
-            state.sccs.push(scc);
-        }
-    }
-
-    let mut state = State {
-        index_counter: 0,
-        stack: Vec::new(),
-        on_stack: HashSet::new(),
-        index: HashMap::new(),
-        lowlink: HashMap::new(),
-        sccs: Vec::new(),
+    let snapshot_neighbours = |v: &str| -> Vec<&str> {
+        adj.get(v)
+            .map(|set| set.iter().copied().collect())
+            .unwrap_or_default()
     };
 
-    for &node in nodes {
-        if !state.index.contains_key(node) {
-            strongconnect(node, adj, &mut state);
+    // Iterate the input slice in caller-provided order so behaviour matches
+    // the previous recursive implementation, which used direct recursion in
+    // the same order.
+    for &root in nodes {
+        if index.contains_key(root) {
+            continue;
+        }
+
+        let mut work: Vec<Frame<'_>> = Vec::new();
+
+        // Visit `root` and push its frame.
+        index.insert(root, index_counter);
+        lowlink.insert(root, index_counter);
+        index_counter += 1;
+        scc_stack.push(root);
+        on_stack.insert(root);
+        work.push(Frame {
+            v: root,
+            neighbours: snapshot_neighbours(root),
+            cursor: 0,
+        });
+
+        while let Some(frame) = work.last_mut() {
+            // Process the next outgoing edge of `frame.v`.
+            if frame.cursor < frame.neighbours.len() {
+                let w = frame.neighbours[frame.cursor];
+                frame.cursor += 1;
+                if !index.contains_key(w) {
+                    // Recurse into `w`: visit, then push its frame and
+                    // resume `frame` (with cursor already advanced) on
+                    // unwind.
+                    index.insert(w, index_counter);
+                    lowlink.insert(w, index_counter);
+                    index_counter += 1;
+                    scc_stack.push(w);
+                    on_stack.insert(w);
+                    work.push(Frame {
+                        v: w,
+                        neighbours: snapshot_neighbours(w),
+                        cursor: 0,
+                    });
+                } else if on_stack.contains(w) {
+                    let v = frame.v;
+                    let w_idx = index[w];
+                    let v_low = lowlink[v];
+                    if w_idx < v_low {
+                        lowlink.insert(v, w_idx);
+                    }
+                }
+                continue;
+            }
+
+            // All neighbours processed: finalize `v`.
+            let v = frame.v;
+            let v_low = lowlink[v];
+            let v_idx = index[v];
+
+            if v_low == v_idx {
+                let mut scc = HashSet::new();
+                loop {
+                    // The SCC stack is nonempty by construction: `v` was
+                    // pushed when its frame was created and has not yet
+                    // been popped.
+                    let w = scc_stack
+                        .pop()
+                        .expect("Tarjan SCC stack underflow — invariant violated");
+                    on_stack.remove(w);
+                    scc.insert(w.to_string());
+                    if w == v {
+                        break;
+                    }
+                }
+                sccs.push(scc);
+            }
+
+            // Pop `frame` and propagate `v`'s lowlink up to the parent
+            // (mirrors the post-recursive update in the original code).
+            work.pop();
+            if let Some(parent) = work.last_mut() {
+                let p = parent.v;
+                let p_low = lowlink[p];
+                if v_low < p_low {
+                    lowlink.insert(p, v_low);
+                }
+            }
         }
     }
 
-    state.sccs
+    sccs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A deeply linear dependency chain `r_0 → r_1 → ... → r_{N-1}` would
+    /// previously blow the thread stack via recursive `strongconnect`.
+    /// The iterative implementation is bounded only by heap.
+    #[test]
+    fn deep_linear_chain_does_not_overflow_stack() {
+        const N: usize = 5_000;
+
+        let mut graph = DependencyGraph {
+            positive_edges: HashMap::new(),
+            negative_edges: HashMap::new(),
+            all_rules: HashSet::new(),
+        };
+        for i in 0..N {
+            let name = format!("r_{i}");
+            graph.all_rules.insert(name.clone());
+            if i + 1 < N {
+                let next = format!("r_{}", i + 1);
+                graph.positive_edges.entry(name).or_default().insert(next);
+            }
+        }
+
+        let result = stratify(&graph).expect("stratify must succeed for an acyclic chain");
+        assert_eq!(result.sccs.len(), N, "each rule should be its own SCC");
+        assert!(
+            result.is_recursive.iter().all(|&r| !r),
+            "no rule should be flagged recursive in a pure chain"
+        );
+    }
+
+    /// Mutual recursion `a ⇄ b` should collapse to a single SCC and be
+    /// flagged as recursive (same behaviour as the previous recursive
+    /// implementation).
+    #[test]
+    fn two_cycle_collapses_to_one_recursive_scc() {
+        let mut graph = DependencyGraph {
+            positive_edges: HashMap::new(),
+            negative_edges: HashMap::new(),
+            all_rules: HashSet::new(),
+        };
+        graph.all_rules.insert("a".to_owned());
+        graph.all_rules.insert("b".to_owned());
+        graph
+            .positive_edges
+            .entry("a".to_owned())
+            .or_default()
+            .insert("b".to_owned());
+        graph
+            .positive_edges
+            .entry("b".to_owned())
+            .or_default()
+            .insert("a".to_owned());
+
+        let result = stratify(&graph).expect("stratify must succeed");
+        assert_eq!(result.sccs.len(), 1);
+        assert_eq!(result.sccs[0].len(), 2);
+        assert!(result.is_recursive[0]);
+    }
 }

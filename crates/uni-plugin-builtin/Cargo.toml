@@ -1,0 +1,44 @@
+[package]
+name = "uni-plugin-builtin"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+description = "Built-in plugin registrations for uni-db (scalar fns, aggregates, procedures, algorithms, CRDTs, …) — dogfoods the uni-plugin framework"
+keywords = ["plugin", "graph", "database", "builtin"]
+categories = ["database", "data-structures"]
+
+[dependencies]
+uni-plugin = { workspace = true }
+uni-store = { workspace = true, optional = true }
+uni-algo = { workspace = true }
+uni-common = { workspace = true }
+uni-crdt = { workspace = true }
+uuid = { workspace = true }
+anyhow = { workspace = true }
+arrow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+datafusion = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+smol_str = { version = "0.3", features = ["serde"] }
+semver = { workspace = true }
+parking_lot = { workspace = true }
+blake3 = { workspace = true }
+cron = { workspace = true }
+
+[features]
+default = ["lance-backend"]
+# Enables the `lance://` storage backend via `uni-store::LanceDbBackend`.
+lance-backend = ["dep:uni-store"]
+
+[dev-dependencies]
+tokio = { workspace = true }
+proptest = { workspace = true }

@@ -1027,15 +1027,12 @@ fn infer_procedure_call_schema(
                 "nullable" | "indexed" | "unique" => DataType::Boolean,
                 _ => DataType::Utf8,
             },
-            "uni.vector.query" | "uni.fts.query" | "uni.search" => {
-                // Search procedures: infer types via canonical yield mapping.
-                // Node expansion happens at execution time in GraphProcedureCallExec.
-                match map_yield_to_canonical(name).as_str() {
-                    "distance" => DataType::Float64,
-                    "score" | "vector_score" | "fts_score" | "raw_score" => DataType::Float32,
-                    "vid" => DataType::Int64,
-                    _ => DataType::Utf8,
-                }
+            // Node-yield procedures (search family): infer scalar yield
+            // types via the canonical yield-name → Arrow-type table.
+            // Node expansion happens at execution time in
+            // `GraphProcedureCallExec`.
+            n if super::procedure_call::is_node_yield_procedure_static(n) => {
+                super::procedure_call::canonical_search_type(map_yield_to_canonical(name))
             }
             // uni.schema.indexes, unknown procedures, and fallback: all Utf8
             _ => DataType::Utf8,

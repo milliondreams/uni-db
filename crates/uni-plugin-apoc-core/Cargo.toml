@@ -1,0 +1,30 @@
+[package]
+name = "uni-plugin-apoc-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+description = "Built-in APOC-equivalent procedures and scalar functions for uni-db — perf-critical or host-intimate APOC analogues in pure Rust"
+keywords = ["apoc", "plugin", "graph", "database"]
+categories = ["database", "data-structures"]
+
+[dependencies]
+uni-plugin = { workspace = true }
+arrow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+datafusion = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+smol_str = { version = "0.3", features = ["serde"] }
+semver = "1.0"
+parking_lot = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

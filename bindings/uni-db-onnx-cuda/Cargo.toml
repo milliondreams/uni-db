@@ -37,6 +37,9 @@ uni-db = { workspace = true, default-features = false, features = [
 uni-locy = { workspace = true }
 uni-common = { workspace = true }
 uni-store = { workspace = true }
+uni-plugin = { workspace = true }
+uni-plugin-rhai = { workspace = true }
+uni-plugin-pyo3 = { workspace = true, features = ["pyo3"] }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 anyhow = { workspace = true }

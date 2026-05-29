@@ -27,12 +27,12 @@ impl GraphAlgoAdapter for PageRankAdapter {
         vec![("nodeId", ValueType::Int), ("score", ValueType::Float)]
     }
 
-    fn to_config(args: Vec<Value>) -> PageRankConfig {
-        PageRankConfig {
+    fn to_config(args: Vec<Value>) -> Result<PageRankConfig> {
+        Ok(PageRankConfig {
             damping_factor: args[0].as_f64().unwrap(),
             max_iterations: args[1].as_u64().unwrap() as usize,
             tolerance: args[2].as_f64().unwrap(),
-        }
+        })
     }
 
     fn map_result(result: <Self::Algo as Algorithm>::Result) -> Result<Vec<AlgoResultRow>> {

@@ -9,24 +9,52 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use uni_common::core::fork::ForkId;
 
-pub mod appender;
+/// Streaming appender, re-exported from `uni-bulk`.
+///
+/// Shim kept so `crate::api::appender::*` paths resolve unchanged after
+/// the bulk-engine extraction.
+pub mod appender {
+    pub use uni_bulk::appender::*;
+}
 pub mod builder;
-pub mod bulk;
+/// Bulk writer engine, re-exported from `uni-bulk`.
+///
+/// Shim kept so `crate::api::bulk::*` paths resolve unchanged after the
+/// bulk-engine extraction.
+pub mod bulk {
+    pub use uni_bulk::bulk::*;
+}
 pub mod compaction;
 pub mod fork;
-pub mod fork_diff;
-pub(crate) mod fork_index_builder;
+/// Fork diff/promote types and engine, re-exported from `uni-fork`.
+///
+/// Shim kept so `crate::api::fork_diff::*` paths resolve unchanged after the
+/// fork-engine extraction. `compute_diff`/`run_promote` are generic over the
+/// `uni_fork` host traits, which uni-db implements for `Session`/`Transaction`.
+pub mod fork_diff {
+    pub use uni_fork::diff::{compute_diff, run_promote};
+    pub use uni_fork::types::*;
+}
+pub(crate) mod fork_maintenance;
 pub mod fork_schema;
-pub(crate) mod fork_sweeper;
 pub mod functions;
-pub mod hooks;
+/// Session/commit hooks — moved to `uni-plugin-host`; re-exported to keep the
+/// `uni_db::api::hooks::*` path stable.
+pub mod hooks {
+    pub use uni_plugin_host::hooks::*;
+}
+pub(crate) mod host_executor;
 pub mod impl_locy;
 pub mod impl_query;
 pub mod indexes;
 pub mod locy_builder;
 pub mod locy_result;
 pub mod multi_agent;
-pub mod notifications;
+/// Commit notifications — moved to `uni-plugin-host`; re-exported to keep the
+/// `uni_db::api::notifications::*` path stable.
+pub mod notifications {
+    pub use uni_plugin_host::notifications::*;
+}
 pub mod prepared;
 pub mod query_builder;
 pub mod rule_registry;
@@ -35,6 +63,11 @@ pub mod session;
 pub mod sync;
 pub mod template;
 pub mod transaction;
+/// Trigger dispatch engine — moved to `uni-plugin-host`; re-exported to keep
+/// the `uni_db::api::triggers::*` path stable.
+pub mod triggers {
+    pub use uni_plugin_host::triggers::*;
+}
 pub mod xervo;
 
 use object_store::ObjectStore;
@@ -59,11 +92,209 @@ use crate::shutdown::ShutdownHandle;
 
 use std::collections::HashMap;
 
+/// Map a [`uni_plugin::PluginError`] to a [`UniError`] for user-facing
+/// surfaces (`Uni::add_plugin`). The catch-all variant is
+/// [`UniError::InvalidArgument`] so we preserve the plugin id /
+/// capability detail via the `Display` impl.
+pub(crate) fn plugin_err_to_uni(e: uni_plugin::PluginError) -> UniError {
+    UniError::InvalidArgument {
+        arg: "plugin".to_string(),
+        message: e.to_string(),
+    }
+}
+
+/// Register the framework-wide built-in plugins into a fresh
+/// `PluginRegistry`. Called once at `Uni::build()` time.
+///
+/// - `BuiltinPlugin` is always registered (closed-enum replacement
+///   infrastructure: Locy aggregates, storage backends, CRDTs, collations,
+///   hooks, logical types, plus a handful of system procedures).
+/// - `ApocCorePlugin` is registered when the `apoc-core` cargo feature is
+///   on (default). Library embedders who don't want APOC content disable
+///   the feature.
+fn register_builtin_plugins(
+    registry: &Arc<uni_plugin::PluginRegistry>,
+    data_path: Option<&std::path::Path>,
+) -> std::result::Result<Option<Arc<crate::persistence::LazyCypherSink>>, uni_plugin::PluginError> {
+    use uni_plugin::{Plugin, PluginRegistrar};
+
+    // BuiltinPlugin — always.
+    {
+        let plugin = uni_plugin_builtin::BuiltinPlugin::new();
+        let manifest = plugin.manifest();
+        let caps = manifest.capabilities.clone();
+        let mut r = PluginRegistrar::new(manifest.id.clone(), &caps, registry);
+        plugin.register(&mut r)?;
+        r.commit_to_registry()?;
+    }
+
+    // ApocCorePlugin — feature-gated, default-on.
+    #[cfg(feature = "apoc-core")]
+    {
+        let plugin = uni_plugin_apoc_core::ApocCorePlugin::new();
+        let manifest = plugin.manifest();
+        let caps = manifest.capabilities.clone();
+        let mut r = PluginRegistrar::new(manifest.id.clone(), &caps, registry);
+        plugin.register(&mut r)?;
+        r.commit_to_registry()?;
+    }
+
+    // Host-coupled built-in procedures (uni.schema.*, uni.vector.query,
+    // uni.fts.query, uni.search, uni.algo.*). These live in `uni-query`
+    // rather than `uni-plugin-builtin` because they depend on
+    // `uni-store` / `uni-algo` types that the latter cannot reach
+    // without inverting the crate layering.
+    {
+        use uni_plugin::{
+            AbiRange, Capability, CapabilitySet, Determinism, PluginId, PluginManifest,
+            ProvidedSurfaces, Scope, SideEffects as PluginSideEffects,
+        };
+
+        let plugin_id = PluginId::new("uni");
+        let caps = CapabilitySet::from_iter_of([
+            Capability::Procedure,
+            Capability::ProcedureSchema,
+            // M11: background-job registration gate. The three built-in
+            // maintenance jobs (`uni.system.ttl_sweep` /
+            // `statistics_refresh` / `compaction`) register through
+            // this plugin id; the registrar's variant-match treats any
+            // `BackgroundJob` cap as sufficient regardless of
+            // `max_concurrent`.
+            Capability::BackgroundJob { max_concurrent: 0 },
+        ]);
+        let manifest = PluginManifest {
+            id: plugin_id.clone(),
+            version: env!("CARGO_PKG_VERSION")
+                .parse()
+                .unwrap_or_else(|_| "1.0.0".parse().expect("static version parses")),
+            abi: AbiRange::parse("^1").expect("manifest ABI range is valid"),
+            depends_on: vec![],
+            capabilities: caps.clone(),
+            determinism: Determinism::Pure,
+            side_effects: PluginSideEffects::ReadOnly,
+            scope: Scope::Instance,
+            hash: None,
+            signature: None,
+            provides: ProvidedSurfaces::default(),
+            docs: "Host-coupled built-in procedures (uni.schema.*, uni.vector.query, \
+                   uni.fts.query, uni.search, uni.algo.*) registered from uni-query."
+                .to_owned(),
+            metadata: std::collections::BTreeMap::new(),
+        };
+        let _ = manifest; // hold ownership for future verification logic; not yet consumed by registrar
+        let mut caps = caps;
+        // M5c.1: this block also registers `AlgorithmProvider`s so the
+        // `Capability::Algorithm` must be in scope. The host's "uni"
+        // plugin owns both procedure registrations (`uni.algo.*`
+        // adapters) and the AlgorithmProvider chain.
+        caps.insert(Capability::Algorithm);
+        let mut r = PluginRegistrar::new(plugin_id, &caps, registry);
+        let algo_registry: Arc<uni_algo::algo::AlgorithmRegistry> =
+            Arc::new(uni_algo::algo::AlgorithmRegistry::new());
+        uni_query::procedures_plugin::register_into(&mut r, Some(&algo_registry))?;
+        // M5c.1: register each algorithm as a phased `AlgorithmProvider`
+        // so consumers can `registry.iter_algorithms()` /
+        // `registry.algorithm(qname)`. The static `AlgorithmRegistry`
+        // path above is the M4 adapter and stays in place during M5c.1
+        // — both surfaces resolve to the same underlying `AlgoProcedure`
+        // impls.
+        uni_plugin_builtin::algorithms::register_into(&mut r)?;
+        // M11: the three built-in maintenance jobs (`ttl_sweep`,
+        // `statistics_refresh`, `compaction`). The host scheduler
+        // driver in `crates/uni/src/scheduler.rs` looks each up by
+        // qname and dispatches per its `Schedule::Periodic` interval.
+        uni_plugin_builtin::background_jobs::register_into(&mut r)?;
+        r.commit_to_registry()?;
+    }
+
+    // CustomPlugin — apoc.custom-style meta-plugin always-on. Exposes
+    // `uni.plugin.declareFunction/Procedure/Aggregate/Trigger` plus
+    // `listDeclared` / `dropDeclared`. The plugin holds a shared
+    // `Arc<PluginRegistry>` so its declare* procedures can register
+    // new scalar functions at runtime; persistence rides through
+    // `SystemLabelPersistence` (M11 A.2) when the instance has a
+    // local data directory, else `NullPersistence` (in-memory /
+    // object-store-backed instances).
+    let (persistence, cypher_sink) = crate::persistence::persistence_for_data_path(data_path);
+    {
+        let synthesizer: Arc<dyn uni_plugin_custom::ProcedureBodySynthesizer> =
+            Arc::new(crate::synthetic_procedure::CypherProcedureSynthesizer::new());
+        let plugin = uni_plugin_custom::CustomPlugin::new(Arc::clone(registry), persistence)
+            .map_err(|e| uni_plugin::PluginError::internal(format!("uni-plugin-custom: {e}")))?
+            .with_procedure_synthesizer(synthesizer);
+        plugin.reactivate_into_registry().map_err(|e| {
+            uni_plugin::PluginError::internal(format!("uni-plugin-custom reactivate: {e}"))
+        })?;
+        let manifest = plugin.manifest();
+        let caps = manifest.capabilities.clone();
+        let mut r = PluginRegistrar::new(manifest.id.clone(), &caps, registry);
+        plugin.register(&mut r)?;
+        r.commit_to_registry()?;
+    }
+
+    Ok(cypher_sink)
+}
+
 /// Shared inner state of a Uni database instance.
 ///
 /// Wrapped in `Arc` by [`Uni`] so that [`Session`](session::Session) and
 /// [`Transaction`](transaction::Transaction) can hold cheap, owned references
 /// without lifetime parameters.
+/// One live entry in the `UniInner::active_connectors` map.
+///
+/// Holds the `Arc<dyn Connector>` so the trait object outlives the
+/// plugin-registry snapshot it was started from, the underlying
+/// plugin-reported `ConnectorHandle` for the eventual `stop()`
+/// dispatch, and the protocol name for diagnostics / `Uni::active_connectors`.
+#[derive(Clone)]
+#[doc(hidden)]
+pub struct ActiveConnector {
+    /// Protocol name (`"bolt"`, `"graphql"`, …).
+    pub protocol: String,
+    /// Connector handle as returned by the plugin's `start()` —
+    /// passed back to `Connector::stop()` verbatim.
+    pub handle: uni_plugin::traits::connector::ConnectorHandle,
+    /// Connector trait object kept alive for the lifecycle.
+    pub connector: Arc<dyn uni_plugin::traits::connector::Connector>,
+}
+
+impl std::fmt::Debug for ActiveConnector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActiveConnector")
+            .field("protocol", &self.protocol)
+            .field("handle", &self.handle)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A live plugin entry tracked by `UniInner.plugins`.
+///
+/// Holds the installed plugin object, the lifecycle handle the reload
+/// driver advances through `Active → Draining → Removed`, and the
+/// monotonic `generation` exposed via [`uni_plugin::PluginHandle`]. The
+/// `generation` is bumped on every successful reload so handles handed
+/// to callers identify the *epoch* of the plugin, not just its id.
+#[derive(Clone)]
+pub struct UniPluginEntry {
+    /// The installed plugin object (Arc-shared so `shutdown()` can run
+    /// after the registry has dropped its references).
+    pub plugin: Arc<dyn uni_plugin::Plugin>,
+    /// Shared lifecycle handle the `EpochFencedReload` driver advances.
+    pub lifecycle: Arc<uni_plugin::lifecycle::PluginLifecycle>,
+    /// Monotonic generation counter; bumped per successful reload.
+    pub generation: u64,
+}
+
+impl std::fmt::Debug for UniPluginEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UniPluginEntry")
+            .field("plugin_id", &self.lifecycle.plugin())
+            .field("state", &self.lifecycle.state())
+            .field("generation", &self.generation)
+            .finish()
+    }
+}
+
 /// Shared inner state of a Uni database instance. Not intended for direct use.
 #[doc(hidden)]
 pub struct UniInner {
@@ -74,6 +305,33 @@ pub struct UniInner {
     pub(crate) xervo_runtime: Option<Arc<ModelRuntime>>,
     pub(crate) config: UniConfig,
     pub(crate) procedure_registry: Arc<uni_query::ProcedureRegistry>,
+    /// Framework-wide plugin registry — `BuiltinPlugin` and (optionally)
+    /// `ApocCorePlugin` register here at construction time. The
+    /// `procedure_registry` holds an `Arc` of this same registry so
+    /// `CALL` dispatch can resolve plugin-registered procedures.
+    pub(crate) plugin_registry: Arc<uni_plugin::PluginRegistry>,
+    /// Per-installed-plugin lifecycle bookkeeping for M10 reload.
+    ///
+    /// Keyed by [`uni_plugin::PluginId`]. The value holds a clone of the
+    /// installed plugin object (so `shutdown()` runs on removal), the
+    /// shared [`uni_plugin::lifecycle::PluginLifecycle`] handle the
+    /// `EpochFencedReload` driver advances, and the monotonic generation
+    /// counter exposed through [`uni_plugin::PluginHandle::generation`].
+    ///
+    /// Shared by `Arc` across `at_snapshot` / `at_fork` clones because
+    /// the underlying `plugin_registry` is shared too — reloading a
+    /// plugin on any session must be observable to siblings.
+    pub(crate) plugins: Arc<parking_lot::RwLock<HashMap<uni_plugin::PluginId, UniPluginEntry>>>,
+    /// In-memory deferral queue for `TriggerOutcome::Defer` (M11 v1).
+    /// Persistent backing is `TODO(M11-persist)`. The background tick
+    /// task spawned in `Uni::build` drives this queue; the trigger
+    /// router pushes to it on `Defer`.
+    pub(crate) defer_queue: Arc<crate::api::triggers::DeferralQueue>,
+    /// M11 background-job scheduler host. Owns the
+    /// [`uni_plugin::scheduler::Scheduler`] primitive that the
+    /// `uni.periodic.*` procedures register jobs against. Driver task
+    /// is tracked by the shared [`Self::shutdown_handle`].
+    pub(crate) scheduler_host: Arc<crate::scheduler::SchedulerHost>,
     pub(crate) shutdown_handle: Arc<ShutdownHandle>,
     /// Global registry of pre-compiled Locy rules.
     ///
@@ -126,6 +384,21 @@ pub struct UniInner {
     /// typed `UniError::ForkInflightTx` instead of letting the drop
     /// proceed and silently discard the work.
     pub(crate) inflight_tx_count: Arc<AtomicUsize>,
+    /// M6a.3 — registry of active connector lifecycles.
+    ///
+    /// Map key is the `ConnectorHandle.0` returned by
+    /// `Connector::start`. The value carries the protocol name (so
+    /// `stop_connector` can dispatch back to the right
+    /// `Connector::stop` impl) and a shared `Arc<dyn Connector>` so
+    /// the connector trait object stays alive for the duration of
+    /// the lifecycle even if the plugin registry is later swapped
+    /// (the current `PluginRegistry::connectors` returns an `Arc`
+    /// snapshot, so this is mostly belt-and-braces).
+    pub(crate) active_connectors: Arc<DashMap<u64, ActiveConnector>>,
+    /// M6a.3 — monotonically increasing id used to disambiguate
+    /// `ConnectorHandle`s when a plugin returns id=0 for every
+    /// `start` (the trait doesn't require unique ids).
+    pub(crate) next_connector_seq: AtomicU64,
     /// Phase 2 Day 8 cache: same-fork-name `Session::fork(name)` calls
     /// share the same `Arc<UniInner>` so sibling sessions on the same
     /// fork see each other's commits without flushing through Lance
@@ -269,6 +542,18 @@ fn build_executor_template(
 }
 
 impl UniInner {
+    /// Build a [`uni_bulk::BulkBackend`] handle bundle from this inner's
+    /// fields for the bulk-write driver (`bulk_writer`/`appender`).
+    pub(crate) fn bulk_backend(self: &Arc<Self>) -> uni_bulk::BulkBackend {
+        uni_bulk::BulkBackend {
+            storage: self.storage.clone(),
+            writer: self.writer.clone(),
+            schema: self.schema.clone(),
+            shutdown: self.shutdown_handle.clone(),
+            config: self.config.clone(),
+        }
+    }
+
     /// Open a point-in-time view of the database at the given snapshot.
     ///
     /// Returns a new `UniInner` that is pinned to the specified snapshot state.
@@ -283,10 +568,11 @@ impl UniInner {
 
         let pinned_storage = Arc::new(self.storage.pinned(manifest));
 
-        let prop_manager = Arc::new(PropertyManager::new(
+        let prop_manager = Arc::new(PropertyManager::with_plugin_registry(
             pinned_storage.clone(),
             self.schema.clone(),
             self.properties.cache_size(),
+            self.plugin_registry.clone(),
         ));
 
         let shutdown_handle = Arc::new(ShutdownHandle::new(Duration::from_secs(30)));
@@ -309,6 +595,10 @@ impl UniInner {
             xervo_runtime: self.xervo_runtime.clone(),
             config: self.config.clone(),
             procedure_registry: self.procedure_registry.clone(),
+            plugin_registry: self.plugin_registry.clone(),
+            plugins: self.plugins.clone(),
+            defer_queue: self.defer_queue.clone(),
+            scheduler_host: Arc::clone(&self.scheduler_host),
             shutdown_handle,
             locy_rule_registry: Arc::new(std::sync::RwLock::new(
                 impl_locy::LocyRuleRegistry::default(),
@@ -325,6 +615,8 @@ impl UniInner {
             fork_registry: self.fork_registry.clone(),
             fork_inners: self.fork_inners.clone(),
             inflight_tx_count: Arc::new(AtomicUsize::new(0)),
+            active_connectors: Arc::new(DashMap::new()),
+            next_connector_seq: AtomicU64::new(1),
             cached_l0_mutation_count: AtomicUsize::new(0),
             cached_l0_estimated_size: AtomicUsize::new(0),
             cached_wal_lsn: AtomicU64::new(0),
@@ -364,10 +656,11 @@ impl UniInner {
                 .at_fork_with_schema(scope.clone(), merged_schema.clone()),
         );
 
-        let prop_manager = Arc::new(PropertyManager::new(
+        let prop_manager = Arc::new(PropertyManager::with_plugin_registry(
             forked_storage.clone(),
             merged_schema.clone(),
             self.properties.cache_size(),
+            self.plugin_registry.clone(),
         ));
 
         let shutdown_handle = Arc::new(ShutdownHandle::new(Duration::from_secs(30)));
@@ -435,6 +728,10 @@ impl UniInner {
             xervo_runtime: self.xervo_runtime.clone(),
             config: self.config.clone(),
             procedure_registry: self.procedure_registry.clone(),
+            plugin_registry: self.plugin_registry.clone(),
+            plugins: self.plugins.clone(),
+            defer_queue: self.defer_queue.clone(),
+            scheduler_host: Arc::clone(&self.scheduler_host),
             shutdown_handle,
             locy_rule_registry: rule_registry,
             start_time: Instant::now(),
@@ -449,6 +746,8 @@ impl UniInner {
             fork_registry: self.fork_registry.clone(),
             fork_inners: self.fork_inners.clone(),
             inflight_tx_count: Arc::new(AtomicUsize::new(0)),
+            active_connectors: Arc::new(DashMap::new()),
+            next_connector_seq: AtomicU64::new(1),
             cached_l0_mutation_count: AtomicUsize::new(0),
             cached_l0_estimated_size: AtomicUsize::new(0),
             cached_wal_lsn: AtomicU64::new(0),
@@ -458,6 +757,77 @@ impl UniInner {
 }
 
 impl Uni {
+    /// Borrow this instance's background-job scheduler host.
+    ///
+    /// The host owns a [`uni_plugin::scheduler::Scheduler`] primitive
+    /// driven by a tokio loop spawned at `Uni::build` time. The
+    /// preferred Rust entry point is [`Uni::periodic_schedule`], which
+    /// routes through the host's `SchedulerControl` impl so the
+    /// schedule kind is captured by the durable persistence backend
+    /// and survives restart:
+    ///
+    /// ```no_run
+    /// # async fn ex(db: uni_db::Uni) {
+    /// use std::time::Duration;
+    /// use uni_plugin::QName;
+    /// use uni_plugin::traits::background::Schedule;
+    ///
+    /// db.periodic_schedule(
+    ///     QName::new("myorg", "nightly"),
+    ///     Schedule::Periodic(Duration::from_secs(86_400)),
+    /// );
+    /// # }
+    /// ```
+    ///
+    /// The job's [`BackgroundJobProvider`](
+    /// uni_plugin::traits::background::BackgroundJobProvider) must
+    /// have been registered into the [`uni_plugin::PluginRegistry`]
+    /// (via `PluginRegistrar::background_job`) before its qname can
+    /// be scheduled.
+    #[must_use]
+    pub fn scheduler_host(&self) -> &Arc<crate::scheduler::SchedulerHost> {
+        &self.inner.scheduler_host
+    }
+
+    /// Register a background job to fire on `schedule`.
+    ///
+    /// This is the Rust analogue of `CALL uni.periodic.schedule(...)`
+    /// — the Cypher wrapper procedure registers via this same path.
+    /// The job's [`BackgroundJobProvider`](
+    /// uni_plugin::traits::background::BackgroundJobProvider) must
+    /// already be registered in the [`uni_plugin::PluginRegistry`]
+    /// (via `PluginRegistrar::background_job` during plugin
+    /// registration); otherwise the scheduler driver logs a warning
+    /// on each tick that `id` is due.
+    pub fn periodic_schedule(
+        &self,
+        id: uni_plugin::QName,
+        schedule: uni_plugin::traits::background::Schedule,
+    ) {
+        // Route through the `SchedulerHost`'s `SchedulerControl` impl
+        // (not the bare `Scheduler`) so the persistence layer captures
+        // the schedule kind for restart durability.
+        <crate::scheduler::SchedulerHost as uni_plugin::scheduler::SchedulerControl>::add_scheduled_job(
+            &self.inner.scheduler_host,
+            id,
+            schedule,
+        );
+    }
+
+    /// Cancel a scheduled job. Returns `true` if a job with this id
+    /// was registered; `false` otherwise. Rust analogue of
+    /// `CALL uni.periodic.cancel(...)`.
+    pub fn periodic_cancel(&self, id: &uni_plugin::QName) -> bool {
+        self.inner.scheduler_host.scheduler().cancel(id)
+    }
+
+    /// Snapshot every known job and its current lifecycle state.
+    /// Rust analogue of `CALL uni.periodic.list()`.
+    #[must_use]
+    pub fn periodic_list(&self) -> Vec<uni_plugin::scheduler::SchedulerJobRecord> {
+        self.inner.scheduler_host.scheduler().list()
+    }
+
     /// Open or create a database at the given path.
     ///
     /// If the database does not exist, it will be created.
@@ -526,6 +896,67 @@ impl Uni {
     /// ```
     pub fn session(&self) -> session::Session {
         session::Session::new(self.inner.clone())
+    }
+
+    /// Open a session authenticated as the given credentials (M5i).
+    ///
+    /// Iterates the registered [`uni_plugin::traits::connector::AuthProvider`]s
+    /// in registration order; the first provider whose `scheme()`
+    /// matches the credential type is asked to `authenticate`. On
+    /// success, the resulting [`uni_plugin::traits::connector::Principal`]
+    /// is attached to the session and propagates into downstream
+    /// authorization checks.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UniError::AuthenticationFailed`] when no registered
+    /// provider matches the credential scheme or the matched
+    /// provider's `authenticate` returned an error.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use uni_plugin::traits::connector::Credentials;
+    /// let creds = Credentials::Basic {
+    ///     username: "alice".into(),
+    ///     password: "hunter2".into(),
+    /// };
+    /// let session = db.session_with_credentials(creds)?;
+    /// ```
+    pub fn session_with_credentials(
+        &self,
+        creds: uni_plugin::traits::connector::Credentials,
+    ) -> Result<session::Session> {
+        let scheme = match &creds {
+            uni_plugin::traits::connector::Credentials::Basic { .. } => "basic",
+            uni_plugin::traits::connector::Credentials::Bearer(_) => "bearer",
+            uni_plugin::traits::connector::Credentials::MtlsCert(_) => "mtls",
+        };
+        let providers = self.inner.plugin_registry.auth_providers();
+        let matching: Vec<_> = providers.iter().filter(|p| p.scheme() == scheme).collect();
+        if matching.is_empty() {
+            return Err(UniError::AuthenticationFailed {
+                reason: format!("no AuthProvider registered for scheme `{scheme}`"),
+            });
+        }
+        // Try each matching provider in registration order; succeed
+        // on the first one that authenticates. This lets a host stack
+        // its own provider alongside the built-in one — either may
+        // hold the credentials.
+        let mut last_error: Option<String> = None;
+        for provider in matching {
+            match provider.authenticate(&creds) {
+                Ok(principal) => {
+                    return Ok(self.session().with_principal(Arc::new(principal)));
+                }
+                Err(e) => {
+                    last_error = Some(e.0);
+                }
+            }
+        }
+        Err(UniError::AuthenticationFailed {
+            reason: last_error.unwrap_or_else(|| "all matching providers rejected".to_owned()),
+        })
     }
 
     /// List every active fork on this database.
@@ -940,20 +1371,19 @@ impl Uni {
         // bulk_insert_* fail mid-flight.
         let primary_schema = self.inner.schema.schema();
         for pat in patterns {
-            match pat {
-                fork_diff::PromotePattern::Vertex { label, .. } => {
-                    if !primary_schema.labels.contains_key(label) {
-                        return Err(UniError::LabelNotFound {
-                            label: label.clone(),
-                        });
-                    }
+            if pat.is_edge() {
+                let edge_type = pat.edge_type_name();
+                if !primary_schema.edge_types.contains_key(edge_type) {
+                    return Err(UniError::EdgeTypeNotFound {
+                        edge_type: edge_type.to_string(),
+                    });
                 }
-                fork_diff::PromotePattern::Edge { edge_type, .. } => {
-                    if !primary_schema.edge_types.contains_key(edge_type) {
-                        return Err(UniError::EdgeTypeNotFound {
-                            edge_type: edge_type.clone(),
-                        });
-                    }
+            } else {
+                let label = pat.label_name();
+                if !primary_schema.labels.contains_key(label) {
+                    return Err(UniError::LabelNotFound {
+                        label: label.to_string(),
+                    });
                 }
             }
         }
@@ -1131,6 +1561,660 @@ impl Uni {
     #[doc(hidden)]
     pub fn procedure_registry(&self) -> &Arc<uni_query::ProcedureRegistry> {
         &self.inner.procedure_registry
+    }
+
+    /// Returns the framework-wide [`uni_plugin::PluginRegistry`].
+    ///
+    /// Built once at `Uni::build()` time and populated with `BuiltinPlugin`
+    /// (always) and `ApocCorePlugin` (when the `apoc-core` feature is on).
+    /// Future user plugins added via [`Uni::add_plugin`] register into the
+    /// same instance.
+    pub fn plugin_registry(&self) -> &Arc<uni_plugin::PluginRegistry> {
+        &self.inner.plugin_registry
+    }
+
+    /// Install a user plugin into this database's [`uni_plugin::PluginRegistry`].
+    ///
+    /// Runs the standard registrar dance: clone the plugin's
+    /// [`uni_plugin::PluginManifest`], build a [`uni_plugin::PluginRegistrar`] scoped
+    /// to the manifest's capability set, invoke
+    /// [`uni_plugin::Plugin::register`], and commit the pending
+    /// registrations atomically.
+    ///
+    /// This is the recommended replacement for the deprecated
+    /// `Session::add_hook` / `Uni::add_hook` legacy API: callers wrap
+    /// their legacy [`crate::api::hooks::SessionHook`] in a
+    /// [`crate::api::hooks::BuiltinHookPlugin`] and pass it here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UniError::InvalidArgument`] if the plugin's
+    /// `register()` fails or any pending registration collides with an
+    /// existing qname.
+    pub fn add_plugin<P: uni_plugin::Plugin>(&self, plugin: P) -> Result<()> {
+        use uni_plugin::PluginRegistrar;
+        use uni_plugin::lifecycle::{LifecycleState, PluginLifecycle};
+
+        let plugin: Arc<dyn uni_plugin::Plugin> = Arc::new(plugin);
+        let manifest = plugin.manifest();
+        let plugin_id = manifest.id.clone();
+        let caps = manifest.capabilities.clone();
+        let mut r = PluginRegistrar::new(plugin_id.clone(), &caps, &self.inner.plugin_registry);
+        plugin.register(&mut r).map_err(plugin_err_to_uni)?;
+        r.commit_to_registry().map_err(plugin_err_to_uni)?;
+
+        // Lifecycle: Loaded → Linked → Initialized → Active.
+        let lifecycle = Arc::new(PluginLifecycle::new(plugin_id.clone()));
+        lifecycle.set(LifecycleState::Active);
+        self.inner.plugins.write().insert(
+            plugin_id,
+            UniPluginEntry {
+                plugin,
+                lifecycle,
+                generation: 0,
+            },
+        );
+        Ok(())
+    }
+
+    /// Snapshot every installed plugin's id, handle, and current state.
+    ///
+    /// Returns a vector ordered by the order plugins were inserted into
+    /// the host's internal map (note: iteration order across the map is
+    /// not stable across reloads — callers needing stable ordering
+    /// should sort on `PluginId`).
+    pub fn plugins(
+        &self,
+    ) -> Vec<(
+        uni_plugin::PluginId,
+        uni_plugin::PluginHandle,
+        uni_plugin::lifecycle::LifecycleState,
+    )> {
+        self.inner
+            .plugins
+            .read()
+            .iter()
+            .map(|(id, entry)| {
+                let handle = uni_plugin::PluginHandle::new(id.clone(), entry.generation);
+                (id.clone(), handle, entry.lifecycle.state())
+            })
+            .collect()
+    }
+
+    /// Look up a plugin handle by id.
+    ///
+    /// Returns `None` when the id is not installed (or has been removed
+    /// via [`Self::remove_plugin`]).
+    #[must_use]
+    pub fn plugin(&self, id: &uni_plugin::PluginId) -> Option<uni_plugin::PluginHandle> {
+        self.inner
+            .plugins
+            .read()
+            .get(id)
+            .map(|entry| uni_plugin::PluginHandle::new(id.clone(), entry.generation))
+    }
+
+    /// Remove an installed plugin, draining in-flight references first.
+    ///
+    /// Implements the §11.2 cutover for the removal direction: snapshot
+    /// the old plugin's per-kind state, evict its registry footprint,
+    /// drive `EpochFencedReload::begin_drain → wait_for_drain →
+    /// finalize`, then run the plugin's `shutdown()` callback and drop
+    /// the entry.
+    ///
+    /// # Errors
+    ///
+    /// - [`UniError::InvalidArgument`] if the handle's id is not
+    ///   installed or the generation does not match (stale handle).
+    /// - [`UniError::Internal`] if the drain times out (default 30 s).
+    pub fn remove_plugin(&self, handle: &uni_plugin::PluginHandle) -> Result<()> {
+        let _outcome = self.reload_internal(handle, None)?;
+        Ok(())
+    }
+
+    /// Reload a plugin, swapping in a new instance under the same id.
+    ///
+    /// Implements the §11.2 epoch-fenced cutover. Drains in-flight
+    /// references to the old instance, runs the per-kind reload
+    /// discipline (CRDT schema-compat check, logical-type contract
+    /// check), evicts the old registry footprint, runs the new
+    /// plugin's `register()` + `init()`, and bumps the handle's
+    /// generation counter on success.
+    ///
+    /// # Errors
+    ///
+    /// - [`UniError::InvalidArgument`] if the handle is stale or the
+    ///   id is not installed.
+    /// - [`UniError::InvalidArgument`] if a per-kind compat check or
+    ///   the new plugin's `register()` rejects the swap (the old
+    ///   plugin remains installed and active on rejection).
+    pub fn reload<P: uni_plugin::Plugin>(
+        &self,
+        handle: &uni_plugin::PluginHandle,
+        new_plugin: P,
+    ) -> Result<uni_plugin::PluginHandle> {
+        let new_arc: Arc<dyn uni_plugin::Plugin> = Arc::new(new_plugin);
+        self.reload_internal(handle, Some(new_arc))
+    }
+
+    fn reload_internal(
+        &self,
+        handle: &uni_plugin::PluginHandle,
+        new_plugin: Option<Arc<dyn uni_plugin::Plugin>>,
+    ) -> Result<uni_plugin::PluginHandle> {
+        use uni_plugin::PluginRegistrar;
+        use uni_plugin::lifecycle::{EpochFencedReload, LifecycleState, PluginLifecycle};
+        use uni_plugin::reload::{OldProviders, ReloadDispatcher};
+
+        let plugin_id = handle.id.clone();
+
+        // Step 1: validate handle + extract the live plugin / lifecycle /
+        // generation. We do **not** keep a clone of the entry around —
+        // the only `Arc<PluginLifecycle>` clones we want at drain time
+        // are (a) the driver's and (b) whichever in-flight captures
+        // still hold one. Holding extra clones here would inflate the
+        // strong-count and force the drain wait to time out.
+        let (old_plugin, old_lifecycle, old_generation) = {
+            let map = self.inner.plugins.read();
+            let entry = map
+                .get(&plugin_id)
+                .ok_or_else(|| UniError::InvalidArgument {
+                    arg: "handle".to_owned(),
+                    message: format!("plugin {plugin_id} not installed"),
+                })?;
+            if entry.generation != handle.generation {
+                return Err(UniError::InvalidArgument {
+                    arg: "handle".to_owned(),
+                    message: format!(
+                        "stale handle for plugin {plugin_id}: expected generation {}, got {}",
+                        entry.generation, handle.generation
+                    ),
+                });
+            }
+            (
+                Arc::clone(&entry.plugin),
+                Arc::clone(&entry.lifecycle),
+                entry.generation,
+            )
+        };
+
+        // Step 2: snapshot the per-kind providers the old plugin owned
+        // for the dispatcher's schema-compat check.
+        let snapshot = self
+            .inner
+            .plugin_registry
+            .iter_for_plugin(&plugin_id)
+            .unwrap_or_default();
+        let mut old_providers = OldProviders::default();
+        for kind in &snapshot.crdt_kinds {
+            if let Some(p) = self.inner.plugin_registry.crdt_kind(kind) {
+                old_providers.crdt_kinds.insert(kind.clone(), p);
+            }
+        }
+
+        // Step 3: begin drain on the old lifecycle.
+        let driver = EpochFencedReload::new(Arc::clone(&old_lifecycle));
+        driver
+            .begin_drain()
+            .map_err(|e| UniError::Internal(anyhow::anyhow!("reload drain begin: {e}")))?;
+
+        // Step 4: evict the old plugin's registry footprint.
+        self.inner.plugin_registry.remove_plugin(&plugin_id);
+
+        // Step 5: if reloading, run the new plugin's registrar dance.
+        if let Some(new) = new_plugin.as_ref() {
+            let manifest = new.manifest();
+            if manifest.id != plugin_id {
+                let _ = self.replay_register_for(&old_plugin);
+                old_lifecycle.set(LifecycleState::Active);
+                return Err(UniError::InvalidArgument {
+                    arg: "new_plugin".to_owned(),
+                    message: format!(
+                        "reload plugin id mismatch: handle is {plugin_id}, new plugin id is {}",
+                        manifest.id
+                    ),
+                });
+            }
+            let caps = manifest.capabilities.clone();
+            let mut r = PluginRegistrar::new(plugin_id.clone(), &caps, &self.inner.plugin_registry);
+            new.register(&mut r).map_err(plugin_err_to_uni)?;
+            r.commit_to_registry().map_err(plugin_err_to_uni)?;
+
+            // Step 6: per-kind compat checks on the now-committed new
+            // registry. Compat failures abort by re-replaying the old
+            // plugin's registrations.
+            let dispatcher = ReloadDispatcher::new(&snapshot, &self.inner.plugin_registry);
+            if let Err(e) = dispatcher.check_compat(&old_providers) {
+                self.inner.plugin_registry.remove_plugin(&plugin_id);
+                let _ = self.replay_register_for(&old_plugin);
+                old_lifecycle.set(LifecycleState::Active);
+                return Err(UniError::InvalidArgument {
+                    arg: "new_plugin".to_owned(),
+                    message: format!("reload compat-check rejected: {e}"),
+                });
+            }
+        }
+
+        // Step 7: replace (or remove) the host's `plugins` map entry
+        // **before** the drain wait so the map's `Arc<PluginLifecycle>`
+        // is no longer counted. After this, the only lifecycle Arcs
+        // outstanding from the host should be: (a) the driver's `old`
+        // ref, (b) our local `old_lifecycle`, plus any in-flight
+        // captures. Threshold=2 lets the wait succeed as soon as no
+        // in-flight capture survives.
+        let new_handle = {
+            let mut map = self.inner.plugins.write();
+            if let Some(new) = new_plugin.clone() {
+                let new_lifecycle = Arc::new(PluginLifecycle::new(plugin_id.clone()));
+                new_lifecycle.set(LifecycleState::Active);
+                let new_generation = old_generation.wrapping_add(1);
+                map.insert(
+                    plugin_id.clone(),
+                    UniPluginEntry {
+                        plugin: new,
+                        lifecycle: new_lifecycle,
+                        generation: new_generation,
+                    },
+                );
+                uni_plugin::PluginHandle::new(plugin_id.clone(), new_generation)
+            } else {
+                map.remove(&plugin_id);
+                uni_plugin::PluginHandle::new(plugin_id.clone(), old_generation)
+            }
+        };
+
+        // Step 8: wait for in-flight references to drain. Threshold 2
+        // accounts for the driver's own `old` Arc plus our local
+        // `old_lifecycle`. If captures outlast the wait, surface a
+        // warning but proceed — the new plugin is already live in the
+        // registry.
+        if let Err(e) = driver.wait_for_drain(
+            2,
+            std::time::Duration::from_millis(10),
+            std::time::Duration::from_secs(30),
+        ) {
+            tracing::warn!(
+                plugin_id = %plugin_id,
+                error = %e,
+                "reload drain wait timed out; proceeding with cutover"
+            );
+        }
+        driver.finalize();
+
+        // Step 9: run shutdown on the old plugin object after the
+        // drain. Safe to call even if other Arcs outlive us because
+        // shutdown is on `&self` and `Plugin: Send + Sync`.
+        old_plugin.shutdown();
+
+        Ok(new_handle)
+    }
+
+    /// Re-run the registrar dance for the given plugin object.
+    ///
+    /// Used as a best-effort rollback when [`Self::reload_internal`]
+    /// rejects a reload after evicting the old plugin's registry
+    /// footprint.
+    fn replay_register_for(
+        &self,
+        plugin: &Arc<dyn uni_plugin::Plugin>,
+    ) -> std::result::Result<(), UniError> {
+        use uni_plugin::PluginRegistrar;
+        let manifest = plugin.manifest();
+        let caps = manifest.capabilities.clone();
+        let mut r = PluginRegistrar::new(manifest.id.clone(), &caps, &self.inner.plugin_registry);
+        plugin.register(&mut r).map_err(plugin_err_to_uni)?;
+        r.commit_to_registry().map_err(plugin_err_to_uni)?;
+        Ok(())
+    }
+
+    /// Load an Extism-shaped WASM plugin from raw bytes.
+    ///
+    /// The two-pass dance defined by
+    /// [`uni_plugin_extism::ExtismLoader::load`] is executed against the
+    /// database's plugin registry: the plugin's `manifest` export is
+    /// read, declared capabilities are intersected with `host_grants`,
+    /// and the plugin's `register` export is consulted to surface every
+    /// qname through an Extism-backed adapter.
+    ///
+    /// `registrar_caps` is the [`uni_plugin::CapabilitySet`] the
+    /// inner [`uni_plugin::PluginRegistrar`] runs under — it gates
+    /// **which surfaces** the plugin may register (e.g.,
+    /// [`uni_plugin::Capability::ScalarFn`]). It must include every
+    /// surface kind a plugin entry will use, or registration will
+    /// fail with [`uni_plugin::PluginError::CapabilityRequired`].
+    ///
+    /// `host_grants` is the list of capability **names** (strings) the
+    /// host grants the plugin for **host-fn access** (e.g.,
+    /// `"Filesystem"`, `"Network"`). The set is intersected with the
+    /// plugin manifest's declared capabilities to compute the
+    /// effective grant set; only host fns whose
+    /// `required_capability` is in that set become part of the plugin's
+    /// import table.
+    ///
+    /// # Errors
+    ///
+    /// Wraps [`uni_plugin_extism::ExtismError`] in
+    /// [`UniError::InvalidArgument`] for plugin-side faults and
+    /// [`UniError::Internal`] for host-side faults.
+    ///
+    /// # Feature
+    ///
+    /// Requires the `extism-plugins` feature.
+    #[cfg(feature = "extism-plugins")]
+    pub fn load_wasm_extism(
+        &self,
+        loader: &uni_plugin_extism::ExtismLoader,
+        bytes: &[u8],
+        host_grants: &[String],
+        registrar_caps: &uni_plugin::CapabilitySet,
+    ) -> Result<uni_plugin_extism::loader::LoadOutcome> {
+        use uni_plugin::{PluginId, PluginRegistrar};
+        // Construct the registrar under a *placeholder* plugin id; the
+        // loader rewrites the real id from the manifest into the
+        // returned LoadOutcome. We need a non-empty placeholder because
+        // QName::namespace() comparisons in `validate_qname` require a
+        // non-builtin namespace; we let the registrar accept any qname
+        // by leaning on `validate_qname`'s `is_builtin` short-circuit
+        // (M6a.2 expands this with a per-plugin namespace gate).
+        let placeholder = PluginId::new("extism.loading");
+        let mut r = PluginRegistrar::new(placeholder, registrar_caps, &self.inner.plugin_registry);
+        let outcome = loader
+            .load(bytes, host_grants, &mut r)
+            .map_err(|e| match e {
+                uni_plugin_extism::ExtismError::Instantiate(m)
+                | uni_plugin_extism::ExtismError::InvalidPlugin(m)
+                | uni_plugin_extism::ExtismError::ManifestInvalid(m)
+                | uni_plugin_extism::ExtismError::OutputDecode(m) => UniError::InvalidArgument {
+                    arg: "bytes".to_owned(),
+                    message: format!("extism plugin: {m}"),
+                },
+                other => UniError::Internal(anyhow::anyhow!(other.to_string())),
+            })?;
+        r.commit_to_registry().map_err(plugin_err_to_uni)?;
+        Ok(outcome)
+    }
+
+    /// Load a Component Model WASM plugin from raw bytes.
+    ///
+    /// The two-pass dance defined by
+    /// [`uni_plugin_wasm::WasmLoader::load`] is executed against the
+    /// database's plugin registry: the plugin's `manifest` export is
+    /// called, declared capabilities are intersected with `host_grants`,
+    /// and the plugin's `register` export is consulted to surface every
+    /// qname through a Component Model-backed adapter.
+    ///
+    /// `registrar_caps` gates which **surfaces** the plugin may
+    /// register; `host_grants` gates which **host fns** become part of
+    /// the plugin's import table (per-major Linker absence for
+    /// capabilities outside the grant set — structural enforcement,
+    /// proposal §5.6.2).
+    ///
+    /// # Errors
+    ///
+    /// Wraps [`uni_plugin_wasm::WasmError`] in
+    /// [`UniError::InvalidArgument`] for plugin-side faults
+    /// (invalid wasm, missing required exports, manifest parse) and
+    /// [`UniError::Internal`] for host-side faults.
+    ///
+    /// # Feature
+    ///
+    /// Requires the `wasm-plugins` feature.
+    #[cfg(feature = "wasm-plugins")]
+    pub fn load_wasm_component(
+        &self,
+        loader: &uni_plugin_wasm::WasmLoader,
+        bytes: &[u8],
+        host_grants: &[String],
+        registrar_caps: &uni_plugin::CapabilitySet,
+    ) -> Result<uni_plugin_wasm::loader::LoadOutcome> {
+        use uni_plugin::{PluginId, PluginRegistrar};
+        let placeholder = PluginId::new("wasm.loading");
+        let mut r = PluginRegistrar::new(placeholder, registrar_caps, &self.inner.plugin_registry);
+        let outcome = loader
+            .load(bytes, host_grants, &mut r)
+            .map_err(|e| match e {
+                uni_plugin_wasm::WasmError::Instantiate(m)
+                | uni_plugin_wasm::WasmError::InvalidWasm(m)
+                | uni_plugin_wasm::WasmError::ResourceLimit(m) => UniError::InvalidArgument {
+                    arg: "bytes".to_owned(),
+                    message: format!("wasm component: {m}"),
+                },
+                uni_plugin_wasm::WasmError::MissingCapability { import } => {
+                    UniError::InvalidArgument {
+                        arg: "host_grants".to_owned(),
+                        message: format!("plugin imports `{import}` but capability not granted"),
+                    }
+                }
+                other => UniError::Internal(anyhow::anyhow!(other.to_string())),
+            })?;
+        r.commit_to_registry().map_err(plugin_err_to_uni)?;
+        Ok(outcome)
+    }
+
+    /// Load a Rhai-script plugin from source text.
+    ///
+    /// Rhai is a pure-Rust embedded scripting language; no WASM wrapper,
+    /// no C toolchain. The Rhai engine is sandboxed by language design —
+    /// scripts have no built-in I/O, every effectful operation comes
+    /// from a host-registered function. The loader's three-phase shape
+    /// mirrors `Self::load_wasm_extism`: read the script's
+    /// `uni_manifest()` to discover declared entries, intersect declared
+    /// capabilities with `registrar_caps`, then register each entry on
+    /// the inner [`uni_plugin::PluginRegistrar`] as a Rhai-backed
+    /// adapter.
+    ///
+    /// `registrar_caps` is **both** the registration gate (it must
+    /// include `Capability::ScalarFn`/`AggregateFn`/`Procedure` matching
+    /// the script's entries) **and** the host-fn grant set (host fns
+    /// like `uni_fs_read` are only registered on the engine if the
+    /// matching `Capability::Filesystem` etc. is present). Rhai's
+    /// capability-enforcement layer 2 is *Engine-import absence* —
+    /// ungranted host fns are not registered, so any call to them
+    /// fails at parse-resolution with `ErrorFunctionNotFound`.
+    ///
+    /// # Errors
+    ///
+    /// Wraps [`uni_plugin_rhai::RhaiError`] in
+    /// [`UniError::InvalidArgument`] for plugin-side faults and
+    /// [`UniError::Internal`] for host-side faults.
+    ///
+    /// # Feature
+    ///
+    /// Requires the `rhai-plugins` feature (on by default).
+    #[cfg(feature = "rhai-plugins")]
+    pub fn load_rhai_plugin(
+        &self,
+        loader: &uni_plugin_rhai::RhaiLoader,
+        script: &str,
+        registrar_caps: &uni_plugin::CapabilitySet,
+    ) -> Result<uni_plugin_rhai::LoadOutcome> {
+        use uni_plugin::{PluginId, PluginRegistrar};
+        let placeholder = PluginId::new("rhai.loading");
+        let mut r = PluginRegistrar::new(placeholder, registrar_caps, &self.inner.plugin_registry);
+        let outcome = loader
+            .load(script, &mut r, registrar_caps)
+            .map_err(|e| match e {
+                uni_plugin_rhai::RhaiError::ParseFailed(m) => UniError::InvalidArgument {
+                    arg: "script".to_owned(),
+                    message: format!("rhai parse: {m}"),
+                },
+                uni_plugin_rhai::RhaiError::InvalidPlugin(m)
+                | uni_plugin_rhai::RhaiError::ManifestInvalid(m)
+                | uni_plugin_rhai::RhaiError::Conversion(m)
+                | uni_plugin_rhai::RhaiError::RuntimeError(m) => UniError::InvalidArgument {
+                    arg: "script".to_owned(),
+                    message: format!("rhai plugin: {m}"),
+                },
+                other => UniError::Internal(anyhow::anyhow!(other.to_string())),
+            })?;
+        r.commit_to_registry().map_err(plugin_err_to_uni)?;
+        Ok(outcome)
+    }
+
+    /// Load a PyO3 (Python source) plugin into this Uni instance.
+    ///
+    /// The supplied [`PyPluginLoader`](uni_plugin_pyo3::PythonPluginLoader)
+    /// holds the loader's default plugin id (used when the module
+    /// doesn't call `db.set_plugin_id(...)`). `module_src` is Python
+    /// source code; `module_name` is the simulated `__name__`. The
+    /// loader executes the source against a fresh module namespace
+    /// that includes a `_uni_decorator_sink` / `db` global; each
+    /// `@db.scalar_fn(...)` / `@db.aggregate_fn(...)` / `@db.procedure(...)`
+    /// decorator records into a builder and the loader drains it on
+    /// completion. Scalar / aggregate / procedure adapters are pushed
+    /// onto a fresh [`PluginRegistrar`](uni_plugin::PluginRegistrar)
+    /// and committed atomically.
+    ///
+    /// **M8 scope:** the plugin is added to the *instance* registry.
+    /// Session-scoped registration (proposal §5.4.2 default) is the
+    /// `M8-followup.session-scope` work item; until then, callers that
+    /// want session-scoped behavior should drop the plugin on session
+    /// drop themselves via `Uni::remove_plugin`.
+    ///
+    /// # Errors
+    ///
+    /// - [`UniError::InvalidArgument`] for plugin-side faults (parse,
+    ///   manifest, unknown type name).
+    /// - [`UniError::Internal`] for host-side faults.
+    ///
+    /// # Feature
+    ///
+    /// Requires the `pyo3-plugins` feature.
+    #[cfg(feature = "pyo3-plugins")]
+    pub fn load_python_plugin(
+        &self,
+        py: pyo3::Python<'_>,
+        loader: &uni_plugin_pyo3::PythonPluginLoader,
+        module_src: &str,
+        module_name: &str,
+        registrar_caps: &uni_plugin::CapabilitySet,
+    ) -> Result<uni_plugin_pyo3::LoadOutcome> {
+        use uni_plugin::{PluginId, PluginRegistrar};
+        let placeholder = PluginId::new("pyo3.loading");
+        let mut r = PluginRegistrar::new(placeholder, registrar_caps, &self.inner.plugin_registry);
+        let outcome = loader
+            .load(py, module_src, module_name, &mut r, registrar_caps)
+            .map_err(|e| match e {
+                uni_plugin_pyo3::PyPluginError::PythonException {
+                    qname,
+                    message,
+                    traceback,
+                } => UniError::InvalidArgument {
+                    arg: "module_src".to_owned(),
+                    message: format!("python exception in {qname}: {message}\n{traceback}"),
+                },
+                uni_plugin_pyo3::PyPluginError::ManifestInvalid(m) => UniError::InvalidArgument {
+                    arg: "module_src".to_owned(),
+                    message: format!("python plugin manifest: {m}"),
+                },
+                uni_plugin_pyo3::PyPluginError::ArrowConversion(m) => UniError::InvalidArgument {
+                    arg: "module_src".to_owned(),
+                    message: format!("python plugin arrow conversion: {m}"),
+                },
+                other => UniError::Internal(anyhow::anyhow!(other.to_string())),
+            })?;
+        r.commit_to_registry().map_err(plugin_err_to_uni)?;
+        Ok(outcome)
+    }
+
+    // ── Connector lifecycle (M6a.3) ─────────────────────────────────
+
+    /// Start a registered wire-protocol connector.
+    ///
+    /// Looks up the first [`Connector`] in the plugin registry whose
+    /// `protocol()` matches `protocol`, calls its `start(cfg)` with the
+    /// supplied configuration, and records the returned handle so that
+    /// [`Self::stop_connector`] can later route to the right `stop()`.
+    /// The returned `u64` is a host-side handle that disambiguates
+    /// connectors that all return the same plugin-side
+    /// `ConnectorHandle(0)`; pass it back to [`Self::stop_connector`]
+    /// to shut the connector down.
+    ///
+    /// # Errors
+    ///
+    /// - [`UniError::NotFound`] if no registered connector advertises
+    ///   `protocol`.
+    /// - [`UniError::Internal`] (wrapping the connector's `FnError`) if
+    ///   `Connector::start` itself fails.
+    ///
+    /// [`Connector`]: uni_plugin::traits::connector::Connector
+    pub fn start_connector(
+        &self,
+        protocol: &str,
+        config: uni_plugin::traits::connector::ConnectorConfig,
+    ) -> Result<u64> {
+        let connectors = self.inner.plugin_registry.connectors();
+        let connector = connectors
+            .iter()
+            .find(|c| c.protocol() == protocol)
+            .ok_or_else(|| UniError::InvalidArgument {
+                arg: "protocol".to_owned(),
+                message: format!("no connector registered for protocol `{protocol}`"),
+            })?;
+        let plugin_handle = connector.start(config).map_err(|e| {
+            UniError::Internal(anyhow::anyhow!(
+                "connector `{protocol}` start failed (code={}): {}",
+                e.code,
+                e.message
+            ))
+        })?;
+        let host_handle = self.inner.next_connector_seq.fetch_add(1, Ordering::SeqCst);
+        self.inner.active_connectors.insert(
+            host_handle,
+            ActiveConnector {
+                protocol: protocol.to_owned(),
+                handle: plugin_handle,
+                connector: Arc::clone(connector),
+            },
+        );
+        Ok(host_handle)
+    }
+
+    /// Stop a previously-started connector by its host handle.
+    ///
+    /// Removes the connector from the active map and calls
+    /// `Connector::stop()` on the trait object recorded at start time.
+    /// Stopping a handle that was never recorded — or that was already
+    /// stopped — returns [`UniError::NotFound`].
+    ///
+    /// # Errors
+    ///
+    /// - [`UniError::NotFound`] if `host_handle` does not name an
+    ///   active connector.
+    /// - [`UniError::Internal`] (wrapping the connector's `FnError`)
+    ///   if `Connector::stop` itself fails. The entry is removed from
+    ///   the active map regardless — `stop` is expected to be
+    ///   idempotent host-side.
+    pub fn stop_connector(&self, host_handle: u64) -> Result<()> {
+        let (_, active) = self
+            .inner
+            .active_connectors
+            .remove(&host_handle)
+            .ok_or_else(|| UniError::InvalidArgument {
+                arg: "host_handle".to_owned(),
+                message: format!("no active connector with handle {host_handle}"),
+            })?;
+        active.connector.stop(active.handle).map_err(|e| {
+            UniError::Internal(anyhow::anyhow!(
+                "connector `{}` stop failed (code={}): {}",
+                active.protocol,
+                e.code,
+                e.message
+            ))
+        })
+    }
+
+    /// Snapshot the active-connector map for diagnostics.
+    ///
+    /// Returns `(host_handle, protocol)` pairs for every connector
+    /// currently running on this `Uni` instance. Order is unspecified.
+    #[must_use]
+    pub fn active_connectors(&self) -> Vec<(u64, String)> {
+        self.inner
+            .active_connectors
+            .iter()
+            .map(|kv| (*kv.key(), kv.value().protocol.clone()))
+            .collect()
     }
 
     /// Get schema manager.
@@ -1883,13 +2967,35 @@ impl UniBuilder {
             .start_background_compaction(shutdown_handle.subscribe());
         shutdown_handle.track_task(compaction_handle);
 
+        // Plugin registry is built early so `PropertyManager` can
+        // share it for registry-dispatched CRDT merges. Built-ins are
+        // registered against this same Arc below; the registry is
+        // shared by-reference, so the registrations are visible to
+        // every later consumer.
+        let plugin_registry = Arc::new(uni_plugin::PluginRegistry::new());
+        // M11 A.2: pass the data directory so `SystemLabelPersistence`
+        // can be wired as the meta-plugin persistence backend. Remote /
+        // object-store URIs (those containing "://") have no local
+        // sidecar root — for those, persistence falls back to
+        // `NullPersistence`.
+        let persistence_data_path: Option<std::path::PathBuf> = if is_remote_uri {
+            None
+        } else {
+            Some(std::path::PathBuf::from(&uri))
+        };
+        let custom_persistence_sink =
+            register_builtin_plugins(&plugin_registry, persistence_data_path.as_deref()).expect(
+                "BuiltinPlugin / ApocCorePlugin registration must succeed against fresh registry",
+            );
+
         // Initialize property manager
         let prop_cache_capacity = self.config.cache_size / 1024;
 
-        let prop_manager = Arc::new(PropertyManager::new(
+        let prop_manager = Arc::new(PropertyManager::with_plugin_registry(
             storage.clone(),
             schema_manager.clone(),
             prop_cache_capacity,
+            plugin_registry.clone(),
         ));
 
         // Setup stores for WAL and IdAllocator (needed for version recovery check)
@@ -2250,7 +3356,13 @@ impl UniBuilder {
             Arc::new(ctx)
         };
 
+        // (The framework-wide plugin registry was built earlier in
+        // this function so `PropertyManager` could share it for
+        // registry-dispatched CRDT merges. `register_builtin_plugins`
+        // already ran there.)
         let procedure_registry = Arc::new(uni_query::ProcedureRegistry::new());
+        procedure_registry.set_plugin_registry(Arc::clone(&plugin_registry));
+
         let executor_template = build_executor_template(
             storage.clone(),
             self.config.clone(),
@@ -2261,6 +3373,155 @@ impl UniBuilder {
             df_session_template.clone(),
         );
 
+        // M5i: start every registered Connector once at DB build.
+        // Failures log + continue — connectors are external wire
+        // protocols, not critical paths. Stop hooks fire from
+        // `Uni::shutdown`.
+        {
+            use uni_plugin::traits::connector::ConnectorConfig;
+            let connectors = plugin_registry.connectors();
+            for c in connectors.iter() {
+                let cfg = ConnectorConfig::default();
+                match c.start(cfg) {
+                    Ok(_handle) => {
+                        tracing::debug!(protocol = %c.protocol(), "Connector started");
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            protocol = %c.protocol(),
+                            error = %e,
+                            "Connector start failed; continuing without"
+                        );
+                    }
+                }
+            }
+        }
+
+        // M11 v1 + FU-5: spawn the deferral-queue tick task. When a
+        // local `data_path` is available, use the JSON-sidecar
+        // persistence backend (`<data_path>/_system/deferred_triggers.json`)
+        // so the queue survives restarts; otherwise fall back to the
+        // in-memory queue.
+        let defer_queue = match persistence_data_path.as_deref() {
+            Some(p) => crate::api::triggers::DeferralQueue::with_persistence(p.to_path_buf()),
+            None => crate::api::triggers::DeferralQueue::new(),
+        };
+        // FU-5: replay any persisted items now that triggers have been
+        // re-registered by `register_builtin_plugins` + user
+        // `add_plugin`s above this point.
+        let _restored = defer_queue.load_from_sidecar(&plugin_registry);
+
+        // FU-4: spawn the CDC runtime. Snapshots registered CDC
+        // providers, resumes each from its last persisted LSN, and
+        // forwards every commit notification as a `CdcBatch`.
+        let _cdc_runtime = crate::cdc_runtime::CdcRuntime::spawn(
+            &plugin_registry,
+            commit_tx.subscribe(),
+            persistence_data_path.clone(),
+            &shutdown_handle,
+        );
+        {
+            let queue = Arc::clone(&defer_queue);
+            let mut shutdown_rx = shutdown_handle.subscribe();
+            let handle = tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(std::time::Duration::from_millis(50));
+                loop {
+                    tokio::select! {
+                        _ = ticker.tick() => { queue.tick(); }
+                        _ = shutdown_rx.recv() => { break; }
+                    }
+                }
+            });
+            shutdown_handle.track_task(handle);
+        }
+
+        // M11: spawn the background-job scheduler driver. The driver
+        // polls `Scheduler::tick_at(now)` every
+        // `crate::scheduler::DEFAULT_TICK_INTERVAL`, looks up each due
+        // job's `BackgroundJobProvider` in the plugin registry, and
+        // dispatches it on `spawn_blocking`. Persistence defaults to
+        // `MemoryPersistence` until the durable
+        // `SystemLabelPersistence` (writes through
+        // `uni_system.background_jobs` via the write-enabled
+        // `execute_inner_query`) lands in `uni-query`.
+        //
+        // M11 A.3: the `SchedulerJobHost` is constructed with the
+        // storage manager now and the `UniInner` weak ref later
+        // (after the inner is wrapped in an Arc) so built-in jobs can
+        // reach host services via `JobContext::host`.
+        let scheduler_job_host = Arc::new(crate::scheduler::SchedulerJobHost::new(Arc::clone(
+            &storage,
+        )));
+        // M11 A.6: pick durable scheduler persistence when a
+        // local data directory is available; fall back to
+        // `MemoryPersistence` for remote / in-memory instances.
+        let (scheduler_persistence, scheduler_persist_sink) =
+            crate::scheduler_persistence::scheduler_persistence_for_data_path(
+                persistence_data_path.as_deref(),
+            );
+        let scheduler_host = crate::scheduler::SchedulerHost::spawn_with_job_host(
+            Arc::clone(&plugin_registry),
+            scheduler_persistence,
+            &shutdown_handle,
+            crate::scheduler::DEFAULT_TICK_INTERVAL,
+            Some(Arc::clone(&scheduler_job_host)),
+        );
+
+        // M11 B.5: register `uni.periodic.{schedule,cancel,list}`
+        // procedures with a `SchedulerControl` trait object pointing
+        // at the live scheduler. Registration happens after
+        // `SchedulerHost::spawn` so the procedures hold a handle to
+        // the actual scheduler the driver loop is polling.
+        {
+            use uni_plugin::{
+                AbiRange, Capability, CapabilitySet, Determinism, PluginId, PluginManifest,
+                PluginRegistrar, ProvidedSurfaces, Scope, SideEffects as PluginSideEffects,
+            };
+
+            // M11 A.2: hand the periodic procedures a control handle
+            // pointing at the host (not the bare `Scheduler` primitive)
+            // so `uni.periodic.submit` / `iterate` reach
+            // `JobHost::execute_write_cypher` via the
+            // `SchedulerHost::submit_cypher` override.
+            let scheduler_ctrl: Arc<dyn uni_plugin::scheduler::SchedulerControl> =
+                Arc::clone(&scheduler_host) as Arc<dyn uni_plugin::scheduler::SchedulerControl>;
+            let plugin_id = PluginId::new("uni");
+            let caps =
+                CapabilitySet::from_iter_of([Capability::Procedure, Capability::ProcedureWrites]);
+            let manifest = PluginManifest {
+                id: plugin_id.clone(),
+                version: env!("CARGO_PKG_VERSION")
+                    .parse()
+                    .unwrap_or_else(|_| "1.0.0".parse().expect("static version parses")),
+                abi: AbiRange::parse("^1").expect("manifest ABI range is valid"),
+                depends_on: vec![],
+                capabilities: caps.clone(),
+                determinism: Determinism::Pure,
+                side_effects: PluginSideEffects::Writes,
+                scope: Scope::Instance,
+                hash: None,
+                signature: None,
+                provides: ProvidedSurfaces::default(),
+                docs: "uni.periodic.* procedures (M11 B.5).".to_owned(),
+                metadata: std::collections::BTreeMap::new(),
+            };
+            // Apply the host's signature policy before activation. The
+            // built-in `uni` plugin ships unsigned today; the default
+            // `Disabled` policy accepts it. Embedders that opt into
+            // `RequireSigned` must also sign this manifest with a key
+            // in their trust root.
+            uni_plugin::verify::verify_manifest_with_policy(
+                &manifest,
+                &uni_plugin::verify::TrustRoot::new(),
+                uni_plugin::verify::SignaturePolicy::default(),
+            )
+            .expect("builtin uni manifest must pass the default Disabled policy");
+            let mut r = PluginRegistrar::new(plugin_id, &caps, &plugin_registry);
+            uni_plugin_builtin::procedures::periodic::register_into(&mut r, scheduler_ctrl)
+                .expect("uni.periodic.* registration");
+            r.commit_to_registry().expect("uni.periodic.* commit");
+        }
+
         let db = Uni {
             inner: Arc::new(UniInner {
                 storage,
@@ -2270,6 +3531,10 @@ impl UniBuilder {
                 xervo_runtime,
                 config: self.config,
                 procedure_registry,
+                plugin_registry,
+                plugins: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+                defer_queue,
+                scheduler_host: Arc::clone(&scheduler_host),
                 shutdown_handle,
                 locy_rule_registry: Arc::new(std::sync::RwLock::new(
                     impl_locy::LocyRuleRegistry::default(),
@@ -2288,6 +3553,8 @@ impl UniBuilder {
                 fork_registry,
                 fork_inners: Arc::new(DashMap::new()),
                 inflight_tx_count: Arc::new(AtomicUsize::new(0)),
+                active_connectors: Arc::new(DashMap::new()),
+                next_connector_seq: AtomicU64::new(1),
                 cached_l0_mutation_count: AtomicUsize::new(0),
                 cached_l0_estimated_size: AtomicUsize::new(0),
                 cached_wal_lsn: AtomicU64::new(0),
@@ -2295,9 +3562,44 @@ impl UniBuilder {
             }),
         };
 
+        // The single `HostCypherExecutor` impl the moved plugin-host engines
+        // (scheduler job host + persistence sinks) call back through for
+        // write-mode Cypher (replaces the per-engine `Weak<UniInner>` they used
+        // to hold directly). The executor itself only weakly references
+        // `UniInner`, so the host ↔ engine cycle stays leak-free even though the
+        // engines hold a strong `Arc<dyn ...>`.
+        let host_cypher_exec: Arc<dyn uni_plugin_host::host::HostCypherExecutor> = Arc::new(
+            host_executor::UniInnerCypherExecutor::new(Arc::downgrade(&db.inner)),
+        );
+
+        // M11 A.3: wire the host Cypher executor into the scheduler's job host
+        // so built-in background jobs can reach the host for write-mode Cypher
+        // (ttl_sweep, etc.).
+        scheduler_job_host.set_host_executor(Arc::clone(&host_cypher_exec));
+
+        // M11 A.7: wire the executor into the meta-plugin persistence sink so
+        // subsequent `declareFunction` / `declareProcedure` calls dual-write
+        // into the `_DeclaredPlugin` graph label (in addition to the JSON
+        // sidecar source-of-truth).
+        if let Some(sink) = &custom_persistence_sink {
+            sink.set_host_executor(Arc::clone(&host_cypher_exec));
+        }
+        // M11 A.6: same lazy-wire pattern for the durable scheduler
+        // persistence sink (`_BackgroundJob` graph nodes).
+        if let Some(sink) = &scheduler_persist_sink {
+            sink.set_host_executor(Arc::clone(&host_cypher_exec));
+        }
+
         // Phase 4a: spawn the TTL sweeper (no-op when disabled).
-        if let Some(handle) = fork_sweeper::spawn(
-            db.inner.clone(),
+        //
+        // The host holds a `Weak<UniInner>` so the task does not extend the
+        // database's lifetime; the scheduling/shutdown loop lives in
+        // `uni_fork::maintenance`.
+        let sweeper_host = Arc::new(fork_maintenance::ForkMaintenanceHostImpl::new(
+            Arc::downgrade(&db.inner),
+        ));
+        if let Some(handle) = uni_fork::maintenance::spawn_sweeper(
+            sweeper_host,
             sweeper_interval,
             sweeper_disabled,
             sweeper_shutdown_rx,
@@ -2307,8 +3609,11 @@ impl UniBuilder {
 
         // Phase 5a-impl Step 7: spawn the fork index builder (no-op
         // when disabled).
-        if let Some(handle) = fork_index_builder::spawn(
-            db.inner.clone(),
+        let index_builder_host = Arc::new(fork_maintenance::ForkMaintenanceHostImpl::new(
+            Arc::downgrade(&db.inner),
+        ));
+        if let Some(handle) = uni_fork::maintenance::spawn_index_builder(
+            index_builder_host,
             index_builder_interval,
             index_builder_threshold,
             index_builder_disabled,

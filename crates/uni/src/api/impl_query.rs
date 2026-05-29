@@ -186,7 +186,8 @@ impl crate::api::UniInner {
     pub(crate) async fn explain_internal(&self, cypher: &str) -> Result<ExplainOutput> {
         let ast = uni_cypher::parse(cypher).map_err(into_parse_error)?;
 
-        let planner = uni_query::QueryPlanner::new(self.schema.schema().clone());
+        let planner = uni_query::QueryPlanner::new(self.schema.schema().clone())
+            .with_plugin_registry(Arc::clone(&self.plugin_registry));
         let logical_plan = planner.plan(ast).map_err(|e| into_query_error(e, cypher))?;
         // Phase 5a-impl: apply fork-aware fusion rewrite so explain
         // output reflects the operators the executor will actually
@@ -205,7 +206,8 @@ impl crate::api::UniInner {
     ) -> Result<(QueryResult, ProfileOutput)> {
         let ast = uni_cypher::parse(cypher).map_err(into_parse_error)?;
 
-        let planner = uni_query::QueryPlanner::new(self.schema.schema().clone());
+        let planner = uni_query::QueryPlanner::new(self.schema.schema().clone())
+            .with_plugin_registry(Arc::clone(&self.plugin_registry));
         let logical_plan = planner.plan(ast).map_err(|e| into_query_error(e, cypher))?;
         let logical_plan = uni_query::rewrite_for_fork_fusion(logical_plan, &*self.storage);
 
@@ -270,8 +272,9 @@ impl crate::api::UniInner {
     ) -> Result<QueryCursor> {
         let ast = uni_cypher::parse(cypher).map_err(into_parse_error)?;
 
-        let planner =
-            uni_query::QueryPlanner::new(self.schema.schema().clone()).with_params(params.clone());
+        let planner = uni_query::QueryPlanner::new(self.schema.schema().clone())
+            .with_params(params.clone())
+            .with_plugin_registry(Arc::clone(&self.plugin_registry));
         let logical_plan = planner.plan(ast).map_err(|e| into_query_error(e, cypher))?;
         let logical_plan = uni_query::rewrite_for_fork_fusion(logical_plan, &*self.storage);
 
@@ -404,7 +407,8 @@ impl crate::api::UniInner {
         let plan_start = Instant::now();
         let logical_plan = {
             let planner = uni_query::QueryPlanner::new(self.schema.schema().clone())
-                .with_params(params.clone());
+                .with_params(params.clone())
+                .with_plugin_registry(Arc::clone(&self.plugin_registry));
             let lp = planner.plan(ast).map_err(|e| into_query_error(e, cypher))?;
             uni_query::rewrite_for_fork_fusion(lp, &*self.storage)
         };
@@ -507,8 +511,9 @@ impl crate::api::UniInner {
             });
         }
 
-        let planner =
-            uni_query::QueryPlanner::new(self.schema.schema().clone()).with_params(params.clone());
+        let planner = uni_query::QueryPlanner::new(self.schema.schema().clone())
+            .with_params(params.clone())
+            .with_plugin_registry(Arc::clone(&self.plugin_registry));
         let logical_plan = planner.plan(ast).map_err(|e| into_query_error(e, cypher))?;
         let logical_plan = uni_query::rewrite_for_fork_fusion(logical_plan, &*self.storage);
 
@@ -768,8 +773,9 @@ impl crate::api::UniInner {
         let total_start = Instant::now();
 
         let plan_start = Instant::now();
-        let planner =
-            uni_query::QueryPlanner::new(self.schema.schema().clone()).with_params(params.clone());
+        let planner = uni_query::QueryPlanner::new(self.schema.schema().clone())
+            .with_params(params.clone())
+            .with_plugin_registry(Arc::clone(&self.plugin_registry));
         let logical_plan = planner.plan(ast).map_err(|e| into_query_error(e, cypher))?;
         let logical_plan = uni_query::rewrite_for_fork_fusion(logical_plan, &*self.storage);
         let plan_time = plan_start.elapsed();
@@ -853,8 +859,9 @@ impl crate::api::UniInner {
         let deadline = total_start + config.query_timeout;
 
         let plan_start = Instant::now();
-        let planner =
-            uni_query::QueryPlanner::new(self.schema.schema().clone()).with_params(params.clone());
+        let planner = uni_query::QueryPlanner::new(self.schema.schema().clone())
+            .with_params(params.clone())
+            .with_plugin_registry(Arc::clone(&self.plugin_registry));
         let logical_plan = planner.plan(ast).map_err(|e| into_query_error(e, cypher))?;
         let logical_plan = uni_query::rewrite_for_fork_fusion(logical_plan, &*self.storage);
         let plan_time = plan_start.elapsed();

@@ -23,8 +23,8 @@ impl GraphAlgoAdapter for GraphColoringAdapter {
         vec![("nodeId", ValueType::Int), ("color", ValueType::Int)]
     }
 
-    fn to_config(_args: Vec<Value>) -> GraphColoringConfig {
-        GraphColoringConfig {}
+    fn to_config(_args: Vec<Value>) -> Result<GraphColoringConfig> {
+        Ok(GraphColoringConfig {})
     }
 
     fn map_result(result: <Self::Algo as Algorithm>::Result) -> Result<Vec<AlgoResultRow>> {

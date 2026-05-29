@@ -1,0 +1,121 @@
+// uni-db plugin framework — Component Model worlds.
+//
+// One WIT package, multiple worlds. Each world describes one plugin
+// kind's typed contract. Per the proposal §6, every plugin world
+// shares:
+//
+//   - The `manifest` and `register` exports — JSON control surfaces
+//     read at load time so the host can negotiate capabilities.
+//   - An optional `host-log` import — always-available, used for
+//     plugin-side tracing.
+//   - Arrow IPC bytes as the columnar wire format. The IPC payload
+//     itself is opaque to WIT — we ship `list<u8>` across the boundary.
+//
+// M6b scope (the M6 closure): scalar, aggregate, procedure.
+// The remaining surfaces (storage/index/algo/hook/connector/...)
+// follow in later milestones as their host-side traits stabilize.
+
+package uni:plugin@0.1.0;
+
+interface types {
+    /// Per-call error returned by a plugin's work function.
+    ///
+    /// `code` is plugin-defined; framework codes occupy 0..=0xFF.
+    /// `message` is human-readable. `retryable` is a hint to the
+    /// host call-site dispatcher.
+    record fn-error {
+        code: u32,
+        message: string,
+        retryable: bool,
+    }
+}
+
+/// Always-available host imports.
+///
+/// `host-log` is the only universally-allowed host call. Other host
+/// functions (filesystem, network, KMS, …) live in capability-gated
+/// interfaces under `uni:plugin/host-fs`, `uni:plugin/host-net`, etc.
+/// Those interfaces are NOT declared here — the proposal calls for
+/// them to be added to the Linker by the host only when the matching
+/// capability has been granted, so a plugin that imports an absent
+/// interface fails at link time.
+interface host-log {
+    log: func(level: string, message: string);
+}
+
+/// Scalar plugin world.
+///
+/// Implements one or more Cypher scalar functions. The wire shape:
+///
+///   - `manifest` returns the plugin's canonical JSON manifest
+///     (id, version, declared capabilities).
+///   - `register` returns the JSON `RegistrationManifest`
+///     enumerating every qname the plugin provides plus its
+///     wire-level signature.
+///   - `invoke-scalar` takes `(qname, ipc-bytes)` and returns
+///     Arrow IPC stream bytes (one batch with one output column).
+world scalar-plugin {
+    use types.{fn-error};
+
+    import host-log;
+
+    export manifest: func() -> string;
+    export register: func() -> string;
+    export invoke-scalar: func(qname: string, ipc-bytes: list<u8>)
+        -> result<list<u8>, fn-error>;
+}
+
+/// Aggregate plugin world.
+///
+/// Implements one or more Cypher aggregate functions. State is opaque
+/// bytes; the host carries it as an Arrow `Binary` value between
+/// `agg-update` / `agg-merge` / `agg-evaluate` calls. The plugin owns
+/// the state's interpretation.
+///
+/// The aggregate ABI mirrors `uni_plugin_extism::adapter_aggregate`
+/// exactly so the cross-ABI parity test produces byte-identical state
+/// transitions for the same input.
+world aggregate-plugin {
+    use types.{fn-error};
+
+    import host-log;
+
+    export manifest: func() -> string;
+    export register: func() -> string;
+
+    /// Initial state for a fresh per-group accumulator.
+    export agg-new: func(qname: string) -> result<list<u8>, fn-error>;
+
+    /// Ingest `values-ipc` into the accumulator at `state`. Returns
+    /// the new state bytes.
+    export agg-update: func(qname: string, state: list<u8>, values-ipc: list<u8>)
+        -> result<list<u8>, fn-error>;
+
+    /// Merge `other-states-ipc` (an Arrow IPC stream with one
+    /// `Binary` column) into the accumulator at `state`.
+    export agg-merge: func(qname: string, state: list<u8>, other-states-ipc: list<u8>)
+        -> result<list<u8>, fn-error>;
+
+    /// Produce the final aggregate value as a 1-row × 1-col Arrow
+    /// IPC stream.
+    export agg-evaluate: func(qname: string, state: list<u8>)
+        -> result<list<u8>, fn-error>;
+}
+
+/// Procedure plugin world.
+///
+/// Implements one or more Cypher procedures. The plugin receives a
+/// 1-row argument batch and produces zero or more `yields`-shaped
+/// batches collected eagerly by the host (true streaming via
+/// host-yield is a future ABI extension).
+world procedure-plugin {
+    use types.{fn-error};
+
+    import host-log;
+
+    export manifest: func() -> string;
+    export register: func() -> string;
+    export invoke-procedure: func(qname: string, args-ipc: list<u8>)
+        -> result<list<u8>, fn-error>;
+}
+

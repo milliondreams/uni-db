@@ -242,6 +242,11 @@ pub fn register_cypher_udfs(ctx: &SessionContext) -> DFResult<()> {
 
 /// Register user-defined custom scalar functions from a [`crate::custom_functions::CustomFunctionRegistry`]
 /// as DataFusion UDFs on the given session context.
+///
+/// Legacy instance-scope path retained for the `CustomFunctionRegistry`
+/// shadow registry; the plugin-registry path
+/// (`register_plugin_scalar_udfs`, in the `uni-query` crate) is the
+/// forward direction.
 pub fn register_custom_udfs(
     ctx: &SessionContext,
     registry: &crate::custom_functions::CustomFunctionRegistry,

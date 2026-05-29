@@ -70,6 +70,100 @@ struct PendingEdgeSet {
     props: HashMap<String, Value>,
 }
 
+/// Refuse to mutate an ephemeral node (M5g / proposal §4.13.1).
+/// Ephemeral entities are return-only — `Vid::EPHEMERAL_BIT` is set on
+/// any id minted by `host.allocate_transient_id()`.
+fn reject_if_ephemeral_vid(vid: Vid) -> Result<()> {
+    if vid.is_ephemeral() {
+        return Err(anyhow::Error::from(
+            uni_common::UniError::EphemeralWriteAttempt {
+                kind: "node",
+                id: vid.transient_id().unwrap_or(vid.as_u64()),
+            },
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse to mutate an ephemeral edge (M5g / proposal §4.13.1).
+fn reject_if_ephemeral_eid(eid: Eid) -> Result<()> {
+    if eid.is_ephemeral() {
+        return Err(anyhow::Error::from(
+            uni_common::UniError::EphemeralWriteAttempt {
+                kind: "edge",
+                id: eid.transient_id().unwrap_or(eid.as_u64()),
+            },
+        ));
+    }
+    Ok(())
+}
+
+/// Reject a write whose target label is currently allocated as a
+/// virtual (catalog-backed) label.
+///
+/// Catalog tables are read-only from the host's perspective — there is
+/// no write-back path through `CatalogTable::scan` to the originating
+/// provider, so silently allowing SET/DELETE would leave ghosted state
+/// on the host side that diverges from the external catalog. The
+/// planner already rejects CREATE/MERGE on virtual labels via
+/// `Planner::reject_virtual_label_writes`; this helper is the
+/// equivalent gate on the runtime write path for SET-label-add and
+/// DELETE.
+///
+/// `op` names the offending operation for the error message (e.g.
+/// `"SET"`, `"DELETE"`).
+///
+/// # Errors
+///
+/// Returns an error if `registry` is `Some` and any name in `labels`
+/// is currently registered as a virtual label. Returns `Ok(())` when
+/// no plugin registry is wired (low-level callers without plugins).
+fn reject_virtual_label_write(
+    registry: Option<&Arc<uni_plugin::PluginRegistry>>,
+    labels: &[String],
+    op: &str,
+) -> Result<()> {
+    let Some(registry) = registry else {
+        return Ok(());
+    };
+    for label in labels {
+        if registry.virtual_label_by_name(label).is_some() {
+            return Err(anyhow!(
+                "Cannot {op} on virtual (catalog-resolved) label `{label}` — virtual \
+                 labels are read-only; write back via the originating catalog instead"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Reject a write whose target edge-type ID is currently allocated as
+/// a virtual (catalog-backed) edge type. Runtime analog of
+/// [`reject_virtual_label_write`] for the edge path.
+///
+/// # Errors
+///
+/// Returns an error if `registry` is `Some` and `edge_type_id` resolves
+/// to a registered virtual edge type. Returns `Ok(())` when no plugin
+/// registry is wired.
+fn reject_virtual_edge_type_write(
+    registry: Option<&Arc<uni_plugin::PluginRegistry>>,
+    edge_type_id: u32,
+    op: &str,
+) -> Result<()> {
+    let Some(registry) = registry else {
+        return Ok(());
+    };
+    if let Some(entry) = registry.virtual_edge_type_by_id(edge_type_id) {
+        return Err(anyhow!(
+            "Cannot {op} on virtual (catalog-resolved) edge type `{}` — virtual edge \
+             types are read-only; write back via the originating catalog instead",
+            entry.name
+        ));
+    }
+    Ok(())
+}
+
 impl Executor {
     /// Extracts labels from a node value.
     ///
@@ -181,13 +275,8 @@ impl Executor {
             Some(Value::Node(ref node)) => {
                 let vid = node.vid;
                 let labels = node.labels.clone();
-                let current = read_vertex_props_with_prefetch(
-                    vid,
-                    prefetched,
-                    prop_manager,
-                    ctx,
-                )
-                .await?;
+                let current =
+                    read_vertex_props_with_prefetch(vid, prefetched, prop_manager, ctx).await?;
                 let write_props = Self::merge_props(current, new_props, replace);
                 let mut enriched = write_props.clone();
                 for label_name in &labels {
@@ -211,13 +300,8 @@ impl Executor {
             Some(ref node_val) if Self::vid_from_value(node_val).is_ok() => {
                 let vid = Self::vid_from_value(node_val)?;
                 let labels = Self::extract_labels_from_node(node_val).unwrap_or_default();
-                let current = read_vertex_props_with_prefetch(
-                    vid,
-                    prefetched,
-                    prop_manager,
-                    ctx,
-                )
-                .await?;
+                let current =
+                    read_vertex_props_with_prefetch(vid, prefetched, prop_manager, ctx).await?;
                 let write_props = Self::merge_props(current, new_props, replace);
                 let mut enriched = write_props.clone();
                 for label_name in &labels {
@@ -1830,6 +1914,7 @@ impl Executor {
                         && let Some(node_val) = row.get(var_name)
                     {
                         if let Ok(vid) = Self::vid_from_value(node_val) {
+                            reject_if_ephemeral_vid(vid)?;
                             let labels =
                                 Self::extract_labels_from_node(node_val).unwrap_or_default();
                             let schema = self.storage.schema_manager().schema().clone();
@@ -1898,6 +1983,7 @@ impl Executor {
                                 || map.get("_type_name").is_some_and(|v| !v.is_null()))
                         {
                             let ei = self.extract_edge_identity(map)?;
+                            reject_if_ephemeral_eid(ei.eid)?;
                             let schema = self.storage.schema_manager().schema().clone();
                             // Handle _type as either String or Int (Int from CREATE, String
                             // from queries). UNWIND on VLP edge lists emits `_type_name`
@@ -1961,6 +2047,7 @@ impl Executor {
                             }
                         } else if let Value::Edge(edge) = node_val {
                             // Handle Value::Edge directly (when traverse returns Edge objects).
+                            reject_if_ephemeral_eid(edge.eid)?;
                             let eid = edge.eid;
                             let src = edge.src;
                             let dst = edge.dst;
@@ -2038,6 +2125,13 @@ impl Executor {
                     if let Some(node_val) = row.get(variable)
                         && let Ok(vid) = Self::vid_from_value(node_val)
                     {
+                        reject_if_ephemeral_vid(vid)?;
+                        let registry = self
+                            .procedure_registry
+                            .as_ref()
+                            .and_then(|pr| pr.plugin_registry());
+                        reject_virtual_label_write(registry.as_ref(), labels, "SET")?;
+
                         // Get current labels from node value
                         let current_labels =
                             Self::extract_labels_from_node(node_val).unwrap_or_default();
@@ -2336,13 +2430,8 @@ impl Executor {
 
             if let Ok(vid) = Self::vid_from_value(node_val) {
                 // Vertex property removal
-                let mut props = read_vertex_props_with_prefetch(
-                    vid,
-                    prefetched,
-                    prop_manager,
-                    ctx,
-                )
-                .await?;
+                let mut props =
+                    read_vertex_props_with_prefetch(vid, prefetched, prop_manager, ctx).await?;
 
                 // Only write back if at least one property actually exists
                 let removed_count = prop_names
@@ -2492,6 +2581,13 @@ impl Executor {
         if let Some(node_val) = row.get(variable)
             && let Ok(vid) = Self::vid_from_value(node_val)
         {
+            reject_if_ephemeral_vid(vid)?;
+            let registry = self
+                .procedure_registry
+                .as_ref()
+                .and_then(|pr| pr.plugin_registry());
+            reject_virtual_label_write(registry.as_ref(), labels, "REMOVE")?;
+
             // Get current labels from node value
             let current_labels = Self::extract_labels_from_node(node_val).unwrap_or_default();
 
@@ -2605,7 +2701,13 @@ impl Executor {
                     self.execute_delete_edge_from_map(map, writer, tx_l0)
                         .await?;
                 } else if let Value::Edge(edge) = val {
+                    reject_if_ephemeral_eid(edge.eid)?;
                     let etype = self.resolve_edge_type_id_for_edge(edge, writer, tx_l0)?;
+                    let registry = self
+                        .procedure_registry
+                        .as_ref()
+                        .and_then(|pr| pr.plugin_registry());
+                    reject_virtual_edge_type_write(registry.as_ref(), etype, "DELETE")?;
                     writer
                         .delete_edge(edge.eid, edge.src, edge.dst, etype, tx_l0)
                         .await?;
@@ -2624,6 +2726,14 @@ impl Executor {
         writer: &Writer,
         tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
     ) -> Result<()> {
+        reject_if_ephemeral_vid(vid)?;
+        if let Some(ls) = labels.as_deref() {
+            let registry = self
+                .procedure_registry
+                .as_ref()
+                .and_then(|pr| pr.plugin_registry());
+            reject_virtual_label_write(registry.as_ref(), ls, "DELETE")?;
+        }
         if detach {
             self.detach_delete_vertex(vid, writer, tx_l0).await?;
         } else {
@@ -2706,6 +2816,12 @@ impl Executor {
         // Check for non-null _eid to skip OPTIONAL MATCH null edges
         if map.get("_eid").is_some_and(|v| !v.is_null()) {
             let ei = self.extract_edge_identity(map)?;
+            reject_if_ephemeral_eid(ei.eid)?;
+            let registry = self
+                .procedure_registry
+                .as_ref()
+                .and_then(|pr| pr.plugin_registry());
+            reject_virtual_edge_type_write(registry.as_ref(), ei.edge_type_id, "DELETE")?;
             writer
                 .delete_edge(ei.eid, ei.src, ei.dst, ei.edge_type_id, tx_l0)
                 .await?;
@@ -3455,9 +3571,7 @@ pub(crate) async fn read_vertex_props_with_prefetch(
 ) -> Result<uni_common::Properties> {
     match prefetched.vertex.get(&vid).cloned() {
         Some(mut base) => {
-            if let Some(l0) =
-                uni_store::runtime::l0_visibility::accumulate_vertex_props(vid, ctx)
-            {
+            if let Some(l0) = uni_store::runtime::l0_visibility::accumulate_vertex_props(vid, ctx) {
                 for (k, v) in l0 {
                     base.insert(k, v);
                 }
@@ -3483,9 +3597,7 @@ pub(crate) async fn read_edge_props_with_prefetch(
 ) -> Result<uni_common::Properties> {
     match prefetched.edge.get(&eid).cloned() {
         Some(mut base) => {
-            if let Some(l0) =
-                uni_store::runtime::l0_visibility::accumulate_edge_props(eid, ctx)
-            {
+            if let Some(l0) = uni_store::runtime::l0_visibility::accumulate_edge_props(eid, ctx) {
                 for (k, v) in l0 {
                     base.insert(k, v);
                 }

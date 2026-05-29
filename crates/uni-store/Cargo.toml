@@ -15,6 +15,11 @@ lance-backend = ["dep:lance", "dep:lancedb", "dep:lance-index", "dep:lance-linal
 uni-common = { workspace = true }
 uni-btic = { workspace = true }
 uni-crdt = { workspace = true }
+# M10 follow-up: PropertyManager's CRDT merge funnel consults
+# `Crdt::merge_via_registry`, which requires a `PluginRegistry`
+# handle. uni-plugin → uni-store is a one-way edge (uni-plugin does
+# not depend on uni-store), so no cycle.
+uni-plugin = { path = "../uni-plugin", version = "1.8" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }

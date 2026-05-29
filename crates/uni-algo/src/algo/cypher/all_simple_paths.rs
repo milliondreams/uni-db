@@ -5,13 +5,13 @@
 
 use crate::algo::ProjectionBuilder;
 use crate::algo::algorithms::{Algorithm, AllSimplePaths, AllSimplePathsConfig};
+use crate::algo::procedure_template::parse_vid_arg;
 use crate::algo::procedures::{
     AlgoContext, AlgoProcedure, AlgoResultRow, ProcedureSignature, ValueType,
 };
 use anyhow::Result;
 use futures::stream::{self, BoxStream, StreamExt};
 use serde_json::{Value, json};
-use uni_common::core::id::Vid;
 
 pub struct AllSimplePathsProcedure;
 
@@ -33,7 +33,11 @@ impl AlgoProcedure for AllSimplePathsProcedure {
         }
     }
 
-    fn execute(
+    fn wants_native_terminals(&self) -> bool {
+        true
+    }
+
+    fn execute_with_native_terminals(
         &self,
         ctx: AlgoContext,
         args: Vec<Value>,
@@ -44,16 +48,15 @@ impl AlgoProcedure for AllSimplePathsProcedure {
             Err(e) => return stream::once(async { Err(e) }).boxed(),
         };
 
-        let start_vid_u64 = match &args[0] {
-            Value::String(s) => s.parse::<u64>().unwrap_or(0),
-            Value::Number(n) => n.as_u64().unwrap_or(0),
-            _ => return stream::once(async { Err(anyhow::anyhow!("Invalid start node")) }).boxed(),
+        // Previously these matches used `unwrap_or(0)`, which silently
+        // routed bad input to vertex 0 instead of failing.
+        let start_vid = match parse_vid_arg(&args[0], "startNode") {
+            Ok(v) => v,
+            Err(e) => return stream::once(async move { Err(e) }).boxed(),
         };
-
-        let end_vid_u64 = match &args[1] {
-            Value::String(s) => s.parse::<u64>().unwrap_or(0),
-            Value::Number(n) => n.as_u64().unwrap_or(0),
-            _ => return stream::once(async { Err(anyhow::anyhow!("Invalid end node")) }).boxed(),
+        let end_vid = match parse_vid_arg(&args[1], "endNode") {
+            Ok(v) => v,
+            Err(e) => return stream::once(async move { Err(e) }).boxed(),
         };
 
         let edge_types = args[2]
@@ -74,9 +77,6 @@ impl AlgoProcedure for AllSimplePathsProcedure {
                 .map(|v| v.as_str().unwrap().to_string())
                 .collect::<Vec<_>>()
         };
-
-        let start_vid = Vid::from(start_vid_u64);
-        let end_vid = Vid::from(end_vid_u64);
 
         let stream = async_stream::try_stream! {
             let schema = ctx.storage.schema_manager().schema();

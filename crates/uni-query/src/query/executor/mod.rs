@@ -10,7 +10,9 @@
 pub mod core;
 pub mod ddl_procedures;
 pub mod path_builder;
+pub mod plugin_adapter;
 pub mod procedure;
+pub mod procedure_host;
 pub mod read;
 pub mod result_normalizer;
 pub mod write;

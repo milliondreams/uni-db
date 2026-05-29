@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2024-2026 Dragonscale Team
+[package]
+name = "uni-fork"
+description = "Fork diff/promote engine and background maintenance tasks for uni-db"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+uni-common = { workspace = true }
+uni-store = { workspace = true }
+uni-query = { workspace = true }
+async-trait = { workspace = true }
+anyhow = { workspace = true }
+arrow-array = { workspace = true }
+futures = { workspace = true }
+chrono = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

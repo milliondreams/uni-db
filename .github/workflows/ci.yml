@@ -33,6 +33,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+          targets: wasm32-unknown-unknown, wasm32-wasip2
 
       - name: Install system dependencies
         run: |
@@ -75,10 +76,26 @@ jobs:
             --exclude uni-python-onnx-metal \
             --all-targets -- -D warnings
 
+      # The uni-plugin-extism / uni-plugin-wasm e2e tests load pre-built
+      # WASM plugin artifacts from the `examples/example-*-geo` crates
+      # (each its own workspace, built for wasm32 targets). They read the
+      # artifacts at runtime and panic if missing, so build them before
+      # the workspace test run. See scripts/build-wasm-fixtures.sh.
+      - name: Build WASM plugin fixtures
+        run: ./scripts/build-wasm-fixtures.sh
+
       - name: Run tests
+        # `uni-python` (bindings/uni-db) and `uni-python-onnx` are
+        # cdylib-only crates with zero Rust `#[test]` items — their tests
+        # are pytest in the python-tests job. We exclude them from the
+        # workspace cargo test because their `pyo3/extension-module` feature
+        # unifies with `uni-plugin-pyo3`'s test binaries and breaks the
+        # linker (no libpython linkage in extension-module mode).
         run: |
           cargo nextest run --workspace \
             --exclude uni-tck \
+            --exclude uni-python \
+            --exclude uni-python-onnx \
             --exclude uni-python-cuda \
             --exclude uni-python-metal \
             --exclude uni-python-onnx-cuda \
@@ -220,7 +237,9 @@ jobs:
 
       - name: Install Python dependencies (uni-db)
         working-directory: bindings/uni-db
-        run: uv sync --group dev
+        # `notebook-runtime` extra (numpy / pyarrow / onnxruntime) is
+        # required by the flagship Locy notebook verifier steps below.
+        run: uv sync --group dev --extra notebook-runtime
 
       - name: Build Python wheel (uni-db)
         working-directory: bindings/uni-db

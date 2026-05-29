@@ -5,11 +5,10 @@
 
 use crate::algo::ProjectionBuilder;
 use crate::algo::algorithms::{Algorithm, BellmanFord, BellmanFordConfig};
-use crate::algo::procedure_template::{GenericAlgoProcedure, GraphAlgoAdapter};
+use crate::algo::procedure_template::{GenericAlgoProcedure, GraphAlgoAdapter, parse_vid_arg};
 use crate::algo::procedures::{AlgoResultRow, ValueType};
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
-use uni_common::core::id::Vid;
 
 pub struct BellmanFordAdapter;
 
@@ -28,10 +27,10 @@ impl GraphAlgoAdapter for BellmanFordAdapter {
         vec![("nodeId", ValueType::Int), ("distance", ValueType::Float)]
     }
 
-    fn to_config(args: Vec<Value>) -> BellmanFordConfig {
-        BellmanFordConfig {
-            source: Vid::from(args[0].as_u64().unwrap_or(0)),
-        }
+    fn to_config(args: Vec<Value>) -> Result<BellmanFordConfig> {
+        Ok(BellmanFordConfig {
+            source: parse_vid_arg(&args[0], "sourceNode")?,
+        })
     }
 
     fn map_result(result: <Self::Algo as Algorithm>::Result) -> Result<Vec<AlgoResultRow>> {

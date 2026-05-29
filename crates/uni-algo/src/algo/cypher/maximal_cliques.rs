@@ -23,10 +23,10 @@ impl GraphAlgoAdapter for MaximalCliquesAdapter {
         vec![("clique", ValueType::List)]
     }
 
-    fn to_config(args: Vec<Value>) -> MaximalCliquesConfig {
-        MaximalCliquesConfig {
+    fn to_config(args: Vec<Value>) -> Result<MaximalCliquesConfig> {
+        Ok(MaximalCliquesConfig {
             min_size: args[0].as_u64().unwrap_or(2) as usize,
-        }
+        })
     }
 
     fn map_result(result: <Self::Algo as Algorithm>::Result) -> Result<Vec<AlgoResultRow>> {

@@ -26,8 +26,8 @@ impl GraphAlgoAdapter for TriangleCountAdapter {
         ]
     }
 
-    fn to_config(_args: Vec<Value>) -> TriangleCountConfig {
-        TriangleCountConfig
+    fn to_config(_args: Vec<Value>) -> Result<TriangleCountConfig> {
+        Ok(TriangleCountConfig)
     }
 
     fn map_result(result: <Self::Algo as Algorithm>::Result) -> Result<Vec<AlgoResultRow>> {

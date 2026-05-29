@@ -1,0 +1,77 @@
+[package]
+name = "uni-plugin"
+# Overrides the workspace version (1.3.0). uni-plugin grew an additive
+# ABI surface in v1.4.0 (phased context shape v1.1) and a Storage::fork
+# signature change in v1.5.0 (Lance fork wiring, M5a follow-up #3) and
+# an additive `OptimizerRuleProvider::physical_rule()` method in v1.7.0
+# (M5 Batch 2 follow-up #2 — physical-phase optimizer rule installation).
+# v1.7.1 adds an additive host-side `register_index_handle` /
+# `index_handle` / `deregister_index_handle` API for the IndexProbeExec
+# bridge (M5 Batch 2 follow-up #4). v1.8.0 (M5 Batch 3): procedures
+# become arity-overloaded — same QName may register multiple times with
+# distinct positional-argument counts (`procedure_with_arity`,
+# `procedure_overloads`); `AlgoProcedure` grows
+# `execute_with_projection`. See CHANGELOG.md.
+version = "1.8.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords = ["plugin", "extensibility", "graph", "database"]
+categories = ["database", "data-structures"]
+description = "Plugin framework for uni-db: registry, manifest, and capability traits"
+
+[dependencies]
+uni-common = { workspace = true }
+arrow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+datafusion = { workspace = true }
+arc-swap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+parking_lot = { workspace = true }
+futures = { workspace = true }
+# §1.2 / Phase 6: `tokio_util::sync::CancellationToken` replaces the hand-rolled
+# token previously in `traits/background.rs`.
+tokio-util = { workspace = true }
+# §1.2 / Phase 5: `host::principal::CURRENT_PRINCIPAL` lives here as a
+# `tokio::task_local!` so host-crate execute boundaries can install the
+# authenticated principal for plugin-procedure invocation sites to read.
+tokio = { workspace = true, features = ["rt", "macros"] }
+
+# Direct dependencies (not in workspace.dependencies)
+semver = { version = "1.0", features = ["serde"] }
+smol_str = { version = "0.3", features = ["serde"] }
+blake3 = "1.5"
+toml = "0.8"
+dashmap = "6.1"
+smallvec = { version = "1.13", features = ["serde"] }
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "fast"], optional = true }
+base64 = { version = "0.21", optional = true }
+# M11: cron-expression parsing for `Schedule::Cron(...)` background jobs.
+# Compute the next fire instant from a cron expression + current time.
+cron = "0.12"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+
+[features]
+default = ["ed25519"]
+# M11: real Ed25519 cryptographic verification of signed plugin manifests.
+# Default-on because plugin loading is a one-time cost where ~200μs
+# verify is negligible. Library embedders who don't need signed-manifest
+# verification can disable to drop the ~2 MB of ed25519-dalek +
+# curve25519-dalek + base64.
+ed25519 = ["dep:ed25519-dalek", "dep:base64"]
+
+[dev-dependencies]
+proptest = { workspace = true }
+serde_test = "1.0"
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "fast", "rand_core"] }
+rand = { workspace = true }
+base64 = "0.21"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

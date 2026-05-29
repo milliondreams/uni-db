@@ -618,7 +618,7 @@ fn is_aggregate_function_name(name: &str) -> bool {
             | "btic_max"
             | "btic_span_agg"
             | "btic_count_at"
-    )
+    ) || uni_cypher::is_known_plugin_aggregate(name)
 }
 
 /// Returns true if the expression is a window function (FunctionCall with window_spec).
@@ -1519,6 +1519,24 @@ fn reject_null_merge_properties(properties: &Option<Expr>) -> Result<()> {
     Ok(())
 }
 
+/// Flatten every label name appearing in a `Pattern` (across all paths
+/// and node elements). Used by the M5 follow-up #6 write-rejection
+/// guard to refuse CREATE/MERGE that names a virtual catalog-resolved
+/// label.
+fn collect_pattern_labels(pattern: &uni_cypher::ast::Pattern) -> Vec<String> {
+    let mut out = Vec::new();
+    for path in &pattern.paths {
+        for element in &path.elements {
+            if let PatternElement::Node(n) = element {
+                for l in n.labels.names() {
+                    out.push(l.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
 fn validate_merge_clause(merge_clause: &MergeClause, vars_in_scope: &[VariableInfo]) -> Result<()> {
     for path in &merge_clause.pattern.paths {
         for element in &path.elements {
@@ -2402,6 +2420,11 @@ pub struct QueryPlanner {
     anon_counter: std::sync::atomic::AtomicUsize,
     /// Optional query parameters for resolving $param in SKIP/LIMIT.
     params: HashMap<String, uni_common::Value>,
+    /// Optional plugin registry consulted when label / edge-type / identifier
+    /// resolution misses the local schema (M5b — Catalog / ReplacementScan).
+    plugin_registry: Option<Arc<uni_plugin::PluginRegistry>>,
+    /// Gate for replacement-scan dispatch on unknown identifiers (M5b).
+    replacement_scans_enabled: bool,
 }
 
 struct TraverseParams<'a> {
@@ -2436,6 +2459,8 @@ impl QueryPlanner {
             gen_expr_cache,
             anon_counter: std::sync::atomic::AtomicUsize::new(0),
             params: HashMap::new(),
+            plugin_registry: None,
+            replacement_scans_enabled: false,
         }
     }
 
@@ -2443,6 +2468,239 @@ impl QueryPlanner {
     pub fn with_params(mut self, params: HashMap<String, uni_common::Value>) -> Self {
         self.params = params;
         self
+    }
+
+    /// Attach a plugin registry for catalog / replacement-scan fallbacks
+    /// (M5b). When absent, label / edge-type resolution behaves exactly as
+    /// before; when present, an unknown label is offered to each
+    /// `CatalogProvider` before erroring.
+    #[must_use]
+    pub fn with_plugin_registry(mut self, registry: Arc<uni_plugin::PluginRegistry>) -> Self {
+        self.plugin_registry = Some(registry);
+        self
+    }
+
+    /// Enable replacement-scan dispatch on unknown identifiers (M5b §4.23).
+    /// Default off; opt-in only.
+    #[must_use]
+    pub fn with_replacement_scans(mut self, enabled: bool) -> Self {
+        self.replacement_scans_enabled = enabled;
+        self
+    }
+
+    /// Allocate (or look up) a virtual label ID for `name` by consulting
+    /// every registered `CatalogProvider` and then every registered
+    /// `ReplacementScanProvider` (only the latter when the replacement-
+    /// scan gate is on). On a first claim the catalog table is stashed
+    /// on the host's [`uni_plugin::PluginRegistry`] under a freshly
+    /// allocated virtual ID; subsequent calls with the same name return
+    /// the cached ID and refresh the stashed table.
+    ///
+    /// Returns `None` if no provider claims the label or no plugin
+    /// registry is attached. Returns `Some((id, table))` on a hit; the
+    /// `id` lies in `[VIRTUAL_LABEL_ID_START, VIRTUAL_LABEL_ID_SENTINEL)`.
+    /// Errors are surfaced as `Some(Err(_))`-equivalent via `Result`.
+    fn allocate_virtual_label(
+        &self,
+        name: &str,
+    ) -> Result<Option<(u16, Arc<dyn uni_plugin::traits::catalog::CatalogTable>)>> {
+        let Some(registry) = self.plugin_registry.as_ref() else {
+            return Ok(None);
+        };
+        // 1. CatalogProvider (always consulted, no gate — Batch 2 semantics).
+        let mut claimed: Option<Arc<dyn uni_plugin::traits::catalog::CatalogTable>> = None;
+        for cat in registry.catalogs() {
+            if let Some(t) = cat.resolve_label(name) {
+                claimed = Some(t);
+                break;
+            }
+        }
+        // 2. ReplacementScanProvider (gated). Only consult if no
+        //    CatalogProvider already claimed.
+        if claimed.is_none() {
+            use uni_plugin::traits::catalog::{Replacement, ReplacementRequest};
+            if let Some(Replacement::CatalogTable(t)) =
+                self.consult_replacement_scan(ReplacementRequest::Label(name))
+            {
+                claimed = Some(t);
+            }
+        }
+        let Some(table) = claimed else {
+            return Ok(None);
+        };
+        let id = registry
+            .register_virtual_label(name, Arc::clone(&table))
+            .map_err(|e| anyhow!("virtual label registration failed for `{name}`: {e}"))?;
+        Ok(Some((id, table)))
+    }
+
+    /// Reject any write operation that names a label currently allocated
+    /// as a virtual (catalog-backed) label. Catalog tables are read-only
+    /// in this milestone — there is no write-back path through
+    /// `CatalogTable::scan` to the originating provider, so silently
+    /// allowing the write would produce ghosted state on the host side
+    /// without affecting the external catalog. Errors with a clear,
+    /// actionable message.
+    fn reject_virtual_label_writes(&self, labels: &[String], op: &str) -> Result<()> {
+        let Some(registry) = self.plugin_registry.as_ref() else {
+            return Ok(());
+        };
+        for label in labels {
+            if registry.virtual_label_by_name(label).is_some() {
+                return Err(anyhow!(
+                    "Cannot {op} on virtual (catalog-resolved) label `{label}` — virtual \
+                     labels are read-only; write back via the originating catalog \
+                     instead"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Edge-type analog of [`Self::allocate_virtual_label`].
+    fn allocate_virtual_edge_type(
+        &self,
+        name: &str,
+    ) -> Result<Option<(u32, Arc<dyn uni_plugin::traits::catalog::CatalogTable>)>> {
+        let Some(registry) = self.plugin_registry.as_ref() else {
+            return Ok(None);
+        };
+        let mut claimed: Option<Arc<dyn uni_plugin::traits::catalog::CatalogTable>> = None;
+        for cat in registry.catalogs() {
+            if let Some(t) = cat.resolve_edge_type(name) {
+                claimed = Some(t);
+                break;
+            }
+        }
+        let Some(table) = claimed else {
+            return Ok(None);
+        };
+        let id = registry
+            .register_virtual_edge_type(name, Arc::clone(&table))
+            .map_err(|e| anyhow!("virtual edge-type registration failed for `{name}`: {e}"))?;
+        Ok(Some((id, table)))
+    }
+
+    /// Try to resolve an unknown identifier through replacement-scan providers
+    /// (gated by [`Self::with_replacement_scans`]). Returns the first
+    /// [`Replacement`] any registered provider produces, or `None` if the
+    /// gate is off, no registry is attached, or no provider claims the
+    /// identifier. First-match wins (mirrors DuckDB).
+    pub(crate) fn consult_replacement_scan(
+        &self,
+        request: uni_plugin::traits::catalog::ReplacementRequest<'_>,
+    ) -> Option<uni_plugin::traits::catalog::Replacement> {
+        if !self.replacement_scans_enabled {
+            return None;
+        }
+        let registry = self.plugin_registry.as_ref()?;
+        for r in registry.replacement_scans().iter() {
+            if let Some(replacement) = r.replace(&request) {
+                tracing::debug!(
+                    target: "uni.plugin.registry",
+                    ?request,
+                    ?replacement,
+                    "identifier resolved via ReplacementScanProvider"
+                );
+                return Some(replacement);
+            }
+        }
+        None
+    }
+
+    /// Resolve a user-typed procedure name against the attached plugin
+    /// registry, applying the same namespace-prefix rules as
+    /// `ProcedureRegistry::resolve_user_procedure` (host-coupled
+    /// procedure dispatch). Returns `true` if any namespace claims the
+    /// name. Used by the procedure-call replacement-scan gate to decide
+    /// whether to consult before substituting.
+    fn procedure_resolves(&self, user_name: &str) -> bool {
+        let Some(registry) = self.plugin_registry.as_ref() else {
+            return false;
+        };
+        if let Some((ns, local)) = user_name.split_once('.')
+            && registry
+                .procedure(&uni_plugin::QName::new(ns, local))
+                .is_some()
+        {
+            return true;
+        }
+        let stripped = user_name.strip_prefix("uni.").unwrap_or(user_name);
+        for plugin_id in ["uni", "builtin", "apoc-core", "custom"] {
+            if registry
+                .procedure(&uni_plugin::QName::new(plugin_id, stripped))
+                .is_some()
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Construct a [`uni_plugin::QName`] from a user-typed identifier for
+    /// passing to [`Replacement`]-scan providers. If the name is dotted,
+    /// the last segment is the local and the rest is the namespace
+    /// (mirroring `QName::parse`). Bare names — which Cypher allows for
+    /// procedures (`CALL foo()`) and functions (`RETURN foo(x)`) — are
+    /// encoded with the conventional `"user"` namespace; providers that
+    /// want to match a bare-typed name should inspect `.local()`.
+    fn qname_from_user(name: &str) -> uni_plugin::QName {
+        uni_plugin::QName::parse(name).unwrap_or_else(|_| uni_plugin::QName::new("user", name))
+    }
+
+    /// Apply `ReplacementScanProvider`-driven function rewrites to the
+    /// query's AST. When the gate is off or no registry is attached, the
+    /// walker is short-circuited and the query is returned unchanged.
+    /// Otherwise, every [`uni_cypher::ast::Expr::FunctionCall`] is offered
+    /// to registered providers (first-match wins); a returned
+    /// `Replacement::Function(new_qname)` substitutes the name in place.
+    /// Rewrite depth is capped at 1 — the rewritten name is NOT re-
+    /// consulted (a chained `A→B→A` provider therefore stops after the
+    /// first hop). Wrong-variant returns (`CatalogTable`, `Procedure`)
+    /// error immediately.
+    fn rewrite_function_calls_in_query(
+        &self,
+        query: uni_cypher::ast::Query,
+    ) -> Result<uni_cypher::ast::Query> {
+        if !self.replacement_scans_enabled || self.plugin_registry.is_none() {
+            return Ok(query);
+        }
+        let mut rename = |name: &str| -> Result<Option<String>> {
+            let qname = Self::qname_from_user(name);
+            use uni_plugin::traits::catalog::{Replacement, ReplacementRequest};
+            match self.consult_replacement_scan(ReplacementRequest::Function(&qname)) {
+                Some(Replacement::Function(new_qname)) => {
+                    // Cypher function-call dispatch is bare-name-keyed
+                    // (the per-category translators in `df_expr` match on
+                    // `name.to_uppercase()` against bare local strings —
+                    // "UPPER", "ABS", etc.). When the provider returns a
+                    // synthetic-namespace target (`builtin.*` or `user.*`),
+                    // strip the namespace so the AST name is what those
+                    // dispatchers expect; for plugin-namespaced targets,
+                    // preserve the full dotted form (matches how users
+                    // type them).
+                    let rewritten = match new_qname.namespace() {
+                        "builtin" | "user" => new_qname.local().to_string(),
+                        _ => new_qname.to_string(),
+                    };
+                    tracing::debug!(
+                        target: "uni.plugin.registry",
+                        from = %name,
+                        to = %rewritten,
+                        "function call rerouted via ReplacementScanProvider"
+                    );
+                    Ok(Some(rewritten))
+                }
+                Some(other) => Err(anyhow!(
+                    "ReplacementScanProvider returned wrong variant for Function \
+                     request `{}`: expected `Function`, got {:?}",
+                    name,
+                    other
+                )),
+                None => Ok(None),
+            }
+        };
+        crate::query::rewrite::function_rename::rewrite_function_calls_in_query(query, &mut rename)
     }
 
     /// Plan a Cypher query with no pre-bound variables.
@@ -2457,6 +2715,14 @@ impl QueryPlanner {
     pub fn plan_with_scope(&self, query: Query, vars: Vec<String>) -> Result<LogicalPlan> {
         // Apply query rewrites before planning
         let rewritten_query = crate::query::rewrite::rewrite_query(query)?;
+        // M5 follow-up #5: function-call rewrite via ReplacementScanProvider.
+        // Done as an AST pass *before* planning so the rewritten name flows
+        // through every downstream stage (translation, UDF resolution,
+        // execution) as if the user had typed it. No-op when the gate is
+        // off or no provider claims the call. First-match wins; hard-cap
+        // at one rewrite per call site (the rewritten name is NOT re-
+        // consulted) — see `rewrite_function_calls_in_query`.
+        let rewritten_query = self.rewrite_function_calls_in_query(rewritten_query)?;
         if Self::has_mixed_union_modes(&rewritten_query) {
             return Err(anyhow!(
                 "SyntaxError: InvalidClauseComposition - Cannot mix UNION and UNION ALL in the same query"
@@ -3114,8 +3380,58 @@ impl QueryPlanner {
                                     VariableType::Imported,
                                 )?;
                             }
+                            // M5 follow-up #5: if replacement-scan dispatch is
+                            // enabled and the procedure name does not resolve
+                            // against the plugin registry, consult registered
+                            // `ReplacementScanProvider`s. A `Replacement::Procedure`
+                            // substitutes the call's target name in the logical
+                            // plan; the rewritten name must itself resolve or
+                            // we error immediately (no second-tier consult — caps
+                            // rewrite depth at one).
+                            let procedure_name = if self.replacement_scans_enabled
+                                && !self.procedure_resolves(procedure)
+                            {
+                                use uni_plugin::traits::catalog::{
+                                    Replacement, ReplacementRequest,
+                                };
+                                let qname = Self::qname_from_user(procedure);
+                                match self
+                                    .consult_replacement_scan(ReplacementRequest::Procedure(&qname))
+                                {
+                                    Some(Replacement::Procedure(new_qname)) => {
+                                        let rewritten = new_qname.to_string();
+                                        if !self.procedure_resolves(&rewritten) {
+                                            return Err(anyhow!(
+                                                "ReplacementScanProvider rerouted procedure \
+                                                 `{}` to `{}`, which also did not resolve",
+                                                procedure,
+                                                rewritten
+                                            ));
+                                        }
+                                        tracing::debug!(
+                                            target: "uni.plugin.registry",
+                                            from = %procedure,
+                                            to = %rewritten,
+                                            "procedure rerouted via ReplacementScanProvider"
+                                        );
+                                        rewritten
+                                    }
+                                    Some(other) => {
+                                        return Err(anyhow!(
+                                            "ReplacementScanProvider returned wrong variant \
+                                             for Procedure request `{}`: expected \
+                                             `Procedure`, got {:?}",
+                                            procedure,
+                                            other
+                                        ));
+                                    }
+                                    None => procedure.clone(),
+                                }
+                            } else {
+                                procedure.clone()
+                            };
                             let proc_plan = LogicalPlan::ProcedureCall {
-                                procedure_name: procedure.clone(),
+                                procedure_name,
                                 arguments: arguments.clone(),
                                 yield_items: yields.clone(),
                             };
@@ -3162,6 +3478,10 @@ impl QueryPlanner {
                 }
                 Clause::Merge(merge_clause) => {
                     validate_merge_clause(&merge_clause, &vars_in_scope)?;
+                    // M5 follow-up #6: virtual (catalog-resolved) labels are
+                    // read-only — reject MERGE that names one.
+                    let merge_labels = collect_pattern_labels(&merge_clause.pattern);
+                    self.reject_virtual_label_writes(&merge_labels, "MERGE")?;
 
                     plan = LogicalPlan::Merge {
                         input: Box::new(plan),
@@ -3198,6 +3518,10 @@ impl QueryPlanner {
                     }
                 }
                 Clause::Create(create_clause) => {
+                    // M5 follow-up #6: virtual (catalog-resolved) labels are
+                    // read-only — reject CREATE that names one.
+                    let create_labels = collect_pattern_labels(&create_clause.pattern);
+                    self.reject_virtual_label_writes(&create_labels, "CREATE")?;
                     // Validate CREATE patterns:
                     // - Nodes with labels/properties are "creations" - can't rebind existing variables
                     // - Bare nodes (v) are "references" if bound, "creations" if not
@@ -3962,13 +4286,21 @@ impl QueryPlanner {
                 .labels
                 .first()
                 .ok_or_else(|| anyhow!("Target node must have label if not already bound"))?;
-            let target_label_meta = self
-                .schema
-                .get_label_case_insensitive(target_label_name)
-                .ok_or_else(|| anyhow!("Label {} not found", target_label_name))?;
+            // Native lookup first; then consult `CatalogProvider` /
+            // `ReplacementScanProvider` and allocate a virtual label-id
+            // (M5b follow-up #6). Virtual ids dispatch to
+            // `CatalogVertexScanExec` at physical-plan time.
+            let target_label_id =
+                if let Some(meta) = self.schema.get_label_case_insensitive(target_label_name) {
+                    meta.id
+                } else if let Some((vid, _)) = self.allocate_virtual_label(target_label_name)? {
+                    vid
+                } else {
+                    return Err(anyhow!("Label {} not found", target_label_name));
+                };
 
             let target_scan = LogicalPlan::Scan {
-                label_id: target_label_meta.id,
+                label_id: target_label_id,
                 labels: target_node.labels.names().to_vec(),
                 variable: target_var.clone(),
                 filter: self.properties_to_expr(&target_var, &target_node.properties),
@@ -3976,7 +4308,7 @@ impl QueryPlanner {
             };
 
             plan = Self::join_with_plan(plan, target_scan);
-            target_label_meta.id
+            target_label_id
         } else {
             if let Some(prop_filter) = self.properties_to_expr(&target_var, &target_node.properties)
             {
@@ -3996,12 +4328,14 @@ impl QueryPlanner {
         } else {
             let mut ids = Vec::new();
             for type_name in &rel.types {
-                let edge_meta = self
-                    .schema
-                    .edge_types
-                    .get(type_name)
-                    .ok_or_else(|| anyhow!("Edge type {} not found", type_name))?;
-                ids.push(edge_meta.id);
+                let id = if let Some(meta) = self.schema.edge_types.get(type_name) {
+                    meta.id
+                } else if let Some((vid, _)) = self.allocate_virtual_edge_type(type_name)? {
+                    vid
+                } else {
+                    return Err(anyhow!("Edge type {} not found", type_name));
+                };
+                ids.push(id);
             }
             ids
         };
@@ -4735,6 +5069,13 @@ impl QueryPlanner {
                     // Known type - use standard Traverse with type_id
                     edge_type_ids.push(edge_meta.id);
                     dst_labels.extend(edge_meta.dst_labels.iter().cloned());
+                } else if let Some((vid, _)) = self.allocate_virtual_edge_type(type_name)? {
+                    // M5b.3: virtual edge type (plugin-registered CatalogTable).
+                    // Resolving it into `edge_type_ids` (not `unknown_types`)
+                    // lets the regular `Traverse` planner build a structured
+                    // plan that the physical planner can dispatch to a
+                    // `CatalogEdgeScanExec` mid-pattern.
+                    edge_type_ids.push(vid);
                 } else {
                     // Unknown type - will use TraverseMainByType
                     unknown_types.push(type_name.clone());
@@ -4968,10 +5309,25 @@ impl QueryPlanner {
             ));
         }
 
+        // Resolve target label to either a schema id or a virtual id from the
+        // plugin registry. Mid-pattern virtual-label dispatch (M5b.3) requires
+        // the virtual id to flow into `Traverse.target_label_id` so the
+        // physical planner can layer a `CatalogVertexScanExec` join on the
+        // traverse output. Mirrors the schema-then-virtual fallthrough used
+        // by single-vertex `Scan` planning (~`plan_node_pattern` below).
+        let mut virtual_target_label_id: Option<u16> = None;
         let target_label_meta = if let Some(label_name) = params.target_node.labels.first() {
             // Use first label for target_label_id
             // For schemaless support, allow unknown target labels
-            self.schema.get_label_case_insensitive(label_name)
+            match self.schema.get_label_case_insensitive(label_name) {
+                Some(meta) => Some(meta),
+                None => {
+                    if let Some((vid, _)) = self.allocate_virtual_label(label_name)? {
+                        virtual_target_label_id = Some(vid);
+                    }
+                    None
+                }
+            }
         } else if !target_is_bound {
             // Infer from edge type(s)
             let unique_dsts: Vec<_> = dst_labels
@@ -5072,7 +5428,10 @@ impl QueryPlanner {
             direction: params.rel.direction.clone(),
             source_variable: source_variable.to_string(),
             target_variable: effective_target_var.clone(),
-            target_label_id: target_label_meta.map(|m| m.id).unwrap_or(0),
+            target_label_id: target_label_meta
+                .map(|m| m.id)
+                .or(virtual_target_label_id)
+                .unwrap_or(0),
             step_variable: effective_step_var.clone(),
             min_hops,
             max_hops,
@@ -5551,7 +5910,34 @@ impl QueryPlanner {
             let joined = Self::join_with_plan(plan, scan);
             Ok(apply_residual_filter(joined, node_residual_filter))
         } else {
-            // Unknown label: use ScanMainByLabels for schemaless support
+            // Unknown label. Try a CatalogProvider / ReplacementScanProvider
+            // claim first: on success allocate a virtual label-ID and emit a
+            // regular `Scan` against the virtual id (`df_planner` dispatches
+            // to `CatalogVertexScanExec`). When no provider claims and the
+            // replacement-scan gate is on, strict-mode errors. When the gate
+            // is off and no provider claims, preserve today's silent-empty
+            // schemaless `ScanMainByLabels` behavior bit-for-bit.
+            if let Some((virtual_id, _)) = self.allocate_virtual_label(label_name)? {
+                let scan = LogicalPlan::Scan {
+                    label_id: virtual_id,
+                    labels: node.labels.names().to_vec(),
+                    variable: variable.to_string(),
+                    filter: node_scan_filter,
+                    optional,
+                };
+                let joined = Self::join_with_plan(plan, scan);
+                return Ok(apply_residual_filter(joined, node_residual_filter));
+            }
+            if self.replacement_scans_enabled {
+                return Err(anyhow!(
+                    "Label `{}` is not defined in schema and no \
+                     CatalogProvider or ReplacementScanProvider claimed it; \
+                     strict-mode (replacement_scans=true) requires the label \
+                     to resolve",
+                    label_name
+                ));
+            }
+
             let scan_main = LogicalPlan::ScanMainByLabels {
                 labels: node.labels.names().to_vec(),
                 variable: variable.to_string(),

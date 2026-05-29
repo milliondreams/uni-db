@@ -215,8 +215,9 @@ fn is_list_expr(e: &DfExpr) -> bool {
 /// Used to determine the identity column when a bare variable is referenced
 /// (e.g., `n` in `RETURN n` should resolve to `n._vid` for nodes).
 ///
-/// This is the physical-layer counterpart to [`crate::planner::VariableType`],
-/// which includes additional variants (`Scalar`, `ScalarLiteral`, `Imported`)
+/// This is the physical-layer counterpart to the planner's `VariableType`
+/// (in the `uni-query` crate), which includes additional variants
+/// (`Scalar`, `ScalarLiteral`, `Imported`)
 /// for logical planning. `VariableKind` only tracks graph-entity types needed
 /// for physical expression compilation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

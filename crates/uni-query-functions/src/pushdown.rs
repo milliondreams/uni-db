@@ -472,42 +472,54 @@ impl PredicateAnalyzer {
 /// expressed as a label-scoped scan without an additional residual filter.
 pub fn try_label_or_to_union(expr: &Expr, variable: &str) -> Option<Vec<String>> {
     let mut labels: Vec<String> = Vec::new();
-    if collect_label_or_branches(expr, variable, &mut labels) && labels.len() >= 2 {
+    if collect_or_branches(expr, variable, &mut labels, &label_leaf) && labels.len() >= 2 {
         Some(labels)
     } else {
         None
     }
 }
 
-fn collect_label_or_branches(expr: &Expr, variable: &str, out: &mut Vec<String>) -> bool {
+/// Walk an `OR`-tree, requiring every leaf to satisfy `leaf` (push into
+/// `out` and return true). Shared by `try_label_or_to_union` and
+/// `try_type_or_to_union`; the predicates differ only in what shape they
+/// recognize at the leaf.
+fn collect_or_branches<F>(expr: &Expr, variable: &str, out: &mut Vec<String>, leaf: &F) -> bool
+where
+    F: Fn(&Expr, &str, &mut Vec<String>) -> bool,
+{
     match expr {
         Expr::BinaryOp {
             left,
             op: BinaryOp::Or,
             right,
         } => {
-            collect_label_or_branches(left, variable, out)
-                && collect_label_or_branches(right, variable, out)
+            collect_or_branches(left, variable, out, leaf)
+                && collect_or_branches(right, variable, out, leaf)
         }
-        Expr::LabelCheck {
-            expr: target,
-            labels,
-        } => {
-            if labels.len() != 1 {
-                // Conjunction-of-multiple is not pushable as a single
-                // label scan branch — fall back to residual filter.
-                return false;
-            }
-            if let Expr::Variable(v) = target.as_ref()
-                && v == variable
-            {
-                out.push(labels[0].clone());
-                return true;
-            }
-            false
-        }
-        _ => false,
+        _ => leaf(expr, variable, out),
     }
+}
+
+fn label_leaf(expr: &Expr, variable: &str, out: &mut Vec<String>) -> bool {
+    let Expr::LabelCheck {
+        expr: target,
+        labels,
+    } = expr
+    else {
+        return false;
+    };
+    if labels.len() != 1 {
+        // Conjunction-of-multiple is not pushable as a single label scan
+        // branch — fall back to residual filter.
+        return false;
+    }
+    if let Expr::Variable(v) = target.as_ref()
+        && v == variable
+    {
+        out.push(labels[0].clone());
+        return true;
+    }
+    false
 }
 
 /// Detect a chain of `type(r) = 'A'` equality checks combined with `OR`
@@ -517,33 +529,23 @@ fn collect_label_or_branches(expr: &Expr, variable: &str, out: &mut Vec<String>)
 /// `Some(["KNOWS", "FOLLOWS"])`.
 pub fn try_type_or_to_union(expr: &Expr, variable: &str) -> Option<Vec<String>> {
     let mut types: Vec<String> = Vec::new();
-    if collect_type_or_branches(expr, variable, &mut types) && types.len() >= 2 {
+    if collect_or_branches(expr, variable, &mut types, &type_eq_leaf) && types.len() >= 2 {
         Some(types)
     } else {
         None
     }
 }
 
-fn collect_type_or_branches(expr: &Expr, variable: &str, out: &mut Vec<String>) -> bool {
-    match expr {
-        Expr::BinaryOp {
-            left,
-            op: BinaryOp::Or,
-            right,
-        } => {
-            collect_type_or_branches(left, variable, out)
-                && collect_type_or_branches(right, variable, out)
-        }
-        Expr::BinaryOp {
-            left,
-            op: BinaryOp::Eq,
-            right,
-        } => {
-            is_type_eq_string(left, right, variable, out)
-                || is_type_eq_string(right, left, variable, out)
-        }
-        _ => false,
-    }
+fn type_eq_leaf(expr: &Expr, variable: &str, out: &mut Vec<String>) -> bool {
+    let Expr::BinaryOp {
+        left,
+        op: BinaryOp::Eq,
+        right,
+    } = expr
+    else {
+        return false;
+    };
+    is_type_eq_string(left, right, variable, out) || is_type_eq_string(right, left, variable, out)
 }
 
 fn is_type_eq_string(

@@ -43,7 +43,7 @@ async fn pagerank_sees_l0_data_without_flush() -> anyhow::Result<()> {
     // Run PageRank — should see the same 3 nodes in L0.
     let pr = session
         .query(
-            "CALL uni.algo.pageRank(['Node'], ['LINKS'], 0.85, 20, 0.000001) \
+            "CALL uni.algo.pageRank({nodeLabels: ['Node'], edgeTypes: ['LINKS']}, {dampingFactor: 0.85, maxIterations: 20, tolerance: 0.000001}) \
              YIELD nodeId, score RETURN count(*) AS cnt",
         )
         .await?;
@@ -82,7 +82,7 @@ async fn wcc_sees_l0_data_without_flush() -> anyhow::Result<()> {
 
     let cc = session
         .query(
-            "CALL uni.algo.wcc(['Node'], ['LINKS']) \
+            "CALL uni.algo.wcc({nodeLabels: ['Node'], edgeTypes: ['LINKS']}, {}) \
              YIELD nodeId, componentId RETURN count(*) AS cnt",
         )
         .await?;

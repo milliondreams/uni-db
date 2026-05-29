@@ -188,7 +188,7 @@ fn bench_pagerank(c: &mut Criterion) {
     run_algo_benchmark(
         c,
         "pagerank",
-        "CALL uni.algo.pageRank(['Node'], ['LINK']) YIELD nodeId, score RETURN nodeId, score",
+        "CALL uni.algo.pageRank({nodeLabels: ['Node'], edgeTypes: ['LINK']}, {}) YIELD nodeId, score RETURN nodeId, score",
     );
 }
 
@@ -196,7 +196,7 @@ fn bench_wcc(c: &mut Criterion) {
     run_algo_benchmark(
         c,
         "wcc",
-        "CALL uni.algo.wcc(['Node'], ['LINK']) YIELD nodeId, componentId RETURN nodeId, componentId",
+        "CALL uni.algo.wcc({nodeLabels: ['Node'], edgeTypes: ['LINK']}, {}) YIELD nodeId, componentId RETURN nodeId, componentId",
     );
 }
 
@@ -204,7 +204,7 @@ fn bench_louvain(c: &mut Criterion) {
     run_algo_benchmark(
         c,
         "louvain",
-        "CALL uni.algo.louvain(['Node'], ['LINK']) YIELD nodeId, communityId RETURN nodeId, communityId",
+        "CALL uni.algo.louvain({nodeLabels: ['Node'], edgeTypes: ['LINK']}, {}) YIELD nodeId, communityId RETURN nodeId, communityId",
     );
 }
 
@@ -212,7 +212,7 @@ fn bench_label_propagation(c: &mut Criterion) {
     run_algo_benchmark(
         c,
         "label_propagation",
-        "CALL uni.algo.labelPropagation(['Node'], ['LINK']) YIELD nodeId, communityId RETURN nodeId, communityId",
+        "CALL uni.algo.labelPropagation({nodeLabels: ['Node'], edgeTypes: ['LINK']}, {}) YIELD nodeId, communityId RETURN nodeId, communityId",
     );
 }
 
@@ -220,7 +220,7 @@ fn bench_scc(c: &mut Criterion) {
     run_algo_benchmark(
         c,
         "scc",
-        "CALL uni.algo.scc(['Node'], ['LINK']) YIELD nodeId, componentId RETURN nodeId, componentId",
+        "CALL uni.algo.scc({nodeLabels: ['Node'], edgeTypes: ['LINK']}, {}) YIELD nodeId, componentId RETURN nodeId, componentId",
     );
 }
 
@@ -229,7 +229,7 @@ fn bench_betweenness(c: &mut Criterion) {
     run_algo_benchmark(
         c,
         "betweenness",
-        "CALL uni.algo.betweenness(['Node'], ['LINK'], true, 100) YIELD nodeId, score RETURN nodeId, score",
+        "CALL uni.algo.betweenness({nodeLabels: ['Node'], edgeTypes: ['LINK']}, {normalize: true, samplingSize: 100}) YIELD nodeId, score RETURN nodeId, score",
     );
 }
 
@@ -237,7 +237,7 @@ fn bench_node_similarity(c: &mut Criterion) {
     run_algo_benchmark(
         c,
         "node_similarity",
-        "CALL uni.algo.nodeSimilarity(['Node'], ['LINK']) YIELD node1, node2, similarity RETURN node1, node2, similarity",
+        "CALL uni.algo.nodeSimilarity({nodeLabels: ['Node'], edgeTypes: ['LINK']}, {}) YIELD node1, node2, similarity RETURN node1, node2, similarity",
     );
 }
 
@@ -245,7 +245,7 @@ fn bench_closeness(c: &mut Criterion) {
     run_algo_benchmark(
         c,
         "closeness",
-        "CALL uni.algo.closeness(['Node'], ['LINK']) YIELD nodeId, score RETURN nodeId, score",
+        "CALL uni.algo.closeness({nodeLabels: ['Node'], edgeTypes: ['LINK']}, {}) YIELD nodeId, score RETURN nodeId, score",
     );
 }
 
@@ -253,7 +253,7 @@ fn bench_triangle_count(c: &mut Criterion) {
     run_algo_benchmark(
         c,
         "triangle_count",
-        "CALL uni.algo.triangleCount(['Node'], ['LINK']) YIELD nodeId, triangleCount RETURN nodeId, triangleCount",
+        "CALL uni.algo.triangleCount({nodeLabels: ['Node'], edgeTypes: ['LINK']}, {}) YIELD nodeId, triangleCount RETURN nodeId, triangleCount",
     );
 }
 
@@ -261,7 +261,7 @@ fn bench_kcore(c: &mut Criterion) {
     run_algo_benchmark(
         c,
         "kcore",
-        "CALL uni.algo.kCore(['Node'], ['LINK']) YIELD nodeId, coreNumber RETURN nodeId, coreNumber",
+        "CALL uni.algo.kCore({nodeLabels: ['Node'], edgeTypes: ['LINK']}, {}) YIELD nodeId, coreNumber RETURN nodeId, coreNumber",
     );
 }
 
@@ -270,7 +270,7 @@ fn bench_random_walk(c: &mut Criterion) {
     run_algo_benchmark(
         c,
         "random_walk",
-        "CALL uni.algo.randomWalk(['Node'], ['LINK'], 5, 1, []) YIELD path RETURN path",
+        "CALL uni.algo.randomWalk({nodeLabels: ['Node'], edgeTypes: ['LINK']}, {walkLength: 5, walksPerNode: 1, startNodes: []}) YIELD path RETURN path",
     );
 }
 
@@ -285,7 +285,7 @@ fn bench_apsp(c: &mut Criterion) {
     run_algo_benchmark(
         c,
         "apsp",
-        "CALL uni.algo.allPairsShortestPath(['Node'], ['LINK']) YIELD sourceNodeId, targetNodeId, distance RETURN sourceNodeId, targetNodeId, distance",
+        "CALL uni.algo.allPairsShortestPath({nodeLabels: ['Node'], edgeTypes: ['LINK']}, {}) YIELD sourceNodeId, targetNodeId, distance RETURN sourceNodeId, targetNodeId, distance",
     );
 }
 

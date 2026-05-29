@@ -1,0 +1,22 @@
+[package]
+name = "uni-plugin-conformance"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+description = "Conformance test runner for uni-db plugin authors"
+keywords = ["plugin", "graph", "database", "testing", "conformance"]
+categories = ["database", "development-tools::testing"]
+
+[dependencies]
+uni-plugin = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+semver = "1.0"

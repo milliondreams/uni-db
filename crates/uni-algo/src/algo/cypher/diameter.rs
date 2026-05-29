@@ -24,8 +24,8 @@ impl GraphAlgoAdapter for DiameterAdapter {
         vec![("diameter", ValueType::Float), ("path", ValueType::Path)]
     }
 
-    fn to_config(_args: Vec<Value>) -> GraphMetricsConfig {
-        GraphMetricsConfig {}
+    fn to_config(_args: Vec<Value>) -> Result<GraphMetricsConfig> {
+        Ok(GraphMetricsConfig {})
     }
 
     fn map_result(result: <Self::Algo as Algorithm>::Result) -> Result<Vec<AlgoResultRow>> {

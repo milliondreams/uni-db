@@ -72,6 +72,31 @@ pub const TAG_LOCALDATETIME: u8 = 18;
 pub const TAG_BTIC: u8 = 19;
 
 // ---------------------------------------------------------------------------
+// rmp_serde + UniError::Storage wrappers
+// ---------------------------------------------------------------------------
+
+/// Deserialize a MessagePack payload, wrapping any error in
+/// `UniError::Storage` with a uniform `"failed to decode <type>: <e>"`
+/// message. Used by every decode arm in this module.
+fn decode_msgpack<'de, T: Deserialize<'de>>(
+    payload: &'de [u8],
+    type_name: &'static str,
+) -> Result<T, UniError> {
+    rmp_serde::from_slice(payload).map_err(|e| UniError::Storage {
+        message: format!("failed to decode {type_name}: {e}"),
+        source: None,
+    })
+}
+
+/// Push `tag` onto `buf`, then append the MessagePack encoding of `value`.
+/// Encoding into a `Vec<u8>` is infallible in practice; we keep the panic
+/// path to match the historical contract.
+fn encode_msgpack<T: Serialize>(buf: &mut Vec<u8>, tag: u8, value: &T, type_name: &'static str) {
+    buf.push(tag);
+    rmp_serde::encode::write(buf, value).unwrap_or_else(|_| panic!("{type_name} encode failed"));
+}
+
+// ---------------------------------------------------------------------------
 // Public encode/decode API
 // ---------------------------------------------------------------------------
 
@@ -95,56 +120,18 @@ pub fn decode(bytes: &[u8]) -> Result<Value, UniError> {
 
     match tag {
         TAG_NULL => Ok(Value::Null),
-        TAG_BOOL => {
-            let b: bool = rmp_serde::from_slice(payload).map_err(|e| UniError::Storage {
-                message: format!("failed to decode bool: {}", e),
-                source: None,
-            })?;
-            Ok(Value::Bool(b))
-        }
-        TAG_INT => {
-            let i: i64 = rmp_serde::from_slice(payload).map_err(|e| UniError::Storage {
-                message: format!("failed to decode int: {}", e),
-                source: None,
-            })?;
-            Ok(Value::Int(i))
-        }
-        TAG_FLOAT => {
-            let f: f64 = rmp_serde::from_slice(payload).map_err(|e| UniError::Storage {
-                message: format!("failed to decode float: {}", e),
-                source: None,
-            })?;
-            Ok(Value::Float(f))
-        }
-        TAG_STRING => {
-            let s: String = rmp_serde::from_slice(payload).map_err(|e| UniError::Storage {
-                message: format!("failed to decode string: {}", e),
-                source: None,
-            })?;
-            Ok(Value::String(s))
-        }
-        TAG_BYTES => {
-            let b: Vec<u8> = rmp_serde::from_slice(payload).map_err(|e| UniError::Storage {
-                message: format!("failed to decode bytes: {}", e),
-                source: None,
-            })?;
-            Ok(Value::Bytes(b))
-        }
+        TAG_BOOL => Ok(Value::Bool(decode_msgpack(payload, "bool")?)),
+        TAG_INT => Ok(Value::Int(decode_msgpack(payload, "int")?)),
+        TAG_FLOAT => Ok(Value::Float(decode_msgpack(payload, "float")?)),
+        TAG_STRING => Ok(Value::String(decode_msgpack(payload, "string")?)),
+        TAG_BYTES => Ok(Value::Bytes(decode_msgpack(payload, "bytes")?)),
         TAG_LIST => {
-            let blobs: Vec<Vec<u8>> =
-                rmp_serde::from_slice(payload).map_err(|e| UniError::Storage {
-                    message: format!("failed to decode list: {}", e),
-                    source: None,
-                })?;
+            let blobs: Vec<Vec<u8>> = decode_msgpack(payload, "list")?;
             let items: Result<Vec<Value>, UniError> = blobs.iter().map(|b| decode(b)).collect();
             Ok(Value::List(items?))
         }
         TAG_MAP => {
-            let blob_map: HashMap<String, Vec<u8>> =
-                rmp_serde::from_slice(payload).map_err(|e| UniError::Storage {
-                    message: format!("failed to decode map: {}", e),
-                    source: None,
-                })?;
+            let blob_map: HashMap<String, Vec<u8>> = decode_msgpack(payload, "map")?;
             let mut map = HashMap::new();
             for (k, v_blob) in blob_map {
                 map.insert(k, decode(&v_blob)?);
@@ -152,11 +139,7 @@ pub fn decode(bytes: &[u8]) -> Result<Value, UniError> {
             Ok(Value::Map(map))
         }
         TAG_NODE => {
-            let np: NodePayload =
-                rmp_serde::from_slice(payload).map_err(|e| UniError::Storage {
-                    message: format!("failed to decode node: {}", e),
-                    source: None,
-                })?;
+            let np: NodePayload = decode_msgpack(payload, "node")?;
             let mut props = HashMap::new();
             for (k, v_blob) in np.properties {
                 props.insert(k, decode(&v_blob)?);
@@ -168,11 +151,7 @@ pub fn decode(bytes: &[u8]) -> Result<Value, UniError> {
             }))
         }
         TAG_EDGE => {
-            let ep: EdgePayload =
-                rmp_serde::from_slice(payload).map_err(|e| UniError::Storage {
-                    message: format!("failed to decode edge: {}", e),
-                    source: None,
-                })?;
+            let ep: EdgePayload = decode_msgpack(payload, "edge")?;
             let mut props = HashMap::new();
             for (k, v_blob) in ep.properties {
                 props.insert(k, decode(&v_blob)?);
@@ -186,11 +165,7 @@ pub fn decode(bytes: &[u8]) -> Result<Value, UniError> {
             }))
         }
         TAG_PATH => {
-            let pp: PathPayload =
-                rmp_serde::from_slice(payload).map_err(|e| UniError::Storage {
-                    message: format!("failed to decode path: {}", e),
-                    source: None,
-                })?;
+            let pp: PathPayload = decode_msgpack(payload, "path")?;
             let nodes: Result<Vec<Node>, UniError> = pp
                 .nodes
                 .iter()
@@ -218,59 +193,27 @@ pub fn decode(bytes: &[u8]) -> Result<Value, UniError> {
                 edges: edges?,
             }))
         }
-        TAG_VECTOR => {
-            let v: Vec<f32> = rmp_serde::from_slice(payload).map_err(|e| UniError::Storage {
-                message: format!("failed to decode vector: {}", e),
-                source: None,
-            })?;
-            Ok(Value::Vector(v))
-        }
-        TAG_DATE => {
-            let days: i32 = rmp_serde::from_slice(payload).map_err(|e| UniError::Storage {
-                message: format!("failed to decode date: {}", e),
-                source: None,
-            })?;
-            Ok(Value::Temporal(crate::value::TemporalValue::Date {
-                days_since_epoch: days,
-            }))
-        }
-        TAG_LOCALTIME => {
-            let nanos: i64 = rmp_serde::from_slice(payload).map_err(|e| UniError::Storage {
-                message: format!("failed to decode localtime: {}", e),
-                source: None,
-            })?;
-            Ok(Value::Temporal(crate::value::TemporalValue::LocalTime {
-                nanos_since_midnight: nanos,
-            }))
-        }
+        TAG_VECTOR => Ok(Value::Vector(decode_msgpack(payload, "vector")?)),
+        TAG_DATE => Ok(Value::Temporal(crate::value::TemporalValue::Date {
+            days_since_epoch: decode_msgpack(payload, "date")?,
+        })),
+        TAG_LOCALTIME => Ok(Value::Temporal(crate::value::TemporalValue::LocalTime {
+            nanos_since_midnight: decode_msgpack(payload, "localtime")?,
+        })),
         TAG_TIME => {
-            let tp: TimePayload =
-                rmp_serde::from_slice(payload).map_err(|e| UniError::Storage {
-                    message: format!("failed to decode time: {}", e),
-                    source: None,
-                })?;
+            let tp: TimePayload = decode_msgpack(payload, "time")?;
             Ok(Value::Temporal(crate::value::TemporalValue::Time {
                 nanos_since_midnight: tp.nanos,
                 offset_seconds: tp.offset,
             }))
         }
-        TAG_LOCALDATETIME => {
-            let nanos: i64 = rmp_serde::from_slice(payload).map_err(|e| UniError::Storage {
-                message: format!("failed to decode localdatetime: {}", e),
-                source: None,
-            })?;
-            Ok(Value::Temporal(
-                crate::value::TemporalValue::LocalDateTime {
-                    nanos_since_epoch: nanos,
-                },
-            ))
-        }
+        TAG_LOCALDATETIME => Ok(Value::Temporal(
+            crate::value::TemporalValue::LocalDateTime {
+                nanos_since_epoch: decode_msgpack(payload, "localdatetime")?,
+            },
+        )),
         TAG_DATETIME => {
-            let dp: DateTimePayload =
-                rmp_serde::from_slice(payload).map_err(|e| UniError::Storage {
-                    message: format!("failed to decode datetime: {}", e),
-                    source: None,
-                })?;
+            let dp: DateTimePayload = decode_msgpack(payload, "datetime")?;
             Ok(Value::Temporal(crate::value::TemporalValue::DateTime {
                 nanos_since_epoch: dp.nanos,
                 offset_seconds: dp.offset,
@@ -278,11 +221,7 @@ pub fn decode(bytes: &[u8]) -> Result<Value, UniError> {
             }))
         }
         TAG_DURATION => {
-            let dp: DurationPayload =
-                rmp_serde::from_slice(payload).map_err(|e| UniError::Storage {
-                    message: format!("failed to decode duration: {}", e),
-                    source: None,
-                })?;
+            let dp: DurationPayload = decode_msgpack(payload, "duration")?;
             Ok(Value::Temporal(crate::value::TemporalValue::Duration {
                 months: dp.months,
                 days: dp.days,
@@ -291,7 +230,7 @@ pub fn decode(bytes: &[u8]) -> Result<Value, UniError> {
         }
         TAG_BTIC => {
             let btic = uni_btic::encode::decode_slice(payload).map_err(|e| UniError::Storage {
-                message: format!("failed to decode BTIC: {}", e),
+                message: format!("failed to decode BTIC: {e}"),
                 source: None,
             })?;
             Ok(Value::Temporal(crate::value::TemporalValue::Btic {
@@ -301,7 +240,7 @@ pub fn decode(bytes: &[u8]) -> Result<Value, UniError> {
             }))
         }
         _ => Err(UniError::Storage {
-            message: format!("unknown CypherValue tag: {}", tag),
+            message: format!("unknown CypherValue tag: {tag}"),
             source: None,
         }),
     }
@@ -422,42 +361,22 @@ pub fn extract_map_entry_raw(blob: &[u8], key: &str) -> Option<Vec<u8>> {
 
 fn encode_to_buf(value: &Value, buf: &mut Vec<u8>) {
     match value {
-        Value::Null => {
-            buf.push(TAG_NULL);
-        }
-        Value::Bool(b) => {
-            buf.push(TAG_BOOL);
-            rmp_serde::encode::write(buf, b).expect("bool encode failed");
-        }
-        Value::Int(i) => {
-            buf.push(TAG_INT);
-            rmp_serde::encode::write(buf, i).expect("int encode failed");
-        }
-        Value::Float(f) => {
-            buf.push(TAG_FLOAT);
-            rmp_serde::encode::write(buf, f).expect("float encode failed");
-        }
-        Value::String(s) => {
-            buf.push(TAG_STRING);
-            rmp_serde::encode::write(buf, s).expect("string encode failed");
-        }
-        Value::Bytes(b) => {
-            buf.push(TAG_BYTES);
-            rmp_serde::encode::write(buf, b).expect("bytes encode failed");
-        }
+        Value::Null => buf.push(TAG_NULL),
+        Value::Bool(b) => encode_msgpack(buf, TAG_BOOL, b, "bool"),
+        Value::Int(i) => encode_msgpack(buf, TAG_INT, i, "int"),
+        Value::Float(f) => encode_msgpack(buf, TAG_FLOAT, f, "float"),
+        Value::String(s) => encode_msgpack(buf, TAG_STRING, s, "string"),
+        Value::Bytes(b) => encode_msgpack(buf, TAG_BYTES, b, "bytes"),
         Value::List(items) => {
-            buf.push(TAG_LIST);
             let blobs: Vec<Vec<u8>> = items.iter().map(encode).collect();
-            rmp_serde::encode::write(buf, &blobs).expect("list encode failed");
+            encode_msgpack(buf, TAG_LIST, &blobs, "list");
         }
         Value::Map(map) => {
-            buf.push(TAG_MAP);
             let blob_map: BTreeMap<String, Vec<u8>> =
                 map.iter().map(|(k, v)| (k.clone(), encode(v))).collect();
-            rmp_serde::encode::write(buf, &blob_map).expect("map encode failed");
+            encode_msgpack(buf, TAG_MAP, &blob_map, "map");
         }
         Value::Node(node) => {
-            buf.push(TAG_NODE);
             let mut props_blobs: Vec<(String, Vec<u8>)> = node
                 .properties
                 .iter()
@@ -469,10 +388,9 @@ fn encode_to_buf(value: &Value, buf: &mut Vec<u8>) {
                 labels: node.labels.clone(),
                 properties: props_blobs,
             };
-            rmp_serde::encode::write(buf, &payload).expect("node encode failed");
+            encode_msgpack(buf, TAG_NODE, &payload, "node");
         }
         Value::Edge(edge) => {
-            buf.push(TAG_EDGE);
             let mut props_blobs: Vec<(String, Vec<u8>)> = edge
                 .properties
                 .iter()
@@ -486,83 +404,67 @@ fn encode_to_buf(value: &Value, buf: &mut Vec<u8>) {
                 dst: edge.dst,
                 properties: props_blobs,
             };
-            rmp_serde::encode::write(buf, &payload).expect("edge encode failed");
+            encode_msgpack(buf, TAG_EDGE, &payload, "edge");
         }
         Value::Path(path) => {
-            buf.push(TAG_PATH);
-            let nodes_blobs: Vec<Vec<u8>> = path
-                .nodes
-                .iter()
-                .map(|n| encode(&Value::Node(n.clone())))
-                .collect();
-            let edges_blobs: Vec<Vec<u8>> = path
-                .edges
-                .iter()
-                .map(|e| encode(&Value::Edge(e.clone())))
-                .collect();
             let payload = PathPayload {
-                nodes: nodes_blobs,
-                edges: edges_blobs,
+                nodes: path
+                    .nodes
+                    .iter()
+                    .map(|n| encode(&Value::Node(n.clone())))
+                    .collect(),
+                edges: path
+                    .edges
+                    .iter()
+                    .map(|e| encode(&Value::Edge(e.clone())))
+                    .collect(),
             };
-            rmp_serde::encode::write(buf, &payload).expect("path encode failed");
+            encode_msgpack(buf, TAG_PATH, &payload, "path");
         }
-        Value::Vector(v) => {
-            buf.push(TAG_VECTOR);
-            rmp_serde::encode::write(buf, v).expect("vector encode failed");
-        }
+        Value::Vector(v) => encode_msgpack(buf, TAG_VECTOR, v, "vector"),
         Value::Temporal(t) => match t {
             crate::value::TemporalValue::Date { days_since_epoch } => {
-                buf.push(TAG_DATE);
-                rmp_serde::encode::write(buf, days_since_epoch).expect("date encode failed");
+                encode_msgpack(buf, TAG_DATE, days_since_epoch, "date");
             }
             crate::value::TemporalValue::LocalTime {
                 nanos_since_midnight,
-            } => {
-                buf.push(TAG_LOCALTIME);
-                rmp_serde::encode::write(buf, nanos_since_midnight)
-                    .expect("localtime encode failed");
-            }
+            } => encode_msgpack(buf, TAG_LOCALTIME, nanos_since_midnight, "localtime"),
             crate::value::TemporalValue::Time {
                 nanos_since_midnight,
                 offset_seconds,
             } => {
-                buf.push(TAG_TIME);
                 let payload = TimePayload {
                     nanos: *nanos_since_midnight,
                     offset: *offset_seconds,
                 };
-                rmp_serde::encode::write(buf, &payload).expect("time encode failed");
+                encode_msgpack(buf, TAG_TIME, &payload, "time");
             }
             crate::value::TemporalValue::LocalDateTime { nanos_since_epoch } => {
-                buf.push(TAG_LOCALDATETIME);
-                rmp_serde::encode::write(buf, nanos_since_epoch)
-                    .expect("localdatetime encode failed");
+                encode_msgpack(buf, TAG_LOCALDATETIME, nanos_since_epoch, "localdatetime");
             }
             crate::value::TemporalValue::DateTime {
                 nanos_since_epoch,
                 offset_seconds,
                 timezone_name,
             } => {
-                buf.push(TAG_DATETIME);
                 let payload = DateTimePayload {
                     nanos: *nanos_since_epoch,
                     offset: *offset_seconds,
                     tz_name: timezone_name.clone(),
                 };
-                rmp_serde::encode::write(buf, &payload).expect("datetime encode failed");
+                encode_msgpack(buf, TAG_DATETIME, &payload, "datetime");
             }
             crate::value::TemporalValue::Duration {
                 months,
                 days,
                 nanos,
             } => {
-                buf.push(TAG_DURATION);
                 let payload = DurationPayload {
                     months: *months,
                     days: *days,
                     nanos: *nanos,
                 };
-                rmp_serde::encode::write(buf, &payload).expect("duration encode failed");
+                encode_msgpack(buf, TAG_DURATION, &payload, "duration");
             }
             crate::value::TemporalValue::Btic { lo, hi, meta } => {
                 buf.push(TAG_BTIC);

@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::matcher::{
     match_error, match_result, match_result_ignoring_list_order, match_result_unordered,
     match_result_unordered_ignoring_list_order, ErrorPhase, TckErrorType,
@@ -5,6 +7,29 @@ use crate::matcher::{
 use crate::parser::parse_table;
 use crate::UniWorld;
 use cucumber::then;
+use uni_query::{QueryResult, Value};
+
+type ResultMatcher = fn(&QueryResult, &[HashMap<String, Value>]) -> Result<(), String>;
+
+fn assert_result_matches(
+    world: &UniWorld,
+    step: &cucumber::gherkin::Step,
+    matcher: ResultMatcher,
+    label: &str,
+) {
+    let Some(result) = world.result() else {
+        if let Some(err) = world.error() {
+            panic!("Query returned error instead of result: {:?}", err);
+        }
+        panic!("No result found (and no error captured)");
+    };
+    let table = step.table().expect("Step is missing a data table");
+    let expected_rows = parse_table(table).expect("Failed to parse expected table");
+
+    if let Err(msg) = matcher(result, &expected_rows) {
+        panic!("Result mismatch ({}): {}", label, msg);
+    }
+}
 
 #[then("the result should be empty")]
 async fn result_should_be_empty(world: &mut UniWorld) {
@@ -19,36 +44,12 @@ async fn result_should_be_empty(world: &mut UniWorld) {
 
 #[then(regex = r"^the result should be, in any order:$")]
 async fn result_should_be_in_any_order(world: &mut UniWorld, step: &cucumber::gherkin::Step) {
-    if world.result().is_none() {
-        if let Some(err) = world.error() {
-            panic!("Query returned error instead of result: {:?}", err);
-        }
-        panic!("No result found (and no error captured)");
-    }
-    let result = world.result().unwrap();
-    let table = step.table().expect("Step is missing a data table");
-    let expected_rows = parse_table(table).expect("Failed to parse expected table");
-
-    if let Err(msg) = match_result_unordered(result, &expected_rows) {
-        panic!("Result mismatch (any order): {}", msg);
-    }
+    assert_result_matches(world, step, match_result_unordered, "any order");
 }
 
 #[then(regex = r"^the result should be, in order:$")]
 async fn result_should_be_in_order(world: &mut UniWorld, step: &cucumber::gherkin::Step) {
-    if world.result().is_none() {
-        if let Some(err) = world.error() {
-            panic!("Query returned error instead of result: {:?}", err);
-        }
-        panic!("No result found (and no error captured)");
-    }
-    let result = world.result().unwrap();
-    let table = step.table().expect("Step is missing a data table");
-    let expected_rows = parse_table(table).expect("Failed to parse expected table");
-
-    if let Err(msg) = match_result(result, &expected_rows) {
-        panic!("Result mismatch (in order): {}", msg);
-    }
+    assert_result_matches(world, step, match_result, "in order");
 }
 
 #[then(regex = r"^the result should be \(ignoring element order for lists\):$")]
@@ -56,19 +57,12 @@ async fn result_should_be_ignoring_list_order(
     world: &mut UniWorld,
     step: &cucumber::gherkin::Step,
 ) {
-    if world.result().is_none() {
-        if let Some(err) = world.error() {
-            panic!("Query returned error instead of result: {:?}", err);
-        }
-        panic!("No result found (and no error captured)");
-    }
-    let result = world.result().unwrap();
-    let table = step.table().expect("Step is missing a data table");
-    let expected_rows = parse_table(table).expect("Failed to parse expected table");
-
-    if let Err(msg) = match_result_ignoring_list_order(result, &expected_rows) {
-        panic!("Result mismatch (ignoring list order): {}", msg);
-    }
+    assert_result_matches(
+        world,
+        step,
+        match_result_ignoring_list_order,
+        "ignoring list order",
+    );
 }
 
 #[then(regex = r"^the result should be, in order \(ignoring element order for lists\):$")]
@@ -76,19 +70,12 @@ async fn result_should_be_in_order_ignoring_list_order(
     world: &mut UniWorld,
     step: &cucumber::gherkin::Step,
 ) {
-    if world.result().is_none() {
-        if let Some(err) = world.error() {
-            panic!("Query returned error instead of result: {:?}", err);
-        }
-        panic!("No result found (and no error captured)");
-    }
-    let result = world.result().unwrap();
-    let table = step.table().expect("Step is missing a data table");
-    let expected_rows = parse_table(table).expect("Failed to parse expected table");
-
-    if let Err(msg) = match_result_ignoring_list_order(result, &expected_rows) {
-        panic!("Result mismatch (in order, ignoring list order): {}", msg);
-    }
+    assert_result_matches(
+        world,
+        step,
+        match_result_ignoring_list_order,
+        "in order, ignoring list order",
+    );
 }
 
 #[then(regex = r"^the result should be, in any order \(ignoring element order for lists\):$")]
@@ -96,19 +83,12 @@ async fn result_should_be_in_any_order_ignoring_list_order(
     world: &mut UniWorld,
     step: &cucumber::gherkin::Step,
 ) {
-    if world.result().is_none() {
-        if let Some(err) = world.error() {
-            panic!("Query returned error instead of result: {:?}", err);
-        }
-        panic!("No result found (and no error captured)");
-    }
-    let result = world.result().unwrap();
-    let table = step.table().expect("Step is missing a data table");
-    let expected_rows = parse_table(table).expect("Failed to parse expected table");
-
-    if let Err(msg) = match_result_unordered_ignoring_list_order(result, &expected_rows) {
-        panic!("Result mismatch (any order, ignoring list order): {}", msg);
-    }
+    assert_result_matches(
+        world,
+        step,
+        match_result_unordered_ignoring_list_order,
+        "any order, ignoring list order",
+    );
 }
 
 #[then(regex = r"^a (\w+) should be raised at (compile time|runtime|any time): (.+)$")]

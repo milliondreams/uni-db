@@ -977,6 +977,58 @@ const DEDUP_ANTI_JOIN_THRESHOLD: usize = 300;
 ///
 /// Returns rows in `candidates` that do not appear in `existing` (LeftAnti semantics).
 /// `null_equals_null = true` so NULLs are treated as equal for dedup purposes.
+/// Dedup `batches` by all columns (set semantics), keeping the first occurrence.
+///
+/// `arrow_left_anti_dedup` removes candidate rows that match the existing fact
+/// set, but a single semi-naive iteration can emit the same row many times — e.g.
+/// a transitive-closure rule derives the same `(a, b)` pair via every intermediate
+/// `mid` on a path. A `LeftAnti` join does not remove these *within-candidate*
+/// duplicates, so they would leak into the fact set. The `RowDedupState` and legacy
+/// paths both dedup within the candidate batch ([`RowDedupState::compute_delta`],
+/// [`FixpointState::compute_delta_legacy`]); this keeps the `arrow_left_anti_dedup`
+/// path identical so dedup behavior does not change across `DEDUP_ANTI_JOIN_THRESHOLD`.
+fn dedup_batches_all_columns(
+    batches: Vec<RecordBatch>,
+    schema: &SchemaRef,
+) -> DFResult<Vec<RecordBatch>> {
+    let fields: Vec<SortField> = schema
+        .fields()
+        .iter()
+        .map(|f| SortField::new(f.data_type().clone()))
+        .collect();
+    // Unsupported column types: leave as-is. This path is only reached for facts
+    // sets >= DEDUP_ANTI_JOIN_THRESHOLD; for those types the <threshold path uses
+    // `compute_delta_legacy`, which dedups via `ScalarKey` instead.
+    let Ok(converter) = RowConverter::new(fields) else {
+        return Ok(batches);
+    };
+    let mut seen: HashSet<Box<[u8]>> = HashSet::new();
+    let mut out = Vec::with_capacity(batches.len());
+    for batch in batches {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let rows = converter
+            .convert_columns(batch.columns())
+            .map_err(arrow_err)?;
+        let mut keep = Vec::with_capacity(batch.num_rows());
+        for row_idx in 0..batch.num_rows() {
+            let row_bytes: Box<[u8]> = rows.row(row_idx).data().into();
+            keep.push(seen.insert(row_bytes));
+        }
+        let keep_mask = arrow_array::BooleanArray::from(keep);
+        let cols = batch
+            .columns()
+            .iter()
+            .map(|c| arrow::compute::filter(c.as_ref(), &keep_mask).map_err(arrow_err))
+            .collect::<DFResult<Vec<_>>>()?;
+        if cols.first().is_some_and(|c| !c.is_empty()) {
+            out.push(RecordBatch::try_new(Arc::clone(schema), cols).map_err(arrow_err)?);
+        }
+    }
+    Ok(out)
+}
+
 async fn arrow_left_anti_dedup(
     candidates: Vec<RecordBatch>,
     existing: &[RecordBatch],
@@ -984,7 +1036,9 @@ async fn arrow_left_anti_dedup(
     task_ctx: &Arc<TaskContext>,
 ) -> DFResult<Vec<RecordBatch>> {
     if existing.is_empty() || existing.iter().all(|b| b.num_rows() == 0) {
-        return Ok(candidates);
+        // No existing facts to anti-join against, but still dedup the candidates
+        // among themselves (a single iteration may emit duplicate rows).
+        return dedup_batches_all_columns(candidates, schema);
     }
 
     let left: Arc<dyn ExecutionPlan> = Arc::new(InMemoryExec::new(candidates, Arc::clone(schema)));
@@ -1025,7 +1079,10 @@ async fn arrow_left_anti_dedup(
     )?;
 
     let join_arc: Arc<dyn ExecutionPlan> = Arc::new(join);
-    collect_all_partitions(&join_arc, task_ctx.clone()).await
+    // LeftAnti removes candidates that match `existing`, but not duplicate rows
+    // within the candidate set — dedup those to match the other delta strategies.
+    let anti = collect_all_partitions(&join_arc, task_ctx.clone()).await?;
+    dedup_batches_all_columns(anti, schema)
 }
 
 // ---------------------------------------------------------------------------

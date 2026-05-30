@@ -44,7 +44,7 @@ and `crates/uni-store/src/runtime/occ.rs`.
 | **C1** L0 snapshot reads (strategy D) | **Done** (`L0Manager::snapshot_isolated`, committed `50e15e4af`); production wiring into `get_context` + generation GC = follow-up (F). |
 | **C3/C4** write-set OCC — lost update | **Done** (`occ.rs`, `commit_transaction_l0` validation). Closes wishlist Request 1. |
 | **C4** serializable MERGE | **Done** (commit-time `constraint_index` check). Closes wishlist Request 2. |
-| **C3/C4** read-set SSI (rw-antidependency) | **Done**, item-level. Covered (2026-05-30): keyed vertex point-reads, **edge reads**, and **traversals** (`record_neighbor_reads`). **Known gap:** bare label scans are intentionally *not* tracked (recording the whole columnar scan would falsely conflict disjoint keyed writers); guard with `FOR UPDATE`. See §6.3. |
+| **C3/C4** read-set SSI (rw-antidependency) | **Done**, item-level. Covered (2026-05-30): keyed vertex point-reads, **edge reads**, **traversals** (`record_neighbor_reads`), and now **filtered label/scan-all vertex scans** via a transparent `ReadSetRecordingExec` inserted *above* the residual `FilterExec` (`record_batch_ids`), so only matched rows are recorded — disjoint keyed writers no longer falsely conflict. **Residual gaps:** phantoms (concurrent inserts newly matching a predicate) and schemaless variable-length traversal (`build_edge_adjacency_map`) are still *not* tracked; guard with `FOR UPDATE`. See §6.3. |
 | **C6** CRDT carve-out | **Done** (2026-05-30) — concurrent CRDT-only writes to a vertex merge instead of aborting; `WriteSet::from_l0` excludes them via shared `try_as_crdt`. See §6.6. |
 | **Retry ergonomics** | **Done** (2026-05-30) — `UniError::is_retriable()` + `Session::transact_with_retry`/`execute_with_retry` (`api/retry.rs`, unconditional). Closes the §9 "bounded-retry helper" item. |
 | **C6** CRDT commutative fast-path | **Pre-existing** (`schema.rs:77-86`, `l0.rs` CRDT merge). |
@@ -300,16 +300,27 @@ queries. Captured paths:
 - **Traversals** — `record_neighbor_reads` in `df_graph/mod.rs` `get_neighbors` /
   `get_neighbors_batch` records the source, each discovered neighbour, and each traversed
   edge id (precise to the actual fan-out).
+- **Filtered label / scan-all vertex scans** — a transparent `ReadSetRecordingExec`
+  (`df_graph/read_set_exec.rs`) is inserted by the planner immediately *above* each vertex
+  scan and its residual `FilterExec` (at the standard label-scan site and the shared
+  `finalize_schemaless_scan` funnel covering schemaless/multi-label/scan-all). It records
+  the surviving `{var}._vid` / `{var}._eid` columns of each output batch into the read-set
+  via `GraphExecutionContext::record_batch_ids`. Because capture is *after* the residual
+  filter, the read-set is exactly the matched rows; a full-label scan with no filter
+  correctly records the whole label. The wrap is a no-op unless `ssi` is on *and* the
+  transaction has an optimistic read-set (RW txn). Edge scans need no separate case — the
+  planner routes edges through traversal, already covered by `record_neighbor_reads`.
 
-**Known limitation — bare label scans are NOT tracked.** The vectorized Cypher scan
-(`scan.rs` `map_to_output_schema`) reads the *whole* label columnar-batch before the
-`{k:v}` predicate narrows it, so recording there would add every scanned row to the
-read-set and falsely conflict disjoint keyed writers on the same label — defeating keyed
-RMW. Precise per-match recording needs post-filter capture (a larger query-engine change),
-deferred. Until then, a read-write antidependency observed *only* through a bare label
-scan is not caught; guard those with `FOR UPDATE` (§6.5). This does not affect lost-update
-or serializable-MERGE, which are write-set / constraint based. Schemaless variable-length
-traversal (`build_edge_adjacency_map`) also bypasses `get_neighbors` and is a residual gap.
+**Now tracked (post-filter), with residual gaps.** Recording above the residual filter
+means only matched rows enter the read-set, so disjoint keyed writers on the same label no
+longer falsely conflict — keyed RMW is preserved. Three limitations remain: (1) **phantoms**
+— a concurrent INSERT of a row that *newly* matches a predicate is still not caught (needs
+predicate/range locks); (2) schemaless variable-length traversal via `build_edge_adjacency_map`
+still bypasses the per-neighbour read hook; (3) under active SSI read-set recording, a
+`MATCH` that would use the `VidLookupJoin` fast path instead falls back to `HashJoinExec`
+so reads are recorded (correctness over that optimization). Guard phantom-sensitive logic
+with `FOR UPDATE` (§6.5). None of this affects lost-update or serializable-MERGE, which are
+write-set / constraint based.
 
 ### 6.4 Commit-time validation (C4)
 
@@ -387,7 +398,10 @@ can never exclude a write the merge would overwrite, which would lose an update)
   concurrent last-writer-wins writer to the *same property* both commit (order-dependent
   result). This is no new hazard — `merge_crdt_properties` already overwrites a CRDT value
   when handed a non-CRDT one. Mixed CRDT+LWW writes and label/tombstone writes stay
-  conflictable.
+  conflictable. R1 still stands (item-level write-set carve-out cannot make these conflict),
+  but `merge_crdt_properties` now logs a `tracing::warn!` whenever it overwrites a CRDT
+  value with a non-CRDT scalar, so contradictory CRDT+LWW usage on the same property is
+  visible rather than silent.
 - **Edges** stay always-conflictable: every edge write asserts endpoints/type
   (non-commutative topology), so no edge write qualifies for the carve-out.
 
@@ -461,11 +475,13 @@ The two wishlist repros are implemented as regression tests and **pass** (2026-0
   the retry re-reads and re-applies.
 - **Serializable MERGE** (`wishlist §Request 2`): 16 concurrent `MERGE (e:E {code:'shared'})`
   → `count == 1` (losers abort on the unique-key check under `flush_lock`).
-- Plus (passing): real read-write antidependency abort via edge/traversal reads; the
-  scan-only antidependency *non*-tracking limitation (pinned); read-only stability under
-  concurrent writes; `FOR UPDATE` mutual exclusion, lock release on commit *and* rollback,
-  multi-key no-deadlock, unsupported-pattern no-op. CRDT carve-out + abort-leaves-no-trace
-  at the Writer layer (`uni-store/tests/common/ssi_occ_test.rs`).
+- Plus (passing): real read-write antidependency abort via edge/traversal reads;
+  scan-read antidependency now aborts (`scan_read_antidependency_aborts`) with disjoint
+  keyed scans still committing (`scan_read_disjoint_key_no_false_abort`, post-filter
+  precision); read-only stability under concurrent writes; `FOR UPDATE` mutual exclusion,
+  lock release on commit *and* rollback, multi-key no-deadlock, unsupported-pattern no-op.
+  CRDT carve-out + abort-leaves-no-trace at the Writer layer
+  (`uni-store/tests/common/ssi_occ_test.rs`).
 
 The four `test_*_concurrent_no_*` cases in
 `uniko2/crates/uniko-store/tests/storage_tests.rs` continue to assert non-regression as
@@ -479,7 +495,7 @@ The four `test_*_concurrent_no_*` cases in
 |---|---|
 | C1 L0 snapshot | `l0.rs:87-159` (fields), `context.rs:12-16`, `l0_visibility.rs:93-130/132-169/171-213/298-328/354-383`, `l0_manager.rs:65-77/82-90` |
 | C2 Lance pinning | `snapshot.rs:9-33`, `manager.rs:75/409/521/534/544`, `vertex.rs:92/96-99`, `lance.rs:127-133/530`, `writer.rs:3317/3480` |
-| C3 read/write-set | `transaction.rs:105-133/39-45/177-186`, `session.rs:828`, `read.rs:224`, `property_manager.rs:911`, `df_graph/mod.rs:503` |
+| C3 read/write-set | `transaction.rs:105-133/39-45/177-186`, `session.rs:828`, `read.rs:224`, `property_manager.rs:911`, `df_graph/mod.rs:503`, `df_graph/read_set_exec.rs` (`ReadSetRecordingExec`), `df_graph/mod.rs` (`record_batch_ids`), `df_planner.rs` (scan-wrap + `finalize_schemaless_scan`) |
 | C4 validation | `writer.rs:171/447-652/456/473-527/534/541`, `l0.rs:137/1023/1119-1193`, `write.rs:1365-1410/1443-1480`, `writer.rs:1437-1495/1753-1754` |
 | C5 FOR UPDATE | `cypher.pest:86/522`, `ast.rs:251-255`, `walker.rs:160-175`, `lance.rs:47` |
 | C6 CRDT | `schema.rs:77-86`, `l0.rs:246-283` |

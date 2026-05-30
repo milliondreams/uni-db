@@ -290,6 +290,9 @@ impl L0Buffer {
     ///
     /// When the entry is empty (new vertex insert), skips the expensive JSON
     /// round-trip and directly assigns the properties.
+    ///
+    /// Logs a warning when a CRDT value is overwritten by a non-CRDT scalar
+    /// (limitation R1).
     fn merge_crdt_properties(entry: &mut Properties, properties: Properties) {
         // Fast path: new vertex with no existing properties — skip JSON round-trip
         if entry.is_empty() {
@@ -313,6 +316,20 @@ impl L0Buffer {
                     continue;
                 }
                 // try_merge failed (type mismatch) — fall through to overwrite.
+            } else if try_as_crdt(&v).is_none()
+                && entry.get(&k).is_some_and(|e| try_as_crdt(e).is_some())
+            {
+                // R1: an existing CRDT value is overwritten by a non-CRDT scalar
+                // (last-writer-wins), silently discarding the CRDT's merged state
+                // — a property written as BOTH a CRDT and last-writer-wins. The OCC
+                // write-set carve-out lets CRDT-only writers commit without
+                // conflicting, so a concurrent LWW write on the same property
+                // cannot be flagged as a conflict; surface it here instead.
+                tracing::warn!(
+                    property = %k,
+                    "overwriting CRDT property with non-CRDT value (last-writer-wins); \
+                     merged CRDT state is discarded"
+                );
             }
             // Fallback: Overwrite (last-writer-wins).
             entry.insert(k, v);

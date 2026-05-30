@@ -51,6 +51,8 @@ use crate::query::df_graph::{
     GraphUnwindExec, GraphVectorKnnExec, L0Context, MutationContext, MutationExec,
     OptionalFilterExec,
 };
+#[cfg(feature = "ssi")]
+use crate::query::df_graph::ReadSetRecordingExec;
 use crate::query::planner::{
     LogicalPlan, STRUCT_ONLY_SENTINEL, aggregate_column_name, collect_properties_from_plan,
 };
@@ -1655,6 +1657,47 @@ impl HybridPhysicalPlanner {
         Some((lance_str, physical))
     }
 
+    /// Wraps a leaf scan plan so surviving row identities feed the SSI read-set.
+    ///
+    /// No-op unless the `ssi` feature is enabled and the current transaction has
+    /// an optimistic read-set (a read-write transaction). Must be inserted above
+    /// the residual `FilterExec` and below any structural projection so the
+    /// `{var}._vid` / `{var}._eid` columns are still present.
+    #[cfg(feature = "ssi")]
+    fn wrap_read_set_recording(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        variable: &str,
+    ) -> Arc<dyn ExecutionPlan> {
+        let has_read_set = self
+            .graph_ctx
+            .l0_context()
+            .transaction_l0
+            .as_ref()
+            .is_some_and(|l0| l0.read().occ_read_set.is_some());
+        if !has_read_set {
+            return plan;
+        }
+        Arc::new(ReadSetRecordingExec::new(
+            plan,
+            self.graph_ctx.clone(),
+            variable,
+        ))
+    }
+
+    /// Wraps a leaf scan plan for SSI read-set recording; no-op without `ssi`.
+    ///
+    /// This is the inert variant compiled when the `ssi` feature is disabled, so
+    /// the default build keeps unchanged behavior and returns `plan` verbatim.
+    #[cfg(not(feature = "ssi"))]
+    fn wrap_read_set_recording(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        _variable: &str,
+    ) -> Arc<dyn ExecutionPlan> {
+        plan
+    }
+
     fn apply_scan_filter(
         &self,
         plan: Arc<dyn ExecutionPlan>,
@@ -2192,6 +2235,10 @@ impl HybridPhysicalPlanner {
         // comparing `_vid` (UInt64) against Int64 literals in type coercion.
         scan_plan = self.apply_scan_filter(scan_plan, variable, filter, Some(label_name))?;
 
+        // Record surviving (post-filter) row ids into the SSI read-set so keyed
+        // matches conflict only with writers touching the same rows.
+        scan_plan = self.wrap_read_set_recording(scan_plan, variable);
+
         if need_full {
             // Filter sentinel markers and overflow_json from the structural
             // projection. Keep _all_props so properties()/keys() UDFs can use it.
@@ -2384,6 +2431,10 @@ impl HybridPhysicalPlanner {
         // Apply filter BEFORE structural projection to avoid ambiguous column
         // references (flat `var._vid` vs struct `var._vid` field).
         let mut plan = self.apply_scan_filter(scan_plan, variable, filter, None)?;
+
+        // Record surviving (post-filter) row ids into the SSI read-set so keyed
+        // matches conflict only with writers touching the same rows.
+        plan = self.wrap_read_set_recording(plan, variable);
 
         // If we need the full object (structural access), build a struct with _labels + properties.
         // This enables labels(n)/keys(n) UDFs which expect a Struct column with a _labels field.
@@ -4071,6 +4122,15 @@ impl HybridPhysicalPlanner {
         };
 
         // 2. Probe-side plan must be a top-level GraphScanExec.
+        //
+        // We deliberately do NOT peek through an SSI `ReadSetRecordingExec`
+        // here. That wrapper is only inserted for read-write transactions with
+        // an active read-set, and `VidLookupJoinExec` drives the probe scan via
+        // `execute_with_vid_filter`, bypassing the wrapper — which would silently
+        // skip read-set capture for the probe rows. Letting the wrapper mask the
+        // scan makes this rewrite bail to `HashJoinExec`, which executes the
+        // wrapper normally and records the reads. Non-SSI / read-only contexts
+        // have no wrapper, so the optimization still fires there.
         if probe_plan
             .as_any()
             .downcast_ref::<GraphScanExec>()

@@ -78,6 +78,8 @@ pub mod pattern_exists;
 pub mod pred_dag;
 pub mod procedure_call;
 pub mod quantifier;
+#[cfg(feature = "ssi")]
+mod read_set_exec;
 pub mod recursive_cte;
 pub mod reduce;
 pub mod scan;
@@ -117,6 +119,8 @@ pub use mutation_remove::MutationRemoveExec;
 pub use mutation_set::MutationSetExec;
 pub use optional_filter::OptionalFilterExec;
 pub use procedure_call::GraphProcedureCallExec;
+#[cfg(feature = "ssi")]
+pub use read_set_exec::ReadSetRecordingExec;
 pub use scan::GraphScanExec;
 pub use shortest_path::GraphShortestPathExec;
 pub use traverse::{GraphTraverseExec, GraphTraverseMainExec};
@@ -684,6 +688,53 @@ impl GraphExecutionContext {
         for (nbr, eid) in neighbors {
             rs.vertices.insert(*nbr);
             rs.edges.insert(*eid);
+        }
+    }
+
+    /// Records the vertex/edge ids in the given batch columns into the read-set.
+    ///
+    /// Used by [`ReadSetRecordingExec`] to capture the identities of rows that
+    /// survived a scan's filters. No-op when there is no transaction read-set
+    /// (read-only / analytical contexts).
+    ///
+    /// [`ReadSetRecordingExec`]: crate::query::df_graph::ReadSetRecordingExec
+    #[cfg(feature = "ssi")]
+    pub(crate) fn record_batch_ids(
+        &self,
+        batch: &arrow_array::RecordBatch,
+        vertex_cols: &[usize],
+        edge_cols: &[usize],
+    ) {
+        use arrow_array::{Array, UInt64Array};
+
+        if vertex_cols.is_empty() && edge_cols.is_empty() {
+            return;
+        }
+        let Some(tx_l0) = &self.l0_context.transaction_l0 else {
+            return;
+        };
+        let guard = tx_l0.read();
+        let Some(read_set) = &guard.occ_read_set else {
+            return;
+        };
+        let mut rs = read_set.lock();
+        for &col in vertex_cols {
+            if let Some(arr) = batch.column(col).as_any().downcast_ref::<UInt64Array>() {
+                for i in 0..arr.len() {
+                    if !arr.is_null(i) {
+                        rs.vertices.insert(Vid::from(arr.value(i)));
+                    }
+                }
+            }
+        }
+        for &col in edge_cols {
+            if let Some(arr) = batch.column(col).as_any().downcast_ref::<UInt64Array>() {
+                for i in 0..arr.len() {
+                    if !arr.is_null(i) {
+                        rs.edges.insert(Eid::from(arr.value(i)));
+                    }
+                }
+            }
         }
     }
 }

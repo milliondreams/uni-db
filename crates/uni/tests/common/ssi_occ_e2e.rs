@@ -224,19 +224,17 @@ async fn read_only_queries_never_abort_under_writes() -> Result<()> {
 
 // ── Failure paths / antidependencies ────────────────────────────────────────
 
-/// KNOWN LIMITATION (pinned): read-write antidependencies through a bare label
-/// scan are NOT tracked. Recording every physically-scanned row would falsely
-/// conflict disjoint keyed writers on the same label (the vectorized scan reads
-/// the whole label, not just the `{id:'x'}` match), defeating keyed RMW. Edge
-/// and traversal reads ARE tracked (`traversal_antidependency_aborts`); use
-/// `FOR UPDATE` to guard scan-based read-modify-write. This test pins the
-/// current behavior so a future precise-scan implementation surfaces here.
+/// Read-write antidependency through a keyed label scan aborts: a transaction
+/// that read `x` via a scan, then writes after a concurrent committer modifies
+/// `x`, must abort. The read-set is captured AFTER the residual filter (by
+/// `ReadSetRecordingExec`), so only the matched row `x` enters the read-set —
+/// not the whole label (see `scan_read_disjoint_key_no_false_abort`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn scan_read_antidependency_is_not_tracked() -> Result<()> {
+async fn scan_read_antidependency_aborts() -> Result<()> {
     let db = counter_db().await?;
     let s_a = db.session();
     let tx_a = s_a.tx().await?;
-    // tx_a reads x via a label scan — not recorded in the read-set.
+    // tx_a reads x via a label scan — recorded in the read-set post-filter.
     tx_a.query("MATCH (c:Counter {id: 'x'}) RETURN c.n").await?;
 
     // A concurrent transaction writes x and commits.
@@ -248,9 +246,46 @@ async fn scan_read_antidependency_is_not_tracked() -> Result<()> {
         tx_b.commit().await?;
     }
 
-    // tx_a writes an unrelated vertex and commits — does NOT abort, because the
-    // scan read of x was not tracked (documented limitation).
+    // tx_a writes an unrelated vertex and commits — must abort, because x (which
+    // tx_a read) was concurrently written: a read-write antidependency.
     tx_a.execute("CREATE (:Counter {id: 'y', n: 0})").await?;
+    match tx_a.commit().await {
+        Err(UniError::SerializationConflict { .. }) => Ok(()),
+        other => panic!("expected SerializationConflict, got {other:?}"),
+    }
+}
+
+/// Post-filter read-set precision: a transaction that read `x` via a keyed scan
+/// does NOT abort when a *disjoint* vertex `y` is concurrently written. If the
+/// scan over-recorded the whole label (pre-filter), this would falsely conflict
+/// — this pins that `ReadSetRecordingExec` records only the matched row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scan_read_disjoint_key_no_false_abort() -> Result<()> {
+    let db = counter_db().await?;
+    {
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (:Counter {id: 'y', n: 0})").await?;
+        tx.commit().await?;
+    }
+
+    let s_a = db.session();
+    let tx_a = s_a.tx().await?;
+    // tx_a reads only x (the residual filter narrows the Counter scan to x).
+    tx_a.query("MATCH (c:Counter {id: 'x'}) RETURN c.n").await?;
+
+    // A concurrent transaction writes the disjoint vertex y and commits.
+    {
+        let s_b = db.session();
+        let tx_b = s_b.tx().await?;
+        tx_b.execute("MATCH (c:Counter {id: 'y'}) SET c.n = 100")
+            .await?;
+        tx_b.commit().await?;
+    }
+
+    // tx_a writes an unrelated vertex and commits — must SUCCEED: x was not
+    // written, and y was never in tx_a's read-set.
+    tx_a.execute("CREATE (:Counter {id: 'z', n: 0})").await?;
     tx_a.commit().await?;
     Ok(())
 }

@@ -325,12 +325,10 @@ impl Transaction {
             let handle = writer.row_lock_handle(&key);
             // Bounded wait so a deadlock surfaces as a retryable timeout rather
             // than hanging the transaction.
-            let guard = tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                handle.lock_owned(),
-            )
-            .await
-            .map_err(|_| UniError::Timeout { timeout_ms: 10_000 })?;
+            let guard =
+                tokio::time::timeout(std::time::Duration::from_secs(10), handle.lock_owned())
+                    .await
+                    .map_err(|_| UniError::Timeout { timeout_ms: 10_000 })?;
             self.for_update_held.lock().insert(key);
             self.for_update_guards.lock().push(guard);
         }

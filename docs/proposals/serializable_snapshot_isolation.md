@@ -44,7 +44,9 @@ and `crates/uni-store/src/runtime/occ.rs`.
 | **C1** L0 snapshot reads (strategy D) | **Done** (`L0Manager::snapshot_isolated`, committed `50e15e4af`); production wiring into `get_context` + generation GC = follow-up (F). |
 | **C3/C4** write-set OCC — lost update | **Done** (`occ.rs`, `commit_transaction_l0` validation). Closes wishlist Request 1. |
 | **C4** serializable MERGE | **Done** (commit-time `constraint_index` check). Closes wishlist Request 2. |
-| **C3/C4** read-set SSI (rw-antidependency) | **Done**, item-level, best-effort coverage (instrumented at the primary keyed vertex-read paths in `l0_visibility`; full read-path coverage — `property_manager`/scan/`get_neighbors`/edges — is the follow-up to claim complete 1SR). |
+| **C3/C4** read-set SSI (rw-antidependency) | **Done**, item-level. Covered (2026-05-30): keyed vertex point-reads, **edge reads**, and **traversals** (`record_neighbor_reads`). **Known gap:** bare label scans are intentionally *not* tracked (recording the whole columnar scan would falsely conflict disjoint keyed writers); guard with `FOR UPDATE`. See §6.3. |
+| **C6** CRDT carve-out | **Done** (2026-05-30) — concurrent CRDT-only writes to a vertex merge instead of aborting; `WriteSet::from_l0` excludes them via shared `try_as_crdt`. See §6.6. |
+| **Retry ergonomics** | **Done** (2026-05-30) — `UniError::is_retriable()` + `Session::transact_with_retry`/`execute_with_retry` (`api/retry.rs`, unconditional). Closes the §9 "bounded-retry helper" item. |
 | **C6** CRDT commutative fast-path | **Pre-existing** (`schema.rs:77-86`, `l0.rs` CRDT merge). |
 | **C2** Lance base-read pinning | **Partial** — row-level `_version <= hwm` filtering via `version_high_water_mark`/`apply_version_filter` already exists and is wired. **Key finding:** because a transaction's storage access is *read-only* (writes go to `tx_l0`; storage writes happen at commit), a transaction can use a `storage.pinned(manifest{hwm=started_at_version})` view for all its reads cleanly. Integration point: swap `Executor::storage` to the pinned view per-tx (`executor/core.rs` field; set in `impl_query.rs:417` `execute_internal_with_tx_l0`). Coupled with F (below). |
 | **C5** `FOR UPDATE` escape hatch | **Done** (`for_update.rs` lock-key extractor + `Writer::row_lock_handle` per-key lock map + `Transaction` lock pre-pass holding guards until commit/rollback). Grammar/AST/walker + 11 constructor sites updated; per-key locks acquired at MATCH for keyed single-node `FOR UPDATE` (the RMW case); other patterns log a warning. 8 tests (lock-key unit + mutual-exclusion + release). **Note:** without the `ssi` feature, `FOR UPDATE` parses but is a documented no-op (enforcement is `ssi`-gated; the grammar is unconditional). |
@@ -63,8 +65,11 @@ DuckDB (uni-db's stated sibling) and every distribution-ready SI/SSI system uses
   `commit_transaction_l0` holds `flush_lock` (`writer.rs:456`) across every commit; the
   `concurrent_writer` refactor (landed, Phase 4, `a5549c9c0`) made it the sole commit
   serialization point. Validation drops into that critical section with no new global lock.
-- `Transaction::started_at_version` (`transaction.rs:126`) is **already captured** at
-  tx-begin and currently **unused for read filtering** — exactly the snapshot timestamp OCC needs.
+- A per-transaction snapshot timestamp is captured at tx-begin. *(Implemented: the OCC
+  snapshot stamp is a dedicated per-commit `Writer::commit_sequence` recorded into
+  `L0Buffer::occ_read_seq` at begin — **not** `started_at_version`, which increments
+  per-mutation (§6.2) and so cannot order commits. References to `started_at_version` as
+  the OCC timestamp elsewhere in this doc predate the implementation.)*
 - This is the safety layer `concurrent_writer` *requires* to be correct: the moment commits
   run concurrently to widen throughput, silent LWW becomes data loss, not a curiosity.
 `─────────────────────────────────────────────────`
@@ -286,6 +291,26 @@ committed-writes registry and returned in `CommitResult`.)
 > is tractable (item-level). It is deliberately **not** applied to analytical/read-only
 > queries, whose read-sets would explode (§7).
 
+**Implemented coverage (2026-05-30).** `OccReadSet` is `Some` only for RW transactions
+(`writer.rs` `create_transaction_l0`), so every hook is a no-op for read-only/analytical
+queries. Captured paths:
+- **Keyed vertex point-reads** — `record_vertex_read` in `l0_visibility.rs`
+  (`lookup_vertex_prop` / `accumulate_vertex_props`).
+- **Edge reads** — `record_edge_read` (`lookup_edge_prop` / `accumulate_edge_props`).
+- **Traversals** — `record_neighbor_reads` in `df_graph/mod.rs` `get_neighbors` /
+  `get_neighbors_batch` records the source, each discovered neighbour, and each traversed
+  edge id (precise to the actual fan-out).
+
+**Known limitation — bare label scans are NOT tracked.** The vectorized Cypher scan
+(`scan.rs` `map_to_output_schema`) reads the *whole* label columnar-batch before the
+`{k:v}` predicate narrows it, so recording there would add every scanned row to the
+read-set and falsely conflict disjoint keyed writers on the same label — defeating keyed
+RMW. Precise per-match recording needs post-filter capture (a larger query-engine change),
+deferred. Until then, a read-write antidependency observed *only* through a bare label
+scan is not caught; guard those with `FOR UPDATE` (§6.5). This does not affect lost-update
+or serializable-MERGE, which are write-set / constraint based. Schemaless variable-length
+traversal (`build_edge_adjacency_map`) also bypasses `get_neighbors` and is a residual gap.
+
 ### 6.4 Commit-time validation (C4)
 
 Insert a validation block in `commit_transaction_l0` **immediately after `:456`,
@@ -345,13 +370,29 @@ For phantom-sensitive or hot-key transactions, an explicit opt-in pessimistic lo
 
 **Effort:** Medium (grammar/AST trivial; striped lock + executor threading is the work).
 
-### 6.6 Component C6 — CRDT fast-path (already present)
+### 6.6 Component C6 — CRDT fast-path
 
-For genuinely commutative counters, the value can **merge** instead of conflicting,
-sidestepping aborts. CRDTs already exist (`uni-common/src/core/schema.rs:77-86`) and L0
-already attempts CRDT merge (`l0.rs` `merge_crdt_properties` `~246-283`). No new work;
-documented here as the recommended pattern for high-contention counters, complementing
-OCC retry.
+For genuinely commutative counters, the value **merges** instead of conflicting,
+sidestepping aborts. CRDTs exist (`uni-common/src/core/schema.rs:77-86`) and L0
+merges them at commit (`l0.rs` `merge_crdt_properties`).
+
+**Implemented (2026-05-30):** the OCC write-set now *carves out* CRDT-only writes so
+concurrent increments to the same vertex both commit and merge instead of aborting.
+`WriteSet::from_l0` excludes a vertex iff every written property is a mergeable CRDT
+value (no delete, no label change), using the shared `l0.rs::try_as_crdt` predicate so
+the carve-out exactly mirrors `merge_crdt_properties`' merge-vs-overwrite decision (it
+can never exclude a write the merge would overwrite, which would lose an update).
+
+- **Accepted limitation (R1):** the carve-out is item-level, so a CRDT-only writer and a
+  concurrent last-writer-wins writer to the *same property* both commit (order-dependent
+  result). This is no new hazard — `merge_crdt_properties` already overwrites a CRDT value
+  when handed a non-CRDT one. Mixed CRDT+LWW writes and label/tombstone writes stay
+  conflictable.
+- **Edges** stay always-conflictable: every edge write asserts endpoints/type
+  (non-commutative topology), so no edge write qualifies for the carve-out.
+
+CRDT properties are not expressible via Cypher (schema-declared, programmatic writes), so
+the carve-out is exercised at the Writer layer (`uni-store/tests/common/ssi_occ_test.rs`).
 
 ---
 
@@ -411,15 +452,20 @@ Phases 1-2 deliver the entire wishlist. 3-5 deliver the full scoped guarantee.
 
 ## 10. Acceptance tests
 
-The two wishlist repros become regression tests (both currently **fail**):
+The two wishlist repros are implemented as regression tests and **pass** (2026-05-30,
+`crates/uni/tests/common/ssi_occ_e2e.rs`, real `tokio::spawn` concurrency under `--features ssi`):
 
-- **Atomic increment** (`wishlist §Request 1`): two concurrent
-  `MATCH (c:Counter {id:'x'}) SET c.n = c.n + 1` → assert `n == 2`. Passes after Phase 2
-  (second committer aborts on write-set conflict; retry reads `n==1`, writes `2`).
-- **Serializable MERGE** (`wishlist §Request 2`): 16 concurrent `MERGE (e:E {eid:'shared'})`
-  → assert `count == 1`. Passes after Phase 2 (constraint_index conflict check under `flush_lock`).
-- Plus: SI read stability under concurrent flush (Phase 1/4); read-set anomaly abort
-  (Phase 3); `FOR UPDATE` mutual exclusion + no deadlock (Phase 5).
+- **Atomic increment** (`wishlist §Request 1`): concurrent
+  `MATCH (c:Counter {id:'x'}) SET c.n = c.n + 1` via `Session::transact_with_retry` →
+  `n == N` (2-writer and 16-writer stress). Second committer aborts on write-set conflict;
+  the retry re-reads and re-applies.
+- **Serializable MERGE** (`wishlist §Request 2`): 16 concurrent `MERGE (e:E {code:'shared'})`
+  → `count == 1` (losers abort on the unique-key check under `flush_lock`).
+- Plus (passing): real read-write antidependency abort via edge/traversal reads; the
+  scan-only antidependency *non*-tracking limitation (pinned); read-only stability under
+  concurrent writes; `FOR UPDATE` mutual exclusion, lock release on commit *and* rollback,
+  multi-key no-deadlock, unsupported-pattern no-op. CRDT carve-out + abort-leaves-no-trace
+  at the Writer layer (`uni-store/tests/common/ssi_occ_test.rs`).
 
 The four `test_*_concurrent_no_*` cases in
 `uniko2/crates/uniko-store/tests/storage_tests.rs` continue to assert non-regression as

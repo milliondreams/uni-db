@@ -150,7 +150,10 @@ async fn make_writer_unique() -> Result<(Arc<Writer>, TempDir)> {
 
 fn eid_props(value: &str) -> HashMap<String, uni_common::Value> {
     let mut props = HashMap::new();
-    props.insert("eid".to_string(), uni_common::Value::String(value.to_string()));
+    props.insert(
+        "eid".to_string(),
+        uni_common::Value::String(value.to_string()),
+    );
     props
 }
 
@@ -242,5 +245,177 @@ async fn disjoint_writes_without_read_do_not_conflict() -> Result<()> {
         .insert_vertex_with_labels(y, counter_props(9), &[LABEL.to_string()], Some(&tx_a))
         .await?;
     writer.commit_transaction_l0(tx_a).await?;
+    Ok(())
+}
+
+// ── CRDT carve-out (FIX A): concurrent commutative writes must merge, not abort ──
+
+/// A property map with a single GCounter under `counter`, written with no
+/// labels so the OCC CRDT carve-out applies.
+fn gcounter_props(actor: &str, n: u64) -> HashMap<String, uni_common::Value> {
+    let mut gc = uni_crdt::GCounter::new();
+    gc.increment(actor, n);
+    let v: uni_common::Value = serde_json::to_value(uni_crdt::Crdt::GCounter(gc))
+        .unwrap()
+        .into();
+    HashMap::from([("counter".to_string(), v)])
+}
+
+/// Reads back the committed `counter` GCounter total for `vid` from the main L0.
+fn gcounter_total(writer: &Writer, vid: uni_common::core::id::Vid) -> u64 {
+    let ctx = QueryContext::new(writer.l0_manager.get_current());
+    let v = lookup_vertex_prop(vid, "counter", Some(&ctx)).expect("counter present");
+    let json: serde_json::Value = v.into();
+    match serde_json::from_value::<uni_crdt::Crdt>(json).unwrap() {
+        uni_crdt::Crdt::GCounter(gc) => gc.value(),
+        other => panic!("expected GCounter, got {other:?}"),
+    }
+}
+
+/// Two concurrent CRDT-counter increments to the same vertex must BOTH commit
+/// and merge — the conflict that would defeat CRDT semantics is carved out.
+#[tokio::test]
+async fn concurrent_crdt_increments_merge_instead_of_conflicting() -> Result<()> {
+    let (writer, _dir) = make_writer().await?;
+    let vid = writer.next_vid().await?;
+    // Seed an empty counter (no labels → carve-out eligible).
+    writer
+        .insert_vertex_with_labels(vid, gcounter_props("seed", 0), &[], None)
+        .await?;
+
+    let tx_a = writer.create_transaction_l0();
+    let tx_b = writer.create_transaction_l0();
+    writer
+        .insert_vertex_with_labels(vid, gcounter_props("a", 5), &[], Some(&tx_a))
+        .await?;
+    writer
+        .insert_vertex_with_labels(vid, gcounter_props("b", 7), &[], Some(&tx_b))
+        .await?;
+
+    // Neither aborts; the second merges into the first's committed state.
+    writer.commit_transaction_l0(tx_a).await?;
+    writer.commit_transaction_l0(tx_b).await?;
+
+    assert_eq!(gcounter_total(&writer, vid), 12, "5 + 7 should merge to 12");
+    Ok(())
+}
+
+/// R1 (documented limitation): a CRDT-only writer and a concurrent LWW writer to
+/// the same property both commit — the item-level carve-out cannot make them
+/// conflict. No new hazard: `merge_crdt_properties` already overwrites a CRDT
+/// value with a non-CRDT one. The final value is commit-order dependent.
+#[tokio::test]
+async fn crdt_only_vs_lww_same_prop_both_commit() -> Result<()> {
+    let (writer, _dir) = make_writer().await?;
+    let vid = writer.next_vid().await?;
+    writer
+        .insert_vertex_with_labels(vid, gcounter_props("seed", 0), &[], None)
+        .await?;
+
+    let tx_a = writer.create_transaction_l0(); // CRDT increment (carved out)
+    let tx_b = writer.create_transaction_l0(); // plain overwrite of `counter`
+    writer
+        .insert_vertex_with_labels(vid, gcounter_props("a", 5), &[], Some(&tx_a))
+        .await?;
+    let lww = HashMap::from([("counter".to_string(), uni_common::Value::Int(99))]);
+    writer
+        .insert_vertex_with_labels(vid, lww, &[], Some(&tx_b))
+        .await?;
+
+    // Both commit (no conflict); this documents the accepted R1 semantics.
+    writer.commit_transaction_l0(tx_a).await?;
+    writer.commit_transaction_l0(tx_b).await?;
+    Ok(())
+}
+
+/// A write mixing a CRDT property with a non-CRDT property stays conflictable —
+/// the LWW part can still be lost, so the carve-out must not apply.
+#[tokio::test]
+async fn mixed_crdt_and_lww_write_still_conflicts() -> Result<()> {
+    let (writer, _dir) = make_writer().await?;
+    let vid = writer.next_vid().await?;
+    writer
+        .insert_vertex_with_labels(vid, gcounter_props("seed", 0), &[], None)
+        .await?;
+
+    let mut mixed_a = gcounter_props("a", 5);
+    mixed_a.insert("n".to_string(), uni_common::Value::Int(1));
+    let mut mixed_b = gcounter_props("b", 7);
+    mixed_b.insert("n".to_string(), uni_common::Value::Int(2));
+
+    let tx_a = writer.create_transaction_l0();
+    let tx_b = writer.create_transaction_l0();
+    writer
+        .insert_vertex_with_labels(vid, mixed_a, &[], Some(&tx_a))
+        .await?;
+    writer
+        .insert_vertex_with_labels(vid, mixed_b, &[], Some(&tx_b))
+        .await?;
+
+    writer.commit_transaction_l0(tx_a).await?;
+    let err = writer.commit_transaction_l0(tx_b).await.unwrap_err();
+    match err.downcast::<UniError>() {
+        Ok(UniError::SerializationConflict { .. }) => Ok(()),
+        Ok(other) => panic!("expected SerializationConflict, got {other:?}"),
+        Err(other) => panic!("expected typed UniError, got {other:?}"),
+    }
+}
+
+/// A delete and a concurrent update of the same vertex conflict (the tombstone
+/// is in the write-set; deletion is not commutative with an update).
+#[tokio::test]
+async fn delete_vs_update_same_vertex_conflicts() -> Result<()> {
+    let (writer, _dir) = make_writer().await?;
+    let vid = writer.next_vid().await?;
+    writer
+        .insert_vertex_with_labels(vid, counter_props(0), &[LABEL.to_string()], None)
+        .await?;
+
+    let tx_a = writer.create_transaction_l0();
+    let tx_b = writer.create_transaction_l0();
+    writer
+        .delete_vertex(vid, Some(vec![LABEL.to_string()]), Some(&tx_a))
+        .await?;
+    writer
+        .insert_vertex_with_labels(vid, counter_props(1), &[LABEL.to_string()], Some(&tx_b))
+        .await?;
+
+    writer.commit_transaction_l0(tx_a).await?;
+    let err = writer.commit_transaction_l0(tx_b).await.unwrap_err();
+    match err.downcast::<UniError>() {
+        Ok(UniError::SerializationConflict { .. }) => Ok(()),
+        Ok(other) => panic!("expected SerializationConflict, got {other:?}"),
+        Err(other) => panic!("expected typed UniError, got {other:?}"),
+    }
+}
+
+/// An aborted commit leaves no trace: after the loser aborts, the committed
+/// value is the winner's, and the loser's write is fully discarded.
+#[tokio::test]
+async fn aborted_commit_leaves_no_trace() -> Result<()> {
+    let (writer, _dir) = make_writer().await?;
+    let vid = writer.next_vid().await?;
+    writer
+        .insert_vertex_with_labels(vid, counter_props(0), &[LABEL.to_string()], None)
+        .await?;
+
+    let tx_a = writer.create_transaction_l0();
+    let tx_b = writer.create_transaction_l0();
+    writer
+        .insert_vertex_with_labels(vid, counter_props(11), &[LABEL.to_string()], Some(&tx_a))
+        .await?;
+    writer
+        .insert_vertex_with_labels(vid, counter_props(22), &[LABEL.to_string()], Some(&tx_b))
+        .await?;
+
+    writer.commit_transaction_l0(tx_a).await?;
+    let _ = writer.commit_transaction_l0(tx_b).await.unwrap_err();
+
+    // The committed value is A's (11); B's 22 left no trace.
+    let ctx = QueryContext::new(writer.l0_manager.get_current());
+    assert_eq!(
+        lookup_vertex_prop(vid, "n", Some(&ctx)),
+        Some(uni_common::Value::Int(11)),
+    );
     Ok(())
 }

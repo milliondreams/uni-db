@@ -35,6 +35,24 @@ fn now_nanos() -> i64 {
         .unwrap_or(0)
 }
 
+/// Returns the [`Crdt`] a property value encodes, or `None` if it is not one.
+///
+/// `Crdt` is `#[serde(tag = "t", content = "d")]`, so it deserializes only from a
+/// JSON object, and only `Value::Map(_)` produces one — gating on `Map` avoids
+/// allocating a JSON tree for large non-map values (e.g. embedding columns).
+///
+/// This is the single source of truth for "is this value CRDT-mergeable": both
+/// the commit-time merge ([`L0Buffer::merge_crdt_properties`]) and the OCC
+/// write-set carve-out ([`crate::runtime::occ::WriteSet::from_l0`]) consult it,
+/// so the carve-out can never exclude an item the merge would actually overwrite
+/// (which would silently lose an update).
+pub(crate) fn try_as_crdt(v: &Value) -> Option<Crdt> {
+    if !matches!(v, Value::Map(_)) {
+        return None;
+    }
+    serde_json::from_value::<Crdt>(v.clone().into()).ok()
+}
+
 /// Serialize a constraint key for O(1) uniqueness checks.
 /// Format: label + separator + sorted (prop_name, value) pairs.
 pub fn serialize_constraint_key(label: &str, key_values: &[(String, Value)]) -> Vec<u8> {
@@ -280,33 +298,23 @@ impl L0Buffer {
         }
 
         for (k, v) in properties {
-            // Crdt is `#[serde(tag = "t", content = "d")]` (see uni-crdt/src/lib.rs:42-61):
-            // it can only deserialize from a JSON Object. Only `Value::Map(_)` converts
-            // to a JSON Object — every other Value variant fails `from_value::<Crdt>`
-            // deterministically, but only after allocating the full JSON tree.
-            //
-            // Gating the probe on Map saves the allocation/deser for large non-Map
-            // values (notably embedding columns: `Value::List(...)` with thousands of
-            // floats), which dominate per-property cost on wide-row schemas. See the
-            // diag tests in profile_test.rs for the measurement.
-            if matches!(&v, uni_common::Value::Map(_)) {
-                let json_v: serde_json::Value = v.clone().into();
-                if let Ok(mut new_crdt) = serde_json::from_value::<Crdt>(json_v)
-                    && let Some(existing_v) = entry.get(&k)
-                    && let Ok(existing_crdt) =
-                        serde_json::from_value::<Crdt>(existing_v.clone().into())
+            // `try_as_crdt` performs the Map-gated CRDT probe (see its docs for the
+            // wide-row perf rationale). Sharing it with `WriteSet::from_l0` keeps the
+            // OCC carve-out consistent with this merge-versus-overwrite decision.
+            if let Some(mut new_crdt) = try_as_crdt(&v)
+                && let Some(existing_v) = entry.get(&k)
+                && let Ok(existing_crdt) = serde_json::from_value::<Crdt>(existing_v.clone().into())
+            {
+                // Use try_merge to avoid panic on type mismatch.
+                if new_crdt.try_merge(&existing_crdt).is_ok()
+                    && let Ok(merged_json) = serde_json::to_value(new_crdt)
                 {
-                    // Use try_merge to avoid panic on type mismatch
-                    if new_crdt.try_merge(&existing_crdt).is_ok()
-                        && let Ok(merged_json) = serde_json::to_value(new_crdt)
-                    {
-                        entry.insert(k, uni_common::Value::from(merged_json));
-                        continue;
-                    }
-                    // try_merge failed (type mismatch) — fall through to overwrite.
+                    entry.insert(k, uni_common::Value::from(merged_json));
+                    continue;
                 }
+                // try_merge failed (type mismatch) — fall through to overwrite.
             }
-            // Fallback: Overwrite
+            // Fallback: Overwrite (last-writer-wins).
             entry.insert(k, v);
         }
     }

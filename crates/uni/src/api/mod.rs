@@ -25,6 +25,8 @@ pub mod bulk {
     pub use uni_bulk::bulk::*;
 }
 pub mod compaction;
+#[cfg(feature = "ssi")]
+pub(crate) mod for_update;
 pub mod fork;
 /// Fork diff/promote types and engine, re-exported from `uni-fork`.
 ///
@@ -59,6 +61,7 @@ pub mod notifications {
 }
 pub mod prepared;
 pub mod query_builder;
+pub mod retry;
 pub mod rule_registry;
 pub mod schema;
 pub mod session;

@@ -95,6 +95,8 @@ tracing-opentelemetry = "0.28"
 opentelemetry = "0.27"
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"] }
+# Jittered backoff for `Session::transact_with_retry` (api/retry.rs).
+rand = { workspace = true }
 # Note: uni-db has no direct ort / tokenizers / hf-hub / ndarray consumers
 # after the LocalOnnxRerankerProvider hoist into uni-xervo (0.5.2). All ONNX
 # access flows through uni-xervo's provider facades.
@@ -186,7 +188,7 @@ storage-internals = []
 # Prototype: forwards the strategy-D L0 snapshot-isolation flag (default off).
 l0-snapshot = ["uni-store/l0-snapshot"]
 # Umbrella: forwards the SSI/OCC commit-validation flag (default off).
-ssi = ["uni-store/ssi", "l0-snapshot"]
+ssi = ["uni-store/ssi", "uni-query/ssi", "l0-snapshot"]
 provider-candle = ["uni-xervo/provider-candle"]
 provider-mistralrs = ["uni-xervo/provider-mistralrs"]
 provider-openai = ["uni-xervo/provider-openai"]

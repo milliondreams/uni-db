@@ -47,6 +47,7 @@ pub use api::impl_locy::LocyRuleRegistry;
 pub use api::multi_agent::{LeaseGuard, WriteLease, WriteLeaseProvider};
 pub use api::notifications::{CommitNotification, CommitStream, WatchBuilder};
 pub use api::prepared::{PreparedLocy, PreparedLocyBinder, PreparedQuery, PreparedQueryBinder};
+pub use api::retry::RetryOptions;
 pub use api::rule_registry::{RuleInfo, RuleRegistry};
 pub use api::schema::{
     ConstraintInfo, EdgeTypeBuilder, EdgeTypeInfo, IndexInfo, IndexType, LabelBuilder, LabelInfo,

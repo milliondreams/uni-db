@@ -7,6 +7,8 @@
 //! through sessions, and sessions are the factory for transactions (writes).
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -19,9 +21,10 @@ use crate::api::UniInner;
 use crate::api::hooks::{HookContext, QueryType, SessionHook};
 use crate::api::impl_locy::LocyRuleRegistry;
 use crate::api::locy_result::LocyResult;
+use crate::api::retry::RetryOptions;
 use crate::api::transaction::{IsolationLevel, Transaction};
 use uni_common::{Result, UniError, Value};
-use uni_query::{ExplainOutput, ProfileOutput, QueryCursor, QueryResult, Row};
+use uni_query::{ExecuteResult, ExplainOutput, ProfileOutput, QueryCursor, QueryResult, Row};
 
 /// Atomic counters for plan cache hits/misses, shared between Session and its
 /// query execution helpers.
@@ -681,6 +684,95 @@ impl Session {
             });
         }
         Transaction::new(self).await
+    }
+
+    /// Runs `f` in a transaction, retrying on retriable conflicts.
+    ///
+    /// Each attempt opens a fresh transaction, passes it to `f`, and commits on
+    /// `Ok`. A retriable failure ([`UniError::is_retriable`]) from either `f` or
+    /// the commit rolls back and retries with jittered backoff, up to
+    /// `opts.max_attempts`; the final error is returned once attempts are
+    /// exhausted. Non-retriable errors return immediately. Because `commit`
+    /// consumes the transaction, `f` is re-run from scratch each attempt — it
+    /// must re-clone any captured input it consumes and re-read any value it
+    /// derives a write from, which is exactly what makes the retry observe the
+    /// winning transaction's committed state.
+    ///
+    /// The closure returns a boxed future borrowing the transaction; the
+    /// `Box::pin(async move { … })` wrapper at the call site is required.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # async fn ex(session: &uni_db::Session) -> uni_db::Result<()> {
+    /// use uni_db::RetryOptions;
+    /// session
+    ///     .transact_with_retry(RetryOptions::default(), |tx| {
+    ///         Box::pin(async move {
+    ///             tx.execute("MATCH (c:Counter {id: 'x'}) SET c.n = c.n + 1").await?;
+    ///             Ok(())
+    ///         })
+    ///     })
+    ///     .await?;
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// # Errors
+    /// Returns the last error once attempts are exhausted, or immediately for any
+    /// non-retriable error raised by `f`, by `tx()`, or by `commit()`.
+    pub async fn transact_with_retry<F, T>(&self, opts: RetryOptions, mut f: F) -> Result<T>
+    where
+        F: for<'a> FnMut(&'a Transaction) -> Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>,
+        T: Send,
+    {
+        let mut attempt: u32 = 1;
+        loop {
+            let tx = self.tx().await?;
+            match f(&tx).await {
+                Ok(value) => match tx.commit().await {
+                    Ok(_) => return Ok(value),
+                    // `commit` already consumed `tx`; nothing to roll back.
+                    Err(e) if e.is_retriable() && attempt < opts.max_attempts => {
+                        attempt += 1;
+                        opts.backoff(attempt).await;
+                    }
+                    Err(e) => return Err(e),
+                },
+                Err(e) if e.is_retriable() && attempt < opts.max_attempts => {
+                    tx.rollback();
+                    attempt += 1;
+                    opts.backoff(attempt).await;
+                }
+                Err(e) => {
+                    tx.rollback();
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    /// Runs a single mutation with conflict retry, using default options.
+    ///
+    /// Convenience over [`Session::transact_with_retry`] for a self-contained
+    /// statement such as an atomic read-modify-write `SET`.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # async fn ex(session: &uni_db::Session) -> uni_db::Result<()> {
+    /// session
+    ///     .execute_with_retry("MATCH (c:Counter {id: 'x'}) SET c.n = c.n + 1")
+    ///     .await?;
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// # Errors
+    /// Same as [`Session::transact_with_retry`].
+    pub async fn execute_with_retry(&self, cypher: &str) -> Result<ExecuteResult> {
+        let cypher = cypher.to_owned();
+        self.transact_with_retry(RetryOptions::default(), move |tx| {
+            let cypher = cypher.clone();
+            Box::pin(async move { tx.execute(&cypher).await })
+        })
+        .await
     }
 
     /// `true` when this session was returned by `Session::fork(...)`.

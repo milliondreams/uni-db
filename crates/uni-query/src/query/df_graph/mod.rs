@@ -596,6 +596,9 @@ impl GraphExecutionContext {
             );
         }
 
+        #[cfg(feature = "ssi")]
+        self.record_neighbor_reads(vid, &neighbors);
+
         neighbors
     }
 
@@ -648,6 +651,9 @@ impl GraphExecutionContext {
                 );
             }
 
+            #[cfg(feature = "ssi")]
+            self.record_neighbor_reads(vid, &neighbors);
+
             results.extend(
                 neighbors
                     .into_iter()
@@ -656,6 +662,29 @@ impl GraphExecutionContext {
         }
 
         results
+    }
+
+    /// Records traversed edges and discovered neighbours into the SSI read-set.
+    ///
+    /// No-op unless this is a read-write transaction (`occ_read_set` is `Some`
+    /// only then), so read-only and analytical traversals pay nothing. Recording
+    /// the source plus each neighbour vid and edge id gives item-level
+    /// antidependency coverage for traversals, matching the keyed read paths.
+    #[cfg(feature = "ssi")]
+    fn record_neighbor_reads(&self, src: Vid, neighbors: &[(Vid, Eid)]) {
+        let Some(tx_l0) = &self.l0_context.transaction_l0 else {
+            return;
+        };
+        let guard = tx_l0.read();
+        let Some(read_set) = &guard.occ_read_set else {
+            return;
+        };
+        let mut rs = read_set.lock();
+        rs.vertices.insert(src);
+        for (nbr, eid) in neighbors {
+            rs.vertices.insert(*nbr);
+            rs.edges.insert(*eid);
+        }
     }
 }
 

@@ -59,6 +59,10 @@ tokio-util = { workspace = true }
 
 [features]
 default = []
+# Optimistic concurrency control. Gates SSI read-set capture on the traversal
+# path (`GraphExecutionContext::record_neighbor_reads`); forwards to
+# `uni-store/ssi`. Default-off; see docs/proposals/serializable_snapshot_isolation.md.
+ssi = ["uni-store/ssi"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

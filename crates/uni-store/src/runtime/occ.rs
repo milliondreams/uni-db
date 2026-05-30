@@ -12,7 +12,7 @@
 
 use std::collections::{HashSet, VecDeque};
 
-use crate::runtime::l0::{L0Buffer, OccReadSet};
+use crate::runtime::l0::{L0Buffer, OccReadSet, try_as_crdt};
 use uni_common::core::id::{Eid, Vid};
 
 /// The set of items a transaction wrote, used for conflict detection.
@@ -27,13 +27,36 @@ pub struct WriteSet {
 impl WriteSet {
     /// Builds a write-set from a transaction's private L0 buffer.
     ///
-    /// Item-level granularity: every touched vertex/edge id (insert, update, or
-    /// tombstone) is included. Property-key granularity is intentionally not
-    /// tracked — two writers touching the same row conflict regardless of which
-    /// columns they wrote, which is the correct (if conservative) lost-update rule.
+    /// Item-level granularity: a touched vertex/edge id is a conflict candidate
+    /// regardless of which columns were written (the conservative lost-update
+    /// rule). The one exception is the CRDT carve-out: a vertex whose write
+    /// touched *only* CRDT-mergeable properties — with no delete and no label
+    /// change — is excluded, because `L0Buffer::merge_crdt_properties` will
+    /// commute those writes at commit. This lets concurrent CRDT-counter
+    /// increments to the same vertex both commit (and merge) instead of aborting.
+    ///
+    /// Mixed CRDT+non-CRDT writes, label changes, and deletes stay conflictable
+    /// (their last-writer-wins / structural part can still be lost). Edges are
+    /// always conflictable: every live edge write asserts endpoints/type, which
+    /// is non-commutative topology that no CRDT carve-out can cover.
     pub fn from_l0(l0: &L0Buffer) -> Self {
-        let mut vertices: HashSet<Vid> = l0.vertex_properties.keys().copied().collect();
+        let mut vertices: HashSet<Vid> = HashSet::new();
+        for (vid, props) in &l0.vertex_properties {
+            // A re-asserted/changed non-empty label set is not CRDT-mergeable, so a
+            // labelled write stays conflictable. A pure CRDT increment is written
+            // with no labels (`&[]`), so it remains eligible for the carve-out.
+            let label_changed = l0
+                .vertex_labels
+                .get(vid)
+                .is_some_and(|labels| !labels.is_empty());
+            let all_crdt = !props.is_empty() && props.values().all(|v| try_as_crdt(v).is_some());
+            if label_changed || !all_crdt {
+                vertices.insert(*vid);
+            }
+        }
+        // A delete is never commutative with a concurrent CRDT increment.
         vertices.extend(l0.vertex_tombstones.iter().copied());
+
         let mut edges: HashSet<Eid> = l0.edge_properties.keys().copied().collect();
         edges.extend(l0.edge_endpoints.keys().copied());
         edges.extend(l0.tombstones.keys().copied());
@@ -227,7 +250,92 @@ mod tests {
         // A tx with read_seq 0 cannot verify against the evicted seq 1.
         assert!(matches!(
             reg.check(0, &ws(&[42]), None),
-            Some(Conflict::HistoryTruncated { read_seq: 0, oldest: 2 })
+            Some(Conflict::HistoryTruncated {
+                read_seq: 0,
+                oldest: 2
+            })
         ));
+    }
+
+    // ── CRDT carve-out (`from_l0`) ───────────────────────────────────────────
+
+    fn vid(n: u64) -> Vid {
+        Vid::from(n)
+    }
+
+    /// A property map with a single GCounter CRDT value under `counter`.
+    fn crdt_props(actor: &str, n: u64) -> uni_common::Properties {
+        let mut gc = uni_crdt::GCounter::new();
+        gc.increment(actor, n);
+        let v: uni_common::Value = serde_json::to_value(uni_crdt::Crdt::GCounter(gc))
+            .unwrap()
+            .into();
+        uni_common::Properties::from([("counter".to_string(), v)])
+    }
+
+    fn int_props(n: i64) -> uni_common::Properties {
+        uni_common::Properties::from([("n".to_string(), uni_common::Value::Int(n))])
+    }
+
+    #[test]
+    fn crdt_only_write_without_labels_is_carved_out() {
+        let mut buf = L0Buffer::new(0, None);
+        buf.insert_vertex_with_labels(vid(1), crdt_props("a", 5), &[]);
+        // A pure CRDT increment with no label change merges at commit, so it must
+        // not be a conflict candidate — this is what lets concurrent increments
+        // both commit.
+        assert!(!WriteSet::from_l0(&buf).vertices.contains(&vid(1)));
+    }
+
+    #[test]
+    fn non_crdt_write_without_labels_is_conflictable() {
+        let mut buf = L0Buffer::new(0, None);
+        buf.insert_vertex_with_labels(vid(1), int_props(1), &[]);
+        assert!(WriteSet::from_l0(&buf).vertices.contains(&vid(1)));
+    }
+
+    #[test]
+    fn crdt_write_with_labels_stays_conflictable() {
+        let mut buf = L0Buffer::new(0, None);
+        // A label change is not CRDT-mergeable, so even an otherwise pure CRDT
+        // write stays a conflict candidate.
+        buf.insert_vertex_with_labels(vid(1), crdt_props("a", 5), &["Counter".to_string()]);
+        assert!(WriteSet::from_l0(&buf).vertices.contains(&vid(1)));
+    }
+
+    #[test]
+    fn mixed_crdt_and_lww_write_is_conflictable() {
+        let mut buf = L0Buffer::new(0, None);
+        let mut props = crdt_props("a", 5);
+        props.insert("n".to_string(), uni_common::Value::Int(1));
+        buf.insert_vertex_with_labels(vid(1), props, &[]);
+        // The LWW `n` can be lost, so the vertex must stay conflictable.
+        assert!(WriteSet::from_l0(&buf).vertices.contains(&vid(1)));
+    }
+
+    #[test]
+    fn plain_map_value_is_not_mistaken_for_crdt() {
+        let mut buf = L0Buffer::new(0, None);
+        let map = uni_common::Value::Map(std::collections::HashMap::from([(
+            "x".to_string(),
+            uni_common::Value::Int(1),
+        )]));
+        buf.insert_vertex_with_labels(
+            vid(1),
+            uni_common::Properties::from([("data".to_string(), map)]),
+            &[],
+        );
+        // A non-CRDT map is overwritten (LWW) by `merge_crdt_properties`, so it
+        // must remain conflictable.
+        assert!(WriteSet::from_l0(&buf).vertices.contains(&vid(1)));
+    }
+
+    #[test]
+    fn tombstoned_vertex_is_conflictable() {
+        let mut buf = L0Buffer::new(0, None);
+        buf.insert_vertex_with_labels(vid(1), crdt_props("a", 5), &[]);
+        buf.delete_vertex(vid(1)).unwrap();
+        // Deletion is not commutative with a concurrent increment.
+        assert!(WriteSet::from_l0(&buf).vertices.contains(&vid(1)));
     }
 }

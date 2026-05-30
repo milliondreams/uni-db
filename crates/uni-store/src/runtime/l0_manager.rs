@@ -196,11 +196,8 @@ mod snapshot_tests {
         assert_eq!(name_of(alice, &snap).as_deref(), Some("alice"));
 
         // A fresh latest view sees the new value...
-        let latest = QueryContext::new_with_pending(
-            mgr.get_current(),
-            None,
-            mgr.get_pending_flush(),
-        );
+        let latest =
+            QueryContext::new_with_pending(mgr.get_current(), None, mgr.get_pending_flush());
         assert_eq!(name_of(alice, &latest).as_deref(), Some("alice2"));
 
         // ...and the untouched vertex remains visible via the frozen generation.

@@ -299,9 +299,9 @@ impl Writer {
         #[cfg(feature = "ssi")]
         let commit_sequence = Arc::new(AtomicU64::new(0));
         #[cfg(feature = "ssi")]
-        let committed_writes = Arc::new(PlMutex::new(
-            crate::runtime::occ::CommitRegistry::new(OCC_REGISTRY_CAPACITY),
-        ));
+        let committed_writes = Arc::new(PlMutex::new(crate::runtime::occ::CommitRegistry::new(
+            OCC_REGISTRY_CAPACITY,
+        )));
         #[cfg(feature = "ssi")]
         let for_update_locks = Arc::new(dashmap::DashMap::new());
 
@@ -530,11 +530,11 @@ impl Writer {
                 // Read-set is consulted only for writing transactions, so a
                 // read-only commit (empty write-set) runs at snapshot isolation.
                 let read_guard = tx_l0.occ_read_set.as_ref().map(|rs| rs.lock());
-                if let Some(conflict) = self.committed_writes.lock().check(
-                    read_seq,
-                    &write_set,
-                    read_guard.as_deref(),
-                ) {
+                if let Some(conflict) =
+                    self.committed_writes
+                        .lock()
+                        .check(read_seq, &write_set, read_guard.as_deref())
+                {
                     return Err(anyhow::Error::new(
                         uni_common::UniError::SerializationConflict {
                             message: conflict.to_string(),

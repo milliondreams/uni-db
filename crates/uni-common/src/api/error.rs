@@ -270,6 +270,40 @@ pub enum UniError {
     },
 }
 
+impl UniError {
+    /// Returns `true` when retrying the failed operation from scratch may succeed.
+    ///
+    /// Distinguishes transient contention failures — optimistic-concurrency
+    /// aborts and lock/commit timeouts, which a fresh transaction can win — from
+    /// deterministic failures (bad query, schema or type violation) that would
+    /// fail identically on retry. This is the signal
+    /// [`Session::transact_with_retry`](../../../uni_db/api/session/struct.Session.html)
+    /// uses to decide whether to re-run a transaction closure.
+    ///
+    /// `TransactionExpired` is deliberately *not* retriable here: a fresh
+    /// transaction gets a new deadline, but the helper treats deadline expiry as
+    /// a caller-set budget, not a contention signal.
+    ///
+    /// # Examples
+    /// ```
+    /// use uni_common::UniError;
+    ///
+    /// assert!(UniError::SerializationConflict { message: "lost update".into() }.is_retriable());
+    /// assert!(!UniError::Schema { message: "no such label".into() }.is_retriable());
+    /// ```
+    #[must_use]
+    pub fn is_retriable(&self) -> bool {
+        matches!(
+            self,
+            UniError::SerializationConflict { .. }
+                | UniError::ConstraintConflict { .. }
+                | UniError::TransactionConflict { .. }
+                | UniError::CommitTimeout { .. }
+                | UniError::Timeout { .. }
+        )
+    }
+}
+
 pub type Result<T> = std::result::Result<T, UniError>;
 
 /// Why a Locy evaluation stopped before reaching its least fixed point.
@@ -383,5 +417,60 @@ impl std::fmt::Display for LocyIncomplete {
             )?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retriable_errors_are_contention_failures() {
+        let s = String::new;
+        let retriable = [
+            UniError::SerializationConflict { message: s() },
+            UniError::ConstraintConflict { message: s() },
+            UniError::TransactionConflict { message: s() },
+            UniError::CommitTimeout {
+                tx_id: s(),
+                hint: "",
+            },
+            UniError::Timeout { timeout_ms: 1 },
+        ];
+        for e in &retriable {
+            assert!(e.is_retriable(), "{e:?} should be retriable");
+        }
+    }
+
+    #[test]
+    fn deterministic_errors_are_not_retriable() {
+        let s = String::new;
+        let terminal = [
+            UniError::Parse {
+                message: s(),
+                position: None,
+                line: None,
+                column: None,
+                context: None,
+            },
+            UniError::Query {
+                message: s(),
+                query: None,
+            },
+            UniError::Schema { message: s() },
+            UniError::Constraint { message: s() },
+            UniError::InvalidArgument {
+                arg: s(),
+                message: s(),
+            },
+            // A caller-set deadline is not a contention signal.
+            UniError::TransactionExpired {
+                tx_id: s(),
+                hint: "",
+            },
+        ];
+        for e in &terminal {
+            assert!(!e.is_retriable(), "{e:?} should not be retriable");
+        }
     }
 }

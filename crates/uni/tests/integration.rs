@@ -42,6 +42,9 @@ mod session_tx;
 #[cfg(feature = "ssi")]
 #[path = "common/ssi_for_update.rs"]
 mod ssi_for_update;
+#[cfg(feature = "ssi")]
+#[path = "common/ssi_occ_e2e.rs"]
+mod ssi_occ_e2e;
 #[path = "common/storage/mod.rs"]
 mod storage;
 #[path = "common/vector_search/mod.rs"]

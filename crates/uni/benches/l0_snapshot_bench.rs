@@ -18,13 +18,11 @@
 
 use std::alloc::{GlobalAlloc, Layout};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::Once;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 
-use criterion::{
-    BatchSize, BenchmarkId, Criterion, black_box, criterion_group, criterion_main,
-};
+use criterion::{BatchSize, BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use mimalloc::MiMalloc;
 use parking_lot::RwLock;
 
@@ -225,12 +223,13 @@ fn bench_snapshot_latency(c: &mut Criterion) {
 fn bench_read_path(c: &mut Criterion) {
     let mut group = c.benchmark_group("read_path");
     group.sample_size(20);
-    let fixtures = [(Shape::Scalar, 10_000_usize), (Shape::Embed768, 10_000_usize)];
+    let fixtures = [
+        (Shape::Scalar, 10_000_usize),
+        (Shape::Embed768, 10_000_usize),
+    ];
     for &(shape, n) in &fixtures {
         let ctx = QueryContext::new(Arc::new(RwLock::new(build_l0(shape, n))));
-        let probe: Vec<Vid> = (0..1024)
-            .map(|k| Vid::from(scatter(k, n) as u64))
-            .collect();
+        let probe: Vec<Vid> = (0..1024).map(|k| Vid::from(scatter(k, n) as u64)).collect();
 
         let mut i = 0_usize;
         group.bench_function(BenchmarkId::new("lookup_vertex_prop", shape.label()), |b| {
@@ -241,21 +240,31 @@ fn bench_read_path(c: &mut Criterion) {
             });
         });
 
-        let batch: Vec<Vid> = (0..1000).map(|k| Vid::from(scatter(k * 3 + 1, n) as u64)).collect();
+        let batch: Vec<Vid> = (0..1000)
+            .map(|k| Vid::from(scatter(k * 3 + 1, n) as u64))
+            .collect();
         let mut vid_to_idx: HashMap<Vid, usize> = HashMap::with_capacity(batch.len());
         for (idx, vid) in batch.iter().enumerate() {
             vid_to_idx.insert(*vid, idx);
         }
-        group.bench_function(BenchmarkId::new("overlay_vertex_batch_1k", shape.label()), |b| {
-            b.iter_batched(
-                || (vec![Properties::new(); batch.len()], vec![false; batch.len()]),
-                |(mut result, mut deleted)| {
-                    overlay_vertex_batch(&vid_to_idx, &mut result, &mut deleted, Some(&ctx));
-                    black_box((result, deleted));
-                },
-                BatchSize::SmallInput,
-            );
-        });
+        group.bench_function(
+            BenchmarkId::new("overlay_vertex_batch_1k", shape.label()),
+            |b| {
+                b.iter_batched(
+                    || {
+                        (
+                            vec![Properties::new(); batch.len()],
+                            vec![false; batch.len()],
+                        )
+                    },
+                    |(mut result, mut deleted)| {
+                        overlay_vertex_batch(&vid_to_idx, &mut result, &mut deleted, Some(&ctx));
+                        black_box((result, deleted));
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
     }
     group.finish();
 }
@@ -387,5 +396,10 @@ fn print_memory_report_once() {
     });
 }
 
-criterion_group!(benches, bench_snapshot_latency, bench_read_path, bench_map_ops);
+criterion_group!(
+    benches,
+    bench_snapshot_latency,
+    bench_read_path,
+    bench_map_ops
+);
 criterion_main!(benches);

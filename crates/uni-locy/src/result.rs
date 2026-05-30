@@ -431,6 +431,7 @@ mod tests {
             approximate_groups: HashMap::new(),
             derived_fact_set: None,
             timed_out: false,
+            incomplete: None,
         };
 
         let cols = result

@@ -39,8 +39,6 @@ pub mod fork_diff {
 }
 pub(crate) mod fork_maintenance;
 pub mod fork_schema;
-#[cfg(feature = "ssi")]
-pub(crate) mod for_update;
 pub mod functions;
 /// Session/commit hooks — moved to `uni-plugin-host`; re-exported to keep the
 /// `uni_db::api::hooks::*` path stable.

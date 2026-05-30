@@ -63,6 +63,7 @@ where
     Ok(match clause {
         Clause::Match(m) => Clause::Match(uni_cypher::ast::MatchClause {
             optional: m.optional,
+            for_update: m.for_update,
             pattern: rewrite_pattern(m.pattern, rename)?,
             where_clause: opt_expr(m.where_clause, rename)?,
         }),

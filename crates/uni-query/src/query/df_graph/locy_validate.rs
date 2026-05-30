@@ -95,6 +95,7 @@ pub fn validate_collection_query(
                 optional: false,
                 pattern: cmd.pattern.clone(),
                 where_clause: cmd.where_expr.clone(),
+                for_update: false,
             }),
             Clause::Return(ReturnClause {
                 distinct: false,

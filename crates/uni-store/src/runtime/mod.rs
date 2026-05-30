@@ -8,6 +8,8 @@ pub mod id_reservoir;
 pub mod l0;
 pub mod l0_manager;
 pub mod l0_visibility;
+#[cfg(feature = "ssi")]
+pub mod occ;
 pub mod property_manager;
 pub mod vid_remapper;
 pub mod wal;

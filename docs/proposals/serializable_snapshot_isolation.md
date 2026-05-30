@@ -33,6 +33,23 @@ This document proposes the root-cause fix: **MVCC snapshot-isolation reads plus
 optimistic commit-time conflict detection**, layered onto the already-serialized
 `flush_lock` commit point. One mechanism subsumes all three wishlist requests.
 
+### Implementation status (2026-05-29, branch `feat/locy-timeout-hard-error`)
+
+All new behavior is behind the default-off `ssi` feature (`l0-snapshot` for C1 reads),
+so the default build is unchanged. Tests live in `crates/uni-store/tests/ssi_occ_test.rs`
+and `crates/uni-store/src/runtime/occ.rs`.
+
+| Component | Status |
+|---|---|
+| **C1** L0 snapshot reads (strategy D) | **Done** (`L0Manager::snapshot_isolated`, committed `50e15e4af`); production wiring into `get_context` + generation GC = follow-up (F). |
+| **C3/C4** write-set OCC — lost update | **Done** (`occ.rs`, `commit_transaction_l0` validation). Closes wishlist Request 1. |
+| **C4** serializable MERGE | **Done** (commit-time `constraint_index` check). Closes wishlist Request 2. |
+| **C3/C4** read-set SSI (rw-antidependency) | **Done**, item-level, best-effort coverage (instrumented at the primary keyed vertex-read paths in `l0_visibility`; full read-path coverage — `property_manager`/scan/`get_neighbors`/edges — is the follow-up to claim complete 1SR). |
+| **C6** CRDT commutative fast-path | **Pre-existing** (`schema.rs:77-86`, `l0.rs` CRDT merge). |
+| **C2** Lance base-read pinning | **Partial** — row-level `_version <= hwm` filtering via `version_high_water_mark`/`apply_version_filter` already exists and is wired. **Key finding:** because a transaction's storage access is *read-only* (writes go to `tx_l0`; storage writes happen at commit), a transaction can use a `storage.pinned(manifest{hwm=started_at_version})` view for all its reads cleanly. Integration point: swap `Executor::storage` to the pinned view per-tx (`executor/core.rs` field; set in `impl_query.rs:417` `execute_internal_with_tx_l0`). Coupled with F (below). |
+| **C5** `FOR UPDATE` escape hatch | **Done** (`for_update.rs` lock-key extractor + `Writer::row_lock_handle` per-key lock map + `Transaction` lock pre-pass holding guards until commit/rollback). Grammar/AST/walker + 11 constructor sites updated; per-key locks acquired at MATCH for keyed single-node `FOR UPDATE` (the RMW case); other patterns log a warning. 8 tests (lock-key unit + mutual-exclusion + release). **Note:** without the `ssi` feature, `FOR UPDATE` parses but is a documented no-op (enforcement is `ssi`-gated; the grammar is unconditional). |
+| **F** C1 production wiring | **TODO — larger than wiring.** **Root finding:** strategy-D freeze-by-rotate mutates the *global* main L0, so per-transaction-begin freezing would rotate on every tx → L0 fragmentation. Sound, cheap per-tx L0 snapshots require making the main L0 **copy-on-write** (writers Arc-swap on mutation; snapshot = `Arc::clone`) — a hot-write-path change. C2+F are coupled (consistent SI reads need L0 and base pinned to the same point) and together constitute a dedicated write-path subproject. `get_context` (`executor/core.rs:448`) is the additive read-side hook. |
+
 The concurrency-control model is the single most irreversible decision in a database,
 so the choice is made for **uni-db's** long-term trajectory, not just uniko's needs.
 uni-db is embedded, OLAP-first (vector search, Locy datalog, graph analytics), with a

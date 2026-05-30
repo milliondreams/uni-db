@@ -83,6 +83,7 @@ impl<'a> ExpressionWalker<'a> {
     ) -> uni_cypher::ast::MatchClause {
         uni_cypher::ast::MatchClause {
             optional: m.optional,
+            for_update: m.for_update,
             pattern: self.rewrite_pattern(m.pattern),
             where_clause: m.where_clause.map(|e| self.rewrite_expr(e)),
         }

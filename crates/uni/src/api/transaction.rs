@@ -107,6 +107,14 @@ pub struct Transaction {
     /// Principal inherited from the session (if any). Drives the
     /// M6a.3 write/schema/dbms authz consultation in `Self::execute`.
     principal: Option<Arc<uni_plugin::traits::connector::Principal>>,
+    /// `FOR UPDATE` pessimistic lock guards, held from MATCH until the
+    /// transaction ends (dropped on commit/rollback → locks released).
+    #[cfg(feature = "ssi")]
+    for_update_guards: parking_lot::Mutex<Vec<tokio::sync::OwnedMutexGuard<()>>>,
+    /// Row keys this transaction already holds a `FOR UPDATE` lock on, so a
+    /// repeated match on the same key does not self-deadlock.
+    #[cfg(feature = "ssi")]
+    for_update_held: parking_lot::Mutex<std::collections::HashSet<Vec<u8>>>,
 }
 
 /// Classify a Cypher payload as `"write"`, `"schema"`, or `"dbms"` for
@@ -234,6 +242,10 @@ impl Transaction {
             cancellation_token,
             hooks: session.hooks.values().cloned().collect(),
             principal: session.principal.clone(),
+            #[cfg(feature = "ssi")]
+            for_update_guards: parking_lot::Mutex::new(Vec::new()),
+            #[cfg(feature = "ssi")]
+            for_update_held: parking_lot::Mutex::new(std::collections::HashSet::new()),
         };
 
         // Transaction constructed successfully — its Drop impl will clear the
@@ -256,6 +268,8 @@ impl Transaction {
     #[instrument(skip(self), fields(transaction_id = %self.id))]
     pub async fn query(&self, cypher: &str) -> Result<QueryResult> {
         self.check_completed()?;
+        #[cfg(feature = "ssi")]
+        self.acquire_for_update_locks(cypher, &HashMap::new()).await?;
         // FU-1: thread the transaction's principal into the executor
         // scope so procedure capability gates (e.g. ProcedureWrites
         // for `declareProcedure WRITE`) see the authenticated user.
@@ -267,6 +281,60 @@ impl Transaction {
             Some(self.id_reservoir.clone()),
         );
         uni_query::maybe_scope_with_principal(principal, fut).await
+    }
+
+    /// Acquires `FOR UPDATE` pessimistic row locks for the matched keyed nodes,
+    /// holding them until the transaction ends. Only single keyed-node matches
+    /// are locked (the RMW use case); other `FOR UPDATE` patterns log a warning.
+    ///
+    /// # Errors
+    /// Returns [`UniError::Timeout`] if a lock cannot be acquired within the
+    /// bound (a likely deadlock or long-held lock); the transaction may retry.
+    #[cfg(feature = "ssi")]
+    async fn acquire_for_update_locks(
+        &self,
+        cypher: &str,
+        params: &HashMap<String, uni_common::Value>,
+    ) -> Result<()> {
+        // Cheap gate: only parse-for-locks when the hint is present. The full
+        // query parse/plan still happens downstream in execute_internal.
+        if !cypher.to_ascii_lowercase().contains("for update") {
+            return Ok(());
+        }
+        let Ok(ast) = uni_cypher::parse(cypher) else {
+            // Let execute_internal surface the parse error uniformly.
+            return Ok(());
+        };
+        let collected = crate::api::for_update::collect_for_update_keys(&ast, params);
+        if collected.unsupported {
+            tracing::warn!(
+                "FOR UPDATE applied to an unsupported pattern (only single keyed nodes are \
+                 locked); that lock hint is ignored"
+            );
+        }
+        let writer = self.db.writer.as_ref().ok_or(UniError::ReadOnly {
+            operation: "for_update".to_string(),
+        })?;
+        let mut keys = collected.keys;
+        keys.sort();
+        keys.dedup();
+        for key in keys {
+            if self.for_update_held.lock().contains(&key) {
+                continue;
+            }
+            let handle = writer.row_lock_handle(&key);
+            // Bounded wait so a deadlock surfaces as a retryable timeout rather
+            // than hanging the transaction.
+            let guard = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                handle.lock_owned(),
+            )
+            .await
+            .map_err(|_| UniError::Timeout { timeout_ms: 10_000 })?;
+            self.for_update_held.lock().insert(key);
+            self.for_update_guards.lock().push(guard);
+        }
+        Ok(())
     }
 
     /// Execute a Cypher query with parameters.
@@ -745,7 +813,14 @@ impl Transaction {
         .map_err(|_| UniError::CommitTimeout {
             tx_id: self.id.clone(),
             hint: "Another commit is in progress and taking longer than expected. Your transaction is still active \u{2014} you can retry commit().",
-        })??;
+        })?
+        // Preserve typed commit errors (e.g. SSI `SerializationConflict` /
+        // `ConstraintConflict`) so callers can detect and retry them, instead
+        // of flattening every error into `Internal`.
+        .map_err(|e| match e.downcast::<UniError>() {
+            Ok(typed) => typed,
+            Err(other) => UniError::Internal(other),
+        })?;
         // _flush_pending is true when async_flush_enabled and the coordinator
         // accepted a flush submission. Nothing to do here — the spawned stream
         // task drives the pipeline to completion independently.

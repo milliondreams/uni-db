@@ -185,6 +185,8 @@ snapshot-internals = []
 storage-internals = []
 # Prototype: forwards the strategy-D L0 snapshot-isolation flag (default off).
 l0-snapshot = ["uni-store/l0-snapshot"]
+# Umbrella: forwards the SSI/OCC commit-validation flag (default off).
+ssi = ["uni-store/ssi", "l0-snapshot"]
 provider-candle = ["uni-xervo/provider-candle"]
 provider-mistralrs = ["uni-xervo/provider-mistralrs"]
 provider-openai = ["uni-xervo/provider-openai"]

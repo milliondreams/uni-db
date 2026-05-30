@@ -90,11 +90,28 @@ pub fn is_edge_deleted(eid: Eid, ctx: Option<&QueryContext>) -> bool {
     false
 }
 
+/// Records a vertex read into the transaction's SSI read-set, when tracking.
+///
+/// Best-effort, item-level: records the queried id whether or not it currently
+/// exists, so a concurrent write to it is detected as an antidependency at
+/// commit. Read-set coverage spans the primary keyed read paths; see the
+/// proposal for the (in-progress) full-coverage follow-up.
+#[cfg(feature = "ssi")]
+fn record_vertex_read(ctx: &QueryContext, vid: Vid) {
+    if let Some(tx_l0_arc) = &ctx.transaction_l0
+        && let Some(read_set) = &tx_l0_arc.read().occ_read_set
+    {
+        read_set.lock().vertices.insert(vid);
+    }
+}
+
 /// Look up a vertex property in the L0 chain.
 /// Returns the value if found, or None if not present in any L0 buffer.
 /// Does NOT check tombstones - caller should check `is_vertex_deleted` first.
 pub fn lookup_vertex_prop(vid: Vid, prop: &str, ctx: Option<&QueryContext>) -> Option<Value> {
     let ctx = ctx?;
+    #[cfg(feature = "ssi")]
+    record_vertex_read(ctx, vid);
 
     // Check transaction L0 first (newest)
     if let Some(tx_l0_arc) = &ctx.transaction_l0 {
@@ -173,6 +190,8 @@ pub fn lookup_edge_prop(eid: Eid, prop: &str, ctx: Option<&QueryContext>) -> Opt
 /// Returns None if the vertex has no properties in the L0 chain.
 pub fn accumulate_vertex_props(vid: Vid, ctx: Option<&QueryContext>) -> Option<Properties> {
     let ctx = ctx?;
+    #[cfg(feature = "ssi")]
+    record_vertex_read(ctx, vid);
 
     let mut result: Option<Properties> = None;
 

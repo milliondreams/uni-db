@@ -93,6 +93,18 @@ pub enum UniError {
     #[error("Constraint violation: {message}")]
     Constraint { message: String },
 
+    /// A transaction was aborted at commit because a concurrent transaction
+    /// committed a conflicting write since this transaction began (optimistic
+    /// concurrency control). The transaction may be safely retried.
+    #[error("Serialization conflict: {message}")]
+    SerializationConflict { message: String },
+
+    /// A transaction was aborted at commit because a concurrent transaction
+    /// committed a row with the same unique key (serializable MERGE). The
+    /// transaction may be safely retried, which will observe the existing row.
+    #[error("Constraint conflict: {message}")]
+    ConstraintConflict { message: String },
+
     #[error("Storage error: {message}")]
     Storage {
         message: String,

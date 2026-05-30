@@ -24,6 +24,7 @@ pub fn build_match_return_query(pattern: &Pattern, where_conditions: &[Expr]) ->
         optional: false,
         pattern: pattern.clone(),
         where_clause,
+        for_update: false,
     });
 
     let return_clause = Clause::Return(ReturnClause {
@@ -107,6 +108,7 @@ fn build_create_from_derive_pattern(
             optional: false,
             pattern: Pattern { paths: match_paths },
             where_clause,
+            for_update: false,
         }));
     }
 

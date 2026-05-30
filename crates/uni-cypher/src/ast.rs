@@ -260,6 +260,12 @@ pub struct MatchClause {
     pub optional: bool,
     pub pattern: Pattern,
     pub where_clause: Option<Expr>,
+    /// `FOR UPDATE` pessimistic row-lock hint (SSI escape hatch). When `true`,
+    /// the transaction acquires per-key row locks for the matched nodes, held
+    /// until commit/rollback. See the SSI proposal (C5). `#[serde(default)]`
+    /// keeps previously-serialized ASTs deserializable.
+    #[serde(default)]
+    pub for_update: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

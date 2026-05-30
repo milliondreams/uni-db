@@ -186,7 +186,28 @@ pub struct Writer {
     /// the drain explicitly.
     #[allow(dead_code)] // first production use lands in Commit 6/7
     pub(crate) flush_coordinator: Option<Arc<crate::runtime::flush_coordinator::FlushCoordinator>>,
+    /// Optimistic-concurrency commit-sequence counter (SSI). Incremented once
+    /// per successful commit under `flush_lock`; a transaction captures the
+    /// current value at begin as its read sequence (`L0Buffer::occ_read_seq`).
+    #[cfg(feature = "ssi")]
+    commit_sequence: Arc<AtomicU64>,
+    /// Bounded log of recently-committed write-sets for OCC conflict detection.
+    /// Read and updated only under `flush_lock`.
+    #[cfg(feature = "ssi")]
+    committed_writes: Arc<PlMutex<crate::runtime::occ::CommitRegistry>>,
+    /// Per-row pessimistic locks for `FOR UPDATE` (SSI escape hatch), keyed by
+    /// canonical (label, key-props) bytes. A transaction holds the lock from
+    /// MATCH until commit/rollback, serializing concurrent `FOR UPDATE` writers
+    /// on the same key (avoiding optimistic abort-retry on hot keys).
+    #[cfg(feature = "ssi")]
+    for_update_locks: Arc<dashmap::DashMap<Vec<u8>, Arc<tokio::sync::Mutex<()>>>>,
 }
+
+/// Number of recent commits retained for OCC conflict detection. Large enough
+/// that under-run — and the resulting conservative abort — is rare in practice;
+/// each entry is a small set of touched ids.
+#[cfg(feature = "ssi")]
+const OCC_REGISTRY_CAPACITY: usize = 4096;
 
 impl Writer {
     pub async fn new(
@@ -275,6 +296,15 @@ impl Writer {
             None
         };
 
+        #[cfg(feature = "ssi")]
+        let commit_sequence = Arc::new(AtomicU64::new(0));
+        #[cfg(feature = "ssi")]
+        let committed_writes = Arc::new(PlMutex::new(
+            crate::runtime::occ::CommitRegistry::new(OCC_REGISTRY_CAPACITY),
+        ));
+        #[cfg(feature = "ssi")]
+        let for_update_locks = Arc::new(dashmap::DashMap::new());
+
         Ok(Self {
             l0_manager,
             storage,
@@ -293,7 +323,24 @@ impl Writer {
             fork_fragment_warn_fired,
             flush_lock,
             flush_coordinator,
+            #[cfg(feature = "ssi")]
+            commit_sequence,
+            #[cfg(feature = "ssi")]
+            committed_writes,
+            #[cfg(feature = "ssi")]
+            for_update_locks,
         })
+    }
+
+    /// Returns the shared pessimistic lock handle for a `FOR UPDATE` row key,
+    /// creating it on first use. The caller `.lock_owned().await`s the returned
+    /// mutex and holds the guard for the transaction's lifetime.
+    #[cfg(feature = "ssi")]
+    pub fn row_lock_handle(&self, key: &[u8]) -> Arc<tokio::sync::Mutex<()>> {
+        self.for_update_locks
+            .entry(key.to_vec())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     /// Build a fresh `SharedFlushCtx` from this Writer's current state.
@@ -412,7 +459,21 @@ impl Writer {
     pub fn create_transaction_l0(&self) -> Arc<RwLock<L0Buffer>> {
         let current_version = self.l0_manager.get_current().read().current_version;
         // Transaction mutations are logged to WAL at COMMIT time, not during the transaction.
-        Arc::new(RwLock::new(L0Buffer::new(current_version, None)))
+        let buf = L0Buffer::new(current_version, None);
+        // SSI: stamp the OCC read sequence at begin so commit can detect any
+        // transaction that committed since.
+        #[cfg(feature = "ssi")]
+        let buf = {
+            let mut buf = buf;
+            buf.occ_read_seq = self.commit_sequence.load(Ordering::Relaxed);
+            // The read path records observed ids here for SSI antidependency
+            // detection; commit consults it.
+            buf.occ_read_set = Some(Arc::new(parking_lot::Mutex::new(
+                crate::runtime::l0::OccReadSet::default(),
+            )));
+            buf
+        };
+        Arc::new(RwLock::new(buf))
     }
 
     /// Resolve the target L0 buffer for a mutation.
@@ -454,6 +515,55 @@ impl Writer {
         // acquisition is uncontended. Phase 4 drops the outer lock and
         // this becomes the load-bearing serialization point.
         let _flush_lock_guard = self.flush_lock.lock().await;
+
+        // SSI: optimistic conflict detection. This MUST run before any WAL
+        // write — `flush_wal()` below is the durable commit point and the WAL
+        // has no abort marker, so aborting after it would resurrect this
+        // transaction on crash recovery. The write-set is reused for
+        // registration after a successful merge.
+        #[cfg(feature = "ssi")]
+        let occ_write_set = {
+            let tx_l0 = tx_l0_arc.read();
+            let read_seq = tx_l0.occ_read_seq;
+            let write_set = crate::runtime::occ::WriteSet::from_l0(&tx_l0);
+            if !write_set.is_empty() {
+                // Read-set is consulted only for writing transactions, so a
+                // read-only commit (empty write-set) runs at snapshot isolation.
+                let read_guard = tx_l0.occ_read_set.as_ref().map(|rs| rs.lock());
+                if let Some(conflict) = self.committed_writes.lock().check(
+                    read_seq,
+                    &write_set,
+                    read_guard.as_deref(),
+                ) {
+                    return Err(anyhow::Error::new(
+                        uni_common::UniError::SerializationConflict {
+                            message: conflict.to_string(),
+                        },
+                    ));
+                }
+            }
+
+            // SSI / serializable MERGE: abort if a concurrent transaction has
+            // already committed a row with one of this transaction's unique
+            // keys. Commits serialize at `flush_lock`, so checking the merged
+            // main L0 here closes the race window left by the per-insert check.
+            if !tx_l0.constraint_index.is_empty() {
+                let main_l0 = self.l0_manager.get_current();
+                let main_l0 = main_l0.read();
+                for (key, vid) in &tx_l0.constraint_index {
+                    if main_l0.has_constraint_key(key, *vid) {
+                        return Err(anyhow::Error::new(
+                            uni_common::UniError::ConstraintConflict {
+                                message: "unique key already committed by a concurrent \
+                                          transaction"
+                                    .to_string(),
+                            },
+                        ));
+                    }
+                }
+            }
+            write_set
+        };
 
         // 1. Write transaction mutations to WAL BEFORE merging into main L0
         // This ensures durability before visibility.
@@ -574,6 +684,15 @@ impl Writer {
                     );
                 }
             }
+        }
+
+        // SSI: register this commit's write-set under a fresh commit sequence so
+        // later transactions detect conflicts against it. Still under
+        // `flush_lock`, before the async-flush branch can drop the guard.
+        #[cfg(feature = "ssi")]
+        if !occ_write_set.is_empty() {
+            let seq = self.commit_sequence.fetch_add(1, Ordering::Relaxed) + 1;
+            self.committed_writes.lock().record(seq, occ_write_set);
         }
 
         self.update_metrics();

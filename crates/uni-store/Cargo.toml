@@ -14,6 +14,10 @@ lance-backend = ["dep:lance", "dep:lancedb", "dep:lance-index", "dep:lance-linal
 # Default-off; gates `L0Manager::snapshot_isolated` and its test. See
 # `docs/proposals/serializable_snapshot_isolation.md` §4 (Component C1).
 l0-snapshot = []
+# Umbrella: optimistic commit-time conflict detection (SSI/OCC). Default-off;
+# gates write-set/read-set validation, serializable MERGE, and the snapshot
+# read path. See `docs/proposals/serializable_snapshot_isolation.md`.
+ssi = ["l0-snapshot"]
 
 [dependencies]
 uni-common = { workspace = true }

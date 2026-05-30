@@ -12,6 +12,21 @@ use uni_common::graph::simple_graph::{Direction, SimpleGraph};
 use uni_common::{Properties, Value};
 use uni_crdt::Crdt;
 
+/// Items a read-write transaction observed during execution, used for SSI
+/// read-write antidependency detection at commit.
+///
+/// Shared (via `Arc<Mutex<_>>`) between the read path — which records reads
+/// through the transaction's `QueryContext` — and the commit path, which checks
+/// it against concurrently-committed write-sets. Item-level granularity;
+/// phantoms are out of scope (handled by the `FOR UPDATE` escape hatch).
+#[derive(Debug, Default)]
+pub struct OccReadSet {
+    /// Vertices the transaction read.
+    pub vertices: HashSet<Vid>,
+    /// Edges the transaction read.
+    pub edges: HashSet<Eid>,
+}
+
 /// Returns the current timestamp in nanoseconds since Unix epoch.
 fn now_nanos() -> i64 {
     SystemTime::now()
@@ -156,6 +171,17 @@ pub struct L0Buffer {
     /// extraction; entries are removed when the embedding lands in the
     /// vertex's L0 property map.
     pub pending_embeddings: HashMap<Vid, String>,
+    /// Optimistic-concurrency read sequence (SSI). Stamped on a transaction's
+    /// private L0 at creation with the Writer's commit-sequence at that moment,
+    /// and consulted at commit to detect intervening conflicting commits. `0`
+    /// for the main L0 and when SSI is disabled. See
+    /// `docs/proposals/serializable_snapshot_isolation.md`.
+    pub occ_read_seq: u64,
+    /// Optimistic-concurrency read-set (SSI). `Some` on a read-write
+    /// transaction's private L0 when SSI tracking is active; the read path
+    /// records observed ids here and commit checks them for antidependencies.
+    /// `None` for the main L0 and read-only / SSI-disabled paths.
+    pub occ_read_set: Option<Arc<parking_lot::Mutex<OccReadSet>>>,
 }
 
 impl std::fmt::Debug for L0Buffer {
@@ -203,6 +229,9 @@ impl Clone for L0Buffer {
             vertex_partial_keys: self.vertex_partial_keys.clone(),
             edge_partial_keys: self.edge_partial_keys.clone(),
             pending_embeddings: self.pending_embeddings.clone(),
+            occ_read_seq: self.occ_read_seq,
+            // Forked L0s (ASSUME/ABDUCE) do not participate in OCC tracking.
+            occ_read_set: None,
         }
     }
 }
@@ -362,6 +391,8 @@ impl L0Buffer {
             vertex_partial_keys: HashMap::new(),
             edge_partial_keys: HashMap::new(),
             pending_embeddings: HashMap::new(),
+            occ_read_seq: 0,
+            occ_read_set: None,
         }
     }
 

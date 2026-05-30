@@ -39,6 +39,7 @@ fn match_query(pattern: Pattern, where_clause: Option<Expr>) -> Query {
             optional: false,
             pattern,
             where_clause,
+            for_update: false,
         })],
     })
 }
@@ -165,12 +166,23 @@ fn build_match_clause(pair: Pair<Rule>) -> Result<Clause, ParseError> {
 
     let pattern = build_pattern(inner.next().unwrap())?;
 
-    let where_clause = inner.next().map(extract_where_expr).transpose()?;
+    // `where_clause` and `for_update_clause` are both optional and trailing, so
+    // dispatch the remaining pairs by rule rather than positionally.
+    let mut where_clause = None;
+    let mut for_update = false;
+    for p in inner {
+        match p.as_rule() {
+            Rule::where_clause => where_clause = Some(extract_where_expr(p)?),
+            Rule::for_update_clause => for_update = true,
+            _ => {}
+        }
+    }
 
     Ok(Clause::Match(MatchClause {
         optional,
         pattern,
         where_clause,
+        for_update,
     }))
 }
 

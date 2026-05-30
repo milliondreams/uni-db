@@ -113,6 +113,9 @@ tracing-subscriber = { workspace = true }
 # Test-only: hooks_bridge_test.rs constructs `SmolStr` keys for the
 # phased `ParseContext::with_params` builder (M5e v1.1 ABI surface).
 smol_str = "0.3"
+# Dev-only: structural-sharing map for the L0 snapshot strategy bench. Not a
+# production dependency until the benchmark decision selects strategy B.
+imbl = "3"
 
 [[bench]]
 name = "algo_benchmarks"
@@ -136,6 +139,10 @@ harness = false
 
 [[bench]]
 name = "concurrent_mutations"
+harness = false
+
+[[bench]]
+name = "l0_snapshot_bench"
 harness = false
 
 [features]
@@ -176,6 +183,8 @@ rhai-plugins = ["dep:uni-plugin-rhai"]
 pyo3-plugins = ["dep:uni-plugin-pyo3", "dep:pyo3"]
 snapshot-internals = []
 storage-internals = []
+# Prototype: forwards the strategy-D L0 snapshot-isolation flag (default off).
+l0-snapshot = ["uni-store/l0-snapshot"]
 provider-candle = ["uni-xervo/provider-candle"]
 provider-mistralrs = ["uni-xervo/provider-mistralrs"]
 provider-openai = ["uni-xervo/provider-openai"]

@@ -96,6 +96,37 @@ impl L0Manager {
         pending.retain(|x| !Arc::ptr_eq(x, l0));
     }
 
+    /// Captures an isolated snapshot of the current L0 (strategy D).
+    ///
+    /// Freezes the current buffer by rotating it aside — writers re-fetch
+    /// `get_current()` at write time, so they move to the fresh buffer and can
+    /// never mutate the frozen one — and keeps it readable via the pending
+    /// list. Returns the `(frozen_main, pending)` pair used to build a
+    /// [`QueryContext`] whose reads are isolated from later writes. Capture is
+    /// O(1): one empty-buffer allocation and an `Arc` move, with no deep copy.
+    ///
+    /// The caller must coordinate with the commit path (e.g. hold the writer's
+    /// `flush_lock`) so the rotation does not race an in-flight merge into the
+    /// current buffer. The frozen generation currently rides the pending-flush
+    /// list; a dedicated generation list with reader-count GC is the production
+    /// follow-up (see the proposal's open questions).
+    ///
+    /// [`QueryContext`]: crate::runtime::QueryContext
+    #[cfg(feature = "l0-snapshot")]
+    pub fn snapshot_isolated(
+        &self,
+        next_version: u64,
+        new_wal: Option<Arc<WriteAheadLog>>,
+    ) -> (Arc<RwLock<L0Buffer>>, Vec<Arc<RwLock<L0Buffer>>>) {
+        // Capture pending before freezing so the frozen buffer becomes the
+        // snapshot's main view rather than one of its pending peers.
+        let pending = self.pending_flush.read().clone();
+        let frozen = self.rotate(next_version, new_wal);
+        // Keep the frozen generation visible to latest (non-snapshot) reads.
+        self.pending_flush.write().push(frozen.clone());
+        (frozen, pending)
+    }
+
     /// Get the minimum WAL LSN across all pending flush L0s.
     /// WAL truncation should not go past this LSN to preserve data for pending flushes.
     /// Returns None if no pending flushes exist.
@@ -111,5 +142,68 @@ impl L0Manager {
                 l0.wal_lsn_at_flush
             })
             .min()
+    }
+}
+
+#[cfg(all(test, feature = "l0-snapshot"))]
+mod snapshot_tests {
+    use super::*;
+    use crate::runtime::QueryContext;
+    use crate::runtime::l0_visibility::lookup_vertex_prop;
+    use uni_common::core::id::Vid;
+    use uni_common::{Properties, Value};
+
+    fn named(name: &str) -> Properties {
+        let mut props = Properties::new();
+        props.insert("name".to_string(), Value::String(name.to_string()));
+        props
+    }
+
+    fn name_of(vid: Vid, ctx: &QueryContext) -> Option<String> {
+        match lookup_vertex_prop(vid, "name", Some(ctx)) {
+            Some(Value::String(s)) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// A strategy-D snapshot must not observe writes that land after capture,
+    /// while a fresh latest view must, and frozen data must stay visible.
+    #[test]
+    fn snapshot_isolated_from_later_writes() {
+        let mgr = L0Manager::new(0, None);
+        let alice = Vid::from(1_u64);
+        let bob = Vid::from(2_u64);
+        let labels = ["Node".to_string()];
+
+        // Pre-snapshot state.
+        {
+            let current = mgr.get_current();
+            let mut guard = current.write();
+            guard.insert_vertex_with_labels(alice, named("alice"), &labels);
+            guard.insert_vertex_with_labels(bob, named("bob"), &labels);
+        }
+
+        // Freeze-rotate snapshot.
+        let (frozen, pending) = mgr.snapshot_isolated(1, None);
+        let snap = QueryContext::new_with_pending(frozen, None, pending);
+
+        // Post-snapshot write into the fresh current buffer.
+        mgr.get_current()
+            .write()
+            .insert_vertex_with_labels(alice, named("alice2"), &labels);
+
+        // The snapshot is isolated: it still sees the pre-write value.
+        assert_eq!(name_of(alice, &snap).as_deref(), Some("alice"));
+
+        // A fresh latest view sees the new value...
+        let latest = QueryContext::new_with_pending(
+            mgr.get_current(),
+            None,
+            mgr.get_pending_flush(),
+        );
+        assert_eq!(name_of(alice, &latest).as_deref(), Some("alice2"));
+
+        // ...and the untouched vertex remains visible via the frozen generation.
+        assert_eq!(name_of(bob, &latest).as_deref(), Some("bob"));
     }
 }

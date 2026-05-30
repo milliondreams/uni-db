@@ -10,6 +10,10 @@ repository.workspace = true
 [features]
 default = ["lance-backend"]
 lance-backend = ["dep:lance", "dep:lancedb", "dep:lance-index", "dep:lance-linalg"]
+# Prototype: strategy-D (epoch/generation pinning) snapshot-isolation reads.
+# Default-off; gates `L0Manager::snapshot_isolated` and its test. See
+# `docs/proposals/serializable_snapshot_isolation.md` §4 (Component C1).
+l0-snapshot = []
 
 [dependencies]
 uni-common = { workspace = true }

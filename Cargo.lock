@@ -13020,17 +13020,19 @@ dependencies = [
 
 [[package]]
 name = "uni-xervo"
-version = "0.12.0"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d31778c384c1491b430b1f164e6f14762b422e66ed8903215a9a8ec5b26fb4e4"
+checksum = "a04a989a640ea65d67512310ac6c837df1bd009b5c88412655f292825f796bac"
 dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.22.1",
+ "bitflags 2.11.0",
  "candle-core 0.10.2",
  "candle-nn 0.10.2",
  "candle-transformers",
  "dashmap",
+ "futures",
  "hf-hub 0.5.0",
  "image",
  "indexmap 2.14.0",

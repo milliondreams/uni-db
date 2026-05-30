@@ -10,7 +10,8 @@
 //! ```bash
 //! docker run -d --name localstack -p 4566:4566 localstack/localstack
 //! AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test \
-//!     cargo test --test cloud_integration_test -- --ignored
+//!     cargo nextest run -p uni-store --test integration --run-ignored all \
+//!         -E 'test(/^cloud_integration_test::/)'
 //! ```
 
 use anyhow::Result;

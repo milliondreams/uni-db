@@ -204,8 +204,12 @@ jobs:
           AWS_ENDPOINT_URL: http://localhost:4566
           AWS_ALLOW_HTTP: true
         run: |
-          cargo nextest run --test cloud_integration_test --run-ignored all
-          cargo nextest run -p uni-db --test hybrid_localstack_e2e --run-ignored all
+          # These suites were consolidated into each crate's single `integration`
+          # binary; filter to the original module by name.
+          cargo nextest run -p uni-store --test integration --run-ignored all \
+            -E 'test(/^cloud_integration_test::/)'
+          cargo nextest run -p uni-db --test integration --run-ignored all \
+            -E 'test(/^hybrid_localstack_e2e::/)'
 
   # Python bindings tests
   # Runs in parallel with test job (builds its own Rust extension via maturin)

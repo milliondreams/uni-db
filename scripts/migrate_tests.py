@@ -2,9 +2,18 @@
 """Classify and consolidate per-crate integration test files into a small
 number of grouped binaries.
 
-Phase 1 of the build-cost reduction plan. Each `tests/<group>.rs` becomes
-a 3-line shim that pulls its members in via `#[path]` so each binary only
-sees its own group's subtree.
+HISTORICAL — Phase 1 of the build-cost reduction plan. Each `tests/<group>.rs`
+became a 3-line shim that pulled its members in via `#[path]` so each binary
+only saw its own group's subtree. This script generated those per-group shims.
+
+Phase 2 (current layout) went further: every group now links into a SINGLE
+per-crate `tests/integration.rs` binary (one `#[path] mod <group>;` line each),
+so a crate links its integration tests exactly once. Feature-gated groups that
+formerly carried a crate-level `#![cfg(...)]` are gated at the module level in
+the umbrella instead (e.g. `#[cfg(feature = "lance-backend")] mod storage;`).
+The per-group regexes below are retained only as the historical record of how
+files map to groups; the generator is no longer the source of truth for the
+on-disk layout (the hand-maintained `tests/integration.rs` umbrellas are).
 
 Usage
 -----
@@ -14,8 +23,11 @@ Usage
 
 Supported crates: `uni`, `uni-store`, `uni-query`.
 
-Files in a crate's `keep_standalone` set stay as individual binaries
-because CI references them by binary name (`cargo nextest run --test X`).
+Files in a crate's `keep_standalone` set stay as individual binaries because CI
+builds them under a feature set incompatible with the consolidated binary —
+currently only `uni`'s `reranker_integration` (CI builds it
+`--no-default-features --features provider-onnx-dynamic`, under which the
+default-feature groups in `integration` would not compile).
 """
 
 from __future__ import annotations
@@ -45,8 +57,12 @@ CRATE_CONFIGS: dict[str, CrateConfig] = {
     "uni": CrateConfig(
         tests_dir=REPO / "crates" / "uni" / "tests",
         keep_standalone={
-            "reranker_integration.rs",   # ci.yml:104,122 — --features provider-onnx
-            "hybrid_localstack_e2e.rs",  # ci.yml:191 — --run-ignored all
+            # ci.yml:104,122 — built `--no-default-features --features
+            # provider-onnx-dynamic`; cannot merge into the default-feature
+            # `integration` binary.
+            "reranker_integration.rs",
+            # hybrid_localstack_e2e was merged into `integration` (Phase 2);
+            # ci.yml:191 now filters it by `test(/^hybrid_localstack_e2e::/)`.
         },
         groups=[
             ("bugs", re.compile(r"^(bug_|issue_?\d+|issue4|issue5|repro_|test_issue_|test_overflow_fix|test_python_repro)")),
@@ -70,9 +86,10 @@ CRATE_CONFIGS: dict[str, CrateConfig] = {
     # --- crates/uni-store — 39 files → 6 group shims + 1 standalone.
     "uni-store": CrateConfig(
         tests_dir=REPO / "crates" / "uni-store" / "tests",
-        keep_standalone={
-            "cloud_integration_test.rs",  # ci.yml:190 — workspace-level --test target
-        },
+        keep_standalone=set(
+            # cloud_integration_test was merged into `integration` (Phase 2);
+            # ci.yml:190 now filters it by `test(/^cloud_integration_test::/)`.
+        ),
         groups=[
             ("bugs", re.compile(r"^test_issue_")),
             ("crdt", re.compile(r"^crdt_")),

@@ -35,9 +35,24 @@ optimistic commit-time conflict detection**, layered onto the already-serialized
 
 ### Implementation status (2026-05-29, branch `feat/locy-timeout-hard-error`)
 
-All new behavior is behind the default-off `ssi` feature (`l0-snapshot` for C1 reads),
-so the default build is unchanged. Tests live in `crates/uni-store/tests/ssi_occ_test.rs`
-and `crates/uni-store/src/runtime/occ.rs`.
+> **Update (2026-05-31): the `ssi` and `l0-snapshot` cargo features were removed.**
+> SSI/OCC is now **always compiled** and toggled at runtime via
+> `UniConfig::ssi_enabled`, **defaulting to `true`**. The whole stack (snapshot
+> reads, write/read-set conflict detection, serializable MERGE, `FOR UPDATE`) is
+> gated at its *origination* sites (`Writer::create_transaction_l0` read-set
+> creation, the begin-time snapshot pin, the commit-time validation block, and
+> `FOR UPDATE` lock acquisition) on `config.ssi_enabled`; everything downstream
+> self-gates on the resulting `Option` (`occ_read_set` / pinned snapshot is
+> `None` when disabled). With `ssi_enabled = false` the engine reproduces the
+> prior last-writer-wins behavior bit-for-bit, and a `FOR UPDATE` in a query
+> emits a `tracing::warn!` instead of silently doing nothing. References to the
+> `ssi`/`l0-snapshot` *features* below are historical; read them as "when
+> `ssi_enabled` is true".
+
+The original behavior was behind the default-off `ssi` feature (`l0-snapshot` for
+C1 reads). Tests live in `crates/uni-store/tests/common/ssi_occ_test.rs`,
+`crates/uni-store/src/runtime/occ.rs`, and the `crates/uni/tests/common/ssi_*`
+suites (the `ssi_default_semantics` suite opens with `ssi_enabled = false`).
 
 | Component | Status |
 |---|---|

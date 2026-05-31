@@ -10,14 +10,10 @@ repository.workspace = true
 [features]
 default = ["lance-backend"]
 lance-backend = ["dep:lance", "dep:lancedb", "dep:lance-index", "dep:lance-linalg"]
-# Prototype: strategy-D (epoch/generation pinning) snapshot-isolation reads.
-# Default-off; gates `L0Manager::snapshot_isolated` and its test. See
-# `docs/proposals/serializable_snapshot_isolation.md` §4 (Component C1).
-l0-snapshot = []
-# Umbrella: optimistic commit-time conflict detection (SSI/OCC). Default-off;
-# gates write-set/read-set validation, serializable MERGE, and the snapshot
-# read path. See `docs/proposals/serializable_snapshot_isolation.md`.
-ssi = ["l0-snapshot"]
+# NOTE: SSI/OCC (snapshot-isolation reads, write/read-set conflict detection,
+# serializable MERGE, FOR UPDATE) is no longer a compile-time feature. It is
+# always compiled and toggled at runtime via `UniConfig::ssi_enabled`
+# (default `true`). See `docs/proposals/serializable_snapshot_isolation.md`.
 # Test-only fault injection: activates the `fail::fail_point!` markers placed in
 # the commit path (`commit_transaction_l0`) so crash-recovery tests can simulate
 # a crash at a precise point. No-op and zero-cost unless enabled. The `fail`

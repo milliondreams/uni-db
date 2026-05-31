@@ -189,24 +189,26 @@ pub struct Writer {
     /// Optimistic-concurrency commit-sequence counter (SSI). Incremented once
     /// per successful commit under `flush_lock`; a transaction captures the
     /// current value at begin as its read sequence (`L0Buffer::occ_read_seq`).
-    #[cfg(feature = "ssi")]
+    ///
+    /// Always allocated; consulted only when `config.ssi_enabled` is `true`.
     commit_sequence: Arc<AtomicU64>,
     /// Bounded log of recently-committed write-sets for OCC conflict detection.
     /// Read and updated only under `flush_lock`.
-    #[cfg(feature = "ssi")]
+    ///
+    /// Always allocated; consulted only when `config.ssi_enabled` is `true`.
     committed_writes: Arc<PlMutex<crate::runtime::occ::CommitRegistry>>,
     /// Per-row pessimistic locks for `FOR UPDATE` (SSI escape hatch), keyed by
     /// canonical (label, key-props) bytes. A transaction holds the lock from
     /// MATCH until commit/rollback, serializing concurrent `FOR UPDATE` writers
     /// on the same key (avoiding optimistic abort-retry on hot keys).
-    #[cfg(feature = "ssi")]
+    ///
+    /// Always allocated; populated only when `config.ssi_enabled` is `true`.
     for_update_locks: Arc<dashmap::DashMap<Vec<u8>, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 /// Number of recent commits retained for OCC conflict detection. Large enough
 /// that under-run — and the resulting conservative abort — is rare in practice;
 /// each entry is a small set of touched ids.
-#[cfg(feature = "ssi")]
 const OCC_REGISTRY_CAPACITY: usize = 4096;
 
 impl Writer {
@@ -296,13 +298,10 @@ impl Writer {
             None
         };
 
-        #[cfg(feature = "ssi")]
         let commit_sequence = Arc::new(AtomicU64::new(0));
-        #[cfg(feature = "ssi")]
         let committed_writes = Arc::new(PlMutex::new(crate::runtime::occ::CommitRegistry::new(
             OCC_REGISTRY_CAPACITY,
         )));
-        #[cfg(feature = "ssi")]
         let for_update_locks = Arc::new(dashmap::DashMap::new());
 
         Ok(Self {
@@ -323,11 +322,8 @@ impl Writer {
             fork_fragment_warn_fired,
             flush_lock,
             flush_coordinator,
-            #[cfg(feature = "ssi")]
             commit_sequence,
-            #[cfg(feature = "ssi")]
             committed_writes,
-            #[cfg(feature = "ssi")]
             for_update_locks,
         })
     }
@@ -335,7 +331,6 @@ impl Writer {
     /// Returns the shared pessimistic lock handle for a `FOR UPDATE` row key,
     /// creating it on first use. The caller `.lock_owned().await`s the returned
     /// mutex and holds the guard for the transaction's lifetime.
-    #[cfg(feature = "ssi")]
     pub fn row_lock_handle(&self, key: &[u8]) -> Arc<tokio::sync::Mutex<()>> {
         self.for_update_locks
             .entry(key.to_vec())
@@ -354,7 +349,6 @@ impl Writer {
     /// removal) or has not yet taken the shard lock (it will mint a fresh entry
     /// after we remove). Either way no two transactions ever lock different
     /// `Mutex` instances for the same key.
-    #[cfg(feature = "ssi")]
     pub fn release_for_update_locks(&self, keys: &[Vec<u8>]) {
         for key in keys {
             self.for_update_locks
@@ -364,7 +358,6 @@ impl Writer {
 
     /// Number of live entries in the `FOR UPDATE` lock map. Introspection for
     /// tests that the map does not leak entries across transactions (G5).
-    #[cfg(feature = "ssi")]
     pub fn for_update_lock_count(&self) -> usize {
         self.for_update_locks.len()
     }
@@ -372,7 +365,6 @@ impl Writer {
     /// The current OCC commit sequence. A `FOR UPDATE` acquisition re-stamps a
     /// fresh transaction's `occ_read_seq` to this so its conflict-detection
     /// baseline advances to lock-acquisition time (read-latest under the lock).
-    #[cfg(feature = "ssi")]
     pub fn current_commit_sequence(&self) -> u64 {
         self.commit_sequence.load(Ordering::Relaxed)
     }
@@ -495,9 +487,10 @@ impl Writer {
         // Transaction mutations are logged to WAL at COMMIT time, not during the transaction.
         let buf = L0Buffer::new(current_version, None);
         // SSI: stamp the OCC read sequence at begin so commit can detect any
-        // transaction that committed since.
-        #[cfg(feature = "ssi")]
-        let buf = {
+        // transaction that committed since. Gated on the runtime `ssi_enabled`
+        // toggle — when off, `occ_read_set` stays `None` and every downstream
+        // read-set recording / commit validation self-gates to a no-op.
+        let buf = if self.config.ssi_enabled {
             let mut buf = buf;
             buf.occ_read_seq = self.commit_sequence.load(Ordering::Relaxed);
             // The read path records observed ids here for SSI antidependency
@@ -505,6 +498,8 @@ impl Writer {
             buf.occ_read_set = Some(Arc::new(parking_lot::Mutex::new(
                 crate::runtime::l0::OccReadSet::default(),
             )));
+            buf
+        } else {
             buf
         };
         Arc::new(RwLock::new(buf))
@@ -560,8 +555,10 @@ impl Writer {
         // has no abort marker, so aborting after it would resurrect this
         // transaction on crash recovery. The write-set is reused for
         // registration after a successful merge.
-        #[cfg(feature = "ssi")]
-        let occ_write_set = {
+        // Runtime-gated on `config.ssi_enabled`. When off, no validation runs
+        // and `occ_write_set` is `None`, so the post-merge registration below
+        // is skipped — reproducing last-writer-wins exactly.
+        let occ_write_set: Option<crate::runtime::occ::WriteSet> = if self.config.ssi_enabled {
             let tx_l0 = tx_l0_arc.read();
             let read_seq = tx_l0.occ_read_seq;
             let write_set = crate::runtime::occ::WriteSet::from_l0(&tx_l0);
@@ -639,7 +636,9 @@ impl Writer {
                     ));
                 }
             }
-            write_set
+            Some(write_set)
+        } else {
+            None
         };
 
         // Crash-recovery seam: SSI validation has passed; the transaction is
@@ -755,7 +754,9 @@ impl Writer {
         // cost — when nothing is pinned (the common case). We hold `flush_lock`,
         // so this cannot race a flush rotate or another commit's merge; the merge
         // below re-fetches `get_current()`, landing in the fresh post-freeze buffer.
-        #[cfg(feature = "l0-snapshot")]
+        // Self-gates on the runtime SSI toggle: a snapshot is only ever pinned by
+        // a transaction begun under `ssi_enabled`, so `is_current_pinned()` is
+        // always false when SSI is off and this is a zero-cost no-op.
         if self.l0_manager.is_current_pinned() {
             self.l0_manager.freeze_current_for_snapshot();
             metrics::counter!("uni_l0_snapshot_freezes_total").increment(1);
@@ -813,10 +814,12 @@ impl Writer {
         // SSI: register this commit's write-set under a fresh commit sequence so
         // later transactions detect conflicts against it. Still under
         // `flush_lock`, before the async-flush branch can drop the guard.
-        #[cfg(feature = "ssi")]
-        if !occ_write_set.is_empty() {
+        // `occ_write_set` is `Some` only when `config.ssi_enabled`.
+        if let Some(write_set) = occ_write_set
+            && !write_set.is_empty()
+        {
             let seq = self.commit_sequence.fetch_add(1, Ordering::Relaxed) + 1;
-            self.committed_writes.lock().record(seq, occ_write_set);
+            self.committed_writes.lock().record(seq, write_set);
         }
 
         self.update_metrics();
@@ -1979,7 +1982,9 @@ impl Writer {
     /// import see no pin and merge in place, and the snapshot keeps reading the
     /// frozen pre-import buffer.
     async fn freeze_for_non_tx_write_if_pinned(&self, tx_l0: Option<&Arc<RwLock<L0Buffer>>>) {
-        #[cfg(feature = "l0-snapshot")]
+        // Self-gates on the runtime SSI toggle: nothing pins a snapshot unless a
+        // transaction began under `ssi_enabled`, so `is_current_pinned()` is
+        // always false (one atomic load) when SSI is off.
         if tx_l0.is_none() && self.l0_manager.is_current_pinned() {
             let _flush_lock_guard = self.flush_lock.lock().await;
             // Re-check under the lock: a concurrent commit may have frozen first.
@@ -1987,10 +1992,6 @@ impl Writer {
                 self.l0_manager.freeze_current_for_snapshot();
                 metrics::counter!("uni_l0_snapshot_freezes_total").increment(1);
             }
-        }
-        #[cfg(not(feature = "l0-snapshot"))]
-        {
-            let _ = (self, tx_l0);
         }
     }
 

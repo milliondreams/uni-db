@@ -610,7 +610,6 @@ async fn r1_crdt_overwritten_by_lww_pins_value() -> Result<()> {
 // cannot regress.
 
 /// No snapshot pinned ⇒ the commit merges in place; the generation is unchanged.
-#[cfg(feature = "l0-snapshot")]
 #[tokio::test]
 async fn commit_without_pin_does_not_freeze() -> Result<()> {
     let (writer, _dir) = make_writer().await?;
@@ -633,7 +632,6 @@ async fn commit_without_pin_does_not_freeze() -> Result<()> {
 
 /// A commit while another snapshot pins the generation freezes it aside (new
 /// buffer), and the held snapshot still reads the pre-commit value.
-#[cfg(feature = "l0-snapshot")]
 #[tokio::test]
 async fn commit_with_held_pin_freezes_and_isolates() -> Result<()> {
     let (writer, _dir) = make_writer().await?;
@@ -664,7 +662,6 @@ async fn commit_with_held_pin_freezes_and_isolates() -> Result<()> {
 }
 
 /// Mirrors the self-pin fix: releasing the pin BEFORE the commit avoids the freeze.
-#[cfg(feature = "l0-snapshot")]
 #[tokio::test]
 async fn commit_after_releasing_pin_does_not_freeze() -> Result<()> {
     let (writer, _dir) = make_writer().await?;

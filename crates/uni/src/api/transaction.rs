@@ -109,11 +109,13 @@ pub struct Transaction {
     principal: Option<Arc<uni_plugin::traits::connector::Principal>>,
     /// `FOR UPDATE` pessimistic lock guards, held from MATCH until the
     /// transaction ends (dropped on commit/rollback → locks released).
-    #[cfg(feature = "ssi")]
+    ///
+    /// Always present; only populated when `UniConfig::ssi_enabled` is `true`.
     for_update_guards: parking_lot::Mutex<Vec<tokio::sync::OwnedMutexGuard<()>>>,
     /// Row keys this transaction already holds a `FOR UPDATE` lock on, so a
     /// repeated match on the same key does not self-deadlock.
-    #[cfg(feature = "ssi")]
+    ///
+    /// Always present; only populated when `UniConfig::ssi_enabled` is `true`.
     for_update_held: parking_lot::Mutex<std::collections::HashSet<Vec<u8>>>,
     /// Pinned L0 snapshot for snapshot-isolated reads (Component C1). Captured at
     /// begin (after `occ_read_seq`), threaded into reads via the executor.
@@ -125,7 +127,8 @@ pub struct Transaction {
     /// Behind a `Mutex` for interior mutability: a `FOR UPDATE` acquisition on a
     /// still-fresh transaction RE-PINS this to lock-acquisition time so the
     /// locked read sees the latest committed value (see `acquire_for_update_locks`).
-    #[cfg(feature = "l0-snapshot")]
+    ///
+    /// Always present; only set to `Some` when `UniConfig::ssi_enabled` is `true`.
     snapshot: parking_lot::Mutex<Option<uni_store::runtime::SnapshotView>>,
 }
 
@@ -230,10 +233,12 @@ impl Transaction {
         // Component C1: pin the L0 snapshot AFTER `create_transaction_l0` stamped
         // `occ_read_seq`, so the snapshot reflects state >= read_seq — any commit
         // newer than read_seq is then caught by OCC rather than silently read.
-        #[cfg(feature = "l0-snapshot")]
-        let snapshot = {
+        // Only pinned when SSI is enabled; otherwise reads run against live L0.
+        let snapshot = if db.config.ssi_enabled {
             let writer: &uni_store::Writer = writer_lock.as_ref();
             parking_lot::Mutex::new(Some(writer.l0_manager.pin_snapshot()))
+        } else {
+            parking_lot::Mutex::new(None)
         };
 
         let id = Uuid::new_v4().to_string();
@@ -263,11 +268,8 @@ impl Transaction {
             cancellation_token,
             hooks: session.hooks.values().cloned().collect(),
             principal: session.principal.clone(),
-            #[cfg(feature = "ssi")]
             for_update_guards: parking_lot::Mutex::new(Vec::new()),
-            #[cfg(feature = "ssi")]
             for_update_held: parking_lot::Mutex::new(std::collections::HashSet::new()),
-            #[cfg(feature = "l0-snapshot")]
             snapshot,
         };
 
@@ -287,18 +289,14 @@ impl Transaction {
     // ── Cypher Reads (sees shared DB + uncommitted writes) ────────────
 
     /// The transaction's pinned L0 snapshot for snapshot-isolated reads
-    /// (Component C1), threaded into the executor. `None` without the
-    /// `l0-snapshot` feature (live reads); a `None` is a safe no-op.
-    #[cfg(feature = "l0-snapshot")]
+    /// (Component C1), threaded into the executor.
+    ///
+    /// Returns `Some` for a read-write transaction begun under
+    /// `UniConfig::ssi_enabled` (until commit/rollback `take`s it); `None` when
+    /// SSI is disabled (nothing was pinned ⇒ live reads) or after release. A
+    /// `None` is a safe no-op downstream.
     fn read_snapshot(&self) -> Option<uni_store::runtime::SnapshotView> {
-        // Returns `Some` for the tx's reads; `None` after commit/rollback `take`s it.
         self.snapshot.lock().clone()
-    }
-
-    /// Without `l0-snapshot`, reads are never snapshot-isolated.
-    #[cfg(not(feature = "l0-snapshot"))]
-    fn read_snapshot(&self) -> Option<uni_store::runtime::SnapshotView> {
-        None
     }
 
     /// Execute a Cypher query within the transaction.
@@ -306,8 +304,19 @@ impl Transaction {
     #[instrument(skip(self), fields(transaction_id = %self.id))]
     pub async fn query(&self, cypher: &str) -> Result<QueryResult> {
         self.check_completed()?;
-        #[cfg(feature = "ssi")]
-        self.acquire_for_update_locks(cypher, &HashMap::new()).await?;
+        if self.db.config.ssi_enabled {
+            self.acquire_for_update_locks(cypher, &HashMap::new()).await?;
+        } else if cypher.to_ascii_lowercase().contains("for update") {
+            // FOR UPDATE is a no-op when SSI is disabled — surface it loudly so a
+            // runtime misconfiguration does not silently drop pessimistic locking
+            // (a far easier mistake than a compile-time opt-out). Structured field
+            // for filtering; message template per M-LOG-STRUCTURED.
+            tracing::warn!(
+                ssi_enabled = false,
+                "FOR UPDATE ignored: ssi_enabled is false, so no row locks are acquired and \
+                 concurrent writers are not serialized — enable SSI or guard the RMW externally"
+            );
+        }
         // FU-1: thread the transaction's principal into the executor
         // scope so procedure capability gates (e.g. ProcedureWrites
         // for `declareProcedure WRITE`) see the authenticated user.
@@ -331,7 +340,8 @@ impl Transaction {
     /// within the bound — a likely deadlock or long-held lock. `transact_with_retry`
     /// will re-run the closure, which re-acquires from scratch and can win the lock
     /// once the holder releases.
-    #[cfg(feature = "ssi")]
+    ///
+    /// Only ever called when `UniConfig::ssi_enabled` is `true` (see `query`).
     async fn acquire_for_update_locks(
         &self,
         cypher: &str,
@@ -400,10 +410,7 @@ impl Transaction {
                 // racing commit causes at most a spurious retry, never a missed
                 // conflict / lost update).
                 self.tx_l0.write().occ_read_seq = writer.current_commit_sequence();
-                #[cfg(feature = "l0-snapshot")]
-                {
-                    *self.snapshot.lock() = Some(writer.l0_manager.pin_snapshot());
-                }
+                *self.snapshot.lock() = Some(writer.l0_manager.pin_snapshot());
             }
         }
         Ok(())
@@ -875,7 +882,6 @@ impl Transaction {
         // when ANOTHER live transaction pins this generation. Without this, the
         // tx's own pin would force a needless deep clone of the main L0 on every
         // commit. Read-your-writes is unaffected (it uses the live `tx_l0`).
-        #[cfg(feature = "l0-snapshot")]
         self.snapshot.lock().take();
 
         // Wrap the commit (which acquires `flush_lock` internally) in the
@@ -1077,7 +1083,6 @@ impl Transaction {
         self.completed = true;
 
         // Component C1: release the snapshot pin promptly (symmetric with commit).
-        #[cfg(feature = "l0-snapshot")]
         self.snapshot.lock().take();
 
         // Release write guard
@@ -1178,7 +1183,8 @@ impl Drop for Transaction {
         // lock-map entries (otherwise the map grows once per distinct locked key
         // for the life of the database). Order matters: drop the guards FIRST so
         // the `Arc` strong count reflects only the map before we prune.
-        #[cfg(feature = "ssi")]
+        // (When SSI is disabled the guard vec and held set are always empty, so
+        // this is a cheap no-op.)
         {
             self.for_update_guards.lock().clear();
             let keys: Vec<Vec<u8>> = self.for_update_held.lock().drain().collect();

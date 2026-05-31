@@ -18,7 +18,6 @@ mod crdt;
 mod fork_recovery;
 #[path = "common/property/mod.rs"]
 mod property;
-#[cfg(feature = "ssi")]
 #[path = "common/ssi_occ_test.rs"]
 mod ssi_occ_test;
 #[cfg(feature = "lance-backend")]

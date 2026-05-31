@@ -591,6 +591,31 @@ pub struct UniConfig {
     /// trigger should set this to `true` so timing isn't dependent on
     /// the polling cadence.
     pub disable_fork_index_builder: bool,
+
+    /// Enable Serializable Snapshot Isolation and optimistic concurrency
+    /// control (default: `true`).
+    ///
+    /// When `true`, read-write transactions read from a pinned L0 snapshot,
+    /// track an item-level read/write-set, and validate at commit under
+    /// `flush_lock`: a write-write or read-write conflict against a commit
+    /// landed since the transaction's snapshot aborts with
+    /// `UniError::SerializationConflict`, a duplicate concurrent `MERGE` on a
+    /// unique key aborts with `UniError::ConstraintConflict`, and `FOR UPDATE`
+    /// acquires per-key row locks. Callers should wrap contended writes in
+    /// `Session::transact_with_retry`, which re-runs retriable conflicts.
+    ///
+    /// When `false`, the engine reverts to last-writer-wins: concurrent
+    /// read-modify-write transactions can silently lose updates, concurrent
+    /// `MERGE` can create duplicate unique keys, and `FOR UPDATE` is a no-op
+    /// (a `tracing::warn!` is emitted when a query requests it). Reads run
+    /// against the live L0 with no snapshot pinning. This reproduces the
+    /// pre-SSI behavior bit-for-bit and skips the (near-zero, but non-nil)
+    /// read-set/validation overhead — appropriate only for single-writer
+    /// workloads or callers that guard read-modify-write externally.
+    ///
+    /// Defaults to `true` because silent lost updates are a correctness hazard
+    /// for any concurrent-writer workload.
+    pub ssi_enabled: bool,
 }
 
 impl Default for UniConfig {
@@ -650,6 +675,11 @@ impl Default for UniConfig {
             fork_index_build_threshold: 10_000,
             fork_index_builder_interval: Duration::from_secs(30),
             disable_fork_index_builder: false,
+            // Correctness-first default: SSI/OCC on. See the field docs for
+            // the behavioral contract and the migration note (concurrent
+            // writers now observe aborts instead of silent lost updates;
+            // wrap them in `Session::transact_with_retry`).
+            ssi_enabled: true,
         }
     }
 }

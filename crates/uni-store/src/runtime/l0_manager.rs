@@ -17,7 +17,8 @@ use std::sync::Arc;
 /// invariant.
 ///
 /// Always compiled (so the inert threading types exist in every build); it is
-/// only ever *minted* by [`L0Manager::pin_snapshot`], which is `l0-snapshot`-gated.
+/// only ever *minted* by [`L0Manager::pin_snapshot`], which a transaction calls
+/// only when `UniConfig::ssi_enabled` is `true`.
 #[derive(Debug)]
 pub struct PinToken(());
 
@@ -34,8 +35,9 @@ pub struct PinToken(());
 ///
 /// Always compiled so it can thread through the executor as an inert
 /// `Option<SnapshotView>` in every build; it is only ever *constructed* by
-/// [`L0Manager::pin_snapshot`] (`l0-snapshot`-gated), so in a non-feature build
-/// the threaded option is always `None`.
+/// [`L0Manager::pin_snapshot`], which a transaction calls only when
+/// `UniConfig::ssi_enabled` is `true`, so with SSI off the threaded option is
+/// always `None`.
 #[derive(Clone)]
 pub struct SnapshotView {
     /// The pinned main L0 generation at capture time.
@@ -72,7 +74,6 @@ pub struct L0Manager {
     // Reset on every rotate so a fresh generation starts unpinned. Read/cloned
     // only under the `current` lock so a snapshot captures a buffer and token
     // from the same generation. See `PinToken`.
-    #[cfg(feature = "l0-snapshot")]
     current_pin: RwLock<Arc<PinToken>>,
 }
 
@@ -82,7 +83,6 @@ impl L0Manager {
         Self {
             current: RwLock::new(Arc::new(RwLock::new(l0))),
             pending_flush: RwLock::new(Vec::new()),
-            #[cfg(feature = "l0-snapshot")]
             current_pin: RwLock::new(Arc::new(PinToken(()))),
         }
     }
@@ -98,7 +98,6 @@ impl L0Manager {
         Self {
             current: RwLock::new(current),
             pending_flush: RwLock::new(pending_flush),
-            #[cfg(feature = "l0-snapshot")]
             current_pin: RwLock::new(Arc::new(PinToken(()))),
         }
     }
@@ -140,10 +139,7 @@ impl L0Manager {
         // holding the `current` write guard: `pin_snapshot` clones the buffer
         // and token under `current.read()`, so this serializes against it and a
         // snapshot can never capture a buffer/token from different generations.
-        #[cfg(feature = "l0-snapshot")]
-        {
-            *self.current_pin.write() = Arc::new(PinToken(()));
-        }
+        *self.current_pin.write() = Arc::new(PinToken(()));
 
         old_l0
     }
@@ -184,7 +180,6 @@ impl L0Manager {
     /// follow-up (see the proposal's open questions).
     ///
     /// [`QueryContext`]: crate::runtime::QueryContext
-    #[cfg(feature = "l0-snapshot")]
     pub fn snapshot_isolated(
         &self,
         next_version: u64,
@@ -214,7 +209,6 @@ impl L0Manager {
     /// let snap = writer.l0_manager().pin_snapshot();
     /// // build a QueryContext from `snap.main` + `snap.extra`
     /// ```
-    #[cfg(feature = "l0-snapshot")]
     pub fn pin_snapshot(&self) -> SnapshotView {
         // Hold `current` read across both clones: a concurrent `rotate` needs
         // `current.write()` and resets the pin token under it, so it cannot
@@ -238,7 +232,6 @@ impl L0Manager {
     /// `strong_count > 1` means a snapshot besides the manager holds the token.
     /// Call under the writer's `flush_lock` at commit so the decision and any
     /// resulting freeze are atomic with respect to the merge.
-    #[cfg(feature = "l0-snapshot")]
     pub fn is_current_pinned(&self) -> bool {
         Arc::strong_count(&self.current_pin.read()) > 1
     }
@@ -257,7 +250,6 @@ impl L0Manager {
     /// `Arc` refcount once the last snapshot drops, so nothing leaks. The new
     /// generation starts unpinned (the pin token is reset). Must be called under
     /// the writer's `flush_lock`, since it swaps the current buffer.
-    #[cfg(feature = "l0-snapshot")]
     pub fn freeze_current_for_snapshot(&self) {
         let mut guard = self.current.write();
         let frozen = guard.clone();
@@ -288,7 +280,7 @@ impl L0Manager {
     }
 }
 
-#[cfg(all(test, feature = "l0-snapshot"))]
+#[cfg(test)]
 mod snapshot_tests {
     use super::*;
     use crate::runtime::QueryContext;

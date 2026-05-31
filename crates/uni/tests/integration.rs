@@ -2,8 +2,9 @@
 // to minimize compile/link time. Each group's sources live under tests/common/<group>/.
 //
 // `recursion_limit` is hoisted here (was a crate-level attr on the former `perf`
-// shim); it applies harmlessly to the whole binary. `ssi_for_update` is gated at
-// the module level (was a crate-level `#![cfg(feature = "ssi")]`).
+// shim); it applies harmlessly to the whole binary. The SSI suites are always
+// compiled now (SSI is a runtime `UniConfig::ssi_enabled` toggle, default on);
+// `ssi_default_semantics` opts out per-database to pin the legacy ssi-off path.
 //
 // NOTE: `reranker_integration` is intentionally NOT merged — CI builds it with
 // `--no-default-features --features provider-onnx-dynamic`, a feature set under
@@ -31,7 +32,6 @@ mod fork;
 mod hybrid_localstack_e2e;
 #[path = "common/index/mod.rs"]
 mod index;
-#[cfg(feature = "l0-snapshot")]
 #[path = "common/l0_snapshot_e2e.rs"]
 mod l0_snapshot_e2e;
 #[path = "common/locy/mod.rs"]
@@ -45,38 +45,28 @@ mod session_tx;
 // Shared infra for the SSI release-readiness suite (metrics capture, reopen
 // harness, conflict assertions, invariant oracles). Must precede the modules
 // that use it.
-#[cfg(feature = "ssi")]
 #[path = "common/ssi_support/mod.rs"]
 mod ssi_support;
-#[cfg(feature = "ssi")]
 #[path = "common/ssi_for_update.rs"]
 mod ssi_for_update;
-#[cfg(feature = "ssi")]
 #[path = "common/ssi_occ_e2e.rs"]
 mod ssi_occ_e2e;
-#[cfg(feature = "ssi")]
 #[path = "common/ssi_hermitage.rs"]
 mod ssi_hermitage;
-#[cfg(feature = "ssi")]
 #[path = "common/ssi_invariants.rs"]
 mod ssi_invariants;
-#[cfg(feature = "ssi")]
 #[path = "common/ssi_read_path_matrix.rs"]
 mod ssi_read_path_matrix;
-#[cfg(feature = "ssi")]
 #[path = "common/ssi_write_set_matrix.rs"]
 mod ssi_write_set_matrix;
-#[cfg(feature = "ssi")]
 #[path = "common/ssi_telemetry.rs"]
 mod ssi_telemetry;
-#[cfg(feature = "ssi")]
 #[path = "common/ssi_resilience.rs"]
 mod ssi_resilience;
-#[cfg(feature = "ssi")]
 #[path = "common/ssi_stress.rs"]
 mod ssi_stress;
-// Backward-compat suite: runs ONLY in the default (ssi-off) build.
-#[cfg(not(feature = "ssi"))]
+// Backward-compat suite: opens databases with `ssi_enabled = false` to pin the
+// last-writer-wins contract regardless of the global default (now SSI-on).
 #[path = "common/ssi_default_semantics.rs"]
 mod ssi_default_semantics;
 #[path = "common/storage/mod.rs"]

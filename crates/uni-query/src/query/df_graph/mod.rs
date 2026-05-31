@@ -78,7 +78,6 @@ pub mod pattern_exists;
 pub mod pred_dag;
 pub mod procedure_call;
 pub mod quantifier;
-#[cfg(feature = "ssi")]
 mod read_set_exec;
 pub mod recursive_cte;
 pub mod reduce;
@@ -119,7 +118,6 @@ pub use mutation_remove::MutationRemoveExec;
 pub use mutation_set::MutationSetExec;
 pub use optional_filter::OptionalFilterExec;
 pub use procedure_call::GraphProcedureCallExec;
-#[cfg(feature = "ssi")]
 pub use read_set_exec::ReadSetRecordingExec;
 pub use scan::GraphScanExec;
 pub use shortest_path::GraphShortestPathExec;
@@ -600,7 +598,6 @@ impl GraphExecutionContext {
             );
         }
 
-        #[cfg(feature = "ssi")]
         self.record_neighbor_reads(vid, &neighbors);
 
         neighbors
@@ -655,7 +652,6 @@ impl GraphExecutionContext {
                 );
             }
 
-            #[cfg(feature = "ssi")]
             self.record_neighbor_reads(vid, &neighbors);
 
             results.extend(
@@ -674,7 +670,6 @@ impl GraphExecutionContext {
     /// only then), so read-only and analytical traversals pay nothing. Recording
     /// the source plus each neighbour vid and edge id gives item-level
     /// antidependency coverage for traversals, matching the keyed read paths.
-    #[cfg(feature = "ssi")]
     fn record_neighbor_reads(&self, src: Vid, neighbors: &[(Vid, Eid)]) {
         let Some(tx_l0) = &self.l0_context.transaction_l0 else {
             return;
@@ -698,7 +693,6 @@ impl GraphExecutionContext {
     /// (read-only / analytical contexts).
     ///
     /// [`ReadSetRecordingExec`]: crate::query::df_graph::ReadSetRecordingExec
-    #[cfg(feature = "ssi")]
     pub(crate) fn record_batch_ids(
         &self,
         batch: &arrow_array::RecordBatch,

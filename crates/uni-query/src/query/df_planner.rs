@@ -51,7 +51,6 @@ use crate::query::df_graph::{
     GraphUnwindExec, GraphVectorKnnExec, L0Context, MutationContext, MutationExec,
     OptionalFilterExec,
 };
-#[cfg(feature = "ssi")]
 use crate::query::df_graph::ReadSetRecordingExec;
 use crate::query::planner::{
     LogicalPlan, STRUCT_ONLY_SENTINEL, aggregate_column_name, collect_properties_from_plan,
@@ -1659,11 +1658,12 @@ impl HybridPhysicalPlanner {
 
     /// Wraps a leaf scan plan so surviving row identities feed the SSI read-set.
     ///
-    /// No-op unless the `ssi` feature is enabled and the current transaction has
-    /// an optimistic read-set (a read-write transaction). Must be inserted above
-    /// the residual `FilterExec` and below any structural projection so the
-    /// `{var}._vid` / `{var}._eid` columns are still present.
-    #[cfg(feature = "ssi")]
+    /// No-op unless the current transaction has an optimistic read-set (a
+    /// read-write transaction begun under `UniConfig::ssi_enabled`), so the wrap
+    /// self-gates at runtime — when SSI is off, `occ_read_set` is `None` and the
+    /// plan is returned verbatim. Must be inserted above the residual `FilterExec`
+    /// and below any structural projection so the `{var}._vid` / `{var}._eid`
+    /// columns are still present.
     fn wrap_read_set_recording(
         &self,
         plan: Arc<dyn ExecutionPlan>,
@@ -1683,19 +1683,6 @@ impl HybridPhysicalPlanner {
             self.graph_ctx.clone(),
             variable,
         ))
-    }
-
-    /// Wraps a leaf scan plan for SSI read-set recording; no-op without `ssi`.
-    ///
-    /// This is the inert variant compiled when the `ssi` feature is disabled, so
-    /// the default build keeps unchanged behavior and returns `plan` verbatim.
-    #[cfg(not(feature = "ssi"))]
-    fn wrap_read_set_recording(
-        &self,
-        plan: Arc<dyn ExecutionPlan>,
-        _variable: &str,
-    ) -> Arc<dyn ExecutionPlan> {
-        plan
     }
 
     fn apply_scan_filter(

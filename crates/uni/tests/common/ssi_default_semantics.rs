@@ -1,26 +1,32 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Dragonscale Team
 
-//! Backward-compatibility guard for the DEFAULT (ssi-off) build.
+//! Backward-compatibility guard for the `ssi_enabled = false` configuration.
 //!
-//! Flipping `ssi` to default-on changes what every caller gets. This module runs
-//! ONLY when `ssi` is **off** (`#[cfg(not(feature = "ssi"))]` at the module
-//! declaration) and pins the legacy contract so a future default flip — or a
-//! regression in the off path — is caught:
+//! SSI/OCC now defaults on; this module opens every database with
+//! `UniConfig::ssi_enabled = false` (see `db_xy`) and pins the legacy
+//! last-writer-wins contract so a regression in the off path is caught:
 //!
 //! - concurrent writes use last-writer-wins and never raise a serialization
-//!   conflict (no OCC in this build),
+//!   conflict (no OCC when disabled),
 //! - the workload that SSI would abort (write skew) instead commits both sides,
-//!   proving the protection is exactly what the feature adds,
-//! - `FOR UPDATE` parses and is an inert no-op (it acquires no lock).
+//!   proving the protection is exactly what `ssi_enabled` adds,
+//! - `FOR UPDATE` parses and is an inert no-op (it acquires no lock; a
+//!   `tracing::warn!` is emitted).
 
 use std::sync::Arc;
 
 use anyhow::Result;
-use uni_db::{DataType, Uni, Value};
+use uni_db::{DataType, Uni, UniConfig, Value};
 
 async fn db_xy() -> Result<Uni> {
-    let db = Uni::in_memory().build().await?;
+    // This suite pins the last-writer-wins contract, so it must opt OUT of the
+    // now-default SSI/OCC behavior explicitly.
+    let config = UniConfig {
+        ssi_enabled: false,
+        ..Default::default()
+    };
+    let db = Uni::in_memory().config(config).build().await?;
     db.schema()
         .label("T")
         .property("id", DataType::String)

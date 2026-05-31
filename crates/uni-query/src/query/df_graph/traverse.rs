@@ -2208,7 +2208,6 @@ impl GraphTraverseMainStream {
     }
 }
 
-#[cfg(feature = "ssi")]
 impl GraphExecutionContext {
     /// Records a schemaless traversal's full edge-type scan into the SSI read-set.
     ///
@@ -2350,7 +2349,6 @@ async fn build_edge_adjacency_map(
 
     // SSI: a schemaless traversal physically scans the whole edge type above, so
     // record that read footprint for read-write transactions (no-op otherwise).
-    #[cfg(feature = "ssi")]
     graph_ctx.record_edge_adjacency(&adjacency);
 
     Ok(adjacency)

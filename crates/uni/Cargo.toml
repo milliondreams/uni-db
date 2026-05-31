@@ -155,8 +155,8 @@ harness = false
 name = "l0_snapshot_bench"
 harness = false
 
-# SSI/OCC performance benches (Phase 5). Build with `--features ssi`; the
-# ssi-off arms in each measure the baseline. See
+# SSI/OCC performance benches (Phase 5). SSI is always compiled; each bench
+# toggles `UniConfig::ssi_enabled` to compare the on/off arms. See
 # docs/proposals/serializable_snapshot_isolation.md.
 [[bench]]
 name = "ssi_read_tax"
@@ -212,14 +212,11 @@ rhai-plugins = ["dep:uni-plugin-rhai"]
 pyo3-plugins = ["dep:uni-plugin-pyo3", "dep:pyo3"]
 snapshot-internals = []
 storage-internals = []
-# L0 snapshot-isolation reads (Component C1, default off). Forwards to both
-# uni-store (manager primitives) and uni-query (executor pinned-read path).
-l0-snapshot = ["uni-store/l0-snapshot", "uni-query/l0-snapshot"]
-# Umbrella: forwards the SSI/OCC commit-validation flag (default off).
-ssi = ["uni-store/ssi", "uni-query/ssi", "l0-snapshot"]
+# NOTE: SSI/OCC is always compiled and toggled at runtime via
+# `UniConfig::ssi_enabled` (default `true`); it is no longer a cargo feature.
 # Forwards commit-path fault injection (uni-store `fail_point!` markers) so the
 # crash-recovery resilience tests can simulate a crash at a precise point.
-# Test-only; combine with `ssi`, e.g. `--features ssi,failpoints`.
+# Test-only.
 failpoints = ["uni-store/failpoints"]
 provider-candle = ["uni-xervo/provider-candle"]
 provider-mistralrs = ["uni-xervo/provider-mistralrs"]

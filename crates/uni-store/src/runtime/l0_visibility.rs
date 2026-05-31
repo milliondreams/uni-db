@@ -96,7 +96,6 @@ pub fn is_edge_deleted(eid: Eid, ctx: Option<&QueryContext>) -> bool {
 /// exists, so a concurrent write to it is detected as an antidependency at
 /// commit. Read-set coverage spans the primary keyed read paths; see the
 /// proposal for the (in-progress) full-coverage follow-up.
-#[cfg(feature = "ssi")]
 fn record_vertex_read(ctx: &QueryContext, vid: Vid) {
     if let Some(tx_l0_arc) = &ctx.transaction_l0
         && let Some(read_set) = &tx_l0_arc.read().occ_read_set
@@ -110,7 +109,6 @@ fn record_vertex_read(ctx: &QueryContext, vid: Vid) {
 /// Mirror of [`record_vertex_read`] for edges; best-effort, item-level. No-op
 /// unless this is a read-write transaction (`occ_read_set` is `Some` only then),
 /// so read-only and analytical queries pay nothing.
-#[cfg(feature = "ssi")]
 fn record_edge_read(ctx: &QueryContext, eid: Eid) {
     if let Some(tx_l0_arc) = &ctx.transaction_l0
         && let Some(read_set) = &tx_l0_arc.read().occ_read_set
@@ -124,7 +122,6 @@ fn record_edge_read(ctx: &QueryContext, eid: Eid) {
 /// Does NOT check tombstones - caller should check `is_vertex_deleted` first.
 pub fn lookup_vertex_prop(vid: Vid, prop: &str, ctx: Option<&QueryContext>) -> Option<Value> {
     let ctx = ctx?;
-    #[cfg(feature = "ssi")]
     record_vertex_read(ctx, vid);
 
     // Check transaction L0 first (newest)
@@ -165,7 +162,6 @@ pub fn lookup_vertex_prop(vid: Vid, prop: &str, ctx: Option<&QueryContext>) -> O
 /// Does NOT check tombstones - caller should check `is_edge_deleted` first.
 pub fn lookup_edge_prop(eid: Eid, prop: &str, ctx: Option<&QueryContext>) -> Option<Value> {
     let ctx = ctx?;
-    #[cfg(feature = "ssi")]
     record_edge_read(ctx, eid);
 
     // Check transaction L0 first (newest)
@@ -206,7 +202,6 @@ pub fn lookup_edge_prop(eid: Eid, prop: &str, ctx: Option<&QueryContext>) -> Opt
 /// Returns None if the vertex has no properties in the L0 chain.
 pub fn accumulate_vertex_props(vid: Vid, ctx: Option<&QueryContext>) -> Option<Properties> {
     let ctx = ctx?;
-    #[cfg(feature = "ssi")]
     record_vertex_read(ctx, vid);
 
     let mut result: Option<Properties> = None;
@@ -252,7 +247,6 @@ pub fn accumulate_vertex_props(vid: Vid, ctx: Option<&QueryContext>) -> Option<P
 /// Returns None if the edge has no properties in the L0 chain.
 pub fn accumulate_edge_props(eid: Eid, ctx: Option<&QueryContext>) -> Option<Properties> {
     let ctx = ctx?;
-    #[cfg(feature = "ssi")]
     record_edge_read(ctx, eid);
 
     let mut result: Option<Properties> = None;

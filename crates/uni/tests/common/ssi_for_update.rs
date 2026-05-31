@@ -8,7 +8,19 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use uni_db::{DataType, Uni};
+use uni_db::{DataType, Uni, Value};
+
+/// Reads the committed `n` for the `x` counter.
+async fn counter_x(db: &Uni) -> anyhow::Result<i64> {
+    let r = db
+        .session()
+        .query("MATCH (c:Counter {id: 'x'}) RETURN c.n AS n")
+        .await?;
+    match r.rows()[0].value("n") {
+        Some(Value::Int(n)) => Ok(*n),
+        other => panic!("expected Int, got {other:?}"),
+    }
+}
 
 async fn seeded_db() -> anyhow::Result<Uni> {
     let db = Uni::in_memory().build().await?;
@@ -289,5 +301,108 @@ async fn for_update_lock_timeout_is_retriable_and_recovers() -> anyhow::Result<(
         .await?;
 
     holder.await.expect("holder task panicked");
+    Ok(())
+}
+
+// ── Read-latest semantics (FOR UPDATE on a fresh transaction) ────────────────
+
+/// The headline new guarantee: concurrent `FOR UPDATE` read-modify-writes with
+/// NO retry all commit and converge exactly. Acquiring the lock on a fresh
+/// transaction re-pins its snapshot to lock-acquisition time, so each writer
+/// reads the latest committed value under the lock and never conflicts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn for_update_rmw_no_retry_converges() -> anyhow::Result<()> {
+    const WRITERS: i64 = 8;
+    let db = Arc::new(seeded_db().await?);
+    let mut handles = Vec::new();
+    for _ in 0..WRITERS {
+        let db = db.clone();
+        handles.push(tokio::spawn(async move {
+            // No retry: a conflict here would surface as an Err and fail the test.
+            let s = db.session();
+            let tx = s.tx().await?;
+            tx.query("MATCH (c:Counter {id: 'x'}) FOR UPDATE RETURN c.n")
+                .await?;
+            tx.execute("MATCH (c:Counter {id: 'x'}) SET c.n = c.n + 1")
+                .await?;
+            tx.commit().await.map(|_| ())
+        }));
+    }
+    for h in handles {
+        // `?` propagates any SerializationConflict — there must be none.
+        h.await.expect("task panicked")?;
+    }
+    assert_eq!(
+        counter_x(&db).await?,
+        WRITERS,
+        "FOR UPDATE RMW must converge without retry"
+    );
+    Ok(())
+}
+
+/// A `FOR UPDATE` read on a fresh transaction sees the LATEST committed value,
+/// not the transaction's begin snapshot — even when another transaction
+/// committed after this one began (but before it acquired the lock).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn for_update_read_sees_latest_committed() -> anyhow::Result<()> {
+    let db = seeded_db().await?; // x.n = 0
+
+    // T2 begins (pins a snapshot at n=0) but does NOT read yet — stays fresh.
+    let s2 = db.session();
+    let t2 = s2.tx().await?;
+
+    // A separate transaction commits n=100 while T2 is open.
+    {
+        let s1 = db.session();
+        let t1 = s1.tx().await?;
+        t1.query("MATCH (c:Counter {id: 'x'}) FOR UPDATE RETURN c.n")
+            .await?;
+        t1.execute("MATCH (c:Counter {id: 'x'}) SET c.n = 100").await?;
+        t1.commit().await?;
+    }
+
+    // T2's first op is a FOR UPDATE read: re-pin makes it observe 100, not 0.
+    let r = t2
+        .query("MATCH (c:Counter {id: 'x'}) FOR UPDATE RETURN c.n AS n")
+        .await?;
+    assert_eq!(
+        r.rows()[0].value("n"),
+        Some(&Value::Int(100)),
+        "FOR UPDATE on a fresh tx must read the latest committed value"
+    );
+    t2.rollback();
+    Ok(())
+}
+
+/// Documented limitation / fallback: if a transaction READS before `FOR UPDATE`,
+/// the re-pin is suppressed (a single per-tx read sequence cannot keep the
+/// earlier read at its begin basis), so the FOR UPDATE read keeps the begin
+/// snapshot and the RMW still needs retry — today's behaviour, preserved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn read_before_for_update_keeps_begin_snapshot() -> anyhow::Result<()> {
+    let db = seeded_db().await?; // x.n = 0
+
+    let s2 = db.session();
+    let t2 = s2.tx().await?;
+    // A prior read makes T2 non-fresh — no re-pin on the later FOR UPDATE.
+    t2.query("MATCH (c:Counter {id: 'x'}) RETURN c.n").await?;
+
+    {
+        let s1 = db.session();
+        let t1 = s1.tx().await?;
+        t1.execute("MATCH (c:Counter {id: 'x'}) SET c.n = 100").await?;
+        t1.commit().await?;
+    }
+
+    // FOR UPDATE after the prior read still sees the begin snapshot (0).
+    let r = t2
+        .query("MATCH (c:Counter {id: 'x'}) FOR UPDATE RETURN c.n AS n")
+        .await?;
+    assert_eq!(
+        r.rows()[0].value("n"),
+        Some(&Value::Int(0)),
+        "after a prior read, FOR UPDATE keeps the begin snapshot (fallback)"
+    );
+    t2.rollback();
     Ok(())
 }

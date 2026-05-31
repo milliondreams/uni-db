@@ -369,6 +369,14 @@ impl Writer {
         self.for_update_locks.len()
     }
 
+    /// The current OCC commit sequence. A `FOR UPDATE` acquisition re-stamps a
+    /// fresh transaction's `occ_read_seq` to this so its conflict-detection
+    /// baseline advances to lock-acquisition time (read-latest under the lock).
+    #[cfg(feature = "ssi")]
+    pub fn current_commit_sequence(&self) -> u64 {
+        self.commit_sequence.load(Ordering::Relaxed)
+    }
+
     /// Build a fresh `SharedFlushCtx` from this Writer's current state.
     /// Used by the async-flush stream/finalize paths to pass into spawned
     /// tasks without smuggling `Arc<Writer>` (which would create a cycle

@@ -88,40 +88,31 @@ async fn hot_key_ssi_retry_converges() -> Result<()> {
     Ok(())
 }
 
-/// FOR UPDATE serializes hot-key writers pessimistically, *paired with retry*.
+/// FOR UPDATE serializes hot-key writers pessimistically AND reads-latest under
+/// the lock — so a `FOR UPDATE` read-modify-write converges with NO retry.
 ///
-/// Note on semantics: FOR UPDATE is an exact-key mutex (Component C5). It blocks a
-/// second writer until the first releases, but the second writer's *snapshot* was
-/// pinned at its begin, so after acquiring the lock it still reads the stale value
-/// and its commit conflicts in OCC. FOR UPDATE therefore reduces the contention
-/// window but does NOT eliminate the need for retry (a future enhancement could
-/// make the locked read see the latest committed value). With retry, it converges
-/// exactly — this test pins that combined behavior.
+/// Semantics (Component C5): FOR UPDATE is an exact-key mutex; acquiring it on a
+/// fresh transaction also re-pins the snapshot to lock-acquisition time, so each
+/// serialized writer reads the latest committed value and its commit does not
+/// conflict. This test pins the retry-free guarantee: 16 writers, no retry, exact
+/// convergence. (Mixed read-then-FOR-UPDATE still needs retry — see
+/// `ssi_for_update::read_before_for_update_keeps_begin_snapshot`.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn hot_key_for_update_with_retry_converges() -> Result<()> {
+async fn hot_key_for_update_no_retry_converges() -> Result<()> {
     const WRITERS: i64 = 16;
     let db = counter_db(&["x"]).await?;
     let mut handles = Vec::new();
     for _ in 0..WRITERS {
         let db = db.clone();
         handles.push(tokio::spawn(async move {
-            db.session()
-                .transact_with_retry(
-                    RetryOptions {
-                        max_attempts: 200,
-                        ..Default::default()
-                    },
-                    |tx| {
-                        Box::pin(async move {
-                            tx.query("MATCH (c:Counter {id: 'x'}) FOR UPDATE RETURN c.n")
-                                .await?;
-                            tx.execute("MATCH (c:Counter {id: 'x'}) SET c.n = c.n + 1")
-                                .await?;
-                            Ok(())
-                        })
-                    },
-                )
-                .await
+            // No retry: any conflict surfaces as an Err and fails the test.
+            let s = db.session();
+            let tx = s.tx().await?;
+            tx.query("MATCH (c:Counter {id: 'x'}) FOR UPDATE RETURN c.n")
+                .await?;
+            tx.execute("MATCH (c:Counter {id: 'x'}) SET c.n = c.n + 1")
+                .await?;
+            tx.commit().await.map(|_| ())
         }));
     }
     for h in handles {

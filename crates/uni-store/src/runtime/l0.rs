@@ -27,6 +27,14 @@ pub struct OccReadSet {
     pub edges: HashSet<Eid>,
 }
 
+impl OccReadSet {
+    /// `true` when nothing has been read yet. Used to decide whether a `FOR
+    /// UPDATE` acquisition may safely re-pin a still-fresh transaction.
+    pub fn is_empty(&self) -> bool {
+        self.vertices.is_empty() && self.edges.is_empty()
+    }
+}
+
 /// Returns the current timestamp in nanoseconds since Unix epoch.
 fn now_nanos() -> i64 {
     SystemTime::now()

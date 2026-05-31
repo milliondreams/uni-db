@@ -121,8 +121,12 @@ pub struct Transaction {
     /// commit-time freeze check — so a transaction's own pin never makes its own
     /// commit freeze; only a *concurrent* reader's pin does. `None` after release
     /// (or on an abandoned tx, dropped via `Arc`).
+    ///
+    /// Behind a `Mutex` for interior mutability: a `FOR UPDATE` acquisition on a
+    /// still-fresh transaction RE-PINS this to lock-acquisition time so the
+    /// locked read sees the latest committed value (see `acquire_for_update_locks`).
     #[cfg(feature = "l0-snapshot")]
-    snapshot: Option<uni_store::runtime::SnapshotView>,
+    snapshot: parking_lot::Mutex<Option<uni_store::runtime::SnapshotView>>,
 }
 
 /// Classify a Cypher payload as `"write"`, `"schema"`, or `"dbms"` for
@@ -229,7 +233,7 @@ impl Transaction {
         #[cfg(feature = "l0-snapshot")]
         let snapshot = {
             let writer: &uni_store::Writer = writer_lock.as_ref();
-            Some(writer.l0_manager.pin_snapshot())
+            parking_lot::Mutex::new(Some(writer.l0_manager.pin_snapshot()))
         };
 
         let id = Uuid::new_v4().to_string();
@@ -288,7 +292,7 @@ impl Transaction {
     #[cfg(feature = "l0-snapshot")]
     fn read_snapshot(&self) -> Option<uni_store::runtime::SnapshotView> {
         // Returns `Some` for the tx's reads; `None` after commit/rollback `take`s it.
-        self.snapshot.clone()
+        self.snapshot.lock().clone()
     }
 
     /// Without `l0-snapshot`, reads are never snapshot-isolated.
@@ -355,6 +359,7 @@ impl Transaction {
         let mut keys = collected.keys;
         keys.sort();
         keys.dedup();
+        let mut acquired_any = false;
         for key in keys {
             if self.for_update_held.lock().contains(&key) {
                 continue;
@@ -370,6 +375,36 @@ impl Transaction {
                     .map_err(|_| UniError::LockTimeout { timeout_ms: 10_000 })?;
             self.for_update_held.lock().insert(key);
             self.for_update_guards.lock().push(guard);
+            acquired_any = true;
+        }
+
+        // Read-latest under the lock. If this acquisition actually took a lock and
+        // the transaction is still FRESH (no reads, no writes yet), re-pin the
+        // snapshot and re-stamp the OCC read sequence to NOW. The locked read then
+        // sees the latest committed value, so a `FOR UPDATE` read-modify-write
+        // commits WITHOUT a retry: the lock keeps the row stable, while a
+        // non-FOR-UPDATE writer that commits the row after this new baseline is
+        // still caught by OCC (correct). Fresh-only because a single per-tx
+        // `occ_read_seq` cannot keep earlier reads at their begin basis — a tx that
+        // read before `FOR UPDATE` keeps today's mutex+retry behaviour.
+        if acquired_any && !self.is_dirty() {
+            let read_set_empty = self
+                .tx_l0
+                .read()
+                .occ_read_set
+                .as_ref()
+                .is_none_or(|rs| rs.lock().is_empty());
+            if read_set_empty {
+                // Order mirrors transaction begin: advance `occ_read_seq` first,
+                // then pin, so the snapshot always reflects state >= read_seq (a
+                // racing commit causes at most a spurious retry, never a missed
+                // conflict / lost update).
+                self.tx_l0.write().occ_read_seq = writer.current_commit_sequence();
+                #[cfg(feature = "l0-snapshot")]
+                {
+                    *self.snapshot.lock() = Some(writer.l0_manager.pin_snapshot());
+                }
+            }
         }
         Ok(())
     }
@@ -841,7 +876,7 @@ impl Transaction {
         // tx's own pin would force a needless deep clone of the main L0 on every
         // commit. Read-your-writes is unaffected (it uses the live `tx_l0`).
         #[cfg(feature = "l0-snapshot")]
-        self.snapshot.take();
+        self.snapshot.lock().take();
 
         // Wrap the commit (which acquires `flush_lock` internally) in the
         // same timeout that used to wrap the outer writer-RwLock acquisition.
@@ -1043,7 +1078,7 @@ impl Transaction {
 
         // Component C1: release the snapshot pin promptly (symmetric with commit).
         #[cfg(feature = "l0-snapshot")]
-        self.snapshot.take();
+        self.snapshot.lock().take();
 
         // Release write guard
         self.session_write_guard.store(false, Ordering::SeqCst);

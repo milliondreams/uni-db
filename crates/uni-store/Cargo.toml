@@ -18,6 +18,11 @@ l0-snapshot = []
 # gates write-set/read-set validation, serializable MERGE, and the snapshot
 # read path. See `docs/proposals/serializable_snapshot_isolation.md`.
 ssi = ["l0-snapshot"]
+# Test-only fault injection: activates the `fail::fail_point!` markers placed in
+# the commit path (`commit_transaction_l0`) so crash-recovery tests can simulate
+# a crash at a precise point. No-op and zero-cost unless enabled. The `fail`
+# crate is always linked but its macros expand to `{}` without this feature.
+failpoints = ["fail/failpoints"]
 
 [dependencies]
 uni-common = { workspace = true }
@@ -58,7 +63,13 @@ object_store = { workspace = true }
 url = { workspace = true }
 sha3 = "0.10.8"
 tokio-util = { workspace = true }
+# Commit-path fault injection for crash-recovery tests. Macros are no-ops (and
+# the crate links to nothing measurable) unless the `failpoints` feature is on.
+fail = "0.5"
 
 [dev-dependencies]
 tempfile = { workspace = true }
 proptest = { workspace = true }
+# Capture emitted `metrics` counters in-process so tests can assert on
+# freeze/abort/conflict telemetry. Pairs with `metrics = "0.22"`.
+metrics-util = "0.16"

@@ -118,6 +118,14 @@ smol_str = "0.3"
 # Dev-only: structural-sharing map for the L0 snapshot strategy bench. Not a
 # production dependency until the benchmark decision selects strategy B.
 imbl = "3"
+# Capture emitted `metrics` counters in-process so SSI resilience/stress tests
+# can assert on freeze/abort/conflict telemetry. Pairs with `metrics = "0.22"`.
+metrics-util = "0.16"
+# Configure the commit-path `fail_point!` markers from crash-recovery tests
+# (`fail::cfg` / `FailScenario`). Only has effect under `--features failpoints`.
+fail = "0.5"
+# Randomized workload generation for the SSI invariant-oracle + chaos tests.
+proptest = { workspace = true }
 
 [[bench]]
 name = "algo_benchmarks"
@@ -145,6 +153,25 @@ harness = false
 
 [[bench]]
 name = "l0_snapshot_bench"
+harness = false
+
+# SSI/OCC performance benches (Phase 5). Build with `--features ssi`; the
+# ssi-off arms in each measure the baseline. See
+# docs/proposals/serializable_snapshot_isolation.md.
+[[bench]]
+name = "ssi_read_tax"
+harness = false
+
+[[bench]]
+name = "ssi_commit_overhead"
+harness = false
+
+[[bench]]
+name = "ssi_freeze"
+harness = false
+
+[[bench]]
+name = "ssi_contention"
 harness = false
 
 [features]
@@ -190,6 +217,10 @@ storage-internals = []
 l0-snapshot = ["uni-store/l0-snapshot", "uni-query/l0-snapshot"]
 # Umbrella: forwards the SSI/OCC commit-validation flag (default off).
 ssi = ["uni-store/ssi", "uni-query/ssi", "l0-snapshot"]
+# Forwards commit-path fault injection (uni-store `fail_point!` markers) so the
+# crash-recovery resilience tests can simulate a crash at a precise point.
+# Test-only; combine with `ssi`, e.g. `--features ssi,failpoints`.
+failpoints = ["uni-store/failpoints"]
 provider-candle = ["uni-xervo/provider-candle"]
 provider-mistralrs = ["uni-xervo/provider-mistralrs"]
 provider-openai = ["uni-xervo/provider-openai"]

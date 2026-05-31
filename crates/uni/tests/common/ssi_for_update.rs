@@ -184,3 +184,110 @@ async fn for_update_unsupported_pattern_does_not_block() -> anyhow::Result<()> {
     tx1.rollback();
     Ok(())
 }
+
+// ── G5: lock-map does not leak ───────────────────────────────────────────────
+
+/// The `FOR UPDATE` lock map holds an entry only while a transaction holds the
+/// lock; it is pruned when the transaction ends. Before the G5 fix, every
+/// distinct locked key accumulated a permanent entry.
+#[tokio::test]
+async fn for_update_lock_map_does_not_leak() -> anyhow::Result<()> {
+    let db = seeded_db().await?;
+    let writer = db.writer().expect("persistent db has a writer");
+    assert_eq!(writer.for_update_lock_count(), 0, "map starts empty");
+
+    {
+        let s = db.session();
+        let tx = s.tx().await?;
+        tx.query("MATCH (c:Counter {id: 'x'}) FOR UPDATE RETURN c.n")
+            .await?;
+        assert_eq!(
+            writer.for_update_lock_count(),
+            1,
+            "entry present while the lock is held"
+        );
+        tx.commit().await?;
+    }
+    assert_eq!(
+        writer.for_update_lock_count(),
+        0,
+        "entry pruned when the holder commits (G5)"
+    );
+
+    // Many sequential transactions on the same key never accumulate entries.
+    for _ in 0..10 {
+        let s = db.session();
+        let tx = s.tx().await?;
+        tx.query("MATCH (c:Counter {id: 'x'}) FOR UPDATE RETURN c.n")
+            .await?;
+        tx.commit().await?;
+    }
+    assert_eq!(
+        writer.for_update_lock_count(),
+        0,
+        "lock map leaked across completed transactions (G5)"
+    );
+    Ok(())
+}
+
+// ── G6: a contended lock surfaces a retriable LockTimeout ─────────────────────
+
+/// A `FOR UPDATE` acquisition that cannot complete within the bound surfaces
+/// `UniError::LockTimeout`, which `is_retriable()` — so `transact_with_retry`
+/// re-runs and wins once the holder releases. Ignored by default because it must
+/// wait out the 10s acquisition bound to trigger the timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "G6: takes >10s — must wait out the FOR UPDATE acquisition bound"]
+async fn for_update_lock_timeout_is_retriable_and_recovers() -> anyhow::Result<()> {
+    use uni_db::{RetryOptions, UniError};
+
+    let db = Arc::new(seeded_db().await?);
+
+    // Holder grabs the lock and keeps it for ~12s (past the 10s acquire bound),
+    // then releases — so the contender's first acquire times out (LockTimeout)
+    // and its retry succeeds.
+    let holder_db = db.clone();
+    let holder = tokio::spawn(async move {
+        let s = holder_db.session();
+        let tx = s.tx().await.unwrap();
+        tx.query("MATCH (c:Counter {id: 'x'}) FOR UPDATE RETURN c.n")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(12_000)).await;
+        tx.commit().await.unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Sanity: a plain (non-retrying) acquire returns the retriable LockTimeout.
+    let probe_db = db.clone();
+    let err = {
+        let s = probe_db.session();
+        let tx = s.tx().await?;
+        tx.query("MATCH (c:Counter {id: 'x'}) FOR UPDATE RETURN c.n")
+            .await
+            .expect_err("should time out while the holder keeps the lock")
+    };
+    assert!(matches!(err, UniError::LockTimeout { .. }), "got {err:?}");
+    assert!(err.is_retriable(), "LockTimeout must be retriable");
+
+    // With retry, the contender eventually wins after the holder releases.
+    db.session()
+        .transact_with_retry(
+            RetryOptions {
+                max_attempts: 5,
+                ..Default::default()
+            },
+            |tx| {
+                Box::pin(async move {
+                    tx.query("MATCH (c:Counter {id: 'x'}) FOR UPDATE RETURN c.n")
+                        .await?;
+                    Ok(())
+                })
+            },
+        )
+        .await?;
+
+    holder.await.expect("holder task panicked");
+    Ok(())
+}

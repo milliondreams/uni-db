@@ -144,6 +144,15 @@ pub enum UniError {
     #[error("Transaction '{tx_id}' commit timed out")]
     CommitTimeout { tx_id: String, hint: &'static str },
 
+    /// A `FOR UPDATE` pessimistic row lock could not be acquired within the
+    /// deadline — the holder is another live transaction (contention or a
+    /// lock-ordering deadlock). Unlike a plain [`UniError::Timeout`] (a slow
+    /// operation that would just time out again), this is transient: a fresh
+    /// transaction can retry and win the lock once the holder releases it, so
+    /// it is classified retriable. See `is_retriable`.
+    #[error("FOR UPDATE lock acquisition timed out after {timeout_ms}ms")]
+    LockTimeout { timeout_ms: u64 },
+
     /// Transaction exceeded its deadline.
     #[error("Transaction '{tx_id}' expired")]
     TransactionExpired { tx_id: String, hint: &'static str },
@@ -285,7 +294,8 @@ impl UniError {
     /// a caller-set budget, not a contention signal. A plain `Timeout` is
     /// likewise *not* retriable — re-running the same slow operation would just
     /// time out again; only `CommitTimeout` (lock contention at the commit point)
-    /// signals retriable contention.
+    /// and `LockTimeout` (a contended `FOR UPDATE` row lock / deadlock) signal
+    /// retriable contention.
     ///
     /// # Examples
     /// ```
@@ -302,6 +312,7 @@ impl UniError {
                 | UniError::ConstraintConflict { .. }
                 | UniError::TransactionConflict { .. }
                 | UniError::CommitTimeout { .. }
+                | UniError::LockTimeout { .. }
         )
     }
 }
@@ -437,6 +448,9 @@ mod tests {
                 tx_id: s(),
                 hint: "",
             },
+            // A contended FOR UPDATE row lock / deadlock clears when the holder
+            // releases; a fresh transaction can retry and win it.
+            UniError::LockTimeout { timeout_ms: 10_000 },
         ];
         for e in &retriable {
             assert!(e.is_retriable(), "{e:?} should be retriable");

@@ -323,8 +323,10 @@ impl Transaction {
     /// are locked (the RMW use case); other `FOR UPDATE` patterns log a warning.
     ///
     /// # Errors
-    /// Returns [`UniError::Timeout`] if a lock cannot be acquired within the
-    /// bound (a likely deadlock or long-held lock); the transaction may retry.
+    /// Returns [`UniError::LockTimeout`] (retriable) if a lock cannot be acquired
+    /// within the bound — a likely deadlock or long-held lock. `transact_with_retry`
+    /// will re-run the closure, which re-acquires from scratch and can win the lock
+    /// once the holder releases.
     #[cfg(feature = "ssi")]
     async fn acquire_for_update_locks(
         &self,
@@ -358,12 +360,14 @@ impl Transaction {
                 continue;
             }
             let handle = writer.row_lock_handle(&key);
-            // Bounded wait so a deadlock surfaces as a retryable timeout rather
-            // than hanging the transaction.
+            // Bounded wait so a deadlock surfaces as a retriable LockTimeout
+            // rather than hanging the transaction. (A plain Timeout would not be
+            // retriable; a contended row lock genuinely clears when the holder
+            // commits/rolls back, so the retry helper should re-attempt it.)
             let guard =
                 tokio::time::timeout(std::time::Duration::from_secs(10), handle.lock_owned())
                     .await
-                    .map_err(|_| UniError::Timeout { timeout_ms: 10_000 })?;
+                    .map_err(|_| UniError::LockTimeout { timeout_ms: 10_000 })?;
             self.for_update_held.lock().insert(key);
             self.for_update_guards.lock().push(guard);
         }
@@ -1134,6 +1138,20 @@ impl Drop for Transaction {
             // No writer lock needed — the private L0 drops with the Transaction.
             // Release write guard
             self.session_write_guard.store(false, Ordering::SeqCst);
+        }
+        // Release any FOR UPDATE pessimistic locks and prune the now-unreferenced
+        // lock-map entries (otherwise the map grows once per distinct locked key
+        // for the life of the database). Order matters: drop the guards FIRST so
+        // the `Arc` strong count reflects only the map before we prune.
+        #[cfg(feature = "ssi")]
+        {
+            self.for_update_guards.lock().clear();
+            let keys: Vec<Vec<u8>> = self.for_update_held.lock().drain().collect();
+            if !keys.is_empty()
+                && let Some(writer) = self.db.writer.as_ref()
+            {
+                writer.release_for_update_locks(&keys);
+            }
         }
         // Phase 2 Day 11: pair with the increment in `new_with_options`.
         // Always runs, regardless of commit/rollback/silent-drop.

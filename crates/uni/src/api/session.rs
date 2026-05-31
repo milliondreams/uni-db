@@ -732,12 +732,15 @@ impl Session {
                     Ok(_) => return Ok(value),
                     // `commit` already consumed `tx`; nothing to roll back.
                     Err(e) if e.is_retriable() && attempt < opts.max_attempts => {
+                        metrics::counter!("uni_ssi_retries_total", "stage" => "commit")
+                            .increment(1);
                         attempt += 1;
                         opts.backoff(attempt).await;
                     }
                     Err(e) => return Err(e),
                 },
                 Err(e) if e.is_retriable() && attempt < opts.max_attempts => {
+                    metrics::counter!("uni_ssi_retries_total", "stage" => "body").increment(1);
                     tx.rollback();
                     attempt += 1;
                     opts.backoff(attempt).await;

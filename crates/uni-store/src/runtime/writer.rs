@@ -343,6 +343,32 @@ impl Writer {
             .clone()
     }
 
+    /// Prunes `FOR UPDATE` lock-map entries for `keys` that no live transaction
+    /// holds anymore, so the map does not grow without bound across the keyspace.
+    ///
+    /// Called when a transaction ends, **after** its guards have been dropped.
+    /// `remove_if` evaluates its predicate under the DashMap shard lock, which is
+    /// the same lock `row_lock_handle` takes to clone an entry — so the check
+    /// `strong_count == 1` (only the map holds the `Arc`) is race-free: a
+    /// concurrent acquirer either already cloned the `Arc` (count ≥ 2 → we skip
+    /// removal) or has not yet taken the shard lock (it will mint a fresh entry
+    /// after we remove). Either way no two transactions ever lock different
+    /// `Mutex` instances for the same key.
+    #[cfg(feature = "ssi")]
+    pub fn release_for_update_locks(&self, keys: &[Vec<u8>]) {
+        for key in keys {
+            self.for_update_locks
+                .remove_if(key, |_, handle| Arc::strong_count(handle) == 1);
+        }
+    }
+
+    /// Number of live entries in the `FOR UPDATE` lock map. Introspection for
+    /// tests that the map does not leak entries across transactions (G5).
+    #[cfg(feature = "ssi")]
+    pub fn for_update_lock_count(&self) -> usize {
+        self.for_update_locks.len()
+    }
+
     /// Build a fresh `SharedFlushCtx` from this Writer's current state.
     /// Used by the async-flush stream/finalize paths to pass into spawned
     /// tasks without smuggling `Arc<Writer>` (which would create a cycle
@@ -516,6 +542,11 @@ impl Writer {
         // this becomes the load-bearing serialization point.
         let _flush_lock_guard = self.flush_lock.lock().await;
 
+        // Crash-recovery seam: simulate process death immediately after winning
+        // the commit serialization point but before any durable work. No-op
+        // unless built with `--features failpoints`. (See ssi_resilience tests.)
+        fail::fail_point!("commit::after-flush-lock");
+
         // SSI: optimistic conflict detection. This MUST run before any WAL
         // write — `flush_wal()` below is the durable commit point and the WAL
         // has no abort marker, so aborting after it would resurrect this
@@ -527,6 +558,9 @@ impl Writer {
             let read_seq = tx_l0.occ_read_seq;
             let write_set = crate::runtime::occ::WriteSet::from_l0(&tx_l0);
             if !write_set.is_empty() {
+                // Telemetry: one validation per non-empty (writing) commit. The
+                // ratio of conflicts to validations is the headline abort rate.
+                metrics::counter!("uni_ssi_commit_validations_total").increment(1);
                 // Read-set is consulted only for writing transactions, so a
                 // read-only commit (empty write-set) runs at snapshot isolation.
                 let read_guard = tx_l0.occ_read_set.as_ref().map(|rs| rs.lock());
@@ -535,6 +569,22 @@ impl Writer {
                         .lock()
                         .check(read_seq, &write_set, read_guard.as_deref())
                 {
+                    use crate::runtime::occ::Conflict;
+                    match &conflict {
+                        Conflict::WriteWrite { .. } => metrics::counter!(
+                            "uni_ssi_serialization_conflicts_total",
+                            "kind" => "write_write",
+                        )
+                        .increment(1),
+                        Conflict::ReadWrite { .. } => metrics::counter!(
+                            "uni_ssi_serialization_conflicts_total",
+                            "kind" => "read_write",
+                        )
+                        .increment(1),
+                        Conflict::HistoryTruncated { .. } => {
+                            metrics::counter!("uni_ssi_history_truncated_total").increment(1)
+                        }
+                    }
                     return Err(anyhow::Error::new(
                         uni_common::UniError::SerializationConflict {
                             message: conflict.to_string(),
@@ -555,6 +605,7 @@ impl Writer {
                 // left by the per-insert check. (Empty index → no iterations.)
                 for (key, vid) in &tx_l0.constraint_index {
                     if main_l0.has_constraint_key(key, *vid) {
+                        metrics::counter!("uni_ssi_constraint_conflicts_total").increment(1);
                         return Err(anyhow::Error::new(
                             uni_common::UniError::ConstraintConflict {
                                 message: "unique key already committed by a concurrent \
@@ -572,6 +623,7 @@ impl Writer {
                 if let Some(conflict) =
                     crate::runtime::occ::crdt_carveout_overwrite(&tx_l0, &main_l0)
                 {
+                    metrics::counter!("uni_ssi_crdt_aborts_total").increment(1);
                     return Err(anyhow::Error::new(
                         uni_common::UniError::SerializationConflict {
                             message: conflict.to_string(),
@@ -581,6 +633,11 @@ impl Writer {
             }
             write_set
         };
+
+        // Crash-recovery seam: SSI validation has passed; the transaction is
+        // about to become durable. A crash here must leave NO trace (validation
+        // happens before the WAL is touched). No-op unless `failpoints`.
+        fail::fail_point!("commit::after-validate");
 
         // 1. Write transaction mutations to WAL BEFORE merging into main L0
         // This ensures durability before visibility.
@@ -610,6 +667,11 @@ impl Writer {
                     let labels = tx_l0.vertex_labels.get(vid).cloned().unwrap_or_default();
                     wal.append(&crate::runtime::wal::Mutation::DeleteVertex { vid: *vid, labels })?;
                 }
+
+                // Crash-recovery seam: vertices appended, edges not yet. Tests
+                // assert that a crash here (before `flush_wal`) recovers NOTHING
+                // — the durable commit point is the flush below, not append.
+                fail::fail_point!("commit::mid-wal");
 
                 // Edge insertions and deletions from edge_endpoints
                 for (eid, (src_vid, dst_vid, edge_type)) in &tx_l0.edge_endpoints {
@@ -659,6 +721,11 @@ impl Writer {
 
         // 2. Flush WAL to durable storage - THIS IS THE COMMIT POINT
         let wal_lsn = self.flush_wal().await?;
+
+        // Crash-recovery seam: the WAL is durable but main L0 has NOT merged.
+        // A crash here must RECOVER the transaction on replay (it is committed),
+        // even though it was never made visible in-process. No-op unless `failpoints`.
+        fail::fail_point!("commit::after-wal-flush");
 
         // Component C1: if an outstanding snapshot pins the current generation,
         // clone it aside (lazy copy-on-write) before merging, so the pinning
@@ -714,6 +781,12 @@ impl Writer {
                 }
             }
         }
+
+        // Crash-recovery seam: durable AND merged, but the in-memory commit
+        // registry has not recorded this write-set yet. A crash here is
+        // indistinguishable from one at `after-wal-flush` on reopen (the
+        // registry is in-memory and rebuilt empty); the tx still recovers.
+        fail::fail_point!("commit::after-merge");
 
         // SSI: register this commit's write-set under a fresh commit sequence so
         // later transactions detect conflicts against it. Still under
@@ -1702,6 +1775,42 @@ impl Writer {
         ))
     }
 
+    /// Layer-1 CRDT variant enforcement, shared by the single-vertex and batch
+    /// write paths.
+    ///
+    /// Rejects a declared CRDT property written as a parsed CRDT value
+    /// (`Value::Map`) whose variant differs from the schema's declared variant.
+    /// A mismatch would make the commit-time merge silently overwrite instead of
+    /// merge, and the OCC CRDT carve-out (`occ::crdt_carveout_overwrite` /
+    /// `WriteSet::from_l0`) would hide it as a lost update — so it must be caught
+    /// at write time, on *every* write path. `try_as_crdt` is `Map`-gated, so the
+    /// JSON-string (Cypher) form and non-CRDT values pass through untouched: they
+    /// are never carved out and stay conflictable.
+    fn enforce_crdt_variants(
+        props_meta: &std::collections::HashMap<String, uni_common::core::schema::PropertyMeta>,
+        properties: &Properties,
+    ) -> Result<()> {
+        for (key, value) in properties {
+            let Some(meta) = props_meta.get(key) else {
+                continue;
+            };
+            let uni_common::core::schema::DataType::Crdt(expected) = &meta.r#type else {
+                continue;
+            };
+            if let Some(crdt) = crate::runtime::l0::try_as_crdt(value)
+                && crdt.type_name() != expected.type_name()
+            {
+                return Err(anyhow::Error::new(uni_common::UniError::Constraint {
+                    message: format!(
+                        "CRDT property '{key}' must be written as a {} value",
+                        expected.type_name()
+                    ),
+                }));
+            }
+        }
+        Ok(())
+    }
+
     /// Prepare a vertex for upsert by merging CRDT properties with existing values.
     ///
     /// When `label` is provided, uses it directly to look up property metadata.
@@ -1768,25 +1877,7 @@ impl Writer {
         // stays conflictable — so it poses no carve-out soundness risk and is left
         // to the existing merge/parse path. This is the declared-property half of
         // the layered fix; the commit-time check covers undeclared CRDT-shaped values.
-        for key in &crdt_keys {
-            let Some(meta) = props_meta.get(key) else {
-                continue;
-            };
-            let uni_common::core::schema::DataType::Crdt(expected) = &meta.r#type else {
-                continue;
-            };
-            if let Some(value) = properties.get(key)
-                && let Some(crdt) = crate::runtime::l0::try_as_crdt(value)
-                && crdt.type_name() != expected.type_name()
-            {
-                return Err(anyhow::Error::new(uni_common::UniError::Constraint {
-                    message: format!(
-                        "CRDT property '{key}' must be written as a {} value",
-                        expected.type_name()
-                    ),
-                }));
-            }
-        }
+        Self::enforce_crdt_variants(props_meta, properties)?;
 
         let ctx = self.get_query_context(tx_l0).await;
         for key in crdt_keys {
@@ -1853,6 +1944,34 @@ impl Writer {
         Ok(())
     }
 
+    /// Component C1 (G4): before a non-transactional mutation merges into main
+    /// L0, if an outstanding snapshot pins the current generation, freeze it
+    /// aside so snapshots taken *before* this write stay isolated from it.
+    ///
+    /// `flush_lock` (acquired and released here) serializes the freeze against
+    /// concurrent commit-time freezes/merges, matching the atomicity the tx
+    /// commit path gets. No-op for transactional writes (their freeze happens at
+    /// commit) and — the common case — when nothing is pinned, where it costs one
+    /// atomic load. Freezes at most once per pinned generation: the freeze
+    /// installs a fresh unpinned `current`, so later writes in the same bulk
+    /// import see no pin and merge in place, and the snapshot keeps reading the
+    /// frozen pre-import buffer.
+    async fn freeze_for_non_tx_write_if_pinned(&self, tx_l0: Option<&Arc<RwLock<L0Buffer>>>) {
+        #[cfg(feature = "l0-snapshot")]
+        if tx_l0.is_none() && self.l0_manager.is_current_pinned() {
+            let _flush_lock_guard = self.flush_lock.lock().await;
+            // Re-check under the lock: a concurrent commit may have frozen first.
+            if self.l0_manager.is_current_pinned() {
+                self.l0_manager.freeze_current_for_snapshot();
+                metrics::counter!("uni_l0_snapshot_freezes_total").increment(1);
+            }
+        }
+        #[cfg(not(feature = "l0-snapshot"))]
+        {
+            let _ = (self, tx_l0);
+        }
+    }
+
     #[instrument(skip(self, properties, labels), level = "trace")]
     pub async fn insert_vertex_with_labels(
         &self,
@@ -1865,22 +1984,11 @@ impl Writer {
         self.check_write_pressure().await?;
         self.check_transaction_memory(tx_l0)?;
 
-        // Component C1 carve-out: a non-transactional write (`tx_l0 == None`, e.g.
-        // bulk import / LOAD CSV) mutates the main L0 directly, bypassing the
-        // commit-time snapshot freeze. If a snapshot is pinned it may observe such
-        // partial writes — declared out of scope for C1. Warn once so the usage is
-        // visible without per-row spam.
-        #[cfg(feature = "l0-snapshot")]
-        if tx_l0.is_none() && self.l0_manager.is_current_pinned() {
-            static WARNED: std::sync::Once = std::sync::Once::new();
-            WARNED.call_once(|| {
-                tracing::warn!(
-                    "non-transactional write to main L0 while an L0 snapshot is pinned; \
-                     snapshot-isolated readers may observe partial writes (e.g. bulk import). \
-                     Component C1 does not isolate non-transactional writes."
-                );
-            });
-        }
+        // Component C1 (G4): a non-transactional write (`tx_l0 == None`, e.g. bulk
+        // import / LOAD CSV) mutates main L0 directly, outside the commit-time
+        // snapshot freeze. Freeze the pinned generation aside first so snapshots
+        // taken before this write stay isolated from it.
+        self.freeze_for_non_tx_write_if_pinned(tx_l0).await;
 
         if !self.try_defer_embedding(labels, &properties, vid, tx_l0) {
             self.process_embeddings_for_labels(labels, &mut properties)
@@ -2196,6 +2304,11 @@ impl Writer {
             self.check_write_pressure().await?;
             self.check_transaction_memory(tx_l0)?;
 
+            // Component C1 (G4): batch bulk-import is the canonical non-tx write —
+            // freeze the pinned generation aside before merging so snapshot
+            // readers stay isolated. No-op when unpinned or transactional.
+            self.freeze_for_non_tx_write_if_pinned(tx_l0).await;
+
             // Batch embedding generation (1 API call per config)
             self.process_embeddings_for_batch(&labels, &mut properties_batch)
                 .await?;
@@ -2224,6 +2337,20 @@ impl Writer {
             };
 
             if has_crdt_fields {
+                // Layer-1 variant enforcement (G3): the batch path must reject a
+                // declared-CRDT variant mismatch exactly as the single-vertex
+                // `prepare_vertex_upsert` does. Without this, a wrong-variant CRDT
+                // written via batch import slips past write-time validation and
+                // the OCC carve-out then masks the overwrite as a lost update.
+                {
+                    let schema = self.schema_manager.schema();
+                    if let Some(props_meta) = schema.properties.get(label.as_str()) {
+                        for props in &properties_batch {
+                            Self::enforce_crdt_variants(props_meta, props)?;
+                        }
+                    }
+                }
+
                 // Batch fetch existing CRDT values: collect VIDs that need merging,
                 // then query once via PropertyManager instead of per-vertex lookups.
                 let schema = self.schema_manager.schema();
@@ -2311,6 +2438,7 @@ impl Writer {
         let start = std::time::Instant::now();
         self.check_write_pressure().await?;
         self.check_transaction_memory(tx_l0)?;
+        self.freeze_for_non_tx_write_if_pinned(tx_l0).await; // C1 (G4)
         let l0 = self.resolve_l0(tx_l0);
 
         // Before deleting, ensure we have the vertex's labels stored in L0
@@ -2445,6 +2573,7 @@ impl Writer {
         touched_keys: HashSet<String>,
         tx_l0: Option<&Arc<RwLock<L0Buffer>>>,
     ) -> Result<()> {
+        self.freeze_for_non_tx_write_if_pinned(tx_l0).await; // C1 (G4)
         if !self.config.partial_lance_writes {
             return self
                 .insert_edge(
@@ -2511,6 +2640,7 @@ impl Writer {
         let start = std::time::Instant::now();
         self.check_write_pressure().await?;
         self.check_transaction_memory(tx_l0)?;
+        self.freeze_for_non_tx_write_if_pinned(tx_l0).await; // C1 (G4)
         self.prepare_edge_upsert(eid, &mut properties, tx_l0)
             .await?;
 
@@ -2550,6 +2680,7 @@ impl Writer {
         let start = std::time::Instant::now();
         self.check_write_pressure().await?;
         self.check_transaction_memory(tx_l0)?;
+        self.freeze_for_non_tx_write_if_pinned(tx_l0).await; // C1 (G4)
         let l0 = self.resolve_l0(tx_l0);
 
         l0.write().delete_edge(eid, src_vid, dst_vid, edge_type)?;

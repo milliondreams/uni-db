@@ -2031,7 +2031,12 @@ impl HybridPhysicalPlanner {
             )
         };
 
-        Ok(Arc::new(knn))
+        // SSI read-set: a vector-KNN result is a set of *real* graph vertices
+        // (the exec emits `{variable}._vid` from the native/plugin index over the
+        // actual store), each of which a concurrent transaction can write. A
+        // read-write antidependency through a KNN read must therefore abort, so
+        // record the matched vids — exactly as `plan_scan` does for label scans.
+        Ok(self.wrap_read_set_recording(Arc::new(knn), variable))
     }
 
     /// Plan a procedure call.
@@ -2130,6 +2135,14 @@ impl HybridPhysicalPlanner {
             // Re-apply the Cypher filter as a top-level FilterExec for
             // safety (the catalog table may have ignored the pushdown).
             plan = self.apply_scan_filter(plan, variable, filter, Some(label_name))?;
+            // SSI read-set: deliberately NOT recorded. A virtual (catalog-backed)
+            // label is read-only — CREATE/SET/DELETE on it is rejected at both
+            // planner and runtime — so no uni transaction can ever write a
+            // virtual vertex, and a read-write antidependency through one is
+            // impossible. Its `_vid` is also synthetic (`label_id << 48 | row`,
+            // ≥ 0xFF00…), disjoint from real vids, so recording it could only add
+            // never-matching keys (and risk a false abort if the spaces ever
+            // overlapped). Excluding it is the sound choice, not a gap.
             return self.wrap_optional(plan, optional);
         }
 
@@ -2590,6 +2603,10 @@ impl HybridPhysicalPlanner {
 
     /// Build the virtual-side scan: a single `CatalogVertexScanExec` for one
     /// virtual label, or a `UnionExec` of one-per-label scans when several.
+    /// SSI note: like the single virtual scan, the catalog scans built here are
+    /// deliberately NOT wrapped in read-set recording — virtual labels are
+    /// read-only with synthetic vids, so no antidependency is possible. See the
+    /// rationale at the single-label virtual scan in `plan_scan`.
     fn build_virtual_union_scan(
         &self,
         virtual_labels: &[(String, u16)],
@@ -2803,6 +2820,12 @@ impl HybridPhysicalPlanner {
     /// duplicate join-key column from the right side. If the destination
     /// label is itself virtual, the postlude layers
     /// `hydrate_virtual_target_from_catalog` on top.
+    ///
+    /// SSI note: the `CatalogEdgeScanExec` and any virtual target are NOT
+    /// read-set recorded — virtual edges/vertices are read-only with synthetic
+    /// ids, so no antidependency is possible (see the rationale in `plan_scan`).
+    /// The *real* source vertex `{source}._vid` entering the join was already
+    /// recorded by whatever scan produced `input_plan`.
     #[expect(
         clippy::too_many_arguments,
         reason = "mirrors plan_traverse's argument set"

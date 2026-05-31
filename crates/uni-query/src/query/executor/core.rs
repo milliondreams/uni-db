@@ -274,8 +274,7 @@ pub struct Executor {
     /// Pinned L0 snapshot for snapshot-isolated reads (Component C1). When set,
     /// `get_context` builds the read context from this frozen view instead of the
     /// live L0, so a transaction's reads are isolated from concurrent commits.
-    /// `None` (the default, and always in a non-`l0-snapshot` build, where it is
-    /// never constructed) means live reads.
+    /// `None` (the default, when no snapshot has been pinned) means live reads.
     pub(crate) read_snapshot: Option<uni_store::runtime::SnapshotView>,
 }
 
@@ -437,9 +436,9 @@ impl Executor {
 
     /// Attach a pinned L0 snapshot for snapshot-isolated reads (Component C1).
     ///
-    /// When `Some`, [`Self::get_context`] reads from the frozen view instead of
+    /// When `Some`, `get_context` reads from the frozen view instead of
     /// the live L0. A `None` is a no-op (live reads), so threading it is always
-    /// safe — in a non-`l0-snapshot` build it is always `None`.
+    /// safe — callers that do not pin a snapshot leave it `None`.
     pub fn set_read_snapshot(&mut self, snapshot: Option<uni_store::runtime::SnapshotView>) {
         self.read_snapshot = snapshot;
     }
@@ -475,7 +474,7 @@ impl Executor {
             // Component C1: when a snapshot is pinned, read from the frozen
             // generation (`main` + `extra`) so concurrent commits are invisible;
             // `transaction_l0` stays live for read-your-writes. `None` (the
-            // default and the only state without `l0-snapshot`) ⇒ live reads.
+            // default, when no snapshot is pinned) ⇒ live reads.
             let mut ctx = match &self.read_snapshot {
                 Some(snap) => {
                     QueryContext::new_with_pending(snap.main.clone(), tx_l0, snap.extra.clone())

@@ -363,7 +363,9 @@ mod tests {
     fn gset_props(item: &str) -> uni_common::Properties {
         let mut gs = uni_crdt::GSet::new();
         gs.add(item.to_string());
-        let v: uni_common::Value = serde_json::to_value(uni_crdt::Crdt::GSet(gs)).unwrap().into();
+        let v: uni_common::Value = serde_json::to_value(uni_crdt::Crdt::GSet(gs))
+            .unwrap()
+            .into();
         uni_common::Properties::from([("counter".to_string(), v)])
     }
 

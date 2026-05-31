@@ -217,7 +217,10 @@ async fn commit_that_crashes(db: Arc<Uni>, val: i64) {
         tx.commit().await
     })
     .await;
-    assert!(res.is_err(), "commit task should have panicked at the failpoint");
+    assert!(
+        res.is_err(),
+        "commit task should have panicked at the failpoint"
+    );
 }
 
 /// After a mid-commit crash + reopen, the value is atomic (`0` or `val`, never a

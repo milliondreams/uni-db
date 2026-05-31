@@ -87,7 +87,8 @@ async fn assert_read_no_false_abort(read: &str, disjoint_write: &str) -> Result<
         assert_committed(tb.commit().await);
     }
 
-    ta.execute("CREATE (:T {id: 'sentinel_ok', val: 0})").await?;
+    ta.execute("CREATE (:T {id: 'sentinel_ok', val: 0})")
+        .await?;
     assert_committed(ta.commit().await);
     Ok(())
 }

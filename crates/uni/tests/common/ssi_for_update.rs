@@ -357,7 +357,8 @@ async fn for_update_read_sees_latest_committed() -> anyhow::Result<()> {
         let t1 = s1.tx().await?;
         t1.query("MATCH (c:Counter {id: 'x'}) FOR UPDATE RETURN c.n")
             .await?;
-        t1.execute("MATCH (c:Counter {id: 'x'}) SET c.n = 100").await?;
+        t1.execute("MATCH (c:Counter {id: 'x'}) SET c.n = 100")
+            .await?;
         t1.commit().await?;
     }
 
@@ -390,7 +391,8 @@ async fn read_before_for_update_keeps_begin_snapshot() -> anyhow::Result<()> {
     {
         let s1 = db.session();
         let t1 = s1.tx().await?;
-        t1.execute("MATCH (c:Counter {id: 'x'}) SET c.n = 100").await?;
+        t1.execute("MATCH (c:Counter {id: 'x'}) SET c.n = 100")
+            .await?;
         t1.commit().await?;
     }
 

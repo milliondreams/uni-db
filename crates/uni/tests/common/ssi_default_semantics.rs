@@ -77,7 +77,9 @@ async fn concurrent_writes_do_not_conflict_without_ssi() -> Result<()> {
         }));
     }
     for h in handles {
-        h.await.expect("task panicked").expect("no conflict in the off build");
+        h.await
+            .expect("task panicked")
+            .expect("no conflict in the off build");
     }
     Ok(())
 }

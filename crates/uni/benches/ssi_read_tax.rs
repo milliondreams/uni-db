@@ -71,8 +71,14 @@ fn bench_read_paths(c: &mut Criterion) {
 
     for (name, q) in [
         ("point_read", "MATCH (n:N {id: 'n1234'}) RETURN n.v"),
-        ("label_scan_filtered", "MATCH (n:N) WHERE n.v > 1990 RETURN n.id"),
-        ("one_hop_traversal", "MATCH (a:N {id: 'n0'})-[:R]->(b) RETURN b.id"),
+        (
+            "label_scan_filtered",
+            "MATCH (n:N) WHERE n.v > 1990 RETURN n.id",
+        ),
+        (
+            "one_hop_traversal",
+            "MATCH (a:N {id: 'n0'})-[:R]->(b) RETURN b.id",
+        ),
     ] {
         group.bench_function(name, |b| {
             b.iter_custom(|iters| time_query(&rt, &db, iters, q));

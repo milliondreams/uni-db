@@ -33,6 +33,7 @@
 //! [`cypher_expr_to_df`] from the `df_expr` module.
 
 use crate::query::df_expr::{TranslationContext, VariableKind, cypher_expr_to_df};
+use crate::query::df_graph::ReadSetRecordingExec;
 use crate::query::df_graph::bind_fixed_path::BindFixedPathExec;
 use crate::query::df_graph::bind_zero_length_path::BindZeroLengthPathExec;
 use crate::query::df_graph::mutation_common::{MutationKind, extended_schema_for_new_vars};
@@ -51,7 +52,6 @@ use crate::query::df_graph::{
     GraphUnwindExec, GraphVectorKnnExec, L0Context, MutationContext, MutationExec,
     OptionalFilterExec,
 };
-use crate::query::df_graph::ReadSetRecordingExec;
 use crate::query::planner::{
     LogicalPlan, STRUCT_ONLY_SENTINEL, aggregate_column_name, collect_properties_from_plan,
 };

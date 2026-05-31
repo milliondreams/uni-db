@@ -62,10 +62,7 @@ pub enum Mutation {
     /// replay can REPLACE (removals included). Added after the original four
     /// variants — externally-tagged serde_json, so old WAL segments (which never
     /// contain it) deserialize unchanged.
-    SetVertexLabels {
-        vid: Vid,
-        labels: Vec<String>,
-    },
+    SetVertexLabels { vid: Vid, labels: Vec<String> },
 }
 
 /// WAL segment with LSN for idempotent recovery

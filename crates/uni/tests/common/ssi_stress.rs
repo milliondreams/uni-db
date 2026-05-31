@@ -44,7 +44,9 @@ async fn counter_db(keys: &[&str]) -> Result<Arc<Uni>> {
 async fn counter_of(db: &Uni, key: &str) -> Result<i64> {
     let r = db
         .session()
-        .query(&format!("MATCH (c:Counter {{id: '{key}'}}) RETURN c.n AS n"))
+        .query(&format!(
+            "MATCH (c:Counter {{id: '{key}'}}) RETURN c.n AS n"
+        ))
         .await?;
     match r.rows()[0].value("n") {
         Some(Value::Int(n)) => Ok(*n),
@@ -202,7 +204,10 @@ async fn mixed_olap_oltp_no_deadlock() -> Result<()> {
         oracle::assert_counter(counter_of(&db, k).await?, WRITES_PER_KEY);
     }
     // ...and the readers actually ran concurrently.
-    assert!(reads.load(Ordering::Relaxed) > 0, "no analytical reads completed");
+    assert!(
+        reads.load(Ordering::Relaxed) > 0,
+        "no analytical reads completed"
+    );
     Ok(())
 }
 

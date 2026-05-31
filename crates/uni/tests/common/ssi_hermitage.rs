@@ -113,7 +113,10 @@ async fn g2_item_write_skew_is_prevented() -> Result<()> {
     assert_serialization_conflict(tb.commit().await);
 
     // Invariant x + y >= 1 holds: only x was zeroed.
-    assert!(val(&db, "x").await? + val(&db, "y").await? >= 1, "write skew leaked");
+    assert!(
+        val(&db, "x").await? + val(&db, "y").await? >= 1,
+        "write skew leaked"
+    );
     Ok(())
 }
 
@@ -130,9 +133,7 @@ async fn g1a_dirty_read_is_prevented() -> Result<()> {
 
     // T2 begins while T1's write is uncommitted; it must see the committed 0.
     let tb = sb.tx().await?;
-    let r = tb
-        .query("MATCH (n:T {id: 'x'}) RETURN n.val AS v")
-        .await?;
+    let r = tb.query("MATCH (n:T {id: 'x'}) RETURN n.val AS v").await?;
     assert_eq!(
         r.rows()[0].value("v"),
         Some(&Value::Int(0)),
@@ -161,7 +162,11 @@ async fn g1b_intermediate_read_is_prevented() -> Result<()> {
 
     // T2's snapshot predates T1: it sees neither 1 nor 2.
     let r = tb.query("MATCH (n:T {id: 'x'}) RETURN n.val AS v").await?;
-    assert_eq!(r.rows()[0].value("v"), Some(&Value::Int(0)), "saw intermediate/final");
+    assert_eq!(
+        r.rows()[0].value("v"),
+        Some(&Value::Int(0)),
+        "saw intermediate/final"
+    );
 
     assert_committed(ta.commit().await);
     drop(tb);

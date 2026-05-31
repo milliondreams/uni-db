@@ -44,7 +44,9 @@ async fn fresh_counter() -> Arc<Uni> {
         .unwrap();
     let s = db.session();
     let tx = s.tx().await.unwrap();
-    tx.execute("CREATE (:Counter {id: 'x', n: 0})").await.unwrap();
+    tx.execute("CREATE (:Counter {id: 'x', n: 0})")
+        .await
+        .unwrap();
     tx.commit().await.unwrap();
     Arc::new(db)
 }

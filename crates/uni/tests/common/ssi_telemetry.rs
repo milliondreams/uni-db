@@ -45,8 +45,10 @@ async fn conflict_increments_serialization_counter() -> Result<()> {
     let (sa, sb) = (db.session(), db.session());
     let ta = sa.tx().await?;
     let tb = sb.tx().await?;
-    ta.execute("MATCH (c:C {id: 'x'}) SET c.n = c.n + 1").await?;
-    tb.execute("MATCH (c:C {id: 'x'}) SET c.n = c.n + 1").await?;
+    ta.execute("MATCH (c:C {id: 'x'}) SET c.n = c.n + 1")
+        .await?;
+    tb.execute("MATCH (c:C {id: 'x'}) SET c.n = c.n + 1")
+        .await?;
     assert_committed(ta.commit().await);
     assert_serialization_conflict(tb.commit().await);
 
@@ -129,7 +131,8 @@ async fn contention_drives_retries() -> Result<()> {
                     },
                     |tx| {
                         Box::pin(async move {
-                            tx.execute("MATCH (c:C {id: 'x'}) SET c.n = c.n + 1").await?;
+                            tx.execute("MATCH (c:C {id: 'x'}) SET c.n = c.n + 1")
+                                .await?;
                             Ok(())
                         })
                     },

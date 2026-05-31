@@ -70,7 +70,8 @@ async fn snapshot_isolates_tx_reads_from_concurrent_commit() -> Result<()> {
     {
         let s_w = db.session();
         let tx_w = s_w.tx().await?;
-        tx_w.execute("MATCH (c:Counter {id: 'x'}) SET c.n = 1").await?;
+        tx_w.execute("MATCH (c:Counter {id: 'x'}) SET c.n = 1")
+            .await?;
         tx_w.commit().await?;
     }
 
@@ -96,7 +97,8 @@ async fn snapshot_preserves_read_your_writes() -> Result<()> {
     let s = db.session();
     let tx = s.tx().await?;
 
-    tx.execute("MATCH (c:Counter {id: 'x'}) SET c.n = 42").await?;
+    tx.execute("MATCH (c:Counter {id: 'x'}) SET c.n = 42")
+        .await?;
     assert_eq!(
         read_n(&tx).await?,
         42,
@@ -143,7 +145,8 @@ async fn snapshots_pinned_at_different_points_are_independent() -> Result<()> {
     {
         let s_w = db.session();
         let tx_w = s_w.tx().await?;
-        tx_w.execute("MATCH (c:Counter {id: 'x'}) SET c.n = 7").await?;
+        tx_w.execute("MATCH (c:Counter {id: 'x'}) SET c.n = 7")
+            .await?;
         tx_w.commit().await?;
     }
 
@@ -237,7 +240,8 @@ async fn freeze_fires_only_under_contention() -> Result<()> {
     {
         let s = db.session();
         let tx = s.tx().await?;
-        tx.execute("MATCH (c:Counter {id: 'x'}) SET c.n = 1").await?;
+        tx.execute("MATCH (c:Counter {id: 'x'}) SET c.n = 1")
+            .await?;
         tx.commit().await?;
     }
     assert_eq!(
@@ -255,7 +259,8 @@ async fn freeze_fires_only_under_contention() -> Result<()> {
         {
             let s_w = db.session();
             let tx_w = s_w.tx().await?;
-            tx_w.execute("MATCH (c:Counter {id: 'x'}) SET c.n = 2").await?;
+            tx_w.execute("MATCH (c:Counter {id: 'x'}) SET c.n = 2")
+                .await?;
             tx_w.commit().await?;
         }
         tx_r.rollback();

@@ -446,7 +446,8 @@ async fn read_only_transaction_is_not_a_pivot() -> Result<()> {
     {
         let s_w = db.session();
         let tx_w = s_w.tx().await?;
-        tx_w.execute("MATCH (c:Counter {id: 'x'}) SET c.n = 5").await?;
+        tx_w.execute("MATCH (c:Counter {id: 'x'}) SET c.n = 5")
+            .await?;
         tx_w.commit().await?;
     }
 

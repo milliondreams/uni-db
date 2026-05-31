@@ -49,7 +49,9 @@ async fn counter_db(keys: &[&str]) -> Result<Uni> {
 async fn counter_of(db: &Uni, key: &str) -> Result<i64> {
     let r = db
         .session()
-        .query(&format!("MATCH (c:Counter {{id: '{key}'}}) RETURN c.n AS n"))
+        .query(&format!(
+            "MATCH (c:Counter {{id: '{key}'}}) RETURN c.n AS n"
+        ))
         .await?;
     match r.rows()[0].value("n") {
         Some(Value::Int(n)) => Ok(*n),
@@ -59,7 +61,12 @@ async fn counter_of(db: &Uni, key: &str) -> Result<i64> {
 
 /// `writers` tasks each apply `incs` retried increments to keys chosen round-robin
 /// from `keys`. Returns the number of increments targeted at each key.
-async fn run_counter_workload(db: Arc<Uni>, keys: Vec<String>, writers: usize, incs: usize) -> Vec<i64> {
+async fn run_counter_workload(
+    db: Arc<Uni>,
+    keys: Vec<String>,
+    writers: usize,
+    incs: usize,
+) -> Vec<i64> {
     let mut expected = vec![0i64; keys.len()];
     let mut handles = Vec::new();
     for w in 0..writers {
@@ -204,9 +211,7 @@ async fn bank_transfers_conserve_and_stay_non_negative() -> Result<()> {
                         Box::pin(async move {
                             // Read both balances (populates the read-set).
                             let r = tx
-                                .query(&format!(
-                                    "MATCH (a:Acct {{id: '{src}'}}) RETURN a.bal AS b"
-                                ))
+                                .query(&format!("MATCH (a:Acct {{id: '{src}'}}) RETURN a.bal AS b"))
                                 .await?;
                             let bal = match r.rows()[0].value("b") {
                                 Some(Value::Int(b)) => *b,

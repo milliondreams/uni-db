@@ -206,7 +206,11 @@ async fn label_add_persists_after_commit() -> Result<()> {
     }
     assert_eq!(count_with_label(&db, "Tagged").await?, 1, "label add lost");
     // The original label is retained (replace used the full resolved set).
-    assert_eq!(count_with_label(&db, "T").await?, 2, "original label dropped");
+    assert_eq!(
+        count_with_label(&db, "T").await?,
+        2,
+        "original label dropped"
+    );
     Ok(())
 }
 
@@ -225,8 +229,16 @@ async fn label_remove_persists_after_commit() -> Result<()> {
         tx.execute("MATCH (n:T {id: 'x'}) REMOVE n:Tagged").await?;
         tx.commit().await?;
     }
-    assert_eq!(count_with_label(&db, "Tagged").await?, 0, "label not removed");
-    assert_eq!(count_with_label(&db, "T").await?, 2, "removal wiped other labels");
+    assert_eq!(
+        count_with_label(&db, "Tagged").await?,
+        0,
+        "label not removed"
+    );
+    assert_eq!(
+        count_with_label(&db, "T").await?,
+        2,
+        "removal wiped other labels"
+    );
     Ok(())
 }
 
@@ -242,7 +254,11 @@ async fn property_set_does_not_wipe_labels() -> Result<()> {
         tx.commit().await?;
     }
     // Both x and y still carry T (a property write must not drop labels).
-    assert_eq!(count_with_label(&db, "T").await?, 2, "property SET wiped labels");
+    assert_eq!(
+        count_with_label(&db, "T").await?,
+        2,
+        "property SET wiped labels"
+    );
     Ok(())
 }
 

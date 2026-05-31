@@ -2617,8 +2617,7 @@ impl Executor {
 
                 // Update the node value in the row with the remaining labels.
                 if let Some(Value::Map(obj)) = row.get_mut(variable) {
-                    let labels_list =
-                        remaining_labels.into_iter().map(Value::String).collect();
+                    let labels_list = remaining_labels.into_iter().map(Value::String).collect();
                     obj.insert("_labels".to_string(), Value::List(labels_list));
                 }
             }

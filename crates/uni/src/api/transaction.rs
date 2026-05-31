@@ -305,7 +305,8 @@ impl Transaction {
     pub async fn query(&self, cypher: &str) -> Result<QueryResult> {
         self.check_completed()?;
         if self.db.config.ssi_enabled {
-            self.acquire_for_update_locks(cypher, &HashMap::new()).await?;
+            self.acquire_for_update_locks(cypher, &HashMap::new())
+                .await?;
         } else if cypher.to_ascii_lowercase().contains("for update") {
             // FOR UPDATE is a no-op when SSI is disabled — surface it loudly so a
             // runtime misconfiguration does not silently drop pessimistic locking

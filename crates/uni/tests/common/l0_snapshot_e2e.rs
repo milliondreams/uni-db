@@ -9,8 +9,8 @@
 //! because the transaction's private `tx_l0` stays live over the snapshot. See
 //! `docs/proposals/serializable_snapshot_isolation.md` (Component C1 / item F).
 //!
-//! Gated on `l0-snapshot` (enabled transitively by `ssi`), so these run under
-//! both the snapshot-only and the full SSI builds.
+//! SSI is always compiled and `UniConfig::ssi_enabled` defaults on, so these
+//! run unconditionally.
 
 use anyhow::Result;
 use uni_db::{DataType, Uni, Value};

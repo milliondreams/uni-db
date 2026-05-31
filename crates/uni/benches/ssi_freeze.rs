@@ -11,11 +11,12 @@
 //! across L0 sizes, so the p99 commit tail under snapshot contention is known.
 //!
 //! ```bash
-//! cargo bench --bench ssi_freeze --features ssi   # freeze only fires with l0-snapshot
+//! cargo bench --bench ssi_freeze
 //! ```
 //!
-//! With `ssi` off the two arms are identical (no freeze); the gap with `ssi` on
-//! is the freeze cost.
+//! Freeze fires under the default (SSI-on) config when a commit races a pinned
+//! snapshot; with `ssi_enabled = false` the two arms are identical (no freeze),
+//! so the gap is the freeze cost.
 
 use std::sync::Arc;
 use std::time::Instant;

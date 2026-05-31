@@ -31,6 +31,9 @@ mod fork;
 mod hybrid_localstack_e2e;
 #[path = "common/index/mod.rs"]
 mod index;
+#[cfg(feature = "l0-snapshot")]
+#[path = "common/l0_snapshot_e2e.rs"]
+mod l0_snapshot_e2e;
 #[path = "common/locy/mod.rs"]
 mod locy;
 #[path = "common/perf/mod.rs"]

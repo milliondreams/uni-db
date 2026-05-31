@@ -6,6 +6,59 @@ use crate::runtime::wal::WriteAheadLog;
 use parking_lot::RwLock;
 use std::sync::Arc;
 
+/// Per-generation pin marker for snapshot isolation (Component C1).
+///
+/// Held by exactly two classes: the [`L0Manager`] keeps one clone for the
+/// current generation, and every live [`SnapshotView`] holds one. So
+/// `Arc::strong_count` on the manager's clone is `1 + (live snapshots of the
+/// current generation)`, which [`L0Manager::is_current_pinned`] uses to decide
+/// whether a commit must freeze the generation aside before mutating it. The
+/// private field stops any other code from minting a token and breaking that
+/// invariant.
+///
+/// Always compiled (so the inert threading types exist in every build); it is
+/// only ever *minted* by [`L0Manager::pin_snapshot`], which is `l0-snapshot`-gated.
+#[derive(Debug)]
+pub struct PinToken(());
+
+/// An isolated, reference-counted view of the L0 tier captured at a point in time.
+///
+/// Reads built from a `SnapshotView` see the L0 generation(s) that were visible
+/// at capture, not later commits: while any view of a generation is alive a
+/// commit that would mutate it first freezes it aside
+/// ([`L0Manager::freeze_current_for_snapshot`]), so the buffers behind `main`
+/// and `extra` are never mutated after capture. Dropping the view releases its
+/// pin; `Arc` reference counting reclaims a frozen generation once no view holds
+/// it. `started_at_version` is captured for the future C2 base-pinning hook and
+/// is not yet consulted.
+///
+/// Always compiled so it can thread through the executor as an inert
+/// `Option<SnapshotView>` in every build; it is only ever *constructed* by
+/// [`L0Manager::pin_snapshot`] (`l0-snapshot`-gated), so in a non-feature build
+/// the threaded option is always `None`.
+#[derive(Clone)]
+pub struct SnapshotView {
+    /// The pinned main L0 generation at capture time.
+    pub main: Arc<RwLock<L0Buffer>>,
+    /// Generations being flushed at capture time, read after `main` (oldest visible state).
+    pub extra: Vec<Arc<RwLock<L0Buffer>>>,
+    /// Pin marker keeping the captured generation freeze-on-commit.
+    pin: Arc<PinToken>,
+    /// Main-L0 version at capture; the hook a future C2 will feed to `open_at`.
+    pub started_at_version: u64,
+}
+
+impl std::fmt::Debug for SnapshotView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Avoid requiring `L0Buffer: Debug` and dumping buffer contents.
+        f.debug_struct("SnapshotView")
+            .field("extra_generations", &self.extra.len())
+            .field("pins", &Arc::strong_count(&self.pin))
+            .field("started_at_version", &self.started_at_version)
+            .finish_non_exhaustive()
+    }
+}
+
 pub struct L0Manager {
     // The current active L0 buffer.
     // Outer RwLock protects the Arc (swapping L0s).
@@ -15,6 +68,12 @@ pub struct L0Manager {
     // These remain visible to reads until flush completes successfully.
     // This prevents data loss if L1 writes fail after rotation.
     pending_flush: RwLock<Vec<Arc<RwLock<L0Buffer>>>>,
+    // Snapshot-isolation pin token for the current generation (Component C1).
+    // Reset on every rotate so a fresh generation starts unpinned. Read/cloned
+    // only under the `current` lock so a snapshot captures a buffer and token
+    // from the same generation. See `PinToken`.
+    #[cfg(feature = "l0-snapshot")]
+    current_pin: RwLock<Arc<PinToken>>,
 }
 
 impl L0Manager {
@@ -23,6 +82,8 @@ impl L0Manager {
         Self {
             current: RwLock::new(Arc::new(RwLock::new(l0))),
             pending_flush: RwLock::new(Vec::new()),
+            #[cfg(feature = "l0-snapshot")]
+            current_pin: RwLock::new(Arc::new(PinToken(()))),
         }
     }
 
@@ -37,6 +98,8 @@ impl L0Manager {
         Self {
             current: RwLock::new(current),
             pending_flush: RwLock::new(pending_flush),
+            #[cfg(feature = "l0-snapshot")]
+            current_pin: RwLock::new(Arc::new(PinToken(()))),
         }
     }
 
@@ -72,6 +135,15 @@ impl L0Manager {
 
         let new_l0 = L0Buffer::new(next_version, new_wal);
         *guard = Arc::new(RwLock::new(new_l0));
+
+        // A fresh generation starts unpinned. Reset the pin token while still
+        // holding the `current` write guard: `pin_snapshot` clones the buffer
+        // and token under `current.read()`, so this serializes against it and a
+        // snapshot can never capture a buffer/token from different generations.
+        #[cfg(feature = "l0-snapshot")]
+        {
+            *self.current_pin.write() = Arc::new(PinToken(()));
+        }
 
         old_l0
     }
@@ -125,6 +197,77 @@ impl L0Manager {
         // Keep the frozen generation visible to latest (non-snapshot) reads.
         self.pending_flush.write().push(frozen.clone());
         (frozen, pending)
+    }
+
+    /// Pins an isolated view of the current L0 tier for a transaction.
+    ///
+    /// O(1): clones the current buffer handle, the pending-flush set, and the
+    /// generation's pin token. No freeze happens here — the current buffer keeps
+    /// taking writes; it is frozen aside lazily, and only if still pinned, when a
+    /// commit would next mutate it (see [`Self::freeze_current_for_snapshot`] and
+    /// [`Self::is_current_pinned`]). Holds the `current` read lock across the
+    /// buffer and token clones so both come from the same generation even if a
+    /// rotate races. Does not require the writer's `flush_lock`.
+    ///
+    /// # Examples
+    /// ```ignore
+    /// let snap = writer.l0_manager().pin_snapshot();
+    /// // build a QueryContext from `snap.main` + `snap.extra`
+    /// ```
+    #[cfg(feature = "l0-snapshot")]
+    pub fn pin_snapshot(&self) -> SnapshotView {
+        // Hold `current` read across both clones: a concurrent `rotate` needs
+        // `current.write()` and resets the pin token under it, so it cannot
+        // interleave and split the buffer/token across generations.
+        let current_guard = self.current.read();
+        let main = current_guard.clone();
+        let pin = self.current_pin.read().clone();
+        let started_at_version = main.read().current_version;
+        let extra = self.pending_flush.read().clone();
+        drop(current_guard);
+        SnapshotView {
+            main,
+            extra,
+            pin,
+            started_at_version,
+        }
+    }
+
+    /// Returns `true` if any live [`SnapshotView`] pins the current generation.
+    ///
+    /// `strong_count > 1` means a snapshot besides the manager holds the token.
+    /// Call under the writer's `flush_lock` at commit so the decision and any
+    /// resulting freeze are atomic with respect to the merge.
+    #[cfg(feature = "l0-snapshot")]
+    pub fn is_current_pinned(&self) -> bool {
+        Arc::strong_count(&self.current_pin.read()) > 1
+    }
+
+    /// Clones the current (pinned) generation aside so a commit can mutate a
+    /// fresh buffer without the pinning snapshots observing the write — lazy
+    /// copy-on-write, performed only when [`Self::is_current_pinned`] holds.
+    ///
+    /// The outgoing buffer — which the pinning [`SnapshotView`]s hold via `main`
+    /// — becomes immutable: a deep copy carrying the same data is installed as
+    /// the new current, the commit merges into that copy, and the original is
+    /// never mutated again. `L0Buffer::clone` drops the WAL handle, so the
+    /// original's WAL (already flushed at this commit's WAL step) is handed to
+    /// the copy; the frozen original keeps none, as it takes no more writes. The
+    /// original is **not** placed on the pending-flush list — it is reclaimed by
+    /// `Arc` refcount once the last snapshot drops, so nothing leaks. The new
+    /// generation starts unpinned (the pin token is reset). Must be called under
+    /// the writer's `flush_lock`, since it swaps the current buffer.
+    #[cfg(feature = "l0-snapshot")]
+    pub fn freeze_current_for_snapshot(&self) {
+        let mut guard = self.current.write();
+        let frozen = guard.clone();
+        let mut new_buf = frozen.read().clone();
+        // Hand the WAL from the now-frozen original to the writable copy.
+        new_buf.wal = frozen.write().wal.take();
+        *guard = Arc::new(RwLock::new(new_buf));
+        // The fresh generation starts unpinned; reset under the `current` write
+        // guard (consistent with `rotate`, which a non-clone path would use).
+        *self.current_pin.write() = Arc::new(PinToken(()));
     }
 
     /// Get the minimum WAL LSN across all pending flush L0s.
@@ -202,5 +345,58 @@ mod snapshot_tests {
 
         // ...and the untouched vertex remains visible via the frozen generation.
         assert_eq!(name_of(bob, &latest).as_deref(), Some("bob"));
+    }
+
+    /// A pin marks the current generation; dropping the snapshot releases it.
+    #[test]
+    fn pin_marks_current_generation() {
+        let mgr = L0Manager::new(0, None);
+        assert!(!mgr.is_current_pinned());
+        let snap = mgr.pin_snapshot();
+        assert!(mgr.is_current_pinned());
+        drop(snap);
+        assert!(
+            !mgr.is_current_pinned(),
+            "dropping the snapshot releases the pin"
+        );
+    }
+
+    /// Clone-on-freeze: after a pinned generation is frozen aside, the snapshot
+    /// still observes its captured state while the new generation takes writes,
+    /// and the new generation starts unpinned.
+    #[test]
+    fn clone_freeze_isolates_pinned_snapshot() {
+        let mgr = L0Manager::new(0, None);
+        let alice = Vid::from(1_u64);
+        let labels = ["Node".to_string()];
+        mgr.get_current()
+            .write()
+            .insert_vertex_with_labels(alice, named("alice"), &labels);
+
+        let snap = mgr.pin_snapshot();
+        assert!(mgr.is_current_pinned());
+
+        // Commit-equivalent: freeze the pinned generation aside, then mutate the
+        // fresh current (where a real commit's merge would land).
+        mgr.freeze_current_for_snapshot();
+        assert!(
+            !mgr.is_current_pinned(),
+            "the fresh generation starts unpinned"
+        );
+        mgr.get_current()
+            .write()
+            .insert_vertex_with_labels(alice, named("alice2"), &labels);
+
+        // The snapshot still sees the pre-freeze value (isolated).
+        let snap_ctx = QueryContext::new_with_pending(snap.main.clone(), None, snap.extra.clone());
+        assert_eq!(name_of(alice, &snap_ctx).as_deref(), Some("alice"));
+
+        // A fresh latest view sees the post-freeze value.
+        let latest =
+            QueryContext::new_with_pending(mgr.get_current(), None, mgr.get_pending_flush());
+        assert_eq!(name_of(alice, &latest).as_deref(), Some("alice2"));
+
+        // Dropping the snapshot releases its hold on the frozen generation.
+        drop(snap);
     }
 }

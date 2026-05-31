@@ -115,6 +115,14 @@ pub struct Transaction {
     /// repeated match on the same key does not self-deadlock.
     #[cfg(feature = "ssi")]
     for_update_held: parking_lot::Mutex<std::collections::HashSet<Vec<u8>>>,
+    /// Pinned L0 snapshot for snapshot-isolated reads (Component C1). Captured at
+    /// begin (after `occ_read_seq`), threaded into reads via the executor.
+    /// Released (`take`n) at the start of commit/rollback — **before** the
+    /// commit-time freeze check — so a transaction's own pin never makes its own
+    /// commit freeze; only a *concurrent* reader's pin does. `None` after release
+    /// (or on an abandoned tx, dropped via `Arc`).
+    #[cfg(feature = "l0-snapshot")]
+    snapshot: Option<uni_store::runtime::SnapshotView>,
 }
 
 /// Classify a Cypher payload as `"write"`, `"schema"`, or `"dbms"` for
@@ -215,6 +223,15 @@ impl Transaction {
             (version, l0, reservoir)
         };
 
+        // Component C1: pin the L0 snapshot AFTER `create_transaction_l0` stamped
+        // `occ_read_seq`, so the snapshot reflects state >= read_seq — any commit
+        // newer than read_seq is then caught by OCC rather than silently read.
+        #[cfg(feature = "l0-snapshot")]
+        let snapshot = {
+            let writer: &uni_store::Writer = writer_lock.as_ref();
+            Some(writer.l0_manager.pin_snapshot())
+        };
+
         let id = Uuid::new_v4().to_string();
         info!(transaction_id = %id, "Transaction started");
 
@@ -246,6 +263,8 @@ impl Transaction {
             for_update_guards: parking_lot::Mutex::new(Vec::new()),
             #[cfg(feature = "ssi")]
             for_update_held: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            #[cfg(feature = "l0-snapshot")]
+            snapshot,
         };
 
         // Transaction constructed successfully — its Drop impl will clear the
@@ -263,6 +282,21 @@ impl Transaction {
 
     // ── Cypher Reads (sees shared DB + uncommitted writes) ────────────
 
+    /// The transaction's pinned L0 snapshot for snapshot-isolated reads
+    /// (Component C1), threaded into the executor. `None` without the
+    /// `l0-snapshot` feature (live reads); a `None` is a safe no-op.
+    #[cfg(feature = "l0-snapshot")]
+    fn read_snapshot(&self) -> Option<uni_store::runtime::SnapshotView> {
+        // Returns `Some` for the tx's reads; `None` after commit/rollback `take`s it.
+        self.snapshot.clone()
+    }
+
+    /// Without `l0-snapshot`, reads are never snapshot-isolated.
+    #[cfg(not(feature = "l0-snapshot"))]
+    fn read_snapshot(&self) -> Option<uni_store::runtime::SnapshotView> {
+        None
+    }
+
     /// Execute a Cypher query within the transaction.
     /// Reads see the private L0 buffer (uncommitted writes).
     #[instrument(skip(self), fields(transaction_id = %self.id))]
@@ -279,6 +313,7 @@ impl Transaction {
             HashMap::new(),
             self.tx_l0.clone(),
             Some(self.id_reservoir.clone()),
+            self.read_snapshot(),
         );
         uni_query::maybe_scope_with_principal(principal, fut).await
     }
@@ -796,6 +831,14 @@ impl Transaction {
             trigger_router.dispatch_before(ctx, events)?;
         }
 
+        // Component C1: release this transaction's OWN snapshot pin before the
+        // commit runs, so the commit-time freeze (`is_current_pinned`) only fires
+        // when ANOTHER live transaction pins this generation. Without this, the
+        // tx's own pin would force a needless deep clone of the main L0 on every
+        // commit. Read-your-writes is unaffected (it uses the live `tx_l0`).
+        #[cfg(feature = "l0-snapshot")]
+        self.snapshot.take();
+
         // Wrap the commit (which acquires `flush_lock` internally) in the
         // same timeout that used to wrap the outer writer-RwLock acquisition.
         // `flush_lock` is now the actual serialization point.
@@ -994,6 +1037,10 @@ impl Transaction {
         }
         self.completed = true;
 
+        // Component C1: release the snapshot pin promptly (symmetric with commit).
+        #[cfg(feature = "l0-snapshot")]
+        self.snapshot.take();
+
         // Release write guard
         self.session_write_guard.store(false, Ordering::SeqCst);
 
@@ -1135,6 +1182,7 @@ impl<'a> ExecuteBuilder<'a> {
             self.params,
             self.tx.tx_l0.clone(),
             Some(self.tx.id_reservoir.clone()),
+            self.tx.read_snapshot(),
         );
         let result = if let Some(t) = self.timeout {
             tokio::time::timeout(t, fut)
@@ -1169,6 +1217,7 @@ impl<'a> ExecuteBuilder<'a> {
             self.params,
             self.tx.tx_l0.clone(),
             Some(self.tx.id_reservoir.clone()),
+            self.tx.read_snapshot(),
         );
         let (result, profile) = if let Some(t) = self.timeout {
             tokio::time::timeout(t, fut)
@@ -1224,6 +1273,7 @@ impl<'a> TxQueryBuilder<'a> {
             self.params,
             self.tx.tx_l0.clone(),
             Some(self.tx.id_reservoir.clone()),
+            self.tx.read_snapshot(),
         );
         let result = if let Some(t) = self.timeout {
             tokio::time::timeout(t, fut)
@@ -1248,6 +1298,7 @@ impl<'a> TxQueryBuilder<'a> {
             self.params,
             self.tx.tx_l0.clone(),
             Some(self.tx.id_reservoir.clone()),
+            self.tx.read_snapshot(),
         );
         if let Some(t) = self.timeout {
             tokio::time::timeout(t, fut)

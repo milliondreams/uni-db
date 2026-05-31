@@ -543,13 +543,16 @@ impl Writer {
                 }
             }
 
-            // SSI / serializable MERGE: abort if a concurrent transaction has
-            // already committed a row with one of this transaction's unique
-            // keys. Commits serialize at `flush_lock`, so checking the merged
-            // main L0 here closes the race window left by the per-insert check.
-            if !tx_l0.constraint_index.is_empty() {
+            // Validate against the committed main L0 under `flush_lock`:
+            // serializable MERGE uniqueness + CRDT carve-out soundness.
+            {
                 let main_l0 = self.l0_manager.get_current();
                 let main_l0 = main_l0.read();
+
+                // SSI / serializable MERGE: abort if a concurrent transaction has
+                // already committed a row with one of this transaction's unique
+                // keys. Commits serialize here, so this closes the race window
+                // left by the per-insert check. (Empty index → no iterations.)
                 for (key, vid) in &tx_l0.constraint_index {
                     if main_l0.has_constraint_key(key, *vid) {
                         return Err(anyhow::Error::new(
@@ -560,6 +563,20 @@ impl Writer {
                             },
                         ));
                     }
+                }
+
+                // CRDT carve-out soundness: a pure-CRDT write was dropped from the
+                // write-set assuming its merge commutes. If main L0 holds a
+                // *different* CRDT variant for the same property, the merge would
+                // silently overwrite it — abort instead of losing the update.
+                if let Some(conflict) =
+                    crate::runtime::occ::crdt_carveout_overwrite(&tx_l0, &main_l0)
+                {
+                    return Err(anyhow::Error::new(
+                        uni_common::UniError::SerializationConflict {
+                            message: conflict.to_string(),
+                        },
+                    ));
                 }
             }
             write_set
@@ -642,6 +659,18 @@ impl Writer {
 
         // 2. Flush WAL to durable storage - THIS IS THE COMMIT POINT
         let wal_lsn = self.flush_wal().await?;
+
+        // Component C1: if an outstanding snapshot pins the current generation,
+        // clone it aside (lazy copy-on-write) before merging, so the pinning
+        // transaction's reads stay isolated from this commit. No-op — and zero
+        // cost — when nothing is pinned (the common case). We hold `flush_lock`,
+        // so this cannot race a flush rotate or another commit's merge; the merge
+        // below re-fetches `get_current()`, landing in the fresh post-freeze buffer.
+        #[cfg(feature = "l0-snapshot")]
+        if self.l0_manager.is_current_pinned() {
+            self.l0_manager.freeze_current_for_snapshot();
+            metrics::counter!("uni_l0_snapshot_freezes_total").increment(1);
+        }
 
         // 3. Merge into main L0 and make visible
         {
@@ -1727,6 +1756,38 @@ impl Writer {
             return Ok(());
         }
 
+        // Enforce that each declared CRDT property written as a parsed CRDT value
+        // (`Value::Map`) carries its declared variant. A mismatched variant makes
+        // `merge_crdt_properties` overwrite rather than merge at commit, and the
+        // OCC carve-out (`occ::crdt_carveout_overwrite` / `WriteSet::from_l0`)
+        // would hide that as a silent lost update — reject it at the source.
+        //
+        // Only the `Map` form is checked: it is exactly the form the carve-out
+        // applies to (`try_as_crdt` is `Map`-gated). A CRDT written as a JSON
+        // string (the Cypher form) or a non-CRDT value is never carved out — it
+        // stays conflictable — so it poses no carve-out soundness risk and is left
+        // to the existing merge/parse path. This is the declared-property half of
+        // the layered fix; the commit-time check covers undeclared CRDT-shaped values.
+        for key in &crdt_keys {
+            let Some(meta) = props_meta.get(key) else {
+                continue;
+            };
+            let uni_common::core::schema::DataType::Crdt(expected) = &meta.r#type else {
+                continue;
+            };
+            if let Some(value) = properties.get(key)
+                && let Some(crdt) = crate::runtime::l0::try_as_crdt(value)
+                && crdt.type_name() != expected.type_name()
+            {
+                return Err(anyhow::Error::new(uni_common::UniError::Constraint {
+                    message: format!(
+                        "CRDT property '{key}' must be written as a {} value",
+                        expected.type_name()
+                    ),
+                }));
+            }
+        }
+
         let ctx = self.get_query_context(tx_l0).await;
         for key in crdt_keys {
             let existing = pm.get_vertex_prop_with_ctx(vid, &key, ctx.as_ref()).await?;
@@ -1803,6 +1864,24 @@ impl Writer {
         let start = std::time::Instant::now();
         self.check_write_pressure().await?;
         self.check_transaction_memory(tx_l0)?;
+
+        // Component C1 carve-out: a non-transactional write (`tx_l0 == None`, e.g.
+        // bulk import / LOAD CSV) mutates the main L0 directly, bypassing the
+        // commit-time snapshot freeze. If a snapshot is pinned it may observe such
+        // partial writes — declared out of scope for C1. Warn once so the usage is
+        // visible without per-row spam.
+        #[cfg(feature = "l0-snapshot")]
+        if tx_l0.is_none() && self.l0_manager.is_current_pinned() {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                tracing::warn!(
+                    "non-transactional write to main L0 while an L0 snapshot is pinned; \
+                     snapshot-isolated readers may observe partial writes (e.g. bulk import). \
+                     Component C1 does not isolate non-transactional writes."
+                );
+            });
+        }
+
         if !self.try_defer_embedding(labels, &properties, vid, tx_l0) {
             self.process_embeddings_for_labels(labels, &mut properties)
                 .await?;

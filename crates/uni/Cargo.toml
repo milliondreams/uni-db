@@ -185,8 +185,9 @@ rhai-plugins = ["dep:uni-plugin-rhai"]
 pyo3-plugins = ["dep:uni-plugin-pyo3", "dep:pyo3"]
 snapshot-internals = []
 storage-internals = []
-# Prototype: forwards the strategy-D L0 snapshot-isolation flag (default off).
-l0-snapshot = ["uni-store/l0-snapshot"]
+# L0 snapshot-isolation reads (Component C1, default off). Forwards to both
+# uni-store (manager primitives) and uni-query (executor pinned-read path).
+l0-snapshot = ["uni-store/l0-snapshot", "uni-query/l0-snapshot"]
 # Umbrella: forwards the SSI/OCC commit-validation flag (default off).
 ssi = ["uni-store/ssi", "uni-query/ssi", "l0-snapshot"]
 provider-candle = ["uni-xervo/provider-candle"]

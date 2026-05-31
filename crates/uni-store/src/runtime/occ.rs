@@ -42,15 +42,7 @@ impl WriteSet {
     pub fn from_l0(l0: &L0Buffer) -> Self {
         let mut vertices: HashSet<Vid> = HashSet::new();
         for (vid, props) in &l0.vertex_properties {
-            // A re-asserted/changed non-empty label set is not CRDT-mergeable, so a
-            // labelled write stays conflictable. A pure CRDT increment is written
-            // with no labels (`&[]`), so it remains eligible for the carve-out.
-            let label_changed = l0
-                .vertex_labels
-                .get(vid)
-                .is_some_and(|labels| !labels.is_empty());
-            let all_crdt = !props.is_empty() && props.values().all(|v| try_as_crdt(v).is_some());
-            if label_changed || !all_crdt {
+            if !is_crdt_carveout(l0, vid, props) {
                 vertices.insert(*vid);
             }
         }
@@ -86,6 +78,89 @@ impl WriteSet {
         };
         small.iter().any(|e| large.contains(e))
     }
+}
+
+/// Returns `true` when a vertex write is a pure CRDT-mergeable carve-out.
+///
+/// A write qualifies when every property is a CRDT value and the write made no
+/// label change. Such a write commutes at commit via
+/// [`L0Buffer::merge_crdt_properties`], so it is excluded from the write-set to
+/// let concurrent CRDT increments to the same vertex both commit. A
+/// re-asserted/changed non-empty label set is not CRDT-mergeable, and a pure
+/// increment is written with no labels (`&[]`), so it stays eligible. Tombstones
+/// are handled by the caller (a delete never commutes with an increment).
+///
+/// Shared by [`WriteSet::from_l0`] and [`crdt_carveout_overwrite`] so the
+/// carve-out decision and its commit-time soundness check stay identical.
+fn is_crdt_carveout(l0: &L0Buffer, vid: &Vid, props: &uni_common::Properties) -> bool {
+    let label_changed = l0
+        .vertex_labels
+        .get(vid)
+        .is_some_and(|labels| !labels.is_empty());
+    let all_crdt = !props.is_empty() && props.values().all(|v| try_as_crdt(v).is_some());
+    all_crdt && !label_changed
+}
+
+/// A carved-out CRDT write whose committed value is a different CRDT variant.
+///
+/// The write-set carve-out ([`WriteSet::from_l0`]) drops a pure-CRDT vertex
+/// write from conflict detection assuming its merge commutes. That holds only
+/// when the committed value is the *same* CRDT variant. For a different variant,
+/// `merge_crdt_properties` falls through to a last-writer-wins overwrite — a
+/// silent lost update the carve-out would otherwise hide.
+#[derive(Debug)]
+pub struct CrdtVariantConflict {
+    /// The vertex whose carved-out CRDT write would be overwritten.
+    pub vid: Vid,
+    /// The property whose committed CRDT variant differs from the write.
+    pub property: String,
+}
+
+impl std::fmt::Display for CrdtVariantConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "carved-out CRDT write to property {:?} would overwrite a different \
+             committed CRDT variant (a lost update); aborting",
+            self.property
+        )
+    }
+}
+
+/// Detects carved-out CRDT writes that would silently overwrite a committed value.
+///
+/// The write-set carve-out removes pure-CRDT writes from conflict detection, so
+/// this commit-time check (against the merged main L0, under `flush_lock`) is
+/// what keeps the carve-out sound when a property's committed value is a
+/// *different* CRDT variant than the write — the one case `merge_crdt_properties`
+/// would overwrite rather than merge. Returns the first such mismatch, or `None`
+/// when every carved-out write merges cleanly. Declared CRDT properties are
+/// additionally guarded at write time; this also covers undeclared CRDT-shaped
+/// values that bypass that path.
+pub fn crdt_carveout_overwrite(tx_l0: &L0Buffer, main: &L0Buffer) -> Option<CrdtVariantConflict> {
+    for (vid, props) in &tx_l0.vertex_properties {
+        if tx_l0.vertex_tombstones.contains(vid) || !is_crdt_carveout(tx_l0, vid, props) {
+            continue;
+        }
+        let Some(existing_props) = main.vertex_properties.get(vid) else {
+            continue;
+        };
+        for (key, value) in props {
+            let (Some(new_crdt), Some(existing_crdt)) = (
+                try_as_crdt(value),
+                existing_props.get(key).and_then(try_as_crdt),
+            ) else {
+                continue;
+            };
+            if new_crdt.type_name() != existing_crdt.type_name() {
+                return Some(CrdtVariantConflict {
+                    vid: *vid,
+                    property: key.clone(),
+                });
+            }
+        }
+    }
+    None
 }
 
 /// Returns `true` when a committed write touched something the read-set saw.
@@ -277,6 +352,15 @@ mod tests {
         uni_common::Properties::from([("n".to_string(), uni_common::Value::Int(n))])
     }
 
+    /// A property map with a single GSet CRDT value under `counter` — a
+    /// *different* CRDT variant than [`crdt_props`]'s GCounter.
+    fn gset_props(item: &str) -> uni_common::Properties {
+        let mut gs = uni_crdt::GSet::new();
+        gs.add(item.to_string());
+        let v: uni_common::Value = serde_json::to_value(uni_crdt::Crdt::GSet(gs)).unwrap().into();
+        uni_common::Properties::from([("counter".to_string(), v)])
+    }
+
     #[test]
     fn crdt_only_write_without_labels_is_carved_out() {
         let mut buf = L0Buffer::new(0, None);
@@ -337,5 +421,80 @@ mod tests {
         buf.delete_vertex(vid(1)).unwrap();
         // Deletion is not commutative with a concurrent increment.
         assert!(WriteSet::from_l0(&buf).vertices.contains(&vid(1)));
+    }
+
+    // ── CRDT carve-out soundness (`crdt_carveout_overwrite`) ─────────────────
+
+    #[test]
+    fn crdt_carveout_overwrite_detects_variant_mismatch() {
+        // main holds a GCounter; a carved-out write puts a GSet under the same
+        // property. `merge_crdt_properties` would silently overwrite the GCounter
+        // (a lost update the carve-out hid), so this must be flagged.
+        let mut main = L0Buffer::new(0, None);
+        main.insert_vertex_with_labels(vid(1), crdt_props("a", 5), &[]);
+        let mut tx = L0Buffer::new(0, None);
+        tx.insert_vertex_with_labels(vid(1), gset_props("x"), &[]);
+        let conflict = crdt_carveout_overwrite(&tx, &main).expect("variant mismatch");
+        assert_eq!(conflict.vid, vid(1));
+        assert_eq!(conflict.property, "counter");
+    }
+
+    #[test]
+    fn crdt_carveout_overwrite_allows_same_variant() {
+        // Same CRDT variant merges commutatively — the carve-out is sound, no abort.
+        let mut main = L0Buffer::new(0, None);
+        main.insert_vertex_with_labels(vid(1), crdt_props("a", 5), &[]);
+        let mut tx = L0Buffer::new(0, None);
+        tx.insert_vertex_with_labels(vid(1), crdt_props("b", 7), &[]);
+        assert!(crdt_carveout_overwrite(&tx, &main).is_none());
+    }
+
+    #[test]
+    fn crdt_carveout_overwrite_allows_new_vertex() {
+        // No committed value to overwrite — the merge just inserts.
+        let main = L0Buffer::new(0, None);
+        let mut tx = L0Buffer::new(0, None);
+        tx.insert_vertex_with_labels(vid(1), gset_props("x"), &[]);
+        assert!(crdt_carveout_overwrite(&tx, &main).is_none());
+    }
+
+    #[test]
+    fn crdt_carveout_overwrite_ignores_conflictable_writes() {
+        // A labelled (non-carved-out) write is already in the write-set and
+        // handled by ordinary conflict detection, so it is not re-flagged here.
+        let mut main = L0Buffer::new(0, None);
+        main.insert_vertex_with_labels(vid(1), crdt_props("a", 5), &[]);
+        let mut tx = L0Buffer::new(0, None);
+        tx.insert_vertex_with_labels(vid(1), gset_props("x"), &["Counter".to_string()]);
+        assert!(crdt_carveout_overwrite(&tx, &main).is_none());
+    }
+
+    // ── Registry pruning under a long-lived reader ───────────────────────────
+
+    #[test]
+    fn long_lived_reader_within_retained_history_does_not_abort() {
+        // Capacity comfortably holds every commit since the reader's snapshot, so
+        // a long-lived reader (low read_seq) is not falsely aborted by truncation.
+        let mut reg = CommitRegistry::new(16);
+        for seq in 1..=5 {
+            reg.record(seq, ws(&[seq + 100])); // disjoint vids → no real conflict
+        }
+        assert!(reg.check(0, &ws(&[1]), None).is_none());
+    }
+
+    #[test]
+    fn truncated_history_aborts_read_set_txn_conservatively() {
+        // A read-write (SSI) transaction whose snapshot predates evicted commits
+        // also aborts conservatively, not just write-set-only transactions.
+        let mut reg = CommitRegistry::new(2);
+        reg.record(1, ws(&[1]));
+        reg.record(2, ws(&[2]));
+        reg.record(3, ws(&[3])); // evicts seq 1
+        let mut rs = OccReadSet::default();
+        rs.vertices.insert(Vid::from(7));
+        assert!(matches!(
+            reg.check(0, &ws(&[42]), Some(&rs)),
+            Some(Conflict::HistoryTruncated { .. })
+        ));
     }
 }

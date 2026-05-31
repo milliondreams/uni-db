@@ -2208,6 +2208,37 @@ impl GraphTraverseMainStream {
     }
 }
 
+#[cfg(feature = "ssi")]
+impl GraphExecutionContext {
+    /// Records a schemaless traversal's full edge-type scan into the SSI read-set.
+    ///
+    /// `build_edge_adjacency_map` scans every edge of the traversed type(s) via
+    /// `find_edges_by_type_names` up front, so the transaction's true read
+    /// footprint is that whole adjacency — not just the neighbourhoods later
+    /// expanded. Recording it here gives schemaless single-hop and
+    /// variable-length traversal (which bypass the per-vertex `get_neighbors`
+    /// path) the same item-level antidependency coverage the schema-typed
+    /// `record_neighbor_reads` path provides. No-op for read-only transactions
+    /// (`occ_read_set` is `Some` only for read-write transactions).
+    fn record_edge_adjacency(&self, adjacency: &EdgeAdjacencyMap) {
+        let Some(tx_l0) = &self.l0_context.transaction_l0 else {
+            return;
+        };
+        let guard = tx_l0.read();
+        let Some(read_set) = &guard.occ_read_set else {
+            return;
+        };
+        let mut rs = read_set.lock();
+        for (src, neighbors) in adjacency {
+            rs.vertices.insert(*src);
+            for (nbr, eid, _type, _props) in neighbors {
+                rs.vertices.insert(*nbr);
+                rs.edges.insert(*eid);
+            }
+        }
+    }
+}
+
 /// Build adjacency map from main edges table for given type names and direction.
 ///
 /// Supports OR relationship types like `[:KNOWS|HATES]` via multiple type_names.
@@ -2316,6 +2347,11 @@ async fn build_edge_adjacency_map(
             }
         }
     }
+
+    // SSI: a schemaless traversal physically scans the whole edge type above, so
+    // record that read footprint for read-write transactions (no-op otherwise).
+    #[cfg(feature = "ssi")]
+    graph_ctx.record_edge_adjacency(&adjacency);
 
     Ok(adjacency)
 }

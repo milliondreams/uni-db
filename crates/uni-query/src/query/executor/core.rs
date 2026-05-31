@@ -271,6 +271,12 @@ pub struct Executor {
     /// a fresh `SessionContext` and re-registering UDFs every query
     /// (~140 µs/query saved on the InMemory backend).
     pub(crate) df_session_template: Option<Arc<datafusion::execution::context::SessionContext>>,
+    /// Pinned L0 snapshot for snapshot-isolated reads (Component C1). When set,
+    /// `get_context` builds the read context from this frozen view instead of the
+    /// live L0, so a transaction's reads are isolated from concurrent commits.
+    /// `None` (the default, and always in a non-`l0-snapshot` build, where it is
+    /// never constructed) means live reads.
+    pub(crate) read_snapshot: Option<uni_store::runtime::SnapshotView>,
 }
 
 impl std::fmt::Debug for Executor {
@@ -309,6 +315,7 @@ impl Clone for Executor {
             cancellation_token: self.cancellation_token.clone(),
             prop_manager_arc: self.prop_manager_arc.clone(),
             df_session_template: self.df_session_template.clone(),
+            read_snapshot: self.read_snapshot.clone(),
         }
     }
 }
@@ -340,6 +347,7 @@ impl Executor {
             cancellation_token: None,
             prop_manager_arc: None,
             df_session_template: None,
+            read_snapshot: None,
         }
     }
 
@@ -427,6 +435,15 @@ impl Executor {
         self.transaction_l0_override = Some(l0);
     }
 
+    /// Attach a pinned L0 snapshot for snapshot-isolated reads (Component C1).
+    ///
+    /// When `Some`, [`Self::get_context`] reads from the frozen view instead of
+    /// the live L0. A `None` is a no-op (live reads), so threading it is always
+    /// safe — in a non-`l0-snapshot` build it is always `None`.
+    pub fn set_read_snapshot(&mut self, snapshot: Option<uni_store::runtime::SnapshotView>) {
+        self.read_snapshot = snapshot;
+    }
+
     /// Attach a per-transaction VID/EID reservoir. When set, CREATE/MERGE
     /// paths in `execute_create_pattern` pull IDs from the reservoir's
     /// pre-reserved cache, amortizing the global `IdAllocator` mutex.
@@ -455,11 +472,20 @@ impl Executor {
         if let Some(writer) = &self.writer {
             // Prefer the override (private tx L0) over the writer's slot
             let tx_l0 = self.transaction_l0_override.clone();
-            let mut ctx = QueryContext::new_with_pending(
-                writer.l0_manager.get_current(),
-                tx_l0,
-                writer.l0_manager.get_pending_flush(),
-            );
+            // Component C1: when a snapshot is pinned, read from the frozen
+            // generation (`main` + `extra`) so concurrent commits are invisible;
+            // `transaction_l0` stays live for read-your-writes. `None` (the
+            // default and the only state without `l0-snapshot`) ⇒ live reads.
+            let mut ctx = match &self.read_snapshot {
+                Some(snap) => {
+                    QueryContext::new_with_pending(snap.main.clone(), tx_l0, snap.extra.clone())
+                }
+                None => QueryContext::new_with_pending(
+                    writer.l0_manager.get_current(),
+                    tx_l0,
+                    writer.l0_manager.get_pending_flush(),
+                ),
+            };
             ctx.set_deadline(Instant::now() + self.config.query_timeout);
             if let Some(ref token) = self.cancellation_token {
                 ctx.set_cancellation_token(token.clone());

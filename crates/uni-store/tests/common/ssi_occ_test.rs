@@ -16,7 +16,9 @@ use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectStorePath;
 use tempfile::TempDir;
 use uni_common::UniError;
-use uni_common::core::schema::{Constraint, ConstraintTarget, ConstraintType, SchemaManager};
+use uni_common::core::schema::{
+    Constraint, ConstraintTarget, ConstraintType, CrdtType, DataType, SchemaManager,
+};
 use uni_store::runtime::QueryContext;
 use uni_store::runtime::l0_visibility::lookup_vertex_prop;
 use uni_store::runtime::writer::Writer;
@@ -417,5 +419,273 @@ async fn aborted_commit_leaves_no_trace() -> Result<()> {
         lookup_vertex_prop(vid, "n", Some(&ctx)),
         Some(uni_common::Value::Int(11)),
     );
+    Ok(())
+}
+
+/// An aborted commit leaves no *durable* trace either: after the loser aborts,
+/// a flush to L1 persists only the winner's value (validation runs before the
+/// WAL/flush commit point, so the loser never reaches durable storage).
+#[tokio::test]
+async fn aborted_commit_leaves_no_trace_after_flush() -> Result<()> {
+    let (writer, _dir) = make_writer().await?;
+    let vid = writer.next_vid().await?;
+    writer
+        .insert_vertex_with_labels(vid, counter_props(0), &[LABEL.to_string()], None)
+        .await?;
+
+    let tx_a = writer.create_transaction_l0();
+    let tx_b = writer.create_transaction_l0();
+    writer
+        .insert_vertex_with_labels(vid, counter_props(11), &[LABEL.to_string()], Some(&tx_a))
+        .await?;
+    writer
+        .insert_vertex_with_labels(vid, counter_props(22), &[LABEL.to_string()], Some(&tx_b))
+        .await?;
+
+    writer.commit_transaction_l0(tx_a).await?;
+    let _ = writer.commit_transaction_l0(tx_b).await.unwrap_err();
+
+    // Flushing must persist only A's committed write; B's aborted 22 is gone.
+    writer.flush_to_l1(None).await?;
+    let pm = writer
+        .property_manager
+        .as_ref()
+        .expect("writer has a property manager");
+    let n = pm.get_vertex_prop(vid, "n").await?;
+    assert_eq!(
+        n,
+        uni_common::Value::Int(11),
+        "only the winner's value is durable after flush",
+    );
+    Ok(())
+}
+
+// ── CRDT carve-out soundness (FIX A): variant mismatch must abort, not lose ──
+
+/// A property map with a single GSet under `counter`, no labels (carve-out
+/// eligible) — a *different* CRDT variant than [`gcounter_props`].
+fn gset_props(item: &str) -> HashMap<String, uni_common::Value> {
+    let mut gs = uni_crdt::GSet::new();
+    gs.add(item.to_string());
+    let v: uni_common::Value = serde_json::to_value(uni_crdt::Crdt::GSet(gs))
+        .unwrap()
+        .into();
+    HashMap::from([("counter".to_string(), v)])
+}
+
+/// Builds a writer whose `Counter` label declares `counter` as a GCounter CRDT,
+/// so write-time variant enforcement (`prepare_vertex_upsert`) applies.
+async fn make_writer_crdt() -> Result<(Arc<Writer>, TempDir)> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().to_str().unwrap();
+    let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path())?);
+    let schema_path = ObjectStorePath::from("schema.json");
+    let schema_manager = Arc::new(SchemaManager::load_from_store(store, &schema_path).await?);
+    schema_manager.add_label(LABEL)?;
+    schema_manager.add_property(LABEL, "counter", DataType::Crdt(CrdtType::GCounter), true)?;
+    schema_manager.save().await?;
+    let storage = Arc::new(StorageManager::new(path, schema_manager.clone()).await?);
+    let writer = Arc::new(Writer::new(storage, schema_manager, 1).await?);
+    Ok((writer, dir))
+}
+
+/// FIX A (commit-time, layer 2): two concurrent carved-out CRDT writes of
+/// *different* variants to the same property. Without the fix, the second
+/// committer's GSet would silently overwrite the first's committed GCounter (a
+/// lost update the carve-out hid). The commit-time soundness check aborts it.
+#[tokio::test]
+async fn concurrent_crdt_variant_mismatch_aborts() -> Result<()> {
+    let (writer, _dir) = make_writer().await?;
+    let vid = writer.next_vid().await?;
+
+    // No labels → carve-out eligible → bypasses write-time enforcement, so this
+    // exercises the commit-time main-L0 check specifically.
+    let tx_a = writer.create_transaction_l0();
+    let tx_b = writer.create_transaction_l0();
+    writer
+        .insert_vertex_with_labels(vid, gcounter_props("a", 5), &[], Some(&tx_a))
+        .await?;
+    writer
+        .insert_vertex_with_labels(vid, gset_props("x"), &[], Some(&tx_b))
+        .await?;
+
+    // tx_a commits a GCounter into main L0.
+    writer.commit_transaction_l0(tx_a).await?;
+    // tx_b's GSet would overwrite that GCounter at merge → must abort.
+    let err = writer.commit_transaction_l0(tx_b).await.unwrap_err();
+    match err.downcast::<UniError>() {
+        Ok(UniError::SerializationConflict { .. }) => Ok(()),
+        Ok(other) => panic!("expected SerializationConflict, got {other:?}"),
+        Err(other) => panic!("expected typed UniError, got {other:?}"),
+    }
+}
+
+/// FIX A (write-time, layer 1): writing a CRDT property with the wrong declared
+/// variant (a GSet where the schema declares a GCounter) is rejected at the
+/// source, before commit — keeping concurrent CRDT writes commutative.
+#[tokio::test]
+async fn write_time_rejects_wrong_crdt_variant() -> Result<()> {
+    let (writer, _dir) = make_writer_crdt().await?;
+    let vid = writer.next_vid().await?;
+    // Labelled write → the schema resolves → variant enforcement fires.
+    let err = writer
+        .insert_vertex_with_labels(vid, gset_props("x"), &[LABEL.to_string()], None)
+        .await
+        .unwrap_err();
+    match err.downcast::<UniError>() {
+        Ok(UniError::Constraint { .. }) => Ok(()),
+        Ok(other) => panic!("expected Constraint, got {other:?}"),
+        Err(other) => panic!("expected typed UniError, got {other:?}"),
+    }
+}
+
+/// Regression guard: a CRDT written in the *string* form (the Cypher
+/// `'{"t":"gc",...}'` representation) is accepted — write-time enforcement only
+/// polices the parsed `Map` form (the carve-out's domain), never the string form
+/// (which is not carved out and stays conflictable).
+#[tokio::test]
+async fn write_time_accepts_string_form_crdt() -> Result<()> {
+    let (writer, _dir) = make_writer_crdt().await?;
+    let vid = writer.next_vid().await?;
+    let string_form = HashMap::from([(
+        "counter".to_string(),
+        uni_common::Value::String(r#"{"t":"gc","d":{"counts":{"a":5}}}"#.to_string()),
+    )]);
+    writer
+        .insert_vertex_with_labels(vid, string_form, &[LABEL.to_string()], None)
+        .await?;
+    Ok(())
+}
+
+/// Control: the correct declared variant is accepted at write time.
+#[tokio::test]
+async fn write_time_accepts_declared_crdt_variant() -> Result<()> {
+    let (writer, _dir) = make_writer_crdt().await?;
+    let vid = writer.next_vid().await?;
+    writer
+        .insert_vertex_with_labels(vid, gcounter_props("a", 5), &[LABEL.to_string()], None)
+        .await?;
+    Ok(())
+}
+
+/// R1 outcome pinned: a concurrent non-CRDT (LWW) write committing *after* the
+/// CRDT writer wins last-writer-wins — the final value is the scalar and the
+/// merged CRDT state is discarded (with a logged warning). Documents that the
+/// item-level carve-out cannot make CRDT-vs-LWW conflict (the accepted R1).
+#[tokio::test]
+async fn r1_crdt_overwritten_by_lww_pins_value() -> Result<()> {
+    let (writer, _dir) = make_writer().await?;
+    let vid = writer.next_vid().await?;
+    writer
+        .insert_vertex_with_labels(vid, gcounter_props("seed", 0), &[], None)
+        .await?;
+
+    let tx_a = writer.create_transaction_l0(); // CRDT increment (carved out)
+    let tx_b = writer.create_transaction_l0(); // LWW scalar overwrite
+    writer
+        .insert_vertex_with_labels(vid, gcounter_props("a", 5), &[], Some(&tx_a))
+        .await?;
+    let lww = HashMap::from([("counter".to_string(), uni_common::Value::Int(99))]);
+    writer
+        .insert_vertex_with_labels(vid, lww, &[], Some(&tx_b))
+        .await?;
+
+    writer.commit_transaction_l0(tx_a).await?;
+    writer.commit_transaction_l0(tx_b).await?; // R1: overwrites, no abort
+
+    let ctx = QueryContext::new(writer.l0_manager.get_current());
+    assert_eq!(
+        lookup_vertex_prop(vid, "counter", Some(&ctx)),
+        Some(uni_common::Value::Int(99)),
+        "last-writer-wins: the scalar overwrites the CRDT",
+    );
+    Ok(())
+}
+
+// ── C1 snapshot freeze (self-pin fix): freeze fires iff the gen is pinned ────────
+//
+// A freeze installs a NEW current buffer (clone-on-freeze), so the generation's
+// `Arc` pointer changes; an in-place merge keeps the same buffer. These pin the
+// freeze decision so the self-pin defect (a tx's own pin freezing its own commit)
+// cannot regress.
+
+/// No snapshot pinned ⇒ the commit merges in place; the generation is unchanged.
+#[cfg(feature = "l0-snapshot")]
+#[tokio::test]
+async fn commit_without_pin_does_not_freeze() -> Result<()> {
+    let (writer, _dir) = make_writer().await?;
+    let vid = writer.next_vid().await?;
+    writer
+        .insert_vertex_with_labels(vid, counter_props(0), &[LABEL.to_string()], None)
+        .await?;
+
+    let before = Arc::as_ptr(&writer.l0_manager.get_current());
+    let tx = writer.create_transaction_l0();
+    writer
+        .insert_vertex_with_labels(vid, counter_props(1), &[LABEL.to_string()], Some(&tx))
+        .await?;
+    writer.commit_transaction_l0(tx).await?;
+    let after = Arc::as_ptr(&writer.l0_manager.get_current());
+
+    assert_eq!(before, after, "no pin ⇒ no freeze (in-place merge)");
+    Ok(())
+}
+
+/// A commit while another snapshot pins the generation freezes it aside (new
+/// buffer), and the held snapshot still reads the pre-commit value.
+#[cfg(feature = "l0-snapshot")]
+#[tokio::test]
+async fn commit_with_held_pin_freezes_and_isolates() -> Result<()> {
+    let (writer, _dir) = make_writer().await?;
+    let vid = writer.next_vid().await?;
+    writer
+        .insert_vertex_with_labels(vid, counter_props(0), &[LABEL.to_string()], None)
+        .await?;
+
+    // A concurrent reader holds a snapshot of the current generation.
+    let snap = writer.l0_manager.pin_snapshot();
+    let before = Arc::as_ptr(&writer.l0_manager.get_current());
+
+    let tx = writer.create_transaction_l0();
+    writer
+        .insert_vertex_with_labels(vid, counter_props(1), &[LABEL.to_string()], Some(&tx))
+        .await?;
+    writer.commit_transaction_l0(tx).await?;
+    let after = Arc::as_ptr(&writer.l0_manager.get_current());
+
+    assert_ne!(before, after, "held pin ⇒ freeze (new generation)");
+    // The held snapshot is isolated: it still reads the pre-commit value.
+    let ctx = QueryContext::new(snap.main.clone());
+    assert_eq!(
+        lookup_vertex_prop(vid, "n", Some(&ctx)),
+        Some(uni_common::Value::Int(0)),
+    );
+    Ok(())
+}
+
+/// Mirrors the self-pin fix: releasing the pin BEFORE the commit avoids the freeze.
+#[cfg(feature = "l0-snapshot")]
+#[tokio::test]
+async fn commit_after_releasing_pin_does_not_freeze() -> Result<()> {
+    let (writer, _dir) = make_writer().await?;
+    let vid = writer.next_vid().await?;
+    writer
+        .insert_vertex_with_labels(vid, counter_props(0), &[LABEL.to_string()], None)
+        .await?;
+
+    let snap = writer.l0_manager.pin_snapshot();
+    assert!(writer.l0_manager.is_current_pinned());
+    drop(snap); // release the pin before committing — what the fix does in commit()
+    assert!(!writer.l0_manager.is_current_pinned());
+
+    let before = Arc::as_ptr(&writer.l0_manager.get_current());
+    let tx = writer.create_transaction_l0();
+    writer
+        .insert_vertex_with_labels(vid, counter_props(1), &[LABEL.to_string()], Some(&tx))
+        .await?;
+    writer.commit_transaction_l0(tx).await?;
+    let after = Arc::as_ptr(&writer.l0_manager.get_current());
+
+    assert_eq!(before, after, "pin released before commit ⇒ no freeze");
     Ok(())
 }

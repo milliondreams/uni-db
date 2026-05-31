@@ -88,6 +88,33 @@ pub enum CrdtType {
     VCRegister,
 }
 
+impl CrdtType {
+    /// Returns the canonical variant name for this CRDT type.
+    ///
+    /// The returned strings must stay in sync with `uni_crdt::Crdt::type_name`,
+    /// so a written CRDT value can be validated against its schema-declared
+    /// variant (see uni-store's write-time CRDT enforcement).
+    ///
+    /// # Examples
+    /// ```
+    /// use uni_common::core::schema::CrdtType;
+    /// assert_eq!(CrdtType::GCounter.type_name(), "GCounter");
+    /// ```
+    #[must_use]
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            CrdtType::GCounter => "GCounter",
+            CrdtType::GSet => "GSet",
+            CrdtType::ORSet => "ORSet",
+            CrdtType::LWWRegister => "LWWRegister",
+            CrdtType::LWWMap => "LWWMap",
+            CrdtType::Rga => "Rga",
+            CrdtType::VectorClock => "VectorClock",
+            CrdtType::VCRegister => "VCRegister",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 pub enum PointType {
     Geographic,  // WGS84

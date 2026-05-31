@@ -18,6 +18,10 @@ pub mod writer;
 
 pub use l0::L0Buffer;
 pub use l0_manager::L0Manager;
+// Always re-exported (inert without `l0-snapshot`) so it can thread through the
+// executor as `Option<SnapshotView>` in every build; only ever constructed under
+// the feature. See `L0Manager::pin_snapshot`.
+pub use l0_manager::SnapshotView;
 pub use property_manager::PropertyManager;
 pub use vid_remapper::{EidRemapper, VidRemapper};
 // Re-export SimpleGraph from uni-common

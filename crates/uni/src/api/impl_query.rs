@@ -385,6 +385,7 @@ impl crate::api::UniInner {
         params: HashMap<String, ApiValue>,
         tx_l0: std::sync::Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>,
         id_reservoir: Option<Arc<uni_store::runtime::TxIdReservoir>>,
+        read_snapshot: Option<uni_store::runtime::SnapshotView>,
     ) -> Result<QueryResult> {
         let total_start = Instant::now();
 
@@ -426,6 +427,7 @@ impl crate::api::UniInner {
             executor.set_custom_functions(Arc::new(reg.clone()));
         }
         executor.set_transaction_l0(tx_l0);
+        executor.set_read_snapshot(read_snapshot);
         if let Some(r) = id_reservoir {
             executor.set_id_reservoir(r);
         }
@@ -496,6 +498,7 @@ impl crate::api::UniInner {
         params: HashMap<String, ApiValue>,
         tx_l0: std::sync::Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>,
         id_reservoir: Option<Arc<uni_store::runtime::TxIdReservoir>>,
+        read_snapshot: Option<uni_store::runtime::SnapshotView>,
     ) -> Result<(QueryResult, ProfileOutput)> {
         let ast = uni_cypher::parse(cypher).map_err(into_parse_error)?;
 
@@ -530,6 +533,7 @@ impl crate::api::UniInner {
             executor.set_writer(w.clone());
         }
         executor.set_transaction_l0(tx_l0);
+        executor.set_read_snapshot(read_snapshot);
         if let Some(r) = id_reservoir {
             executor.set_id_reservoir(r);
         }

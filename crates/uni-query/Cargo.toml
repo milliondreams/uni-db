@@ -59,10 +59,15 @@ tokio-util = { workspace = true }
 
 [features]
 default = []
+# L0 snapshot-isolation reads (Component C1). Gates the executor's pinned-read
+# path (`Executor::read_snapshot` + the `get_context` hook); forwards to
+# `uni-store/l0-snapshot`. Default-off.
+l0-snapshot = ["uni-store/l0-snapshot"]
 # Optimistic concurrency control. Gates SSI read-set capture on the traversal
 # path (`GraphExecutionContext::record_neighbor_reads`); forwards to
-# `uni-store/ssi`. Default-off; see docs/proposals/serializable_snapshot_isolation.md.
-ssi = ["uni-store/ssi"]
+# `uni-store/ssi` and enables `l0-snapshot`. Default-off; see
+# docs/proposals/serializable_snapshot_isolation.md.
+ssi = ["uni-store/ssi", "l0-snapshot"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

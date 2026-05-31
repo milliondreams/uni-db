@@ -282,7 +282,10 @@ impl UniError {
     ///
     /// `TransactionExpired` is deliberately *not* retriable here: a fresh
     /// transaction gets a new deadline, but the helper treats deadline expiry as
-    /// a caller-set budget, not a contention signal.
+    /// a caller-set budget, not a contention signal. A plain `Timeout` is
+    /// likewise *not* retriable — re-running the same slow operation would just
+    /// time out again; only `CommitTimeout` (lock contention at the commit point)
+    /// signals retriable contention.
     ///
     /// # Examples
     /// ```
@@ -299,7 +302,6 @@ impl UniError {
                 | UniError::ConstraintConflict { .. }
                 | UniError::TransactionConflict { .. }
                 | UniError::CommitTimeout { .. }
-                | UniError::Timeout { .. }
         )
     }
 }
@@ -435,7 +437,6 @@ mod tests {
                 tx_id: s(),
                 hint: "",
             },
-            UniError::Timeout { timeout_ms: 1 },
         ];
         for e in &retriable {
             assert!(e.is_retriable(), "{e:?} should be retriable");
@@ -468,6 +469,8 @@ mod tests {
                 tx_id: s(),
                 hint: "",
             },
+            // Re-running the same slow operation would just time out again.
+            UniError::Timeout { timeout_ms: 1 },
         ];
         for e in &terminal {
             assert!(!e.is_retriable(), "{e:?} should not be retriable");

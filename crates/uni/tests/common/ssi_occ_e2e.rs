@@ -381,6 +381,157 @@ async fn edge_read_antidependency_aborts() -> Result<()> {
     }
 }
 
+/// A *schemaless* traversal aborts on a concurrent neighbour write. An undeclared
+/// edge type routes the traversal through `TraverseMainByType` →
+/// `build_edge_adjacency_map`, which scans the whole edge type — exercising the
+/// schemaless read-set hook (`record_edge_adjacency`), distinct from the
+/// schema-typed `record_neighbor_reads` path covered above.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn schemaless_traversal_antidependency_aborts() -> Result<()> {
+    let db = {
+        let db = Uni::in_memory().build().await?;
+        // Declare the vertex label but NOT edge type `R`: an unknown edge type
+        // routes the traversal through the schemaless main path.
+        db.schema()
+            .label("N")
+            .property("id", DataType::String)
+            .property("v", DataType::Int)
+            .done()
+            .apply()
+            .await?;
+        let session = db.session();
+        let tx = session.tx().await?;
+        tx.execute("CREATE (a:N {id: 'a', v: 0})-[:R]->(b:N {id: 'b', v: 0})")
+            .await?;
+        tx.commit().await?;
+        db
+    };
+
+    let s_a = db.session();
+    let tx_a = s_a.tx().await?;
+    // Schemaless traversal a -> b; b enters the read-set via the schemaless
+    // adjacency hook. `RETURN a.id` does not hydrate b.
+    tx_a.query("MATCH (a:N {id: 'a'})-[:R]->(nbr) RETURN a.id")
+        .await?;
+
+    // Concurrently modify the neighbour b and commit.
+    {
+        let s_b = db.session();
+        let tx_b = s_b.tx().await?;
+        tx_b.execute("MATCH (b:N {id: 'b'}) SET b.v = 1").await?;
+        tx_b.commit().await?;
+    }
+
+    tx_a.execute("CREATE (:N {id: 'c', v: 0})").await?;
+    match tx_a.commit().await {
+        Err(UniError::SerializationConflict { .. }) => Ok(()),
+        other => panic!("expected SerializationConflict, got {other:?}"),
+    }
+}
+
+/// A read-only transaction is never a serialization pivot: a concurrent writer to
+/// a row the reader observed still commits, and the read-only transaction itself
+/// commits cleanly afterwards (empty write-set → snapshot isolation, §7).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn read_only_transaction_is_not_a_pivot() -> Result<()> {
+    let db = counter_db().await?;
+
+    let s_r = db.session();
+    let tx_r = s_r.tx().await?;
+    // Read x inside a transaction (records a read-set), but never write.
+    tx_r.query("MATCH (c:Counter {id: 'x'}) RETURN c.n").await?;
+
+    // A writer modifies the same row x and commits — must succeed; a concurrent
+    // reader is never a write-conflict pivot.
+    {
+        let s_w = db.session();
+        let tx_w = s_w.tx().await?;
+        tx_w.execute("MATCH (c:Counter {id: 'x'}) SET c.n = 5").await?;
+        tx_w.commit().await?;
+    }
+
+    // The read-only transaction commits cleanly even though x changed under it.
+    tx_r.commit().await?;
+    assert_eq!(counter_value(&db).await?, 5);
+    Ok(())
+}
+
+/// VidLookupJoin → HashJoin fallback regression: under an active SSI read-set, a
+/// cross-MATCH equi-join (`id(b) = a.linked_vid`, the `VidLookupJoinExec` path)
+/// must fall back to a HashJoin so the probed target's read is recorded. A
+/// concurrent write to that target then aborts the reader. If the fast path were
+/// taken, it would probe `b` by vid and bypass `ReadSetRecordingExec`, so `b`
+/// would never enter the read-set and tx_a would NOT abort.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn vid_lookup_join_records_reads_via_fallback() -> Result<()> {
+    let db = {
+        let db = Uni::in_memory().build().await?;
+        db.schema()
+            .label("Source")
+            .property("name", DataType::String)
+            .property_nullable("linked_vid", DataType::Int64)
+            .property_nullable("score", DataType::Float64)
+            .done()
+            .label("Target")
+            .property("name", DataType::String)
+            .done()
+            .apply()
+            .await?;
+        db
+    };
+
+    // Create target `b`, then a source linked to it by vid.
+    let b_vid: i64 = {
+        let s = db.session();
+        let tx = s.tx().await?;
+        let r = tx
+            .query("CREATE (n:Target {name: 'b'}) RETURN id(n) AS vid")
+            .await?;
+        let vid = match r.rows()[0].value("vid") {
+            Some(Value::Int(v)) => *v,
+            other => panic!("expected Int vid, got {other:?}"),
+        };
+        tx.commit().await?;
+        vid
+    };
+    {
+        let s = db.session();
+        let tx = s.tx().await?;
+        tx.execute(&format!(
+            "CREATE (:Source {{name: 'a', linked_vid: {b_vid}, score: 0.9}})"
+        ))
+        .await?;
+        tx.commit().await?;
+    }
+
+    // RW tx_a reads `b` through the VidLookupJoin-eligible cross-MATCH.
+    let s_a = db.session();
+    let tx_a = s_a.tx().await?;
+    tx_a.query(
+        "MATCH (a:Source) WHERE a.score > 0.5 \
+         MATCH (b:Target) WHERE id(b) = a.linked_vid \
+         RETURN b.name",
+    )
+    .await?;
+
+    // Concurrently modify the probed target `b` and commit.
+    {
+        let s_b = db.session();
+        let tx_b = s_b.tx().await?;
+        tx_b.execute("MATCH (b:Target {name: 'b'}) SET b.name = 'changed'")
+            .await?;
+        tx_b.commit().await?;
+    }
+
+    // tx_a writes a disjoint vertex and commits — must abort, because it read `b`
+    // (via the join) which was concurrently written.
+    tx_a.execute("CREATE (:Target {name: 'c'})").await?;
+    match tx_a.commit().await {
+        Err(UniError::SerializationConflict { .. }) => Ok(()),
+        other => panic!("expected SerializationConflict, got {other:?}"),
+    }
+}
+
 // ── Retry-helper semantics ──────────────────────────────────────────────────
 
 /// When conflicts persist past `max_attempts`, the underlying conflict error is

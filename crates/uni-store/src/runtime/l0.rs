@@ -315,7 +315,19 @@ impl L0Buffer {
                     entry.insert(k, uni_common::Value::from(merged_json));
                     continue;
                 }
-                // try_merge failed (type mismatch) — fall through to overwrite.
+                // CRDT variant mismatch (or a failed re-serialize): fall through to
+                // a last-writer-wins overwrite, discarding the existing CRDT's
+                // merged state. The OCC commit-time carve-out check
+                // (`occ::crdt_carveout_overwrite`) aborts a *concurrent* writer
+                // before reaching here, and write-time schema enforcement rejects a
+                // wrong declared variant; this warns on any residual (e.g. a
+                // single-writer variant change) so the discarded state is visible.
+                tracing::warn!(
+                    property = %k,
+                    existing_variant = existing_crdt.type_name(),
+                    "overwriting CRDT property with a different CRDT variant \
+                     (last-writer-wins); merged CRDT state is discarded"
+                );
             } else if try_as_crdt(&v).is_none()
                 && entry.get(&k).is_some_and(|e| try_as_crdt(e).is_some())
             {

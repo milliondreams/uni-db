@@ -48,13 +48,12 @@ impl WriteSet {
         }
         // A delete is never commutative with a concurrent CRDT increment.
         vertices.extend(l0.vertex_tombstones.iter().copied());
-        // NOTE (G7): a label-only mutation (`SET n:Label` / `REMOVE n:Label`)
-        // does NOT reach this transaction's private L0 today — the executor
-        // routes it to the context (main) L0 via `ctx.l0`, bypassing both the
-        // tx-L0 and OCC (see ssi_write_set_matrix's ignored label tests). Adding
-        // `vertex_labels` here would therefore not help until label mutations are
-        // rerouted through `tx_l0` AND `L0Buffer::merge` is taught to union label
-        // deltas for existing vids. Left out deliberately to avoid dead code.
+        // A label-only mutation (`SET n:Label` / `REMOVE n:Label`) is a
+        // structural write — not CRDT-commutative — so the vertex is
+        // conflictable. `vertex_label_overwrites` flags exactly the vids whose
+        // labels were explicitly replaced, so this is precise: a pure-CRDT
+        // increment (no label op) is never flagged and stays carved out.
+        vertices.extend(l0.vertex_label_overwrites.iter().copied());
 
         let mut edges: HashSet<Eid> = l0.edge_properties.keys().copied().collect();
         edges.extend(l0.edge_endpoints.keys().copied());

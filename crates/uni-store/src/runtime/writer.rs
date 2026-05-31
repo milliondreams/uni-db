@@ -668,6 +668,20 @@ impl Writer {
                     wal.append(&crate::runtime::wal::Mutation::DeleteVertex { vid: *vid, labels })?;
                 }
 
+                // Label-only mutations (SET n:Label / REMOVE n:Label). After
+                // vertex inserts (so the vertex exists on replay), before edges,
+                // and skipping vertices deleted in this same commit.
+                for vid in &tx_l0.vertex_label_overwrites {
+                    if tx_l0.vertex_tombstones.contains(vid) {
+                        continue;
+                    }
+                    let labels = tx_l0.vertex_labels.get(vid).cloned().unwrap_or_default();
+                    wal.append(&crate::runtime::wal::Mutation::SetVertexLabels {
+                        vid: *vid,
+                        labels,
+                    })?;
+                }
+
                 // Crash-recovery seam: vertices appended, edges not yet. Tests
                 // assert that a crash here (before `flush_wal`) recovers NOTHING
                 // — the durable commit point is the flush below, not append.

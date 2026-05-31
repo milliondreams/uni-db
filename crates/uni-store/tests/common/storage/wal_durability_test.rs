@@ -549,6 +549,59 @@ async fn test_wal_delete_vertex_labels_round_trip() -> Result<()> {
     Ok(())
 }
 
+/// `SetVertexLabels` (G7) round-trips through the WAL and REPLACES, not appends,
+/// on replay — so a replayed label *removal* actually removes and the reverse
+/// index is rebuilt correctly.
+#[tokio::test]
+async fn test_wal_set_vertex_labels_round_trip_replace() -> Result<()> {
+    use uni_store::runtime::L0Buffer;
+
+    let store = create_memory_store();
+    let wal = WriteAheadLog::new(store.clone(), Path::from("wal"));
+    let vid = Vid::new(100);
+
+    // A vertex created with two labels, then a label-only change that drops one:
+    // the WAL carries the FULL resolved set [Person].
+    wal.append(&Mutation::InsertVertex {
+        vid,
+        properties: HashMap::new(),
+        labels: vec!["Person".to_string(), "Admin".to_string()],
+    })?;
+    wal.append(&Mutation::SetVertexLabels {
+        vid,
+        labels: vec!["Person".to_string()],
+    })?;
+    wal.flush().await?;
+
+    let replayed = wal.replay().await?;
+    let mut l0 = L0Buffer::new(0, None);
+    l0.replay_mutations(replayed)?;
+
+    // REPLACE semantics: only Person remains (Admin removed) and the reverse
+    // index reflects it.
+    assert_eq!(
+        l0.vertex_labels.get(&vid).unwrap(),
+        &vec!["Person".to_string()],
+        "replay must REPLACE, not append"
+    );
+    assert!(l0.label_to_vids.get("Person").unwrap().contains(&vid));
+    assert!(
+        l0.label_to_vids
+            .get("Admin")
+            .is_none_or(|s| !s.contains(&vid)),
+        "Admin must be unindexed after replace"
+    );
+
+    // The new variant round-trips through JSON unchanged.
+    let json = serde_json::to_string(&Mutation::SetVertexLabels {
+        vid,
+        labels: vec!["X".to_string()],
+    })?;
+    let back: Mutation = serde_json::from_str(&json)?;
+    assert!(matches!(back, Mutation::SetVertexLabels { .. }));
+    Ok(())
+}
+
 // ============================================================================
 // Edge Type Name WAL Tests (Issue #28, #102)
 // ============================================================================

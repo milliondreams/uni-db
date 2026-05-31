@@ -57,6 +57,15 @@ pub enum Mutation {
         #[serde(default)]
         labels: Vec<String>,
     },
+    /// Replaces a vertex's full label set (a `SET n:Label` / `REMOVE n:Label`
+    /// that touched no properties). Carries the complete resolved label set so
+    /// replay can REPLACE (removals included). Added after the original four
+    /// variants — externally-tagged serde_json, so old WAL segments (which never
+    /// contain it) deserialize unchanged.
+    SetVertexLabels {
+        vid: Vid,
+        labels: Vec<String>,
+    },
 }
 
 /// WAL segment with LSN for idempotent recovery

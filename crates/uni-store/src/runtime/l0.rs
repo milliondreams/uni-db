@@ -140,6 +140,14 @@ pub struct L0Buffer {
     /// Reverse index: label name → set of VIDs with that label. Maintained
     /// alongside `vertex_labels` for O(1) label-based vertex lookups.
     pub label_to_vids: HashMap<String, HashSet<Vid>>,
+    /// Vids whose FULL label set was explicitly replaced by a label mutation
+    /// (`SET n:Label` / `REMOVE n:Label`) in this buffer, via
+    /// [`L0Buffer::set_vertex_labels`]. Distinguishes a deliberate label
+    /// replacement from the empty `vertex_labels` entry a property-only write
+    /// incidentally creates (`entry().or_default()`), so `merge` knows to REPLACE
+    /// (not append) these vids' labels and `WriteSet::from_l0` knows they are
+    /// conflictable writes. A transaction-buffer concept; empty on main L0.
+    pub vertex_label_overwrites: HashSet<Vid>,
     /// Edge types (EID -> type name)
     pub edge_types: HashMap<Eid, String>,
     /// Current version counter
@@ -232,6 +240,7 @@ impl Clone for L0Buffer {
             edge_endpoints: self.edge_endpoints.clone(),
             vertex_labels: self.vertex_labels.clone(),
             label_to_vids: self.label_to_vids.clone(),
+            vertex_label_overwrites: self.vertex_label_overwrites.clone(),
             edge_types: self.edge_types.clone(),
             current_version: self.current_version,
             mutation_count: self.mutation_count,
@@ -283,6 +292,25 @@ impl L0Buffer {
                 }
             }
         }
+    }
+
+    /// Replaces a vertex's FULL label set — the semantics of `SET n:Label` /
+    /// `REMOVE n:Label`, which resolve the new complete set before writing.
+    ///
+    /// Unlike [`add_vertex_labels`](Self::add_vertex_labels) (append), this clears
+    /// the vid's existing labels from the reverse index, sets the new set, and
+    /// re-indexes — so a removal actually removes. It marks the vid in
+    /// `vertex_label_overwrites` so `merge` REPLACES (not appends) these labels at
+    /// commit and `WriteSet::from_l0` treats the change as a conflictable write.
+    /// Increments `mutation_count` (a label change is a real mutation; its sibling
+    /// `remove_vertex_label` already does so).
+    pub fn set_vertex_labels(&mut self, vid: Vid, labels: &[String]) {
+        self.remove_vid_from_label_index(vid);
+        self.vertex_labels.insert(vid, labels.to_vec());
+        self.index_labels_for_vid(vid, labels);
+        self.vertex_label_overwrites.insert(vid);
+        self.current_version += 1;
+        self.mutation_count += 1;
     }
 
     /// Merge CRDT properties into an existing property map.
@@ -413,6 +441,7 @@ impl L0Buffer {
             edge_endpoints: HashMap::new(),
             vertex_labels: HashMap::new(),
             label_to_vids: HashMap::new(),
+            vertex_label_overwrites: HashSet::new(),
             edge_types: HashMap::new(),
             current_version: start_version,
             mutation_count: 0,
@@ -1125,6 +1154,22 @@ impl L0Buffer {
             }
         }
 
+        // Label-overwrite pass: a `SET n:Label` / `REMOVE n:Label` resolved the
+        // FULL new label set into `other.vertex_labels[vid]` and flagged the vid.
+        // REPLACE (not append) so removals actually remove and an existing
+        // vertex's label change lands — overriding any append from the property
+        // loop above. Skip vids deleted in the same commit. (The append loops
+        // stay correct for property-path label unions, which are NOT flagged.)
+        for vid in &other.vertex_label_overwrites {
+            if other.vertex_tombstones.contains(vid) {
+                continue;
+            }
+            let labels = other.vertex_labels.get(vid).cloned().unwrap_or_default();
+            self.remove_vid_from_label_index(*vid);
+            self.vertex_labels.insert(*vid, labels.clone());
+            self.index_labels_for_vid(*vid, &labels);
+        }
+
         // Merge Edges - insert all edges from edge_endpoints, using empty props if none exist
         for (eid, (src, dst, etype)) in &other.edge_endpoints {
             if other.tombstones.contains_key(eid) {
@@ -1228,6 +1273,17 @@ impl L0Buffer {
                         }
                     }
                     self.apply_vertex_deletion(vid);
+                }
+                Mutation::SetVertexLabels { vid, labels } => {
+                    // REPLACE the vid's full label set (a label-only mutation
+                    // resolved the complete set). Replace, not append, so a
+                    // replayed removal removes; clears the old reverse-index
+                    // entries first.
+                    self.current_version += 1;
+                    self.remove_vid_from_label_index(vid);
+                    self.vertex_labels.insert(vid, labels.clone());
+                    self.index_labels_for_vid(vid, &labels);
+                    self.mutation_count += 1;
                 }
                 Mutation::InsertEdge {
                     src_vid,

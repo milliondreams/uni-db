@@ -12,8 +12,9 @@
 //! MERGE), so none can slip a lost update past OCC.
 
 use anyhow::Result;
-use uni_db::{DataType, Uni};
+use uni_db::{DataType, Uni, Value};
 
+use crate::ssi_support::reopen::DiskHarness;
 use crate::ssi_support::schedule::{
     assert_committed, assert_conflict, assert_serialization_conflict,
 };
@@ -66,27 +67,11 @@ async fn set_vs_set() -> Result<()> {
     .await
 }
 
-/// G7 (KNOWN GAP — discovered by this matrix): a label-only mutation must enter
-/// the write-set and conflict with a concurrent write to the same vertex.
-///
-/// It does NOT today. `SET n:Label` / `REMOVE n:Label` are executed by writing to
-/// the *context* (main) L0 via `ctx.l0` in `execute_set_items_locked` /
-/// `execute_remove_items_locked` — NOT the transaction's private `tx_l0` (which
-/// is how property writes route, via `writer.insert_vertex_with_labels(tx_l0)`).
-/// Consequences:
-///   1. the label change is invisible to OCC (`WriteSet::from_l0` reads tx_l0),
-///      so a concurrent property write to the same vertex does NOT conflict — a
-///      silent lost update on the label;
-///   2. it is arguably non-transactional (it lands in main L0 immediately);
-///   3. `add_vertex_labels` also omits the `mutation_count += 1` its sibling
-///      `remove_vertex_label` performs, so the commit reports 0 mutations.
-///
-/// The fix is multi-part and carries label-merge regression risk (it must also
-/// teach `L0Buffer::merge` to union label deltas for already-present vids, which
-/// today it skips), so it is tracked as a follow-up rather than rushed here.
-/// This test is the executable spec for that fix; un-`ignore` it once G7 lands.
+/// G7 (FIXED): a label-only mutation enters the write-set and conflicts with a
+/// concurrent write to the same vertex. `SET n:Label` now routes to the
+/// transaction's `tx_l0` via `L0Buffer::set_vertex_labels`, flagging the vid in
+/// `vertex_label_overwrites` so `WriteSet::from_l0` sees the write.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "G7: label-only mutations bypass tx_l0/OCC (write to ctx.l0); see doc above"]
 async fn set_vs_label_add() -> Result<()> {
     assert_mutations_conflict(
         "MATCH (n:T {id: 'x'}) SET n.val = 1",
@@ -95,9 +80,8 @@ async fn set_vs_label_add() -> Result<()> {
     .await
 }
 
-/// G7 companion for `REMOVE n:Label` (same root cause — see `set_vs_label_add`).
+/// G7 (FIXED) companion for `REMOVE n:Label` (same path — see `set_vs_label_add`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "G7: label-only mutations bypass tx_l0/OCC (write to ctx.l0); see set_vs_label_add"]
 async fn set_vs_label_remove() -> Result<()> {
     let db = ws_db().await?;
     {
@@ -193,5 +177,106 @@ async fn merge_same_unique_key_conflicts() -> Result<()> {
         .query("MATCH (u:U) RETURN count(u) AS c")
         .await?;
     assert_eq!(r.rows()[0].value("c"), Some(&uni_db::Value::Int(1)));
+    Ok(())
+}
+
+// ── G7 label-mutation persistence + regression guards ────────────────────────
+
+/// `count(*)` of `T` carrying `label`.
+async fn count_with_label(db: &Uni, label: &str) -> Result<i64> {
+    let r = db
+        .session()
+        .query(&format!("MATCH (n:{label}) RETURN count(n) AS c"))
+        .await?;
+    match r.rows()[0].value("c") {
+        Some(Value::Int(n)) => Ok(*n),
+        other => panic!("expected Int, got {other:?}"),
+    }
+}
+
+/// A committed `SET n:Label` actually persists: the node becomes matchable by the
+/// new label (it must route through the tx and survive merge, not vanish).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn label_add_persists_after_commit() -> Result<()> {
+    let db = ws_db().await?;
+    {
+        let tx = db.session().tx().await?;
+        tx.execute("MATCH (n:T {id: 'x'}) SET n:Tagged").await?;
+        tx.commit().await?;
+    }
+    assert_eq!(count_with_label(&db, "Tagged").await?, 1, "label add lost");
+    // The original label is retained (replace used the full resolved set).
+    assert_eq!(count_with_label(&db, "T").await?, 2, "original label dropped");
+    Ok(())
+}
+
+/// A committed `REMOVE n:Label` persists: the node is no longer matchable by the
+/// removed label, but keeps its other labels.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn label_remove_persists_after_commit() -> Result<()> {
+    let db = ws_db().await?;
+    {
+        let tx = db.session().tx().await?;
+        tx.execute("MATCH (n:T {id: 'x'}) SET n:Tagged").await?;
+        tx.commit().await?;
+    }
+    {
+        let tx = db.session().tx().await?;
+        tx.execute("MATCH (n:T {id: 'x'}) REMOVE n:Tagged").await?;
+        tx.commit().await?;
+    }
+    assert_eq!(count_with_label(&db, "Tagged").await?, 0, "label not removed");
+    assert_eq!(count_with_label(&db, "T").await?, 2, "removal wiped other labels");
+    Ok(())
+}
+
+/// THE key regression guard: a property-only `SET` must NOT touch labels. The
+/// merge "replace" path is gated on `vertex_label_overwrites`, which a property
+/// write never sets — so x keeps its `T` label.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn property_set_does_not_wipe_labels() -> Result<()> {
+    let db = ws_db().await?;
+    {
+        let tx = db.session().tx().await?;
+        tx.execute("MATCH (n:T {id: 'x'}) SET n.val = 42").await?;
+        tx.commit().await?;
+    }
+    // Both x and y still carry T (a property write must not drop labels).
+    assert_eq!(count_with_label(&db, "T").await?, 2, "property SET wiped labels");
+    Ok(())
+}
+
+/// G7 durability: a committed label change survives close + reopen (it is now
+/// written to the WAL as `Mutation::SetVertexLabels` and replayed on recovery).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn label_change_survives_reopen() -> Result<()> {
+    let h = DiskHarness::new()?;
+    {
+        let db = h.open().await?;
+        db.schema()
+            .label("T")
+            .property("id", DataType::String)
+            .property("val", DataType::Int)
+            .done()
+            .apply()
+            .await?;
+        {
+            let tx = db.session().tx().await?;
+            tx.execute("CREATE (:T {id: 'x', val: 0})").await?;
+            tx.commit().await?;
+        }
+        {
+            let tx = db.session().tx().await?;
+            tx.execute("MATCH (n:T {id: 'x'}) SET n:Tagged").await?;
+            tx.commit().await?;
+        }
+        db.flush().await?;
+    }
+    let db = h.open().await?;
+    assert_eq!(
+        count_with_label(&db, "Tagged").await?,
+        1,
+        "label change did not survive reopen (not WAL-durable)"
+    );
     Ok(())
 }

@@ -2144,18 +2144,22 @@ impl Executor {
                             .collect();
 
                         if !labels_to_add.is_empty() {
-                            // Add labels via L0Buffer (schemaless: accept any label name,
-                            // matching CREATE behavior)
+                            // Resolve the FULL new label set and write it to the
+                            // TRANSACTION buffer (so the change is transactional
+                            // and OCC-conflictable), falling back to the context
+                            // (main) L0 for non-transactional callers. Replace
+                            // semantics via `set_vertex_labels`.
+                            let mut new_labels = current_labels;
+                            new_labels.extend(labels_to_add);
                             if let Some(ctx) = ctx {
-                                ctx.l0.write().add_vertex_labels(vid, &labels_to_add);
+                                let l0 = ctx.transaction_l0.as_ref().unwrap_or(&ctx.l0);
+                                l0.write().set_vertex_labels(vid, &new_labels);
                             }
 
-                            // Update the node value in the row with new labels
+                            // Update the node value in the row with the new labels.
                             if let Some(Value::Map(obj)) = row.get_mut(variable) {
-                                let mut updated_labels = current_labels;
-                                updated_labels.extend(labels_to_add);
                                 let labels_list =
-                                    updated_labels.into_iter().map(Value::String).collect();
+                                    new_labels.into_iter().map(Value::String).collect();
                                 obj.insert("_labels".to_string(), Value::List(labels_list));
                             }
                         }
@@ -2598,22 +2602,23 @@ impl Executor {
                 .collect();
 
             if !labels_to_remove.is_empty() {
-                // Remove labels via L0Buffer
+                // Resolve the FULL remaining label set and write it to the
+                // TRANSACTION buffer (transactional + OCC-conflictable), falling
+                // back to the context (main) L0 for non-transactional callers.
+                let remaining_labels: Vec<String> = current_labels
+                    .iter()
+                    .filter(|l| !labels_to_remove.contains(l))
+                    .cloned()
+                    .collect();
                 if let Some(ctx) = ctx {
-                    let mut l0 = ctx.l0.write();
-                    for label in &labels_to_remove {
-                        l0.remove_vertex_label(vid, label);
-                    }
+                    let l0 = ctx.transaction_l0.as_ref().unwrap_or(&ctx.l0);
+                    l0.write().set_vertex_labels(vid, &remaining_labels);
                 }
 
-                // Update the node value in the row with remaining labels
+                // Update the node value in the row with the remaining labels.
                 if let Some(Value::Map(obj)) = row.get_mut(variable) {
-                    let remaining_labels: Vec<_> = current_labels
-                        .iter()
-                        .filter(|l| !labels_to_remove.contains(l))
-                        .cloned()
-                        .collect();
-                    let labels_list = remaining_labels.into_iter().map(Value::String).collect();
+                    let labels_list =
+                        remaining_labels.into_iter().map(Value::String).collect();
                     obj.insert("_labels".to_string(), Value::List(labels_list));
                 }
             }
